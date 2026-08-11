@@ -59,7 +59,7 @@ const nodeFs: ConversationStoreFs = fs;
  * The token lets a releasing predecessor preserve a successor's marker when
  * the same path has already been reacquired.
  */
-const heldLockFiles = new Map<string, string>();
+const heldLockFiles = new Map<string, Set<string>>();
 
 export function conversationStorePath(agentDir: string, kind: string, fileName = "conversations.json"): string {
 	return path.join(agentDir, "sdk", "daemons", kind, fileName);
@@ -248,7 +248,10 @@ export class ConversationStore<T extends ConversationRecord> {
 	}
 
 	#releaseHeldLock(lockFile: string, lock: ConversationStoreLock): void {
-		if (heldLockFiles.get(lockFile) === lock.nonce) heldLockFiles.delete(lockFile);
+		const tokens = heldLockFiles.get(lockFile);
+		if (!tokens) return;
+		tokens.delete(lock.nonce!);
+		if (tokens.size === 0) heldLockFiles.delete(lockFile);
 	}
 
 	async #unlinkOwnedLock(lockFile: string, expected: ConversationStoreLock): Promise<boolean> {
@@ -381,7 +384,9 @@ export class ConversationStore<T extends ConversationRecord> {
 				timestamp: this.#clock(),
 				nonce: randomUUID(),
 			};
-			if (!heldLockFiles.has(lockFile)) heldLockFiles.set(lockFile, lock.nonce!);
+			const heldTokens = heldLockFiles.get(lockFile) ?? new Set<string>();
+			heldTokens.add(lock.nonce!);
+			heldLockFiles.set(lockFile, heldTokens);
 			await handle.writeFile(`${JSON.stringify(lock)}\n`, "utf8");
 			await handle.sync();
 			await this.#fs.link(pendingFile, lockFile);
