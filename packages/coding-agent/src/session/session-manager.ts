@@ -18522,10 +18522,11 @@ export class SessionManager {
 				throw error;
 			}
 		}
-		const managedBoundedDescriptor = managedResumeBounded
-			? managedInspectionStore?.descriptorExpected(path.basename(filePath))
-			: undefined;
-		if (managedResumeBounded && !managedBoundedDescriptor) {
+		const managedBoundedDescriptor =
+			managedResumeBounded && sameManagedDirectory
+				? managedInspectionStore?.descriptorExpected(path.basename(filePath))
+				: undefined;
+		if (managedResumeBounded && sameManagedDirectory && !managedBoundedDescriptor) {
 			managedInspectionStore?.close();
 			throw new Error("Could not open session: unstable");
 		}
