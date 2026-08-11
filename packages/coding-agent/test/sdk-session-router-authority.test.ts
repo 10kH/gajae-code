@@ -1,10 +1,13 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
+import * as fsPromises from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 
+import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
 import type { SessionIndex } from "../src/sdk/broker/session-index";
+import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 import {
 	type SessionAttachment,
 	SessionRouter,
@@ -58,6 +61,8 @@ async function routerFixture(
 		start?: boolean;
 		initiallyIndexed?: boolean;
 		onIndexRefresh?: () => void | Promise<void>;
+		onClientCreated?: () => void | Promise<void>;
+		createBrokerClient?: () => Promise<SessionRouterClient>;
 	} = {},
 ): Promise<RouterFixture> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-authority-"));
@@ -141,8 +146,10 @@ async function routerFixture(
 					emit: frame => handler?.(frame),
 					reconnect: () => reconnectHandler?.(),
 				});
+				await options.onClientCreated?.();
 				return client;
 			},
+			createBrokerClient: options.createBrokerClient,
 			onAttachment: attachment => {
 				if (options.onAttachment) return options.onAttachment(attachment);
 				attachments.push(attachment);
@@ -752,5 +759,263 @@ describe("SessionRouter dispatch authority", () => {
 		expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 		expect(fixture.clients[0]?.requests).toEqual([{ type: "event_replay", sinceSeq: 0, sinceGeneration: 1 }]);
 		await fixture.router.stop();
+	});
+	test("rejects activation when the exact endpoint rotates after connecting", async () => {
+		let fixture!: RouterFixture;
+		fixture = await routerFixture({
+			start: false,
+			onClientCreated: () => {
+				fs.writeFileSync(
+					fixture.endpointFile,
+					JSON.stringify({
+						sessionId: fixture.sessionId,
+						url: "ws://router-successor",
+						token: "successor",
+						pid: 43,
+					}),
+				);
+				fixture.authority.pid = 43;
+				fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+			},
+		});
+		try {
+			await expect(fixture.router.activatePreparedSession(fixture.sessionId)).rejects.toMatchObject({
+				code: "session_not_live",
+			});
+			expect(fixture.clients).toHaveLength(1);
+			expect(fixture.clients[0]?.requests).toEqual([]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("preserves Broker list results when transport cleanup fails", async () => {
+		const response = { ok: true, sessions: [{ sessionId: "listed-session" }] };
+		let closed = 0;
+		let brokerRequest: Record<string, unknown> | undefined;
+		const fixture = await routerFixture({
+			start: false,
+			createBrokerClient: async () => ({
+				onFrame: () => () => {},
+				request: async frame => {
+					brokerRequest = frame;
+					return response;
+				},
+				close: async () => {
+					closed += 1;
+					throw new Error("close handshake failed");
+				},
+				send: () => {},
+			}),
+		});
+		const incarnation = brokerProcessIncarnation(process.pid);
+		if (!incarnation) throw new Error("Test process incarnation is unavailable.");
+		await writeBrokerDiscovery(path.join(fixture.repo, ".gjc", "agent"), {
+			version: SDK_STATE_VERSION,
+			protocolVersion: 3,
+			packageGeneration: "router-test",
+			ownerId: "router-test-owner",
+			pid: process.pid,
+			incarnation,
+			host: "127.0.0.1",
+			port: 1,
+			url: "ws://127.0.0.1:1",
+			token: "broker-test-token",
+			startedAt: Date.now(),
+			heartbeatAt: Date.now(),
+		});
+		const warnings: string[] = [];
+		const warnSpy = spyOn(logger, "warn").mockImplementation((message: string) => {
+			warnings.push(message);
+		});
+		try {
+			expect(await fixture.router.listBrokerSessions({ workspace: fixture.repo }, "list-key")).toEqual(response);
+			expect(brokerRequest).toEqual({
+				type: "broker_request",
+				operation: "session.list",
+				input: { workspace: fixture.repo },
+				idempotencyKey: "list-key",
+			});
+			expect(closed).toBe(1);
+			expect(warnings).toEqual([
+				"SDK Broker session.list transport cleanup failed (Error: close handshake failed).",
+			]);
+		} finally {
+			warnSpy.mockRestore();
+			await fixture.router.stop();
+		}
+	});
+
+	test("rejects an endpoint rewritten after its indexed stat", async () => {
+		const fixture = await routerFixture({ start: false });
+		const realStat = fsPromises.stat;
+		let rewritten = false;
+		const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (file, options) => {
+			const stat = await realStat(file, options);
+			if (!rewritten && file === fixture.endpointFile) {
+				rewritten = true;
+				fs.writeFileSync(
+					fixture.endpointFile,
+					JSON.stringify({
+						sessionId: fixture.sessionId,
+						url: "ws://router.test",
+						token: "replacement",
+						pid: 42,
+					}),
+				);
+			}
+			return stat;
+		}) as typeof fsPromises.stat);
+		try {
+			await fixture.router.start();
+			expect(rewritten).toBe(true);
+			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
+			expect(fixture.clients).toEqual([]);
+		} finally {
+			statSpy.mockRestore();
+			await fixture.router.stop();
+		}
+	});
+
+	test("waits for retirement installed while successor endpoint validation is in flight", async () => {
+		const endpointValidationEntered = Promise.withResolvers<void>();
+		const releaseEndpointValidation = Promise.withResolvers<void>();
+		const retirementEntered = Promise.withResolvers<void>();
+		const releaseRetirement = Promise.withResolvers<void>();
+		const fixture = await routerFixture({
+			onSessionRemoved: async (_attachment, reason) => {
+				if (reason !== "replaced_same_generation") return;
+				retirementEntered.resolve();
+				await releaseRetirement.promise;
+			},
+		});
+		fs.writeFileSync(
+			fixture.endpointFile,
+			JSON.stringify({
+				sessionId: fixture.sessionId,
+				url: "ws://router.test",
+				token: "replacement",
+				pid: 43,
+			}),
+		);
+		fixture.authority.pid = 43;
+		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+		const realStat = fsPromises.stat;
+		let blockedValidation = false;
+		const statSpy = spyOn(fsPromises, "stat").mockImplementation((async (file, options) => {
+			const stat = await realStat(file, options);
+			if (!blockedValidation && file === fixture.endpointFile) {
+				blockedValidation = true;
+				endpointValidationEntered.resolve();
+				await releaseEndpointValidation.promise;
+			}
+			return stat;
+		}) as typeof fsPromises.stat);
+		try {
+			const reconciliation = fixture.router.reconcile();
+			await endpointValidationEntered.promise;
+			fixture.clients[0]?.reconnect();
+			await retirementEntered.promise;
+			releaseEndpointValidation.resolve();
+			await Bun.sleep(25);
+			expect(fixture.clients).toHaveLength(1);
+			releaseRetirement.resolve();
+			await reconciliation;
+			expect(fixture.clients).toHaveLength(2);
+		} finally {
+			releaseEndpointValidation.resolve();
+			releaseRetirement.resolve();
+			statSpy.mockRestore();
+			await fixture.router.stop();
+		}
+	});
+
+	test("classifies token-only and URL-only same-generation rotations as successors", async () => {
+		const reasons: Array<"removed" | "replaced" | "replaced_same_generation" | undefined> = [];
+		const fixture = await routerFixture({
+			start: false,
+			onSessionRemoved: (_attachment, reason) => {
+				reasons.push(reason);
+			},
+		});
+		const preservedTimestamp = new Date(1_700_000_000_000);
+		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+		const replaceEndpoint = (url: string, token: string): void => {
+			fs.writeFileSync(fixture.endpointFile, JSON.stringify({ sessionId: fixture.sessionId, url, token, pid: 42 }));
+			fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+			expect(fs.statSync(fixture.endpointFile).mtimeMs).toBe(fixture.authority.endpointMtimeMs);
+		};
+		try {
+			await fixture.router.start();
+			replaceEndpoint("ws://router.test", "rotated-token");
+			await fixture.router.reconcile();
+			replaceEndpoint("ws://router-successor", "rotated-token");
+			await fixture.router.reconcile();
+			expect(reasons).toEqual(["replaced_same_generation", "replaced_same_generation"]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("classifies a reconnect token rotation as a same-generation successor", async () => {
+		const reasons: Array<"removed" | "replaced" | "replaced_same_generation" | undefined> = [];
+		const fixture = await routerFixture({
+			start: false,
+			onSessionRemoved: (_attachment, reason) => {
+				reasons.push(reason);
+			},
+		});
+		const preservedTimestamp = new Date(1_700_000_000_000);
+		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+		try {
+			await fixture.router.start();
+			fs.writeFileSync(
+				fixture.endpointFile,
+				JSON.stringify({
+					sessionId: fixture.sessionId,
+					url: "ws://router.test",
+					token: "rotated-token",
+					pid: 42,
+				}),
+			);
+			fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+			expect(fs.statSync(fixture.endpointFile).mtimeMs).toBe(fixture.authority.endpointMtimeMs);
+			fixture.clients[0]?.reconnect();
+			for (let attempt = 0; reasons.length === 0 && attempt < 50; attempt++) await Bun.sleep(10);
+			expect(reasons).toEqual(["replaced_same_generation"]);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+	test("derives distinct durable authority IDs for token and URL rotations", async () => {
+		const fixture = await routerFixture({ start: false });
+		const preservedTimestamp = new Date(1_700_000_000_000);
+		fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+		fixture.authority.endpointMtimeMs = fs.statSync(fixture.endpointFile).mtimeMs;
+		const replaceEndpoint = (url: string, token: string): void => {
+			fs.writeFileSync(fixture.endpointFile, JSON.stringify({ sessionId: fixture.sessionId, url, token, pid: 42 }));
+			fs.utimesSync(fixture.endpointFile, preservedTimestamp, preservedTimestamp);
+			expect(fs.statSync(fixture.endpointFile).mtimeMs).toBe(fixture.authority.endpointMtimeMs);
+		};
+		try {
+			await fixture.router.start();
+			const initialAuthorityId = fixture.router.attachment(fixture.sessionId)?.authorityId;
+			replaceEndpoint("ws://router.test", "rotated-token");
+			await fixture.router.reconcile();
+			const tokenAuthorityId = fixture.router.attachment(fixture.sessionId)?.authorityId;
+			replaceEndpoint("ws://router-successor", "rotated-token");
+			await fixture.router.reconcile();
+			const urlAuthorityId = fixture.router.attachment(fixture.sessionId)?.authorityId;
+			expect(initialAuthorityId).toBeDefined();
+			expect(tokenAuthorityId).toBeDefined();
+			expect(urlAuthorityId).toBeDefined();
+			expect(tokenAuthorityId).not.toBe(initialAuthorityId);
+			expect(urlAuthorityId).not.toBe(tokenAuthorityId);
+			expect(urlAuthorityId).not.toBe(initialAuthorityId);
+		} finally {
+			await fixture.router.stop();
+		}
 	});
 });

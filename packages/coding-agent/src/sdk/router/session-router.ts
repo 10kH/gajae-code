@@ -19,6 +19,8 @@ import { ACP_SESSION_RECONNECT } from "../session-reconnect";
 export interface SessionAttachment {
 	readonly sessionId: string;
 	readonly authorityId?: string;
+	/** Current Router-owned transport identity for this exact attachment's reverse leases. */
+	readonly connectionId?: string;
 	readonly generation: number;
 	isCurrent(): boolean;
 	send(frame: Record<string, unknown>): unknown;
@@ -32,7 +34,7 @@ export interface SessionRouterClient {
 	onReconnect?(handler: () => void): () => void;
 	connect?(): Promise<void>;
 	request(frame: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<Record<string, unknown>>;
-	/** Current private transport connection identity; never exposed through SessionAttachment. */
+	/** Current private transport connection identity, surfaced only through its exact attachment. */
 	readonly connectionId?: string;
 
 	close(): Promise<void>;
@@ -431,7 +433,7 @@ export class SessionRouter {
 				endpoint.token !== attached.endpoint.token ||
 				endpoint.pid !== attached.pid
 			) {
-				await this.#retireAttachment(attached);
+				await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
 				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 			}
 		}
@@ -529,6 +531,17 @@ export class SessionRouter {
 			throw new SessionActivationError("activation_unavailable", "The session endpoint could not be reached.");
 		}
 		try {
+			const currentEndpoint = await this.#readEndpoint(indexed).catch(() => null);
+			if (
+				!currentEndpoint ||
+				currentEndpoint.url !== endpoint.url ||
+				currentEndpoint.token !== endpoint.token ||
+				currentEndpoint.pid !== endpoint.pid
+			)
+				throw new SessionActivationError(
+					"session_not_live",
+					"The session endpoint changed before activation could be dispatched.",
+				);
 			return await requestPreparedSessionActivation(client, sessionId, indexed.endpointGeneration);
 		} finally {
 			await client.close().catch(() => undefined);
@@ -555,7 +568,9 @@ export class SessionRouter {
 				timeoutMs === undefined ? undefined : { timeoutMs },
 			);
 		} finally {
-			await client.close();
+			await client.close().catch(error => {
+				logger.warn(`SDK Broker session.list transport cleanup failed (${String(error)}).`);
+			});
 		}
 	}
 
@@ -681,7 +696,16 @@ export class SessionRouter {
 		} catch {
 			return null;
 		}
-		if (raw.sessionId !== indexed.sessionId || raw.pid !== indexed.pid || raw.stale === true) return null;
+		if (
+			raw.sessionId !== indexed.sessionId ||
+			raw.pid !== indexed.pid ||
+			raw.stale === true ||
+			raw.url !== endpoint.url ||
+			raw.token !== endpoint.token
+		)
+			return null;
+		const endpointStatAfterRead = await fs.stat(endpoint.path).catch(() => undefined);
+		if (!endpointStatAfterRead || endpointStatAfterRead.mtimeMs !== indexed.endpointMtimeMs) return null;
 		await this.#index.refresh();
 		const listing = this.#index.listSessions();
 		if (listing.warnings.length > 0) return null;
@@ -737,7 +761,10 @@ export class SessionRouter {
 			await this.#deps.onSessionRemoved?.(
 				existing.capability,
 				existing.generation === indexed.endpointGeneration &&
-					(existing.pid !== indexed.pid || existing.endpointMtimeMs !== indexed.endpointMtimeMs)
+					(existing.endpoint.url !== endpoint.url ||
+						existing.endpoint.token !== endpoint.token ||
+						existing.pid !== indexed.pid ||
+						existing.endpointMtimeMs !== indexed.endpointMtimeMs)
 					? "replaced_same_generation"
 					: "replaced",
 			);
@@ -768,6 +795,10 @@ export class SessionRouter {
 		const barrier: ReplayBarrier = { held: undefined, detached: false, failed: false };
 		const publication = Promise.withResolvers<void>();
 		void publication.promise.catch(() => undefined);
+		const endpointAuthorityDigest = crypto
+			.createHash("sha256")
+			.update(JSON.stringify({ url: endpoint.url, token: endpoint.token }))
+			.digest("hex");
 		const capability: SessionAttachment = Object.freeze({
 			authorityId: crypto
 				.createHash("sha256")
@@ -777,11 +808,15 @@ export class SessionRouter {
 						generation: indexed.endpointGeneration,
 						pid: indexed.pid,
 						endpointMtimeMs: indexed.endpointMtimeMs,
+						endpointAuthorityDigest,
 					}),
 				)
 				.digest("hex"),
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
+			get connectionId(): string | undefined {
+				return attached?.client.connectionId;
+			},
 			isCurrent: () => attached !== undefined && this.#attachmentPublished(attached),
 			send: async (frame: Record<string, unknown>) => {
 				if (!attached || !this.#attachmentPublished(attached))
@@ -794,7 +829,7 @@ export class SessionRouter {
 						endpoint.token !== attached.endpoint.token ||
 						endpoint.pid !== attached.pid
 					) {
-						await this.#retireAttachment(attached);
+						await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
 						throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 					}
 				} else await this.#serialReconcile(runEpoch);
@@ -956,7 +991,7 @@ export class SessionRouter {
 					endpoint.token !== attached.endpoint.token ||
 					endpoint.pid !== attached.pid
 				) {
-					await this.#retireAttachment(attached);
+					await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
 					return;
 				}
 				attached.initializingPublication = true;
