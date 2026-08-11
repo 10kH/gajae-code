@@ -2794,6 +2794,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						activeSkillState: session?.getActiveSkillState(),
 						sessionId: sessionManager.getSessionId?.() ?? null,
 					}),
+					() => session?.getSessionAgentDir(),
 				),
 			);
 
@@ -3002,6 +3003,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			sessionManager,
 			settings,
+			// The session's REQUESTED agent directory when the caller explicitly
+			// supplied it, independent of the reused global Settings singleton
+			// (which may belong to an earlier session). When the option is
+			// absent, the injected settings instance's own profile wins via the
+			// AgentSession fallback - never the process default.
+			agentDir: options.agentDir,
 			memoryBackend: runtimeServices.memoryBackend,
 			notificationSessionController,
 			evalKernelOwnerId,

@@ -279,6 +279,11 @@ export interface ToolSession {
 	agentOutputManager?: AgentOutputManager;
 	/** Settings instance for passing to subagents */
 	settings: Settings;
+	/**
+	 * The session's REQUESTED effective agent directory, independent of the
+	 * global Settings singleton (which can be reused across sessions).
+	 */
+	getSessionAgentDir?: () => string;
 	/** Live service-tier intent of the parent session, inherited by `inherit` subagents. */
 	serviceTier?: ServiceTier;
 	/** Whether the effective subagent tier grants fast mode for a resolved provider. */

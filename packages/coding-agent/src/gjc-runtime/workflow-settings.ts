@@ -72,6 +72,14 @@ export interface ResolveWorkflowSettingOptions<T> {
 	parse: (value: unknown) => WorkflowSettingParseResult<T>;
 	/** Omitted means "continue"; ralplan passes "throw" explicitly. */
 	invalidPolicy?: "throw" | "continue";
+	/**
+	 * The session's effective agent directory. Defaults to the process-global
+	 * `getAgentDir()`; an SDK embedder that created the session with
+	 * `createAgentSession({ agentDir })` must pass that directory here so the
+	 * agent-config layer matches the profile `Settings.init` loaded and
+	 * migrated, instead of inheriting an unrelated default-profile value.
+	 */
+	agentDir?: string;
 }
 
 export interface WorkflowSettingResolution<T> {
@@ -117,7 +125,6 @@ type ResolverCandidate = {
 
 const LAYER_CANDIDATES: ReadonlyArray<ResolverCandidate> = [
 	{ layer: "project-config", format: "yaml", buildPath: cwd => path.resolve(gjcRoot(cwd), "config.yml") },
-	{ layer: "agent-config", format: "yaml", buildPath: () => path.resolve(getAgentDir(), "config.yml") },
 ];
 
 /**
@@ -132,8 +139,14 @@ async function projectKeyMigrated(cwd: string, key: WorkflowSettingKey): Promise
 	let raw: string;
 	try {
 		raw = await Bun.file(path.join(gjcRoot(cwd), "state", "settings.json.migrated-keys")).text();
-	} catch {
-		return false;
+	} catch (error) {
+		// Only a MISSING marker reads as no ownership. A non-ENOENT read
+		// failure (EACCES, transient I/O) must fail closed: reporting unowned
+		// would let the resolver reactivate a stale retained value after the
+		// key was unset from project config.yml (an invalid strict value could
+		// make ralplan exit 2 again).
+		if (isEnoent(error)) return false;
+		throw error;
 	}
 	try {
 		const parsed = JSON.parse(raw) as unknown;
@@ -170,8 +183,13 @@ async function legacySourceExists(sourcePath: string): Promise<boolean> {
 	try {
 		await fs.stat(sourcePath);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		// Only ENOENT means absence. A non-ENOENT failure (EACCES, transient
+		// I/O) RETAINS the candidate: the normal read-error policy then
+		// surfaces the unreadable explicit settings source (strict ralplan
+		// callers exit 2) instead of silently treating it as absence.
+		if (isEnoent(error)) return false;
+		return true;
 	}
 }
 
@@ -328,7 +346,15 @@ export async function resolveWorkflowSetting<T>(
 	// not resurrect through the agent slot either after `gjc config unset`
 	// removed it from config.yml.
 	const configRootAliasesProject = await filesAreSamePhysicalFile(projectSettingsJson, agentSettingsJson);
-	if (await legacySourceExists(agentSettingsJson)) {
+	// The machine-global config-root legacy belongs ONLY to the environment-
+	// selected global agent profile: an isolated SDK/tenant profile
+	// (`options.agentDir` differing from `getAgentDir()`) must not inherit the
+	// host's legacy override - the migration deliberately refuses to consume
+	// the machine-global source for custom scopes, so it stays present and
+	// would defeat profile isolation if applied here.
+	const agentLayerIsGlobal =
+		options.agentDir === undefined || path.resolve(options.agentDir) === path.resolve(getAgentDir());
+	if (agentLayerIsGlobal && (await legacySourceExists(agentSettingsJson))) {
 		legacyCandidates.push({
 			layer: "agent-config",
 			format: "json",
@@ -338,10 +364,18 @@ export async function resolveWorkflowSetting<T>(
 				: {}),
 		});
 	}
+	// The session's effective agent directory (SDK sessions pass their
+	// `createAgentSession({ agentDir })` profile); the process-global
+	// `getAgentDir()` is the default for CLI flows.
+	const agentCandidate: ResolverCandidate = {
+		layer: "agent-config",
+		format: "yaml",
+		buildPath: () => path.resolve(options.agentDir ?? getAgentDir(), "config.yml"),
+	};
 	const candidates = [
 		LAYER_CANDIDATES[0]!,
 		...legacyCandidates.filter(candidate => candidate.layer === "project-config"),
-		LAYER_CANDIDATES[1]!,
+		agentCandidate,
 		...legacyCandidates.filter(candidate => candidate.layer === "agent-config"),
 	];
 	for (const candidate of candidates) {
@@ -534,8 +568,12 @@ export async function resolveWorkflowSetting<T>(
 	// still fail loudly) persists agent-layer evidence; strict callers surface
 	// it here - after the project layer had its chance to win - instead of
 	// silently falling back to the default. Tolerant callers never abort on
-	// invalid values, so the evidence only ever records ralplan keys.
-	if (invalidPolicy === "throw") {
+	// invalid values, so the evidence only ever records ralplan keys. Like the
+	// legacy candidate, the machine-global evidence applies only to the
+	// environment-selected global profile: an isolated SDK/tenant profile must
+	// fall through to its own defaults instead of inheriting the host's
+	// retained failure.
+	if (invalidPolicy === "throw" && agentLayerIsGlobal) {
 		const retained = await readRetainedStrictEvidence(
 			path.resolve(getConfigRootDir(), STRICT_INVALID_EVIDENCE_FILENAME),
 			key,

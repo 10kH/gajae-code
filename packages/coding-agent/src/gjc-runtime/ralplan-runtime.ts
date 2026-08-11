@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isSettingsInitialized, Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -413,9 +414,18 @@ async function resolveStrictRalplanSetting<T>(
 	key: WorkflowSettingKey,
 	parse: (value: unknown) => WorkflowSettingParseResult<T>,
 	defaultValue: T,
+	agentDir?: string,
 ): Promise<{ value: T; source: string }> {
 	try {
-		const resolution = await resolveWorkflowSetting(cwd, key, { defaultValue, parse, invalidPolicy: "throw" });
+		const resolution = await resolveWorkflowSetting(cwd, key, {
+			defaultValue,
+			parse,
+			invalidPolicy: "throw",
+			// The session's effective agent profile: an SDK session created with
+			// `createAgentSession({ agentDir })` resolves against that directory
+			// instead of the process-global default.
+			agentDir: agentDir ?? (isSettingsInitialized() ? Settings.instance.getAgentDir() : undefined),
+		});
 		return { value: resolution.value, source: resolution.source };
 	} catch (error) {
 		if (error instanceof WorkflowSettingError) {
@@ -429,7 +439,10 @@ async function resolveStrictRalplanSetting<T>(
  * Resolve the ralplan consensus iteration cap through the shared resolver.
  * Project `.gjc/config.yml` and `.gjc/settings.json` beat user layers.
  */
-export async function resolveRalplanMaxIterations(cwd: string): Promise<{ maxIterations: number; source: string }> {
+export async function resolveRalplanMaxIterations(
+	cwd: string,
+	agentDir?: string,
+): Promise<{ maxIterations: number; source: string }> {
 	const { value, source } = await resolveStrictRalplanSetting(
 		cwd,
 		"gjc.ralplan.maxIterations",
@@ -438,6 +451,7 @@ export async function resolveRalplanMaxIterations(cwd: string): Promise<{ maxIte
 			`expected gjc.ralplan.maxIterations to be an integer between 1 and ${RALPLAN_MAX_ITERATIONS_LIMIT}`,
 		),
 		RALPLAN_DEFAULT_MAX_ITERATIONS,
+		agentDir,
 	);
 	return { maxIterations: value, source };
 }
@@ -451,6 +465,8 @@ function parseRalplanAutoHandoffTarget(value: unknown): RalplanAutoHandoffTarget
 type RalplanAutoHandoffOptions = {
 	planningStuck?: boolean;
 	teamAvailabilityProbe?: () => { available: true } | { available: false; reason: string };
+	/** The session's effective agent directory (see resolveWorkflowSetting). */
+	agentDir?: string;
 };
 
 function parsePresentRalplanAutoHandoff(value: unknown): WorkflowSettingParseResult<RalplanAutoHandoffTarget> {
@@ -469,6 +485,7 @@ export async function resolveRalplanAutoHandoff(
 		"gjc.ralplan.autoHandoff",
 		parsePresentRalplanAutoHandoff,
 		"off",
+		options.agentDir,
 	);
 	return resolveRalplanAutoHandoffTarget(value, source, options);
 }
@@ -502,6 +519,7 @@ function parseMaxReviewPassesPerLaneValue(value: unknown): number | null {
 /** Resolve the per-lane review-pass budget through the shared resolver. */
 export async function resolveRalplanMaxReviewPassesPerLane(
 	cwd: string,
+	agentDir?: string,
 ): Promise<{ maxReviewPassesPerLane: number; source: string }> {
 	const { value, source } = await resolveStrictRalplanSetting(
 		cwd,
@@ -511,6 +529,7 @@ export async function resolveRalplanMaxReviewPassesPerLane(
 			`expected gjc.ralplan.maxReviewPassesPerLane to be an integer between 1 and ${RALPLAN_MAX_REVIEW_PASSES_PER_LANE_LIMIT}`,
 		),
 		RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE,
+		agentDir,
 	);
 	return { maxReviewPassesPerLane: value, source };
 }
@@ -1823,7 +1842,11 @@ function buildIndexedReviewArtifacts(indexText: string | undefined): Map<string,
 	return map;
 }
 
-async function handleArtifactWrite(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
+async function handleArtifactWrite(
+	args: readonly string[],
+	cwd: string,
+	agentDir?: string,
+): Promise<RalplanCommandResult> {
 	const resolved = await resolveArtifactArgs(args, cwd);
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);
@@ -1927,8 +1950,8 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 	const [onDiskOpeners, onDiskLaneArtifacts, iterationLimit, laneLimit] = await Promise.all([
 		countRalplanOnDiskOpeners(cwd, resolved.sessionId, resolved.runId),
 		countRalplanOnDiskLaneArtifacts(cwd, resolved.sessionId, resolved.runId),
-		resolveRalplanMaxIterations(cwd),
-		resolveRalplanMaxReviewPassesPerLane(cwd),
+		resolveRalplanMaxIterations(cwd, agentDir),
+		resolveRalplanMaxReviewPassesPerLane(cwd, agentDir),
 	]);
 	const capDecision = evaluateRalplanIterationCap({
 		rows: indexLoad.rows,
@@ -1971,6 +1994,7 @@ async function handleArtifactWrite(args: readonly string[], cwd: string): Promis
 		// state write. The ledger row below is the durable receipt for deduplicated
 		// retries; state is only a current-session projection.
 		autoHandoff = await resolveRalplanAutoHandoff(cwd, {
+			agentDir,
 			planningStuck: await readRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId),
 		});
 	}
@@ -2248,10 +2272,14 @@ async function handleDoctor(args: readonly string[], cwd: string): Promise<Ralpl
 
 /* -------------------------------- entry --------------------------------- */
 
-export async function runNativeRalplanCommand(args: string[], cwd = process.cwd()): Promise<RalplanCommandResult> {
+export async function runNativeRalplanCommand(
+	args: string[],
+	cwd = process.cwd(),
+	options: { agentDir?: string } = {},
+): Promise<RalplanCommandResult> {
 	try {
 		if (isRalplanDoctorInvocation(args)) return await handleDoctor(args, cwd);
-		if (isRalplanArtifactWriteInvocation(args)) return await handleArtifactWrite(args, cwd);
+		if (isRalplanArtifactWriteInvocation(args)) return await handleArtifactWrite(args, cwd, options.agentDir);
 		return await handleConsensusHandoff(args, cwd);
 	} catch (error) {
 		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };

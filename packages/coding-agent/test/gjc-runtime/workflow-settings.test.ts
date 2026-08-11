@@ -52,9 +52,10 @@ async function resolveIn(
 	cwd: string,
 	env: Record<string, string | undefined>,
 	key: string = KEY,
-	options: { strict?: boolean } = {},
+	options: { strict?: boolean; agentDir?: string } = {},
 ): Promise<{ value: unknown; source: string; diagnostics: unknown[]; threw?: boolean; message?: string }> {
 	const args = [process.execPath, PROBE, key, ...(options.strict ? ["--strict"] : [])];
+	if (options.agentDir) args.push("--agent-dir", options.agentDir);
 	const proc = Bun.spawn(args, {
 		cwd,
 		env: {
@@ -148,6 +149,168 @@ describe("workflow-settings resolver", () => {
 		});
 		expect(result.value).toBe("default");
 		expect(result.threw).toBeUndefined();
+	});
+	test("the session agent directory overrides the process-global agent layer", async () => {
+		const cwd = await tempDir();
+		const defaultAgentDir = await tempDir();
+		const tenantAgentDir = await tempDir();
+		const home = await tempDir();
+		// An SDK embedder created the session with `createAgentSession({ agentDir:
+		// tenant })`: Settings.init loads/migrates the tenant profile, so the
+		// resolver must read THAT config.yml - not the process-global default
+		// profile a CLI flow would use.
+		await writeProjectConfig(cwd, { theme: { dark: "red" } });
+		await fs.mkdir(defaultAgentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(defaultAgentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.mkdir(tenantAgentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(tenantAgentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 9 } } }, null, 2),
+		);
+
+		// The process-global env points at the DEFAULT profile; the explicit
+		// session agentDir must win.
+		const result = await resolveIn(
+			cwd,
+			{ GJC_CODING_AGENT_DIR: defaultAgentDir, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+			KEY,
+			{
+				agentDir: tenantAgentDir,
+			},
+		);
+		expect(result.value).toBe(9);
+		expect(result.source).toContain(tenantAgentDir);
+	});
+	test("an unreadable legacy config-root source fails closed under strict policy", async () => {
+		const cwd = await tempDir();
+		const agentDir = await tempDir();
+		const home = await tempDir();
+		// A legacy config-root settings.json exists under a config root the
+		// resolver cannot enter (EACCES on stat): the strict ralplan contract
+		// must surface the unreadable explicit source (exit 2) instead of
+		// treating it as absence and falling through to the default.
+		await writeProjectConfig(cwd, { theme: { dark: "red" } });
+		const configRoot = path.join(home, ".gjc");
+		await fs.mkdir(path.join(configRoot, "agent"), { recursive: true });
+		await fs.writeFile(path.join(configRoot, "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
+		// Deny access to the config root so `stat` of the legacy source fails
+		// with EACCES (a file-mode 000 would not block stat itself).
+		await fs.chmod(configRoot, 0o000);
+		try {
+			const result = await resolveIn(
+				cwd,
+				{ GJC_CODING_AGENT_DIR: agentDir, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+				KEY,
+				{ strict: true },
+			);
+			expect(result.threw).toBe(true);
+		} finally {
+			await fs.chmod(configRoot, 0o700);
+		}
+	});
+	test("an isolated session profile does not inherit the machine-global legacy source", async () => {
+		const cwd = await tempDir();
+		const defaultAgentDir = await tempDir();
+		const tenantAgentDir = await tempDir();
+		const home = await tempDir();
+		// The host's machine-global config-root legacy holds a value, but the
+		// isolated SDK/tenant profile's config.yml omits the key: the tenant
+		// must fall through to the default instead of inheriting the host's
+		// legacy override (the migration refuses to consume the machine-global
+		// source for custom scopes, so applying it here would defeat profile
+		// isolation).
+		await writeProjectConfig(cwd, { theme: { dark: "red" } });
+		const configRoot = path.join(home, ".gjc");
+		await fs.mkdir(path.join(configRoot, "agent"), { recursive: true });
+		await fs.writeFile(path.join(configRoot, "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
+		await fs.mkdir(defaultAgentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(defaultAgentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.mkdir(tenantAgentDir, { recursive: true });
+		await fs.writeFile(path.join(tenantAgentDir, "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
+
+		const result = await resolveIn(
+			cwd,
+			{ GJC_CODING_AGENT_DIR: defaultAgentDir, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+			KEY,
+			{ agentDir: tenantAgentDir },
+		);
+		expect(result.value).toBe("default");
+		expect(result.source).toBe("default");
+	});
+	test("an isolated session profile does not inherit the machine-global strict evidence", async () => {
+		const cwd = await tempDir();
+		const defaultAgentDir = await tempDir();
+		const tenantAgentDir = await tempDir();
+		const home = await tempDir();
+		// The host's machine-global config-root retained STRICT evidence (an
+		// invalid legacy value once kept exit 2 for the global profile), but an
+		// isolated SDK/tenant profile must fall through to its own defaults
+		// instead of failing on the host's retained failure.
+		await writeProjectConfig(cwd, { theme: { dark: "red" } });
+		const configRoot = path.join(home, ".gjc");
+		await fs.mkdir(path.join(configRoot, "agent"), { recursive: true });
+		await fs.writeFile(
+			path.join(configRoot, "settings.json.strict-invalid"),
+			JSON.stringify({
+				version: 2,
+				keys: [{ key: "gjc.ralplan.maxIterations", value: "invalid" }],
+				source: path.join(configRoot, "settings.json"),
+			}),
+		);
+		await fs.mkdir(defaultAgentDir, { recursive: true });
+		await fs.writeFile(
+			path.join(defaultAgentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7 } } }, null, 2),
+		);
+		await fs.mkdir(tenantAgentDir, { recursive: true });
+		await fs.writeFile(path.join(tenantAgentDir, "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
+
+		const result = await resolveIn(
+			cwd,
+			{ GJC_CODING_AGENT_DIR: defaultAgentDir, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+			KEY,
+			{ strict: true, agentDir: tenantAgentDir },
+		);
+		expect(result.threw).toBeUndefined();
+		expect(result.value).toBe("default");
+	});
+
+	test("an unreadable ownership marker fails closed instead of resurrecting the retained value", async () => {
+		const cwd = await tempDir();
+		const agentDir = await tempDir();
+		const home = await tempDir();
+		// A migrated key was unset from project config.yml; the retained legacy
+		// settings.json still holds an INVALID strict value. The ownership marker
+		// exists but is UNREADABLE: resolving must fail closed on the marker read
+		// instead of treating it as unowned and reactivating the stale value
+		// (which would make ralplan exit 2 again).
+		await writeProjectConfig(cwd, { theme: { dark: "red" } });
+		await writeProjectSettings(cwd, { "gjc.ralplan.maxIterations": "invalid" });
+		await fs.mkdir(path.join(cwd, ".gjc", "state"), { recursive: true });
+		await fs.writeFile(
+			path.join(cwd, ".gjc", "state", "settings.json.migrated-keys"),
+			JSON.stringify(["gjc.ralplan.maxIterations"]),
+		);
+		await fs.mkdir(agentDir, { recursive: true });
+		await fs.chmod(path.join(cwd, ".gjc", "state"), 0o000);
+		try {
+			const result = await resolveIn(
+				cwd,
+				{ GJC_CODING_AGENT_DIR: agentDir, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+				KEY,
+				{ strict: true },
+			);
+			expect(result.threw).toBe(true);
+			expect(result.message ?? "").toContain("EACCES");
+		} finally {
+			await fs.chmod(path.join(cwd, ".gjc", "state"), 0o700);
+		}
 	});
 
 	test("parses a legacy settings.json fallback as JSON, not YAML", async () => {

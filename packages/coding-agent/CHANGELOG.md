@@ -174,6 +174,7 @@
 - ralplan settings are strict for all three keys: malformed or invalid explicit settings in any layer/format exit 2 (the former silent `maxIterations` fallback is removed). An invalid strict ralplan value in the target `config.yml` is repaired with a valid legacy value during migration.
 - `config.yml` settings use the nested schema form; flat dotted keys are honored only in legacy `settings.json` files so every effective override stays manageable via `Settings`/`gjc config`.
 - A strict ralplan key in a retained project `settings.json` that is shadowed by a valid project `config.yml` value is recorded as migrated (owned), so a later `gjc config unset` of that value falls through to the default layer instead of resurrecting the invalid legacy value (exit 2).
+- Workflow commands inside an SDK session created with a custom `agentDir` (`createAgentSession({ agentDir })`) resolve the user/agent settings layer from that profile instead of the process-global default profile.
 - Deferred notification adapters, native bindings, provider construction, tools, skills, eval, session artifacts, and history storage until their feature paths are used, reducing the CLI startup module graph without changing default behavior.
 
 - Split SDK session hosting into a transport-neutral runtime and lazy notification adapters.

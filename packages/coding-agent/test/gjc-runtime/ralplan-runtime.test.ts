@@ -9,6 +9,7 @@ import {
 	RALPLAN_DEFAULT_MAX_ITERATIONS,
 	RALPLAN_DEFAULT_MAX_REVIEW_PASSES_PER_LANE,
 	resolveRalplanAutoHandoff,
+	resolveRalplanMaxIterations,
 	resolveRalplanMaxReviewPassesPerLane,
 	runNativeRalplanCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
@@ -3229,5 +3230,40 @@ describe("ralplan HUD lane verdict carriage", () => {
 			).status,
 		).toBe(0);
 		expect((await readRalplanHudChips(root)).some(chip => chip.label === "verdict")).toBe(false);
+	});
+});
+describe("native gjc ralplan runtime — session agent directory threading", () => {
+	it("the session agent directory reaches the strict settings resolution", async () => {
+		const cwd = await tempDir();
+		const defaultAgentDir = await tempDir();
+		const tenantAgentDir = await tempDir();
+		// Project config must not shadow the agent layers under test.
+		await fs.mkdir(path.join(cwd, ".gjc"), { recursive: true });
+		await fs.writeFile(path.join(cwd, ".gjc", "config.yml"), YAML.stringify({ theme: { dark: "red" } }, null, 2));
+		await fs.writeFile(
+			path.join(defaultAgentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 7, maxReviewPassesPerLane: 5 } } }, null, 2),
+		);
+		await fs.writeFile(
+			path.join(tenantAgentDir, "config.yml"),
+			YAML.stringify({ gjc: { ralplan: { maxIterations: 9, maxReviewPassesPerLane: 3 } } }, null, 2),
+		);
+
+		// An SDK session with an INJECTED settings instance passes its agent
+		// directory through: the process-global agent layer holds 7, the
+		// injected profile holds 9 and must win.
+		const previousAgentDir = getAgentDir();
+		setAgentDir(defaultAgentDir);
+		try {
+			const { maxIterations, source } = await resolveRalplanMaxIterations(cwd, tenantAgentDir);
+			expect(maxIterations).toBe(9);
+			expect(source).toContain(tenantAgentDir);
+			// The per-lane review-pass cap must use the same session profile.
+			const reviewPasses = await resolveRalplanMaxReviewPassesPerLane(cwd, tenantAgentDir);
+			expect(reviewPasses.maxReviewPassesPerLane).toBe(3);
+			expect(reviewPasses.source).toContain(tenantAgentDir);
+		} finally {
+			setAgentDir(previousAgentDir);
+		}
 	});
 });

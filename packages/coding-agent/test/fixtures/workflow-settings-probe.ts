@@ -9,11 +9,14 @@ import { resolveWorkflowSetting, type WorkflowSettingKey } from "../../src/gjc-r
 const cwd = process.cwd();
 const key = process.argv[2] as WorkflowSettingKey;
 const strict = process.argv.includes("--strict");
+const agentDirIndex = process.argv.indexOf("--agent-dir");
+const agentDir = agentDirIndex >= 0 ? process.argv[agentDirIndex + 1] : undefined;
 try {
 	const result = await resolveWorkflowSetting(cwd, key, {
 		defaultValue: "default",
 		parse: (value: unknown) => ({ kind: "valid" as const, value }),
 		...(strict ? { invalidPolicy: "throw" as const } : {}),
+		...(agentDir ? { agentDir } : {}),
 	});
 	process.stdout.write(
 		`${JSON.stringify({ value: result.value, source: result.source, diagnostics: result.diagnostics })}

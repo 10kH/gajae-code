@@ -200,6 +200,25 @@ describe("ultragoal nudge guard", () => {
 		expect(askNudges.length).toBe(1);
 	});
 
+	// Session profile: the ask guard resolves the nudge budget from the
+	// session agent directory (a tenant profile with nudgeBudget 0 is never
+	// nudged) instead of the process-default profile.
+	it("AC1: the session agent directory selects the nudge budget profile", async () => {
+		const cwd = await tempDir();
+		const tenantAgentDir = await tempDir();
+		process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+		await createUltragoalPlan({ cwd, brief: SINGLE_BRIEF });
+		await fs.writeFile(
+			path.join(tenantAgentDir, "config.yml"),
+			YAML.stringify({ gjc: { ultragoal: { nudgeBudget: 0 } } }, null, 2),
+		);
+		// The tenant forbids nudges: the ask assert falls straight to the
+		// block message and appends no nudge row.
+		await expect(assertUltragoalAskAllowed(cwd, { sessionId: TEST_SESSION_ID }, tenantAgentDir)).rejects.toThrow();
+		const ledger = await readUltragoalLedger(cwd, TEST_SESSION_ID);
+		expect(ledger.filter(event => event.event === "nudge" && event.surface === "ask").length).toBe(0);
+	});
+
 	// AC1 (drop): a real give-up drop is nudged while budget remains.
 	it("AC1/AC7: a real give-up drop is nudged but a legitimate reset drop is not", async () => {
 		const cwd = await tempDir();

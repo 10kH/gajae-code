@@ -1,4 +1,4 @@
-import { Command } from "@gajae-code/utils/cli";
+import { Command, renderCommandHelp } from "@gajae-code/utils/cli";
 import { ensureWorkflowSettingsMigrated } from "../config/settings";
 import {
 	GJC_SESSION_FILE_ENV,
@@ -17,6 +17,13 @@ export default class Ultragoal extends Command {
 	static delegateHelp = true;
 
 	async run(): Promise<void> {
+		// A read-only help request must not perform the workflow-settings
+		// migration (which can create/drain agent.db, write config.yml, and
+		// retire legacy settings.json): render help before the trigger.
+		if (this.argv.includes("--help") || this.argv.includes("-h")) {
+			renderCommandHelp("gjc", "ultragoal", Ultragoal);
+			return;
+		}
 		await ensureWorkflowSettingsMigrated(process.cwd());
 		const isReviewStart = this.argv.includes("review") && this.argv.includes("review-start");
 		const shouldActivateGoalMode = isUltragoalCreateGoalsInvocation(this.argv);

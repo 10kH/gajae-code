@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { isSettingsInitialized, Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { deriveDeepInterviewHud } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
@@ -356,6 +357,7 @@ interface DeepInterviewSpecWriteSummary {
  */
 async function resolveConfiguredAmbiguityThreshold(
 	cwd: string,
+	agentDir?: string,
 ): Promise<{ threshold: number; source: string } | undefined> {
 	const resolution = await resolveWorkflowSetting(cwd, "gjc.deepInterview.ambiguityThreshold", {
 		defaultValue: DEFAULT_AMBIGUITY_THRESHOLD,
@@ -368,6 +370,10 @@ async function resolveConfiguredAmbiguityThreshold(
 			}
 			return { kind: "valid", value };
 		},
+		// The session's effective agent profile: an SDK session created with
+		// `createAgentSession({ agentDir })` resolves against that directory
+		// instead of the process-global default.
+		agentDir: agentDir ?? (isSettingsInitialized() ? Settings.instance.getAgentDir() : undefined),
 	});
 	if (resolution.source === "default") return undefined;
 	return { threshold: resolution.value, source: resolution.source };
@@ -471,7 +477,11 @@ async function resolveSpecWriteArgs(args: readonly string[], cwd: string): Promi
 	};
 }
 
-async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): Promise<ResolvedDeepInterviewArgs> {
+async function resolveDeepInterviewArgs(
+	args: readonly string[],
+	cwd: string,
+	agentDir?: string,
+): Promise<ResolvedDeepInterviewArgs> {
 	const session = resolveGjcSessionForWrite(cwd, {
 		flagValue: flagValue(args, "--session-id"),
 		envSessionId: process.env.GJC_SESSION_ID,
@@ -500,7 +510,7 @@ async function resolveDeepInterviewArgs(args: readonly string[], cwd: string): P
 		threshold = parsed;
 		thresholdSource = flagValue(args, "--threshold-source")?.trim() || "flag:--threshold";
 	} else {
-		const configured = await resolveConfiguredAmbiguityThreshold(cwd);
+		const configured = await resolveConfiguredAmbiguityThreshold(cwd, agentDir);
 		if (configured) {
 			threshold = configured.threshold;
 			thresholdSource = configured.source;
@@ -792,7 +802,11 @@ async function syncDeepInterviewHud(options: {
 	}
 }
 
-async function handleSpecWrite(args: readonly string[], cwd: string): Promise<DeepInterviewCommandResult> {
+async function handleSpecWrite(
+	args: readonly string[],
+	cwd: string,
+	agentDir?: string,
+): Promise<DeepInterviewCommandResult> {
 	const resolved = await resolveSpecWriteArgs(args, cwd);
 	const persisted = await persistDeepInterviewSpec(cwd, resolved);
 	const shouldHandoff = resolved.deliberate || resolved.handoff === "ralplan";
@@ -812,7 +826,7 @@ async function handleSpecWrite(args: readonly string[], cwd: string): Promise<De
 		const ralplanArgs = ["--deliberate", "--json"];
 		if (resolved.sessionId) ralplanArgs.push("--session-id", resolved.sessionId);
 		ralplanArgs.push(persisted.path);
-		const ralplanResult = await runNativeRalplanCommand(ralplanArgs, cwd);
+		const ralplanResult = await runNativeRalplanCommand(ralplanArgs, cwd, { agentDir });
 		if (ralplanResult.status !== 0) {
 			throw new DeepInterviewCommandError(
 				ralplanResult.status,
@@ -859,12 +873,13 @@ async function handleSpecWrite(args: readonly string[], cwd: string): Promise<De
 export async function runNativeDeepInterviewCommand(
 	args: string[],
 	cwd = process.cwd(),
+	options: { agentDir?: string } = {},
 ): Promise<DeepInterviewCommandResult> {
 	try {
 		const [firstArg, ...restArgs] = args;
 		if (isDeepInterviewStageVerb(firstArg)) return await runDeepInterviewStageCommand(firstArg, restArgs, cwd);
-		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd);
-		const resolved = await resolveDeepInterviewArgs(args, cwd);
+		if (isDeepInterviewSpecWriteInvocation(args)) return await handleSpecWrite(args, cwd, options.agentDir);
+		const resolved = await resolveDeepInterviewArgs(args, cwd, options.agentDir);
 		if (!resolved.idea) {
 			throw new DeepInterviewCommandError(
 				2,
