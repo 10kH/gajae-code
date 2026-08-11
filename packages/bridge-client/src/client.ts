@@ -8,6 +8,7 @@ export type SdkErrorCode =
 	| "timeout"
 	| "connection_closed"
 	| "endpoint_credential_forbidden"
+	| "uncertain_after_send"
 	| (string & {});
 
 export class SdkClientError extends Error {
@@ -44,6 +45,13 @@ export interface SdkRequestOptions {
 }
 
 export type SdkFrame = Record<string, unknown>;
+
+export interface SdkSentRecord {
+	readonly id: string;
+	readonly operation?: string;
+	readonly idempotencyKey?: string;
+	readonly fingerprint: string;
+}
 export type SdkFrameHandler = (frame: SdkFrame) => void;
 export type SdkReconnectHandler = () => void;
 export type SdkReconnectFailedHandler = (error: SdkClientError) => void;
@@ -114,6 +122,21 @@ function parseFrame(value: unknown): Frame {
 	throw new SdkClientError("protocol_error", "SDK server sent a malformed frame.");
 }
 
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
+
+function lifecycleFingerprint(operation: string, input: unknown): string {
+	return JSON.stringify({ operation, input: JSON.parse(JSON.stringify(input)) });
+}
+
 /** A transport-only v3 SDK WebSocket client with no host or session authority. */
 export class SdkClient {
 	readonly #url: string;
@@ -133,6 +156,7 @@ export class SdkClient {
 	#opening: Cycle | null = null;
 	#cycleGeneration = 0;
 	#incarnationGeneration = 0;
+	#sentRecords = new Map<string, SdkSentRecord>();
 	#pending = new Map<string, Pending>();
 	#frameHandlers = new Set<SdkFrameHandler>();
 	#reconnectHandlers = new Set<SdkReconnectHandler>();
@@ -212,6 +236,7 @@ export class SdkClient {
 	}
 	async #close(): Promise<void> {
 		this.#closed = true;
+
 		const transports = new Set<Incarnation>();
 		const cycle = this.#opening;
 		if (cycle) {
@@ -233,6 +258,7 @@ export class SdkClient {
 		for (const [id, pending] of this.#pending)
 			this.#settlePending(id, pending, new SdkClientError("connection_closed", "SDK client closed"));
 		await Promise.all([...transports].map(incarnation => this.#closeTransport(incarnation)));
+		this.#sentRecords.clear();
 	}
 
 	async control(
@@ -280,6 +306,27 @@ export class SdkClient {
 		);
 	}
 
+	getSentRecord(id: string): SdkSentRecord | undefined {
+		return this.#sentRecords.get(id);
+	}
+	#rememberSentRecord(record: SdkSentRecord): void {
+		this.#sentRecords.set(record.id, record);
+		while (this.#sentRecords.size > 256) this.#sentRecords.delete(this.#sentRecords.keys().next().value!);
+	}
+
+	async lookupLifecycle(record: SdkSentRecord, timeoutMs?: number): Promise<unknown> {
+		if (!record.operation || !record.idempotencyKey)
+			throw new SdkClientError("invalid_input", "A lifecycle sent record requires operation and idempotencyKey.");
+		return await this.#request(
+			{
+				type: "broker_request",
+				operation: "broker.lookup_lifecycle",
+				input: { operation: record.operation, fingerprint: record.fingerprint },
+			},
+			{ timeoutMs, idempotencyKey: record.idempotencyKey },
+		);
+	}
+
 	async #request(frame: Frame, options: SdkRequestOptions): Promise<unknown> {
 		if (this.#closed) throw new SdkClientError("connection_closed", "SDK client closed");
 		this.#throwIfDeadlineElapsed();
@@ -287,6 +334,13 @@ export class SdkClient {
 		const timeoutMs = this.#remainingTimeout(options.timeoutMs ?? this.#timeoutMs);
 		if (timeoutMs <= 0) throw this.#deadlineError();
 		const id = randomUUID();
+		const requestFrame = {
+			...frame,
+			id,
+			...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
+		};
+		const serializedRequest = JSON.stringify(requestFrame);
+		const serializedFrame = JSON.parse(serializedRequest) as Frame;
 		return await new Promise<unknown>((resolve, reject) => {
 			const pending: Pending = {
 				incarnation,
@@ -312,14 +366,17 @@ export class SdkClient {
 				return;
 			}
 			try {
-				incarnation.socket.send(
-					JSON.stringify({
-						...frame,
-						id,
-						...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
-					}),
-				);
+				incarnation.socket.send(serializedRequest);
 				pending.sent = true;
+				this.#rememberSentRecord({
+					id,
+					operation: typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined,
+					idempotencyKey: options.idempotencyKey,
+					fingerprint:
+						typeof serializedFrame.operation === "string"
+							? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
+							: canonicalJson(serializedFrame.input ?? {}),
+				});
 			} catch (error) {
 				this.#settlePending(
 					id,
@@ -643,8 +700,24 @@ export class SdkClient {
 		if (this.#pending.get(id) !== pending) return;
 		this.#pending.delete(id);
 		clearTimeout(pending.timer);
-		if (result instanceof Error) pending.reject(result);
-		else pending.resolve(result);
+		if (result instanceof Error) {
+			if (
+				pending.sent &&
+				result instanceof SdkClientError &&
+				(result.code === "timeout" || result.code === "connection_closed")
+			)
+				pending.reject(
+					new SdkClientError(
+						"uncertain_after_send",
+						"SDK request outcome is uncertain after the frame was sent.",
+						this.#sentRecords.get(id),
+					),
+				);
+			else pending.reject(result);
+		} else {
+			this.#sentRecords.delete(id);
+			pending.resolve(result);
+		}
 	}
 	#rejectPendingFor(incarnation: Incarnation, error: SdkClientError): void {
 		for (const [id, pending] of this.#pending)

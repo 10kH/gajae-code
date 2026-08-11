@@ -29,6 +29,9 @@ pub struct BrokerRequest {
 pub enum BrokerOperation {
 	#[serde(rename = "session.list")]
 	SessionList,
+	#[serde(rename = "broker.lookup_lifecycle")]
+	BrokerLookupLifecycle,
+
 	#[serde(rename = "session.get_endpoint")]
 	SessionGetEndpoint,
 	#[serde(rename = "session.create")]
@@ -43,7 +46,6 @@ pub enum BrokerOperation {
 	SessionDelete,
 }
 
-/// Global broker request result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerResponse {

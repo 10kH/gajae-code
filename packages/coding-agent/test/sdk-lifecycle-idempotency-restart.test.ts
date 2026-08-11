@@ -15,7 +15,14 @@ describe("SDK lifecycle ledger", () => {
 		expect((await resumed.begin("i", "a")).kind).toBe("replay");
 		expect((await resumed.begin("i", "b")).kind).toBe("idempotency_conflict");
 	});
-	it("retries a clean accepted row after restart", async () => {
+	it("recognizes pre-index legacy rows as ambiguous without making them migration authority", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		await ledger.begin("legacy-target-a", "request-a");
+		expect(ledger.hasLegacyIdentity()).toBe(true);
+		expect(ledger.findByOperationKey("session.create\0caller-key")).toBeUndefined();
+	});
+	it("re-admits a durably accepted row after restart before any effect starts", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-accepted-"));
 		const ledger = await new LifecycleLedger(dir).open();
 		await ledger.begin("i", "a");
@@ -26,7 +33,16 @@ describe("SDK lifecycle ledger", () => {
 		await resumed.transition("i", "terminal_ok", { response: { sessionId: "s" } });
 		expect((await new LifecycleLedger(dir).open()).get("i")?.state).toBe("terminal_ok");
 	});
-	it("seals a valid row missing its final newline before appending", async () => {
+	it("keeps effect_started as the retry lockout boundary", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-effect-started-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		await ledger.begin("i", "a");
+		await ledger.transition("i", "effect_started");
+
+		const resumed = await new LifecycleLedger(dir).open();
+		expect((await resumed.begin("i", "a")).kind).toBe("terminal_uncertain");
+	});
+	it("seals a valid accepted row missing its final newline and re-admits it", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-unsealed-"));
 		const ledgerPath = path.join(dir, "sdk", "lifecycle-ledger.jsonl");
 		const ledger = await new LifecycleLedger(dir).open();
@@ -410,4 +426,103 @@ it("quarantines terminal-uncertain replay rows with corrupt response or durable-
 	expect((await reopened.begin("response", "request-response")).kind).toBe("terminal_uncertain");
 	expect((await reopened.begin("effects", "request-effects")).kind).toBe("terminal_uncertain");
 	expect(await fs.readFile(path.join(dir, "sdk", "lifecycle-ledger.jsonl.corrupt"), "utf8")).toContain("corrupt");
+});
+
+describe("SDK lifecycle reconciliation lookup (broker.lookup_lifecycle)", () => {
+	it("replays the original terminal_ok BrokerResponse instead of a lookup envelope", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-lookup-ok-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		const originalResponse = { ok: true, result: { sessionId: "session-123" } };
+		await ledger.begin("id-1", "hash-1", {
+			operationKey: "session.create\0key-1",
+			fingerprint: '{"operation":"session.create","input":{}}',
+		});
+		await ledger.transition("id-1", "terminal_ok", { response: originalResponse });
+
+		const entry = ledger.get("id-1");
+		expect(entry).toBeDefined();
+		expect(entry?.state).toBe("terminal_ok");
+		// The broker returns entry.response (the original BrokerResponse) on terminal_ok,
+		// NOT a lookup-shaped {ok:true, result:{operation,state,...}} envelope.
+		expect(entry?.response).toEqual(originalResponse);
+	});
+
+	it("replays the original terminal_error BrokerResponse instead of a lookup envelope", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-lookup-err-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		const errorResponse = { ok: false, error: { code: "workspace_deleted", message: "nope" } };
+		await ledger.begin("id-2", "hash-2", {
+			operationKey: "session.close\0key-2",
+			fingerprint: '{"operation":"session.close","input":{}}',
+		});
+		await ledger.transition("id-2", "terminal_error", { response: errorResponse });
+
+		const entry = ledger.get("id-2");
+		expect(entry?.state).toBe("terminal_error");
+		expect(entry?.response).toEqual(errorResponse);
+	});
+
+	it("returns terminal_uncertain as a BrokerResponse error, not as a lookup envelope", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-lookup-uncertain-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		await ledger.begin("id-3", "hash-3", {
+			operationKey: "session.create\0key-3",
+			fingerprint: '{"operation":"session.create","input":{}}',
+		});
+		await ledger.transition("id-3", "terminal_uncertain");
+
+		const entry = ledger.get("id-3");
+		expect(entry?.state).toBe("terminal_uncertain");
+		// The broker endpoint returns {ok:false, error:{code:"terminal_uncertain"}} for
+		// terminal_uncertain state — callers throw this rather than silently returning it.
+		expect(entry?.response).toBeUndefined();
+	});
+});
+
+describe("SDK lifecycle legacy identity retirement", () => {
+	it("retires a legacy identity after migration so unrelated requests are not globally blocked", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-retire-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		// Simulate a pre-index legacy row (no operationKey/fingerprint metadata).
+		await ledger.begin("legacy-target-a", "request-a");
+		expect(ledger.hasLegacyIdentity()).toBe(true);
+
+		// Migrate the legacy identity to the new operation/key-based identity.
+		const migrated = await ledger.migrateIdentity("legacy-target-a", "new-identity-a", {
+			operationKey: "session.create\0caller-key-a",
+			fingerprint: '{"operation":"session.create","input":{}}',
+		});
+		expect(migrated).toBeDefined();
+		expect(migrated?.identity).toBe("new-identity-a");
+		expect(migrated?.operationKey).toBe("session.create\0caller-key-a");
+
+		// The legacy identity is now retired: hasLegacyIdentity() must be false.
+		expect(ledger.hasLegacyIdentity()).toBe(false);
+
+		// A fresh unrelated lifecycle request (different operation, different key)
+		// must succeed without hitting idempotency_conflict from the legacy row.
+		const fresh = await ledger.begin("new-identity-b", "request-b", {
+			operationKey: "session.close\0caller-key-b",
+			fingerprint: '{"operation":"session.close","input":{}}',
+		});
+		expect(fresh.kind).toBe("new");
+	});
+
+	it("is idempotent: repeated migration of the same legacy identity is a no-op", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-ledger-legacy-idempotent-"));
+		const ledger = await new LifecycleLedger(dir).open();
+		await ledger.begin("legacy-target-c", "request-c");
+
+		const metadata = {
+			operationKey: "session.create\0caller-key-c",
+			fingerprint: '{"operation":"session.create","input":{}}',
+		};
+		const first = await ledger.migrateIdentity("legacy-target-c", "new-identity-c", metadata);
+		expect(first).toBeDefined();
+
+		// Second migration: the new identity already exists, so it returns early.
+		const second = await ledger.migrateIdentity("legacy-target-c", "new-identity-c", metadata);
+		expect(second?.identity).toBe("new-identity-c");
+		expect(ledger.hasLegacyIdentity()).toBe(false);
+	});
 });

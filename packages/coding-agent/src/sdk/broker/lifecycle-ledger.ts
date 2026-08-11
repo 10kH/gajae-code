@@ -66,6 +66,8 @@ export interface LifecycleDurableEffectsReceipt {
 }
 
 export interface LifecycleLedgerEntry {
+	operationKey?: string;
+	fingerprint?: string;
 	version: typeof SDK_STATE_VERSION;
 	identity: string;
 	requestHash: string;
@@ -153,7 +155,9 @@ function isLifecycleLedgerEntry(value: unknown): value is LifecycleLedgerEntry {
 			entry.state === "terminal_error" ||
 			entry.state === "terminal_uncertain") &&
 		typeof entry.ts === "number" &&
-		Number.isSafeInteger(entry.ts)
+		Number.isSafeInteger(entry.ts) &&
+		(entry.operationKey === undefined || typeof entry.operationKey === "string") &&
+		(entry.fingerprint === undefined || typeof entry.fingerprint === "string")
 	);
 }
 function canonicalJson(value: unknown): string {
@@ -661,6 +665,35 @@ export class LifecycleLedger {
 		}
 		return replacement !== undefined;
 	}
+	findByOperationKey(operationKey: string): LifecycleLedgerEntry | undefined {
+		return [...this.#byIdentity.values()].find(entry => entry.operationKey === operationKey);
+	}
+	/**
+	 * Legacy target-inclusive rows predate the operation/key index. Their opaque
+	 * identities cannot establish that a different target is safe, so callers
+	 * must reject rather than create a second admission.
+	 */
+	hasLegacyIdentity(): boolean {
+		return [...this.#byIdentity.values()].some(entry => entry.operationKey === undefined);
+	}
+	async migrateIdentity(
+		from: string,
+		to: string,
+		metadata: { operationKey: string; fingerprint: string },
+	): Promise<LifecycleLedgerEntry | undefined> {
+		return this.#mutate(async () => {
+			if (this.#byIdentity.has(to)) return this.#byIdentity.get(to);
+			const entry = this.#byIdentity.get(from);
+			if (!entry) return undefined;
+			const migrated = await this.#append({ ...entry, identity: to, ...metadata, ts: Date.now() });
+			// Retire the legacy row so hasLegacyIdentity() returns false and future
+			// unrelated lifecycle requests are not globally blocked. The legacy
+			// identity gets a metadata-bearing replacement row in the append-only
+			// log, superseding the original metadata-free entry in #byIdentity.
+			if (entry.operationKey === undefined) await this.#append({ ...entry, ...metadata, ts: Date.now() });
+			return migrated;
+		});
+	}
 	get warnings(): readonly string[] {
 		return this.#warnings;
 	}
@@ -687,11 +720,19 @@ export class LifecycleLedger {
 		this.#byteCount += line.length;
 		return entry;
 	}
-	async begin(identity: string, requestHash: string): Promise<BeginResult> {
-		return this.#mutate(async () => this.#begin(identity, requestHash));
+	async begin(
+		identity: string,
+		requestHash: string,
+		metadata: { operationKey?: string; fingerprint?: string } = {},
+	): Promise<BeginResult> {
+		return this.#mutate(async () => this.#begin(identity, requestHash, metadata));
 	}
 
-	async #begin(identity: string, requestHash: string): Promise<BeginResult> {
+	async #begin(
+		identity: string,
+		requestHash: string,
+		metadata: { operationKey?: string; fingerprint?: string },
+	): Promise<BeginResult> {
 		const prior = this.#byIdentity.get(identity);
 		if (!prior)
 			return {
@@ -700,15 +741,24 @@ export class LifecycleLedger {
 					version: SDK_STATE_VERSION,
 					identity,
 					requestHash,
+					operationKey: metadata.operationKey,
+					fingerprint: metadata.fingerprint,
 					state: "accepted",
 					ts: Date.now(),
 				}),
 			};
-		if (prior.requestHash !== requestHash) return { kind: "idempotency_conflict" };
+		if (
+			prior.requestHash !== requestHash ||
+			(prior.operationKey !== undefined &&
+				metadata.operationKey !== undefined &&
+				prior.operationKey !== metadata.operationKey)
+		)
+			return { kind: "idempotency_conflict" };
 		if (terminal(prior.state) || (prior.state === "effect_started" && this.#isCleanupPending(prior)))
 			return { kind: "replay", entry: prior };
 		if (prior.state === "terminal_uncertain") return { kind: "terminal_uncertain", entry: prior };
-		// An accepted row has no durable side effect. Target serialization makes retrying it safe.
+		// Accepted proves admission only. The effect_started marker is the boundary
+		// after which retrying the operation is unsafe.
 		if (prior.state === "accepted") return { kind: "new", entry: prior };
 		return { kind: "in_progress", entry: prior };
 	}
