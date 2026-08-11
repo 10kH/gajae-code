@@ -12,7 +12,15 @@ Use the smallest surface that fits your bot:
 | --- | --- | --- | --- |
 | Coordinator MCP | Any external controller that can discover SDK-backed sessions, send turns, answer questions, and read artifacts. | `gjc mcp-serve coordinator` | Preferred orchestration surface. `gjc mcp-serve hermes` is a compatibility alias, not a separate contract. |
 | Setup adapter | Rendering a portable MCP config and operator instructions for a controller profile. | `gjc setup hermes --root /path/to/repo` | Compatibility-oriented config renderer; does not call an LLM or validate provider credentials. |
+<<<<<<< HEAD
 | Daemon session CLI | Scripted control and queries against a live session with JSON output. | `gjc daemon session list\|control\|query\|global` | Broker-backed, core-owned lifecycle access that never exposes endpoint credentials or a raw transport client. |
+||||||| d5b782d8dd
+| SDK WebSocket | A controller that drives one live session directly: state queries, events, actions, and workflow-gate replies. | Connect to the session's loopback SDK endpoint (see [`docs/sdk.md`](./sdk.md)) | The canonical machine interface. `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. |
+| Daemon session CLI | Scripted control/queries against a live session with JSON output. | `gjc daemon session list\|control\|query\|global` | A pure SDK client; honors the same protocol and dispositions. |
+=======
+| SDK WebSocket | A controller that drives one live session directly: state queries, events, actions, and workflow-gate replies. | Connect to the session's loopback SDK endpoint (see [`docs/sdk.md`](./sdk.md)) | The canonical machine interface. `--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. |
+| SDK session CLI | Broker-bound semantic session operations and explicit raw SDK dispatch with JSON output. | `gjc sdk session list|inspect|send|status|tail|elevate` or `gjc sdk session raw control|query|global` | Resolves authority through the broker and never renders endpoint credentials by default. |
+>>>>>>> origin/dev
 
 ## Recommended architecture
 
@@ -320,8 +328,44 @@ Artifact paths are canonicalized, symlink escapes are rejected, and output is by
 
 Bots must attach through a managed SDK-core adapter backed by `SessionRouter`. Do not read `.gjc/state/sdk` endpoint records, retain URL/token credentials, or open raw per-session WebSockets. `SessionRouter` owns endpoint resolution, credentials, replay, reconnect, rotation, and exact opaque attachment authority; provider code owns only transport and presentation state.
 
+<<<<<<< HEAD
 Use the Telegram, Discord, or Slack managed adapter for a single live session. Use Coordinator MCP for multi-session orchestration, artifacts, status, and durable workflow-gate operations. Lifecycle mutations always enter `SessionLifecycleService` and the Broker ledger with a stable idempotency identity.
 The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+||||||| d5b782d8dd
+Key SDK workflow-gate facts:
+- The discovery file carries the endpoint URL and per-session token; a wrong
+  token is rejected at the WebSocket handshake. `server_hello` marks a
+  connection ready, and `gjc daemon session control|query|global` uses the same
+  protocol for shell scripts.
+
+- `action_needed.id` is an opaque, transient presentation ID. It is the only
+  generic `reply.id` authority. Do not equate it with a durable workflow gate.
+- A durable workflow-gate presentation optionally includes additive SDK v3 `workflowGateId`. It correlates to Q12's durable `gate_id` only within `(sessionId, workflowGateId)` on the current authenticated endpoint; it never authorizes generic reply.
+- `workflow.gate_answer` and `workflow.plan_approve` use the durable `gate_id`. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 clients continue to work, but new clients must send it. Mandatory enforcement or removal may occur no earlier than SDK v4 and only after at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before resolution.
+- One session has one active answerable presentation. Additional Q12 gates stay queued while Q12 exposes durable pending records and additive SDK v3 diagnostics. A same-server reconnect replays the active action ID; a process restart quarantines old records and a rebuilt workflow remints fresh gate and presentation IDs.
+- A native generic reply claim wins a direct-control race once acquired; a direct control wins only by atomically retiring the exact unclaimed active presentation. Terminal, stale, and reissued action IDs never regain authority. Do not use text, option/order, durable-ID, or history heuristics, and fail closed rather than guess when identity is unsafe or ambiguous. Do not persist private route/claim/receipt/epoch/generation state.
+- Rust/N-API compatibility is additive: legacy `ActionNeeded`, `register_ask`,
+  and `registerAsk` stay uncorrelated; explicit workflow reader/registration
+  APIs preserve correlation without exposing private arbitration state.
+- The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+=======
+Key SDK workflow-gate facts:
+- The discovery file carries the endpoint URL and per-session token; a wrong
+  token is rejected at the WebSocket handshake. `server_hello` marks a
+  connection ready, and `gjc sdk session raw control|query|global` uses the same
+  protocol for shell scripts.
+
+- `action_needed.id` is an opaque, transient presentation ID. It is the only
+  generic `reply.id` authority. Do not equate it with a durable workflow gate.
+- A durable workflow-gate presentation optionally includes additive SDK v3 `workflowGateId`. It correlates to Q12's durable `gate_id` only within `(sessionId, workflowGateId)` on the current authenticated endpoint; it never authorizes generic reply.
+- `workflow.gate_answer` and `workflow.plan_approve` use the durable `gate_id`. `expectedSessionId` omission remains accepted and audited for the entire SDK v3 line so deployed v3 clients continue to work, but new clients must send it. Mandatory enforcement or removal may occur no earlier than SDK v4 and only after at least one full published deprecation release/window with deployed-client notice. A supplied session mismatch is rejected before resolution.
+- One session has one active answerable presentation. Additional Q12 gates stay queued while Q12 exposes durable pending records and additive SDK v3 diagnostics. A same-server reconnect replays the active action ID; a process restart quarantines old records and a rebuilt workflow remints fresh gate and presentation IDs.
+- A native generic reply claim wins a direct-control race once acquired; a direct control wins only by atomically retiring the exact unclaimed active presentation. Terminal, stale, and reissued action IDs never regain authority. Do not use text, option/order, durable-ID, or history heuristics, and fail closed rather than guess when identity is unsafe or ambiguous. Do not persist private route/claim/receipt/epoch/generation state.
+- Rust/N-API compatibility is additive: legacy `ActionNeeded`, `register_ask`,
+  and `registerAsk` stay uncorrelated; explicit workflow reader/registration
+  APIs preserve correlation without exposing private arbitration state.
+- The `@gajae-code/coding-agent` runtime and `@gajae-code/natives` native addon ship from the same source release at exact matching package versions; the native loader version sentinel enforces the pair. Mixed native/runtime versions are unsupported and cannot claim SDK compatibility.
+>>>>>>> origin/dev
 
 The prior documented invariant `action_needed.id == gate_id` is incorrect for
 v3 and must not be implemented by controllers. See [`docs/sdk.md`](./sdk.md)
