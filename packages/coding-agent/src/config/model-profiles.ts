@@ -134,6 +134,27 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		critic: "gpt-5.6-luna:xhigh",
 		architect: "gpt-5.6-luna:xhigh",
 	}),
+	profile("open-weights-spark", [], {
+		default: "muse-spark-1.2:medium",
+		executor: "muse-spark-1.2:low",
+		planner: "muse-spark-1.2:high",
+		critic: "muse-spark-1.2:high",
+		architect: "muse-spark-1.2:xhigh",
+	}),
+	profile("open-weights-spark-deepseek", [], {
+		default: "muse-spark-1.2:medium",
+		executor: "deepseek-v4-flash:high",
+		planner: "muse-spark-1.2:high",
+		critic: "muse-spark-1.2:high",
+		architect: "muse-spark-1.2:xhigh",
+	}),
+	profile("open-weights-spark-luna", [], {
+		default: "muse-spark-1.2:medium",
+		executor: "gpt-5.6-luna:high",
+		planner: "muse-spark-1.2:high",
+		critic: "muse-spark-1.2:high",
+		architect: "muse-spark-1.2:xhigh",
+	}),
 	profile("open-weights-glm-deepseek", [], {
 		default: "glm-5.2:medium",
 		executor: "deepseek-v4-flash:high",
@@ -444,6 +465,15 @@ const PROFILE_PRESENTATION: Record<string, ModelProfilePresentation> = {
 	},
 	"open-weights-kimi": { displayName: "Kimi", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
 	"open-weights-luna": { displayName: "Luna", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
+	"open-weights-spark": { displayName: "Muse Spark", providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)" },
+	"open-weights-spark-deepseek": {
+		displayName: "Muse Spark + DeepSeek",
+		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	},
+	"open-weights-spark-luna": {
+		displayName: "Muse Spark + Luna",
+		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
+	},
 	"open-weights-glm-deepseek": {
 		displayName: "GLM + DeepSeek",
 		providerGroup: "OPEN WEIGHT MODELS (PROVIDER AGNOSTIC)",
@@ -518,6 +548,9 @@ const OPEN_WEIGHT_PROFILE_ORDER = [
 	"open-weights-deepseek",
 	"open-weights-kimi",
 	"open-weights-luna",
+	"open-weights-spark",
+	"open-weights-spark-deepseek",
+	"open-weights-spark-luna",
 	"open-weights-glm-deepseek",
 	"open-weights-kimi-deepseek",
 	"open-weights-kimi-glm",
