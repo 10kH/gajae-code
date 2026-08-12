@@ -107,7 +107,8 @@ describe("injectMuseSparkModels", () => {
 				api: "openai-completions",
 				reasoning: true,
 				contextWindow: 1_048_576,
-				maxTokens: 1_048_576,
+				maxTokens: 131_072,
+				input: ["text", "image"],
 				thinking: {
 					mode: "effort",
 					minLevel: "minimal",

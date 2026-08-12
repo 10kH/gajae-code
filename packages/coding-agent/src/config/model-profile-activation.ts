@@ -572,7 +572,9 @@ function rewriteSelectorForProxy(
 	const proxyModels = allModels.filter(model => model.provider === proxyProvider);
 	if (slash < 0) {
 		if (proxyMode === "fallback") return selector;
-		const matches = proxyModels.filter(model => model.id === baseSelector);
+		const exactMatches = proxyModels.filter(model => model.id === baseSelector);
+		const finalSegmentMatches = proxyModels.filter(model => model.id.split("/").at(-1) === baseSelector);
+		const matches = exactMatches.length > 0 ? exactMatches : finalSegmentMatches;
 		if (matches.length !== 1) {
 			throw new Error(
 				`Configured proxy "${proxyProvider}" does not expose an unambiguous model for "${baseSelector}"`,

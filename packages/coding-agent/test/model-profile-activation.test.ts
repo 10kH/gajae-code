@@ -2266,6 +2266,56 @@ describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
 		expect(prepared.defaultChain).toEqual(["litellm/grok-4.3:medium"]);
 	});
 
+	test("routes Muse Spark's bare alias through a unique provider-prefixed proxy model in always mode", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "open-weights-spark");
+		if (!profile) throw new Error("Missing open-weights-spark profile");
+		const registry = proxyRegistry({ profiles: [profile] });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: {
+				...registry,
+				getAll: () => [
+					...registry.getAll(),
+					proxyModel("meta/muse-spark-1.2", {
+						mode: "effort",
+						minLevel: ThinkingLevel.Minimal,
+						maxLevel: ThinkingLevel.XHigh,
+					}),
+				],
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
+			profileName: profile.name,
+		});
+
+		expect(prepared.defaultChain).toEqual(["litellm/meta/muse-spark-1.2:medium"]);
+		expect(prepared.agentModelOverrides.architect).toBe("litellm/meta/muse-spark-1.2:xhigh");
+	});
+
+	test("fails closed when multiple provider-prefixed proxy models share the Muse Spark alias", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "open-weights-spark");
+		if (!profile) throw new Error("Missing open-weights-spark profile");
+		const registry = proxyRegistry({ profiles: [profile] });
+
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: {
+					...registry,
+					getAll: () => [
+						...registry.getAll(),
+						proxyModel("meta/muse-spark-1.2"),
+						proxyModel("other/muse-spark-1.2"),
+					],
+				} as unknown as ModelRegistry,
+				settings: Settings.isolated({
+					"modelProfile.proxyProvider": "litellm",
+					"modelProfile.proxyMode": "always",
+				}),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(/does not expose an unambiguous model for "muse-spark-1\.2"/);
+	});
+
 	test("fails closed pointing at the proxy when a routable provider is missing and the proxy is unauthenticated", async () => {
 		const settings = Settings.isolated({ "modelProfile.proxyProvider": "litellm" });
 		await expect(

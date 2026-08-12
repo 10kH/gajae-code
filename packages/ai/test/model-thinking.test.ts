@@ -726,7 +726,7 @@ describe("model thinking runtime helpers", () => {
 				input: ["text", "image"],
 				cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
 				contextWindow: 1_048_576,
-				maxTokens: 1_048_576,
+				maxTokens: 131_072,
 			},
 		];
 
