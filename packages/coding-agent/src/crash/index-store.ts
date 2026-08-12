@@ -491,7 +491,7 @@ export async function recordCrashStateEvent(
 	const paths = options.paths ?? resolveCrashStatePaths();
 	await fs.mkdir(path.dirname(paths.events), { recursive: true, mode: 0o700 });
 	appendCrashEvent(event, paths.events);
-	return compactCrashIndex({ paths, now: options.now });
+	return compactCrashIndex({ paths, now: options.now ?? event.at });
 }
 
 export interface CrashSignatureView extends CrashSignatureEntry {
