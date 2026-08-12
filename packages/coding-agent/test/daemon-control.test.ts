@@ -1949,6 +1949,23 @@ describe("ChatDaemonController ownership safety", () => {
 			expect(spawns).toBe(0);
 		});
 
+		test("acknowledges an update-recovery restart while globally disabled without spawning delivery", async () => {
+			const agentDir = tempAgentDir();
+			const settings = configuredSettings(agentDir);
+			settings.set("notifications.enabled", false);
+			let spawns = 0;
+			const controller = new ChatDaemonController(settings, kind, {
+				spawn: () => {
+					spawns++;
+					return { unref() {} };
+				},
+			});
+			const result = await controller.reload({ allowDisabledNoop: true });
+			expect(result.ok).toBe(true);
+			expect(result.message).toContain("leaving daemon stopped");
+			expect(spawns).toBe(0);
+		});
+
 		test.each([
 			["lower", chatDaemonGeneration(kind) - 1, "owner_spawned", "stale"],
 			["equal", chatDaemonGeneration(kind), "attached", "running"],

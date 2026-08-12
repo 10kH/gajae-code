@@ -570,9 +570,18 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		const warnings = before.runtime.warning ? [before.runtime.warning] : [];
 		if (!before.configured)
 			return this.result(action, false, `${this.kind} notifications are not configured`, before, before, warnings);
-		if (action === "reload" && !this.effectivelyEnabled()) {
+		if (action === "reload" && !this.effectivelyEnabled() && !opts.allowDisabledNoop) {
 			return this.result(action, false, `${this.kind} notifications are not enabled`, before, before, warnings);
 		}
+		if (action === "reload" && !this.effectivelyEnabled())
+			return this.result(
+				action,
+				true,
+				`${this.kind} notifications are disabled; leaving daemon stopped`,
+				before,
+				before,
+				warnings,
+			);
 		const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
 		const classification = this.classify(state, this.identity());
 		if (classification === "newer")

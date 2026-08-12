@@ -1,5 +1,5 @@
 /**
- * Manage GJC background daemons (status/list/stop/reload).
+ * Manage GJC background daemons (status/list/stop/restart).
  */
 import { Args, CliParseError, Command, Flags } from "@gajae-code/utils/cli";
 import {

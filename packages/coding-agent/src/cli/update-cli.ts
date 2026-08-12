@@ -784,6 +784,8 @@ export interface UpdateCommandDependencies {
 	exit?: (code: number) => never;
 }
 
+export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
+
 /**
  * A complete, non-quarantined provider with provider-level desired intent is a
  * durable managed-notify setup. The global switch is deliberately excluded:
@@ -820,7 +822,7 @@ async function restartManagedDaemon(settings: Settings): Promise<void> {
 	const kinds = managedNotifyDaemonKinds(settings);
 	let failed = false;
 	await runDaemonCommand(
-		{ action: "restart", kinds, all: false, json: false, force: false },
+		{ action: "restart", kinds, all: false, json: false, force: false, allowDisabledNoop: true },
 		{
 			settings,
 			setExitCode: code => {
@@ -835,14 +837,21 @@ async function recoverManagedNotifications(settings: Settings): Promise<void> {
 	await runNotifyCommand({ action: "recovery", rawArgs: [], forceDaemonLock: false }, { settings });
 }
 
-async function runPostUpdateRecovery(runtimePath: string): Promise<void> {
-	const child = Bun.spawn([runtimePath, "update", "update-recovery"], {
-		stdin: "inherit",
-		stdout: "inherit",
-		stderr: "inherit",
-	});
-	const exitCode = await child.exited;
+async function spawnPostUpdateRecovery(argv: string[]): Promise<number> {
+	const child = Bun.spawn(argv, { stdin: "inherit", stdout: "inherit", stderr: "inherit" });
+	return await child.exited;
+}
+
+export async function runPostUpdateRecoveryForTest(
+	runtimePath: string,
+	spawn: PostUpdateRecoverySpawn = spawnPostUpdateRecovery,
+): Promise<void> {
+	const exitCode = await spawn([runtimePath, "update", "update-recovery"]);
 	if (exitCode !== 0) throw new Error(`the verified installed runtime exited ${exitCode}`);
+}
+
+async function runPostUpdateRecovery(runtimePath: string): Promise<void> {
+	await runPostUpdateRecoveryForTest(runtimePath);
 }
 
 export async function runManagedNotifyRecovery(

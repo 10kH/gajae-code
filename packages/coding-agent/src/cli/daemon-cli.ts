@@ -49,6 +49,7 @@ export interface DaemonCommandArgs {
 	gracefulTimeoutMs?: number;
 	killTimeoutMs?: number;
 	spawnIfStopped?: boolean;
+	allowDisabledNoop?: boolean;
 	smoke?: boolean;
 	ownerId?: string;
 	agentDir?: string;
@@ -148,6 +149,7 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 		killTimeoutMs: cmd.killTimeoutMs,
 		force: cmd.force,
 		spawnIfStopped: cmd.spawnIfStopped,
+		allowDisabledNoop: cmd.allowDisabledNoop,
 	};
 	const results: DaemonOperationResult[] = [];
 	for (const controller of controllers) {

@@ -22,6 +22,7 @@ import {
 	runBinaryUpdateFlow,
 	runManagedNotifyRecovery,
 	runPackageManagerUpdateForTest,
+	runPostUpdateRecoveryForTest,
 	runUpdateCommand,
 } from "../src/cli/update-cli";
 import { Settings } from "../src/config/settings";
@@ -511,6 +512,18 @@ describe("update-cli managed notification recovery", () => {
 			...overrides,
 		} as never);
 	}
+
+	it("executes recovery through the verified runtime with an argv array and propagates nonzero exits", async () => {
+		const argv: Array<readonly string[]> = [];
+		await runPostUpdateRecoveryForTest("/verified path/gjc;not-a-shell", async args => {
+			argv.push(args);
+			return 0;
+		});
+		expect(argv).toEqual([["/verified path/gjc;not-a-shell", "update", "update-recovery"]]);
+		await expect(runPostUpdateRecoveryForTest("/verified/gjc", async () => 23)).rejects.toThrow(
+			"the verified installed runtime exited 23",
+		);
+	});
 
 	it("uses canonical global provider completeness, including globally disabled configured credentials", () => {
 		expect(hasManagedNotifySetup(Settings.isolated())).toBe(false);
