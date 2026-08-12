@@ -38,6 +38,23 @@ describe("redactImageProviderText", () => {
 		expect(result).not.toContain("mysecret1234567890abcdef1234");
 	});
 
+	it("redacts JSON credential fields without suppressing neighboring diagnostics", () => {
+		const result = redactImageProviderText(
+			'{"error":"bad request","x-api-key":"test-secret-1234567890","request_id":"req_123"}',
+		);
+		expect(result).toContain('"error":"bad request"');
+		expect(result).toContain('"request_id":"req_123"');
+		expect(result).toContain('"x-api-key":[redacted]');
+		expect(result).not.toContain("test-secret-1234567890");
+	});
+
+	it("redacts exact active keys across multibyte chunk-like separators", () => {
+		const key = "active-secret-1234567890";
+		const result = redactImageProviderText(`provider said ${key.slice(0, 9)}\u200b${key.slice(9)} after ☃`, key);
+		expect(result).toContain("after ☃");
+		expect(result).not.toContain("active-secret");
+	});
+
 	it("truncates very long text", () => {
 		const longText = "x".repeat(8192);
 		const result = redactImageProviderText(longText);
