@@ -69,7 +69,7 @@ const KNOWN_MANIFEST_KEYS = new Set([
  * `mcps` entry (`type` is Claude Code / loose mcp.json vocabulary for the
  * canonical `transport` field).
  */
-const MCP_SERVER_ALIAS_KEYS = new Set(["type", "command", "args", "cwd", "url", "headers"]);
+const MCP_SERVER_ALIAS_KEYS = new Set(["type", "command", "args", "cwd", "url"]);
 
 /**
  * Per-server keys that exist in GJC's loose mcp.json surface but have NO
@@ -81,6 +81,7 @@ const MCP_SERVER_ALIAS_UNSUPPORTED_KEYS = [
 	"env",
 	"auth",
 	"oauth",
+	"headers",
 	"enabled",
 	"timeout",
 	"autoload",
@@ -245,7 +246,7 @@ function parseHooks(value: unknown, manifestPath: string): GjcPluginHookManifest
 		// constrained file with a declared event. The shapes cannot be mapped
 		// onto each other, so give the author a targeted migration diagnostic
 		// instead of a generic missing-field error.
-		if (isRecord(entry) && !("name" in entry) && (("matcher" in entry && "hooks" in entry) || "source" in entry)) {
+		if (isRecord(entry) && ("matcher" in entry || "hooks" in entry || "source" in entry)) {
 			throw new GjcPluginLoadError(
 				"invalid_manifest",
 				`Invalid GJC plugin manifest at ${manifestPath}: hooks[${index}] looks like a Claude Code plugin.json hook entry ({ matcher, hooks, source }), which cannot be preserved as a GJC bundle hook. Canonical GJC bundle hooks are { name, event, target?, phase?, path, sha256? } (event "tool_call"/"tool_result" with target/phase, or a session event). For unconstrained local hooks, use the loose surface .gjc/hooks/pre/<tool>.ts / .gjc/hooks/post/<tool>.ts.`,
@@ -335,7 +336,7 @@ function parseMcps(value: unknown, manifestPath: string): GjcPluginMcpManifestEn
  * Claude Code / Codex-familiar `mcpServers` map (server name -> server config),
  * normalized into the canonical `mcps` array. Only fields with an unambiguous
  * canonical equivalent are accepted; anything the canonical `mcps` entry cannot
- * preserve (env, auth, oauth, enablement/timeout/autoload controls, unknown
+ * preserve (env, auth, oauth, headers, enablement/timeout/autoload controls, unknown
  * keys) raises a targeted migration diagnostic naming the exact alternative.
  */
 function normalizeMcpServersAlias(value: unknown, manifestPath: string): GjcPluginMcpManifestEntry[] {
@@ -346,7 +347,8 @@ function normalizeMcpServersAlias(value: unknown, manifestPath: string): GjcPlug
 		);
 	}
 	const entries: GjcPluginMcpManifestEntry[] = [];
-	for (const [serverName, rawEntry] of Object.entries(value)) {
+	const serverEntries = Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	for (const [serverName, rawEntry] of serverEntries) {
 		if (!isRecord(rawEntry)) {
 			throw new GjcPluginLoadError(
 				"invalid_manifest",
@@ -357,7 +359,7 @@ function normalizeMcpServersAlias(value: unknown, manifestPath: string): GjcPlug
 			if ((MCP_SERVER_ALIAS_UNSUPPORTED_KEYS as readonly string[]).includes(key)) {
 				throw new GjcPluginLoadError(
 					"unsupported_surface",
-					`mcpServers["${serverName}"] uses "${key}", which the canonical GJC "mcps" entry cannot preserve. "${key}" is supported by GJC's loose MCP surface (mcpServers map in .gjc/mcp.json, mcp.json, or .mcp.json): move this server there, or drop "${key}" from the bundle manifest (${manifestPath})`,
+					`mcpServers["${serverName}"] uses "${key}", which the canonical GJC bundle runtime cannot preserve end to end. "${key}" is supported by GJC's canonical loose MCP surface (mcpServers map in <project>/.gjc/mcp.json or ~/.gjc/agent/mcp.json): move this server there directly or through the /extensions import flow, or drop "${key}" from the bundle manifest (${manifestPath})`,
 				);
 			}
 			if (!MCP_SERVER_ALIAS_KEYS.has(key)) {
@@ -395,12 +397,21 @@ function normalizeMcpServersAlias(value: unknown, manifestPath: string): GjcPlug
 				`Invalid GJC plugin manifest at ${manifestPath}: mcpServers["${serverName}"] cannot determine a transport. Set "type" (stdio | http | sse), or provide "command" (stdio) or "url" (http)`,
 			);
 		}
+		const incompatibleKeys = transport === "stdio" ? ["url"] : ["command", "args", "cwd"];
+		for (const key of incompatibleKeys) {
+			if (rawEntry[key] !== undefined) {
+				throw new GjcPluginLoadError(
+					"unsupported_surface",
+					`mcpServers["${serverName}"] uses "${key}" with transport "${transport}", but the GJC bundle runtime cannot preserve that field for this transport. Use only command/args/cwd for stdio or url for http/sse, or move the server to the canonical loose .gjc/mcp.json surface (${manifestPath})`,
+				);
+			}
+		}
 		entries.push(
 			parseMcpEntry(
 				{
 					name: serverName,
 					transport,
-					...pickOptional(rawEntry, ["command", "args", "cwd", "url", "headers"]),
+					...pickOptional(rawEntry, ["command", "args", "cwd", "url"]),
 				},
 				`mcpServers["${serverName}"]`,
 				manifestPath,
@@ -413,7 +424,8 @@ function normalizeMcpServersAlias(value: unknown, manifestPath: string): GjcPlug
 function pickOptional(entry: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> {
 	const out: Record<string, unknown> = {};
 	for (const key of keys) {
-		if (entry[key] !== undefined) out[key] = entry[key];
+		const value = entry[key];
+		if (value !== undefined) out[key] = value;
 	}
 	return out;
 }

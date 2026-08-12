@@ -19,6 +19,7 @@ import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import {
 	applyGjcBundleUpdate,
 	assertMcpInstallPolicy,
+	buildPluginMcpConfigs,
 	compileGjcPluginBundle,
 	GjcPluginLoadError,
 	type GjcPluginMcpManifestEntry,
@@ -84,7 +85,7 @@ const canonicalManifest = {
 	version: "1.0.0",
 	mcps: [
 		{ name: "docs", transport: "stdio", command: "bun", args: ["mcp/server.ts"], cwd: "." },
-		{ name: "remote", transport: "http", url: "https://example.com/mcp", headers: { "x-api": "k" } },
+		{ name: "remote", transport: "http", url: "https://example.com/mcp" },
 	],
 };
 
@@ -94,7 +95,7 @@ const aliasManifest = {
 	version: "1.0.0",
 	mcpServers: {
 		docs: { type: "stdio", command: "bun", args: ["mcp/server.ts"], cwd: "." },
-		remote: { url: "https://example.com/mcp", headers: { "x-api": "k" } },
+		remote: { url: "https://example.com/mcp" },
 	},
 };
 
@@ -147,6 +148,76 @@ describe("issue #4287 acceptance 1: aliases compile to byte-equivalent normalize
 			["c", "sse"],
 		]);
 	});
+
+	test("map insertion order does not change normalized surfaces or config hashes", async () => {
+		const firstRoot = await mkTemp("gjc-alias-order-a-");
+		const secondRoot = await mkTemp("gjc-alias-order-b-");
+		await writeManifestBundle(firstRoot, {
+			kind: "gajae-code-plugin",
+			name: "ordered",
+			version: "1.0.0",
+			mcpServers: {
+				zeta: { url: "https://example.com/z" },
+				alpha: { url: "https://example.com/a" },
+			},
+		});
+		await writeManifestBundle(secondRoot, {
+			kind: "gajae-code-plugin",
+			name: "ordered",
+			version: "1.0.0",
+			mcpServers: {
+				alpha: { url: "https://example.com/a" },
+				zeta: { url: "https://example.com/z" },
+			},
+		});
+
+		const [first, second] = await Promise.all([
+			compileGjcPluginBundle(firstRoot),
+			compileGjcPluginBundle(secondRoot),
+		]);
+		expect(first.manifestHash).not.toBe(second.manifestHash);
+		expect(first.surfaces).toEqual(second.surfaces);
+		expect(JSON.stringify(first.surfaces)).toBe(JSON.stringify(second.surfaces));
+		expect(first.surfaces.mcps.map(m => m.configHash)).toEqual(second.surfaces.mcps.map(m => m.configHash));
+	});
+
+	test("alias determinism does not rewrite the established canonical config hash", async () => {
+		const root = await mkTemp("gjc-canonical-hash-compat-");
+		await writeManifestBundle(root, {
+			kind: "gajae-code-plugin",
+			name: "canonical-hash-compat",
+			version: "1.0.0",
+			mcps: [
+				{
+					name: "remote",
+					transport: "http",
+					url: "https://example.com/mcp",
+					headers: { z: "2", a: "1" },
+				},
+			],
+		});
+		const bundle = await compileGjcPluginBundle(root);
+		expect(bundle.surfaces.mcps[0]?.configHash).toBe(
+			"39585360e397aa5dd3b1b18595d01f23c52d6ba90f1f30720e8680fa0bd50c9c",
+		);
+	});
+
+	test("prototype-like server names remain ordinary deterministic entries", () => {
+		const manifest = parseManifest(
+			{
+				kind: "gajae-code-plugin",
+				name: "prototype-names",
+				version: "1.0.0",
+				mcpServers: {
+					toString: { url: "https://example.com/to-string" },
+					constructor: { url: "https://example.com/constructor" },
+					prototype: { url: "https://example.com/prototype" },
+				},
+			},
+			"/plugin/prototype-names/gajae-plugin.json",
+		);
+		expect(manifest.mcps.map(m => m.name)).toEqual(["constructor", "prototype", "toString"]);
+	});
 });
 
 describe("issue #4287 acceptance 2: ambiguous/unsafe aliases fail with actionable canonical form", () => {
@@ -179,8 +250,8 @@ describe("issue #4287 acceptance 2: ambiguous/unsafe aliases fail with actionabl
 		);
 	});
 
-	test("mcpServers auth/oauth/enablement controls cannot be preserved", () => {
-		for (const key of ["auth", "oauth", "enabled", "timeout", "autoload", "noInheritEnv"]) {
+	test("mcpServers auth/oauth/headers/enablement controls cannot be preserved", () => {
+		for (const key of ["auth", "oauth", "headers", "enabled", "timeout", "autoload", "noInheritEnv"]) {
 			expectAliasError(
 				() =>
 					parseManifest(
@@ -193,7 +264,25 @@ describe("issue #4287 acceptance 2: ambiguous/unsafe aliases fail with actionabl
 						"/plugin/x/gajae-plugin.json",
 					),
 				"unsupported_surface",
-				[`"${key}"`, "mcps"],
+				[`"${key}"`, ".gjc/mcp.json"],
+			);
+		}
+	});
+
+	test("mcpServers rejects fields incompatible with the selected transport", () => {
+		for (const entry of [
+			{ type: "stdio", command: "bun", args: ["s.ts"], url: "https://example.com/mcp" },
+			{ type: "http", url: "https://example.com/mcp", command: "bun" },
+			{ type: "sse", url: "https://example.com/sse", cwd: "." },
+		]) {
+			expectAliasError(
+				() =>
+					parseManifest(
+						{ kind: "gajae-code-plugin", name: "x", version: "1.0.0", mcpServers: { db: entry } },
+						"/plugin/x/gajae-plugin.json",
+					),
+				"unsupported_surface",
+				["cannot preserve", ".gjc/mcp.json"],
 			);
 		}
 	});
@@ -308,6 +397,33 @@ describe("issue #4287 acceptance 2: ambiguous/unsafe aliases fail with actionabl
 		);
 	});
 
+	test("hybrid Claude hook entries cannot hide foreign semantics behind canonical fields", () => {
+		expectAliasError(
+			() =>
+				parseManifest(
+					{
+						kind: "gajae-code-plugin",
+						name: "x",
+						version: "1.0.0",
+						hooks: [
+							{
+								name: "audit",
+								event: "tool_call",
+								target: "bash",
+								phase: "before",
+								path: "hooks/audit.ts",
+								matcher: "Bash",
+								hooks: [{ type: "command", command: "echo hidden" }],
+							},
+						],
+					},
+					"/plugin/x/gajae-plugin.json",
+				),
+			"invalid_manifest",
+			["matcher", ".gjc/hooks/"],
+		);
+	});
+
 	test("mcps and mcpServers together is a targeted conflict, not a guess", () => {
 		expectAliasError(
 			() =>
@@ -419,6 +535,22 @@ describe("issue #4287 acceptance 5: aliases never bypass security or collision a
 			mcpServers: { db: { command: "bun", args: ["s.ts"], env: { DB_URL: "x" } } },
 		});
 		await expect(compileGjcPluginBundle(root)).rejects.toThrow(GjcPluginLoadError);
+	});
+
+	test("alias MCP policy failure leaves the target scope untouched", async () => {
+		const cwd = await mkProjectCwd();
+		const root = await mkTemp("gjc-alias-policy-atomic-");
+		await writeManifestBundle(root, {
+			kind: "gajae-code-plugin",
+			name: "alias-policy-atomic",
+			version: "1.0.0",
+			mcpServers: { metadata: { url: "http://169.254.169.254/latest/meta-data" } },
+		});
+		const scopeRoot = path.join(cwd, ".gjc", "gjc-plugins");
+		await expect(fs.stat(scopeRoot)).rejects.toThrow();
+
+		await expect(installGjcBundle({ cwd }, "project", root)).rejects.toMatchObject({ code: "security_policy" });
+		await expect(fs.stat(scopeRoot)).rejects.toThrow();
 	});
 });
 
@@ -597,5 +729,25 @@ describe("issue #4287 acceptance 4: install lifecycle remains covered for alias 
 			expect(drift.surfaceId).toContain("alias-equivalence");
 			expect(drift.code).toBe("runtime_mismatch");
 		}
+	});
+
+	test("prototype-like alias names remain own keys in the runtime MCP config map", async () => {
+		const cwd = await mkProjectCwd();
+		const root = await mkTemp("gjc-alias-prototype-runtime-");
+		await writeManifestBundle(root, {
+			kind: "gajae-code-plugin",
+			name: "prototype-runtime",
+			version: "1.0.0",
+			mcpServers: { constructor: { command: "bun", args: ["mcp/server.ts"] } },
+		});
+		await fs.mkdir(path.join(root, "mcp"), { recursive: true });
+		await fs.writeFile(path.join(root, "mcp", "server.ts"), "export default {};\n");
+		const installed = await installGjcBundle({ cwd }, "project", root);
+		expect(installed.ok).toBe(true);
+
+		const runtime = await buildPluginMcpConfigs({ cwd });
+		expect(Object.getPrototypeOf(runtime.configs)).toBeNull();
+		expect(Object.hasOwn(runtime.configs, "constructor")).toBe(true);
+		expect(runtime.configs.constructor).toMatchObject({ type: "stdio", command: "bun" });
 	});
 });

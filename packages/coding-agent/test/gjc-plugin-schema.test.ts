@@ -62,7 +62,7 @@ describe("GJC plugin schema", () => {
 				version: "1.0.0",
 				mcpServers: {
 					docs: { type: "stdio", command: "bun", args: ["mcp/server.ts"], cwd: "." },
-					remote: { url: "https://example.com/mcp", headers: { "x-api": "k" } },
+					remote: { url: "https://example.com/mcp" },
 				},
 			},
 			"/plugin/mcpServers/gajae-plugin.json",
@@ -82,7 +82,7 @@ describe("GJC plugin schema", () => {
 				name: "remote",
 				transport: "http",
 				url: "https://example.com/mcp",
-				headers: { "x-api": "k" },
+				headers: undefined,
 				command: undefined,
 				args: undefined,
 				cwd: undefined,
