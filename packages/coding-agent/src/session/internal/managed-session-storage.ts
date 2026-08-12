@@ -26,8 +26,10 @@ type NativeManagedSessionStorage = Pick<
 	| "exactReplacePath"
 	| "exactUnlink"
 	| "linkNoReplacePath"
+	| "linkNoReplacePathAsync"
 	| "openRecoveryFsRoot"
 	| "renameNoReplacePath"
+	| "renameNoReplacePathAsync"
 	| "repairOwnerOnlyPathSecurityExpected"
 	| "snapshotDirectoryTree"
 	| "verifyOwnerOnlyFdSecurity"
@@ -513,6 +515,9 @@ const SCRUBBED_REMNANT_PREFIXES = [
 /** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
 const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
 
+/** Minimum interval between best-effort remnant reaps of one bound store directory. */
+const SCRUBBED_REMNANT_REAP_INTERVAL_MS = 60_000;
+
 export interface ScrubbedProtocolRemnantReapResult {
 	readonly reaped: number;
 	readonly failures: number;
@@ -558,6 +563,48 @@ export function reapScrubbedProtocolRemnantsSync(
 			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
 			if (named.mtimeMs > cutoff) continue;
 			fs.unlinkSync(pathname);
+			reaped += 1;
+		} catch (error) {
+			if (!isEnoent(error)) failures += 1;
+		}
+	}
+	return reportScrubbedProtocolRemnantReap(reaped, failures);
+}
+
+/** Number of candidate remnants inspected between event-loop yields. */
+const SCRUBBED_REMNANT_REAP_BATCH_SIZE = 256;
+
+/**
+ * Async twin of {@link reapScrubbedProtocolRemnantsSync} with the same safety
+ * filters (terminal remnant prefix, zero-length, single-link, non-symlink,
+ * older than the age gate), yielding between bounded batches. Long-lived
+ * processes reap per-session descendant directories through this path so a
+ * legacy oversized directory cannot starve timers or sibling subagents while
+ * it is being drained (issue #4394).
+ */
+export async function reapScrubbedProtocolRemnants(
+	directory: string,
+	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
+): Promise<ScrubbedProtocolRemnantReapResult> {
+	let names: string[];
+	try {
+		names = await fsp.readdir(directory);
+	} catch (error) {
+		return reportScrubbedProtocolRemnantReap(0, isEnoent(error) ? 0 : 1);
+	}
+	const cutoff = Date.now() - minAgeMs;
+	let reaped = 0;
+	let failures = 0;
+	let scanned = 0;
+	for (const name of names) {
+		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
+		const pathname = path.join(directory, name);
+		try {
+			const named = await fsp.lstat(pathname);
+			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			if (named.mtimeMs > cutoff) continue;
+			await fsp.unlink(pathname);
 			reaped += 1;
 		} catch (error) {
 			if (!isEnoent(error)) failures += 1;
@@ -926,6 +973,8 @@ export class ManagedSessionDescendantStore {
 	#ownsAuthority = false;
 	#closed = false;
 	#reconcilingReplacementCleanup = false;
+	#remnantReapInFlight = false;
+	#lastRemnantReapAttempt = 0;
 	readonly #authorityBaseDir: string;
 	/** Logical profile root inherited by nested managed session destinations. */
 	readonly #profileAgentDir: string;
@@ -1378,6 +1427,30 @@ export class ManagedSessionDescendantStore {
 		this.#assertBound();
 		this.#reconcileReplacementCleanupReceipts();
 		this.#assertBound();
+		this.#scheduleRemnantReap();
+	}
+
+	/**
+	 * Best-effort asynchronous reaping of scrubbed write-protocol remnants in
+	 * this store's bound directory. Replacements leak zero-byte remnants on
+	 * platforms without retained authority (macOS), and scope-resolution reaping
+	 * never visits per-session descendant directories, so unbounded remnant
+	 * growth there degraded every namespace mutation and let one publication
+	 * stall the whole process (issue #4394). Reaping is throttled, serialized
+	 * per store, and never fails the triggering mutation.
+	 */
+	#scheduleRemnantReap(): void {
+		const now = Date.now();
+		if (this.#remnantReapInFlight || now - this.#lastRemnantReapAttempt < SCRUBBED_REMNANT_REAP_INTERVAL_MS) return;
+		this.#lastRemnantReapAttempt = now;
+		this.#remnantReapInFlight = true;
+		void reapScrubbedProtocolRemnants(this.#baseDir)
+			.catch((error: unknown) => {
+				logger.warn("Managed session remnant reaping failed", { error: String(error) });
+			})
+			.finally(() => {
+				this.#remnantReapInFlight = false;
+			});
 	}
 
 	ensureDirectory(relativePath = ""): ManagedDirectoryRoot {
@@ -2347,6 +2420,17 @@ function fsyncDirectory(pathname: string): void {
 	}
 }
 
+/** Async twin of {@link fsyncDirectory} for the off-loop publication path. */
+async function fsyncDirectoryAsync(pathname: string): Promise<void> {
+	if (!shouldFsyncManagedDirectory()) return;
+	const handle = await fsp.open(pathname, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
 function bootId(): string | undefined {
 	try {
 		return fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
@@ -2628,7 +2712,7 @@ export async function publishManagedFileNoReplace(
 	const parent = path.dirname(destination);
 	ensureManagedDirectory(parent, root, policy);
 	const staging = path.join(parent, `.${path.basename(destination)}.${randomUUID()}.staging`);
-	let fd: number | undefined;
+	let handle: fsp.FileHandle | undefined;
 	let stagingIdentity: { dev: bigint; ino: bigint } | undefined;
 	let failure: unknown;
 	let outcome: NativePublishOutcome | undefined;
@@ -2637,36 +2721,47 @@ export async function publishManagedFileNoReplace(
 
 	try {
 		assertOwned?.();
-		fd = fs.openSync(
+		// The whole staging + publication chain is awaited off the resident event
+		// loop: FileHandle operations run on the libuv pool and the no-replace
+		// namespace publication crosses the async native boundary. A rename that
+		// stalls in the kernel — e.g. into an oversized APFS directory namespace,
+		// issue #4394 — blocks one pool thread instead of freezing the process:
+		// await timeouts, sibling subagents, and watchdogs keep running, and a
+		// hung publication degrades to one unresolved receipt.
+		handle = await fsp.open(
 			staging,
 			fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW,
 			0o600,
 		);
-		secureFileDescriptor(staging, fd, "apply");
+		secureFileDescriptor(staging, handle.fd, "apply");
 		let offset = 0;
-		while (offset < bytes.byteLength) offset += fs.writeSync(fd, bytes, offset, bytes.byteLength - offset);
-		fs.fsyncSync(fd);
-		secureFileDescriptor(staging, fd, "verify");
-		const staged = fs.fstatSync(fd, { bigint: true });
+		while (offset < bytes.byteLength) {
+			const { bytesWritten } = await handle.write(bytes, offset, bytes.byteLength - offset);
+			if (bytesWritten <= 0) throw new Error("managed_publish_failed");
+			offset += bytesWritten;
+		}
+		await handle.sync();
+		secureFileDescriptor(staging, handle.fd, "verify");
+		const staged = await handle.stat({ bigint: true });
 		stagingIdentity = { dev: staged.dev, ino: staged.ino };
 		assertOwned?.();
 
 		renameAttempted = true;
-		outcome = classifyNativePublishOutcome(nativeSessionStorage().renameNoReplacePath(staging, destination));
+		outcome = classifyNativePublishOutcome(
+			await nativeSessionStorage().renameNoReplacePathAsync(staging, destination),
+		);
 		if (renameFlagsUnsupported(outcome)) {
-			// linkat publishes the destination without consuming the staging name, so the
-			// secured staging descriptor stays authoritative across publication exactly as
-			// it does across a rename. The staging link is removed in the finally block
-			// below, after that descriptor is closed: unlinking a still-open name on NFS
-			// silly-renames it instead of removing it, which would leave a second link on
-			// the published inode.
-			outcome = classifyNativePublishOutcome(nativeSessionStorage().linkNoReplacePath(staging, destination));
+			// See publishManagedFileNoReplaceSync: the staging link outlives this
+			// publication and is removed only after the secured descriptor is closed.
+			outcome = classifyNativePublishOutcome(
+				await nativeSessionStorage().linkNoReplacePathAsync(staging, destination),
+			);
 			linkPublished = outcome.ok;
 		}
 
 		if (!outcome.ok) throw publishFailure(outcome);
 
-		const named = fs.lstatSync(destination, { bigint: true });
+		const named = await fsp.lstat(destination, { bigint: true });
 		if (
 			!named.isFile() ||
 			named.isSymbolicLink() ||
@@ -2675,15 +2770,21 @@ export async function publishManagedFileNoReplace(
 		) {
 			throw new Error("destination_identity_changed");
 		}
-		secureFileDescriptor(destination, fd, "verify");
-		fs.closeSync(fd);
-		fd = undefined;
+		secureFileDescriptor(destination, handle.fd, "verify");
+		await handle.close();
+		handle = undefined;
 
-		fsyncDirectory(parent);
+		await fsyncDirectoryAsync(parent);
 	} catch (error) {
 		failure = error;
 	} finally {
-		if (fd !== undefined) fs.closeSync(fd);
+		if (handle !== undefined) {
+			try {
+				await handle.close();
+			} catch (error) {
+				failure ??= error;
+			}
+		}
 
 		if (stagingIdentity && (linkPublished || !renameAttempted || (outcome && mayCleanCurrentStaging(outcome)))) {
 			await fsp

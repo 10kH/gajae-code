@@ -12,6 +12,7 @@ use napi_derive::napi;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 
+use crate::task;
 /// Classification of a read-only retained-publication observation.
 #[napi(object)]
 pub struct NativeBrokerPublicationObservation {
@@ -1183,6 +1184,36 @@ pub fn link_no_replace_path(
 		Path::new(&source_path),
 		Path::new(&destination_path),
 	))
+}
+
+/// Async variant of [`rename_no_replace_path`] scheduled on the libuv blocking
+/// pool.
+///
+/// Managed output publication awaits this boundary so a rename that stalls in
+/// the kernel (oversized APFS directory namespaces, issue #4394) blocks one
+/// pool thread instead of the agent's event loop: await timeouts, sibling
+/// subagents, and watchdogs keep running, and a hung publication degrades to
+/// one unresolved receipt rather than a frozen process.
+#[napi]
+pub fn rename_no_replace_path_async(
+	source_path: String,
+	destination_path: String,
+) -> task::Promise<NativeNoReplaceResult> {
+	task::blocking("rename_no_replace_path", (), move |_| {
+		Ok(rename_no_replace_path(source_path, destination_path))
+	})
+}
+
+/// Async variant of [`link_no_replace_path`] scheduled on the libuv blocking
+/// pool; see [`rename_no_replace_path_async`] for the rationale.
+#[napi]
+pub fn link_no_replace_path_async(
+	source_path: String,
+	destination_path: String,
+) -> task::Promise<NativeNoReplaceResult> {
+	task::blocking("link_no_replace_path", (), move |_| {
+		Ok(link_no_replace_path(source_path, destination_path))
+	})
 }
 
 /// Capture a deterministic, descriptor-relative snapshot of a regular-file and
