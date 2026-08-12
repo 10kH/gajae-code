@@ -494,8 +494,7 @@
 							"type": "string",
 							"enum": [
 								"off",
-								"ultragoal",
-								"team"
+								"ultragoal"
 							],
 							"default": "off"
 						},
