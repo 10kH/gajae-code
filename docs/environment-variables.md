@@ -501,7 +501,7 @@ LSP project configuration may control declarative matching, activation, and capa
 | `PWD`                 | Used when matching canonical current working directory in path helpers        |
 | `GJC_WORKTREE_DIR`     | Directory holding `--worktree` launch worktrees (default `{repo}.gajae-code-worktrees`) |
 
-`GJC_WORKTREE_DIR` is a path template. `{repo}` expands to the repository directory name, which keeps one exported value repo-scoped so two repositories that share a branch name never resolve to the same worktree. A relative value resolves against the repository's parent directory — the default's own shape — so `{repo}.worktrees` adopts an existing sibling bucket and `.worktrees` nests one inside the repository; an absolute value (or a leading `~/`) is used as given. An unset or blank value keeps the default bucket.
+`GJC_WORKTREE_DIR` is a path template. `{repo}` expands to the repository directory name, which keeps one exported value repo-scoped so two repositories that share a branch name never resolve to the same worktree. A relative value resolves against the repository's parent directory — the default's own shape — so `{repo}.worktrees` adopts an existing sibling bucket and `.worktrees` parks a hidden bucket beside the repository; an absolute value (or a leading `~/`) is used as given. An unset or blank value keeps the default bucket.
 
 ```sh
 # Reuse an existing <repo>.worktrees convention instead of a second bucket

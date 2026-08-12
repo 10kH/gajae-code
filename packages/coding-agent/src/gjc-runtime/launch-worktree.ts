@@ -80,9 +80,29 @@ const WORKTREE_BUCKET_ENV = "GJC_WORKTREE_DIR";
 const REPO_NAME_PLACEHOLDER = "{repo}";
 const DEFAULT_WORKTREE_BUCKET = `${REPO_NAME_PLACEHOLDER}.gajae-code-worktrees`;
 
-function expandHomePrefix(value: string): string {
-	if (value === "~") return os.homedir();
-	return value.startsWith(`~${path.sep}`) || value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value;
+function expandHomePrefix(value: string, home: string, pathApi: typeof path.posix): string {
+	if (value === "~") return home;
+	return value.startsWith(`~${pathApi.sep}`) || value.startsWith("~/") ? pathApi.join(home, value.slice(2)) : value;
+}
+
+/**
+ * Pure core of {@link resolveWorktreeBucket}, exported for tests.
+ *
+ * Injecting the home directory and path implementation lets tests exercise
+ * Windows drive/UNC/separator semantics (`path.win32`) on any host.
+ */
+export function resolveWorktreeBucketForPath(
+	repoRoot: string,
+	envValue: string | undefined,
+	home: string,
+	pathApi: typeof path.posix,
+): string {
+	const configured = envValue?.trim();
+	const template = expandHomePrefix(configured || DEFAULT_WORKTREE_BUCKET, home, pathApi);
+	return pathApi.resolve(
+		pathApi.dirname(repoRoot),
+		template.replaceAll(REPO_NAME_PLACEHOLDER, pathApi.basename(repoRoot)),
+	);
 }
 
 /**
@@ -90,12 +110,10 @@ function expandHomePrefix(value: string): string {
  *
  * A relative override resolves against the repository's PARENT directory, matching the
  * default's own shape, so `{repo}.worktrees` adopts an existing sibling bucket and
- * `.worktrees` nests one inside the repository. An absolute override is used verbatim.
+ * `.worktrees` parks a hidden bucket beside the repository. An absolute override is used verbatim.
  */
 function resolveWorktreeBucket(repoRoot: string): string {
-	const configured = process.env[WORKTREE_BUCKET_ENV]?.trim();
-	const template = expandHomePrefix(configured || DEFAULT_WORKTREE_BUCKET);
-	return path.resolve(path.dirname(repoRoot), template.replaceAll(REPO_NAME_PLACEHOLDER, path.basename(repoRoot)));
+	return resolveWorktreeBucketForPath(repoRoot, process.env[WORKTREE_BUCKET_ENV], os.homedir(), path);
 }
 
 function resolveSourceBranchSlug(repoRoot: string, baseRef: string): string {
