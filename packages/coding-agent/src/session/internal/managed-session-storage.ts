@@ -1317,7 +1317,7 @@ export class ManagedSessionDescendantStore {
 			const existing = captureIfPresent(destination);
 			if (!currentPending && existing) {
 				if (
-					!sameIdentity(existing.identity, pending.identity) ||
+					!sameReplacementIdentity(existing.identity, pending.identity) ||
 					existing.identity.sha256 !== pending.identity.sha256
 				)
 					throw new Error("managed_replace_cleanup_receipt_invalid");
