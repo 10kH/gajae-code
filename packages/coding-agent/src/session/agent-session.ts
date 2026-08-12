@@ -2946,7 +2946,14 @@ export class AgentSession {
 			// Persist before notifying synchronous subscribers: a subscriber may start a
 			// successor prompt from agent_end, whose running state must serialize after
 			// this terminal boundary rather than be overwritten by it.
-			void this.#queueCoordinatorRuntimeStatePersist(pending);
+			//
+			// Awaited, not fire-and-forget: this is the terminal boundary, and the write
+			// runs under the native identity-bound state-file lock. A detached write
+			// outlives the session that owns it — under `bun test --isolate` the pending
+			// unlink lands after the runtime has torn down the context it was scheduled in
+			// and segfaults the process, and in production it lets a settled session's
+			// last write race whatever reclaims its lock next.
+			await this.#queueCoordinatorRuntimeStatePersist(pending);
 			this.#emit(pending);
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
@@ -6898,6 +6905,13 @@ export class AgentSession {
 		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
+		// Drain the sidecar write order for the same reason the two queues above are
+		// drained: each entry writes under the native identity-bound state-file lock, so a
+		// still-queued write would run after the session that owns it is gone — releasing
+		// a lock whose owner no longer exists, and under `bun test --isolate` calling into
+		// the addon after the runtime tore down the context it was scheduled in. The chain
+		// is already failure-absorbing, so this only waits.
+		await this.#coordinatorPersistQueue;
 		this.#workflowGateEmitter?.fence?.();
 		this.#pendingBackgroundExchanges = [];
 		this.yieldQueue.clear();
