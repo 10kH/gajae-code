@@ -92,6 +92,7 @@ import {
 	type ManagedBoundedAppendExpectation,
 	ManagedCommittedMutationError,
 	type ManagedDirectoryRoot,
+	type ManagedFileIdentity,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
@@ -3500,6 +3501,18 @@ function descriptorSnapshotAsStorageStat(descriptor: DescriptorSnapshot): Sessio
 	return { ...descriptor, mtimeMs, mtime: new Date(mtimeMs), isFile: true };
 }
 
+function managedIdentityFromDescriptor(descriptor: DescriptorSnapshot): ManagedFileIdentity {
+	if (descriptor.nlink === undefined) throw new Error("managed_identity_nlink_unavailable");
+	return {
+		dev: descriptor.dev,
+		ino: descriptor.ino,
+		nlink: descriptor.nlink,
+		size: descriptor.size,
+		mtimeNs: descriptor.mtimeNs,
+		ctimeNs: descriptor.ctimeNs,
+	};
+}
+
 function retainedManagedInspectionStorage(
 	storage: SessionStorage,
 	store: ManagedSessionDescendantStore,
@@ -6562,6 +6575,7 @@ interface SessionManagerStateSnapshot {
 	sessionName: string | undefined;
 	titleSource: "auto" | "user" | undefined;
 	sessionFile: string | undefined;
+	managedPersistExpectedIdentity: ManagedFileIdentity | undefined;
 	flushed: boolean;
 	ensuredOnDisk: boolean;
 	needsFullRewriteOnNextPersist: boolean;
@@ -6585,6 +6599,12 @@ export const SessionManagerTestHooks: {
 	beforeStrictMissingCheck?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeAcceptance?: (filePath: string, storage: SessionStorage) => void;
 	beforeManagedResumeReturn?: (filePath: string, storage: SessionStorage) => void;
+	beforeManagedSourceStat?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeManagedMissingInit?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeManagedMissingPublish?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeManagedMissingReturn?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	afterManagedMissingAssertion?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeManagedSwitchIdentity?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -6933,6 +6953,7 @@ export class SessionManager {
 	#managedSidecarSecurityContext: ManagedSessionSecurityContext | undefined;
 	#managedSidecarCacheSessionFile: string | undefined;
 	#managedRangeExpectedDescriptor: DescriptorSnapshot | undefined;
+	#managedPersistExpectedIdentity: ManagedFileIdentity | undefined;
 	#boundedReadStorageProxy: SessionStorage | undefined;
 	#boundedManagedSource:
 		| { path: string; store: ManagedSessionDescendantStore; descriptor: DescriptorSnapshot; owned: boolean }
@@ -7000,6 +7021,7 @@ export class SessionManager {
 		private readonly persist: boolean,
 		storage: SessionStorage,
 		private destination: SessionDestination = explicitDestination(sessionDir),
+		skipEnsureSessionDir = false,
 		persistenceProfile?: SessionStorageProfile,
 	) {
 		this.#storage = new Proxy(storage, {
@@ -7101,7 +7123,7 @@ export class SessionManager {
 			},
 		});
 		if (persist && sessionDir) {
-			this.#storage.ensureDirSync(sessionDir);
+			if (!skipEnsureSessionDir) this.#storage.ensureDirSync(sessionDir);
 			// Canonicalize the trusted session directory (single choke point for every
 			// creation path: create/open/moveTo/fork/SDK) so benign ancestor symlinks
 			// (e.g. macOS `/var -> /private/var`, a symlinked `$HOME`) are resolved to a
@@ -7558,6 +7580,7 @@ export class SessionManager {
 				flushed: this.#flushed,
 				ensuredOnDisk: this.#ensuredOnDisk,
 				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
+				managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
 				fileEntries: [],
 				materializedFileEntries: [],
 				adoptedArtifactManager: this.#adoptedArtifactManager,
@@ -7592,6 +7615,7 @@ export class SessionManager {
 		this.#flushed = snapshot.flushed;
 		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
+		this.#managedPersistExpectedIdentity = snapshot.managedPersistExpectedIdentity;
 		this.#adoptedArtifactManager = snapshot.adoptedArtifactManager;
 	}
 	captureState(): SessionManagerStateSnapshot {
@@ -7608,6 +7632,7 @@ export class SessionManager {
 			flushed: this.#flushed,
 			ensuredOnDisk: this.#ensuredOnDisk,
 			needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
+			managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
 			// Snapshot entry objects by reference: switch/reload replaces the active entry array,
 			// so rollback does not need structured cloning of extension/custom details.
 			fileEntries: [...this.#fileEntries],
@@ -7643,6 +7668,7 @@ export class SessionManager {
 		this.#flushed = snapshot.flushed;
 		this.#ensuredOnDisk = snapshot.ensuredOnDisk;
 		this.#needsFullRewriteOnNextPersist = snapshot.needsFullRewriteOnNextPersist;
+		this.#managedPersistExpectedIdentity = snapshot.managedPersistExpectedIdentity;
 		if (!retainsPersistWriter) {
 			this.#persistWriter = undefined;
 			this.#persistWriterPath = undefined;
@@ -7691,6 +7717,7 @@ export class SessionManager {
 		this.#titleSource = state.header.titleSource;
 		this.#sessionFile = state.sessionFile;
 		this.#managedRangeExpectedDescriptor = undefined;
+		this.#managedPersistExpectedIdentity = undefined;
 		this.#clearBoundedManagedSource();
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
@@ -7932,6 +7959,7 @@ export class SessionManager {
 			this.#usageStatistics = commit.usageStatistics;
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
+			this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(terminalDescriptor);
 			this.#lazyReopenSucceeded = true;
 			this.#lazyReopenFallbackReason = undefined;
 			initialized = true;
@@ -8118,6 +8146,7 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
 				return false;
 			}
+			this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(finalDescriptor);
 			this.#sessionId = discovery.header.id;
 			this.#sessionName = discovery.header.title;
 			this.#titleSource = discovery.header.titleSource;
@@ -8929,6 +8958,7 @@ export class SessionManager {
 		this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		this.#adoptManagedPersistIdentity(resolvedSessionFile);
 		if (!strictResume && !deferPersistenceUntilAccepted)
 			await this.#sanitizeLoadedOpenAIResponsesReplayMetadataAndPersist();
 		if (publishedSidecarWasPresent && this.#lazyReopenAttempted && !this.#lazyReopenSucceeded) {
@@ -8968,6 +8998,7 @@ export class SessionManager {
 		this.#commitResidentTextStoreTransition(prepared);
 		this.#flushed = true;
 		this.#ensuredOnDisk = true;
+		this.#adoptManagedPersistIdentity(resolvedSessionFile);
 	}
 
 	/** Initialize with a new session (used by factory methods). */
@@ -9081,6 +9112,7 @@ export class SessionManager {
 					titleSource: this.#titleSource,
 					sessionFile: this.#sessionFile,
 					needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
+					managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
 				};
 				this.#persistError = undefined;
 				this.#persistErrorReported = false;
@@ -9092,6 +9124,8 @@ export class SessionManager {
 				try {
 					managedTransition?.adopt();
 					this.#writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
+					await SessionManagerTestHooks.beforeManagedSwitchIdentity?.(resolvedSessionFile, this.#storage);
+					this.#adoptManagedPersistIdentity(resolvedSessionFile);
 					this.#commitResidentTextStoreTransition(prepared);
 				} catch (error) {
 					managedTransition?.rollback();
@@ -9100,6 +9134,7 @@ export class SessionManager {
 					this.#titleSource = previous.titleSource;
 					this.#sessionFile = previous.sessionFile;
 					this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
+					this.#managedPersistExpectedIdentity = previous.managedPersistExpectedIdentity;
 					prepared.dispose();
 					throw error;
 				}
@@ -9132,6 +9167,7 @@ export class SessionManager {
 				flushed: this.#flushed,
 				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 				ensuredOnDisk: this.#ensuredOnDisk,
+				managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
 				artifactManager: this.#artifactManager,
 				artifactManagerSessionFile: this.#artifactManagerSessionFile,
 				adoptedArtifactManager: this.#adoptedArtifactManager,
@@ -9155,6 +9191,7 @@ export class SessionManager {
 				this.#flushed = previous.flushed;
 				this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
 				this.#ensuredOnDisk = previous.ensuredOnDisk;
+				this.#managedPersistExpectedIdentity = previous.managedPersistExpectedIdentity;
 				this.#artifactManager = previous.artifactManager;
 				this.#artifactManagerSessionFile = previous.artifactManagerSessionFile;
 				this.#adoptedArtifactManager = previous.adoptedArtifactManager;
@@ -9310,7 +9347,10 @@ export class SessionManager {
 		);
 		if (this.destination.kind === "managed") {
 			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-			await this.#managedTranscriptStore(stage.sessionFile).replace(path.basename(stage.sessionFile), bytes);
+			await this.#managedTranscriptStore(stage.sessionFile).publishNoReplace(
+				path.basename(stage.sessionFile),
+				bytes,
+			);
 		} else {
 			const staleCleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
 			if (staleCleanupError) throw staleCleanupError;
@@ -9614,6 +9654,7 @@ export class SessionManager {
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
 		this.#commitResidentTextStoreTransition(transition);
+		if (stage.flushed) this.#adoptManagedPersistIdentity(stage.sessionFile);
 		this.#retireEphemeralArtifacts();
 		stage.committed = true;
 		this.#preparedNewSessions.delete(stage);
@@ -9943,6 +9984,7 @@ export class SessionManager {
 		this.#needsFullRewriteOnNextPersist = false;
 		this.#ensuredOnDisk = true;
 		this.#commitResidentTextStoreTransition(transition);
+		this.#adoptManagedPersistIdentity(newSessionFile);
 		return { oldSessionFile, newSessionFile };
 	}
 
@@ -10393,6 +10435,7 @@ export class SessionManager {
 			managedMove && managedDestinationStore
 				? { directory: path.resolve(newSessionDir), store: managedDestinationStore }
 				: null;
+		this.#adoptManagedPersistIdentity(this.#sessionFile);
 
 		const hasAssistant = this.#fileEntries.some(e => e.type === "message" && e.message.role === "assistant");
 		try {
@@ -10429,6 +10472,7 @@ export class SessionManager {
 					managedMove && managedSourceStore
 						? { directory: path.resolve(previousSessionDir), store: managedSourceStore }
 						: null;
+				this.#adoptManagedPersistIdentity(previousSessionFile);
 				const header = this.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header) applyHeaderPatch(header, { cwd: previousCwd });
 				this.#headerExportRevision++;
@@ -14242,6 +14286,15 @@ export class SessionManager {
 		return classification;
 	}
 
+	#adoptManagedPersistIdentity(sessionFile = this.#sessionFile): void {
+		if (this.destination.kind !== "managed" || !sessionFile) {
+			this.#managedPersistExpectedIdentity = undefined;
+			return;
+		}
+		const descriptor = this.#managedTranscriptStore(sessionFile).descriptorExpected(path.basename(sessionFile));
+		if (!descriptor) throw new Error("managed_persist_identity_unavailable");
+		this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);
+	}
 	/** Current transcript descriptor, or null when unavailable. */
 	#managedDescriptorSnapshotOrNull(): DescriptorSnapshot | null {
 		const sessionFile = this.#sessionFile;
@@ -14274,7 +14327,14 @@ export class SessionManager {
 		this.#withSessionPersistenceFenceSync(() => {
 			if (this.destination.kind === "managed") {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-				this.#managedTranscriptStore(sessionFile).replaceSync(path.basename(sessionFile), bytes);
+				const store = this.#managedTranscriptStore(sessionFile);
+				const relativePath = path.basename(sessionFile);
+				if (this.#managedPersistExpectedIdentity)
+					store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+				else store.replaceSync(relativePath, bytes);
+				const descriptor = store.descriptorExpected(relativePath);
+				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
+				this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);
 				this.#publishCommitMarkerFromCurrentTranscriptSync();
 				return;
 			}
@@ -15862,9 +15922,10 @@ export class SessionManager {
 			const store = this.#managedTranscriptStore(sessionFile);
 			const relativePath = path.basename(sessionFile);
 			const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
-			// R2.3: the post-operation receipt descriptor (retained or Darwin
-			// replacement) feeds the commit snapshot directly — no pathname stat.
-			const receipt = store.appendSync(relativePath, bytes);
+			const receipt = this.#managedPersistExpectedIdentity
+				? store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity)
+				: store.appendSync(relativePath, bytes);
+			this.#managedPersistExpectedIdentity = receipt.identity;
 			this.#publishSessionCommitMarkerSync(receipt.descriptor);
 		});
 	}
@@ -17662,6 +17723,7 @@ export class SessionManager {
 			this.#sessionFile = newSessionFile;
 			this.#flushed = true;
 			this.#commitResidentTextStoreTransition(transition);
+			this.#adoptManagedPersistIdentity(newSessionFile);
 			return newSessionFile;
 		}
 
@@ -17782,6 +17844,7 @@ export class SessionManager {
 			true,
 			storage,
 			destination,
+			false,
 			options?.persistenceProfile,
 		);
 		manager.#initNewSession();
@@ -18322,7 +18385,7 @@ export class SessionManager {
 	): Promise<SessionManager> {
 		const destination = destinationFor(cwd, destinationInput, storage);
 		const dir = destination.directory;
-		const manager = new SessionManager(cwd, dir, true, storage, destination, options?.persistenceProfile);
+		const manager = new SessionManager(cwd, dir, true, storage, destination, false, options?.persistenceProfile);
 		manager.#sessionMemoryMode = sessionMemoryMode;
 		let managedSourcePath = sourcePath;
 		if (destination.kind === "managed" && storage instanceof FileSessionStorage) {
@@ -18520,6 +18583,7 @@ export class SessionManager {
 						true,
 						storage,
 						destination,
+						false,
 						options?.persistenceProfile,
 					);
 
@@ -18537,6 +18601,7 @@ export class SessionManager {
 				true,
 				storage,
 				destination,
+				false,
 				options?.persistenceProfile,
 			);
 
@@ -18591,16 +18656,68 @@ export class SessionManager {
 		}
 		let managedSourceSize: number | undefined;
 		try {
+			await SessionManagerTestHooks.beforeManagedSourceStat?.(filePath, managedInspectionStorage);
 			managedSourceSize = managedInspectionStorage.statSync(filePath).size;
-		} catch {
-			// Strict inspection below reports the stable failure.
+		} catch (error) {
+			if (!isEnoent(error)) {
+				managedInspectionStore?.close();
+				throw error;
+			}
+			if (managedInspectionStore) {
+				managedInspectionStore.assertBound();
+				await SessionManagerTestHooks.beforeManagedMissingInit?.(filePath, managedInspectionStorage);
+				managedInspectionStore.assertBound();
+				const manager = new SessionManager(
+					getProjectDir(),
+					destination.directory,
+					true,
+					storage,
+					destination,
+					true,
+				);
+				manager.#sessionMemoryMode = sessionMemoryMode;
+				try {
+					await SessionManagerTestHooks.beforeManagedMissingPublish?.(filePath, managedInspectionStorage);
+					managedInspectionStore.assertBound();
+					await SessionManagerTestHooks.afterManagedMissingAssertion?.(filePath, managedInspectionStorage);
+					const fresh = manager.#freshSessionState(undefined, filePath);
+					const prepared = manager.#prepareFreshSessionTransition(fresh, "memory-fallback");
+					manager.#applyFreshSessionMetadata(fresh);
+					manager.#commitResidentTextStoreTransition(prepared, false);
+					manager.#retireEphemeralArtifacts();
+					const content = `${JSON.stringify(prepareEntryForPersistenceSync(fresh.header, manager.#blobStore))}\n`;
+					managedInspectionStore.publishNoReplaceSync(path.basename(filePath), Buffer.from(content, "utf8"));
+					const publishedTranscript = managedInspectionStore.readExpected(path.basename(filePath));
+					if (publishedTranscript?.bytes?.equals(Buffer.from(content, "utf8")) !== true)
+						throw new Error("Could not open session: unstable");
+					if (manager.#effectiveSessionMemoryMode() !== "off") {
+						manager.#buildDisposableSidecars(manager.#fileEntries);
+						if (manager.#coldSidecarActive()) manager.#retireColdEntries();
+					}
+					manager.#flushed = true;
+					manager.#ensuredOnDisk = true;
+					await SessionManagerTestHooks.beforeManagedMissingReturn?.(filePath, managedInspectionStorage);
+					const returnTranscript = managedInspectionStore.readExpected(path.basename(filePath));
+					if (!returnTranscript || !managedFileSnapshotEquals(returnTranscript, publishedTranscript))
+						throw new Error("Could not open session: unstable");
+					manager.#managedPersistExpectedIdentity = returnTranscript.identity;
+					writeTerminalBreadcrumb(manager.cwd, filePath);
+					return manager;
+				} catch (createError) {
+					await manager.#discardRejectedOpenState();
+					throw createError;
+				} finally {
+					managedInspectionStore.close();
+				}
+			}
+			// Cross-directory missing candidates continue through the migration path below.
 		}
 		const managedResumeBounded =
-			sessionMemoryMode === "enabled" ||
-			(sessionMemoryMode === "auto" &&
-				process.platform !== "win32" &&
-				managedSourceSize !== undefined &&
-				managedSourceSize >= autoModeMinTranscriptBytes());
+			managedSourceSize !== undefined &&
+			(sessionMemoryMode === "enabled" ||
+				(sessionMemoryMode === "auto" &&
+					process.platform !== "win32" &&
+					managedSourceSize >= autoModeMinTranscriptBytes()));
 		let strictManagedSmallInspection: ResumeInspectionSnapshot | undefined;
 		if (
 			managedResumeBounded &&
@@ -18662,6 +18779,7 @@ export class SessionManager {
 				const returnManagedDescriptor = managedInspectionStore?.descriptorExpected(path.basename(filePath));
 				if (!returnManagedDescriptor || !sameDescriptor(managedBoundedDescriptor, returnManagedDescriptor))
 					throw new Error("Could not open session: unstable");
+				manager.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(returnManagedDescriptor);
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
@@ -18704,6 +18822,7 @@ export class SessionManager {
 					true,
 					storage,
 					destination,
+					false,
 					options?.persistenceProfile,
 				);
 
@@ -18789,6 +18908,7 @@ export class SessionManager {
 					const finalDescriptor = store.descriptorExpected(path.basename(resolved));
 					if (!finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
 						throw new Error("source_changed");
+					boundedManager.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(finalDescriptor);
 					boundedManager.buildSessionContext();
 					return boundedManager;
 				}
@@ -18847,6 +18967,7 @@ export class SessionManager {
 			true,
 			storage,
 			destination,
+			false,
 			options?.persistenceProfile,
 		);
 		manager.#sessionMemoryMode = sessionMemoryMode;
@@ -19017,6 +19138,7 @@ export class SessionManager {
 				true,
 				snapshot.storage,
 				destination,
+				false,
 				options?.persistenceProfile,
 			);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
@@ -19129,6 +19251,7 @@ export class SessionManager {
 				true,
 				snapshot.storage,
 				forkDestination,
+				false,
 				options?.persistenceProfile,
 			);
 			manager.#sessionMemoryMode = sessionMemoryMode;
@@ -19250,6 +19373,7 @@ export class SessionManager {
 					manager.destination = destination;
 					manager.#sessionFile = finalSessionFile;
 					manager.#commitResidentTextStoreTransition(finalTransition);
+					manager.#adoptManagedPersistIdentity(finalSessionFile);
 				} catch (error) {
 					finalTransition.dispose();
 					throw error;
@@ -19528,6 +19652,7 @@ export class SessionManager {
 			true,
 			storage,
 			destination,
+			false,
 			options?.persistenceProfile,
 		);
 		await manager.#hydrateExistingSession(identity.canonicalPath, inspected.entries, false, "memory-only");
@@ -19606,6 +19731,7 @@ export class SessionManager {
 		this.#sessionFile = promotionPath;
 		this.#recoveryPromotionTranscriptPath = undefined;
 		this.#commitResidentTextStoreTransition(transition);
+		this.#adoptManagedPersistIdentity(promotionPath);
 		this.#writeTerminalBreadcrumb(this.cwd, promotionPath);
 		this.#recoveryHydrationContext = undefined;
 	}
@@ -19665,6 +19791,7 @@ export class SessionManager {
 			true,
 			storage,
 			destination,
+			false,
 			options?.persistenceProfile,
 		);
 		manager.#sessionMemoryMode = sessionMemoryMode;
@@ -19791,7 +19918,7 @@ export class SessionManager {
 			const opened = await openSelectedStrictly(mostRecent);
 			if (opened) return opened;
 		}
-		const manager = new SessionManager(cwd, dir, true, storage, destination, options?.persistenceProfile);
+		const manager = new SessionManager(cwd, dir, true, storage, destination, false, options?.persistenceProfile);
 		manager.#initNewSession();
 		return manager;
 	}

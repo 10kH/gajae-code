@@ -38,7 +38,13 @@ import {
 	providerSupportsAppendOnlyAuto,
 	resolveAppendOnlyMode,
 } from "../append-only-mode";
-import { type AsyncJob, AsyncJobManager, isBackgroundJobSupportEnabled, jobElapsedMs } from "../async";
+import {
+	type AsyncJob,
+	AsyncJobManager,
+	asyncJobEndpointId as deriveAsyncJobEndpointId,
+	isBackgroundJobSupportEnabled,
+	jobElapsedMs,
+} from "../async";
 import { loadCapability } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import { resolveModelProfileName } from "../config/model-profile-contract";
@@ -447,6 +453,8 @@ export interface CreateAgentSessionOptions {
 	credentialSessionId?: string;
 	/** Runtime credential selector for multi-account auth pools. */
 	credentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
+	/** Soft runtime credential preference; quota/rate-limit failures may rotate away from it. */
+	preferredCredentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -1490,6 +1498,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (earlyCredentialSelectorProvider) {
 			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
 		}
+		// Soft `--prefer-credential` preference. Unlike the hard-pin selector above,
+		// its provider is never ambiguous by construction: an explicit `provider/`
+		// prefix wins, otherwise `resolveRuntimePreferredCredentialSelectorProvider`
+		// resolves the single active OAuth provider the selector matches or throws.
+		// So the provider (and therefore installation) is always known synchronously
+		// here, with no deferred per-candidate install needed.
+		const preferredCredentialProvider = options.preferredCredentialSelector
+			? (options.preferredCredentialSelector.provider ??
+				authStorage.resolveRuntimePreferredCredentialSelectorProvider(options.preferredCredentialSelector.selector))
+			: undefined;
+		if (options.preferredCredentialSelector && preferredCredentialProvider) {
+			authStorage.setRuntimePreferredCredentialSelector(
+				preferredCredentialProvider,
+				options.preferredCredentialSelector.selector,
+			);
+		}
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
 		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
@@ -1561,6 +1585,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// session_id upstream, where session-owning transports reject the extra
 		// downstreams (owner_busy) and degrade those turns to uncached HTTP.
 		const providerSessionId = options.providerSessionId ?? logicalSessionId;
+		// AsyncJobManager ownership is distinct from both the persisted logical
+		// header and provider cache affinity. Managed child transcripts may share a
+		// logical header, while unrelated top-level sessions may intentionally share
+		// providerSessionId. Bind explicit provider scopes to the independently
+		// persisted transcript path so ownership is collision-free and stable across
+		// detached resume; ordinary sessions keep the transition-aware logical id.
+		const sessionFile = sessionManager.getSessionFile();
+		const asyncJobEndpointId = deriveAsyncJobEndpointId(
+			options.providerSessionId === undefined ? undefined : providerSessionId,
+			logicalSessionId,
+			sessionFile,
+		);
 		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
@@ -1580,6 +1616,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: undefined
 					: undefined;
 			if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
+				modelApiKeyAvailability.set(availabilityKey, false);
+				return false;
+			}
+			// A preferred (soft) credential is always installed synchronously above, so
+			// availability just needs to exclude candidates from a different provider —
+			// `--prefer-credential` names one provider's account, and letting a
+			// different-provider default model win here would silently strand the
+			// preference.
+			if (preferredCredentialProvider && preferredCredentialProvider !== candidate.provider) {
 				modelApiKeyAvailability.set(availabilityKey, false);
 				return false;
 			}
@@ -1707,13 +1752,25 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					},
 				);
 				model = restoredDefaultResolution.model;
+				// A restored session model from a different provider than an active
+				// `--prefer-credential` preference is discarded rather than kept: the
+				// preference names one provider's account, and silently resuming on
+				// another provider would strand it without any error.
+				if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
+					model = undefined;
+				}
 				if (!model) modelFallbackMessage = `Could not restore model ${defaultModelEntries.join(" -> ")}`;
 			});
 		}
 
 		// If still no model, try settings default.
 		// Skip settings fallback when an explicit model was requested.
-		if (!hasExplicitModel && !model && defaultRoleSpec.model) {
+		if (
+			!hasExplicitModel &&
+			!model &&
+			defaultRoleSpec.model &&
+			(!preferredCredentialProvider || defaultRoleSpec.model.provider === preferredCredentialProvider)
+		) {
 			const settingsDefaultModel = defaultRoleSpec.model;
 			logger.time("resolveSettingsDefaultModel", () => {
 				// defaultRoleSpec.model already comes from modelRegistry.getAvailable(),
@@ -1923,7 +1980,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							// from sessionManager.getSessionId(), so session.sessionId
 							// would miss the tuple and turn a left-running completion
 							// into an ordinary follow-up (review thread P1).
-							const endpointId = AsyncJobManager.endpointIdOf(asyncJobManager) ?? sessionManager.getSessionId();
+							const endpointId = AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId;
 							const registration = job ? lookupOwnedRegistration(jobId, job.generation, endpointId) : undefined;
 							const ownedCompletion = registration
 								? {
@@ -2004,7 +2061,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// pass the same endpoint the manager's completion callback resolves
 			// (review thread P1). For a top-level session this equals the
 			// session id.
-			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? sessionManager.getSessionId?.() ?? null,
+			getSessionId: () => AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
 			getCredentialSessionId: () => session?.credentialSessionId ?? credentialSessionId,
 			getMcpManager: () => mcpManager ?? options.inheritedMcpManager,
 			isManagedSessionDestination: () => sessionManager.isManagedDestination(),
@@ -2115,17 +2172,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (asyncJobManager) {
 				// Register under the session endpoint so concurrent sessions'
 				// owned work settles in the correct manager (review thread P1).
-				// `session` is not yet constructed here; the session manager id
-				// is the endpoint identity. ADMIT THE ENDPOINT FIRST: a second
+				// `session` is not yet constructed here; the provider identity is
+				// the endpoint identity. ADMIT THE ENDPOINT FIRST: a second
 				// top-level session constructed or resumed under an endpoint id
 				// already held by another LIVE manager must fail construction
 				// BEFORE the global instance is replaced — otherwise the
 				// rejected construction leaves this orphan manager as the
 				// process-global instance, redirecting global-manager
 				// consumers away from the live session (review thread P1).
-				if (!AsyncJobManager.registerForEndpoint(sessionManager.getSessionId(), asyncJobManager)) {
+				if (!AsyncJobManager.registerForEndpoint(asyncJobEndpointId, asyncJobManager)) {
 					throw new Error(
-						`Cannot construct session "${sessionManager.getSessionId()}": the endpoint id is already held by another live async job manager`,
+						`Cannot construct session "${asyncJobEndpointId}": the endpoint id is already held by another live async job manager`,
 					);
 				}
 				asyncJobManagerAdmitted = true;
@@ -2705,6 +2762,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (!options.modelRegistry && !canRefreshModelsBeforeCredentialSelector) {
 				modelRegistry.refreshInBackground();
 			}
+		}
+		// Safety net: every resolution branch above already filters candidates by
+		// `preferredCredentialProvider` (session restore, settings default, fallback
+		// scan via `hasModelApiKey`), but an explicit `--model`/`--models` request for
+		// a different provider takes priority earlier in resolution and would
+		// otherwise silently ignore the preference. Fail closed with a clear error
+		// instead.
+		if (model && preferredCredentialProvider && model.provider !== preferredCredentialProvider) {
+			throw new Error(
+				`--prefer-credential ${options.preferredCredentialSelector?.raw ?? ""} matches ${preferredCredentialProvider}, but the resolved model uses ${model.provider}`,
+			);
 		}
 		const customCommandsResult: CustomCommandsLoadResult = { commands: [], errors: [] };
 
@@ -3518,6 +3586,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			obfuscator,
 			agentId: resolvedAgentId,
 			agentRegistry,
+			asyncJobProviderSessionId: options.providerSessionId,
 			providerSessionId: options.providerSessionId,
 			credentialSessionId: options.credentialSessionId,
 			providerCacheSessionId: providerSessionId,
@@ -3567,10 +3636,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// repeated session churn cannot saturate the registry
 						// (review thread P2). The endpoint is the manager's live
 						// registration key, which survives newSession/switchSession
-						// rekeying and may differ from the provider-facing session id.
+						// rekeying and may differ from the persisted logical session id.
 						if (!options.parentTaskPrefix) {
 							retireOwnedRegistrationsForEndpoint(
-								AsyncJobManager.endpointIdOf(asyncJobManager) ?? session.sessionId,
+								AsyncJobManager.endpointIdOf(asyncJobManager) ?? asyncJobEndpointId,
 							);
 							AsyncJobManager.unregisterManager(asyncJobManager);
 						}

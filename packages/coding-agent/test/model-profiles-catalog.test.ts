@@ -123,6 +123,39 @@ const expectedProfiles: Array<{
 		},
 	},
 	{
+		name: "open-weights-spark",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "muse-spark-1.2:low",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "deepseek-v4-flash:high",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark-luna",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "gpt-5.6-luna:high",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
 		name: "open-weights-glm-deepseek",
 		requiredProviders: [],
 		mapping: {
@@ -593,7 +626,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 46-profile matrix cell-for-cell", () => {
+	test("contains exact 49-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -611,6 +644,9 @@ describe("built-in model profile catalog", () => {
 			"open-weights-deepseek",
 			"open-weights-kimi",
 			"open-weights-luna",
+			"open-weights-spark",
+			"open-weights-spark-deepseek",
+			"open-weights-spark-luna",
 			"open-weights-glm-deepseek",
 			"open-weights-kimi-deepseek",
 			"open-weights-kimi-glm",
@@ -791,6 +827,9 @@ describe("built-in model profile catalog", () => {
 			"open-weights-deepseek",
 			"open-weights-kimi",
 			"open-weights-luna",
+			"open-weights-spark",
+			"open-weights-spark-deepseek",
+			"open-weights-spark-luna",
 			"open-weights-glm-deepseek",
 			"open-weights-kimi-deepseek",
 			"open-weights-kimi-glm",
