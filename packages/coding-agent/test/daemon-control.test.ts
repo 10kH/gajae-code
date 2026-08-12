@@ -2747,7 +2747,7 @@ describe("runDaemonCommand", () => {
 		expect(parsed[0].ownerId).toBe("o1");
 	});
 
-	test("reload prints a human result line", async () => {
+	test("restart prints a human result line", async () => {
 		const status: DaemonStatus = {
 			kind: "telegram",
 			configured: true,
@@ -2763,7 +2763,7 @@ describe("runDaemonCommand", () => {
 		};
 		const out = await captureStdout(() =>
 			runDaemonCommand(
-				{ action: "reload", kinds: ["telegram"], all: false, json: false, force: false },
+				{ action: "restart", kinds: ["telegram"], all: false, json: false, force: false },
 				{ controllers: [fakeController(status, result)] },
 			),
 		);
@@ -2771,7 +2771,7 @@ describe("runDaemonCommand", () => {
 		expect(out).toContain("reloaded telegram daemon");
 	});
 
-	test("a refused reload surfaces recovery guidance and exits non-zero", async () => {
+	test("a refused restart surfaces recovery guidance and exits non-zero", async () => {
 		const prevExit = process.exitCode;
 		const status: DaemonStatus = {
 			kind: "telegram",
@@ -2789,7 +2789,7 @@ describe("runDaemonCommand", () => {
 		};
 		const out = await captureStdout(() =>
 			runDaemonCommand(
-				{ action: "reload", kinds: ["telegram"], all: false, json: false, force: false },
+				{ action: "restart", kinds: ["telegram"], all: false, json: false, force: false },
 				{ controllers: [fakeController(status, result)] },
 			),
 		);

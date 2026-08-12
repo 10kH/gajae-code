@@ -12,6 +12,7 @@ import {
 	formatVerificationFailureForTest,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
+	hasManagedNotifySetup,
 	parseReportedVersionForTest,
 	parseUpdateArgs,
 	replaceBinaryForUpdate,
@@ -19,13 +20,12 @@ import {
 	resolveUpdateDecision,
 	resolveUpdateMethodForTest,
 	runBinaryUpdateFlow,
+	runManagedNotifyRecovery,
 	runPackageManagerUpdateForTest,
 	runUpdateCommand,
-	hasManagedNotifySetup,
-	runManagedNotifyRecovery,
 } from "../src/cli/update-cli";
-import { distTagForChannel, isUpdateChannel } from "../src/config/update-channel";
 import { Settings } from "../src/config/settings";
+import { distTagForChannel, isUpdateChannel } from "../src/config/update-channel";
 import { initTheme } from "../src/modes/theme/theme";
 import { DEFAULT_NPM_REGISTRY } from "../src/utils/npm-registry";
 
@@ -540,7 +540,12 @@ describe("update-cli managed notification recovery", () => {
 
 	it.each(["binary", "bun", "npm"] as const)("runs the verified %s lifecycle in exact order", async method => {
 		const calls: string[] = [];
-		const target = method === "binary" ? { method, path: "/verified/gjc" } : method === "npm" ? { method, packageName: "gajae-code" } : { method };
+		const target =
+			method === "binary"
+				? { method, path: "/verified/gjc" }
+				: method === "npm"
+					? { method, packageName: "gajae-code" }
+					: { method };
 		await runUpdateCommand(
 			{ force: false, check: false },
 			{
@@ -558,11 +563,17 @@ describe("update-cli managed notification recovery", () => {
 							expect(settings).toBeDefined();
 							calls.push("stop --force");
 						},
-						restartDaemon: async () => calls.push("restart"),
-						recoverNotifications: async () => calls.push("notify recovery"),
+						restartDaemon: async () => {
+							calls.push("restart");
+						},
+						recoverNotifications: async () => {
+							calls.push("notify recovery");
+						},
 					});
 				},
-				refreshInstalledDefaultSkills: async () => calls.push("refresh defaults"),
+				refreshInstalledDefaultSkills: async () => {
+					calls.push("refresh defaults");
+				},
 			},
 		);
 		expect(calls).toEqual(["verified install", "stop --force", "restart", "notify recovery", "refresh defaults"]);
@@ -572,7 +583,7 @@ describe("update-cli managed notification recovery", () => {
 		["stop", ["verified install", "stop --force"]],
 		["restart", ["verified install", "stop --force", "restart"]],
 		["recovery", ["verified install", "stop --force", "restart", "notify recovery"]],
-	] as const)("fails closed after %s lifecycle failure", async (failure, expectedCalls) => {
+	] as [string, string[]][])("fails closed after %s lifecycle failure", async (failure, expectedCalls) => {
 		const calls: string[] = [];
 		const errors: string[] = [];
 		const exits: number[] = [];
@@ -605,7 +616,9 @@ describe("update-cli managed notification recovery", () => {
 									if (failure === "recovery") throw new Error("recovery failed");
 								},
 							}),
-						refreshInstalledDefaultSkills: async () => calls.push("refresh defaults"),
+						refreshInstalledDefaultSkills: async () => {
+							calls.push("refresh defaults");
+						},
 						exit: code => {
 							exits.push(code);
 							throw sentinel;
@@ -615,15 +628,45 @@ describe("update-cli managed notification recovery", () => {
 			).rejects.toBe(sentinel);
 			expect(calls).toEqual(expectedCalls);
 			expect(exits).toEqual([1]);
-			const stage = failure === "stop" ? "daemon stop --force" : failure === "restart" ? "daemon restart" : "notify recovery";
-		expect(errors.join("\n")).toContain(`Post-update ${stage} failed`);
+			const stage =
+				failure === "stop" ? "daemon stop --force" : failure === "restart" ? "daemon restart" : "notify recovery";
+			expect(errors.join("\n")).toContain(`Post-update ${stage} failed`);
 			expect(errors.join("\n")).not.toContain("telegram-secret");
 		} finally {
 			errorSpy.mockRestore();
 		}
 	});
 
-	it("does not initialize notification recovery for checks, up-to-date responses, failed installs, or unconfigured settings", async () => {
+	it("reports recovery failure as partial success after the installed runtime verifies", async () => {
+		const errors: string[] = [];
+		const sentinel = new Error("exit");
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => errors.push(String(message)));
+		try {
+			await expect(
+				runUpdateCommand(
+					{ force: false, check: false },
+					{
+						getLatestRelease: async () => release,
+						resolveUpdateTarget: async () => ({ method: "bun" }),
+						performUpdate: async () => ({ ok: true, path: "/verified/gjc" }),
+						runPostUpdateRecovery: async () => {
+							throw new Error("restart failed");
+						},
+						exit: () => {
+							throw sentinel;
+						},
+					},
+				),
+			).rejects.toBe(sentinel);
+			expect(errors.join("\n")).toContain(
+				"Updated to 999.0.0, but post-update recovery failed: Error: restart failed",
+			);
+		} finally {
+			errorSpy.mockRestore();
+		}
+	});
+
+	it("does not initialize notification recovery for checks, up-to-date responses, failed installs, or missing verified runtime identity", async () => {
 		let settingsCalls = 0;
 		const lifecycle = {
 			runPostUpdateRecovery: async () => {
@@ -656,7 +699,35 @@ describe("update-cli managed notification recovery", () => {
 				...lifecycle,
 			},
 		);
-		expect(settingsCalls).toBe(1);
+		expect(settingsCalls).toBe(0);
+	});
+
+	it("runs the verified runtime for an unconfigured install but performs no lifecycle operations", async () => {
+		const calls: string[] = [];
+		await runUpdateCommand(
+			{ force: false, check: false },
+			{
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method: "bun" }),
+				performUpdate: async () => ({ ok: true, path: "/verified/gjc" }),
+				runPostUpdateRecovery: async runtimePath => {
+					expect(runtimePath).toBe("/verified/gjc");
+					await runManagedNotifyRecovery({
+						settings: async () => Settings.isolated(),
+						stopDaemon: async () => {
+							calls.push("stop");
+						},
+						restartDaemon: async () => {
+							calls.push("restart");
+						},
+						recoverNotifications: async () => {
+							calls.push("recovery");
+						},
+					});
+				},
+			},
+		);
+		expect(calls).toEqual([]);
 	});
 });
 

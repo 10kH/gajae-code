@@ -158,5 +158,11 @@ export async function runDaemonCommand(cmd: DaemonCommandArgs, deps: DaemonComma
 	} else {
 		process.stdout.write(`${results.map(formatDaemonResult).join("\n")}\n`);
 	}
-	if (results.some(r => !r.ok)) (deps.setExitCode ?? (code => { process.exitCode = code; }))(DAEMON_EXIT.failure);
+	if (results.some(r => !r.ok))
+		(
+			deps.setExitCode ??
+			(code => {
+				process.exitCode = code;
+			})
+		)(DAEMON_EXIT.failure);
 }

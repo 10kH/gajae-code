@@ -10,19 +10,19 @@ import { pipeline } from "node:stream/promises";
 import { $which, APP_NAME, isEnoent, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
-import { runDaemonCommand } from "./daemon-cli";
-import { runNotifyCommand } from "./notify-cli";
 import { Settings } from "../config/settings";
 import { distTagForChannel, isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
-import { getNotificationConfig, resolveNotificationProvider, type NotificationProvider } from "../sdk/bus/config";
+import { getNotificationConfig, type NotificationProvider, resolveNotificationProvider } from "../sdk/bus/config";
 import {
 	DEFAULT_NPM_REGISTRY,
 	fetchLatestPackageVersion,
 	type Installer,
 	type NpmRegistryLookupOptions,
 } from "../utils/npm-registry";
+import { runDaemonCommand } from "./daemon-cli";
+import { runNotifyCommand } from "./notify-cli";
 
 const RELEASE_REPO = "Yeachan-Heo/gajae-code";
 const PACKAGE = "@gajae-code/coding-agent";
@@ -774,7 +774,7 @@ export interface UpdateCommandDependencies {
 		target: UpdateTarget,
 		expectedVersion: string,
 		registry?: string,
-	) => Promise<InstalledVersionVerification | void>;
+	) => Promise<InstalledVersionVerification | undefined>;
 	refreshInstalledDefaultSkills?: () => Promise<void>;
 	settings?: () => Promise<Settings>;
 	stopDaemon?: (settings: Settings) => Promise<void>;
@@ -806,9 +806,12 @@ async function stopManagedDaemon(settings: Settings): Promise<void> {
 	let failed = false;
 	await runDaemonCommand(
 		{ action: "stop", kinds, all: false, json: false, force: true },
-		{ settings, setExitCode: code => {
-			if (code !== 0) failed = true;
-		} },
+		{
+			settings,
+			setExitCode: code => {
+				if (code !== 0) failed = true;
+			},
+		},
 	);
 	if (failed) throw new Error("daemon stop reported failure");
 }
@@ -818,9 +821,12 @@ async function restartManagedDaemon(settings: Settings): Promise<void> {
 	let failed = false;
 	await runDaemonCommand(
 		{ action: "restart", kinds, all: false, json: false, force: false },
-		{ settings, setExitCode: code => {
-			if (code !== 0) failed = true;
-		} },
+		{
+			settings,
+			setExitCode: code => {
+				if (code !== 0) failed = true;
+			},
+		},
 	);
 	if (failed) throw new Error("daemon restart reported failure");
 }
@@ -977,13 +983,19 @@ export async function runUpdateCommand(
 
 	if (opts.check) return;
 
+	let installedVersion: string | undefined;
 	try {
 		const resolved = target ?? (await resolveTarget());
 		const verification = await update(resolved, release.version, release.registry);
-		if (verification?.path) await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
-		else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
+		if (verification?.path) {
+			installedVersion = release.version;
+			await (deps.runPostUpdateRecovery ?? runPostUpdateRecovery)(verification.path);
+		} else if (!deps.performUpdate) throw new Error("verified installed runtime path is unavailable");
 	} catch (err) {
-		console.error(chalk.red(`Update failed: ${err}`));
+		const prefix = installedVersion
+			? `Updated to ${installedVersion}, but post-update recovery failed`
+			: "Update failed";
+		console.error(chalk.red(`${prefix}: ${err}`));
 		return exit(1);
 	}
 
