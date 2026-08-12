@@ -84,13 +84,13 @@ export interface IndexedSession {
 	activity?: SessionActivity;
 	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
 	lastHeartbeatAt?: number;
-	/** True when more than one unresolved current state-root identity claims this session id. */
+	/** True when more than one unresolved authority-fencing state-root identity claims this session id. */
 	ambiguous: boolean;
 	/** True when the identity's latest event is terminal (DR-1 retains stopped rows for inspection/offline tail). */
 	terminal: boolean;
 }
 
-/** A session can grant endpoint or lifecycle authority only when one current state root claims its id. */
+/** A session can grant endpoint or lifecycle authority only when one authority-fencing state root claims its id. */
 export function isSessionAuthorityEligible(session: Pick<IndexedSession, "ambiguous">): boolean {
 	return session.ambiguous !== true;
 }
@@ -297,6 +297,30 @@ function isUnresolvedEvent(event: SessionIndexEvent): boolean {
 	return !isTerminalEvent(event);
 }
 
+/**
+ * True only for the proven direct-session GC fence row: the `host_registered`
+ * event `main.ts` appends at endpoint generation 0 with the agent dir itself as
+ * the state root. It has never published an endpoint and can never be attached
+ * by SessionRouter (which requires a positive generation and a readable
+ * endpoint), so it must not fence a real endpoint root into ambiguity —
+ * otherwise every interactive session reads ambiguous and no chat daemon can
+ * attach anything.
+ *
+ * The locator is required provenance, not decoration. Without it any admitted
+ * generation-0 `host_registered` from a foreign root would silently stop
+ * fencing, which is fail-open relative to the symmetric fence. Generation 0 is
+ * also emitted by `recordTerminalUncertain` as an unproven `lifecycle_terminal`
+ * claim, and malformed generations are not proof of anything: everything that
+ * is not this exact shape keeps fencing (C5/C6).
+ */
+function isDirectSessionGcFenceRow(event: SessionIndexEvent, agentDir: string): boolean {
+	return (
+		event.type === "host_registered" &&
+		event.endpointGeneration === 0 &&
+		path.resolve(event.locator.stateRoot) === path.resolve(agentDir)
+	);
+}
+
 function preferredIdentity(states: Iterable<SessionIdentityState>): SessionIdentityState | undefined {
 	let preferred: SessionIdentityState | undefined;
 	for (const state of states) {
@@ -356,13 +380,15 @@ function projectIdentity(state: SessionIdentityState, ambiguous: boolean, now: n
 
 /**
  * Total-order projection (C5/C6): first retain every current composite-identity
- * row, then select one public row per session. More than one unresolved state root
- * fences authority. Once exactly one unresolved root remains, its current identity
- * becomes the public authority even when a terminated identity from another root
- * has a higher generation. Heartbeats inherit locator/endpoint metadata from their
- * identity's prior event.
+ * row, then select one public row per session. More than one unresolved
+ * authority-fencing state root fences authority; the direct-session GC fence
+ * row never fences, but still survives as public authority when it is the only
+ * unresolved root left. Once exactly one authority-fencing root remains, its
+ * current identity becomes the public authority even when a terminated identity
+ * from another root has a higher generation. Heartbeats inherit
+ * locator/endpoint metadata from their identity's prior event.
  */
-function reduceEvents(events: SessionIndexEvent[], now: number): SessionIndexProjection {
+function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string): SessionIndexProjection {
 	const { admitted } = admitEvents(events);
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
@@ -397,7 +423,13 @@ function reduceEvents(events: SessionIndexEvent[], now: number): SessionIndexPro
 		}
 		rootStates.push(state);
 	}
+	// Two views of the same roots. `fencingRoots` holds the roots that may claim
+	// authority: more than one fences the session, and exactly one is the sole
+	// surviving authority. `unresolvedRoots` additionally holds the
+	// direct-session GC fence row, which never fences and only becomes public
+	// authority when no fencing root is left at all.
 	const unresolvedRoots = new Map<string, Map<string, SessionIdentityState[]>>();
+	const fencingRoots = new Map<string, Map<string, SessionIdentityState[]>>();
 	for (const [sessionId, roots] of rootsBySession) {
 		for (const [root, rootStates] of roots) {
 			const current = preferredIdentity(rootStates);
@@ -408,19 +440,31 @@ function reduceEvents(events: SessionIndexEvent[], now: number): SessionIndexPro
 				unresolvedRoots.set(sessionId, unresolved);
 			}
 			unresolved.set(root, rootStates);
+			if (isDirectSessionGcFenceRow(current.latest, agentDir)) continue;
+			let fencing = fencingRoots.get(sessionId);
+			if (fencing === undefined) {
+				fencing = new Map<string, SessionIdentityState[]>();
+				fencingRoots.set(sessionId, fencing);
+			}
+			fencing.set(root, rootStates);
 		}
 	}
 	const identities: IndexedSession[] = [];
 	const sessions: IndexedSession[] = [];
 	for (const [sessionId, states] of statesBySession) {
-		const roots = unresolvedRoots.get(sessionId);
-		const ambiguous = (roots?.size ?? 0) > 1;
+		const fencing = fencingRoots.get(sessionId);
+		const unresolved = unresolvedRoots.get(sessionId);
+		const ambiguous = (fencing?.size ?? 0) > 1;
 		for (const state of states) identities.push(projectIdentity(state, ambiguous, now));
 		const defaultAuthority = preferredIdentity(states);
 		if (defaultAuthority === undefined || defaultAuthority.latest.type === "session_deleted") continue;
 		let authority = defaultAuthority;
-		if (roots?.size === 1) {
-			const onlyRoot = roots.values().next().value;
+		// A sole fencing root outranks any terminated identity from another root,
+		// including a higher-generation one. Only when nothing can claim authority
+		// does a lone GC fence row become the public survivor.
+		const survivingRoots = fencing?.size === 1 ? fencing : (fencing?.size ?? 0) === 0 ? unresolved : undefined;
+		if (survivingRoots?.size === 1) {
+			const onlyRoot = survivingRoots.values().next().value;
 			const survivingAuthority = onlyRoot ? preferredIdentity(onlyRoot) : undefined;
 			if (survivingAuthority !== undefined) authority = survivingAuthority;
 		}
@@ -868,15 +912,25 @@ export class SessionIndex {
 					await writeAndSync(path.join(quarantinePath, "index.snapshot.json"), scan.snapshotContents);
 				if (scan.logContents) await writeAndSync(path.join(quarantinePath, "index.jsonl"), scan.logContents);
 				await syncDirectory(path.join(quarantinePath, "index.jsonl"));
-				const events = [...scan.snapshotEvents, ...scan.validLogEvents];
+				// Repair republishes the surviving history as the new snapshot, so it must
+				// apply the same retention the ordinary snapshot path applies. Writing the
+				// raw survivor set instead let one repair of a long-lived index restore an
+				// unbounded snapshot, and every later locked transaction then re-parsed that
+				// whole history while holding the index lock — the broker burns CPU and
+				// unrelated launches time out waiting for the lock.
+				const events = compactEvents([...scan.snapshotEvents, ...scan.validLogEvents], this.#policy);
 				const snapshot = JSON.stringify({
 					version: SESSION_INDEX_SNAPSHOT_VERSION,
 					indexSeq: scan.diagnosis.validPrefixSeq,
 					events,
 				});
-				const log = scan.validLogEvents.map(event => JSON.stringify(event)).join("\n");
 				await replaceAtomically(snapshotFor(this.#agentDir), snapshot);
-				await replaceAtomically(logFor(this.#agentDir), log ? `${log}\n` : "");
+				// The republished snapshot already carries the full surviving history (after
+				// compaction), so the log must be truncated to match: leaving the original
+				// events in place keeps every subsequent #scan() parsing them under the lock
+				// — the same starvation the compaction above is meant to end. This mirrors
+				// #rotate(), which writes an empty log after snapshotting.
+				await replaceAtomically(logFor(this.#agentDir), "");
 				await this.#replayUnderLock();
 				return { ...scan.diagnosis, repaired: true, quarantinePath };
 			});
@@ -1090,26 +1144,14 @@ export class SessionIndex {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
 		}
 		if (isValidSnapshot(current) && current.indexSeq > this.indexSeq) return;
-		const tmp = `${file}.${process.pid}.tmp`;
-		await fs.writeFile(
-			tmp,
+		await replaceAtomically(
+			file,
 			JSON.stringify({
 				version: SESSION_INDEX_SNAPSHOT_VERSION,
 				indexSeq: this.indexSeq,
 				events: compactEvents(this.#events, this.#policy),
 			}),
-			{
-				mode: 0o600,
-			},
 		);
-		const h = await fs.open(tmp, "r");
-		try {
-			await h.sync();
-		} finally {
-			await h.close();
-		}
-		await fs.rename(tmp, file);
-		await syncDirectory(file);
 	}
 	/**
 	 * Broker-scheduled compaction (C3), independent of rotation size: applies the
@@ -1137,7 +1179,7 @@ export class SessionIndex {
 	listSessions(): SessionList {
 		return {
 			indexSeq: this.indexSeq,
-			sessions: reduceEvents(this.#events, this.#policy.clock()).sessions,
+			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).sessions,
 			warnings: this.#warnings,
 		};
 	}
@@ -1147,7 +1189,7 @@ export class SessionIndex {
 	 * disturbing the surviving authority.
 	 */
 	listSessionIdentities(): IndexedSession[] {
-		return reduceEvents(this.#events, this.#policy.clock()).identities;
+		return reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).identities;
 	}
 
 	/**
@@ -1164,12 +1206,21 @@ export class SessionIndex {
 	async checkpointLiveHeartbeats(now = Date.now()): Promise<number> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
-			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			// An absent index holds no registration to checkpoint, so this pass must read
+			// it as "nothing to do" instead of creating one. Recreating the directory
+			// resurrects a state root its owner already retired: the broker's 5s
+			// publication watch would rebuild a removed agent dir after shutdown.
+			try {
+				await fs.stat(dirFor(this.#agentDir));
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+				throw error;
+			}
 			return await withFileLock(logFor(this.#agentDir), async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) return 0;
 				const events: SessionIndexEvent[] = [];
-				const rows = reduceEvents(this.#events, now).sessions;
+				const rows = reduceEvents(this.#events, now, this.#agentDir).sessions;
 				for (const row of rows) {
 					if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
 					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)

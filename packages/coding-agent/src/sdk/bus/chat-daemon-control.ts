@@ -112,10 +112,11 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 56 / Slack generation 62 fence durable provider-post and thread-effect recovery by attachment identity.
  * Discord generation 57 removes missing-authority wildcard behavior from durable binding checks.
  * Discord generation 58 preserves exact authority through unarchive replacement fallback.
+ * Discord generation 59 / Slack generation 63 derive attachment authority ids from one Router function so persisted provider bindings and live attachments cannot drift apart.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 58,
-	slack: 62,
+	discord: 60,
+	slack: 64,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -569,9 +570,18 @@ export class ChatDaemonController implements BuiltInDaemonController {
 		const warnings = before.runtime.warning ? [before.runtime.warning] : [];
 		if (!before.configured)
 			return this.result(action, false, `${this.kind} notifications are not configured`, before, before, warnings);
-		if (action === "reload" && !this.effectivelyEnabled()) {
+		if (action === "reload" && !this.effectivelyEnabled() && !opts.allowDisabledNoop) {
 			return this.result(action, false, `${this.kind} notifications are not enabled`, before, before, warnings);
 		}
+		if (action === "reload" && !this.effectivelyEnabled())
+			return this.result(
+				action,
+				true,
+				`${this.kind} notifications are disabled; leaving daemon stopped`,
+				before,
+				before,
+				warnings,
+			);
 		const state = await readChatDaemonState(this.settings.getAgentDir(), this.kind);
 		const classification = this.classify(state, this.identity());
 		if (classification === "newer")

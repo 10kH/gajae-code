@@ -17,7 +17,39 @@ import {
 	requestPreparedSessionActivation,
 	SessionActivationError,
 } from "../session-activation";
-import { ACP_SESSION_RECONNECT } from "../session-reconnect";
+import { ACP_SESSION_RECONNECT, SESSION_REQUEST_TIMEOUT_MS } from "../session-reconnect";
+
+/**
+ * Exact identity of one attached SDK session endpoint. Providers persist it next to
+ * their conversation state and re-prove it before every resume, so it must be derived
+ * in exactly one place: a caller that recomputes the digest by hand silently stops
+ * matching the moment the bound fields change.
+ */
+export function sessionAttachmentAuthorityId(input: {
+	sessionId: string;
+	generation: number;
+	pid: number;
+	endpointMtimeMs: number | undefined;
+	url: string;
+	token: string;
+}): string {
+	const endpointAuthorityDigest = crypto
+		.createHash("sha256")
+		.update(JSON.stringify({ url: input.url, token: input.token }))
+		.digest("hex");
+	return crypto
+		.createHash("sha256")
+		.update(
+			JSON.stringify({
+				sessionId: input.sessionId,
+				generation: input.generation,
+				pid: input.pid,
+				endpointMtimeMs: input.endpointMtimeMs,
+				endpointAuthorityDigest,
+			}),
+		)
+		.digest("hex");
+}
 
 /** The only capability a provider may retain for an attached SDK session. */
 export interface SessionAttachment {
@@ -451,7 +483,13 @@ export class SessionRouter {
 				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 			}
 		}
-		const response = await attached.client.request(this.#prepareFrame(attached, frame), options);
+		// A caller that sized its own budget keeps it; everything else gets the
+		// long-lived session budget instead of the transport's one-shot default,
+		// which a cold host's first credential-collecting query outruns (#4258).
+		const response = await attached.client.request(this.#prepareFrame(attached, frame), {
+			...options,
+			timeoutMs: options?.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+		});
 		if (
 			!this.#attachmentPublished(attached) ||
 			(expectedGeneration !== undefined && attached.generation !== expectedGeneration) ||
@@ -869,23 +907,15 @@ export class SessionRouter {
 		const barrier: ReplayBarrier = { held: undefined, detached: false, failed: false };
 		const publication = Promise.withResolvers<void>();
 		void publication.promise.catch(() => undefined);
-		const endpointAuthorityDigest = crypto
-			.createHash("sha256")
-			.update(JSON.stringify({ url: endpoint.url, token: endpoint.token }))
-			.digest("hex");
 		const capability: SessionAttachment = Object.freeze({
-			authorityId: crypto
-				.createHash("sha256")
-				.update(
-					JSON.stringify({
-						sessionId: indexed.sessionId,
-						generation: indexed.endpointGeneration,
-						pid: indexed.pid,
-						endpointMtimeMs: indexed.endpointMtimeMs,
-						endpointAuthorityDigest,
-					}),
-				)
-				.digest("hex"),
+			authorityId: sessionAttachmentAuthorityId({
+				sessionId: indexed.sessionId,
+				generation: indexed.endpointGeneration,
+				pid: indexed.pid,
+				endpointMtimeMs: indexed.endpointMtimeMs,
+				url: endpoint.url,
+				token: endpoint.token,
+			}),
 			sessionId: indexed.sessionId,
 			generation: indexed.endpointGeneration,
 			get connectionId(): string | undefined {

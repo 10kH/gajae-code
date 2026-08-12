@@ -1,5 +1,6 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
+import { logger } from "@gajae-code/utils";
 import type { AgentSession, DefaultFallbackRuntimeState } from "../session/agent-session";
 import { clampExplicitThinkingLevelForModel, formatClampedModelSelector } from "../thinking";
 import { validateModelProfileName } from "./model-profile-contract";
@@ -48,6 +49,8 @@ type ModelProfileActivationSession = Pick<
 	clearProfileInstalledOverrides?: () => void;
 	/** Current profile-installed override keys, for deriving the activation base. */
 	getProfileInstalledOverrideKeys?: () => { modelRoles: readonly string[]; agentModelOverrides: readonly string[] };
+	/** Re-apply vendor-separated delegation (task tool + prompt) after the role layer changed. */
+	syncEagerDelegation?: () => Promise<void>;
 	getSessionDefaultModelSelector?: () => string | undefined;
 	recordResumeDefaultModel?: (selector: string | undefined) => void;
 	seedDefaultFallbackResolution?: (activeIndex: number, skips: Array<{ selector: string; reason: string }>) => void;
@@ -92,6 +95,7 @@ export interface PrepareModelProfileActivationOptions {
 			Pick<
 				ModelRegistry,
 				| "getAvailable"
+				| "getAvailableForProfileActivation"
 				| "resolveModelByLookupAlias"
 				| "lookupAliasExists"
 				| "clearCanonicalVariant"
@@ -572,7 +576,9 @@ function rewriteSelectorForProxy(
 	const proxyModels = allModels.filter(model => model.provider === proxyProvider);
 	if (slash < 0) {
 		if (proxyMode === "fallback") return selector;
-		const matches = proxyModels.filter(model => model.id === baseSelector);
+		const exactMatches = proxyModels.filter(model => model.id === baseSelector);
+		const finalSegmentMatches = proxyModels.filter(model => model.id.split("/").at(-1) === baseSelector);
+		const matches = exactMatches.length > 0 ? exactMatches : finalSegmentMatches;
 		if (matches.length !== 1) {
 			throw new Error(
 				`Configured proxy "${proxyProvider}" does not expose an unambiguous model for "${baseSelector}"`,
@@ -950,7 +956,10 @@ export async function prepareModelProfileActivation(
 			);
 		}
 
-		const availableModels = options.modelRegistry.getAvailable?.() ?? options.modelRegistry.getAll();
+		const availableModels =
+			options.modelRegistry.getAvailableForProfileActivation?.() ??
+			options.modelRegistry.getAvailable?.() ??
+			options.modelRegistry.getAll();
 		let bindings = resolveProfileBindings(profile);
 		if (missingProviders.length > 0 && alternativeGroups.length > 0) {
 			bindings = rewriteBindingsProviders(bindings, new Set(authenticatedProviders), alternativeGroups);
@@ -1295,6 +1304,18 @@ export async function applyPreparedModelProfileActivation(
 			);
 		}
 		throw error;
+	}
+	// The installed role layer decides whether this profile is vendor-separated,
+	// so delegation must be re-applied to the live session rather than only to
+	// sessions started after activation. Activation itself already succeeded; a
+	// failed refresh must not roll it back.
+	try {
+		await prepared.session.syncEagerDelegation?.();
+	} catch (error) {
+		logger.warn("Failed to sync eager delegation after model profile activation", {
+			profile: prepared.profileName,
+			error: error instanceof Error ? error.message : String(error),
+		});
 	}
 }
 
