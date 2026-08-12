@@ -369,7 +369,7 @@ const expectedProfiles: Array<{
 		requiredProviders: ["xai"],
 		mapping: {
 			default: "xai/grok-4.5:low",
-			executor: "xai/grok-4.5:minimal",
+			executor: "xai/grok-4.5:low",
 			planner: "xai/grok-4.5:low",
 			critic: "xai/grok-4.5:medium",
 			architect: "xai/grok-4.5:high",
@@ -395,6 +395,39 @@ const expectedProfiles: Array<{
 			planner: "xai/grok-4.5:high",
 			critic: "xai/grok-4.5:high",
 			architect: "xai/grok-4.5:high",
+		},
+	},
+	{
+		name: "grok-46-eco",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:low",
+			executor: "xai/grok-4.6:low",
+			planner: "xai/grok-4.6:low",
+			critic: "xai/grok-4.6:medium",
+			architect: "xai/grok-4.6:high",
+		},
+	},
+	{
+		name: "grok-46-medium",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:medium",
+			executor: "xai/grok-4.6:low",
+			planner: "xai/grok-4.6:medium",
+			critic: "xai/grok-4.6:high",
+			architect: "xai/grok-4.6:high",
+		},
+	},
+	{
+		name: "grok-46-pro",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:xhigh",
+			executor: "xai/grok-4.6:medium",
+			planner: "xai/grok-4.6:high",
+			critic: "xai/grok-4.6:xhigh",
+			architect: "xai/grok-4.6:xhigh",
 		},
 	},
 	{
@@ -779,6 +812,7 @@ describe("built-in model profile catalog", () => {
 		expect(
 			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["qwen3.8-max-preview"],
 		).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>).xai?.["grok-4.6"]).toBeDefined();
 	});
 
 	test("plain minimax provider does not appear in catalog or recommendations", () => {
@@ -801,6 +835,9 @@ describe("built-in model profile catalog", () => {
 			"grok-45-eco": "Grok 4.5 Eco",
 			"grok-45-medium": "Grok 4.5 Medium",
 			"grok-45-pro": "Grok 4.5 Pro",
+			"grok-46-eco": "Grok 4.6 Eco",
+			"grok-46-medium": "Grok 4.6 Medium",
+			"grok-46-pro": "Grok 4.6 Pro",
 		})) {
 			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "GROK" });
 		}
@@ -845,7 +882,7 @@ describe("built-in model profile catalog", () => {
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-sgp", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-ams", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-cn", profiles)?.name).toBe("mimo-medium");
-		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-medium");
+		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-46-medium");
 		expect(recommendModelProfileForProvider("grok-build", profiles)?.name).toBe("grok-build-pro");
 		expect(recommendModelProfileForProvider("cursor", profiles)?.name).toBe("cursor-medium");
 		expect(recommendModelProfileForProvider("alibaba-token-plan", profiles)?.name).toBe(

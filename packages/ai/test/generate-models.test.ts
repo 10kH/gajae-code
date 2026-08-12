@@ -33,7 +33,7 @@ describe("injectImageGenerationModels", () => {
 });
 
 describe("injectAlibabaTokenPlanModels", () => {
-	it("adds the DeepSeek V4 Flash 0731 and Qwen 3.8 Max fallbacks exactly once", () => {
+	it("adds the DeepSeek and Qwen 3.8 Max fallbacks exactly once", () => {
 		const models: Model[] = [];
 
 		injectAlibabaTokenPlanModels(models);
@@ -62,7 +62,43 @@ describe("injectAlibabaTokenPlanModels", () => {
 				contextWindow: 1_000_000,
 				maxTokens: 65_536,
 			}),
+			expect.objectContaining({
+				id: "qwen3.8-max-preview",
+				name: "Qwen3.8 Max Preview",
+				api: "openai-responses",
+				provider: "alibaba-token-plan",
+				reasoning: true,
+				input: ["text"],
+				contextWindow: 1_000_000,
+				maxTokens: 65_536,
+			}),
 		]);
+	});
+
+	it("restores the Qwen preview Responses transport over discovered metadata", () => {
+		const models: Model[] = [
+			{
+				id: "qwen3.8-max-preview",
+				name: "Discovered preview",
+				api: "openai-completions",
+				provider: "alibaba-token-plan",
+				baseUrl: "https://example.invalid",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 1, output: 1, cacheRead: 1, cacheWrite: 1 },
+				contextWindow: 1,
+				maxTokens: 1,
+			},
+		];
+
+		injectAlibabaTokenPlanModels(models);
+
+		expect(models[0]).toMatchObject({
+			api: "openai-responses",
+			input: ["text"],
+			contextWindow: 1_000_000,
+			maxTokens: 65_536,
+		});
 	});
 
 	it("removes every legacy Qwen 3.8 Max alias before restoring the canonical model", () => {

@@ -41,6 +41,34 @@ describe("thinking control modes", () => {
 });
 
 describe("model thinking metadata", () => {
+	it("exposes the exact direct xAI Grok 4.5 and 4.6 effort ranges", () => {
+		const grok45 = createModel({
+			id: "grok-4.5",
+			api: "openai-completions",
+			provider: "xai",
+		});
+		const grok46 = createModel({
+			id: "grok-4.6",
+			api: "openai-completions",
+			provider: "xai",
+		});
+
+		expect(grok45.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.High,
+		});
+		expect(grok46.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.XHigh,
+		});
+		expect(() => requireSupportedEffort(grok45, Effort.Minimal)).toThrow(/not supported/);
+		expect(() => requireSupportedEffort(grok45, Effort.XHigh)).toThrow(/not supported/);
+		expect(() => requireSupportedEffort(grok46, Effort.Minimal)).toThrow(/not supported/);
+		expect(() => requireSupportedEffort(grok46, Effort.Max)).toThrow(/not supported/);
+	});
+
 	it("exposes Alibaba DeepSeek V4 Flash's documented low/high/max efforts", () => {
 		const model = createModel({
 			id: "deepseek-v4-flash-0731",
@@ -223,6 +251,29 @@ describe("model thinking metadata", () => {
 });
 
 describe("generated model policies", () => {
+	it("corrects stale direct xAI Grok reasoning metadata before enrichment", () => {
+		const models = [
+			createModel({ id: "grok-4.5", api: "openai-completions", provider: "xai", reasoning: false }),
+			createModel({ id: "grok-4.6", api: "openai-completions", provider: "xai", reasoning: false }),
+			createModel({ id: "grok-4.6", api: "openai-completions", provider: "openrouter", reasoning: false }),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]).toMatchObject({
+			reasoning: true,
+			thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+		});
+		expect(models[1]).toMatchObject({
+			reasoning: true,
+			maxTokens: 32_000,
+			thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh },
+		});
+		expect(models[0]?.maxTokens).toBe(32_000);
+		expect(models[2]?.reasoning).toBe(false);
+		expect(models[2]?.thinking).toBeUndefined();
+	});
+
 	it("corrects Alibaba DeepSeek V4 Flash discovery before thinking enrichment", () => {
 		const models: Model<Api>[] = [
 			createModel({
