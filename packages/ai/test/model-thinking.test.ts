@@ -714,6 +714,33 @@ describe("model thinking runtime helpers", () => {
 		);
 	});
 
+	it("preserves Muse Spark xhigh through shared runtime policy inference", () => {
+		const models: Model<"openai-completions">[] = [
+			{
+				id: "meta/muse-spark-1.2",
+				name: "Meta: Muse Spark 1.2",
+				api: "openai-completions",
+				provider: "openrouter",
+				baseUrl: "https://openrouter.ai/api/v1",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
+				contextWindow: 1_048_576,
+				maxTokens: 1_048_576,
+			},
+		];
+
+		applyGeneratedModelPolicies(models);
+		const model = models[0]!;
+
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.XHigh,
+		});
+		expect(requireSupportedEffort(model, Effort.XHigh)).toBe(Effort.XHigh);
+	});
+
 	it("enables xhigh for openai-responses and openai-codex-responses APIs", () => {
 		const responsesModel = createModel({
 			id: "custom-responses",
