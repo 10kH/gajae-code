@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added three provider-agnostic Muse Spark 1.2 presets: Muse Spark across all roles, plus DeepSeek and Luna executor variants.
 - Hook discovery now records one canonical six-kind normalization contract while preserving each existing runtime's real authority and semantics. Native/Claude/Codex directory modules are validated before import and adapted into the session `ExtensionRunner`, constrained plugin batches validate atomically before registration and route after-phases to the post-tool path without gaining blocking authority, unsupported aliases and malformed matchers fail closed with stable diagnostics, and Codex-managed command timing/trust/redaction remain explicitly provider-owned.
 
 - GJC plugin bundle manifests now accept the Claude Code/Codex-familiar `mcpServers` map alias and normalize transport-relevant, end-to-end representable fields into the canonical `mcps` array (per-server `type` maps to `transport`; `command` implies `stdio`, a bare `url` implies `http`), so canonical and alias manifests compile to byte-equivalent normalized surfaces. Ambiguous or unrepresentable aliases (`mcp`, a top-level `skills`/`agents`/`commands`/`slash-commands`, Claude Code-shaped or hybrid hooks, transport-incompatible MCP fields, or `mcpServers` entries with `env`/`auth`/`oauth`/`headers`/enablement controls) now fail with targeted migration diagnostics naming the canonical form and the loose `.gjc/` surface, instead of generic unknown/forbidden-key failures.
