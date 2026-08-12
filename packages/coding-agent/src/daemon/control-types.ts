@@ -8,7 +8,8 @@
 
 export type DaemonKind = "telegram" | "discord" | "slack";
 
-export type DaemonAction = "list" | "status" | "stop" | "reload";
+/** `reload` remains the controller result verb; `restart` is the CLI canonical action. */
+export type DaemonAction = "list" | "status" | "stop" | "restart" | "reload";
 
 export type DaemonHealth = "not_configured" | "stopped" | "running" | "stale" | "stopping" | "error";
 

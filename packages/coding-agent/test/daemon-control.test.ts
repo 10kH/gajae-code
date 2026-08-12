@@ -242,7 +242,7 @@ describe("parseDaemonArgs", () => {
 	test("parses all kinds and internal worker flags", () => {
 		const parsed = parseDaemonArgs([
 			"daemon",
-			"reload",
+			"restart",
 			"telegram",
 			"discord",
 			"slack",
@@ -253,7 +253,7 @@ describe("parseDaemonArgs", () => {
 			"1500",
 		]);
 		expect(parsed).toMatchObject({
-			action: "reload",
+			action: "restart",
 			kinds: ["telegram", "discord", "slack"],
 			all: true,
 			json: true,
@@ -282,8 +282,9 @@ describe("parseDaemonArgs", () => {
 		).rejects.toBeInstanceOf(UnknownDaemonKindError);
 	});
 
-	test("resolves the restart alias to reload and parses --verbose/-v", () => {
-		expect(parseDaemonArgs(["daemon", "restart"])?.action).toBe("reload");
+	test("keeps restart canonical and accepts reload as an alias", () => {
+		expect(parseDaemonArgs(["daemon", "restart"])?.action).toBe("restart");
+		expect(parseDaemonArgs(["daemon", "reload"])?.action).toBe("restart");
 		expect(parseDaemonArgs(["daemon", "restart", "telegram"])?.kinds).toEqual(["telegram"]);
 		expect(parseDaemonArgs(["daemon", "status", "--verbose"])?.verbose).toBe(true);
 		expect(parseDaemonArgs(["daemon", "status", "-v"])?.verbose).toBe(true);
@@ -292,11 +293,11 @@ describe("parseDaemonArgs", () => {
 });
 
 describe("daemon operator contract", () => {
-	test("resolveDaemonAction maps canonical verbs and the restart alias", () => {
+	test("resolveDaemonAction maps canonical restart and the reload alias", () => {
 		expect(resolveDaemonAction("status")).toBe("status");
-		expect(resolveDaemonAction("reload")).toBe("reload");
-		expect(resolveDaemonAction("restart")).toBe("reload");
-		expect(DAEMON_ACTION_ALIASES.restart).toBe("reload");
+		expect(resolveDaemonAction("reload")).toBe("restart");
+		expect(resolveDaemonAction("restart")).toBe("restart");
+		expect(DAEMON_ACTION_ALIASES.reload).toBe("restart");
 		expect(resolveDaemonAction("bogus")).toBeUndefined();
 		expect(resolveDaemonAction(undefined)).toBeUndefined();
 	});
