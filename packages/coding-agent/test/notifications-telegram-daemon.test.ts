@@ -305,9 +305,8 @@ describe("Telegram provider supervisor ownership", () => {
 	});
 	test("threaded mode admits an ordinary endpoint and keeps its topic", async () => {
 		const agentDir = tempAgentDir();
-		let now = 1_000;
+		const now = 1_000;
 		const calls: string[] = [];
-		let scheduledCleanup: (() => void) | undefined;
 		const botApi: BotApi = {
 			call: async method => {
 				calls.push(method);
@@ -325,10 +324,7 @@ describe("Telegram provider supervisor ownership", () => {
 			now: () => now,
 			installationHostId: "provider-owner",
 			requireTelegramTopicEligibility: true,
-			setTimeoutImpl: callback => {
-				scheduledCleanup = () => callback();
-				return setTimeout(() => {}, 0);
-			},
+			setTimeoutImpl: () => setTimeout(() => {}, 0),
 		});
 		try {
 			fs.mkdirSync(path.dirname(statePath), { recursive: true });
