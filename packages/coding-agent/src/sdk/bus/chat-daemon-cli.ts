@@ -58,8 +58,10 @@ function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		// Only ESRCH proves the launcher is gone. Permission and unknown probe
+		// failures are indeterminate and must not authorize a detached worker.
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
 	}
 }
 

@@ -116,10 +116,13 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 61 fences master-channel worker lifecycle and delivery authority.
  * Discord generation 62 / Slack generation 65 fence the Windows process-incarnation
  * authority change (#4362): the native binding fallback no longer spawns powershell.exe.
+ * Discord generation 63 / Slack generation 66 retain the shared ownership fence
+ * unless a zero-signal process probe returns ESRCH. EPERM and unknown failures are
+ * indeterminate, so earlier owners must not reclaim, replace, or spawn through them.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 62,
-	slack: 65,
+	discord: 63,
+	slack: 66,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {
@@ -384,8 +387,10 @@ function defaultPidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
-	} catch {
-		return false;
+	} catch (error) {
+		// Only ESRCH proves the process is gone. EPERM and other probe failures are
+		// indeterminate and must retain ownership rather than permit replacement.
+		return (error as NodeJS.ErrnoException).code !== "ESRCH";
 	}
 }
 /** Windows process ownership uses immutable StartTime/FileTime provenance through
