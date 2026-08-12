@@ -111,7 +111,7 @@ export class MasterDaemonClient implements MasterDaemonWorkerClientLike {
 	#transportDisposer: (() => void) | undefined;
 	#connectTask: Promise<this> | undefined;
 	#reconnectTask: Promise<void> | undefined;
-	#reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	#reconnectTimer: NodeJS.Timeout | undefined;
 	#reconnectAttempt = 0;
 	#registrationTimer: NodeJS.Timeout | undefined;
 	#lastSeq = 0;
@@ -488,14 +488,15 @@ export class MasterDaemonClient implements MasterDaemonWorkerClientLike {
 	}
 
 	async #withTimeout<T>(value: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<never>((_, reject) => {
-			timer = setTimeout(() => reject(new MasterDaemonClientError(`${label} timed out`, "timeout")), timeoutMs);
-		});
+		const { promise: timeout, reject } = Promise.withResolvers<never>();
+		const timer: NodeJS.Timeout = setTimeout(
+			() => reject(new MasterDaemonClientError(`${label} timed out`, "timeout")),
+			timeoutMs,
+		);
 		try {
 			return await Promise.race([value, timeout]);
 		} finally {
-			if (timer !== undefined) clearTimeout(timer);
+			clearTimeout(timer);
 		}
 	}
 }

@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { DaemonHealth, DaemonOperationOptions, DaemonRuntimeInfo } from "../daemon/control-types";
 import { MASTER_OWNER_INTERNAL_ACTION } from "../daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
+import type { MasterDaemonStatus as MasterDaemonRuntimeStatus } from "./daemon";
 import {
 	DEFAULT_MASTER_DAEMON_HEARTBEAT_TTL_MS,
 	MASTER_DAEMON_LIFECYCLE_VERSION,
@@ -39,7 +40,7 @@ export interface MasterDaemonLike {
 	start(): Promise<void>;
 	stop(options?: { readonly drain?: boolean; readonly timeoutMs?: number }): Promise<MasterDaemonOperationResult>;
 	reload(options?: { readonly drain?: boolean; readonly timeoutMs?: number }): Promise<MasterDaemonOperationResult>;
-	status(): Promise<import("./daemon").MasterDaemonStatus>;
+	status(): Promise<MasterDaemonRuntimeStatus>;
 }
 
 export type MasterDaemonFactory =
@@ -575,7 +576,7 @@ export class MasterDaemonController {
 
 	async #statusFromLifecycle(
 		lifecycle: LifecycleSnapshot,
-		actual?: import("./daemon").MasterDaemonStatus,
+		actual?: MasterDaemonRuntimeStatus,
 	): Promise<MasterDaemonStatus> {
 		const { root, owner, heartbeat, state } = lifecycle;
 		const configured = state !== null ? state.masterNames.length > 0 : await configuredFromRoot(root);

@@ -529,10 +529,10 @@ export class MasterSdkClient {
 		const url = new URL(options.url);
 		url.searchParams.set("token", options.token);
 		this.#socket = new WebSocketConstructor(url.toString());
-		this.#hello = new Promise((resolve, reject) => {
-			this.#helloResolve = resolve;
-			this.#helloReject = reject;
-		});
+		const hello = Promise.withResolvers<Extract<MasterServerFrame, { type: "hello" }>>();
+		this.#hello = hello.promise;
+		this.#helloResolve = hello.resolve;
+		this.#helloReject = hello.reject;
 		this.#socket.onmessage = event =>
 			this.#onMessage(typeof event.data === "string" ? event.data : String(event.data));
 		this.#socket.onerror = () => this.#fail(new Error("master SDK websocket error"));
@@ -563,12 +563,11 @@ export class MasterSdkClient {
 	async request(frame: MasterClientFrame): Promise<MasterServerFrame> {
 		const requestId = "requestId" in frame ? frame.requestId : null;
 		if (requestId === null) throw new Error("master SDK request requires requestId");
-		const response = new Promise<MasterServerFrame>((resolve, reject) => {
-			this.#pending.set(requestId, { resolve, reject });
-		});
+		const response = Promise.withResolvers<MasterServerFrame>();
+		this.#pending.set(requestId, { resolve: response.resolve, reject: response.reject });
 		try {
 			await this.send(frame);
-			return await response;
+			return await response.promise;
 		} finally {
 			this.#pending.delete(requestId);
 		}

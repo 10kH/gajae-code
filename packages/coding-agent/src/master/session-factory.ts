@@ -16,7 +16,7 @@ import { EventBus } from "../utils/event-bus";
 import type { MasterCoordinatorGateway } from "./coordinator-gateway";
 import type { MasterDomainStore } from "./domain-store";
 import { createUnavailableMemoryContract, type MemoryContract } from "./memory-contract";
-import { getMasterPaths } from "./paths";
+import { getMasterPaths, type MasterPaths } from "./paths";
 import systemPrompt from "./prompts/system.md" with { type: "text" };
 import {
 	createMasterOrchestrationTools,
@@ -244,10 +244,7 @@ function buildToolDependencies(
 	};
 }
 
-function validateInjectedSessionManagerProfile(
-	manager: SessionManager,
-	paths: ReturnType<typeof getMasterPaths>,
-): void {
+function validateInjectedSessionManagerProfile(manager: SessionManager, paths: MasterPaths): void {
 	if (path.resolve(manager.getSessionDir()) !== path.resolve(paths.sessionDir))
 		throw new Error("Injected master session manager is outside the master session destination.");
 	const candidate = manager as unknown as {

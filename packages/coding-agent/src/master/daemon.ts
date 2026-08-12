@@ -1,4 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import type { Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -208,7 +209,7 @@ async function ensurePrivateDirectory(directory: string): Promise<void> {
 	await fs.chmod(directory, 0o700);
 }
 
-async function lstatOrNull(filePath: string): Promise<import("node:fs").Stats | null> {
+async function lstatOrNull(filePath: string): Promise<Stats | null> {
 	try {
 		return await fs.lstat(filePath);
 	} catch (error) {
@@ -373,7 +374,7 @@ export class MasterDaemon {
 	#draining = false;
 	#startPromise: Promise<void> | null = null;
 	#stopPromise: Promise<MasterDaemonOperationResult> | null = null;
-	#heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+	#heartbeatTimer: NodeJS.Timeout | null = null;
 	#owner: MasterDaemonOwnerRecord | null = null;
 	#authorityFingerprint: string | undefined;
 
