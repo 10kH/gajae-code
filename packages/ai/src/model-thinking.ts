@@ -58,6 +58,8 @@ const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effo
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
 const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 const DEEPSEEK_V4_FLASH_0731_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const GROK_4_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
+const GROK_4_6_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
@@ -206,6 +208,9 @@ export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): A
 export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	for (let index = 0; index < models.length; index++) {
 		const source = models[index]!;
+		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
+			source.reasoning = true;
+		}
 		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
 			source.reasoning = true;
 			source.name = "DeepSeek V4 Flash 0731";
@@ -667,6 +672,12 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 }
 
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
+	if (model.provider === "xai" && model.id === "grok-4.5") {
+		return GROK_4_5_EFFORTS;
+	}
+	if (model.provider === "xai" && model.id === "grok-4.6") {
+		return GROK_4_6_EFFORTS;
+	}
 	if (model.provider === "kimi-code" && model.id === "k3") {
 		return KIMI_K3_EFFORTS;
 	}

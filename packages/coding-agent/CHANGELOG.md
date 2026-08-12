@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Added built-in `grok-46-{eco,medium,pro}` role profiles using the existing xAI OAuth/subscription provider, with supported reasoning-effort selection for Grok 4.5/4.6.
 - Added three provider-agnostic Muse Spark 1.2 presets: Muse Spark across all roles, plus DeepSeek and Luna executor variants.
 
 ### Fixed

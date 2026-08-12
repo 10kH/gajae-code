@@ -118,6 +118,26 @@ function createCodexReasoningModel(id: string): Model {
 	} as Model;
 }
 
+function createXaiGrokReasoningModel(id: "grok-4.5" | "grok-4.6"): Model {
+	return {
+		id,
+		name: id,
+		api: "openai-completions",
+		provider: "xai",
+		baseUrl: "https://api.x.ai/v1",
+		reasoning: true,
+		thinking: {
+			minLevel: Effort.Low,
+			maxLevel: id === "grok-4.6" ? Effort.XHigh : Effort.High,
+			mode: "effort",
+		},
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 500_000,
+		maxTokens: 500_000,
+	} as Model;
+}
+
 let testTheme = await getThemeByName("red-claw");
 
 function installTestTheme(): void {
@@ -172,6 +192,34 @@ describe("ModelSelector batch assignment thinking menu", () => {
 		expect(selectedAfterEnter.roles).toEqual(["executor", "architect", "planner", "critic"]);
 		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.XHigh);
 		expect(selectedAfterEnter.selector).toBe("anthropic/claude-fable-5:xhigh");
+	});
+
+	test("direct xAI Grok default assignment requires an explicit supported effort", async () => {
+		installTestTheme();
+		const model = createXaiGrokReasoningModel("grok-4.6");
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(model, Settings.isolated(), selection => {
+			if (selection.kind === "assignment") selected = selection;
+		});
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selectActionRow(selector, 0);
+
+		expect(selected).toBeUndefined();
+		const thinkingRendered = normalizeRenderedText(selector.render(220).join("\n"));
+		expect(thinkingRendered).toContain("Reasoning for Default");
+		expect(thinkingRendered).toContain("xhigh");
+
+		// Levels are [off, low, medium, high, xhigh]; pick xhigh.
+		for (let i = 0; i < 4; i++) selector.handleInput(DOWN);
+		selector.handleInput("\n");
+
+		const selectedAfterEnter = selected;
+		if (!selectedAfterEnter) throw new Error("Expected default selection after picking a thinking level");
+		expect(selectedAfterEnter.role).toBe("default");
+		expect(selectedAfterEnter.thinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(selectedAfterEnter.selector).toBe("xai/grok-4.6");
 	});
 
 	test("all targets batch keeps every target through the reasoning menu", async () => {

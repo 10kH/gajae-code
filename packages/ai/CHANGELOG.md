@@ -4,6 +4,7 @@
 
 ### Added
 
+- Added first-class direct xAI `grok-4.6` catalog support over the existing xAI OAuth/subscription transport. Grok 4.5 exposes `low` through `high` reasoning effort and Grok 4.6 exposes `low` through `xhigh`.
 - Added the authoritative OpenRouter `meta/muse-spark-1.2` catalog fallback with a 1,048,576-token context window and `minimal` through `xhigh` reasoning effort, so stale or credential-limited catalog generation still closes the Muse Spark preset alias deterministically.
 
 ### Fixed
