@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Hook discovery now records one canonical six-kind normalization contract while preserving each existing runtime's real authority and semantics. Native/Claude/Codex directory modules are validated before import, constrained plugin after-phases select the post-tool runtime path without gaining blocking authority, unsupported aliases and malformed matchers fail closed with stable diagnostics, and Codex-managed command timing/trust/redaction remain explicitly provider-owned.
+- Hook discovery now records one canonical six-kind normalization contract while preserving each existing runtime's real authority and semantics. Native/Claude/Codex directory modules are validated before import and adapted into the session `ExtensionRunner`, constrained plugin batches validate atomically before registration and route after-phases to the post-tool path without gaining blocking authority, unsupported aliases and malformed matchers fail closed with stable diagnostics, and Codex-managed command timing/trust/redaction remain explicitly provider-owned.
 
 ### Fixed
 - The legacy `agentDir/settings.json` source is now retired (`.bak`) only after the combined migration commits: a malformed `agent.db` row that aborts the load keeps the source discoverable for the next load instead of stranding its only copy.

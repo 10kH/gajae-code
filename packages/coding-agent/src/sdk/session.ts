@@ -93,6 +93,7 @@ import {
 	gjcActivationGenerationFor,
 } from "../extensibility/gjc-plugins/runtime-quarantine";
 import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
+import { discoverAndLoadHookExtensions } from "../extensibility/hooks/loader";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
@@ -922,21 +923,26 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 
 export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): ExtensionFactory {
 	return api => {
-		for (const hook of hooks) {
-			const normalized = normalizePluginHook({
+		const normalizedHooks = hooks.map(hook => ({
+			hook,
+			result: normalizePluginHook({
 				declaredEvent: hook.event,
 				target: hook.target,
 				phase: hook.phase,
 				plugin: hook.plugin,
 				source: `plugin:${hook.plugin}`,
-			});
-			if (!normalized.hook) {
-				throw new Error(
-					normalized.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "),
-				);
-			}
-			const registrationEvent = normalized.hook.runtimeEvent;
-			const target = normalized.hook.toolName === "*" ? undefined : normalized.hook.toolName;
+			}),
+		}));
+		const diagnostics = normalizedHooks.flatMap(entry => entry.result.diagnostics);
+		if (normalizedHooks.some(entry => !entry.result.hook)) {
+			throw new Error(diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "));
+		}
+
+		for (const { hook, result } of normalizedHooks) {
+			const normalized = result.hook;
+			if (!normalized) throw new Error("Hook normalization invariant violated");
+			const registrationEvent = normalized.runtimeEvent;
+			const target = normalized.toolName === "*" ? undefined : normalized.toolName;
 			const handler = target
 				? (event: { toolName?: string; tool?: { name?: string }; name?: string }, ...rest: unknown[]) => {
 						const toolName = event?.toolName ?? event?.tool?.name ?? event?.name;
@@ -2212,12 +2218,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		// MCP routing is scope-held; no process-global manager registration.
 
-		// Custom tool and extension discovery is quarantined from the public GJC utility surface.
-		// Explicit SDK extension factories are still honored; callers use them to
-		// register in-process tools/providers without enabling filesystem discovery.
+		// General extension discovery is quarantined from the public SDK surface.
+		// Recognized hook conventions are the bounded exception: their descriptors
+		// normalize before import and then adapt into the authoritative ExtensionRunner.
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
+		}
+		if (!options.disableExtensionDiscovery) {
+			try {
+				const hookExtensions = await discoverAndLoadHookExtensions(cwd);
+				inlineExtensions.push(...hookExtensions.factories.map(entry => entry.factory));
+				for (const error of hookExtensions.errors) {
+					logger.warn("Rejected discovered hook", { path: error.path, error: error.error });
+				}
+			} catch (error) {
+				logger.warn("Failed to discover hook extensions", { error: safeErrorForLog(error) });
+			}
 		}
 
 		// Always-on constrained plugin hooks (validated registry surfaces). Additive

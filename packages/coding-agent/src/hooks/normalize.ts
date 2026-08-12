@@ -107,9 +107,11 @@ function validateSource(convention: HookSourceConvention, source: string): Norma
 }
 
 /** Tool identifiers are logical, case-sensitive runtime names, not filesystem paths. */
-export function normalizeToolMatcher(toolName: string): string | null {
+export function normalizeToolMatcher(toolName: unknown): string | null {
+	if (typeof toolName !== "string") return null;
 	const normalized = toolName.trim();
 	if (!normalized || normalized === "." || normalized === "..") return null;
+	if (normalized !== toolName) return null;
 	if (normalized !== "*" && (normalized.includes("/") || normalized.includes("\\") || normalized.includes("\0"))) {
 		return null;
 	}
@@ -119,7 +121,7 @@ export function normalizeToolMatcher(toolName: string): string | null {
 function buildHook(
 	convention: HookSourceConvention,
 	kind: HookEventKind,
-	toolName: string,
+	toolName: unknown,
 	source: string,
 ): NormalizeHookResult {
 	const sourceFailure = validateSource(convention, source);
@@ -206,7 +208,12 @@ export function normalizeManagedJsonHook(input: ManagedJsonHookInput): Normalize
 			{ source: input.source, externalEvent: input.externalEvent },
 		);
 	}
-	const kind = resolveCanonicalKind(input.externalEvent);
+	const kind =
+		input.externalEvent === "UserPromptSubmit"
+			? HookEventKind.UserPromptSubmit
+			: input.externalEvent === "Stop"
+				? HookEventKind.Stop
+				: null;
 	if (!kind) {
 		return {
 			hook: null,
@@ -220,8 +227,8 @@ export function normalizeManagedJsonHook(input: ManagedJsonHookInput): Normalize
 
 export interface PluginHookInput {
 	declaredEvent: string;
-	target?: string;
-	phase?: "before" | "after";
+	target?: unknown;
+	phase?: unknown;
 	plugin: string;
 	source: string;
 }
@@ -238,7 +245,7 @@ export function normalizePluginHook(input: PluginHookInput): NormalizeHookResult
 	}
 
 	if (input.declaredEvent === "tool_call") {
-		if (!input.target || !input.phase) {
+		if (!input.target || (input.phase !== "before" && input.phase !== "after")) {
 			return invalid(
 				HookDiagnosticCode.InvalidPluginPhase,
 				`Plugin "${input.plugin}" tool_call hooks require both target and before/after phase.`,
@@ -279,7 +286,20 @@ export function normalizeInProcessHook(input: InProcessHookInput): NormalizeHook
 			{ source: input.source, externalEvent: input.registeredEvent, canonicalKind: HookEventKind.Stop },
 		);
 	}
-	const kind = resolveCanonicalKind(input.registeredEvent);
+	const kind =
+		input.registeredEvent === "before_agent_start"
+			? HookEventKind.UserPromptSubmit
+			: input.registeredEvent === "tool_call"
+				? HookEventKind.PreToolUse
+				: input.registeredEvent === "tool_result"
+					? HookEventKind.PostToolUse
+					: input.registeredEvent === "agent_end"
+						? HookEventKind.Stop
+						: input.registeredEvent === "session_start"
+							? HookEventKind.SessionStart
+							: input.registeredEvent === "session_shutdown"
+								? HookEventKind.SessionShutdown
+								: null;
 	if (!kind) {
 		return {
 			hook: null,

@@ -1,10 +1,10 @@
 # Hooks
 
-GJC currently has three execution surfaces that are all called hooks. The canonical model in `packages/coding-agent/src/hooks/events.ts` is a **normalization and documentation layer** over those existing runtimes. It does not replace `HookRunner`, `ExtensionRunner`, Codex, or the constrained plugin loader, and it does not make unsupported events executable.
+GJC currently has three execution surfaces that are all called hooks. The canonical model in `packages/coding-agent/src/hooks/events.ts` is a **normalization and adaptation layer** over those existing runtimes. It does not create a second dispatcher: GJC adapters register accepted hooks on the authoritative `ExtensionRunner`, while Codex continues to own managed command execution.
 
 | Surface | Runtime authority | Distribution | Runtime owner |
 |---|---|---|---|
-| Native/Claude/Codex hook directories | In-process `HookAPI` module | User/project files | GJC `HookRunner` |
+| Native/Claude/Codex hook directories | In-process `HookAPI` module adapted to `ExtensionRunner` | User/project files | GJC `ExtensionRunner` |
 | Codex managed `hooks.json` | External command | User Codex configuration | Codex invokes `gjc codex-native-hook` |
 | Distributable plugin hooks | Constrained GJC API; ambient host-process authority | Installed plugin bundle | GJC `ExtensionRunner` adapter |
 
@@ -42,12 +42,12 @@ Current runtime truth:
 | Event | Ordering | Timeout | Error behavior | Cancellation/mutation |
 |---|---|---|---|---|
 | `tool_call` / `pre_tool_use` | sequential, awaited | none | fail closed; the tool does not execute | first `{ block: true }` stops later handlers |
-| `tool_result` / `post_tool_use` | sequential, awaited | none | errors are isolated | last returned replacement wins; `HookToolWrapper` applies `content` and `details`, not `isError` |
-| ordinary lifecycle events | sequential, awaited | none | errors are isolated | event-specific |
+| `tool_result` / `post_tool_use` | sequential, awaited | 30s | errors/timeouts are isolated | `content`, `details`, and `isError` replacements chain in registration order |
+| ordinary lifecycle events | sequential, awaited | 30s | errors/timeouts are isolated | event-specific |
 
 Project-directory hook modules execute as code during loading. There is currently no separate workspace-trust prompt in this hook loader. The normalization table therefore records `not-enforced` rather than claiming a nonexistent trust gate.
 
-Hook error listeners receive the hook path, event name, and error message. The runner does not redact event payloads because it does not log them, but error messages and hook code can contain sensitive data; the canonical layer does not add a redaction boundary.
+Extension error listeners receive the extension path, event name, error message, and stack. The runner does not log whole event payloads, but error messages, stacks, and hook code can contain sensitive data; the canonical layer does not add a redaction boundary.
 
 ## Codex managed `hooks.json`
 
@@ -85,7 +85,7 @@ Plugin execution uses `ExtensionRunner` after adaptation:
 
 ## In-process lifecycle normalization
 
-The full `HookAPI` remains larger than the six-event model. `context`, compaction, retry, tree, and other events continue directly through `HookRunner` and receive the diagnostic `in_process_event_outside_hook_ir` when inspected by the normalizer.
+The full in-process extension API remains larger than the six-event model. `context`, compaction, retry, tree, and other events continue directly through `ExtensionRunner` and receive the diagnostic `in_process_event_outside_hook_ir` when inspected by the normalizer.
 
 `before_agent_start` is the closest safe prompt-submission overlap and can return a message for injection. `agent_end` is the loop-end overlap for `stop`. `turn_end` is deliberately rejected with `semantic_mismatch` because collapsing per-turn and per-loop events would silently change invocation counts.
 
@@ -107,7 +107,7 @@ Batch normalization accepts already-bounded adapter results, preserves input ord
 
 ## Runtime integration boundary
 
-Native/Claude/Codex discovery is validated through `normalizeDirectoryHook` before discovered modules are imported. Constrained plugin execution uses the same plugin normalization rules when selecting its runtime registration event. The canonical layer therefore participates in startup/runtime adaptation without becoming a second dispatcher.
+Native/Claude/Codex discovery is validated through `normalizeDirectoryHook` before discovered modules are imported, then accepted hook factories are adapted into the session's `ExtensionRunner`. Tool-scoped directory handlers receive exact matcher filtering at that adapter boundary. Constrained plugin execution uses the same plugin normalization rules when selecting its runtime registration event and validates the complete batch before the first registration. The canonical layer therefore participates in startup/runtime adaptation without becoming a second dispatcher.
 
 It does **not**:
 

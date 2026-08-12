@@ -42,8 +42,8 @@ export interface HookEventSchemaContract {
 export const HOOK_EVENT_SCHEMAS: Record<HookEventKind, HookEventSchemaContract> = {
 	[HookEventKind.UserPromptSubmit]: {
 		kind: HookEventKind.UserPromptSubmit,
-		input: "BeforeAgentStartEvent { type, prompt, images? } or provider-owned named-event payload",
-		output: "BeforeAgentStartEventResult { message? } or provider-owned command output",
+		input: "BeforeAgentStartEvent { type, prompt, images?, systemPrompt } or provider-owned named-event payload",
+		output: "BeforeAgentStartEventResult { message?, systemPrompt? } or provider-owned command output",
 	},
 	[HookEventKind.PreToolUse]: {
 		kind: HookEventKind.PreToolUse,
@@ -109,7 +109,7 @@ const hookModulePre: HookExecutionContract = {
 	processAuthority: "hook-api",
 	trustRequirement: "not-enforced",
 	redaction: "none",
-	logging: "Hook errors expose the hook path, event name, and error message to registered listeners.",
+	logging: "Extension errors expose the extension path, event name, error message, and stack to registered listeners.",
 	semanticNotes:
 		"The first blocking result stops later handlers. Directory hooks are imported modules, not shell scripts.",
 };
@@ -121,15 +121,15 @@ const hookModulePost: HookExecutionContract = {
 	awaitBehavior: "awaited",
 	ordering: "sequential",
 	canCancel: false,
-	mutation: ["content", "details"],
-	timeoutMs: null,
+	mutation: ["content", "details", "isError"],
+	timeoutMs: 30_000,
 	errorBehavior: "isolate",
 	processAuthority: "hook-api",
 	trustRequirement: "not-enforced",
 	redaction: "none",
-	logging: "Hook errors expose the hook path, event name, and error message to registered listeners.",
+	logging: "Extension errors expose the extension path, event name, error message, and stack to registered listeners.",
 	semanticNotes:
-		"Handlers receive the original event; the last returned replacement wins. HookToolWrapper does not apply isError overrides.",
+		"Handlers receive the prior handler's replacements; content, details, and isError changes are chained in registration order.",
 };
 
 const constrainedPre: HookExecutionContract = {
@@ -179,13 +179,13 @@ const inProcessPrompt: HookExecutionContract = {
 	awaitBehavior: "awaited",
 	ordering: "sequential",
 	canCancel: false,
-	mutation: ["message"],
-	timeoutMs: null,
+	mutation: ["message", "systemPrompt"],
+	timeoutMs: 30_000,
 	errorBehavior: "isolate",
 	processAuthority: "hook-api",
 	trustRequirement: "not-enforced",
 	redaction: "none",
-	logging: "Hook errors expose the hook path, event name, and error message to registered listeners.",
+	logging: "Extension errors expose the extension path, event name, error message, and stack to registered listeners.",
 	semanticNotes: "This is a before-agent-start callback, not a byte-for-byte Claude/Codex UserPromptSubmit payload.",
 };
 
@@ -197,12 +197,12 @@ const inProcessStop: HookExecutionContract = {
 	ordering: "sequential",
 	canCancel: false,
 	mutation: [],
-	timeoutMs: null,
+	timeoutMs: 30_000,
 	errorBehavior: "isolate",
 	processAuthority: "hook-api",
 	trustRequirement: "not-enforced",
 	redaction: "none",
-	logging: "Hook errors expose the hook path, event name, and error message to registered listeners.",
+	logging: "Extension errors expose the extension path, event name, error message, and stack to registered listeners.",
 	semanticNotes:
 		"agent_end is the loop-end equivalent. turn_end is per-turn and is intentionally not normalized to Stop.",
 };
@@ -215,14 +215,13 @@ const lifecycle = (kind: HookEventKind, runtimeEvent: string): HookExecutionCont
 	ordering: "sequential",
 	canCancel: false,
 	mutation: [],
-	timeoutMs: null,
+	timeoutMs: 30_000,
 	errorBehavior: "isolate",
 	processAuthority: "hook-api",
 	trustRequirement: "not-enforced",
 	redaction: "none",
-	logging: "Hook errors expose the hook path, event name, and error message to registered listeners.",
-	semanticNotes:
-		"Dispatched by HookRunner.emit; session_shutdown is awaited by the runner rather than fire-and-forget.",
+	logging: "Extension errors expose the extension path, event name, error message, and stack to registered listeners.",
+	semanticNotes: "Dispatched by ExtensionRunner and awaited sequentially with the shared extension timeout.",
 });
 
 /** Per-convention execution truth. Missing entries are unsupported. */

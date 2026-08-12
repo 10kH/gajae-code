@@ -56,6 +56,29 @@ describe("createPluginHooksExtension", () => {
 		expect(registered).toEqual([]);
 	});
 
+	test("validates a mixed batch atomically before any registration", () => {
+		const registered: string[] = [];
+		const factory = createPluginHooksExtension([
+			{ plugin: "p", event: "tool_call", target: "read", phase: "before", handler: () => undefined },
+			{ plugin: "p", event: "tool_call", target: " read ", phase: "before", handler: () => undefined },
+		]);
+		expect(() => factory({ on: (event: string) => registered.push(event) } as any)).toThrow("invalid_tool_matcher");
+		expect(registered).toEqual([]);
+	});
+
+	test("preserves all-valid registration order, including duplicate descriptors", () => {
+		const registered: string[] = [];
+		const handler = () => undefined;
+		const factory = createPluginHooksExtension([
+			{ plugin: "p", event: "tool_call", target: "read", phase: "before", handler },
+			{ plugin: "p", event: "tool_call", target: "read", phase: "before", handler },
+			{ plugin: "p", event: "tool_call", target: "write", phase: "after", handler },
+			{ plugin: "p", event: "tool_result", phase: "after", handler },
+		]);
+		factory({ on: (event: string) => registered.push(event) } as any);
+		expect(registered).toEqual(["tool_call", "tool_call", "tool_result", "tool_result"]);
+	});
+
 	test("registers nothing for an empty hook list", () => {
 		const registered: string[] = [];
 		const factory = createPluginHooksExtension([]);

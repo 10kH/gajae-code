@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import "../src/discovery/codex";
+import { Settings } from "../src/config/settings";
 import { EXTENSION_HANDLER_TIMEOUT_MS } from "../src/extensibility/extensions/runner";
 import { discoverAndLoadHooks } from "../src/extensibility/hooks/loader";
 import {
@@ -26,6 +27,8 @@ import {
 	resolveCanonicalKind,
 	resolveExecutionContract,
 } from "../src/hooks/normalize";
+import { createAgentSession } from "../src/sdk";
+import { SessionManager } from "../src/session/session-manager";
 
 const directory = (convention: HookSourceConvention, phase: "pre" | "post", toolName = "edit") =>
 	normalizeDirectoryHook({ convention, phase, toolName, source: `${convention}:${phase}:${toolName}` });
@@ -84,7 +87,7 @@ describe("cross-convention normalization", () => {
 });
 
 describe("execution contracts reflect runtime differences", () => {
-	it("records actual HookRunner pre-tool fail-closed behavior", () => {
+	it("records actual ExtensionRunner pre-tool fail-closed behavior", () => {
 		const contract = resolveExecutionContract(HookSourceConvention.NativeGjc, HookEventKind.PreToolUse);
 		expect(contract).toMatchObject({
 			runtimeEvent: "tool_call",
@@ -99,10 +102,10 @@ describe("execution contracts reflect runtime differences", () => {
 		});
 	});
 
-	it("records actual HookRunner post-tool mutation and isolation behavior", () => {
+	it("records actual ExtensionRunner post-tool mutation and isolation behavior", () => {
 		const contract = resolveExecutionContract(HookSourceConvention.ClaudeCode, HookEventKind.PostToolUse);
-		expect(contract?.mutation).toEqual(["content", "details"]);
-		expect(contract?.timeoutMs).toBeNull();
+		expect(contract?.mutation).toEqual(["content", "details", "isError"]);
+		expect(contract?.timeoutMs).toBe(EXTENSION_HANDLER_TIMEOUT_MS);
 		expect(contract?.errorBehavior).toBe("isolate");
 	});
 
@@ -196,6 +199,20 @@ describe("constrained plugin authority cannot expand through normalization", () 
 		}
 	});
 
+	it("rejects unknown runtime phases instead of defaulting them to post-tool", () => {
+		for (const declaredEvent of ["tool_call", "tool_result"]) {
+			const result = normalizePluginHook({
+				declaredEvent,
+				target: "read",
+				phase: "during",
+				plugin: "malformed",
+				source: "plugin:malformed",
+			});
+			expect(result.hook).toBeNull();
+			expect(result.diagnostics[0]?.code).toBe(HookDiagnosticCode.InvalidPluginPhase);
+		}
+	});
+
 	it("rejects aliases and lifecycle names instead of resolving them for plugins", () => {
 		for (const declaredEvent of [
 			"pre_tool_use",
@@ -259,7 +276,7 @@ describe("bounded diagnostics, matchers, provenance, duplicates, and ordering", 
 	});
 
 	it("rejects path-like, empty, dot, and NUL tool matchers while preserving case", () => {
-		for (const matcher of ["", "  ", ".", "..", "../bash", "a/b", "a\\b", "a\0b"]) {
+		for (const matcher of ["", "  ", " read ", ".", "..", "../bash", "a/b", "a\\b", "a\0b", 42]) {
 			expect(normalizeToolMatcher(matcher)).toBeNull();
 		}
 		expect(normalizeToolMatcher("Read")).toBe("Read");
@@ -302,6 +319,14 @@ describe("bounded diagnostics, matchers, provenance, duplicates, and ordering", 
 		expect(EXTERNAL_EVENT_ALIASES.turn_end).toBeUndefined();
 		expect(resolveCanonicalKind("BeforeTool")).toBeNull();
 		expect(resolveCanonicalKind("stop")).toBeNull();
+		expect(
+			normalizeManagedJsonHook({ externalEvent: "before_agent_start", command: "x", source: "hooks.json" }).hook,
+		).toBeNull();
+		expect(
+			normalizeManagedJsonHook({ externalEvent: "agent_end", command: "x", source: "hooks.json" }).hook,
+		).toBeNull();
+		expect(normalizeInProcessHook({ registeredEvent: "UserPromptSubmit", source: "hook.ts" }).hook).toBeNull();
+		expect(normalizeInProcessHook({ registeredEvent: "Stop", source: "hook.ts" }).hook).toBeNull();
 	});
 });
 
@@ -326,6 +351,61 @@ describe("production discovery integration", () => {
 			const invalidError = result.errors.find(error => error.path.endsWith("unprefixed.ts"));
 			expect(invalidError?.error).toContain("semantic_mismatch");
 			expect(await Bun.file(marker).exists()).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("loads accepted directory hooks into session ExtensionRunner and executes exact matches", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-session-"));
+		const hooksDir = path.join(root, ".codex", "hooks");
+		const executionMarker = path.join(root, "executed");
+		const rejectedImportMarker = path.join(root, "rejected-imported");
+		await fs.mkdir(hooksDir, { recursive: true });
+		await Bun.write(
+			path.join(hooksDir, "pre-read.ts"),
+			`export default (api) => api.on("tool_call", async () => { await Bun.write(${JSON.stringify(executionMarker)}, "read"); });\n`,
+		);
+		await Bun.write(
+			path.join(hooksDir, "unprefixed.ts"),
+			`await Bun.write(${JSON.stringify(rejectedImportMarker)}, "imported"); export default () => undefined;\n`,
+		);
+
+		try {
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				settings: Settings.isolated(),
+				sessionManager: SessionManager.inMemory(root),
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["__none__"],
+			});
+			try {
+				expect(session.extensionRunner?.hasHandlers("tool_call")).toBe(true);
+				await session.extensionRunner?.emitToolCall({
+					type: "tool_call",
+					toolName: "write",
+					toolCallId: "wrong-tool",
+					input: {},
+				});
+				expect(await Bun.file(executionMarker).exists()).toBe(false);
+				await session.extensionRunner?.emitToolCall({
+					type: "tool_call",
+					toolName: "read",
+					toolCallId: "exact-tool",
+					input: {},
+				});
+				expect(await Bun.file(executionMarker).text()).toBe("read");
+				expect(await Bun.file(rejectedImportMarker).exists()).toBe(false);
+			} finally {
+				await session.dispose();
+			}
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
