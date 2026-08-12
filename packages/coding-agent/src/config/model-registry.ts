@@ -172,6 +172,17 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 	image: { id: "image", tag: "IMAGE", name: "Image", color: "accent", settingsPath: "modelRoles" },
 };
 
+export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
+	if (model.reasoning !== true) return false;
+	if (
+		model.provider === "openai" ||
+		model.provider === "openai-codex" ||
+		(model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6"))
+	)
+		return true;
+	return role !== null && GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
+}
+
 /** Alias for ModelRoleInfo - used for both built-in and custom roles */
 export type RoleInfo = ModelRoleInfo;
 

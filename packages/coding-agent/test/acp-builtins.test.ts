@@ -547,6 +547,67 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("Default model set to anthropic/claude-3-5-sonnet:low");
 	});
 
+	it("model: requires explicit Grok effort for argument-based default assignment", async () => {
+		const { output, runtime, session } = createRuntime();
+		const grok = {
+			provider: "xai",
+			id: "grok-4.6",
+			reasoning: true,
+			contextWindow: 500_000,
+			maxTokens: 64_000,
+		};
+		session.getAvailableModels = () => [grok];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+
+		const result = await executeAcpBuiltinSlashCommand("/model xai/grok-4.6", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setModelSpy).not.toHaveBeenCalled();
+		expect(output[0]).toContain("requires an explicit effort suffix");
+		expect(output[0]).toContain("/model <target> <model[:effort]>");
+	});
+
+	it("model: requires explicit Grok effort for argument-based role assignment", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableModels = () => [
+			{
+				provider: "xai",
+				id: "grok-4.5",
+				reasoning: true,
+				contextWindow: 500_000,
+				maxTokens: 64_000,
+			},
+		];
+
+		const result = await executeAcpBuiltinSlashCommand("/model executor xai/grok-4.5", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({});
+		expect(output[0]).toContain("requires an explicit effort suffix");
+	});
+
+	it("model: accepts explicit Grok effort for argument-based assignment", async () => {
+		const { runtime, session } = createRuntime();
+		const grok = {
+			provider: "xai",
+			id: "grok-4.6",
+			reasoning: true,
+			contextWindow: 500_000,
+			maxTokens: 64_000,
+		};
+		session.getAvailableModels = () => [grok];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+
+		const result = await executeAcpBuiltinSlashCommand("/model xai/grok-4.6:xhigh", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setModelSpy).toHaveBeenCalledWith(grok, "default", {
+			cause: "user-selection",
+			selector: "xai/grok-4.6",
+			thinkingLevel: "xhigh",
+		});
+	});
+
 	it("model: assigns a known model to a GJC role-agent target without switching active model", async () => {
 		const { output, runtime, session } = createRuntime();
 		session.getAvailableModels = () => [{ provider: "anthropic", id: "claude-3-5-sonnet", contextWindow: 200_000 }];

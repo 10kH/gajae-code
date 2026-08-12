@@ -175,6 +175,18 @@ test("normalizes invalid fork-context token caps and enforces the child context 
 	expect(trimmed.metadata.skippedReasons["child-context-ceiling"]).toBe(1);
 });
 
+test("keeps a nonzero inherited context budget for policy-capped Grok 4.6", () => {
+	const seed = createSeed("parent context");
+	const trimmed = trimForkContextSeedForModel(seed, {
+		contextWindow: 500_000,
+		maxTokens: 64_000,
+	} as Model);
+
+	expect(trimmed.messages).toHaveLength(1);
+	expect(trimmed.metadata.maxTokens).toBeGreaterThan(0);
+	expect(trimmed.metadata.skippedReasons["child-context-ceiling"]).toBeUndefined();
+});
+
 describe("fork context policy surface", () => {
 	afterEach(() => {
 		AsyncJobManager.resetForTests();

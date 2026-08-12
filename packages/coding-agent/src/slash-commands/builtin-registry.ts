@@ -12,6 +12,7 @@ import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,
+	requiresExplicitThinkingChoice,
 } from "../config/model-registry";
 
 import {
@@ -873,6 +874,18 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					return usage(modelSelectionUsage(runtime, resolution.failure.message), runtime);
 				}
 				const { selection } = resolution;
+				if (
+					selection.thinkingLevel === undefined &&
+					targetIds.some(targetId => requiresExplicitThinkingChoice(selection.model, targetId))
+				) {
+					return usage(
+						modelSelectionUsage(
+							runtime,
+							`Model ${selection.model.provider}/${selection.model.id} requires an explicit effort suffix.`,
+						),
+						runtime,
+					);
+				}
 				try {
 					const includesDefault = targetIds.includes("default");
 					const includesRoleAgent = targetIds.some(role => role !== "default");

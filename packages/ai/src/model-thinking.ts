@@ -479,6 +479,9 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			requiresReasoningContentForToolCalls: true,
 		};
 	}
+	if (model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6")) {
+		model.maxTokens = Math.min(model.maxTokens, 64_000);
+	}
 	// MiniMax-M3's official Token Plan routes expose a 1M context window.
 	// Scope the correction to the four first-class regional MiniMax routes
 	// (canonical id plus the Anthropic Token Plan `[1m]` id); unrelated

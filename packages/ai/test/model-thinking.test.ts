@@ -266,8 +266,10 @@ describe("generated model policies", () => {
 		});
 		expect(models[1]).toMatchObject({
 			reasoning: true,
+			maxTokens: 32_000,
 			thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.XHigh },
 		});
+		expect(models[0]?.maxTokens).toBe(32_000);
 		expect(models[2]?.reasoning).toBe(false);
 		expect(models[2]?.thinking).toBeUndefined();
 	});
