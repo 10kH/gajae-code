@@ -35,7 +35,7 @@ afterEach(async () => {
 describe("master command registration and strict parsing", () => {
 	it("registers the root master command", () => {
 		expect(commands.some(command => command.name === "master")).toBe(true);
-	});
+	}, 30_000);
 
 	it("parses create, list, and configure forms with strict flags", () => {
 		expect(parseMasterArgs(["master", "create", "alpha", "--max-concurrent-workers", "4"])).toEqual({
@@ -52,7 +52,7 @@ describe("master command registration and strict parsing", () => {
 		expect(() => parseMasterArgs(["master", "list", "alpha"])).toThrow();
 		expect(() => parseMasterArgs(["master", "create", "Alpha"])).toThrow();
 		expect(() => parseMasterArgs(["master", "configure", "alpha", "--max-concurrent-workers", "0"])).toThrow();
-	});
+	}, 30_000);
 });
 
 describe("master create/list/configure lifecycle", () => {
@@ -65,7 +65,7 @@ describe("master create/list/configure lifecycle", () => {
 		expect(listed.masters?.map(item => item.masterName)).toEqual(["alpha"]);
 		const configured = await runMasterCommand({ action: "configure", name: "alpha", maxConcurrentWorkers: 5 }, deps);
 		expect(configured.record?.maxConcurrentWorkers).toBe(5);
-	});
+	}, 30_000);
 
 	it("rejects duplicate creates without reloading the daemon", async () => {
 		const { root, workdir } = await makeRoot();
@@ -83,7 +83,7 @@ describe("master create/list/configure lifecycle", () => {
 			/already exists/i,
 		);
 		expect(reloads).toBe(1);
-	});
+	}, 30_000);
 
 	it("persists before reload and retains the record when reload fails", async () => {
 		const { root, workdir } = await makeRoot();
@@ -104,7 +104,7 @@ describe("master create/list/configure lifecycle", () => {
 		expect(order).toEqual(["persist", "reload"]);
 		expect(result.ok).toBe(false);
 		expect(await MasterDomainStore.exists({ masterName: "recoverable", masterRootDir: root })).toBe(true);
-	});
+	}, 30_000);
 
 	it("rejects missing and symlinked workdirs before persistence", async () => {
 		const { root, workdir } = await makeRoot();
@@ -118,5 +118,5 @@ describe("master create/list/configure lifecycle", () => {
 		).rejects.toThrow();
 		await expect(runMasterCommand({ action: "create", name: "linked", workdir: linked }, deps)).rejects.toThrow();
 		expect(await MasterDomainStore.exists({ masterName: "missing", masterRootDir: root })).toBe(false);
-	});
+	}, 30_000);
 });

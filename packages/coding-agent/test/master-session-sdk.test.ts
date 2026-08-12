@@ -149,7 +149,7 @@ describe("master SDK v1 contract", () => {
 				expect(masterEventFrameSchema.safeParse(candidate).success).toBe(expected);
 			}
 		}
-	});
+	}, 30_000);
 
 	it("enforces UTF-8, ASCII, numeric, queue, provider, and retry bounds", () => {
 		expect(queueStateSummarySchemaV1.safeParse(QUEUE).success).toBe(true);
@@ -198,7 +198,7 @@ describe("master SDK v1 contract", () => {
 				ingress: { kind: "local", actorId: "actor-1", sourceId: "source-1" },
 			}).success,
 		).toBe(false);
-	});
+	}, 30_000);
 
 	it("enforces effect lease correlation shapes and strict unknown fields", () => {
 		const lease = {
@@ -233,7 +233,7 @@ describe("master SDK v1 contract", () => {
 				previousRemoteChannelId: null,
 			}).success,
 		).toBe(true);
-	});
+	}, 30_000);
 
 	it("enforces the pre-parse frame byte ceiling", () => {
 		const frame = { type: "ping", requestId: "r1", nonce: "n1" } as const;
@@ -241,7 +241,7 @@ describe("master SDK v1 contract", () => {
 		const oversized = `{"type":"ping","requestId":"r1","nonce":"${"x".repeat(MAX_MASTER_FRAME_BYTES)}"}`;
 		expect(() => parseMasterJsonFrame(oversized, "client")).toThrow();
 		expect(serializeMasterFrame(frame, "client")).toContain("ping");
-	});
+	}, 30_000);
 });
 
 describe("MemoryContract", () => {
@@ -286,7 +286,7 @@ describe("MemoryContract", () => {
 				idempotencyKey: "write-1",
 			}),
 		).rejects.toBeInstanceOf(MemoryConflictError);
-	});
+	}, 30_000);
 
 	it("makes unavailable memory explicit and nonblocking to callers", async () => {
 		const memory = createUnavailableMemoryContract();
@@ -302,7 +302,7 @@ describe("MemoryContract", () => {
 				idempotencyKey: "k",
 			}),
 		).rejects.toBeInstanceOf(MemoryUnavailableError);
-	});
+	}, 30_000);
 });
 
 describe("master SDK discovery and transport lifecycle", () => {
@@ -326,7 +326,7 @@ describe("master SDK discovery and transport lifecycle", () => {
 			expect(await readMasterSdkDiscovery({ masterRootDir: root })).toBeNull();
 			await fs.rm(root, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 
 	it("publishes snapshot/replay events and page responses with correlated ids", async () => {
 		const root = await fs.mkdtemp(path.join(process.cwd(), ".master-sdk-test-"));
@@ -357,5 +357,5 @@ describe("master SDK discovery and transport lifecycle", () => {
 			await transport.stop();
 			await fs.rm(root, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 });

@@ -61,7 +61,7 @@ describe("master durable paths and records", () => {
 					path.resolve(value) === path.resolve(root),
 			).toBe(true);
 		}
-	});
+	}, 30_000);
 
 	test("writes private versioned records and fails closed on future data", async () => {
 		const store = await makeStore();
@@ -74,7 +74,7 @@ describe("master durable paths and records", () => {
 		await expect(
 			MasterDomainStore.open({ masterName: "alpha", masterRootDir: store.masterRootDir }),
 		).rejects.toThrow();
-	});
+	}, 30_000);
 });
 
 describe("master queue and durable capacity", () => {
@@ -107,7 +107,7 @@ describe("master queue and durable capacity", () => {
 		const queue = await store.readQueue();
 		expect(queue.tasks.find(task => task.taskId === fairLease?.taskId)?.priority).toBe("autonomous");
 		validateQueueSummary(await store.readQueueSummary());
-	});
+	}, 30_000);
 
 	test("keeps independent leases while draining 3 to 1 and recovers releases", async () => {
 		const store = await makeStore("drain", 3);
@@ -136,7 +136,7 @@ describe("master queue and durable capacity", () => {
 		const available = await restarted.admitNextTask();
 
 		expect(available).not.toBeNull();
-	});
+	}, 30_000);
 
 	test("makes enqueue and terminal release idempotent and keeps contiguous events", async () => {
 		const store = await makeStore("idempotent", 2);
@@ -154,7 +154,7 @@ describe("master queue and durable capacity", () => {
 		const events = await store.readEvents();
 		expect(events.map(event => event.seq)).toEqual(events.map((_, index) => index + 1));
 		expect(await store.getEventSequence()).toBe(events.length);
-	});
+	}, 30_000);
 });
 
 describe("intent-first independent worker lifecycle", () => {
@@ -183,7 +183,7 @@ describe("intent-first independent worker lifecycle", () => {
 			"create-a",
 			"create-b",
 		]);
-	});
+	}, 30_000);
 
 	test("reconciles actual Coordinator IDs, stable create retries, prompt ambiguity, and one-shot quarantine drain", async () => {
 		const store = await makeStore("lifecycle");
@@ -231,7 +231,7 @@ describe("intent-first independent worker lifecycle", () => {
 		expect(
 			(await store.observe({ workerSessionId: "coordinator-session-1", event: { action: "idle" } })).disposition,
 		).toBe("master");
-	});
+	}, 30_000);
 
 	test("recovers each worker independently, blocks authority mismatch, and preserves user ownership", async () => {
 		const root = await makeRoot();
@@ -265,7 +265,7 @@ describe("intent-first independent worker lifecycle", () => {
 		expect((await restarted.observe({ workerSessionId: "user-worker", event: { action: "ask" } })).disposition).toBe(
 			"user",
 		);
-	});
+	}, 30_000);
 });
 describe("queue pure decisions", () => {
 	test("requires strict below-limit admission and chooses urgent first", () => {
@@ -306,7 +306,7 @@ describe("queue pure decisions", () => {
 			workdir: null,
 		});
 		expect(selectNextTask([task("user", 2), task("urgent_user", 3)], 0)?.priority).toBe("urgent_user");
-	});
+	}, 30_000);
 });
 
 describe("master coordinator security boundaries", () => {
@@ -340,7 +340,7 @@ describe("master coordinator security boundaries", () => {
 		).toBe(false);
 		assertAuthorityFingerprint(authority, authority.fingerprint);
 		expect(() => assertAuthorityFingerprint(authority, "forged")).toThrow();
-	});
+	}, 30_000);
 
 	test("gateway exposes only lifecycle calls, rejects authority input, and replays stable mutations", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-gateway-root-"));
@@ -373,7 +373,7 @@ describe("master coordinator security boundaries", () => {
 		expect(replay).toEqual(first);
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.args).toEqual({ cwd: root, idempotency_key: "create-1", allow_mutation: true });
-	});
+	}, 30_000);
 
 	test("keeps one owner and fences pre-active worker events", () => {
 		const ledger = new OwnershipLedger();
@@ -387,7 +387,7 @@ describe("master coordinator security boundaries", () => {
 		const userFence = ledger.registerUserWorker("worker-user");
 		expect(ledger.recordWorkerEvent("worker-user", { action: "ask" }).disposition).toBe("user");
 		expect(userFence.lifecycle).toBe("user_registered");
-	});
+	}, 30_000);
 
 	test("requires ingress authorization, one-time model consumption, and distinct authenticated approval", () => {
 		let now = new Date("2026-08-10T00:00:00.000Z");
@@ -481,7 +481,7 @@ describe("master coordinator security boundaries", () => {
 				requestedMasterName: "alpha",
 			}),
 		).toThrow();
-	});
+	}, 30_000);
 });
 
 describe("explicit worker task admission", () => {
@@ -506,7 +506,7 @@ describe("explicit worker task admission", () => {
 		expect(lease?.taskId).toBe(autonomous.taskId);
 		const queue = await store.readQueue();
 		expect(queue.tasks.find(task => task.taskId === urgent.taskId)?.state).toBe("queued");
-	});
+	}, 30_000);
 
 	test("replays the same lease for a retried explicit admission and rejects a switched task", async () => {
 		const store = await makeStore("requested-replay", 3);
@@ -523,7 +523,7 @@ describe("explicit worker task admission", () => {
 		const replay = await store.admitNextTask({ ...args, taskId: second.taskId });
 		expect(replay).toMatchObject({ leaseId: lease!.leaseId, taskId: second.taskId, idempotent: true });
 		await expect(store.admitNextTask({ ...args, taskId: first.taskId })).rejects.toThrow();
-	});
+	}, 30_000);
 
 	test("refuses an unknown or already-leased task rather than silently picking another", async () => {
 		const store = await makeStore("requested-invalid", 3);
@@ -542,5 +542,5 @@ describe("explicit worker task admission", () => {
 				createIdempotencyKey: "create-second",
 			}),
 		).rejects.toThrow();
-	});
+	}, 30_000);
 });

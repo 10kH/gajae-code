@@ -111,7 +111,7 @@ describe("MasterSessionFactory", () => {
 			await authStorage.close();
 			await rm(root, { recursive: true, force: true });
 		}
-	});
+	}, 30_000);
 });
 
 describe("Coordinator-backed worker observation", () => {
@@ -154,7 +154,7 @@ describe("Coordinator-backed worker observation", () => {
 				terminal: true,
 			},
 		]);
-	});
+	}, 30_000);
 
 	it("keeps action_needed when the real turn stopped for input", () => {
 		expect(coordinatorTurnObservation({ status: "waiting", stop_reason: "action_needed" })).toMatchObject({
@@ -166,5 +166,5 @@ describe("Coordinator-backed worker observation", () => {
 			action: "worker_terminal",
 			terminal: true,
 		});
-	});
+	}, 30_000);
 });

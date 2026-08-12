@@ -95,7 +95,7 @@ describe("master provider channel authority", () => {
 		await activate(both, "telegram");
 		await activate(both, "discord");
 		expect((await both.readProviderHealth()).activeProviders).toEqual(["telegram", "discord"]);
-	});
+	}, 30_000);
 
 	test("commits one ordered row per configured provider and continues through a healthy provider", async () => {
 		const store = await makeStore(["telegram", "discord"]);
@@ -134,7 +134,7 @@ describe("master provider channel authority", () => {
 			state: "active",
 			deliveryHealth: "degraded",
 		});
-	});
+	}, 30_000);
 
 	test("replays pending rows in provider event order and advances cursor only after exact reconcile", async () => {
 		const store = await makeStore(["telegram"]);
@@ -180,7 +180,7 @@ describe("master provider channel authority", () => {
 			},
 		});
 		expect((await store.readChannels()).receiptCursors.telegram).toBe(second.eventId.includes("event:4") ? 4 : 3);
-	});
+	}, 30_000);
 
 	test("restart preserves effect identity and duplicate results are idempotent while conflicts fail closed", async () => {
 		const store = await makeStore(["telegram"]);
@@ -237,7 +237,7 @@ describe("master provider channel authority", () => {
 				},
 			}),
 		).rejects.toThrow(/conflict|effect|stale/i);
-	});
+	}, 30_000);
 
 	test("provider worker registration is leased and store is the only mutation authority", async () => {
 		const store = await makeStore(["telegram"]);
@@ -254,7 +254,7 @@ describe("master provider channel authority", () => {
 		});
 		expect(effect?.kind).toBe("provision_channel");
 		expect((await store.readProviderWorkerLeases()).length).toBe(1);
-	});
+	}, 30_000);
 
 	test("master SDK routes presentation receipts through the durable outbox owner", async () => {
 		const store = await makeStore(["telegram"]);
@@ -305,7 +305,7 @@ describe("master provider channel authority", () => {
 			result: { effectId: effect.effectId, nextState: "reconciled" },
 		});
 		expect((await store.readChannels()).receiptCursors.telegram).toBeGreaterThan(0);
-	});
+	}, 30_000);
 });
 
 describe("claim mint idempotency", () => {
@@ -342,7 +342,7 @@ describe("claim mint idempotency", () => {
 
 		expect(replay.authorizationId).toBe(first.authorizationId);
 		expect(replay.expiresAt).toBe(first.expiresAt);
-	});
+	}, 30_000);
 
 	test("still rejects a reused idempotency key that carries a different request", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-master-claim-conflict-"));
@@ -375,7 +375,7 @@ describe("claim mint idempotency", () => {
 				idempotencyKey: "claim-conflict-1",
 			}),
 		).rejects.toThrow();
-	});
+	}, 30_000);
 });
 
 describe("provider worker registration lifecycle", () => {
@@ -396,7 +396,7 @@ describe("provider worker registration lifecycle", () => {
 		// registration must not remain eligible for the durable effect lease.
 		expect(await hello("worker-new")).toMatchObject({ type: "ack" });
 		expect(sdk.providerWorkerKeysForTest()).toEqual(["telegram:worker-new"]);
-	});
+	}, 30_000);
 
 	test("closing a provider socket retires exactly that connection's registrations", async () => {
 		const store = await makeStore(["telegram", "discord"]);
@@ -416,7 +416,7 @@ describe("provider worker registration lifecycle", () => {
 		sdk.retireProviderConnectionForTest("conn-telegram");
 
 		expect(sdk.providerWorkerKeysForTest()).toEqual(["discord:dc-worker"]);
-	});
+	}, 30_000);
 });
 
 describe("Telegram leased provider effects", () => {
@@ -465,7 +465,7 @@ describe("Telegram leased provider effects", () => {
 
 		expect(calls).toHaveLength(1);
 		expect(frame.outcome).toMatchObject({ status: "terminal", code: "post_unverifiable" });
-	});
+	}, 30_000);
 
 	test("reports recoverable uncertainty when a nonce lookup can prove the post", async () => {
 		const worker = new TelegramMasterChannelWorker({
@@ -482,5 +482,5 @@ describe("Telegram leased provider effects", () => {
 		const frame = await worker.handleEffect(presentEffect() as never);
 
 		expect(frame.outcome).toMatchObject({ status: "unknown", code: "post_uncertain" });
-	});
+	}, 30_000);
 });

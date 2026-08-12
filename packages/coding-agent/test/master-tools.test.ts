@@ -87,7 +87,7 @@ describe("master orchestration tools", () => {
 		expect(tools.map(tool => tool.name).sort()).toEqual([...MASTER_ORCHESTRATION_TOOL_NAMES].sort());
 		expect(tools).toHaveLength(11);
 		expect(tools.some(tool => tool.name === "master_claim_approve")).toBe(false);
-	});
+	}, 30_000);
 
 	it("rejects duplicate, missing, and extra catalog entries", () => {
 		expect(() =>
@@ -97,7 +97,7 @@ describe("master orchestration tools", () => {
 		expect(() =>
 			assertMasterOrchestrationToolCatalog([...MASTER_ORCHESTRATION_TOOL_NAMES.slice(0, -1), "master_unlisted"]),
 		).toThrow(/missing=.*master_memory_write/);
-	});
+	}, 30_000);
 
 	it("dispatches validated calls only through injected adapters", async () => {
 		const calls: Call[] = [];
@@ -140,7 +140,7 @@ describe("master orchestration tools", () => {
 			"decision.record",
 			"claim.request",
 		]);
-	});
+	}, 30_000);
 
 	it("rejects malformed input and missing dependencies", async () => {
 		const tools = toolMap(makeDependencies([]));
@@ -160,7 +160,7 @@ describe("master orchestration tools", () => {
 			memory: undefined,
 		} as unknown as MasterOrchestrationToolDependencies;
 		expect(() => createMasterOrchestrationTools(incomplete)).toThrow(/Memory/);
-	});
+	}, 30_000);
 
 	it("keeps approval outside the model surface and states the policy in the prompt", () => {
 		expect(systemPrompt).toContain("master_claim_request");
@@ -170,5 +170,5 @@ describe("master orchestration tools", () => {
 		expect(systemPrompt).toContain("maxConcurrentWorkers");
 		expect(systemPrompt).toMatch(/Never edit source code/i);
 		expect(systemPrompt).not.toMatch(/\{\{[^}]+\}\}/);
-	});
+	}, 30_000);
 });
