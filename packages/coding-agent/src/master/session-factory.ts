@@ -197,7 +197,10 @@ function defaultAdapters(
 			return result;
 		},
 		observe: async input =>
-			await observer.observe({ workerSessionId: input.workerSessionId, event: { action: input.action } }),
+			await observer.observeFromCoordinator({
+				workerSessionId: input.workerSessionId,
+				action: input.action,
+			}),
 		followUp: async input => await followUpThroughObserver(options, input),
 	};
 	const decisions: MasterDecisionAdapter = options.adapters?.decisions ?? {

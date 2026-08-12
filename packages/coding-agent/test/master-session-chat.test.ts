@@ -306,3 +306,114 @@ describe("master provider channel authority", () => {
 		expect((await store.readChannels()).receiptCursors.telegram).toBeGreaterThan(0);
 	});
 });
+
+describe("claim mint idempotency", () => {
+	test("replays the original authorization when an identical request retries at a later instant", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-master-claim-"));
+		roots.push(root);
+		let now = new Date("2026-08-12T00:00:00.000Z");
+		const store = await MasterDomainStore.create({
+			masterName: "alpha",
+			masterRootDir: path.join(root, "master"),
+			configuredProviders: ["telegram"],
+			defaultWorkdir: process.cwd(),
+			now: () => now,
+		});
+		await activate(store, "telegram");
+		const request = {
+			workerSessionId: "worker-claim-idem",
+			requestedMasterName: "alpha",
+			ingress: {
+				kind: "provider" as const,
+				provider: "telegram" as const,
+				channelId: "telegram-channel",
+				messageId: "message-1",
+				actorId: "actor-1",
+			},
+			idempotencyKey: "claim-retry-1",
+		};
+		const first = await store.mintClaimAuthorization(request);
+
+		// A lost acknowledgement makes the provider retry the identical frame later.
+		// The server-generated expiry must not make that a conflict.
+		now = new Date("2026-08-12T00:00:00.050Z");
+		const replay = await store.mintClaimAuthorization(request);
+
+		expect(replay.authorizationId).toBe(first.authorizationId);
+		expect(replay.expiresAt).toBe(first.expiresAt);
+	});
+
+	test("still rejects a reused idempotency key that carries a different request", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-master-claim-conflict-"));
+		roots.push(root);
+		const store = await MasterDomainStore.create({
+			masterName: "alpha",
+			masterRootDir: path.join(root, "master"),
+			configuredProviders: ["telegram"],
+			defaultWorkdir: process.cwd(),
+		});
+		await activate(store, "telegram");
+		const ingress = {
+			kind: "provider" as const,
+			provider: "telegram" as const,
+			channelId: "telegram-channel",
+			messageId: "message-1",
+			actorId: "actor-1",
+		};
+		await store.mintClaimAuthorization({
+			workerSessionId: "worker-claim-conflict",
+			requestedMasterName: "alpha",
+			ingress,
+			idempotencyKey: "claim-conflict-1",
+		});
+		await expect(
+			store.mintClaimAuthorization({
+				workerSessionId: "worker-claim-conflict",
+				requestedMasterName: "alpha",
+				ingress: { ...ingress, messageId: "message-2" },
+				idempotencyKey: "claim-conflict-1",
+			}),
+		).rejects.toThrow();
+	});
+});
+
+describe("provider worker registration lifecycle", () => {
+	test("a reconnecting provider daemon replaces its stale registration instead of queueing behind it", async () => {
+		const store = await makeStore(["telegram"]);
+		await activate(store, "telegram");
+		const sdk = new MasterSdk({ stores: { alpha: store }, publishDiscovery: false });
+		const hello = async (workerId: string) =>
+			await sdk.handleClientFrame(
+				{ type: "provider_worker_hello", requestId: `hello-${workerId}`, provider: "telegram", workerId },
+				"master-sdk-local",
+			);
+
+		expect(await hello("worker-old")).toMatchObject({ type: "ack" });
+		expect(sdk.providerWorkerKeysForTest()).toEqual(["telegram:worker-old"]);
+
+		// A restarted daemon reconnects under a fresh random worker id. The dead
+		// registration must not remain eligible for the durable effect lease.
+		expect(await hello("worker-new")).toMatchObject({ type: "ack" });
+		expect(sdk.providerWorkerKeysForTest()).toEqual(["telegram:worker-new"]);
+	});
+
+	test("closing a provider socket retires exactly that connection's registrations", async () => {
+		const store = await makeStore(["telegram", "discord"]);
+		await activate(store, "telegram");
+		await activate(store, "discord");
+		const sdk = new MasterSdk({ stores: { alpha: store }, publishDiscovery: false });
+		await sdk.handleClientFrame(
+			{ type: "provider_worker_hello", requestId: "h1", provider: "telegram", workerId: "tg-worker" },
+			"conn-telegram",
+		);
+		await sdk.handleClientFrame(
+			{ type: "provider_worker_hello", requestId: "h2", provider: "discord", workerId: "dc-worker" },
+			"conn-discord",
+		);
+		expect(sdk.providerWorkerKeysForTest()).toEqual(["discord:dc-worker", "telegram:tg-worker"]);
+
+		sdk.retireProviderConnectionForTest("conn-telegram");
+
+		expect(sdk.providerWorkerKeysForTest()).toEqual(["discord:dc-worker"]);
+	});
+});

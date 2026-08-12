@@ -75,6 +75,12 @@ export interface MasterSdkTransportOptions extends MasterSdkDiscoveryOptions {
 		frame: MasterClientFrame,
 		connectionId: string,
 	) => Promise<MasterClientHandlerResult> | MasterClientHandlerResult;
+	/**
+	 * Invoked with the exact connection id after its socket closes, so owners of
+	 * connection-scoped registrations (e.g. provider workers holding durable
+	 * effect leases) can retire them instead of leasing work to a dead socket.
+	 */
+	onConnectionClosed?: (connectionId: string) => void;
 }
 
 export interface MasterSdkTransportState {
@@ -234,6 +240,7 @@ export class MasterSdkTransport {
 				message: (socket, message) => void this.#handleMessage(socket, message),
 				close: socket => {
 					this.#clients.delete(socket.data.connectionId);
+					this.#options.onConnectionClosed?.(socket.data.connectionId);
 				},
 			},
 		});

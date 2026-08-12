@@ -23,6 +23,7 @@ import {
 	countActiveWorkerLeases,
 	nextUserDispatchStreak,
 	selectNextTask,
+	selectRequestedTask,
 	validateQueueState,
 	validateTaskRecord,
 } from "./queue";
@@ -1584,6 +1585,8 @@ export class MasterDomainStore {
 			canonicalCwd?: string;
 			createIdempotencyKey?: string;
 			promptDigest?: string;
+			/** Admit exactly this queued task instead of the queue's own next selection. */
+			taskId?: string;
 		} = {},
 	): Promise<LeaseReceipt | null> {
 		if (Object.hasOwn(input as object, "workerSessionId"))
@@ -1597,6 +1600,7 @@ export class MasterDomainStore {
 		if (input.createIdempotencyKey !== undefined) assertOpaqueId(input.createIdempotencyKey, "createIdempotencyKey");
 		if (input.promptDigest !== undefined && !FINGERPRINT_PATTERN.test(input.promptDigest))
 			throw new MasterStoreError("INVALID_INPUT", "promptDigest must be a 64-character lowercase SHA-256 digest.");
+		if (input.taskId !== undefined) assertOpaqueId(input.taskId, "taskId");
 		return await this.#withLock<LeaseReceipt | null>(async state => {
 			let existing: WorkerCreateIntent | undefined;
 			if (input.leaseId !== undefined) {
@@ -1621,6 +1625,8 @@ export class MasterDomainStore {
 					throw new MasterIdempotencyConflictError(existing.createIdempotencyKey);
 				if (input.promptDigest !== undefined && existing.promptDigest !== input.promptDigest)
 					throw new MasterIdempotencyConflictError(existing.createIdempotencyKey);
+				if (input.taskId !== undefined && existingWorker.taskId !== input.taskId)
+					throw new MasterIdempotencyConflictError(existing.createIdempotencyKey);
 				if (existingWorker.state === "terminal") return { value: null };
 				return {
 					value: {
@@ -1639,8 +1645,19 @@ export class MasterDomainStore {
 			}
 			const summary = queueSummary(state.queue);
 			if (!canAdmitWorker(summary)) return { value: null };
-			const selected = selectNextTask(state.queue.tasks, state.queue.userDispatchStreak);
-			if (selected === null) return { value: null };
+			// An explicit task selection must bind that exact task; falling back to the
+			// queue's own ordering would give this prompt/workdir/worker to another task.
+			const selected =
+				input.taskId === undefined
+					? selectNextTask(state.queue.tasks, state.queue.userDispatchStreak)
+					: selectRequestedTask(state.queue.tasks, input.taskId);
+			if (selected === null) {
+				if (input.taskId === undefined) return { value: null };
+				throw new MasterStoreError(
+					"TASK_NOT_ADMISSIBLE",
+					"Requested task is unknown or is not queued/retry-pending.",
+				);
+			}
 			const timestamp = nowIso(this.#now);
 			const canonicalCwd = input.canonicalCwd ?? selected.workdir ?? this.#defaultWorkdir;
 			if (!isAbsoluteNormalizedPath(canonicalCwd) || !isPathWithin(this.#defaultWorkdir, canonicalCwd))
@@ -2480,12 +2497,17 @@ export class MasterDomainStore {
 					"CLAIM_AUTHORIZATION_EXPIRED",
 					"Claim authorization expiry must be in the future.",
 				);
+			// The digest must cover only caller-supplied request identity. A retry after a
+			// lost acknowledgement carries the same idempotency key but arrives later, so
+			// folding a server-generated expiry in here would turn a safe replay into an
+			// idempotency conflict. Caller-supplied expiry/TTL stays part of the request.
 			const digest = sha256(
 				canonicalJson({
 					workerSessionId: input.workerSessionId,
 					requestedMasterName: input.requestedMasterName,
 					ingress: input.ingress,
-					expiresAt,
+					expiresAt: input.expiresAt ?? null,
+					ttlMs: input.ttlMs ?? null,
 				}),
 			);
 			if (input.idempotencyKey !== undefined) {

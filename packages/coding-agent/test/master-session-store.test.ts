@@ -483,3 +483,64 @@ describe("master coordinator security boundaries", () => {
 		).toThrow();
 	});
 });
+
+describe("explicit worker task admission", () => {
+	test("admits exactly the requested task instead of the queue's own next selection", async () => {
+		const store = await makeStore("requested", 3);
+		const autonomous = await store.enqueueAutonomous({ idempotencyKey: "auto-req", summary: "autonomous work" });
+		// Higher-priority work the queue would otherwise select first.
+		const urgent = await store.enqueueUser({
+			idempotencyKey: "urgent-req",
+			priority: "urgent_user",
+			summary: "urgent work",
+		});
+		expect(selectNextTask((await store.readQueue()).tasks, 0)?.taskId).toBe(urgent.taskId);
+
+		const lease = await store.admitNextTask({
+			taskId: autonomous.taskId,
+			canonicalCwd: process.cwd(),
+			createIdempotencyKey: "create-requested",
+			promptDigest: "e".repeat(64),
+		});
+
+		expect(lease?.taskId).toBe(autonomous.taskId);
+		const queue = await store.readQueue();
+		expect(queue.tasks.find(task => task.taskId === urgent.taskId)?.state).toBe("queued");
+	});
+
+	test("replays the same lease for a retried explicit admission and rejects a switched task", async () => {
+		const store = await makeStore("requested-replay", 3);
+		const first = await store.enqueueUser({ idempotencyKey: "req-a", priority: "user", summary: "task a" });
+		const second = await store.enqueueUser({ idempotencyKey: "req-b", priority: "user", summary: "task b" });
+		const args = {
+			canonicalCwd: process.cwd(),
+			createIdempotencyKey: "create-replay",
+			promptDigest: "f".repeat(64),
+		};
+		const lease = await store.admitNextTask({ ...args, taskId: second.taskId });
+		expect(lease?.taskId).toBe(second.taskId);
+
+		const replay = await store.admitNextTask({ ...args, taskId: second.taskId });
+		expect(replay).toMatchObject({ leaseId: lease!.leaseId, taskId: second.taskId, idempotent: true });
+		await expect(store.admitNextTask({ ...args, taskId: first.taskId })).rejects.toThrow();
+	});
+
+	test("refuses an unknown or already-leased task rather than silently picking another", async () => {
+		const store = await makeStore("requested-invalid", 3);
+		const task = await store.enqueueUser({ idempotencyKey: "req-only", priority: "user", summary: "only task" });
+		await expect(
+			store.admitNextTask({ taskId: "00000000-0000-4000-8000-000000000000", canonicalCwd: process.cwd() }),
+		).rejects.toThrow();
+
+		const lease = await store.admitNextTask({ taskId: task.taskId, canonicalCwd: process.cwd() });
+		expect(lease?.taskId).toBe(task.taskId);
+		// The task is no longer queued, so a second distinct admission must fail closed.
+		await expect(
+			store.admitNextTask({
+				taskId: task.taskId,
+				canonicalCwd: process.cwd(),
+				createIdempotencyKey: "create-second",
+			}),
+		).rejects.toThrow();
+	});
+});

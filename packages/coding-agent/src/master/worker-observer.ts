@@ -25,6 +25,7 @@ export interface WorkerObserverCoordinator {
 		force?: boolean;
 		allow_mutation?: true;
 	}): Promise<Record<string, unknown>>;
+	awaitTurn?(input: { turn_id: string; session_id?: string; timeout_ms?: number }): Promise<Record<string, unknown>>;
 	callTool?(name: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
 }
 
@@ -35,6 +36,7 @@ export interface WorkerObserverStore {
 		canonicalCwd?: string;
 		createIdempotencyKey?: string;
 		promptDigest?: string;
+		taskId?: string;
 	}): Promise<LeaseReceipt | null>;
 	admit?(input?: Record<string, unknown>): Promise<LeaseReceipt | null>;
 	admitTask?(input?: Record<string, unknown>): Promise<LeaseReceipt | null>;
@@ -169,12 +171,46 @@ function digestPrompt(prompt: string): string {
 	return createHash("sha256").update(prompt, "utf8").digest("hex");
 }
 
+/**
+ * Normalizes a frozen-Coordinator `await_turn` response into the durable worker
+ * observation the master reasons over. A terminal turn is reported as such so
+ * the master can release the worker instead of polling a finished session; a
+ * turn that stopped for input keeps `action_needed`.
+ */
+export function coordinatorTurnObservation(
+	turn: Record<string, unknown>,
+	requestedAction?: string,
+): Record<string, unknown> {
+	const status = stringValue(turn.status) ?? stringValue(turn.state);
+	const stopReason = stringValue(turn.stop_reason) ?? stringValue(turn.stopReason);
+	const terminal =
+		status === "completed" ||
+		status === "failed" ||
+		status === "cancelled" ||
+		status === "terminated" ||
+		turn.terminal === true;
+	const needsAction = stopReason === "action_needed" || turn.action_needed === true || turn.actionNeeded === true;
+	const action = terminal && !needsAction ? "worker_terminal" : (requestedAction ?? "action_needed");
+	const output = stringValue(turn.output) ?? stringValue(turn.text) ?? stringValue(turn.response);
+	const turnId = stringValue(turn.turn_id) ?? stringValue(turn.turnId);
+	return {
+		action,
+		source: "coordinator_await_turn",
+		...(status === null ? {} : { status }),
+		...(stopReason === null ? {} : { stopReason }),
+		...(turnId === null ? {} : { turnId }),
+		...(output === null ? {} : { output }),
+		terminal,
+	};
+}
+
 export class MasterWorkerObserver {
 	readonly masterName: string;
 	readonly domainStore: WorkerObserverStore | MasterDomainStore;
 	readonly coordinator: WorkerObserverCoordinator | MasterCoordinatorGateway | undefined;
 	readonly #options: WorkerObserverOptions;
 	readonly #prompts = new Map<string, string>();
+	readonly #turnIds = new Map<string, string>();
 
 	constructor(options: WorkerObserverOptions) {
 		if (!/^[a-z][a-z0-9-]{0,62}$/.test(options.masterName))
@@ -257,12 +293,77 @@ export class MasterWorkerObserver {
 		return await this.observe(input);
 	}
 
+	/**
+	 * Observes a worker from its actual Coordinator turn rather than from an
+	 * action the caller guessed. The frozen Coordinator `await_turn` operation is
+	 * the only worker-state source the master is permitted to read, so the
+	 * observation the master durably records is the real turn outcome: whether the
+	 * worker needs action, produced output, or reached a terminal state.
+	 *
+	 * When no Coordinator is injected the caller-supplied action is still recorded,
+	 * so in-process tests and adapter overrides keep working.
+	 */
+	async observeFromCoordinator(input: {
+		readonly workerSessionId: string;
+		readonly action?: string;
+		readonly timeoutMs?: number;
+		readonly observationId?: string;
+	}): Promise<WorkerObservationReceipt> {
+		const turn = await this.#awaitTurn(input.workerSessionId, input.timeoutMs);
+		if (turn === null)
+			return await this.observe({
+				workerSessionId: input.workerSessionId,
+				event: { action: input.action ?? "action_needed" },
+				...(input.observationId === undefined ? {} : { observationId: input.observationId }),
+			});
+		return await this.observe({
+			workerSessionId: input.workerSessionId,
+			event: coordinatorTurnObservation(turn, input.action),
+			...(input.observationId === undefined ? {} : { observationId: input.observationId }),
+		});
+	}
+
+	async #awaitTurn(workerSessionId: string, timeoutMs?: number): Promise<Record<string, unknown> | null> {
+		const coordinator = this.coordinator;
+		if (!coordinator) return null;
+		// `await_turn` is turn-scoped. Without the turn id proven by this worker's
+		// prompt delivery there is no real turn to read, so fall back rather than
+		// inventing one.
+		const turnId = this.#turnIds.get(workerSessionId);
+		if (turnId === undefined) return null;
+		const args = {
+			turn_id: turnId,
+			session_id: workerSessionId,
+			...(timeoutMs === undefined ? {} : { timeout_ms: timeoutMs }),
+		};
+		if (typeof coordinator.awaitTurn === "function") return await coordinator.awaitTurn(args);
+		if (typeof coordinator.callTool === "function")
+			return await coordinator.callTool("gjc_coordinator_await_turn", args);
+		return null;
+	}
+
+	/** Records the turn id proven by a prompt delivery so observation can read it. */
+	#rememberTurn(workerSessionId: string | null, response: Record<string, unknown>): void {
+		if (workerSessionId === null) return;
+		const turnId = stringValue(response.turn_id) ?? stringValue(response.turnId);
+		if (turnId !== null) this.#turnIds.set(workerSessionId, turnId);
+	}
+
 	async registerUserWorker(workerSessionId: string): Promise<unknown> {
 		if (typeof this.domainStore.registerUserWorker === "function")
 			return await this.domainStore.registerUserWorker({ workerSessionId });
 		if (typeof this.domainStore.registerUserSession === "function")
 			return await this.domainStore.registerUserSession({ workerSessionId });
 		throw new Error("Durable store does not implement user worker registration.");
+	}
+
+	/** @internal Test seam for proving a turn id without a full dispatch cycle. */
+	async sendPromptForTest(
+		workerSessionId: string,
+		prompt: string,
+		idempotencyKey: string,
+	): Promise<Record<string, unknown>> {
+		return await this.#sendPrompt(workerSessionId, prompt, idempotencyKey, {});
 	}
 
 	async #admit(input: WorkerObserverPromptInput): Promise<LeaseReceipt | null> {
@@ -272,6 +373,9 @@ export class MasterWorkerObserver {
 			...(input.createIdempotencyKey === undefined ? {} : { createIdempotencyKey: input.createIdempotencyKey }),
 			...(input.canonicalCwd === undefined ? {} : { canonicalCwd: input.canonicalCwd }),
 			...(input.prompt === undefined ? {} : { promptDigest: digestPrompt(input.prompt) }),
+			// A requested task must reach admission; dropping it lets the store select a
+			// different queued task and bind it to this prompt/workdir/worker.
+			...(input.taskId === undefined ? {} : { taskId: input.taskId }),
 		};
 		for (const method of ["admitNextTask", "admit", "admitTask", "leaseNext"] as const) {
 			const candidate = this.domainStore[method];
@@ -466,10 +570,15 @@ export class MasterWorkerObserver {
 			...(input.queue === true ? { queue: true } : {}),
 			...(input.force === true ? { force: true } : {}),
 		};
-		if (typeof this.coordinator.sendPrompt === "function") return await this.coordinator.sendPrompt(request);
-		if (typeof this.coordinator.callTool === "function")
-			return await this.coordinator.callTool("gjc_coordinator_send_prompt", request);
-		throw new Error("Coordinator gateway does not implement sendPrompt.");
+		const response =
+			typeof this.coordinator.sendPrompt === "function"
+				? await this.coordinator.sendPrompt(request)
+				: typeof this.coordinator.callTool === "function"
+					? await this.coordinator.callTool("gjc_coordinator_send_prompt", request)
+					: null;
+		if (response === null) throw new Error("Coordinator gateway does not implement sendPrompt.");
+		this.#rememberTurn(workerSessionId, response);
+		return response;
 	}
 
 	async #reconcileCreate(

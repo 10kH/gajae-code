@@ -10,6 +10,7 @@ import type { MasterDomainStore } from "../src/master/domain-store";
 import { createDeterministicMemoryContract } from "../src/master/memory-contract";
 import { MasterSessionFactory } from "../src/master/session-factory";
 import { MASTER_ORCHESTRATION_TOOL_NAMES } from "../src/master/tools";
+import { coordinatorTurnObservation, MasterWorkerObserver } from "../src/master/worker-observer";
 import type { CreateAgentSessionResult } from "../src/sdk/session";
 import { AuthStorage } from "../src/session/auth-storage";
 
@@ -110,5 +111,60 @@ describe("MasterSessionFactory", () => {
 			await authStorage.close();
 			await rm(root, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("Coordinator-backed worker observation", () => {
+	it("records the real turn outcome instead of the caller's guessed action", async () => {
+		const observations: Array<Record<string, unknown>> = [];
+		const calls: Array<{ name: string; input: Record<string, unknown> }> = [];
+		const observer = new MasterWorkerObserver({
+			masterName: "alpha",
+			domainStore: {
+				observe: async (input: { event: unknown }) => {
+					observations.push(input.event as Record<string, unknown>);
+					return { observationId: "obs-1", disposition: "master" } as never;
+				},
+			} as never,
+			coordinatorGateway: {
+				sendPrompt: async (input: Record<string, unknown>) => {
+					calls.push({ name: "send_prompt", input });
+					return { ok: true, turn_id: "turn-7" };
+				},
+				awaitTurn: async (input: Record<string, unknown>) => {
+					calls.push({ name: "await_turn", input });
+					return { status: "completed", turn_id: "turn-7", output: "worker finished the task" };
+				},
+			} as never,
+		});
+		// Prove the turn through prompt delivery, which is the only way a real turn id exists.
+		await observer.sendPromptForTest("worker-9", "do the work", "idem-1");
+
+		await observer.observeFromCoordinator({ workerSessionId: "worker-9", action: "action_needed" });
+
+		expect(calls.map(call => call.name)).toEqual(["send_prompt", "await_turn"]);
+		expect(calls[1]!.input).toMatchObject({ turn_id: "turn-7", session_id: "worker-9" });
+		expect(observations).toEqual([
+			{
+				action: "worker_terminal",
+				source: "coordinator_await_turn",
+				status: "completed",
+				turnId: "turn-7",
+				output: "worker finished the task",
+				terminal: true,
+			},
+		]);
+	});
+
+	it("keeps action_needed when the real turn stopped for input", () => {
+		expect(coordinatorTurnObservation({ status: "waiting", stop_reason: "action_needed" })).toMatchObject({
+			action: "action_needed",
+			terminal: false,
+			stopReason: "action_needed",
+		});
+		expect(coordinatorTurnObservation({ status: "failed" })).toMatchObject({
+			action: "worker_terminal",
+			terminal: true,
+		});
 	});
 });

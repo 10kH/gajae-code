@@ -312,7 +312,7 @@ export class MasterSdk {
 			registrations: Map<string, string>;
 		}
 	>();
-	#eventPumpTimer: ReturnType<typeof setTimeout> | null = null;
+	#eventPumpTimer: Timer | null = null;
 	#refreshPromise: Promise<void> | null = null;
 	#started = false;
 	readonly #providerPumps = new Map<string, Promise<void>>();
@@ -326,6 +326,7 @@ export class MasterSdk {
 			getSnapshot: async snapshotCutSeq => await this.#snapshot(snapshotCutSeq),
 			getQueuePage: async (frame, snapshotCutSeq) => await this.#queuePage(frame, snapshotCutSeq),
 			handleClientFrame: async (frame, connectionId) => await this.handleClientFrame(frame, connectionId),
+			onConnectionClosed: connectionId => this.#retireProviderConnection(connectionId),
 		});
 	}
 
@@ -415,6 +416,29 @@ export class MasterSdk {
 			await run;
 		} finally {
 			if (this.#refreshPromise === run) this.#refreshPromise = null;
+		}
+	}
+
+	/**
+	 * Retires every provider registration bound to a closed socket. A dead
+	 * registration must never remain eligible for a durable effect lease: the pump
+	 * visits registrations in insertion order, so a stale entry would reacquire the
+	 * lease each expiry, fail to send, and starve the live replacement worker.
+	 */
+	/** @internal Test seam exposing exactly which provider workers remain eligible for effects. */
+	providerWorkerKeysForTest(): string[] {
+		return [...this.#providerWorkers.keys()].sort();
+	}
+
+	/** @internal Test seam driving the transport's socket-close notification. */
+	retireProviderConnectionForTest(connectionId: string): void {
+		this.#retireProviderConnection(connectionId);
+	}
+
+	#retireProviderConnection(connectionId: string): void {
+		if (connectionId === "master-sdk-local") return;
+		for (const [key, worker] of this.#providerWorkers) {
+			if (worker.connectionId === connectionId) this.#providerWorkers.delete(key);
 		}
 	}
 
@@ -625,6 +649,13 @@ export class MasterSdk {
 			connectionId,
 			registrations,
 		};
+		// A provider daemon restart reconnects under a fresh random worker id. Retire
+		// every other registration for this provider first, or the dead entry keeps
+		// winning the durable effect lease ahead of this live replacement.
+		for (const [key, existing] of this.#providerWorkers) {
+			if (existing.provider === frame.provider && existing.workerId !== frame.workerId)
+				this.#providerWorkers.delete(key);
+		}
 		this.#providerWorkers.set(`${frame.provider}:${frame.workerId}`, worker);
 		if (connectionId !== "master-sdk-local")
 			this.#transport.registerProviderConnection(connectionId, frame.provider, frame.workerId);

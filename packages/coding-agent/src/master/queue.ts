@@ -201,6 +201,19 @@ export function selectNextTask(tasks: readonly TaskRecord[], userDispatchStreak:
 	return userDispatchStreak >= USER_FAIRNESS_LIMIT ? autonomous : user;
 }
 
+/**
+ * Selects exactly the requested admissible task. An explicit `master_worker_create`
+ * task selection must never fall back to the queue's own ordering, or the request's
+ * prompt/workdir/worker would bind to a different task.
+ */
+export function selectRequestedTask(tasks: readonly TaskRecord[], taskId: string): TaskRecord | null {
+	for (const task of tasks) {
+		if (task.taskId !== taskId) continue;
+		return task.state === "queued" || task.state === "retry_pending" ? task : null;
+	}
+	return null;
+}
+
 export const chooseNextTask = selectNextTask;
 export const nextDispatchTask = selectNextTask;
 
