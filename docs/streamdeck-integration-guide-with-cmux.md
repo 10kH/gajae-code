@@ -150,7 +150,7 @@ Compiled AppleScript applications are suitable when Stream Deck's built-in websi
 ```text
 TAB PREV | TAB NEXT | NEW SESSION | CLOSE TAB | GJC FOCUS
 PANE PREV | PANE NEXT | VOICE | STEER | ESC X2
-BACK | VibeQuant | gajae-code | HOME | NEXT
+BACK | PROJECT 1 | PROJECT 2 | HOME | NEXT
 ```
 
 #### Navigation controls
@@ -182,15 +182,21 @@ exec "$HOME/.local/bin/gjc" "${args[@]}"
 
 Do not prompt for a model profile here. Apply the profile after the GJC session starts.
 
-#### Fixed folder controls
+#### Frequent GJC project controls
 
-Use explicit paths instead of recent-project discovery:
+Bind the first two project keys from GJC session history, not operator-specific absolute paths. Merge `gjc sdk session list` with saved top-level session headers under the agent session store, canonicalize managed worktree paths such as `<repo>.gajae-code-worktrees/<name>` back to `<repo>`, discard non-existent and non-Git directories outside the user's home, count sessions per canonical repository, and display the top two repositories. The third key always opens `$HOME`.
 
-- `VibeQuant` -> `$HOME/Documents/Workspace/VibeQuant`;
-- `gajae-code` -> `$HOME/Documents/Workspace/gajae-code`;
-- `HOME` -> `$HOME`.
+Each project key shows the repository basename and session count. Pressing it creates a terminal surface in that repository. The `HOME` key creates a terminal surface in the user's home directory. Leave the cmux tab name automatic so a later `gjc` launch can publish its authoritative `GJC:` title.
 
-Parameterize these values for each operator. A fixed folder key creates a terminal surface in the current pane and sends `cd -- '<path>'`. Store fully expanded absolute paths (or `$HOME`-relative values the plugin normalizes before shell-quoting) so single-quoting never suppresses tilde expansion. Do not manually rename the cmux tab: when the operator starts `gjc`, GJC must remain free to publish its authoritative `GJC:` title so focus guards recognize the session.
+### Bundled source and assets
+
+The repository-owned implementation lives at `integrations/streamdeck-cmux/`:
+
+- `plugin/` contains the native Stream Deck plugin source, launcher, worktree helper, and required 144-by-144 PNG assets;
+- `profile/page-2` and `profile/page-3` contain portable page manifests and page-owned artwork;
+- `install.sh` installs the plugin and creates an importable `.streamDeckProfile` bundle on the Desktop.
+
+Runtime paths are derived from `$HOME`, `import.meta.dir`, `PATH`, and optional environment overrides (`GJC_STREAMDECK_GJC`, `GJC_STREAMDECK_CMUX`, `GJC_STREAMDECK_WORKTREE`, `GJC_AGENT_DIR`, `GJC_STREAMDECK_LOG`). Never commit local profile databases, SDK endpoint files, tokens, or user-specific absolute project paths.
 
 ### Page 3: focused GJC operations
 
