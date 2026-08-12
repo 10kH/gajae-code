@@ -443,7 +443,8 @@ async function requestQuery(
 	return response;
 }
 
-async function waitForTerminalStatus(
+/** Exported for tests: each status poll must stay inside the caller's wait window. */
+export async function waitForTerminalStatus(
 	router: SessionRouter,
 	sessionId: string,
 	clientRef: string,
@@ -451,7 +452,17 @@ async function waitForTerminalStatus(
 ): Promise<{ terminal: boolean; status: string; detail: unknown }> {
 	const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
 	for (;;) {
-		const response = await requestQuery(router, sessionId, "turn.result", { kind: "prompt", clientRef }, {});
+		// Each poll carries what is left of the caller's wait window. Without it the
+		// status query inherits the Router's session reply budget, so one wedged
+		// status reply outlives the wait the caller actually asked for.
+		const remainingMs = deadline === undefined ? undefined : Math.max(1, deadline - Date.now());
+		const response = await requestQuery(
+			router,
+			sessionId,
+			"turn.result",
+			{ kind: "prompt", clientRef },
+			remainingMs === undefined ? {} : { timeoutMs: remainingMs },
+		);
 		const result = resultObject(response) ?? {};
 		const status = typeof result.status === "string" ? result.status : "unknown";
 		if (status === "terminal_ok" || status === "failed") return { terminal: true, status, detail: result };
