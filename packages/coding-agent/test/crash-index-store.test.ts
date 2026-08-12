@@ -127,6 +127,30 @@ describe("compactCrashIndex", () => {
 		expect(index.overflow).toBe(false);
 	});
 
+	it("uses the production clock when no compaction time is injected", async () => {
+		const paths = await tempPaths();
+		const future = Date.now() + 2 * 24 * 60 * 60 * 1000;
+		appendCrashEvent(occurrence(fingerprintFor(8), recordId(8), future - 1000), paths.events);
+		const index = await recordCrashStateEvent(
+			{ kind: "acknowledged", fingerprint: fingerprintFor(8), at: future },
+			{ paths },
+		);
+
+		expect(index.signatures[fingerprintFor(8)]).toBeUndefined();
+	});
+
+	it("preserves an injected event time when the caller also injects compaction time", async () => {
+		const paths = await tempPaths();
+		const future = Date.now() + 2 * 24 * 60 * 60 * 1000;
+		appendCrashEvent(occurrence(fingerprintFor(9), recordId(9), future - 1000), paths.events);
+		const index = await recordCrashStateEvent(
+			{ kind: "acknowledged", fingerprint: fingerprintFor(9), at: future },
+			{ paths, now: future },
+		);
+
+		expect(index.signatures[fingerprintFor(9)]?.acknowledgedAt).toBe(future);
+	});
+
 	it("quarantines a hostile index and rebuilds from the journal", async () => {
 		const paths = await tempPaths();
 		await fs.mkdir(path.dirname(paths.index), { recursive: true });

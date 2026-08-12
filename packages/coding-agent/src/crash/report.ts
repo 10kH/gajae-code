@@ -394,9 +394,10 @@ export async function runCrashReportFlow(deps: CrashReportDeps): Promise<CrashRe
 	]);
 	if (action === undefined || action === 2) return { status: "cancelled" };
 	if (action === 1) {
+		const eventAt = now().getTime();
 		await recordCrashStateEvent(
-			{ kind: "acknowledged", fingerprint: signature.fingerprint, at: now().getTime() },
-			{ paths: deps.paths },
+			{ kind: "acknowledged", fingerprint: signature.fingerprint, at: eventAt },
+			{ paths: deps.paths, now: eventAt },
 		);
 		deps.io.print(`Dismissed ${signature.fingerprint}.\n`);
 		return { status: "acknowledged", fingerprint: signature.fingerprint };
@@ -512,15 +513,16 @@ export async function runCrashReportFlow(deps: CrashReportDeps): Promise<CrashRe
 			deps.io.print(`Comment failed: ${comment.stderr.trim() || "unknown error"}\n`);
 			return { status: "refused", reason: "comment failed" };
 		}
+		const eventAt = now().getTime();
 		await recordCrashStateEvent(
 			{
 				kind: "reported",
 				fingerprint: signature.fingerprint,
-				at: now().getTime(),
+				at: eventAt,
 				issueUrl: candidate.url,
 				commented: true,
 			},
-			{ paths: deps.paths },
+			{ paths: deps.paths, now: eventAt },
 		);
 		deps.io.print(`Commented on ${candidate.url}\n`);
 		return { status: "commented", url: candidate.url };
@@ -539,9 +541,10 @@ export async function runCrashReportFlow(deps: CrashReportDeps): Promise<CrashRe
 		deps.io.print(`Issue creation returned an unexpected URL; not recording it: ${url}\n`);
 		return { status: "refused", reason: "non-canonical issue URL" };
 	}
+	const eventAt = now().getTime();
 	await recordCrashStateEvent(
-		{ kind: "reported", fingerprint: signature.fingerprint, at: now().getTime(), issueUrl: url },
-		{ paths: deps.paths },
+		{ kind: "reported", fingerprint: signature.fingerprint, at: eventAt, issueUrl: url },
+		{ paths: deps.paths, now: eventAt },
 	);
 	deps.io.print(`Created ${url}\n`);
 	return { status: "created", url };
