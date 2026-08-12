@@ -194,7 +194,6 @@ const LIFECYCLE_OPERATIONS = new Set([
 function lifecycleFingerprint(operation: string, input: unknown): string {
 	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
 }
-
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
 	if (isCleanupPending(response)) return "effect_started";

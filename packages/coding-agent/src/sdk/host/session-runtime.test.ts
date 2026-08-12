@@ -64,6 +64,18 @@ function memoryTransport(): SessionSdkTransport & {
 	};
 }
 
+function admissionBarrier(target: number) {
+	const ready = Promise.withResolvers<void>();
+	let admitted = 0;
+	return {
+		onFrameAdmitted() {
+			admitted += 1;
+			if (admitted === target) ready.resolve();
+		},
+		ready: ready.promise,
+	};
+}
+
 function extensionContext(sessionId: string, cwd: string): ExtensionContext {
 	return {
 		cwd,
@@ -243,6 +255,7 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
+			onSdkRequest: undefined,
 			terminalAbortSeams: {
 				getReconciliationStore: () => reconciliationStore,
 				getTerminalTurnEpoch: () => activeEpoch,
@@ -251,6 +264,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -295,6 +309,10 @@ describe("SessionSdkSessionRuntime", () => {
 
 			transport.feed("client", { ...request, id: "terminal-abort-replay" });
 			await waitForFrame("terminal-abort-replay");
+			// An in-memory dispatch-cache replay short-circuits before the
+			// surface: terminalAbort never runs, so no snapshot is captured and
+			// nothing to discard (the durable-replay discard is covered by the
+			// seeded-row test below).
 			expect(seamCalls).toHaveLength(1);
 			expect(transport.sent).toEqual(
 				expect.arrayContaining([
@@ -398,6 +416,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -490,6 +509,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -583,6 +603,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -672,6 +693,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (_handle, _options) => {
 					// The aborted run's loop exit publishes the correlated
@@ -738,6 +760,7 @@ describe("SessionSdkSessionRuntime", () => {
 				cancelPendingPreflightForTerminalAbort: () => {},
 				captureTerminalAbortSteeringSnapshot: () => {
 					captureCalls += 1;
+					return captureCalls;
 				},
 				abortPromptAndWaitWithTerminal: async (handle, options) => {
 					seamCalls.push({ handle, scope: options.terminal?.scope ?? "none" });
@@ -1712,6 +1735,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
+		const admissions = admissionBarrier(9);
 		const reconciliationStore = createReconciliationStore({
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
@@ -1720,7 +1744,9 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
+			onFrameAdmitted: admissions.onFrameAdmitted,
 			terminalAbortSeams: {
+				maxDurableTerminalReservationsForTests: 8,
 				getReconciliationStore: () => reconciliationStore,
 				// No active turn: every idle abort reserves a no-effect row.
 				getTerminalTurnEpoch: () => undefined,
@@ -1746,12 +1772,9 @@ describe("SessionSdkSessionRuntime", () => {
 			// Fill the completed-scope bound (256) and overflow once so the FIRST
 			// no-effect row is evicted into a tombstone that preserves its
 			// turnDisposition (review thread P2).
-			for (let index = 0; index < 257; index++) idleAbort(`idle-${index}`, `evict-key-${index}`);
-			const deadline = Date.now() + 15_000;
-			while (!transport.sent.some(frame => frame.id === "idle-256")) {
-				if (Date.now() > deadline) throw new Error("Timed out filling the completed-scope bound");
-				await Bun.sleep(20);
-			}
+			for (let index = 0; index < 9; index++) idleAbort(`idle-${index}`, `evict-key-${index}`);
+			await admissions.ready;
+			await reconciliationStore.drain?.();
 			expect(seamCalls).toHaveLength(0);
 			// The overflowed reservation now exists only as a tombstone; replaying
 			// its key must return the original no_active_turn/terminal_no_effect
@@ -1763,6 +1786,7 @@ describe("SessionSdkSessionRuntime", () => {
 				input: { mode: "terminal" },
 				idempotencyKey: "evict-key-0",
 			} as SdkFrame);
+			const deadline = Date.now() + 15_000;
 			while (!transport.sent.some(frame => frame.id === "evicted-replay")) {
 				if (Date.now() > deadline) throw new Error("Timed out waiting for the evicted-key replay");
 				await Bun.sleep(20);
@@ -1974,6 +1998,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
+		const admissions = admissionBarrier(12);
 		const reconciliationStore = createReconciliationStore({
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
@@ -1981,7 +2006,9 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
+			onFrameAdmitted: admissions.onFrameAdmitted,
 			terminalAbortSeams: {
+				maxDurableTerminalReservationsForTests: 8,
 				getReconciliationStore: () => reconciliationStore,
 				getTerminalTurnEpoch: () => undefined,
 				getActivePromptHandle: () => undefined,
@@ -1995,7 +2022,7 @@ describe("SessionSdkSessionRuntime", () => {
 			// Idle terminal aborts with distinct keys must not grow the
 			// reconciliation document without limit: completed rows are bounded
 			// and evicted keys become compact tombstones (review thread P2).
-			for (let index = 0; index < 260; index++) {
+			for (let index = 0; index < 12; index++) {
 				transport.feed("client", {
 					type: "control_request",
 					id: `bound-${index}`,
@@ -2004,12 +2031,14 @@ describe("SessionSdkSessionRuntime", () => {
 					idempotencyKey: `bound-key-${index}`,
 				} as SdkFrame);
 			}
-			// All 260 serialized transactions must settle before the bound rows and
-			// tombstones are observable (the document caps at 256 completed rows,
-			// so wait on delivered responses instead of the row count).
-			for (let attempt = 0; attempt < 100 && transport.sent.length < 260; attempt += 1) await Bun.sleep(50);
-			expect(transport.sent.length).toBeGreaterThanOrEqual(260);
-			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(256);
+			// Yield once so every fire-and-forget frame handler can admit its first
+			// serialized transaction, then drain the exact durable queue. Polling all
+			// responses under the file's five-second deadline made scheduler load part
+			// of the persistence contract.
+			await admissions.ready;
+			await reconciliationStore.drain?.();
+			expect(transport.sent.length).toBeGreaterThanOrEqual(12);
+			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(8);
 			expect(reconciliationStore.snapshotTerminalKeys().length).toBeGreaterThan(0);
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
@@ -2030,6 +2059,7 @@ describe("SessionSdkSessionRuntime", () => {
 			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
+		const admissions = admissionBarrier(12);
 		const reconciliationStore = createReconciliationStore({
 			sessionFile: path.join(cwd, "session.json"),
 			sessionId: transport.sessionId,
@@ -2037,7 +2067,9 @@ describe("SessionSdkSessionRuntime", () => {
 		createSdkSessionRuntimeExtension(api, {
 			agentDir: cwd,
 			createTransport: async () => transport,
+			onFrameAdmitted: admissions.onFrameAdmitted,
 			terminalAbortSeams: {
+				maxDurableTerminalReservationsForTests: 8,
 				getReconciliationStore: () => reconciliationStore,
 				getTerminalTurnEpoch: () => 7,
 				getActivePromptHandle: () => "exact-run-handle",
@@ -2051,7 +2083,7 @@ describe("SessionSdkSessionRuntime", () => {
 		const ctx = extensionContext(transport.sessionId, cwd);
 		try {
 			await handlers.get("session_start")?.({}, ctx);
-			for (let index = 0; index < 260; index++) {
+			for (let index = 0; index < 12; index++) {
 				transport.feed("client", {
 					type: "control_request",
 					id: `uncertain-${index}`,
@@ -2060,10 +2092,11 @@ describe("SessionSdkSessionRuntime", () => {
 					idempotencyKey: `uncertain-key-${index}`,
 				} as SdkFrame);
 			}
-			for (let attempt = 0; attempt < 100 && transport.sent.length < 260; attempt += 1) await Bun.sleep(50);
-			expect(transport.sent.length).toBeGreaterThanOrEqual(260);
+			await admissions.ready;
+			await reconciliationStore.drain?.();
+			expect(transport.sent.length).toBeGreaterThanOrEqual(12);
 			// The uncertain finalizes evicted the oldest rows into tombstones.
-			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(256);
+			expect(reconciliationStore.snapshotTerminalScopes().length).toBeLessThanOrEqual(8);
 			expect(reconciliationStore.snapshotTerminalKeys().length).toBeGreaterThan(0);
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
@@ -2962,6 +2995,8 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 		sessionFile: path.join(cwd, "session.json"),
 		sessionId: transport.sessionId,
 	});
+	let captureCalls = 0;
+	let discardCalls = 0;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
 		createTransport: async () => transport,
@@ -2971,6 +3006,13 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 			getActivePromptHandle: () => "exact-run-handle",
 			getActivePromptOwnerConnectionId: () => "client",
 			cancelPendingPreflightForTerminalAbort: () => {},
+			captureTerminalAbortSteeringSnapshot: () => {
+				captureCalls += 1;
+				return captureCalls;
+			},
+			discardTerminalAbortSteeringSnapshot: () => {
+				discardCalls += 1;
+			},
 			abortPromptAndWaitWithTerminal: async (_handle, _options) => {
 				return { status: "settled", terminalScope: {} };
 			},
@@ -3057,6 +3099,13 @@ test("SDK-only host advances a finalized stopped row when the retry replay match
 				replay: expect.objectContaining({ responseState: "pending" }),
 			}),
 		});
+		// The durable replay (dispatch-cache eviction equivalent: the row was
+		// seeded before this runtime admitted anything) captured a snapshot at
+		// admission and then DISCARDED it — the replay path never settles, so
+		// the FIFO holds no stale entry for a later real abort to consume
+		// (review thread P1).
+		expect(captureCalls).toBe(1);
+		expect(discardCalls).toBe(1);
 	} finally {
 		await handlers.get("session_shutdown")?.({}, ctx);
 		await rm(cwd, { recursive: true, force: true });
@@ -3310,6 +3359,82 @@ test("SDK-only host lets every connection whose follow-up was promoted abort the
 			.snapshot()
 			.filter(record => record.kind === "prompt" && record.status === "terminal_ok");
 		expect(batchedTerminals).toHaveLength(2);
+	} finally {
+		await handlers.get("session_shutdown")?.({}, ctx);
+		await rm(cwd, { recursive: true, force: true });
+	}
+});
+
+test("SDK-only host rebinds the steering snapshot when the requester's turn wins the owner race", async () => {
+	// Review thread P1: an abort admitted while another connection owns the
+	// active turn captures its snapshot under that OLD turn; when the durable
+	// no-effect reservation reveals that the ABORTING requester's own prompt
+	// became active, the fall-through terminalizes that turn and must REBIND
+	// the admission snapshot to it — otherwise the settlement rejects the
+	// still-old token and the requester's turn keeps running.
+	const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-snapshot-rebind-"));
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	const transport = memoryTransport();
+	const reconciliationStore = createReconciliationStore({
+		sessionFile: path.join(cwd, "session.json"),
+		sessionId: transport.sessionId,
+	});
+	let ownerReads = 0;
+	let rebindCalls = 0;
+	const settledOptions: Array<{ scope?: string; steeringSnapshotToken?: number }> = [];
+	createSdkSessionRuntimeExtension(api, {
+		agentDir: cwd,
+		createTransport: async () => transport,
+		terminalAbortSeams: {
+			getReconciliationStore: () => reconciliationStore,
+			getTerminalTurnEpoch: () => 7,
+			getActivePromptHandle: () => "exact-run-handle",
+			// First read: another connection owns the turn. The recheck after
+			// the durable reservation: the aborting requester now owns it.
+			getActivePromptOwnerConnectionId: () => (ownerReads++ === 0 ? undefined : "client"),
+			cancelPendingPreflightForTerminalAbort: () => {},
+			captureTerminalAbortSteeringSnapshot: () => 42,
+			rebindTerminalAbortSteeringSnapshot: () => {
+				rebindCalls += 1;
+			},
+			abortPromptAndWaitWithTerminal: async (_handle, options) => {
+				settledOptions.push({
+					scope: options.terminal?.scope,
+					steeringSnapshotToken: options.terminal?.steeringSnapshotToken,
+				});
+				return { status: "settled", terminalScope: {} };
+			},
+		},
+	});
+	const ctx = extensionContext(transport.sessionId, cwd);
+	try {
+		await handlers.get("session_start")?.({}, ctx);
+		transport.feed("client", {
+			type: "control_request",
+			id: "owner-race-abort",
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "owner-race-key",
+		} as SdkFrame);
+		const deadline = Date.now() + 15_000;
+		while (!transport.sent.some(frame => frame.id === "owner-race-abort" && frame.type === "control_response")) {
+			if (Date.now() > deadline) throw new Error("Timed out waiting for the owner-race abort response");
+			await Bun.sleep(20);
+		}
+		// The fall-through terminalized the requester's rechecked turn: the
+		// admission snapshot was rebound to it and the settlement received the
+		// token instead of a stale rejection.
+		expect(rebindCalls).toBe(1);
+		expect(settledOptions).toEqual([{ scope: "turn", steeringSnapshotToken: 42 }]);
+		expect(transport.sent.find(frame => frame.id === "owner-race-abort")).toMatchObject({
+			ok: true,
+			result: expect.objectContaining({ turn: "stopped" }),
+		});
 	} finally {
 		await handlers.get("session_shutdown")?.({}, ctx);
 		await rm(cwd, { recursive: true, force: true });

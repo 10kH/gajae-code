@@ -1358,7 +1358,7 @@ describe("chat daemon worker", () => {
 					sessionId: host.sessionId,
 					locator: { repo: root, stateRoot: path.join(root, ".gjc", "state") },
 					endpointGeneration: 1,
-					pid: process.pid,
+					pid: host.endpoint.pid,
 					endpointMtimeMs: host.endpointMtimeMs,
 				});
 				const store = new ConversationStore<SlackConversation>({ agentDir, kind: "slack" });
@@ -1371,13 +1371,12 @@ describe("chat daemon worker", () => {
 					rootTs: "root",
 					sessionId: host.sessionId,
 					endpointGeneration: 1,
-					// Derived through the Router's own identity function: a hand-rolled digest
-					// stops matching the live attachment as soon as the bound fields change,
-					// and the daemon then refuses every resume against this stored root.
+					// Derive through the Router's identity helper using the exact host
+					// process tuple; hand-rolled or test-runner pids create stale roots.
 					attachmentAuthorityId: sessionAttachmentAuthorityId({
 						sessionId: host.sessionId,
 						generation: 1,
-						pid: process.pid,
+						pid: host.endpoint.pid,
 						endpointMtimeMs: host.endpointMtimeMs,
 						url: host.endpoint.url,
 						token: host.endpoint.token,

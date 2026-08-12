@@ -352,7 +352,7 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		const submitted: AgentMessage[][] = [];
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async (messages, options) => {
 			submitted.push(messages as AgentMessage[]);
-			if (!Array.isArray(options)) options?.onRunAccepted?.();
+			if (!Array.isArray(options)) options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 		});
 		const realContext = sessionManager.buildSessionContext();
 		const overflow = new SessionContextTooLargeError(70 * 1024 * 1024);
@@ -439,7 +439,7 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 			})
 			.mockImplementationOnce(async (messages, options) => {
 				submitted.push(messages as AgentMessage[]);
-				if (!Array.isArray(options)) options?.onRunAccepted?.();
+				if (!Array.isArray(options)) options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 			});
 
 		await session.prompt("busy");
@@ -498,12 +498,12 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 			.spyOn(session.agent, "prompt")
 			.mockImplementationOnce(async (messages, options) => {
 				submitted.push(messages as AgentMessage[]);
-				if (!Array.isArray(options)) options?.onRunAccepted?.();
+				if (!Array.isArray(options)) options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 				throw providerFailure;
 			})
 			.mockImplementationOnce(async (messages, options) => {
 				submitted.push(messages as AgentMessage[]);
-				if (!Array.isArray(options)) options?.onRunAccepted?.();
+				if (!Array.isArray(options)) options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 			});
 
 		await expect(session.prompt("first")).rejects.toBe(providerFailure);
@@ -537,7 +537,7 @@ describe("R3 AgentSession overflow compact-once seam (D7)", () => {
 		const submitted: AgentMessage[][] = [];
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async (messages, options) => {
 			submitted.push(messages as AgentMessage[]);
-			if (!Array.isArray(options)) options?.onRunAccepted?.();
+			if (!Array.isArray(options)) options?.onRunAccepted?.(undefined as never, { consumedQueuedMessages: [] });
 		});
 		const realContext = sessionManager.buildSessionContext();
 		const overflow = new SessionContextTooLargeError(70 * 1024 * 1024);

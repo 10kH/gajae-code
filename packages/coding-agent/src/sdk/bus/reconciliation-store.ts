@@ -9,7 +9,7 @@
  * Non-terminal records with a pending outcome finalize that exact claim on bootstrap.
  * Outcome-less skills retain the existing failed/process_restart settlement.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { PromptReconciliationStatus, SdkPromptTerminalOutcome } from "../prompt-status";
@@ -472,8 +472,13 @@ export function settleTerminalScopeRestart(
 		if (scope.turnDisposition === "no_effect_reserved") {
 			// The reservation's only deliverable after restart is the
 			// metadata-bearing no_active_turn replay; store the replay-shaped
-			// payload hash (and replace the input placeholder) so a written
-			// replay can advance the row instead of staying durably pending
+			// payload hash so a written replay can advance the row instead of
+			// staying durably pending (review thread P2). The stored
+			// responsePayloadHash stays the ORIGINAL placeholder: the delivered
+			// replay envelope embeds it, so the replay hash computed from that
+			// envelope is the hash the delivery observer will actually compare —
+			// replacing the field with the replay hash would make the delivered
+			// envelope embed a DIFFERENT value and never advance the row
 			// (review thread P2).
 			const replayResult = {
 				ok: true,
@@ -490,7 +495,6 @@ export function settleTerminalScopeRestart(
 			return {
 				...scope,
 				turnDisposition: "no_effect" as const,
-				responsePayloadHash: replayPayloadHash,
 				replayPayloadHash,
 				terminalAt: scope.terminalAt ?? now,
 			};
@@ -521,8 +525,13 @@ export function settleTerminalScopeRestart(
 			...scope,
 			turnDisposition: "uncertain",
 			ownedWorkDisposition: scope.ownedWorkDisposition === "not_requested" ? "not_requested" : "uncertain",
-			responsePayloadHash: replayPayloadHash,
-			replayPayloadHash: replayPayloadHash,
+			// responsePayloadHash stays the ORIGINAL hash: the delivered replay
+			// envelope embeds it, so replayPayloadHash (computed from that
+			// envelope) is the hash the delivery observer compares — replacing
+			// the field with the replay hash would embed a different value and
+			// keep the row durably pending (review thread P2).
+			responsePayloadHash: scope.responsePayloadHash,
+			replayPayloadHash,
 			terminalAt: now,
 		};
 	});
@@ -588,6 +597,8 @@ export interface ReconciliationStore {
 			keys: EvictedTerminalKeyEntry[];
 		},
 	): Promise<void>;
+	/** Wait until every previously admitted reconciliation transaction settles. */
+	drain?(): Promise<void>;
 	transactTerminalKeys(mutator: (keys: EvictedTerminalKeyEntry[]) => EvictedTerminalKeyEntry[]): Promise<void>;
 	snapshotTerminalKeys(): EvictedTerminalKeyEntry[];
 	loadTerminalScopes(): Promise<DurableTerminalScopeRecord[]>;
@@ -619,7 +630,7 @@ export function createReconciliationStore(options: {
 		if (!filePath) return;
 		const directory = path.dirname(filePath);
 		await fileFs.mkdir(directory, { recursive: true, mode: 0o700 });
-		const temporary = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+		const temporary = `${filePath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`;
 		try {
 			await fileFs.writeFile(temporary, `${JSON.stringify(document)}\n`, { mode: 0o600 });
 			try {
@@ -815,6 +826,17 @@ export function createReconciliationStore(options: {
 		transactTerminalScopes,
 		transactTerminalState,
 		transactTerminalKeys,
+		drain: async () => {
+			while (true) {
+				const observed = chain;
+				await observed;
+				// Fire-and-forget frame handlers can enqueue their first transaction in
+				// a later microtask. Yield once and require the queue tail to remain
+				// stable before reporting durable quiescence.
+				await Bun.sleep(0);
+				if (chain === observed) return;
+			}
+		},
 		loadTerminalScopes: async () => {
 			await load();
 			return terminalMemory.map(s => ({ ...s }));

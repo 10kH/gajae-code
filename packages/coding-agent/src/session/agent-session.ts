@@ -1900,6 +1900,23 @@ export interface DefaultFallbackRuntimeState {
 	exhaustedLastTurn: boolean;
 }
 
+/**
+ * Fire-and-forget continuations (auto-compaction retries, queued follow-ups) race a
+ * still-busy agent whose current turn can legitimately hold the run for minutes.
+ * Reschedule with capped exponential backoff instead of a fixed 100ms spin, and give
+ * up after a bounded number of attempts (~4 minutes total) so a stuck busy state
+ * cannot spin forever — observed in production logs as 10,742 reschedules over
+ * 21 minutes inside a single session.
+ */
+const AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS = 100;
+const AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS = 5_000;
+const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
+
+function agentContinueBusyRescheduleDelayMs(attempt: number): number {
+	const exponential = AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1);
+	return Math.min(exponential, AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS);
+}
+
 function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretObfuscator | undefined): SessionContext {
 	if (!obfuscator?.hasSecrets()) return context;
 	const messages = obfuscator.deobfuscateObject(context.messages);
@@ -2036,18 +2053,41 @@ export class AgentSession {
 	// continuation of the aborted attempt that the contract requires to be
 	// blocked (review thread P1).
 	readonly #externalSteerMessages = new WeakSet<AgentMessage>();
+	/** Per-message SDK requester-ownership correlation for queued client steers:
+	 *  fired exactly once when the steer's run accepts it — via the idle
+	 *  auto-continue or the terminal-abort rearm (review thread P1). */
+	readonly #steerPromotionHooks = new WeakMap<AgentMessage, () => void>();
 	/** Monotonic steering admission sequence; the terminal abort snapshots it. */
 	#steeringAdmissionSeq = 0;
 	readonly #externalSteerAdmissionSeq = new WeakMap<AgentMessage, number>();
 	/**
 	 * Per-admission terminal-abort steering snapshots, FIFO per aborted turn
-	 * key (lineage:epoch). Each admission pushes its sequence here; the
+	 * key (lineage:epoch). Each admission pushes { sequence, token } here; the
 	 * settlement of THAT admission consumes (shifts) it, so overlapping aborts
 	 * of the same turn never overwrite an earlier admission's snapshot (review
-	 * thread P1).
+	 * thread P1). A replay-only abort discards its own token — the durable
+	 * replay path never settles, so without the discard a later real abort
+	 * would consume the stale entry and treat steering admitted since the
+	 * replay as post-abort (review thread P1).
 	 */
-	readonly #terminalAbortSteeringSnapshots = new Map<string, number[]>();
+	readonly #terminalAbortSteeringSnapshots = new Map<string, Array<{ seq: number; token: number }>>();
+	readonly #terminalAbortSteeringSnapshotKeys = new Map<number, string>();
+	#terminalAbortAdmissionSeq = 0;
 	#queuedDisplaySequence = 0;
+	#fireQueuedPromotionHooks(messages: readonly AgentMessage[]): void {
+		for (const message of messages) {
+			const steerHook = this.#steerPromotionHooks.get(message);
+			if (steerHook) {
+				this.#steerPromotionHooks.delete(message);
+				steerHook();
+			}
+			const followUpHook = this.#followUpPromotionHooks.get(message);
+			if (followUpHook) {
+				this.#followUpPromotionHooks.delete(message);
+				followUpHook();
+			}
+		}
+	}
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
@@ -2781,6 +2821,15 @@ export class AgentSession {
 		this.#flushPendingAgentEnd();
 	}
 
+	#retainDeferredAgentEndAfterContinuationBusy(
+		hold: symbol | undefined,
+		pending: AgentSessionEvent | undefined,
+	): void {
+		if (!hold || !pending) return;
+		this.#pendingAgentEndEmit = pending;
+		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+	}
+
 	#releaseDeferredAgentEndContinuation(hold: symbol | undefined): void {
 		if (!hold) return;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
@@ -3329,13 +3378,7 @@ export class AgentSession {
 			// when the batch is drained by a continuation the message did not
 			// schedule (a skipped continuation must never discard the correlation
 			// of work that is still consumed; review thread P2).
-			for (const message of messages) {
-				const hook = this.#followUpPromotionHooks.get(message);
-				if (hook) {
-					this.#followUpPromotionHooks.delete(message);
-					hook();
-				}
-			}
+			this.#fireQueuedPromotionHooks(messages);
 		};
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
@@ -5346,6 +5389,10 @@ export class AgentSession {
 		return scheduled;
 	}
 
+	#isAgentBusyError(error: unknown): error is AgentBusyError {
+		return error instanceof AgentBusyError;
+	}
+
 	#scheduleAgentContinue(options?: {
 		delayMs?: number;
 		generation?: number;
@@ -5364,6 +5411,8 @@ export class AgentSession {
 		// queued turn without replaying the non-assistant tail. Every other
 		// scheduled continuation keeps continue() semantics.
 		continueQueuedOnly?: boolean;
+		/** Reschedule with capped exponential backoff when the continuation hits AgentBusyError. */
+		rescheduleOnBusy?: boolean;
 		/** Called when the scheduled continuation accepts its run (before agent_start). */
 		onRunAccepted?: (handle: AttemptRunHandle) => void;
 	}): Promise<void> {
@@ -5390,155 +5439,178 @@ export class AgentSession {
 		};
 		const scheduledGeneration = options?.generation;
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
-		const leaseSettlement = Promise.withResolvers<void>();
-		const settleLease = () => leaseSettlement.resolve();
-		return this.#schedulePostPromptTask(
-			async scheduledSignal => {
-				try {
-					await this.#withSessionAdmission(
-						"prompt",
-						async () => {
-							const canContinue = (): boolean => {
-								if (scheduledSignal.aborted || this.#isDisposed) {
-									skip("aborted_signal");
-									return false;
-								}
-								if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-									skip("generation_changed");
-									return false;
-								}
-								if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
-									skip("queue_drained");
-									return false;
-								}
-								if (options?.shouldContinue && !options.shouldContinue()) {
-									skip("queue_drained");
-									return false;
-								}
-								return true;
-							};
-							if (!canContinue()) {
-								settleLease();
-								return;
-							}
-							await this.#awaitStartupTurnBarrier();
-							if (!canContinue()) {
-								settleLease();
-								return;
-							}
-							try {
-								if (!options?.skipCompactionCheck) {
-									await this.#checkEstimatedContextBeforePrompt();
-									if (!canContinue()) return;
-								}
-								if (scheduledSignal.aborted) {
-									skip("aborted_signal");
-									return;
-								}
-								if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-									skip("generation_changed");
-									return;
-								}
-								if (options?.shouldContinue && !options.shouldContinue()) {
-									skip("queue_drained");
-									return;
-								}
-								// A scheduled same-turn continuation of a terminally aborted turn is
-								// denied at the final synchronous boundary before agent.continue
-								// entry; no await intervenes between this check and method entry.
-								// Owned-completion deliveries are NOT affected (they use followUp).
-								if (this.#isTurnContinuationBlocked()) {
-									skip("terminal_turn");
-									return;
-								}
-								// A continuation scheduled before a handoff engaged must not start a
-								// turn against the session being handed off (or the restored
-								// predecessor). rearmIdle / normal delivery resumes after the fence.
-								if (this.#handoffTransitionActive) {
-									skip("handoff_in_progress");
-									return;
-								}
-								const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
-								let predecessorAccepted = false;
-								const releasePredecessor = () => {
-									if (predecessorAccepted) return;
-									predecessorAccepted = true;
-									this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+		let busyReschedules = 0;
+		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
+			const leaseSettlement = Promise.withResolvers<void>();
+			const settleLease = () => leaseSettlement.resolve();
+			return this.#schedulePostPromptTask(
+				async scheduledSignal => {
+					try {
+						await this.#withSessionAdmission(
+							"prompt",
+							async () => {
+								const canContinue = (): boolean => {
+									if (scheduledSignal.aborted || this.#isDisposed) {
+										skip("aborted_signal");
+										return false;
+									}
+									if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+										skip("generation_changed");
+										return false;
+									}
+									if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
+										skip("queue_drained");
+										return false;
+									}
+									if (options?.shouldContinue && !options.shouldContinue()) {
+										skip("queue_drained");
+										return false;
+									}
+									return true;
 								};
-								const hasQueuedMessages = this.agent.hasQueuedMessages();
-								const startsQueuedSuccessor =
-									hasQueuedMessages &&
-									(options?.continueQueuedOnly === true ||
-										this.agent.state.messages.at(-1)?.role === "assistant");
-								const continueQueued = options?.continueQueuedOnly
-									? this.agent.continueQueuedMessages.bind(this.agent)
-									: this.agent.continue.bind(this.agent);
-								const queuedMessagesBeforeContinue = [
-									...this.agent.snapshotSteering(),
-									...this.agent.snapshotFollowUp(),
-								];
-								try {
-									await continueQueued({
-										...this.#managedFallbackPromptOptions(),
-										maintenanceContinuation: options?.maintenanceContinuation,
-										// Reset only after continue() has claimed the queued turn. Skipped or stale
-										// continuations retain predecessor accounting, and resetAttemptBudget keeps
-										// the sticky fallback cursor unchanged.
-										onRunAccepted: (handle: AttemptRunHandle) => {
-											const queuedMessagesAfterContinue = new Set([
-												...this.agent.snapshotSteering(),
-												...this.agent.snapshotFollowUp(),
-											]);
-											for (const message of queuedMessagesBeforeContinue) {
-												if (queuedMessagesAfterContinue.has(message)) continue;
-												const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
-												if (sdkRunToken) {
-													this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
-													break;
-												}
-											}
-											this.#acceptRunHandle(handle);
-											options?.onRunAccepted?.(handle);
-											settleLease();
-											releasePredecessor();
-											if (startsQueuedSuccessor) {
-												this.#defaultFallbackChain().resetAttemptBudget();
-												this.#overflowMaintenanceAttempts = 0;
-											}
-										},
-									});
-									releasePredecessor();
-								} catch (error) {
-									if (!predecessorAccepted)
-										this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
-									throw error;
+								if (!canContinue()) {
+									settleLease();
+									return;
 								}
-							} catch (error) {
-								fail(error);
-							} finally {
-								settleLease();
-							}
-						},
-						scheduledSignal,
-						continuationAdmission,
-					);
-				} catch (error) {
-					if (scheduledSignal.aborted) skip("aborted_signal");
-					else fail(error);
-				}
-			},
-			{
-				delayMs: options?.delayMs,
-				onSkip: () => {
-					settleLease();
-					skip("aborted_signal");
+								await this.#awaitStartupTurnBarrier();
+								if (!canContinue()) {
+									settleLease();
+									return;
+								}
+								try {
+									if (!options?.skipCompactionCheck) {
+										await this.#checkEstimatedContextBeforePrompt();
+										if (!canContinue()) return;
+									}
+									if (scheduledSignal.aborted) {
+										skip("aborted_signal");
+										return;
+									}
+									if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+										skip("generation_changed");
+										return;
+									}
+									if (options?.shouldContinue && !options.shouldContinue()) {
+										skip("queue_drained");
+										return;
+									}
+									// A scheduled same-turn continuation of a terminally aborted turn is
+									// denied at the final synchronous boundary before agent.continue
+									// entry; no await intervenes between this check and method entry.
+									// Owned-completion deliveries are NOT affected (they use followUp).
+									if (this.#isTurnContinuationBlocked()) {
+										skip("terminal_turn");
+										return;
+									}
+									// A continuation scheduled before a handoff engaged must not start a
+									// turn against the session being handed off (or the restored
+									// predecessor). rearmIdle / normal delivery resumes after the fence.
+									if (this.#handoffTransitionActive) {
+										skip("handoff_in_progress");
+										return;
+									}
+									const predecessorAgentEnd =
+										this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+									let predecessorAccepted = false;
+									const releasePredecessor = () => {
+										if (predecessorAccepted) return;
+										predecessorAccepted = true;
+										this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+									};
+									const hasQueuedMessages = this.agent.hasQueuedMessages();
+									const startsQueuedSuccessor =
+										hasQueuedMessages &&
+										(options?.continueQueuedOnly === true ||
+											this.agent.state.messages.at(-1)?.role === "assistant");
+									const continueQueued = options?.continueQueuedOnly
+										? this.agent.continueQueuedMessages.bind(this.agent)
+										: this.agent.continue.bind(this.agent);
+									try {
+										await continueQueued({
+											...this.#managedFallbackPromptOptions(),
+											maintenanceContinuation: options?.maintenanceContinuation,
+											// Reset only after continue() has claimed the queued turn. Skipped or stale
+											// continuations retain predecessor accounting, and resetAttemptBudget keeps
+											// the sticky fallback cursor unchanged.
+											onRunAccepted: (handle: AttemptRunHandle, acceptance) => {
+												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages);
+												for (const message of acceptance.consumedQueuedMessages) {
+													const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
+													if (sdkRunToken) {
+														this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+														break;
+													}
+												}
+												this.#acceptRunHandle(handle);
+												options?.onRunAccepted?.(handle);
+												settleLease();
+												releasePredecessor();
+												if (startsQueuedSuccessor) {
+													this.#defaultFallbackChain().resetAttemptBudget();
+													this.#overflowMaintenanceAttempts = 0;
+												}
+											},
+										});
+										releasePredecessor();
+									} catch (error) {
+										if (
+											options?.rescheduleOnBusy &&
+											this.#isAgentBusyError(error) &&
+											!predecessorAccepted &&
+											!terminalized &&
+											canContinue()
+										) {
+											if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
+												busyReschedules += 1;
+												const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
+												this.#retainDeferredAgentEndAfterContinuationBusy(
+													predecessorAgentEndHold,
+													predecessorAgentEnd,
+												);
+												logger.debug("agent.continue busy after scheduling; rescheduling", {
+													error: error.message,
+													attempt: busyReschedules,
+													delayMs: nextDelayMs,
+												});
+												void scheduleAttempt(nextDelayMs);
+												return;
+											}
+											logger.warn("agent.continue busy reschedule budget exhausted; giving up", {
+												attempts: busyReschedules,
+												error: error.message,
+											});
+										}
+										if (!predecessorAccepted)
+											this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+										throw error;
+									}
+								} catch (error) {
+									fail(error);
+								} finally {
+									settleLease();
+								}
+							},
+							scheduledSignal,
+							continuationAdmission,
+						);
+					} catch (error) {
+						if (scheduledSignal.aborted) skip("aborted_signal");
+						else fail(error);
+					}
 				},
-				resourceRunId: options?.resourceRunId,
-				leaseTask: leaseSettlement.promise,
-			},
-		);
+				{
+					delayMs,
+					onSkip: () => {
+						settleLease();
+						skip("aborted_signal");
+					},
+					resourceRunId: options?.resourceRunId,
+					leaseTask: leaseSettlement.promise,
+				},
+			);
+		};
+		return scheduleAttempt();
 	}
-
 	#logCompactionContinuationSkipped(
 		source: "auto_continue_prompt" | "queued_continue" | "overflow_retry",
 		reason: string,
@@ -10193,6 +10265,7 @@ export class AgentSession {
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
+			if (options.onPromoted) this.#steerPromotionHooks.set(message, options.onPromoted);
 		}
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
@@ -10210,11 +10283,8 @@ export class AgentSession {
 		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForSteer()) {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
+				rescheduleOnBusy: true,
 				continueQueuedOnly: true,
-				// The queued steer will start its OWN run: fire the SDK ownership
-				// correlation hook so the submitting connection can terminal-abort
-				// that turn once it starts (review thread P2).
-				onRunAccepted: options?.onPromoted,
 			});
 		}
 	}
@@ -10281,6 +10351,10 @@ export class AgentSession {
 					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
 					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 					this.#sdkRunTokensByQueuedMessage.delete(message);
+					// A canceled follow-up is never promoted: release its
+					// promotion hook so the callback is not retained for the
+					// session lifetime (review thread P2).
+					this.#followUpPromotionHooks.delete(message);
 				}
 				return removed;
 			},
@@ -10297,6 +10371,7 @@ export class AgentSession {
 		this.agent.followUp(message, { forceOneAtATime: true });
 		this.#scheduleAgentContinue({
 			shouldContinue: () => this.#canStartDeferredSdkFollowUp() && this.agent.hasQueuedMessages(),
+			rescheduleOnBusy: true,
 			continueQueuedOnly: true,
 		});
 	}
@@ -10334,6 +10409,7 @@ export class AgentSession {
 			this.#scheduleAgentContinue({
 				shouldContinue: () =>
 					this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages() && (ownsQueuedMessage?.() ?? true),
+				rescheduleOnBusy: true,
 				continueQueuedOnly: true,
 			});
 		}
@@ -11291,6 +11367,7 @@ export class AgentSession {
 					delayMs: 1,
 					generation: this.#promptGeneration,
 					shouldContinue: () => this.agent.hasQueuedSteering(),
+					rescheduleOnBusy: true,
 					continueQueuedOnly: true,
 				});
 			}
@@ -11349,12 +11426,57 @@ export class AgentSession {
 	 * overwrite an earlier admission's snapshot and purge an already-accepted
 	 * steer (review thread P1).
 	 */
-	captureTerminalAbortSteeringSnapshot(): void {
-		if (this.#turnLineageIdHash === undefined) return;
+	captureTerminalAbortSteeringSnapshot(): number | undefined {
+		if (this.#turnLineageIdHash === undefined) return undefined;
 		const key = `${this.#turnLineageIdHash}:${this.#promptGeneration}`;
 		const queue = this.#terminalAbortSteeringSnapshots.get(key) ?? [];
-		queue.push(this.#steeringAdmissionSeq);
+		const token = ++this.#terminalAbortAdmissionSeq;
+		queue.push({ seq: this.#steeringAdmissionSeq, token });
 		this.#terminalAbortSteeringSnapshots.set(key, queue);
+		this.#terminalAbortSteeringSnapshotKeys.set(token, key);
+		return token;
+	}
+	/**
+	 * Discard a captured snapshot whose admission never settles (a durable
+	 * same-key replay, no-effect, conflict, or marker failure): the entry is
+	 * keyed to the CURRENT turn, which is where its admission captured it.
+	 * Removing by token keeps overlapping admissions' entries independent.
+	 */
+	/**
+	 * Rebind a captured snapshot to the CURRENT turn: the owner-mismatch
+	 * fall-through may terminalize the aborting requester's own turn that won
+	 * the race, while the token was captured under the other connection's
+	 * turn. The entry moves to the current turn's FIFO (retaining the original
+	 * admission sequence) so the settlement's purge classifies steering
+	 * admitted since admission as post-snapshot (review thread P1).
+	 */
+	rebindTerminalAbortSteeringSnapshot(token: number): void {
+		const capturedKey = this.#terminalAbortSteeringSnapshotKeys.get(token);
+		if (capturedKey === undefined) return;
+		if (this.#turnLineageIdHash === undefined) return;
+		const currentKey = `${this.#turnLineageIdHash}:${this.#promptGeneration}`;
+		if (capturedKey === currentKey) return;
+		const capturedQueue = this.#terminalAbortSteeringSnapshots.get(capturedKey);
+		const index = capturedQueue?.findIndex(entry => entry.token === token) ?? -1;
+		if (index < 0) return;
+		const [entry] = capturedQueue!.splice(index, 1);
+		if (capturedQueue!.length === 0) this.#terminalAbortSteeringSnapshots.delete(capturedKey);
+		const currentQueue = this.#terminalAbortSteeringSnapshots.get(currentKey) ?? [];
+		currentQueue.push(entry);
+		this.#terminalAbortSteeringSnapshots.set(currentKey, currentQueue);
+		this.#terminalAbortSteeringSnapshotKeys.set(token, currentKey);
+	}
+	discardTerminalAbortSteeringSnapshot(token: number): void {
+		const key = this.#terminalAbortSteeringSnapshotKeys.get(token);
+		if (!key) return;
+		this.#terminalAbortSteeringSnapshotKeys.delete(token);
+		const queue = this.#terminalAbortSteeringSnapshots.get(key);
+		if (!queue) return;
+		const index = queue.findIndex(entry => entry.token === token);
+		if (index >= 0) {
+			queue.splice(index, 1);
+			if (queue.length === 0) this.#terminalAbortSteeringSnapshots.delete(key);
+		}
 	}
 
 	getTerminalTurnEpoch(): number | undefined {
@@ -11380,7 +11502,10 @@ export class AgentSession {
 	}
 	async abortPromptAndWait(
 		handle: string,
-		options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
+		options: {
+			graceMs: number;
+			terminal?: { scope: "turn" | "owned"; expectedEpoch?: number; steeringSnapshotToken?: number };
+		},
 	): Promise<
 		RunSettlementProof & {
 			terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
@@ -11405,6 +11530,20 @@ export class AgentSession {
 				options.terminal.expectedEpoch !== this.#promptGeneration
 			) {
 				return { status: "unfenced", reason: "unknown_run", pending: [] };
+			}
+			const requestedSnapshotToken = options.terminal.steeringSnapshotToken;
+			const currentSnapshotKey =
+				this.#turnLineageIdHash === undefined ? undefined : `${this.#turnLineageIdHash}:${this.#promptGeneration}`;
+			if (requestedSnapshotToken !== undefined) {
+				const capturedKey = this.#terminalAbortSteeringSnapshotKeys.get(requestedSnapshotToken);
+				const capturedQueue = capturedKey ? this.#terminalAbortSteeringSnapshots.get(capturedKey) : undefined;
+				if (
+					capturedKey !== currentSnapshotKey ||
+					!capturedQueue?.some(entry => entry.token === requestedSnapshotToken)
+				) {
+					this.discardTerminalAbortSteeringSnapshot(requestedSnapshotToken);
+					return { status: "unfenced", reason: "unknown_run", pending: [] };
+				}
 			}
 			// Terminal abort (C04 mode:"terminal"): register and synchronously
 			// close the continuation fence for the current turn BEFORE the run is
@@ -11437,7 +11576,14 @@ export class AgentSession {
 				// preserved — owned-completion resumes must still deliver.
 				const turnSnapshotKey = `${lineageIdHash}:${this.#promptGeneration}`;
 				const queuedTurnSnapshots = this.#terminalAbortSteeringSnapshots.get(turnSnapshotKey);
-				abortSteeringSnapshot = queuedTurnSnapshots?.shift() ?? this.#steeringAdmissionSeq;
+				const snapshotIndex =
+					requestedSnapshotToken === undefined
+						? 0
+						: (queuedTurnSnapshots?.findIndex(entry => entry.token === requestedSnapshotToken) ?? -1);
+				const consumedSnapshot =
+					queuedTurnSnapshots && snapshotIndex >= 0 ? queuedTurnSnapshots.splice(snapshotIndex, 1)[0] : undefined;
+				if (consumedSnapshot) this.#terminalAbortSteeringSnapshotKeys.delete(consumedSnapshot.token);
+				abortSteeringSnapshot = consumedSnapshot?.seq ?? this.#steeringAdmissionSeq;
 				if (queuedTurnSnapshots?.length === 0) {
 					this.#terminalAbortSteeringSnapshots.delete(turnSnapshotKey);
 				}
@@ -11592,6 +11738,21 @@ export class AgentSession {
 					delayMs: 1,
 					generation: this.#promptGeneration,
 					shouldContinue: () => hasPreservedFollowUp() || hasPreservedSteering(),
+					// The rearmed continuation must consume the queued steer inside
+					// the run acceptance (continueQueuedMessages) rather than
+					// dequeue it later via getSteeringMessages: a terminal abort
+					// leaves a non-assistant history tail (tool result), which
+					// would otherwise select Agent.continue() and accept the run
+					// with an empty consumedQueuedMessages payload, so
+					// #fireQueuedPromotionHooks never fires and the submitting
+					// connection is not recorded as an owner — its later terminal
+					// abort is rejected as an owner mismatch (review thread P1).
+					// The preserved messages are still re-verified by
+					// shouldContinue at continuation time, so a steer removed
+					// during the delay never fires a stale hook and a post-snapshot
+					// steer admitted during the delay is not missed.
+					continueQueuedOnly: true,
+					rescheduleOnBusy: true,
 				});
 			}
 		}
@@ -11746,6 +11907,7 @@ export class AgentSession {
 							resetRetryReplaySafety: true,
 							onRunAccepted: () => {
 								runAccepted = true;
+								if (selected) this.#fireQueuedPromotionHooks([message]);
 								if (selected) {
 									this.#steeringMessages = this.#steeringMessages.filter(entry => entry !== selected.display);
 									this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== selected.display);
@@ -16242,6 +16404,7 @@ export class AgentSession {
 							delayMs: 100,
 							generation,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
+							rescheduleOnBusy: true,
 							continueQueuedOnly: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -16263,6 +16426,7 @@ export class AgentSession {
 						suppressPredecessorAgentEnd: true,
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
+						rescheduleOnBusy: true,
 						continueQueuedOnly: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -16522,6 +16686,7 @@ export class AgentSession {
 					generation,
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
+					rescheduleOnBusy: true,
 					continueQueuedOnly: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -18066,6 +18231,7 @@ export class AgentSession {
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+					rescheduleOnBusy: true,
 					continueQueuedOnly: true,
 				});
 			}

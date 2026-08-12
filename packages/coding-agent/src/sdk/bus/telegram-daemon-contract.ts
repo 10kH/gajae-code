@@ -233,6 +233,7 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * Generation 157 adds orphan-topic reconciliation: FORUM_TOPIC_NOT_FOUND is
  * settled as definitive, and the unsupported-method fallback closes when
  * deleteForumTopic is unavailable on older Bot API deployments.
+ * Generation 158 updates terminal-abort notification admission and cleanup semantics.
  * Generation 158 fences the master-worker lifecycle: older daemons cannot
  * continue serving while this daemon adds or removes master-channel delivery
  * authority.

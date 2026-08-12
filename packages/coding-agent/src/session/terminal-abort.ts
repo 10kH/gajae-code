@@ -1239,8 +1239,9 @@ export const MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
 export function boundTerminalRetentionState<Row extends DurableScopeRetentionRow, Key extends { keyHash: string }>(
 	priorKeys: readonly Key[],
 	nextScopes: Row[],
+	maxScopes: number = MAX_DURABLE_TERMINAL_RESERVATIONS,
 ): { scopes: Row[]; keys: Array<Key | EvictedTerminalKey> } {
-	const scopes = boundCompletedTerminalScopeRows(nextScopes, MAX_DURABLE_TERMINAL_RESERVATIONS);
+	const scopes = boundCompletedTerminalScopeRows(nextScopes, maxScopes);
 	const evicted = collectEvictedTerminalKeys(nextScopes, scopes);
 	return {
 		scopes,

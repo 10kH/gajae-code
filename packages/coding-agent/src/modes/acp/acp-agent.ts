@@ -123,6 +123,17 @@ interface PromptWaiter {
 	activity: PromptActivity;
 	/** Coordinates a prompt-control rejection racing an acknowledged ACP cancellation. */
 	cancelAttempt?: Promise<boolean>;
+	/** Whether ANY overlapping cancel attempt for this prompt was acknowledged:
+	 *  a later failed attempt must not erase an earlier success (review thread P2). */
+	cancelAcknowledged?: boolean;
+	/** In-flight cancel attempts for this prompt: cancellation intent must stay
+	 *  set while any attempt can still acknowledge, so a failure only clears
+	 *  the shared flag when no attempt remains pending (review thread P2). */
+	pendingCancelAttempts?: number;
+	/** Shared resolver for cancelAttempt: ANY successful attempt resolves it
+	 *  immediately (no request-order serialization), and the LAST failing
+	 *  attempt resolves false (review thread P2). */
+	cancelAttemptResolve?: (acknowledged: boolean) => void;
 	resolve: (response: PromptResponse) => void;
 	reject: (error: Error) => void;
 }
@@ -1680,8 +1691,23 @@ export class AcpAgent implements Agent {
 		// `_meta.gjc.abortScope: "owned"` (or `GJC_ACP_ABORT_SCOPE=owned`).
 		const scope = resolveAcpAbortScope(params._meta, process.env);
 		const waiter = record.activePrompt;
-		const cancelAttempt = waiter ? Promise.withResolvers<boolean>() : undefined;
-		if (waiter && cancelAttempt) waiter.cancelAttempt = cancelAttempt.promise;
+		if (waiter) {
+			// Overlapping cancels must not lose an earlier successful
+			// acknowledgement: ANY successful attempt resolves the shared
+			// waiter promise IMMEDIATELY (aggregation, not request-order
+			// serialization — an unanswered first attempt must not delay the
+			// second attempt's acknowledged success, or a prompt rejection
+			// awaiting cancelAttempt could hang past the grace bound; review
+			// thread P2). The LAST failing attempt resolves false. In-flight
+			// attempts are counted so a failure only clears the shared intent
+			// when no earlier attempt can still acknowledge.
+			waiter.pendingCancelAttempts = (waiter.pendingCancelAttempts ?? 0) + 1;
+			if (!waiter.cancelAttemptResolve) {
+				const deferred = Promise.withResolvers<boolean>();
+				waiter.cancelAttempt = deferred.promise;
+				waiter.cancelAttemptResolve = deferred.resolve;
+			}
+		}
 		try {
 			const acknowledgement = await record.adapter.cancel(scope);
 			const result = object(object(acknowledgement)?.result) ?? object(acknowledgement);
@@ -1690,6 +1716,11 @@ export class AcpAgent implements Agent {
 					"abort_unacknowledged",
 					"SDK did not acknowledge cancellation of the active prompt.",
 				);
+			if (waiter) waiter.cancelAcknowledged = true;
+			if (waiter && record.activePrompt !== waiter) {
+				waiter.cancelAttemptResolve?.(true);
+				return;
+			}
 			if (
 				result?.disposition === "preflight_cancelled" &&
 				waiter &&
@@ -1710,11 +1741,36 @@ export class AcpAgent implements Agent {
 				// published. Arm the bounded settlement so the turn cannot outlive the cancel.
 				this.#scheduleCancelSettlement(params.sessionId, record);
 			}
-			cancelAttempt?.resolve(true);
+			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
-			record.cancelRequested = false;
-			cancelAttempt?.resolve(false);
+			if (!waiter) record.cancelRequested = false;
+			// Only the LAST in-flight attempt resolves the shared promise false;
+			// an earlier attempt may still acknowledge (review thread P2). After
+			// every attempt of this wave failed, RE-ARM the aggregate: a later
+			// cancellation wave must get a fresh resolver — a stale resolved-false
+			// promise would let the prompt path observe the old failure
+			// immediately and report cancelled while the retry is still pending
+			// (review thread P2).
+			// Only clear and re-arm the aggregate when the LAST in-flight
+			// attempt fails AND the entire wave was unacknowledged: a
+			// failing attempt that follows an acknowledged one must not
+			// erase the already-resolved successful aggregate, or a later
+			// cancel installs a fresh unresolved cancelAttempt that a
+			// concurrent prompt-preflight rejection awaits past the grace
+			// bound (review thread P2).
+			if (waiter && (waiter.pendingCancelAttempts ?? 0) <= 1 && !waiter.cancelAcknowledged) {
+				waiter.cancelAttemptResolve?.(false);
+				waiter.cancelAttempt = undefined;
+				waiter.cancelAttemptResolve = undefined;
+			}
 			throw error;
+		} finally {
+			if (waiter) {
+				waiter.pendingCancelAttempts = Math.max(0, (waiter.pendingCancelAttempts ?? 1) - 1);
+				if (waiter.pendingCancelAttempts === 0 && !waiter.cancelAcknowledged && record.activePrompt === waiter) {
+					record.cancelRequested = false;
+				}
+			}
 		}
 	}
 

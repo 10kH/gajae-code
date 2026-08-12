@@ -311,6 +311,22 @@ describe("AgentSession.cancelAndSubmit", () => {
 		expect(s.getQueuedMessageEntries().map(entry => entry.id)).not.toContain(head.id);
 	});
 
+	it("committed external steer fires its ownership hook exactly once", async () => {
+		const { session: s } = buildSession();
+		let promoted = 0;
+		await s.sendUserMessage("owned queued steer", {
+			deliverAs: "steer",
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+		const [head] = s.getQueuedMessageEntries();
+		if (!head) throw new Error("Expected an external queued steer");
+
+		expect(await s.cancelAndSubmit(head.text, { queuedEntryId: head.id })).toEqual({ kind: "submitted" });
+		expect(promoted).toBe(1);
+	});
+
 	it("committed queue-head removes only the selected duplicate-text display", async () => {
 		const { session: s } = buildSession();
 		await s.steer("duplicate queued text");
@@ -449,16 +465,16 @@ describe("AgentSession.cancelAndSubmit", () => {
 			if (event.type === "notice" && event.level === "warning") notices.push(event.message);
 		});
 		vi.spyOn(agent, "waitForIdle").mockImplementationOnce(() => new Promise<void>(() => {}));
-		vi.useFakeTimers();
-		const cancelling = s.cancelAndSubmit("send now");
-		await Promise.resolve();
-		await Promise.resolve();
-		vi.advanceTimersByTime(5_000);
-		await Promise.resolve();
-		await expect(cancelling).resolves.toEqual({ kind: "rolled_back", outcome: { kind: "timeout" } });
+		// #abortWithOutcome uses Bun.sleep for the production timeout. Bun's sleep
+		// is intentionally independent of vi fake timers, so advancing a mocked
+		// setTimeout clock leaves this promise pending forever. Exercise the real
+		// bounded timeout instead; this is the observable contract under test.
+		await expect(s.cancelAndSubmit("send now")).resolves.toEqual({
+			kind: "rolled_back",
+			outcome: { kind: "timeout" },
+		});
 		expect(notices).toContainEqual(expect.stringContaining("forced session recovery"));
-		vi.useRealTimers();
-	});
+	}, 10_000);
 
 	// Refusal scenarios have no abort outcome: compaction and duplicate-token calls must leave all stores untouched.
 	it("compaction-refused × refusal leaves queues and hidden context untouched", async () => {
