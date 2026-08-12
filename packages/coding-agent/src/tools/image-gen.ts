@@ -67,7 +67,7 @@ export function redactImageProviderText(value: unknown, activeApiKey?: string): 
 	text = text
 		.replace(/\b(?:bearer|basic)\s+[^\s,;]+/gi, match => `${match.split(/\s+/, 1)[0]} ${REDACTED_PROVIDER_SECRET}`)
 		.replace(
-			/\b(?:authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
+			/(?:\b|["'])(?:authorization|api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
 			match => match.replace(/([:=]\s*).*/, `$1${REDACTED_PROVIDER_SECRET}`),
 		)
 		.replace(/\b(?:sk|rk|pk|sess|ghp|gho|github_pat|xox[baprs])-[-A-Za-z0-9._]{8,}\b/gi, REDACTED_PROVIDER_SECRET)
@@ -96,11 +96,16 @@ function parseProviderJson<T>(rawText: string, activeApiKey?: string): T {
 	throw new Error(redactImageProviderText(message, activeApiKey));
 }
 
-async function readProviderResponseText(response: Response): Promise<string> {
+async function readProviderResponseText(
+	response: Response,
+	activeApiKey?: string,
+	signal?: AbortSignal,
+): Promise<string> {
 	const contentLength = response.headers.get("content-length");
 	if (contentLength !== null) {
 		const declaredLength = Number(contentLength);
 		if (Number.isFinite(declaredLength) && declaredLength > MAX_PROVIDER_BODY_BYTES) {
+			await response.body?.cancel().catch(() => undefined);
 			throw new Error(PROVIDER_OVERSIZED_RESPONSE);
 		}
 	}
@@ -129,6 +134,9 @@ async function readProviderResponseText(response: Response): Promise<string> {
 		const trailingText = decoder.decode();
 		if (trailingText.length > 0) chunks.push(trailingText);
 		return chunks.join("");
+	} catch (error) {
+		if (signal?.aborted) throw signal.reason ?? error;
+		throw new Error(redactImageProviderText(error instanceof Error ? error.message : error, activeApiKey));
 	} finally {
 		reader.releaseLock();
 	}
@@ -138,6 +146,19 @@ const PROVIDER_SSE_READ_OPTIONS = {
 	maxEventBytes: MAX_PROVIDER_SSE_EVENT_BYTES,
 	maxTotalBytes: MAX_PROVIDER_BODY_BYTES,
 } as const;
+
+async function fetchImageProvider(
+	input: string | URL | Request,
+	init: RequestInit,
+	activeApiKey: string,
+): Promise<Response> {
+	try {
+		return await fetch(input, init);
+	} catch (error) {
+		if (init.signal?.aborted) throw init.signal.reason ?? error;
+		throw new Error(redactImageProviderText(error instanceof Error ? error.message : error, activeApiKey));
+	}
+}
 
 const ANTIGRAVITY_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
 const ALIBABA_TOKEN_PLAN_HOST = "https://token-plan.ap-southeast-1.maas.aliyuncs.com";
@@ -352,6 +373,30 @@ interface OpenAIHostedImageResult {
 	responseText?: string;
 	revisedPrompt?: string;
 	usage?: OpenAIResponsesUsage;
+}
+
+function redactOpenAIHostedImageResult(result: OpenAIHostedImageResult, activeApiKey: string): OpenAIHostedImageResult {
+	return {
+		...result,
+		responseText: result.responseText ? redactImageProviderText(result.responseText, activeApiKey) : undefined,
+		revisedPrompt: result.revisedPrompt ? redactImageProviderText(result.revisedPrompt, activeApiKey) : undefined,
+	};
+}
+
+function redactGeminiPromptFeedback(
+	promptFeedback: GeminiPromptFeedback | undefined,
+	activeApiKey: string,
+): GeminiPromptFeedback | undefined {
+	if (!promptFeedback) return undefined;
+	return {
+		blockReason: promptFeedback.blockReason
+			? redactImageProviderText(promptFeedback.blockReason, activeApiKey)
+			: undefined,
+		safetyRatings: promptFeedback.safetyRatings?.map(rating => ({
+			category: rating.category ? redactImageProviderText(rating.category, activeApiKey) : undefined,
+			probability: rating.probability ? redactImageProviderText(rating.probability, activeApiKey) : undefined,
+		})),
+	};
 }
 
 interface OpenRouterImageUrl {
@@ -1236,9 +1281,7 @@ async function parseOpenAIHostedImageSse(
 	const fallbackOutput: OpenAIResponseOutput[] = [];
 	let completedResponse: OpenAIHostedImageResponse | undefined;
 
-	let events: OpenAISseEvent[];
 	try {
-		events = [];
 		for await (const event of readSseJson<OpenAISseEvent>(
 			response.body,
 			signal,
@@ -1246,28 +1289,25 @@ async function parseOpenAIHostedImageSse(
 			PROVIDER_SSE_READ_OPTIONS,
 		)) {
 			if (!event || typeof event !== "object" || Array.isArray(event)) throw new Error(PROVIDER_MALFORMED_RESPONSE);
-			events.push(event);
+			if (event.type === "error") {
+				const message = event.error?.message ?? event.message ?? "OpenAI image request failed";
+				throw new Error(redactImageProviderText(message, activeApiKey));
+			}
+			if (event.type === "response.failed") {
+				const message = event.response?.error?.message ?? "OpenAI image request failed";
+				throw new Error(redactImageProviderText(message, activeApiKey));
+			}
+			if (event.type === "response.output_item.done" && event.item) {
+				fallbackOutput.push(event.item);
+			}
+			if ((event.type === "response.completed" || event.type === "response.done") && event.response) {
+				completedResponse = event.response;
+			}
 		}
 	} catch (error) {
 		if (signal?.aborted) throw signal.reason ?? error;
+		if (error instanceof Error && error.message !== PROVIDER_MALFORMED_RESPONSE) throw error;
 		throw new Error(redactImageProviderText(PROVIDER_MALFORMED_RESPONSE, activeApiKey));
-	}
-
-	for (const event of events) {
-		if (event.type === "error") {
-			const message = event.error?.message ?? event.message ?? "OpenAI image request failed";
-			throw new Error(redactImageProviderText(message, activeApiKey));
-		}
-		if (event.type === "response.failed") {
-			const message = event.response?.error?.message ?? "OpenAI image request failed";
-			throw new Error(redactImageProviderText(message, activeApiKey));
-		}
-		if (event.type === "response.output_item.done" && event.item) {
-			fallbackOutput.push(event.item);
-		}
-		if ((event.type === "response.completed" || event.type === "response.done") && event.response) {
-			completedResponse = event.response;
-		}
 	}
 
 	return collectOpenAIHostedImageResult(
@@ -1289,15 +1329,19 @@ async function generateOpenAIHostedImage(
 	const promptText = assemblePrompt(params);
 	const stream = model.api === "openai-codex-responses" || model.provider === "openai-codex";
 	const requestBody = buildOpenAIHostedImageRequest(model, promptText, params, inputImages, stream);
-	const response = await fetch(getOpenAIResponsesUrl(model, options?.authCredentialType), {
-		method: "POST",
-		headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
-		body: JSON.stringify(requestBody),
-		signal,
-	});
+	const response = await fetchImageProvider(
+		getOpenAIResponsesUrl(model, options?.authCredentialType),
+		{
+			method: "POST",
+			headers: buildOpenAIImageHeaders(model, apiKey, sessionId),
+			body: JSON.stringify(requestBody),
+			signal,
+		},
+		apiKey,
+	);
 
 	if (!response.ok) {
-		const errorText = await readProviderResponseText(response);
+		const errorText = await readProviderResponseText(response, apiKey, signal);
 		throw new Error(
 			`OpenAI image request failed (${response.status}): ${getOpenAIResponseErrorMessage(errorText, apiKey)}`,
 		);
@@ -1305,12 +1349,12 @@ async function generateOpenAIHostedImage(
 
 	const contentType = response.headers.get("content-type") ?? "";
 	if (stream || contentType.includes("text/event-stream")) {
-		return parseOpenAIHostedImageSse(response, signal, apiKey);
+		return redactOpenAIHostedImageResult(await parseOpenAIHostedImageSse(response, signal, apiKey), apiKey);
 	}
 
-	const rawText = await readProviderResponseText(response);
+	const rawText = await readProviderResponseText(response, apiKey, signal);
 	const data = parseProviderJson<OpenAIHostedImageResponse>(rawText, apiKey);
-	return collectOpenAIHostedImageResult(data);
+	return redactOpenAIHostedImageResult(collectOpenAIHostedImageResult(data), apiKey);
 }
 
 function combineParts(response: GeminiGenerateContentResponse): GeminiPart[] {
@@ -1537,20 +1581,24 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 				const { getAntigravityUserAgent } =
 					require("@gajae-code/ai/providers/google-gemini-headers") as typeof import("@gajae-code/ai/providers/google-gemini-headers");
-				const response = await fetch(`${ANTIGRAVITY_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`, {
-					method: "POST",
-					headers: {
-						Authorization: `Bearer ${apiKey.apiKey}`,
-						"Content-Type": "application/json",
-						Accept: "text/event-stream",
-						"User-Agent": getAntigravityUserAgent(),
+				const response = await fetchImageProvider(
+					`${ANTIGRAVITY_ENDPOINT}/v1internal:streamGenerateContent?alt=sse`,
+					{
+						method: "POST",
+						headers: {
+							Authorization: `Bearer ${apiKey.apiKey}`,
+							"Content-Type": "application/json",
+							Accept: "text/event-stream",
+							"User-Agent": getAntigravityUserAgent(),
+						},
+						body: JSON.stringify(requestBody),
+						signal: requestSignal,
 					},
-					body: JSON.stringify(requestBody),
-					signal: requestSignal,
-				});
+					apiKey.apiKey,
+				);
 
-			if (!response.ok) {
-					const errorText = await readProviderResponseText(response);
+				if (!response.ok) {
+					const errorText = await readProviderResponseText(response, apiKey.apiKey, requestSignal);
 					const parsed = tryParseProviderJson<{ error?: { message?: string } }>(errorText);
 					const message = parsed?.error?.message;
 					throw new Error(
@@ -1606,20 +1654,24 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					messages: [{ role: "user" as const, content: contentParts }],
 				};
 
-				const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-						Authorization: `Bearer ${apiKey.apiKey}`,
-						"HTTP-Referer": "https://gaebal-gajae.dev/",
-						"X-OpenRouter-Title": "Gajae Code",
-						"X-OpenRouter-Categories": "cli-agent",
+				const response = await fetchImageProvider(
+					"https://openrouter.ai/api/v1/chat/completions",
+					{
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							Authorization: `Bearer ${apiKey.apiKey}`,
+							"HTTP-Referer": "https://gaebal-gajae.dev/",
+							"X-OpenRouter-Title": "Gajae Code",
+							"X-OpenRouter-Categories": "cli-agent",
+						},
+						body: JSON.stringify(requestBody),
+						signal: requestSignal,
 					},
-					body: JSON.stringify(requestBody),
-					signal: requestSignal,
-				});
+					apiKey.apiKey,
+				);
 
-			const rawText = await readProviderResponseText(response);
+				const rawText = await readProviderResponseText(response, apiKey.apiKey, requestSignal);
 				if (!response.ok) {
 					const parsed = tryParseProviderJson<{ error?: { message?: string } }>(rawText);
 					const message = parsed?.error?.message;
@@ -1631,9 +1683,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				const data = parseProviderJson<OpenRouterResponse>(rawText, apiKey.apiKey);
 				const message = data.choices?.[0]?.message;
 				const rawResponseText = collectOpenRouterResponseText(message);
-				const responseText = rawResponseText
-					? redactImageProviderText(rawResponseText, apiKey.apiKey)
-					: undefined;
+				const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
 				const imageUrls = extractOpenRouterImageUrls(message);
 				const inlineImages: InlineImageData[] = [];
 				for (const imageUrl of imageUrls) {
@@ -1680,17 +1730,21 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					params.image_size,
 				);
 
-				const response = await fetch(ALIBABA_IMAGE_GENERATION_URL, {
-					method: "POST",
-					headers: {
-						"Content-Type": "application/json",
-						Authorization: `Bearer ${apiKey.apiKey}`,
+				const response = await fetchImageProvider(
+					ALIBABA_IMAGE_GENERATION_URL,
+					{
+						method: "POST",
+						headers: {
+							"Content-Type": "application/json",
+							Authorization: `Bearer ${apiKey.apiKey}`,
+						},
+						body: JSON.stringify(requestBody),
+						signal: requestSignal,
 					},
-					body: JSON.stringify(requestBody),
-					signal: requestSignal,
-				});
+					apiKey.apiKey,
+				);
 
-			const rawText = await readProviderResponseText(response);
+				const rawText = await readProviderResponseText(response, apiKey.apiKey, requestSignal);
 				if (!response.ok) {
 					const parsed = tryParseProviderJson<{ message?: string; error?: { message?: string } }>(rawText);
 					const message = parsed?.error?.message ?? parsed?.message;
@@ -1707,9 +1761,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				}
 
 				const { imageUrls, responseText: rawResponseText } = collectAlibabaImageResult(data);
-				const responseText = rawResponseText
-					? redactImageProviderText(rawResponseText, apiKey.apiKey)
-					: undefined;
+				const responseText = rawResponseText ? redactImageProviderText(rawResponseText, apiKey.apiKey) : undefined;
 				// Result URLs are short-lived OSS-signed URLs (24h); download immediately.
 				const inlineImages: InlineImageData[] = [];
 				for (const imageUrl of imageUrls) {
@@ -1771,7 +1823,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				generationConfig,
 			};
 
-			const response = await fetch(
+			const response = await fetchImageProvider(
 				`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
 				{
 					method: "POST",
@@ -1782,9 +1834,10 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					body: JSON.stringify(requestBody),
 					signal: requestSignal,
 				},
+				apiKey.apiKey,
 			);
 
-			const rawText = await readProviderResponseText(response);
+			const rawText = await readProviderResponseText(response, apiKey.apiKey, requestSignal);
 			if (!response.ok) {
 				const parsed = tryParseProviderJson<{ error?: { message?: string } }>(rawText);
 				const message = parsed?.error?.message;
@@ -1812,7 +1865,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 						imagePaths: [],
 						images: [],
 						responseText,
-						promptFeedback: data.promptFeedback,
+						promptFeedback: redactGeminiPromptFeedback(data.promptFeedback, apiKey.apiKey),
 						usage: data.usageMetadata,
 					},
 				};
@@ -1829,7 +1882,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 					imagePaths,
 					images: inlineImages,
 					responseText,
-					promptFeedback: data.promptFeedback,
+					promptFeedback: redactGeminiPromptFeedback(data.promptFeedback, apiKey.apiKey),
 					usage: data.usageMetadata,
 				},
 			};
