@@ -141,6 +141,7 @@ import {
 	type CustomModelPresetWizardSubmit,
 } from "../components/custom-model-preset-wizard";
 import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "../components/custom-provider-wizard";
+import { CustomizationDashboard } from "../components/customization";
 import { ExtensionDashboard } from "../components/extensions";
 import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
@@ -1955,6 +1956,25 @@ export class SelectorController {
 	 */
 	async showExtensionsDashboard(): Promise<void> {
 		const dashboard = await ExtensionDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows);
+		this.showSelector(done => {
+			dashboard.onClose = () => {
+				done();
+				this.ctx.ui.requestRender();
+			};
+			dashboard.onRequestRender = () => {
+				this.ctx.ui.requestRender();
+			};
+			return { component: dashboard, focus: dashboard };
+		});
+	}
+
+	/**
+	 * Show the `/extensions` umbrella local-customization dashboard (skills,
+	 * hooks, MCPs, import) — a separate surface from the provider-focused
+	 * Extension Control Center above (issue #4291).
+	 */
+	async showCustomizationDashboard(): Promise<void> {
+		const dashboard = await CustomizationDashboard.create(getProjectDir(), this.ctx.settings);
 		this.showSelector(done => {
 			dashboard.onClose = () => {
 				done();
