@@ -210,6 +210,9 @@ export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 			source.reasoning = true;
 			source.name = "DeepSeek V4 Flash 0731";
 		}
+		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
+			source.reasoning = true;
+		}
 		const model = refreshModelThinking(source);
 		applyGeneratedModelPolicy(model);
 		models[index] = model;
