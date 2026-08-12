@@ -312,12 +312,18 @@ function isUnresolvedEvent(event: SessionIndexEvent): boolean {
  * also emitted by `recordTerminalUncertain` as an unproven `lifecycle_terminal`
  * claim, and malformed generations are not proof of anything: everything that
  * is not this exact shape keeps fencing (C5/C6).
+ *
+ * The comparison is symlink-equivalent because the writer and the reader can
+ * legitimately spell the same agent dir differently (one via a symlink, one via
+ * its realpath). A plain `path.resolve` match would reject the genuine fence
+ * row under a symlinked agent dir and re-fence every session — the exact
+ * outage this predicate exists to prevent.
  */
-function isDirectSessionGcFenceRow(event: SessionIndexEvent, agentDir: string): boolean {
+function isDirectSessionGcFenceRow(event: SessionIndexEvent, agentDirIdentity: string): boolean {
 	return (
 		event.type === "host_registered" &&
 		event.endpointGeneration === 0 &&
-		path.resolve(event.locator.stateRoot) === path.resolve(agentDir)
+		resolveEquivalentPath(event.locator.stateRoot) === agentDirIdentity
 	);
 }
 
@@ -389,6 +395,9 @@ function projectIdentity(state: SessionIdentityState, ambiguous: boolean, now: n
  * locator/endpoint metadata from their identity's prior event.
  */
 function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string): SessionIndexProjection {
+	// Resolved once: the fence-row check runs per root, and only this side of the
+	// comparison is ours to normalize.
+	const agentDirIdentity = resolveEquivalentPath(agentDir);
 	const { admitted } = admitEvents(events);
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
@@ -440,7 +449,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string
 				unresolvedRoots.set(sessionId, unresolved);
 			}
 			unresolved.set(root, rootStates);
-			if (isDirectSessionGcFenceRow(current.latest, agentDir)) continue;
+			if (isDirectSessionGcFenceRow(current.latest, agentDirIdentity)) continue;
 			let fencing = fencingRoots.get(sessionId);
 			if (fencing === undefined) {
 				fencing = new Map<string, SessionIdentityState[]>();

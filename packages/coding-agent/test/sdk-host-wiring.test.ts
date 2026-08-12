@@ -1064,7 +1064,11 @@ test("startup records identity before an early lifecycle event and publishes it 
 		const events = replay.events as Array<Record<string, unknown>>;
 		expect(events.map(event => event.payload)).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ type: "identity_header", sessionId, telegramTopicsEnabled: true }),
+				// Telegram is not configured in this harness, so the session correctly
+				// declares itself ineligible. Eligibility tracks configuration only;
+				// `isTelegramSessionEligible` owns that rule and is covered directly in
+				// notifications-config.test.ts.
+				expect.objectContaining({ type: "identity_header", sessionId, telegramTopicsEnabled: false }),
 				expect.objectContaining({ type: "activity", sessionId, state: "busy" }),
 			]),
 		);

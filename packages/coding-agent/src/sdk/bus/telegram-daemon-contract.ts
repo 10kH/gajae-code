@@ -218,8 +218,14 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * same way instead of terminating the daemon (#4200).
  * Generation 153 restricts Telegram forum-topic ownership, replay, routing, callbacks,
  * and lease renewal to identities with coordinator or lifecycle provenance.
+ * Generation 154 derives Telegram session eligibility from configuration
+ * (Telegram configured and effectively enabled) instead of coordinator or
+ * lifecycle launch provenance. Generation 153 made every ordinary interactive
+ * session declare itself ineligible, so the daemon rejected its identity
+ * header, never created a topic, and delivered nothing while still reporting
+ * healthy attachments.
  */
-export const DAEMON_GENERATION = 153;
+export const DAEMON_GENERATION = 154;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
