@@ -254,4 +254,38 @@ describe("managed master runtime acceptance", () => {
 		expect(response).toMatchObject({ type: "error", requestId: "missing-request", code: "unknown_master" });
 		expect((await store.readQueue()).tasks).toHaveLength(1);
 	});
+	test("bounds graceful stop when a master turn never settles", async () => {
+		const root = await tempRoot();
+		const store = await createStore(root, "hung");
+		// A prompt that never resolves models a wedged model call or tool.
+		const neverSettles = Promise.withResolvers<void>();
+		const runtime = new MasterRuntime({
+			masterName: "hung",
+			domainStore: store,
+			providerHealth: health(["telegram"]),
+			sessionFactory: async () => ({ prompt: async () => await neverSettles.promise }),
+		});
+		await runtime.start();
+		await store.enqueueUser({
+			idempotencyKey: "hung-task",
+			priority: "user",
+			summary: "hung task",
+			workdir: null,
+		});
+		// Drive a real trigger so the runtime enters a turn that can never complete.
+		void runtime.refreshFromStore();
+		await Bun.sleep(150);
+		expect(runtime.statusValue).toBe("busy");
+
+		const startedAt = Date.now();
+		await runtime.stop({ drain: true, timeoutMs: 200 });
+		const elapsed = Date.now() - startedAt;
+
+		// Before the fix this awaited the same unsettled turn promise forever.
+		expect(elapsed).toBeLessThan(5_000);
+		// Let the abandoned turn unwind against a still-existing root before cleanup.
+		neverSettles.resolve();
+		await runtime.waitForIdle(2_000);
+		await Bun.sleep(50);
+	}, 20_000);
 });

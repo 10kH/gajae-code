@@ -78,8 +78,9 @@ class BuiltInMasterDaemonController extends MasterDaemonController {
 	}
 
 	async reload(opts?: DaemonOperationOptions): Promise<DaemonOperationResult> {
-		void opts;
-		return adaptMasterOperation("reload", await super.reload());
+		// Forward the operator's timeout/spawn options; dropping them made
+		// `gjc daemon restart master --graceful-timeout-ms N` silently ignore N.
+		return adaptMasterOperation("reload", await super.reload(opts));
 	}
 }
 

@@ -326,7 +326,21 @@ export class MasterDaemonController {
 	async reload(opts: DaemonOperationOptions = {}): Promise<MasterDaemonOperationResult> {
 		if (this.#reloadOperation !== undefined) return copyResult(await this.#reloadOperation());
 		const daemon = await this.#resolveDaemon();
-		if (!daemon) return await this.#spawnOwner();
+		if (!daemon) {
+			// In ordinary CLI use there is no in-process daemon object even when a
+			// healthy detached owner exists. Spawning here would start a competitor that
+			// the live owner's fence rejects, while this process could observe the OLD
+			// owner's still-fresh heartbeat and report a reload that never happened.
+			const before = await this.status();
+			if (before.health === "running") return await this.#replaceDetachedOwner(before, opts);
+			if (opts.spawnIfStopped === false)
+				return {
+					ok: true,
+					warnings: [],
+					message: "Master daemon is stopped and --spawn-if-stopped=false was requested; nothing to reload.",
+				};
+			return await this.#spawnOwner();
+		}
 		try {
 			const result = copyResult(await daemon.reload({ drain: true, timeoutMs: opts.gracefulTimeoutMs }));
 			if (!result.ok) return result;
@@ -348,19 +362,46 @@ export class MasterDaemonController {
 		}
 	}
 
-	async #spawnOwner(): Promise<MasterDaemonOperationResult> {
+	/**
+	 * Reloads a healthy detached owner by stopping it and starting a successor.
+	 * The successor must publish a DIFFERENT owner identity than the one observed
+	 * beforehand, so a stale heartbeat from the predecessor can never be mistaken
+	 * for a completed reload.
+	 */
+	async #replaceDetachedOwner(
+		before: MasterDaemonStatus,
+		opts: DaemonOperationOptions,
+	): Promise<MasterDaemonOperationResult> {
+		const stopped = await this.stop(opts);
+		if (!stopped.ok)
+			return {
+				ok: false,
+				warnings: [...stopped.warnings],
+				message: "Master daemon reload failed closed; the running owner could not be stopped.",
+			};
+		return await this.#spawnOwner(before.ownerId);
+	}
+
+	async #spawnOwner(supersededOwnerId?: string): Promise<MasterDaemonOperationResult> {
 		const runtime = resolveGjcRuntimeSpawnInfo(process.execPath);
 		const args = [...runtime.argsPrefix, "daemon", MASTER_OWNER_INTERNAL_ACTION, "--agent-dir", this.#rootDir()];
-		const child = this.#deps.spawn
-			? this.#deps.spawn(runtime.execPath, args)
-			: childProcessSpawn(runtime.execPath, args, { detached: true, stdio: "ignore", env: process.env });
-		child.unref();
+		let child: { unref(): void; readonly exitCode: number | null };
+		try {
+			child = this.#deps.spawn
+				? this.#deps.spawn(runtime.execPath, args)
+				: childProcessSpawn(runtime.execPath, args, { detached: true, stdio: "ignore", env: process.env });
+			child.unref();
+		} catch (error) {
+			return { ok: false, warnings: [errorMessage(error)], message: "Master daemon startup failed closed." };
+		}
 		const deadline = Date.now() + 10_000;
 		let detail = "Master daemon did not publish a running heartbeat.";
 		while (Date.now() < deadline) {
 			await Bun.sleep(100);
 			const status = await this.status();
-			if (status.health === "running")
+			// A running status carrying the superseded owner id is the predecessor's
+			// lingering record, not proof that this spawn took ownership.
+			if (status.health === "running" && status.ownerId !== supersededOwnerId)
 				return { ok: true, warnings: [], message: "Master daemon started with durable owner and heartbeat." };
 			if (status.detail) detail = status.detail;
 			if (child.exitCode !== null)

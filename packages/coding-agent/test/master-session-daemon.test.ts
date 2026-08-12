@@ -242,3 +242,79 @@ describe("master daemon detached-owner stop escalation", () => {
 		expect(await Bun.file(getMasterRootPaths({ masterRootDir: root }).daemonOwnerPath).exists()).toBe(true);
 	}, 15_000);
 });
+
+describe("master daemon detached-owner reload safety", () => {
+	test("does not spawn beside a healthy detached owner and requires a new owner identity", async () => {
+		const root = await makeRoot();
+		const now = Date.now();
+		const pid = 987_700;
+		await writeDetachedOwner(root, pid, now);
+		const spawned: string[][] = [];
+		const signals: NodeJS.Signals[] = [];
+		let alive = true;
+		const controller = new MasterDaemonController({
+			masterRootDir: root,
+			now: () => new Date(now),
+			pidAlive: candidate => candidate === pid && alive,
+			kill: (_candidate, signal) => {
+				signals.push(signal);
+				if (signal === "SIGKILL") alive = false;
+			},
+			spawn: (_command, args) => {
+				spawned.push(args);
+				// The successor never publishes a distinct owner identity.
+				return { unref() {}, exitCode: 1 };
+			},
+		});
+
+		const result = await controller.reload({ force: true, gracefulTimeoutMs: 150, killTimeoutMs: 300 });
+
+		// The healthy owner is stopped first; only then may a successor start.
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(spawned).toHaveLength(1);
+		// A successor that never proves new ownership must not be reported as reloaded.
+		expect(result.ok).toBe(false);
+	}, 20_000);
+
+	test("refuses to stop-and-replace when the running owner cannot be stopped", async () => {
+		const root = await makeRoot();
+		const now = Date.now();
+		const pid = 987_701;
+		await writeDetachedOwner(root, pid, now);
+		const spawned: string[][] = [];
+		const controller = new MasterDaemonController({
+			masterRootDir: root,
+			now: () => new Date(now),
+			pidAlive: candidate => candidate === pid,
+			kill: () => {},
+			spawn: (_command, args) => {
+				spawned.push(args);
+				return { unref() {}, exitCode: null };
+			},
+		});
+
+		const result = await controller.reload({ gracefulTimeoutMs: 150 });
+
+		expect(result.ok).toBe(false);
+		expect(result.message).toContain("could not be stopped");
+		// Critically: no competing owner was spawned beside the live one.
+		expect(spawned).toEqual([]);
+	}, 20_000);
+
+	test("honors --spawn-if-stopped=false instead of always spawning", async () => {
+		const root = await makeRoot();
+		const spawned: string[][] = [];
+		const controller = new MasterDaemonController({
+			masterRootDir: root,
+			spawn: (_command, args) => {
+				spawned.push(args);
+				return { unref() {}, exitCode: null };
+			},
+		});
+
+		const result = await controller.reload({ spawnIfStopped: false });
+
+		expect(result.ok).toBe(true);
+		expect(spawned).toEqual([]);
+	}, 20_000);
+});

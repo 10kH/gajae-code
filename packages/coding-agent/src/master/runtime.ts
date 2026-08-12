@@ -26,6 +26,35 @@ import {
 	type WorkerObserverStore,
 } from "./worker-observer";
 
+/**
+ * Bound on how long durable provider ingress waits for the master turn it just
+ * scheduled. Acknowledgement correctness depends on persistence, not on the
+ * model finishing, so this only smooths the common fast case.
+ */
+const INGRESS_SETTLE_TIMEOUT_MS = 2_000;
+
+/** Awaits `task`, but never longer than `timeoutMs`; rejections are absorbed. */
+async function settleWithin(task: Promise<unknown>, timeoutMs: number): Promise<void> {
+	if (timeoutMs <= 0) {
+		void task.catch(() => undefined);
+		return;
+	}
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const timer = setTimeout(resolve, timeoutMs);
+	timer.unref?.();
+	try {
+		await Promise.race([
+			task.then(
+				() => undefined,
+				() => undefined,
+			),
+			promise,
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 export interface MasterRuntimeStore extends WorkerObserverStore {
 	readonly masterName: string;
 	enqueueUser?(input: {
@@ -350,8 +379,13 @@ export class MasterRuntime {
 		if (this.#stopping && this.#status === "stopped") return;
 		this.#draining = options.drain === true;
 		this.#stopping = true;
-		if (this.#draining) await this.waitForIdle(options.timeoutMs ?? 10_000);
-		if (this.#turnPromise) await this.#turnPromise.catch(() => undefined);
+		const deadlineMs = options.timeoutMs ?? 10_000;
+		if (this.#draining) await this.waitForIdle(deadlineMs);
+		// The drain deadline is the whole graceful budget. Awaiting the turn promise
+		// unbounded here would let a model prompt or tool call that never settles hang
+		// stop/reload and the SIGTERM path forever, retaining the durable owner fence
+		// well past the configured timeout.
+		if (this.#turnPromise) await settleWithin(this.#turnPromise, deadlineMs);
 		if (this.#session?.dispose) await this.#session.dispose();
 		this.#session = null;
 		this.#setStatus("stopped", "operator_stop");
@@ -413,20 +447,24 @@ export class MasterRuntime {
 			this.#enqueueTrigger(event);
 		}
 		await this.#providerHealth();
-		await this.waitForIdle(0);
+		// Durable ingress is already persisted at this point. Waiting for the whole
+		// master turn here would hold a provider's acknowledgement open for as long as
+		// the model runs, so bound the settle wait instead of blocking indefinitely.
+		await this.waitForIdle(INGRESS_SETTLE_TIMEOUT_MS);
 	}
 
 	async waitForIdle(timeoutMs = 10_000): Promise<void> {
 		if (!this.#busy && !this.#scheduled) return;
-		await new Promise<void>(resolve => {
-			this.#idleWaiters.push(resolve);
-			if (timeoutMs <= 0) return;
+		const { promise, resolve } = Promise.withResolvers<void>();
+		this.#idleWaiters.push(resolve);
+		if (timeoutMs > 0) {
 			setTimeout(() => {
 				const index = this.#idleWaiters.indexOf(resolve);
 				if (index >= 0) this.#idleWaiters.splice(index, 1);
 				resolve();
 			}, timeoutMs).unref?.();
-		});
+		}
+		await promise;
 	}
 
 	async runTurn(): Promise<MasterRuntimeTurnResult | null> {
@@ -632,23 +670,30 @@ export class MasterRuntime {
 		this.#reason = reason;
 		if (changed && this.domainStore.appendEvent) {
 			const providers = this.#providerHealthCache;
-			this.#statusPersistence = this.#statusPersistence.then(async () => {
-				const event = await this.domainStore.appendEvent!({
-					type: "master_status",
-					payload: {
-						transition: "state_changed",
-						previousStatus,
-						status,
-						reason,
-						providers,
-						memoryAvailability: this.#options.memory === undefined ? "unavailable" : "available",
-					},
+			// Recover the tail before chaining: one rejected persistence would otherwise
+			// poison every later status write and escape as an unhandled rejection from
+			// the detached turn path.
+			this.#statusPersistence = this.#statusPersistence
+				.catch(() => undefined)
+				.then(async () => {
+					const event = await this.domainStore.appendEvent!({
+						type: "master_status",
+						payload: {
+							transition: "state_changed",
+							previousStatus,
+							status,
+							reason,
+							providers,
+							memoryAvailability: this.#options.memory === undefined ? "unavailable" : "available",
+						},
+					});
+					if (event && event.seq > this.#eventHighWater) this.#eventHighWater = event.seq;
+					if (event) await this.#options.onEvent?.(event);
 				});
-				if (event && event.seq > this.#eventHighWater) this.#eventHighWater = event.seq;
-				if (event) await this.#options.onEvent?.(event);
-			});
+			this.#statusPersistence.catch(() => undefined);
 		}
-		if (changed) void this.#options.onStatus?.(status, reason);
+		// A consumer status callback must never turn into an unhandled rejection.
+		if (changed) void Promise.resolve(this.#options.onStatus?.(status, reason)).catch(() => undefined);
 	}
 
 	async #flushStatus(): Promise<void> {
