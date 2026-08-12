@@ -33,7 +33,9 @@ import {
 	assertImagePlaceholdersHavePayload,
 	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
+	dispatchedToolIdentity,
 	getAgentTerminalOwnerContext,
+	isNonDispatchedToolEvent,
 	type ManagedAttemptContinuationOwnership,
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
@@ -301,9 +303,11 @@ import {
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
 import {
+	type CoordinatorToolObservation,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	registerCoordinatorRuntimeStateFinalizer,
+	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heartbeat";
@@ -422,6 +426,7 @@ import {
 	type ContributionPrepResult,
 	prepareContributionPrep,
 } from "./contribution-prep";
+import { canonicalCoordinatorToolLabel } from "./coordinator-tool-label";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
@@ -672,6 +677,12 @@ export interface AgentSessionConfig {
 	workflowGatePublication?: "endpoint" | "local";
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
+	/**
+	 * Tool objects this session's builder constructed from built-in descriptors, captured
+	 * before any extension, MCP, or dynamically registered tool could claim their registry
+	 * names. Absent means no provenance was proven and every tool reports as `custom`.
+	 */
+	builtinToolIdentities?: ReadonlySet<object>;
 	/** Tool-session factory context used to lazily attach workflow-gate-only tools. */
 	workflowGateToolSession?: ToolSession;
 	/** Current session pre-LLM message transform pipeline */
@@ -2248,6 +2259,17 @@ export class AgentSession {
 
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
+	/**
+	 * Session-owned provenance for tool OBJECTS built from a built-in descriptor.
+	 *
+	 * Copy-owned so this session can extend it with built-ins it creates or refreshes
+	 * later (the execution guard wrapper, an SSH reload, the lazily attached workflow-gate
+	 * `ask`) without mutating the builder's set. Weak because it holds no opinion about a
+	 * tool's lifetime: an object that is no longer reachable can never be dispatched
+	 * again. Custom, MCP, and dynamically registered tools never enter it, so a name
+	 * collision cannot inherit a built-in's label.
+	 */
+	#builtinToolIdentities: WeakSet<object>;
 	#workflowGateToolSession: ToolSession | undefined;
 	#transformContext: (
 		messages: AgentMessage[],
@@ -2925,7 +2947,14 @@ export class AgentSession {
 			// Persist before notifying synchronous subscribers: a subscriber may start a
 			// successor prompt from agent_end, whose running state must serialize after
 			// this terminal boundary rather than be overwritten by it.
-			void this.#persistRuntimeStateInBackground(pending);
+			//
+			// Awaited, not fire-and-forget: this is the terminal boundary, and the write
+			// runs under the native identity-bound state-file lock. A detached write
+			// outlives the session that owns it — under `bun test --isolate` the pending
+			// unlink lands after the runtime has torn down the context it was scheduled in
+			// and segfaults the process, and in production it lets a settled session's
+			// last write race whatever reclaims its lock next.
+			await this.#queueCoordinatorRuntimeStatePersist(pending);
 			this.#emit(pending);
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
@@ -3023,6 +3052,7 @@ export class AgentSession {
 			this.#providerSessionState = config.providerSessionState;
 		}
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#builtinToolIdentities = new WeakSet(config.builtinToolIdentities ?? []);
 		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
@@ -4154,7 +4184,52 @@ export class AgentSession {
 		return queued;
 	}
 
+	/**
+	 * Immutable coordinator observations, keyed by the exact agent event object they were
+	 * taken for.
+	 *
+	 * Weak because an observation only matters for an event that is eventually published:
+	 * a maintenance checkpoint, a rejected terminal, and a superseded run's late event are
+	 * observed here but never emitted, and must not be persisted merely because they were
+	 * seen.
+	 */
+	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
+
+	/**
+	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
+	 *
+	 * The label comes from the tool OBJECT the producer bound to this exact event when it
+	 * dispatched the call — never from re-resolving `event.toolName` here. `agent.state.tools`
+	 * is mutable: a tool refresh or MCP reload between dispatch and this observation would
+	 * otherwise attribute the call to whatever happens to hold its wire name now, publishing
+	 * a built-in label for a colliding custom tool that actually ran, or the reverse.
+	 *
+	 * The clock is captured here for the same reason: it keeps moving while subscribers run.
+	 *
+	 * A tool END is deliberately NOT labelled: its label comes from the correlation its own
+	 * START recorded, so one call cannot open under one label and close under another.
+	 *
+	 * A pairing-only event is not observed at all. The loop emits a start/end pair for a
+	 * call it skipped or aborted before dispatch so the stream keeps its shape, but this
+	 * snapshot is a claim about what is RUNNING — and nothing ran. Observing it would put a
+	 * tool into `active_tools` for the window between the two synthetic writes.
+	 */
+	#observeCoordinatorToolEvent(event: AgentEvent): void {
+		if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return;
+		if (isNonDispatchedToolEvent(event)) return;
+		const label =
+			event.type === "tool_execution_start"
+				? canonicalCoordinatorToolLabel(dispatchedToolIdentity(event), tool =>
+						this.#builtinToolIdentities.has(tool),
+					)
+				: UNPROVEN_TOOL_LABEL;
+		this.#coordinatorToolObservations.set(event, Object.freeze({ label, observedAt: new Date().toISOString() }));
+	}
+
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		// First statement of the listener: the observation must precede every claim,
+		// reservation, and async hop this handler performs.
+		this.#observeCoordinatorToolEvent(event);
 		const terminalOwner = event.type === "agent_end" ? getAgentTerminalOwnerContext(event) : undefined;
 		const maintenanceCheckpoint =
 			event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
@@ -4238,13 +4313,43 @@ export class AgentSession {
 		return handler;
 	};
 
-	async #persistRuntimeStateInBackground(event: AgentSessionEvent): Promise<void> {
+	/** Serializes sidecar writes in publication order, independent of write latency. */
+	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
+
+	/**
+	 * Reserve this event's place in the sidecar write order.
+	 *
+	 * Called immediately BEFORE local delivery so a synchronous subscriber that re-enters
+	 * the session cannot get its own, later event persisted first. The returned promise is
+	 * only awaited where durability must precede delivery (terminal `agent_end`).
+	 *
+	 * A pairing-only tool event takes no place in that order at all — neither its start nor
+	 * its end. It describes a call that was never dispatched, and this file is read as the
+	 * answer to "what is this session doing right now".
+	 */
+	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent): Promise<void> {
+		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
+		const observation = this.#coordinatorToolObservations.get(event);
+		const run = () => this.#persistRuntimeStateInBackground(event, observation);
+		const queued = this.#coordinatorPersistQueue.then(run, run);
+		this.#coordinatorPersistQueue = queued.catch(() => {});
+		return queued;
+	}
+
+	async #persistRuntimeStateInBackground(
+		event: AgentSessionEvent,
+		observation: CoordinatorToolObservation | undefined,
+	): Promise<void> {
 		try {
-			await persistCoordinatorRuntimeStateFromEvent(event, {
-				sessionId: this.sessionId,
-				cwd: this.sessionManager.getCwd(),
-				sessionFile: this.sessionManager.getSessionFile(),
-			});
+			await persistCoordinatorRuntimeStateFromEvent(
+				event,
+				{
+					sessionId: this.sessionId,
+					cwd: this.sessionManager.getCwd(),
+					sessionFile: this.sessionManager.getSessionFile(),
+				},
+				observation,
+			);
 		} catch {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
 		}
@@ -4292,7 +4397,6 @@ export class AgentSession {
 		if (event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted")
 			return;
 
-		const persistRuntimeState = () => this.#persistRuntimeStateInBackground(event);
 		// Hold agent_end until the prompt's finally and all earlier async event work
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
@@ -4305,7 +4409,7 @@ export class AgentSession {
 		if (event.type === "agent_end") {
 			// Start the durable terminal write before synchronous subscribers can
 			// re-enter prompt(), so a successor's running transition serializes after it.
-			await persistRuntimeState();
+			await this.#queueCoordinatorRuntimeStatePersist(event);
 			this.#emit(event);
 			await this.#emitExtensionEvent(event);
 			return;
@@ -4315,8 +4419,13 @@ export class AgentSession {
 		// auto-continuation gates, goal reminders, and tests all observe these events
 		// synchronously. Coordinator sidecar writes and extension hooks are secondary
 		// sinks, so they must not delay or suppress local delivery.
+		//
+		// The sidecar write is ENQUEUED before delivery and awaited by nobody: a
+		// synchronous subscriber that re-enters the session and emits its own event still
+		// lands behind this one, while nothing about that subscriber's latency reaches the
+		// snapshot.
+		void this.#queueCoordinatorRuntimeStatePersist(event);
 		this.#emit(event);
-		void persistRuntimeState();
 		await this.#emitExtensionEvent(event);
 	}
 
@@ -6756,6 +6865,13 @@ export class AgentSession {
 		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
+		// Drain the sidecar write order for the same reason the two queues above are
+		// drained: each entry writes under the native identity-bound state-file lock, so a
+		// still-queued write would run after the session that owns it is gone — releasing
+		// a lock whose owner no longer exists, and under `bun test --isolate` calling into
+		// the addon after the runtime tore down the context it was scheduled in. The chain
+		// is already failure-absorbing, so this only waits.
+		await this.#coordinatorPersistQueue;
 		this.#workflowGateEmitter?.fence?.();
 		this.#pendingBackgroundExchanges = [];
 		this.yieldQueue.clear();
@@ -7551,6 +7667,11 @@ export class AgentSession {
 				),
 			),
 		);
+		// The object published into `agent.state.tools` — and therefore the object the
+		// agent loop actually dispatches to — is this guard wrapper, not the registry
+		// entry. A wrapper built from a proven built-in inherits that proof; one built
+		// from a custom, MCP, or extension tool inherits nothing.
+		if (this.#builtinToolIdentities.has(tool)) this.#builtinToolIdentities.add(wrapped);
 		if (!wrappersByVersion) {
 			wrappersByVersion = new Map();
 			this.#guardedToolWrapperCache.set(tool, wrappersByVersion);
@@ -7676,6 +7797,9 @@ export class AgentSession {
 		const refreshedTool = await this.#reloadSshTool();
 		if (refreshedTool) {
 			this.#toolRegistry.set(refreshedTool.name, refreshedTool);
+			// A reloaded built-in is a NEW object. Without this it would replace the proven
+			// one and every subsequent `ssh` call would be reported as `custom`.
+			this.#builtinToolIdentities.add(refreshedTool);
 		} else {
 			this.#toolRegistry.delete("ssh");
 			this.#selectedDiscoveredToolNames.delete("ssh");
@@ -8607,6 +8731,11 @@ export class AgentSession {
 			const wrappedTool = wrapToolWithMetaNotice(createdAskTool as unknown as AgentTool);
 			askTool = this.#extensionRunner ? new ExtensionToolWrapper(wrappedTool, this.#extensionRunner) : wrappedTool;
 			this.#toolRegistry.set(askTool.name, askTool);
+			// Built here from the built-in `ask` descriptor rather than by the session
+			// builder, so its provenance has to be recorded here too. Only this
+			// construction path qualifies: an `ask` already in the registry is left alone,
+			// because whatever put it there owns its provenance.
+			this.#builtinToolIdentities.add(askTool);
 		}
 
 		try {
