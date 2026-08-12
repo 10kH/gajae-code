@@ -317,13 +317,19 @@ function isUnresolvedEvent(event: SessionIndexEvent): boolean {
  * legitimately spell the same agent dir differently (one via a symlink, one via
  * its realpath). A plain `path.resolve` match would reject the genuine fence
  * row under a symlinked agent dir and re-fence every session — the exact
- * outage this predicate exists to prevent.
+ * outage this predicate exists to prevent. `rootIdentity` resolves a stateRoot
+ * string once per scan so repeated sessions sharing one root never re-run
+ * `realpath` on the same spelling.
  */
-function isDirectSessionGcFenceRow(event: SessionIndexEvent, agentDirIdentity: string): boolean {
+function isDirectSessionGcFenceRow(
+	event: SessionIndexEvent,
+	agentDirIdentity: string,
+	rootIdentity: (stateRoot: string) => string,
+): boolean {
 	return (
 		event.type === "host_registered" &&
 		event.endpointGeneration === 0 &&
-		resolveEquivalentPath(event.locator.stateRoot) === agentDirIdentity
+		rootIdentity(event.locator.stateRoot) === agentDirIdentity
 	);
 }
 
@@ -398,6 +404,18 @@ function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string
 	// Resolved once: the fence-row check runs per root, and only this side of the
 	// comparison is ours to normalize.
 	const agentDirIdentity = resolveEquivalentPath(agentDir);
+	// Sessions routinely share one stateRoot spelling (agent dir, worktree, ...);
+	// resolve each distinct spelling once per scan instead of per root so the
+	// symlink-equivalence check stays a cheap map hit on every repeated session.
+	const rootIdentities = new Map<string, string>();
+	const rootIdentity = (stateRoot: string): string => {
+		let identity = rootIdentities.get(stateRoot);
+		if (identity === undefined) {
+			identity = resolveEquivalentPath(stateRoot);
+			rootIdentities.set(stateRoot, identity);
+		}
+		return identity;
+	};
 	const { admitted } = admitEvents(events);
 	const latestByIdentity = new Map<string, SessionIndexEvent>();
 	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
@@ -449,7 +467,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number, agentDir: string
 				unresolvedRoots.set(sessionId, unresolved);
 			}
 			unresolved.set(root, rootStates);
-			if (isDirectSessionGcFenceRow(current.latest, agentDirIdentity)) continue;
+			if (isDirectSessionGcFenceRow(current.latest, agentDirIdentity, rootIdentity)) continue;
 			let fencing = fencingRoots.get(sessionId);
 			if (fencing === undefined) {
 				fencing = new Map<string, SessionIdentityState[]>();
