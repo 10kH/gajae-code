@@ -1041,7 +1041,7 @@ describe("SDK session index", () => {
 			const bookkeeping = {
 				type: "host_registered" as const,
 				sessionId,
-				locator: { repo: "r", stateRoot: "agent-dir" },
+				locator: { repo: "r", stateRoot: dir },
 				endpointGeneration: 0,
 				pid: process.pid,
 			};
@@ -1097,7 +1097,7 @@ describe("SDK session index", () => {
 		const bookkeeping = await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "r", stateRoot: "agent-dir" },
+			locator: { repo: "r", stateRoot: dir },
 			endpointGeneration: 0,
 			pid: process.pid,
 		});
@@ -1120,6 +1120,80 @@ describe("SDK session index", () => {
 				terminal: false,
 			}),
 		]);
+	});
+	it("still fences a generation-0 registration that does not carry agent-dir provenance", async () => {
+		// The exemption is bound to the direct-session GC fence row's durable
+		// provenance (agent dir as state root). A foreign or legacy generation-0
+		// registration proves nothing and must keep fencing, or the fence is
+		// fail-open relative to the symmetric rule it relaxes.
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-foreign-"));
+		const index = await new SessionIndex(dir).open();
+		const sessionId = "foreign-zero";
+		await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: "elsewhere", stateRoot: "not-the-agent-dir" },
+			endpointGeneration: 0,
+			pid: process.pid,
+		});
+		await index.append(event(sessionId));
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId, ambiguous: true, live: false }),
+		]);
+		expect(await index.checkpointLiveHeartbeats()).toBe(0);
+	});
+	it("promotes the sole surviving endpoint root once a competing root unregisters", async () => {
+		// With the GC fence row plus two endpoint roots, resolving the conflict
+		// must publish the endpoint root that is still live — never the terminated
+		// one, even though it holds the higher generation. Otherwise SessionRouter
+		// stays detached after the ambiguity clears.
+		for (const terminatedIsHigher of [true, false]) {
+			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-promote-"));
+			const index = await new SessionIndex(dir).open();
+			const sessionId = `promote-${terminatedIsHigher ? "higher" : "lower"}`;
+			await index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { repo: "r", stateRoot: dir },
+				endpointGeneration: 0,
+				pid: process.pid,
+			});
+			const survivor = await index.append({
+				...event(sessionId),
+				locator: { repo: "survivor", stateRoot: "survivor-root" },
+				endpointGeneration: terminatedIsHigher ? 1 : 2,
+			});
+			const terminated = await index.append({
+				...event(sessionId),
+				locator: { repo: "terminated", stateRoot: "terminated-root" },
+				endpointGeneration: terminatedIsHigher ? 2 : 1,
+			});
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({ sessionId, ambiguous: true, live: false }),
+			]);
+			await index.append({
+				type: "host_unregistered",
+				sessionId,
+				locator: terminated.locator,
+				endpointGeneration: terminated.endpointGeneration,
+				pid: terminated.pid,
+				...(terminated.processIncarnation === undefined
+					? {}
+					: { processIncarnation: terminated.processIncarnation }),
+				...(terminated.hostIncarnation === undefined ? {} : { hostIncarnation: terminated.hostIncarnation }),
+			});
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: survivor.endpointGeneration,
+					locator: survivor.locator,
+					ambiguous: false,
+					terminal: false,
+				}),
+			]);
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
+			expect(index.listSessions().sessions[0]).toMatchObject({ live: true });
+		}
 	});
 	it("hides deleted sessions until a later registration establishes new authority", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-deleted-"));
