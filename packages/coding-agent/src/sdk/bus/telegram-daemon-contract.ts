@@ -218,14 +218,20 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * same way instead of terminating the daemon (#4200).
  * Generation 153 restricts Telegram forum-topic ownership, replay, routing, callbacks,
  * and lease renewal to identities with coordinator or lifecycle provenance.
- * Generation 154 derives Telegram session eligibility from configuration
+ * Generation 154 archives private-chat topics through deleteForumTopic, settles
+ * TOPIC_ID_INVALID as definitive, and drains durable archive retries periodically.
+ * Generation 155 unifies the duplicated durable terminal-retention write path
+ * (bus and SDK-only host runtimes) into a single `boundTerminalRetentionState`
+ * helper in `session/terminal-abort.ts` (#4329).
+ * Generation 156 derives Telegram session eligibility from configuration
  * (Telegram configured and effectively enabled) instead of coordinator or
- * lifecycle launch provenance. Generation 153 made every ordinary interactive
- * session declare itself ineligible, so the daemon rejected its identity
- * header, never created a topic, and delivered nothing while still reporting
- * healthy attachments.
+ * lifecycle launch provenance, and stops consulting a session's self-declared
+ * eligibility for topic admission: threaded mode always uses threads. Before
+ * this, every ordinary interactive session declared itself ineligible, the
+ * daemon rejected its identity header, no topic was created, and nothing was
+ * delivered while attachments still looked healthy.
  */
-export const DAEMON_GENERATION = 154;
+export const DAEMON_GENERATION = 156;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
