@@ -1510,6 +1510,12 @@ export interface LineDiffPart {
 export declare function linkNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
 
 /**
+ * Async variant of [`link_no_replace_path`] scheduled on the libuv blocking
+ * pool; see [`rename_no_replace_path_async`] for the rationale.
+ */
+export declare function linkNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
+
+/**
  * Walk the workspace once and return tree entries plus AGENTS.md candidates.
  *
  * File-level ignore rules for AGENTS.md are bypassed by checking each
@@ -2119,6 +2125,16 @@ export interface RecoveryFsRetainedCleanupResult {
 }
 
 export declare function renameNoReplacePath(sourcePath: string, destinationPath: string): NativeNoReplaceResult
+
+/**
+ * Async variant of [`rename_no_replace_path`] scheduled on the libuv blocking
+ * pool. Managed output publication awaits this boundary so a rename that
+ * stalls in the kernel (oversized APFS directory namespaces, issue #4394)
+ * blocks one pool thread instead of the agent's event loop: await timeouts,
+ * sibling subagents, and watchdogs keep running, and a hung publication
+ * degrades to one unresolved receipt rather than a frozen process.
+ */
+export declare function renameNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
 
 /**
  * Repair an owner-only ACL on a retained expected path.
