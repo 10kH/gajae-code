@@ -247,7 +247,10 @@ class FakeMasterTransport {
 async function withDaemon(
 	run: (daemon: DiscordNotificationDaemon, provider: FakeDiscordProvider, agentDir: string) => Promise<void>,
 	overrides: Partial<
-		Pick<DiscordNotificationDaemonOptions, "resolveAttachment" | "onCommand" | "now" | "masterClient">
+		Pick<
+			DiscordNotificationDaemonOptions,
+			"resolveAttachment" | "onCommand" | "now" | "masterClient" | "createMasterClient"
+		>
 	> = {},
 ): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-discord-daemon-"));
