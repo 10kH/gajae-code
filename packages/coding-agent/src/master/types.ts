@@ -81,7 +81,13 @@ export type ProviderPresentationOutcome =
 	| {
 			effectKind: "present_event";
 			status: "terminal";
-			code: "permission_denied" | "channel_deleted" | "provider_not_configured";
+			/**
+			 * `post_unverifiable` means the provider accepted or may have accepted the
+			 * post but exposes no way to correlate it. Retrying would duplicate a
+			 * user-visible message, so the effect is blocked for explicit recovery
+			 * instead of being re-leased.
+			 */
+			code: "permission_denied" | "channel_deleted" | "provider_not_configured" | "post_unverifiable";
 			message: string;
 	  };
 

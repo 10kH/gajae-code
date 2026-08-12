@@ -18550,6 +18550,8 @@ export class SessionManager {
 							true,
 							storage,
 							destination,
+							false,
+							options?.persistenceProfile,
 						);
 						manager.#sessionMemoryMode = sessionMemoryMode;
 						await manager.#initSessionFile(filePath, true);
@@ -18565,6 +18567,8 @@ export class SessionManager {
 					true,
 					storage,
 					destination,
+					false,
+					options?.persistenceProfile,
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				await manager.#hydrateExistingSession(filePath, inspected.entries, inspected.migrationApplied);
@@ -18674,6 +18678,7 @@ export class SessionManager {
 					storage,
 					destination,
 					true,
+					options?.persistenceProfile,
 				);
 				manager.#sessionMemoryMode = sessionMemoryMode;
 				try {
@@ -18701,7 +18706,9 @@ export class SessionManager {
 					if (!returnTranscript || !managedFileSnapshotEquals(returnTranscript, publishedTranscript))
 						throw new Error("Could not open session: unstable");
 					manager.#managedPersistExpectedIdentity = returnTranscript.identity;
-					writeTerminalBreadcrumb(manager.cwd, filePath);
+					// Profile-gated: a master-profile session must not write an ordinary
+					// global terminal breadcrumb outside its confined root.
+					manager.#writeTerminalBreadcrumb(manager.cwd, filePath);
 					return manager;
 				} catch (createError) {
 					await manager.#discardRejectedOpenState();
@@ -18744,7 +18751,15 @@ export class SessionManager {
 		}
 
 		if (managedResumeBounded && sameManagedDirectory) {
-			const manager = new SessionManager(getProjectDir(), destination.directory, true, storage, destination);
+			const manager = new SessionManager(
+				getProjectDir(),
+				destination.directory,
+				true,
+				storage,
+				destination,
+				false,
+				options?.persistenceProfile,
+			);
 			manager.#sessionMemoryMode = sessionMemoryMode;
 			try {
 				await manager.#initSessionFile(
@@ -18890,6 +18905,8 @@ export class SessionManager {
 				true,
 				storage,
 				destination,
+				false,
+				options?.persistenceProfile,
 			);
 			boundedManager.#sessionMemoryMode = sessionMemoryMode;
 			try {
@@ -19854,6 +19871,7 @@ export class SessionManager {
 					storage,
 					migrationPolicy,
 					sessionMemoryMode,
+					options,
 				);
 				if (canContinuePersistedHistory(manager.buildSessionContext().messages)) return manager;
 				await manager.close();

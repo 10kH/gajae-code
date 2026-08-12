@@ -2805,4 +2805,38 @@ describe("DiscordNotificationDaemon fake-provider acceptance", () => {
 			{ masterClient },
 		);
 	});
+	test("retries master discovery after startup ordering left it unavailable", async () => {
+		const transport = new FakeMasterTransport();
+		let available = false;
+		let attempts = 0;
+		await withDaemon(
+			async daemon => {
+				await daemon.start();
+				// Discovery was unavailable at startup: no provider was registered.
+				expect(attempts).toBe(1);
+				expect(transport.requests.filter(frame => frame.type === "provider_worker_hello")).toHaveLength(0);
+
+				// A master is created later while this daemon stays live.
+				available = true;
+				// The lifecycle-owned retry must reach discovery without any inbound event.
+				const deadline = Date.now() + 8_000;
+				while (
+					Date.now() < deadline &&
+					transport.requests.filter(frame => frame.type === "provider_worker_hello").length === 0
+				)
+					await Bun.sleep(100);
+
+				expect(attempts).toBeGreaterThan(1);
+				expect(transport.requests.filter(frame => frame.type === "provider_worker_hello")).toHaveLength(1);
+				await daemon.stop();
+			},
+			{
+				createMasterClient: () => {
+					attempts += 1;
+					if (!available) throw new Error("master discovery record is unavailable");
+					return new MasterDaemonClient({ client: transport as any });
+				},
+			},
+		);
+	}, 20_000);
 });

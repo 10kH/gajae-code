@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { MasterDomainStore } from "../src/master/domain-store";
 import { MasterSdk } from "../src/master/sdk";
 import type { MasterProvider, ProviderEffectResultInput } from "../src/master/types";
+import { TelegramMasterChannelWorker } from "../src/sdk/bus/telegram-master-channel-worker";
 
 const roots: string[] = [];
 
@@ -415,5 +416,71 @@ describe("provider worker registration lifecycle", () => {
 		sdk.retireProviderConnectionForTest("conn-telegram");
 
 		expect(sdk.providerWorkerKeysForTest()).toEqual(["discord:dc-worker"]);
+	});
+});
+
+describe("Telegram leased provider effects", () => {
+	function presentEffect(overrides: Record<string, unknown> = {}) {
+		return {
+			kind: "present_event" as const,
+			effectId: "present:telegram:event-1",
+			intentId: "intent-1",
+			leaseId: "lease-1",
+			masterName: "alpha",
+			provider: "telegram" as const,
+			fence: 1,
+			nonce: "nonce-1",
+			expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			eventId: "event-1",
+			bindingId: "binding-1",
+			content: {
+				text: "master update",
+				workerSessionId: null,
+				taskId: null,
+				decisionId: null,
+				memoryActivityId: null,
+			},
+			...overrides,
+		};
+	}
+
+	test("fails closed instead of duplicating an unverifiable Telegram post", async () => {
+		const calls: Array<{ method: string; opts?: { noRetry?: boolean } }> = [];
+		const worker = new TelegramMasterChannelWorker({
+			client: { onEffect: () => () => {}, submitEffectResult: async () => undefined } as never,
+			chatId: "42",
+			resolveRemoteChannelId: () => "900",
+			// No findMessageByNonce: Telegram cannot correlate a post it may have accepted.
+			provider: {
+				chatId: "42",
+				call: async (method: string, _body: unknown, opts?: { noRetry?: boolean }) => {
+					calls.push({ method, opts });
+					// Accepted, but with no usable message identifier.
+					return { ok: true, result: {} };
+				},
+			} as never,
+		});
+
+		const frame = await worker.handleEffect(presentEffect() as never);
+
+		expect(calls).toHaveLength(1);
+		expect(frame.outcome).toMatchObject({ status: "terminal", code: "post_unverifiable" });
+	});
+
+	test("reports recoverable uncertainty when a nonce lookup can prove the post", async () => {
+		const worker = new TelegramMasterChannelWorker({
+			client: { onEffect: () => () => {}, submitEffectResult: async () => undefined } as never,
+			chatId: "42",
+			resolveRemoteChannelId: () => "900",
+			provider: {
+				chatId: "42",
+				findMessageByNonce: async () => null,
+				call: async () => ({ ok: true, result: {} }),
+			} as never,
+		});
+
+		const frame = await worker.handleEffect(presentEffect() as never);
+
+		expect(frame.outcome).toMatchObject({ status: "unknown", code: "post_uncertain" });
 	});
 });

@@ -586,6 +586,23 @@ export class TelegramMasterChannelWorker {
 		}
 	}
 
+	/**
+	 * Telegram exposes no reliable lookup for a message this worker may already
+	 * have posted. Re-leasing such an effect would duplicate a user-visible master
+	 * event, so an uncorrelatable post fails closed for explicit recovery unless a
+	 * nonce lookup is configured to prove the outcome.
+	 */
+	#unverifiablePresentation(message: string): ProviderPresentationOutcome {
+		if (this.#provider.findMessageByNonce)
+			return { effectKind: "present_event", status: "unknown", code: "post_uncertain", message };
+		return {
+			effectKind: "present_event",
+			status: "terminal",
+			code: "post_unverifiable",
+			message: `${message} Telegram exposes no nonce lookup, so this presentation cannot be safely retried.`,
+		};
+	}
+
 	async #present(effect: TelegramPresentationEffect): Promise<ProviderPresentationOutcome> {
 		try {
 			const remoteChannelId = await this.#remoteChannelId(effect);
@@ -630,12 +647,9 @@ export class TelegramMasterChannelWorker {
 					return telegramPresentationFailure(error);
 				}
 				if (!messageIdFromTelegramResponse(raw))
-					return {
-						effectKind: "present_event",
-						status: "unknown",
-						code: "post_uncertain",
-						message: "Telegram accepted presentation without a usable message identifier.",
-					};
+					return this.#unverifiablePresentation(
+						"Telegram accepted presentation without a usable message identifier.",
+					);
 			} else
 				return {
 					effectKind: "present_event",
@@ -658,14 +672,10 @@ export class TelegramMasterChannelWorker {
 							reconciled: true,
 						};
 				}
+				if (normalized.status === "unknown") return this.#unverifiablePresentation(normalized.message);
 				return normalized;
 			}
-			return {
-				effectKind: "present_event",
-				status: "unknown",
-				code: "post_uncertain",
-				message: "Telegram presentation returned no usable receipt.",
-			};
+			return this.#unverifiablePresentation("Telegram presentation returned no usable receipt.");
 		} catch (error) {
 			const remoteChannelId = await this.#remoteChannelId(effect).catch(() => undefined);
 			const reconciled =

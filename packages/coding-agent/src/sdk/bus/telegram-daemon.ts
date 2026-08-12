@@ -5014,7 +5014,16 @@ export class TelegramNotificationDaemon {
 				new MasterDaemonClient();
 			const worker = new TelegramMasterChannelWorker({
 				client,
-				provider: { chatId: this.opts.chatId, call: this.botApi.call.bind(this.botApi) },
+				provider: {
+					chatId: this.opts.chatId,
+					// Leased master effects are non-idempotent provider mutations with no
+					// nonce Telegram can echo back. A blind transport retry after a lost
+					// response would create a second topic or post a duplicate message that
+					// the durable receipt can never correlate, so a single attempt is the
+					// only safe contract: ambiguity is reported, never retried underneath.
+					call: (method: string, body: unknown, callOpts?: { signal?: AbortSignal; noRetry?: boolean }) =>
+						this.botApi.call(method, body, { ...callOpts, noRetry: true }),
+				},
 				chatId: this.opts.chatId,
 				resolveRemoteChannelId: input => client!.resolveRemoteChannelId?.(input),
 			});

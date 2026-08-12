@@ -868,7 +868,7 @@ const providerPresentationOutcomeSchema = z.discriminatedUnion("status", [
 		.object({
 			effectKind: z.literal("present_event"),
 			status: z.literal("terminal"),
-			code: z.enum(["permission_denied", "channel_deleted", "provider_not_configured"]),
+			code: z.enum(["permission_denied", "channel_deleted", "provider_not_configured", "post_unverifiable"]),
 			message: reasonText,
 		})
 		.strict(),

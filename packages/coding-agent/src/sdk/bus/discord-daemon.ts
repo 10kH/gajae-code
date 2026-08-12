@@ -211,6 +211,8 @@ export class DiscordNotificationDaemon {
 	#masterBindingDisposer: (() => void) | undefined;
 	#masterStartTask: Promise<void> | undefined;
 	#masterStopRequested = false;
+	#masterDiscoveryTimer: Timer | undefined;
+	#masterDiscoveryAttempts = 0;
 	constructor(private readonly options: DiscordNotificationDaemonOptions) {
 		this.#store = new ConversationStore({ agentDir: options.agentDir, kind: "discord", now: options.now });
 		this.#effects = new ChatEffectJournal({ agentDir: options.agentDir, transport: "discord", now: options.now });
@@ -242,6 +244,32 @@ export class DiscordNotificationDaemon {
 		} finally {
 			if (this.#masterStartTask === task) this.#masterStartTask = undefined;
 		}
+		// Discovery can legitimately be absent when this daemon starts before the
+		// master daemon, or before any master exists. Without a lifecycle-owned retry
+		// a master created later would never get a Discord provider, because inbound
+		// handling consults the (still empty) binding map first.
+		if (!this.#masterWorker) this.#scheduleMasterDiscoveryRetry();
+	}
+
+	#scheduleMasterDiscoveryRetry(): void {
+		if (
+			this.#masterDiscoveryTimer !== undefined ||
+			this.options.master?.enabled === false ||
+			this.#masterStopRequested ||
+			!this.#started
+		)
+			return;
+		const delayMs = Math.min(30_000, 1_000 * 2 ** Math.min(this.#masterDiscoveryAttempts, 5));
+		this.#masterDiscoveryAttempts += 1;
+		// Deliberately NOT the lease-recovery scheduler: master discovery retry is an
+		// independent lifecycle concern and must not perturb effect-lease recovery.
+		const timer = setTimeout(() => {
+			this.#masterDiscoveryTimer = undefined;
+			if (this.#masterStopRequested || !this.#started || this.#masterWorker) return;
+			void this.#ensureMasterWorker().catch(() => undefined);
+		}, delayMs);
+		timer.unref?.();
+		this.#masterDiscoveryTimer = timer;
 	}
 
 	async #startMasterWorker(): Promise<void> {
@@ -419,6 +447,9 @@ export class DiscordNotificationDaemon {
 		const key = `discord:${event.threadId}:${event.id}`;
 		if (this.#masterIngressSeen.has(key)) return true;
 		if (this.#masterAmbiguousBindings.has(event.threadId)) return false;
+		// Bootstrap discovery before consulting the binding map: an empty map is the
+		// exact state a startup-ordering failure leaves behind.
+		if (!this.#masterWorker) await this.#ensureMasterWorker();
 		const binding = this.#masterBindings.get(event.threadId);
 		if (!binding || binding.remoteChannelId !== event.threadId || !event.authorId.trim()) return false;
 		const content = event.content?.trim();
@@ -472,6 +503,8 @@ export class DiscordNotificationDaemon {
 
 	async #stopMasterWorker(): Promise<void> {
 		this.#masterStopRequested = true;
+		if (this.#masterDiscoveryTimer !== undefined) clearTimeout(this.#masterDiscoveryTimer);
+		this.#masterDiscoveryTimer = undefined;
 		try {
 			await this.#masterStartTask;
 		} catch {}
@@ -526,6 +559,7 @@ export class DiscordNotificationDaemon {
 
 	async #start(lifecycleGeneration: number): Promise<void> {
 		this.#masterStopRequested = false;
+		this.#masterDiscoveryAttempts = 0;
 		try {
 			// Provider start is the delivery boundary; complete crash recovery first.
 			await this.#reconcileTerminalInboundReceipts();
