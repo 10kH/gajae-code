@@ -82,4 +82,36 @@ describe("usage report column ordering", () => {
 		expect(output.match(/account 1/g)).toHaveLength(2);
 		expect(output).not.toContain("account 2");
 	});
+
+	test("unidentified hybrid reports keep distinct identities across every window", () => {
+		const hybridReport = (monthly: number, weekly: number): UsageReport =>
+			({
+				provider: "grok-build",
+				fetchedAt: NOW,
+				metadata: {},
+				limits: [
+					{
+						...limit("7d", "SuperGrok monthly credits", "Monthly credits", 20 * 86_400_000, monthly),
+						scope: { provider: "grok-build", windowId: "7d" },
+					},
+					{
+						...limit("weekly", "SuperGrok weekly credits", "Weekly", 6 * 86_400_000, weekly),
+						scope: { provider: "grok-build", windowId: "weekly" },
+					},
+				],
+			}) as UsageReport;
+		const lines = stripAnsi(
+			renderUsageReports([hybridReport(0.1, 0.2), hybridReport(0.8, 0.7)], theme, NOW, 100),
+		).split("\n");
+
+		const headerAfter = (titleNeedle: string): string => {
+			const titleIndex = lines.findIndex(line => line.includes(titleNeedle));
+			expect(titleIndex).toBeGreaterThanOrEqual(0);
+			return lines[titleIndex + 1] ?? "";
+		};
+		for (const header of [headerAfter("SuperGrok monthly credits"), headerAfter("SuperGrok weekly credits")]) {
+			expect(header.match(/account 1/g)).toHaveLength(1);
+			expect(header.match(/account 2/g)).toHaveLength(1);
+		}
+	});
 });
