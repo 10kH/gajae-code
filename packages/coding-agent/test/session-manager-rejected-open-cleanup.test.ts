@@ -557,4 +557,48 @@ describe("managed strict-resume target races", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("does not rewrite a successor installed after managed resume acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-close-successor-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		storage.writeTextSync(sourceFile, transcript());
+		const manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
+		storage.writeTextSync(sourceFile, replacement);
+		try {
+			await expect(manager.close()).rejects.toThrow("managed_replace_identity_mismatch");
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			await manager.close().catch(() => undefined);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not append to a successor installed after managed resume acceptance", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-append-successor-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		const replacement = transcript().replaceAll("rejected-open", "replacement");
+		storage.writeTextSync(sourceFile, transcript());
+		const manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
+		storage.writeTextSync(sourceFile, replacement);
+		try {
+			expect(() => manager.appendMessage({ role: "user", content: "must not persist", timestamp: 1 })).toThrow(
+				"managed_replace_identity_mismatch",
+			);
+			expect(storage.readTextSync(sourceFile)).toBe(replacement);
+		} finally {
+			await manager.close().catch(() => undefined);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });

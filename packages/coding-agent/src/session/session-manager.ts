@@ -92,6 +92,7 @@ import {
 	type ManagedBoundedAppendExpectation,
 	ManagedCommittedMutationError,
 	type ManagedDirectoryRoot,
+	type ManagedFileIdentity,
 	type ManagedFileSnapshot,
 	ManagedSessionDescendantStore,
 	type ManagedSessionSecurityPolicy,
@@ -3442,6 +3443,18 @@ function resumeIdentityMatchesDescriptor(identity: ResumeSessionIdentity, descri
 function descriptorSnapshotAsStorageStat(descriptor: DescriptorSnapshot): SessionStorageStat {
 	const mtimeMs = Number(descriptor.mtimeNs) / 1_000_000;
 	return { ...descriptor, mtimeMs, mtime: new Date(mtimeMs), isFile: true };
+}
+
+function managedIdentityFromDescriptor(descriptor: DescriptorSnapshot): ManagedFileIdentity {
+	if (descriptor.nlink === undefined) throw new Error("managed_identity_nlink_unavailable");
+	return {
+		dev: descriptor.dev,
+		ino: descriptor.ino,
+		nlink: descriptor.nlink,
+		size: descriptor.size,
+		mtimeNs: descriptor.mtimeNs,
+		ctimeNs: descriptor.ctimeNs,
+	};
 }
 
 function retainedManagedInspectionStorage(
@@ -6872,6 +6885,7 @@ export class SessionManager {
 	#managedSidecarSecurityContext: ManagedSessionSecurityContext | undefined;
 	#managedSidecarCacheSessionFile: string | undefined;
 	#managedRangeExpectedDescriptor: DescriptorSnapshot | undefined;
+	#managedPersistExpectedIdentity: ManagedFileIdentity | undefined;
 	#boundedReadStorageProxy: SessionStorage | undefined;
 	#boundedManagedSource:
 		| { path: string; store: ManagedSessionDescendantStore; descriptor: DescriptorSnapshot; owned: boolean }
@@ -7621,6 +7635,7 @@ export class SessionManager {
 		this.#titleSource = state.header.titleSource;
 		this.#sessionFile = state.sessionFile;
 		this.#managedRangeExpectedDescriptor = undefined;
+		this.#managedPersistExpectedIdentity = undefined;
 		this.#clearBoundedManagedSource();
 		this.#flushed = false;
 		this.#needsFullRewriteOnNextPersist = false;
@@ -14206,7 +14221,14 @@ export class SessionManager {
 		this.#withSessionPersistenceFenceSync(() => {
 			if (this.destination.kind === "managed") {
 				const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-				this.#managedTranscriptStore(sessionFile).replaceSync(path.basename(sessionFile), bytes);
+				const store = this.#managedTranscriptStore(sessionFile);
+				const relativePath = path.basename(sessionFile);
+				if (this.#managedPersistExpectedIdentity)
+					store.replaceExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity);
+				else store.replaceSync(relativePath, bytes);
+				const descriptor = store.descriptorExpected(relativePath);
+				if (!descriptor) throw new Error("managed_replace_identity_unavailable");
+				this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(descriptor);
 				this.#publishCommitMarkerFromCurrentTranscriptSync();
 				return;
 			}
@@ -15794,9 +15816,10 @@ export class SessionManager {
 			const store = this.#managedTranscriptStore(sessionFile);
 			const relativePath = path.basename(sessionFile);
 			const bytes = Buffer.from(`${records.map(record => JSON.stringify(record)).join("\n")}\n`, "utf8");
-			// R2.3: the post-operation receipt descriptor (retained or Darwin
-			// replacement) feeds the commit snapshot directly — no pathname stat.
-			const receipt = store.appendSync(relativePath, bytes);
+			const receipt = this.#managedPersistExpectedIdentity
+				? store.appendExpectedIdentitySync(relativePath, bytes, this.#managedPersistExpectedIdentity)
+				: store.appendSync(relativePath, bytes);
+			this.#managedPersistExpectedIdentity = receipt.identity;
 			this.#publishSessionCommitMarkerSync(receipt.descriptor);
 		});
 	}
@@ -18547,6 +18570,7 @@ export class SessionManager {
 					const returnTranscript = managedInspectionStore.readExpected(path.basename(filePath));
 					if (!returnTranscript || !managedFileSnapshotEquals(returnTranscript, publishedTranscript))
 						throw new Error("Could not open session: unstable");
+					manager.#managedPersistExpectedIdentity = returnTranscript.identity;
 					writeTerminalBreadcrumb(manager.cwd, filePath);
 					return manager;
 				} catch (createError) {
@@ -18625,6 +18649,7 @@ export class SessionManager {
 				const returnManagedDescriptor = managedInspectionStore?.descriptorExpected(path.basename(filePath));
 				if (!returnManagedDescriptor || !sameDescriptor(managedBoundedDescriptor, returnManagedDescriptor))
 					throw new Error("Could not open session: unstable");
+				manager.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(returnManagedDescriptor);
 				const header = manager.#fileEntries.find(entry => entry.type === "session") as SessionHeader | undefined;
 				if (header?.cwd) manager.cwd = header.cwd;
 				manager.buildSessionContext();
