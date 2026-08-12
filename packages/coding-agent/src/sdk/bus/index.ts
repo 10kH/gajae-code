@@ -118,7 +118,7 @@ import {
 	getNotificationConfig,
 	isProviderEffectivelyEnabled,
 	isSlackComplete,
-	isTelegramOrchestrationSession,
+	isTelegramSessionEligible,
 	type NotificationConfig,
 	type NotificationSettingsReader,
 	resolveGenericNotificationSessionEligibility,
@@ -3900,8 +3900,13 @@ export function createNotificationsExtension(
 ): void {
 	const terminalAbortSeams = options.terminalAbortSeams;
 	const lifecycleStartupCapability = lifecycleStartupCapabilityForApi(api);
-	const telegramTopicsEnabled =
-		lifecycleStartupCapability !== undefined || isTelegramOrchestrationSession(process.env);
+	// Telegram session eligibility follows the user's configuration, not how the
+	// session happened to be launched. Any session may own a forum topic and
+	// receive notifications once Telegram is configured and effectively active;
+	// gating this on coordinator/lifecycle provenance silently denied every
+	// ordinary interactive session (the daemon refuses an identity header that
+	// declares itself ineligible, so nothing was ever delivered).
+	const telegramTopicsEnabled = (): boolean => isTelegramSessionEligible(resolveSettings(options.settings).cfg);
 	const runtimes = new Map<string, SessionRuntime>();
 	const controller =
 		options.controller ??
@@ -3930,7 +3935,7 @@ export function createNotificationsExtension(
 	let extensionShuttingDown = false;
 
 	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
-		if (!telegramTopicsEnabled) return "blocked_identity";
+		if (!telegramTopicsEnabled()) return "blocked_identity";
 		if (options.ensureTelegramDaemon) {
 			return (await options.ensureTelegramDaemon({ settings })) === "blocked" ? "blocked_identity" : "ready";
 		}
@@ -3943,7 +3948,7 @@ export function createNotificationsExtension(
 		settings: Settings,
 		cfg: NotificationConfig,
 	): Promise<ConfiguredDaemonOwnerResult> {
-		if (telegramTopicsEnabled && isProviderEffectivelyEnabled(cfg, "telegram")) {
+		if (telegramTopicsEnabled() && isProviderEffectivelyEnabled(cfg, "telegram")) {
 			const telegramMarker = getCurrentTelegramActivationMarker(cfg);
 			if (telegramMarker) {
 				if (!isProviderEffectivelyEnabled(cfg, "discord") && !isProviderEffectivelyEnabled(cfg, "slack")) {
@@ -7079,7 +7084,7 @@ export function createNotificationsExtension(
 			const identityHeader = {
 				type: "identity_header",
 				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled),
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
 			};
 			host.emitEvent({ kind: identityHeader.type, payload: identityHeader });
 			// Core SDK authority is published before optional notification adapters acquire
@@ -7975,7 +7980,7 @@ export function createNotificationsExtension(
 			pushSessionFrame(rt, {
 				type: "identity_header",
 				sessionId: id,
-				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled),
+				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
 			});
 		} catch {}
 		try {
