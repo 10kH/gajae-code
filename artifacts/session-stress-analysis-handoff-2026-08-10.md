@@ -969,13 +969,13 @@ Concurrency improved latency by only 11.0 ms (1.8%) while increasing RSS by 7.7 
 - cold lookup required one bounded range read;
 - warm lookup required zero range reads.
 
-The current full direct/captured fork corpus in `artifacts/session-gib-stress-source-bound-2026-08-10.json` is bound to product source `c1bc3ef75a1091df1e2ee09162a0eaaf9ebaadd2`. Direct fork p50/p95 was 3,406.5/3,408.4 ms at a p95 79.4 MiB RSS increase; captured fork p50/p95 was 2,851.1/2,911.7 ms at a p95 76.0 MiB RSS increase. These results remain below the accepted four-second fork and 8.2-second first-open budgets. The earlier profile and A/B matrices in sections 14.3–14.4 remain explicitly bound to their cited `b41feb2ad` source and are retained as historical causal evidence, not relabeled as current-source runs.
+The current full direct/captured fork corpus in `artifacts/session-gib-stress-source-bound-2026-08-10.json` is bound to product source `1cb704987cf6c1dc2a99dcf4083a0068e7e9e992`. Direct fork p50/p95 was 2,682.1/2,743.6 ms at a p95 79.9 MiB RSS increase; captured fork p50/p95 was 2,050.4/2,054.7 ms at a p95 76.9 MiB RSS increase. These results remain below the accepted four-second fork and 8.2-second first-open budgets. The earlier profile and A/B matrices in sections 14.3–14.4 remain explicitly bound to their cited `b41feb2ad` source and are retained as historical causal evidence, not relabeled as current-source runs.
 
 ### 14.6 Memory and verification acceptance
 
 Live bounded session state remains under the 64 MiB accountant budget. Bun/macOS allocator high-water RSS is separately bounded by a 128 MiB process envelope for large first-open/fork operations. Split metrics are recomputed from live cache, tail, provider-state, and reducer state rather than stale transition snapshots.
 
-`artifacts/session-source-bound-verification-receipt.json` binds the current verification to product source `c1bc3ef75a1091df1e2ee09162a0eaaf9ebaadd2`: 273 focused tests passed with one intentional default-off latency skip, the explicit opt-in latency/I-O and RSS evidence remains retained, all seven mandatory computer-enforcement adversarial cases passed, package typecheck passed, schema synchronization passed, 67 release-policy/evidence/publish-order tests passed, frozen-lockfile installation passed, and the mixed historical/current source-bound report rendered successfully.
+`artifacts/session-source-bound-verification-receipt.json` binds the current verification to product source `1cb704987cf6c1dc2a99dcf4083a0068e7e9e992`: 273 focused tests passed with one intentional default-off latency skip, the explicit opt-in latency/I-O and RSS evidence remains retained, all seven mandatory computer-enforcement adversarial cases passed, package typecheck passed, schema synchronization passed, 67 release-policy/evidence/publish-order tests passed, frozen-lockfile installation passed, and the mixed historical/current source-bound report rendered successfully.
 
 ### 14.7 Review-closed safety behavior and rejected follow-ups
 
