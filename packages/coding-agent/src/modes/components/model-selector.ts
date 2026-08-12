@@ -27,6 +27,7 @@ import {
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	isAuthenticated,
 	kNoAuth,
+	requiresExplicitThinkingChoice,
 } from "../../config/model-registry";
 import {
 	formatModelSelectorValue,
@@ -2430,17 +2431,6 @@ export class ModelSelectorComponent extends Container {
 		const row = this.#getSelectedPresetRow();
 		return row ? presetRowIdentity(row) : undefined;
 	}
-}
-
-function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
-	if (model.reasoning !== true) return false;
-	if (
-		model.provider === "openai" ||
-		model.provider === "openai-codex" ||
-		(model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6"))
-	)
-		return true;
-	return role !== null && GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
 }
 
 function getSelectableThinkingLevels(model: Model): ThinkingLevel[] {

@@ -144,13 +144,26 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 		maxTokens: 65_536,
 		compat: { supportsDeveloperRole: false },
 	};
+	const qwenPreview: Model<"openai-responses"> = {
+		id: "qwen3.8-max-preview",
+		name: "Qwen3.8 Max Preview",
+		api: "openai-responses",
+		provider: "alibaba-token-plan",
+		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		compat: { supportsDeveloperRole: false },
+	};
 	for (let index = models.length - 1; index >= 0; index--) {
 		const model = models[index]!;
 		if (model.provider === "alibaba-token-plan" && model.id === "qwen-3.8-max") {
 			models.splice(index, 1);
 		}
 	}
-	for (const metadata of [deepseek, qwen]) {
+	for (const metadata of [deepseek, qwen, qwenPreview]) {
 		const existing = models.find(model => model.provider === "alibaba-token-plan" && model.id === metadata.id);
 		if (existing) {
 			Object.assign(existing, metadata);
