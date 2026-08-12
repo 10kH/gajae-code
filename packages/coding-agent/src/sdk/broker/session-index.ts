@@ -297,6 +297,18 @@ function isUnresolvedEvent(event: SessionIndexEvent): boolean {
 	return !isTerminalEvent(event);
 }
 
+/**
+ * True when an unresolved identity actually claims endpoint authority. A
+ * bookkeeping registration with endpoint generation 0 has never published a
+ * session endpoint (e.g. the direct-session GC fence row appended by `main.ts`
+ * under the agent dir) and can never be attached by SessionRouter, so it must
+ * never fence a real endpoint root into ambiguity. Two genuinely
+ * endpoint-claiming roots still fence each other (C5/C6).
+ */
+function claimsEndpointAuthority(event: SessionIndexEvent): boolean {
+	return event.endpointGeneration >= 1;
+}
+
 function preferredIdentity(states: Iterable<SessionIdentityState>): SessionIdentityState | undefined {
 	let preferred: SessionIdentityState | undefined;
 	for (const state of states) {
@@ -401,7 +413,7 @@ function reduceEvents(events: SessionIndexEvent[], now: number): SessionIndexPro
 	for (const [sessionId, roots] of rootsBySession) {
 		for (const [root, rootStates] of roots) {
 			const current = preferredIdentity(rootStates);
-			if (!current || !isUnresolvedEvent(current.latest)) continue;
+			if (!current || !isUnresolvedEvent(current.latest) || !claimsEndpointAuthority(current.latest)) continue;
 			let unresolved = unresolvedRoots.get(sessionId);
 			if (unresolved === undefined) {
 				unresolved = new Map<string, SessionIdentityState[]>();

@@ -1028,6 +1028,38 @@ describe("SDK session index", () => {
 			]);
 		}
 	});
+	it("does not fence a real endpoint root behind a generation-0 bookkeeping registration", async () => {
+		// Regression: main.ts appends a direct-session GC fence row under the
+		// agent dir with endpointGeneration 0 and no endpoint. That row must not
+		// mark the session's real endpoint root ambiguous — every interactive
+		// session would otherwise read live:false and chat daemons (Telegram)
+		// could never attach any session (#post-0.13.1 notification outage).
+		for (const bookkeepingFirst of [true, false]) {
+			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-bookkeeping-"));
+			const index = await new SessionIndex(dir).open();
+			const sessionId = `direct-${bookkeepingFirst ? "first" : "second"}`;
+			const bookkeeping = {
+				type: "host_registered" as const,
+				sessionId,
+				locator: { repo: "r", stateRoot: "agent-dir" },
+				endpointGeneration: 0,
+				pid: process.pid,
+			};
+			if (bookkeepingFirst) await index.append(bookkeeping);
+			const real = await index.append(event(sessionId));
+			if (!bookkeepingFirst) await index.append(bookkeeping);
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: real.endpointGeneration,
+					locator: real.locator,
+					ambiguous: false,
+					live: true,
+				}),
+			]);
+		}
+	});
 	it("hides deleted sessions until a later registration establishes new authority", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-deleted-"));
 		const index = await new SessionIndex(dir).open();
