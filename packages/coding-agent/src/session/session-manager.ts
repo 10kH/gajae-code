@@ -7882,6 +7882,7 @@ export class SessionManager {
 			this.#usageStatistics = commit.usageStatistics;
 			this.#flushed = true;
 			this.#ensuredOnDisk = true;
+			this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(terminalDescriptor);
 			this.#lazyReopenSucceeded = true;
 			this.#lazyReopenFallbackReason = undefined;
 			initialized = true;
@@ -9088,6 +9089,7 @@ export class SessionManager {
 				flushed: this.#flushed,
 				needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
 				ensuredOnDisk: this.#ensuredOnDisk,
+				managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
 				artifactManager: this.#artifactManager,
 				artifactManagerSessionFile: this.#artifactManagerSessionFile,
 				adoptedArtifactManager: this.#adoptedArtifactManager,
@@ -9111,6 +9113,7 @@ export class SessionManager {
 				this.#flushed = previous.flushed;
 				this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
 				this.#ensuredOnDisk = previous.ensuredOnDisk;
+				this.#managedPersistExpectedIdentity = previous.managedPersistExpectedIdentity;
 				this.#artifactManager = previous.artifactManager;
 				this.#artifactManagerSessionFile = previous.artifactManagerSessionFile;
 				this.#adoptedArtifactManager = previous.adoptedArtifactManager;
