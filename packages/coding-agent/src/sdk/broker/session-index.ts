@@ -84,13 +84,13 @@ export interface IndexedSession {
 	activity?: SessionActivity;
 	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
 	lastHeartbeatAt?: number;
-	/** True when more than one unresolved current state-root identity claims this session id. */
+	/** True when more than one unresolved authority-fencing state-root identity claims this session id. */
 	ambiguous: boolean;
 	/** True when the identity's latest event is terminal (DR-1 retains stopped rows for inspection/offline tail). */
 	terminal: boolean;
 }
 
-/** A session can grant endpoint or lifecycle authority only when one current state root claims its id. */
+/** A session can grant endpoint or lifecycle authority only when one authority-fencing state root claims its id. */
 export function isSessionAuthorityEligible(session: Pick<IndexedSession, "ambiguous">): boolean {
 	return session.ambiguous !== true;
 }
@@ -374,8 +374,10 @@ function projectIdentity(state: SessionIdentityState, ambiguous: boolean, now: n
 
 /**
  * Total-order projection (C5/C6): first retain every current composite-identity
- * row, then select one public row per session. More than one unresolved state root
- * fences authority. Once exactly one unresolved root remains, its current identity
+ * row, then select one public row per session. More than one unresolved
+ * authority-fencing state root fences authority; a proven non-endpoint
+ * bookkeeping registration never fences, but still participates in survivor
+ * selection. Once exactly one unresolved root remains, its current identity
  * becomes the public authority even when a terminated identity from another root
  * has a higher generation. Heartbeats inherit locator/endpoint metadata from their
  * identity's prior event.
