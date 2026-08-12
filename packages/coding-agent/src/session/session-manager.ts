@@ -9280,7 +9280,10 @@ export class SessionManager {
 		);
 		if (this.destination.kind === "managed") {
 			const bytes = Buffer.from(`${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`, "utf8");
-			await this.#managedTranscriptStore(stage.sessionFile).replace(path.basename(stage.sessionFile), bytes);
+			await this.#managedTranscriptStore(stage.sessionFile).publishNoReplace(
+				path.basename(stage.sessionFile),
+				bytes,
+			);
 		} else {
 			const staleCleanupError = await this.#cleanupPreparedNewSessionPersistence(stage);
 			if (staleCleanupError) throw staleCleanupError;
