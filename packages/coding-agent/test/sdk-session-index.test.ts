@@ -847,7 +847,11 @@ describe("SDK session index", () => {
 		const started = Date.now();
 		await contender.withLocked(async () => undefined);
 		expect(Date.now() - started).toBeLessThan(5_000);
-	});
+		// The seeding above appends 400 fsynced rows; on slow CI filesystems that
+		// setup alone can exceed the 5s default per-test ceiling even though the
+		// lock-promptness contract asserted above stays far below it. Match the
+		// other heavy multi-process tests in this file.
+	}, 30_000);
 	it("serializes repair with a racing writer and resumes after the retained prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const seed = await new SessionIndex(dir).open();
