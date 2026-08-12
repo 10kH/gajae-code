@@ -3904,7 +3904,7 @@ export interface TelegramDaemonOptions {
 	/** TTL for durable topic-adoption intents (default 10 minutes). Observed, not a fixed contract. */
 	adoptionIntentTtlMs?: number;
 	pid?: number;
-	/** Liveness probe for skipping dead-PID endpoint records in {@link TelegramNotificationDaemon.scanRoots}. */
+	/** Liveness probe for skipping dead-PID endpoint records during root scanning. */
 	pidAlive?: (pid: number) => boolean;
 	/** Optional aggregate master endpoint; absent discovery is a no-op. */
 	master?: TelegramMasterClientOptions;
