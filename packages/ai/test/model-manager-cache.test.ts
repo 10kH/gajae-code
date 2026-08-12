@@ -55,6 +55,7 @@ describe("online-if-uncached model refresh", () => {
 				providerId,
 				staticModels,
 				cacheDbPath,
+				cacheDynamicModelProvenance: "credential-a\u0000https://provider-a.example.test",
 				now: () => now,
 				fetchDynamicModels: async () => {
 					discoveryCalls += 1;
@@ -67,6 +68,147 @@ describe("online-if-uncached model refresh", () => {
 		expect(discoveryCalls).toBe(0);
 		expect(result.stale).toBe(false);
 		expect(result.models.map(entry => entry.id)).toEqual(["static", "cached"]);
+	});
+
+	test("retains authoritative dynamic IDs separately from merged static models", async () => {
+		const providerId = "cache-authoritative-ids";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+
+		const fetched = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: "credential-a\u0000https://provider-a.example.test",
+				now: () => now,
+				fetchDynamicModels: async () => [model(providerId, "dynamic")],
+			},
+			"online",
+		);
+		expect(fetched.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(fetched.dynamicModelIds).toEqual(["dynamic"]);
+
+		const cached = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: "credential-a\u0000https://provider-a.example.test",
+				now: () => now,
+				fetchDynamicModels: async () => {
+					throw new Error("fresh cache must be reused");
+				},
+			},
+			"online-if-uncached",
+		);
+		expect(cached.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(cached.dynamicModelIds).toEqual(["dynamic"]);
+	});
+
+	test("retains fresh cached dynamic IDs when static transport drift forces a cache re-merge", async () => {
+		const providerId = "cache-authoritative-remerge";
+		const now = 1_700_000_000_000;
+		const initialStatic = [model(providerId, "static")];
+		await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: initialStatic,
+				cacheDbPath,
+				cacheDynamicModelProvenance: "credential-a\u0000https://provider-a.example.test",
+				now: () => now,
+				fetchDynamicModels: async () => [model(providerId, "dynamic")],
+			},
+			"online",
+		);
+
+		const changedStatic = [{ ...model(providerId, "static"), baseUrl: "https://changed.example.test/v1" }];
+		const cached = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: changedStatic,
+				cacheDbPath,
+				cacheDynamicModelProvenance: "credential-a\u0000https://provider-a.example.test",
+				now: () => now,
+				fetchDynamicModels: async () => {
+					throw new Error("fresh cache must be reused");
+				},
+			},
+			"online-if-uncached",
+		);
+
+		expect(cached.fetched).toBe(false);
+		expect(cached.stale).toBe(false);
+		expect(cached.dynamicModelIds).toEqual(["dynamic"]);
+	});
+
+	test("does not reuse cached dynamic IDs after an offline credential or endpoint change", async () => {
+		const providerId = "cache-provenance-change";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: "credential-a\u0000https://provider-a.example.test",
+				now: () => now,
+				fetchDynamicModels: async () => [model(providerId, "dynamic")],
+			},
+			"online",
+		);
+
+		const offline = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: "credential-b\u0000https://provider-b.example.test",
+				now: () => now,
+				fetchDynamicModels: async () => {
+					throw new Error("offline refresh must not fetch");
+				},
+			},
+			"offline",
+		);
+
+		expect(offline.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(offline.dynamicModelIds).toBeUndefined();
+	});
+
+	test("withholds matching cached dynamic IDs during offline refresh", async () => {
+		const providerId = "cache-offline-provenance";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: provenance,
+				now: () => now,
+				fetchDynamicModels: async () => [model(providerId, "dynamic")],
+			},
+			"online",
+		);
+
+		const offline = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: provenance,
+				now: () => now,
+				fetchDynamicModels: async () => {
+					throw new Error("offline refresh must not fetch");
+				},
+			},
+			"offline",
+		);
+
+		expect(offline.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(offline.dynamicModelIds).toBeUndefined();
 	});
 
 	test("refreshes missing and stale caches", async () => {
@@ -158,6 +300,24 @@ describe("online-if-uncached model refresh", () => {
 				failure,
 			).toEqual(["static"]);
 		}
+	});
+
+	test("does not present stale or failed catalog IDs as live evidence", async () => {
+		const providerId = "cache-unproven-ids";
+		const staticModels = [model(providerId, "static")];
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				fetchDynamicModels: async () => null,
+			},
+			"online",
+		);
+
+		expect(result.models.map(entry => entry.id)).toEqual(["static"]);
+		expect(result.stale).toBe(true);
+		expect(result.dynamicModelIds).toBeUndefined();
 	});
 
 	test("does not publish successful dynamic models when the cache guard denies publication", async () => {
