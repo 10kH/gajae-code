@@ -15,9 +15,7 @@ import { type ModelSelectorValue, normalizeModelSelectorValue } from "../../conf
 import { type Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
 import {
-	boundCompletedTerminalScopeRows,
-	boundEvictedTerminalKeys,
-	collectEvictedTerminalKeys,
+	boundTerminalRetentionState,
 	findOwnedRegistrationsForTurn,
 	isOwnedAttemptRegistrationIncomplete,
 	settleOwnedWork,
@@ -73,17 +71,12 @@ class SdkOnlyIdempotencyConflictError extends Error {
 	}
 }
 
-/** Bounded completed-row retention for the SDK-only terminal reconciliation
- *  document, mirroring the bus terminal-abort implementation (review thread
- *  P2): no-active/idle aborts with unique keys and repeated active-turn
- *  markers must not grow the document without limit. */
-const SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS = 256;
-const SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES = 4096;
-
 /** Bounded wait for the correlated agent_end lifecycle publication after a
  *  terminal abort settles, before the durable row may claim
- *  `terminalPublished` (review thread P2). Mirrors the full-bus path's 1s
- *  publication wait. */
+ *  `terminalPublished` (review thread P2). The bus runtime needs no such wait:
+ *  it publishes the correlated event inline during terminalization and records
+ *  the outcome synchronously on its capture slot, while this runtime observes
+ *  the publication from the separate `agent_end` handler. */
 const SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS = 1_000;
 /** Bounded wait for in-flight workflow gate resolutions to settle during SDK
  *  runtime shutdown before proceeding with cleanup. Unresolved resolutions
@@ -1697,16 +1690,7 @@ function createControlSurface(
 							acceptedAt: Date.now(),
 						},
 					];
-					const bounded = boundCompletedTerminalScopeRows(preBound, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
-					const evicted = collectEvictedTerminalKeys(preBound, bounded);
-					const combined = [...state.keys, ...evicted];
-					// FIFO-expire the OLDEST tombstones past the cap instead of
-					// throwing after the destructive stop already happened (review
-					// thread P2).
-					return {
-						scopes: bounded,
-						keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-					};
+					return boundTerminalRetentionState(state.keys, preBound);
 				});
 				return "ok";
 			} catch (error) {
@@ -1755,16 +1739,7 @@ function createControlSurface(
 					// Finalized reservations become evictable completed rows: apply
 					// the SAME bounded retention as writeNoEffect so a burst of idle
 					// aborts cannot grow the document (review thread P2).
-					const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
-					const evicted = collectEvictedTerminalKeys(scopes, bounded);
-					const combined = [...state.keys, ...evicted];
-					// FIFO-expire the OLDEST tombstones past the cap instead of
-					// throwing after the destructive stop already happened (review
-					// thread P2).
-					return {
-						scopes: bounded,
-						keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-					};
+					return boundTerminalRetentionState(state.keys, scopes);
 				});
 			} catch {
 				// Best-effort: the row stays reserved (replays as uncertainty)
@@ -1781,17 +1756,7 @@ function createControlSurface(
 			mutate: (scopes: SdkOnlyTerminalScopeRecord[]) => SdkOnlyTerminalScopeRecord[],
 		): Promise<void> => {
 			await store.transactTerminalState(state => {
-				const scopes = mutate(state.scopes);
-				const bounded = boundCompletedTerminalScopeRows(scopes, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
-				const evicted = collectEvictedTerminalKeys(scopes, bounded);
-				const combined = [...state.keys, ...evicted];
-				// FIFO-expire the OLDEST tombstones past the cap instead of
-				// throwing after the destructive stop already happened (review
-				// thread P2).
-				return {
-					scopes: bounded,
-					keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-				};
+				return boundTerminalRetentionState(state.keys, mutate(state.scopes));
 			});
 		};
 		let handle = terminalAbortSeams.getActivePromptHandle();
@@ -2004,16 +1969,7 @@ function createControlSurface(
 						acceptedAt: Date.now(),
 					},
 				];
-				const bounded = boundCompletedTerminalScopeRows(preBound, SDK_ONLY_MAX_DURABLE_TERMINAL_RESERVATIONS);
-				const evicted = collectEvictedTerminalKeys(preBound, bounded);
-				const combined = [...state.keys, ...evicted];
-				// FIFO-expire the OLDEST tombstones past the cap instead of
-				// throwing after the destructive stop already happened (review
-				// thread P2).
-				return {
-					scopes: bounded,
-					keys: boundEvictedTerminalKeys(combined, SDK_ONLY_MAX_RETAINED_TERMINAL_KEY_TOMBSTONES),
-				};
+				return boundTerminalRetentionState(state.keys, preBound);
 			});
 		} catch (error) {
 			if (error instanceof SdkOnlyIdempotencyConflictError) {
