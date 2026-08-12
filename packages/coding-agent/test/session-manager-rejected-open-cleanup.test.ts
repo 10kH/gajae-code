@@ -601,4 +601,40 @@ describe("managed strict-resume target races", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("restores full resident state and identity when managed switch identity fails", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-switch-identity-"));
+		const cwd = path.join(root, "cwd");
+		const agentDir = path.join(root, "agent");
+		await fs.mkdir(cwd, { recursive: true });
+		const storage = new FileSessionStorage();
+		const destination = SessionManager.managedDestination(cwd, agentDir, storage);
+		const sourceFile = path.join(destination.directory, "source.jsonl");
+		storage.writeTextSync(sourceFile, transcript());
+		let manager: SessionManager | undefined;
+		try {
+			manager = await SessionManager.open(sourceFile, destination, storage, "copy-retain", "enabled");
+			const originalSessionId = manager.getSessionId();
+			const originalSessionFile = manager.getSessionFile();
+			const targetFile = path.join(destination.directory, "target.jsonl");
+			storage.writeTextSync(targetFile, transcript().replaceAll("rejected-open", "target-session"));
+			// Inject failure: delete the target file right before identity adoption
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = async (filePath: string) => {
+				if (filePath === targetFile) {
+					storage.unlinkSync(targetFile);
+				}
+			};
+			await expect(manager.setSessionFile(targetFile)).rejects.toThrow();
+			// Verify the manager fully restored to the original session
+			expect(manager.getSessionId()).toBe(originalSessionId);
+			expect(manager.getSessionFile()).toBe(originalSessionFile);
+			// Verify the original session content is intact (not cross-session)
+			expect(storage.existsSync(sourceFile)).toBe(true);
+			expect(storage.readTextSync(sourceFile)).toBe(transcript());
+		} finally {
+			SessionManagerTestHooks.beforeManagedSwitchIdentity = undefined;
+			await manager?.close().catch(() => undefined);
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 });

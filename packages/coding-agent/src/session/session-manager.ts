@@ -6549,6 +6549,7 @@ export const SessionManagerTestHooks: {
 	beforeManagedMissingPublish?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	beforeManagedMissingReturn?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	afterManagedMissingAssertion?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
+	beforeManagedSwitchIdentity?: (filePath: string, storage: SessionStorage) => void | Promise<void>;
 	/** Internal first-open GC strategy override; omitted means current. */
 	firstOpenGcStrategy?: SessionMemoryGcStrategy;
 	/** Internal first-open secondary-artifact mode override; omitted means auto. */
@@ -9058,8 +9059,9 @@ export class SessionManager {
 				try {
 					managedTransition?.adopt();
 					writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
-					this.#commitResidentTextStoreTransition(prepared);
+					await SessionManagerTestHooks.beforeManagedSwitchIdentity?.(resolvedSessionFile, this.#storage);
 					this.#adoptManagedPersistIdentity(resolvedSessionFile);
+					this.#commitResidentTextStoreTransition(prepared);
 				} catch (error) {
 					managedTransition?.rollback();
 					this.#sessionId = previous.sessionId;
