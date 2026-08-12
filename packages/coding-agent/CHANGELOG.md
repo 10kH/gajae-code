@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+### Fixed
+- The SDK broker's Windows process-liveness probe no longer opens a console window on every poll. `runProcessIncarnationCommand` spawned `powershell.exe` without `windowsHide`, and on Windows 11 — where the default terminal delegation hands every new console to Windows Terminal — each probe therefore created a visible terminal window that stole focus. The PowerShell path runs whenever the native reader cannot bind the target pid, so one dead or inaccessible pid turned the broker's ~2s liveness polling into a continuous window flash for the life of the process. Every other internal spawn in the repo already passed `windowsHide: true`; this one did not.
 ## [0.13.1] - 2026-08-11
 
 ### Added
