@@ -176,7 +176,6 @@ process.exitCode = await child.exited;`;
 			"contribute-pr",
 			"deep-interview",
 			"migrate",
-			"rlm",
 			"update",
 			"read",
 			"customize",
