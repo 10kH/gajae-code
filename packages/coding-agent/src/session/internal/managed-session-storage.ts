@@ -596,6 +596,48 @@ export async function reapScrubbedProtocolRemnants(
 	return reportScrubbedProtocolRemnantReap(reaped, failures);
 }
 
+/** Number of candidate remnants inspected between event-loop yields. */
+const SCRUBBED_REMNANT_REAP_BATCH_SIZE = 256;
+
+/**
+ * Async twin of {@link reapScrubbedProtocolRemnantsSync} with the same safety
+ * filters (terminal remnant prefix, zero-length, single-link, non-symlink,
+ * older than the age gate), yielding between bounded batches. Long-lived
+ * processes reap per-session descendant directories through this path so a
+ * legacy oversized directory cannot starve timers or sibling subagents while
+ * it is being drained (issue #4394).
+ */
+export async function reapScrubbedProtocolRemnants(
+	directory: string,
+	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
+): Promise<ScrubbedProtocolRemnantReapResult> {
+	let names: string[];
+	try {
+		names = await fsp.readdir(directory);
+	} catch (error) {
+		return reportScrubbedProtocolRemnantReap(0, isEnoent(error) ? 0 : 1);
+	}
+	const cutoff = Date.now() - minAgeMs;
+	let reaped = 0;
+	let failures = 0;
+	let scanned = 0;
+	for (const name of names) {
+		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		if (++scanned % SCRUBBED_REMNANT_REAP_BATCH_SIZE === 0) await Bun.sleep(0);
+		const pathname = path.join(directory, name);
+		try {
+			const named = await fsp.lstat(pathname);
+			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			if (named.mtimeMs > cutoff) continue;
+			await fsp.unlink(pathname);
+			reaped += 1;
+		} catch (error) {
+			if (!isEnoent(error)) failures += 1;
+		}
+	}
+	return reportScrubbedProtocolRemnantReap(reaped, failures);
+}
+
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
 const ACL_CLEAR_EVIDENCE = new Set(["cleared", "already_absent", "unsupported", "not_run"]);
 const GENERAL_FAILURE_CODES = new Set([
