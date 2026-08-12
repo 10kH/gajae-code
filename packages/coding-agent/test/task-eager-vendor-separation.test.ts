@@ -32,7 +32,7 @@ function vendorSeparatedProfile(): ModelProfileDefinition {
 	};
 }
 
-async function createSession(settings: Settings) {
+async function createSession(settings: Settings, toolNames?: string[]) {
 	const tempDir = path.join(os.tmpdir(), `gjc-task-eager-${Snowflake.next()}`);
 	tempDirs.push(tempDir);
 	fs.mkdirSync(tempDir, { recursive: true });
@@ -56,6 +56,7 @@ async function createSession(settings: Settings) {
 		enableLsp: false,
 		notificationHostModeSupported: false,
 		sdkHostModeSupported: false,
+		toolNames,
 	});
 }
 
@@ -179,6 +180,29 @@ describe("vendor-separated delegation in the system prompt", () => {
 		);
 		try {
 			expect(session.systemPrompt.join("\n")).not.toContain(DELEGATION_DIRECTIVE);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("activates the task tool and directive when a profile becomes vendor-separated mid-session", async () => {
+		const settings = Settings.isolated({
+			"tools.discoveryMode": "all",
+			modelRoles: { default: "openai-codex/gpt-5.6-sol:low" },
+			"task.agentModelOverrides": { executor: "openai-codex/gpt-5.6-terra:low" },
+		});
+		const { session } = await createSession(settings);
+		try {
+			expect(session.getActiveToolNames()).not.toContain("task");
+			expect(session.systemPrompt.join("\n")).not.toContain(DELEGATION_DIRECTIVE);
+
+			// What activating a vendor-separated profile installs mid-session.
+			settings.override("modelRoles", { default: "anthropic/claude-opus-5:medium" });
+			settings.override("task.agentModelOverrides", { executor: "openai-codex/gpt-5.5:high" });
+			await session.syncEagerDelegation();
+
+			expect(session.getActiveToolNames()).toContain("task");
+			expect(session.systemPrompt.join("\n")).toContain(DELEGATION_DIRECTIVE);
 		} finally {
 			await session.dispose();
 		}
