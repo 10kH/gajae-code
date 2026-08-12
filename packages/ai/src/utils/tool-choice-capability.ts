@@ -24,6 +24,7 @@ const CACHE_MAX_ENTRIES = 256;
 let cachePathOverride: string | undefined;
 let nowForTests: (() => number) | undefined;
 let beforeExpiredDeleteForTests: (() => void) | undefined;
+let beforeMalformedDeleteForTests: (() => void) | undefined;
 
 /**
  * Claude Mythos accepts tools but rejects forced tool use (Anthropic 400:
@@ -75,10 +76,12 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 	path?: string;
 	now?: () => number;
 	beforeExpiredDelete?: () => void;
+	beforeMalformedDelete?: () => void;
 }): void {
 	cachePathOverride = options?.path;
 	nowForTests = options?.now;
 	beforeExpiredDeleteForTests = options?.beforeExpiredDelete;
+	beforeMalformedDeleteForTests = options?.beforeMalformedDelete;
 	clearToolChoiceIncapabilityRegistryForTests();
 }
 
@@ -294,11 +297,24 @@ function hydrateToolChoiceCapability(registryKey: string): void {
 	withCapabilityCache(database => {
 		const digest = capabilityKeyDigest(registryKey);
 		const row = database
-			.query("SELECT max_support, observed_at FROM tool_choice_capabilities WHERE key_digest = ?")
-			.get(digest) as { max_support?: unknown; observed_at?: unknown } | null;
+			.query("SELECT max_support, support_rank, observed_at FROM tool_choice_capabilities WHERE key_digest = ?")
+			.get(digest) as { max_support?: unknown; support_rank?: unknown; observed_at?: unknown } | null;
 		if (!row) return;
-		if (!isToolChoiceSupport(row.max_support) || !isValidObservedAt(row.observed_at, now)) {
-			database.run("DELETE FROM tool_choice_capabilities WHERE key_digest = ?", [digest]);
+		if (
+			!isToolChoiceSupport(row.max_support) ||
+			row.support_rank !== supportRank[row.max_support] ||
+			!isValidObservedAt(row.observed_at, now)
+		) {
+			beforeMalformedDeleteForTests?.();
+			database.run(
+				"DELETE FROM tool_choice_capabilities WHERE key_digest = ? AND max_support = ? AND support_rank = ? AND observed_at = ?",
+				[
+					digest,
+					typeof row.max_support === "string" ? row.max_support : String(row.max_support),
+					typeof row.support_rank === "number" ? row.support_rank : -1,
+					typeof row.observed_at === "number" ? row.observed_at : -1,
+				],
+			);
 			return;
 		}
 		if (now - row.observed_at >= CACHE_TTL_MS) {
@@ -348,6 +364,11 @@ function withCapabilityCache<T>(operation: (database: Database) => T): T | undef
 		fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
 		const database = openCapabilityCache(cachePath);
 		try {
+			try {
+				fs.chmodSync(cachePath, 0o600);
+			} catch {
+				// Cache access remains fail-open on filesystems without POSIX modes.
+			}
 			return operation(database);
 		} finally {
 			database.close();
@@ -366,27 +387,48 @@ function openCapabilityCache(cachePath: string): Database {
 	database.run("PRAGMA busy_timeout = 3000");
 	database.run("PRAGMA journal_mode = WAL");
 	database.run("PRAGMA synchronous = FULL");
-	const version = database.query("PRAGMA user_version").get() as { user_version?: number } | null;
-	const schemaVersion = version?.user_version ?? 0;
-	if (schemaVersion === 0) {
-		const initialize = database.transaction(() => {
-			database.run("DROP TABLE IF EXISTS tool_choice_capabilities");
+	const initialize = database.transaction(() => {
+		const version = database.query("PRAGMA user_version").get() as { user_version?: number } | null;
+		const schemaVersion = version?.user_version ?? 0;
+		if (schemaVersion === 0) {
 			database.run(`
-				CREATE TABLE tool_choice_capabilities (
+				CREATE TABLE IF NOT EXISTS tool_choice_capabilities (
 					key_digest TEXT PRIMARY KEY NOT NULL,
 					max_support TEXT NOT NULL,
 					support_rank INTEGER NOT NULL,
 					observed_at INTEGER NOT NULL
 				) STRICT
 			`);
+			assertCapabilityCacheSchema(database);
 			database.run(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION}`);
-		});
-		initialize();
-	} else if (schemaVersion !== CACHE_SCHEMA_VERSION) {
-		database.close();
-		throw new CapabilityCacheCorruptionError("unsupported cache schema version");
-	}
+			return;
+		}
+		if (schemaVersion !== CACHE_SCHEMA_VERSION) {
+			throw new CapabilityCacheCorruptionError("unsupported cache schema version");
+		}
+		assertCapabilityCacheSchema(database);
+	});
+	initialize();
 	return database;
+}
+
+function assertCapabilityCacheSchema(database: Database): void {
+	const columns = database.query("PRAGMA table_info(tool_choice_capabilities)").all() as Array<{
+		name?: unknown;
+		type?: unknown;
+		notnull?: unknown;
+		pk?: unknown;
+	}>;
+	const actual = columns.map(column => [column.name, column.type, column.notnull, column.pk]);
+	const expected = [
+		["key_digest", "TEXT", 1, 1],
+		["max_support", "TEXT", 1, 0],
+		["support_rank", "INTEGER", 1, 0],
+		["observed_at", "INTEGER", 1, 0],
+	];
+	if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+		throw new CapabilityCacheCorruptionError("invalid cache schema");
+	}
 }
 
 class CapabilityCacheCorruptionError extends Error {}

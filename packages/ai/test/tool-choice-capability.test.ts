@@ -257,6 +257,51 @@ describe("durable tool-choice capability cache", () => {
 		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
 	});
 
+	it("recovers from an invalid version-zero schema", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-schema-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		const database = new Database(cachePath);
+		try {
+			database.run("CREATE TABLE tool_choice_capabilities (wrong TEXT)");
+		} finally {
+			database.close();
+		}
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		markToolChoiceIncapability(model("named"), "auto");
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
+	it("does not delete a row repaired while malformed data is being cleaned", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-malformed-race-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		markToolChoiceIncapability(model("named"), "auto");
+		const database = new Database(cachePath);
+		try {
+			database.run("UPDATE tool_choice_capabilities SET support_rank = 3");
+		} finally {
+			database.close();
+		}
+
+		configureToolChoiceCapabilityCacheForTests({
+			path: cachePath,
+			beforeMalformedDelete: () => {
+				const repair = new Database(cachePath);
+				try {
+					repair.run("UPDATE tool_choice_capabilities SET support_rank = 1");
+				} finally {
+					repair.close();
+				}
+			},
+		});
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
 	it("isolates api, provider, base URL, and wire model without persisting raw keys or errors", async () => {
 		using tempDir = TempDir.createSync("tool-choice-capability-isolation-");
 		const cachePath = path.join(tempDir.path(), "capabilities.db");
@@ -274,6 +319,7 @@ describe("durable tool-choice capability cache", () => {
 		}
 
 		const bytes = await fs.readFile(cachePath);
+		expect((await fs.stat(cachePath)).mode & 0o777).toBe(0o600);
 		const persisted = bytes.toString("utf8");
 		expect(persisted).not.toContain(target.baseUrl);
 		expect(persisted).not.toContain(target.provider);
