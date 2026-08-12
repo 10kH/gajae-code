@@ -235,7 +235,7 @@ describe("online-if-uncached model refresh", () => {
 			baseUrl: "https://openrouter.ai/api/v1",
 			reasoning: true,
 			contextWindow: 1_048_576,
-			maxTokens: 1_048_576,
+			maxTokens: 131_072,
 		};
 
 		const result = await resolveProviderModels<Api>(

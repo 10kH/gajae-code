@@ -176,10 +176,14 @@ export function injectMuseSparkModels(models: Model[]): void {
 		provider: "openrouter",
 		baseUrl: "https://openrouter.ai/api/v1",
 		reasoning: true,
+		// GJC's current Model.input contract represents only text/image. Meta and
+		// OpenRouter also accept video, audio, and PDF/file inputs for this model;
+		// those modalities remain intentionally unadvertised until the shared model
+		// contract and request pipelines can represent them end to end.
 		input: ["text", "image"],
 		cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
 		contextWindow: 1_048_576,
-		maxTokens: 1_048_576,
+		maxTokens: 131_072,
 		thinking: {
 			mode: "effort",
 			minLevel: Effort.Minimal,
