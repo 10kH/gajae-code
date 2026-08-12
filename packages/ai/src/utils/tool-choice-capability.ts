@@ -21,6 +21,7 @@ const CACHE_SCHEMA_VERSION = 1;
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const EMPTY_CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 256;
+const REGISTRY_MAX_ENTRIES = 256;
 
 let cachePathOverride: string | undefined;
 let nowForTests: (() => number) | undefined;
@@ -336,6 +337,7 @@ function hydrateToolChoiceCapability(registryKey: string): void {
 	if (hydrated === false && !registryExpiresAt.has(registryKey)) {
 		registryExpiresAt.set(registryKey, now + EMPTY_CACHE_TTL_MS);
 	}
+	pruneRegistry(now);
 }
 
 function persistToolChoiceCapability(
@@ -478,4 +480,19 @@ function isValidObservedAt(value: unknown, now: number): value is number {
 
 function currentTime(): number {
 	return nowForTests?.() ?? Date.now();
+}
+
+function pruneRegistry(now: number): void {
+	for (const [key, expiresAt] of registryExpiresAt) {
+		if (expiresAt <= now) {
+			registryExpiresAt.delete(key);
+			registry.delete(key);
+		}
+	}
+	while (registryExpiresAt.size > REGISTRY_MAX_ENTRIES) {
+		const oldestKey = registryExpiresAt.keys().next().value;
+		if (typeof oldestKey !== "string") break;
+		registryExpiresAt.delete(oldestKey);
+		registry.delete(oldestKey);
+	}
 }

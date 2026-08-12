@@ -195,6 +195,22 @@ describe("durable tool-choice capability cache", () => {
 		expect(opens).toBe(2);
 	});
 
+	it("bounds empty lookup memoization", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-empty-bound-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let opens = 0;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, onCacheOpen: () => opens++ });
+		for (let index = 0; index < 300; index++) {
+			resolveToolChoice({ ...model("named"), wireModelId: `wire-${index}` }, "required");
+		}
+		expect(opens).toBe(300);
+
+		resolveToolChoice({ ...model("named"), wireModelId: "wire-0" }, "required");
+		expect(opens).toBe(301);
+		resolveToolChoice({ ...model("named"), wireModelId: "wire-299" }, "required");
+		expect(opens).toBe(301);
+	});
+
 	it("expires learned support so provider behavior is re-probed", () => {
 		using tempDir = TempDir.createSync("tool-choice-capability-ttl-");
 		const cachePath = path.join(tempDir.path(), "capabilities.db");
