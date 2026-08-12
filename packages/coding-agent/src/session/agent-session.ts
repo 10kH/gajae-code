@@ -1871,33 +1871,22 @@ type SessionAdmissionEntry = {
 	ready: PromiseWithResolvers<void>;
 	settled: PromiseWithResolvers<void>;
 	released: boolean;
+	continuationCapability?: symbol;
 };
 
 type SessionAdmissionLease = {
 	release(): void;
 };
 
+type ScheduledContinuationAdmission = {
+	entry: SessionAdmissionEntry;
+	capability: symbol;
+};
+
 export interface DefaultFallbackRuntimeState {
 	chain: ConfiguredFallbackChain;
 	controller: FallbackChainRuntimeState;
 	exhaustedLastTurn: boolean;
-}
-
-/**
- * Fire-and-forget continuations (auto-compaction retries, queued follow-ups) race a
- * still-busy agent whose current turn can legitimately hold the run for minutes.
- * Reschedule with capped exponential backoff instead of a fixed 100ms spin, and give
- * up after a bounded number of attempts (~4 minutes total) so a stuck busy state
- * cannot spin forever — observed in production logs as 10,742 reschedules over
- * 21 minutes inside a single session.
- */
-const AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS = 100;
-const AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS = 5_000;
-const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
-
-function agentContinueBusyRescheduleDelayMs(attempt: number): number {
-	const exponential = AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1);
-	return Math.min(exponential, AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS);
 }
 
 function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretObfuscator | undefined): SessionContext {
@@ -2543,6 +2532,18 @@ export class AgentSession {
 		next.ready.resolve();
 	}
 
+	#captureScheduledContinuationAdmission(): ScheduledContinuationAdmission | undefined {
+		const entry = this.#sessionAdmissionContext.getStore();
+		if (
+			entry?.kind !== "prompt" ||
+			entry.released ||
+			this.#activeSessionAdmission !== entry ||
+			entry.continuationCapability === undefined
+		)
+			return undefined;
+		return { entry, capability: entry.continuationCapability };
+	}
+
 	async #awaitStartupTurnBarrier(): Promise<void> {
 		const barrier = this.#startupTurnBarrier;
 		if (!barrier) return;
@@ -2559,10 +2560,18 @@ export class AgentSession {
 		kind: SessionAdmissionKind,
 		body: (lease: SessionAdmissionLease) => Promise<T>,
 		signal?: AbortSignal,
+		continuationAdmission?: ScheduledContinuationAdmission,
 	): Promise<T> {
 		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
 		const owner = this.#sessionAdmissionContext.getStore();
-		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		if (owner && !owner.released) {
+			if (
+				continuationAdmission?.entry === owner &&
+				continuationAdmission.capability === owner.continuationCapability
+			)
+				return await body({ release: () => {} });
+			throw this.#sessionAdmissionBusyError();
+		}
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		// Reject new external turns for the whole handoff transition. The handoff
 		// itself never acquires prompt admission (it generates via generateHandoff and
@@ -2580,6 +2589,7 @@ export class AgentSession {
 			ready: Promise.withResolvers<void>(),
 			settled: Promise.withResolvers<void>(),
 			released: false,
+			...(kind === "prompt" ? { continuationCapability: Symbol("scheduled-continuation") } : {}),
 		};
 		const releaseEntry = () => {
 			if (entry.released) return;
@@ -2747,15 +2757,6 @@ export class AgentSession {
 			this.#pendingAgentEndEmit = pending;
 		}
 		this.#flushPendingAgentEnd();
-	}
-
-	#retainDeferredAgentEndAfterContinuationBusy(
-		hold: symbol | undefined,
-		pending: AgentSessionEvent | undefined,
-	): void {
-		if (!hold || !pending) return;
-		this.#pendingAgentEndEmit = pending;
-		this.#pendingAgentEndContinuationHolds.set(hold, pending);
 	}
 
 	#releaseDeferredAgentEndContinuation(hold: symbol | undefined): void {
@@ -5236,10 +5237,6 @@ export class AgentSession {
 		return scheduled;
 	}
 
-	#isAgentBusyError(error: unknown): error is AgentBusyError {
-		return error instanceof AgentBusyError;
-	}
-
 	#scheduleAgentContinue(options?: {
 		delayMs?: number;
 		generation?: number;
@@ -5250,7 +5247,6 @@ export class AgentSession {
 			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
 		) => void;
 		allowDuringCancelAndSubmit?: boolean;
-		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
 		resourceRunId?: string;
 		maintenanceContinuation?: boolean;
@@ -5284,171 +5280,154 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
-		let busyReschedules = 0;
-		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
-			const leaseSettlement = Promise.withResolvers<void>();
-			const settleLease = () => leaseSettlement.resolve();
-			return this.#schedulePostPromptTask(
-				async scheduledSignal => {
-					const canContinue = (): boolean => {
-						if (scheduledSignal.aborted || this.#isDisposed) {
-							skip("aborted_signal");
-							return false;
-						}
-						if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-							skip("generation_changed");
-							return false;
-						}
-						if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
-							skip("queue_drained");
-							return false;
-						}
-						if (options?.shouldContinue && !options.shouldContinue()) {
-							skip("queue_drained");
-							return false;
-						}
-						return true;
-					};
-					if (!canContinue()) {
-						settleLease();
-						return;
-					}
-					await this.#awaitStartupTurnBarrier();
-					if (!canContinue()) {
-						settleLease();
-						return;
-					}
-					try {
-						if (!options?.skipCompactionCheck) {
-							await this.#checkEstimatedContextBeforePrompt();
-							if (!canContinue()) return;
-						}
-						if (scheduledSignal.aborted) {
-							skip("aborted_signal");
-							return;
-						}
-						if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-							skip("generation_changed");
-							return;
-						}
-						if (options?.shouldContinue && !options.shouldContinue()) {
-							skip("queue_drained");
-							return;
-						}
-						// A scheduled same-turn continuation of a terminally aborted turn is
-						// denied at the final synchronous boundary before agent.continue
-						// entry; no await intervenes between this check and method entry.
-						// Owned-completion deliveries are NOT affected (they use followUp).
-						if (this.#isTurnContinuationBlocked()) {
-							skip("terminal_turn");
-							return;
-						}
-						// A continuation scheduled before a handoff engaged must not start a
-						// turn against the session being handed off (or the restored
-						// predecessor). rearmIdle / normal delivery resumes after the fence.
-						if (this.#handoffTransitionActive) {
-							skip("handoff_in_progress");
-							return;
-						}
-						const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
-						let predecessorAccepted = false;
-						const releasePredecessor = () => {
-							if (predecessorAccepted) return;
-							predecessorAccepted = true;
-							this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
-						};
-						const hasQueuedMessages = this.agent.hasQueuedMessages();
-						const startsQueuedSuccessor =
-							hasQueuedMessages &&
-							(options?.continueQueuedOnly === true || this.agent.state.messages.at(-1)?.role === "assistant");
-						const continueQueued = options?.continueQueuedOnly
-							? this.agent.continueQueuedMessages.bind(this.agent)
-							: this.agent.continue.bind(this.agent);
-						const queuedMessagesBeforeContinue = [
-							...this.agent.snapshotSteering(),
-							...this.agent.snapshotFollowUp(),
-						];
-						try {
-							await continueQueued({
-								...this.#managedFallbackPromptOptions(),
-								maintenanceContinuation: options?.maintenanceContinuation,
-								// Reset only after continue() has claimed the queued turn. Skipped or stale
-								// continuations retain predecessor accounting, and resetAttemptBudget keeps
-								// the sticky fallback cursor unchanged.
-								onRunAccepted: (handle: AttemptRunHandle) => {
-									const queuedMessagesAfterContinue = new Set([
-										...this.agent.snapshotSteering(),
-										...this.agent.snapshotFollowUp(),
-									]);
-									for (const message of queuedMessagesBeforeContinue) {
-										if (queuedMessagesAfterContinue.has(message)) continue;
-										const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
-										if (sdkRunToken) {
-											this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
-											break;
-										}
-									}
-									this.#acceptRunHandle(handle);
-									options?.onRunAccepted?.(handle);
-									settleLease();
-									releasePredecessor();
-									if (startsQueuedSuccessor) {
-										this.#defaultFallbackChain().resetAttemptBudget();
-										this.#overflowMaintenanceAttempts = 0;
-									}
-								},
-							});
-							releasePredecessor();
-						} catch (error) {
-							if (
-								options?.rescheduleOnBusy &&
-								this.#isAgentBusyError(error) &&
-								!predecessorAccepted &&
-								!terminalized &&
-								canContinue()
-							) {
-								if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
-									busyReschedules += 1;
-									const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
-									this.#retainDeferredAgentEndAfterContinuationBusy(
-										predecessorAgentEndHold,
-										predecessorAgentEnd,
-									);
-									logger.debug("agent.continue busy after scheduling; rescheduling", {
-										error: error.message,
-										attempt: busyReschedules,
-										delayMs: nextDelayMs,
-									});
-									void scheduleAttempt(nextDelayMs);
+		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const leaseSettlement = Promise.withResolvers<void>();
+		const settleLease = () => leaseSettlement.resolve();
+		return this.#schedulePostPromptTask(
+			async scheduledSignal => {
+				try {
+					await this.#withSessionAdmission(
+						"prompt",
+						async () => {
+							const canContinue = (): boolean => {
+								if (scheduledSignal.aborted || this.#isDisposed) {
+									skip("aborted_signal");
+									return false;
+								}
+								if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+									skip("generation_changed");
+									return false;
+								}
+								if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
+									skip("queue_drained");
+									return false;
+								}
+								if (options?.shouldContinue && !options.shouldContinue()) {
+									skip("queue_drained");
+									return false;
+								}
+								return true;
+							};
+							if (!canContinue()) {
+								settleLease();
+								return;
+							}
+							await this.#awaitStartupTurnBarrier();
+							if (!canContinue()) {
+								settleLease();
+								return;
+							}
+							try {
+								if (!options?.skipCompactionCheck) {
+									await this.#checkEstimatedContextBeforePrompt();
+									if (!canContinue()) return;
+								}
+								if (scheduledSignal.aborted) {
+									skip("aborted_signal");
 									return;
 								}
-								logger.warn("agent.continue busy reschedule budget exhausted; giving up", {
-									attempts: busyReschedules,
-									error: error.message,
-								});
+								if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+									skip("generation_changed");
+									return;
+								}
+								if (options?.shouldContinue && !options.shouldContinue()) {
+									skip("queue_drained");
+									return;
+								}
+								// A scheduled same-turn continuation of a terminally aborted turn is
+								// denied at the final synchronous boundary before agent.continue
+								// entry; no await intervenes between this check and method entry.
+								// Owned-completion deliveries are NOT affected (they use followUp).
+								if (this.#isTurnContinuationBlocked()) {
+									skip("terminal_turn");
+									return;
+								}
+								// A continuation scheduled before a handoff engaged must not start a
+								// turn against the session being handed off (or the restored
+								// predecessor). rearmIdle / normal delivery resumes after the fence.
+								if (this.#handoffTransitionActive) {
+									skip("handoff_in_progress");
+									return;
+								}
+								const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+								let predecessorAccepted = false;
+								const releasePredecessor = () => {
+									if (predecessorAccepted) return;
+									predecessorAccepted = true;
+									this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+								};
+								const hasQueuedMessages = this.agent.hasQueuedMessages();
+								const startsQueuedSuccessor =
+									hasQueuedMessages &&
+									(options?.continueQueuedOnly === true ||
+										this.agent.state.messages.at(-1)?.role === "assistant");
+								const continueQueued = options?.continueQueuedOnly
+									? this.agent.continueQueuedMessages.bind(this.agent)
+									: this.agent.continue.bind(this.agent);
+								const queuedMessagesBeforeContinue = [
+									...this.agent.snapshotSteering(),
+									...this.agent.snapshotFollowUp(),
+								];
+								try {
+									await continueQueued({
+										...this.#managedFallbackPromptOptions(),
+										maintenanceContinuation: options?.maintenanceContinuation,
+										// Reset only after continue() has claimed the queued turn. Skipped or stale
+										// continuations retain predecessor accounting, and resetAttemptBudget keeps
+										// the sticky fallback cursor unchanged.
+										onRunAccepted: (handle: AttemptRunHandle) => {
+											const queuedMessagesAfterContinue = new Set([
+												...this.agent.snapshotSteering(),
+												...this.agent.snapshotFollowUp(),
+											]);
+											for (const message of queuedMessagesBeforeContinue) {
+												if (queuedMessagesAfterContinue.has(message)) continue;
+												const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
+												if (sdkRunToken) {
+													this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+													break;
+												}
+											}
+											this.#acceptRunHandle(handle);
+											options?.onRunAccepted?.(handle);
+											settleLease();
+											releasePredecessor();
+											if (startsQueuedSuccessor) {
+												this.#defaultFallbackChain().resetAttemptBudget();
+												this.#overflowMaintenanceAttempts = 0;
+											}
+										},
+									});
+									releasePredecessor();
+								} catch (error) {
+									if (!predecessorAccepted)
+										this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+									throw error;
+								}
+							} catch (error) {
+								fail(error);
+							} finally {
+								settleLease();
 							}
-							if (!predecessorAccepted)
-								this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
-							throw error;
-						}
-					} catch (error) {
-						fail(error);
-					} finally {
-						settleLease();
-					}
+						},
+						scheduledSignal,
+						continuationAdmission,
+					);
+				} catch (error) {
+					if (scheduledSignal.aborted) skip("aborted_signal");
+					else fail(error);
+				}
+			},
+			{
+				delayMs: options?.delayMs,
+				onSkip: () => {
+					settleLease();
+					skip("aborted_signal");
 				},
-				{
-					delayMs,
-					onSkip: () => {
-						settleLease();
-						skip("aborted_signal");
-					},
-					resourceRunId: options?.resourceRunId,
-					leaseTask: leaseSettlement.promise,
-				},
-			);
-		};
-		return scheduleAttempt();
+				resourceRunId: options?.resourceRunId,
+				leaseTask: leaseSettlement.promise,
+			},
+		);
 	}
 
 	#logCompactionContinuationSkipped(
@@ -5511,7 +5490,6 @@ export class AgentSession {
 				generation,
 				suppressPredecessorAgentEnd: true,
 				resourceRunId,
-				rescheduleOnBusy: true,
 				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
 				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
 			});
@@ -5563,81 +5541,63 @@ export class AgentSession {
 			if (!authorized) this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 			return authorized;
 		};
-		let busyReschedules = 0;
-		const scheduleAttempt = (delayMs = 0) => {
-			let rescheduled = false;
-			void this.#schedulePostPromptTask(
-				async signal => {
-					try {
-						await Promise.resolve();
-						if (signal.aborted) {
-							this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-							return;
-						}
-						if (this.#promptGeneration !== scheduledGeneration) {
-							this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
-							return;
-						}
-						if (!(await continuationAuthorized(signal))) return;
-						await this.#promptWithMessage(
-							{
-								role: "developer",
-								content: [{ type: "text", text: autoContinuePrompt }],
-								attribution: "agent",
-								timestamp: Date.now(),
-							},
-							autoContinuePrompt,
-							{
-								skipPostPromptRecoveryWait: true,
-								skipCompactionCheck: true,
-								predecessorAgentEndHold,
-								onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
-									continuationAuthorized(signal, hasPendingNextTurnMessages),
-							},
-						);
-					} catch (error) {
-						if (signal.aborted) {
-							this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-							return;
-						}
-						if (this.#isAgentBusyError(error) && this.#promptGeneration === scheduledGeneration) {
-							if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
-								busyReschedules += 1;
-								const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
-								logger.debug("Auto-compaction continuation busy; rescheduling", {
-									source: "auto_continue_prompt",
-									reason: "queue_drained",
-									error: error.message,
-									attempt: busyReschedules,
-									delayMs: nextDelayMs,
-								});
-								rescheduled = true;
-								scheduleAttempt(nextDelayMs);
+		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		void this.#schedulePostPromptTask(
+			async signal => {
+				try {
+					await this.#withSessionAdmission(
+						"prompt",
+						async () => {
+							await Promise.resolve();
+							if (signal.aborted) {
+								this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
 								return;
 							}
-							logger.warn("Auto-compaction continuation busy reschedule budget exhausted; giving up", {
-								source: "auto_continue_prompt",
-								attempts: busyReschedules,
-								error: error.message,
-							});
-						}
-						this.#logCompactionContinuationError("auto_continue_prompt", error);
-					} finally {
-						if (!rescheduled) this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-					}
-				},
-				{
-					delayMs,
-					generation: scheduledGeneration,
-					resourceRunId,
-					onSkip: () => {
+							if (this.#promptGeneration !== scheduledGeneration) {
+								this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+								return;
+							}
+							if (!(await continuationAuthorized(signal))) return;
+							await this.#promptWithMessage(
+								{
+									role: "developer",
+									content: [{ type: "text", text: autoContinuePrompt }],
+									attribution: "agent",
+									timestamp: Date.now(),
+								},
+								autoContinuePrompt,
+								{
+									skipPostPromptRecoveryWait: true,
+									skipCompactionCheck: true,
+									predecessorAgentEndHold,
+									onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
+										continuationAuthorized(signal, hasPendingNextTurnMessages),
+								},
+							);
+						},
+						signal,
+						continuationAdmission,
+					);
+				} catch (error) {
+					if (signal.aborted) {
 						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-						this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-					},
+						return;
+					}
+					this.#logCompactionContinuationError("auto_continue_prompt", error);
+				} finally {
+					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+				}
+			},
+			{
+				delayMs: 0,
+				generation: scheduledGeneration,
+				resourceRunId,
+				onSkip: () => {
+					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 				},
-			);
-		};
-		scheduleAttempt();
+			},
+		);
 	}
 
 	async #cancelPostPromptTasks(): Promise<void> {
@@ -10209,7 +10169,6 @@ export class AgentSession {
 		this.#scheduleAgentContinue({
 			shouldContinue: () => this.#canStartDeferredSdkFollowUp() && this.agent.hasQueuedMessages(),
 			continueQueuedOnly: true,
-			rescheduleOnBusy: true,
 		});
 	}
 	#canStartDeferredSdkFollowUp(): boolean {
@@ -12386,11 +12345,10 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
+		// Do not hold selection admission while waiting for a scheduled continuation:
+		// the continuation may need prompt admission to settle the current turn.
+		await this.waitForIdle();
 		const canonicalName = await this.#withSessionAdmission("selection", async () => {
-			// A model-picker action must not alter an in-flight generation: wait
-			// for the current run to settle inside the admission before applying
-			// the profile, matching `setDefaultModelSelection`.
-			await this.waitForIdle();
 			const profiles = this.#modelRegistry.getModelProfiles();
 			let canonical: string;
 			try {
@@ -12477,10 +12435,10 @@ export class AgentSession {
 	 * profile activation and default-model selection.
 	 */
 	async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+		// Waiting while selection owns admission deadlocks with a scheduled
+		// continuation queued behind it. Wait before acquiring the mutation lease.
+		await this.waitForIdle();
 		return this.#withSessionAdmission("selection", async () => {
-			// A config mutation can change the active model-role assignment. Do not
-			// alter an in-flight turn after its prompt admission lease has released.
-			await this.waitForIdle();
 			return await body();
 		});
 	}
@@ -12832,6 +12790,9 @@ export class AgentSession {
 			onAfterMutation?: () => void;
 		},
 	): Promise<DefaultModelSelectionResult> {
+		// Scheduled continuations share this admission queue, so idle settlement
+		// must happen before selection acquires its lease.
+		await this.waitForIdle();
 		return this.#withSessionAdmission("selection", async () => {
 			options?.onBeforeMutation?.();
 			const expectedSessionId = this.sessionId;
@@ -12848,7 +12809,6 @@ export class AgentSession {
 				resolvedLevel ??
 				resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
 				ThinkingLevel.Off;
-			await this.waitForIdle();
 			await this.sessionManager.flush();
 			await this.#waitForAdmittedBaseSystemPromptRebuilds();
 			if (this.sessionId !== expectedSessionId) {
@@ -16149,7 +16109,6 @@ export class AgentSession {
 							delayMs: 100,
 							generation,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
-							rescheduleOnBusy: true,
 							continueQueuedOnly: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -16171,7 +16130,6 @@ export class AgentSession {
 						suppressPredecessorAgentEnd: true,
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
-						rescheduleOnBusy: true,
 						continueQueuedOnly: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -16431,7 +16389,6 @@ export class AgentSession {
 					generation,
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
-					rescheduleOnBusy: true,
 					continueQueuedOnly: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -17976,7 +17933,6 @@ export class AgentSession {
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
-					rescheduleOnBusy: true,
 					continueQueuedOnly: true,
 				});
 			}
