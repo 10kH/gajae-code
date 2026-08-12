@@ -2,7 +2,7 @@ import { describe, expect, it, test, vi } from "bun:test";
 import { Agent, ThinkingLevel } from "@gajae-code/agent-core";
 
 import type { Model } from "@gajae-code/ai";
-import { TempDir } from "@gajae-code/utils";
+import { hookFetch, TempDir } from "@gajae-code/utils";
 import {
 	activateModelProfile,
 	applyPreparedModelProfileActivation,
@@ -17,9 +17,10 @@ import {
 
 import type { ModelProfileDefinition } from "../src/config/model-profiles";
 import { BUILTIN_MODEL_PROFILES, mergeModelProfiles } from "../src/config/model-profiles";
-import { kNoAuth, type ModelRegistry } from "../src/config/model-registry";
+import { kNoAuth, ModelRegistry } from "../src/config/model-registry";
 import { Settings } from "../src/config/settings";
 import { AgentSession, type DefaultFallbackRuntimeState } from "../src/session/agent-session";
+import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
 
 const model = (provider: string, id: string, thinking?: Model["thinking"]): Model =>
@@ -259,6 +260,174 @@ describe("model profile activation", () => {
 
 		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
 		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+	});
+
+	test("built-in claude-opus skips a bundled Opus 5 absent from fresh live catalog evidence", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-live-catalog-");
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			authStorage.setRuntimeApiKey("anthropic", "test-anthropic-key");
+			const requests: string[] = [];
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				requests.push(url);
+				switch (url) {
+					case "https://models.dev/api.json":
+						return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+							headers: { "Content-Type": "application/json" },
+						});
+					default:
+						if (!url.endsWith("/models")) {
+							throw new Error(`Unexpected model discovery request: ${input}`);
+						}
+						return new Response(
+							JSON.stringify({ data: [{ id: "claude-opus-4-6" }, { id: "claude-sonnet-5" }] }),
+							{ headers: { "Content-Type": "application/json" } },
+						);
+				}
+			});
+			const registry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
+			await registry.refreshProvider("anthropic", "online");
+
+			expect(requests.some(url => url.endsWith("/models"))).toBe(true);
+			expect(registry.getAvailable().some(candidate => candidate.id === "claude-opus-5")).toBe(true);
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.filter(candidate => candidate.provider === "anthropic")
+					.map(candidate => candidate.id),
+			).not.toContain("claude-opus-5");
+			const session = fakeSession();
+			session.model = undefined;
+			session.thinkingLevel = undefined;
+			session.sessionId = "parent-session";
+			const prepared = await prepareModelProfileActivation({
+				session: session as unknown as AgentSession,
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "claude-opus",
+			});
+
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
+			expect(prepared.defaultResolutionSkips).toEqual([
+				{ selector: "anthropic/claude-opus-5:xhigh", reason: "unknown_model" },
+			]);
+			expect(prepared.agentModelOverrides).toMatchObject({
+				executor: "anthropic/claude-sonnet-5",
+				planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+				critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+				architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:high"],
+			});
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("built-in claude-opus retains bundled Opus 5 after live catalog discovery fails", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-stale-catalog-");
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			authStorage.setRuntimeApiKey("anthropic", "test-anthropic-key");
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				switch (url) {
+					case "https://models.dev/api.json":
+						return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+							headers: { "Content-Type": "application/json" },
+						});
+					default:
+						if (!url.endsWith("/models")) {
+							throw new Error(`Unexpected model discovery request: ${input}`);
+						}
+						return new Response("unavailable", { status: 503 });
+				}
+			});
+			const registry = new ModelRegistry(authStorage, `${tempDir.path()}/models.yml`);
+			await registry.refreshProvider("anthropic", "online");
+			const prepared = await prepareModelProfileActivation({
+				session: fakeSession() as unknown as AgentSession,
+				modelRegistry: registry,
+				settings: Settings.isolated(),
+				profileName: "claude-opus",
+			});
+
+			expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+			expect(prepared.defaultResolutionSkips).toEqual([]);
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
+	});
+
+	test("fresh catalog omission does not exclude a same-id custom Anthropic replacement", async () => {
+		const tempDir = TempDir.createSync("@gjc-profile-custom-overlay-");
+		const modelsPath = `${tempDir.path()}/models.yml`;
+		const authStorage = await AuthStorage.create(`${tempDir.path()}/auth.db`);
+		try {
+			await Bun.write(
+				modelsPath,
+				JSON.stringify({
+					providers: {
+						anthropic: {
+							baseUrl: "https://custom-anthropic.example.test/v1",
+							api: "anthropic-messages",
+							apiKey: "TEST_ANTHROPIC_KEY",
+							models: [{ id: "claude-opus-5" }],
+						},
+					},
+				}),
+			);
+			using _hook = hookFetch(input => {
+				const url = String(input);
+				if (url === "https://models.dev/api.json") {
+					return new Response(JSON.stringify({ anthropic: { models: {} } }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				if (url === "https://custom-anthropic.example.test/models") {
+					return new Response(JSON.stringify({ data: [{ id: "claude-opus-4-6" }] }), {
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				throw new Error(`Unexpected model discovery request: ${input}`);
+			});
+			const registry = new ModelRegistry(authStorage, modelsPath);
+			await registry.refreshProvider("anthropic", "online");
+
+			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe("https://custom-anthropic.example.test/v1");
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+			).toBe(true);
+
+			registry.registerProvider("anthropic", {
+				baseUrl: "https://runtime-anthropic.example.test/v1",
+				api: "anthropic-messages",
+				apiKey: "TEST_RUNTIME_ANTHROPIC_KEY",
+				models: [
+					{
+						id: "claude-opus-5",
+						name: "Runtime Opus 5",
+						reasoning: true,
+						input: ["text"],
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+						contextWindow: 200_000,
+						maxTokens: 8_000,
+					},
+				],
+			});
+			expect(registry.find("anthropic", "claude-opus-5")?.baseUrl).toBe("https://runtime-anthropic.example.test/v1");
+			expect(
+				registry
+					.getAvailableForProfileActivation()
+					.some(candidate => candidate.provider === "anthropic" && candidate.id === "claude-opus-5"),
+			).toBe(true);
+		} finally {
+			authStorage.close();
+			tempDir.removeSync();
+		}
 	});
 
 	test("rejects a mixed provider-agnostic profile before mutation when a role alias is unavailable", async () => {
