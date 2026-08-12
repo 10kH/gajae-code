@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../src/config/settings";
+import { getProviderInfo } from "../src/discovery";
 import { EXTENSION_HANDLER_TIMEOUT_MS } from "../src/extensibility/extensions/runner";
 import { discoverAndLoadHooks } from "../src/extensibility/hooks/loader";
 import {
@@ -359,6 +360,11 @@ describe("bounded diagnostics, matchers, provenance, duplicates, and ordering", 
 });
 
 describe("production discovery integration", () => {
+	it("registers Claude and Codex only for hook discovery", () => {
+		expect(getProviderInfo("claude")?.capabilities).toEqual(["hooks"]);
+		expect(getProviderInfo("codex")?.capabilities).toEqual(["hooks"]);
+	});
+
 	it("normalizes Codex descriptors before import and preserves valid module loading", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-normalization-"));
 		const hooksDir = path.join(root, ".codex", "hooks");
