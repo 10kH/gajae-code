@@ -606,6 +606,11 @@ export const SETTINGS_SCHEMA = {
 		default: 1,
 		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 10,
 	},
+	"gjc.ultragoal.nudgeBudget": {
+		type: "number",
+		default: 10,
+		validate: (value: number) => Number.isInteger(value) && value >= 0,
+	},
 
 	// ────────────────────────────────────────────────────────────────────────
 	// Appearance
@@ -3810,7 +3815,7 @@ export function getEnumValues(path: SettingPath): readonly string[] | undefined 
 	return "values" in def ? (def.values as readonly string[]) : undefined;
 }
 
-export const CONFIG_SCHEMA_VERSION = 1;
+export { CONFIG_SCHEMA_VERSION } from "./config-schema-version";
 
 export type SettingsSchemaIssue = {
 	path: string;

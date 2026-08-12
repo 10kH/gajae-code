@@ -149,7 +149,16 @@ describe("ACP production cancellation completion", () => {
 								frame.operation === "turn.prompt"
 									? { commandId: "prompt-command", turnId: "prompt-turn", accepted: true }
 									: frame.operation === "turn.abort"
-										? { aborted: abortAcknowledged }
+										? abortAcknowledged
+											? {
+													ok: true,
+													selection: "owned",
+													turn: "stopped",
+													ownedWork: "stopped",
+													automaticDelivery: "none",
+													resumeOnOwnedCompletion: false,
+												}
+											: { aborted: false }
 										: {},
 						}),
 					);

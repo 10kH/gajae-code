@@ -33,7 +33,7 @@ import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
-import { distTagForChannel, type UpdateChannel } from "./config/update-channel";
+import { distTagForChannel, resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/update-channel";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
@@ -1493,7 +1493,8 @@ export async function runRootCommand(
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
 		() => settingsInstance.get("startup.checkUpdate"),
-		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION, settingsInstance.get("startup.updateChannel"))),
+		deps.startupUpdate?.check ??
+			(() => checkForNewVersion(VERSION, resolveMachineLocalUpdateChannel(settingsInstance))),
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";

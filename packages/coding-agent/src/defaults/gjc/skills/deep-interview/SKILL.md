@@ -104,14 +104,14 @@ Complete this phase before Phase 1, before brownfield exploration, before GJC st
 1. **Prefer pre-resolved native state**:
    - First inspect active deep-interview state with `gjc deep-interview read --json`.
    - If state contains a finite numeric `threshold` and a non-empty `threshold_source`, use those values, set `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>`, and skip optional settings-file reads. This is the normal `/skill:deep-interview` path because the native hook already resolved settings quietly before loading the skill.
-2. **Only if native state lacks a resolved threshold, read threshold settings in runtime precedence order**:
-   - YAML config first: read the **single** modern config path the environment selects — `$GJC_CODING_AGENT_DIR/config.yml` when `GJC_CODING_AGENT_DIR` is set, else `$GJC_CONFIG_DIR/agent/config.yml` when `GJC_CONFIG_DIR` is set, else `~/.gjc/agent/config.yml`. Do not cascade through the other YAML locations when the selected one is absent or invalid.
-   - Then JSON settings: project settings `./.gjc/settings.json`, then user settings `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`.
-   - Read `gjc.deepInterview.ambiguityThreshold` only from files that are known to exist; optional config/settings-file absence is expected and must not be surfaced as failed `Read` calls.
-   - Do not probe arbitrary ancestor candidates such as `../../.gjc/settings.json`; use the current project `.gjc/settings.json` and user settings only.
+2. **Only if native state lacks a resolved threshold, read threshold settings in the runtime precedence order** (one shared resolver; first valid value wins):
+   1. project `.gjc/config.yml`
+   2. user `<agentDir>/config.yml` (normally `~/.gjc/agent/config.yml`, honoring `GJC_CODING_AGENT_DIR`/`PI_CODING_AGENT_DIR`; XDG variables apply only to categorized data/state/cache subdirectories, never to the workflow config path)
+   3. built-in default (`0.05` before resolution-flag fallback)
+   - `config.yml` uses the nested (schema) form - `gjc: { deepInterview: { ambiguityThreshold } }`. Project configuration beats user configuration. The reported `threshold_source` is the canonical path of the winning file, or the default. `config.yml` is the ONLY settings surface: the legacy `settings.json` files' workflow keys are retired: the config-root `~/.gjc/settings.json` is migrated once into the default global agent `config.yml` and its source removed, while the project `.gjc/settings.json` is retained for non-workflow settings (only its workflow keys are migrated into project `.gjc/config.yml` and no longer read unless a migration target is absent - a migration that could not publish (e.g. a read-only `.gjc`) leaves the retained legacy value effective as the previously configured override until it can publish). Invalid optional settings files continue to the next layer or the default (tolerant) — never a failed `Read`; do not probe arbitrary ancestor candidates.
 3. **Resolve threshold and source**:
    - Use the first valid configured value in the precedence order above; otherwise use the mode default when a resolution flag was passed: `--quick` = `0.6`, `--standard` = `0.5`, `--deep` = `0.35`; with no resolution flag, use the base default `0.05`.
-   - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` (for example `GJC_CODING_AGENT_DIR/config.yml`, `$GJC_CONFIG_DIR/agent/config.yml`, `~/.gjc/agent/config.yml`, `./.gjc/settings.json`, `[$GJC_CONFIG_DIR|~/.gjc]/settings.json`, or the selected mode default).
+   - Set these run variables exactly: `<resolvedThreshold>`, `<resolvedThresholdPercent>`, and `<resolvedThresholdSource>` (for example `./.gjc/config.yml`, `<agentDir>/config.yml` such as `~/.gjc/agent/config.yml`, or the selected mode default).
 4. **Emit the required first line to the user before any other interview announcement**:
 
 ```
@@ -984,23 +984,12 @@ Why bad: 45% ambiguity means nearly half the requirements are unclear. The mathe
 <Advanced>
 ## Configuration
 
-Optional settings in `.gjc/settings.json`:
+Optional settings in `.gjc/config.yml`:
 
-```json
-{
-  "gjc": {
-    "deepInterview": {
-      "ambiguityThreshold": <resolvedThreshold>,
-      "maxRounds": 100,
-      "softWarningRounds": 16,
-      "minRoundsBeforeExit": 3,
-      "enableChallengeAgents": true,
-      "autoExecuteOnComplete": false,
-      "defaultExecutionMode": null,
-      "scoringModel": "opus"
-    }
-  }
-}
+```yaml
+gjc:
+  deepInterview:
+    ambiguityThreshold: 0.7
 ```
 
 ## Resume

@@ -173,3 +173,86 @@ describe("async result yield queue delivery", () => {
 		expect(asyncDetails(harness.prompts[0]![0]!).jobs.map(job => job.jobId)).toEqual([jobId]);
 	});
 });
+
+test("flush builds one message per groupKey origin so owned drops cannot suppress other origins", async () => {
+	const { queue, followUps } = createHarness(false);
+	// Two entries from DIFFERENT ownership origins plus one ordinary entry.
+	const g1 = { jobId: "j-1", result: "one", kind: "g1" };
+	const g2 = { jobId: "j-2", result: "two", kind: "g2" };
+	const ordinary = { jobId: "j-3", result: "three", kind: "ordinary" };
+	queue.register("test-grouped", {
+		groupKey: entry => entry.kind,
+		build: (survivors: Array<{ jobId: string; result: string; kind: string }>) => ({
+			role: "custom",
+			customType: "async-result",
+			content: survivors.map(s => s.result).join("+"),
+			display: true,
+			attribution: "agent",
+			details: { jobs: survivors.map(s => s.jobId) },
+			timestamp: 1,
+		}),
+	});
+	queue.enqueue("test-grouped", g1);
+	queue.enqueue("test-grouped", g2);
+	queue.enqueue("test-grouped", ordinary);
+	await queue.flush("streaming");
+	// One message per origin (3 groups), each carrying only its own entries.
+	const grouped = followUps as CustomMessage<{ jobs: string[] }>[];
+	expect(grouped).toHaveLength(3);
+	expect(grouped.map(m => m.content).sort()).toEqual(["one", "three", "two"]);
+	expect(grouped.find(m => m.content === "one")?.details?.jobs).toEqual(["j-1"]);
+	expect(grouped.find(m => m.content === "two")?.details?.jobs).toEqual(["j-2"]);
+	expect(grouped.find(m => m.content === "three")?.details?.jobs).toEqual(["j-3"]);
+	expect(grouped[0]?.details?.jobs).toBeDefined();
+});
+
+test("flush preserves the queued FIFO chronology across contiguous origin runs", async () => {
+	// Entries arrive as A1, B1, A2: a map grouping every A together would
+	// deliver A2 before the earlier B1, changing the observable chronology
+	// of async results. Contiguous origin runs keep the arrival order
+	// (review thread P2).
+	const { queue, followUps } = createHarness(false);
+	const a1 = { jobId: "j-1", result: "a1", kind: "origin-a" };
+	const b1 = { jobId: "j-2", result: "b1", kind: "origin-b" };
+	const a2 = { jobId: "j-3", result: "a2", kind: "origin-a" };
+	queue.register("test-fifo", {
+		groupKey: entry => entry.kind,
+		build: (survivors: Array<{ jobId: string; result: string; kind: string }>) => ({
+			role: "custom",
+			customType: "async-result",
+			content: survivors.map(s => s.result).join("+"),
+			display: true,
+			attribution: "agent",
+			details: { jobs: survivors.map(s => s.jobId) },
+			timestamp: 1,
+		}),
+	});
+	queue.enqueue("test-fifo", a1);
+	queue.enqueue("test-fifo", b1);
+	queue.enqueue("test-fifo", a2);
+	await queue.flush("streaming");
+	const grouped = followUps as CustomMessage<{ jobs: string[] }>[];
+	expect(grouped.map(m => m.content)).toEqual(["a1", "b1", "a2"]);
+	expect(grouped.map(m => m.details?.jobs)).toEqual([["j-1"], ["j-2"], ["j-3"]]);
+});
+
+test("flush without a groupKey keeps the single-batch behavior", async () => {
+	const { queue, followUps } = createHarness(false);
+	queue.register("test-plain", {
+		build: (survivors: string[]) => ({
+			role: "custom",
+			customType: "async-result",
+			content: survivors.join("+"),
+			display: true,
+			attribution: "agent",
+			details: {},
+			timestamp: 1,
+		}),
+	});
+	queue.enqueue("test-plain", "a");
+	queue.enqueue("test-plain", "b");
+	await queue.flush("streaming");
+	const plain = followUps as CustomMessage<Record<string, never>>[];
+	expect(plain).toHaveLength(1);
+	expect(plain[0]?.content).toBe("a+b");
+});

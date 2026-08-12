@@ -151,6 +151,32 @@ test("MCP forwards the lifecycle startup budget to the lifecycle service", async
 	await mcp.close();
 });
 
+test("MCP forwards the bounded idempotency key on control envelopes", async () => {
+	// Terminal abort requires the key on the control frame: the control
+	// tool must expose it AND forward it, or every {mode:"terminal"} control
+	// through this surface is rejected with invalid_input (review thread P1).
+	const { agentDir, sessionId } = await fixture();
+	const mcp = createSdkMcpServer({ agentDir });
+	try {
+		const control = mcp.tools.find(tool => tool.name === "gjc_session_control")!;
+		expect(control.inputSchema).toMatchObject({ properties: { idempotencyKey: { type: "string" } } });
+		const result = await mcp.callTool("gjc_session_control", {
+			sessionId,
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "term-key-mcp",
+		});
+		expect(result).toMatchObject({ ok: true });
+		expect((result as { echoed?: Record<string, unknown> }).echoed).toMatchObject({
+			operation: "turn.abort",
+			input: { mode: "terminal" },
+			idempotencyKey: "term-key-mcp",
+		});
+	} finally {
+		await mcp.close();
+	}
+});
+
 test("MCP global schema exposes and requires caller lifecycle idempotency keys", async () => {
 	const { repo, agentDir } = await fixture();
 	const mcp = createSdkMcpServer({ agentDir });

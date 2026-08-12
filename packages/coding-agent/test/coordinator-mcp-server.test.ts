@@ -462,6 +462,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		expect(publicResult).not.toContain("session-endpoint-secret");
 		expect(publicResult).not.toContain("session-record-secret");
 		expect(publicResult).not.toContain("session-state-secret");
+
 		expect(publicResult).not.toContain(root);
 		expect(controls).toEqual([
 			{ operation: "session.list", input: { cwd: root }, idempotencyKey: undefined },

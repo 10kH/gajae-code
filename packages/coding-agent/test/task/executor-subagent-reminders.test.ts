@@ -5,8 +5,8 @@ import * as path from "node:path";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, Effort, type Model } from "@gajae-code/ai";
 import type { RecoveryFsRoot } from "@gajae-code/natives";
+import type { AsyncJobManager } from "../../src/async/job-manager";
 import { kNoAuth } from "../../src/config/model-registry";
-
 import { Settings } from "../../src/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import { AgentRegistry } from "../../src/registry/agent-registry";
@@ -226,6 +226,71 @@ describe("runSubprocess yield reminders", () => {
 				scope: "subagent",
 			}),
 		]);
+	});
+
+	it("keeps the fallback metadata update on the inherited job manager", async () => {
+		// Review thread P2: when this subagent emits model_fallback_switched
+		// after another top-level session has become the process-global
+		// manager, the metadata update must still go to the manager selected at
+		// dispatch — writing to AsyncJobManager.instance() would leave this
+		// session's subagent metadata stale or overwrite an unrelated same-ID
+		// record in the other session.
+		const updates: Array<{ subagentId: string; meta: Record<string, unknown> }> = [];
+		const inheritedManager = {
+			updateSubagentModel: (subagentId: string, meta: Record<string, unknown>) => updates.push({ subagentId, meta }),
+			removeLiveHandle: () => {},
+			registerLiveHandle: () => {},
+			getSubagentRecord: () => undefined,
+		} as unknown as AsyncJobManager;
+		const fallbackEvents: AgentSessionEvent[] = [];
+		const eventBus = new EventBus();
+		eventBus.on("task:subagent:event", payload => {
+			const event = (payload as { event: AgentSessionEvent }).event;
+			if (event.type === "model_fallback_switched") fallbackEvents.push(event);
+		});
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-inherited-manager",
+				from: "primary/model",
+				to: "fallback/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 3,
+			});
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fallback-inherited-manager",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-inherited-manager",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+			asyncJobManager: inheritedManager,
+		});
+
+		expect(fallbackEvents).toHaveLength(1);
+		// The initial model update AND the fallback update both land on the
+		// inherited manager; the fallback one carries modelFellBack:true.
+		expect(updates.length).toBeGreaterThanOrEqual(2);
+		expect(updates.at(-1)).toMatchObject({
+			subagentId: "subagent-fallback-inherited-manager",
+			meta: expect.objectContaining({ modelFellBack: true, effectiveModel: "fallback/model" }),
+		});
 	});
 
 	it("refreshes Fast state when the active fallback model changes", async () => {

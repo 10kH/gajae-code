@@ -77,9 +77,10 @@ pub struct ComputerScreenshot {
 
 /// Capture the primary display for JS callers (macOS).
 ///
-/// Requires the Screen Recording permission. This is the read-only `screenshot`
-/// primitive of the computer-use tool; input primitives land behind the same
-/// surface once the Accessibility gate is satisfied in a granted `gjc` process.
+/// Requires the Screen & System Audio Recording permission. This is the
+/// read-only `screenshot` primitive of the computer-use tool; input primitives
+/// land behind the same surface once the Accessibility gate is satisfied in a
+/// granted `gjc` process.
 ///
 /// # Errors
 /// Returns an error when capture fails (e.g. Screen Recording not granted).
@@ -88,7 +89,7 @@ pub fn computer_screenshot() -> napi::Result<ComputerScreenshot> {
 	#[cfg(target_os = "macos")]
 	{
 		let frame = capture::capture_primary_display()
-			.map_err(|err| napi::Error::from_reason(format!("{err}")))?;
+			.map_err(|err| napi::Error::from_reason(format!("{}: {err}", err.code())))?;
 		Ok(ComputerScreenshot {
 			png:           Uint8Array::from(frame.png),
 			width_px:      frame.display.width_px,

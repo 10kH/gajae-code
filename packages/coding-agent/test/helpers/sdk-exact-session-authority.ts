@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { processIncarnation } from "../../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../../src/sdk/broker/state-version";
 
@@ -60,6 +61,11 @@ export async function publishExactSessionAuthority(
 		locator: { repo: options.cwd, stateRoot },
 		endpointGeneration: authority.endpointGeneration,
 		pid: authority.pid,
+		// A real host publishes its own OS start incarnation; without it the
+		// pid-reuse fence (incarnationMatches) never holds and the session
+		// reads not-live, so the fixture publishes the test process's
+		// incarnation to mirror a genuine host.
+		processIncarnation: processIncarnation(process.pid),
 		endpointMtimeMs: authority.endpointMtimeMs,
 		version: SDK_STATE_VERSION,
 		indexSeq: 1,

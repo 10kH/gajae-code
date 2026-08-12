@@ -1,26 +1,46 @@
 # External control readiness
 
-The Gajae-Code SDK WebSocket protocol is the **only** external machine-control interface. See [SDK machine interfaces](./sdk.md) for the endpoint, authentication, events, state, and action contracts.
+Process-isolated controllers use broker-bound or managed surfaces. Endpoint
+records, transport credentials, and raw session transports remain inside SDK
+core; see [SDK machine interfaces](./sdk.md) for the ownership boundary.
 
 ## Supported surfaces
 
 | Surface | Entrypoint | Use it when |
 | --- | --- | --- |
-| SDK WebSocket | A running GJC session's loopback SDK endpoint | A program needs session state, events, actions, or workflow-gate replies. |
+| SDK session CLI | `gjc sdk session list|inspect|send|status|tail` or `raw control|query|global` | A local script needs bounded, credential-free session operations. |
 | Coordinator MCP | `gjc mcp-serve coordinator` | A controller needs multi-session orchestration, durable reports, or worktree-scoped lifecycle operations. |
+| Managed adapter | Configured Telegram, Discord, or Slack integration | A provider renders session presentation through opaque Router attachments. |
 | ACP | `gjc --mode acp` or `gjc acp` | An editor or ACP-compatible client supplies the session frontend. |
 
-`--mode rpc`, `--mode rpc-ui`, and `--mode bridge` have been removed. Their JSONL, socket, and HTTPS protocols are not supported compatibility interfaces.
+`--mode rpc`, `--mode rpc-ui`, `--mode bridge`, and `gjc sdk serve` are removed;
+they are not compatibility interfaces.
 
-## SDK readiness
+## SDK session CLI readiness
 
-The SDK endpoint is loopback-only and is created with the session. It provides the machine interface for state reads, event subscriptions, action resolution, workflow-gate replies, and controlled session operations. Review [docs/sdk.md](./sdk.md) before building an integration.
-
+The session CLI resolves controls through `SessionRouter` and lifecycle globals
+through `SessionLifecycleService` and the Broker. It emits credential-free JSON;
+review [docs/sdk-session-cli.md](./sdk-session-cli.md) before building a script.
 ## ACP readiness
 
 ACP remains a stdio editor protocol. Its session control uses the SDK adapter internally; it is not a replacement external bot-control protocol.
 
 For the build/run/verify loop when changing ACP code locally, see [ACP local development](./acp-local-development.md).
+
+#### Turn-end termination of owned work
+
+An ACP `session/cancel` is a C04 terminal abort: it stops the active turn **and** the
+exact owned work that turn spawned (background Bash/task jobs, detached subagents), so an
+external client such as Paseo that ends a run terminates everything it started instead of
+leaving subagents running in the background. A fresh bounded idempotency key is issued per
+cancel, so retries replay deterministically. A cancel with no active turn is a
+deterministic no-effect (`no_active_turn`), and an unsettled stop reports `uncertain`
+instead of claiming stopped work.
+
+Clients that want a cancel to leave owned background work running (its completion can then
+resume the root worker as a fresh turn) opt out per request with `_meta.gjc.abortScope:
+"turn"` on the `session/cancel` notification; `GJC_ACP_ABORT_SCOPE=turn` in the agent
+environment is the process-wide fallback. Both default to `"owned"`.
 
 #### Evidence promotion policy
 

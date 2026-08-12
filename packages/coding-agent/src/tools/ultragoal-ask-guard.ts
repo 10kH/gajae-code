@@ -41,7 +41,11 @@ export function formatUltragoalAskBlockMessage(diagnostic: UltragoalAskBlockDiag
 	].join("\n");
 }
 
-export async function assertUltragoalAskAllowed(cwd: string, context: UltragoalAskGuardContext = {}): Promise<void> {
+export async function assertUltragoalAskAllowed(
+	cwd: string,
+	context: UltragoalAskGuardContext = {},
+	agentDir?: string,
+): Promise<void> {
 	const activeSkill = normalizedActiveSkill(context);
 	// Deep-interview and ralplan are upstream planning workflows whose core gates
 	// are `ask` calls. Scope their Ultragoal check to the current session so stale
@@ -51,7 +55,7 @@ export async function assertUltragoalAskAllowed(cwd: string, context: UltragoalA
 	const sessionId = sessionScopedAskGuardId(context, activeSkill);
 	const diagnostic = await isUltragoalAskBlocked(cwd, { sessionId });
 	if (!diagnostic.active) return;
-	const nudge = await consumeUltragoalAskNudge(cwd, sessionId);
+	const nudge = await consumeUltragoalAskNudge(cwd, sessionId, agentDir);
 	if (nudge.nudged) throw new ToolError(nudge.message);
 	throw new ToolError(formatUltragoalAskBlockMessage(diagnostic));
 }
@@ -60,6 +64,7 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 	tool: T,
 	getCwd: () => string,
 	getContext: () => UltragoalAskGuardContext = () => ({}),
+	getSessionAgentDir: () => string | undefined = () => undefined,
 ): T {
 	if (tool.name !== "ask") return tool;
 	const candidate = tool as GuardedTool;
@@ -69,7 +74,9 @@ export function guardToolForUltragoalAsk<T extends AgentTool>(
 			if (prop === ULTRAGOAL_ASK_GUARD) return true;
 			if (prop !== "execute") return Reflect.get(target, prop, receiver);
 			return async (...args: unknown[]): Promise<unknown> => {
-				await assertUltragoalAskAllowed(getCwd(), getContext());
+				// The wrapper runs BEFORE AskTool.execute(): resolve the nudge
+				// budget against the SESSION profile, never the process-global one.
+				await assertUltragoalAskAllowed(getCwd(), getContext(), getSessionAgentDir());
 				return Reflect.apply(target.execute, target, args);
 			};
 		},

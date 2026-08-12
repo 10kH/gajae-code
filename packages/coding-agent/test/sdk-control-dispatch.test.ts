@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { type ControlRequest, type ControlSurface, dispatchControl } from "../src/sdk/host/control";
+import { type ControlRequest, type ControlSurface, dispatchControl, TypedControlError } from "../src/sdk/host/control";
 import { OPERATIONS } from "../src/sdk/protocol/operation-registry";
 
 const methodByOperation: Record<string, string> = {
@@ -70,37 +70,44 @@ const BROKER_LIFECYCLE_OPERATIONS = new Set([
 ]);
 
 function request(row: (typeof OPERATIONS)[number]): ControlRequest {
+	// turn.abort validates strictly: the generic kitchen-sink input carries
+	// `mode: "all"`, which is an invalid mode. Legacy C04 sends `{}` (omitted
+	// mode), so the broad fixture uses `{}` for turn.abort.
+	const input =
+		row.sdkId === "turn.abort"
+			? {}
+			: {
+					text: "text",
+					images: [],
+					id: "id",
+					answer: "answer",
+					response: "response",
+					choice: "choice",
+					name: "name",
+					args: [],
+					on: true,
+					op: "create",
+					objective: "goal",
+					items: [],
+					level: "high",
+					mode: "all",
+					cmd: "echo hi",
+					entryId: "entry",
+					target: "target",
+					patch: {},
+					components: [],
+					provider: "provider",
+					defs: [],
+					tier: "pro",
+					names: [],
+					before: "before",
+					after: "after",
+					path: "/tmp",
+				};
 	return {
 		id: row.id,
 		operation: row.sdkId,
-		input: {
-			text: "text",
-			images: [],
-			id: "id",
-			answer: "answer",
-			response: "response",
-			choice: "choice",
-			name: "name",
-			args: [],
-			on: true,
-			op: "create",
-			objective: "goal",
-			items: [],
-			level: "high",
-			mode: "all",
-			cmd: "echo hi",
-			entryId: "entry",
-			target: "target",
-			patch: {},
-			components: [],
-			provider: "provider",
-			defs: [],
-			tier: "pro",
-			names: [],
-			before: "before",
-			after: "after",
-			path: "/tmp",
-		},
+		input,
 		confirm: row.sdkId === "context.clear" || row.sdkId === "session.delete",
 	};
 }
@@ -154,6 +161,26 @@ test("forwards expectedSessionId only to durable workflow controls", async () =>
 		["gate", "approve", "session"],
 		["gate", "approve", "session"],
 	]);
+});
+
+test("forwards an explicit workflow gate idempotency key", async () => {
+	const gate = OPERATIONS.find(operation => operation.sdkId === "workflow.gate_answer")!;
+	const calls: unknown[][] = [];
+	const surface = {
+		answerGate: (...args: unknown[]) => {
+			calls.push(args);
+			return { resolved: true };
+		},
+	} as unknown as ControlSurface;
+
+	const response = await dispatchControl(surface, gate, {
+		...request(gate),
+		input: { id: "gate", response: "approve", expectedSessionId: "session" },
+		idempotencyKey: "gate-answer-key",
+	});
+
+	expect(response.ok).toBe(true);
+	expect(calls).toEqual([["gate", "approve", "session", "gate-answer-key"]]);
 });
 
 test("forwards an optional thinking level with model.set without changing legacy calls", async () => {
@@ -599,4 +626,165 @@ test("forwards a synthetic selection without a thinking level as undefined", asy
 
 	expect(calls).toEqual([["gajae-code/codex-eco", undefined]]);
 	expect(response.result).toEqual({ changed: true });
+});
+
+test("turn.abort terminal mode validates strictly and forwards normalized input", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	const calls: Array<Record<string, unknown>> = [];
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: (input: unknown, idempotencyKey?: string) => {
+			calls.push({ ...(input as Record<string, unknown>), idempotencyKey });
+			return "terminal";
+		},
+	} as unknown as ControlSurface;
+	const terminal = (input: Record<string, unknown>, idempotencyKey?: string) =>
+		dispatchControl(surface, abort, {
+			id: "t",
+			operation: abort.sdkId,
+			input,
+			idempotencyKey,
+		});
+
+	expect(await terminal({ mode: "terminal" }, "key-1")).toEqual({ id: "t", ok: true, result: "terminal" });
+	expect(calls).toEqual([{ mode: "terminal", scope: "turn", idempotencyKey: "key-1" }]);
+	expect(await terminal({ mode: "terminal", scope: "owned" }, "key-2")).toEqual({
+		id: "t",
+		ok: true,
+		result: "terminal",
+	});
+	expect(calls).toEqual([
+		{ mode: "terminal", scope: "turn", idempotencyKey: "key-1" },
+		{ mode: "terminal", scope: "owned", idempotencyKey: "key-2" },
+	]);
+	// Same-key same-input retry replays at the dispatch layer without invoking
+	// the surface again (the durable record covers the evicted/restart window).
+	const replay = await terminal({ mode: "terminal" }, "key-1");
+	expect(replay).toEqual({ id: "t", ok: true, result: "terminal" });
+	expect(calls).toHaveLength(2);
+});
+test("turn.abort terminal normalizes omitted scope before idempotency hashing", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	let calls = 0;
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: () => {
+			calls++;
+			return "terminal";
+		},
+	} as unknown as ControlSurface;
+	const terminal = (input: Record<string, unknown>, idempotencyKey: string) =>
+		dispatchControl(surface, abort, {
+			id: "t",
+			operation: abort.sdkId,
+			input,
+			idempotencyKey,
+		});
+
+	// The defaulted shape and the explicit `scope:"turn"` are the SAME input:
+	// the retry must replay (not idempotency_conflict), so it never re-runs the
+	// surface and stays eligible for the durable terminal-scope replay.
+	expect(await terminal({ mode: "terminal" }, "key-norm")).toEqual({ id: "t", ok: true, result: "terminal" });
+	expect(await terminal({ mode: "terminal", scope: "turn" }, "key-norm")).toEqual({
+		id: "t",
+		ok: true,
+		result: "terminal",
+	});
+	expect(calls).toBe(1);
+	// A genuinely different scope with the same key still conflicts.
+	const conflict = await terminal({ mode: "terminal", scope: "owned" }, "key-norm");
+	expect(conflict).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
+	expect(calls).toBe(1);
+	// A malformed input (extra field) does NOT normalize: with a FRESH key it
+	// is rejected downstream (invalid_input), never replayed against a valid
+	// input's key.
+	const malformed = await terminal({ mode: "terminal", force: true }, "key-malformed");
+	expect(malformed).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+});
+
+test("turn.abort terminal mode rejects missing/oversized key, invalid mode/scope, and unknown fields", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	let terminalCalls = 0;
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: () => {
+			terminalCalls++;
+			return "terminal";
+		},
+	} as unknown as ControlSurface;
+	const terminal = (input: Record<string, unknown>, idempotencyKey?: string) =>
+		dispatchControl(surface, abort, {
+			id: "t",
+			operation: abort.sdkId,
+			input,
+			idempotencyKey,
+		});
+	const rejection = async (input: Record<string, unknown>, idempotencyKey?: string) => {
+		const response = await terminal(input, idempotencyKey);
+		expect(response.ok).toBe(false);
+		expect((response.error as { code?: string }).code).toBe("invalid_input");
+	};
+
+	await rejection({ mode: "terminal" }); // keyless
+	await rejection({ mode: "terminal" }, ""); // empty key
+	await rejection({ mode: "terminal" }, "x".repeat(129)); // oversized
+	await rejection({ mode: "terminal", force: true }, "k-force");
+	await rejection({ mode: "unknown" }, "k-mode");
+	await rejection({ mode: "terminal", scope: "all" }, "k-scope");
+	await rejection({ mode: "terminal", foo: 1 }, "k-field");
+	expect(terminalCalls).toBe(0);
+});
+
+test("turn.abort terminal mode is rejected when the surface does not implement abortTerminal", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	const surface = { abort: () => "legacy" } as unknown as ControlSurface;
+	const response = await dispatchControl(surface, abort, {
+		id: "t",
+		operation: abort.sdkId,
+		input: { mode: "terminal" },
+		idempotencyKey: "key",
+	});
+	expect(response).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+});
+
+test("turn.abort legacy mode keeps dropping input and calling the argument-less abort", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	const calls: unknown[] = [];
+	const surface = {
+		abort: (...args: unknown[]) => {
+			calls.push(args);
+			return "legacy";
+		},
+	} as unknown as ControlSurface;
+	for (const input of [{}, { mode: "turn" }, { mode: "turn", scope: "owned", extra: 1 }]) {
+		const response = await dispatchControl(surface, abort, {
+			id: "t",
+			operation: abort.sdkId,
+			input,
+		});
+		expect(response).toEqual({ id: "t", ok: true, result: "legacy" });
+	}
+	expect(calls).toEqual([[], [], []]);
+});
+
+test("turn.abort terminal conflict surfaces as a top-level control error", async () => {
+	const abort = OPERATIONS.find(row => row.sdkId === "turn.abort")!;
+	// A surface that throws a typed idempotency_conflict (the durable
+	// terminal-scope replay conflict path after in-memory eviction) must
+	// produce a TOP-LEVEL ok:false response — not a nested result inside a
+	// successful control_response.
+	const surface = {
+		abort: () => "legacy",
+		abortTerminal: () => {
+			throw new TypedControlError("idempotency_conflict", "Idempotency key was reused with different input.");
+		},
+	} as unknown as ControlSurface;
+	const response = await dispatchControl(surface, abort, {
+		id: "t-conflict",
+		operation: abort.sdkId,
+		input: { mode: "terminal", scope: "turn" },
+		idempotencyKey: "k",
+	});
+	expect(response.ok).toBe(false);
+	expect(response.error).toMatchObject({ code: "idempotency_conflict" });
 });

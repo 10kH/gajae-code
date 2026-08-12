@@ -1,6 +1,7 @@
 import type { AgentTelemetryConfig, AgentTool } from "@gajae-code/agent-core";
 import type { Model, ServiceTier, ToolChoice } from "@gajae-code/ai/core";
 import { $env, logger } from "@gajae-code/utils";
+import type { AsyncJobManager } from "../async";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
 import type { Skill } from "../extensibility/skills";
@@ -217,6 +218,8 @@ export interface ToolSession {
 	hasForegroundBashBackgroundRequestHandler?: () => boolean;
 	/** Request that the active managed foreground bash call fold into a background job, if supported. */
 	requestForegroundBashBackground?: () => boolean;
+	/** Get the session-owned or inherited async job manager. */
+	getAsyncJobManager?: () => AsyncJobManager | undefined;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/** Get credential-selection session identity. */
@@ -279,6 +282,11 @@ export interface ToolSession {
 	agentOutputManager?: AgentOutputManager;
 	/** Settings instance for passing to subagents */
 	settings: Settings;
+	/**
+	 * The session's REQUESTED effective agent directory, independent of the
+	 * global Settings singleton (which can be reused across sessions).
+	 */
+	getSessionAgentDir?: () => string;
 	/** Live service-tier intent of the parent session, inherited by `inherit` subagents. */
 	serviceTier?: ServiceTier;
 	/** Whether the effective subagent tier grants fast mode for a resolved provider. */
