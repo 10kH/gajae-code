@@ -1,5 +1,5 @@
 import { HEARTBEAT_TTL_MS } from "./bus/daemon-paths";
-import type { SdkClientOptions } from "./client";
+import { DEFAULT_SDK_REQUEST_TIMEOUT_MS, type SdkClientOptions } from "./client";
 
 type SessionReconnectOptions = Required<
 	Pick<SdkClientOptions, "reconnectAttempts" | "reconnectBackoffMs" | "reconnectMaxBackoffMs">
@@ -72,3 +72,16 @@ export const ACP_SESSION_RECONNECT: SessionReconnectOptions = {
  * bounds only the terminal that follows an acknowledged abort.
  */
 export const SESSION_REQUEST_TIMEOUT_MS = 2 * HEARTBEAT_TTL_MS;
+
+/**
+ * Reply budget for `turn.abort`, which cannot use {@link SESSION_REQUEST_TIMEOUT_MS}.
+ *
+ * A cancel is the user asking for the turn to stop now, and the caller waits for
+ * its acknowledgement before anything else can bound the turn: ACP arms its own
+ * settlement grace only after `aborted: true` comes back, so an abort that waits
+ * the full session budget delays cancellation by that budget and, if it finally
+ * rejects, leaves the prompt for the inactivity watchdog instead of the cancel
+ * path. Aborting therefore keeps the ordinary one-shot request deadline: the
+ * abort is not the query whose cold first answer needed a wider budget (#4258).
+ */
+export const SESSION_ABORT_TIMEOUT_MS = DEFAULT_SDK_REQUEST_TIMEOUT_MS;
