@@ -5,6 +5,7 @@ import {
 	type AssistantMessageEventStream,
 	type AuthCredentialSelector,
 	applyFinalCodexGpt56ContextCap,
+	applyGeneratedModelPolicies,
 	type CacheRetention,
 	CODEX_GPT_5_6_CONTEXT_CAP,
 	type Context,
@@ -1634,7 +1635,9 @@ export class ModelRegistry {
 			const withTransport = providerOverride
 				? models.map(model => this.#applyProviderTransportOverride(model, providerOverride))
 				: models;
-			cachedModels.push(...this.#applyProviderModelOverrides(descriptor.providerId, withTransport));
+			const normalized = this.#applyProviderModelOverrides(descriptor.providerId, withTransport);
+			applyGeneratedModelPolicies(normalized);
+			cachedModels.push(...normalized);
 		}
 		return cachedModels;
 	}
