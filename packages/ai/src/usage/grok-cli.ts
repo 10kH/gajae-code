@@ -13,8 +13,15 @@ interface BillingUsage {
 	used: number;
 	billingPeriodEnd: string;
 }
+
+interface WeeklyBillingUsage {
+	creditUsagePercent: number;
+	billingPeriodEnd: string;
+}
+
 const DEFAULT_GROK_BUILD_BASE_URL = "https://cli-chat-proxy.grok.com/v1";
 const ALLOWED_GROK_BUILD_HOSTS = new Set(["cli-chat-proxy.grok.com"]);
+const GROK_WEEKLY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return !!value && typeof value === "object";
@@ -44,6 +51,23 @@ export function parseGrokCliBillingUsage(payload: unknown): BillingUsage {
 		throw new Error("invalid Grok CLI billing payload");
 	}
 	return { monthlyLimit, used, billingPeriodEnd };
+}
+
+export function parseGrokCliWeeklyBillingUsage(payload: unknown): WeeklyBillingUsage | undefined {
+	if (!isRecord(payload) || !isRecord(payload.config)) return undefined;
+	const currentPeriod = isRecord(payload.config.currentPeriod) ? payload.config.currentPeriod : undefined;
+	if (currentPeriod?.type !== "USAGE_PERIOD_TYPE_WEEKLY") return undefined;
+
+	const billingPeriodEnd = payload.config.billingPeriodEnd;
+	if (typeof billingPeriodEnd !== "string" || !Number.isFinite(new Date(billingPeriodEnd).getTime())) {
+		return undefined;
+	}
+
+	const rawCreditUsagePercent = payload.config.creditUsagePercent;
+	const creditUsagePercent = rawCreditUsagePercent === undefined ? 0 : finiteNumber(rawCreditUsagePercent);
+	if (creditUsagePercent === undefined) return undefined;
+
+	return { creditUsagePercent, billingPeriodEnd };
 }
 
 function isAllowedGrokCredentialHost(baseUrl: string): boolean {
@@ -108,6 +132,33 @@ function buildMonthlyUsageLimit(usage: BillingUsage, nowMs: number): UsageLimit 
 	};
 }
 
+function buildWeeklyUsageLimit(usage: WeeklyBillingUsage): UsageLimit {
+	const percent = Math.min(Math.max(usage.creditUsagePercent, 0), 100);
+	const usedFraction = percent / 100;
+	const resetsAt = new Date(usage.billingPeriodEnd).getTime();
+	return {
+		id: "grok-build:weekly",
+		label: "SuperGrok weekly credits",
+		scope: { provider: "grok-build", shared: true, windowId: "weekly" },
+		window: {
+			id: "weekly",
+			label: "Weekly",
+			durationMs: GROK_WEEKLY_WINDOW_MS,
+			resetsAt,
+		},
+		amount: {
+			unit: "percent",
+			used: percent,
+			limit: 100,
+			remaining: 100 - percent,
+			usedFraction,
+			remainingFraction: 1 - usedFraction,
+		},
+		status: percent >= 95 ? "exhausted" : percent >= 80 ? "warning" : "ok",
+		notes: [`${percent}% used`],
+	};
+}
+
 export const grokCliUsageProvider: UsageProvider = {
 	id: "grok-build",
 
@@ -151,10 +202,42 @@ export const grokCliUsageProvider: UsageProvider = {
 		}
 
 		const nowMs = Date.now();
+		let weekly: WeeklyBillingUsage | undefined;
+		try {
+			const weeklyResponse = await ctx.fetch(`${billingBaseUrl}/billing?format=credits`, {
+				headers: {
+					Authorization: `Bearer ${accessToken}`,
+					"x-xai-token-auth": "xai-grok-cli",
+					accept: "application/json",
+				},
+				signal: params.signal,
+			});
+			if (weeklyResponse.ok) {
+				weekly = parseGrokCliWeeklyBillingUsage((await weeklyResponse.json()) as unknown);
+			}
+		} catch (error) {
+			if (params.signal?.aborted && billing.monthlyLimit <= 0) throw error;
+			ctx.logger?.debug("Grok Build weekly billing request failed", { error: String(error) });
+		}
+
+		const limits: UsageLimit[] = [];
+		if (billing.monthlyLimit > 0) {
+			limits.push(buildMonthlyUsageLimit(billing, nowMs));
+		}
+		if (weekly) {
+			limits.push(buildWeeklyUsageLimit(weekly));
+		}
+		if (limits.length === 0) {
+			ctx.logger?.warn("Grok Build billing response contained no usable quota", {
+				provider: params.provider,
+			});
+			return null;
+		}
+
 		return {
 			provider: "grok-build",
 			fetchedAt: nowMs,
-			limits: [buildMonthlyUsageLimit(billing, nowMs)],
+			limits,
 			metadata: {
 				email: params.credential.email,
 				accountId: params.credential.accountId,
@@ -167,6 +250,8 @@ export const grokCliUsageProvider: UsageProvider = {
 
 export const grokCliRankingStrategy: CredentialRankingStrategy = {
 	findWindowLimits(report) {
+		const weekly = report.limits.find(limit => limit.id === "grok-build:weekly");
+		if (weekly) return { secondary: weekly };
 		const monthly = report.limits.find(limit => limit.id === "grok-build:7d");
 		return { secondary: monthly };
 	},

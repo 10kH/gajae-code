@@ -728,7 +728,10 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 		"grok-build",
 		{
 			findWindowLimits(report) {
-				return { secondary: report.limits.find(limit => limit.id === "grok-build:7d") };
+				const weekly = report.limits.find(limit => limit.id === "grok-build:weekly");
+				return {
+					secondary: weekly ?? report.limits.find(limit => limit.id === "grok-build:7d"),
+				};
 			},
 			windowDefaults: { primaryMs: 5 * 60 * 60 * 1000, secondaryMs: 30 * 24 * 60 * 60 * 1000 },
 		} satisfies CredentialRankingStrategy,

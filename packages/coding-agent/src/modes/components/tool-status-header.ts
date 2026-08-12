@@ -583,6 +583,8 @@ export class StatusLineComponent implements Component {
 					pushWindow(`${providerId ?? "provider"}:5h`, "5h", fraction, resetsAt, "m");
 				} else if (windowId === "7d" && !tier) {
 					pushWindow(`${providerId ?? "provider"}:7d`, "7d", fraction, resetsAt, "h");
+				} else if (providerId === "grok-build" && windowId === "weekly" && !tier) {
+					pushWindow("grok-build:weekly", "weekly", fraction, resetsAt, "h");
 				}
 			}
 		}

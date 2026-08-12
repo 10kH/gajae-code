@@ -1588,20 +1588,20 @@ function formatWindowSuffix(label: string, windowLabel: string, uiTheme: typeof 
 	return uiTheme.fg("dim", `(${windowLabel})`);
 }
 
-function formatAccountLabel(limit: UsageLimit, report: UsageReport, index: number): string {
+function formatAccountLabel(limit: UsageLimit, report: UsageReport, reportIndex: number): string {
 	const email = (report.metadata?.email as string | undefined) ?? limit.scope.accountId;
 	if (email) return email;
 	const accountId = (report.metadata?.accountId as string | undefined) ?? limit.scope.accountId;
 	if (accountId) return accountId;
-	return `account ${index + 1}`;
+	return `account ${reportIndex + 1}`;
 }
 
-function formatUnlimitedReportLabel(report: UsageReport, index: number): string {
+function formatUnlimitedReportLabel(report: UsageReport, reportIndex: number): string {
 	const email = report.metadata?.email as string | undefined;
 	if (email) return email;
 	const accountId = report.metadata?.accountId as string | undefined;
 	if (accountId) return accountId;
-	return `account ${index + 1}`;
+	return `account ${reportIndex + 1}`;
 }
 
 function formatResetShort(limit: UsageLimit, nowMs: number): string | undefined {
@@ -1614,6 +1614,7 @@ function formatResetShort(limit: UsageLimit, nowMs: number): string | undefined 
 function formatAccountHeaderRow(
 	limits: UsageLimit[],
 	reports: UsageReport[],
+	reportIndexes: ReadonlyMap<UsageReport, number>,
 	nowMs: number,
 	columnWidth: number,
 	uiTheme: typeof theme,
@@ -1621,7 +1622,7 @@ function formatAccountHeaderRow(
 	const parts = limits.map((limit, index) => {
 		const reset = formatResetShort(limit, nowMs);
 		return {
-			label: formatAccountLabel(limit, reports[index], index),
+			label: formatAccountLabel(limit, reports[index], reportIndexes.get(reports[index]) ?? index),
 			suffix: reset ? `(${reset})` : "",
 		};
 	});
@@ -1780,6 +1781,7 @@ export function renderUsageReports(
 	for (const { provider, providerReports } of providerEntries) {
 		lines.push("");
 		const providerName = formatProviderName(provider);
+		const reportIndexes = new Map(providerReports.map((report, index) => [report, index]));
 
 		const limitGroups = new Map<
 			string,
@@ -1811,10 +1813,13 @@ export function renderUsageReports(
 		const rankedAccounts = providerReports
 			.map(report => {
 				const [firstLimit] = report.limits;
+				const reportIndex = reportIndexes.get(report) ?? 0;
 				return {
 					report,
 					total: report.limits.reduce((sum, limit) => sum + (resolveFraction(limit) ?? 0), 0),
-					label: firstLimit ? formatAccountLabel(firstLimit, report, 0) : formatUnlimitedReportLabel(report, 0),
+					label: firstLimit
+						? formatAccountLabel(firstLimit, report, reportIndex)
+						: formatUnlimitedReportLabel(report, reportIndex),
 				};
 			})
 			.sort((a, b) => (a.total !== b.total ? b.total - a.total : a.label.localeCompare(b.label)));
@@ -1850,7 +1855,14 @@ export function renderUsageReports(
 
 			const windowSuffix = formatWindowSuffix(group.label, group.windowLabel, uiTheme);
 			lines.push(`${statusIcon} ${uiTheme.bold(group.label)} ${windowSuffix}`.trim());
-			const accountLabels = formatAccountHeaderRow(sortedLimits, sortedReports, nowMs, sectionColumnWidth, uiTheme);
+			const accountLabels = formatAccountHeaderRow(
+				sortedLimits,
+				sortedReports,
+				reportIndexes,
+				nowMs,
+				sectionColumnWidth,
+				uiTheme,
+			);
 			lines.push(`  ${accountLabels.join(" ")}`.trimEnd());
 			const bars = sortedLimits.map(limit =>
 				padColumn(renderUsageBar(limit, uiTheme, sectionColumnWidth), sectionColumnWidth),
@@ -1869,7 +1881,7 @@ export function renderUsageReports(
 		// Render accounts with no rate limits (e.g. business/enterprise plans).
 		const unlimitedReports = providerReports.filter(report => report.limits.length === 0);
 		for (const report of unlimitedReports) {
-			const label = formatUnlimitedReportLabel(report, 0);
+			const label = formatUnlimitedReportLabel(report, reportIndexes.get(report) ?? 0);
 			const tier = report.metadata?.planType as string | undefined;
 			const tierSuffix = tier ? ` ${uiTheme.fg("dim", `(${tier})`)}` : "";
 			lines.push(

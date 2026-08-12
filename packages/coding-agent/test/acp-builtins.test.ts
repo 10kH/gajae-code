@@ -350,6 +350,38 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("resets in");
 	});
 
+	it("keeps one fallback account identity across multiple quota windows in one report", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.session.fetchUsageReports = async () => [
+			{
+				provider: "grok-build",
+				fetchedAt: Date.now(),
+				limits: [
+					{
+						id: "grok-build:7d",
+						label: "SuperGrok monthly credits",
+						scope: { provider: "grok-build", windowId: "7d" },
+						window: { id: "7d", label: "Monthly credits", resetsAt: Date.now() + 20 * 86400_000 },
+						amount: { used: 25, usedFraction: 0.25, unit: "percent" },
+					},
+					{
+						id: "grok-build:weekly",
+						label: "SuperGrok weekly credits",
+						scope: { provider: "grok-build", windowId: "weekly" },
+						window: { id: "weekly", label: "Weekly", resetsAt: Date.now() + 6 * 86400_000 },
+						amount: { used: 6, usedFraction: 0.06, unit: "percent" },
+					},
+				],
+				metadata: {},
+			},
+		];
+
+		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
+
+		expect(output[0]?.match(/account 1:/g)).toHaveLength(2);
+		expect(output[0]).not.toContain("account 2:");
+	});
+
 	it("returns false for unknown commands", async () => {
 		const { runtime } = createRuntime();
 

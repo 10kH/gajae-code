@@ -21,12 +21,12 @@ function formatUsageAmount(limit: UsageLimit): string {
 	return `${usedText}${remainingText}`;
 }
 
-function formatUsageReportAccount(report: UsageReport, limit: UsageLimit, index: number): string {
+function formatUsageReportAccount(report: UsageReport, limit: UsageLimit, reportIndex: number): string {
 	const email = report.metadata?.email;
 	if (typeof email === "string" && email) return email;
 	const accountId = report.metadata?.accountId ?? limit.scope.accountId;
 	if (typeof accountId === "string" && accountId) return accountId;
-	return `account ${index + 1}`;
+	return `account ${reportIndex + 1}`;
 }
 
 function renderUsageReports(reports: UsageReport[], nowMs: number): string {
@@ -43,9 +43,11 @@ function renderUsageReports(reports: UsageReport[], nowMs: number): string {
 		left.localeCompare(right),
 	)) {
 		lines.push("", formatProviderName(provider));
-		for (const report of providerReports) {
+		for (let reportIndex = 0; reportIndex < providerReports.length; reportIndex++) {
+			const report = providerReports[reportIndex]!;
 			if (report.limits.length === 0) {
-				const email = typeof report.metadata?.email === "string" ? report.metadata.email : "account";
+				const email =
+					typeof report.metadata?.email === "string" ? report.metadata.email : `account ${reportIndex + 1}`;
 				lines.push(`- ${email}: no limits reported`);
 				continue;
 			}
@@ -54,7 +56,7 @@ function renderUsageReports(reports: UsageReport[], nowMs: number): string {
 				const window = limit.window?.label ?? limit.scope.windowId;
 				const tier = limit.scope.tier ? ` (${limit.scope.tier})` : "";
 				lines.push(`- ${limit.label}${tier}${window ? ` — ${window}` : ""}`);
-				lines.push(`  ${formatUsageReportAccount(report, limit, index)}: ${formatUsageAmount(limit)}`);
+				lines.push(`  ${formatUsageReportAccount(report, limit, reportIndex)}: ${formatUsageAmount(limit)}`);
 				lines.push(`  ${renderAsciiBar(limit.amount.usedFraction)}`);
 				if (limit.window?.resetsAt) lines.push(`  resets in ${formatDuration(limit.window.resetsAt - nowMs)}`);
 				if (limit.notes && limit.notes.length > 0) lines.push(`  ${limit.notes.join(" • ")}`);
