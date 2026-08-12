@@ -3,7 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
-import { installGjcBundle, loadConstrainedPluginHooks } from "../src/extensibility/gjc-plugins";
+import {
+	ConstrainedPluginHookDescriptor,
+	installGjcBundle,
+	loadConstrainedPluginHooks,
+} from "../src/extensibility/gjc-plugins";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
 const sixSurface = path.join(fixturesRoot, "valid-six-surface-bundle");
@@ -88,5 +92,26 @@ describe("constrained plugin hooks", () => {
 		const res = await loadConstrainedPluginHooks({ cwd });
 		expect(res.hooks).toHaveLength(0);
 		expect(res.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
+	});
+
+	test("rejects malformed declared metadata before importing plugin code", async () => {
+		const root = await mkCwd();
+		const hookPath = path.join(root, "malformed.ts");
+		const markerPath = path.join(root, "imported");
+		await fs.writeFile(
+			hookPath,
+			`await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default () => undefined;\n`,
+		);
+		const descriptor = new ConstrainedPluginHookDescriptor({
+			plugin: "malformed",
+			scope: "project",
+			event: "tool_call",
+			target: "read",
+			phase: "during" as never,
+			relativePath: hookPath,
+		});
+
+		await expect(descriptor.load()).rejects.toThrow("invalid_plugin_phase");
+		expect(await Bun.file(markerPath).exists()).toBe(false);
 	});
 });
