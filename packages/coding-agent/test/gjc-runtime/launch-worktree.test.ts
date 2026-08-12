@@ -34,6 +34,18 @@ function testSlug(value: string): string {
 	return `${prefix}-${digest}`;
 }
 
+/** Runs `body` with the bucket override applied, restoring the caller's environment. */
+function withWorktreeBucketDir<T>(value: string, body: () => T): T {
+	const previous = process.env.GJC_WORKTREE_DIR;
+	process.env.GJC_WORKTREE_DIR = value;
+	try {
+		return body();
+	} finally {
+		if (previous === undefined) delete process.env.GJC_WORKTREE_DIR;
+		else process.env.GJC_WORKTREE_DIR = previous;
+	}
+}
+
 async function createRepo(prefix: string): Promise<string> {
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
 	cleanupRoots.push(root);
@@ -379,6 +391,56 @@ describe("default launch worktrees", () => {
 		);
 		expect(unicodePlan.enabled && asciiPlan.enabled && unicodePlan.worktreePath).not.toBe(
 			asciiPlan.enabled && asciiPlan.worktreePath,
+		);
+	});
+
+	it("adopts an existing sibling bucket named by the GJC_WORKTREE_DIR template", async () => {
+		const repo = await createRepo("gjc-launch-bucket-env-");
+		const bucket = path.join(path.dirname(repo), `${path.basename(repo)}.worktrees`);
+		cleanupPaths.push(bucket);
+
+		const ensured = withWorktreeBucketDir("{repo}.worktrees", () =>
+			ensureLaunchWorktree(planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" })),
+		);
+
+		expect(ensured.enabled && (await fs.realpath(ensured.worktreePath))).toBe(
+			await fs.realpath(path.join(bucket, testSlug("feature/demo"))),
+		);
+		expect(run("git", ["branch", "--show-current"], path.join(bucket, testSlug("feature/demo")))).toBe(
+			"feature/demo",
+		);
+		expect(fsSync.existsSync(path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`))).toBe(
+			false,
+		);
+	});
+
+	it("keeps the template repo-scoped so two repos never share one worktree path", async () => {
+		const first = await createRepo("gjc-launch-bucket-shared-a-");
+		const second = await createRepo("gjc-launch-bucket-shared-b-");
+		const shared = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-launch-bucket-shared-root-"));
+		cleanupPaths.push(shared);
+
+		const plans = withWorktreeBucketDir(path.join(shared, "{repo}"), () => [
+			planLaunchWorktree(first, { enabled: true, detached: false, name: "feature/demo" }),
+			planLaunchWorktree(second, { enabled: true, detached: false, name: "feature/demo" }),
+		]);
+
+		expect(plans[0].enabled && path.dirname(plans[0].worktreePath)).toBe(path.join(shared, path.basename(first)));
+		expect(plans[1].enabled && path.dirname(plans[1].worktreePath)).toBe(path.join(shared, path.basename(second)));
+	});
+
+	it("expands a home-relative override and falls back to the default bucket when unset", async () => {
+		const repo = await createRepo("gjc-launch-bucket-home-");
+		const homePlan = withWorktreeBucketDir("~/gjc-worktrees", () =>
+			planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" }),
+		);
+		const blankPlan = withWorktreeBucketDir("   ", () =>
+			planLaunchWorktree(repo, { enabled: true, detached: false, name: "feature/demo" }),
+		);
+
+		expect(homePlan.enabled && path.dirname(homePlan.worktreePath)).toBe(path.join(os.homedir(), "gjc-worktrees"));
+		expect(blankPlan.enabled && path.dirname(blankPlan.worktreePath)).toBe(
+			path.join(path.dirname(repo), `${path.basename(repo)}.gajae-code-worktrees`),
 		);
 	});
 

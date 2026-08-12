@@ -1,5 +1,6 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { shortenPath } from "../tools/render-utils";
 
@@ -59,6 +60,42 @@ function sanitizePathToken(value: string): string {
 	const prefix = readable || "default";
 	const digest = crypto.createHash("sha256").update(value).digest("hex").slice(0, 8);
 	return `${prefix}-${digest}`;
+}
+
+/**
+ * Environment override for the directory that holds a repository's launch worktrees.
+ *
+ * The bucket is otherwise derived entirely from the repository path, so a machine that
+ * already keeps worktrees somewhere else — a dedicated volume, or a pre-existing
+ * `<repo>.worktrees` convention — has no way to say so and accumulates a second bucket
+ * beside the first.
+ */
+const WORKTREE_BUCKET_ENV = "GJC_WORKTREE_DIR";
+/**
+ * Expands to the repository directory name.
+ *
+ * A single exported value therefore stays repo-scoped across every checkout, which is
+ * what keeps two repositories that share a branch name from resolving to one worktree.
+ */
+const REPO_NAME_PLACEHOLDER = "{repo}";
+const DEFAULT_WORKTREE_BUCKET = `${REPO_NAME_PLACEHOLDER}.gajae-code-worktrees`;
+
+function expandHomePrefix(value: string): string {
+	if (value === "~") return os.homedir();
+	return value.startsWith(`~${path.sep}`) || value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value;
+}
+
+/**
+ * Directory that holds this repository's launch worktrees.
+ *
+ * A relative override resolves against the repository's PARENT directory, matching the
+ * default's own shape, so `{repo}.worktrees` adopts an existing sibling bucket and
+ * `.worktrees` nests one inside the repository. An absolute override is used verbatim.
+ */
+function resolveWorktreeBucket(repoRoot: string): string {
+	const configured = process.env[WORKTREE_BUCKET_ENV]?.trim();
+	const template = expandHomePrefix(configured || DEFAULT_WORKTREE_BUCKET);
+	return path.resolve(path.dirname(repoRoot), template.replaceAll(REPO_NAME_PLACEHOLDER, path.basename(repoRoot)));
 }
 
 function resolveSourceBranchSlug(repoRoot: string, baseRef: string): string {
@@ -322,9 +359,8 @@ export function planLaunchWorktree(
 	const baseRef = runGit(repoRoot, ["rev-parse", "HEAD"]);
 	const branchName = mode.detached ? null : mode.name;
 	if (branchName) validateBranchName(repoRoot, branchName);
-	const bucket = `${path.basename(repoRoot)}.gajae-code-worktrees`;
 	const worktreeSlug = mode.detached ? resolveSourceBranchSlug(repoRoot, baseRef) : sanitizePathToken(mode.name);
-	const worktreePath = path.join(path.dirname(repoRoot), bucket, worktreeSlug);
+	const worktreePath = path.join(resolveWorktreeBucket(repoRoot), worktreeSlug);
 	return { enabled: true, repoRoot, worktreePath, detached: mode.detached, baseRef, branchName };
 }
 
