@@ -11,11 +11,25 @@ import { HookSourceConvention } from "../../hooks/events";
 import { type NormalizedHook, normalizeDirectoryHook } from "../../hooks/normalize";
 import type { HookMessage } from "../../session/messages";
 import type { SessionManager } from "../../session/session-manager";
-import type { ExtensionAPI, ExtensionFactory } from "../extensions/types";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ExtensionFactory,
+	MessageRenderer,
+} from "../extensions/types";
 import * as typebox from "../typebox";
 import { resolvePath } from "../utils";
 import { execCommand } from "./runner";
-import type { ExecOptions, HookAPI, HookFactory, HookMessageRenderer, RegisteredCommand } from "./types";
+import type {
+	ExecOptions,
+	HookAPI,
+	HookCommandContext,
+	HookContext,
+	HookFactory,
+	HookMessageRenderer,
+	RegisteredCommand,
+} from "./types";
 
 /**
  * Generic handler function type.
@@ -300,6 +314,41 @@ export async function discoverAndLoadHooks(configuredPaths: string[], cwd: strin
 	return { hooks: loaded.hooks, errors: [...normalizationErrors, ...loaded.errors] };
 }
 
+function toHookContext(context: ExtensionContext): HookContext {
+	return {
+		ui: {
+			select: (title, options) => context.ui.select(title, options),
+			confirm: (title, message) => context.ui.confirm(title, message),
+			input: (title, placeholder) => context.ui.input(title, placeholder),
+			notify: (message, type) => context.ui.notify(message, type),
+			setStatus: (key, text) => context.ui.setStatus(key, text),
+			custom: factory => context.ui.custom((tui, theme, _keybindings, done) => factory(tui, theme, done)),
+			setEditorText: text => context.ui.setEditorText(text),
+			getEditorText: () => context.ui.getEditorText(),
+			editor: (title, prefill, options) => context.ui.editor(title, prefill, options),
+			theme: context.ui.theme,
+		},
+		hasUI: context.hasUI,
+		cwd: context.cwd,
+		sessionManager: context.sessionManager,
+		modelRegistry: context.modelRegistry,
+		model: context.model,
+		isIdle: () => context.isIdle(),
+		abort: () => context.abort(),
+		hasQueuedMessages: () => context.hasQueuedMessages(),
+	};
+}
+
+function toHookCommandContext(context: ExtensionCommandContext): HookCommandContext {
+	return {
+		...toHookContext(context),
+		waitForIdle: () => context.waitForIdle(),
+		newSession: options => context.newSession(options),
+		branch: entryId => context.branch(entryId),
+		navigateTree: (targetId, options) => context.navigateTree(targetId, options),
+	};
+}
+
 function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 	return (api: ExtensionAPI) => {
 		hook.setSendMessageHandler((message, options) => api.sendMessage(message, options));
@@ -308,28 +357,31 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 		for (const [event, handlers] of hook.handlers) {
 			for (const handler of handlers) {
 				const normalized = hook.normalization;
-				const adapted: HandlerFn =
-					normalized && event === normalized.runtimeEvent && normalized.toolName !== "*"
-						? async (...args: unknown[]) => {
-								const payload = args[0] as { toolName?: string };
-								if (payload.toolName !== normalized.toolName) return undefined;
-								return await handler(...args);
-							}
-						: handler;
+				const adapted: HandlerFn = async (...args: unknown[]) => {
+					const payload = args[0] as { toolName?: string };
+					if (
+						normalized &&
+						event === normalized.runtimeEvent &&
+						normalized.toolName !== "*" &&
+						payload.toolName !== normalized.toolName
+					) {
+						return undefined;
+					}
+					return await handler(payload, toHookContext(args[1] as ExtensionContext));
+				};
 				(api.on as (event: string, handler: HandlerFn) => void)(event, adapted);
 			}
 		}
 
 		for (const [customType, renderer] of hook.messageRenderers) {
-			api.registerMessageRenderer(
-				customType,
-				renderer as unknown as Parameters<ExtensionAPI["registerMessageRenderer"]>[1],
-			);
+			const adaptedRenderer: MessageRenderer = (message, options, theme) =>
+				renderer({ ...message, role: "hookMessage" }, options, theme);
+			api.registerMessageRenderer(customType, adaptedRenderer);
 		}
 		for (const command of hook.commands.values()) {
 			api.registerCommand(command.name, {
 				description: command.description,
-				handler: command.handler as unknown as Parameters<ExtensionAPI["registerCommand"]>[1]["handler"],
+				handler: (args, context) => command.handler(args, toHookCommandContext(context)),
 			});
 		}
 	};

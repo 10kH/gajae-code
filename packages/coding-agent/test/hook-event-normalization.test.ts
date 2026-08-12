@@ -364,7 +364,7 @@ describe("production discovery integration", () => {
 		await fs.mkdir(hooksDir, { recursive: true });
 		await Bun.write(
 			path.join(hooksDir, "pre-read.ts"),
-			`export default (api) => api.on("tool_call", async () => { await Bun.write(${JSON.stringify(executionMarker)}, "read"); });\n`,
+			`export default (api) => api.on("tool_call", async (_event, ctx) => { await Bun.write(${JSON.stringify(executionMarker)}, ctx.hasQueuedMessages() ? "queued" : "read"); });\n`,
 		);
 		await Bun.write(
 			path.join(hooksDir, "unprefixed.ts"),
