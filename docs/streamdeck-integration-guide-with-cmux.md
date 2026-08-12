@@ -58,7 +58,7 @@ The control surface should:
 4. Resolve the focused cmux surface with `cmux identify --no-caller`; do not infer focus only from tree decorations.
 5. Send GJC-only controls only when the focused surface title starts with `GJC:`.
 6. Use `action_needed.id` as the only authority for a generic SDK question reply.
-7. Do not answer stale, resolved, hidden, non-focused, free-text, or unsupported multi-select questions from fixed answer keys.
+7. Do not answer stale, resolved, hidden, non-focused, free-text, or unsupported controlled questions from fixed answer keys.
 8. Send `Shift+Tab` as one atomic key event. Do not emulate it with separately delivered `Esc`-prefixed text.
 9. Do not create duplicate browser tabs when an existing Chrome or Safari tab matches.
 10. Reuse a focused non-GJC terminal when the operator explicitly wants an in-place worktree launch.
@@ -361,15 +361,26 @@ Reply with the exact active presentation ID:
 
 Return to the ordinary profile controls only when `action_resolved` arrives for the **same presentation ID currently displayed**; an `action_resolved` for a different session can arrive while another question's pad is still active, so match the frame `id` against the displayed presentation before clearing it. If `reply_rejected` arrives, show an error and do not guess from question text, option text, workflow IDs, or earlier presentations.
 
-Only display the fixed answer pad when:
+For checkbox questions, negotiate `ask_controls_v1` in the client `hello` / replay request and require both `selectedOptionIndices` and an enabled or disabled typed `navigation_forward` control. Support up to four checkbox options because the fifth top-row key is reserved for `Done` or `Next`:
 
-- the question belongs to the focused GJC session;
-- the session-to-surface mapping is exact;
-- the action is still active;
-- the question has one to five scalar options;
-- the action has no negotiated `controls` (multi-select and other controlled asks are not safe for a fixed numeric reply).
+```text
+☐ OPTION 1 | ☑ OPTION 2 | ☐ OPTION 3 | NO OPTION | DONE
+```
 
-Leave free-text, multi-select, controlled, and larger option sets to the native GJC UI.
+Pressing an option sends its numeric index against the exact current `action_needed.id`. GJC resolves that presentation and reissues a fresh one with updated `selectedOptionIndices`; replace the displayed ID and selection state rather than reusing the old ID. Pressing the fifth key sends the typed control:
+
+```json
+{ "type": "reply", "id": "<current action id>", "answer": { "controlId": "navigation_forward" }, "token": "<session token>" }
+```
+
+Do not infer controls from labels such as `Done` or `Next`; only use the negotiated control object and honor its `enabled` field.
+
+Only display the fixed answer pad when the question belongs to the focused GJC session, the PID/TTY mapping is exact, and the action is still active. Supported shapes are:
+
+- one to five scalar options with no negotiated controls;
+- one to four checkbox options with `selectedOptionIndices` and a typed `navigation_forward` control.
+
+Leave free-text, checkbox questions with five or more options, malformed/missing controls, and other controlled asks to the native GJC UI.
 
 ## Mascot artwork
 
@@ -487,7 +498,7 @@ Check:
 - the token-authenticated WebSocket connected;
 - the focused surface maps to the endpoint TTY;
 - the focused session was retained even when the session inventory is capped;
-- the question has no more than five scalar options.
+- the question has no more than five scalar options, or no more than four checkbox options plus a negotiated `navigation_forward` control.
 
 ### A browser shortcut creates duplicates
 
