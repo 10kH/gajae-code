@@ -515,14 +515,57 @@ describe("update-cli managed notification recovery", () => {
 
 	it("executes recovery through the verified runtime with an argv array and propagates nonzero exits", async () => {
 		const argv: Array<readonly string[]> = [];
-		await runPostUpdateRecoveryForTest("/verified path/gjc;not-a-shell", async args => {
-			argv.push(args);
-			return 0;
-		});
-		expect(argv).toEqual([["/verified path/gjc;not-a-shell", "update", "update-recovery"]]);
-		await expect(runPostUpdateRecoveryForTest("/verified/gjc", async () => 23)).rejects.toThrow(
-			"the verified installed runtime exited 23",
+		await runPostUpdateRecoveryForTest(
+			"/verified path/gjc;not-a-shell",
+			async args => {
+				argv.push(args);
+				return 0;
+			},
+			async () => true,
 		);
+		expect(argv).toEqual([["/verified path/gjc;not-a-shell", "update", "update-recovery"]]);
+		await expect(
+			runPostUpdateRecoveryForTest(
+				"/verified/gjc",
+				async () => 23,
+				async () => true,
+			),
+		).rejects.toThrow("the verified installed runtime exited 23");
+	});
+
+	it("uses the bounded legacy handoff only when the verified target lacks update-recovery", async () => {
+		const argv: string[][] = [];
+		await runPostUpdateRecoveryForTest(
+			"/older stable/gjc",
+			async args => {
+				argv.push(args);
+				return 0;
+			},
+			async () => false,
+		);
+		expect(argv).toEqual([
+			["/older stable/gjc", "daemon", "stop", "--force"],
+			["/older stable/gjc", "daemon", "reload"],
+			["/older stable/gjc", "notify", "recovery"],
+		]);
+	});
+
+	it("fails fast when a legacy recovery stage fails", async () => {
+		const argv: string[][] = [];
+		await expect(
+			runPostUpdateRecoveryForTest(
+				"/older/gjc",
+				async args => {
+					argv.push(args);
+					return args[2] === "reload" ? 17 : 0;
+				},
+				async () => false,
+			),
+		).rejects.toThrow("legacy post-update daemon reload exited 17");
+		expect(argv).toEqual([
+			["/older/gjc", "daemon", "stop", "--force"],
+			["/older/gjc", "daemon", "reload"],
+		]);
 	});
 
 	it("uses canonical global provider completeness, including globally disabled configured credentials", () => {

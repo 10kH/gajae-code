@@ -115,8 +115,8 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 59 / Slack generation 63 derive attachment authority ids from one Router function so persisted provider bindings and live attachments cannot drift apart.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 59,
-	slack: 63,
+	discord: 60,
+	slack: 64,
 };
 
 export function chatDaemonGeneration(kind: ChatDaemonKind): number {

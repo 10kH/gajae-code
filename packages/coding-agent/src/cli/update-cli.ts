@@ -785,6 +785,7 @@ export interface UpdateCommandDependencies {
 }
 
 export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
+export type PostUpdateRecoverySupportCheck = (runtimePath: string) => Promise<boolean>;
 
 /**
  * A complete, non-quarantined provider with provider-level desired intent is a
@@ -842,10 +843,32 @@ async function spawnPostUpdateRecovery(argv: string[]): Promise<number> {
 	return await child.exited;
 }
 
+async function supportsUpdateRecovery(runtimePath: string): Promise<boolean> {
+	const child = Bun.spawn([runtimePath, "update", "--help"], { stdout: "pipe", stderr: "pipe" });
+	const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+	return exitCode === 0 && stdout.includes("update-recovery");
+}
+
+async function runLegacyPostUpdateRecovery(runtimePath: string, spawn: PostUpdateRecoverySpawn): Promise<void> {
+	for (const [name, argv] of [
+		["daemon stop --force", [runtimePath, "daemon", "stop", "--force"]],
+		["daemon reload", [runtimePath, "daemon", "reload"]],
+		["notify recovery", [runtimePath, "notify", "recovery"]],
+	] as const) {
+		const exitCode = await spawn([...argv]);
+		if (exitCode !== 0) throw new Error(`legacy post-update ${name} exited ${exitCode}`);
+	}
+}
+
 export async function runPostUpdateRecoveryForTest(
 	runtimePath: string,
 	spawn: PostUpdateRecoverySpawn = spawnPostUpdateRecovery,
+	supportsRecovery: PostUpdateRecoverySupportCheck = supportsUpdateRecovery,
 ): Promise<void> {
+	if (!(await supportsRecovery(runtimePath))) {
+		await runLegacyPostUpdateRecovery(runtimePath, spawn);
+		return;
+	}
 	const exitCode = await spawn([runtimePath, "update", "update-recovery"]);
 	if (exitCode !== 0) throw new Error(`the verified installed runtime exited ${exitCode}`);
 }
