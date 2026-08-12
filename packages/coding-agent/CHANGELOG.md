@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- GJC plugin bundle manifests now accept the Claude Code/Codex-familiar `mcpServers` map alias and normalize transport-relevant, end-to-end representable fields into the canonical `mcps` array (per-server `type` maps to `transport`; `command` implies `stdio`, a bare `url` implies `http`), so canonical and alias manifests compile to byte-equivalent normalized surfaces. Ambiguous or unrepresentable aliases (`mcp`, a top-level `skills`/`agents`/`commands`/`slash-commands`, Claude Code-shaped or hybrid hooks, transport-incompatible MCP fields, or `mcpServers` entries with `env`/`auth`/`oauth`/`headers`/enablement controls) now fail with targeted migration diagnostics naming the canonical form and the loose `.gjc/` surface, instead of generic unknown/forbidden-key errors. Protected workflow-skill and role-agent invariants, collision authority, MCP security policy, constrained hooks, and appendix authority are unchanged and apply to normalized entries (`#4287`).
+- `docs/gjc-plugins.md` now contains a decision table for canonical project/user `.gjc` loose customization (`.gjc/mcp.json`, `.gjc/hooks/pre|post/<tool>.ts`, `.gjc/skills/<name>/SKILL.md`, `.gjc/extensions/<name>/`) versus distributable plugin bundles, and identifies Claude Code/Codex layouts as explicit `/extensions` import sources rather than parallel runtime authorities (`#4287`, `#4291`).
+
 ### Fixed
 - The legacy `agentDir/settings.json` source is now retired (`.bak`) only after the combined migration commits: a malformed `agent.db` row that aborts the load keeps the source discoverable for the next load instead of stranding its only copy.
 - An unreadable project ownership marker (`.gjc/state/settings.json.migrated-keys`, e.g. EACCES/EISDIR) now aborts the project migration instead of treating it as empty and reimporting a stale retained value.
