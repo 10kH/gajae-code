@@ -361,10 +361,15 @@ describe("production discovery integration", () => {
 		const hooksDir = path.join(root, ".codex", "hooks");
 		const executionMarker = path.join(root, "executed");
 		const rejectedImportMarker = path.join(root, "rejected-imported");
+		const throwingHookPath = path.join(hooksDir, "pre-bash.ts");
 		await fs.mkdir(hooksDir, { recursive: true });
 		await Bun.write(
 			path.join(hooksDir, "pre-read.ts"),
 			`export default (api) => api.on("tool_call", async (_event, ctx) => { await Bun.write(${JSON.stringify(executionMarker)}, ctx.hasQueuedMessages() ? "queued" : "read"); });\n`,
+		);
+		await Bun.write(
+			throwingHookPath,
+			'export default (api) => api.on("tool_call", () => { throw new Error("hook-boom"); });\n',
 		);
 		await Bun.write(
 			path.join(hooksDir, "unprefixed.ts"),
@@ -388,6 +393,10 @@ describe("production discovery integration", () => {
 			});
 			try {
 				expect(session.extensionRunner?.hasHandlers("tool_call")).toBe(true);
+				let observedErrorPath: string | undefined;
+				session.extensionRunner?.onError(error => {
+					if (error.error === "hook-boom") observedErrorPath = error.extensionPath;
+				});
 				await session.extensionRunner?.emitToolCall({
 					type: "tool_call",
 					toolName: "write",
@@ -402,6 +411,15 @@ describe("production discovery integration", () => {
 					input: {},
 				});
 				expect(await Bun.file(executionMarker).text()).toBe("read");
+				const blocked = await session.extensionRunner?.emitToolCall({
+					type: "tool_call",
+					toolName: "bash",
+					toolCallId: "throwing-hook",
+					input: {},
+				});
+				expect(blocked).toMatchObject({ block: true });
+				expect(blocked?.reason).toContain(`hook:${throwingHookPath}`);
+				expect(observedErrorPath).toBe(`hook:${throwingHookPath}`);
 				expect(await Bun.file(rejectedImportMarker).exists()).toBe(false);
 			} finally {
 				await session.dispose();

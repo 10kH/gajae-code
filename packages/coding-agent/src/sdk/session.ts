@@ -2222,13 +2222,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Recognized hook conventions are the bounded exception: their descriptors
 		// normalize before import and then adapt into the authoritative ExtensionRunner.
 		const inlineExtensions: ExtensionFactory[] = [...(options.extensions ?? [])];
+		const discoveredHookExtensions: Array<{ factory: ExtensionFactory; name: string }> = [];
 		if (customTools.length > 0) {
 			inlineExtensions.push(createCustomToolsExtension(customTools));
 		}
 		if (!options.disableExtensionDiscovery) {
 			try {
 				const hookExtensions = await discoverAndLoadHookExtensions(cwd);
-				inlineExtensions.push(...hookExtensions.factories.map(entry => entry.factory));
+				discoveredHookExtensions.push(...hookExtensions.factories);
 				for (const error of hookExtensions.errors) {
 					logger.warn("Rejected discovered hook", { path: error.path, error: error.error });
 				}
@@ -2452,6 +2453,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				);
 				extensionsResult.extensions.push(loaded);
 			}
+		}
+		for (const entry of discoveredHookExtensions) {
+			const loaded = await loadExtensionFromFactory(
+				entry.factory,
+				cwd,
+				eventBus,
+				extensionsResult.runtime,
+				entry.name,
+			);
+			extensionsResult.extensions.push(loaded);
 		}
 
 		// Process provider registrations queued during extension loading.
