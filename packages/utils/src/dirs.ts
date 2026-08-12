@@ -487,6 +487,11 @@ export function getGithubCacheDbPath(): string {
 	return dirs.rootSubdir(path.join("cache", "github-cache.db"), "cache");
 }
 
+/** Get the durable tool-choice capability cache path. */
+export function getToolChoiceCapabilityCachePath(): string {
+	return dirs.rootSubdir(path.join("cache", "tool-choice-capabilities.db"), "cache");
+}
+
 /** Get the natives directory (~/.gjc/natives). */
 export function getNativesDir(): string {
 	return dirs.rootSubdir("natives", "cache");
