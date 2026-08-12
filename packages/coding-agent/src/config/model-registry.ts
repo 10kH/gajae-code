@@ -180,7 +180,9 @@ export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssig
 		(model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6"))
 	)
 		return true;
-	return role !== null && GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
+	if (role === null) return false;
+	if (role === "default") return true;
+	return GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
 }
 
 /** Alias for ModelRoleInfo - used for both built-in and custom roles */

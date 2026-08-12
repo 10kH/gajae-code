@@ -1,7 +1,11 @@
 import { beforeAll, describe, expect, test, vi } from "bun:test";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Model } from "@gajae-code/ai";
-import { resolveAgentModelPatterns, resolveModelOverride } from "@gajae-code/coding-agent/config/model-resolver";
+import {
+	resolveAgentModelPatterns,
+	resolveModelOverride,
+	resolveModelRoleValue,
+} from "@gajae-code/coding-agent/config/model-resolver";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import type { ModelSelectorComponent } from "@gajae-code/coding-agent/modes/components/model-selector";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
@@ -469,6 +473,36 @@ describe("SelectorController model batch assignments", () => {
 		});
 		expect(setDefaultFallbackRuntimeModel).toHaveBeenCalledWith("provider-a/selected:low");
 		expect(settings.getModelRole("default")).toBe("provider-a/original-default:medium");
+	});
+
+	test("DEFAULT assignment persists its explicit effort for session restart resolution", async () => {
+		const { ctx, settings, setModelCalls } = createControllerContext();
+		const selector = await openSelector(ctx);
+
+		await selector.__testSelectAssignment({
+			model: selectedModel,
+			role: "default",
+			thinkingLevel: ThinkingLevel.High,
+			selector: "provider-a/selected",
+		});
+
+		expect(setModelCalls).toEqual([
+			{
+				model: selectedModel,
+				role: "default",
+				options: {
+					cause: "user-selection",
+					onMutationStarted: expect.any(Function),
+					selector: "provider-a/selected",
+					thinkingLevel: ThinkingLevel.High,
+				},
+			},
+		]);
+		expect(settings.getModelRole("default")).toBe("provider-a/selected:high");
+		const restarted = resolveModelRoleValue(settings.getModelRole("default"), [selectedModel]);
+		expect(restarted.model).toBe(selectedModel);
+		expect(restarted.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(restarted.explicitThinkingLevel).toBe(true);
 	});
 
 	test("relies on AgentSession to replace the prior temporary provider-session scope", async () => {
