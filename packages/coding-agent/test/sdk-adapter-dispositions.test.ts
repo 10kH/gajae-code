@@ -5,16 +5,24 @@ import path from "node:path";
 import { AcpSdkAdapter } from "../src/sdk/acp";
 import { Broker } from "../src/sdk/broker";
 import { brokerOwnerForTest } from "../src/sdk/broker/ensure";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { sendAuthorizedChatOperation } from "../src/sdk/bus/chat-command-policy";
 import { runSdkSessionCli } from "../src/sdk/cli/session-cli";
 import { SdkClient } from "../src/sdk/client";
 import { createSdkMcpServer } from "../src/sdk/mcp";
 import { type Adapter, OPERATIONS, type Operation } from "../src/sdk/protocol/operation-registry";
+import type { SessionAttachment } from "../src/sdk/router";
 import { startProductionSdkHost } from "./helpers/sdk-production-host";
 
 type MachineAdapter = Extract<Adapter, "mcp" | "acp" | "daemonCli">;
 type Expected = "forwarded" | "rejected_before_send" | "internal_only";
 type ObservedRequest = { kind: "control" | "query" | "global"; operation: string };
+
+function currentHostIncarnation(): string {
+	const incarnation = processIncarnation(process.pid);
+	if (!incarnation) throw new Error("Current process incarnation is unavailable.");
+	return incarnation;
+}
 
 type ParityRow = {
 	adapterTestId: string;
@@ -28,7 +36,7 @@ const parityRows = (
 		rows: ParityRow[];
 	}
 ).rows;
-expect(parityRows).toHaveLength(576);
+expect(parityRows).toHaveLength(582);
 const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",
 	discord: "D",
@@ -47,6 +55,10 @@ function parityRow(adapter: Adapter, operation: Operation, secret = false): Pari
 	return row;
 }
 
+type SdkMcpServer = {
+	callTool(name: string, args?: Record<string, unknown>): Promise<unknown>;
+	close(): Promise<void>;
+};
 type AdapterFixture = {
 	repo: string;
 	agentDir: string;
@@ -54,6 +66,15 @@ type AdapterFixture = {
 	endpoint: { url: string; token: string };
 	brokerEndpoint: { url: string; token: string };
 	observed: ObservedRequest[];
+	acpRouter: {
+		request: (
+			sessionId: string,
+			frame: Record<string, unknown>,
+			generation?: number,
+			attachment?: SessionAttachment,
+		) => Promise<Record<string, unknown>>;
+	};
+	acpAttachment: SessionAttachment;
 	stop: () => Promise<void>;
 };
 
@@ -62,6 +83,8 @@ const adapterPrefix: Record<MachineAdapter, string> = { mcp: "M", acp: "A", daem
 
 function expectedOutcome(adapter: MachineAdapter, operation: Operation, secret = false): Expected {
 	if (secret) return "rejected_before_send";
+	if (operation.sdkId === "session.get_endpoint" && (adapter === "mcp" || adapter === "daemonCli"))
+		return "rejected_before_send";
 	if (operation.kind === "reverse") return "internal_only";
 	const disposition = operation.adapterDispositions[adapter];
 	if (disposition === "prohibited" || disposition === "provider_only") return "rejected_before_send";
@@ -91,8 +114,7 @@ const expectedDomainErrors: Readonly<Record<string, string>> = {
 	"session.export_html": "invalid_request",
 	"auth.login": "operation_not_session_owned",
 	"skill.invoke": "invalid_input",
-	"turn.prompt_status": "invalid_request",
-	"skill.invoke_status": "invalid_request",
+	"turn.result": "invalid_request",
 	"mode.plan.set": "unavailable",
 	"model.profile.set": "invalid_input",
 };
@@ -217,6 +239,24 @@ function inputFor(operation: Operation, secret = false): Record<string, unknown>
 	}
 }
 
+/** Raw lifecycle globals require typed targets; retain broker-side invalid-input probes without launching a session. */
+function daemonCliLifecycleInput(host: AdapterFixture, operation: string): Record<string, unknown> | undefined {
+	const invalidStateRoot = path.join(host.repo, ".invalid-state");
+	switch (operation) {
+		case "session.create":
+		case "session.fork":
+			return { cwd: host.repo, stateRoot: invalidStateRoot };
+		case "session.resume":
+			return { cwd: host.repo, stateRoot: invalidStateRoot, sessionId: host.sessionId };
+		case "session.close":
+			return { sessionId: host.sessionId, endpointGeneration: 0 };
+		case "session.delete":
+			return { sessionId: "missing-session" };
+		default:
+			return undefined;
+	}
+}
+
 async function fixture(): Promise<AdapterFixture> {
 	const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-adapter-dispositions-"));
 	const agentDir = path.join(repo, ".gjc", "adapter-agent");
@@ -233,14 +273,49 @@ async function fixture(): Promise<AdapterFixture> {
 		return await handleRequest(operation, input, idempotencyKey);
 	};
 	const endpointMtimeMs = fs.statSync(path.join(stateRoot, "sdk", `${sessionId}.json`)).mtimeMs;
+	const hostIncarnation = currentHostIncarnation();
 	await broker.index.append({
 		type: "host_registered",
 		sessionId,
 		locator: { repo, stateRoot },
 		endpointGeneration: 1,
 		pid: process.pid,
+		processIncarnation: hostIncarnation,
+		hostIncarnation,
 		endpointMtimeMs,
 	});
+	await broker.heartbeatSessions();
+	const acpAttachment: SessionAttachment = {
+		sessionId,
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => undefined,
+	};
+	const acpRouter = {
+		request: async (
+			requestedSessionId: string,
+			frame: Record<string, unknown>,
+			generation?: number,
+			attachment?: SessionAttachment,
+		): Promise<Record<string, unknown>> => {
+			if (
+				requestedSessionId !== sessionId ||
+				generation !== acpAttachment.generation ||
+				attachment !== acpAttachment
+			)
+				throw new Error("ACP fixture received a non-current SessionAttachment");
+			const operation =
+				frame.type === "control_request"
+					? frame.operation
+					: frame.type === "query_request"
+						? frame.query
+						: undefined;
+			if (typeof operation !== "string")
+				return { ok: false, error: { code: "invalid_input", message: "invalid frame" } };
+			const code = expectedDomainErrors[operation];
+			return code ? { ok: false, error: { code, message: code } } : { ok: true, result: { ok: true } };
+		},
+	};
 	return {
 		repo,
 		agentDir,
@@ -248,6 +323,8 @@ async function fixture(): Promise<AdapterFixture> {
 		endpoint: productionHost.endpoint,
 		brokerEndpoint,
 		observed,
+		acpRouter,
+		acpAttachment,
 		stop: async () => {
 			await brokerOwnerForTest(agentDir)?.stop();
 			await productionHost.stop();
@@ -279,8 +356,16 @@ async function assertAcpRow(operation: Operation, secret: boolean): Promise<void
 	const expected = expectedOutcome("acp", operation, secret);
 	const before = host.observed.length;
 	const input = inputFor(operation, secret);
-	const endpoint = operation.kind === "global" ? host.brokerEndpoint : host.endpoint;
-	const adapter = await AcpSdkAdapter.connect(endpoint);
+	const adapter =
+		operation.kind === "global"
+			? await AcpSdkAdapter.connect({
+					client: await SdkClient.connect(host.brokerEndpoint.url, host.brokerEndpoint.token),
+				})
+			: await AcpSdkAdapter.connect({
+					router: host.acpRouter as never,
+					attachment: host.acpAttachment,
+					sessionId: host.sessionId,
+				});
 	try {
 		if (operation.kind === "control") {
 			if (expected === "forwarded") {
@@ -313,17 +398,12 @@ async function assertAcpRow(operation: Operation, secret: boolean): Promise<void
 
 async function assertMcpRow(operation: Operation, secret: boolean): Promise<void> {
 	const host = await fixture();
+	let mcp: SdkMcpServer | undefined;
 	try {
 		const expected = expectedOutcome("mcp", operation, secret);
 		const before = host.observed.length;
 		const input = inputFor(operation, secret);
-		const mcp = createSdkMcpServer({
-			repo: host.repo,
-			agentDir: host.agentDir,
-			...(operation.kind === "global"
-				? {}
-				: { connect: () => SdkClient.connect(host.endpoint.url, host.endpoint.token) }),
-		});
+		mcp = createSdkMcpServer({ agentDir: host.agentDir });
 		const tool =
 			operation.kind === "global"
 				? "gjc_session_global"
@@ -343,6 +423,7 @@ async function assertMcpRow(operation: Operation, secret: boolean): Promise<void
 		} else expect(result).toMatchObject({ ok: false, error: expect.any(Object) });
 		expectObservation(host, before, operation, expected);
 	} finally {
+		await mcp?.close();
 		await stopFixture(host, operation);
 	}
 }
@@ -369,19 +450,19 @@ async function assertDaemonCliRow(operation: Operation, secret: boolean): Promis
 	try {
 		const expected = expectedOutcome("daemonCli", operation, secret);
 		const before = host.observed.length;
+		const lifecycleInput = operation.kind === "global" ? daemonCliLifecycleInput(host, operation.sdkId) : undefined;
 		const input =
-			operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret);
+			lifecycleInput ??
+			(operation.sdkId === "session.get_endpoint" ? { sessionId: host.sessionId } : inputFor(operation, secret));
 		const action = operation.kind === "global" ? "global" : operation.kind === "query" ? "query" : "control";
 		const args = {
 			action,
-			repo: host.repo,
 			agentDir: host.agentDir,
 			idempotencyKey: operation.kind === "global" ? `parity-${operation.id}` : undefined,
 			...(action === "query"
 				? { sessionId: host.sessionId, query: operation.sdkId }
 				: { operation: operation.sdkId }),
 			...(action === "control" ? { sessionId: host.sessionId, confirm: true } : {}),
-			...(operation.sdkId === "session.get_endpoint" ? { showEndpointCredential: true, yes: true } : {}),
 			jsonInput: JSON.stringify(input),
 		};
 		const result = await runDaemonCli(args);

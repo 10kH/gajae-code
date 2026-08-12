@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, setSystemTime, spyOn } from "bun:test";
+import { createHash } from "node:crypto";
+
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -153,14 +155,311 @@ describe("coordinator runtime state sidecar", () => {
 			{ event: { type: "message_update", message: {}, assistantMessageEvent: {} }, affects: false },
 			{ event: { type: "notice", level: "info", message: "background notice" }, affects: false },
 			{ event: { type: "turn_start" }, affects: true },
+			{ event: { type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash" }, affects: true },
+			{ event: { type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash" }, affects: true },
 			{ event: { type: "agent_start" }, affects: true },
 			{ event: { type: "agent_end", messages: [] }, affects: true },
 		] as const;
 
 		for (const { event, affects } of events) {
 			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(affects);
-			expect(eventAffectsCoordinatorRuntimeState(event as never)).toBe(stateForEvent(event as never) !== null);
 		}
+		expect(stateForEvent({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash" })).toBeNull();
+	});
+
+	it("persists bounded public-safe tool activity while preserving lifecycle state", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "activity-session";
+		try {
+			setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "turn_start" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			setSystemTime(new Date("2026-01-01T00:00:01.000Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_start", toolCallId: "private-tool-call-id", toolName: "bash" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			setSystemTime(new Date("2026-01-01T00:00:03.500Z"));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_end", toolCallId: "private-tool-call-id", toolName: "bad\nlabel", isError: true },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+			const payload = await readJson(stateFile);
+			expect(payload).toMatchObject({
+				state: "running",
+				last_activity_at: "2026-01-01T00:00:03.500Z",
+				activity: {
+					sequence: 2,
+					kind: "tool_execution",
+					phase: "finished",
+					tool_name: "custom",
+					started_at: "2026-01-01T00:00:01.000Z",
+					elapsed_ms: 2500,
+					outcome: "failed",
+					active_tool_count: 0,
+				},
+				active_tools: [],
+			});
+			expect(JSON.stringify(payload.active_tools)).not.toContain("private-tool-call-id");
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("keeps the active-tool count truthful when the public list is bounded", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "bounded-activity-session";
+		for (let index = 0; index < 9; index++)
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+		const payload = await readJson(stateFile);
+		expect(payload.activity).toMatchObject({ sequence: 9, active_tool_count: 9 });
+		expect(payload.active_tools).toHaveLength(8);
+	});
+	it("bounds unmatched tool-call correlations and records evictions", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "bounded-tool-call-correlations";
+		const firstStartedAt = Date.parse("2026-01-01T00:00:00.000Z");
+		try {
+			for (let index = 0; index < 65; index++) {
+				setSystemTime(new Date(firstStartedAt + index));
+				await persistCoordinatorRuntimeStateFromEvent(
+					{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				);
+			}
+
+			const payload = await readJson(stateFile);
+			const activeToolCalls = payload.active_tool_calls as Record<string, unknown>;
+			expect(Object.keys(activeToolCalls)).toHaveLength(64);
+			expect(payload).toMatchObject({
+				activity: { sequence: 65, active_tool_count: 65 },
+				active_tool_calls_overflow_count: 1,
+				active_tool_calls_overflow_digests: [createHash("sha256").update("tool-0").digest("hex")],
+			});
+			expect(payload.active_tools).toHaveLength(8);
+			expect(activeToolCalls[createHash("sha256").update("tool-0").digest("hex")]).toBeUndefined();
+			expect(activeToolCalls[createHash("sha256").update("tool-64").digest("hex")]).toEqual({
+				tool_name: "read",
+				started_at: "2026-01-01T00:00:00.064Z",
+			});
+		} finally {
+			setSystemTime();
+		}
+	});
+	it("settles only known overflowed tool-call correlations", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "overflow-settlement";
+		const firstStartedAt = Date.parse("2026-01-01T00:00:00.000Z");
+		const overflowedToolCallKeys = ["tool-0", "tool-1"].map(toolCallId =>
+			createHash("sha256").update(toolCallId).digest("hex"),
+		);
+		try {
+			for (let index = 0; index < 66; index++) {
+				setSystemTime(new Date(firstStartedAt + index));
+				await persistCoordinatorRuntimeStateFromEvent(
+					{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				);
+			}
+
+			let payload = await readJson(stateFile);
+			expect(payload).toMatchObject({
+				activity: { active_tool_count: 66 },
+				active_tool_calls_overflow_count: 2,
+				active_tool_calls_overflow_digests: overflowedToolCallKeys,
+			});
+
+			setSystemTime(new Date(firstStartedAt + 66));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_end", toolCallId: "unknown-tool", toolName: "read" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			payload = await readJson(stateFile);
+			expect(payload).toMatchObject({
+				activity: { active_tool_count: 66 },
+				active_tool_calls_overflow_count: 2,
+				active_tool_calls_overflow_digests: overflowedToolCallKeys,
+			});
+
+			setSystemTime(new Date(firstStartedAt + 67));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_end", toolCallId: "tool-0", toolName: "read" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			payload = await readJson(stateFile);
+			expect(payload).toMatchObject({
+				activity: { active_tool_count: 65 },
+				active_tool_calls_overflow_count: 1,
+				active_tool_calls_overflow_digests: [overflowedToolCallKeys[1]],
+			});
+
+			setSystemTime(new Date(firstStartedAt + 68));
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_end", toolCallId: "tool-0", toolName: "read" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+			payload = await readJson(stateFile);
+			expect(payload).toMatchObject({
+				activity: { active_tool_count: 65 },
+				active_tool_calls_overflow_count: 1,
+				active_tool_calls_overflow_digests: [overflowedToolCallKeys[1]],
+			});
+		} finally {
+			setSystemTime();
+		}
+	});
+
+	it("bounds overflow correlation evidence and marks active counts as lower bounds", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "bounded-overflow-evidence";
+		for (let index = 0; index < 129; index++)
+			await persistCoordinatorRuntimeStateFromEvent(
+				{ type: "tool_execution_start", toolCallId: `tool-${index}`, toolName: "read" },
+				{ sessionId: "fallback", cwd: root, sessionFile: null },
+			);
+
+		const payload = await readJson(stateFile);
+		expect(payload).toMatchObject({
+			activity: { active_tool_count: 128, active_tool_count_is_lower_bound: true },
+			active_tool_calls_overflow_count: 64,
+			active_tool_calls_overflow_count_is_lower_bound: true,
+		});
+		expect(payload.active_tool_calls).toHaveProperty(createHash("sha256").update("tool-128").digest("hex"));
+		expect(payload.active_tool_calls_overflow_digests).toHaveLength(64);
+	});
+
+	it("refuses malformed persisted overflow correlation evidence", async () => {
+		const root = await tempRoot();
+		const validDigest = createHash("sha256").update("tool-0").digest("hex");
+		const invalidOverflowStates: Array<Record<string, unknown>> = [
+			{
+				active_tool_calls_overflow_count: 1,
+				active_tool_calls_overflow_digests: ["not-a-tool-call-digest"],
+			},
+			{
+				active_tool_calls_overflow_count: 1,
+				active_tool_calls_overflow_digests: [],
+			},
+			{
+				active_tool_calls_overflow_count: 2,
+				active_tool_calls_overflow_digests: [validDigest, validDigest],
+			},
+			{
+				active_tool_calls_overflow_count: 65,
+				active_tool_calls_overflow_digests: Array.from({ length: 65 }, (_, index) =>
+					createHash("sha256").update(`tool-${index}`).digest("hex"),
+				),
+			},
+			{
+				active_tool_calls_overflow_count: 1,
+				active_tool_calls_overflow_digests: [validDigest],
+				active_tool_calls_overflow_count_is_lower_bound: "true",
+			},
+		];
+		for (const [index, overflowState] of invalidOverflowStates.entries()) {
+			const sessionId = `invalid-overflow-correlations-${index}`;
+			const stateFile = path.join(root, `${sessionId}.json`);
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			const evidence = JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				...overflowState,
+			});
+			await Bun.write(stateFile, evidence);
+
+			await expect(
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "tool_execution_start", toolCallId: "tool-next", toolName: "read" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				),
+			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+			expect(await Bun.file(stateFile).text()).toBe(evidence);
+		}
+	});
+
+	it("refuses malformed and oversized persisted tool-call correlation tables", async () => {
+		const root = await tempRoot();
+		const invalidToolCalls: unknown[] = [
+			{ "not-a-tool-call-digest": { tool_name: "read", started_at: "2026-01-01T00:00:00.000Z" } },
+			Object.fromEntries(
+				Array.from({ length: 65 }, (_, index) => [
+					createHash("sha256").update(`tool-${index}`).digest("hex"),
+					{ tool_name: "read", started_at: "2026-01-01T00:00:00.000Z" },
+				]),
+			),
+		];
+		for (const [index, activeToolCalls] of invalidToolCalls.entries()) {
+			const sessionId = `invalid-tool-call-correlations-${index}`;
+			const stateFile = path.join(root, `${sessionId}.json`);
+			process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+			process.env[GJC_COORDINATOR_SESSION_ID_ENV] = sessionId;
+			const evidence = JSON.stringify({
+				schema_version: 1,
+				session_id: sessionId,
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				active_tool_calls: activeToolCalls,
+			});
+			await Bun.write(stateFile, evidence);
+
+			await expect(
+				persistCoordinatorRuntimeStateFromEvent(
+					{ type: "tool_execution_start", toolCallId: "tool-next", toolName: "read" },
+					{ sessionId: "fallback", cwd: root, sessionFile: null },
+				),
+			).rejects.toThrow("Existing runtime state marker is invalid or unreadable; refusing to overwrite.");
+			expect(await Bun.file(stateFile).text()).toBe(evidence);
+		}
+	});
+
+	it("saturates an exhausted activity sequence without wrapping", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "state.json");
+		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
+		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "saturated-activity-session";
+		await Bun.write(
+			stateFile,
+			JSON.stringify({
+				schema_version: 1,
+				session_id: "saturated-activity-session",
+				state: "running",
+				cwd: root,
+				workdir: root,
+				session_file: null,
+				activity: { sequence: Number.MAX_SAFE_INTEGER },
+			}),
+		);
+
+		await persistCoordinatorRuntimeStateFromEvent(
+			{ type: "tool_execution_start", toolCallId: "tool-1", toolName: "read" },
+			{ sessionId: "fallback", cwd: root, sessionFile: null },
+		);
+
+		expect((await readJson(stateFile)).activity).toMatchObject({ sequence: Number.MAX_SAFE_INTEGER });
 	});
 
 	it("skips duplicate same-state running writes within the heartbeat", async () => {

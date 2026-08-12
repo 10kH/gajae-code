@@ -9,6 +9,7 @@ import type {
 	RecoveryFsIdentity,
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
+import { isEnoent, logger } from "@gajae-code/utils";
 import type { SessionStorageRangeSnapshot, SessionStorageStat } from "../session-storage";
 import {
 	classifyNativePublishOutcome,
@@ -474,6 +475,80 @@ function replacementReceiptPlaceholderRetirementName(
 	receipt: { dev: bigint; ino: bigint },
 ): string {
 	return `.gjc-receipt-placeholder-remove-${placeholder.dev.toString(16)}-${placeholder.ino.toString(16)}-${predecessor.dev.toString(16)}-${predecessor.ino.toString(16)}-${receipt.dev.toString(16)}-${receipt.ino.toString(16)}`;
+}
+
+/**
+ * Terminal write-protocol remnant names. The POSIX exact-unlink fallback cannot
+ * descriptor-unlink, so it detaches, scrubs, and retains zero-length quarantine
+ * entries and exchange placeholders instead of removing them (`cleanup_pending`
+ * with a durable payload). Linux completes deletion through the retained
+ * directory authority, but macOS has no retained authority, so every managed
+ * replacement leaks its scrubbed remnants and scope directories grow without
+ * bound (tens of thousands of dirents per workspace), degrading every
+ * per-mutation receipt scan and widening quarantine-collision windows.
+ */
+const SCRUBBED_REMNANT_PREFIXES = [
+	".gjc-exact-unlink-placeholder-",
+	".gjc-exact-replace-destination-",
+	".gjc-receipt-remove-",
+	".gjc-receipt-placeholder-remove-",
+	".gjc-replace-retry-",
+] as const;
+
+/** In-flight protocol steps complete in milliseconds; anything older is abandoned. */
+const SCRUBBED_REMNANT_MIN_AGE_MS = 15 * 60 * 1000;
+
+export interface ScrubbedProtocolRemnantReapResult {
+	readonly reaped: number;
+	readonly failures: number;
+}
+
+function reportScrubbedProtocolRemnantReap(reaped: number, failures: number): ScrubbedProtocolRemnantReapResult {
+	if (failures > 0)
+		logger.warn("Managed session remnant reaping completed with failures", {
+			failureCount: failures,
+			reapedCount: reaped,
+		});
+	return { reaped, failures };
+}
+
+/**
+ * Best-effort removal of scrubbed write-protocol remnants from one managed
+ * directory. Only zero-length, single-link, non-symlink regular files whose
+ * names carry a terminal remnant prefix and whose timestamps are older than
+ * the age gate are removed: a zero-length single-link entry is exactly what
+ * the scrub proof leaves behind, and non-zero entries (displaced predecessors
+ * or detached receipts retained as evidence) are never touched. A proven
+ * concurrent disappearance (ENOENT) is benign; all other I/O failures are
+ * returned and logged once without aborting scope preparation.
+ */
+export function reapScrubbedProtocolRemnantsSync(
+	directory: string,
+	minAgeMs: number = SCRUBBED_REMNANT_MIN_AGE_MS,
+): ScrubbedProtocolRemnantReapResult {
+	let names: string[];
+	try {
+		names = fs.readdirSync(directory);
+	} catch (error) {
+		return reportScrubbedProtocolRemnantReap(0, isEnoent(error) ? 0 : 1);
+	}
+	const cutoff = Date.now() - minAgeMs;
+	let reaped = 0;
+	let failures = 0;
+	for (const name of names) {
+		if (!SCRUBBED_REMNANT_PREFIXES.some(prefix => name.startsWith(prefix))) continue;
+		const pathname = path.join(directory, name);
+		try {
+			const named = fs.lstatSync(pathname);
+			if (!named.isFile() || named.isSymbolicLink() || named.nlink !== 1 || named.size !== 0) continue;
+			if (named.mtimeMs > cutoff) continue;
+			fs.unlinkSync(pathname);
+			reaped += 1;
+		} catch (error) {
+			if (!isEnoent(error)) failures += 1;
+		}
+	}
+	return reportScrubbedProtocolRemnantReap(reaped, failures);
 }
 
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
@@ -1808,6 +1883,7 @@ export class ManagedSessionDescendantStore {
 	}
 	/** Read an exact managed file without exposing its pathname as authority. */
 	readExpected(relativePath: string): ManagedFileSnapshot | null {
+		this.#assertPathBackedReadRelative(relativePath);
 		this.#assertBound();
 		const resolved = this.#resolve(relativePath);
 		const relative = this.#relative(resolved);

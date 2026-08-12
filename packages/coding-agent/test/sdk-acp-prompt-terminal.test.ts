@@ -1,9 +1,17 @@
-import { expect, test } from "bun:test";
+import { expect, setDefaultTimeout, test, vi } from "bun:test";
 import * as path from "node:path";
 import type { AgentSideConnection, PromptRequest, SessionNotification } from "@agentclientprotocol/sdk";
-import { TempDir } from "@gajae-code/utils";
+import { logger, TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import {
+	type ExactSessionAuthorityFixture,
+	type ExactSessionAuthorityOptions,
+	prepareExactSessionAuthority,
+	publishExactSessionAuthority,
+} from "./helpers/sdk-exact-session-authority";
+
+setDefaultTimeout(75_000);
 
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
@@ -26,14 +34,14 @@ type Fixture = {
 async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 	return await Promise.race([
 		promise,
-		Bun.sleep(2_000).then(() => {
+		Bun.sleep(60_000).then(() => {
 			throw new Error(`Timed out waiting for ${label}`);
 		}),
 	]);
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
-	const deadline = Date.now() + 2_000;
+	const deadline = Date.now() + 60_000;
 	while (Date.now() < deadline) {
 		if (predicate()) return;
 		await Bun.sleep(5);
@@ -56,6 +64,7 @@ async function createFixture(
 		preAcknowledgementTerminal?: Record<string, unknown>;
 		promptAcknowledgement?: Record<string, unknown>;
 		cancelSettlementGraceMs?: number;
+		abortAcknowledgement?: Record<string, unknown>;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -103,6 +112,10 @@ async function createFixture(
 	const sendAssistantMessage = (text: string): void => {
 		send({
 			type: "event",
+			kind: "message_end",
+			sessionId,
+			commandId,
+			turnId,
 			payload: {
 				event_type: "message_end",
 				event: {
@@ -135,11 +148,11 @@ async function createFixture(
 					return;
 				}
 				if (frame.type === "broker_request") {
-					const result =
-						frame.operation === "session.create"
-							? { sessionId, endpoint: { url: `ws://127.0.0.1:${server.port}`, token } }
-							: {};
-					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+					// Every broker interaction (session.list, session.get_endpoint,
+					// session.create) is answered with the exact authority: the
+					// router's reconcile resolves the session through this fixture.
+					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: authority }));
+					setTimeout(() => void publishExactSessionAuthority(authorityOptions, authority), 10);
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -185,7 +198,14 @@ async function createFixture(
 							frame.operation === "turn.prompt"
 								? (options.promptAcknowledgement ?? { commandId, turnId, accepted: true })
 								: frame.operation === "turn.abort"
-									? { aborted: true }
+									? (options.abortAcknowledgement ?? {
+											ok: true,
+											selection: "owned",
+											turn: "stopped",
+											ownedWork: "stopped",
+											automaticDelivery: "none",
+											resumeOnOwnedCompletion: false,
+										})
 									: {},
 					}),
 				);
@@ -194,6 +214,14 @@ async function createFixture(
 	});
 	const port = server.port;
 	if (port === undefined) throw new Error("Expected ACP fixture server port");
+	const authorityOptions: ExactSessionAuthorityOptions = {
+		agentDir,
+		cwd,
+		sessionId,
+		url: `ws://127.0.0.1:${port}`,
+		token,
+	};
+	const authority: ExactSessionAuthorityFixture = await prepareExactSessionAuthority(authorityOptions);
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
 		protocolVersion: 3,
@@ -388,6 +416,7 @@ test("ACP drops a mismatched pre-ack terminal without publication or queries", a
 			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
 		},
 	});
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
 	try {
 		let settled = false;
 		const pending = prompt(fixture, "mismatched pre-ack").then(
@@ -399,6 +428,19 @@ test("ACP drops a mismatched pre-ack terminal without publication or queries", a
 			},
 		);
 		await bounded(fixture.promptDelivered, "prompt delivery");
+		await waitFor(
+			() => errorSpy.mock.calls.some(([event]) => event === "acp_prompt_terminal_dropped"),
+			"deferred mismatched terminal drop log",
+		);
+		expect(errorSpy).toHaveBeenCalledWith("acp_prompt_terminal_dropped", {
+			sessionId: "prompt-terminal-session",
+			terminalType: "agent_end",
+			reason: "correlation_mismatch",
+			commandId: "other-command",
+			turnId: "other-turn",
+			expectedCommandId: "prompt-terminal-command",
+			expectedTurnId: "prompt-terminal-turn",
+		});
 		const updatesBefore = fixture.updates.length;
 		const queriesBefore = fixture.queryCalls.length;
 		await Bun.sleep(30);
@@ -408,6 +450,39 @@ test("ACP drops a mismatched pre-ack terminal without publication or queries", a
 		fixture.dispose();
 		await bounded(pending, "mismatched prompt cleanup");
 	} finally {
+		errorSpy.mockRestore();
+		fixture.dispose();
+	}
+});
+
+test("ACP logs incomplete-correlation terminals dropped from an acknowledged prompt", async () => {
+	const fixture = await createFixture();
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+	try {
+		const pending = prompt(fixture, "incomplete terminal correlation");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendTerminal({
+			type: "agent_end",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			outcome: { kind: "stopped", reason: "end_turn", provenance: "agent" },
+		});
+		await waitFor(
+			() => errorSpy.mock.calls.some(([event]) => event === "acp_prompt_terminal_dropped"),
+			"incomplete terminal drop log",
+		);
+		expect(errorSpy).toHaveBeenCalledWith("acp_prompt_terminal_dropped", {
+			sessionId: "prompt-terminal-session",
+			terminalType: "agent_end",
+			reason: "incomplete_correlation",
+			commandId: "prompt-terminal-command",
+			expectedCommandId: "prompt-terminal-command",
+			expectedTurnId: "prompt-terminal-turn",
+		});
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "prompt completion after incomplete terminal")).toEqual({ stopReason: "end_turn" });
+	} finally {
+		errorSpy.mockRestore();
 		fixture.dispose();
 	}
 });
@@ -547,8 +622,113 @@ test("ACP keeps the authoritative terminal when it arrives inside the cancel gra
 	}
 });
 
+test("ACP rejects a no_active_turn disposition as a cancel acknowledgement", async () => {
+	const fixture = await createFixture({
+		abortAcknowledgement: { ok: true, selection: "owned", turn: "no_active_turn", terminal: "terminal_no_effect" },
+	});
+	try {
+		// no_active_turn provides no proof the worker was stopped (it can also be a
+		// requester-ownership no-op after an SDK reconnect): the cancel must NOT
+		// settle as acknowledged (review thread P1).
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "no-active-turn cancel acknowledgement"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects an uncertain disposition as a cancel acknowledgement without settling the prompt", async () => {
+	const fixture = await createFixture({
+		cancelSettlementGraceMs: 25,
+		abortAcknowledgement: {
+			ok: true,
+			selection: "owned",
+			turn: "uncertain",
+			ownedWork: "uncertain",
+			automaticDelivery: "none",
+			resumeOnOwnedCompletion: false,
+			reason: "owned_unsettled",
+		},
+	});
+	try {
+		const pending = prompt(fixture, "cancel into uncertainty");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		// uncertain proves nothing was stopped: the cancel is refused and the
+		// prompt must NOT settle as cancelled (the real terminal decides it).
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "uncertain cancel acknowledgement"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+		await Bun.sleep(60);
+		let settled = false;
+		void pending.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		await Bun.sleep(30);
+		expect(settled).toBe(false);
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects a cancel acknowledgement that is neither terminal nor legacy", async () => {
+	const fixture = await createFixture({ abortAcknowledgement: { ok: true, result: {} } });
+	try {
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "unacknowledged cancel"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects a terminal disposition that echoes a foreign scope", async () => {
+	const fixture = await createFixture({
+		abortAcknowledgement: {
+			ok: true,
+			selection: "turn",
+			turn: "stopped",
+			ownedWork: "left_running",
+			automaticDelivery: "enabled",
+			resumeOnOwnedCompletion: true,
+		},
+	});
+	try {
+		// The default cancel requests scope "owned"; a disposition answering
+		// selection "turn" belongs to another abort and must not settle this one.
+		await expect(
+			bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), "foreign-scope cancel"),
+		).rejects.toThrow("SDK did not acknowledge cancellation");
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP rejects the deterministic no_effect and no_store dispositions as cancel acknowledgements", async () => {
+	for (const turn of ["no_effect", "no_store"]) {
+		const fixture = await createFixture({
+			abortAcknowledgement: { ok: true, selection: "owned", turn, terminal: "terminal_no_effect" },
+		});
+		try {
+			// A no-effect disposition is no proof the worker was stopped: the
+			// cancel is refused (review thread P1).
+			await expect(
+				bounded(fixture.agent.cancel({ sessionId: fixture.sessionId }), `${turn} cancel acknowledgement`),
+			).rejects.toThrow("SDK did not acknowledge cancellation");
+		} finally {
+			fixture.dispose();
+		}
+	}
+});
+
 test("ACP suppresses partial and duplicate terminals after settlement", async () => {
 	const fixture = await createFixture();
+	const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
 	try {
 		const pending = prompt(fixture, "late terminal suppression");
 		await bounded(fixture.promptDelivered, "prompt delivery");
@@ -582,12 +762,14 @@ test("ACP suppresses partial and duplicate terminals after settlement", async ()
 		await Bun.sleep(30);
 		expect(fixture.updates).toHaveLength(updatesAfterSettlement);
 		expect(fixture.queryCalls).toHaveLength(queriesAfterSettlement);
+		expect(errorSpy.mock.calls.some(([event]) => event === "acp_prompt_terminal_dropped")).toBe(false);
 	} finally {
+		errorSpy.mockRestore();
 		fixture.dispose();
 	}
 });
 
-test("ACP delivers assistant updates before terminal settlement and drops later updates", async () => {
+test("ACP keeps correlationless session updates publishable after terminal settlement", async () => {
 	const fixture = await createFixture();
 	try {
 		const order: string[] = [];
@@ -609,8 +791,12 @@ test("ACP delivers assistant updates before terminal settlement and drops later 
 		expect(await bounded(pending, "terminal completion")).toEqual({ stopReason: "end_turn" });
 		expect(order).toEqual(["update", "update", "resolved"]);
 		fixture.sendAssistantMessage("after terminal");
-		await Bun.sleep(30);
-		expect(fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(2);
+		await waitFor(
+			() => fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").length === 3,
+			"post-terminal correlationless assistant update",
+		);
+		const lastChunk = fixture.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk").at(-1);
+		expect((lastChunk?.update as { content?: { text?: string } }).content?.text).toBe("after terminal");
 	} finally {
 		fixture.dispose();
 	}

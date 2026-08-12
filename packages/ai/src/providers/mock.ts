@@ -75,8 +75,9 @@ export type MockContent =
 			arguments: Record<string, unknown> | string;
 			/** Simulate a provider-flagged truncated call (cut off mid-arguments). */
 			incompleteArguments?: boolean;
+			/** Typed reason matching `ToolCall.incompleteArgumentsReason`. Defaults to `"truncated"`. */
+			incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 	  };
-
 /** One scripted response. */
 export interface MockResponse {
 	/** Content blocks to emit, in order. Strings become text blocks. */
@@ -87,6 +88,8 @@ export interface MockResponse {
 	usage?: Partial<Omit<Usage, "cost">> & { cost?: Partial<Usage["cost"]> };
 	/** Pre-set responseId. */
 	responseId?: string;
+	/** Optional typed provider failure metadata for retry/fallback tests. */
+	transportFailure?: AssistantMessage["transportFailure"];
 	/** If set, the stream emits a terminal error event instead of completing. */
 	throw?: string | Error;
 	/** Delay before any event is emitted. Honors the call's AbortSignal. */
@@ -363,6 +366,7 @@ async function runMock(
 		provider: model.provider,
 		model: model.id,
 		responseId: response.responseId,
+		transportFailure: response.transportFailure,
 		usage: emptyUsage(),
 		stopReason: "stop",
 		timestamp: startedAt,
@@ -419,7 +423,9 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 			id: input.id ?? generateToolCallId(state),
 			name: input.name,
 			arguments: typeof input.arguments === "string" ? input.arguments : { ...input.arguments },
-			...(input.incompleteArguments ? { incompleteArguments: true } : {}),
+			...(input.incompleteArguments
+				? { incompleteArguments: true, incompleteArgumentsReason: input.incompleteArgumentsReason ?? "truncated" }
+				: {}),
 		} as ToolCall;
 	}
 	return input;

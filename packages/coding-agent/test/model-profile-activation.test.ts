@@ -99,6 +99,11 @@ function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelP
 				maxLevel: ThinkingLevel.XHigh,
 			}),
 			model("anthropic", "claude-sonnet-5"),
+			model("anthropic", "claude-opus-4-6", {
+				mode: "effort",
+				minLevel: ThinkingLevel.Low,
+				maxLevel: ThinkingLevel.XHigh,
+			}),
 			model("opencode-go", "deepseek-v4-pro"),
 			model("opencode-go", "kimi-k3"),
 			model("opencode-go", "mimo-v2.5-pro"),
@@ -210,6 +215,50 @@ describe("model profile activation", () => {
 			executor: "provider-b/executor",
 			architect: "provider-a/architect",
 		});
+	});
+
+	test("built-in claude-opus falls back to Opus 4.6 when Opus 5 is absent", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
+		expect(profile).toBeDefined();
+		const baseRegistry = fakeRegistry({ profiles: [profile!] });
+		const available = baseRegistry.getAll().filter(candidate => candidate.id !== "claude-opus-5");
+		const session = fakeSession();
+
+		const prepared = await prepareModelProfileActivation({
+			session,
+			modelRegistry: {
+				...baseRegistry,
+				getAvailable: baseRegistry.getAll,
+				getAvailableForProfileActivation: () => available,
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: "claude-opus",
+		});
+
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-4-6" });
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
+		expect(prepared.defaultChain).toEqual(["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"]);
+		expect(prepared.agentModelOverrides).toEqual({
+			executor: "anthropic/claude-sonnet-5",
+			planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+			critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+			architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
+		});
+	});
+
+	test("built-in claude-opus retains Opus 5 when the catalog exposes it", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "claude-opus");
+		expect(profile).toBeDefined();
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: fakeRegistry({ profiles: [profile!] }),
+			settings: Settings.isolated(),
+			profileName: "claude-opus",
+		});
+
+		expect(prepared.defaultModel).toMatchObject({ provider: "anthropic", id: "claude-opus-5" });
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.XHigh);
 	});
 
 	test("rejects a mixed provider-agnostic profile before mutation when a role alias is unavailable", async () => {
@@ -1016,6 +1065,46 @@ describe("model profile activation", () => {
 		expect(setCalls).toEqual([]);
 		expect(settings.get("modelProfile.default")).toBeUndefined();
 		expect(session.getActiveModelProfile()).toBe("profile-a");
+	});
+
+	test("re-applies eager delegation after a successful activation but not after rollback", async () => {
+		const session = Object.assign(fakeSession(), { syncEagerDelegation: vi.fn(async () => {}) });
+		await activateModelProfile({
+			session,
+			modelRegistry: fakeRegistry(),
+			settings: Settings.isolated(),
+			profileName: "profile-a",
+		});
+		expect(session.syncEagerDelegation).toHaveBeenCalledTimes(1);
+
+		const rollbackSession = Object.assign(fakeSession(), { syncEagerDelegation: vi.fn(async () => {}) });
+		const settings = Settings.isolated();
+		const prepared = await prepareModelProfileActivation({
+			session: rollbackSession,
+			modelRegistry: fakeRegistry(),
+			settings,
+			profileName: "profile-a",
+		});
+		vi.spyOn(settings, "flushOrThrow").mockRejectedValueOnce(new Error("flush failed"));
+
+		await expect(applyPreparedModelProfileActivation(prepared, { persistDefault: true })).rejects.toThrow(
+			"flush failed",
+		);
+		expect(rollbackSession.syncEagerDelegation).not.toHaveBeenCalled();
+	});
+
+	test("a failing delegation sync never fails an already-applied activation", async () => {
+		const session = Object.assign(fakeSession(), {
+			syncEagerDelegation: vi.fn(async () => {
+				throw new Error("prompt refresh failed");
+			}),
+		});
+		const settings = Settings.isolated();
+
+		await activateModelProfile({ session, modelRegistry: fakeRegistry(), settings, profileName: "profile-a" });
+
+		expect(session.getActiveModelProfile()).toBe("profile-a");
+		expect(settings.get("task.agentModelOverrides")).toMatchObject({ executor: "provider-b/executor" });
 	});
 
 	test("materializing a profile role override persists the full effective assignment set and clears the profile", async () => {
@@ -2082,5 +2171,335 @@ describe("preset-equivalent profile activation", () => {
 		} finally {
 			tempDir.removeSync();
 		}
+	});
+});
+
+describe("model-profile-activation: OpenAI-compatible proxy routing", () => {
+	const proxyModel = (id: string, thinking?: Model["thinking"]): Model => model("litellm", id, thinking);
+
+	// xai/grok-4.3 is pinned by builtin grok profiles and is proxy-routable.
+	const grokProfile: ModelProfileDefinition = {
+		name: "grok-pro",
+		requiredProviders: ["xai"],
+		modelMapping: {
+			default: "xai/grok-4.3:medium",
+			executor: "xai/grok-4.3:high",
+		},
+		source: "builtin",
+	};
+
+	function proxyRegistry(
+		options: { proxyApiKey?: string; missing?: string[]; profiles?: ModelProfileDefinition[] } = {},
+	) {
+		const base = fakeRegistry({ missingProviders: options.missing, profiles: options.profiles });
+		return {
+			...base,
+			getAll: () => [
+				...base.getAll(),
+				model("xai", "grok-4.3", {
+					mode: "effort",
+					minLevel: ThinkingLevel.Low,
+					maxLevel: ThinkingLevel.XHigh,
+				}),
+				proxyModel("xai/grok-4.3", {
+					mode: "effort",
+					minLevel: ThinkingLevel.Low,
+					maxLevel: ThinkingLevel.XHigh,
+				}),
+			],
+			getConfiguredProviderIds: () => ["litellm"],
+			getApiKeyForProvider: async (provider: string) => {
+				if (provider === "litellm") {
+					// Explicit undefined means "proxy not authenticated"; the default
+					// (no key passed) means "authenticated".
+					return "proxyApiKey" in options ? options.proxyApiKey : "key-litellm";
+				}
+				return base.getApiKeyForProvider(provider);
+			},
+		};
+	}
+
+	test("routes builtin preset selectors through the proxy when the direct provider is unauthenticated", async () => {
+		const settings = Settings.isolated({ "modelProfile.proxyProvider": "litellm" });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: proxyRegistry({ missing: ["xai"], profiles: [grokProfile] }) as unknown as ModelRegistry,
+			settings,
+			profileName: grokProfile.name,
+		});
+
+		expect(prepared.defaultModel?.provider).toBe("litellm");
+		expect(prepared.defaultModel?.id).toBe("xai/grok-4.3");
+		expect(prepared.defaultChain).toEqual(["litellm/xai/grok-4.3:medium"]);
+		expect(prepared.agentModelOverrides.executor).toBe("litellm/xai/grok-4.3:high");
+	});
+
+	test("keeps direct selectors when the direct provider is authenticated even with a proxy configured", async () => {
+		const settings = Settings.isolated({ "modelProfile.proxyProvider": "litellm" });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: proxyRegistry({ profiles: [grokProfile] }) as unknown as ModelRegistry,
+			settings,
+			profileName: grokProfile.name,
+		});
+
+		expect(prepared.defaultModel?.provider).toBe("xai");
+		expect(prepared.defaultModel?.id).toBe("grok-4.3");
+		expect(prepared.defaultChain).toEqual(["xai/grok-4.3:medium"]);
+		expect(prepared.agentModelOverrides.executor).toBe("xai/grok-4.3:high");
+	});
+
+	test("routes builtin preset selectors through the proxy in always mode despite direct credentials", async () => {
+		const settings = Settings.isolated({
+			"modelProfile.proxyProvider": "litellm",
+			"modelProfile.proxyMode": "always",
+		});
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: proxyRegistry({ profiles: [grokProfile] }) as unknown as ModelRegistry,
+			settings,
+			profileName: grokProfile.name,
+		});
+
+		expect(prepared.defaultModel?.provider).toBe("litellm");
+		expect(prepared.defaultChain).toEqual(["litellm/xai/grok-4.3:medium"]);
+		expect(prepared.agentModelOverrides.executor).toBe("litellm/xai/grok-4.3:high");
+	});
+
+	test("routes provider-agnostic builtin aliases through an exact proxy model in always mode", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "open-weights-grok",
+			requiredProviders: [],
+			modelMapping: { default: "grok-4.3:medium" },
+			source: "builtin",
+		};
+		const registry = proxyRegistry({ profiles: [profile] });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: {
+				...registry,
+				getAll: () => [...registry.getAll(), proxyModel("grok-4.3")],
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm", "modelProfile.proxyMode": "always" }),
+			profileName: profile.name,
+		});
+		expect(prepared.defaultChain).toEqual(["litellm/grok-4.3:medium"]);
+	});
+
+	test("fails closed pointing at the proxy when a routable provider is missing and the proxy is unauthenticated", async () => {
+		const settings = Settings.isolated({ "modelProfile.proxyProvider": "litellm" });
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: proxyRegistry({
+					missing: ["xai"],
+					proxyApiKey: undefined,
+					profiles: [grokProfile],
+				}) as unknown as ModelRegistry,
+				settings,
+				profileName: grokProfile.name,
+			}),
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			profileLabel: grokProfile.name,
+			providers: ["litellm"],
+		});
+	});
+
+	test("keeps the direct provider credential error when no proxy is configured", async () => {
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: proxyRegistry({ missing: ["xai"], profiles: [grokProfile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: grokProfile.name,
+			}),
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			profileLabel: grokProfile.name,
+			providers: ["xai"],
+		});
+	});
+
+	test("treats a keyless proxy as authenticated for routing", async () => {
+		const settings = Settings.isolated({ "modelProfile.proxyProvider": "litellm" });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: proxyRegistry({
+				missing: ["xai"],
+				proxyApiKey: kNoAuth,
+				profiles: [grokProfile],
+			}) as unknown as ModelRegistry,
+			settings,
+			profileName: grokProfile.name,
+		});
+
+		expect(prepared.defaultModel?.provider).toBe("litellm");
+	});
+
+	test("never routes user-defined profiles through the proxy", async () => {
+		const userProfile: ModelProfileDefinition = { ...grokProfile, name: "user-grok", source: "user" };
+		const settings = Settings.isolated({ "modelProfile.proxyProvider": "litellm" });
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: proxyRegistry({ missing: ["xai"], profiles: [userProfile] }) as unknown as ModelRegistry,
+				settings,
+				profileName: userProfile.name,
+			}),
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			profileLabel: userProfile.name,
+			providers: ["xai"],
+		});
+	});
+
+	test("satisfies an all-routable alternative group through the proxy", async () => {
+		const group = ["xiaomi", "xiaomi-token-plan-sgp", "xiaomi-token-plan-ams", "xiaomi-token-plan-cn"];
+		const mimoProfile: ModelProfileDefinition = {
+			name: "mimo-medium",
+			requiredProviders: [...group],
+			modelMapping: { default: "xiaomi/mimo-v2.5-pro:medium" },
+			alternativeProviderGroups: [group],
+			source: "builtin",
+		};
+		const registry = proxyRegistry({ missing: group, profiles: [mimoProfile] });
+		const settings = Settings.isolated({ "modelProfile.proxyProvider": "litellm" });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: {
+				...registry,
+				getAll: () => [
+					...registry.getAll(),
+					proxyModel("xiaomi/mimo-v2.5-pro", {
+						mode: "effort",
+						minLevel: ThinkingLevel.Low,
+						maxLevel: ThinkingLevel.XHigh,
+					}),
+				],
+			} as unknown as ModelRegistry,
+			settings,
+			profileName: mimoProfile.name,
+		});
+
+		expect(prepared.defaultModel?.provider).toBe("litellm");
+		expect(prepared.defaultModel?.id).toBe("xiaomi/mimo-v2.5-pro");
+	});
+
+	test("rejects a non-routable missing provider even when the proxy is configured", async () => {
+		const profile: ModelProfileDefinition = {
+			name: "custom-strict",
+			requiredProviders: ["acme-private"],
+			modelMapping: { default: "acme-private/alpha:medium" },
+			source: "builtin",
+		};
+		const base = fakeRegistry({ missingProviders: ["acme-private"], profiles: [profile] });
+		const registry = {
+			...base,
+			getAll: () => [...base.getAll(), proxyModel("acme-private/alpha")],
+			getConfiguredProviderIds: () => ["litellm"],
+			getApiKeyForProvider: async (provider: string) =>
+				provider === "litellm" ? "key-litellm" : base.getApiKeyForProvider(provider),
+		};
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: registry as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			providers: ["acme-private"],
+		});
+	});
+
+	test("rejects an invalid or unconfigured proxy provider id with a config error", async () => {
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: proxyRegistry({ profiles: [grokProfile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "Bad Proxy!" }),
+				profileName: grokProfile.name,
+			}),
+		).rejects.toThrow(/proxyProvider must be a lowercase provider id/);
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: proxyRegistry({ profiles: [grokProfile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "litelm" }),
+				profileName: grokProfile.name,
+			}),
+		).rejects.toThrow(/proxyProvider "litelm" is not configured/);
+	});
+
+	test("fails closed when any proxy-routed preset binding has no proxy model", async () => {
+		const profile: ModelProfileDefinition = {
+			...grokProfile,
+			modelMapping: {
+				default: "xai/grok-4.3:medium",
+				executor: "xai/grok-4.4:high",
+			},
+		};
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: proxyRegistry({ missing: ["xai"], profiles: [profile] }) as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(/does not expose a model for "xai\/grok-4.4"/);
+	});
+
+	test("uses an exact upstream-prefixed proxy model instead of ambiguous suffix matches", async () => {
+		const profile: ModelProfileDefinition = {
+			...grokProfile,
+			modelMapping: { default: "xai/grok-4.3:medium" },
+		};
+		const registry = proxyRegistry({ missing: ["xai"], profiles: [profile] });
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: {
+				...registry,
+				getAll: () => [...registry.getAll(), proxyModel("other/grok-4.3")],
+			} as unknown as ModelRegistry,
+			settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
+			profileName: profile.name,
+		});
+		expect(prepared.defaultChain).toEqual(["litellm/xai/grok-4.3:medium"]);
+	});
+
+	test("rejects differently prefixed proxy model matches", async () => {
+		const profile: ModelProfileDefinition = {
+			...grokProfile,
+			modelMapping: { default: "xai/grok-4.4:medium" },
+		};
+		const registry = proxyRegistry({ missing: ["xai"], profiles: [profile] });
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: {
+					...registry,
+					getAll: () => [...registry.getAll(), proxyModel("foo/grok-4.4"), proxyModel("bar/grok-4.4")],
+				} as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "litellm" }),
+				profileName: profile.name,
+			}),
+		).rejects.toThrow(/does not expose a model for "xai\/grok-4.4"/);
+	});
+
+	test("rejects a direct provider configured as its own always-mode proxy", async () => {
+		await expect(
+			prepareModelProfileActivation({
+				session: fakeSession(),
+				modelRegistry: {
+					...proxyRegistry({ profiles: [grokProfile] }),
+					getConfiguredProviderIds: () => ["xai"],
+					getApiKeyForProvider: async () => "key-xai",
+				} as unknown as ModelRegistry,
+				settings: Settings.isolated({ "modelProfile.proxyProvider": "xai", "modelProfile.proxyMode": "always" }),
+				profileName: grokProfile.name,
+			}),
+		).rejects.toThrow(/cannot route its own direct selector/);
 	});
 });

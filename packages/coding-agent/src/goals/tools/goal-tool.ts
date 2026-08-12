@@ -99,7 +99,10 @@ async function executeGoalOperation(session: ToolSession, params: GoalToolInput)
 	}
 	if (params.op === "pause") {
 		try {
-			await assertUltragoalPauseAllowed(session.cwd);
+			await assertUltragoalPauseAllowed(
+				session.cwd,
+				session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.(),
+			);
 		} catch (error) {
 			throw new ToolError(error instanceof Error ? error.message : String(error));
 		}
@@ -112,6 +115,7 @@ async function executeGoalOperation(session: ToolSession, params: GoalToolInput)
 				cwd: session.cwd,
 				currentGoal: session.getGoalModeState?.()?.goal ?? null,
 				sessionId: session.getSessionId?.(),
+				agentDir: session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.(),
 			});
 		} catch (error) {
 			throw new ToolError(error instanceof Error ? error.message : String(error));
@@ -124,6 +128,7 @@ async function executeGoalOperation(session: ToolSession, params: GoalToolInput)
 			cwd: session.cwd,
 			currentGoal: session.getGoalModeState?.()?.goal ?? null,
 			sessionId: session.getSessionId?.(),
+			agentDir: session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.(),
 		});
 	} catch (error) {
 		throw new ToolError(error instanceof Error ? error.message : String(error));

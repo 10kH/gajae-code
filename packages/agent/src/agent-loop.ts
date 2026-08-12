@@ -10,6 +10,7 @@ import {
 	type Context,
 	classifyContextOverflow,
 	classifyFallbackTrigger,
+	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
 	isZodSchema,
 	streamSimple,
@@ -173,6 +174,23 @@ function managedRetryableFailure(failure: unknown): boolean {
 	// downstream would block healthy credentials on the way.
 	if (trigger.class === "auth") return trigger.authDisposition !== "forbidden";
 	return trigger.class === "rate_limit" || trigger.class === "quota" || trigger.class === "server";
+}
+
+function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
+	if (
+		message.stopReason !== "stop" ||
+		message.content.length !== 0 ||
+		message.usage.input !== 0 ||
+		message.usage.output !== 0 ||
+		message.usage.cacheRead !== 0 ||
+		message.usage.cacheWrite !== 0 ||
+		message.usage.totalTokens !== 0 ||
+		managedTransportFailure(message)?.providerCode?.toLowerCase() !== EMPTY_RESPONSE_PROVIDER_CODE
+	) {
+		return;
+	}
+	message.stopReason = "error";
+	message.errorMessage = "Provider returned an empty response with zero token usage";
 }
 
 /**
@@ -791,6 +809,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const intent = managedProperty(value, "intent");
 	const customWireName = managedProperty(value, "customWireName");
 	const incompleteArguments = managedProperty(value, "incompleteArguments");
+	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
 	return {
 		type,
 		id,
@@ -800,6 +819,15 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 		...(typeof intent === "string" ? { intent } : {}),
 		...(typeof customWireName === "string" ? { customWireName } : {}),
 		...(typeof incompleteArguments === "boolean" ? { incompleteArguments } : {}),
+		...(typeof incompleteArgumentsReason === "string"
+			? {
+					incompleteArgumentsReason: incompleteArgumentsReason as
+						| "truncated"
+						| "malformed"
+						| "conflicting"
+						| "ambiguous",
+				}
+			: {}),
 	};
 }
 
@@ -2420,6 +2448,7 @@ async function streamAssistantResponse(
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(await finishResponse(), config.model)
 								: await finishResponse();
+							promoteTypedEmptyResponseStop(finalMessage);
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
 							} else {
@@ -2714,15 +2743,19 @@ async function executeToolCalls(
 			try {
 				if (toolCall.incompleteArguments) {
 					record.argumentValidationFailed = true;
-					// The provider flagged this call's argument JSON as truncated
-					// (the model hit its output-token limit mid-call). Executing the
-					// best-effort partial parse would run the tool on wrong input, so
-					// reject with a retryable, actionable error instead.
-					throw new Error(
-						`Tool call "${toolCall.name}" was cut off before its arguments finished streaming ` +
-							`(the response hit its output token limit). The partial arguments cannot be executed. ` +
-							`Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`,
-					);
+					// The provider flagged this call's arguments as unsafe to execute.
+					// The typed reason selects accurate recovery guidance; callers that
+					// only read the boolean still get a safe, actionable rejection.
+					const reason = toolCall.incompleteArgumentsReason;
+					const detail =
+						reason === "malformed"
+							? `The terminal arguments for tool call "${toolCall.name}" did not decode to a valid JSON object. The arguments cannot be executed. Re-issue the call with valid, complete arguments.`
+							: reason === "conflicting"
+								? `The streamed and terminal arguments for tool call "${toolCall.name}" disagree. The arguments cannot be executed safely. Re-issue the call with consistent arguments.`
+								: reason === "ambiguous"
+									? `The identity of tool call "${toolCall.name}" was ambiguous on the wire (duplicate call id or id/call_id collision), so its arguments cannot be safely attributed. Re-issue the call.`
+									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
+					throw new Error(detail);
 				}
 				if (!tool) {
 					// A discoverable tool that hasn't been activated yet resolves to

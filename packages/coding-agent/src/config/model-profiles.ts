@@ -170,11 +170,11 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "gpt-5.6-luna:xhigh",
 	}),
 	profile("claude-opus", ["anthropic"], {
-		default: "anthropic/claude-opus-5:xhigh",
+		default: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
 		executor: "anthropic/claude-sonnet-5",
-		planner: "anthropic/claude-opus-5:low",
-		critic: "anthropic/claude-opus-5:high",
-		architect: "anthropic/claude-opus-5:xhigh",
+		planner: ["anthropic/claude-opus-5:low", "anthropic/claude-opus-4-6:low"],
+		critic: ["anthropic/claude-opus-5:high", "anthropic/claude-opus-4-6:high"],
+		architect: ["anthropic/claude-opus-5:xhigh", "anthropic/claude-opus-4-6:xhigh"],
 	}),
 	profile("claude-fable", ["anthropic"], {
 		default: "anthropic/claude-fable-5:xhigh",
@@ -404,6 +404,23 @@ export const BUILTIN_MODEL_PROFILES: readonly ModelProfileDefinition[] = [
 		architect: "openai-codex/gpt-5.6-sol:xhigh",
 	}),
 ];
+
+/**
+ * Providers that built-in model presets pin via qualified `<provider>/<model>`
+ * selectors. When `modelProfile.proxyProvider` is set, selectors for these
+ * providers are rewritten to `<proxy>/<model>` at activation time when their
+ * direct provider is unauthenticated, or unconditionally when
+ * `modelProfile.proxyMode` is `always`. Bare-alias (open-weights) profiles are
+ * not included: they already resolve through any authenticated provider,
+ * including a configured proxy.
+ */
+export const PROXY_ROUTABLE_PROVIDER_IDS: ReadonlySet<string> = new Set(
+	BUILTIN_MODEL_PROFILES.flatMap(definition => [
+		...definition.requiredProviders,
+		...deriveModelProfileMappedProviders(definition),
+		...(definition.alternativeProviderGroups ?? []).flat(),
+	]),
+);
 
 export interface ModelProfilePresentation {
 	displayName: string;

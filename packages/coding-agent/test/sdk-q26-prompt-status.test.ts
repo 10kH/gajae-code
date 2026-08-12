@@ -28,6 +28,7 @@ describe("prompt reconciliation record", () => {
 		rec.noteAccepted(correlation(), "ref-1");
 		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
 			status: "accepted",
+			receiptState: "absent",
 			commandId: "command-1",
 			turnId: "turn-1",
 			clientRef: "ref-1",
@@ -36,6 +37,7 @@ describe("prompt reconciliation record", () => {
 		rec.noteTransition(correlation(), { type: "agent_start" });
 		expect(rec.lookup({ clientRef: "ref-1" })).toEqual({
 			status: "in_flight",
+			receiptState: "absent",
 			commandId: "command-1",
 			turnId: "turn-1",
 			clientRef: "ref-1",
@@ -45,6 +47,7 @@ describe("prompt reconciliation record", () => {
 		rec.noteTransition(correlation(), { type: "agent_end" });
 		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
 			status: "terminal_ok",
+			receiptState: "missing",
 			commandId: "command-1",
 			turnId: "turn-1",
 			clientRef: "ref-1",
@@ -101,8 +104,14 @@ describe("prompt reconciliation record", () => {
 	it("reports unknown for a wrong commandId/turnId pair even when the commandId exists", () => {
 		const rec = createPromptReconciliation();
 		rec.noteAccepted(correlation());
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-other" })).toEqual({ status: "unknown" });
-		expect(rec.lookup({ commandId: "command-other", turnId: "turn-1" })).toEqual({ status: "unknown" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-other" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
+		expect(rec.lookup({ commandId: "command-other", turnId: "turn-1" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
 	});
 
 	it("reports unknown after session-runtime restart", () => {
@@ -110,8 +119,8 @@ describe("prompt reconciliation record", () => {
 		beforeRestart.noteAccepted(correlation(), "restart-ref");
 		expect(beforeRestart.lookup({ clientRef: "restart-ref" })).toMatchObject({ status: "accepted" });
 		const afterRestart = createPromptReconciliation();
-		expect(afterRestart.lookup({ clientRef: "restart-ref" })).toEqual({ status: "unknown" });
-		expect(afterRestart.lookup(correlation())).toEqual({ status: "unknown" });
+		expect(afterRestart.lookup({ clientRef: "restart-ref" })).toEqual({ status: "unknown", receiptState: "unknown" });
+		expect(afterRestart.lookup(correlation())).toEqual({ status: "unknown", receiptState: "unknown" });
 	});
 
 	it("never ages an active record into terminal", () => {
@@ -134,8 +143,11 @@ describe("prompt reconciliation record", () => {
 		clock.advance(PROMPT_RECONCILIATION_TERMINAL_TTL_MS);
 		// Admission itself enforces cleanup; no preceding lookup is required.
 		expect(() => rec.admit("ref-1")).not.toThrow();
-		expect(rec.lookup({ clientRef: "ref-1" })).toEqual({ status: "unknown" });
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({ status: "unknown" });
+		expect(rec.lookup({ clientRef: "ref-1" })).toEqual({ status: "unknown", receiptState: "unknown" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
 	});
 
 	it("rejects a retained duplicate clientRef before execution", () => {
@@ -175,7 +187,10 @@ describe("prompt reconciliation record", () => {
 			rec.noteTransition(correlation(n), { type: "agent_end" });
 			clock.advance(1);
 		}
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({ status: "unknown" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
 		expect(
 			rec.lookup({
 				commandId: `command-${PROMPT_RECONCILIATION_TERMINAL_CAPACITY + 1}`,
@@ -198,7 +213,10 @@ describe("prompt reconciliation record", () => {
 		// must drop the oldest terminal record, not the newly terminal one.
 		rec.noteTransition({ commandId: "command-early", turnId: "turn-early" }, { type: "agent_end" });
 		expect(rec.lookup({ clientRef: "ref-early" })).toMatchObject({ status: "terminal_ok" });
-		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({ status: "unknown" });
+		expect(rec.lookup({ commandId: "command-1", turnId: "turn-1" })).toEqual({
+			status: "unknown",
+			receiptState: "unknown",
+		});
 	});
 
 	it("holds admission reservations across overlapping preflights until acceptance or release", () => {
@@ -334,13 +352,21 @@ describe("prompt reconciliation record", () => {
 			acceptedAt: startedAt,
 			startedAt,
 			terminalAt,
+			receiptState: "missing",
 			error: { code: "transport_reset", message: "Prompt submission failed." },
 		});
 		expect(rec.activeCount()).toBe(0);
 	});
 });
 
-function surface(getPromptStatus?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown) {
+function surface(
+	getTurnResult?: (selector: {
+		kind: "prompt" | "skill";
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}) => unknown,
+) {
 	return {
 		getTranscriptEntries: () => [],
 		getContextSnapshot: () => ({}),
@@ -362,50 +388,89 @@ function surface(getPromptStatus?: (selector: { commandId?: string; turnId?: str
 		getQueueMessages: () => [],
 		getExtensions: () => [],
 		getJobs: () => [],
-		...(getPromptStatus ? { getPromptStatus } : {}),
+		...(getTurnResult ? { getTurnResult } : {}),
 	};
 }
 
 function handlers(
-	getPromptStatus?: (selector: { commandId?: string; turnId?: string; clientRef?: string }) => unknown,
+	getTurnResult?: (selector: {
+		kind: "prompt" | "skill";
+		commandId?: string;
+		turnId?: string;
+		clientRef?: string;
+	}) => unknown,
 ) {
 	const store = new RevisionStore("s1");
 	const cursors = new CursorRegistry("token", store);
-	return new QueryHandlers(surface(getPromptStatus) as never, "s1", store, cursors);
+	return new QueryHandlers(surface(getTurnResult) as never, "s1", store, cursors);
 }
 
-describe("Q26 turn.prompt_status query handler", () => {
-	it("resolves by commandId/turnId pair and returns the surface result", async () => {
+describe("turn.result query handler and retained aliases", () => {
+	it("delegates the prompt alias with an injected prompt kind", async () => {
 		const seen: unknown[] = [];
 		const h = handlers(selector => {
 			seen.push(selector);
-			return { status: "in_flight", commandId: "c1", turnId: "t1", acceptedAt: 1, startedAt: 2 };
+			return { kind: "prompt", status: "in_flight", commandId: "c1", turnId: "t1", acceptedAt: 1, startedAt: 2 };
 		});
 		const response = await h.dispatch({
 			query: "turn.prompt_status",
 			input: { commandId: "c1", turnId: "t1" },
 			connectionId: "c",
 		});
-		expect(response).toMatchObject({ ok: true, result: { status: "in_flight" } });
-		expect(seen).toEqual([{ commandId: "c1", turnId: "t1" }]);
+		expect(response).toMatchObject({ ok: true, result: { kind: "prompt", status: "in_flight" } });
+		expect(seen).toEqual([{ kind: "prompt", commandId: "c1", turnId: "t1" }]);
 	});
-
-	it("resolves by clientRef and by the Q26 numeric alias", async () => {
+	it("delegates the skill alias with an injected skill kind", async () => {
 		const seen: unknown[] = [];
 		const h = handlers(selector => {
 			seen.push(selector);
-			return { status: "accepted", commandId: "c1", turnId: "t1", clientRef: "ref-1", acceptedAt: 1 };
+			return { kind: "skill", status: "in_flight", commandId: "c1", turnId: "t1", acceptedAt: 1, startedAt: 2 };
 		});
-		const response = await h.dispatch({ query: "Q26", input: { clientRef: "ref-1" }, connectionId: "c" });
-		expect(response).toMatchObject({ ok: true, result: { status: "accepted", clientRef: "ref-1" } });
-		expect(seen).toEqual([{ clientRef: "ref-1" }]);
+		const response = await h.dispatch({
+			query: "skill.invoke_status",
+			input: { commandId: "c1", turnId: "t1" },
+			connectionId: "c",
+		});
+		expect(response).toMatchObject({ ok: true, result: { kind: "skill", status: "in_flight" } });
+		expect(seen).toEqual([{ kind: "skill", commandId: "c1", turnId: "t1" }]);
 	});
 
-	it("normalizes a padded clientRef selector before lookup", async () => {
+	it("requires kind on the canonical Q26 query", async () => {
 		const seen: unknown[] = [];
 		const h = handlers(selector => {
 			seen.push(selector);
-			return { status: "accepted", commandId: "c1", turnId: "t1", clientRef: "ref-1", acceptedAt: 1 };
+			return {
+				kind: "prompt",
+				status: "accepted",
+				commandId: "c1",
+				turnId: "t1",
+				clientRef: "ref-1",
+				acceptedAt: 1,
+			};
+		});
+		const missingKind = await h.dispatch({ query: "Q26", input: { clientRef: "ref-1" }, connectionId: "c" });
+		expect(missingKind).toMatchObject({ ok: false, error: { code: "invalid_request" } });
+		const response = await h.dispatch({
+			query: "Q26",
+			input: { kind: "prompt", clientRef: "ref-1" },
+			connectionId: "c",
+		});
+		expect(response).toMatchObject({ ok: true, result: { kind: "prompt", status: "accepted", clientRef: "ref-1" } });
+		expect(seen).toEqual([{ kind: "prompt", clientRef: "ref-1" }]);
+	});
+
+	it("normalizes a padded clientRef before alias delegation", async () => {
+		const seen: unknown[] = [];
+		const h = handlers(selector => {
+			seen.push(selector);
+			return {
+				kind: "prompt",
+				status: "accepted",
+				commandId: "c1",
+				turnId: "t1",
+				clientRef: "ref-1",
+				acceptedAt: 1,
+			};
 		});
 		const response = await h.dispatch({
 			query: "turn.prompt_status",
@@ -413,7 +478,7 @@ describe("Q26 turn.prompt_status query handler", () => {
 			connectionId: "c",
 		});
 		expect(response.ok).toBe(true);
-		expect(seen).toEqual([{ clientRef: "ref-1" }]);
+		expect(seen).toEqual([{ kind: "prompt", clientRef: "ref-1" }]);
 	});
 
 	it("rejects a partial commandId/turnId pair", async () => {
@@ -441,7 +506,7 @@ describe("Q26 turn.prompt_status query handler", () => {
 		}
 	});
 
-	it("prohibits cursors on the keyed lookup", async () => {
+	it("rejects cursors as unreachable continuation", async () => {
 		const h = handlers(() => ({}));
 		const response = await h.dispatch({
 			query: "turn.prompt_status",

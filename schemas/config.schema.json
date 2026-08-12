@@ -408,6 +408,19 @@
 				"default": {
 					"type": "string",
 					"description": "Model profile applied automatically at startup"
+				},
+				"proxyProvider": {
+					"type": "string",
+					"description": "Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints."
+				},
+				"proxyMode": {
+					"type": "string",
+					"enum": [
+						"fallback",
+						"always"
+					],
+					"description": "fallback routes only selectors whose direct provider lacks credentials; always routes every proxy-routable built-in preset selector through the configured proxy.",
+					"default": "fallback"
 				}
 			},
 			"additionalProperties": false
@@ -460,12 +473,27 @@
 							"default": "off"
 						},
 						"maxIterations": {
-							"type": "number",
-							"default": 5
+							"type": "integer",
+							"default": 5,
+							"minimum": 1,
+							"maximum": 20
 						},
 						"maxReviewPassesPerLane": {
-							"type": "number",
-							"default": 1
+							"type": "integer",
+							"default": 1,
+							"minimum": 1,
+							"maximum": 10
+						}
+					},
+					"additionalProperties": false
+				},
+				"ultragoal": {
+					"type": "object",
+					"properties": {
+						"nudgeBudget": {
+							"type": "integer",
+							"default": 10,
+							"minimum": 0
 						}
 					},
 					"additionalProperties": false
@@ -909,7 +937,7 @@
 				},
 				"eager": {
 					"type": "boolean",
-					"description": "Encourage the agent to delegate work to subagents unless changes are trivial",
+					"description": "Encourage the agent to delegate work to subagents unless changes are trivial (on by default when executor/planner run on a different provider than the default role)",
 					"default": false
 				},
 				"simple": {
@@ -1157,6 +1185,17 @@
 				"enabled": {
 					"type": "boolean",
 					"description": "Show the interactive GitHub star reminder when gh is authenticated",
+					"default": true
+				}
+			},
+			"additionalProperties": false
+		},
+		"crashReport": {
+			"type": "object",
+			"properties": {
+				"nudge": {
+					"type": "boolean",
+					"description": "At interactive startup, show one rate-limited line when unreported crash signatures exist. Reads local state only; nothing is ever transmitted without the explicit consent flow in `gjc crash report`.",
 					"default": true
 				}
 			},
@@ -1608,9 +1647,10 @@
 					"enum": [
 						"off",
 						"shadow",
-						"enabled"
+						"enabled",
+						"auto"
 					],
-					"default": "shadow"
+					"default": "auto"
 				},
 				"contextOverflowRecovery": {
 					"type": "boolean",
@@ -1625,14 +1665,29 @@
 				"mode": {
 					"type": "string",
 					"enum": [
+						"auto",
 						"apply_patch",
 						"hashline",
 						"patch",
 						"replace",
 						"vim"
 					],
-					"description": "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
-					"default": "hashline"
+					"description": "Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
+					"default": "auto"
+				},
+				"modelVariants": {
+					"type": "object",
+					"additionalProperties": {
+						"type": "string",
+						"enum": [
+							"apply_patch",
+							"hashline",
+							"patch",
+							"replace",
+							"vim"
+						]
+					},
+					"default": {}
 				},
 				"fuzzyMatch": {
 					"type": "boolean",
@@ -2652,36 +2707,6 @@
 					],
 					"description": "Provider for web search tool",
 					"default": "auto"
-				},
-				"image": {
-					"type": "string",
-					"enum": [
-						"auto",
-						"openai",
-						"gemini",
-						"openrouter",
-						"antigravity",
-						"alibaba",
-						"custom"
-					],
-					"description": "Provider and model for image generation tool",
-					"default": "auto"
-				},
-				"imageModel": {
-					"type": "string",
-					"description": "Override the default image generation model for the selected provider"
-				},
-				"imageCustomUrl": {
-					"type": "string",
-					"description": "Base URL for custom OpenAI-compatible image endpoint"
-				},
-				"imageCustomKey": {
-					"type": "string",
-					"description": "API key for custom OpenAI-compatible image endpoint"
-				},
-				"imageCustomKeyEnv": {
-					"type": "string",
-					"description": "Environment variable name holding the API key for custom image endpoint"
 				},
 				"kimiApiFormat": {
 					"type": "string",

@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as native from "@gajae-code/natives";
+import { logger } from "@gajae-code/utils";
 import {
 	artifactTreeReplayCompatible,
 	deleteManagedSessionCandidate,
@@ -13,6 +14,7 @@ import {
 	ManagedSessionScopeTestHooks,
 	openManagedCandidateForWrite,
 	prepareManagedSessionScopeForWrite,
+	prepareManagedSessionScopeForWriteSync,
 	reconcileManagedTombstones,
 	resolveManagedScope,
 } from "../../src/session/internal/managed-session-scope";
@@ -2782,7 +2784,10 @@ describe("managed session write protocol", () => {
 				await expect(prepareManagedSessionScopeForWrite(restarted.scope)).resolves.toMatchObject({
 					kind: "error",
 					code: "durability_failed",
-					cause: { classification: "binding_invalid" },
+					// Since #4185 the operator-visible classification mirrors the
+					// recognized error code instead of falling back to a false
+					// `binding_invalid` corruption report (#4184).
+					cause: { classification: "durability_failed" },
 				});
 			} finally {
 				FileSessionStorage.prototype.deleteSessionVerified = originalDelete;
@@ -2951,5 +2956,163 @@ describe("managed session write protocol", () => {
 			remove.mockRestore();
 			unlink.mockRestore();
 		}
+	});
+});
+
+describe("scrubbed write-protocol remnant reaping", () => {
+	const remnantNames = [
+		".gjc-exact-unlink-placeholder-100000d-cad4835",
+		".gjc-exact-replace-destination-100000d-9f00001",
+		".gjc-receipt-remove-100000d-c023948-100000d-c023947",
+		".gjc-receipt-placeholder-remove-1-2-3-4-5-6",
+		".gjc-replace-retry-100000d-c024971",
+	];
+	const aged = new Date(Date.now() - 60 * 60 * 1000);
+
+	it("reaps only aged zero-length remnants and preserves evidence", async () => {
+		const { scope } = await fixture();
+		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+		for (const name of remnantNames) {
+			const pathname = path.join(scope.directoryPath, name);
+			await fs.writeFile(pathname, "", { mode: 0o600 });
+			await fs.utimes(pathname, aged, aged);
+		}
+		const fresh = path.join(scope.directoryPath, ".gjc-exact-unlink-placeholder-fresh");
+		await fs.writeFile(fresh, "", { mode: 0o600 });
+		const evidence = path.join(scope.directoryPath, ".gjc-receipt-remove-retained-evidence");
+		await fs.writeFile(evidence, "retained receipt payload", { mode: 0o600 });
+		await fs.utimes(evidence, aged, aged);
+		const transcriptFile = path.join(scope.directoryPath, "unrelated.jsonl");
+		await fs.writeFile(transcriptFile, "", { mode: 0o600 });
+		await fs.utimes(transcriptFile, aged, aged);
+
+		expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({
+			reaped: remnantNames.length,
+			failures: 0,
+		});
+
+		const remaining = await fs.readdir(scope.directoryPath);
+		expect(remaining.sort()).toEqual(
+			[path.basename(fresh), path.basename(evidence), path.basename(transcriptFile)].sort(),
+		);
+	});
+
+	it("removes aged remnants during managed scope preparation", async () => {
+		const { scope } = await fixture();
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+		for (const name of remnantNames) {
+			const pathname = path.join(scope.directoryPath, name);
+			await fs.writeFile(pathname, "", { mode: 0o600 });
+			await fs.utimes(pathname, aged, aged);
+		}
+
+		expect((await prepareManagedSessionScopeForWrite(scope)).kind).toBe("resolved");
+
+		const remaining = await fs.readdir(scope.directoryPath);
+		for (const name of remnantNames) expect(remaining).not.toContain(name);
+		expect(remaining).toContain(MANAGED_SESSION_BINDING_FILE);
+	});
+
+	it("reaps an over-limit poisoned scope before binding publication and preserves protected entries", async () => {
+		const { scope } = await fixture();
+		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+		for (let index = 0; index <= MANAGED_ARTIFACT_MAX_FILES; index += 1) {
+			const pathname = path.join(scope.directoryPath, `.gjc-receipt-remove-poison-${index}`);
+			await fs.writeFile(pathname, "", { mode: 0o600 });
+			await fs.utimes(pathname, aged, aged);
+		}
+		const evidence = path.join(scope.directoryPath, ".gjc-receipt-remove-evidence");
+		await fs.writeFile(evidence, "retained receipt payload", { mode: 0o600 });
+		await fs.utimes(evidence, aged, aged);
+		const young = path.join(scope.directoryPath, ".gjc-receipt-remove-young");
+		await fs.writeFile(young, "", { mode: 0o600 });
+		const unrelated = path.join(scope.directoryPath, "unrelated.jsonl");
+		await fs.writeFile(unrelated, "", { mode: 0o600 });
+		const hardlink = path.join(scope.directoryPath, ".gjc-receipt-remove-hardlink");
+		const hardlinkAlias = path.join(scope.directoryPath, "hardlink-alias");
+		await fs.writeFile(hardlink, "", { mode: 0o600 });
+		await fs.link(hardlink, hardlinkAlias);
+		await fs.utimes(hardlink, aged, aged);
+		const symlink = path.join(scope.directoryPath, ".gjc-receipt-remove-symlink");
+		if (process.platform !== "win32") await fs.symlink(unrelated, symlink);
+
+		expect(prepareManagedSessionScopeForWriteSync(scope)).toMatchObject({ kind: "resolved" });
+
+		expect(await fs.readFile(evidence, "utf8")).toBe("retained receipt payload");
+		await expect(fs.access(young)).resolves.toBeNull();
+		await expect(fs.access(unrelated)).resolves.toBeNull();
+		await expect(fs.access(hardlink)).resolves.toBeNull();
+		await expect(fs.access(hardlinkAlias)).resolves.toBeNull();
+		if (process.platform !== "win32") expect((await fs.lstat(symlink)).isSymbolicLink()).toBe(true);
+		expect(await fs.readFile(path.join(scope.directoryPath, MANAGED_SESSION_BINDING_FILE), "utf8")).toContain(
+			'"layoutVersion":2',
+		);
+	}, 20_000);
+
+	it("counts and logs an lstat failure without aborting remnant reaping", async () => {
+		const { scope } = await fixture();
+		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+		const pathname = path.join(scope.directoryPath, remnantNames[0]!);
+		await fs.writeFile(pathname, "", { mode: 0o600 });
+		await fs.utimes(pathname, aged, aged);
+		const lstatSync = syncFs.lstatSync;
+		const lstat = vi.spyOn(syncFs, "lstatSync").mockImplementation(((file, options) => {
+			if (file === pathname) throw Object.assign(new Error("injected lstat failure"), { code: "EACCES" });
+			return lstatSync(file, options as never);
+		}) as typeof syncFs.lstatSync);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({
+				reaped: 0,
+				failures: 1,
+			});
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+				failureCount: 1,
+				reapedCount: 0,
+			});
+		} finally {
+			warning.mockRestore();
+			lstat.mockRestore();
+		}
+		expect(await fs.readFile(pathname, "utf8")).toBe("");
+	});
+
+	it("counts and logs an unlink failure without aborting remnant reaping", async () => {
+		const { scope } = await fixture();
+		await fs.mkdir(scope.directoryPath, { recursive: true, mode: 0o700 });
+		const pathname = path.join(scope.directoryPath, remnantNames[0]!);
+		await fs.writeFile(pathname, "", { mode: 0o600 });
+		await fs.utimes(pathname, aged, aged);
+		const unlinkSync = syncFs.unlinkSync;
+		const unlink = vi.spyOn(syncFs, "unlinkSync").mockImplementation(((file: syncFs.PathLike) => {
+			if (file === pathname) throw Object.assign(new Error("injected unlink failure"), { code: "EACCES" });
+			return unlinkSync(file);
+		}) as typeof syncFs.unlinkSync);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			expect(managedSessionStorage.reapScrubbedProtocolRemnantsSync(scope.directoryPath)).toEqual({
+				reaped: 0,
+				failures: 1,
+			});
+			expect(warning).toHaveBeenCalledTimes(1);
+			expect(warning).toHaveBeenCalledWith("Managed session remnant reaping completed with failures", {
+				failureCount: 1,
+				reapedCount: 0,
+			});
+		} finally {
+			warning.mockRestore();
+			unlink.mockRestore();
+		}
+		expect(await fs.readFile(pathname, "utf8")).toBe("");
+	});
+
+	it("tolerates a missing scope directory", () => {
+		expect(
+			managedSessionStorage.reapScrubbedProtocolRemnantsSync(path.join(os.tmpdir(), "gjc-reap-missing-none")),
+		).toEqual({
+			reaped: 0,
+			failures: 0,
+		});
 	});
 });

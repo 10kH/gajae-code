@@ -1146,6 +1146,13 @@ describe("SDK broker identity and discovery", () => {
 			pid: process.pid,
 			endpointMtimeMs,
 		});
+		await broker.index.append({
+			type: "host_heartbeat",
+			sessionId: "s",
+			locator: { repo: "r", stateRoot },
+			endpointGeneration: 3,
+			pid: process.pid,
+		});
 		const endpointIncarnation = createHash("sha256")
 			.update(JSON.stringify({ endpointGeneration: 3, endpointMtimeMs, pid: process.pid, sessionId: "s" }))
 			.digest("hex");
@@ -1180,6 +1187,13 @@ describe("SDK broker identity and discovery", () => {
 			endpointGeneration: 4,
 			pid: process.pid,
 			endpointMtimeMs: endpointMtimeMs + 1,
+		});
+		await broker.index.append({
+			type: "host_heartbeat",
+			sessionId: "s",
+			locator: { repo: "r", stateRoot },
+			endpointGeneration: 4,
+			pid: process.pid,
 		});
 		expect(await broker.handleRequest("session.get_endpoint", { sessionId: "s", endpointGeneration: 4 })).toEqual({
 			ok: false,
@@ -1217,6 +1231,13 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator: { repo: liveCwd, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
 			});
 			const result = await broker.handleRequest(
 				"session.resume",
@@ -2490,6 +2511,13 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
 			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator: { repo: dir, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
 			expect(await broker.handleRequest("session.close", { sessionId }, "rotating-close")).toEqual({
 				ok: false,
 				error: { code: "endpoint_stale", message: "session endpoint is stale" },
@@ -2551,6 +2579,14 @@ describe("SDK broker identity and discovery", () => {
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(endpointPath)).mtimeMs,
+				lifecycleRequestId: "flush-close-capability",
+			});
+			await broker.index.append({
+				type: "host_heartbeat",
+				sessionId,
+				locator: { repo: dir, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
 			});
 			expect(await broker.handleRequest("session.close", { sessionId }, "flush-close")).toEqual({
 				ok: false,

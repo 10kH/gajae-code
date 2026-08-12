@@ -1120,10 +1120,11 @@ function mapComputerError(error: unknown, hotkey?: string): { code: string; mess
 		COMPUTER_SUSPENDED: `Stop and wait for the user${hotkey ? ` (kill-switch hotkey: ${hotkey})` : ""}.`,
 		COMPUTER_CANCELLED: `Stop and wait for the user${hotkey ? ` (kill-switch hotkey: ${hotkey})` : ""}.`,
 		COMPUTER_PERMISSION_REQUIRED:
-			"The host needs screen-recording or accessibility permission. Ask the user to grant it.",
+			"Grant Screen & System Audio Recording or Accessibility to the exact GJC launcher named in the diagnostic, then fully quit and relaunch GJC.",
 		COMPUTER_DISABLED:
 			"The computer tool is disabled or unsupported. Do not retry without enabling it on Apple Silicon macOS.",
-		COMPUTER_SCREENSHOT_FAILED: "Capture failed. Check screen-recording permission and retry the screenshot.",
+		COMPUTER_SCREENSHOT_FAILED:
+			"Capture failed after the current-process permission preflight passed. Check display availability and retry the screenshot.",
 		COMPUTER_CURSOR_RESTORE_FAILED:
 			"Input may have completed, but the cursor could not be restored. Stop and ask the user to inspect the desktop before retrying.",
 	};

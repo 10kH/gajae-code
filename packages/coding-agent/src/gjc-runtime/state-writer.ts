@@ -102,11 +102,23 @@ export type GuardedWriteResult =
 	| { path: string; written: true; revision: number; stamped: unknown }
 	| { path: string; written: false; reason: "stale-skip"; revision: number };
 
+export interface GuardedStateWriteReceipt {
+	path: string;
+	revision: number;
+	stamped: unknown;
+}
+
+export function guardedStateWriteReceipt(result: GuardedWriteResult): GuardedStateWriteReceipt | undefined {
+	return result.written ? { path: result.path, revision: result.revision, stamped: result.stamped } : undefined;
+}
+
 export interface StateWriterOptions {
 	cwd?: string;
 	receipt?: StateWriterReceiptContext;
 	audit?: StateWriterAuditContext;
 	sourceRevision?: number;
+	/** Advance a cache source revision under the target lock when the value carries none. */
+	advanceSourceRevision?: boolean;
 	/**
 	 * Cross-process lock tuning for read-modify-write paths that route through
 	 * `withWorkflowStateLock` / `updateJsonAtomic`. Omit for the hardened
@@ -442,6 +454,12 @@ function stampStateRevision(value: unknown, stateRevision: number, sourceRevisio
 		state_revision: stateRevision,
 	};
 }
+export function matchesGuardedStateWriteReceipt(current: unknown, receipt: GuardedStateWriteReceipt): boolean {
+	return (
+		persistedStateRevision(current) === receipt.revision &&
+		JSON.stringify(current) === JSON.stringify(receipt.stamped)
+	);
+}
 
 function withWorkflowReceipt(value: unknown, receipt: WorkflowStateReceipt | undefined): unknown {
 	if (!receipt || !value || typeof value !== "object" || Array.isArray(value)) return value;
@@ -531,8 +549,10 @@ async function writeGuardedResolvedJsonAtomic(
 				return { path: filePath, written: true, revision: currentRevision + 1, stamped: next };
 			}
 
+			const valueSourceRevision = isPlainObject(value) ? persistedSourceRevision(value) : 0;
 			const incomingSourceRevision =
-				options.sourceRevision ?? (isPlainObject(value) ? persistedStateRevision(value) : 0);
+				options.sourceRevision ??
+				(valueSourceRevision || (options.advanceSourceRevision ? persistedSourceRevision(current) + 1 : 0));
 			if (current !== undefined && incomingSourceRevision <= persistedSourceRevision(current)) {
 				return { path: filePath, written: false, reason: "stale-skip", revision: currentRevision };
 			}
@@ -960,12 +980,18 @@ export async function deleteIfOwned(
 	const options = typeof predicateOrOptions === "function" ? undefined : predicateOrOptions;
 	const predicate = typeof predicateOrOptions === "function" ? predicateOrOptions : predicateOrOptions?.predicate;
 	const filePath = resolveGjcTarget(targetPath, cwdForOptions(options));
-	const current = await readJsonIfPresent(filePath);
-	if (current === undefined) return { path: filePath, deleted: false };
-	if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
-	const deleted = await atomicRemove(filePath);
-	if (deleted) await maybeAudit(filePath, options);
-	return { path: filePath, deleted };
+	return lockResolvedWorkflowTarget(
+		filePath,
+		async () => {
+			const current = await readJsonIfPresent(filePath);
+			if (current === undefined) return { path: filePath, deleted: false };
+			if (predicate && !(await predicate(current))) return { path: filePath, deleted: false };
+			const deleted = await atomicRemove(filePath);
+			if (deleted) await maybeAudit(filePath, options);
+			return { path: filePath, deleted };
+		},
+		options?.lock,
+	);
 }
 
 export async function removeFileAudited(targetPath: string, options?: StateWriterOptions): Promise<DeleteResult> {
@@ -987,20 +1013,19 @@ export async function writeActiveEntry(
 	skill: string,
 	entry: SkillActiveEntry,
 	options?: StateWriterOptions,
-): Promise<string> {
+): Promise<GuardedWriteResult> {
 	const filePath = activeEntryPath(path.resolve(cwd), sessionScope, skill);
-	await writeGuardedResolvedJsonAtomic(
+	const result = await writeGuardedResolvedJsonAtomic(
 		filePath,
 		{ ...entry, skill },
 		{
 			...options,
 			policy: "cache",
-			sourceRevision:
-				persistedSourceRevision(entry) || persistedSourceRevision(await readJsonIfPresent(filePath)) + 1,
+			advanceSourceRevision: true,
 		},
 	);
 	invalidateActiveStateCacheForScope(cwd, sessionScope);
-	return filePath;
+	return result;
 }
 
 export async function removeActiveEntry(
@@ -1082,9 +1107,9 @@ export async function mergeActiveState(
 	entry: SkillActiveEntry,
 	options?: StateWriterOptions,
 ): Promise<ActiveEntryWriteResult> {
-	const entryPath = await writeActiveEntry(cwd, sessionScope, skill, entry, options);
+	const entryWrite = await writeActiveEntry(cwd, sessionScope, skill, entry, options);
 	const snapshotPath = await rebuildActiveSnapshot(cwd, sessionScope, options);
-	return { entryPath, snapshotPath };
+	return { entryPath: entryWrite.path, snapshotPath };
 }
 
 export async function writeArtifact(

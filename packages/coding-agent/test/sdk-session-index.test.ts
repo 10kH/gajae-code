@@ -219,6 +219,7 @@ describe("SDK session index", () => {
 		expect(await index.repair()).toMatchObject({ status: "corrupt", repaired: true, validPrefixSeq: 2 });
 
 		await index.append(event("after"));
+		await index.compact();
 
 		expect(JSON.parse(await fs.readFile(snapshotFile, "utf8")).indexSeq).toBe(3);
 
@@ -313,6 +314,33 @@ describe("SDK session index", () => {
 			spy.mockRestore();
 			if (platform) Object.defineProperty(process, "platform", platform);
 		}
+	});
+	it("publishes the snapshot without fsyncing a read-only temp handle (Windows EPERM, #4250)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-readonly-fsync-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("windows"));
+		// Windows refuses FlushFileBuffers on a handle opened read-only with EPERM.
+		// Any read-only open of the snapshot temp must fail exactly like the reported
+		// crash, and publication must still land through a writable handle.
+		const open = fs.open.bind(fs);
+		const spy = vi.spyOn(fs, "open").mockImplementation((async (file: string, ...rest: unknown[]) => {
+			const handle = await (open as (file: string, ...args: unknown[]) => Promise<fs.FileHandle>)(file, ...rest);
+			if (rest[0] === "r" && file.endsWith(".tmp"))
+				(handle as unknown as { sync: () => Promise<void> }).sync = async () => {
+					throw Object.assign(new Error("operation not permitted, fsync"), { code: "EPERM" });
+				};
+			return handle;
+		}) as typeof fs.open);
+		try {
+			await index.snapshot();
+		} finally {
+			spy.mockRestore();
+		}
+		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
+		expect(snapshot.events.map((item: SessionIndexEvent) => item.sessionId)).toEqual(["windows"]);
+		// Publication must not leave the temp artifact behind.
+		const entries = await fs.readdir(path.join(dir, "sdk", "sessions"));
+		expect(entries.filter(name => name.endsWith(".tmp"))).toEqual([]);
 	});
 	it("accepts EBADF when closing a successfully written and synced append handle", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-close-ebadf-"));
@@ -490,7 +518,7 @@ describe("SDK session index", () => {
 		});
 	}, 30_000);
 
-	it("compaction drops terminal+dead sessions and keeps live sessions with their original indexSeq", async () => {
+	it("compaction retains terminal sessions and keeps live sessions with their original indexSeq", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const deadPid = await (async () => {
 			const proc = Bun.spawn({ cmd: ["true"] });
@@ -504,11 +532,15 @@ describe("SDK session index", () => {
 		await index.append(event("live2"));
 		await index.snapshot();
 		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
-		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "live2"]);
+		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "dead", "dead", "live2"]);
 		expect(snapshot.events[0].indexSeq).toBe(1);
 		expect(snapshot.indexSeq).toBe(4);
 		const replay = await new SessionIndex(dir).open();
-		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "live2"]);
+		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "dead", "live2"]);
+		expect(replay.listSessions().sessions.find(session => session.sessionId === "dead")).toMatchObject({
+			live: false,
+			terminal: true,
+		});
 		expect(replay.indexSeq).toBe(4);
 	});
 	it("collapses superseded heartbeats to the latest per surviving session", async () => {
@@ -599,7 +631,7 @@ describe("SDK session index", () => {
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.mkdir(sessionsDir, { recursive: true });
 		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
-		await fs.writeFile(snapshotFile, JSON.stringify({ version: 3, indexSeq: 7, events: [] }));
+		await fs.writeFile(snapshotFile, JSON.stringify({ version: 4, indexSeq: 7, events: [] }));
 		const unsupported = new SessionIndex(dir);
 		expect(await unsupported.diagnose()).toMatchObject({ status: "unsupported", validPrefixSeq: 0, snapshotSeq: 7 });
 		expect(await unsupported.repair()).toMatchObject({ status: "unsupported", repaired: false });
@@ -763,6 +795,59 @@ describe("SDK session index", () => {
 		}
 		expect(replacementChecks).toBe(2);
 	});
+	it("does not recreate a retired index directory when a heartbeat pass runs", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-retired-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append(event("heartbeat-owner"));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		expect(await fs.exists(sessionsDir)).toBe(true);
+
+		// The owner retires the whole state root; the broker's periodic checkpoint must
+		// observe "nothing to check point" rather than rebuilding the tree underneath it.
+		await fs.rm(path.join(dir, "sdk"), { recursive: true, force: true });
+		expect(await index.checkpointLiveHeartbeats()).toBe(0);
+		expect(await fs.exists(sessionsDir)).toBe(false);
+		expect(await fs.exists(path.join(dir, "sdk"))).toBe(false);
+	});
+	it("repairs a long history into a retention-bounded snapshot other clients can lock promptly", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-repair-bound-"));
+		const maxRows = 50;
+		const policy = { maxRows };
+		const seed = await new SessionIndex(dir, policy).open();
+		// History that never reached a rotation boundary: the log alone carries every
+		// event, so repair is what decides whether the republished snapshot is bounded.
+		for (let i = 0; i < 400; i++) await seed.append(event(`session-${i}`));
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		const log = path.join(sessionsDir, "index.jsonl");
+		const before = await fs.readFile(log);
+		await fs.appendFile(log, "broken\n");
+
+		const repair = await new SessionIndex(dir, policy).repair();
+		expect(repair).toMatchObject({ status: "corrupt", repaired: true });
+		expect(await fs.readFile(path.join(repair.quarantinePath!, "index.jsonl"))).toEqual(
+			Buffer.concat([before, Buffer.from("broken\n")]),
+		);
+		// A repair republishes history as the snapshot; without retention it restores an
+		// unbounded snapshot that every later locked transaction must re-parse, which is
+		// how one broker starved every other client of the index lock.
+		const snapshot = JSON.parse(await fs.readFile(path.join(sessionsDir, "index.snapshot.json"), "utf8")) as {
+			events: SessionIndexEvent[];
+		};
+		expect(snapshot.events.length).toBeLessThanOrEqual(maxRows);
+		// Repair truncates the log to match the snapshot: the pre-repair events are all
+		// covered by the republished snapshot, so leaving them in place would force every
+		// later #scan() to re-parse the full history under the lock.
+		expect((await fs.readFile(path.join(sessionsDir, "index.jsonl"), "utf8")).trim()).toBe("");
+
+		// A second client must still take the shared index lock while the repaired index
+		// is in normal use, within a bound far below the 60s launch budget.
+		const holder = await new SessionIndex(dir, policy).open();
+		const contender = await new SessionIndex(dir, policy).open();
+		await holder.append(event("post-repair"));
+		const started = Date.now();
+		await contender.withLocked(async () => undefined);
+		expect(Date.now() - started).toBeLessThan(5_000);
+	});
 	it("serializes repair with a racing writer and resumes after the retained prefix", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const seed = await new SessionIndex(dir).open();
@@ -802,5 +887,180 @@ describe("SDK session index", () => {
 			resumeRepair.resolve();
 			mkdir.mockRestore();
 		}
+	});
+	it("does not unregister a same-session successor under the index lock", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-unregister-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({
+			...event("session"),
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request-a",
+			processIncarnation: "incarnation-a",
+		});
+		const predecessor = index.listSessions().sessions[0]!;
+		await index.append({
+			...event("session"),
+			pid: 1002,
+			endpointMtimeMs: 2,
+			lifecycleRequestId: "request-b",
+			processIncarnation: "incarnation-b",
+		});
+		expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
+		const successor = index.listSessions().sessions[0]!;
+		expect(successor).toMatchObject({ pid: 1002, lifecycleRequestId: "request-b" });
+		expect(await index.unregisterIfCurrent({ ...successor, hostIncarnation: "different-incarnation" })).toBe(false);
+		expect(await index.unregisterIfCurrent(successor)).toBe(true);
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId: "session",
+				pid: 1002,
+				lifecycleRequestId: "request-b",
+				live: false,
+				terminal: true,
+			}),
+		]);
+	});
+	it("does not unregister a concurrent terminal-uncertain record", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({
+			...event("session"),
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request",
+			processIncarnation: "incarnation",
+		});
+		const predecessor = index.listSessions().sessions[0]!;
+		await index.append({
+			...event("session"),
+			type: "lifecycle_terminal",
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request",
+			processIncarnation: "incarnation",
+			terminalUncertain: true,
+		});
+		expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
+		expect(index.listSessions().sessions[0]).toMatchObject({
+			sessionId: "session",
+			terminalUncertain: true,
+			live: false,
+		});
+	});
+	it("never exposes a terminal-uncertain identity as live", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-live-"));
+		const index = await new SessionIndex(dir).open();
+		const registration = await index.append(event("session"));
+		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+		expect(index.listSessions().sessions[0]).toMatchObject({ live: true });
+		await index.append({
+			type: "lifecycle_terminal",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+			terminalUncertain: true,
+		});
+		expect(index.listSessions().sessions[0]).toMatchObject({ terminalUncertain: true, live: false });
+	});
+	it("fences unresolved state roots, then projects either surviving root as authority", async () => {
+		for (const terminateHigherGeneration of [false, true]) {
+			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-ambiguous-"));
+			const index = await new SessionIndex(dir).open();
+			const sessionId = `ambiguous-${terminateHigherGeneration ? "higher" : "lower"}`;
+			const alternate = await index.append({
+				...event(sessionId),
+				locator: { repo: "alternate", stateRoot: "alternate-state" },
+				endpointGeneration: 1,
+			});
+			const current = await index.append({
+				...event(sessionId),
+				locator: { repo: "current", stateRoot: "current-state" },
+				endpointGeneration: 2,
+			});
+			const terminated = terminateHigherGeneration ? current : alternate;
+			const survivor = terminateHigherGeneration ? alternate : current;
+
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: current.endpointGeneration,
+					ambiguous: true,
+					live: false,
+				}),
+			]);
+			const ambiguousSeq = index.indexSeq;
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(index.indexSeq).toBe(ambiguousSeq);
+
+			await index.append({
+				type: "host_unregistered",
+				sessionId: terminated.sessionId,
+				locator: terminated.locator,
+				endpointGeneration: terminated.endpointGeneration,
+				pid: terminated.pid,
+				...(terminated.processIncarnation === undefined
+					? {}
+					: { processIncarnation: terminated.processIncarnation }),
+				...(terminated.hostIncarnation === undefined ? {} : { hostIncarnation: terminated.hostIncarnation }),
+			});
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: survivor.endpointGeneration,
+					locator: survivor.locator,
+					ambiguous: false,
+				}),
+			]);
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: survivor.endpointGeneration,
+					ambiguous: false,
+					live: true,
+				}),
+			]);
+		}
+	});
+	it("hides deleted sessions until a later registration establishes new authority", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-deleted-"));
+		const index = await new SessionIndex(dir).open();
+		const registration = await index.append(event("deleted"));
+		await index.append({
+			type: "session_deleted",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+		});
+		expect(index.listSessions().sessions).toEqual([]);
+
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+		});
+		expect(index.listSessions().sessions).toEqual([]);
+
+		await index.append({ ...event("deleted"), endpointGeneration: registration.endpointGeneration + 1 });
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId: "deleted", endpointGeneration: registration.endpointGeneration + 1 }),
+		]);
 	});
 });

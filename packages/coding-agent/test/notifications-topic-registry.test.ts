@@ -413,6 +413,86 @@ describe("TopicRegistry", () => {
 		expect(snapshot.topics.s1.disconnectGraceExpiresAt).toBeUndefined();
 		expect(parseTopicRegistryState(snapshot)).toBeDefined();
 	});
+	test("accepts an archive fence poisoned with a stray grace deadline and heals it on load", () => {
+		// v0.12.12–v0.12.17 beginArchive moved disconnect_grace records to
+		// archive_pending without clearing disconnectGraceExpiresAt. Rejecting
+		// that persisted shape bricked the shared registry: the CAS authority
+		// refused every subsequent read and write.
+		const poisoned = {
+			version: 2,
+			registryGeneration: 4056,
+			topics: {
+				s1: {
+					topicId: "14261",
+					topicOrigin: "daemon_created",
+					sessionUuid: "94fd6b56-a281-455b-b014-2ab3975bfa21",
+					identitySent: true,
+					createdAt: 1_785_971_485_050,
+					orphanedAt: 1_785_991_593_616,
+					creationLeaseEpoch: 0,
+					authorityEpoch: 1,
+					authorityState: "archive_pending",
+					chatId: "42",
+					endpointKey: "endpoint",
+					endpointDigest: "digest",
+					endpointGeneration: 1,
+					endpointIncarnation: 0,
+					archiveHostId: "host-a",
+					archiveLeaseEpoch: 1,
+					disconnectGraceExpiresAt: 1_785_991_623_616,
+				},
+			},
+		} as unknown as TopicRegistryState;
+
+		const state = parseTopicRegistryState(poisoned);
+		expect(state).toBeDefined();
+
+		const reg = new TopicRegistry(state);
+		expect(reg.get("s1")).toMatchObject({ topicId: "14261", authorityState: "archive_pending" });
+		const snapshot = reg.serialize();
+		expect(snapshot.topics.s1.disconnectGraceExpiresAt).toBeUndefined();
+		expect(parseTopicRegistryState(snapshot)).toBeDefined();
+	});
+	test("still rejects disconnect grace records missing the deadline or orphan timestamp", () => {
+		const record = {
+			topicId: "1",
+			topicOrigin: "daemon_created",
+			sessionUuid: "94fd6b56-a281-455b-b014-2ab3975bfa22",
+			identitySent: false,
+			createdAt: 1,
+			authorityState: "disconnect_grace",
+			orphanedAt: 1_000,
+			disconnectGraceExpiresAt: 31_000,
+			chatId: "42",
+			endpointKey: "endpoint",
+			endpointDigest: "digest",
+		};
+		const stateWith = (patch: object) =>
+			({
+				version: 2,
+				registryGeneration: 1,
+				topics: { s1: { ...record, ...patch } },
+			}) as unknown as TopicRegistryState;
+
+		expect(parseTopicRegistryState(stateWith({}))).toBeDefined();
+		expect(() => parseTopicRegistryState(stateWith({ disconnectGraceExpiresAt: undefined }))).toThrow(
+			"malformed Telegram topic state",
+		);
+		expect(() => parseTopicRegistryState(stateWith({ orphanedAt: undefined }))).toThrow(
+			"malformed Telegram topic state",
+		);
+		expect(() => parseTopicRegistryState(stateWith({ disconnectGraceExpiresAt: "soon" }))).toThrow(
+			"malformed Telegram topic state",
+		);
+		// The archive-family tolerance is scoped: a stray grace deadline on any
+		// non-archive state is still rejected, never interpreted as healthy.
+		expect(() => parseTopicRegistryState(stateWith({ authorityState: "active" }))).toThrow(
+			"malformed Telegram topic state",
+		);
+		expect(() => parseTopicRegistryState(stateWith({ authorityState: "delete_pending" }))).toThrow(
+			"malformed Telegram topic state",
+		);
+	});
 
 	test("restores the exact disconnect grace deadline after archive publication fails", async () => {
 		const reg = new TopicRegistry();
@@ -620,15 +700,14 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes generation 60 at serving epoch 5", () => {
-	// Generation 55: shared-topic-authority outage hardening (#3974).
-	// Generation 56: lazy native authority for startup-cost cut (#3846).
-	// Generation 57: parser-valid archive transitions after disconnect grace.
+test("publishes exact durable authority generation 154 at serving epoch 87", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
-	// Generation 59: attached OPEN-socket count in the heartbeat sidecar (#4128).
-	// Generation 60: master-worker delivery authority.
-	expect(DAEMON_GENERATION).toBe(60);
-	expect(SERVING_EPOCH).toBe(5);
+	// Generation 152: a thrown steady heartbeat renewal in the run loop is
+	// contained instead of terminating the daemon (#4200).
+	// Generation 153: strict orchestration admission fences Telegram topics.
+	// Generation 154: master-worker delivery authority.
+	expect(DAEMON_GENERATION).toBe(154);
+	expect(SERVING_EPOCH).toBe(87);
 });
 test("archives pending topics into retained inactive records", async () => {
 	const registry = new TopicRegistry();

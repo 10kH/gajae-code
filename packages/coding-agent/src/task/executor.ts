@@ -15,7 +15,14 @@ import type {
 } from "@gajae-code/agent-core";
 import { recordHandoff, resolveTelemetry } from "@gajae-code/agent-core";
 import { estimateMessageTokensHeuristic } from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage, Message, Model, ServiceTier } from "@gajae-code/ai/core";
+import {
+	type AssistantMessage,
+	isFastModeEffectiveForProvider,
+	type Message,
+	type Model,
+	modelSupportsServiceTier,
+	type ServiceTier,
+} from "@gajae-code/ai/core";
 import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-code/ai/utils/schema";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
@@ -40,7 +47,7 @@ import type { AgentSession, AgentSessionEvent, ForkContextSeed } from "../sessio
 import type { ArtifactManager } from "../session/artifacts";
 import type { AuthStorage } from "../session/auth-storage";
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
-import { SessionManager } from "../session/session-manager";
+import { SessionManager, type SessionMemoryMode } from "../session/session-manager";
 import { FileSessionStorage } from "../session/session-storage";
 import { truncateTail } from "../session/streaming-output";
 // Ensure mandatory subagent result extraction is available even when a session is mocked.
@@ -248,14 +255,11 @@ export interface ExecutorOptions {
 	/** Parent session's registry; shared by child sessions for IRC routing and roster visibility. */
 	agentRegistry?: AgentRegistry;
 	/**
-	 * Live service-tier intent of the parent session (`AgentSession.serviceTier`),
-	 * used as the inherited tier when `task.serviceTier === "inherit"`. Passing the
-	 * live value (not the stale settings snapshot) lets a runtime `/fast on` reach
-	 * subagents, and a main-model fast-mode auto-disable does not clobber it.
+	 * Parent service-tier intent captured when the child is spawned. Used when
+	 * `task.serviceTier === "inherit"` so request serialization and reporting use
+	 * the same immutable child settings snapshot.
 	 */
 	inheritedServiceTier?: ServiceTier;
-	/** Resolve whether the effective subagent tier grants fast mode for the selected provider. */
-	isFastForSubagentProvider?: (provider?: string) => boolean;
 	/** Override local:// protocol options so subagent shares parent's local:// root */
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
@@ -265,6 +269,15 @@ export interface ExecutorOptions {
 	 */
 	parentArtifactManager?: ArtifactManager;
 	managedPersistence?: ManagedTaskPersistence;
+	/**
+	 * The parent session's ENDPOINT-owned AsyncJobManager (resolved by the
+	 * TaskTool via forEndpoint(sessionId) ?? instance()). Model metadata and
+	 * live-handle state for THIS subagent are recorded in the SAME manager the
+	 * task job runs in — with concurrent top-level sessions the process-global
+	 * instance belongs to a different session and would surface this subagent
+	 * under the wrong session's record (review thread P1).
+	 */
+	asyncJobManager?: AsyncJobManager;
 	parentHindsightSessionState?: HindsightSessionState;
 	/**
 	 * Parent agent's OpenTelemetry configuration. When defined, the subagent's
@@ -296,7 +309,7 @@ export class ManagedTaskPersistence {
 			throw new Error("Managed task persistence authority is unavailable");
 	}
 
-	async openSession(cwd: string, sessionMemoryMode: "off" | "shadow" | "enabled" = "shadow"): Promise<SessionManager> {
+	async openSession(cwd: string, sessionMemoryMode: SessionMemoryMode = "shadow"): Promise<SessionManager> {
 		const store = this.#artifacts.getManagedStore();
 		if (!store) throw new Error("Managed task persistence authority is unavailable");
 		this.#artifacts.assertManagedBinding();
@@ -865,6 +878,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 	const settings = options.settings ?? Settings.isolated();
 	const subagentSettings = createSubagentSettings(settings, options.inheritedServiceTier);
+	const configuredSubagentServiceTier = subagentSettings.get("serviceTier");
+	const subagentServiceTier = configuredSubagentServiceTier === "none" ? undefined : configuredSubagentServiceTier;
+	const isFastForModel = (candidate: Model | undefined): boolean =>
+		candidate !== undefined &&
+		isFastModeEffectiveForProvider(subagentServiceTier, candidate.provider, modelSupportsServiceTier(candidate));
 	const maxRecursionDepth = settings.get("task.maxRecursionDepth") ?? 2;
 	const maxRuntimeMs = Math.max(0, Math.trunc(Number(settings.get("task.maxRuntimeMs") ?? 0) || 0));
 	const parentDepth = options.taskDepth ?? 0;
@@ -1533,7 +1551,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				resolvedModelString = formatModelString(model);
 				activeProviderModelString = resolvedModelString;
 			}
-			progress.fastMode = model ? (options.isFastForSubagentProvider?.(model.provider) ?? false) : false;
+			progress.fastMode = isFastForModel(model);
 			if (authFallbackUsed && model && requestedModel) {
 				modelSubstitutionWarning = {
 					requested: formatModelString(requestedModel),
@@ -1551,7 +1569,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Record which model the subagent actually runs on (and any auth fallback,
 			// see #985) so the subagent panel can surface it to the user.
 			if (model) {
-				AsyncJobManager.instance()?.updateSubagentModel?.(options.subagentId ?? id, {
+				(options.asyncJobManager ?? AsyncJobManager.instance())?.updateSubagentModel?.(options.subagentId ?? id, {
 					requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
 					effectiveModel: resolvedModelString,
 					modelFellBack: authFallbackUsed === true,
@@ -1729,6 +1747,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					},
 					parentHindsightSessionState: options.parentHindsightSessionState,
 					parentTaskPrefix: id,
+					inheritedAsyncJobManager: options.asyncJobManager,
 					inheritedMcpManager: options.parentMcpManager,
 					agentId: id,
 					agentDisplayName: agent.name,
@@ -1752,7 +1771,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				session.seedDefaultFallbackResolution(activeIndex ?? 0, skips);
 			}
 			const liveSubagentId = options.subagentId ?? id;
-			const manager = AsyncJobManager.instance();
+			const manager = options.asyncJobManager ?? AsyncJobManager.instance();
 			if (manager) {
 				manager.registerLiveHandle(liveSubagentId, {
 					requestPause: () => {
@@ -1954,6 +1973,22 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				}
 				if (event.type === "model_fallback_switched") {
 					activeProviderModelString = event.to;
+					progress.fastMode = isFastForModel(session.model);
+					// Keep the fallback metadata on the SAME manager the initial
+					// update used: another session may have become the
+					// process-global instance, and writing to it would leave this
+					// session's subagent metadata stale or overwrite an unrelated
+					// same-ID record (review thread P2).
+					(options.asyncJobManager ?? AsyncJobManager.instance())?.updateSubagentModel?.(
+						options.subagentId ?? id,
+						{
+							requestedModel: modelSubstitutionWarning?.requested ?? resolvedModelString,
+							effectiveModel: event.to,
+							modelFellBack: true,
+							fastMode: progress.fastMode,
+						},
+					);
+					scheduleProgress(true);
 					forwardSubagentEvent(event);
 					return;
 				}
@@ -2091,7 +2126,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				if (exitCode === 0) exitCode = 1;
 			}
 			sessionAbortController.abort();
-			AsyncJobManager.instance()?.removeLiveHandle(options.subagentId ?? id);
+			(options.asyncJobManager ?? AsyncJobManager.instance())?.removeLiveHandle(options.subagentId ?? id);
 			if (unsubscribe) {
 				try {
 					unsubscribe();

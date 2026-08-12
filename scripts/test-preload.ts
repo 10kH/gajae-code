@@ -21,3 +21,4 @@ try {
 } catch {
 	// Leave the environment untouched if the temp root cannot be resolved.
 }
+

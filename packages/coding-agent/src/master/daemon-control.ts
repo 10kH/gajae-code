@@ -2,6 +2,7 @@ import { spawn as childProcessSpawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { DaemonHealth, DaemonOperationOptions, DaemonRuntimeInfo } from "../daemon/control-types";
+import { MASTER_OWNER_INTERNAL_ACTION } from "../daemon/operator-contract";
 import { resolveGjcRuntimeSpawnInfo } from "../daemon/runtime";
 import {
 	DEFAULT_MASTER_DAEMON_HEARTBEAT_TTL_MS,
@@ -65,10 +66,17 @@ export interface MasterDaemonControllerDeps {
 	readonly authorityFingerprint?: string;
 	readonly now?: () => Date;
 	readonly pidAlive?: (pid: number) => boolean | Promise<boolean>;
+	/** Signal delivery seam; production sends the real POSIX signal to the owner pid. */
+	readonly kill?: (pid: number, signal: NodeJS.Signals) => void;
+	/** Owner spawn seam; production detaches a real `gjc` owner process. */
+	readonly spawn?: (command: string, args: string[]) => { unref(): void; readonly exitCode: number | null };
 	readonly heartbeatTtlMs?: number;
 }
 
 export type MasterDaemonReloadResult = MasterDaemonOperationResult;
+
+const DEFAULT_GRACEFUL_TIMEOUT_MS = 10_000;
+const DEFAULT_KILL_TIMEOUT_MS = 3_000;
 
 const DEFAULT_RUNTIME: DaemonRuntimeInfo = Object.freeze({
 	mode: "source",
@@ -275,20 +283,23 @@ export class MasterDaemonController {
 					warnings: ["No durable master daemon owner PID is available."],
 					message: "Master daemon stop refused: owner identity is unavailable.",
 				};
-			try {
-				process.kill(status.pid, "SIGTERM");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-					await this.#fenceExitedOwner();
-					return {
-						ok: true,
-						warnings: ["Master daemon owner had already exited; stale lifecycle records were fenced."],
-						message: "Master daemon stopped and stale owner lease fenced.",
-					};
-				}
-				return { ok: false, warnings: [errorMessage(error)], message: "Master daemon stop signal failed." };
-			}
-			return await this.#waitForStopped(opts.gracefulTimeoutMs);
+			const signalled = await this.#signalOwner(status.pid, "SIGTERM");
+			if (signalled.kind === "exited") return signalled.result;
+			if (signalled.kind === "failed") return signalled.result;
+			const graceful = await this.#waitForStopped(opts.gracefulTimeoutMs ?? DEFAULT_GRACEFUL_TIMEOUT_MS);
+			if (graceful.ok || opts.force !== true) return graceful;
+			// `gjc daemon stop master --force` advertises hard-kill escalation: a
+			// detached owner that ignored SIGTERM must still be recoverable.
+			const killed = await this.#signalOwner(status.pid, "SIGKILL");
+			if (killed.kind === "exited") return killed.result;
+			if (killed.kind === "failed") return killed.result;
+			const forced = await this.#waitForStopped(opts.killTimeoutMs ?? DEFAULT_KILL_TIMEOUT_MS);
+			if (forced.ok) return forced;
+			return {
+				ok: false,
+				warnings: ["Master daemon owner did not exit after SIGKILL."],
+				message: "Master daemon stop timed out after forced escalation.",
+			};
 		}
 		try {
 			const result = copyResult(
@@ -339,11 +350,10 @@ export class MasterDaemonController {
 
 	async #spawnOwner(): Promise<MasterDaemonOperationResult> {
 		const runtime = resolveGjcRuntimeSpawnInfo(process.execPath);
-		const child = childProcessSpawn(
-			runtime.execPath,
-			[...runtime.argsPrefix, "daemon", "session", "--op", "master.owner.internal", "--agent-dir", this.#rootDir()],
-			{ detached: true, stdio: "ignore", env: process.env },
-		);
+		const args = [...runtime.argsPrefix, "daemon", MASTER_OWNER_INTERNAL_ACTION, "--agent-dir", this.#rootDir()];
+		const child = this.#deps.spawn
+			? this.#deps.spawn(runtime.execPath, args)
+			: childProcessSpawn(runtime.execPath, args, { detached: true, stdio: "ignore", env: process.env });
 		child.unref();
 		const deadline = Date.now() + 10_000;
 		let detail = "Master daemon did not publish a running heartbeat.";
@@ -363,7 +373,42 @@ export class MasterDaemonController {
 		};
 	}
 
-	async #waitForStopped(timeoutMs = 10_000): Promise<MasterDaemonOperationResult> {
+	/**
+	 * Delivers one signal to the detached owner. An already-exited owner is
+	 * fenced and reported as a successful stop; any other signal failure is
+	 * terminal for this operation.
+	 */
+	async #signalOwner(
+		pid: number,
+		signal: NodeJS.Signals,
+	): Promise<
+		| { kind: "signalled" }
+		| { kind: "exited"; result: MasterDaemonOperationResult }
+		| { kind: "failed"; result: MasterDaemonOperationResult }
+	> {
+		try {
+			(this.#deps.kill ?? ((target, sig) => process.kill(target, sig)))(pid, signal);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+				await this.#fenceExitedOwner();
+				return {
+					kind: "exited",
+					result: {
+						ok: true,
+						warnings: ["Master daemon owner had already exited; stale lifecycle records were fenced."],
+						message: "Master daemon stopped and stale owner lease fenced.",
+					},
+				};
+			}
+			return {
+				kind: "failed",
+				result: { ok: false, warnings: [errorMessage(error)], message: "Master daemon stop signal failed." },
+			};
+		}
+		return { kind: "signalled" };
+	}
+
+	async #waitForStopped(timeoutMs = DEFAULT_GRACEFUL_TIMEOUT_MS): Promise<MasterDaemonOperationResult> {
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
 			await Bun.sleep(100);

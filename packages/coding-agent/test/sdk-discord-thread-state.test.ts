@@ -4,6 +4,7 @@ import {
 	type DiscordConversation,
 	discordConversationKey,
 } from "../src/sdk/bus/discord-conversation";
+import type { SessionAttachment } from "../src/sdk/router";
 
 function record(): DiscordConversation {
 	return {
@@ -21,6 +22,23 @@ function record(): DiscordConversation {
 	};
 }
 
+function attachment(sessionId = "session", generation = 4, current = true): SessionAttachment {
+	return {
+		sessionId,
+		generation,
+		isCurrent: () => current,
+		send: () => {},
+	};
+}
+
+function acceptsAttachment(recordValue: DiscordConversation, value: SessionAttachment): boolean {
+	return (
+		value.sessionId === recordValue.sessionId &&
+		value.isCurrent() &&
+		acceptsDiscordInbound(recordValue, recordValue.threadId!, value.generation)
+	);
+}
+
 describe("Discord conversation identity", () => {
 	test("uses the complete app, guild, parent and thread identity", () => {
 		expect(
@@ -34,5 +52,12 @@ describe("Discord conversation identity", () => {
 		expect(acceptsDiscordInbound(active, "thread", 5)).toBe(false);
 		expect(acceptsDiscordInbound({ ...active, state: "archived" }, "thread", 4)).toBe(false);
 		expect(acceptsDiscordInbound({ ...active, supersededByThreadId: "new" }, "thread", 4)).toBe(false);
+	});
+	test("allows only a current attachment matching the mapped session generation", () => {
+		const active = record();
+		expect(acceptsAttachment(active, attachment())).toBe(true);
+		expect(acceptsAttachment(active, attachment("session", 3))).toBe(false);
+		expect(acceptsAttachment(active, attachment("other", 4))).toBe(false);
+		expect(acceptsAttachment(active, attachment("session", 4, false))).toBe(false);
 	});
 });

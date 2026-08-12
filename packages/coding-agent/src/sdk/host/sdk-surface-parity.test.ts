@@ -114,8 +114,9 @@ describe("SDK surface parity", () => {
 		expect([...nativePolicy.installedControls]).toEqual([...loopbackPolicy.installedControls]);
 		expect([...nativePolicy.installedQueries]).toEqual([...loopbackPolicy.installedQueries]);
 		expect(createSdkCapabilities(nativePolicy, false)).toEqual(createSdkCapabilities(loopbackPolicy, false));
-		expect(nativePolicy.installedQueries).toContain("turn.prompt_status");
-		expect(nativePolicy.installedQueries).toContain("skill.invoke_status");
+		expect(nativePolicy.installedQueries).toContain("turn.result");
+		expect(nativePolicy.installedQueries).not.toContain("skill.invoke_status");
+		expect(nativePolicy.installedQueries).toContain("session.checkpoint");
 	});
 
 	test("workflow controls are advertised exactly when a durable gate bridge exists", () => {

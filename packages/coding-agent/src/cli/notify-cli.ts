@@ -7,7 +7,6 @@ import { createInterface } from "node:readline/promises";
 import { APP_NAME } from "@gajae-code/utils/dirs";
 import chalk from "chalk";
 import { Settings, type SettingsAtomicPatch } from "../config/settings";
-import { SessionIndex } from "../sdk/broker/session-index";
 import {
 	ChatDaemonController,
 	type EnsureChatDaemonResult,
@@ -15,7 +14,6 @@ import {
 	ensureSlackDaemon,
 } from "../sdk/bus/chat-daemon-control";
 import { getNotificationConfig, maskToken, tokenFingerprint } from "../sdk/bus/config";
-import { type ActivatedPreparedSession, activatePreparedSession } from "../sdk/bus/existing-thread-readiness";
 import {
 	clearTelegramActivationMarker,
 	createTelegramActivationMarker,
@@ -56,6 +54,8 @@ import {
 	type TelegramSetupPreflight,
 	type TelegramSetupTimers,
 } from "../sdk/bus/telegram-setup";
+import { SessionRouter } from "../sdk/router";
+import type { ActivatedPreparedSession } from "../sdk/session-activation";
 
 export type NotifyAction =
 	| "setup"
@@ -548,12 +548,7 @@ async function runTelegramSetup(cmd: NotifyCommandArgs, deps: NotifyCommandDeps)
 				reconnect: async () =>
 					deps.ensureTelegramDaemon
 						? await deps.ensureTelegramDaemon(settings)
-						: await ensureTelegramDaemonRunningDetailed({
-								settings,
-								cwd: process.cwd(),
-								sessionId: `notify-cli-${process.pid}`,
-								registerRoot: false,
-							}),
+						: await ensureTelegramDaemonRunningDetailed({ settings }),
 				persistInactive: async marker => await persistTelegramActivationMarker(settings, marker),
 				clearInactive: async marker => await clearTelegramActivationMarker(settings, marker),
 				marker: activationMarker,
@@ -929,11 +924,10 @@ async function runActivateThread(cmd: NotifyCommandArgs, deps: NotifyCommandDeps
 	const { sessionId } = assertStrictActivateThreadInvocation(cmd);
 	const activate =
 		deps.activatePreparedSession ??
-		(async (input: { settings: Settings; sessionId: string }) =>
-			await activatePreparedSession({
-				sessionIndex: await new SessionIndex(input.settings.getAgentDir()).open(),
-				sessionId: input.sessionId,
-			}));
+		(async (input: { settings: Settings; sessionId: string }) => {
+			const router = new SessionRouter({ agentDir: input.settings.getAgentDir() });
+			return await router.activatePreparedSession(input.sessionId);
+		});
 	const activated = await activate({ settings: await getSettings(deps), sessionId });
 	process.stdout.write(`${formatActivatedSession(activated)}\n`);
 }
@@ -987,7 +981,7 @@ ${chalk.bold("Examples:")}
   ${APP_NAME} notify activate-thread --session-id 01J...
 
 ${chalk.bold("Threaded Mode:")}
-  GJC uses Telegram private-chat topics for per-session threads. Setup verifies the bot
+  GJC uses Telegram private-chat topics for coordinator/lifecycle sessions only. Setup verifies the bot
   capability via getMe.has_topics_enabled. Enable Threaded Mode in @BotFather > Bot Settings
   > Threads Settings; bots cannot toggle it through the Bot API. If Telegram refuses topic
   creation at runtime, GJC delivers flat to the paired private chat with outbound notifications

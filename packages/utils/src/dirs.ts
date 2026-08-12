@@ -90,7 +90,7 @@ export function formatBunRuntimeError(opts: {
  * On macOS, strip /private prefix only when both paths resolve to the same location.
  * This preserves aliases like /private/tmp -> /tmp without rewriting unrelated paths.
  */
-function standardizeMacOSPath(p: string): string {
+export function standardizeMacOSPath(p: string): string {
 	if (process.platform !== "darwin" || !p.startsWith("/private/")) return p;
 	const stripped = p.slice("/private".length);
 	try {
@@ -594,6 +594,16 @@ export function getTerminalSessionsDir(agentDir?: string): string {
 /** Get the crash log path (~/.gjc/agent/gjc-crash.log). */
 export function getCrashLogPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "gjc-crash.log", "state");
+}
+
+/** Get the crash event journal path (~/.gjc/agent/gjc-crash-events.jsonl). */
+export function getCrashEventsPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-crash-events.jsonl", "state");
+}
+
+/** Get the compacted crash signature index path (~/.gjc/agent/gjc-crash-index.json). */
+export function getCrashIndexPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-crash-index.json", "state");
 }
 
 /** Get the debug log path (~/.gjc/agent/gjc-debug.log). */

@@ -838,43 +838,8 @@ function rpcModeInvocationViolations(file: string, contents: string): string[] {
 }
 
 function bridgeClientPackageMetadataViolation(file: string, contents: string): string | undefined {
-	if (
-		!file.endsWith("package.json") ||
-		(file !== bridgeClientPackageManifestPath && !contents.includes(bridgeClientPackageName))
-	)
-		return undefined;
-	try {
-		const manifest = JSON.parse(contents) as {
-			catalog?: Record<string, unknown>;
-			dependencies?: Record<string, unknown>;
-			name?: unknown;
-			optionalDependencies?: Record<string, unknown>;
-			peerDependencies?: Record<string, unknown>;
-			workspaces?: { catalog?: Record<string, unknown> };
-		};
-		if (file === bridgeClientPackageManifestPath) {
-			if (manifest.name !== bridgeClientPackageName)
-				return `${file}: is not the canonical bridge-client package manifest`;
-			if (
-				Object.keys(manifest.dependencies ?? {}).length > 0 ||
-				Object.keys(manifest.peerDependencies ?? {}).length > 0 ||
-				Object.keys(manifest.optionalDependencies ?? {}).length > 0
-			)
-				return `${file}: canonical bridge-client package must remain runtime-dependency-free`;
-			return undefined;
-		}
-		if (
-			file === "package.json" &&
-			(typeof manifest.catalog?.[bridgeClientPackageName] === "string" ||
-				typeof manifest.workspaces?.catalog?.[bridgeClientPackageName] === "string")
-		)
-			return undefined;
-		if (file === packageManifestPath && typeof manifest.dependencies?.[bridgeClientPackageName] === "string")
-			return undefined;
-	} catch {
-		return `${file}: declares unsupported bridge-client package metadata`;
-	}
-
+	if (!file.endsWith("package.json")) return undefined;
+	if (file !== bridgeClientPackageManifestPath && !contents.includes(bridgeClientPackageName)) return undefined;
 	return `${file}: declares unsupported bridge-client package metadata`;
 }
 
@@ -1635,14 +1600,14 @@ function lineNumber(contents: string, offset: number): number {
 const machineEntrypoints = new Map<string, string>([
 	["packages/coding-agent/src/modes/acp/acp-agent.ts", "ACP"],
 	["packages/coding-agent/src/commands/mcp-serve.ts", "MCP"],
-	["packages/coding-agent/src/sdk/cli/session-cli.ts", "daemon session CLI"],
+	["packages/coding-agent/src/sdk/cli/session-cli.ts", "sdk session CLI"],
 ]);
 
 const machineWrapperEntrypoints = new Map<string, string>([
 	["packages/coding-agent/src/commands/acp.ts", "ACP command"],
 	["packages/coding-agent/src/commands/daemon.ts", "daemon command"],
 	["packages/coding-agent/src/commands/mcp-serve.ts", "MCP command"],
-	["packages/coding-agent/src/sdk/cli/session-cli.ts", "daemon session CLI"],
+	["packages/coding-agent/src/sdk/cli/session-cli.ts", "sdk session CLI"],
 ]);
 const rootAcpEntrypoint = "packages/coding-agent/src/main.ts";
 const directMachineWrapperRoutePattern =
@@ -1938,9 +1903,14 @@ async function scan(): Promise<string[]> {
 				violations.push(`${file}: shipped ACP command does not dispatch through the root ACP bootstrap`);
 			}
 		}
-		if (file === "packages/coding-agent/src/commands/daemon.ts") {
+		if (file === "packages/coding-agent/src/commands/sdk.ts") {
 			if (!/runSdkSessionCli\s*\(/.test(contents)) {
-				violations.push(`${file}: shipped daemon session command does not dispatch the SDK session CLI`);
+				violations.push(`${file}: shipped sdk session command does not dispatch the SDK session CLI`);
+			}
+		}
+		if (file === "packages/coding-agent/src/commands/daemon.ts") {
+			if (/\brawAction\s*===\s*["']session["']|\baction:\s*["']session["']\s*[,}]/.test(contents)) {
+				violations.push(`${file}: daemon command retained removed SDK session routing`);
 			}
 		}
 		if (file === "packages/coding-agent/src/modes/acp/acp-agent.ts") {
@@ -2612,7 +2582,8 @@ async function selfTest(): Promise<void> {
 			"packages/coding-agent/src/sdk/client/client.ts":
 				'export { SdkClient } from "@gajae-code/bridge-client";\nexport type { SdkClientOptions } from "@gajae-code/bridge-client";\n',
 		},
-		0,
+		1,
+		"declares unsupported bridge-client package metadata",
 	);
 	await runSelfTestFixture(
 		{
@@ -2620,7 +2591,7 @@ async function selfTest(): Promise<void> {
 				'{"name":"@gajae-code/bridge-client","dependencies":{"unsafe":"1.0.0"}}\n',
 		},
 		1,
-		"canonical bridge-client package must remain runtime-dependency-free",
+		"declares unsupported bridge-client package metadata",
 	);
 	await runSelfTestFixture(
 		{

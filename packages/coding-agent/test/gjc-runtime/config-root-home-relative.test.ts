@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { standardizeMacOSPath } from "@gajae-code/utils";
+import { YAML } from "bun";
 
 /**
  * `GJC_CONFIG_DIR` is documented as "Config root dirname under home", and
@@ -23,14 +25,20 @@ afterEach(() => {
 	for (const dir of roots.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-function scenario(settings: Record<string, unknown>, dirName = ".myconfig"): { home: string; repo: string } {
+function scenario(
+	legacySettings: Record<string, unknown>,
+	config: Record<string, unknown>,
+	dirName = ".myconfig",
+): { home: string; repo: string } {
 	const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-config-root-")));
 	roots.push(root);
 	const home = path.join(root, "home");
 	const repo = path.join(root, "repo");
-	fs.mkdirSync(path.join(home, dirName), { recursive: true });
+	const configRoot = path.join(home, dirName);
+	fs.mkdirSync(path.join(configRoot, "agent"), { recursive: true });
 	fs.mkdirSync(repo, { recursive: true });
-	fs.writeFileSync(path.join(home, dirName, "settings.json"), JSON.stringify(settings));
+	fs.writeFileSync(path.join(configRoot, "settings.json"), JSON.stringify(legacySettings));
+	fs.writeFileSync(path.join(configRoot, "agent", "config.yml"), YAML.stringify(config));
 	return { home, repo };
 }
 
@@ -43,27 +51,31 @@ async function resolveIn(home: string, repo: string, configDir: string | undefin
 }
 
 describe("config root is resolved under home", () => {
-	it("reads ralplan settings from <home>/<GJC_CONFIG_DIR>", async () => {
-		const { home, repo } = scenario({ "gjc.ralplan.maxIterations": 9 });
+	it("reads ralplan settings from the user config.yml under <home>/<GJC_CONFIG_DIR> and ignores settings.json", async () => {
+		const { home, repo } = scenario({ "gjc.ralplan.maxIterations": 99 }, { gjc: { ralplan: { maxIterations: 9 } } });
 		const result = (await resolveIn(home, repo, ".myconfig")).ralplan as { maxIterations: number; source: string };
 
 		expect(result.maxIterations).toBe(9);
-		expect(result.source).toBe(path.join(home, ".myconfig", "settings.json"));
+		expect(result.source).toBe(standardizeMacOSPath(path.join(home, ".myconfig", "agent", "config.yml")));
 	});
 
-	it("reads ultragoal settings from <home>/<GJC_CONFIG_DIR>", async () => {
-		const { home, repo } = scenario({ "gjc.ultragoal.nudgeBudget": 7 });
+	it("reads ultragoal settings from the user config.yml under <home>/<GJC_CONFIG_DIR> and ignores settings.json", async () => {
+		const { home, repo } = scenario({ "gjc.ultragoal.nudgeBudget": 77 }, { gjc: { ultragoal: { nudgeBudget: 7 } } });
 		const result = (await resolveIn(home, repo, ".myconfig")).ultragoal as { budget: number; source: string };
 
 		expect(result.budget).toBe(7);
-		expect(result.source).toBe(path.join(home, ".myconfig", "settings.json"));
+		expect(result.source).toBe(standardizeMacOSPath(path.join(home, ".myconfig", "agent", "config.yml")));
 	});
 
-	it("keeps using the default config dir name when unset", async () => {
-		const { home, repo } = scenario({ "gjc.ralplan.maxIterations": 4 }, ".gjc");
+	it("keeps using the default config dir name when unset and ignores settings.json", async () => {
+		const { home, repo } = scenario(
+			{ "gjc.ralplan.maxIterations": 44 },
+			{ gjc: { ralplan: { maxIterations: 4 } } },
+			".gjc",
+		);
 		const result = (await resolveIn(home, repo, undefined)).ralplan as { maxIterations: number; source: string };
 
 		expect(result.maxIterations).toBe(4);
-		expect(result.source).toBe(path.join(home, ".gjc", "settings.json"));
+		expect(result.source).toBe(standardizeMacOSPath(path.join(home, ".gjc", "agent", "config.yml")));
 	});
 });

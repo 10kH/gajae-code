@@ -32,4 +32,81 @@ describe("kind-aware reconciliation", () => {
 		});
 		await fs.rm(root, { recursive: true, force: true });
 	});
+	test("retains bounded Unicode terminal content across restart", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-recon-content-"));
+		const sessionFile = path.join(root, "s.jsonl");
+		await fs.writeFile(sessionFile, "");
+		const store = createReconciliationStore({ sessionFile, sessionId: "s1" });
+		const rec = createKindAwareReconciliation({ store });
+		rec.admit("skill", "ref-content");
+		await rec.noteAccepted("skill", { commandId: "c1", turnId: "t1" }, "ref-content");
+		await rec.noteTransition(
+			"skill",
+			{ commandId: "c1", turnId: "t1" },
+			{
+				type: "agent_end",
+				content: { version: 1, type: "text", text: "😀".repeat(10_000), byteLength: 40_000, truncated: false },
+			},
+		);
+		const reopened = createKindAwareReconciliation({
+			store: createReconciliationStore({ sessionFile, sessionId: "s1" }),
+		});
+		await reopened.hydrateFromStore();
+		const result = reopened.lookupResult("skill", { clientRef: "ref-content" });
+		expect(result).toMatchObject({ status: "terminal_ok", content: { truncated: true } });
+		expect(new TextEncoder().encode(result.content?.text).length).toBeLessThanOrEqual(16_384);
+		await fs.rm(root, { recursive: true, force: true });
+	});
+	test("terminal transitions preserve claimed skill outcomes across reload", async () => {
+		const cases = [
+			{
+				name: "stopped claim beats a later failure frame",
+				outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+				frame: { type: "agent_failed", error: new Error("late failure") },
+				expectedStatus: "terminal_ok",
+			},
+			{
+				name: "failed claim beats a later completion frame",
+				outcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "claimed failure",
+					provenance: "agent_failed",
+				},
+				frame: { type: "agent_end" },
+				expectedStatus: "failed",
+			},
+		] as const;
+
+		for (const [index, testCase] of cases.entries()) {
+			const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-recon-terminal-"));
+			try {
+				const sessionFile = path.join(root, "s.jsonl");
+				await fs.writeFile(sessionFile, "");
+				const correlation = { commandId: `c${index}`, turnId: `t${index}` };
+				const clientRef = `ref-${index}`;
+				const store = createReconciliationStore({ sessionFile, sessionId: "s1", now: () => 1000 });
+				const rec = createKindAwareReconciliation({ store, now: () => 1000 });
+				rec.admit("skill", clientRef);
+				await rec.noteAccepted("skill", correlation, clientRef, { skillName: "deep-interview" });
+				await rec.claimPendingOutcome("skill", correlation, testCase.outcome);
+				await rec.noteTransition("skill", correlation, testCase.frame);
+
+				expect(rec.lookup("skill", { clientRef }), testCase.name).toMatchObject({
+					status: testCase.expectedStatus,
+					outcome: testCase.outcome,
+				});
+
+				const reopenedStore = createReconciliationStore({ sessionFile, sessionId: "s1", now: () => 2000 });
+				const reopened = createKindAwareReconciliation({ store: reopenedStore, now: () => 2000 });
+				await reopened.hydrateFromStore();
+				expect(reopened.lookup("skill", { clientRef }), `${testCase.name} after reload`).toMatchObject({
+					status: testCase.expectedStatus,
+					outcome: testCase.outcome,
+				});
+			} finally {
+				await fs.rm(root, { recursive: true, force: true });
+			}
+		}
+	});
 });

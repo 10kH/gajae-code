@@ -1,3 +1,4 @@
+import * as syncFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentState } from "@gajae-code/agent-core";
@@ -109,6 +110,104 @@ class Base64StreamEncoder {
 	}
 }
 
+async function canonicalizeExportPath(target: string, symlinks = new Set<string>()): Promise<string> {
+	const resolved = path.resolve(target);
+	const tail: string[] = [];
+	let current = resolved;
+	while (true) {
+		try {
+			const real = await fs.realpath(current);
+			return tail.length === 0 ? real : path.join(real, ...tail.reverse());
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		const stat = await fs.lstat(current).catch(error => {
+			if (isEnoent(error)) return undefined;
+			throw error;
+		});
+		if (stat?.isSymbolicLink()) {
+			if (symlinks.has(current)) throw new Error("HTML export path contains a symlink loop");
+			const linkTarget = await fs.readlink(current);
+			return canonicalizeExportPath(
+				path.resolve(path.dirname(current), linkTarget, ...tail.slice().reverse()),
+				new Set([...symlinks, current]),
+			);
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return resolved;
+		tail.push(path.basename(current));
+		current = parent;
+	}
+}
+
+async function assertExportDoesNotAliasSource(sourcePath: string, outputPath: string): Promise<void> {
+	const sourceResolvedPath = await canonicalizeExportPath(sourcePath);
+	const outputResolvedPath = await canonicalizeExportPath(outputPath);
+	if (sourceResolvedPath === outputResolvedPath)
+		throw new Error("HTML export output must not overwrite the source transcript");
+
+	const sourceIdentity = await fs.stat(sourcePath).catch(error => {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	});
+	const outputIdentity = await fs.stat(outputPath).catch(error => {
+		if (isEnoent(error)) return undefined;
+		throw error;
+	});
+	if (
+		sourceIdentity &&
+		outputIdentity &&
+		sourceIdentity.dev === outputIdentity.dev &&
+		sourceIdentity.ino === outputIdentity.ino
+	)
+		throw new Error("HTML export output must not overwrite the source transcript");
+}
+
+const HTML_EXPORT_SOURCE_OPEN_FLAGS =
+	syncFs.constants.O_RDONLY |
+	syncFs.constants.O_NONBLOCK |
+	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
+
+const HTML_EXPORT_DESTINATION_OPEN_FLAGS =
+	syncFs.constants.O_WRONLY |
+	syncFs.constants.O_CREAT |
+	(process.platform === "win32" ? 0 : (syncFs.constants.O_NOFOLLOW ?? 0));
+
+function sameFileIdentity(left: syncFs.BigIntStats, right: syncFs.BigIntStats): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function openHtmlExportDescriptors(
+	sourcePath: string | undefined,
+	outputPath: string,
+): Promise<{ source: number | undefined; destination: number }> {
+	let source: number | undefined;
+	let destination: number | undefined;
+	try {
+		if (sourcePath) {
+			try {
+				source = syncFs.openSync(sourcePath, HTML_EXPORT_SOURCE_OPEN_FLAGS);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+			await assertExportDoesNotAliasSource(sourcePath, outputPath);
+		}
+		destination = syncFs.openSync(outputPath, HTML_EXPORT_DESTINATION_OPEN_FLAGS, 0o666);
+		if (source !== undefined) {
+			const sourceIdentity = syncFs.fstatSync(source, { bigint: true });
+			const destinationIdentity = syncFs.fstatSync(destination, { bigint: true });
+			if (sameFileIdentity(sourceIdentity, destinationIdentity))
+				throw new Error("HTML export output must not overwrite the source transcript");
+		}
+		syncFs.ftruncateSync(destination, 0);
+		return { source, destination };
+	} catch (error) {
+		if (destination !== undefined) syncFs.closeSync(destination);
+		if (source !== undefined) syncFs.closeSync(source);
+		throw error;
+	}
+}
+
 async function writeSessionHtml(
 	sm: SessionManager,
 	state: AgentState | undefined,
@@ -121,13 +220,8 @@ async function writeSessionHtml(
 	const markerOffset = themedTemplate.indexOf(marker);
 	if (markerOffset < 0) throw new Error("HTML export template is missing the session-data marker");
 	const sourcePath = sm.getSessionFile();
-	if (sourcePath) {
-		const sourceIdentity = await fs.realpath(sourcePath).catch(() => path.resolve(sourcePath));
-		const outputIdentity = await fs.realpath(outputPath).catch(() => path.resolve(outputPath));
-		if (sourceIdentity === outputIdentity)
-			throw new Error("HTML export output must not overwrite the source transcript");
-	}
-	const sink = Bun.file(outputPath).writer();
+	const descriptors = await openHtmlExportDescriptors(sourcePath, outputPath);
+	const sink = Bun.file(descriptors.destination).writer();
 	const encoder = new Base64StreamEncoder();
 	const writeEncoded = (value: string): void => {
 		const encoded = encoder.write(value);
@@ -156,6 +250,9 @@ async function writeSessionHtml(
 	} catch (error) {
 		await sink.end();
 		throw error;
+	} finally {
+		if (descriptors.source !== undefined) syncFs.closeSync(descriptors.source);
+		syncFs.closeSync(descriptors.destination);
 	}
 }
 
@@ -178,6 +275,7 @@ export async function exportSessionToHtml(
 /** Export session file to HTML (standalone). */
 export async function exportFromFile(inputPath: string, options?: ExportOptions | string): Promise<string> {
 	const opts: ExportOptions = typeof options === "string" ? { outputPath: options } : options || {};
+	const outputPath = opts.outputPath || `${APP_NAME}-session-${path.basename(inputPath, ".jsonl")}.html`;
 
 	let sm: SessionManager;
 	const artifactRoot = inputPath.endsWith(".jsonl") ? inputPath.slice(0, -6) : inputPath;
@@ -189,6 +287,8 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 		)
 	).some(Boolean);
 	if (!(await Bun.file(inputPath).exists())) throw new Error(`File not found: ${inputPath}`);
+	await assertExportDoesNotAliasSource(inputPath, outputPath);
+
 	try {
 		sm = await SessionManager.open(
 			inputPath,
@@ -203,7 +303,6 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	}
 
 	try {
-		const outputPath = opts.outputPath || `${APP_NAME}-session-${path.basename(inputPath, ".jsonl")}.html`;
 		await writeSessionHtml(sm, undefined, outputPath, opts.themeName);
 		return outputPath;
 	} finally {

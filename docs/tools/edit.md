@@ -1,6 +1,6 @@
 # edit
 
-> Applies source edits; default mode is the hashline patch language consumed from a single `input` string.
+> Applies source edits; the default `edit.mode: auto` routes the edit protocol by model family, with the hashline patch language (single `input` string) as the fallback mode documented here.
 
 ## Source
 - Entry: `packages/coding-agent/src/edit/index.ts`
@@ -22,7 +22,7 @@
 
 ## Inputs
 
-### Hashline mode (default)
+### Hashline mode
 
 | Field | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -42,7 +42,7 @@ Patch language inside `input`:
 
 Anchors come from `read`/`search` output. `read` formats lines as `LINEhh|TEXT` via `formatHashLine` / `formatHashLines` in `packages/coding-agent/src/hashline/hash.ts`; copy only the token left of `|` into op lines.
 
-Other edit modes exist (`replace`, `patch`, `vim`, `apply_patch`) and are selected outside the tool payload by `resolveEditMode()` in `packages/coding-agent/src/utils/edit-mode.ts`. Their schemas are different; this document covers the default hashline mode.
+Other edit modes exist (`replace`, `patch`, `vim`, `apply_patch`) and are selected outside the tool payload by `resolveEditMode()` in `packages/coding-agent/src/utils/edit-mode.ts`. With the default `edit.mode: auto`, the mode is routed by detected model family (GPT/Codex → `apply_patch`; Claude/DeepSeek/Qwen → `replace`; MiniMax/GLM/Kimi and unknown models → `hashline`). Precedence: `GJC_EDIT_VARIANT`/`PI_EDIT_VARIANT` env force, then a matching `edit.modelVariants` rule, then explicit non-`auto` `edit.mode`, then a model-catalog edit recommendation when the session exposes one, then the built-in family mapping, then the `hashline` fallback. Their schemas are different; this document covers hashline mode.
 
 ## Outputs
 - Single-shot tool result; hashline mode does not use a `resolve` preview/apply handshake.
@@ -67,7 +67,7 @@ Warnings:
 - While the model is still typing arguments, the TUI can compute a diff preview with `packages/coding-agent/src/edit/streaming.ts`; that preview is not a deferred action and does not block execution.
 
 ## Flow
-1. `EditTool.execute()` in `packages/coding-agent/src/edit/index.ts` resolves the active mode. Default is `hashline`; `customFormat` exposes `packages/coding-agent/src/hashline/grammar.lark` with `$HFMT$` / `$HOP_INSERT_BEFORE$` / `$HOP_INSERT_AFTER$` / `$HOP_REPLACE$` / `$HOP_CHARS$` / `$HFILE$` placeholders filled from `packages/coding-agent/src/hashline/hash.ts`.
+1. `EditTool.execute()` in `packages/coding-agent/src/edit/index.ts` resolves the active mode. The default setting is `auto`, which routes by model family; `hashline` is the unknown-model fallback. `customFormat` exposes the grammar for the selected mode, with hashline's `packages/coding-agent/src/hashline/grammar.lark` placeholders `$HFMT$` / `$HOP_INSERT_BEFORE$` / `$HOP_INSERT_AFTER$` / `$HOP_REPLACE$` / `$HOP_CHARS$` / `$HFILE$` filled from `packages/coding-agent/src/hashline/hash.ts`.
 2. `executeHashlineSingle()` in `packages/coding-agent/src/hashline/execute.ts` splits the raw `input` into `§PATH` sections with `splitHashlineInputs()`.
 3. If multiple sections target the same path, `mergeSamePathSections()` concatenates them before execution so every op still refers to the original file snapshot.
 4. Multi-section calls run a preflight pass (`preflightHashlineSection()`): parse ops, enforce plan-mode write rules, load the current file, reject anchor-scoped edits against missing files, reject auto-generated files, apply edits in memory, and fail if the result is a no-op. This prevents partial batches.
@@ -94,7 +94,7 @@ Warnings:
 16. The final response is built from a unified diff (`generateDiffString()`), a compact preview, and any accumulated warnings.
 
 ## Modes / Variants
-- `hashline` — default mode; line-anchored patch language described here (`packages/coding-agent/src/utils/edit-mode.ts`).
+- `hashline` — unknown-model fallback mode; line-anchored patch language described here (`packages/coding-agent/src/utils/edit-mode.ts`).
 - `replace` — exact/fuzzy old/new text replacement (`packages/coding-agent/src/edit/modes/replace.ts`).
 - `patch` — structured JSON diff-hunk mode (`packages/coding-agent/src/edit/modes/patch.ts`).
 - `apply_patch` — freeform patch-envelope `*** Begin Patch` envelope, internally expanded into patch-mode entries (`packages/coding-agent/src/edit/modes/apply-patch.ts`).
@@ -172,7 +172,7 @@ export const done = true;
   - The tool itself is marked `nonAbortable = true` and `concurrency = "exclusive"` in `packages/coding-agent/src/edit/index.ts`.
 
 ## Limits & Caps
-- Default mode is `hashline` (`DEFAULT_EDIT_MODE`) in `packages/coding-agent/src/utils/edit-mode.ts`.
+- Default `edit.mode` is `auto` (model-family routing); `hashline` (`DEFAULT_EDIT_MODE`) is the fallback for unknown models, in `packages/coding-agent/src/utils/edit-mode.ts`.
 - Anchor hashes are always 2 lowercase letters from a stable 647-entry bigram table (`HL_BIGRAMS_COUNT`) in `packages/coding-agent/src/hashline/hash.ts`.
 - The visible mismatch report shows 2 lines of context on each side (`MISMATCH_CONTEXT`) in `packages/coding-agent/src/hashline/constants.ts`.
 - Stale-anchor recovery uses `fuzzFactor: 3` (`HASHLINE_RECOVERY_FUZZ_FACTOR`) in `packages/coding-agent/src/hashline/recovery.ts`.

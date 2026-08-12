@@ -4,7 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai";
 import { getBlobsDir, getTerminalSessionsDir } from "@gajae-code/utils";
-import { getMasterPaths } from "../src/master/paths";
+import { MASTER_DAEMON_LIFECYCLE_VERSION } from "../src/master/daemon";
+import { MasterDaemonController } from "../src/master/daemon-control";
+import { getMasterPaths, getMasterRootPaths } from "../src/master/paths";
 import { SessionManager } from "../src/session/session-manager";
 import { FileSessionStorage } from "../src/session/session-storage";
 
@@ -141,4 +143,102 @@ describe("master session persistence profile", () => {
 		expect(manager.getSessionFile()).toStartWith(path.resolve(destination));
 		await manager.close();
 	});
+});
+
+async function writeDetachedOwner(root: string, pid: number, now: number): Promise<void> {
+	const paths = getMasterRootPaths({ masterRootDir: root });
+	await fs.mkdir(path.join(root, "daemon"), { recursive: true, mode: 0o700 });
+	await fs.mkdir(path.join(root, "masters", "alpha"), { recursive: true, mode: 0o700 });
+	await Bun.write(
+		paths.daemonOwnerPath,
+		JSON.stringify({
+			version: MASTER_DAEMON_LIFECYCLE_VERSION,
+			kind: "master_daemon_owner",
+			ownerId: "detached-owner",
+			pid,
+			fence: 1,
+			startedAt: now - 1_000,
+			heartbeatAt: now,
+		}),
+	);
+	await Bun.write(
+		paths.daemonHeartbeatPath,
+		JSON.stringify({
+			version: MASTER_DAEMON_LIFECYCLE_VERSION,
+			kind: "master_daemon_heartbeat",
+			ownerId: "detached-owner",
+			pid,
+			fence: 1,
+			heartbeatAt: now,
+		}),
+	);
+	await Bun.write(
+		paths.daemonStatePath,
+		JSON.stringify({
+			version: MASTER_DAEMON_LIFECYCLE_VERSION,
+			kind: "master_daemon_state",
+			state: "running",
+			ownerId: "detached-owner",
+			pid,
+			fence: 1,
+			startedAt: now - 1_000,
+			heartbeatAt: now,
+			masterNames: ["alpha"],
+			roots: [root],
+			runtimeCount: 1,
+			currentSeq: 0,
+		}),
+	);
+}
+
+describe("master daemon detached-owner stop escalation", () => {
+	test("escalates to SIGKILL and fences the owner when --force is requested", async () => {
+		const root = await makeRoot();
+		const now = Date.now();
+		const pid = 987_654;
+		await writeDetachedOwner(root, pid, now);
+		const signals: NodeJS.Signals[] = [];
+		let alive = true;
+		const controller = new MasterDaemonController({
+			masterRootDir: root,
+			now: () => new Date(now),
+			pidAlive: candidate => candidate === pid && alive,
+			kill: (candidate, signal) => {
+				expect(candidate).toBe(pid);
+				signals.push(signal);
+				// The owner ignores SIGTERM and only dies on SIGKILL.
+				if (signal === "SIGKILL") alive = false;
+			},
+		});
+
+		const result = await controller.stop({ force: true, gracefulTimeoutMs: 150, killTimeoutMs: 500 });
+
+		expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(getMasterRootPaths({ masterRootDir: root }).daemonOwnerPath).exists()).toBe(false);
+		expect(await Bun.file(getMasterRootPaths({ masterRootDir: root }).daemonHeartbeatPath).exists()).toBe(false);
+	}, 15_000);
+
+	test("does not hard-kill an unresponsive owner without --force", async () => {
+		const root = await makeRoot();
+		const now = Date.now();
+		const pid = 987_655;
+		await writeDetachedOwner(root, pid, now);
+		const signals: NodeJS.Signals[] = [];
+		const controller = new MasterDaemonController({
+			masterRootDir: root,
+			now: () => new Date(now),
+			pidAlive: candidate => candidate === pid,
+			kill: (_candidate, signal) => {
+				signals.push(signal);
+			},
+		});
+
+		const result = await controller.stop({ gracefulTimeoutMs: 150 });
+
+		expect(signals).toEqual(["SIGTERM"]);
+		expect(result.ok).toBe(false);
+		expect(result.message).toBe("Master daemon stop timed out.");
+		expect(await Bun.file(getMasterRootPaths({ masterRootDir: root }).daemonOwnerPath).exists()).toBe(true);
+	}, 15_000);
 });

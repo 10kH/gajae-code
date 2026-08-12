@@ -6,7 +6,8 @@ import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import { PET_SKINS, type PetMode, Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
-import { materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
+import { activateModelProfile, materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
+import { formatModelProfileDisplayLabel } from "../config/model-profiles";
 import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
@@ -86,7 +87,12 @@ const PET_COMMAND_DEPRECATED_INPUTS: Readonly<Record<string, PetMode>> = {
 type GjcModelBatchAssignmentTargetId = "all-role-agents" | "all-targets";
 type ParsedModelCommandArgs =
 	| { kind: "summary" }
-	| { kind: "assign"; targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId; selector: string };
+	| {
+			kind: "assign";
+			targetId: GjcModelAssignmentTargetId | GjcModelBatchAssignmentTargetId;
+			selector: string;
+			hasExplicitTarget: boolean;
+	  };
 
 const GJC_MODEL_ROLE_AGENT_TARGET_IDS: GjcModelAssignmentTargetId[] = ["executor", "architect", "planner", "critic"];
 
@@ -229,19 +235,67 @@ function parseModelCommandArgs(args: string): ParsedModelCommandArgs {
 
 	if (first === "assign") {
 		const targetId = parseTarget(tokens[1]);
-		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" ") };
-		return { kind: "assign", targetId: "default", selector: tokens.slice(1).join(" ") };
+		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" "), hasExplicitTarget: true };
+		return { kind: "assign", targetId: "default", selector: tokens.slice(1).join(" "), hasExplicitTarget: false };
 	}
 
 	const explicitTarget = parseTarget(first);
 	if (explicitTarget) {
-		return { kind: "assign", targetId: explicitTarget, selector: tokens.slice(1).join(" ") };
+		return { kind: "assign", targetId: explicitTarget, selector: tokens.slice(1).join(" "), hasExplicitTarget: true };
 	}
 	if (first === "set") {
 		const targetId = parseTarget(tokens[1]);
-		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" ") };
+		if (targetId) return { kind: "assign", targetId, selector: tokens.slice(2).join(" "), hasExplicitTarget: true };
 	}
-	return { kind: "assign", targetId: "default", selector: args.trim() };
+	return { kind: "assign", targetId: "default", selector: args.trim(), hasExplicitTarget: false };
+}
+/**
+ * Optional namespace prefix accepted on `/model <preset>` selectors so users
+ * can disambiguate preset names from model ids with `gajae-code/<preset>`.
+ * The bare preset name remains the canonical form.
+ */
+const MODEL_PRESET_NAMESPACE_PREFIX = "gajae-code/";
+
+/**
+ * Resolve a `/model <selector>` argument against the merged model-profile
+ * registry. Returns the canonical profile name when `selector` is either a
+ * bare preset name (`codex-medium`) or a namespaced one
+ * (`gajae-code/codex-medium`); returns `undefined` otherwise so the caller
+ * falls through to ordinary model resolution.
+ *
+ * Only selectors that do NOT look like `provider/model` references are
+ * considered, so `/model anthropic/claude-...` is never hijacked by a preset.
+ */
+export function resolvePresetSelector(
+	selector: string,
+	modelRegistry: { getModelProfile?: (name: string) => unknown; getError?: () => unknown },
+): string | undefined {
+	const trimmed = selector.trim();
+	if (!trimmed) return undefined;
+
+	// Reject `provider/model` references outright: even if a preset happened to
+	// be named `anthropic/claude`, the slash form is a model selector, not a
+	// preset shortcut. The only accepted slash form is the `gajae-code/`
+	// namespace prefix.
+	if (trimmed.includes("/")) {
+		if (!trimmed.toLowerCase().startsWith(MODEL_PRESET_NAMESPACE_PREFIX)) return undefined;
+		const stripped = trimmed.slice(MODEL_PRESET_NAMESPACE_PREFIX.length);
+		if (!stripped || stripped.includes("/")) return undefined;
+		return matchProfileName(stripped, modelRegistry);
+	}
+
+	return matchProfileName(trimmed, modelRegistry);
+}
+
+function matchProfileName(
+	candidate: string,
+	modelRegistry: { getModelProfile?: (name: string) => unknown; getError?: () => unknown },
+): string | undefined {
+	// A registry load error means we cannot trust the profile index; fall
+	// through to model resolution rather than guessing. A registry without a
+	// getModelProfile surface (e.g. a minimal test fixture) has no presets.
+	if (modelRegistry.getError?.()) return undefined;
+	return modelRegistry.getModelProfile?.(candidate) ? candidate : undefined;
 }
 
 function splitExplicitThinkingSelector(selector: string): { baseSelector: string; thinkingLevel?: ThinkingLevel } {
@@ -391,7 +445,7 @@ function formatModelAssignmentSuccess(
 		return `Role-agent models set to ${selector} for EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
 	}
 	if (targetId === "all-targets") {
-		return `All model targets set to ${selector} for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC.`;
+		return `All model targets set to ${selector} for DEFAULT, EXECUTOR, ARCHITECT, PLANNER, CRITIC, IMAGE.`;
 	}
 	if (targetId === "default") return `Default model set to ${selector}.`;
 	return `${targetId} agent model set to ${selector}.`;
@@ -402,6 +456,7 @@ function modelSelectionUsage(runtime: SlashCommandRuntime, currentModelLine?: st
 		currentModelLine,
 		formatModelAssignmentSummary(runtime),
 		"Use /model <model> for DEFAULT, or /model <target> <model[:effort]> for EXECUTOR, ARCHITECT, PLANNER, or CRITIC.",
+		"Use /model <preset> or /model gajae-code/<preset> to activate a known model profile.",
 		formatModelOnboardingGuidance(),
 	]
 		.filter((line): line is string => Boolean(line))
@@ -746,6 +801,36 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 						modelSelectionUsage(runtime, `Missing model for ${parsedArgs.targetId.toUpperCase()}.`),
 						runtime,
 					);
+				}
+				// Preset shortcut: when the selector names a known model profile
+				// (optionally `gajae-code/`-prefixed) and the target is implicit,
+				// activate the profile immediately instead of treating the preset name
+				// as a model id and failing with "Unknown model". Explicit targets,
+				// including `/model default <preset>`, remain ordinary assignments.
+				if (parsedArgs.targetId === "default" && !parsedArgs.hasExplicitTarget) {
+					const presetName = resolvePresetSelector(modelId, runtime.session.modelRegistry);
+					if (presetName) {
+						try {
+							const profileLabel = formatModelProfileDisplayLabel(
+								runtime.session.modelRegistry.getModelProfile(presetName) ?? { name: presetName },
+							);
+							await activateModelProfile(
+								{
+									session: runtime.session,
+									modelRegistry: runtime.session.modelRegistry,
+									settings: runtime.settings,
+									profileName: presetName,
+								},
+								{ persistDefault: false },
+							);
+							await runtime.output(`Model profile: ${profileLabel}`);
+							await runtime.notifyTitleChanged?.();
+							await runtime.notifyConfigChanged?.();
+							return commandConsumed();
+						} catch (err) {
+							return usage(`Failed to activate model profile: ${errorMessage(err)}`, runtime);
+						}
+					}
 				}
 				const resolution = await resolveModelCommandSelection(runtime, modelId);
 				if (!resolution.ok) {

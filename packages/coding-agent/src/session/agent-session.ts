@@ -107,15 +107,17 @@ import {
 	classifyContextOverflow,
 	getSupportedEfforts,
 	isContextOverflow,
+	isFastModeEffectiveForProvider,
 	isUsageLimitError,
+	modelSupportsServiceTier,
 	modelsAreEqual,
-	resolveServiceTier,
 	streamSimple,
 } from "@gajae-code/ai/core";
 import {
 	type AuthDisposition,
 	beginAttempt,
 	classifyFallbackTrigger,
+	EMPTY_RESPONSE_PROVIDER_CODE,
 	type FallbackAttemptToken,
 	type FallbackTriggerClass,
 	STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE,
@@ -222,6 +224,7 @@ import type { Settings, SkillsSettings } from "../config/settings";
 import { onAppendOnlyModeChanged } from "../config/settings";
 import type { SettingPath } from "../config/settings-schema";
 import { getDefault } from "../config/settings-schema";
+import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { RawSseDebugBuffer } from "../debug/raw-sse-buffer";
 import { loadCapability } from "../discovery";
 import { expandApplyPatchToEntries, normalizeDiff, normalizeToLF, ParseError, previewPatch, stripBom } from "../edit";
@@ -301,7 +304,12 @@ import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heart
 import { GoalRuntime } from "../goals/runtime";
 import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
-import { buildSkillStopOutput, ensureWorkflowSkillActivationState } from "../hooks/skill-state";
+import {
+	buildSkillStopOutput,
+	ensureWorkflowSkillActivationSeed,
+	ensureWorkflowSkillActivationState,
+	type WorkflowSkillActivationSeed,
+} from "../hooks/skill-state";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import { resolveMemoryBackendId } from "../memory-backend/resolve";
@@ -449,6 +457,18 @@ import {
 	transferSessionMessageIdentity,
 } from "./session-manager";
 import { getEntriesForInternalRead, getSessionContextForInternalRead } from "./session-manager-internal";
+import {
+	bindToolLineage,
+	classifyOwnedEnvelope,
+	isOwnedCompletionEnvelope,
+	lookupTerminalScope,
+	mintTurnLineageIdHash,
+	type OwnedCompletionEnvelope,
+	registerTerminalTurnScope,
+	retireOwnedRegistrationsForEndpoint,
+	settleToolLineageRegistrationWindow,
+	unregisterOwnedRegistration,
+} from "./terminal-abort";
 
 import { ToolChoiceQueue } from "./tool-choice-queue";
 import { pruneSupersededMaintenanceReminders, pruneSupersededVolatileProjectContext } from "./volatile-context-pruning";
@@ -476,6 +496,37 @@ function sanitizeCompactionStateText(value: string, maxLength: number): string {
 function appendCompactionStateContext(summary: string, stateContext: string[]): string {
 	if (stateContext.length === 0) return summary;
 	return `${summary}\n\n<compaction-state>\n${stateContext.join("\n")}\n</compaction-state>`;
+}
+/**
+ * Classify an async-result delivery against terminal-abort ownership:
+ * - "ordinary": no owned-completion envelope — deliver as before.
+ * - "fresh": an exact registered owned-completion the owning scope's gate
+ *   authorizes as a fresh-turn resume (scope:"turn", policy enabled).
+ * - "drop": a recognized owned-completion the gate denies — scope:"owned"
+ *   (policy disabled, stopped work must never call followUp/prompt), a
+ *   forged/unregistered tuple, or an envelope whose terminal scope no longer
+ *   exists. Dropped entries never reach the agent (AC 36 zero final calls
+ *   from stopped work), even if a delivery races the settlement purge.
+ */
+export function ownedCompletionResumeAction(message: AgentMessage): "ordinary" | "fresh" | "drop" {
+	const details = (message as { details?: { ownedCompletions?: unknown } }).details;
+	const envelopes = details?.ownedCompletions;
+	// Extension-provided details are untrusted: the field must be an array of
+	// structurally valid internal envelopes, or it is ignored entirely —
+	// malformed metadata must never crash idle triggerTurn delivery or the
+	// agent loop (review thread P2).
+	if (!Array.isArray(envelopes) || envelopes.length === 0) return "ordinary";
+	// Three states per envelope: no terminal scope (no abort) is ORDINARY,
+	// turn-scope enabled is FRESH, owned-scope disabled is DROP. ANY drop in a
+	// mixed batch drops the whole delivery (defense in depth).
+	let anyFresh = false;
+	for (const envelope of envelopes) {
+		if (!isOwnedCompletionEnvelope(envelope)) continue;
+		const action = classifyOwnedEnvelope(envelope);
+		if (action === "drop") return "drop";
+		if (action === "fresh") anyFresh = true;
+	}
+	return anyFresh ? "fresh" : "ordinary";
 }
 
 const PRUNED_ARTIFACT_REF_MAX_CHARS = 64;
@@ -569,6 +620,9 @@ export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
 	settings: Settings;
+	/** The session's REQUESTED effective agent directory, independent of the
+	 * global Settings singleton (which may be reused across sessions). */
+	agentDir?: string;
 	/** Lazy memory backend service; omitted callers receive a session-local default. */
 	memoryBackend?: LazyService<MemoryBackend>;
 	/** Lazy workspace-tree service; omitted callers retain the legacy direct-scan path. */
@@ -693,6 +747,8 @@ export interface AgentSessionConfig {
 	 * **MUST NOT** dispose it on their own teardown.
 	 */
 	ownedAsyncJobManager?: AsyncJobManager;
+	/** False when a child borrows its parent's manager and must not dispose it. */
+	disposeAsyncJobManager?: boolean;
 	/** Cheap TUI retained-memory counters; absent for headless sessions. */
 	retainedMemorySampler?: () => RetainedMemorySample;
 	/**
@@ -751,6 +807,13 @@ type AutoCompactionTerminalStatus =
 	| { kind: "skipped"; continuationScheduled?: boolean }
 	| { kind: "failed" };
 
+type ToolOutputPruneResult = {
+	prunedCount: number;
+	tokensSaved: number;
+	committed: boolean;
+	failure?: "artifact_persistence";
+};
+
 /**
  * R3.2 pre-submit seam: `build` assembles the attempt messages (Phase A once,
  * Phase B per attempt) and may throw the typed overflow error; `reset` drops the
@@ -793,12 +856,26 @@ export interface PromptOptions {
 	onPreflightAcceptCommit?: () => void | Promise<void>;
 	/** Skill-only: prepared metadata before the durable fence (path/lineCount/cleanedArgs). */
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
+	preflightSignal?: AbortSignal;
 }
 
 function promptPreflightCancelledError(): Error {
 	const error = Object.assign(new Error("Prompt preflight was cancelled before execution."), { code: "busy" });
 	error.name = "PromptPreflightCancelledError";
 	return error;
+}
+async function awaitPromptInvocationPreflight<T>(pending: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return await pending;
+	if (signal.aborted) throw promptPreflightCancelledError();
+	const cancellation = Promise.withResolvers<never>();
+	const cancel = () => cancellation.reject(promptPreflightCancelledError());
+	signal.addEventListener("abort", cancel, { once: true });
+	try {
+		return await Promise.race([pending, cancellation.promise]);
+	} finally {
+		signal.removeEventListener("abort", cancel);
+	}
 }
 
 function isPromptPreflightCancelledError(error: unknown): boolean {
@@ -938,6 +1015,7 @@ type RetryErrorClassification =
 	| "terminal"
 	| "usage_limit"
 	| "first_event_timeout"
+	| "empty_response"
 	| "transient"
 	| "local_unavailable"
 	| "unknown";
@@ -1494,6 +1572,7 @@ function extractPermissionLocations(
  *  stable edit id while the display arrays preserve delivery order. */
 type QueuedDisplayEntry = { text: string; tag?: string; sequence: number };
 type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
+type QueuedFollowUpOwner = { cancel(): boolean };
 export type QueuedMessageEditMode = "steer" | "followUp";
 
 export interface QueuedMessageEditEntry {
@@ -1825,6 +1904,16 @@ export class AgentSession {
 	readonly agent: Agent;
 	sessionManager: SessionManager;
 	readonly settings: Settings;
+	readonly #requestedAgentDir: string | undefined;
+
+	/**
+	 * The session's effective agent directory: its REQUESTED directory when
+	 * provided, else the global Settings singleton's (which may be reused
+	 * across sessions and therefore not the requesting session's own).
+	 */
+	getSessionAgentDir(): string {
+		return this.#requestedAgentDir ?? this.settings.getAgentDir();
+	}
 	readonly memoryBackend: LazyService<MemoryBackend>;
 	readonly notificationSessionController: NotificationSessionController | undefined;
 	readonly taskDepth: number;
@@ -1920,9 +2009,39 @@ export class AgentSession {
 	/** Tracks pending follow-up messages for UI display. Removed when delivered.
 	 *  See `#steeringMessages` for entry shape. */
 	#followUpMessages: QueuedDisplayEntry[] = [];
+	/** User/SDK-requested next turns, distinct from aborted-turn continuations. */
+	readonly #externalFollowUps = new WeakSet<AgentMessage>();
+	// SDK requester-ownership correlation per queued follow-up message: the hook
+	// fires when the message is actually DEQUEUED into a run (onFollowUpConsumed),
+	// not when an independently scheduled continuation is accepted — a skipped
+	// continuation must never discard the correlation of work that is still
+	// consumed (review thread P2).
+	readonly #followUpPromotionHooks = new Map<AgentMessage, () => void>();
+	/** SDK-owned follow-ups held outside Agent's live queue until the active run ends. */
+	#deferredSdkFollowUps: AgentMessage[] = [];
+	// Client/SDK steering (turn.prompt diverted to steer while streaming, or an
+	// explicit turn.steer) is an independent root-turn request ONLY when it is
+	// admitted AFTER the terminal abort snapshot: a terminal abort admitted
+	// earlier must never purge it, or the acknowledged submission would never
+	// run and its reconciliation record would stay accepted indefinitely —
+	// while a steer admitted BEFORE the abort is an accepted-pre-close
+	// continuation of the aborted attempt that the contract requires to be
+	// blocked (review thread P1).
+	readonly #externalSteerMessages = new WeakSet<AgentMessage>();
+	/** Monotonic steering admission sequence; the terminal abort snapshots it. */
+	#steeringAdmissionSeq = 0;
+	readonly #externalSteerAdmissionSeq = new WeakMap<AgentMessage, number>();
+	/**
+	 * Per-admission terminal-abort steering snapshots, FIFO per aborted turn
+	 * key (lineage:epoch). Each admission pushes its sequence here; the
+	 * settlement of THAT admission consumes (shifts) it, so overlapping aborts
+	 * of the same turn never overwrite an earlier admission's snapshot (review
+	 * thread P1).
+	 */
+	readonly #terminalAbortSteeringSnapshots = new Map<string, number[]>();
 	#queuedDisplaySequence = 0;
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
-	#pendingNextTurnMessages: CustomMessage[] = [];
+	#pendingNextTurnMessages: Array<{ message: CustomMessage; origin: "turn" | "external" }> = [];
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	#planModeState: PlanModeState | undefined;
 	#goalModeState: GoalModeState | undefined;
@@ -2059,6 +2178,7 @@ export class AgentSession {
 	 * this undefined and **MUST NOT** dispose the global instance on teardown.
 	 */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
+	readonly #disposeAsyncJobManager: boolean;
 	readonly #ownedMcpManager: MCPManager | undefined;
 	#startupTurnBarrier: Promise<void> | undefined;
 	#pendingPythonMessages: Array<{
@@ -2090,6 +2210,9 @@ export class AgentSession {
 	#newSessionTransition: Promise<boolean> | undefined;
 	// Extension system
 	#extensionRunner: ExtensionRunner | undefined = undefined;
+	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
+	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
+	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
 	#attemptAuthority!: AttemptScopeAuthority;
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
@@ -2287,6 +2410,15 @@ export class AgentSession {
 
 	#pendingRewindReport: string | undefined = undefined;
 	#lastSuccessfulYieldToolCallId: string | undefined = undefined;
+	// Private terminal-abort machinery (C04 mode:"terminal"). The lineage id is
+	// minted per prompt turn before the model runs; tool-call bindings attach
+	// the attempt epoch so background registrations can later be classified as
+	// exact owned work (turn-continuation vs owned-completion) by source, never
+	// by timing. Endpoint generation is 0 for local/non-SDK sessions and is
+	// bound by the SDK host layer when a terminal endpoint is known.
+	#terminalEndpointGeneration = 0;
+	#turnLineageIdHash: string | undefined;
+	#terminalLineageSecret = crypto.randomUUID();
 	#promptGeneration = 0;
 	#promptPreflightAbortController = new AbortController();
 
@@ -2417,8 +2549,9 @@ export class AgentSession {
 	async #withSessionAdmission<T>(
 		kind: SessionAdmissionKind,
 		body: (lease: SessionAdmissionLease) => Promise<T>,
+		signal?: AbortSignal,
 	): Promise<T> {
-		if (kind === "prompt") await this.#awaitStartupTurnBarrier();
+		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
@@ -2439,9 +2572,23 @@ export class AgentSession {
 			settled: Promise.withResolvers<void>(),
 			released: false,
 		};
+		const releaseEntry = () => {
+			if (entry.released) return;
+			entry.released = true;
+			entry.settled.resolve();
+			const queuedIndex = this.#sessionAdmissionQueue.indexOf(entry);
+			if (queuedIndex >= 0) this.#sessionAdmissionQueue.splice(queuedIndex, 1);
+			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
+			this.#activateNextSessionAdmission();
+		};
 		this.#sessionAdmissionQueue.push(entry);
 		this.#activateNextSessionAdmission();
-		await entry.ready.promise;
+		try {
+			await awaitPromptInvocationPreflight(entry.ready.promise, signal);
+		} catch (error) {
+			releaseEntry();
+			throw error;
+		}
 		if (this.#sessionAdmissionClosed || this.#isDisposed) {
 			entry.released = true;
 			entry.settled.resolve();
@@ -2462,11 +2609,7 @@ export class AgentSession {
 		}
 
 		const release = () => {
-			if (entry.released) return;
-			entry.released = true;
-			entry.settled.resolve();
-			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
-			this.#activateNextSessionAdmission();
+			releaseEntry();
 		};
 		try {
 			return await this.#sessionAdmissionContext.run(entry, () => body({ release }));
@@ -2498,6 +2641,50 @@ export class AgentSession {
 			// Runtime-owned worker liveness follows Agent turns and background jobs
 			// in #refreshTeamWorkerHeartbeat(), including internally dispatched turns.
 		}
+	}
+	/**
+	 * Allocate a FRESH prompt attempt/lineage for an allowed owned-completion
+	 * delivery (corrected turn semantics). The new turn gets a new attempt epoch
+	 * and an opaque lineage id; it never reuses the aborted attempt's epoch and
+	 * is not a retry/TTSR/steering/successor of the aborted turn. The caller
+	 * then invokes the existing followUp/prompt path.
+	 */
+	#resumeFromOwnedCompletion(): void {
+		// Allocate the fresh epoch from the SESSION prompt epoch, not the
+		// module-global counter (root admissions never advance it, so after a
+		// normal root prompt at epoch N the counter could still be <= N and mint
+		// the SAME lineage as the aborted turn — review thread P1). A
+		// session-relative +1 is always distinct from the current turn's epoch.
+		const freshEpoch = this.#promptGeneration + 1;
+		this.#promptGeneration = freshEpoch;
+		this.#turnLineageIdHash = mintTurnLineageIdHash(
+			this.sessionManager.getSessionId?.() ?? "local",
+			freshEpoch,
+			this.#terminalLineageSecret,
+		);
+	}
+	/**
+	 * Whether a same-turn continuation of the current turn is blocked by a
+	 * terminal-abort fence. Fails open (false) when no terminal scope exists for
+	 * the current lineage+epoch, so ordinary sessions never consult a gate.
+	 * Post-close continuations (retry/TTSR/steering/hidden-next-turn/
+	 * maintenance/worker successor) are denied at the final synchronous boundary
+	 * before method entry; a continuation already linearized as a predecessor
+	 * before close stays allowed to finish.
+	 */
+	#isTurnContinuationBlocked(): boolean {
+		const lineageIdHash = this.#turnLineageIdHash;
+		if (!lineageIdHash) return false;
+		const scope = lookupTerminalScope(lineageIdHash, this.#promptGeneration);
+		if (!scope) return false;
+		return (
+			scope.gate.authorizeContinuation({
+				kind: "turn-continuation",
+				lineageIdHash,
+				attemptEpoch: this.#promptGeneration,
+				continuationId: crypto.randomUUID(),
+			}) === "deny"
+		);
 	}
 
 	#isPromptPreflightCancelled(generation: number, signal: AbortSignal): boolean {
@@ -2753,6 +2940,7 @@ export class AgentSession {
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#requestedAgentDir = config.agentDir ? path.resolve(config.agentDir) : undefined;
 		this.sessionManager.setSessionMemoryMode(this.settings.get("sessionMemory.mode"));
 		this.#unregisterSessionMemorySettings = this.settings.onChanged(settingPath => {
 			if (settingPath === "sessionMemory.mode") {
@@ -2801,6 +2989,7 @@ export class AgentSession {
 		this.#evalKernelOwnerId = config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`;
 		this.#recoveryHydrationContext = config.recoveryHydrationContext;
 		this.#ownedAsyncJobManager = config.ownedAsyncJobManager;
+		this.#disposeAsyncJobManager = config.disposeAsyncJobManager ?? true;
 		this.#retainedMemorySampler = config.retainedMemorySampler;
 		this.#ownedMcpManager = config.ownedMcpManager;
 		this.#startupTurnBarrier = config.startupTurnBarrier;
@@ -2860,16 +3049,80 @@ export class AgentSession {
 		this.#bindWorkflowGateEmitter();
 		this.yieldQueue = new YieldQueue({
 			isStreaming: () => this.isStreaming || this.#handoffTransitionActive,
-			injectStreaming: message => this.agent.followUp(message),
+			injectStreaming: message => {
+				// Mandated boundary comment (corrected turn semantics): turn-scope
+				// abort blocks only deliveries whose origin is a continuation of the
+				// aborted turn. Owned-completion deliveries from work deliberately
+				// left running are intentionally allowed to resume the agent through
+				// the normal followUp/prompt path and receive a fresh turn attempt.
+				// A denied owned-completion entry (owned scope, forged tuple, or
+				// missing scope) is DROPPED here — it must never call followUp/prompt.
+				const action = ownedCompletionResumeAction(message);
+				if (action === "drop") {
+					// A denied owned-completion entry is terminal: settle its
+					// registration before discarding it. An owned_unsettled abort
+					// (e.g. a job missing the settlement grace) leaves the tuple in
+					// the registry, and without this settlement repeated occurrences
+					// would retain terminal registrations until the bounded registry
+					// saturates and later owned aborts fail closed (review thread
+					// P2).
+					this.#settleDeliveredOwnedRegistrations([message]);
+					return;
+				}
+				// Defer the fresh lineage allocation to the ACTUAL resume admission:
+				// while another prompt is streaming, followUp only queues, so
+				// mutating the session-wide epoch/lineage here would corrupt the
+				// ACTIVE turn's lineage if it is terminal-aborted meanwhile (review
+				// thread P2). The queued resume is admitted through
+				// #promptWithMessage (resetRetryReplaySafety), which allocates the
+				// fresh attempt epoch at turn start. The idle injector, which calls
+				// agent.prompt directly, allocates right before admission.
+				this.agent.followUp(message);
+			},
 			injectIdle: async messages => {
-				const first = messages[0];
+				// Mandated boundary comment (corrected turn semantics): same origin
+				// split as the streaming injector — an allowed owned-completion
+				// delivery starts a fresh turn attempt/lineage and is not a
+				// continuation of the aborted turn. Denied owned-completion entries
+				// are dropped (mixed batches split before injection).
+				const dropped = messages.filter(message => ownedCompletionResumeAction(message) === "drop");
+				const survivors = messages.filter(message => ownedCompletionResumeAction(message) !== "drop");
+				// Settle the dropped subset (owned scope, forged tuple, vanished
+				// scope): the denied envelopes are terminal and their registrations
+				// must not occupy the bounded registry (review thread P2).
+				if (dropped.length > 0) this.#settleDeliveredOwnedRegistrations(dropped);
+				const first = survivors[0];
 				if (!first) return;
 				await this.#awaitStartupTurnBarrier();
 				if (this.#isDisposed) return;
-				if (messages.length === 1) {
-					await this.agent.prompt(first, this.#managedFallbackPromptOptions());
-				} else {
-					await this.agent.prompt(messages, this.#managedFallbackPromptOptions());
+				// A user prompt may have started during the barrier/scheduling
+				// delay: if the session is now streaming, mutating the epoch and
+				// lineage here would corrupt the ACTIVE user turn (and
+				// agent.prompt would then reject as busy, losing the drained
+				// completion). Route the survivors through followUp — the
+				// streaming injector's path — which allocates the fresh resume
+				// lineage at actual admission (review thread P1).
+				if (this.isStreaming) {
+					for (const message of survivors) this.agent.followUp(message);
+					return;
+				}
+				if (survivors.some(message => ownedCompletionResumeAction(message) === "fresh"))
+					this.#resumeFromOwnedCompletion();
+				try {
+					if (survivors.length === 1) {
+						await this.agent.prompt(first, this.#managedFallbackPromptOptions());
+					} else {
+						await this.agent.prompt(survivors, this.#managedFallbackPromptOptions());
+					}
+				} finally {
+					// The owned completions were delivered OR the prompt attempt
+					// failed (e.g. provider rejection): either way the yield
+					// queue already drained the entries, so this is their only
+					// delivery boundary — settle the registrations even on
+					// failure, otherwise repeated failed idle resumptions leak
+					// terminal tuples into the global registries until capacity
+					// is exhausted (review thread P2).
+					this.#settleDeliveredOwnedRegistrations(survivors);
 				}
 			},
 			scheduleIdleFlush: run => {
@@ -2964,7 +3217,85 @@ export class AgentSession {
 		this.#credentialSessionId = config.credentialSessionId;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
-		this.agent.afterToolCall = ctx => this.#ttsrAfterToolCall(ctx);
+		this.agent.afterToolCall = ctx => {
+			settleToolLineageRegistrationWindow(ctx.toolCall.id, this.#ownedRegistrationEndpoint());
+			return this.#ttsrAfterToolCall(ctx);
+		};
+		// Bind immutable lineage/attempt metadata to each tool call id before the
+		// tool executes. Background registrations made inside the tool (task, Bash)
+		// read this binding synchronously so their completion can later be
+		// classified as exact owned work instead of a turn continuation. Bindings
+		// intentionally survive the tool call: resumed registrations re-use the
+		// original tool call id and must retain the same owned-completion origin.
+		// They are superseded by a rebind on the same id or by bounded eviction.
+		this.agent.beforeToolCall = ctx => {
+			const lineageIdHash = this.#turnLineageIdHash;
+			if (lineageIdHash) {
+				bindToolLineage(ctx.toolCall.id, {
+					lineageIdHash,
+					promptAttemptEpoch: this.#promptGeneration,
+					endpointGeneration: this.#terminalEndpointGeneration,
+					// Endpoint identity: the owned-registration registry is
+					// process-global and job ids restart per manager, so
+					// concurrent sessions must not collide (review thread P1).
+					// Subagents inherit the parent's manager, so the key follows
+					// the MANAGER's registered endpoint — the child's own
+					// sessionManager id is never registered, and the inherited
+					// manager's completion callback resolves registrations via
+					// AsyncJobManager.endpointIdOf(manager) (review thread P1).
+					endpointId: this.#ownedRegistrationEndpoint(),
+				});
+			}
+			return undefined;
+		};
+		// A queued owned-completion follow-up is consumed by the agent loop
+		// DIRECTLY (getFollowUpMessages), never through #promptWithMessage, so
+		// the fresh attempt/lineage promised for the resume is allocated HERE at
+		// actual resume admission — when the loop dequeues the follow-up for the
+		// next turn, the previously streaming turn has ended, so mutating the
+		// session-wide epoch/lineage is safe and its tools bind the fresh lineage.
+		this.agent.onFollowUpConsumed = messages => {
+			// A follow-up whose owned-completion origin is DENIED — an owned
+			// scope landed after the result was queued, or the tuple is
+			// forged/vanished-disabled — must NOT resume the agent: remove it
+			// from the dequeued batch before the loop processes it (review
+			// thread P1). This is the final consumption boundary for
+			// follow-up-delivered owned completions.
+			const dropped: AgentMessage[] = [];
+			for (let i = messages.length - 1; i >= 0; i--) {
+				if (ownedCompletionResumeAction(messages[i]) === "drop") {
+					dropped.push(messages[i]);
+					messages.splice(i, 1);
+				}
+			}
+			// An allowed owned-completion resume allocates the fresh lineage at
+			// actual admission (see the comment above).
+			if (messages.some(message => ownedCompletionResumeAction(message) === "fresh")) {
+				this.#resumeFromOwnedCompletion();
+			}
+			// Monitor task-notifications now carry the owned-completion envelope
+			// (see tools/monitor.ts), so the general drop + fresh-admission paths
+			// above cover them exactly like async results — no monitor-specific
+			// filter is needed.
+			// Every consumed envelope (delivered OR dropped) is settled: the
+			// dropped ones are captured above so their now-terminal
+			// registrations are retired too — otherwise an owned_unsettled
+			// abort's later drop would keep occupying the global registration
+			// and retained-policy capacities (review thread P2).
+			this.#settleDeliveredOwnedRegistrations([...messages, ...dropped]);
+			// Transfer SDK requester ownership correlation at the ACTUAL dequeue:
+			// every follow-up consumed by this batch's run fires its hook — even
+			// when the batch is drained by a continuation the message did not
+			// schedule (a skipped continuation must never discard the correlation
+			// of work that is still consumed; review thread P2).
+			for (const message of messages) {
+				const hook = this.#followUpPromotionHooks.get(message);
+				if (hook) {
+					this.#followUpPromotionHooks.delete(message);
+					hook();
+				}
+			}
+		};
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
 		this.#removeEphemeralCustomMessages();
@@ -3231,7 +3562,7 @@ export class AgentSession {
 	}
 
 	/** Restore a temporary scope, unwinding any auto-owned scopes above it. */
-	restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): boolean {
+	async restoreTemporaryProviderSessionScope(token: TemporaryProviderSessionScope): Promise<boolean> {
 		const scopeIndex = this.#temporaryProviderSessionScopes.findLastIndex(scope => scope.token === token);
 		if (
 			scopeIndex < 0 ||
@@ -3240,12 +3571,12 @@ export class AgentSession {
 			return false;
 		}
 		while (this.#temporaryProviderSessionScopes.length > scopeIndex) {
-			this.#restoreTopTemporaryProviderSessionScope();
+			await this.#restoreTopTemporaryProviderSessionScope();
 		}
 		return true;
 	}
 
-	#restoreTopTemporaryProviderSessionScope(): void {
+	async #restoreTopTemporaryProviderSessionScope(): Promise<void> {
 		const scope = this.#temporaryProviderSessionScopes.pop();
 		if (!scope) return;
 		this.#closeProviderSessionMap(this.#providerSessionState, "temporary scope restore");
@@ -3264,7 +3595,7 @@ export class AgentSession {
 		this.#pendingThinkingVisibilityControlFailure = undefined;
 		this.#thinkingLevel = scope.thinkingLevel;
 		this.agent.setThinkingLevel(toReasoningEffort(scope.thinkingLevel));
-		void this.#syncEditToolModeAfterModelChange(previousEditMode);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/** Promote a temporary scope. The suspended provider state is permanently closed. */
@@ -3621,7 +3952,12 @@ export class AgentSession {
 	}
 
 	getAsyncJobSnapshot(options?: { recentLimit?: number }): AsyncJobSnapshot | null {
-		const manager = AsyncJobManager.instance();
+		// The session's OWNED manager first: /jobs, the status header, and the
+		// active-background count must reflect THIS session's jobs — with
+		// concurrent top-level sessions the process-global instance belongs to
+		// a different session and would report no running jobs for A or show
+		// B's (review thread P2).
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		if (!manager) return null;
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
 		const running = manager.getRunningJobs(ownerFilter).map(job => ({
@@ -3654,7 +3990,12 @@ export class AgentSession {
 	 */
 	#cancelOwnAsyncJobs(): void {
 		if (!this.#agentId) return;
-		const manager = AsyncJobManager.instance();
+		// The session's OWNED manager first: with concurrent top-level sessions
+		// the process-global instance may belong to a different session, and a
+		// transition (newSession/fork/handoff/switch) must cancel THIS session's
+		// jobs — otherwise the predecessor's stale completion reaches the
+		// successor as ordinary work (review thread P1).
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		if (!manager) return;
 		// Run owner cleanups first so cron timers (and any other owner-scoped
 		// resource cleanup) cannot register fresh jobs while we tear down the
@@ -3665,7 +4006,7 @@ export class AgentSession {
 
 	async #settleOwnAsyncJobsBeforeArtifactRetirement(): Promise<void> {
 		const ownerId = this.#agentId;
-		const manager = AsyncJobManager.instance();
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		if (!ownerId || !manager) return;
 		const lease = manager.beginOwnerSubagentShutdown(ownerId);
 		if (!lease) throw new Error("Owned async cleanup is already in progress before artifact retirement.");
@@ -3689,6 +4030,7 @@ export class AgentSession {
 		manager: AsyncJobManager,
 		lease: OwnerSubagentShutdownLease,
 		ownerId: string,
+		predecessorEndpointId: string,
 	): void {
 		const finalization = (async () => {
 			while (!this.#isDisposed) {
@@ -3699,7 +4041,11 @@ export class AgentSession {
 					if (!(await manager.waitForOwnerInFlightDeliveries(ownerId)))
 						throw new Error("owner_delivery_settlement_timeout");
 					if (!(await manager.cancelAndSettleOwnerJobs(ownerId))) throw new Error("owner_job_settlement_timeout");
-					if (this.#isDisposed) break;
+					if (this.#isDisposed) {
+						retireOwnedRegistrationsForEndpoint(predecessorEndpointId);
+						break;
+					}
+					retireOwnedRegistrationsForEndpoint(predecessorEndpointId);
 					this.sessionManager.retireEphemeralArtifactsAfterTransition();
 					await this.#runToolSessionTransitionCleanups();
 					manager.finishOwnerSubagentShutdown(lease, "commit");
@@ -3720,7 +4066,14 @@ export class AgentSession {
 
 	#suppressOwnAsyncJobDeliveries(): void {
 		if (!this.#agentId) return;
-		const manager = AsyncJobManager.instance();
+		// The session's OWNED manager first: with concurrent top-level sessions
+		// the process-global instance belongs to a different session, and a
+		// transition (clearContext/handoff/switch) must acknowledge THIS
+		// session's pending deliveries — otherwise an already-completed
+		// delivery pending in A's manager is injected after A's context was
+		// cleared while a same-owner delivery in B's manager is discarded
+		// (review thread P2).
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		if (!manager) return;
 		const pendingJobIds = manager.getDeliveryState({ ownerId: this.#agentId }).pendingJobIds;
 		if (pendingJobIds.length > 0) {
@@ -4613,6 +4966,13 @@ export class AgentSession {
 			}
 		}
 
+		if (
+			event.type === "agent_end" &&
+			!(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted")
+		) {
+			this.#releaseDeferredSdkFollowUps();
+		}
+
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
 			// Cooperative mid-run maintenance interruption (issue #2035). The loop
@@ -4876,7 +5236,9 @@ export class AgentSession {
 		skipCompactionCheck?: boolean;
 		suppressPredecessorAgentEnd?: boolean;
 		shouldContinue?: () => boolean;
-		onSkip?: (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => void;
+		onSkip?: (
+			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
+		) => void;
 		allowDuringCancelAndSubmit?: boolean;
 		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
@@ -4887,12 +5249,16 @@ export class AgentSession {
 		// queued turn without replaying the non-assistant tail. Every other
 		// scheduled continuation keeps continue() semantics.
 		continueQueuedOnly?: boolean;
+		/** Called when the scheduled continuation accepts its run (before agent_start). */
+		onRunAccepted?: (handle: AttemptRunHandle) => void;
 	}): Promise<void> {
 		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
 			? this.#reserveDeferredAgentEndForContinuation()
 			: undefined;
 		let terminalized = false;
-		const skip = (reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress") => {
+		const skip = (
+			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
+		) => {
 			if (terminalized) return;
 			terminalized = true;
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -4959,6 +5325,14 @@ export class AgentSession {
 							skip("queue_drained");
 							return;
 						}
+						// A scheduled same-turn continuation of a terminally aborted turn is
+						// denied at the final synchronous boundary before agent.continue
+						// entry; no await intervenes between this check and method entry.
+						// Owned-completion deliveries are NOT affected (they use followUp).
+						if (this.#isTurnContinuationBlocked()) {
+							skip("terminal_turn");
+							return;
+						}
 						// A continuation scheduled before a handoff engaged must not start a
 						// turn against the session being handed off (or the restored
 						// predecessor). rearmIdle / normal delivery resumes after the fence.
@@ -4980,6 +5354,10 @@ export class AgentSession {
 						const continueQueued = options?.continueQueuedOnly
 							? this.agent.continueQueuedMessages.bind(this.agent)
 							: this.agent.continue.bind(this.agent);
+						const queuedMessagesBeforeContinue = [
+							...this.agent.snapshotSteering(),
+							...this.agent.snapshotFollowUp(),
+						];
 						try {
 							await continueQueued({
 								...this.#managedFallbackPromptOptions(),
@@ -4988,7 +5366,20 @@ export class AgentSession {
 								// continuations retain predecessor accounting, and resetAttemptBudget keeps
 								// the sticky fallback cursor unchanged.
 								onRunAccepted: (handle: AttemptRunHandle) => {
+									const queuedMessagesAfterContinue = new Set([
+										...this.agent.snapshotSteering(),
+										...this.agent.snapshotFollowUp(),
+									]);
+									for (const message of queuedMessagesBeforeContinue) {
+										if (queuedMessagesAfterContinue.has(message)) continue;
+										const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
+										if (sdkRunToken) {
+											this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+											break;
+										}
+									}
 									this.#acceptRunHandle(handle);
+									options?.onRunAccepted?.(handle);
 									settleLease();
 									releasePredecessor();
 									if (startsQueuedSuccessor) {
@@ -5144,6 +5535,13 @@ export class AgentSession {
 					"auto_continue_prompt",
 					this.#isDisposed ? "session_disposed" : "generation_changed",
 				);
+				return false;
+			}
+			// A same-turn auto-continue of a terminally aborted turn is denied
+			// (corrected turn semantics); owned-completion deliveries are not
+			// affected — they flow through followUp as fresh turns.
+			if (this.#isTurnContinuationBlocked()) {
+				this.#logCompactionContinuationSkipped("auto_continue_prompt", "terminal_turn");
 				return false;
 			}
 			const authorized = requireUnfinishedWork
@@ -5995,7 +6393,16 @@ export class AgentSession {
 		try {
 			if (event.type === "agent_start") {
 				this.#turnIndex = 0;
-				await this.#extensionRunner.emit({ type: "agent_start" }, undefined, deliveryScope);
+				await this.#extensionRunner.emit(
+					{
+						type: "agent_start",
+						...(deliveryScope
+							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
+							: {}),
+					},
+					undefined,
+					deliveryScope,
+				);
 			} else if (event.type === "agent_end") {
 				await this.#extensionRunner.emit(
 					{
@@ -6233,6 +6640,71 @@ export class AgentSession {
 		);
 	}
 
+	/**
+	 * Re-register the session's AsyncJobManager under the successor endpoint
+	 * id after a committed session-identity transition (newSession, fork,
+	 * handoff, branch, switchSession). Tool-side lineage bindings made after
+	 * the transition use the successor id; the process-global endpoint
+	 * registry must follow, otherwise AsyncJobManager.endpointIdOf() keeps
+	 * resolving the predecessor and a queued subagent resume can neither
+	 * resolve its lineage nor register its owned tuple (review thread P1).
+	 */
+	#assertJobManagerEndpointAdmission(successorEndpointId: string): void {
+		const ownManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		const successorOwner = AsyncJobManager.forEndpoint(successorEndpointId);
+		if (ownManager && successorOwner !== undefined && successorOwner !== ownManager) {
+			throw new Error(
+				`Session identity transition rejected: endpoint "${successorEndpointId}" is owned by another live session's job manager.`,
+			);
+		}
+	}
+
+	#rekeyJobManagerForSessionIdentity(
+		previousEndpointId: string,
+		options: { retirePredecessorRegistrations?: boolean } = {},
+	): void {
+		const currentEndpointId = this.sessionManager.getSessionId();
+		const predecessorOwner = AsyncJobManager.forEndpoint(previousEndpointId);
+		// Rekey and retire ONLY when the predecessor key belongs to THIS
+		// session's manager (the session-owned manager, else the process-global
+		// fallback the session uses). A predecessor key held by a FOREIGN
+		// manager means another live session currently carries this id —
+		// neither the mapping nor the tuples keyed under it are ours to move
+		// or retire (review thread P1).
+		const ownManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		if (predecessorOwner !== undefined && predecessorOwner !== ownManager) return;
+		if (predecessorOwner !== undefined) {
+			const rekeyed = AsyncJobManager.rekeyForEndpoint(previousEndpointId, currentEndpointId, predecessorOwner);
+			if (!rekeyed) {
+				// The successor endpoint is owned by a FOREIGN live manager. A
+				// silent no-op would leave THIS manager registered under the
+				// predecessor while tools resolve the successor to the foreign
+				// manager — jobs queried or registered in the wrong session and
+				// owned aborts losing their causal set — and retiring the
+				// predecessor tuples afterwards would destroy the registration
+				// evidence of this session's still-live owned work. Fail the
+				// transition: every caller routes throws into the existing
+				// rollback (discardPreparedNewSessionAfterFailure /
+				// restoreState) BEFORE any predecessor state is retired
+				// (review thread P1).
+				throw new Error(
+					`Session identity transition rejected: endpoint "${currentEndpointId}" is owned by another live session's job manager.`,
+				);
+			}
+		}
+		// Owned registrations created before the transition are keyed by the
+		// PREDECESSOR endpoint. The transitions settle/cancel the session's
+		// owned jobs before committing identity, so no live delivery boundary
+		// depends on them; leaving them behind leaks tuples that disposal (now
+		// keyed by the successor) can never retire, saturating the global
+		// registry across repeated transitions. Retire them as part of the
+		// rekey (review thread P2). A same-id transition (no-op rekey) keeps
+		// the session's own live tuples.
+		if (previousEndpointId !== currentEndpointId && options.retirePredecessorRegistrations !== false) {
+			retireOwnedRegistrationsForEndpoint(previousEndpointId);
+		}
+	}
+
 	#rekeyHindsightMemoryForCurrentSessionId(): void {
 		if (resolveMemoryBackendId(this.settings) !== "hindsight") return;
 
@@ -6327,7 +6799,7 @@ export class AgentSession {
 		this.#cancelOwnAsyncJobs();
 		await Promise.allSettled(this.#deferredOwnerShutdownFinalizations);
 		const ownedAsyncManager = this.#ownedAsyncJobManager;
-		if (ownedAsyncManager) {
+		if (ownedAsyncManager && this.#disposeAsyncJobManager) {
 			const drained = await ownedAsyncManager.dispose({ timeoutMs: 3_000 });
 			const deliveryState = ownedAsyncManager.getDeliveryState();
 			if (drained === false && deliveryState) {
@@ -6513,7 +6985,7 @@ export class AgentSession {
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
-		const manager = AsyncJobManager.instance();
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		if (!manager) return false;
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
 		const before = manager.getDeliveryState(ownerFilter);
@@ -6537,7 +7009,7 @@ export class AgentSession {
 	 * any remaining queued/delivering work is observable and can block mutation.
 	 */
 	getAsyncDeliveryStateForAcp(): { queued: number; delivering: boolean } {
-		const manager = AsyncJobManager.instance();
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		if (!manager) return { queued: 0, delivering: false };
 		const ownerFilter = this.#agentId ? { ownerId: this.#agentId } : undefined;
 		return manager.getDeliveryState(ownerFilter);
@@ -6785,17 +7257,9 @@ export class AgentSession {
 		return resolveEditMode(this.#getEditModeSession());
 	}
 
-	#resolveEditModeForModel(model: Model): EditMode {
-		return resolveEditMode({
-			settings: this.settings,
-			getActiveModelString: () => formatModelString(model),
-		});
-	}
-
 	async #prepareDefaultModelSelectionPrompt(model: Model): Promise<string[] | undefined> {
 		if (!this.#rebuildSystemPrompt) return undefined;
 		if (!this.getActiveToolNames().includes("edit")) return undefined;
-		if (this.#resolveActiveEditMode() === this.#resolveEditModeForModel(model)) return undefined;
 		const built = await this.#rebuildSystemPrompt(this.getActiveToolNames(), this.#toolRegistry, model);
 		return built.systemPrompt;
 	}
@@ -6834,11 +7298,8 @@ export class AgentSession {
 		this.#lastAppliedToolSignature = this.#computeAppliedToolSignature(activeToolNames, activeTools);
 	}
 
-	async #syncEditToolModeAfterModelChange(previousEditMode: EditMode): Promise<void> {
-		const currentEditMode = this.#resolveActiveEditMode();
-		if (previousEditMode !== currentEditMode && this.getActiveToolNames().includes("edit")) {
-			await this.refreshBaseSystemPrompt();
-		}
+	async #syncEditToolModeAfterModelChange(_previousEditMode: EditMode): Promise<void> {
+		if (this.getActiveToolNames().includes("edit")) await this.refreshBaseSystemPrompt();
 	}
 
 	getSelectedMCPToolNames(): string[] {
@@ -7106,6 +7567,7 @@ export class AgentSession {
 						activeSkillState: this.getActiveSkillState(),
 						sessionId: this.sessionManager.getSessionId(),
 					}),
+					() => this.getSessionAgentDir(),
 				),
 			),
 		);
@@ -7888,8 +8350,12 @@ export class AgentSession {
 	async invokeSkill(
 		name: string,
 		args = "",
-		options?: Pick<PromptOptions, "onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared">,
+		options?: Pick<
+			PromptOptions,
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
+		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const skillName = name.trim();
 		if (!skillName) throw Object.assign(new Error("skill.invoke requires a skill name."), { code: "invalid_input" });
 		if (typeof args !== "string")
@@ -7901,18 +8367,24 @@ export class AgentSession {
 			throw Object.assign(new Error(`Skill ${skillName} was not found.${availableHint}`), { code: "invalid_input" });
 		}
 		const deepInterviewUserIntentEpoch = this.#claimDeepInterviewUserIntent();
-		const activation = await resolveSubskillActivationForSkillInvocation({
-			cwd: this.sessionManager.getCwd(),
-			sessionId: this.sessionId,
-			skillName: skill.name,
-			args,
-		});
-		const built = await buildSkillPromptMessage(skill, activation.cleanedArgs, {
-			subskillActivation: activation.activation,
-			subskillActivationSet: activation.activeSubskillsToPersist,
-			cwd: this.sessionManager.getCwd(),
-			sessionId: this.sessionId,
-		});
+		const activation = await awaitPromptInvocationPreflight(
+			resolveSubskillActivationForSkillInvocation({
+				cwd: this.sessionManager.getCwd(),
+				sessionId: this.sessionId,
+				skillName: skill.name,
+				args,
+			}),
+			options?.preflightSignal,
+		);
+		const built = await awaitPromptInvocationPreflight(
+			buildSkillPromptMessage(skill, activation.cleanedArgs, {
+				subskillActivation: activation.activation,
+				subskillActivationSet: activation.activeSubskillsToPersist,
+				cwd: this.sessionManager.getCwd(),
+				sessionId: this.sessionId,
+			}),
+			options?.preflightSignal,
+		);
 		const skillPromptMessage = {
 			customType: SKILL_PROMPT_MESSAGE_TYPE,
 			content: built.message,
@@ -7921,6 +8393,7 @@ export class AgentSession {
 			attribution: "user" as const,
 		};
 		this.#deepInterviewPreclaimedCustomInputEpochs.set(skillPromptMessage, deepInterviewUserIntentEpoch);
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		options?.onSkillPrepared?.({
 			name: skill.name,
 			path: skill.filePath,
@@ -8613,12 +9086,13 @@ export class AgentSession {
 					await this.invokeSkill(
 						invocation.skill.name,
 						invocation.args,
-						options?.onPreflightAccepted || options?.onPreflightAcceptCommit
+						options?.onPreflightAccepted || options?.onPreflightAcceptCommit || options?.preflightSignal
 							? {
 									...(options.onPreflightAccepted ? { onPreflightAccepted: options.onPreflightAccepted } : {}),
 									...(options.onPreflightAcceptCommit
 										? { onPreflightAcceptCommit: options.onPreflightAcceptCommit }
 										: {}),
+									...(options.preflightSignal ? { preflightSignal: options.preflightSignal } : {}),
 								}
 							: undefined,
 					);
@@ -8681,62 +9155,67 @@ export class AgentSession {
 
 		const admissionGeneration = this.#promptGeneration;
 		const admissionSignal = this.#promptPreflightAbortController.signal;
-		await this.#withSessionAdmission("prompt", async admission => {
-			this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
-			if (workflowIntentDiff) {
-				this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
-			}
+		await this.#withSessionAdmission(
+			"prompt",
+			async admission => {
+				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
+				if (workflowIntentDiff) {
+					this.sessionManager.appendCustomEntry(WORKFLOW_INTENT_DIFF_CUSTOM_TYPE, workflowIntentDiff);
+				}
 
-			// Skip eager todo prelude when the user has already queued a directive
-			const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
-			const eagerTodoPrelude =
-				!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
+				// Skip eager todo prelude when the user has already queued a directive
+				const hasPendingUserDirective = this.#toolChoiceQueue.inspect().includes("user-force");
+				const eagerTodoPrelude =
+					!options?.synthetic && !hasPendingUserDirective ? this.#createEagerTodoPrelude(expandedText) : undefined;
 
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
-			if (options?.images) {
-				userContent.push(...options.images);
-			}
+				const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: expandedText }];
+				if (options?.images) {
+					userContent.push(...options.images);
+				}
 
-			const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
-			const message = options?.synthetic
-				? {
-						role: "developer" as const,
-						content: userContent,
-						attribution: promptAttribution,
-						timestamp: Date.now(),
-					}
-				: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
-			if (deepInterviewUserIntentEpoch !== undefined)
-				this.#deepInterviewGenuineUserMessageEpochs.set(message, deepInterviewUserIntentEpoch);
-			await this.refreshGjcSubskillTools();
+				const promptAttribution = options?.attribution ?? (options?.synthetic ? "agent" : "user");
+				const message = options?.synthetic
+					? {
+							role: "developer" as const,
+							content: userContent,
+							attribution: promptAttribution,
+							timestamp: Date.now(),
+						}
+					: { role: "user" as const, content: userContent, attribution: promptAttribution, timestamp: Date.now() };
+				if (deepInterviewUserIntentEpoch !== undefined)
+					this.#deepInterviewGenuineUserMessageEpochs.set(message, deepInterviewUserIntentEpoch);
+				await this.refreshGjcSubskillTools();
 
-			if (eagerTodoPrelude?.toolChoice) {
-				this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
-					label: "eager-todo",
-				});
-			}
+				if (eagerTodoPrelude?.toolChoice) {
+					this.#toolChoiceQueue.pushOnce(eagerTodoPrelude.toolChoice, {
+						label: "eager-todo",
+					});
+				}
 
-			try {
-				await this.#promptWithMessage(message, expandedText, {
-					...options,
-					prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
-					admissionLease: admission,
-					resetRetryReplaySafety: true,
-				});
-			} finally {
-				// Clean up residual eager-todo directive if the prompt never consumed it
-				// (e.g., compaction aborted, validation failed).
-				this.#toolChoiceQueue.removeByLabel("eager-todo");
-			}
-			if (!options?.synthetic) {
-				await this.#enforcePlanModeToolDecision();
-			}
-		});
+				try {
+					await this.#promptWithMessage(message, expandedText, {
+						...options,
+						prependMessages: eagerTodoPrelude ? [eagerTodoPrelude.message] : undefined,
+						admissionLease: admission,
+						resetRetryReplaySafety: true,
+					});
+				} finally {
+					// Clean up residual eager-todo directive if the prompt never consumed it
+					// (e.g., compaction aborted, validation failed).
+					this.#toolChoiceQueue.removeByLabel("eager-todo");
+				}
+				if (!options?.synthetic) {
+					await this.#enforcePlanModeToolDecision();
+				}
+			},
+			options?.preflightSignal,
+		);
 	}
 
 	async #syncSkillPromptActiveState(
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
+		persistActiveState = true,
 	): Promise<void> {
 		if (message.customType !== SKILL_PROMPT_MESSAGE_TYPE) return;
 		const details = message.details;
@@ -8760,8 +9239,12 @@ export class AgentSession {
 		// initial mode-state + active row only when the skill is not already
 		// active, so the mutation guard and Stop hook engage immediately instead
 		// of relying on the skill prompt to run its own state-init steps.
-		if (active) {
-			await ensureWorkflowSkillActivationState({ cwd: this.sessionManager.getCwd(), skill, sessionId });
+		if (active && persistActiveState) {
+			await ensureWorkflowSkillActivationState({
+				cwd: this.sessionManager.getCwd(),
+				skill,
+				sessionId,
+			});
 			const subskillDetails = details as {
 				subskillActivation?: LoadedSubskillActivation;
 				subskillActivationSet?: LoadedSubskillActivation[];
@@ -8795,9 +9278,10 @@ export class AgentSession {
 	async #syncSkillPromptActiveStateSafely(
 		message: Pick<CustomMessage<unknown>, "customType" | "details">,
 		active: boolean,
+		persistActiveState = true,
 	): Promise<void> {
 		try {
-			await this.#syncSkillPromptActiveState(message, active);
+			await this.#syncSkillPromptActiveState(message, active, persistActiveState);
 		} catch {
 			// Skill HUD state is observational; a filesystem write failure must not
 			// interrupt the prompt turn it is visualizing. The native Stop hook still
@@ -8805,13 +9289,48 @@ export class AgentSession {
 		}
 	}
 
+	async #seedSkillPromptActiveStateSafely(
+		message: Pick<CustomMessage<unknown>, "customType" | "details">,
+	): Promise<WorkflowSkillActivationSeed | undefined> {
+		if (message.customType !== SKILL_PROMPT_MESSAGE_TYPE) return undefined;
+		const details = message.details;
+		if (!details || typeof details !== "object") return undefined;
+		const name = (details as { name?: unknown }).name;
+		if (typeof name !== "string" || !name.trim()) return undefined;
+		try {
+			const subskillDetails = details as {
+				subskillActivation?: LoadedSubskillActivation;
+				subskillActivationSet?: LoadedSubskillActivation[];
+			};
+			const activations = subskillDetails.subskillActivationSet?.length
+				? subskillDetails.subskillActivationSet
+				: subskillDetails.subskillActivation
+					? [subskillDetails.subskillActivation]
+					: [];
+			return await ensureWorkflowSkillActivationSeed({
+				cwd: this.sessionManager.getCwd(),
+				skill: name.trim(),
+				sessionId: this.sessionManager.getSessionId(),
+				activeSubskills: activations.length ? activations.map(toActiveSubskillEntry) : undefined,
+			});
+		} catch {
+			return undefined;
+		}
+	}
+
 	async promptCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
 		options?: Pick<
 			PromptOptions,
-			"streamingBehavior" | "toolChoice" | "followUpQueuePolicy" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+			| "streamingBehavior"
+			| "toolChoice"
+			| "followUpQueuePolicy"
+			| "onPreflightAccepted"
+			| "onPreflightAcceptCommit"
+			| "preflightSignal"
 		>,
 	): Promise<void> {
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		const textContent =
 			typeof message.content === "string"
 				? message.content
@@ -8842,31 +9361,61 @@ export class AgentSession {
 
 		const admissionGeneration = this.#promptGeneration;
 		const admissionSignal = this.#promptPreflightAbortController.signal;
-		await this.#withSessionAdmission("prompt", async admission => {
-			this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
-			const customMessage: CustomMessage<T> = {
-				role: "custom",
-				customType: message.customType,
-				content: message.content,
-				display: message.display,
-				details: message.details,
-				attribution: message.attribution ?? "agent",
-				timestamp: Date.now(),
-			};
-			if (deepInterviewUserIntentEpoch !== undefined)
-				this.#deepInterviewGenuineUserMessageEpochs.set(customMessage, deepInterviewUserIntentEpoch);
+		await this.#withSessionAdmission(
+			"prompt",
+			async admission => {
+				this.#throwIfPromptPreflightCancelled(admissionGeneration, admissionSignal);
+				if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+				const customMessage: CustomMessage<T> = {
+					role: "custom",
+					customType: message.customType,
+					content: message.content,
+					display: message.display,
+					details: message.details,
+					attribution: message.attribution ?? "agent",
+					timestamp: Date.now(),
+				};
+				if (deepInterviewUserIntentEpoch !== undefined)
+					this.#deepInterviewGenuineUserMessageEpochs.set(customMessage, deepInterviewUserIntentEpoch);
 
-			await this.#syncSkillPromptActiveStateSafely(customMessage, true);
-			try {
-				await this.#promptWithMessage(customMessage, textContent, {
-					...options,
-					admissionLease: admission,
-					resetRetryReplaySafety: true,
-				});
-			} finally {
-				await this.#syncSkillPromptActiveStateSafely(customMessage, false);
-			}
-		});
+				let activationSeed: WorkflowSkillActivationSeed | undefined;
+				let preflightCancelled = false;
+				let durableAcceptanceCompleted = false;
+				const commitAcceptance = async () => {
+					activationSeed = await this.#seedSkillPromptActiveStateSafely(customMessage);
+					await this.#syncSkillPromptActiveStateSafely(customMessage, true, activationSeed?.seeded !== true);
+					if (options?.preflightSignal?.aborted) {
+						await activationSeed?.rollback();
+						throw promptPreflightCancelledError();
+					}
+					if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+					else options?.onPreflightAccepted?.();
+					durableAcceptanceCompleted = true;
+					if (options?.preflightSignal?.aborted) {
+						await activationSeed?.rollback();
+						throw promptPreflightCancelledError();
+					}
+				};
+				try {
+					await this.#promptWithMessage(customMessage, textContent, {
+						...options,
+						onPreflightAccepted: undefined,
+						onPreflightAcceptCommit: commitAcceptance,
+						admissionLease: admission,
+						resetRetryReplaySafety: true,
+					});
+				} catch (error) {
+					if (isPromptPreflightCancelledError(error) || !durableAcceptanceCompleted) {
+						preflightCancelled = true;
+						await activationSeed?.rollback();
+					}
+					throw error;
+				} finally {
+					if (!preflightCancelled) await this.#syncSkillPromptActiveStateSafely(customMessage, false);
+				}
+			},
+			options?.preflightSignal,
+		);
 	}
 
 	async #promptWithMessage(
@@ -8874,7 +9423,12 @@ export class AgentSession {
 		expandedText: string,
 		options?: Pick<
 			PromptOptions,
-			"toolChoice" | "images" | "skipCompactionCheck" | "onPreflightAccepted" | "onPreflightAcceptCommit"
+			| "toolChoice"
+			| "images"
+			| "skipCompactionCheck"
+			| "onPreflightAccepted"
+			| "onPreflightAcceptCommit"
+			| "preflightSignal"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
@@ -8886,16 +9440,59 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
-		await this.#agentEndPublicationPromise;
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
+		await awaitPromptInvocationPreflight(this.#agentEndPublicationPromise, options?.preflightSignal);
 		// Re-check after the publication await: a handoff can engage during that
 		// window, and #beginInFlight below would otherwise start a turn against the
 		// session being handed off.
 		this.#assertNoHandoffTransition();
 		this.#beginInFlight();
+		// Discard hidden next-turn successors queued by a PREVIOUS turn that a
+		// terminal abort closed. This must run BEFORE the admission bump below:
+		// once the new root turn advances the epoch, the fence lookup can no
+		// longer find the aborted turn's scope, and the pending messages would
+		// otherwise be injected into this new prompt (review thread P2).
+		if (this.#pendingNextTurnMessages.length > 0 && this.#isTurnContinuationBlocked()) {
+			// Discard only TURN-origin hidden successors of the fenced attempt;
+			// external/background next-turn context (extension triggers,
+			// autoresearch) must survive (review thread P2). AUTHORIZED
+			// owned-completion envelopes are preserved too: a monitor
+			// notification queued via the deferred path (default origin "turn")
+			// is an authorized completion from work left running by a PRIOR
+			// scope:"turn" abort and must still reach followUp/prompt (review
+			// thread P1).
+			this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(
+				entry => entry.origin !== "turn" || ownedCompletionResumeAction(entry.message as never) !== "ordinary",
+			);
+		}
+		// NEW ROOT TURN: advance the attempt epoch before minting the lineage so
+		// consecutive non-aborted turns never share (lineageIdHash, epoch). A
+		// terminal abort of turn B must never capture turn A's left-running
+		// owned work, and turn A's completion must never classify as a resume of
+		// B. Same-turn continuations (auto-continue/retry, resetRetryReplaySafety
+		// unset) keep the turn's epoch and lineage.
+		if (options?.resetRetryReplaySafety) {
+			this.#promptGeneration++;
+			this.#promptPreflightAbortController.abort();
+			this.#promptPreflightAbortController = new AbortController();
+		}
 		const predecessorAgentEndHold =
 			options?.predecessorAgentEndHold ?? this.#reserveDeferredAgentEndForContinuation();
 		const generation = this.#promptGeneration;
-		const preflightSignal = this.#promptPreflightAbortController.signal;
+		// Mint the immutable lineage identity for this prompt turn before the
+		// model runs; beforeToolCall attaches this lineage + attempt epoch to
+		// each tool call id so background registrations can be classified by
+		// source later (terminal-abort owned-completion vs turn-continuation).
+		this.#turnLineageIdHash = mintTurnLineageIdHash(
+			this.sessionManager.getSessionId?.() ?? "local",
+			generation,
+			this.#terminalLineageSecret,
+		);
+
+		const sessionPreflightSignal = this.#promptPreflightAbortController.signal;
+		const preflightSignal = options?.preflightSignal
+			? AbortSignal.any([sessionPreflightSignal, options.preflightSignal])
+			: sessionPreflightSignal;
 		const rosterClaim = this.#claimIrcRosterCandidate();
 		let hasPendingNextTurnMessages = false;
 		let pendingNextTurnMessageCount = 0;
@@ -8942,7 +9539,7 @@ export class AgentSession {
 				await this.#checkEstimatedContextBeforePrompt([
 					...(options?.prependMessages ?? []),
 					message,
-					...this.#pendingNextTurnMessages,
+					...this.#pendingNextTurnMessages.map(entry => entry.message),
 				]);
 			}
 
@@ -9101,8 +9698,14 @@ export class AgentSession {
 				messages.push(message);
 
 				// Re-present captured pending next-turn messages (never drained here).
-				for (const msg of this.#pendingNextTurnMessages.slice(0, pendingNextTurnMessageCount)) {
-					messages.push(msg);
+				// Reclassify deferred envelopes before injecting them into the new
+				// root turn: a monitor notification queued during/after a scope:"owned"
+				// abort must be dropped (and fresh ones allocate a fresh lineage)
+				// even though the deferred queueing path never ran the classifier
+				// (review thread P1).
+				for (const entry of this.#pendingNextTurnMessages.slice(0, pendingNextTurnMessageCount)) {
+					if (ownedCompletionResumeAction(entry.message as never) === "drop") continue;
+					messages.push(entry.message);
 				}
 				messages.push(...fileMentionMessages);
 				if (hindsightRecall) {
@@ -9146,6 +9749,15 @@ export class AgentSession {
 					attemptMessages = undefined;
 				},
 			};
+			// Abort can race asynchronous preflight work. The injection signatures were
+			// consumed while building context, but no prompt was accepted, so reset them.
+			if (this.#isPromptPreflightCancelled(generation, preflightSignal) || options?.preflightSignal?.aborted) {
+				this.#resetInjectedContextSignatures();
+				// Ack-waiting callers are told the preflight never ran; direct callers
+				// (aborted after setup) resolve gracefully as before f24f46ff5.
+				if (options?.onPreflightAccepted || options?.onPreflightAcceptCommit) throw promptPreflightCancelledError();
+				return;
+			}
 
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
@@ -9161,11 +9773,20 @@ export class AgentSession {
 						this.getHindsightSessionState()?.markRecallSnippetInjected(hindsightRecall);
 					}
 					if (pendingNextTurnMessageCount > 0) {
+						// The captured prefix is consumed here whether its entries were
+						// injected or dropped. Settle every owned envelope at this
+						// consumption boundary; the helper retains registrations whose
+						// jobs are still running, while non-persistent monitor jobs
+						// already cancelled after delivery cannot produce another
+						// settlement (review thread P2).
+						const consumedPrefix = this.#pendingNextTurnMessages.slice(0, pendingNextTurnMessageCount);
+						this.#settleDeliveredOwnedRegistrations(consumedPrefix.map(entry => entry.message));
 						this.#pendingNextTurnMessages.splice(0, pendingNextTurnMessageCount);
 					}
 					if (this.#cancelAndSubmitInProgress) this.#cancelAndSubmitPendingNextTurnDrained = true;
 				},
 			};
+
 			await this.#promptAgentWithIdleRetry(preSubmit, agentPromptOptions, predecessorAgentEndHold, {
 				signal: preflightSignal,
 				resourceRunId: this.#runResourceLeaseContext.getStore()?.resourceRunId,
@@ -9450,15 +10071,20 @@ export class AgentSession {
 	async #queueSteer(
 		text: string,
 		images?: ImageContent[],
-		options?: { claimsGenuineUserIntent?: boolean },
+		options?: { claimsGenuineUserIntent?: boolean; onPromoted?: () => void; external?: boolean },
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText));
+		const displayEntry = this.#createQueuedDisplayEntry(displayText);
+		this.#steeringMessages.push(displayEntry);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		if (options?.external) {
+			this.#externalSteerMessages.add(message);
+			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
+		}
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
@@ -9476,6 +10102,10 @@ export class AgentSession {
 			this.#scheduleAgentContinue({
 				shouldContinue: () => this.#canAutoContinueForSteer() && this.agent.hasQueuedSteering(),
 				continueQueuedOnly: true,
+				// The queued steer will start its OWN run: fire the SDK ownership
+				// correlation hook so the submitting connection can terminal-abort
+				// that turn once it starts (review thread P2).
+				onRunAccepted: options?.onPromoted,
 			});
 		}
 	}
@@ -9486,29 +10116,91 @@ export class AgentSession {
 	async #queueFollowUp(
 		text: string,
 		images?: ImageContent[],
-		options?: { forceOneAtATime?: boolean; claimsGenuineUserIntent?: boolean },
-	): Promise<void> {
+		options?: {
+			forceOneAtATime?: boolean;
+			claimsGenuineUserIntent?: boolean;
+			onPromoted?: () => void;
+			sdkRunToken?: string;
+		},
+	): Promise<QueuedFollowUpOwner> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		this.#followUpMessages.push(this.#createQueuedDisplayEntry(displayText));
+		const queueWasEmpty = !this.agent.hasQueuedMessages();
+		const displayEntry = this.#createQueuedDisplayEntry(displayText);
+		this.#followUpMessages.push(displayEntry);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		this.#externalFollowUps.add(message);
+		if (options?.onPromoted) this.#followUpPromotionHooks.set(message, options.onPromoted);
 		if (options?.claimsGenuineUserIntent) {
 			const epoch = this.#claimDeepInterviewUserIntent();
 			this.#deepInterviewGenuineUserMessageEpochs.set(message, epoch);
 		}
-		this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
-		// When fully idle AND the session is in a resumable assistant-ended state,
-		// schedule an immediate continue so the queued follow-up is delivered
-		// without waiting for the next user turn. We gate on isStreaming (model
-		// actively producing), isRetrying (auto-retry backoff is sleeping between
-		// attempts, #retryPromise set), and the last message being assistant —
-		// agent.continue() only dequeues follow-ups from an assistant-ended state;
-		// resuming from user/toolResult state runs an extra model call on the
-		// stale prompt before draining the queue.
-		this.#scheduleQueuedFollowUpContinuation();
+		if (options?.sdkRunToken) this.#sdkRunTokensByQueuedMessage.set(message, options.sdkRunToken);
+		if (options?.sdkRunToken && (this.agent.state.isStreaming || this.agent.hasQueuedMessages())) {
+			this.#deferredSdkFollowUps.push(message);
+		} else {
+			this.agent.followUp(message, options?.forceOneAtATime ? { forceOneAtATime: true } : undefined);
+		}
+		// When this is the first queued message and the session is in a resumable
+		// assistant-ended state, schedule an immediate continue so it is delivered
+		// without waiting for the next user turn. A later accepted follow-up must
+		// not start unrelated queued work ahead of it, because that work has a
+		// different cancellation and terminal owner.
+		if (queueWasEmpty)
+			this.#scheduleQueuedFollowUpContinuation(() =>
+				this.agent.snapshotFollowUp().some(candidate => candidate === message),
+			);
+		return {
+			cancel: () => {
+				const deferredIndex = this.#deferredSdkFollowUps.indexOf(message);
+				let removed = false;
+				if (deferredIndex !== -1) {
+					this.#deferredSdkFollowUps.splice(deferredIndex, 1);
+					removed = true;
+				} else {
+					removed = this.agent.removeQueuedMessages(candidate => candidate === message).followUp > 0;
+					// This message was already released from the deferred queue; its
+					// scheduled continuation was cancelled before it started. No further
+					// agent_end may arrive to release the next deferred follow-up, so
+					// advance the queue here to keep the next accepted SDK request moving.
+					if (removed) this.#releaseDeferredSdkFollowUps();
+				}
+				if (removed) {
+					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
+					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
+					this.#sdkRunTokensByQueuedMessage.delete(message);
+				}
+				return removed;
+			},
+		};
+	}
+	#releaseDeferredSdkFollowUps(): void {
+		// A deferred SDK follow-up must become the sole first message at the next
+		// acceptance so its run token is bound to the agent_start. Releasing it
+		// behind still-queued work reproduces the token-less mid-run consumption
+		// hazard, so wait for the queue to drain; the next agent_end retries.
+		if (this.agent.hasQueuedMessages()) return;
+		const message = this.#deferredSdkFollowUps.shift();
+		if (!message) return;
+		this.agent.followUp(message, { forceOneAtATime: true });
+		this.#scheduleAgentContinue({
+			shouldContinue: () => this.#canStartDeferredSdkFollowUp() && this.agent.hasQueuedMessages(),
+			continueQueuedOnly: true,
+			rescheduleOnBusy: true,
+		});
+	}
+	#canStartDeferredSdkFollowUp(): boolean {
+		if (this.agent.state.isStreaming) return false;
+		if (this.isCompacting) return false;
+		if (this.isBashRunning) return false;
+		if (this.isEvalRunning) return false;
+		if (this.isRetrying) return false;
+		const messages = this.agent.state.messages;
+		const last = messages[messages.length - 1];
+		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
 	}
 
 	/**
@@ -9524,10 +10216,16 @@ export class AgentSession {
 		const last = messages[messages.length - 1];
 		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
 	}
-	#scheduleQueuedFollowUpContinuation(): void {
-		if (!this.#cancelAndSubmitInProgress && this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages()) {
+	#scheduleQueuedFollowUpContinuation(ownsQueuedMessage: (() => boolean) | undefined = undefined): void {
+		if (
+			!this.#cancelAndSubmitInProgress &&
+			this.#canAutoContinueForFollowUp() &&
+			this.agent.hasQueuedMessages() &&
+			(ownsQueuedMessage?.() ?? true)
+		) {
 			this.#scheduleAgentContinue({
-				shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
+				shouldContinue: () =>
+					this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages() && (ownsQueuedMessage?.() ?? true),
 				continueQueuedOnly: true,
 			});
 		}
@@ -9549,16 +10247,16 @@ export class AgentSession {
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {
-		this.#queueHiddenNextTurnMessage(message, true);
+		this.#queueHiddenNextTurnMessage(message, true, "turn");
 	}
 
 	queueDeferredMessageForTests(message: CustomMessage, triggerTurn = true): void {
-		this.#queueHiddenNextTurnMessage(message, triggerTurn);
+		this.#queueHiddenNextTurnMessage(message, triggerTurn, "turn");
 	}
 
 	/** Read-only test seam for the hidden next-turn context queue. */
 	getPendingNextTurnMessagesForTests(): readonly CustomMessage[] {
-		return this.#pendingNextTurnMessages.slice();
+		return this.#pendingNextTurnMessages.map(entry => entry.message);
 	}
 
 	/** Test-only abort outcome override; undefined retains the production abort race. */
@@ -9566,12 +10264,16 @@ export class AgentSession {
 		this.#cancelAndSubmitAbortOutcomeProviderForTests = provider;
 	}
 
-	#queueHiddenNextTurnMessage(message: CustomMessage, triggerTurn: boolean): void {
+	#queueHiddenNextTurnMessage(
+		message: CustomMessage,
+		triggerTurn: boolean,
+		origin: "turn" | "external" = "external",
+	): void {
 		// A hidden next-turn message queued during a handoff transition would be
 		// dropped when the successor clears predecessor queues; reject it as busy so
 		// the caller can retry against the settled session.
 		this.#assertNoHandoffTransition();
-		this.#pendingNextTurnMessages.push(message);
+		this.#pendingNextTurnMessages.push({ message, origin });
 		if (!triggerTurn) return;
 		const generation = this.#promptGeneration;
 		if (this.#scheduledHiddenNextTurnGeneration === generation) {
@@ -9584,6 +10286,27 @@ export class AgentSession {
 					this.#scheduledHiddenNextTurnGeneration = undefined;
 				}
 				if (this.#pendingNextTurnMessages.length === 0) {
+					return;
+				}
+				// Terminal abort closed this turn's continuation fence: a hidden
+				// next-turn successor queued by the aborted turn must NOT start,
+				// even though the scheduler's generation check still passes
+				// (the abort preserves the epoch so the gate can find the scope).
+				if (this.#isTurnContinuationBlocked()) {
+					// Terminal abort closed this turn's continuation fence:
+					// DISCARD only the turn-origin hidden successors queued by the
+					// aborted turn so they cannot be drained into a later explicit
+					// prompt; external/background next-turn context survives
+					// (review thread P2). AUTHORIZED owned-completion envelopes
+					// survive too: a left-running owned job's completion queued
+					// via sendCustomMessage (default origin "turn") is a promised
+					// resume of the root worker, not a continuation of the aborted
+					// attempt, and #promptQueuedHiddenNextTurnMessages classifies
+					// it fresh (review thread P1).
+					this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(
+						entry =>
+							entry.origin !== "turn" || ownedCompletionResumeAction(entry.message as never) !== "ordinary",
+					);
 					return;
 				}
 				try {
@@ -9610,12 +10333,47 @@ export class AgentSession {
 
 		const queuedMessages = [...this.#pendingNextTurnMessages];
 		this.#pendingNextTurnMessages = [];
-		const message = queuedMessages[queuedMessages.length - 1];
+		// Reclassify deferred envelopes at the drain boundary: a monitor
+		// notification queued via the deferAgentInitiatedTurns branch never ran
+		// ownedCompletionResumeAction at queue time, so a scope:"owned" abort
+		// that landed since may now classify the envelope as drop — drop it and
+		// allocate a fresh lineage for fresh envelopes (review thread P1).
+		const dropped: Array<{ message: CustomMessage }> = [];
+		const reclassified = queuedMessages.filter(entry => {
+			if (ownedCompletionResumeAction(entry.message as never) === "drop") {
+				dropped.push(entry);
+				return false;
+			}
+			return true;
+		});
+		// A reclassified drop (owned scope, terminal job) never reaches a
+		// follow-up/prompt boundary: settle its registrations here so the
+		// terminal tuple does not occupy the global registration and
+		// retained-policy capacities indefinitely (review thread P2).
+		if (dropped.length > 0) {
+			this.#settleDeliveredOwnedRegistrations(dropped.map(entry => entry.message));
+		}
+		if (reclassified.length === 0) {
+			return;
+		}
+		// Allocate a fresh root-turn lineage when the drained batch contains a
+		// fresh owned envelope OR an EXTERNAL hidden trigger: an external
+		// nextTurn message has no owned envelope, so without this it would
+		// reuse the previous turn's identical lineage+epoch and a later
+		// scope:"owned" abort of the external turn could capture the previous
+		// turn's jobs (review thread P1).
+		if (
+			reclassified.some(entry => ownedCompletionResumeAction(entry.message as never) === "fresh") ||
+			reclassified.some(entry => entry.origin === "external")
+		) {
+			this.#resumeFromOwnedCompletion();
+		}
+		const message = reclassified[reclassified.length - 1]?.message;
 		if (!message) {
 			return;
 		}
 
-		const prependMessages = queuedMessages.slice(0, -1);
+		const prependMessages = reclassified.slice(0, -1).map(entry => entry.message);
 		const textContent = this.#getCustomMessageTextContent(message);
 		await this.#syncSkillPromptActiveStateSafely(message, true);
 		try {
@@ -9624,10 +10382,44 @@ export class AgentSession {
 				skipPostPromptRecoveryWait: true,
 			});
 		} catch (error) {
-			this.#pendingNextTurnMessages = [...queuedMessages, ...this.#pendingNextTurnMessages];
+			// Requeue only the SURVIVING reclassified entries: a completion
+			// denied by scope:"owned" was settled (dropped) above and must
+			// never reach a later prompt — once its scope and now-unoccupied
+			// policy tombstone are evicted by the bounded registries, the
+			// restored external monitor message would classify as ordinary and
+			// breach the owned abort's zero-delivery guarantee (review thread
+			// P2).
+			this.#pendingNextTurnMessages = [...reclassified, ...this.#pendingNextTurnMessages];
 			throw error;
 		} finally {
 			await this.#syncSkillPromptActiveStateSafely(message, false);
+		}
+	}
+
+	/** Unregister owned-completion registrations once their delivery is settled
+	 *  (delivered as a fresh/ordinary turn or dropped by an owned scope) AND the
+	 *  underlying job is TERMINAL. A monitor notification reuses the still-running
+	 *  monitor's registration, so removing it after an intermediate notification
+	 *  would let a later scope:"owned" abort miss the monitor and make subsequent
+	 *  notifications lose their envelope (review thread P1). */
+	#settleDeliveredOwnedRegistrations(messages: AgentMessage[]): void {
+		// Use the SESSION-OWNED manager first: the process-global instance is
+		// the last-created session, so checking this session's delivery against
+		// another session's manager (which lacks the same local job id) would
+		// see job === undefined and remove a still-live registration (review
+		// thread P1).
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		for (const message of messages) {
+			const details = (message as { details?: { ownedCompletions?: OwnedCompletionEnvelope[] } }).details;
+			for (const envelope of details?.ownedCompletions ?? []) {
+				const job = manager?.getJob(envelope.registration.jobId);
+				const status = job?.generation === envelope.registration.jobGeneration ? job?.status : undefined;
+				// Evicted jobs have no live record (job === undefined); terminal
+				// statuses settle the registration.
+				if (job === undefined || status === "completed" || status === "cancelled" || status === "failed") {
+					unregisterOwnedRegistration(envelope.registration);
+				}
+			}
 		}
 	}
 
@@ -9672,6 +10464,13 @@ export class AgentSession {
 			triggerTurn?: boolean;
 			deliverAs?: "steer" | "followUp" | "nextTurn";
 			followUpQueuePolicy?: "respect-mode" | "sequential";
+			/** INTERNAL trusted option: origin of a hidden next-turn message —
+			 *  "turn" (produced by the current turn's continuation machinery,
+			 *  purged by a terminal abort) or "external" (background producers,
+			 *  preserved). Extension sendMessage callers are classified
+			 *  "external" at the trusted bridge and never supply this bit
+			 *  (review thread P2). */
+			origin?: "turn" | "external";
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
@@ -9696,7 +10495,7 @@ export class AgentSession {
 			// while an (auto-)handoff is unwinding it.
 			this.#assertNoHandoffTransition();
 			if (options?.deliverAs === "nextTurn") {
-				this.#queueHiddenNextTurnMessage(appMessage, options?.triggerTurn ?? false);
+				this.#queueHiddenNextTurnMessage(appMessage, options?.triggerTurn ?? false, options?.origin ?? "turn");
 				return;
 			}
 
@@ -9714,9 +10513,13 @@ export class AgentSession {
 		if (options?.deliverAs === "nextTurn") {
 			if (options?.triggerTurn) {
 				if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
-					this.#queueHiddenNextTurnMessage(appMessage, false);
+					this.#queueHiddenNextTurnMessage(appMessage, false, options?.origin ?? "turn");
 					return;
 				}
+				// Every direct idle admission is a NEW ROOT TURN: allocate a fresh
+				// lineage so the turn never remints the previous turn's identical
+				// lineage+epoch (review thread P1).
+				this.#resumeFromOwnedCompletion();
 				await this.#syncSkillPromptActiveStateSafely(appMessage, true);
 				try {
 					await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
@@ -9724,6 +10527,11 @@ export class AgentSession {
 					});
 				} finally {
 					await this.#syncSkillPromptActiveStateSafely(appMessage, false);
+					// The direct idle admission bypasses onFollowUpConsumed:
+					// settle any delivered owned-completion envelope so a
+					// terminal registration does not occupy the registry until
+					// saturation (review thread P2).
+					this.#settleDeliveredOwnedRegistrations([appMessage]);
 				}
 				return;
 			}
@@ -9745,6 +10553,27 @@ export class AgentSession {
 				this.#queueHiddenNextTurnMessage(appMessage, false);
 				return;
 			}
+			// Gate owned-completion deliveries at this IDLE boundary too: the
+			// monitor notification envelope must DROP for scope:"owned" (racing
+			// settlement) and allocate a FRESH lineage for scope:"turn" — the
+			// direct prompt path below bypasses the follow-up consumption
+			// classification (review thread P1).
+			const idleResumeAction = ownedCompletionResumeAction(appMessage as never);
+			if (idleResumeAction === "drop") {
+				// The notification is denied (owned scope) but its job may be
+				// terminal: settle the envelope's registrations before
+				// discarding it, otherwise the tuple occupies the global
+				// registration and retained-policy bounds indefinitely
+				// (review thread P2).
+				this.#settleDeliveredOwnedRegistrations([appMessage]);
+				return;
+			}
+			// Every direct idle admission is a NEW ROOT TURN: allocate a fresh
+			// lineage even for ordinary triggers (cron/extension). Without this,
+			// the turn would remint the previous turn's identical lineage+epoch
+			// and a later scope:"owned" abort could capture the earlier turn's
+			// unrelated jobs (review thread P1).
+			this.#resumeFromOwnedCompletion();
 			await this.#syncSkillPromptActiveStateSafely(appMessage, true);
 			try {
 				await this.#promptWithMessage(appMessage, this.#getCustomMessageTextContent(appMessage), {
@@ -9752,6 +10581,13 @@ export class AgentSession {
 				});
 			} finally {
 				await this.#syncSkillPromptActiveStateSafely(appMessage, false);
+				// The direct idle admission bypasses onFollowUpConsumed:
+				// settle any delivered owned-completion envelope so a terminal
+				// registration does not occupy the registry until saturation —
+				// a non-persistent monitor cancels right after its first line
+				// and enqueues no delivery that would settle it otherwise
+				// (review thread P2).
+				this.#settleDeliveredOwnedRegistrations([appMessage]);
 			}
 			return;
 		}
@@ -9779,13 +10615,13 @@ export class AgentSession {
 		}
 		const agentRemoved = this.agent.removeQueuedMessages(isMatch);
 		const beforeNext = this.#pendingNextTurnMessages.length;
-		for (const m of this.#pendingNextTurnMessages) {
-			if (predicate(m)) {
-				const tag = readPendingDisplayTag(m.details);
+		for (const entry of this.#pendingNextTurnMessages) {
+			if (predicate(entry.message)) {
+				const tag = readPendingDisplayTag(entry.message.details);
 				if (tag) removedTags.add(tag);
 			}
 		}
-		this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(m => !predicate(m));
+		this.#pendingNextTurnMessages = this.#pendingNextTurnMessages.filter(entry => !predicate(entry.message));
 		const pendingNextTurn = beforeNext - this.#pendingNextTurnMessages.length;
 		let displaySteering = 0;
 		let displayFollowUp = 0;
@@ -9820,9 +10656,14 @@ export class AgentSession {
 			deliverAs?: "steer" | "followUp";
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
+			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
+			onQueuedPromoted?: () => void;
+			preflightSignal?: AbortSignal;
+			sdkRunToken?: string;
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
+		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
@@ -9845,13 +10686,25 @@ export class AgentSession {
 
 		if (options?.deliverAs === "followUp") {
 			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			await this.#queueFollowUp(text, images, { claimsGenuineUserIntent: true });
+			const queuedFollowUp = await this.#queueFollowUp(text, images, {
+				claimsGenuineUserIntent: true,
+				forceOneAtATime: Boolean(options.preflightSignal),
+				onPromoted: options?.onQueuedPromoted,
+				sdkRunToken: options.sdkRunToken,
+			});
+			const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
+			options.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
+			if (options.preflightSignal?.aborted) cancelQueuedFollowUp();
 			options.onPreflightAccepted?.();
 			return;
 		}
 		if (options?.deliverAs === "steer") {
 			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
+			await this.#queueSteer(text, images, {
+				claimsGenuineUserIntent: true,
+				onPromoted: options?.onQueuedPromoted,
+				external: true,
+			});
 			options.onPreflightAccepted?.();
 			return;
 		}
@@ -9863,7 +10716,11 @@ export class AgentSession {
 		// the message in the steering queue with no turn to consume it.
 		if (this.isStreaming) {
 			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			await this.#queueSteer(text, images, { claimsGenuineUserIntent: true });
+			await this.#queueSteer(text, images, {
+				claimsGenuineUserIntent: true,
+				onPromoted: options?.onQueuedPromoted,
+				external: true,
+			});
 			options?.onPreflightAccepted?.();
 			return;
 		}
@@ -9874,6 +10731,7 @@ export class AgentSession {
 			images,
 			onPreflightAccepted: options?.onPreflightAccepted,
 			onPreflightAcceptCommit: options?.onPreflightAcceptCommit,
+			preflightSignal: options?.preflightSignal,
 		});
 	}
 
@@ -9886,6 +10744,7 @@ export class AgentSession {
 		const followUp = this.#followUpMessages.map(e => e.text);
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
+		this.#deferredSdkFollowUps = [];
 		this.agent.clearAllQueues();
 		return { steering, followUp };
 	}
@@ -10354,20 +11213,284 @@ export class AgentSession {
 		if (outcome.kind === "error") throw outcome.cause;
 	}
 	/**
-	 * Abort a specific active prompt and prove whether its tracked resources settled.
+	 * Private terminal-abort seam: read the CURRENT turn's attempt epoch WITHOUT
+	 * interrupting it. Used to write the durable initial terminal marker BEFORE
+	 * any fence/stop effect (plan ordered step 4). Only the epoch is exposed —
+	 * never the opaque lineage handle — so no private origin metadata leaves the
+	 * session. Fails closed (undefined) when no active turn lineage exists.
 	 */
-	async abortPromptAndWait(handle: string, options: { graceMs: number }): Promise<RunSettlementProof> {
+	/**
+	 * Private terminal-abort seam: cancel a PENDING (not-yet-started) prompt
+	 * preflight. Aborting the preflight controller fires the captured admission
+	 * signal so #throwIfPromptPreflightCancelled throws and the pending prompt
+	 * never starts even if its SDK waiter was already settled; the controller is
+	 * reset for the next admission. No run handle exists for a preflight prompt.
+	 */
+	cancelPendingPreflightForTerminalAbort(): void {
+		this.#promptPreflightAbortController.abort();
+		this.#promptPreflightAbortController = new AbortController();
+	}
+	/**
+	 * Capture the steering admission snapshot at abort ADMISSION: the host
+	 * invokes this before its durable marker transaction, so client steering
+	 * admitted while the abort is in flight classifies as post-snapshot and is
+	 * preserved instead of being purged at the later abortPromptAndWait
+	 * (review thread P1). Snapshots are stored PER-ADMISSION in a per-turn
+	 * FIFO: the settlement of each admission consumes its own captured
+	 * sequence, so a later overlapping abort of the same turn can never
+	 * overwrite an earlier admission's snapshot and purge an already-accepted
+	 * steer (review thread P1).
+	 */
+	captureTerminalAbortSteeringSnapshot(): void {
+		if (this.#turnLineageIdHash === undefined) return;
+		const key = `${this.#turnLineageIdHash}:${this.#promptGeneration}`;
+		const queue = this.#terminalAbortSteeringSnapshots.get(key) ?? [];
+		queue.push(this.#steeringAdmissionSeq);
+		this.#terminalAbortSteeringSnapshots.set(key, queue);
+	}
+
+	getTerminalTurnEpoch(): number | undefined {
+		const lineageIdHash = this.#turnLineageIdHash;
+		if (!lineageIdHash) return undefined;
+		return this.#promptGeneration;
+	}
+	/**
+	 * Logical endpoint used to key owned-registration lineage bindings.
+	 * Subagents inherit the parent's AsyncJobManager, whose completion callback
+	 * resolves registrations via AsyncJobManager.endpointIdOf(manager); the
+	 * child's own sessionManager id is never registered under the manager, so
+	 * binding/registering under it would make the parent's lookup miss and
+	 * demote the completion to an ordinary follow-up — purgeable by a parent
+	 * terminal turn abort and outside owned-scope delivery denial (review
+	 * thread P1). The manager's registered endpoint (owned for a top-level
+	 * session, inherited for a child) is authoritative for both binding and
+	 * lookup.
+	 */
+	#ownedRegistrationEndpoint(): string {
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
+		return AsyncJobManager.endpointIdOf(manager) ?? this.sessionManager.getSessionId() ?? "local";
+	}
+	async abortPromptAndWait(
+		handle: string,
+		options: { graceMs: number; terminal?: { scope: "turn" | "owned"; expectedEpoch?: number } },
+	): Promise<
+		RunSettlementProof & {
+			terminalScope?: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string };
+		}
+	> {
+		let registeredScope: { scopeId: string; abortedAttemptEpoch: number; lineageIdHash: string } | undefined;
+		// The purge snapshot is consumed per-admission inside the terminal
+		// block; the rearm below (reachable only when a scope was registered,
+		// i.e. only after the purge ran) reads the same value.
+		let abortSteeringSnapshot: number | undefined;
+		if (options.terminal) {
+			// The terminal scope must be registered for the ABORTED turn's
+			// lineage, never a successor's. A new root turn advances the attempt
+			// epoch at admission, so when the caller captured the epoch before a
+			// durable claim and a successor won that window, the current epoch no
+			// longer matches — fail closed and never fence or purge the
+			// unrelated successor's queues (review thread P1). Callers that do
+			// not pass an expected epoch (direct seam users) retain the prior
+			// register-regardless behavior.
+			if (
+				options.terminal.expectedEpoch !== undefined &&
+				options.terminal.expectedEpoch !== this.#promptGeneration
+			) {
+				return { status: "unfenced", reason: "unknown_run", pending: [] };
+			}
+			// Terminal abort (C04 mode:"terminal"): register and synchronously
+			// close the continuation fence for the current turn BEFORE the run is
+			// interrupted, so a later left-running owned completion classifies as
+			// owned-completion by exact source (lineage + attempt epoch). The
+			// owned-completion policy stays enabled for scope:"turn" — delivery
+			// intentionally resumes the agent — and disabled for scope:"owned".
+			// A missing lineage (no active turn) fails closed: no scope is
+			// registered, so nothing is attributed.
+			const lineageIdHash = this.#turnLineageIdHash;
+			if (lineageIdHash) {
+				const scope = registerTerminalTurnScope({
+					lineageIdHash,
+					promptAttemptEpoch: this.#promptGeneration,
+					ownedCompletionPolicy: options.terminal.scope === "owned" ? "disabled" : "enabled",
+				});
+				// Admission can fail closed (registry saturation): the abort
+				// proceeds without a scope, so nothing is attributed.
+				if (scope) {
+					registeredScope = {
+						scopeId: scope.scopeId,
+						abortedAttemptEpoch: scope.promptAttemptEpoch,
+						lineageIdHash: scope.lineageIdHash,
+					};
+				}
+				// Terminal abort blocks STEERING continuations of the aborted turn:
+				// purge steering queued just before the abort won (the loop can
+				// exit on the abort signal without polling it) so it cannot alter
+				// the next user turn (review thread P2). The follow-up queue is
+				// preserved — owned-completion resumes must still deliver.
+				const turnSnapshotKey = `${lineageIdHash}:${this.#promptGeneration}`;
+				const queuedTurnSnapshots = this.#terminalAbortSteeringSnapshots.get(turnSnapshotKey);
+				abortSteeringSnapshot = queuedTurnSnapshots?.shift() ?? this.#steeringAdmissionSeq;
+				if (queuedTurnSnapshots?.length === 0) {
+					this.#terminalAbortSteeringSnapshots.delete(turnSnapshotKey);
+				}
+				const admittedAfterSnapshot = (message: AgentMessage): boolean =>
+					(this.#externalSteerAdmissionSeq.get(message) ?? 0) > (abortSteeringSnapshot ?? -1);
+				// Steering purge, STEERING queue only: the agent-wide removal
+				// would also wipe the follow-up queue, which owned-completion
+				// resumes must still deliver (review thread P1).
+				const steeringBeforePurge = this.agent.snapshotSteering();
+				this.agent.removeQueuedMessages(
+					message => !(this.#externalSteerMessages.has(message) && admittedAfterSnapshot(message)),
+					"steering",
+				);
+				// Keep the display list aligned with the ACTUAL purge decisions:
+				// preserved post-snapshot external steers stay visible and
+				// purged internal steers disappear — a stale entry would let the
+				// positional editing APIs remove a different preserved steer
+				// (review thread P2).
+				const steeringAfterPurge = new Set(this.agent.snapshotSteering());
+				const keptSteeringDisplays: QueuedDisplayEntry[] = [];
+				for (let displayIndex = 0; displayIndex < steeringBeforePurge.length; displayIndex++) {
+					if (steeringAfterPurge.has(steeringBeforePurge[displayIndex]!)) {
+						keptSteeringDisplays.push(this.#steeringMessages[displayIndex]!);
+					}
+				}
+				this.#steeringMessages = keptSteeringDisplays;
+
+				// Remove ORDINARY follow-ups queued for the aborted turn: the
+				// aborted loop exits without polling them, so a later unrelated
+				// prompt could drain and execute the supposedly-terminated turn's
+				// command. Only authorized owned-completion envelopes survive
+				// (review thread P1).
+				const followUpBeforePurge = this.agent.snapshotFollowUp();
+				this.agent.removeQueuedMessages(message => {
+					// An SDK/client follow-up independently requested the next
+					// root turn; it is not a continuation caused by the
+					// aborted turn.
+					if (this.#externalFollowUps.has(message)) return false;
+					// Preserve only envelopes that are CURRENTLY AUTHORIZED as
+					// owned completions (fresh or drop). The public
+					// sendMessage() accepts arbitrary details, so the mere
+					// presence of the ownedCompletions field is not authority —
+					// an envelope with no matching terminal scope classifies
+					// ordinary and must NOT survive the abort (review thread P2).
+					return ownedCompletionResumeAction(message as never) === "ordinary";
+				}, "followUp");
+				// Mirror the follow-up purge in the display list so stale entries
+				// cannot misalign the positional editing APIs (review thread P2).
+				const followUpAfterPurge = new Set(this.agent.snapshotFollowUp());
+				const keptFollowUpDisplays: QueuedDisplayEntry[] = [];
+				for (let displayIndex = 0; displayIndex < followUpBeforePurge.length; displayIndex++) {
+					if (followUpAfterPurge.has(followUpBeforePurge[displayIndex]!)) {
+						keptFollowUpDisplays.push(this.#followUpMessages[displayIndex]!);
+					}
+				}
+				this.#followUpMessages = keptFollowUpDisplays;
+			}
+			// Do NOT advance the attempt epoch here: the terminal scope must stay
+			// keyed to the aborted epoch so #isTurnContinuationBlocked (which
+			// looks up by the CURRENT #promptGeneration) still finds the closed
+			// fence for hidden-next-turn and other non-generation-guarded
+			// continuation paths. Fresh-turn allocation is the per-admission
+			// responsibility: every NEW ROOT TURN (#promptWithMessage with
+			// resetRetryReplaySafety) advances the epoch before minting, so the
+			// next turn after the abort gets a distinct (lineage, epoch) and is
+			// never captured by this scope (review thread P2).
+			this.#promptPreflightAbortController.abort();
+			this.#promptPreflightAbortController = new AbortController();
+		}
 		const aborted = this.#runCancellationDomains.abort(handle);
 		if (!aborted.ok) {
 			if (aborted.reason === "quarantined") {
-				return await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 });
+				return {
+					...(await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: 0 })),
+					...(registeredScope ? { terminalScope: registeredScope } : {}),
+				};
 			}
-			return { status: "unfenced", reason: "unknown_run", pending: [] };
+			return {
+				status: "unfenced",
+				reason: "unknown_run",
+				pending: [],
+				...(registeredScope ? { terminalScope: registeredScope } : {}),
+			};
 		}
 		if (handle === this.agent.activeResourceRunId) this.agent.abort();
 		const proof = await this.agent.resourceLedger.waitForSettlement(handle, { graceMs: options.graceMs });
 		if (proof.status === "unfenced") this.agent.resourceLedger.quarantine(handle);
-		return proof;
+		// Rearm surviving owned-completion follow-ups once the abort has
+		// settled: the aborted loop exits before polling the follow-up queue,
+		// so preserving the envelopes alone leaves them stranded until an
+		// unrelated prompt. Schedule a continue so they are consumed as a
+		// fresh turn (review thread P1).
+		if (options.terminal && registeredScope) {
+			// Rearm ONLY envelopes the classifier marks fresh. A drop-classified
+			// envelope (a denied owned completion under scope:"owned") must never
+			// reach the model: purge it from the follow-up queue BEFORE the
+			// rearm's continue is scheduled, because the agent loop dequeues
+			// follow-ups DIRECTLY and consumes the whole queue at once — a
+			// denied envelope left queued alongside the fresh completion would
+			// otherwise be passed to #runLoop with it (review thread P1). The
+			// onFollowUpConsumed filter at agent.ts continue() is the second
+			// line of defense for any envelope queued in the window after this
+			// purge and before the dequeue.
+			const followUpSnapshot = this.agent.snapshotQueues();
+			const droppedFollowUps: AgentMessage[] = [];
+			const purgedFollowUps = followUpSnapshot.followUp.filter(message => {
+				if (ownedCompletionResumeAction(message as never) === "drop") {
+					droppedFollowUps.push(message);
+					return false;
+				}
+				return true;
+			});
+			if (droppedFollowUps.length > 0) {
+				this.agent.restoreQueues({ ...followUpSnapshot, followUp: purgedFollowUps });
+				// The denied completion is terminal; settle its registration so
+				// the tuple does not occupy global capacity while the fresh
+				// completion resumes (review thread P2).
+				this.#settleDeliveredOwnedRegistrations(droppedFollowUps);
+			}
+			const hasPreservedFollowUp = () =>
+				this.agent
+					.snapshotQueues()
+					.followUp.some(
+						message =>
+							ownedCompletionResumeAction(message as never) === "fresh" || this.#externalFollowUps.has(message),
+					);
+			// A preserved post-snapshot client steer is also an independent
+			// root-turn request: the abort exits the loop and never polls the
+			// steering queue, so without a rearm the accepted steer stays
+			// stranded until unrelated activity (review thread P1).
+			const hasPreservedSteering = (): boolean =>
+				this.agent
+					.snapshotQueues()
+					.steering.some(
+						message =>
+							this.#externalSteerMessages.has(message) &&
+							(this.#externalSteerAdmissionSeq.get(message) ?? 0) > (abortSteeringSnapshot ?? -1),
+					);
+			if (hasPreservedFollowUp() || hasPreservedSteering()) {
+				// ANY preserved follow-up or steer — an owned-completion resume,
+				// an independently requested external follow-up, or a
+				// post-snapshot client steer — needs a fresh lineage before its
+				// continue: without it the scheduled continuation runs under the
+				// aborted lineage+epoch and the terminal fence skips it as
+				// terminal_turn, stranding the preserved user request until
+				// unrelated activity. Minting the fresh lineage does not
+				// reclassify the external message as agent-initiated owned work;
+				// it only unbinds the new turn from the aborted attempt (review
+				// thread P1).
+				this.#resumeFromOwnedCompletion();
+				this.#scheduleAgentContinue({
+					delayMs: 1,
+					generation: this.#promptGeneration,
+					shouldContinue: () => hasPreservedFollowUp() || hasPreservedSteering(),
+				});
+			}
+		}
+		return {
+			...proof,
+			...(registeredScope ? { terminalScope: registeredScope } : {}),
+		};
 	}
 
 	/** Atomically interrupt the active run and make text the next prompt. */
@@ -10597,7 +11720,7 @@ export class AgentSession {
 			}
 		}
 
-		const manager = AsyncJobManager.instance();
+		const manager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 		const ownerId = this.#agentId;
 		const lease = manager && ownerId ? manager.beginOwnerSubagentShutdown(ownerId) : undefined;
 		if (manager && ownerId && !lease) {
@@ -10623,11 +11746,17 @@ export class AgentSession {
 			this.#rebindProviderSessionState(new Map());
 			this.agent.reset();
 			if (!options?.drop) await this.sessionManager.flush();
+			const noLeasePreviousSessionIdentity = this.sessionManager.getSessionId();
 			const prepared = await this.sessionManager.prepareNewSession(options);
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				this.#assertJobManagerEndpointAdmission(prepared.sessionId);
 				this.sessionManager.commitPreparedNewSession(prepared);
+				// Endpoint identity committed to the successor: re-register the
+				// manager so post-transition lineage bindings resolve and owned
+				// aborts classify in the successor session (review thread P1).
+				this.#rekeyJobManagerForSessionIdentity(noLeasePreviousSessionIdentity);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
@@ -10697,7 +11826,12 @@ export class AgentSession {
 			try {
 				// Last fallible gate while public getters still show the predecessor (#3138).
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
+				this.#assertJobManagerEndpointAdmission(prepared.sessionId);
 				this.sessionManager.commitPreparedNewSession(prepared);
+				// Endpoint identity committed to the successor: re-register the
+				// manager so post-transition lineage bindings resolve and owned
+				// aborts classify in the successor session (review thread P1).
+				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
@@ -10872,6 +12006,7 @@ export class AgentSession {
 		try {
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
+			const previousSessionIdentity = this.sessionManager.getSessionId();
 
 			// Emit session_before_switch event with reason "fork" (can be cancelled)
 			if (this.#extensionRunner?.hasHandlers("session_before_switch")) {
@@ -10889,15 +12024,13 @@ export class AgentSession {
 			await this.sessionManager.flush();
 
 			const boundedColdForkEligible =
-				this.sessionManager.getSessionMemoryStats().coldRetirementActive &&
-				!this.sessionManager.isManagedDestination() &&
-				previousSessionFile !== undefined;
+				this.sessionManager.getSessionMemoryStats().coldRetirementActive && previousSessionFile !== undefined;
 			if (boundedColdForkEligible) {
 				const previousManager = this.sessionManager;
 				const forkedManager = await SessionManager.forkFrom(
 					previousSessionFile,
 					previousManager.getCwd(),
-					SessionManager.explicitDestination(previousManager.getSessionDir()),
+					previousManager.getDestinationForFork(),
 					undefined,
 					"copy-retain",
 					this.settings.get("sessionMemory.mode"),
@@ -10905,15 +12038,38 @@ export class AgentSession {
 				try {
 					await initializeLocalRoot({
 						getArtifactsDir: () => forkedManager.getArtifactsDir(),
-						isManagedDestination: () => false,
-						getManagedLegacyLocalMigrationSource: () => null,
+						isManagedDestination: () => forkedManager.isManagedDestination(),
+						getManagedLegacyLocalMigrationSource: () => forkedManager.getManagedLegacyLocalMigrationSource(),
 						getSessionId: () => forkedManager.getSessionId(),
 					});
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
 				} catch (error) {
 					const forkedFile = forkedManager.getSessionFile();
-					await forkedManager.close();
-					if (forkedFile) await previousManager.discardUncommittedSession(forkedFile);
+					const cleanupErrors: unknown[] = [];
+					try {
+						await forkedManager.close();
+					} catch (closeError) {
+						cleanupErrors.push(closeError);
+						logger.warn("Bounded fork successor close failed after initialization failure", {
+							error: closeError instanceof Error ? closeError.message : String(closeError),
+						});
+					}
+					if (forkedFile) {
+						try {
+							await previousManager.discardUncommittedSession(forkedFile);
+						} catch (cleanupError) {
+							cleanupErrors.push(cleanupError);
+							logger.warn("Bounded fork successor cleanup failed after initialization failure", {
+								error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+							});
+						}
+					}
+					if (cleanupErrors.length > 0) {
+						throw new AggregateError(
+							[error, ...cleanupErrors],
+							"Bounded fork initialization and successor cleanup both failed.",
+						);
+					}
 					throw error;
 				}
 				this.sessionManager = forkedManager;
@@ -10933,7 +12089,11 @@ export class AgentSession {
 				try {
 					await initializeLocalRoot(this.#localProtocolOptions(prepared));
 					await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+					this.#assertJobManagerEndpointAdmission(prepared.sessionId);
 					this.sessionManager.commitPreparedNewSession(prepared);
+					// Fork commits a successor endpoint identity; re-register the
+					// manager under it (review thread P1).
+					this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity);
 					await this.#runToolSessionTransitionCleanups();
 				} catch (error) {
 					throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);
@@ -11032,6 +12192,27 @@ export class AgentSession {
 
 	getActiveModelProfile(): string | undefined {
 		return this.#activeModelProfile;
+	}
+
+	/**
+	 * Re-apply vendor-separated delegation after a profile activation changed the
+	 * role layer. `eagerTasks` is resolved at prompt build time, but under
+	 * `tools.discoveryMode: all` the `task` tool is hidden until something
+	 * activates it, and the delegation directive stays behind its
+	 * `has tools "task"` guard. Activating a vendor-separated profile mid-session
+	 * must therefore reach the live tool set, not just the next session.
+	 */
+	async syncEagerDelegation(): Promise<void> {
+		const { eagerTasks } = resolveEagerTaskDelegation({
+			settings: this.settings,
+			profile: this.#activeModelProfile
+				? this.#modelRegistry.getModelProfile?.(this.#activeModelProfile)
+				: undefined,
+		});
+		if (eagerTasks && this.#toolRegistry.has("task") && !this.getActiveToolNames().includes("task")) {
+			await this.activateDiscoveredTools(["task"]);
+		}
+		await this.refreshBaseSystemPrompt();
 	}
 
 	/** Resolver intent only for assignments owned by the active profile. */
@@ -11450,7 +12631,7 @@ export class AgentSession {
 			currentAutoScope !== undefined &&
 			this.#temporaryProviderSessionScopes.at(-1) === currentAutoScope;
 		if (replaceAutoScope && currentAutoScope) {
-			this.#restoreTopTemporaryProviderSessionScope();
+			await this.#restoreTopTemporaryProviderSessionScope();
 		}
 		const scope = isTemporaryOperation
 			? (suppliedScope ??
@@ -11481,7 +12662,7 @@ export class AgentSession {
 			if (options?.persistAsSessionDefault === true) this.#clearActiveModelProfileForConcreteDefault(options?.cause);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 		} catch (error) {
-			if (ownsScope) this.restoreTemporaryProviderSessionScope(scope);
+			if (ownsScope) await this.restoreTemporaryProviderSessionScope(scope);
 			throw error;
 		}
 		return scope;
@@ -12196,17 +13377,12 @@ export class AgentSession {
 	}
 
 	/**
-	 * True when the configured `serviceTier` resolves to `"priority"` for the
-	 * given model `provider`. Returns false for scoped tiers that don't match
-	 * (e.g. `"openai-only"` on an anthropic provider) and when `provider` is
-	 * undefined. This is the canonical provider-aware fast-mode predicate.
+	 * True when the configured tier is realized as a fast-mode field on the
+	 * provider's wire protocol. Providers that silently drop unscoped priority
+	 * intent return false so UI indicators match the request that is sent.
 	 */
-	isFastForProvider(provider?: string): boolean {
-		// Fast mode applies to a concrete model's provider. With no provider
-		// (no model selected) it cannot apply, even under an unscoped `priority`
-		// tier that `resolveServiceTier` would otherwise pass through.
-		if (provider === undefined) return false;
-		return resolveServiceTier(this.serviceTier, provider) === "priority";
+	isFastForProvider(provider?: string, supportsServiceTier = false): boolean {
+		return isFastModeEffectiveForProvider(this.serviceTier, provider, supportsServiceTier);
 	}
 
 	/**
@@ -12223,14 +13399,11 @@ export class AgentSession {
 	}
 
 	/**
-	 * Provider-aware fast-mode predicate for task-tool subagent roles, evaluated
-	 * against the effective subagent tier (`task.serviceTier`) rather than the
-	 * main session tier. Use this for `task.agentModelOverrides` role rows so the
-	 * ⚡ glyph reflects the tier the subagent actually runs under.
+	 * Wire-effective fast-mode predicate for task-tool subagent roles, evaluated
+	 * against `task.serviceTier` rather than the main session tier.
 	 */
-	isFastForSubagentProvider(provider?: string): boolean {
-		if (provider === undefined) return false;
-		return resolveServiceTier(this.#subagentServiceTier(), provider) === "priority";
+	isFastForSubagentProvider(provider?: string, supportsServiceTier = false): boolean {
+		return isFastModeEffectiveForProvider(this.#subagentServiceTier(), provider, supportsServiceTier);
 	}
 
 	/**
@@ -12286,7 +13459,10 @@ export class AgentSession {
 	 */
 	isFastModeActive(): boolean {
 		const provider = this.model?.provider;
-		return this.isFastForProvider(provider) && !this.#isFastModeAutoDisabledForProvider(provider);
+		const supportsServiceTier = modelSupportsServiceTier(this.model);
+		return (
+			this.isFastForProvider(provider, supportsServiceTier) && !this.#isFastModeAutoDisabledForProvider(provider)
+		);
 	}
 
 	setServiceTier(serviceTier: ServiceTier | undefined): void {
@@ -12381,19 +13557,34 @@ export class AgentSession {
 		signal?: AbortSignal,
 		overThreshold = false,
 		options?: { commitGate?: (actual: { prunedCount: number; tokensSaved: number }) => boolean },
-	): Promise<{ prunedCount: number; tokensSaved: number; committed: boolean } | undefined> {
+	): Promise<ToolOutputPruneResult | undefined> {
 		const branchEntries = this.sessionManager.getBranch();
+		const artifactManager = await this.sessionManager.ensureArtifactManager();
+		// Over-threshold callers have already proven tool-output savings before entering
+		// this path. If exact persistence is unavailable, fail closed before hashing and
+		// planning large outputs so maintenance cannot drift into timeout-driven abort.
+		if (overThreshold && !artifactManager)
+			return { prunedCount: 0, tokensSaved: 0, committed: false, failure: "artifact_persistence" };
 		const plan = planToolOutputPrune(branchEntries, {
 			...DEFAULT_PRUNE_CONFIG,
 			minimumSavings: overThreshold ? 0 : DEFAULT_PRUNE_CONFIG.minimumSavings,
 		});
-		const artifactManager = await this.sessionManager.ensureArtifactManager();
 		const published = new Map<string, ToolOutputPruneEvictionHandle>();
 		// Fail closed when tool-output eviction is planned but no artifact store can be
 		// established: do not report a successful prune that skipped durable eviction.
 		if (!artifactManager && plan.digests.length > 0) {
-			return undefined;
+			return { prunedCount: 0, tokensSaved: 0, committed: false, failure: "artifact_persistence" };
 		}
+		const removePublishedArtifacts = async (): Promise<void> => {
+			for (const handle of published.values()) {
+				const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
+				if (removed === false) {
+					logger.warn("Failed to remove unpublished tool-output eviction artifact", {
+						artifactId: handle.artifactId,
+					});
+				}
+			}
+		};
 
 		// Publish exact text one candidate at a time. The plan carries only digests and
 		// replacement proposals; original output bytes exist only in this iteration.
@@ -12416,21 +13607,18 @@ export class AgentSession {
 						outcome: outcome.outcome,
 						diagnostic: "diagnostic" in outcome ? outcome.diagnostic : undefined,
 					});
-					if (outcome.outcome === "failed") break;
+					if (outcome.outcome === "failed") {
+						await removePublishedArtifacts();
+						return {
+							prunedCount: published.size,
+							tokensSaved: 0,
+							committed: false,
+							failure: "artifact_persistence",
+						};
+					}
 				}
 			}
 		}
-
-		const removePublishedArtifacts = async (): Promise<void> => {
-			for (const handle of published.values()) {
-				const removed = await artifactManager?.removeNamedBestEffort(`${handle.artifactId}.evicted.log`);
-				if (removed === false) {
-					logger.warn("Failed to remove unpublished tool-output eviction artifact", {
-						artifactId: handle.artifactId,
-					});
-				}
-			}
-		};
 
 		// Evaluate non-tool pruning on a disposable copy so the gate runs before any
 		// live entry is mutated. This avoids retaining originals for rollback.
@@ -13112,7 +14300,7 @@ export class AgentSession {
 			// and the generated handoff document is preserved for copy/retry.
 			const previousSessionFile = this.sessionFile;
 			await this.sessionManager.flush();
-			const rollbackSessionState = this.sessionManager.captureState();
+			const rollbackSessionState = await this.sessionManager.captureRollbackState();
 			const rollbackAgentMessages = [...this.agent.state.messages];
 			const rollbackSteeringMessages = [...this.#steeringMessages];
 			const rollbackFollowUpMessages = [...this.#followUpMessages];
@@ -13150,9 +14338,13 @@ export class AgentSession {
 				// Last fallible action: verified local:// readiness from immutable staged options.
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+				this.#assertJobManagerEndpointAdmission(prepared.sessionId);
 
 				// --- Commit boundary: synchronous adoption is the sole identity publication.
 				this.sessionManager.commitPreparedNewSession(prepared);
+				// Handoff commits a successor endpoint identity; re-register the
+				// manager under it (review thread P1).
+				this.#rekeyJobManagerForSessionIdentity(rollbackSessionState.sessionId);
 				committed = true;
 				await this.#runToolSessionTransitionCleanups();
 				this.agent.reset();
@@ -13224,7 +14416,7 @@ export class AgentSession {
 				// failure is non-destructive. Predecessor gate emitter, provider
 				// sessions, async jobs, IRC/plan bookkeeping, and injection signatures
 				// were never mutated before commit, so they survive intact.
-				this.sessionManager.restoreState(rollbackSessionState);
+				await this.sessionManager.restoreRollbackState(rollbackSessionState);
 				this.#syncAgentSessionId(rollbackSessionState.sessionId);
 				this.#rekeyHindsightMemoryForCurrentSessionId();
 				this.agent.replaceMessages(rollbackAgentMessages, {
@@ -13513,7 +14705,7 @@ export class AgentSession {
 				relaxedMinimum: 0,
 				artifactRefMaxChars: PRUNED_ARTIFACT_REF_MAX_CHARS,
 			});
-			let pruneResult: { prunedCount: number; tokensSaved: number; committed: boolean } | undefined;
+			let pruneResult: ToolOutputPruneResult | undefined;
 			if (
 				pruneEstimate.tokensSaved > 0 &&
 				!shouldCompact(
@@ -13525,6 +14717,7 @@ export class AgentSession {
 			) {
 				pruneResult = await this.#pruneToolOutputs(maintenanceSignal, true);
 				if (isAborted()) return result("aborted");
+				if (pruneResult?.failure === "artifact_persistence") return result("failed");
 				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
 			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
@@ -13656,7 +14849,10 @@ export class AgentSession {
 			imageBytes,
 			sessionResidentImageBytes: this.sessionManager.getResidentImageBytes(),
 			materializedResidentBytes:
-				this.#streamingEditFileCache.totalBytes + sessionMemory.hotRegionBytes + sessionMemory.metaDescriptorBytes,
+				this.#streamingEditFileCache.totalBytes +
+				sessionMemory.allocatedCacheBytes +
+				sessionMemory.hotResidentBytes +
+				sessionMemory.metadataResidentBytes,
 			tuiChatChildren: retainedMemory.tuiChatChildren ?? 0,
 			tuiCachedRenderBytes: retainedMemory.tuiCachedRenderBytes ?? 0,
 		};
@@ -14129,7 +15325,7 @@ export class AgentSession {
 				signal,
 			});
 			if (signal?.aborted) {
-				if (scope) this.restoreTemporaryProviderSessionScope(scope);
+				if (scope) await this.restoreTemporaryProviderSessionScope(scope);
 				return false;
 			}
 			logger.debug("Context promotion switched model on overflow", {
@@ -15333,6 +16529,10 @@ export class AgentSession {
 		return message.transportFailure?.providerCode?.toLowerCase() === STREAM_FIRST_EVENT_TIMEOUT_PROVIDER_CODE;
 	}
 
+	#isTypedEmptyResponse(message: AssistantMessage): boolean {
+		return message.transportFailure?.providerCode?.toLowerCase() === EMPTY_RESPONSE_PROVIDER_CODE;
+	}
+
 	#isTerminalProviderFirstEventTimeout(message: AssistantMessage): boolean {
 		return this.#isKimiCodeFirstEventTimeout(message) || this.#isAlibabaTokenPlanFirstEventTimeout(message);
 	}
@@ -15357,7 +16557,8 @@ export class AgentSession {
 				classification === "usage_limit" ||
 				classification === "transient" ||
 				classification === "unknown" ||
-				classification === "first_event_timeout"
+				classification === "first_event_timeout" ||
+				classification === "empty_response"
 			);
 		}
 		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
@@ -15468,6 +16669,7 @@ export class AgentSession {
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
+		if (this.#isTypedEmptyResponse(message)) return "empty_response";
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
 		// Provider safety refusals (e.g. Anthropic stop_reason "refusal" /
@@ -15632,8 +16834,10 @@ export class AgentSession {
 			controller.seedResolution(activeIndex, [...controller.skips, ...resolution.skips]);
 		}
 		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
+		const previousEditMode = this.#resolveActiveEditMode();
 		this.#setModelAuthoritatively(resolution.model, "restore");
 		this.setThinkingLevel(resolution.explicitThinkingLevel ? resolution.thinkingLevel : this.thinkingLevel);
+		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
 	/**
@@ -15830,8 +17034,10 @@ export class AgentSession {
 			const from =
 				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
 			const to = selector;
+			const previousEditMode = this.#resolveActiveEditMode();
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
 			this.setThinkingLevel(resolved.explicitThinkingLevel ? resolved.thinkingLevel : this.thinkingLevel);
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			if (from !== to) {
 				this.#emit({
 					type: "model_fallback_switched",
@@ -15964,6 +17170,7 @@ export class AgentSession {
 		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = this.#classifyErrorForRetry(message);
 		const firstEventTimeout = classification === "first_event_timeout";
+		const emptyResponse = classification === "empty_response";
 		// Content-free message-only watchdog prose (wrapped canonical or bare
 		// per-provider variants) is admitted like the typed path: it is
 		// replay-safe, so a bare-default retry may re-issue the request even
@@ -15971,6 +17178,14 @@ export class AgentSession {
 		const messageOnlyWatchdogTimeout = isBareDefaultMessageOnlyFirstEventTimeout(message);
 		if (!managedFallback && firstEventTimeout && this.#retryAttempt === 0) {
 			this.#firstEventTimeoutRetryStartedAt = Date.now();
+		}
+		if (emptyResponse && (assistantMessageHasVisibleOrToolContent(message) || !scope || !scopeWasClean)) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
 		}
 		const requiresScopedFirstEventTimeout = managedFallback || !legacyRetryConfigured;
 		if (
@@ -16021,7 +17236,8 @@ export class AgentSession {
 		// Bare defaults retain their narrow watchdog and Codex admissions. A
 		// first-event timeout adds the typed, content-free, current-clean-scope
 		// requirement above; other transient watchdogs preserve legacy behavior.
-		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential) {
+		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
+		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
@@ -16139,18 +17355,27 @@ export class AgentSession {
 			this.#retryAbortController?.abort();
 			this.#retryAbortController = retryAbortController;
 			this.#retryNowRequested = false;
-			await this.#emitSessionEvent({
-				type: "auto_retry_start",
-				attempt: this.#retryAttempt,
-				maxAttempts: managedFallback
-					? controller.maxAttempts
-					: firstEventTimeout
-						? retrySettings.maxRetries + 1
-						: retrySettings.maxRetries,
-				delayMs,
-				errorMessage,
-				unbounded: managedFallback ? false : legacyUnbounded,
-			});
+			try {
+				await this.#emitSessionEvent({
+					type: "auto_retry_start",
+					attempt: this.#retryAttempt,
+					maxAttempts: managedFallback
+						? controller.maxAttempts
+						: firstEventTimeout
+							? retrySettings.maxRetries + 1
+							: retrySettings.maxRetries,
+					delayMs,
+					errorMessage,
+					unbounded: managedFallback ? false : legacyUnbounded,
+				});
+			} catch (error) {
+				if (this.#retryAbortController === retryAbortController) this.#retryAbortController = undefined;
+				retryAbortController.abort();
+				this.#failRetryRecovery(
+					`Retry start delivery failed: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				throw error;
+			}
 
 			const messages = this.agent.state.messages;
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
@@ -17558,7 +18783,7 @@ export class AgentSession {
 			}
 			options?.onTransitionMutationStarted?.();
 
-			const asyncManager = AsyncJobManager.instance();
+			const asyncManager = this.#ownedAsyncJobManager ?? AsyncJobManager.instance();
 			const ownerId = this.#agentId;
 			const lease =
 				switchingToDifferentSession && asyncManager && ownerId
@@ -17585,7 +18810,7 @@ export class AgentSession {
 			this.#disconnectFromAgent();
 			// Flush pending writes before switching so restore snapshots reflect committed state.
 			await this.sessionManager.flush();
-			const previousSessionState = this.sessionManager.captureState();
+			const previousSessionState = await this.sessionManager.captureRollbackState();
 			const previousSessionContext = this.buildDisplaySessionContext();
 			// switchSession replaces these arrays wholesale during load/rollback, so retaining
 			// the existing message objects is sufficient and avoids structured-clone failures for
@@ -17620,6 +18845,13 @@ export class AgentSession {
 				await this.sessionManager.setSessionFile(sessionPath, {
 					deferEphemeralArtifactRetirement: switchingToDifferentSession,
 				});
+				// setSessionFile rotated the endpoint identity to the successor;
+				// re-register the manager under it so post-transition lineage
+				// bindings resolve and owned aborts classify in the successor
+				// session (review thread P1).
+				this.#rekeyJobManagerForSessionIdentity(previousSessionState.sessionId, {
+					retirePredecessorRegistrations: false,
+				});
 				if (switchingToDifferentSession) this.sessionManager.stageAdoptedArtifactManagerForTransition();
 				// The successor identity is already rotated in the manager but not yet
 				// published; gate its local:// root before publication so the agent,
@@ -17639,6 +18871,7 @@ export class AgentSession {
 					: didReloadConversationChange
 						? "conversation-reload"
 						: undefined;
+				const previousEditMode = this.#resolveActiveEditMode();
 				await this.#restoreMCPSelectionsForSessionContext(sessionContext);
 
 				// The target session is loaded and MCP selections are restored: discard
@@ -17712,6 +18945,7 @@ export class AgentSession {
 					if (!this.model || !modelsAreEqual(this.model, resolution.model)) {
 						this.#setModelAuthoritatively(resolution.model, "restore");
 					}
+					await this.#syncEditToolModeAfterModelChange(previousEditMode);
 					if (resolution.explicitThinkingLevel && resolution.thinkingLevel !== undefined) {
 						this.setThinkingLevel(resolution.thinkingLevel);
 					}
@@ -17778,7 +19012,12 @@ export class AgentSession {
 						} catch (error) {
 							ownerShutdownSettled = false;
 							ownerShutdownFinalizationDeferred = true;
-							this.#scheduleDeferredOwnerShutdownFinalization(ownerShutdownManager, ownerShutdownLease, ownerId);
+							this.#scheduleDeferredOwnerShutdownFinalization(
+								ownerShutdownManager,
+								ownerShutdownLease,
+								ownerId,
+								previousSessionState.sessionId,
+							);
 							this.#suppressOwnAsyncJobDeliveries();
 							this.emitNotice(
 								"error",
@@ -17791,6 +19030,10 @@ export class AgentSession {
 					// Different files may intentionally carry the same copied session id; pathname transition is the commit signal.
 					ownerShutdownTransitionCommitted = true;
 					if (ownerShutdownSettled) {
+						// Every predecessor job/delivery has settled. Only now can its
+						// tuple evidence be retired; doing this immediately after rekey
+						// made rollback restore live jobs without their owned tuples.
+						retireOwnedRegistrationsForEndpoint(previousSessionState.sessionId);
 						this.sessionManager.retireEphemeralArtifactsAfterTransition();
 						await this.#runToolSessionTransitionCleanups();
 					}
@@ -17816,7 +19059,28 @@ export class AgentSession {
 				return true;
 			} catch (error) {
 				if (transitionCleanupCommitted) throw error;
-				this.sessionManager.restoreState(previousSessionState);
+				// The switch never committed: rotate the manager's endpoint
+				// registration back to the predecessor before restoring it
+				// (review thread P1 — the map key must track the session id).
+				const rekeyed = AsyncJobManager.rekeyForEndpoint(
+					this.sessionManager.getSessionId(),
+					previousSessionState.sessionId,
+					AsyncJobManager.forEndpoint(this.sessionManager.getSessionId()),
+				);
+				if (!rekeyed) {
+					// Another top-level session claimed the freed predecessor endpoint
+					// while the switch's cleanup was in flight: restoring the old
+					// identity would leave this manager registered under the successor
+					// while tool lookups for the restored identity resolve the foreign
+					// manager, so same-ID jobs could be queried or cancelled across
+					// sessions and owned aborts lose their causal set (review thread
+					// P1). Fail the rollback instead of restoring into misattributed
+					// ownership; the caller surfaces the switch failure.
+					throw new Error(
+						`Session switch rollback aborted: predecessor endpoint "${previousSessionState.sessionId}" is no longer owned by this session.`,
+					);
+				}
+				await this.sessionManager.restoreRollbackState(previousSessionState);
 				this.#defaultFallbackController = undefined;
 				this.#syncAgentSessionId(previousSessionState.sessionId);
 				this.#activeModelProfile = previousActiveModelProfile;
@@ -17907,6 +19171,7 @@ export class AgentSession {
 		try {
 			const previousSessionFile = this.sessionFile;
 			const previousWorkflowGateSessionId = this.sessionId;
+			const previousSessionIdentity = this.sessionManager.getSessionId();
 			const selectedEntry = this.sessionManager.getEntryForFidelity(entryId);
 
 			if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
@@ -17938,7 +19203,11 @@ export class AgentSession {
 			try {
 				await initializeLocalRoot(this.#localProtocolOptions(prepared));
 				await this.#settleOwnAsyncJobsBeforeArtifactRetirement();
+				this.#assertJobManagerEndpointAdmission(prepared.sessionId);
 				this.sessionManager.commitPreparedNewSession(prepared);
+				// Branch commits a successor endpoint identity; re-register the
+				// manager under it (review thread P1).
+				this.#rekeyJobManagerForSessionIdentity(previousSessionIdentity);
 				await this.#runToolSessionTransitionCleanups();
 			} catch (error) {
 				throw await discardPreparedNewSessionAfterFailure(this.sessionManager, prepared, error);

@@ -2463,7 +2463,7 @@
 			"adapterTestId": "AD-M-C25",
 			"sdkId": "bash.execute",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C25",
 			"argv": [
@@ -2473,13 +2473,13 @@
 				"--test-name-pattern",
 				"^AD-M-C25:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C25",
 			"sdkId": "bash.execute",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C25",
 			"argv": [
@@ -2489,13 +2489,13 @@
 				"--test-name-pattern",
 				"^AD-A-C25:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C25",
 			"sdkId": "bash.execute",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C25",
 			"argv": [
@@ -2505,7 +2505,7 @@
 				"--test-name-pattern",
 				"^AD-L-C25:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C26",
@@ -2559,7 +2559,7 @@
 			"adapterTestId": "AD-M-C26",
 			"sdkId": "bash.abort",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C26",
 			"argv": [
@@ -2569,13 +2569,13 @@
 				"--test-name-pattern",
 				"^AD-M-C26:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C26",
 			"sdkId": "bash.abort",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C26",
 			"argv": [
@@ -2585,13 +2585,13 @@
 				"--test-name-pattern",
 				"^AD-A-C26:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C26",
 			"sdkId": "bash.abort",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C26",
 			"argv": [
@@ -2601,13 +2601,13 @@
 				"--test-name-pattern",
 				"^AD-L-C26:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C27",
 			"sdkId": "session.new",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C27",
 			"argv": [
@@ -2617,13 +2617,13 @@
 				"--test-name-pattern",
 				"^AD-T-C27:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C27",
 			"sdkId": "session.new",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C27",
 			"argv": [
@@ -2633,13 +2633,13 @@
 				"--test-name-pattern",
 				"^AD-D-C27:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C27",
 			"sdkId": "session.new",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C27",
 			"argv": [
@@ -2649,13 +2649,13 @@
 				"--test-name-pattern",
 				"^AD-S-C27:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C27",
 			"sdkId": "session.new",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C27",
 			"argv": [
@@ -2665,13 +2665,13 @@
 				"--test-name-pattern",
 				"^AD-M-C27:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C27",
 			"sdkId": "session.new",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C27",
 			"argv": [
@@ -2681,13 +2681,13 @@
 				"--test-name-pattern",
 				"^AD-A-C27:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C27",
 			"sdkId": "session.new",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C27",
 			"argv": [
@@ -2697,13 +2697,13 @@
 				"--test-name-pattern",
 				"^AD-L-C27:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C28",
 			"sdkId": "session.fork",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C28",
 			"argv": [
@@ -2713,13 +2713,13 @@
 				"--test-name-pattern",
 				"^AD-T-C28:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C28",
 			"sdkId": "session.fork",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C28",
 			"argv": [
@@ -2729,13 +2729,13 @@
 				"--test-name-pattern",
 				"^AD-D-C28:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C28",
 			"sdkId": "session.fork",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C28",
 			"argv": [
@@ -2745,13 +2745,13 @@
 				"--test-name-pattern",
 				"^AD-S-C28:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C28",
 			"sdkId": "session.fork",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C28",
 			"argv": [
@@ -2761,13 +2761,13 @@
 				"--test-name-pattern",
 				"^AD-M-C28:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C28",
 			"sdkId": "session.fork",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C28",
 			"argv": [
@@ -2777,13 +2777,13 @@
 				"--test-name-pattern",
 				"^AD-A-C28:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C28",
 			"sdkId": "session.fork",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C28",
 			"argv": [
@@ -2793,13 +2793,13 @@
 				"--test-name-pattern",
 				"^AD-L-C28:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C29",
 			"sdkId": "session.resume",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C29",
 			"argv": [
@@ -2809,13 +2809,13 @@
 				"--test-name-pattern",
 				"^AD-T-C29:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C29",
 			"sdkId": "session.resume",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C29",
 			"argv": [
@@ -2825,13 +2825,13 @@
 				"--test-name-pattern",
 				"^AD-D-C29:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C29",
 			"sdkId": "session.resume",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C29",
 			"argv": [
@@ -2841,13 +2841,13 @@
 				"--test-name-pattern",
 				"^AD-S-C29:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C29",
 			"sdkId": "session.resume",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C29",
 			"argv": [
@@ -2857,13 +2857,13 @@
 				"--test-name-pattern",
 				"^AD-M-C29:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C29",
 			"sdkId": "session.resume",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C29",
 			"argv": [
@@ -2873,13 +2873,13 @@
 				"--test-name-pattern",
 				"^AD-A-C29:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C29",
 			"sdkId": "session.resume",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C29",
 			"argv": [
@@ -2889,13 +2889,13 @@
 				"--test-name-pattern",
 				"^AD-L-C29:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C30",
 			"sdkId": "session.close",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C30",
 			"argv": [
@@ -2905,13 +2905,13 @@
 				"--test-name-pattern",
 				"^AD-T-C30:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C30",
 			"sdkId": "session.close",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C30",
 			"argv": [
@@ -2921,13 +2921,13 @@
 				"--test-name-pattern",
 				"^AD-D-C30:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C30",
 			"sdkId": "session.close",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C30",
 			"argv": [
@@ -2937,13 +2937,13 @@
 				"--test-name-pattern",
 				"^AD-S-C30:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C30",
 			"sdkId": "session.close",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C30",
 			"argv": [
@@ -2953,13 +2953,13 @@
 				"--test-name-pattern",
 				"^AD-M-C30:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C30",
 			"sdkId": "session.close",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C30",
 			"argv": [
@@ -2969,13 +2969,13 @@
 				"--test-name-pattern",
 				"^AD-A-C30:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C30",
 			"sdkId": "session.close",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C30",
 			"argv": [
@@ -2985,13 +2985,13 @@
 				"--test-name-pattern",
 				"^AD-L-C30:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C31",
 			"sdkId": "session.switch",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C31",
 			"argv": [
@@ -3001,13 +3001,13 @@
 				"--test-name-pattern",
 				"^AD-T-C31:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C31",
 			"sdkId": "session.switch",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C31",
 			"argv": [
@@ -3017,13 +3017,13 @@
 				"--test-name-pattern",
 				"^AD-D-C31:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C31",
 			"sdkId": "session.switch",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C31",
 			"argv": [
@@ -3033,13 +3033,13 @@
 				"--test-name-pattern",
 				"^AD-S-C31:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C31",
 			"sdkId": "session.switch",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C31",
 			"argv": [
@@ -3049,13 +3049,13 @@
 				"--test-name-pattern",
 				"^AD-M-C31:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C31",
 			"sdkId": "session.switch",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C31",
 			"argv": [
@@ -3065,13 +3065,13 @@
 				"--test-name-pattern",
 				"^AD-A-C31:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C31",
 			"sdkId": "session.switch",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C31",
 			"argv": [
@@ -3081,13 +3081,13 @@
 				"--test-name-pattern",
 				"^AD-L-C31:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C32",
 			"sdkId": "session.branch",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C32",
 			"argv": [
@@ -3097,13 +3097,13 @@
 				"--test-name-pattern",
 				"^AD-T-C32:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C32",
 			"sdkId": "session.branch",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C32",
 			"argv": [
@@ -3113,13 +3113,13 @@
 				"--test-name-pattern",
 				"^AD-D-C32:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C32",
 			"sdkId": "session.branch",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C32",
 			"argv": [
@@ -3129,13 +3129,13 @@
 				"--test-name-pattern",
 				"^AD-S-C32:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C32",
 			"sdkId": "session.branch",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C32",
 			"argv": [
@@ -3145,13 +3145,13 @@
 				"--test-name-pattern",
 				"^AD-M-C32:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C32",
 			"sdkId": "session.branch",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C32",
 			"argv": [
@@ -3161,13 +3161,13 @@
 				"--test-name-pattern",
 				"^AD-A-C32:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C32",
 			"sdkId": "session.branch",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C32",
 			"argv": [
@@ -3177,7 +3177,7 @@
 				"--test-name-pattern",
 				"^AD-L-C32:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C33",
@@ -3279,7 +3279,7 @@
 			"adapterTestId": "AD-T-C34",
 			"sdkId": "session.handoff",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C34",
 			"argv": [
@@ -3289,13 +3289,13 @@
 				"--test-name-pattern",
 				"^AD-T-C34:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C34",
 			"sdkId": "session.handoff",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C34",
 			"argv": [
@@ -3305,13 +3305,13 @@
 				"--test-name-pattern",
 				"^AD-D-C34:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C34",
 			"sdkId": "session.handoff",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C34",
 			"argv": [
@@ -3321,13 +3321,13 @@
 				"--test-name-pattern",
 				"^AD-S-C34:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C34",
 			"sdkId": "session.handoff",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C34",
 			"argv": [
@@ -3337,13 +3337,13 @@
 				"--test-name-pattern",
 				"^AD-M-C34:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C34",
 			"sdkId": "session.handoff",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C34",
 			"argv": [
@@ -3353,13 +3353,13 @@
 				"--test-name-pattern",
 				"^AD-A-C34:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C34",
 			"sdkId": "session.handoff",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C34",
 			"argv": [
@@ -3369,7 +3369,7 @@
 				"--test-name-pattern",
 				"^AD-L-C34:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C35",
@@ -4719,7 +4719,7 @@
 			"adapterTestId": "AD-T-C48",
 			"sdkId": "session.delete",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-C48",
 			"argv": [
@@ -4729,13 +4729,13 @@
 				"--test-name-pattern",
 				"^AD-T-C48:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-C48",
 			"sdkId": "session.delete",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-C48",
 			"argv": [
@@ -4745,13 +4745,13 @@
 				"--test-name-pattern",
 				"^AD-D-C48:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-C48",
 			"sdkId": "session.delete",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-C48",
 			"argv": [
@@ -4761,13 +4761,13 @@
 				"--test-name-pattern",
 				"^AD-S-C48:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-C48",
 			"sdkId": "session.delete",
 			"adapter": "mcp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-M-C48",
 			"argv": [
@@ -4777,13 +4777,13 @@
 				"--test-name-pattern",
 				"^AD-M-C48:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-A-C48",
 			"sdkId": "session.delete",
 			"adapter": "acp",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-A-C48",
 			"argv": [
@@ -4793,13 +4793,13 @@
 				"--test-name-pattern",
 				"^AD-A-C48:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-L-C48",
 			"sdkId": "session.delete",
 			"adapter": "daemonCli",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-L-C48",
 			"argv": [
@@ -4809,7 +4809,7 @@
 				"--test-name-pattern",
 				"^AD-L-C48:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-T-C49",
@@ -5487,7 +5487,7 @@
 			"adapterTestId": "AD-T-G03",
 			"sdkId": "session.create",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G03",
 			"argv": [
@@ -5497,13 +5497,13 @@
 				"--test-name-pattern",
 				"^AD-T-G03:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-G03",
 			"sdkId": "session.create",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G03",
 			"argv": [
@@ -5513,13 +5513,13 @@
 				"--test-name-pattern",
 				"^AD-D-G03:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-G03",
 			"sdkId": "session.create",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G03",
 			"argv": [
@@ -5529,7 +5529,7 @@
 				"--test-name-pattern",
 				"^AD-S-G03:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-G03",
@@ -5583,7 +5583,7 @@
 			"adapterTestId": "AD-T-G04",
 			"sdkId": "session.fork",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G04",
 			"argv": [
@@ -5593,13 +5593,13 @@
 				"--test-name-pattern",
 				"^AD-T-G04:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-G04",
 			"sdkId": "session.fork",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G04",
 			"argv": [
@@ -5609,13 +5609,13 @@
 				"--test-name-pattern",
 				"^AD-D-G04:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-G04",
 			"sdkId": "session.fork",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G04",
 			"argv": [
@@ -5625,7 +5625,7 @@
 				"--test-name-pattern",
 				"^AD-S-G04:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-G04",
@@ -5679,7 +5679,7 @@
 			"adapterTestId": "AD-T-G05",
 			"sdkId": "session.resume",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G05",
 			"argv": [
@@ -5689,13 +5689,13 @@
 				"--test-name-pattern",
 				"^AD-T-G05:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-G05",
 			"sdkId": "session.resume",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G05",
 			"argv": [
@@ -5705,13 +5705,13 @@
 				"--test-name-pattern",
 				"^AD-D-G05:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-G05",
 			"sdkId": "session.resume",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G05",
 			"argv": [
@@ -5721,7 +5721,7 @@
 				"--test-name-pattern",
 				"^AD-S-G05:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-G05",
@@ -5775,7 +5775,7 @@
 			"adapterTestId": "AD-T-G06",
 			"sdkId": "session.close",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G06",
 			"argv": [
@@ -5785,13 +5785,13 @@
 				"--test-name-pattern",
 				"^AD-T-G06:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-G06",
 			"sdkId": "session.close",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G06",
 			"argv": [
@@ -5801,13 +5801,13 @@
 				"--test-name-pattern",
 				"^AD-D-G06:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-G06",
 			"sdkId": "session.close",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G06",
 			"argv": [
@@ -5817,7 +5817,7 @@
 				"--test-name-pattern",
 				"^AD-S-G06:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-G06",
@@ -5871,7 +5871,7 @@
 			"adapterTestId": "AD-T-G07",
 			"sdkId": "session.delete",
 			"adapter": "telegram",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-T-G07",
 			"argv": [
@@ -5881,13 +5881,13 @@
 				"--test-name-pattern",
 				"^AD-T-G07:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-D-G07",
 			"sdkId": "session.delete",
 			"adapter": "discord",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-D-G07",
 			"argv": [
@@ -5897,13 +5897,13 @@
 				"--test-name-pattern",
 				"^AD-D-G07:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-S-G07",
 			"sdkId": "session.delete",
 			"adapter": "slack",
-			"disposition": "generic_safe",
+			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 			"testNamePattern": "AD-S-G07",
 			"argv": [
@@ -5913,7 +5913,7 @@
 				"--test-name-pattern",
 				"^AD-S-G07:"
 			],
-			"expected": "forwarded"
+			"expected": "rejected_before_send"
 		},
 		{
 			"adapterTestId": "AD-M-G07",
@@ -8365,7 +8365,7 @@
 		},
 		{
 			"adapterTestId": "AD-T-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "telegram",
 			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8381,7 +8381,7 @@
 		},
 		{
 			"adapterTestId": "AD-D-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "discord",
 			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8397,7 +8397,7 @@
 		},
 		{
 			"adapterTestId": "AD-S-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "slack",
 			"disposition": "prohibited",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8413,7 +8413,7 @@
 		},
 		{
 			"adapterTestId": "AD-M-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "mcp",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8429,7 +8429,7 @@
 		},
 		{
 			"adapterTestId": "AD-A-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "acp",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8445,7 +8445,7 @@
 		},
 		{
 			"adapterTestId": "AD-L-Q26",
-			"sdkId": "turn.prompt_status",
+			"sdkId": "turn.result",
 			"adapter": "daemonCli",
 			"disposition": "generic_safe",
 			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
@@ -8556,102 +8556,6 @@
 			"expected": "forwarded"
 		},
 		{
-			"adapterTestId": "AD-T-Q28",
-			"sdkId": "skill.invoke_status",
-			"adapter": "telegram",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-T-Q28",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-T-Q28:"
-			],
-			"expected": "rejected_before_send"
-		},
-		{
-			"adapterTestId": "AD-D-Q28",
-			"sdkId": "skill.invoke_status",
-			"adapter": "discord",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-D-Q28",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-D-Q28:"
-			],
-			"expected": "rejected_before_send"
-		},
-		{
-			"adapterTestId": "AD-S-Q28",
-			"sdkId": "skill.invoke_status",
-			"adapter": "slack",
-			"disposition": "prohibited",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-S-Q28",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-S-Q28:"
-			],
-			"expected": "rejected_before_send"
-		},
-		{
-			"adapterTestId": "AD-M-Q28",
-			"sdkId": "skill.invoke_status",
-			"adapter": "mcp",
-			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-M-Q28",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-M-Q28:"
-			],
-			"expected": "forwarded"
-		},
-		{
-			"adapterTestId": "AD-A-Q28",
-			"sdkId": "skill.invoke_status",
-			"adapter": "acp",
-			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-A-Q28",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-A-Q28:"
-			],
-			"expected": "forwarded"
-		},
-		{
-			"adapterTestId": "AD-L-Q28",
-			"sdkId": "skill.invoke_status",
-			"adapter": "daemonCli",
-			"disposition": "generic_safe",
-			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-			"testNamePattern": "AD-L-Q28",
-			"argv": [
-				"bun",
-				"test",
-				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
-				"--test-name-pattern",
-				"^AD-L-Q28:"
-			],
-			"expected": "forwarded"
-		},
-		{
 			"adapterTestId": "AD-T-Q29",
 			"sdkId": "providers.list/active",
 			"adapter": "telegram",
@@ -8744,6 +8648,198 @@
 				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
 				"--test-name-pattern",
 				"^AD-L-Q29:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-T-Q30",
+			"sdkId": "session.checkpoint",
+			"adapter": "telegram",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-Q30",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-Q30:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-D-Q30",
+			"sdkId": "session.checkpoint",
+			"adapter": "discord",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-Q30",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-Q30:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-S-Q30",
+			"sdkId": "session.checkpoint",
+			"adapter": "slack",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-Q30",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-Q30:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-M-Q30",
+			"sdkId": "session.checkpoint",
+			"adapter": "mcp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-M-Q30",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-M-Q30:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-A-Q30",
+			"sdkId": "session.checkpoint",
+			"adapter": "acp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-A-Q30",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-A-Q30:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-L-Q30",
+			"sdkId": "session.checkpoint",
+			"adapter": "daemonCli",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-L-Q30",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-L-Q30:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-T-Q31",
+			"sdkId": "turn.steer_status",
+			"adapter": "telegram",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-T-Q31",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-T-Q31:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-D-Q31",
+			"sdkId": "turn.steer_status",
+			"adapter": "discord",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-D-Q31",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-D-Q31:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-S-Q31",
+			"sdkId": "turn.steer_status",
+			"adapter": "slack",
+			"disposition": "prohibited",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-S-Q31",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-S-Q31:"
+			],
+			"expected": "rejected_before_send"
+		},
+		{
+			"adapterTestId": "AD-M-Q31",
+			"sdkId": "turn.steer_status",
+			"adapter": "mcp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-M-Q31",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-M-Q31:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-A-Q31",
+			"sdkId": "turn.steer_status",
+			"adapter": "acp",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-A-Q31",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-A-Q31:"
+			],
+			"expected": "forwarded"
+		},
+		{
+			"adapterTestId": "AD-L-Q31",
+			"sdkId": "turn.steer_status",
+			"adapter": "daemonCli",
+			"disposition": "generic_safe",
+			"testFile": "packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+			"testNamePattern": "AD-L-Q31",
+			"argv": [
+				"bun",
+				"test",
+				"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+				"--test-name-pattern",
+				"^AD-L-Q31:"
 			],
 			"expected": "forwarded"
 		},

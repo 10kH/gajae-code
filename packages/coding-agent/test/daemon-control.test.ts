@@ -9,8 +9,10 @@ import { createBuiltInDaemonControllers, selectDaemonControllers } from "../src/
 import type { BuiltInDaemonController, DaemonOperationResult, DaemonStatus } from "../src/daemon/control-types";
 import {
 	DAEMON_ACTION_ALIASES,
+	DAEMON_ACTION_TOKENS,
 	formatDaemonResult,
 	formatDaemonStatus,
+	MASTER_OWNER_INTERNAL_ACTION,
 	OWNERSHIP_MISMATCH_MESSAGE,
 	ownershipMismatchRecovery,
 	resolveDaemonAction,
@@ -334,10 +336,14 @@ describe("parseDaemonArgs", () => {
 		expect(parseDaemonArgs(["daemon"])?.action).toBe("status");
 	});
 
-	test("does not expose a master owner action", () => {
-		expect(parseDaemonArgs(["daemon", "master-internal"])).toMatchObject({
+	test("does not expose the internal master owner action on the operator surface", () => {
+		expect(DAEMON_ACTION_TOKENS).not.toContain(MASTER_OWNER_INTERNAL_ACTION);
+		expect(resolveDaemonAction(MASTER_OWNER_INTERNAL_ACTION)).toBeUndefined();
+		// The internal token is claimed by the cli.ts fast path, so the operator
+		// parser must treat it as a (rejected) kind rather than an action.
+		expect(parseDaemonArgs(["daemon", MASTER_OWNER_INTERNAL_ACTION])).toMatchObject({
 			action: "status",
-			kinds: ["master-internal"],
+			kinds: [MASTER_OWNER_INTERNAL_ACTION],
 		});
 	});
 
@@ -2874,8 +2880,34 @@ describe("cli registration", () => {
 
 	test("public daemon actions do not include a master owner action", () => {
 		const commandSource = fs.readFileSync(path.join(import.meta.dir, "../src/commands/daemon.ts"), "utf8");
-		expect(commandSource).not.toContain("master-internal");
+		expect(commandSource).not.toContain(MASTER_OWNER_INTERNAL_ACTION);
 	});
+
+	test("the detached master owner is spawned on the internal cli fast path, not `daemon session`", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-master-spawn-argv-"));
+		try {
+			const spawned: Array<{ command: string; args: string[] }> = [];
+			const result = await new MasterDaemonController({
+				masterRootDir: root,
+				spawn: (command, args) => {
+					spawned.push({ command, args });
+					// Report immediate child exit so the readiness loop terminates.
+					return { unref() {}, exitCode: 1 };
+				},
+			}).reload();
+
+			expect(result.ok).toBe(false);
+			expect(spawned).toHaveLength(1);
+			const args = spawned[0]!.args;
+			expect(args.slice(-4)).toEqual(["daemon", MASTER_OWNER_INTERNAL_ACTION, "--agent-dir", path.resolve(root)]);
+			// `gjc daemon session` was removed from the operator surface; the owner
+			// must not depend on it.
+			expect(args).not.toContain("session");
+			expect(args).not.toContain("--op");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	}, 20_000);
 });
 
 describe("topic registry reload persistence", () => {

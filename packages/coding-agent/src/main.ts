@@ -33,7 +33,7 @@ import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
-import { distTagForChannel, type UpdateChannel } from "./config/update-channel";
+import { distTagForChannel, resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/update-channel";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
@@ -1000,8 +1000,14 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, sessionDestination(), undefined, migrationPolicy);
-		if (manager.getEntries().length > 0) {
+		const manager = await SessionManager.continueRecent(
+			cwd,
+			sessionDestination(),
+			undefined,
+			migrationPolicy,
+			sessionMemoryMode,
+		);
+		if (manager.hasHistoryEntries()) {
 			parsed.continue = true;
 		}
 		return manager;
@@ -1215,7 +1221,9 @@ async function buildSessionOptions(
 		options.rules = [];
 	}
 
-	options.disableExtensionDiscovery = true;
+	// General extension modules stay preloaded/explicit, while the SDK performs
+	// bounded native/Claude/Codex hook discovery through the canonical adapter.
+	options.disableExtensionDiscovery = false;
 	options.additionalExtensionPaths = [];
 
 	return { options };
@@ -1487,7 +1495,8 @@ export async function runRootCommand(
 	const startupUpdate = new StartupUpdateOrchestrator(
 		startupUpdateRoute,
 		() => settingsInstance.get("startup.checkUpdate"),
-		deps.startupUpdate?.check ?? (() => checkForNewVersion(VERSION, settingsInstance.get("startup.updateChannel"))),
+		deps.startupUpdate?.check ??
+			(() => checkForNewVersion(VERSION, resolveMachineLocalUpdateChannel(settingsInstance))),
 	);
 	const isInteractive = disposition.isInteractive;
 	const mode = parsedArgs.mode || "text";

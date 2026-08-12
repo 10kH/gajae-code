@@ -1,0 +1,101 @@
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+export interface BrokerStartupFailureMarker {
+	version: 1;
+	reason: string;
+	exitCode: number | null;
+	signal: string | null;
+	writtenAt: number;
+}
+
+const BROKER_STARTUP_FAILURE_FILE = "broker.startup-failure.json";
+const MAX_BROKER_STARTUP_FAILURE_REASON = 512;
+
+export function brokerStartupFailurePath(agentDir: string): string {
+	return path.join(agentDir, "sdk", BROKER_STARTUP_FAILURE_FILE);
+}
+
+function boundedMarker(reason: string, exitCode: number | null, signal: string | null): BrokerStartupFailureMarker {
+	return {
+		version: 1,
+		reason: reason.slice(0, MAX_BROKER_STARTUP_FAILURE_REASON),
+		exitCode,
+		signal,
+		writtenAt: Date.now(),
+	};
+}
+
+/** Best-effort durable marker write; never throws (diagnostics must not mask the exit itself). */
+export async function writeBrokerStartupFailureMarker(
+	agentDir: string,
+	failure: { reason: string; exitCode: number | null; signal: string | null },
+): Promise<void> {
+	try {
+		await fs.mkdir(path.dirname(brokerStartupFailurePath(agentDir)), { recursive: true, mode: 0o700 });
+		await Bun.write(
+			brokerStartupFailurePath(agentDir),
+			JSON.stringify(boundedMarker(failure.reason, failure.exitCode, failure.signal)),
+		);
+	} catch {
+		// Best-effort only.
+	}
+}
+
+/** Reads a bounded startup-failure marker; `undefined` when absent or malformed. */
+export async function readBrokerStartupFailureMarker(
+	agentDir: string,
+): Promise<BrokerStartupFailureMarker | undefined> {
+	try {
+		const file = Bun.file(brokerStartupFailurePath(agentDir));
+		if (!(await file.exists())) return undefined;
+		const raw = await file.text();
+		const value: unknown = JSON.parse(raw);
+		if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+		const marker = value as Partial<BrokerStartupFailureMarker>;
+		if (
+			marker.version !== 1 ||
+			typeof marker.reason !== "string" ||
+			marker.reason.length === 0 ||
+			(marker.exitCode !== null && typeof marker.exitCode !== "number") ||
+			(marker.signal !== null && typeof marker.signal !== "string") ||
+			typeof marker.writtenAt !== "number"
+		)
+			return undefined;
+		return marker as BrokerStartupFailureMarker;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Best-effort marker removal; used at spawn so a stale marker never misattributes an older failure. */
+export async function clearBrokerStartupFailureMarker(agentDir: string): Promise<void> {
+	try {
+		const file = Bun.file(brokerStartupFailurePath(agentDir));
+		if (await file.exists()) await file.unlink();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			// Best-effort only.
+		}
+	}
+}
+
+/** Typed error returned when a detached broker exits before discovery. */
+export class BrokerStartupError extends Error {
+	readonly code = "broker_startup_failed";
+	readonly exitCode: number | null;
+	readonly signal: string | null;
+	readonly reason: string;
+	readonly stderrExcerpt?: string;
+
+	constructor(fields: { exitCode: number | null; signal: string | null; reason: string; stderrExcerpt?: string }) {
+		super(
+			`Detached SDK broker exited before discovery (code=${fields.exitCode}, signal=${fields.signal}): ${fields.reason}${fields.stderrExcerpt ? ` Broker stderr: ${fields.stderrExcerpt}` : ""}`,
+		);
+		this.name = "BrokerStartupError";
+		this.exitCode = fields.exitCode;
+		this.signal = fields.signal;
+		this.reason = fields.reason;
+		this.stderrExcerpt = fields.stderrExcerpt;
+	}
+}

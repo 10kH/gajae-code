@@ -3,7 +3,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
-import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import {
 	cleanupFixtureRoots,
 	createNotificationFixtureRoot,
@@ -11,6 +10,7 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
+import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
 
 /**
  * Regression for the text-before-ask ordering bug: the assistant text that
@@ -113,7 +113,7 @@ async function setup(
 
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
-	const { url, token } = readEndpoint(endpointFile);
+	const { url, token } = readTestSdkEndpoint(endpointFile);
 
 	const frames: Frame[] = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);

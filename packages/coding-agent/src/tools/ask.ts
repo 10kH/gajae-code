@@ -803,10 +803,14 @@ export class AskTool implements AgentTool<AskParametersSchema, AskToolDetails> {
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
 		context?: AgentToolContext,
 	): Promise<AgentToolResult<AskToolDetails>> {
-		await assertUltragoalAskAllowed(this.session.cwd, {
-			activeSkillState: this.session.getActiveSkillState?.(),
-			sessionId: this.session.getSessionId?.() ?? null,
-		});
+		await assertUltragoalAskAllowed(
+			this.session.cwd,
+			{
+				activeSkillState: this.session.getActiveSkillState?.(),
+				sessionId: this.session.getSessionId?.() ?? null,
+			},
+			this.session.getSessionAgentDir?.() ?? this.session.settings.getAgentDir(),
+		);
 		assertDeepInterviewStructuredResponseWithinLimit(params);
 		let activeRemoteReceipt: AskRemoteReceipt | undefined;
 		let activeRemoteRequest: AskAnswerRequest | undefined;

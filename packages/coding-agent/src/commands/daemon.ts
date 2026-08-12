@@ -11,13 +11,9 @@ import {
 } from "../cli/daemon-cli";
 import type { DaemonKind } from "../daemon/control-types";
 import { DAEMON_ACTION_TOKENS, resolveDaemonAction } from "../daemon/operator-contract";
-import { runMasterDaemonInternal } from "../master/daemon";
 import { initTheme } from "../modes/theme/theme";
-import { runSdkSessionCli } from "../sdk/cli";
 
-const INTERNAL_ACTIONS = ["discord-internal", "slack-internal"] as const;
-
-const ACTIONS = [...DAEMON_ACTION_TOKENS, ...INTERNAL_ACTIONS, "session"] as const;
+const ACTIONS = [...DAEMON_ACTION_TOKENS, "discord-internal", "slack-internal"] as const;
 
 function parsePositiveTimeout(raw: string | undefined, flagName: string): number | undefined {
 	if (raw === undefined) return undefined;
@@ -33,7 +29,7 @@ function parsePositiveTimeout(raw: string | undefined, flagName: string): number
 
 export default class Daemon extends Command {
 	static description =
-		"Manage GJC background daemons and SDK sessions. Routine use: `gjc daemon status` to check, `gjc daemon restart` to reload (spawns one if none is running). `stop`/`list` and the escalation flags below are advanced primitives.";
+		"Manage GJC background daemons. Routine use: `gjc daemon status` to check, `gjc daemon restart` to reload (spawns one if none is running). `stop`/`list` and the escalation flags below are advanced primitives.";
 
 	static examples = [
 		"# Check the daemon (concise per-daemon result)\n  gjc daemon status",
@@ -63,16 +59,6 @@ export default class Daemon extends Command {
 		smoke: Flags.boolean({ description: "Internal: run worker smoke without configuration or network" }),
 		"owner-id": Flags.string({ description: "Internal: daemon owner id" }),
 		"agent-dir": Flags.string({ description: "Internal: daemon state directory" }),
-		op: Flags.string({ description: "SDK control or global operation" }),
-		"idempotency-key": Flags.string({ description: "Caller idempotency key required for SDK lifecycle globals" }),
-		"json-input": Flags.string({ description: "SDK request JSON object" }),
-		"json-input-file": Flags.string({ description: "Read SDK request JSON from a 0600 file" }),
-		"json-input-stdin": Flags.boolean({ description: "Read SDK request JSON from standard input" }),
-		confirm: Flags.boolean({ description: "Confirm a destructive SDK control operation" }),
-		query: Flags.string({ description: "SDK query name" }),
-		cursor: Flags.string({ description: "SDK query continuation cursor" }),
-		"show-endpoint-credential": Flags.boolean({ description: "Allow session.get_endpoint secret output" }),
-		yes: Flags.boolean({ description: "Confirm endpoint credential output on a TTY" }),
 	};
 
 	async run(): Promise<void> {
@@ -85,28 +71,6 @@ export default class Daemon extends Command {
 			"--graceful-timeout-ms",
 		);
 		const killTimeoutMs = parsePositiveTimeout(flagRec["kill-timeout-ms"] as string | undefined, "--kill-timeout-ms");
-		if (rawAction === "session") {
-			if (rawAction === "session" && flagRec.op === "master.owner.internal") {
-				await runMasterDaemonInternal(flagRec["agent-dir"] as string | undefined);
-				return;
-			}
-			await runSdkSessionCli({
-				action: positional[0],
-				sessionId: positional[1],
-				operation: flagRec.op as string | undefined,
-				query: flagRec.query as string | undefined,
-				jsonInput: flagRec["json-input"] as string | undefined,
-				jsonInputFile: flagRec["json-input-file"] as string | undefined,
-				jsonInputStdin: Boolean(flagRec["json-input-stdin"]),
-				confirm: Boolean(flagRec.confirm),
-				idempotencyKey: flagRec["idempotency-key"] as string | undefined,
-				cursor: flagRec.cursor as string | undefined,
-				showEndpointCredential: Boolean(flagRec["show-endpoint-credential"]),
-				yes: Boolean(flagRec.yes),
-				agentDir: flagRec["agent-dir"] as string | undefined,
-			});
-			return;
-		}
 		const action = (resolveDaemonAction(rawAction) ?? rawAction) as DaemonCommandAction;
 		const kinds = positional as DaemonKind[];
 		const cmd: DaemonCommandArgs = {

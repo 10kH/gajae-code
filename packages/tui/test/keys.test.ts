@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import {
 	extractPrintableText,
 	isKeyId,
+	isKeyRelease,
+	isKeyRepeat,
 	matchesKey,
 	parseKey,
 	parseKeyId,
@@ -39,6 +41,17 @@ describe("matchesKey", () => {
 		expect(matchesKey(dvorakCtrlK, "ctrl+v")).toBe(false);
 		setKittyProtocolActive(false);
 	});
+	it("matches modified Korean Dubeolsik keys when Kitty omits the base-layout key", () => {
+		setKittyProtocolActive(true);
+		expect(matchesKey("\x1b[12621;5u", "ctrl+v")).toBe(true);
+		expect(matchesKey("\x1b[12621;9u", "super+v")).toBe(true);
+		expect(matchesKey("\x1b[12621;3u", "alt+v")).toBe(true);
+		expect(matchesKey("\x1b[12621u", "v")).toBe(false);
+		expect(matchesKey("\x1b[12621;5u", "ctrl+b")).toBe(false);
+		expect(matchesKey("\x1b[12621;5:3u", "ctrl+v")).toBe(false);
+		expect(matchesKey("\x1b[12626;2u", "shift+o")).toBe(false);
+		setKittyProtocolActive(false);
+	});
 
 	it("should prefer codepoint for symbol keys even when base layout differs", () => {
 		setKittyProtocolActive(true);
@@ -53,6 +66,26 @@ describe("matchesKey", () => {
 		expect(matchesKey("\x1b[127u", "backspace")).toBe(true);
 		expect(matchesKey("\x1b[127;1:2u", "backspace")).toBe(true);
 		expect(matchesKey("\x1b[127;1:3u", "backspace")).toBe(false);
+		setKittyProtocolActive(false);
+	});
+	it("filters Kitty release and repeat events for CSI letter finals", () => {
+		setKittyProtocolActive(true);
+		for (const final of ["E", "P", "Q", "R", "S"]) {
+			const release = `\x1b[1;1:3${final}`;
+			const repeat = `\x1b[1;1:2${final}`;
+			expect(isKeyRelease(release)).toBe(true);
+			expect(isKeyRepeat(repeat)).toBe(true);
+			expect(matchesKey(release, "f1")).toBe(false);
+			expect(parseKey(release)).toBeUndefined();
+		}
+		setKittyProtocolActive(false);
+	});
+	it("rejects unknown Kitty event types", () => {
+		setKittyProtocolActive(true);
+		for (const sequence of ["\x1b[112;1:0u", "\x1b[112;1:4u", "\x1b[1;1:4P", "\x1b[15;1:4~"]) {
+			expect(parseKey(sequence)).toBeUndefined();
+			expect(matchesKey(sequence, "p")).toBe(false);
+		}
 		setKittyProtocolActive(false);
 	});
 
@@ -96,6 +129,53 @@ describe("matchesKey", () => {
 		expect(matchesKey("p", "super+p")).toBe(false);
 		setKittyProtocolActive(false);
 	});
+	it("matches Command/Super through Kitty and modifyOtherKeys encodings", () => {
+		setKittyProtocolActive(false);
+		expect(matchesKey("\x1b[27;9;112~", "super+p")).toBe(true);
+		expect(parseKey("\x1b[27;9;112~")).toBe("super+p");
+		expect(matchesKey("\x1b[27;9;112~", parseKeyId("command+p")!.keyId)).toBe(true);
+	});
+	it("matches unmodified Kitty CSI function keys", () => {
+		setKittyProtocolActive(false);
+		expect(matchesKey("\x1b[1;1P", "f1")).toBe(true);
+		expect(parseKey("\x1b[1;1P")).toBe("f1");
+	});
+	it("keeps all Kitty function keys symmetric", () => {
+		const cases = [
+			["f1", "\x1b[1;1P"],
+			["f2", "\x1b[1;1Q"],
+			["f3", "\x1b[1;1R"],
+			["f4", "\x1b[1;1S"],
+			["f5", "\x1b[15;1~"],
+			["f6", "\x1b[17;1~"],
+			["f7", "\x1b[18;1~"],
+			["f8", "\x1b[19;1~"],
+			["f9", "\x1b[20;1~"],
+			["f10", "\x1b[21;1~"],
+			["f11", "\x1b[23;1~"],
+			["f12", "\x1b[24;1~"],
+		] as const;
+		for (const [key, data] of cases) {
+			expect(matchesKey(data, key)).toBe(true);
+			expect(parseKey(data)).toBe(key);
+		}
+	});
+	it("accepts Option and Command modifier names as canonical aliases", () => {
+		expect(parseKeyId("option+q")?.keyId).toBe("alt+q");
+		expect(parseKeyId("meta+q")?.keyId).toBe("alt+q");
+		expect(parseKeyId("command+p")?.keyId).toBe("super+p");
+		expect(parseKeyId("cmd+p")?.keyId).toBe("super+p");
+		expect(isKeyId("option+q")).toBe(false);
+		expect(isKeyId("command+p")).toBe(false);
+	});
+	it("rejects duplicate and inherited modifier aliases", () => {
+		for (const value of ["ctrl+ctrl+p", "option+alt+p", "meta+option+p", "command+super+p"]) {
+			expect(parseKeyId(value)).toBeUndefined();
+		}
+		for (const value of ["constructor+p", "toString+p", "__proto__+p"]) {
+			expect(parseKeyId(value)).toBeUndefined();
+		}
+	});
 });
 describe.each([
 	{ data: "\x1bq", kitty: false, key: "alt+q", expected: "alt+q" },
@@ -105,6 +185,11 @@ describe.each([
 	{ data: "\x1b[113;3u", kitty: true, key: "alt+q", expected: "alt+q" },
 	{ data: "\x1b[99;4u", kitty: true, key: "alt+shift+c", expected: "alt+shift+c" },
 	{ data: "\x1b[27;3;105~", kitty: false, key: "alt+i", expected: "alt+i" },
+	{ data: "\x1b0", kitty: true, key: "alt+0", expected: "alt+0" },
+	{ data: "\x1b-", kitty: true, key: "alt+-", expected: "alt+-" },
+	{ data: "\x1b[", kitty: true, key: "alt+[", expected: "alt+[" },
+	{ data: "\x1b!", kitty: true, key: "alt+!", expected: "alt+!" },
+	{ data: "\x1b ", kitty: true, key: "alt+space", expected: "alt+space" },
 ] as const)("normalizes Option input $expected", ({ data, kitty, key, expected }) => {
 	it("matches and parses one canonical KeyId", () => {
 		setKittyProtocolActive(kitty);
@@ -135,10 +220,10 @@ describe("Alt+I protocol symmetry", () => {
 		setKittyProtocolActive(false);
 	});
 
-	it("does not parse or match gated legacy space and control forms while Kitty is active", () => {
+	it("keeps legacy Option space available while enhanced input is active", () => {
 		setKittyProtocolActive(true);
-		expect(matchesKey("\x1b ", "alt+space")).toBe(false);
-		expect(parseKey("\x1b ")).toBeUndefined();
+		expect(matchesKey("\x1b ", "alt+space")).toBe(true);
+		expect(parseKey("\x1b ")).toBe("alt+space");
 		expect(matchesKey("\x1b\x01", "ctrl+alt+a")).toBe(false);
 		expect(parseKey("\x1b\x01")).toBeUndefined();
 		setKittyProtocolActive(false);
@@ -293,6 +378,23 @@ describe("extractPrintableText", () => {
 	it("preserves Kitty CSI-u text-field decoding for supported modifiers", () => {
 		expect(extractPrintableText("\x1b[97;1;229u")).toBe("å");
 	});
+	it("rejects malformed event types, modifier overflow, control text, and surrogate code points", () => {
+		for (const data of [
+			"\x1b[97;1:0u",
+			"\x1b[97;1:03u",
+			"\x1b[97;1:4u",
+			"\x1b[97;4294967297u",
+			"\x1b[27;4294967297;97~",
+			"\x1b[127u",
+			"\x1b[128u",
+			"\x1b[97;1;127u",
+			"\x1b[55296u",
+			"\x1b[97;1;55296u",
+			"\x1b[27;1;55296~",
+		]) {
+			expect(extractPrintableText(data)).toBeUndefined();
+		}
+	});
 });
 describe("KeyId grammar", () => {
 	it("parses canonical keys case-insensitively", () => {
@@ -319,12 +421,10 @@ describe("KeyId grammar", () => {
 		expect(parseKeyId("ctrl+++")).toBeUndefined();
 	});
 
-	it("rejects aliases, duplicates, malformed chains, unknown keys, and controls", () => {
+	it("rejects duplicates, malformed chains, unknown keys, and controls", () => {
 		for (const key of [
-			"cmd+p",
-			"command+p",
-			"meta+p",
-			"option+p",
+			"option+alt+p",
+			"command+super+p",
 			"ctrl+ctrl+c",
 			"ctrl++x",
 			"ctrl+unknown",

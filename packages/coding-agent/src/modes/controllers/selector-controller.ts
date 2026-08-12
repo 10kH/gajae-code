@@ -52,6 +52,7 @@ import {
 	stopInteractiveActivityIndicator,
 	suspendInteractiveActivityIndicator,
 } from "../../modes/types";
+import { configureSttFromSettings } from "../../runtime/stt-settings-setup";
 import { ChatDaemonController } from "../../sdk/bus/chat-daemon-control";
 import {
 	getCurrentTelegramActivationMarker,
@@ -84,13 +85,7 @@ import {
 	sendNotificationTest,
 } from "../../sdk/bus/notification-service";
 import type { NotificationSessionStatus } from "../../sdk/bus/session-control";
-import {
-	ensureTelegramDaemonRunningDetailed,
-	readNotificationRootRegistration,
-	resolveTelegramSetupPreflight,
-	unregisterNotificationRoot,
-	withNotificationRootRegistryFence,
-} from "../../sdk/bus/telegram-daemon";
+import { ensureTelegramDaemonRunningDetailed, resolveTelegramSetupPreflight } from "../../sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
 import type { DefaultFallbackRuntimeState } from "../../session/agent-session";
@@ -126,11 +121,8 @@ import {
 } from "../../setup/model-onboarding-guidance";
 import { addApiCompatibleProvider, formatProviderSetupResult } from "../../setup/provider-onboarding";
 import {
-	IMAGE_PROVIDER_DEFAULTS,
 	isConfigurableSearchProviderId,
 	isSearchProviderPreference,
-	setConfiguredImageModel,
-	setPreferredImageProvider,
 	setPreferredSearchProvider,
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
@@ -272,13 +264,6 @@ export interface NotificationsEditorOperationDependencies {
 	reconcileCommittedTelegramConfiguration: typeof reconcileCommittedTelegramConfiguration;
 	saveTelegramInactive: typeof saveTelegramInactive;
 	removeTelegramConfiguration: typeof removeTelegramConfiguration;
-	readNotificationRootRegistration: typeof readNotificationRootRegistration;
-	unregisterNotificationRoot: typeof unregisterNotificationRoot;
-	stopTelegramDaemonIfRootRegistryFenceMatches(input: {
-		settings: Settings;
-		registryFingerprint: string;
-		stop: () => Promise<TelegramDaemonStopResult>;
-	}): Promise<boolean>;
 
 	reloadTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
 	restartTelegramDaemon(settings: Settings): Promise<{ ok: boolean; message: string }>;
@@ -302,17 +287,6 @@ const notificationEditorOperationDependencies: NotificationsEditorOperationDepen
 	reconcileCommittedTelegramConfiguration,
 	saveTelegramInactive,
 	removeTelegramConfiguration,
-	readNotificationRootRegistration,
-	unregisterNotificationRoot,
-	stopTelegramDaemonIfRootRegistryFenceMatches: async input =>
-		await withNotificationRootRegistryFence({
-			settings: input.settings,
-			registryFingerprint: input.registryFingerprint,
-			action: async () => {
-				const stopped = await input.stop();
-				if (!stopped.ok) throw new Error(stopped.message);
-			},
-		}),
 
 	reloadTelegramDaemon: async settings =>
 		await new TelegramDaemonController(settings).reload({ spawnIfStopped: false }),
@@ -363,12 +337,7 @@ export function createNotificationsEditorOperations(
 	const notifyAfterDurableCommit = async (): Promise<void> => {
 		await ctx.notifyConfigChanged?.();
 	};
-	const reconnect = async () =>
-		await services.ensureTelegramDaemonRunningDetailed({
-			settings: ctx.settings,
-			cwd: ctx.sessionManager.getCwd(),
-			sessionId: ctx.sessionManager.getSessionId(),
-		});
+	const reconnect = async () => await services.ensureTelegramDaemonRunningDetailed({ settings: ctx.settings });
 	const telegramSetupPreflight = async (): Promise<TelegramSetupPreflight> =>
 		await services.resolveTelegramSetupPreflight(ctx.settings);
 	const providerRuntime: NotificationProviderRuntimeAuthority = services.providerRuntime ?? {
@@ -1043,23 +1012,8 @@ export function createNotificationsEditorOperations(
 						stopAndUnregister: async () => {
 							if (controller) await controller.enterBlockedRuntime(sessionContext());
 							runtimePrepared = true;
-							const registration = await services.readNotificationRootRegistration({
-								settings: ctx.settings,
-								sessionId: ctx.sessionManager.getSessionId(),
-							});
-							const unregistered = await services.unregisterNotificationRoot({
-								settings: ctx.settings,
-								cwd: ctx.sessionManager.getCwd(),
-								sessionId: ctx.sessionManager.getSessionId(),
-								registrationToken: registration.token,
-							});
-							if (unregistered.registryFingerprint !== undefined) {
-								await services.stopTelegramDaemonIfRootRegistryFenceMatches({
-									settings: ctx.settings,
-									registryFingerprint: unregistered.registryFingerprint,
-									stop: () => services.stopTelegramDaemon(ctx.settings),
-								});
-							}
+							const stopped = await services.stopTelegramDaemon(ctx.settings);
+							if (!stopped.ok) throw new Error(stopped.message);
 						},
 					},
 				});
@@ -1662,81 +1616,6 @@ export class SelectorController {
 		}
 	}
 
-	async #handleImageGenerationConfig(): Promise<void> {
-		const provider = await this.ctx.showHookInput(
-			"Image Generation provider (auto, openai, gemini, openrouter, antigravity, alibaba, custom)",
-			"auto",
-		);
-		if (provider === undefined) return;
-		const normalized = provider.trim().toLowerCase();
-		const validProviders = ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"];
-		if (!validProviders.includes(normalized)) {
-			this.ctx.showStatus(`Invalid image provider: ${normalized}. Valid: ${validProviders.join(", ")}`);
-			return;
-		}
-		let model: string | undefined;
-		if (normalized !== "auto" && normalized !== "custom") {
-			const defaultModel = IMAGE_PROVIDER_DEFAULTS[normalized];
-			model = await this.ctx.showHookInput(`Image model for ${normalized} (default: ${defaultModel})`, defaultModel);
-			if (model === undefined) return;
-			model = model.trim() || defaultModel;
-		}
-		let customUrl: string | undefined;
-		let customKey: string | undefined;
-		if (normalized === "custom") {
-			customUrl = await this.ctx.showHookInput("Custom image endpoint base URL");
-			if (!customUrl?.trim()) {
-				this.ctx.showStatus("Custom image endpoint requires a base URL");
-				return;
-			}
-			model = await this.ctx.showHookInput("Custom image model", IMAGE_PROVIDER_DEFAULTS.openai);
-			if (model === undefined) return;
-			model = model.trim() || IMAGE_PROVIDER_DEFAULTS.openai;
-			customKey = await this.ctx.showHookInput("Custom image endpoint API key");
-		}
-		const scope = await this.ctx.showHookInput(
-			"Scope: 'session' (this session only) or 'default' (persist)",
-			"session",
-		);
-		if (scope === undefined) return;
-		const persistDefault = scope.trim().toLowerCase() === "default";
-		if (persistDefault && !this.ctx.settings.canWriteDurableConfig()) {
-			this.ctx.showError(
-				"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
-			);
-			return;
-		}
-
-		const imageProvider = normalized as
-			| "auto"
-			| "openai"
-			| "gemini"
-			| "openrouter"
-			| "antigravity"
-			| "alibaba"
-			| "custom";
-		setPreferredImageProvider(imageProvider === "custom" ? "auto" : imageProvider);
-		setConfiguredImageModel({
-			provider: imageProvider,
-			model: model ?? null,
-			customUrl: customUrl?.trim(),
-			customKey: customKey?.trim(),
-		});
-
-		if (persistDefault) {
-			this.ctx.settings.set("providers.image", imageProvider);
-			if (model) this.ctx.settings.set("providers.imageModel", model);
-			if (customUrl?.trim()) this.ctx.settings.set("providers.imageCustomUrl", customUrl.trim());
-			if (customKey?.trim()) this.ctx.settings.set("providers.imageCustomKey", customKey.trim());
-		}
-
-		const displayModel =
-			model ?? (normalized !== "auto" && normalized !== "custom" ? IMAGE_PROVIDER_DEFAULTS[normalized] : undefined);
-		const label = normalized === "auto" ? "Auto" : `${normalized}${displayModel ? ` (${displayModel})` : ""}`;
-		this.ctx.showStatus(`Image Generation: ${label}${persistDefault ? " (default)" : " (session)"}`);
-		this.ctx.ui.requestRender();
-	}
-
 	showCustomProviderWizard(): void {
 		this.showSelector(done => {
 			let wizard: CustomProviderWizardComponent;
@@ -2126,6 +2005,18 @@ export class SelectorController {
 				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));
 				break;
 
+			case "stt.enabled":
+				if (value === true) {
+					void configureSttFromSettings({
+						modelName: settings.get("stt.modelName"),
+						setEnabled: enabled => settings.set("stt.enabled", enabled),
+						flush: () => settings.flushOrThrow(),
+						showStatus: message => this.ctx.showStatus(message),
+						showError: message => this.ctx.showError(message),
+					});
+				}
+				break;
+
 			// Settings with UI side effects
 			case "showImages":
 				for (const child of this.ctx.chatContainer.children) {
@@ -2262,37 +2153,6 @@ export class SelectorController {
 					setSearchHardTimeoutMs(value * 1000);
 				}
 				break;
-			case "providers.image":
-			case "providers.imageModel":
-			case "providers.imageCustomUrl":
-			case "providers.imageCustomKey":
-			case "providers.imageCustomKeyEnv": {
-				const imgProvider = this.ctx.settings.get("providers.image");
-				const imgModel = this.ctx.settings.get("providers.imageModel");
-				const imgCustomUrl = this.ctx.settings.get("providers.imageCustomUrl");
-				const imgCustomKey = this.ctx.settings.get("providers.imageCustomKey");
-				const imgCustomKeyEnv = this.ctx.settings.get("providers.imageCustomKeyEnv");
-				if (
-					imgProvider === "auto" ||
-					imgProvider === "openai" ||
-					imgProvider === "gemini" ||
-					imgProvider === "openrouter" ||
-					imgProvider === "antigravity" ||
-					imgProvider === "alibaba" ||
-					imgProvider === "custom"
-				) {
-					setPreferredImageProvider(imgProvider === "custom" ? "auto" : imgProvider);
-					setConfiguredImageModel({
-						provider: imgProvider,
-						model: imgModel ?? null,
-						customUrl: imgCustomUrl,
-						customKey: imgCustomKey,
-						customKeyEnv: imgCustomKeyEnv,
-					});
-				}
-				break;
-			}
-
 			// MCP update injection - live subscribe/unsubscribe
 			case "mcp.notifications":
 				this.ctx.mcpManager?.setNotificationsEnabled(value as boolean);
@@ -2358,11 +2218,6 @@ export class SelectorController {
 						}
 						if (selection.kind === "deleteProfile") {
 							await this.#deleteCustomModelPreset(selection.profileName, modelSelector);
-							return;
-						}
-						if (selection.kind === "imageGeneration") {
-							done();
-							await this.#handleImageGenerationConfig();
 							return;
 						}
 						if (selection.kind === "profile") {
@@ -2577,8 +2432,10 @@ export class SelectorController {
 					currentThinkingLevel: this.ctx.session.thinkingLevel,
 					activeModelProfile:
 						this.ctx.session.getActiveModelProfile?.() ?? this.ctx.settings.get("modelProfile.default"),
-					isFastForProvider: provider => this.ctx.session.isFastForProvider(provider),
-					isFastForSubagentProvider: provider => this.ctx.session.isFastForSubagentProvider(provider),
+					isFastForProvider: (provider, supportsServiceTier) =>
+						this.ctx.session.isFastForProvider(provider, supportsServiceTier),
+					isFastForSubagentProvider: (provider, supportsServiceTier) =>
+						this.ctx.session.isFastForSubagentProvider(provider, supportsServiceTier),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
 				},
 			);

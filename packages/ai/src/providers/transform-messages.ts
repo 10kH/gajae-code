@@ -98,8 +98,15 @@ export function transformMessages<TApi extends Api>(
 					if (dropAssistantThinkingForRepair && replaysAsNativeThinking) return [];
 					if (mustPreserveLatestAnthropicThinking) return sanitized;
 					// For same model: keep thinking blocks with signatures (needed for replay)
-					// even if the thinking text is empty (OpenAI encrypted reasoning)
-					if (isSameModel && sanitized.thinkingSignature) return sanitized;
+					// even if the thinking text is empty — but only for non-Anthropic APIs where
+					// the signature represents OpenAI encrypted reasoning. For anthropic-messages,
+					// a signed block with empty text means clear_thinking_20251015 stripped the
+					// content server-side while the stale signature remained; replaying it
+					// produces `thinking ... cannot be modified` 400s on every turn (#4247).
+					if (isSameModel && sanitized.thinkingSignature) {
+						if (sanitized.thinking.trim() === "" && model.api === "anthropic-messages") return [];
+						return sanitized;
+					}
 					// Skip empty thinking blocks, convert others to plain text
 					if (!sanitized.thinking || sanitized.thinking.trim() === "") return [];
 					if (isSameModel) return sanitized;

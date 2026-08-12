@@ -135,7 +135,8 @@ describe("withFileLock stale owner liveness (#652)", () => {
 					},
 					{ staleMs: 1, retries: 10, retryDelayMs: 1 },
 				);
-				await Bun.sleep(5);
+				for (let attempt = 0; attempt < 1_000 && !deniedInfoRead; attempt++) await Bun.sleep(1);
+				expect(deniedInfoRead).toBe(true);
 				expect(contenderEntered).toBe(false);
 			},
 			{ staleMs: 1, retries: 1, retryDelayMs: 1 },

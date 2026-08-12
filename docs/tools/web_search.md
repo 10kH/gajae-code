@@ -2,7 +2,7 @@
 
 > Run one web query through the first available search provider and return LLM-formatted answer, source URLs, and optional citations.
 
-> Note: `insane-search` is **not** a `web_search` provider and does not affect search-provider selection. It is an opt-in fallback for the `read` tool's URL fetch path (`web.insaneFallback`); see `docs/tools/read.md`.
+> Note: the selectable, keyless `insane` provider uses native safe public routes for supported platforms. It is separate from the vendored `insane-search` compatibility path in `read`; that fallback is production-disabled even when `web.insaneFallback` is enabled. See `docs/tools/read.md`.
 
 ## Source
 - Entry: `packages/coding-agent/src/web/search/index.ts`
@@ -206,6 +206,7 @@ Streaming: none. `WebSearchTool.execute()` does not forward its `_signal` argume
 ## Limits & Caps
 - Provider registry size: 16 providers (`SEARCH_PROVIDER_ORDER` in `packages/coding-agent/src/web/search/provider.ts`), including the keyless `duckduckgo` default/fallback and selectable `insane` safe-public-route provider. `SEARCH_PROVIDER_ORDER` no longer drives auto selection — see "Active-model-gated auto" above.
 - Insane result count: default `10`, max `20` (`packages/coding-agent/src/web/search/providers/insane.ts`).
+- Insane public-route response bodies are limited to 1 MiB after transfer/content decoding; oversized declared or streamed bodies are cancelled and that route fails closed (`packages/coding-agent/src/web/search/providers/insane.ts`).
 - `formatForLLM()` truncates source snippets and citation text to 240 chars (`packages/coding-agent/src/web/search/index.ts`).
 - `formatForLLM()` emits at most 3 search queries, each truncated to 120 chars (`packages/coding-agent/src/web/search/index.ts`).
 - Brave result count: default `10`, max `20` (`DEFAULT_NUM_RESULTS`, `MAX_NUM_RESULTS` in `packages/coding-agent/src/web/search/providers/brave.ts`).

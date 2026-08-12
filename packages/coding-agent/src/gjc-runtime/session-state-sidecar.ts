@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
 import {
 	isValidOwnerIntent,
@@ -45,6 +46,11 @@ export type RuntimeState = "ready_for_input" | "running" | "needs_user_input" | 
 type FinalResponseSource = "agent_end" | "launch_error";
 const MAX_PUBLIC_ERROR_MESSAGE_LENGTH = 2000;
 const HEARTBEAT_MS = 1000;
+const MAX_PUBLIC_ACTIVE_TOOLS = 8;
+const MAX_ACTIVE_TOOL_CALLS = 64;
+const MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS = MAX_ACTIVE_TOOL_CALLS;
+const SAFE_TOOL_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+const ACTIVE_TOOL_CALL_KEY = /^[a-f0-9]{64}$/;
 
 type LastPayloadCacheEntry = { mtimeMs: number; size: number; payload: Record<string, unknown> };
 const lastPayloadByStateFile = new Map<string, LastPayloadCacheEntry>();
@@ -61,6 +67,9 @@ export const __sessionStateSidecarPerfCounters = {
 interface RuntimeStateEvent {
 	type: string;
 	messages?: unknown[];
+	toolCallId?: unknown;
+	toolName?: unknown;
+	isError?: unknown;
 }
 
 export interface OwnerTerminalContext {
@@ -369,7 +378,200 @@ export function stateForEvent(event: RuntimeStateEvent): RuntimeState | null {
 }
 
 export function eventAffectsCoordinatorRuntimeState(event: RuntimeStateEvent): boolean {
-	return stateForEvent(event) !== null;
+	return stateForEvent(event) !== null || toolActivityForEvent(event) !== null;
+}
+
+function safeToolName(value: unknown): string {
+	return typeof value === "string" && SAFE_TOOL_NAME.test(value) ? value : "custom";
+}
+
+type ToolActivityEvent =
+	| { phase: "started"; toolCallKey: string; toolName: string }
+	| { phase: "finished"; toolCallKey: string; toolName: string; outcome: "succeeded" | "failed" };
+
+type ActiveToolCall = { tool_name: string; started_at: string };
+type ActiveToolCalls = Record<string, ActiveToolCall>;
+
+function toolActivityForEvent(event: RuntimeStateEvent): ToolActivityEvent | null {
+	if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return null;
+	if (typeof event.toolCallId !== "string") return null;
+	const toolCallKey = createHash("sha256").update(event.toolCallId).digest("hex");
+	if (event.type === "tool_execution_start")
+		return { phase: "started", toolCallKey, toolName: safeToolName(event.toolName) };
+	return {
+		phase: "finished",
+		toolCallKey,
+		toolName: safeToolName(event.toolName),
+		outcome: event.isError === true ? "failed" : "succeeded",
+	};
+}
+
+function runtimeStateFromPrevious(value: unknown): RuntimeState {
+	return value === "ready_for_input" ||
+		value === "running" ||
+		value === "needs_user_input" ||
+		value === "completed" ||
+		value === "errored"
+		? value
+		: "running";
+}
+
+function validActiveToolCall(value: unknown): value is ActiveToolCall {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const entry = value as Record<string, unknown>;
+	return (
+		Object.keys(entry).length === 2 &&
+		Object.hasOwn(entry, "tool_name") &&
+		Object.hasOwn(entry, "started_at") &&
+		typeof entry.tool_name === "string" &&
+		SAFE_TOOL_NAME.test(entry.tool_name) &&
+		typeof entry.started_at === "string" &&
+		Number.isFinite(Date.parse(entry.started_at))
+	);
+}
+
+function validActiveToolCalls(value: unknown): value is ActiveToolCalls {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const entries = Object.entries(value);
+	return (
+		entries.length <= MAX_ACTIVE_TOOL_CALLS &&
+		entries.every(([key, entry]) => ACTIVE_TOOL_CALL_KEY.test(key) && validActiveToolCall(entry))
+	);
+}
+
+function validActiveToolCallsOverflowCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function validActiveToolCallsOverflowDigests(value: unknown): value is string[] {
+	return (
+		Array.isArray(value) &&
+		value.length <= MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS &&
+		new Set(value).size === value.length &&
+		value.every(digest => typeof digest === "string" && ACTIVE_TOOL_CALL_KEY.test(digest))
+	);
+}
+
+function activeToolCallsOverflowCount(previous: Record<string, unknown>): number {
+	return validActiveToolCallsOverflowCount(previous.active_tool_calls_overflow_count)
+		? previous.active_tool_calls_overflow_count
+		: 0;
+}
+
+function activeToolCallsOverflowDigests(previous: Record<string, unknown>): string[] {
+	return validActiveToolCallsOverflowDigests(previous.active_tool_calls_overflow_digests)
+		? [...previous.active_tool_calls_overflow_digests]
+		: [];
+}
+
+function activeToolCallsOverflowCountIsLowerBound(previous: Record<string, unknown>): boolean {
+	return previous.active_tool_calls_overflow_count_is_lower_bound === true;
+}
+
+function validActiveToolCallsOverflowState(payload: Record<string, unknown>): boolean {
+	const hasOverflowCount = Object.hasOwn(payload, "active_tool_calls_overflow_count");
+	const hasOverflowDigests = Object.hasOwn(payload, "active_tool_calls_overflow_digests");
+	const hasLowerBound = Object.hasOwn(payload, "active_tool_calls_overflow_count_is_lower_bound");
+	if (
+		(hasOverflowCount && !validActiveToolCallsOverflowCount(payload.active_tool_calls_overflow_count)) ||
+		(hasOverflowDigests && !validActiveToolCallsOverflowDigests(payload.active_tool_calls_overflow_digests)) ||
+		(hasLowerBound && typeof payload.active_tool_calls_overflow_count_is_lower_bound !== "boolean") ||
+		(hasOverflowDigests && !hasOverflowCount) ||
+		(hasLowerBound && (!hasOverflowCount || !hasOverflowDigests))
+	)
+		return false;
+	const overflowDigests = activeToolCallsOverflowDigests(payload);
+	if (activeToolCallsOverflowCount(payload) !== overflowDigests.length) return false;
+	const activeToolCalls = payload.active_tool_calls;
+	return (
+		!validActiveToolCalls(activeToolCalls) || !overflowDigests.some(digest => Object.hasOwn(activeToolCalls, digest))
+	);
+}
+
+function evictOldestActiveToolCall(activeToolCalls: ActiveToolCalls): string | null {
+	let oldestKey: string | undefined;
+	let oldestStartedAt = Number.POSITIVE_INFINITY;
+	for (const [key, entry] of Object.entries(activeToolCalls)) {
+		const startedAt = Date.parse(entry.started_at);
+		if (startedAt < oldestStartedAt) {
+			oldestKey = key;
+			oldestStartedAt = startedAt;
+		}
+	}
+	if (!oldestKey) return null;
+	delete activeToolCalls[oldestKey];
+	return oldestKey;
+}
+
+function activityFieldsForEvent(
+	previous: Record<string, unknown>,
+	activityEvent: ToolActivityEvent,
+	now: string,
+	nowMs: number,
+): Record<string, unknown> {
+	const activeToolCalls: ActiveToolCalls = validActiveToolCalls(previous.active_tool_calls)
+		? { ...previous.active_tool_calls }
+		: {};
+	const overflowDigests = activeToolCallsOverflowDigests(previous);
+	let overflowCountIsLowerBound = activeToolCallsOverflowCountIsLowerBound(previous);
+	const prior = activeToolCalls[activityEvent.toolCallKey];
+	const overflowDigestIndex = overflowDigests.indexOf(activityEvent.toolCallKey);
+	if (activityEvent.phase === "started") {
+		if (!prior && overflowDigestIndex === -1) {
+			const evictedToolCallKey =
+				Object.keys(activeToolCalls).length >= MAX_ACTIVE_TOOL_CALLS
+					? evictOldestActiveToolCall(activeToolCalls)
+					: null;
+			if (evictedToolCallKey) {
+				if (overflowDigests.length < MAX_ACTIVE_TOOL_CALLS_OVERFLOW_DIGESTS)
+					overflowDigests.push(evictedToolCallKey);
+				else overflowCountIsLowerBound = true;
+			}
+			activeToolCalls[activityEvent.toolCallKey] = { tool_name: activityEvent.toolName, started_at: now };
+		}
+	} else {
+		if (prior) delete activeToolCalls[activityEvent.toolCallKey];
+		else if (overflowDigestIndex !== -1) overflowDigests.splice(overflowDigestIndex, 1);
+	}
+	const previousActivity =
+		previous.activity && typeof previous.activity === "object" && !Array.isArray(previous.activity)
+			? (previous.activity as Record<string, unknown>)
+			: null;
+	const sequence =
+		previousActivity &&
+		typeof previousActivity.sequence === "number" &&
+		Number.isSafeInteger(previousActivity.sequence) &&
+		previousActivity.sequence >= 0
+			? Math.min(Number.MAX_SAFE_INTEGER, previousActivity.sequence + 1)
+			: 1;
+	const activeTools = Object.values(activeToolCalls)
+		.sort((left, right) => Date.parse(left.started_at) - Date.parse(right.started_at))
+		.slice(0, MAX_PUBLIC_ACTIVE_TOOLS);
+	const startedAt = activityEvent.phase === "started" ? now : prior?.started_at;
+	const elapsedMs = startedAt ? Math.max(0, nowMs - Date.parse(startedAt)) : undefined;
+	return {
+		last_activity_at: now,
+		activity: {
+			sequence,
+			kind: "tool_execution",
+			phase: activityEvent.phase,
+			tool_name: activityEvent.toolName,
+			observed_at: now,
+			...(startedAt ? { started_at: startedAt } : {}),
+			...(elapsedMs === undefined ? {} : { elapsed_ms: elapsedMs }),
+			...(activityEvent.phase === "finished" ? { outcome: activityEvent.outcome } : {}),
+			active_tool_count: Math.min(
+				Number.MAX_SAFE_INTEGER,
+				Object.keys(activeToolCalls).length + overflowDigests.length,
+			),
+			...(overflowCountIsLowerBound ? { active_tool_count_is_lower_bound: true } : {}),
+		},
+		active_tools: activeTools,
+		active_tool_calls: activeToolCalls,
+		active_tool_calls_overflow_count: overflowDigests.length,
+		active_tool_calls_overflow_digests: overflowDigests,
+		...(overflowCountIsLowerBound ? { active_tool_calls_overflow_count_is_lower_bound: true } : {}),
+	};
 }
 
 class PreviousRuntimeStateReadError extends Error {
@@ -424,6 +626,11 @@ function validPreviousRuntimeStatePayload(value: unknown): value is Record<strin
 	if (
 		payload.updated_at !== undefined &&
 		(typeof payload.updated_at !== "string" || !Number.isFinite(Date.parse(payload.updated_at)))
+	)
+		return false;
+	if (
+		(Object.hasOwn(payload, "active_tool_calls") && !validActiveToolCalls(payload.active_tool_calls)) ||
+		!validActiveToolCallsOverflowState(payload)
 	)
 		return false;
 	if (payload.ready_for_input !== undefined) {
@@ -584,6 +791,25 @@ function basePayload(input: {
 		workdir: identity.workdir,
 		branch: branchForContext(input.context),
 		session_file: identity.sessionFile,
+		...(typeof input.previous.last_activity_at === "string"
+			? { last_activity_at: input.previous.last_activity_at }
+			: {}),
+		...(input.previous.activity && typeof input.previous.activity === "object"
+			? { activity: input.previous.activity }
+			: {}),
+		...(Array.isArray(input.previous.active_tools) ? { active_tools: input.previous.active_tools } : {}),
+		...(validActiveToolCalls(input.previous.active_tool_calls)
+			? { active_tool_calls: input.previous.active_tool_calls }
+			: {}),
+		...(validActiveToolCallsOverflowCount(input.previous.active_tool_calls_overflow_count)
+			? { active_tool_calls_overflow_count: input.previous.active_tool_calls_overflow_count }
+			: {}),
+		...(validActiveToolCallsOverflowDigests(input.previous.active_tool_calls_overflow_digests)
+			? { active_tool_calls_overflow_digests: input.previous.active_tool_calls_overflow_digests }
+			: {}),
+		...(input.previous.active_tool_calls_overflow_count_is_lower_bound === true
+			? { active_tool_calls_overflow_count_is_lower_bound: true }
+			: {}),
 		...(input.context.ownerTerminal ? { owner_generation: input.context.ownerTerminal.generation } : {}),
 	};
 }
@@ -784,8 +1010,9 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 ): Promise<void> {
 	__sessionStateSidecarPerfCounters.persistFromEventCalls += 1;
 	const stateFile = runtimeStateFileForContext(context);
-	const state = stateForEvent(event);
-	if (!stateFile || !state) return;
+	const eventState = stateForEvent(event);
+	const activityEvent = toolActivityForEvent(event);
+	if (!stateFile || (!eventState && !activityEvent)) return;
 	context = contextWithManagedOwnerGeneration(context);
 	const identity = normalizedIdentity(context);
 	await serializeStateFileWrite(
@@ -799,6 +1026,15 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 						const now = new Date(nowMs).toISOString();
 						const previous = await readPreviousPayloadForEvent(stateFile);
 						assertPreviousRuntimeStateIdentity(previous, identity);
+						const state = eventState ?? runtimeStateFromPrevious(previous.state);
+						const finalResponse = finalResponseForEvent(event);
+						const terminalReceipt =
+							state === "completed" || state === "errored"
+								? reduceTerminalReceiptState({
+										execution: state === "errored" ? "failed" : "completed",
+										reportable: Boolean(finalResponse?.text?.trim()),
+									})
+								: null;
 						const payload = {
 							...basePayload({
 								context,
@@ -810,11 +1046,32 @@ export async function persistCoordinatorRuntimeStateFromEvent(
 								reason: null,
 								sessionId: identity.sessionId,
 							}),
-							...(state === "completed" || state === "errored" ? { ended_at: now } : {}),
-							...(finalResponseForEvent(event) ? { final_response: finalResponseForEvent(event) } : {}),
-							...(state === "errored"
-								? { error: { code: "agent_error", message: "GJC agent reported an error", recoverable: true } }
+							...(terminalReceipt
+								? {
+										execution_state: terminalReceipt.execution,
+										receipt_state: terminalReceipt.receipt,
+										ended_at: now,
+									}
 								: {}),
+							...(activityEvent ? activityFieldsForEvent(previous, activityEvent, now, nowMs) : {}),
+							...(finalResponse ? { final_response: finalResponse } : {}),
+							...(terminalReceipt?.receipt === "missing"
+								? {
+										error: {
+											code: "receipt_missing",
+											message: "Agent completed without reportable final response text or artifact path.",
+											recoverable: true,
+										},
+									}
+								: state === "errored"
+									? {
+											error: {
+												code: "agent_error",
+												message: "GJC agent reported an error",
+												recoverable: true,
+											},
+										}
+									: {}),
 						};
 						if (shouldSkipRuntimeStateWrite(previous, payload, nowMs)) return;
 						await writeStateFile(stateFile, payload);

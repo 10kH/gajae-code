@@ -1,4 +1,17 @@
 export type ControlValue = unknown;
+export type AbortMode = "turn" | "terminal";
+export type AbortScope = "turn" | "owned";
+
+/**
+ * Terminal-mode C04 `turn.abort` input. `scope` selects whether exact causal
+ * owned work (background Bash/task jobs, detached subagents) is also stopped
+ * (`"owned"`) or left running so its completion can resume the root worker
+ * (`"turn"`, the default).
+ */
+export interface TerminalAbortInput {
+	mode: "terminal";
+	scope?: AbortScope;
+}
 export type ControlInput = Record<string, unknown>;
 
 /**
@@ -7,9 +20,11 @@ export type ControlInput = Record<string, unknown>;
  */
 export interface ControlSurface {
 	prompt(text: string, images?: ControlValue, clientRef?: string): Promise<ControlValue> | ControlValue;
-	steer(text: string): Promise<ControlValue> | ControlValue;
+	steer(text: string, clientRef?: string): Promise<ControlValue> | ControlValue;
 	followUp(text: string): Promise<ControlValue> | ControlValue;
 	abort(): Promise<ControlValue> | ControlValue;
+	/** Terminal abort: stop the current root turn (and optionally exact owned work). */
+	abortTerminal?(input: TerminalAbortInput, idempotencyKey?: string): Promise<ControlValue> | ControlValue;
 	abortAndPrompt(text: string): Promise<ControlValue> | ControlValue;
 	answerAsk(id: string, answer: ControlValue): Promise<ControlValue> | ControlValue;
 	answerGate(
@@ -39,7 +54,7 @@ export interface ControlSurface {
 	newSession(): Promise<ControlValue> | ControlValue;
 	forkSession(): Promise<ControlValue> | ControlValue;
 	resumeSession(id: string): Promise<ControlValue> | ControlValue;
-	closeSession(): Promise<ControlValue> | ControlValue;
+	closeSession(capability?: string): Promise<ControlValue> | ControlValue;
 	switchSession(id: string): Promise<ControlValue> | ControlValue;
 	branchSession(entryId: string): Promise<ControlValue> | ControlValue;
 	renameSession(name: string): Promise<ControlValue> | ControlValue;

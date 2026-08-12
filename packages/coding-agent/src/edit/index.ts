@@ -1,5 +1,5 @@
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { $pickenv, prompt } from "@gajae-code/utils";
+import { prompt } from "@gajae-code/utils";
 import type * as z from "zod/v4";
 import {
 	executeHashlineSingle,
@@ -22,7 +22,7 @@ import patchDescription from "../prompts/tools/patch.md" with { type: "text" };
 import replaceDescription from "../prompts/tools/replace.md" with { type: "text" };
 import type { ToolSession } from "../tools";
 import { VimTool, vimSchema } from "../tools/vim";
-import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
+import { type EditMode, resolveEditMode, resolveForcedEnvEditMode } from "../utils/edit-mode";
 import type { VimToolDetails } from "../vim/types";
 import { type ApplyPatchParams, applyPatchSchema, expandApplyPatchToEntries } from "./modes/apply-patch";
 import applyPatchGrammar from "./modes/apply-patch.lark" with { type: "text" };
@@ -131,19 +131,6 @@ type EditModeDefinition = {
 		onUpdate?: (partialResult: AgentToolResult<EditToolResultDetails, TInput>) => void,
 	) => Promise<AgentToolResult<EditToolResultDetails, TInput>>;
 };
-
-function resolveConfiguredEditMode(rawEditMode: string): EditMode | undefined {
-	if (!rawEditMode || rawEditMode === "auto") {
-		return undefined;
-	}
-
-	const editMode = normalizeEditMode(rawEditMode);
-	if (!editMode) {
-		throw new Error(`Invalid PI_EDIT_VARIANT: ${rawEditMode}`);
-	}
-
-	return editMode;
-}
 
 function resolveAllowFuzzy(session: ToolSession, rawValue: string): boolean {
 	switch (rawValue) {
@@ -347,15 +334,15 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #allowFuzzy: boolean;
 	readonly #fuzzyThreshold: number;
 	readonly #writethrough: WritethroughCallback;
-	readonly #editMode?: EditMode;
 	readonly #vimTool: VimTool;
 	readonly #pendingDeferredFetches = new Map<string, AbortController>();
 
 	constructor(private readonly session: ToolSession) {
 		const { PI_EDIT_FUZZY: editFuzzy = "auto", PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto" } = Bun.env;
-		const envEditVariant = $pickenv("GJC_EDIT_VARIANT", "PI_EDIT_VARIANT") ?? "auto";
 
-		this.#editMode = resolveConfiguredEditMode(envEditVariant);
+		// Fail fast on an invalid forced env variant; the shared resolver owns
+		// env precedence at resolution time (no separate cache here).
+		resolveForcedEnvEditMode();
 		this.#allowFuzzy = resolveAllowFuzzy(session, editFuzzy);
 		this.#fuzzyThreshold = resolveFuzzyThreshold(session, editFuzzyThreshold);
 		this.#writethrough = createEditWritethrough(session);
@@ -363,7 +350,6 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get mode(): EditMode {
-		if (this.#editMode) return this.#editMode;
 		return resolveEditMode(this.session);
 	}
 

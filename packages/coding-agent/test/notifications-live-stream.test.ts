@@ -9,7 +9,6 @@ import type { NotificationSessionContext } from "../src/sdk/bus/session-control"
 import { NotificationSessionController } from "../src/sdk/bus/session-control";
 import { type EnsureDaemonResult, TelegramNotificationDaemon } from "../src/sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../src/sdk/bus/telegram-daemon-control";
-import { readEndpoint } from "../src/sdk/bus/telegram-reference";
 import { renderThreadedFrame } from "../src/sdk/bus/threaded-render";
 import {
 	cleanupFixtureRoot,
@@ -19,6 +18,8 @@ import {
 	isolatedNotificationSettings,
 	registerNotificationRuntime,
 } from "./helpers/notification-settings";
+import { readTestSdkEndpoint } from "./helpers/sdk-endpoint";
+import { withTelegramOrchestrationProvenance } from "./helpers/telegram-topic-test";
 
 // ---------------------------------------------------------------------------
 // 1) Pure render contract: streamed turn frames become editable, and live +
@@ -148,11 +149,7 @@ test("abandons a premature endpoint generation before handing out its replacemen
 async function bootSession(
 	settingsOverrides: Record<string, unknown> = {},
 	options: {
-		ensureTelegramDaemon?: (input: {
-			settings: Settings;
-			cwd: string;
-			sessionId: string;
-		}) => Promise<EnsureDaemonResult>;
+		ensureTelegramDaemon?: (input: { settings: Settings }) => Promise<EnsureDaemonResult>;
 	} = {},
 	replacePrematureEndpoint = true,
 ): Promise<{
@@ -190,7 +187,13 @@ async function bootSession(
 		eligible: true,
 		getConfig: () => getNotificationConfig(settings),
 	});
-	createNotificationsExtension(api, { settings, controller, ensureTelegramDaemon: options.ensureTelegramDaemon });
+	withTelegramOrchestrationProvenance(() =>
+		createNotificationsExtension(api, {
+			settings,
+			controller,
+			ensureTelegramDaemon: options.ensureTelegramDaemon ?? (async () => "attached"),
+		}),
+	);
 	const sid = `stream-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 	const ctx = {
 		cwd,
@@ -218,7 +221,7 @@ async function bootSession(
 	await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
 	const endpointFile = path.join(cwd, ".gjc", "state", "sdk", `${sid}.json`);
 	await waitFor(() => fs.existsSync(endpointFile), 4000, "endpoint file");
-	const { url, token } = readEndpoint(endpointFile);
+	const { url, token } = readTestSdkEndpoint(endpointFile);
 
 	const frames: Frame[] = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);

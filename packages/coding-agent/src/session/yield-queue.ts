@@ -4,6 +4,13 @@ import { logger } from "@gajae-code/utils";
 export interface YieldDispatcher<P> {
 	/** Drop entries already delivered through another path. Called per-entry at flush time. */
 	isStale?(entry: P): boolean;
+	/**
+	 * Optional ownership-origin key: when provided, the flush builds ONE
+	 * message per distinct key instead of one message for the whole batch, so
+	 * a later scope:"owned" drop of one origin never suppresses entries of
+	 * another origin (review thread P2).
+	 */
+	groupKey?(entry: P): string;
 	/** Produce one batched AgentMessage from non-stale entries. Return null to skip. */
 	build(survivors: P[]): AgentMessage | null;
 }
@@ -19,6 +26,7 @@ type YieldFlushMode = "streaming" | "idle";
 
 interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
+	groupKey?: (entry: unknown) => string;
 	build: (survivors: unknown[]) => AgentMessage | null;
 }
 
@@ -39,6 +47,7 @@ export class YieldQueue {
 	register<P>(kind: string, dispatcher: YieldDispatcher<P>): () => void {
 		const stored: StoredDispatcher = {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
+			...(dispatcher.groupKey ? { groupKey: entry => dispatcher.groupKey?.(entry as P) ?? "default" } : {}),
 			build: survivors => dispatcher.build(survivors as P[]),
 		};
 		this.#dispatchers.set(kind, stored);
@@ -81,16 +90,17 @@ export class YieldQueue {
 		for (const [kind, dispatcher] of this.#dispatchers) {
 			const entries = this.#drain(kind);
 			if (entries.length === 0) continue;
-			const message = this.#build(kind, dispatcher, entries);
-			if (!message) continue;
-			if (mode === "streaming") {
-				try {
-					this.#options.injectStreaming(message);
-				} catch (error) {
-					logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
+			const messages = this.#build(kind, dispatcher, entries) ?? [];
+			for (const message of messages) {
+				if (mode === "streaming") {
+					try {
+						this.#options.injectStreaming(message);
+					} catch (error) {
+						logger.warn("Yield queue streaming dispatch failed", { kind, error: formatError(error) });
+					}
+				} else {
+					idleMessages.push(message);
 				}
-			} else {
-				idleMessages.push(message);
 			}
 		}
 		if (mode === "idle" && idleMessages.length > 0) {
@@ -149,7 +159,16 @@ export class YieldQueue {
 		return entries;
 	}
 
-	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[]): AgentMessage | null {
+	#build(kind: string, dispatcher: StoredDispatcher, entries: unknown[]): AgentMessage[] | null {
+		// Corrected turn semantics (terminal abort): turn-scope abort blocks only
+		// deliveries whose origin is a continuation of the aborted turn.
+		// Owned-completion deliveries from work deliberately left running are
+		// intentionally allowed to resume the agent through the normal
+		// followUp/prompt path and receive a fresh turn attempt. A closed
+		// terminal record must never make an allowed owned-completion entry
+		// stale merely because it is closed; stale filtering below applies only
+		// to ordinary manager state (e.g. isDeliverySuppressed) or explicit
+		// blocked-continuation/owned-cleanup entries.
 		const survivors: unknown[] = [];
 		for (const entry of entries) {
 			if (dispatcher.isStale) {
@@ -165,11 +184,34 @@ export class YieldQueue {
 			survivors.push(entry);
 		}
 		if (survivors.length === 0) return null;
-		try {
-			return dispatcher.build(survivors);
-		} catch (error) {
-			logger.warn("Yield queue build failed", { kind, error: formatError(error) });
-			return null;
+		// Build one message per ownership-origin group (when the dispatcher
+		// declares a groupKey) so a later owned-scope drop of one group never
+		// suppresses another group's entries. Groups are partitioned into
+		// CONTIGUOUS origin runs (preserving the queued FIFO chronology): with
+		// entries A1, B1, A2, a map grouping every A together would deliver A2
+		// before the earlier B1, changing the observable order of async results
+		// (review thread P2).
+		const groups: unknown[][] = [];
+		let currentGroupKey: string | undefined;
+		for (const entry of survivors) {
+			const key = dispatcher.groupKey ? dispatcher.groupKey(entry) : "default";
+			const last = groups[groups.length - 1];
+			if (last !== undefined && currentGroupKey === key) {
+				last.push(entry);
+			} else {
+				groups.push([entry]);
+				currentGroupKey = key;
+			}
 		}
+		const messages: AgentMessage[] = [];
+		for (const group of groups.values()) {
+			try {
+				const message = dispatcher.build(group);
+				if (message) messages.push(message);
+			} catch (error) {
+				logger.warn("Yield queue build failed", { kind, error: formatError(error) });
+			}
+		}
+		return messages.length > 0 ? messages : null;
 	}
 }

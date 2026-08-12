@@ -1,13 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClient, SdkClientError, type SdkFrame } from "../client";
+import { type SdkClient, SdkClientError } from "../client";
+import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { OPERATIONS } from "../protocol/operation-registry";
+import { type SessionAttachment, type SessionRouter, SessionRouterError } from "../router";
 import { ACP_SESSION_RECONNECT } from "../session-reconnect";
 import type { SessionLifecycleMcpServer } from "./mcp";
 
 type JsonObject = Record<string, unknown>;
+function object(value: unknown): JsonObject | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
+}
 
 /** The small agent-side ACP surface used for reverse requests. */
 export interface AcpReverseConnection {
@@ -21,9 +26,11 @@ export interface AcpProviderRegistration {
 }
 
 export interface AcpSdkAdapterOptions {
-	url: string;
-	token: string;
+	/** Broker lifecycle transport only. Live session work requires `router` plus an opaque attachment. */
 	client?: SdkClient;
+	router?: SessionRouter;
+	attachment?: SessionAttachment;
+	sessionId?: string;
 	connection?: AcpReverseConnection;
 	providers?: AcpProviderRegistration[];
 	/** Lease IDs persisted by the ACP host across a WebSocket reconnect. */
@@ -39,6 +46,17 @@ export class AcpSdkAdapterError extends Error {
 		this.name = "AcpSdkAdapterError";
 		this.code = code;
 	}
+}
+
+function credentialFreeLifecycleResult(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(credentialFreeLifecycleResult);
+	if (value === null || typeof value !== "object") return value;
+	const output: Record<string, unknown> = {};
+	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+		if (key === "endpoint" || key === "token" || key === "url") continue;
+		output[key] = credentialFreeLifecycleResult(nested);
+	}
+	return output;
 }
 
 /**
@@ -76,7 +94,8 @@ export function acpMcpLaunchFailure(error: unknown, mcpServers: SessionLifecycle
 }
 
 export type AcpReconnectFailedHandler = (error: SdkClientError) => void;
-export type AcpFrameHandler = (frame: SdkFrame) => void;
+export type AcpFrameHandler = (frame: Record<string, unknown>) => void;
+
 type ReverseRequest = {
 	state: "pending" | "cancelled";
 	controller?: AbortController;
@@ -109,7 +128,10 @@ function isLifecycleOperation(operation: string): boolean {
  * ACP bridge: all session work is performed through authenticated v3 frames.
  */
 export class AcpSdkAdapter {
-	readonly #client: SdkClient;
+	readonly #client?: SdkClient;
+	readonly #router?: SessionRouter;
+	#attachment?: SessionAttachment;
+	readonly #sessionId?: string;
 	readonly #connection?: AcpReverseConnection;
 	readonly #providers: AcpProviderRegistration[];
 	readonly #heartbeatMs: number;
@@ -118,17 +140,33 @@ export class AcpSdkAdapter {
 	#unsubscribeReconnectFailed?: () => void;
 	#heartbeat?: NodeJS.Timeout;
 	#connectionId?: string;
+	/** Router transport identity captured before reverse provider activation. */
+	#routerConnectionReady = false;
+
 	#leases = new Map<string, string>();
 	#reclaiming?: Promise<void>;
+	#providerActivation?: Promise<void>;
+	#providersActivated = false;
 	#reverseRequests = new Map<string, ReverseRequest>();
 	#reconnectFailedHandlers = new Set<AcpReconnectFailedHandler>();
 	#frameHandlers = new Set<AcpFrameHandler>();
 
 	#reverseCancelTtlMs: number;
 	#closed = false;
-
+	#started = false;
 	constructor(options: AcpSdkAdapterOptions) {
-		this.#client = options.client ?? new SdkClient(options.url, options.token, { ...ACP_SESSION_RECONNECT });
+		if ((options.client === undefined) === (options.router === undefined))
+			throw new AcpSdkAdapterError(
+				"invalid_input",
+				"ACP adapter requires exactly one Broker client or SessionRouter.",
+			);
+		const sessionId = options.sessionId ?? options.attachment?.sessionId;
+		if (options.router && (!options.attachment || !sessionId || options.attachment.sessionId !== sessionId))
+			throw new AcpSdkAdapterError("invalid_input", "ACP session adapters require an exact SessionAttachment.");
+		this.#client = options.client;
+		this.#router = options.router;
+		this.#attachment = options.attachment;
+		this.#sessionId = sessionId;
 		this.#connection = options.connection;
 		this.#providers = options.providers ?? [];
 		for (const [capability, leaseId] of Object.entries(options.expectedLeaseIds ?? {}))
@@ -138,13 +176,46 @@ export class AcpSdkAdapter {
 	}
 
 	static async connect(options: AcpSdkAdapterOptions): Promise<AcpSdkAdapter> {
-		const client =
-			options.client ?? (await SdkClient.connect(options.url, options.token, { ...ACP_SESSION_RECONNECT }));
-		const adapter = new AcpSdkAdapter({ ...options, client });
+		const adapter = new AcpSdkAdapter(options);
 		await adapter.start();
 		return adapter;
 	}
 
+	acceptAttachment(attachment: SessionAttachment): void {
+		if (!this.#router || attachment.sessionId !== this.#sessionId)
+			throw new AcpSdkAdapterError("invalid_input", "ACP attachment does not match this session adapter.");
+		this.#abortActiveReverseRequests();
+		this.#attachment = attachment;
+		this.#connectionId = undefined;
+		this.#routerConnectionReady = false;
+		this.#providersActivated = false;
+		if (attachment.isCurrent()) void this.#activateProviders().catch(error => this.#reportReconnectFailure(error));
+	}
+
+	revokeAttachment(attachment: SessionAttachment): void {
+		if (this.#attachment !== attachment) return;
+		this.#abortActiveReverseRequests();
+		this.#attachment = undefined;
+		this.#connectionId = undefined;
+		this.#routerConnectionReady = false;
+		this.#providersActivated = false;
+	}
+
+	async attachmentReady(attachment: SessionAttachment): Promise<void> {
+		if (this.#attachment !== attachment) this.acceptAttachment(attachment);
+		else {
+			this.#abortActiveReverseRequests();
+			this.#connectionId = undefined;
+			this.#routerConnectionReady = false;
+			this.#providersActivated = false;
+		}
+		if (!attachment.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		await this.#activateProviders();
+	}
+
+	acceptFrame(frame: Record<string, unknown>): void {
+		void this.#onFrame(frame);
+	}
 	get leaseIds(): ReadonlyMap<string, string> {
 		return this.#leases;
 	}
@@ -164,15 +235,26 @@ export class AcpSdkAdapter {
 
 	async start(): Promise<void> {
 		if (this.#closed) throw new AcpSdkAdapterError("connection_closed");
-		this.#unsubscribe ??= this.#client.onFrame(frame => void this.#onFrame(frame));
-		this.#unsubscribeReconnect ??= this.#client.onReconnect(
-			() => void this.#reclaimProviders().catch(error => this.#reportReconnectFailure(error)),
-		);
-		this.#unsubscribeReconnectFailed ??= this.#client.onReconnectFailed(error => this.#reportReconnectFailure(error));
-		await this.#client.connect();
-		this.#connectionId = this.#client.connectionId;
-		if (this.#providers.length > 0 && !this.#connectionId) this.#connectionId = await this.#waitForConnectionId();
-		for (const provider of this.#providers) await this.registerProvider(provider);
+		if (!this.#started) {
+			this.#started = true;
+			if (this.#client) {
+				this.#unsubscribe ??= this.#client.onFrame(frame => void this.#onFrame(frame));
+				this.#unsubscribeReconnect ??= this.#client.onReconnect(
+					() => void this.#reclaimProviders().catch(error => this.#reportReconnectFailure(error)),
+				);
+				this.#unsubscribeReconnectFailed ??= this.#client.onReconnectFailed(error =>
+					this.#reportReconnectFailure(error),
+				);
+				await this.#client.connect();
+				this.#connectionId = this.#client.connectionId;
+			}
+		}
+		if (this.#router) {
+			if (!this.#attachment?.isCurrent()) return;
+			await this.#activateProviders();
+		} else {
+			await this.#activateProviders();
+		}
 		this.#heartbeat ??= setInterval(
 			() => void this.#heartbeatLeases().catch(error => this.#reportReconnectFailure(error)),
 			this.#heartbeatMs,
@@ -191,48 +273,123 @@ export class AcpSdkAdapter {
 		this.#unsubscribe?.();
 		this.#unsubscribeReconnect?.();
 		this.#unsubscribeReconnectFailed?.();
-		await this.#client.close();
+		if (this.#client) await this.#client.close();
 	}
 
 	async prompt(params: JsonObject | string): Promise<unknown> {
 		const text = typeof params === "string" ? params : String(params.prompt ?? params.text ?? "");
-		return await this.#client.control("turn.prompt", { ...(typeof params === "object" ? params : {}), text });
+		return await this.#requestSession({
+			type: "control_request",
+			operation: "turn.prompt",
+			input: { ...(typeof params === "object" ? params : {}), text },
+		});
 	}
-	async cancel(): Promise<unknown> {
-		return await this.#client.control("turn.abort", {});
+	/**
+	 * Ends the active turn with a C04 terminal abort. The default `scope:"owned"`
+	 * also stops exact causal owned work (background Bash/task jobs, detached
+	 * subagents) so an external client that cancels a turn terminates everything
+	 * that turn spawned; `scope:"turn"` leaves owned work running so its
+	 * completion can resume the root worker. A fresh bounded idempotency key per
+	 * call keeps terminal-abort replay deterministic across retries.
+	 */
+	async cancel(scope: AbortScope = "owned"): Promise<unknown> {
+		return await this.control("turn.abort", { mode: "terminal", scope, idempotencyKey: randomUUID() });
 	}
 	async setModel(params: JsonObject | string): Promise<unknown> {
 		const id = typeof params === "string" ? params : String(params.modelId ?? params.id ?? "");
-		return await this.#client.control("model.set", { id });
+		return await this.#requestSession({ type: "control_request", operation: "model.set", input: { id } });
 	}
 
 	async control(operation: string, input: JsonObject = {}): Promise<unknown> {
 		this.#assertGenericDisposition("control", operation);
-		const { confirm, ...payload } = input;
+		// `confirm` and `idempotencyKey` are envelope concerns, not control input:
+		// extract them so the payload passes the control validator and the bounded
+		// key reaches the control envelope — terminal abort requires it, and
+		// without it every {mode:"terminal"} control is rejected (review
+		// thread P1).
+		const { confirm, idempotencyKey, ...payload } = input;
 		const secretError = validateAdapterSecretFields(operation, payload);
 		if (secretError) throw new AcpSdkAdapterError(secretError.code, secretError.message);
 
 		const invalid = validateAdapterControl(operation, payload);
 		if (invalid) throw new AcpSdkAdapterError(invalid.code, invalid.message);
-		return await this.#client.control(operation, payload, { confirm: confirm === true });
+		return await this.#requestSession({
+			type: "control_request",
+			operation,
+			input: payload,
+			...(confirm === undefined ? {} : { confirm: confirm === true }),
+			...(typeof idempotencyKey === "string" && idempotencyKey ? { idempotencyKey } : {}),
+		});
 	}
 	async query(query: string, input: JsonObject = {}, cursor?: string): Promise<unknown> {
-		return await this.#client.query(query, input, cursor);
+		return await this.#requestSession({
+			type: "query_request",
+			query,
+			input,
+			...(cursor === undefined ? {} : { cursor }),
+		});
+	}
+
+	#unwrapSessionResponse(response: unknown): unknown {
+		const envelope = object(response);
+		if (envelope?.ok === false) {
+			const error = object(envelope.error);
+			throw new AcpSdkAdapterError(
+				typeof error?.code === "string" ? error.code : "request_failed",
+				typeof error?.message === "string" ? error.message : "SDK session request failed.",
+			);
+		}
+		return envelope?.result ?? response;
+	}
+
+	async #requestSession(frame: JsonObject, raw = false): Promise<unknown> {
+		const router = this.#router;
+		if (!router)
+			throw new AcpSdkAdapterError(
+				"operation_prohibited",
+				"Live session controls and queries require the current Router attachment.",
+			);
+		const attachment = this.#attachment;
+		const sessionId = this.#sessionId;
+		if (!attachment || !sessionId || !attachment.isCurrent())
+			throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		const response = await router.request(
+			sessionId,
+			{ ...frame, id: randomUUID() },
+			attachment.generation,
+			attachment,
+		);
+		if (!attachment.isCurrent())
+			throw new SessionRouterError("ambiguous", "SDK session attachment changed while awaiting command response.");
+		return raw ? response : this.#unwrapSessionResponse(response);
 	}
 	async global(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
+		const result = await this.#lifecycleRequest(operation, input, idempotencyKey);
+		return isLifecycleOperation(operation) ? credentialFreeLifecycleResult(result) : result;
+	}
+	/** Uses lifecycle endpoint credentials only inside the ACP session owner. */
+	async lifecycle(operation: string, input: JsonObject = {}, idempotencyKey?: string): Promise<unknown> {
+		if (!isLifecycleOperation(operation))
+			throw new AcpSdkAdapterError("invalid_input", "ACP lifecycle requests must use a lifecycle operation.");
+		return await this.#lifecycleRequest(operation, input, idempotencyKey);
+	}
+	async #lifecycleRequest(operation: string, input: JsonObject, idempotencyKey?: string): Promise<unknown> {
 		this.#assertGenericDisposition("global", operation);
 		if (isLifecycleOperation(operation) && !idempotencyKey)
 			throw new AcpSdkAdapterError("invalid_input", "idempotencyKey is required for lifecycle operations.");
+		if (!this.#client)
+			throw new AcpSdkAdapterError("operation_prohibited", "Lifecycle operations require the Broker connection.");
 		// The broker may hold a startup in its admission queue before the readiness
 		// clock even starts, so the caller deadline covers the queue wait too; sizing
 		// it on readiness alone times out requests the broker is still running. A
 		// request that named no readiness budget is queued for the default one, so it
 		// needs the same extension rather than the client's generic request deadline.
 		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-		return await this.#client.global(operation, input, {
+		const response = await this.#client.global(operation, input, {
 			idempotencyKey,
 			...(timeoutMs === undefined ? {} : { timeoutMs }),
 		});
+		return response;
 	}
 
 	async sdkControl(params: { operation: string; input?: JsonObject }): Promise<unknown> {
@@ -272,19 +429,62 @@ export class AcpSdkAdapter {
 	}
 
 	async registerProvider(provider: AcpProviderRegistration): Promise<void> {
-		const connectionId = this.#connectionId ?? (await this.#waitForConnectionId());
+		if (!this.#router)
+			throw new AcpSdkAdapterError(
+				"operation_prohibited",
+				"Provider registration requires the current Router attachment.",
+			);
+		const attachment = this.#attachment;
+		if (!attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		this.#captureRouterConnection(attachment);
 		const previousLeaseId = this.#leases.get(provider.capability);
-		const result = await this.#client.request({
-			type: "register_provider",
-			connectionId,
-			capability: provider.capability,
-			definitions: provider.definitions,
-			idempotencyKey: randomUUID(),
-			...(previousLeaseId ? { expectedLeaseId: previousLeaseId } : {}),
-		});
+		const response = await this.#requestSession(
+			{
+				type: "register_provider",
+				capability: provider.capability,
+				definitions: provider.definitions,
+				idempotencyKey: randomUUID(),
+				...(previousLeaseId ? { expectedLeaseId: previousLeaseId } : {}),
+			},
+			true,
+		);
+		const result = object(object(response)?.result) ?? object(response) ?? {};
 		if (typeof result.leaseId !== "string")
 			throw new AcpSdkAdapterError("invalid_reverse_frame", "Provider registration omitted leaseId.");
 		this.#leases.set(provider.capability, result.leaseId);
+	}
+
+	async #activateProviders(): Promise<void> {
+		if (this.#providersActivated || this.#providers.length === 0) return;
+		if (this.#providerActivation) return await this.#providerActivation;
+		const activation = (async () => {
+			for (;;) {
+				const attachment = this.#attachment;
+				const connectionId = attachment?.connectionId;
+				try {
+					for (const provider of this.#providers) await this.registerProvider(provider);
+					if (this.#router && (attachment !== this.#attachment || attachment?.connectionId !== connectionId)) {
+						this.#abortActiveReverseRequests();
+						this.#providersActivated = false;
+						continue;
+					}
+					this.#providersActivated = true;
+					return;
+				} catch (error) {
+					if (this.#router && attachment !== this.#attachment && !this.#closed) {
+						this.#providersActivated = false;
+						continue;
+					}
+					throw error;
+				}
+			}
+		})();
+		this.#providerActivation = activation;
+		try {
+			await activation;
+		} finally {
+			if (this.#providerActivation === activation) this.#providerActivation = undefined;
+		}
 	}
 
 	#assertGenericDisposition(kind: "control" | "global", sdkId: string): void {
@@ -310,14 +510,35 @@ export class AcpSdkAdapter {
 		if (this.#reclaiming) return await this.#reclaiming;
 		this.#reclaiming = (async () => {
 			this.#abortActiveReverseRequests();
-			this.#connectionId = this.#client.connectionId;
-			if (!this.#connectionId) this.#connectionId = await this.#waitForConnectionId();
-			for (const provider of this.#providers) await this.registerProvider(provider);
+			if (!this.#router)
+				throw new AcpSdkAdapterError(
+					"operation_prohibited",
+					"Provider reactivation requires the current Router attachment.",
+				);
+			this.#providersActivated = false;
+			await this.#activateProviders();
 		})();
 		try {
 			await this.#reclaiming;
 		} finally {
 			this.#reclaiming = undefined;
+		}
+	}
+
+	#captureRouterConnection(attachment: SessionAttachment): void {
+		const connectionId = attachment.connectionId;
+		if (typeof connectionId !== "string" || connectionId.length === 0) {
+			this.#connectionId = undefined;
+			this.#routerConnectionReady = false;
+			this.#providersActivated = false;
+			return;
+		}
+		const changed = this.#connectionId !== undefined && this.#connectionId !== connectionId;
+		this.#connectionId = connectionId;
+		this.#routerConnectionReady = true;
+		if (changed) {
+			this.#providersActivated = false;
+			this.#abortActiveReverseRequests();
 		}
 	}
 
@@ -333,40 +554,32 @@ export class AcpSdkAdapter {
 		for (const handler of this.#reconnectFailedHandlers) handler(typed);
 	}
 
-	async #waitForConnectionId(): Promise<string> {
-		if (this.#connectionId) return this.#connectionId;
-		return await new Promise<string>((resolve, reject) => {
-			const timeout = setTimeout(
-				() => reject(new AcpSdkAdapterError("unavailable", "SDK server did not provide a connection id.")),
-				10_000,
+	async #sendSession(frame: Record<string, unknown>): Promise<void> {
+		if (!this.#router)
+			throw new AcpSdkAdapterError(
+				"operation_prohibited",
+				"Live session sends require the current Router attachment.",
 			);
-			const unsubscribe = this.#client.onFrame(frame => {
-				if ((frame.type === "hello" || frame.type === "server_hello") && typeof frame.connectionId === "string") {
-					clearTimeout(timeout);
-					unsubscribe();
-					this.#connectionId = frame.connectionId;
-					resolve(frame.connectionId);
-				}
-			});
-		});
+		const attachment = this.#attachment;
+		if (!attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		await Promise.resolve(attachment.send(frame));
 	}
 
 	async #heartbeatLeases(): Promise<void> {
 		if (this.#closed) return;
 		try {
-			await this.#client.awaitHello();
-			this.#connectionId ??= this.#client.connectionId;
-			if (!this.#connectionId) return;
-			for (const leaseId of this.#leases.values())
-				this.#client.send({ type: "provider_heartbeat", connectionId: this.#connectionId, leaseId });
+			if (!this.#router) return;
+			if (!this.#attachment?.isCurrent()) throw new SessionRouterError("pre_send");
+			for (const leaseId of this.#leases.values()) await this.#sendSession({ type: "provider_heartbeat", leaseId });
 		} catch (error) {
 			this.#reportReconnectFailure(error);
 		}
 	}
 
-	async #onFrame(frame: SdkFrame): Promise<void> {
+	async #onFrame(frame: Record<string, unknown>): Promise<void> {
 		for (const handler of this.#frameHandlers) handler(frame);
 		if ((frame.type === "hello" || frame.type === "server_hello") && typeof frame.connectionId === "string") {
+			if (this.#router) return;
 			const changed = this.#connectionId !== undefined && this.#connectionId !== frame.connectionId;
 			this.#connectionId = frame.connectionId;
 			if (changed) void this.#reclaimProviders().catch(error => this.#reportReconnectFailure(error));
@@ -382,20 +595,24 @@ export class AcpSdkAdapter {
 			return;
 		}
 
-		if (frame.type !== "reverse_request") return;
+		if (frame.type !== "reverse_request" || !this.#router) return;
 		const id = typeof frame.id === "string" ? frame.id : "";
 		const connectionId = typeof frame.connectionId === "string" ? frame.connectionId : "";
 		const capability = typeof frame.capability === "string" ? frame.capability : "";
 		const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : "";
-		if (
-			!id ||
-			!connectionId ||
-			!capability ||
-			!leaseId ||
-			this.#reverseRequests.has(id) ||
-			!this.#ownsReverseLease(connectionId, capability, leaseId)
-		)
+		if (!id || !connectionId || !capability || !leaseId || this.#reverseRequests.has(id)) return;
+		if (this.#connectionId === undefined) {
+			this.#connectionId = connectionId;
+			this.#routerConnectionReady = true;
+		} else if (this.#connectionId !== connectionId) {
+			this.#connectionId = connectionId;
+			this.#routerConnectionReady = true;
+			this.#providersActivated = false;
+			this.#abortActiveReverseRequests();
+			void this.#reclaimProviders().catch(error => this.#reportReconnectFailure(error));
 			return;
+		}
+		if (!this.#ownsReverseLease(connectionId, capability, leaseId)) return;
 		const controller = new AbortController();
 		const active: ReverseRequest = { state: "pending", controller };
 		this.#reverseRequests.set(id, active);
@@ -408,7 +625,7 @@ export class AcpSdkAdapter {
 
 			const response = { type: "reverse_response", id, connectionId, leaseId, ok: true, result };
 			assertReverseResponseFrame(response);
-			this.#client.send(response);
+			await this.#sendSession(response);
 		} catch (error) {
 			if (!this.#canRespondToReverse(id, active, connectionId, capability, leaseId)) return;
 
@@ -421,21 +638,31 @@ export class AcpSdkAdapter {
 								"acp_reverse_failed",
 								error instanceof Error ? error.message : "ACP reverse request failed.",
 							);
-			this.#client.send({
-				type: "reverse_response",
-				id,
-				connectionId,
-				leaseId,
-				ok: false,
-				error: { code: typed.code, message: typed.message },
-			});
+			try {
+				await this.#sendSession({
+					type: "reverse_response",
+					id,
+					connectionId,
+					leaseId,
+					ok: false,
+					error: { code: typed.code, message: typed.message },
+				});
+			} catch (sendError) {
+				this.#reportReconnectFailure(sendError);
+			}
 		} finally {
 			this.#finishReverse(id, active);
 		}
 	}
 
 	#ownsReverseLease(connectionId: string, capability: string, leaseId: string): boolean {
-		return this.#connectionId === connectionId && this.#leases.get(capability) === leaseId;
+		return (
+			this.#router !== undefined &&
+			this.#routerConnectionReady &&
+			this.#providersActivated &&
+			this.#connectionId === connectionId &&
+			this.#leases.get(capability) === leaseId
+		);
 	}
 
 	#canRespondToReverse(

@@ -2,16 +2,23 @@
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-11
+
 ### Fixed
 
+- `Shell` now exposes `close()`, which aborts in-flight commands and drops the retained session. `abort()` only cancels running commands, so a shell whose command completed kept its session — and its native resources — alive for the rest of the host process. Holding 200 completed one-shot shells retained 14.1 MB with `abort()` versus 6.8 MB with `close()`.
 - Code summarization now runs on the native blocking-work pool and returns a promise, keeping the JavaScript render and input loop responsive while tree-sitter parses source.
 - The macOS computer batch controller is now warning-free under the workspace's strict Clippy configuration, with infallible result construction represented directly instead of wrapped in redundant `Result` values.
 - macOS Terminal.app Meta-wrapped escape sequences such as Option+Arrow are now recognized by the native key matcher and parser.
+- POSIX checked file publication now retains an open source descriptor across no-replace rename/link validation, pins exact replacements behind a verified private source link, and can retire one explicitly authorized staging hard-link name without touching the remaining published alias.
+
+### Removed
+
+- Removed the obsolete `NotificationControlServer` N-API surface. Session lifecycle mutations now enter the coding-agent SDK Broker path instead of a provider-owned native control endpoint.
 
 ## [0.12.21] - 2026-08-09
 
 ## [0.12.20] - 2026-08-09
-
 ## [0.12.19] - 2026-08-08
 
 ## [0.12.18] - 2026-08-08

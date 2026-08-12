@@ -7,10 +7,16 @@ import { PassThrough, Writable } from "node:stream";
 import { CliParseError, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { ServerWebSocket } from "bun";
 import Sdk, { parseSdkInternalArgv } from "../src/commands/sdk.js";
+import { SdkClientError } from "../src/sdk/client/client.js";
 import { listSdkSessionEndpoints } from "../src/sdk/client/discovery.js";
 import { classifyEndpoint, selectLiveEndpoint } from "../src/sdk/client/liveness.js";
 import { type RelayWebSocket, startRelayPair, type TransportError } from "../src/sdk/transport/relay.js";
-import { resolveServePendingCeiling, runSdkServe } from "../src/sdk/transport/serve-cli.js";
+import {
+	listBrokerSessions,
+	resolveServePendingCeiling,
+	runSdkServe,
+	selectBrokerSession,
+} from "../src/sdk/transport/serve-cli.js";
 import { startSocketServe } from "../src/sdk/transport/socket.js";
 
 const token = "test-token";
@@ -154,23 +160,41 @@ async function withStalledWebSocket<T>(run: () => Promise<T>): Promise<T> {
 	}
 }
 
-async function relayFixture(pendingCeilingBytes = 256 * 1024) {
-	const fake = upstream();
-	const input = new PassThrough();
-	const output = new PassThrough();
-	const received: Buffer[] = [];
-	output.on("data", chunk => received.push(Buffer.from(chunk)));
-	const errors: TransportError[] = [];
-	const pair = await startRelayPair({
-		url: fake.url,
-		token,
-		pendingCeilingBytes,
-		downstream: input,
-		downstreamSink: output,
-		onTransportError: error => errors.push(error),
-	});
-	await waitFor(() => fake.connections[0], "upstream connection");
-	return { fake, input, output, received, errors, pair };
+async function relayFixture(pendingCeilingBytes = 256 * 1024, validateDownstreamFrame?: (frame: string) => boolean) {
+	// Under heavy parallel suite load the first localhost WebSocket open can fail
+	// before the fake upstream accepts. Retry only that pre-acceptance failure.
+	let retryCount = 0;
+	for (;;) {
+		const fake = upstream();
+		const input = new PassThrough();
+		const output = new PassThrough();
+		const received: Buffer[] = [];
+		output.on("data", chunk => received.push(Buffer.from(chunk)));
+		const errors: TransportError[] = [];
+		try {
+			const pair = await startRelayPair({
+				url: fake.url,
+				token,
+				pendingCeilingBytes,
+				downstream: input,
+				downstreamSink: output,
+				onTransportError: error => errors.push(error),
+				validateDownstreamFrame,
+			});
+			await waitFor(() => fake.connections[0], "upstream connection");
+			expect(retryCount).toBeLessThanOrEqual(1);
+			return { fake, input, output, received, errors, pair };
+		} catch (error) {
+			const retryable =
+				retryCount === 0 &&
+				fake.connections.length === 0 &&
+				error instanceof Error &&
+				error.message === "upstream_error";
+			fake.stop();
+			if (!retryable) throw error;
+			retryCount++;
+		}
+	}
 }
 
 describe("SDK serve raw relay", () => {
@@ -186,6 +210,24 @@ describe("SDK serve raw relay", () => {
 			expect((await waitFor(() => fixture.received[0], "websocket downstream frame")).toString()).toBe(
 				`${response}\n`,
 			);
+		} finally {
+			await fixture.pair.close();
+			fixture.fake.stop();
+		}
+	});
+
+	test("rejects a downstream frame refused by the injected relay validator", async () => {
+		const fixture = await relayFixture(256 * 1024, source => {
+			const frame = JSON.parse(source) as { forgedAuthorityField?: unknown };
+			return frame.forgedAuthorityField === undefined;
+		});
+		try {
+			fixture.input.write(`${JSON.stringify({ type: "control_request", forgedAuthorityField: "forged" })}\n`);
+			expect(await waitFor(() => fixture.errors[0], "forged claim rejection")).toMatchObject({
+				code: "protocol_error",
+				direction: "downstream->ws",
+			});
+			expect(fixture.fake.connections[0]?.messages).toEqual([]);
 		} finally {
 			await fixture.pair.close();
 			fixture.fake.stop();
@@ -446,7 +488,7 @@ describe("SDK socket serve", () => {
 });
 
 describe("SDK serve CLI and discovery", () => {
-	test("keeps private argv exact and public help private", () => {
+	test("advertises public SDK families without leaking internal actions", () => {
 		expect(parseSdkInternalArgv(["broker-internal", "--agent-dir", "/tmp/a"])).toEqual({
 			action: "broker-internal",
 			agentDir: "/tmp/a",
@@ -467,6 +509,8 @@ describe("SDK serve CLI and discovery", () => {
 		const help = output.join("\n");
 		expect(help).toContain("serve");
 		expect(help).toContain("--socket");
+		expect(help).toContain("session");
+		expect(help).toContain("guides");
 		expect(help).not.toContain("broker-internal");
 		expect(help).not.toContain("session-host-internal");
 		expect(help).not.toContain("--agent-dir");
@@ -525,5 +569,94 @@ describe("SDK serve CLI and discovery", () => {
 			await fixture.pair.close();
 			fixture.fake.stop();
 		}
+	});
+	test("serve targets a live session beyond the first 100-session page", async () => {
+		// The broker's session.list page limit is 100; the live target is the
+		// 150th row, so only an exhausted paginated snapshot can select it.
+		const sessions = Array.from({ length: 150 }, (_, index) => ({
+			sessionId: `sess-${index + 1}`,
+			live: index === 149,
+			ambiguous: false,
+		}));
+		const broker = {
+			global: async (operation: string, input: Record<string, unknown>) => {
+				if (operation !== "session.list") return { ok: false, error: { code: "unknown_operation" } };
+				if (input.cursor === "page-2")
+					return { ok: true, result: { indexSeq: 1, sessions: sessions.slice(100), warnings: [] } };
+				return {
+					ok: true,
+					result: {
+						indexSeq: 1,
+						sessions: sessions.slice(0, 100),
+						warnings: [],
+						continuationCursor: "page-2",
+					},
+				};
+			},
+			close: async () => {},
+		} as never;
+		const rows = await listBrokerSessions(broker);
+		expect(rows).toHaveLength(150);
+		// Explicit targeting resolves the row only the second page carries.
+		expect(selectBrokerSession(rows, "sess-150")).toBe("sess-150");
+		// Auto-selection also observes beyond-page liveness.
+		expect(selectBrokerSession(rows, undefined)).toBe("sess-150");
+		// First-page rows are still governed by the same broker truth.
+		expect(() => selectBrokerSession(rows, "sess-1")).toThrow(/endpoint_stale/);
+	});
+
+	test("rejects malformed broker session.list pages instead of treating them as empty", async () => {
+		const broker = {
+			global: async () => ({ ok: true, result: { sessions: "not-an-array" } }),
+		} as never;
+
+		await expect(listBrokerSessions(broker)).rejects.toBeInstanceOf(SdkClientError);
+		await expect(
+			listBrokerSessions({ global: async () => ({ ok: true, result: { sessions: "not-an-array" } }) } as never),
+		).rejects.toMatchObject({ code: "protocol_error", message: "session.list returned a malformed page." });
+	});
+
+	test("rejects malformed broker session.list continuation cursors", async () => {
+		await expect(
+			listBrokerSessions({
+				global: async () => ({ ok: true, result: { sessions: [], continuationCursor: "" } }),
+			} as never),
+		).rejects.toMatchObject({ code: "protocol_error", message: "session.list returned a malformed page." });
+	});
+
+	test("rejects repeated broker session.list cursors without returning partial rows", async () => {
+		let calls = 0;
+		const broker = {
+			global: async () => {
+				calls++;
+				return { ok: true, result: { sessions: [{ sessionId: `page-${calls}` }], continuationCursor: "repeat" } };
+			},
+		} as never;
+
+		await expect(listBrokerSessions(broker)).rejects.toMatchObject({
+			code: "protocol_error",
+			message: "session.list returned a repeated continuation cursor.",
+		});
+		expect(calls).toBe(2);
+	});
+
+	test("preserves an explicit continuation error from the broker", async () => {
+		let calls = 0;
+		const broker = {
+			global: async () => {
+				calls++;
+				return calls === 1
+					? { ok: true, result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-two" } }
+					: { ok: false, error: { code: "continuation_failed", message: "page two failed" } };
+			},
+		} as never;
+
+		await expect(listBrokerSessions(broker)).rejects.toMatchObject({
+			name: "SdkClientError",
+			code: "continuation_failed",
+			message: "page two failed",
+			details: { code: "continuation_failed", message: "page two failed" },
+		});
+		expect(calls).toBe(2);
 	});
 });
