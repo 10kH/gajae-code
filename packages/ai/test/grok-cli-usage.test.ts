@@ -245,7 +245,7 @@ describe("Grok CLI usage provider", () => {
 					if (!String(url).endsWith("?format=credits")) {
 						return Response.json({
 							config: {
-								monthlyLimit: { val: 10_000 },
+								monthlyLimit: { val: 0 },
 								used: { val: 1_000 },
 								billingPeriodEnd: "2026-09-01T00:00:00.000Z",
 							},
@@ -258,6 +258,35 @@ describe("Grok CLI usage provider", () => {
 		);
 
 		await expect(reportPromise).rejects.toBe(abortError);
+	});
+
+	it("preserves a valid monthly report when the optional weekly request is aborted", async () => {
+		const controller = new AbortController();
+		const report = await grokCliUsageProvider.fetchUsage(
+			{
+				provider: "grok-build",
+				credential: { type: "oauth", accessToken: "token", expiresAt: Date.now() + 60_000 },
+				signal: controller.signal,
+			},
+			{
+				fetch: (async url => {
+					if (!String(url).endsWith("?format=credits")) {
+						return Response.json({
+							config: {
+								monthlyLimit: { val: 10_000 },
+								used: { val: 1_000 },
+								billingPeriodEnd: "2026-09-01T00:00:00.000Z",
+							},
+						});
+					}
+					controller.abort();
+					throw new DOMException("timed out", "AbortError");
+				}) as typeof fetch,
+			},
+		);
+
+		expect(report?.limits.map(limit => limit.id)).toEqual(["grok-build:7d"]);
+		expect(report?.limits[0]?.amount.usedFraction).toBe(0.1);
 	});
 
 	it("does not send OAuth credentials to unsafe billing host overrides", async () => {

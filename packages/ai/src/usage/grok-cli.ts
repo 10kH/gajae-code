@@ -216,7 +216,7 @@ export const grokCliUsageProvider: UsageProvider = {
 				weekly = parseGrokCliWeeklyBillingUsage((await weeklyResponse.json()) as unknown);
 			}
 		} catch (error) {
-			if (params.signal?.aborted) throw error;
+			if (params.signal?.aborted && billing.monthlyLimit <= 0) throw error;
 			ctx.logger?.debug("Grok Build weekly billing request failed", { error: String(error) });
 		}
 
