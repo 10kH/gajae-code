@@ -185,6 +185,25 @@ export async function loadConstrainedPluginHooks(input: { cwd: string }): Promis
 	const invalidHookIds = new Set<string>();
 	for (const entry of effective) {
 		if (!entry.enabled) continue;
+		for (const hook of entry.surfaces.hooks) {
+			if (entry.disabledSurfaceIds.includes(hook.extensionId)) continue;
+			const normalized = normalizePluginHook({
+				declaredEvent: hook.event,
+				target: hook.target,
+				phase: hook.phase,
+				plugin: entry.name,
+				source: hook.relativePath,
+			});
+			if (normalized.hook) continue;
+			invalidHookIds.add(`${entry.scope}:${entry.name}:${hook.extensionId}`);
+			preQuarantine.push({
+				identity: bundleIdentity(entry.scope, entry.name),
+				plugin: entry.name,
+				surfaceId: hook.extensionId,
+				code: "invalid_hook",
+				message: normalized.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "),
+			});
+		}
 		const drift = await verifyEntryHashes(entry);
 		if (drift) preQuarantine.push(drift);
 		for (const hook of entry.surfaces.hooks) {

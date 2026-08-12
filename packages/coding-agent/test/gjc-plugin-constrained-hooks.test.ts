@@ -7,6 +7,7 @@ import {
 	ConstrainedPluginHookDescriptor,
 	installGjcBundle,
 	loadConstrainedPluginHooks,
+	registryPathForScope,
 } from "../src/extensibility/gjc-plugins";
 
 const fixturesRoot = path.join(import.meta.dir, "fixtures", "gjc-plugins");
@@ -94,7 +95,7 @@ describe("constrained plugin hooks", () => {
 		expect(res.quarantine.some(q => q.code === "runtime_mismatch")).toBe(true);
 	});
 
-	test("rejects malformed declared metadata before importing plugin code", async () => {
+	test("rejects malformed declared metadata before hashing or importing plugin code", async () => {
 		const root = await mkCwd();
 		const hookPath = path.join(root, "malformed.ts");
 		const markerPath = path.join(root, "imported");
@@ -109,9 +110,32 @@ describe("constrained plugin hooks", () => {
 			target: "read",
 			phase: "during" as never,
 			relativePath: hookPath,
+			implementationHash: "not-a-real-hash",
 		});
 
 		await expect(descriptor.load()).rejects.toThrow("invalid_plugin_phase");
+		expect(await Bun.file(markerPath).exists()).toBe(false);
+	});
+
+	test("quarantines malformed registry metadata before evaluating an installed hook", async () => {
+		const cwd = await mkCwd();
+		const markerPath = path.join(cwd, "imported");
+		const src = await bundleWithHook(
+			`await Bun.write(${JSON.stringify(markerPath)}, "imported"); export default function(api){ api.on('tool_call', ()=>({})); }\n`,
+		);
+		await installGjcBundle({ cwd }, "project", src);
+		const registryPath = registryPathForScope("project", cwd);
+		const registry = JSON.parse(await fs.readFile(registryPath, "utf8")) as {
+			plugins: Array<{ surfaces: { hooks: Array<{ phase?: string }> } }>;
+		};
+		const hook = registry.plugins[0]?.surfaces.hooks[0];
+		if (!hook) throw new Error("expected installed hook metadata");
+		hook.phase = "during";
+		await fs.writeFile(registryPath, JSON.stringify(registry));
+
+		const res = await loadConstrainedPluginHooks({ cwd });
+		expect(res.hooks).toHaveLength(0);
+		expect(res.quarantine.some(q => q.code === "invalid_hook")).toBe(true);
 		expect(await Bun.file(markerPath).exists()).toBe(false);
 	});
 });
