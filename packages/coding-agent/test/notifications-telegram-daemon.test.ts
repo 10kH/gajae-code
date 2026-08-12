@@ -7,7 +7,6 @@ import { logger } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
-import { MasterDaemonClient } from "../src/sdk/bus/master-daemon-client";
 import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "../src/sdk/bus/notification-service";
 import type { NotificationOperatorRuntime } from "../src/sdk/bus/operator-runtime";
 import {
@@ -52,6 +51,26 @@ function settings(agentDir: string): Settings {
 			return typeof value === "function" ? value.bind(target) : value;
 		},
 	}) as Settings;
+}
+function topicAdmissionBot(): {
+	bot: BotApi;
+	calls: Array<{ method: string; body: unknown }>;
+	updates: Array<Record<string, unknown>>;
+} {
+	const calls: Array<{ method: string; body: unknown }> = [];
+	const updates: Array<Record<string, unknown>> = [];
+	const bot: BotApi = {
+		call: async (method, body) => {
+			calls.push({ method, body });
+			if (method === "getUpdates") return { ok: true, result: updates };
+			if (method === "getChat")
+				return { ok: true, result: { id: (body as { chat_id?: unknown }).chat_id, type: "private" } };
+			if (method === "createForumTopic") return { ok: true, result: { message_thread_id: 555 } };
+			if (method === "sendMessage") return { ok: true, result: { message_id: calls.length } };
+			return { ok: true, result: true };
+		},
+	};
+	return { bot, calls, updates };
 }
 
 function lifecycleSpy() {
@@ -1121,151 +1140,117 @@ test("a throwing run-loop heartbeat renewal is contained and the daemon keeps se
 	await runScenario("state");
 	await runScenario("lock");
 });
-
-class FakeBotApi {
-	createdTopicThreadIds: number[] = [];
-	calls: Array<{ method: string; body: any; options?: { noRetry?: boolean; signal?: AbortSignal } }> = [];
-	updates: any[] = [];
-	activeGetUpdates = 0;
-	maxConcurrentGetUpdates = 0;
-	botUsername: string | undefined = undefined;
-	async call(method: string, body: unknown, options?: { noRetry?: boolean; signal?: AbortSignal }): Promise<unknown> {
-		this.calls.push({ method, body, options });
-		if (method === "getUpdates") {
-			this.activeGetUpdates++;
-			this.maxConcurrentGetUpdates = Math.max(this.maxConcurrentGetUpdates, this.activeGetUpdates);
-			await Promise.resolve();
-			this.activeGetUpdates--;
-			const result = this.updates;
-			this.updates = [];
-			return { ok: true, result };
-		}
-		if (method === "getMe")
-			return { ok: true, result: this.botUsername ? { id: 1, username: this.botUsername } : { id: 1 } };
-		if (method === "getChat")
-			return { ok: true, result: { id: (body as { chat_id?: unknown }).chat_id, type: "private" } };
-		if (method === "getFile") return { ok: true, result: { file_path: "docs/file_7.bin" } };
-		if (method === "createForumTopic") {
-			const threadId = this.calls.length;
-			this.createdTopicThreadIds.push(threadId);
-			return { ok: true, result: { message_thread_id: threadId } };
-		}
-		if (method === "sendMessage" || method === "sendRichMessage")
-			return { ok: true, result: { message_id: this.calls.length } };
-		return { ok: true, result: true };
+test("strict topic daemon retries updates before the durable registry is loaded", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const { bot, calls, updates } = topicAdmissionBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot,
+			requireTelegramTopicEligibility: true,
+			setTimeoutImpl: ((callback: () => void) => {
+				callback();
+				return 0 as unknown as NodeJS.Timeout;
+			}) as unknown as typeof setTimeout,
+		});
+		updates.push({ update_id: 7 });
+		expect(await daemon.pollOnce()).toBe(1);
+		updates.length = 0;
+		expect(await daemon.pollOnce()).toBe(0);
+		expect(
+			calls.filter(call => call.method === "getUpdates").map(call => (call.body as { offset?: unknown }).offset),
+		).toEqual([0, 0]);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
-}
+});
 
-class FakeMasterTransport {
-	readonly requests: Array<Record<string, unknown>> = [];
-	async ready(): Promise<void> {}
-	onFrame(_listener: (frame: any) => void): () => void {
-		return () => {};
+test("strict topic daemon rejects malformed present registry state before topic service starts", async () => {
+	const agentDir = tempAgentDir();
+	try {
+		const topicPath = path.join(daemonPaths(agentDir).dir, "telegram-topics.json");
+		fs.mkdirSync(path.dirname(topicPath), { recursive: true });
+		fs.writeFileSync(topicPath, JSON.stringify({ version: 2 }));
+		const { bot, calls, updates } = topicAdmissionBot();
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi: bot,
+			requireTelegramTopicEligibility: true,
+			setTimeoutImpl: ((callback: () => void) => {
+				callback();
+				return 0 as unknown as NodeJS.Timeout;
+			}) as unknown as typeof setTimeout,
+		});
+		await expect(daemon.loadTopics()).rejects.toThrow("malformed Telegram topic state");
+		updates.push({ update_id: 8 });
+		expect(await daemon.pollOnce()).toBe(1);
+		expect(calls.filter(call => call.method === "createForumTopic")).toHaveLength(0);
+		expect(
+			calls.filter(call => call.method === "getUpdates").map(call => (call.body as { offset?: unknown }).offset),
+		).toEqual([0]);
+	} finally {
+		fs.rmSync(agentDir, { recursive: true, force: true });
 	}
-	async request(frame: any): Promise<any> {
-		this.requests.push(frame);
-		if (frame.type === "subscribe")
-			return {
-				type: "subscription_ready",
-				requestId: frame.requestId,
-				mode: "snapshot",
-				highWaterSeq: 1,
+});
+
+test("strict replay admits only capability-bearing identity frames", async () => {
+	// After #4336, topic admission follows config-derived eligibility.
+	const scenarios = [
+		{ enabled: false, expectedTopics: 1 },
+		{ enabled: true, expectedTopics: 1 },
+	] as const;
+	for (const scenario of scenarios) {
+		const agentDir = tempAgentDir();
+		try {
+			const { bot, calls } = topicAdmissionBot();
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+				botApi: bot,
+				requireTelegramTopicEligibility: true,
+			});
+			await daemon.loadTopics();
+			const routing = daemon.attachmentRoutingHarnessForTest();
+			const attachment = {
+				sessionId: "replay-session",
+				generation: 1,
+				isCurrent: () => true,
+				send: () => {},
 			};
-		if (frame.type === "get_snapshot")
-			return {
-				type: "master_snapshot",
-				protocolVersion: 1,
-				requestId: frame.requestId,
-				snapshotCutSeq: 1,
-				generatedAt: new Date(0).toISOString(),
-				masters: [
+			routing.attach(attachment);
+			const session = daemon.sessions.get(attachment.sessionId);
+			if (!session) throw new Error("Expected replay attachment session.");
+			await daemon.handleSessionMessage(session, {
+				type: "event_replay_result",
+				id: session.replayId,
+				ok: true,
+				generation: 1,
+				lastSeq: 1,
+				events: [
 					{
-						masterName: "alpha",
-						channels: [
-							{
-								provider: "telegram",
-								state: "active",
-								intentId: "intent",
-								bindingId: "binding",
-								remoteChannelId: "900",
-								fence: 1,
-								pendingPresentationCount: 0,
-								deliveryHealth: "healthy",
-							},
-						],
+						seq: 1,
+						payload: {
+							type: "identity_header",
+							sessionId: attachment.sessionId,
+							repo: "replay-repo",
+							branch: "main",
+							telegramTopicsEnabled: scenario.enabled,
+						},
 					},
 				],
-			};
-		if (frame.type === "provider_worker_hello")
-			return {
-				type: "ack",
-				requestId: frame.requestId,
-				operation: frame.type,
-				result: {
-					kind: "provider_worker",
-					provider: frame.provider,
-					workerId: frame.workerId,
-					state: "registered",
-				},
-			};
-		if (frame.type === "master_user_message")
-			return {
-				type: "ack",
-				requestId: frame.requestId,
-				operation: frame.type,
-				idempotencyKey: frame.idempotencyKey,
-				result: { kind: "task", taskId: "task", enqueueSeq: 1, state: "queued" },
-			};
-		return {
-			type: "ack",
-			requestId: frame.requestId,
-			operation: frame.type,
-			result: {
-				kind: "provider_effect_result",
-				effectId: frame.effectId,
-				disposition: "recorded",
-				nextState: "reconciled",
-			},
-		};
-	}
-	async close(): Promise<void> {}
-}
-
-test("Telegram master worker leases through the existing bot API and fences bound topic ingress", async () => {
-	const agentDir = tempAgentDir();
-	const bot = new FakeBotApi();
-	const transport = new FakeMasterTransport();
-	const daemon = new TelegramNotificationDaemon({
-		settings: settings(agentDir),
-		ownerId: "owner",
-		botToken: "tok",
-		chatId: "42",
-		botApi: bot,
-		masterClient: new MasterDaemonClient({ client: transport as any }),
-	});
-	try {
-		(daemon as any).running = true;
-		await (daemon as any).ensureMasterWorker();
-		await daemon.handleTelegramUpdate({
-			update_id: 700,
-			message: {
-				chat: { id: 42, type: "supergroup" },
-				message_thread_id: 900,
-				message_id: 11,
-				from: { id: 5 },
-				text: "hello master",
-			},
-		});
-		expect(transport.requests.filter(frame => frame.type === "master_user_message")).toEqual([
-			expect.objectContaining({ masterName: "alpha", text: "hello master", idempotencyKey: "telegram:900:11" }),
-		]);
-		await (daemon as any).stopMasterWorker();
-		(daemon as any).running = true;
-		(daemon as any).masterStopRequested = false;
-		await (daemon as any).ensureMasterWorker();
-		expect(transport.requests.filter(frame => frame.type === "provider_worker_hello")).toHaveLength(2);
-	} finally {
-		await (daemon as any).stopMasterWorker();
-		fs.rmSync(agentDir, { recursive: true, force: true });
+			});
+			expect(calls.filter(call => call.method === "createForumTopic")).toHaveLength(scenario.expectedTopics);
+			expect(daemon.sessions.has(attachment.sessionId)).toBe(true);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
 	}
 });
