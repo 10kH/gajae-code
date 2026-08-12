@@ -54,6 +54,7 @@ import {
 } from "../config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
 import { Settings, type SkillsSettings } from "../config/settings";
+import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import "../discovery";
@@ -2667,7 +2668,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 
 		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
-		const eagerTasks = settings.get("task.eager");
+		// Re-resolved per prompt build so a profile activated after session start is
+		// reflected on the next refresh. Vendor-separated worker roles imply eager
+		// delegation unless `task.eager` is configured explicitly.
+		const resolveEagerTasks = (): boolean => {
+			const profileName = startupActiveModelProfile ?? settings.get("modelProfile.default");
+			const resolvedProfileName = profileName ? resolveModelProfileName(profileName, persistedProfiles) : undefined;
+			return resolveEagerTaskDelegation({
+				settings,
+				profile: resolvedProfileName ? persistedProfiles.get(resolvedProfileName) : undefined,
+			}).eagerTasks;
+		};
+		const eagerTasks = resolveEagerTasks();
 		const intentTracingEnabled = resolveIntentTracingEnabled(settings.get("tools.intentTracing"), {
 			subSession: isCanonicalSubSession,
 		});
@@ -2752,7 +2764,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				repeatToolDescriptions,
 				intentField,
 				toolDiscoveryActive: effectiveDiscoveryMode === "all" || mcpDiscoveryEnabled,
-				eagerTasks,
+				eagerTasks: resolveEagerTasks(),
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				subagent: options.parentTaskPrefix !== undefined,
