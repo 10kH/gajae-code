@@ -1,5 +1,10 @@
 import { describe, expect, it } from "bun:test";
-import { grokCliUsageProvider, parseGrokCliBillingUsage, parseGrokCliWeeklyBillingUsage } from "../src/usage/grok-cli";
+import {
+	grokCliRankingStrategy,
+	grokCliUsageProvider,
+	parseGrokCliBillingUsage,
+	parseGrokCliWeeklyBillingUsage,
+} from "../src/usage/grok-cli";
 
 describe("Grok CLI usage provider", () => {
 	it("parses billing payload", () => {
@@ -93,6 +98,54 @@ describe("Grok CLI usage provider", () => {
 		expect(report?.limits[0]?.notes).not.toContain("108/0 credits used");
 	});
 
+	it("keeps monthly and weekly windows in a hybrid report and ranks the weekly reset", async () => {
+		const report = await grokCliUsageProvider.fetchUsage(
+			{
+				provider: "grok-build",
+				credential: { type: "oauth", accessToken: "token", expiresAt: Date.now() + 60_000 },
+			},
+			{
+				fetch: (async url => {
+					return Response.json(
+						String(url).endsWith("?format=credits")
+							? {
+									config: {
+										currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" },
+										creditUsagePercent: 70,
+										billingPeriodEnd: "2026-08-18T13:31:00.000Z",
+									},
+								}
+							: {
+									config: {
+										monthlyLimit: { val: 10_000 },
+										used: { val: 2_500 },
+										billingPeriodEnd: "2026-09-01T00:00:00.000Z",
+									},
+								},
+					);
+				}) as typeof fetch,
+			},
+		);
+
+		expect(report?.limits.map(limit => limit.id)).toEqual(["grok-build:7d", "grok-build:weekly"]);
+		const ranked = report ? grokCliRankingStrategy.findWindowLimits(report) : undefined;
+		expect(ranked?.primary).toBeUndefined();
+		expect(ranked?.secondary?.id).toBe("grok-build:weekly");
+		expect(ranked?.secondary?.window?.resetsAt).toBe(Date.parse("2026-08-18T13:31:00.000Z"));
+	});
+
+	it("preserves an explicit zero weekly percentage", () => {
+		expect(
+			parseGrokCliWeeklyBillingUsage({
+				config: {
+					currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" },
+					creditUsagePercent: 0,
+					billingPeriodEnd: "2026-08-18T13:31:00.000Z",
+				},
+			}),
+		).toEqual({ creditUsagePercent: 0, billingPeriodEnd: "2026-08-18T13:31:00.000Z" });
+	});
+
 	it("maps monthly billing to status-line-compatible usage when weekly data is unavailable", async () => {
 		const report = await grokCliUsageProvider.fetchUsage(
 			{
@@ -145,6 +198,66 @@ describe("Grok CLI usage provider", () => {
 			},
 		);
 		expect(report).toBeNull();
+	});
+
+	it("falls back to a valid monthly report when the weekly payload is malformed", async () => {
+		const report = await grokCliUsageProvider.fetchUsage(
+			{
+				provider: "grok-build",
+				credential: { type: "oauth", accessToken: "token", expiresAt: Date.now() + 60_000 },
+			},
+			{
+				fetch: (async url => {
+					if (String(url).endsWith("?format=credits")) {
+						return Response.json({
+							config: {
+								currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" },
+								creditUsagePercent: "bad",
+								billingPeriodEnd: "not-a-date",
+							},
+						});
+					}
+					return Response.json({
+						config: {
+							monthlyLimit: { val: 10_000 },
+							used: { val: 1_000 },
+							billingPeriodEnd: "2026-09-01T00:00:00.000Z",
+						},
+					});
+				}) as typeof fetch,
+			},
+		);
+
+		expect(report?.limits.map(limit => limit.id)).toEqual(["grok-build:7d"]);
+	});
+
+	it("propagates caller aborts from the weekly request", async () => {
+		const controller = new AbortController();
+		const abortError = new DOMException("cancelled", "AbortError");
+		const reportPromise = grokCliUsageProvider.fetchUsage(
+			{
+				provider: "grok-build",
+				credential: { type: "oauth", accessToken: "token", expiresAt: Date.now() + 60_000 },
+				signal: controller.signal,
+			},
+			{
+				fetch: (async url => {
+					if (!String(url).endsWith("?format=credits")) {
+						return Response.json({
+							config: {
+								monthlyLimit: { val: 10_000 },
+								used: { val: 1_000 },
+								billingPeriodEnd: "2026-09-01T00:00:00.000Z",
+							},
+						});
+					}
+					controller.abort();
+					throw abortError;
+				}) as typeof fetch,
+			},
+		);
+
+		await expect(reportPromise).rejects.toBe(abortError);
 	});
 
 	it("does not send OAuth credentials to unsafe billing host overrides", async () => {

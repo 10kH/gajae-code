@@ -59,4 +59,27 @@ describe("usage report column ordering", () => {
 			expect(aliceCol).toBeLessThan(bobCol);
 		}
 	});
+
+	test("multiple windows from one unidentified report keep one fallback account label", () => {
+		const hybridReport = {
+			provider: "grok-build",
+			fetchedAt: NOW,
+			metadata: {},
+			limits: [
+				{
+					...limit("7d", "SuperGrok monthly credits", "Monthly credits", 20 * 86_400_000, 0.25),
+					scope: { provider: "grok-build", windowId: "7d" },
+				},
+				{
+					...limit("weekly", "SuperGrok weekly credits", "Weekly", 6 * 86_400_000, 0.06),
+					scope: { provider: "grok-build", windowId: "weekly" },
+				},
+			],
+		} as UsageReport;
+
+		const output = stripAnsi(renderUsageReports([hybridReport], theme, NOW, 100));
+
+		expect(output.match(/account 1/g)).toHaveLength(2);
+		expect(output).not.toContain("account 2");
+	});
 });

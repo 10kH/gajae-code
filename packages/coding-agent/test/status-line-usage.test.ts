@@ -33,7 +33,7 @@ async function waitForUsageText(component: StatusLineComponent): Promise<string>
 	let text = "";
 	for (let i = 0; i < 20; i++) {
 		text = stripAnsi(component.getTopBorder(120).content);
-		if (text.includes("1h") || text.includes("5h")) return text;
+		if (/\b(?:1h|5h|weekly) \d+%/.test(text)) return text;
 		await Bun.sleep(10);
 	}
 	return text;
@@ -220,6 +220,38 @@ describe("status line usage segment", () => {
 
 		expect(text).toContain("5h 40% (1h 30m)");
 		expect(text).not.toContain("90%");
+		component.dispose();
+	});
+
+	it("renders Grok weekly quota without admitting unrelated tiered windows", async () => {
+		const now = Date.now();
+		const session = makeSession(async () => [
+			{
+				provider: "grok-build",
+				fetchedAt: now,
+				limits: [
+					{
+						id: "grok-build:weekly",
+						scope: { provider: "grok-build", windowId: "weekly" },
+						window: { id: "weekly", resetsAt: now + 6 * 24 * 3_600_000 },
+						amount: { usedFraction: 0.06, unit: "percent" },
+					},
+					{
+						id: "grok-build:weekly:heavy",
+						scope: { provider: "grok-build", windowId: "weekly", tier: "heavy" },
+						window: { id: "weekly", resetsAt: now + 24 * 3_600_000 },
+						amount: { usedFraction: 0.99, unit: "percent" },
+					},
+				],
+			},
+		]);
+		const component = new StatusLineComponent(session);
+		component.updateSettings({ preset: "custom", leftSegments: [], rightSegments: ["usage"], showSkillHud: false });
+
+		const text = await waitForUsageText(component);
+
+		expect(text).toContain("weekly 6% (6d)");
+		expect(text).not.toContain("99%");
 		component.dispose();
 	});
 });
