@@ -567,6 +567,48 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("/model <target> <model[:effort]>");
 	});
 
+	it("model: requires explicit effort for argument-based reasoning defaults from other providers", async () => {
+		const { output, runtime, session } = createRuntime();
+		const reasoningModel = {
+			provider: "anthropic",
+			id: "claude-fable-5",
+			reasoning: true,
+			contextWindow: 500_000,
+			maxTokens: 64_000,
+		};
+		session.getAvailableModels = () => [reasoningModel];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+
+		const result = await executeAcpBuiltinSlashCommand("/model anthropic/claude-fable-5", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setModelSpy).not.toHaveBeenCalled();
+		expect(output[0]).toContain("requires an explicit effort suffix");
+	});
+
+	it("model: accepts explicit effort for argument-based reasoning defaults from other providers", async () => {
+		const { runtime, session } = createRuntime();
+		const reasoningModel = {
+			provider: "anthropic",
+			id: "claude-fable-5",
+			reasoning: true,
+			contextWindow: 500_000,
+			maxTokens: 64_000,
+		};
+		session.getAvailableModels = () => [reasoningModel];
+		const setModelSpy = spyOn(session, "setModel").mockResolvedValue(undefined);
+
+		const result = await executeAcpBuiltinSlashCommand("/model anthropic/claude-fable-5:xhigh", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(setModelSpy).toHaveBeenCalledWith(reasoningModel, "default", {
+			cause: "user-selection",
+			selector: "anthropic/claude-fable-5",
+			thinkingLevel: "xhigh",
+		});
+		expect(runtime.settings.getModelRole("default")).toBe("anthropic/claude-fable-5:xhigh");
+	});
+
 	it("model: requires explicit Grok effort for argument-based role assignment", async () => {
 		const { output, runtime, session } = createRuntime();
 		session.getAvailableModels = () => [
