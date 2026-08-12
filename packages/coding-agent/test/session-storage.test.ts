@@ -1055,7 +1055,6 @@ describe.skipIf(process.platform !== "darwin")("managed replacement receipt deta
 		store.publishNoReplaceSync(name, Buffer.from("trigger\n"));
 	};
 
-
 	beforeEach(() => {
 		root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-replace-journal-"));
 		leaveReceiptPlaceholder = false;
@@ -1354,20 +1353,35 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		expect(fs.existsSync(path.join(root, "concurrent-reconcile"))).toBe(true);
 	});
 
-	it("removes an identical pending receipt after invalid_request reports an existing destination", () => {
+	it("rejects invalid_request when the pending receipt disappears into a conflicting destination", () => {
+		const { pending, receipt } = pendingReceipt();
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (source !== pending) return realRename(source, destination);
+			fs.rmSync(source);
+			fs.writeFileSync(destination, "conflicting receipt\n");
+			return invalidRequest();
+		});
+
+		expect(() => replay("conflicting-move")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.existsSync(pending)).toBe(false);
+		expect(fs.readFileSync(receipt, "utf8")).toBe("conflicting receipt\n");
+		expect(fs.existsSync(path.join(root, "conflicting-move"))).toBe(false);
+	});
+
+	it("rejects a byte-identical destination copy because it lacks the receipt filesystem identity", () => {
 		const { pending, receipt } = pendingReceipt();
 		fs.copyFileSync(pending, receipt);
 		const realRename = native.renameNoReplacePath;
 		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
-			if (source === pending)
-				return invalidRequest();
+			if (source === pending) return invalidRequest();
 			return realRename(source, destination);
 		});
 
-		replay("identical-receipt");
-
-		expect(fs.existsSync(pending)).toBe(false);
+		expect(() => replay("identical-receipt")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.existsSync(pending)).toBe(true);
 		expect(fs.existsSync(receipt)).toBe(true);
+		expect(fs.existsSync(path.join(root, "identical-receipt"))).toBe(false);
 	});
 
 	it("rejects invalid_request when the existing destination receipt has different contents", () => {
@@ -1375,14 +1389,27 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 		fs.writeFileSync(receipt, "different receipt\n");
 		const realRename = native.renameNoReplacePath;
 		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) =>
-			source === pending
-				? invalidRequest()
-				: realRename(source, destination),
+			source === pending ? invalidRequest() : realRename(source, destination),
 		);
 
 		expect(() => replay("conflicting-receipt")).toThrow("managed_replace_cleanup_receipt_invalid");
 		expect(fs.existsSync(pending)).toBe(true);
 		expect(fs.existsSync(receipt)).toBe(true);
+	});
+
+	it("rejects invalid_request when both receipt paths disappear", () => {
+		const { pending, receipt } = pendingReceipt();
+		const realRename = native.renameNoReplacePath;
+		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destination) => {
+			if (source !== pending) return realRename(source, destination);
+			fs.rmSync(source);
+			return invalidRequest();
+		});
+
+		expect(() => replay("missing-receipts")).toThrow("managed_replace_cleanup_receipt_invalid");
+		expect(fs.existsSync(pending)).toBe(false);
+		expect(fs.existsSync(receipt)).toBe(false);
+		expect(fs.existsSync(path.join(root, "missing-receipts"))).toBe(false);
 	});
 
 	it("preserves invalid_request when only the pending receipt exists", () => {
@@ -1392,7 +1419,7 @@ describe("replacement cleanup receipt reconcile TOCTOU resilience", () => {
 			source === pending ? invalidRequest() : realRename(source, destination),
 		);
 
-		expect(() => replay("genuine-invalid-request")).toThrow("managed_publish_failed:invalid_request");
+		expect(() => replay("genuine-invalid-request")).toThrow("invalid_request");
 		expect(fs.existsSync(pending)).toBe(true);
 		expect(fs.existsSync(receipt)).toBe(false);
 	});

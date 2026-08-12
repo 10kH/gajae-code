@@ -1316,27 +1316,20 @@ export class ManagedSessionDescendantStore {
 			const currentPending = captureIfPresent(receiptPath);
 			const existing = captureIfPresent(destination);
 			if (!currentPending && existing) {
+				if (
+					!sameIdentity(existing.identity, pending.identity) ||
+					existing.identity.sha256 !== pending.identity.sha256
+				)
+					throw new Error("managed_replace_cleanup_receipt_invalid");
 				fsyncDirectory(this.#baseDir);
 				return;
 			}
 			if (currentPending && !existing) throw publishFailure(outcome);
-			if (!currentPending || !existing || existing.identity.sha256 !== currentPending.identity.sha256)
-				throw new Error("managed_replace_cleanup_receipt_invalid");
-			const removed = nativeSessionStorage().exactUnlink(receiptPath, {
-				dev: currentPending.identity.dev,
-				ino: currentPending.identity.ino,
-				nlink: currentPending.identity.nlink,
-				parentDev: this.#subtreeRoot.dev,
-				parentIno: this.#subtreeRoot.ino,
-				size: BigInt(currentPending.identity.size),
-				mtimeNs: currentPending.identity.mtimeNs,
-				sha256: currentPending.identity.sha256,
-				quarantineName: `.gjc-receipt-pending-remove-${currentPending.identity.dev.toString(16)}-${currentPending.identity.ino.toString(16)}`,
-			});
-			if (!exactUnlinkCompleted(removed) && removed.code !== "not_found")
-				throw new Error(`managed_replace_receipt_cleanup_pending:${removed.code ?? "unknown"}`);
-			fsyncDirectory(this.#baseDir);
-			return;
+			// Two names cannot both authoritatively represent the one receipt identity
+			// encoded in the canonical filename. A byte-identical copy has a different
+			// filesystem identity and would make the canonical receipt fail its next
+			// reconciliation, while a hard link violates the single-link capture fence.
+			throw new Error("managed_replace_cleanup_receipt_invalid");
 		}
 		throw publishFailure(outcome);
 	}
