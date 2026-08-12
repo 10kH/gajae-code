@@ -43,6 +43,18 @@ afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
+describe("update-cli recovery command surface", () => {
+	it("advertises update-recovery so verified runtimes can feature-probe it", async () => {
+		const result = Bun.spawnSync([process.execPath, "src/cli.ts", "update", "--help"], {
+			cwd: path.join(repoRoot, "packages", "coding-agent"),
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout.toString()).toContain("update-recovery");
+	});
+});
+
 describe("update-cli release lookup", () => {
 	const isolated = {
 		homeDir: "/nonexistent-home",
@@ -542,10 +554,29 @@ describe("update-cli managed notification recovery", () => {
 				return 0;
 			},
 			async () => false,
+			async () => ["discord"],
 		);
 		expect(argv).toEqual([
-			["/older stable/gjc", "daemon", "stop", "--force"],
-			["/older stable/gjc", "daemon", "reload"],
+			["/older stable/gjc", "daemon", "stop", "discord", "--force"],
+			["/older stable/gjc", "daemon", "reload", "discord"],
+			["/older stable/gjc", "notify", "recovery"],
+		]);
+	});
+
+	it("targets a Slack-only durable provider during legacy recovery", async () => {
+		const argv: string[][] = [];
+		await runPostUpdateRecoveryForTest(
+			"/older stable/gjc",
+			async args => {
+				argv.push(args);
+				return 0;
+			},
+			async () => false,
+			async () => ["slack"],
+		);
+		expect(argv).toEqual([
+			["/older stable/gjc", "daemon", "stop", "slack", "--force"],
+			["/older stable/gjc", "daemon", "reload", "slack"],
 			["/older stable/gjc", "notify", "recovery"],
 		]);
 	});
@@ -560,11 +591,12 @@ describe("update-cli managed notification recovery", () => {
 					return args[2] === "reload" ? 17 : 0;
 				},
 				async () => false,
+				async () => ["slack"],
 			),
 		).rejects.toThrow("legacy post-update daemon reload exited 17");
 		expect(argv).toEqual([
-			["/older/gjc", "daemon", "stop", "--force"],
-			["/older/gjc", "daemon", "reload"],
+			["/older/gjc", "daemon", "stop", "slack", "--force"],
+			["/older/gjc", "daemon", "reload", "slack"],
 		]);
 	});
 

@@ -25,7 +25,11 @@ export default class Update extends Command {
 	};
 
 	static args = {
-		action: Args.string({ description: "Internal post-update recovery action", required: false }),
+		action: Args.string({
+			description: "Internal post-update recovery action (update-recovery)",
+			required: false,
+			options: ["update-recovery"],
+		}),
 	};
 
 	async run(): Promise<void> {

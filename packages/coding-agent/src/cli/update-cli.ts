@@ -786,6 +786,7 @@ export interface UpdateCommandDependencies {
 
 export type PostUpdateRecoverySpawn = (argv: string[]) => Promise<number>;
 export type PostUpdateRecoverySupportCheck = (runtimePath: string) => Promise<boolean>;
+export type LegacyRecoveryDaemonKinds = () => Promise<NotificationProvider[]>;
 
 /**
  * A complete, non-quarantined provider with provider-level desired intent is a
@@ -849,10 +850,16 @@ async function supportsUpdateRecovery(runtimePath: string): Promise<boolean> {
 	return exitCode === 0 && stdout.includes("update-recovery");
 }
 
-async function runLegacyPostUpdateRecovery(runtimePath: string, spawn: PostUpdateRecoverySpawn): Promise<void> {
+async function runLegacyPostUpdateRecovery(
+	runtimePath: string,
+	spawn: PostUpdateRecoverySpawn,
+	managedKinds: LegacyRecoveryDaemonKinds,
+): Promise<void> {
+	const kinds = await managedKinds();
+	if (kinds.length === 0) return;
 	for (const [name, argv] of [
-		["daemon stop --force", [runtimePath, "daemon", "stop", "--force"]],
-		["daemon reload", [runtimePath, "daemon", "reload"]],
+		["daemon stop --force", [runtimePath, "daemon", "stop", ...kinds, "--force"]],
+		["daemon reload", [runtimePath, "daemon", "reload", ...kinds]],
 		["notify recovery", [runtimePath, "notify", "recovery"]],
 	] as const) {
 		const exitCode = await spawn([...argv]);
@@ -864,9 +871,10 @@ export async function runPostUpdateRecoveryForTest(
 	runtimePath: string,
 	spawn: PostUpdateRecoverySpawn = spawnPostUpdateRecovery,
 	supportsRecovery: PostUpdateRecoverySupportCheck = supportsUpdateRecovery,
+	managedKinds: LegacyRecoveryDaemonKinds = async () => managedNotifyDaemonKinds(await Settings.init()),
 ): Promise<void> {
 	if (!(await supportsRecovery(runtimePath))) {
-		await runLegacyPostUpdateRecovery(runtimePath, spawn);
+		await runLegacyPostUpdateRecovery(runtimePath, spawn, managedKinds);
 		return;
 	}
 	const exitCode = await spawn([runtimePath, "update", "update-recovery"]);
