@@ -298,15 +298,21 @@ function isUnresolvedEvent(event: SessionIndexEvent): boolean {
 }
 
 /**
- * True when an unresolved identity actually claims endpoint authority. A
- * bookkeeping registration with endpoint generation 0 has never published a
- * session endpoint (e.g. the direct-session GC fence row appended by `main.ts`
- * under the agent dir) and can never be attached by SessionRouter, so it must
- * never fence a real endpoint root into ambiguity. Two genuinely
- * endpoint-claiming roots still fence each other (C5/C6).
+ * True only for the proven non-endpoint bookkeeping registration: the
+ * direct-session GC fence row `main.ts` appends under the agent dir with
+ * endpoint generation 0. It has never published an endpoint and can never be
+ * attached by SessionRouter (which requires a positive generation and a
+ * readable endpoint), so it must not fence a real endpoint root into
+ * ambiguity — otherwise every interactive session reads ambiguous and no chat
+ * daemon can attach anything.
+ *
+ * Deliberately shape-scoped rather than "generation === 0": generation 0 is
+ * also emitted by `recordTerminalUncertain` as an unproven `lifecycle_terminal`
+ * claim, and malformed generations must keep fencing. Everything that is not
+ * this exact shape keeps fencing exactly as before (C5/C6).
  */
-function claimsEndpointAuthority(event: SessionIndexEvent): boolean {
-	return event.endpointGeneration >= 1;
+function isNonEndpointBookkeepingRegistration(event: SessionIndexEvent): boolean {
+	return event.type === "host_registered" && event.endpointGeneration === 0;
 }
 
 function preferredIdentity(states: Iterable<SessionIdentityState>): SessionIdentityState | undefined {
@@ -409,24 +415,37 @@ function reduceEvents(events: SessionIndexEvent[], now: number): SessionIndexPro
 		}
 		rootStates.push(state);
 	}
+	// `unresolvedRoots` drives surviving-authority selection and keeps its exact
+	// prior membership. `fencingRoots` is the strictly smaller subset that may
+	// fence authority into ambiguity: a proven non-endpoint bookkeeping root
+	// never fences, but it still survives as public authority when it is the
+	// only unresolved root left.
 	const unresolvedRoots = new Map<string, Map<string, SessionIdentityState[]>>();
+	const fencingRoots = new Map<string, Set<string>>();
 	for (const [sessionId, roots] of rootsBySession) {
 		for (const [root, rootStates] of roots) {
 			const current = preferredIdentity(rootStates);
-			if (!current || !isUnresolvedEvent(current.latest) || !claimsEndpointAuthority(current.latest)) continue;
+			if (!current || !isUnresolvedEvent(current.latest)) continue;
 			let unresolved = unresolvedRoots.get(sessionId);
 			if (unresolved === undefined) {
 				unresolved = new Map<string, SessionIdentityState[]>();
 				unresolvedRoots.set(sessionId, unresolved);
 			}
 			unresolved.set(root, rootStates);
+			if (isNonEndpointBookkeepingRegistration(current.latest)) continue;
+			let fencing = fencingRoots.get(sessionId);
+			if (fencing === undefined) {
+				fencing = new Set<string>();
+				fencingRoots.set(sessionId, fencing);
+			}
+			fencing.add(root);
 		}
 	}
 	const identities: IndexedSession[] = [];
 	const sessions: IndexedSession[] = [];
 	for (const [sessionId, states] of statesBySession) {
 		const roots = unresolvedRoots.get(sessionId);
-		const ambiguous = (roots?.size ?? 0) > 1;
+		const ambiguous = (fencingRoots.get(sessionId)?.size ?? 0) > 1;
 		for (const state of states) identities.push(projectIdentity(state, ambiguous, now));
 		const defaultAuthority = preferredIdentity(states);
 		if (defaultAuthority === undefined || defaultAuthority.latest.type === "session_deleted") continue;

@@ -1060,6 +1060,67 @@ describe("SDK session index", () => {
 			]);
 		}
 	});
+	it("keeps fencing every generation-0 root that is not a proven bookkeeping registration", async () => {
+		// The bookkeeping exemption is shape-scoped, not "generation === 0":
+		// `recordTerminalUncertain` emits an unproven generation-0
+		// `lifecycle_terminal` claim, and a malformed generation is not proof of
+		// anything. Both must keep fencing a conflicting endpoint root closed.
+		for (const conflicting of [
+			{ name: "lifecycle-uncertain", type: "lifecycle_terminal" as const, endpointGeneration: 0 },
+			{ name: "malformed-generation", type: "host_registered" as const, endpointGeneration: 1.5 },
+		]) {
+			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-fence-"));
+			const index = await new SessionIndex(dir).open();
+			const sessionId = `fenced-${conflicting.name}`;
+			await index.append({
+				type: conflicting.type,
+				sessionId,
+				locator: { repo: "other", stateRoot: "other-state" },
+				endpointGeneration: conflicting.endpointGeneration,
+				pid: process.pid,
+			});
+			await index.append(event(sessionId));
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({ sessionId, ambiguous: true, live: false }),
+			]);
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+		}
+	});
+	it("keeps a sole live bookkeeping root as surviving authority after the endpoint root unregisters", async () => {
+		// Exempting the bookkeeping row from the ambiguity fence must not change
+		// surviving-authority selection: while the direct session process is still
+		// registered, an unregistered endpoint root must not become the public row
+		// (which would let lifecycle admit a delete for a live session).
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-survivor-"));
+		const index = await new SessionIndex(dir).open();
+		const sessionId = "survivor";
+		const bookkeeping = await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo: "r", stateRoot: "agent-dir" },
+			endpointGeneration: 0,
+			pid: process.pid,
+		});
+		const real = await index.append(event(sessionId));
+		await index.append({
+			type: "host_unregistered",
+			sessionId,
+			locator: real.locator,
+			endpointGeneration: real.endpointGeneration,
+			pid: real.pid,
+			...(real.processIncarnation === undefined ? {} : { processIncarnation: real.processIncarnation }),
+			...(real.hostIncarnation === undefined ? {} : { hostIncarnation: real.hostIncarnation }),
+		});
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId,
+				endpointGeneration: bookkeeping.endpointGeneration,
+				locator: bookkeeping.locator,
+				ambiguous: false,
+				terminal: false,
+			}),
+		]);
+	});
 	it("hides deleted sessions until a later registration establishes new authority", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-deleted-"));
 		const index = await new SessionIndex(dir).open();
