@@ -148,8 +148,8 @@ Compiled AppleScript applications are suitable when Stream Deck's built-in websi
 ### Page 2: cmux navigation and session entry
 
 ```text
-PANE PREV | PANE NEXT | NEW SESSION | CLOSE TAB | GJC FOCUS
-TAB PREV | TAB NEXT | VOICE | STEER | ESC X2
+TAB PREV | TAB NEXT | NEW SESSION | CLOSE TAB | GJC FOCUS
+PANE PREV | PANE NEXT | VOICE | STEER | ESC X2
 BACK | VibeQuant | gajae-code | HOME | NEXT
 ```
 
