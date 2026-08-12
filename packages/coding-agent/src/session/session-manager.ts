@@ -8068,6 +8068,7 @@ export class SessionManager {
 				this.#lazyReopenFallbackReason = "bounded_first_open_descriptor_changed";
 				return false;
 			}
+			this.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(finalDescriptor);
 			this.#sessionId = discovery.header.id;
 			this.#sessionName = discovery.header.title;
 			this.#titleSource = discovery.header.titleSource;
@@ -9033,6 +9034,7 @@ export class SessionManager {
 					titleSource: this.#titleSource,
 					sessionFile: this.#sessionFile,
 					needsFullRewriteOnNextPersist: this.#needsFullRewriteOnNextPersist,
+					managedPersistExpectedIdentity: this.#managedPersistExpectedIdentity,
 				};
 				this.#persistError = undefined;
 				this.#persistErrorReported = false;
@@ -9045,6 +9047,7 @@ export class SessionManager {
 					managedTransition?.adopt();
 					writeTerminalBreadcrumb(this.cwd, resolvedSessionFile);
 					this.#commitResidentTextStoreTransition(prepared);
+					this.#adoptManagedPersistIdentity(resolvedSessionFile);
 				} catch (error) {
 					managedTransition?.rollback();
 					this.#sessionId = previous.sessionId;
@@ -9052,6 +9055,7 @@ export class SessionManager {
 					this.#titleSource = previous.titleSource;
 					this.#sessionFile = previous.sessionFile;
 					this.#needsFullRewriteOnNextPersist = previous.needsFullRewriteOnNextPersist;
+					this.#managedPersistExpectedIdentity = previous.managedPersistExpectedIdentity;
 					prepared.dispose();
 					throw error;
 				}
@@ -18788,6 +18792,7 @@ export class SessionManager {
 					const finalDescriptor = store.descriptorExpected(path.basename(resolved));
 					if (!finalDescriptor || !sameDescriptor(capturedDescriptor, finalDescriptor))
 						throw new Error("source_changed");
+					boundedManager.#managedPersistExpectedIdentity = managedIdentityFromDescriptor(finalDescriptor);
 					boundedManager.buildSessionContext();
 					return boundedManager;
 				}
