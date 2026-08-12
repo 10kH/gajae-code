@@ -1246,7 +1246,15 @@ export class ModelRegistry {
 	#configuredDiscoveryProviderIds: ReadonlySet<string> = new Set();
 	#descriptorDiscoveryEvidence = new Map<
 		string,
-		{ fresh: boolean; modelIds: ReadonlySet<string>; authGeneration: string; endpoint: string }
+		{
+			fresh: boolean;
+			modelIds: ReadonlySet<string>;
+			profileModelIds?: ReadonlySet<string>;
+			profileFresh?: boolean;
+			profileEndpoint?: string;
+			authGeneration: string;
+			endpoint: string;
+		}
 	>();
 	#descriptorDiscoveryGenerations = new Map<string, number>();
 	#configuredDiscoveryEvidence = new Map<
@@ -2595,12 +2603,13 @@ export class ModelRegistry {
 			const manager = createModelManager({
 				...options,
 				cacheDbPath: this.#cacheDbPath,
+				cacheDynamicModelProvenance: Bun.hash(`${authGeneration}\u0000${endpoint}`).toString(36),
 				canPublishCache: isCurrentDiscovery,
 				...(options.fetchDynamicModels
 					? {
 							fetchDynamicModels: async () => {
 								const models = await options.fetchDynamicModels?.();
-								if (models === null) return null;
+								if (models === null || models === undefined) return null;
 								const sanitizedModels = this.#stripModelBaseUrlQueries(models ?? []);
 								if (canUseCredentialDerivedXiaomiEndpoint) {
 									credentialDerivedEndpoint = sanitizedModels[0]?.baseUrl;
@@ -2634,9 +2643,15 @@ export class ModelRegistry {
 					...(baseUrl !== model.baseUrl ? { baseUrl } : {}),
 				};
 			});
+			const preservesExistingDescriptorEvidence =
+				(result.dynamicModelIds === undefined && !result.fetched && !result.stale) ||
+				(result.stale && result.cacheFresh && result.cacheAuthoritative && evidence?.fresh === true) ||
+				(strategy === "offline" && result.dynamicModelIds === undefined);
 			if (
 				isCurrentDiscovery() &&
+				!preservesExistingDescriptorEvidence &&
 				(result.fetched ||
+					result.dynamicModelIds !== undefined ||
 					result.stale ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.authGeneration !== authGeneration ||
 					this.#descriptorDiscoveryEvidence.get(options.providerId)?.endpoint !== endpoint)
@@ -2644,6 +2659,13 @@ export class ModelRegistry {
 				this.#descriptorDiscoveryEvidence.set(options.providerId, {
 					fresh: result.fetched,
 					modelIds: new Set(models.map(model => model.id)),
+					...(result.dynamicModelIds === undefined
+						? {}
+						: {
+								profileModelIds: new Set(result.dynamicModelIds),
+								profileFresh: !result.stale,
+								profileEndpoint: endpoint,
+							}),
 					authGeneration,
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(models[0]?.baseUrl ?? endpoint),
 				});
@@ -3705,17 +3727,28 @@ export class ModelRegistry {
 	getAvailableForProfileActivation(): Model<Api>[] {
 		return this.getAvailable().filter(model => {
 			const evidence = this.#descriptorDiscoveryEvidence.get(model.provider);
-			if (!evidence?.fresh) return true;
+			if (!evidence?.profileFresh || evidence.profileModelIds === undefined) return true;
+			if (this.#hasCustomModelOverlay(model.provider, model.id)) return true;
+			const bundledModelIds = new Set(
+				(getBundledModels(model.provider as Parameters<typeof getBundledModels>[0]) as Model<Api>[]).map(
+					candidate => candidate.id,
+				),
+			);
+			if (!bundledModelIds.has(model.id)) return true;
 			if (
 				evidence.authGeneration !== this.#getProviderEvidenceGeneration(model.provider) ||
-				evidence.endpoint !==
-					this.#normalizeDiscoveryEvidenceEndpoint(
-						this.#getProviderBaseUrlForDiscovery(model.provider) ?? model.baseUrl ?? "",
-					)
+				evidence.profileEndpoint !==
+					this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(model.provider) ?? "")
 			)
 				return true;
-			return evidence.modelIds.has(model.id);
+			return evidence.profileModelIds.has(model.id);
 		});
+	}
+
+	#hasCustomModelOverlay(provider: string, id: string): boolean {
+		return [...this.#customModelOverlays, ...this.#runtimeModelOverlays].some(
+			overlay => overlay.provider === provider && overlay.id === id,
+		);
 	}
 
 	#hasFreshOrStaticModelEvidence(model: Model<Api>): boolean {
