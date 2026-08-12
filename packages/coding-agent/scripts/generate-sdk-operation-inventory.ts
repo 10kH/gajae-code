@@ -37,6 +37,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:exit": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:notify":
 		"interactive diagnostics command; session on/off delegate to the notifications extension, not an SDK ingress seam",
+	"slash_command:credential":
+		"interactive session credential selector; not a credential-free public SDK operation or independent control seam",
 	"slash_command:pet": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
 	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
@@ -45,6 +47,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal session-scoped agent-directory accessor, not a user-facing SDK control seam",
 	"agent_session:captureTerminalAbortSteeringSnapshot":
 		"internal terminal-abort steering snapshot, not a user-facing SDK control seam",
+	"agent_session:rebindTerminalAbortSteeringSnapshot":
+		"internal terminal-abort steering snapshot rebind, not a user-facing SDK control seam",
+	"agent_session:discardTerminalAbortSteeringSnapshot":
+		"internal terminal-abort steering snapshot cleanup, not a user-facing SDK control seam",
 	"agent_session:getConfiguredModelChainState":
 		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
 	"agent_session:getDefaultFallbackRuntimeState":
@@ -229,6 +235,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal fallback runtime bookkeeping, not a user-facing SDK control seam",
 	"agent_session:seedDefaultFallbackResolution":
 		"internal fallback resolution bookkeeping, not a user-facing SDK control seam",
+	"agent_session:syncEagerDelegation":
+		"internal profile-derived eager delegation synchronization, not a user-facing SDK control seam",
 };
 /** Maps reviewed source seams to registry SDK operation IDs. */
 const SEAM_TO_SDK: Readonly<Record<string, string>> = {
