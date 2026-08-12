@@ -56,7 +56,6 @@ import {
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
 import { SessionIndex } from "./sdk/broker/session-index";
-
 import type { AgentSession } from "./session/agent-session";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
@@ -79,6 +78,7 @@ import { persistTaskTokenLog, resolveTaskTokenLogDir, taskTokenLogFromUsage } fr
 import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
+import { installHerdrReporter } from "./utils/herdr-pane";
 import { fetchLatestPackageVersion } from "./utils/npm-registry";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
@@ -1815,6 +1815,8 @@ export async function runRootCommand(
 			eventBus,
 		} = await createSession(sessionOptions, { skipPostCreateModelRefresh: hasRootStartupProfile });
 		applyCliRuntimeApiKeyOverride(authStorage, parsedArgs.apiKey, session.model);
+		// Herdr integration: report gjc lifecycle state when running in a Herdr pane.
+		installHerdrReporter(listener => session.subscribe(listener));
 
 		// Research-mode (RLM) preset: hard tool-boundary assertion after the registry is assembled.
 		if (deps.rlmPreset?.onSessionCreated) {
