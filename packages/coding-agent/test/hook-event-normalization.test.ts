@@ -2,7 +2,6 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import "../src/discovery/codex";
 import { Settings } from "../src/config/settings";
 import { EXTENSION_HANDLER_TIMEOUT_MS } from "../src/extensibility/extensions/runner";
 import { discoverAndLoadHooks } from "../src/extensibility/hooks/loader";
