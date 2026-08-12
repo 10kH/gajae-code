@@ -5067,6 +5067,41 @@ describe("ModelRegistry", () => {
 		});
 	});
 
+	test("normalizes configured discovery Muse caches through shared policy", () => {
+		writeRawModelsJson({
+			"muse-proxy": {
+				baseUrl: "https://proxy.example/v1",
+				apiKey: "TEST_KEY",
+				api: "openai-completions",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const cachedModel: Model<"openai-completions"> = {
+			id: "meta/muse-spark-1.2",
+			name: "Meta: Muse Spark 1.2",
+			api: "openai-completions",
+			provider: "muse-proxy",
+			baseUrl: "https://proxy.example/v1",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+		};
+		writeModelCache("muse-proxy", Date.now(), [cachedModel], true, "", cacheDbPath);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		expect(registry.find("muse-proxy", "meta/muse-spark-1.2")).toMatchObject({
+			reasoning: true,
+			thinking: {
+				mode: "effort",
+				minLevel: Effort.Minimal,
+				maxLevel: Effort.XHigh,
+			},
+		});
+	});
+
 	test("preserves request shaping and wire aliases when replacing a built-in model", () => {
 		writeRawModelsJson({
 			openai: {

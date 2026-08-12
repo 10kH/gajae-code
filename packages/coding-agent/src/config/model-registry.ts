@@ -1653,6 +1653,7 @@ export class ModelRegistry {
 					this.#applyProviderCompat(providerConfig.compat, [...models]),
 				),
 			);
+			applyGeneratedModelPolicies(normalized);
 			cachedModels.push(...normalized);
 		}
 		return cachedModels;
