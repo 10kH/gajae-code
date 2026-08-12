@@ -384,14 +384,15 @@ function withCapabilityCache<T>(operation: (database: Database) => T): T | undef
 
 function openCapabilityCache(cachePath: string): Database {
 	const database = new Database(cachePath, { create: true, strict: true });
-	database.run("PRAGMA busy_timeout = 3000");
-	database.run("PRAGMA journal_mode = WAL");
-	database.run("PRAGMA synchronous = FULL");
-	const initialize = database.transaction(() => {
-		const version = database.query("PRAGMA user_version").get() as { user_version?: number } | null;
-		const schemaVersion = version?.user_version ?? 0;
-		if (schemaVersion === 0) {
-			database.run(`
+	try {
+		database.run("PRAGMA busy_timeout = 3000");
+		database.run("PRAGMA journal_mode = WAL");
+		database.run("PRAGMA synchronous = FULL");
+		const initialize = database.transaction(() => {
+			const version = database.query("PRAGMA user_version").get() as { user_version?: number } | null;
+			const schemaVersion = version?.user_version ?? 0;
+			if (schemaVersion === 0) {
+				database.run(`
 				CREATE TABLE IF NOT EXISTS tool_choice_capabilities (
 					key_digest TEXT PRIMARY KEY NOT NULL,
 					max_support TEXT NOT NULL,
@@ -399,17 +400,21 @@ function openCapabilityCache(cachePath: string): Database {
 					observed_at INTEGER NOT NULL
 				) STRICT
 			`);
+				assertCapabilityCacheSchema(database);
+				database.run(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION}`);
+				return;
+			}
+			if (schemaVersion !== CACHE_SCHEMA_VERSION) {
+				throw new CapabilityCacheCorruptionError("unsupported cache schema version");
+			}
 			assertCapabilityCacheSchema(database);
-			database.run(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION}`);
-			return;
-		}
-		if (schemaVersion !== CACHE_SCHEMA_VERSION) {
-			throw new CapabilityCacheCorruptionError("unsupported cache schema version");
-		}
-		assertCapabilityCacheSchema(database);
-	});
-	initialize();
-	return database;
+		});
+		initialize();
+		return database;
+	} catch (error) {
+		database.close();
+		throw error;
+	}
 }
 
 function assertCapabilityCacheSchema(database: Database): void {
