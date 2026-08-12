@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the authoritative OpenRouter `meta/muse-spark-1.2` catalog fallback with a 1,048,576-token context window and `minimal` through `xhigh` reasoning effort, so stale or credential-limited catalog generation still closes the Muse Spark preset alias deterministically.
+
 ### Fixed
 - Validate Synthetic API key via models endpoint, not retired Kimi probe (#4385).
 

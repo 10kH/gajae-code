@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Added three provider-agnostic Muse Spark 1.2 presets: Muse Spark across all roles, plus DeepSeek and Luna executor variants.
+
 ### Fixed
 - Managed sessions recover from `content_too_large` by rewriting live in-memory entries, and proactively compact before the managed transcript limit (#4411).
 - Managed output publication no longer freezes the resident event loop when a no-replace rename stalls in the kernel; async publication uses blocking-pool native boundaries and per-session stores reap scrubbed protocol remnants (#4396).

@@ -350,6 +350,75 @@ describe("model profile activation", () => {
 		expect(prepared.agentModelOverrides.executor).toBe("glm-5.2:low");
 	});
 
+	test("resolves Muse Spark through an authenticated provider and preserves xhigh effort", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "open-weights-spark");
+		if (!profile) throw new Error("Missing open-weights-spark profile");
+		const kilo = model("kilo", "meta/muse-spark-1.2", {
+			mode: "effort",
+			minLevel: ThinkingLevel.Minimal,
+			maxLevel: ThinkingLevel.XHigh,
+		});
+		const openrouter = model("openrouter", "meta/muse-spark-1.2", {
+			mode: "effort",
+			minLevel: ThinkingLevel.Minimal,
+			maxLevel: ThinkingLevel.XHigh,
+		});
+		const baseRegistry = fakeRegistry({ profiles: [profile] });
+		const registry = {
+			...baseRegistry,
+			getAll: () => [kilo, openrouter],
+			getAvailable: () => [kilo, openrouter],
+			getApiKeyForProvider: async (provider: string) => (provider === "openrouter" ? "key-openrouter" : undefined),
+			lookupAliasExists: (alias: string) => alias === "muse-spark-1.2",
+			resolveModelByLookupAlias: (_alias: string, options?: { candidates?: readonly Model[] }) =>
+				options?.candidates?.[0],
+		};
+
+		const prepared = await prepareModelProfileActivation({
+			session: fakeSession(),
+			modelRegistry: registry as unknown as ModelRegistry,
+			settings: Settings.isolated(),
+			profileName: profile.name,
+		});
+
+		expect(prepared.defaultModel).toBe(openrouter);
+		expect(prepared.defaultThinkingLevel).toBe(ThinkingLevel.Medium);
+		expect(prepared.agentModelOverrides).toEqual({
+			executor: "muse-spark-1.2:low",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		});
+	});
+
+	test("fails Muse Spark preset activation before mutation when no provider exposes the alias", async () => {
+		const profile = BUILTIN_MODEL_PROFILES.find(candidate => candidate.name === "open-weights-spark");
+		if (!profile) throw new Error("Missing open-weights-spark profile");
+		const registry = {
+			...fakeRegistry({ profiles: [profile] }),
+			getAll: () => [],
+			getAvailable: () => [],
+			lookupAliasExists: (alias: string) => alias === "muse-spark-1.2",
+			resolveModelByLookupAlias: () => undefined,
+		};
+		const session = fakeSession();
+
+		await expect(
+			prepareModelProfileActivation({
+				session,
+				modelRegistry: registry as unknown as ModelRegistry,
+				settings: Settings.isolated(),
+				profileName: profile.name,
+			}),
+		).rejects.toMatchObject({
+			constructor: ModelProfileCredentialError,
+			code: "authentication_failed",
+			providers: ["muse-spark-1.2"],
+		});
+		expect(session.model?.id).toBe("initial");
+		expect(session.getActiveModelProfile()).toBeUndefined();
+	});
+
 	test("keeps unauthenticated fallback heads and authenticated mixed-provider tails", async () => {
 		const profile: ModelProfileDefinition = {
 			name: "fallback-profile",
