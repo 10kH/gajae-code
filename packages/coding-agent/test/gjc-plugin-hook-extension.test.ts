@@ -45,6 +45,23 @@ describe("createPluginHooksExtension", () => {
 		expect(registered).toEqual(["tool_result"]);
 	});
 
+	test("registers compiler-valid constrained lifecycle hooks", () => {
+		let starts = 0;
+		let shutdowns = 0;
+		const registered: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+		const factory = createPluginHooksExtension([
+			{ plugin: "p", event: "session_start", handler: () => starts++ },
+			{ plugin: "p", event: "session_shutdown", handler: () => shutdowns++ },
+		]);
+		factory({
+			on: (event: string, handler: (...args: unknown[]) => unknown) => registered.push({ event, handler }),
+		} as any);
+		expect(registered.map(entry => entry.event)).toEqual(["session_start", "session_shutdown"]);
+		registered[0]?.handler({ type: "session_start" });
+		registered[1]?.handler({ type: "session_shutdown" });
+		expect({ starts, shutdowns }).toEqual({ starts: 1, shutdowns: 1 });
+	});
+
 	test("fails closed before registration for an invalid constrained descriptor", () => {
 		const registered: string[] = [];
 		const factory = createPluginHooksExtension([

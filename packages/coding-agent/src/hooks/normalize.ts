@@ -235,6 +235,22 @@ export interface PluginHookInput {
 
 /** Normalize only manifest shapes that the constrained plugin compiler accepts. */
 export function normalizePluginHook(input: PluginHookInput): NormalizeHookResult {
+	if (input.declaredEvent === "session_start" || input.declaredEvent === "session_shutdown") {
+		if (input.phase !== undefined || input.target !== undefined) {
+			return invalid(
+				HookDiagnosticCode.InvalidPluginPhase,
+				`Plugin "${input.plugin}" ${input.declaredEvent} hooks do not accept target or phase.`,
+				HookSourceConvention.GjcPlugin,
+				{ source: input.source, externalEvent: input.declaredEvent },
+			);
+		}
+		return buildHook(
+			HookSourceConvention.GjcPlugin,
+			input.declaredEvent === "session_start" ? HookEventKind.SessionStart : HookEventKind.SessionShutdown,
+			"*",
+			input.source,
+		);
+	}
 	if (input.declaredEvent !== "tool_call" && input.declaredEvent !== "tool_result") {
 		return invalid(
 			HookDiagnosticCode.UnrecognizedPluginEvent,

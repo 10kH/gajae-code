@@ -62,10 +62,11 @@ The adapter rejects unknown event names and empty commands. It does not claim Cl
 
 ## Distributable plugin hooks
 
-Plugin manifests support only the compiler-accepted tool shapes:
+Plugin manifests support the compiler-accepted constrained shapes:
 
 - `tool_call` requires a target and `before` or `after` phase;
-- `tool_result` requires `after` phase.
+- `tool_result` requires `after` phase;
+- `session_start` and `session_shutdown` accept neither target nor phase.
 
 `tool_call/after` is a post-tool observation and normalizes to `post_tool_use`; it must never gain pre-tool blocking authority. Aliases such as `pre_tool_use`, `UserPromptSubmit`, or `session_start` are rejected for plugins even if those names exist elsewhere.
 
@@ -82,6 +83,8 @@ Plugin execution uses `ExtensionRunner` after adaptation:
 | `tool_call/before` | `pre_tool_use` | none | thrown error fails closed and blocks | constrained GJC API; ambient host |
 | `tool_call/after` | `post_tool_use` | 30s | timeout/error isolated | constrained GJC API; ambient host |
 | `tool_result/after` | `post_tool_use` | 30s | timeout/error isolated | constrained GJC API; ambient host |
+| `session_start` | `session_start` | 30s | timeout/error isolated | constrained GJC API; ambient host |
+| `session_shutdown` | `session_shutdown` | 30s | timeout/error isolated | constrained GJC API; ambient host |
 
 ## In-process lifecycle normalization
 

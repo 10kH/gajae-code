@@ -178,6 +178,22 @@ describe("constrained plugin authority cannot expand through normalization", () 
 		expect(result.hook?.contract.canCancel).toBe(false);
 	});
 
+	it("preserves compiler-valid constrained session lifecycle hooks", () => {
+		for (const declaredEvent of ["session_start", "session_shutdown"] as const) {
+			const result = normalizePluginHook({
+				declaredEvent,
+				plugin: "lifecycle",
+				source: "plugin:lifecycle",
+			});
+			expect(result.diagnostics).toEqual([]);
+			expect(result.hook).toMatchObject({
+				runtimeEvent: declaredEvent,
+				authority: HookAuthority.Constrained,
+				toolName: "*",
+			});
+		}
+	});
+
 	it("accepts only compiler-valid tool_result/after", () => {
 		const valid = normalizePluginHook({
 			declaredEvent: "tool_result",
@@ -213,13 +229,26 @@ describe("constrained plugin authority cannot expand through normalization", () 
 		}
 	});
 
+	it("rejects target or phase fields on constrained lifecycle hooks", () => {
+		for (const input of [{ target: "read" }, { phase: "before" }, { target: null }, { phase: null }]) {
+			const result = normalizePluginHook({
+				declaredEvent: "session_start",
+				...input,
+				plugin: "malformed",
+				source: "plugin:malformed",
+			});
+			expect(result.hook).toBeNull();
+			expect(result.diagnostics[0]?.code).toBe(HookDiagnosticCode.InvalidPluginPhase);
+		}
+	});
+
 	it("rejects aliases and lifecycle names instead of resolving them for plugins", () => {
 		for (const declaredEvent of [
 			"pre_tool_use",
 			"post_tool_use",
 			"UserPromptSubmit",
 			"Stop",
-			"session_start",
+			"session_switch",
 			"agent_end",
 		]) {
 			const result = normalizePluginHook({

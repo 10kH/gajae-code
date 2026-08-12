@@ -149,6 +149,24 @@ const constrainedPost: HookExecutionContract = {
 	semanticNotes: "The constrained hook is adapted into ExtensionRunner; timeout and thrown errors are isolated.",
 };
 
+const constrainedLifecycle = (kind: HookEventKind, runtimeEvent: string): HookExecutionContract => ({
+	kind,
+	runtimeEvent,
+	authority: HookAuthority.Constrained,
+	awaitBehavior: "awaited",
+	ordering: "sequential",
+	canCancel: false,
+	mutation: [],
+	timeoutMs: 30_000,
+	errorBehavior: "isolate",
+	processAuthority: "ambient-host",
+	trustRequirement: "not-enforced",
+	redaction: "none",
+	logging: "Extension errors expose the extension path, event name, error message, and stack to registered listeners.",
+	semanticNotes:
+		"The constrained GJC API remains denied, but the imported plugin module retains ambient host-process authority.",
+});
+
 const managedPrompt: HookExecutionContract = {
 	kind: HookEventKind.UserPromptSubmit,
 	runtimeEvent: "UserPromptSubmit",
@@ -248,6 +266,8 @@ export const CONVENTION_EVENT_CONTRACTS: Record<
 	[HookSourceConvention.GjcPlugin]: {
 		[HookEventKind.PreToolUse]: constrainedPre,
 		[HookEventKind.PostToolUse]: constrainedPost,
+		[HookEventKind.SessionStart]: constrainedLifecycle(HookEventKind.SessionStart, "session_start"),
+		[HookEventKind.SessionShutdown]: constrainedLifecycle(HookEventKind.SessionShutdown, "session_shutdown"),
 	},
 	[HookSourceConvention.InProcess]: {
 		[HookEventKind.UserPromptSubmit]: inProcessPrompt,
