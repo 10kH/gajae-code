@@ -243,7 +243,7 @@ describe("online-if-uncached model refresh", () => {
 				providerId,
 				staticModels: [muse],
 				cacheDbPath,
-				fetchDynamicModels: async () => [{ ...muse, thinking: undefined }],
+				fetchDynamicModels: async () => [{ ...muse, reasoning: false, thinking: undefined }],
 			},
 			"online",
 		);
