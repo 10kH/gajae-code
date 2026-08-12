@@ -1,3 +1,8 @@
+import { Database } from "bun:sqlite";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { getToolChoiceCapabilityCachePath } from "@gajae-code/utils/dirs";
 import { extractHttpStatusFromError } from "@gajae-code/utils/fetch-retry";
 import * as logger from "@gajae-code/utils/logger";
 import type { Api, Model, ToolChoice, ToolChoiceCompat, ToolChoiceSupport, ToolChoiceSupportSource } from "../types";
@@ -11,6 +16,13 @@ const supportRank: Record<ToolChoiceSupport, number> = {
 
 const registry = new Map<string, ToolChoiceSupport>();
 const loggedRegistryKeys = new Set<string>();
+const registryExpiresAt = new Map<string, number>();
+const CACHE_SCHEMA_VERSION = 1;
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const CACHE_MAX_ENTRIES = 256;
+
+let cachePathOverride: string | undefined;
+let nowForTests: (() => number) | undefined;
 
 /**
  * Claude Mythos accepts tools but rejects forced tool use (Anthropic 400:
@@ -45,21 +57,34 @@ export function toolChoiceRegistryKey(model: Model<Api>): string {
 
 /** Returns the current runtime tool-choice capability override for a model. */
 export function getToolChoiceCapabilityOverride(model: Model<Api>): ToolChoiceSupport | undefined {
-	return registry.get(toolChoiceRegistryKey(model));
+	const key = toolChoiceRegistryKey(model);
+	hydrateToolChoiceCapability(key);
+	return registry.get(key);
 }
 
 /** Clears runtime tool-choice capability overrides for tests. */
 export function clearToolChoiceIncapabilityRegistryForTests(): void {
 	registry.clear();
 	loggedRegistryKeys.clear();
+	registryExpiresAt.clear();
+}
+
+/** Overrides durable-cache dependencies for isolated tests. */
+export function configureToolChoiceCapabilityCacheForTests(options?: { path?: string; now?: () => number }): void {
+	cachePathOverride = options?.path;
+	nowForTests = options?.now;
+	clearToolChoiceIncapabilityRegistryForTests();
 }
 
 /** Records a discovered maximum supported tool-choice level for a model. */
 export function markToolChoiceIncapability(model: Model<Api>, maxSupport: ToolChoiceSupport, reason?: string): void {
 	const key = toolChoiceRegistryKey(model);
+	hydrateToolChoiceCapability(key);
 	const existing = registry.get(key);
 	const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
 	registry.set(key, next);
+	registryExpiresAt.set(key, currentTime() + CACHE_TTL_MS);
+	persistToolChoiceCapability(key, next);
 
 	if (!loggedRegistryKeys.has(key)) {
 		loggedRegistryKeys.add(key);
@@ -85,12 +110,13 @@ export function resolveToolChoice(
 	compat?: ToolChoiceCompat,
 ): ResolveToolChoiceResult {
 	const derived = deriveToolChoiceSupport(compat ?? model.compat);
-	const runtime = registry.get(toolChoiceRegistryKey(model));
+	const registryKey = toolChoiceRegistryKey(model);
+	hydrateToolChoiceCapability(registryKey);
+	const runtime = registry.get(registryKey);
 	const support = runtime && supportRank[runtime] < supportRank[derived.support] ? runtime : derived.support;
 	const supportSource: ToolChoiceSupportSource = support === derived.support ? derived.source : "runtime";
 	const requestedInfo = requestedToolChoiceLevel(requested);
 	const clampLevel = requestedInfo.requestedLevel === "none" ? "auto" : requestedInfo.requestedLevel;
-	const registryKey = toolChoiceRegistryKey(model);
 
 	if (requested === undefined) {
 		return {
@@ -250,4 +276,121 @@ function safeHostname(baseUrl: string): string | undefined {
 	} catch {
 		return undefined;
 	}
+}
+
+function hydrateToolChoiceCapability(registryKey: string): void {
+	const now = currentTime();
+	const expiresAt = registryExpiresAt.get(registryKey);
+	if (expiresAt !== undefined && now < expiresAt) return;
+	registry.delete(registryKey);
+	registryExpiresAt.delete(registryKey);
+	withCapabilityCache(database => {
+		const digest = capabilityKeyDigest(registryKey);
+		const row = database
+			.query("SELECT max_support, observed_at FROM tool_choice_capabilities WHERE key_digest = ?")
+			.get(digest) as { max_support?: unknown; observed_at?: unknown } | null;
+		if (!row) return;
+		if (!isToolChoiceSupport(row.max_support) || typeof row.observed_at !== "number") {
+			database.run("DELETE FROM tool_choice_capabilities WHERE key_digest = ?", [digest]);
+			return;
+		}
+		if (now - row.observed_at >= CACHE_TTL_MS) {
+			database.run("DELETE FROM tool_choice_capabilities WHERE key_digest = ?", [digest]);
+			return;
+		}
+		registry.set(registryKey, row.max_support);
+		registryExpiresAt.set(registryKey, row.observed_at + CACHE_TTL_MS);
+	});
+}
+
+function persistToolChoiceCapability(registryKey: string, maxSupport: ToolChoiceSupport): void {
+	withCapabilityCache(database => {
+		const write = database.transaction(() => {
+			const digest = capabilityKeyDigest(registryKey);
+			database.run(
+				"INSERT INTO tool_choice_capabilities (key_digest, max_support, support_rank, observed_at) VALUES (?, ?, ?, ?) ON CONFLICT(key_digest) DO UPDATE SET max_support = excluded.max_support, support_rank = excluded.support_rank, observed_at = excluded.observed_at WHERE excluded.support_rank < tool_choice_capabilities.support_rank",
+				[digest, maxSupport, supportRank[maxSupport], currentTime()],
+			);
+			database.run(
+				"DELETE FROM tool_choice_capabilities WHERE key_digest NOT IN (SELECT key_digest FROM tool_choice_capabilities ORDER BY observed_at DESC, key_digest DESC LIMIT ?)",
+				[CACHE_MAX_ENTRIES],
+			);
+		});
+		write();
+	});
+}
+
+function withCapabilityCache(operation: (database: Database) => void): void {
+	if (process.env.NODE_ENV === "test" && cachePathOverride === undefined) return;
+	const cachePath = cachePathOverride ?? getToolChoiceCapabilityCachePath();
+	try {
+		fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
+		const database = openCapabilityCache(cachePath);
+		try {
+			operation(database);
+		} finally {
+			database.close();
+		}
+	} catch (error) {
+		logger.debug("Tool-choice capability cache unavailable", {
+			cachePath: path.basename(cachePath),
+			error: error instanceof Error ? error.message : String(error),
+		});
+		if (isCorruptCapabilityCacheError(error)) retireCorruptCapabilityCache(cachePath);
+	}
+}
+
+function openCapabilityCache(cachePath: string): Database {
+	const database = new Database(cachePath, { create: true, strict: true });
+	database.run("PRAGMA busy_timeout = 3000");
+	database.run("PRAGMA journal_mode = WAL");
+	database.run("PRAGMA synchronous = FULL");
+	database.run(`
+		CREATE TABLE IF NOT EXISTS tool_choice_capabilities (
+			key_digest TEXT PRIMARY KEY NOT NULL,
+			max_support TEXT NOT NULL,
+			support_rank INTEGER NOT NULL,
+			observed_at INTEGER NOT NULL
+		) STRICT
+	`);
+	const version = database.query("PRAGMA user_version").get() as { user_version?: number } | null;
+	const schemaVersion = version?.user_version ?? 0;
+	if (schemaVersion === 0) {
+		database.run(`PRAGMA user_version = ${CACHE_SCHEMA_VERSION}`);
+	} else if (schemaVersion !== CACHE_SCHEMA_VERSION) {
+		database.close();
+		throw new CapabilityCacheCorruptionError("unsupported cache schema version");
+	}
+	return database;
+}
+
+class CapabilityCacheCorruptionError extends Error {}
+
+function isCorruptCapabilityCacheError(error: unknown): boolean {
+	if (error instanceof CapabilityCacheCorruptionError) return true;
+	if (!error || typeof error !== "object") return false;
+	const code = (error as { code?: unknown }).code;
+	return code === "SQLITE_CORRUPT" || code === "SQLITE_NOTADB";
+}
+
+function retireCorruptCapabilityCache(cachePath: string): void {
+	for (const suffix of ["", "-wal", "-shm"]) {
+		try {
+			fs.rmSync(`${cachePath}${suffix}`, { force: true });
+		} catch {
+			// A best-effort cache reset must never break provider fallback behavior.
+		}
+	}
+}
+
+function capabilityKeyDigest(registryKey: string): string {
+	return crypto.createHash("sha256").update(registryKey).digest("hex");
+}
+
+function isToolChoiceSupport(value: unknown): value is ToolChoiceSupport {
+	return value === "none" || value === "auto" || value === "required" || value === "named";
+}
+
+function currentTime(): number {
+	return nowForTests?.() ?? Date.now();
 }

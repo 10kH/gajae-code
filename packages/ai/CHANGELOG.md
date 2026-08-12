@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Persist learned tool-choice incapabilities in a bounded, expiring, digest-keyed cache so fresh processes avoid repeating known-invalid forced-choice probes while retaining automatic revalidation and existing first-discovery fallback behavior. Credit: @probepark (#4319).
+
 ### Added
 
 - Added the authoritative OpenRouter `meta/muse-spark-1.2` catalog fallback with a 1,048,576-token context window and `minimal` through `xhigh` reasoning effort, so stale or credential-limited catalog generation still closes the Muse Spark preset alias deterministically.
