@@ -1699,6 +1699,7 @@ export class MasterDomainStore {
 				intendedOwner: { kind: "master", masterName: this.masterName },
 				state: "reserved",
 				promptIdempotencyKey: null,
+				promptTurnId: null,
 				followUps: [],
 				createdAt: timestamp,
 				updatedAt: timestamp,
@@ -1941,6 +1942,7 @@ export class MasterDomainStore {
 		if (typeof input.proven !== "boolean")
 			throw new MasterStoreError("INVALID_INPUT", "Prompt reconciliation requires proven delivery evidence.");
 		if (input.promptIdempotencyKey !== undefined) assertOpaqueId(input.promptIdempotencyKey, "promptIdempotencyKey");
+		if (input.promptTurnId !== undefined) assertOpaqueId(input.promptTurnId, "promptTurnId");
 		return await this.#withLock(async state => {
 			const worker =
 				input.leaseId === undefined
@@ -1967,6 +1969,8 @@ export class MasterDomainStore {
 			worker.lifecycle = "active";
 			worker.updatedAt = timestamp;
 			intent.state = "active";
+			// Retain the proven turn so observation still works after a restart.
+			if (input.promptTurnId !== undefined) intent.promptTurnId = input.promptTurnId;
 			intent.updatedAt = timestamp;
 			return { value: this.#promptReconcileReceipt(worker, intent, true, drained), persist: true };
 		});

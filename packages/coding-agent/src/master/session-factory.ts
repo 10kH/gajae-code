@@ -50,6 +50,12 @@ export interface MasterSessionFactoryOptions {
 	readonly doctrineProvider?: () => MasterDoctrineDocument | Promise<MasterDoctrineDocument>;
 	readonly adapters?: MasterSessionFactoryAdapters;
 	readonly sessionManager?: SessionManager;
+	/**
+	 * The observer that dispatched this master's workers. It must be shared: the
+	 * Coordinator turn ids proven by prompt delivery live on that instance, so a
+	 * second observer would make `master_worker_observe` unable to read real turns.
+	 */
+	readonly workerObserver?: MasterWorkerObserver;
 }
 
 function sha256(value: string): string {
@@ -323,11 +329,13 @@ export async function createMasterSession(options: MasterSessionFactoryOptions):
 	const doctrineBlocks = resolvedInitialDoctrine === undefined ? [] : [doctrinePrompt(resolvedInitialDoctrine)];
 	const eventBus = new EventBus();
 	const agentRegistry = new AgentRegistry();
-	const observer = new MasterWorkerObserver({
-		masterName: options.masterName,
-		domainStore: options.domainStore,
-		coordinatorGateway: options.coordinatorGateway,
-	});
+	const observer =
+		options.workerObserver ??
+		new MasterWorkerObserver({
+			masterName: options.masterName,
+			domainStore: options.domainStore,
+			coordinatorGateway: options.coordinatorGateway,
+		});
 	const tools = createMasterOrchestrationTools(buildToolDependencies(options, memory, observer));
 	const profile: MasterSessionCapabilityProfile = {
 		masterName: options.masterName,

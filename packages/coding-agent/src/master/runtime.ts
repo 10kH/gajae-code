@@ -536,6 +536,9 @@ export class MasterRuntime {
 			cwd: (await this.domainStore.readRecord?.())?.defaultWorkdir,
 			domainStore: this.domainStore,
 			coordinatorGateway: this.#options.coordinatorGateway ?? this.#options.coordinator,
+			// Share the dispatching observer so `master_worker_observe` can read the
+			// Coordinator turn proven when this runtime delivered the worker's prompt.
+			workerObserver: this.workerObserver,
 			memory: this.#options.memory,
 			model: this.#options.model,
 			authStorage: this.#options.authStorage,

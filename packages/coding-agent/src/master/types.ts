@@ -698,6 +698,12 @@ export interface WorkerCreateIntent {
 	intendedOwner: { kind: "master"; masterName: string };
 	state: WorkerCreateIntentState;
 	promptIdempotencyKey: string | null;
+	/**
+	 * Coordinator turn proven by the last accepted prompt delivery. Observation is
+	 * turn-scoped, so this must be durable: without it a restarted master cannot
+	 * read the real worker turn and would fall back to a guessed action.
+	 */
+	promptTurnId: string | null;
 	followUps: WorkerFollowUpIntent[];
 	createdAt: string;
 	updatedAt: string;
@@ -802,6 +808,8 @@ export interface PromptReconcileInput {
 	intentId?: string;
 	promptIdempotencyKey?: string;
 	proven: boolean;
+	/** Coordinator turn id proven by this delivery, retained for later observation. */
+	promptTurnId?: string;
 }
 
 export interface ObserveWorkerInput {

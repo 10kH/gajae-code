@@ -10,6 +10,7 @@ import { MasterRuntime, type MasterRuntimeStore } from "../src/master/runtime";
 import { MasterSdk } from "../src/master/sdk";
 import { connectMasterSdkClient } from "../src/master/sdk-transport";
 import type { MasterProvider } from "../src/master/types";
+import { MasterWorkerObserver } from "../src/master/worker-observer";
 
 const roots: string[] = [];
 
@@ -288,4 +289,61 @@ describe("managed master runtime acceptance", () => {
 		await runtime.waitForIdle(2_000);
 		await Bun.sleep(50);
 	}, 20_000);
+	test("observes the real Coordinator turn proven at dispatch, across a restart", async () => {
+		const root = await tempRoot();
+		const store = await createStore(root, "observed");
+		const coordinator = new FakeCoordinator();
+		const awaited: Array<Record<string, unknown>> = [];
+		const gateway = {
+			startSession: async (input: { cwd: string; idempotency_key: string }) => await coordinator.startSession(input),
+			sendPrompt: async (input: { session_id: string; idempotency_key: string }) =>
+				await coordinator.sendPrompt(input),
+			awaitTurn: async (input: Record<string, unknown>) => {
+				awaited.push(input);
+				return { status: "completed", turn_id: input.turn_id, output: "done" };
+			},
+		} as unknown as MasterCoordinatorGateway;
+		const runtime = new MasterRuntime({
+			masterName: "observed",
+			domainStore: store,
+			coordinatorGateway: gateway,
+			providerHealth: health(["telegram"]),
+			sessionFactory: async () => ({ prompt: async () => undefined }),
+		});
+		await runtime.start();
+		await store.enqueueUser({
+			idempotencyKey: "observed-task",
+			priority: "user",
+			summary: "observed task",
+			workdir: null,
+		});
+		await runtime.refreshFromStore();
+		const worker = (await store.readWorkers()).workers.find(candidate => candidate.workerSessionId !== null);
+		if (!worker?.workerSessionId) throw new Error("expected a dispatched worker");
+
+		// The observer that dispatched the prompt must be the one the master tool uses.
+		const receipt = await runtime.workerObserver.observeFromCoordinator({
+			workerSessionId: worker.workerSessionId,
+			action: "action_needed",
+		});
+		expect(receipt).toBeDefined();
+		expect(awaited).toHaveLength(1);
+		expect(awaited[0]).toMatchObject({ session_id: worker.workerSessionId, turn_id: "turn-1" });
+
+		// The proven turn is durable, so a fresh observer (restart) still reads it.
+		const reopened = await MasterDomainStore.open({
+			masterName: "observed",
+			masterRootDir: path.join(root, "master"),
+			defaultWorkdir: root,
+		});
+		const restarted = new MasterWorkerObserver({
+			masterName: "observed",
+			domainStore: reopened,
+			coordinatorGateway: gateway,
+		});
+		await restarted.observeFromCoordinator({ workerSessionId: worker.workerSessionId });
+		expect(awaited).toHaveLength(2);
+		expect(awaited[1]).toMatchObject({ session_id: worker.workerSessionId, turn_id: "turn-1" });
+		await runtime.stop({ drain: true, timeoutMs: 500 });
+	}, 30_000);
 });

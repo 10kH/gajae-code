@@ -45,7 +45,11 @@ export interface WorkerObserverStore {
 	readWorkerIntents?(): Promise<readonly WorkerCreateIntent[]>;
 	readWorkerIntent?(intentId: string): Promise<WorkerCreateIntent | null>;
 	readWorkers?(): Promise<{
-		workers: Array<{ intentId: string; workerSessionId: string | null; lifecycle: string | null }>;
+		workers: Array<{
+			intentId: string;
+			workerSessionId: string | null;
+			lifecycle: string | null;
+		}>;
 	}>;
 	reconcileCreate?(input: {
 		intentId: string;
@@ -69,6 +73,7 @@ export interface WorkerObserverStore {
 		intentId?: string;
 		promptIdempotencyKey?: string;
 		proven: boolean;
+		promptTurnId?: string;
 	}): Promise<PromptReconcileReceipt>;
 	reconcileWorkerPrompt?(input: Record<string, unknown>): Promise<PromptReconcileReceipt>;
 	reconcilePromptDelivery?(input: Record<string, unknown>): Promise<PromptReconcileReceipt>;
@@ -165,6 +170,12 @@ function promptWasAccepted(response: Record<string, unknown>): boolean {
 		response.queued === true ||
 		response.reconciled === true
 	);
+}
+
+/** Extracts the Coordinator turn id a prompt response proved, if any. */
+function promptTurnFields(response: Record<string, unknown>): { promptTurnId?: string } {
+	const turnId = stringValue(response.turn_id) ?? stringValue(response.turnId);
+	return turnId === null ? {} : { promptTurnId: turnId };
 }
 
 function digestPrompt(prompt: string): string {
@@ -328,8 +339,9 @@ export class MasterWorkerObserver {
 		if (!coordinator) return null;
 		// `await_turn` is turn-scoped. Without the turn id proven by this worker's
 		// prompt delivery there is no real turn to read, so fall back rather than
-		// inventing one.
-		const turnId = this.#turnIds.get(workerSessionId);
+		// inventing one. Memory is only a cache; the durable intent is authoritative
+		// so observation still works after a daemon restart.
+		const turnId = this.#turnIds.get(workerSessionId) ?? (await this.#durableTurnId(workerSessionId));
 		if (turnId === undefined) return null;
 		const args = {
 			turn_id: turnId,
@@ -347,6 +359,20 @@ export class MasterWorkerObserver {
 		if (workerSessionId === null) return;
 		const turnId = stringValue(response.turn_id) ?? stringValue(response.turnId);
 		if (turnId !== null) this.#turnIds.set(workerSessionId, turnId);
+	}
+
+	/** Reads the durably retained prompt turn for a worker session. */
+	async #durableTurnId(workerSessionId: string): Promise<string | undefined> {
+		if (typeof this.domainStore.readWorkers !== "function") return undefined;
+		if (typeof this.domainStore.readWorkerIntents !== "function") return undefined;
+		const workers = await this.domainStore.readWorkers();
+		const worker = workers.workers.find(candidate => candidate.workerSessionId === workerSessionId);
+		if (worker === undefined) return undefined;
+		const intents = await this.domainStore.readWorkerIntents();
+		const turnId = intents.find(candidate => candidate.intentId === worker.intentId)?.promptTurnId;
+		if (turnId === null || turnId === undefined) return undefined;
+		this.#turnIds.set(workerSessionId, turnId);
+		return turnId;
 	}
 
 	async registerUserWorker(workerSessionId: string): Promise<unknown> {
@@ -412,6 +438,7 @@ export class MasterWorkerObserver {
 					intentId: lease.intentId,
 					promptIdempotencyKey: promptPending.promptIdempotencyKey,
 					proven: promptWasAccepted(promptResponse),
+					...promptTurnFields(promptResponse),
 				});
 				return {
 					lease,
@@ -455,6 +482,7 @@ export class MasterWorkerObserver {
 				intentId: lease.intentId,
 				promptIdempotencyKey: promptPending.promptIdempotencyKey,
 				proven: promptWasAccepted(promptResponse),
+				...promptTurnFields(promptResponse),
 			});
 			return { lease, create, promptPending, prompt: promptReceipt, workerSessionId, promptResponse };
 		} catch (error) {
@@ -489,6 +517,7 @@ export class MasterWorkerObserver {
 			intentId: intent.intentId,
 			promptIdempotencyKey: promptPending.promptIdempotencyKey,
 			proven: promptWasAccepted(promptResponse),
+			...promptTurnFields(promptResponse),
 		});
 		return { lease, create, promptPending, prompt: promptReceipt, workerSessionId, promptResponse };
 	}
