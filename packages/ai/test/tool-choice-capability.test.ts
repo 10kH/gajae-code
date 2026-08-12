@@ -204,6 +204,48 @@ describe("durable tool-choice capability cache", () => {
 		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
 	});
 
+	it("does not delete a capability refreshed while an expired row is being revalidated", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-expiry-race-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let now = 1_000;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		markToolChoiceIncapability(model("named"), "auto");
+
+		now += 30 * 24 * 60 * 60 * 1000;
+		configureToolChoiceCapabilityCacheForTests({
+			path: cachePath,
+			now: () => now,
+			beforeExpiredDelete: () => {
+				const database = new Database(cachePath);
+				try {
+					database.run("UPDATE tool_choice_capabilities SET observed_at = ? WHERE max_support = ?", [now, "auto"]);
+				} finally {
+					database.close();
+				}
+			},
+		});
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
+	it("refreshes durable and in-memory expiry when the same incapability is observed again", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-refresh-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let now = 1_000;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		markToolChoiceIncapability(model("named"), "auto");
+
+		now += 29 * 24 * 60 * 60 * 1000;
+		markToolChoiceIncapability(model("named"), "auto");
+		now += 2 * 24 * 60 * 60 * 1000;
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("auto");
+	});
+
 	it("recovers from a corrupted cache without changing fallback behavior", async () => {
 		using tempDir = TempDir.createSync("tool-choice-capability-corrupt-");
 		const cachePath = path.join(tempDir.path(), "capabilities.db");
