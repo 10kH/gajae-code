@@ -180,6 +180,21 @@ describe("durable tool-choice capability cache", () => {
 		expect(resolved.supportSource).toBe("runtime");
 	});
 
+	it("memoizes an empty durable lookup without hiding later revalidation", () => {
+		using tempDir = TempDir.createSync("tool-choice-capability-empty-");
+		const cachePath = path.join(tempDir.path(), "capabilities.db");
+		let now = 1_000;
+		let opens = 0;
+		configureToolChoiceCapabilityCacheForTests({ path: cachePath, now: () => now, onCacheOpen: () => opens++ });
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		expect(opens).toBe(1);
+
+		now += 5 * 60 * 1000;
+		expect(resolveToolChoice(model("named"), "required").support).toBe("named");
+		expect(opens).toBe(2);
+	});
+
 	it("expires learned support so provider behavior is re-probed", () => {
 		using tempDir = TempDir.createSync("tool-choice-capability-ttl-");
 		const cachePath = path.join(tempDir.path(), "capabilities.db");

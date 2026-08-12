@@ -19,12 +19,14 @@ const loggedRegistryKeys = new Set<string>();
 const registryExpiresAt = new Map<string, number>();
 const CACHE_SCHEMA_VERSION = 1;
 const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const EMPTY_CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 256;
 
 let cachePathOverride: string | undefined;
 let nowForTests: (() => number) | undefined;
 let beforeExpiredDeleteForTests: (() => void) | undefined;
 let beforeMalformedDeleteForTests: (() => void) | undefined;
+let onCacheOpenForTests: (() => void) | undefined;
 
 /**
  * Claude Mythos accepts tools but rejects forced tool use (Anthropic 400:
@@ -77,11 +79,13 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 	now?: () => number;
 	beforeExpiredDelete?: () => void;
 	beforeMalformedDelete?: () => void;
+	onCacheOpen?: () => void;
 }): void {
 	cachePathOverride = options?.path;
 	nowForTests = options?.now;
 	beforeExpiredDeleteForTests = options?.beforeExpiredDelete;
 	beforeMalformedDeleteForTests = options?.beforeMalformedDelete;
+	onCacheOpenForTests = options?.onCacheOpen;
 	clearToolChoiceIncapabilityRegistryForTests();
 }
 
@@ -294,12 +298,12 @@ function hydrateToolChoiceCapability(registryKey: string): void {
 	if (expiresAt !== undefined && now < expiresAt) return;
 	registry.delete(registryKey);
 	registryExpiresAt.delete(registryKey);
-	withCapabilityCache(database => {
+	const hydrated = withCapabilityCache(database => {
 		const digest = capabilityKeyDigest(registryKey);
 		const row = database
 			.query("SELECT max_support, support_rank, observed_at FROM tool_choice_capabilities WHERE key_digest = ?")
 			.get(digest) as { max_support?: unknown; support_rank?: unknown; observed_at?: unknown } | null;
-		if (!row) return;
+		if (!row) return false;
 		if (
 			!isToolChoiceSupport(row.max_support) ||
 			row.support_rank !== supportRank[row.max_support] ||
@@ -315,7 +319,7 @@ function hydrateToolChoiceCapability(registryKey: string): void {
 					typeof row.observed_at === "number" ? row.observed_at : -1,
 				],
 			);
-			return;
+			return false;
 		}
 		if (now - row.observed_at >= CACHE_TTL_MS) {
 			beforeExpiredDeleteForTests?.();
@@ -323,11 +327,15 @@ function hydrateToolChoiceCapability(registryKey: string): void {
 				digest,
 				row.observed_at,
 			]);
-			return;
+			return false;
 		}
 		registry.set(registryKey, row.max_support);
 		registryExpiresAt.set(registryKey, row.observed_at + CACHE_TTL_MS);
+		return true;
 	});
+	if (hydrated === false && !registryExpiresAt.has(registryKey)) {
+		registryExpiresAt.set(registryKey, now + EMPTY_CACHE_TTL_MS);
+	}
 }
 
 function persistToolChoiceCapability(
@@ -383,6 +391,7 @@ function withCapabilityCache<T>(operation: (database: Database) => T): T | undef
 }
 
 function openCapabilityCache(cachePath: string): Database {
+	onCacheOpenForTests?.();
 	const database = new Database(cachePath, { create: true, strict: true });
 	try {
 		database.run("PRAGMA busy_timeout = 3000");
