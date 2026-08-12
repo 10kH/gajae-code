@@ -1436,30 +1436,46 @@ describe("ChatDaemonController ownership safety", () => {
 		expect(signals).toEqual([]);
 	});
 
-	test("treats EPERM liveness probes as an existing chat daemon owner", async () => {
+	test.each([
+		["discord", "EPERM", "operation not permitted"],
+		["discord", undefined, "probe authority unavailable"],
+		["slack", "EPERM", "operation not permitted"],
+		["slack", undefined, "probe authority unavailable"],
+	] as const)("treats %s %s liveness probes as an existing chat daemon owner", async (kind, code, message) => {
 		const agentDir = tempAgentDir();
+		const providerSettings =
+			kind === "discord"
+				? {
+						"notifications.discord.botToken": "discord-token",
+						"notifications.discord.applicationId": "app",
+						"notifications.discord.guildId": "guild",
+						"notifications.discord.parentChannelId": "parent",
+					}
+				: {
+						"notifications.slack.botToken": "slack-token",
+						"notifications.slack.appToken": "slack-app-token",
+						"notifications.slack.workspaceId": "workspace",
+						"notifications.slack.channelId": "channel",
+					};
 		const s = setPrivateAgentDir(
 			Settings.isolated({
 				"notifications.enabled": true,
-				"notifications.discord.botToken": "discord-token",
-				"notifications.discord.applicationId": "app",
-				"notifications.discord.guildId": "guild",
-				"notifications.discord.parentChannelId": "parent",
+				...providerSettings,
 			}) as Settings,
 			agentDir,
 		);
-		const identity = crypto
-			.createHash("sha256")
-			.update(["discord-token", "app", "guild", "parent", "false", "lean"].join("\0"))
-			.digest("hex")
-			.slice(0, 16);
-		const paths = chatDaemonPaths(agentDir, "discord");
+		const identityParts =
+			kind === "discord"
+				? ["discord-token", "app", "guild", "parent", "false", "lean"]
+				: ["slack-token", "slack-app-token", "workspace", "channel", "", "false", "lean"];
+		const identity = crypto.createHash("sha256").update(identityParts.join("\0")).digest("hex").slice(0, 16);
+		const paths = chatDaemonPaths(agentDir, kind);
 		fs.mkdirSync(paths.dir, { recursive: true });
 		fs.writeFileSync(
 			paths.state,
 			JSON.stringify({
 				version: 1,
-				kind: "discord",
+				kind,
 				pid: 77,
 				ownerId: "owner-a",
 				identity,
@@ -1467,15 +1483,17 @@ describe("ChatDaemonController ownership safety", () => {
 				startedAt: Date.now(),
 				heartbeatAt: Date.now(),
 				transportHealthy: true,
-				generation: chatDaemonGeneration("discord"),
+				generation: chatDaemonGeneration(kind),
 			}),
 		);
 		const kill = spyOn(process, "kill").mockImplementation(() => {
-			throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+			const error = new Error(message) as NodeJS.ErrnoException;
+			if (code) error.code = code;
+			throw error;
 		});
 		let spawns = 0;
 		try {
-			const controller = new ChatDaemonController(s, "discord", {
+			const controller = new ChatDaemonController(s, kind, {
 				pidIncarnation: () => "linux:12345",
 				spawn: () => {
 					spawns++;
@@ -3108,6 +3126,53 @@ describe("runChatDaemonInternal heartbeat ownership", () => {
 	function workerArgs(agentDir: string): string[] {
 		return ["--agent-dir", agentDir, "--owner-id", `${process.pid}-heartbeat-test`];
 	}
+
+	test.each([
+		["EPERM", "operation not permitted"],
+		[undefined, "probe authority unavailable"],
+	] as const)("retains launcher ownership when the default probe returns %s", async (code, message) => {
+		const agentDir = tempAgentDir();
+		writeChatDaemonConfig(agentDir);
+		const kill = spyOn(process, "kill").mockImplementation(() => {
+			const error = new Error(message) as NodeJS.ErrnoException;
+			if (code) error.code = code;
+			throw error;
+		});
+		let constructed = false;
+		try {
+			await runChatDaemonInternal("discord", workerArgs(agentDir), {
+				pidIncarnation: () => "linux:12345",
+				createRuntime: () => {
+					constructed = true;
+					return { start: async () => undefined, stop: async () => undefined };
+				},
+				renewHeartbeat: async () => false,
+			});
+			expect(constructed).toBe(true);
+		} finally {
+			kill.mockRestore();
+		}
+	});
+
+	test("returns before constructing the runtime when the default launcher probe returns ESRCH", async () => {
+		const agentDir = tempAgentDir();
+		writeChatDaemonConfig(agentDir);
+		const kill = spyOn(process, "kill").mockImplementation(() => {
+			throw Object.assign(new Error("no such process"), { code: "ESRCH" });
+		});
+		let constructed = false;
+		try {
+			await runChatDaemonInternal("discord", workerArgs(agentDir), {
+				createRuntime: () => {
+					constructed = true;
+					throw new Error("runtime should not be constructed");
+				},
+			});
+			expect(constructed).toBe(false);
+		} finally {
+			kill.mockRestore();
+		}
+	});
 
 	test("returns cleanly without constructing a desired-off provider runtime", async () => {
 		const agentDir = tempAgentDir();
