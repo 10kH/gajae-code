@@ -1,236 +1,118 @@
 # Hooks
 
-GJC exposes three distinct hook categories. They share a canonical event model but differ in authority, distribution, and trust. This document separates them clearly so you never need to understand separate runner internals.
+GJC currently has three execution surfaces that are all called hooks. The canonical model in `packages/coding-agent/src/hooks/events.ts` is a **normalization and documentation layer** over those existing runtimes. It does not replace `HookRunner`, `ExtensionRunner`, Codex, or the constrained plugin loader, and it does not make unsupported events executable.
 
-> **TL;DR** — Use the table below to pick the right hook type, then read its section.
+| Surface | Runtime authority | Distribution | Runtime owner |
+|---|---|---|---|
+| Native/Claude/Codex hook directories | In-process `HookAPI` module | User/project files | GJC `HookRunner` |
+| Codex managed `hooks.json` | External command | User Codex configuration | Codex invokes `gjc codex-native-hook` |
+| Distributable plugin hooks | Constrained GJC API; ambient host-process authority | Installed plugin bundle | GJC `ExtensionRunner` adapter |
 
-| Category | What it is | Authority | Distributable | Trust |
-|----------|-----------|-----------|---------------|-------|
-| **Command hooks** | Shell scripts in `.gjc/hooks/`, `.claude/hooks/`, `.codex/hooks/` or Codex `hooks.json` | Shell execution | Per-project files | Project trust required |
-| **In-process extensions** | TypeScript hook modules with full `HookAPI` | Full (sendMessage, exec, commands) | First-party / user-installed only | Project trust required |
-| **Distributable plugin hooks** | Hooks inside GJC plugin bundles (`gajae-plugin.json`) | Constrained (observe + structured result only) | Yes — installable from git/tarball | No shell, no message injection |
+The broader in-process `HookAPI` also contains lifecycle/context events. Only semantically safe overlaps are assigned one of the six canonical names.
 
-## Canonical event model
+## Canonical names
 
-All three categories normalize to one internal event IR. Every event documents its ordering, cancellation, timeout, error behavior, and authority requirements.
+| Canonical kind | Accepted source event | Important difference retained |
+|---|---|---|
+| `user_prompt_submit` | in-process `before_agent_start`; managed Codex `UserPromptSubmit` | Payload, output, ordering, and command behavior remain runtime-owned |
+| `pre_tool_use` | directory `pre`; plugin `tool_call/before`; in-process `tool_call` | Directory hooks are imported modules, not shell scripts |
+| `post_tool_use` | directory `post`; plugin `tool_call/after` or `tool_result/after`; in-process `tool_result` | Mutation fields and timeouts differ by runner |
+| `stop` | managed Codex `Stop`; in-process `agent_end` | `turn_end` is rejected because it fires once per turn, not once per agent loop |
+| `session_start` | in-process `session_start` | No command/plugin equivalent |
+| `session_shutdown` | in-process `session_shutdown` | The current runner awaits handlers; it is not fire-and-forget |
 
-| Canonical event | Claude Code name | Codex name | In-process name | Command hooks? | Plugin hooks? |
-|----------------|-----------------|------------|-----------------|----------------|---------------|
-| `user_prompt_submit` | `UserPromptSubmit` | `UserPromptSubmit` (hooks.json) | `before_agent_start` | hooks.json only | ✗ |
-| `pre_tool_use` | `pre/` dir | `pre-*` file / `pre/` dir | `tool_call` | ✓ | ✓ |
-| `post_tool_use` | `post/` dir | `post-*` file / `post/` dir | `tool_result` | ✓ | ✓ |
-| `stop` | — | `Stop` (hooks.json) | `turn_end` / `agent_end` | hooks.json only | ✗ |
-| `session_start` | — | — | `session_start` | — | ✗ |
-| `session_shutdown` | — | — | `session_shutdown` | — | ✗ |
+Unknown names and unsupported convention/event pairs produce bounded diagnostics. The adapter never treats an alias as authority.
 
-### Event contract reference
+## Execution contracts
 
-| Event | Async | Ordering | Can cancel | Can mutate | Timeout | Error isolation | Shell |
-|-------|-------|----------|-----------|------------|---------|-----------------|-------|
-| `user_prompt_submit` | yes | sequential | no | no | none | isolate | allowed |
-| `pre_tool_use` | yes | sequential | **yes** (block) | no | 30s | isolate | allowed |
-| `post_tool_use` | yes | sequential | no | **yes** (modify result) | 30s | isolate | allowed |
-| `stop` | yes | sequential | no | no | 30s | isolate | allowed |
-| `session_start` | yes | sequential | no | no | none | isolate | none |
-| `session_shutdown` | no | sequential | no | no | 5s | isolate | none |
+The authoritative per-convention table is `CONVENTION_EVENT_CONTRACTS`. A single global timeout/error table would be false because the runtimes differ.
 
-Key behaviors:
-- **Sequential ordering**: handlers run in registration order; each is awaited before the next.
-- **Error isolation**: a handler error does not stop other handlers; the originating operation proceeds unless a block result was already returned.
-- **Pre-tool cancellation**: a `pre_tool_use` handler returning `{ block: true, reason: "..." }` stops the tool from executing.
-- **Post-tool mutation**: a `post_tool_use` handler can return modified `{ content }` to change what the agent sees.
-- **Secret redaction**: `pre_tool_use` and `post_tool_use` redact known secret keys from logged payloads; `user_prompt_submit` redacts values, keeping only keys for diagnostics.
+### Native, Claude, and Codex hook directories
 
----
+Discovery paths:
 
-## 1. Command hooks (shell scripts)
+- native GJC: `~/.gjc/hooks/{pre,post}/` and `.gjc/hooks/{pre,post}/`;
+- Claude: `.claude/hooks/{pre,post}/`;
+- Codex: `.codex/hooks/pre-<tool>.{ts,js}` and `post-<tool>.{ts,js}`.
 
-Shell scripts that run at tool execution boundaries. GJC discovers them from three directory conventions plus the Codex `hooks.json` managed integration.
+These files are loaded with Bun `import()` and must export a hook factory. They receive the full in-process `HookAPI`, including `exec`, messages, renderers, and command registration. They are **not command/shell-script hooks** merely because some legacy discovery comments use that terminology.
 
-### Native GJC hooks (`.gjc/hooks/`)
+Current runtime truth:
 
-```
-.gjc/hooks/
-  pre/
-    bash          # runs before the bash tool
-    edit          # runs before the edit tool
-    *             # runs before every tool
-  post/
-    bash          # runs after the bash tool
-    write         # runs after the write tool
-```
+| Event | Ordering | Timeout | Error behavior | Cancellation/mutation |
+|---|---|---|---|---|
+| `tool_call` / `pre_tool_use` | sequential, awaited | none | fail closed; the tool does not execute | first `{ block: true }` stops later handlers |
+| `tool_result` / `post_tool_use` | sequential, awaited | none | errors are isolated | last returned replacement wins; `HookToolWrapper` applies `content` and `details`, not `isError` |
+| ordinary lifecycle events | sequential, awaited | none | errors are isolated | event-specific |
 
-- File name (minus extension) = tool name, or `*` for all tools.
-- `pre/` scripts run before the tool; `post/` scripts run after.
-- Both user (`~/.gjc/hooks/`) and project (`.gjc/hooks/`) levels are discovered.
+Project-directory hook modules execute as code during loading. There is currently no separate workspace-trust prompt in this hook loader. The normalization table therefore records `not-enforced` rather than claiming a nonexistent trust gate.
 
-### Claude Code hooks (`.claude/hooks/`)
+Hook error listeners receive the hook path, event name, and error message. The runner does not redact event payloads because it does not log them, but error messages and hook code can contain sensitive data; the canonical layer does not add a redaction boundary.
 
-```
-.claude/hooks/
-  pre/
-    edit.sh
-  post/
-    write.sh
-```
+## Codex managed `hooks.json`
 
-Same layout as native GJC hooks. Discovered from the project `.claude/` directory. Extensions `.sh`, `.bash`, `.zsh`, `.fish` are stripped when deriving the tool name.
+`gjc setup hooks` merges two managed entries into `~/.codex/hooks.json`:
 
-### Codex project hooks (`.codex/hooks/`)
+- `UserPromptSubmit`;
+- `Stop`.
 
-```
-.codex/hooks/
-  pre-edit.ts      # runs before the edit tool
-  post-write.js    # runs after the write tool
-```
+Both invoke `gjc codex-native-hook`. GJC validates and handles its command payload, but Codex owns scheduling, ordering, timeout, cancellation, environment, and command logging. Those fields are marked `external-runtime` or `provider-owned`; they are not guessed from the in-process runner.
 
-File names use the `pre-<tool>` / `post-<tool>` convention with `.ts` or `.js` extensions.
+The adapter rejects unknown event names and empty commands. It does not claim Claude settings-hook execution: GJC currently discovers Claude `pre/` and `post/` modules only.
 
-### Codex `hooks.json` managed integration
+## Distributable plugin hooks
 
-GJC installs a managed integration into `~/.codex/hooks.json` for `UserPromptSubmit` and `Stop` events:
+Plugin manifests support only the compiler-accepted tool shapes:
 
-```sh
-gjc setup hooks           # install the managed hooks
-gjc setup hooks --check   # verify installation
-```
+- `tool_call` requires a target and `before` or `after` phase;
+- `tool_result` requires `after` phase.
 
-This wires `gjc codex-native-hook` as the command for those two events. The managed integration is merged idempotently — existing user hooks are preserved.
+`tool_call/after` is a post-tool observation and normalizes to `post_tool_use`; it must never gain pre-tool blocking authority. Aliases such as `pre_tool_use`, `UserPromptSubmit`, or `session_start` are rejected for plugins even if those names exist elsewhere.
 
-### Command hook semantics
+The loader realpath-confines the implementation beneath the installed plugin root, verifies hashes, requires exactly one registration for the declared event, and provides a constrained **GJC API**. Calls to `exec`, `sendMessage`, `appendEntry`, `registerCommand`, or `registerMessageRenderer` throw `security_policy`.
 
-- **Authority**: shell execution (Command).
-- **Project trust**: required — command hooks run executables and are only loaded from trusted project/user directories.
-- **Timeout**: `pre_tool_use` and `post_tool_use` have a 30-second default timeout.
-- **Error behavior**: isolated — one hook's failure does not block others or the tool itself unless a pre-hook explicitly blocks.
+This is not a JavaScript or operating-system sandbox. The module is imported into the GJC process and retains ambient Bun/JavaScript globals, so an installed plugin must still be treated as trusted executable code. `Constrained` means it cannot obtain broader GJC extension capabilities through the normalizer or supplied API; it does not mean the host process has removed every process/filesystem/network primitive. The contract records `ambient-host` process authority instead of claiming isolation that does not exist.
 
----
+The runtime adapter filters target tool names with exact, case-sensitive logical-name matching. Normalization rejects empty names, path separators, NUL, `.` and `..`; `*` is the only wildcard. Filesystem case rules do not change logical tool matching.
 
-## 2. In-process extension hooks
+Plugin execution uses `ExtensionRunner` after adaptation:
 
-TypeScript modules that run inside the GJC process with full `HookAPI` access. These are first-party hooks installed by the user, not distributable.
+| Shape | Canonical kind | Timeout | Error behavior | Authority |
+|---|---|---|---|---|
+| `tool_call/before` | `pre_tool_use` | none | thrown error fails closed and blocks | constrained GJC API; ambient host |
+| `tool_call/after` | `post_tool_use` | 30s | timeout/error isolated | constrained GJC API; ambient host |
+| `tool_result/after` | `post_tool_use` | 30s | timeout/error isolated | constrained GJC API; ambient host |
 
-### Layout
+## In-process lifecycle normalization
 
-Hook modules are TypeScript files exporting a default factory:
+The full `HookAPI` remains larger than the six-event model. `context`, compaction, retry, tree, and other events continue directly through `HookRunner` and receive the diagnostic `in_process_event_outside_hook_ir` when inspected by the normalizer.
 
-```typescript
-// ~/.gjc/hooks/my-hook.ts
-import type { HookFactory } from "@gajae-code/coding-agent";
+`before_agent_start` is the closest safe prompt-submission overlap and can return a message for injection. `agent_end` is the loop-end overlap for `stop`. `turn_end` is deliberately rejected with `semantic_mismatch` because collapsing per-turn and per-loop events would silently change invocation counts.
 
-export default ((pi) => {
-  // Register for canonical events via the in-process event names
-  pi.on("tool_call", (event) => {
-    if (event.toolName === "bash" && event.input.command?.includes("rm -rf")) {
-      return { block: true, reason: "Destructive command blocked by hook" };
-    }
-  });
+## Diagnostics and batch behavior
 
-  pi.on("tool_result", (event) => {
-    // Observe or modify results
-  });
+Diagnostic codes are stable constants:
 
-  pi.on("turn_end", () => {
-    // Turn cleanup
-  });
-}) satisfies HookFactory;
-```
+- `unsupported_convention_event`;
+- `unrecognized_plugin_event`;
+- `invalid_plugin_phase`;
+- `invalid_tool_matcher`;
+- `invalid_source`;
+- `invalid_command`;
+- `duplicate_hook`;
+- `in_process_event_outside_hook_ir`;
+- `semantic_mismatch`.
 
-### Available API
+Batch normalization accepts already-bounded adapter results, preserves input order, keeps the first exact duplicate, and emits `duplicate_hook` for later copies. Rejected hooks are never returned in `hooks`, and their diagnostics are never dropped.
 
-In-process hooks receive the full `HookAPI`:
-- `pi.on(event, handler)` — subscribe to events.
-- `pi.sendMessage(message)` — inject messages into the agent conversation.
-- `pi.appendEntry(customType, data)` — append session entries.
-- `pi.registerCommand(command)` — register slash commands.
-- `pi.registerMessageRenderer(type, renderer)` — custom TUI rendering.
-- `pi.exec(command, options)` — shell execution.
+## Runtime integration boundary
 
-### Semantics
+Native/Claude/Codex discovery is validated through `normalizeDirectoryHook` before discovered modules are imported. Constrained plugin execution uses the same plugin normalization rules when selecting its runtime registration event. The canonical layer therefore participates in startup/runtime adaptation without becoming a second dispatcher.
 
-- **Authority**: InProcess (broadest — full API access).
-- **Distribution**: first-party / user-installed only. Never loaded from distributable plugin bundles.
-- **Trust**: project trust required.
-- **Events**: all canonical events are available, plus additional lifecycle/context events (`session_before_compact`, `context`, `auto_compaction_start`, etc.) that run directly through the extension runner.
+It does **not**:
 
----
-
-## 3. Distributable plugin hooks (GJC plugin bundles)
-
-Hooks inside GJC plugin bundles (`gajae-plugin.json`). These are **constrained**: they can observe events and return structured results (block/modify) but **cannot** call shell, inject messages, or register commands.
-
-### Manifest declaration
-
-```json
-{
-  "kind": "gajae-code-plugin",
-  "name": "audit-bundle",
-  "version": "1.0.0",
-  "hooks": [
-    {
-      "name": "audit-read",
-      "event": "tool_call",
-      "target": "read",
-      "phase": "before",
-      "path": "hooks/audit-read.ts"
-    }
-  ]
-}
-```
-
-### Hook implementation
-
-```typescript
-// hooks/audit-read.ts
-export default function (pi) {
-  // Constrained API: only pi.on(event, handler) and pi.logger
-  // Calling pi.sendMessage, pi.registerCommand, pi.exec throws security_policy
-  pi.on("tool_call", (event) => {
-    pi.logger.info(`Read accessed: ${event.toolCallId}`);
-    // Can return { block: true, reason: "..." } to block
-    // Cannot call shell or inject messages
-  });
-}
-```
-
-### Constrained authority guarantees
-
-The constrained hook loader enforces these restrictions at load time:
-
-| API method | Available? |
-|-----------|-----------|
-| `pi.on(event, handler)` | ✓ (must register exactly the declared event) |
-| `pi.logger` | ✓ |
-| `pi.sendMessage(...)` | ✗ throws `security_policy` |
-| `pi.appendEntry(...)` | ✗ throws `security_policy` |
-| `pi.registerCommand(...)` | ✗ throws `security_policy` |
-| `pi.registerMessageRenderer(...)` | ✗ throws `security_policy` |
-| `pi.exec(...)` | ✗ throws `security_policy` |
-
-### Additional guarantees
-
-- **Hash verification**: plugin hook implementation files are hash-verified at session start. Hash drift quarantines the hook.
-- **Single-event enforcement**: the factory must register exactly the declared event — registering anything else quarantines the hook.
-- **No normalization escape hatch**: the canonical event model grants plugin hooks only `Constrained` authority. There is no path from a plugin hook to `Command` or `InProcess` authority through the normalization layer.
-
-### Supported events
-
-Plugin hooks support only tool-scoped events:
-- `tool_call` (phase `before`) → `pre_tool_use`
-- `tool_result` (phase `after`) → `post_tool_use`
-
-User prompt, stop, and session lifecycle events are **not available** to plugin hooks. Use command hooks (shell scripts) or in-process extensions for those events.
-
----
-
-## Normalization contract
-
-The canonical event IR (`packages/coding-agent/src/hooks/events.ts`) and adapters (`packages/coding-agent/src/hooks/normalize.ts`) enforce these rules:
-
-1. **Overlap normalizes to the same IR**: a pre-tool shell script in `.gjc/hooks/pre/edit`, `.claude/hooks/pre/edit.sh`, and `.codex/hooks/pre-edit.ts` all produce the same canonical `pre_tool_use` event with `Command` authority.
-
-2. **Unsupported semantics fail explicitly**: if a convention does not support an event kind (e.g., native `.gjc/hooks` directories cannot express `UserPromptSubmit`), the adapter emits an `unsupported_convention_event` diagnostic. Nothing is silently ignored.
-
-3. **Authority is an enum, not an escape hatch**: each convention grants a fixed authority level per event. Plugin hooks are always `Constrained` regardless of event — the normalization layer cannot be tricked into granting `InProcess` or `Command` authority to a distributable plugin.
-
-4. **Constrained hooks remain constrained**: the `CONVENTION_AUTHORITY` table is the single source of truth. The constrained hook loader (`constrained-hooks.ts`) independently enforces the API denial list at module load time as defense in depth.
+- execute a hook itself;
+- add Claude named settings hooks that discovery does not support;
+- change Codex-owned managed-hook semantics;
+- replace the extension lifecycle API;
+- create a new logging/redaction or workspace-trust mechanism.

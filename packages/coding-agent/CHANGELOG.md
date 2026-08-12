@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Hook discovery now records one canonical six-kind normalization contract while preserving each existing runtime's real authority and semantics. Native/Claude/Codex directory modules are validated before import, constrained plugin after-phases select the post-tool runtime path without gaining blocking authority, unsupported aliases and malformed matchers fail closed with stable diagnostics, and Codex-managed command timing/trust/redaction remain explicitly provider-owned.
+
 ### Fixed
 - The legacy `agentDir/settings.json` source is now retired (`.bak`) only after the combined migration commits: a malformed `agent.db` row that aborts the load keeps the source discoverable for the next load instead of stranding its only copy.
 - An unreadable project ownership marker (`.gjc/state/settings.json.migrated-keys`, e.g. EACCES/EISDIR) now aborts the project migration instead of treating it as empty and reimporting a stale retained value.

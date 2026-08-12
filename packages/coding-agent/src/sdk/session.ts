@@ -96,6 +96,7 @@ import { loadActiveSubskillTools } from "../extensibility/gjc-plugins/tools";
 import { loadSkills, type Skill, type SkillWarning, setActiveSkills } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import type { HindsightSessionState } from "../hindsight/state";
+import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
@@ -922,11 +923,20 @@ function createCustomToolsExtension(tools: CustomTool[]): ExtensionFactory {
 export function createPluginHooksExtension(hooks: ConstrainedPluginHook[]): ExtensionFactory {
 	return api => {
 		for (const hook of hooks) {
-			// Constrained hooks have one explicit execution phase. `tool_call` is
-			// pre-execution; an after-phase tool_call hook is registered on the
-			// post-execution tool_result event so it cannot block the tool.
-			const registrationEvent = hook.event === "tool_call" && hook.phase === "after" ? "tool_result" : hook.event;
-			const target = hook.target;
+			const normalized = normalizePluginHook({
+				declaredEvent: hook.event,
+				target: hook.target,
+				phase: hook.phase,
+				plugin: hook.plugin,
+				source: `plugin:${hook.plugin}`,
+			});
+			if (!normalized.hook) {
+				throw new Error(
+					normalized.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "),
+				);
+			}
+			const registrationEvent = normalized.hook.runtimeEvent;
+			const target = normalized.hook.toolName === "*" ? undefined : normalized.hook.toolName;
 			const handler = target
 				? (event: { toolName?: string; tool?: { name?: string }; name?: string }, ...rest: unknown[]) => {
 						const toolName = event?.toolName ?? event?.tool?.name ?? event?.name;

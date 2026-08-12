@@ -1,453 +1,333 @@
 import { describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import "../src/discovery/codex";
+import { EXTENSION_HANDLER_TIMEOUT_MS } from "../src/extensibility/extensions/runner";
+import { discoverAndLoadHooks } from "../src/extensibility/hooks/loader";
 import {
-	CONVENTION_AUTHORITY,
+	CONVENTION_EVENT_CONTRACTS,
 	EXTERNAL_EVENT_ALIASES,
-	HOOK_EVENT_CONTRACTS,
+	HOOK_EVENT_SCHEMAS,
 	HookAuthority,
 	HookEventKind,
 	HookSourceConvention,
 } from "../src/hooks/events";
 import {
-	authorityMismatchDiagnostic,
+	HookDiagnosticCode,
 	HookDiagnosticSeverity,
 	normalizeDirectoryHook,
 	normalizeHookBatch,
 	normalizeInProcessHook,
 	normalizeManagedJsonHook,
 	normalizePluginHook,
+	normalizeToolMatcher,
 	resolveAuthority,
 	resolveCanonicalKind,
+	resolveExecutionContract,
 } from "../src/hooks/normalize";
 
-// ===========================================================================
-// Acceptance test 1: equivalent Claude/Codex/native fixtures normalize to
-// the same event IR where semantics overlap.
-// ===========================================================================
+const directory = (convention: HookSourceConvention, phase: "pre" | "post", toolName = "edit") =>
+	normalizeDirectoryHook({ convention, phase, toolName, source: `${convention}:${phase}:${toolName}` });
 
-describe("acceptance 1: cross-convention IR normalization", () => {
-	it("native pre-tool, Claude pre-tool, and Codex pre-tool all normalize to PreToolUse with command authority", () => {
-		const nativeResult = normalizeDirectoryHook({
-			convention: HookSourceConvention.NativeGjc,
-			phase: "pre",
-			toolName: "edit",
-			source: ".gjc/hooks/pre/edit.sh",
-		});
-		const claudeResult = normalizeDirectoryHook({
-			convention: HookSourceConvention.ClaudeCode,
-			phase: "pre",
-			toolName: "edit",
-			source: ".claude/hooks/pre/edit.sh",
-		});
-		const codexResult = normalizeDirectoryHook({
-			convention: HookSourceConvention.Codex,
-			phase: "pre",
-			toolName: "edit",
-			source: ".codex/hooks/pre-edit.ts",
-		});
-
-		expect(nativeResult.diagnostics).toEqual([]);
-		expect(claudeResult.diagnostics).toEqual([]);
-		expect(codexResult.diagnostics).toEqual([]);
-
-		// All three normalize to the same canonical kind + authority
-		for (const result of [nativeResult, claudeResult, codexResult]) {
-			expect(result.hook).not.toBeNull();
-			expect(result.hook!.kind).toBe(HookEventKind.PreToolUse);
-			expect(result.hook!.authority).toBe(HookAuthority.Command);
-			expect(result.hook!.toolName).toBe("edit");
-			expect(result.hook!.projectTrustRequired).toBe(true);
-		}
-
-		// Convention field preserves provenance
-		expect(nativeResult.hook!.convention).toBe(HookSourceConvention.NativeGjc);
-		expect(claudeResult.hook!.convention).toBe(HookSourceConvention.ClaudeCode);
-		expect(codexResult.hook!.convention).toBe(HookSourceConvention.Codex);
-	});
-
-	it("native post-tool, Claude post-tool, and Codex post-tool all normalize to PostToolUse", () => {
+describe("cross-convention normalization", () => {
+	it("normalizes native, Claude, and Codex directory metadata to one tool event while retaining provenance", () => {
 		for (const convention of [
 			HookSourceConvention.NativeGjc,
 			HookSourceConvention.ClaudeCode,
 			HookSourceConvention.Codex,
 		] as const) {
-			const result = normalizeDirectoryHook({
-				convention,
-				phase: "post",
-				toolName: "write",
-				source: `${convention}/hooks/post/write.sh`,
-			});
+			const result = directory(convention, "pre");
 			expect(result.diagnostics).toEqual([]);
-			expect(result.hook!.kind).toBe(HookEventKind.PostToolUse);
-			expect(result.hook!.authority).toBe(HookAuthority.Command);
+			expect(result.hook).toMatchObject({
+				kind: HookEventKind.PreToolUse,
+				runtimeEvent: "tool_call",
+				authority: HookAuthority.InProcess,
+				convention,
+				toolName: "edit",
+			});
 		}
 	});
 
-	it("Claude UserPromptSubmit and Codex managed-json UserPromptSubmit both normalize to UserPromptSubmit", () => {
-		const claudePre = normalizeDirectoryHook({
-			convention: HookSourceConvention.ClaudeCode,
-			phase: "pre",
-			toolName: "*",
-			source: ".claude/hooks/pre/UserPromptSubmit",
-		});
-		// Claude pre/* maps to PreToolUse, not UserPromptSubmit — the Claude
-		// directory convention does not have a dedicated UserPromptSubmit
-		// directory; it uses the pre/ layout. The managed-json path is the
-		// one that carries the named event.
-		expect(claudePre.hook!.kind).toBe(HookEventKind.PreToolUse);
+	it("does not mislabel imported directory modules as command hooks", () => {
+		for (const convention of [
+			HookSourceConvention.NativeGjc,
+			HookSourceConvention.ClaudeCode,
+			HookSourceConvention.Codex,
+		] as const) {
+			expect(directory(convention, "post").hook?.authority).toBe(HookAuthority.InProcess);
+		}
+	});
 
-		const codexManaged = normalizeManagedJsonHook({
+	it("keeps Codex managed JSON command authority separate", () => {
+		const result = normalizeManagedJsonHook({
 			externalEvent: "UserPromptSubmit",
 			command: "gjc codex-native-hook",
 			source: "~/.codex/hooks.json:UserPromptSubmit",
 		});
-		expect(codexManaged.diagnostics).toEqual([]);
-		expect(codexManaged.hook!.kind).toBe(HookEventKind.UserPromptSubmit);
-		expect(codexManaged.hook!.authority).toBe(HookAuthority.Command);
-		expect(codexManaged.hook!.convention).toBe(HookSourceConvention.CodexManagedJson);
+		expect(result.hook).toMatchObject({
+			kind: HookEventKind.UserPromptSubmit,
+			authority: HookAuthority.Command,
+			runtimeEvent: "UserPromptSubmit",
+		});
+		expect(result.hook?.contract.ordering).toBe("external-runtime");
 	});
 
-	it("Codex managed-json Stop and in-process turn_end both normalize to Stop", () => {
-		const codexStop = normalizeManagedJsonHook({
-			externalEvent: "Stop",
-			command: "gjc codex-native-hook",
-			source: "~/.codex/hooks.json:Stop",
-		});
-		const inProcTurnEnd = normalizeInProcessHook({
-			registeredEvent: "turn_end",
-			source: ".gjc/hooks/lifecycle.ts",
-		});
-		const inProcAgentEnd = normalizeInProcessHook({
-			registeredEvent: "agent_end",
-			source: ".gjc/hooks/lifecycle.ts",
-		});
-
-		expect(codexStop.hook!.kind).toBe(HookEventKind.Stop);
-		expect(inProcTurnEnd.hook!.kind).toBe(HookEventKind.Stop);
-		expect(inProcAgentEnd.hook!.kind).toBe(HookEventKind.Stop);
-	});
-
-	it("in-process tool_call and native pre-tool both normalize to PreToolUse", () => {
-		const inProc = normalizeInProcessHook({
-			registeredEvent: "tool_call",
-			source: ".gjc/hooks/pre-check.ts",
-		});
-		const native = normalizeDirectoryHook({
-			convention: HookSourceConvention.NativeGjc,
-			phase: "pre",
-			toolName: "bash",
-			source: ".gjc/hooks/pre/bash",
-		});
-
-		expect(inProc.hook!.kind).toBe(HookEventKind.PreToolUse);
-		expect(native.hook!.kind).toBe(HookEventKind.PreToolUse);
-		// But different authority: in-process gets InProcess, native gets Command
-		expect(inProc.hook!.authority).toBe(HookAuthority.InProcess);
-		expect(native.hook!.authority).toBe(HookAuthority.Command);
+	it("maps agent_end to Stop but rejects per-turn turn_end", () => {
+		expect(normalizeInProcessHook({ registeredEvent: "agent_end", source: "hook.ts" }).hook?.kind).toBe(
+			HookEventKind.Stop,
+		);
+		const turnEnd = normalizeInProcessHook({ registeredEvent: "turn_end", source: "hook.ts" });
+		expect(turnEnd.hook).toBeNull();
+		expect(turnEnd.diagnostics[0]?.code).toBe(HookDiagnosticCode.SemanticMismatch);
 	});
 });
 
-// ===========================================================================
-// Acceptance test 2: unsupported semantic differences fail with explicit
-// diagnostics instead of being silently ignored.
-// ===========================================================================
-
-describe("acceptance 2: unsupported semantics produce explicit diagnostics", () => {
-	it("native .gjc hooks cannot express UserPromptSubmit", () => {
-		// Native .gjc/hooks only has pre/ and post/ directories — there is no
-		// path for UserPromptSubmit. Attempting to normalize a native hook
-		// for UserPromptSubmit via directory layout fails.
-		const authority = resolveAuthority(HookSourceConvention.NativeGjc, HookEventKind.UserPromptSubmit);
-		expect(authority).toBeNull();
-	});
-
-	it("Codex managed-json cannot express PreToolUse", () => {
-		const authority = resolveAuthority(HookSourceConvention.CodexManagedJson, HookEventKind.PreToolUse);
-		expect(authority).toBeNull();
-	});
-
-	it("managed-json with unrecognized event produces explicit error diagnostic", () => {
-		const result = normalizeManagedJsonHook({
-			externalEvent: "UnknownEvent",
-			command: "some-cmd",
-			source: "~/.codex/hooks.json:UnknownEvent",
+describe("execution contracts reflect runtime differences", () => {
+	it("records actual HookRunner pre-tool fail-closed behavior", () => {
+		const contract = resolveExecutionContract(HookSourceConvention.NativeGjc, HookEventKind.PreToolUse);
+		expect(contract).toMatchObject({
+			runtimeEvent: "tool_call",
+			ordering: "sequential",
+			awaitBehavior: "awaited",
+			canCancel: true,
+			timeoutMs: null,
+			errorBehavior: "fail-closed",
+			processAuthority: "hook-api",
+			trustRequirement: "not-enforced",
+			redaction: "none",
 		});
-		expect(result.hook).toBeNull();
-		expect(result.diagnostics).toHaveLength(1);
-		expect(result.diagnostics[0].severity).toBe(HookDiagnosticSeverity.Error);
-		expect(result.diagnostics[0].code).toBe("unsupported_convention_event");
-		expect(result.diagnostics[0].message).toContain("UnknownEvent");
 	});
 
-	it("in-process hook for an unrecognized non-hook event produces warning diagnostic", () => {
-		// "session_before_compact" is a real extension event but outside the
-		// hook IR — it runs directly through the extension runner.
-		const result = normalizeInProcessHook({
-			registeredEvent: "session_before_compact",
-			source: ".gjc/hooks/ext.ts",
+	it("records actual HookRunner post-tool mutation and isolation behavior", () => {
+		const contract = resolveExecutionContract(HookSourceConvention.ClaudeCode, HookEventKind.PostToolUse);
+		expect(contract?.mutation).toEqual(["content", "details"]);
+		expect(contract?.timeoutMs).toBeNull();
+		expect(contract?.errorBehavior).toBe("isolate");
+	});
+
+	it("records constrained pre/post timeout and error differences", () => {
+		const pre = resolveExecutionContract(HookSourceConvention.GjcPlugin, HookEventKind.PreToolUse);
+		const post = resolveExecutionContract(HookSourceConvention.GjcPlugin, HookEventKind.PostToolUse);
+		expect(pre).toMatchObject({
+			authority: HookAuthority.Constrained,
+			timeoutMs: null,
+			errorBehavior: "fail-closed",
 		});
-		expect(result.hook).toBeNull();
-		expect(result.diagnostics).toHaveLength(1);
-		expect(result.diagnostics[0].severity).toBe(HookDiagnosticSeverity.Warning);
-		expect(result.diagnostics[0].code).toBe("in_process_event_outside_hook_ir");
-	});
-
-	it("plugin hook with unrecognized event produces explicit error diagnostic", () => {
-		const result = normalizePluginHook({
-			declaredEvent: "unknown_lifecycle",
-			plugin: "bad-plugin",
-			source: "plugins/bad/hooks/x.ts",
+		expect(post).toMatchObject({
+			authority: HookAuthority.Constrained,
+			timeoutMs: EXTENSION_HANDLER_TIMEOUT_MS,
+			errorBehavior: "isolate",
 		});
-		expect(result.hook).toBeNull();
-		expect(result.diagnostics).toHaveLength(1);
-		expect(result.diagnostics[0].severity).toBe(HookDiagnosticSeverity.Error);
-		expect(result.diagnostics[0].code).toBe("unrecognized_plugin_event");
+		expect(post?.mutation).toEqual(["content", "details", "isError"]);
 	});
 
-	it("batch normalization collects all diagnostics, never silently drops", () => {
-		const batch = normalizeHookBatch([
-			() =>
-				normalizeDirectoryHook({
-					convention: HookSourceConvention.NativeGjc,
-					phase: "pre",
-					toolName: "edit",
-					source: "a",
-				}),
-			() => normalizeManagedJsonHook({ externalEvent: "Bad", command: "x", source: "b" }),
-			() => normalizePluginHook({ declaredEvent: "nope", plugin: "p", source: "c" }),
-		]);
-		expect(batch.hooks).toHaveLength(1);
-		expect(batch.diagnostics).toHaveLength(2);
-		expect(batch.diagnostics.every(d => d.severity === HookDiagnosticSeverity.Error)).toBe(true);
+	it("does not invent GJC scheduling semantics for Codex-owned commands", () => {
+		const contract = resolveExecutionContract(HookSourceConvention.CodexManagedJson, HookEventKind.UserPromptSubmit);
+		expect(contract).toMatchObject({
+			ordering: "external-runtime",
+			awaitBehavior: "external-runtime",
+			errorBehavior: "external-runtime",
+			trustRequirement: "provider-owned",
+			redaction: "provider-owned",
+		});
+	});
+
+	it("covers every canonical schema without creating a parallel runtime union", () => {
+		expect(Object.keys(HOOK_EVENT_SCHEMAS).sort()).toEqual(Object.values(HookEventKind).sort());
+		for (const schema of Object.values(HOOK_EVENT_SCHEMAS)) {
+			expect(schema.input.length).toBeGreaterThan(0);
+			expect(schema.output.length).toBeGreaterThan(0);
+		}
 	});
 });
 
-// ===========================================================================
-// Acceptance test 3: ordering, cancellation, timeout, error isolation, and
-// tool-name matching are covered by the contract table.
-// ===========================================================================
-
-describe("acceptance 3: event contract metadata", () => {
-	it("PreToolUse is sequential, cancellable, non-mutating, with 30s timeout and isolate isolation", () => {
-		const contract = HOOK_EVENT_CONTRACTS[HookEventKind.PreToolUse];
-		expect(contract.ordering).toBe("sequential");
-		expect(contract.canCancel).toBe(true);
-		expect(contract.canMutate).toBe(false);
-		expect(contract.timeoutMs).toBe(30_000);
-		expect(contract.errorIsolation).toBe("isolate");
-		expect(contract.shellAuthority).toBe("allowed");
-		expect(contract.projectTrustRequired).toBe(true);
-	});
-
-	it("PostToolUse is sequential, non-cancellable, mutating, with 30s timeout", () => {
-		const contract = HOOK_EVENT_CONTRACTS[HookEventKind.PostToolUse];
-		expect(contract.ordering).toBe("sequential");
-		expect(contract.canCancel).toBe(false);
-		expect(contract.canMutate).toBe(true);
-		expect(contract.timeoutMs).toBe(30_000);
-		expect(contract.errorIsolation).toBe("isolate");
-	});
-
-	it("Stop is sequential, non-cancellable, non-mutating", () => {
-		const contract = HOOK_EVENT_CONTRACTS[HookEventKind.Stop];
-		expect(contract.canCancel).toBe(false);
-		expect(contract.canMutate).toBe(false);
-		expect(contract.ordering).toBe("sequential");
-	});
-
-	it("UserPromptSubmit has no timeout (user prompts can take as long as needed)", () => {
-		const contract = HOOK_EVENT_CONTRACTS[HookEventKind.UserPromptSubmit];
-		expect(contract.timeoutMs).toBeNull();
-	});
-
-	it("SessionShutdown is synchronous with a short timeout", () => {
-		const contract = HOOK_EVENT_CONTRACTS[HookEventKind.SessionShutdown];
-		expect(contract.async).toBe(false);
-		expect(contract.timeoutMs).toBe(5_000);
-		expect(contract.shellAuthority).toBe("none");
-		expect(contract.projectTrustRequired).toBe(false);
-	});
-
-	it("tool-name matching: directory hook preserves the target tool name", () => {
-		const result = normalizeDirectoryHook({
-			convention: HookSourceConvention.NativeGjc,
-			phase: "pre",
-			toolName: "bash",
-			source: ".gjc/hooks/pre/bash",
-		});
-		expect(result.hook!.toolName).toBe("bash");
-	});
-
-	it("wildcard tool name is preserved for managed-json hooks", () => {
-		const result = normalizeManagedJsonHook({
-			externalEvent: "Stop",
-			command: "x",
-			source: "s",
-		});
-		expect(result.hook!.toolName).toBe("*");
-	});
-
-	it("plugin hook preserves declared target", () => {
-		const result = normalizePluginHook({
-			declaredEvent: "tool_call",
-			target: "read",
-			phase: "before",
-			plugin: "p",
-			source: "s",
-		});
-		expect(result.hook!.toolName).toBe("read");
-	});
-});
-
-// ===========================================================================
-// Acceptance test 4: constrained plugin hooks remain constrained and cannot
-// acquire broad extension APIs through normalization.
-// ===========================================================================
-
-describe("acceptance 4: constrained plugin hook authority preservation", () => {
-	it("plugin tool_call hook normalizes to Constrained authority, never InProcess", () => {
+describe("constrained plugin authority cannot expand through normalization", () => {
+	it("maps tool_call/before to cancellable pre-tool constrained authority", () => {
 		const result = normalizePluginHook({
 			declaredEvent: "tool_call",
 			target: "edit",
 			phase: "before",
 			plugin: "audit",
-			source: "plugins/audit/hooks/audit-edit.ts",
+			source: "plugin:audit",
 		});
 		expect(result.diagnostics).toEqual([]);
-		expect(result.hook!.authority).toBe(HookAuthority.Constrained);
-		expect(result.hook!.authority).not.toBe(HookAuthority.InProcess);
-		expect(result.hook!.authority).not.toBe(HookAuthority.Command);
+		expect(result.hook).toMatchObject({
+			kind: HookEventKind.PreToolUse,
+			runtimeEvent: "tool_call",
+			authority: HookAuthority.Constrained,
+		});
 	});
 
-	it("plugin tool_result hook normalizes to Constrained authority", () => {
+	it("maps tool_call/after to post-tool and removes blocking authority", () => {
 		const result = normalizePluginHook({
+			declaredEvent: "tool_call",
+			target: "edit",
+			phase: "after",
+			plugin: "audit",
+			source: "plugin:audit",
+		});
+		expect(result.hook).toMatchObject({
+			kind: HookEventKind.PostToolUse,
+			runtimeEvent: "tool_result",
+			authority: HookAuthority.Constrained,
+		});
+		expect(result.hook?.contract.canCancel).toBe(false);
+	});
+
+	it("accepts only compiler-valid tool_result/after", () => {
+		const valid = normalizePluginHook({
 			declaredEvent: "tool_result",
 			phase: "after",
 			plugin: "audit",
-			source: "plugins/audit/hooks/audit-result.ts",
+			source: "plugin:audit",
 		});
-		expect(result.hook!.authority).toBe(HookAuthority.Constrained);
-	});
+		expect(valid.hook?.kind).toBe(HookEventKind.PostToolUse);
 
-	it("plugin hook for UserPromptSubmit is unsupported (plugin hooks are tool-scoped only)", () => {
-		const authority = resolveAuthority(HookSourceConvention.GjcPlugin, HookEventKind.UserPromptSubmit);
-		expect(authority).toBeNull();
-	});
-
-	it("plugin hook for Stop is unsupported", () => {
-		const authority = resolveAuthority(HookSourceConvention.GjcPlugin, HookEventKind.Stop);
-		expect(authority).toBeNull();
-	});
-
-	it("plugin hook for session lifecycle is unsupported", () => {
-		expect(resolveAuthority(HookSourceConvention.GjcPlugin, HookEventKind.SessionStart)).toBeNull();
-		expect(resolveAuthority(HookSourceConvention.GjcPlugin, HookEventKind.SessionShutdown)).toBeNull();
-	});
-
-	it("convention authority table grants only Constrained to GjcPlugin", () => {
-		const grants = CONVENTION_AUTHORITY[HookSourceConvention.GjcPlugin];
-		expect(Object.keys(grants)).toEqual(
-			expect.arrayContaining([HookEventKind.PreToolUse, HookEventKind.PostToolUse]),
-		);
-		// Every granted event is Constrained
-		for (const key of Object.keys(grants) as (keyof typeof grants)[]) {
-			expect(grants[key]).toBe(HookAuthority.Constrained);
+		for (const phase of [undefined, "before"] as const) {
+			const invalid = normalizePluginHook({
+				declaredEvent: "tool_result",
+				phase,
+				plugin: "audit",
+				source: "plugin:audit",
+			});
+			expect(invalid.hook).toBeNull();
+			expect(invalid.diagnostics[0]?.code).toBe(HookDiagnosticCode.InvalidPluginPhase);
 		}
-		// Only tool events — no lifecycle/prompt/stop
-		expect(grants[HookEventKind.UserPromptSubmit]).toBeUndefined();
-		expect(grants[HookEventKind.Stop]).toBeUndefined();
-		expect(grants[HookEventKind.SessionStart]).toBeUndefined();
 	});
 
-	it("authority mismatch diagnostic fires when convention would grant non-Constrained to a plugin", () => {
-		const diag = authorityMismatchDiagnostic(
-			HookSourceConvention.GjcPlugin,
-			HookEventKind.PreToolUse,
-			HookAuthority.InProcess,
-		);
-		expect(diag.code).toBe("authority_mismatch");
-		expect(diag.message).toContain("Constrained");
+	it("rejects aliases and lifecycle names instead of resolving them for plugins", () => {
+		for (const declaredEvent of [
+			"pre_tool_use",
+			"post_tool_use",
+			"UserPromptSubmit",
+			"Stop",
+			"session_start",
+			"agent_end",
+		]) {
+			const result = normalizePluginHook({
+				declaredEvent,
+				target: "bash",
+				phase: "before",
+				plugin: "malicious",
+				source: "plugin:malicious",
+			});
+			expect(result.hook).toBeNull();
+			expect(result.diagnostics[0]?.code).toBe(HookDiagnosticCode.UnrecognizedPluginEvent);
+		}
+	});
+
+	it("rejects malformed/defaulted tool_call descriptors", () => {
+		for (const input of [
+			{ target: undefined, phase: "before" as const },
+			{ target: "read", phase: undefined },
+			{ target: "", phase: "before" as const },
+		]) {
+			const result = normalizePluginHook({
+				declaredEvent: "tool_call",
+				...input,
+				plugin: "malicious",
+				source: "plugin:malicious",
+			});
+			expect(result.hook).toBeNull();
+			expect(result.diagnostics[0]?.code).toBe(HookDiagnosticCode.InvalidPluginPhase);
+		}
+	});
+
+	it("grants plugins only constrained authority", () => {
+		for (const contract of Object.values(CONVENTION_EVENT_CONTRACTS[HookSourceConvention.GjcPlugin])) {
+			expect(contract?.authority).toBe(HookAuthority.Constrained);
+			expect(contract?.processAuthority).toBe("ambient-host");
+		}
+		expect(resolveAuthority(HookSourceConvention.GjcPlugin, HookEventKind.UserPromptSubmit)).toBeNull();
+		expect(resolveAuthority(HookSourceConvention.GjcPlugin, HookEventKind.Stop)).toBeNull();
 	});
 });
 
-// ===========================================================================
-// Acceptance test 5: documentation clearly separates the three hook
-// categories. (This test validates the data model that the documentation
-// describes.)
-// ===========================================================================
-
-describe("acceptance 5: three hook categories are cleanly separated in the model", () => {
-	it("Constrained (plugin) authority cannot run shell", () => {
-		// Plugin hooks are Constrained — no shell authority
-		const pluginHook = normalizePluginHook({
-			declaredEvent: "tool_call",
-			target: "read",
-			phase: "before",
-			plugin: "p",
-			source: "s",
+describe("bounded diagnostics, matchers, provenance, duplicates, and ordering", () => {
+	it("rejects unknown managed events and empty commands", () => {
+		const unknown = normalizeManagedJsonHook({ externalEvent: "BeforeTool", command: "x", source: "hooks.json" });
+		expect(unknown.hook).toBeNull();
+		expect(unknown.diagnostics[0]).toMatchObject({
+			severity: HookDiagnosticSeverity.Error,
+			code: HookDiagnosticCode.UnsupportedConventionEvent,
 		});
-		expect(pluginHook.hook!.authority).toBe(HookAuthority.Constrained);
-		// The Constrained authority level does not carry shell access —
-		// the constrained hook loader enforces the API denial list at load.
+
+		const empty = normalizeManagedJsonHook({ externalEvent: "Stop", command: "  ", source: "hooks.json" });
+		expect(empty.hook).toBeNull();
+		expect(empty.diagnostics[0]?.code).toBe(HookDiagnosticCode.InvalidCommand);
 	});
 
-	it("Command (shell-script) authority requires project trust", () => {
-		const nativeHook = normalizeDirectoryHook({
-			convention: HookSourceConvention.NativeGjc,
+	it("rejects path-like, empty, dot, and NUL tool matchers while preserving case", () => {
+		for (const matcher of ["", "  ", ".", "..", "../bash", "a/b", "a\\b", "a\0b"]) {
+			expect(normalizeToolMatcher(matcher)).toBeNull();
+		}
+		expect(normalizeToolMatcher("Read")).toBe("Read");
+		expect(normalizeToolMatcher("read")).toBe("read");
+		expect(normalizeToolMatcher("*")).toBe("*");
+	});
+
+	it("retains source provenance and rejects blank sources", () => {
+		const source = ".claude/hooks/pre/edit.ts";
+		expect(directory(HookSourceConvention.ClaudeCode, "pre").hook?.source).toContain("claude-code");
+		const invalid = normalizeDirectoryHook({
+			convention: HookSourceConvention.ClaudeCode,
 			phase: "pre",
-			toolName: "bash",
-			source: ".gjc/hooks/pre/bash",
+			toolName: "edit",
+			source: " ",
 		});
-		expect(nativeHook.hook!.authority).toBe(HookAuthority.Command);
-		expect(nativeHook.hook!.projectTrustRequired).toBe(true);
+		expect(invalid.hook).toBeNull();
+		expect(invalid.diagnostics[0]?.code).toBe(HookDiagnosticCode.InvalidSource);
+		expect(source.length).toBeGreaterThan(0);
 	});
 
-	it("InProcess (extension) authority is the broadest and only for first-party", () => {
-		const extHook = normalizeInProcessHook({
-			registeredEvent: "tool_call",
-			source: ".gjc/hooks/pre-check.ts",
-		});
-		expect(extHook.hook!.authority).toBe(HookAuthority.InProcess);
+	it("batch normalization is stable first-wins and never drops rejection diagnostics", () => {
+		const first = directory(HookSourceConvention.NativeGjc, "pre", "bash");
+		const rejected = normalizeManagedJsonHook({ externalEvent: "Unknown", command: "x", source: "hooks.json" });
+		const batch = normalizeHookBatch([
+			first,
+			rejected,
+			first,
+			directory(HookSourceConvention.NativeGjc, "post", "bash"),
+		]);
+		expect(batch.hooks.map(hook => hook.kind)).toEqual([HookEventKind.PreToolUse, HookEventKind.PostToolUse]);
+		expect(batch.diagnostics.map(diagnostic => diagnostic.code)).toEqual([
+			HookDiagnosticCode.UnsupportedConventionEvent,
+			HookDiagnosticCode.DuplicateHook,
+		]);
 	});
 
-	it("the three authorities are distinct values", () => {
-		expect(HookAuthority.Constrained).not.toBe(HookAuthority.Command);
-		expect(HookAuthority.Constrained).not.toBe(HookAuthority.InProcess);
-		expect(HookAuthority.Command).not.toBe(HookAuthority.InProcess);
+	it("keeps aliases intentionally narrow", () => {
+		expect(EXTERNAL_EVENT_ALIASES.agent_end).toBe(HookEventKind.Stop);
+		expect(EXTERNAL_EVENT_ALIASES.turn_end).toBeUndefined();
+		expect(resolveCanonicalKind("BeforeTool")).toBeNull();
+		expect(resolveCanonicalKind("stop")).toBeNull();
 	});
 });
 
-// ===========================================================================
-// Contract table integrity
-// ===========================================================================
+describe("production discovery integration", () => {
+	it("normalizes Codex descriptors before import and preserves valid module loading", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-normalization-"));
+		const hooksDir = path.join(root, ".codex", "hooks");
+		const marker = path.join(root, "invalid-imported");
+		await fs.mkdir(hooksDir, { recursive: true });
+		await Bun.write(
+			path.join(hooksDir, "pre-read.ts"),
+			'export default (api: { on(event: string, handler: () => void): void }) => api.on("tool_call", () => undefined);\n',
+		);
+		await Bun.write(
+			path.join(hooksDir, "unprefixed.ts"),
+			`await Bun.write(${JSON.stringify(marker)}, "imported"); export default () => undefined;\n`,
+		);
 
-describe("event contract table integrity", () => {
-	it("HOOK_EVENT_CONTRACTS covers every HookEventKind", () => {
-		const kinds: HookEventKind[] = [
-			HookEventKind.UserPromptSubmit,
-			HookEventKind.PreToolUse,
-			HookEventKind.PostToolUse,
-			HookEventKind.Stop,
-			HookEventKind.SessionStart,
-			HookEventKind.SessionShutdown,
-		];
-		for (const kind of kinds) {
-			expect(HOOK_EVENT_CONTRACTS[kind]).toBeDefined();
-			expect(HOOK_EVENT_CONTRACTS[kind].kind).toBe(kind);
+		try {
+			const result = await discoverAndLoadHooks([], root);
+			expect(result.hooks.some(hook => hook.path.endsWith("pre-read.ts"))).toBe(true);
+			const invalidError = result.errors.find(error => error.path.endsWith("unprefixed.ts"));
+			expect(invalidError?.error).toContain("semantic_mismatch");
+			expect(await Bun.file(marker).exists()).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
 		}
-	});
-
-	it("EXTERNAL_EVENT_ALIASES maps Claude, Codex, and in-process names correctly", () => {
-		expect(EXTERNAL_EVENT_ALIASES.UserPromptSubmit).toBe(HookEventKind.UserPromptSubmit);
-		expect(EXTERNAL_EVENT_ALIASES.Stop).toBe(HookEventKind.Stop);
-		expect(EXTERNAL_EVENT_ALIASES.tool_call).toBe(HookEventKind.PreToolUse);
-		expect(EXTERNAL_EVENT_ALIASES.tool_result).toBe(HookEventKind.PostToolUse);
-		expect(EXTERNAL_EVENT_ALIASES.turn_end).toBe(HookEventKind.Stop);
-		expect(EXTERNAL_EVENT_ALIASES.before_agent_start).toBe(HookEventKind.UserPromptSubmit);
-		expect(EXTERNAL_EVENT_ALIASES.pre_tool_use).toBe(HookEventKind.PreToolUse);
-		expect(EXTERNAL_EVENT_ALIASES.post_tool_use).toBe(HookEventKind.PostToolUse);
-	});
-
-	it("resolveCanonicalKind returns null for unknown events", () => {
-		expect(resolveCanonicalKind("nonexistent_event")).toBeNull();
 	});
 });

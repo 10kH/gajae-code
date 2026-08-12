@@ -14,7 +14,7 @@ describe("createPluginHooksExtension", () => {
 		};
 		const hooks: ConstrainedPluginHook[] = [
 			{ plugin: "p", event: "tool_call", target: "read", phase: "before", handler: handlerA },
-			{ plugin: "p", event: "tool_result", handler: handlerB },
+			{ plugin: "p", event: "tool_result", phase: "after", handler: handlerB },
 		];
 		const registered: Array<{ event: string; handler: (...a: unknown[]) => unknown }> = [];
 		const fakeApi = {
@@ -34,6 +34,26 @@ describe("createPluginHooksExtension", () => {
 		expect(registered[1]?.handler).toBe(handlerB);
 		registered[1]?.handler({});
 		expect(bCalls).toBe(1);
+	});
+
+	test("uses canonical plugin normalization for after-phase runtime selection", () => {
+		const registered: string[] = [];
+		const factory = createPluginHooksExtension([
+			{ plugin: "p", event: "tool_call", target: "read", phase: "after", handler: () => undefined },
+		]);
+		factory({ on: (event: string) => registered.push(event) } as any);
+		expect(registered).toEqual(["tool_result"]);
+	});
+
+	test("fails closed before registration for an invalid constrained descriptor", () => {
+		const registered: string[] = [];
+		const factory = createPluginHooksExtension([
+			{ plugin: "p", event: "pre_tool_use", target: "read", phase: "before", handler: () => undefined },
+		]);
+		expect(() => factory({ on: (event: string) => registered.push(event) } as any)).toThrow(
+			"unrecognized_plugin_event",
+		);
+		expect(registered).toEqual([]);
 	});
 
 	test("registers nothing for an empty hook list", () => {

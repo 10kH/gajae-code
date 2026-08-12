@@ -7,6 +7,8 @@ import * as zod from "zod/v4";
 import { hookCapability } from "../../capability/hook";
 import type { Hook } from "../../discovery";
 import { loadCapability } from "../../discovery";
+import { HookSourceConvention } from "../../hooks/events";
+import { normalizeDirectoryHook } from "../../hooks/normalize";
 import type { HookMessage } from "../../session/messages";
 import type { SessionManager } from "../../session/session-manager";
 import * as typebox from "../typebox";
@@ -234,6 +236,7 @@ export async function loadHooks(paths: string[], cwd: string): Promise<LoadHooks
 export async function discoverAndLoadHooks(configuredPaths: string[], cwd: string): Promise<LoadHooksResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
+	const normalizationErrors: Array<{ path: string; error: string }> = [];
 
 	// Helper to add paths without duplicates
 	const addPaths = (paths: string[]) => {
@@ -246,12 +249,40 @@ export async function discoverAndLoadHooks(configuredPaths: string[], cwd: strin
 		}
 	};
 
-	// 1. Discover hooks via capability API
+	// 1. Discover hooks via capability API and validate the provider descriptor
+	// against the canonical model before importing project-controlled code.
 	const discovered = await loadCapability<Hook>(hookCapability.id, { cwd });
-	addPaths(discovered.items.map(hook => hook.path));
+	for (const hook of discovered.items) {
+		const convention =
+			hook._source.provider === "native"
+				? HookSourceConvention.NativeGjc
+				: hook._source.provider === "claude"
+					? HookSourceConvention.ClaudeCode
+					: hook._source.provider === "codex"
+						? HookSourceConvention.Codex
+						: null;
+		if (convention) {
+			const normalized = normalizeDirectoryHook({
+				convention,
+				phase: hook.type,
+				toolName: hook.tool,
+				source: hook.path,
+				externalName: hook.name,
+			});
+			if (!normalized.hook) {
+				normalizationErrors.push({
+					path: hook.path,
+					error: normalized.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; "),
+				});
+				continue;
+			}
+		}
+		addPaths([hook.path]);
+	}
 
 	// 2. Explicitly configured paths (can override/add)
 	addPaths(configuredPaths.map(p => resolvePath(p, cwd)));
 
-	return loadHooks(allPaths, cwd);
+	const loaded = await loadHooks(allPaths, cwd);
+	return { hooks: loaded.hooks, errors: [...normalizationErrors, ...loaded.errors] };
 }
