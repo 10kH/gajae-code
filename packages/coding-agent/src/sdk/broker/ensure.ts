@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import { BrokerStartupError, clearBrokerStartupFailureMarker, readBrokerStartupFailureMarker } from "./startup-failure";
 export interface EnsureBrokerSettings {
 	agentDir: string;
 	heartbeatTtlMs?: number;
@@ -301,6 +302,8 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
 	const spawnLog = await openBrokerSpawnLog(settings.agentDir);
+	// A stale marker must never be misattributed to this spawn; clear it first.
+	await clearBrokerStartupFailureMarker(settings.agentDir);
 	try {
 		const child = spawn(command.file, [...command.args, "--agent-dir", settings.agentDir], {
 			detached: true,
@@ -358,16 +361,16 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			}
 		}
 		const spawnLogTail = exitedBeforeDiscovery && spawnLog ? await readBrokerSpawnLogTail(spawnLog.path) : "";
+		const marker = await readBrokerStartupFailureMarker(settings.agentDir);
 		const failure = spawnError
 			? new Error(`Failed to spawn detached SDK broker: ${spawnError.message}`)
 			: exitedBeforeDiscovery
-				? new Error(
-						`Detached SDK broker exited before discovery (code=${child.exitCode}, signal=${child.signalCode}).${
-							spawnLogTail
-								? ` Broker stderr: ${spawnLogTail}`
-								: " The broker wrote no stderr; see the gjc log for its lock-contention diagnostic."
-						}`,
-					)
+				? new BrokerStartupError({
+						exitCode: child.exitCode,
+						signal: child.signalCode,
+						reason: marker?.reason ?? "Detached SDK broker exited before publishing discovery.",
+						stderrExcerpt: spawnLogTail.length > 0 ? spawnLogTail : undefined,
+					})
 				: discoveryError
 					? discoveryError
 					: new Error("Timed out waiting for detached SDK broker discovery.");

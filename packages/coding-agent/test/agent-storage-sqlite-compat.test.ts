@@ -94,4 +94,51 @@ describe("AgentStorage SQLite compatibility", () => {
 		expect(storage.getModelUsageOrder()).toEqual(["anthropic/claude-sonnet-4-5"]);
 		expect(readSettingsRows(dbPath)).toEqual([{ key: "theme", value: '"dark"', updated_at: LEGACY_TIMESTAMP }]);
 	});
+
+	it("clearSettings drains the legacy rows so a later load cannot re-import them", async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-agent-storage-drain-"));
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const storage = await AgentStorage.open(dbPath);
+		const raw = new Database(dbPath);
+		raw.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("theme.dark", '"red-claw"');
+		raw.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("gjc.ralplan.maxIterations", "7");
+		raw.close();
+
+		await storage.clearSettings();
+		expect(readSettingsRows(dbPath)).toEqual([]);
+		expect(storage.getSettings()).toBeNull();
+	});
+
+	it("clearSettings does not swallow a persistent drain failure", async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-agent-storage-drain-fail-"));
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const storage = await AgentStorage.open(dbPath);
+		const raw = new Database(dbPath);
+		raw.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("theme.dark", '"red-claw"');
+		raw.close();
+		// A closed database makes the DELETE fail permanently (non-SQLITE_BUSY),
+		// so clearSettings must THROW instead of logging and reporting success:
+		// the migration relies on the throw to know the stale rows are still
+		// eligible for the next load's absent-only merge.
+		storage.close();
+		await expect(storage.clearSettings()).rejects.toThrow();
+	});
+
+	it("getSettings fails the read when a row cannot be decoded", async () => {
+		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-agent-storage-bad-row-"));
+		const dbPath = path.join(tempDir, "agent.db");
+
+		const storage = await AgentStorage.open(dbPath);
+		const raw = new Database(dbPath);
+		raw.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("theme.dark", '"red-claw"');
+		raw.prepare("INSERT INTO settings (key, value) VALUES (?, ?)").run("gjc.ralplan.maxIterations", "{ not json");
+		raw.close();
+
+		// A malformed row must fail the whole read (the migration drains rows
+		// only after a fully successful read): deleting a row that never decoded
+		// would permanently lose its value.
+		expect(() => storage.getSettings()).toThrow();
+	});
 });

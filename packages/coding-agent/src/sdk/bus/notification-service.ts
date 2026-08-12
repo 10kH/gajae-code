@@ -877,6 +877,19 @@ export async function checkNotificationHealth(opts: HealthOptions): Promise<Noti
 				level: "warn",
 				detail: "a live daemon owns a different bot token or chat id",
 			});
+		} else if (telegramConfigured && !daemon.stopped && daemon.generationRelation !== "current") {
+			// Liveness is not serviceability. `isCurrentCompatibleOwner` refuses to attach
+			// a session to an owner whose generation is not this build's, and
+			// `acquireDaemonOwnership` then answers `provisional`, which `ensureTelegramDaemonRunning`
+			// reports as `blocked_identity`: no transport is ever attached and no
+			// notification is ever published, while the owner keeps heartbeating. Reporting
+			// that as OK is what makes the outage invisible. Recovery is platform-dependent,
+			// so health identifies the condition without prescribing an unsupported command.
+			checks.push({
+				name: "daemon",
+				level: "warn",
+				detail: `daemon pid ${daemon.pid} serves generation ${daemon.generation ?? "unknown"} but this build attaches only to generation ${daemon.currentGeneration}; it cannot attach a session transport — inspect daemon lifecycle status before attempting recovery`,
+			});
 		} else {
 			checks.push({ name: "daemon", level: "ok", detail: `daemon pid ${daemon.pid} alive with a fresh heartbeat` });
 		}

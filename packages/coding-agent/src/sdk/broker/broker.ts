@@ -27,6 +27,7 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
+
 import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 
 import {
@@ -35,7 +36,7 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
-import { type IndexedSession, SessionIndex, type SessionList } from "./session-index";
+import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -182,6 +183,18 @@ function pendingCleanupSessionId(response: BrokerResponse): string | undefined {
 	return typeof response.error.cleanup?.sessionId === "string" ? response.error.cleanup.sessionId : undefined;
 }
 
+const LIFECYCLE_OPERATIONS = new Set([
+	"session.create",
+	"session.fork",
+	"session.resume",
+	"session.close",
+	"session.delete",
+]);
+
+function lifecycleFingerprint(operation: string, input: unknown): string {
+	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+}
+
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
 	if (isCleanupPending(response)) return "effect_started";
@@ -323,6 +336,25 @@ function canonicalJson(value: unknown): string {
 		.join(",")}}`;
 }
 
+function credentialFreeLifecycleResponse(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(credentialFreeLifecycleResponse);
+	if (value === null || typeof value !== "object") return value;
+	const output: Record<string, unknown> = {};
+	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+		if (key === "token" || key === "url" || (key === "endpoint" && nested !== null && typeof nested === "object"))
+			continue;
+		output[key] = credentialFreeLifecycleResponse(nested);
+	}
+	return output;
+}
+
+type LifecycleReplayEndpoint = {
+	endpoint: Record<string, unknown>;
+	endpointGeneration: number;
+	pid: number;
+	endpointMtimeMs: number;
+};
+
 type EndpointAuthority = { endpointGeneration?: number; endpointIncarnation?: string };
 function endpointIncarnation(
 	record: Pick<IndexedSession, "endpointGeneration" | "endpointMtimeMs" | "pid">,
@@ -376,6 +408,7 @@ function matchesEndpointAuthority(record: IndexedSession, authority: EndpointAut
 function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): boolean {
 	return (
 		current.live &&
+		isSessionAuthorityEligible(current) &&
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
@@ -985,6 +1018,7 @@ export class Broker {
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
 			this.#heartbeatTimer = setInterval(() => void this.#watchPublication(), cadenceMs);
+			await this.#checkpointSessionHeartbeats();
 			return this.discovery;
 		} catch (error) {
 			await this.#transport?.stop();
@@ -1051,6 +1085,7 @@ export class Broker {
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
 			if (writeHeartbeat) await this.#writeHeartbeat();
+			if (this.#publicationState === "healthy-owned") await this.#checkpointSessionHeartbeats();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
@@ -1076,6 +1111,17 @@ export class Broker {
 	async heartbeat(): Promise<void> {
 		if (this.#publicationState !== "healthy-owned") return;
 		await this.#writeHeartbeat();
+	}
+	/** Re-observes provably live session hosts and checkpoints their liveness. */
+	async heartbeatSessions(now = Date.now()): Promise<number> {
+		return await this.index.checkpointLiveHeartbeats(now);
+	}
+	async #checkpointSessionHeartbeats(): Promise<void> {
+		try {
+			await this.heartbeatSessions();
+		} catch (error) {
+			logger.warn(`sdk broker: session heartbeat checkpoint failed: ${String(error)}`);
+		}
 	}
 	async #complete(mode: BrokerStopMode): Promise<void> {
 		if (this.#completionTask) return this.#completionTask;
@@ -1169,11 +1215,53 @@ export class Broker {
 		const authority = expectedEndpointAuthority(input);
 		if ("ok" in authority) return authority;
 		await this.index.refresh();
-		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		let record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		if (
+			record &&
+			!record.live &&
+			!record.terminal &&
+			!record.terminalUncertain &&
+			isSessionAuthorityEligible(record)
+		) {
+			await this.heartbeatSessions();
+			await this.index.refresh();
+			record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		}
 		if (!record) return error("resource_gone", "session is not indexed");
-		if (!record.live || !matchesEndpointAuthority(record, authority))
-			return error("endpoint_stale", "session endpoint is stale");
+		if (!isSessionAuthorityEligible(record)) return error("resource_gone", "session endpoint record is gone");
+		if (!matchesEndpointAuthority(record, authority)) return error("endpoint_stale", "session endpoint is stale");
+		if (!record.live) return error("resource_gone", "session endpoint record is gone");
 		return this.#readEndpoint(record, authority);
+	}
+	async #readLifecycleReplayEndpoint(sessionId: string): Promise<LifecycleReplayEndpoint | BrokerResponse> {
+		await this.index.refresh();
+		const record = this.index.listSessions().sessions.find(session => session.sessionId === sessionId);
+		if (!record) return error("resource_gone", "session endpoint record is gone");
+		if (record.terminalUncertain)
+			return error("terminal_uncertain", "Session ownership is uncertain and cannot be replayed safely");
+		if (!isSessionAuthorityEligible(record) || !record.live)
+			return error("resource_gone", "session endpoint record is gone");
+		const endpointMtimeMs = record.endpointMtimeMs;
+		if (
+			!Number.isSafeInteger(record.endpointGeneration) ||
+			record.endpointGeneration <= 0 ||
+			!Number.isSafeInteger(record.pid) ||
+			record.pid <= 0 ||
+			endpointMtimeMs === undefined ||
+			!Number.isFinite(endpointMtimeMs) ||
+			endpointMtimeMs <= 0
+		)
+			return error("endpoint_stale", "session endpoint authority is incomplete");
+		const endpoint = await this.#readEndpoint(record, {});
+		if (!endpoint.ok) return endpoint;
+		if (endpoint.result === null || typeof endpoint.result !== "object" || Array.isArray(endpoint.result))
+			return error("endpoint_stale", "session endpoint is malformed");
+		return {
+			endpoint: endpoint.result as Record<string, unknown>,
+			endpointGeneration: record.endpointGeneration,
+			pid: record.pid,
+			endpointMtimeMs,
+		};
 	}
 	async #readEndpoint(record: IndexedSession, authority: EndpointAuthority): Promise<BrokerResponse> {
 		if (!isCanonicalSessionId(record.sessionId))
@@ -1188,7 +1276,7 @@ export class Broker {
 				endpoint.pid !== record.pid ||
 				endpoint.stale === true ||
 				record.endpointMtimeMs === undefined ||
-				metadata.mtimeMs !== record.endpointMtimeMs
+				Math.abs(metadata.mtimeMs - record.endpointMtimeMs) > 0.001
 			)
 				return error("endpoint_stale", "session endpoint is stale");
 			await this.index.refresh();
@@ -1236,7 +1324,10 @@ export class Broker {
 			offset: 0,
 			expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS,
 		};
-		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit);
+		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
+			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
+			return publicSession;
+		});
 		const offset = snapshot.offset + sessions.length;
 		if (offset >= snapshot.sessions.length && typeof cursor === "string") this.#sessionListCursors.delete(cursor);
 		const continuationCursor =
@@ -1275,6 +1366,7 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
 		input = normalization.input;
@@ -1294,25 +1386,63 @@ export class Broker {
 						? listed.owned.filter(candidate => candidate.sessionId === resolveSessionId)
 						: [];
 				const match = matches.length === 1 ? matches[0] : undefined;
+				const savedSession =
+					match &&
+					match.sessionId === resolveSessionId &&
+					match.identity.nlink !== undefined &&
+					match.identity.ctimeNs !== undefined
+						? {
+								id: match.sessionId,
+								path: match.path,
+								identity: {
+									dev: match.identity.dev.toString(),
+									ino: match.identity.ino.toString(),
+									nlink: match.identity.nlink.toString(),
+									size: match.identity.size,
+									mtimeMs: match.identity.mtimeMs,
+									mtimeNs: match.identity.mtimeNs.toString(),
+									ctimeNs: match.identity.ctimeNs.toString(),
+									sha256: match.identity.sha256,
+								},
+							}
+						: undefined;
 				return {
 					...page,
 					result: {
 						...pageResult,
-						savedSession:
-							match && match.sessionId === resolveSessionId
-								? { id: match.sessionId, path: match.path }
-								: undefined,
+						...(savedSession === undefined ? {} : { savedSession }),
 					},
 				};
 			}
 			return page;
 		}
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
+		if (operation === "broker.lookup_lifecycle") {
+			const requestedOperation = typeof input.operation === "string" ? input.operation : undefined;
+			const requestedFingerprint = typeof input.fingerprint === "string" ? input.fingerprint : undefined;
+			if (!idempotencyKey || !requestedOperation || !requestedFingerprint)
+				return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
+			if (!LIFECYCLE_OPERATIONS.has(requestedOperation))
+				return error("not_found", "lifecycle operation was not found");
+			const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);
+			const entry = this.ledger.get(identity);
+			if (!entry) return error("not_found", "lifecycle operation was not found");
+			if (entry.fingerprint !== requestedFingerprint)
+				return error("idempotency_conflict", "lifecycle request fingerprint differs");
+			if (entry.state === "terminal_uncertain")
+				return error("terminal_uncertain", "lifecycle outcome is still uncertain");
+			return isBrokerResponse(entry.response)
+				? entry.response
+				: error("terminal_uncertain", "lifecycle outcome has no recorded response");
+		}
+
 		if (!idempotencyKey) return error("invalid_input", "idempotencyKey is required for lifecycle operations");
 		const target = createHash("sha256")
 			.update(canonicalJson(lifecycleTarget(operation, input)))
 			.digest("hex");
 		const identity = await deriveIdempotencyIdentity(this.settings.agentDir, operation, idempotencyKey, target);
+		const operationKey = `${operation}\0${idempotencyKey}`;
+
 		let reconstructedDeleteCleanup: BrokerCleanupEvidence | undefined;
 		if (operation === "session.delete" && input.cwd === undefined && input.sessionPath === undefined) {
 			const entry = this.ledger.get(identity);
@@ -1378,16 +1508,39 @@ export class Broker {
 		await prev;
 		try {
 			const beforeBegin = this.ledger.get(identity);
-			const begun = await this.ledger.begin(identity, requestHash);
+			const begun = await this.ledger.begin(identity, requestHash, { operationKey, fingerprint });
 			if (begun.kind === "replay") {
 				const replay = begun.entry.response as BrokerResponse;
 				const cleanup = cleanupFromResponse(replay) ?? reconstructedDeleteCleanup;
-				if (!cleanup) return replay;
+				if (!cleanup) {
+					if (
+						replay.ok &&
+						(operation === "session.create" || operation === "session.fork" || operation === "session.resume") &&
+						typeof (replay.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
+					) {
+						const refreshed = await this.#readLifecycleReplayEndpoint(
+							(replay.result as { sessionId: string }).sessionId,
+						);
+						if (isBrokerResponse(refreshed)) return refreshed;
+						return {
+							ok: true,
+							result: {
+								...(replay.result as Record<string, unknown>),
+								endpointGeneration: refreshed.endpointGeneration,
+								pid: refreshed.pid,
+								endpointMtimeMs: refreshed.endpointMtimeMs,
+								endpoint: refreshed.endpoint,
+							},
+						};
+					}
+					return replay;
+				}
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
+				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
-					response,
-					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					response: storedResponse,
+					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
@@ -1402,10 +1555,11 @@ export class Broker {
 					return replay ?? error("terminal_uncertain", "prior lifecycle operation outcome is uncertain");
 				const outcome = await executeLifecycle(this, operation, input, identity, cleanup);
 				const response = outcome.response;
+				const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 				await this.ledger.transition(identity, lifecycleResponseState(response), {
 					...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
-					response,
-					responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+					response: storedResponse,
+					responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 					...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 					...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 				});
@@ -1414,14 +1568,15 @@ export class Broker {
 			if (begun.kind === "in_progress") return error("broker_restarting", "lifecycle operation is in progress");
 			const outcome = await executeLifecycle(this, operation, input, identity);
 			const response = outcome.response;
+			const storedResponse = credentialFreeLifecycleResponse(response) as BrokerResponse;
 			await this.ledger.transition(identity, lifecycleResponseState(response), {
 				...(pendingCleanupSessionId(response) ? { intendedSessionId: pendingCleanupSessionId(response) } : {}),
 				resultSessionId:
 					response.ok && typeof (response.result as { sessionId?: unknown } | undefined)?.sessionId === "string"
 						? (response.result as { sessionId: string }).sessionId
 						: undefined,
-				response,
-				responseDigest: createHash("sha256").update(canonicalJson(response)).digest("hex"),
+				response: storedResponse,
+				responseDigest: createHash("sha256").update(canonicalJson(storedResponse)).digest("hex"),
 				...(outcome.durableEffects ? { durableEffects: outcome.durableEffects } : {}),
 				...(outcome.startupFailure ? { startupFailure: outcome.startupFailure } : {}),
 			});
@@ -1429,7 +1584,7 @@ export class Broker {
 			const persisted = await this.ledger.readTerminal(identity, requestHash);
 			const persistenceVerified =
 				persisted !== undefined &&
-				canonicalJson(persisted.response) === canonicalJson(response) &&
+				canonicalJson(persisted.response) === canonicalJson(storedResponse) &&
 				canonicalJson(persisted.durableEffects) === canonicalJson(outcome.durableEffects) &&
 				canonicalJson(persisted.startupFailure) === canonicalJson(outcome.startupFailure);
 			if (!persistenceVerified) {

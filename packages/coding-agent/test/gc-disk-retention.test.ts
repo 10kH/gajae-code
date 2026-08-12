@@ -520,6 +520,44 @@ describe("gjc gc --disk --prune (blob mark and sweep)", () => {
 		}
 	});
 
+	test("withholds the sweep when a transcript is replaced with preserved size and mtime during marking", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const precious = await writeBlob(fixture, "payload referenced after transcript replacement", 10);
+			const replaced = await writeBlob(fixture, "payload replaced in the transcript reference", 10);
+			const transcript = await writeSession(fixture, "repo-a", "replaced-mid-mark-session", {
+				ageDays: 0,
+				blobRefs: [replaced],
+			});
+			const original = await fsp.lstat(transcript);
+			const realLstat = fsp.lstat as unknown as (target: PathLike, options?: { bigint?: false }) => Promise<Stats>;
+			let transcriptStats = 0;
+			const spy = spyOn(fsp, "lstat");
+			spy.mockImplementation((async (target: PathLike, options?: { bigint?: false }) => {
+				if (path.resolve(String(target)) === transcript && ++transcriptStats === 3) {
+					const replacement = `${transcript}.replacement`;
+					const content = (await Bun.file(transcript).text()).replace(replaced, precious);
+					await Bun.write(replacement, content);
+					await fsp.utimes(replacement, original.atime, original.mtime);
+					await fsp.rename(replacement, transcript);
+				}
+				return await realLstat(target, options);
+			}) as unknown as typeof fsp.lstat);
+			try {
+				const disk = requireDisk(await runDisk(fixture, ["--disk", "--prune", "--json"]));
+				expect(reasonById(disk, "blobs").get(precious)).toBe(
+					"keep:withheld_evidence_incomplete: sessions_changed_during_mark",
+				);
+				expect(disk.surfaces.blobs.reclaimed).toBe(0);
+				expect(await Bun.file(path.join(fixture.blobsDir, precious)).exists()).toBe(true);
+			} finally {
+				spy.mockRestore();
+			}
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
 	test("withholds the sweep when a transcript is appended to during the sweep", async () => {
 		const fixture = await makeTestRoot();
 		try {
@@ -605,6 +643,31 @@ describe("gjc gc --disk --prune (blob mark and sweep)", () => {
 			await fsp.rename(replacement, blobPath);
 
 			expect(await removeCanonicalBlob(entry)).toEqual({ removed: false, reason: "blob_changed" });
+			expect(await Bun.file(blobPath).exists()).toBe(true);
+		} finally {
+			await fsp.rm(fixture.root, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses a canonical blob replacement after the final sweep fence", async () => {
+		const fixture = await makeTestRoot();
+		try {
+			const hash = await writeBlob(fixture, "canonical identity must survive the final fence", 10);
+			const blobPath = path.join(fixture.blobsDir, hash);
+			const entry = (await listCanonicalBlobs(fixture.blobsDir))[0]!;
+			const original = await fsp.lstat(blobPath);
+			const replacement = `${blobPath}.replacement`;
+			await Bun.write(replacement, "canonical identity must survive the final fence");
+			await fsp.utimes(replacement, original.atime, original.mtime);
+
+			expect(
+				await removeCanonicalBlob(entry, {
+					beforeUnlink: async () => {
+						await fsp.rename(replacement, blobPath);
+						return true;
+					},
+				}),
+			).toEqual({ removed: false, reason: "blob_unlink_failed: identity_mismatch", failed: true });
 			expect(await Bun.file(blobPath).exists()).toBe(true);
 		} finally {
 			await fsp.rm(fixture.root, { recursive: true, force: true });

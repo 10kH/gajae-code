@@ -56,6 +56,7 @@ import {
 } from "../gjc-runtime/repository-binding";
 import { initializeLocalRoot, type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { ArtifactManager } from "../session/artifacts";
+import { registerOwnedIfLineaged } from "../session/terminal-abort";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
@@ -66,7 +67,6 @@ import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimit, Semaphore } from "./parallel";
 import { assertNoRawTaskFields, buildTaskReceipt, buildTaskRoiSummary, type TaskResultReceipt } from "./receipt";
-
 import { renderResult, renderCall as renderTaskCall } from "./render";
 import { reconcileSpawnRoi } from "./roi-reconciliation";
 import { getTaskSimpleModeCapabilities, type TaskSimpleMode } from "./simple-mode";
@@ -796,6 +796,23 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
 	}
 
+	/**
+	 * The session's ENDPOINT-owned AsyncJobManager, falling back to the
+	 * process-global instance. Concurrent top-level sessions each register
+	 * their manager under their endpoint (sdk/session.ts), so a task job
+	 * created by THIS session must be registered, resumed, and reported
+	 * through THIS session's manager — otherwise a scope:"owned" abort
+	 * consults the endpoint manager and cannot cancel or prove the task, and
+	 * its completion is delivered by the wrong session's callback (review
+	 * thread P1).
+	 */
+	#resolveOwnedJobManager(): AsyncJobManager | undefined {
+		const endpointId = this.session.getSessionId?.() ?? undefined;
+		return (
+			this.session.getAsyncJobManager?.() ?? AsyncJobManager.forEndpoint(endpointId) ?? AsyncJobManager.instance()
+		);
+	}
+
 	async execute(
 		_toolCallId: string,
 		rawParams: unknown,
@@ -886,7 +903,14 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			};
 		}
 
-		const manager = AsyncJobManager.instance();
+		// The session's ENDPOINT-owned manager first: with concurrent top-level
+		// sessions the process-global instance may belong to a different
+		// session, and an endpoint-qualified owned registration recorded here
+		// must live in the SAME manager the job actually runs in — otherwise a
+		// scope:"owned" abort consults the endpoint manager, cannot cancel or
+		// prove the task, and returns uncertainty while the task continues
+		// (review thread P1).
+		const manager = this.#resolveOwnedJobManager();
 		if (!manager) {
 			return {
 				content: [{ type: "text", text: "Subagent background execution is unavailable in this session." }],
@@ -1015,7 +1039,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		};
 		let resumeRunner: ResumeRunner | undefined;
 		if (typeof manager.setResumeRunner === "function") {
-			resumeRunner = (_subagentId, message, resumeDescriptor) => {
+			resumeRunner = (_subagentId, message, resumeDescriptor, resumeToolCallId) => {
 				const descriptor = isTaskResumeDescriptor(resumeDescriptor?.data) ? resumeDescriptor.data : undefined;
 				if (!descriptor) return undefined;
 				const admission = (() => {
@@ -1066,7 +1090,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					repositoryBinding: descriptor.repositoryBinding,
 					duplicate_policy: descriptor.duplicatePolicy,
 				};
-				return manager.register(
+				const resumeJobId = manager.register(
 					"task",
 					descriptor.task.id,
 					async ({ signal: runSignal }) => {
@@ -1128,6 +1152,21 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					},
 				);
+				// Bind the resumed job to the CURRENT resume request's tool call
+				// (the original launch id would attribute it to the OLD turn, so a
+				// scope:"owned" abort of the resuming turn could miss it — review
+				// thread P1).
+				// The registration is ENDPOINT-qualified: concurrent sessions can
+				// receive the same provider-local tool-call id, and an
+				// endpoint-less resolve would take the FIRST matching binding —
+				// registering B's task under A's endpoint/lineage (review P1).
+				registerOwnedIfLineaged(
+					manager,
+					resumeToolCallId ?? descriptor.toolCallId,
+					resumeJobId,
+					this.session.getSessionId?.() ?? undefined,
+				);
+				return resumeJobId;
 			};
 			manager.setResumeRunner(resumeRunner);
 		}
@@ -1357,6 +1396,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						},
 					},
 				);
+				registerOwnedIfLineaged(manager, _toolCallId, jobId, this.session.getSessionId?.() ?? undefined);
 				startedJobs.push({ jobId, taskId: taskItem.id });
 				if (typeof manager.registerResumeDescriptor === "function") {
 					manager.registerResumeDescriptor(
@@ -1957,6 +1997,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				},
 			) => {
 				const forkContextSeed = prebuiltForkContextSeeds?.get(task.id) ?? (await buildForkContextSeed(task));
+				// The session's ENDPOINT-owned manager (resolved once per task so
+				// model metadata and live handles land in the SAME manager the
+				// job runs in — review thread P1).
+				const manager = this.#resolveOwnedJobManager();
 				const forkContext = requestsForkContext(task)
 					? { mode: task.inheritContext, clonedTokens: forkContextSeed?.metadata.approximateTokens ?? 0 }
 					: undefined;
@@ -1997,6 +2041,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						runMode: overrides?.runMode ?? executionOverrides?.runMode,
 						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
 						subagentId: task.id,
+						asyncJobManager: manager,
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
@@ -2019,7 +2064,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							progressMap.set(index, {
 								...structuredClone(progress),
 							});
-							AsyncJobManager.instance()?.recordSubagentProgress(task.id, progress);
+							this.#resolveOwnedJobManager()?.recordSubagentProgress(task.id, progress);
 							emitProgress();
 						},
 						authStorage: this.session.authStorage,
@@ -2027,7 +2072,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
 						inheritedServiceTier: this.session.serviceTier,
-						isFastForSubagentProvider: provider => this.session.isFastForSubagentProvider?.(provider) ?? false,
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,
@@ -2075,6 +2119,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						runMode: overrides?.runMode ?? executionOverrides?.runMode,
 						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
 						subagentId: task.id,
+						asyncJobManager: manager,
 						taskDepth,
 						modelOverride,
 						parentActiveModelPattern,
@@ -2097,7 +2142,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							progressMap.set(index, {
 								...structuredClone(progress),
 							});
-							AsyncJobManager.instance()?.recordSubagentProgress(task.id, progress);
+							this.#resolveOwnedJobManager()?.recordSubagentProgress(task.id, progress);
 							emitProgress();
 						},
 						authStorage: this.session.authStorage,
@@ -2105,7 +2150,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						agentRegistry: this.session.agentRegistry,
 						settings: this.session.settings,
 						inheritedServiceTier: this.session.serviceTier,
-						isFastForSubagentProvider: provider => this.session.isFastForSubagentProvider?.(provider) ?? false,
 						contextFiles,
 						skills: availableSkills,
 						autoloadSkills: resolvedAutoloadSkills,

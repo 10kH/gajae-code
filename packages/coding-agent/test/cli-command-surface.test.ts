@@ -457,6 +457,92 @@ process.exitCode = await child.exited;`;
 			await fs.rm(home, { recursive: true, force: true });
 		}
 	}, 15_000);
+
+	it("routes every advertised SDK family and rejects the removed daemon session route", async () => {
+		const sdkHelp = Bun.spawnSync(["bun", cliEntry, "sdk", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const sdkHelpOutput = `${sdkHelp.stdout.toString()}\n${sdkHelp.stderr.toString()}`;
+		expect(sdkHelp.exitCode, sdkHelpOutput).toBe(0);
+		for (const token of ["serve", "session", "guides"]) expect(sdkHelp.stdout.toString()).toContain(token);
+
+		const serve = Bun.spawnSync(["bun", cliEntry, "sdk", "serve"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const serveOutput = `${serve.stdout.toString()}\n${serve.stderr.toString()}`;
+		expect(serve.exitCode, serveOutput).toBe(2);
+		expect(serveOutput).toContain("gjc sdk serve: specify exactly one of");
+
+		const guideAgentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-guides-command-"));
+		try {
+			const guides = Bun.spawnSync(["bun", cliEntry, "sdk", "guides", "list", "--agent-dir", guideAgentDir], {
+				cwd: repoRoot,
+				stderr: "pipe",
+				stdout: "pipe",
+			});
+			const guidesOutput = `${guides.stdout.toString()}\n${guides.stderr.toString()}`;
+			expect(guides.exitCode, guidesOutput).toBe(0);
+			expect(JSON.parse(guides.stdout.toString())).toMatchObject({ ok: true, result: { source: "bundled" } });
+		} finally {
+			await fs.rm(guideAgentDir, { recursive: true, force: true });
+		}
+		const help = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "--help"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const helpOutput = `${help.stdout.toString()}\n${help.stderr.toString()}`;
+		expect(help.exitCode, helpOutput).toBe(0);
+		for (const token of [
+			"list",
+			"inspect",
+			"send",
+			"status",
+			"tail",
+			"raw",
+			"--until-idle",
+			"--strict",
+			"--all-events",
+		])
+			expect(help.stdout.toString()).toContain(token);
+		expect(help.stdout.toString()).not.toContain("elevate");
+		expect(help.stdout.toString()).not.toContain("show-endpoint-credential");
+
+		const missingVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const missingOutput = `${missingVerb.stdout.toString()}\n${missingVerb.stderr.toString()}`;
+		expect(missingVerb.exitCode, missingOutput).toBe(2);
+		expect(JSON.parse(missingVerb.stdout.toString())).toMatchObject({
+			ok: false,
+			error: { code: "usage" },
+		});
+
+		const unknownVerb = Bun.spawnSync(["bun", cliEntry, "sdk", "session", "bogus"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const unknownOutput = `${unknownVerb.stdout.toString()}\n${unknownVerb.stderr.toString()}`;
+		expect(unknownVerb.exitCode, unknownOutput).toBe(2);
+		expect(unknownVerb.stderr.toString()).toContain("Expected verb to be one of");
+
+		// `gjc daemon session` is deleted without an alias (DR-13).
+		const daemonSession = Bun.spawnSync(["bun", cliEntry, "daemon", "session", "list"], {
+			cwd: repoRoot,
+			stderr: "pipe",
+			stdout: "pipe",
+		});
+		const daemonOutput = `${daemonSession.stdout.toString()}\n${daemonSession.stderr.toString()}`;
+		expect(daemonSession.exitCode, daemonOutput).toBe(2);
+		expect(daemonSession.stderr.toString()).toContain("Expected action to be one of");
+	}, 30_000);
 });
 
 describe("startup login parsing", () => {

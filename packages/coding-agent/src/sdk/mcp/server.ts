@@ -1,16 +1,17 @@
-import path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClient, SdkClientError } from "../client/client";
-import {
-	listSdkSessionEndpoints,
-	readSdkBrokerDiscovery,
-	readSdkSessionEndpoint,
-	SdkDiscoveryError,
-} from "../client/discovery";
+import { SdkClientError } from "../client/client";
+import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
+import type {
+	SessionLifecycleMutationRequest,
+	SessionLifecycleOperation,
+	SessionLifecycleService,
+} from "../lifecycle/service";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
 import { adapterDispositionError, findOperation } from "../protocol/operation-registry";
+import { type SessionAttachment, SessionRouter, SessionRouterError } from "../router";
+import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../session-list";
 
 const PROTOCOL_VERSION = "2024-11-05";
 const SERVER_NAME = "gjc-sdk-mcp";
@@ -26,9 +27,9 @@ type JsonRpcResponse = {
 };
 
 export interface SdkMcpServerOptions {
-	repo?: string;
 	agentDir?: string;
-	connect?: (url: string, token: string) => Promise<SdkClient>;
+	router?: SessionRouter;
+	lifecycleService?: SessionLifecycleService;
 }
 
 export const SDK_MCP_TOOL_NAMES = [
@@ -53,6 +54,10 @@ function schema(name: (typeof SDK_MCP_TOOL_NAMES)[number]): Record<string, unkno
 						operation: { type: "string" },
 						input: { type: "object" },
 						confirm: { type: "boolean", description: "Required for destructive controls." },
+						idempotencyKey: {
+							type: "string",
+							description: "Bounded idempotency key; required for turn.abort mode:terminal.",
+						},
 					},
 				},
 			};
@@ -107,8 +112,7 @@ function asString(args: Arguments, name: string): string | null {
 }
 
 function resultError(error: unknown): { ok: false; error: { code: string; message: string; path?: string } } {
-	if (error instanceof SdkDiscoveryError)
-		return { ok: false, error: { code: error.code, path: path.basename(error.path), message: error.message } };
+	if (error instanceof SessionRouterError) return { ok: false, error: { code: error.phase, message: error.message } };
 	if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
 	return {
 		ok: false,
@@ -143,7 +147,12 @@ function mcpOperationError(
 	return adapterDispositionError("mcp", kind, operation, true);
 }
 
-function isLifecycleOperation(operation: string): boolean {
+const MCP_LIFECYCLE_ACTOR = { id: "gjc-sdk-mcp", namespace: "sdk:mcp" } as const;
+const ROUTER_START_TIMEOUT_MS = 3_000;
+const ROUTER_STOP_TIMEOUT_MS = 5_000;
+type LifecycleMutationOperation = Exclude<SessionLifecycleOperation, "session.list">;
+
+function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
 	return (
 		operation === "session.create" ||
 		operation === "session.fork" ||
@@ -152,14 +161,64 @@ function isLifecycleOperation(operation: string): boolean {
 		operation === "session.delete"
 	);
 }
-function redactLifecycleCredentials(value: unknown): unknown {
-	if (Array.isArray(value)) return value.map(redactLifecycleCredentials);
-	if (!isObject(value)) return value;
-	return Object.fromEntries(
-		Object.entries(value)
-			.filter(([key]) => key !== "endpoint" && key !== "token")
-			.map(([key, nested]) => [key, redactLifecycleCredentials(nested)]),
-	);
+
+async function bounded<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	const timeout = Promise.withResolvers<never>();
+	try {
+		timer = setTimeout(() => timeout.reject(new SdkClientError("timeout", message)), timeoutMs);
+		return await Promise.race([promise, timeout.promise]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
+class McpSessionListBrokerResponseError extends Error {
+	readonly #response: Arguments;
+
+	constructor(response: Arguments) {
+		super("session.list failed");
+		this.name = "McpSessionListBrokerResponseError";
+		this.#response = response;
+	}
+
+	get response(): Arguments {
+		return this.#response;
+	}
+}
+
+async function paginatedSessionList(
+	router: SessionRouter,
+	input: Arguments = {},
+	requestKey = `${MCP_LIFECYCLE_ACTOR.namespace}:session.list`,
+): Promise<unknown> {
+	try {
+		const pages = await traverseSessionList(
+			input,
+			async pageInput => {
+				const rawResponse = await router.listBrokerSessions(pageInput, requestKey);
+				const response = isObject(rawResponse) ? rawResponse : undefined;
+				if (response?.ok === false) throw new McpSessionListBrokerResponseError(response);
+				return response;
+			},
+			response => sessionListPageFromResponse(response),
+		);
+		const aggregate: Arguments = {};
+		const sessions: unknown[] = [];
+		for (const { page } of pages) {
+			for (const [key, value] of Object.entries(page))
+				if (key !== "sessions" && key !== "continuationCursor") aggregate[key] = value;
+			sessions.push(...page.sessions);
+		}
+		const result = { ...aggregate, sessions };
+		const firstResponse = pages[0]?.response;
+		return firstResponse && Object.hasOwn(firstResponse, "result") ? { ...firstResponse, result } : result;
+	} catch (error) {
+		if (error instanceof McpSessionListBrokerResponseError) return error.response;
+		if (error instanceof SessionListTraversalError)
+			return { ok: false, error: { code: "protocol_error", message: error.message } };
+		throw error;
+	}
 }
 
 function textResult(
@@ -169,32 +228,68 @@ function textResult(
 	return { content: [{ type: "text", text: JSON.stringify(payload) }], isError };
 }
 
-/** Creates the model-facing MCP adapter using only SDK discovery records and v3 WebSockets. */
+/** Creates the model-facing MCP adapter with Router-owned live session authority. */
 export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
-	const repo = options.repo ?? process.cwd();
 	const agentDir = options.agentDir ?? getAgentDir();
-	const connect = options.connect ?? ((url, token) => SdkClient.connect(url, token));
+	const router = options.router ?? new SessionRouter({ agentDir });
+	const lifecycleService = options.lifecycleService ?? createBrokerSessionLifecycleService(agentDir);
+	let startPromise: Promise<void> | undefined;
+	let closePromise: Promise<void> | undefined;
+	async function start(): Promise<void> {
+		if (closePromise) throw new SdkClientError("connection_closed", "SDK MCP server is closed.");
+		if (!startPromise) {
+			const authoritative = router.start();
+			let tracked!: Promise<void>;
+			tracked = authoritative.catch(error => {
+				if (startPromise === tracked) startPromise = undefined;
+				throw error;
+			});
+			startPromise = tracked;
+		}
+		await bounded(startPromise, ROUTER_START_TIMEOUT_MS, "SDK session Router startup timed out.");
+	}
 
-	async function withSession(sessionId: string, action: (client: SdkClient) => Promise<unknown>): Promise<unknown> {
-		let client: SdkClient | undefined;
+	async function close(): Promise<void> {
+		closePromise ??= (async () => {
+			await bounded(router.stop(), ROUTER_STOP_TIMEOUT_MS, "SDK session Router shutdown timed out.");
+		})();
+		await closePromise;
+	}
+
+	async function withSession(sessionId: string, frame: Record<string, unknown>): Promise<unknown> {
 		try {
-			const endpoint = await readSdkSessionEndpoint(repo, sessionId);
-			if (!endpoint)
+			await start();
+			const attachment: SessionAttachment | null = router.attachment(sessionId);
+			if (!attachment)
 				return { ok: false, error: { code: "not_found", message: `SDK session not found: ${sessionId}` } };
-			client = await connect(endpoint.url, endpoint.token);
-			return await action(client);
+			return await router.request(sessionId, frame, attachment.generation, attachment);
 		} catch (error) {
 			return resultError(error);
-		} finally {
-			await client?.close();
 		}
+	}
+
+	async function runLifecycle(
+		operation: LifecycleMutationOperation,
+		input: Arguments,
+		requestKey: string,
+	): Promise<unknown> {
+		const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
+		return await lifecycleService.execute({
+			operation,
+			actor: MCP_LIFECYCLE_ACTOR,
+			capability: operation,
+			requestKey,
+			target: input,
+			...(timeoutMs === undefined ? {} : { timeoutMs }),
+		} as unknown as SessionLifecycleMutationRequest);
 	}
 
 	async function callTool(name: string, args: Arguments = {}): Promise<unknown> {
 		if (name === "gjc_session_list") {
 			try {
-				const { endpoints, warnings } = await listSdkSessionEndpoints(repo);
-				return { ok: true, sessions: endpoints.map(({ sessionId }) => ({ sessionId })), warnings };
+				await ensureBroker({ agentDir });
+				await start();
+				return await paginatedSessionList(router);
 			} catch (error) {
 				return resultError(error);
 			}
@@ -211,9 +306,23 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 			if (secretError) return invalidControl(secretError);
 			const invalid = validateAdapterControl(operation, input);
 			if (invalid) return invalidControl(invalid);
-			return await withSession(sessionId, client =>
-				client.control(operation, input, { confirm: args.confirm === true }),
-			);
+			const idempotencyKey =
+				args.idempotencyKey === undefined ? undefined : (asString(args, "idempotencyKey") ?? undefined);
+			if (args.idempotencyKey !== undefined && !idempotencyKey)
+				return {
+					ok: false,
+					error: { code: "invalid_input", message: "idempotencyKey must be a non-empty string" },
+				};
+			// Forward the key on the control frame: terminal abort requires it,
+			// and without it every {mode:"terminal"} control is rejected (review
+			// thread P1).
+			return await withSession(sessionId, {
+				type: "control_request",
+				operation,
+				input,
+				confirm: args.confirm === true,
+				...(idempotencyKey === undefined ? {} : { idempotencyKey }),
+			});
 		}
 		if (name === "gjc_session_query") {
 			const sessionId = asString(args, "sessionId");
@@ -226,7 +335,12 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 			const input = isObject(args.input) ? args.input : {};
 			const dispositionError = mcpOperationError("query", query);
 			if (dispositionError) return invalidControl(dispositionError);
-			return await withSession(sessionId, client => client.query(query, input, cursor ?? undefined));
+			return await withSession(sessionId, {
+				type: "query_request",
+				query,
+				input,
+				...(cursor === undefined ? {} : { cursor }),
+			});
 		}
 		if (name === "gjc_session_global") {
 			const operation = asString(args, "operation");
@@ -248,22 +362,20 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 					ok: false,
 					error: { code: "invalid_input", message: "idempotencyKey is required for lifecycle operations" },
 				};
-			let client: SdkClient | undefined;
 			try {
-				await ensureBroker({ agentDir });
-				const broker = await readSdkBrokerDiscovery(agentDir);
-				if (!broker) return { ok: false, error: { code: "not_found", message: "SDK broker not found" } };
-				client = await connect(broker.url, broker.token);
-				const timeoutMs = lifecycleRequestTimeoutMs(operation, input);
-				const response = await client.global(operation, input, {
-					idempotencyKey,
-					...(timeoutMs === undefined ? {} : { timeoutMs }),
-				});
-				return isLifecycleOperation(operation) ? redactLifecycleCredentials(response) : response;
+				if (operation === "session.list") {
+					await ensureBroker({ agentDir });
+					await start();
+					return await paginatedSessionList(router, input);
+				}
+				if (!isLifecycleOperation(operation))
+					return {
+						ok: false,
+						error: { code: "unknown_operation", message: `Unknown global operation: ${operation}` },
+					};
+				return await runLifecycle(operation, input, idempotencyKey!);
 			} catch (error) {
 				return resultError(error);
-			} finally {
-				await client?.close();
 			}
 		}
 		return { ok: false, error: { code: "unknown_tool", message: `Unknown SDK MCP tool: ${name}` } };
@@ -295,71 +407,83 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 		return { jsonrpc: "2.0", id, error: { code: -32601, message: `unknown_method:${request.method}` } };
 	}
 
-	return { callTool, handleJsonRpc, handle: handleJsonRpc, tools: SDK_MCP_TOOL_NAMES.map(schema) };
+	return {
+		callTool,
+		handleJsonRpc,
+		handle: handleJsonRpc,
+		start,
+		close,
+		tools: SDK_MCP_TOOL_NAMES.map(schema),
+	};
 }
 
 /**
  * Runs the SDK MCP server over stdio (newline-delimited JSON-RPC), the shipped
- * `gjc mcp-serve sdk` entrypoint. Pure SDK client: session control/query flows
- * through discovery records and v3 WebSockets only.
+ * `gjc mcp-serve sdk` entrypoint. SessionRouter owns live endpoint authority and starts lazily
+ * on the first live-session tool, then stops after stdin and in-flight requests drain.
  */
 export async function runSdkMcpStdio(options: SdkMcpServerOptions = {}): Promise<void> {
 	const server = createSdkMcpServer(options);
 	let buffer = "";
 	const inflight = new Set<Promise<void>>();
-	process.stdin.setEncoding("utf8");
+	try {
+		process.stdin.setEncoding("utf8");
 
-	const track = (work: Promise<void>): void => {
-		inflight.add(work);
-		void work.finally(() => inflight.delete(work));
-	};
+		const track = (work: Promise<void>): void => {
+			inflight.add(work);
+			void work.finally(() => inflight.delete(work));
+		};
 
-	await new Promise<void>((resolve, reject) => {
-		const onData = (chunk: string) => {
-			buffer += chunk;
-			let index = buffer.indexOf("\n");
-			while (index >= 0) {
-				const line = buffer.slice(0, index).trim();
-				buffer = buffer.slice(index + 1);
-				index = buffer.indexOf("\n");
-				if (!line) continue;
-				track(
-					(async () => {
-						let request: JsonRpcRequest;
-						try {
-							request = JSON.parse(line) as JsonRpcRequest;
-						} catch {
-							process.stdout.write(
-								`${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse_error" } })}\n`,
-							);
-							return;
-						}
-						const response = await server.handleJsonRpc(request);
-						// JSON-RPC notifications (no id) receive no response.
-						if (request.id !== undefined) process.stdout.write(`${JSON.stringify(response)}\n`);
-					})(),
-				);
-			}
-		};
-		const onEnd = () => {
-			process.stdin.off("data", onData);
-			process.stdin.off("end", onEnd);
-			process.stdin.off("error", onError);
-			resolve();
-		};
-		const onError = (error: Error) => {
-			process.stdin.off("data", onData);
-			process.stdin.off("end", onEnd);
-			process.stdin.off("error", onError);
-			reject(error);
-		};
-		process.stdin.on("data", onData);
-		process.stdin.on("end", onEnd);
-		process.stdin.on("error", onError);
-	});
+		const stdinDone = Promise.withResolvers<void>();
+		{
+			const onData = (chunk: string) => {
+				buffer += chunk;
+				let index = buffer.indexOf("\n");
+				while (index >= 0) {
+					const line = buffer.slice(0, index).trim();
+					buffer = buffer.slice(index + 1);
+					index = buffer.indexOf("\n");
+					if (!line) continue;
+					track(
+						(async () => {
+							let request: JsonRpcRequest;
+							try {
+								request = JSON.parse(line) as JsonRpcRequest;
+							} catch {
+								process.stdout.write(
+									`${JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse_error" } })}\n`,
+								);
+								return;
+							}
+							const response = await server.handleJsonRpc(request);
+							// JSON-RPC notifications (no id) receive no response.
+							if (request.id !== undefined) process.stdout.write(`${JSON.stringify(response)}\n`);
+						})(),
+					);
+				}
+			};
+			const onEnd = () => {
+				process.stdin.off("data", onData);
+				process.stdin.off("end", onEnd);
+				process.stdin.off("error", onError);
+				stdinDone.resolve();
+			};
+			const onError = (error: Error) => {
+				process.stdin.off("data", onData);
+				process.stdin.off("end", onEnd);
+				process.stdin.off("error", onError);
+				stdinDone.reject(error);
+			};
+			process.stdin.on("data", onData);
+			process.stdin.on("end", onEnd);
+			process.stdin.on("error", onError);
+		}
+		await stdinDone.promise;
 
-	// Stdin EOF must not drop in-flight tools/call handlers (WS connect/query).
-	// Awaiting them also prevents the process from exiting before responses flush,
-	// and lets clients close so the event loop can drain deterministically.
-	await Promise.allSettled([...inflight]);
+		// Stdin EOF must not drop in-flight tools/call handlers (WS connect/query).
+		// Awaiting them also prevents the process from exiting before responses flush.
+		await Promise.allSettled([...inflight]);
+	} finally {
+		await server.close();
+	}
 }

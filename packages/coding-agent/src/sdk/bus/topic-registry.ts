@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 /**
- * Per-session forum-topic registry for the threaded session surface.
+ * Forum-topic registry for eligible orchestration sessions on the threaded
+ * Telegram surface.
  *
- * Each GJC session owns one active Telegram forum topic. Remote archive closes
- * daemon-created topics without deleting their durable records; rotated
- * successors move inactive records into retained history before creating a new
- * active authority. The registry also tracks whether the one-time identity
- * header has already been pinned.
+ * Each eligible orchestration session owns one active Telegram forum topic.
+ * Remote archive closes daemon-created topics without deleting their durable
+ * records; rotated successors move inactive records into retained history before
+ * creating a new active authority. The registry also tracks whether the one-time
+ * identity header has already been pinned.
  *
  * State is a plain serialisable map persisted beside the daemon state files;
  * topic creation is injected so this module is pure and unit-testable without a
@@ -213,7 +214,7 @@ export function emptyTopicRegistryState(): TopicRegistryState {
  */
 export function parseTopicRegistryState(value: unknown): TopicRegistryState | undefined {
 	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const state = value as TopicRegistryState;
+	let state = value as TopicRegistryState;
 	if (state.version !== undefined && state.version !== 2) throw new Error("unsupported future Telegram topic state");
 	if (!state.topics || typeof state.topics !== "object" || Array.isArray(state.topics)) return undefined;
 	if (state.version === undefined) {
@@ -239,6 +240,26 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 
 	const isObject = (candidate: unknown): candidate is Record<string, unknown> =>
 		!!candidate && typeof candidate === "object" && !Array.isArray(candidate);
+	state = {
+		...state,
+		topics: Object.fromEntries(
+			Object.entries(state.topics).map(([sessionId, record]) => [
+				sessionId,
+				isObject(record) ? { ...record } : record,
+			]),
+		),
+		retiredTopics:
+			state.retiredTopics === undefined
+				? undefined
+				: Object.fromEntries(
+						Object.entries(state.retiredTopics).map(([sessionId, records]) => [
+							sessionId,
+							Array.isArray(records)
+								? records.map(record => (isObject(record) ? { ...record } : record))
+								: records,
+						]),
+					),
+	};
 	const validTimestamp = (candidate: unknown): candidate is number =>
 		typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0;
 	const validEpoch = (candidate: unknown): candidate is number =>
@@ -303,12 +324,24 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 			value => value !== undefined,
 		).length;
 		if (leaseFieldCount !== 0 && leaseFieldCount !== 3) malformed();
-		if (
-			raw.authorityState === "disconnect_grace"
-				? raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined
-				: raw.disconnectGraceExpiresAt !== undefined
-		)
-			malformed();
+		if (raw.authorityState === "disconnect_grace") {
+			if (raw.disconnectGraceExpiresAt === undefined || raw.orphanedAt === undefined) malformed();
+		} else if (raw.disconnectGraceExpiresAt !== undefined) {
+			if (
+				raw.authorityState !== "archive_pending" &&
+				raw.authorityState !== "archive_exhausted" &&
+				raw.authorityState !== "inactive"
+			)
+				malformed();
+			// A grace deadline on a non-grace record is a known artifact of the
+			// v0.12.12–v0.12.17 archive writers, which moved disconnect_grace records
+			// to archive_pending without clearing disconnectGraceExpiresAt (fixed by
+			// #4054). Rejecting it here permanently bricked otherwise-healthy shared
+			// registries: the CAS authority refused every read and write forever.
+			// The field is inert outside disconnect_grace, so drop it here to heal
+			// the in-memory state; the next serialize no longer persists it.
+			delete raw.disconnectGraceExpiresAt;
+		}
 		const hasBinding = hasAnyBinding(raw);
 		const hasArchiveOnlyChatIdentity =
 			(raw.authorityState === "archive_pending" ||
@@ -333,11 +366,13 @@ export function parseTopicRegistryState(value: unknown): TopicRegistryState | un
 	for (const [sessionId, records] of Object.entries(state.retiredTopics ?? {})) {
 		if (!isValidBindingString(sessionId) || !Array.isArray(records)) malformed();
 		for (const [index, record] of records.entries()) {
-			parseTopicRegistryState({
+			const recordKey = `${sessionId}:retired:${index}`;
+			const parsed = parseTopicRegistryState({
 				version: 2,
 				registryGeneration: 0,
-				topics: { [`${sessionId}:retired:${index}`]: record },
+				topics: { [recordKey]: record },
 			});
+			records[index] = parsed?.topics[recordKey] ?? malformed();
 		}
 	}
 	for (const [sessionId, epoch] of Object.entries(state.fences ?? {}))

@@ -126,4 +126,20 @@ gjc --mpreset daily               # this session only
 gjc --mpreset ultimate --default  # persist as the startup default (config.yml)
 ```
 
+### Delegation is what makes vendor separation pay off
+
+Worker roles only consume the other vendor's quota when the main agent actually delegates, and the strong "delegate by default" directive is gated behind `task.eager`. When `executor` or `planner` is pinned to a provider other than the `default` role's provider, GJC therefore turns eager delegation on for that session unless `task.eager` is set explicitly in config. Setting `task.eager false` by hand stays authoritative and keeps the separated workers idle — `gjc config doctor` reports that combination as an advisory.
+
 Activation hard-blocks when any provider in `required_providers` lacks credentials, so log in first: `/login anthropic`, `/login openai-codex`, `/login google-antigravity`, `/login xai` (and `opencode-go` via `OPENCODE_API_KEY`).
+
+### Serving cross-vendor profiles through one OpenAI-compatible proxy
+
+When a single gateway (LiteLLM, OpenRouter, or a custom proxy) fronts several vendors, you do not need to configure every `required_providers` entry directly. Add the gateway as a provider — `gjc setup provider --preset litellm --base-url <url>` or `gjc setup provider --preset openai-compatible-proxy --base-url <url>` — and point `modelProfile.proxyProvider` at it in `config.yml`:
+
+```yaml
+modelProfile:
+  proxyProvider: litellm
+  proxyMode: always # route all supported built-in preset selectors through the gateway
+```
+
+`proxyMode: fallback` is the default and uses the gateway only when the direct provider is unauthenticated. Set `proxyMode: always` when the gateway must be the single audit, quota, or spend-control surface: it routes all proxy-routable **built-in** preset selectors through the proxy even when direct credentials exist. The configured proxy must be authenticated and expose every routed model; activation fails closed for missing or ambiguous models. User-defined profiles are never rewritten — set their selectors to `litellm/…` explicitly if you want them proxied. Routing and fail-closed behavior are documented in [Routing built-in presets through a proxy](./models.md#routing-built-in-presets-through-a-proxy-modelprofileproxyprovider).

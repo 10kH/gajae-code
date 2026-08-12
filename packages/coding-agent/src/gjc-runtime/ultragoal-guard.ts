@@ -816,6 +816,8 @@ async function consumeUltragoalNudge(input: {
 	surface: UltragoalNudgeSurface;
 	currentGoal?: CurrentGoalLike | null;
 	sessionId?: string | null;
+	/** The session's effective agent directory (see resolveWorkflowSetting). */
+	agentDir?: string;
 }): Promise<{ nudged: true; message: string } | { nudged: false }> {
 	const sessionId = input.sessionId?.trim() || (await ultragoalReadPaths(input.cwd)).sessionId;
 	if (!sessionId) return { nudged: false };
@@ -823,7 +825,7 @@ async function consumeUltragoalNudge(input: {
 	if (!plan) return { nudged: false };
 	const target = selectUltragoalNudgeTarget(plan, { currentGoalObjective: input.currentGoal?.objective });
 	if (!target) return { nudged: false };
-	const { budget } = await resolveUltragoalNudgeBudget(input.cwd);
+	const { budget } = await resolveUltragoalNudgeBudget(input.cwd, input.agentDir);
 	const outcome = await recordUltragoalNudgeIfBudgetRemaining({
 		cwd: input.cwd,
 		sessionId,
@@ -855,15 +857,17 @@ async function consumeUltragoalNudge(input: {
 export async function consumeUltragoalAskNudge(
 	cwd: string,
 	sessionId?: string | null,
+	agentDir?: string,
 ): Promise<{ nudged: true; message: string } | { nudged: false }> {
 	if (!cwd) return { nudged: false };
-	return consumeUltragoalNudge({ cwd, surface: "ask", sessionId });
+	return consumeUltragoalNudge({ cwd, surface: "ask", sessionId, agentDir });
 }
 
 export async function assertCanCompleteCurrentGoal(input: {
 	cwd: string;
 	currentGoal?: CurrentGoalLike | null;
 	sessionId?: string | null;
+	agentDir?: string;
 }): Promise<void> {
 	if (!input.cwd) return;
 	const diagnostic = await verifyUltragoalDurableCompletionState(input);
@@ -871,6 +875,7 @@ export async function assertCanCompleteCurrentGoal(input: {
 	const nudge = await consumeUltragoalNudge({
 		cwd: input.cwd,
 		surface: "premature_complete",
+		agentDir: input.agentDir,
 		currentGoal: input.currentGoal,
 		sessionId: input.sessionId,
 	});
@@ -969,9 +974,9 @@ export async function isUltragoalPauseBlocked(cwd: string): Promise<UltragoalPau
 	};
 }
 
-export async function assertUltragoalPauseAllowed(cwd: string): Promise<void> {
+export async function assertUltragoalPauseAllowed(cwd: string, agentDir?: string): Promise<void> {
 	if (cwd) {
-		const nudge = await consumeUltragoalNudge({ cwd, surface: "pause" });
+		const nudge = await consumeUltragoalNudge({ cwd, surface: "pause", agentDir });
 		if (nudge.nudged) throw new Error(nudge.message);
 	}
 	const diagnostic = await isUltragoalPauseBlocked(cwd);
@@ -996,6 +1001,7 @@ export async function assertUltragoalDropAllowed(input: {
 	cwd: string;
 	currentGoal?: CurrentGoalLike | null;
 	sessionId?: string | null;
+	agentDir?: string;
 }): Promise<void> {
 	if (!input.cwd) return;
 	let paths: UltragoalPaths;
@@ -1041,6 +1047,7 @@ export async function assertUltragoalDropAllowed(input: {
 	const nudge = await consumeUltragoalNudge({
 		cwd: input.cwd,
 		surface: "drop",
+		agentDir: input.agentDir,
 		currentGoal: input.currentGoal,
 		sessionId,
 	});

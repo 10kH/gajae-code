@@ -15,6 +15,8 @@ const BROKER_OPERATIONS = new Set([
 	"session.close",
 	"session.delete",
 	"broker.shutdown",
+	"session.control",
+	"broker.lookup_lifecycle",
 ]);
 type RequestInput = Record<string, unknown>;
 type BrokerRequest = {

@@ -1020,6 +1020,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				const partial = (currentBlock as { partialArgs?: string }).partialArgs;
 				if (partial !== undefined && !isCompleteJson(partial)) {
 					currentBlock.incompleteArguments = true;
+					currentBlock.incompleteArgumentsReason = "truncated";
 				}
 			}
 
@@ -1335,7 +1336,7 @@ function buildParams(
 	if (options?.frequencyPenalty !== undefined) {
 		params.frequency_penalty = options.frequencyPenalty;
 	}
-	if (shouldSendServiceTier(options?.serviceTier, model.provider)) {
+	if (shouldSendServiceTier(options?.serviceTier, model.provider, compat.supportsServiceTier === true)) {
 		const resolved = resolveServiceTier(options?.serviceTier, model.provider);
 		if (resolved === "flex" || resolved === "scale" || resolved === "priority") {
 			params.service_tier = resolved;

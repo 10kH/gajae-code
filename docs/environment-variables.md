@@ -478,10 +478,11 @@ Extra conditional behavior:
 | `LM_STUDIO_BASE_URL`         | Default implicit LM Studio discovery base URL override (`http://127.0.0.1:1234/v1` if unset)       |
 | `OLLAMA_BASE_URL`            | Default implicit Ollama discovery base URL override (`http://127.0.0.1:11434` if unset)            |
 | `LLAMA_CPP_BASE_URL`         | Default implicit Llama.cpp discovery base URL override (`http://127.0.0.1:8080` if unset)          |
-| `GJC_EDIT_VARIANT`            | Forces edit tool variant when valid (`patch`, `replace`, `hashline`, `atom`, `vim`, `apply_patch`) |
+| `GJC_EDIT_VARIANT`            | Forces edit tool variant (`patch`, `replace`, `hashline`, `vim`, `apply_patch`). The force beats `edit.modelVariants`, `edit.mode`, and automatic model-family routing; invalid values fail fast at startup. `PI_EDIT_VARIANT` is the legacy alias. |
 | `GJC_FORCE_IMAGE_PROTOCOL`    | Forces supported image protocol (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) where used            |
 | `GJC_ALLOW_SIXEL_PASSTHROUGH` | Allows SIXEL passthrough when `GJC_FORCE_IMAGE_PROTOCOL=sixel`                                      |
 | `GJC_NO_PTY`                  | If `1`, disables interactive PTY path for bash tool                                                |
+| `GJC_SESSION_CONTEXT_BUDGET_BYTES` | Overrides the synchronous session-context materialization budget in bytes (default `536870912` = 512 MiB, ceiling `8589934592` = 8 GiB). Only a canonical positive-integer value is honored; anything invalid (empty, non-numeric, negative, zero, overflowing a safe integer, or above the ceiling) fail-closes to the 512 MiB default with a warning. Raise it above your measured session size to suppress the `SessionContextTooLargeError` preflight, or lower it to restore the old tight bound. |
 
 LSP project configuration may control declarative matching, activation, and capabilities, but it cannot define a command, arguments, executable, client factory, initialization options, or opaque server settings. Trusted user-wide configuration outside the project—including the recommended `~/.gjc/agent/lsp.*` files and supported legacy user locations—can override LSP launches and server options; automatic discovery uses trusted external executables and rejects project-owned lexical paths as well as symlink-resolved project binaries.
 
@@ -555,7 +556,7 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | `GJC_DEBUG_REDRAW`         | If `1`, enables redraw debug logging                                                  |
 | `GJC_TUI_DEBUG`            | If `1`, enables deep TUI debug dump path                                              |
 | `GJC_FORCE_IMAGE_PROTOCOL` | Forces terminal image protocol detection (`kitty`, `iterm2`/`iterm`, `sixel`, `none`) |
-| `GJC_TUI_KEYBOARD_PROTOCOL` | Enhanced keyboard input (Kitty keyboard protocol + xterm modifyOtherKeys). Enabled by default; set `0` / `false` to leave the keyboard in its default mode. Use this when a terminal (e.g. Android Termius) breaks IME/Hangul composition while these enhanced modes are active. |
+| `GJC_TUI_KEYBOARD_PROTOCOL` | Enhanced keyboard input (Kitty keyboard protocol + xterm modifyOtherKeys). Enabled by default; set `0` / `false` to leave the keyboard in its default mode. GJC automatically skips the modifyOtherKeys fallback on Windows and Apple Terminal because it breaks CJK/Hangul IME composition there; use the full opt-out for other affected terminals such as Android Termius. |
 | `GJC_TUI_SYNCHRONIZED_OUTPUT` | Synchronized-output framing (`CSI ?2026h/l`) is enabled by default. Set `0` / `false` / `off` / `no` before starting or restarting GJC to remove that framing for terminal parsers that render it incorrectly. This is a process-wide compatibility and diagnostic switch, not tmux/Byobu client detection or per-client negotiation. Disabling it may expose visible tearing; return to the default after diagnosis unless the client requires the workaround. |
 
 ---
@@ -576,8 +577,9 @@ These are read as runtime signals; they are usually set by the terminal/OS rathe
 | Variable | Values | Default | Behavior |
 | --- | --- | --- | --- |
 | `GJC_ACP_PERMISSION_MODE` | `prompt`, `auto`, `always-allow` | `prompt` | Controls whether ACP tool calls use the client's permission prompt or the SDK allow policy. `auto` and `always-allow` both allow gated tool calls without prompting. Invalid values fail safely to `prompt`. |
+| `GJC_ACP_ABORT_SCOPE` | `turn`, `owned` | `owned` | Selects the C04 terminal-abort scope for ACP `session/cancel`. `owned` (the default) stops the active turn **and** exact owned subagents and background tasks; `turn` aborts only the turn and leaves owned work running so its completion can resume the root worker. Invalid values fail safely to `owned`. |
 
-ACP client metadata at `_meta.gjc.permissionHandling` takes precedence when the client supplies that field; the process environment is the fallback. JetBrains Air custom agents can set the fallback per agent in `acp.json`:
+ACP client metadata at `_meta.gjc.permissionHandling` takes precedence when the client supplies that field; the process environment is the fallback. The same precedence applies to the cancel scope: `_meta.gjc.abortScope` on the `session/cancel` notification wins over `GJC_ACP_ABORT_SCOPE` (when `_meta.gjc.abortScope` is present but invalid, the value fails safe to `owned` and the environment fallback is not consulted). JetBrains Air custom agents can set the fallback per agent in `acp.json`:
 
 ```json
 {

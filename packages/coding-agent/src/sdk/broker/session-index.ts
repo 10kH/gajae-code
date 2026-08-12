@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import { resolveEquivalentPath } from "@gajae-code/utils";
 import { withFileLock } from "../../config/file-lock";
+import { processIncarnation } from "./process-incarnation";
 import {
 	assertSupportedSnapshotVersion,
 	assertSupportedStateVersion,
@@ -17,7 +19,29 @@ export type SessionIndexEventType =
 	| "lifecycle_started"
 	| "lifecycle_terminal"
 	| "session_closed"
+	| "session_deleted"
 	| "record_reconciled";
+
+export type SessionActivityState = "active" | "idle";
+/** Coalesced broker-owned heartbeat checkpoint (C2): state plus the observation time. */
+export interface SessionActivity {
+	state: SessionActivityState;
+	at: number;
+}
+/** Events persisted without an OS process incarnation (v1/v2 era) are legacy provenance. */
+export type SessionIdentityProvenance = "composite" | "legacy";
+export type SessionTombstoneRule = "retain" | "expire";
+/**
+ * Injected retention policy (C3). The broker schedules compaction independently of
+ * rotation; settings apply at the next scheduled compaction. `clock` drives both
+ * retention expiry and heartbeat-freshness liveness reads.
+ */
+export interface RetentionPolicy {
+	clock?: () => number;
+	maxAgeMs?: number;
+	maxRows?: number;
+	tombstoneRule?: SessionTombstoneRule;
+}
 export interface SessionIndexEvent {
 	version: typeof SDK_STATE_VERSION;
 	indexSeq: number;
@@ -36,6 +60,10 @@ export interface SessionIndexEvent {
 	endpointMtimeMs?: number;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
+	/** OS process incarnation (C1); absent on legacy v1/v2 events. */
+	hostIncarnation?: string;
+	/** Present on host_heartbeat checkpoints (C2). */
+	activity?: SessionActivity;
 	ts: number;
 	checksum: string;
 }
@@ -51,6 +79,20 @@ export interface IndexedSession {
 	indexSeq: number;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
+	hostIncarnation?: string;
+	identityProvenance: SessionIdentityProvenance;
+	activity?: SessionActivity;
+	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
+	lastHeartbeatAt?: number;
+	/** True when more than one unresolved current state-root identity claims this session id. */
+	ambiguous: boolean;
+	/** True when the identity's latest event is terminal (DR-1 retains stopped rows for inspection/offline tail). */
+	terminal: boolean;
+}
+
+/** A session can grant endpoint or lifecycle authority only when one current state root claims its id. */
+export function isSessionAuthorityEligible(session: Pick<IndexedSession, "ambiguous">): boolean {
+	return session.ambiguous !== true;
 }
 export interface SessionList {
 	indexSeq: number;
@@ -78,13 +120,322 @@ interface SessionIndexScan {
 	logContents: Buffer | undefined;
 	unsupportedError?: UnsupportedStateVersionError;
 }
+
+/** Admission-fence rejection codes recorded in the durable index audit (C5/C4). */
+export type SessionIndexAuditCode = "rejected_superseded_incarnation" | "rejected_after_tombstone";
+export interface SessionIndexAuditRecord {
+	version: typeof SDK_STATE_VERSION;
+	code: SessionIndexAuditCode;
+	/** indexSeq of the rejected event (unique per record; used for idempotent dedupe). */
+	indexSeq: number;
+	sessionId: string;
+	endpointGeneration: number;
+	stateRoot: string;
+	hostIncarnation?: string;
+	supersededByIncarnation?: string;
+	/** indexSeq of the superseding registration, or of the tombstone for post-delete rejections. */
+	supersededByIndexSeq: number;
+	ts: number;
+}
+
 const canonical = (event: Omit<SessionIndexEvent, "checksum">) => JSON.stringify(event);
 export const sessionIndexChecksum = (event: Omit<SessionIndexEvent, "checksum">) =>
 	createHash("sha256").update(canonical(event)).digest("hex");
 const dirFor = (agentDir: string) => path.join(agentDir, "sdk", "sessions");
 const logFor = (agentDir: string) => path.join(dirFor(agentDir), "index.jsonl");
 const snapshotFor = (agentDir: string) => path.join(dirFor(agentDir), "index.snapshot.json");
+const auditFor = (agentDir: string) => path.join(dirFor(agentDir), "index-audit.jsonl");
 const ROTATE_BYTES = 4 * 1024 * 1024;
+/** Coalesced heartbeat checkpoint rate cap (C2): at most one per session per minute. */
+export const SESSION_HEARTBEAT_INTERVAL_MS = 60_000;
+export const DEFAULT_SESSION_RETENTION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+export const DEFAULT_SESSION_RETENTION_MAX_ROWS = 25_000;
+
+/** Identity tuple: (sessionId, generation, stateRoot). Registration authority is per tuple. */
+const tupleKey = (event: SessionIndexEvent) =>
+	`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.locator.stateRoot}`;
+/** Composite identity (C1): (sessionId, generation, process incarnation, stateRoot). */
+const effectiveIncarnation = (event: SessionIndexEvent) => event.hostIncarnation ?? event.processIncarnation;
+const identityKey = (event: SessionIndexEvent) => `${tupleKey(event)}\u0000${effectiveIncarnation(event) ?? ""}`;
+
+interface ResolvedRetentionPolicy {
+	clock: () => number;
+	maxAgeMs: number;
+	maxRows: number;
+	tombstoneRule: SessionTombstoneRule;
+}
+const resolvePolicy = (policy: RetentionPolicy): ResolvedRetentionPolicy => ({
+	clock: policy.clock ?? Date.now,
+	maxAgeMs: policy.maxAgeMs ?? DEFAULT_SESSION_RETENTION_MAX_AGE_MS,
+	maxRows: policy.maxRows ?? DEFAULT_SESSION_RETENTION_MAX_ROWS,
+	tombstoneRule: policy.tombstoneRule ?? "retain",
+});
+
+interface RejectedEvent {
+	code: SessionIndexAuditCode;
+	event: SessionIndexEvent;
+	supersededByIncarnation: string | undefined;
+	supersededByIndexSeq: number;
+}
+interface Admission {
+	admitted: SessionIndexEvent[];
+	rejected: RejectedEvent[];
+}
+
+/**
+ * Broker admission fence (C5), applied before reduction over the total order of
+ * checksum-chained indexSeq. Rule A: per (sessionId, generation, stateRoot) tuple the
+ * latest host_registered event is the incarnation authority; every event of a different
+ * incarnation is rejected (`rejected_superseded_incarnation`). This is a whole-log
+ * function so replay and snapshot replay re-derive the same admission order
+ * (supersession survives compaction). Rule B: after an admitted `session_deleted`
+ * tombstone, non-registration events of identities anchored to pre-delete registrations
+ * are rejected (`rejected_after_tombstone`), so a deleted session cannot be resurrected
+ * by stale old-host events, while registrations after the tombstone lift it.
+ */
+function admitEvents(events: SessionIndexEvent[]): Admission {
+	const authoritative = new Map<string, { incarnation: string | undefined; indexSeq: number }>();
+	for (const event of events) {
+		if (event.type !== "host_registered") continue;
+		const key = tupleKey(event);
+		const current = authoritative.get(key);
+		if (current === undefined || event.indexSeq > current.indexSeq) {
+			authoritative.set(key, { incarnation: event.hostIncarnation, indexSeq: event.indexSeq });
+		}
+	}
+	const admitted: SessionIndexEvent[] = [];
+	const rejected: RejectedEvent[] = [];
+	for (const event of events) {
+		const authority = authoritative.get(tupleKey(event));
+		if (
+			authority !== undefined &&
+			authority.incarnation !== undefined &&
+			event.hostIncarnation !== undefined &&
+			event.hostIncarnation !== authority.incarnation
+		) {
+			rejected.push({
+				code: "rejected_superseded_incarnation",
+				event,
+				supersededByIncarnation: authority.incarnation,
+				supersededByIndexSeq: authority.indexSeq,
+			});
+			continue;
+		}
+		admitted.push(event);
+	}
+	const tombstoneSeq = new Map<string, number>();
+	for (const event of admitted) {
+		if (event.type !== "session_deleted") continue;
+		const previous = tombstoneSeq.get(event.sessionId);
+		if (previous === undefined || event.indexSeq > previous) tombstoneSeq.set(event.sessionId, event.indexSeq);
+	}
+	if (tombstoneSeq.size === 0) return { admitted, rejected };
+	const anchorSeqByIdentity = new Map<string, number>();
+	const postTombstone: SessionIndexEvent[] = [];
+	for (const event of admitted) {
+		const key = identityKey(event);
+		const tombstone = tombstoneSeq.get(event.sessionId);
+		if (event.type === "host_registered") anchorSeqByIdentity.set(key, event.indexSeq);
+		if (tombstone === undefined || event.indexSeq <= tombstone) {
+			postTombstone.push(event);
+			continue;
+		}
+		if (event.type === "host_registered") {
+			postTombstone.push(event);
+			continue;
+		}
+		const anchor = anchorSeqByIdentity.get(key);
+		if (anchor === undefined || anchor <= tombstone) {
+			rejected.push({
+				code: "rejected_after_tombstone",
+				event,
+				supersededByIncarnation: undefined,
+				supersededByIndexSeq: tombstone,
+			});
+			continue;
+		}
+		postTombstone.push(event);
+	}
+	return { admitted: postTombstone, rejected };
+}
+
+/** Pure rejection ledger derived from the event stream (C5 audit, idempotent by indexSeq). */
+function auditRecords(events: SessionIndexEvent[], ts: number): SessionIndexAuditRecord[] {
+	const { rejected } = admitEvents(events);
+	return rejected.map(rejection => ({
+		version: SDK_STATE_VERSION,
+		code: rejection.code,
+		indexSeq: rejection.event.indexSeq,
+		sessionId: rejection.event.sessionId,
+		endpointGeneration: rejection.event.endpointGeneration,
+		stateRoot: rejection.event.locator.stateRoot,
+		...(rejection.event.hostIncarnation !== undefined ? { hostIncarnation: rejection.event.hostIncarnation } : {}),
+		...(rejection.supersededByIncarnation !== undefined
+			? { supersededByIncarnation: rejection.supersededByIncarnation }
+			: {}),
+		supersededByIndexSeq: rejection.supersededByIndexSeq,
+		ts,
+	}));
+}
+
+interface SessionIdentityState {
+	identity: string;
+	latest: SessionIndexEvent;
+	heartbeat: SessionIndexEvent | undefined;
+}
+
+interface SessionIndexProjection {
+	identities: IndexedSession[];
+	sessions: IndexedSession[];
+}
+
+function isTerminalEvent(event: SessionIndexEvent): boolean {
+	return event.type === "host_unregistered" || event.type === "session_closed" || event.type === "session_deleted";
+}
+
+function isUnresolvedEvent(event: SessionIndexEvent): boolean {
+	return !isTerminalEvent(event);
+}
+
+function preferredIdentity(states: Iterable<SessionIdentityState>): SessionIdentityState | undefined {
+	let preferred: SessionIdentityState | undefined;
+	for (const state of states) {
+		if (
+			preferred === undefined ||
+			state.latest.endpointGeneration > preferred.latest.endpointGeneration ||
+			(state.latest.endpointGeneration === preferred.latest.endpointGeneration &&
+				state.latest.indexSeq > preferred.latest.indexSeq)
+		)
+			preferred = state;
+	}
+	return preferred;
+}
+
+function projectIdentity(state: SessionIdentityState, ambiguous: boolean, now: number): IndexedSession {
+	const { latest, heartbeat } = state;
+	const terminal = isTerminalEvent(latest);
+	const terminalUncertain = latest.type === "lifecycle_terminal" || latest.terminalUncertain === true;
+	const pidAlive = alive(latest.pid);
+	// Liveness evidence is host-written: a checkpointed heartbeat, or the
+	// `host_registered` event the host appended itself. Counting registration
+	// closes the up-to-one-interval window where a just-registered session
+	// would read not-live before the first C2 pass — without weakening the
+	// pid-reuse fence, because the incarnation match below is still required.
+	// Broker-written events (reconciliation, terminal records) are not host
+	// evidence and never refresh liveness.
+	const evidenceTs = Math.max(heartbeat?.ts ?? 0, latest.type === "host_registered" ? latest.ts : 0);
+	const heartbeatFresh = evidenceTs > 0 && now - evidenceTs < 2 * SESSION_HEARTBEAT_INTERVAL_MS;
+	const recordedIncarnation = effectiveIncarnation(latest);
+	const currentIncarnation = recordedIncarnation === undefined ? undefined : processIncarnation(latest.pid);
+	const incarnationMatches = currentIncarnation !== undefined && currentIncarnation === recordedIncarnation;
+	return {
+		sessionId: latest.sessionId,
+		locator: latest.locator,
+		endpointGeneration: latest.endpointGeneration,
+		pid: latest.pid,
+		processIncarnation: latest.processIncarnation,
+		endpointMtimeMs: latest.endpointMtimeMs,
+		lifecycleRequestId: latest.lifecycleRequestId,
+		terminalUncertain,
+		indexSeq: latest.indexSeq,
+		hostIncarnation: latest.hostIncarnation,
+		identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
+		activity: heartbeat?.activity,
+		lastHeartbeatAt: heartbeat?.ts,
+		ambiguous,
+		terminal,
+		live:
+			isSessionAuthorityEligible({ ambiguous }) &&
+			!terminal &&
+			!terminalUncertain &&
+			pidAlive &&
+			heartbeatFresh &&
+			incarnationMatches,
+	};
+}
+
+/**
+ * Total-order projection (C5/C6): first retain every current composite-identity
+ * row, then select one public row per session. More than one unresolved state root
+ * fences authority. Once exactly one unresolved root remains, its current identity
+ * becomes the public authority even when a terminated identity from another root
+ * has a higher generation. Heartbeats inherit locator/endpoint metadata from their
+ * identity's prior event.
+ */
+function reduceEvents(events: SessionIndexEvent[], now: number): SessionIndexProjection {
+	const { admitted } = admitEvents(events);
+	const latestByIdentity = new Map<string, SessionIndexEvent>();
+	const latestHeartbeatByIdentity = new Map<string, SessionIndexEvent>();
+	for (const event of admitted) {
+		const identity = identityKey(event);
+		if (event.type === "host_heartbeat") {
+			latestHeartbeatByIdentity.set(identity, event);
+			continue;
+		}
+		const previous = latestByIdentity.get(identity);
+		if (previous === undefined || event.indexSeq > previous.indexSeq) latestByIdentity.set(identity, event);
+	}
+	const statesBySession = new Map<string, SessionIdentityState[]>();
+	const rootsBySession = new Map<string, Map<string, SessionIdentityState[]>>();
+	for (const [identity, latest] of latestByIdentity) {
+		const state: SessionIdentityState = { identity, latest, heartbeat: latestHeartbeatByIdentity.get(identity) };
+		let states = statesBySession.get(latest.sessionId);
+		if (states === undefined) {
+			states = [];
+			statesBySession.set(latest.sessionId, states);
+		}
+		states.push(state);
+		let roots = rootsBySession.get(latest.sessionId);
+		if (roots === undefined) {
+			roots = new Map<string, SessionIdentityState[]>();
+			rootsBySession.set(latest.sessionId, roots);
+		}
+		let rootStates = roots.get(latest.locator.stateRoot);
+		if (rootStates === undefined) {
+			rootStates = [];
+			roots.set(latest.locator.stateRoot, rootStates);
+		}
+		rootStates.push(state);
+	}
+	const unresolvedRoots = new Map<string, Map<string, SessionIdentityState[]>>();
+	for (const [sessionId, roots] of rootsBySession) {
+		for (const [root, rootStates] of roots) {
+			const current = preferredIdentity(rootStates);
+			if (!current || !isUnresolvedEvent(current.latest)) continue;
+			let unresolved = unresolvedRoots.get(sessionId);
+			if (unresolved === undefined) {
+				unresolved = new Map<string, SessionIdentityState[]>();
+				unresolvedRoots.set(sessionId, unresolved);
+			}
+			unresolved.set(root, rootStates);
+		}
+	}
+	const identities: IndexedSession[] = [];
+	const sessions: IndexedSession[] = [];
+	for (const [sessionId, states] of statesBySession) {
+		const roots = unresolvedRoots.get(sessionId);
+		const ambiguous = (roots?.size ?? 0) > 1;
+		for (const state of states) identities.push(projectIdentity(state, ambiguous, now));
+		const defaultAuthority = preferredIdentity(states);
+		if (defaultAuthority === undefined || defaultAuthority.latest.type === "session_deleted") continue;
+		let authority = defaultAuthority;
+		if (roots?.size === 1) {
+			const onlyRoot = roots.values().next().value;
+			const survivingAuthority = onlyRoot ? preferredIdentity(onlyRoot) : undefined;
+			if (survivingAuthority !== undefined) authority = survivingAuthority;
+		}
+		sessions.push(projectIdentity(authority, ambiguous, now));
+	}
+	return { identities, sessions };
+}
+
+// Global launch bursts may queue behind legitimate long index transactions. Keep
+// this bounded at one minute while the shared lock's exact dead-owner recovery runs.
+const SESSION_INDEX_LOCK_OPTIONS = { retries: 600, retryDelayMs: 100 } as const;
+
+function withSessionIndexLock<T>(agentDir: string, callback: () => Promise<T>): Promise<T> {
+	return withFileLock(logFor(agentDir), callback, SESSION_INDEX_LOCK_OPTIONS);
+}
 function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; events: SessionIndexEvent[] } {
 	if (!snapshot || typeof snapshot !== "object") return false;
 	const { indexSeq, events } = snapshot as { indexSeq?: unknown; events?: unknown };
@@ -105,25 +456,44 @@ function isValidSnapshot(snapshot: unknown): snapshot is { indexSeq: number; eve
 	return previous === indexSeq;
 }
 
-// Compact the event history for a snapshot without renumbering: clients hold indexSeq
-// across calls, so retained events keep their original indexSeq and checksum. Drops
-// terminal+dead sessions entirely, collapses superseded heartbeats to the latest per
-// surviving session, and always retains the global-max indexSeq as the chain anchor.
-function compactEvents(events: SessionIndexEvent[]): SessionIndexEvent[] {
+/**
+ * Compact the event history for a snapshot without renumbering: clients hold indexSeq
+ * across calls, so retained events keep their original indexSeq and checksum. Stopped
+ * and terminal identities are retained (DR-1: only `session_deleted` hides a row), so
+ * inspect/offline tail keep working across compaction; superseded heartbeats collapse
+ * to the latest per surviving composite identity, the global-max indexSeq always stays
+ * as the chain anchor, then the injected retention policy applies per session
+ * (whole-session eviction keeps the projection deterministic: a dropped session
+ * contributes no events to re-derive). Tombstone rule "retain" exempts deleted sessions
+ * from age/row eviction (C4 audit evidence retained); "expire" evicts them like any
+ * other session.
+ */
+function compactEvents(events: SessionIndexEvent[], policy: ResolvedRetentionPolicy): SessionIndexEvent[] {
 	if (events.length === 0) return events;
 	const maxIndexSeq = events[events.length - 1]!.indexSeq;
-	const latestBySession = new Map<string, SessionIndexEvent>();
-	for (const event of events) latestBySession.set(event.sessionId, event);
-	const deadTerminal = new Set<string>();
-	for (const [sessionId, latest] of latestBySession) {
-		const terminal = latest.type === "host_unregistered" || latest.type === "session_closed";
-		if (terminal && !alive(latest.pid)) deadTerminal.add(sessionId);
-	}
-	const latestHeartbeatSeq = new Map<string, number>();
+	const latestByIdentity = new Map<string, SessionIndexEvent>();
+	const latestHeartbeatByIdentity = new Map<string, number>();
 	for (const event of events) {
-		if (event.type === "host_heartbeat" && !deadTerminal.has(event.sessionId)) {
-			latestHeartbeatSeq.set(event.sessionId, event.indexSeq);
+		const key = identityKey(event);
+		const previous = latestByIdentity.get(key);
+		if (previous === undefined || event.indexSeq > previous.indexSeq) latestByIdentity.set(key, event);
+		if (event.type === "host_heartbeat") {
+			const current = latestHeartbeatByIdentity.get(key);
+			if (current === undefined || event.indexSeq > current) latestHeartbeatByIdentity.set(key, event.indexSeq);
 		}
+	}
+	const now = policy.clock();
+	const sessionLatest = new Map<string, SessionIndexEvent>();
+	for (const event of events) {
+		const previous = sessionLatest.get(event.sessionId);
+		if (previous === undefined || event.indexSeq > previous.indexSeq) sessionLatest.set(event.sessionId, event);
+	}
+	const expiredSessions = new Set<string>();
+	for (const [sessionId, latest] of sessionLatest) {
+		if (latest.indexSeq === maxIndexSeq) continue;
+		const deleted = latest.type === "session_deleted";
+		if (policy.tombstoneRule === "retain" && deleted) continue;
+		if (latest.ts < now - policy.maxAgeMs) expiredSessions.add(sessionId);
 	}
 	const kept: SessionIndexEvent[] = [];
 	for (const event of events) {
@@ -131,9 +501,28 @@ function compactEvents(events: SessionIndexEvent[]): SessionIndexEvent[] {
 			kept.push(event);
 			continue;
 		}
-		if (deadTerminal.has(event.sessionId)) continue;
-		if (event.type === "host_heartbeat" && latestHeartbeatSeq.get(event.sessionId) !== event.indexSeq) continue;
+		if (event.type === "host_heartbeat" && latestHeartbeatByIdentity.get(identityKey(event)) !== event.indexSeq)
+			continue;
+		if (expiredSessions.has(event.sessionId)) continue;
 		kept.push(event);
+	}
+	if (policy.maxRows >= 1 && kept.length > policy.maxRows) {
+		const keptLatest = new Map<string, SessionIndexEvent>();
+		for (const event of kept) {
+			const previous = keptLatest.get(event.sessionId);
+			if (previous === undefined || event.indexSeq > previous.indexSeq) keptLatest.set(event.sessionId, event);
+		}
+		const anchorSession = kept.find(event => event.indexSeq === maxIndexSeq)?.sessionId;
+		const candidates = [...keptLatest.entries()]
+			.filter(([sessionId]) => sessionId !== anchorSession)
+			.filter(([, latest]) => !(policy.tombstoneRule === "retain" && latest.type === "session_deleted"))
+			.sort((a, b) => a[1].indexSeq - b[1].indexSeq);
+		let result = kept;
+		for (const [sessionId] of candidates) {
+			if (result.length <= policy.maxRows) break;
+			result = result.filter(event => event.sessionId !== sessionId);
+		}
+		return result;
 	}
 	return kept;
 }
@@ -220,12 +609,16 @@ export class SessionIndex {
 	static #operations = new Map<string, Promise<void>>();
 	static #openGroups = new Map<string, SessionIndexOpenGroup>();
 	#agentDir: string;
+	#policy: ResolvedRetentionPolicy;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
 	#logOffset = 0;
 	#corruptSuffix = false;
-	constructor(agentDir: string) {
+	/** indexSeqs already recorded in the durable audit; null until lazily seeded. */
+	#auditedSeq: Set<number> | null = null;
+	constructor(agentDir: string, policy: RetentionPolicy = {}) {
 		this.#agentDir = agentDir;
+		this.#policy = resolvePolicy(policy);
 	}
 	static #enqueue<T>(indexPath: string, operation: () => Promise<T>): Promise<T> {
 		const previous = SessionIndex.#operations.get(indexPath) ?? Promise.resolve();
@@ -249,7 +642,7 @@ export class SessionIndex {
 			group.promise = SessionIndex.#enqueue(indexPath, () => this.#prepareOpenGroup(indexPath, group!));
 		}
 		await group.promise;
-		await SessionIndex.#enqueue(indexPath, () => withFileLock(logFor(this.#agentDir), () => this.#replayUnderLock()));
+		await SessionIndex.#enqueue(indexPath, () => withSessionIndexLock(this.#agentDir, () => this.#replayUnderLock()));
 		return this;
 	}
 	async #prepareOpenGroup(indexPath: string, group: SessionIndexOpenGroup): Promise<void> {
@@ -263,7 +656,7 @@ export class SessionIndex {
 	}
 	async replay(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
-		await SessionIndex.#enqueue(indexPath, () => withFileLock(logFor(this.#agentDir), () => this.#replayUnderLock()));
+		await SessionIndex.#enqueue(indexPath, () => withSessionIndexLock(this.#agentDir, () => this.#replayUnderLock()));
 	}
 	async #replayUnderLock(): Promise<void> {
 		const scan = await this.#scan();
@@ -274,6 +667,33 @@ export class SessionIndex {
 		this.#corruptSuffix = scan.diagnosis.status === "corrupt";
 		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
 		if (this.#corruptSuffix) this.#warnings.push("Corrupt session index entry; replay truncated");
+		await this.#writeAuditUnderLock();
+	}
+	/** Seed the audit dedupe set once, then append records for newly-rejected events. */
+	async #writeAuditUnderLock(): Promise<void> {
+		if (this.#auditedSeq === null) {
+			this.#auditedSeq = new Set();
+			try {
+				const contents = await fs.readFile(auditFor(this.#agentDir), "utf8");
+				for (const line of contents.split("\n")) {
+					if (!line) continue;
+					try {
+						const record = JSON.parse(line) as Partial<SessionIndexAuditRecord>;
+						if (typeof record.indexSeq === "number") this.#auditedSeq.add(record.indexSeq);
+					} catch {
+						// Best-effort dedupe seed; a corrupt audit row never blocks the index.
+					}
+				}
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			}
+		}
+		const pending = auditRecords(this.#events, this.#policy.clock()).filter(
+			record => !this.#auditedSeq!.has(record.indexSeq),
+		);
+		if (pending.length === 0) return;
+		await appendSync(auditFor(this.#agentDir), pending.map(record => JSON.stringify(record)).join("\n"));
+		for (const record of pending) this.#auditedSeq.add(record.indexSeq);
 	}
 	async #scan(): Promise<SessionIndexScan> {
 		let snapshotContents: Buffer | undefined;
@@ -427,14 +847,14 @@ export class SessionIndex {
 				}),
 			);
 			if (!exists.some(Boolean)) return { status: "healthy", validPrefixSeq: 0, snapshotSeq: 0 };
-			return await withFileLock(logFor(this.#agentDir), async () => (await this.#scan()).diagnosis);
+			return await withSessionIndexLock(this.#agentDir, async () => (await this.#scan()).diagnosis);
 		});
 	}
 	async repair(): Promise<SessionIndexRepairResult> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-			return await withFileLock(logFor(this.#agentDir), async () => {
+			return await withSessionIndexLock(this.#agentDir, async () => {
 				const scan = await this.#scan();
 				if (scan.diagnosis.status === "unsupported") return { ...scan.diagnosis, repaired: false };
 				if (scan.diagnosis.status === "healthy") return { ...scan.diagnosis, repaired: false };
@@ -517,11 +937,12 @@ export class SessionIndex {
 	async refresh(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
-			withFileLock(logFor(this.#agentDir), () => this.#refreshUnderLock()),
+			withSessionIndexLock(this.#agentDir, () => this.#refreshUnderLock()),
 		);
 	}
 	async #refreshUnderLock(): Promise<void> {
 		await this.#tailUnderLock();
+		await this.#writeAuditUnderLock();
 	}
 	get indexSeq(): number {
 		return this.#events.at(-1)?.indexSeq ?? 0;
@@ -533,7 +954,7 @@ export class SessionIndex {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, async () => {
 			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
-			return await withFileLock(logFor(this.#agentDir), async () => {
+			return await withSessionIndexLock(this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix)
 					throw new Error(
@@ -545,11 +966,93 @@ export class SessionIndex {
 					indexSeq: this.indexSeq + 1,
 					ts: input.ts ?? Date.now(),
 				};
+				// A host may derive its own OS identity; broker-authored events for another
+				// process must carry the registration's persisted binding instead.
+				if (
+					unsigned.hostIncarnation === undefined &&
+					unsigned.pid === process.pid &&
+					Number.isSafeInteger(unsigned.pid) &&
+					unsigned.pid > 0
+				) {
+					unsigned.hostIncarnation = unsigned.processIncarnation ?? processIncarnation(unsigned.pid);
+				}
 				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
 				await this.#refreshUnderLock();
 				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
 				return event;
+			});
+		});
+	}
+	async unregisterIfCurrent(expected: IndexedSession): Promise<boolean> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			return await withFileLock(logFor(this.#agentDir), async () => {
+				await this.#replayUnderLock();
+				if (this.#corruptSuffix) throw new Error("Cannot conditionally unregister from a corrupt session index");
+				const identities = this.listSessionIdentities();
+				const current = identities.find(
+					session =>
+						session.sessionId === expected.sessionId &&
+						session.endpointGeneration === expected.endpointGeneration &&
+						session.pid === expected.pid &&
+						session.endpointMtimeMs === expected.endpointMtimeMs &&
+						session.lifecycleRequestId === expected.lifecycleRequestId &&
+						session.processIncarnation === expected.processIncarnation &&
+						(session.hostIncarnation ?? session.processIncarnation) ===
+							(expected.hostIncarnation ?? expected.processIncarnation) &&
+						resolveEquivalentPath(session.locator.repo) === resolveEquivalentPath(expected.locator.repo) &&
+						path.resolve(session.locator.stateRoot) === path.resolve(expected.locator.stateRoot),
+				);
+				let currentRoot: IndexedSession | undefined;
+				for (const session of identities) {
+					if (
+						session.sessionId !== expected.sessionId ||
+						session.terminal ||
+						resolveEquivalentPath(session.locator.repo) !== resolveEquivalentPath(expected.locator.repo) ||
+						path.resolve(session.locator.stateRoot) !== path.resolve(expected.locator.stateRoot)
+					)
+						continue;
+					if (
+						currentRoot === undefined ||
+						session.endpointGeneration > currentRoot.endpointGeneration ||
+						(session.endpointGeneration === currentRoot.endpointGeneration &&
+							session.indexSeq > currentRoot.indexSeq)
+					)
+						currentRoot = session;
+				}
+				if (
+					!current ||
+					current !== currentRoot ||
+					current.terminal ||
+					current.terminalUncertain ||
+					this.hostUnregisteredAfter(expected)
+				)
+					return false;
+				const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+					version: SDK_STATE_VERSION,
+					indexSeq: this.indexSeq + 1,
+					ts: Date.now(),
+					type: "host_unregistered",
+					sessionId: expected.sessionId,
+					locator: expected.locator,
+					endpointGeneration: expected.endpointGeneration,
+					pid: expected.pid,
+					...(expected.processIncarnation === undefined
+						? {}
+						: { processIncarnation: expected.processIncarnation }),
+					...(expected.hostIncarnation === undefined ? {} : { hostIncarnation: expected.hostIncarnation }),
+					...(expected.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: expected.endpointMtimeMs }),
+					...(expected.lifecycleRequestId === undefined
+						? {}
+						: { lifecycleRequestId: expected.lifecycleRequestId }),
+				};
+				const event: SessionIndexEvent = { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
+				await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+				await this.#refreshUnderLock();
+				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+				return true;
 			});
 		});
 	}
@@ -564,7 +1067,7 @@ export class SessionIndex {
 				if ((error as NodeJS.ErrnoException).code === "ENOENT") return await callback();
 				throw error;
 			}
-			return await withFileLock(logFor(this.#agentDir), async () => {
+			return await withSessionIndexLock(this.#agentDir, async () => {
 				await this.#replayUnderLock();
 				if (this.#corruptSuffix) throw new Error("Cannot use corrupt session index for artifact reclamation");
 				return await callback();
@@ -574,7 +1077,7 @@ export class SessionIndex {
 	async snapshot(): Promise<void> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		await SessionIndex.#enqueue(indexPath, () =>
-			withFileLock(logFor(this.#agentDir), () => this.#snapshotUnderLock()),
+			withSessionIndexLock(this.#agentDir, () => this.#snapshotUnderLock()),
 		);
 	}
 	async #snapshotUnderLock(): Promise<void> {
@@ -593,7 +1096,7 @@ export class SessionIndex {
 			JSON.stringify({
 				version: SESSION_INDEX_SNAPSHOT_VERSION,
 				indexSeq: this.indexSeq,
-				events: compactEvents(this.#events),
+				events: compactEvents(this.#events, this.#policy),
 			}),
 			{
 				mode: 0o600,
@@ -608,6 +1111,19 @@ export class SessionIndex {
 		await fs.rename(tmp, file);
 		await syncDirectory(file);
 	}
+	/**
+	 * Broker-scheduled compaction (C3), independent of rotation size: applies the
+	 * injected retention policy to a fresh snapshot and truncates the log.
+	 */
+	async compact(): Promise<void> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		await SessionIndex.#enqueue(indexPath, () =>
+			withFileLock(logFor(this.#agentDir), async () => {
+				await this.#replayUnderLock();
+				await this.#rotate();
+			}),
+		);
+	}
 	async #rotate(): Promise<void> {
 		await this.#snapshotUnderLock();
 		const file = logFor(this.#agentDir);
@@ -619,46 +1135,89 @@ export class SessionIndex {
 	}
 
 	listSessions(): SessionList {
-		const latest = new Map<string, SessionIndexEvent>();
-		for (const event of this.#events) {
-			const previous = latest.get(event.sessionId);
-			latest.set(
-				event.sessionId,
-				event.type === "host_heartbeat" && previous
-					? {
-							...event,
-							locator: previous.locator,
-							endpointMtimeMs: previous.endpointMtimeMs,
-							lifecycleRequestId: previous.lifecycleRequestId,
-							processIncarnation: previous.processIncarnation,
-						}
-					: event,
-			);
-		}
-		const sessions = [...latest.values()]
-			.filter(event => !["host_unregistered", "session_closed"].includes(event.type))
-			.map(event => ({
-				sessionId: event.sessionId,
-				locator: event.locator,
-				endpointGeneration: event.endpointGeneration,
-				pid: event.pid,
-				processIncarnation: event.processIncarnation,
-				endpointMtimeMs: event.endpointMtimeMs,
-				lifecycleRequestId: event.lifecycleRequestId,
-				terminalUncertain: event.type === "lifecycle_terminal" || event.terminalUncertain === true,
-				indexSeq: event.indexSeq,
-				live: alive(event.pid),
-			}));
-		return { indexSeq: this.indexSeq, sessions, warnings: this.#warnings };
+		return {
+			indexSeq: this.indexSeq,
+			sessions: reduceEvents(this.#events, this.#policy.clock()).sessions,
+			warnings: this.#warnings,
+		};
+	}
+	/**
+	 * Broker-internal current composite-identity rows. Unlike {@link listSessions},
+	 * this retains losing roots so an exact dead registration can be retired without
+	 * disturbing the surviving authority.
+	 */
+	listSessionIdentities(): IndexedSession[] {
+		return reduceEvents(this.#events, this.#policy.clock()).identities;
+	}
+
+	/**
+	 * Production coalesced heartbeat checkpoint pass (C2): appends one
+	 * `host_heartbeat` per session at most once per {@link SESSION_HEARTBEAT_INTERVAL_MS}.
+	 * The pass observes liveness the same way the projection does — the host process
+	 * must be alive and, for composite identities, still carry the recorded OS process
+	 * incarnation (a reused PID is never checkpointed). Stopped, terminal, and ambiguous rows
+	 * and rows whose heartbeat is still fresh are skipped. After a broker restart, sessions whose
+	 * host survived are re-observed as live on the first pass; sessions whose host died
+	 * while the broker was down keep their stale or missing heartbeat and read as
+	 * unknown/not-live (never fresh forever). Returns the number of checkpoints written.
+	 */
+	async checkpointLiveHeartbeats(now = Date.now()): Promise<number> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, async () => {
+			await fs.mkdir(dirFor(this.#agentDir), { recursive: true, mode: 0o700 });
+			return await withFileLock(logFor(this.#agentDir), async () => {
+				await this.#replayUnderLock();
+				if (this.#corruptSuffix) return 0;
+				const events: SessionIndexEvent[] = [];
+				const rows = reduceEvents(this.#events, now).sessions;
+				for (const row of rows) {
+					if (!isSessionAuthorityEligible(row) || row.terminal || row.terminalUncertain) continue;
+					if (row.lastHeartbeatAt !== undefined && now - row.lastHeartbeatAt < SESSION_HEARTBEAT_INTERVAL_MS)
+						continue;
+					if (!alive(row.pid)) continue;
+					const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
+					if (recordedIncarnation === undefined) continue;
+					const current = processIncarnation(row.pid);
+					if (current === undefined || current !== recordedIncarnation) continue;
+					const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+						version: SDK_STATE_VERSION,
+						indexSeq: this.indexSeq + events.length + 1,
+						type: "host_heartbeat",
+						sessionId: row.sessionId,
+						locator: row.locator,
+						endpointGeneration: row.endpointGeneration,
+						pid: row.pid,
+						...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
+						...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
+						activity: { state: "active", at: now },
+						ts: now,
+					};
+					events.push({ ...unsigned, checksum: sessionIndexChecksum(unsigned) });
+				}
+				if (events.length === 0) return 0;
+				for (const event of events) await appendSync(logFor(this.#agentDir), JSON.stringify(event));
+				await this.#refreshUnderLock();
+				if ((await fs.stat(logFor(this.#agentDir))).size >= ROTATE_BYTES) await this.#rotate();
+				return events.length;
+			});
+		});
 	}
 
 	hostUnregisteredAfter(
 		registration: Pick<
 			IndexedSession,
-			"sessionId" | "endpointGeneration" | "pid" | "indexSeq" | "lifecycleRequestId"
+			| "sessionId"
+			| "locator"
+			| "endpointGeneration"
+			| "pid"
+			| "indexSeq"
+			| "lifecycleRequestId"
+			| "hostIncarnation"
+			| "processIncarnation"
 		>,
 	): { indexSeq: number; lifecycleRequestId?: string } | undefined {
 		const lifecycleRequestId = registration.lifecycleRequestId;
+		const incarnation = registration.hostIncarnation ?? registration.processIncarnation;
 		const event = this.#events.findLast(
 			item =>
 				item.type === "host_unregistered" &&
@@ -666,7 +1225,10 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
-				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId),
+				resolveEquivalentPath(item.locator.repo) === resolveEquivalentPath(registration.locator.repo) &&
+				path.resolve(item.locator.stateRoot) === path.resolve(registration.locator.stateRoot) &&
+				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&
+				(incarnation === undefined || (item.hostIncarnation ?? item.processIncarnation) === incarnation),
 		);
 		return event
 			? {
@@ -701,7 +1263,11 @@ export class SessionIndex {
 					lifecycleRequestId: event.lifecycleRequestId,
 					terminalUncertain: false,
 					indexSeq: event.indexSeq,
+					hostIncarnation: event.hostIncarnation,
+					identityProvenance: event.hostIncarnation === undefined ? "legacy" : "composite",
+					ambiguous: false,
 					live: alive(event.pid),
+					terminal: false,
 				}
 			: undefined;
 	}

@@ -65,6 +65,9 @@
 							"supportsResponsesSessionAffinity": {
 								"type": "boolean"
 							},
+							"supportsServiceTier": {
+								"type": "boolean"
+							},
 							"supportsMultipleSystemMessages": {
 								"type": "boolean"
 							},
@@ -511,6 +514,9 @@
 										"supportsResponsesSessionAffinity": {
 											"type": "boolean"
 										},
+										"supportsServiceTier": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -897,6 +903,9 @@
 										"supportsResponsesSessionAffinity": {
 											"type": "boolean"
 										},
+										"supportsServiceTier": {
+											"type": "boolean"
+										},
 										"supportsMultipleSystemMessages": {
 											"type": "boolean"
 										},
@@ -1268,7 +1277,8 @@
 								"executor",
 								"architect",
 								"planner",
-								"critic"
+								"critic",
+								"image"
 							]
 						},
 						"additionalProperties": {

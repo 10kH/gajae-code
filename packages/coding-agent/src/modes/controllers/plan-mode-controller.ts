@@ -145,7 +145,7 @@ export class PlanModeController {
 		await this.ctx.session.abort({ timeoutMs: ABORT_TIMEOUT_MS });
 		if (this.#previousTools?.length) await this.ctx.session.setActiveToolsByName(this.#previousTools);
 		if (this.#providerSessionScope && !this.ctx.session.isStreaming) {
-			if (this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope))
+			if (await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope))
 				this.#providerSessionScope = undefined;
 		} else if (this.#previousModelState) {
 			const previous = this.#previousModelState;
@@ -187,7 +187,7 @@ export class PlanModeController {
 			});
 		} catch (error) {
 			if (this.#providerSessionScope)
-				this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope);
+				await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope);
 			this.#providerSessionScope = undefined;
 			this.ctx.showWarning(
 				`Failed to switch model after streaming: ${error instanceof Error ? error.message : String(error)}`,
@@ -284,7 +284,7 @@ export class PlanModeController {
 			});
 		} catch (error) {
 			if (this.#providerSessionScope)
-				this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope);
+				await this.ctx.session.restoreTemporaryProviderSessionScope(this.#providerSessionScope);
 			this.#providerSessionScope = undefined;
 			this.ctx.showWarning(
 				`Failed to switch to plan model for plan mode: ${error instanceof Error ? error.message : String(error)}`,

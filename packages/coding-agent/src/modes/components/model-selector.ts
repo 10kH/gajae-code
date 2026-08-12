@@ -1,5 +1,5 @@
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import { getSupportedEfforts, type Model, modelsAreEqual } from "@gajae-code/ai/core";
+import { getSupportedEfforts, type Model, modelSupportsServiceTier, modelsAreEqual } from "@gajae-code/ai/core";
 import {
 	Container,
 	fuzzyFilter,
@@ -43,7 +43,6 @@ import type { Settings } from "../../config/settings";
 import { type ThemeColor, theme } from "../../modes/theme/theme";
 import { formatModelOnboardingInlineHint } from "../../setup/model-onboarding-guidance";
 import { formatClampedModelSelector, getThinkingLevelMetadata, parseThinkingLevel } from "../../thinking";
-import { getConfiguredImageModel } from "../../tools/image-gen";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
 
@@ -147,9 +146,6 @@ export type ModelSelectorSelection =
 	| {
 			kind: "deleteProfile";
 			profileName: string;
-	  }
-	| {
-			kind: "imageGeneration";
 	  };
 
 interface PendingThinkingChoice {
@@ -215,8 +211,8 @@ interface PresetBrowseRow {
 	kind: "browse";
 }
 
-interface PresetImageGenerationRow {
-	kind: "imageGeneration";
+interface PresetImageRoleRow {
+	kind: "imageRole";
 }
 
 type PresetLandingRow =
@@ -226,7 +222,7 @@ type PresetLandingRow =
 	| PresetCreateUnavailableRow
 	| PresetAlreadySavedRow
 	| PresetBrowseRow
-	| PresetImageGenerationRow;
+	| PresetImageRoleRow;
 
 // Stable logical identity for a preset landing row, independent of its current
 // list position. Used to relocate the cursor after the expanded group changes so
@@ -245,8 +241,8 @@ function presetRowIdentity(row: PresetLandingRow): string {
 			return "createUnavailable";
 		case "alreadySaved":
 			return `alreadySaved:${row.profile.name}`;
-		case "imageGeneration":
-			return "imageGeneration";
+		case "imageRole":
+			return "imageRole";
 	}
 }
 
@@ -369,8 +365,8 @@ export class ModelSelectorComponent extends Container {
 	#currentThinkingLevel?: ThinkingLevel;
 	#activeModelProfile?: string;
 	#configuredDefaultChain?: readonly string[];
-	#isFastForProvider: (provider?: string) => boolean = () => false;
-	#isFastForSubagentProvider: (provider?: string) => boolean = () => false;
+	#isFastForProvider: (provider?: string, supportsServiceTier?: boolean) => boolean = () => false;
+	#isFastForSubagentProvider: (provider?: string, supportsServiceTier?: boolean) => boolean = () => false;
 	#isCurrentModelFastModeActive: () => boolean = () => false;
 	#pendingActionItem?: ModelItem | CanonicalModelItem;
 	#selectedActionIndex: number = 0;
@@ -378,6 +374,8 @@ export class ModelSelectorComponent extends Container {
 	#selectedThinkingIndex: number = 0;
 	#assignmentState: "idle" | "assigning" = "idle";
 	#closeAfterAssignment = false;
+	#unsubscribeCatalogChanged: () => void = () => {};
+	#disposed = false;
 
 	// Preset landing state
 	#viewMode: ModelSelectorViewMode = "presets";
@@ -391,6 +389,7 @@ export class ModelSelectorComponent extends Container {
 	#providerAuthPending: boolean = false;
 	#presetLoginHint?: string;
 	#authSessionId?: string;
+	#imageRoleFilter: boolean = false;
 
 	// Tab state
 	#providers: ProviderTabState[] = STATIC_PROVIDER_TABS;
@@ -408,8 +407,8 @@ export class ModelSelectorComponent extends Container {
 			temporaryOnly?: boolean;
 			initialSearchInput?: string;
 			sessionId?: string;
-			isFastForProvider?: (provider?: string) => boolean;
-			isFastForSubagentProvider?: (provider?: string) => boolean;
+			isFastForProvider?: (provider?: string, supportsServiceTier?: boolean) => boolean;
+			isFastForSubagentProvider?: (provider?: string, supportsServiceTier?: boolean) => boolean;
 			isCurrentModelFastModeActive?: () => boolean;
 			currentThinkingLevel?: ThinkingLevel;
 			activeModelProfile?: string;
@@ -437,7 +436,10 @@ export class ModelSelectorComponent extends Container {
 		// session's effective predicate so an auto-disabled provider shows no glyph.
 		this.#isCurrentModelFastModeActive =
 			options?.isCurrentModelFastModeActive ??
-			(() => (this.#currentModel ? this.#isFastForProvider(this.#currentModel.provider) : false));
+			(() =>
+				this.#currentModel
+					? this.#isFastForProvider(this.#currentModel.provider, modelSupportsServiceTier(this.#currentModel))
+					: false);
 		const initialSearchInput = options?.initialSearchInput;
 		this.#viewMode = this.#temporaryOnly || initialSearchInput || scopedModels.length > 0 ? "models" : "presets";
 
@@ -482,6 +484,13 @@ export class ModelSelectorComponent extends Container {
 		// Add bottom border
 		this.addChild(new DynamicBorder());
 
+		if (typeof this.#modelRegistry.onCatalogChanged === "function") {
+			this.#unsubscribeCatalogChanged = this.#modelRegistry.onCatalogChanged(() => {
+				if (this.#disposed) return;
+				if (this.#refreshCatalogView()) this.#tui.requestRender();
+			});
+		}
+
 		// Load models and do initial render
 		this.#loadModels().then(() => {
 			this.#buildProviderTabs();
@@ -505,6 +514,13 @@ export class ModelSelectorComponent extends Container {
 			// Request re-render after models are loaded
 			this.#tui.requestRender();
 		});
+	}
+
+	override dispose(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#unsubscribeCatalogChanged();
+		super.dispose();
 	}
 
 	#isActiveDefaultFallback(): boolean {
@@ -1031,8 +1047,11 @@ export class ModelSelectorComponent extends Container {
 		// Start with all models or filter by provider/canonical view
 		let baseModels = this.#allModels;
 		const baseCanonicalModels = this.#canonicalModels;
+		if (this.#imageRoleFilter) {
+			baseModels = baseModels.filter(m => m.model.output?.includes("image") ?? false);
+		}
 		if (activeProviderId) {
-			baseModels = this.#allModels.filter(m => m.provider === activeProviderId);
+			baseModels = baseModels.filter(m => m.provider === activeProviderId);
 		}
 
 		// Apply fuzzy filter if query is present
@@ -1208,7 +1227,7 @@ export class ModelSelectorComponent extends Container {
 		} else {
 			rows.push({ kind: "createUnavailable", label: "Select a model before creating a custom preset" });
 		}
-		rows.push({ kind: "imageGeneration" });
+		rows.push({ kind: "imageRole" });
 		rows.push({ kind: "browse" });
 		return rows;
 	}
@@ -1415,7 +1434,7 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
 			selected.kind === "alreadySaved" ||
-			selected.kind === "imageGeneration"
+			selected.kind === "imageRole"
 		)
 			return;
 		if (this.#expandedPresetProviderId === selected.groupId) return;
@@ -1432,7 +1451,7 @@ export class ModelSelectorComponent extends Container {
 			selected.kind === "create" ||
 			selected.kind === "createUnavailable" ||
 			selected.kind === "alreadySaved" ||
-			selected.kind === "imageGeneration"
+			selected.kind === "imageRole"
 		)
 			return;
 		if (this.#expandedPresetProviderId !== selected.groupId) return;
@@ -1445,7 +1464,7 @@ export class ModelSelectorComponent extends Container {
 		this.#searchInput.setValue(value);
 	}
 
-	#switchToModelMode(seed?: string): void {
+	#switchToModelMode(seed?: string, options?: { imageRoleFilter?: boolean }): void {
 		this.#viewMode = "models";
 		this.#expandedPresetProviderId = undefined;
 		this.#previewProfileName = undefined;
@@ -1454,6 +1473,7 @@ export class ModelSelectorComponent extends Container {
 		this.#presetLoginHint = undefined;
 		this.#activeTabIndex = 0;
 		this.#selectedIndex = 0;
+		this.#imageRoleFilter = options?.imageRoleFilter ?? false;
 		this.#setSearchInputValue(seed ?? this.#searchInput.getValue());
 		this.#updateTabBar();
 		this.#filterModels(this.#searchInput.getValue());
@@ -1532,13 +1552,14 @@ export class ModelSelectorComponent extends Container {
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
-			if (row.kind === "imageGeneration") {
-				const config = getConfiguredImageModel();
-				const current =
-					config && config.provider !== "auto"
-						? `${config.provider}${config.model ? ` (${config.model})` : ""}`
-						: "Auto";
-				const label = `Image Generation: ${current}`;
+			if (row.kind === "imageRole") {
+				const imageRoleValue = this.#settings.getModelRole("image");
+				const current = imageRoleValue
+					? Array.isArray(imageRoleValue)
+						? imageRoleValue[0]
+						: imageRoleValue
+					: "No image model set";
+				const label = `Image Role: ${current}`;
 				this.#listContainer.addChild(new Text(`${prefix}${selected ? theme.fg("accent", label) : label}`, 0, 0));
 				continue;
 			}
@@ -1703,11 +1724,12 @@ export class ModelSelectorComponent extends Container {
 					// other modelRoles rows show pure intent.
 					const isSubagentRole = roleInfo.settingsPath === "task.agentModelOverrides";
 					const isCurrentRow = this.#currentModel !== undefined && modelsAreEqual(this.#currentModel, item.model);
+					const supportsServiceTier = modelSupportsServiceTier(assigned.model);
 					const roleFast = isSubagentRole
-						? this.#isFastForSubagentProvider(assigned.model.provider)
+						? this.#isFastForSubagentProvider(assigned.model.provider, supportsServiceTier)
 						: isCurrentRow
 							? this.#isCurrentModelFastModeActive()
-							: this.#isFastForProvider(assigned.model.provider);
+							: this.#isFastForProvider(assigned.model.provider, supportsServiceTier);
 					if (roleFast && isCurrentRow && !isSubagentRole) {
 						currentModelEffectiveGlyphRendered = true;
 					}
@@ -2094,8 +2116,8 @@ export class ModelSelectorComponent extends Container {
 			this.#switchToModelMode();
 			return;
 		}
-		if (row.kind === "imageGeneration") {
-			this.#onSelectCallback({ kind: "imageGeneration" });
+		if (row.kind === "imageRole") {
+			this.#switchToModelMode(undefined, { imageRoleFilter: true });
 			return;
 		}
 		if (row.kind === "group") {

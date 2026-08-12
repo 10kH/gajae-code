@@ -2,12 +2,22 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Apple Terminal.app now retains its default keyboard mode when it does not support the Kitty keyboard protocol, avoiding the modifyOtherKeys fallback that breaks Korean/Hangul IME composition.
+
+## [0.13.1] - 2026-08-11
+
 ### Added
 
 - Added atomic same-line deletion APIs and an `Editor` undo callback for keeping application state synchronized with editor history.
 ### Fixed
 
 - macOS Terminal.app Option+Arrow input is now buffered and decoded as a single Meta-wrapped escape sequence, so Option+Up/Down can open and navigate queued-message selectors.
+- Terminal.app Meta-prefix decoding now covers legacy Option shortcuts for printable symbols, digits, spaces, and Ctrl+Option symbol chords while preserving enhanced Kitty and modifyOtherKeys Super/Command matching.
+- Kitty and modifyOtherKeys function-key sequences now match consistently for F1–F12, including unmodified CSI forms.
+- Kitty protocol release/repeat and modifyOtherKeys lock-mask handling now fail closed and stay symmetric across native and TypeScript key matching, including duplicate macOS modifier aliases.
+- TypeScript Kitty and modifyOtherKeys printable decoding now rejects surrogate and out-of-range Unicode code points before text extraction.
 
 ## [0.12.21] - 2026-08-09
 
@@ -24,6 +34,7 @@
 ### Changed
 
 - Native fuzzy matching and image encoding bindings now load only when their TUI feature is used instead of at module startup.
+- Kitty-protocol shortcuts can match modified Korean Dubeolsik compatibility-jamo input when terminals omit base-layout metadata, without treating unmodified or Shift-only text input as shortcuts.
 
 ### Fixed
 

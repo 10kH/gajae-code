@@ -5,6 +5,7 @@ import { postmortem, TempDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../src/cli/args";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
+import { resolveMachineLocalUpdateChannel } from "../src/config/update-channel";
 import {
 	classifyStartupUpdateRoute,
 	getChangelogForDisplay,
@@ -829,9 +830,18 @@ describe("startup update contract", () => {
 		const source = await Bun.file(new URL("../src/main.ts", import.meta.url)).text();
 
 		// The channel comes from the config-layer primitives (never the updater
-		// module) and defaults to the user's startup.updateChannel setting.
+		// module) and is resolved machine-locally: the global layer only, so a
+		// project `.gjc/config.yml` startup.updateChannel override can never pick
+		// the release channel, and a nightly notification is always satisfiable
+		// by the default `gjc update` invocation.
 		expect(source).toContain('from "./config/update-channel"');
-		expect(source).toContain('settingsInstance.get("startup.updateChannel")');
+		expect(source).toContain("resolveMachineLocalUpdateChannel(settingsInstance)");
+		expect(source).not.toContain('settingsInstance.get("startup.updateChannel")');
+
+		expect(resolveMachineLocalUpdateChannel(Settings.isolated({}))).toBe("stable");
+		expect(resolveMachineLocalUpdateChannel(Settings.isolated({ "startup.updateChannel": "nightly" }))).toBe(
+			"nightly",
+		);
 
 		const settings = Settings.isolated({});
 		expect(settings.get("startup.updateChannel")).toBe("stable");

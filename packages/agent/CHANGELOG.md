@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Reassignable `onFollowUpConsumed` hook on `Agent`: invoked with the follow-up messages the loop dequeues for the next turn, so consumers can attach per-turn state (e.g. a fresh owned-completion lineage) at actual resume admission.
+
+## [0.13.1] - 2026-08-11
+
 ## [0.12.21] - 2026-08-09
 
 ## [0.12.20] - 2026-08-09
@@ -27,6 +33,7 @@
 ### Fixed
 
 - An aborted run whose tool ignores its `AbortSignal` now terminates on its own (#3894). `Promise.allSettled` waited on the unresolved call forever, so the turn only ended when the session's force-abort budget expired; the loop now emits a synthetic aborted result for the outstanding calls and `waitForIdle` settles immediately. Session dispose consequently reaches idle through the cooperative path instead of force-invalidating the run.
+
 ### Changed
 
 - Telemetry configured with `spans: false` now skips span and attribute construction while preserving usage and cost hooks.

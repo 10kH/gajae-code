@@ -6,7 +6,10 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 	readonly calls: string[] = [];
 	failWrite = false;
 	failRename = false;
-	failFileSync = false;
+	failLockSync = false;
+	failLockWrite = false;
+	failLockLink = false;
+	failDocumentSync = false;
 	failDirectorySync = false;
 
 	async mkdir(directory: string, options: { recursive: true; mode: number }): Promise<void> {
@@ -47,6 +50,22 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 		this.modes.delete(from);
 	}
 
+	async link(from: string, to: string): Promise<void> {
+		this.calls.push(`link:${from}:${to}`);
+		if (from.endsWith(".pending") && this.failLockLink) {
+			throw Object.assign(new Error("lock link failed"), { code: "EPERM" });
+		}
+
+		if (this.files.has(to)) {
+			throw Object.assign(new Error(`EEXIST: ${to}`), { code: "EEXIST" });
+		}
+		const data = this.files.get(from);
+		if (data === undefined) throw Object.assign(new Error(`ENOENT: ${from}`), { code: "ENOENT" });
+		this.files.set(to, data);
+		const mode = this.modes.get(from);
+		if (mode !== undefined) this.modes.set(to, mode);
+	}
+
 	async unlink(file: string): Promise<void> {
 		this.calls.push(`unlink:${file}`);
 		this.files.delete(file);
@@ -61,13 +80,18 @@ export class MemoryConversationStoreFs implements ConversationStoreFs {
 		}
 		const isDirectory = !this.files.has(file);
 		const writeFile = async (data: string, _encoding: "utf8"): Promise<void> => {
+			if (file.endsWith(".pending") && this.failLockWrite) throw new Error("lock write failed");
 			this.files.set(file, data);
 		};
 
 		return {
 			sync: async () => {
 				this.calls.push(`sync:${file}`);
-				if ((isDirectory && this.failDirectorySync) || (!isDirectory && this.failFileSync)) {
+				if (
+					(isDirectory && this.failDirectorySync) ||
+					(file.endsWith(".pending") && this.failLockSync) ||
+					(file.endsWith(".tmp") && this.failDocumentSync)
+				) {
 					throw new Error("sync failed");
 				}
 			},

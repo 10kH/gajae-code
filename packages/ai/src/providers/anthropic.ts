@@ -1560,6 +1560,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					if (orphaned.type === "toolCall") {
 						if (!isCompleteJson(orphaned.partialJson)) {
 							orphaned.incompleteArguments = true;
+							orphaned.incompleteArgumentsReason = "truncated";
 							truncatedToolCalls.add(orphaned);
 						}
 						if (orphaned.partialJson.trim()) {
@@ -2037,6 +2038,32 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						resetOutputForRetry();
 						continue;
 					}
+					// Managed attempts never take the repair branch above: the fallback
+					// controller owns retries, so the provider must not retry inside the
+					// attempt it was handed. That left the repair unreachable for the
+					// coding agent, which prompts exclusively through managed attempts —
+					// every turn rebuilt the same replay from the same history, drew the
+					// same deterministic 400, and the session never converged (issue
+					// #4262: one rejected 1.3 MB request every 12s, indefinitely).
+					// Recording the escalation costs no round trip and keeps the retry
+					// boundary intact: the next managed attempt builds a repaired replay.
+					// The masked `api_error` stays out — it names no cause and may be a
+					// transient blip, so only a rejection that provably indicts the
+					// replayed thinking blocks may cost the session its native replay.
+					if (
+						options?.fallbackManaged &&
+						providerSessionState &&
+						providerSessionState.thinkingReplayRepairScope !== "all" &&
+						firstTokenTime === undefined &&
+						(thinkingSignatureInvalid || thinkingBlocksImmutable) &&
+						hasNativeThinkingBlocks(params.messages)
+					) {
+						logger.debug("anthropic: recording thinking replay repair for the next managed attempt", {
+							model: model.id,
+							error: streamFailure instanceof Error ? streamFailure.message : String(streamFailure),
+						});
+						providerSessionState.thinkingReplayRepairScope = "all";
+					}
 					if (
 						!options?.fallbackManaged &&
 						!dropFastMode &&
@@ -2123,6 +2150,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				for (const block of output.content) {
 					if (block.type === "toolCall" && truncatedToolCalls.has(block)) {
 						block.incompleteArguments = true;
+						block.incompleteArgumentsReason = "truncated";
 					}
 				}
 			}
@@ -2367,6 +2395,46 @@ function hasNativeThinkingBlocks(messages: MessageParam[]): boolean {
 			Array.isArray(message.content) &&
 			message.content.some(block => block.type === "thinking" || block.type === "redacted_thinking"),
 	);
+}
+
+/**
+ * Would the latest assistant turn lose a thinking block on its way to the wire?
+ *
+ * `convertAnthropicMessages` can only replay a `thinking` block natively when it
+ * still carries the bytes Anthropic signed. A block that arrived as a bare
+ * start/stop pair — no `thinking_delta`, no `signature_delta` — has neither, so
+ * it is silently dropped, and Anthropic rejects the turn it produced for coming
+ * back without it. Same for a `redactedThinking` block whose opaque payload is
+ * gone. Only the latest assistant message is inspected because that is the turn
+ * Anthropic validates against its own output.
+ */
+function latestAssistantThinkingIsUnreplayable(messages: Message[], model: Model<"anthropic-messages">): boolean {
+	const index = messages.findLastIndex(message => message.role === "assistant");
+	if (index < 0) return false;
+
+	const assistant = messages[index] as AssistantMessage;
+	// Cross-API history degrades to text rather than replaying native blocks, so
+	// nothing is lost and nothing needs repairing.
+	if (assistant.api !== "anthropic-messages") return false;
+	// Endpoints that never sign thinking replay unsigned blocks verbatim.
+	const requiresSignature = !isNonSigningAnthropicEndpoint(model);
+
+	return assistant.content.some(block => {
+		if (block.type === "redactedThinking") return block.data.trim().length === 0;
+		if (block.type !== "thinking") return false;
+		// A block with empty text and no signature cannot go back on the wire:
+		// `convertAnthropicMessages` drops it, and Anthropic rejects the turn for
+		// arriving without it. A block with a valid signature AND non-empty text is
+		// replayable. But a signed block whose text was emptied — e.g. by
+		// clear_thinking_20251015 — carries a stale signature that signing endpoints
+		// reject on replay (issue #4247). Non-signing endpoints replay unsigned
+		// blocks verbatim, so only they treat a missing signature as unreplayable.
+		const hasSignature = !!block.thinkingSignature?.trim();
+		const isEmpty = !block.thinking.trim();
+		if (!hasSignature) return requiresSignature;
+		if (isEmpty && requiresSignature) return true;
+		return false;
+	});
 }
 
 function mapAnthropicToolChoice(
@@ -2721,6 +2789,27 @@ function buildParams(
 	// replay has to degrade in the same rebuild. Runs before the billing/system payload
 	// snapshot so the attribution hash covers the messages actually sent.
 	if (disableThinkingIfToolChoiceForced(params) && hasNativeThinkingBlocks(params.messages)) {
+		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
+			...thinkingRepair,
+			repairAllAssistantThinking: true,
+		});
+	}
+
+	// Anthropic compares the latest assistant message against the turn it actually
+	// produced, and rejects it when a `thinking`/`redacted_thinking` block that was
+	// in that response is missing. A block Anthropic streamed as a start/stop pair
+	// with no `thinking_delta` and no `signature_delta` lands in history empty and
+	// unsigned, and `convertAnthropicMessages` then drops it: the turn goes back
+	// carrying only its `tool_use`, and the request is rejected before a token
+	// streams. The rejection is recoverable — the repair drops native thinking from
+	// the whole replay — but only after a full round trip has been spent, and the
+	// condition is visible locally, so detect it here and degrade in the first
+	// build instead of paying for the 400 to discover it.
+	if (
+		!thinkingRepair?.repairAllAssistantThinking &&
+		latestAssistantThinkingIsUnreplayable(context.messages, model) &&
+		hasNativeThinkingBlocks(params.messages)
+	) {
 		params.messages = convertAnthropicMessages(context.messages, model, isOAuthToken, {
 			...thinkingRepair,
 			repairAllAssistantThinking: true,

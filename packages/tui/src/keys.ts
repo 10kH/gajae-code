@@ -263,12 +263,22 @@ const BASE_KEYS = new Set<string>([
 	"f12",
 ]);
 
-const KEY_MODIFIERS: readonly KeyModifier[] = ["ctrl", "alt", "shift", "super"];
+const KEY_MODIFIER_ALIASES: Readonly<Partial<Record<string, KeyModifier>>> = {
+	ctrl: "ctrl",
+	alt: "alt",
+	shift: "shift",
+	super: "super",
+	option: "alt",
+	meta: "alt",
+	cmd: "super",
+	command: "super",
+};
 
 /**
  * Parse a case-insensitive key identifier into normalized dispatch parts.
  * The legacy `plus` base-key alias normalizes to `+`; the trailing `+` in
  * values such as `ctrl++` is the literal plus base.
+ * Modifier aliases `option`/`meta` and `command`/`cmd` normalize to `alt` and `super`.
  */
 export function parseKeyId(value: string): ParsedKeyId | undefined {
 	if (hasControlChars(value) || value.length === 0) return undefined;
@@ -289,10 +299,12 @@ export function parseKeyId(value: string): ParsedKeyId | undefined {
 					.slice(0, -1)
 					.split("+")
 					.map(part => part.trim());
-	if (modifierParts.some(part => !KEY_MODIFIERS.includes(part as KeyModifier))) return undefined;
-
-	const modifiers = modifierParts as KeyModifier[];
-	if (new Set(modifiers).size !== modifiers.length) return undefined;
+	const modifiers: KeyModifier[] = [];
+	for (const part of modifierParts) {
+		const modifier = Object.hasOwn(KEY_MODIFIER_ALIASES, part) ? KEY_MODIFIER_ALIASES[part] : undefined;
+		if (!modifier || modifiers.includes(modifier)) return undefined;
+		modifiers.push(modifier);
+	}
 
 	const canonicalBase = baseKey === "pageup" ? "pageUp" : baseKey === "pagedown" ? "pageDown" : baseKey;
 	return {
@@ -314,10 +326,7 @@ export function isKeyId(value: string): value is KeyId {
  * is literally `"enter"`); the value of `Key` over a bag of magic strings is
  * that each property is typed to the exact `KeyId` literal it produces and the
  * modifier methods return precisely-typed concatenations (e.g. `Key.ctrl("c")`
- * is `"ctrl+c"`, not just `string`). This mirrors the upstream
- * `@mariozechner/pi-tui` `Key` export verbatim so plugins built against any
- * scope alias (`@mariozechner`, `@earendil-works`, `@gajae-code`) keep working
- * once the specifier shim remaps them to this package.
+ * The canonical modifier helpers mirror the upstream `@mariozechner/pi-tui` `Key` export so plugins built against any scope alias (`@mariozechner`, `@earendil-works`, `@gajae-code`) keep working once the specifier shim remaps them to this package. The additional `option`/`command` helpers normalize macOS naming to the portable `alt`/`super` identifiers.
  */
 export const Key = {
 	escape: "escape",
@@ -384,7 +393,10 @@ export const Key = {
 	ctrl: <K extends BaseKey>(key: K) => `ctrl+${key}` as const,
 	shift: <K extends BaseKey>(key: K) => `shift+${key}` as const,
 	alt: <K extends BaseKey>(key: K) => `alt+${key}` as const,
+	option: <K extends BaseKey>(key: K) => `alt+${key}` as const,
 	super: <K extends BaseKey>(key: K) => `super+${key}` as const,
+	cmd: <K extends BaseKey>(key: K) => `super+${key}` as const,
+	command: <K extends BaseKey>(key: K) => `super+${key}` as const,
 	ctrlShift: <K extends BaseKey>(key: K) => `ctrl+shift+${key}` as const,
 	shiftCtrl: <K extends BaseKey>(key: K) => `shift+ctrl+${key}` as const,
 	ctrlAlt: <K extends BaseKey>(key: K) => `ctrl+alt+${key}` as const,
@@ -415,9 +427,9 @@ interface ParsedKittySequence {
 
 // Regex for Kitty protocol event type detection
 // Matches CSI sequences with :2 (repeat) or :3 (release) event type
-// Format: \x1b[...;modifier:event_type<terminator> where terminator is u, ~, or A-F/H
-const KITTY_RELEASE_PATTERN = /^\x1b\[[\d:;]*:3[u~ABCDHF]$/;
-const KITTY_REPEAT_PATTERN = /^\x1b\[[\d:;]*:2[u~ABCDHF]$/;
+// Format: \x1b[...;modifier:event_type<terminator> where terminator is u, ~, navigation, or function-key finals
+const KITTY_RELEASE_PATTERN = /^\x1b\[[\d:;]*:3[u~ABCDEFHPQRS]$/;
+const KITTY_REPEAT_PATTERN = /^\x1b\[[\d:;]*:2[u~ABCDEFHPQRS]$/;
 const KITTY_CSI_U_PATTERN = /^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?(?:;([\d:]*))?u$/;
 const KITTY_MOD_SHIFT = 1;
 const KITTY_MOD_ALT = 2;
@@ -425,6 +437,77 @@ const KITTY_MOD_CTRL = 4;
 const KITTY_MOD_SUPER = 8;
 const KITTY_MOD_NUM_LOCK = 128;
 const KITTY_LOCK_MASK = 64 + 128; // Caps Lock + Num Lock
+const KOREAN_DUBEOLSIK_BASE_KEYS = new Map<number, BaseKey>(
+	[
+		["ㄱ", "r"],
+		["ㄲ", "r"],
+		["ㄴ", "s"],
+		["ㄷ", "e"],
+		["ㄸ", "e"],
+		["ㄹ", "f"],
+		["ㅁ", "a"],
+		["ㅂ", "q"],
+		["ㅃ", "q"],
+		["ㅅ", "t"],
+		["ㅆ", "t"],
+		["ㅇ", "d"],
+		["ㅈ", "w"],
+		["ㅉ", "w"],
+		["ㅊ", "c"],
+		["ㅋ", "z"],
+		["ㅌ", "x"],
+		["ㅍ", "v"],
+		["ㅎ", "g"],
+		["ㅏ", "k"],
+		["ㅐ", "o"],
+		["ㅑ", "i"],
+		["ㅒ", "o"],
+		["ㅓ", "j"],
+		["ㅔ", "p"],
+		["ㅕ", "u"],
+		["ㅖ", "p"],
+		["ㅗ", "h"],
+		["ㅛ", "y"],
+		["ㅜ", "n"],
+		["ㅠ", "b"],
+		["ㅡ", "m"],
+		["ㅣ", "l"],
+	].map(([character, key]) => [character.codePointAt(0)!, key as BaseKey]),
+);
+
+function matchesKoreanDubeolsikKittySequence(data: string, keyId: KeyId): boolean {
+	const event = parseKittySequence(data);
+	if (!event || event.eventType === 3 || event.baseLayoutKey !== undefined) return false;
+
+	const baseKey = KOREAN_DUBEOLSIK_BASE_KEYS.get(event.codepoint);
+	if (!baseKey) return false;
+
+	const expected = parseKeyId(keyId);
+	if (
+		!expected?.modifiers.some(modifier => modifier === "alt" || modifier === "ctrl" || modifier === "super") ||
+		expected.baseKey !== baseKey
+	)
+		return false;
+
+	let expectedModifier = 0;
+	for (const modifier of expected.modifiers) {
+		switch (modifier) {
+			case "shift":
+				expectedModifier |= KITTY_MOD_SHIFT;
+				break;
+			case "alt":
+				expectedModifier |= KITTY_MOD_ALT;
+				break;
+			case "ctrl":
+				expectedModifier |= KITTY_MOD_CTRL;
+				break;
+			case "super":
+				expectedModifier |= KITTY_MOD_SUPER;
+				break;
+		}
+	}
+	return (event.modifier & ~KITTY_LOCK_MASK) === expectedModifier;
+}
 const MODIFY_OTHER_KEYS_PATTERN = /^\x1b\[27;(\d+);(\d+)~$/;
 const KITTY_KEYPAD_OPERATOR_TEXT: Record<number, string> = {
 	57410: "/",
@@ -505,18 +588,37 @@ function hasControlChars(data: string): boolean {
 	});
 }
 
+function isValidProtocolNumber(value: number): boolean {
+	return Number.isSafeInteger(value) && value >= 0 && value <= 0xffffffff;
+}
+
+function isPrintableCodePoint(value: number): boolean {
+	return (
+		Number.isSafeInteger(value) &&
+		value >= 32 &&
+		value <= 0x10ffff &&
+		value !== 0x7f &&
+		!(value >= 0x80 && value <= 0x9f) &&
+		!(value >= 0xd800 && value <= 0xdfff)
+	);
+}
+
 function decodeKittyPrintable(data: string): string | undefined {
 	const match = data.match(KITTY_CSI_U_PATTERN);
 	if (!match) return undefined;
 
 	const codepoint = Number.parseInt(match[1] ?? "", 10);
-	if (!Number.isFinite(codepoint)) return undefined;
+	if (!isValidProtocolNumber(codepoint)) return undefined;
 
-	if (match[5] === "3") return undefined;
+	const eventTypeText = match[5];
+	const eventType =
+		eventTypeText === undefined || eventTypeText.length === 0 ? undefined : Number.parseInt(eventTypeText, 10);
+	if (eventType !== undefined && eventType !== 1 && eventType !== 2) return undefined;
 
 	const shiftedKey = match[2] && match[2].length > 0 ? Number.parseInt(match[2], 10) : undefined;
 	const modValue = match[4] ? Number.parseInt(match[4], 10) : 1;
-	const modifier = Number.isFinite(modValue) ? modValue - 1 : 0;
+	if (!isValidProtocolNumber(modValue) || modValue < 1) return undefined;
+	const modifier = modValue - 1;
 	const effectiveMod = modifier & ~KITTY_LOCK_MASK;
 	const supportedModifierMask = KITTY_MOD_SHIFT | KITTY_MOD_ALT | KITTY_MOD_CTRL | KITTY_MOD_SUPER;
 
@@ -529,7 +631,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 			.split(":")
 			.filter(Boolean)
 			.map(value => Number.parseInt(value, 10))
-			.filter(value => Number.isFinite(value) && value >= 32);
+			.filter(value => isPrintableCodePoint(value));
 		if (codepoints.length > 0) {
 			try {
 				return String.fromCodePoint(...codepoints);
@@ -537,6 +639,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 				return undefined;
 			}
 		}
+		return undefined;
 	}
 	const keypadOperatorText = KITTY_KEYPAD_OPERATOR_TEXT[codepoint];
 	if (keypadOperatorText) return keypadOperatorText;
@@ -555,7 +658,7 @@ function decodeKittyPrintable(data: string): string | undefined {
 		return undefined;
 	}
 
-	if (!Number.isFinite(effectiveCodepoint) || effectiveCodepoint < 32) return undefined;
+	if (!isPrintableCodePoint(effectiveCodepoint)) return undefined;
 
 	try {
 		return String.fromCodePoint(effectiveCodepoint);
@@ -572,7 +675,7 @@ function decodeKittyPrintable(data: string): string | undefined {
  */
 export function extractPrintableText(data: string): string | undefined {
 	const printable = decodePrintableKey(data);
-	if (printable !== undefined) return printable;
+	if (printable !== undefined && !hasControlChars(printable)) return printable;
 	if (data.length === 0 || hasControlChars(data)) return undefined;
 	return data;
 }
@@ -591,7 +694,7 @@ function parseModifyOtherKeysSequence(data: string): ParsedModifyOtherKeysSequen
 	if (!match) return null;
 	const modValue = Number.parseInt(match[1] ?? "", 10);
 	const codepoint = Number.parseInt(match[2] ?? "", 10);
-	if (!Number.isFinite(modValue) || !Number.isFinite(codepoint)) return null;
+	if (!isValidProtocolNumber(modValue) || modValue < 1 || !isValidProtocolNumber(codepoint)) return null;
 	return { codepoint, modifier: modValue - 1 };
 }
 
@@ -606,7 +709,7 @@ function decodeModifyOtherKeysPrintable(data: string): string | undefined {
 	if (!parsed) return undefined;
 	const modifier = parsed.modifier & ~KITTY_LOCK_MASK;
 	if ((modifier & ~KITTY_MOD_SHIFT) !== 0) return undefined;
-	if (!Number.isFinite(parsed.codepoint) || parsed.codepoint < 32) return undefined;
+	if (!isPrintableCodePoint(parsed.codepoint)) return undefined;
 	try {
 		return String.fromCodePoint(parsed.codepoint);
 	} catch {
@@ -641,7 +744,10 @@ export function decodePrintableKey(data: string): string | undefined {
  * @param keyId - Key identifier (e.g., "ctrl+c", "escape", Key.ctrl("c"))
  */
 export function matchesKey(data: string, keyId: KeyId): boolean {
-	return nativeKeys().matchesKey(data, keyId, kittyProtocolActive);
+	return (
+		nativeKeys().matchesKey(data, keyId, kittyProtocolActive) ||
+		(kittyProtocolActive && matchesKoreanDubeolsikKittySequence(data, keyId))
+	);
 }
 
 /**

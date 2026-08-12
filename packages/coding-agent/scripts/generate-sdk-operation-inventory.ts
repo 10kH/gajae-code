@@ -11,6 +11,12 @@ const inventoryPath = process.env.GJC_SDK_OPERATION_INVENTORY
 
 /** Reviewed seams deliberately excluded from the public SDK operation surface. */
 const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
+	"agent_session:getTerminalTurnEpoch":
+		"internal terminal-abort bus seam (epoch only), threaded via terminalAbortSeams; not a user-facing SDK control seam",
+	"agent_session:cancelPendingPreflightForTerminalAbort":
+		"internal terminal-abort bus seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
+	"agent_session:abortPromptAndWaitWithTerminal":
+		"internal terminal-abort fencing seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"slash_command:settings": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:theme": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:copy": "visual/local-only command, not a user-facing SDK control seam",
@@ -35,6 +41,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
 	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",
+	"agent_session:getSessionAgentDir":
+		"internal session-scoped agent-directory accessor, not a user-facing SDK control seam",
+	"agent_session:captureTerminalAbortSteeringSnapshot":
+		"internal terminal-abort steering snapshot, not a user-facing SDK control seam",
 	"agent_session:getConfiguredModelChainState":
 		"internal model-profile transaction snapshot, not a user-facing SDK control seam",
 	"agent_session:getDefaultFallbackRuntimeState":

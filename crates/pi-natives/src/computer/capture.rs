@@ -7,10 +7,12 @@
 //! the captured physical pixel size versus the logical display bounds, so the
 //! coordinate contract stays correct on Retina/HiDPI.
 //!
-//! Capture requires the macOS Screen Recording (TCC) permission. When it is not
-//! granted, `CGDisplayCreateImage` returns null and this surfaces
-//! [`CaptureError::CaptureFailed`] rather than silently returning a black
-//! frame.
+//! Capture requires the macOS Screen & System Audio Recording (TCC)
+//! permission. When it is not granted, `CGDisplayCreateImage` returns null and
+//! this surfaces [`CaptureError::PermissionRequired`] rather than silently
+//! returning a black frame. A preflight result is consulted only after the
+//! real capture call fails, so a stale or overly conservative preflight cannot
+//! reject a capture that the OS actually permits.
 //!
 //! Implemented with raw CoreGraphics FFI (no extra crates); the buffer is owned
 //! Rust memory and every Core Graphics handle is released exactly once.
@@ -90,8 +92,11 @@ unsafe extern "C" {
 /// Reason a primary-display capture failed.
 #[derive(Debug, Clone)]
 pub enum CaptureError {
-	/// `CGDisplayCreateImage` returned null or a zero-sized image — commonly the
-	/// Screen Recording permission is not granted.
+	/// The OS denied capture and the current process preflight also reports no
+	/// Screen & System Audio Recording grant.
+	PermissionRequired,
+	/// `CGDisplayCreateImage` returned null or a zero-sized image after the
+	/// current-process permission preflight passed.
 	CaptureFailed,
 	/// A Core Graphics color space or bitmap context could not be created.
 	ContextFailed,
@@ -102,11 +107,29 @@ pub enum CaptureError {
 impl fmt::Display for CaptureError {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
+			Self::PermissionRequired => write!(
+				f,
+				"screen capture was denied because the current process lacks the Screen & System \
+				 Audio Recording permission; grant it for this GJC launcher and relaunch. {}",
+				crate::computer::permissions::current_process_diagnostic()
+			),
 			Self::CaptureFailed => {
-				write!(f, "screen capture failed; the Screen Recording permission may not be granted")
+				write!(f, "screen capture failed after the current process preflight passed")
 			},
 			Self::ContextFailed => write!(f, "failed to create a Core Graphics bitmap context"),
 			Self::Encode(reason) => write!(f, "failed to encode captured frame as PNG: {reason}"),
+		}
+	}
+}
+
+impl CaptureError {
+	#[must_use]
+	pub const fn code(&self) -> &'static str {
+		match self {
+			Self::PermissionRequired => "COMPUTER_PERMISSION_REQUIRED",
+			Self::CaptureFailed | Self::ContextFailed | Self::Encode(_) => {
+				"COMPUTER_SCREENSHOT_FAILED"
+			},
 		}
 	}
 }
@@ -132,9 +155,8 @@ pub struct CapturedFrame {
 /// Capture the current primary display as a PNG plus its coordinate descriptor.
 ///
 /// # Errors
-/// Returns [`CaptureError`] when the OS capture call fails (often a missing
-/// Screen Recording grant), a bitmap context cannot be created, or PNG encoding
-/// fails.
+/// Returns [`CaptureError`] when the OS capture call fails, a bitmap context
+/// cannot be created, or PNG encoding fails.
 pub fn capture_primary_display() -> Result<CapturedFrame, CaptureError> {
 	// SAFETY: pure Core Graphics geometry queries for the active primary display;
 	// no image capture occurs before `CGDisplayCreateImage` below.
@@ -149,14 +171,29 @@ pub fn capture_primary_display() -> Result<CapturedFrame, CaptureError> {
 	// released exactly once below regardless of the `frame_from_image` result.
 	let image = unsafe { CGDisplayCreateImage(display_id) };
 	if image.is_null() {
-		return Err(CaptureError::CaptureFailed);
+		return Err(classify_capture_failure(CaptureError::CaptureFailed));
 	}
 
 	let result = frame_from_image(image, bounds, capture_id);
 
 	// SAFETY: `image` is non-null (checked above) and not used after release.
 	unsafe { CGImageRelease(image) };
-	result
+	match result {
+		Err(CaptureError::CaptureFailed) => {
+			Err(classify_capture_failure(CaptureError::CaptureFailed))
+		},
+		other => other,
+	}
+}
+
+fn classify_capture_failure(error: CaptureError) -> CaptureError {
+	if crate::computer::permissions::screen_recording_granted() {
+		return error;
+	}
+	let _ = crate::computer::permissions::open_settings(
+		crate::computer::permissions::TccPermission::ScreenRecording,
+	);
+	CaptureError::PermissionRequired
 }
 
 #[must_use]

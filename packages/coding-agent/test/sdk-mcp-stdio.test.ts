@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { SessionIndex } from "../src/sdk/broker/session-index";
 
 const packageRoot = path.resolve(import.meta.dir, "..");
 type TestServer = {
@@ -12,6 +13,7 @@ type TestServer = {
 
 test("shipped MCP stdio advertises confirm and forwards confirmed destructive controls", async () => {
 	const repo = await mkdtemp(path.join(tmpdir(), "gjc-sdk-mcp-stdio-"));
+	const agentDir = await mkdtemp(path.join(tmpdir(), "gjc-sdk-mcp-stdio-agent-"));
 	const token = "mcp-stdio-token";
 	const received: Array<Record<string, unknown>> = [];
 	let server!: TestServer;
@@ -37,13 +39,38 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 
 	try {
 		const sessionId = "confirmed-control-session";
-		await mkdir(path.join(repo, ".gjc", "state", "sdk"), { recursive: true });
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointPath = path.join(stateRoot, "sdk", `${sessionId}.json`);
+		await mkdir(path.dirname(endpointPath), { recursive: true });
 		await writeFile(
-			path.join(repo, ".gjc", "state", "sdk", `${sessionId}.json`),
-			JSON.stringify({ url: `ws://127.0.0.1:${server.port!}`, token }),
+			endpointPath,
+			JSON.stringify({ sessionId, url: `ws://127.0.0.1:${server.port!}`, token, pid: process.pid }),
 		);
+		// The MCP stdio server resolves sessions only through the broker's
+		// session index (C10): registration plus a fresh heartbeat make the
+		// fixture session read as live without waiting for a checkpoint pass.
+		const endpointMtimeMs = (await stat(endpointPath)).mtimeMs;
+		const index = await new SessionIndex(agentDir).open();
+		await index.append({
+			type: "host_registered",
+			sessionId,
+			locator: { repo, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs,
+		});
+		await index.append({
+			type: "host_heartbeat",
+			sessionId,
+			locator: { repo, stateRoot },
+			endpointGeneration: 1,
+			pid: process.pid,
+			endpointMtimeMs,
+			activity: { state: "idle", at: Date.now() },
+		});
 		const child = Bun.spawn(["bun", "run", path.join(packageRoot, "src", "cli.ts"), "mcp-serve", "sdk"], {
 			cwd: repo,
+			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -90,5 +117,6 @@ test("shipped MCP stdio advertises confirm and forwards confirmed destructive co
 	} finally {
 		server.stop(true);
 		await rm(repo, { recursive: true, force: true });
+		await rm(agentDir, { recursive: true, force: true });
 	}
 }, 60_000);

@@ -220,7 +220,7 @@ export class ConversationStore<T extends ConversationRecord> {
 			return await operation();
 		} finally {
 			try {
-				await fileLock?.close();
+				await closeConversationStoreFileLock(fileLock);
 				if (fileLock)
 					await this.#fs.unlink(`${this.#file}.lock`).catch(error => {
 						if (!isMissing(error)) throw error;
@@ -366,6 +366,15 @@ export class ConversationStore<T extends ConversationRecord> {
 
 function isMissing(error: unknown): error is NodeJS.ErrnoException {
 	return isRecord(error) && error.code === "ENOENT";
+}
+
+async function closeConversationStoreFileLock(handle: ConversationStoreFileHandle | undefined): Promise<void> {
+	if (!handle) return;
+	// A failed close must never skip the unlink: that would leak a well-formed
+	// lock whose pid is still alive and block every later waiter. The unlink is
+	// ownership-checked by the pending-file model so it can only ever remove the
+	// lock this holder wrote, making a best-effort close safe.
+	await handle.close().catch(() => undefined);
 }
 
 async function syncParentDirectory(

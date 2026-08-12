@@ -1,16 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { AgentBusyError, type AgentTelemetryConfig, type Tracer } from "@gajae-code/agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, Effort, type Model } from "@gajae-code/ai";
+import type { RecoveryFsRoot } from "@gajae-code/natives";
+import type { AsyncJobManager } from "../../src/async/job-manager";
 import { kNoAuth } from "../../src/config/model-registry";
-
 import { Settings } from "../../src/config/settings";
 import type { ExtensionActions, LoadExtensionsResult } from "../../src/extensibility/extensions/types";
 import { AgentRegistry } from "../../src/registry/agent-registry";
 import type { CreateAgentSessionResult } from "../../src/sdk";
 import * as sdkModule from "../../src/sdk";
 import type { AgentSession, AgentSessionEvent, ForkContextSeed, PromptOptions } from "../../src/session/agent-session";
+import { ArtifactManager } from "../../src/session/artifacts";
 import type { AuthStorage } from "../../src/session/auth-storage";
-import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
+import {
+	ManagedSessionDescendantStore,
+	managedDirectoryRoot,
+} from "../../src/session/internal/managed-session-storage";
+import { createManagedTaskPersistence, runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
 
 import {
 	type AgentDefinition,
@@ -217,6 +226,129 @@ describe("runSubprocess yield reminders", () => {
 				scope: "subagent",
 			}),
 		]);
+	});
+
+	it("keeps the fallback metadata update on the inherited job manager", async () => {
+		// Review thread P2: when this subagent emits model_fallback_switched
+		// after another top-level session has become the process-global
+		// manager, the metadata update must still go to the manager selected at
+		// dispatch — writing to AsyncJobManager.instance() would leave this
+		// session's subagent metadata stale or overwrite an unrelated same-ID
+		// record in the other session.
+		const updates: Array<{ subagentId: string; meta: Record<string, unknown> }> = [];
+		const inheritedManager = {
+			updateSubagentModel: (subagentId: string, meta: Record<string, unknown>) => updates.push({ subagentId, meta }),
+			removeLiveHandle: () => {},
+			registerLiveHandle: () => {},
+			getSubagentRecord: () => undefined,
+		} as unknown as AsyncJobManager;
+		const fallbackEvents: AgentSessionEvent[] = [];
+		const eventBus = new EventBus();
+		eventBus.on("task:subagent:event", payload => {
+			const event = (payload as { event: AgentSessionEvent }).event;
+			if (event.type === "model_fallback_switched") fallbackEvents.push(event);
+		});
+		const session = createMockSession(({ emit }) => {
+			emit({
+				type: "model_fallback_switched",
+				eventId: "fallback-inherited-manager",
+				from: "primary/model",
+				to: "fallback/model",
+				reason: "rate_limit",
+				role: "executor",
+				scope: "subagent",
+				activeIndex: 1,
+				chainLength: 2,
+				attemptsUsed: 3,
+			});
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-fallback-inherited-manager",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+		});
+		mockCreateAgentSession(session);
+
+		await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-inherited-manager",
+			eventBus,
+			modelOverride: "test/mock",
+			modelRegistry,
+			asyncJobManager: inheritedManager,
+		});
+
+		expect(fallbackEvents).toHaveLength(1);
+		// The initial model update AND the fallback update both land on the
+		// inherited manager; the fallback one carries modelFellBack:true.
+		expect(updates.length).toBeGreaterThanOrEqual(2);
+		expect(updates.at(-1)).toMatchObject({
+			subagentId: "subagent-fallback-inherited-manager",
+			meta: expect.objectContaining({ modelFellBack: true, effectiveModel: "fallback/model" }),
+		});
+	});
+
+	it("refreshes Fast state when the active fallback model changes", async () => {
+		const primaryModel = {
+			...model,
+			provider: "custom-proxy",
+			id: "gpt-5.6-sol",
+			compat: { supportsServiceTier: true },
+		} as Model;
+		const fallbackModel = {
+			...model,
+			provider: "openrouter",
+			id: "openai/gpt-5.6-sol",
+		} as Model;
+		const session = createMockSession(
+			({ emit }) => {
+				(session as unknown as { model: Model }).model = fallbackModel;
+				emit({
+					type: "model_fallback_switched",
+					eventId: "fallback-fast-state",
+					from: "custom-proxy/gpt-5.6-sol",
+					to: "openrouter/openai/gpt-5.6-sol",
+					reason: "rate_limit",
+					role: "executor",
+					scope: "subagent",
+					activeIndex: 1,
+					chainLength: 2,
+					attemptsUsed: 1,
+				});
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-fallback-fast-state",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			},
+			{ model: primaryModel },
+		);
+		mockCreateAgentSession(session);
+		const fallbackRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [primaryModel, fallbackModel],
+			getApiKey: async () => "sk-test",
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-fallback-fast-state",
+			modelOverride: "custom-proxy/gpt-5.6-sol",
+			modelRegistry: fallbackRegistry,
+			inheritedServiceTier: "priority",
+		});
+
+		expect(result.fastMode).toBe(false);
 	});
 
 	it("publishes the persisted session file for observer lifecycle and progress events", async () => {
@@ -748,6 +880,81 @@ describe("runSubprocess yield reminders", () => {
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.credentialSessionId).toBe("credential-pool");
 		expect(authSessionIds).toEqual(["credential-pool"]);
 	});
+	it("keeps managed fork siblings on distinct canonical provider scopes", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-fork-"));
+		const retainedAuthorities: RecoveryFsRoot[] = [];
+		const retainedAuthorityCloseCounts = new Map<RecoveryFsRoot, number>();
+		const childRuns: Promise<unknown>[] = [];
+		let store: ManagedSessionDescendantStore | undefined;
+
+		try {
+			const artifactsDir = path.join(root, "artifacts");
+			store = new ManagedSessionDescendantStore(managedDirectoryRoot(root), artifactsDir);
+			const manager = new ArtifactManager(store);
+			const retainAuthority = store.retainAuthority.bind(store);
+			vi.spyOn(store, "retainAuthority").mockImplementation(() => {
+				const authority = retainAuthority();
+				if (!authority) return undefined;
+				retainedAuthorities.push(authority);
+				const close = authority.close.bind(authority);
+				vi.spyOn(authority, "close").mockImplementation(() => {
+					retainedAuthorityCloseCounts.set(authority, (retainedAuthorityCloseCounts.get(authority) ?? 0) + 1);
+					return close();
+				});
+				return authority;
+			});
+			const createAgentSessionSpy = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+				const session = createMockSession(({ emit }) => {
+					emit({
+						type: "tool_execution_end",
+						toolCallId: "tool-managed-fork",
+						toolName: "yield",
+						result: {
+							content: [{ type: "text", text: "Result submitted." }],
+							details: { status: "success", data: { ok: true } },
+						},
+						isError: false,
+					});
+				});
+				session.dispose = async () => {
+					await options?.sessionManager?.close();
+				};
+				return createSessionResult(session);
+			});
+			const childIds = ["4-ManagedFork", "5-ManagedFork"];
+
+			childRuns.push(
+				...childIds.map((id, index) =>
+					runSubprocess({
+						...baseOptions,
+						cwd: root,
+						index,
+						id,
+						subagentId: id,
+						parentSessionId: "parent-session",
+						forkContextSeed: createForkContextSeed(),
+						artifactsDir,
+						managedPersistence: createManagedTaskPersistence(manager, id),
+					}),
+				),
+			);
+			await Promise.all(childRuns);
+
+			// Managed siblings share a lifecycle parent but must retain distinct child provider scopes.
+			const expectedScopes = childIds.map(id => JSON.stringify(["subagent-canonical", "parent-session", id]));
+			const providerScopes = createAgentSessionSpy.mock.calls.map(([options]) => options?.providerSessionId);
+			expect(providerScopes.sort()).toEqual(expectedScopes.sort());
+			expect(retainedAuthorities).toHaveLength(childIds.length);
+			await Promise.all(childIds.map(id => fs.stat(path.join(artifactsDir, `${id}.md.selector.json`))));
+		} finally {
+			await Promise.allSettled(childRuns);
+			for (const authority of retainedAuthorities) authority.close();
+			expect(retainedAuthorityCloseCounts).toHaveLength(retainedAuthorities.length);
+			expect([...retainedAuthorityCloseCounts.values()]).toEqual(retainedAuthorities.map(() => 1));
+			store?.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
 
 	it("renders shared task context in subagent system prompt before now", async () => {
 		let userPrompt = "";
@@ -1137,7 +1344,6 @@ describe("runSubprocess yield reminders", () => {
 			],
 			getApiKey: async (model: { id: string }) => (model.id === "gpt-5.5" ? "sk-test" : undefined),
 		} as unknown as import("../../src/config/model-registry").ModelRegistry;
-		const isFastForSubagentProvider = vi.fn((provider?: string) => provider === "openai-codex");
 
 		const result = await runSubprocess({
 			...baseOptions,
@@ -1145,7 +1351,7 @@ describe("runSubprocess yield reminders", () => {
 			modelOverride: "openai-codex/gpt-5.3-codex:high",
 			parentActiveModelPattern: "openai-codex/gpt-5.5",
 			modelRegistry,
-			isFastForSubagentProvider,
+			inheritedServiceTier: "priority",
 		});
 
 		expect(result.modelSubstitutionWarning).toEqual({
@@ -1153,7 +1359,6 @@ describe("runSubprocess yield reminders", () => {
 			effective: "openai-codex/gpt-5.5",
 			reason: "auth_unavailable",
 		});
-		expect(isFastForSubagentProvider).toHaveBeenCalledWith("openai-codex");
 		expect(result.fastMode).toBe(true);
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.model?.id).toBe("gpt-5.5");
 		expect(createAgentSessionSpy.mock.calls[0]?.[0]?.modelSubstitution).toMatchObject({
@@ -1161,6 +1366,51 @@ describe("runSubprocess yield reminders", () => {
 			requestedModel: { provider: "openai-codex", id: "gpt-5.3-codex" },
 		});
 		expect(sessionModelChanges).toEqual([]);
+	});
+
+	it("reports Fast for an opted-in custom provider using the child tier snapshot", async () => {
+		vi.clearAllMocks();
+		const customModel = {
+			provider: "custom-proxy",
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-responses",
+			baseUrl: "https://proxy.example/v1",
+			contextWindow: 400_000,
+			maxTokens: 32_000,
+			compat: { supportsServiceTier: true },
+		} as Model;
+		const session = createMockSession(
+			({ emit }) => {
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-custom-fast",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "Result submitted." }],
+						details: { status: "success", data: { ok: true } },
+					},
+					isError: false,
+				});
+			},
+			{ model: customModel },
+		);
+		mockCreateAgentSession(session);
+		const customRegistry = {
+			refresh: async () => {},
+			getAvailable: () => [customModel],
+			getApiKey: async () => "sk-test",
+		} as unknown as import("../../src/config/model-registry").ModelRegistry;
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "subagent-custom-fast",
+			modelOverride: "custom-proxy/gpt-5.6-sol",
+			modelRegistry: customRegistry,
+			inheritedServiceTier: "priority",
+		});
+
+		expect(result.fastMode).toBe(true);
 	});
 
 	it("surfaces server-side assistant model substitution evidence", async () => {

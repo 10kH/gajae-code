@@ -2,7 +2,7 @@ import type { Effort } from "@gajae-code/ai/model-thinking";
 import { PET_MODE_IDS, PET_SKIN_IDS, PET_SKINS } from "@gajae-code/tui/components/gajae-pet";
 import { TASK_SIMPLE_MODES } from "../task/simple-mode";
 import { getThinkingLevelMetadata } from "../thinking-metadata";
-import { EDIT_MODES } from "../utils/edit-mode";
+import { DEFAULT_EDIT_MODE_SETTING, EDIT_MODE_SETTINGS, EDIT_MODES, type EditMode } from "../utils/edit-mode";
 import { CONFIGURABLE_SEARCH_PROVIDER_IDS } from "../web/search/types";
 import type { ModelSelectorValue } from "./model-selector-value";
 import { UPDATE_CHANNELS } from "./update-channel";
@@ -181,9 +181,7 @@ interface ArrayDef<T> {
 	ui?: UiBase;
 }
 
-interface RecordValueDef {
-	type: "model-selector-value";
-}
+type RecordValueDef = { type: "model-selector-value" } | { type: "string-enum"; values: readonly string[] };
 
 interface RecordDef<T> {
 	type: "record";
@@ -218,6 +216,7 @@ export interface ModelTagsSettings {
 const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_MODEL_SELECTOR_RECORD: Record<string, ModelSelectorValue> = {};
 const MODEL_SELECTOR_VALUE_SCHEMA = { type: "model-selector-value" } as const;
+const EDIT_MODE_VALUE_SCHEMA = { type: "string-enum", values: EDIT_MODES } as const;
 const DEFAULT_CYCLE_ORDER: string[] = ["default"];
 const EMPTY_MODEL_TAGS_RECORD: ModelTagsSettings = {};
 const HINDSIGHT_RECALL_TYPES_DEFAULT: string[] = ["world", "experience"];
@@ -522,6 +521,39 @@ export const SETTINGS_SCHEMA = {
 			options: "runtime",
 		},
 	},
+	"modelProfile.proxyProvider": {
+		type: "string",
+		default: undefined,
+		ui: {
+			tab: "model",
+			label: "Proxy Provider",
+			description:
+				"Configured OpenAI-compatible proxy/gateway provider id (e.g. litellm) used by built-in model presets. Leave unset to keep direct provider endpoints.",
+		},
+	},
+	"modelProfile.proxyMode": {
+		type: "enum",
+		values: ["fallback", "always"] as const,
+		default: "fallback",
+		ui: {
+			tab: "model",
+			label: "Proxy Routing Mode",
+			description:
+				"fallback routes only selectors whose direct provider lacks credentials; always routes every proxy-routable built-in preset selector through the configured proxy.",
+			options: [
+				{
+					value: "fallback",
+					label: "Fallback",
+					description: "Use the proxy only when direct provider credentials are unavailable",
+				},
+				{
+					value: "always",
+					label: "Always",
+					description: "Route proxy-routable built-in preset selectors through the proxy",
+				},
+			],
+		},
+	},
 	"session.resumeModelBehavior": {
 		type: "enum",
 		values: ["keepSessionModel", "useCurrentDefault", "ask"] as const,
@@ -573,6 +605,11 @@ export const SETTINGS_SCHEMA = {
 		type: "number",
 		default: 1,
 		validate: (value: number) => Number.isInteger(value) && value >= 1 && value <= 10,
+	},
+	"gjc.ultragoal.nudgeBudget": {
+		type: "number",
+		default: 10,
+		validate: (value: number) => Number.isInteger(value) && value >= 0,
 	},
 
 	// ────────────────────────────────────────────────────────────────────────
@@ -2088,15 +2125,14 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
-	// Bounded-memory cold-session offloading (rollout knobs; budgets are fixed
-	// implementation constants in the sidecar primitives, not user-tunable
-	// fields). "shadow" (default) measures and offloads without changing
-	// observable behavior; canary/default-on are release-channel states, not
-	// user-facing enum values.
+	// Bounded-memory cold-session offloading. Budgets are fixed implementation
+	// constants in the sidecar primitives, not user-tunable fields. Auto keeps
+	// ordinary sessions on the eager path and routes transcripts above the eager
+	// admission limit through bounded cold-session state.
 	"sessionMemory.mode": {
 		type: "enum",
-		values: ["off", "shadow", "enabled"] as const,
-		default: "shadow",
+		values: ["off", "shadow", "enabled", "auto"] as const,
+		default: "auto",
 	},
 	// Independent runtime switch for AgentSession's async compact-once overflow
 	// recovery. The synchronous bounded context preflight stays always on.
@@ -2109,13 +2145,19 @@ export const SETTINGS_SCHEMA = {
 	// Edit tool
 	"edit.mode": {
 		type: "enum",
-		values: EDIT_MODES,
-		default: "hashline",
+		values: EDIT_MODE_SETTINGS,
+		default: DEFAULT_EDIT_MODE_SETTING,
 		ui: {
 			tab: "editing",
 			label: "Edit Mode",
-			description: "Select the edit tool variant (replace, patch, hashline, vim, or apply_patch)",
+			description:
+				"Select the edit tool variant (auto routes by model family; replace, patch, hashline, vim, or apply_patch)",
 		},
+	},
+	"edit.modelVariants": {
+		type: "record",
+		default: {} as Record<string, EditMode>,
+		valueSchema: EDIT_MODE_VALUE_SCHEMA,
 	},
 
 	"edit.fuzzyMatch": {
@@ -3267,7 +3309,8 @@ export const SETTINGS_SCHEMA = {
 		ui: {
 			tab: "tasks",
 			label: "Prefer Task Delegation",
-			description: "Encourage the agent to delegate work to subagents unless changes are trivial",
+			description:
+				"Encourage the agent to delegate work to subagents unless changes are trivial (on by default when executor/planner run on a different provider than the default role)",
 		},
 	},
 
@@ -3566,74 +3609,6 @@ export const SETTINGS_SCHEMA = {
 			],
 		},
 	},
-	"providers.image": {
-		type: "enum",
-		values: ["auto", "openai", "gemini", "openrouter", "antigravity", "alibaba", "custom"] as const,
-		default: "auto",
-		ui: {
-			tab: "providers",
-			label: "Image Generation",
-			description: "Provider and model for image generation tool",
-			options: [
-				{
-					value: "auto",
-					label: "Auto",
-					description: "Priority: GPT model image tool > Antigravity > OpenRouter > Gemini > Alibaba",
-				},
-				{ value: "openai", label: "OpenAI", description: "Uses gpt-image-2 via OpenAI Responses/Codex" },
-				{ value: "gemini", label: "Gemini", description: "Requires GEMINI_API_KEY" },
-				{ value: "openrouter", label: "OpenRouter", description: "Requires OPENROUTER_API_KEY" },
-				{ value: "antigravity", label: "Antigravity", description: "Requires login with google-antigravity" },
-				{
-					value: "alibaba",
-					label: "Alibaba Bailian",
-					description: "Requires ALIBABA_TOKEN_PLAN_API_KEY (wan2.7-image via Token Plan)",
-				},
-				{
-					value: "custom",
-					label: "Custom",
-					description: "OpenAI-compatible endpoint (set providers.imageCustomUrl)",
-				},
-			],
-		},
-	},
-	"providers.imageModel": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Model",
-			description: "Override the default image generation model for the selected provider",
-		},
-	},
-	"providers.imageCustomUrl": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom URL",
-			description: "Base URL for custom OpenAI-compatible image endpoint",
-		},
-	},
-	"providers.imageCustomKey": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom API Key",
-			description: "API key for custom OpenAI-compatible image endpoint",
-		},
-	},
-	"providers.imageCustomKeyEnv": {
-		type: "string",
-		default: undefined,
-		ui: {
-			tab: "providers",
-			label: "Image Custom API Key Env",
-			description: "Environment variable name holding the API key for custom image endpoint",
-		},
-	},
-
 	"providers.kimiApiFormat": {
 		type: "enum",
 		values: ["openai", "anthropic"] as const,
@@ -3841,7 +3816,7 @@ export function getEnumValues(path: SettingPath): readonly string[] | undefined 
 	return "values" in def ? (def.values as readonly string[]) : undefined;
 }
 
-export const CONFIG_SCHEMA_VERSION = 1;
+export { CONFIG_SCHEMA_VERSION } from "./config-schema-version";
 
 export type SettingsSchemaIssue = {
 	path: string;
@@ -3893,6 +3868,13 @@ function validArraySettingValue(value: unknown, allowedValues: readonly string[]
 	return !allowedValues || value.every(item => typeof item === "string" && allowedValues.includes(item));
 }
 
+function validRecordValue(valueSchema: RecordValueDef, value: unknown): boolean {
+	if (valueSchema.type === "model-selector-value") {
+		return typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string"));
+	}
+	return typeof value === "string" && valueSchema.values.includes(value);
+}
+
 function validSettingValue(definition: (typeof SETTINGS_SCHEMA)[SettingPath], value: unknown): boolean {
 	return (
 		(definition.type === "boolean" && typeof value === "boolean") ||
@@ -3933,11 +3915,8 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 				issues.push({ path, detail: "Setting is not a valid record sub-path." });
 				continue;
 			}
-			if (
-				parentDef.valueSchema.type === "model-selector-value" &&
-				!(typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string")))
-			) {
-				issues.push({ path, detail: "Expected model-selector-value." });
+			if (!validRecordValue(parentDef.valueSchema, value)) {
+				issues.push({ path, detail: `Expected ${parentDef.valueSchema.type}.` });
 			}
 			continue;
 		}
@@ -3959,11 +3938,8 @@ export function validateSettingPatch(patch: Record<string, unknown>): Array<{ pa
 		}
 		if (definition.type === "record" && "valueSchema" in definition && definition.valueSchema) {
 			for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-				if (
-					definition.valueSchema.type === "model-selector-value" &&
-					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
-				) {
-					issues.push({ path: `${path}.${key}`, detail: "Expected model-selector-value." });
+				if (!validRecordValue(definition.valueSchema, entry)) {
+					issues.push({ path: `${path}.${key}`, detail: `Expected ${definition.valueSchema.type}.` });
 				}
 			}
 		}
@@ -4020,11 +3996,12 @@ export function reconcileSettingsSchema(raw: Record<string, unknown>): {
 			validSettingValue(definition, next)
 		) {
 			for (const [key, entry] of Object.entries(next as Record<string, unknown>)) {
-				if (
-					definition.valueSchema.type === "model-selector-value" &&
-					!(typeof entry === "string" || (Array.isArray(entry) && entry.every(item => typeof item === "string")))
-				) {
-					issues.push({ path: `${path}.${key}`, kind: "invalid", detail: "Expected model-selector-value." });
+				if (!validRecordValue(definition.valueSchema, entry)) {
+					issues.push({
+						path: `${path}.${key}`,
+						kind: "invalid",
+						detail: `Expected ${definition.valueSchema.type}.`,
+					});
 				}
 			}
 		}
@@ -4183,7 +4160,7 @@ export interface ShellMinimizerSettings {
 }
 
 export interface SessionMemorySettings {
-	mode: "off" | "shadow" | "enabled";
+	mode: "off" | "shadow" | "enabled" | "auto";
 	contextOverflowRecovery: boolean;
 }
 

@@ -87,6 +87,8 @@ pub enum ExecError {
 	UnknownKey(String),
 	/// A screenshot step could not capture the display.
 	ScreenshotFailed,
+	/// The current process lacks Screen & System Audio Recording permission.
+	ScreenRecordingPermissionRequired(String),
 	/// A batch action failed at this zero-based index.
 	ActionFailed { index: usize, source: Box<Self> },
 	/// The cursor could not be captured before an input transaction began.
@@ -113,6 +115,7 @@ impl ExecError {
 			Self::UnknownKey(_) => "COMPUTER_UNKNOWN_KEY",
 			Self::Cancelled => "COMPUTER_CANCELLED",
 			Self::ScreenshotFailed => "COMPUTER_SCREENSHOT_FAILED",
+			Self::ScreenRecordingPermissionRequired(_) => "COMPUTER_PERMISSION_REQUIRED",
 			Self::ActionFailed { source, .. } => source.code(),
 			Self::CursorCaptureFailed => "COMPUTER_CURSOR_CAPTURE_FAILED",
 			Self::CursorRestoreFailed { .. } => "COMPUTER_CURSOR_RESTORE_FAILED",
@@ -142,6 +145,9 @@ impl std::fmt::Display for ExecError {
 			Self::ActionFailed { index, source } => write!(f, "action {index}: {source}"),
 			Self::CursorRestoreFailed { primary: Some(primary) } => {
 				write!(f, "{} after {primary}", self.code())
+			},
+			Self::ScreenRecordingPermissionRequired(reason) => {
+				write!(f, "{}: {reason}", self.code())
 			},
 			Self::TransactionPoisoned => {
 				write!(f, "{}: input transaction mutex is poisoned", self.code())
@@ -1042,6 +1048,10 @@ mod tests {
 		assert_eq!(ExecError::Suspended.code(), "COMPUTER_SUSPENDED");
 		assert_eq!(ExecError::SupervisorNotLive.code(), "COMPUTER_SUPERVISOR_NOT_LIVE");
 		assert_eq!(ExecError::PermissionRequired.code(), "COMPUTER_PERMISSION_REQUIRED");
+		assert_eq!(
+			ExecError::ScreenRecordingPermissionRequired("denied".to_string()).code(),
+			"COMPUTER_PERMISSION_REQUIRED"
+		);
 		assert_eq!(ExecError::DisplayStale.code(), "COMPUTER_DISPLAY_STALE");
 		assert_eq!(ExecError::CursorWarpFailed(1).code(), "COMPUTER_CURSOR_WARP_FAILED");
 		assert_eq!(ExecError::CursorCaptureFailed.code(), "COMPUTER_CURSOR_CAPTURE_FAILED");

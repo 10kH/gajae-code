@@ -1447,7 +1447,18 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly name = "read";
 	readonly label = "Read";
 	readonly loadMode = "essential";
-	readonly description: string;
+	get description(): string {
+		const displayMode = resolveFileDisplayMode(this.session);
+		return prompt.render(readDescription, {
+			DEFAULT_LIMIT: String(this.#defaultLimit),
+			DEFAULT_MAX_LINES: String(DEFAULT_MAX_LINES),
+			TRUNCATION_DEFAULT: String(this.session.settings.get("read.truncation") ?? "last"),
+			RECEIPT_LINES: String(this.session.settings.get("read.receiptBudgetLines")),
+			RECEIPT_KIB: String(this.session.settings.get("read.receiptBudgetBytes")),
+			IS_HL_MODE: displayMode.hashLines,
+			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
+		});
+	}
 	readonly parameters = readSchema;
 	readonly nonAbortable = true;
 	readonly strict = true;
@@ -1457,21 +1468,11 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	readonly #defaultLimit: number;
 
 	constructor(private readonly session: ToolSession) {
-		const displayMode = resolveFileDisplayMode(session);
 		this.#autoResizeImages = session.settings.get("images.autoResize");
 		this.#defaultLimit = Math.max(
 			1,
 			Math.min(session.settings.get("read.defaultLimit") ?? DEFAULT_MAX_LINES, DEFAULT_MAX_LINES),
 		);
-		this.description = prompt.render(readDescription, {
-			DEFAULT_LIMIT: String(this.#defaultLimit),
-			DEFAULT_MAX_LINES: String(DEFAULT_MAX_LINES),
-			TRUNCATION_DEFAULT: String(this.session.settings.get("read.truncation") ?? "last"),
-			RECEIPT_LINES: String(this.session.settings.get("read.receiptBudgetLines")),
-			RECEIPT_KIB: String(this.session.settings.get("read.receiptBudgetBytes")),
-			IS_HL_MODE: displayMode.hashLines,
-			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
-		});
 	}
 
 	async #resolveArchiveReadPath(readPath: string, signal?: AbortSignal): Promise<ResolvedArchiveReadPath | null> {

@@ -65,7 +65,6 @@ import type {
 import type { EventBus } from "../../utils/event-bus";
 import type {
 	AgentEndEvent,
-	AgentStartEvent,
 	AutoCompactionEndEvent,
 	AutoCompactionStartEvent,
 	AutoRetryEndEvent,
@@ -89,6 +88,7 @@ import type {
 	SessionStartEvent,
 	SessionSwitchEvent,
 	SessionTreeEvent,
+	AgentStartEvent as SharedAgentStartEvent,
 	TodoReminderEvent,
 	ToolCallEventResult,
 	ToolResultEventResult,
@@ -429,6 +429,7 @@ export interface ExtensionContext {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			preflightSignal?: AbortSignal;
 		},
 	): Promise<unknown>;
 	setPlanMode?(on: boolean): unknown;
@@ -634,7 +635,12 @@ export interface BeforeAgentStartEvent {
 	systemPrompt: string[];
 }
 
-export type { AgentEndEvent, AgentStartEvent, TurnEndEvent, TurnStartEvent } from "../shared-events";
+export type { AgentEndEvent, TurnEndEvent, TurnStartEvent } from "../shared-events";
+
+/** Fired when an agent loop starts. `sdkRunToken` is an internal SDK queue-owner binding. */
+export interface AgentStartEvent extends SharedAgentStartEvent {
+	sdkRunToken?: string;
+}
 
 /** Fired when a message starts (user, assistant, or toolResult) */
 export interface MessageStartEvent {
@@ -1169,7 +1175,10 @@ export interface ExtensionAPI {
 	 */
 	sendMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details" | "attribution">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+		},
 	): void;
 
 	/** Send a user message to the agent, or queue it when deliverAs is set. */
@@ -1179,6 +1188,9 @@ export interface ExtensionAPI {
 			deliverAs?: "steer" | "followUp";
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
+			preflightSignal?: AbortSignal;
+			/** Internal SDK correlation owner for an exact queued follow-up. */
+			sdkRunToken?: string;
 		},
 	): Promise<void>;
 
@@ -1387,7 +1399,10 @@ export type SendMessageHandler = <T = unknown>(
 	 * When paired with `triggerTurn: true` during prompt teardown, the session schedules
 	 * an internal continuation without surfacing the message in the editable pending queue.
 	 */
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	options?: {
+		triggerTurn?: boolean;
+		deliverAs?: "steer" | "followUp" | "nextTurn";
+	},
 ) => void;
 
 export type SendUserMessageHandler = (
@@ -1396,6 +1411,11 @@ export type SendUserMessageHandler = (
 		deliverAs?: "steer" | "followUp";
 		onPreflightAccepted?: () => void;
 		onPreflightAcceptCommit?: () => void | Promise<void>;
+		/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
+		onQueuedPromoted?: () => void;
+		preflightSignal?: AbortSignal;
+		/** Internal SDK correlation owner for an exact queued follow-up. */
+		sdkRunToken?: string;
 	},
 ) => void | Promise<void>;
 
@@ -1487,6 +1507,7 @@ export interface ExtensionContextActions {
 	getActivePromptHandle?: () => string | undefined;
 	abort: () => void;
 	abortPromptAndWait?: (handle: string, options: { graceMs: number }) => Promise<RunSettlementProof>;
+
 	hasPendingMessages: () => boolean;
 	/** Typed pending-message counts per queue; optional for embedders without a counted queue. */
 	getPendingMessageCounts?: () => { steering: number; followUp: number; nextTurn: number };
@@ -1555,6 +1576,7 @@ export interface ExtensionContextActions {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
+			preflightSignal?: AbortSignal;
 		},
 	) => Promise<unknown>;
 	setPlanMode?: (on: boolean) => unknown;

@@ -23,6 +23,7 @@ import type {
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import type { KiroCodeWhispererOptions } from "./providers/kiro-codewhisperer";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
@@ -43,7 +44,8 @@ export type KnownApi =
 	| "google-gemini-cli"
 	| "google-vertex"
 	| "ollama-chat"
-	| "cursor-agent";
+	| "cursor-agent"
+	| "kiro-codewhisperer-stream";
 export type Api = KnownApi | (string & {});
 export interface ApiOptionsMap {
 	"anthropic-messages": AnthropicOptions;
@@ -57,6 +59,7 @@ export interface ApiOptionsMap {
 	"google-vertex": GoogleVertexOptions;
 	"ollama-chat": OllamaChatOptions;
 	"cursor-agent": CursorOptions;
+	"kiro-codewhisperer-stream": KiroCodeWhispererOptions;
 }
 // Compile-time exhaustiveness check - this will fail if ApiOptionsMap doesn't have all KnownApi keys
 type _CheckExhaustive =
@@ -116,6 +119,7 @@ export interface ThinkingConfig {
 export const KNOWN_PROVIDERS = [
 	"alibaba-token-plan",
 	"amazon-bedrock",
+	"kiro",
 	"azure-openai",
 	"anthropic",
 	"google",
@@ -257,17 +261,38 @@ export function resolveServiceTier(
 
 /**
  * True when the (possibly scoped) tier should be sent as an OpenAI-compatible
- * `service_tier` request field for providers that support it. Unsupported tiers
- * (`"auto"`, `"default"`) and scope mismatches all return false.
+ * `service_tier` request field. Custom providers must explicitly opt in through
+ * `compat.supportsServiceTier`; unknown providers remain fail-closed.
  */
 export function shouldSendServiceTier(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
+	supportsServiceTier = false,
 ): boolean {
 	const resolved = resolveServiceTier(serviceTier, provider);
 	if (provider === "deepinfra") return resolved === "priority";
-	if (provider !== "openai" && provider !== "openai-codex") return false;
+	if (provider !== "openai" && provider !== "openai-codex" && !supportsServiceTier) return false;
 	return resolved === "flex" || resolved === "scale" || resolved === "priority";
+}
+
+/**
+ * True when a priority tier is realized as a fast-mode request on the provider's
+ * wire protocol. Custom OpenAI-compatible proxies opt in explicitly rather than
+ * inheriting support merely because their API shape resembles OpenAI.
+ */
+export function isFastModeEffectiveForProvider(
+	serviceTier: ServiceTier | null | undefined,
+	provider: Provider | undefined,
+	supportsServiceTier = false,
+): boolean {
+	if (resolveServiceTier(serviceTier, provider) !== "priority") return false;
+	return (
+		provider === "openai" ||
+		provider === "openai-codex" ||
+		provider === "anthropic" ||
+		provider === "deepinfra" ||
+		supportsServiceTier
+	);
 }
 
 /**
@@ -282,12 +307,7 @@ export function getPriorityPremiumRequests(
 	serviceTier: ServiceTier | null | undefined,
 	provider: Provider | undefined,
 ): number {
-	if (resolveServiceTier(serviceTier, provider) !== "priority") return 0;
-	// Only providers that realize `priority` on the wire bill the user.
-	// Everywhere else, the field is silently dropped and nothing is charged.
-	return provider === "openai" || provider === "openai-codex" || provider === "anthropic" || provider === "deepinfra"
-		? 1
-		: 0;
+	return isFastModeEffectiveForProvider(serviceTier, provider) ? 1 : 0;
 }
 
 export interface ProviderSessionState {
@@ -561,13 +581,27 @@ export interface ToolCall {
 	 */
 	customWireName?: string;
 	/**
-	 * Set when the provider detected the argument JSON was truncated — the model
-	 * hit its output-token limit (or the response was otherwise cut short) before
-	 * emitting a complete arguments object. The `arguments` field then holds a
-	 * best-effort partial parse and must not be executed as-is; the agent loop
-	 * rejects the call with a retryable error instead.
+	 * Set when the provider detected the argument JSON was not safely executable —
+	 * the model hit its output-token limit (or the response was otherwise cut short)
+	 * before emitting a complete arguments object, the terminal payload was malformed,
+	 * the streamed and terminal payloads conflicted, or the tool-call identity was
+	 * ambiguous on the wire. The `arguments` field then holds a best-effort partial
+	 * parse and must not be executed as-is; the agent loop rejects the call with a
+	 * retryable, reason-specific error instead.
 	 */
 	incompleteArguments?: boolean;
+	/**
+	 * When `incompleteArguments` is set, the typed cause so the agent loop can give
+	 * reason-specific recovery guidance:
+	 *  - `"truncated"`: the response was cut short mid-arguments (output-token limit).
+	 *  - `"malformed"`: the terminal arguments did not decode to a valid JSON object.
+	 *  - `"conflicting"`: the streamed and terminal argument payloads disagree.
+	 *  - `"ambiguous"`: the tool-call identity could not be unambiguously resolved
+	 *    (duplicate `call_id`, id/call_id collision, etc.), so attribution is unsafe.
+	 * Absent when `incompleteArguments` is not set. Existing callers that read only
+	 * `incompleteArguments` continue to work.
+	 */
+	incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 }
 
 export interface Usage {
@@ -888,6 +922,12 @@ export interface OpenAICompat extends ToolChoiceCompat {
 	 */
 	supportsResponsesSessionAffinity?: boolean;
 	/**
+	 * Whether an OpenAI-compatible endpoint accepts the `service_tier` request
+	 * field. Disabled by default for custom providers; opt in only when the proxy
+	 * preserves or intentionally realizes OpenAI priority processing.
+	 */
+	supportsServiceTier?: boolean;
+	/**
 	 * Tool names the provider reserves for its own built-ins and refuses to
 	 * accept as custom function declarations. A colliding tool is **dropped**
 	 * from the declared tools array rather than renamed: a renamed function
@@ -1147,4 +1187,9 @@ export interface Model<TApi extends Api = any> {
 	 * `options.isOAuth = true` for the underlying provider call.
 	 */
 	isOAuth?: boolean;
+}
+
+/** True when a model explicitly opts into OpenAI-compatible `service_tier` forwarding. */
+export function modelSupportsServiceTier(model: Pick<Model, "compat"> | undefined): boolean {
+	return Boolean(model?.compat && "supportsServiceTier" in model.compat && model.compat.supportsServiceTier === true);
 }

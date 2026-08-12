@@ -490,7 +490,7 @@ describe("SDK session index", () => {
 		});
 	}, 30_000);
 
-	it("compaction drops terminal+dead sessions and keeps live sessions with their original indexSeq", async () => {
+	it("compaction retains terminal sessions and keeps live sessions with their original indexSeq", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const deadPid = await (async () => {
 			const proc = Bun.spawn({ cmd: ["true"] });
@@ -504,11 +504,15 @@ describe("SDK session index", () => {
 		await index.append(event("live2"));
 		await index.snapshot();
 		const snapshot = JSON.parse(await fs.readFile(path.join(dir, "sdk", "sessions", "index.snapshot.json"), "utf8"));
-		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "live2"]);
+		expect(snapshot.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["live", "dead", "dead", "live2"]);
 		expect(snapshot.events[0].indexSeq).toBe(1);
 		expect(snapshot.indexSeq).toBe(4);
 		const replay = await new SessionIndex(dir).open();
-		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "live2"]);
+		expect(replay.listSessions().sessions.map(s => s.sessionId)).toEqual(["live", "dead", "live2"]);
+		expect(replay.listSessions().sessions.find(session => session.sessionId === "dead")).toMatchObject({
+			live: false,
+			terminal: true,
+		});
 		expect(replay.indexSeq).toBe(4);
 	});
 	it("collapses superseded heartbeats to the latest per surviving session", async () => {
@@ -599,7 +603,7 @@ describe("SDK session index", () => {
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.mkdir(sessionsDir, { recursive: true });
 		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
-		await fs.writeFile(snapshotFile, JSON.stringify({ version: 3, indexSeq: 7, events: [] }));
+		await fs.writeFile(snapshotFile, JSON.stringify({ version: 4, indexSeq: 7, events: [] }));
 		const unsupported = new SessionIndex(dir);
 		expect(await unsupported.diagnose()).toMatchObject({ status: "unsupported", validPrefixSeq: 0, snapshotSeq: 7 });
 		expect(await unsupported.repair()).toMatchObject({ status: "unsupported", repaired: false });
@@ -802,5 +806,180 @@ describe("SDK session index", () => {
 			resumeRepair.resolve();
 			mkdir.mockRestore();
 		}
+	});
+	it("does not unregister a same-session successor under the index lock", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-unregister-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({
+			...event("session"),
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request-a",
+			processIncarnation: "incarnation-a",
+		});
+		const predecessor = index.listSessions().sessions[0]!;
+		await index.append({
+			...event("session"),
+			pid: 1002,
+			endpointMtimeMs: 2,
+			lifecycleRequestId: "request-b",
+			processIncarnation: "incarnation-b",
+		});
+		expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
+		const successor = index.listSessions().sessions[0]!;
+		expect(successor).toMatchObject({ pid: 1002, lifecycleRequestId: "request-b" });
+		expect(await index.unregisterIfCurrent({ ...successor, hostIncarnation: "different-incarnation" })).toBe(false);
+		expect(await index.unregisterIfCurrent(successor)).toBe(true);
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({
+				sessionId: "session",
+				pid: 1002,
+				lifecycleRequestId: "request-b",
+				live: false,
+				terminal: true,
+			}),
+		]);
+	});
+	it("does not unregister a concurrent terminal-uncertain record", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-"));
+		const index = await new SessionIndex(dir).open();
+		await index.append({
+			...event("session"),
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request",
+			processIncarnation: "incarnation",
+		});
+		const predecessor = index.listSessions().sessions[0]!;
+		await index.append({
+			...event("session"),
+			type: "lifecycle_terminal",
+			pid: 1001,
+			endpointMtimeMs: 1,
+			lifecycleRequestId: "request",
+			processIncarnation: "incarnation",
+			terminalUncertain: true,
+		});
+		expect(await index.unregisterIfCurrent(predecessor)).toBe(false);
+		expect(index.listSessions().sessions[0]).toMatchObject({
+			sessionId: "session",
+			terminalUncertain: true,
+			live: false,
+		});
+	});
+	it("never exposes a terminal-uncertain identity as live", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-uncertain-live-"));
+		const index = await new SessionIndex(dir).open();
+		const registration = await index.append(event("session"));
+		expect(await index.checkpointLiveHeartbeats()).toBe(1);
+		expect(index.listSessions().sessions[0]).toMatchObject({ live: true });
+		await index.append({
+			type: "lifecycle_terminal",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+			terminalUncertain: true,
+		});
+		expect(index.listSessions().sessions[0]).toMatchObject({ terminalUncertain: true, live: false });
+	});
+	it("fences unresolved state roots, then projects either surviving root as authority", async () => {
+		for (const terminateHigherGeneration of [false, true]) {
+			const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-ambiguous-"));
+			const index = await new SessionIndex(dir).open();
+			const sessionId = `ambiguous-${terminateHigherGeneration ? "higher" : "lower"}`;
+			const alternate = await index.append({
+				...event(sessionId),
+				locator: { repo: "alternate", stateRoot: "alternate-state" },
+				endpointGeneration: 1,
+			});
+			const current = await index.append({
+				...event(sessionId),
+				locator: { repo: "current", stateRoot: "current-state" },
+				endpointGeneration: 2,
+			});
+			const terminated = terminateHigherGeneration ? current : alternate;
+			const survivor = terminateHigherGeneration ? alternate : current;
+
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: current.endpointGeneration,
+					ambiguous: true,
+					live: false,
+				}),
+			]);
+			const ambiguousSeq = index.indexSeq;
+			expect(await index.checkpointLiveHeartbeats()).toBe(0);
+			expect(index.indexSeq).toBe(ambiguousSeq);
+
+			await index.append({
+				type: "host_unregistered",
+				sessionId: terminated.sessionId,
+				locator: terminated.locator,
+				endpointGeneration: terminated.endpointGeneration,
+				pid: terminated.pid,
+				...(terminated.processIncarnation === undefined
+					? {}
+					: { processIncarnation: terminated.processIncarnation }),
+				...(terminated.hostIncarnation === undefined ? {} : { hostIncarnation: terminated.hostIncarnation }),
+			});
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: survivor.endpointGeneration,
+					locator: survivor.locator,
+					ambiguous: false,
+				}),
+			]);
+			expect(await index.checkpointLiveHeartbeats()).toBe(1);
+			expect(index.listSessions().sessions).toEqual([
+				expect.objectContaining({
+					sessionId,
+					endpointGeneration: survivor.endpointGeneration,
+					ambiguous: false,
+					live: true,
+				}),
+			]);
+		}
+	});
+	it("hides deleted sessions until a later registration establishes new authority", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-deleted-"));
+		const index = await new SessionIndex(dir).open();
+		const registration = await index.append(event("deleted"));
+		await index.append({
+			type: "session_deleted",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+		});
+		expect(index.listSessions().sessions).toEqual([]);
+
+		await index.append({
+			type: "host_heartbeat",
+			sessionId: registration.sessionId,
+			locator: registration.locator,
+			endpointGeneration: registration.endpointGeneration,
+			pid: registration.pid,
+			...(registration.processIncarnation === undefined
+				? {}
+				: { processIncarnation: registration.processIncarnation }),
+			...(registration.hostIncarnation === undefined ? {} : { hostIncarnation: registration.hostIncarnation }),
+		});
+		expect(index.listSessions().sessions).toEqual([]);
+
+		await index.append({ ...event("deleted"), endpointGeneration: registration.endpointGeneration + 1 });
+		expect(index.listSessions().sessions).toEqual([
+			expect.objectContaining({ sessionId: "deleted", endpointGeneration: registration.endpointGeneration + 1 }),
+		]);
 	});
 });
