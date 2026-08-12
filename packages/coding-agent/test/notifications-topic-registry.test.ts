@@ -705,7 +705,8 @@ test("publishes exact durable authority generation 154 at serving epoch 87", () 
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
 	// Generation 153: strict orchestration admission fences Telegram topics.
-	// Generation 154: master-worker delivery authority.
+	// Generation 154: private-chat archives dispatch deleteForumTopic, settle
+	// TOPIC_ID_INVALID, and drain durable archive retries periodically.
 	expect(DAEMON_GENERATION).toBe(154);
 	expect(SERVING_EPOCH).toBe(87);
 });
@@ -846,7 +847,7 @@ test("terminal archive states cannot be revived by lease or orphan transitions",
 	for (let attempt = 0; attempt < 9; attempt++) registry.scheduleArchiveRetry("session", attempt);
 	expect(registry.get("session")?.authorityState).toBe("archive_pending");
 	expect(registry.acquireLease("session", "host", 10, 1_000, 500)).toBe(false);
-	expect(registry.archivePendingSessionIds(70_000)).toEqual(["session"]);
+	expect(registry.archivePendingSessionIds(1_000_000)).toEqual(["session"]);
 	expect(registry.archiveExhaustedSessionIds()).toEqual([]);
 	expect(registry.markOrphaned("session", 10)).toBe(false);
 	expect(registry.clearOrphaned("session")).toBe(false);

@@ -33,7 +33,9 @@ import {
 	assertImagePlaceholdersHavePayload,
 	type ContextMaintenanceResult,
 	canContinuePersistedHistory,
+	dispatchedToolIdentity,
 	getAgentTerminalOwnerContext,
+	isNonDispatchedToolEvent,
 	type ManagedAttemptContinuationOwnership,
 	type ManagedAttemptDecision,
 	type ManagedAttemptOutcome,
@@ -301,9 +303,11 @@ import {
 	sessionStateDir,
 } from "../gjc-runtime/session-layout";
 import {
+	type CoordinatorToolObservation,
 	ownerTerminalContextFromEnvironment,
 	persistCoordinatorRuntimeStateFromEvent,
 	registerCoordinatorRuntimeStateFinalizer,
+	UNPROVEN_TOOL_LABEL,
 } from "../gjc-runtime/session-state-sidecar";
 import { requestGjcWorkerIntegrationAttempt } from "../gjc-runtime/team-runtime";
 import { GjcTeamWorkerHeartbeatReporter } from "../gjc-runtime/team-worker-heartbeat";
@@ -422,6 +426,7 @@ import {
 	type ContributionPrepResult,
 	prepareContributionPrep,
 } from "./contribution-prep";
+import { canonicalCoordinatorToolLabel } from "./coordinator-tool-label";
 import { pruneStaleFileMentions } from "./file-mention-pruning";
 import type { MemoryGuardRestoreResult } from "./memory-guard-checkpoint-participant";
 import {
@@ -672,6 +677,12 @@ export interface AgentSessionConfig {
 	workflowGatePublication?: "endpoint" | "local";
 	/** Tool registry for LSP and settings */
 	toolRegistry?: Map<string, AgentTool>;
+	/**
+	 * Tool objects this session's builder constructed from built-in descriptors, captured
+	 * before any extension, MCP, or dynamically registered tool could claim their registry
+	 * names. Absent means no provenance was proven and every tool reports as `custom`.
+	 */
+	builtinToolIdentities?: ReadonlySet<object>;
 	/** Tool-session factory context used to lazily attach workflow-gate-only tools. */
 	workflowGateToolSession?: ToolSession;
 	/** Current session pre-LLM message transform pipeline */
@@ -1871,33 +1882,22 @@ type SessionAdmissionEntry = {
 	ready: PromiseWithResolvers<void>;
 	settled: PromiseWithResolvers<void>;
 	released: boolean;
+	continuationCapability?: symbol;
 };
 
 type SessionAdmissionLease = {
 	release(): void;
 };
 
+type ScheduledContinuationAdmission = {
+	entry: SessionAdmissionEntry;
+	capability: symbol;
+};
+
 export interface DefaultFallbackRuntimeState {
 	chain: ConfiguredFallbackChain;
 	controller: FallbackChainRuntimeState;
 	exhaustedLastTurn: boolean;
-}
-
-/**
- * Fire-and-forget continuations (auto-compaction retries, queued follow-ups) race a
- * still-busy agent whose current turn can legitimately hold the run for minutes.
- * Reschedule with capped exponential backoff instead of a fixed 100ms spin, and give
- * up after a bounded number of attempts (~4 minutes total) so a stuck busy state
- * cannot spin forever — observed in production logs as 10,742 reschedules over
- * 21 minutes inside a single session.
- */
-const AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS = 100;
-const AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS = 5_000;
-const AGENT_CONTINUE_BUSY_MAX_RESCHEDULES = 50;
-
-function agentContinueBusyRescheduleDelayMs(attempt: number): number {
-	const exponential = AGENT_CONTINUE_BUSY_RESCHEDULE_BASE_DELAY_MS * 2 ** Math.max(0, attempt - 1);
-	return Math.min(exponential, AGENT_CONTINUE_BUSY_RESCHEDULE_MAX_DELAY_MS);
 }
 
 function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretObfuscator | undefined): SessionContext {
@@ -2259,6 +2259,17 @@ export class AgentSession {
 
 	// Tool registry and prompt builder for extensions
 	#toolRegistry: Map<string, AgentTool>;
+	/**
+	 * Session-owned provenance for tool OBJECTS built from a built-in descriptor.
+	 *
+	 * Copy-owned so this session can extend it with built-ins it creates or refreshes
+	 * later (the execution guard wrapper, an SSH reload, the lazily attached workflow-gate
+	 * `ask`) without mutating the builder's set. Weak because it holds no opinion about a
+	 * tool's lifetime: an object that is no longer reachable can never be dispatched
+	 * again. Custom, MCP, and dynamically registered tools never enter it, so a name
+	 * collision cannot inherit a built-in's label.
+	 */
+	#builtinToolIdentities: WeakSet<object>;
 	#workflowGateToolSession: ToolSession | undefined;
 	#transformContext: (
 		messages: AgentMessage[],
@@ -2543,6 +2554,18 @@ export class AgentSession {
 		next.ready.resolve();
 	}
 
+	#captureScheduledContinuationAdmission(): ScheduledContinuationAdmission | undefined {
+		const entry = this.#sessionAdmissionContext.getStore();
+		if (
+			entry?.kind !== "prompt" ||
+			entry.released ||
+			this.#activeSessionAdmission !== entry ||
+			entry.continuationCapability === undefined
+		)
+			return undefined;
+		return { entry, capability: entry.continuationCapability };
+	}
+
 	async #awaitStartupTurnBarrier(): Promise<void> {
 		const barrier = this.#startupTurnBarrier;
 		if (!barrier) return;
@@ -2559,10 +2582,18 @@ export class AgentSession {
 		kind: SessionAdmissionKind,
 		body: (lease: SessionAdmissionLease) => Promise<T>,
 		signal?: AbortSignal,
+		continuationAdmission?: ScheduledContinuationAdmission,
 	): Promise<T> {
 		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
 		const owner = this.#sessionAdmissionContext.getStore();
-		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		if (owner && !owner.released) {
+			if (
+				continuationAdmission?.entry === owner &&
+				continuationAdmission.capability === owner.continuationCapability
+			)
+				return await body({ release: () => {} });
+			throw this.#sessionAdmissionBusyError();
+		}
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
 		// Reject new external turns for the whole handoff transition. The handoff
 		// itself never acquires prompt admission (it generates via generateHandoff and
@@ -2580,6 +2611,7 @@ export class AgentSession {
 			ready: Promise.withResolvers<void>(),
 			settled: Promise.withResolvers<void>(),
 			released: false,
+			...(kind === "prompt" ? { continuationCapability: Symbol("scheduled-continuation") } : {}),
 		};
 		const releaseEntry = () => {
 			if (entry.released) return;
@@ -2749,15 +2781,6 @@ export class AgentSession {
 		this.#flushPendingAgentEnd();
 	}
 
-	#retainDeferredAgentEndAfterContinuationBusy(
-		hold: symbol | undefined,
-		pending: AgentSessionEvent | undefined,
-	): void {
-		if (!hold || !pending) return;
-		this.#pendingAgentEndEmit = pending;
-		this.#pendingAgentEndContinuationHolds.set(hold, pending);
-	}
-
 	#releaseDeferredAgentEndContinuation(hold: symbol | undefined): void {
 		if (!hold) return;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
@@ -2924,7 +2947,14 @@ export class AgentSession {
 			// Persist before notifying synchronous subscribers: a subscriber may start a
 			// successor prompt from agent_end, whose running state must serialize after
 			// this terminal boundary rather than be overwritten by it.
-			void this.#persistRuntimeStateInBackground(pending);
+			//
+			// Awaited, not fire-and-forget: this is the terminal boundary, and the write
+			// runs under the native identity-bound state-file lock. A detached write
+			// outlives the session that owns it — under `bun test --isolate` the pending
+			// unlink lands after the runtime has torn down the context it was scheduled in
+			// and segfaults the process, and in production it lets a settled session's
+			// last write race whatever reclaims its lock next.
+			await this.#queueCoordinatorRuntimeStatePersist(pending);
 			this.#emit(pending);
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
@@ -3022,6 +3052,7 @@ export class AgentSession {
 			this.#providerSessionState = config.providerSessionState;
 		}
 		this.#toolRegistry = config.toolRegistry ?? new Map();
+		this.#builtinToolIdentities = new WeakSet(config.builtinToolIdentities ?? []);
 		this.#workflowGateToolSession = config.workflowGateToolSession;
 		this.#requestedToolNames = config.requestedToolNames;
 		this.#transformContext = config.transformContext ?? (messages => messages);
@@ -4153,7 +4184,52 @@ export class AgentSession {
 		return queued;
 	}
 
+	/**
+	 * Immutable coordinator observations, keyed by the exact agent event object they were
+	 * taken for.
+	 *
+	 * Weak because an observation only matters for an event that is eventually published:
+	 * a maintenance checkpoint, a rejected terminal, and a superseded run's late event are
+	 * observed here but never emitted, and must not be persisted merely because they were
+	 * seen.
+	 */
+	#coordinatorToolObservations = new WeakMap<object, CoordinatorToolObservation>();
+
+	/**
+	 * Capture what is true at the SYNCHRONOUS agent-event boundary, before any async work.
+	 *
+	 * The label comes from the tool OBJECT the producer bound to this exact event when it
+	 * dispatched the call — never from re-resolving `event.toolName` here. `agent.state.tools`
+	 * is mutable: a tool refresh or MCP reload between dispatch and this observation would
+	 * otherwise attribute the call to whatever happens to hold its wire name now, publishing
+	 * a built-in label for a colliding custom tool that actually ran, or the reverse.
+	 *
+	 * The clock is captured here for the same reason: it keeps moving while subscribers run.
+	 *
+	 * A tool END is deliberately NOT labelled: its label comes from the correlation its own
+	 * START recorded, so one call cannot open under one label and close under another.
+	 *
+	 * A pairing-only event is not observed at all. The loop emits a start/end pair for a
+	 * call it skipped or aborted before dispatch so the stream keeps its shape, but this
+	 * snapshot is a claim about what is RUNNING — and nothing ran. Observing it would put a
+	 * tool into `active_tools` for the window between the two synthetic writes.
+	 */
+	#observeCoordinatorToolEvent(event: AgentEvent): void {
+		if (event.type !== "tool_execution_start" && event.type !== "tool_execution_end") return;
+		if (isNonDispatchedToolEvent(event)) return;
+		const label =
+			event.type === "tool_execution_start"
+				? canonicalCoordinatorToolLabel(dispatchedToolIdentity(event), tool =>
+						this.#builtinToolIdentities.has(tool),
+					)
+				: UNPROVEN_TOOL_LABEL;
+		this.#coordinatorToolObservations.set(event, Object.freeze({ label, observedAt: new Date().toISOString() }));
+	}
+
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
+		// First statement of the listener: the observation must precede every claim,
+		// reservation, and async hop this handler performs.
+		this.#observeCoordinatorToolEvent(event);
 		const terminalOwner = event.type === "agent_end" ? getAgentTerminalOwnerContext(event) : undefined;
 		const maintenanceCheckpoint =
 			event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
@@ -4237,13 +4313,43 @@ export class AgentSession {
 		return handler;
 	};
 
-	async #persistRuntimeStateInBackground(event: AgentSessionEvent): Promise<void> {
+	/** Serializes sidecar writes in publication order, independent of write latency. */
+	#coordinatorPersistQueue: Promise<void> = Promise.resolve();
+
+	/**
+	 * Reserve this event's place in the sidecar write order.
+	 *
+	 * Called immediately BEFORE local delivery so a synchronous subscriber that re-enters
+	 * the session cannot get its own, later event persisted first. The returned promise is
+	 * only awaited where durability must precede delivery (terminal `agent_end`).
+	 *
+	 * A pairing-only tool event takes no place in that order at all — neither its start nor
+	 * its end. It describes a call that was never dispatched, and this file is read as the
+	 * answer to "what is this session doing right now".
+	 */
+	#queueCoordinatorRuntimeStatePersist(event: AgentSessionEvent): Promise<void> {
+		if (isNonDispatchedToolEvent(event)) return Promise.resolve();
+		const observation = this.#coordinatorToolObservations.get(event);
+		const run = () => this.#persistRuntimeStateInBackground(event, observation);
+		const queued = this.#coordinatorPersistQueue.then(run, run);
+		this.#coordinatorPersistQueue = queued.catch(() => {});
+		return queued;
+	}
+
+	async #persistRuntimeStateInBackground(
+		event: AgentSessionEvent,
+		observation: CoordinatorToolObservation | undefined,
+	): Promise<void> {
 		try {
-			await persistCoordinatorRuntimeStateFromEvent(event, {
-				sessionId: this.sessionId,
-				cwd: this.sessionManager.getCwd(),
-				sessionFile: this.sessionManager.getSessionFile(),
-			});
+			await persistCoordinatorRuntimeStateFromEvent(
+				event,
+				{
+					sessionId: this.sessionId,
+					cwd: this.sessionManager.getCwd(),
+					sessionFile: this.sessionManager.getSessionFile(),
+				},
+				observation,
+			);
 		} catch {
 			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
 		}
@@ -4291,7 +4397,6 @@ export class AgentSession {
 		if (event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted")
 			return;
 
-		const persistRuntimeState = () => this.#persistRuntimeStateInBackground(event);
 		// Hold agent_end until the prompt's finally and all earlier async event work
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
@@ -4304,7 +4409,7 @@ export class AgentSession {
 		if (event.type === "agent_end") {
 			// Start the durable terminal write before synchronous subscribers can
 			// re-enter prompt(), so a successor's running transition serializes after it.
-			await persistRuntimeState();
+			await this.#queueCoordinatorRuntimeStatePersist(event);
 			this.#emit(event);
 			await this.#emitExtensionEvent(event);
 			return;
@@ -4314,8 +4419,13 @@ export class AgentSession {
 		// auto-continuation gates, goal reminders, and tests all observe these events
 		// synchronously. Coordinator sidecar writes and extension hooks are secondary
 		// sinks, so they must not delay or suppress local delivery.
+		//
+		// The sidecar write is ENQUEUED before delivery and awaited by nobody: a
+		// synchronous subscriber that re-enters the session and emits its own event still
+		// lands behind this one, while nothing about that subscriber's latency reaches the
+		// snapshot.
+		void this.#queueCoordinatorRuntimeStatePersist(event);
 		this.#emit(event);
-		void persistRuntimeState();
 		await this.#emitExtensionEvent(event);
 	}
 
@@ -5236,10 +5346,6 @@ export class AgentSession {
 		return scheduled;
 	}
 
-	#isAgentBusyError(error: unknown): error is AgentBusyError {
-		return error instanceof AgentBusyError;
-	}
-
 	#scheduleAgentContinue(options?: {
 		delayMs?: number;
 		generation?: number;
@@ -5250,7 +5356,6 @@ export class AgentSession {
 			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
 		) => void;
 		allowDuringCancelAndSubmit?: boolean;
-		rescheduleOnBusy?: boolean;
 		onError?: (error: unknown) => void;
 		resourceRunId?: string;
 		maintenanceContinuation?: boolean;
@@ -5284,171 +5389,154 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
-		let busyReschedules = 0;
-		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
-			const leaseSettlement = Promise.withResolvers<void>();
-			const settleLease = () => leaseSettlement.resolve();
-			return this.#schedulePostPromptTask(
-				async scheduledSignal => {
-					const canContinue = (): boolean => {
-						if (scheduledSignal.aborted || this.#isDisposed) {
-							skip("aborted_signal");
-							return false;
-						}
-						if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-							skip("generation_changed");
-							return false;
-						}
-						if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
-							skip("queue_drained");
-							return false;
-						}
-						if (options?.shouldContinue && !options.shouldContinue()) {
-							skip("queue_drained");
-							return false;
-						}
-						return true;
-					};
-					if (!canContinue()) {
-						settleLease();
-						return;
-					}
-					await this.#awaitStartupTurnBarrier();
-					if (!canContinue()) {
-						settleLease();
-						return;
-					}
-					try {
-						if (!options?.skipCompactionCheck) {
-							await this.#checkEstimatedContextBeforePrompt();
-							if (!canContinue()) return;
-						}
-						if (scheduledSignal.aborted) {
-							skip("aborted_signal");
-							return;
-						}
-						if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
-							skip("generation_changed");
-							return;
-						}
-						if (options?.shouldContinue && !options.shouldContinue()) {
-							skip("queue_drained");
-							return;
-						}
-						// A scheduled same-turn continuation of a terminally aborted turn is
-						// denied at the final synchronous boundary before agent.continue
-						// entry; no await intervenes between this check and method entry.
-						// Owned-completion deliveries are NOT affected (they use followUp).
-						if (this.#isTurnContinuationBlocked()) {
-							skip("terminal_turn");
-							return;
-						}
-						// A continuation scheduled before a handoff engaged must not start a
-						// turn against the session being handed off (or the restored
-						// predecessor). rearmIdle / normal delivery resumes after the fence.
-						if (this.#handoffTransitionActive) {
-							skip("handoff_in_progress");
-							return;
-						}
-						const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
-						let predecessorAccepted = false;
-						const releasePredecessor = () => {
-							if (predecessorAccepted) return;
-							predecessorAccepted = true;
-							this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
-						};
-						const hasQueuedMessages = this.agent.hasQueuedMessages();
-						const startsQueuedSuccessor =
-							hasQueuedMessages &&
-							(options?.continueQueuedOnly === true || this.agent.state.messages.at(-1)?.role === "assistant");
-						const continueQueued = options?.continueQueuedOnly
-							? this.agent.continueQueuedMessages.bind(this.agent)
-							: this.agent.continue.bind(this.agent);
-						const queuedMessagesBeforeContinue = [
-							...this.agent.snapshotSteering(),
-							...this.agent.snapshotFollowUp(),
-						];
-						try {
-							await continueQueued({
-								...this.#managedFallbackPromptOptions(),
-								maintenanceContinuation: options?.maintenanceContinuation,
-								// Reset only after continue() has claimed the queued turn. Skipped or stale
-								// continuations retain predecessor accounting, and resetAttemptBudget keeps
-								// the sticky fallback cursor unchanged.
-								onRunAccepted: (handle: AttemptRunHandle) => {
-									const queuedMessagesAfterContinue = new Set([
-										...this.agent.snapshotSteering(),
-										...this.agent.snapshotFollowUp(),
-									]);
-									for (const message of queuedMessagesBeforeContinue) {
-										if (queuedMessagesAfterContinue.has(message)) continue;
-										const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
-										if (sdkRunToken) {
-											this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
-											break;
-										}
-									}
-									this.#acceptRunHandle(handle);
-									options?.onRunAccepted?.(handle);
-									settleLease();
-									releasePredecessor();
-									if (startsQueuedSuccessor) {
-										this.#defaultFallbackChain().resetAttemptBudget();
-										this.#overflowMaintenanceAttempts = 0;
-									}
-								},
-							});
-							releasePredecessor();
-						} catch (error) {
-							if (
-								options?.rescheduleOnBusy &&
-								this.#isAgentBusyError(error) &&
-								!predecessorAccepted &&
-								!terminalized &&
-								canContinue()
-							) {
-								if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
-									busyReschedules += 1;
-									const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
-									this.#retainDeferredAgentEndAfterContinuationBusy(
-										predecessorAgentEndHold,
-										predecessorAgentEnd,
-									);
-									logger.debug("agent.continue busy after scheduling; rescheduling", {
-										error: error.message,
-										attempt: busyReschedules,
-										delayMs: nextDelayMs,
-									});
-									void scheduleAttempt(nextDelayMs);
+		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const leaseSettlement = Promise.withResolvers<void>();
+		const settleLease = () => leaseSettlement.resolve();
+		return this.#schedulePostPromptTask(
+			async scheduledSignal => {
+				try {
+					await this.#withSessionAdmission(
+						"prompt",
+						async () => {
+							const canContinue = (): boolean => {
+								if (scheduledSignal.aborted || this.#isDisposed) {
+									skip("aborted_signal");
+									return false;
+								}
+								if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+									skip("generation_changed");
+									return false;
+								}
+								if (this.#cancelAndSubmitInProgress && !options?.allowDuringCancelAndSubmit) {
+									skip("queue_drained");
+									return false;
+								}
+								if (options?.shouldContinue && !options.shouldContinue()) {
+									skip("queue_drained");
+									return false;
+								}
+								return true;
+							};
+							if (!canContinue()) {
+								settleLease();
+								return;
+							}
+							await this.#awaitStartupTurnBarrier();
+							if (!canContinue()) {
+								settleLease();
+								return;
+							}
+							try {
+								if (!options?.skipCompactionCheck) {
+									await this.#checkEstimatedContextBeforePrompt();
+									if (!canContinue()) return;
+								}
+								if (scheduledSignal.aborted) {
+									skip("aborted_signal");
 									return;
 								}
-								logger.warn("agent.continue busy reschedule budget exhausted; giving up", {
-									attempts: busyReschedules,
-									error: error.message,
-								});
+								if (scheduledGeneration !== undefined && this.#promptGeneration !== scheduledGeneration) {
+									skip("generation_changed");
+									return;
+								}
+								if (options?.shouldContinue && !options.shouldContinue()) {
+									skip("queue_drained");
+									return;
+								}
+								// A scheduled same-turn continuation of a terminally aborted turn is
+								// denied at the final synchronous boundary before agent.continue
+								// entry; no await intervenes between this check and method entry.
+								// Owned-completion deliveries are NOT affected (they use followUp).
+								if (this.#isTurnContinuationBlocked()) {
+									skip("terminal_turn");
+									return;
+								}
+								// A continuation scheduled before a handoff engaged must not start a
+								// turn against the session being handed off (or the restored
+								// predecessor). rearmIdle / normal delivery resumes after the fence.
+								if (this.#handoffTransitionActive) {
+									skip("handoff_in_progress");
+									return;
+								}
+								const predecessorAgentEnd = this.#claimDeferredAgentEndForContinuation(predecessorAgentEndHold);
+								let predecessorAccepted = false;
+								const releasePredecessor = () => {
+									if (predecessorAccepted) return;
+									predecessorAccepted = true;
+									this.#releaseDeferredAgentEndLease(predecessorAgentEnd);
+								};
+								const hasQueuedMessages = this.agent.hasQueuedMessages();
+								const startsQueuedSuccessor =
+									hasQueuedMessages &&
+									(options?.continueQueuedOnly === true ||
+										this.agent.state.messages.at(-1)?.role === "assistant");
+								const continueQueued = options?.continueQueuedOnly
+									? this.agent.continueQueuedMessages.bind(this.agent)
+									: this.agent.continue.bind(this.agent);
+								const queuedMessagesBeforeContinue = [
+									...this.agent.snapshotSteering(),
+									...this.agent.snapshotFollowUp(),
+								];
+								try {
+									await continueQueued({
+										...this.#managedFallbackPromptOptions(),
+										maintenanceContinuation: options?.maintenanceContinuation,
+										// Reset only after continue() has claimed the queued turn. Skipped or stale
+										// continuations retain predecessor accounting, and resetAttemptBudget keeps
+										// the sticky fallback cursor unchanged.
+										onRunAccepted: (handle: AttemptRunHandle) => {
+											const queuedMessagesAfterContinue = new Set([
+												...this.agent.snapshotSteering(),
+												...this.agent.snapshotFollowUp(),
+											]);
+											for (const message of queuedMessagesBeforeContinue) {
+												if (queuedMessagesAfterContinue.has(message)) continue;
+												const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
+												if (sdkRunToken) {
+													this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+													break;
+												}
+											}
+											this.#acceptRunHandle(handle);
+											options?.onRunAccepted?.(handle);
+											settleLease();
+											releasePredecessor();
+											if (startsQueuedSuccessor) {
+												this.#defaultFallbackChain().resetAttemptBudget();
+												this.#overflowMaintenanceAttempts = 0;
+											}
+										},
+									});
+									releasePredecessor();
+								} catch (error) {
+									if (!predecessorAccepted)
+										this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
+									throw error;
+								}
+							} catch (error) {
+								fail(error);
+							} finally {
+								settleLease();
 							}
-							if (!predecessorAccepted)
-								this.#restoreDeferredAgentEndAfterContinuationFailure(predecessorAgentEnd);
-							throw error;
-						}
-					} catch (error) {
-						fail(error);
-					} finally {
-						settleLease();
-					}
+						},
+						scheduledSignal,
+						continuationAdmission,
+					);
+				} catch (error) {
+					if (scheduledSignal.aborted) skip("aborted_signal");
+					else fail(error);
+				}
+			},
+			{
+				delayMs: options?.delayMs,
+				onSkip: () => {
+					settleLease();
+					skip("aborted_signal");
 				},
-				{
-					delayMs,
-					onSkip: () => {
-						settleLease();
-						skip("aborted_signal");
-					},
-					resourceRunId: options?.resourceRunId,
-					leaseTask: leaseSettlement.promise,
-				},
-			);
-		};
-		return scheduleAttempt();
+				resourceRunId: options?.resourceRunId,
+				leaseTask: leaseSettlement.promise,
+			},
+		);
 	}
 
 	#logCompactionContinuationSkipped(
@@ -5511,7 +5599,6 @@ export class AgentSession {
 				generation,
 				suppressPredecessorAgentEnd: true,
 				resourceRunId,
-				rescheduleOnBusy: true,
 				onSkip: reason => this.#logCompactionContinuationSkipped("overflow_retry", reason),
 				onError: error => this.#logCompactionContinuationError("overflow_retry", error),
 			});
@@ -5563,81 +5650,63 @@ export class AgentSession {
 			if (!authorized) this.emitNotice("info", "Auto-continue skipped: no unfinished work detected");
 			return authorized;
 		};
-		let busyReschedules = 0;
-		const scheduleAttempt = (delayMs = 0) => {
-			let rescheduled = false;
-			void this.#schedulePostPromptTask(
-				async signal => {
-					try {
-						await Promise.resolve();
-						if (signal.aborted) {
-							this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-							return;
-						}
-						if (this.#promptGeneration !== scheduledGeneration) {
-							this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
-							return;
-						}
-						if (!(await continuationAuthorized(signal))) return;
-						await this.#promptWithMessage(
-							{
-								role: "developer",
-								content: [{ type: "text", text: autoContinuePrompt }],
-								attribution: "agent",
-								timestamp: Date.now(),
-							},
-							autoContinuePrompt,
-							{
-								skipPostPromptRecoveryWait: true,
-								skipCompactionCheck: true,
-								predecessorAgentEndHold,
-								onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
-									continuationAuthorized(signal, hasPendingNextTurnMessages),
-							},
-						);
-					} catch (error) {
-						if (signal.aborted) {
-							this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-							return;
-						}
-						if (this.#isAgentBusyError(error) && this.#promptGeneration === scheduledGeneration) {
-							if (busyReschedules < AGENT_CONTINUE_BUSY_MAX_RESCHEDULES) {
-								busyReschedules += 1;
-								const nextDelayMs = agentContinueBusyRescheduleDelayMs(busyReschedules);
-								logger.debug("Auto-compaction continuation busy; rescheduling", {
-									source: "auto_continue_prompt",
-									reason: "queue_drained",
-									error: error.message,
-									attempt: busyReschedules,
-									delayMs: nextDelayMs,
-								});
-								rescheduled = true;
-								scheduleAttempt(nextDelayMs);
+		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		void this.#schedulePostPromptTask(
+			async signal => {
+				try {
+					await this.#withSessionAdmission(
+						"prompt",
+						async () => {
+							await Promise.resolve();
+							if (signal.aborted) {
+								this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
 								return;
 							}
-							logger.warn("Auto-compaction continuation busy reschedule budget exhausted; giving up", {
-								source: "auto_continue_prompt",
-								attempts: busyReschedules,
-								error: error.message,
-							});
-						}
-						this.#logCompactionContinuationError("auto_continue_prompt", error);
-					} finally {
-						if (!rescheduled) this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-					}
-				},
-				{
-					delayMs,
-					generation: scheduledGeneration,
-					resourceRunId,
-					onSkip: () => {
+							if (this.#promptGeneration !== scheduledGeneration) {
+								this.#logCompactionContinuationSkipped("auto_continue_prompt", "generation_changed");
+								return;
+							}
+							if (!(await continuationAuthorized(signal))) return;
+							await this.#promptWithMessage(
+								{
+									role: "developer",
+									content: [{ type: "text", text: autoContinuePrompt }],
+									attribution: "agent",
+									timestamp: Date.now(),
+								},
+								autoContinuePrompt,
+								{
+									skipPostPromptRecoveryWait: true,
+									skipCompactionCheck: true,
+									predecessorAgentEndHold,
+									onFinalPreflight: ({ hasPendingNextTurnMessages }) =>
+										continuationAuthorized(signal, hasPendingNextTurnMessages),
+								},
+							);
+						},
+						signal,
+						continuationAdmission,
+					);
+				} catch (error) {
+					if (signal.aborted) {
 						this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
-						this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-					},
+						return;
+					}
+					this.#logCompactionContinuationError("auto_continue_prompt", error);
+				} finally {
+					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
+				}
+			},
+			{
+				delayMs: 0,
+				generation: scheduledGeneration,
+				resourceRunId,
+				onSkip: () => {
+					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
+					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
 				},
-			);
-		};
-		scheduleAttempt();
+			},
+		);
 	}
 
 	async #cancelPostPromptTasks(): Promise<void> {
@@ -6796,7 +6865,13 @@ export class AgentSession {
 		await admissionClosed;
 		await this.#agentEndPublicationPromise;
 		await this.#queuedExtensionEvents;
-		this.#workflowGateEmitter?.fence?.();
+		// Drain the sidecar write order for the same reason the two queues above are
+		// drained: each entry writes under the native identity-bound state-file lock, so a
+		// still-queued write would run after the session that owns it is gone — releasing
+		// a lock whose owner no longer exists, and under `bun test --isolate` calling into
+		// the addon after the runtime tore down the context it was scheduled in. The chain
+		// is already failure-absorbing, so this only waits.
+		await this.#coordinatorPersistQueue;
 		this.#pendingBackgroundExchanges = [];
 		this.yieldQueue.clear();
 
@@ -6808,6 +6883,7 @@ export class AgentSession {
 		} catch (error) {
 			logger.warn("Failed to emit session_shutdown event", { error: String(error) });
 		}
+		this.#workflowGateEmitter?.fence?.();
 		this.#workflowGateEmitter = undefined;
 		this.#notifyWorkflowGateEmitterChanged(this.sessionId, undefined);
 		await this.#flushWorkerIntegrationAttempt();
@@ -7591,6 +7667,11 @@ export class AgentSession {
 				),
 			),
 		);
+		// The object published into `agent.state.tools` — and therefore the object the
+		// agent loop actually dispatches to — is this guard wrapper, not the registry
+		// entry. A wrapper built from a proven built-in inherits that proof; one built
+		// from a custom, MCP, or extension tool inherits nothing.
+		if (this.#builtinToolIdentities.has(tool)) this.#builtinToolIdentities.add(wrapped);
 		if (!wrappersByVersion) {
 			wrappersByVersion = new Map();
 			this.#guardedToolWrapperCache.set(tool, wrappersByVersion);
@@ -7716,6 +7797,9 @@ export class AgentSession {
 		const refreshedTool = await this.#reloadSshTool();
 		if (refreshedTool) {
 			this.#toolRegistry.set(refreshedTool.name, refreshedTool);
+			// A reloaded built-in is a NEW object. Without this it would replace the proven
+			// one and every subsequent `ssh` call would be reported as `custom`.
+			this.#builtinToolIdentities.add(refreshedTool);
 		} else {
 			this.#toolRegistry.delete("ssh");
 			this.#selectedDiscoveredToolNames.delete("ssh");
@@ -8647,6 +8731,11 @@ export class AgentSession {
 			const wrappedTool = wrapToolWithMetaNotice(createdAskTool as unknown as AgentTool);
 			askTool = this.#extensionRunner ? new ExtensionToolWrapper(wrappedTool, this.#extensionRunner) : wrappedTool;
 			this.#toolRegistry.set(askTool.name, askTool);
+			// Built here from the built-in `ask` descriptor rather than by the session
+			// builder, so its provenance has to be recorded here too. Only this
+			// construction path qualifies: an `ask` already in the registry is left alone,
+			// because whatever put it there owns its provenance.
+			this.#builtinToolIdentities.add(askTool);
 		}
 
 		try {
@@ -10209,7 +10298,6 @@ export class AgentSession {
 		this.#scheduleAgentContinue({
 			shouldContinue: () => this.#canStartDeferredSdkFollowUp() && this.agent.hasQueuedMessages(),
 			continueQueuedOnly: true,
-			rescheduleOnBusy: true,
 		});
 	}
 	#canStartDeferredSdkFollowUp(): boolean {
@@ -12386,11 +12474,10 @@ export class AgentSession {
 			onAfterActivation?: () => void;
 		},
 	): Promise<{ changed: boolean; id: string }> {
+		// Do not hold selection admission while waiting for a scheduled continuation:
+		// the continuation may need prompt admission to settle the current turn.
+		await this.waitForIdle();
 		const canonicalName = await this.#withSessionAdmission("selection", async () => {
-			// A model-picker action must not alter an in-flight generation: wait
-			// for the current run to settle inside the admission before applying
-			// the profile, matching `setDefaultModelSelection`.
-			await this.waitForIdle();
 			const profiles = this.#modelRegistry.getModelProfiles();
 			let canonical: string;
 			try {
@@ -12477,10 +12564,10 @@ export class AgentSession {
 	 * profile activation and default-model selection.
 	 */
 	async withSdkControlMutation<T>(body: () => Promise<T>): Promise<T> {
+		// Waiting while selection owns admission deadlocks with a scheduled
+		// continuation queued behind it. Wait before acquiring the mutation lease.
+		await this.waitForIdle();
 		return this.#withSessionAdmission("selection", async () => {
-			// A config mutation can change the active model-role assignment. Do not
-			// alter an in-flight turn after its prompt admission lease has released.
-			await this.waitForIdle();
 			return await body();
 		});
 	}
@@ -12832,6 +12919,13 @@ export class AgentSession {
 			onAfterMutation?: () => void;
 		},
 	): Promise<DefaultModelSelectionResult> {
+		// Scheduled continuations share this admission queue, so idle settlement
+		// must happen before selection acquires its lease. But a reentrant
+		// selection from inside an active admission (e.g. before_agent_start)
+		// must reject immediately instead of deadlocking on waitForIdle.
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		await this.waitForIdle();
 		return this.#withSessionAdmission("selection", async () => {
 			options?.onBeforeMutation?.();
 			const expectedSessionId = this.sessionId;
@@ -12848,7 +12942,6 @@ export class AgentSession {
 				resolvedLevel ??
 				resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
 				ThinkingLevel.Off;
-			await this.waitForIdle();
 			await this.sessionManager.flush();
 			await this.#waitForAdmittedBaseSystemPromptRebuilds();
 			if (this.sessionId !== expectedSessionId) {
@@ -16149,7 +16242,6 @@ export class AgentSession {
 							delayMs: 100,
 							generation,
 							shouldContinue: () => this.agent.hasQueuedMessages(),
-							rescheduleOnBusy: true,
 							continueQueuedOnly: true,
 							onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 							onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -16171,7 +16263,6 @@ export class AgentSession {
 						suppressPredecessorAgentEnd: true,
 
 						shouldContinue: () => this.agent.hasQueuedMessages(),
-						rescheduleOnBusy: true,
 						continueQueuedOnly: true,
 						onSkip: skipReason => this.#logCompactionContinuationSkipped("queued_continue", skipReason),
 						onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -16431,7 +16522,6 @@ export class AgentSession {
 					generation,
 					suppressPredecessorAgentEnd: true,
 					shouldContinue: () => this.agent.hasQueuedMessages(),
-					rescheduleOnBusy: true,
 					continueQueuedOnly: true,
 					onSkip: reason => this.#logCompactionContinuationSkipped("queued_continue", reason),
 					onError: error => this.#logCompactionContinuationError("queued_continue", error),
@@ -17976,7 +18066,6 @@ export class AgentSession {
 			if (!this.#cancelAndSubmitInProgress && this.agent.hasQueuedMessages()) {
 				this.#scheduleAgentContinue({
 					shouldContinue: () => this.#canAutoContinueForFollowUp() && this.agent.hasQueuedMessages(),
-					rescheduleOnBusy: true,
 					continueQueuedOnly: true,
 				});
 			}

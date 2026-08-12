@@ -62,6 +62,11 @@ import {
 	startExecuteToolSpan,
 	startInvokeAgentSpan,
 } from "./telemetry";
+import {
+	activeToolForCallName,
+	bindDispatchedToolIdentity,
+	markNonDispatchedToolEvent,
+} from "./tool-dispatch-identity";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -74,6 +79,11 @@ import type {
 	StandaloneRunOwnership,
 	StreamFn,
 } from "./types";
+
+// Capture the intrinsic before any tool/hook can replace `Reflect.apply`. Calling this
+// local binding performs no user-controlled property lookup between publishing a dispatch
+// start and entering the selected execute function.
+const intrinsicReflectApply = Reflect.apply;
 
 /** Sentinel returned by the abort race in `streamAssistantResponse`. */
 /**
@@ -810,6 +820,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const customWireName = managedProperty(value, "customWireName");
 	const incompleteArguments = managedProperty(value, "incompleteArguments");
 	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
+	const escapedNonAsciiArguments = managedProperty(value, "escapedNonAsciiArguments");
 	return {
 		type,
 		id,
@@ -828,6 +839,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 						| "ambiguous",
 				}
 			: {}),
+		...(typeof escapedNonAsciiArguments === "boolean" ? { escapedNonAsciiArguments } : {}),
 	};
 }
 
@@ -2541,19 +2553,16 @@ function toolCallNames(tool: { name: string; customWireName?: string }): string[
 const TOOL_DISCOVERY_NAME = "search_tool_bm25";
 
 /**
- * Active tool a call name dispatches to. Tools emitted via OpenAI's custom-tool
- * path (e.g. `apply_patch` on GPT-5) come back under their wire-level name,
- * which may differ from the harness-internal `name`. Match on either, preferring
- * `name` for determinism if both somehow collide.
+ * Active tool a call name dispatches to.
+ *
+ * The rule itself lives with the dispatch-identity binding so execution and the identity
+ * bound onto the emitted event can never diverge.
  */
 function findActiveTool<T extends { name: string; customWireName?: string }>(
 	tools: ReadonlyArray<T> | undefined,
 	callName: string,
 ): T | undefined {
-	return (
-		tools?.find(tool => tool.name === callName) ??
-		tools?.find(tool => tool.customWireName !== undefined && tool.customWireName === callName)
-	);
+	return activeToolForCallName(tools, callName);
 }
 
 /**
@@ -2615,6 +2624,7 @@ async function executeToolCalls(
 		toolCall,
 		tool: findActiveTool(tools, toolCall.name),
 		args: toolCall.arguments as Record<string, unknown>,
+		eventFields: undefined as { toolCallId: string; toolName: string; intent: string | undefined } | undefined,
 		started: false,
 		result: undefined as AgentToolResult<any> | undefined,
 		isError: false,
@@ -2648,29 +2658,44 @@ async function executeToolCalls(
 	const emitToolResult = (record: (typeof records)[number], result: AgentToolResult<any>, isError: boolean): void => {
 		if (record.resultEmitted) return;
 		const { toolCall } = record;
-		if (!record.started) {
-			stream.push({
+		const eventFields =
+			record.eventFields ?? ({ toolCallId: toolCall.id, toolName: toolCall.name, intent: toolCall.intent } as const);
+		// A call that was skipped or aborted before dispatch still owes the stream a
+		// start/end PAIR, because every consumer downstream is built around results
+		// arriving in pairs. Both halves are marked as what they are — pairing only — so a
+		// consumer that publishes "this tool is running" can leave them out while relays,
+		// history, and result handling keep seeing the same events they always did.
+		const dispatched = record.started;
+		if (!dispatched) {
+			// No dispatch provenance is bound here. `record.tool` is the object this call
+			// WOULD have run, and binding it would let a consumer resolve a canonical
+			// built-in label for a tool whose `execute` was never entered.
+			const startEvent: AgentEvent = {
 				type: "tool_execution_start",
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
+				toolCallId: eventFields.toolCallId,
+				toolName: eventFields.toolName,
 				args: record.args,
-				intent: toolCall.intent,
+				intent: eventFields.intent,
 				scope,
-			});
+			};
+			markNonDispatchedToolEvent(startEvent);
+			stream.push(startEvent);
 		}
-		stream.push({
+		const endEvent: AgentEvent = {
 			type: "tool_execution_end",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
+			toolCallId: eventFields.toolCallId,
+			toolName: eventFields.toolName,
 			result,
 			isError,
 			scope,
-		});
+		};
+		if (!dispatched) markNonDispatchedToolEvent(endEvent);
+		stream.push(endEvent);
 
 		const toolResultMessage: ToolResultMessage = {
 			role: "toolResult",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
+			toolCallId: eventFields.toolCallId,
+			toolName: eventFields.toolName,
 			content: result.content,
 			details: result.details,
 			isError,
@@ -2684,6 +2709,62 @@ async function executeToolCalls(
 
 		stream.push({ type: "message_start", message: toolResultMessage, scope });
 		stream.push({ type: "message_end", message: toolResultMessage, scope });
+	};
+
+	/**
+	 * Prepare every value needed to publish and invoke one dispatch before claiming that it
+	 * started. Once this returns, the path from a successful start publication to intrinsic
+	 * invocation contains only trusted local bindings and values.
+	 */
+	const prepareToolDispatch = (
+		record: (typeof records)[number],
+		startArgs: Record<string, unknown>,
+		executionArgs: Record<string, unknown>,
+		executionSignal: AbortSignal | undefined,
+		effectiveArgs: Record<string, unknown>,
+		toolContext: AgentToolContext | undefined,
+	): { startEvent: AgentEvent; invocationArguments: Parameters<AgentTool["execute"]> } => {
+		const eventFields = {
+			toolCallId: record.toolCall.id,
+			toolName: record.toolCall.name,
+			intent: record.toolCall.intent,
+		};
+		const startEvent: AgentEvent = {
+			type: "tool_execution_start",
+			toolCallId: eventFields.toolCallId,
+			toolName: eventFields.toolName,
+			args: startArgs,
+			intent: eventFields.intent,
+			scope,
+		};
+		// Retain the exact values the start/end/result pair must share. No later event in
+		// this dispatch needs to re-read a stateful ToolCall property.
+		record.eventFields = eventFields;
+		bindDispatchedToolIdentity(startEvent, record.tool);
+		const onUpdate: NonNullable<Parameters<AgentTool["execute"]>[3]> = partialResult => {
+			stream.push({
+				type: "tool_execution_update",
+				toolCallId: eventFields.toolCallId,
+				toolName: eventFields.toolName,
+				args: effectiveArgs,
+				partialResult: coerceToolResult(partialResult).result,
+				scope,
+			});
+		};
+		const invocationArguments = [
+			eventFields.toolCallId,
+			executionArgs,
+			executionSignal,
+			onUpdate,
+			toolContext,
+		] as Parameters<AgentTool["execute"]>;
+		return { startEvent, invocationArguments };
+	};
+
+	/** Mark dispatch only after the fully prepared start was successfully published. */
+	const publishToolDispatch = (record: (typeof records)[number], startEvent: AgentEvent): void => {
+		stream.push(startEvent);
+		record.started = true;
 	};
 
 	const runTool = async (record: (typeof records)[number], index: number): Promise<void> => {
@@ -2714,15 +2795,6 @@ async function executeToolCalls(
 			}
 		}
 		record.args = argsForExecution;
-		record.started = true;
-		stream.push({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: argsForExecution,
-			intent: toolCall.intent,
-			scope,
-		});
 
 		const toolSpan = startExecuteToolSpan(telemetry, {
 			tool,
@@ -2756,6 +2828,20 @@ async function executeToolCalls(
 									? `The identity of tool call "${toolCall.name}" was ambiguous on the wire (duplicate call id or id/call_id collision), so its arguments cannot be safely attributed. Re-issue the call.`
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
 					throw new Error(detail);
+				}
+				if (toolCall.escapedNonAsciiArguments) {
+					record.argumentValidationFailed = true;
+					// The arguments decoded cleanly, but they were spelled as `\uXXXX`
+					// escapes rather than literal UTF-8. Hand-written hex is where models
+					// mistype digits, and every mistyped nibble decodes to a different but
+					// equally valid character — the payload is unverifiable and cannot be
+					// repaired after parsing, so it is rejected rather than executed on
+					// silently corrupted text.
+					throw new Error(
+						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
+							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
+							`so the call was not executed. Re-issue it writing every non-ASCII character literally.`,
+					);
 				}
 				if (!tool) {
 					// A discoverable tool that hasn't been activated yet resolves to
@@ -2820,22 +2906,25 @@ async function executeToolCalls(
 				const toolContext = scope
 					? (Object.assign(baseToolContext ?? {}, { attemptScope: scope }) as AgentToolContext)
 					: baseToolContext;
-				const execution = tool.execute(
-					toolCall.id,
-					transformToolCallArguments ? transformToolCallArguments(effectiveArgs, toolCall.name) : effectiveArgs,
-					tool.nonAbortable ? undefined : toolSignal,
-					partialResult => {
-						stream.push({
-							type: "tool_execution_update",
-							toolCallId: toolCall.id,
-							toolName: toolCall.name,
-							args: effectiveArgs,
-							partialResult: coerceToolResult(partialResult).result,
-							scope,
-						});
-					},
+				const executionArgs = transformToolCallArguments
+					? transformToolCallArguments(effectiveArgs, toolCall.name)
+					: effectiveArgs;
+				const executionSignal = tool.nonAbortable ? undefined : toolSignal;
+				const execute = tool.execute;
+				if (typeof execute !== "function")
+					throw new Error(`Tool ${toolCall.name} has no executable implementation`);
+				const { startEvent, invocationArguments } = prepareToolDispatch(
+					record,
+					argsForExecution,
+					executionArgs,
+					executionSignal,
+					effectiveArgs,
 					toolContext,
 				);
+				// Preparation is complete. A successful publication is the only transition
+				// that marks this record dispatched; intrinsic invocation then consumes locals.
+				publishToolDispatch(record, startEvent);
+				const execution = intrinsicReflectApply(execute, tool, invocationArguments);
 				const rawResult = await execution;
 				const coerced = coerceToolResult(rawResult);
 				result = coerced.result;
@@ -3027,20 +3116,30 @@ function createAbortedToolResult(
 		details: {},
 	};
 
-	stream.push({
+	// Nothing was dispatched for this call: the turn errored or was aborted before any
+	// `Tool.execute` could be entered, and this pair exists only so the stream keeps
+	// delivering results in start/end PAIRS. Both halves say so, and neither binds the
+	// tool the call would have run, so a consumer that publishes "this tool is running"
+	// can leave them out while relays, history, and result handling see what they always
+	// did.
+	const startEvent: AgentEvent = {
 		type: "tool_execution_start",
 		toolCallId: toolCall.id,
 		toolName: toolCall.name,
 		args: toolCall.arguments,
 		intent: toolCall.intent,
-	});
-	stream.push({
+	};
+	markNonDispatchedToolEvent(startEvent);
+	stream.push(startEvent);
+	const endEvent: AgentEvent = {
 		type: "tool_execution_end",
 		toolCallId: toolCall.id,
 		toolName: toolCall.name,
 		result,
 		isError: true,
-	});
+	};
+	markNonDispatchedToolEvent(endEvent);
+	stream.push(endEvent);
 
 	const toolResultMessage: ToolResultMessage = {
 		role: "toolResult",
