@@ -984,6 +984,10 @@ class ManagedAttemptTransaction {
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
 		const partial = managedAssistantShell(message, this.model);
+		if (this.#committed) {
+			this.onAssistantMessageEvent?.(partial, managedAssistantEventSnapshot(event, partial));
+			return;
+		}
 		this.#batch.push({
 			type: "assistant_event",
 			message: partial,

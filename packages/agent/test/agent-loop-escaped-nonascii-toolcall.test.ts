@@ -213,6 +213,35 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(toolEnds[0]?.type === "tool_execution_end" ? toolEnds[0].isError : false).toBe(true);
 	});
 
+	it("delivers every assistant stream callback exactly once after visible text commits the turn", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		const mock = createMockModel({ responses: [escapedTurnWithText("tc-visible"), { content: ["done"] }] });
+		const callbackTypes: string[] = [];
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			onAssistantMessageEvent: (_message, event) => callbackTypes.push(event.type),
+		};
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(callbackTypes).toEqual([
+			"text_start",
+			"text_delta",
+			"text_end",
+			"toolcall_start",
+			"toolcall_delta",
+			"toolcall_end",
+			"text_start",
+			"text_delta",
+			"text_end",
+		]);
+	});
+
 	it("executes no calls from a mixed batch before validating the whole turn", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
