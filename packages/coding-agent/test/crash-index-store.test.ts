@@ -88,6 +88,26 @@ describe("compactCrashIndex", () => {
 		expect(index.signatures[fingerprintFor(3)]?.retainedCount).toBe(1);
 	});
 
+	it("writes an index its own reader accepts when the log holds more records than the journal counted", async () => {
+		const paths = await tempPaths();
+		// A fatal whose journal append failed — or that spent the per-process latch —
+		// still writes its crash-log record, so the log can name a signature more
+		// times than the journal counted it.
+		appendCrashEvent(occurrence(fingerprintFor(20), recordId(20)), paths.events);
+		await fs.writeFile(
+			paths.crashLog,
+			`2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] Error: x\n${formatCrashRecordMarker(fingerprintFor(20), 1, recordId(20))}\n\n` +
+				`2026-08-11T12:30:00.000Z pid=1 [Uncaught Exception] Error: x\n${formatCrashRecordMarker(fingerprintFor(20), 1, recordId(21))}\n\n` +
+				`2026-08-11T13:00:00.000Z pid=1 [Uncaught Exception] Error: x\n${formatCrashRecordMarker(fingerprintFor(20), 1, recordId(22))}\n\n`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+
+		expect(index.signatures[fingerprintFor(20)]?.retainedCount).toBe(1);
+		// `parseEntry` rejects a retained count above the lifetime count, so emitting
+		// one quarantines the whole index — every signature in it — on the next read.
+		expect(parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW)).toBeDefined();
+	});
+
 	it("never evicts an unreported signature and records an overflow marker instead", async () => {
 		const paths = await tempPaths();
 		for (let seed = 1; seed <= CRASH_INDEX_MAX_SIGNATURES; seed++)
