@@ -92,6 +92,8 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 	});
 
 	it("recovers from append not_found via normalization (covers #appendManagedRecordsSync)", async () => {
+		// Hot path with identity: #appendManagedRecordsSync calls appendExpectedIdentitySync,
+		// not appendSync. Mocking appendSync would be vacuously passing.
 		const destination = SessionManager.managedDestination(cwd, agentDir);
 		const manager = SessionManager.create(cwd, destination);
 		manager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
@@ -99,20 +101,24 @@ describe("managed rewrite ENOENT regression (P0)", () => {
 		await manager.flush();
 
 		const sessionFile = manager.getSessionFile()!;
-		const origAppendSync = ManagedSessionDescendantStore.prototype.appendSync;
+		// Hot path uses appendExpectedIdentitySync; with a missing predecessor the
+		// store's bounded capture returns undefined and this throws
+		// managed_append_identity_mismatch (or ENOENT when normalized). The handler
+		// recovers via rewrite. Mock ENOENT to exercise the isEnoent recovery branch
+		// without relying on the darwin/linux capture divergence.
+		const origAppendExpected = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
 		let threw2 = false;
-		const spy2 = spyOn(ManagedSessionDescendantStore.prototype, "appendSync").mockImplementation(function (
-			this: unknown,
-			...args: unknown[]
-		) {
-			if (!threw2) {
-				threw2 = true;
-				const err = new Error("not_found") as NodeJS.ErrnoException;
-				(err as unknown as Record<string, unknown>)["code"] = "not_found";
-				throw err;
-			}
-			return (origAppendSync as unknown as (...a: unknown[]) => unknown).apply(this, args);
-		} as unknown as typeof origAppendSync);
+		const spy2 = spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedIdentitySync").mockImplementation(
+			function (this: unknown, ...args: unknown[]) {
+				if (!threw2) {
+					threw2 = true;
+					const err = new Error("ENOENT") as NodeJS.ErrnoException;
+					(err as unknown as Record<string, unknown>)["code"] = "ENOENT";
+					throw err;
+				}
+				return (origAppendExpected as unknown as (...a: unknown[]) => unknown).apply(this, args);
+			} as unknown as typeof origAppendExpected,
+		);
 
 		try {
 			manager.appendMessage({ role: "user", content: "after-append-not-found", timestamp: Date.now() });
