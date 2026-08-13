@@ -4,7 +4,7 @@ import type { Api, Model } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
-import { Input, isPetMode, Loader, Spacer, Text } from "@gajae-code/tui";
+import { Input, Loader, resolvePetMode, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
 import type { AppKeybinding } from "../../config/keybindings";
 import {
@@ -1728,6 +1728,36 @@ export class SelectorController {
 								this.#refreshThemeUi();
 							});
 						},
+						onThemeCommit: async (path, themeName, previousTheme) => {
+							if (!settings.canWriteDurableConfig()) {
+								this.ctx.showError(
+									"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+								);
+								return false;
+							}
+							const applied = await restoreThemePreview(themeName);
+							if (!applied.success) {
+								if (applied.error && !isThemePreviewSuperseded(applied)) {
+									this.ctx.showError(`Failed to apply theme "${themeName}": ${applied.error}`);
+								}
+								const restored = await restoreThemePreview(previousTheme);
+								if (!restored.success && restored.error && !isThemePreviewSuperseded(restored)) {
+									this.ctx.showError(`Failed to restore theme preview: ${restored.error}`);
+								}
+								this.#refreshThemeUi();
+								return false;
+							}
+							try {
+								settings.set(path, themeName);
+							} catch (error) {
+								await restoreThemePreview(previousTheme);
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+								this.#refreshThemeUi();
+								return false;
+							}
+							this.#refreshThemeUi();
+							return true;
+						},
 						onPetPreview: mode => {
 							this.ctx.previewPetMode(mode as PetMode);
 						},
@@ -1809,6 +1839,8 @@ export class SelectorController {
 	showThemeSelector(): void {
 		getAvailableThemes().then(availableThemes => {
 			const initialTheme = getCurrentThemeName() ?? "red-claw";
+			const settingsPath = getDetectedThemeSettingsPath();
+			const savedTheme = settings.get(settingsPath);
 			this.showSelector(done => {
 				const restoreAndClose = () => {
 					void restoreThemePreview(initialTheme).then(result => {
@@ -1831,7 +1863,7 @@ export class SelectorController {
 							return;
 						}
 						try {
-							settings.set(getDetectedThemeSettingsPath(), themeName);
+							settings.set(settingsPath, themeName);
 						} catch (error) {
 							if (!settings.canWriteDurableConfig()) {
 								this.ctx.showError(error instanceof Error ? error.message : String(error));
@@ -1840,8 +1872,21 @@ export class SelectorController {
 							}
 							throw error;
 						}
-						this.#refreshThemeUi();
-						done();
+						void restoreThemePreview(themeName).then(result => {
+							if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
+								this.ctx.showError(`Failed to apply theme: ${result.error}`);
+								settings.set(settingsPath, savedTheme);
+								void restoreThemePreview(initialTheme).then(recovery => {
+									if (!recovery.success && recovery.error && !isThemePreviewSuperseded(recovery)) {
+										this.ctx.showError(`Failed to restore theme preview: ${recovery.error}`);
+									}
+									this.#refreshThemeUi();
+								});
+								return;
+							}
+							this.#refreshThemeUi();
+							done();
+						});
 					},
 					restoreAndClose,
 					themeName => {
@@ -1860,7 +1905,7 @@ export class SelectorController {
 
 	showPetSelector(): void {
 		const stored = settings.get("pet.mode");
-		const initial: PetMode = isPetMode(stored) ? stored : "off";
+		const initial: PetMode = resolvePetMode(stored);
 		this.showSelector(done => {
 			// Live-preview via previewMode (no editor re-mount, so the overlay stays);
 			// Enter commits + persists, Esc restores the initial skin.
@@ -2043,6 +2088,17 @@ export class SelectorController {
 					this.ctx.ui.invalidate();
 					if (!result.success) {
 						this.ctx.showError(`Failed to load theme "${value}": ${result.error}\nFell back to dark theme.`);
+					}
+				});
+				break;
+			}
+			case "theme.dark":
+			case "theme.light": {
+				restoreThemePreview(value as string).then(result => {
+					if (this.ctx.isStopped?.()) return;
+					this.#refreshThemeUi();
+					if (!result.success && result.error && !isThemePreviewSuperseded(result)) {
+						this.ctx.showError(`Failed to apply theme "${value}": ${result.error}`);
 					}
 				});
 				break;

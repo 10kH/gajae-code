@@ -1,10 +1,11 @@
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { SettingPath } from "@gajae-code/coding-agent/config/settings";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
-import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
+import { initTheme, previewTheme, restoreThemePreview, theme } from "@gajae-code/coding-agent/modes/theme/theme";
 
 const THEMES = ["red-claw", "blue-crab"];
+const ORIGINAL_COLORTERM = Bun.env.COLORTERM;
 
 type ChangedSetting = {
 	path: SettingPath;
@@ -16,10 +17,20 @@ type SelectorHarness = {
 	previewedThemes: string[];
 	restoredThemes: string[];
 	changedSettings: ChangedSetting[];
+	committedThemes: string[];
 };
 
 beforeAll(async () => {
+	Bun.env.COLORTERM = "truecolor";
 	await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
+});
+
+afterAll(() => {
+	if (ORIGINAL_COLORTERM === undefined) {
+		delete Bun.env.COLORTERM;
+	} else {
+		Bun.env.COLORTERM = ORIGINAL_COLORTERM;
+	}
 });
 
 beforeEach(async () => {
@@ -38,6 +49,7 @@ function createSelector(): SelectorHarness {
 	const previewedThemes: string[] = [];
 	const restoredThemes: string[] = [];
 	const changedSettings: ChangedSetting[] = [];
+	const committedThemes: string[] = [];
 	const component = new SettingsSelectorComponent(
 		{
 			availableThinkingLevels: [],
@@ -56,11 +68,17 @@ function createSelector(): SelectorHarness {
 			onThemePreviewCancel: themeName => {
 				restoredThemes.push(themeName);
 			},
+			onThemeCommit: async (path, themeName) => {
+				committedThemes.push(themeName);
+				settings.set(path, themeName);
+				changedSettings.push({ path, value: themeName });
+				return true;
+			},
 			onCancel: () => {},
 			getStatusLinePreview: () => "status-preview",
 		},
 	);
-	return { component, previewedThemes, restoredThemes, changedSettings };
+	return { component, previewedThemes, restoredThemes, changedSettings, committedThemes };
 }
 
 describe("SettingsSelectorComponent theme selection", () => {
@@ -74,6 +92,34 @@ describe("SettingsSelectorComponent theme selection", () => {
 		expect(restoredThemes).toEqual([]);
 		expect(changedSettings).toEqual([]);
 		expect(settings.get("theme.dark")).toBe("red-claw");
+	});
+
+	it("recolors the open Settings theme submenu while previewing", async () => {
+		const component = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [],
+				thinkingLevel: undefined,
+				availableThemes: THEMES,
+				availableModelProfiles: [],
+				cwd: process.cwd(),
+			},
+			{
+				onChange: () => {},
+				onThemePreview: themeName => previewTheme(themeName).then(() => {}),
+				onThemePreviewCancel: themeName => restoreThemePreview(themeName).then(() => {}),
+				onCancel: () => {},
+				getStatusLinePreview: () => "status-preview",
+			},
+		);
+
+		component.handleInput("\n");
+		component.handleInput("\x1b[B");
+		await Bun.sleep(1);
+
+		const title = component.render(120).find(line => Bun.stripANSI(line).includes("Dark Theme"));
+		expect(title).toContain(theme.getFgAnsi("accent"));
+		expect(theme.getFgAnsi("accent")).toBe("\u001b[38;2;94;200;255m");
+		await restoreThemePreview("red-claw");
 	});
 
 	it("restores the pre-preview rendered theme on cancel and leaves dark settings unchanged", () => {
@@ -104,6 +150,35 @@ describe("SettingsSelectorComponent theme selection", () => {
 		const rendered = component.render(120).join("\n");
 		expect(rendered).toContain("Dark Theme");
 		expect(rendered).toContain("blue-crab");
+	});
+
+	it("keeps the submenu and persisted mapping unchanged when theme confirmation fails", async () => {
+		const component = new SettingsSelectorComponent(
+			{
+				availableThinkingLevels: [],
+				thinkingLevel: undefined,
+				availableThemes: THEMES,
+				availableModelProfiles: [],
+				cwd: process.cwd(),
+			},
+			{
+				onChange: () => {
+					throw new Error("generic change callback must not own theme persistence");
+				},
+				onThemePreview: () => {},
+				onThemePreviewCancel: () => {},
+				onThemeCommit: async () => false,
+				onCancel: () => {},
+			},
+		);
+
+		component.handleInput("\n");
+		component.handleInput("\x1b[B");
+		component.handleInput("\n");
+		await Bun.sleep(1);
+
+		expect(settings.get("theme.dark")).toBe("red-claw");
+		expect(component.render(120).join("\n")).toContain("Enter to select");
 	});
 
 	it("keeps light theme preview independent from persisted light settings", () => {
