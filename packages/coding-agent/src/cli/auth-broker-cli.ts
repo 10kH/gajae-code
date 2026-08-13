@@ -33,7 +33,7 @@ import {
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "@gajae-code/ai/core";
-import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, isEnoent, logger, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, logger, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import {

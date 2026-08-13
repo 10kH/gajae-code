@@ -21,7 +21,7 @@ async function validateDirectory(directory: string): Promise<void> {
 }
 
 async function validateTokenPath(file: string): Promise<boolean> {
-	let stat;
+	let stat: Awaited<ReturnType<typeof fs.lstat>>;
 	try {
 		stat = await fs.lstat(file);
 	} catch (error) {

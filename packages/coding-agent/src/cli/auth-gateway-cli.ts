@@ -28,7 +28,7 @@ import {
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
 } from "@gajae-code/ai/core";
-import { getConfigRootDir, isEnoent, VERSION } from "@gajae-code/utils";
+import { getConfigRootDir, VERSION } from "@gajae-code/utils";
 import chalk from "chalk";
 import {
 	createSecureTokenFileExclusive,
