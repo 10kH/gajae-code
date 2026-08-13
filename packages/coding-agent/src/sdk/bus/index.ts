@@ -7658,8 +7658,7 @@ export function createNotificationsExtension(
 				runtime.pendingFinal = undefined;
 				runtime.pendingSettled = undefined;
 				terminalizeInFlightTools(runtime, runtime.id, "cancelled", true);
-			}
-			else if (wasPolicySuspended && !policy.redact) settleProvisionalToolTerminals(runtime, runtime.id);
+			} else if (wasPolicySuspended && !policy.redact) settleProvisionalToolTerminals(runtime, runtime.id);
 		},
 		activate: binding => {
 			const runtime = runtimes.get(binding.sessionId);
