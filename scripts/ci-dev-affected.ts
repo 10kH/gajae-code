@@ -240,6 +240,7 @@ export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
 	const tasks = new Map<string, Task>();
 	addNativeBuild(tasks);
 	addWorkspaceTestTasks(tasks, packages);
+	add(tasks, "test:scripts/run-bun-test-files.test.ts", "Test fresh-process Bun harness", ["bun", "test", "scripts/run-bun-test-files.test.ts"]);
 	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 	addRustTestTasks(tasks);
 	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
@@ -792,7 +793,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	}
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
-		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
+		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
 		add(tasks, "workflow-permissions", "Workflow permission policy regression", ["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
 		if (paths.some(isWorkflowPath)) {
 			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);

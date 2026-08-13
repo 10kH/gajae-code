@@ -58,9 +58,9 @@ describe("fresh-process test harness contracts", () => {
 		]);
 	});
 
-	test("keeps generated source-bound evidence out of the package runtime suite", async () => {
+	test("keeps every AI test-shaped file in the package runtime suite", async () => {
 		const files = await enumerateTestFiles("packages/ai", path.join(import.meta.dir, ".."));
-		expect(files).not.toContain("packages/ai/test/anthropic-cache-eval.integration.test.ts");
+		expect(files).toContain("packages/ai/test/anthropic-cache-eval.integration.test.ts");
 	});
 
 	test("keeps Bun shard assignment deterministic", () => {
@@ -81,6 +81,8 @@ describe("fresh-process test harness contracts", () => {
 				ANTHROPIC_API_KEY: "host-secret",
 				ANTHROPIC_BASE_URL: "https://host.invalid",
 				GEMINI_API_KEY: "host-secret",
+				MISTRAL_API_KEY: "host-secret",
+				AWS_SECRET_ACCESS_KEY: "host-secret",
 				OPENAI_API_KEY: "host-secret",
 			},
 		);
@@ -105,6 +107,8 @@ describe("fresh-process test harness contracts", () => {
 		expect(spec.env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(spec.env.ANTHROPIC_BASE_URL).toBeUndefined();
 		expect(spec.env.GEMINI_API_KEY).toBeUndefined();
+		expect(spec.env.MISTRAL_API_KEY).toBeUndefined();
+		expect(spec.env.AWS_SECRET_ACCESS_KEY).toBeUndefined();
 		expect(spec.env.OPENAI_API_KEY).toBeUndefined();
 	});
 

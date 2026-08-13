@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import * as fs from "node:fs/promises";
+import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -43,17 +44,10 @@ export interface LinuxProcessIdentity {
 const repoRoot = path.join(import.meta.dir, "..");
 const TEST_FILE_PATTERN = /(?:^|\/)(?:[^/]+\.(?:test|spec)|(?:test|spec)_[^/]+)\.(?:[cm]?[jt]sx?)$/u;
 const PROVIDER_ENDPOINT_ENV = [
-	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_BASE_URL",
-	"ANTHROPIC_AUTH_TOKEN",
-	"ANTHROPIC_OAUTH_TOKEN",
-	"AZURE_OPENAI_API_KEY",
 	"E2E",
-	"GEMINI_API_KEY",
 	"GJC_E2E_GATEWAY_URL",
-	"GOOGLE_API_KEY",
 	"OPENAI_BASE_URL",
-	"OPENAI_API_KEY",
 ] as const;
 const INHERITED_GJC_STATE_ENV = [
 	"GJC_AGENT_DIR",
@@ -66,10 +60,17 @@ const INHERITED_GJC_STATE_ENV = [
 	"GJC_LIFECYCLE_REQUEST_ID",
 	"GJC_SDK_LIFECYCLE_REQUEST",
 ] as const;
-// This deterministic evidence oracle is scheduled directly by its owning
-// artifact path. Running it in every package-wide AI suite would bind unrelated
-// source changes to a stale committed blob hash.
-const EXCLUDED_TEST_FILES = new Set(["packages/ai/test/anthropic-cache-eval.integration.test.ts"]);
+const CREDENTIAL_ENV_SUFFIXES = ["_API_KEY", "_AUTH_TOKEN", "_OAUTH_TOKEN", "_ACCESS_TOKEN"] as const;
+const CREDENTIAL_ENV_NAMES = new Set([
+	"AWS_ACCESS_KEY_ID",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_SESSION_TOKEN",
+	"GOOGLE_APPLICATION_CREDENTIALS",
+]);
+
+function isCredentialEnvironmentName(name: string): boolean {
+	return CREDENTIAL_ENV_NAMES.has(name) || CREDENTIAL_ENV_SUFFIXES.some(suffix => name.endsWith(suffix));
+}
 
 function usage(message?: string): never {
 	if (message) process.stderr.write(`${message}\n`);
@@ -126,7 +127,6 @@ export async function enumerateTestFiles(root: string, base: string = repoRoot):
 		const normalized = entry.split(path.sep).join("/");
 		if (!TEST_FILE_PATTERN.test(normalized)) continue;
 		const file = path.posix.join(relativeRoot.split(path.sep).join("/"), normalized);
-		if (EXCLUDED_TEST_FILES.has(file)) continue;
 		files.push(file);
 	}
 	return files.sort();
@@ -147,6 +147,9 @@ export function buildTestProcessSpec(
 	const home = path.join(sandbox, "home");
 	const env: NodeJS.ProcessEnv = { ...parentEnv };
 	for (const name of PROVIDER_ENDPOINT_ENV) env[name] = undefined;
+	for (const name of Object.keys(env)) {
+		if (isCredentialEnvironmentName(name)) env[name] = undefined;
+	}
 	for (const name of INHERITED_GJC_STATE_ENV) env[name] = undefined;
 	return {
 		argv: ["bun", "test", `--timeout=${testTimeoutMs}`, "--preload", TEST_PRELOAD, `./${file}`],
@@ -174,6 +177,21 @@ export function buildTestProcessSpec(
 export async function probeLinuxProcess(pid: number): Promise<LinuxProcessIdentity | undefined> {
 	try {
 		const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const state = fields[0];
+		const processGroup = Number(fields[2]);
+		const startTime = fields[19];
+		if (!state || !Number.isSafeInteger(processGroup) || !startTime) throw new Error(`Malformed /proc/${pid}/stat.`);
+		return { pid, processGroup, startTime, state };
+	} catch (error) {
+		if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
+		throw error;
+	}
+}
+
+function probeLinuxProcessSync(pid: number): LinuxProcessIdentity | undefined {
+	try {
+		const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
 		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
 		const state = fields[0];
 		const processGroup = Number(fields[2]);
@@ -268,8 +286,10 @@ export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
 		stderr: "inherit",
 		detached: process.platform !== "win32",
 	});
-	activeChildren.set(child, undefined);
-	const leader = process.platform === "linux" ? await probeLinuxProcess(child.pid) : undefined;
+	// Signal handlers cannot run between these synchronous statements. Capture
+	// Linux start identity before publishing the child as active, so every visible
+	// entry is identity-bound and a reused pid/process-group is never signalled.
+	const leader = process.platform === "linux" ? probeLinuxProcessSync(child.pid) : undefined;
 	activeChildren.set(child, leader);
 	let timedOut = false;
 	let timeoutCleanup: Promise<void> | undefined;

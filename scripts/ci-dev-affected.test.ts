@@ -606,6 +606,7 @@ describe("describeTasks matrix emission", () => {
 				"bun",
 				"test",
 				"scripts/ci-dev-affected.test.ts",
+				"scripts/run-bun-test-files.test.ts",
 				"scripts/dev-ci-guard-topology.test.ts",
 				"scripts/ci-risk-canary-manifest.test.ts",
 				"scripts/ci-virtual-integration.test.ts",
@@ -613,6 +614,11 @@ describe("describeTasks matrix emission", () => {
 		}
 		const riskTasks = planTasks(["packages/coding-agent/src/session/session-manager.ts"], packages);
 		expect(riskTasks.some(task => task.key === "test:packages/coding-agent/test/notifications-live-stream.test.ts")).toBe(true);
+	});
+
+	test("full plan includes the fresh-process harness regression", () => {
+		const task = planFullTasks(packages).find(candidate => candidate.key === "test:scripts/run-bun-test-files.test.ts");
+		expect(task?.command).toEqual(["bun", "test", "scripts/run-bun-test-files.test.ts"]);
 	});
 
 	test("cwd is emitted repo-relative for package-scoped tasks", () => {
