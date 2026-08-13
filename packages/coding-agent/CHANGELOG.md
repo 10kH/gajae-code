@@ -7,6 +7,7 @@
 
 ### Fixed
 ### Fixed
+- Task-launched canonical subagents no longer receive an ACP exact-config `toolsOnly` MCP manager that they are forbidden to reuse. Planner, Architect, Critic, and Ralplan consensus lanes now start normally while reusable plugin MCP managers continue to inherit across sub-sessions.
 - Managed output publication no longer freezes the resident event loop when a no-replace rename stalls in the kernel (#4394). Async managed publication now uses async file operations and native blocking-pool rename/link boundaries, while per-session stores also reap scrubbed protocol remnants on a throttled, serialized schedule. Atomic no-replace semantics and the synchronous publication path are unchanged.
 - The SDK broker's Windows process-liveness probe no longer opens a console window on every poll. `runProcessIncarnationCommand` spawned `powershell.exe` without `windowsHide`, and on Windows 11 — where the default terminal delegation hands every new console to Windows Terminal — each probe therefore created a visible terminal window that stole focus. The PowerShell path runs whenever the native reader cannot bind the target pid, so one dead or inaccessible pid turned the broker's ~2s liveness polling into a continuous window flash for the life of the process. Every other internal spawn in the repo already passed `windowsHide: true`; this one did not.
 ## [0.13.1] - 2026-08-11
