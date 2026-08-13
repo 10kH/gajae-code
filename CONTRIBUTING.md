@@ -67,7 +67,7 @@ The `CI` workflow publishes a scheduled nightly prerelease from `main` at 04:23 
 
 Every pull request to `dev` must keep exactly one `gajae.pr-review-verdict.v1` line from the pull request template. The `PR contract / Validate exact-head PR contract` status is produced by a narrowly scoped `pull_request_target` workflow loaded from the trusted default branch. It has read-only permissions, receives no secrets, consumes no caches or artifacts, and executes only the base-owned validator while inspecting the event's immutable base and exact head. The validator recomputes the binary diff digest, requires the head to contain the base, runs the fast GJC state-writer scan against the PR-head bytes, and rejects self-approved `merge-approved` verdicts. `needs-human` and `merge-blocked` are valid review states but intentionally keep the status red until an independent reviewer records `merge-approved` for the current head.
 
-The first PR that introduces this workflow is a two-phase bootstrap: existing exact-head CI and independent review prove the proposed validator, and trusted enforcement activates only after that reviewed change lands on `dev`. A PR-authored workflow is never treated as enforcement authority. Repository owners should require the stable status name in branch protection when branch protection is enabled.
+The first PR that introduces this workflow is a two-phase bootstrap. Phase 1 is the trusted `Dev CI / PR contract bootstrap` job, whose inline validation already exists in the base workflow and validates the exact head without executing PR-authored code. The new `PR contract` consumer remains disabled in that landing. Phase 2, after the workflow and validator exist on default-branch `dev`, enables the base-owned consumer and replaces the ruleset requirement with `PR contract / Validate exact-head PR contract`. A PR-authored workflow is never treated as enforcement authority.
 
 After the final commit and rebase, compute the digest with:
 
@@ -78,7 +78,7 @@ git diff --binary --full-index --no-ext-diff origin/dev...HEAD | sha256sum
 bun scripts/verify-gjc-state-writers.ts --fail
 ```
 
-The verdict line must use the resulting lowercase digest and name an independent reviewer identity:
+The verdict line must use the resulting lowercase digest and name the independent GitHub reviewer whose effective `APPROVED` review targets the exact PR head:
 
 ```text
 gajae.pr-review-verdict.v1 merge-approved sha256:<64-hex-digest> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<review-or-CI-reference>

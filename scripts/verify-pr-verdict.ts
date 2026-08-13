@@ -150,9 +150,13 @@ async function authenticatedApproval(event: PullRequestEvent, reviewerId: string
 		reviews.push(...pageReviews);
 		if (pageReviews.length < 100) break;
 	}
-	const reviewerReviews = reviews.filter(review => review.user?.login?.toLowerCase() === reviewerId.toLowerCase());
+	const reviewerReviews = reviews.filter(review =>
+		review.user?.login?.toLowerCase() === reviewerId.toLowerCase()
+		&& review.state !== "COMMENTED"
+		&& review.commit_id === headSha,
+	);
 	const approval = reviewerReviews.at(-1);
-	if (approval?.state !== "APPROVED" || approval.commit_id !== headSha) return {};
+	if (approval?.state !== "APPROVED") return {};
 	return approval ? { login: approval.user!.login, headSha: approval.commit_id } : {};
 }
 
