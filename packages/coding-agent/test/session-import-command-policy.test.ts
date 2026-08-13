@@ -1,9 +1,13 @@
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
+import * as nodeFs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { ACP_BUILTIN_SLASH_COMMANDS, executeAcpBuiltinSlashCommand } from "../src/slash-commands/acp-builtins";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
@@ -16,6 +20,41 @@ import type {
 	SlashCommandRuntime,
 	TuiSlashCommandRuntime,
 } from "../src/slash-commands/types";
+
+/**
+ * Writes the SDK session endpoint file and the session-index registration event
+ * so the SessionRouter's reconciliation can find and publish the adopted
+ * session. The current router requires exact endpoint/session-identity
+ * authority, so the fixture must materialise both surfaces.
+ */
+async function publishBrokerSession(
+	agentDir: string,
+	cwd: string,
+	sessionId: string,
+	pid: number,
+	endpointGeneration: number,
+	endpointMtimeMs: number,
+): Promise<void> {
+	const stateRoot = path.join(cwd, ".gjc", "state");
+	const sessionsDir = path.join(agentDir, "sdk", "sessions");
+	await fs.mkdir(sessionsDir, { recursive: true });
+	const indexFile = path.join(sessionsDir, "index.jsonl");
+	const incarnation = processIncarnation(pid);
+	const event = {
+		version: 1,
+		indexSeq: 1,
+		type: "host_registered" as const,
+		sessionId,
+		locator: { repo: cwd, stateRoot },
+		endpointGeneration,
+		pid,
+		...(incarnation !== undefined ? { hostIncarnation: incarnation } : {}),
+		endpointMtimeMs,
+		ts: Date.now(),
+	};
+	const checksum = createHash("sha256").update(JSON.stringify(event)).digest("hex");
+	await fs.writeFile(indexFile, `${JSON.stringify({ ...event, checksum })}\n`, "utf8");
+}
 
 type AcpPromptFixture = {
 	agent: AcpAgent;
@@ -50,7 +89,7 @@ async function createAcpPromptFixture(): Promise<AcpPromptFixture> {
 			open(socket) {
 				socket.send(JSON.stringify({ type: "hello", connectionId: "acp-import-policy" }));
 			},
-			message(socket, raw) {
+			async message(socket, raw) {
 				const frame = JSON.parse(String(raw)) as Record<string, unknown>;
 				if (frame.type === "register_provider") {
 					socket.send(
@@ -59,11 +98,28 @@ async function createAcpPromptFixture(): Promise<AcpPromptFixture> {
 					return;
 				}
 				if (frame.type === "broker_request") {
-					const result =
-						frame.operation === "session.create"
-							? { sessionId, endpoint: { url: `ws://127.0.0.1:${server.port}`, token } }
-							: {};
-					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+					if (frame.operation === "session.create") {
+						const url = `ws://127.0.0.1:${server.port}`;
+						const sdkDir = path.join(cwd, ".gjc", "state", "sdk");
+						nodeFs.mkdirSync(sdkDir, { recursive: true });
+						const endpointFile = path.join(sdkDir, `${sessionId}.json`);
+						nodeFs.writeFileSync(
+							endpointFile,
+							JSON.stringify({ version: 1, sessionId, url, token, pid: process.pid }),
+						);
+						const endpointMtimeMs = nodeFs.statSync(endpointFile).mtimeMs;
+						const result = {
+							sessionId,
+							endpointGeneration: 1,
+							pid: process.pid,
+							endpointMtimeMs,
+							endpoint: { sessionId, pid: process.pid, url, token },
+						};
+						await publishBrokerSession(agentDir, cwd, sessionId, process.pid, 1, endpointMtimeMs);
+						socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result }));
+						return;
+					}
+					socket.send(JSON.stringify({ type: "broker_response", id: frame.id, ok: true, result: {} }));
 					return;
 				}
 				if (frame.type === "query_request") {
@@ -85,6 +141,10 @@ async function createAcpPromptFixture(): Promise<AcpPromptFixture> {
 									? { page: { items: [{ sessionId, name: "ACP import policy", cwd }], complete: true } }
 									: { page: { items, complete: true } };
 					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, result }));
+					return;
+				}
+				if (frame.type === "event_replay") {
+					socket.send(JSON.stringify({ type: "event_replay_result", id: frame.id, events: [] }));
 					return;
 				}
 				if (frame.type !== "control_request") return;
