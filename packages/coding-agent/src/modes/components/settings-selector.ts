@@ -5,6 +5,7 @@ import {
 	Container,
 	Input,
 	matchesKey,
+	resolvePetMode,
 	type SelectItem,
 	SelectList,
 	type SettingItem,
@@ -27,6 +28,7 @@ import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } 
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
 import { DynamicBorder } from "./dynamic-border";
+import { DynamicThemeText } from "./dynamic-theme-text";
 import { GjcBundleSettingsComponent } from "./gjc-bundle-settings";
 import {
 	type NotificationsEditorOperations,
@@ -101,18 +103,18 @@ class SelectSubmenu extends Container {
 		super();
 
 		// Title
-		this.addChild(new Text(theme.bold(theme.fg("accent", title)), 0, 0));
+		this.addChild(new DynamicThemeText(() => theme.bold(theme.fg("accent", title))));
 
 		// Description
 		if (description) {
 			this.addChild(new Spacer(1));
-			this.addChild(new Text(theme.fg("muted", description), 0, 0));
+			this.addChild(new DynamicThemeText(() => theme.fg("muted", description)));
 		}
 
 		// Preview (if provided)
 		if (getPreview) {
 			this.addChild(new Spacer(1));
-			this.addChild(new Text(theme.fg("muted", "Preview:"), 0, 0));
+			this.addChild(new DynamicThemeText(() => theme.fg("muted", "Preview:")));
 			this.#previewText = new Text(getPreview(), 0, 0);
 			this.addChild(this.#previewText);
 		}
@@ -121,7 +123,7 @@ class SelectSubmenu extends Container {
 		this.addChild(new Spacer(1));
 
 		// Select list
-		this.#selectList = new SelectList(options, Math.min(options.length, 10), getSelectListTheme());
+		this.#selectList = new SelectList(options, Math.min(options.length, 10), () => getSelectListTheme());
 
 		// Pre-select current value
 		const currentIndex = options.findIndex(o => o.value === currentValue);
@@ -157,7 +159,7 @@ class SelectSubmenu extends Container {
 
 		// Hint
 		this.addChild(new Spacer(1));
-		this.addChild(new Text(theme.fg("dim", "  Enter to select · Esc to go back"), 0, 0));
+		this.addChild(new DynamicThemeText(() => theme.fg("dim", "  Enter to select · Esc to go back")));
 	}
 
 	#updatePreview(): void {
@@ -708,6 +710,11 @@ export interface SettingsCallbacks {
 	onThemePreview?: (theme: string) => void | Promise<void>;
 	/** Called to restore the rendered theme when theme settings preview is cancelled */
 	onThemePreviewCancel?: (theme: string) => void | Promise<void>;
+	/**
+	 * Atomically apply and persist a theme selection. Returns false when the
+	 * candidate could not be loaded, leaving the submenu open.
+	 */
+	onThemeCommit?: (path: "theme.dark" | "theme.light", theme: string, previousTheme: string) => Promise<boolean>;
 	/** Called to live-preview the gajae pet skin while browsing the pet setting. */
 	onPetPreview?: (mode: string) => void;
 	/**
@@ -971,6 +978,7 @@ export class SettingsSelectorComponent extends Container {
 		}
 		let description = def.description;
 		if (def.path === "pet.mode") {
+			currentValue = resolvePetMode(currentValue);
 			const petAvailable = this.context.petAvailable ?? isPetAvailable();
 			options = createPetSelectItems(options, currentValue, petAvailable);
 			// Unsupported terminals must see the same actionable guidance the
@@ -1070,6 +1078,13 @@ export class SettingsSelectorComponent extends Container {
 				if (def.path === "modelProfile.default") {
 					this.callbacks.onChange(def.path, value);
 					done(value);
+					return;
+				}
+				if (def.path === "theme.dark" || def.path === "theme.light") {
+					if (!this.callbacks.onThemeCommit) return;
+					void this.callbacks.onThemeCommit(def.path, value, currentValue).then(accepted => {
+						if (accepted) done(value);
+					});
 					return;
 				}
 				if (def.path === "pet.mode") {

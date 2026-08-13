@@ -11,6 +11,7 @@
 ## [0.13.2] - 2026-08-13
 
 ### Added
+- Added the bundled Ouroboros theme and pet, including transactional theme selection and RedGajae fallback (#4468).
 
 - Added a portable Stream Deck integration for cmux sessions, including a plugin manifest, reusable profile pages, action icons, installation scripts, and a guided setup document (#4308 by @Yeachan-Heo).
 - `/theme <name>` now switches the theme immediately without opening the selector. The name is validated against built-in and custom themes, persisted to the detected `theme.dark`/`theme.light` slot, and applied to the running session in one step (#4429 by @Yeachan-Heo).

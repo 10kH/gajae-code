@@ -35,6 +35,7 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 	const themeRuntime = await readText("packages/coding-agent/src/modes/theme/theme.ts");
 	const redClaw = await readJson("packages/coding-agent/src/modes/theme/defaults/red-claw.json");
 	const blueCrab = await readJson("packages/coding-agent/src/modes/theme/defaults/blue-crab.json");
+	const ouroboros = await readJson("packages/coding-agent/src/modes/theme/defaults/ouroboros.json");
 	const defaultIndex = await readText("packages/coding-agent/src/modes/theme/defaults/index.ts");
 	const colors = isRecord(redClaw.colors) ? redClaw.colors : {};
 	const vars = isRecord(redClaw.vars) ? redClaw.vars : {};
@@ -50,7 +51,7 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 		.filter(([left, right]) => resolveColor(colors[left], vars) === resolveColor(colors[right], vars))
 		.map(([left, right]) => `${left} matches ${right}`);
 
-	const expectedBuiltIns = ["blue-crab", "claude-code", "codex", "gruvbox-dark", "opencode", "red-claw"];
+	const expectedBuiltIns = ["blue-crab", "claude-code", "codex", "gruvbox-dark", "opencode", "ouroboros", "red-claw"];
 	const retainedBuiltIns =
 		[...defaultIndex.matchAll(/^import /gm)].length === expectedBuiltIns.length &&
 		[...defaultIndex.matchAll(/^\t/gm)].length === expectedBuiltIns.length &&
@@ -59,10 +60,12 @@ async function verifyThemeDefaults(): Promise<GateResult> {
 		defaultIndex.includes("\tcodex,") &&
 		defaultIndex.includes('"gruvbox-dark": gruvbox_dark') &&
 		defaultIndex.includes("\topencode,") &&
+		defaultIndex.includes("\touroboros,") &&
 		defaultIndex.includes('"red-claw": red_claw') &&
 		!defaultIndex.includes("dark_") &&
 		!defaultIndex.includes("light_") &&
-		isRecord(blueCrab.colors);
+		isRecord(blueCrab.colors) &&
+		isRecord(ouroboros.colors);
 
 	return {
 		name: "red-claw/blue-crab theme defaults and semantic token split",
