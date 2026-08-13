@@ -90,6 +90,8 @@ export interface Args {
 	unknownFlags: Map<string, boolean | string>;
 	/** Exact interactive startup login intent, recognized before model-profile activation. */
 	authBootstrap?: true;
+	/** Launch the session in master mode (resident session supervisor; `gjc master`). */
+	master?: boolean;
 }
 
 const CONSUMER_FLAGS_BY_ARGS = new WeakMap<Args, Map<ConsumerLaunchFlagName, string>>();
@@ -136,6 +138,7 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 		unknownFlags: new Map(),
 	};
 	const consumerFlags = new Map<ConsumerLaunchFlagName, string>();
+	let masterSeen = false;
 
 	for (let i = 0; i < args.length; i++) {
 		let arg = args[i];
@@ -355,6 +358,11 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 			result.noRules = true;
 		} else if (arg === "--no-title") {
 			result.noTitle = true;
+		} else if (arg === "--master") {
+			if (hasInlineValue) throw new CliParseError("--master does not accept a value");
+			if (masterSeen) throw new CliParseError("--master can only be specified once");
+			masterSeen = true;
+			result.master = true;
 		} else if (arg === "--list-models") {
 			// Check if next arg is a search pattern (not a flag or file arg)
 			if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")) {
@@ -383,6 +391,14 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 	if (result.mcpConfig !== undefined && (result.listModels !== undefined || result.export !== undefined)) {
 		throw new CliParseError(
 			"--mcp-config is only supported in standalone interactive, tmux, print, text, or json modes.",
+		);
+	}
+	if (result.master === true && result.mode === "acp") {
+		throw new CliParseError("--master is only supported for local interactive/print launches, not --mode acp.");
+	}
+	if (result.master === true && result.resume === true) {
+		throw new CliParseError(
+			"Master mode requires --resume <recorded-master-id> or --continue; the session picker is disabled.",
 		);
 	}
 
