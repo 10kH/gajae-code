@@ -175,7 +175,7 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 				await seedRemnant(dir, `${REMNANT_PREFIX}aged-${index}`, 60 * 60 * 1000);
 			}
 			const syncResult = reapScrubbedProtocolRemnantsSync(dir);
-			expect(asyncResult).toEqual(syncResult);
+			expect(asyncResult.reaped).toBe(syncResult);
 			expect(asyncResult).toEqual({ reaped: 4, failures: 0 });
 		});
 	});

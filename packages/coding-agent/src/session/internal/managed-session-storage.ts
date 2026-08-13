@@ -9,6 +9,7 @@ import type {
 	RecoveryFsIdentity,
 	RecoveryFsRoot,
 } from "@gajae-code/natives";
+import { isEnoent, logger } from "@gajae-code/utils";
 import type { SessionStorageRangeSnapshot, SessionStorageStat } from "../session-storage";
 import {
 	classifyNativePublishOutcome,
