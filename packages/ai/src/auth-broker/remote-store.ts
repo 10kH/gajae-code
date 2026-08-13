@@ -8,16 +8,19 @@
  * runs isn't required.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 
-import { logger } from "@gajae-code/utils";
+import { getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import {
 	type AuthCredential,
 	type AuthCredentialIfAbsentResult,
 	type AuthCredentialSnapshotEntry,
 	type AuthCredentialStore,
 	assertCanonicalMCPOAuthBinding,
+	type CachedCredentialHealth,
 	type CachedUsagePresentation,
 	type CredentialInventoryRecord,
 	type MCPOAuthRefreshClient,
@@ -71,6 +74,8 @@ const BACKGROUND_BACKOFF_INITIAL_MS = 500;
 const BACKGROUND_BACKOFF_MAX_MS = 30_000;
 const PRESENTATION_FRESH_MS = 5 * 60_000;
 const PRESENTATION_RETENTION_MS = 24 * 60 * 60_000;
+const PRESENTATION_SIDECAR_VERSION = 1;
+const DEFAULT_PRESENTATION_SIDECAR = path.join(getConfigRootDir(), "auth-broker-presentations.json");
 
 function emptySnapshot(): SnapshotResponse {
 	return {
@@ -97,6 +102,38 @@ interface UsageCacheEntry {
 	fetchedAt: number;
 }
 
+interface PersistedPresentation {
+	credentialId: number;
+	provider: string;
+	identityDigest: string;
+	health?: {
+		v: 1;
+		status: "ok" | "failed" | "unverifiable";
+		reason: string | null;
+		checkedAt?: number;
+		retainUntil: number;
+	};
+	usage?: CachedUsagePresentation;
+}
+
+interface PresentationSidecarFile {
+	version: 1;
+	authorities: Record<string, Record<string, PersistedPresentation>>;
+}
+
+function presentationRecordKey(provider: string, identityDigest: string): string {
+	return `${provider}\u0000${identityDigest}`;
+}
+
+function safePresentationReason(value: unknown): string | null {
+	if (value === null || value === undefined) return null;
+	let reason = value instanceof Error ? value.message : String(value);
+	reason = reason.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
+	reason = reason.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]");
+	reason = reason.replace(/[\r\n\t ]+/g, " ").trim();
+	return reason.length > 256 ? `${reason.slice(0, 253)}...` : reason || null;
+}
+
 export interface RemoteAuthCredentialStoreOptions {
 	client: AuthBrokerClient;
 	/**
@@ -109,6 +146,8 @@ export interface RemoteAuthCredentialStoreOptions {
 	 * to long-poll permanently when the broker returns 404. Default `true`.
 	 */
 	streamSnapshots?: boolean;
+	/** Override the local redacted presentation sidecar path (primarily for tests). */
+	presentationPath?: string;
 }
 
 export class RemoteAuthCredentialStore implements AuthCredentialStore {
@@ -133,6 +172,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#inventorySyncInflight?: Promise<Readonly<CredentialInventoryMetadataState>>;
 	#inventoryMetadataUnsupported = false;
 	#usagePresentations = new Map<number, CachedUsagePresentation>();
+	readonly #presentationPath: string;
+	readonly #presentationAuthority: string;
+	#persistedPresentations = new Map<string, PersistedPresentation>();
+	#sidecarAuthorities: Record<string, Record<string, PersistedPresentation>> = {};
+	#presentationReady: Promise<void>;
+	#presentationWriteChain: Promise<void> = Promise.resolve();
 	#closed = false;
 	/**
 	 * `true` once the SSE consumer received its first frame and hasn't dropped
@@ -147,17 +192,147 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	constructor(opts: RemoteAuthCredentialStoreOptions) {
 		this.#client = opts.client;
 		this.#streamSnapshots = opts.streamSnapshots ?? true;
+		this.#presentationPath = opts.presentationPath ?? DEFAULT_PRESENTATION_SIDECAR;
+		this.#presentationAuthority = createHash("sha256").update(this.#client.baseUrl).digest("hex");
 		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0, false);
 		this.#setInventoryState("pending", this.#generation, {
 			status: "pending",
 			reason: "credential metadata sync pending",
 			generation: this.#generation,
 		});
+		this.#presentationReady = this.#loadPresentationSidecar();
+		this.#scheduleInventoryMetadataSync();
 		void this.#runBackground();
 	}
 
 	get client(): AuthBrokerClient {
 		return this.#client;
+	}
+
+	/** Wait for redacted presentation hydration and initial inventory metadata. */
+	async waitForReady(): Promise<void> {
+		await this.#presentationReady;
+		await this.syncInventoryMetadata();
+	}
+
+	/** Await pending atomic sidecar writes (useful to bounded shutdown callers). */
+	async flushPresentationPersistence(): Promise<void> {
+		await this.#presentationReady;
+		await this.#presentationWriteChain;
+	}
+
+	async #loadPresentationSidecar(): Promise<void> {
+		let raw: string;
+		try {
+			const stat = await fs.lstat(this.#presentationPath);
+			if (stat.isSymbolicLink() || !stat.isFile()) return;
+			raw = await fs.readFile(this.#presentationPath, "utf8");
+		} catch (error) {
+			if (isEnoent(error)) return;
+			logger.debug("auth-broker presentation sidecar unavailable", { error: String(error) });
+			return;
+		}
+		try {
+			const parsed = JSON.parse(raw) as Partial<PresentationSidecarFile>;
+			if (parsed.version !== PRESENTATION_SIDECAR_VERSION || !parsed.authorities) return;
+			this.#sidecarAuthorities = parsed.authorities;
+			const records = this.#sidecarAuthorities[this.#presentationAuthority];
+			if (!records || typeof records !== "object") return;
+			const now = Date.now();
+			for (const [key, candidate] of Object.entries(records)) {
+				if (!candidate || typeof candidate !== "object") continue;
+				const record = candidate as PersistedPresentation;
+				if (!Number.isInteger(record.credentialId) || typeof record.provider !== "string") continue;
+				if (record.health && (!Number.isFinite(record.health.retainUntil) || record.health.retainUntil <= now)) {
+					delete record.health;
+				}
+				if (record.usage && (!Number.isFinite(record.usage.retainUntil) || record.usage.retainUntil <= now)) {
+					delete record.usage;
+				}
+				if (!record.health && !record.usage) continue;
+				this.#persistedPresentations.set(key, record);
+			}
+			this.#reconcilePersistedPresentations();
+			this.#hydratePresentations();
+			this.#queuePresentationWrite();
+		} catch (error) {
+			logger.debug("auth-broker presentation sidecar invalid", { error: String(error) });
+		}
+	}
+
+	#hydratePresentations(): void {
+		for (const entry of this.#snapshot.credentials) {
+			const key = presentationRecordKey(entry.provider, this.#identityDigestForEntry(entry));
+			const persisted = this.#persistedPresentations.get(key);
+			if (!persisted) continue;
+			if (persisted.usage) {
+				this.#usagePresentations.set(entry.id, {
+					...persisted.usage,
+					credentialId: entry.id,
+					provider: entry.provider,
+					inventoryGeneration: this.#generation,
+					identityDigest: this.#identityDigestForEntry(entry),
+				});
+			}
+			if (persisted.health && persisted.health.retainUntil <= Date.now()) delete persisted.health;
+		}
+	}
+
+	#reconcilePersistedPresentations(): void {
+		if (this.#persistedPresentations.size === 0) return;
+		let changed = false;
+		const current = new Map(
+			this.#snapshot.credentials.map(entry => [
+				entry.id,
+				{ provider: entry.provider, identityDigest: this.#identityDigestForEntry(entry) },
+			]),
+		);
+		for (const [key, record] of this.#persistedPresentations) {
+			const identity = current.get(record.credentialId);
+			if (
+				!identity ||
+				identity.provider !== record.provider ||
+				key !== presentationRecordKey(identity.provider, identity.identityDigest)
+			) {
+				this.#persistedPresentations.delete(key);
+				changed = true;
+			}
+		}
+		if (changed) this.#queuePresentationWrite();
+	}
+
+	#queuePresentationWrite(): void {
+		const next = this.#presentationWriteChain
+			.catch(() => {})
+			.then(async () => {
+				if (this.#closed) return;
+				const parsed: PresentationSidecarFile = {
+					version: 1,
+					authorities: {
+						...this.#sidecarAuthorities,
+						[this.#presentationAuthority]: Object.fromEntries(this.#persistedPresentations),
+					},
+				};
+				this.#sidecarAuthorities = parsed.authorities;
+				const directory = path.dirname(this.#presentationPath);
+				await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+				if (this.#closed) return;
+				const existing = await fs.lstat(this.#presentationPath).catch(error => {
+					if (isEnoent(error)) return undefined;
+					throw error;
+				});
+				if (existing?.isSymbolicLink() || (existing && !existing.isFile()))
+					throw new Error("Auth-broker presentation sidecar path is unsafe");
+				const temporary = `${this.#presentationPath}.${process.pid}.${randomUUID()}.tmp`;
+				try {
+					await fs.writeFile(temporary, JSON.stringify(parsed), { flag: "wx", mode: 0o600 });
+					await fs.chmod(temporary, 0o600).catch(() => {});
+					await fs.rename(temporary, this.#presentationPath);
+				} finally {
+					await fs.unlink(temporary).catch(() => {});
+				}
+			});
+		this.#presentationWriteChain = next;
 	}
 
 	get snapshot(): SnapshotResponse {
@@ -200,6 +375,8 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				if (scheduleMetadata) this.#scheduleInventoryMetadataSync();
 			}
 		}
+		this.#reconcilePersistedPresentations();
+		this.#hydratePresentations();
 	}
 
 	#setInventoryState(
@@ -524,6 +701,14 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		);
 	}
 
+	/** Logout authority remains on the broker; the client only mirrors its result. */
+	async deleteAuthCredentialsRemote(provider: string, disabledCause: string): Promise<void> {
+		const existing = this.listAuthCredentials(provider);
+		for (const entry of existing) await this.#client.disableCredential(entry.id, disabledCause);
+		this.#removeProviderEntries(provider);
+		this.#maybeRefreshSnapshot("delete");
+	}
+
 	/**
 	 * Upsert a single credential through the broker. The broker server is the
 	 * canonical writer — see `POST /v1/credential`. The redacted snapshot
@@ -577,6 +762,11 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const others = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
 		const incoming = entries.map(entry => ({ ...entry, rotatesInMs: null }));
 		this.#snapshot = { ...this.#snapshot, credentials: [...others, ...incoming] };
+	}
+
+	#removeProviderEntries(provider: string): void {
+		const credentials = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
+		this.#applySnapshot({ ...this.#snapshot, credentials }, this.#generation, false);
 	}
 	#applyCredentialEntry(entry: AuthCredentialSnapshotEntry): void {
 		const incoming = { ...entry, rotatesInMs: null };
@@ -647,7 +837,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credentialId: number,
 		_credential: OAuthCredential,
 		signal?: AbortSignal,
-	): Promise<OAuthCredentials & { mcpBinding?: OAuthCredential["mcpBinding"] }> {
+	): Promise<OAuthCredentials> {
 		let entry: AuthCredentialSnapshotEntry;
 		try {
 			({ entry } = await this.#client.refreshCredential(credentialId, signal));
@@ -678,7 +868,6 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			email: refreshed.email,
 			projectId: refreshed.projectId,
 			enterpriseUrl: refreshed.enterpriseUrl,
-			mcpBinding: refreshed.mcpBinding,
 		};
 	}
 
@@ -738,6 +927,50 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return cloneUsagePresentation(cached);
 	}
 
+	/** Synchronous, zero-network health presentation read backed by the redacted sidecar. */
+	peekCachedCredentialHealth(provider: Provider, credentialId: number): CachedCredentialHealth | undefined {
+		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (!entry || entry.provider !== provider) return undefined;
+		const key = presentationRecordKey(provider, this.#identityDigestForEntry(entry));
+		const health = this.#persistedPresentations.get(key)?.health;
+		if (!health || health.retainUntil <= Date.now()) {
+			if (health) {
+				const record = this.#persistedPresentations.get(key);
+				if (record) {
+					delete record.health;
+					if (!record.usage) this.#persistedPresentations.delete(key);
+					this.#queuePresentationWrite();
+				}
+			}
+			return undefined;
+		}
+		return {
+			status: health.status,
+			reason: health.reason,
+			...(health.checkedAt === undefined ? {} : { checkedAt: health.checkedAt }),
+			retainUntil: health.retainUntil,
+		};
+	}
+
+	/** Persist a safe health result without credential or bearer-token material. */
+	recordCredentialHealth(provider: Provider, credentialId: number, health: CachedCredentialHealth): void {
+		if (health.status === "unknown" || !health.retainUntil || health.retainUntil <= Date.now()) return;
+		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (!entry || entry.provider !== provider) return;
+		const identityDigest = this.#identityDigestForEntry(entry);
+		const key = presentationRecordKey(provider, identityDigest);
+		const record = this.#persistedPresentations.get(key) ?? { credentialId, provider, identityDigest };
+		record.health = {
+			v: 1,
+			status: health.status,
+			reason: safePresentationReason(health.reason),
+			...(health.checkedAt === undefined ? {} : { checkedAt: health.checkedAt }),
+			retainUntil: health.retainUntil,
+		};
+		this.#persistedPresentations.set(key, record);
+		this.#queuePresentationWrite();
+	}
+
 	/** Record a safe usage observation after an explicit broker usage/check call. */
 	recordUsagePresentation(observation: CachedUsagePresentation): void {
 		if (!Number.isInteger(observation.credentialId)) return;
@@ -760,6 +993,32 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			retainUntil: Math.min(observation.retainUntil, observation.fetchedAt + PRESENTATION_RETENTION_MS),
 		});
 		this.#usagePresentations.set(observation.credentialId, stored);
+		const key = presentationRecordKey(observation.provider, observation.identityDigest);
+		const persisted = this.#persistedPresentations.get(key) ?? {
+			credentialId: observation.credentialId,
+			provider: observation.provider,
+			identityDigest: observation.identityDigest,
+		};
+		persisted.usage = stored;
+		this.#persistedPresentations.set(key, persisted);
+		this.#queuePresentationWrite();
+	}
+
+	/** Persist an explicit usage/check report for the current credential identity. */
+	recordCredentialUsage(provider: Provider, credentialId: number, report: SafeUsageReport): void {
+		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (!entry || entry.provider !== provider) return;
+		const fetchedAt = Number.isFinite(report.fetchedAt) ? report.fetchedAt : Date.now();
+		this.recordUsagePresentation({
+			credentialId,
+			provider,
+			inventoryGeneration: this.#generation,
+			identityDigest: this.#identityDigestForEntry(entry),
+			usage: safePresentationUsageReport(report),
+			fetchedAt,
+			freshUntil: fetchedAt + PRESENTATION_FRESH_MS,
+			retainUntil: fetchedAt + PRESENTATION_RETENTION_MS,
+		});
 	}
 
 	/**
@@ -894,6 +1153,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#backgroundAbort.abort();
 		this.#cache.clear();
 		this.#usagePresentations.clear();
+		this.#persistedPresentations.clear();
 		this.#inventoryMetadata.clear();
 		this.#inventorySyncInflight = undefined;
 	}

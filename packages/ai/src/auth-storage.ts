@@ -515,6 +515,17 @@ export interface AuthCredentialStore {
 	peekCachedUsagePresentation?(provider: Provider, credentialId: number): CachedUsagePresentation | undefined;
 	/** Record a safe usage observation after an explicit fetch/check. */
 	recordUsagePresentation?(observation: CachedUsagePresentation): void;
+	/** Read a safe, durable health observation for one credential row. */
+	peekCachedCredentialHealth?(provider: Provider, credentialId: number): CachedCredentialHealth | undefined;
+	/** Persist a safe health observation for one credential row. */
+	recordCredentialHealth?(provider: Provider, credentialId: number, health: CachedCredentialHealth): void;
+	/** Persist a safe usage observation without exposing credential payloads. */
+	recordCredentialUsage?(provider: Provider, credentialId: number, report: SafeUsageReport): void;
+	/**
+	 * Optional readiness hook for stores that must hydrate payload-free metadata
+	 * before one-shot inventory consumers read their first snapshot.
+	 */
+	waitForReady?(): Promise<void>;
 	/**
 	 * Optional store-supplied per-credential usage report lookup. When present,
 	 * `AuthStorage` consults this before its own per-credential upstream fetch
@@ -559,6 +570,12 @@ export interface AuthCredentialStore {
 	 * `replaceAuthCredentialsForProvider`.
 	 */
 	replaceAuthCredentialsRemote?(provider: string, credentials: AuthCredential[]): Promise<StoredAuthCredential[]>;
+	/**
+	 * Optional async write hook for clearing every credential for a provider
+	 * (logout or a provider-wide invalidation). Remote stores must perform this
+	 * through their authoritative broker rather than mutating the client cache.
+	 */
+	deleteAuthCredentialsRemote?(provider: string, disabledCause: string): Promise<void>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1913,6 +1930,7 @@ export class AuthStorage {
 	 * Reload credentials from storage.
 	 */
 	async reload(): Promise<void> {
+		await this.#store.waitForReady?.();
 		const records = this.#store.listAuthCredentials();
 		const grouped = new Map<string, StoredCredential[]>();
 		for (const record of records) {
@@ -2022,6 +2040,7 @@ export class AuthStorage {
 			for (const entry of removed) {
 				this.#store.deleteAuthCredential(entry.id, "deduplicated duplicate credential");
 			}
+			this.#clearSelectorsForRemovedCredential(provider, new Set(removed.map(entry => entry.id)), entries);
 			this.#resetProviderAssignments(provider);
 		}
 		return kept.reverse();
@@ -2391,6 +2410,7 @@ export class AuthStorage {
 		if (!disabled) return false;
 		const updated = entries.filter((_value, idx) => idx !== index);
 		this.#setStoredCredentials(provider, updated);
+		this.#clearSelectorsForRemovedCredential(provider, new Set([target.id]), entries);
 		this.#resetProviderAssignments(provider);
 		this.#emitCredentialDisabled({ provider, disabledCause });
 		return true;
@@ -2420,8 +2440,28 @@ export class AuthStorage {
 			provider,
 			entries.filter(entry => entry.id !== credentialId),
 		);
+		this.#clearSelectorsForRemovedCredential(provider, new Set([credentialId]), entries);
 		this.#resetProviderAssignments(provider);
 		this.#emitCredentialDisabled({ provider, disabledCause });
+	}
+
+	/** Clear every selector whose durable/in-memory target was just removed. */
+	#clearSelectorsForRemovedCredential(
+		provider: string,
+		removedIds: ReadonlySet<number>,
+		previousEntries: readonly StoredCredential[] = this.#getStoredCredentials(provider),
+	): void {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		for (const [scopeId, selectors] of this.#sessionCredentialSelectors) {
+			const selector = selectors.get(storageProvider);
+			if (!selector) continue;
+			const selected = previousEntries.find(entry => this.#credentialMatchesSelector(entry, selector));
+			if (selected && removedIds.has(selected.id)) this.clearSessionCredentialSelector(storageProvider, scopeId);
+		}
+		for (const [sessionId, sticky] of this.#sessionLastCredential.get(storageProvider) ?? []) {
+			if (removedIds.has(previousEntries[sticky.index]?.id ?? -1))
+				this.#clearSessionCredential(storageProvider, sessionId);
+		}
 	}
 
 	#emitCredentialDisabled(event: CredentialDisabledEvent): void {
@@ -2560,8 +2600,18 @@ export class AuthStorage {
 	 */
 	async remove(provider: string): Promise<void> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
-		this.#store.deleteAuthCredentialsForProvider(storageProvider, "deleted by user");
+		if (this.#store.deleteAuthCredentialsRemote) {
+			await this.#store.deleteAuthCredentialsRemote(storageProvider, "deleted by user");
+		} else {
+			this.#store.deleteAuthCredentialsForProvider(storageProvider, "deleted by user");
+		}
+		const previousEntries = this.#getStoredCredentials(storageProvider);
 		this.#setStoredCredentials(storageProvider, []);
+		this.#clearSelectorsForRemovedCredential(
+			storageProvider,
+			new Set(previousEntries.map(entry => entry.id)),
+			previousEntries,
+		);
 		this.#resetProviderAssignments(storageProvider);
 	}
 
@@ -3803,6 +3853,8 @@ export class AuthStorage {
 		const inventory = this.#store.listCredentialInventory?.() ?? [];
 		const row = inventory.find(candidate => candidate.id === credentialId);
 		if (row?.disabled) return { status: "failed", reason: scrubHealthReason(row.disabledCause ?? "disabled") };
+		const remote = row ? this.#store.peekCachedCredentialHealth?.(row.provider as Provider, credentialId) : undefined;
+		if (remote) return remote;
 		const raw = this.#store.getCache(`${HEALTH_CACHE_PREFIX}${credentialId}`);
 		if (!raw) return { status: "unknown", reason: null };
 		try {
@@ -3827,6 +3879,23 @@ export class AuthStorage {
 		} catch {
 			return { status: "unknown", reason: null };
 		}
+	}
+
+	#recordCredentialHealth(provider: Provider, credentialId: number, health: CachedCredentialHealth): void {
+		if (health.status !== "unknown") this.#store.recordCredentialHealth?.(provider, credentialId, health);
+		if (health.status === "unknown" || !health.retainUntil) return;
+		const healthPayload = {
+			v: 1,
+			status: health.status,
+			reason: health.reason ? scrubHealthReason(health.reason) : null,
+			checkedAt: health.checkedAt ?? Date.now(),
+			retainUntil: health.retainUntil,
+		};
+		this.#store.setCache(
+			`${HEALTH_CACHE_PREFIX}${credentialId}`,
+			JSON.stringify(healthPayload),
+			Math.floor(healthPayload.retainUntil / 1000),
+		);
 	}
 	/** Explicit API-key probe; key bytes are not retained in the returned result. */
 	async checkApiKeyCredential(
@@ -3950,18 +4019,13 @@ export class AuthStorage {
 			}
 			if (base.ok === false && base.reason?.startsWith("oauth refresh failed:")) {
 				results.push(base);
-				const healthPayload = {
-					v: 1,
+				const healthPayload: CachedCredentialHealth = {
 					status: "failed",
 					reason: scrubHealthReason(base.reason),
 					checkedAt: Date.now(),
 					retainUntil: Date.now() + PRESENTATION_RETENTION_MS,
 				};
-				this.#store.setCache(
-					`${HEALTH_CACHE_PREFIX}${row.id}`,
-					JSON.stringify(healthPayload),
-					Math.floor(healthPayload.retainUntil / 1000),
-				);
+				this.#recordCredentialHealth(row.provider as Provider, row.id, healthPayload);
 				continue;
 			}
 
@@ -3977,6 +4041,7 @@ export class AuthStorage {
 					if (email) base.email = email;
 					const { raw: _raw, ...trimmed } = report;
 					base.report = trimmed;
+					this.#store.recordCredentialUsage?.(row.provider as Provider, row.id, trimmed);
 				}
 			} catch (error) {
 				base.ok = false;
@@ -3984,8 +4049,7 @@ export class AuthStorage {
 			}
 
 			results.push(base);
-			const healthPayload = {
-				v: 1,
+			const healthPayload: CachedCredentialHealth = {
 				status: base.ok === true ? "ok" : base.ok === false ? "failed" : "unverifiable",
 				reason: base.reason
 					? scrubHealthReason(base.reason, row.credential.type === "api_key" ? [row.credential.key] : [])
@@ -3993,11 +4057,7 @@ export class AuthStorage {
 				checkedAt: Date.now(),
 				retainUntil: Date.now() + PRESENTATION_RETENTION_MS,
 			};
-			this.#store.setCache(
-				`${HEALTH_CACHE_PREFIX}${row.id}`,
-				JSON.stringify(healthPayload),
-				Math.floor(healthPayload.retainUntil / 1000),
-			);
+			this.#recordCredentialHealth(row.provider as Provider, row.id, healthPayload);
 		}
 
 		return results;
@@ -5381,7 +5441,7 @@ export class AuthStorage {
 				email: refreshed.email ?? target.credential.email,
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
-				mcpBinding: refreshed.mcpBinding ?? target.credential.mcpBinding,
+				mcpBinding: refreshed.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease);
 			return {
@@ -5407,6 +5467,7 @@ export class AuthStorage {
 			this.#store.deleteAuthCredential(id, cause);
 			const next = entries.filter((_value, idx) => idx !== index);
 			this.#setStoredCredentials(provider, next);
+			this.#clearSelectorsForRemovedCredential(provider, new Set([id]), entries);
 			this.#resetProviderAssignments(provider);
 			this.#emitCredentialDisabled({ provider, disabledCause: cause });
 			return true;

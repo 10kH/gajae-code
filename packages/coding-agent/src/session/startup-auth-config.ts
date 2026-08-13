@@ -10,7 +10,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AuthCredentialSelector, CredentialRankingMode } from "@gajae-code/ai/core";
-import { $credentialEnv, getAgentDir, getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
+import { $credentialEnv, getAgentDbPath, getAgentDir, getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { readSecureTokenFile } from "./secure-token-file";
 
@@ -21,6 +21,10 @@ export interface AuthBrokerClientConfig {
 
 export interface StartupAuthConfigSnapshot {
 	broker: AuthBrokerClientConfig | null;
+	/** Opaque credential-store authority used to bind numeric row-id pins. */
+	credentialStoreIdentity: string;
+	/** Persisted authority for global numeric pins; absent values invalidate ID pins. */
+	credentialPinStoreIdentity?: string;
 	credentialRankingMode: CredentialRankingMode;
 	credentialPins: Readonly<Record<string, string>>;
 }
@@ -53,6 +57,8 @@ export class StartupAuthConfigError extends Error {
 }
 
 const DEFAULT_CREDENTIAL_RANKING_MODE: CredentialRankingMode = "balanced";
+/** JSON-schema pattern shared with the runtime persisted-selector grammar. */
+export const PERSISTED_CREDENTIAL_SELECTOR_PATTERN = "^(id:[1-9][0-9]*|email:[^@\\s]+@[^@\\s]+|account:\\S+)$";
 const LEGACY_LITERAL_AUTH_KEYS = new Set([
 	"auth.broker.url",
 	"auth.broker.token",
@@ -84,7 +90,7 @@ export function getAuthBrokerTokenFilePath(): string {
 /** Validate the persisted selector grammar used by `auth.credentialPins`. */
 export function parsePersistedCredentialSelector(value: string): AuthCredentialSelector | undefined {
 	const trimmed = value.trim();
-	if (/^id:[1-9]\d*$/.test(trimmed)) return { kind: "id", value: trimmed.slice(3) };
+	if (/^id:[1-9][0-9]*$/.test(trimmed)) return { kind: "id", value: trimmed.slice(3) };
 	if (/^email:[^@\s]+@[^@\s]+$/.test(trimmed)) return { kind: "email", value: trimmed.slice(6) };
 	if (/^account:\S+$/.test(trimmed)) return { kind: "account", value: trimmed.slice(8) };
 	return undefined;
@@ -104,6 +110,15 @@ function resolveRankingMode(value: unknown): CredentialRankingMode | undefined {
 	return value === "balanced" || value === "earliest-reset" ? value : undefined;
 }
 
+/** Resolve the documented `$ENV_NAME` indirection without consulting project `.env` values. */
+function resolveNestedBrokerValue(raw: string | undefined): string | undefined {
+	const trimmed = raw?.trim();
+	if (!trimmed) return undefined;
+	const match = /^\$([A-Za-z_][A-Za-z0-9_]*)$/.exec(trimmed);
+	if (!match) return trimmed;
+	return $credentialEnv(match[1]);
+}
+
 function canonicalBrokerUrl(raw: string): string {
 	let parsed: URL;
 	try {
@@ -115,9 +130,7 @@ function canonicalBrokerUrl(raw: string): string {
 		throw new Error("Auth broker URL must be an HTTP(S) origin without credentials.");
 	}
 	if (parsed.search || parsed.hash) throw new Error("Auth broker URL must not contain a query or fragment.");
-	if (parsed.pathname !== "/" && parsed.pathname !== "")
-		throw new Error("Auth broker URL must be an origin without a path.");
-	parsed.pathname = "";
+	parsed.pathname = parsed.pathname.replace(/\/+$/, "");
 	return parsed.toString().replace(/\/$/, "");
 }
 
@@ -161,6 +174,7 @@ function readCredentialPins(
 
 interface GlobalStartupAuthYaml {
 	auth: Record<string, unknown> | undefined;
+	credentialPinStoreIdentity: string | undefined;
 	credentialPins: Readonly<Record<string, string>>;
 }
 
@@ -170,16 +184,16 @@ async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartu
 	try {
 		raw = await Bun.file(configPath).text();
 	} catch (error) {
-		if (isEnoent(error)) return { auth: undefined, credentialPins: {} };
+		if (isEnoent(error)) return { auth: undefined, credentialPinStoreIdentity: undefined, credentialPins: {} };
 		logger.warn("startup auth config.yml unreadable", { path: shortenConfigPath(configPath), cause: "unreadable" });
 		throw startupAuthConfigError(agentDir, "unreadable");
 	}
-	if (raw.trim() === "") return { auth: undefined, credentialPins: {} };
+	if (raw.trim() === "") return { auth: undefined, credentialPinStoreIdentity: undefined, credentialPins: {} };
 
 	let parsed: unknown;
 	try {
 		parsed = YAML.parse(raw);
-	} catch (error) {
+	} catch {
 		logger.warn("startup auth config.yml has invalid YAML", {
 			path: shortenConfigPath(configPath),
 			cause: "invalid-yaml",
@@ -197,7 +211,7 @@ async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartu
 	const legacyKeys = Object.keys(root).filter(key => LEGACY_LITERAL_AUTH_KEYS.has(key));
 	if (legacyKeys.length > 0) throwLegacyLiteralKeyError(legacyKeys);
 
-	if (root.auth === undefined) return { auth: undefined, credentialPins: {} };
+	if (root.auth === undefined) return { auth: undefined, credentialPinStoreIdentity: undefined, credentialPins: {} };
 	const auth = asRecord(root.auth);
 	if (!auth) throw startupAuthConfigError(agentDir, "invalid-auth");
 
@@ -220,7 +234,12 @@ async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartu
 		throw startupAuthConfigError(agentDir, "invalid-ranking-mode");
 	}
 	const credentialPins = readCredentialPins(auth, configPath);
-	return { auth, credentialPins };
+	const rawCredentialPinStoreIdentity = auth.credentialPinStoreIdentity;
+	const credentialPinStoreIdentity =
+		typeof rawCredentialPinStoreIdentity === "string" && rawCredentialPinStoreIdentity.trim().length > 0
+			? rawCredentialPinStoreIdentity.trim()
+			: undefined;
+	return { auth, credentialPinStoreIdentity, credentialPins };
 }
 
 async function readTokenFile(): Promise<string | undefined> {
@@ -234,16 +253,21 @@ async function readTokenFile(): Promise<string | undefined> {
  * cannot influence credential selection.
  */
 export async function resolveStartupAuthConfig(agentDir: string = getAgentDir()): Promise<StartupAuthConfigSnapshot> {
-	const { auth, credentialPins } = await readGlobalStartupAuthYaml(agentDir);
+	const { auth, credentialPinStoreIdentity, credentialPins } = await readGlobalStartupAuthYaml(agentDir);
 	const broker = asRecord(auth?.broker);
 	const envUrl = $credentialEnv("GJC_AUTH_BROKER_URL")?.trim();
 	const envToken = $credentialEnv("GJC_AUTH_BROKER_TOKEN")?.trim();
 
 	let url = envUrl || undefined;
-	if (!url && typeof broker?.url === "string" && broker.url.trim()) url = broker.url.trim();
+	const nestedUrlRaw = typeof broker?.url === "string" ? broker.url : undefined;
+	const nestedUrl = resolveNestedBrokerValue(nestedUrlRaw);
+	if (!url && nestedUrlRaw?.trim() && nestedUrl === undefined) {
+		throw startupAuthConfigError(agentDir, "invalid-broker");
+	}
+	if (!url && nestedUrl) url = nestedUrl;
 	if (url) url = canonicalBrokerUrl(url);
 
-	const configToken = typeof broker?.token === "string" && broker.token.trim() ? broker.token.trim() : undefined;
+	const configToken = resolveNestedBrokerValue(typeof broker?.token === "string" ? broker.token : undefined);
 
 	let resolvedBroker: AuthBrokerClientConfig | null = null;
 	if (url) {
@@ -263,6 +287,10 @@ export async function resolveStartupAuthConfig(agentDir: string = getAgentDir())
 		DEFAULT_CREDENTIAL_RANKING_MODE;
 	return {
 		broker: resolvedBroker,
+		credentialStoreIdentity: resolvedBroker
+			? `broker:${resolvedBroker.url}`
+			: `local:${path.resolve(getAgentDbPath(agentDir))}`,
+		...(credentialPinStoreIdentity ? { credentialPinStoreIdentity } : {}),
 		credentialRankingMode: rankingMode,
 		credentialPins,
 	};

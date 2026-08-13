@@ -1279,11 +1279,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
+	const hasInjectedAuth = options.authStorage !== undefined || options.modelRegistry !== undefined;
 
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
 	// / session would silently miss credential_disabled events.
-	const startupAuthConfig = options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir));
+	// Injected auth is already the caller's authority; do not discover global
+	// startup auth or apply persistent pins while constructing this session.
+	const startupAuthConfig = hasInjectedAuth
+		? undefined
+		: (options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir)));
 	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
 	const modelRegistry =
 		options.modelRegistry ??
@@ -1447,7 +1452,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const scopeAlreadyLeased = authStorage.hasCredentialScopeLease(credentialSessionId);
 		authStorage.acquireCredentialScope(credentialSessionId);
 		credentialScopeLeased = true;
-		const configuredPins = startupAuthConfig.credentialPins;
+		const configuredPins = hasInjectedAuth ? {} : (startupAuthConfig?.credentialPins ?? {});
+		const persistedPinStoreMatches =
+			startupAuthConfig?.credentialPinStoreIdentity === startupAuthConfig?.credentialStoreIdentity;
 		// AuthStorage has no scope-level "pinned but unavailable" marker. Keep the
 		// discarded durable pin identity local to this credential scope so startup
 		// config cannot immediately replace it with a different account; later
@@ -1477,7 +1484,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return cached;
 			}
 
-			const credentialSelector = undefined;
+			const credentialSelector = options.credentialSelector?.provider
+				? undefined
+				: options.credentialSelector?.selector;
 			if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
 				modelApiKeyAvailability.set(availabilityKey, false);
 				return false;
@@ -1552,6 +1561,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			try {
 				if (pin?.auto === true) {
 					authStorage.setSessionCredentialAuto(record.provider, credentialSessionId);
+					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
 				} else if (
 					pin &&
 					(pin.kind === "id" || pin.kind === "email" || pin.kind === "account" || pin.kind === "project") &&
@@ -1561,8 +1571,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						kind: pin.kind,
 						value: pin.value,
 					});
+					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
 				}
 			} catch {
+				// A newer stale pin must not leave an earlier replayed selector active.
+				authStorage.clearSessionCredentialSelector(record.provider, credentialSessionId);
 				staleDurableCredentialPins.add(resolveOAuthStorageProvider(record.provider));
 			}
 		}
@@ -1581,6 +1594,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					continue;
 				const selector = parsePersistedCredentialSelector(rawSelector);
 				if (!selector) continue;
+				if (selector.kind === "id" && !persistedPinStoreMatches) {
+					logger.warn("Numeric persistent credential pin discarded after credential-store authority changed", {
+						provider: sanitizeProviderForLog(provider),
+					});
+					continue;
+				}
 				applyCredentialSelector(credentialSessionId, provider, selector);
 			}
 		}
@@ -3407,20 +3426,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getApiKey: async provider => {
 				// Read agent.sessionId at call time so credential selection stays aligned
 				// with metadataResolver after /new, fork, resume, or branch switches.
-				const key = await modelRegistry.getApiKeyForProvider(
-					provider,
-					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
-				);
+				const key = await modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
 				if (!key) {
 					throw new Error(`No API key found for provider "${provider}"`);
 				}
 				return key;
 			},
-			getAuthCredentialType: provider =>
-				modelRegistry.getSessionCredentialType(
-					provider,
-					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
-				),
+			getAuthCredentialType: provider => modelRegistry.getSessionCredentialType(provider, credentialSessionId),
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
@@ -3428,8 +3440,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
 						onAuthError: async (provider, oldKey, error) => {
-							const credentialSessionId =
-								options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId;
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
 								sessionId: credentialSessionId,
@@ -3609,7 +3619,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agentRegistry,
 			asyncJobProviderSessionId: options.providerSessionId,
 			providerSessionId: options.providerSessionId,
-			credentialSessionId: options.credentialSessionId,
+			credentialSessionId,
 			providerCacheSessionId: providerSessionId,
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,

@@ -130,11 +130,14 @@ auth:
   credentialPins:
     anthropic: id:42
     openai-codex: email:me@example.com
+  credentialPinStoreIdentity: broker:https://broker.example.test:8765
 ```
 
-- `auth.broker.url` and `auth.broker.token` select direct-broker mode. `GJC_AUTH_BROKER_URL` and `GJC_AUTH_BROKER_TOKEN` take precedence over the nested values; nested values are literal strings, not environment-variable indirections. A configured URL without a resolvable token is a hard error; GJC does not silently fall back to local SQLite. An absent config file leaves broker mode disabled, while malformed or unreadable global startup-auth config fails closed with a typed `StartupAuthConfigError`.
+- `auth.broker.url` and `auth.broker.token` select direct-broker mode. `GJC_AUTH_BROKER_URL` and `GJC_AUTH_BROKER_TOKEN` take precedence over the nested values; nested values may be literal strings or trusted `$ENV_NAME` references. Resolution order remains explicit env → nested value (after indirection) → the owner-only `<config-dir>/auth-broker.token` file, so an unresolved nested token does not displace the token-file authority. A configured URL without a resolvable token is a hard error; GJC does not silently fall back to local SQLite. An absent config file leaves broker mode disabled, while malformed or unreadable global startup-auth config fails closed with a typed `StartupAuthConfigError`.
 - `auth.credentialRankingMode` is `balanced` (default) or `earliest-reset`. `GJC_CREDENTIAL_RANKING_MODE` takes precedence over the nested setting.
 - `auth.credentialPins` is a global-only record of provider → selector. Project-scoped pins are ignored; do not place this record in project settings.
+- Numeric `id:<positive-row-id>` pins are bound to the credential-store authority fingerprint (`broker:<normalized-url>` or `local:<absolute-agent-db-path>`). Changing broker URL or local database invalidates those numeric pins instead of retargeting a row with the same number; `email:` and `account:` selectors remain portable.
+- `auth.credentialPinStoreIdentity` is managed alongside persistent pins and contains no credential material. Numeric pins are applied only when this value exactly matches the current store authority; missing or mismatched metadata invalidates the numeric pin rather than retargeting a same-number row. Email/account selectors remain portable across store changes.
 - Literal dotted root keys such as `auth.broker.url: ...`, `auth.credentialRankingMode: ...`, or `auth.credentialPins: ...` are rejected. Startup reports the keys and prints manual rewrite guidance. Rewrite `config.yml` by hand using the nested shape above; there is no automatic migration, and secret values must not be copied into command output.
 
 ### Pin and credential precedence
@@ -156,7 +159,7 @@ Ranking is performed at session start, or when the session's preferred account i
 | Credential writer | Local `agent.db` | Broker host's `agent.db` | Broker host's `agent.db` (gateway is a broker client) |
 | OAuth login/add | `/login` picker and **Add new account** write locally | `/login` picker and **Add new account** write through the broker; `gjc auth-broker login` also works on the broker host | No login picker; use `gjc auth-broker login` on the broker host |
 | Logout/removal | `/logout` can remove one local OAuth row or all local OAuth rows; `gjc accounts logout` selects by `--account` or `--all` | Selective local removal is unavailable; use provider-wide `gjc auth-broker logout` on the broker host; `gjc accounts logout` refuses in broker mode | No account-removal API; mutate the broker directly |
-| Inventory/check | `/usage` and `gjc accounts list` are cache-only; `/usage check` and `gjc accounts check` probe sequentially | Same client presentation/check contract; expired OAuth refreshes route through the broker | `gjc auth-gateway check` and `GET /v1/credentials/check` probe broker rows sequentially; `GET /v1/usage` serves aggregate cached usage |
+| Inventory/check | `/usage` and `gjc accounts list` are cache-only; `/usage check` and `gjc accounts check` probe sequentially | Same client presentation/check contract; expired OAuth refreshes route through the broker | `gjc auth-gateway check` probes broker rows sequentially; `GET /v1/usage` serves aggregate cached usage |
 | Pin/ranking | Session pins/AUTO plus global `gjc accounts pin --persistent` and ranking mode | Same GJC session/global controls; the broker remains the credential writer | The service has no TUI session scope; broker clients/operators control pins and ranking |
 | Secret boundary | Local OAuth refresh/access material stays in the local credential store/process | Broker snapshots replace OAuth refresh tokens with `__remote__`; direct clients can hold access tokens but never the refresh token | Gateway clients never receive provider access tokens; the gateway injects them server-side |
 

@@ -288,9 +288,10 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		const clientStorage = new AuthStorage(remoteStore);
 		await clientStorage.reload();
 
-		await expect(clientStorage.remove("kagi")).rejects.toThrow("read-only");
-		expect(serverStore!.listAuthCredentials("kagi")).toHaveLength(1);
-		expect(clientStorage.get("kagi")).toEqual({ type: "api_key", key: "k1" });
+		await expect(clientStorage.remove("kagi")).resolves.toBeUndefined();
+		expect(remoteStore.listAuthCredentials("kagi")).toHaveLength(0);
+		expect(serverStore!.listAuthCredentials("kagi")).toHaveLength(0);
+		expect(clientStorage.get("kagi")).toBeUndefined();
 		clientStorage.close();
 	});
 });

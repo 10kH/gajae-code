@@ -140,6 +140,44 @@ describe("OAuth selector filtering", () => {
 		}
 	});
 
+	test("OAuth account choices are disabled while an API-key override is active", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const selected: unknown[] = [];
+		let selector: OAuthSelectorComponent | undefined;
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access-account-a",
+					refresh: "refresh-account-a",
+					expires: Date.now() + 60_000,
+					accountId: "account-a",
+					email: "a@example.com",
+				},
+			]);
+			authStorage.setRuntimeApiKey("anthropic", "runtime-secret");
+			selector = new OAuthSelectorComponent(
+				"login",
+				authStorage,
+				() => {},
+				() => {},
+				{
+					accountProviderId: "anthropic",
+					onAccountSelect: value => {
+						selected.push(value);
+					},
+				},
+			);
+
+			selector.handleInput("\n");
+
+			expect(selected).toEqual([]);
+			expect(renderedText(selector)).toContain("This account is not selectable.");
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
+	});
 	test("a non-matching query reports no matches instead of an empty list", async () => {
 		const { selector } = await createSelector();
 		type(selector, "zzzznotaprovider");

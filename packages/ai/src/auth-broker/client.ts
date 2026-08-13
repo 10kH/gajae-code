@@ -118,6 +118,11 @@ export class AuthBrokerClient {
 		this.#fetch = opts.fetchImpl ?? fetch;
 	}
 
+	/** Normalized broker origin used for non-secret local presentation partitioning. */
+	get baseUrl(): string {
+		return this.#baseUrl;
+	}
+
 	healthz(signal?: AbortSignal): Promise<HealthzResponse> {
 		return this.#request("GET", "/v1/healthz", { schema: healthzResponseSchema, auth: false, signal });
 	}

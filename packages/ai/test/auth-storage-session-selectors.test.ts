@@ -114,4 +114,21 @@ describe("AuthStorage session credential selectors", () => {
 			storage.close();
 		}
 	});
+
+	test("removing a selected account clears its session pin and sticky selection", async () => {
+		const storage = await createStorage();
+		try {
+			storage.acquireCredentialScope("remove-session");
+			storage.setSessionCredentialSelector("remove-session", "anthropic", {
+				kind: "email",
+				value: "first@example.com",
+			});
+			const id = storage.listCredentialInventory("anthropic").find(row => row.credentialKind === "oauth")!.id;
+			expect(storage.disableCredentialById(id, "removed by test")).toBe(true);
+			expect(storage.hasSessionCredentialSelector("anthropic", "remove-session")).toBe(false);
+			expect(storage.getOAuthCredential("anthropic", "remove-session")?.email).toBe("second@example.com");
+		} finally {
+			storage.close();
+		}
+	});
 });

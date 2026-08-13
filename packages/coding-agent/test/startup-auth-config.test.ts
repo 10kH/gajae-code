@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { getAgentDbPath } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { validateSettingPatch } from "../src/config/settings-schema";
 import {
@@ -11,7 +12,13 @@ import {
 	type StartupAuthConfigErrorKind,
 } from "../src/session/startup-auth-config";
 
-const ENV_KEYS = ["GJC_AUTH_BROKER_URL", "GJC_AUTH_BROKER_TOKEN", "GJC_CREDENTIAL_RANKING_MODE"] as const;
+const ENV_KEYS = [
+	"GJC_AUTH_BROKER_URL",
+	"GJC_AUTH_BROKER_TOKEN",
+	"GJC_CREDENTIAL_RANKING_MODE",
+	"STARTUP_AUTH_BROKER_URL",
+	"STARTUP_AUTH_BROKER_TOKEN",
+] as const;
 const savedEnv = new Map<string, string | undefined>();
 const tempDirs: string[] = [];
 
@@ -68,6 +75,7 @@ describe("startup auth config", () => {
 		tempDirs.push(absentDir);
 		await expect(resolveStartupAuthConfig(absentDir)).resolves.toEqual({
 			broker: null,
+			credentialStoreIdentity: `local:${getAgentDbPath(absentDir)}`,
 			credentialRankingMode: "balanced",
 			credentialPins: {},
 		});
@@ -75,6 +83,7 @@ describe("startup auth config", () => {
 		const emptyDir = await makeAgentDir("");
 		await expect(resolveStartupAuthConfig(emptyDir)).resolves.toEqual({
 			broker: null,
+			credentialStoreIdentity: `local:${getAgentDbPath(emptyDir)}`,
 			credentialRankingMode: "balanced",
 			credentialPins: {},
 		});
@@ -141,6 +150,7 @@ describe("startup auth config", () => {
 				"  broker:",
 				"    url: https://broker.example",
 				"    token: nested-token",
+				"  credentialPinStoreIdentity: broker:https://broker.example",
 				"  credentialRankingMode: earliest-reset",
 				"  credentialPins:",
 				"    anthropic: email:operator@example.com",
@@ -149,9 +159,22 @@ describe("startup auth config", () => {
 
 		await expect(resolveStartupAuthConfig(agentDir)).resolves.toEqual({
 			broker: { url: "https://broker.example", token: "nested-token" },
+			credentialStoreIdentity: "broker:https://broker.example",
+			credentialPinStoreIdentity: "broker:https://broker.example",
 			credentialRankingMode: "earliest-reset",
 			credentialPins: { anthropic: "email:operator@example.com" },
 		});
+	});
+
+	it("keeps malformed or absent pin-store metadata from authorizing numeric pins", async () => {
+		clearAuthEnv();
+		const absent = await makeAgentDir("auth:\n  credentialPins:\n    anthropic: id:42\n");
+		await expect(resolveStartupAuthConfig(absent)).resolves.not.toHaveProperty("credentialPinStoreIdentity");
+
+		const malformed = await makeAgentDir(
+			"auth:\n  credentialPinStoreIdentity:\n    - not-a-store-id\n  credentialPins:\n    anthropic: id:42\n",
+		);
+		await expect(resolveStartupAuthConfig(malformed)).resolves.not.toHaveProperty("credentialPinStoreIdentity");
 	});
 
 	it("rejects literal legacy keys with manual nested rewrite guidance", async () => {
@@ -177,8 +200,33 @@ describe("startup auth config", () => {
 
 		await expect(resolveStartupAuthConfig(agentDir)).resolves.toMatchObject({
 			broker: { url: "https://env.example", token: "env-token" },
+			credentialStoreIdentity: "broker:https://env.example",
 			credentialRankingMode: "earliest-reset",
 		});
+	});
+
+	it("resolves trusted environment indirection in nested broker values", async () => {
+		clearAuthEnv();
+		process.env.STARTUP_AUTH_BROKER_URL = "https://indirect.example///";
+		process.env.STARTUP_AUTH_BROKER_TOKEN = "indirect-token";
+		const agentDir = await makeAgentDir(
+			["auth:", "  broker:", "    url: $STARTUP_AUTH_BROKER_URL", "    token: $STARTUP_AUTH_BROKER_TOKEN"].join(
+				"\n",
+			),
+		);
+
+		await expect(resolveStartupAuthConfig(agentDir)).resolves.toMatchObject({
+			broker: { url: "https://indirect.example", token: "indirect-token" },
+			credentialStoreIdentity: "broker:https://indirect.example",
+		});
+	});
+
+	it("invalidates unresolved nested broker URLs instead of using a placeholder authority", async () => {
+		clearAuthEnv();
+		const agentDir = await makeAgentDir(
+			"auth:\n  broker:\n    url: $MISSING_STARTUP_AUTH_URL\n    token: config-token\n",
+		);
+		await expectStartupAuthConfigError(resolveStartupAuthConfig(agentDir), "invalid-broker");
 	});
 
 	it("ignores project-scoped pins", async () => {
@@ -204,9 +252,17 @@ describe("startup auth config", () => {
 		expect(isValidPersistedCredentialSelector("email:operator@example.com")).toBe(true);
 		expect(isValidPersistedCredentialSelector("account:acct-1")).toBe(true);
 		expect(isValidPersistedCredentialSelector("id:0")).toBe(false);
+		expect(isValidPersistedCredentialSelector("id:01")).toBe(false);
+		expect(isValidPersistedCredentialSelector("operator@example.com")).toBe(false);
 		expect(isValidPersistedCredentialSelector("project:project-1")).toBe(false);
 		expect(validateSettingPatch({ "auth.credentialPins": { anthropic: "id:1" } })).toEqual([]);
 		expect(validateSettingPatch({ "auth.credentialPins": { anthropic: "project:project-1" } })).toEqual([
+			{ path: "auth.credentialPins.anthropic", detail: "Expected credential-selector." },
+		]);
+		expect(validateSettingPatch({ "auth.credentialPins": { anthropic: "id:0" } })).toEqual([
+			{ path: "auth.credentialPins.anthropic", detail: "Expected credential-selector." },
+		]);
+		expect(validateSettingPatch({ "auth.credentialPins": { anthropic: "operator@example.com" } })).toEqual([
 			{ path: "auth.credentialPins.anthropic", detail: "Expected credential-selector." },
 		]);
 	});

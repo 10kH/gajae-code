@@ -29,6 +29,8 @@ type SettingsSchema = typeof SETTINGS_SCHEMA;
 type SettingDefinition = SettingsSchema[keyof SettingsSchema];
 
 const DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema";
+const PERSISTED_CREDENTIAL_SELECTOR_PATTERN =
+	"^(id:[1-9][0-9]*|email:[^@\\s]+@[^@\\s]+|account:\\S+)$";
 export const JSON_SCHEMA_OUTPUTS = [
 	{
 		path: "schemas/config.schema.json",
@@ -54,6 +56,10 @@ function createConfigJsonSchema(): JsonSchemaObject {
 	for (const [settingPath, definition] of Object.entries(SETTINGS_SCHEMA)) {
 		addNestedProperty(root, settingPath.split("."), settingDefinitionToJsonSchema(settingPath, definition));
 	}
+	// This metadata is written alongside persistent pins and is intentionally not
+	// exposed as a user-facing setting. Keep it in the generated public schema so
+	// editors accept the runtime's store-authority binding field.
+	addNestedProperty(root, ["auth", "credentialPinStoreIdentity"], { type: "string" });
 
 	return root;
 }
@@ -160,7 +166,7 @@ function recordValueSchema(
 	if (valueSchema?.type === "credential-selector") {
 		return {
 			type: "string",
-			pattern: "^(id:[1-9][0-9]*|email:[^@\\s]+@[^@\\s]+|account:\\S+)$",
+			pattern: PERSISTED_CREDENTIAL_SELECTOR_PATTERN,
 		};
 	}
 	if (valueSchema?.type !== "model-selector-value") return true;

@@ -214,4 +214,41 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		await remote.refreshSnapshot();
 		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toBeUndefined();
 	});
+
+	test("hydrates metadata and durable health/usage presentations for one-shot consumers", async () => {
+		const presentationPath = path.join(tempDir, "presentations.json");
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false, presentationPath });
+		await remote.waitForReady();
+		const entry = remote.snapshot.credentials[0]!;
+		const now = Date.now();
+		remote.recordCredentialHealth(entry.provider as never, entry.id, {
+			status: "failed",
+			reason: "Bearer secret-token rejected",
+			checkedAt: now,
+			retainUntil: now + 60_000,
+		});
+		remote.recordCredentialUsage(entry.provider as never, entry.id, {
+			provider: entry.provider as never,
+			fetchedAt: now,
+			limits: [],
+		});
+		await remote.flushPresentationPersistence();
+		const snapshot = remote.snapshot;
+		remote.close();
+		remote = new RemoteAuthCredentialStore({
+			client,
+			streamSnapshots: false,
+			initialSnapshot: snapshot,
+			presentationPath,
+		});
+		await remote.waitForReady();
+		expect(remote.peekCachedCredentialHealth(entry.provider as never, entry.id)).toMatchObject({
+			status: "failed",
+			reason: "Bearer [redacted] rejected",
+		});
+		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toEqual(
+			expect.objectContaining({ credentialId: entry.id }),
+		);
+	});
 });

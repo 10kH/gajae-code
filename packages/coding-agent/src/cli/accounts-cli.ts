@@ -13,9 +13,14 @@ import {
 	resolveOAuthStorageProvider,
 } from "@gajae-code/ai/core";
 import { getAgentDir } from "@gajae-code/utils";
+import { ModelRegistry } from "../config/model-registry";
 import { type RawSettings, Settings, type SettingsAtomicPatch } from "../config/settings";
 import { discoverAuthStorage } from "../sdk/session";
-import { buildAccountInventorySnapshot, checkAccountInventory } from "../session/account-inventory";
+import {
+	buildAccountInventorySnapshot,
+	checkAccountInventory,
+	clearPersistentPinForRemovedRows,
+} from "../session/account-inventory";
 import { resolveStartupAuthConfig, type StartupAuthConfigSnapshot } from "../session/startup-auth-config";
 
 export const ACCOUNTS_ACTIONS = ["list", "check", "pin", "logout"] as const;
@@ -93,21 +98,23 @@ function formatCandidate(row: CredentialInventoryRecord): string {
 	return `  id=${row.id} ${identity}${row.disabled ? " [disabled]" : ""}`;
 }
 
-async function withAuthStorage<T>(
-	callback: (storage: AuthStorage, startupAuth: StartupAuthConfigSnapshot) => Promise<T>,
+async function withAuthStorageAndModels<T>(
+	callback: (storage: AuthStorage, modelRegistry: ModelRegistry, startupAuth: StartupAuthConfigSnapshot) => Promise<T>,
 ): Promise<T> {
 	const startupAuth = await resolveStartupAuthConfig();
 	const storage = await discoverAuthStorage(getAgentDir(), startupAuth);
+	const modelRegistry = new ModelRegistry(storage);
 	try {
-		return await callback(storage, startupAuth);
+		await modelRegistry.refresh("offline");
+		return await callback(storage, modelRegistry, startupAuth);
 	} finally {
 		storage.close();
 	}
 }
 
 async function runList(flags: AccountsCommandArgs["flags"]): Promise<void> {
-	await withAuthStorage(async storage => {
-		const snapshot = buildAccountInventorySnapshot({ authStorage: storage });
+	await withAuthStorageAndModels(async (storage, modelRegistry) => {
+		const snapshot = buildAccountInventorySnapshot({ authStorage: storage, modelRegistry });
 		const accounts = snapshot.rows;
 		if (flags.json) {
 			writeJson({ ok: true, generatedAt: snapshot.generatedAt, generation: snapshot.generation, accounts });
@@ -132,8 +139,12 @@ async function runList(flags: AccountsCommandArgs["flags"]): Promise<void> {
 
 async function runCheck(providerArg: string | undefined, flags: AccountsCommandArgs["flags"]): Promise<void> {
 	const provider = providerArg ? canonicalProvider(providerArg) : undefined;
-	await withAuthStorage(async storage => {
-		const snapshot = await checkAccountInventory({ authStorage: storage, provider });
+	await withAuthStorageAndModels(async (storage, modelRegistry) => {
+		const snapshot = await checkAccountInventory({
+			authStorage: storage,
+			modelRegistry,
+			provider,
+		});
 		const checks = snapshot.rows
 			.filter(row => provider === undefined || row.provider === provider)
 			.map(row => ({
@@ -183,14 +194,31 @@ function pinsFromCurrent(current: Readonly<RawSettings>): Record<string, string>
 	return Object.fromEntries(Object.entries(pins).map(([key, value]) => [key, String(value).trim()]));
 }
 
-async function writePersistentPin(provider: string, selector: string | undefined, clear: boolean): Promise<void> {
+async function writePersistentPin(
+	provider: string,
+	selector: string | undefined,
+	clear: boolean,
+	credentialStoreIdentity?: string,
+): Promise<void> {
 	const settings = await Settings.init();
 	await settings.commitAtomicBatchWithCurrent(current => {
 		const pins = pinsFromCurrent(current);
 		if (clear) delete pins[provider];
 		else if (selector) pins[provider] = selector;
-		const patch: SettingsAtomicPatch = { path: "auth.credentialPins", op: "set", value: pins };
-		return [patch];
+		const patches: SettingsAtomicPatch[] = [{ path: "auth.credentialPins", op: "set", value: pins }];
+		const hasNumericPins = Object.values(pins).some(value => value.startsWith("id:"));
+		if (hasNumericPins) {
+			if (credentialStoreIdentity) {
+				patches.push({ path: "auth.credentialPinStoreIdentity", op: "set", value: credentialStoreIdentity });
+			} else if (!clear) {
+				throw new AccountsCommandError(
+					"Numeric persistent pins require a credential-store identity; no pin was written.",
+				);
+			}
+		} else {
+			patches.push({ path: "auth.credentialPinStoreIdentity", op: "unset" });
+		}
+		return patches;
 	});
 }
 
@@ -215,10 +243,16 @@ async function runPin(
 	}
 
 	const selector = selectorFromInput(selectorArg);
-	await withAuthStorage(async storage => {
+	await withAuthStorageAndModels(async (storage, modelRegistry, startupAuth) => {
+		if (
+			!modelRegistry.getConfiguredProviderIds().includes(provider) &&
+			modelRegistry.getAll().every(model => model.provider !== provider)
+		) {
+			throw new AccountsCommandError(`Provider ${provider} is not configured; no pin was written.`);
+		}
 		const target = storage.resolveOAuthPinTarget(provider, selector);
 		const canonicalSelector = `${target.canonicalSelector.kind}:${target.canonicalSelector.value}`;
-		await writePersistentPin(provider, canonicalSelector, false);
+		await writePersistentPin(provider, canonicalSelector, false, startupAuth.credentialStoreIdentity);
 		if (flags.json) writeJson({ ok: true, provider, selector: canonicalSelector });
 		else writeText([`Pinned ${provider} to ${canonicalSelector}.`]);
 	});
@@ -287,6 +321,8 @@ async function runLogout(providerArg: string | undefined, flags: AccountsCommand
 				`Account inventory changed before logout; no credentials were removed. Retry and choose from current candidates (ids: ${result.currentIds.join(", ") || "none"}).`,
 			);
 		}
+		const settings = await Settings.init();
+		await clearPersistentPinForRemovedRows(settings, provider, inventory, result.ids);
 		if (flags.json) writeJson({ ok: true, provider, removedIds: [...result.ids] });
 		else
 			writeText([

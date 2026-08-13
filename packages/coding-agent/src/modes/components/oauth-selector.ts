@@ -1,4 +1,5 @@
 import type { AuthCredentialSelector, CredentialInventoryRecord, CredentialRemovalTarget } from "@gajae-code/ai/core";
+import { getEnvApiKey } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProviderInfo } from "@gajae-code/ai/utils/oauth/types";
 import { Container, fuzzyFilter, Input, matchesKey, Spacer, TruncatedText } from "@gajae-code/tui";
@@ -141,12 +142,19 @@ export class OAuthSelectorComponent extends Container {
 		const targets = new Map(
 			this.#authStorage.listCredentialRemovalTargets(provider).map(target => [target.id, target]),
 		);
+		const apiKeyOverrideActive =
+			this.#authStorage.hasRuntimeApiKey(provider) ||
+			this.#authStorage.hasConfigApiKey(provider) ||
+			Boolean(getEnvApiKey(provider));
 		const rows = inventory.filter(row => this.#mode === "login" || row.credentialKind === "oauth");
 		this.#accountEntries = rows.map(row => ({
 			kind: "account" as const,
 			row,
 			target: targets.get(row.id),
-			selectable: row.credentialKind === "oauth" && (this.#mode === "login" ? !row.disabled : targets.has(row.id)),
+			selectable:
+				row.credentialKind === "oauth" &&
+				!apiKeyOverrideActive &&
+				(this.#mode === "login" ? !row.disabled : targets.has(row.id)),
 		}));
 		if (this.#mode === "login") {
 			this.#accountEntries.push(
@@ -285,7 +293,6 @@ export class OAuthSelectorComponent extends Container {
 		}
 		this.#updateList();
 	}
-
 	#updateList(): void {
 		if (this.#accountProviderId) {
 			this.#updateAccountList();

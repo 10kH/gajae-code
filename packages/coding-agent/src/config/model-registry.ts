@@ -26,6 +26,7 @@ import {
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
 	registerCustomApi,
+	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	type ThinkingConfig,
 	UNK_CONTEXT_WINDOW,
@@ -791,22 +792,19 @@ function extractGoogleOAuthToken(value: string | undefined): string | undefined 
 	return value;
 }
 
-function getOAuthCredentialsForProvider(
-	authStorage: AuthStorage,
-	provider: string,
-	sessionId?: string,
-): OAuthCredential[] {
-	const selected = authStorage.getOAuthCredential(provider, sessionId);
-	return selected ? [selected] : [];
+function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: string): OAuthCredential[] {
+	const providerEntry = authStorage.getAll()[resolveOAuthStorageProvider(provider)];
+	if (!providerEntry) return [];
+	const entries = Array.isArray(providerEntry) ? providerEntry : [providerEntry];
+	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
 }
 
 function resolveOAuthAccountIdForAccessToken(
 	authStorage: AuthStorage,
 	provider: string,
 	accessToken: string,
-	sessionId?: string,
 ): string | undefined {
-	const oauthCredentials = getOAuthCredentialsForProvider(authStorage, provider, sessionId);
+	const oauthCredentials = getOAuthCredentialsForProvider(authStorage, provider);
 	const matchingCredential = oauthCredentials.find(credential => credential.access === accessToken);
 	if (matchingCredential) {
 		return matchingCredential.accountId;

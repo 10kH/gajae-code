@@ -88,10 +88,10 @@ import type { NotificationSessionStatus } from "../../sdk/bus/session-control";
 import { ensureTelegramDaemonRunningDetailed, resolveTelegramSetupPreflight } from "../../sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
+import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
 import type { DefaultFallbackRuntimeState } from "../../session/agent-session";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
-
 import { FileSessionStorage } from "../../session/session-storage";
 import {
 	CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING,
@@ -3223,6 +3223,7 @@ export class SelectorController {
 					);
 					return;
 				}
+				await clearPersistentPinForRemovedRows(this.ctx.settings, providerId, inventory, result.ids);
 				await this.ctx.session.modelRegistry.refresh();
 				this.ctx.showStatus(
 					`Successfully removed ${result.ids.length} OAuth account${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
@@ -3240,6 +3241,7 @@ export class SelectorController {
 				this.ctx.showError("Logout failed: account inventory changed; no credentials were removed. Retry /logout.");
 				return;
 			}
+			await clearPersistentPinForRemovedRows(this.ctx.settings, providerId, inventory, result.ids);
 			await this.ctx.session.modelRegistry.refresh();
 			this.ctx.showStatus(
 				`Successfully removed ${result.ids.length} OAuth account${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
@@ -3264,6 +3266,13 @@ export class SelectorController {
 			const hasOAuthInventory = authStorage
 				.listCredentialInventory(providerId)
 				.some(row => row.provider === providerId && row.credentialKind === "oauth");
+			const hasRemovableOAuth = authStorage
+				.listCredentialRemovalTargets(providerId)
+				.some(target => target.provider === providerId);
+			if (mode === "logout" && hasOAuthInventory && !hasRemovableOAuth) {
+				await this.#handleOAuthLogout(providerId);
+				return;
+			}
 			if (hasOAuthInventory && !options?.manualCode) {
 				this.showSelector(done => {
 					let selector: OAuthSelectorComponent;
@@ -3310,9 +3319,6 @@ export class SelectorController {
 				await this.#handleOAuthLogin(providerId, options);
 				return;
 			}
-			const hasRemovableOAuth = authStorage
-				.listCredentialRemovalTargets(providerId)
-				.some(target => target.provider === providerId);
 			if (!hasRemovableOAuth) {
 				await this.#handleOAuthLogout(providerId);
 				return;

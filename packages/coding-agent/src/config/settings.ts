@@ -1500,9 +1500,15 @@ export class Settings implements NotificationSettingsReader {
 			let merged: RawSettings = {};
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level !== "project") continue;
-				const { settings, rejectedNotifications, rejectedCredentialPins } = this.#stripProjectNotificationSettings(
-					item.data as RawSettings,
-				);
+				// Retained project settings.json remains discoverable for non-workflow
+				// settings, but workflow keys durably migrated to config.yml must not be
+				// resurrected after `gjc config unset`. Unowned keys stay visible as the
+				// resolver's fallback when migration could not publish ownership.
+				const data = item.path.endsWith(`${path.sep}settings.json`)
+					? await this.#stripRetiredWorkflowKeys(item.path, structuredClone(item.data as RawSettings))
+					: (item.data as RawSettings);
+				const { settings, rejectedNotifications, rejectedCredentialPins } =
+					this.#stripProjectNotificationSettings(data);
 				if (rejectedNotifications) {
 					logger.warn("Settings: ignoring project notification settings", { path: item.path });
 				}
@@ -1528,6 +1534,29 @@ export class Settings implements NotificationSettingsReader {
 			}
 			return {};
 		}
+	}
+
+	/**
+	 * Remove workflow keys from retained project settings.json only when the
+	 * migrated-keys marker durably records config.yml ownership. Unowned keys are
+	 * normalized from legacy flat dotted form to the nested settings shape so the
+	 * generic Settings view agrees with the workflow resolver's fallback.
+	 */
+	async #stripRetiredWorkflowKeys(sourcePath: string, settings: RawSettings): Promise<RawSettings> {
+		const owned = await this.#readProjectMigratedKeys(sourcePath);
+		for (const key of CONFIG_ROOT_WORKFLOW_MIGRATION_KEYS) {
+			if (owned.has(key)) {
+				if (Object.hasOwn(settings, key)) delete settings[key];
+				deleteByPath(settings, key.split("."));
+				continue;
+			}
+			if (Object.hasOwn(settings, key)) {
+				const value = settings[key];
+				delete settings[key];
+				setByPath(settings, key.split("."), value);
+			}
+		}
+		return settings;
 	}
 
 	async #normalizeAfterLoad(): Promise<void> {
@@ -5857,10 +5886,14 @@ export class Settings implements NotificationSettingsReader {
 					delete authSettings.credentialPins;
 					rejectedCredentialPins = true;
 				}
+				if (Object.hasOwn(authSettings, "credentialPinStoreIdentity")) {
+					delete authSettings.credentialPinStoreIdentity;
+					rejectedCredentialPins = true;
+				}
 				if (Object.keys(authSettings).length > 0) sanitized[key] = authSettings;
 				continue;
 			}
-			if (key === "auth.credentialPins") {
+			if (key === "auth.credentialPins" || key === "auth.credentialPinStoreIdentity") {
 				rejectedCredentialPins = true;
 				continue;
 			}

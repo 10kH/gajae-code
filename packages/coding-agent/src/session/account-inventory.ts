@@ -12,6 +12,8 @@ import {
 	type UsageUnit,
 	type UsageWindow,
 } from "@gajae-code/ai/core";
+import type { RawSettings, Settings, SettingsAtomicPatch } from "../config/settings";
+import { parsePersistedCredentialSelector } from "./startup-auth-config";
 
 /** A redacted usage observation attached to an account row. */
 export interface AccountUsageCache extends CachedUsageReport {}
@@ -80,6 +82,18 @@ export interface AccountInventoryInput {
 	nowMs?: number;
 }
 
+type SyntheticAccountSource = Exclude<AccountInventorySource, "stored">;
+
+/** Optional source-scoped cache hooks supplied by AuthStorage. */
+interface SourceHealthStorage {
+	peekCachedCredentialHealthForSource?: (provider: string, source: SyntheticAccountSource) => CachedCredentialHealth;
+	recordCredentialHealthForSource?: (
+		provider: string,
+		source: SyntheticAccountSource,
+		health: CachedCredentialHealth,
+	) => void;
+}
+
 export interface AccountInventoryCheckResult {
 	rowId: string;
 	provider: string;
@@ -141,7 +155,6 @@ function classifyDisabledCause(value: unknown, disabled: boolean): AccountInvent
 	}
 	return "unknown";
 }
-
 function sourceId(provider: string, source: AccountInventorySource, credentialId?: number): string {
 	const safe = safeProvider(provider);
 	return credentialId === undefined ? `${safe}:${source}` : `${safe}:stored:${credentialId}`;
@@ -300,6 +313,42 @@ function canPinStoredOAuth(authStorage: AuthStorage, provider: string): boolean 
 	return !getEnvApiKey(provider);
 }
 
+function sourceHealth(authStorage: AuthStorage, provider: string, source: SyntheticAccountSource): AccountHealthCache {
+	const getter = (authStorage as AuthStorage & SourceHealthStorage).peekCachedCredentialHealthForSource;
+	const cached = getter?.call(authStorage, provider, source);
+	if (!cached) return { status: "unknown", reason: null };
+	return {
+		status:
+			cached.status === "ok" ||
+			cached.status === "failed" ||
+			cached.status === "unverifiable" ||
+			cached.status === "unknown"
+				? cached.status
+				: "unknown",
+		reason: asSafeLabel(cached.reason),
+		...(finiteNumber(cached.checkedAt) !== undefined ? { checkedAt: finiteNumber(cached.checkedAt) } : {}),
+		...(finiteNumber(cached.retainUntil) !== undefined ? { retainUntil: finiteNumber(cached.retainUntil) } : {}),
+	};
+}
+
+function recordSourceHealth(
+	authStorage: AuthStorage,
+	provider: string,
+	source: SyntheticAccountSource,
+	ok: boolean | null,
+	reason: unknown,
+): void {
+	const recorder = (authStorage as AuthStorage & SourceHealthStorage).recordCredentialHealthForSource;
+	if (!recorder) return;
+	const now = Date.now();
+	recorder.call(authStorage, provider, source, {
+		status: ok === true ? "ok" : ok === false ? "failed" : "unverifiable",
+		reason: asSafeLabel(reason),
+		checkedAt: now,
+		retainUntil: now + 24 * 60 * 60_000,
+	});
+}
+
 function addStoredRows(
 	rows: AccountInventoryRow[],
 	authStorage: AuthStorage,
@@ -378,7 +427,7 @@ function addSyntheticRows(
 				identityLabel: null,
 				disabled: false,
 				disabledCause: null,
-				health: { status: "unknown", reason: null },
+				health: sourceHealth(authStorage, provider, source as SyntheticAccountSource),
 				capabilities: {
 					canCheck: true,
 					canPin: false,
@@ -417,6 +466,7 @@ export const buildAccountInventory = buildAccountInventorySnapshot;
 
 function applyStoredCheck(
 	rows: AccountInventoryRow[],
+	authStorage: AuthStorage,
 	results: CredentialHealthResult[],
 ): AccountInventoryCheckResult[] {
 	const byId = new Map(rows.filter(row => row.credentialId !== undefined).map(row => [row.credentialId!, row]));
@@ -429,14 +479,14 @@ function applyStoredCheck(
 			reason: asSafeLabel(result.reason),
 		};
 		if (result.report) {
-			row.usage = {
-				report: redactUsageReport(result.report),
-				fetchedAt: finiteNumber(result.report.fetchedAt) ?? 0,
-				freshUntil: Date.now(),
-				retainUntil: Date.now(),
-				freshness: "fresh",
-			};
-			row.capabilities.hasCachedUsage = true;
+			const cached =
+				row.credentialId === undefined
+					? undefined
+					: authStorage.getCachedUsageReport(row.provider as Provider, row.credentialId);
+			if (cached) {
+				row.usage = redactUsageCache(cached);
+				row.capabilities.hasCachedUsage = true;
+			}
 		}
 		checked.push({
 			rowId: row.id,
@@ -461,6 +511,7 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 	const authStorage = input.authStorage;
 	applyStoredCheck(
 		rows,
+		authStorage,
 		await authStorage.checkCredentials({
 			provider: input.provider,
 			baseUrlResolver: provider => input.modelRegistry?.getProviderBaseUrl?.(provider),
@@ -488,12 +539,13 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 			status: result.ok === true ? "ok" : result.ok === false ? "failed" : "unverifiable",
 			reason: asSafeLabel(result.reason),
 		};
+		recordSourceHealth(authStorage, row.provider, row.source as SyntheticAccountSource, result.ok, result.reason);
 		if (result.report) {
 			row.usage = {
 				report: redactUsageReport(result.report),
 				fetchedAt: finiteNumber(result.report.fetchedAt) ?? 0,
-				freshUntil: Date.now(),
-				retainUntil: Date.now(),
+				freshUntil: Date.now() + 15 * 60_000,
+				retainUntil: Date.now() + 24 * 60 * 60_000,
 				freshness: "fresh",
 			};
 			row.capabilities.hasCachedUsage = true;
@@ -503,3 +555,48 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 }
 
 export const checkAccountInventorySnapshot = checkAccountInventory;
+
+function selectorMatchesRemovedRow(
+	selector: string,
+	provider: string,
+	inventory: readonly CredentialInventoryRecord[],
+	removedIds: ReadonlySet<number>,
+): boolean {
+	const parsed = parsePersistedCredentialSelector(selector);
+	if (!parsed) return false;
+	if (parsed.kind === "id") return removedIds.has(Number(parsed.value));
+	return inventory.some(
+		row =>
+			row.provider === provider &&
+			removedIds.has(row.id) &&
+			typeof row.identityLabel === "string" &&
+			row.identityLabel.trim().toLowerCase() === parsed.value.trim().toLowerCase(),
+	);
+}
+
+/** Clear a global persistent pin only after its selected credential was removed. */
+export async function clearPersistentPinForRemovedRows(
+	settings: Pick<Settings, "commitAtomicBatchWithCurrent">,
+	provider: string,
+	inventory: readonly CredentialInventoryRecord[],
+	removedIds: readonly number[],
+): Promise<boolean> {
+	const removed = new Set(removedIds);
+	if (removed.size === 0) return false;
+	let cleared = false;
+	await settings.commitAtomicBatchWithCurrent(current => {
+		const auth = asRecord((current as RawSettings).auth);
+		const pins = asRecord(auth?.credentialPins);
+		const selector = pins?.[provider];
+		if (typeof selector !== "string" || !selectorMatchesRemovedRow(selector, provider, inventory, removed)) return [];
+		const nextPins = { ...pins };
+		delete nextPins[provider];
+		cleared = true;
+		const patches: SettingsAtomicPatch[] = [{ path: "auth.credentialPins", op: "set", value: nextPins }];
+		if (!Object.values(nextPins).some(value => typeof value === "string" && value.startsWith("id:"))) {
+			patches.push({ path: "auth.credentialPinStoreIdentity", op: "unset" });
+		}
+		return patches;
+	});
+	return cleared;
+}

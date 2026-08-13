@@ -288,6 +288,7 @@ export const SETTINGS_SCHEMA = {
 		default: {} as Record<string, string>,
 		valueSchema: { type: "credential-selector" } as const,
 	},
+	"auth.credentialPinStoreIdentity": { type: "string", default: undefined },
 	"session.directoryMigration": {
 		type: "enum",
 		values: ["copy-retain", "disabled"] as const,
