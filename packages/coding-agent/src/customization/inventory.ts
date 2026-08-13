@@ -53,29 +53,19 @@ export function inventoryRowId(surface: CustomizationSurface, scope: GjcScope, r
 // Display redaction
 // ---------------------------------------------------------------------------
 
-// Free-form command/argument/URL strings are not a safe credential boundary:
-// quoting, auth schemes, shell syntax, and provider-specific flags make
-// heuristic partial redaction incomplete. Structured env/header maps expose
-// keys only; opaque free-form fields are omitted from display entirely.
-export function redactDisplayText(text: string): string {
-	if (/\b(bearer|basic|digest|token|secret|password|api[-_]?key|authorization)\b/i.test(text)) {
-		return "[credential-bearing text redacted]";
-	}
-	return text;
-}
-
 function redactServerForDisplay(server: Record<string, unknown>): Record<string, unknown> {
-	const copy: Record<string, unknown> = { ...server };
-	if (copy.env && typeof copy.env === "object") {
-		copy.env = Object.fromEntries(Object.keys(copy.env as Record<string, unknown>).map(k => [k, "•••"]));
-	}
-	if (copy.headers && typeof copy.headers === "object") {
-		copy.headers = Object.fromEntries(Object.keys(copy.headers as Record<string, unknown>).map(k => [k, "•••"]));
-	}
-	if (copy.command !== undefined) copy.command = "[command redacted]";
-	if (copy.args !== undefined) copy.args = "[arguments redacted]";
-	if (copy.url !== undefined) copy.url = "[URL redacted]";
-	return copy;
+	return {
+		type: typeof server.type === "string" ? server.type : undefined,
+		enabled: typeof server.enabled === "boolean" ? server.enabled : undefined,
+		autoload: typeof server.autoload === "boolean" ? server.autoload : undefined,
+		sharing: typeof server.sharing === "string" ? server.sharing : undefined,
+		timeout: typeof server.timeout === "number" ? server.timeout : undefined,
+		command: server.command === undefined ? undefined : "[command redacted]",
+		args: server.args === undefined ? undefined : "[arguments redacted]",
+		url: server.url === undefined ? undefined : "[URL redacted]",
+		envKeys: server.env && typeof server.env === "object" ? Object.keys(server.env) : undefined,
+		headerKeys: server.headers && typeof server.headers === "object" ? Object.keys(server.headers) : undefined,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +88,7 @@ function importedProductLabel(marker: string): string {
 	return marker === "claude-code" ? "Claude Code" : marker === "codex" ? "Codex" : marker;
 }
 
-async function loadSkillRows(options: LoadCustomizationInventoryOptions, warnings: string[]): Promise<InventoryRow[]> {
+async function loadSkillRows(options: LoadCustomizationInventoryOptions, _warnings: string[]): Promise<InventoryRow[]> {
 	const rows: InventoryRow[] = [];
 	const records = await listNativeSkillsForManagement({
 		cwd: options.cwd,
@@ -241,14 +231,22 @@ function mcpDescription(name: string, server: Record<string, unknown>): string {
 
 async function loadMcpRows(options: LoadCustomizationInventoryOptions, warnings: string[]): Promise<InventoryRow[]> {
 	const rows: InventoryRow[] = [];
-	const disabled = new Set(
+	const disabledExtensions = new Set(
 		(options.disabledExtensions ?? []).filter(id => id.startsWith("mcp:")).map(id => id.slice("mcp:".length)),
+	);
+	const scopeConfigs = await Promise.all(
+		(["project", "global"] as const).map(async scope => {
+			const configPath = resolveScopePaths(scope, options.cwd).mcpConfigPath;
+			const config = await readMCPConfigFile(configPath).catch(() => null);
+			return { scope, configPath, config };
+		}),
+	);
+	const disabledServers = new Set(
+		scopeConfigs.flatMap(({ config }) => (Array.isArray(config?.disabledServers) ? config.disabledServers : [])),
 	);
 	// Runtime semantics: project scope wins; the user-global entry is shadowed.
 	const seen = new Set<string>();
-	for (const scope of ["project", "global"] as const) {
-		const mcpConfigPath = resolveScopePaths(scope, options.cwd).mcpConfigPath;
-		const config = await readMCPConfigFile(mcpConfigPath).catch(() => null);
+	for (const { scope, configPath: mcpConfigPath, config } of scopeConfigs) {
 		if (config === null) {
 			let exists = false;
 			try {
@@ -282,7 +280,7 @@ async function loadMcpRows(options: LoadCustomizationInventoryOptions, warnings:
 				name,
 				...record,
 			} as Parameters<NonNullable<typeof mcpCapability.validate>>[0]);
-			const isDisabled = disabled.has(name) || record.enabled === false;
+			const isDisabled = disabledExtensions.has(name) || disabledServers.has(name) || record.enabled === false;
 			const status: InventoryStatus = validationError
 				? "invalid"
 				: shadowed

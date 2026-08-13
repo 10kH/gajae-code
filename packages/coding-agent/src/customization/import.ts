@@ -748,6 +748,16 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 	}
 
 	if (mcpWrites.length > 0) {
+		const mcpSymlink = await findSymlinkedAncestor(destination.root, destination.mcpConfigPath).catch(error => {
+			return `error:${(error as Error).message}`;
+		});
+		if (typeof mcpSymlink === "string") {
+			return failAll(
+				mcpSymlink.startsWith("error:")
+					? `cannot validate MCP destination ancestors: ${mcpSymlink.slice(6)}`
+					: `refusing to write MCP config through symlinked ancestor: ${mcpSymlink}`,
+			);
+		}
 		const destState = await readDestinationMcpState(destination.mcpConfigPath);
 		if (destState.servers === null) {
 			return failAll(destState.error ?? `destination ${destination.mcpConfigPath} is unusable`);
@@ -795,6 +805,12 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 		}
 
 		if (mcpConfig && mcpWrites.length > 0) {
+			const mcpSymlink = await findSymlinkedAncestor(destination.root, destination.mcpConfigPath);
+			if (mcpSymlink) throw new Error(`refusing to write MCP config through symlinked ancestor: ${mcpSymlink}`);
+			const mcpStat = await fs.lstat(destination.mcpConfigPath).catch(() => null);
+			if (mcpStat?.isSymbolicLink()) {
+				throw new Error(`refusing to write through symlinked MCP config: ${destination.mcpConfigPath}`);
+			}
 			const priorRaw = await readStructured(destination.mcpConfigPath);
 			snapshots.push({
 				path: destination.mcpConfigPath,

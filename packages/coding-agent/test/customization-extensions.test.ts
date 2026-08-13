@@ -157,6 +157,16 @@ describe("customization inventory", () => {
 		expect(rows.find(r => r.scope === "global")?.status).toBe("shadowed");
 	});
 
+	test("disabledServers from either scope make the effective server disabled", async () => {
+		await writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { srv: { type: "stdio", command: "npx" } } }),
+		);
+		await writeFile(path.join(getAgentDir(), "mcp.json"), JSON.stringify({ disabledServers: ["srv"] }));
+		const inventory = await loadCustomizationInventory({ cwd: projectDir, home: homeDir });
+		expect(inventory.rows.find(r => r.surface === "mcps" && r.name === "srv")?.status).toBe("disabled");
+	});
+
 	test("malformed MCP config surfaces as an invalid row, never raw JSON", async () => {
 		await writeFile(path.join(projectDir, ".gjc", "mcp.json"), "{ not json");
 		const inventory = await loadCustomizationInventory({ cwd: projectDir, home: homeDir });
@@ -183,6 +193,26 @@ describe("customization inventory", () => {
 		expect(row).toBeDefined();
 		expect(JSON.stringify(row)).not.toContain("super-secret-value");
 		expect(JSON.stringify(row)).not.toContain("abc123secret");
+	});
+
+	test("MCP inventory raw projection drops nested auth and oauth secrets", async () => {
+		await writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					srv: {
+						type: "stdio",
+						command: "npx",
+						auth: { clientSecret: "AUTH_NESTED_SECRET" },
+						oauth: { clientSecret: "OAUTH_NESTED_SECRET" },
+					},
+				},
+			}),
+		);
+		const inventory = await loadCustomizationInventory({ cwd: projectDir, home: homeDir });
+		const serialized = JSON.stringify(inventory.rows.find(r => r.surface === "mcps" && r.name === "srv"));
+		expect(serialized).not.toContain("AUTH_NESTED_SECRET");
+		expect(serialized).not.toContain("OAUTH_NESTED_SECRET");
 	});
 });
 
@@ -496,6 +526,22 @@ describe("import collision policy and safety", () => {
 		await expect(fs.stat(path.join(external, "claude-skill"))).rejects.toThrow();
 	});
 
+	test("symlinked MCP config destination is refused without writing externally", async () => {
+		await writeFile(
+			path.join(projectDir, ".mcp.json"),
+			JSON.stringify({ mcpServers: { srv: { type: "stdio", command: "npx" } } }),
+		);
+		const external = path.join(tmpRoot, "external-mcp.json");
+		await writeFile(external, JSON.stringify({ mcpServers: {} }));
+		await fs.mkdir(path.join(projectDir, ".gjc"), { recursive: true });
+		await fs.symlink(external, path.join(projectDir, ".gjc", "mcp.json"));
+		const plan = await buildImportPreview(previewOptions({ surfaces: ["mcps"] }));
+		const result = await applyImport(plan, { cwd: projectDir });
+		expect(result.ok).toBe(true);
+		expect(result.entries[0].outcome).toBe("skipped");
+		expect(await fs.readFile(external, "utf-8")).toBe(JSON.stringify({ mcpServers: {} }));
+	});
+
 	test("stale preview fails closed instead of silently overwriting", async () => {
 		await seedSkillBothSides();
 		const plan = await buildImportPreview(previewOptions({ surfaces: ["skills"], collisionPolicy: "rename" }));
@@ -546,15 +592,15 @@ describe("native .gjc mutations", () => {
 		await fs.stat(skillPath);
 	});
 
-	test("MCP enable/disable/remove go through the canonical writer", async () => {
+	test("MCP enable/disable/remove use the canonical disabledServers denylist", async () => {
 		const paths = resolveScopePaths("project", projectDir);
 		await writeFile(paths.mcpConfigPath, JSON.stringify({ mcpServers: { srv: { type: "stdio", command: "npx" } } }));
 		expect(await setMcpServerEnabled(paths.mcpConfigPath, "srv", false)).toEqual({ ok: true });
 		let config = JSON.parse(await fs.readFile(paths.mcpConfigPath, "utf-8"));
-		expect(config.mcpServers.srv.enabled).toBe(false);
+		expect(config.disabledServers).toEqual(["srv"]);
 		expect(await setMcpServerEnabled(paths.mcpConfigPath, "srv", true)).toEqual({ ok: true });
 		config = JSON.parse(await fs.readFile(paths.mcpConfigPath, "utf-8"));
-		expect(config.mcpServers.srv.enabled).toBeUndefined();
+		expect(config.disabledServers).toBeUndefined();
 		expect(await removeMcpServerEntry(paths.mcpConfigPath, "srv")).toEqual({ ok: true });
 		config = JSON.parse(await fs.readFile(paths.mcpConfigPath, "utf-8"));
 		expect(config.mcpServers.srv).toBeUndefined();

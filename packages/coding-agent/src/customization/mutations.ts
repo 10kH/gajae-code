@@ -16,7 +16,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { setNativeSkillEnabled } from "../extensibility/skill-management";
-import { readMCPConfigFile, removeMCPServer, writeMCPConfigFile } from "../runtime-mcp/config-writer";
+import { readMCPConfigFile, removeMCPServer, setServerDisabled } from "../runtime-mcp/config-writer";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 
 const BUNDLED_SKILL_NAMES: ReadonlySet<string> = new Set(CANONICAL_GJC_WORKFLOW_SKILLS);
@@ -74,7 +74,7 @@ export async function removeSkill(record: { name: string; path: string }): Promi
 // MCPs
 // ---------------------------------------------------------------------------
 
-/** Toggle a server's `enabled` flag in the canonical mcp.json writer. */
+/** Toggle a server through the canonical disabledServers denylist. */
 export async function setMcpServerEnabled(
 	mcpConfigPath: string,
 	name: string,
@@ -84,16 +84,7 @@ export async function setMcpServerEnabled(
 	if (!config) return { ok: false, reason: `${mcpConfigPath} is malformed; fix or remove it first` };
 	const server = config.mcpServers?.[name];
 	if (!server) return { ok: false, reason: `server "${name}" not found in ${mcpConfigPath}` };
-	const updatedServer = { ...server };
-	if (enabled) {
-		delete updatedServer.enabled;
-	} else {
-		updatedServer.enabled = false;
-	}
-	await writeMCPConfigFile(mcpConfigPath, {
-		...config,
-		mcpServers: { ...config.mcpServers, [name]: updatedServer },
-	});
+	await setServerDisabled(mcpConfigPath, name, !enabled);
 	return { ok: true };
 }
 
