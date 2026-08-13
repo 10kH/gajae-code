@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { formatCrashRecordMarker } from "@gajae-code/utils";
-import { findLatestRecord, parseCrashRecords } from "../src/crash/record-loader";
+import { computeCrashFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
+import { findLatestRecord, parseCrashRecords, parseRecoverableCrashRecords } from "../src/crash/record-loader";
 
 const FP_A = "a".repeat(32);
 const FP_B = "b".repeat(32);
@@ -17,6 +17,36 @@ function record(fingerprint: string, recordId: string, message: string, body: st
 		`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] Error: ${message}\n` +
 		`${body}\n${formatCrashRecordMarker(fingerprint, 1, recordId)}\n\n`
 	);
+}
+
+function boundRecord(recordId: string, message: string, body: string): { fingerprint: string; text: string } {
+	const headline = `Error: ${message}`;
+	const stack = `${headline}\n${body}`;
+	const fingerprint = computeCrashFingerprint(
+		{ name: "Error", message, stack },
+		{ installRoot: process.cwd() },
+	).fingerprint;
+	return {
+		fingerprint,
+		text:
+			`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] ${headline}\n` +
+			`${stack}\n${formatCrashRecordMarker(fingerprint, 1, recordId)}\n\n`,
+	};
+}
+
+function boundDiagnosticRecord(
+	recordId: string,
+	name: string,
+	message: string,
+	stack: string,
+): { fingerprint: string; text: string } {
+	const fingerprint = computeCrashFingerprint({ name, message, stack }, { installRoot: process.cwd() }).fingerprint;
+	return {
+		fingerprint,
+		text:
+			`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] ${name}: ${message}\n` +
+			`${stack}\n${formatCrashRecordMarker(fingerprint, 1, recordId)}\n\n`,
+	};
 }
 
 describe("parseCrashRecords", () => {
@@ -60,5 +90,49 @@ describe("parseCrashRecords", () => {
 	it("ignores a forged marker that has no record header before it", () => {
 		const log = `${formatCrashRecordMarker(FP_A, 1, "0123456789abcdef")}\n`;
 		expect(parseCrashRecords(log)).toHaveLength(0);
+	});
+
+	it("accepts only complete v1 records bound to their own diagnostic fingerprint", () => {
+		const valid = boundRecord("0123456789abcdef", "bound crash", "    at frame (packages/coding-agent/src/x.ts:1:1)");
+		expect(parseRecoverableCrashRecords(valid.text).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+		expect(parseRecoverableCrashRecords(valid.text.trimEnd())).toHaveLength(0);
+	});
+
+	it("accepts a bound record with a serialized object payload after its stack", () => {
+		const valid = boundRecord("0123456789abcdef", "bound crash", "    at frame (packages/coding-agent/src/x.ts:1:1)");
+		const withPayload = valid.text.replace(
+			formatCrashRecordMarker(valid.fingerprint, 1, "0123456789abcdef"),
+			`{"phase":"startup","reason":"pending"}\n${formatCrashRecordMarker(valid.fingerprint, 1, "0123456789abcdef")}`,
+		);
+		expect(parseRecoverableCrashRecords(withPayload).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+	});
+
+	it("recovers production v1 records with a colon in the error name", () => {
+		const valid = boundDiagnosticRecord(
+			"1123456789abcdef",
+			"Provider:ProtocolError",
+			"stream failed",
+			"Provider:ProtocolError: stream failed\n    at frame (packages/coding-agent/src/x.ts:1:1)",
+		);
+		expect(parseRecoverableCrashRecords(valid.text).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+	});
+
+	it("recovers production v1 records with a multiline message", () => {
+		const valid = boundDiagnosticRecord(
+			"2123456789abcdef",
+			"Error",
+			"first line\nsecond line",
+			"Error: first line\nsecond line\n    at frame (packages/coding-agent/src/x.ts:1:1)",
+		);
+		expect(parseRecoverableCrashRecords(valid.text).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+	});
+
+	it("rejects arbitrary-text identity decoys and mismatched markers", () => {
+		const valid = boundRecord("0123456789abcdef", "bound crash", "    at frame (packages/coding-agent/src/x.ts:1:1)");
+		const decoy =
+			`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] Error: decoy\n` +
+			`${formatCrashRecordMarker(valid.fingerprint, 1, "fedcba9876543210")}\n` +
+			`${formatCrashRecordMarker(valid.fingerprint, 1, "aaaaaaaaaaaaaaaa")}\n\n`;
+		expect(parseRecoverableCrashRecords(decoy)).toHaveLength(0);
 	});
 });
