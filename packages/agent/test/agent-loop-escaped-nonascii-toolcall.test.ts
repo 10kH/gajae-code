@@ -315,6 +315,56 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(mock.calls).toHaveLength(6);
 	});
 
+	it("preserves a queue-backed tool choice across a resample", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		const queuedChoices = ["required" as const, "none" as const];
+		let getterCalls = 0;
+		const mock = createMockModel({
+			responses: [escapedTurn("tc-1"), literalTurn("tc-2"), { content: ["done"] }],
+		});
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			getToolChoice: () => {
+				getterCalls += 1;
+				return queuedChoices.shift();
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(mock.calls.map(call => call.options?.toolChoice)).toEqual(["required", "required", "none"]);
+		expect(getterCalls).toBe(2);
+		expect(executed).toEqual([{ question: QUESTION }]);
+	});
+
+	it("drains accepted tool-call updates before entering tool execution", async () => {
+		const observed: string[] = [];
+		const tool: AgentTool<typeof askSchema, Record<string, never>> = {
+			...askTool([]),
+			async execute() {
+				observed.push("execute");
+				return { content: [{ type: "text", text: "answered" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({ responses: [literalTurn("tc-live"), { content: ["done"] }] });
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+
+		for await (const event of stream) {
+			if (event.type === "message_update" && event.assistantMessageEvent.type === "toolcall_end") {
+				observed.push("toolcall_end");
+			}
+		}
+
+		expect(observed).toEqual(["toolcall_end", "execute"]);
+	});
+
 	it("rejects the call once the resample budget is spent", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };

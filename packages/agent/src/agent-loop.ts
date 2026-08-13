@@ -14,6 +14,7 @@ import {
 	EventStream,
 	isZodSchema,
 	streamSimple,
+	type ToolChoice,
 	type ToolResultMessage,
 	type TSchema,
 	transportFailureFacts,
@@ -1526,6 +1527,11 @@ async function runLoopBody(
 	// arrived `\uXXXX`-escaped. Reset once a turn gets past the check, so every
 	// turn is judged on its own wire bytes.
 	let escapedNonAsciiResampleAttempt = 0;
+	// A queue-backed dynamic tool choice belongs to the logical turn, not to one
+	// wire attempt. Capture it once and replay it across escaped-argument
+	// resamples; reset only after a response is accepted for normal processing.
+	let escapedNonAsciiToolChoiceCaptured = false;
+	let escapedNonAsciiToolChoice: ToolChoice | undefined;
 	let previousMalformedToolSignatures = new Set<string>();
 	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider";
 	let pendingRecovery:
@@ -1645,6 +1651,12 @@ async function runLoopBody(
 			const recoveryAttempt = pendingRecovery;
 			const wasMalformedToolRecoveryAttempt = recoveryAttempt?.kind === "malformed-tool-call";
 			try {
+				const getLogicalTurnToolChoice = (): ToolChoice | undefined => {
+					if (escapedNonAsciiToolChoiceCaptured) return escapedNonAsciiToolChoice;
+					escapedNonAsciiToolChoice = config.getToolChoice?.();
+					escapedNonAsciiToolChoiceCaptured = true;
+					return escapedNonAsciiToolChoice;
+				};
 				const attemptConfig = attemptTransaction
 					? {
 							...config,
@@ -1688,6 +1700,7 @@ async function runLoopBody(
 							}
 						: undefined,
 					escapedToolTransaction,
+					recoveryAttempt ? undefined : { value: getLogicalTurnToolChoice() },
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -1866,6 +1879,8 @@ async function runLoopBody(
 				continue;
 			}
 			escapedNonAsciiResampleAttempt = 0;
+			escapedNonAsciiToolChoiceCaptured = false;
+			escapedNonAsciiToolChoice = undefined;
 
 			const overflow = managedContextOverflow(message, config);
 			if (config.fallbackManaged && overflow) {
@@ -1921,6 +1936,13 @@ async function runLoopBody(
 
 			// One provider invocation is committed before any tool can run.
 			transaction?.flush();
+			if (escapedToolTransaction) {
+				// Tool-call updates are staged so an escaped turn can disappear
+				// atomically. Once accepted, drain every published update through the
+				// Agent/AgentSession consumers before dispatch: streaming edit guards
+				// can then abort the run before any tool execute() is entered.
+				if (!loopSignal.aborted && stream.hasActiveConsumer) await stream.waitForConsumerDrain(loopSignal);
+			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
 			}
@@ -2167,6 +2189,7 @@ async function streamAssistantResponse(
 		forceAutoToolChoice?: boolean;
 	},
 	provisionalToolTransaction?: ManagedAttemptTransaction,
+	toolChoiceOverride?: { value: ToolChoice | undefined },
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
@@ -2229,7 +2252,11 @@ async function streamAssistantResponse(
 
 	// Synthetic recovery requests choose their tool mode explicitly below and
 	// must never consume a queued dynamic choice intended for an ordinary turn.
-	const dynamicToolChoice = recoveryMode ? undefined : config.getToolChoice?.();
+	const dynamicToolChoice = recoveryMode
+		? undefined
+		: toolChoiceOverride
+			? toolChoiceOverride.value
+			: config.getToolChoice?.();
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);
 	const harmonyAbortController = harmonyMitigationEnabled ? new AbortController() : undefined;
