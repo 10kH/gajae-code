@@ -33,6 +33,13 @@ export interface TestProcessResult {
 
 export type TestProcessRunner = (spec: TestProcessSpec, timeoutMs: number) => Promise<TestProcessResult>;
 
+export interface LinuxProcessIdentity {
+	pid: number;
+	processGroup: number;
+	startTime: string;
+	state: string;
+}
+
 const repoRoot = path.join(import.meta.dir, "..");
 const TEST_FILE_PATTERN = /(?:^|\/)(?:[^/]+\.(?:test|spec)|(?:test|spec)_[^/]+)\.(?:[cm]?[jt]sx?)$/u;
 const PROVIDER_ENDPOINT_ENV = [
@@ -157,7 +164,59 @@ export function buildTestProcessSpec(
 	};
 }
 
-async function terminateProcess(child: Bun.Subprocess, signal: NodeJS.Signals): Promise<void> {
+export async function probeLinuxProcess(pid: number): Promise<LinuxProcessIdentity | undefined> {
+	try {
+		const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+		const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const state = fields[0];
+		const processGroup = Number(fields[2]);
+		const startTime = fields[19];
+		if (!state || !Number.isSafeInteger(processGroup) || !startTime) throw new Error(`Malformed /proc/${pid}/stat.`);
+		return { pid, processGroup, startTime, state };
+	} catch (error) {
+		if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
+		throw error;
+	}
+}
+
+export async function processIdentityIsExecuting(identity: LinuxProcessIdentity): Promise<boolean> {
+	const current = await probeLinuxProcess(identity.pid);
+	if (!current || current.startTime !== identity.startTime) return false;
+	return current.state !== "Z" && current.state !== "X";
+}
+
+async function processGroupHasExecutingMembers(processGroup: number): Promise<boolean> {
+	if (process.platform !== "linux") {
+		try {
+			process.kill(-processGroup, 0);
+			return true;
+		} catch (error) {
+			return (error as NodeJS.ErrnoException).code === "EPERM";
+		}
+	}
+	for (const entry of await fs.readdir("/proc")) {
+		if (!/^\d+$/u.test(entry)) continue;
+		let identity: LinuxProcessIdentity | undefined;
+		try {
+			identity = await probeLinuxProcess(Number(entry));
+		} catch {
+			return true;
+		}
+		if (identity?.processGroup === processGroup && identity.state !== "Z" && identity.state !== "X") return true;
+	}
+	return false;
+}
+
+async function waitForNoExecutingGroupMembers(processGroup: number, timeoutMs: number): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	do {
+		if (!(await processGroupHasExecutingMembers(processGroup))) return true;
+		await Bun.sleep(20);
+	} while (Date.now() < deadline);
+	return !(await processGroupHasExecutingMembers(processGroup));
+}
+
+async function signalProcessGroup(child: Bun.Subprocess, signal: NodeJS.Signals): Promise<void> {
 	if (process.platform === "win32") {
 		if (child.exitCode !== null) return;
 		child.kill(signal);
@@ -170,6 +229,29 @@ async function terminateProcess(child: Bun.Subprocess, signal: NodeJS.Signals): 
 	}
 }
 
+async function terminateProcess(child: Bun.Subprocess, leader: LinuxProcessIdentity | undefined): Promise<void> {
+	if (process.platform === "win32") {
+		await signalProcessGroup(child, "SIGTERM");
+		await Bun.sleep(1_000);
+		await signalProcessGroup(child, "SIGKILL");
+		return;
+	}
+	const currentLeader = await probeLinuxProcess(child.pid);
+	if (leader && currentLeader && currentLeader.startTime !== leader.startTime) {
+		throw new Error(`Refusing to signal reused process-group leader pid ${child.pid}.`);
+	}
+	await signalProcessGroup(child, "SIGTERM");
+	if (await waitForNoExecutingGroupMembers(child.pid, 1_000)) return;
+	const leaderAfterGrace = await probeLinuxProcess(child.pid);
+	if (leader && leaderAfterGrace && leaderAfterGrace.startTime !== leader.startTime) {
+		throw new Error(`Refusing to SIGKILL reused process-group leader pid ${child.pid}.`);
+	}
+	await signalProcessGroup(child, "SIGKILL");
+	if (!(await waitForNoExecutingGroupMembers(child.pid, 2_000))) {
+		throw new Error(`Process group ${child.pid} still has executing members after SIGKILL.`);
+	}
+}
+
 export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
 	const child = Bun.spawn(spec.argv, {
 		cwd: spec.cwd,
@@ -179,17 +261,14 @@ export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
 		stderr: "inherit",
 		detached: process.platform !== "win32",
 	});
-	activeChildren.add(child);
+	const leader = process.platform === "linux" ? await probeLinuxProcess(child.pid) : undefined;
+	activeChildren.set(child, leader);
 	let timedOut = false;
 	let timeoutCleanup: Promise<void> | undefined;
 	const { promise: timeoutStarted, resolve: resolveTimeoutStarted } = Promise.withResolvers<void>();
 	const timer = setTimeout(() => {
 		timedOut = true;
-		timeoutCleanup = (async () => {
-			await terminateProcess(child, "SIGTERM");
-			await Bun.sleep(1_000);
-			await terminateProcess(child, "SIGKILL");
-		})();
+		timeoutCleanup = terminateProcess(child, leader);
 		resolveTimeoutStarted();
 	}, timeoutMs);
 	try {
@@ -204,7 +283,7 @@ export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
 	}
 };
 
-const activeChildren = new Set<Bun.Subprocess>();
+const activeChildren = new Map<Bun.Subprocess, LinuxProcessIdentity | undefined>();
 let terminating = false;
 let signalHandlersInstalled = false;
 
@@ -212,9 +291,7 @@ async function handleSignal(signal: NodeJS.Signals): Promise<void> {
 	if (terminating) return;
 	terminating = true;
 	const children = Array.from(activeChildren);
-	await Promise.all(children.map(child => terminateProcess(child, "SIGTERM")));
-	await Bun.sleep(1_000);
-	await Promise.all(children.map(child => terminateProcess(child, "SIGKILL")));
+	await Promise.all(children.map(([child, leader]) => terminateProcess(child, leader)));
 	process.exit(signal === "SIGINT" ? 130 : 143);
 }
 

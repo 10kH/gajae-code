@@ -6,6 +6,8 @@ import {
 	buildTestProcessSpec,
 	enumerateTestFiles,
 	parseHarnessOptions,
+	probeLinuxProcess,
+	processIdentityIsExecuting,
 	runHarness,
 	selectShard,
 	type TestProcessRunner,
@@ -165,7 +167,7 @@ describe("fresh-process test harness contracts", () => {
 		const pidFile = path.join(root, "descendant.pid");
 		await Bun.write(
 			path.join(root, "tests", "timeout.test.ts"),
-			'import { test } from "bun:test"; import * as fs from "node:fs/promises"; test("hang", async () => { const child = Bun.spawn(["bun", "-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000)"], { stdout: "ignore", stderr: "ignore" }); await fs.writeFile(process.env.DESCENDANT_PID!, String(child.pid)); await new Promise(() => {}); });\n',
+			'import { test } from "bun:test"; import * as fs from "node:fs/promises"; test("hang", async () => { const child = Bun.spawn(["bun", "-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000)"], { stdout: "ignore", stderr: "ignore" }); const stat = await fs.readFile(`/proc/${child.pid}/stat`, "utf8"); const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" "); await fs.writeFile(process.env.DESCENDANT_PID!, `${child.pid}:${fields[19]}`); await new Promise(() => {}); });\n',
 		);
 		const priorPidFile = process.env.DESCENDANT_PID;
 		process.env.DESCENDANT_PID = pidFile;
@@ -181,9 +183,11 @@ describe("fresh-process test harness contracts", () => {
 			else process.env.DESCENDANT_PID = priorPidFile;
 		}
 		expect(exitCode).toBe(1);
-		const descendantPid = Number((await Bun.file(pidFile).text()).trim());
+		const [pidText, startTime] = (await Bun.file(pidFile).text()).trim().split(":");
+		const descendantPid = Number(pidText);
 		expect(descendantPid).toBeInteger();
-		expect(() => process.kill(descendantPid, 0)).toThrow();
+		const observed = await probeLinuxProcess(descendantPid);
+		if (observed?.startTime === startTime) expect(await processIdentityIsExecuting(observed)).toBe(false);
 	});
 
 	test("SIGTERM cleans up the active test process group before the harness exits", async () => {
@@ -196,7 +200,7 @@ describe("fresh-process test harness contracts", () => {
 		const pidFile = path.join(root, "descendant.pid");
 		await Bun.write(
 			path.join(root, "tests", "signal.test.ts"),
-			`import { test } from "bun:test";\nimport * as fs from "node:fs/promises";\ntest("hang", async () => { const child = Bun.spawn(["bun", "-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdout: "ignore", stderr: "ignore" }); await fs.writeFile(process.env.DESCENDANT_PID!, String(child.pid)); await new Promise(() => {}); });\n`,
+			`import { test } from "bun:test";\nimport * as fs from "node:fs/promises";\ntest("hang", async () => { const child = Bun.spawn(["bun", "-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdout: "ignore", stderr: "ignore" }); const stat = await fs.readFile(\`/proc/\${child.pid}/stat\`, "utf8"); const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" "); await fs.writeFile(process.env.DESCENDANT_PID!, \`\${child.pid}:\${fields[19]}\`); await new Promise(() => {}); });\n`,
 		);
 		const harness = Bun.spawn(
 			[
@@ -216,7 +220,7 @@ describe("fresh-process test harness contracts", () => {
 		let descendantPid: number | undefined;
 		for (let attempt = 0; attempt < 100; attempt++) {
 			if (await Bun.file(pidFile).exists()) {
-				descendantPid = Number((await Bun.file(pidFile).text()).trim());
+				descendantPid = Number((await Bun.file(pidFile).text()).trim().split(":")[0]);
 				break;
 			}
 			await Bun.sleep(20);
@@ -224,13 +228,10 @@ describe("fresh-process test harness contracts", () => {
 		expect(descendantPid).toBeInteger();
 		harness.kill("SIGTERM");
 		expect(await harness.exited).toBe(143);
+		const startTime = (await Bun.file(pidFile).text()).trim().split(":")[1];
 		for (let attempt = 0; attempt < 100; attempt++) {
-			try {
-				process.kill(descendantPid!, 0);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
-				throw error;
-			}
+			const observed = await probeLinuxProcess(descendantPid!);
+			if (!observed || observed.startTime !== startTime || !(await processIdentityIsExecuting(observed))) return;
 			await Bun.sleep(20);
 		}
 		throw new Error(`Descendant process ${descendantPid} survived harness SIGTERM cleanup.`);
