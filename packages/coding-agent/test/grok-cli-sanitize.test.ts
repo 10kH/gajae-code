@@ -50,11 +50,32 @@ describe("Grok CLI payload sanitize", () => {
 		}
 	});
 
-	it("does not enable effort for IDs merely sharing a supported prefix", () => {
-		expect(supportsReasoningEffort("grok-4.60")).toBe(false);
-		expect(
-			sanitizePayload({ reasoning: { effort: "high" } }, "grok-4.60", undefined, process.cwd()).reasoning,
-		).toBeUndefined();
+	it("accepts valid hyphenated variants and rejects collisions or malformed suffixes", () => {
+		for (const modelId of ["grok-4.5-preview", "grok-4.6-preview"]) {
+			expect(supportsReasoningEffort(modelId)).toBe(true);
+			expect(
+				sanitizePayload({ reasoning: { effort: "high" } }, modelId, undefined, process.cwd()).reasoning,
+			).toEqual({
+				effort: "high",
+			});
+		}
+
+		for (const modelId of [
+			"grok-4.60",
+			"grok-4.5-",
+			"grok-4.6-",
+			"grok-4.6--preview",
+			"grok-4.6-preview--fast",
+			"grok-4.6- preview",
+			"grok-4.6-preview_fast",
+			"grok-4.6-preview.fast",
+			"ungrok-4.6",
+		]) {
+			expect(supportsReasoningEffort(modelId)).toBe(false);
+			expect(
+				sanitizePayload({ reasoning: { effort: "high" } }, modelId, undefined, process.cwd()).reasoning,
+			).toBeUndefined();
+		}
 	});
 });
 
