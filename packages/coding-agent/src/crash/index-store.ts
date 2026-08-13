@@ -343,6 +343,17 @@ async function readRetiredFingerprints(indexPath: string): Promise<string[]> {
 	return raw === undefined ? [] : (parseRetiredIndex(raw)?.fingerprints ?? []);
 }
 
+async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string): Promise<void> {
+	if (index.retiredFingerprints.length === 0) return;
+	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
+	if (contents === undefined) {
+		index.retiredFingerprints = [];
+		return;
+	}
+	const retained = new Set(parseRecoverableCrashRecords(contents).map(record => record.fingerprint));
+	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => retained.has(fingerprint));
+}
+
 // ---------------------------------------------------------------------------
 // Merge
 // ---------------------------------------------------------------------------
@@ -411,6 +422,10 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	index.recentEventIds.push(event.recordId);
 	if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
 		index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
+	// A journal occurrence is newer authority than a prior eviction tombstone.
+	// Clear it before capacity eviction so a full retirement ledger cannot block
+	// the signature's explicit revival.
+	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => fingerprint !== event.fingerprint);
 	if (existing) {
 		existing.lifetimeCount += 1;
 		existing.lastSeen = Math.max(existing.lastSeen, event.at);
@@ -472,8 +487,8 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 		recordsByFingerprint.set(record.fingerprint, records);
 	}
 	for (const [fingerprint, records] of recordsByFingerprint) {
-		const oldest = records[0];
-		const newest = records.at(-1);
+		const oldest = records.reduce((candidate, record) => (record.at < candidate.at ? record : candidate));
+		const newest = records.reduce((candidate, record) => (record.at >= candidate.at ? record : candidate));
 		if (!oldest || !newest) continue;
 		let entry = index.signatures[fingerprint];
 		if (!entry) {
@@ -549,6 +564,7 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		for (const fingerprint of await readRetiredFingerprints(paths.index)) {
 			if (!index.retiredFingerprints.includes(fingerprint)) index.retiredFingerprints.push(fingerprint);
 		}
+		await pruneRetiredFingerprints(index, paths.crashLog);
 
 		const drained = await drainJournal(paths);
 		for (const file of drained) {
