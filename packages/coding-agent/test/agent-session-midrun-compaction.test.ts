@@ -253,7 +253,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 		toolResultText?: string;
 		extensionSource?: string;
 		partialForStream?: (message: AssistantMessage) => AssistantMessage;
-
+		publishTextStartBeforeAfterStreamStart?: boolean;
 		afterStreamStart?: (options: Parameters<StreamFn>[2]) => Promise<void>;
 	}): Promise<{
 		session: AgentSession;
@@ -299,6 +299,10 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 						const message = options.responder(call);
 						const partial = options.partialForStream?.(message) ?? message;
 						stream.push({ type: "start", partial });
+						if (options.publishTextStartBeforeAfterStreamStart) {
+							stream.push({ type: "text_start", contentIndex: 0, partial });
+							await stream.waitForConsumerDrain(streamOptions?.signal ?? new AbortController().signal);
+						}
 						await options.afterStreamStart?.(streamOptions);
 						stream.push({ type: "done", reason: message.stopReason as never, message });
 					})();
@@ -340,7 +344,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 		for (const message of messages) {
 			session.agent.emitExternalEvent({ type: "message_end", message: message as never });
 		}
-		await Bun.sleep(10);
+		await session.awaitSessionSettlement();
 	}
 
 	async function seedPrunableLoop(session: AgentSession, count: number, toolCallPrefix: string): Promise<void> {
@@ -576,6 +580,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 
 		const loop = await buildLoopSession({
 			extensionSource: shortCircuitExtensionSource(),
+			publishTextStartBeforeAfterStreamStart: true,
 			responder: call => {
 				if (call === 1) {
 					originalAnchor = assistantFor(model, {
@@ -634,9 +639,25 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 
 			expect(originalAnchor).toBeDefined();
 			expect(loop.session.messages.includes(originalAnchor!)).toBe(false);
+			const cursorMessages = loop.agentEvents.flatMap(event => {
+				if (event.type !== "message_end") return [];
+				const content = JSON.stringify((event.message as { content?: unknown }).content ?? "");
+				return content.includes("Cursor") || content.includes("and continuation") ? [event.message] : [];
+			});
+			expect(cursorMessages.map(message => message.role)).toEqual(["assistant", "toolResult", "assistant"]);
+			expect(JSON.stringify((cursorMessages[0] as { content?: unknown } | undefined)?.content)).toContain(
+				"Cursor preamble",
+			);
+			expect(JSON.stringify((cursorMessages[1] as { content?: unknown } | undefined)?.content)).toContain(
+				"Cursor server-side result",
+			);
+			expect(JSON.stringify((cursorMessages[2] as { content?: unknown } | undefined)?.content)).toContain(
+				"and continuation",
+			);
 			expect(
 				loop.agentEvents.filter(event => event.type === "agent_end" && event.stopReason === "maintenance"),
 			).toHaveLength(1);
+			expect(loop.events.filter(event => event.type === "agent_end")).toHaveLength(1);
 			expect(loop.streamCallCount()).toBe(2);
 		} finally {
 			unsubscribeCursorStart();
