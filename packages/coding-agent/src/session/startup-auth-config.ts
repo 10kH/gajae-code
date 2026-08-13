@@ -103,6 +103,21 @@ function resolveRankingMode(value: unknown): CredentialRankingMode | undefined {
 	return value === "balanced" || value === "earliest-reset" ? value : undefined;
 }
 
+function canonicalBrokerUrl(raw: string): string {
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		throw new Error("Auth broker URL is invalid.");
+	}
+	if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) {
+		throw new Error("Auth broker URL must be an HTTP(S) origin without credentials.");
+	}
+	if (parsed.search || parsed.hash) throw new Error("Auth broker URL must not contain a query or fragment.");
+	parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+	return parsed.toString().replace(/\/$/, "");
+}
+
 function throwLegacyLiteralKeyError(keys: string[]): never {
 	throw new Error(
 		`Unsupported legacy dotted auth configuration key${keys.length === 1 ? "" : "s"}: ${keys.join(", ")}. ` +
@@ -230,6 +245,7 @@ export async function resolveStartupAuthConfig(agentDir: string = getAgentDir())
 
 	let url = envUrl || undefined;
 	if (!url && typeof broker?.url === "string" && broker.url.trim()) url = broker.url.trim();
+	if (url) url = canonicalBrokerUrl(url);
 
 	const configToken = typeof broker?.token === "string" && broker.token.trim() ? broker.token.trim() : undefined;
 
@@ -238,7 +254,7 @@ export async function resolveStartupAuthConfig(agentDir: string = getAgentDir())
 		const token = envToken || configToken || (await readTokenFile());
 		if (!token) {
 			throw new Error(
-				`GJC_AUTH_BROKER_URL is set (${url}) but no bearer token is available. ` +
+				"An auth broker URL is configured but no bearer token is available. " +
 					`Set GJC_AUTH_BROKER_TOKEN, the nested \`auth.broker.token\` config entry, or place one at ${getAuthBrokerTokenFilePath()}.`,
 			);
 		}

@@ -3306,8 +3306,39 @@ export class SelectorController {
 				});
 				return;
 			}
-			if (mode === "login") await this.#handleOAuthLogin(providerId, options);
-			else await this.#handleOAuthLogout(providerId);
+			if (mode === "login") {
+				await this.#handleOAuthLogin(providerId, options);
+				return;
+			}
+			const hasRemovableOAuth = authStorage
+				.listCredentialRemovalTargets(providerId)
+				.some(target => target.provider === providerId);
+			if (!hasRemovableOAuth) {
+				await this.#handleOAuthLogout(providerId);
+				return;
+			}
+			this.showSelector(done => {
+				let selector: OAuthSelectorComponent;
+				selector = new OAuthSelectorComponent(
+					"logout",
+					authStorage,
+					() => undefined,
+					() => {
+						selector.stopValidation();
+						done();
+						this.ctx.ui.requestRender();
+					},
+					{
+						accountProviderId: providerId,
+						onAccountRemove: async targets => {
+							await this.#handleOAuthLogout(providerId, targets);
+							selector.stopValidation();
+							done();
+						},
+					},
+				);
+				return { component: selector, focus: selector };
+			});
 			return;
 		}
 

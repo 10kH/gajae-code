@@ -269,6 +269,23 @@ export class OAuthSelectorComponent extends Container {
 			.map(entry => entry.target as CredentialRemovalTarget);
 	}
 
+	#confirmOrArmAccountRemoval(targets: readonly CredentialRemovalTarget[], prompt: string): void {
+		if (this.#pendingAccountRemovalTargets !== undefined) {
+			const pending = this.#pendingAccountRemovalTargets;
+			this.#pendingAccountRemovalTargets = undefined;
+			this.#statusMessage = undefined;
+			void this.#onAccountRemove?.(pending);
+			return;
+		}
+		if (targets.length === 0) {
+			this.#statusMessage = "No accounts available to remove.";
+		} else {
+			this.#pendingAccountRemovalTargets = targets;
+			this.#statusMessage = `${prompt} Enter to confirm, Esc to cancel`;
+		}
+		this.#updateList();
+	}
+
 	#updateList(): void {
 		if (this.#accountProviderId) {
 			this.#updateAccountList();
@@ -421,7 +438,7 @@ export class OAuthSelectorComponent extends Container {
 				if (this.#mode === "login") {
 					void this.#onAccountSelect?.({ kind: "id", value: String(selected.row.id) });
 				} else if (selected.target) {
-					void this.#onAccountRemove?.([selected.target]);
+					this.#confirmOrArmAccountRemoval([selected.target], "Remove this account?");
 				}
 			} else if (selected.kind === "auto") {
 				void this.#onAutoSelect?.();
@@ -434,13 +451,7 @@ export class OAuthSelectorComponent extends Container {
 					void this.#onAccountRemove?.(targets);
 				} else {
 					const targets = this.#getAccountRemovalTargets();
-					if (targets.length === 0) {
-						this.#statusMessage = "No accounts available to remove.";
-					} else {
-						this.#pendingAccountRemovalTargets = targets;
-						this.#statusMessage = `Remove all ${targets.length} accounts? Enter to confirm, Esc to cancel`;
-					}
-					this.#updateList();
+					this.#confirmOrArmAccountRemoval(targets, `Remove all ${targets.length} accounts?`);
 				}
 			}
 			return;
@@ -463,24 +474,28 @@ export class OAuthSelectorComponent extends Container {
 		const pendingConfirmationCleared = !isConfirm && !isCancel ? this.#clearPendingAccountRemoval() : false;
 		const itemCount = this.#accountProviderId ? this.#filteredAccountEntries.length : this.#filteredProviders.length;
 		if (matchesKey(keyData, "up")) {
+			this.#clearPendingAccountRemoval();
 			if (itemCount > 0) this.#selectedIndex = this.#selectedIndex === 0 ? itemCount - 1 : this.#selectedIndex - 1;
 			this.#statusMessage = undefined;
 			this.#updateList();
 			return;
 		}
 		if (matchesKey(keyData, "down")) {
+			this.#clearPendingAccountRemoval();
 			if (itemCount > 0) this.#selectedIndex = this.#selectedIndex === itemCount - 1 ? 0 : this.#selectedIndex + 1;
 			this.#statusMessage = undefined;
 			this.#updateList();
 			return;
 		}
 		if (matchesKey(keyData, "pageUp")) {
+			this.#clearPendingAccountRemoval();
 			if (itemCount > 0) this.#selectedIndex = Math.max(0, this.#selectedIndex - OAUTH_SELECTOR_MAX_VISIBLE);
 			this.#statusMessage = undefined;
 			this.#updateList();
 			return;
 		}
 		if (matchesKey(keyData, "pageDown")) {
+			this.#clearPendingAccountRemoval();
 			if (itemCount > 0)
 				this.#selectedIndex = Math.min(itemCount - 1, this.#selectedIndex + OAUTH_SELECTOR_MAX_VISIBLE);
 			this.#statusMessage = undefined;
