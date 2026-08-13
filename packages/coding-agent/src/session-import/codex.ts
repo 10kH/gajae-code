@@ -337,8 +337,7 @@ function sameSourceIdentity(left: RecoveryFsIdentity, right: RecoveryFsIdentity)
 	return (
 		left.dev === right.dev &&
 		left.ino === right.ino &&
-		left.nlink === "1" &&
-		right.nlink === "1" &&
+		left.nlink === right.nlink &&
 		left.size === right.size &&
 		left.mtimeNs === right.mtimeNs &&
 		left.ctimeNs === right.ctimeNs
@@ -386,7 +385,7 @@ function readCodexSessionTitles(codexHome: string): Map<string, string> {
 		root = openRecoveryFsRoot(codexHome);
 		file = root.openFile("session_index.jsonl");
 		const initial = file.identity();
-		if (!initial.ok || !initial.identity || initial.identity.nlink !== "1") return new Map();
+		if (!initial.ok || !initial.identity) return new Map();
 		if (BigInt(initial.identity.size) > BigInt(MAX_SESSION_INDEX_BYTES)) return new Map();
 		const chunks: Buffer[] = [];
 		let offset = 0;
@@ -460,7 +459,7 @@ async function readSessionMeta(
 	const handle = await fs.open(file, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
 	try {
 		const initial = await handle.stat({ bigint: true });
-		if (!initial.isFile() || initial.nlink !== 1n) return null;
+		if (!initial.isFile()) return null;
 		const buffer = Buffer.alloc(64 * 1024);
 		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
 		const meta = parseSessionMeta(file, buffer.subarray(0, bytesRead));
@@ -911,29 +910,29 @@ export async function convertCodexSession(
 			}
 			counts.input++;
 			const timestamp = safeTimestamp(record.timestamp, source.timestamp);
-			if (record.type !== "response_item" || !record.payload || typeof record.payload !== "object") {
-				if (record.type === "event_msg" || record.type === "turn_context" || record.type === "world_state") {
-					counts.dropped++;
-					continue;
-				}
-				const sanitized = sanitizeImportedValue(record);
-				const eventType = sanitizeImportedString(String(record.type ?? "unknown"));
-				counts.redacted += sanitized.redacted + eventType.redacted;
-				const item: CodexQuarantineRecord = {
-					line: lineNumber,
-					timestamp,
-					eventType: eventType.value,
-					reason: "unsupported_envelope",
-					payload: sanitized.value,
-				};
-				const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + 1;
-				if (quarantineBytes + itemBytes <= MAX_QUARANTINE_BYTES) {
-					quarantine.push(item);
-					quarantineBytes += itemBytes;
-				} else quarantineTruncated = true;
-				counts.quarantined++;
-				continue;
-			}
+		if (record.type !== "response_item" || !record.payload || typeof record.payload !== "object") {
+			const sanitized = sanitizeImportedValue(record);
+			const eventType = sanitizeImportedString(String(record.type ?? "unknown"));
+			counts.redacted += sanitized.redacted + eventType.redacted;
+			const reason =
+				record.type === "event_msg" || record.type === "turn_context" || record.type === "world_state"
+					? "unsupported_record_type"
+					: "unsupported_envelope";
+			const item: CodexQuarantineRecord = {
+				line: lineNumber,
+				timestamp,
+				eventType: eventType.value,
+				reason,
+				payload: sanitized.value,
+			};
+			const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + 1;
+			if (quarantineBytes + itemBytes <= MAX_QUARANTINE_BYTES) {
+				quarantine.push(item);
+				quarantineBytes += itemBytes;
+			} else quarantineTruncated = true;
+			counts.quarantined++;
+			continue;
+		}
 			const payload = record.payload as Record<string, unknown>;
 			let result = mapResponseItem(payload, timestamp);
 			if ("kind" in result && result.kind === "tool_call") {

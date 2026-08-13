@@ -217,19 +217,23 @@ describe.skipIf(process.platform !== "linux")("Codex session import", () => {
 		});
 	});
 
-	it("rejects symlinked and hard-linked Codex sources", async () => {
+	it("rejects symlinked Codex sources and accepts hard-linked sources", async () => {
 		await source("safe-source", workspace, [message("user", "safe")]);
-		await source("hard-linked", workspace, [message("user", "unsafe")]);
+		await source("hard-linked", workspace, [message("user", "hard-linked")]);
 		const directory = path.join(codexHome, "sessions", "2026");
 		await fs.symlink(path.join(directory, "safe-source.jsonl"), path.join(directory, "symlink-source.jsonl"));
-		await fs.link(path.join(directory, "hard-linked.jsonl"), path.join(directory, "hard-linked-copy.jsonl"));
 
 		expect((await discoverCodexSessions(workspace, ["safe-source"], codexHome)).map(value => value.id)).toEqual([
 			"safe-source",
 		]);
-		await expect(discoverCodexSessions(workspace, ["hard-linked"], codexHome)).rejects.toMatchObject({
+		await expect(discoverCodexSessions(workspace, ["symlink-source"], codexHome)).rejects.toMatchObject({
 			code: "source_not_found",
 		});
+		// Hard-linked files (nlink > 1) are accepted — real Codex rollout files
+		// legitimately have nlink = 2.
+		expect((await discoverCodexSessions(workspace, ["hard-linked"], codexHome)).map(value => value.id)).toEqual([
+			"hard-linked",
+		]);
 	});
 	it("rejects group-writable retained Codex roots during discovery", async () => {
 		await source("untrusted-root", workspace, [message("user", "unsafe root")]);
@@ -775,7 +779,7 @@ describe.skipIf(process.platform !== "linux")("Codex session import", () => {
 		}
 	});
 	it("rejects a converted transcript that cannot be resumed within the context budget", async () => {
-		const exactBytes = 70_002_143;
+		const exactBytes = 134_002_143;
 		const id = "large";
 		const dir = path.join(codexHome, "sessions", "2026");
 		await fs.mkdir(dir, { recursive: true });
