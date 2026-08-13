@@ -417,6 +417,25 @@ describe("import collision policy and safety", () => {
 		}
 	});
 
+	test("nested auth/oauth MCP fields are diagnosed instead of silently dropped", async () => {
+		await writeFile(
+			path.join(projectDir, ".mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					srv: { type: "stdio", command: "npx", auth: { clientSecret: "NESTED_SECRET" } },
+				},
+			}),
+		);
+		const plan = await buildImportPreview(previewOptions({ surfaces: ["mcps"] }));
+		expect(plan.preview.entries[0].status).toBe("unsupported");
+		expect(plan.preview.entries[0].reason).toContain("not supported");
+		expect(JSON.stringify(plan.preview)).not.toContain("NESTED_SECRET");
+		expect(JSON.stringify(plan.payloads)).not.toContain("NESTED_SECRET");
+		const result = await applyImport(plan, { cwd: projectDir });
+		expect(result.ok).toBe(true);
+		expect(result.entries[0].outcome).toBe("skipped");
+	});
+
 	test("malformed source MCP config is a warning, not a crash", async () => {
 		await writeFile(path.join(projectDir, ".mcp.json"), "{ broken");
 		const plan = await buildImportPreview(previewOptions({ surfaces: ["mcps"] }));

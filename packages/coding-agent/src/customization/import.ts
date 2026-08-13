@@ -290,6 +290,32 @@ interface DestinationMcpState {
 	error?: string;
 }
 
+function nestedAuthServerNames(product: ImportProduct, content: string): Set<string> {
+	const names = new Set<string>();
+	if (product === "claude-code") {
+		const parsed = tryParseJson<Record<string, unknown>>(content);
+		const servers = parsed?.mcpServers;
+		if (!servers || !isRecord(servers)) return names;
+		for (const [name, value] of Object.entries(servers)) {
+			if (!isRecord(value)) continue;
+			if (value.auth !== undefined || value.oauth !== undefined) names.add(name);
+		}
+		return names;
+	}
+	try {
+		const parsed = Bun.TOML.parse(content) as Record<string, unknown>;
+		const servers = parsed.mcp_servers;
+		if (!servers || !isRecord(servers)) return names;
+		for (const [name, value] of Object.entries(servers)) {
+			if (!isRecord(value)) continue;
+			if (value.auth !== undefined || value.oauth !== undefined) names.add(name);
+		}
+	} catch {
+		// The canonical normalizer reports parse diagnostics.
+	}
+	return names;
+}
+
 async function readDestinationMcpState(mcpConfigPath: string): Promise<DestinationMcpState> {
 	const read = await readStructured(mcpConfigPath);
 	if (read.kind === "absent") return { servers: {} };
@@ -491,6 +517,8 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 					: normalizeCodexMcpToml(read.content, sourcePath, options.sourceScope)
 				: { items: [], warnings: [] as string[] };
 		for (const warning of normalized.warnings) warnings.push(`${sourceLabel} MCPs: ${warning}`);
+		const unsupportedNestedAuth =
+			read.kind === "value" ? nestedAuthServerNames(options.product, read.content) : new Set<string>();
 		if (normalized.items.length > 0) {
 			const destState = await readDestinationMcpState(destination.mcpConfigPath);
 			if (destState.servers === null) {
@@ -500,6 +528,19 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 			const takenMcpNames = new Set(Object.keys(existingServers));
 			for (const server of normalized.items) {
 				const name = server.name;
+				if (unsupportedNestedAuth.has(name)) {
+					push({
+						surface: "mcps",
+						sourceName: name,
+						destinationName: name,
+						status: "unsupported",
+						sourceCategory: "MCP server entry",
+						description: `MCP server "${name}" (credentials redacted)`,
+						reason:
+							"nested auth/oauth configuration is not supported by the canonical GJC MCP contract; import was skipped to avoid dropping credentials",
+					});
+					continue;
+				}
 				const invalidReason = !isSafeName(name)
 					? "unsafe MCP server name (path separators, control characters, or traversal segments are not allowed)"
 					: validateMCPCompatServer(server);
