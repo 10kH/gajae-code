@@ -7,9 +7,10 @@
  * auto-target anything: a `reportedAt` stamp changes default highlighting, not
  * permission, and every submission is independently confirmed.
  *
- * Increments come from the append-only journal, not from this file, so a lost,
- * hostile or concurrently-rewritten index can never silently deflate counts —
- * it is rebuilt from the journal instead.
+ * Increments normally come from the append-only journal. When that write was
+ * lost, compaction may recover a never-indexed signature only from a complete
+ * v1 crash record whose fingerprint recomputes from its own diagnostic text.
+ * Evicted reported or acknowledged signatures stay durably retired.
  */
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -26,6 +27,7 @@ import {
 	parseCrashRecordMarker,
 } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
+import { parseRecoverableCrashRecords } from "./record-loader";
 
 export const CRASH_INDEX_VERSION = 1;
 /** Per-entry message preview cap. */
@@ -78,7 +80,14 @@ export interface CrashIndex {
 	/** True when a new signature could not be stored because nothing was evictable. */
 	overflow: boolean;
 	recentEventIds: string[];
+	/** Reported or acknowledged signatures evicted from the index; never recovered from the log. */
+	retiredFingerprints: string[];
 	signatures: Record<string, CrashSignatureEntry>;
+}
+
+interface CrashRetiredIndex {
+	version: number;
+	fingerprints: string[];
 }
 
 export interface CrashStatePaths {
@@ -102,6 +111,7 @@ export function emptyCrashIndex(): CrashIndex {
 		lastNudgedAt: 0,
 		overflow: false,
 		recentEventIds: [],
+		retiredFingerprints: [],
 		signatures: Object.create(null) as Record<string, CrashSignatureEntry>,
 	};
 }
@@ -124,7 +134,15 @@ const ENTRY_KEYS = new Set([
 	"acknowledgedAt",
 	"commentedIssues",
 ]);
-const INDEX_KEYS = new Set(["version", "updatedAt", "lastNudgedAt", "overflow", "recentEventIds", "signatures"]);
+const INDEX_KEYS = new Set([
+	"version",
+	"updatedAt",
+	"lastNudgedAt",
+	"overflow",
+	"recentEventIds",
+	"retiredFingerprints",
+	"signatures",
+]);
 
 const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/;
 
@@ -152,6 +170,26 @@ function parseJsonNullProto(raw: string): unknown {
 		if (value && typeof value === "object" && !Array.isArray(value)) return Object.assign(Object.create(null), value);
 		return value;
 	}) as unknown;
+}
+
+function retiredIndexPath(indexPath: string): string {
+	return `${indexPath}.retired`;
+}
+
+function parseRetiredIndex(raw: string): CrashRetiredIndex | undefined {
+	let parsed: unknown;
+	try {
+		parsed = parseJsonNullProto(raw);
+	} catch {
+		return undefined;
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+	const body = parsed as Record<string, unknown>;
+	if (body.version !== CRASH_INDEX_VERSION || !Array.isArray(body.fingerprints)) return undefined;
+	if (body.fingerprints.length > CRASH_INDEX_MAX_SIGNATURES) return undefined;
+	if (!body.fingerprints.every(value => typeof value === "string" && CRASH_FINGERPRINT_PATTERN.test(value)))
+		return undefined;
+	return { version: CRASH_INDEX_VERSION, fingerprints: [...body.fingerprints] };
 }
 
 function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefined {
@@ -213,6 +251,16 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 	if (typeof body.overflow !== "boolean") return undefined;
 	if (!Array.isArray(body.recentEventIds) || body.recentEventIds.length > RECENT_EVENT_ID_LIMIT) return undefined;
 	if (!body.recentEventIds.every(id => typeof id === "string" && /^[0-9a-f]{8,32}$/.test(id))) return undefined;
+	if (body.retiredFingerprints !== undefined) {
+		if (!Array.isArray(body.retiredFingerprints) || body.retiredFingerprints.length > CRASH_INDEX_MAX_SIGNATURES)
+			return undefined;
+		if (
+			!body.retiredFingerprints.every(
+				fingerprint => typeof fingerprint === "string" && CRASH_FINGERPRINT_PATTERN.test(fingerprint),
+			)
+		)
+			return undefined;
+	}
 	if (!body.signatures || typeof body.signatures !== "object" || Array.isArray(body.signatures)) return undefined;
 
 	const signatures = Object.create(null) as Record<string, CrashSignatureEntry>;
@@ -231,6 +279,7 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		lastNudgedAt: body.lastNudgedAt as number,
 		overflow: body.overflow,
 		recentEventIds: [...(body.recentEventIds as string[])],
+		retiredFingerprints: [...((body.retiredFingerprints as string[] | undefined) ?? [])],
 		signatures,
 	};
 }
@@ -289,6 +338,11 @@ async function quarantineIndex(indexPath: string, now: number): Promise<string |
 	return target;
 }
 
+async function readRetiredFingerprints(indexPath: string): Promise<string[]> {
+	const raw = await readNoFollow(retiredIndexPath(indexPath), CRASH_INDEX_MAX_BYTES);
+	return raw === undefined ? [] : (parseRetiredIndex(raw)?.fingerprints ?? []);
+}
+
 // ---------------------------------------------------------------------------
 // Merge
 // ---------------------------------------------------------------------------
@@ -315,6 +369,10 @@ function evictOne(index: CrashIndex): boolean {
 		}
 	}
 	if (!victim) return false;
+	if (!index.retiredFingerprints.includes(victim)) {
+		if (index.retiredFingerprints.length >= CRASH_INDEX_MAX_SIGNATURES) return false;
+		index.retiredFingerprints.push(victim);
+	}
 	delete index.signatures[victim];
 	return true;
 }
@@ -381,12 +439,12 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 }
 
 /**
- * Recompute retained counts from the crash log's identity markers.
+ * Recover never-indexed signatures from bound records, then recompute retained counts.
  *
- * `lifetimeCount` accumulates from the journal and never decreases; the crash
- * log is capped and reset, so retained counts are re-derived from what the log
- * actually still holds. That separation keeps a log reset from deflating a
- * signature's history.
+ * Journal counts remain authoritative for known signatures. A never-seen
+ * signature is admitted only from complete v1 records that recompute to their
+ * marker fingerprint; its initial lifetime is the number of distinct retained
+ * record ids. Repeated compaction cannot add those records again.
  *
  * The count is held at `lifetimeCount`, which `parseEntry` requires it not to
  * exceed. The log can hold more records than the journal counted — a fatal whose
@@ -394,7 +452,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
  * record — and without this the compactor would write an index its own reader
  * quarantines whole on the next read.
  */
-async function recomputeRetainedCounts(index: CrashIndex, crashLogPath: string): Promise<void> {
+async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath: string, now: number): Promise<void> {
 	for (const entry of Object.values(index.signatures)) entry.retainedCount = 0;
 	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
 	if (contents === undefined) return;
@@ -403,6 +461,46 @@ async function recomputeRetainedCounts(index: CrashIndex, crashLogPath: string):
 		if (!marker) continue;
 		const entry = index.signatures[marker.fingerprint];
 		if (entry && entry.retainedCount < entry.lifetimeCount) entry.retainedCount += 1;
+	}
+	const recordsByFingerprint = new Map<string, ReturnType<typeof parseRecoverableCrashRecords>>();
+	const seenRecordIds = new Set<string>();
+	for (const record of parseRecoverableCrashRecords(contents)) {
+		if (seenRecordIds.has(record.recordId)) continue;
+		seenRecordIds.add(record.recordId);
+		const records = recordsByFingerprint.get(record.fingerprint) ?? [];
+		records.push(record);
+		recordsByFingerprint.set(record.fingerprint, records);
+	}
+	for (const [fingerprint, records] of recordsByFingerprint) {
+		const oldest = records[0];
+		const newest = records.at(-1);
+		if (!oldest || !newest) continue;
+		let entry = index.signatures[fingerprint];
+		if (!entry) {
+			if (index.retiredFingerprints.includes(fingerprint)) continue;
+			if (oldest.at < MIN_TIMESTAMP_MS || newest.at > now + MAX_FUTURE_SKEW_MS) continue;
+			if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {
+				index.overflow = true;
+				continue;
+			}
+			entry = {
+				fpv: newest.fpv,
+				errorName: newest.errorName,
+				messageClass: boundMessageClass(newest.messageClass),
+				lifetimeCount: records.length,
+				retainedCount: records.length,
+				firstSeen: oldest.at,
+				lastSeen: newest.at,
+				lastRecordId: newest.recordId,
+			};
+			index.signatures[fingerprint] = entry;
+			for (const record of records) {
+				if (index.recentEventIds.includes(record.recordId)) continue;
+				index.recentEventIds.push(record.recordId);
+				if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
+					index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
+			}
+		}
 	}
 }
 
@@ -448,6 +546,9 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 			await quarantineIndex(paths.index, now);
 			index = emptyCrashIndex();
 		}
+		for (const fingerprint of await readRetiredFingerprints(paths.index)) {
+			if (!index.retiredFingerprints.includes(fingerprint)) index.retiredFingerprints.push(fingerprint);
+		}
 
 		const drained = await drainJournal(paths);
 		for (const file of drained) {
@@ -459,7 +560,7 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 			}
 		}
 
-		await recomputeRetainedCounts(index, paths.crashLog);
+		await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
 		index.updatedAt = now;
 		let serialized = `${JSON.stringify(index)}\n`;
 		while (Buffer.byteLength(serialized, "utf8") > CRASH_INDEX_MAX_BYTES && evictOne(index)) {
@@ -471,6 +572,10 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		}
 		await fs.rm(paths.index, { force: true });
 		await writeAtomic(paths.index, serialized);
+		await writeAtomic(
+			retiredIndexPath(paths.index),
+			`${JSON.stringify({ version: CRASH_INDEX_VERSION, fingerprints: index.retiredFingerprints })}\n`,
+		);
 		for (const file of drained) await fs.rm(file, { force: true }).catch(() => {});
 		return index;
 	});

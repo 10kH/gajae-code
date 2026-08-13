@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { appendCrashEvent, type CrashEvent, formatCrashRecordMarker } from "@gajae-code/utils";
+import { appendCrashEvent, type CrashEvent, computeCrashFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
 import {
 	CRASH_INDEX_MAX_SIGNATURES,
 	type CrashStatePaths,
@@ -44,6 +44,26 @@ function recordId(seed: number): string {
 	return seed.toString(16).padStart(16, "0");
 }
 
+function recoverableRecord(
+	seed: number,
+	message = `recovered crash ${seed}`,
+): { fingerprint: string; recordId: string; text: string } {
+	const id = recordId(seed);
+	const headline = `Error: ${message}`;
+	const stack = `${headline}\n    at recovered (packages/coding-agent/src/crash/recovery.ts:1:1)`;
+	const fingerprint = computeCrashFingerprint(
+		{ name: "Error", message, stack },
+		{ installRoot: process.cwd() },
+	).fingerprint;
+	return {
+		fingerprint,
+		recordId: id,
+		text:
+			`2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] ${headline}\n` +
+			`${stack}\n${formatCrashRecordMarker(fingerprint, 1, id)}\n\n`,
+	};
+}
+
 describe("compactCrashIndex", () => {
 	it("counts every journaled occurrence exactly once, including across repeated compactions", async () => {
 		const paths = await tempPaths();
@@ -58,6 +78,76 @@ describe("compactCrashIndex", () => {
 		// Re-running with an empty journal must not change counts.
 		const again = await compactCrashIndex({ paths, now: NOW });
 		expect(again.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(8);
+	});
+
+	it("recovers a complete fingerprint-bound v1 record when its journal append was lost", async () => {
+		const paths = await tempPaths();
+		const recovered = recoverableRecord(200);
+		await fs.writeFile(paths.crashLog, recovered.text);
+
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[recovered.fingerprint]).toMatchObject({
+			lifetimeCount: 1,
+			retainedCount: 1,
+			lastRecordId: recovered.recordId,
+		});
+		expect(index.signatures[recovered.fingerprint]?.reportedAt).toBeUndefined();
+		expect(index.signatures[recovered.fingerprint]?.acknowledgedAt).toBeUndefined();
+	});
+
+	it("deduplicates recovered record ids and keeps repeated compaction idempotent", async () => {
+		const paths = await tempPaths();
+		const recovered = recoverableRecord(201);
+		await fs.writeFile(paths.crashLog, recovered.text + recovered.text);
+
+		const first = await compactCrashIndex({ paths, now: NOW });
+		const second = await compactCrashIndex({ paths, now: NOW });
+		expect(first.signatures[recovered.fingerprint]?.lifetimeCount).toBe(1);
+		expect(second.signatures[recovered.fingerprint]?.lifetimeCount).toBe(1);
+		expect(second.signatures[recovered.fingerprint]?.retainedCount).toBe(1);
+	});
+
+	it("recovers from the log after compaction drained the journal and a later index is quarantined", async () => {
+		const paths = await tempPaths();
+		const recovered = recoverableRecord(202);
+		appendCrashEvent(occurrence(recovered.fingerprint, recovered.recordId), paths.events);
+		await fs.writeFile(paths.crashLog, recovered.text);
+		await compactCrashIndex({ paths, now: NOW });
+		await fs.writeFile(paths.index, "not-json");
+
+		const rebuilt = await compactCrashIndex({ paths, now: NOW });
+		expect(rebuilt.signatures[recovered.fingerprint]?.lifetimeCount).toBe(1);
+		expect(rebuilt.signatures[recovered.fingerprint]?.retainedCount).toBe(1);
+	});
+
+	it("does not revive a reported signature after it is evicted", async () => {
+		const paths = await tempPaths();
+		const retired = recoverableRecord(203);
+		await fs.writeFile(paths.crashLog, retired.text);
+		appendCrashEvent(occurrence(retired.fingerprint, retired.recordId, NOW - 1_000_000), paths.events);
+		for (let seed = 1; seed < CRASH_INDEX_MAX_SIGNATURES; seed++)
+			appendCrashEvent(occurrence(fingerprintFor(seed), recordId(seed), NOW - seed), paths.events);
+		await compactCrashIndex({ paths, now: NOW });
+		await recordCrashStateEvent(
+			{
+				kind: "reported",
+				fingerprint: retired.fingerprint,
+				at: NOW,
+				issueUrl: "https://github.com/Yeachan-Heo/gajae-code/issues/1",
+			},
+			{ paths, now: NOW },
+		);
+		appendCrashEvent(occurrence(fingerprintFor(9999), recordId(9999), NOW), paths.events);
+
+		const evicted = await compactCrashIndex({ paths, now: NOW });
+		expect(evicted.signatures[retired.fingerprint]).toBeUndefined();
+		expect(evicted.retiredFingerprints).toContain(retired.fingerprint);
+		const again = await compactCrashIndex({ paths, now: NOW });
+		expect(again.signatures[retired.fingerprint]).toBeUndefined();
+		await fs.writeFile(paths.index, "not-json");
+		const rebuilt = await compactCrashIndex({ paths, now: NOW });
+		expect(rebuilt.signatures[retired.fingerprint]).toBeUndefined();
+		expect(rebuilt.retiredFingerprints).toContain(retired.fingerprint);
 	});
 
 	it("produces exact counts under concurrent compactors", async () => {
@@ -228,6 +318,7 @@ describe("parseCrashIndex", () => {
 		lastNudgedAt: 0,
 		overflow: false,
 		recentEventIds: [recordId(1)],
+		retiredFingerprints: [],
 		signatures: {
 			[fingerprintFor(1)]: {
 				fpv: 1,
