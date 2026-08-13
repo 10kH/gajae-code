@@ -677,13 +677,13 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 		}
 		try {
 			await fs.link(tempFile, readinessFile);
-			await syncCoordinatorDirectory(path.dirname(readinessFile));
 		} catch (error) {
 			if ((error as { code?: unknown }).code !== "EEXIST") throw runtimeReadinessMarkerConflict();
 			const raced = await readRuntimeInputReadyMarker(readinessFile);
 			if (raced && raced.session_id === expected.sessionId && raced.launch_id === expected.launchId) return raced;
 			throw runtimeReadinessMarkerConflict();
 		}
+		await syncCoordinatorDirectory(path.dirname(readinessFile));
 		return marker;
 	} finally {
 		await fs.rm(tempFile, { force: true });
