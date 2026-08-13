@@ -129,6 +129,45 @@ test("steady ownership heartbeat advances only the owner-tagged sidecar", async 
 	expect((await readOwnerFreshnessSnapshot({ settings: s })).effectiveHeartbeatAt).toBe(2);
 });
 
+test("heartbeat lock-read failures clean staging files for the live owner", async () => {
+	const agentDir = tempAgentDir();
+	const s = setPrivateAgentDir(settings(agentDir), agentDir);
+	const paths = daemonPaths(agentDir);
+	await acquireDaemonOwnership({
+		settings: s,
+		tokenFingerprint: "fp",
+		chatId: "42",
+		pid: process.pid,
+		randomId: () => "owner",
+	});
+	const originalReadFile = fs.promises.readFile.bind(fs.promises);
+	let lockReads = 0;
+	const failingFs: TelegramDaemonFs = {
+		...(fs.promises as unknown as TelegramDaemonFs),
+		readFile: (async (file: string, options?: BufferEncoding | { encoding?: BufferEncoding | null }) => {
+			if (file === paths.lock && ++lockReads >= 1) {
+				const error = new Error("simulated sharing violation") as NodeJS.ErrnoException;
+				error.code = "EPERM";
+				throw error;
+			}
+			return await originalReadFile(file, options as BufferEncoding);
+		}) as TelegramDaemonFs["readFile"],
+	};
+
+	await expect(
+		renewOwnerHeartbeatSidecar({
+			settings: s,
+			ownerId: "owner",
+			acquisitionId: "owner",
+			pid: process.pid,
+			fs: failingFs,
+		}),
+	).rejects.toMatchObject({ code: "EPERM" });
+
+	const stagingPrefix = `${paths.heartbeat}.`;
+	expect(fs.readdirSync(path.dirname(paths.heartbeat)).filter(name => path.join(path.dirname(paths.heartbeat), name).startsWith(stagingPrefix))).toEqual([]);
+});
+
 test("stale-tag sidecars are inert and a stale writer cannot overwrite a successor heartbeat", async () => {
 	const agentDir = tempAgentDir();
 	const s = setPrivateAgentDir(settings(agentDir), agentDir);

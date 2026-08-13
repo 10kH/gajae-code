@@ -6,10 +6,13 @@
 - `/theme <name>` now switches the theme immediately without opening the selector: the name is validated against built-in and custom themes, persisted to the detected `theme.dark`/`theme.light` slot, and applied to the running session in one step. Bare `/theme` keeps the existing live-preview selector, and an unknown name is rejected with the list of available themes.
 
 ### Fixed
-### Fixed
+- The Telegram notification daemon now contains transient Windows state or ownership-lock read failures during steady heartbeat renewal instead of terminating its run loop. Staging files are cleaned in a `finally` block, and only a proven ownership mismatch stops the owner (#4200).
+- Coordinator MCP now answers the standard `ping` keepalive with an empty result instead of `method not found`, preventing liveness clients from reconnecting repeatedly.
 - Task-launched canonical subagents no longer receive an ACP exact-config `toolsOnly` MCP manager that they are forbidden to reuse. Planner, Architect, Critic, and Ralplan consensus lanes now start normally while reusable plugin MCP managers continue to inherit across sub-sessions.
 - Managed output publication no longer freezes the resident event loop when a no-replace rename stalls in the kernel (#4394). Async managed publication now uses async file operations and native blocking-pool rename/link boundaries, while per-session stores also reap scrubbed protocol remnants on a throttled, serialized schedule. Atomic no-replace semantics and the synchronous publication path are unchanged.
 - The SDK broker's Windows process-liveness probe no longer opens a console window on every poll. `runProcessIncarnationCommand` spawned `powershell.exe` without `windowsHide`, and on Windows 11 — where the default terminal delegation hands every new console to Windows Terminal — each probe therefore created a visible terminal window that stole focus. The PowerShell path runs whenever the native reader cannot bind the target pid, so one dead or inaccessible pid turned the broker's ~2s liveness polling into a continuous window flash for the life of the process. Every other internal spawn in the repo already passed `windowsHide: true`; this one did not.
+- Foreground Bash calls that finish before their auto-background deadline now cancel that deadline instead of leaving an uncancellable `Bun.sleep()` behind. In print mode the losing sleep kept the compiled CLI alive for the full command timeout after Bash and subagent work had already completed, which appeared as a shutdown hang with no active Node handles.
+- Prompt suggestions now remain visible after cancelling another interactive action and returning to the composer.
 ## [0.13.1] - 2026-08-11
 
 ### Added
