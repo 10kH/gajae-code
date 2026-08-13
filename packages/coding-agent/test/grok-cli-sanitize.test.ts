@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { resolveModels } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/models/catalog";
 import { sanitizePayload } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/payload/sanitize";
 
 describe("Grok CLI payload sanitize", () => {
@@ -33,5 +34,35 @@ describe("Grok CLI payload sanitize", () => {
 
 			expect(efforts).toEqual(["low", "low", "medium", "high", "high", "high"]);
 		}
+	});
+
+	it("keeps xhigh for Grok 4.6 and its aliases", () => {
+		for (const modelId of ["grok-4.6", "grok-4.6-latest"]) {
+			const efforts = ["minimal", "low", "medium", "high", "xhigh", "max"].map(requested => {
+				const payload = sanitizePayload({ reasoning: { effort: requested } }, modelId, undefined, process.cwd());
+				return (payload.reasoning as { effort: string }).effort;
+			});
+
+			expect(efforts).toEqual(["low", "low", "medium", "high", "xhigh", "xhigh"]);
+		}
+	});
+});
+
+describe("Grok CLI model catalog", () => {
+	it("lists grok-4.6 with the documented context window and pricing", () => {
+		const model = resolveModels().find(entry => entry.id === "grok-4.6");
+
+		expect(model).toBeDefined();
+		expect(model?.reasoning).toBe(true);
+		expect(model?.input).toEqual(["text", "image"]);
+		expect(model?.contextWindow).toBe(500_000);
+		expect(model?.cost).toEqual({ input: 2, output: 6, cacheRead: 0.5, cacheWrite: 0 });
+	});
+
+	it("keeps grok-4.5 listed alongside grok-4.6", () => {
+		const ids = resolveModels().map(entry => entry.id);
+
+		expect(ids).toContain("grok-4.5");
+		expect(ids).toContain("grok-4.6");
 	});
 });
