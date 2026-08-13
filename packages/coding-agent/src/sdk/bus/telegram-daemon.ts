@@ -5292,7 +5292,32 @@ export class TelegramNotificationDaemon {
 	archiveReconciliationHarnessForTest() {
 		return {
 			reconcilePendingTopicDeletes: () => this.reconcilePendingTopicDeletes(),
+			archiveAuthorizedTopics: () => this.archiveAuthorizedTopicsForTest(),
 		};
+	}
+
+	/** Retry only topics carrying explicit durable archive authority. */
+	async #archiveAuthorizedTopics(): Promise<void> {
+		if (!this.#topicRegistryMutationAllowed()) return;
+		for (const sessionId of this.topics.archivePendingSessionIds(this.runtime.now())) {
+			const topic = this.topics.get(sessionId);
+			if (topic?.topicOrigin !== "daemon_created" || topic.archiveReason === undefined) continue;
+			const foreignOwner = topic.leaseOwner ?? topic.archiveHostId;
+			if (
+				foreignOwner !== undefined &&
+				foreignOwner !== this.installationHostId &&
+				(topic.leaseExpiresAt ?? 0) > this.runtime.now()
+			)
+				continue;
+			const outcome = await this.archiveTopic(sessionId);
+			if (outcome === "post_dispatch_pending")
+				logger.warn(`notifications: Telegram topic cleanup retained a retry for session ${sessionId}`);
+		}
+	}
+
+	/** @internal Test-only access to explicit durable archive reconciliation. */
+	private archiveAuthorizedTopicsForTest(): Promise<void> {
+		return this.#archiveAuthorizedTopics();
 	}
 	#attachmentIsCurrent(session: AttachmentSession): boolean {
 		return this.sessions.get(session.sessionId) === session && session.subscription.isActive();
@@ -5446,11 +5471,15 @@ export class TelegramNotificationDaemon {
 			reason,
 		};
 		this.#cleanupReceipts.set(subscription.subscriptionId, receipt);
-		void this.#persistPresentationState().catch(() => undefined);
+		await this.#persistPublicationReceipts().catch(() => {
+			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
+		});
 		if (reason === "removed" && !session.logicalSessionIdTrusted) {
 			// Router disappearance alone is not durable archive authority.
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
-			void this.#persistPresentationState().catch(() => undefined);
+			await this.#persistPublicationReceipts().catch(() => {
+				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
+			});
 			return;
 		}
 		if (reason === "replaced" || reason === "replaced_same_generation") {
@@ -5469,12 +5498,16 @@ export class TelegramNotificationDaemon {
 				if (owner === session) this.#logicalSessionOwners.delete(logicalSessionId);
 			}
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
-			void this.#persistPresentationState().catch(() => undefined);
+			await this.#persistPublicationReceipts().catch(() => {
+				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
+			});
 			return;
 		}
 		this.#dropSession(session, "router_session_removed");
 		this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
-		void this.#persistPresentationState().catch(() => undefined);
+		await this.#persistPublicationReceipts().catch(() => {
+			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
+		});
 	}
 
 	#createFrameRouter(): OperatorEventRouter<AttachmentSession> {
