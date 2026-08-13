@@ -240,6 +240,7 @@ export function planFullTasks(packages: readonly WorkspacePackage[]): Task[] {
 	const tasks = new Map<string, Task>();
 	addNativeBuild(tasks);
 	addWorkspaceTestTasks(tasks, packages);
+	add(tasks, "test:scripts/run-bun-test-files.test.ts", "Test fresh-process Bun harness", ["bun", "test", "scripts/run-bun-test-files.test.ts"]);
 	add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 	addRustTestTasks(tasks);
 	add(tasks, "cli-smoke", "GJC CLI smoke test", ["bun", "run", "ci:test:smoke"]);
@@ -792,7 +793,7 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 	}
 	if (paths.some(isWorkflowOrScriptPath)) {
 		add(tasks, "affected-dry-run", "Affected CI selector self-check", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
-		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
+		add(tasks, "affected-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
 		add(tasks, "workflow-permissions", "Workflow permission policy regression", ["bun", "test", "scripts/check-workflow-permissions.test.ts", "scripts/release-policy.test.ts"]);
 		if (paths.some(isWorkflowPath)) {
 			add(tasks, "workflow-yaml-parse", "Workflow YAML parse check", ["bun", "scripts/check-workflow-yaml.ts"]);
@@ -931,7 +932,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 		add(tasks, "install-methods", "Install method smoke tests", ["bun", "run", "ci:test:install-methods"]);
 	}
 	if (needCiSelftest) {
-		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
+		add(tasks, "ci-selftest", "Affected CI selector unit tests", ["bun", "test", "scripts/ci-dev-affected.test.ts", "scripts/run-bun-test-files.test.ts", "scripts/dev-ci-guard-topology.test.ts", "scripts/ci-risk-canary-manifest.test.ts", "scripts/ci-virtual-integration.test.ts"]);
 		add(tasks, "ci-dry-run", "Affected CI selector dry-run", ["bun", "scripts/ci-dev-affected.ts", "--dry-run"]);
 	}
 	if (needYamlParse) {
@@ -968,6 +969,22 @@ function addWorkspaceTestTasks(tasks: Map<string, Task>, packages: readonly Work
 }
 
 function addPackageTestTasks(tasks: Map<string, Task>, workspacePackage: WorkspacePackage): void {
+	if (workspacePackage.name === "@gajae-code/ai") {
+		add(
+			tasks,
+			`test:${workspacePackage.name}`,
+			`Test ${workspacePackage.name}`,
+			[
+				"bun",
+				"scripts/run-bun-test-files.ts",
+				"--root=packages/ai",
+				"--timeout=30000",
+				"--file-timeout=300000",
+				"--concurrency=1",
+			],
+		);
+		return;
+	}
 	if (workspacePackage.name !== "@gajae-code/coding-agent") {
 		add(tasks, `test:${workspacePackage.name}`, `Test ${workspacePackage.name}`, packageScriptCommand("test"), resolvePackageCwd(workspacePackage.dir));
 		return;
@@ -985,7 +1002,15 @@ function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total:
 		tasks,
 		`test:@gajae-code/coding-agent:shard-${shard}-of-${total}`,
 		`Test @gajae-code/coding-agent shard ${shard}/${total}`,
-		["bun", "test", "packages/coding-agent", "--timeout=30000", `--shard=${shard}/${total}`],
+		[
+			"bun",
+			"scripts/run-bun-test-files.ts",
+			"--root=packages/coding-agent",
+			`--shard=${shard}/${total}`,
+			"--timeout=30000",
+			"--file-timeout=300000",
+			"--concurrency=1",
+		],
 	);
 }
 
@@ -1065,7 +1090,7 @@ function isTestFilePath(changedPath: string): boolean {
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
-	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts" || changedPath === "scripts/ci-risk-canary-manifest.ts" || changedPath === "scripts/ci-risk-canary-manifest.test.ts" || changedPath === "scripts/ci-virtual-integration.ts" || changedPath === "scripts/ci-virtual-integration.test.ts";
+	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/run-bun-test-files.ts" || changedPath === "scripts/run-bun-test-files.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts" || changedPath === "scripts/ci-risk-canary-manifest.ts" || changedPath === "scripts/ci-risk-canary-manifest.test.ts" || changedPath === "scripts/ci-virtual-integration.ts" || changedPath === "scripts/ci-virtual-integration.test.ts";
 }
 
 
@@ -1459,6 +1484,8 @@ function isWorkflowHarnessPath(changedPath: string): boolean {
 		isWorkflowPath(changedPath) ||
 		changedPath === "scripts/ci-dev-affected.ts" ||
 		changedPath === "scripts/ci-dev-affected.test.ts" ||
+		changedPath === "scripts/run-bun-test-files.ts" ||
+		changedPath === "scripts/run-bun-test-files.test.ts" ||
 		changedPath === "scripts/dev-ci-guard-topology.test.ts" ||
 		changedPath === "scripts/check-workflow-yaml.ts" ||
 		changedPath === "scripts/check-workflow-permissions.ts" ||
