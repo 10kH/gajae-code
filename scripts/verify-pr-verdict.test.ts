@@ -94,17 +94,36 @@ test("canonicalDiffSha256 hashes exact bytes", () => {
 	expect(canonicalDiffSha256("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 });
 
-test("workflow is pull_request-scoped, read-only, exact-head, and invokes the validator", async () => {
+test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
-	expect(workflow).toContain("pull_request:");
-	expect(workflow).not.toContain("pull_request_target");
+	expect(workflow).toContain("pull_request_target:");
+	expect(workflow).not.toMatch(/^\s+pull_request:\s*$/mu);
 	expect(workflow).toContain("permissions:\n  contents: read");
+	expect(workflow).toContain("name: PR contract");
+	expect(workflow).toContain("name: Validate exact-head PR contract");
+	expect(workflow).toContain("repository: ${{ github.event.pull_request.head.repo.full_name }}");
 	expect(workflow).toContain("ref: ${{ github.event.pull_request.head.sha }}");
 	expect(workflow).toContain("ref: ${{ github.event.pull_request.base.sha }}");
-	expect(workflow).toContain("validator=trusted-base/scripts/verify-pr-verdict.ts");
-	expect(workflow).not.toContain("validator=pr-head/scripts/verify-pr-verdict.ts");
-	expect(workflow).toContain('bun "$validator" --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base');
+	expect(workflow.match(/persist-credentials: false/gu)).toHaveLength(2);
+	expect(workflow).toContain('bun trusted-base/scripts/verify-pr-verdict.ts --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base');
+	expect(workflow).not.toContain("pr-head/scripts/verify-pr-verdict.ts");
+	expect(workflow).not.toContain("secrets.");
+	expect(workflow).not.toContain("actions/cache");
+	expect(workflow).not.toContain("upload-artifact");
+	expect(workflow).not.toContain("download-artifact");
 	expect(workflow).not.toContain("continue-on-error");
+});
+
+test("a PR-authored workflow cannot become the trusted enforcement authority", async () => {
+	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
+	const spoofedHeadWorkflow = workflow.replace(
+		'bun trusted-base/scripts/verify-pr-verdict.ts --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base',
+		'bun pr-head/scripts/verify-pr-verdict.ts --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root pr-head',
+	);
+	// GitHub loads pull_request_target workflow bytes from the default branch, not from this PR diff.
+	expect(workflow).toContain("pull_request_target:");
+	expect(spoofedHeadWorkflow).toContain("pr-head/scripts/verify-pr-verdict.ts");
+	expect(workflow).not.toContain("pr-head/scripts/verify-pr-verdict.ts");
 });
 
 test("template pins reviewer identity and exact diff digest", async () => {

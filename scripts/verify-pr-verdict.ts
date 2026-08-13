@@ -144,7 +144,7 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	if (checkedOut.exitCode !== 0 || new TextDecoder().decode(checkedOut.stdout).trim() !== headSha) {
 		return { ok: false, diagnostics: [`Checked-out source must equal exact PR head ${headSha}.` ] };
 	}
-	const fetchBase = await git(["fetch", "--no-tags", "origin", baseSha], cwd);
+	const fetchBase = await git(["fetch", "--no-tags", trustedRoot, baseSha], cwd);
 	if (fetchBase.exitCode !== 0) return { ok: false, diagnostics: [`Could not fetch immutable PR base ${baseSha}: ${fetchBase.stderr}`] };
 	const ancestry = await git(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
 	const diff = await git(["diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], cwd);
