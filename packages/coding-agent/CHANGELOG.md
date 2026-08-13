@@ -4,6 +4,7 @@
 
 ### Fixed
 - Print mode now requests a governed process exit after successful session teardown, so completed one-shot runs cannot be pinned by residual runtime handles; both stdout and stderr are drained first and the recorded exit code is preserved.
+- `todo_write` no longer rejects a positional task handle without saying how to address a task. Callers reach for `id`/`index` because the tool result renders todos as a list, and raw validation rejects the unknown key before `execute` runs; positional-handle keys now explain that tasks are addressed by exact `task` content or by `phase`.
 
 ## [0.13.2] - 2026-08-13
 
