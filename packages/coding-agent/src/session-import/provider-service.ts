@@ -4,11 +4,10 @@ import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { canContinuePersistedHistory } from "@gajae-code/agent-core";
 import { type SessionDestinationInput, SessionManager } from "../session/session-manager";
-import { FileSessionStorage } from "../session/session-storage";
 import { parseClaudeCodeTranscript, parseClaudeExport } from "./claude";
 import { detectSessionImportFormat } from "./detect";
 import { parseCodexRollout } from "./provider-codex";
-import { IMPORT_SANITIZER_VERSION } from "./redact";
+import { IMPORT_SANITIZER_VERSION, redactImportedText } from "./redact";
 import {
 	type ImportedConversation,
 	type ImportQuarantineRecord,
@@ -59,18 +58,19 @@ interface ParsedSource {
 /** Read the explicit source file with fixed bounds. The source is never written. */
 async function readImportSource(sourcePath: string): Promise<{ text: string; bytes: number; sha256: string }> {
 	const resolved = path.resolve(sourcePath);
+	const displayPath = redactImportedText(sourcePath).value;
 	let handle: fsp.FileHandle;
 	try {
 		handle = await fsp.open(resolved, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT") {
-			throw new SessionImportError("source_not_found", "read", `Transcript file does not exist: ${sourcePath}`);
+			throw new SessionImportError("source_not_found", "read", `Transcript file does not exist: ${displayPath}`);
 		}
 		throw new SessionImportError(
 			"source_unreadable",
 			"read",
-			`Transcript file cannot be read (${code ?? "unknown error"}): ${sourcePath}`,
+			`Transcript file cannot be read (${code ?? "unknown error"}): ${displayPath}`,
 			{ retryable: true },
 		);
 	}
@@ -80,11 +80,11 @@ async function readImportSource(sourcePath: string): Promise<{ text: string; byt
 			throw new SessionImportError(
 				"invalid_request",
 				"read",
-				`Import source must be a regular file, not a directory or special file: ${sourcePath}`,
+				`Import source must be a regular file, not a directory or special file: ${displayPath}`,
 			);
 		}
 		if (initial.size === 0n) {
-			throw new SessionImportError("malformed_input", "parse", `Transcript file is empty: ${sourcePath}`);
+			throw new SessionImportError("malformed_input", "parse", `Transcript file is empty: ${displayPath}`);
 		}
 		if (initial.size > BigInt(EXTERNAL_IMPORT_SOURCE_MAX_BYTES)) {
 			throw new SessionImportError(
@@ -138,7 +138,7 @@ async function readImportSource(sourcePath: string): Promise<{ text: string; byt
 		throw new SessionImportError(
 			"source_unreadable",
 			"read",
-			`Transcript file cannot be read (${code ?? "unknown error"}): ${sourcePath}`,
+			`Transcript file cannot be read (${code ?? "unknown error"}): ${displayPath}`,
 			{ retryable: true },
 		);
 	} finally {
@@ -167,7 +167,7 @@ function normalizeAdapterResult(result: {
 		conversation: result.conversation,
 		quarantine: {
 			present: result.quarantine.length > 0,
-			truncated: result.quarantine.length > MAX_QUARANTINE_RECORDS,
+			truncated: result.counts.quarantined > result.quarantine.length,
 			records: result.quarantine.slice(0, MAX_QUARANTINE_RECORDS),
 		},
 		counts: result.counts,
@@ -310,7 +310,7 @@ export async function prepareExternalSessionImport(
 		customType: EXTERNAL_IMPORT_PROVENANCE_CUSTOM_TYPE,
 		provider: parsed.conversation.provider,
 		format: parsed.conversation.format,
-		sourceFileName: path.basename(path.resolve(request.sourcePath)),
+		sourceFileName: redactImportedText(path.basename(path.resolve(request.sourcePath))).value.slice(0, 255),
 		...(parsed.conversation.sourceSessionId ? { sourceSessionId: parsed.conversation.sourceSessionId } : {}),
 		...(parsed.conversation.title ? { sourceTitle: truncateText(parsed.conversation.title, MAX_TITLE_CHARS) } : {}),
 		sourceSha256: source.sha256,
@@ -346,6 +346,7 @@ export async function materializeExternalSessionImport(
 	}
 	const importedAt = (options.now?.() ?? new Date()).toISOString();
 	const manager = SessionManager.create(options.cwd, options.destination);
+	const destination = manager.getDestinationForFork();
 	const sessionFile = manager.getSessionFile();
 	if (!sessionFile) {
 		await manager.close().catch(() => {});
@@ -390,7 +391,7 @@ export async function materializeExternalSessionImport(
 
 		// Verify the written file reopens cleanly and is continuable before the
 		// caller switches to it; a failed verification discards the new file.
-		const reopened = await SessionManager.open(sessionFile, options.destination);
+		const reopened = await SessionManager.open(sessionFile, destination);
 		try {
 			if (!canContinuePersistedHistory(reopened.buildSessionContext().messages)) {
 				throw new SessionImportError(
@@ -405,10 +406,6 @@ export async function materializeExternalSessionImport(
 		return { targetSessionId, targetPath: sessionFile, title: truncateText(title, MAX_TITLE_CHARS), prepared };
 	} catch (error) {
 		await manager.close().catch(() => {});
-		// The import manager is closed and its file was never handed to the
-		// caller's session, so a storage-level exact delete cannot conflict with
-		// a live writer. Best-effort: the failure diagnostic still wins.
-		await new FileSessionStorage().deleteSessionWithArtifacts(sessionFile).catch(() => {});
 		if (error instanceof SessionImportError) throw error;
 		const message = error instanceof Error ? error.message : String(error);
 		throw new SessionImportError("io_failed", "persist", `Failed to persist the imported session: ${message}`, {

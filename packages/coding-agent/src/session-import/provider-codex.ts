@@ -105,6 +105,7 @@ class EvidenceCollector {
 
 /** Parse a Codex rollout JSONL transcript into the provider-neutral IR. */
 export function parseCodexRollout(text: string): CodexParseResult {
+	const maxQuarantineRecords = 512;
 	const messages: ImportedMessage[] = [];
 	const quarantine: ImportQuarantineRecord[] = [];
 	const counts: SessionImportCounts = { mapped: 0, quarantined: 0, redacted: 0, omitted: 0 };
@@ -157,7 +158,9 @@ export function parseCodexRollout(text: string): CodexParseResult {
 	};
 
 	const quarantineRecord = (record: number, line: string, reason: ImportQuarantineRecord["reason"]): void => {
-		quarantine.push({ record, byteLength: Buffer.byteLength(line, "utf8"), sha256: sha256Hex(line), reason });
+		if (quarantine.length < maxQuarantineRecords) {
+			quarantine.push({ record, byteLength: Buffer.byteLength(line, "utf8"), sha256: sha256Hex(line), reason });
+		}
 		counts.quarantined++;
 	};
 
@@ -218,7 +221,7 @@ export function parseCodexRollout(text: string): CodexParseResult {
 						break;
 					}
 					case "function_call": {
-						const name = typeof payload.name === "string" ? payload.name : "tool";
+						const name = redact(typeof payload.name === "string" ? payload.name : "tool");
 						const summary = redact(boundEvidence(summarizeArguments(payload.arguments)));
 						evidence.add(summary ? `$ ${name} ${summary}` : `$ ${name}`);
 						counts.mapped++;
@@ -237,7 +240,7 @@ export function parseCodexRollout(text: string): CodexParseResult {
 						break;
 					}
 					case "custom_tool_call": {
-						const name = typeof payload.name === "string" ? payload.name : "tool";
+						const name = redact(typeof payload.name === "string" ? payload.name : "tool");
 						const input = typeof payload.input === "string" ? payload.input : "";
 						const summary = redact(boundEvidence(input));
 						evidence.add(summary ? `$ ${name} ${summary}` : `$ ${name}`);

@@ -13,7 +13,7 @@ export const IMPORT_SANITIZER_VERSION = 2;
 
 const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/gu;
 const UNSAFE_CONTROL =
-	/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
+	/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
 const HEADER_CREDENTIAL = /(\b(?:authorization|cookie|set-cookie)\b[ \t]*:[ \t]*)([^\r\n]*)/giu;
 const JSON_AUTHORIZATION = /((?:\\?")authorization(?:\\?")\s*:\s*(?:\\?")?)([^",}\r\n]+)/giu;
 

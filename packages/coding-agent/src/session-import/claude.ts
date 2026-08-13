@@ -46,6 +46,7 @@ function boundEvidence(text: string): string {
 }
 
 class ParseSink {
+	static readonly MAX_QUARANTINE_RECORDS = 512;
 	readonly messages: ImportedMessage[] = [];
 	readonly quarantine: ImportQuarantineRecord[] = [];
 	readonly counts: SessionImportCounts = { mapped: 0, quarantined: 0, redacted: 0, omitted: 0 };
@@ -63,7 +64,9 @@ class ParseSink {
 	}
 
 	quarantineRecord(record: number, raw: string, reason: ImportQuarantineRecord["reason"]): void {
-		this.quarantine.push({ record, byteLength: Buffer.byteLength(raw, "utf8"), sha256: sha256Hex(raw), reason });
+		if (this.quarantine.length < ParseSink.MAX_QUARANTINE_RECORDS) {
+			this.quarantine.push({ record, byteLength: Buffer.byteLength(raw, "utf8"), sha256: sha256Hex(raw), reason });
+		}
 		this.counts.quarantined++;
 	}
 
@@ -194,7 +197,7 @@ export function parseClaudeCodeTranscript(text: string): ClaudeParseResult {
 							// Model-internal reasoning is never imported (non-goal).
 							break;
 						case "tool_use": {
-							const name = typeof block.name === "string" ? block.name : "tool";
+							const name = sink.redact(typeof block.name === "string" ? block.name : "tool");
 							const summary = sink.redact(boundEvidence(toolUseSummary(block.input)));
 							sink.addEvidence(summary ? `$ ${name} ${summary}` : `$ ${name}`);
 							break;
@@ -259,13 +262,13 @@ export function parseClaudeExport(text: string): ClaudeParseResult {
 	try {
 		parsed = JSON.parse(text);
 	} catch {
-		sink.quarantineRecord(1, text.slice(0, 4096), "invalid_json");
+		sink.quarantineRecord(1, text, "invalid_json");
 		return emptyResult(sink);
 	}
 
 	const conversations = Array.isArray(parsed) ? parsed : [parsed];
 	if (conversations.length === 0 || !conversations.every(isRecord)) {
-		sink.quarantineRecord(1, text.slice(0, 4096), "missing_fields");
+		sink.quarantineRecord(1, text, "missing_fields");
 		return emptyResult(sink);
 	}
 	// Deterministic order: the export array order is preserved; otherwise sort by
@@ -286,18 +289,18 @@ export function parseClaudeExport(text: string): ClaudeParseResult {
 		}
 		const chatMessages = conversation.chat_messages;
 		if (!Array.isArray(chatMessages)) {
-			sink.quarantineRecord(++recordNumber, JSON.stringify(conversation).slice(0, 4096), "missing_fields");
+			sink.quarantineRecord(++recordNumber, JSON.stringify(conversation), "missing_fields");
 			continue;
 		}
 		for (const message of chatMessages) {
 			recordNumber++;
 			if (!isRecord(message)) {
-				sink.quarantineRecord(recordNumber, String(message).slice(0, 4096), "invalid_json");
+				sink.quarantineRecord(recordNumber, JSON.stringify(message), "invalid_json");
 				continue;
 			}
 			const sender = message.sender;
 			if (sender !== "human" && sender !== "assistant") {
-				sink.quarantineRecord(recordNumber, JSON.stringify(message).slice(0, 4096), "unknown_record");
+				sink.quarantineRecord(recordNumber, JSON.stringify(message), "unknown_record");
 				continue;
 			}
 			sink.counts.mapped++;

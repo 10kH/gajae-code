@@ -616,6 +616,7 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		acp: false,
 		localHeadless: true,
 		handle: async (command, runtime) => {
+			if (runtime.session?.isStreaming) return usage("Cannot import a session while streaming.", runtime);
 			const outcome = await runSessionImportCommand(command.args, runtime.cwd);
 			if (outcome.kind === "error") {
 				await runtime.output(outcome.message);
