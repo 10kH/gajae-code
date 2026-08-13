@@ -119,9 +119,12 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 63 / Slack generation 66 retain the shared ownership fence
  * unless a zero-signal process probe returns ESRCH. EPERM and unknown failures are
  * indeterminate, so earlier owners must not reclaim, replace, or spawn through them.
+ * Discord generation 64 contains synchronous provider-subscription admission
+ * and ready-hook failures without revoking shared Router attachment authority.
+ * Slack does not consume the changed hook path in this branch and remains 66.
  */
 export const CHAT_DAEMON_GENERATIONS: Readonly<Record<ChatDaemonKind, number>> = {
-	discord: 63,
+	discord: 64,
 	slack: 66,
 };
 
