@@ -156,6 +156,7 @@ process.exitCode = await child.exited;`;
 			"auth-gateway",
 			"skills",
 			"session",
+			"accounts",
 			"harness",
 			"coordinator",
 			"team",

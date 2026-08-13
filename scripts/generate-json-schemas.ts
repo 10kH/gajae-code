@@ -153,9 +153,16 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 function recordValueSchema(
 	valueSchema?:
 		| { readonly type: "model-selector-value" }
+		| { readonly type: "credential-selector" }
 		| { readonly type: "string-enum"; readonly values: readonly string[] },
 ): JsonSchema {
 	if (valueSchema?.type === "string-enum") return { type: "string", enum: valueSchema.values };
+	if (valueSchema?.type === "credential-selector") {
+		return {
+			type: "string",
+			pattern: "^(id:[1-9][0-9]*|email:[^@\\s]+@[^@\\s]+|account:\\S+)$",
+		};
+	}
 	if (valueSchema?.type !== "model-selector-value") return true;
 	const selector = { type: "string", minLength: 1, pattern: "\\S" };
 	return {

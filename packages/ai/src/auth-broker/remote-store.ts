@@ -648,7 +648,19 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		_credential: OAuthCredential,
 		signal?: AbortSignal,
 	): Promise<OAuthCredentials> {
-		const { entry } = await this.#client.refreshCredential(credentialId, signal);
+		let entry: AuthCredentialSnapshotEntry;
+		try {
+			({ entry } = await this.#client.refreshCredential(credentialId, signal));
+		} catch (error) {
+			if (isErrorStatus(error, 404) && !this.#streamingActive) {
+				await this.refreshSnapshot().catch(refreshError => {
+					logger.debug("auth-broker snapshot refresh after missing credential refresh failed", {
+						error: String(refreshError),
+					});
+				});
+			}
+			throw error;
+		}
 		if (!this.#streamingActive) {
 			await this.refreshSnapshot().catch(error => {
 				logger.debug("auth-broker snapshot refresh after credential refresh failed", { error: String(error) });

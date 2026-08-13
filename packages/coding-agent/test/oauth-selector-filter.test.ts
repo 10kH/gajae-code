@@ -86,6 +86,54 @@ describe("OAuth selector filtering", () => {
 		expect(selected).toEqual(["bizrouter"]);
 	});
 
+	test("bulk account removal requires confirmation and cancel leaves the callback untouched", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const removed: unknown[] = [];
+		const cancelled: boolean[] = [];
+		let selector: OAuthSelectorComponent | undefined;
+
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access-account-a",
+					refresh: "refresh-account-a",
+					expires: Date.now() + 60_000,
+					accountId: "account-a",
+					email: "a@example.com",
+				},
+				{
+					type: "oauth",
+					access: "access-account-b",
+					refresh: "refresh-account-b",
+					expires: Date.now() + 60_000,
+					accountId: "account-b",
+					email: "b@example.com",
+				},
+			]);
+			selector = new OAuthSelectorComponent("logout", authStorage, () => {}, () => cancelled.push(true), {
+				accountProviderId: "anthropic",
+				onAccountRemove: targets => {
+					removed.push(targets);
+				},
+			});
+
+			selector.handleInput("\x1b[B");
+			selector.handleInput("\x1b[B");
+			selector.handleInput("\n");
+
+			expect(removed).toHaveLength(0);
+			expect(renderedText(selector)).toContain("Remove all 2 accounts? Enter to confirm, Esc to cancel");
+
+			selector.handleInput("\x1b");
+			expect(removed).toHaveLength(0);
+			expect(cancelled).toHaveLength(1);
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
+	});
+
 	test("a non-matching query reports no matches instead of an empty list", async () => {
 		const { selector } = await createSelector();
 		type(selector, "zzzznotaprovider");

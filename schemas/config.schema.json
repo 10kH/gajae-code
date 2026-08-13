@@ -34,7 +34,10 @@
 				},
 				"credentialPins": {
 					"type": "object",
-					"additionalProperties": true,
+					"additionalProperties": {
+						"type": "string",
+						"pattern": "^(id:[1-9][0-9]*|email:[^@\\s]+@[^@\\s]+|account:\\S+)$"
+					},
 					"default": {}
 				}
 			},

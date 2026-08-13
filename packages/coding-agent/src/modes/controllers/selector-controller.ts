@@ -3196,10 +3196,14 @@ export class SelectorController {
 		try {
 			const authStorage = this.ctx.session.modelRegistry.authStorage;
 			const inventory = authStorage.listCredentialInventory(providerId);
-			const brokerManaged =
-				inventory.some(row => row.provider === providerId && row.credentialKind === "oauth") &&
-				authStorage.listCredentialRemovalTargets(providerId).length === 0;
-			if (brokerManaged) {
+			const oauthRows = inventory.filter(row => row.provider === providerId && row.credentialKind === "oauth");
+			const removalTargetsById = new Map(
+				authStorage.listCredentialRemovalTargets(providerId).map(target => [target.id, target]),
+			);
+			const oauthRemovalTargets = oauthRows
+				.map(row => removalTargetsById.get(row.id))
+				.filter((target): target is CredentialRemovalTarget => target !== undefined);
+			if (oauthRows.length > 0 && oauthRemovalTargets.length === 0) {
 				this.ctx.showError(
 					`Logout is broker-managed for ${providerId}; run \`gjc auth-broker logout ${providerId}\` on the broker host.`,
 				);
@@ -3207,9 +3211,7 @@ export class SelectorController {
 			}
 			if (targets) {
 				if (targets.length === 0) {
-					this.ctx.showError(
-						`Logout is broker-managed for ${providerId}; run \`gjc auth-broker logout ${providerId}\` on the broker host.`,
-					);
+					this.ctx.showError(`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`);
 					return;
 				}
 				const result = authStorage.removeAuthCredentialsHard(providerId, targets);
@@ -3225,16 +3227,19 @@ export class SelectorController {
 				);
 				return;
 			}
-			await authStorage.logout(providerId);
+			if (oauthRemovalTargets.length === 0) {
+				this.ctx.showError(`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`);
+				return;
+			}
+			const result = authStorage.removeAuthCredentialsHard(providerId, oauthRemovalTargets);
+			if (result.kind !== "removed") {
+				this.ctx.showError("Logout failed: account inventory changed; no credentials were removed. Retry /logout.");
+				return;
+			}
 			await this.ctx.session.modelRegistry.refresh();
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("success", `${theme.status.success} Successfully logged out of ${providerId}`), 1, 0),
+			this.ctx.showStatus(
+				`Successfully removed ${result.ids.length} OAuth account${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
 			);
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("dim", `Credentials removed from ${getAgentDbPath()}`), 1, 0),
-			);
-			this.ctx.ui.requestRender();
 		} catch (error: unknown) {
 			this.ctx.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
 		}

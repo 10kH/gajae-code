@@ -1534,16 +1534,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const record = data as { v?: unknown; scopeId?: unknown; provider?: unknown; pin?: unknown };
 			if (record.v !== 1 || record.scopeId !== credentialSessionId || typeof record.provider !== "string") continue;
 			const pin = record.pin as { auto?: unknown; kind?: unknown; value?: unknown } | undefined;
-			if (pin?.auto === true) {
-				authStorage.setSessionCredentialAuto(record.provider, credentialSessionId);
-			} else if (
-				pin &&
-				(pin.kind === "id" || pin.kind === "email" || pin.kind === "account" || pin.kind === "project") &&
-				typeof pin.value === "string"
-			) {
-				authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {
-					kind: pin.kind,
-					value: pin.value,
+			// Durable replay must never abort session startup: a pinned account may
+			// have been removed, disabled, or deduplicated since the pin was written.
+			// Pin identity is preserved by leaving the provider unpinned on failure —
+			// never silently retarget to another account; the user re-pins or picks AUTO.
+			try {
+				if (pin?.auto === true) {
+					authStorage.setSessionCredentialAuto(record.provider, credentialSessionId);
+				} else if (
+					pin &&
+					(pin.kind === "id" || pin.kind === "email" || pin.kind === "account" || pin.kind === "project") &&
+					typeof pin.value === "string"
+				) {
+					authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {
+						kind: pin.kind,
+						value: pin.value,
+					});
+				}
+			} catch (error) {
+				logger.warn("discarding stale durable credential pin during session restore", {
+					provider: record.provider,
+					pinKind: pin?.auto === true ? "auto" : typeof pin?.kind === "string" ? pin.kind : "unknown",
+					error: error instanceof Error ? error.message : String(error),
 				});
 			}
 		}

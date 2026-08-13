@@ -297,24 +297,45 @@ async function runLogout(providerArg: string | undefined, flags: AccountsCommand
 	}
 }
 
+function writeJsonFailure(error: unknown): void {
+	// Machine contract: exactly one JSON document on stdout, never secrets/stacks.
+	if (error instanceof AccountsCommandError) {
+		writeJson({ ok: false, error: { code: "accounts-error", message: cleanReason(error) ?? "Command failed." } });
+		return;
+	}
+	writeJson({ ok: false, error: { code: "internal-error", message: "Accounts command failed; see stderr for diagnostics." } });
+}
+
 export async function runAccountsCommand(cmd: AccountsCommandArgs): Promise<void> {
-	switch (cmd.action) {
-		case "list":
-			await runList(cmd.flags);
-			return;
-		case "check":
-			await runCheck(cmd.provider, cmd.flags);
-			return;
-		case "pin":
-			await runPin(cmd.provider, cmd.selector, cmd.flags);
-			return;
-		case "logout":
-			await runLogout(cmd.provider, cmd.flags);
-			return;
-		default: {
-			const exhaustive: never = cmd.action;
-			throw new AccountsCommandError(`Unknown accounts action: ${String(exhaustive)}`);
+	try {
+		switch (cmd.action) {
+			case "list":
+				await runList(cmd.flags);
+				return;
+			case "check":
+				await runCheck(cmd.provider, cmd.flags);
+				return;
+			case "pin":
+				await runPin(cmd.provider, cmd.selector, cmd.flags);
+				return;
+			case "logout":
+				await runLogout(cmd.provider, cmd.flags);
+				return;
+			default: {
+				const exhaustive: never = cmd.action;
+				throw new AccountsCommandError(`Unknown accounts action: ${String(exhaustive)}`);
+			}
 		}
+	} catch (error) {
+		if (cmd.flags.json) {
+			if (!(error instanceof AccountsCommandError)) {
+				process.stderr.write(`accounts command failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+			}
+			process.exitCode = 1;
+			writeJsonFailure(error);
+			return;
+		}
+		throw error;
 	}
 }
 

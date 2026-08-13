@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	AuthBrokerError,
 	AuthBrokerClient,
 	type AuthBrokerServerHandle,
 	AuthStorage,
@@ -167,6 +168,31 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		await remote.refreshSnapshot();
 		const entry = remote.snapshot.credentials[0]!;
 		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toBeUndefined();
+	});
+
+	test("refreshes the snapshot after a deleted-row refresh failure and preserves the broker error", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const staleEntry = remote.snapshot.credentials[0]!;
+		expect(staleEntry.credential.type).toBe("oauth");
+		if (staleEntry.credential.type !== "oauth") throw new Error("expected OAuth credential");
+		const snapshotFetch = vi.spyOn(client, "fetchSnapshot");
+		const directFetchesBeforeFailure = snapshotFetch.mock.calls.filter(([opts]) => opts?.waitMs === undefined).length;
+
+		storage!.disableCredentialById(staleEntry.id, "deleted in test");
+		storage!.upsertCredential("anthropic", mintOAuthCredential("replacement", Date.now() + 120_000));
+
+		const refreshError = await remote
+			.refreshOAuthCredential("anthropic", staleEntry.id, staleEntry.credential)
+			.then(() => undefined, error => error);
+		expect(refreshError).toBeInstanceOf(AuthBrokerError);
+		expect((refreshError as AuthBrokerError).status).toBe(404);
+		expect((refreshError as AuthBrokerError).body).toContain(`No credential with id=${staleEntry.id}`);
+		const directFetchesAfterFailure = snapshotFetch.mock.calls.filter(([opts]) => opts?.waitMs === undefined).length;
+		expect(directFetchesAfterFailure).toBeGreaterThan(directFetchesBeforeFailure);
+		expect(remote.snapshot.credentials).toHaveLength(1);
+		expect(remote.snapshot.credentials[0]!.id).not.toBe(staleEntry.id);
 	});
 
 	test("records aggregate usage only for the current snapshot generation", async () => {

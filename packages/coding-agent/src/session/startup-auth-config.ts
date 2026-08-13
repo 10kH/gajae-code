@@ -7,6 +7,7 @@
  * precedence over global config values.
  */
 import * as path from "node:path";
+import * as os from "node:os";
 import type { AuthCredentialSelector, CredentialRankingMode } from "@gajae-code/ai/core";
 import { $credentialEnv, getAgentDir, getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import { YAML } from "bun";
@@ -22,6 +23,33 @@ export interface StartupAuthConfigSnapshot {
 	credentialPins: Readonly<Record<string, string>>;
 }
 
+export type StartupAuthConfigErrorKind =
+	| "unreadable"
+	| "invalid-yaml"
+	| "non-mapping-root"
+	| "invalid-auth"
+	| "invalid-broker"
+	| "invalid-gateway"
+	| "invalid-ranking-mode"
+	| "invalid-credential-pins";
+
+/** A malformed startup-auth config aborts resolution rather than downgrading to local authority. */
+export class StartupAuthConfigError extends Error {
+	readonly name = "StartupAuthConfigError";
+	readonly code: StartupAuthConfigErrorKind;
+	readonly causeClass: StartupAuthConfigErrorKind;
+
+	constructor(
+		readonly kind: StartupAuthConfigErrorKind,
+		configPath: string,
+	) {
+		const displayPath = shortenConfigPath(configPath);
+		super(`Startup auth config ${displayPath}: ${kind}.`);
+		this.code = kind;
+		this.causeClass = kind;
+	}
+}
+
 const DEFAULT_CREDENTIAL_RANKING_MODE: CredentialRankingMode = "balanced";
 const LEGACY_LITERAL_AUTH_KEYS = new Set([
 	"auth.broker.url",
@@ -29,6 +57,22 @@ const LEGACY_LITERAL_AUTH_KEYS = new Set([
 	"auth.credentialRankingMode",
 	"auth.credentialPins",
 ]);
+
+function configPathForAgentDir(agentDir: string): string {
+	return path.join(agentDir, "config.yml");
+}
+
+function shortenConfigPath(configPath: string): string {
+	const absolutePath = path.resolve(configPath).replace(/[\u0000-\u001f\u007f]/gu, "?");
+	const homePath = path.resolve(os.homedir());
+	if (absolutePath === homePath) return "~";
+	const homePrefix = `${homePath}${path.sep}`;
+	return absolutePath.startsWith(homePrefix) ? `~${absolutePath.slice(homePath.length)}` : absolutePath;
+}
+
+function startupAuthConfigError(agentDir: string, kind: StartupAuthConfigErrorKind): StartupAuthConfigError {
+	return new StartupAuthConfigError(kind, configPathForAgentDir(agentDir));
+}
 
 /** Path to the local bearer token file. Created on the broker host by `gjc auth-broker token`. */
 export function getAuthBrokerTokenFilePath(): string {
@@ -73,23 +117,23 @@ function throwLegacyLiteralKeyError(keys: string[]): never {
 	);
 }
 
-function readCredentialPins(auth: Record<string, unknown> | undefined): Readonly<Record<string, string>> {
+function readCredentialPins(
+	auth: Record<string, unknown> | undefined,
+	configPath: string,
+): Readonly<Record<string, string>> {
 	const rawPins = auth?.credentialPins;
 	if (rawPins === undefined) return {};
 	const pins = asRecord(rawPins);
-	if (!pins) throw new Error("Invalid auth.credentialPins: expected a record of selector strings.");
+	if (!pins) throw new StartupAuthConfigError("invalid-credential-pins", configPath);
 
 	const result: Record<string, string> = {};
 	for (const [provider, rawSelector] of Object.entries(pins)) {
 		const normalizedProvider = provider.trim();
 		if (normalizedProvider.length === 0 || /[\u0000-\u001f\u007f]/u.test(normalizedProvider)) {
-			throw new Error("Invalid auth.credentialPins provider key: expected a non-empty provider name.");
+			throw new StartupAuthConfigError("invalid-credential-pins", configPath);
 		}
 		if (typeof rawSelector !== "string" || !isValidPersistedCredentialSelector(rawSelector)) {
-			throw new Error(
-				`Invalid auth.credentialPins entry for provider ${JSON.stringify(normalizedProvider)}: ` +
-					"expected id:<positive-id>, email:<email>, or account:<account-id>.",
-			);
+			throw new StartupAuthConfigError("invalid-credential-pins", configPath);
 		}
 		result[normalizedProvider] = rawSelector.trim();
 	}
@@ -98,35 +142,69 @@ function readCredentialPins(auth: Record<string, unknown> | undefined): Readonly
 
 interface GlobalStartupAuthYaml {
 	auth: Record<string, unknown> | undefined;
+	credentialPins: Readonly<Record<string, string>>;
 }
 
 async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartupAuthYaml> {
-	const configPath = path.join(agentDir, "config.yml");
+	const configPath = configPathForAgentDir(agentDir);
 	let raw: string;
 	try {
 		raw = await Bun.file(configPath).text();
 	} catch (error) {
-		if (isEnoent(error)) return { auth: undefined };
-		logger.warn("startup auth config.yml unreadable", { error: String(error) });
-		return { auth: undefined };
+		if (isEnoent(error)) return { auth: undefined, credentialPins: {} };
+		logger.warn("startup auth config.yml unreadable", { path: shortenConfigPath(configPath), cause: "unreadable" });
+		throw startupAuthConfigError(agentDir, "unreadable");
 	}
-	if (raw.trim() === "") return { auth: undefined };
+	if (raw.trim() === "") return { auth: undefined, credentialPins: {} };
 
 	let parsed: unknown;
 	try {
 		parsed = YAML.parse(raw);
 	} catch (error) {
-		logger.warn("startup auth config.yml has invalid YAML", { error: String(error) });
-		return { auth: undefined };
+		logger.warn("startup auth config.yml has invalid YAML", {
+			path: shortenConfigPath(configPath),
+			cause: "invalid-yaml",
+		});
+		throw startupAuthConfigError(agentDir, "invalid-yaml");
 	}
 	const root = asRecord(parsed);
 	if (!root) {
-		logger.warn("startup auth config.yml root is not a mapping");
-		return { auth: undefined };
+		logger.warn("startup auth config.yml root is not a mapping", {
+			path: shortenConfigPath(configPath),
+			cause: "non-mapping-root",
+		});
+		throw startupAuthConfigError(agentDir, "non-mapping-root");
 	}
 	const legacyKeys = Object.keys(root).filter(key => LEGACY_LITERAL_AUTH_KEYS.has(key));
 	if (legacyKeys.length > 0) throwLegacyLiteralKeyError(legacyKeys);
-	return { auth: asRecord(root.auth) };
+
+	if (root.auth === undefined) return { auth: undefined, credentialPins: {} };
+	const auth = asRecord(root.auth);
+	if (!auth) throw startupAuthConfigError(agentDir, "invalid-auth");
+
+	for (const [sectionName, errorKind] of [
+		["broker", "invalid-broker"],
+		["gateway", "invalid-gateway"],
+	] as const) {
+		const section = auth[sectionName];
+		if (section === undefined) continue;
+		const sectionRecord = asRecord(section);
+		if (!sectionRecord) throw startupAuthConfigError(agentDir, errorKind);
+		for (const key of ["url", "token"] as const) {
+			if (Object.prototype.hasOwnProperty.call(sectionRecord, key) && typeof sectionRecord[key] !== "string") {
+				throw startupAuthConfigError(agentDir, errorKind);
+			}
+		}
+	}
+
+	if (
+		Object.prototype.hasOwnProperty.call(auth, "credentialRankingMode") &&
+		resolveRankingMode(auth.credentialRankingMode) === undefined
+	) {
+		throw startupAuthConfigError(agentDir, "invalid-ranking-mode");
+	}
+	const credentialPins = readCredentialPins(auth, configPath);
+	return { auth, credentialPins };
 }
 
 async function readTokenFile(): Promise<string | undefined> {
@@ -147,7 +225,7 @@ async function readTokenFile(): Promise<string | undefined> {
  * cannot influence credential selection.
  */
 export async function resolveStartupAuthConfig(agentDir: string = getAgentDir()): Promise<StartupAuthConfigSnapshot> {
-	const { auth } = await readGlobalStartupAuthYaml(agentDir);
+	const { auth, credentialPins } = await readGlobalStartupAuthYaml(agentDir);
 	const broker = asRecord(auth?.broker);
 	const envUrl = $credentialEnv("GJC_AUTH_BROKER_URL")?.trim();
 	const envToken = $credentialEnv("GJC_AUTH_BROKER_TOKEN")?.trim();
@@ -176,6 +254,6 @@ export async function resolveStartupAuthConfig(agentDir: string = getAgentDir())
 	return {
 		broker: resolvedBroker,
 		credentialRankingMode: rankingMode,
-		credentialPins: readCredentialPins(auth),
+		credentialPins,
 	};
 }

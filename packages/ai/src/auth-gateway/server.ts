@@ -28,7 +28,7 @@ import * as piNative from "../providers/pi-native-server";
 import { streamSimple } from "../stream";
 import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
 import { beginAttempt, classifyFallbackTrigger } from "../utils/fallback-transport";
-import { parseBind } from "../utils/parse-bind";
+import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
 import {
 	captureRequestHeaders,
 	corsHeaders,
@@ -787,6 +787,7 @@ function handleModelsList(opts: AuthGatewayBootOptions): Response {
 export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_GATEWAY_BIND);
 	const tokens = new Set<string>(opts.bearerTokens);
+	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-gateway");
 	const version = opts.version;
 
 	const server = Bun.serve({

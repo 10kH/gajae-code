@@ -66,6 +66,7 @@ export class OAuthSelectorComponent extends Container {
 	#onAutoSelect?: () => void | Promise<void>;
 	#onAddAccount?: () => void | Promise<void>;
 	#onAccountRemove?: (targets: readonly CredentialRemovalTarget[]) => void | Promise<void>;
+	#pendingAccountRemovalTargets?: readonly CredentialRemovalTarget[];
 
 	constructor(
 		mode: "login" | "logout",
@@ -252,6 +253,22 @@ export class OAuthSelectorComponent extends Container {
 		}
 	}
 
+	#clearPendingAccountRemoval(): boolean {
+		if (this.#pendingAccountRemovalTargets === undefined) return false;
+		this.#pendingAccountRemovalTargets = undefined;
+		this.#statusMessage = undefined;
+		return true;
+	}
+
+	#getAccountRemovalTargets(): CredentialRemovalTarget[] {
+		return this.#accountEntries
+			.filter(
+				(entry): entry is Extract<AccountEntry, { kind: "account" }> =>
+					entry.kind === "account" && entry.selectable && entry.target !== undefined,
+			)
+			.map(entry => entry.target as CredentialRemovalTarget);
+	}
+
 	#updateList(): void {
 		if (this.#accountProviderId) {
 			this.#updateAccountList();
@@ -411,13 +428,20 @@ export class OAuthSelectorComponent extends Container {
 			} else if (selected.kind === "add") {
 				void this.#onAddAccount?.();
 			} else if (selected.kind === "all") {
-				const targets = this.#accountEntries
-					.filter(
-						(entry): entry is Extract<AccountEntry, { kind: "account" }> =>
-							entry.kind === "account" && entry.selectable && entry.target !== undefined,
-					)
-					.map(entry => entry.target as CredentialRemovalTarget);
-				void this.#onAccountRemove?.(targets);
+				if (this.#pendingAccountRemovalTargets !== undefined) {
+					const targets = this.#pendingAccountRemovalTargets;
+					this.#pendingAccountRemovalTargets = undefined;
+					void this.#onAccountRemove?.(targets);
+				} else {
+					const targets = this.#getAccountRemovalTargets();
+					if (targets.length === 0) {
+						this.#statusMessage = "No accounts available to remove.";
+					} else {
+						this.#pendingAccountRemovalTargets = targets;
+						this.#statusMessage = `Remove all ${targets.length} accounts? Enter to confirm, Esc to cancel`;
+					}
+					this.#updateList();
+				}
 			}
 			return;
 		}
@@ -434,6 +458,10 @@ export class OAuthSelectorComponent extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		const isConfirm = matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n";
+		const isCancel = matchesSelectCancel(keyData);
+		const pendingConfirmationCleared =
+			!isConfirm && !isCancel ? this.#clearPendingAccountRemoval() : false;
 		const itemCount = this.#accountProviderId ? this.#filteredAccountEntries.length : this.#filteredProviders.length;
 		if (matchesKey(keyData, "up")) {
 			if (itemCount > 0) this.#selectedIndex = this.#selectedIndex === 0 ? itemCount - 1 : this.#selectedIndex - 1;
@@ -460,18 +488,20 @@ export class OAuthSelectorComponent extends Container {
 			this.#updateList();
 			return;
 		}
-		if (matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n") {
+		if (isConfirm) {
 			this.#selectCurrent();
 			return;
 		}
-		if (matchesSelectCancel(keyData)) {
+		if (isCancel) {
+			const pending = this.#clearPendingAccountRemoval();
 			this.stopValidation();
+			if (pending) this.#updateList();
 			this.#onCancelCallback();
 			return;
 		}
 		const previousQuery = this.#searchInput.getValue();
 		this.#searchInput.handleInput(keyData);
-		if (this.#searchInput.getValue() !== previousQuery) {
+		if (pendingConfirmationCleared || this.#searchInput.getValue() !== previousQuery) {
 			this.#selectedIndex = 0;
 			this.#statusMessage = undefined;
 			this.#updateList();

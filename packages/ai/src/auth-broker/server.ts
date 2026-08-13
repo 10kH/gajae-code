@@ -11,7 +11,7 @@
  */
 import { logger } from "@gajae-code/utils";
 import type { AuthStorage } from "../auth-storage";
-import { parseBind } from "../utils/parse-bind";
+import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
 	CredentialDisableResponse,
@@ -522,6 +522,7 @@ function serveSnapshotStream(
 export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_BROKER_BIND);
 	const tokens = new Set<string>(opts.bearerTokens);
+	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
 

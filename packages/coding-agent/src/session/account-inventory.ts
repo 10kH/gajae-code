@@ -7,6 +7,10 @@ import {
 	getEnvApiKey,
 	listProvidersWithEnvKey,
 	type Provider,
+	type UsageLimit,
+	type UsageStatus,
+	type UsageUnit,
+	type UsageWindow,
 } from "@gajae-code/ai/core";
 
 /** A redacted usage observation attached to an account row. */
@@ -16,6 +20,9 @@ export interface AccountUsageCache extends CachedUsageReport {}
 export interface AccountHealthCache extends CachedCredentialHealth {}
 
 export type AccountInventorySource = "stored" | "env" | "config" | "runtime";
+
+/** Fixed presentation classification for a persisted disabled credential. */
+export type AccountInventoryDisabledCause = "auth_failure" | "user_removed" | "duplicate" | "replaced" | "unknown";
 
 export interface AccountInventoryCapabilities {
 	canCheck: boolean;
@@ -49,7 +56,7 @@ export interface AccountInventoryRow {
 	/** OAuth identity is intentionally limited to safe labels from inventory. */
 	oauthIdentity?: { label: string };
 	disabled: boolean;
-	disabledCause: string | null;
+	disabledCause: AccountInventoryDisabledCause | null;
 	health: AccountHealthCache;
 	usage?: AccountUsageCache;
 	capabilities: AccountInventoryCapabilities;
@@ -84,16 +91,58 @@ export interface AccountInventoryCheckResult {
 function asSafeLabel(value: unknown): string | null {
 	if (typeof value !== "string") return null;
 	const normalized = value
+		.replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
+		.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, " ")
 		.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
 		.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
-		.replace(/[\u0000-\u001f\u007f]/g, " ")
+		.replace(/https?:\/\/[^\s?#]+(?:\?[^\s#]*)?/gi, value => value.split("?")[0] ?? "[redacted URL]")
+		.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+		.replace(/[\u061c\u200e\u200f\u200b-\u200d\u2060\u202a-\u202e\u2066-\u2069\ufeff]/g, "")
 		.replace(/\s+/g, " ")
 		.trim();
 	return normalized.length > 0 ? normalized.slice(0, 160) : null;
 }
 
+function safeProvider(value: unknown): string {
+	return asSafeLabel(value) ?? "unknown-provider";
+}
+
+function optionalSafeLabel(value: unknown): string | undefined {
+	return asSafeLabel(value) ?? undefined;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function classifyDisabledCause(value: unknown, disabled: boolean): AccountInventoryDisabledCause | null {
+	if (!disabled) return null;
+	if (typeof value !== "string") return "unknown";
+	const cause = value.trim();
+	if (/^(?:deleted|logged out) by user(?:$|\b)/i.test(cause) || /^disabled via auth-broker$/i.test(cause)) {
+		return "user_removed";
+	}
+	if (/^deduplicated duplicate credential$/i.test(cause)) return "duplicate";
+	if (/^replaced by newer credential$/i.test(cause)) return "replaced";
+	if (
+		/^(?:oauth|auth-broker) refresh failed:/i.test(cause) ||
+		/invalid_grant|grant is invalid|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(cause) ||
+		(/\b(401|403)\b/.test(cause) && !/timeout|network|fetch failed|ECONNREFUSED/i.test(cause))
+	) {
+		return "auth_failure";
+	}
+	return "unknown";
+}
+
 function sourceId(provider: string, source: AccountInventorySource, credentialId?: number): string {
-	return credentialId === undefined ? `${provider}:${source}` : `${provider}:stored:${credentialId}`;
+	const safe = safeProvider(provider);
+	return credentialId === undefined ? `${safe}:${source}` : `${safe}:stored:${credentialId}`;
 }
 
 function sourceLabel(source: AccountInventorySource): string {
@@ -110,8 +159,12 @@ function sourceLabel(source: AccountInventorySource): string {
 }
 
 function providerSet(input: AccountInventoryInput, inventory: CredentialInventoryRecord[]): Set<string> {
-	const providers = new Set(inventory.map(row => row.provider));
-	for (const provider of input.modelRegistry?.getAvailable?.() ?? []) providers.add(provider.provider);
+	const providers = new Set(
+		inventory.flatMap(row => (typeof row.provider === "string" ? [row.provider] : [])),
+	);
+	for (const provider of input.modelRegistry?.getAvailable?.() ?? []) {
+		if (typeof provider?.provider === "string") providers.add(provider.provider);
+	}
 	// This only asks whether a known env-backed provider is present. The key value
 	// never enters the snapshot or any renderer.
 	for (const provider of listProvidersWithEnvKey()) {
@@ -121,38 +174,124 @@ function providerSet(input: AccountInventoryInput, inventory: CredentialInventor
 }
 
 function storedHealth(authStorage: AuthStorage, row: CredentialInventoryRecord): AccountHealthCache {
-	return authStorage.getCachedCredentialHealth(row.id);
+	const cached = asRecord(authStorage.getCachedCredentialHealth(row.id));
+	if (row.disabled) return { status: "failed", reason: null };
+	const status: AccountHealthCache["status"] =
+		cached?.status === "ok" ||
+		cached?.status === "failed" ||
+		cached?.status === "unverifiable" ||
+		cached?.status === "unknown"
+			? cached.status
+			: "unknown";
+	return {
+		status,
+		reason: asSafeLabel(cached?.reason),
+		...(finiteNumber(cached?.checkedAt) !== undefined ? { checkedAt: finiteNumber(cached?.checkedAt) } : {}),
+		...(finiteNumber(cached?.retainUntil) !== undefined ? { retainUntil: finiteNumber(cached?.retainUntil) } : {}),
+	};
 }
 
 function storedUsage(authStorage: AuthStorage, row: CredentialInventoryRecord): AccountUsageCache | undefined {
 	return authStorage.getCachedUsageReport(row.provider as Provider, row.id);
 }
+
+function safeUsageUnit(value: unknown): UsageUnit {
+	return value === "percent" ||
+		value === "tokens" ||
+		value === "requests" ||
+		value === "usd" ||
+		value === "minutes" ||
+		value === "bytes" ||
+		value === "unknown"
+		? value
+		: "unknown";
+}
+
+function safeUsageStatus(value: unknown): UsageStatus | undefined {
+	return value === "ok" || value === "warning" || value === "exhausted" || value === "unknown" ? value : undefined;
+}
+
+function redactUsageWindow(value: unknown): UsageWindow | undefined {
+	const window = asRecord(value);
+	if (!window) return undefined;
+	return {
+		id: asSafeLabel(window.id) ?? "usage-window",
+		label: asSafeLabel(window.label) ?? "usage window",
+		...(finiteNumber(window.durationMs) !== undefined ? { durationMs: finiteNumber(window.durationMs) } : {}),
+		...(finiteNumber(window.resetsAt) !== undefined ? { resetsAt: finiteNumber(window.resetsAt) } : {}),
+	};
+}
+
+function redactUsageLimit(value: unknown, reportProvider: string): UsageLimit {
+	const limit = asRecord(value);
+	const scope = asRecord(limit?.scope);
+	const amount = asRecord(limit?.amount);
+	const used = finiteNumber(amount?.used);
+	const amountLimit = finiteNumber(amount?.limit);
+	const remaining = finiteNumber(amount?.remaining);
+	const usedFraction = finiteNumber(amount?.usedFraction);
+	const remainingFraction = finiteNumber(amount?.remainingFraction);
+	const notes = Array.isArray(limit?.notes)
+		? limit.notes.map(note => asSafeLabel(note)).filter((note): note is string => note !== null)
+		: undefined;
+	const status = safeUsageStatus(limit?.status);
+	const window = redactUsageWindow(limit?.window);
+	return {
+		id: asSafeLabel(limit?.id) ?? "usage-limit",
+		label: asSafeLabel(limit?.label) ?? "usage limit",
+		scope: {
+			provider: safeProvider(scope?.provider ?? reportProvider),
+			...(optionalSafeLabel(scope?.accountId) ? { accountId: optionalSafeLabel(scope?.accountId) } : {}),
+			...(optionalSafeLabel(scope?.projectId) ? { projectId: optionalSafeLabel(scope?.projectId) } : {}),
+			...(optionalSafeLabel(scope?.orgId) ? { orgId: optionalSafeLabel(scope?.orgId) } : {}),
+			...(optionalSafeLabel(scope?.modelId) ? { modelId: optionalSafeLabel(scope?.modelId) } : {}),
+			...(optionalSafeLabel(scope?.tier) ? { tier: optionalSafeLabel(scope?.tier) } : {}),
+			...(optionalSafeLabel(scope?.windowId) ? { windowId: optionalSafeLabel(scope?.windowId) } : {}),
+			...(typeof scope?.shared === "boolean" ? { shared: scope.shared } : {}),
+		},
+		...(window ? { window } : {}),
+		amount: {
+			...(used !== undefined ? { used } : {}),
+			...(amountLimit !== undefined ? { limit: amountLimit } : {}),
+			...(remaining !== undefined ? { remaining } : {}),
+			...(usedFraction !== undefined ? { usedFraction } : {}),
+			...(remainingFraction !== undefined ? { remainingFraction } : {}),
+			unit: safeUsageUnit(amount?.unit),
+		},
+		...(status !== undefined ? { status } : {}),
+		...(notes !== undefined ? { notes } : {}),
+	};
+}
+
 function redactUsageReport(report: CachedUsageReport["report"]): CachedUsageReport["report"] {
-	const safeMetadata = report.metadata
+	const value = asRecord(report);
+	const provider = safeProvider(value?.provider);
+	const metadata = asRecord(value?.metadata);
+	const safeMetadata = metadata
 		? Object.fromEntries(
 				["email", "accountId", "account", "user", "projectId", "orgId"].flatMap(key => {
-					const value = asSafeLabel(report.metadata?.[key]);
-					return value ? [[key, value]] : [];
+					const safe = asSafeLabel(metadata[key]);
+					return safe ? [[key, safe]] : [];
 				}),
 			)
 		: undefined;
+	const limits = Array.isArray(value?.limits) ? value.limits.map(limit => redactUsageLimit(limit, provider)) : [];
 	return {
-		...report,
-		metadata: safeMetadata,
-		limits: report.limits.map(limit => ({
-			...limit,
-			label: asSafeLabel(limit.label) ?? "usage limit",
-			notes: limit.notes?.map(note => asSafeLabel(note)).filter((note): note is string => note !== null),
-			scope: {
-				...limit.scope,
-				accountId: asSafeLabel(limit.scope.accountId) ?? undefined,
-				projectId: asSafeLabel(limit.scope.projectId) ?? undefined,
-				orgId: asSafeLabel(limit.scope.orgId) ?? undefined,
-				tier: asSafeLabel(limit.scope.tier) ?? undefined,
-				modelId: asSafeLabel(limit.scope.modelId) ?? undefined,
-				windowId: asSafeLabel(limit.scope.windowId) ?? undefined,
-			},
-		})),
+		provider,
+		fetchedAt: finiteNumber(value?.fetchedAt) ?? 0,
+		limits,
+		...(safeMetadata && Object.keys(safeMetadata).length > 0 ? { metadata: safeMetadata } : {}),
+	};
+}
+
+function redactUsageCache(usage: CachedUsageReport | undefined): AccountUsageCache | undefined {
+	if (!usage || !asRecord(usage.report)) return undefined;
+	return {
+		report: redactUsageReport(usage.report),
+		fetchedAt: finiteNumber(usage.fetchedAt) ?? 0,
+		freshUntil: finiteNumber(usage.freshUntil) ?? 0,
+		retainUntil: finiteNumber(usage.retainUntil) ?? 0,
+		freshness: usage.freshness === "fresh" ? "fresh" : "stale-last-good",
 	};
 }
 
@@ -167,26 +306,31 @@ function addStoredRows(
 	inventory: CredentialInventoryRecord[],
 	sessionId: string | undefined,
 ): void {
+	const removalTargetIds = new Set(
+		(typeof authStorage.listCredentialRemovalTargets === "function"
+			? authStorage.listCredentialRemovalTargets()
+			: []
+		).map(target => target.id),
+	);
 	for (const record of inventory) {
 		const identityLabel = asSafeLabel(record.identityLabel);
-		const usage = storedUsage(authStorage, record);
-		const safeUsage = usage ? { ...usage, report: redactUsageReport(usage.report) } : undefined;
-		const active = authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
+		const safeUsage = redactUsageCache(storedUsage(authStorage, record));
+		const active =
+			typeof record.provider === "string" && authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
 		const canPin =
 			record.credentialKind === "oauth" && !record.disabled && canPinStoredOAuth(authStorage, record.provider);
-		const canRemove =
-			record.credentialKind === "oauth" && typeof authStorage.listCredentialRemovalTargets === "function";
+		const canRemove = record.credentialKind === "oauth" && removalTargetIds.has(record.id);
 		rows.push({
 			id: sourceId(record.provider, "stored", record.id),
 			credentialId: record.id,
-			provider: record.provider,
+			provider: safeProvider(record.provider),
 			credentialKind: record.credentialKind,
 			source: "stored",
 			sourceLabel: sourceLabel("stored"),
 			identityLabel,
 			...(record.credentialKind === "oauth" && identityLabel ? { oauthIdentity: { label: identityLabel } } : {}),
 			disabled: record.disabled,
-			disabledCause: asSafeLabel(record.disabledCause),
+			disabledCause: classifyDisabledCause(record.disabledCause, record.disabled),
 			health: storedHealth(authStorage, record),
 			...(safeUsage ? { usage: safeUsage } : {}),
 			capabilities: {
@@ -226,7 +370,7 @@ function addSyntheticRows(
 			const id = sourceId(provider, source);
 			rows.push({
 				id,
-				provider,
+				provider: safeProvider(provider),
 				credentialKind: "api_key",
 				source,
 				sourceLabel: sourceLabel(source),
@@ -286,7 +430,7 @@ function applyStoredCheck(
 		if (result.report) {
 			row.usage = {
 				report: redactUsageReport(result.report),
-				fetchedAt: result.report.fetchedAt,
+				fetchedAt: finiteNumber(result.report.fetchedAt) ?? 0,
 				freshUntil: Date.now(),
 				retainUntil: Date.now(),
 				freshness: "fresh",
@@ -346,7 +490,7 @@ export async function checkAccountInventory(input: AccountInventoryInput): Promi
 		if (result.report) {
 			row.usage = {
 				report: redactUsageReport(result.report),
-				fetchedAt: result.report.fetchedAt,
+				fetchedAt: finiteNumber(result.report.fetchedAt) ?? 0,
 				freshUntil: Date.now(),
 				retainUntil: Date.now(),
 				freshness: "fresh",
