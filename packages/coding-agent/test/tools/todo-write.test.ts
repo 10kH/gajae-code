@@ -481,7 +481,9 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		const message = captureValidationError(() =>
 			validateToolArguments(tool, call({ ops: [{ op: "done", ...unknownKeys }] })),
 		);
-		expect(message).toContain('rejected keys: "unknown0", "unknown1", "unknown2", "unknown3", "unknown4", "unknown5", "unknown6", "unknown7"');
+		expect(message).toContain(
+			'rejected keys: "unknown0", "unknown1", "unknown2", "unknown3", "unknown4", "unknown5", "unknown6", "unknown7"',
+		);
 		expect(message).toContain("24 additional rejected keys omitted");
 		expect(message).not.toContain('"unknown8"');
 	});
