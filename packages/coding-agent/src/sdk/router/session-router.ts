@@ -1094,10 +1094,12 @@ export class SessionRouter {
 		try {
 			await this.#deps.onAttachment?.(capability);
 			this.#recordNotificationReceipt(notificationSubscription, "pending");
-			void Promise.resolve(this.#deps.onNotificationSubscription?.(notificationSubscription)).catch(error => {
-				this.#detachNotification(attached!, "cancelled");
-				logger.warn(`SDK notification subscription admission failed: ${String(error)}`);
-			});
+			void Promise.resolve()
+				.then(() => this.#deps.onNotificationSubscription?.(notificationSubscription))
+				.catch(error => {
+					this.#detachNotification(attached!, "cancelled");
+					logger.warn(`SDK notification subscription admission failed: ${String(error)}`);
+				});
 		} catch (error) {
 			const failedStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
 			this.#adopted.delete(indexed.sessionId);
@@ -1135,12 +1137,12 @@ export class SessionRouter {
 		attached.publication.resolve();
 		attached.initializingPublication = true;
 		try {
-			void Promise.resolve(this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription)).catch(
-				error => {
+			void Promise.resolve()
+				.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
+				.catch(error => {
 					this.#detachNotification(attached, "cancelled");
 					logger.warn(`SDK notification subscription ready hook failed locally: ${String(error)}`);
-				},
-			);
+				});
 			await this.#deps.onAttachmentReady?.(attached.capability);
 		} catch (error) {
 			const stillCurrent = this.#sessions.get(attached.sessionId) === attached;
@@ -1183,12 +1185,12 @@ export class SessionRouter {
 				}
 				attached.initializingPublication = true;
 				try {
-					void Promise.resolve(
-						this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription),
-					).catch(error => {
-						this.#detachNotification(attached, "cancelled");
-						logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
-					});
+					void Promise.resolve()
+						.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
+						.catch(error => {
+							this.#detachNotification(attached, "cancelled");
+							logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
+						});
 					await this.#deps.onAttachmentReady?.(attached.capability);
 				} catch {
 					await this.#retireAttachment(attached);
