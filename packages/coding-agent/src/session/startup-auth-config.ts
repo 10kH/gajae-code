@@ -115,7 +115,9 @@ function canonicalBrokerUrl(raw: string): string {
 		throw new Error("Auth broker URL must be an HTTP(S) origin without credentials.");
 	}
 	if (parsed.search || parsed.hash) throw new Error("Auth broker URL must not contain a query or fragment.");
-	parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+	if (parsed.pathname !== "/" && parsed.pathname !== "")
+		throw new Error("Auth broker URL must be an origin without a path.");
+	parsed.pathname = "";
 	return parsed.toString().replace(/\/$/, "");
 }
 

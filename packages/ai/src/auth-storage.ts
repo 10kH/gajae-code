@@ -5381,7 +5381,7 @@ export class AuthStorage {
 				email: refreshed.email ?? target.credential.email,
 				projectId: refreshed.projectId ?? target.credential.projectId,
 				enterpriseUrl: refreshed.enterpriseUrl ?? target.credential.enterpriseUrl,
-				mcpBinding: refreshed.mcpBinding,
+				mcpBinding: refreshed.mcpBinding ?? target.credential.mcpBinding,
 			};
 			this.#replaceCredentialAt(provider, index, updated, !refreshed.persistedByLease);
 			return {
