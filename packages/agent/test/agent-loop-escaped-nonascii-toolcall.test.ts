@@ -2,7 +2,7 @@ import { describe, expect, it } from "bun:test";
 import { Agent } from "@gajae-code/agent-core";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { Message } from "@gajae-code/ai";
+import type { AssistantMessage, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import * as z from "zod/v4";
 import { createUserMessage } from "./helpers";
@@ -55,6 +55,47 @@ function escapedTurnWithText(id: string) {
 /** The same turn as the model would have produced it with literal UTF-8 on the wire. */
 function literalTurn(id: string) {
 	return { content: [{ type: "toolCall" as const, id, name: "ask", arguments: { question: QUESTION } }] };
+}
+
+const PROVIDER_USAGE = {
+	input: 7,
+	output: 11,
+	cacheRead: 13,
+	cacheWrite: 17,
+	totalTokens: 48,
+	premiumRequests: 2,
+	reasoningTokens: 5,
+	cttl: { ephemeral5m: 3, ephemeral1h: 14 },
+	server: { webSearch: 2, webFetch: 1 },
+	cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
+};
+
+function thinkingToolTurn(id: string, escaped = false) {
+	return {
+		content: [
+			{
+				type: "thinking" as const,
+				thinking: "provider reasoning",
+				thinkingSignature: "reasoning-signature",
+				itemId: "reasoning-item",
+				provenance: "mixed" as const,
+				summaryText: "summary",
+				rawText: "raw",
+			},
+			{
+				type: "toolCall" as const,
+				id,
+				name: "ask",
+				arguments: { question: QUESTION },
+				thoughtSignature: "tool-thought-signature",
+				...(escaped ? { escapedNonAsciiArguments: true } : {}),
+			},
+		],
+		usage: PROVIDER_USAGE,
+		responseId: "provider-response-id",
+		disabledFeatures: ["priority"],
+		providerPayload: { type: "openaiResponsesHistory" as const, provider: "mock", items: [{ id: "native-item" }] },
+	};
 }
 
 describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
@@ -127,6 +168,49 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		).toBe(false);
 		expect(events.filter(event => event.type === "turn_start")).toHaveLength(3);
 		expect(events.filter(event => event.type === "turn_end")).toHaveLength(2);
+	});
+
+	it("preserves provider-native thinking and usage metadata through accepted Agent state and replay", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const mock = createMockModel({
+			responses: [thinkingToolTurn("tc-defective", true), thinkingToolTurn("tc-accepted"), { content: ["done"] }],
+		});
+		const agent = new Agent({
+			initialState: { systemPrompt: [""], model: mock.model, tools: [askTool(executed)], messages: [] },
+			convertToLlm: identityConverter,
+			streamFn: mock.stream,
+		});
+
+		await agent.prompt("ask me");
+
+		const accepted = agent.state.messages.find(
+			(message): message is AssistantMessage =>
+				message.role === "assistant" &&
+				message.content.some(block => block.type === "toolCall" && block.id === "tc-accepted"),
+		);
+		expect(accepted).toBeDefined();
+		expect(accepted?.content[0]).toEqual(thinkingToolTurn("unused").content[0]);
+		expect(accepted?.usage).toEqual(PROVIDER_USAGE);
+		expect(accepted?.responseId).toBe("provider-response-id");
+		expect(accepted?.disabledFeatures).toEqual(["priority"]);
+		expect(accepted?.providerPayload).toEqual({
+			type: "openaiResponsesHistory",
+			provider: "mock",
+			items: [{ id: "native-item" }],
+		});
+		expect(
+			agent.state.messages.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(block => block.type === "toolCall" && block.id === "tc-defective"),
+			),
+		).toBe(false);
+		const replayed = mock.calls[2]?.context.messages.find(
+			(message): message is AssistantMessage =>
+				message.role === "assistant" &&
+				message.content.some(block => block.type === "toolCall" && block.id === "tc-accepted"),
+		);
+		expect(replayed).toEqual(accepted);
 	});
 
 	it("preserves all pre-existing history and removes only the defective assistant turn", async () => {

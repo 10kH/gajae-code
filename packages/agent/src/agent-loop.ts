@@ -969,6 +969,7 @@ class ManagedAttemptTransaction {
 			| undefined,
 		private readonly model: AgentLoopConfig["model"],
 		readonly scope?: AttemptScope,
+		private readonly snapshotMode: "managed" | "lossless" = "managed",
 	) {}
 
 	push(event: AgentEvent): void {
@@ -984,15 +985,15 @@ class ManagedAttemptTransaction {
 	}
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
-		const partial = managedAssistantShell(message, this.model);
+		const partial = this.#assistantSnapshot(message);
 		if (this.#committed) {
-			this.onAssistantMessageEvent?.(partial, managedAssistantEventSnapshot(event, partial));
+			this.onAssistantMessageEvent?.(partial, this.#assistantEventSnapshot(event, partial));
 			return;
 		}
 		this.#batch.push({
 			type: "assistant_event",
 			message: partial,
-			event: managedAssistantEventSnapshot(event, partial),
+			event: this.#assistantEventSnapshot(event, partial),
 		});
 	}
 
@@ -1046,7 +1047,11 @@ class ManagedAttemptTransaction {
 			this.discard();
 			throw new ManagedAttemptBufferOverflowError();
 		}
-		const detailed = managedAttemptSnapshotDetailed(this.#repairAssistantEvent(event));
+		const repaired = this.#repairAssistantEvent(event);
+		const detailed =
+			this.snapshotMode === "lossless"
+				? { snapshot: this.#losslessSnapshot(repaired), degraded: false }
+				: managedAttemptSnapshotDetailed(repaired);
 		let snapshot = detailed.snapshot;
 		if (bytes === undefined || detailed.degraded) {
 			// Account the bytes of what is actually retained: a degraded
@@ -1083,6 +1088,7 @@ class ManagedAttemptTransaction {
 	}
 
 	#repairAssistantEvent(event: AgentEvent): AgentEvent {
+		if (this.snapshotMode === "lossless") return event;
 		if (event.type === "message_start" || event.type === "message_end" || event.type === "turn_end") {
 			return event.message.role === "assistant"
 				? { ...event, message: managedAssistantShell(event.message, this.model) }
@@ -1105,6 +1111,30 @@ class ManagedAttemptTransaction {
 			};
 		}
 		return event;
+	}
+
+	#losslessSnapshot<T>(value: T): T {
+		try {
+			return structuredClone(value);
+		} catch {
+			this.discard();
+			throw new ManagedAttemptSnapshotError();
+		}
+	}
+
+	#assistantSnapshot(message: AssistantMessage): AssistantMessage {
+		return this.snapshotMode === "lossless"
+			? this.#losslessSnapshot(message)
+			: managedAssistantShell(message, this.model);
+	}
+
+	#assistantEventSnapshot(event: AssistantMessageEvent, message: AssistantMessage): AssistantMessageEvent {
+		if (this.snapshotMode === "managed") return managedAssistantEventSnapshot(event, message);
+		const snapshot = this.#losslessSnapshot(event);
+		if (snapshot.type === "done") return { ...snapshot, message };
+		if (snapshot.type === "error") return { ...snapshot, error: message };
+		if ("partial" in snapshot) return { ...snapshot, partial: message };
+		return snapshot;
 	}
 }
 
@@ -1568,7 +1598,7 @@ async function runLoopBody(
 					: undefined);
 			const escapedToolTransaction = config.fallbackManaged
 				? undefined
-				: new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope);
+				: new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope, "lossless");
 			const transaction = managedTransaction ?? escapedToolTransaction;
 			initialTransaction = undefined;
 			const attemptScope = transaction?.scope ?? scope;

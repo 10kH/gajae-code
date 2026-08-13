@@ -79,6 +79,7 @@ export type MockContent =
 			incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 			/** Simulate a provider-flagged `\uXXXX`-escaped non-ASCII argument payload. */
 			escapedNonAsciiArguments?: boolean;
+			thoughtSignature?: string;
 	  };
 /** One scripted response. */
 export interface MockResponse {
@@ -90,6 +91,9 @@ export interface MockResponse {
 	usage?: Partial<Omit<Usage, "cost">> & { cost?: Partial<Usage["cost"]> };
 	/** Pre-set responseId. */
 	responseId?: string;
+	/** Optional provider metadata copied onto the final assistant message. */
+	disabledFeatures?: string[];
+	providerPayload?: AssistantMessage["providerPayload"];
 	/** Optional typed provider failure metadata for retry/fallback tests. */
 	transportFailure?: AssistantMessage["transportFailure"];
 	/** If set, the stream emits a terminal error event instead of completing. */
@@ -368,6 +372,8 @@ async function runMock(
 		provider: model.provider,
 		model: model.id,
 		responseId: response.responseId,
+		disabledFeatures: response.disabledFeatures,
+		providerPayload: response.providerPayload,
 		transportFailure: response.transportFailure,
 		usage: emptyUsage(),
 		stopReason: "stop",
@@ -429,6 +435,7 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 				? { incompleteArguments: true, incompleteArgumentsReason: input.incompleteArgumentsReason ?? "truncated" }
 				: {}),
 			...(input.escapedNonAsciiArguments ? { escapedNonAsciiArguments: true } : {}),
+			...(input.thoughtSignature ? { thoughtSignature: input.thoughtSignature } : {}),
 		} as ToolCall;
 	}
 	return input;
