@@ -2271,6 +2271,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		void this.#selectorController.showExtensionsDashboard();
 	}
 
+	showCustomizationDashboard(): void {
+		void this.#selectorController.showCustomizationDashboard();
+	}
+
 	showAgentsDashboard(): void {
 		void this.#selectorController.showAgentsDashboard();
 	}

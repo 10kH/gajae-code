@@ -271,6 +271,10 @@ The default dark TUI identity is the GJC red-claw theme; light-appearance termin
 
 ## SDK extensions
 
+### Local customization: `/extensions`
+
+In an interactive session, `/extensions` is the primary customization setup surface — it configures skills, hooks, and MCPs across the project (`<project>/.gjc/`) and user-global (`~/.gjc/agent/`) scopes, with status/provenance diagnostics, enable/disable/remove, and a guided Import-from-Claude-Code/Codex flow (normalized preview, explicit confirmation, skip/rename/overwrite collision policy, atomic writes with rollback). Non-interactive setups use `gjc mcp` for MCP servers and `gjc migrate` for Claude Code/Codex imports.
+
 ### Skill migration and bundled skill inspection
 
 When moving a workflow into GJC, inspect the bundled defaults before installing or overwriting anything:

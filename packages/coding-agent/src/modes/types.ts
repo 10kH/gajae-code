@@ -402,6 +402,7 @@ export interface InteractiveModeContext {
 	showPetSelector(): void;
 	showHistorySearch(): Promise<void>;
 	showExtensionsDashboard(): void;
+	showCustomizationDashboard(): void;
 	showAgentsDashboard(): void;
 	showModelSelector(options?: { temporaryOnly?: boolean }): void;
 	showEffortSelector(): void;
