@@ -910,29 +910,29 @@ export async function convertCodexSession(
 			}
 			counts.input++;
 			const timestamp = safeTimestamp(record.timestamp, source.timestamp);
-		if (record.type !== "response_item" || !record.payload || typeof record.payload !== "object") {
-			const sanitized = sanitizeImportedValue(record);
-			const eventType = sanitizeImportedString(String(record.type ?? "unknown"));
-			counts.redacted += sanitized.redacted + eventType.redacted;
-			const reason =
-				record.type === "event_msg" || record.type === "turn_context" || record.type === "world_state"
-					? "unsupported_record_type"
-					: "unsupported_envelope";
-			const item: CodexQuarantineRecord = {
-				line: lineNumber,
-				timestamp,
-				eventType: eventType.value,
-				reason,
-				payload: sanitized.value,
-			};
-			const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + 1;
-			if (quarantineBytes + itemBytes <= MAX_QUARANTINE_BYTES) {
-				quarantine.push(item);
-				quarantineBytes += itemBytes;
-			} else quarantineTruncated = true;
-			counts.quarantined++;
-			continue;
-		}
+			if (record.type !== "response_item" || !record.payload || typeof record.payload !== "object") {
+				const sanitized = sanitizeImportedValue(record);
+				const eventType = sanitizeImportedString(String(record.type ?? "unknown"));
+				counts.redacted += sanitized.redacted + eventType.redacted;
+				const reason =
+					record.type === "event_msg" || record.type === "turn_context" || record.type === "world_state"
+						? "unsupported_record_type"
+						: "unsupported_envelope";
+				const item: CodexQuarantineRecord = {
+					line: lineNumber,
+					timestamp,
+					eventType: eventType.value,
+					reason,
+					payload: sanitized.value,
+				};
+				const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8") + 1;
+				if (quarantineBytes + itemBytes <= MAX_QUARANTINE_BYTES) {
+					quarantine.push(item);
+					quarantineBytes += itemBytes;
+				} else quarantineTruncated = true;
+				counts.quarantined++;
+				continue;
+			}
 			const payload = record.payload as Record<string, unknown>;
 			let result = mapResponseItem(payload, timestamp);
 			if ("kind" in result && result.kind === "tool_call") {

@@ -85,6 +85,8 @@ export interface SessionImportSuccess {
 	transcriptBytes: number;
 	mappedEvents: number;
 	quarantinedEvents: number;
+	droppedEvents: number;
+	quarantineTruncated: boolean;
 	redactedValues: number;
 }
 
@@ -593,6 +595,8 @@ async function findExisting(
 			transcriptBytes: observed.totalBytes,
 			mappedEvents: provenance.counts.mapped,
 			quarantinedEvents: provenance.counts.quarantined,
+			droppedEvents: provenance.counts.dropped,
+			quarantineTruncated: false,
 			redactedValues: provenance.counts.redacted,
 		};
 	}
@@ -1156,6 +1160,8 @@ async function publishSource(source: CodexConversion["source"]): Promise<Session
 				transcriptBytes: staged.transcript.bytes,
 				mappedEvents: staged.conversion.counts.mapped,
 				quarantinedEvents: staged.conversion.counts.quarantined,
+				droppedEvents: staged.conversion.counts.dropped,
+				quarantineTruncated: staged.conversion.quarantineTruncated,
 				redactedValues: staged.conversion.counts.redacted,
 			};
 		} catch (error) {
@@ -1238,7 +1244,9 @@ export function formatSessionImportBatch(result: SessionImportBatchResult): stri
 			const id = item.sourceSessionId ? ` ${item.sourceSessionId}` : "";
 			return `failed${id}: ${item.code} (${item.phase}) — ${item.message}`;
 		}
-		return `${item.status} ${item.sourceSessionId} -> ${item.targetSessionId} (${item.mappedEvents} mapped, ${item.quarantinedEvents} quarantined)`;
+		const truncated = item.quarantineTruncated ? ", quarantine truncated" : "";
+		const dropped = item.droppedEvents > 0 ? `, ${item.droppedEvents} dropped` : "";
+		return `${item.status} ${item.sourceSessionId} -> ${item.targetSessionId} (${item.mappedEvents} mapped, ${item.quarantinedEvents} quarantined${dropped}${truncated})`;
 	});
 	return [`Codex session import: ${result.status}`, ...lines].join("\n");
 }
