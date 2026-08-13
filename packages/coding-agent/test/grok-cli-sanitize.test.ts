@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { resolveModels } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/models/catalog";
+import {
+	resolveModels,
+	supportsReasoningEffort,
+} from "../src/defaults/gjc/extensions/grok-cli-vendor/src/models/catalog";
 import { sanitizePayload } from "../src/defaults/gjc/extensions/grok-cli-vendor/src/payload/sanitize";
 
 describe("Grok CLI payload sanitize", () => {
@@ -45,6 +48,13 @@ describe("Grok CLI payload sanitize", () => {
 
 			expect(efforts).toEqual(["low", "low", "medium", "high", "xhigh", "xhigh"]);
 		}
+	});
+
+	it("does not enable effort for IDs merely sharing a supported prefix", () => {
+		expect(supportsReasoningEffort("grok-4.60")).toBe(false);
+		expect(
+			sanitizePayload({ reasoning: { effort: "high" } }, "grok-4.60", undefined, process.cwd()).reasoning,
+		).toBeUndefined();
 	});
 });
 
