@@ -36,6 +36,11 @@ import {
 import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, isEnoent, logger, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
+import {
+	createSecureTokenFileExclusive,
+	readSecureTokenFile,
+	writeSecureTokenFile,
+} from "../session/secure-token-file";
 import { resolveStartupAuthConfig } from "../session/startup-auth-config";
 
 export type AuthBrokerAction = "serve" | "token" | "login" | "logout" | "status" | "import" | "migrate";
@@ -113,48 +118,15 @@ function getTokenFilePath(): string {
 }
 
 async function readToken(): Promise<string | null> {
-	try {
-		const raw = await Bun.file(getTokenFilePath()).text();
-		const trimmed = raw.trim();
-		return trimmed.length > 0 ? trimmed : null;
-	} catch (err) {
-		if (isEnoent(err)) return null;
-		throw err;
-	}
+	return readSecureTokenFile(getTokenFilePath());
 }
 
 async function writeToken(token: string): Promise<void> {
-	const file = getTokenFilePath();
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-	await fs.writeFile(file, token, { mode: 0o600 });
-	try {
-		await fs.chmod(file, 0o600);
-	} catch {
-		// Best-effort (e.g. Windows).
-	}
+	await writeSecureTokenFile(getTokenFilePath(), token);
 }
 
-/**
- * Atomically create the token file, refusing to clobber an existing one.
- * Returns `true` on success, `false` when the file already existed (so the
- * caller re-reads it instead of racing another concurrent `ensureToken`).
- */
 async function createTokenExclusive(token: string): Promise<boolean> {
-	const file = getTokenFilePath();
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-	try {
-		// `wx` = O_CREAT | O_EXCL — fails with EEXIST if the file is already there.
-		await fs.writeFile(file, token, { flag: "wx", mode: 0o600 });
-	} catch (err) {
-		if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-		throw err;
-	}
-	try {
-		await fs.chmod(file, 0o600);
-	} catch {
-		// Best-effort (e.g. Windows).
-	}
-	return true;
+	return createSecureTokenFileExclusive(getTokenFilePath(), token);
 }
 
 function generateToken(): string {

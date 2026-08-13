@@ -12,6 +12,7 @@ import * as path from "node:path";
 import type { AuthCredentialSelector, CredentialRankingMode } from "@gajae-code/ai/core";
 import { $credentialEnv, getAgentDir, getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import { YAML } from "bun";
+import { readSecureTokenFile } from "./secure-token-file";
 
 export interface AuthBrokerClientConfig {
 	url: string;
@@ -221,15 +222,8 @@ async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartu
 }
 
 async function readTokenFile(): Promise<string | undefined> {
-	try {
-		const raw = await Bun.file(getAuthBrokerTokenFilePath()).text();
-		const trimmed = raw.trim();
-		return trimmed.length > 0 ? trimmed : undefined;
-	} catch (error) {
-		if (isEnoent(error)) return undefined;
-		logger.warn("auth-broker token file unreadable", { error: String(error) });
-		return undefined;
-	}
+	const token = await readSecureTokenFile(getAuthBrokerTokenFilePath());
+	return token ?? undefined;
 }
 
 /**
