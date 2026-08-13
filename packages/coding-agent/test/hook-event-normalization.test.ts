@@ -2,8 +2,9 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { hookCapability } from "../src/capability/hook";
 import { Settings } from "../src/config/settings";
-import { getProviderInfo } from "../src/discovery";
+import { getProviderInfo, loadCapability } from "../src/discovery";
 import { EXTENSION_HANDLER_TIMEOUT_MS } from "../src/extensibility/extensions/runner";
 import { discoverAndLoadHooks } from "../src/extensibility/hooks/loader";
 import {
@@ -360,53 +361,78 @@ describe("bounded diagnostics, matchers, provenance, duplicates, and ordering", 
 });
 
 describe("production discovery integration", () => {
-	it("registers Claude and Codex only for hook discovery", () => {
+	it("keeps Claude and Codex providers available for import diagnostics", async () => {
 		expect(getProviderInfo("claude")?.capabilities).toEqual(["hooks"]);
 		expect(getProviderInfo("codex")?.capabilities).toEqual(["hooks"]);
-	});
 
-	it("normalizes Codex descriptors before import and preserves valid module loading", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-normalization-"));
-		const hooksDir = path.join(root, ".codex", "hooks");
-		const marker = path.join(root, "invalid-imported");
-		await fs.mkdir(hooksDir, { recursive: true });
-		await Bun.write(
-			path.join(hooksDir, "pre-read.ts"),
-			'export default (api: { on(event: string, handler: () => void): void }) => api.on("tool_call", () => undefined);\n',
-		);
-		await Bun.write(
-			path.join(hooksDir, "unprefixed.ts"),
-			`await Bun.write(${JSON.stringify(marker)}, "imported"); export default () => undefined;\n`,
-		);
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-provider-diagnostics-"));
+		await fs.mkdir(path.join(root, ".claude", "hooks", "pre"), { recursive: true });
+		await fs.mkdir(path.join(root, ".codex", "hooks"), { recursive: true });
+		await Bun.write(path.join(root, ".claude", "hooks", "pre", "read.ts"), "export default () => undefined;\n");
+		await Bun.write(path.join(root, ".codex", "hooks", "pre-read.ts"), "export default () => undefined;\n");
 
 		try {
-			const result = await discoverAndLoadHooks([], root);
-			expect(result.hooks.some(hook => hook.path.endsWith("pre-read.ts"))).toBe(true);
-			const invalidError = result.errors.find(error => error.path.endsWith("unprefixed.ts"));
-			expect(invalidError?.error).toContain("semantic_mismatch");
-			expect(await Bun.file(marker).exists()).toBe(false);
+			const claude = await loadCapability(hookCapability.id, { cwd: root, providers: ["claude"] });
+			const codex = await loadCapability(hookCapability.id, { cwd: root, providers: ["codex"] });
+			expect(claude.items.map(hook => hook._source.provider)).toEqual(["claude"]);
+			expect(codex.items.map(hook => hook._source.provider)).toEqual(["codex"]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});
 
-	it("loads accepted directory hooks into session ExtensionRunner and executes exact matches", async () => {
-		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-session-"));
-		const hooksDir = path.join(root, ".codex", "hooks");
-		const executionMarker = path.join(root, "executed");
-		const rejectedImportMarker = path.join(root, "rejected-imported");
-		const throwingHookPath = path.join(hooksDir, "pre-bash.ts");
-		await fs.mkdir(hooksDir, { recursive: true });
+	it("keeps foreign hook layouts import-only during runtime discovery", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-normalization-"));
+		const claudeHooksDir = path.join(root, ".claude", "hooks", "pre");
+		const codexHooksDir = path.join(root, ".codex", "hooks");
+		const claudeMarker = path.join(root, "claude-imported");
+		const codexMarker = path.join(root, "codex-imported");
+		await fs.mkdir(claudeHooksDir, { recursive: true });
+		await fs.mkdir(codexHooksDir, { recursive: true });
 		await Bun.write(
-			path.join(hooksDir, "pre-read.ts"),
+			path.join(claudeHooksDir, "read.ts"),
+			`await Bun.write(${JSON.stringify(claudeMarker)}, "imported"); export default () => undefined;\n`,
+		);
+		await Bun.write(
+			path.join(codexHooksDir, "pre-read.ts"),
+			`await Bun.write(${JSON.stringify(codexMarker)}, "imported"); export default () => undefined;\n`,
+		);
+
+		try {
+			const result = await discoverAndLoadHooks([], root);
+			expect(result.hooks).toEqual([]);
+			expect(result.errors).toEqual([]);
+			expect(await Bun.file(claudeMarker).exists()).toBe(false);
+			expect(await Bun.file(codexMarker).exists()).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("loads native directory hooks into session ExtensionRunner and ignores foreign duplicates", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-session-"));
+		const hooksDir = path.join(root, ".gjc", "hooks", "pre");
+		const foreignHooksDir = path.join(root, ".codex", "hooks");
+		const executionMarker = path.join(root, "executed");
+		const foreignExecutionMarker = path.join(root, "foreign-executed");
+		const rejectedImportMarker = path.join(root, "rejected-imported");
+		const throwingHookPath = path.join(hooksDir, "bash.ts");
+		await fs.mkdir(hooksDir, { recursive: true });
+		await fs.mkdir(foreignHooksDir, { recursive: true });
+		await Bun.write(
+			path.join(hooksDir, "read.ts"),
 			`export default (api) => api.on("tool_call", async (_event, ctx) => { await Bun.write(${JSON.stringify(executionMarker)}, ctx.hasQueuedMessages() ? "queued" : "read"); });\n`,
+		);
+		await Bun.write(
+			path.join(foreignHooksDir, "pre-read.ts"),
+			`export default (api) => api.on("tool_call", async () => { await Bun.write(${JSON.stringify(foreignExecutionMarker)}, "foreign"); });\n`,
 		);
 		await Bun.write(
 			throwingHookPath,
 			'export default (api) => api.on("tool_call", () => { throw new Error("hook-boom"); });\n',
 		);
 		await Bun.write(
-			path.join(hooksDir, "unprefixed.ts"),
+			path.join(foreignHooksDir, "unprefixed.ts"),
 			`await Bun.write(${JSON.stringify(rejectedImportMarker)}, "imported"); export default () => undefined;\n`,
 		);
 
@@ -445,6 +471,7 @@ describe("production discovery integration", () => {
 					input: {},
 				});
 				expect(await Bun.file(executionMarker).text()).toBe("read");
+				expect(await Bun.file(foreignExecutionMarker).exists()).toBe(false);
 				const blocked = await session.extensionRunner?.emitToolCall({
 					type: "tool_call",
 					toolName: "bash",
@@ -458,6 +485,29 @@ describe("production discovery integration", () => {
 			} finally {
 				await session.dispose();
 			}
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("loads explicit configured hook paths without granting foreign directory authority", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-configured-"));
+		const configuredHook = path.join(root, "configured", "hook.ts");
+		const marker = path.join(root, "configured-executed");
+		await fs.mkdir(path.dirname(configuredHook), { recursive: true });
+		await Bun.write(
+			configuredHook,
+			`export default (api) => api.on("tool_call", async () => { await Bun.write(${JSON.stringify(marker)}, "executed"); });\n`,
+		);
+
+		try {
+			const result = await discoverAndLoadHooks([path.relative(root, configuredHook)], root);
+			expect(result.errors).toEqual([]);
+			expect(result.hooks).toHaveLength(1);
+			expect(result.hooks[0]?.resolvedPath).toBe(configuredHook);
+			const handlers = result.hooks[0]?.handlers.get("tool_call") ?? [];
+			await handlers[0]?.({}, {});
+			expect(await Bun.file(marker).text()).toBe("executed");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
