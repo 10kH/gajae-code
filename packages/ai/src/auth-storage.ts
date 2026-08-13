@@ -3178,6 +3178,7 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			mcpBinding: credential.mcpBinding,
 		};
 	}
 
@@ -3252,6 +3253,7 @@ export class AuthStorage {
 			projectId: credential.projectId,
 			email: credential.email,
 			enterpriseUrl: credential.enterpriseUrl,
+			mcpBinding: credential.mcpBinding,
 		};
 	}
 
@@ -3265,6 +3267,7 @@ export class AuthStorage {
 			projectId: refreshed.projectId ?? credential.projectId,
 			email: refreshed.email ?? credential.email,
 			enterpriseUrl: refreshed.enterpriseUrl ?? credential.enterpriseUrl,
+			mcpBinding: credential.mcpBinding,
 		};
 	}
 
@@ -3312,6 +3315,7 @@ export class AuthStorage {
 			projectId: next.projectId,
 			email: next.email,
 			enterpriseUrl: next.enterpriseUrl,
+			mcpBinding: next.mcpBinding ?? existing.mcpBinding,
 		});
 	}
 

@@ -131,6 +131,12 @@ export interface UsageLogger {
 }
 
 /** Credential bundle for usage endpoints. */
+/** MCP OAuth authority carried through usage-triggered refresh. */
+export interface UsageMCPOAuthBinding {
+	resourceOrigin: string;
+	tokenEndpoint: string;
+}
+
 export interface UsageCredential {
 	type: "api_key" | "oauth";
 	apiKey?: string;
@@ -141,6 +147,7 @@ export interface UsageCredential {
 	projectId?: string;
 	email?: string;
 	enterpriseUrl?: string;
+	mcpBinding?: UsageMCPOAuthBinding;
 	metadata?: Record<string, unknown>;
 }
 
