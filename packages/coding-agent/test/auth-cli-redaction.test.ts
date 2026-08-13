@@ -19,7 +19,6 @@ const ENV_KEYS = ["GJC_AUTH_BROKER_URL", "GJC_AUTH_BROKER_TOKEN"] as const;
 async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string; stderr: string }> {
 	const originalStdout = process.stdout.write.bind(process.stdout);
 	const originalStderr = process.stderr.write.bind(process.stderr);
-	const originalExitCode = process.exitCode;
 	let stdout = "";
 	let stderr = "";
 	process.stdout.write = ((chunk: string | Uint8Array): boolean => {
@@ -35,7 +34,7 @@ async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string
 	} finally {
 		process.stdout.write = originalStdout;
 		process.stderr.write = originalStderr;
-		process.exitCode = originalExitCode;
+		process.exitCode = 0;
 	}
 	return { stdout, stderr };
 }
@@ -48,12 +47,12 @@ describe("auth CLI diagnostic redaction", () => {
 		for (const key of ENV_KEYS) savedEnv.set(key, process.env[key]);
 		agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-auth-cli-redaction-"));
 		setAgentDir(agentDir);
-		process.exitCode = undefined;
+		process.exitCode = 0;
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
-		process.exitCode = undefined;
+		process.exitCode = 0;
 		for (const key of ENV_KEYS) {
 			const value = savedEnv.get(key);
 			if (value === undefined) delete process.env[key];
@@ -90,7 +89,7 @@ describe("auth CLI diagnostic redaction", () => {
 			file: source,
 		});
 
-		process.exitCode = undefined;
+		process.exitCode = 0;
 		const textOutput = await captureOutput(() =>
 			runAuthBrokerCommand({ action: "import", flags: { source, json: false } }),
 		);
@@ -113,7 +112,7 @@ describe("auth CLI diagnostic redaction", () => {
 			error: { code: "broker_unavailable", message: "Auth broker is unavailable." },
 		});
 
-		process.exitCode = undefined;
+		process.exitCode = 0;
 		const textOutput = await captureOutput(() => runAuthBrokerCommand({ action: "status", flags: { json: false } }));
 		expect(textOutput.stdout).not.toContain(SECRET);
 		expect(textOutput.stdout).toContain("api_key=[redacted]");
@@ -152,7 +151,7 @@ describe("auth CLI diagnostic redaction", () => {
 			expect(jsonOutput.stdout).not.toContain(SECRET);
 			expect(jsonOutput.stdout).toContain("api_key=[redacted]");
 
-			process.exitCode = undefined;
+			process.exitCode = 0;
 			const textOutput = await captureOutput(() =>
 				runAuthGatewayCommand({ action: "check", flags: { json: false } }),
 			);
