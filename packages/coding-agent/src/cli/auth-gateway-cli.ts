@@ -15,6 +15,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import { startAuthGateway } from "@gajae-code/ai/auth-gateway/server";
 import {
 	type Api,
@@ -28,7 +29,6 @@ import {
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
 } from "@gajae-code/ai/core";
-import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import { getConfigRootDir, isEnoent, VERSION } from "@gajae-code/utils";
 import chalk from "chalk";
 import { type AuthBrokerClientConfig, resolveStartupAuthConfig } from "../session/startup-auth-config";
@@ -52,7 +52,11 @@ export interface AuthGatewayCommandArgs {
 
 const ACTIONS: readonly AuthGatewayAction[] = ["serve", "token", "status", "check"];
 
-type AuthGatewayCliErrorCode = "broker_not_configured" | "broker_unavailable" | "credential_check_failed" | "auth_gateway_command_failed";
+type AuthGatewayCliErrorCode =
+	| "broker_not_configured"
+	| "broker_unavailable"
+	| "credential_check_failed"
+	| "auth_gateway_command_failed";
 
 function stableErrorForAction(action: AuthGatewayAction): { code: AuthGatewayCliErrorCode; message: string } {
 	switch (action) {
@@ -356,7 +360,6 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 	}
 }
 
-
 export async function runAuthGatewayCommand(cmd: AuthGatewayCommandArgs): Promise<void> {
 	try {
 		switch (cmd.action) {
@@ -437,7 +440,9 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 					const identity =
 						row.email ?? row.accountId ?? (row.type === "api_key" ? "(api key)" : "(no identity on credential)");
 					const remote = row.remoteRefresh ? chalk.dim(" [remote-refresh]") : "";
-					const reason = row.reason ? chalk.dim(` — ${safeDiagnostic(row.reason, "Credential check failed.")}`) : "";
+					const reason = row.reason
+						? chalk.dim(` — ${safeDiagnostic(row.reason, "Credential check failed.")}`)
+						: "";
 					process.stdout.write(
 						`  ${status} id=${row.id.toString().padStart(3)} ${row.type.padEnd(7)} ${identity}${remote}${reason}\n`,
 					);

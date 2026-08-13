@@ -17,6 +17,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import {
 	AuthBrokerClient,
 	type AuthCredential,
@@ -32,7 +33,6 @@ import {
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "@gajae-code/ai/core";
-import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, isEnoent, logger, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
@@ -793,12 +793,13 @@ async function runStatus(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 				`${JSON.stringify({ ok: false, url: cfg.url, error: { code: "broker_unavailable", message: "Auth broker is unavailable." } })}\n`,
 			);
 		} else {
-			process.stdout.write(`${chalk.red("FAILED")} ${cfg.url}: ${safeDiagnostic(error, "Auth broker is unavailable.")}\n`);
+			process.stdout.write(
+				`${chalk.red("FAILED")} ${cfg.url}: ${safeDiagnostic(error, "Auth broker is unavailable.")}\n`,
+			);
 		}
 		process.exitCode = 1;
 	}
 }
-
 
 export async function runAuthBrokerCommand(cmd: AuthBrokerCommandArgs): Promise<void> {
 	try {

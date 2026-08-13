@@ -3,8 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	type AuthBrokerServerHandle,
 	AuthBrokerClient,
+	type AuthBrokerServerHandle,
 	AuthStorage,
 	SqliteAuthCredentialStore,
 	startAuthBroker,
@@ -103,9 +103,7 @@ describe("auth CLI diagnostic redaction", () => {
 			new Error(`provider status failed api_key=${SECRET}`),
 		);
 
-		const jsonOutput = await captureOutput(() =>
-			runAuthBrokerCommand({ action: "status", flags: { json: true } }),
-		);
+		const jsonOutput = await captureOutput(() => runAuthBrokerCommand({ action: "status", flags: { json: true } }));
 		expect(jsonOutput.stdout).not.toContain(SECRET);
 		expect(JSON.parse(jsonOutput.stdout.trim())).toEqual({
 			ok: false,
@@ -114,9 +112,7 @@ describe("auth CLI diagnostic redaction", () => {
 		});
 
 		process.exitCode = undefined;
-		const textOutput = await captureOutput(() =>
-			runAuthBrokerCommand({ action: "status", flags: { json: false } }),
-		);
+		const textOutput = await captureOutput(() => runAuthBrokerCommand({ action: "status", flags: { json: false } }));
 		expect(textOutput.stdout).not.toContain(SECRET);
 		expect(textOutput.stdout).toContain("api_key=[redacted]");
 	});
