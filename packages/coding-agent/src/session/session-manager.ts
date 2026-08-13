@@ -14288,13 +14288,7 @@ export class SessionManager {
 						// A confirmed missing predecessor can be recreated from the complete
 						// resident transcript. Any present-but-different identity still fails
 						// closed so a concurrent successor is never overwritten.
-						const errCode = (err as NodeJS.ErrnoException)?.code;
-						const isMissingPredecessor =
-							isEnoent(err) ||
-							errCode === "not_found" ||
-							(err instanceof Error &&
-								(err.message === "not_found" || err.message === "managed_replace_missing"));
-						if (!isMissingPredecessor) throw err;
+						if (!isEnoent(err)) throw err;
 						this.#managedPersistExpectedIdentity = undefined;
 						store.replaceSync(relativePath, bytes);
 					}
