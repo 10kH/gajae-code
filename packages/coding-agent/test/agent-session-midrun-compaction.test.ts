@@ -664,6 +664,21 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 			expect(canonicalPreamble).toBeDefined();
 			expect(canonicalContinuation).toBeDefined();
 			expect(canonicalServerResult).toBeDefined();
+			const cursorEvents = loop.agentEvents.flatMap(event => {
+				if (event.type !== "message_end") return [];
+				const content = JSON.stringify((event.message as { content?: unknown }).content ?? "");
+				return content.includes("Cursor") || content.includes("and continuation") ? [event.message] : [];
+			});
+			expect(cursorEvents.map(message => message.role)).toEqual(["assistant", "toolResult", "assistant"]);
+			expect(JSON.stringify((cursorEvents[0] as { content?: unknown } | undefined)?.content)).toContain(
+				"Cursor preamble",
+			);
+			expect(JSON.stringify((cursorEvents[1] as { content?: unknown } | undefined)?.content)).toContain(
+				"Cursor server-side result",
+			);
+			expect(JSON.stringify((cursorEvents[2] as { content?: unknown } | undefined)?.content)).toContain(
+				"and continuation",
+			);
 			expect(
 				canonicalMessages.some(message => {
 					if (message.role !== "assistant") return false;
