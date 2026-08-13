@@ -619,6 +619,43 @@ test("normal agent-start turn-start user-message order retains the first lean re
 	}
 }, 30000);
 
+test("a direct user prompt remains user-attributed after framework context in the same turn", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Complete the request." } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: {
+					role: "custom",
+					customType: "volatile-project-context",
+					attribution: "agent",
+					content: "context",
+				},
+			},
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Completion receipt." } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "user-attributed receipt");
+		expect(turnStreams()[0]!.text).toContain("Completion receipt.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 test("agent-attributed user-role notifications do not supersede a pending settlement", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";

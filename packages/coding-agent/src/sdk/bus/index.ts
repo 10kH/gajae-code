@@ -8055,6 +8055,8 @@ export function createNotificationsExtension(
 	 */
 	const isUserSettlementBoundary = (message: { role?: unknown; attribution?: unknown }): boolean =>
 		message.attribution === "user" || (message.role === "user" && message.attribution === undefined);
+	const isFrameworkPromptContext = (message: { role?: unknown; customType?: unknown }): boolean =>
+		message.role === "custom" && message.customType === "volatile-project-context";
 
 	type SettlementOrigin = "user" | "autonomous" | "continuation";
 
@@ -8135,8 +8137,8 @@ export function createNotificationsExtension(
 	/** Emit the deferred lean settled answer exactly once (agent_end / idle). */
 	const flushPendingSettled = (rt: SessionRuntime, id: string): void => {
 		const settled = rt.pendingSettled;
-		rt.pendingSettled = undefined;
 		if (!settled?.receipts.length || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
+		rt.pendingSettled = undefined;
 		const text = settled.receipts.map(receipt => receipt.text).join("\n\n");
 		// A composition represents multiple finalized turns. It must be a fresh
 		// terminal message rather than editing either constituent turn's stream.
@@ -8616,7 +8618,7 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
 		if (rt) {
-			const message = event.message as { role?: unknown; attribution?: unknown };
+			const message = event.message as { role?: unknown; attribution?: unknown; customType?: unknown };
 			if (isUserSettlementBoundary(message)) {
 				const openingTurn = rt.currentTurnSettlementOrigin !== "user";
 				const supersedingSettledTurn =
@@ -8634,8 +8636,12 @@ export function createNotificationsExtension(
 				rt.pendingSettled = undefined;
 				rt.pendingFinal = undefined;
 			} else if (message.role !== "assistant") {
-				rt.currentTurnSettlementWindow = rt.settlementWindow;
-				rt.currentTurnSettlementOrigin = "autonomous";
+				// The assembled direct prompt can contain framework context after its
+				// user message. A user boundary is authoritative for this turn.
+				if (rt.currentTurnSettlementOrigin !== "user" || !isFrameworkPromptContext(message)) {
+					rt.currentTurnSettlementWindow = rt.settlementWindow;
+					rt.currentTurnSettlementOrigin = "autonomous";
+				}
 			}
 		}
 		if (!rt?.notificationsActive || rt.redact) return;
