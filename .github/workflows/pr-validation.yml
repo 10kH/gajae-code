@@ -21,6 +21,9 @@ concurrency:
 jobs:
   validate:
     name: Validate exact-head PR contract
+    # Enabled directly on dev after this workflow and validator land. Until then,
+    # the pre-existing Dev CI bootstrap is the trusted phase-one authority.
+    if: ${{ false }}
 
     runs-on: ubuntu-22.04
     timeout-minutes: 10
