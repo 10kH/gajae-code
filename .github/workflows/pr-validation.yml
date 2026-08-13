@@ -21,7 +21,7 @@ concurrency:
 jobs:
   validate:
     name: Validate exact-head PR contract
-    if: ${{ github.event_name != 'pull_request_review' || github.event.review.state != 'commented' }}
+
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:

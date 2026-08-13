@@ -17,7 +17,7 @@ export default function registerPrPreflight(api: HookApi): void {
 		const [repoRoot, rootExitCode] = await Promise.all([new Response(rootProbe.stdout).text(), rootProbe.exited]);
 		if (rootExitCode !== 0) return { block: true, reason: "PR preflight requires a Git repository checkout." };
 		const repositoryRoot = repoRoot.trim();
-		const check = Bun.spawn(["bun", "scripts/verify-pr-verdict.ts", "--preflight-command", command], {
+		const check = Bun.spawn(["bun", "scripts/verify-pr-verdict.ts", "--preflight-command", command, "--repo", invocationCwd], {
 			cwd: repositoryRoot,
 			stdout: "pipe",
 			stderr: "pipe",
