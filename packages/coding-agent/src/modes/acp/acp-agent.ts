@@ -1412,7 +1412,11 @@ export class AcpAgent implements Agent {
 		}
 		this.#beginTeardown(params.sessionId);
 		try {
-			await this.#teardownSession(params.sessionId, "deleted", true);
+			// A retained delete locator proves the prior attempt already completed
+			// connection/process teardown and reached durable artifact cleanup. Re-closing
+			// that terminal session can only replace the authoritative cleanup_pending
+			// result with unrelated close uncertainty, so retries resume deletion directly.
+			await this.#teardownSession(params.sessionId, "deleted", pendingLocator === undefined || record !== undefined);
 			let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
 			if (!saved) {
 				try {
@@ -1950,6 +1954,7 @@ export class AcpAgent implements Agent {
 			// ACP clients replay their declared MCP servers when reconnecting. The live
 			// session host remains authoritative for its immutable configuration, so
 			// attachment must not reinterpret the replay as a mutation request.
+			this.#pendingDeleteLocators.delete(id);
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -2132,6 +2137,10 @@ export class AcpAgent implements Agent {
 			this.#knownSessionCwds.set(id, cwd);
 			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
 			this.#assertSessionEpoch(id, epoch);
+			// A successful attachment establishes a new live-owner epoch. Any locator
+			// retained from an earlier cleanup_pending delete belongs to the terminal
+			// owner and must not suppress remote close when this live session is deleted.
+			this.#pendingDeleteLocators.delete(id);
 			this.#pendingCloseIdempotencyKeys.delete(id);
 		} catch (error) {
 			unsubscribePendingFrames();
