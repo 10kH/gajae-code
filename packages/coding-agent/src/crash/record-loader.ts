@@ -78,7 +78,24 @@ function parseCandidates(contents: string): ParsedCrashRecord[] {
 				const errorName = headline.slice(0, separator).trim();
 				const message = headline.slice(separator + 1).trim();
 				const rawBody = buffer.join("\n").trimEnd();
-				const fingerprint = computeCrashFingerprint({ name: errorName, message, stack: rawBody });
+				const bodyLines = rawBody.split("\n");
+				let fingerprint = computeCrashFingerprint({ name: errorName, message, stack: rawBody });
+				if (fingerprint.fingerprint !== marker.fingerprint) {
+					// Object throwables append a one-line allowlisted JSON payload after the
+					// stack, but v1 records carry no explicit stack/payload delimiter. Match
+					// the longest body prefix that reproduces the writer's marker so payload
+					// text cannot make an otherwise authentic record unbound.
+					for (let end = bodyLines.length - 1; end >= 0; end--) {
+						const candidate = computeCrashFingerprint({
+							name: errorName,
+							message,
+							stack: bodyLines.slice(0, end).join("\n").trimEnd(),
+						});
+						if (candidate.fingerprint !== marker.fingerprint) continue;
+						fingerprint = candidate;
+						break;
+					}
+				}
 				// A stack's first line repeats `Name: message`, which the header already
 				// carries; dropping it keeps the rendered report free of a duplicate.
 				const lines = buffer[0]?.trim() === headline.trim() ? buffer.slice(1) : buffer;

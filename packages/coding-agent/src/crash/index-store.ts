@@ -47,6 +47,8 @@ const MIN_TIMESTAMP_MS = Date.UTC(2020, 0, 1);
 const MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
 /** Bounded read of the crash log when recomputing retained counts. */
 const CRASH_LOG_SCAN_MAX_BYTES = 1024 * 1024;
+/** A complete retained record consumes more than 64 bytes, so this covers every distinct fingerprint in the scan. */
+const CRASH_RETIRED_MAX_FINGERPRINTS = Math.ceil(CRASH_LOG_SCAN_MAX_BYTES / 64);
 /**
  * Bounded read of a rotated journal. The journal is rotated away at every
  * compaction, so this only has to cover one startup interval; when a pathological
@@ -186,7 +188,7 @@ function parseRetiredIndex(raw: string): CrashRetiredIndex | undefined {
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
 	const body = parsed as Record<string, unknown>;
 	if (body.version !== CRASH_INDEX_VERSION || !Array.isArray(body.fingerprints)) return undefined;
-	if (body.fingerprints.length > CRASH_INDEX_MAX_SIGNATURES) return undefined;
+	if (body.fingerprints.length > CRASH_RETIRED_MAX_FINGERPRINTS) return undefined;
 	if (!body.fingerprints.every(value => typeof value === "string" && CRASH_FINGERPRINT_PATTERN.test(value)))
 		return undefined;
 	return { version: CRASH_INDEX_VERSION, fingerprints: [...body.fingerprints] };
@@ -339,15 +341,29 @@ async function quarantineIndex(indexPath: string, now: number): Promise<string |
 }
 
 async function readRetiredFingerprints(indexPath: string): Promise<string[]> {
-	const raw = await readNoFollow(retiredIndexPath(indexPath), CRASH_INDEX_MAX_BYTES);
+	const raw = await readNoFollow(retiredIndexPath(indexPath), CRASH_LOG_SCAN_MAX_BYTES);
 	return raw === undefined ? [] : (parseRetiredIndex(raw)?.fingerprints ?? []);
+}
+
+async function crashLogExists(crashLogPath: string): Promise<boolean | undefined> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(crashLogPath, fs.constants.O_RDONLY | NOFOLLOW);
+		const stat = await handle.stat();
+		return stat.isFile() ? true : undefined;
+	} catch (error) {
+		if (isEnoent(error)) return false;
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => {});
+	}
 }
 
 async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string): Promise<void> {
 	if (index.retiredFingerprints.length === 0) return;
 	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
 	if (contents === undefined) {
-		index.retiredFingerprints = [];
+		if ((await crashLogExists(crashLogPath)) === false) index.retiredFingerprints = [];
 		return;
 	}
 	const retained = new Set(parseRecoverableCrashRecords(contents).map(record => record.fingerprint));
@@ -381,7 +397,7 @@ function evictOne(index: CrashIndex): boolean {
 	}
 	if (!victim) return false;
 	if (!index.retiredFingerprints.includes(victim)) {
-		if (index.retiredFingerprints.length >= CRASH_INDEX_MAX_SIGNATURES) return false;
+		if (index.retiredFingerprints.length >= CRASH_RETIRED_MAX_FINGERPRINTS) return false;
 		index.retiredFingerprints.push(victim);
 	}
 	delete index.signatures[victim];
@@ -471,9 +487,12 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 	for (const entry of Object.values(index.signatures)) entry.retainedCount = 0;
 	const contents = await readNoFollow(crashLogPath, CRASH_LOG_SCAN_MAX_BYTES);
 	if (contents === undefined) return;
+	const retainedRecordIds = new Set<string>();
 	for (const line of contents.split("\n")) {
 		const marker = parseCrashRecordMarker(line);
 		if (!marker) continue;
+		if (retainedRecordIds.has(marker.recordId)) continue;
+		retainedRecordIds.add(marker.recordId);
 		const entry = index.signatures[marker.fingerprint];
 		if (entry && entry.retainedCount < entry.lifetimeCount) entry.retainedCount += 1;
 	}
@@ -578,13 +597,14 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 
 		await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
 		index.updatedAt = now;
-		let serialized = `${JSON.stringify(index)}\n`;
+		const serializeIndex = (): string => `${JSON.stringify({ ...index, retiredFingerprints: [] })}\n`;
+		let serialized = serializeIndex();
 		while (Buffer.byteLength(serialized, "utf8") > CRASH_INDEX_MAX_BYTES && evictOne(index)) {
-			serialized = `${JSON.stringify(index)}\n`;
+			serialized = serializeIndex();
 		}
 		if (Buffer.byteLength(serialized, "utf8") > CRASH_INDEX_MAX_BYTES) {
 			index.overflow = true;
-			serialized = `${JSON.stringify(index)}\n`;
+			serialized = serializeIndex();
 		}
 		await fs.rm(paths.index, { force: true });
 		await writeAtomic(paths.index, serialized);

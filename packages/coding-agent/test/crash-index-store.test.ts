@@ -164,6 +164,17 @@ describe("compactCrashIndex", () => {
 		expect(rebuilt.retiredFingerprints).toContain(retired.fingerprint);
 	});
 
+	it("preserves retirement when the crash log exists but cannot be read as a regular file", async () => {
+		const paths = await tempPaths();
+		await fs.mkdir(paths.crashLog);
+		await fs.writeFile(
+			`${paths.index}.retired`,
+			`${JSON.stringify({ version: 1, fingerprints: [fingerprintFor(204)] })}\n`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.retiredFingerprints).toContain(fingerprintFor(204));
+	});
+
 	it("supersedes retirement when a new journal occurrence revives the signature", async () => {
 		const paths = await tempPaths();
 		const retired = recoverableRecord(206, "journal revival", "2026-08-11T11:00:00.000Z");
@@ -248,6 +259,21 @@ describe("compactCrashIndex", () => {
 		const index = await compactCrashIndex({ paths, now: NOW });
 		expect(index.signatures[fingerprintFor(3)]?.lifetimeCount).toBe(4);
 		expect(index.signatures[fingerprintFor(3)]?.retainedCount).toBe(1);
+	});
+
+	it("does not count a duplicate retained record id twice for an existing signature", async () => {
+		const paths = await tempPaths();
+		appendCrashEvent(occurrence(fingerprintFor(30), recordId(30)), paths.events);
+		appendCrashEvent(occurrence(fingerprintFor(30), recordId(31)), paths.events);
+		const marker = formatCrashRecordMarker(fingerprintFor(30), 1, recordId(30));
+		await fs.writeFile(
+			paths.crashLog,
+			`2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] Error: x\n${marker}\n\n` +
+				`2026-08-11T12:00:00.000Z pid=1 [Uncaught Exception] Error: x\n${marker}\n\n`,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(30)]?.lifetimeCount).toBe(2);
+		expect(index.signatures[fingerprintFor(30)]?.retainedCount).toBe(1);
 	});
 
 	it("writes an index its own reader accepts when the log holds more records than the journal counted", async () => {

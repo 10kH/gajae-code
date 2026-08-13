@@ -83,6 +83,15 @@ describe("parseCrashRecords", () => {
 		expect(parseRecoverableCrashRecords(valid.text.trimEnd())).toHaveLength(0);
 	});
 
+	it("accepts a bound record with a serialized object payload after its stack", () => {
+		const valid = boundRecord("0123456789abcdef", "bound crash", "    at frame (packages/coding-agent/src/x.ts:1:1)");
+		const withPayload = valid.text.replace(
+			formatCrashRecordMarker(valid.fingerprint, 1, "0123456789abcdef"),
+			`{"phase":"startup","reason":"pending"}\n${formatCrashRecordMarker(valid.fingerprint, 1, "0123456789abcdef")}`,
+		);
+		expect(parseRecoverableCrashRecords(withPayload).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+	});
+
 	it("rejects arbitrary-text identity decoys and mismatched markers", () => {
 		const valid = boundRecord("0123456789abcdef", "bound crash", "    at frame (packages/coding-agent/src/x.ts:1:1)");
 		const decoy =
