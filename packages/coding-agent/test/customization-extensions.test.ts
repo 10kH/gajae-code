@@ -245,7 +245,7 @@ describe("import from Claude Code (project → project .gjc)", () => {
 		expect(hooks.map(e => e.destinationName)).toEqual(["pre/bash.ts"]);
 		expect(mcps.map(e => e.destinationName)).toEqual(["claude-server"]);
 		const mcp = mcps[0];
-		expect(mcp.status).toBe("redacted");
+		expect(mcp.status).toBe("add");
 		expect(mcp.reason).toContain("env:API_KEY");
 		// The preview DTO is serialization-safe: no secret values anywhere.
 		expect(JSON.stringify(preview)).not.toContain("secret-value");
@@ -292,13 +292,13 @@ describe("import from Codex (user-global → global .gjc, explicit selection)", 
 			"codex-server",
 		]);
 		expect(plan.preview.entries.filter(e => e.surface === "hooks").map(e => e.destinationName)).toEqual([
-			"pre/pre-bash.ts",
+			"pre/bash.ts",
 		]);
 		const result = await applyImport(plan, { cwd: projectDir });
 		expect(result.ok).toBe(true);
 		// Writes land only in the global .gjc scope, never the project.
 		await fs.stat(path.join(getAgentDir(), "skills", "codex-skill", "SKILL.md"));
-		await fs.stat(path.join(getAgentDir(), "hooks", "pre", "pre-bash.ts"));
+		await fs.stat(path.join(getAgentDir(), "hooks", "pre", "bash.ts"));
 		const mcpConfig = JSON.parse(await fs.readFile(path.join(getAgentDir(), "mcp.json"), "utf-8"));
 		expect(mcpConfig.mcpServers["codex-server"].command).toBe("uvx");
 		await expect(fs.stat(path.join(projectDir, ".gjc", "skills", "codex-skill"))).rejects.toThrow();
@@ -340,6 +340,23 @@ describe("import collision policy and safety", () => {
 		await fs.stat(path.join(projectDir, ".gjc", "skills", "dupe-imported", "SKILL.md"));
 	});
 
+	test("rename rewrites an explicit skill frontmatter name to the destination identity", async () => {
+		const named = `---\nname: dupe\ndescription: Named skill.\n---\n\nbody\n`;
+		await writeFile(path.join(projectDir, ".claude", "skills", "dupe", "SKILL.md"), named);
+		await writeFile(path.join(projectDir, ".gjc", "skills", "dupe", "SKILL.md"), SKILL_MD);
+		const plan = await buildImportPreview(previewOptions({ surfaces: ["skills"], collisionPolicy: "rename" }));
+		await applyImport(plan, { cwd: projectDir });
+		const imported = await fs.readFile(path.join(projectDir, ".gjc", "skills", "dupe-imported", "SKILL.md"), "utf-8");
+		expect(imported).toContain("name: dupe-imported");
+	});
+
+	test("protected bundled workflow skill names are rejected at preview", async () => {
+		await writeFile(path.join(projectDir, ".claude", "skills", "ralplan", "SKILL.md"), SKILL_MD);
+		const plan = await buildImportPreview(previewOptions({ surfaces: ["skills"] }));
+		expect(plan.preview.entries[0].status).toBe("unsupported");
+		expect(plan.preview.entries[0].reason).toContain("protected bundled");
+	});
+
 	test("rename never overwrites an occupied -imported destination", async () => {
 		await seedSkillBothSides();
 		// Pre-occupy every suffix the renamer might pick.
@@ -362,6 +379,23 @@ describe("import collision policy and safety", () => {
 		expect(result.entries[0].outcome).toBe("overwritten");
 		const content = await fs.readFile(path.join(projectDir, ".gjc", "skills", "dupe", "SKILL.md"), "utf-8");
 		expect(content).toContain("Fixture skill for tests.");
+	});
+
+	test("credential-bearing MCP overwrite preserves overwrite status and applies", async () => {
+		await writeFile(
+			path.join(projectDir, ".mcp.json"),
+			JSON.stringify({ mcpServers: { srv: { type: "stdio", command: "new", env: { TOKEN: "secret" } } } }),
+		);
+		await writeFile(
+			path.join(projectDir, ".gjc", "mcp.json"),
+			JSON.stringify({ mcpServers: { srv: { type: "stdio", command: "old" } } }),
+		);
+		const plan = await buildImportPreview(previewOptions({ surfaces: ["mcps"], collisionPolicy: "overwrite" }));
+		expect(plan.preview.entries[0].status).toBe("overwrite");
+		expect(plan.preview.entries[0].reason).toContain("secret values hidden");
+		const result = await applyImport(plan, { cwd: projectDir });
+		expect(result.ok).toBe(true);
+		expect(result.entries[0].outcome).toBe("overwritten");
 	});
 
 	test("identical re-import is a no-op (idempotent)", async () => {
@@ -614,10 +648,14 @@ describe("native .gjc mutations", () => {
 	test("MCP enable/disable/remove use the canonical disabledServers denylist", async () => {
 		const paths = resolveScopePaths("project", projectDir);
 		await writeFile(paths.mcpConfigPath, JSON.stringify({ mcpServers: { srv: { type: "stdio", command: "npx" } } }));
-		expect(await setMcpServerEnabled(paths.mcpConfigPath, "srv", false)).toEqual({ ok: true });
+		const disabled = await setMcpServerEnabled(paths.mcpConfigPath, "srv", false);
+		expect(disabled.ok).toBe(true);
+		if (disabled.ok && "disabledExtensions" in disabled) expect(disabled.disabledExtensions).toEqual(["mcp:srv"]);
 		let config = JSON.parse(await fs.readFile(paths.mcpConfigPath, "utf-8"));
 		expect(config.disabledServers).toEqual(["srv"]);
-		expect(await setMcpServerEnabled(paths.mcpConfigPath, "srv", true)).toEqual({ ok: true });
+		const enabled = await setMcpServerEnabled(paths.mcpConfigPath, "srv", true, ["mcp:srv"]);
+		expect(enabled.ok).toBe(true);
+		if (enabled.ok && "disabledExtensions" in enabled) expect(enabled.disabledExtensions).toEqual([]);
 		config = JSON.parse(await fs.readFile(paths.mcpConfigPath, "utf-8"));
 		expect(config.disabledServers).toBeUndefined();
 		expect(await removeMcpServerEntry(paths.mcpConfigPath, "srv")).toEqual({ ok: true });

@@ -33,6 +33,7 @@ import { HookSourceConvention } from "../hooks/events";
 import { normalizeDirectoryHook } from "../hooks/normalize";
 import { readMCPConfigFile, writeMCPConfigFile } from "../runtime-mcp/config-writer";
 import type { MCPServerConfig } from "../runtime-mcp/types";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 import { IMPORTED_FROM_FRONTMATTER_KEY } from "./inventory";
 import type {
 	ImportCollisionPolicy,
@@ -55,6 +56,8 @@ export interface BuildImportPreviewOptions {
 	cwd: string;
 	homeDir: string;
 }
+
+const PROTECTED_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
 
 // ---------------------------------------------------------------------------
 // Structured filesystem reads — absent/value/error, never silent
@@ -366,6 +369,18 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 		const takenSkillNames = new Set(await listDirNames(destination.skillsDir, "directory"));
 		for (const source of scoped) {
 			const slug = source.name;
+			if (PROTECTED_SKILL_NAMES.has(slug)) {
+				push({
+					surface: "skills",
+					sourceName: slug,
+					destinationName: slug,
+					status: "unsupported",
+					sourceCategory: "skill directory",
+					description: `import skill "${slug}"`,
+					reason: "protected bundled GJC workflow skill name; foreign copies cannot override bundled authority",
+				});
+				continue;
+			}
 			if (!isSafeName(slug)) {
 				push({
 					surface: "skills",
@@ -421,7 +436,12 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 				base => renamedDestination(base, name => takenSkillNames.has(name)),
 			);
 			takenSkillNames.add(entry.destinationName);
-			push(entry, { skill: { slug: entry.destinationName, content } });
+			let destinationContent = content;
+			if (entry.destinationName !== slug) {
+				const { frontmatter, body } = parseFrontmatter(content, { level: "off" });
+				destinationContent = `---\n${YAML.stringify({ ...frontmatter, name: entry.destinationName }).trimEnd()}\n---\n\n${body.trim()}\n`;
+			}
+			push(entry, { skill: { slug: entry.destinationName, content: destinationContent } });
 		}
 	}
 
@@ -440,7 +460,11 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 			}
 		}
 		for (const candidate of collected.candidates) {
-			const relDest = `${candidate.phase}/${candidate.fileName}`;
+			const canonicalFileName =
+				options.product === "codex"
+					? `${candidate.toolName}${path.extname(candidate.fileName)}`
+					: candidate.fileName;
+			const relDest = `${candidate.phase}/${canonicalFileName}`;
 			const normalized = normalizeDirectoryHook({
 				convention,
 				phase: candidate.phase,
@@ -473,7 +497,7 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 				});
 				continue;
 			}
-			const existing = await readStructured(path.join(destination.hooksDir, candidate.phase, candidate.fileName));
+			const existing = await readStructured(path.join(destination.hooksDir, candidate.phase, canonicalFileName));
 			const entry = applyCollision(
 				{
 					surface: "hooks",
@@ -582,7 +606,6 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 				);
 				takenMcpNames.add(entry.destinationName);
 				if (secretKeys.length > 0 && (entry.status === "add" || entry.status === "overwrite")) {
-					entry.status = "redacted";
 					entry.reason = `${entry.reason ? `${entry.reason}; ` : ""}secret values hidden in preview (keys: ${secretKeys.join(", ")})`;
 				}
 				push(entry, { mcp: { name: entry.destinationName, config } });

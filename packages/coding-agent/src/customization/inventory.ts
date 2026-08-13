@@ -102,7 +102,10 @@ async function loadSkillRows(options: LoadCustomizationInventoryOptions, _warnin
 		const marker = await readImportMarker(record.path);
 		let status: InventoryStatus;
 		const diagnostics: string[] = [];
-		if (record.enabled) {
+		if (options.policy?.enabled === false) {
+			status = "disabled";
+			diagnostics.push("native skills are disabled globally (skills.enabled=false)");
+		} else if (record.enabled) {
 			status = marker ? "imported" : "enabled";
 		} else if (record.disabledReason === "protected") {
 			// Bundled workflow skills are always active; the name is protected.

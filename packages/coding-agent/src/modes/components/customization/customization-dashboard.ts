@@ -136,6 +136,7 @@ export class CustomizationDashboard extends Container {
 
 	#skillPolicy(): SkillManagementPolicy {
 		return {
+			enabled: this.#settings?.get("skills.enabled") as boolean | undefined,
 			trustProjectSkills: this.#settings?.get("skills.trustProjectSkills") as boolean | undefined,
 			trustUserSkills: this.#settings?.get("skills.trustUserSkills") as boolean | undefined,
 			ignoredSkills: this.#getStringArray("skills.ignoredSkills"),
@@ -274,6 +275,10 @@ export class CustomizationDashboard extends Container {
 		}
 		const enable = row.status === "disabled";
 		if (row.surface === "skills") {
+			if (enable && this.#settings?.get("skills.enabled") === false) {
+				this.#flashStatus("native skills are disabled globally; enable skills.enabled in /settings first");
+				return;
+			}
 			const result = setSkillEnabled(row.name, enable, this.#getStringArray("disabledExtensions"));
 			if (!result.ok) {
 				this.#flashStatus(result.reason);
@@ -287,7 +292,20 @@ export class CustomizationDashboard extends Container {
 			await this.#applyMutation(async () => ({ ok: true }) as { ok: true });
 		} else if (row.surface === "mcps") {
 			const paths = resolveScopePaths(row.scope, this.#cwd);
-			await this.#applyMutation(() => setMcpServerEnabled(paths.mcpConfigPath, row.name, enable));
+			const result = await setMcpServerEnabled(
+				paths.mcpConfigPath,
+				row.name,
+				enable,
+				this.#getStringArray("disabledExtensions"),
+			);
+			if (!result.ok) {
+				this.#flashStatus(result.reason);
+				return;
+			}
+			if ("disabledExtensions" in result && this.#settings?.set) {
+				this.#settings.set("disabledExtensions", result.disabledExtensions);
+			}
+			await this.#applyMutation(async () => ({ ok: true }) as { ok: true });
 		} else {
 			this.#flashStatus("hook enable/disable is not part of the canonical hook contract; remove instead");
 		}

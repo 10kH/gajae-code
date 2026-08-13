@@ -95,6 +95,19 @@ describe("CustomizationDashboard", () => {
 		expect(lines).not.toContain("fixture");
 	});
 
+	test("skills master switch marks native skills disabled", async () => {
+		await seedProjectSkill();
+		const settings = {
+			get(key: string): unknown {
+				return key === "skills.enabled" ? false : undefined;
+			},
+		};
+		const dashboard = await CustomizationDashboard.create(projectDir, settings, homeDir);
+		const row = dashboard.inventory.rows.find(r => r.surface === "skills" && r.name === "fixture");
+		expect(row?.status).toBe("disabled");
+		expect(row?.diagnostics?.join(" ")).toContain("disabled globally");
+	});
+
 	test("rendered rows strip terminal control sequences from hostile names", async () => {
 		await fs.mkdir(path.join(projectDir, ".gjc", "hooks", "pre"), { recursive: true });
 		await fs.writeFile(path.join(projectDir, ".gjc", "hooks", "pre", "evil\x1b[31m.ts"), "export {}\n");

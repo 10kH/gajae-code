@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Added `/extensions`, an interactive project/global `.gjc` manager for skills, hooks, MCPs, and explicit Claude Code/Codex imports with redacted previews and atomic rollback.
+
 ### Added
 
 - `gjc master` (or `gjc --master`) launches a resident master session that supervises other resident GJC sessions through the authoritative SDK/ACP control surface (#4448). Master sessions get a dedicated `<master-mode>` system-prompt section and a session-start hook that injects the SDK supervision guidelines plus a bounded, credential-free snapshot of the broker's resident-session inventory. Classification is fail-closed: only an explicit broker deletion tombstone counts as terminal, non-live rows are `unknown`/hands-off, and turn state is never inferred from liveness heartbeats. Continuation preserves master identity exactly through a durable per-project registry — `gjc master --continue` / `--resume <id>` resolve only recorded master sessions and refuse to convert ordinary sessions. No team mode, no delegate/worker orchestration, no pane scraping. See `docs/master-mode.md`.
