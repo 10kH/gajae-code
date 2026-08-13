@@ -152,11 +152,16 @@ function getCanonicalModelName(modelId: string): string {
   return MODEL_ALIASES[name] ?? name;
 }
 
+function matchesModelFamily(name: string, modelId: string): boolean {
+  if (name === modelId) return true;
+  const suffix = name.slice(modelId.length + 1);
+  return name.startsWith(`${modelId}-`) && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(suffix);
+}
+
 export function getMaxReasoningEffort(modelId: string): Effort | undefined {
   const name = getCanonicalModelName(modelId);
-  return FALLBACK_MODELS.find(
-    (model) => name === model.id.toLowerCase() || name.startsWith(`${model.id.toLowerCase()}-`),
-  )?.maxReasoningEffort;
+  return FALLBACK_MODELS.find((model) => matchesModelFamily(name, model.id.toLowerCase()))
+    ?.maxReasoningEffort;
 }
 
 const EFFORT_CAPABLE_PREFIXES = [
@@ -169,7 +174,7 @@ const EFFORT_CAPABLE_PREFIXES = [
 
 export function supportsReasoningEffort(modelId: string): boolean {
   const name = getCanonicalModelName(modelId);
-  if (!EFFORT_CAPABLE_PREFIXES.some((prefix) => name === prefix || name.startsWith(`${prefix}-`))) {
+  if (!EFFORT_CAPABLE_PREFIXES.some((prefix) => matchesModelFamily(name, prefix))) {
     return false;
   }
   const model = resolveModels().find((entry) => getCanonicalModelName(entry.id) === name);
