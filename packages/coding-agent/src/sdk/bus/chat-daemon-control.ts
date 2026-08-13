@@ -113,7 +113,6 @@ export type ChatDaemonAction = "stop" | "reload";
  * Discord generation 57 removes missing-authority wildcard behavior from durable binding checks.
  * Discord generation 58 preserves exact authority through unarchive replacement fallback.
  * Discord generation 59 / Slack generation 63 derive attachment authority ids from one Router function so persisted provider bindings and live attachments cannot drift apart.
- * Discord generation 61 fences master-channel worker lifecycle and delivery authority.
  * Discord generation 62 / Slack generation 65 fence the Windows process-incarnation
  * authority change (#4362): the native binding fallback no longer spawns powershell.exe.
  * Discord generation 63 / Slack generation 66 retain the shared ownership fence

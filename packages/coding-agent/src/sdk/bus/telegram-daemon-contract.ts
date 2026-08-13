@@ -243,9 +243,6 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * settled as definitive, and the unsupported-method fallback closes when
  * deleteForumTopic is unavailable on older Bot API deployments.
  * Generation 158 updates terminal-abort notification admission and cleanup semantics.
- * Generation 158 fences the master-worker lifecycle: older daemons cannot
- * continue serving while this daemon adds or removes master-channel delivery
- * authority.
  * Generation 159 fences the Windows process-incarnation authority: the native
  * binding fallback no longer spawns powershell.exe when it cannot bind a pid,
  * so older daemons that may still flash a console window during liveness polling

@@ -168,7 +168,6 @@ process.exitCode = await child.exited;`;
 			"notify",
 			"sdk",
 			"daemon",
-			"master",
 			"web-search",
 			"local-provider",
 			"mcp-serve",
