@@ -95,13 +95,14 @@ function createRuntime() {
 		number,
 		ReturnType<AgentSession["modelRegistry"]["authStorage"]["getCachedUsageReport"]>
 	>();
+	const activeCredentialRows = new Map<string, number>();
 	const authStorage = {
 		listCredentialInventory: () => credentialInventory,
 		listCredentialRemovalTargets: () => [],
 		getGeneration: () => 0,
 		getCachedCredentialHealth: () => ({ status: "unknown", reason: null }),
 		getCachedUsageReport: (_provider: string, credentialId: number) => cachedUsage.get(credentialId),
-		getSessionCredentialRowId: () => undefined,
+		getSessionCredentialRowId: (provider: string) => activeCredentialRows.get(provider),
 		hasRuntimeApiKey: () => false,
 		hasConfigApiKey: () => false,
 		getEffectiveCredentialType: () => undefined,
@@ -259,13 +260,19 @@ function createRuntime() {
 		output,
 		session,
 		fakeSessionManager,
-		setAccountUsage(
+		setAccountInventory(
 			inventory: typeof credentialInventory,
-			usage: NonNullable<ReturnType<AgentSession["modelRegistry"]["authStorage"]["getCachedUsageReport"]>>,
+			usageByCredentialId: ReadonlyMap<
+				number,
+				NonNullable<ReturnType<AgentSession["modelRegistry"]["authStorage"]["getCachedUsageReport"]>>
+			>,
+			activeRows: ReadonlyMap<string, number> = new Map(),
 		): void {
 			credentialInventory = inventory;
 			cachedUsage.clear();
-			for (const row of inventory) cachedUsage.set(row.id, usage);
+			for (const [credentialId, usage] of usageByCredentialId) cachedUsage.set(credentialId, usage);
+			activeCredentialRows.clear();
+			for (const [provider, credentialId] of activeRows) activeCredentialRows.set(provider, credentialId);
 		},
 		runtime: {
 			session: typedSession,
@@ -353,9 +360,9 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("renders provider usage reports when the session can fetch them", async () => {
-		const { output, runtime, setAccountUsage } = createRuntime();
+		const { output, runtime, setAccountInventory } = createRuntime();
 		const now = Date.now();
-		setAccountUsage(
+		setAccountInventory(
 			[
 				{
 					id: 1,
@@ -365,27 +372,63 @@ describe("ACP builtin slash commands", () => {
 					disabled: false,
 					disabledCause: null,
 				},
-			],
-			{
-				report: {
+				{
+					id: 2,
 					provider: "openai-codex",
-					fetchedAt: now,
-					limits: [
-						{
-							id: "codex-5h",
-							label: "5 hours",
-							scope: { provider: "openai-codex", tier: "prolite", accountId: "account-1" },
-							window: { id: "5h", label: "5 hours", resetsAt: now + 60 * 60 * 1000 },
-							amount: { used: 0.24, usedFraction: 0.24, unit: "unknown" },
-						},
-					],
-					metadata: { email: "user@example.com" },
+					credentialKind: "oauth",
+					identityLabel: "selected@example.com",
+					disabled: false,
+					disabledCause: null,
 				},
-				fetchedAt: now,
-				freshUntil: now + 60_000,
-				retainUntil: now + 86_400_000,
-				freshness: "fresh",
-			},
+			],
+			new Map([
+				[
+					1,
+					{
+						report: {
+							provider: "openai-codex",
+							fetchedAt: now,
+							limits: [
+								{
+									id: "codex-5h",
+									label: "5 hours",
+									scope: { provider: "openai-codex", tier: "prolite", accountId: "account-1" },
+									window: { id: "5h", label: "5 hours", resetsAt: now + 60 * 60 * 1000 },
+									amount: { used: 0.24, usedFraction: 0.24, unit: "unknown" },
+								},
+							],
+							metadata: { email: "user@example.com" },
+						},
+						fetchedAt: now,
+						freshUntil: now + 60_000,
+						retainUntil: now + 86_400_000,
+						freshness: "fresh",
+					},
+				],
+				[
+					2,
+					{
+						report: {
+							provider: "openai-codex",
+							fetchedAt: now,
+							limits: [
+								{
+									id: "codex-weekly",
+									label: "Weekly",
+									scope: { provider: "openai-codex", accountId: "account-2" },
+									amount: { used: 2, usedFraction: 0.02, unit: "requests" },
+								},
+							],
+							metadata: { email: "selected@example.com" },
+						},
+						fetchedAt: now,
+						freshUntil: now + 60_000,
+						retainUntil: now + 86_400_000,
+						freshness: "fresh",
+					},
+				],
+			]),
+			new Map([["openai-codex", 2]]),
 		);
 
 		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
@@ -394,12 +437,24 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("openai-codex:stored:1");
 		expect(output[0]).toContain("user@example.com");
 		expect(output[0]).toContain("5 hours: 0.24 unknown used (76.0% left)");
+		expect(output[0]).toContain("openai-codex:stored:2");
+		expect(output[0]).toContain("selected@example.com [active]");
+		expect(output[0]).toContain("Weekly: 2.00 requests used (98.0% left)");
+	});
+
+	it("renders the deterministic empty stored-account inventory without probing", async () => {
+		const { output, runtime } = createRuntime();
+
+		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
+
+		expect(output[0]).toContain("Accounts (cache only)");
+		expect(output[0]).not.toContain(":stored:");
 	});
 
 	it("keeps one fallback account identity across multiple quota windows in one report", async () => {
-		const { output, runtime, setAccountUsage } = createRuntime();
+		const { output, runtime, setAccountInventory } = createRuntime();
 		const now = Date.now();
-		setAccountUsage(
+		setAccountInventory(
 			[
 				{
 					id: 1,
@@ -410,33 +465,38 @@ describe("ACP builtin slash commands", () => {
 					disabledCause: null,
 				},
 			],
-			{
-				report: {
-					provider: "grok-build",
-					fetchedAt: now,
-					limits: [
-						{
-							id: "grok-build:7d",
-							label: "SuperGrok monthly credits",
-							scope: { provider: "grok-build", windowId: "7d" },
-							window: { id: "7d", label: "Monthly credits", resetsAt: now + 20 * 86400_000 },
-							amount: { used: 25, usedFraction: 0.25, unit: "percent" },
+			new Map([
+				[
+					1,
+					{
+						report: {
+							provider: "grok-build",
+							fetchedAt: now,
+							limits: [
+								{
+									id: "grok-build:7d",
+									label: "SuperGrok monthly credits",
+									scope: { provider: "grok-build", windowId: "7d" },
+									window: { id: "7d", label: "Monthly credits", resetsAt: now + 20 * 86400_000 },
+									amount: { used: 25, usedFraction: 0.25, unit: "percent" },
+								},
+								{
+									id: "grok-build:weekly",
+									label: "SuperGrok weekly credits",
+									scope: { provider: "grok-build", windowId: "weekly" },
+									window: { id: "weekly", label: "Weekly", resetsAt: now + 6 * 86400_000 },
+									amount: { used: 6, usedFraction: 0.06, unit: "percent" },
+								},
+							],
+							metadata: {},
 						},
-						{
-							id: "grok-build:weekly",
-							label: "SuperGrok weekly credits",
-							scope: { provider: "grok-build", windowId: "weekly" },
-							window: { id: "weekly", label: "Weekly", resetsAt: now + 6 * 86400_000 },
-							amount: { used: 6, usedFraction: 0.06, unit: "percent" },
-						},
-					],
-					metadata: {},
-				},
-				fetchedAt: now,
-				freshUntil: now + 60_000,
-				retainUntil: now + 86_400_000,
-				freshness: "fresh",
-			},
+						fetchedAt: now,
+						freshUntil: now + 60_000,
+						retainUntil: now + 86_400_000,
+						freshness: "fresh",
+					},
+				],
+			]),
 		);
 
 		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
@@ -1477,9 +1537,9 @@ describe("wave 5 — adapters and polish", () => {
 
 	// /usage bar character
 	it("/usage: includes bar character when usedFraction is 0.5", async () => {
-		const { output, runtime, setAccountUsage } = createRuntime();
+		const { output, runtime, setAccountInventory } = createRuntime();
 		const now = Date.now();
-		setAccountUsage(
+		setAccountInventory(
 			[
 				{
 					id: 1,
@@ -1490,26 +1550,31 @@ describe("wave 5 — adapters and polish", () => {
 					disabledCause: null,
 				},
 			],
-			{
-				report: {
-					provider: "test-provider",
-					fetchedAt: now,
-					limits: [
-						{
-							id: "test-limit",
-							label: "Monthly",
-							scope: { provider: "test-provider", tier: "pro", accountId: "acct-1" },
-							window: { id: "monthly", label: "monthly", resetsAt: now + 30 * 86400_000 },
-							amount: { used: 50, usedFraction: 0.5, unit: "requests" },
+			new Map([
+				[
+					1,
+					{
+						report: {
+							provider: "test-provider",
+							fetchedAt: now,
+							limits: [
+								{
+									id: "test-limit",
+									label: "Monthly",
+									scope: { provider: "test-provider", tier: "pro", accountId: "acct-1" },
+									window: { id: "monthly", label: "monthly", resetsAt: now + 30 * 86400_000 },
+									amount: { used: 50, usedFraction: 0.5, unit: "requests" },
+								},
+							],
+							metadata: {},
 						},
-					],
-					metadata: {},
-				},
-				fetchedAt: now,
-				freshUntil: now + 60_000,
-				retainUntil: now + 86_400_000,
-				freshness: "fresh",
-			},
+						fetchedAt: now,
+						freshUntil: now + 60_000,
+						retainUntil: now + 86_400_000,
+						freshness: "fresh",
+					},
+				],
+			]),
 		);
 		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
 		expect(result).toEqual({ consumed: true });
