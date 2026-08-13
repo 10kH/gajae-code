@@ -3,18 +3,22 @@
  * `/extensions` dashboard (issue #4291).
  *
  * Steps: source product → source scope → surfaces → collision policy →
- * normalized preview → apply result. The preview step is explicit-confirmation
- * only: Enter applies (journaled, rollback on failure), Esc cancels without
- * writing anything. Secret values never appear in any rendered line — the
- * preview only carries redacted descriptions from `buildImportPreview`.
+ * normalized preview (paged, every entry reviewable) → apply result.
+ * Selection lists are attached to the component tree so choices are actually
+ * visible; the preview step is explicit-confirmation only — Enter applies
+ * once (applying latch), Esc cancels without writing anything. Secret values
+ * never appear in any rendered line, and `applied` is reported only when the
+ * transaction succeeded. All dynamic text is sanitized before rendering.
  */
 import * as os from "node:os";
-import { Container, type SelectItem, SelectList, Text } from "@gajae-code/tui";
+import { Container, matchesKey, type SelectItem, SelectList, Text } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import { applyImport, type BuildImportPreviewOptions, buildImportPreview } from "../../../customization/import";
 import type {
 	CustomizationSurface,
 	GjcScope,
 	ImportCollisionPolicy,
+	ImportPlan,
 	ImportPreview,
 	ImportProduct,
 	ImportResult,
@@ -48,8 +52,15 @@ const COLLISION_CHOICES: Array<{ value: ImportCollisionPolicy; hint: string }> =
 	{ value: "overwrite", hint: "replace existing .gjc entries (explicit, never silent)" },
 ];
 
+const PREVIEW_PAGE_SIZE = 8;
+
+/** Sanitize + detab every dynamic string before it reaches a renderer. */
+function safe(text: string): string {
+	return replaceTabs(sanitizeText(text));
+}
+
 export class ImportWizard extends Container {
-	/** Called when the wizard finishes or is cancelled; `applied` is true when an import ran. */
+	/** Called when the wizard finishes or is cancelled; `applied` is true only when an import succeeded. */
 	onClose: ((applied: boolean) => void) | undefined;
 	onRequestRender: (() => void) | undefined;
 
@@ -61,11 +72,14 @@ export class ImportWizard extends Container {
 	#sourceScope: ImportSourceScope = "project";
 	#surfaces: CustomizationSurface[] = ["skills", "hooks", "mcps"];
 	#collisionPolicy: ImportCollisionPolicy = "skip";
-	#preview: ImportPreview | null = null;
+	#plan: ImportPlan | null = null;
 	#result: ImportResult | null = null;
 	#applied = false;
+	#applying = false;
+	#previewPage = 0;
 
 	#headerText: Text;
+	#selectContainer: Container;
 	#selectList: SelectList | null = null;
 	#bodyText: Text;
 	#footerText: Text;
@@ -80,6 +94,8 @@ export class ImportWizard extends Container {
 		this.#headerText = new Text("", 0, 0);
 		this.addChild(this.#headerText);
 		this.addChild(new DynamicBorder());
+		this.#selectContainer = new Container();
+		this.addChild(this.#selectContainer);
 		this.#bodyText = new Text("", 0, 0);
 		this.addChild(this.#bodyText);
 		this.addChild(new DynamicBorder());
@@ -94,14 +110,19 @@ export class ImportWizard extends Container {
 		return this.#step;
 	}
 
-	/** Last built preview (test-visible). */
+	/** Last built preview DTO — redacted and serialization-safe (test-visible). */
 	get preview(): ImportPreview | null {
-		return this.#preview;
+		return this.#plan?.preview ?? null;
 	}
 
 	/** Last apply result (test-visible). */
 	get result(): ImportResult | null {
 		return this.#result;
+	}
+
+	/** Whether the wizard currently shows an attached selection list (test-visible). */
+	get hasVisibleSelector(): boolean {
+		return this.#selectList !== null;
 	}
 
 	#previewOptions(): BuildImportPreviewOptions {
@@ -117,9 +138,12 @@ export class ImportWizard extends Container {
 	}
 
 	#setSelectStep(title: string, items: SelectItem[], onSelect: (value: string) => void): void {
-		this.#selectList = new SelectList(items, Math.min(items.length, 8), getSelectListTheme());
-		this.#selectList.onSelect = item => onSelect(item.value);
-		this.#selectList.onCancel = () => this.onClose?.(this.#applied);
+		this.#selectContainer.clear();
+		const list = new SelectList(items, Math.min(items.length, 8), getSelectListTheme());
+		list.onSelect = item => onSelect(item.value);
+		list.onCancel = () => this.onClose?.(this.#applied);
+		this.#selectList = list;
+		this.#selectContainer.addChild(list);
 		this.#headerText.setText(theme.bold(theme.fg("accent", title)));
 		this.#bodyText.setText("");
 		this.#footerText.setText(theme.fg("muted", "↑/↓ navigate · enter select · esc cancel"));
@@ -189,22 +213,34 @@ export class ImportWizard extends Container {
 	}
 
 	async #buildPreview(): Promise<void> {
+		this.#selectContainer.clear();
 		this.#selectList = null;
 		this.#headerText.setText(theme.fg("muted", "Reading source configuration…"));
 		this.#requestRender();
-		this.#preview = await buildImportPreview(this.#previewOptions());
+		this.#plan = await buildImportPreview(this.#previewOptions());
+		this.#previewPage = 0;
 		this.#step = "preview";
 		this.#renderPreview();
 	}
 
+	#previewPageCount(): number {
+		const total = this.#plan?.preview.entries.length ?? 0;
+		return Math.max(1, Math.ceil(total / PREVIEW_PAGE_SIZE));
+	}
+
 	#renderPreview(): void {
-		const preview = this.#preview;
-		if (!preview) return;
-		const lines: string[] = [];
+		const plan = this.#plan;
+		if (!plan) return;
+		const { preview } = plan;
 		const writable = preview.entries.filter(
 			e => e.status === "add" || e.status === "overwrite" || e.status === "redacted",
 		);
 		const skipped = preview.entries.filter(e => e.status === "conflict" || e.status === "unsupported");
+		const pageCount = this.#previewPageCount();
+		const page = Math.min(this.#previewPage, pageCount - 1);
+		const pageEntries = preview.entries.slice(page * PREVIEW_PAGE_SIZE, (page + 1) * PREVIEW_PAGE_SIZE);
+
+		const lines: string[] = [];
 		lines.push(
 			`${theme.bold("Preview:")} ${productLabel(preview.product)} ${sourceScopeLabel(preview.sourceScope)} → ${scopeLabel(preview.destinationScope)} · policy: ${this.#collisionPolicy}`,
 		);
@@ -212,7 +248,7 @@ export class ImportWizard extends Container {
 		if (preview.entries.length === 0) {
 			lines.push(theme.fg("muted", "(nothing found to import at the selected source)"));
 		}
-		for (const entry of preview.entries.slice(0, 12)) {
+		for (const entry of pageEntries) {
 			const statusColor =
 				entry.status === "add"
 					? theme.fg("success", "+")
@@ -226,32 +262,51 @@ export class ImportWizard extends Container {
 					? entry.sourceName
 					: `${entry.sourceName} → ${entry.destinationName}`;
 			lines.push(
-				` ${statusColor} ${surfaceLabel(entry.surface)}: ${replaceTabs(name)}${entry.reason ? theme.fg("muted", ` — ${replaceTabs(entry.reason)}`) : ""}`,
+				` ${statusColor} ${surfaceLabel(entry.surface)}: ${safe(name)}${entry.reason ? theme.fg("muted", ` — ${safe(entry.reason)}`) : ""}`,
 			);
 		}
-		if (preview.entries.length > 12) {
-			lines.push(theme.fg("muted", ` … ${preview.entries.length - 12} more`));
+		for (const warning of preview.warnings.slice(0, 3)) {
+			lines.push(theme.fg("warning", ` ⚠ ${safe(warning)}`));
 		}
-		for (const warning of preview.warnings.slice(0, 4)) {
-			lines.push(theme.fg("warning", ` ⚠ ${replaceTabs(warning)}`));
+		if (preview.warnings.length > 3) {
+			lines.push(theme.fg("muted", ` … ${preview.warnings.length - 3} more diagnostics`));
 		}
 		this.#headerText.setText(theme.bold(theme.fg("accent", "Confirm import")));
 		this.#bodyText.setText(lines.join("\n"));
+		const paging = pageCount > 1 ? `←/→ page ${page + 1}/${pageCount} · ` : "";
 		this.#footerText.setText(
 			theme.fg(
 				"muted",
-				`enter: apply ${writable.length} entr${writable.length === 1 ? "y" : "ies"} (${skipped.length} skipped) · esc: cancel (no writes)`,
+				`${paging}enter: apply ${writable.length} entr${writable.length === 1 ? "y" : "ies"} (${skipped.length} skipped) · esc: cancel (no writes)`,
 			),
 		);
 		this.#requestRender();
 	}
 
 	async #apply(): Promise<void> {
-		if (!this.#preview) return;
+		if (!this.#plan || this.#applying) return;
+		this.#applying = true;
 		this.#footerText.setText(theme.fg("muted", "Applying import…"));
 		this.#requestRender();
-		this.#result = await applyImport(this.#preview, { cwd: this.#cwd });
-		this.#applied = true;
+		try {
+			this.#result = await applyImport(this.#plan, { cwd: this.#cwd });
+		} catch (error) {
+			this.#result = {
+				entries: [
+					{
+						surface: "skills",
+						sourceName: "",
+						destinationName: "",
+						outcome: "failed",
+						reason: (error as Error).message,
+					},
+				],
+				ok: false,
+			};
+		} finally {
+			this.#applying = false;
+		}
+		this.#applied = this.#result.ok;
 		this.#step = "result";
 		const counts = new Map<string, number>();
 		for (const entry of this.#result.entries) {
@@ -268,9 +323,7 @@ export class ImportWizard extends Container {
 			[
 				summary,
 				"",
-				...failed.map(e =>
-					theme.fg("error", ` ✗ ${e.surface}: ${replaceTabs(e.sourceName)} — ${replaceTabs(e.reason ?? "")}`),
-				),
+				...failed.map(e => theme.fg("error", ` ✗ ${e.surface}: ${safe(e.sourceName)} — ${safe(e.reason ?? "")}`)),
 				...(this.#result.ok
 					? [theme.fg("muted", "Imported entries take effect after the documented reload/new-session boundary.")]
 					: []),
@@ -286,10 +339,18 @@ export class ImportWizard extends Container {
 
 	handleInput(keyData: string): void {
 		if (matchesAppInterrupt(keyData)) {
+			if (this.#applying) return; // never interrupt an in-flight transaction
 			this.onClose?.(this.#applied);
 			return;
 		}
 		if (this.#step === "preview") {
+			if (matchesKey(keyData, "left") || matchesKey(keyData, "right")) {
+				const pageCount = this.#previewPageCount();
+				const delta = matchesKey(keyData, "right") ? 1 : -1;
+				this.#previewPage = (this.#previewPage + delta + pageCount) % pageCount;
+				this.#renderPreview();
+				return;
+			}
 			if (keyData === "\r" || keyData === "\n") {
 				void this.#apply();
 			}

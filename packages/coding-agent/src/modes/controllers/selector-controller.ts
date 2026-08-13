@@ -1974,7 +1974,13 @@ export class SelectorController {
 	 * Extension Control Center above (issue #4291).
 	 */
 	async showCustomizationDashboard(): Promise<void> {
-		const dashboard = await CustomizationDashboard.create(getProjectDir(), this.ctx.settings);
+		let dashboard: CustomizationDashboard;
+		try {
+			dashboard = await CustomizationDashboard.create(getProjectDir(), this.ctx.settings);
+		} catch (error) {
+			this.ctx.showError(`Failed to open /extensions: ${error instanceof Error ? error.message : String(error)}`);
+			return;
+		}
 		this.showSelector(done => {
 			dashboard.onClose = () => {
 				done();

@@ -127,6 +127,8 @@ export type InventoryStatus =
 	| "restart-required";
 
 export interface InventoryRow {
+	/** Stable row identity: `<surface>:<scope>:<path>` */
+	id: string;
 	/** Surface kind */
 	surface: CustomizationSurface;
 	/** Entry name */
@@ -137,7 +139,7 @@ export interface InventoryRow {
 	status: InventoryStatus;
 	/** Provenance — which scope/convention discovered it */
 	provenance: string;
-	/** Absolute source path */
+	/** Absolute discovered path — the exact identity mutations act on */
 	path: string;
 	/** Scope that persists this row (project `.gjc` or global `.gjc`) */
 	scope: GjcScope;
@@ -145,7 +147,7 @@ export interface InventoryRow {
 	description?: string;
 	/** Diagnostics/remediation detail for invalid/conflicted rows */
 	diagnostics?: string[];
-	/** Raw item for inspector (secret-redacted before display) */
+	/** Redacted inspector payload (never contains secret values) */
 	raw: unknown;
 }
 
@@ -170,14 +172,12 @@ export interface ImportPreviewEntry {
 	description: string;
 	/** Reason for conflict/unsupported/redaction if applicable */
 	reason?: string;
-	/** Normalized data to write (never exposed in UI) */
-	_payload?: NormalizedPayload;
 }
 
 export interface NormalizedPayload {
 	mcp?: { name: string; config: MCPServerConfig };
 	skill?: { slug: string; content: string };
-	hook?: { sourceName: string; destinationName: string; content: string; warnings: string[] };
+	hook?: { phase: "pre" | "post"; fileName: string; content: string };
 }
 
 export interface ImportPreview {
@@ -188,6 +188,18 @@ export interface ImportPreview {
 	entries: ImportPreviewEntry[];
 	/** Aggregate warnings across all entries */
 	warnings: string[];
+}
+
+/**
+ * Validated apply plan produced alongside the redacted preview. `payloads` is
+ * parallel to `preview.entries` (undefined for entries that carry no write).
+ * It is deliberately separate from the preview DTO: the preview is safe to
+ * serialize and display, while the plan holds full file contents and MCP
+ * secret values and is only consumed by the apply transaction.
+ */
+export interface ImportPlan {
+	preview: ImportPreview;
+	payloads: readonly (NormalizedPayload | undefined)[];
 }
 
 // ---------------------------------------------------------------------------

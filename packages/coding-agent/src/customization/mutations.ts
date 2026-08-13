@@ -3,26 +3,23 @@
  * (issue #4291). Every operation goes through the same canonical
  * loaders/writers the runtime and CLI use — no parallel state model.
  *
- * - Skills: enable/disable via frontmatter `enabled`, remove with bundled-name
- *   and symlink protection.
+ * - Skills: enable/disable via the authoritative `setNativeSkillEnabled`
+ *   policy contract (the caller persists the returned `disabledExtensions`
+ *   list through Settings); remove targets the exact discovered SKILL.md
+ *   path identity with bundled-name and symlink protection.
  * - MCPs: enable/disable via the `enabled` flag and remove via the canonical
  *   config writer (atomic write, cache invalidation included).
- * - Hooks: remove only (directory hook files); enable/disable is not part of
- *   the canonical hook contract and is rejected with a diagnostic.
+ * - Hooks: remove only, by exact discovered path; enable/disable is not part
+ *   of the canonical hook contract and is rejected by the UI with a
+ *   diagnostic.
  */
-import { promises as fs } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { parseFrontmatter } from "@gajae-code/utils";
-import { YAML } from "bun";
-import { BUNDLED_GJC_SKILL_CATALOG } from "../defaults/gjc-skills.generated";
+import { setNativeSkillEnabled } from "../extensibility/skill-management";
 import { readMCPConfigFile, removeMCPServer, writeMCPConfigFile } from "../runtime-mcp/config-writer";
-import type { GjcScopePaths } from "./types";
+import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
 
-const BUNDLED_SKILL_NAMES: ReadonlySet<string> = new Set(
-	BUNDLED_GJC_SKILL_CATALOG.flatMap(entry =>
-		entry.kind === "skill" && typeof entry.name === "string" ? [entry.name] : [],
-	),
-);
+const BUNDLED_SKILL_NAMES: ReadonlySet<string> = new Set(CANONICAL_GJC_WORKFLOW_SKILLS);
 
 export type MutationResult = { ok: true } | { ok: false; reason: string };
 
@@ -30,56 +27,46 @@ export type MutationResult = { ok: true } | { ok: false; reason: string };
 // Skills
 // ---------------------------------------------------------------------------
 
-async function resolveSkillDir(paths: GjcScopePaths, slug: string): Promise<{ dir: string } | { error: string }> {
-	const dir = path.join(paths.skillsDir, slug);
-	const relative = path.relative(paths.skillsDir, dir);
-	if (relative.startsWith("..") || path.isAbsolute(relative)) {
-		return { error: `skill name "${slug}" escapes the skills directory` };
+/**
+ * Toggle a native skill through the authoritative policy contract. Returns
+ * the updated `disabledExtensions` list; the caller persists it via Settings.
+ * Bundled workflow skill names cannot be disabled.
+ */
+export function setSkillEnabled(
+	name: string,
+	enabled: boolean,
+	disabledExtensions: string[],
+): MutationResult & { disabledExtensions?: string[] } {
+	if (!enabled && BUNDLED_SKILL_NAMES.has(name)) {
+		return { ok: false, reason: `"${name}" is a protected bundled workflow skill name` };
 	}
-	try {
-		const stat = await fs.lstat(dir);
-		if (stat.isSymbolicLink()) return { error: `refusing to mutate symlinked skill directory: ${dir}` };
-		if (!stat.isDirectory()) return { error: `not a skill directory: ${dir}` };
-	} catch {
-		return { error: `skill "${slug}" not found at ${dir}` };
-	}
-	return { dir };
+	return { ok: true, disabledExtensions: setNativeSkillEnabled(name, enabled, disabledExtensions) };
 }
 
-/** Toggle a local skill via its frontmatter `enabled` flag. */
-export async function setSkillEnabled(paths: GjcScopePaths, slug: string, enabled: boolean): Promise<MutationResult> {
-	if (BUNDLED_SKILL_NAMES.has(slug)) {
-		return { ok: false, reason: `"${slug}" is a protected bundled workflow skill name` };
+/**
+ * Remove a native skill by its exact discovered SKILL.md path identity.
+ * Fails when the discovered file is absent, refuses symlinked directories or
+ * files, and never removes protected bundled workflow skill names.
+ */
+export async function removeSkill(record: { name: string; path: string }): Promise<MutationResult> {
+	if (BUNDLED_SKILL_NAMES.has(record.name)) {
+		return { ok: false, reason: `"${record.name}" is a protected bundled workflow skill name` };
 	}
-	const resolved = await resolveSkillDir(paths, slug);
-	if ("error" in resolved) return { ok: false, reason: resolved.error };
-	const skillPath = path.join(resolved.dir, "SKILL.md");
-	let text: string;
+	const dir = path.dirname(record.path);
 	try {
-		text = await fs.readFile(skillPath, "utf-8");
+		const fileStat = await fs.lstat(record.path);
+		if (fileStat.isSymbolicLink())
+			return { ok: false, reason: `refusing to remove symlinked skill file: ${record.path}` };
+		if (!fileStat.isFile())
+			return { ok: false, reason: `discovered skill file is not a regular file: ${record.path}` };
+		const dirStat = await fs.lstat(dir);
+		if (dirStat.isSymbolicLink())
+			return { ok: false, reason: `refusing to remove symlinked skill directory: ${dir}` };
+		if (!dirStat.isDirectory()) return { ok: false, reason: `not a skill directory: ${dir}` };
 	} catch {
-		return { ok: false, reason: `no SKILL.md at ${skillPath}` };
+		return { ok: false, reason: `discovered skill file is absent: ${record.path}` };
 	}
-	const { frontmatter, body } = parseFrontmatter(text, { level: "off" });
-	const fm: Record<string, unknown> = { ...frontmatter };
-	if (enabled) {
-		delete fm.enabled;
-	} else {
-		fm.enabled = false;
-	}
-	const yaml = YAML.stringify(fm).trimEnd();
-	await fs.writeFile(skillPath, `---\n${yaml}\n---\n\n${body.trim()}\n`, "utf-8");
-	return { ok: true };
-}
-
-/** Remove a local skill directory. Never removes bundled-name shadows blindly. */
-export async function removeSkill(paths: GjcScopePaths, slug: string): Promise<MutationResult> {
-	if (BUNDLED_SKILL_NAMES.has(slug)) {
-		return { ok: false, reason: `"${slug}" is a protected bundled workflow skill name` };
-	}
-	const resolved = await resolveSkillDir(paths, slug);
-	if ("error" in resolved) return { ok: false, reason: resolved.error };
-	await fs.rm(resolved.dir, { recursive: true, force: true });
+	await fs.rm(dir, { recursive: true, force: false });
 	return { ok: true };
 }
 
@@ -124,17 +111,16 @@ export async function removeMcpServerEntry(mcpConfigPath: string, name: string):
 // Hooks
 // ---------------------------------------------------------------------------
 
-/** Remove a directory hook file; refuses symlinks and paths outside the hooks dir. */
-export async function removeHookFile(paths: GjcScopePaths, fileName: string): Promise<MutationResult> {
-	const filePath = path.join(paths.hooksDir, fileName);
-	const relative = path.relative(paths.hooksDir, filePath);
-	if (relative.startsWith("..") || path.isAbsolute(relative)) {
-		return { ok: false, reason: `hook name "${fileName}" escapes the hooks directory` };
-	}
+/**
+ * Remove a hook by its exact discovered path. Refuses symlinks, non-files,
+ * and paths that do not exist (no silent success).
+ */
+export async function removeHookFile(hookPath: string): Promise<MutationResult> {
 	try {
-		const stat = await fs.lstat(filePath);
-		if (stat.isSymbolicLink()) return { ok: false, reason: `refusing to remove symlinked hook: ${filePath}` };
-		await fs.rm(filePath, { force: true });
+		const stat = await fs.lstat(hookPath);
+		if (stat.isSymbolicLink()) return { ok: false, reason: `refusing to remove symlinked hook: ${hookPath}` };
+		if (!stat.isFile()) return { ok: false, reason: `not a hook file: ${hookPath}` };
+		await fs.rm(hookPath, { force: false });
 		return { ok: true };
 	} catch (error) {
 		return { ok: false, reason: (error as Error).message };

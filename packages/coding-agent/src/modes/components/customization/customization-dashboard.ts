@@ -7,14 +7,19 @@
  * provider/extension-module ExtensionDashboard; the two surfaces share only
  * generic TUI primitives (Container, Text, SelectList, DynamicBorder).
  *
+ * The scope switch is a real management boundary: each list only shows rows
+ * persisted at the active scope, and mutations refuse rows from the other
+ * scope. All dynamic text is sanitized before rendering.
+ *
  * Layout (narrow-terminal safe):
  *   title: /extensions — Configure skills, hooks, and MCPs.
- *   destination scope badge (Project .gjc / Global .gjc) — `s` switches
+ *   scope badge (Project .gjc / Global .gjc) — `s` switches
  *   section tabs: Skills | Hooks | MCPs — left/right switch
- *   inventory rows for the active section with status + provenance
+ *   inventory rows for the active section + scope with status + provenance
  *   footer key hints
  */
 import { Container, matchesKey, type SelectItem, SelectList, Text } from "@gajae-code/tui";
+import { sanitizeText } from "@gajae-code/utils";
 import { type CustomizationInventory, loadCustomizationInventory } from "../../../customization/inventory";
 import {
 	removeHookFile,
@@ -32,15 +37,22 @@ import {
 	scopeLabel,
 	surfaceLabel,
 } from "../../../customization/types";
+import type { SkillManagementPolicy } from "../../../extensibility/skill-management";
 import { replaceTabs, truncateToWidth } from "../../../tools/render-utils";
 import { getSelectListTheme, theme } from "../../theme/theme";
 import { matchesAppInterrupt } from "../../utils/keybinding-matchers";
 import { DynamicBorder } from "../dynamic-border";
 import { ImportWizard } from "./import-wizard";
 
-/** Minimal settings slice the dashboard reads. */
+/** Minimal settings slice the dashboard reads and writes. */
 export interface CustomizationSettingsSlice {
 	get(key: string): unknown;
+	set?(key: string, value: unknown): void;
+}
+
+/** Sanitize + detab every dynamic string before it reaches a renderer. */
+function safe(text: string): string {
+	return replaceTabs(sanitizeText(text));
 }
 
 const STATUS_COLORS: Record<InventoryRow["status"], (text: string) => string> = {
@@ -57,11 +69,11 @@ function rowToSelectItem(row: InventoryRow): SelectItem {
 	const color = STATUS_COLORS[row.status];
 	const status = color(row.status);
 	return {
-		value: `${row.surface}:${row.scope}:${row.name}`,
-		label: replaceTabs(row.displayName),
-		description: `${status} ${theme.fg("muted", `· ${replaceTabs(row.provenance)}`)}${
-			row.description ? theme.fg("muted", ` — ${replaceTabs(row.description)}`) : ""
-		}`,
+		value: row.id,
+		label: safe(row.displayName),
+		description: `${status} ${theme.fg("muted", `· ${safe(row.provenance)}`)}${
+			row.description ? theme.fg("muted", ` — ${safe(row.description)}`) : ""
+		}${row.diagnostics?.length ? theme.fg("warning", ` — ${safe(row.diagnostics[0])}`) : ""}`,
 	};
 }
 
@@ -82,16 +94,23 @@ export class CustomizationDashboard extends Container {
 	#footerText!: Text;
 	#wizard: ImportWizard | null = null;
 	#confirmRemove: InventoryRow | null = null;
+	#homeDir: string | undefined;
 	#statusMessage: string | null = null;
 
-	private constructor(cwd: string, settings: CustomizationSettingsSlice | undefined) {
+	/** Use `create()` — async inventory load runs before chrome construction. */
+	constructor(cwd: string, settings: CustomizationSettingsSlice | undefined, homeDir: string | undefined) {
 		super();
 		this.#cwd = cwd;
 		this.#settings = settings;
+		this.#homeDir = homeDir;
 	}
 
-	static async create(cwd: string, settings?: CustomizationSettingsSlice): Promise<CustomizationDashboard> {
-		const dashboard = new CustomizationDashboard(cwd, settings);
+	static async create(
+		cwd: string,
+		settings?: CustomizationSettingsSlice,
+		homeDir?: string,
+	): Promise<CustomizationDashboard> {
+		const dashboard = new CustomizationDashboard(cwd, settings, homeDir);
 		await dashboard.#reload();
 		dashboard.#buildChrome();
 		return dashboard;
@@ -110,12 +129,33 @@ export class CustomizationDashboard extends Container {
 		return this.#inventory;
 	}
 
+	#getStringArray(key: string): string[] {
+		const value = this.#settings?.get(key);
+		return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+	}
+
+	#skillPolicy(): SkillManagementPolicy {
+		return {
+			trustProjectSkills: this.#settings?.get("skills.trustProjectSkills") as boolean | undefined,
+			trustUserSkills: this.#settings?.get("skills.trustUserSkills") as boolean | undefined,
+			ignoredSkills: this.#getStringArray("skills.ignoredSkills"),
+			includeSkills: this.#getStringArray("skills.includeSkills"),
+			disabledExtensions: this.#getStringArray("disabledExtensions"),
+		};
+	}
+
 	async #reload(): Promise<void> {
-		const disabled = this.#settings?.get("disabledExtensions");
 		this.#inventory = await loadCustomizationInventory({
 			cwd: this.#cwd,
-			disabledExtensions: Array.isArray(disabled) ? (disabled as string[]) : [],
+			home: this.#homeDir,
+			policy: this.#skillPolicy(),
+			disabledExtensions: this.#getStringArray("disabledExtensions"),
 		});
+	}
+
+	/** Rows visible under the active scope — the scope switch is a real boundary. */
+	#visibleRows(surface: CustomizationSurface): InventoryRow[] {
+		return this.#inventory.rows.filter(row => row.surface === surface && row.scope === this.#scope);
 	}
 
 	#buildChrome(): void {
@@ -135,15 +175,18 @@ export class CustomizationDashboard extends Container {
 
 		this.#bodyContainer = new Container();
 		for (const surface of CUSTOMIZATION_SURFACES) {
-			const rows = this.#inventory.rows.filter(row => row.surface === surface);
+			const rows = this.#visibleRows(surface);
 			const items: SelectItem[] =
 				rows.length > 0
 					? rows.map(rowToSelectItem)
 					: [
 							{
 								value: `${surface}:empty`,
-								label: theme.fg("muted", `(no ${surfaceLabel(surface).toLowerCase()} configured)`),
-								description: theme.fg("muted", "nothing configured at Project .gjc or Global .gjc yet"),
+								label: theme.fg(
+									"muted",
+									`(no ${surfaceLabel(surface).toLowerCase()} at ${scopeLabel(this.#scope)})`,
+								),
+								description: theme.fg("muted", "switch scope with s, or import with i"),
 								disabled: true,
 							},
 						];
@@ -168,7 +211,7 @@ export class CustomizationDashboard extends Container {
 		);
 		const other: GjcScope = this.#scope === "project" ? "global" : "project";
 		scopeLine.setText(
-			`${theme.fg("muted", "destination:")} ${theme.bold(scopeLabel(this.#scope))}  ${theme.fg("muted", `(s: switch to ${scopeLabel(other)})`)}`,
+			`${theme.fg("muted", "scope:")} ${theme.bold(scopeLabel(this.#scope))}  ${theme.fg("muted", `(s: switch to ${scopeLabel(other)} — lists and actions follow the scope)`)}`,
 		);
 		const tabLine = CUSTOMIZATION_SURFACES.map(surface =>
 			surface === this.#section
@@ -177,9 +220,9 @@ export class CustomizationDashboard extends Container {
 		).join(theme.fg("muted", "│"));
 		tabs.setText(tabLine);
 		const warnings = this.#inventory.warnings.length;
-		const status = this.#statusMessage ? ` · ${theme.fg("accent", replaceTabs(this.#statusMessage))}` : "";
+		const status = this.#statusMessage ? ` · ${theme.fg("accent", safe(this.#statusMessage))}` : "";
 		const confirm = this.#confirmRemove
-			? ` · ${theme.fg("warning", `remove ${this.#confirmRemove.displayName}? y/n`)}`
+			? ` · ${theme.fg("warning", `remove ${safe(this.#confirmRemove.displayName)}? y/n`)}`
 			: "";
 		this.#footerText.setText(
 			theme.fg(
@@ -194,12 +237,13 @@ export class CustomizationDashboard extends Container {
 	#selectedRow(): InventoryRow | null {
 		const selected = this.#lists.get(this.#section)?.getSelectedItem();
 		if (!selected || selected.disabled) return null;
-		return this.#inventory.rows.find(row => `${row.surface}:${row.scope}:${row.name}` === selected.value) ?? null;
+		return this.#visibleRows(this.#section).find(row => row.id === selected.value) ?? null;
 	}
 
-	/** Rows discovered outside the canonical .gjc scopes are import sources, not managed entries. */
-	#isForeignRow(row: InventoryRow): boolean {
-		return row.provenance.includes("import to manage");
+	#flashStatus(message: string): void {
+		this.#statusMessage = message;
+		this.#refreshChrome();
+		this.onRequestRender?.();
 	}
 
 	async #applyMutation(action: () => Promise<{ ok: true } | { ok: false; reason: string }>): Promise<void> {
@@ -210,43 +254,48 @@ export class CustomizationDashboard extends Container {
 		this.onRequestRender?.();
 	}
 
+	/** Mutations may only target rows persisted at the active scope. */
+	#guardScope(row: InventoryRow): boolean {
+		if (row.scope !== this.#scope) {
+			this.#flashStatus(
+				`refusing to mutate a ${scopeLabel(row.scope)} entry while viewing ${scopeLabel(this.#scope)}`,
+			);
+			return false;
+		}
+		return true;
+	}
+
 	async #toggleSelected(): Promise<void> {
 		const row = this.#selectedRow();
-		if (!row) return;
-		if (this.#isForeignRow(row)) {
-			this.#statusMessage = "foreign entries are import sources — use i to import, not managed in place";
-			this.#refreshChrome();
-			this.onRequestRender?.();
-			return;
-		}
+		if (!row || !this.#guardScope(row)) return;
 		if (row.status === "invalid" || row.status === "shadowed" || row.status === "quarantined") {
-			this.#statusMessage = `cannot toggle a ${row.status} entry; resolve its diagnostics first`;
-			this.#refreshChrome();
-			this.onRequestRender?.();
+			this.#flashStatus(`cannot toggle a ${row.status} entry; resolve its diagnostics first`);
 			return;
 		}
 		const enable = row.status === "disabled";
-		const paths = resolveScopePaths(row.scope, this.#cwd);
 		if (row.surface === "skills") {
-			await this.#applyMutation(() => setSkillEnabled(paths, row.name, enable));
+			const result = setSkillEnabled(row.name, enable, this.#getStringArray("disabledExtensions"));
+			if (!result.ok) {
+				this.#flashStatus(result.reason);
+				return;
+			}
+			if (!this.#settings?.set) {
+				this.#flashStatus("settings are read-only in this session; cannot persist the toggle");
+				return;
+			}
+			this.#settings.set("disabledExtensions", result.disabledExtensions);
+			await this.#applyMutation(async () => ({ ok: true }) as { ok: true });
 		} else if (row.surface === "mcps") {
+			const paths = resolveScopePaths(row.scope, this.#cwd);
 			await this.#applyMutation(() => setMcpServerEnabled(paths.mcpConfigPath, row.name, enable));
 		} else {
-			this.#statusMessage = "hook enable/disable is not part of the canonical hook contract; remove instead";
-			this.#refreshChrome();
-			this.onRequestRender?.();
+			this.#flashStatus("hook enable/disable is not part of the canonical hook contract; remove instead");
 		}
 	}
 
 	#beginRemove(): void {
 		const row = this.#selectedRow();
-		if (!row) return;
-		if (this.#isForeignRow(row)) {
-			this.#statusMessage = "foreign entries are import sources — use i to import, not managed in place";
-			this.#refreshChrome();
-			this.onRequestRender?.();
-			return;
-		}
+		if (!row || !this.#guardScope(row)) return;
 		this.#confirmRemove = row;
 		this.#refreshChrome();
 		this.onRequestRender?.();
@@ -255,20 +304,18 @@ export class CustomizationDashboard extends Container {
 	async #confirmRemoveSelected(): Promise<void> {
 		const row = this.#confirmRemove;
 		this.#confirmRemove = null;
-		if (!row) return;
-		const paths = resolveScopePaths(row.scope, this.#cwd);
+		if (!row || !this.#guardScope(row)) return;
 		if (row.surface === "skills") {
-			await this.#applyMutation(() => removeSkill(paths, row.name));
+			await this.#applyMutation(() => removeSkill({ name: row.name, path: row.path }));
 		} else if (row.surface === "mcps") {
-			await this.#applyMutation(() => removeMcpServerEntry(paths.mcpConfigPath, row.name));
+			await this.#applyMutation(() => removeMcpServerEntry(row.path, row.name));
 		} else {
-			const fileName = row.path.split("/").pop() ?? row.name;
-			await this.#applyMutation(() => removeHookFile(paths, fileName));
+			await this.#applyMutation(() => removeHookFile(row.path));
 		}
 	}
 
 	#openImportWizard(): void {
-		const wizard = new ImportWizard(this.#cwd, this.#scope);
+		const wizard = new ImportWizard(this.#cwd, this.#scope, this.#homeDir);
 		this.#wizard = wizard;
 		wizard.onRequestRender = () => this.onRequestRender?.();
 		wizard.onClose = applied => {
@@ -305,7 +352,8 @@ export class CustomizationDashboard extends Container {
 
 	#switchScope(): void {
 		this.#scope = this.#scope === "project" ? "global" : "project";
-		this.#refreshChrome();
+		// Rebuild the lists: the visible rows are scope-bound.
+		this.#buildChrome();
 		this.onRequestRender?.();
 	}
 

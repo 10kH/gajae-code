@@ -1,35 +1,42 @@
 /**
  * Import flow for the `/extensions` umbrella customization surface (issue #4291).
  *
- * Imports Claude Code / Codex skills, hooks, and MCP servers — from either the
- * project-local or user-global source layout — into the canonical `.gjc`
- * project/global destination. The flow is preview-first: `buildImportPreview`
- * performs all reads and normalization, applies the deterministic collision
- * policy (skip / rename / overwrite), redacts secrets from everything the UI
- * can render, and only `applyImport` writes — with journaled rollback so a
- * failed import never leaves partial state.
+ * Source layouts are consumed through the sibling contracts instead of local
+ * reimplementations:
+ * - Skills: `listConventionSkillImportSources` (#4285) — Claude `.claude/skills`
+ *   and Codex `.codex/skills` layouts, both scopes.
+ * - Hooks: Claude `.claude/hooks/<pre|post>/<file>` and Codex flat
+ *   `.codex/hooks/<phase>-<tool>.ts|js` conventions, normalized through the
+ *   canonical hook IR (`normalizeDirectoryHook`, #4286/#4289) and written to
+ *   the runtime-discovered `<root>/hooks/<pre|post>/` layout.
+ * - MCPs: `normalizeClaudeMcpJson` / `normalizeCodexMcpToml` plus
+ *   `validateMCPCompatServer` (#4284 bounded compatibility adapters), merged
+ *   through the canonical atomic config writer.
  *
- * Normalization consumes the sibling contracts instead of reimplementing them:
- * the migrate skill normalizer + MCP mapper (#4284/#4285 ownership) and the
- * canonical hook IR normalizer (#4286). Unsupported foreign semantics surface
- * as preview diagnostics, never silent drops.
+ * The preview DTO is redacted and serialization-safe; full file contents and
+ * secret values live only in the separate `ImportPlan`. `applyImport` runs as
+ * a validated transaction: every destination path is containment- and
+ * symlink-checked before any write, destinations are revalidated against the
+ * preview decisions, files are published with same-directory temp+rename, and
+ * any failure restores exactly the files this transaction wrote (pre-existing
+ * symlinks are never touched). Verification failures roll back too.
  */
-import { promises as fs } from "node:fs";
+import type { Dirent } from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isEnoent, parseFrontmatter } from "@gajae-code/utils";
-import { TOML, YAML } from "bun";
+import { parseFrontmatter, tryParseJson } from "@gajae-code/utils";
+import { YAML } from "bun";
+import type { MCPServer } from "../capability/mcp";
+import { normalizeClaudeMcpJson, normalizeCodexMcpToml, validateMCPCompatServer } from "../discovery/mcp-compat";
+import { listConventionSkillImportSources } from "../extensibility/skill-management";
 import { HookSourceConvention } from "../hooks/events";
 import { normalizeDirectoryHook } from "../hooks/normalize";
-import { collectMarkdownPrompts, collectSkillDir } from "../migrate/adapters/index";
-import { mapMcpEntry } from "../migrate/mcp-mapper";
-import { readMCPConfigFile, validateServerName, writeMCPConfigFile } from "../runtime-mcp/config-writer";
-import type { MCPConfigFile, MCPServerConfig } from "../runtime-mcp/types";
+import { readMCPConfigFile, writeMCPConfigFile } from "../runtime-mcp/config-writer";
+import type { MCPServerConfig } from "../runtime-mcp/types";
 import { IMPORTED_FROM_FRONTMATTER_KEY } from "./inventory";
 import type {
-	CustomizationSurface,
-	GjcScope,
 	ImportCollisionPolicy,
-	ImportPreview,
+	ImportPlan,
 	ImportPreviewEntry,
 	ImportProduct,
 	ImportResult,
@@ -42,57 +49,70 @@ import { productLabel, resolveScopePaths, sourceConfigDir, sourceScopeLabel } fr
 export interface BuildImportPreviewOptions {
 	product: ImportProduct;
 	sourceScope: ImportSourceScope;
-	destinationScope: GjcScope;
-	/** Surfaces to import; defaults to all three. */
-	surfaces?: readonly CustomizationSurface[];
+	destinationScope: "project" | "global";
+	surfaces?: readonly ("skills" | "hooks" | "mcps")[];
 	collisionPolicy: ImportCollisionPolicy;
-	/** Project working directory (project source/destination resolution). */
 	cwd: string;
-	/** Home directory root; overridable for tests. */
 	homeDir: string;
 }
 
 // ---------------------------------------------------------------------------
-// Source layouts
+// Structured filesystem reads — absent/value/error, never silent
 // ---------------------------------------------------------------------------
 
-interface SourceLayout {
-	skillsDir: string;
-	hooksDir: string;
-	/** Product-specific MCP config file (`.claude.json` / `.mcp.json` / `config.toml`). */
-	mcpConfigPath: string;
-	/** How MCP entries are encoded in that file. */
-	mcpFormat: "json-mcpServers" | "toml-mcp_servers";
-	/** How skills are encoded: SKILL.md directories (Claude) or markdown prompts (Codex). */
-	skillFormat: "skill-dirs" | "markdown-prompts";
+type ReadResult = { kind: "absent" } | { kind: "value"; content: string } | { kind: "error"; message: string };
+
+function isEnoent(error: unknown): boolean {
+	return (error as NodeJS.ErrnoException)?.code === "ENOENT";
 }
 
-function sourceLayout(
-	product: ImportProduct,
-	sourceScope: ImportSourceScope,
-	cwd: string,
-	homeDir: string,
-): SourceLayout {
-	const configDir = sourceConfigDir(product, sourceScope, cwd, homeDir);
-	if (product === "claude-code") {
-		return {
-			skillsDir: path.join(configDir, "skills"),
-			hooksDir: path.join(configDir, "hooks"),
-			// Project-scope Claude MCP servers live in `<project>/.mcp.json`;
-			// user-global servers live in `~/.claude.json`.
-			mcpConfigPath: sourceScope === "project" ? path.join(cwd, ".mcp.json") : path.join(homeDir, ".claude.json"),
-			mcpFormat: "json-mcpServers",
-			skillFormat: "skill-dirs",
-		};
+/** Read a regular file. Symlinks and non-files are errors, never "absent". */
+async function readStructured(filePath: string): Promise<ReadResult> {
+	let stat: Awaited<ReturnType<typeof fs.lstat>>;
+	try {
+		stat = await fs.lstat(filePath);
+	} catch (error) {
+		if (isEnoent(error)) return { kind: "absent" };
+		return { kind: "error", message: `cannot stat ${filePath}: ${(error as Error).message}` };
 	}
-	return {
-		// Codex "skills" are markdown prompts; both scopes follow the same layout.
-		skillsDir: path.join(configDir, "prompts"),
-		hooksDir: path.join(configDir, "hooks"),
-		mcpConfigPath: path.join(configDir, "config.toml"),
-		mcpFormat: "toml-mcp_servers",
-		skillFormat: "markdown-prompts",
-	};
+	if (stat.isSymbolicLink()) return { kind: "error", message: `refusing unsafe symlink: ${filePath}` };
+	if (!stat.isFile()) return { kind: "error", message: `not a regular file: ${filePath}` };
+	try {
+		return { kind: "value", content: await fs.readFile(filePath, "utf-8") };
+	} catch (error) {
+		if (isEnoent(error)) return { kind: "absent" };
+		return { kind: "error", message: `failed to read ${filePath}: ${(error as Error).message}` };
+	}
+}
+
+async function listDirNames(dir: string, kind: "file" | "directory"): Promise<string[]> {
+	let entries: Dirent[];
+	try {
+		entries = await fs.readdir(dir, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	return entries
+		.filter(entry => (kind === "file" ? entry.isFile() : entry.isDirectory()) && !entry.name.startsWith("."))
+		.map(entry => entry.name)
+		.sort();
+}
+
+// ---------------------------------------------------------------------------
+// Name safety
+// ---------------------------------------------------------------------------
+
+/** A destination name must be a single safe path segment. */
+function isSafeName(name: string): boolean {
+	return (
+		name.length > 0 &&
+		name !== "." &&
+		name !== ".." &&
+		!name.includes("/") &&
+		!name.includes("\\") &&
+		!name.includes("\0") &&
+		!name.split("").some(ch => ch < " ")
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -102,79 +122,12 @@ function sourceLayout(
 /** Inject the imported-from provenance key into a normalized SKILL.md. */
 function withImportProvenance(content: string, product: ImportProduct): string {
 	const { frontmatter, body } = parseFrontmatter(content, { level: "off" });
-	const fm: Record<string, unknown> = { ...frontmatter, [IMPORTED_FROM_FRONTMATTER_KEY]: product };
+	// parseFrontmatter camelCases keys; drop a prior camelized marker so the
+	// canonical kebab-case key is written exactly once.
+	const { xGjcImportedFrom: _priorMarker, ...rest } = frontmatter;
+	const fm: Record<string, unknown> = { ...rest, [IMPORTED_FROM_FRONTMATTER_KEY]: product };
 	const yaml = YAML.stringify(fm).trimEnd();
 	return `---\n${yaml}\n---\n\n${body.trim()}\n`;
-}
-
-// ---------------------------------------------------------------------------
-// Source collection
-// ---------------------------------------------------------------------------
-
-async function readJsonMcpServers(filePath: string): Promise<{ servers: Record<string, unknown> } | { error: string }> {
-	let text: string;
-	try {
-		text = await fs.readFile(filePath, "utf-8");
-	} catch (error) {
-		if (isEnoent(error)) return { servers: {} };
-		return { error: `failed to read ${filePath}: ${(error as Error).message}` };
-	}
-	try {
-		const data = JSON.parse(text) as Record<string, unknown>;
-		const servers = data?.mcpServers;
-		if (servers && typeof servers === "object" && !Array.isArray(servers)) {
-			return { servers: servers as Record<string, unknown> };
-		}
-		return { servers: {} };
-	} catch (error) {
-		return { error: `invalid JSON in ${filePath}: ${(error as Error).message}` };
-	}
-}
-
-async function readTomlMcpServers(filePath: string): Promise<{ servers: Record<string, unknown> } | { error: string }> {
-	let text: string;
-	try {
-		text = await fs.readFile(filePath, "utf-8");
-	} catch (error) {
-		if (isEnoent(error)) return { servers: {} };
-		return { error: `failed to read ${filePath}: ${(error as Error).message}` };
-	}
-	try {
-		const data = TOML.parse(text) as Record<string, unknown>;
-		const servers = data?.mcp_servers;
-		if (servers && typeof servers === "object" && !Array.isArray(servers)) {
-			return { servers: servers as Record<string, unknown> };
-		}
-		return { servers: {} };
-	} catch (error) {
-		return { error: `invalid TOML in ${filePath}: ${(error as Error).message}` };
-	}
-}
-
-interface RawHookCandidate {
-	fileName: string;
-	filePath: string;
-	content: string;
-}
-
-async function collectSourceHooks(hooksDir: string): Promise<RawHookCandidate[]> {
-	let names: string[];
-	try {
-		names = await fs.readdir(hooksDir);
-	} catch {
-		return [];
-	}
-	const candidates: RawHookCandidate[] = [];
-	for (const name of names.sort()) {
-		if (!/\.(ts|js)$/.test(name)) continue;
-		const filePath = path.join(hooksDir, name);
-		try {
-			const stat = await fs.lstat(filePath);
-			if (!stat.isFile() || stat.isSymbolicLink()) continue;
-			candidates.push({ fileName: name, filePath, content: await fs.readFile(filePath, "utf-8") });
-		} catch {}
-	}
-	return candidates;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,14 +146,18 @@ function renamedDestination(base: string, taken: (name: string) => boolean): str
 }
 
 function applyCollision(
-	entry: Omit<ImportPreviewEntry, "status"> & { status?: ImportPreviewEntry["status"] },
-	exists: boolean,
-	identical: boolean,
+	entry: Omit<ImportPreviewEntry, "status">,
+	existing: ReadResult,
+	identicalContent: string | undefined,
 	policy: ImportCollisionPolicy,
 	rename: (base: string) => string,
 ): ImportPreviewEntry {
-	if (!exists) return { ...entry, status: entry.status ?? "add" };
-	if (identical) {
+	if (existing.kind === "error") {
+		return { ...entry, status: "conflict", reason: `destination is unsafe or unreadable: ${existing.message}` };
+	}
+	const exists = existing.kind === "value";
+	if (!exists) return { ...entry, status: "add" };
+	if (identicalContent !== undefined && existing.content === identicalContent) {
 		return {
 			...entry,
 			status: "conflict",
@@ -225,66 +182,220 @@ function applyCollision(
 }
 
 // ---------------------------------------------------------------------------
+// Hook source candidates
+// ---------------------------------------------------------------------------
+
+const CLAUDE_HOOK_EXTENSIONS = [".sh", ".bash", ".zsh", ".fish", ".ts", ".js"] as const;
+
+interface HookCandidate {
+	phase: "pre" | "post";
+	fileName: string;
+	filePath: string;
+	toolName: string;
+	sourceCategory: string;
+}
+
+async function collectSourceHooks(
+	product: ImportProduct,
+	configDir: string,
+): Promise<{ candidates: HookCandidate[]; warnings: string[] }> {
+	const candidates: HookCandidate[] = [];
+	const warnings: string[] = [];
+	if (product === "claude-code") {
+		// Canonical Claude layout: `.claude/hooks/<pre|post>/<file>`.
+		for (const phase of ["pre", "post"] as const) {
+			const dir = path.join(configDir, "hooks", phase);
+			for (const fileName of await listDirNames(dir, "file")) {
+				const ext = CLAUDE_HOOK_EXTENSIONS.find(e => fileName.endsWith(e));
+				if (!ext) {
+					warnings.push(`skipped ${phase} hook "${fileName}": unsupported extension`);
+					continue;
+				}
+				candidates.push({
+					phase,
+					fileName,
+					filePath: path.join(dir, fileName),
+					toolName: fileName.slice(0, -ext.length),
+					sourceCategory: `hook file (${phase}/)`,
+				});
+			}
+		}
+		return { candidates, warnings };
+	}
+	// Canonical Codex layout: flat `.codex/hooks/<phase>-<tool>.ts|js`.
+	const dir = path.join(configDir, "hooks");
+	for (const fileName of await listDirNames(dir, "file")) {
+		const match = fileName.match(/^(pre|post)-(.+)\.(ts|js)$/);
+		if (!match) {
+			warnings.push(
+				`skipped hook "${fileName}": filename must follow the pre-<tool>.ts|js or post-<tool>.ts|js convention`,
+			);
+			continue;
+		}
+		candidates.push({
+			phase: match[1] as "pre" | "post",
+			fileName,
+			filePath: path.join(dir, fileName),
+			toolName: match[2],
+			sourceCategory: "hook file (flat)",
+		});
+	}
+	return { candidates, warnings };
+}
+
+// ---------------------------------------------------------------------------
+// MCP source config path
+// ---------------------------------------------------------------------------
+
+function sourceMcpConfigPath(
+	product: ImportProduct,
+	sourceScope: ImportSourceScope,
+	cwd: string,
+	homeDir: string,
+): string {
+	if (product === "claude-code") {
+		// Project-scope Claude MCP servers live in `<project>/.mcp.json`;
+		// user-global servers live in `~/.claude.json`.
+		return sourceScope === "project" ? path.join(cwd, ".mcp.json") : path.join(homeDir, ".claude.json");
+	}
+	return path.join(sourceConfigDir(product, sourceScope, cwd, homeDir), "config.toml");
+}
+
+/** Map a normalized compat MCPServer onto the canonical config writer shape. */
+function toMCPServerConfig(server: MCPServer): MCPServerConfig {
+	const config: Record<string, unknown> = {};
+	if (server.transport) config.type = server.transport;
+	if (server.command !== undefined) config.command = server.command;
+	if (server.args !== undefined) config.args = server.args;
+	if (server.env !== undefined) config.env = server.env;
+	if (server.cwd !== undefined) config.cwd = server.cwd;
+	if (server.url !== undefined) config.url = server.url;
+	if (server.headers !== undefined) config.headers = server.headers;
+	if (server.enabled !== undefined) config.enabled = server.enabled;
+	if (server.autoload !== undefined) config.autoload = server.autoload;
+	if (server.timeout !== undefined) config.timeout = server.timeout;
+	if (server.sharing !== undefined) config.sharing = server.sharing;
+	if (server.noInheritEnv !== undefined) config.noInheritEnv = server.noInheritEnv;
+	return config as unknown as MCPServerConfig;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+interface DestinationMcpState {
+	/** Existing server entries, or null when the destination is unusable. */
+	servers: Record<string, unknown> | null;
+	/** Why the destination is unusable (malformed/unsafe), when servers is null. */
+	error?: string;
+}
+
+async function readDestinationMcpState(mcpConfigPath: string): Promise<DestinationMcpState> {
+	const read = await readStructured(mcpConfigPath);
+	if (read.kind === "absent") return { servers: {} };
+	if (read.kind === "error") return { servers: null, error: read.message };
+	const json = tryParseJson<Record<string, unknown>>(read.content);
+	if (!json || !isRecord(json)) {
+		return { servers: null, error: `destination ${mcpConfigPath} is malformed; MCP entries cannot be imported` };
+	}
+	if (json.mcpServers !== undefined && !isRecord(json.mcpServers)) {
+		return {
+			servers: null,
+			error: `destination ${mcpConfigPath} has a non-object mcpServers value; MCP entries cannot be imported`,
+		};
+	}
+	return { servers: (json.mcpServers as Record<string, unknown> | undefined) ?? {} };
+}
+
+// ---------------------------------------------------------------------------
 // Preview
 // ---------------------------------------------------------------------------
 
 /**
  * Read the selected source product/scope, normalize every candidate through
- * the sibling contracts, and produce a redacted preview. Pure reads only —
- * nothing is written until `applyImport`.
+ * the sibling contracts, and produce a redacted preview plus an opaque apply
+ * plan. Pure reads only — nothing is written until `applyImport`.
  */
-export async function buildImportPreview(options: BuildImportPreviewOptions): Promise<ImportPreview> {
+export async function buildImportPreview(options: BuildImportPreviewOptions): Promise<ImportPlan> {
 	const surfaces = options.surfaces ?? (["skills", "hooks", "mcps"] as const);
-	const takenSkillNames = new Set<string>();
-	const takenHookNames = new Set<string>();
-	const takenMcpNames = new Set<string>();
-	const layout = sourceLayout(options.product, options.sourceScope, options.cwd, options.homeDir);
 	const destination = resolveScopePaths(options.destinationScope, options.cwd);
 	const entries: ImportPreviewEntry[] = [];
+	const payloads: (NormalizedPayload | undefined)[] = [];
 	const warnings: string[] = [];
 	const productName = productLabel(options.product);
 	const sourceLabel = `${productName} ${sourceScopeLabel(options.sourceScope)}`;
 
+	const push = (entry: ImportPreviewEntry, payload?: NormalizedPayload): void => {
+		entries.push(entry);
+		payloads.push(payload);
+	};
+
 	// --- Skills -------------------------------------------------------------
 	if (surfaces.includes("skills")) {
-		const collected =
-			layout.skillFormat === "skill-dirs"
-				? await collectSkillDir(layout.skillsDir, options.product)
-				: await collectMarkdownPrompts(layout.skillsDir, options.product);
-		for (const diagnostic of collected.diagnostics) {
-			warnings.push(`${sourceLabel} skills: ${diagnostic.message}`);
-		}
-		for (const candidate of collected.candidates) {
-			const slug = candidate.slug;
-			const content = withImportProvenance(candidate.content, options.product);
-			const destPath = path.join(destination.skillsDir, slug, "SKILL.md");
-			const existing = await readIfExists(destPath);
-			const payload: NormalizedPayload = { skill: { slug, content } };
+		const host = options.product === "claude-code" ? "claude" : "codex";
+		const sources = await listConventionSkillImportSources({ cwd: options.cwd, home: options.homeDir, host });
+		const scoped = sources.filter(source =>
+			options.sourceScope === "project" ? source.scope === "project" : source.scope === "user",
+		);
+		const takenSkillNames = new Set(await listDirNames(destination.skillsDir, "directory"));
+		for (const source of scoped) {
+			const slug = source.name;
+			if (!isSafeName(slug)) {
+				push({
+					surface: "skills",
+					sourceName: slug,
+					destinationName: slug,
+					status: "unsupported",
+					sourceCategory: "skill directory",
+					description: `import skill "${slug}"`,
+					reason: "unsafe skill name (path separators, control characters, or traversal segments are not allowed)",
+				});
+				continue;
+			}
+			const read = await readStructured(source.path);
+			if (read.kind !== "value") {
+				push({
+					surface: "skills",
+					sourceName: slug,
+					destinationName: slug,
+					status: "unsupported",
+					sourceCategory: "skill directory",
+					description: `import skill "${slug}"`,
+					reason: read.kind === "error" ? read.message : `no SKILL.md content at ${source.path}`,
+				});
+				continue;
+			}
+			const content = withImportProvenance(read.content, options.product);
+			const { frontmatter } = parseFrontmatter(content, { level: "off" });
+			const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+			if (!description) {
+				push({
+					surface: "skills",
+					sourceName: slug,
+					destinationName: slug,
+					status: "unsupported",
+					sourceCategory: "skill directory",
+					description: `import skill "${slug}"`,
+					reason: "skill frontmatter must include a non-empty description",
+				});
+				continue;
+			}
+			const existing = await readStructured(path.join(destination.skillsDir, slug, "SKILL.md"));
 			const entry = applyCollision(
 				{
 					surface: "skills",
 					sourceName: slug,
 					destinationName: slug,
-					sourceCategory: layout.skillFormat === "skill-dirs" ? "skill directory" : "markdown prompt",
+					sourceCategory: "skill directory",
 					description: `import skill "${slug}" into ${destination.skillsDir}`,
-					_payload: payload,
 				},
-				existing !== null,
-				existing === content,
+				existing,
+				content,
 				options.collisionPolicy,
 				base => renamedDestination(base, name => takenSkillNames.has(name)),
 			);
 			takenSkillNames.add(entry.destinationName);
-			if (entry.destinationName !== slug && entry._payload?.skill) {
-				entry._payload = {
-					skill: {
-						slug: entry.destinationName,
-						content: withImportProvenance(candidate.content, options.product),
-					},
-				};
-			}
-			for (const warning of candidate.warnings) warnings.push(`${sourceLabel} skill "${slug}": ${warning}`);
-			entries.push(entry);
+			push(entry, { skill: { slug: entry.destinationName, content } });
 		}
 	}
 
@@ -292,186 +403,167 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 	if (surfaces.includes("hooks")) {
 		const convention =
 			options.product === "claude-code" ? HookSourceConvention.ClaudeCode : HookSourceConvention.Codex;
-		const candidates = await collectSourceHooks(layout.hooksDir);
-		for (const candidate of candidates) {
-			const baseName = candidate.fileName.replace(/\.(ts|js)$/, "");
-			const match = baseName.match(/^(pre|post)-(.+)$/);
-			if (!match) {
-				entries.push({
-					surface: "hooks",
-					sourceName: candidate.fileName,
-					destinationName: candidate.fileName,
-					status: "unsupported",
-					sourceCategory: "hook file",
-					description: `hook file "${candidate.fileName}"`,
-					reason: `filename must follow the pre-<tool>.ts|js or post-<tool>.ts|js convention`,
-				});
-				continue;
+		const configDir = sourceConfigDir(options.product, options.sourceScope, options.cwd, options.homeDir);
+		const collected = await collectSourceHooks(options.product, configDir);
+		for (const warning of collected.warnings) warnings.push(`${sourceLabel} hooks: ${warning}`);
+		// Destination identity is the canonical phase-relative path.
+		const takenHookPaths = new Set<string>();
+		for (const phase of ["pre", "post"] as const) {
+			for (const fileName of await listDirNames(path.join(destination.hooksDir, phase), "file")) {
+				takenHookPaths.add(`${phase}/${fileName}`);
 			}
-			const phase = match[1] as "pre" | "post";
-			const toolName = match[2];
+		}
+		for (const candidate of collected.candidates) {
+			const relDest = `${candidate.phase}/${candidate.fileName}`;
 			const normalized = normalizeDirectoryHook({
 				convention,
-				phase,
-				toolName,
+				phase: candidate.phase,
+				toolName: candidate.toolName,
 				source: candidate.filePath,
 				externalName: candidate.fileName,
 			});
 			if (!normalized.hook) {
-				entries.push({
+				push({
 					surface: "hooks",
-					sourceName: candidate.fileName,
-					destinationName: candidate.fileName,
+					sourceName: relDest,
+					destinationName: relDest,
 					status: "unsupported",
-					sourceCategory: "hook file",
-					description: `${phase} hook for ${toolName}`,
+					sourceCategory: candidate.sourceCategory,
+					description: `${candidate.phase} hook for ${candidate.toolName}`,
 					reason: normalized.diagnostics.map(d => `${d.code}: ${d.message}`).join("; "),
 				});
 				continue;
 			}
-			const destPath = path.join(destination.hooksDir, candidate.fileName);
-			const existing = await readIfExists(destPath);
-			const payload: NormalizedPayload = {
-				hook: {
-					sourceName: candidate.fileName,
-					destinationName: candidate.fileName,
-					content: candidate.content,
-					warnings: [],
-				},
-			};
+			const read = await readStructured(candidate.filePath);
+			if (read.kind !== "value") {
+				push({
+					surface: "hooks",
+					sourceName: relDest,
+					destinationName: relDest,
+					status: "unsupported",
+					sourceCategory: candidate.sourceCategory,
+					description: `${candidate.phase} hook for ${candidate.toolName}`,
+					reason: read.kind === "error" ? read.message : `no hook content at ${candidate.filePath}`,
+				});
+				continue;
+			}
+			const existing = await readStructured(path.join(destination.hooksDir, candidate.phase, candidate.fileName));
 			const entry = applyCollision(
 				{
 					surface: "hooks",
-					sourceName: candidate.fileName,
-					destinationName: candidate.fileName,
-					sourceCategory: "hook file",
-					description: `${phase} hook for ${toolName} (${normalized.hook.contract.runtimeEvent})`,
-					_payload: payload,
+					sourceName: relDest,
+					destinationName: relDest,
+					sourceCategory: candidate.sourceCategory,
+					description: `${candidate.phase} hook for ${candidate.toolName} (${normalized.hook.contract.runtimeEvent})`,
 				},
-				existing !== null,
-				existing === candidate.content,
+				existing,
+				read.content,
 				options.collisionPolicy,
 				base => {
-					const renamed = renamedDestination(base.replace(/\.(ts|js)$/, ""), name =>
-						takenHookNames.has(`${name}.ts`),
-					);
-					return `${renamed}${path.extname(base)}`;
+					const ext = path.extname(base);
+					const stem = base.slice(candidate.phase.length + 1, base.length - ext.length);
+					const renamed = renamedDestination(stem, name => takenHookPaths.has(`${candidate.phase}/${name}${ext}`));
+					return `${candidate.phase}/${renamed}${ext}`;
 				},
 			);
-			if (entry.destinationName !== candidate.fileName && entry._payload?.hook) {
-				entry._payload = { hook: { ...entry._payload.hook, destinationName: entry.destinationName } };
-			}
-			takenHookNames.add(entry.destinationName);
-			entries.push(entry);
+			takenHookPaths.add(entry.destinationName);
+			push(entry, {
+				hook: {
+					phase: candidate.phase,
+					fileName: entry.destinationName.slice(candidate.phase.length + 1),
+					content: read.content,
+				},
+			});
 		}
 	}
 
 	// --- MCPs ---------------------------------------------------------------
 	if (surfaces.includes("mcps")) {
-		const read =
-			layout.mcpFormat === "json-mcpServers"
-				? await readJsonMcpServers(layout.mcpConfigPath)
-				: await readTomlMcpServers(layout.mcpConfigPath);
-		if ("error" in read) {
-			warnings.push(`${sourceLabel} MCPs: ${read.error}`);
-		} else {
-			const existingConfig = await readMCPConfigFile(destination.mcpConfigPath).catch(() => null);
-			if (existingConfig === null) {
-				warnings.push(`destination ${destination.mcpConfigPath} is malformed; MCP entries cannot be imported`);
+		const sourcePath = sourceMcpConfigPath(options.product, options.sourceScope, options.cwd, options.homeDir);
+		const read = await readStructured(sourcePath);
+		if (read.kind === "error") {
+			warnings.push(`${sourceLabel} MCPs: ${read.message}`);
+		}
+		const normalized =
+			read.kind === "value"
+				? options.product === "claude-code"
+					? normalizeClaudeMcpJson(read.content, sourcePath, options.sourceScope)
+					: normalizeCodexMcpToml(read.content, sourcePath, options.sourceScope)
+				: { items: [], warnings: [] as string[] };
+		for (const warning of normalized.warnings) warnings.push(`${sourceLabel} MCPs: ${warning}`);
+		if (normalized.items.length > 0) {
+			const destState = await readDestinationMcpState(destination.mcpConfigPath);
+			if (destState.servers === null) {
+				warnings.push(destState.error ?? `destination ${destination.mcpConfigPath} is unusable`);
 			}
-			const existingServers = existingConfig?.mcpServers ?? {};
-			for (const [name, raw] of Object.entries(read.servers)) {
-				const nameError = validateServerName(name);
-				if (nameError) {
-					entries.push({
+			const existingServers = destState.servers ?? {};
+			const takenMcpNames = new Set(Object.keys(existingServers));
+			for (const server of normalized.items) {
+				const name = server.name;
+				const invalidReason = !isSafeName(name)
+					? "unsafe MCP server name (path separators, control characters, or traversal segments are not allowed)"
+					: validateMCPCompatServer(server);
+				if (invalidReason || destState.servers === null) {
+					push({
 						surface: "mcps",
 						sourceName: name,
 						destinationName: name,
 						status: "unsupported",
 						sourceCategory: "MCP server entry",
 						description: `MCP server "${name}"`,
-						reason: nameError,
+						reason: invalidReason ?? destState.error ?? "destination MCP config is unusable",
 					});
 					continue;
 				}
-				const mapped = mapMcpEntry(options.product, name, raw);
-				if (!mapped.ok) {
-					entries.push({
-						surface: "mcps",
-						sourceName: name,
-						destinationName: name,
-						status: "unsupported",
-						sourceCategory: "MCP server entry",
-						description: `MCP server "${name}"`,
-						reason: mapped.reason,
-					});
-					continue;
-				}
-				for (const warning of mapped.warnings) warnings.push(`${sourceLabel} MCP "${name}": ${warning}`);
+				const config = toMCPServerConfig(server);
 				const existing = existingServers[name];
 				const secretKeys = [
-					...("env" in mapped.config && mapped.config.env
-						? Object.keys(mapped.config.env).map(k => `env:${k}`)
-						: []),
-					...("headers" in mapped.config && mapped.config.headers
-						? Object.keys(mapped.config.headers).map(k => `header:${k}`)
+					...(config && "env" in config && config.env ? Object.keys(config.env).map(k => `env:${k}`) : []),
+					...(config && "headers" in config && config.headers
+						? Object.keys(config.headers).map(k => `header:${k}`)
 						: []),
 				];
-				const payload: NormalizedPayload = { mcp: { name, config: mapped.config } };
-				const baseEntry = {
-					surface: "mcps" as const,
-					sourceName: name,
-					destinationName: name,
-					sourceCategory: "MCP server entry",
-					description:
-						mapped.config.type === "stdio"
-							? `stdio MCP "${name}" (${mapped.config.command})`
-							: `${mapped.config.type ?? "http"} MCP "${name}"`,
-					_payload: payload,
-				};
 				const entry = applyCollision(
-					baseEntry,
-					existing !== undefined,
-					existing !== undefined && JSON.stringify(existing) === JSON.stringify(mapped.config),
+					{
+						surface: "mcps",
+						sourceName: name,
+						destinationName: name,
+						sourceCategory: "MCP server entry",
+						description:
+							config && "command" in config && typeof config.command === "string"
+								? `stdio MCP "${name}" (${config.command})`
+								: `${config && "type" in config ? String(config.type) : "http"} MCP "${name}"`,
+					},
+					existing === undefined ? { kind: "absent" } : { kind: "value", content: JSON.stringify(existing) },
+					JSON.stringify(config),
 					options.collisionPolicy,
-					base =>
-						renamedDestination(base, candidate => takenMcpNames.has(candidate) || candidate in existingServers),
+					base => renamedDestination(base, candidate => takenMcpNames.has(candidate)),
 				);
-				if (entry.destinationName !== name && entry._payload?.mcp) {
-					entry._payload = { mcp: { name: entry.destinationName, config: mapped.config } };
-				}
 				takenMcpNames.add(entry.destinationName);
 				if (secretKeys.length > 0 && (entry.status === "add" || entry.status === "overwrite")) {
 					entry.status = "redacted";
 					entry.reason = `${entry.reason ? `${entry.reason}; ` : ""}secret values hidden in preview (keys: ${secretKeys.join(", ")})`;
 				}
-				entries.push(entry);
+				push(entry, { mcp: { name: entry.destinationName, config } });
 			}
 		}
 	}
 
 	return {
-		product: options.product,
-		sourceScope: options.sourceScope,
-		destinationScope: options.destinationScope,
-		surfaces: [...surfaces],
-		entries,
-		warnings,
+		preview: {
+			product: options.product,
+			sourceScope: options.sourceScope,
+			destinationScope: options.destinationScope,
+			surfaces: [...surfaces],
+			entries,
+			warnings,
+		},
+		payloads,
 	};
 }
 
-async function readIfExists(filePath: string): Promise<string | null> {
-	try {
-		const stat = await fs.lstat(filePath);
-		if (!stat.isFile() || stat.isSymbolicLink()) return null;
-		return await fs.readFile(filePath, "utf-8");
-	} catch {
-		return null;
-	}
-}
-
 // ---------------------------------------------------------------------------
-// Apply (journaled rollback)
+// Apply (validated transaction: staged atomic writes + journaled rollback)
 // ---------------------------------------------------------------------------
 
 interface FileSnapshot {
@@ -480,150 +572,293 @@ interface FileSnapshot {
 	previous: string | null;
 }
 
+interface PlannedFileWrite {
+	entry: ImportPreviewEntry;
+	path: string;
+	content: string;
+}
+
 /**
- * Apply a confirmed preview. Writes are bounded and journaled: every file a
- * write touches is snapshotted first, and any failure restores all snapshots
- * (no partial import). MCP entries are merged into one in-memory config and
- * written atomically via the canonical config writer.
+ * Walk `root` itself and every existing component down to `target`'s parent
+ * directory; return the first symlinked component, or null. A target outside
+ * `root` is reported as the root itself (containment is checked separately).
  */
-export async function applyImport(preview: ImportPreview, options: { cwd: string }): Promise<ImportResult> {
+async function findSymlinkedAncestor(root: string, target: string): Promise<string | null> {
+	const relative = path.relative(root, path.dirname(target));
+	if (relative.startsWith("..") || path.isAbsolute(relative)) return root;
+	const segments = relative === "" ? [] : relative.split(path.sep);
+	let current = root;
+	try {
+		const stat = await fs.lstat(current);
+		if (stat.isSymbolicLink()) return current;
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+		return null;
+	}
+	for (const segment of segments) {
+		current = path.join(current, segment);
+		try {
+			const stat = await fs.lstat(current);
+			if (stat.isSymbolicLink()) return current;
+		} catch (error) {
+			if (isEnoent(error)) return null;
+			throw error;
+		}
+	}
+	return null;
+}
+
+/** Remove stale staging temp files from an interrupted earlier apply. */
+async function sweepStagingTemps(dir: string): Promise<void> {
+	let names: string[];
+	try {
+		names = await fs.readdir(dir);
+	} catch {
+		return;
+	}
+	for (const name of names) {
+		if (!name.includes(".gjc-import-") || !name.endsWith(".tmp")) continue;
+		await fs.rm(path.join(dir, name), { force: true }).catch(() => {});
+	}
+}
+
+/**
+ * Apply a confirmed plan. The transaction contract:
+ *
+ * 1. Pre-validation — every destination path is derived from validated plan
+ *    identities (never raw payload names), containment-checked beneath the
+ *    canonical scope directories, and walked for symlinked ancestors; the
+ *    destination MCP config shape is validated; add/rename destinations are
+ *    revalidated against the preview decision (stale previews fail closed).
+ *    Any problem aborts the whole apply before a single write.
+ * 2. Publication — each skill/hook file is written to a same-directory temp
+ *    file (0600) and atomically renamed into place; MCP entries merge into one
+ *    in-memory config written once via the canonical atomic writer. Only
+ *    files this transaction actually publishes enter the rollback journal.
+ * 3. Verification — persisted state is re-read inside the transaction; a
+ *    verification mismatch rolls back exactly like a write failure.
+ * 4. Rollback — restores journal snapshots (or removes created files) and
+ *    reports every restore failure honestly instead of claiming success.
+ */
+export async function applyImport(plan: ImportPlan, options: { cwd: string }): Promise<ImportResult> {
+	const { preview } = plan;
 	const destination = resolveScopePaths(preview.destinationScope, options.cwd);
 	const results: ImportResultEntry[] = [];
-	const snapshots: FileSnapshot[] = [];
-	const written: ImportPreviewEntry[] = [];
 
-	const writable = preview.entries.filter(
-		entry => entry.status === "add" || entry.status === "overwrite" || entry.status === "redacted",
-	);
-	for (const entry of preview.entries) {
-		if (entry.status === "conflict") {
+	const writable: Array<{ entry: ImportPreviewEntry; payload: NormalizedPayload }> = [];
+	preview.entries.forEach((entry, index) => {
+		const payload = plan.payloads[index];
+		if (entry.status === "conflict" || entry.status === "unsupported") {
 			results.push({
 				surface: entry.surface,
 				sourceName: entry.sourceName,
 				destinationName: entry.destinationName,
 				outcome: "skipped",
-				reason: entry.reason,
+				reason: entry.reason ?? (entry.status === "unsupported" ? "unsupported semantics" : undefined),
 			});
-		} else if (entry.status === "unsupported") {
-			results.push({
-				surface: entry.surface,
-				sourceName: entry.sourceName,
-				destinationName: entry.destinationName,
-				outcome: "skipped",
-				reason: entry.reason ?? "unsupported semantics",
-			});
+			return;
 		}
-	}
-
-	// Snapshot skill/hook destinations.
-	const skillHookWrites: Array<{ entry: ImportPreviewEntry; path: string; content: string }> = [];
-	const mcpWrites: Array<{ entry: ImportPreviewEntry; name: string; config: MCPServerConfig }> = [];
-	for (const entry of writable) {
-		if (entry.surface === "skills" && entry._payload?.skill) {
-			const slug = entry._payload.skill.slug;
-			skillHookWrites.push({
-				entry,
-				path: path.join(destination.skillsDir, slug, "SKILL.md"),
-				content: entry._payload.skill.content,
-			});
-		} else if (entry.surface === "hooks" && entry._payload?.hook) {
-			skillHookWrites.push({
-				entry,
-				path: path.join(destination.hooksDir, entry._payload.hook.destinationName),
-				content: entry._payload.hook.content,
-			});
-		} else if (entry.surface === "mcps" && entry._payload?.mcp) {
-			mcpWrites.push({ entry, name: entry._payload.mcp.name, config: entry._payload.mcp.config });
-		}
-	}
-
-	try {
-		for (const write of skillHookWrites) {
-			snapshots.push({ path: write.path, previous: await readIfExists(write.path) });
-		}
-		let mcpConfig: MCPConfigFile | null = null;
-		if (mcpWrites.length > 0) {
-			mcpConfig = await readMCPConfigFile(destination.mcpConfigPath);
-			snapshots.push({
-				path: destination.mcpConfigPath,
-				previous: await readIfExists(destination.mcpConfigPath),
-			});
-		}
-
-		// Write skill/hook files.
-		for (const write of skillHookWrites) {
-			await fs.mkdir(path.dirname(write.path), { recursive: true, mode: 0o700 });
-			const stat = await fs.lstat(write.path).catch(() => null);
-			if (stat?.isSymbolicLink()) throw new Error(`refusing to write through symlink: ${write.path}`);
-			await fs.writeFile(write.path, write.content, { encoding: "utf-8", mode: 0o600 });
-			written.push(write.entry);
-		}
-
-		// Merge + single atomic MCP config write.
-		if (mcpConfig && mcpWrites.length > 0) {
-			const servers = { ...(mcpConfig.mcpServers ?? {}) };
-			for (const write of mcpWrites) {
-				servers[write.name] = write.config;
-				written.push(write.entry);
-			}
-			await writeMCPConfigFile(destination.mcpConfigPath, { ...mcpConfig, mcpServers: servers });
-		}
-	} catch (error) {
-		// Roll back every snapshot: restore previous content or remove created files.
-		const reason = (error as Error).message;
-		for (const snapshot of snapshots.reverse()) {
-			try {
-				if (snapshot.previous === null) {
-					await fs.rm(snapshot.path, { force: true });
-				} else {
-					await fs.writeFile(snapshot.path, snapshot.previous, "utf-8");
-				}
-			} catch {
-				// best-effort rollback; the failure reason still reports the original error
-			}
-		}
-		for (const entry of writable) {
+		if (!payload) {
 			results.push({
 				surface: entry.surface,
 				sourceName: entry.sourceName,
 				destinationName: entry.destinationName,
 				outcome: "failed",
-				reason: `import failed and was rolled back: ${reason}`,
+				reason: "internal error: writable preview entry has no plan payload",
+			});
+			return;
+		}
+		writable.push({ entry, payload });
+	});
+
+	const failAll = (reason: string): ImportResult => {
+		for (const { entry } of writable) {
+			results.push({
+				surface: entry.surface,
+				sourceName: entry.sourceName,
+				destinationName: entry.destinationName,
+				outcome: "failed",
+				reason,
 			});
 		}
 		return { entries: results, ok: false };
-	}
+	};
 
-	// Post-import verification against the persisted destination state.
-	let verifyFailure: string | null = null;
-	for (const entry of written) {
-		if (entry.surface === "skills" && entry._payload?.skill) {
-			const destPath = path.join(destination.skillsDir, entry._payload.skill.slug, "SKILL.md");
-			const content = await readIfExists(destPath);
-			if (content !== entry._payload.skill.content)
-				verifyFailure = `skill "${entry._payload.skill.slug}" not persisted`;
-		} else if (entry.surface === "hooks" && entry._payload?.hook) {
-			const destPath = path.join(destination.hooksDir, entry._payload.hook.destinationName);
-			const content = await readIfExists(destPath);
-			if (content !== entry._payload.hook.content)
-				verifyFailure = `hook "${entry._payload.hook.destinationName}" not persisted`;
-		} else if (entry.surface === "mcps" && entry._payload?.mcp) {
-			const config = await readMCPConfigFile(destination.mcpConfigPath).catch(() => null);
-			if (!config?.mcpServers?.[entry._payload.mcp.name])
-				verifyFailure = `MCP "${entry._payload.mcp.name}" not persisted`;
+	// --- Phase 1: pre-validation -------------------------------------------
+	const fileWrites: PlannedFileWrite[] = [];
+	const mcpWrites: Array<{ entry: ImportPreviewEntry; name: string; config: MCPServerConfig }> = [];
+	let mcpConfig: Awaited<ReturnType<typeof readMCPConfigFile>> | null = null;
+
+	for (const { entry, payload } of writable) {
+		if (payload.skill) {
+			const slug = payload.skill.slug;
+			if (!isSafeName(slug)) return failAll(`refusing unsafe skill destination name: ${slug}`);
+			const target = path.join(destination.skillsDir, slug, "SKILL.md");
+			const relative = path.relative(destination.skillsDir, target);
+			if (relative.startsWith("..") || path.isAbsolute(relative)) {
+				return failAll(`refusing skill destination outside ${destination.skillsDir}: ${slug}`);
+			}
+			const symlinked = await findSymlinkedAncestor(destination.root, target).catch(error => {
+				return `error:${(error as Error).message}`;
+			});
+			if (typeof symlinked === "string") {
+				return failAll(
+					symlinked.startsWith("error:")
+						? `cannot validate destination ancestors: ${symlinked.slice(6)}`
+						: `refusing to write through symlinked ancestor: ${symlinked}`,
+				);
+			}
+			const existing = await readStructured(target);
+			if (existing.kind === "error") return failAll(existing.message);
+			if (entry.status !== "overwrite" && existing.kind === "value" && existing.content !== payload.skill.content) {
+				return failAll(
+					`destination changed since preview for skill "${slug}"; rebuild the preview instead of overwriting silently`,
+				);
+			}
+			fileWrites.push({ entry, path: target, content: payload.skill.content });
+		} else if (payload.hook) {
+			const { phase, fileName } = payload.hook;
+			if (phase !== "pre" && phase !== "post") return failAll(`refusing unknown hook phase: ${String(phase)}`);
+			if (!isSafeName(fileName)) return failAll(`refusing unsafe hook destination name: ${fileName}`);
+			const target = path.join(destination.hooksDir, phase, fileName);
+			const relative = path.relative(destination.hooksDir, target);
+			if (relative.startsWith("..") || path.isAbsolute(relative)) {
+				return failAll(`refusing hook destination outside ${destination.hooksDir}: ${fileName}`);
+			}
+			const symlinked = await findSymlinkedAncestor(destination.root, target).catch(error => {
+				return `error:${(error as Error).message}`;
+			});
+			if (typeof symlinked === "string") {
+				return failAll(
+					symlinked.startsWith("error:")
+						? `cannot validate destination ancestors: ${symlinked.slice(6)}`
+						: `refusing to write through symlinked ancestor: ${symlinked}`,
+				);
+			}
+			const existing = await readStructured(target);
+			if (existing.kind === "error") return failAll(existing.message);
+			if (entry.status !== "overwrite" && existing.kind === "value" && existing.content !== payload.hook.content) {
+				return failAll(
+					`destination changed since preview for hook "${phase}/${fileName}"; rebuild the preview instead of overwriting silently`,
+				);
+			}
+			fileWrites.push({ entry, path: target, content: payload.hook.content });
+		} else if (payload.mcp) {
+			mcpWrites.push({ entry, name: payload.mcp.name, config: payload.mcp.config });
 		}
-		if (verifyFailure) break;
 	}
 
-	for (const entry of writable) {
+	if (mcpWrites.length > 0) {
+		const destState = await readDestinationMcpState(destination.mcpConfigPath);
+		if (destState.servers === null) {
+			return failAll(destState.error ?? `destination ${destination.mcpConfigPath} is unusable`);
+		}
+		const raw = await readStructured(destination.mcpConfigPath);
+		mcpConfig =
+			raw.kind === "value"
+				? (tryParseJson<Record<string, unknown>>(raw.content) as Awaited<ReturnType<typeof readMCPConfigFile>>)
+				: { mcpServers: {} };
+		for (const write of mcpWrites) {
+			if (!isSafeName(write.name)) return failAll(`refusing unsafe MCP destination name: ${write.name}`);
+			const existing = destState.servers[write.name];
+			if (
+				write.entry.status !== "overwrite" &&
+				existing !== undefined &&
+				JSON.stringify(existing) !== JSON.stringify(write.config)
+			) {
+				return failAll(
+					`destination changed since preview for MCP "${write.name}"; rebuild the preview instead of overwriting silently`,
+				);
+			}
+		}
+	}
+
+	// --- Phase 2: publication ------------------------------------------------
+	const snapshots: FileSnapshot[] = [];
+	const written: Array<{ entry: ImportPreviewEntry }> = [];
+	for (const dir of [destination.skillsDir, destination.hooksDir]) {
+		await sweepStagingTemps(dir).catch(() => {});
+	}
+
+	try {
+		for (const [index, write] of fileWrites.entries()) {
+			await fs.mkdir(path.dirname(write.path), { recursive: true, mode: 0o700 });
+			const stat = await fs.lstat(write.path).catch(() => null);
+			if (stat?.isSymbolicLink()) throw new Error(`refusing to write through symlink: ${write.path}`);
+			const prior = await readStructured(write.path);
+			if (prior.kind === "error") throw new Error(prior.message);
+			const staged = path.join(
+				path.dirname(write.path),
+				`.gjc-import-${process.pid}-${index}-${path.basename(write.path)}.tmp`,
+			);
+			await fs.writeFile(staged, write.content, { encoding: "utf-8", mode: 0o600 });
+			await fs.rename(staged, write.path);
+			snapshots.push({ path: write.path, previous: prior.kind === "value" ? prior.content : null });
+			written.push({ entry: write.entry });
+		}
+
+		if (mcpConfig && mcpWrites.length > 0) {
+			const priorRaw = await readStructured(destination.mcpConfigPath);
+			snapshots.push({
+				path: destination.mcpConfigPath,
+				previous: priorRaw.kind === "value" ? priorRaw.content : null,
+			});
+			const servers = { ...(mcpConfig.mcpServers ?? {}) };
+			for (const write of mcpWrites) {
+				servers[write.name] = write.config;
+				written.push({ entry: write.entry });
+			}
+			await writeMCPConfigFile(destination.mcpConfigPath, { ...mcpConfig, mcpServers: servers });
+		}
+
+		// --- Phase 3: verification (inside the transaction) ------------------
+		for (const write of fileWrites) {
+			const persisted = await readStructured(write.path);
+			if (persisted.kind !== "value" || persisted.content !== write.content) {
+				throw new Error(`post-import verification failed: ${write.path} was not persisted`);
+			}
+		}
+		if (mcpWrites.length > 0) {
+			const persistedConfig = await readMCPConfigFile(destination.mcpConfigPath).catch(() => null);
+			for (const write of mcpWrites) {
+				if (!persistedConfig?.mcpServers?.[write.name]) {
+					throw new Error(`post-import verification failed: MCP "${write.name}" was not persisted`);
+				}
+			}
+		}
+	} catch (error) {
+		// --- Phase 4: rollback — restore exactly what this transaction wrote --
+		const reason = (error as Error).message;
+		const rollbackErrors: string[] = [];
+		for (const snapshot of snapshots.reverse()) {
+			try {
+				if (snapshot.previous === null) {
+					await fs.rm(snapshot.path, { force: true });
+				} else {
+					const staged = `${snapshot.path}.gjc-rollback-${process.pid}.tmp`;
+					await fs.writeFile(staged, snapshot.previous, { encoding: "utf-8", mode: 0o600 });
+					await fs.rename(staged, snapshot.path);
+				}
+			} catch (rollbackError) {
+				rollbackErrors.push(`${snapshot.path}: ${(rollbackError as Error).message}`);
+			}
+		}
+		for (const dir of new Set(fileWrites.map(write => path.dirname(write.path)))) {
+			await sweepStagingTemps(dir).catch(() => {});
+		}
+		return failAll(
+			`import failed and was rolled back: ${reason}` +
+				(rollbackErrors.length > 0 ? `; ROLLBACK ERRORS (manual repair needed): ${rollbackErrors.join("; ")}` : ""),
+		);
+	}
+
+	for (const { entry } of writable) {
 		const base = {
 			surface: entry.surface,
 			sourceName: entry.sourceName,
 			destinationName: entry.destinationName,
 		};
-		if (verifyFailure) {
-			results.push({ ...base, outcome: "failed", reason: `post-import verification failed: ${verifyFailure}` });
-		} else if (entry.status === "overwrite") {
+		if (entry.status === "overwrite") {
 			results.push({ ...base, outcome: "overwritten" });
 		} else if (entry.destinationName !== entry.sourceName) {
 			results.push({ ...base, outcome: "renamed" });
@@ -631,5 +866,5 @@ export async function applyImport(preview: ImportPreview, options: { cwd: string
 			results.push({ ...base, outcome: "imported" });
 		}
 	}
-	return { entries: results, ok: verifyFailure === null };
+	return { entries: results, ok: true };
 }
