@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { canonicalDiffSha256, parseGhPrCreate, parsePrVerdict, validatePrContract } from "./verify-pr-verdict";
 
 const base = "a".repeat(40);
@@ -105,7 +107,11 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 	expect(workflow).toContain("ref: ${{ github.event.pull_request.head.sha }}");
 	expect(workflow).toContain("ref: ${{ github.event.pull_request.base.sha }}");
 	expect(workflow.match(/persist-credentials: false/gu)).toHaveLength(2);
-	expect(workflow).toContain('bun trusted-base/scripts/verify-pr-verdict.ts --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base');
+	expect(workflow).toContain("unset BUN_OPTIONS");
+	expect(workflow).toContain("empty_bunfig=\"$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml\"");
+	expect(workflow).toContain("cd \"$trusted_root\"");
+	expect(workflow).toContain('bun --no-env-file --config="$empty_bunfig" "$trusted_root/scripts/verify-pr-verdict.ts"');
+	expect(workflow).toContain('--event "$GITHUB_EVENT_PATH" --repo "$repo_root" --trusted-root "$trusted_root"');
 	expect(workflow).not.toContain("pr-head/scripts/verify-pr-verdict.ts");
 	expect(workflow).not.toContain("secrets.");
 	expect(workflow).not.toContain("actions/cache");
@@ -114,16 +120,45 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 	expect(workflow).not.toContain("continue-on-error");
 });
 
+test("trusted Bun launch cannot load an untrusted repo bunfig preload", async () => {
+	const root = await Bun.file(new URL("../package.json", import.meta.url)).json() as { packageManager: string };
+	expect(root.packageManager).toBe("bun@1.3.14");
+	const temp = await fs.mkdtemp("/tmp/gjc-pr-bun-isolation-");
+	try {
+		const trusted = path.join(temp, "trusted");
+		const untrusted = path.join(temp, "untrusted");
+		const sentinel = path.join(temp, "preload-ran");
+		await fs.mkdir(trusted, { recursive: true });
+		await fs.mkdir(untrusted, { recursive: true });
+		await Bun.write(path.join(untrusted, "bunfig.toml"), 'preload = ["./preload.ts"]\n');
+		await Bun.write(path.join(untrusted, "preload.ts"), `await Bun.write(${JSON.stringify(sentinel)}, "pwned");\n`);
+		await Bun.write(path.join(trusted, "empty.toml"), "# trusted empty Bun configuration\n");
+		await Bun.write(path.join(trusted, "probe.ts"), 'console.log("trusted-probe");\n');
+		const child = Bun.spawn([process.execPath, "--no-env-file", `--config=${path.join(trusted, "empty.toml")}`, path.join(trusted, "probe.ts")], {
+			cwd: untrusted,
+			env: { ...process.env, BUN_OPTIONS: "" },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+		expect(exitCode).toBe(0);
+		expect(stdout).toContain("trusted-probe");
+		expect(await Bun.file(sentinel).exists()).toBe(false);
+	} finally {
+		await fs.rm(temp, { recursive: true, force: true });
+	}
+});
+
 test("a PR-authored workflow cannot become the trusted enforcement authority", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	const spoofedHeadWorkflow = workflow.replace(
-		'bun trusted-base/scripts/verify-pr-verdict.ts --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base',
-		'bun pr-head/scripts/verify-pr-verdict.ts --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root pr-head',
+		'"$trusted_root/scripts/verify-pr-verdict.ts"',
+		'"$repo_root/scripts/verify-pr-verdict.ts"',
 	);
 	// GitHub loads pull_request_target workflow bytes from the default branch, not from this PR diff.
 	expect(workflow).toContain("pull_request_target:");
-	expect(spoofedHeadWorkflow).toContain("pr-head/scripts/verify-pr-verdict.ts");
-	expect(workflow).not.toContain("pr-head/scripts/verify-pr-verdict.ts");
+	expect(spoofedHeadWorkflow).toContain('"$repo_root/scripts/verify-pr-verdict.ts"');
+	expect(workflow).not.toContain('"$repo_root/scripts/verify-pr-verdict.ts"');
 });
 
 test("template pins reviewer identity and exact diff digest", async () => {

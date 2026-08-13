@@ -43,4 +43,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          bun trusted-base/scripts/verify-pr-verdict.ts --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base
+          unset BUN_OPTIONS
+          trusted_root="$PWD/trusted-base"
+          repo_root="$PWD/pr-head"
+          empty_bunfig="$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml"
+          printf '# trusted empty Bun configuration\n' > "$empty_bunfig"
+          cd "$trusted_root"
+          bun --no-env-file --config="$empty_bunfig" "$trusted_root/scripts/verify-pr-verdict.ts" \
+            --event "$GITHUB_EVENT_PATH" --repo "$repo_root" --trusted-root "$trusted_root"
