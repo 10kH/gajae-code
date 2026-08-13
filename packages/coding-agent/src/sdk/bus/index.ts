@@ -5251,7 +5251,6 @@ export function createNotificationsExtension(
 				// is in flight classifies as post-snapshot and is preserved at
 				// abortPromptAndWait (review thread P1).
 				const steeringSnapshotToken = terminalAbortSeams?.captureTerminalAbortSteeringSnapshot?.();
-				const steeringSnapshotConsumed = false;
 				// Hash the EXACT response payload this abort will return: the durable
 				// row stores it at finalization so the response-state advance requires
 				// equality instead of trusting a non-pending placeholder (review

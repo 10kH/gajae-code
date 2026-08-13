@@ -157,4 +157,44 @@ describe("status line path segment", () => {
 			fs.rmSync(realProjectDir, { recursive: true, force: true });
 		}
 	});
+	it("keeps HOME/Projects a workspace even when HOME is nested under a broader scratch root", () => {
+		if (process.platform === "win32") return;
+
+		// Regression for CI harnesses that redirect HOME beneath the OS temp
+		// dir: a broader scratch root (e.g. unconditional /tmp) is an ancestor
+		// of HOME, so scratch classification must not win over ~/Projects.
+		// This uses the same HOME the product sees at render time.
+		const projectsRoot = path.join(fs.realpathSync(os.homedir()), "Projects");
+		fs.mkdirSync(projectsRoot, { recursive: true });
+		const realProjectDir = fs.mkdtempSync(path.join(projectsRoot, "gjc-status-line-nested-"));
+		const aliasRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-status-line-nested-alias-"));
+		const homeAlias = path.join(aliasRoot, "home-link");
+
+		try {
+			fs.symlinkSync(fs.realpathSync(os.homedir()), homeAlias, "dir");
+			const aliasedDir = path.join(homeAlias, "Projects", path.basename(realProjectDir));
+
+			// The canonical HOME/Projects path keeps the folder icon and strips
+			// the Projects root even though a scratch root encloses HOME.
+			setProjectDir(realProjectDir);
+			let rendered = renderSegment("path", createPathContext());
+			expect(rendered.visible).toBe(true);
+			expect(rendered.content).toContain(theme.icon.folder);
+			expect(rendered.content).not.toContain(theme.icon.scratchFolder);
+			expect(rendered.content).toContain(path.basename(realProjectDir));
+			expect(rendered.content).not.toContain(`${path.sep}Projects${path.sep}`);
+
+			// A symlink alias of the same HOME resolves equivalently.
+			setProjectDir(aliasedDir);
+			rendered = renderSegment("path", createPathContext());
+			expect(rendered.visible).toBe(true);
+			expect(rendered.content).toContain(theme.icon.folder);
+			expect(rendered.content).not.toContain(theme.icon.scratchFolder);
+			expect(rendered.content).not.toContain("home-link");
+			expect(rendered.content).not.toContain(`${path.sep}Projects${path.sep}`);
+		} finally {
+			fs.rmSync(aliasRoot, { recursive: true, force: true });
+			fs.rmSync(realProjectDir, { recursive: true, force: true });
+		}
+	});
 });

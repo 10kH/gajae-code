@@ -31,13 +31,13 @@ describe("가재씨 launcher alias", () => {
 				expect(pkg.bin).not.toBeNull();
 				const bin = pkg.bin as Record<string, string>;
 				expect(bin.gjc).toBeDefined();
-				expect(bin["가재씨"]).toBeDefined();
+				expect(bin.가재씨).toBeDefined();
 			});
 
 			it("maps 가재씨 to the gajaessi.js wrapper", () => {
 				const pkg = readPackageJson(rel);
 				const bin = pkg.bin as Record<string, string>;
-				expect(bin["가재씨"]).toBe("bin/gajaessi.js");
+				expect(bin.가재씨).toBe("bin/gajaessi.js");
 				expect(fs.existsSync(path.join(repoRoot, rel, "bin", "gajaessi.js"))).toBe(true);
 			});
 

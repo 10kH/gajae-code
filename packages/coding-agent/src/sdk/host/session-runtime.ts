@@ -2676,13 +2676,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	);
 	api.on("tool_execution_start", async (_event, ctx) => {
 		const current = active;
-		if (!current?.activeInvocation || current.activeInvocation.kind !== "prompt") return;
+		if (current?.activeInvocation?.kind !== "prompt") return;
 		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_start");
 		void ctx;
 	});
 	api.on("tool_execution_end", async (_event, ctx) => {
 		const current = active;
-		if (!current?.activeInvocation || current.activeInvocation.kind !== "prompt") return;
+		if (current?.activeInvocation?.kind !== "prompt") return;
 		current.deadlineManager.onAttributableEvent(current.activeInvocation.correlation, "tool_execution_end");
 		void ctx;
 	});

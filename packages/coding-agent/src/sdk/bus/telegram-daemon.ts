@@ -3142,7 +3142,6 @@ export async function spawnTelegramDaemonOwner(
 ): Promise<TelegramSpawnOwnerResult> {
 	const agentDir = input.settings.getAgentDir();
 	const execPath = deps.execPath ?? process.execPath;
-	const runtimeInfo = resolveGjcRuntimeSpawnInfo(execPath);
 	// A detached child can begin after any short-lived CLI parent has exited.
 	// Keep the owner id opaque so daemon-internal does not reject a valid owner
 	// based on that transient PID; ownership is instead bound to the child PID,

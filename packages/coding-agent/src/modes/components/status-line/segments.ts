@@ -21,7 +21,7 @@ function withIcon(icon: string, text: string): string {
 }
 
 function stripDisplayRoot(pwd: string): string {
-	for (const root of ["/work", path.join(os.homedir(), "Projects")]) {
+	for (const root of displayRoots()) {
 		const relative = relativePathWithinRoot(root, pwd);
 		if (relative) return relative;
 	}
@@ -32,6 +32,14 @@ function normalizePremiumRequests(value: number): number {
 	return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
+// Display roots take precedence over scratch classification: ~/Projects and
+// /work are deliberate workspaces, never scratch, even when the home directory
+// itself sits under a temp/scratch root (CI harnesses and containers redirect
+// HOME beneath the OS temp dir). Resolved at render time so a preload-rewritten
+// HOME is honored, matching scratchRoots().
+function displayRoots(): readonly string[] {
+	return ["/work", path.join(os.homedir(), "Projects")];
+}
 function scratchRoots(): readonly string[] {
 	const roots = new Set<string>([os.tmpdir(), path.join(os.homedir(), "tmp")]);
 	if (process.platform === "win32") {
@@ -51,7 +59,13 @@ function scratchRoots(): readonly string[] {
 }
 
 function classifyProjectDir(pwd: string): { scratch: boolean; relative: string | null } {
-	if (pathIsWithin(os.homedir(), pwd)) return { scratch: false, relative: null };
+	// A deliberate display root wins over scratch ancestry: ~/Projects is a
+	// workspace even when HOME itself sits under the OS temp dir (CI and test
+	// harnesses redirect HOME beneath the scratch root). This is more precise
+	// than exempting all of HOME: ~/tmp stays scratch (it is in scratchRoots).
+	for (const root of displayRoots()) {
+		if (pathIsWithin(root, pwd)) return { scratch: false, relative: null };
+	}
 	for (const root of scratchRoots()) {
 		if (pathIsWithin(root, pwd)) {
 			return { scratch: true, relative: relativePathWithinRoot(root, pwd) };
