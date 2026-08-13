@@ -206,6 +206,10 @@ async function validatePreflight(command: string, cwd: string, trustedRoot: stri
 	if (!parsed.bodyFile && parsed.body === undefined) return { ok: false, diagnostics: ["gh pr create must provide --body-file or --body so the PR verdict can be validated before submission."] };
 	const body = parsed.bodyFile ? await Bun.file(path.resolve(cwd, parsed.bodyFile)).text().catch(() => "") : parsed.body!;
 	const baseRef = parsed.base ?? "dev";
+	const refreshBase = await git(["fetch", "--no-tags", "origin", "dev"], cwd);
+	if (refreshBase.exitCode !== 0) {
+		return { ok: false, diagnostics: [`Could not refresh origin/dev before PR preflight: ${refreshBase.stderr}. Run git fetch origin dev and retry.`] };
+	}
 	const base = await git(["rev-parse", "origin/dev"], cwd);
 	const head = await git(["rev-parse", "HEAD"], cwd);
 	const baseSha = new TextDecoder().decode(base.stdout).trim();

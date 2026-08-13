@@ -44,6 +44,26 @@ const MUTATION_API_PATTERNS: readonly RegExp[] = [
 	/\bcreateWriteStream\s*\(/u,
 ];
 
+const MUTATION_EXPORTS = new Set([
+	"appendFile",
+	"appendFileSync",
+	"copyFile",
+	"cp",
+	"createWriteStream",
+	"mkdir",
+	"mkdirSync",
+	"open",
+	"rename",
+	"renameSync",
+	"rm",
+	"rmSync",
+	"rmdir",
+	"unlink",
+	"unlinkSync",
+	"writeFile",
+	"writeFileSync",
+]);
+
 // `.gjc` is referenced directly, or via a known path-helper symbol that resolves under `.gjc`.
 const GJC_REFERENCE_PATTERNS: readonly RegExp[] = [
 	/["'`]\.gjc(?:[\\/]|["'`])/u,
@@ -86,10 +106,24 @@ function listTsFiles(dir: string): string[] {
 	return out;
 }
 
-function matchedApi(line: string): string | null {
+function importedMutationAliases(content: string): Set<string> {
+	const aliases = new Set<string>();
+	for (const match of content.matchAll(/import\s*\{([^}]+)\}\s*from\s*["']node:fs(?:\/promises)?["']/gu)) {
+		for (const raw of match[1]!.split(",")) {
+			const binding = /^\s*([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*$/u.exec(raw);
+			if (binding && MUTATION_EXPORTS.has(binding[1]!)) aliases.add(binding[2] ?? binding[1]!);
+		}
+	}
+	return aliases;
+}
+
+function matchedApi(line: string, aliases: ReadonlySet<string>): string | null {
 	for (const re of MUTATION_API_PATTERNS) {
 		const m = re.exec(line);
 		if (m) return m[0].replace(/\s*\($/u, "");
+	}
+	for (const alias of aliases) {
+		if (new RegExp(`\\b${alias}\\s*\\(`, "u").test(line)) return alias;
 	}
 	return null;
 }
@@ -143,13 +177,14 @@ function collectFindings(): Finding[] {
 	const findings: Finding[] = [];
 	for (const file of listTsFiles(SCAN_ROOT)) {
 		const content = fs.readFileSync(file, "utf8");
+		const mutationAliases = importedMutationAliases(content);
 		const relative = path.relative(repoRoot, file);
 		const lines = content.split("\n");
 		for (let i = 0; i < lines.length; i++) {
 			const raw = lines[i];
 			const line = raw.trim();
 			if (line.startsWith("//") || line.startsWith("*")) continue;
-			const api = matchedApi(line);
+			const api = matchedApi(line, mutationAliases);
 			if (!api) continue;
 			const knownAllowed = KNOWN_ALLOWED_SITES.has(`${relative}:${i + 1}:${api}`);
 			const allowed = relative === ALLOWED_WRITER_RELATIVE || knownAllowed;

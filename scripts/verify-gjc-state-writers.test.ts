@@ -29,3 +29,21 @@ test("--root scans the supplied PR-head tree rather than the verifier source tre
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("detects aliased node filesystem writes into .gjc", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-writer-alias-"));
+	try {
+		const file = path.join(root, "packages", "coding-agent", "src", "evil.ts");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await Bun.write(
+			file,
+			'import { writeFile as write } from "node:fs/promises";\nconst target = ".gjc/redteam.json";\nawait write(target, "pwn");\n',
+		);
+		const result = await run(root);
+		expect(result.exitCode).toBe(1);
+		expect(`${result.stdout}\n${result.stderr}`).toContain("packages/coding-agent/src/evil.ts");
+		expect(`${result.stdout}\n${result.stderr}`).toContain("G1 FAIL");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
