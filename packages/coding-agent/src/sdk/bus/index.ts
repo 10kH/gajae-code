@@ -8112,7 +8112,10 @@ export function createNotificationsExtension(
 		if (pending.receipts.length && rt.notificationsActive && !rt.redact) {
 			// Under lean, hold intermediate finals until agent_end when the agent is still
 			// running so provisional-policy activation cannot reintroduce per-turn spam.
-			if (rt.verbosity === "lean" && rt.busy) {
+			// A receipt retained from an idle reached during provisional policy has the
+			// same settlement window. Merge it before either path publishes so stable
+			// activation emits one composed terminal receipt, not two messages.
+			if (rt.verbosity === "lean" && (rt.busy || rt.pendingSettled?.window === pending.window)) {
 				for (const receipt of pending.receipts)
 					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window, receipt.origin);
 			} else {
