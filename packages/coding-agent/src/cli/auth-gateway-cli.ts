@@ -28,6 +28,7 @@ import {
 	RemoteAuthCredentialStore,
 	type SnapshotResponse,
 } from "@gajae-code/ai/core";
+import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import { getConfigRootDir, isEnoent, VERSION } from "@gajae-code/utils";
 import chalk from "chalk";
 import { type AuthBrokerClientConfig, resolveStartupAuthConfig } from "../session/startup-auth-config";
@@ -50,6 +51,33 @@ export interface AuthGatewayCommandArgs {
 }
 
 const ACTIONS: readonly AuthGatewayAction[] = ["serve", "token", "status", "check"];
+
+type AuthGatewayCliErrorCode = "broker_not_configured" | "broker_unavailable" | "credential_check_failed" | "auth_gateway_command_failed";
+
+function stableErrorForAction(action: AuthGatewayAction): { code: AuthGatewayCliErrorCode; message: string } {
+	switch (action) {
+		case "status":
+			return { code: "broker_unavailable", message: "Auth broker is unavailable." };
+		case "check":
+			return { code: "credential_check_failed", message: "Credential check failed." };
+		default:
+			return { code: "auth_gateway_command_failed", message: "Auth gateway command failed." };
+	}
+}
+
+function safeDiagnostic(value: unknown, fallback: string): string {
+	return cleanReason(value) ?? fallback;
+}
+
+function writeCommandFailure(action: AuthGatewayAction, flags: AuthGatewayCommandArgs["flags"], error: unknown): void {
+	const stable = stableErrorForAction(action);
+	if (flags.json) {
+		process.stdout.write(`${JSON.stringify({ ok: false, error: stable })}\n`);
+	} else {
+		process.stderr.write(`${chalk.red("FAILED")} ${safeDiagnostic(error, stable.message)}\n`);
+	}
+	process.exitCode = 1;
+}
 
 function getTokenFilePath(): string {
 	return path.join(getConfigRootDir(), "auth-gateway.token");
@@ -253,7 +281,8 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 	if (!brokerConfig) {
 		const status = {
 			ready: false,
-			reason: "not_configured",
+			reason: "broker_not_configured",
+			error: { code: "broker_not_configured", message: "Auth broker is not configured." },
 			tokenFile,
 			tokenPresent: token !== null,
 			broker: null,
@@ -303,7 +332,6 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 		}
 		if (!tokenPresent) process.exitCode = 1;
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
 		const status = {
 			ready: false,
 			reason: "broker_unavailable",
@@ -312,12 +340,14 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 			broker: brokerConfig.url,
 			brokerConfigured: true,
 			brokerAuthenticated: false,
-			error: message,
+			error: { code: "broker_unavailable", message: "Auth broker is unavailable." },
 		};
 		if (flags.json) {
 			process.stdout.write(`${JSON.stringify(status)}\n`);
 		} else {
-			process.stdout.write(`${chalk.red("FAILED")} upstream broker: ${brokerConfig.url}: ${message}\n`);
+			process.stdout.write(
+				`${chalk.red("FAILED")} upstream broker: ${brokerConfig.url}: ${safeDiagnostic(error, "Auth broker is unavailable.")}\n`,
+			);
 			process.stdout.write(
 				`token: ${status.tokenPresent ? chalk.green("present") : chalk.red("missing")} at ${status.tokenFile}\n`,
 			);
@@ -326,24 +356,33 @@ async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> 
 	}
 }
 
+
 export async function runAuthGatewayCommand(cmd: AuthGatewayCommandArgs): Promise<void> {
-	switch (cmd.action) {
-		case "serve":
-			await runServe(cmd.flags);
-			return;
-		case "token":
-			await runToken(cmd.flags);
-			return;
-		case "status":
-			await runStatus(cmd.flags);
-			return;
-		case "check":
-			await runCheck(cmd.flags);
-			return;
-		default: {
-			const _exhaustive: never = cmd.action;
-			throw new Error(`Unknown auth-gateway action: ${String(_exhaustive)}`);
+	try {
+		switch (cmd.action) {
+			case "serve":
+				await runServe(cmd.flags);
+				return;
+			case "token":
+				await runToken(cmd.flags);
+				return;
+			case "status":
+				await runStatus(cmd.flags);
+				return;
+			case "check":
+				await runCheck(cmd.flags);
+				return;
+			default: {
+				const _exhaustive: never = cmd.action;
+				throw new Error(`Unknown auth-gateway action: ${String(_exhaustive)}`);
+			}
 		}
+	} catch (error) {
+		if (cmd.action === "status" || cmd.action === "check") {
+			writeCommandFailure(cmd.action, cmd.flags, error);
+			return;
+		}
+		throw error;
 	}
 }
 
@@ -371,7 +410,11 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		const results = await storage.checkCredentials();
 
 		if (flags.json) {
-			process.stdout.write(`${JSON.stringify({ broker: brokerConfig.url, credentials: results }, null, 2)}\n`);
+			const credentials = results.map(row => ({
+				...row,
+				...(row.reason ? { reason: safeDiagnostic(row.reason, "Credential check failed.") } : {}),
+			}));
+			process.stdout.write(`${JSON.stringify({ broker: brokerConfig.url, credentials }, null, 2)}\n`);
 		} else {
 			const grouped = new Map<string, typeof results>();
 			for (const row of results) {
@@ -394,7 +437,7 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 					const identity =
 						row.email ?? row.accountId ?? (row.type === "api_key" ? "(api key)" : "(no identity on credential)");
 					const remote = row.remoteRefresh ? chalk.dim(" [remote-refresh]") : "";
-					const reason = row.reason ? chalk.dim(` — ${row.reason}`) : "";
+					const reason = row.reason ? chalk.dim(` — ${safeDiagnostic(row.reason, "Credential check failed.")}`) : "";
 					process.stdout.write(
 						`  ${status} id=${row.id.toString().padStart(3)} ${row.type.padEnd(7)} ${identity}${remote}${reason}\n`,
 					);
