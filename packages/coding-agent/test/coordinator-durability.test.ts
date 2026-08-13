@@ -128,12 +128,20 @@ describe("Coordinator durability", () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-durability-"));
 		try {
 			const file = path.join(root, "event-journal.jsonl");
+			const calls: string[] = [];
 			await expect(
 				appendCoordinatorFile(file, "event\n", {
-					syncFile: async () => Promise.reject(errno("EIO")),
-					openDirectory: async () => Promise.reject(errno("EIO")),
+					syncFile: async () => {
+						calls.push("file-sync");
+						throw errno("EIO");
+					},
+					openDirectory: async () => {
+						calls.push("directory-open");
+						throw errno("directory barrier must not run");
+					},
 				}),
 			).rejects.toMatchObject({ code: "EIO" });
+			expect(calls).toEqual(["file-sync"]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
