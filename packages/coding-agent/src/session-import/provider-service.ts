@@ -51,7 +51,7 @@ export interface ExternalSessionImportRequest {
 
 interface ParsedSource {
 	conversation: ImportedConversation;
-	quarantine: { present: boolean; truncated: boolean };
+	quarantine: { present: boolean; truncated: boolean; records: ImportQuarantineRecord[] };
 	counts: SessionImportCounts;
 	redactionKinds: string[];
 }
@@ -168,6 +168,7 @@ function normalizeAdapterResult(result: {
 		quarantine: {
 			present: result.quarantine.length > 0,
 			truncated: result.quarantine.length > MAX_QUARANTINE_RECORDS,
+			records: result.quarantine.slice(0, MAX_QUARANTINE_RECORDS),
 		},
 		counts: result.counts,
 		redactionKinds: result.redactionKinds,

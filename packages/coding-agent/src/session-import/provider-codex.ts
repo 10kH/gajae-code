@@ -186,8 +186,8 @@ export function parseCodexRollout(text: string): CodexParseResult {
 					quarantineRecord(recordNumber, line, "missing_fields");
 					break;
 				}
-				if (typeof payload.id === "string") sourceSessionId = payload.id;
-				if (typeof payload.cwd === "string") cwd = payload.cwd;
+				if (typeof payload.id === "string") sourceSessionId = redact(payload.id);
+				if (typeof payload.cwd === "string") cwd = redact(payload.cwd);
 				if (typeof payload.title === "string" && payload.title.trim().length > 0) {
 					title = redact(payload.title).trim();
 				}

@@ -9,7 +9,13 @@
 
 export const IMPORT_REDACTED_PLACEHOLDER = "[REDACTED]";
 /** Bumped when patterns change; persisted in import provenance. */
-export const IMPORT_SANITIZER_VERSION = 1;
+export const IMPORT_SANITIZER_VERSION = 2;
+
+const ANSI_ESCAPE = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/gu;
+const UNSAFE_CONTROL =
+	/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]/gu;
+const HEADER_CREDENTIAL = /(\b(?:authorization|cookie|set-cookie)\b[ \t]*:[ \t]*)([^\r\n]*)/giu;
+const JSON_AUTHORIZATION = /((?:\\?")authorization(?:\\?")\s*:\s*(?:\\?")?)([^",}\r\n]+)/giu;
 
 interface RedactionRule {
 	readonly id: string;
@@ -74,9 +80,21 @@ export interface ImportRedactionResult {
  * is used for all kinds so a partial pattern overlap cannot leak fragments.
  */
 export function redactImportedText(input: string): ImportRedactionResult {
-	let value = input;
+	let value = input.replace(ANSI_ESCAPE, "").replace(UNSAFE_CONTROL, "");
 	let redacted = 0;
 	const kinds = new Set<string>();
+	value = value.replace(HEADER_CREDENTIAL, (_match, prefix: string, raw: string) => {
+		if (!raw.trim()) return `${prefix}${raw}`;
+		redacted++;
+		kinds.add("credential-header");
+		return `${prefix}${IMPORT_REDACTED_PLACEHOLDER}`;
+	});
+	value = value.replace(JSON_AUTHORIZATION, (_match, prefix: string, raw: string) => {
+		if (!raw.trim()) return `${prefix}${raw}`;
+		redacted++;
+		kinds.add("authorization-json");
+		return `${prefix}${IMPORT_REDACTED_PLACEHOLDER}`;
+	});
 	for (const rule of REDACTION_RULES) {
 		rule.pattern.lastIndex = 0;
 		value = value.replace(rule.pattern, match => {

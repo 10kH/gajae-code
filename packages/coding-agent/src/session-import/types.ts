@@ -122,7 +122,7 @@ export interface SessionImportProvenance {
 	counts: SessionImportCounts;
 	/** True when head/tail bounding elided part of the conversation. */
 	truncated: boolean;
-	quarantine: { present: boolean; truncated: boolean };
+	quarantine: { present: boolean; truncated: boolean; records: ImportQuarantineRecord[] };
 }
 
 /** Fully prepared import: parsed, normalized, redacted, bounded. No session state mutated yet. */

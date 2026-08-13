@@ -155,8 +155,8 @@ export function parseClaudeCodeTranscript(text: string): ClaudeParseResult {
 			sink.quarantineRecord(recordNumber, line, "invalid_json");
 			continue;
 		}
-		if (typeof record.sessionId === "string" && !sourceSessionId) sourceSessionId = record.sessionId;
-		if (typeof record.cwd === "string" && !cwd) cwd = record.cwd;
+		if (typeof record.sessionId === "string" && !sourceSessionId) sourceSessionId = sink.redact(record.sessionId);
+		if (typeof record.cwd === "string" && !cwd) cwd = sink.redact(record.cwd);
 		const timestamp = typeof record.timestamp === "string" ? record.timestamp : undefined;
 
 		switch (record.type) {
@@ -280,7 +280,7 @@ export function parseClaudeExport(text: string): ClaudeParseResult {
 	let sourceSessionId: string | undefined;
 	let recordNumber = 0;
 	for (const conversation of ordered) {
-		if (typeof conversation.uuid === "string" && !sourceSessionId) sourceSessionId = conversation.uuid;
+		if (typeof conversation.uuid === "string" && !sourceSessionId) sourceSessionId = sink.redact(conversation.uuid);
 		if (typeof conversation.name === "string" && conversation.name.trim().length > 0 && !title) {
 			title = sink.redact(conversation.name).trim();
 		}
