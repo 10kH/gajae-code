@@ -65,9 +65,9 @@ const TODO_OP_KEYS_WITH_ALIASES = new Set([...TODO_OP_KEYS, "content"]);
  * other repeatable confusion: the tool result renders tasks as a list, so a
  * caller assumes the list is addressable by ordinal. No op has ever taken a
  * handle - a task is addressed by its verbatim content - and the executor
- * already says so, but that message is unreachable because this validator
- * rejects the key first. One shared correction keeps both layers telling the
- * same story.
+ * already says so, but on the validated model-facing path this validator
+ * rejects the key first, so that message never gets its turn. One shared
+ * correction keeps both layers telling the same story.
  */
 const POSITIONAL_HANDLE_CORRECTION =
 	'tasks have no id or index; target a task with "task" set to its exact content, or a whole phase with "phase"';

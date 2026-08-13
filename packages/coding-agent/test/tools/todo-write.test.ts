@@ -431,7 +431,7 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 	});
 
 	it("tells the caller tasks are addressed by content when an entry carries a positional handle", () => {
-		// The tool result renders a numbered list, so callers reach for `id`/`index`.
+		// The tool result renders tasks as a list, so callers reach for `id`/`index`.
 		// The executor's targetless-op message already says tasks are addressed by
 		// content, but raw validation rejects the key first, so it has to say it too.
 		const correction =
@@ -545,8 +545,8 @@ describe("TodoWriteTool operation aliases", () => {
 	});
 
 	it("tells the model how to address a task when a completion arrives with no target", async () => {
-		// Raw validation rejects a positional handle (`id: "1"`) before execute runs, so
-		// this covers a caller that bypasses it and sends a genuinely targetless op.
+		// Raw validation rejects a positional handle (`id: "1"`) before execute runs on
+		// the model-facing path, so this covers the bridges that call execute directly.
 		const tool = new TodoWriteTool(
 			createSession([{ name: "Implementation", tasks: [{ content: "Apply fix", status: "pending" }] }]),
 		);
