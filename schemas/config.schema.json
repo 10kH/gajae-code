@@ -22,6 +22,20 @@
 						}
 					},
 					"additionalProperties": false
+				},
+				"credentialRankingMode": {
+					"type": "string",
+					"enum": [
+						"balanced",
+						"earliest-reset"
+					],
+					"description": "Choose balanced distribution or earliest-reset-first OAuth account selection.",
+					"default": "balanced"
+				},
+				"credentialPins": {
+					"type": "object",
+					"additionalProperties": true,
+					"default": {}
 				}
 			},
 			"additionalProperties": false

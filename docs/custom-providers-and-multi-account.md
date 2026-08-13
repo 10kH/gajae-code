@@ -3,9 +3,9 @@
 Practical setup recipes for two power-user needs:
 
 1. **Custom providers** — point GJC at any OpenAI/Anthropic-compatible endpoint, proxy, or local runtime through `~/.gjc/agent/models.yml`.
-2. **Multi-account routing** — keep several OAuth accounts for the same provider (e.g. two Claude Max seats) and control which one each session drains.
+2. **Multi-account routing** — keep several OAuth accounts for the same provider (for example, two Claude Max seats) and control which one a session drains.
 
-Authoritative field-by-field reference: [`models.md`](./models.md). This page is the setup-oriented companion.
+The canonical runtime behavior is described here; the field-by-field model reference remains [`models.md`](./models.md).
 
 ## Custom providers (`~/.gjc/agent/models.yml`)
 
@@ -40,81 +40,148 @@ providers:
       type: openai-models-list
 ```
 
-A `models.yml` `apiKey` deliberately beats a stored/broker-resolved OAuth token for the same provider without overriding an explicit `--api-key` — this is how you pin one environment to a specific key.
+A `models.yml` `apiKey` is a config API-key override: it beats a stored or broker-resolved OAuth token for that provider, but does not override an explicit runtime `--api-key`. This is useful when one environment must use a particular proxy key.
 
 ### Coding-plan provider presets
 
-`gjc setup` ships ready-made presets for coding-plan providers with OpenAI-compatible Provider APIs — for example `commandcode-goat` (Command Code GOAT, `CMD_API_KEY`). Presets render the provider block for you; plan entitlement is enforced by the provider. See [`models.md` → Coding-plan provider presets](./models.md#coding-plan-provider-presets).
+`gjc setup` ships ready-made presets for coding-plan providers with OpenAI-compatible APIs — for example `commandcode-goat` (Command Code GOAT, `CMD_API_KEY`). Presets render the provider block for you; plan entitlement is enforced by the provider. See [`models.md` → Coding-plan provider presets](./models.md#coding-plan-provider-presets).
 
 ### Custom providers join routing automatically
 
 A registered, authenticated custom provider participates in preset/profile alias lookup: `hosted/glm-5.2` contributes the bare alias `glm-5.2`, and Provider Priority can rank the custom provider ahead of bundled ones without editing any preset. Validation is strict — unknown provider/model keys fail before dispatch.
 
-Full field reference (compat flags, `api` values, override-only providers, fallback chains, proxy routing for built-in presets): [`models.md`](./models.md).
+Full field reference (compat flags, `api` values, override-only providers, fallback chains, and proxy routing for built-in presets): [`models.md`](./models.md).
 
-## Multi-account routing
+## Multi-account UX
 
-### Add more than one account per provider
+GJC treats stored OAuth credentials as an account pool. API-key sources can be visible in the same inventory, but the account-pinning and selective-removal UX is OAuth-only.
 
-Run `/login` in a session again for the same provider with a different account (broker setups use `gjc auth-broker login <provider>`). Credentials are deduplicated by identity (account/email), so re-logging the same account replaces its row while a different account adds a new one to the pool. `gjc setup credentials` and startup auto-import can also pull existing Claude Code / Codex CLI credentials from disk (`CLAUDE_CONFIG_DIR`, `CODEX_HOME` are honored).
+### `/login`: provider picker, account picker, and session scope
 
-### Session-start ranking strategy
+- Bare `/login` opens the OAuth provider picker. `/login <provider>` targets one provider directly.
+- When the targeted provider already has OAuth rows, the account picker shows the existing identities plus **AUTO (ranked)** and **Add new account**. Selecting an existing identity pins that account for the current credential session only. **AUTO** masks session/global selectors for that session and returns to normal automatic selection.
+- **Add new account** runs the normal OAuth flow and upserts the resulting credential. Re-logging a stable OAuth identity updates its existing row; a different identity adds another row. It does not create a persistent pin.
+- A session selection is recorded with the session's credential scope, so it does not silently change another live session. Use `gjc accounts pin ... --persistent` when the intent is global for future sessions.
+- With a direct broker configured, the same OAuth login path uses the broker's remote write hooks; the refresh token remains on the broker. `gjc auth-broker login <provider>` is the broker-host CLI flow when the operator is working on the broker host instead.
 
-When a provider has several OAuth credentials, GJC ranks them at session start and picks one. Strategy is opt-in via env:
+### `/logout`: selective local removal
+
+`/logout` opens the OAuth provider picker. For a provider with local OAuth rows, its account picker can remove one selected account or **Remove all accounts**. Removal is local, atomic, and limited to OAuth rows; an inventory race leaves every row intact and asks you to retry.
+
+A direct-broker client has no local hard-removal targets for individual rows, so `/logout` cannot selectively remove a broker row. Use `gjc auth-broker logout <provider>` on the broker host for provider-wide removal. The separate `gjc accounts logout` command is explicitly local-only and refuses to run when broker mode is configured.
+
+### `/usage`: cache-only by default, explicit checks on demand
+
+| Surface | Network behavior | What it presents |
+| --- | --- | --- |
+| `/usage` | Cache-only. It does not fetch usage or probe credentials. | Per-account rows from the current inventory, cached health, and cached usage (which can be fresh, stale-last-good, or unavailable), followed by session token statistics. |
+| `/usage check` | Explicit sequential checks, one credential/source at a time. | Fresh per-row `ok`, `failed`, or `unknown/unverifiable` status and any safe usage report returned by the probe. |
+
+The explicit checker probes active stored rows sequentially, then checks synthetic runtime/config/environment API-key sources sequentially. OAuth checks refresh an expired credential before probing when possible. Plain `/usage` never turns a presentation refresh into a provider request.
+
+### `gjc accounts` command grammar
+
+The command is intentionally payload-free and has four actions:
+
+```text
+gjc accounts list [--json]
+gjc accounts check [<provider>] [--json]
+gjc accounts pin <provider> <selector> --persistent [--json]
+gjc accounts pin <provider> --clear --persistent [--json]
+gjc accounts logout <provider> --account <id|email> [--json]
+gjc accounts logout <provider> --all [--json]
+```
+
+Examples from the command help:
 
 ```sh
-# default: prefer the least-drained account (spreads load, keeps burst headroom)
-GJC_CREDENTIAL_RANKING_MODE=balanced
-
-# drain the soonest-to-reset account first (good for perishable tumbling-window
-# quota like Claude 5h/7d windows)
-GJC_CREDENTIAL_RANKING_MODE=earliest-reset
+gjc accounts list
+gjc accounts list --json
+gjc accounts check
+gjc accounts check anthropic --json
+gjc accounts pin anthropic me@example.com --persistent
+gjc accounts pin anthropic id:42 --persistent
+gjc accounts pin anthropic --clear --persistent
+gjc accounts logout anthropic --account me@example.com
+gjc accounts logout anthropic --all
 ```
 
-Blocked or exhausted accounts always sort last regardless of strategy. Ranking affects session start only; a running session keeps its credential.
+- `list` shows stored OAuth rows and configured API-key sources, with safe identity/source/health/usage-freshness fields. It does not probe.
+- `check` performs the explicit sequential checker. `--json` emits safe machine-readable rows; a failed probe sets a non-zero exit status.
+- `pin` requires `--persistent`. `<selector>` is a bare email, `id:<positive-row-id>`, `email:<email>`, or `account:<account-id>`. The command validates an active OAuth row and writes the canonical `id:<row-id>` selector to global configuration. `--clear` removes the provider's persistent pin.
+- `logout` requires exactly one of `--account <id|email>` or `--all`; it removes only OAuth rows from the local store. It never removes API-key source rows, and it refuses to mutate a broker-backed store.
 
-### Prefer one account, with automatic fallback
+API-key rows remain visible and checkable so operators can see which source is selected, but they are not part of OAuth account pooling, cannot be pinned by `gjc accounts pin`, and cannot be removed by `gjc accounts logout`.
 
-`GJC_CREDENTIAL_RANKING_MODE` only weighs ranking heuristics — it cannot pin one specific account ahead of the others by identity. `--prefer-credential <selector>` does: it names one stored OAuth credential (by `id`, `email`, `account`, or `project`) to try first, ahead of the ranking strategy's normal order, while still falling back to the rest of the pool the instant that account hits a quota or rate limit:
+## Persistent auth configuration
 
-```sh
-gjc --prefer-credential email:name@example.com
+The canonical configuration is nested YAML in the global `~/.gjc/agent/config.yml` (or the configured agent directory):
+
+```yaml
+auth:
+  broker:
+    url: https://broker.example.test:8765
+    token: $GJC_AUTH_BROKER_TOKEN
+  credentialRankingMode: balanced
+  credentialPins:
+    anthropic: id:42
+    openai-codex: email:me@example.com
 ```
 
-Unlike `--credential` (a hard pin that never rotates and fails the session on exhaustion), `--prefer-credential` is soft: it wins the initial pick, and a content-free quota/rate-limit failure switches to another active credential immediately and keeps the fallback sticky for the rest of the session. See [`non-compaction-retry-policy.md` → Preferred credential quota fallback](./non-compaction-retry-policy.md#preferred-credential-quota-fallback) for the full failure-mode contract.
+- `auth.broker.url` and `auth.broker.token` select direct-broker mode. `GJC_AUTH_BROKER_URL` and `GJC_AUTH_BROKER_TOKEN` take precedence over the nested values. A configured URL without a resolvable token is a hard error; GJC does not silently fall back to local SQLite.
+- `auth.credentialRankingMode` is `balanced` (default) or `earliest-reset`. `GJC_CREDENTIAL_RANKING_MODE` takes precedence over the nested setting.
+- `auth.credentialPins` is a global-only record of provider → selector. Project-scoped pins are ignored; do not place this record in project settings.
+- Literal dotted root keys such as `auth.broker.url: ...`, `auth.credentialRankingMode: ...`, or `auth.credentialPins: ...` are rejected. Startup reports the keys and prints manual rewrite guidance. Rewrite `config.yml` by hand using the nested shape above; there is no automatic migration, and secret values must not be copied into command output.
 
-### Switch accounts mid-session
+### Pin and credential precedence
 
-`/credential` (alias `/account`) switches a *running* session's active stored OAuth account for a provider, independent of quota state — unlike the automatic quota-triggered fallback above, this is a manual switch for when nothing is exhausted and you just want a different account:
+API-key overrides are outside OAuth pinning:
 
+1. Runtime `--api-key` is highest priority.
+2. A `models.yml` provider `apiKey` config override comes next and beats stored/broker OAuth.
+3. If no API-key override is active, an explicit session selector wins: `--credential ...` or an account selected in `/login <provider>`.
+4. A global `auth.credentialPins` entry seeds that provider's selector when a new session starts. Session **AUTO** masks it for that session.
+5. With no selector, OAuth accounts use automatic ranking (`balanced` or `earliest-reset`).
+
+Ranking is performed at session start, or when the session's preferred account is blocked; a running session keeps its selected credential. Blocked/exhausted accounts sort last. Persistent pins and session selectors are valid only for active OAuth credentials. An API-key override (including a configured environment API-key source when creating a pin) makes OAuth pinning unavailable for that provider.
+
+## Local, direct-broker, and gateway capabilities
+
+| Capability | Local SQLite client | Direct-broker GJC client | Auth-gateway service |
+| --- | --- | --- | --- |
+| Credential writer | Local `agent.db` | Broker host's `agent.db` | Broker host's `agent.db` (gateway is a broker client) |
+| OAuth login/add | `/login` picker and **Add new account** write locally | `/login` picker and **Add new account** write through the broker; `gjc auth-broker login` also works on the broker host | No login picker; use `gjc auth-broker login` on the broker host |
+| Logout/removal | `/logout` can remove one local OAuth row or all local OAuth rows; `gjc accounts logout` selects by `--account` or `--all` | Selective local removal is unavailable; use provider-wide `gjc auth-broker logout` on the broker host; `gjc accounts logout` refuses in broker mode | No account-removal API; mutate the broker directly |
+| Inventory/check | `/usage` and `gjc accounts list` are cache-only; `/usage check` and `gjc accounts check` probe sequentially | Same client presentation/check contract; expired OAuth refreshes route through the broker | `gjc auth-gateway check` and `GET /v1/credentials/check` probe broker rows sequentially; `GET /v1/usage` serves aggregate cached usage |
+| Pin/ranking | Session pins/AUTO plus global `gjc accounts pin --persistent` and ranking mode | Same GJC session/global controls; the broker remains the credential writer | The service has no TUI session scope; broker clients/operators control pins and ranking |
+| Secret boundary | Local OAuth refresh/access material stays in the local credential store/process | Broker snapshots replace OAuth refresh tokens with `__remote__`; direct clients can hold access tokens but never the refresh token | Gateway clients never receive provider access tokens; the gateway injects them server-side |
+
+## Broker metadata and cache-only presentation
+
+The broker's payload-free `GET /v1/credentials/metadata` response has a wrapper (`generation`, `generatedAt`, `credentials`) and each `credentials[]` record has **exactly five fields**:
+
+```json
+{
+  "id": 42,
+  "provider": "anthropic",
+  "type": "oauth",
+  "identity": "me@example.com",
+  "disabledCause": null
+}
 ```
-/credential                          # list every provider's stored accounts and which is active
-/credential id:15                    # switch to a specific stored row
-/credential email:me@example.com     # switch by email (current model's provider, or the one unique OAuth-pool match)
-/credential anthropic/id:15          # switch, naming the provider explicitly
-```
 
-With no argument, it lists every provider's stored OAuth rows and marks which one this session is currently using. A bare (unqualified) selector targets the current model's provider when that provider has a matching row, otherwise the single OAuth-pool provider it uniquely matches; an ambiguous match across providers asks for an explicit `provider/<selector>` prefix.
+There are no token, key, raw credential, identity-object, or extension fields in a metadata record. The metadata endpoint may synchronize broker inventory, but it is not a provider health probe.
 
-The switch only affects this session's credential identity — the session and its subagents/team workers share one credential identity (`credentialSessionId`) by design, and it never changes another session's identity or a provider-wide override. It takes effect on the next request to that provider, and refuses outright when a stronger override already owns the provider's credential selection every call: `--credential` (hard pin), a runtime `--api-key` override, or a config-sourced `models.yml` `apiKey`. Switching to a row that is currently backoff-blocked from a prior quota failure does not force it through — the existing session-start ranking still skips a blocked row and falls back to a usable account instead of drawing another 429.
+`/usage`, `gjc accounts list`, and the account picker render the current inventory plus retained health/usage observations. They do not probe providers merely to render a page. Broker-backed clients may receive a background snapshot/metadata update. An explicit check returns fresh per-row results and retains safe health state; it does not change the cache-only contract of the plain commands.
 
-### Provider order across vendors
+## Secret and log safety
 
-Which *provider* serves a bare model alias is a separate ladder:
-
-1. explicit `modelProviderOrder` entries in `config.yml` (Provider Priority in Settings), in saved order
-2. omitted providers whose credential came from OAuth
-3. omitted providers on manual API keys or keyless access
-4. deterministic tie-breakers (vision, canonical identity, `cost.input + cost.cacheRead`, registry order)
-
-A listed API-key provider beats every omitted OAuth provider; resetting Provider Priority restores OAuth-first.
-
-### Team-scale pools: auth broker / gateway
-
-To share one credential pool across machines or containers, run `gjc auth-broker serve` as the single refresh owner and point clients at it with `GJC_AUTH_BROKER_URL` / `GJC_AUTH_BROKER_TOKEN`. The gateway (`gjc auth-gateway serve`) additionally hides access tokens from clients entirely. Per-credential health probing surfaces which row in a multi-account pool is producing 401s. See [`auth-broker-gateway.md`](./auth-broker-gateway.md).
+- Account inventory, `/usage`, `/usage check`, and `gjc accounts --json` intentionally omit credential payloads and raw provider response bodies. Error reasons are bounded and scrub credential-shaped strings.
+- OAuth refresh tokens are never sent in broker snapshots; they are replaced by the `__remote__` sentinel. Gateway consumers do not receive access tokens either.
+- Keep broker and gateway bearer tokens in their `0600` token files under a `0700` config directory. Do not paste tokens, API keys, authorization headers, callback URLs containing secrets, or unredacted provider errors into issues, transcripts, or logs.
 
 ## See also
 
-- [`models.md`](./models.md) — full `models.yml` reference, auth resolution order, presets
-- [`multi-vendor-profiles.md`](./multi-vendor-profiles.md) — role-based cross-vendor profiles
-- [`environment-variables.md`](./environment-variables.md) — `GJC_CREDENTIAL_RANKING_MODE`, broker vars, credential import roots
+- [`models.md`](./models.md) — full `models.yml` reference and auth resolution order
+- [`auth-broker-gateway.md`](./auth-broker-gateway.md) — broker/gateway endpoints, refresh ownership, and usage cache layers
+- [`environment-variables.md`](./environment-variables.md) — broker variables and credential import roots

@@ -12,6 +12,7 @@ import type {
 	CredentialDisableRequest,
 	CredentialDisableResponse,
 	CredentialIfAbsentUploadResponse,
+	CredentialMetadataResponse,
 	CredentialRefreshRequest,
 	CredentialRefreshResponse,
 	CredentialUploadRequest,
@@ -24,6 +25,7 @@ import type {
 import {
 	credentialDisableResponseSchema,
 	credentialIfAbsentUploadResponseSchema,
+	credentialMetadataResponseSchema,
 	credentialRefreshResponseSchema,
 	credentialUploadResponseSchema,
 	healthzResponseSchema,
@@ -65,6 +67,14 @@ export class AuthBrokerStreamUnsupportedError extends AuthBrokerError {
 	constructor(message = "Auth broker does not support /v1/snapshot/stream") {
 		super(message, { status: 404 });
 		this.name = "AuthBrokerStreamUnsupportedError";
+	}
+}
+
+/** Thrown when a broker responds 404 to `GET /v1/credentials/metadata`. */
+export class AuthBrokerCredentialMetadataUnsupportedError extends AuthBrokerError {
+	constructor(message = "Auth broker does not support /v1/credentials/metadata") {
+		super(message, { status: 404 });
+		this.name = "AuthBrokerCredentialMetadataUnsupportedError";
 	}
 }
 
@@ -114,6 +124,21 @@ export class AuthBrokerClient {
 
 	async fetchSnapshot(opts: FetchSnapshotOptions = {}): Promise<FetchSnapshotResult> {
 		return this.#fetchSnapshotResult(opts);
+	}
+
+	/** Fetches the generation-aware, secret-free credential inventory projection. */
+	async fetchCredentialMetadata(signal?: AbortSignal): Promise<CredentialMetadataResponse> {
+		try {
+			return (await this.#request("GET", "/v1/credentials/metadata", {
+				schema: credentialMetadataResponseSchema,
+				signal,
+			})) as CredentialMetadataResponse;
+		} catch (error) {
+			if (error instanceof AuthBrokerError && error.status === 404) {
+				throw new AuthBrokerCredentialMetadataUnsupportedError();
+			}
+			throw error;
+		}
 	}
 	async #fetchSnapshotResult(opts: FetchSnapshotOptions): Promise<FetchSnapshotResult> {
 		const query = new URLSearchParams();

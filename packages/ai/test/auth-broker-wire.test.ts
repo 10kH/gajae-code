@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	AuthBrokerClient,
+	AuthBrokerCredentialMetadataUnsupportedError,
 	type AuthBrokerServerHandle,
 	AuthBrokerStreamUnsupportedError,
 	AuthStorage,
@@ -72,6 +73,82 @@ describe("auth-broker wire surface", () => {
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as { ok: boolean };
 		expect(body.ok).toBe(true);
+	});
+
+	test("GET /v1/credentials/metadata is authenticated, strict, redacted, and generation-aware", async () => {
+		const unauthorized = await fetch(`${handle!.url}/v1/credentials/metadata`);
+		expect(unauthorized.status).toBe(401);
+
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		const metadata = await client.fetchCredentialMetadata();
+		expect(metadata.generation).toBe(storage!.getGeneration());
+		expect(metadata.generatedAt).toBeGreaterThan(0);
+		expect(metadata.credentials).toHaveLength(1);
+		expect(metadata.credentials[0]).toEqual({
+			id: expect.any(Number),
+			provider: "anthropic",
+			type: "oauth",
+			identity: "a@example.com",
+			disabledCause: null,
+		});
+		expect(Object.keys(metadata.credentials[0] ?? {}).sort()).toEqual([
+			"disabledCause",
+			"id",
+			"identity",
+			"provider",
+			"type",
+		]);
+		const raw = JSON.stringify(metadata);
+		expect(raw).not.toContain("access-a");
+		expect(raw).not.toContain("refresh-a");
+		expect(raw).not.toContain("key");
+
+		storage!.upsertCredential("kagi", { type: "api_key", key: "api-key-secret" });
+		const withApiKey = await client.fetchCredentialMetadata();
+		expect(withApiKey.credentials.find(record => record.provider === "kagi")).toEqual({
+			id: expect.any(Number),
+			provider: "kagi",
+			type: "api_key",
+			identity: null,
+			disabledCause: null,
+		});
+		expect(JSON.stringify(withApiKey)).not.toContain("api-key-secret");
+
+		storage!.disableCredentialById(metadata.credentials[0]!.id, "secret disabled reason");
+		const disabled = await client.fetchCredentialMetadata();
+		expect(disabled.credentials[0]).toMatchObject({
+			id: metadata.credentials[0]!.id,
+			disabledCause: "secret disabled reason",
+		});
+		expect(disabled.generation).toBeGreaterThan(metadata.generation);
+	});
+
+	test("metadata wire schema rejects extra secret-bearing record fields", async () => {
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () =>
+				Response.json({
+					generation: 1,
+					generatedAt: Date.now(),
+					credentials: [
+						{
+							id: 1,
+							provider: "anthropic",
+							type: "oauth",
+							identity: null,
+							disabledCause: null,
+							access: "secret",
+						},
+					],
+				}),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			await expect(client.fetchCredentialMetadata()).rejects.toThrow(/schema validation/);
+		} finally {
+			dummy.stop(true);
+		}
 	});
 
 	test("GET /v1/snapshot requires bearer and redacts refresh tokens", async () => {
@@ -416,6 +493,22 @@ describe("auth-broker wire surface", () => {
 			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
 			const iter = client.openSnapshotStream();
 			await expect(iter.next()).rejects.toBeInstanceOf(AuthBrokerStreamUnsupportedError);
+		} finally {
+			dummy.stop(true);
+		}
+	});
+
+	test("fetchCredentialMetadata preserves 404 unsupported compatibility", async () => {
+		const dummy = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			fetch: () => new Response("Not Found", { status: 404 }),
+		});
+		try {
+			const client = new AuthBrokerClient({ url: `http://${dummy.hostname}:${dummy.port}`, token });
+			await expect(client.fetchCredentialMetadata()).rejects.toBeInstanceOf(
+				AuthBrokerCredentialMetadataUnsupportedError,
+			);
 		} finally {
 			dummy.stop(true);
 		}

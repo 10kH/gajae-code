@@ -1,12 +1,17 @@
-import type { UsageLimit, UsageReport } from "@gajae-code/ai/core";
+import type { UsageLimit } from "@gajae-code/ai/core";
+import { sanitizeText } from "@gajae-code/utils";
+import {
+	type AccountInventoryRow,
+	buildAccountInventorySnapshot,
+	checkAccountInventory,
+} from "../../session/account-inventory";
+import { truncateHead } from "../../session/streaming-output";
 import type { SlashCommandRuntime } from "../types";
-import { formatDuration, renderAsciiBar } from "./format";
+import { formatDuration } from "./format";
 
-function formatProviderName(provider: string): string {
-	return provider
-		.split(/[-_]/g)
-		.map(part => (part ? part[0].toUpperCase() + part.slice(1) : ""))
-		.join(" ");
+function sanitizeAndTruncateOutput(text: string): string {
+	const sanitized = sanitizeText(text);
+	return truncateHead(sanitized, { maxBytes: 32_768, maxLines: 1_000 }).content;
 }
 
 function formatUsageAmount(limit: UsageLimit): string {
@@ -21,65 +26,40 @@ function formatUsageAmount(limit: UsageLimit): string {
 	return `${usedText}${remainingText}`;
 }
 
-function formatUsageReportAccount(report: UsageReport, limit: UsageLimit, reportIndex: number): string {
-	const email = report.metadata?.email;
-	if (typeof email === "string" && email) return email;
-	const accountId = report.metadata?.accountId ?? limit.scope.accountId;
-	if (typeof accountId === "string" && accountId) return accountId;
-	return `account ${reportIndex + 1}`;
+function healthLabel(row: AccountInventoryRow): string {
+	if (row.disabled) return `disabled${row.disabledCause ? `: ${row.disabledCause}` : ""}`;
+	if (row.health.status === "ok") return "ok";
+	if (row.health.status === "failed") return `failed${row.health.reason ? `: ${row.health.reason}` : ""}`;
+	if (row.health.status === "unverifiable") return `unverifiable${row.health.reason ? `: ${row.health.reason}` : ""}`;
+	return "unknown";
 }
 
-function renderUsageReports(reports: UsageReport[], nowMs: number): string {
-	const latestFetchedAt = Math.max(...reports.map(report => report.fetchedAt ?? 0));
-	const lines = [`Usage${latestFetchedAt ? ` (${formatDuration(nowMs - latestFetchedAt)} ago)` : ""}`];
-	const grouped = new Map<string, UsageReport[]>();
-	for (const report of reports) {
-		const providerReports = grouped.get(report.provider) ?? [];
-		providerReports.push(report);
-		grouped.set(report.provider, providerReports);
+function renderAccountRows(rows: AccountInventoryRow[], nowMs: number, checked: boolean): string {
+	const lines = [`Accounts${checked ? " (checked)" : " (cache only)"}`];
+	if (rows.length === 0) {
+		lines.push("No configured accounts or API-key sources discovered.");
+		return lines.join("\n");
 	}
-
-	for (const [provider, providerReports] of [...grouped.entries()].sort(([left], [right]) =>
-		left.localeCompare(right),
-	)) {
-		lines.push("", formatProviderName(provider));
-		for (let reportIndex = 0; reportIndex < providerReports.length; reportIndex++) {
-			const report = providerReports[reportIndex]!;
-			if (report.limits.length === 0) {
-				const email =
-					typeof report.metadata?.email === "string" ? report.metadata.email : `account ${reportIndex + 1}`;
-				lines.push(`- ${email}: no limits reported`);
-				continue;
-			}
-			for (let index = 0; index < report.limits.length; index++) {
-				const limit = report.limits[index]!;
-				const window = limit.window?.label ?? limit.scope.windowId;
-				const tier = limit.scope.tier ? ` (${limit.scope.tier})` : "";
-				lines.push(`- ${limit.label}${tier}${window ? ` — ${window}` : ""}`);
-				lines.push(`  ${formatUsageReportAccount(report, limit, reportIndex)}: ${formatUsageAmount(limit)}`);
-				lines.push(`  ${renderAsciiBar(limit.amount.usedFraction)}`);
-				if (limit.window?.resetsAt) lines.push(`  resets in ${formatDuration(limit.window.resetsAt - nowMs)}`);
-				if (limit.notes && limit.notes.length > 0) lines.push(`  ${limit.notes.join(" • ")}`);
+	for (const row of rows) {
+		const identity = row.identityLabel ? ` — ${row.identityLabel}` : "";
+		const marker =
+			row.routing.marker === "active" ? " [active]" : row.routing.marker === "selected" ? " [selected]" : "";
+		const cache = row.usage
+			? `, usage ${row.usage.freshness}${formatDuration(Math.max(0, nowMs - row.usage.fetchedAt)) ? ` ${formatDuration(Math.max(0, nowMs - row.usage.fetchedAt))} ago` : ""}`
+			: "";
+		lines.push(
+			`- ${row.id}: ${row.provider}/${row.credentialKind} (${row.sourceLabel})${identity}${marker} — ${healthLabel(row)}${cache}`,
+		);
+		if (row.usage?.report.limits.length) {
+			for (const limit of row.usage.report.limits.slice(0, 8)) {
+				lines.push(`  ${sanitizeText(limit.label)}: ${formatUsageAmount(limit)}`);
 			}
 		}
 	}
-	return ["```", ...lines, "```"].join("\n");
+	return lines.join("\n");
 }
 
-/**
- * Build the `/usage` ACP-mode text. Prefers provider-reported limits when the
- * session exposes `fetchUsageReports`; otherwise falls back to the local
- * session-manager tallies.
- */
-export async function buildUsageReportText(runtime: SlashCommandRuntime): Promise<string> {
-	const provider = runtime.session as SlashCommandRuntime["session"] & {
-		fetchUsageReports?: () => Promise<UsageReport[] | null>;
-	};
-	if (provider.fetchUsageReports) {
-		const reports = await provider.fetchUsageReports();
-		if (reports && reports.length > 0) return renderUsageReports(reports, Date.now());
-	}
-
+function buildLegacyUsage(runtime: SlashCommandRuntime): string {
 	const stats = runtime.session.sessionManager.getUsageStatistics();
 	return [
 		"Usage",
@@ -90,4 +70,27 @@ export async function buildUsageReportText(runtime: SlashCommandRuntime): Promis
 		`Premium requests: ${stats.premiumRequests}`,
 		`Cost: $${stats.cost.toFixed(6)}`,
 	].join("\n");
+}
+
+export interface UsageReportOptions {
+	check?: boolean;
+}
+
+/** Build `/usage`; plain mode is cache-only and never fetches or probes. */
+export async function buildUsageReportText(
+	runtime: SlashCommandRuntime,
+	options: UsageReportOptions = {},
+): Promise<string> {
+	const session = runtime.session;
+	const modelRegistry = session.modelRegistry;
+	const input = {
+		authStorage: modelRegistry.authStorage,
+		modelRegistry,
+		sessionId: session.credentialSessionId ?? session.sessionId,
+	};
+	const snapshot = options.check ? await checkAccountInventory(input) : buildAccountInventorySnapshot(input);
+	const report = renderAccountRows(snapshot.rows, Date.now(), options.check === true);
+	const legacy = buildLegacyUsage(runtime);
+
+	return sanitizeAndTruncateOutput(`${report}\n\n${legacy}`);
 }

@@ -181,7 +181,10 @@ interface ArrayDef<T> {
 	ui?: UiBase;
 }
 
-type RecordValueDef = { type: "model-selector-value" } | { type: "string-enum"; values: readonly string[] };
+type RecordValueDef =
+	| { type: "model-selector-value" }
+	| { type: "string-enum"; values: readonly string[] }
+	| { type: "credential-selector" };
 
 interface RecordDef<T> {
 	type: "record";
@@ -270,6 +273,21 @@ export const SETTINGS_SCHEMA = {
 	// per-machine overrides remain trivial.
 	"auth.broker.url": { type: "string", default: undefined },
 	"auth.broker.token": { type: "string", default: undefined },
+	"auth.credentialRankingMode": {
+		type: "enum",
+		values: ["balanced", "earliest-reset"] as const,
+		default: "balanced",
+		ui: {
+			tab: "providers",
+			label: "Credential Ranking",
+			description: "Choose balanced distribution or earliest-reset-first OAuth account selection.",
+		},
+	},
+	"auth.credentialPins": {
+		type: "record",
+		default: {} as Record<string, string>,
+		valueSchema: { type: "credential-selector" } as const,
+	},
 	"session.directoryMigration": {
 		type: "enum",
 		values: ["copy-retain", "disabled"] as const,
@@ -3908,6 +3926,14 @@ function validArraySettingValue(value: unknown, allowedValues: readonly string[]
 function validRecordValue(valueSchema: RecordValueDef, value: unknown): boolean {
 	if (valueSchema.type === "model-selector-value") {
 		return typeof value === "string" || (Array.isArray(value) && value.every(item => typeof item === "string"));
+	}
+	if (valueSchema.type === "credential-selector") {
+		return (
+			typeof value === "string" &&
+			((value.startsWith("id:") && /^[1-9]\d*$/.test(value.slice(3))) ||
+				/^email:[^@\s]+@[^@\s]+$/.test(value) ||
+				/^account:\S+$/.test(value))
+		);
 	}
 	return typeof value === "string" && valueSchema.values.includes(value);
 }

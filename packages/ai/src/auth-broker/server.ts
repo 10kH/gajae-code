@@ -16,6 +16,7 @@ import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresh
 import type {
 	CredentialDisableResponse,
 	CredentialIfAbsentUploadResponse,
+	CredentialMetadataResponse,
 	CredentialRefreshRequest,
 	CredentialRefreshResponse,
 	CredentialUploadResponse,
@@ -284,6 +285,22 @@ function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | un
 	};
 }
 
+/** Build the payload-free credential inventory projection for the metadata route. */
+function buildCredentialMetadata(storage: AuthStorage): CredentialMetadataResponse {
+	const credentials = storage.listCredentialInventory().map(record => ({
+		id: record.id,
+		provider: record.provider,
+		type: record.credentialKind,
+		identity: record.identityLabel,
+		disabledCause: record.disabledCause,
+	}));
+	return {
+		generation: storage.getGeneration(),
+		generatedAt: Date.now(),
+		credentials,
+	};
+}
+
 async function serveSnapshot(
 	req: Request,
 	url: URL,
@@ -536,6 +553,15 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					logger.info("auth-broker request unauthorized", { method: req.method, path: pathname, peer });
 					return json(401, { error: "unauthorized" });
 				}
+				if (req.method === "GET" && pathname === "/v1/credentials/metadata") {
+					await opts.storage.reload();
+					const body = buildCredentialMetadata(opts.storage);
+					logger.info("auth-broker credential metadata served", {
+						generation: body.generation,
+						status: "ok",
+					});
+					return json(200, body);
+				}
 				if (req.method === "GET" && pathname === "/v1/snapshot/stream") {
 					return serveSnapshotStream(req, opts.storage, refresher, peer, streamKeepaliveMs);
 				}
@@ -594,10 +620,10 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						parsed.data.cause && parsed.data.cause.length > 0 ? parsed.data.cause : "disabled via auth-broker";
 					const ok = opts.storage.disableCredentialById(id, cause);
 					if (!ok) {
-						logger.info("auth-broker disable miss", { id, peer, cause });
+						logger.info("auth-broker disable miss", { id, peer });
 						return json(404, { error: `No credential with id=${id}` });
 					}
-					logger.info("auth-broker credential disabled", { id, peer, cause });
+					logger.info("auth-broker credential disabled", { id, peer });
 					const response: CredentialDisableResponse = { ok: true };
 					return json(200, response);
 				}

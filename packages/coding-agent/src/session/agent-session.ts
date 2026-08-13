@@ -177,6 +177,7 @@ export interface ForkContextSeedOptions {
 	signal?: AbortSignal;
 }
 
+import type { AuthCredentialSelector } from "@gajae-code/ai/core";
 import type { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
 	extractRetryHint,
@@ -188,7 +189,6 @@ import {
 	prompt,
 	Snowflake,
 } from "@gajae-code/utils";
-
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
 	type AsyncJob,
@@ -7022,6 +7022,7 @@ export class AgentSession {
 		await this.memoryBackend.dispose();
 		if (this.#workspaceTreeService) await this.#workspaceTreeService.dispose();
 		if (this.#networkPrewarmService) await this.#networkPrewarmService.dispose();
+		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.getHindsightSessionState();
@@ -8492,6 +8493,32 @@ export class AgentSession {
 	/** Credential selection identity; defaults to the provider-facing session identity. */
 	get credentialSessionId(): string {
 		return this.#credentialSessionId ?? this.sessionId;
+	}
+
+	/** Pin one OAuth credential for this session scope and persist the minimal intent. */
+	async setCredentialPin(provider: string, selector: AuthCredentialSelector): Promise<void> {
+		const scopeId = this.credentialSessionId;
+		const authStorage = this.#modelRegistry.authStorage;
+		const target = authStorage.resolveOAuthPinTarget(provider, selector);
+		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector);
+		this.sessionManager.appendCustomEntry("auth-credential-pin", {
+			v: 1,
+			scopeId,
+			provider,
+			pin: target.canonicalSelector,
+		});
+	}
+
+	/** Mask persistent/global selection for this session and restore AUTO ranking. */
+	async setCredentialAuto(provider: string): Promise<void> {
+		const scopeId = this.credentialSessionId;
+		this.#modelRegistry.authStorage.setSessionCredentialAuto(provider, scopeId);
+		this.sessionManager.appendCustomEntry("auth-credential-pin", {
+			v: 1,
+			scopeId,
+			provider,
+			pin: { auto: true },
+		});
 	}
 
 	/** Current session display name, if set */

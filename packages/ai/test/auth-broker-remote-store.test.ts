@@ -109,4 +109,82 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		await waitUntil(() => remote!.snapshot.credentials.length === 1);
 		expect(remote!.snapshot.credentials[0].id).not.toBe(bId);
 	});
+
+	test("syncs metadata once and joins disabled rows without exposing payloads", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const activeId = remote.snapshot.credentials[0]!.id;
+		storage!.upsertCredential("anthropic", mintOAuthCredential("disabled", Date.now() + 60_000));
+		const disabledId = storage!
+			.listCredentialInventory("anthropic")
+			.find(row => row.identityLabel === "disabled@example.com")!.id;
+		storage!.disableCredentialById(disabledId, "revoked in test");
+		await remote.refreshSnapshot();
+		const state = await remote.syncInventoryMetadata();
+		expect(state.capability).toBe("supported");
+		expect(state.generation).toBe(remote.snapshot.generation);
+		expect(remote.listCredentialInventory("anthropic")).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ id: activeId, disabled: false }),
+				expect.objectContaining({ id: disabledId, disabled: true, disabledCause: "revoked in test" }),
+			]),
+		);
+		for (const row of remote.listCredentialInventory()) expect(row).not.toHaveProperty("credential");
+	});
+
+	test("404 metadata is cached as unsupported and list is zero-network", async () => {
+		const fetchMock = vi.fn(async (input: string | URL | Request) => {
+			const url = String(input);
+			if (url.endsWith("/v1/snapshot")) {
+				return new Response(
+					JSON.stringify({
+						generation: 1,
+						generatedAt: Date.now(),
+						serverNowMs: Date.now(),
+						refresher: { enabled: false, intervalMs: 0, skewMs: 0, nextSweepInMs: Number.MAX_SAFE_INTEGER },
+						credentials: [],
+					}),
+					{ status: 200, headers: { "content-type": "application/json", etag: '"1"' } },
+				);
+			}
+			return new Response("not found", { status: 404 });
+		});
+		const fetchImpl = fetchMock as unknown as typeof fetch;
+		const client = new AuthBrokerClient({ url: "http://broker.test", token, fetchImpl, maxRetries: 0 });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		const state = await remote.syncInventoryMetadata();
+		expect(state.capability).toBe("unsupported");
+		const before = fetchMock.mock.calls.length;
+		expect(remote.listCredentialInventory()).toEqual([]);
+		expect(remote.getInventoryMetadataState().capability).toBe("unsupported");
+		expect(fetchMock.mock.calls.length).toBe(before);
+	});
+
+	test("presentation usage peek is safe and zero-network", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const entry = remote.snapshot.credentials[0]!;
+		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toBeUndefined();
+	});
+
+	test("records aggregate usage only for the current snapshot generation", async () => {
+		const client = new AuthBrokerClient({ url: handle!.url, token });
+		remote = new RemoteAuthCredentialStore({ client, streamSnapshots: false });
+		await remote.refreshSnapshot();
+		const entry = remote.snapshot.credentials[0]!;
+		const now = Date.now();
+		vi.spyOn(client, "fetchUsage").mockResolvedValue({
+			generatedAt: now,
+			reports: [{ provider: entry.provider as never, fetchedAt: now, limits: [] }],
+		});
+		await remote.fetchUsageReports();
+		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toEqual(
+			expect.objectContaining({ credentialId: entry.id, inventoryGeneration: remote.snapshot.generation }),
+		);
+		storage!.disableCredentialById(entry.id, "removed in test");
+		await remote.refreshSnapshot();
+		expect(remote.peekCachedUsagePresentation(entry.provider as never, entry.id)).toBeUndefined();
+	});
 });

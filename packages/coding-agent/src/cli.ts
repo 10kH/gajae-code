@@ -39,6 +39,7 @@ export const commands: CommandEntry[] = [
 	{ name: "auth-gateway", load: () => import("./commands/auth-gateway").then(m => m.default) },
 	{ name: "skills", load: () => import("./commands/skills").then(m => m.default) },
 	{ name: "session", load: () => import("./commands/session").then(m => m.default) },
+	{ name: "accounts", load: () => import("./commands/accounts").then(m => m.default) },
 	{ name: "harness", load: () => import("./commands/harness").then(m => m.default) },
 	{ name: "coordinator", load: () => import("./commands/coordinator").then(m => m.default) },
 	{ name: "team", load: () => import("./commands/team").then(m => m.default) },

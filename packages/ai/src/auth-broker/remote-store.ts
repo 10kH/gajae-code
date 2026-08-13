@@ -7,7 +7,10 @@
  * usage reports cache TTL is 5 minutes per credential, so durability across
  * runs isn't required.
  */
+
+import { createHash } from "node:crypto";
 import { scheduler } from "node:timers/promises";
+
 import { logger } from "@gajae-code/utils";
 import {
 	type AuthCredential,
@@ -15,16 +18,44 @@ import {
 	type AuthCredentialSnapshotEntry,
 	type AuthCredentialStore,
 	assertCanonicalMCPOAuthBinding,
+	type CachedUsagePresentation,
+	type CredentialInventoryRecord,
 	type MCPOAuthRefreshClient,
 	type OAuthCredential,
 	REMOTE_REFRESH_SENTINEL,
+	type SafeUsageReport,
 	type StoredAuthCredential,
 } from "../auth-storage";
 import type { Provider } from "../types";
 import type { UsageReport } from "../usage";
 import type { OAuthCredentials } from "../utils/oauth/types";
-import { type AuthBrokerClient, AuthBrokerStreamUnsupportedError } from "./client";
-import type { RefresherSchedule, SnapshotEntry, SnapshotResponse, SnapshotStreamEvent } from "./types";
+import {
+	type AuthBrokerClient,
+	AuthBrokerCredentialMetadataUnsupportedError,
+	AuthBrokerStreamUnsupportedError,
+} from "./client";
+import type {
+	CredentialMetadataRecord,
+	RefresherSchedule,
+	SnapshotEntry,
+	SnapshotResponse,
+	SnapshotStreamEvent,
+} from "./types";
+
+export type CredentialInventoryMetadataCapability = "pending" | "supported" | "unsupported" | "mismatch" | "failed";
+
+export interface CachedInventoryNotice {
+	status: Exclude<CredentialInventoryMetadataCapability, "supported">;
+	reason: string;
+	generation?: number;
+}
+
+export interface CredentialInventoryMetadataState {
+	capability: CredentialInventoryMetadataCapability;
+	generation: number;
+	records: readonly CredentialInventoryRecord[];
+	notice?: CachedInventoryNotice;
+}
 
 /**
  * Client-side TTL for the aggregate `/v1/usage` response. Set below the
@@ -38,6 +69,8 @@ const MAX_WAIT_MS = 5_000;
 const BACKGROUND_WAIT_MS = 30_000;
 const BACKGROUND_BACKOFF_INITIAL_MS = 500;
 const BACKGROUND_BACKOFF_MAX_MS = 30_000;
+const PRESENTATION_FRESH_MS = 5 * 60_000;
+const PRESENTATION_RETENTION_MS = 24 * 60 * 60_000;
 
 function emptySnapshot(): SnapshotResponse {
 	return {
@@ -89,6 +122,17 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	#usageCache?: UsageCacheEntry;
 	#usageInflight?: Promise<UsageReport[] | null>;
 	#usageCacheEpoch = 0;
+	#inventoryMetadata = new Map<number, CredentialMetadataRecord>();
+	#inventoryMetadataGeneration = -1;
+	#inventoryState: CredentialInventoryMetadataState = {
+		capability: "pending",
+		generation: 0,
+		records: [],
+		notice: { status: "pending", reason: "credential metadata sync pending", generation: 0 },
+	};
+	#inventorySyncInflight?: Promise<Readonly<CredentialInventoryMetadataState>>;
+	#inventoryMetadataUnsupported = false;
+	#usagePresentations = new Map<number, CachedUsagePresentation>();
 	#closed = false;
 	/**
 	 * `true` once the SSE consumer received its first frame and hasn't dropped
@@ -103,7 +147,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	constructor(opts: RemoteAuthCredentialStoreOptions) {
 		this.#client = opts.client;
 		this.#streamSnapshots = opts.streamSnapshots ?? true;
-		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0);
+		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0, false);
+		this.#setInventoryState("pending", this.#generation, {
+			status: "pending",
+			reason: "credential metadata sync pending",
+			generation: this.#generation,
+		});
 		void this.#runBackground();
 	}
 
@@ -115,10 +164,158 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return this.#snapshot;
 	}
 
-	#applySnapshot(snapshot: SnapshotResponse, generation: number): void {
+	getInventoryMetadataState(): Readonly<CredentialInventoryMetadataState> {
+		const records = this.#buildInventoryRecords().map(record => ({ ...record }));
+		const notice = this.#inventoryState.notice ? { ...this.#inventoryState.notice } : undefined;
+		return {
+			capability: this.#inventoryState.capability,
+			generation: this.#inventoryState.generation,
+			records,
+			...(notice ? { notice } : {}),
+		};
+	}
+
+	#applySnapshot(snapshot: SnapshotResponse, generation: number, scheduleMetadata = true): void {
+		const generationChanged = generation !== this.#generation || this.#inventoryMetadataGeneration !== generation;
 		this.#snapshot = snapshot;
 		this.#generation = generation;
 		this.#snapshotReceivedAt = Date.now();
+		if (generationChanged) {
+			this.#inventoryMetadata.clear();
+			this.#inventoryMetadataGeneration = -1;
+			this.#invalidateUsageCache();
+			this.#reconcileUsagePresentations();
+			if (this.#inventoryMetadataUnsupported) {
+				this.#setInventoryState("unsupported", generation, {
+					status: "unsupported",
+					reason: "credential metadata endpoint unsupported; disabled rows unavailable",
+					generation,
+				});
+			} else {
+				this.#setInventoryState("pending", generation, {
+					status: "pending",
+					reason: "credential metadata sync pending",
+					generation,
+				});
+				if (scheduleMetadata) this.#scheduleInventoryMetadataSync();
+			}
+		}
+	}
+
+	#setInventoryState(
+		capability: CredentialInventoryMetadataCapability,
+		generation: number,
+		notice?: CachedInventoryNotice,
+	): void {
+		const records = this.#buildInventoryRecords();
+		this.#inventoryState = {
+			capability,
+			generation,
+			records,
+			...(notice ? { notice } : {}),
+		};
+	}
+
+	#buildInventoryRecords(): CredentialInventoryRecord[] {
+		const metadataReady = this.#inventoryMetadataGeneration === this.#generation;
+		const records: CredentialInventoryRecord[] = [];
+		const seen = new Set<number>();
+		for (const entry of this.#snapshot.credentials) {
+			const metadata = metadataReady ? this.#inventoryMetadata.get(entry.id) : undefined;
+			seen.add(entry.id);
+			records.push({
+				id: entry.id,
+				provider: entry.provider,
+				credentialKind: metadata?.type ?? entry.credential.type,
+				identityLabel: metadata?.identity ?? snapshotIdentityLabel(entry),
+				disabled: false,
+				disabledCause: null,
+			});
+		}
+		if (metadataReady) {
+			for (const metadata of this.#inventoryMetadata.values()) {
+				if (seen.has(metadata.id) || metadata.disabledCause === null) continue;
+				records.push({
+					id: metadata.id,
+					provider: metadata.provider,
+					credentialKind: metadata.type,
+					identityLabel: metadata.identity,
+					disabled: true,
+					disabledCause: metadata.disabledCause,
+				});
+			}
+		}
+		return records;
+	}
+
+	#scheduleInventoryMetadataSync(): void {
+		if (this.#closed || this.#inventoryMetadataUnsupported) return;
+		if (this.#inventorySyncInflight) return;
+		void this.syncInventoryMetadata().catch(() => {});
+	}
+
+	async syncInventoryMetadata(): Promise<Readonly<CredentialInventoryMetadataState>> {
+		if (this.#inventoryMetadataUnsupported) return this.getInventoryMetadataState();
+		if (this.#inventoryState.capability === "supported" && this.#inventoryMetadataGeneration === this.#generation) {
+			return this.getInventoryMetadataState();
+		}
+		if (this.#inventorySyncInflight) return this.#inventorySyncInflight;
+		const inflight = this.#syncInventoryMetadata().finally(() => {
+			this.#inventorySyncInflight = undefined;
+		});
+		this.#inventorySyncInflight = inflight;
+		return inflight;
+	}
+
+	async #syncInventoryMetadata(): Promise<Readonly<CredentialInventoryMetadataState>> {
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			try {
+				const metadata = await this.#client.fetchCredentialMetadata();
+				if (metadata.generation !== this.#generation) {
+					if (attempt === 0) {
+						await this.refreshSnapshot().catch(() => {});
+						continue;
+					}
+					this.#inventoryMetadata.clear();
+					this.#inventoryMetadataGeneration = -1;
+					this.#setInventoryState("mismatch", this.#generation, {
+						status: "mismatch",
+						reason: "credential metadata generation mismatch",
+						generation: this.#generation,
+					});
+					return this.getInventoryMetadataState();
+				}
+				this.#inventoryMetadata = new Map(metadata.credentials.map(record => [record.id, { ...record }]));
+				this.#inventoryMetadataGeneration = metadata.generation;
+				this.#setInventoryState("supported", metadata.generation);
+				this.#reconcileUsagePresentations();
+				return this.getInventoryMetadataState();
+			} catch (error) {
+				if (error instanceof AuthBrokerCredentialMetadataUnsupportedError || isErrorStatus(error, 404)) {
+					this.#inventoryMetadataUnsupported = true;
+					this.#inventoryMetadata.clear();
+					this.#inventoryMetadataGeneration = -1;
+					this.#setInventoryState("unsupported", this.#generation, {
+						status: "unsupported",
+						reason: "credential metadata endpoint unsupported; disabled rows unavailable",
+						generation: this.#generation,
+					});
+					return this.getInventoryMetadataState();
+				}
+				this.#setInventoryState("failed", this.#generation, {
+					status: "failed",
+					reason: "credential metadata sync failed; retry explicitly",
+					generation: this.#generation,
+				});
+				return this.getInventoryMetadataState();
+			}
+		}
+		this.#setInventoryState("mismatch", this.#generation, {
+			status: "mismatch",
+			reason: "credential metadata generation mismatch",
+			generation: this.#generation,
+		});
+		return this.getInventoryMetadataState();
 	}
 
 	async #runBackground(): Promise<void> {
@@ -211,16 +408,23 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			index === -1
 				? [...this.#snapshot.credentials, entry]
 				: this.#snapshot.credentials.map((candidate, i) => (i === index ? entry : candidate));
-		this.#snapshot = { ...this.#snapshot, generation, serverNowMs, refresher, credentials };
-		this.#generation = generation;
-		this.#snapshotReceivedAt = Date.now();
+		this.#applySnapshot({ ...this.#snapshot, generation, serverNowMs, refresher, credentials }, generation);
 	}
 
 	#removeStreamCredential(id: number, refresher: RefresherSchedule, generation: number, serverNowMs: number): void {
 		const credentials = this.#snapshot.credentials.filter(entry => entry.id !== id);
-		this.#snapshot = { ...this.#snapshot, generation, serverNowMs, refresher, credentials };
-		this.#generation = generation;
-		this.#snapshotReceivedAt = Date.now();
+		this.#applySnapshot({ ...this.#snapshot, generation, serverNowMs, refresher, credentials }, generation);
+	}
+
+	/**
+	 * Payload-free inventory view. This method never performs network I/O; metadata
+	 * rows appear only after an explicit or background metadata synchronization for
+	 * the current snapshot generation.
+	 */
+	listCredentialInventory(provider?: string): CredentialInventoryRecord[] {
+		return this.#buildInventoryRecords()
+			.filter(record => provider === undefined || record.provider === provider)
+			.map(record => ({ ...record }));
 	}
 
 	/** Re-hydrate the in-memory snapshot from the broker. */
@@ -257,19 +461,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		}
 	}
 
-	deleteAuthCredential(id: number, disabledCause: string): void {
-		this.#removeCredentialById(id);
-		// Fire-and-forget: tell the broker to persist the disable.
-		this.#client.disableCredential(id, disabledCause).catch(error => {
-			logger.warn("auth-broker disable propagation failed", { id, error: String(error) });
-		});
+	deleteAuthCredential(_id: number, _disabledCause: string): void {
+		throw new Error("Remote auth-broker credentials can only be disabled on the broker host");
 	}
 
-	tryDisableAuthCredentialIfMatches(id: number, _expectedData: string, disabledCause: string): boolean {
-		const found = this.#snapshot.credentials.find(entry => entry.id === id);
-		if (!found) return false;
-		this.deleteAuthCredential(id, disabledCause);
-		return true;
+	tryDisableAuthCredentialIfMatches(_id: number, _expectedData: string, _disabledCause: string): boolean {
+		return false;
 	}
 
 	async waitForFreshSnapshot(maxWaitMs: number, opts: { signal?: AbortSignal } = {}): Promise<boolean> {
@@ -362,47 +559,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	): Promise<StoredAuthCredential[]> {
 		const existing = this.listAuthCredentials(provider);
 		for (const entry of existing) {
-			try {
-				await this.#client.disableCredential(entry.id, "replaced by newer credential");
-			} catch (error) {
-				logger.warn("auth-broker disable during replace failed", {
-					provider,
-					id: entry.id,
-					error: String(error),
-				});
-			}
+			await this.#client.disableCredential(entry.id, "replaced by newer credential");
 		}
-		// Snapshot reflects the disables before we add the new rows so a concurrent
-		// reader cannot momentarily see old + new together for the same provider.
-		this.#removeProviderEntries(provider);
+		await this.refreshSnapshot();
 		for (const credential of credentials) {
 			const { entries } = await this.#client.uploadCredential(provider, credential);
 			this.#applyProviderEntries(provider, entries);
 		}
 		this.#maybeRefreshSnapshot("replace");
 		return this.listAuthCredentials(provider);
-	}
-
-	/**
-	 * Logout: disable every active credential for the provider on the broker,
-	 * then drop them from the local snapshot. Refresh fetches the authoritative
-	 * post-state in the background.
-	 */
-	async deleteAuthCredentialsRemote(provider: string, disabledCause: string): Promise<void> {
-		const existing = this.listAuthCredentials(provider);
-		for (const entry of existing) {
-			try {
-				await this.#client.disableCredential(entry.id, disabledCause);
-			} catch (error) {
-				logger.warn("auth-broker disable during delete failed", {
-					provider,
-					id: entry.id,
-					error: String(error),
-				});
-			}
-		}
-		this.#removeProviderEntries(provider);
-		this.#maybeRefreshSnapshot("delete");
 	}
 
 	#applyProviderEntries(provider: string, entries: AuthCredentialSnapshotEntry[]): void {
@@ -423,16 +588,6 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const credentials = [...this.#snapshot.credentials];
 		credentials[index] = incoming;
 		this.#snapshot = { ...this.#snapshot, credentials };
-	}
-
-	#removeProviderEntries(provider: string): void {
-		const next = this.#snapshot.credentials.filter(entry => entry.provider !== provider);
-		this.#snapshot = { ...this.#snapshot, credentials: next };
-	}
-
-	#removeCredentialById(id: number): void {
-		const next = this.#snapshot.credentials.filter(entry => entry.id !== id);
-		this.#snapshot = { ...this.#snapshot, credentials: next };
 	}
 
 	/**
@@ -547,6 +702,53 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		return this.#raceWithSignal(this.#loadUsageReports(), signal);
 	}
 
+	/** Synchronous, zero-network usage presentation read. */
+	peekCachedUsagePresentation(provider: Provider, credentialId: number): CachedUsagePresentation | undefined {
+		const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+		if (!entry || entry.provider !== provider) return undefined;
+		const cached = this.#usagePresentations.get(credentialId);
+		if (!cached) return undefined;
+		const now = Date.now();
+		if (cached.retainUntil <= now) {
+			this.#usagePresentations.delete(credentialId);
+			return undefined;
+		}
+		const identityDigest = this.#identityDigestForEntry(entry);
+		if (
+			cached.provider !== provider ||
+			cached.inventoryGeneration !== this.#generation ||
+			cached.identityDigest !== identityDigest
+		) {
+			this.#usagePresentations.delete(credentialId);
+			return undefined;
+		}
+		return cloneUsagePresentation(cached);
+	}
+
+	/** Record a safe usage observation after an explicit broker usage/check call. */
+	recordUsagePresentation(observation: CachedUsagePresentation): void {
+		if (!Number.isInteger(observation.credentialId)) return;
+		if (!Number.isFinite(observation.inventoryGeneration) || observation.inventoryGeneration !== this.#generation)
+			return;
+		if (!Number.isFinite(observation.fetchedAt) || !Number.isFinite(observation.freshUntil)) return;
+		if (!Number.isFinite(observation.retainUntil) || observation.retainUntil <= observation.fetchedAt) return;
+		const entry = this.#snapshot.credentials.find(candidate => candidate.id === observation.credentialId);
+		if (!entry || entry.provider !== observation.provider) return;
+		if (this.#identityDigestForEntry(entry) !== observation.identityDigest) return;
+		const usage = safePresentationUsageReport(observation.usage);
+		const stored = cloneUsagePresentation({
+			credentialId: observation.credentialId,
+			provider: observation.provider,
+			inventoryGeneration: observation.inventoryGeneration,
+			identityDigest: observation.identityDigest,
+			usage,
+			fetchedAt: observation.fetchedAt,
+			freshUntil: Math.min(observation.freshUntil, observation.fetchedAt + PRESENTATION_FRESH_MS),
+			retainUntil: Math.min(observation.retainUntil, observation.fetchedAt + PRESENTATION_RETENTION_MS),
+		});
+		this.#usagePresentations.set(observation.credentialId, stored);
+	}
+
 	/**
 	 * Per-credential usage hook consumed by `AuthStorage.#getUsageReport`. Pulls
 	 * the aggregate broker `/v1/usage` once and serves all callers from the
@@ -594,6 +796,58 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		});
 	}
 
+	#identityDigestForEntry(entry: SnapshotEntry): string {
+		const credential = entry.credential;
+		const identity =
+			credential.type === "oauth"
+				? {
+						accountId: credential.accountId ?? null,
+						email: credential.email?.trim().toLowerCase() ?? null,
+						projectId: credential.projectId ?? null,
+						enterpriseUrl: credential.enterpriseUrl ?? null,
+						mcpBinding: credential.mcpBinding ?? null,
+					}
+				: { type: credential.type };
+		return createHash("sha256")
+			.update(JSON.stringify({ id: entry.id, provider: entry.provider, type: credential.type, identity }))
+			.digest("hex");
+	}
+
+	#reconcileUsagePresentations(): void {
+		for (const [credentialId, cached] of this.#usagePresentations) {
+			const entry = this.#snapshot.credentials.find(candidate => candidate.id === credentialId);
+			if (
+				!entry ||
+				entry.provider !== cached.provider ||
+				this.#identityDigestForEntry(entry) !== cached.identityDigest
+			) {
+				this.#usagePresentations.delete(credentialId);
+				continue;
+			}
+			this.#usagePresentations.set(credentialId, { ...cached, inventoryGeneration: this.#generation });
+		}
+	}
+
+	#recordUsageReports(reports: UsageReport[], epoch: number): void {
+		if (this.#usageCacheEpoch !== epoch) return;
+		for (const entry of this.#snapshot.credentials) {
+			if (entry.credential.type !== "oauth") continue;
+			const report = matchUsageReport(reports, entry.provider, entry.credential);
+			if (!report) continue;
+			const fetchedAt = Number.isFinite(report.fetchedAt) ? report.fetchedAt : Date.now();
+			this.recordUsagePresentation({
+				credentialId: entry.id,
+				provider: entry.provider,
+				inventoryGeneration: this.#generation,
+				identityDigest: this.#identityDigestForEntry(entry),
+				usage: safePresentationUsageReport(report),
+				fetchedAt,
+				freshUntil: fetchedAt + PRESENTATION_FRESH_MS,
+				retainUntil: fetchedAt + PRESENTATION_RETENTION_MS,
+			});
+		}
+	}
+
 	#loadUsageReports(): Promise<UsageReport[] | null> {
 		const cached = this.#usageCache;
 		if (cached && Date.now() - cached.fetchedAt < USAGE_CACHE_TTL_MS) {
@@ -604,7 +858,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const inflight = this.#client
 			.fetchUsage()
 			.then(body => {
-				if (this.#usageCacheEpoch === epoch) this.#usageCache = { reports: body.reports, fetchedAt: Date.now() };
+				if (this.#usageCacheEpoch === epoch) {
+					this.#usageCache = { reports: body.reports, fetchedAt: Date.now() };
+					this.#recordUsageReports(body.reports, epoch);
+				}
 				return body.reports;
 			})
 			.catch(error => {
@@ -623,7 +880,52 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		this.#closed = true;
 		this.#backgroundAbort.abort();
 		this.#cache.clear();
+		this.#usagePresentations.clear();
+		this.#inventoryMetadata.clear();
+		this.#inventorySyncInflight = undefined;
 	}
+}
+
+function isErrorStatus(error: unknown, status: number): boolean {
+	return (
+		typeof error === "object" &&
+		error !== null &&
+		"status" in error &&
+		(error as { status?: unknown }).status === status
+	);
+}
+
+function snapshotIdentityLabel(entry: SnapshotEntry): string | null {
+	if (entry.credential.type !== "oauth") return null;
+	return entry.credential.email ?? entry.credential.accountId ?? entry.credential.projectId ?? null;
+}
+
+function safePresentationUsageReport(report: UsageReport): SafeUsageReport {
+	const { raw: _raw, metadata: _metadata, ...safe } = report;
+	return {
+		...safe,
+		limits: safe.limits.map(limit => {
+			const { accountId: _accountId, projectId: _projectId, orgId: _orgId, ...scope } = limit.scope;
+			return { ...limit, scope };
+		}),
+	};
+}
+
+function cloneUsagePresentation(observation: CachedUsagePresentation): CachedUsagePresentation {
+	return {
+		...observation,
+		usage: {
+			...observation.usage,
+			limits: observation.usage.limits.map(limit => ({
+				...limit,
+				scope: { ...limit.scope },
+				window: limit.window ? { ...limit.window } : undefined,
+				amount: { ...limit.amount },
+				notes: limit.notes ? [...limit.notes] : undefined,
+			})),
+			metadata: observation.usage.metadata ? { ...observation.usage.metadata } : undefined,
+		},
+	};
 }
 
 /**

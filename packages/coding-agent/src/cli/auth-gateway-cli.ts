@@ -30,7 +30,7 @@ import {
 } from "@gajae-code/ai/core";
 import { getConfigRootDir, isEnoent, VERSION } from "@gajae-code/utils";
 import chalk from "chalk";
-import { type AuthBrokerClientConfig, resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import { type AuthBrokerClientConfig, resolveStartupAuthConfig } from "../session/startup-auth-config";
 
 export type AuthGatewayAction = "serve" | "token" | "status" | "check";
 
@@ -129,7 +129,7 @@ async function fetchBrokerSnapshot(client: AuthBrokerClient): Promise<SnapshotRe
 }
 
 async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
-	const brokerConfig = await resolveAuthBrokerConfig();
+	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	if (!brokerConfig) {
 		throw new Error(
 			"`gjc auth-gateway serve` requires GJC_AUTH_BROKER_URL (or `auth.broker.url`/`auth.broker.token` in config.yml). The gateway is itself a broker client.",
@@ -243,7 +243,7 @@ async function runToken(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 
 async function runStatus(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	const token = await readToken();
-	const brokerConfig = await resolveAuthBrokerConfig();
+	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	const tokenFile = getTokenFilePath();
 	if (!brokerConfig) {
 		const status = {
@@ -350,7 +350,7 @@ export async function runAuthGatewayCommand(cmd: AuthGatewayCommandArgs): Promis
  * dedicated diagnostic is the only way to see which credentials failed.
  */
 async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
-	const brokerConfig = await resolveAuthBrokerConfig();
+	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	if (!brokerConfig) {
 		throw new Error(
 			"`gjc auth-gateway check` requires GJC_AUTH_BROKER_URL (or `auth.broker.url`/`auth.broker.token` in config.yml). It probes the same credentials the gateway would serve.",

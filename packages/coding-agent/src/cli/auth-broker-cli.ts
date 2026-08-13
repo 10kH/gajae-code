@@ -28,13 +28,14 @@ import {
 	listProvidersWithEnvKey,
 	type OAuthCredential,
 	type OAuthProvider,
+	resolveOAuthStorageProvider,
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "@gajae-code/ai/core";
 import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, isEnoent, logger, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
-import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import { resolveStartupAuthConfig } from "../session/startup-auth-config";
 
 export type AuthBrokerAction = "serve" | "token" | "login" | "logout" | "status" | "import" | "migrate";
 
@@ -133,7 +134,7 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	logger.info("auth-broker bearer token loaded", { path: getTokenFilePath(), mode: "0600" });
 
 	const credentialDisabledUnsub = storage.onCredentialDisabled((event: CredentialDisabledEvent) => {
-		logger.warn("auth-broker credential disabled", { ...event });
+		logger.warn("auth-broker credential disabled", { provider: event.provider });
 	});
 
 	const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
@@ -241,10 +242,11 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	if (!providerArg) {
 		throw new Error("Usage: gjc auth-broker logout <provider>");
 	}
+	const provider = resolveOAuthStorageProvider(providerArg);
 	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 	try {
-		store.deleteAuthCredentialsForProvider(providerArg, "logged out by user");
-		process.stdout.write(`Logged out of ${providerArg}\n`);
+		store.deleteAuthCredentialsForProvider(provider, "logged out by user");
+		process.stdout.write(`Logged out of ${provider}\n`);
 	} finally {
 		store.close();
 	}
@@ -439,7 +441,7 @@ async function runImport(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 		return;
 	}
 
-	const brokerConfig = await resolveAuthBrokerConfig();
+	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	if (brokerConfig) {
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		for (const entry of entries) {
@@ -531,7 +533,7 @@ function brokerAlreadyHas(existing: Map<string, Set<string>>, provider: string, 
 }
 
 async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
-	const brokerConfig = await resolveAuthBrokerConfig();
+	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	if (!brokerConfig) {
 		throw new Error(
 			"GJC_AUTH_BROKER_URL must be set (or `auth.broker.url` in config.yml). `migrate` uploads local credentials to a configured broker.",
@@ -685,7 +687,7 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 }
 
 async function runStatus(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
-	const cfg = await resolveAuthBrokerConfig();
+	const cfg = (await resolveStartupAuthConfig()).broker;
 	if (!cfg) {
 		const message = "No auth-broker configured (set GJC_AUTH_BROKER_URL to enable).";
 		if (flags.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: "not_configured" })}\n`);

@@ -184,6 +184,113 @@ export interface StoredAuthCredential {
 	provider: string;
 	credential: AuthCredential;
 	disabledCause: string | null;
+	/** Monotonic local row revision used by optimistic hard-removal actions. */
+	revision?: number;
+}
+
+/**
+ * Payload-free inventory projection used by account-management and presentation
+ * surfaces. This deliberately has no credential/token fields; `listAuthCredentials`
+ * remains the active full-fidelity selection contract.
+ */
+export interface CredentialInventoryRecord {
+	id: number;
+	provider: string;
+	credentialKind: "oauth" | "api_key";
+	identityLabel: string | null;
+	disabled: boolean;
+	disabledCause: string | null;
+}
+
+/** Safe usage observation supplied by a remote store's presentation cache. */
+export interface CachedUsagePresentation {
+	credentialId: number;
+	provider: string;
+	inventoryGeneration: number;
+	identityDigest: string;
+	usage: SafeUsageReport;
+	fetchedAt: number;
+	freshUntil: number;
+	retainUntil: number;
+}
+
+/** Opaque local action target for an all-or-nothing OAuth hard removal. */
+export interface CredentialRemovalTarget {
+	id: number;
+	provider: string;
+	expectedRevision: number;
+}
+
+export type AuthCredentialHardRemovalResult =
+	| { kind: "removed"; ids: readonly number[] }
+	| { kind: "conflict"; currentIds: readonly number[] };
+
+/** Usage report projection safe to cross a presentation boundary. */
+export type SafeUsageReport = Omit<UsageReport, "raw">;
+
+export type CachedUsageFreshness = "fresh" | "stale-last-good";
+
+export interface CachedUsageReport {
+	report: SafeUsageReport;
+	fetchedAt: number;
+	freshUntil: number;
+	retainUntil: number;
+	freshness: CachedUsageFreshness;
+}
+
+export type CachedCredentialHealthStatus = "ok" | "failed" | "unverifiable" | "unknown";
+
+export interface CachedCredentialHealth {
+	status: CachedCredentialHealthStatus;
+	reason: string | null;
+	checkedAt?: number;
+	retainUntil?: number;
+}
+
+/** Safe result from an explicit API-key probe whose key bytes are invocation-only. */
+export interface ApiKeyCredentialCheckResult {
+	provider: string;
+	type: "api_key";
+	ok: boolean | null;
+	reason?: string;
+	report?: SafeUsageReport;
+}
+
+/** Typed failure raised when an OAuth-only selector cannot be applied. */
+export type OAuthCredentialSelectorFailureReason =
+	| "api-key-row"
+	| "api-key-provider"
+	| "override-active"
+	| "not-found"
+	| "disabled"
+	| "ambiguous"
+	| "gateway-managed";
+
+export class OAuthCredentialSelectorError extends Error {
+	readonly reason: OAuthCredentialSelectorFailureReason;
+	readonly provider: string;
+	readonly selector: AuthCredentialSelector;
+	readonly candidateIds: readonly number[];
+
+	constructor(
+		reason: OAuthCredentialSelectorFailureReason,
+		provider: string,
+		selector: AuthCredentialSelector,
+		message: string,
+		candidateIds: readonly number[] = [],
+	) {
+		super(message);
+		this.name = "OAuthCredentialSelectorError";
+		this.reason = reason;
+		this.provider = provider;
+		this.selector = selector;
+		this.candidateIds = candidateIds;
+	}
+}
+
+export interface OAuthPinTarget {
+	credentialId: number;
+	canonicalSelector: AuthCredentialSelector;
 }
 
 /**
@@ -215,16 +322,23 @@ export interface CredentialHealthResult {
 	ok: boolean | null;
 	/** Failure / unverifiable reason; absent when `ok === true`. */
 	reason?: string;
-	/** Probe usage report (raw payload stripped) when `ok === true`. */
-	report?: Omit<UsageReport, "raw">;
+	report?: SafeUsageReport;
 }
 
 export interface CheckCredentialsOptions {
 	signal?: AbortSignal;
+	provider?: string;
 	/** Per-credential probe timeout (ms). Defaults to the configured usage request timeout. */
 	timeoutMs?: number;
 	/** Provider → base URL override, same shape as {@link AuthStorage.fetchUsageReports}. */
 	baseUrlResolver?: (provider: Provider) => string | undefined;
+}
+
+/** Options for the explicit, invocation-only API-key probe. */
+export interface ApiKeyCredentialCheckOptions {
+	signal?: AbortSignal;
+	timeoutMs?: number;
+	baseUrl?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -316,6 +430,15 @@ export type OAuthRefreshLeaseClaim =
 export interface AuthCredentialStore {
 	close(): void;
 	listAuthCredentials(provider?: string): StoredAuthCredential[];
+	/** Payload-free account inventory; active and soft-disabled rows are included. */
+	listCredentialInventory?(provider?: string): CredentialInventoryRecord[];
+	/** Local opaque removal targets; remote stores may omit this capability. */
+	listCredentialRemovalTargets?(provider?: string): CredentialRemovalTarget[];
+	/** Transactional local hard removal; remote stores must reject this capability. */
+	removeAuthCredentialsHard?(
+		provider: string,
+		targets: readonly CredentialRemovalTarget[],
+	): AuthCredentialHardRemovalResult;
 	updateAuthCredential(id: number, credential: AuthCredential): void;
 	deleteAuthCredential(id: number, disabledCause: string): void;
 	tryDisableAuthCredentialIfMatches(id: number, expectedData: string, disabledCause: string): boolean;
@@ -388,6 +511,10 @@ export interface AuthCredentialStore {
 	 * `signal` propagates the agent's cancel down to the broker fetch.
 	 */
 	fetchUsageReports?(signal?: AbortSignal): Promise<UsageReport[] | null>;
+	/** Synchronous, zero-network usage presentation peek. */
+	peekCachedUsagePresentation?(provider: Provider, credentialId: number): CachedUsagePresentation | undefined;
+	/** Record a safe usage observation after an explicit fetch/check. */
+	recordUsagePresentation?(observation: CachedUsagePresentation): void;
 	/**
 	 * Optional store-supplied per-credential usage report lookup. When present,
 	 * `AuthStorage` consults this before its own per-credential upstream fetch
@@ -432,12 +559,6 @@ export interface AuthCredentialStore {
 	 * `replaceAuthCredentialsForProvider`.
 	 */
 	replaceAuthCredentialsRemote?(provider: string, credentials: AuthCredential[]): Promise<StoredAuthCredential[]>;
-	/**
-	 * Optional async write hook for clearing every credential for a provider
-	 * (logout). When present, `AuthStorage.remove` routes through this instead
-	 * of the sync `deleteAuthCredentialsForProvider`.
-	 */
-	deleteAuthCredentialsRemote?(provider: string, disabledCause: string): Promise<void>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -903,6 +1024,26 @@ function isAbortSignalOption(
 	return typeof value === "object" && value !== null && "aborted" in value && "addEventListener" in value;
 }
 
+const HEALTH_CACHE_PREFIX = "account_health:v1:local:row:";
+const PRESENTATION_RETENTION_MS = 24 * 60 * 60_000;
+
+function safeUsageReport(report: UsageReport): SafeUsageReport {
+	const { raw: _raw, ...safe } = report;
+	return safe;
+}
+
+function scrubHealthReason(reason: unknown, secrets: readonly string[] = []): string {
+	let value = reason instanceof Error ? reason.message : String(reason);
+	for (const secret of secrets) {
+		if (secret.length > 0) value = value.split(secret).join("[redacted]");
+	}
+	value = value.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]");
+	value = value.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]");
+	value = value.replace(/[\r\n\t ]+/g, " ").trim();
+	if (value.length > 256) value = `${value.slice(0, 253)}...`;
+	return value || "credential check failed";
+}
+
 function requiresOpenAICodexProModel(provider: string, modelId: string | undefined): boolean {
 	return provider === "openai-codex" && typeof modelId === "string" && modelId.includes("-spark");
 }
@@ -1070,8 +1211,14 @@ export class AuthStorage {
 	#runtimeOverrides: Map<string, string> = new Map();
 	#configOverrides: Map<string, string> = new Map();
 	#runtimeCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
-	/** Soft runtime credential preference per provider (CLI --prefer-credential); quota/rate-limit failures rotate away from it. */
+	/** Soft runtime credential preference per provider; quota failures may rotate away from it. */
 	#runtimePreferredCredentialSelectors: Map<string, AuthCredentialSelector> = new Map();
+	/** Credential selectors explicitly attached to a credential session scope. */
+	#sessionCredentialSelectors: Map<string, Map<string, AuthCredentialSelector>> = new Map();
+	/** Explicit AUTO masks suppress both scoped and process-global selectors for a scope/provider. */
+	#sessionCredentialAutoMasks: Map<string, Set<string>> = new Map();
+	/** Reference counts for sessions sharing one credential scope (top-level + subagents). */
+	#credentialScopeLeases: Map<string, number> = new Map();
 	/** Tracks next credential index per provider:type key for round-robin distribution (non-session use). */
 	#providerRoundRobinIndex: Map<string, number> = new Map();
 	/** Tracks the last used credential per provider for a session (used for rate-limit switching). */
@@ -1166,6 +1313,10 @@ export class AuthStorage {
 	close(): void {
 		if (this.#closed) return;
 		this.#closed = true;
+		this.#credentialScopeLeases.clear();
+		this.#sessionCredentialSelectors.clear();
+		this.#sessionCredentialAutoMasks.clear();
+		this.#sessionLastCredential.clear();
 		this.#store.close();
 	}
 
@@ -1189,7 +1340,7 @@ export class AuthStorage {
 		const evidenceApiKey = resolvedApiKey;
 		let selectedCredential: ({ index: number } & StoredCredential) | undefined;
 		try {
-			selectedCredential = this.#resolveSelectedStoredCredential(provider);
+			selectedCredential = this.#resolveSelectedStoredCredential(provider, undefined, undefined);
 		} catch {
 			return crypto
 				.createHash("sha256")
@@ -1321,6 +1472,226 @@ export class AuthStorage {
 		this.#bumpGeneration("set-runtime-credential-selector", provider);
 	}
 
+	/** Acquire a reference-counted credential scope for a session or shared subagent scope. */
+	acquireCredentialScope(scopeId: string): void {
+		const scope = scopeId.trim();
+		if (!scope) throw new Error("Credential scope id must not be empty");
+		this.#credentialScopeLeases.set(scope, (this.#credentialScopeLeases.get(scope) ?? 0) + 1);
+	}
+
+	/** Whether a credential scope already has at least one live owner. */
+	hasCredentialScopeLease(scopeId: string): boolean {
+		const scope = scopeId.trim();
+		return scope.length > 0 && (this.#credentialScopeLeases.get(scope) ?? 0) > 0;
+	}
+
+	/** Release one credential-scope lease; final release clears only that scope's derived state. */
+	releaseCredentialScope(scopeId: string): void {
+		const scope = scopeId.trim();
+		if (!scope) return;
+		const leases = this.#credentialScopeLeases.get(scope);
+		if (leases === undefined) return;
+		if (leases > 1) {
+			this.#credentialScopeLeases.set(scope, leases - 1);
+			return;
+		}
+		this.#credentialScopeLeases.delete(scope);
+		this.#sessionCredentialSelectors.delete(scope);
+		this.#sessionCredentialAutoMasks.delete(scope);
+		for (const [provider, sessions] of this.#sessionLastCredential) {
+			if (!sessions.delete(scope)) continue;
+			if (sessions.size === 0) this.#sessionLastCredential.delete(provider);
+		}
+	}
+
+	/** Set the selector derived from a durable session pin or a session seed. */
+	setSessionCredentialSelector(scopeId: string, provider: string, selector: AuthCredentialSelector): void {
+		const scope = scopeId.trim();
+		if (!scope) throw new Error("Credential scope id must not be empty");
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		this.#assertCredentialSelectorUsable(storageProvider, selector);
+		const selectors = this.#sessionCredentialSelectors.get(scope) ?? new Map<string, AuthCredentialSelector>();
+		selectors.set(storageProvider, selector);
+		this.#sessionCredentialSelectors.set(scope, selectors);
+		this.#sessionCredentialAutoMasks.get(scope)?.delete(storageProvider);
+		this.#bumpGeneration("set-session-credential-selector", storageProvider);
+	}
+
+	/** Explicitly mask persistent/process-global selection and return the provider to AUTO for one scope. */
+	setSessionCredentialAuto(provider: string, scopeId: string): void {
+		const scope = scopeId.trim();
+		if (!scope) throw new Error("Credential scope id must not be empty");
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		this.#sessionCredentialSelectors.get(scope)?.delete(storageProvider);
+		const masks = this.#sessionCredentialAutoMasks.get(scope) ?? new Set<string>();
+		masks.add(storageProvider);
+		this.#sessionCredentialAutoMasks.set(scope, masks);
+		this.#bumpGeneration("set-session-credential-auto", storageProvider);
+	}
+
+	/** Clear a scope's explicit selector and AUTO mask, restoring normal precedence. */
+	clearSessionCredentialSelector(provider: string, scopeId: string): void {
+		const scope = scopeId.trim();
+		if (!scope) return;
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const selectors = this.#sessionCredentialSelectors.get(scope);
+		const masks = this.#sessionCredentialAutoMasks.get(scope);
+		const changed = Boolean(selectors?.delete(storageProvider) || masks?.delete(storageProvider));
+		if (selectors?.size === 0) this.#sessionCredentialSelectors.delete(scope);
+		if (masks?.size === 0) this.#sessionCredentialAutoMasks.delete(scope);
+		if (changed) this.#bumpGeneration("clear-session-credential-selector", storageProvider);
+	}
+
+	/** Whether the effective selection for a scope is explicitly pinned (AUTO masks are not pins). */
+	hasSessionCredentialSelector(provider: string, scopeId?: string): boolean {
+		if (!scopeId) return false;
+		return this.#getCredentialSelector(provider, undefined, scopeId) !== undefined;
+	}
+
+	/** Whether this scope explicitly masks provider pins and uses AUTO ranking. */
+	hasSessionCredentialAuto(provider: string, scopeId?: string): boolean {
+		if (!scopeId) return false;
+		return this.#sessionCredentialAutoMasks.get(scopeId)?.has(resolveOAuthStorageProvider(provider)) === true;
+	}
+
+	/** Resolve the effective selector precedence for a provider/scope. */
+	resolveEffectiveCredentialSelector(
+		provider: string,
+		scopeId?: string,
+		explicitSelector?: AuthCredentialSelector,
+	): AuthCredentialSelector | undefined {
+		return this.#getCredentialSelector(
+			provider,
+			explicitSelector ? { credentialSelector: explicitSelector } : undefined,
+			scopeId,
+		);
+	}
+
+	/** Validate and canonicalize an OAuth-only selector for account pinning. */
+	resolveOAuthPinTarget(provider: string, selector: AuthCredentialSelector): OAuthPinTarget {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (
+			this.#runtimeOverrides.has(storageProvider) ||
+			this.#configOverrides.has(storageProvider) ||
+			getEnvApiKey(storageProvider)
+		) {
+			throw new OAuthCredentialSelectorError(
+				"override-active",
+				storageProvider,
+				selector,
+				`Credential selector ${this.#formatCredentialSelector(selector)} cannot be used for ${storageProvider} while an API-key override is active; remove the override or choose AUTO`,
+			);
+		}
+		const allRows = this.#store.listCredentialInventory?.(storageProvider) ?? [];
+		const matchingCredentials = this.#getStoredCredentials(storageProvider).filter(entry =>
+			this.#credentialMatchesSelector(entry, selector),
+		);
+		const matchingIds = new Set(matchingCredentials.map(entry => entry.id));
+		const matchingRows = allRows.filter(
+			row => matchingIds.has(row.id) && !row.disabled && row.credentialKind === "oauth",
+		);
+		if (matchingRows.length === 0) {
+			const providerRows = allRows.filter(row => row.provider === storageProvider);
+			if (
+				selector.kind === "id" &&
+				providerRows.some(row => String(row.id) === selector.value && row.credentialKind === "api_key")
+			) {
+				throw new OAuthCredentialSelectorError(
+					"api-key-row",
+					storageProvider,
+					selector,
+					`Credential ${selector.value} is an API-key row and cannot be pinned; choose an OAuth account`,
+				);
+			}
+			if (providerRows.length > 0 && providerRows.every(row => row.credentialKind === "api_key")) {
+				throw new OAuthCredentialSelectorError(
+					"api-key-provider",
+					storageProvider,
+					selector,
+					`Provider ${storageProvider} has no OAuth credentials to pin`,
+				);
+			}
+			const disabled = providerRows.find(
+				row => row.disabled && this.#credentialMatchesInventorySelector(row, selector),
+			);
+			if (disabled) {
+				throw new OAuthCredentialSelectorError(
+					"disabled",
+					storageProvider,
+					selector,
+					`Credential ${this.#formatCredentialSelector(selector)} is disabled${disabled.disabledCause ? `: ${disabled.disabledCause}` : ""}; run /login ${storageProvider} or choose an active account`,
+				);
+			}
+			throw new OAuthCredentialSelectorError(
+				"not-found",
+				storageProvider,
+				selector,
+				`No active OAuth credential found for ${storageProvider} matching ${this.#formatCredentialSelector(selector)}; run /login ${storageProvider} or choose AUTO`,
+			);
+		}
+		if (matchingRows.length > 1) {
+			throw new OAuthCredentialSelectorError(
+				"ambiguous",
+				storageProvider,
+				selector,
+				`Selector ${this.#formatCredentialSelector(selector)} matches multiple OAuth credentials; choose id:<row-id>`,
+				matchingRows.map(row => row.id),
+			);
+		}
+		const target = matchingRows[0];
+		if (!target || target.disabled || target.credentialKind !== "oauth") {
+			throw new OAuthCredentialSelectorError(
+				"disabled",
+				storageProvider,
+				selector,
+				`Credential ${this.#formatCredentialSelector(selector)} is not an active OAuth credential; choose an active account`,
+			);
+		}
+		return { credentialId: target.id, canonicalSelector: { kind: "id", value: String(target.id) } };
+	}
+
+	/** Return all local inventory rows, including soft-disabled metadata, without payloads. */
+	listCredentialInventory(provider?: string): CredentialInventoryRecord[] {
+		return this.#store.listCredentialInventory?.(provider) ?? [];
+	}
+
+	/** Return local OAuth hard-removal action targets, including disabled rows. */
+	listCredentialRemovalTargets(provider?: string): CredentialRemovalTarget[] {
+		return this.#store.listCredentialRemovalTargets?.(provider) ?? [];
+	}
+
+	/** Remove selected local OAuth rows atomically; conflict leaves all rows intact. */
+	removeAuthCredentialsHard(
+		provider: string,
+		targets: readonly CredentialRemovalTarget[],
+	): AuthCredentialHardRemovalResult {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const result = this.#store.removeAuthCredentialsHard?.(storageProvider, targets) ?? {
+			kind: "conflict",
+			currentIds: [],
+		};
+		if (result.kind !== "removed") return result;
+		const removed = new Set(result.ids);
+		const previousEntries = this.#getStoredCredentials(storageProvider);
+		const entries = previousEntries.filter(entry => !removed.has(entry.id));
+		this.#setStoredCredentials(storageProvider, entries);
+		this.#usageRequestInFlight.clear();
+		this.#usageReportsInFlight.clear();
+		this.#usageCache.deletePrefix?.(`report:${storageProvider}:`);
+		for (const [scopeId, selectors] of this.#sessionCredentialSelectors) {
+			const selector = selectors.get(storageProvider);
+			const selected = selector
+				? previousEntries.find(entry => this.#credentialMatchesSelector(entry, selector))
+				: undefined;
+			if (selected && removed.has(selected.id)) this.clearSessionCredentialSelector(storageProvider, scopeId);
+		}
+		for (const [sessionId, sticky] of this.#sessionLastCredential.get(storageProvider) ?? []) {
+			if (removed.has(previousEntries[sticky.index]?.id ?? -1))
+				this.#clearSessionCredential(storageProvider, sessionId);
+		}
+		this.#resetProviderAssignments(storageProvider);
+		return result;
+	}
 	/**
 	 * Remove a runtime credential selector.
 	 */
@@ -1329,6 +1700,31 @@ export class AuthStorage {
 		if (this.#runtimeCredentialSelectors.delete(storageProvider)) {
 			this.#bumpGeneration("remove-runtime-credential-selector", provider);
 		}
+	}
+
+	/** Whether a provider currently has a soft runtime credential preference. */
+	hasRuntimePreferredCredentialSelector(provider: string): boolean {
+		return this.#runtimePreferredCredentialSelectors.has(resolveOAuthStorageProvider(provider));
+	}
+
+	/** Resolve an unqualified preferred selector to the single active OAuth provider it matches. */
+	resolveRuntimePreferredCredentialSelectorProvider(selector: AuthCredentialSelector): string {
+		const providers = [...this.#data.entries()]
+			.filter(([, entries]) =>
+				entries.some(
+					entry => entry.credential.type === "oauth" && this.#credentialMatchesSelector(entry, selector),
+				),
+			)
+			.map(([provider]) => provider);
+		if (providers.length === 0) {
+			throw new Error(`No active credential found matching ${this.#formatCredentialSelector(selector)}`);
+		}
+		if (providers.length > 1) {
+			throw new Error(
+				`Preferred credential selector ${this.#formatCredentialSelector(selector)} matches multiple providers; use provider/${this.#formatCredentialSelector(selector)}`,
+			);
+		}
+		return providers[0]!;
 	}
 
 	/**
@@ -1390,33 +1786,9 @@ export class AuthStorage {
 		return this.#runtimeCredentialSelectors.has(resolveOAuthStorageProvider(provider));
 	}
 
-	/** Whether a provider currently has a soft runtime credential preference (`--prefer-credential`). */
-	hasRuntimePreferredCredentialSelector(provider: string): boolean {
-		return this.#runtimePreferredCredentialSelectors.has(resolveOAuthStorageProvider(provider));
-	}
-
-	/**
-	 * Resolve an unqualified preferred-credential selector (no `provider/` prefix)
-	 * to the single active OAuth provider it matches. Used so a default model from
-	 * another provider cannot silently capture an unqualified preference.
-	 */
-	resolveRuntimePreferredCredentialSelectorProvider(selector: AuthCredentialSelector): string {
-		const providers = [...this.#data.entries()]
-			.filter(([, entries]) =>
-				entries.some(
-					entry => entry.credential.type === "oauth" && this.#credentialMatchesSelector(entry, selector),
-				),
-			)
-			.map(([provider]) => provider);
-		if (providers.length === 0) {
-			throw new Error(`No active credential found matching ${this.#formatCredentialSelector(selector)}`);
-		}
-		if (providers.length > 1) {
-			throw new Error(
-				`Preferred credential selector ${this.#formatCredentialSelector(selector)} matches multiple providers; use provider/${this.#formatCredentialSelector(selector)}`,
-			);
-		}
-		return providers[0]!;
+	/** Whether the effective selector for a session scope is pinned. */
+	hasEffectiveCredentialSelector(provider: string, sessionId?: string): boolean {
+		return this.#getCredentialSelector(provider, undefined, sessionId) !== undefined;
 	}
 
 	/**
@@ -1804,8 +2176,31 @@ export class AuthStorage {
 		return undefined;
 	}
 
-	#getCredentialSelector(provider: string, options?: AuthApiKeyOptions): AuthCredentialSelector | undefined {
-		return options?.credentialSelector ?? this.#runtimeCredentialSelectors.get(resolveOAuthStorageProvider(provider));
+	#credentialMatchesInventorySelector(row: CredentialInventoryRecord, selector: AuthCredentialSelector): boolean {
+		if (row.disabled || row.credentialKind !== "oauth") return false;
+		switch (selector.kind) {
+			case "id":
+				return String(row.id) === selector.value;
+			case "email":
+				return row.identityLabel?.toLowerCase() === selector.value.toLowerCase();
+			case "account":
+			case "project":
+				return row.identityLabel === selector.value;
+		}
+	}
+	#getCredentialSelector(
+		provider: string,
+		options?: AuthApiKeyOptions,
+		sessionId?: string,
+	): AuthCredentialSelector | undefined {
+		if (options?.credentialSelector) return options.credentialSelector;
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (sessionId) {
+			if (this.#sessionCredentialAutoMasks.get(sessionId)?.has(storageProvider)) return undefined;
+			const scoped = this.#sessionCredentialSelectors.get(sessionId)?.get(storageProvider);
+			if (scoped) return scoped;
+		}
+		return this.#runtimeCredentialSelectors.get(storageProvider);
 	}
 
 	#getPreferredCredentialSelector(provider: string, options?: AuthApiKeyOptions): AuthCredentialSelector | undefined {
@@ -1854,8 +2249,9 @@ export class AuthStorage {
 	#resolveSelectedStoredCredential(
 		provider: string,
 		options?: AuthApiKeyOptions,
+		sessionId?: string,
 	): ({ index: number } & StoredCredential) | undefined {
-		const selector = this.#getCredentialSelector(provider, options);
+		const selector = this.#getCredentialSelector(provider, options, sessionId);
 		if (!selector) return undefined;
 		this.#assertCredentialSelectorUsable(resolveOAuthStorageProvider(provider), selector);
 		const selected = this.#findCredentialBySelector(provider, selector);
@@ -2164,11 +2560,7 @@ export class AuthStorage {
 	 */
 	async remove(provider: string): Promise<void> {
 		const storageProvider = resolveOAuthStorageProvider(provider);
-		if (this.#store.deleteAuthCredentialsRemote) {
-			await this.#store.deleteAuthCredentialsRemote(storageProvider, "deleted by user");
-		} else {
-			this.#store.deleteAuthCredentialsForProvider(storageProvider, "deleted by user");
-		}
+		this.#store.deleteAuthCredentialsForProvider(storageProvider, "deleted by user");
 		this.#setStoredCredentials(storageProvider, []);
 		this.#resetProviderAssignments(storageProvider);
 	}
@@ -2200,10 +2592,10 @@ export class AuthStorage {
 		return false;
 	}
 
-	hasAuth(provider: string): boolean {
+	hasAuth(provider: string, sessionId?: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		try {
-			this.#resolveSelectedStoredCredential(storageProvider);
+			this.#resolveSelectedStoredCredential(storageProvider, undefined, sessionId);
 		} catch {
 			return false;
 		}
@@ -2219,7 +2611,7 @@ export class AuthStorage {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		let selected: ({ index: number } & StoredCredential) | undefined;
 		try {
-			selected = this.#resolveSelectedStoredCredential(storageProvider);
+			selected = this.#resolveSelectedStoredCredential(storageProvider, undefined, sessionId);
 		} catch {
 			return undefined;
 		}
@@ -2246,7 +2638,7 @@ export class AuthStorage {
 	hasUsableAuth(provider: string): boolean {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		try {
-			const selectedCredential = this.#resolveSelectedStoredCredential(storageProvider);
+			const selectedCredential = this.#resolveSelectedStoredCredential(storageProvider, undefined, undefined);
 			if (this.hasRuntimeApiKey(storageProvider)) return true;
 			if (this.#configOverrides.has(storageProvider)) return true;
 			if (selectedCredential) {
@@ -2302,7 +2694,14 @@ export class AuthStorage {
 	/**
 	 * Get OAuth credentials for a provider.
 	 */
-	getOAuthCredential(provider: string): OAuthCredential | undefined {
+	getOAuthCredential(provider: string, sessionId?: string): OAuthCredential | undefined {
+		const selected = this.#resolveSelectedStoredCredential(
+			resolveOAuthStorageProvider(provider),
+			undefined,
+			sessionId,
+		);
+		if (selected?.credential.type === "oauth") return selected.credential;
+		if (selected) return undefined;
 		return this.#getCredentialsForProvider(provider).find(
 			(credential): credential is OAuthCredential => credential.type === "oauth",
 		);
@@ -2326,6 +2725,13 @@ export class AuthStorage {
 		if (this.#runtimeOverrides.has(provider) || this.#configOverrides.has(provider)) return undefined;
 
 		// Prefer the session-sticky credential when available.
+
+		const scopedSelection = this.#resolveSelectedStoredCredential(provider, undefined, sessionId);
+		if (scopedSelection?.credential.type === "api_key") return undefined;
+		if (scopedSelection?.credential.type === "oauth") {
+			const accountId = scopedSelection.credential.accountId;
+			return typeof accountId === "string" && accountId.length > 0 ? accountId : undefined;
+		}
 		const sessionPref = this.#getSessionCredential(provider, sessionId);
 		// If the session has been routed to a stored API key, do not inject OAuth account_uuid.
 		if (sessionPref !== undefined && sessionPref.type !== "oauth") return undefined;
@@ -3357,9 +3763,113 @@ export class AuthStorage {
 	 * Environment-variable API keys are not enumerated — the caller's intent
 	 * here is "which of my stored credentials is broken".
 	 */
+	/** Return a safe cache-only usage observation. */
+	getCachedUsageReport(provider: Provider, credentialId: number, baseUrl?: string): CachedUsageReport | undefined {
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		const presentation = this.#store.peekCachedUsagePresentation?.(storageProvider, credentialId);
+		if (presentation) {
+			const now = Date.now();
+			if (presentation.retainUntil > now) {
+				return {
+					report: presentation.usage,
+					fetchedAt: presentation.fetchedAt,
+					freshUntil: presentation.freshUntil,
+					retainUntil: presentation.retainUntil,
+					freshness: presentation.freshUntil > now ? "fresh" : "stale-last-good",
+				};
+			}
+		}
+		const entry = this.#getStoredCredentials(storageProvider).find(candidate => candidate.id === credentialId);
+		if (entry?.credential.type !== "oauth") return undefined;
+		const request = this.#buildUsageRequestForOauth(storageProvider, entry.credential, baseUrl);
+		const cached = this.#usageCache.getStale<UsageReport | null>(this.#buildUsageReportCacheKey(request));
+		if (!cached || cached.value === null || cached.expiresAt + PRESENTATION_RETENTION_MS < Date.now())
+			return undefined;
+		return {
+			report: safeUsageReport(cached.value),
+			fetchedAt: cached.value.fetchedAt,
+			freshUntil: cached.expiresAt,
+			retainUntil: cached.expiresAt + PRESENTATION_RETENTION_MS,
+			freshness: cached.expiresAt > Date.now() ? "fresh" : "stale-last-good",
+		};
+	}
+
+	/** Cache-only health observation; unknown means no retained explicit check. */
+	getCachedCredentialHealth(credentialId: number): CachedCredentialHealth {
+		const inventory = this.#store.listCredentialInventory?.() ?? [];
+		const row = inventory.find(candidate => candidate.id === credentialId);
+		if (row?.disabled) return { status: "failed", reason: scrubHealthReason(row.disabledCause ?? "disabled") };
+		const raw = this.#store.getCache(`${HEALTH_CACHE_PREFIX}${credentialId}`);
+		if (!raw) return { status: "unknown", reason: null };
+		try {
+			const value = JSON.parse(raw) as {
+				status?: unknown;
+				reason?: unknown;
+				checkedAt?: unknown;
+				retainUntil?: unknown;
+			};
+			if (typeof value.retainUntil !== "number" || value.retainUntil <= Date.now())
+				return { status: "unknown", reason: null };
+			const status =
+				value.status === "ok" || value.status === "failed" || value.status === "unverifiable"
+					? value.status
+					: "unknown";
+			return {
+				status,
+				reason: typeof value.reason === "string" ? value.reason : null,
+				checkedAt: typeof value.checkedAt === "number" ? value.checkedAt : undefined,
+				retainUntil: value.retainUntil,
+			};
+		} catch {
+			return { status: "unknown", reason: null };
+		}
+	}
+	/** Explicit API-key probe; key bytes are not retained in the returned result. */
+	async checkApiKeyCredential(
+		provider: Provider,
+		apiKey: string,
+		options: ApiKeyCredentialCheckOptions = {},
+	): Promise<ApiKeyCredentialCheckResult> {
+		const providerImpl = this.#usageProviderResolver?.(provider);
+		const base: ApiKeyCredentialCheckResult = { provider, type: "api_key", ok: null };
+		if (!providerImpl) {
+			base.reason = `unsupported API-key probe for ${provider}`;
+			return base;
+		}
+		const request = this.#buildUsageRequest(provider, { type: "api_key", apiKey }, options.baseUrl);
+		if (providerImpl.supports && !providerImpl.supports(request)) {
+			base.reason = `unsupported API-key probe for ${provider}`;
+			return base;
+		}
+		options.signal?.throwIfAborted();
+		const timeoutMs = options.timeoutMs ?? this.#usageRequestTimeoutMs;
+		const timeoutSignal = AbortSignal.timeout(timeoutMs);
+		const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+		try {
+			const report = await providerImpl.fetchUsage(
+				{ ...request, signal },
+				{
+					fetch: this.#usageFetch,
+					logger: this.#usageLogger,
+				},
+			);
+			if (!report) {
+				base.reason = "API-key probe returned no verifiable data";
+				return base;
+			}
+			base.ok = true;
+			base.report = safeUsageReport(report);
+			return base;
+		} catch (error) {
+			base.ok = false;
+			base.reason = scrubHealthReason(error, [apiKey]);
+			return base;
+		}
+	}
+
 	async checkCredentials(options?: CheckCredentialsOptions): Promise<CredentialHealthResult[]> {
 		options?.signal?.throwIfAborted();
-		const stored = this.#store.listAuthCredentials();
+		const stored = this.#store.listAuthCredentials(options?.provider);
 		const resolver = this.#usageProviderResolver;
 		const timeoutMs = options?.timeoutMs ?? this.#usageRequestTimeoutMs;
 		const ctx: UsageFetchContext = { fetch: this.#usageFetch, logger: this.#usageLogger };
@@ -3430,11 +3940,25 @@ export class AuthStorage {
 						params = { ...params, credential: refreshedCredential };
 					} catch (error) {
 						base.ok = false;
-						base.reason = `oauth refresh failed: ${error instanceof Error ? error.message : String(error)}`;
-						results.push(base);
-						continue;
+						base.reason = `oauth refresh failed: ${scrubHealthReason(error)}`;
 					}
 				}
+			}
+			if (base.ok === false && base.reason?.startsWith("oauth refresh failed:")) {
+				results.push(base);
+				const healthPayload = {
+					v: 1,
+					status: "failed",
+					reason: scrubHealthReason(base.reason),
+					checkedAt: Date.now(),
+					retainUntil: Date.now() + PRESENTATION_RETENTION_MS,
+				};
+				this.#store.setCache(
+					`${HEALTH_CACHE_PREFIX}${row.id}`,
+					JSON.stringify(healthPayload),
+					Math.floor(healthPayload.retainUntil / 1000),
+				);
+				continue;
 			}
 
 			try {
@@ -3452,10 +3976,24 @@ export class AuthStorage {
 				}
 			} catch (error) {
 				base.ok = false;
-				base.reason = error instanceof Error ? error.message : String(error);
+				base.reason = scrubHealthReason(error, cred.type === "api_key" ? [cred.key] : []);
 			}
 
 			results.push(base);
+			const healthPayload = {
+				v: 1,
+				status: base.ok === true ? "ok" : base.ok === false ? "failed" : "unverifiable",
+				reason: base.reason
+					? scrubHealthReason(base.reason, row.credential.type === "api_key" ? [row.credential.key] : [])
+					: null,
+				checkedAt: Date.now(),
+				retainUntil: Date.now() + PRESENTATION_RETENTION_MS,
+			};
+			this.#store.setCache(
+				`${HEALTH_CACHE_PREFIX}${row.id}`,
+				JSON.stringify(healthPayload),
+				Math.floor(healthPayload.retainUntil / 1000),
+			);
 		}
 
 		return results;
@@ -3708,7 +4246,7 @@ export class AuthStorage {
 			});
 			return undefined;
 		}
-		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options);
+		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 		const selectedOAuthCredential =
 			selectedCredential?.credential.type === "oauth"
 				? { credential: selectedCredential.credential, index: selectedCredential.index }
@@ -4302,7 +4840,7 @@ export class AuthStorage {
 			logger.warn("OAuth token refresh failed", {
 				provider,
 				index: selection.index,
-				error: errorMsg,
+				error: scrubHealthReason(error, [selection.credential.access, selection.credential.refresh]),
 				isDefinitiveFailure,
 			});
 
@@ -4347,7 +4885,7 @@ export class AuthStorage {
 					}
 				}
 				if (
-					!this.#getCredentialSelector(provider, options) &&
+					!this.#getCredentialSelector(provider, options, sessionId) &&
 					this.#getCredentialsForProvider(provider).some(credential => credential.type === "oauth")
 				) {
 					return this.#resolveOAuthSelection(provider, sessionId, options, reloadsUsed);
@@ -4357,8 +4895,8 @@ export class AuthStorage {
 				this.#markCredentialBlocked(providerKey, selection.index, Date.now() + 5 * 60 * 1000);
 			}
 		}
-		if (this.#getCredentialSelector(provider, options)) {
-			const selector = this.#getCredentialSelector(provider, options);
+		if (this.#getCredentialSelector(provider, options, sessionId)) {
+			const selector = this.#getCredentialSelector(provider, options, sessionId);
 			throw new Error(
 				`Selected credential for ${provider} (${selector ? this.#formatCredentialSelector(selector) : "unknown"}) is unavailable`,
 			);
@@ -4443,7 +4981,7 @@ export class AuthStorage {
 		const configKey = this.#configOverrides.get(provider);
 		if (configKey) return configKey;
 
-		const selectedCredential = this.#resolveSelectedStoredCredential(provider);
+		const selectedCredential = this.#resolveSelectedStoredCredential(provider, undefined, undefined);
 		if (selectedCredential?.credential.type === "api_key") {
 			return this.#resolveStoredApiKey(provider, selectedCredential.credential.key);
 		}
@@ -4503,7 +5041,7 @@ export class AuthStorage {
 	 */
 	async getApiKey(provider: string, sessionId?: string, options?: AuthApiKeyOptions): Promise<string | undefined> {
 		provider = resolveOAuthStorageProvider(provider);
-		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options);
+		const selectedCredential = this.#resolveSelectedStoredCredential(provider, options, sessionId);
 
 		// Runtime override takes highest priority after selector validation.
 		const runtimeKey = this.#runtimeOverrides.get(provider);
@@ -4858,14 +5396,15 @@ export class AuthStorage {
 	 * `POST /v1/credential/:id/disable`. Returns `false` when no such row exists.
 	 */
 	disableCredentialById(id: number, disabledCause: string): boolean {
+		const cause = normalizeDisabledCause(disabledCause);
 		for (const [provider, entries] of this.#data) {
 			const index = entries.findIndex(entry => entry.id === id);
 			if (index === -1) continue;
-			this.#store.deleteAuthCredential(id, disabledCause);
+			this.#store.deleteAuthCredential(id, cause);
 			const next = entries.filter((_value, idx) => idx !== index);
 			this.#setStoredCredentials(provider, next);
 			this.#resetProviderAssignments(provider);
-			this.#emitCredentialDisabled({ provider, disabledCause });
+			this.#emitCredentialDisabled({ provider, disabledCause: cause });
 			return true;
 		}
 		return false;
@@ -4951,6 +5490,7 @@ type AuthRow = {
 	data: string;
 	disabled_cause: string | null;
 	identity_key: string | null;
+	revision: number;
 };
 
 type SerializedCredentialRecord = {
@@ -4959,7 +5499,7 @@ type SerializedCredentialRecord = {
 	identityKey: string | null;
 };
 
-const AUTH_SCHEMA_VERSION = 4;
+const AUTH_SCHEMA_VERSION = 5;
 const SQLITE_NOW_EPOCH = "CAST(strftime('%s','now') AS INTEGER)";
 
 function normalizeStoredAccountId(accountId: string | null | undefined): string | null {
@@ -5019,12 +5559,19 @@ function deserializeCredential(row: AuthRow): AuthCredential | null {
 }
 
 function normalizeDisabledCause(disabledCause: string): string {
-	const normalized = disabledCause.trim();
+	const normalized = disabledCause
+		.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+		.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
+		.replace(/https?:\/\/[^\s?#]+\?[^\s]+/gi, value => value.split("?")[0] ?? "[redacted URL]")
+		.replace(/[\u0000-\u001f\u007f]/g, " ")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, 240);
 	return normalized.length > 0 ? normalized : "disabled";
 }
 
 function toStoredAuthCredential(row: AuthRow, credential: AuthCredential): StoredAuthCredential {
-	return { id: row.id, provider: row.provider, credential, disabledCause: row.disabled_cause };
+	return { id: row.id, provider: row.provider, credential, disabledCause: row.disabled_cause, revision: row.revision };
 }
 
 function resolveProviderCredentialIdentityKey(provider: string, identifiers: string[]): string | null {
@@ -5133,6 +5680,8 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 	#db: Database;
 	#listActiveStmt: Statement;
 	#listActiveByProviderStmt: Statement;
+	#listAllStmt: Statement;
+	#listAllByProviderStmt: Statement;
 	#listDisabledByProviderStmt: Statement;
 	#insertStmt: Statement;
 	#updateStmt: Statement;
@@ -5152,28 +5701,34 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#initializeSchema();
 
 		this.#listActiveStmt = this.#db.prepare(
-			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE disabled_cause IS NULL ORDER BY id ASC",
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE disabled_cause IS NULL ORDER BY id ASC",
 		);
 		this.#listActiveByProviderStmt = this.#db.prepare(
-			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL ORDER BY id ASC",
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? AND disabled_cause IS NULL ORDER BY id ASC",
+		);
+		this.#listAllStmt = this.#db.prepare(
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials ORDER BY id ASC",
+		);
+		this.#listAllByProviderStmt = this.#db.prepare(
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? ORDER BY id ASC",
 		);
 		this.#listDisabledByProviderStmt = this.#db.prepare(
-			"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE provider = ? AND disabled_cause IS NOT NULL ORDER BY id ASC",
+			"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE provider = ? AND disabled_cause IS NOT NULL ORDER BY id ASC",
 		);
 		this.#insertStmt = this.#db.prepare(
-			`INSERT INTO auth_credentials (provider, credential_type, data, identity_key, created_at, updated_at) VALUES (?, ?, ?, ?, ${SQLITE_NOW_EPOCH}, ${SQLITE_NOW_EPOCH}) RETURNING id`,
+			`INSERT INTO auth_credentials (provider, credential_type, data, identity_key, revision, created_at, updated_at) VALUES (?, ?, ?, ?, 1, ${SQLITE_NOW_EPOCH}, ${SQLITE_NOW_EPOCH}) RETURNING id`,
 		);
 		this.#updateStmt = this.#db.prepare(
-			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
+			`UPDATE auth_credentials SET credential_type = ?, data = ?, identity_key = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
 		);
 		this.#deleteStmt = this.#db.prepare(
-			`UPDATE auth_credentials SET disabled_cause = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
+			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ?`,
 		);
 		this.#deleteIfMatchesStmt = this.#db.prepare(
-			`UPDATE auth_credentials SET disabled_cause = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND data = ? AND disabled_cause IS NULL`,
+			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE id = ? AND data = ? AND disabled_cause IS NULL`,
 		);
 		this.#deleteByProviderStmt = this.#db.prepare(
-			`UPDATE auth_credentials SET disabled_cause = ?, updated_at = ${SQLITE_NOW_EPOCH} WHERE provider = ? AND disabled_cause IS NULL`,
+			`UPDATE auth_credentials SET disabled_cause = ?, revision = revision + 1, updated_at = ${SQLITE_NOW_EPOCH} WHERE provider = ? AND disabled_cause IS NULL`,
 		);
 		this.#hardDeleteStmt = this.#db.prepare("DELETE FROM auth_credentials WHERE id = ?");
 		this.#getCacheStmt = this.#db.prepare(
@@ -5298,6 +5853,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				data TEXT NOT NULL,
 				disabled_cause TEXT DEFAULT NULL,
 				identity_key TEXT DEFAULT NULL,
+				revision INTEGER NOT NULL DEFAULT 1,
 				created_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH}),
 				updated_at INTEGER NOT NULL DEFAULT (${SQLITE_NOW_EPOCH})
 			);
@@ -5321,6 +5877,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 		if (fromVersion < 4) {
 			this.#migrateAuthSchemaV3ToV4();
+		}
+		if (fromVersion < 5) {
+			this.#migrateAuthSchemaV4ToV5();
 		}
 	}
 
@@ -5401,11 +5960,16 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		});
 		migrate();
 	}
+	#migrateAuthSchemaV4ToV5(): void {
+		const columns = this.#db.prepare("PRAGMA table_info(auth_credentials)").all() as Array<{ name?: string }>;
+		if (columns.some(column => column.name === "revision")) return;
+		this.#db.run("ALTER TABLE auth_credentials ADD COLUMN revision INTEGER NOT NULL DEFAULT 1");
+	}
 
 	#backfillCredentialIdentityKeys(): void {
 		const rows = this.#db
 			.prepare(
-				"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
+				"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE identity_key IS NULL ORDER BY id ASC",
 			)
 			.all() as AuthRow[];
 		if (rows.length === 0) return;
@@ -5433,6 +5997,76 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		}
 		return results;
 	}
+
+	listCredentialInventory(provider?: string): CredentialInventoryRecord[] {
+		const rows =
+			provider === undefined
+				? (this.#listAllStmt.all() as AuthRow[])
+				: (this.#listAllByProviderStmt.all(provider) as AuthRow[]);
+		const results: CredentialInventoryRecord[] = [];
+		for (const row of rows) {
+			const credential = deserializeCredential(row);
+			if (!credential) continue;
+			const identityLabel =
+				credential.type === "oauth"
+					? (credential.email ?? credential.accountId ?? credential.projectId ?? null)
+					: null;
+			results.push({
+				id: row.id,
+				provider: row.provider,
+				credentialKind: credential.type,
+				identityLabel,
+				disabled: row.disabled_cause !== null,
+				disabledCause: row.disabled_cause,
+			});
+		}
+		return results;
+	}
+
+	listCredentialRemovalTargets(provider?: string): CredentialRemovalTarget[] {
+		const rows =
+			provider === undefined
+				? (this.#listAllStmt.all() as AuthRow[])
+				: (this.#listAllByProviderStmt.all(provider) as AuthRow[]);
+		return rows
+			.filter(row => row.credential_type === "oauth")
+			.map(row => ({ id: row.id, provider: row.provider, expectedRevision: row.revision }));
+	}
+	removeAuthCredentialsHard(
+		provider: string,
+		targets: readonly CredentialRemovalTarget[],
+	): AuthCredentialHardRemovalResult {
+		const unique = [...new Map(targets.map(target => [target.id, target])).values()];
+		const remove = this.#db.transaction((): AuthCredentialHardRemovalResult => {
+			const currentIds: number[] = [];
+			for (const target of unique) {
+				const row = this.#db
+					.prepare("SELECT id, provider, credential_type, revision FROM auth_credentials WHERE id = ?")
+					.get(target.id) as
+					| { id?: number; provider?: string; credential_type?: string; revision?: number }
+					| undefined;
+				if (
+					!row ||
+					row.provider !== provider ||
+					row.credential_type !== "oauth" ||
+					row.revision !== target.expectedRevision
+				) {
+					currentIds.push(row?.id ?? target.id);
+				}
+			}
+			if (currentIds.length > 0) return { kind: "conflict", currentIds };
+			for (const target of unique) {
+				this.#hardDeleteStmt.run(target.id);
+				this.#db.prepare("DELETE FROM oauth_refresh_leases WHERE credential_id = ?").run(target.id);
+				this.#db.prepare("DELETE FROM cache WHERE key = ?").run(`${HEALTH_CACHE_PREFIX}${target.id}`);
+			}
+			this.#db
+				.prepare("DELETE FROM cache WHERE substr(key, 1, ?) = ?")
+				.run(`usage_cache:report:${provider}:`.length, `usage_cache:report:${provider}:`);
+			return { kind: "removed", ids: unique.map(target => target.id) };
+		});
+		return remove();
+	}
 	claimOAuthRefreshLease(
 		credentialId: number,
 		expectedRefresh: string,
@@ -5444,7 +6078,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		const claim = this.#db.transaction((): OAuthRefreshLeaseClaim => {
 			const row = this.#db
 				.prepare(
-					"SELECT id, provider, credential_type, data, disabled_cause, identity_key FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
+					"SELECT id, provider, credential_type, data, disabled_cause, identity_key, revision FROM auth_credentials WHERE id = ? AND disabled_cause IS NULL",
 				)
 				.get(credentialId) as AuthRow | undefined;
 			const credential = row ? deserializeCredential(row) : null;
@@ -5891,6 +6525,8 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 		this.#closed = true;
 		this.#listActiveStmt.finalize();
 		this.#listActiveByProviderStmt.finalize();
+		this.#listAllStmt.finalize();
+		this.#listAllByProviderStmt.finalize();
 		this.#listDisabledByProviderStmt.finalize();
 		this.#insertStmt.finalize();
 		this.#updateStmt.finalize();

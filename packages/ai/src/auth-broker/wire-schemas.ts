@@ -109,6 +109,27 @@ export const snapshotResponseSchema = z
 	})
 	.strict();
 
+// ─── Credential metadata ───────────────────────────────────────────────────
+
+/** Closed redacted projection: no token, key, identity object, or extension fields. */
+export const credentialMetadataRecordSchema = z
+	.object({
+		id: z.number().int(),
+		provider: z.string().min(1),
+		type: z.enum(["oauth", "api_key"]),
+		identity: z.string().nullable(),
+		disabledCause: z.string().nullable(),
+	})
+	.strict();
+
+export const credentialMetadataResponseSchema = z
+	.object({
+		generation: z.number().int().nonnegative(),
+		generatedAt: z.number().finite().nonnegative(),
+		credentials: z.array(credentialMetadataRecordSchema),
+	})
+	.strict();
+
 // ─── Snapshot stream (SSE) ────────────────────────────────────────────────
 
 /** First frame on connect — full snapshot embedded inline with a `kind` tag. */

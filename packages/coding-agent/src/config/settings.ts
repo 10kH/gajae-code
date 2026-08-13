@@ -1500,21 +1500,14 @@ export class Settings implements NotificationSettingsReader {
 			let merged: RawSettings = {};
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level !== "project") continue;
-				// The retired workflow keys live in the retained `.gjc/settings.json`
-				// only: the config.yml-only resolver never reads them, so the generic
-				// settings.get() must not surface stale legacy values (e.g. after
-				// `gjc config unset` removed a migrated key). The project config.yml
-				// item keeps its workflow keys - config.yml is the settings surface.
-				// Only keys with DURABLE migration ownership are stripped: when the
-				// migration could not publish or could not record ownership, the
-				// resolver keeps the retained legacy value active as a fallback, and
-				// the generic view must agree with it.
-				const data = item.path.endsWith(`${path.sep}settings.json`)
-					? await this.#stripRetiredWorkflowKeys(item.path, structuredClone(item.data as RawSettings))
-					: (item.data as RawSettings);
-				const { settings, rejectedNotifications } = this.#stripProjectNotificationSettings(data);
+				const { settings, rejectedNotifications, rejectedCredentialPins } = this.#stripProjectNotificationSettings(
+					item.data as RawSettings,
+				);
 				if (rejectedNotifications) {
 					logger.warn("Settings: ignoring project notification settings", { path: item.path });
+				}
+				if (rejectedCredentialPins) {
+					logger.warn("Settings: ignoring project auth.credentialPins; pins are global-only", { path: item.path });
 				}
 				merged = this.#deepMerge(merged, settings);
 			}
@@ -1535,41 +1528,6 @@ export class Settings implements NotificationSettingsReader {
 			}
 			return {};
 		}
-	}
-
-	/**
-	 * Retired workflow keys (flat dotted and nested forms) are removed from a
-	 * retained project `settings.json` before merging ONLY when they are durably
-	 * owned by config.yml (recorded in the migrated-keys marker): config.yml is
-	 * the workflow settings surface, so the generic settings API must not
-	 * resurrect values the resolver no longer reads. An UNOWNED key stays
-	 * visible: an incomplete migration (could not publish, or could not record
-	 * ownership) keeps the retained legacy value active as the resolver's
-	 * fallback, and the generic view must report the same value the workflow
-	 * runtime uses.
-	 */
-	async #stripRetiredWorkflowKeys(sourcePath: string, settings: RawSettings): Promise<RawSettings> {
-		const owned = await this.#readProjectMigratedKeys(sourcePath);
-		for (const key of CONFIG_ROOT_WORKFLOW_MIGRATION_KEYS) {
-			if (owned.has(key)) {
-				// Flat dotted form used by the legacy settings.json.
-				if (Object.hasOwn(settings, key)) delete settings[key];
-				// Nested config form.
-				deleteByPath(settings, key.split("."));
-				continue;
-			}
-			// UNOWNED key: the migration is incomplete (could not publish or could
-			// not record ownership), so the resolver keeps the retained legacy
-			// value active as a fallback and the generic view must agree. The
-			// legacy file stores flat dotted keys; expose them under the nested
-			// (schema) form the generic settings API reads.
-			if (Object.hasOwn(settings, key)) {
-				const value = settings[key];
-				delete settings[key];
-				setByPath(settings, key.split("."), value);
-			}
-		}
-		return settings;
 	}
 
 	async #normalizeAfterLoad(): Promise<void> {
@@ -5887,10 +5845,25 @@ export class Settings implements NotificationSettingsReader {
 	#stripProjectNotificationSettings(settings: RawSettings): {
 		settings: RawSettings;
 		rejectedNotifications: boolean;
+		rejectedCredentialPins: boolean;
 	} {
 		let rejectedNotifications = false;
+		let rejectedCredentialPins = false;
 		const sanitized: RawSettings = {};
 		for (const [key, value] of Object.entries(settings)) {
+			if (key === "auth" && value && typeof value === "object" && !Array.isArray(value)) {
+				const authSettings = { ...(value as Record<string, unknown>) };
+				if (Object.hasOwn(authSettings, "credentialPins")) {
+					delete authSettings.credentialPins;
+					rejectedCredentialPins = true;
+				}
+				if (Object.keys(authSettings).length > 0) sanitized[key] = authSettings;
+				continue;
+			}
+			if (key === "auth.credentialPins") {
+				rejectedCredentialPins = true;
+				continue;
+			}
 			if (key === "notifications" && value && typeof value === "object" && !Array.isArray(value)) {
 				const localNotifications: Record<string, unknown> = {};
 				for (const [notificationKey, notificationValue] of Object.entries(value)) {
@@ -5909,7 +5882,7 @@ export class Settings implements NotificationSettingsReader {
 			}
 			sanitized[key] = value;
 		}
-		return { settings: sanitized, rejectedNotifications };
+		return { settings: sanitized, rejectedNotifications, rejectedCredentialPins };
 	}
 
 	#deepMerge(base: RawSettings, overrides: RawSettings): RawSettings {

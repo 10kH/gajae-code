@@ -791,21 +791,22 @@ function extractGoogleOAuthToken(value: string | undefined): string | undefined 
 	return value;
 }
 
-function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: string): OAuthCredential[] {
-	const providerEntry = authStorage.getAll()[provider];
-	if (!providerEntry) {
-		return [];
-	}
-	const entries = Array.isArray(providerEntry) ? providerEntry : [providerEntry];
-	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
+function getOAuthCredentialsForProvider(
+	authStorage: AuthStorage,
+	provider: string,
+	sessionId?: string,
+): OAuthCredential[] {
+	const selected = authStorage.getOAuthCredential(provider, sessionId);
+	return selected ? [selected] : [];
 }
 
 function resolveOAuthAccountIdForAccessToken(
 	authStorage: AuthStorage,
 	provider: string,
 	accessToken: string,
+	sessionId?: string,
 ): string | undefined {
-	const oauthCredentials = getOAuthCredentialsForProvider(authStorage, provider);
+	const oauthCredentials = getOAuthCredentialsForProvider(authStorage, provider, sessionId);
 	const matchingCredential = oauthCredentials.find(credential => credential.access === accessToken);
 	if (matchingCredential) {
 		return matchingCredential.accountId;
