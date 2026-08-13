@@ -5,20 +5,39 @@ import { currentResults, findBaselineMetric, findBaselineRunNumber, findBaseline
 import type { AutoresearchRuntime, DashboardController, ExperimentResult, ExperimentState } from "./types";
 
 export function createDashboardController(): DashboardController {
-	let overlayTui: { requestRender(): void } | null = null;
+	let overlayTui: { requestLayoutRender(source?: string): void } | null = null;
 	let spinnerTimer: NodeJS.Timeout | undefined;
 	let spinnerFrame = 0;
 
 	const requestRender = (): void => {
-		overlayTui?.requestRender();
+		overlayTui?.requestLayoutRender("autoresearch-overlay");
+	};
+
+	const stopSpinner = (): void => {
+		if (!spinnerTimer) return;
+		clearInterval(spinnerTimer);
+		spinnerTimer = undefined;
+	};
+
+	const syncSpinner = (runtime: AutoresearchRuntime): void => {
+		if (!overlayTui || !runtime.runningExperiment) {
+			stopSpinner();
+			return;
+		}
+		if (spinnerTimer) return;
+		spinnerTimer = setInterval(() => {
+			if (!runtime.runningExperiment) {
+				stopSpinner();
+				return;
+			}
+			spinnerFrame += 1;
+			requestRender();
+		}, 80);
 	};
 
 	const clear = (): void => {
 		overlayTui = null;
-		if (spinnerTimer) {
-			clearInterval(spinnerTimer);
-			spinnerTimer = undefined;
-		}
+		stopSpinner();
 	};
 
 	return {
@@ -31,6 +50,7 @@ export function createDashboardController(): DashboardController {
 		requestRender,
 		updateWidget(ctx, runtime): void {
 			if (!ctx.hasUI) return;
+			syncSpinner(runtime);
 			const state = runtime.state;
 			if (!shouldShowDashboard(runtime, state)) {
 				ctx.ui.setWidget("autoresearch", undefined);
@@ -57,12 +77,7 @@ export function createDashboardController(): DashboardController {
 			await ctx.ui.custom<void>(
 				(tui, theme, _keybindings, done) => {
 					overlayTui = tui;
-					if (!spinnerTimer) {
-						spinnerTimer = setInterval(() => {
-							spinnerFrame += 1;
-							requestRender();
-						}, 80);
-					}
+					syncSpinner(runtime);
 
 					let scrollOffset = 0;
 					return {
@@ -108,7 +123,7 @@ export function createDashboardController(): DashboardController {
 							} else if (data === "G") {
 								scrollOffset = maxScroll;
 							}
-							tui.requestRender();
+							tui.requestLayoutRender("autoresearch-overlay-input");
 						},
 						invalidate(): void {},
 						dispose(): void {

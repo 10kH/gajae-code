@@ -252,6 +252,7 @@ export type IrcSidebarThemeSource = IrcSidebarTheme | (() => IrcSidebarTheme);
 export class IrcSplitViewComponent implements ViewportAnchorProvider {
 	#visible = false;
 	#themeGeneration = 0;
+	#renderRevision = 0n;
 	#styledMemo:
 		| { token: string; width: number; themeGeneration: number; theme: IrcSidebarTheme; lines: string[] }
 		| undefined;
@@ -261,6 +262,13 @@ export class IrcSplitViewComponent implements ViewportAnchorProvider {
 		private readonly ledger: IrcObservationLedger,
 		private readonly componentTheme: IrcSidebarThemeSource,
 	) {}
+	getRenderRevision(): bigint {
+		return this.#renderRevision + (this.leftPane.getRenderRevision?.() ?? 0n);
+	}
+
+	#advanceRenderRevision(): void {
+		this.#renderRevision += 1n;
+	}
 	get visible(): boolean {
 		return this.#visible;
 	}
@@ -276,10 +284,12 @@ export class IrcSplitViewComponent implements ViewportAnchorProvider {
 	invalidateTheme(): void {
 		this.#themeGeneration++;
 		this.#styledMemo = undefined;
+		this.#advanceRenderRevision();
 	}
 	resetSource(): void {
 		projectionMemo.delete(this.ledger);
 		this.#styledMemo = undefined;
+		this.#advanceRenderRevision();
 	}
 	render(width: number): string[] {
 		return this.renderWithViewportAnchors(width).lines;
@@ -345,5 +355,6 @@ export class IrcSplitViewComponent implements ViewportAnchorProvider {
 	}
 	invalidate(): void {
 		this.leftPane.invalidate?.();
+		this.#advanceRenderRevision();
 	}
 }

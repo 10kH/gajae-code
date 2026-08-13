@@ -12,7 +12,7 @@ interface SttEditor {
 
 interface SttUi {
 	getShowHardwareCursor(): boolean;
-	requestRender(): void;
+	requestLayoutRender(source?: string): void;
 	setShowHardwareCursor(enabled: boolean): void;
 }
 
@@ -59,7 +59,7 @@ export class SttModeController {
 			this.#cleanupAnimation(ctx);
 		}
 		ctx.updateEditorChrome();
-		ctx.ui.requestRender();
+		ctx.ui.requestLayoutRender("stt-state");
 	}
 
 	#setMicCursor(editor: SttEditor, color: { r: number; g: number; b: number }): void {
@@ -74,7 +74,7 @@ export class SttModeController {
 		this.#animationInterval = setInterval(() => {
 			this.#hue = (this.#hue + 8) % 360;
 			this.#updateMicIcon(ctx.editor);
-			ctx.ui.requestRender();
+			ctx.ui.requestLayoutRender("stt-animation");
 		}, 60);
 	}
 
