@@ -356,6 +356,21 @@ describe("import collision policy and safety", () => {
 		expect(plan.preview.warnings.join(" ")).toContain("pre-<tool>");
 	});
 
+	test("command text with token-shaped arguments is masked in the preview", async () => {
+		await writeFile(
+			path.join(projectDir, ".mcp.json"),
+			JSON.stringify({
+				mcpServers: { srv: { type: "stdio", command: "node srv --token=GEN2_TOKEN_SECRET" } },
+			}),
+		);
+		const plan = await buildImportPreview(previewOptions({ surfaces: ["mcps"] }));
+		expect(JSON.stringify(plan.preview)).not.toContain("GEN2_TOKEN_SECRET");
+		const entry = plan.preview.entries[0];
+		expect(entry.description).toContain("•••");
+		// The plan payload keeps the real value for the actual write.
+		expect(JSON.stringify(plan.payloads)).toContain("GEN2_TOKEN_SECRET");
+	});
+
 	test("malformed source MCP config is a warning, not a crash", async () => {
 		await writeFile(path.join(projectDir, ".mcp.json"), "{ broken");
 		const plan = await buildImportPreview(previewOptions({ surfaces: ["mcps"] }));

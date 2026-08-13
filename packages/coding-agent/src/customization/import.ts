@@ -33,7 +33,7 @@ import { HookSourceConvention } from "../hooks/events";
 import { normalizeDirectoryHook } from "../hooks/normalize";
 import { readMCPConfigFile, writeMCPConfigFile } from "../runtime-mcp/config-writer";
 import type { MCPServerConfig } from "../runtime-mcp/types";
-import { IMPORTED_FROM_FRONTMATTER_KEY } from "./inventory";
+import { IMPORTED_FROM_FRONTMATTER_KEY, redactDisplayText } from "./inventory";
 import type {
 	ImportCollisionPolicy,
 	ImportPlan,
@@ -531,7 +531,7 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 						sourceCategory: "MCP server entry",
 						description:
 							config && "command" in config && typeof config.command === "string"
-								? `stdio MCP "${name}" (${config.command})`
+								? redactDisplayText(`stdio MCP "${name}" (${config.command})`)
 								: `${config && "type" in config ? String(config.type) : "http"} MCP "${name}"`,
 					},
 					existing === undefined ? { kind: "absent" } : { kind: "value", content: JSON.stringify(existing) },
@@ -775,7 +775,6 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 
 	// --- Phase 2: publication ------------------------------------------------
 	const snapshots: FileSnapshot[] = [];
-	const written: Array<{ entry: ImportPreviewEntry }> = [];
 	for (const dir of [destination.skillsDir, destination.hooksDir]) {
 		await sweepStagingTemps(dir).catch(() => {});
 	}
@@ -794,7 +793,6 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 			await fs.writeFile(staged, write.content, { encoding: "utf-8", mode: 0o600 });
 			await fs.rename(staged, write.path);
 			snapshots.push({ path: write.path, previous: prior.kind === "value" ? prior.content : null });
-			written.push({ entry: write.entry });
 		}
 
 		if (mcpConfig && mcpWrites.length > 0) {
@@ -806,7 +804,6 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 			const servers = { ...(mcpConfig.mcpServers ?? {}) };
 			for (const write of mcpWrites) {
 				servers[write.name] = write.config;
-				written.push({ entry: write.entry });
 			}
 			await writeMCPConfigFile(destination.mcpConfigPath, { ...mcpConfig, mcpServers: servers });
 		}
