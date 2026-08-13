@@ -27,14 +27,21 @@ export function isUnsupportedWindowsDirectorySyncError(
 ): boolean {
 	if (platform !== "win32") return false;
 	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	return code === "EPERM" || code === "EACCES" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "EINVAL";
+	// Bun reports EPERM when fsync is applied to a Windows directory handle.
+	return code === "EPERM" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "EINVAL";
 }
 
 export async function syncCoordinatorDirectory(
 	directory: string,
 	options: CoordinatorDirectoryBarrierOptions = {},
 ): Promise<void> {
-	const handle = await (options.openDirectory ?? (path => fs.open(path, "r")))(directory);
+	let handle: fs.FileHandle;
+	try {
+		handle = await (options.openDirectory ?? (path => fs.open(path, "r")))(directory);
+	} catch (error) {
+		if (!isUnsupportedWindowsDirectorySyncError(error, options.platform)) throw error;
+		return;
+	}
 	try {
 		try {
 			await handle.sync();
@@ -52,6 +59,19 @@ export async function syncCoordinatorFile(
 	options: CoordinatorFileDurabilityOptions = {},
 ): Promise<void> {
 	await (options.syncFile ?? (file => file.sync()))(handle);
+}
+
+/** Append a durable coordinator journal or diagnostic record, then barrier its parent. */
+export async function appendCoordinatorFile(file: string, contents: string): Promise<void> {
+	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	const handle = await fs.open(file, "a", 0o600);
+	try {
+		await handle.writeFile(contents);
+		await syncCoordinatorFile(handle);
+	} finally {
+		await handle.close();
+	}
+	await syncCoordinatorDirectory(path.dirname(file));
 }
 
 /** Atomically publish a synced coordinator state file, then barrier its parent. */

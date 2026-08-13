@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
+	appendCoordinatorFile,
 	isUnsupportedWindowsDirectorySyncError,
 	syncCoordinatorDirectory,
 	syncCoordinatorFile,
@@ -14,6 +15,27 @@ function errno(code: string): NodeJS.ErrnoException {
 }
 
 describe("Coordinator durability", () => {
+	it("accepts a documented Windows directory barrier failure while opening", async () => {
+		const calls: string[] = [];
+		await syncCoordinatorDirectory("state", {
+			platform: "win32",
+			openDirectory: async () => {
+				calls.push("directory-open");
+				throw errno("EPERM");
+			},
+		});
+		expect(calls).toEqual(["directory-open"]);
+	});
+
+	it("keeps unexpected Windows directory open failures fail-closed", async () => {
+		await expect(
+			syncCoordinatorDirectory("state", {
+				platform: "win32",
+				openDirectory: async () => Promise.reject(errno("EIO")),
+			}),
+		).rejects.toMatchObject({ code: "EIO" });
+	});
+
 	it("accepts only unsupported Windows directory barriers after file durability", async () => {
 		const calls: string[] = [];
 		const handle = {
@@ -59,6 +81,17 @@ describe("Coordinator durability", () => {
 			} finally {
 				await handle.close();
 			}
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("appends a journal record only after file durability", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-durability-"));
+		try {
+			const file = path.join(root, "event-journal.jsonl");
+			await appendCoordinatorFile(file, "event\n");
+			expect(await fs.readFile(file, "utf8")).toBe("event\n");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -110,9 +143,10 @@ describe("Coordinator durability", () => {
 	});
 
 	it("classifies only documented Windows directory error codes", () => {
-		for (const code of ["EPERM", "EACCES", "ENOTSUP", "EOPNOTSUPP", "EINVAL"])
+		for (const code of ["EPERM", "ENOTSUP", "EOPNOTSUPP", "EINVAL"])
 			expect(isUnsupportedWindowsDirectorySyncError(errno(code), "win32")).toBe(true);
 		expect(isUnsupportedWindowsDirectorySyncError(errno("EIO"), "win32")).toBe(false);
+		expect(isUnsupportedWindowsDirectorySyncError(errno("EACCES"), "win32")).toBe(false);
 		expect(isUnsupportedWindowsDirectorySyncError(errno("EPERM"), "linux")).toBe(false);
 	});
 });
