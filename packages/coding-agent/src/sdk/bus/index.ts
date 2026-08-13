@@ -8564,7 +8564,7 @@ export function createNotificationsExtension(
 	api.on("turn_end", (event, ctx) => {
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
-		if (!rt?.notificationsActive) return;
+		if (!rt || (!rt.notificationsActive && !rt.policySuspended)) return;
 		const text = rt.policySuspended
 			? rt.committedRedact
 				? undefined
