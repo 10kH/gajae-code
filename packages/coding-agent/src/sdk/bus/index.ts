@@ -6655,7 +6655,10 @@ export function createNotificationsExtension(
 			cancelPostmortemCleanup: () => {},
 
 			redact: true,
-			committedRedact: true,
+			// Provisional policy withholds delivery. This is not a committed redaction
+			// decision: terminal text may be retained in the bounded settlement window
+			// until the parsed policy either clears it for redaction or activates it.
+			committedRedact: false,
 			policySuspended: true,
 			verbosity: "lean",
 			stream: false,
