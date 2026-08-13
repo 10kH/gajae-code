@@ -1728,6 +1728,36 @@ export class SelectorController {
 								this.#refreshThemeUi();
 							});
 						},
+						onThemeCommit: async (path, themeName, previousTheme) => {
+							if (!settings.canWriteDurableConfig()) {
+								this.ctx.showError(
+									"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+								);
+								return false;
+							}
+							const applied = await restoreThemePreview(themeName);
+							if (!applied.success) {
+								if (applied.error && !isThemePreviewSuperseded(applied)) {
+									this.ctx.showError(`Failed to apply theme "${themeName}": ${applied.error}`);
+								}
+								const restored = await restoreThemePreview(previousTheme);
+								if (!restored.success && restored.error && !isThemePreviewSuperseded(restored)) {
+									this.ctx.showError(`Failed to restore theme preview: ${restored.error}`);
+								}
+								this.#refreshThemeUi();
+								return false;
+							}
+							try {
+								settings.set(path, themeName);
+							} catch (error) {
+								await restoreThemePreview(previousTheme);
+								this.ctx.showError(error instanceof Error ? error.message : String(error));
+								this.#refreshThemeUi();
+								return false;
+							}
+							this.#refreshThemeUi();
+							return true;
+						},
 						onPetPreview: mode => {
 							this.ctx.previewPetMode(mode as PetMode);
 						},

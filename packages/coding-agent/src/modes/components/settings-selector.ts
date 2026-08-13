@@ -710,6 +710,11 @@ export interface SettingsCallbacks {
 	onThemePreview?: (theme: string) => void | Promise<void>;
 	/** Called to restore the rendered theme when theme settings preview is cancelled */
 	onThemePreviewCancel?: (theme: string) => void | Promise<void>;
+	/**
+	 * Atomically apply and persist a theme selection. Returns false when the
+	 * candidate could not be loaded, leaving the submenu open.
+	 */
+	onThemeCommit?: (path: "theme.dark" | "theme.light", theme: string, previousTheme: string) => Promise<boolean>;
 	/** Called to live-preview the gajae pet skin while browsing the pet setting. */
 	onPetPreview?: (mode: string) => void;
 	/**
@@ -1073,6 +1078,13 @@ export class SettingsSelectorComponent extends Container {
 				if (def.path === "modelProfile.default") {
 					this.callbacks.onChange(def.path, value);
 					done(value);
+					return;
+				}
+				if (def.path === "theme.dark" || def.path === "theme.light") {
+					if (!this.callbacks.onThemeCommit) return;
+					void this.callbacks.onThemeCommit(def.path, value, currentValue).then(accepted => {
+						if (accepted) done(value);
+					});
 					return;
 				}
 				if (def.path === "pet.mode") {
