@@ -38,6 +38,7 @@ const KNOWN_ALLOWED_SITES = new Set<string>([
 // Filesystem-mutation APIs we treat as candidate writers.
 const MUTATION_API_PATTERNS: readonly RegExp[] = [
 	/\bfs(?:\/promises)?\.(?:writeFile|appendFile|mkdir|rm|rmdir|unlink|rename|cp|copyFile|open)\s*\(/u,
+	/\b[A-Za-z_$][\w$]*\.promises\.(?:writeFile|appendFile|mkdir|rm|rmdir|unlink|rename|cp|copyFile|open)\s*\(/u,
 	/\bfsp?\.(?:writeFile|appendFile|mkdir|rm|rmdir|unlink|rename|cp|copyFile|open)\s*\(/u,
 	/\bwriteFileSync\s*\(|\bappendFileSync\s*\(|\bmkdirSync\s*\(|\brmSync\s*\(|\bunlinkSync\s*\(|\brenameSync\s*\(/u,
 	/\bBun\.write\s*\(/u,
@@ -117,13 +118,25 @@ function importedMutationAliases(content: string): Set<string> {
 	return aliases;
 }
 
-function matchedApi(line: string, aliases: ReadonlySet<string>): string | null {
+function importedFsNamespaces(content: string): Set<string> {
+	const aliases = new Set<string>();
+	for (const match of content.matchAll(/import\s*\*\s*as\s*([A-Za-z_$][\w$]*)\s*from\s*["']node:fs(?:\/promises)?["']/gu)) {
+		aliases.add(match[1]!);
+	}
+	return aliases;
+}
+
+function matchedApi(line: string, aliases: ReadonlySet<string>, namespaces: ReadonlySet<string>): string | null {
 	for (const re of MUTATION_API_PATTERNS) {
 		const m = re.exec(line);
 		if (m) return m[0].replace(/\s*\($/u, "");
 	}
 	for (const alias of aliases) {
 		if (new RegExp(`\\b${alias}\\s*\\(`, "u").test(line)) return alias;
+	}
+	for (const namespace of namespaces) {
+		const match = new RegExp(`\\b${namespace}(?:\\.promises)?\\.(?:writeFile|appendFile|mkdir|rm|rmdir|unlink|rename|cp|copyFile|open|createWriteStream)\\s*\\(`, "u").exec(line);
+		if (match) return match[0].replace(/\s*\($/u, "");
 	}
 	return null;
 }
@@ -178,13 +191,14 @@ function collectFindings(): Finding[] {
 	for (const file of listTsFiles(SCAN_ROOT)) {
 		const content = fs.readFileSync(file, "utf8");
 		const mutationAliases = importedMutationAliases(content);
+		const fsNamespaces = importedFsNamespaces(content);
 		const relative = path.relative(repoRoot, file);
 		const lines = content.split("\n");
 		for (let i = 0; i < lines.length; i++) {
 			const raw = lines[i];
 			const line = raw.trim();
 			if (line.startsWith("//") || line.startsWith("*")) continue;
-			const api = matchedApi(line, mutationAliases);
+			const api = matchedApi(line, mutationAliases, fsNamespaces);
 			if (!api) continue;
 			const knownAllowed = KNOWN_ALLOWED_SITES.has(`${relative}:${i + 1}:${api}`);
 			const allowed = relative === ALLOWED_WRITER_RELATIVE || knownAllowed;

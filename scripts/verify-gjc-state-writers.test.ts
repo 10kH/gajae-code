@@ -47,3 +47,19 @@ test("detects aliased node filesystem writes into .gjc", async () => {
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("detects namespace and fs.promises writes into .gjc", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-writer-namespace-"));
+	try {
+		const directory = path.join(root, "packages", "coding-agent", "src");
+		await fs.mkdir(directory, { recursive: true });
+		await Bun.write(path.join(directory, "namespace.ts"), 'import * as io from "node:fs/promises";\nawait io.writeFile(".gjc/a", "x");\n');
+		await Bun.write(path.join(directory, "promises.ts"), 'import * as fs from "node:fs";\nawait fs.promises.writeFile(".gjc/b", "x");\n');
+		const result = await run(root);
+		expect(result.exitCode).toBe(1);
+		expect(`${result.stdout}\n${result.stderr}`).toContain("namespace.ts");
+		expect(`${result.stdout}\n${result.stderr}`).toContain("promises.ts");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

@@ -124,8 +124,20 @@ async function git(args: string[], cwd: string): Promise<{ exitCode: number; std
 }
 
 async function runFastGate(cwd: string, trustedRoot: string): Promise<boolean> {
-	const process = Bun.spawn(["bun", path.join(trustedRoot, "scripts", "verify-gjc-state-writers.ts"), "--fail", "--root", cwd], { cwd, stdout: "inherit", stderr: "inherit" });
-	return (await process.exited) === 0;
+	const configPath = path.join(Bun.env.RUNNER_TEMP ?? Bun.env.TMPDIR ?? "/tmp", "gjc-pr-contract-empty-bunfig.toml");
+	await Bun.write(configPath, "# trusted empty Bun configuration\n");
+	const env: Record<string, string | undefined> = { ...process.env };
+	delete env.BUN_OPTIONS;
+	const child = Bun.spawn([
+		process.execPath,
+		"--no-env-file",
+		`--config=${configPath}`,
+		path.join(trustedRoot, "scripts", "verify-gjc-state-writers.ts"),
+		"--fail",
+		"--root",
+		cwd,
+	], { cwd: trustedRoot, env, stdout: "inherit", stderr: "inherit" });
+	return (await child.exited) === 0;
 }
 
 async function validateEvent(eventPath: string, cwd: string, trustedRoot: string): Promise<PrValidationResult> {
