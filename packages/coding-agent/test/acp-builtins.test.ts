@@ -1,6 +1,6 @@
 import { describe, expect, it, spyOn } from "bun:test";
 import { type AgentMessage, ThinkingLevel } from "@gajae-code/agent-core";
-import type { Usage } from "@gajae-code/ai";
+import type { CachedUsageReport, CredentialInventoryRecord, Usage } from "@gajae-code/ai";
 import { Settings } from "../src/config/settings";
 import { createMemoryBackendService } from "../src/memory-backend";
 import { getThemeByName, setThemeInstance, theme } from "../src/modes/theme/theme";
@@ -90,11 +90,8 @@ interface FakeAcpBuiltinSession {
 function createRuntime() {
 	const output: string[] = [];
 	const settings = Settings.isolated();
-	let credentialInventory: ReturnType<AgentSession["modelRegistry"]["authStorage"]["listCredentialInventory"]> = [];
-	const cachedUsage = new Map<
-		number,
-		ReturnType<AgentSession["modelRegistry"]["authStorage"]["getCachedUsageReport"]>
-	>();
+	let credentialInventory: CredentialInventoryRecord[] = [];
+	const cachedUsage = new Map<number, CachedUsageReport | undefined>();
 	const activeCredentialRows = new Map<string, number>();
 	const authStorage = {
 		listCredentialInventory: () => credentialInventory,
@@ -262,10 +259,7 @@ function createRuntime() {
 		fakeSessionManager,
 		setAccountInventory(
 			inventory: typeof credentialInventory,
-			usageByCredentialId: ReadonlyMap<
-				number,
-				NonNullable<ReturnType<AgentSession["modelRegistry"]["authStorage"]["getCachedUsageReport"]>>
-			>,
+			usageByCredentialId: ReadonlyMap<number, CachedUsageReport>,
 			activeRows: ReadonlyMap<string, number> = new Map(),
 		): void {
 			credentialInventory = inventory;
