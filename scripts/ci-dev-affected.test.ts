@@ -1073,10 +1073,12 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).toContain(shardOne);
 		expect(tasks.find(task => task.key === shardOne)?.command).toEqual([
 			"bun",
-			"test",
-			"packages/coding-agent",
-			"--timeout=30000",
+			"scripts/run-bun-test-files.ts",
+			"--root=packages/coding-agent",
 			"--shard=1/8",
+			"--timeout=30000",
+			"--file-timeout=300000",
+			"--concurrency=1",
 		]);
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([shardOne]);
 			expect(keys).toContain(isolated);
@@ -1093,10 +1095,12 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(tasks.find(task => task.key === `test:${testFile}`)?.command).toEqual(["bun", "test", testFile]);
 		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.command).toEqual([
 			"bun",
-			"test",
-			"packages/coding-agent",
-			"--timeout=30000",
+			"scripts/run-bun-test-files.ts",
+			"--root=packages/coding-agent",
 			"--shard=1/8",
+			"--timeout=30000",
+			"--file-timeout=300000",
+			"--concurrency=1",
 		]);
 		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated")?.command).toEqual([
 			"bun",
@@ -1294,6 +1298,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"bun",
 			"test",
 			"scripts/ci-dev-affected.test.ts",
+			"scripts/run-bun-test-files.test.ts",
 			"scripts/dev-ci-guard-topology.test.ts",
 			"scripts/ci-risk-canary-manifest.test.ts",
 			"scripts/ci-virtual-integration.test.ts",
@@ -1447,10 +1452,12 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		]);
 		expect(testShards[0]?.command).toEqual([
 			"bun",
-			"test",
-			"packages/coding-agent",
-			"--timeout=30000",
+			"scripts/run-bun-test-files.ts",
+			"--root=packages/coding-agent",
 			"--shard=1/8",
+			"--timeout=30000",
+			"--file-timeout=300000",
+			"--concurrency=1",
 		]);
 		expect(testShards[0]?.cwd).toBeUndefined();
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
@@ -1458,6 +1465,24 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 
 		const entries = describeTasks(tasks);
 		expect(entries.find(entry => entry.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.native).toBe(true);
+	});
+
+	test("push mode runs the AI suite with the same fresh-process boundary", () => {
+		const ai: WorkspacePackage = {
+			name: "@gajae-code/ai",
+			dir: "packages/ai",
+			manifest: { name: "@gajae-code/ai", scripts: { check: "biome check .", test: "bun test" } },
+		};
+		const task = planTasks(["packages/ai/src/index.ts"], [ai]).find(candidate => candidate.key === "test:@gajae-code/ai");
+		expect(task?.command).toEqual([
+			"bun",
+			"scripts/run-bun-test-files.ts",
+			"--root=packages/ai",
+			"--timeout=30000",
+			"--file-timeout=300000",
+			"--concurrency=1",
+		]);
+		expect(task?.cwd).toBeUndefined();
 	});
 
 	test("push mode schedules release evidence contract, dry-run, and focused coverage once", () => {
