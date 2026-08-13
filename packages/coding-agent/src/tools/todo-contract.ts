@@ -60,11 +60,27 @@ const TODO_OP_KEYS_WITH_ALIASES = new Set([...TODO_OP_KEYS, "content"]);
  * an entry here when the replacement is unambiguous — never from fuzzy or
  * edit-distance matching, because a wrong suggestion costs more turns than no
  * suggestion.
+ *
+ * The positional-handle family (`id`, `index`, and spellings of them) is the
+ * other repeatable confusion: the tool result renders tasks as a list, so a
+ * caller assumes the list is addressable by ordinal. No op has ever taken a
+ * handle - a task is addressed by its verbatim content - and the executor
+ * already says so, but that message is unreachable because this validator
+ * rejects the key first. One shared correction keeps both layers telling the
+ * same story.
  */
+const POSITIONAL_HANDLE_CORRECTION =
+	'tasks have no id or index; target a task with "task" set to its exact content, or a whole phase with "phase"';
+
 const TODO_KEY_CORRECTIONS = new Map<string, string>([
 	["note", 'note is an op, not a key; note operations require both "task" and "text"'],
 	["newTask", "there is no rename op; re-run init with the corrected list to rename a task"],
 	["tasks", 'tasks is not a key; append operations take "items"'],
+	["id", POSITIONAL_HANDLE_CORRECTION],
+	["ids", POSITIONAL_HANDLE_CORRECTION],
+	["index", POSITIONAL_HANDLE_CORRECTION],
+	["taskId", POSITIONAL_HANDLE_CORRECTION],
+	["task_id", POSITIONAL_HANDLE_CORRECTION],
 ]);
 
 function unknownKeys(value: object, allowed: Set<string>): string[] {

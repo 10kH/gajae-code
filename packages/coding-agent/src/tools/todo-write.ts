@@ -539,9 +539,10 @@ export class TodoWriteTool implements AgentTool<typeof todoWriteSchema, TodoWrit
 			entry => (entry.op === "done" || entry.op === "drop") && !entry.task && !entry.phase,
 		);
 		if (missingTarget) {
-			// Models reach for a positional handle here (`id: "1"`, `index: 2`). Those keys
-			// are stripped before this point, leaving a targetless op, so the message has to
-			// name the one thing that does work: the task's content, verbatim.
+			// Positional handles (`id: "1"`, `index: 2`) never reach this point: raw
+			// validation rejects the key and carries the same correction. This guard is
+			// for callers that bypass raw validation and send a genuinely targetless op,
+			// so the message still names the one thing that works: the task's content.
 			const errors = [
 				`Missing task or phase for ${missingTarget.op} operation. ` +
 					`Pass "task" with the task's exact content, or "phase" with the phase name; ` +
