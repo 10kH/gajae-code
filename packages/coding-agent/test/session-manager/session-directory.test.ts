@@ -152,11 +152,16 @@ describe.skipIf(process.platform !== "linux")("managed session scope shared stic
 	}
 
 	it("prepares the managed chain directly below the shared sticky temp directory", async () => {
-		expect((await fs.stat(os.tmpdir())).mode & 0o1000).toBe(0o1000);
-		const stickyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-shared-sticky-root-"));
+		let tempRoot = path.resolve(os.tmpdir());
+		while (((await fs.stat(tempRoot)).mode & 0o1000) === 0) {
+			const parent = path.dirname(tempRoot);
+			if (parent === tempRoot) throw new Error("No shared sticky temp ancestor is available.");
+			tempRoot = parent;
+		}
+		const stickyRoot = await fs.mkdtemp(path.join(tempRoot, "gjc-managed-shared-sticky-root-"));
 		await fs.rm(stickyRoot, { recursive: true, force: true });
 		temporaryDirectories.push(stickyRoot);
-		const cwdRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-managed-shared-sticky-workspace-"));
+		const cwdRoot = await fs.mkdtemp(path.join(tempRoot, "gjc-managed-shared-sticky-workspace-"));
 		temporaryDirectories.push(cwdRoot);
 		const cwd = path.join(cwdRoot, "workspace");
 		await fs.mkdir(cwd);

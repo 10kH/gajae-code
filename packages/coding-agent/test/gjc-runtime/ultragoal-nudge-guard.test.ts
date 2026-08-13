@@ -357,7 +357,13 @@ describe("ultragoal nudge guard", () => {
 		const probe = path.join(import.meta.dir, "..", "fixtures", "config-root-settings-probe.ts");
 		const userOnly = Bun.spawn([process.execPath, probe], {
 			cwd,
-			env: { ...process.env, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+			env: {
+				...process.env,
+				HOME: home,
+				GJC_CONFIG_DIR: ".gjc",
+				GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+				PI_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+			},
 			stdout: "pipe",
 			stderr: "pipe",
 		});
@@ -369,7 +375,13 @@ describe("ultragoal nudge guard", () => {
 		await setProjectBudget(cwd, 7);
 		const projectWins = Bun.spawn([process.execPath, probe], {
 			cwd,
-			env: { ...process.env, HOME: home, GJC_CONFIG_DIR: ".gjc" },
+			env: {
+				...process.env,
+				HOME: home,
+				GJC_CONFIG_DIR: ".gjc",
+				GJC_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+				PI_CODING_AGENT_DIR: path.join(home, ".gjc", "agent"),
+			},
 			stdout: "pipe",
 			stderr: "pipe",
 		});
