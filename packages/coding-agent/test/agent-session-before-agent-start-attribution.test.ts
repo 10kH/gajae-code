@@ -280,6 +280,67 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 			message: "Agent session admission is busy due to same-session reentrancy.",
 		});
 	});
+	it("fails awaited same-session prompt reentrancy before a later selection fence can deadlock it", async () => {
+		const { emitBeforeAgentStart } = createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-model" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const hookStarted = Promise.withResolvers<void>();
+		const releaseHook = Promise.withResolvers<void>();
+		let reentrantError: unknown;
+		emitBeforeAgentStart.mockImplementationOnce(async () => {
+			hookStarted.resolve();
+			await releaseHook.promise;
+			try {
+				await session.prompt("reentrant prompt");
+			} catch (error) {
+				reentrantError = error;
+			}
+			return undefined;
+		});
+
+		const prompt = session.prompt("outer prompt");
+		await hookStarted.promise;
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		releaseHook.resolve();
+		await prompt;
+		await selection;
+
+		expect(reentrantError).toMatchObject({
+			name: "AgentBusyError",
+			code: "busy",
+			message: "Agent session admission is busy due to same-session reentrancy.",
+		});
+	});
+	it("orders a selection accepted during an active prompt before a later queued successor", async () => {
+		const { emitBeforeAgentStart } = createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-model" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const preflightStarted = Promise.withResolvers<void>();
+		const releasePreflight = Promise.withResolvers<void>();
+		emitBeforeAgentStart.mockImplementationOnce(async () => {
+			preflightStarted.resolve();
+			await releasePreflight.promise;
+			return undefined;
+		});
+
+		const activePrompt = session.prompt("active prompt");
+		await preflightStarted.promise;
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		const successor = session.prompt("later successor", { streamingBehavior: "followUp" });
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+		releasePreflight.resolve();
+		await activePrompt;
+		await selection;
+		await successor;
+		expect(session.model).toBe(selectionModel);
+	});
 	it("cancels a queued prompt without starving later admission", async () => {
 		createSession();
 		const currentModel = session.model;

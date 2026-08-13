@@ -9412,6 +9412,13 @@ export class AgentSession {
 		assertImagePlaceholdersHavePayload(expandedText, options?.images);
 		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
 		const claimsGenuineUserIntent = !options?.synthetic && options?.attribution !== "agent";
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		const admissionGeneration = this.#promptGeneration;
+		const admissionSignal = options?.preflightSignal
+			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
+			: this.#promptPreflightAbortController.signal;
+		await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
 		const deepInterviewUserIntentEpoch =
 			claimsGenuineUserIntent && !this.isStreaming ? this.#claimDeepInterviewUserIntent() : undefined;
 
@@ -9436,8 +9443,6 @@ export class AgentSession {
 			return;
 		}
 
-		const admissionGeneration = this.#promptGeneration;
-		const admissionSignal = this.#promptPreflightAbortController.signal;
 		await this.#withSessionAdmission(
 			"prompt",
 			async admission => {
