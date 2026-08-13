@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Emergency compaction now considers managed transcript file size so sessions compact before the managed per-file limit (#4411).
+
 ## [0.13.2] - 2026-08-13
 
 ## [0.13.1] - 2026-08-11
