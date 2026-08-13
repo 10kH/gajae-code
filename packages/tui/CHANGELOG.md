@@ -6,12 +6,11 @@
 
 ### Fixed
 
-- A fast double-Esc (or triple-Esc) whose ESC bytes coalesce into one stdin chunk — which tmux always produces within its escape-time window, and SSH batching produces routinely — is now emitted as individual Escape key presses instead of a single `"\x1b\x1b"` sequence that parsed as the unbound `alt+escape` and silently swallowed both presses. This restores the double-Esc draft-clear and double-Esc selector gestures under tmux/SSH. Option-as-Meta sequences with a real continuation (e.g. Option+Up as `ESC ESC [ A`) remain atomic, and an ESC-cancelled incomplete sequence is still emitted whole.
-- An ambiguous trailing run of Escape bytes now stays buffered until a continuation or the flush timeout resolves it, so `ESC ESC ESC` followed by `[A` in the next chunk still decodes as Escape then `alt+up` instead of two Escapes plus a plain Up that fired the destructive double-Escape gesture.
-- Escape presses immediately followed by a bracketed paste in the same read are now emitted as individual Escape presses instead of one coalesced sequence that parsed as the unbound `alt+escape` and swallowed every press.
-- A long run of Escape bytes arriving as many small reads no longer rescans the accumulated buffer on every read; only the two-byte ambiguous tail stays buffered, so 50,000 byte-by-byte Escape reads cost 50ms instead of 2.4s.
-- A long run of Escape bytes followed by another key now decodes in linear time instead of rescanning the remaining input on every step, which blocked the event loop for over a second on a 50,000-byte run.
-- Apple Terminal.app now retains its default keyboard mode when it does not support the Kitty keyboard protocol, avoiding the modifyOtherKeys fallback that breaks Korean/Hangul IME composition.
+- Fast double-Esc and triple-Esc sequences coalesced into one stdin chunk by tmux or SSH are now emitted as individual Escape presses, restoring draft-clear and selector gestures while preserving atomic Option-as-Meta sequences (#4312 by @Yeachan-Heo).
+- Ambiguous trailing Escape bytes now remain buffered until a continuation or flush timeout resolves them, preventing a split `ESC ESC ESC [A` sequence from firing the destructive double-Escape gesture (#4312 by @Yeachan-Heo).
+- Escape presses immediately followed by bracketed paste are now emitted individually instead of being swallowed as an unbound `alt+escape` sequence (#4312 by @Yeachan-Heo).
+- Long runs of Escape bytes now decode in linear time without repeatedly rescanning accumulated input; 50,000 byte-by-byte reads now complete in milliseconds instead of seconds (#4312 by @Yeachan-Heo).
+- Apple Terminal.app now retains its default keyboard mode when it does not support the Kitty keyboard protocol, avoiding the modifyOtherKeys fallback that broke Korean/Hangul IME composition (#4297 by @Yeachan-Heo).
 
 ## [0.13.1] - 2026-08-11
 

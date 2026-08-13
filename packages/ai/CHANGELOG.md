@@ -4,6 +4,10 @@
 
 ## [0.13.2] - 2026-08-13
 
+### Fixed
+
+- `clear_thinking`-emptied Anthropic thinking blocks now drop stale signatures before replay, preventing the next request from failing with `Invalid signature in thinking block` after a provider-side reasoning clear (#4247, reported by @probepark).
+
 ## [0.13.1] - 2026-08-11
 
 ### Fixed
