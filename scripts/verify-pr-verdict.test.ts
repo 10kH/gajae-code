@@ -19,6 +19,8 @@ function validInput(overrides: Partial<Parameters<typeof validatePrContract>[0]>
 		baseIsAncestor: true,
 		fastGatePassed: true,
 		requireMergeApproved: true,
+		authenticatedReviewerLogin: "review-agent",
+		authenticatedReviewHeadSha: head,
 		...overrides,
 	};
 }
@@ -73,6 +75,11 @@ describe("validatePrContract", () => {
 		expect(validatePrContract(validInput({ body, requireMergeApproved: true })).diagnostics[0]).toContain("intentionally blocks merge");
 	});
 
+	test("server merge approval requires an authenticated exact-head GitHub review", () => {
+		expect(validatePrContract(validInput({ authenticatedReviewerLogin: undefined })).diagnostics.join("\n")).toContain("not backed by an authenticated");
+		expect(validatePrContract(validInput({ authenticatedReviewHeadSha: "d".repeat(40) })).diagnostics.join("\n")).toContain("must target exact PR head");
+	});
+
 	test("rejects invalid event hashes", () => {
 		const result = validatePrContract(validInput({ baseSha: "HEAD", headSha: "head", computedDiffSha256: "sha" }));
 		expect(result.diagnostics.join("\n")).toContain("40-hex");
@@ -100,7 +107,7 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("pull_request_target:");
 	expect(workflow).not.toMatch(/^\s+pull_request:\s*$/mu);
-	expect(workflow).toContain("permissions:\n  contents: read");
+	expect(workflow).toContain("permissions:\n  contents: read\n  pull-requests: read");
 	expect(workflow).toContain("name: PR contract");
 	expect(workflow).toContain("name: Validate exact-head PR contract");
 	expect(workflow).toContain("repository: ${{ github.event.pull_request.head.repo.full_name }}");

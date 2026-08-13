@@ -27,6 +27,8 @@ export interface PrValidationInput {
 	computedDiffSha256: string;
 	baseIsAncestor: boolean;
 	fastGatePassed: boolean;
+	authenticatedReviewerLogin?: string;
+	authenticatedReviewHeadSha?: string;
 	requireMergeApproved?: boolean;
 }
 
@@ -96,6 +98,14 @@ export function validatePrContract(input: PrValidationInput): PrValidationResult
 		if (input.requireMergeApproved && parsed.verdict.verdict !== "merge-approved") {
 			diagnostics.push(`Verdict ${parsed.verdict.verdict} intentionally blocks merge. Obtain independent review, update the exact-head verdict to merge-approved, and rerun this check.`);
 		}
+		if (input.requireMergeApproved && parsed.verdict.verdict === "merge-approved") {
+			if (!input.authenticatedReviewerLogin || input.authenticatedReviewerLogin.toLowerCase() !== parsed.verdict.reviewerId.toLowerCase()) {
+				diagnostics.push(`merge-approved reviewer-id ${parsed.verdict.reviewerId} is not backed by an authenticated approving GitHub review.`);
+			}
+			if (input.authenticatedReviewHeadSha !== input.headSha) {
+				diagnostics.push(`Authenticated approval must target exact PR head ${input.headSha}, not ${input.authenticatedReviewHeadSha ?? "a missing commit"}.`);
+			}
+		}
 	}
 	return { ok: diagnostics.length === 0, verdict: parsed.verdict, diagnostics };
 }
@@ -105,12 +115,38 @@ export function canonicalDiffSha256(diff: Uint8Array | string): string {
 }
 
 interface PullRequestEvent {
+	repository?: { full_name?: string };
 	pull_request?: {
+		number?: number;
 		body?: string | null;
 		user?: { login?: string };
 		base?: { ref?: string; sha?: string };
 		head?: { sha?: string };
 	};
+}
+
+interface PullRequestReview {
+	state?: string;
+	commit_id?: string;
+	user?: { login?: string };
+}
+
+async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string): Promise<{ login?: string; headSha?: string }> {
+	const repository = event.repository?.full_name;
+	const number = event.pull_request?.number;
+	const token = Bun.env.GITHUB_TOKEN;
+	if (!repository || !number || !token) return {};
+	const response = await fetch(`https://api.github.com/repos/${repository}/pulls/${number}/reviews?per_page=100`, {
+		headers: {
+			Accept: "application/vnd.github+json",
+			Authorization: `Bearer ${token}`,
+			"X-GitHub-Api-Version": "2022-11-28",
+		},
+	});
+	if (!response.ok) return {};
+	const reviews = await response.json() as PullRequestReview[];
+	const approval = reviews.find(review => review.state === "APPROVED" && review.commit_id === headSha && review.user?.login?.toLowerCase() === reviewerId.toLowerCase());
+	return approval ? { login: approval.user!.login, headSha: approval.commit_id } : {};
 }
 
 async function git(args: string[], cwd: string): Promise<{ exitCode: number; stdout: Uint8Array; stderr: string }> {
@@ -161,6 +197,10 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 	const ancestry = await git(["merge-base", "--is-ancestor", baseSha, headSha], cwd);
 	const diff = await git(["diff", "--binary", "--full-index", "--no-ext-diff", `${baseSha}...${headSha}`], cwd);
 	if (diff.exitCode !== 0) return { ok: false, diagnostics: [`Could not compute exact PR diff: ${diff.stderr}`] };
+	const parsed = parsePrVerdict(body);
+	const approval = parsed.verdict?.verdict === "merge-approved"
+		? await authenticatedApproval(event, parsed.verdict.reviewerId, headSha)
+		: {};
 	return validatePrContract({
 		body,
 		baseRef,
@@ -170,6 +210,8 @@ async function validateEvent(eventPath: string, cwd: string, trustedRoot: string
 		computedDiffSha256: canonicalDiffSha256(diff.stdout),
 		baseIsAncestor: ancestry.exitCode === 0,
 		fastGatePassed: await runFastGate(cwd, trustedRoot),
+		authenticatedReviewerLogin: approval.login,
+		authenticatedReviewHeadSha: approval.headSha,
 		requireMergeApproved: true,
 	});
 }

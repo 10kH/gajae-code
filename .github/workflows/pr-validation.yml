@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: pr-contract-${{ github.event.pull_request.number }}
@@ -40,6 +41,7 @@ jobs:
       - name: Validate body, exact head, immutable base, reviewer, and fast gate
         env:
           GITHUB_ACTOR: ${{ github.event.pull_request.user.login }}
+          GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail

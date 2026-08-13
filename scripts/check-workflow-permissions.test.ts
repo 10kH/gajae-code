@@ -73,7 +73,7 @@ describe("workflow permission policy", () => {
 		const document = documentRecord(prValidation!.document);
 
 		expect(REQUIRED_READ_DEFAULT).toContain(PR_VALIDATION_WORKFLOW);
-		expect(document.permissions).toEqual({ contents: "read" });
+		expect(document.permissions).toEqual({ contents: "read", "pull-requests": "read" });
 		expect(jobWriteScopes(document)).toEqual([]);
 	});
 
