@@ -52,6 +52,7 @@ import {
 	createDefaultCodexTransportFactory,
 	publishCodexWake,
 } from "./codex-wake-publisher";
+import { syncCoordinatorDirectory, syncCoordinatorFile, writeCoordinatorAtomic } from "./durability";
 import {
 	createDefaultEventWebhookDelivery,
 	deliverEventWebhook,
@@ -867,8 +868,7 @@ async function readJsonFile(file: string): Promise<unknown | null> {
 }
 
 async function writeJsonFile(file: string, value: unknown): Promise<void> {
-	await ensureDir(path.dirname(file));
-	await fs.writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
+	await writeCoordinatorAtomic(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
 const COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP = 64 * 1024;
@@ -906,27 +906,7 @@ async function readCoordinatorIdempotencyFile(file: string): Promise<Coordinator
 }
 
 async function writeCoordinatorIdempotencyFile(file: string, value: CoordinatorToolIdempotencyRecord): Promise<void> {
-	await ensureDir(path.dirname(file));
-	const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-	try {
-		const handle = await fs.open(temporary, "wx", 0o600);
-		try {
-			await handle.writeFile(`${JSON.stringify(value)}\n`);
-			await handle.sync();
-		} finally {
-			await handle.close();
-		}
-		await fs.rename(temporary, file);
-		const directory = await fs.open(path.dirname(file), "r");
-		try {
-			await directory.sync();
-		} finally {
-			await directory.close();
-		}
-	} catch (error) {
-		await fs.rm(temporary, { force: true }).catch(() => undefined);
-		throw error;
-	}
+	await writeCoordinatorAtomic(file, `${JSON.stringify(value)}\n`);
 }
 
 function canonicalJson(value: unknown): string {
@@ -1683,8 +1663,16 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 			...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
 			...(input.metadata ? { metadata: input.metadata } : {}),
 		};
+		const journalPath = eventJournalFile(namespaceDir);
 		await ensureDir(eventsDir(namespaceDir));
-		await fs.appendFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
+		const journal = await fs.open(journalPath, "a", 0o600);
+		try {
+			await journal.writeFile(`${JSON.stringify(event)}\n`);
+			await syncCoordinatorFile(journal);
+		} finally {
+			await journal.close();
+		}
+		await syncCoordinatorDirectory(path.dirname(journalPath));
 		await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
 		const codexWake = await maybeRecordCodexWake(namespaceDir, event).catch(async error => {
 			await appendCodexWakeDiagnostic(namespaceDir, event, error);
