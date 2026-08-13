@@ -10,12 +10,15 @@
  * the server only checks a bearer token against an allow-list per request.
  */
 import { logger } from "@gajae-code/utils";
+import { timingSafeEqual } from "../auth-gateway/http";
 import type { AuthStorage } from "../auth-storage";
-import { parseBind } from "../utils/parse-bind";
+import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
+import { cleanReason } from "./redact";
 import { AuthBrokerRefresher, type AuthBrokerRefresherSchedule } from "./refresher";
 import type {
 	CredentialDisableResponse,
 	CredentialIfAbsentUploadResponse,
+	CredentialMetadataResponse,
 	CredentialRefreshRequest,
 	CredentialRefreshResponse,
 	CredentialUploadResponse,
@@ -88,7 +91,13 @@ function isAuthorized(req: Request, tokens: ReadonlySet<string>): boolean {
 	if (!header) return false;
 	const match = header.match(/^Bearer\s+(.+)$/i);
 	if (!match) return false;
-	return tokens.has(match[1].trim());
+	const presented = new TextEncoder().encode(match[1].trim());
+	let ok = false;
+	for (const token of tokens) {
+		const expected = new TextEncoder().encode(token);
+		if (timingSafeEqual(presented, expected)) ok = true;
+	}
+	return ok;
 }
 
 /**
@@ -105,7 +114,12 @@ async function parseBody<T>(
 	try {
 		raw = await req.text();
 	} catch (error) {
-		return { ok: false, response: json(400, { error: `Invalid request body: ${String(error)}` }) };
+		return {
+			ok: false,
+			response: json(400, {
+				error: `Invalid request body: ${cleanReason(error) ?? "request body could not be read"}`,
+			}),
+		};
 	}
 	if (raw.length === 0 && !options.allowEmpty) {
 		return { ok: false, response: json(400, { error: "Request body required" }) };
@@ -114,7 +128,12 @@ async function parseBody<T>(
 	try {
 		parsed = raw.length === 0 ? {} : JSON.parse(raw);
 	} catch (error) {
-		return { ok: false, response: json(400, { error: `Invalid JSON body: ${String(error)}` }) };
+		return {
+			ok: false,
+			response: json(400, {
+				error: `Invalid JSON body: ${cleanReason(error) ?? "request body could not be parsed"}`,
+			}),
+		};
 	}
 	const result = schema.safeParse(parsed);
 	if (!result.success) {
@@ -280,6 +299,22 @@ function buildSnapshot(storage: AuthStorage, refresher: AuthBrokerRefresher | un
 		generatedAt: base.generatedAt,
 		serverNowMs,
 		refresher: wire,
+		credentials,
+	};
+}
+
+/** Build the payload-free credential inventory projection for the metadata route. */
+function buildCredentialMetadata(storage: AuthStorage): CredentialMetadataResponse {
+	const credentials = storage.listCredentialInventory().map(record => ({
+		id: record.id,
+		provider: record.provider,
+		type: record.credentialKind,
+		identity: record.identityLabel,
+		disabledCause: record.disabledCause,
+	}));
+	return {
+		generation: storage.getGeneration(),
+		generatedAt: Date.now(),
 		credentials,
 	};
 }
@@ -505,6 +540,7 @@ function serveSnapshotStream(
 export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServerHandle {
 	const bind = parseBind(opts.bind ?? DEFAULT_AUTH_BROKER_BIND);
 	const tokens = new Set<string>(opts.bearerTokens);
+	assertAuthenticatedOrLoopback(bind, tokens.size, "auth-broker");
 	const version = opts.version;
 	const streamKeepaliveMs = opts.streamKeepaliveMs ?? DEFAULT_STREAM_KEEPALIVE_MS;
 
@@ -536,6 +572,15 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 					logger.info("auth-broker request unauthorized", { method: req.method, path: pathname, peer });
 					return json(401, { error: "unauthorized" });
 				}
+				if (req.method === "GET" && pathname === "/v1/credentials/metadata") {
+					await opts.storage.reload();
+					const body = buildCredentialMetadata(opts.storage);
+					logger.info("auth-broker credential metadata served", {
+						generation: body.generation,
+						status: "ok",
+					});
+					return json(200, body);
+				}
 				if (req.method === "GET" && pathname === "/v1/snapshot/stream") {
 					return serveSnapshotStream(req, opts.storage, refresher, peer, streamKeepaliveMs);
 				}
@@ -557,7 +602,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						logger.info("auth-broker usage served", { peer, reports: trimmed.length });
 						return json(200, { generatedAt: Date.now(), reports: trimmed });
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						const message = cleanReason(error) ?? "Usage fetch failed";
 						logger.warn("auth-broker usage fetch failed", { peer, error: message });
 						return json(502, { error: message });
 					}
@@ -579,9 +624,9 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						});
 						return json(200, body);
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						const message = cleanReason(error) ?? "Credential refresh failed";
 						logger.warn("auth-broker refresh failed", { id, peer, error: message });
-						const status = message.includes("No credential with id") ? 404 : 500;
+						const status = message.startsWith("No credential with id") ? 404 : 500;
 						return json(status, { error: message });
 					}
 				}
@@ -594,10 +639,10 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						parsed.data.cause && parsed.data.cause.length > 0 ? parsed.data.cause : "disabled via auth-broker";
 					const ok = opts.storage.disableCredentialById(id, cause);
 					if (!ok) {
-						logger.info("auth-broker disable miss", { id, peer, cause });
+						logger.info("auth-broker disable miss", { id, peer });
 						return json(404, { error: `No credential with id=${id}` });
 					}
-					logger.info("auth-broker credential disabled", { id, peer, cause });
+					logger.info("auth-broker credential disabled", { id, peer });
 					const response: CredentialDisableResponse = { ok: true };
 					return json(200, response);
 				}
@@ -622,7 +667,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						};
 						return json(200, response);
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						const message = cleanReason(error) ?? "Credential import failed";
 						logger.warn("auth-broker upload-if-absent failed", { provider, type: credential.type, peer });
 						return json(500, { error: message });
 					}
@@ -647,7 +692,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 						const response: CredentialUploadResponse = { entries };
 						return json(200, response);
 					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
+						const message = cleanReason(error) ?? "Credential upload failed";
 						logger.warn("auth-broker upload failed", { provider, peer, error: message });
 						return json(500, { error: message });
 					}
@@ -657,7 +702,7 @@ export function startAuthBroker(opts: AuthBrokerServerOptions): AuthBrokerServer
 				logger.error("auth-broker handler crashed", {
 					method: req.method,
 					path: pathname,
-					error: String(error),
+					error: cleanReason(error) ?? "internal error",
 				});
 				return json(500, { error: "internal error" });
 			}

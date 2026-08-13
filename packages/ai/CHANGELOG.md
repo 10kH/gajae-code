@@ -23,6 +23,8 @@
 
 ### Changed
 
+- Documented multi-account auth behavior: credential ranking (`balanced` or `earliest-reset`) runs at session start or after a blocked preferred account, explicit OAuth checks run sequentially, and API-key sources remain visible/checkable without entering OAuth pooling, pinning, or removal.
+
 - Model discovery now retains the authoritative dynamic provider model IDs separately from the merged static/cache catalog. Consumers can distinguish a fresh provider omission from bundled offline availability through `ModelResolutionResult.dynamicModelIds`; cache schema v5 persists those IDs through fresh-cache reuse and static transport re-merges, scoped to the credential-and-endpoint provenance that produced them.
 
 ### Fixed

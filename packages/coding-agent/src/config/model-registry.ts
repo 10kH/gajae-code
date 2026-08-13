@@ -26,6 +26,7 @@ import {
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
 	registerCustomApi,
+	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	type ThinkingConfig,
 	UNK_CONTEXT_WINDOW,
@@ -792,10 +793,8 @@ function extractGoogleOAuthToken(value: string | undefined): string | undefined 
 }
 
 function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: string): OAuthCredential[] {
-	const providerEntry = authStorage.getAll()[provider];
-	if (!providerEntry) {
-		return [];
-	}
+	const providerEntry = authStorage.getAll()[resolveOAuthStorageProvider(provider)];
+	if (!providerEntry) return [];
 	const entries = Array.isArray(providerEntry) ? providerEntry : [providerEntry];
 	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
 }

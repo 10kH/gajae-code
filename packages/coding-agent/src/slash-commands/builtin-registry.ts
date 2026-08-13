@@ -1332,12 +1332,24 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		name: "usage",
 		description: "Show provider usage and limits",
 		acpDescription: "Show token usage",
-		handle: async (_command, runtime) => {
-			await runtime.output(await buildUsageReportText(runtime));
+		subcommands: [{ name: "check", description: "Explicitly check account health and usage" }],
+		inlineHint: "[check]",
+		acpInputHint: "[check]",
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const args = command.args.trim().toLowerCase();
+			if (args !== "" && args !== "check") return usage("Usage: /usage [check]", runtime);
+			await runtime.output(await buildUsageReportText(runtime, { check: args === "check" }));
 			return commandConsumed();
 		},
-		handleTui: async (_command, runtime) => {
-			await runtime.ctx.handleUsageCommand();
+		handleTui: async (command, runtime) => {
+			const args = command.args.trim().toLowerCase();
+			if (args !== "" && args !== "check") {
+				runtime.ctx.showError("Usage: /usage [check]");
+			} else {
+				const adapted = toSlashCommandRuntime(runtime);
+				await adapted.output(await buildUsageReportText(adapted, { check: args === "check" }));
+			}
 			runtime.ctx.editor.setText("");
 		},
 	},

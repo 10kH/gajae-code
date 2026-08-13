@@ -177,6 +177,7 @@ export interface ForkContextSeedOptions {
 	signal?: AbortSignal;
 }
 
+import type { AuthCredentialSelector } from "@gajae-code/ai/core";
 import type { MacOSPowerAssertion } from "@gajae-code/natives";
 import {
 	extractRetryHint,
@@ -188,7 +189,6 @@ import {
 	prompt,
 	Snowflake,
 } from "@gajae-code/utils";
-
 import { createAppendOnlyContextManager, resolveAppendOnlyMode } from "../append-only-mode";
 import {
 	type AsyncJob,
@@ -794,6 +794,8 @@ export interface AgentSessionConfig {
 	providerSessionId?: string;
 	/** Optional auth-selection identity, distinct from logical/canonical and provider-cache identity. */
 	credentialSessionId?: string;
+	/** Opaque credential-store authority fingerprint for durable numeric session pins. */
+	credentialStoreIdentity?: string;
 	/** Optional provider-facing cache identity, distinct from logical session identity. */
 	providerCacheSessionId?: string;
 	/** Explicit provider affinity whose persisted transcript path scopes async ownership. */
@@ -2250,6 +2252,7 @@ export class AgentSession {
 	#ircRosterClaim: IrcRosterClaim | null = null;
 	#providerSessionId: string | undefined;
 	#credentialSessionId: string | undefined;
+	#credentialStoreIdentity: string | undefined;
 	#providerCacheSessionId: string | undefined;
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
@@ -3326,6 +3329,7 @@ export class AgentSession {
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
 		this.#credentialSessionId = config.credentialSessionId;
+		this.#credentialStoreIdentity = config.credentialStoreIdentity;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		this.#asyncJobProviderSessionId = config.asyncJobProviderSessionId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
@@ -7053,6 +7057,7 @@ export class AgentSession {
 		await this.memoryBackend.dispose();
 		if (this.#workspaceTreeService) await this.#workspaceTreeService.dispose();
 		if (this.#networkPrewarmService) await this.#networkPrewarmService.dispose();
+		this.#modelRegistry.authStorage?.releaseCredentialScope(this.credentialSessionId);
 		await this.sessionManager.close();
 		this.#closeAllProviderSessions("dispose");
 		const hindsightState = this.getHindsightSessionState();
@@ -8523,6 +8528,36 @@ export class AgentSession {
 	/** Credential selection identity; defaults to the provider-facing session identity. */
 	get credentialSessionId(): string {
 		return this.#credentialSessionId ?? this.sessionId;
+	}
+
+	/** Pin one OAuth credential for this session scope and persist the minimal intent. */
+	async setCredentialPin(provider: string, selector: AuthCredentialSelector): Promise<void> {
+		const scopeId = this.credentialSessionId;
+		const authStorage = this.#modelRegistry.authStorage;
+		const target = authStorage.resolveOAuthPinTarget(provider, selector);
+		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector);
+		if (target.canonicalSelector.kind === "id" && !this.#credentialStoreIdentity) return;
+		this.sessionManager.appendCustomEntry("auth-credential-pin", {
+			v: 1,
+			scopeId,
+			provider,
+			pin: target.canonicalSelector,
+			...(target.canonicalSelector.kind === "id" && this.#credentialStoreIdentity
+				? { credentialStoreIdentity: this.#credentialStoreIdentity }
+				: {}),
+		});
+	}
+
+	/** Mask persistent/global selection for this session and restore AUTO ranking. */
+	async setCredentialAuto(provider: string): Promise<void> {
+		const scopeId = this.credentialSessionId;
+		this.#modelRegistry.authStorage.setSessionCredentialAuto(provider, scopeId);
+		this.sessionManager.appendCustomEntry("auth-credential-pin", {
+			v: 1,
+			scopeId,
+			provider,
+			pin: { auto: true },
+		});
 	}
 
 	/** Current session display name, if set */

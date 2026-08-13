@@ -15,6 +15,22 @@ import type {
 } from "../auth-storage";
 import type { UsageReport } from "../usage";
 
+/** A single credential metadata projection; secret-bearing fields are intentionally absent. */
+export interface CredentialMetadataRecord {
+	id: number;
+	provider: string;
+	type: "oauth" | "api_key";
+	identity: string | null;
+	disabledCause: string | null;
+}
+
+/** GET /v1/credentials/metadata response body. */
+export interface CredentialMetadataResponse {
+	generation: number;
+	generatedAt: number;
+	credentials: CredentialMetadataRecord[];
+}
+
 /** GET /v1/healthz response body. */
 export interface HealthzResponse {
 	ok: boolean;

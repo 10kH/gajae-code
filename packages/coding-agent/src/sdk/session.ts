@@ -18,6 +18,7 @@ import {
 	type Message,
 	type Model,
 	type ProviderSessionState,
+	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	streamSimple,
 	type ToolResultMessage,
@@ -134,10 +135,14 @@ import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
-import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
 import { type CustomMessage, convertToLlm } from "../session/messages";
 import { createReadonlySessionManager, SessionManager } from "../session/session-manager";
+import {
+	parsePersistedCredentialSelector,
+	resolveStartupAuthConfig,
+	type StartupAuthConfigSnapshot,
+} from "../session/startup-auth-config";
 import {
 	isOwnedCompletionEnvelopeAllowed,
 	lookupOwnedRegistration,
@@ -435,6 +440,8 @@ export interface CreateAgentSessionOptions {
 	credentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
 	/** Soft runtime credential preference; quota/rate-limit failures may rotate away from it. */
 	preferredCredentialSelector?: { provider?: string; selector: AuthCredentialSelector; raw: string };
+	/** Durable global pin intent loaded from startup-auth config; session bootstrap resolves it without mutating shared storage. */
+	startupAuthConfig?: StartupAuthConfigSnapshot;
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
@@ -654,9 +661,13 @@ function getDefaultAgentDir(): string {
  * back into the broker through the {@link AuthStorageOptions.refreshOAuthCredential}
  * override to re-mint access tokens when needed.
  */
-export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir()): Promise<AuthStorage> {
-	const brokerConfig = await resolveAuthBrokerConfig();
-	const credentialRankingMode = resolveCredentialRankingMode();
+export async function discoverAuthStorage(
+	agentDir: string = getDefaultAgentDir(),
+	startupAuth?: StartupAuthConfigSnapshot,
+): Promise<AuthStorage> {
+	const resolvedStartupAuth = startupAuth ?? (await resolveStartupAuthConfig(agentDir));
+	const brokerConfig = resolvedStartupAuth.broker;
+	const credentialRankingMode = resolvedStartupAuth.credentialRankingMode;
 	if (brokerConfig) {
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		const initialResult = await client.fetchSnapshot();
@@ -700,18 +711,7 @@ export async function discoverAuthStorage(agentDir: string = getDefaultAgentDir(
 	return storage;
 }
 
-/**
- * Opt-in multi-account credential ranking mode, read from the
- * `GJC_CREDENTIAL_RANKING_MODE` env var. Unset/unknown → `undefined`, leaving
- * {@link AuthStorage}'s default (`balanced`) untouched. `earliest-reset`
- * switches to earliest-expiry-first selection so soon-to-reset tumbling-window
- * quota is drained before it is lost.
- */
-function resolveCredentialRankingMode(): "balanced" | "earliest-reset" | undefined {
-	const raw = process.env.GJC_CREDENTIAL_RANKING_MODE?.trim();
-	if (raw === "balanced" || raw === "earliest-reset") return raw;
-	return undefined;
-}
+/** Ranking is resolved as part of the typed startup-auth snapshot. */
 
 /**
  * Discover extensions from cwd.
@@ -1191,6 +1191,11 @@ function safeErrorForLog(value: unknown): unknown {
 	return safeErrorDescription(value);
 }
 
+function sanitizeProviderForLog(provider: string): string {
+	const sanitized = provider.replace(/[^\x20-\x7e]/g, "?").slice(0, 128);
+	return sanitized.length > 0 ? sanitized : "<empty>";
+}
+
 function attachMcpCleanupDiagnostic(primary: unknown, cleanup: unknown): unknown {
 	const diagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED" as const, cause: cleanup };
 	if (primary && (typeof primary === "object" || typeof primary === "function")) {
@@ -1274,14 +1279,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const explicitMcpConfigPath = !isCanonicalSubSession && !options.mcpManager ? options.mcpConfigPath : undefined;
 	const agentDir = options.agentDir ?? getDefaultAgentDir();
 	const eventBus = options.eventBus ?? new EventBus();
+	const hasInjectedAuth = options.authStorage !== undefined || options.modelRegistry !== undefined;
 
 	// Pin authStorage to modelRegistry.authStorage: ModelRegistry.getApiKey() routes refresh
 	// failures through that instance, so any divergent storage handed to the bridge / mcpManager
 	// / session would silently miss credential_disabled events.
+	// Injected auth is already the caller's authority; do not discover global
+	// startup auth or apply persistent pins while constructing this session.
+	const startupAuthConfig = hasInjectedAuth
+		? undefined
+		: (options.startupAuthConfig ?? (await resolveStartupAuthConfig(agentDir)));
 	const ownsAuthStorage = options.modelRegistry === undefined && options.authStorage === undefined;
 	const modelRegistry =
 		options.modelRegistry ??
-		new ModelRegistry(options.authStorage ?? (await logger.time("discoverModels", discoverAuthStorage, agentDir)));
+		new ModelRegistry(
+			options.authStorage ??
+				(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig))),
+		);
 	const authStorage = modelRegistry.authStorage;
 	if (options.authStorage && options.authStorage !== authStorage) {
 		throw new Error(
@@ -1315,7 +1329,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 	const enableLsp = options.enableLsp ?? true;
 	let authStorageClosed = false;
+	let credentialScopeId: string | undefined;
+	let credentialScopeLeased = false;
 	const closeOwnedAuthStorage = (): void => {
+		if (!hasSession && credentialScopeLeased && credentialScopeId) {
+			authStorage.releaseCredentialScope(credentialScopeId);
+			credentialScopeLeased = false;
+		}
 		if (!ownsAuthStorage || authStorageClosed) return;
 		authStorageClosed = true;
 		authStorage.close();
@@ -1342,39 +1362,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				startupCredentialDisabledEvents.push(event);
 			}
 		});
-		let runtimeCredentialSelectorInstalled = false;
-		const installRuntimeCredentialSelector = (provider: string): void => {
-			if (!options.credentialSelector || runtimeCredentialSelectorInstalled) return;
-			authStorage.setRuntimeCredentialSelector(provider, options.credentialSelector.selector);
-			runtimeCredentialSelectorInstalled = true;
+		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
+			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
 		};
-		const earlyCredentialSelectorProvider = options.credentialSelector?.provider ?? options.model?.provider;
-		if (earlyCredentialSelectorProvider) {
-			installRuntimeCredentialSelector(earlyCredentialSelectorProvider);
-		}
-		// Soft `--prefer-credential` preference. Unlike the hard-pin selector above,
-		// its provider is never ambiguous by construction: an explicit `provider/`
-		// prefix wins, otherwise `resolveRuntimePreferredCredentialSelectorProvider`
-		// resolves the single active OAuth provider the selector matches or throws.
-		// So the provider (and therefore installation) is always known synchronously
-		// here, with no deferred per-candidate install needed.
-		const preferredCredentialProvider = options.preferredCredentialSelector
-			? (options.preferredCredentialSelector.provider ??
-				authStorage.resolveRuntimePreferredCredentialSelectorProvider(options.preferredCredentialSelector.selector))
-			: undefined;
-		if (options.preferredCredentialSelector && preferredCredentialProvider) {
-			authStorage.setRuntimePreferredCredentialSelector(
-				preferredCredentialProvider,
-				options.preferredCredentialSelector.selector,
-			);
-		}
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
 		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
-		const canRefreshModelsBeforeCredentialSelector =
-			!options.credentialSelector || runtimeCredentialSelectorInstalled || options.modelRegistry !== undefined;
-		if (!options.modelRegistry && canRefreshModelsBeforeCredentialSelector) {
+		if (!options.modelRegistry) {
 			modelRegistry.refreshInBackground();
 		}
 		// Resolve the workspace tree through its runtime service. The compatibility
@@ -1452,6 +1447,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			sessionFile,
 		);
 		const credentialSessionId = options.credentialSessionId ?? providerSessionId;
+		credentialScopeId = credentialSessionId;
+
+		const scopeAlreadyLeased = authStorage.hasCredentialScopeLease(credentialSessionId);
+		authStorage.acquireCredentialScope(credentialSessionId);
+		credentialScopeLeased = true;
+		const configuredPins = hasInjectedAuth ? {} : (startupAuthConfig?.credentialPins ?? {});
+		const persistedPinStoreMatches =
+			startupAuthConfig?.credentialPinStoreIdentity === startupAuthConfig?.credentialStoreIdentity;
+		// AuthStorage has no scope-level "pinned but unavailable" marker. Keep the
+		// discarded durable pin identity local to this credential scope so startup
+		// config cannot immediately replace it with a different account; later
+		// request-time resolution for this provider remains ordinary AUTO ranking.
+		const staleDurableCredentialPins = new Set<string>();
+		if (options.credentialSelector) {
+			const provider = options.credentialSelector.provider ?? options.model?.provider;
+			if (provider) applyCredentialSelector(credentialSessionId, provider, options.credentialSelector.selector);
+		}
+		const preferredCredentialProvider = options.preferredCredentialSelector
+			? (options.preferredCredentialSelector.provider ??
+				authStorage.resolveRuntimePreferredCredentialSelectorProvider(options.preferredCredentialSelector.selector))
+			: undefined;
+		if (options.preferredCredentialSelector && preferredCredentialProvider) {
+			authStorage.setRuntimePreferredCredentialSelector(
+				preferredCredentialProvider,
+				options.preferredCredentialSelector.selector,
+			);
+		}
 		const modelApiKeyAvailability = new Map<string, boolean>();
 		const getModelAvailabilityKey = (candidate: Model): string =>
 			`${candidate.provider}\u0000${candidate.baseUrl ?? ""}`;
@@ -1462,13 +1484,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return cached;
 			}
 
-			const credentialSelector =
-				options.credentialSelector && !runtimeCredentialSelectorInstalled
-					? options.credentialSelector.provider === undefined ||
-						options.credentialSelector.provider === candidate.provider
-						? options.credentialSelector.selector
-						: undefined
-					: undefined;
+			const credentialSelector = options.credentialSelector?.provider
+				? undefined
+				: options.credentialSelector?.selector;
 			if (options.credentialSelector?.provider && options.credentialSelector.provider !== candidate.provider) {
 				modelApiKeyAvailability.set(availabilityKey, false);
 				return false;
@@ -1528,6 +1546,83 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const hasExistingSession = existingBranch.length > 0;
 		const hasThinkingEntry = existingBranch.some(entry => entry.type === "thinking_level_change");
 		const hasServiceTierEntry = existingBranch.some(entry => entry.type === "service_tier_change");
+
+		for (const entry of existingBranch) {
+			if (entry.type !== "custom" || entry.customType !== "auth-credential-pin") continue;
+			const data = entry.data;
+			if (!data || typeof data !== "object") continue;
+			const record = data as {
+				v?: unknown;
+				scopeId?: unknown;
+				provider?: unknown;
+				pin?: unknown;
+				credentialStoreIdentity?: unknown;
+			};
+			if (record.v !== 1 || record.scopeId !== credentialSessionId || typeof record.provider !== "string") continue;
+			const pin = record.pin as { auto?: unknown; kind?: unknown; value?: unknown } | undefined;
+			// Durable replay must never abort session startup: a pinned account may
+			// have been removed, disabled, or deduplicated since the pin was written.
+			// Pin identity is preserved by leaving the provider unpinned on failure —
+			// never silently retarget to another account; the user re-pins or picks AUTO.
+			try {
+				if (pin?.auto === true) {
+					authStorage.setSessionCredentialAuto(record.provider, credentialSessionId);
+					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
+				} else if (
+					pin &&
+					(pin.kind === "id" || pin.kind === "email" || pin.kind === "account" || pin.kind === "project") &&
+					typeof pin.value === "string"
+				) {
+					if (
+						pin.kind === "id" &&
+						(!startupAuthConfig?.credentialStoreIdentity ||
+							record.credentialStoreIdentity !== startupAuthConfig.credentialStoreIdentity)
+					) {
+						throw new Error("Durable numeric credential pin authority changed");
+					}
+					authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {
+						kind: pin.kind,
+						value: pin.value,
+					});
+					staleDurableCredentialPins.delete(resolveOAuthStorageProvider(record.provider));
+				}
+			} catch {
+				// A newer stale pin must not leave an earlier replayed selector active.
+				authStorage.clearSessionCredentialSelector(record.provider, credentialSessionId);
+				staleDurableCredentialPins.add(resolveOAuthStorageProvider(record.provider));
+			}
+		}
+		if (staleDurableCredentialPins.size > 0) {
+			logger.warn("Stale durable credential pin discarded; re-pin or select AUTO explicitly", {
+				providers: [...staleDurableCredentialPins].map(sanitizeProviderForLog),
+			});
+		}
+		if (!scopeAlreadyLeased) {
+			for (const [provider, rawSelector] of Object.entries(configuredPins)) {
+				if (staleDurableCredentialPins.has(resolveOAuthStorageProvider(provider))) continue;
+				if (
+					authStorage.hasSessionCredentialSelector(provider, credentialSessionId) ||
+					authStorage.hasSessionCredentialAuto(provider, credentialSessionId)
+				)
+					continue;
+				const selector = parsePersistedCredentialSelector(rawSelector);
+				if (!selector) continue;
+				if (selector.kind === "id" && !persistedPinStoreMatches) {
+					logger.warn("Numeric persistent credential pin discarded after credential-store authority changed", {
+						provider: sanitizeProviderForLog(provider),
+					});
+					continue;
+				}
+				applyCredentialSelector(credentialSessionId, provider, selector);
+			}
+		}
+		if (options.credentialSelector?.provider) {
+			applyCredentialSelector(
+				credentialSessionId,
+				options.credentialSelector.provider,
+				options.credentialSelector.selector,
+			);
+		}
 
 		const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
 		const modelMatchPreferences = {
@@ -2266,6 +2361,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				};
 				if (Object.keys(mergedConfigs).length > 0) {
 					const owned = new MCPManager(cwd, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
+					owned.setAuthStorage(authStorage);
 					cleanupOwnedMcpManager = () => owned.disconnectAll();
 					try {
 						const result = await owned.connectServers(mergedConfigs, mergedSources as never);
@@ -2687,18 +2783,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						: formatNoModelsAvailableFallback();
 			}
 		}
+		if (options.credentialSelector && !options.credentialSelector.provider && model) {
+			applyCredentialSelector(credentialSessionId, model.provider, options.credentialSelector.selector);
+		}
 
-		if (options.credentialSelector && !runtimeCredentialSelectorInstalled) {
-			const credentialProvider = options.credentialSelector.provider ?? model?.provider;
-			if (!credentialProvider) {
-				throw new Error(
-					`--credential ${options.credentialSelector.raw} requires a resolved model or an explicit provider prefix`,
-				);
-			}
-			installRuntimeCredentialSelector(credentialProvider);
-			if (!options.modelRegistry && !canRefreshModelsBeforeCredentialSelector) {
-				modelRegistry.refreshInBackground();
-			}
+		if (options.credentialSelector && !options.credentialSelector.provider && !model?.provider) {
+			throw new Error(
+				`--credential ${options.credentialSelector.raw} requires a resolved model or an explicit provider prefix`,
+			);
 		}
 		// Safety net: every resolution branch above already filters candidates by
 		// `preferredCredentialProvider` (session restore, settings default, fallback
@@ -3347,20 +3439,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getApiKey: async provider => {
 				// Read agent.sessionId at call time so credential selection stays aligned
 				// with metadataResolver after /new, fork, resume, or branch switches.
-				const key = await modelRegistry.getApiKeyForProvider(
-					provider,
-					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
-				);
+				const key = await modelRegistry.getApiKeyForProvider(provider, credentialSessionId);
 				if (!key) {
 					throw new Error(`No API key found for provider "${provider}"`);
 				}
 				return key;
 			},
-			getAuthCredentialType: provider =>
-				modelRegistry.getSessionCredentialType(
-					provider,
-					options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId,
-				),
+			getAuthCredentialType: provider => modelRegistry.getSessionCredentialType(provider, credentialSessionId),
 			streamFn: async (streamModel, context, streamOptions) => {
 				const requestStartedAt = performance.now();
 				let stream: Awaited<ReturnType<typeof streamSimple>>;
@@ -3368,8 +3453,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					stream = await streamSimple(streamModel, context, {
 						...streamOptions,
 						onAuthError: async (provider, oldKey, error) => {
-							const credentialSessionId =
-								options.credentialSessionId ?? agent.providerSessionId ?? agent.sessionId;
 							await modelRegistry.authStorage.invalidateCredentialMatching(provider, oldKey, {
 								signal: streamOptions?.signal,
 								sessionId: credentialSessionId,
@@ -3549,7 +3632,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agentRegistry,
 			asyncJobProviderSessionId: options.providerSessionId,
 			providerSessionId: options.providerSessionId,
-			credentialSessionId: options.credentialSessionId,
+			credentialSessionId,
+			credentialStoreIdentity: startupAuthConfig?.credentialStoreIdentity,
 			providerCacheSessionId: providerSessionId,
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,

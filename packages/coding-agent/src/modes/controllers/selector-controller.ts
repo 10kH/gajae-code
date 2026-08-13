@@ -1,6 +1,12 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, Model } from "@gajae-code/ai/core";
+import {
+	type Api,
+	type AuthCredentialSelector,
+	type CredentialRemovalTarget,
+	type Model,
+	resolveOAuthStorageProvider,
+} from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
@@ -88,10 +94,10 @@ import type { NotificationSessionStatus } from "../../sdk/bus/session-control";
 import { ensureTelegramDaemonRunningDetailed, resolveTelegramSetupPreflight } from "../../sdk/bus/telegram-daemon";
 import { TelegramDaemonController } from "../../sdk/bus/telegram-daemon-control";
 import { runTelegramSetup, type TelegramSetupPreflight } from "../../sdk/bus/telegram-setup";
+import { clearPersistentPinForRemovedRows } from "../../session/account-inventory";
 import type { DefaultFallbackRuntimeState } from "../../session/agent-session";
 import { type SessionInfo, SessionManager } from "../../session/session-manager";
 import { getTreeForInternalRead } from "../../session/session-manager-internal";
-
 import { FileSessionStorage } from "../../session/session-storage";
 import {
 	CREDENTIAL_AUTO_IMPORT_DISCOVERY_WARNING,
@@ -3192,18 +3198,60 @@ export class SelectorController {
 		}
 	}
 
-	async #handleOAuthLogout(providerId: string): Promise<void> {
+	async #handleOAuthLogout(providerId: string, targets?: readonly CredentialRemovalTarget[]): Promise<void> {
 		try {
-			await this.ctx.session.modelRegistry.authStorage.logout(providerId);
+			const authStorage = this.ctx.session.modelRegistry.authStorage;
+			const inventory = authStorage.listCredentialInventory(providerId);
+			const oauthRows = inventory.filter(row => row.provider === providerId && row.credentialKind === "oauth");
+			const removalTargetsById = new Map(
+				authStorage.listCredentialRemovalTargets(providerId).map(target => [target.id, target]),
+			);
+			const oauthRemovalTargets = oauthRows
+				.map(row => removalTargetsById.get(row.id))
+				.filter((target): target is CredentialRemovalTarget => target !== undefined);
+			if (oauthRows.length > 0 && oauthRemovalTargets.length === 0) {
+				this.ctx.showError(
+					`Logout is broker-managed for ${providerId}; run \`gjc auth-broker logout ${providerId}\` on the broker host.`,
+				);
+				return;
+			}
+			if (targets) {
+				if (targets.length === 0) {
+					this.ctx.showError(
+						`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`,
+					);
+					return;
+				}
+				const result = authStorage.removeAuthCredentialsHard(providerId, targets);
+				if (result.kind !== "removed") {
+					this.ctx.showError(
+						"Logout failed: account inventory changed; no credentials were removed. Retry /logout.",
+					);
+					return;
+				}
+				await clearPersistentPinForRemovedRows(this.ctx.settings, providerId, inventory, result.ids);
+				await this.ctx.session.modelRegistry.refresh();
+				this.ctx.showStatus(
+					`Successfully removed ${result.ids.length} OAuth account${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
+				);
+				return;
+			}
+			if (oauthRemovalTargets.length === 0) {
+				this.ctx.showError(
+					`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`,
+				);
+				return;
+			}
+			const result = authStorage.removeAuthCredentialsHard(providerId, oauthRemovalTargets);
+			if (result.kind !== "removed") {
+				this.ctx.showError("Logout failed: account inventory changed; no credentials were removed. Retry /logout.");
+				return;
+			}
+			await clearPersistentPinForRemovedRows(this.ctx.settings, providerId, inventory, result.ids);
 			await this.ctx.session.modelRegistry.refresh();
-			this.ctx.chatContainer.addChild(new Spacer(1));
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("success", `${theme.status.success} Successfully logged out of ${providerId}`), 1, 0),
+			this.ctx.showStatus(
+				`Successfully removed ${result.ids.length} OAuth account${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
 			);
-			this.ctx.chatContainer.addChild(
-				new Text(theme.fg("dim", `Credentials removed from ${getAgentDbPath()}`), 1, 0),
-			);
-			this.ctx.ui.requestRender();
 		} catch (error: unknown) {
 			this.ctx.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
 		}
@@ -3215,16 +3263,95 @@ export class SelectorController {
 		options?: OAuthSelectorOptions,
 	): Promise<void> {
 		if (providerId) {
-			const oauthProvider = getOAuthProviders().find(provider => provider.id === providerId);
-			if (!oauthProvider && !this.ctx.session.modelRegistry.getModelProfiles().has(providerId)) {
-				this.ctx.showError(`Unknown OAuth provider: ${providerId}`);
+			const selectedProviderId = mode === "logout" ? resolveOAuthStorageProvider(providerId) : providerId;
+			const oauthProvider = getOAuthProviders().find(provider => provider.id === selectedProviderId);
+			if (!oauthProvider && !this.ctx.session.modelRegistry.getModelProfiles().has(selectedProviderId)) {
+				this.ctx.showError(`Unknown OAuth provider: ${selectedProviderId}`);
+				return;
+			}
+			const authStorage = this.ctx.session.modelRegistry.authStorage;
+			const hasOAuthInventory = authStorage
+				.listCredentialInventory(selectedProviderId)
+				.some(row => row.provider === selectedProviderId && row.credentialKind === "oauth");
+			const hasRemovableOAuth = authStorage
+				.listCredentialRemovalTargets(selectedProviderId)
+				.some(target => target.provider === selectedProviderId);
+			if (mode === "logout" && hasOAuthInventory && !hasRemovableOAuth) {
+				await this.#handleOAuthLogout(selectedProviderId);
+				return;
+			}
+			if (hasOAuthInventory && !options?.manualCode) {
+				this.showSelector(done => {
+					let selector: OAuthSelectorComponent;
+					selector = new OAuthSelectorComponent(
+						mode,
+						authStorage,
+						() => undefined,
+						() => {
+							selector.stopValidation();
+							done();
+							this.ctx.ui.requestRender();
+						},
+						{
+							accountProviderId: selectedProviderId,
+							onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
+								await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
+								selector.stopValidation();
+								done();
+								this.ctx.showStatus(`Pinned OAuth account for ${selectedProviderId} to this session.`);
+							},
+							onAutoSelect: async () => {
+								await this.ctx.session.setCredentialAuto(selectedProviderId);
+								selector.stopValidation();
+								done();
+								this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);
+							},
+							onAddAccount: async () => {
+								selector.stopValidation();
+								done();
+								await this.#handleOAuthLogin(selectedProviderId, options);
+							},
+							onAccountRemove: async targets => {
+								await this.#handleOAuthLogout(selectedProviderId, targets);
+								selector.stopValidation();
+								done();
+							},
+						},
+					);
+					return { component: selector, focus: selector };
+				});
 				return;
 			}
 			if (mode === "login") {
-				await this.#handleOAuthLogin(providerId, options);
-			} else {
-				await this.#handleOAuthLogout(providerId);
+				await this.#handleOAuthLogin(selectedProviderId, options);
+				return;
 			}
+			if (!hasRemovableOAuth) {
+				await this.#handleOAuthLogout(selectedProviderId);
+				return;
+			}
+			this.showSelector(done => {
+				let selector: OAuthSelectorComponent;
+				selector = new OAuthSelectorComponent(
+					"logout",
+					authStorage,
+					() => undefined,
+					() => {
+						selector.stopValidation();
+						done();
+						this.ctx.ui.requestRender();
+					},
+					{
+						accountProviderId: selectedProviderId,
+						onAccountRemove: async targets => {
+							await this.#handleOAuthLogout(selectedProviderId, targets);
+							selector.stopValidation();
+							done();
+						},
+					},
+				);
+				return { component: selector, focus: selector };
+			});
 			return;
 		}
 
@@ -3366,11 +3493,7 @@ export class SelectorController {
 				async (selectedProviderId: string) => {
 					selector.stopValidation();
 					done();
-					if (mode === "login") {
-						await this.#handleOAuthLogin(selectedProviderId);
-					} else {
-						await this.#handleOAuthLogout(selectedProviderId);
-					}
+					await this.showOAuthSelector(mode, selectedProviderId);
 				},
 				() => {
 					selector.stopValidation();

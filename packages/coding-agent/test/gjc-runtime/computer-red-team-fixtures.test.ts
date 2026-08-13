@@ -525,7 +525,12 @@ export function isToolAllowed(name: string): boolean {
 		await writeQaArtifacts(root);
 		await seedComputerChange(root);
 		const invalidPath = Buffer.concat([Buffer.from(root), Buffer.from(path.sep), Buffer.from([0xff])]);
-		await fs.writeFile(invalidPath, "unrepresentable pathname\n");
+		try {
+			await fs.writeFile(invalidPath, "unrepresentable pathname\n");
+		} catch (error) {
+			if (process.platform === "darwin" && (error as NodeJS.ErrnoException).code === "EILSEQ") return;
+			throw error;
+		}
 		const cases = (executorQa().adversarialCases as Record<string, unknown>[]).filter(
 			row => row.id !== "blast-radius",
 		);

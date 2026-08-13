@@ -340,6 +340,62 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		}
 	});
 
+	test("uses an unqualified credential selector while checking fallback model availability", async () => {
+		const anthropicModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!anthropicModel) throw new Error("Expected a bundled anthropic model");
+		await authStorage.set("anthropic", [
+			{
+				type: "oauth",
+				access: "selector-access",
+				refresh: "selector-refresh",
+				expires: Date.now() + 60_000,
+				email: "selector@example.test",
+			},
+		]);
+		const row = authStorage.exportSnapshot().credentials.find(entry => entry.provider === "anthropic");
+		if (!row) throw new Error("Expected an anthropic credential row");
+		const calls: Array<{ provider: string; selector: unknown }> = [];
+		const getApiKeySpy = vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, _session, options) => {
+			calls.push({ provider: model.provider, selector: options?.credentialSelector });
+			return model.provider === "anthropic" && options?.credentialSelector?.kind === "id"
+				? "selected-key"
+				: undefined;
+		});
+		try {
+			const { session } = await createAgentSession({
+				...buildSessionOptions(),
+				credentialSelector: {
+					selector: { kind: "id", value: String(row.id) },
+					raw: `id:${row.id}`,
+				},
+			});
+			try {
+				expect(session.model?.provider).toBe("anthropic");
+				expect(calls.some(call => call.provider === "anthropic" && call.selector !== undefined)).toBe(true);
+			} finally {
+				await session.dispose();
+			}
+		} finally {
+			getApiKeySpy.mockRestore();
+		}
+	});
+
+	test("passes the resolved provider credential scope into the AgentSession", async () => {
+		const scopeId = "provider-credential-scope";
+		const { session } = await createAgentSession({
+			...buildSessionOptions("runtime-provider/runtime-model"),
+			providerSessionId: scopeId,
+			credentialSessionId: undefined,
+		});
+		try {
+			expect(session.credentialSessionId).toBe(scopeId);
+			expect(authStorage.hasCredentialScopeLease(scopeId)).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+		expect(authStorage.hasCredentialScopeLease(scopeId)).toBe(false);
+	});
+
 	test("a model resolved from another provider than the preferred credential fails closed", async () => {
 		await authStorage.set("anthropic", [
 			{

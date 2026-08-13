@@ -17,6 +17,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
 import {
 	AuthBrokerClient,
 	type AuthCredential,
@@ -28,13 +29,19 @@ import {
 	listProvidersWithEnvKey,
 	type OAuthCredential,
 	type OAuthProvider,
+	resolveOAuthStorageProvider,
 	SqliteAuthCredentialStore,
 	startAuthBroker,
 } from "@gajae-code/ai/core";
-import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, isEnoent, logger, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, getAgentDbPath, getConfigRootDir, logger, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
-import { resolveAuthBrokerConfig } from "../session/auth-broker-config";
+import {
+	createSecureTokenFileExclusive,
+	readSecureTokenFile,
+	writeSecureTokenFile,
+} from "../session/secure-token-file";
+import { resolveStartupAuthConfig } from "../session/startup-auth-config";
 
 export type AuthBrokerAction = "serve" | "token" | "login" | "logout" | "status" | "import" | "migrate";
 
@@ -62,6 +69,39 @@ export interface AuthBrokerCommandArgs {
 
 const ACTIONS: readonly AuthBrokerAction[] = ["serve", "token", "login", "logout", "import", "migrate", "status"];
 
+type AuthBrokerCliErrorCode =
+	| "broker_unavailable"
+	| "credential_import_failed"
+	| "credential_migration_failed"
+	| "auth_broker_command_failed";
+
+function stableErrorForAction(action: AuthBrokerAction): { code: AuthBrokerCliErrorCode; message: string } {
+	switch (action) {
+		case "status":
+			return { code: "broker_unavailable", message: "Auth broker is unavailable." };
+		case "import":
+			return { code: "credential_import_failed", message: "Credential import failed." };
+		case "migrate":
+			return { code: "credential_migration_failed", message: "Credential migration failed." };
+		default:
+			return { code: "auth_broker_command_failed", message: "Auth broker command failed." };
+	}
+}
+
+function safeDiagnostic(value: unknown, fallback: string): string {
+	return cleanReason(value) ?? fallback;
+}
+
+function writeCommandFailure(action: AuthBrokerAction, flags: AuthBrokerCommandArgs["flags"], error: unknown): void {
+	const stable = stableErrorForAction(action);
+	if (flags.json) {
+		process.stdout.write(`${JSON.stringify({ ok: false, error: stable })}\n`);
+	} else {
+		process.stderr.write(`${chalk.red("FAILED")} ${safeDiagnostic(error, stable.message)}\n`);
+	}
+	process.exitCode = 1;
+}
+
 /** Callback ports baked from the per-provider OAuth flow modules. */
 const CALLBACK_PORTS: Record<string, number> = {
 	anthropic: 54545,
@@ -78,25 +118,15 @@ function getTokenFilePath(): string {
 }
 
 async function readToken(): Promise<string | null> {
-	try {
-		const raw = await Bun.file(getTokenFilePath()).text();
-		const trimmed = raw.trim();
-		return trimmed.length > 0 ? trimmed : null;
-	} catch (err) {
-		if (isEnoent(err)) return null;
-		throw err;
-	}
+	return readSecureTokenFile(getTokenFilePath());
 }
 
 async function writeToken(token: string): Promise<void> {
-	const file = getTokenFilePath();
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
-	await Bun.write(file, token);
-	try {
-		await fs.chmod(file, 0o600);
-	} catch {
-		// Best-effort (e.g. Windows).
-	}
+	await writeSecureTokenFile(getTokenFilePath(), token);
+}
+
+async function createTokenExclusive(token: string): Promise<boolean> {
+	return createSecureTokenFileExclusive(getTokenFilePath(), token);
 }
 
 function generateToken(): string {
@@ -107,8 +137,19 @@ async function ensureToken(): Promise<string> {
 	const existing = await readToken();
 	if (existing) return existing;
 	const token = generateToken();
-	await writeToken(token);
-	return token;
+	if (await createTokenExclusive(token)) return token;
+	// Another concurrent invocation won the create race. Its file may exist
+	// briefly before the winner writes the token, so retry reads without ever
+	// overwriting the winner's file.
+	for (let attempt = 0; attempt < 5; attempt++) {
+		const fromRace = await readToken();
+		if (fromRace) return fromRace;
+		if (attempt < 4) await Bun.sleep(10);
+	}
+	// If the file disappeared, make one final exclusive-create attempt. Never
+	// fall back to an unconditional write after observing EEXIST.
+	if (await createTokenExclusive(token)) return token;
+	throw new Error("Unable to initialize auth-broker token: another process owns an empty token file.");
 }
 
 async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
@@ -133,7 +174,7 @@ async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	logger.info("auth-broker bearer token loaded", { path: getTokenFilePath(), mode: "0600" });
 
 	const credentialDisabledUnsub = storage.onCredentialDisabled((event: CredentialDisabledEvent) => {
-		logger.warn("auth-broker credential disabled", { ...event });
+		logger.warn("auth-broker credential disabled", { provider: event.provider });
 	});
 
 	const shutdown = async (signal: NodeJS.Signals): Promise<void> => {
@@ -241,10 +282,11 @@ async function runLogout(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 	if (!providerArg) {
 		throw new Error("Usage: gjc auth-broker logout <provider>");
 	}
+	const provider = resolveOAuthStorageProvider(providerArg);
 	const store = await SqliteAuthCredentialStore.open(getAgentDbPath());
 	try {
-		store.deleteAuthCredentialsForProvider(providerArg, "logged out by user");
-		process.stdout.write(`Logged out of ${providerArg}\n`);
+		store.deleteAuthCredentialsForProvider(provider, "logged out by user");
+		process.stdout.write(`Logged out of ${provider}\n`);
 	} finally {
 		store.close();
 	}
@@ -338,7 +380,7 @@ async function loadImportPlan(
 		try {
 			json = (await Bun.file(file).json()) as CliProxyCredentialJson;
 		} catch (err) {
-			skipped.push({ file, reason: `unreadable JSON: ${String(err)}` });
+			skipped.push({ file, reason: `unreadable JSON: ${safeDiagnostic(err, "unreadable JSON")}` });
 			continue;
 		}
 		if (json.disabled === true && !includeDisabled) {
@@ -415,14 +457,19 @@ async function runImport(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 					disabled: e.disabled,
 					file: e.sourceFile,
 				})),
-				skipped,
+				skipped: skipped.map(skip => ({
+					...skip,
+					reason: safeDiagnostic(skip.reason, "Credential import skipped."),
+				})),
 			})}\n`,
 		);
 	}
 
 	if (!flags.json) {
 		for (const skip of skipped) {
-			process.stdout.write(`${chalk.yellow("skip")} ${skip.file}: ${skip.reason}\n`);
+			process.stdout.write(
+				`${chalk.yellow("skip")} ${skip.file}: ${safeDiagnostic(skip.reason, "Credential import skipped.")}\n`,
+			);
 		}
 	}
 
@@ -439,7 +486,7 @@ async function runImport(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 		return;
 	}
 
-	const brokerConfig = await resolveAuthBrokerConfig();
+	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	if (brokerConfig) {
 		const client = new AuthBrokerClient({ url: brokerConfig.url, token: brokerConfig.token });
 		for (const entry of entries) {
@@ -449,11 +496,14 @@ async function runImport(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 					process.stdout.write(`${chalk.green("uploaded")} ${describeImportEntry(entry)} → ${brokerConfig.url}\n`);
 				}
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
 				if (flags.json) {
-					process.stdout.write(`${JSON.stringify({ error: message, file: entry.sourceFile })}\n`);
+					process.stdout.write(
+						`${JSON.stringify({ ok: false, error: { code: "credential_import_failed", message: "Credential import failed." }, file: entry.sourceFile })}\n`,
+					);
 				} else {
-					process.stdout.write(`${chalk.red("failed")} ${describeImportEntry(entry)}: ${message}\n`);
+					process.stdout.write(
+						`${chalk.red("failed")} ${describeImportEntry(entry)}: ${safeDiagnostic(error, "Credential import failed.")}\n`,
+					);
 				}
 				process.exitCode = 1;
 			}
@@ -531,7 +581,7 @@ function brokerAlreadyHas(existing: Map<string, Set<string>>, provider: string, 
 }
 
 async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
-	const brokerConfig = await resolveAuthBrokerConfig();
+	const brokerConfig = (await resolveStartupAuthConfig()).broker;
 	if (!brokerConfig) {
 		throw new Error(
 			"GJC_AUTH_BROKER_URL must be set (or `auth.broker.url` in config.yml). `migrate` uploads local credentials to a configured broker.",
@@ -640,13 +690,16 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 			`${JSON.stringify({
 				dryRun: flags.dryRun === true,
 				plan: plan.map(p => ({ source: p.source, provider: p.provider, identity: p.identity })),
-				skipped,
+				skipped: skipped.map(skip => ({
+					...skip,
+					reason: safeDiagnostic(skip.reason, "Credential migration skipped."),
+				})),
 			})}\n`,
 		);
 	} else {
 		for (const skip of skipped) {
 			process.stdout.write(
-				`${chalk.yellow("skip")} [${skip.source}] ${skip.provider} ${skip.identity}: ${skip.reason}\n`,
+				`${chalk.yellow("skip")} [${skip.source}] ${skip.provider} ${skip.identity}: ${safeDiagnostic(skip.reason, "Credential migration skipped.")}\n`,
 			);
 		}
 	}
@@ -673,11 +726,14 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 				process.stdout.write(`${chalk.green("uploaded")} [${entry.source}] ${entry.provider} ${entry.identity}\n`);
 			}
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
 			if (flags.json) {
-				process.stdout.write(`${JSON.stringify({ error: message, provider: entry.provider })}\n`);
+				process.stdout.write(
+					`${JSON.stringify({ ok: false, error: { code: "credential_migration_failed", message: "Credential migration failed." }, provider: entry.provider })}\n`,
+				);
 			} else {
-				process.stdout.write(`${chalk.red("failed")} [${entry.source}] ${entry.provider}: ${message}\n`);
+				process.stdout.write(
+					`${chalk.red("failed")} [${entry.source}] ${entry.provider}: ${safeDiagnostic(error, "Credential migration failed.")}\n`,
+				);
 			}
 			process.exitCode = 1;
 		}
@@ -685,10 +741,13 @@ async function runMigrate(flags: AuthBrokerCommandArgs["flags"]): Promise<void> 
 }
 
 async function runStatus(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
-	const cfg = await resolveAuthBrokerConfig();
+	const cfg = (await resolveStartupAuthConfig()).broker;
 	if (!cfg) {
 		const message = "No auth-broker configured (set GJC_AUTH_BROKER_URL to enable).";
-		if (flags.json) process.stdout.write(`${JSON.stringify({ ok: false, reason: "not_configured" })}\n`);
+		if (flags.json)
+			process.stdout.write(
+				`${JSON.stringify({ ok: false, error: { code: "broker_not_configured", message: "Auth broker is not configured." } })}\n`,
+			);
 		else process.stdout.write(`${chalk.yellow(message)}\n`);
 		return;
 	}
@@ -701,44 +760,55 @@ async function runStatus(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {
 			process.stdout.write(`${chalk.green("OK")} ${cfg.url} (version=${health.version ?? "unknown"})\n`);
 		}
 	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
 		if (flags.json) {
-			process.stdout.write(`${JSON.stringify({ ok: false, url: cfg.url, error: message })}\n`);
+			process.stdout.write(
+				`${JSON.stringify({ ok: false, url: cfg.url, error: { code: "broker_unavailable", message: "Auth broker is unavailable." } })}\n`,
+			);
 		} else {
-			process.stdout.write(`${chalk.red("FAILED")} ${cfg.url}: ${message}\n`);
+			process.stdout.write(
+				`${chalk.red("FAILED")} ${cfg.url}: ${safeDiagnostic(error, "Auth broker is unavailable.")}\n`,
+			);
 		}
 		process.exitCode = 1;
 	}
 }
 
 export async function runAuthBrokerCommand(cmd: AuthBrokerCommandArgs): Promise<void> {
-	switch (cmd.action) {
-		case "serve":
-			await runServe(cmd.flags);
-			return;
-		case "token":
-			await runToken(cmd.flags);
-			return;
-		case "login":
-			await runLogin(cmd.flags);
-			return;
-		case "logout":
-			await runLogout(cmd.flags);
-			return;
-		case "import":
-			await runImport(cmd.flags);
-			return;
-		case "migrate":
-			await runMigrate(cmd.flags);
-			return;
-		case "status":
-			await runStatus(cmd.flags);
-			return;
-		default: {
-			// Exhaustive check.
-			const _exhaustive: never = cmd.action;
-			throw new Error(`Unknown auth-broker action: ${String(_exhaustive)}`);
+	try {
+		switch (cmd.action) {
+			case "serve":
+				await runServe(cmd.flags);
+				return;
+			case "token":
+				await runToken(cmd.flags);
+				return;
+			case "login":
+				await runLogin(cmd.flags);
+				return;
+			case "logout":
+				await runLogout(cmd.flags);
+				return;
+			case "import":
+				await runImport(cmd.flags);
+				return;
+			case "migrate":
+				await runMigrate(cmd.flags);
+				return;
+			case "status":
+				await runStatus(cmd.flags);
+				return;
+			default: {
+				// Exhaustive check.
+				const _exhaustive: never = cmd.action;
+				throw new Error(`Unknown auth-broker action: ${String(_exhaustive)}`);
+			}
 		}
+	} catch (error) {
+		if (cmd.action === "status" || cmd.action === "import" || cmd.action === "migrate") {
+			writeCommandFailure(cmd.action, cmd.flags, error);
+			return;
+		}
+		throw error;
 	}
 }
 

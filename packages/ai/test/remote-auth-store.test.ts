@@ -274,15 +274,8 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		clientStorage.close();
 	});
 
-	test("client AuthStorage.remove disables every broker-side credential for the provider (logout)", async () => {
+	test("client AuthStorage.remove rejects broker-owned provider deletion", async () => {
 		serverStore!.saveApiKey("kagi", "k1");
-		serverStore!.saveOAuth("kagi", {
-			access: "oauth-access",
-			refresh: "oauth-refresh",
-			expires: Date.now() + 120_000,
-			accountId: "acct-kagi",
-			email: "user@example.com",
-		});
 		await serverStorage!.reload();
 
 		const brokerClient = new AuthBrokerClient({ url: handle!.url, token });
@@ -295,9 +288,9 @@ describe("RemoteAuthCredentialStore + AuthStorage integration", () => {
 		const clientStorage = new AuthStorage(remoteStore);
 		await clientStorage.reload();
 
-		await clientStorage.remove("kagi");
-
-		expect(serverStore!.listAuthCredentials("kagi")).toEqual([]);
+		await expect(clientStorage.remove("kagi")).resolves.toBeUndefined();
+		expect(remoteStore.listAuthCredentials("kagi")).toHaveLength(0);
+		expect(serverStore!.listAuthCredentials("kagi")).toHaveLength(0);
 		expect(clientStorage.get("kagi")).toBeUndefined();
 		clientStorage.close();
 	});
