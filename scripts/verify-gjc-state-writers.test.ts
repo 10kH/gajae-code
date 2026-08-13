@@ -99,3 +99,17 @@ test("detects computed and indirect namespace calls, distant targets, and non-ts
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("detects constructed constant .gjc paths", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-writer-constructed-"));
+	try {
+		const file = path.join(root, "packages", "coding-agent", "src", "constructed.ts");
+		await fs.mkdir(path.dirname(file), { recursive: true });
+		await Bun.write(file, 'const target = "." + "gjc/pwned.json";\nawait Bun.write(target, "pwn");\n');
+		const result = await run(root);
+		expect(result.exitCode).toBe(1);
+		expect(`${result.stdout}\n${result.stderr}`).toContain("constructed.ts");
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

@@ -171,7 +171,7 @@ function locallyReferencesGjc(lines: readonly string[], index: number): boolean 
 	for (let i = start; i <= end; i++) {
 		const line = lines[i]?.trim() ?? "";
 		if (line.startsWith("//") || line.startsWith("*")) continue;
-		if (GJC_REFERENCE_PATTERNS.some(re => re.test(line))) return true;
+		if (sameLineReferencesGjc(line)) return true;
 	}
 	return false;
 }
@@ -185,7 +185,7 @@ function nearbyAssignmentTargetsThisLine(lines: readonly string[], index: number
 	const start = Math.max(0, index - 25);
 	for (let i = start; i < index; i++) {
 		const prior = lines[i]?.trim() ?? "";
-		if (!GJC_REFERENCE_PATTERNS.some(re => re.test(prior))) continue;
+		if (!sameLineReferencesGjc(prior)) continue;
 		const assignment = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=/u.exec(prior);
 		if (assignment && new RegExp(`\\b${assignment[1]}\\b`, "u").test(line)) return true;
 	}
@@ -193,7 +193,10 @@ function nearbyAssignmentTargetsThisLine(lines: readonly string[], index: number
 }
 
 function sameLineReferencesGjc(line: string): boolean {
-	return GJC_REFERENCE_PATTERNS.some(re => re.test(line));
+	if (GJC_REFERENCE_PATTERNS.some(re => re.test(line))) return true;
+	if (lineLooksLikeGeneratedStringLiteral(line)) return false;
+	const stringParts = [...line.matchAll(/["'`]([^"'`]*)["'`]/gu)].map(match => match[1]!).join("");
+	return /(?:^|[\\/])?\.gjc(?:[\\/]|$)/u.test(stringParts);
 }
 
 
