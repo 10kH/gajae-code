@@ -797,7 +797,10 @@ function losslessDetachedClone<T>(value: T): T {
 				}
 				const output: unknown[] | Record<string, unknown> = Array.isArray(input) ? [] : {};
 				seen.set(input, output);
-				for (const key of Object.keys(input)) {
+				const keys = Object.keys(input);
+				const keyLimit = Math.min(keys.length, Math.max(0, budget));
+				for (let index = 0; index < keyLimit && budget > 0; index++) {
+					const key = keys[index]!;
 					const descriptor = Object.getOwnPropertyDescriptor(input, key);
 					if (!descriptor || !("value" in descriptor)) continue;
 					const child = clone(descriptor.value);
@@ -2030,7 +2033,7 @@ async function runLoopBody(
 				// can then abort the run before any tool execute() is entered.
 				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
 					if (loopSignal.aborted) break;
-					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(loopSignal);
+					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
 					if (loopSignal.aborted) break;
 				}
 			}
