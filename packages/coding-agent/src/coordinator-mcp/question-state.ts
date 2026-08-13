@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
-import { syncCoordinatorDirectory, syncCoordinatorFile, writeCoordinatorAtomic } from "./durability";
+import { appendCoordinatorFile, writeCoordinatorAtomic } from "./durability";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
 
 export type CoordinatorSessionState =
@@ -652,14 +652,7 @@ export async function appendOutboxEvents(
 		);
 		const events = Object.values(transaction.outbox).filter(event => !event.emitted && !ids.has(event.id));
 		if (events.length > 0) {
-			const handle = await fs.open(paths.journal, "a", 0o600);
-			try {
-				await handle.writeFile(`${events.map(event => JSON.stringify(event)).join("\n")}\n`);
-				await syncCoordinatorFile(handle);
-			} finally {
-				await handle.close();
-			}
-			await syncCoordinatorDirectory(path.dirname(paths.journal));
+			await appendCoordinatorFile(paths.journal, `${events.map(event => JSON.stringify(event)).join("\n")}\n`);
 		}
 		for (const event of Object.values(transaction.outbox)) event.emitted = true;
 		transaction.projection.applied_events_revision = transaction.revision;

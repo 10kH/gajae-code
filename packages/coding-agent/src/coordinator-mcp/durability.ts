@@ -62,16 +62,20 @@ export async function syncCoordinatorFile(
 }
 
 /** Append a durable coordinator journal or diagnostic record, then barrier its parent. */
-export async function appendCoordinatorFile(file: string, contents: string): Promise<void> {
+export async function appendCoordinatorFile(
+	file: string,
+	contents: string,
+	options: CoordinatorDirectoryBarrierOptions & CoordinatorFileDurabilityOptions = {},
+): Promise<void> {
 	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
 	const handle = await fs.open(file, "a", 0o600);
 	try {
 		await handle.writeFile(contents);
-		await syncCoordinatorFile(handle);
+		await syncCoordinatorFile(handle, options);
 	} finally {
 		await handle.close();
 	}
-	await syncCoordinatorDirectory(path.dirname(file));
+	await syncCoordinatorDirectory(path.dirname(file), options);
 }
 
 /** Atomically publish a synced coordinator state file, then barrier its parent. */

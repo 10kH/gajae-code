@@ -36,6 +36,18 @@ describe("Coordinator durability", () => {
 		).rejects.toMatchObject({ code: "EIO" });
 	});
 
+	it("keeps Windows directory close failures fail-closed", async () => {
+		const handle = {
+			async sync(): Promise<void> {},
+			async close(): Promise<void> {
+				throw errno("EIO");
+			},
+		} as fs.FileHandle;
+		await expect(
+			syncCoordinatorDirectory("state", { platform: "win32", openDirectory: async () => handle }),
+		).rejects.toMatchObject({ code: "EIO" });
+	});
+
 	it("accepts only unsupported Windows directory barriers after file durability", async () => {
 		const calls: string[] = [];
 		const handle = {
@@ -86,12 +98,42 @@ describe("Coordinator durability", () => {
 		}
 	});
 
-	it("appends a journal record only after file durability", async () => {
+	it("appends a journal record only after file durability and its parent barrier", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-durability-"));
 		try {
 			const file = path.join(root, "event-journal.jsonl");
-			await appendCoordinatorFile(file, "event\n");
+			const calls: string[] = [];
+			await appendCoordinatorFile(file, "event\n", {
+				syncFile: async () => {
+					calls.push("file-sync");
+				},
+				openDirectory: async () => {
+					calls.push("directory-open");
+					return {
+						async sync(): Promise<void> {
+							calls.push("directory-sync");
+						},
+						async close(): Promise<void> {},
+					} as fs.FileHandle;
+				},
+			});
 			expect(await fs.readFile(file, "utf8")).toBe("event\n");
+			expect(calls).toEqual(["file-sync", "directory-open", "directory-sync"]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps append file sync failures fail-closed without a directory barrier", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-durability-"));
+		try {
+			const file = path.join(root, "event-journal.jsonl");
+			await expect(
+				appendCoordinatorFile(file, "event\n", {
+					syncFile: async () => Promise.reject(errno("EIO")),
+					openDirectory: async () => Promise.reject(errno("EIO")),
+				}),
+			).rejects.toMatchObject({ code: "EIO" });
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -137,6 +179,19 @@ describe("Coordinator durability", () => {
 				writeCoordinatorAtomic(file, "state", { syncFile: async () => Promise.reject(errno("EIO")) }),
 			).rejects.toMatchObject({ code: "EIO" });
 			expect(await Bun.file(file).exists()).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("cleans up the temporary file after rename failure", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-durability-"));
+		try {
+			const file = path.join(root, "state.json");
+			await expect(
+				writeCoordinatorAtomic(file, "state", { rename: async () => Promise.reject(errno("EIO")) }),
+			).rejects.toMatchObject({ code: "EIO" });
+			expect((await fs.readdir(root)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
