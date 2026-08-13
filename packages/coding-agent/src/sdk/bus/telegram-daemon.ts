@@ -5034,6 +5034,7 @@ export class TelegramNotificationDaemon {
 			publicationShouldSuppress: (publicationId: string) => this.#publicationShouldSuppress(publicationId),
 			publicationSettlement: (publicationId: string) => this.#publicationSettlement(publicationId),
 			settlePublication: (publicationId: string) => this.#settlePublication(publicationId),
+			drainPersistence: () => this.#presentationPersistenceQueue,
 		};
 	}
 

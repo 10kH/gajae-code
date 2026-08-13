@@ -629,6 +629,8 @@ describe("Telegram topic admission", () => {
 				title: "Orphaned session",
 				telegramTopicsEnabled: true,
 			});
+			const registry = (daemon as unknown as { topics: TopicRegistry }).topics;
+			registry.beginArchive(session.sessionId, "host", Date.now(), "session_closed");
 			bot.calls.length = 0;
 			await daemon.archiveReconciliationHarnessForTest().archiveAuthorizedTopics();
 			// Private-chat archival deletes the orphaned topic.
@@ -665,6 +667,8 @@ describe("Telegram topic admission", () => {
 					title: `Retry ${label}`,
 					telegramTopicsEnabled: true,
 				});
+				const registry = (daemon as unknown as { topics: TopicRegistry }).topics;
+				registry.beginArchive(session.sessionId, "host", Date.now(), "session_closed");
 				bot.calls.length = 0;
 				await daemon.archiveReconciliationHarnessForTest().archiveAuthorizedTopics();
 				expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
