@@ -1531,7 +1531,15 @@ export class ManagedSessionDescendantStore {
 		}
 		const relative = this.#relative(resolved);
 		const observed = this.#authority.stat(relative);
-		if (!observed.ok || !observed.identity) throw new Error(observed.code ?? "managed_replace_missing");
+		if (!observed.ok || !observed.identity) {
+			const rawCode =
+				typeof (observed as { code?: unknown })?.code === "string" ? (observed as { code: string }).code : "";
+			// Authority reports "not_found" for missing, non-authority uses ENOENT.
+			// Normalize to ENOENT so callers' isEnoent() recovers via create.
+			const err = new Error(rawCode || "managed_replace_missing") as NodeJS.ErrnoException;
+			err.code = rawCode === "not_found" ? "ENOENT" : rawCode || "managed_replace_missing";
+			throw err;
+		}
 		const current = managedFileIdentityFromNative(observed.identity);
 		if (!sameManagedIdentity(current, expected)) throw new Error("managed_replace_identity_mismatch");
 		const expectedSha256 =
