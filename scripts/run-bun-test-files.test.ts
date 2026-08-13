@@ -58,9 +58,9 @@ describe("fresh-process test harness contracts", () => {
 		]);
 	});
 
-	test("keeps every AI test-shaped file in the package runtime suite", async () => {
+	test("keeps source-bound evidence out of unrelated AI runtime suites", async () => {
 		const files = await enumerateTestFiles("packages/ai", path.join(import.meta.dir, ".."));
-		expect(files).toContain("packages/ai/test/anthropic-cache-eval.integration.test.ts");
+		expect(files).not.toContain("packages/ai/test/anthropic-cache-eval.integration.test.ts");
 	});
 
 	test("keeps Bun shard assignment deterministic", () => {

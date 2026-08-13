@@ -72,6 +72,12 @@ function isCredentialEnvironmentName(name: string): boolean {
 	return CREDENTIAL_ENV_NAMES.has(name) || CREDENTIAL_ENV_SUFFIXES.some(suffix => name.endsWith(suffix));
 }
 
+// This committed evidence oracle hashes its owning provider source. It is
+// scheduled directly when the evidence artifact changes; unrelated provider
+// edits intentionally make the committed blob stale until that owner regenerates
+// it, so package-wide runtime suites must not execute it implicitly.
+const SOURCE_BOUND_EVIDENCE_TESTS = new Set(["packages/ai/test/anthropic-cache-eval.integration.test.ts"]);
+
 function usage(message?: string): never {
 	if (message) process.stderr.write(`${message}\n`);
 	process.stderr.write(
@@ -127,6 +133,7 @@ export async function enumerateTestFiles(root: string, base: string = repoRoot):
 		const normalized = entry.split(path.sep).join("/");
 		if (!TEST_FILE_PATTERN.test(normalized)) continue;
 		const file = path.posix.join(relativeRoot.split(path.sep).join("/"), normalized);
+		if (SOURCE_BOUND_EVIDENCE_TESTS.has(file)) continue;
 		files.push(file);
 	}
 	return files.sort();
