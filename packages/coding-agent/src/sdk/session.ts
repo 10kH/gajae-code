@@ -18,6 +18,7 @@ import {
 	type Message,
 	type Model,
 	type ProviderSessionState,
+	resolveOAuthStorageProvider,
 	type SimpleStreamOptions,
 	streamSimple,
 	type ToolResultMessage,
@@ -1190,6 +1191,11 @@ function safeErrorForLog(value: unknown): unknown {
 	return safeErrorDescription(value);
 }
 
+function sanitizeProviderForLog(provider: string): string {
+	const sanitized = provider.replace(/[^\x20-\x7e]/g, "?").slice(0, 128);
+	return sanitized.length > 0 ? sanitized : "<empty>";
+}
+
 function attachMcpCleanupDiagnostic(primary: unknown, cleanup: unknown): unknown {
 	const diagnostic = { code: "MCP_MANAGER_CLEANUP_FAILED" as const, cause: cleanup };
 	if (primary && (typeof primary === "object" || typeof primary === "function")) {
@@ -1442,6 +1448,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		authStorage.acquireCredentialScope(credentialSessionId);
 		credentialScopeLeased = true;
 		const configuredPins = startupAuthConfig.credentialPins;
+		// AuthStorage has no scope-level "pinned but unavailable" marker. Keep the
+		// discarded durable pin identity local to this credential scope so startup
+		// config cannot immediately replace it with a different account; later
+		// request-time resolution for this provider remains ordinary AUTO ranking.
+		const staleDurableCredentialPins = new Set<string>();
 		if (options.credentialSelector) {
 			const provider = options.credentialSelector.provider ?? options.model?.provider;
 			if (provider) applyCredentialSelector(credentialSessionId, provider, options.credentialSelector.selector);
@@ -1551,16 +1562,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						value: pin.value,
 					});
 				}
-			} catch (error) {
-				logger.warn("discarding stale durable credential pin during session restore", {
-					provider: record.provider,
-					pinKind: pin?.auto === true ? "auto" : typeof pin?.kind === "string" ? pin.kind : "unknown",
-					error: error instanceof Error ? error.message : String(error),
-				});
+			} catch {
+				staleDurableCredentialPins.add(resolveOAuthStorageProvider(record.provider));
 			}
+		}
+		if (staleDurableCredentialPins.size > 0) {
+			logger.warn("Stale durable credential pin discarded; re-pin or select AUTO explicitly", {
+				providers: [...staleDurableCredentialPins].map(sanitizeProviderForLog),
+			});
 		}
 		if (!scopeAlreadyLeased) {
 			for (const [provider, rawSelector] of Object.entries(configuredPins)) {
+				if (staleDurableCredentialPins.has(resolveOAuthStorageProvider(provider))) continue;
 				if (
 					authStorage.hasSessionCredentialSelector(provider, credentialSessionId) ||
 					authStorage.hasSessionCredentialAuto(provider, credentialSessionId)
@@ -2316,6 +2329,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				};
 				if (Object.keys(mergedConfigs).length > 0) {
 					const owned = new MCPManager(cwd, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
+					owned.setAuthStorage(authStorage);
 					cleanupOwnedMcpManager = () => owned.disconnectAll();
 					try {
 						const result = await owned.connectServers(mergedConfigs, mergedSources as never);

@@ -11,6 +11,7 @@
  */
 import { logger } from "@gajae-code/utils";
 import type { AuthStorage } from "../auth-storage";
+import { cleanReason } from "./redact";
 import { DEFAULT_REFRESH_INTERVAL_MS, DEFAULT_REFRESH_SKEW_MS } from "./types";
 
 export interface AuthBrokerRefresherOptions {
@@ -113,8 +114,9 @@ export class AuthBrokerRefresher {
 		try {
 			await this.#storage.refreshCredentialById(id);
 		} catch (error) {
-			const errorMsg = String(error);
-			if (isDefinitiveFailure(errorMsg)) {
+			const rawErrorMsg = String(error);
+			const errorMsg = cleanReason(error) ?? "Unknown refresh failure";
+			if (isDefinitiveFailure(rawErrorMsg)) {
 				logger.warn("auth-broker refresh failed definitively; disabling credential", {
 					id,
 					error: errorMsg,

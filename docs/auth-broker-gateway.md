@@ -5,9 +5,9 @@ The auth broker and auth gateway are two cooperating HTTP services that move OAu
 - **`gjc auth-broker serve`** holds the canonical SQLite credential vault, performs OAuth refreshes, and exposes a small REST API (`/v1/snapshot`, `/v1/credential/:id/refresh`, `/v1/credential/:id/disable`, `/v1/credential`, `/v1/usage`, `/v1/healthz`).
 - **`gjc auth-gateway serve`** is a forward-proxy. It accepts OpenAI Chat Completions, Anthropic Messages, and OpenAI Responses requests, injects the broker-resolved access token, and forwards the bytes to the real provider. Clients (containerised gjc, llm-git, the macOS usage widget, …) never see the access token.
 
-Transport security between operator, broker, and gateway is delegated to the operator (Tailscale / Wireguard / reverse proxy + TLS). Every endpoint except `/v1/healthz` (broker) and `/healthz` (gateway) requires a bearer token.
+Transport security between operator, broker, and gateway is delegated to the operator (Tailscale / Wireguard / reverse proxy + TLS). Every endpoint except `/v1/healthz` (broker) and `/healthz` (gateway) requires a bearer token when bearer authentication is configured. The gateway's `--no-auth` mode disables inbound bearer checks only on a loopback bind; an unauthenticated non-loopback bind is rejected at startup.
 
-Source: `packages/ai/src/auth-broker/`, `packages/ai/src/auth-gateway/`, `packages/coding-agent/src/cli/auth-broker-cli.ts`, `packages/coding-agent/src/cli/auth-gateway-cli.ts`, `packages/coding-agent/src/session/auth-broker-config.ts`.
+Source: `packages/ai/src/auth-broker/`, `packages/ai/src/auth-gateway/`, `packages/coding-agent/src/cli/auth-broker-cli.ts`, `packages/coding-agent/src/cli/auth-gateway-cli.ts`, `packages/coding-agent/src/session/startup-auth-config.ts`.
 
 ## Data flow
 
@@ -93,7 +93,7 @@ gjc auth-gateway token   [--regenerate] [--json]
 gjc auth-gateway status  [--json]
 ```
 
-- `serve` requires `GJC_AUTH_BROKER_URL` (or `auth.broker.url` in `config.yml`) — the gateway is itself a broker client. It calls `AuthBrokerClient.fetchSnapshot()`, wraps it in `RemoteAuthCredentialStore`, and constructs an `AuthStorage` that resolves access tokens through the broker. Default bind is `127.0.0.1:4000`. The gateway token is stored at `<config-dir>/auth-gateway.token` (`0600`); `--no-auth` disables the bearer check entirely (loopback-only use).
+- `serve` requires a resolved broker URL — `GJC_AUTH_BROKER_URL` or nested `auth.broker.url` in the global `config.yml` — and a bearer token from `GJC_AUTH_BROKER_TOKEN`, nested `auth.broker.token`, or `<config-dir>/auth-broker.token`. The gateway is itself a broker client: it calls `AuthBrokerClient.fetchSnapshot()`, wraps it in `RemoteAuthCredentialStore`, and constructs an `AuthStorage` that resolves access tokens through the broker. Default bind is `127.0.0.1:4000`. The gateway token is stored at `<config-dir>/auth-gateway.token` (`0600`); `--no-auth` disables the inbound bearer check only on a loopback bind. A non-loopback unauthenticated bind is rejected at startup.
 - `token` / `status` mirror the broker’s equivalents.
 
 ### Endpoints
@@ -143,13 +143,26 @@ The broker is **off** unless `GJC_AUTH_BROKER_URL` (or `auth.broker.url` in `con
 | Variable | Purpose | Required when |
 | -------- | ------- | ------------- |
 | `GJC_AUTH_BROKER_URL`   | Base URL of the remote auth-broker (e.g. `https://broker.tailnet:8765`). Selecting this puts the client in broker mode — local SQLite is bypassed. | Any time the gjc client should resolve credentials through a broker (and required by `gjc auth-gateway serve`). |
-| `GJC_AUTH_BROKER_TOKEN` | Bearer token used for every broker endpoint except `/v1/healthz`. | When `GJC_AUTH_BROKER_URL` is set and no token is available from `auth.broker.token` or `<config-dir>/auth-broker.token`. |
+| `GJC_AUTH_BROKER_TOKEN` | Bearer token used for every broker endpoint except `/v1/healthz`. | When a broker URL is set and no token is available from nested config or `<config-dir>/auth-broker.token`. |
 
-Resolution order in `resolveAuthBrokerConfig()`:
+### Startup resolver and configuration
 
-1. `GJC_AUTH_BROKER_URL` env (else `auth.broker.url` from `config.yml`, with `$ENV_NAME` resolution);
-2. `GJC_AUTH_BROKER_TOKEN` env (else `auth.broker.token` from `config.yml`, else `<config-dir>/auth-broker.token`);
-3. URL set but no token resolvable → hard error pointing at the token file path.
+The startup resolver reads the global agent `config.yml` before the normal settings layer. Broker settings must use the canonical nested YAML shape:
+
+```yaml
+auth:
+  broker:
+    url: https://broker.example.test:8765
+    token: <literal-bearer-token>
+```
+
+Resolution is explicit and ordered:
+
+1. `GJC_AUTH_BROKER_URL` takes precedence over the nested `auth.broker.url` value.
+2. If a URL is resolved, `GJC_AUTH_BROKER_TOKEN` takes precedence over nested `auth.broker.token`, which takes precedence over the trimmed contents of `<config-dir>/auth-broker.token`.
+3. A resolved URL without a token is a hard startup error; GJC does not fall back to the local SQLite store.
+
+The nested URL and token entries are literal strings; environment-variable indirection is not supported in `config.yml`. Put those values in `GJC_AUTH_BROKER_URL` or `GJC_AUTH_BROKER_TOKEN` instead. Missing config is allowed and leaves broker mode disabled. An unreadable file, invalid YAML, non-mapping root, malformed `auth`/`broker`/`gateway` section, invalid ranking mode, or invalid credential-pin record fails closed with a typed `StartupAuthConfigError` rather than silently downgrading to local authority. Legacy literal dotted auth keys are rejected with manual nested-YAML rewrite guidance.
 
 The gateway has no dedicated env vars — it inherits `GJC_AUTH_BROKER_*` because it is itself a broker client.
 
@@ -158,7 +171,7 @@ The gateway has no dedicated env vars — it inherits `GJC_AUTH_BROKER_*` becaus
 | Key | Default | Purpose |
 | --- | ------- | ------- |
 | `auth.broker.url`   | unset | Same as `GJC_AUTH_BROKER_URL`; env wins. Hidden from the settings UI. |
-| `auth.broker.token` | unset | Same as `GJC_AUTH_BROKER_TOKEN`; env wins. Values may be the literal token or `$ENV_NAME` to indirect through env. |
+| `auth.broker.token` | unset | Same as `GJC_AUTH_BROKER_TOKEN`; env wins. The value is a literal bearer token; environment-variable indirection is not expanded. |
 
 ### Token files
 

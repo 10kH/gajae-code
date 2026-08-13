@@ -19,6 +19,7 @@
  */
 
 import { logger } from "@gajae-code/utils";
+import { cleanReason } from "../auth-broker/redact";
 import type { AuthStorage } from "../auth-storage";
 import { Effort } from "../model-thinking";
 import * as anthropicMessages from "../providers/anthropic-messages-server";
@@ -26,7 +27,15 @@ import * as openaiChat from "../providers/openai-chat-server";
 import * as openaiResponses from "../providers/openai-responses-server";
 import * as piNative from "../providers/pi-native-server";
 import { streamSimple } from "../stream";
-import type { Api, AssistantMessageEventStream, Context, Model, SimpleStreamOptions } from "../types";
+import type {
+	Api,
+	AssistantMessage,
+	AssistantMessageEvent,
+	AssistantMessageEventStream,
+	Context,
+	Model,
+	SimpleStreamOptions,
+} from "../types";
 import { beginAttempt, classifyFallbackTrigger } from "../utils/fallback-transport";
 import { assertAuthenticatedOrLoopback, parseBind } from "../utils/parse-bind";
 import {
@@ -204,8 +213,9 @@ function buildStreamOptions(parsed: ParsedFormatRequest, api: Api, signal: Abort
  * format emits its native envelope shape.
  */
 function classifyGatewayError(err: unknown): { status: number; type: string; message: string } {
-	const message = err instanceof Error ? err.message : String(err);
-	const lower = message.toLowerCase();
+	const rawMessage = err instanceof Error ? err.message : String(err);
+	const message = cleanReason(rawMessage) ?? "Upstream request failed";
+	const lower = rawMessage.toLowerCase();
 
 	// Custom pi-ai errors may attach a numeric `status` property; honor it
 	// when present and pick the matching tag.
@@ -242,6 +252,48 @@ function classifyGatewayError(err: unknown): { status: number; type: string; mes
 	return { status: 502, type: "upstream_error", message };
 }
 
+function redactGatewayError(error: unknown): Error {
+	const redacted = new Error(cleanReason(error) ?? "Upstream request failed");
+	if (error instanceof Error) {
+		redacted.name = error.name;
+		const status = (error as { status?: unknown }).status;
+		if (typeof status === "number") (redacted as Error & { status: number }).status = status;
+	}
+	return redacted;
+}
+
+function redactGatewayMessage(message: AssistantMessage): AssistantMessage {
+	if (message.errorMessage === undefined) return message;
+	return { ...message, errorMessage: cleanReason(message.errorMessage) ?? "Upstream request failed" };
+}
+
+/**
+ * Protect all gateway SSE encoders from upstream error text. Provider wire
+ * modules format `error` events themselves, so sanitize at this boundary and
+ * also convert iterator failures to bounded errors before their catch blocks.
+ */
+function redactGatewayStream(events: AssistantMessageEventStream): AssistantMessageEventStream {
+	async function* redactedEvents(): AsyncGenerator<AssistantMessageEvent> {
+		try {
+			for await (const event of events) {
+				if (event.type === "error") yield { ...event, error: redactGatewayMessage(event.error) };
+				else yield event;
+			}
+		} catch (error) {
+			throw redactGatewayError(error);
+		}
+	}
+	const result = redactedEvents() as unknown as AssistantMessageEventStream;
+	result.result = async () => {
+		try {
+			return redactGatewayMessage(await events.result());
+		} catch (error) {
+			throw redactGatewayError(error);
+		}
+	};
+	return result;
+}
+
 async function refreshGatewayApiKeyAfterAuthError(
 	storage: AuthStorage,
 	model: Model<Api>,
@@ -257,7 +309,7 @@ async function refreshGatewayApiKeyAfterAuthError(
 		format,
 		provider,
 		peer,
-		error: error instanceof Error ? error.message : String(error),
+		error: cleanReason(error) ?? "Upstream request failed",
 	});
 	return storage.getApiKey(provider, undefined, { modelId: model.id, signal });
 }
@@ -308,7 +360,7 @@ async function markManagedGatewayCredentialFailure(
 			format,
 			provider: model.provider,
 			peer,
-			error: markError instanceof Error ? markError.message : String(markError),
+			error: cleanReason(markError) ?? "Credential bookkeeping failed",
 		});
 	}
 }
@@ -382,7 +434,11 @@ async function handleFormatEndpoint(
 		body = await req.json();
 	} catch (error) {
 		if (controller.signal.aborted) return clientClosedResponse(route);
-		return route.module.formatError(400, "invalid_request_error", `Invalid JSON body: ${String(error)}`);
+		return route.module.formatError(
+			400,
+			"invalid_request_error",
+			`Invalid JSON body: ${cleanReason(error) ?? "request body could not be parsed"}`,
+		);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
@@ -438,7 +494,7 @@ async function handleFormatEndpoint(
 		parsed = route.module.parseRequest(body, req.headers);
 	} catch (error) {
 		if (controller.signal.aborted) return clientClosedResponse(route);
-		const message = error instanceof Error ? error.message : String(error);
+		const message = cleanReason(error) ?? "Request validation failed";
 		return route.module.formatError(400, "invalid_request_error", message);
 	}
 	// Merge gateway-captured passthrough headers under the parser's own
@@ -511,6 +567,7 @@ async function handleFormatEndpoint(
 			),
 		);
 	}
+	events = redactGatewayStream(events);
 
 	if (!parsed.stream) {
 		try {
@@ -520,17 +577,18 @@ async function handleFormatEndpoint(
 				const errorMessage =
 					message.errorMessage ??
 					(message.stopReason === "aborted" ? "Request was aborted" : "Upstream request failed");
+				const safeErrorMessage = cleanReason(errorMessage) ?? "Upstream request failed";
 				logger.warn("auth-gateway non-streaming failed", {
 					format: route.label,
 					reason: message.stopReason,
-					error: errorMessage,
+					error: safeErrorMessage,
 					peer,
 				});
 				if (message.stopReason === "aborted") {
-					return route.module.formatError(499, "request_aborted", errorMessage);
+					return route.module.formatError(499, "request_aborted", safeErrorMessage);
 				}
-				const classified = classifyGatewayError(new Error(errorMessage));
-				return route.module.formatError(classified.status, classified.type, errorMessage);
+				const classified = classifyGatewayError(new Error(safeErrorMessage));
+				return route.module.formatError(classified.status, classified.type, classified.message);
 			}
 			return json(200, route.module.encodeResponse(message, parsed.modelId));
 		} catch (error) {
@@ -585,7 +643,11 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		body = await req.json();
 	} catch (error) {
 		if (controller.signal.aborted) return aborted();
-		return piNative.formatError(400, "invalid_request_error", `Invalid JSON body: ${String(error)}`);
+		return piNative.formatError(
+			400,
+			"invalid_request_error",
+			`Invalid JSON body: ${cleanReason(error) ?? "request body could not be parsed"}`,
+		);
 	}
 	if (controller.signal.aborted) return aborted();
 
@@ -594,7 +656,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 		parsed = piNative.parseRequest(body, req.headers);
 	} catch (error) {
 		if (controller.signal.aborted) return aborted();
-		const message = error instanceof Error ? error.message : String(error);
+		const message = cleanReason(error) ?? "Request validation failed";
 		return piNative.formatError(400, "invalid_request_error", message);
 	}
 
@@ -699,6 +761,7 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 			),
 		);
 	}
+	events = redactGatewayStream(events);
 
 	if (!parsed.stream) {
 		try {
@@ -708,17 +771,18 @@ async function handlePiNative(bootOpts: AuthGatewayBootOptions, req: Request, pe
 				const errorMessage =
 					message.errorMessage ??
 					(message.stopReason === "aborted" ? "Request was aborted" : "Upstream request failed");
+				const safeErrorMessage = cleanReason(errorMessage) ?? "Upstream request failed";
 				logger.warn("auth-gateway non-streaming failed", {
 					format: "pi-native",
 					reason: message.stopReason,
-					error: errorMessage,
+					error: safeErrorMessage,
 					peer,
 				});
 				if (message.stopReason === "aborted") {
-					return piNative.formatError(499, "request_aborted", errorMessage);
+					return piNative.formatError(499, "request_aborted", safeErrorMessage);
 				}
-				const classified = classifyGatewayError(new Error(errorMessage));
-				return piNative.formatError(classified.status, classified.type, errorMessage);
+				const classified = classifyGatewayError(new Error(safeErrorMessage));
+				return piNative.formatError(classified.status, classified.type, classified.message);
 			}
 			return json(200, { message });
 		} catch (error) {
@@ -860,7 +924,7 @@ export function startAuthGateway(opts: AuthGatewayBootOptions): AuthGatewayServe
 					method: req.method,
 					path: pathname,
 					peer,
-					error: String(error),
+					error: cleanReason(error) ?? "internal error",
 				});
 				return withCors(json(500, { error: "internal error" }), req);
 			}

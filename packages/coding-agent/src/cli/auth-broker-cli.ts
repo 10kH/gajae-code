@@ -132,13 +132,18 @@ async function ensureToken(): Promise<string> {
 	if (existing) return existing;
 	const token = generateToken();
 	if (await createTokenExclusive(token)) return token;
-	// Another concurrent invocation won the create race; read what they wrote.
-	const fromRace = await readToken();
-	if (fromRace) return fromRace;
-	// File existed-then-disappeared between EEXIST and read; last resort, write
-	// our generated token unconditionally so callers don't see an empty string.
-	await writeToken(token);
-	return token;
+	// Another concurrent invocation won the create race. Its file may exist
+	// briefly before the winner writes the token, so retry reads without ever
+	// overwriting the winner's file.
+	for (let attempt = 0; attempt < 5; attempt++) {
+		const fromRace = await readToken();
+		if (fromRace) return fromRace;
+		if (attempt < 4) await Bun.sleep(10);
+	}
+	// If the file disappeared, make one final exclusive-create attempt. Never
+	// fall back to an unconditional write after observing EEXIST.
+	if (await createTokenExclusive(token)) return token;
+	throw new Error("Unable to initialize auth-broker token: another process owns an empty token file.");
 }
 
 async function runServe(flags: AuthBrokerCommandArgs["flags"]): Promise<void> {

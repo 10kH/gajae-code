@@ -3,6 +3,7 @@
  * paths. Centralized so the two servers can't drift on what they accept (the
  * gateway used to silently allow empty hostnames; this fixes it).
  */
+import { isIP } from "node:net";
 
 export interface ParsedBind {
 	hostname: string;
@@ -59,7 +60,11 @@ export function isLoopbackHostname(hostname: string): boolean {
 		.trim()
 		.toLowerCase()
 		.replace(/^\[|\]$/g, "");
-	return normalized === "localhost" || normalized === "::1" || normalized.startsWith("127.");
+	if (normalized === "localhost" || normalized === "::1") return true;
+	// Strict numeric IPv4 loopback literals only: a bare prefix match would
+	// accept attacker-controlled names like `127.evil.example`, and short/hex
+	// IPv4 forms (`127.1`, `0x7f.1`) are rejected by the parser anyway.
+	return isIP(normalized) === 4 && normalized.split(".")[0] === "127";
 }
 
 /**

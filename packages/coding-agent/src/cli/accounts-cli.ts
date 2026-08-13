@@ -332,9 +332,7 @@ export async function runAccountsCommand(cmd: AccountsCommandArgs): Promise<void
 	} catch (error) {
 		if (cmd.flags.json) {
 			if (!(error instanceof AccountsCommandError)) {
-				process.stderr.write(
-					`accounts command failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
-				);
+				process.stderr.write(`accounts command failed: ${cleanReason(error) ?? "Command failed."}\n`);
 			}
 			process.exitCode = 1;
 			writeJsonFailure(error);

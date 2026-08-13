@@ -113,6 +113,10 @@ gjc accounts logout anthropic --all
 
 API-key rows remain visible and checkable so operators can see which source is selected, but they are not part of OAuth account pooling, cannot be pinned by `gjc accounts pin`, and cannot be removed by `gjc accounts logout`.
 
+### `gjc accounts --json` output and failure contract
+
+With `--json`, `gjc accounts` writes exactly one JSON document to stdout. A successful action uses an `{ "ok": true, ... }` envelope. An action-level failure uses `{ "ok": false, "error": { "code": "...", "message": "..." } }`, sets a nonzero exit status, and never writes a second stdout document. Diagnostics written to stderr are sanitized and bounded; they must not contain credential payloads, stacks, or unredacted provider responses. A completed `check` may still use an `ok: true` envelope with per-account failed/unknown check rows; its nonzero status reports those probe results rather than a command-format failure.
+
 ## Persistent auth configuration
 
 The canonical configuration is nested YAML in the global `~/.gjc/agent/config.yml` (or the configured agent directory):
@@ -121,14 +125,14 @@ The canonical configuration is nested YAML in the global `~/.gjc/agent/config.ym
 auth:
   broker:
     url: https://broker.example.test:8765
-    token: $GJC_AUTH_BROKER_TOKEN
+    token: <literal-bearer-token>
   credentialRankingMode: balanced
   credentialPins:
     anthropic: id:42
     openai-codex: email:me@example.com
 ```
 
-- `auth.broker.url` and `auth.broker.token` select direct-broker mode. `GJC_AUTH_BROKER_URL` and `GJC_AUTH_BROKER_TOKEN` take precedence over the nested values. A configured URL without a resolvable token is a hard error; GJC does not silently fall back to local SQLite.
+- `auth.broker.url` and `auth.broker.token` select direct-broker mode. `GJC_AUTH_BROKER_URL` and `GJC_AUTH_BROKER_TOKEN` take precedence over the nested values; nested values are literal strings, not environment-variable indirections. A configured URL without a resolvable token is a hard error; GJC does not silently fall back to local SQLite. An absent config file leaves broker mode disabled, while malformed or unreadable global startup-auth config fails closed with a typed `StartupAuthConfigError`.
 - `auth.credentialRankingMode` is `balanced` (default) or `earliest-reset`. `GJC_CREDENTIAL_RANKING_MODE` takes precedence over the nested setting.
 - `auth.credentialPins` is a global-only record of provider → selector. Project-scoped pins are ignored; do not place this record in project settings.
 - Literal dotted root keys such as `auth.broker.url: ...`, `auth.credentialRankingMode: ...`, or `auth.credentialPins: ...` are rejected. Startup reports the keys and prints manual rewrite guidance. Rewrite `config.yml` by hand using the nested shape above; there is no automatic migration, and secret values must not be copied into command output.
