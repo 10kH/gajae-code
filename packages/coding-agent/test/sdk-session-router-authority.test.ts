@@ -10,6 +10,7 @@ import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
 import {
+	type NotificationSubscription,
 	type SessionAttachment,
 	SessionRouter,
 	type SessionRouterClient,
@@ -61,6 +62,8 @@ async function routerFixture(
 			reason?: "removed" | "replaced" | "replaced_same_generation",
 		) => void | Promise<void>;
 		onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void | Promise<void>;
+		onNotificationSubscription?: (subscription: NotificationSubscription) => void | Promise<void>;
+		onNotificationSubscriptionReady?: (subscription: NotificationSubscription) => void | Promise<void>;
 		start?: boolean;
 		initiallyIndexed?: boolean;
 		onIndexRefresh?: () => void | Promise<void>;
@@ -164,6 +167,8 @@ async function routerFixture(
 			},
 			onAttachmentReady: options.onAttachmentReady,
 			onFrame: options.onFrame,
+			onNotificationSubscription: options.onNotificationSubscription,
+			onNotificationSubscriptionReady: options.onNotificationSubscriptionReady,
 			onSessionRemoved: options.onSessionRemoved,
 			setInterval: (() => 0) as unknown as typeof setInterval,
 			clearInterval: (() => {}) as unknown as typeof clearInterval,
@@ -650,6 +655,40 @@ describe("SessionRouter dispatch authority", () => {
 			expect(fixture.router.attachment(fixture.sessionId)).toBeNull();
 			expect(removed?.sessionId).toBe(fixture.sessionId);
 			expect(removed?.isCurrent()).toBe(false);
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("contains synchronous notification admission failure without revoking core attachment", async () => {
+		const fixture = await routerFixture({
+			onNotificationSubscription: () => {
+				throw new Error("Telegram admission failed synchronously");
+			},
+		});
+		try {
+			await Bun.sleep(0);
+			const attachment = fixture.router.attachment(fixture.sessionId);
+			expect(attachment).not.toBeNull();
+			expect(attachment?.isCurrent()).toBe(true);
+			expect(await fixture.router.request(fixture.sessionId, { type: "query_request" })).toEqual({ events: [] });
+		} finally {
+			await fixture.router.stop();
+		}
+	});
+
+	test("contains synchronous notification ready failure without revoking core attachment", async () => {
+		const fixture = await routerFixture({
+			onNotificationSubscriptionReady: () => {
+				throw new Error("Telegram ready failed synchronously");
+			},
+		});
+		try {
+			await Bun.sleep(0);
+			const attachment = fixture.router.attachment(fixture.sessionId);
+			expect(attachment).not.toBeNull();
+			expect(attachment?.isCurrent()).toBe(true);
+			expect(await fixture.router.request(fixture.sessionId, { type: "query_request" })).toEqual({ events: [] });
 		} finally {
 			await fixture.router.stop();
 		}

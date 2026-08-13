@@ -149,6 +149,18 @@ export interface SessionRouterDeps {
 	clearTimeout?: typeof clearTimeout;
 }
 
+export type SessionRouterProviderDeps = Pick<
+	SessionRouterDeps,
+	| "createClient"
+	| "createIndex"
+	| "createBrokerClient"
+	| "setInterval"
+	| "clearInterval"
+	| "setTimeout"
+	| "clearTimeout"
+	| "onReconciled"
+>;
+
 export interface SessionRouterOptions {
 	agentDir: string;
 	deps?: SessionRouterDeps;
@@ -468,7 +480,9 @@ export class SessionRouter {
 			);
 		}
 		this.#adopted.clear();
-		const pending = Promise.allSettled([this.#reconcileTail, ...this.#pending, ...shutdownTasks]);
+		// Provider notification work is detached and bounded independently; core
+		// shutdown waits only for Router reconciliation and client close.
+		const pending = Promise.allSettled([this.#reconcileTail, ...shutdownTasks]);
 		const outcome = await Promise.race([
 			pending.then(results => ({ kind: "settled" as const, results })),
 			Bun.sleep(5_000).then(() => ({ kind: "timeout" as const })),
@@ -1080,10 +1094,12 @@ export class SessionRouter {
 		try {
 			await this.#deps.onAttachment?.(capability);
 			this.#recordNotificationReceipt(notificationSubscription, "pending");
-			void Promise.resolve(this.#deps.onNotificationSubscription?.(notificationSubscription)).catch(error => {
-				this.#detachNotification(attached!, "cancelled");
-				logger.warn(`SDK notification subscription admission failed: ${String(error)}`);
-			});
+			void Promise.resolve()
+				.then(() => this.#deps.onNotificationSubscription?.(notificationSubscription))
+				.catch(error => {
+					this.#detachNotification(attached!, "cancelled");
+					logger.warn(`SDK notification subscription admission failed: ${String(error)}`);
+				});
 		} catch (error) {
 			const failedStillCurrent = this.#sessions.get(indexed.sessionId) === attached;
 			this.#adopted.delete(indexed.sessionId);
@@ -1121,12 +1137,12 @@ export class SessionRouter {
 		attached.publication.resolve();
 		attached.initializingPublication = true;
 		try {
-			void Promise.resolve(this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription)).catch(
-				error => {
+			void Promise.resolve()
+				.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
+				.catch(error => {
 					this.#detachNotification(attached, "cancelled");
 					logger.warn(`SDK notification subscription ready hook failed locally: ${String(error)}`);
-				},
-			);
+				});
 			await this.#deps.onAttachmentReady?.(attached.capability);
 		} catch (error) {
 			const stillCurrent = this.#sessions.get(attached.sessionId) === attached;
@@ -1169,12 +1185,12 @@ export class SessionRouter {
 				}
 				attached.initializingPublication = true;
 				try {
-					void Promise.resolve(
-						this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription),
-					).catch(error => {
-						this.#detachNotification(attached, "cancelled");
-						logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
-					});
+					void Promise.resolve()
+						.then(() => this.#deps.onNotificationSubscriptionReady?.(attached.notificationSubscription))
+						.catch(error => {
+							this.#detachNotification(attached, "cancelled");
+							logger.warn(`SDK notification subscription reconnect hook failed locally: ${String(error)}`);
+						});
 					await this.#deps.onAttachmentReady?.(attached.capability);
 				} catch {
 					await this.#retireAttachment(attached);

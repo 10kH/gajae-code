@@ -629,12 +629,10 @@ describe("Telegram topic admission", () => {
 				title: "Orphaned session",
 				telegramTopicsEnabled: true,
 			});
+			const registry = (daemon as unknown as { topics: TopicRegistry }).topics;
+			registry.beginArchive(session.sessionId, "host", Date.now(), "session_closed");
 			bot.calls.length = 0;
-			await (
-				daemon as unknown as {
-					archiveUnownedTopicsAfterReconcile(): Promise<void>;
-				}
-			).archiveUnownedTopicsAfterReconcile();
+			await daemon.archiveReconciliationHarnessForTest().archiveAuthorizedTopics();
 			// Private-chat archival deletes the orphaned topic.
 			expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
 		} finally {
@@ -669,12 +667,10 @@ describe("Telegram topic admission", () => {
 					title: `Retry ${label}`,
 					telegramTopicsEnabled: true,
 				});
+				const registry = (daemon as unknown as { topics: TopicRegistry }).topics;
+				registry.beginArchive(session.sessionId, "host", Date.now(), "session_closed");
 				bot.calls.length = 0;
-				await (
-					daemon as unknown as {
-						archiveUnownedTopicsAfterReconcile(): Promise<void>;
-					}
-				).archiveUnownedTopicsAfterReconcile();
+				await daemon.archiveReconciliationHarnessForTest().archiveAuthorizedTopics();
 				expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(1);
 				const state = JSON.parse(
 					fs.readFileSync(path.join(daemonPaths(agentDir).dir, "telegram-topics.json"), "utf8"),
@@ -711,11 +707,7 @@ describe("Telegram topic admission", () => {
 				installationHostId: "local-host",
 			});
 			await daemon.loadTopics();
-			await (
-				daemon as unknown as {
-					archiveUnownedTopicsAfterReconcile(): Promise<void>;
-				}
-			).archiveUnownedTopicsAfterReconcile();
+			await daemon.archiveReconciliationHarnessForTest().archiveAuthorizedTopics();
 			expect(bot.calls.filter(call => call.method === "deleteForumTopic")).toHaveLength(0);
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
@@ -778,7 +770,7 @@ describe("Telegram topic admission", () => {
 					endpointGeneration: 1,
 				},
 			);
-			registry.beginArchive("S", "host", 2);
+			registry.beginArchive("S", "host", 2, "session_closed");
 			fs.writeFileSync(topicPath, JSON.stringify(registry.serialize()));
 			bot.calls.length = 0;
 			const restarted = new TelegramNotificationDaemon({
