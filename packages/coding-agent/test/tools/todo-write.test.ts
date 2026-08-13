@@ -459,6 +459,33 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		expect(message).not.toContain("\u2026");
 	});
 
+	it("rejects positional handles nested in task aliases before coercion", () => {
+		const correction =
+			'tasks have no id or index; target a task with "task" set to its exact content, or a whole phase with "phase"';
+		for (const [alias, key] of [
+			["task", "id"],
+			["content", "ids"],
+			["task", "index"],
+			["content", "taskId"],
+			["task", "task_id"],
+		] as const) {
+			const message = captureValidationError(() =>
+				validateToolArguments(tool, call({ ops: [{ op: "done", [alias]: { [key]: 1 } }] })),
+			);
+			expect(message).toContain(`rejected key: "${alias}.${key}" (ops[0]; ${correction})`);
+		}
+	});
+
+	it("bounds rejected keys and reports omitted keys deterministically", () => {
+		const unknownKeys = Object.fromEntries(Array.from({ length: 32 }, (_, index) => [`unknown${index}`, index]));
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "done", ...unknownKeys }] })),
+		);
+		expect(message).toContain('rejected keys: "unknown0", "unknown1", "unknown2", "unknown3", "unknown4", "unknown5", "unknown6", "unknown7"');
+		expect(message).toContain("24 additional rejected keys omitted");
+		expect(message).not.toContain('"unknown8"');
+	});
+
 	it("keeps complete and completed aliased to done instead of rejecting them as unknown ops", () => {
 		for (const op of ["complete", "completed"]) {
 			const parsed = validateToolArguments(tool, call({ ops: [{ op, task: "ship it" }] })) as {
