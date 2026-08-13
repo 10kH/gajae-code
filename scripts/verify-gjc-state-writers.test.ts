@@ -81,3 +81,21 @@ test("detects dynamic fs bindings and indirect Bun.write aliases into .gjc", asy
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("detects computed and indirect namespace calls, distant targets, and non-ts sources", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-writer-expanded-"));
+	try {
+		const directory = path.join(root, "packages", "coding-agent", "src");
+		await fs.mkdir(directory, { recursive: true });
+		await Bun.write(path.join(directory, "indirect.mts"), 'import * as io from "node:fs/promises";\nconst writer = io.writeFile;\nawait writer(".gjc/a", "x");\n');
+		await Bun.write(path.join(directory, "computed.js"), 'import * as io from "node:fs/promises";\nawait io["writeFile"](".gjc/b", "x");\n');
+		await Bun.write(path.join(directory, "distant.tsx"), `import { writeFile } from "node:fs/promises";\nconst target = ".gjc/c";\n${"// gap\n".repeat(12)}await writeFile(target, "x");\n`);
+		const result = await run(root);
+		expect(result.exitCode).toBe(1);
+		for (const file of ["indirect.mts", "computed.js", "distant.tsx"]) {
+			expect(`${result.stdout}\n${result.stderr}`).toContain(file);
+		}
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

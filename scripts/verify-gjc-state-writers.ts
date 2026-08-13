@@ -100,7 +100,7 @@ function listTsFiles(dir: string): string[] {
 		if (entry.isDirectory()) {
 			if (entry.name === "node_modules" || entry.name === "__snapshots__") continue;
 			out.push(...listTsFiles(full));
-		} else if (/\.ts$/u.test(entry.name) && !/\.test\.ts$/u.test(entry.name) && !/\.d\.ts$/u.test(entry.name)) {
+		} else if (/\.(?:[cm]?[jt]s|tsx)$/u.test(entry.name) && !/\.test\.(?:[cm]?[jt]s|tsx)$/u.test(entry.name) && !/\.d\.ts$/u.test(entry.name)) {
 			out.push(full);
 		}
 	}
@@ -139,6 +139,13 @@ function dynamicMutationBindings(content: string): { aliases: Set<string>; names
 		}
 	}
 	for (const match of content.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*Bun\.write\b/gu)) aliases.add(match[1]!);
+	const namespaceNames = new Set([...importedFsNamespaces(content), ...namespaces]);
+	for (const namespace of namespaceNames) {
+		const member = `(?:${[...MUTATION_EXPORTS].join("|")})`;
+		for (const match of content.matchAll(new RegExp(`(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*=\\s*${namespace}(?:\\.promises)?(?:\\.${member}|\\[['\"]${member}['\"]\\])\\b`, "gu"))) {
+			aliases.add(match[1]!);
+		}
+	}
 	return { aliases, namespaces };
 }
 
@@ -151,15 +158,16 @@ function matchedApi(line: string, aliases: ReadonlySet<string>, namespaces: Read
 		if (new RegExp(`\\b${alias}\\s*\\(`, "u").test(line)) return alias;
 	}
 	for (const namespace of namespaces) {
-		const match = new RegExp(`\\b${namespace}(?:\\.promises)?\\.(?:writeFile|appendFile|mkdir|rm|rmdir|unlink|rename|cp|copyFile|open|createWriteStream)\\s*\\(`, "u").exec(line);
+		const member = "(?:writeFile|appendFile|mkdir|rm|rmdir|unlink|rename|cp|copyFile|open|createWriteStream)";
+		const match = new RegExp(`\\b${namespace}(?:\\.promises)?(?:\\.${member}|\\[['\"]${member}['\"]\\])\\s*\\(`, "u").exec(line);
 		if (match) return match[0].replace(/\s*\($/u, "");
 	}
 	return null;
 }
 
 function locallyReferencesGjc(lines: readonly string[], index: number): boolean {
-	const start = Math.max(0, index - 3);
-	const end = Math.min(lines.length - 1, index + 3);
+	const start = Math.max(0, index - 25);
+	const end = Math.min(lines.length - 1, index + 25);
 	for (let i = start; i <= end; i++) {
 		const line = lines[i]?.trim() ?? "";
 		if (line.startsWith("//") || line.startsWith("*")) continue;
@@ -174,7 +182,7 @@ function lineLooksLikeGeneratedStringLiteral(line: string): boolean {
 
 function nearbyAssignmentTargetsThisLine(lines: readonly string[], index: number): boolean {
 	const line = lines[index]?.trim() ?? "";
-	const start = Math.max(0, index - 3);
+	const start = Math.max(0, index - 25);
 	for (let i = start; i < index; i++) {
 		const prior = lines[i]?.trim() ?? "";
 		if (!GJC_REFERENCE_PATTERNS.some(re => re.test(prior))) continue;
