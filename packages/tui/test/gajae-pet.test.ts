@@ -1,12 +1,55 @@
 import { describe, expect, it } from "bun:test";
+import * as zlib from "node:zlib";
 import {
 	__gajaePetTestHooks,
 	buildGajaePixelFrames,
+	encodeGridIterm2,
 	encodeGridSixel,
 	PET_SKIN_IDS,
 	PET_SKINS,
 	resolvePetMode,
 } from "@gajae-code/tui";
+
+function decodeIterm2Png(sequence: string): {
+	width: number;
+	height: number;
+	rgba: Uint8Array;
+	chunks: Array<{ type: string; data: Buffer; crc: number }>;
+} {
+	const match = sequence.match(/^\x1b\]1337;File=[^:]+:([A-Za-z0-9+/=]+)\x1b\\$/u);
+	if (!match) throw new Error("Invalid iTerm2 image sequence");
+	const png = Buffer.from(match[1], "base64");
+	expect(png.subarray(0, 8)).toEqual(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
+	const chunks: Array<{ type: string; data: Buffer; crc: number }> = [];
+	for (let offset = 8; offset < png.length; ) {
+		const length = png.readUInt32BE(offset);
+		const type = png.toString("ascii", offset + 4, offset + 8);
+		const data = png.subarray(offset + 8, offset + 8 + length);
+		chunks.push({ type, data, crc: png.readUInt32BE(offset + 8 + length) });
+		offset += 12 + length;
+	}
+	const ihdr = chunks.find(chunk => chunk.type === "IHDR")?.data;
+	if (!ihdr) throw new Error("Missing IHDR");
+	const width = ihdr.readUInt32BE(0);
+	const height = ihdr.readUInt32BE(4);
+	const compressed = Buffer.concat(chunks.filter(chunk => chunk.type === "IDAT").map(chunk => chunk.data));
+	const scanlines = zlib.inflateSync(compressed);
+	const rgba = new Uint8Array(width * height * 4);
+	for (let y = 0; y < height; y++) {
+		expect(scanlines[y * (width * 4 + 1)]).toBe(0);
+		rgba.set(scanlines.subarray(y * (width * 4 + 1) + 1, (y + 1) * (width * 4 + 1)), y * width * 4);
+	}
+	return { width, height, rgba, chunks };
+}
+
+function pngCrc(type: string, data: Uint8Array): number {
+	let crc = 0xffffffff;
+	for (const byte of Buffer.concat([Buffer.from(type, "ascii"), Buffer.from(data)])) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+	}
+	return (crc ^ 0xffffffff) >>> 0;
+}
 
 describe("gajae pixel frames", () => {
 	it("falls back removed persisted skins to RedGajae without overriding explicit off", () => {
@@ -80,6 +123,48 @@ describe("gajae pixel frames", () => {
 	it("keeps a minimum 1x scale for tiny cells", () => {
 		const sixel = encodeGridSixel(["RK", ".G"], 1);
 		expect(sixel.startsWith('\x1bP0;1;0q"1;1;2;2')).toBe(true);
+	});
+
+	it("encodes deterministic iTerm2 PNG dimensions, CRCs, colors, and transparent padding", () => {
+		const sequence = encodeGridIterm2(["R."], 2, 1, 1, { R: [12, 34, 56] });
+		expect(sequence).toContain("width=4px;height=4px;preserveAspectRatio=0;inline=1");
+		const decoded = decodeIterm2Png(sequence);
+		expect(decoded.width).toBe(4);
+		expect(decoded.height).toBe(4);
+		expect(decoded.chunks.map(chunk => chunk.type)).toEqual(["IHDR", "IDAT", "IEND"]);
+		for (const chunk of decoded.chunks) expect(chunk.crc).toBe(pngCrc(chunk.type, chunk.data));
+		const pixel = (x: number, y: number) => [
+			...decoded.rgba.subarray((y * decoded.width + x) * 4, (y * decoded.width + x + 1) * 4),
+		];
+		expect(pixel(0, 0)).toEqual([0, 0, 0, 0]);
+		expect(pixel(0, 1)).toEqual([12, 34, 56, 255]);
+		expect(pixel(2, 1)).toEqual([0, 0, 0, 0]);
+		expect(pixel(0, 3)).toEqual([0, 0, 0, 0]);
+	});
+
+	it("rejects malformed or unbounded iTerm2 PNG inputs", () => {
+		expect(() => encodeGridIterm2([], 1)).toThrow("non-empty and rectangular");
+		expect(() => encodeGridIterm2(["R", "RR"], 1)).toThrow("non-empty and rectangular");
+		expect(() => encodeGridIterm2(["R"], 0)).toThrow("finite and positive");
+		expect(() => encodeGridIterm2(["R"], Number.POSITIVE_INFINITY)).toThrow("finite and positive");
+		expect(() => encodeGridIterm2(["R"], 20_000)).toThrow("dimensions are out of bounds");
+		expect(() => encodeGridIterm2(["R"], 1, -1)).toThrow("non-negative integer");
+		expect(() => buildGajaePixelFrames({ protocol: "iterm2", cellWidthPx: 0, cellHeightPx: 18 })).toThrow(
+			"cell width",
+		);
+		expect(() => buildGajaePixelFrames({ protocol: "kitty", cellWidthPx: 1, cellHeightPx: 10_000 })).toThrow(
+			"frame dimensions are out of bounds",
+		);
+	});
+
+	it("keeps existing Kitty and Sixel fixtures unchanged while adding iTerm2", () => {
+		const sixel = buildGajaePixelFrames({ protocol: "sixel", cellWidthPx: 9, cellHeightPx: 18 });
+		const kitty = buildGajaePixelFrames({ protocol: "kitty", cellWidthPx: 9, cellHeightPx: 18 });
+		const iterm2 = buildGajaePixelFrames({ protocol: "iterm2", cellWidthPx: 9, cellHeightPx: 18 });
+		expect(sixel.frames.base).toStartWith('\x1bP0;1;0q"1;1;36;36');
+		expect(kitty.frames.base).toContain("a=T,f=32,s=36,v=36,c=4,r=2");
+		expect(iterm2.frames.base).toContain("width=36px;height=36px");
+		expect(iterm2).toMatchObject({ widthPx: 36, heightPx: 36, columns: 4, rows: 2, rasterRows: 2 });
 	});
 
 	it("registers Ouroboros as a 16x16 skin with authored heart turns and work transitions", () => {

@@ -21,7 +21,11 @@ export function getPetUnavailableWarning(env: NodeJS.ProcessEnv = Bun.env): stri
 	return isUnderTerminalMultiplexer(env) ? PET_MULTIPLEXER_UNAVAILABLE_WARNING : PET_UNAVAILABLE_WARNING;
 }
 
-export function getPetPixelProtocol(): PetPixelProtocol | null {
+export function getPetPixelProtocol(env: NodeJS.ProcessEnv = Bun.env): PetPixelProtocol | null {
+	if (isUnderTerminalMultiplexer(env)) {
+		const forced = env.PI_FORCE_IMAGE_PROTOCOL?.trim().toLowerCase();
+		return TERMINAL.imageProtocol === ImageProtocol.Sixel && forced === "sixel" ? "sixel" : null;
+	}
 	if (TERMINAL.imageProtocol === ImageProtocol.Kitty) return "kitty";
 	if (TERMINAL.imageProtocol === ImageProtocol.Sixel) return "sixel";
 	if (TERMINAL.imageProtocol === ImageProtocol.Iterm2) return "iterm2";
