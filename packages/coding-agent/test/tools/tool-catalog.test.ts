@@ -1,11 +1,68 @@
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { generateToolCatalogData, ToolCatalogGenerationError } from "../../scripts/generate-tool-catalog";
+import { clearPluginRootsAndCaches } from "../../src/discovery/helpers";
+import { discoverAgents } from "../../src/task/discovery";
 import { TOOL_CATALOG } from "../../src/tools/tool-catalog.generated";
 
 describe("generated tool catalog", () => {
 	test("committed advertised metadata is reproducible from eager implementations", async () => {
 		const regenerated = await generateToolCatalogData();
 		expect(regenerated).toEqual(TOOL_CATALOG);
+	});
+
+	test("ambient agent fixtures cannot contaminate generated task metadata", async () => {
+		const project = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tool-catalog-project-"));
+		const pluginRoot = path.join(project, "review-plugin");
+		const registryPath = path.join(project, ".gjc", "plugins", "installed_plugins.json");
+		try {
+			const agentsDir = path.join(pluginRoot, "agents");
+			await fs.mkdir(agentsDir, { recursive: true });
+			await fs.copyFile(
+				path.join(
+					import.meta.dir,
+					"..",
+					"marketplace",
+					"fixtures",
+					"valid-marketplace",
+					"plugins",
+					"hello-plugin",
+					"agents",
+					"reviewer.md",
+				),
+				path.join(agentsDir, "reviewer.md"),
+			);
+			await fs.mkdir(path.dirname(registryPath), { recursive: true });
+			await Bun.write(
+				registryPath,
+				JSON.stringify({
+					version: 2,
+					plugins: {
+						"review-plugin@test-marketplace": [
+							{
+								scope: "user",
+								installPath: pluginRoot,
+								version: "1.0.0",
+								installedAt: "2026-08-13T00:00:00.000Z",
+								lastUpdated: "2026-08-13T00:00:00.000Z",
+							},
+						],
+					},
+				}),
+			);
+			clearPluginRootsAndCaches([registryPath]);
+			const predecessor = await discoverAgents(project);
+			expect(predecessor.agents.map(agent => agent.name)).toContain("reviewer");
+
+			const regenerated = await generateToolCatalogData({ cwd: project });
+			expect(regenerated.task?.description).not.toContain("# reviewer");
+			expect(regenerated).toEqual(TOOL_CATALOG);
+		} finally {
+			clearPluginRootsAndCaches([registryPath]);
+			await fs.rm(project, { recursive: true, force: true });
+		}
 	});
 
 	test("unavailable fallback rejects corrupted committed metadata and schema", async () => {

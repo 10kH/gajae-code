@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { toolWireSchema } from "@gajae-code/ai/utils/schema";
+import { TaskTool } from "../src/task";
 import { TOOL_CATALOG } from "../src/tools/tool-catalog.generated";
 
 export interface GeneratedToolCatalogEntry {
@@ -26,6 +27,7 @@ export interface GeneratedToolCatalogEntry {
 export interface ToolCatalogGenerationOptions {
 	platform?: NodeJS.Platform;
 	arch?: NodeJS.Architecture;
+	cwd?: string;
 }
 
 type AuditedFallback = {
@@ -99,10 +101,10 @@ function makeSettings() {
 	};
 }
 
-function makeSession(): any {
+function makeSession(cwd: string = path.resolve(import.meta.dir, "../..")): any {
 	const settings = makeSettings();
 	return {
-		cwd: path.resolve(import.meta.dir, "../.."),
+		cwd,
 		hasUI: false,
 		workflowGateEligible: true,
 		settings,
@@ -326,7 +328,7 @@ export async function generateToolCatalogData(
 			...HIDDEN_TOOL_DESCRIPTORS,
 			...PLATFORM_EXCLUDED_TOOL_DESCRIPTORS,
 		} as Record<string, any>;
-		const session = makeSession();
+		const session = makeSession(options.cwd);
 		const output: Record<string, GeneratedToolCatalogEntry> = {};
 		for (const [name, descriptor] of Object.entries(all)) {
 			let fallback: AuditedFallback | undefined;
@@ -334,7 +336,7 @@ export async function generateToolCatalogData(
 			const platformExcluded = excludedOnPlatform(descriptor.metadata.platformExclusions, platform, arch);
 			if (!platformExcluded) {
 				try {
-					tool = await descriptor.load(session);
+					tool = name === "task" ? await TaskTool.createForToolCatalog(session) : await descriptor.load(session);
 				} catch (cause) {
 					throw new ToolCatalogGenerationError(
 						`Failed to load descriptor "${name}": ${formatCause(cause)}`,
