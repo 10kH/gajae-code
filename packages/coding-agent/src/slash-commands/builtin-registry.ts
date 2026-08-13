@@ -34,6 +34,7 @@ import {
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
+import { formatProviderSessionImportSummary, runSessionImportCommand } from "../session-import";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
@@ -603,7 +604,28 @@ const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashComma
 	return commandConsumed();
 };
 
+const IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE = process.platform === "linux";
+
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
+	{
+		name: "import-session",
+		priority: 29,
+		description: "Import a Codex or Claude transcript into native GJC history",
+		inlineHint: "<transcript-file> [--provider codex|claude]",
+		allowArgs: true,
+		acp: false,
+		localHeadless: true,
+		handle: async (command, runtime) => {
+			if (runtime.session?.isStreaming) return usage("Cannot import a session while streaming.", runtime);
+			const outcome = await runSessionImportCommand(command.args, runtime.cwd);
+			if (outcome.kind === "error") {
+				await runtime.output(outcome.message);
+				return { consumed: true, exitCode: 1 };
+			}
+			await runtime.output(formatProviderSessionImportSummary(outcome.result));
+			return { consumed: true };
+		},
+	},
 	{
 		name: "notify",
 		priority: 30,
@@ -1963,7 +1985,9 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 const QUARANTINED_UTILITY_SLASH_COMMANDS = new Set(["agents"]);
 
 const ACTIVE_BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = BUILTIN_SLASH_COMMAND_REGISTRY.filter(
-	command => !QUARANTINED_UTILITY_SLASH_COMMANDS.has(command.name),
+	command =>
+		!QUARANTINED_UTILITY_SLASH_COMMANDS.has(command.name) &&
+		(command.name !== "import-session" || IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE),
 );
 
 const BUILTIN_SLASH_COMMAND_LOOKUP = new Map<string, SlashCommandSpec>();
@@ -2046,6 +2070,18 @@ export async function executeBuiltinSlashCommand(
 	return false;
 }
 
+/** Dispatch a command explicitly authorized for trusted local non-interactive mode. */
+export async function executeLocalHeadlessBuiltinSlashCommand(
+	text: string,
+	runtime: SlashCommandRuntime,
+): Promise<false | Exclude<SlashCommandResult, undefined>> {
+	const parsed = parseSlashCommand(text);
+	if (!parsed) return false;
+	const command = BUILTIN_SLASH_COMMAND_LOOKUP.get(parsed.name);
+	if (!command?.handle || command.localHeadless !== true) return false;
+	if (parsed.args.length > 0 && !command.allowArgs) return false;
+	return (await command.handle(parsed, runtime)) ?? { consumed: true };
+}
 /** Look up a unified spec by name or alias. Used by the ACP dispatcher. */
 export function lookupBuiltinSlashCommand(name: string): SlashCommandSpec | undefined {
 	return BUILTIN_SLASH_COMMAND_LOOKUP.get(name);

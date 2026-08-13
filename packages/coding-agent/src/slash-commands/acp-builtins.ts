@@ -15,7 +15,7 @@ export type { AcpBuiltinCommandRuntime, AcpBuiltinSlashCommandResult } from "./t
  * see commands it cannot drive.
  */
 export const ACP_BUILTIN_SLASH_COMMANDS: AvailableCommand[] = BUILTIN_SLASH_COMMANDS_INTERNAL.filter(
-	command => command.handle !== undefined,
+	command => command.handle !== undefined && command.acp !== false,
 ).map(command => {
 	// Honor mode-specific copy: ACP clients receive concise text-mode
 	// descriptions/hints when the spec sets `acpDescription` / `acpInputHint`,
@@ -35,14 +35,22 @@ export const ACP_BUILTIN_SLASH_COMMANDS: AvailableCommand[] = BUILTIN_SLASH_COMM
  * - `{ consumed: true }` when the command handled the input entirely.
  * - `{ prompt }` when the command was handled but a residual prompt should be
  *   sent to the model.
+ * When `disabledOnly` is set, ACP-enabled builtins also return `false` so a
+ * transport can apply only the unavailable-over-ACP policy before forwarding.
  */
 export async function executeAcpBuiltinSlashCommand(
 	text: string,
 	runtime: AcpBuiltinCommandRuntime,
+	options?: { disabledOnly?: boolean },
 ): Promise<AcpBuiltinSlashCommandResult> {
 	const parsed = parseSlashCommand(text);
 	if (!parsed) return false;
 	const command = lookupBuiltinSlashCommand(parsed.name);
+	if (command?.acp === false) {
+		await runtime.output(`Slash command /${parsed.name} is unavailable over ACP.`);
+		return { consumed: true };
+	}
+	if (options?.disabledOnly) return false;
 	if (!command?.handle) {
 		const diagnostic = formatUnknownBuiltinSlashCommandDiagnostic(parsed.name);
 		if (!diagnostic) return false;

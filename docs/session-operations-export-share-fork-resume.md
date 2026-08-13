@@ -7,6 +7,7 @@ This document describes operator-visible behavior for session export/share/fork/
 - [`../src/modes/controllers/command-controller.ts`](../packages/coding-agent/src/modes/controllers/command-controller.ts)
 - [`../src/session/agent-session.ts`](../packages/coding-agent/src/session/agent-session.ts)
 - [`../src/session/session-manager.ts`](../packages/coding-agent/src/session/session-manager.ts)
+- [`../src/session-import/`](../packages/coding-agent/src/session-import/)
 - [`../src/export/html/index.ts`](../packages/coding-agent/src/export/html/index.ts)
 - [`../src/export/custom-share.ts`](../packages/coding-agent/src/export/custom-share.ts)
 - [`../src/main.ts`](../packages/coding-agent/src/main.ts)
@@ -21,11 +22,23 @@ This document describes operator-visible behavior for session export/share/fork/
 | `/share`                                | Interactive slash command | No                                    | No                                                                                 | Temp HTML + share URL/gist                                                       |
 | `/fork`                                 | Interactive slash command | Yes (active session identity changes) | Creates new session file and switches current session to it (persistent mode only) | Copies artifact directory to new session namespace when present                  |
 | `--fork <id                             | path>`                    | CLI startup                           | Yes after session creation                                                         | Creates a new session fork from the selected source into current cwd/session dir | None |
+| `/import-session <transcript-file> [--provider codex\|claude]` | Interactive or trusted local startup command | No active-session mutation | Creates one independently resumable native session file | Bounded quarantine digest proof and provenance |
 | `/resume`                               | Interactive slash command | Yes (active in-memory state replaced) | Switches to selected existing session file                                         | None                                                                             |
 | `--resume`                              | CLI startup (picker)      | Yes after session creation            | Opens selected existing session file                                               | None                                                                             |
 | `--resume <id                           | path>`                    | CLI startup                           | Yes after session creation                                                         | Opens existing session; cross-project case can fork into current project         | None |
 | `--continue`                            | CLI startup               | Yes after session creation            | Opens terminal breadcrumb or most-recent session; creates new one if none exists   | None                                                                             |
 
+## Import external sessions
+
+`/import-session <transcript-file> [--provider codex|claude]` imports one explicit Codex CLI rollout transcript, Claude Code transcript, or claude.ai conversation export. Format detection is content-based; `--provider` narrows detection and fails closed on a mismatch. The command never scans private live process state or provider history directories.
+
+The importer reconstructs user/assistant context and bounded tool evidence in a fresh native session. Unsupported or malformed records are never silently dropped: aggregate counts and at most 512 full-record SHA-256 quarantine proofs are retained in provenance. The source basename, provider/format, source/session identifier when available, exact source digest and byte count, converter/sanitizer versions, mapping/redaction counts, and bounded-context state are persisted. Raw provider archives are never copied into the session store.
+
+The source is opened once with no-follow semantics and read through that retained descriptor; device, inode, link count, size, mtime, and ctime must remain exact through the complete read. Regular hard-linked exports are accepted without weakening managed-session storage, whose files remain single-linked. Secret-bearing values, Authorization/Cookie headers, terminal escapes, C0/C1 controls, bidi/zero-width controls, tool labels, IDs, titles, cwd metadata, and source diagnostics are sanitized before display or persistence.
+
+Each invocation creates one new session, verifies that it reopens with the same captured destination authority and reconstructs continuable history, then releases that authority. Imports are refused while the current session is streaming. Imported sessions do not replace the active session automatically; select the new session with `/resume`.
+
+The command is available only on Linux in the interactive TUI and trusted local startup command path. It is neither advertised nor dispatched over ACP or remote-control transports.
 ## Export and dump
 
 ### `/export [outputPath]` (interactive)
