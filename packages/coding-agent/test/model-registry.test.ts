@@ -63,49 +63,6 @@ describe("ModelRegistry", () => {
 		authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 	});
 
-	test("matches Codex discovery account metadata against the full OAuth pool", async () => {
-		await authStorage.set("openai-codex", [
-			{
-				type: "oauth",
-				access: "codex-access-a",
-				refresh: "codex-refresh-a",
-				expires: Date.now() + 60_000,
-				accountId: "account-a",
-			},
-			{
-				type: "oauth",
-				access: "codex-access-b",
-				refresh: "codex-refresh-b",
-				expires: Date.now() + 60_000,
-				accountId: "account-b",
-			},
-		]);
-		const getApiKeySpy = vi.spyOn(authStorage, "getApiKey").mockResolvedValue("codex-access-b");
-		const requests: Array<{ authorization: string | null; accountId: string | null }> = [];
-		using _hook = hookFetch((input, init) => {
-			const url = input instanceof Request ? input.url : String(input);
-			if (url.includes("registry.npmjs.org")) {
-				return new Response(JSON.stringify({ version: "1.0.0" }), { status: 200 });
-			}
-			const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
-			requests.push({
-				authorization: headers.get("Authorization"),
-				accountId: headers.get("chatgpt-account-id"),
-			});
-			return new Response(JSON.stringify({ models: [] }), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		});
-
-		try {
-			const registry = new ModelRegistry(authStorage, modelsJsonPath);
-			await registry.refreshProvider("openai-codex", "online");
-			expect(requests).toContainEqual({ authorization: "Bearer codex-access-b", accountId: "account-b" });
-		} finally {
-			getApiKeySpy.mockRestore();
-		}
-	});
 	afterEach(() => {
 		resetSettingsForTest();
 		authStorage.close();

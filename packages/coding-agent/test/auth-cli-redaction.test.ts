@@ -19,6 +19,7 @@ const ENV_KEYS = ["GJC_AUTH_BROKER_URL", "GJC_AUTH_BROKER_TOKEN"] as const;
 async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string; stderr: string }> {
 	const originalStdout = process.stdout.write.bind(process.stdout);
 	const originalStderr = process.stderr.write.bind(process.stderr);
+	const originalExitCode = process.exitCode;
 	let stdout = "";
 	let stderr = "";
 	process.stdout.write = ((chunk: string | Uint8Array): boolean => {
@@ -34,6 +35,7 @@ async function captureOutput(run: () => Promise<void>): Promise<{ stdout: string
 	} finally {
 		process.stdout.write = originalStdout;
 		process.stderr.write = originalStderr;
+		process.exitCode = originalExitCode;
 	}
 	return { stdout, stderr };
 }
