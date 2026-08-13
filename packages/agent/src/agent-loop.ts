@@ -809,14 +809,27 @@ function losslessDetachedClone<T>(value: T): T {
 		// metadata while stripping only the failed top-level surface.
 		if (!isManagedPlainRecord(value)) return sanitizedDetachedClone(value);
 		const output: Record<string, unknown> = {};
+		let remaining = MANAGED_SNAPSHOT_MAX_NODES;
 		for (const key of LOSSLESS_SNAPSHOT_KEYS) {
+			if (remaining-- <= 0) break;
 			const descriptor = Object.getOwnPropertyDescriptor(value, key);
 			if (!descriptor || !("value" in descriptor)) continue;
 			try {
 				output[key] = structuredClone(descriptor.value);
 			} catch {
-				const detached = sanitizedDetachedClone(descriptor.value);
-				if (detached !== "[unserializable]") output[key] = detached;
+				if (key === "transportFailure" && isManagedPlainRecord(descriptor.value)) {
+					const transport: Record<string, unknown> = {};
+					for (const transportKey of ["kind", "status", "code", "providerCode", "retryAfterMs"] as const) {
+						const transportDescriptor = Object.getOwnPropertyDescriptor(descriptor.value, transportKey);
+						if (!transportDescriptor || !("value" in transportDescriptor)) continue;
+						try {
+							transport[transportKey] = structuredClone(transportDescriptor.value);
+						} catch {
+							// Strip only this non-cloneable transport fact.
+						}
+					}
+					output[key] = transport;
+				}
 			}
 		}
 		return output as T;
@@ -1094,6 +1107,31 @@ class ManagedAttemptTransaction {
 	}
 
 	#stage(event: AgentEvent): void {
+		if (this.snapshotMode === "lossless") {
+			const snapshot = this.#repairAssistantEvent(event);
+			let detached: AgentEvent;
+			try {
+				detached = this.#losslessSnapshot(snapshot);
+			} catch {
+				this.discard();
+				throw new ManagedAttemptSnapshotError();
+			}
+			let detachedBytes: number;
+			try {
+				detachedBytes = managedAttemptTextEncoder.encode(JSON.stringify(detached)).byteLength;
+			} catch {
+				this.discard();
+				throw new ManagedAttemptSnapshotError();
+			}
+			if (this.#wouldOverflow(detachedBytes)) {
+				this.discard();
+				throw new ManagedAttemptSnapshotError();
+			}
+			this.#batch.push({ type: "event", event: detached });
+			this.#stagedEventCount++;
+			this.#stagedBytes += detachedBytes;
+			return;
+		}
 		// Measure the raw event FIRST so an oversized payload is rejected
 		// before the snapshot duplicates it — the staged-byte cap exists to
 		// bound memory, so cloning ahead of the check would defeat it.
@@ -1111,10 +1149,7 @@ class ManagedAttemptTransaction {
 			throw new ManagedAttemptBufferOverflowError();
 		}
 		const repaired = this.#repairAssistantEvent(event);
-		const detailed =
-			this.snapshotMode === "lossless"
-				? { snapshot: this.#losslessSnapshot(repaired), degraded: false }
-				: managedAttemptSnapshotDetailed(repaired);
+		const detailed = managedAttemptSnapshotDetailed(repaired);
 		let snapshot = detailed.snapshot;
 		if (bytes === undefined || detailed.degraded) {
 			// Account the bytes of what is actually retained: a degraded
