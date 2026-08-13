@@ -330,7 +330,12 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 					throw new Error("Auth-broker presentation sidecar path is unsafe");
 				const temporary = `${this.#presentationPath}.${process.pid}.${randomUUID()}.tmp`;
 				try {
-					await fs.writeFile(temporary, JSON.stringify(parsed), { flag: "wx", mode: 0o600 });
+					try {
+						await fs.writeFile(temporary, JSON.stringify(parsed), { flag: "wx", mode: 0o600 });
+					} catch (error) {
+						if (isEnoent(error)) return;
+						throw error;
+					}
 					await fs.chmod(temporary, 0o600).catch(() => {});
 					await fs.rename(temporary, this.#presentationPath).catch(error => {
 						if (!isEnoent(error)) throw error;
