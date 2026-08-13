@@ -3,8 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-	AuthBrokerError,
 	AuthBrokerClient,
+	AuthBrokerError,
 	type AuthBrokerServerHandle,
 	AuthStorage,
 	REMOTE_REFRESH_SENTINEL,
@@ -183,9 +183,10 @@ describe("RemoteAuthCredentialStore SSE integration", () => {
 		storage!.disableCredentialById(staleEntry.id, "deleted in test");
 		storage!.upsertCredential("anthropic", mintOAuthCredential("replacement", Date.now() + 120_000));
 
-		const refreshError = await remote
-			.refreshOAuthCredential("anthropic", staleEntry.id, staleEntry.credential)
-			.then(() => undefined, error => error);
+		const refreshError = await remote.refreshOAuthCredential("anthropic", staleEntry.id, staleEntry.credential).then(
+			() => undefined,
+			error => error,
+		);
 		expect(refreshError).toBeInstanceOf(AuthBrokerError);
 		expect((refreshError as AuthBrokerError).status).toBe(404);
 		expect((refreshError as AuthBrokerError).body).toContain(`No credential with id=${staleEntry.id}`);

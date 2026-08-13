@@ -111,12 +111,18 @@ describe("OAuth selector filtering", () => {
 					email: "b@example.com",
 				},
 			]);
-			selector = new OAuthSelectorComponent("logout", authStorage, () => {}, () => cancelled.push(true), {
-				accountProviderId: "anthropic",
-				onAccountRemove: targets => {
-					removed.push(targets);
+			selector = new OAuthSelectorComponent(
+				"logout",
+				authStorage,
+				() => {},
+				() => cancelled.push(true),
+				{
+					accountProviderId: "anthropic",
+					onAccountRemove: targets => {
+						removed.push(targets);
+					},
 				},
-			});
+			);
 
 			selector.handleInput("\x1b[B");
 			selector.handleInput("\x1b[B");

@@ -460,8 +460,7 @@ export class OAuthSelectorComponent extends Container {
 	handleInput(keyData: string): void {
 		const isConfirm = matchesKey(keyData, "enter") || matchesKey(keyData, "return") || keyData === "\n";
 		const isCancel = matchesSelectCancel(keyData);
-		const pendingConfirmationCleared =
-			!isConfirm && !isCancel ? this.#clearPendingAccountRemoval() : false;
+		const pendingConfirmationCleared = !isConfirm && !isCancel ? this.#clearPendingAccountRemoval() : false;
 		const itemCount = this.#accountProviderId ? this.#filteredAccountEntries.length : this.#filteredProviders.length;
 		if (matchesKey(keyData, "up")) {
 			if (itemCount > 0) this.#selectedIndex = this.#selectedIndex === 0 ? itemCount - 1 : this.#selectedIndex - 1;

@@ -55,7 +55,10 @@ export function parseBind(raw: string): ParsedBind {
 
 /** True for loopback-only hostnames the auth servers may bind without credentials. */
 export function isLoopbackHostname(hostname: string): boolean {
-	const normalized = hostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+	const normalized = hostname
+		.trim()
+		.toLowerCase()
+		.replace(/^\[|\]$/g, "");
 	return normalized === "localhost" || normalized === "::1" || normalized.startsWith("127.");
 }
 

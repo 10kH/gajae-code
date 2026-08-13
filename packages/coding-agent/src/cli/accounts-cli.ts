@@ -303,7 +303,10 @@ function writeJsonFailure(error: unknown): void {
 		writeJson({ ok: false, error: { code: "accounts-error", message: cleanReason(error) ?? "Command failed." } });
 		return;
 	}
-	writeJson({ ok: false, error: { code: "internal-error", message: "Accounts command failed; see stderr for diagnostics." } });
+	writeJson({
+		ok: false,
+		error: { code: "internal-error", message: "Accounts command failed; see stderr for diagnostics." },
+	});
 }
 
 export async function runAccountsCommand(cmd: AccountsCommandArgs): Promise<void> {
@@ -329,7 +332,9 @@ export async function runAccountsCommand(cmd: AccountsCommandArgs): Promise<void
 	} catch (error) {
 		if (cmd.flags.json) {
 			if (!(error instanceof AccountsCommandError)) {
-				process.stderr.write(`accounts command failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+				process.stderr.write(
+					`accounts command failed: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+				);
 			}
 			process.exitCode = 1;
 			writeJsonFailure(error);

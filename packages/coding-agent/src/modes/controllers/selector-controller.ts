@@ -3211,7 +3211,9 @@ export class SelectorController {
 			}
 			if (targets) {
 				if (targets.length === 0) {
-					this.ctx.showError(`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`);
+					this.ctx.showError(
+						`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`,
+					);
 					return;
 				}
 				const result = authStorage.removeAuthCredentialsHard(providerId, targets);
@@ -3228,7 +3230,9 @@ export class SelectorController {
 				return;
 			}
 			if (oauthRemovalTargets.length === 0) {
-				this.ctx.showError(`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`);
+				this.ctx.showError(
+					`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`,
+				);
 				return;
 			}
 			const result = authStorage.removeAuthCredentialsHard(providerId, oauthRemovalTargets);

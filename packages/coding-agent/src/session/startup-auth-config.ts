@@ -6,8 +6,9 @@
  * performed. Environment values are trusted credential sources and take
  * precedence over global config values.
  */
-import * as path from "node:path";
+
 import * as os from "node:os";
+import * as path from "node:path";
 import type { AuthCredentialSelector, CredentialRankingMode } from "@gajae-code/ai/core";
 import { $credentialEnv, getAgentDir, getConfigRootDir, isEnoent, logger } from "@gajae-code/utils";
 import { YAML } from "bun";
@@ -191,16 +192,13 @@ async function readGlobalStartupAuthYaml(agentDir: string): Promise<GlobalStartu
 		const sectionRecord = asRecord(section);
 		if (!sectionRecord) throw startupAuthConfigError(agentDir, errorKind);
 		for (const key of ["url", "token"] as const) {
-			if (Object.prototype.hasOwnProperty.call(sectionRecord, key) && typeof sectionRecord[key] !== "string") {
+			if (Object.hasOwn(sectionRecord, key) && typeof sectionRecord[key] !== "string") {
 				throw startupAuthConfigError(agentDir, errorKind);
 			}
 		}
 	}
 
-	if (
-		Object.prototype.hasOwnProperty.call(auth, "credentialRankingMode") &&
-		resolveRankingMode(auth.credentialRankingMode) === undefined
-	) {
+	if (Object.hasOwn(auth, "credentialRankingMode") && resolveRankingMode(auth.credentialRankingMode) === undefined) {
 		throw startupAuthConfigError(agentDir, "invalid-ranking-mode");
 	}
 	const credentialPins = readCredentialPins(auth, configPath);

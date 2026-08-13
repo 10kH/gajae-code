@@ -105,16 +105,32 @@ describe("startup auth config", () => {
 	it("fails closed for malformed auth, broker, gateway, and pin sections", async () => {
 		clearAuthEnv();
 		const malformedAuth = await makeAgentDir('auth: "auth-section-secret"\n');
-		await expectStartupAuthConfigError(resolveStartupAuthConfig(malformedAuth), "invalid-auth", "auth-section-secret");
+		await expectStartupAuthConfigError(
+			resolveStartupAuthConfig(malformedAuth),
+			"invalid-auth",
+			"auth-section-secret",
+		);
 
 		const malformedBroker = await makeAgentDir("auth:\n  broker:\n    url:\n      - broker-section-secret\n");
-		await expectStartupAuthConfigError(resolveStartupAuthConfig(malformedBroker), "invalid-broker", "broker-section-secret");
+		await expectStartupAuthConfigError(
+			resolveStartupAuthConfig(malformedBroker),
+			"invalid-broker",
+			"broker-section-secret",
+		);
 
 		const malformedGateway = await makeAgentDir('auth:\n  gateway: "gateway-section-secret"\n');
-		await expectStartupAuthConfigError(resolveStartupAuthConfig(malformedGateway), "invalid-gateway", "gateway-section-secret");
+		await expectStartupAuthConfigError(
+			resolveStartupAuthConfig(malformedGateway),
+			"invalid-gateway",
+			"gateway-section-secret",
+		);
 
 		const malformedPins = await makeAgentDir("auth:\n  credentialPins: pin-section-secret\n");
-		await expectStartupAuthConfigError(resolveStartupAuthConfig(malformedPins), "invalid-credential-pins", "pin-section-secret");
+		await expectStartupAuthConfigError(
+			resolveStartupAuthConfig(malformedPins),
+			"invalid-credential-pins",
+			"pin-section-secret",
+		);
 	});
 
 	it("reads canonical nested YAML and validates persistent pins", async () => {

@@ -92,7 +92,7 @@ function asSafeLabel(value: unknown): string | null {
 	if (typeof value !== "string") return null;
 	const normalized = value
 		.replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, " ")
-		.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, " ")
+		.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, " ")
 		.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
 		.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
 		.replace(/https?:\/\/[^\s?#]+(?:\?[^\s#]*)?/gi, value => value.split("?")[0] ?? "[redacted URL]")
@@ -132,7 +132,9 @@ function classifyDisabledCause(value: unknown, disabled: boolean): AccountInvent
 	if (/^replaced by newer credential$/i.test(cause)) return "replaced";
 	if (
 		/^(?:oauth|auth-broker) refresh failed:/i.test(cause) ||
-		/invalid_grant|grant is invalid|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(cause) ||
+		/invalid_grant|grant is invalid|invalid_token|revoked|unauthorized|expired.*refresh|refresh.*expired/i.test(
+			cause,
+		) ||
 		(/\b(401|403)\b/.test(cause) && !/timeout|network|fetch failed|ECONNREFUSED/i.test(cause))
 	) {
 		return "auth_failure";
@@ -159,9 +161,7 @@ function sourceLabel(source: AccountInventorySource): string {
 }
 
 function providerSet(input: AccountInventoryInput, inventory: CredentialInventoryRecord[]): Set<string> {
-	const providers = new Set(
-		inventory.flatMap(row => (typeof row.provider === "string" ? [row.provider] : [])),
-	);
+	const providers = new Set(inventory.flatMap(row => (typeof row.provider === "string" ? [row.provider] : [])));
 	for (const provider of input.modelRegistry?.getAvailable?.() ?? []) {
 		if (typeof provider?.provider === "string") providers.add(provider.provider);
 	}
@@ -316,7 +316,8 @@ function addStoredRows(
 		const identityLabel = asSafeLabel(record.identityLabel);
 		const safeUsage = redactUsageCache(storedUsage(authStorage, record));
 		const active =
-			typeof record.provider === "string" && authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
+			typeof record.provider === "string" &&
+			authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
 		const canPin =
 			record.credentialKind === "oauth" && !record.disabled && canPinStoredOAuth(authStorage, record.provider);
 		const canRemove = record.credentialKind === "oauth" && removalTargetIds.has(record.id);
