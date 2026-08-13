@@ -5,6 +5,7 @@ import type { ModelProfileDefinition } from "@gajae-code/coding-agent/config/mod
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { SelectorController } from "@gajae-code/coding-agent/modes/controllers/selector-controller";
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
+import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 
 const model = (provider: string, id: string): Model =>
 	({
@@ -109,12 +110,12 @@ function createControllerContext(
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 	};
-	return { ctx, settings, session, setCalls };
+	return { ctx: ctx as unknown as InteractiveModeContext, settings, session, setCalls };
 }
 
-async function login(ctx: ReturnType<typeof createControllerContext>["ctx"], providerId: string): Promise<void> {
+async function login(ctx: InteractiveModeContext, providerId: string): Promise<void> {
 	installTestTheme();
-	const controller = new SelectorController(ctx as never);
+	const controller = new SelectorController(ctx);
 	await controller.showOAuthSelector("login", providerId);
 }
 

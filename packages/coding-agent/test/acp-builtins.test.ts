@@ -16,6 +16,7 @@ interface FakeAcpBuiltinSession {
 	isStreaming: boolean;
 	sessionFile: string | undefined;
 	sessionId: string;
+	credentialSessionId: string;
 	sessionName: string;
 	_todoPhases: Array<{ name: string; tasks: Array<{ content: string; status: string }> }>;
 	thinkingLevel: ThinkingLevel | undefined;
@@ -99,7 +100,8 @@ function createRuntime() {
 		getGeneration: () => 0,
 		getCachedCredentialHealth: () => ({ status: "unknown", reason: null }),
 		getCachedUsageReport: (_provider: string, credentialId: number) => cachedUsage.get(credentialId),
-		getSessionCredentialRowId: (provider: string) => activeCredentialRows.get(provider),
+		getSessionCredentialRowId: (provider: string, sessionId?: string) =>
+			activeCredentialRows.get(`${sessionId ?? ""}\u0000${provider}`),
 		hasRuntimeApiKey: () => false,
 		hasConfigApiKey: () => false,
 		getEffectiveCredentialType: () => undefined,
@@ -113,6 +115,7 @@ function createRuntime() {
 		isStreaming: false,
 		sessionFile: undefined,
 		sessionId: "fake-session-id",
+		credentialSessionId: "fake-credential-session-id",
 		sessionName: "Fake Session",
 		_todoPhases: [],
 		thinkingLevel: ThinkingLevel.Low,
@@ -266,7 +269,8 @@ function createRuntime() {
 			cachedUsage.clear();
 			for (const [credentialId, usage] of usageByCredentialId) cachedUsage.set(credentialId, usage);
 			activeCredentialRows.clear();
-			for (const [provider, credentialId] of activeRows) activeCredentialRows.set(provider, credentialId);
+			for (const [scopeAndProvider, credentialId] of activeRows)
+				activeCredentialRows.set(scopeAndProvider, credentialId);
 		},
 		runtime: {
 			session: typedSession,
@@ -422,7 +426,7 @@ describe("ACP builtin slash commands", () => {
 					},
 				],
 			]),
-			new Map([["openai-codex", 2]]),
+			new Map([["fake-credential-session-id\u0000openai-codex", 2]]),
 		);
 
 		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
@@ -434,6 +438,41 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("openai-codex:stored:2");
 		expect(output[0]).toContain("selected@example.com [active]");
 		expect(output[0]).toContain("Weekly: 2.00 requests used (98.0% left)");
+	});
+
+	it("does not cross-label active accounts between credential sessions or providers", async () => {
+		const { output, runtime, session, setAccountInventory } = createRuntime();
+		setAccountInventory(
+			[
+				{
+					id: 1,
+					provider: "openai-codex",
+					credentialKind: "oauth",
+					identityLabel: "codex@example.com",
+					disabled: false,
+					disabledCause: null,
+				},
+				{
+					id: 2,
+					provider: "anthropic",
+					credentialKind: "oauth",
+					identityLabel: "claude@example.com",
+					disabled: false,
+					disabledCause: null,
+				},
+			],
+			new Map(),
+			new Map([
+				["other-session\u0000openai-codex", 1],
+				["fake-credential-session-id\u0000anthropic", 2],
+			]),
+		);
+
+		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
+
+		expect(session.credentialSessionId).toBe("fake-credential-session-id");
+		expect(output[0]).not.toContain("codex@example.com [active]");
+		expect(output[0]).toContain("claude@example.com [active]");
 	});
 
 	it("renders the deterministic empty stored-account inventory without probing", async () => {
