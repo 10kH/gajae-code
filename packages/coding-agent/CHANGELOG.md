@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Post-merge repair for #4401/#4399: `CHAT_DAEMON_GENERATIONS.discord` 63→64 and `.slack` 66→67 so the shared `SessionRouter` attachment lifecycle changes from #4401 (`#attach`, `#createAttachedClient`, `#publishAttachment`) are properly generation-fenced for Discord and Slack daemons, not just Telegram. The semantic guard manifest is regenerated.
+
 ### Added
 - `/theme <name>` now switches the theme immediately without opening the selector: the name is validated against built-in and custom themes, persisted to the detected `theme.dark`/`theme.light` slot, and applied to the running session in one step. Bare `/theme` keeps the existing live-preview selector, and an unknown name is rejected with the list of available themes.
 - Added built-in `grok-46-{eco,medium,pro}` role profiles using the existing xAI OAuth/subscription provider, and updated `/model` so direct xAI Grok 4.5/4.6 assignment prompts for a supported reasoning effort instead of retaining `(inherit)`. Grok 4.5 offers `low`/`medium`/`high`; Grok 4.6 adds `xhigh`.
