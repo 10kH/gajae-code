@@ -43,8 +43,15 @@ export interface LinuxProcessIdentity {
 const repoRoot = path.join(import.meta.dir, "..");
 const TEST_FILE_PATTERN = /(?:^|\/)(?:[^/]+\.(?:test|spec)|(?:test|spec)_[^/]+)\.(?:[cm]?[jt]sx?)$/u;
 const PROVIDER_ENDPOINT_ENV = [
+	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_BASE_URL",
 	"ANTHROPIC_AUTH_TOKEN",
+	"ANTHROPIC_OAUTH_TOKEN",
+	"AZURE_OPENAI_API_KEY",
+	"E2E",
+	"GEMINI_API_KEY",
+	"GJC_E2E_GATEWAY_URL",
+	"GOOGLE_API_KEY",
 	"OPENAI_BASE_URL",
 	"OPENAI_API_KEY",
 ] as const;
@@ -261,6 +268,7 @@ export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
 		stderr: "inherit",
 		detached: process.platform !== "win32",
 	});
+	activeChildren.set(child, undefined);
 	const leader = process.platform === "linux" ? await probeLinuxProcess(child.pid) : undefined;
 	activeChildren.set(child, leader);
 	let timedOut = false;
@@ -273,9 +281,15 @@ export const runTestProcess: TestProcessRunner = async (spec, timeoutMs) => {
 	}, timeoutMs);
 	try {
 		const first = await Promise.race([child.exited.then(exitCode => ({ exitCode })), timeoutStarted.then(() => undefined)]);
-		if (first) return { exitCode: first.exitCode, signal: child.signalCode ?? undefined, timedOut };
-		await timeoutCleanup;
-		const exitCode = await child.exited;
+		let exitCode: number;
+		if (first) exitCode = first.exitCode;
+		else {
+			await timeoutCleanup;
+			exitCode = await child.exited;
+		}
+		if (process.platform !== "win32" && (await processGroupHasExecutingMembers(child.pid))) {
+			await terminateProcess(child, leader);
+		}
 		return { exitCode, signal: child.signalCode ?? undefined, timedOut };
 	} finally {
 		clearTimeout(timer);

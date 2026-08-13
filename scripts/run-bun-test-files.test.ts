@@ -75,7 +75,14 @@ describe("fresh-process test harness contracts", () => {
 			"/tmp/sandbox with spaces",
 			30_000,
 			"/repo root",
-			{ PATH: "/bin", ANTHROPIC_BASE_URL: "https://host.invalid", OPENAI_API_KEY: "host-secret" },
+			{
+				PATH: "/bin",
+				E2E: "1",
+				ANTHROPIC_API_KEY: "host-secret",
+				ANTHROPIC_BASE_URL: "https://host.invalid",
+				GEMINI_API_KEY: "host-secret",
+				OPENAI_API_KEY: "host-secret",
+			},
 		);
 		expect(spec.argv).toEqual([
 			"bun",
@@ -94,7 +101,10 @@ describe("fresh-process test harness contracts", () => {
 		expect(spec.env.GJC_CODING_AGENT_DIR).toBeUndefined();
 		expect(spec.env.GJC_SESSION_ID).toBeUndefined();
 		expect(spec.env.GJC_STATE_ROOT).toBeUndefined();
+		expect(spec.env.E2E).toBeUndefined();
+		expect(spec.env.ANTHROPIC_API_KEY).toBeUndefined();
 		expect(spec.env.ANTHROPIC_BASE_URL).toBeUndefined();
+		expect(spec.env.GEMINI_API_KEY).toBeUndefined();
 		expect(spec.env.OPENAI_API_KEY).toBeUndefined();
 	});
 
@@ -187,6 +197,37 @@ describe("fresh-process test harness contracts", () => {
 		const descendantPid = Number(pidText);
 		expect(descendantPid).toBeInteger();
 		const observed = await probeLinuxProcess(descendantPid);
+		if (observed?.startTime === startTime) expect(await processIdentityIsExecuting(observed)).toBe(false);
+	});
+
+	test("a normally exited test file cannot leave an active descendant", async () => {
+		if (process.platform !== "linux") return;
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "run-bun-test-clean-exit-"));
+		tempDirs.push(root);
+		await fs.mkdir(path.join(root, "scripts"), { recursive: true });
+		await Bun.write(path.join(root, "scripts", "test-preload.ts"), "export {};\n");
+		await fs.mkdir(path.join(root, "tests"), { recursive: true });
+		const pidFile = path.join(root, "descendant.pid");
+		await Bun.write(
+			path.join(root, "tests", "background.test.ts"),
+			'import { test } from "bun:test"; import * as fs from "node:fs/promises"; test("background", async () => { const child = Bun.spawn(["bun", "-e", "process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 1000)"], { stdout: "ignore", stderr: "ignore" }); const stat = await fs.readFile(`/proc/${child.pid}/stat`, "utf8"); const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" "); await fs.writeFile(process.env.DESCENDANT_PID!, `${child.pid}:${fields[19]}`); child.unref(); });\n',
+		);
+		const priorPidFile = process.env.DESCENDANT_PID;
+		process.env.DESCENDANT_PID = pidFile;
+		let exitCode: number;
+		try {
+			exitCode = await runHarness(
+				{ root: "tests", testTimeoutMs: 30_000, fileTimeoutMs: 30_000, concurrency: 1 },
+				undefined,
+				root,
+			);
+		} finally {
+			if (priorPidFile === undefined) delete process.env.DESCENDANT_PID;
+			else process.env.DESCENDANT_PID = priorPidFile;
+		}
+		expect(exitCode).toBe(0);
+		const [pidText, startTime] = (await Bun.file(pidFile).text()).trim().split(":");
+		const observed = await probeLinuxProcess(Number(pidText));
 		if (observed?.startTime === startTime) expect(await processIdentityIsExecuting(observed)).toBe(false);
 	});
 

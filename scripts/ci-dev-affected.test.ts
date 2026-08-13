@@ -1305,6 +1305,14 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		]);
 	});
 
+	test("the fresh-process runner is a first-class CI harness path", () => {
+		for (const changedPath of ["scripts/run-bun-test-files.ts", "scripts/run-bun-test-files.test.ts"]) {
+			const keys = targeted([changedPath]).map(task => task.key);
+			expect(keys).toContain("ci-selftest");
+			expect(keys).toContain("ci-dry-run");
+		}
+	});
+
 	test("native platform package changes plan release publish validation", () => {
 		const tasks = targeted(["packages/natives-linux-x64/package.json"]);
 		const keys = tasks.map(task => task.key);

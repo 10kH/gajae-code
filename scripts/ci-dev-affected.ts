@@ -1089,7 +1089,7 @@ function isTestFilePath(changedPath: string): boolean {
 }
 
 function isCiHarnessScriptPath(changedPath: string): boolean {
-	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts" || changedPath === "scripts/ci-risk-canary-manifest.ts" || changedPath === "scripts/ci-risk-canary-manifest.test.ts" || changedPath === "scripts/ci-virtual-integration.ts" || changedPath === "scripts/ci-virtual-integration.test.ts";
+	return changedPath === "scripts/ci-dev-affected.ts" || changedPath === "scripts/ci-dev-affected.test.ts" || changedPath === "scripts/run-bun-test-files.ts" || changedPath === "scripts/run-bun-test-files.test.ts" || changedPath === "scripts/dev-ci-guard-topology.test.ts" || changedPath === "scripts/check-workflow-yaml.ts" || changedPath === "scripts/check-workflow-permissions.ts" || changedPath === "scripts/check-workflow-permissions.test.ts" || changedPath === "scripts/ci-risk-canary-manifest.ts" || changedPath === "scripts/ci-risk-canary-manifest.test.ts" || changedPath === "scripts/ci-virtual-integration.ts" || changedPath === "scripts/ci-virtual-integration.test.ts";
 }
 
 
@@ -1483,6 +1483,8 @@ function isWorkflowHarnessPath(changedPath: string): boolean {
 		isWorkflowPath(changedPath) ||
 		changedPath === "scripts/ci-dev-affected.ts" ||
 		changedPath === "scripts/ci-dev-affected.test.ts" ||
+		changedPath === "scripts/run-bun-test-files.ts" ||
+		changedPath === "scripts/run-bun-test-files.test.ts" ||
 		changedPath === "scripts/dev-ci-guard-topology.test.ts" ||
 		changedPath === "scripts/check-workflow-yaml.ts" ||
 		changedPath === "scripts/check-workflow-permissions.ts" ||
