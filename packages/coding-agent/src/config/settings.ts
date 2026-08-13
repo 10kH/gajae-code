@@ -277,15 +277,6 @@ function isAtomicSettingsPath(path: string): boolean {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Value at a dotted path, accepting both the flat legacy key form and the
- * nested form (used for the interrupted-retirement source republication).
- */
-function valueAtPath(obj: Record<string, unknown>, dottedPath: string): unknown {
-	if (dottedPath in obj) return obj[dottedPath];
-	return getByPath(obj, dottedPath.split("."));
-}
-
-/**
  * Flatten an object to its leaf dotted paths (nested and dotted keys alike),
  * used to verify publication proof before retiring a legacy source.
  */
