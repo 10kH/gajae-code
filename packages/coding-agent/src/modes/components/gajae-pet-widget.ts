@@ -184,7 +184,7 @@ export class GajaePetWidget {
 	#nextWorkBurstAt = 0;
 	#workBurstIndex = 0;
 	#autoFlexGapMs: [number, number] | null;
-	#forcedProtocol: "sixel" | "kitty" | undefined;
+	#forcedProtocol: "sixel" | "kitty" | "iterm2" | undefined;
 	/** Cell metrics the current frames were built for; a change triggers a rebuild. */
 	#builtCellW = 0;
 	#builtCellH = 0;
@@ -211,7 +211,7 @@ export class GajaePetWidget {
 		isWorking: () => boolean;
 		/** Rows rendered below the composer box (pet floor + hook widgets). */
 		getComposerBottomOffset: () => number;
-		forcePixelProtocol?: "sixel" | "kitty";
+		forcePixelProtocol?: "sixel" | "kitty" | "iterm2";
 		/** Random [min, max] ms between auto-flexes; null disables. */
 		autoFlexGapMs?: [number, number] | null;
 	}) {
@@ -228,7 +228,7 @@ export class GajaePetWidget {
 	}
 
 	/** Protocol available for the real-pixel pet, if any. */
-	static pixelProtocol(): "sixel" | "kitty" | null {
+	static pixelProtocol(): "sixel" | "kitty" | "iterm2" | null {
 		return getPetPixelProtocol();
 	}
 
@@ -303,7 +303,7 @@ export class GajaePetWidget {
 	}
 
 	/** (Re)build the encoded frames for the current terminal cell metrics. */
-	#buildPixel(protocol: "sixel" | "kitty"): void {
+	#buildPixel(protocol: "sixel" | "kitty" | "iterm2"): void {
 		const cell = getCellDimensions();
 		this.#builtCellW = cell.widthPx;
 		this.#builtCellH = cell.heightPx;
@@ -317,10 +317,17 @@ export class GajaePetWidget {
 			skin,
 			cellWidthPx: cell.widthPx,
 			cellHeightPx: cell.heightPx,
+			// Encode iTerm2 at the same two-row pixel size as Kitty/Sixel. The
+			// iTerm2 protocol receives explicit pixel dimensions below, so it must
+			// not be reduced to a fractional cell canvas or it becomes undersized.
 			targetRows: 2,
 			sixelTopPaddingPx: protocol === "sixel" ? PET_SIXEL_DROP_PX : 0,
 			kittyCellYOffsetPx: protocol === "kitty" ? petKittyDropPx(cell.heightPx) : 0,
 			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
+			// iTerm2 receives an explicit 1:1 pixel size; keep its raster inside the
+			// same two-row footprint reserved for Kitty and Sixel.
+			iterm2TopPaddingPx: 0,
+			iterm2BottomPaddingPx: 0,
 		});
 		this.#framedEditor.setReserve(this.#pixel.columns + PET_SIDE_MARGIN);
 	}
@@ -485,7 +492,15 @@ export class GajaePetWidget {
 		// back onto the composer's bottom border per protocol (sixel via transparent
 		// top padding, kitty via a sub-cell Y offset baked into the frames).
 		const composerBottom = rows - this.#getComposerBottomOffset();
-		const y = composerBottom - pixel.rows - PET_RAISE_ROWS;
+		// iTerm2 anchors an inline image at the current cursor row. Keep the full
+		// sprite inside the composer rows and leave the HUD boundary below it.
+		// Keep the full-size iTerm2 sprite aligned with the composer like the
+		// cursor-neutral Kitty/Sixel overlays; only the protocol encoding differs.
+		// Nudge the iTerm2 image one terminal row upward while preserving its
+		// explicit 36px size and aspect ratio. Kitty/Sixel keep their established
+		// safety lift.
+		const safetyLift = PET_RAISE_ROWS;
+		const y = composerBottom - pixel.rows - safetyLift;
 		const x = columns - pixel.columns - PET_SIDE_MARGIN;
 		if (y < 0 || x < 0) return null;
 		return { x, y };
@@ -563,7 +578,7 @@ export class GajaePetWidget {
 		const { x, y } = pos;
 		let out = "";
 
-		if (pixel.protocol === "sixel") {
+		if (pixel.protocol === "sixel" || pixel.protocol === "iterm2") {
 			const footprint = { x, y, columns: pixel.columns, rows: pixel.rasterRows };
 			if (this.#lastSixelFootprint && !sameFootprint(this.#lastSixelFootprint, footprint)) {
 				out += this.#clearSixelFootprint(this.#lastSixelFootprint);
