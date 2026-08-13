@@ -36,7 +36,7 @@ The importer converts user, assistant, function/custom-tool call, and tool-resul
 
 Each source is independently staged, validated, fsynced, and published without replacement. Repeating the command verifies provenance and returns the existing imported session, including after that session has been resumed and continued. Imported sessions do not replace the active session automatically; select them with `/resume`.
 
-The command is available only in the interactive TUI and trusted local startup command path. It is neither advertised nor dispatched over ACP or remote-control transports. Source files must be regular, single-link, non-symlink files beneath the selected Codex sessions directory. Secret-bearing fields, credential-shaped values, terminal escape sequences, bidi/zero-width controls, and provider control tokens are redacted before persistence.
+The command is available only in the interactive TUI and trusted local startup command path. It is neither advertised nor dispatched over ACP or remote-control transports. Source files must be regular, non-symlink files beneath the selected Codex sessions directory. Hard-linked files (nlink > 1, as real Codex rollout files produce) are accepted; descriptor-relative identity re-verification on every read prevents TOCTOU swap attacks regardless of link count. Secret-bearing fields, credential-shaped values, terminal escape sequences, bidi/zero-width controls, and provider control tokens are redacted before persistence.
 Trusted source import currently requires Linux descriptor-relative filesystem authority and fails closed on platforms where that authority is unavailable.
 ## Export and dump
 
