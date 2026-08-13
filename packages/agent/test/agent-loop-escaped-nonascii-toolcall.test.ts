@@ -601,6 +601,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(failure?.role === "assistant" ? failure.transportFailure : undefined).toEqual({
 			kind: "transport",
 			status: 429,
+			headers: {},
 		});
 	});
 

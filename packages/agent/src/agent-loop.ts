@@ -764,7 +764,33 @@ function managedAttemptSnapshot<T>(value: T): T {
 	return managedAttemptSnapshotDetailed(value).snapshot;
 }
 
-const NON_CLONEABLE = Symbol("non-cloneable");
+const LOSSLESS_SNAPSHOT_KEYS = [
+	"role",
+	"content",
+	"api",
+	"provider",
+	"model",
+	"responseId",
+	"usage",
+	"stopReason",
+	"errorMessage",
+	"errorKind",
+	"errorStatus",
+	"transportFailure",
+	"disabledFeatures",
+	"providerPayload",
+	"timestamp",
+	"duration",
+	"ttft",
+	"type",
+	"contentIndex",
+	"delta",
+	"partial",
+	"toolCall",
+	"reason",
+	"message",
+	"error",
+] as const;
 
 /**
  * Detach unmanaged provider metadata without normalizing the cloneable parts.
@@ -776,46 +802,24 @@ function losslessDetachedClone<T>(value: T): T {
 	try {
 		return structuredClone(value);
 	} catch {
-		let budget = MANAGED_SNAPSHOT_MAX_NODES;
-		const seen = new Map<object, unknown>();
-		const clone = (input: unknown): unknown | typeof NON_CLONEABLE => {
-			if (budget-- <= 0) return NON_CLONEABLE;
-			if (typeof input === "function" || typeof input === "symbol") return NON_CLONEABLE;
-			if (input === null || typeof input !== "object") return input;
-			if (nodeUtilTypes.isProxy(input)) return NON_CLONEABLE;
-			const prior = seen.get(input);
-			if (prior !== undefined) return prior;
+		// The managed sanitizer is explicitly bounded and total. Use it only to
+		// identify which top-level assistant metadata surfaces are cloneable; the
+		// cloneable surfaces themselves still come from structuredClone and remain
+		// lossless. This avoids recursive/unbounded traversal of hostile provider
+		// metadata while stripping only the failed top-level surface.
+		if (!isManagedPlainRecord(value)) return sanitizedDetachedClone(value);
+		const output: Record<string, unknown> = {};
+		for (const key of LOSSLESS_SNAPSHOT_KEYS) {
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor || !("value" in descriptor)) continue;
 			try {
-				return structuredClone(input);
+				output[key] = structuredClone(descriptor.value);
 			} catch {
-				// Only recurse into ordinary records/arrays. Host objects such as live
-				// Headers are stripped as one surface rather than flattened into a
-				// misleading normalized representation.
-				if (!Array.isArray(input)) {
-					const prototype = Object.getPrototypeOf(input);
-					if (prototype !== Object.prototype && prototype !== null) return NON_CLONEABLE;
-				}
-				const output: unknown[] | Record<string, unknown> = Array.isArray(input) ? [] : {};
-				seen.set(input, output);
-				const keys = Object.keys(input);
-				const keyLimit = Math.min(keys.length, Math.max(0, budget));
-				for (let index = 0; index < keyLimit && budget > 0; index++) {
-					const key = keys[index]!;
-					const descriptor = Object.getOwnPropertyDescriptor(input, key);
-					if (!descriptor || !("value" in descriptor)) continue;
-					const child = clone(descriptor.value);
-					if (child !== NON_CLONEABLE) {
-						(output as Record<string, unknown>)[key] = child;
-					}
-				}
-				return output;
+				const detached = sanitizedDetachedClone(descriptor.value);
+				if (detached !== "[unserializable]") output[key] = detached;
 			}
-		};
-		const cloned = clone(value);
-		if (cloned === NON_CLONEABLE) {
-			throw new ManagedAttemptSnapshotError();
 		}
-		return cloned as T;
+		return output as T;
 	}
 }
 
@@ -2613,6 +2617,9 @@ async function streamAssistantResponse(
 								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
+							if (provisionalToolTransaction) {
+								config.onProvisionalAssistantMessageEvent?.(partialMessage, event);
+							}
 							stream.push({ type: "message_start", message: { ...partialMessage }, scope });
 							break;
 
@@ -2639,6 +2646,7 @@ async function streamAssistantResponse(
 								const partialEvent = config.fallbackManaged ? { ...event, partial: partialMessage } : event;
 								context.messages[context.messages.length - 1] = partialMessage;
 								if (provisionalToolTransaction) {
+									config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent);
 									provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
 								} else {
 									config.onAssistantMessageEvent?.(partialMessage, partialEvent);

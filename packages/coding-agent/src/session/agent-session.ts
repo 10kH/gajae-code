@@ -1926,6 +1926,7 @@ function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretOb
 }
 
 export class AgentSession {
+	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
 	sessionManager: SessionManager;
 	readonly settings: Settings;
@@ -3025,6 +3026,27 @@ export class AgentSession {
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
+		this.agent.setProvisionalAssistantMessageEventInterceptor((message, assistantMessageEvent) => {
+			const contentIndex = assistantMessageEvent.contentIndex ?? 0;
+			const block = message.content[contentIndex];
+			if (block?.type === "toolCall" && block.id) this.#provisionalStreamingToolCallIds.add(block.id);
+			if (
+				assistantMessageEvent.type !== "toolcall_start" &&
+				assistantMessageEvent.type !== "toolcall_delta" &&
+				assistantMessageEvent.type !== "toolcall_end"
+			) {
+				return;
+			}
+			const event: AgentEvent = {
+				type: "message_update",
+				message,
+				assistantMessageEvent,
+			};
+			void this.#preCacheStreamingEditFile(event);
+			if (assistantMessageEvent.type === "toolcall_delta" || assistantMessageEvent.type === "toolcall_end") {
+				this.#maybeAbortStreamingEdit(event, this.#promptGeneration);
+			}
+		});
 		this.agent.bindRunCancellationDomainBridge(this.#runCancellationDomains, this.#agentSessionClaimKey);
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
@@ -4984,6 +5006,7 @@ export class AgentSession {
 
 		if (
 			event.type === "message_update" &&
+			!this.#isProvisionalStreamingToolEvent(event) &&
 			(event.assistantMessageEvent.type === "toolcall_start" ||
 				event.assistantMessageEvent.type === "toolcall_delta" ||
 				event.assistantMessageEvent.type === "toolcall_end")
@@ -4993,6 +5016,7 @@ export class AgentSession {
 
 		if (
 			event.type === "message_update" &&
+			!this.#isProvisionalStreamingToolEvent(event) &&
 			(event.assistantMessageEvent.type === "toolcall_end" || event.assistantMessageEvent.type === "toolcall_delta")
 		) {
 			this.#maybeAbortStreamingEdit(event, this.#promptGeneration);
@@ -6196,6 +6220,13 @@ export class AgentSession {
 			// if priming hasn't completed by the time removed lines appear.
 			void this.#preCacheFileAsync(streamingEdit.resolvedPath);
 		}
+	}
+
+	#isProvisionalStreamingToolEvent(event: AgentEvent): boolean {
+		if (event.type !== "message_update") return false;
+		const contentIndex = event.assistantMessageEvent.contentIndex ?? 0;
+		const block = event.message.role === "assistant" ? event.message.content[contentIndex] : undefined;
+		return block?.type === "toolCall" && this.#provisionalStreamingToolCallIds.has(block.id);
 	}
 
 	#streamingEditPrecachePending = new Set<string>();

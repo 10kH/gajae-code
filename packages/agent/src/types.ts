@@ -424,6 +424,10 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Callers may abort synchronously to stop consuming buffered provider events.
 	 */
 	onAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	/** Observe unmanaged provisional assistant deltas before public publication. */
+	onProvisionalAssistantMessageEvent?: (message: AssistantMessage, event: AssistantMessageEvent) => void;
+	/** True when the host consumes provisional assistant events for live safety checks. */
+	hasProvisionalAssistantMessageEventConsumer?: boolean;
 
 	/** Called for non-content tool-choice incapability stream events. */
 	onToolChoiceIncapability?: (event: Extract<AssistantMessageEvent, { type: "toolChoiceIncapability" }>) => void;
