@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+### Changed
+- Defense-in-depth: when an Anthropic-origin assistant transcript message carrying directly adjacent `thinking`/`redacted_thinking` blocks is persisted, a single bounded warn is emitted per session manager instance — but only in development/test builds, never in production. The diagnostic names only the envelope shape (block count, adjacency presence, provider), never raw thinking text, signatures, redacted payloads, or transcript-path metadata. Storage is never mutated — the send-boundary collapse remains the wire source of truth; this is a read-only observation that helps surface upstream producers of the rejected shape (#4443).
 ### Fixed
 - Print mode now requests a governed process exit after successful session teardown, so completed one-shot runs cannot be pinned by residual runtime handles; both stdout and stderr are drained first and the recorded exit code is preserved.
 - Post-merge repair for #4401/#4399: `CHAT_DAEMON_GENERATIONS.discord` 63→64 and `.slack` 66→67 so the shared `SessionRouter` attachment lifecycle changes from #4401 (`#attach`, `#createAttachedClient`, `#publishAttachment`) are properly generation-fenced for Discord and Slack daemons, not just Telegram. The semantic guard manifest is regenerated.
