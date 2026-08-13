@@ -6,8 +6,7 @@ import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { Settings } from "../src/config/settings";
 import { applyImport, type BuildImportPreviewOptions, buildImportPreview } from "../src/customization/import";
 import { discoverRuntimeSkills } from "../src/extensibility/runtime-skill-discovery";
-import { loadSkills } from "../src/extensibility/skills";
-import { loadAllMCPConfigs } from "../src/runtime-mcp/config";
+import { loadSkills, resetActiveSkillsForTests } from "../src/extensibility/skills";
 import { MCPManager } from "../src/runtime-mcp/manager";
 import { createAgentSession } from "../src/sdk";
 import { SessionManager } from "../src/session/session-manager";
@@ -19,6 +18,7 @@ const PROTECTED_SKILL = "ralplan";
 const MCP_NAME = "cross-convention-server";
 const MCP_SECRET = "cross-convention-secret";
 const HOOK_TOOL = "read";
+const READ_TARGET = "fixture-target.txt";
 const SKILL_CONTENT = `---
 name: ${SKILL_NAME}
 description: Cross-convention fixture skill.
@@ -59,10 +59,11 @@ rl.on("line", line => {
       }
     }) + "\\n");
   } else if (message.method === "tools/call") {
+	const credentialPresent = process.env.API_KEY === ${JSON.stringify(MCP_SECRET)};
     process.stdout.write(JSON.stringify({
       jsonrpc: "2.0",
       id: message.id,
-      result: { content: [{ type: "text", text: "canonical-mcp-consumed" }] }
+	  result: { content: [{ type: "text", text: credentialPresent ? "canonical-mcp-consumed" : "missing-imported-secret" }] }
     }) + "\\n");
   } else if (message.id !== undefined) {
     process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }) + "\\n");
@@ -122,21 +123,21 @@ function hookContent(marker: string): string {
 `;
 }
 
-function claudeMcpConfig(): string {
+function claudeMcpConfig(script: string = MCP_SERVER_SCRIPT): string {
 	return JSON.stringify({
 		mcpServers: {
 			[MCP_NAME]: {
 				type: "stdio",
 				command: process.execPath,
-				args: ["-e", MCP_SERVER_SCRIPT],
+				args: ["-e", script],
 				env: { API_KEY: MCP_SECRET },
 			},
 		},
 	});
 }
 
-function codexMcpConfig(): string {
-	return `[mcp_servers.${MCP_NAME}]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ["-e", ${JSON.stringify(MCP_SERVER_SCRIPT)}]\nenv = { API_KEY = ${JSON.stringify(MCP_SECRET)} }\n`;
+function codexMcpConfig(script: string = MCP_SERVER_SCRIPT): string {
+	return `[mcp_servers.${MCP_NAME}]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ["-e", ${JSON.stringify(script)}]\nenv = { API_KEY = ${JSON.stringify(MCP_SECRET)} }\n`;
 }
 
 async function seedConvention(product: ImportedProduct, marker: string): Promise<void> {
@@ -165,13 +166,27 @@ async function seedNative(marker: string): Promise<void> {
 	);
 }
 
-async function removeConvention(product: ImportedProduct): Promise<void> {
+async function seedCollisionBundle(marker: string): Promise<void> {
+	await writeFile(
+		path.join(projectDir, ".gjc", "skills", SKILL_NAME, "SKILL.md"),
+		SKILL_CONTENT.replace("canonical runtime consumption", "pre-existing native authority"),
+	);
+	await writeFile(path.join(projectDir, ".gjc", "hooks", "pre", `${HOOK_TOOL}.ts`), hookContent(marker));
+	await writeFile(
+		path.join(projectDir, ".gjc", "mcp.json"),
+		JSON.stringify({ mcpServers: { [MCP_NAME]: { type: "stdio", command: "native-collision" } } }),
+	);
+}
+
+async function makeForeignHookDistinct(product: ImportedProduct, marker: string): Promise<void> {
 	const files = sourceFiles(product);
-	await fs.rm(product === "claude-code" ? path.join(projectDir, ".claude") : path.join(projectDir, ".codex"), {
-		recursive: true,
-		force: true,
-	});
-	if (product === "claude-code") await fs.rm(files.mcp, { force: true });
+	await fs.writeFile(files.hook, hookContent(marker), "utf8");
+	const foreignMcpScript = MCP_SERVER_SCRIPT.replace("canonical-mcp-consumed", "foreign-mcp-consumed");
+	await fs.writeFile(
+		files.mcp,
+		product === "claude-code" ? claudeMcpConfig(foreignMcpScript) : codexMcpConfig(foreignMcpScript),
+		"utf8",
+	);
 }
 
 async function consumeCanonicalBundle(marker: string): Promise<{
@@ -185,6 +200,13 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 		policy: { enabled: true, trustProjectSkills: false, trustUserSkills: true },
 	});
 	expect(runtimeSkills.candidates.some(candidate => candidate.name === SKILL_NAME)).toBe(false);
+	const untrustedLoadedSkills = await loadSkills({
+		cwd: projectDir,
+		enabled: true,
+		trustProjectSkills: false,
+		trustUserSkills: true,
+	});
+	expect(untrustedLoadedSkills.skills.some(skill => skill.name === SKILL_NAME)).toBe(false);
 
 	const trustedRuntimeSkills = await discoverRuntimeSkills({
 		cwd: projectDir,
@@ -205,57 +227,43 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 	const body = await loadedSkill?.loadContent?.();
 	expect(body).toContain("canonical runtime consumption");
 
-	const loadedMcp = await loadAllMCPConfigs(projectDir, {
-		nativeOnly: true,
-		filterExa: false,
-		autoloadOnly: true,
-	});
-	expect(loadedMcp.configs[MCP_NAME]).toMatchObject({ command: process.execPath });
-	const manager = new MCPManager(projectDir);
-	try {
-		const connected = await manager.connectServers(loadedMcp.configs, loadedMcp.sources);
-		expect(connected.errors).toEqual(new Map());
-		const tool = connected.tools.find(candidate => candidate.name.includes("cross_convention_server_lookup"));
-		expect(tool).toBeDefined();
-		const toolResult = await tool?.execute("cross-convention-call", {}, undefined, {} as never, undefined);
-		const text = (toolResult?.content ?? []).map(content => (content.type === "text" ? content.text : "")).join("\n");
-		expect(text).toBe("canonical-mcp-consumed");
-		expect(tool?.mcpServerName).toBe(MCP_NAME);
-		return {
-			skill: { name: loadedSkill!.name, description: loadedSkill!.description, body: body! },
-			mcp: { toolName: tool!.name, text },
-			hook: await consumeHook(marker),
-		};
-	} finally {
-		await manager.disconnectAll();
-	}
-}
-
-async function consumeHook(marker: string): Promise<string> {
 	const created = await createAgentSession({
 		cwd: projectDir,
 		agentDir,
 		settings: Settings.isolated(),
 		sessionManager: SessionManager.inMemory(projectDir),
-		skills: [],
+		skills: loadedSkills.skills,
 		rules: [],
 		contextFiles: [],
 		promptTemplates: [],
 		slashCommands: [],
-		enableMcpAutoload: false,
+		enableMcpAutoload: true,
 		enableLsp: false,
-		toolNames: ["__none__"],
+		toolNames: [HOOK_TOOL],
 	});
 	try {
-		expect(created.session.extensionRunner?.hasHandlers("tool_call")).toBe(true);
-		await created.session.extensionRunner?.emitToolCall({
-			type: "tool_call",
-			toolName: HOOK_TOOL,
-			toolCallId: "cross-convention-hook",
-			input: {},
-		});
+		const tool = created.session.agent.state.tools.find(candidate =>
+			candidate.name.includes("cross_convention_server_lookup"),
+		);
+		expect(tool).toBeDefined();
+		const toolResult = await tool?.execute("cross-convention-call", {}, undefined, {} as never, undefined);
+		const text = (toolResult?.content ?? []).map(content => (content.type === "text" ? content.text : "")).join("\n");
+		expect(text).toBe("canonical-mcp-consumed");
+		const readTool = created.session.agent.state.tools.find(candidate => candidate.name === HOOK_TOOL);
+		expect(readTool).toBeDefined();
+		await readTool?.execute(
+			"cross-convention-read",
+			{ path: path.join(projectDir, READ_TARGET) },
+			undefined,
+			undefined as never,
+			undefined,
+		);
 		await expect(fs.readFile(marker, "utf8")).resolves.toBe(HOOK_TOOL);
-		return await fs.readFile(marker, "utf8");
+		return {
+			skill: { name: loadedSkill!.name, description: loadedSkill!.description, body: body! },
+			mcp: { toolName: tool!.name, text },
+			hook: await fs.readFile(marker, "utf8"),
+		};
 	} finally {
 		await created.session.dispose();
 	}
@@ -269,6 +277,7 @@ beforeEach(async () => {
 	await fs.mkdir(projectDir, { recursive: true });
 	await fs.mkdir(homeDir, { recursive: true });
 	await fs.mkdir(agentDir, { recursive: true });
+	await writeFile(path.join(projectDir, READ_TARGET), "cross-convention read target\n");
 	homeBefore = await fs.readdir(homeDir);
 	originalAgentDir = getAgentDir();
 	setAgentDir(agentDir);
@@ -278,6 +287,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	vi.restoreAllMocks();
+	resetActiveSkillsForTests();
 	setAgentDir(originalAgentDir);
 	await expect(fs.readdir(homeDir)).resolves.toEqual(homeBefore);
 	await fs.rm(root, { recursive: true, force: true });
@@ -287,12 +297,28 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 	for (const convention of ["claude-code", "codex", "native"] as const) {
 		test(`${convention} bundle is consumed through canonical .gjc`, async () => {
 			const marker = path.join(root, `${convention}-hook-ran`);
+			const foreignMarker = path.join(root, `${convention}-foreign-hook-ran`);
 			if (convention === "native") {
 				await seedNative(marker);
 			} else {
 				await seedConvention(convention, marker);
+				await seedCollisionBundle(path.join(root, `${convention}-collision-hook-ran`));
+				const collisionPlan = await buildImportPreview(previewOptions(convention));
+				expect(collisionPlan.preview.entries.filter(entry => entry.status === "conflict")).toHaveLength(3);
+				const collisionResult = await applyImport(collisionPlan, { cwd: projectDir });
+				expect(collisionResult.ok).toBe(true);
+				expect(collisionResult.entries.filter(entry => entry.outcome === "skipped")).toHaveLength(4);
+				expect(
+					await fs.readFile(path.join(projectDir, ".gjc", "skills", SKILL_NAME, "SKILL.md"), "utf8"),
+				).toContain("pre-existing native authority");
+				expect(await fs.readFile(path.join(projectDir, ".gjc", "hooks", "pre", "read.ts"), "utf8")).toContain(
+					"collision-hook-ran",
+				);
+				expect(await fs.readFile(path.join(projectDir, ".gjc", "mcp.json"), "utf8")).toContain("native-collision");
+				await fs.rm(path.join(projectDir, ".gjc"), { recursive: true, force: true });
 				const plan = await buildImportPreview(previewOptions(convention));
 				const previewJson = JSON.stringify(plan.preview);
+				await expect(fs.stat(path.join(projectDir, ".gjc"))).rejects.toMatchObject({ code: "ENOENT" });
 				expect(
 					plan.preview.entries.some(entry => entry.surface === "skills" && entry.destinationName === SKILL_NAME),
 				).toBe(true);
@@ -312,12 +338,15 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 				const applied = await applyImport(plan, { cwd: projectDir });
 				expect(applied.ok).toBe(true);
 				expect(applied.entries.filter(entry => entry.outcome === "imported")).toHaveLength(3);
+				for (const sourceFile of Object.values(sourceFiles(convention))) {
+					expect(await fs.stat(sourceFile)).toBeTruthy();
+				}
 				expect(
 					await fs.readFile(path.join(projectDir, ".gjc", "skills", SKILL_NAME, "SKILL.md"), "utf8"),
 				).toContain("x-gjc-imported-from");
 				expect(await fs.stat(path.join(projectDir, ".gjc", "hooks", "pre", "read.ts"))).toBeTruthy();
 				expect(await fs.stat(path.join(projectDir, ".gjc", "mcp.json"))).toBeTruthy();
-				await removeConvention(convention);
+				await makeForeignHookDistinct(convention, foreignMarker);
 			}
 
 			const observed = await consumeCanonicalBundle(marker);
@@ -325,6 +354,21 @@ describe("issue #4508 cross-convention canonical fixture", () => {
 			expect(observed.skill.description).toBe("Cross-convention fixture skill.");
 			expect(observed.mcp.text).toBe("canonical-mcp-consumed");
 			expect(observed.hook).toBe(HOOK_TOOL);
+			expect(
+				await fs.stat(foreignMarker).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+			await fs.rm(marker, { force: true });
+			const repeated = await consumeCanonicalBundle(marker);
+			expect(repeated).toEqual(observed);
+			expect(
+				await fs.stat(foreignMarker).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
 		});
 	}
 });
