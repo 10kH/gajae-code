@@ -21,10 +21,7 @@ concurrency:
 jobs:
   validate:
     name: Validate exact-head PR contract
-    # Phase 2 activation: switch this to the review-state condition after this
-    # workflow and validator exist on the repository default branch. Phase 1 is
-    # enforced by the trusted dev-ci PR contract bootstrap job.
-    if: ${{ false }}
+    if: ${{ github.event_name != 'pull_request_review' || github.event.review.state != 'commented' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:

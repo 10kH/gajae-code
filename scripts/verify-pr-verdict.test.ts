@@ -108,7 +108,7 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 	expect(workflow).toContain("pull_request_target:");
 	expect(workflow).toContain("pull_request_review:");
 	expect(workflow).toContain("types: [submitted, edited, dismissed]");
-	expect(workflow).toContain("if: ${{ false }}");
+	expect(workflow).toContain("github.event.review.state != 'commented'");
 	expect(workflow).not.toMatch(/^\s+pull_request:\s*$/mu);
 	expect(workflow).toContain("permissions:\n  contents: read\n  pull-requests: read");
 	expect(workflow).toContain("name: PR contract");
