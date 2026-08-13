@@ -1006,6 +1006,10 @@ class ManagedAttemptTransaction {
 		this.#committed = true;
 	}
 
+	get committed(): boolean {
+		return this.#committed;
+	}
+
 	discard(): void {
 		this.#batch = [];
 		this.#stagedBytes = 0;
@@ -1547,11 +1551,15 @@ async function runLoopBody(
 			const scope =
 				initialScope ?? (firstTurn ? config.initialScope : undefined) ?? config.attemptMinter?.mint("main");
 			initialScope = undefined;
-			const transaction =
+			const managedTransaction =
 				initialTransaction ??
 				(config.fallbackManaged
 					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope)
 					: undefined);
+			const escapedToolTransaction = config.fallbackManaged
+				? undefined
+				: new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope);
+			const transaction = managedTransaction ?? escapedToolTransaction;
 			initialTransaction = undefined;
 			const attemptScope = transaction?.scope ?? scope;
 			lastAttemptScope = attemptScope;
@@ -1629,7 +1637,7 @@ async function runLoopBody(
 			// Stream assistant response
 			let recovered: HarmonyRecoveredToolCall | undefined;
 			let message: AssistantMessage;
-			const attemptTransaction = transaction;
+			const attemptTransaction = managedTransaction;
 			const recoveryAttempt = pendingRecovery;
 			const wasMalformedToolRecoveryAttempt = recoveryAttempt?.kind === "malformed-tool-call";
 			try {
@@ -1661,7 +1669,7 @@ async function runLoopBody(
 					currentContext,
 					attemptConfig,
 					loopSignal,
-					attemptTransaction ? (attemptTransaction as unknown as EventStream<AgentEvent, AgentMessage[]>) : stream,
+					transaction ? (transaction as unknown as EventStream<AgentEvent, AgentMessage[]>) : stream,
 					telemetry,
 					invokeAgentSpan,
 					stepCounter,
@@ -1675,6 +1683,7 @@ async function runLoopBody(
 								forceAutoToolChoice: !wasMalformedToolRecoveryAttempt,
 							}
 						: undefined,
+					escapedToolTransaction,
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -1840,9 +1849,11 @@ async function runLoopBody(
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
 				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
+				!escapedToolTransaction?.committed &&
 				hasEscapedNonAsciiToolCall(message)
 			) {
 				escapedNonAsciiResampleAttempt++;
+				escapedToolTransaction?.discard();
 				// The defective turn was already committed to the context by the
 				// streaming path. Remove that exact object rather than assuming it is
 				// still the tail: callbacks may append user/system history while the
@@ -2151,6 +2162,7 @@ async function streamAssistantResponse(
 		disableTools?: boolean;
 		forceAutoToolChoice?: boolean;
 	},
+	provisionalToolTransaction?: ManagedAttemptTransaction,
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
@@ -2501,7 +2513,11 @@ async function streamAssistantResponse(
 									: event.partial;
 								const partialEvent = config.fallbackManaged ? { ...event, partial: partialMessage } : event;
 								context.messages[context.messages.length - 1] = partialMessage;
-								config.onAssistantMessageEvent?.(partialMessage, partialEvent);
+								if (provisionalToolTransaction) {
+									provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
+								} else {
+									config.onAssistantMessageEvent?.(partialMessage, partialEvent);
+								}
 								if (signal?.aborted) continue;
 								stream.push({
 									type: "message_update",
@@ -2509,6 +2525,13 @@ async function streamAssistantResponse(
 									message: { ...partialMessage },
 									scope,
 								});
+								// Preserve ordinary text streaming. Once visible text is
+								// published, this response can no longer be silently resampled;
+								// a later escaped tool call therefore falls through to the
+								// existing terminal per-call rejection instead.
+								if (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") {
+									provisionalToolTransaction?.flush();
+								}
 							}
 							break;
 

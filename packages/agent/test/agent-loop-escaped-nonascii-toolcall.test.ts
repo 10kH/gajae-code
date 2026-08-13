@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Agent } from "@gajae-code/agent-core";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
 import type { Message } from "@gajae-code/ai";
@@ -45,6 +46,12 @@ function escapedTurn(id: string, stopReason?: "aborted" | "error") {
 	};
 }
 
+function escapedTurnWithText(id: string) {
+	return {
+		content: [{ type: "text" as const, text: "I will ask." }, ...escapedTurn(id).content],
+	};
+}
+
 /** The same turn as the model would have produced it with literal UTF-8 on the wire. */
 function literalTurn(id: string) {
 	return { content: [{ type: "toolCall" as const, id, name: "ask", arguments: { question: QUESTION } }] };
@@ -77,6 +84,49 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		const resampleRequest = mock.model.calls[1];
 		expect(resampleRequest).toBeDefined();
 		expect(resampleRequest.context.messages.some(message => message.role === "assistant")).toBe(false);
+	});
+
+	it("publishes and stores only the accepted assistant lifecycle", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const mock = createMockModel({
+			responses: [escapedTurn("tc-defective"), literalTurn("tc-accepted"), { content: ["done"] }],
+		});
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: [""],
+				model: mock.model,
+				tools: [askTool(executed)],
+				messages: [],
+			},
+			convertToLlm: identityConverter,
+			streamFn: mock.stream,
+		});
+		const events: AgentEvent[] = [];
+		agent.subscribe(event => events.push(event));
+
+		await agent.prompt("ask me");
+
+		const assistantEnds = events.filter(
+			(event): event is Extract<AgentEvent, { type: "message_end" }> =>
+				event.type === "message_end" && event.message.role === "assistant",
+		);
+		expect(assistantEnds).toHaveLength(2);
+		expect(
+			assistantEnds.some(event =>
+				event.message.role === "assistant"
+					? event.message.content.some(block => block.type === "toolCall" && block.id === "tc-defective")
+					: false,
+			),
+		).toBe(false);
+		expect(
+			agent.state.messages.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(block => block.type === "toolCall" && block.id === "tc-defective"),
+			),
+		).toBe(false);
+		expect(events.filter(event => event.type === "turn_start")).toHaveLength(3);
+		expect(events.filter(event => event.type === "turn_end")).toHaveLength(2);
 	});
 
 	it("preserves all pre-existing history and removes only the defective assistant turn", async () => {
@@ -145,6 +195,22 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 			);
 			expect(messageEnd?.message.role === "assistant" ? messageEnd.message.stopReason : undefined).toBe(stopReason);
 		}
+	});
+
+	it("does not retract a turn after visible text has streamed", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		const mock = createMockModel({ responses: [escapedTurnWithText("tc-visible"), { content: ["done"] }] });
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const toolEnds: AgentEvent[] = [];
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, mock.stream);
+		for await (const event of stream) if (event.type === "tool_execution_end") toolEnds.push(event);
+
+		expect(mock.calls).toHaveLength(2);
+		expect(executed).toHaveLength(0);
+		expect(toolEnds).toHaveLength(1);
+		expect(toolEnds[0]?.type === "tool_execution_end" ? toolEnds[0].isError : false).toBe(true);
 	});
 
 	it("executes no calls from a mixed batch before validating the whole turn", async () => {
