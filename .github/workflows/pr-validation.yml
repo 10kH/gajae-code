@@ -39,8 +39,5 @@ jobs:
         run: |
           set -euo pipefail
           validator=trusted-base/scripts/verify-pr-verdict.ts
-          if [ ! -f "$validator" ]; then
-            echo "Trusted base predates the PR contract validator; using the proposed validator for this one-time bootstrap. Future PRs always execute the immutable base copy."
-            validator=pr-head/scripts/verify-pr-verdict.ts
-          fi
+          test -f "$validator" || { echo "::error::Immutable base does not contain the trusted PR validator; bootstrap this workflow from a maintainer-owned trusted commit before requiring the status."; exit 1; }
           bun "$validator" --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base

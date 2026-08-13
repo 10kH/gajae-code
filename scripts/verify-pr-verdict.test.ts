@@ -102,7 +102,7 @@ test("workflow is pull_request-scoped, read-only, exact-head, and invokes the va
 	expect(workflow).toContain("ref: ${{ github.event.pull_request.head.sha }}");
 	expect(workflow).toContain("ref: ${{ github.event.pull_request.base.sha }}");
 	expect(workflow).toContain("validator=trusted-base/scripts/verify-pr-verdict.ts");
-	expect(workflow).toContain("validator=pr-head/scripts/verify-pr-verdict.ts");
+	expect(workflow).not.toContain("validator=pr-head/scripts/verify-pr-verdict.ts");
 	expect(workflow).toContain('bun "$validator" --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base');
 	expect(workflow).not.toContain("continue-on-error");
 });

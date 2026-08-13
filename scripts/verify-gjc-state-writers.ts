@@ -14,7 +14,10 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-const repoRoot = path.join(import.meta.dir, "..");
+const rootArgIndex = process.argv.indexOf("--root");
+const repoRoot = rootArgIndex >= 0 && process.argv[rootArgIndex + 1]
+	? path.resolve(process.cwd(), process.argv[rootArgIndex + 1])
+	: path.join(import.meta.dir, "..");
 const SCAN_ROOT = path.join(repoRoot, "packages", "coding-agent", "src");
 
 // The one module allowed to perform raw `.gjc/**` filesystem mutations once routing is complete.

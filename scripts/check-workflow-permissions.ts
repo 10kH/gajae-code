@@ -27,6 +27,7 @@ export const JOB_WRITE_ALLOWLIST: readonly { workflow: string; job: string; scop
 export const REQUIRED_READ_DEFAULT: readonly string[] = [
 	".github/workflows/ci.yml",
 	".github/workflows/dev-ci.yml",
+	".github/workflows/pr-validation.yml",
 	".github/workflows/public-site-sync.yml",
 ];
 

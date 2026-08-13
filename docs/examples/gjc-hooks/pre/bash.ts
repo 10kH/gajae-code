@@ -1,10 +1,10 @@
-import type { ExtensionAPI } from "../../../../../packages/coding-agent/src/extensibility/extensions/types";
+import type { HookAPI } from "../../../../../packages/coding-agent/src/extensibility/hooks/types";
 
 /**
  * Repository-local opt-in: copy this file to .gjc/hooks/pre/bash.ts in this checkout.
  * Do not install it under ~/.gjc/agent because the enforced PR contract belongs to this repository.
  */
-export default function registerPrPreflight(api: ExtensionAPI): void {
+export default function registerPrPreflight(api: HookAPI): void {
 	api.on("tool_call", async event => {
 		if (event.toolName !== "bash") return;
 		const command = event.input.command;

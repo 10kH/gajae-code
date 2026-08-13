@@ -124,7 +124,7 @@ async function git(args: string[], cwd: string): Promise<{ exitCode: number; std
 }
 
 async function runFastGate(cwd: string, trustedRoot: string): Promise<boolean> {
-	const process = Bun.spawn(["bun", path.join(trustedRoot, "scripts", "verify-gjc-state-writers.ts"), "--fail"], { cwd, stdout: "inherit", stderr: "inherit" });
+	const process = Bun.spawn(["bun", path.join(trustedRoot, "scripts", "verify-gjc-state-writers.ts"), "--fail", "--root", cwd], { cwd, stdout: "inherit", stderr: "inherit" });
 	return (await process.exited) === 0;
 }
 
