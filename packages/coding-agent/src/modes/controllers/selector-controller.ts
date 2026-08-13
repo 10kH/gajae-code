@@ -1,6 +1,12 @@
 import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
-import type { Api, AuthCredentialSelector, CredentialRemovalTarget, Model } from "@gajae-code/ai/core";
+import {
+	type Api,
+	type AuthCredentialSelector,
+	type CredentialRemovalTarget,
+	type Model,
+	resolveOAuthStorageProvider,
+} from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
@@ -3257,20 +3263,21 @@ export class SelectorController {
 		options?: OAuthSelectorOptions,
 	): Promise<void> {
 		if (providerId) {
-			const oauthProvider = getOAuthProviders().find(provider => provider.id === providerId);
-			if (!oauthProvider && !this.ctx.session.modelRegistry.getModelProfiles().has(providerId)) {
-				this.ctx.showError(`Unknown OAuth provider: ${providerId}`);
+			const selectedProviderId = mode === "logout" ? resolveOAuthStorageProvider(providerId) : providerId;
+			const oauthProvider = getOAuthProviders().find(provider => provider.id === selectedProviderId);
+			if (!oauthProvider && !this.ctx.session.modelRegistry.getModelProfiles().has(selectedProviderId)) {
+				this.ctx.showError(`Unknown OAuth provider: ${selectedProviderId}`);
 				return;
 			}
 			const authStorage = this.ctx.session.modelRegistry.authStorage;
 			const hasOAuthInventory = authStorage
-				.listCredentialInventory(providerId)
-				.some(row => row.provider === providerId && row.credentialKind === "oauth");
+				.listCredentialInventory(selectedProviderId)
+				.some(row => row.provider === selectedProviderId && row.credentialKind === "oauth");
 			const hasRemovableOAuth = authStorage
-				.listCredentialRemovalTargets(providerId)
-				.some(target => target.provider === providerId);
+				.listCredentialRemovalTargets(selectedProviderId)
+				.some(target => target.provider === selectedProviderId);
 			if (mode === "logout" && hasOAuthInventory && !hasRemovableOAuth) {
-				await this.#handleOAuthLogout(providerId);
+				await this.#handleOAuthLogout(selectedProviderId);
 				return;
 			}
 			if (hasOAuthInventory && !options?.manualCode) {
@@ -3286,26 +3293,26 @@ export class SelectorController {
 							this.ctx.ui.requestRender();
 						},
 						{
-							accountProviderId: providerId,
+							accountProviderId: selectedProviderId,
 							onAccountSelect: async (selectorValue: AuthCredentialSelector) => {
-								await this.ctx.session.setCredentialPin(providerId, selectorValue);
+								await this.ctx.session.setCredentialPin(selectedProviderId, selectorValue);
 								selector.stopValidation();
 								done();
-								this.ctx.showStatus(`Pinned OAuth account for ${providerId} to this session.`);
+								this.ctx.showStatus(`Pinned OAuth account for ${selectedProviderId} to this session.`);
 							},
 							onAutoSelect: async () => {
-								await this.ctx.session.setCredentialAuto(providerId);
+								await this.ctx.session.setCredentialAuto(selectedProviderId);
 								selector.stopValidation();
 								done();
-								this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${providerId}.`);
+								this.ctx.showStatus(`Using AUTO (ranked) OAuth accounts for ${selectedProviderId}.`);
 							},
 							onAddAccount: async () => {
 								selector.stopValidation();
 								done();
-								await this.#handleOAuthLogin(providerId, options);
+								await this.#handleOAuthLogin(selectedProviderId, options);
 							},
 							onAccountRemove: async targets => {
-								await this.#handleOAuthLogout(providerId, targets);
+								await this.#handleOAuthLogout(selectedProviderId, targets);
 								selector.stopValidation();
 								done();
 							},
@@ -3316,11 +3323,11 @@ export class SelectorController {
 				return;
 			}
 			if (mode === "login") {
-				await this.#handleOAuthLogin(providerId, options);
+				await this.#handleOAuthLogin(selectedProviderId, options);
 				return;
 			}
 			if (!hasRemovableOAuth) {
-				await this.#handleOAuthLogout(providerId);
+				await this.#handleOAuthLogout(selectedProviderId);
 				return;
 			}
 			this.showSelector(done => {
@@ -3335,9 +3342,9 @@ export class SelectorController {
 						this.ctx.ui.requestRender();
 					},
 					{
-						accountProviderId: providerId,
+						accountProviderId: selectedProviderId,
 						onAccountRemove: async targets => {
-							await this.#handleOAuthLogout(providerId, targets);
+							await this.#handleOAuthLogout(selectedProviderId, targets);
 							selector.stopValidation();
 							done();
 						},

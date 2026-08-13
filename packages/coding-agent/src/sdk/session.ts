@@ -1573,7 +1573,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					(pin.kind === "id" || pin.kind === "email" || pin.kind === "account" || pin.kind === "project") &&
 					typeof pin.value === "string"
 				) {
-					if (pin.kind === "id" && record.credentialStoreIdentity !== startupAuthConfig?.credentialStoreIdentity) {
+					if (
+						pin.kind === "id" &&
+						(!startupAuthConfig?.credentialStoreIdentity ||
+							record.credentialStoreIdentity !== startupAuthConfig.credentialStoreIdentity)
+					) {
 						throw new Error("Durable numeric credential pin authority changed");
 					}
 					authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {

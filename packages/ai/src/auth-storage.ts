@@ -4085,6 +4085,10 @@ export class AuthStorage {
 					if (email) base.email = email;
 					const { raw: _raw, ...trimmed } = report;
 					base.report = trimmed;
+					this.#usageCache.set(this.#buildUsageReportCacheKey(params), {
+						value: report,
+						expiresAt: Date.now() + USAGE_REPORT_TTL_MS,
+					});
 					this.#store.recordCredentialUsage?.(row.provider as Provider, row.id, trimmed);
 				}
 			} catch (error) {

@@ -815,7 +815,16 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	setCache(key: string, value: string, expiresAtSec: number): void {
-		const entry = { value, expiresAtSec };
+		let persistedValue = value;
+		if (key.startsWith("account_health:v1:source:")) {
+			try {
+				const parsed = JSON.parse(value) as { reason?: unknown } & Record<string, unknown>;
+				persistedValue = JSON.stringify({ ...parsed, reason: safePresentationReason(parsed.reason) });
+			} catch {
+				persistedValue = JSON.stringify({ status: "unknown", reason: null });
+			}
+		}
+		const entry = { value: persistedValue, expiresAtSec };
 		this.#cache.set(key, entry);
 		if (key.startsWith("account_health:v1:source:")) {
 			this.#persistedSourceHealth[this.#presentationAuthority] = {
