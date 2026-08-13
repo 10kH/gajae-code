@@ -203,12 +203,26 @@ async function writePersistentPin(
 	const settings = await Settings.init();
 	await settings.commitAtomicBatchWithCurrent(current => {
 		const pins = pinsFromCurrent(current);
+		const currentAuth = asRecord(current.auth);
+		const existingStoreIdentity =
+			typeof currentAuth?.credentialPinStoreIdentity === "string"
+				? currentAuth.credentialPinStoreIdentity.trim()
+				: undefined;
+		if (
+			Object.values(pins).some(value => value.startsWith("id:")) &&
+			credentialStoreIdentity &&
+			existingStoreIdentity !== credentialStoreIdentity
+		) {
+			for (const [pinnedProvider, pinnedSelector] of Object.entries(pins)) {
+				if (pinnedSelector.startsWith("id:")) delete pins[pinnedProvider];
+			}
+		}
 		if (clear) delete pins[provider];
 		else if (selector) pins[provider] = selector;
 		const patches: SettingsAtomicPatch[] = [{ path: "auth.credentialPins", op: "set", value: pins }];
 		const hasNumericPins = Object.values(pins).some(value => value.startsWith("id:"));
 		if (hasNumericPins) {
-			if (credentialStoreIdentity) {
+			if (credentialStoreIdentity && existingStoreIdentity === credentialStoreIdentity) {
 				patches.push({ path: "auth.credentialPinStoreIdentity", op: "set", value: credentialStoreIdentity });
 			} else if (!clear) {
 				throw new AccountsCommandError(

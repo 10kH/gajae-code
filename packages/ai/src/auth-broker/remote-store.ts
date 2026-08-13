@@ -305,7 +305,6 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		const next = this.#presentationWriteChain
 			.catch(() => {})
 			.then(async () => {
-				if (this.#closed) return;
 				const parsed: PresentationSidecarFile = {
 					version: 1,
 					authorities: {
@@ -316,7 +315,6 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				this.#sidecarAuthorities = parsed.authorities;
 				const directory = path.dirname(this.#presentationPath);
 				await fs.mkdir(directory, { recursive: true, mode: 0o700 });
-				if (this.#closed) return;
 				const existing = await fs.lstat(this.#presentationPath).catch(error => {
 					if (isEnoent(error)) return undefined;
 					throw error;
@@ -1149,11 +1147,13 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 
 	close(): void {
 		if (this.#closed) return;
-		this.#closed = true;
 		this.#backgroundAbort.abort();
+		void this.#presentationWriteChain.finally(() => {
+			this.#persistedPresentations.clear();
+		});
+		this.#closed = true;
 		this.#cache.clear();
 		this.#usagePresentations.clear();
-		this.#persistedPresentations.clear();
 		this.#inventoryMetadata.clear();
 		this.#inventorySyncInflight = undefined;
 	}

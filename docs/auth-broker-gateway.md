@@ -162,7 +162,7 @@ Resolution is explicit and ordered:
 2. If a URL is resolved, `GJC_AUTH_BROKER_TOKEN` takes precedence over nested `auth.broker.token`, which takes precedence over the trimmed contents of `<config-dir>/auth-broker.token`.
 3. A resolved URL without a token is a hard startup error; GJC does not fall back to the local SQLite store.
 
-The nested URL and token entries are literal strings; environment-variable indirection is not supported in `config.yml`. Put those values in `GJC_AUTH_BROKER_URL` or `GJC_AUTH_BROKER_TOKEN` instead. Missing config is allowed and leaves broker mode disabled. An unreadable file, invalid YAML, non-mapping root, malformed `auth`/`broker`/`gateway` section, invalid ranking mode, or invalid credential-pin record fails closed with a typed `StartupAuthConfigError` rather than silently downgrading to local authority. Legacy literal dotted auth keys are rejected with manual nested-YAML rewrite guidance.
+The nested URL and token entries may be literal strings or exact `$ENV_NAME` references resolved from the trusted process environment. Missing config is allowed and leaves broker mode disabled. An unreadable file, invalid YAML, non-mapping root, malformed `auth`/`broker`/`gateway` section, unresolved nested URL reference, invalid ranking mode, or invalid credential-pin record fails closed with a typed `StartupAuthConfigError` rather than silently downgrading to local authority. An unresolved nested token reference may still fall through to the owner-only token file. Legacy literal dotted auth keys are rejected with manual nested-YAML rewrite guidance.
 
 The gateway has no dedicated env vars — it inherits `GJC_AUTH_BROKER_*` because it is itself a broker client.
 
@@ -171,7 +171,7 @@ The gateway has no dedicated env vars — it inherits `GJC_AUTH_BROKER_*` becaus
 | Key | Default | Purpose |
 | --- | ------- | ------- |
 | `auth.broker.url`   | unset | Same as `GJC_AUTH_BROKER_URL`; env wins. Hidden from the settings UI. |
-| `auth.broker.token` | unset | Same as `GJC_AUTH_BROKER_TOKEN`; env wins. The value is a literal bearer token; environment-variable indirection is not expanded. |
+| `auth.broker.token` | unset | Same as `GJC_AUTH_BROKER_TOKEN`; env wins. Accepts a literal bearer token or exact `$ENV_NAME` reference. |
 
 ### Token files
 

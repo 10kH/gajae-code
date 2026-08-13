@@ -84,10 +84,10 @@ export interface AccountInventoryInput {
 
 type SyntheticAccountSource = Exclude<AccountInventorySource, "stored">;
 
-/** Optional source-scoped cache hooks supplied by AuthStorage. */
+/** Source-scoped cache hooks supplied by AuthStorage. */
 interface SourceHealthStorage {
-	peekCachedCredentialHealthForSource?: (provider: string, source: SyntheticAccountSource) => CachedCredentialHealth;
-	recordCredentialHealthForSource?: (
+	peekCachedCredentialHealthForSource: (provider: string, source: SyntheticAccountSource) => CachedCredentialHealth;
+	recordCredentialHealthForSource: (
 		provider: string,
 		source: SyntheticAccountSource,
 		health: CachedCredentialHealth,
@@ -315,8 +315,7 @@ function canPinStoredOAuth(authStorage: AuthStorage, provider: string): boolean 
 
 function sourceHealth(authStorage: AuthStorage, provider: string, source: SyntheticAccountSource): AccountHealthCache {
 	const getter = (authStorage as AuthStorage & SourceHealthStorage).peekCachedCredentialHealthForSource;
-	const cached = getter?.call(authStorage, provider, source);
-	if (!cached) return { status: "unknown", reason: null };
+	const cached = getter.call(authStorage, provider, source);
 	return {
 		status:
 			cached.status === "ok" ||
@@ -339,7 +338,6 @@ function recordSourceHealth(
 	reason: unknown,
 ): void {
 	const recorder = (authStorage as AuthStorage & SourceHealthStorage).recordCredentialHealthForSource;
-	if (!recorder) return;
 	const now = Date.now();
 	recorder.call(authStorage, provider, source, {
 		status: ok === true ? "ok" : ok === false ? "failed" : "unverifiable",
@@ -569,8 +567,11 @@ function selectorMatchesRemovedRow(
 		row =>
 			row.provider === provider &&
 			removedIds.has(row.id) &&
-			typeof row.identityLabel === "string" &&
-			row.identityLabel.trim().toLowerCase() === parsed.value.trim().toLowerCase(),
+			(parsed.kind === "email"
+				? row.email?.trim().toLowerCase() === parsed.value.trim().toLowerCase()
+				: parsed.kind === "account"
+					? row.accountId === parsed.value
+					: row.projectId === parsed.value),
 	);
 }
 

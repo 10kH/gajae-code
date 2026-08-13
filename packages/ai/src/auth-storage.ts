@@ -198,6 +198,9 @@ export interface CredentialInventoryRecord {
 	provider: string;
 	credentialKind: "oauth" | "api_key";
 	identityLabel: string | null;
+	accountId?: string;
+	email?: string;
+	projectId?: string;
 	disabled: boolean;
 	disabledCause: string | null;
 }
@@ -1042,6 +1045,7 @@ function isAbortSignalOption(
 }
 
 const HEALTH_CACHE_PREFIX = "account_health:v1:local:row:";
+const SOURCE_HEALTH_CACHE_PREFIX = "account_health:v1:source:";
 const PRESENTATION_RETENTION_MS = 24 * 60 * 60_000;
 
 function safeUsageReport(report: UsageReport): SafeUsageReport {
@@ -3881,6 +3885,46 @@ export class AuthStorage {
 		}
 	}
 
+	peekCachedCredentialHealthForSource(provider: string, source: "env" | "config" | "runtime"): CachedCredentialHealth {
+		const raw = this.#store.getCache(`${SOURCE_HEALTH_CACHE_PREFIX}${provider}:${source}`);
+		if (!raw) return { status: "unknown", reason: null };
+		try {
+			const value = JSON.parse(raw) as CachedCredentialHealth;
+			if (!value.retainUntil || value.retainUntil <= Date.now()) return { status: "unknown", reason: null };
+			return {
+				status:
+					value.status === "ok" || value.status === "failed" || value.status === "unverifiable"
+						? value.status
+						: "unknown",
+				reason: value.reason ? scrubHealthReason(value.reason) : null,
+				checkedAt: value.checkedAt,
+				retainUntil: value.retainUntil,
+			};
+		} catch {
+			return { status: "unknown", reason: null };
+		}
+	}
+
+	recordCredentialHealthForSource(
+		provider: string,
+		source: "env" | "config" | "runtime",
+		health: CachedCredentialHealth,
+	): void {
+		if (health.status === "unknown" || !health.retainUntil) return;
+		const retainUntil = health.retainUntil;
+		const payload: CachedCredentialHealth = {
+			status: health.status,
+			reason: health.reason ? scrubHealthReason(health.reason) : null,
+			checkedAt: health.checkedAt ?? Date.now(),
+			retainUntil,
+		};
+		this.#store.setCache(
+			`${SOURCE_HEALTH_CACHE_PREFIX}${resolveOAuthStorageProvider(provider)}:${source}`,
+			JSON.stringify(payload),
+			Math.floor(retainUntil / 1000),
+		);
+	}
+
 	#recordCredentialHealth(provider: Provider, credentialId: number, health: CachedCredentialHealth): void {
 		if (health.status !== "unknown") this.#store.recordCredentialHealth?.(provider, credentialId, health);
 		if (health.status === "unknown" || !health.retainUntil) return;
@@ -6081,6 +6125,9 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				provider: row.provider,
 				credentialKind: credential.type,
 				identityLabel,
+				...(credential.type === "oauth" && credential.accountId ? { accountId: credential.accountId } : {}),
+				...(credential.type === "oauth" && credential.email ? { email: credential.email } : {}),
+				...(credential.type === "oauth" && credential.projectId ? { projectId: credential.projectId } : {}),
 				disabled: row.disabled_cause !== null,
 				disabledCause: row.disabled_cause,
 			});
