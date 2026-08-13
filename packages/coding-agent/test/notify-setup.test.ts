@@ -1863,6 +1863,57 @@ describe("notify daemon-internal lightweight startup", () => {
 		}
 	});
 
+	test("daemon startup fires the debris sweep without awaiting it and survives its rejection", async () => {
+		// Startup hygiene must never own daemon availability: the sweep is fired
+		// and forgotten, a never-settling sweep does not delay daemon
+		// construction, and a rejection is logged instead of failing startup.
+		const agentDir = tempAgentDir();
+		fs.writeFileSync(
+			path.join(agentDir, "config.yml"),
+			`notifications:
+  enabled: true
+  telegram:
+    botToken: 1234:token
+    chatId: "999"
+`,
+		);
+		const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			for (const mode of ["never-settles", "rejects", "resolves-with-failures"] as const) {
+				let sweptDir: string | undefined;
+				let daemonRan = false;
+				const rejection = new Error("sweep exploded");
+				await runDaemonInternal(["--owner-id", `${process.pid}-${token}`, "--agent-dir", agentDir], {
+					processPid: process.pid,
+					pidAlive: () => true,
+					loadInstallationHostId: async () => "host-id",
+					sweepNotificationDebris: async input => {
+						sweptDir = input.dir;
+						if (mode === "rejects") throw rejection;
+						if (mode === "resolves-with-failures") return { removed: [], kept: 0, failures: 2, scanFailed: true };
+						return await new Promise(() => {});
+					},
+					DaemonImpl: class {
+						requestStop(): void {}
+						async run(): Promise<void> {
+							daemonRan = true;
+						}
+					} as never,
+				});
+				// Startup completed: a never-settling sweep never blocked it.
+				expect(daemonRan).toBe(true);
+				expect(sweptDir).toBe(path.join(agentDir, "notifications"));
+			}
+			await Bun.sleep(10);
+			expect(warning.mock.calls.flat().join("\n")).toContain("startup debris sweep failed");
+			// A RESOLVED report carrying operational failures must not disappear.
+			expect(warning.mock.calls.flat().join("\n")).toContain("startup debris sweep incomplete");
+			expect(warning.mock.calls.flat().join("\n")).toContain("failed 2, scan failed");
+		} finally {
+			warning.mockRestore();
+		}
+	}, 30_000);
+
 	test("owner pid parser accepts pid-prefixed owner ids only", () => {
 		expect(ownerPidFromOwnerId("12345-kabc-random")).toBe(12345);
 		expect(ownerPidFromOwnerId("12345")).toBe(12345);

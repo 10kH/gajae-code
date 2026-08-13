@@ -12,6 +12,7 @@ import {
 	parseNotificationSettingsSnapshot,
 } from "./config";
 import { daemonPaths, HEARTBEAT_TTL_MS } from "./daemon-paths";
+import { type NotificationDebrisSweepReport, sweepNotificationDebris } from "./notification-service";
 import {
 	type DaemonState,
 	FilesystemTopicRegistryCasAuthority,
@@ -50,6 +51,12 @@ export interface RunDaemonInternalDeps {
 	readDaemonState?: (settings: Settings) => Promise<DaemonState | undefined>;
 	/** Loads the verified machine-local identity; injectable so daemon tests do not touch the host. */
 	loadInstallationHostId?: () => Promise<string>;
+	/**
+	 * Startup hygiene sweep over the notifications dir; injectable so tests can
+	 * prove it is fired, is never awaited by startup, and that a rejection is
+	 * logged instead of failing the daemon.
+	 */
+	sweepNotificationDebris?: (input: { dir: string }) => Promise<NotificationDebrisSweepReport>;
 }
 
 /** Ownership-watchdog cadence while the daemon process is running. */
@@ -236,6 +243,22 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 	const settings = await resolveDaemonSettings(resolvedAgentDir, deps);
 	const cfg = getNotificationConfig(settings);
 	if (!isProviderEffectivelyEnabled(cfg, "telegram") || !isTelegramComplete(cfg)) return;
+	// Startup hygiene: reclaim inert quarantine/staging debris left by crashed
+	// writers so the notifications dir cannot grow unboundedly and slow every
+	// later endpoint scan. Never awaited by startup; a rejection is logged and
+	// never fails the daemon, because hygiene must not own daemon availability.
+	void (deps.sweepNotificationDebris ?? sweepNotificationDebris)({
+		dir: daemonPaths(resolvedAgentDir).dir,
+	})
+		.then(report => {
+			// A resolved report can still carry operational failures; surfacing only
+			// a rejected promise would hide exactly the evidence the sweep records.
+			if (report.failures > 0 || report.scanFailed === true)
+				logger.warn(
+					`telegram-daemon: startup debris sweep incomplete: removed ${report.removed.length}, failed ${report.failures}${report.scanFailed ? ", scan failed" : ""}`,
+				);
+		})
+		.catch(error => logger.warn(`telegram-daemon: startup debris sweep failed: ${String(error)}`));
 	const installationHostId = await (deps.loadInstallationHostId ?? loadInstallationHostId)();
 	const topicRegistryAuthority = new FilesystemTopicRegistryCasAuthority(
 		path.join(daemonPaths(resolvedAgentDir).dir, "telegram-topics.json"),
