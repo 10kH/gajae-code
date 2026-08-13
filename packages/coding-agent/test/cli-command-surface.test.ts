@@ -179,6 +179,7 @@ process.exitCode = await child.exited;`;
 			"rlm",
 			"update",
 			"read",
+			"customize",
 			"plugin",
 			"completion",
 			"launch",
