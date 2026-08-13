@@ -8505,6 +8505,7 @@ export class AgentSession {
 		const authStorage = this.#modelRegistry.authStorage;
 		const target = authStorage.resolveOAuthPinTarget(provider, selector);
 		authStorage.setSessionCredentialSelector(scopeId, provider, target.canonicalSelector);
+		if (target.canonicalSelector.kind === "id" && !this.#credentialStoreIdentity) return;
 		this.sessionManager.appendCustomEntry("auth-credential-pin", {
 			v: 1,
 			scopeId,
