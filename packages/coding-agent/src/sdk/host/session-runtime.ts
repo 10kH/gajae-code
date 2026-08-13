@@ -8,6 +8,7 @@ import { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Api, Model } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
 import { AsyncJobManager } from "../../async";
+import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { isModelProfileProviderAvailable, projectModelProfileCatalog } from "../../config/model-profile-contract";
 import { type ModelProfileDefinition, resolveProfileBindings } from "../../config/model-profiles";
 import { resolveModelChainWithAuth, splitSelectorThinkingSuffix } from "../../config/model-resolver";
@@ -121,6 +122,8 @@ export interface SessionSdkRuntimeOptions
 	transport: SessionSdkTransport;
 	/** Session settings; enables `config.patch` application on this runtime. */
 	settings?: Settings;
+	/** Determined once by the session factory; published by the host after start. */
+	autoroutingInactive?: boolean;
 	/** Mutable shadow of patched config values merged into query readback. */
 	configOverrides?: Map<string, unknown>;
 }
@@ -386,9 +389,12 @@ export interface CreateSdkSessionRuntimeOptions {
 		stateRoot: string;
 		token: string;
 	}): SessionSdkTransport | Promise<SessionSdkTransport>;
-	onSdkRequest?: SessionSdkHostOptions["onRequest"];
 	/** Session settings; enables `config.patch` application on this runtime. */
 	settings?: Settings;
+	/** Determined once by the session factory; published by the host after start. */
+	/** Callback for diagnostics and lifecycle request observation. */
+	onSdkRequest?: SessionSdkHostOptions["onRequest"];
+	autoroutingInactive?: boolean;
 	/** Mutable shadow of patched config values merged into query readback. */
 	configOverrides?: Map<string, unknown>;
 	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
@@ -2926,6 +2932,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (capability === "fs") ctx.setSdkClientBridge?.(undefined);
 		};
 		runtime = new SessionSdkSessionRuntime({
+			autoroutingInactive: options.autoroutingInactive,
 			transport,
 			control: async (connectionId, frame) => {
 				options.onFrameAdmitted?.();
