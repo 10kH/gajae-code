@@ -3108,6 +3108,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return key;
 	}
 
+	/**
+	 * Path for the lock owner file that serializes idempotency mutations.
+	 *
+	 * Lock artifacts (owner records, transition markers, quarantine placeholders) are
+	 * created as siblings of the locked path by {@link withSessionStateFileLock}.
+	 * The record directory must enumerate as parseable records only, so the lock
+	 * path lives in a sibling `idempotency-locks` directory: its artifacts can never
+	 * appear inside `idempotency/`, which would surface as
+	 * `JSON Parse error: Unexpected EOF` during replay or enumeration.
+	 */
+	function idempotencyLockFile(idempotencyKey: string): string {
+		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
+		return path.join(namespaceDir, "idempotency-locks", `${keyDigest}.json`);
+	}
 	function idempotencyFile(idempotencyKey: string): string {
 		const keyDigest = createHash("sha256").update(idempotencyKey).digest("hex");
 		return path.join(namespaceDir, "idempotency", `${keyDigest}.json`);
@@ -3139,7 +3153,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			.update(canonicalJson({ tool, args: canonicalArgs }))
 			.digest("hex");
 		const file = idempotencyFile(idempotencyKey);
-		return await withSessionStateLock(file, async () => {
+		const lockFile = idempotencyLockFile(idempotencyKey);
+		return await withSessionStateLock(lockFile, async () => {
 			const existingFile = await readCoordinatorIdempotencyFile(file);
 			if (existingFile.kind === "corrupt")
 				return {
