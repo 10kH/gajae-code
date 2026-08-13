@@ -184,6 +184,12 @@ export interface Component {
 	 * Default is false - release events are filtered out.
 	 */
 	wantsKeyRelease?: boolean;
+	/**
+	 * Optional monotonic revision for renderer-level subtree reuse. Components that
+	 * expose this MUST advance it whenever render output can change without a
+	 * width change. Unversioned components are always rendered normally.
+	 */
+	getRenderRevision?(): bigint;
 
 	/**
 	 * Invalidate any cached rendering state.
@@ -511,9 +517,19 @@ export class Container implements ViewportAnchorProvider {
 	children: Component[] = [];
 	#disposed = false;
 	#viewportAnchorSources = new Map<Component, ViewportAnchorSource>();
+	#renderRevision = 0n;
+
+	#advanceRenderRevision(): void {
+		this.#renderRevision += 1n;
+	}
+
+	getRenderRevision(): bigint {
+		return this.#renderRevision;
+	}
 
 	addChild(component: Component): void {
 		this.children.push(component);
+		this.#advanceRenderRevision();
 	}
 
 	removeChild(component: Component): void {
@@ -522,6 +538,7 @@ export class Container implements ViewportAnchorProvider {
 			this.children.splice(index, 1);
 			this.#viewportAnchorSources.delete(component);
 			component.dispose?.();
+			this.#advanceRenderRevision();
 		}
 	}
 
@@ -531,6 +548,7 @@ export class Container implements ViewportAnchorProvider {
 		if (index !== -1) {
 			this.children.splice(index, 1);
 			this.#viewportAnchorSources.delete(component);
+			this.#advanceRenderRevision();
 		}
 	}
 
@@ -552,12 +570,21 @@ export class Container implements ViewportAnchorProvider {
 		for (const child of this.children) child.dispose?.();
 		this.children = [];
 		this.#viewportAnchorSources.clear();
+		this.#advanceRenderRevision();
 	}
 
 	/** Remove all children without disposing them (for detach-then-readd reuse). */
 	detachAll(): void {
 		this.children = [];
 		this.#viewportAnchorSources.clear();
+		this.#advanceRenderRevision();
+	}
+
+	/** Replace direct children without disposing reusable components. */
+	replaceChildren(children: Component[]): void {
+		this.children = children;
+		this.#viewportAnchorSources.clear();
+		this.#advanceRenderRevision();
 	}
 
 	/** Registers a direct child as eligible for semantic viewport anchoring. */
@@ -567,6 +594,7 @@ export class Container implements ViewportAnchorProvider {
 		}
 		if (source === null) this.#viewportAnchorSources.delete(component);
 		else this.#viewportAnchorSources.set(component, source);
+		this.#advanceRenderRevision();
 	}
 
 	dispose(): void {
@@ -574,10 +602,12 @@ export class Container implements ViewportAnchorProvider {
 		this.#disposed = true;
 		for (const child of this.children) child.dispose?.();
 		this.#viewportAnchorSources.clear();
+		this.#advanceRenderRevision();
 	}
 
 	invalidate(): void {
 		for (const child of this.children) child.invalidate?.();
+		this.#advanceRenderRevision();
 	}
 
 	render(width: number): string[] {
@@ -871,6 +901,18 @@ export class TUI extends Container {
 	#previousHeight = 0;
 	#focusedComponent: Component | null = null;
 	#inputListeners = new Set<InputListener>();
+	#viewportAnchorRenderCache:
+		| {
+				component: Component;
+				width: number;
+				componentRevision: bigint;
+				sourceIdentity: string;
+				sourceRevision: bigint;
+				rendered: ViewportAnchorRender;
+				safeLines: string[];
+				kittyPlacements: KittyPlacementReference[][];
+		  }
+		| undefined;
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	onDebug?: () => void;
@@ -883,6 +925,7 @@ export class TUI extends Container {
 	#resizeRenderQueued = false;
 	#resizeRenderMutationQueued = false;
 	#renderMutationQueued = false;
+	#renderScope: "full" | "layout" = "full";
 	#renderTimer: NodeJS.Timeout | undefined;
 	#widthSettleTimer: NodeJS.Timeout | undefined;
 	#widthSettleRepairPending = false;
@@ -1157,11 +1200,13 @@ export class TUI extends Container {
 	override removeChild(component: Component): void {
 		this.#invalidateFocusForRemovedTree(component);
 		super.removeChild(component);
+		if (component === this.#viewportAnchorComponent) this.#viewportAnchorRenderCache = undefined;
 	}
 
 	override clear(): void {
 		for (const child of this.children) this.#invalidateFocusForRemovedTree(child);
 		super.clear();
+		this.#viewportAnchorRenderCache = undefined;
 	}
 
 	#invalidateFocusForRemovedTree(component: Component): void {
@@ -1203,6 +1248,7 @@ export class TUI extends Container {
 		}
 		if (identityReset || this.#manualViewportTop === undefined) this.#manualOutputNotice = false;
 		this.#viewportOutputSource = source;
+		if (identityReset) this.#viewportAnchorRenderCache = undefined;
 		this.requestRender();
 	}
 
@@ -1213,6 +1259,7 @@ export class TUI extends Container {
 		}
 		if (this.#viewportAnchorComponent === component) return;
 		this.#viewportAnchorComponent = component;
+		this.#viewportAnchorRenderCache = undefined;
 		this.#viewportAnchorFrame = null;
 	}
 	/** Returns the direct component registered as the semantic viewport anchor source. */
@@ -1615,6 +1662,7 @@ export class TUI extends Container {
 
 	override invalidate(): void {
 		super.invalidate();
+		this.#viewportAnchorRenderCache = undefined;
 		for (const overlay of this.overlayStack) overlay.component.invalidate?.();
 		for (const overlay of this.overlayStack) overlay.mouseBounds = undefined;
 	}
@@ -2061,11 +2109,22 @@ export class TUI extends Container {
 		this.requestRenderWithGeneration(force, source);
 	}
 
-	requestRenderWithGeneration(force = false, source = "unknown"): number {
+	#requestRenderWithScope(force: boolean, source: string, scope: "full" | "layout"): number {
 		const generation = ++this.#nextRenderGeneration;
 		this.#renderRequestedGeneration = Math.max(this.#renderRequestedGeneration, generation);
+		if (scope === "full") this.#renderScope = "full";
 		this.#requestRenderCore(force, source, generation);
 		return generation;
+	}
+
+	/** Request a frame whose mutation is known to be outside the viewport-anchor subtree. */
+	requestLayoutRender(source = "layout"): void {
+		if (!this.#renderRequested) this.#renderScope = "layout";
+		this.#requestRenderWithScope(false, source, "layout");
+	}
+
+	requestRenderWithGeneration(force = false, source = "unknown"): number {
+		return this.#requestRenderWithScope(force, source, "full");
 	}
 
 	#requestRenderCore(force: boolean, source: string, generation: number): void {
@@ -3331,6 +3390,8 @@ export class TUI extends Container {
 		};
 
 		const renderTreeStart = renderMetrics.now();
+		const renderScope = this.#renderScope;
+		this.#renderScope = "full";
 		const renderedLines: string[] = [];
 		const renderedChildren = new Map<Component, string[]>();
 		let anchorFrame: ViewportAnchorFrame | null = null;
@@ -3342,8 +3403,37 @@ export class TUI extends Container {
 		const anchorRenderFailureCountBefore = viewportAnchorRenderFailureCount;
 		for (let childIndex = 0; childIndex < this.children.length; childIndex++) {
 			const child = this.children[childIndex];
-			const rendered = safeRenderComponentWithViewportAnchors(child, width, "tui-child");
-			const safeLines = rendered.lines.map(stripTerminalEraseControls);
+			const componentRevision = child.getRenderRevision?.();
+			const source = child === this.#viewportAnchorComponent ? this.#viewportOutputSource : null;
+			const cached = this.#viewportAnchorRenderCache;
+			const reuseCached =
+				renderScope === "layout" &&
+				componentRevision !== undefined &&
+				source !== null &&
+				cached?.component === child &&
+				cached.width === width &&
+				cached.componentRevision === componentRevision &&
+				cached.sourceIdentity === source.identity &&
+				cached.sourceRevision === source.revision;
+			const rendered = reuseCached
+				? cached.rendered
+				: safeRenderComponentWithViewportAnchors(child, width, "tui-child");
+			const safeLines = reuseCached ? cached.safeLines : rendered.lines.map(stripTerminalEraseControls);
+			const kittyPlacements = reuseCached
+				? cached.kittyPlacements
+				: rendered.lines.map(line => [...extractKittyPlacementReferences(line)]);
+			if (!reuseCached && componentRevision !== undefined && source !== null) {
+				this.#viewportAnchorRenderCache = {
+					component: child,
+					width,
+					componentRevision,
+					sourceIdentity: source.identity,
+					sourceRevision: source.revision,
+					rendered,
+					safeLines,
+					kittyPlacements,
+				};
+			}
 			renderedChildren.set(child, safeLines);
 			const childStart = renderedLines.length;
 			if (child === this.#viewportAnchorComponent && rendered.anchors.some(anchor => anchor !== null)) {
@@ -3351,11 +3441,10 @@ export class TUI extends Container {
 			}
 			const owner: KittyPlacementOwner = hasStickySuffix && childIndex >= pinnedChildIndex ? "suffix" : "transcript";
 			for (let lineIndex = 0; lineIndex < rendered.lines.length; lineIndex++) {
-				const line = rendered.lines[lineIndex]!;
-				for (const placement of extractKittyPlacementReferences(line)) {
+				for (const placement of kittyPlacements[lineIndex] ?? []) {
 					placementOwners.set(this.#kittyPlacementKey(placement), owner);
 				}
-				renderedLines.push(safeLines[lineIndex] ?? line);
+				renderedLines.push(safeLines[lineIndex] ?? rendered.lines[lineIndex]!);
 			}
 		}
 		const sourceTranscriptLineCount = hasStickySuffix

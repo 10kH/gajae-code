@@ -3293,7 +3293,7 @@ export class SelectorController {
 				() => {
 					selector.stopValidation();
 					done();
-					this.ctx.ui.requestRender();
+					this.ctx.ui.requestLayoutRender("oauth-selector-close");
 				},
 				{
 					validateAuth: async (selectedProviderId: string) => {
@@ -3304,7 +3304,7 @@ export class SelectorController {
 						return !!apiKey;
 					},
 					requestRender: () => {
-						this.ctx.ui.requestRender();
+						this.ctx.ui.requestLayoutRender("oauth-selector-spinner");
 					},
 					externalCredentialCandidates,
 				},

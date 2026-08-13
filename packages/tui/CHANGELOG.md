@@ -5,6 +5,8 @@
 ### Fixed
 - Kitty inline images are no longer deleted when live output moves their anchor above the viewport, so terminal-native scrollback keeps previously rendered images visible.
 
+- Layout-only animation and selector frames can now reuse an unchanged revisioned transcript subtree instead of rebuilding every off-screen transcript component, anchor row, and Kitty placement on each tick. Ordinary render requests remain conservative, and transcript revision, width, identity, and global invalidation changes still force a full subtree render.
+
 - A fast double-Esc (or triple-Esc) whose ESC bytes coalesce into one stdin chunk — which tmux always produces within its escape-time window, and SSH batching produces routinely — is now emitted as individual Escape key presses instead of a single `"\x1b\x1b"` sequence that parsed as the unbound `alt+escape` and silently swallowed both presses. This restores the double-Esc draft-clear and double-Esc selector gestures under tmux/SSH. Option-as-Meta sequences with a real continuation (e.g. Option+Up as `ESC ESC [ A`) remain atomic, and an ESC-cancelled incomplete sequence is still emitted whole.
 - An ambiguous trailing run of Escape bytes now stays buffered until a continuation or the flush timeout resolves it, so `ESC ESC ESC` followed by `[A` in the next chunk still decodes as Escape then `alt+up` instead of two Escapes plus a plain Up that fired the destructive double-Escape gesture.
 - Escape presses immediately followed by a bracketed paste in the same read are now emitted as individual Escape presses instead of one coalesced sequence that parsed as the unbound `alt+escape` and swallowed every press.

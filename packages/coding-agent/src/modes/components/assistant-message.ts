@@ -419,7 +419,12 @@ export class AssistantMessageComponent extends Container {
 				child.dispose?.();
 			}
 		}
-		this.#contentContainer.children = nextChildren;
+		this.#contentContainer.replaceChildren(nextChildren);
+		for (const descriptor of descriptors) {
+			if (descriptor.anchorSource && isViewportAnchorSourceRenderer(descriptor.component)) {
+				this.#contentContainer.setViewportAnchorSource(descriptor.component, descriptor.anchorSource);
+			}
+		}
 	}
 
 	updateContent(message: AssistantMessage, options?: AssistantMessageUpdateOptions): void {
