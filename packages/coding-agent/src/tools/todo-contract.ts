@@ -88,7 +88,12 @@ function unknownKeys(value: object, allowed: Set<string>): string[] {
 }
 
 function keyRejectionDetail(keys: readonly string[], location?: string): RawArgumentRejectionDetail {
-	const hints = keys.map(key => TODO_KEY_CORRECTIONS.get(key)).filter((hint): hint is string => hint !== undefined);
+	// Distinct corrections only. A family that shares one correction (every
+	// positional handle) would otherwise repeat it once per rejected key and blow
+	// past the caller's hint clamp, which truncates the advice mid-sentence.
+	const hints = [
+		...new Set(keys.map(key => TODO_KEY_CORRECTIONS.get(key)).filter((hint): hint is string => hint !== undefined)),
+	];
 	const parts = location === undefined ? hints : [location, ...hints];
 	return parts.length > 0 ? { rejectedKeys: keys, hint: parts.join("; ") } : { rejectedKeys: keys };
 }

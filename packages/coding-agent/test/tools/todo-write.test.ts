@@ -446,6 +446,19 @@ describe("TodoWriteTool raw argument rejection codes", () => {
 		}
 	});
 
+	it("states a shared correction once so the hint clamp cannot truncate it", () => {
+		// The hint is clamped at 200 chars by the caller. Repeating one correction per
+		// rejected key overran that and cut the advice off mid-sentence.
+		const message = captureValidationError(() =>
+			validateToolArguments(tool, call({ ops: [{ op: "done", id: 1, index: 2, taskId: 3 }] })),
+		);
+		const correction = 'tasks have no id or index; target a task with "task" set to its exact content';
+		expect(message.split(correction).length - 1).toBe(1);
+		expect(message).toContain('rejected keys: "id", "index", "taskId"');
+		expect(message).toContain('or a whole phase with "phase")');
+		expect(message).not.toContain("\u2026");
+	});
+
 	it("keeps complete and completed aliased to done instead of rejecting them as unknown ops", () => {
 		for (const op of ["complete", "completed"]) {
 			const parsed = validateToolArguments(tool, call({ ops: [{ op, task: "ship it" }] })) as {
