@@ -387,6 +387,12 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
  * log is capped and reset, so retained counts are re-derived from what the log
  * actually still holds. That separation keeps a log reset from deflating a
  * signature's history.
+ *
+ * The count is held at `lifetimeCount`, which `parseEntry` requires it not to
+ * exceed. The log can hold more records than the journal counted — a fatal whose
+ * journal append failed, or that spent the per-process latch, still writes its
+ * record — and without this the compactor would write an index its own reader
+ * quarantines whole on the next read.
  */
 async function recomputeRetainedCounts(index: CrashIndex, crashLogPath: string): Promise<void> {
 	for (const entry of Object.values(index.signatures)) entry.retainedCount = 0;
@@ -396,7 +402,7 @@ async function recomputeRetainedCounts(index: CrashIndex, crashLogPath: string):
 		const marker = parseCrashRecordMarker(line);
 		if (!marker) continue;
 		const entry = index.signatures[marker.fingerprint];
-		if (entry) entry.retainedCount += 1;
+		if (entry && entry.retainedCount < entry.lifetimeCount) entry.retainedCount += 1;
 	}
 }
 
