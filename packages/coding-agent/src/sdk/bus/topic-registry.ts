@@ -1020,6 +1020,7 @@ export class TopicRegistry {
 			if ((this.epochs.get(sessionId) ?? 0) !== epoch) {
 				record.authorityEpoch = this.epochs.get(sessionId) ?? 0;
 				record.authorityState = "archive_pending";
+				record.archiveReason = "create_compensation";
 				this.topics.set(sessionId, record);
 				throw new Error("topic authority was revoked during creation");
 			}
@@ -1278,6 +1279,7 @@ export class TopicRegistry {
 				...snapshot.record,
 				authorityEpoch: deleteEpoch,
 				authorityState: "archive_pending",
+				archiveReason: snapshot.record.archiveReason ?? "create_compensation",
 			});
 			const restored = this.topics.get(snapshot.sessionId);
 			if (restored) delete restored.disconnectGraceExpiresAt;
@@ -1286,6 +1288,7 @@ export class TopicRegistry {
 		} else {
 			record.authorityEpoch = deleteEpoch;
 			record.authorityState = "archive_pending";
+			record.archiveReason = snapshot.record?.archiveReason ?? record.archiveReason ?? "create_compensation";
 			delete record.disconnectGraceExpiresAt;
 			if (this.byTopic.get(record.topicId) === snapshot.sessionId) this.byTopic.delete(record.topicId);
 		}

@@ -570,7 +570,7 @@
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramDaemonOwnershipPhase": "e18b8212480f9c8c7d21c3e97b9b4813d445e5afa8f13c16916cc145d0a45339",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramEffectSupervisor": "c934e7df341cbb4fa41ea01c821b2df4b4bce29f9535cd79ca3985abb1c5e82d",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#authorizeLease": "916223aece3a4823ad395d7c9418c83a91cf8092a749447928fb8197f9fb107a",
-    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#dropSession": "f78104b645551f7b51154f3eec2ea4b409769738aae05543a6e6fff0448559c7",
+    "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#dropSession": "a949b9cabcbd2a74fb19ab527b2aea1685a72d27eae3a00113f5c4d289c4c555",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#leaseAllows": "864b076a5fb401ab49cbd199ad0b92795f299aba6e8c1c3c17224e5c08a6f0b3",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#leaseTokenAllows": "30bfd5cee2ca79a96a5a4c3cc70a6570e5820ee8647795970ac717a3e4405a91",
     "telegram:packages/coding-agent/src/sdk/bus/telegram-daemon.ts:TelegramNotificationDaemon.#rejectTopicAdmission": "4bc6024ac7110b0125e88b4fcd2fc7abf8e0d6d79f16a0b669ff1d572359826a",

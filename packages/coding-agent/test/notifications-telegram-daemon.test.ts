@@ -352,6 +352,7 @@ describe("Telegram provider supervisor ownership", () => {
 			const subscription = notificationSubscription("cleanup-session");
 			routing.attach(subscription);
 			await routing.remove(subscription, "removed");
+			await daemon.publicationReceiptHarnessForTest().loadPresentationState();
 			expect(routing.cleanupReceipts()).toEqual([
 				expect.objectContaining({
 					sessionId: "cleanup-session",

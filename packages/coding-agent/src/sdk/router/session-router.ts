@@ -480,7 +480,9 @@ export class SessionRouter {
 			);
 		}
 		this.#adopted.clear();
-		const pending = Promise.allSettled([this.#reconcileTail, ...this.#pending, ...shutdownTasks]);
+		// Provider notification work is detached and bounded independently; core
+		// shutdown waits only for Router reconciliation and client close.
+		const pending = Promise.allSettled([this.#reconcileTail, ...shutdownTasks]);
 		const outcome = await Promise.race([
 			pending.then(results => ({ kind: "settled" as const, results })),
 			Bun.sleep(5_000).then(() => ({ kind: "timeout" as const })),

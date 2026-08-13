@@ -5471,13 +5471,13 @@ export class TelegramNotificationDaemon {
 			reason,
 		};
 		this.#cleanupReceipts.set(subscription.subscriptionId, receipt);
-		await this.#persistPublicationReceipts().catch(() => {
+		void this.#persistPublicationReceipts().catch(() => {
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 		});
 		if (reason === "removed" && !session.logicalSessionIdTrusted) {
 			// Router disappearance alone is not durable archive authority.
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
-			await this.#persistPublicationReceipts().catch(() => {
+			void this.#persistPublicationReceipts().catch(() => {
 				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 			});
 			return;
@@ -5498,14 +5498,14 @@ export class TelegramNotificationDaemon {
 				if (owner === session) this.#logicalSessionOwners.delete(logicalSessionId);
 			}
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
-			await this.#persistPublicationReceipts().catch(() => {
+			void this.#persistPublicationReceipts().catch(() => {
 				this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 			});
 			return;
 		}
 		this.#dropSession(session, "router_session_removed");
 		this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "completed" });
-		await this.#persistPublicationReceipts().catch(() => {
+		void this.#persistPublicationReceipts().catch(() => {
 			this.#cleanupReceipts.set(subscription.subscriptionId, { ...receipt, state: "failed" });
 		});
 	}
@@ -6512,7 +6512,8 @@ export class TelegramNotificationDaemon {
 		if (isCurrentSession) this.cancelLegacyToolStartsForSession(session);
 		// Telegram teardown is provider-local; never retire the SDK attachment.
 		session.subscription.cancel(reason);
-		if (isCurrentSession) this.#scheduleVisibleToolTerminalization(session.attachmentKey).catch(() => undefined);
+		// Transport loss revokes Telegram presentation only. Pending turns remain
+		// owned by SDK core and sibling consumers.
 		const clearIntervalImpl = this.opts.clearIntervalImpl ?? clearInterval;
 		if (session.pingTimer) {
 			clearIntervalImpl(session.pingTimer);
@@ -8703,8 +8704,7 @@ export class TelegramNotificationDaemon {
 
 	/** Retry crash-interrupted or ambiguous topic archives only when the durable backoff permits it. */
 	private async reconcilePendingTopicDeletes(): Promise<void> {
-		for (const sessionId of this.topics.archivePendingSessionIds(this.runtime.now()))
-			await this.archiveTopic(sessionId);
+		await this.#archiveAuthorizedTopics();
 	}
 
 	private startArchiveRetryTimer(): void {
