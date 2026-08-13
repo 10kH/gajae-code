@@ -10,6 +10,7 @@ import {
 	SessionTranscriptOversizedError,
 } from "@gajae-code/coding-agent/session/session-manager";
 import { FileSessionStorage } from "@gajae-code/coding-agent/session/session-storage";
+import { MANAGED_ARTIFACT_MAX_FILE_BYTES } from "../src/session/internal/managed-session-storage";
 
 const tempDirs: string[] = [];
 
@@ -169,6 +170,6 @@ describe("SessionManager oversized resume graceful fallback (#3851)", () => {
 
 	it("RESUME_TRANSCRIPT_MAX_BYTES matches the managed-storage per-file bound", () => {
 		// Guard against silently decoupling the resume limit from the artifact bound.
-		expect(RESUME_TRANSCRIPT_MAX_BYTES).toBe(64 * 1024 * 1024);
+		expect(RESUME_TRANSCRIPT_MAX_BYTES).toBe(MANAGED_ARTIFACT_MAX_FILE_BYTES);
 	});
 });
