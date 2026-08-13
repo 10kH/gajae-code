@@ -1262,7 +1262,7 @@ interface SessionRuntime {
 	 */
 	pendingSettled?: {
 		window: number;
-		receipts: Array<{ text: string; messageRef?: string }>;
+		receipts: Array<{ text: string; messageRef?: string; origin: "user" | "autonomous" | "continuation" }>;
 	};
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
@@ -8069,7 +8069,7 @@ export function createNotificationsExtension(
 		origin: SettlementOrigin = rt.currentTurnSettlementOrigin ?? "continuation",
 	): void => {
 		if (window !== rt.settlementWindow) return;
-		const receipt = { text, ...(messageRef ? { messageRef } : {}) };
+		const receipt = { text, ...(messageRef ? { messageRef } : {}), origin };
 		const pending = rt.pendingSettled;
 		if (!pending || pending.window !== window) {
 			rt.pendingSettled = { window, receipts: [receipt] };
@@ -8079,6 +8079,10 @@ export function createNotificationsExtension(
 			const prior = pending.receipts[pending.receipts.length - 1];
 			if (prior?.text === text) return;
 			// Keep the user-request receipt plus the newest autonomous outcome.
+			pending.receipts = [pending.receipts[0]!, receipt];
+			return;
+		}
+		if (origin === "continuation" && pending.receipts[0]?.origin === "user") {
 			pending.receipts = [pending.receipts[0]!, receipt];
 			return;
 		}
