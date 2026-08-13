@@ -136,16 +136,23 @@ async function authenticatedApproval(event: PullRequestEvent, reviewerId: string
 	const number = event.pull_request?.number;
 	const token = Bun.env.GITHUB_TOKEN;
 	if (!repository || !number || !token) return {};
-	const response = await fetch(`https://api.github.com/repos/${repository}/pulls/${number}/reviews?per_page=100`, {
-		headers: {
+	const reviews: PullRequestReview[] = [];
+	for (let page = 1; ; page++) {
+		const response = await fetch(`https://api.github.com/repos/${repository}/pulls/${number}/reviews?per_page=100&page=${page}`, {
+			headers: {
 			Accept: "application/vnd.github+json",
 			Authorization: `Bearer ${token}`,
 			"X-GitHub-Api-Version": "2022-11-28",
-		},
-	});
-	if (!response.ok) return {};
-	const reviews = await response.json() as PullRequestReview[];
-	const approval = reviews.find(review => review.state === "APPROVED" && review.commit_id === headSha && review.user?.login?.toLowerCase() === reviewerId.toLowerCase());
+			},
+		});
+		if (!response.ok) return {};
+		const pageReviews = await response.json() as PullRequestReview[];
+		reviews.push(...pageReviews);
+		if (pageReviews.length < 100) break;
+	}
+	const reviewerReviews = reviews.filter(review => review.user?.login?.toLowerCase() === reviewerId.toLowerCase());
+	const approval = reviewerReviews.at(-1);
+	if (approval?.state !== "APPROVED" || approval.commit_id !== headSha) return {};
 	return approval ? { login: approval.user!.login, headSha: approval.commit_id } : {};
 }
 

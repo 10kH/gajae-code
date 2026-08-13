@@ -106,6 +106,8 @@ test("canonicalDiffSha256 hashes exact bytes", () => {
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("pull_request_target:");
+	expect(workflow).toContain("pull_request_review:");
+	expect(workflow).toContain("types: [submitted, edited, dismissed]");
 	expect(workflow).not.toMatch(/^\s+pull_request:\s*$/mu);
 	expect(workflow).toContain("permissions:\n  contents: read\n  pull-requests: read");
 	expect(workflow).toContain("name: PR contract");
