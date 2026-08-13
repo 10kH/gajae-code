@@ -8112,6 +8112,8 @@ export function createNotificationsExtension(
 		pending.receipts = [receipt];
 	};
 
+	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => rt.pendingSettled?.receipts[0]?.origin === "user";
+
 	const flushPendingFinal = (rt: SessionRuntime, id: string): void => {
 		const pending = rt.pendingFinal;
 		if (!pending) return;
@@ -8412,7 +8414,8 @@ export function createNotificationsExtension(
 		rt.preAskFlushedText = text;
 		// Ask lead-ins supersede any deferred lean settled answer from earlier turns
 		// so agent_end does not re-emit stale intermediate narration (#2863 review).
-		if (!finalAnswer && rt.currentTurnSettlementOrigin !== "autonomous") rt.pendingSettled = undefined;
+		if (!finalAnswer && rt.currentTurnSettlementOrigin !== "autonomous" && !hasUserSettlementReceipt(rt))
+			rt.pendingSettled = undefined;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
 		// async-queued and none landed before this flush, reuse the per-turn ref
@@ -8589,7 +8592,8 @@ export function createNotificationsExtension(
 			} else {
 				// Lead-in already flushed: drop any older deferred settled text so idle
 				// does not re-emit intermediate narration after the ask prompt (#2863).
-				if (rt.currentTurnSettlementOrigin !== "autonomous") rt.pendingSettled = undefined;
+				if (rt.currentTurnSettlementOrigin === "user" || !hasUserSettlementReceipt(rt))
+					rt.pendingSettled = undefined;
 			}
 		}
 		resetTurnStreamState(rt);
