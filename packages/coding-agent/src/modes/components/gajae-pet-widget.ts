@@ -162,7 +162,7 @@ export class PetFramedEditor implements Component {
  * - frame advances write the payload directly to the terminal, because the
  *   TUI skips writes entirely when no component line changed.
  *
- * Requires a sixel- or kitty-graphics terminal (`pixelProtocol()`).
+ * Requires a Sixel-, Kitty-, or iTerm2-graphics terminal (`pixelProtocol()`).
  */
 export class GajaePetWidget {
 	#ui: TUI;
