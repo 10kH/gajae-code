@@ -366,9 +366,25 @@ describe("import collision policy and safety", () => {
 		const plan = await buildImportPreview(previewOptions({ surfaces: ["mcps"] }));
 		expect(JSON.stringify(plan.preview)).not.toContain("GEN2_TOKEN_SECRET");
 		const entry = plan.preview.entries[0];
-		expect(entry.description).toContain("•••");
+		expect(entry.description).toContain("command redacted");
 		// The plan payload keeps the real value for the actual write.
 		expect(JSON.stringify(plan.payloads)).toContain("GEN2_TOKEN_SECRET");
+	});
+
+	test("quoted bearer and authorization command forms are omitted from the preview", async () => {
+		for (const [name, command, secret] of [
+			["bearer", 'node --bearer "Bearer GEN3_BEARER_SECRET"', "GEN3_BEARER_SECRET"],
+			["authorization", 'node --header "Authorization: Bearer ARCH_SECRET"', "ARCH_SECRET"],
+		] as const) {
+			await writeFile(
+				path.join(projectDir, ".mcp.json"),
+				JSON.stringify({ mcpServers: { [name]: { type: "stdio", command } } }),
+			);
+			const plan = await buildImportPreview(previewOptions({ surfaces: ["mcps"] }));
+			expect(JSON.stringify(plan.preview)).not.toContain(secret);
+			expect(plan.preview.entries[0].description).toContain("command redacted");
+			expect(JSON.stringify(plan.payloads)).toContain(secret);
+		}
 	});
 
 	test("malformed source MCP config is a warning, not a crash", async () => {

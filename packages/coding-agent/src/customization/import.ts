@@ -33,7 +33,7 @@ import { HookSourceConvention } from "../hooks/events";
 import { normalizeDirectoryHook } from "../hooks/normalize";
 import { readMCPConfigFile, writeMCPConfigFile } from "../runtime-mcp/config-writer";
 import type { MCPServerConfig } from "../runtime-mcp/types";
-import { IMPORTED_FROM_FRONTMATTER_KEY, redactDisplayText } from "./inventory";
+import { IMPORTED_FROM_FRONTMATTER_KEY } from "./inventory";
 import type {
 	ImportCollisionPolicy,
 	ImportPlan,
@@ -531,8 +531,8 @@ export async function buildImportPreview(options: BuildImportPreviewOptions): Pr
 						sourceCategory: "MCP server entry",
 						description:
 							config && "command" in config && typeof config.command === "string"
-								? redactDisplayText(`stdio MCP "${name}" (${config.command})`)
-								: `${config && "type" in config ? String(config.type) : "http"} MCP "${name}"`,
+								? `stdio MCP "${name}" (command redacted)`
+								: `${config && "type" in config ? String(config.type) : "http"} MCP "${name}" (endpoint redacted)`,
 					},
 					existing === undefined ? { kind: "absent" } : { kind: "value", content: JSON.stringify(existing) },
 					JSON.stringify(config),
@@ -573,7 +573,6 @@ interface FileSnapshot {
 }
 
 interface PlannedFileWrite {
-	entry: ImportPreviewEntry;
 	path: string;
 	content: string;
 }
@@ -715,7 +714,7 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 					`destination changed since preview for skill "${slug}"; rebuild the preview instead of overwriting silently`,
 				);
 			}
-			fileWrites.push({ entry, path: target, content: payload.skill.content });
+			fileWrites.push({ path: target, content: payload.skill.content });
 		} else if (payload.hook) {
 			const { phase, fileName } = payload.hook;
 			if (phase !== "pre" && phase !== "post") return failAll(`refusing unknown hook phase: ${String(phase)}`);
@@ -742,7 +741,7 @@ export async function applyImport(plan: ImportPlan, options: { cwd: string }): P
 					`destination changed since preview for hook "${phase}/${fileName}"; rebuild the preview instead of overwriting silently`,
 				);
 			}
-			fileWrites.push({ entry, path: target, content: payload.hook.content });
+			fileWrites.push({ path: target, content: payload.hook.content });
 		} else if (payload.mcp) {
 			mcpWrites.push({ entry, name: payload.mcp.name, config: payload.mcp.config });
 		}

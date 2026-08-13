@@ -53,11 +53,15 @@ export function inventoryRowId(surface: CustomizationSurface, scope: GjcScope, r
 // Display redaction
 // ---------------------------------------------------------------------------
 
-const SECRET_ASSIGNMENT_RE = /(bearer|token|secret|password|api[-_]?key|authorization)([\s:=]+)\S+/gi;
-
-/** Mask token-shaped assignments and env/header values from display text. */
+// Free-form command/argument/URL strings are not a safe credential boundary:
+// quoting, auth schemes, shell syntax, and provider-specific flags make
+// heuristic partial redaction incomplete. Structured env/header maps expose
+// keys only; opaque free-form fields are omitted from display entirely.
 export function redactDisplayText(text: string): string {
-	return text.replace(SECRET_ASSIGNMENT_RE, (_match, key: string, sep: string) => `${key}${sep}•••`);
+	if (/\b(bearer|basic|digest|token|secret|password|api[-_]?key|authorization)\b/i.test(text)) {
+		return "[credential-bearing text redacted]";
+	}
+	return text;
 }
 
 function redactServerForDisplay(server: Record<string, unknown>): Record<string, unknown> {
@@ -68,10 +72,9 @@ function redactServerForDisplay(server: Record<string, unknown>): Record<string,
 	if (copy.headers && typeof copy.headers === "object") {
 		copy.headers = Object.fromEntries(Object.keys(copy.headers as Record<string, unknown>).map(k => [k, "•••"]));
 	}
-	if (typeof copy.command === "string") copy.command = redactDisplayText(copy.command);
-	if (Array.isArray(copy.args))
-		copy.args = copy.args.map(arg => (typeof arg === "string" ? redactDisplayText(arg) : arg));
-	if (typeof copy.url === "string") copy.url = redactDisplayText(copy.url);
+	if (copy.command !== undefined) copy.command = "[command redacted]";
+	if (copy.args !== undefined) copy.args = "[arguments redacted]";
+	if (copy.url !== undefined) copy.url = "[URL redacted]";
 	return copy;
 }
 
@@ -230,10 +233,10 @@ async function loadHookRows(options: LoadCustomizationInventoryOptions, _warning
 
 function mcpDescription(name: string, server: Record<string, unknown>): string {
 	if (typeof server.command === "string" && server.command) {
-		return redactDisplayText(`stdio MCP "${name}" (${server.command})`);
+		return `stdio MCP "${name}" (command redacted)`;
 	}
 	const type = typeof server.type === "string" ? server.type : "http";
-	return `${type} MCP "${name}"`;
+	return `${type} MCP "${name}" (endpoint redacted)`;
 }
 
 async function loadMcpRows(options: LoadCustomizationInventoryOptions, warnings: string[]): Promise<InventoryRow[]> {
