@@ -116,6 +116,97 @@ describe("TUI overlays", () => {
 		Bun.env.TERM = "xterm-256color";
 	});
 
+	it("bounds non-finite overlay geometry without stalling the render loop", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 2), {
+				margin: { top: Number.POSITIVE_INFINITY, right: Number.NaN },
+				row: Number.POSITIVE_INFINITY,
+				col: Number.NaN,
+				offsetX: Number.POSITIVE_INFINITY,
+				offsetY: Number.NEGATIVE_INFINITY,
+				minWidth: Number.POSITIVE_INFINITY,
+			});
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-0");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("clamps enormous finite margins to the terminal bounds", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 2), { margin: Number.MAX_VALUE });
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("o");
+			expect(term.getScrollBuffer().length).toBeLessThan(100);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("falls back from overflowing overlay percentages without terminating rendering", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			const overflowingPercent = `${"9".repeat(400)}%` as `${number}%`;
+			tui.showOverlay(new LineComponent("overlay-", 8), {
+				width: overflowingPercent,
+				row: overflowingPercent,
+				col: overflowingPercent,
+			});
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-0");
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("bounds a non-finite maximum height to the terminal", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			tui.showOverlay(new LineComponent("overlay-", 10_000), { maxHeight: Number.POSITIVE_INFINITY });
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-");
+			expect(term.getScrollBuffer().length).toBeLessThan(100);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("bounds an overflowing percentage maximum height to the terminal", async () => {
+		const term = new VirtualTerminal(40, 8);
+		const tui = new TUI(term);
+		tui.addChild(new LineComponent("base-", 2));
+		try {
+			tui.start();
+			await flushRender(term);
+			const overflowingPercent = `${"9".repeat(400)}%` as `${number}%`;
+			tui.showOverlay(new LineComponent("overlay-", 10_000), { maxHeight: overflowingPercent });
+			await flushRender(term);
+			expect(term.getViewport().join("\n")).toContain("overlay-");
+			expect(term.getScrollBuffer().length).toBeLessThan(100);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	afterEach(() => {
 		if (previousTmux === undefined) {
 			delete Bun.env.TMUX;
