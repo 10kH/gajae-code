@@ -2399,7 +2399,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			"codex_handoff_explicit_source_missing",
 		);
 	});
-	it("treats a corrupt explicit handoff registration as missing without failing delegation", async () => {
+	it("fails closed for a corrupt explicit handoff registration", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls);
@@ -2415,7 +2415,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 				allow_mutation: true,
 				codex_host_session_id: "corrupt-codex-host",
 			}),
-		).resolves.toMatchObject({ ok: true, codex_handoff: { auto_bound: false } });
+		).resolves.toMatchObject({ ok: false, error: { code: "unavailable", message: "state_corrupt" } });
 		await expect(fs.readFile(path.join(namespace, "codex-wake-errors.log"), "utf8")).resolves.toContain(
 			"codex_handoff_explicit_source_missing",
 		);

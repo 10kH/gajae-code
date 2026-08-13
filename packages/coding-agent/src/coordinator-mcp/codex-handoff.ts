@@ -133,6 +133,7 @@ async function writeExclusive(file: string, value: unknown): Promise<boolean> {
 		}
 		throw error;
 	}
+	await syncCoordinatorDirectory(path.dirname(file));
 	await fs.unlink(temp);
 	await syncCoordinatorDirectory(path.dirname(file));
 	return true;

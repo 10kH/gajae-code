@@ -97,7 +97,11 @@ export async function writeCoordinatorAtomic(
 		await (options.rename ?? fs.rename)(temporary, file);
 		await syncCoordinatorDirectory(path.dirname(file), options);
 	} catch (error) {
-		await fs.rm(temporary, { force: true }).catch(() => undefined);
+		try {
+			await fs.rm(temporary, { force: true });
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "coordinator atomic write and cleanup failed");
+		}
 		throw error;
 	}
 }

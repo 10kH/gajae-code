@@ -1427,13 +1427,13 @@ async function autoBindDelegateCodexHandoff(
 		let source: CodexHandoffRegistrationV1 | null;
 		try {
 			source = await readCodexHandoff(namespaceDir, explicitHostWorkUnit);
-		} catch {
+		} catch (error) {
 			await appendCodexWakeDiagnostic(
 				namespaceDir,
 				diagnosticEvent,
 				new Error("codex_handoff_explicit_source_missing"),
 			);
-			return { auto_bound: false };
+			throw error;
 		}
 		if (!source) {
 			await appendCodexWakeDiagnostic(
@@ -1518,7 +1518,7 @@ async function autoBindDelegateCodexHandoff(
 		return { auto_bound: true, thread_id: binding.handoff.thread_id };
 	} catch (error) {
 		await appendCodexWakeDiagnostic(namespaceDir, diagnosticEvent, error);
-		return { auto_bound: false };
+		throw error;
 	}
 }
 
@@ -1553,27 +1553,24 @@ async function publishRecordedCodexWake(
 	if (event.status !== "pending" && event.status !== "failed") return "skipped";
 	const transportFactory = codexWakeTransportFactories.get(namespaceDir);
 	if (!transportFactory) return "skipped";
+	let published: { published: boolean };
 	try {
-		const published = await publishCodexWake({ handoff, event, transportFactory });
-		await updateCodexWakeEvent(namespaceDir, event.key, {
-			...(published.published ? { status: "published" as const } : {}),
-			attempts_delta: 1,
-			last_error: null,
-		});
-		return published.published ? "published" : "thread_active_pending";
+		published = await publishCodexWake({ handoff, event, transportFactory });
 	} catch (error) {
 		await appendCodexWakePublishDiagnostic(namespaceDir, event, error);
-		try {
-			await updateCodexWakeEvent(namespaceDir, event.key, {
-				status: "failed",
-				attempts_delta: 1,
-				last_error: codexWakeErrorCode(error),
-			});
-		} catch (updateError) {
-			await appendCodexWakePublishDiagnostic(namespaceDir, event, updateError);
-		}
+		await updateCodexWakeEvent(namespaceDir, event.key, {
+			status: "failed",
+			attempts_delta: 1,
+			last_error: codexWakeErrorCode(error),
+		});
 		return "failed";
 	}
+	await updateCodexWakeEvent(namespaceDir, event.key, {
+		...(published.published ? { status: "published" as const } : {}),
+		attempts_delta: 1,
+		last_error: null,
+	});
+	return published.published ? "published" : "thread_active_pending";
 }
 
 async function publishPendingCodexWakes(namespaceDir: string, threadId: string): Promise<void> {
