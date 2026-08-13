@@ -115,6 +115,20 @@ describe("compactCrashIndex", () => {
 		expect(index.signatures[recovered.fingerprint]?.acknowledgedAt).toBeUndefined();
 	});
 
+	it("deduplicates every delayed journal event for more than 256 recovered records", async () => {
+		const paths = await tempPaths();
+		const records = Array.from({ length: 300 }, (_, seed) =>
+			recoverableRecord(50_000 + seed, "delayed journal batch"),
+		);
+		await fs.writeFile(paths.crashLog, records.map(record => record.text).join(""));
+		const recovered = await compactCrashIndex({ paths, now: NOW });
+		expect(recovered.signatures[records[0]?.fingerprint ?? ""]?.lifetimeCount).toBe(300);
+		for (const record of records)
+			appendCrashEvent(occurrence(record.fingerprint, record.recordId, NOW), paths.events);
+		const merged = await compactCrashIndex({ paths, now: NOW });
+		expect(merged.signatures[records[0]?.fingerprint ?? ""]?.lifetimeCount).toBe(300);
+	});
+
 	it("deduplicates recovered record ids and keeps repeated compaction idempotent", async () => {
 		const paths = await tempPaths();
 		const recovered = recoverableRecord(201);
@@ -477,6 +491,7 @@ describe("parseCrashIndex", () => {
 		overflow: false,
 		recentEventIds: [recordId(1)],
 		recentJournalDigests: [],
+		recoveredRecordIds: [],
 		retiredFingerprints: [],
 		signatures: {
 			[fingerprintFor(1)]: {

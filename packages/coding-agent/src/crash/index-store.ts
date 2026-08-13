@@ -27,7 +27,7 @@ import {
 	parseCrashRecordMarker,
 } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
-import { parseRecoverableCrashRecords } from "./record-loader";
+import { type LoadedCrashRecord, parseRecoverableCrashRecords } from "./record-loader";
 
 export const CRASH_INDEX_VERSION = 1;
 /** Per-entry message preview cap. */
@@ -85,6 +85,8 @@ export interface CrashIndex {
 	overflow: boolean;
 	recentEventIds: string[];
 	recentJournalDigests: string[];
+	/** Log-recovered occurrence ids awaiting a possibly delayed journal event. */
+	recoveredRecordIds: string[];
 	/** Reported or acknowledged signatures evicted from the index; never recovered from the log. */
 	retiredFingerprints: string[];
 	signatures: Record<string, CrashSignatureEntry>;
@@ -93,6 +95,7 @@ export interface CrashIndex {
 interface CrashRetiredIndex {
 	version: number;
 	fingerprints: string[];
+	recoveredRecordIds: string[];
 }
 
 export interface CrashStatePaths {
@@ -117,6 +120,7 @@ export function emptyCrashIndex(): CrashIndex {
 		overflow: false,
 		recentEventIds: [],
 		recentJournalDigests: [],
+		recoveredRecordIds: [],
 		retiredFingerprints: [],
 		signatures: Object.create(null) as Record<string, CrashSignatureEntry>,
 	};
@@ -147,6 +151,7 @@ const INDEX_KEYS = new Set([
 	"overflow",
 	"recentEventIds",
 	"recentJournalDigests",
+	"recoveredRecordIds",
 	"retiredFingerprints",
 	"signatures",
 ]);
@@ -196,7 +201,17 @@ function parseRetiredIndex(raw: string): CrashRetiredIndex | undefined {
 	if (body.fingerprints.length > CRASH_RETIRED_MAX_FINGERPRINTS) return undefined;
 	if (!body.fingerprints.every(value => typeof value === "string" && CRASH_FINGERPRINT_PATTERN.test(value)))
 		return undefined;
-	return { version: CRASH_INDEX_VERSION, fingerprints: [...body.fingerprints] };
+	if (body.recoveredRecordIds !== undefined) {
+		if (!Array.isArray(body.recoveredRecordIds) || body.recoveredRecordIds.length > CRASH_RETIRED_MAX_FINGERPRINTS)
+			return undefined;
+		if (!body.recoveredRecordIds.every(value => typeof value === "string" && /^[0-9a-f]{8,32}$/.test(value)))
+			return undefined;
+	}
+	return {
+		version: CRASH_INDEX_VERSION,
+		fingerprints: [...body.fingerprints],
+		recoveredRecordIds: [...((body.recoveredRecordIds as string[] | undefined) ?? [])],
+	};
 }
 
 function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefined {
@@ -264,6 +279,11 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		if (!body.recentJournalDigests.every(digest => typeof digest === "string" && /^[0-9a-f]{64}$/.test(digest)))
 			return undefined;
 	}
+	if (body.recoveredRecordIds !== undefined) {
+		if (!Array.isArray(body.recoveredRecordIds) || body.recoveredRecordIds.length > CRASH_RETIRED_MAX_FINGERPRINTS)
+			return undefined;
+		if (!body.recoveredRecordIds.every(id => typeof id === "string" && /^[0-9a-f]{8,32}$/.test(id))) return undefined;
+	}
 	if (body.retiredFingerprints !== undefined) {
 		if (!Array.isArray(body.retiredFingerprints) || body.retiredFingerprints.length > CRASH_INDEX_MAX_SIGNATURES)
 			return undefined;
@@ -293,6 +313,7 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		overflow: body.overflow,
 		recentEventIds: [...(body.recentEventIds as string[])],
 		recentJournalDigests: [...((body.recentJournalDigests as string[] | undefined) ?? [])],
+		recoveredRecordIds: [...((body.recoveredRecordIds as string[] | undefined) ?? [])],
 		retiredFingerprints: [...((body.retiredFingerprints as string[] | undefined) ?? [])],
 		signatures,
 	};
@@ -352,11 +373,13 @@ async function quarantineIndex(indexPath: string, now: number): Promise<string |
 	return target;
 }
 
-async function readRetiredFingerprints(indexPath: string): Promise<string[] | undefined> {
+async function readRetiredIndex(indexPath: string): Promise<CrashRetiredIndex | undefined> {
 	const target = retiredIndexPath(indexPath);
 	const raw = await readNoFollow(target, CRASH_LOG_SCAN_MAX_BYTES);
-	if (raw !== undefined) return parseRetiredIndex(raw)?.fingerprints;
-	return (await crashLogExists(target)) === false ? [] : undefined;
+	if (raw !== undefined) return parseRetiredIndex(raw);
+	return (await crashLogExists(target)) === false
+		? { version: CRASH_INDEX_VERSION, fingerprints: [], recoveredRecordIds: [] }
+		: undefined;
 }
 
 async function crashLogExists(crashLogPath: string): Promise<boolean | undefined> {
@@ -382,6 +405,8 @@ async function pruneRetiredFingerprints(index: CrashIndex, crashLogPath: string)
 	}
 	const retained = new Set(parseRecoverableCrashRecords(contents).map(record => record.fingerprint));
 	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => retained.has(fingerprint));
+	const retainedIds = new Set(parseRecoverableCrashRecords(contents).map(record => record.recordId));
+	index.recoveredRecordIds = index.recoveredRecordIds.filter(recordId => retainedIds.has(recordId));
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +476,10 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	// Clear before deduplication: a replayed occurrence after main-index publish
 	// but before retirement-sidecar publish must still supersede a stale tombstone.
 	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => fingerprint !== event.fingerprint);
+	if (index.recoveredRecordIds.includes(event.recordId)) {
+		index.recoveredRecordIds = index.recoveredRecordIds.filter(recordId => recordId !== event.recordId);
+		return false;
+	}
 	if (index.recentEventIds.includes(event.recordId)) return false;
 	index.recentEventIds.push(event.recordId);
 	if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
@@ -514,7 +543,7 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 		const entry = index.signatures[marker.fingerprint];
 		if (entry && entry.retainedCount < entry.lifetimeCount) entry.retainedCount += 1;
 	}
-	const recordsByFingerprint = new Map<string, ReturnType<typeof parseRecoverableCrashRecords>>();
+	const recordsByFingerprint = new Map<string, LoadedCrashRecord[]>();
 	const seenRecordIds = new Set<string>();
 	for (const record of parseRecoverableCrashRecords(contents)) {
 		if (seenRecordIds.has(record.recordId)) continue;
@@ -547,6 +576,7 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 			};
 			index.signatures[fingerprint] = entry;
 			for (const record of records) {
+				if (!index.recoveredRecordIds.includes(record.recordId)) index.recoveredRecordIds.push(record.recordId);
 				if (index.recentEventIds.includes(record.recordId)) continue;
 				index.recentEventIds.push(record.recordId);
 				if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
@@ -598,10 +628,13 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 			await quarantineIndex(paths.index, now);
 			index = emptyCrashIndex();
 		}
-		const retiredFingerprints = await readRetiredFingerprints(paths.index);
-		if (retiredFingerprints === undefined) throw new Error("Crash retirement ledger is unreadable");
-		for (const fingerprint of retiredFingerprints) {
+		const retired = await readRetiredIndex(paths.index);
+		if (retired === undefined) throw new Error("Crash retirement ledger is unreadable");
+		for (const fingerprint of retired.fingerprints) {
 			if (!index.retiredFingerprints.includes(fingerprint)) index.retiredFingerprints.push(fingerprint);
+		}
+		for (const recordId of retired.recoveredRecordIds) {
+			if (!index.recoveredRecordIds.includes(recordId)) index.recoveredRecordIds.push(recordId);
 		}
 		await pruneRetiredFingerprints(index, paths.crashLog);
 
@@ -633,7 +666,8 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 
 		await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
 		index.updatedAt = now;
-		const serializeIndex = (): string => `${JSON.stringify({ ...index, retiredFingerprints: [] })}\n`;
+		const serializeIndex = (): string =>
+			`${JSON.stringify({ ...index, retiredFingerprints: [], recoveredRecordIds: [] })}\n`;
 		let serialized = serializeIndex();
 		while (Buffer.byteLength(serialized, "utf8") > CRASH_INDEX_MAX_BYTES && evictOne(index)) {
 			serialized = serializeIndex();
@@ -642,12 +676,12 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 			index.overflow = true;
 			serialized = serializeIndex();
 		}
-		await fs.rm(paths.index, { force: true });
-		await writeAtomic(paths.index, serialized);
 		await writeAtomic(
 			retiredIndexPath(paths.index),
-			`${JSON.stringify({ version: CRASH_INDEX_VERSION, fingerprints: index.retiredFingerprints })}\n`,
+			`${JSON.stringify({ version: CRASH_INDEX_VERSION, fingerprints: index.retiredFingerprints, recoveredRecordIds: index.recoveredRecordIds })}\n`,
 		);
+		await fs.rm(paths.index, { force: true });
+		await writeAtomic(paths.index, serialized);
 		for (const file of drained) await fs.rm(file, { force: true }).catch(() => {});
 		return index;
 	});

@@ -14,6 +14,7 @@
 import {
 	CRASH_FINGERPRINT_VERSION,
 	CRASH_RECORD_MARKER,
+	type CrashFingerprint,
 	computeCrashFingerprint,
 	parseCrashRecordMarker,
 } from "@gajae-code/utils";
@@ -44,21 +45,19 @@ function findBoundFingerprint(
 	headline: string,
 	bodyLines: string[],
 	markerFingerprint: string,
-): ReturnType<typeof computeCrashFingerprint> | undefined {
+): CrashFingerprint | undefined {
 	for (let separator = headline.indexOf(":"); separator > 0; separator = headline.indexOf(":", separator + 1)) {
 		const name = headline.slice(0, separator).trim();
 		const firstMessageLine = headline.slice(separator + 1).trim();
 		for (let continuationCount = 0; continuationCount <= bodyLines.length; continuationCount++) {
 			const message = [firstMessageLine, ...bodyLines.slice(0, continuationCount)].join("\n");
 			const remaining = bodyLines.slice(continuationCount);
-			const stackPrefix = `${name}: ${message}`;
 			const stackCandidates = [remaining.join("\n").trimEnd()];
 			// Production object payloads are one serialized JSON line appended after
 			// the stack. V1 has no explicit delimiter, so also test that one-line
 			// suffix omission against the marker rather than trusting its syntax.
 			if (remaining.length > 0) stackCandidates.push(remaining.slice(0, -1).join("\n").trimEnd());
 			for (const stack of stackCandidates) {
-				if (stack.length > 0 && !stack.startsWith(stackPrefix)) continue;
 				const fingerprint = computeCrashFingerprint({ name, message, stack });
 				if (fingerprint.fingerprint === markerFingerprint) return fingerprint;
 			}
