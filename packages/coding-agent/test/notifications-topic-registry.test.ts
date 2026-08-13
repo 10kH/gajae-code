@@ -213,7 +213,7 @@ describe("TopicRegistry", () => {
 		expect(fresh.topicId).toBe("43");
 		expect(reg.sessionForTopic("43")).toBe("s1");
 	});
-	test("rejects a lower replay generation for the same endpoint without mutating durable authority", async () => {
+	test("ignores transient replay generation changes without mutating durable topic authority", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "42", Date.now, undefined, {
 			chatId: "42",
@@ -236,7 +236,7 @@ describe("TopicRegistry", () => {
 				endpointDigest: "digest",
 				endpointGeneration: 8,
 			}),
-		).toBe("rejected");
+		).toBe("unchanged");
 		expect(reg.serialize().topics.s1).toMatchObject({
 			telegramBinding: { chatId: "42", transport: "telegram" },
 		});
@@ -328,7 +328,7 @@ describe("TopicRegistry", () => {
 		expect(creates).toBe(0);
 		expect(reg.pendingCreateClaims()).toEqual([{ sessionId: "s1", authorityEpoch: 0, createdAt: 1 }]);
 	});
-	test("restored create claim rejects different active binding evidence", () => {
+	test("restored create claim reconciles by stable Telegram binding instead of endpoint credentials", () => {
 		const claimBinding = {
 			chatId: "42",
 			endpointKey: "old-key",
@@ -357,17 +357,15 @@ describe("TopicRegistry", () => {
 				s1: { sessionId: "s1", authorityEpoch: 0, createdAt: 1, binding: claimBinding },
 			},
 		});
-		expect(reg.reconcileCreateClaim("s1", reg.get("s1"))).toBe(false);
-		expect(reg.pendingCreateClaims()).toEqual([
-			{ sessionId: "s1", authorityEpoch: 0, createdAt: 1, binding: claimBinding },
-		]);
+		expect(reg.reconcileCreateClaim("s1", reg.get("s1"))).toBe(true);
+		expect(reg.pendingCreateClaims()).toEqual([]);
 	});
 
 	test("retains archived topic records and never recreates physical topics", async () => {
 		const reg = new TopicRegistry();
 		await reg.getOrCreateTopic("s1", async () => "1");
 
-		reg.beginArchive("s1");
+		reg.beginArchive("s1", undefined, Date.now(), "session_closed");
 		expect(reg.get("s1")?.authorityState).toBe("archive_pending");
 		expect(reg.sessionForTopic("1")).toBeUndefined();
 
@@ -379,7 +377,7 @@ describe("TopicRegistry", () => {
 		await reg.getOrCreateTopic("s1", async () => "1");
 		expect(reg.markOrphaned("s1", 1_000)).toBe(true);
 
-		reg.beginArchive("s1", undefined, 2_000);
+		reg.beginArchive("s1", undefined, 2_000, "session_closed");
 		const snapshot = reg.serialize();
 
 		expect(snapshot.topics.s1).toMatchObject({ authorityState: "archive_pending", orphanedAt: 1_000 });
@@ -501,7 +499,7 @@ describe("TopicRegistry", () => {
 		expect(reg.markOrphaned("s1", 1_000)).toBe(true);
 		const authority = reg.captureArchiveAuthority("s1");
 
-		reg.beginArchive("s1", undefined, 2_000);
+		reg.beginArchive("s1", undefined, 2_000, "session_closed");
 		expect(reg.restoreArchiveAuthority(authority)).toBe(true);
 		const snapshot = reg.serialize();
 
@@ -546,7 +544,7 @@ describe("TopicRegistry", () => {
 		const reg = new TopicRegistry();
 		const created = Promise.withResolvers<string>();
 		const create = reg.getOrCreateTopic("s1", () => created.promise);
-		expect(reg.beginArchive("s1")).toBeUndefined();
+		expect(reg.beginArchive("s1", undefined, Date.now(), "session_closed")).toBeUndefined();
 		created.resolve("42");
 		await expect(create).rejects.toThrow("topic authority was revoked during creation");
 		expect(reg.get("s1")).toMatchObject({ topicId: "42", authorityState: "archive_pending" });
@@ -563,7 +561,7 @@ describe("TopicRegistry", () => {
 				undefined,
 				undefined,
 				async () => {
-					reg.beginArchive("s1");
+					reg.beginArchive("s1", undefined, Date.now(), "session_closed");
 				},
 			),
 		).rejects.toThrow("topic authority was revoked during creation");
@@ -579,7 +577,7 @@ describe("TopicRegistry", () => {
 			endpointDigest: "digest-s1",
 			endpointGeneration: 1,
 		});
-		reg.beginArchive("s1");
+		reg.beginArchive("s1", undefined, Date.now(), "session_closed");
 
 		const reloaded = new TopicRegistry(reg.serialize());
 
@@ -671,7 +669,7 @@ describe("TopicRegistry", () => {
 		});
 		await reg.getOrCreateTopic("A", async () => "42", Date.now, undefined, binding("A"));
 		const snapshot = reg.captureArchiveAuthority("A");
-		reg.beginArchive("A");
+		reg.beginArchive("A", undefined, Date.now(), "session_closed");
 		await reg.getOrCreateTopic("B", async () => "42", Date.now, undefined, binding("B"));
 
 		expect(reg.restoreArchiveAuthority(snapshot)).toBe(true);
@@ -730,20 +728,20 @@ test("archives pending topics into retained inactive records", async () => {
 		endpointGeneration: 1,
 	});
 
-	registry.beginArchive("session");
+	registry.beginArchive("session", undefined, Date.now(), "session_closed");
 	expect(registry.get("session")?.authorityState).toBe("archive_pending");
-	expect(registry.settleArchive("session", "42", registry.authorityEpoch("session"))).toBe(true);
+	expect(registry.settleArchive("session", "42", registry.authorityEpoch("session"), "session_closed")).toBe(true);
 	expect(registry.get("session")?.authorityState).toBe("inactive");
 	expect(registry.serialize().topics.session?.topicId).toBe("42");
 });
 test("a stale archive result cannot settle a newer archive fence", async () => {
 	const registry = new TopicRegistry();
 	await registry.getOrCreateTopic("session", async () => "43");
-	expect(registry.beginArchive("session", "host-a", 100)).toBeDefined();
+	expect(registry.beginArchive("session", "host-a", 100, "session_closed")).toBeDefined();
 	const dispatchedEpoch = registry.authorityEpoch("session");
-	expect(registry.beginArchive("session", "host-a", 101)).toBeDefined();
+	expect(registry.beginArchive("session", "host-a", 101, "session_closed")).toBeDefined();
 
-	expect(registry.settleArchive("session", "43", dispatchedEpoch)).toBe(false);
+	expect(registry.settleArchive("session", "43", dispatchedEpoch, "session_closed")).toBe(false);
 	expect(registry.get("session")).toMatchObject({
 		topicId: "43",
 		authorityState: "archive_pending",
@@ -781,10 +779,10 @@ test("saturated authority epochs fail closed for create, archive, and settlement
 		},
 		fences: { session: Number.MAX_SAFE_INTEGER },
 	});
-	expect(saturated.beginArchive("session", "host-a", 100)).toBeUndefined();
+	expect(saturated.beginArchive("session", "host-a", 100, "session_closed")).toBeUndefined();
 	expect(saturated.get("session")?.authorityState).toBe("archive_exhausted");
-	expect(saturated.settleArchive("session", "45", Number.MAX_SAFE_INTEGER)).toBe(false);
-	expect(saturated.archivePendingSessionIds(100)).toEqual(["session"]);
+	expect(saturated.settleArchive("session", "45", Number.MAX_SAFE_INTEGER, "session_closed")).toBe(false);
+	expect(saturated.archivePendingSessionIds(100)).toEqual([]);
 });
 
 test("rejects future topic registry versions and quarantines retained legacy records", () => {
@@ -854,8 +852,8 @@ test("terminal archive states cannot be revived by lease or orphan transitions",
 			endpointDigest: "digest",
 		},
 	);
-	registry.beginArchive("session");
-	for (let attempt = 0; attempt < 9; attempt++) registry.scheduleArchiveRetry("session", attempt);
+	registry.beginArchive("session", undefined, Date.now(), "session_closed");
+	for (let attempt = 0; attempt < 9; attempt++) registry.scheduleArchiveRetry("session", attempt, "session_closed");
 	expect(registry.get("session")?.authorityState).toBe("archive_pending");
 	expect(registry.acquireLease("session", "host", 10, 1_000, 500)).toBe(false);
 	expect(registry.archivePendingSessionIds(1_000_000)).toEqual(["session"]);
@@ -903,7 +901,7 @@ test("retains adopted topics and rejects an unexpired foreign archive owner", as
 		undefined,
 		"user_created",
 	);
-	expect(registry.beginArchive("session", "host-a", 100)).toBeUndefined();
+	expect(registry.beginArchive("session", "host-a", 100, "session_closed")).toBeUndefined();
 	expect(registry.serialize().topics.session?.topicOrigin).toBe("user_created");
 
 	const daemonTopic = new TopicRegistry();
@@ -915,8 +913,8 @@ test("retains adopted topics and rejects an unexpired foreign archive owner", as
 		{ chatId: "42", endpointKey: "endpoint-2", endpointDigest: "digest-2" },
 	);
 	expect(daemonTopic.acquireLease("daemon", "host-a", 100, 1_000, 0)).toBe(true);
-	expect(daemonTopic.beginArchive("daemon", "host-b", 101)).toBeUndefined();
-	expect(daemonTopic.beginArchive("daemon", "host-b", 1_101)?.archiveHostId).toBe("host-b");
+	expect(daemonTopic.beginArchive("daemon", "host-b", 101, "session_closed")).toBeUndefined();
+	expect(daemonTopic.beginArchive("daemon", "host-b", 1_101, "session_closed")?.archiveHostId).toBe("host-b");
 	expect(daemonTopic.archiveAuthorityAllows("daemon", "host-b", 1_101)).toBe(true);
 });
 test("accepted-create compensation publishes exact host and archive epoch authority", async () => {
@@ -929,7 +927,18 @@ test("accepted-create compensation publishes exact host and archive epoch author
 		undefined,
 		binding,
 	);
-	const fenced = registry.fenceAcceptedCreateForLease("session", "44", 0, "host-a", () => 101, undefined, binding);
+	const fenced = registry.fenceAcceptedCreateForLease(
+		"session",
+		"44",
+		0,
+		"host-a",
+		() => 101,
+		undefined,
+		binding,
+		undefined,
+		undefined,
+		"create_compensation",
+	);
 	expect(fenced).toMatchObject({
 		topicId: "44",
 		authorityState: "archive_pending",
@@ -951,8 +960,8 @@ test("retains inactive predecessor evidence when an authenticated successor rota
 		undefined,
 		original,
 	);
-	expect(registry.beginArchive("session", "host-a", 101)).toBeDefined();
-	expect(registry.settleArchive("session", "45", registry.authorityEpoch("session"))).toBe(true);
+	expect(registry.beginArchive("session", "host-a", 101, "session_closed")).toBeDefined();
+	expect(registry.settleArchive("session", "45", registry.authorityEpoch("session"), "session_closed")).toBe(true);
 	expect(
 		registry.retireInactiveEndpointForSuccessor("session", {
 			chatId: "42",

@@ -29,6 +29,27 @@ import {
 	TelegramUpdatePoller,
 	waitForTelegramDaemonReady,
 } from "../src/sdk/bus/telegram-daemon";
+import type { NotificationSubscription } from "../src/sdk/router";
+
+function notificationSubscription(sessionId: string, generation = 1): NotificationSubscription {
+	let active = true;
+	const cursor = { generation, seq: 0 };
+	return {
+		sessionId,
+		subscriptionId: `test:${sessionId}:${generation}`,
+		cursor,
+		isActive: () => active,
+		send: () => undefined,
+		advanceCursor: (nextGeneration, seq) => {
+			cursor.generation = nextGeneration;
+			cursor.seq = seq;
+		},
+		cancel: () => {
+			active = false;
+		},
+	};
+}
+
 import type { AgentDirSessionLifecycleService } from "../src/sdk/lifecycle/client";
 
 const BOT_TOKEN = "1234567890:ABCDEFghijkLmnOpQrsTuvWxYz012345678";
@@ -296,12 +317,7 @@ describe("Telegram provider supervisor ownership", () => {
 				chatId: "42",
 			});
 			const routing = daemon.attachmentRoutingHarnessForTest();
-			const attachment = {
-				sessionId: "session",
-				generation: 1,
-				isCurrent: () => true,
-				send: () => {},
-			};
+			const attachment = notificationSubscription("session");
 			routing.attach(attachment);
 			const session = daemon.sessions.get(attachment.sessionId);
 			if (!session) throw new Error("Expected a routed Telegram attachment session.");
@@ -319,6 +335,39 @@ describe("Telegram provider supervisor ownership", () => {
 
 			expect(routing.ownsLogicalSession(attachment.sessionId)).toBe(false);
 			expect(daemon.sessions.has(attachment.sessionId)).toBe(false);
+		} finally {
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+	test("persists provider-local cleanup receipts without exposing SDK retirement authority", async () => {
+		const agentDir = tempAgentDir();
+		try {
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+			});
+			const routing = daemon.attachmentRoutingHarnessForTest();
+			const subscription = notificationSubscription("cleanup-session");
+			routing.attach(subscription);
+			await routing.remove(subscription, "removed");
+			expect(routing.cleanupReceipts()).toEqual([
+				expect.objectContaining({
+					sessionId: "cleanup-session",
+					subscriptionId: subscription.subscriptionId,
+					state: "completed",
+				}),
+			]);
+
+			const restarted = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner-restarted",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+			});
+			await restarted.publicationReceiptHarnessForTest().loadPresentationState();
+			expect(restarted.attachmentRoutingHarnessForTest().cleanupReceipts()).toEqual(routing.cleanupReceipts());
 		} finally {
 			fs.rmSync(agentDir, { recursive: true, force: true });
 		}
@@ -375,17 +424,7 @@ describe("Telegram provider supervisor ownership", () => {
 			);
 			await daemon.loadTopics();
 			const routing = daemon.attachmentRoutingHarnessForTest();
-			let retired = 0;
-			const attachment = {
-				sessionId: "ordinary",
-				authorityId: "ordinary-endpoint-a",
-				generation: 1,
-				isCurrent: () => true,
-				send: () => {},
-				retire: async () => {
-					retired += 1;
-				},
-			};
+			const attachment = notificationSubscription("ordinary");
 			routing.attach(attachment);
 			const session = daemon.sessions.get(attachment.sessionId);
 			if (!session) throw new Error("Expected a routed Telegram attachment session.");
@@ -401,7 +440,6 @@ describe("Telegram provider supervisor ownership", () => {
 			// topic-ineligible (every session still running an older build) must not
 			// be retired, quarantined, or downgraded to flat chat-root delivery, and
 			// its existing topic must stay active rather than being archived.
-			expect(retired).toBe(0);
 			expect(daemon.sessions.has("ordinary")).toBe(true);
 			// The session is admitted, so normal topic reconciliation may run; what
 			// must never happen is the topic being closed or orphaned.
@@ -651,13 +689,7 @@ describe("Telegram provider supervisor ownership", () => {
 		});
 		try {
 			const routing = daemon.attachmentRoutingHarnessForTest();
-			const unloadedAttachment = {
-				sessionId: "eligible",
-				authorityId: "eligible-unloaded",
-				generation: 1,
-				isCurrent: () => true,
-				send: () => {},
-			};
+			const unloadedAttachment = notificationSubscription("eligible");
 			routing.attach(unloadedAttachment);
 			const unloaded = daemon.sessions.get(unloadedAttachment.sessionId);
 			if (!unloaded) throw new Error("Expected a routed Telegram attachment session.");
@@ -670,10 +702,7 @@ describe("Telegram provider supervisor ownership", () => {
 			expect(calls).toEqual([]);
 
 			await daemon.loadTopics();
-			const attachment = {
-				...unloadedAttachment,
-				authorityId: "eligible-loaded",
-			};
+			const attachment = notificationSubscription("eligible", 2);
 			routing.attach(attachment);
 			const session = daemon.sessions.get(attachment.sessionId);
 			if (!session) throw new Error("Expected a routed Telegram attachment session.");
@@ -1219,12 +1248,7 @@ test("strict replay admits only capability-bearing identity frames", async () =>
 			});
 			await daemon.loadTopics();
 			const routing = daemon.attachmentRoutingHarnessForTest();
-			const attachment = {
-				sessionId: "replay-session",
-				generation: 1,
-				isCurrent: () => true,
-				send: () => {},
-			};
+			const attachment = notificationSubscription("replay-session");
 			routing.attach(attachment);
 			const session = daemon.sessions.get(attachment.sessionId);
 			if (!session) throw new Error("Expected replay attachment session.");

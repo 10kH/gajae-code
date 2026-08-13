@@ -238,7 +238,7 @@ describe("Telegram fault containment on production Router and registry surfaces"
 		const registry = new TopicRegistry();
 		await registry.getOrCreateTopic("s1", async () => "1");
 		expect(registry.get("s1")?.authorityState).toBe("active");
-		registry.beginArchive("s1");
+		registry.beginArchive("s1", undefined, Date.now(), "session_closed");
 		expect(registry.get("s1")?.authorityState).toBe("archive_pending");
 	});
 });

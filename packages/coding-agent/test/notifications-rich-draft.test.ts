@@ -778,7 +778,7 @@ describe("Telegram topic admission", () => {
 					endpointGeneration: 1,
 				},
 			);
-			registry.beginArchive("S", "host", 2);
+			registry.beginArchive("S", "host", 2, "session_closed");
 			fs.writeFileSync(topicPath, JSON.stringify(registry.serialize()));
 			bot.calls.length = 0;
 			const restarted = new TelegramNotificationDaemon({

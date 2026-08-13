@@ -149,6 +149,18 @@ export interface SessionRouterDeps {
 	clearTimeout?: typeof clearTimeout;
 }
 
+export type SessionRouterProviderDeps = Pick<
+	SessionRouterDeps,
+	| "createClient"
+	| "createIndex"
+	| "createBrokerClient"
+	| "setInterval"
+	| "clearInterval"
+	| "setTimeout"
+	| "clearTimeout"
+	| "onReconciled"
+>;
+
 export interface SessionRouterOptions {
 	agentDir: string;
 	deps?: SessionRouterDeps;
