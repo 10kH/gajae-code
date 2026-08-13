@@ -5,7 +5,12 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
-import { syncCoordinatorDirectory, syncCoordinatorFile, writeCoordinatorAtomic } from "../coordinator-mcp/durability";
+import {
+	ensureCoordinatorDirectory,
+	syncCoordinatorDirectory,
+	syncCoordinatorFile,
+	writeCoordinatorAtomic,
+} from "../coordinator-mcp/durability";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
@@ -667,7 +672,7 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 		`.${path.basename(readinessFile)}.${process.pid}.${randomUUID()}.tmp`,
 	);
 	try {
-		await fs.mkdir(path.dirname(readinessFile), { recursive: true });
+		await ensureCoordinatorDirectory(path.dirname(readinessFile));
 		const handle = await fs.open(tempFile, "wx", 0o600);
 		try {
 			await handle.writeFile(`${JSON.stringify(marker)}\n`);

@@ -16,6 +16,34 @@ export interface CoordinatorAtomicWriteOptions
 	rename?: (source: string, destination: string) => Promise<void>;
 }
 
+export async function ensureCoordinatorDirectory(
+	directory: string,
+	options: CoordinatorDirectoryBarrierOptions = {},
+): Promise<void> {
+	const missing: string[] = [];
+	for (let current = directory; ; current = path.dirname(current)) {
+		try {
+			const stat = await fs.stat(current);
+			if (!stat.isDirectory()) throw new Error(`coordinator directory is not a directory: ${current}`);
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			missing.push(current);
+			if (current === path.dirname(current)) throw error;
+		}
+	}
+	for (const created of missing.reverse()) {
+		try {
+			await fs.mkdir(created, { mode: 0o700 });
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			const stat = await fs.stat(created);
+			if (!stat.isDirectory()) throw error;
+		}
+		await syncCoordinatorDirectory(path.dirname(created), options);
+	}
+}
+
 /**
  * Windows does not support fsync on directory handles. File contents must be
  * synced before publication; this barrier only makes the renamed directory
@@ -67,7 +95,7 @@ export async function appendCoordinatorFile(
 	contents: string,
 	options: CoordinatorDirectoryBarrierOptions & CoordinatorFileDurabilityOptions = {},
 ): Promise<void> {
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(path.dirname(file), options);
 	const handle = await fs.open(file, "a", 0o600);
 	try {
 		await handle.writeFile(contents);
@@ -84,7 +112,7 @@ export async function writeCoordinatorAtomic(
 	contents: string,
 	options: CoordinatorAtomicWriteOptions = {},
 ): Promise<void> {
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(path.dirname(file), options);
 	const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
 	try {
 		const handle = await fs.open(temporary, "wx", 0o600);

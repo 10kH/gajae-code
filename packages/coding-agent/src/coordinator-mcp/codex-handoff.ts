@@ -3,7 +3,12 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
 import { assertSafeCodexEndpoint } from "./codex-wake-publisher";
-import { syncCoordinatorDirectory, syncCoordinatorFile, writeCoordinatorAtomic } from "./durability";
+import {
+	ensureCoordinatorDirectory,
+	syncCoordinatorDirectory,
+	syncCoordinatorFile,
+	writeCoordinatorAtomic,
+} from "./durability";
 
 export const CODEX_WAKE_EVENT_KINDS = [
 	"question.opened",
@@ -114,7 +119,7 @@ async function writeAtomic(file: string, value: unknown): Promise<void> {
 }
 
 async function writeExclusive(file: string, value: unknown): Promise<boolean> {
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(path.dirname(file));
 	const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
 	const handle = await fs.open(temp, "wx", 0o600);
 	try {

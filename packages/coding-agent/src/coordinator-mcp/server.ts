@@ -52,7 +52,7 @@ import {
 	createDefaultCodexTransportFactory,
 	publishCodexWake,
 } from "./codex-wake-publisher";
-import { appendCoordinatorFile, writeCoordinatorAtomic } from "./durability";
+import { appendCoordinatorFile, syncCoordinatorDirectory, writeCoordinatorAtomic } from "./durability";
 import {
 	createDefaultEventWebhookDelivery,
 	deliverEventWebhook,
@@ -862,9 +862,21 @@ async function ensureDir(dir: string): Promise<void> {
 async function readJsonFile(file: string): Promise<unknown | null> {
 	try {
 		return JSON.parse(await fs.readFile(file, "utf8"));
-	} catch {
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		return null;
 	}
+}
+
+async function removeCoordinatorFile(file: string): Promise<void> {
+	try {
+		await fs.lstat(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	await fs.rm(file);
+	await syncCoordinatorDirectory(path.dirname(file));
 }
 
 async function writeJsonFile(file: string, value: unknown): Promise<void> {
@@ -1853,7 +1865,7 @@ async function writeActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<
 
 async function clearActiveTurn(namespaceDir: string, turn: TurnRecord): Promise<void> {
 	const active = asRecord(await readJsonFile(activeTurnFile(namespaceDir, turn.session_id)));
-	if (active?.turn_id === turn.turn_id) await fs.rm(activeTurnFile(namespaceDir, turn.session_id), { force: true });
+	if (active?.turn_id === turn.turn_id) await removeCoordinatorFile(activeTurnFile(namespaceDir, turn.session_id));
 }
 
 async function readSessionState(namespaceDir: string, sessionId: string): Promise<CoordinatorSessionState | null> {
@@ -3636,9 +3648,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					return { ok: false, reason: "close_failed", detail: error.code, closed: false };
 				return { ok: false, reason: "close_failed", detail: "unavailable", closed: false };
 			}
-			await fs.rm(sessionFile(id), { force: true });
-			await fs.rm(sessionStateFile(namespaceDir, id), { force: true });
-			await fs.rm(activeTurnFile(namespaceDir, id), { force: true });
+			await removeCoordinatorFile(sessionFile(id));
+			await removeCoordinatorFile(sessionStateFile(namespaceDir, id));
+			await removeCoordinatorFile(activeTurnFile(namespaceDir, id));
 			await appendCoordinatorEvent(namespaceDir, {
 				kind: "session.reaped",
 				sessionId: id,
@@ -4042,7 +4054,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				if (canonicalTurnIds.has(turnId)) continue;
 				const projected = asRecord(await readJsonFile(path.join(turnsDir(namespaceDir), entry)));
 				if (projected?.session_id === sessionId)
-					await fs.rm(path.join(turnsDir(namespaceDir), entry), { force: true });
+					await removeCoordinatorFile(path.join(turnsDir(namespaceDir), entry));
 			}
 			const reportsDirectory = path.join(namespaceDir, "reports");
 			const canonicalReportIds = new Set(Object.keys(canonical.reports));
@@ -4051,7 +4063,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const reportId = entry.slice(0, -5);
 				if (canonicalReportIds.has(reportId)) continue;
 				const projected = asRecord(await readJsonFile(path.join(reportsDirectory, entry)));
-				if (projected?.session_id === sessionId) await fs.rm(path.join(reportsDirectory, entry), { force: true });
+				if (projected?.session_id === sessionId) await removeCoordinatorFile(path.join(reportsDirectory, entry));
 			}
 			const activeId = canonical.queue.selected_promotion?.to_turn_id ?? canonical.queue.active_turn_id;
 			const active = activeId ? canonical.turns[activeId] : null;
