@@ -51,7 +51,13 @@ function deferred<T = void>(): {
 }
 
 type Handler = (event: unknown, ctx: unknown) => unknown;
-type Frame = { type: string; title?: string; sessionId?: string; state?: string };
+type Frame = {
+	type: string;
+	title?: string;
+	sessionId?: string;
+	state?: string;
+	events?: Array<{ payload?: Frame }>;
+};
 
 const tempDirs: string[] = [];
 const openSockets: WebSocket[] = [];
@@ -144,7 +150,7 @@ function createHarness(
 	};
 }
 
-async function connectFrames(endpoint: string): Promise<Frame[]> {
+async function connectFrameClient(endpoint: string): Promise<{ frames: Frame[]; ws: WebSocket }> {
 	const { url, token } = readTestSdkEndpoint(endpoint);
 	const frames: Frame[] = [];
 	const ws = new WebSocket(`${url}/?token=${encodeURIComponent(token)}`);
@@ -155,7 +161,11 @@ async function connectFrames(endpoint: string): Promise<Frame[]> {
 		ws.addEventListener("error", () => reject(new Error("ws error")));
 	});
 	await sleep(250);
-	return frames;
+	return { frames, ws };
+}
+
+async function connectFrames(endpoint: string): Promise<Frame[]> {
+	return (await connectFrameClient(endpoint)).frames;
 }
 
 async function startAndConnect(harness: ReturnType<typeof createHarness>): Promise<Frame[]> {
@@ -328,11 +338,12 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 		},
 	} as never);
 	const sessionId = `terminal-failure-${process.pid}-${Date.now()}`;
+	let sessionName: string | undefined = "Terminal failure";
 	const ctx = {
 		cwd,
 		sessionManager: {
 			getSessionId: () => sessionId,
-			getSessionName: () => "Terminal failure",
+			getSessionName: () => sessionName,
 			getArtifactsDir: () => cwd,
 			getCwd: () => cwd,
 		},
@@ -366,6 +377,23 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 		frame => frame.type === "control_response" && frame.id === "terminal-failure-request",
 	) as { result?: { commandId?: string; turnId?: string } };
 	expect(response.result).toMatchObject({ accepted: true });
+	sessionName = "Delayed title during terminal failure";
+	await waitFor(
+		() =>
+			frames.some(
+				frame =>
+					frame.type === "agent_failed" &&
+					frame.commandId === response.result?.commandId &&
+					frame.turnId === response.result?.turnId,
+			),
+		4000,
+		"live correlated terminal failure",
+	);
+	await waitFor(
+		() => frames.some(frame => frame.type === "identity_header" && frame.title === sessionName),
+		4000,
+		"delayed title concurrent with terminal failure",
+	);
 	ws.send(JSON.stringify({ type: "event_replay", id: "terminal-failure-events", sinceGeneration: 1, sinceSeq: 0 }));
 	await waitFor(
 		() => frames.some(frame => frame.type === "event_replay_result" && frame.id === "terminal-failure-events"),
@@ -388,6 +416,123 @@ test("accepted turn.prompt submission failures emit a correlated terminal event"
 	await handlers.get("session_shutdown")!({ type: "session_shutdown" }, ctx);
 });
 
+test("publishes a delayed session title without waiting for another agent lifecycle event", async () => {
+	await withNotifications(async () => {
+		const harness = createHarness("gjc-notif-delayed-title-", undefined);
+		const frames = await startAndConnect(harness);
+		expect(frames.some(frame => frame.type === "identity_header")).toBe(false);
+
+		harness.name = "Delayed generated title";
+		await waitFor(
+			() => frames.some(frame => frame.type === "identity_header" && frame.title === harness.name),
+			4000,
+			"delayed session title identity",
+		);
+		const titledCount = frames.filter(
+			frame => frame.type === "identity_header" && frame.title === "Delayed generated title",
+		).length;
+		await sleep(500);
+		expect(
+			frames.filter(frame => frame.type === "identity_header" && frame.title === "Delayed generated title"),
+		).toHaveLength(titledCount);
+
+		await harness.commands
+			.get("notify")!
+			.handler("off", { ...(harness.ctx as Record<string, unknown>), ui: { notify: () => {} } });
+		harness.name = "Title while notifications are off";
+		await waitFor(
+			() => frames.some(frame => frame.type === "identity_header" && frame.title === harness.name),
+			4000,
+			"SDK identity while notification adapters are off",
+		);
+		await harness.commands
+			.get("notify")!
+			.handler("on", { ...(harness.ctx as Record<string, unknown>), ui: { notify: () => {} } });
+		await sleep(500);
+		expect(
+			frames.filter(
+				frame => frame.type === "identity_header" && frame.title === "Title while notifications are off",
+			),
+		).toHaveLength(1);
+
+		await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+		harness.name = "Title after shutdown";
+		await sleep(500);
+		expect(frames.some(frame => frame.title === "Title after shutdown")).toBe(false);
+	});
+});
+
+test("startup title settlement publishes once after transport readiness", async () => {
+	await withNotifications(async () => {
+		const harness = createHarness("gjc-notif-title-startup-race-", undefined);
+		const entered = deferred();
+		const release = deferred();
+		const hostStart = SessionSdkHost.prototype.start;
+		const startSpy = vi.spyOn(SessionSdkHost.prototype, "start").mockImplementation(async function (
+			this: SessionSdkHost,
+		) {
+			entered.resolve();
+			await release.promise;
+			return hostStart.call(this);
+		});
+		try {
+			const startup = harness.handlers.get("session_start")!({ type: "session_start" }, harness.ctx);
+			await entered.promise;
+			harness.name = "Settled during startup";
+			release.resolve();
+			await startup;
+			await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "startup-race endpoint");
+			const { frames, ws } = await connectFrameClient(harness.endpoint());
+			ws.send(JSON.stringify({ type: "event_replay", id: "startup-title-events", sinceGeneration: 1, sinceSeq: 0 }));
+			await waitFor(
+				() => frames.some(frame => frame.type === "event_replay_result"),
+				4000,
+				"startup-race identity replay",
+			);
+			const replay = frames.find(frame => frame.type === "event_replay_result");
+			if (!replay) throw new Error("Expected startup title event replay.");
+			expect(
+				replay.events?.filter(
+					event => event.payload?.type === "identity_header" && event.payload.title === "Settled during startup",
+				),
+			).toHaveLength(1);
+			await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+		} finally {
+			release.resolve();
+			startSpy.mockRestore();
+		}
+	});
+});
+
+test("session_switch fences the predecessor title observer", async () => {
+	await withNotifications(async () => {
+		const harness = createHarness("gjc-notif-title-switch-fence-", undefined);
+		const predecessorFrames = await startAndConnect(harness);
+		const predecessorId = harness.sid;
+		harness.sid = `successor-${predecessorId}`;
+		harness.name = "Successor title before switch commit";
+		await sleep(500);
+		expect(predecessorFrames.some(frame => frame.title === harness.name)).toBe(false);
+
+		harness.name = undefined;
+		await harness.handlers.get("session_switch")!(
+			{ type: "session_switch", previousSessionFile: harness.previousSessionFile(predecessorId) },
+			harness.ctx,
+		);
+		await waitFor(() => fs.existsSync(harness.endpoint()), 4000, "successor endpoint");
+		const successorFrames = await connectFrames(harness.endpoint());
+
+		harness.name = "Successor delayed title";
+		await waitFor(
+			() => successorFrames.some(frame => frame.type === "identity_header" && frame.title === harness.name),
+			4000,
+			"successor delayed title",
+		);
+		await sleep(500);
+		expect(predecessorFrames.some(frame => frame.title === "Successor delayed title")).toBe(false);
+		await harness.handlers.get("session_shutdown")!({ type: "session_shutdown" }, harness.ctx);
+	});
+});
 test("session_switch rotates SDK authority while preserving topic identity", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
