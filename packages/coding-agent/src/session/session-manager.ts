@@ -14291,7 +14291,6 @@ export class SessionManager {
 						const errCode = (err as NodeJS.ErrnoException)?.code;
 						const isMissingPredecessor =
 							isEnoent(err) ||
-							errCode === "ENOENT" ||
 							errCode === "not_found" ||
 							(err instanceof Error &&
 								(err.message === "not_found" || err.message === "managed_replace_missing"));

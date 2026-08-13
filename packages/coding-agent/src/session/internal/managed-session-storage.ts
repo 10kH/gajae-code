@@ -1693,7 +1693,13 @@ export class ManagedSessionDescendantStore {
 		if (this.#authority) {
 			const relative = this.#relative(resolved);
 			const observed = this.#authority.stat(relative);
-			if (!observed.ok || !observed.identity) throw new Error(observed.code ?? "managed_append_missing");
+			if (!observed.ok || !observed.identity) {
+				const rawCode =
+					typeof (observed as { code?: unknown })?.code === "string" ? (observed as { code: string }).code : "";
+				const err = new Error(rawCode || "managed_append_missing") as NodeJS.ErrnoException;
+				err.code = rawCode === "not_found" ? "ENOENT" : rawCode || "managed_append_missing";
+				throw err;
+			}
 			const nativeSha256 = observed.identity.sha256;
 			const expectedSha256 =
 				typeof nativeSha256 === "string" && /^[0-9a-f]{64}$/i.test(nativeSha256)
