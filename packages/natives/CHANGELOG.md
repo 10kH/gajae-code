@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-08-13
+
 ### Added
 
 - `renameNoReplacePathAsync` and `linkNoReplacePathAsync`, async variants of the checked no-replace namespace publication primitives, are scheduled on the native blocking-work pool so managed output publication can await the rename/link syscall boundary without blocking the host event loop (#4394).

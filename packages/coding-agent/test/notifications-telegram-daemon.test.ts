@@ -165,7 +165,11 @@ test("heartbeat lock-read failures clean staging files for the live owner", asyn
 	).rejects.toMatchObject({ code: "EPERM" });
 
 	const stagingPrefix = `${paths.heartbeat}.`;
-	expect(fs.readdirSync(path.dirname(paths.heartbeat)).filter(name => path.join(path.dirname(paths.heartbeat), name).startsWith(stagingPrefix))).toEqual([]);
+	expect(
+		fs
+			.readdirSync(path.dirname(paths.heartbeat))
+			.filter(name => path.join(path.dirname(paths.heartbeat), name).startsWith(stagingPrefix)),
+	).toEqual([]);
 });
 
 test("stale-tag sidecars are inert and a stale writer cannot overwrite a successor heartbeat", async () => {

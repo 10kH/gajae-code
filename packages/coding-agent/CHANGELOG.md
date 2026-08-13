@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.2] - 2026-08-13
+
 ### Added
 - `/theme <name>` now switches the theme immediately without opening the selector: the name is validated against built-in and custom themes, persisted to the detected `theme.dark`/`theme.light` slot, and applied to the running session in one step. Bare `/theme` keeps the existing live-preview selector, and an unknown name is rejected with the list of available themes.
 
