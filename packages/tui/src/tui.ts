@@ -580,6 +580,13 @@ export class Container implements ViewportAnchorProvider {
 		this.#advanceRenderRevision();
 	}
 
+	/** Replace direct children without disposing reusable components. */
+	replaceChildren(children: Component[]): void {
+		this.children = children;
+		this.#viewportAnchorSources.clear();
+		this.#advanceRenderRevision();
+	}
+
 	/** Registers a direct child as eligible for semantic viewport anchoring. */
 	setViewportAnchorSource(component: Component, source: ViewportAnchorSource | null): void {
 		if (source !== null && !isViewportAnchorSourceRenderer(component)) {

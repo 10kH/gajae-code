@@ -30,7 +30,9 @@ class MutableComponent implements Component {
 }
 
 async function settle(term: VirtualTerminal): Promise<void> {
-	await new Promise<void>(resolve => process.nextTick(resolve));
+	const tick = Promise.withResolvers<void>();
+	process.nextTick(tick.resolve);
+	await tick.promise;
 	await Bun.sleep(20);
 	await term.flush();
 }
@@ -86,6 +88,30 @@ describe("revisioned subtree render cache", () => {
 			term.resize(100, 12);
 			await settle(term);
 			expect(transcript.renderCount).toBe(3);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it("rerenders when a transcript subtree replaces direct children", async () => {
+		const term = new VirtualTerminal(80, 12);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		const transcript = new CountingTranscript();
+		transcript.addChild(new MutableComponent("before"));
+		tui.addChild(transcript);
+		tui.addChild(new MutableComponent("suffix"));
+		tui.setViewportAnchorComponent(transcript);
+		tui.setViewportOutputSource({ identity: "session:test", revision: 0n });
+
+		try {
+			tui.start();
+			await settle(term);
+			transcript.replaceChildren([new MutableComponent("after")]);
+			tui.requestLayoutRender("transcript-replacement");
+			await settle(term);
+
+			expect(transcript.renderCount).toBe(2);
+			expect(term.getViewport().join("\n")).toContain("after");
 		} finally {
 			tui.stop();
 		}
