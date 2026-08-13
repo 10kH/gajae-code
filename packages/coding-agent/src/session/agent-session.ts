@@ -1966,8 +1966,10 @@ export class AgentSession {
 	#preProfileModel: Model | undefined;
 	#sessionAdmissionQueue: SessionAdmissionEntry[] = [];
 	#activeSessionAdmission: SessionAdmissionEntry | undefined;
+	#sessionAdmissionClosing = false;
 	#sessionAdmissionClosed = false;
 	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
+	#selectionFenceTail: Promise<void> = Promise.resolve();
 	#defaultModelSelectionMutationRevision = 0;
 	#thinkingLevelMutationRevision = 0;
 	#thinkingVisibilityMutationRevision = 0;
@@ -2627,8 +2629,12 @@ export class AgentSession {
 		body: (lease: SessionAdmissionLease) => Promise<T>,
 		signal?: AbortSignal,
 		continuationAdmission?: ScheduledContinuationAdmission,
+		options?: { allowDuringClosing?: boolean },
 	): Promise<T> {
 		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
+		if (kind === "prompt" && continuationAdmission === undefined) {
+			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
+		}
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) {
 			if (
@@ -2638,7 +2644,11 @@ export class AgentSession {
 				return await body({ release: () => {} });
 			throw this.#sessionAdmissionBusyError();
 		}
-		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
+		if (
+			this.#sessionAdmissionClosed ||
+			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
+		)
+			throw this.#sessionAdmissionBusyError();
 		// Reject new external turns for the whole handoff transition. The handoff
 		// itself never acquires prompt admission (it generates via generateHandoff and
 		// injects via appendCustomMessageEntry), so this fences external entrants —
@@ -2674,7 +2684,10 @@ export class AgentSession {
 			releaseEntry();
 			throw error;
 		}
-		if (this.#sessionAdmissionClosed || this.#isDisposed) {
+		if (
+			this.#sessionAdmissionClosed ||
+			((this.#sessionAdmissionClosing || this.#isDisposed) && options?.allowDuringClosing !== true)
+		) {
 			entry.released = true;
 			entry.settled.resolve();
 			if (this.#activeSessionAdmission === entry) this.#activeSessionAdmission = undefined;
@@ -2704,19 +2717,21 @@ export class AgentSession {
 	}
 
 	async #closeSessionAdmission(): Promise<void> {
-		this.#sessionAdmissionClosed = true;
-		const queued = this.#sessionAdmissionQueue.splice(0);
-		for (const entry of queued) {
-			entry.released = true;
-			entry.ready.reject(this.#sessionAdmissionBusyError());
-			entry.settled.resolve();
-		}
+		this.#sessionAdmissionClosing = true;
 		const active = this.#activeSessionAdmission;
 		if (active?.kind === "prompt") {
 			this.#promptGeneration++;
 			this.#promptPreflightAbortController.abort();
 		}
 		if (active) await active.settled.promise;
+		await this.#selectionFenceTail;
+		this.#sessionAdmissionClosed = true;
+		const queued = this.#sessionAdmissionQueue.splice(0);
+		for (const entry of queued) {
+			entry.released = true;
+			entry.ready.resolve();
+			entry.settled.resolve();
+		}
 	}
 
 	#beginInFlight(): void {
@@ -13173,103 +13188,137 @@ export class AgentSession {
 			onAfterMutation?: () => void;
 		},
 	): Promise<DefaultModelSelectionResult> {
-		// Fail-fast reentrancy/inherit checks before any wait. Credential
-		// probe and idle wait stay outside the selection admission so they do
-		// not hold the lease while auto-compaction's post-prompt continuation
-		// (needing prompt admission via #postPromptTasksPromise) is pending.
+		// Reserve the causal selection fence synchronously, before credential
+		// probing can yield. Later external prompts wait behind this operation,
+		// while an inherited post-prompt continuation may bypass the fence so
+		// waitForIdle never deadlocks waiting for prompt admission.
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
+			throw this.#sessionAdmissionBusyError();
+		}
 		if (thinkingLevel === ThinkingLevel.Inherit) {
 			throw new Error("Default model selection cannot inherit a thinking level");
 		}
-		const speculativeApiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
-		if (!speculativeApiKey) {
-			throw new Error(`No API key for ${model.provider}/${model.id}`);
-		}
-		const resolvedLevel = resolveThinkingLevelForModel(model, thinkingLevel);
-		const effectiveLevel =
-			resolvedLevel ??
-			resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
-			ThinkingLevel.Off;
 		const expectedSessionId = this.sessionId;
-		await this.waitForIdle();
-		return this.#withSessionAdmission("selection", async () => {
-			options?.onBeforeMutation?.();
-			if (this.sessionId !== expectedSessionId) {
-				throw new Error("Session changed while selecting model");
-			}
-			await this.sessionManager.flush();
-			await this.#waitForAdmittedBaseSystemPromptRebuilds();
-			if (this.sessionId !== expectedSessionId) {
-				throw new Error("Session changed while selecting model");
-			}
-			const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
-			const preparedSystemPrompt = await this.#prepareDefaultModelSelectionPrompt(model);
-			if (this.sessionId !== expectedSessionId) {
-				throw new Error("Session changed while selecting model");
-			}
-			const stage = await this.sessionManager.stageDefaultModelSelection(
-				`${model.provider}/${model.id}`,
-				effectiveLevel,
-				{ appendThinkingLevel: true },
+		const priorSelectionFence = this.#selectionFenceTail;
+		const selectionFence = Promise.withResolvers<void>();
+		this.#selectionFenceTail = priorSelectionFence.then(() => selectionFence.promise);
+		void this.#selectionFenceTail.catch(() => {});
+		try {
+			await priorSelectionFence;
+			const { effectiveLevel } = await this.#withSessionAdmission(
+				"selection",
+				async () => {
+					if (this.sessionId !== expectedSessionId) {
+						throw new Error("Session changed while selecting model");
+					}
+					const apiKey = await this.#modelRegistry.getApiKey(model, this.credentialSessionId);
+					if (this.sessionId !== expectedSessionId) {
+						throw new Error("Session changed while selecting model");
+					}
+					if (!apiKey) {
+						throw new Error(`No API key for ${model.provider}/${model.id}`);
+					}
+					const resolvedLevel = resolveThinkingLevelForModel(model, thinkingLevel);
+					return {
+						effectiveLevel:
+							resolvedLevel ??
+							resolveThinkingLevelForModel(model, model.thinking?.defaultLevel ?? this.thinkingLevel) ??
+							ThinkingLevel.Off,
+					};
+				},
+				undefined,
+				undefined,
+				{ allowDuringClosing: true },
 			);
-			let durableCommit: CasReceipt;
-			try {
-				const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
-				durableCommit = await this.settings.commitAtomicBatchWithCurrent(() => [
-					{ path: "modelRoles.default" as SettingPath, op: "set", value: selector },
-				]);
-			} catch (error) {
-				try {
-					await this.sessionManager.discardDefaultModelSelectionStage(stage);
-				} catch (cleanupError) {
-					throw new AggregateError(
-						[error, cleanupError],
-						"Default model selection persistence and staged session cleanup both failed.",
+			await this.waitForIdle();
+			return await this.#withSessionAdmission(
+				"selection",
+				async () => {
+					options?.onBeforeMutation?.();
+					if (this.sessionId !== expectedSessionId) {
+						throw new Error("Session changed while selecting model");
+					}
+					await this.sessionManager.flush();
+					await this.#waitForAdmittedBaseSystemPromptRebuilds();
+					if (this.sessionId !== expectedSessionId) {
+						throw new Error("Session changed while selecting model");
+					}
+					const expectedMutationRevision = this.#defaultModelSelectionMutationRevision;
+					const preparedSystemPrompt = await this.#prepareDefaultModelSelectionPrompt(model);
+					if (this.sessionId !== expectedSessionId) {
+						throw new Error("Session changed while selecting model");
+					}
+					const stage = await this.sessionManager.stageDefaultModelSelection(
+						`${model.provider}/${model.id}`,
+						effectiveLevel,
+						{ appendThinkingLevel: true },
 					);
-				}
-				throw error;
-			}
-			if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
-				await this.#throwDefaultModelSelectionRecovery(
-					new Error("Default model selection was superseded before session promotion"),
-					stage,
-					durableCommit,
-				);
-			}
-			const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
-			switch (promotion.kind) {
-				case "promoted": {
-					this.#publishDefaultModelSelection(model, effectiveLevel, preparedSystemPrompt);
-					break;
-				}
-				case "not_promoted": {
-					return this.#throwDefaultModelSelectionRecovery(
-						promotion.error ?? new Error("Default model selection was superseded before session promotion"),
-						stage,
-						durableCommit,
-					);
-				}
-				case "unknown": {
-					const message = "Session replacement outcome could not be determined.";
-					throw new DefaultModelSelectionRecoveryError(message, {
-						message,
-						rollback: {
-							disposition: "unknown",
-							failures: [
-								{
-									stage: "session",
-									message: "Session replacement outcome could not be determined.",
+					let durableCommit: CasReceipt;
+					try {
+						const selector = formatModelSelectorValue(`${model.provider}/${model.id}`, effectiveLevel);
+						durableCommit = await this.settings.commitAtomicBatchWithCurrent(() => [
+							{ path: "modelRoles.default" as SettingPath, op: "set", value: selector },
+						]);
+					} catch (error) {
+						try {
+							await this.sessionManager.discardDefaultModelSelectionStage(stage);
+						} catch (cleanupError) {
+							throw new AggregateError(
+								[error, cleanupError],
+								"Default model selection persistence and staged session cleanup both failed.",
+							);
+						}
+						throw error;
+					}
+					if (this.#defaultModelSelectionMutationRevision !== expectedMutationRevision) {
+						await this.#throwDefaultModelSelectionRecovery(
+							new Error("Default model selection was superseded before session promotion"),
+							stage,
+							durableCommit,
+						);
+					}
+					const promotion = this.sessionManager.promoteDefaultModelSelection(stage);
+					switch (promotion.kind) {
+						case "promoted": {
+							this.#publishDefaultModelSelection(model, effectiveLevel, preparedSystemPrompt);
+							break;
+						}
+						case "not_promoted": {
+							return this.#throwDefaultModelSelectionRecovery(
+								promotion.error ?? new Error("Default model selection was superseded before session promotion"),
+								stage,
+								durableCommit,
+							);
+						}
+						case "unknown": {
+							const message = "Session replacement outcome could not be determined.";
+							throw new DefaultModelSelectionRecoveryError(message, {
+								message,
+								rollback: {
+									disposition: "unknown",
+									failures: [
+										{
+											stage: "session",
+											message: "Session replacement outcome could not be determined.",
+										},
+									],
 								},
-							],
-						},
-					});
-				}
-			}
-			this.#clearActiveModelProfileForConcreteDefault("user-selection");
-			options?.onAfterMutation?.();
-			return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
-		});
+							});
+						}
+					}
+					this.#clearActiveModelProfileForConcreteDefault("user-selection");
+					options?.onAfterMutation?.();
+					return { provider: model.provider, modelId: model.id, thinkingLevel: effectiveLevel };
+				},
+				undefined,
+				undefined,
+				{ allowDuringClosing: true },
+			);
+		} finally {
+			selectionFence.resolve();
+		}
 	}
 	/**
 	 * Cycle to next/previous model.
