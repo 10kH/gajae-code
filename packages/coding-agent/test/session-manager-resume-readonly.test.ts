@@ -1212,10 +1212,10 @@ describe("active managed picker root", () => {
 			receipts: fs.readdirSync(path.join(protocolRoot, "receipts")),
 			tombstones: fs.readdirSync(path.join(protocolRoot, "tombstones")),
 		};
-		const renameNoReplacePath = native.renameNoReplacePath;
+		const renameNoReplacePathAsync = native.renameNoReplacePathAsync;
 		let publicationGuards = 0;
-		vi.spyOn(native, "renameNoReplacePath").mockImplementation((source, destinationPath) => {
-			const result = renameNoReplacePath(source, destinationPath);
+		vi.spyOn(native, "renameNoReplacePathAsync").mockImplementation(async (source, destinationPath) => {
+			const result = await renameNoReplacePathAsync(source, destinationPath);
 			if (
 				result.ok &&
 				String(destinationPath).includes(`${path.sep}receipts${path.sep}`) &&
