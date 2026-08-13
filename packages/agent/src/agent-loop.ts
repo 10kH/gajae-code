@@ -764,6 +764,78 @@ function managedAttemptSnapshot<T>(value: T): T {
 	return managedAttemptSnapshotDetailed(value).snapshot;
 }
 
+const LOSSLESS_SNAPSHOT_KEYS = [
+	"role",
+	"content",
+	"api",
+	"provider",
+	"model",
+	"responseId",
+	"usage",
+	"stopReason",
+	"errorMessage",
+	"errorKind",
+	"errorStatus",
+	"transportFailure",
+	"disabledFeatures",
+	"providerPayload",
+	"timestamp",
+	"duration",
+	"ttft",
+	"type",
+	"contentIndex",
+	"delta",
+	"partial",
+	"toolCall",
+	"reason",
+	"message",
+	"error",
+] as const;
+
+/**
+ * Detach unmanaged provider metadata without normalizing the cloneable parts.
+ * A failed subtree is removed at its own property boundary; siblings retain
+ * their exact structured-clone representation. The bounded recursive path is
+ * used only after cloning the complete value fails.
+ */
+function losslessDetachedClone<T>(value: T): T {
+	try {
+		return structuredClone(value);
+	} catch {
+		// The managed sanitizer is explicitly bounded and total. Use it only to
+		// identify which top-level assistant metadata surfaces are cloneable; the
+		// cloneable surfaces themselves still come from structuredClone and remain
+		// lossless. This avoids recursive/unbounded traversal of hostile provider
+		// metadata while stripping only the failed top-level surface.
+		if (!isManagedPlainRecord(value)) return sanitizedDetachedClone(value);
+		const output: Record<string, unknown> = {};
+		let remaining = MANAGED_SNAPSHOT_MAX_NODES;
+		for (const key of LOSSLESS_SNAPSHOT_KEYS) {
+			if (remaining-- <= 0) break;
+			const descriptor = Object.getOwnPropertyDescriptor(value, key);
+			if (!descriptor || !("value" in descriptor)) continue;
+			try {
+				output[key] = structuredClone(descriptor.value);
+			} catch {
+				if (key === "transportFailure" && isManagedPlainRecord(descriptor.value)) {
+					const transport: Record<string, unknown> = {};
+					for (const transportKey of ["kind", "status", "code", "providerCode", "retryAfterMs"] as const) {
+						const transportDescriptor = Object.getOwnPropertyDescriptor(descriptor.value, transportKey);
+						if (!transportDescriptor || !("value" in transportDescriptor)) continue;
+						try {
+							transport[transportKey] = structuredClone(transportDescriptor.value);
+						} catch {
+							// Strip only this non-cloneable transport fact.
+						}
+					}
+					output[key] = transport;
+				}
+			}
+		}
+		return output as T;
+	}
+}
+
 /**
  * Recover the required assistant-message shell when a managed snapshot degrades
  * at its root (notably for Proxy-wrapped provider messages). Only known fields
@@ -969,6 +1041,7 @@ class ManagedAttemptTransaction {
 			| undefined,
 		private readonly model: AgentLoopConfig["model"],
 		readonly scope?: AttemptScope,
+		private readonly snapshotMode: "managed" | "lossless" = "managed",
 	) {}
 
 	push(event: AgentEvent): void {
@@ -984,15 +1057,15 @@ class ManagedAttemptTransaction {
 	}
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
-		const partial = managedAssistantShell(message, this.model);
+		const partial = this.#assistantSnapshot(message);
 		if (this.#committed) {
-			this.onAssistantMessageEvent?.(partial, managedAssistantEventSnapshot(event, partial));
+			this.onAssistantMessageEvent?.(partial, this.#assistantEventSnapshot(event, partial));
 			return;
 		}
 		this.#batch.push({
 			type: "assistant_event",
 			message: partial,
-			event: managedAssistantEventSnapshot(event, partial),
+			event: this.#assistantEventSnapshot(event, partial),
 		});
 	}
 
@@ -1015,6 +1088,10 @@ class ManagedAttemptTransaction {
 		return this.#committed;
 	}
 
+	acceptedAssistantSnapshot(message: AssistantMessage): AssistantMessage {
+		return this.#assistantSnapshot(message);
+	}
+
 	discard(): void {
 		this.#batch = [];
 		this.#stagedBytes = 0;
@@ -1030,6 +1107,31 @@ class ManagedAttemptTransaction {
 	}
 
 	#stage(event: AgentEvent): void {
+		if (this.snapshotMode === "lossless") {
+			const snapshot = this.#repairAssistantEvent(event);
+			let detached: AgentEvent;
+			try {
+				detached = this.#losslessSnapshot(snapshot);
+			} catch {
+				this.discard();
+				throw new ManagedAttemptSnapshotError();
+			}
+			let detachedBytes: number;
+			try {
+				detachedBytes = managedAttemptTextEncoder.encode(JSON.stringify(detached)).byteLength;
+			} catch {
+				this.discard();
+				throw new ManagedAttemptSnapshotError();
+			}
+			if (this.#wouldOverflow(detachedBytes)) {
+				this.discard();
+				throw new ManagedAttemptSnapshotError();
+			}
+			this.#batch.push({ type: "event", event: detached });
+			this.#stagedEventCount++;
+			this.#stagedBytes += detachedBytes;
+			return;
+		}
 		// Measure the raw event FIRST so an oversized payload is rejected
 		// before the snapshot duplicates it — the staged-byte cap exists to
 		// bound memory, so cloning ahead of the check would defeat it.
@@ -1046,7 +1148,8 @@ class ManagedAttemptTransaction {
 			this.discard();
 			throw new ManagedAttemptBufferOverflowError();
 		}
-		const detailed = managedAttemptSnapshotDetailed(this.#repairAssistantEvent(event));
+		const repaired = this.#repairAssistantEvent(event);
+		const detailed = managedAttemptSnapshotDetailed(repaired);
 		let snapshot = detailed.snapshot;
 		if (bytes === undefined || detailed.degraded) {
 			// Account the bytes of what is actually retained: a degraded
@@ -1083,6 +1186,7 @@ class ManagedAttemptTransaction {
 	}
 
 	#repairAssistantEvent(event: AgentEvent): AgentEvent {
+		if (this.snapshotMode === "lossless") return event;
 		if (event.type === "message_start" || event.type === "message_end" || event.type === "turn_end") {
 			return event.message.role === "assistant"
 				? { ...event, message: managedAssistantShell(event.message, this.model) }
@@ -1105,6 +1209,25 @@ class ManagedAttemptTransaction {
 			};
 		}
 		return event;
+	}
+
+	#losslessSnapshot<T>(value: T): T {
+		return losslessDetachedClone(value);
+	}
+
+	#assistantSnapshot(message: AssistantMessage): AssistantMessage {
+		return this.snapshotMode === "lossless"
+			? this.#losslessSnapshot(message)
+			: managedAssistantShell(message, this.model);
+	}
+
+	#assistantEventSnapshot(event: AssistantMessageEvent, message: AssistantMessage): AssistantMessageEvent {
+		if (this.snapshotMode === "managed") return managedAssistantEventSnapshot(event, message);
+		const snapshot = this.#losslessSnapshot(event);
+		if (snapshot.type === "done") return { ...snapshot, message };
+		if (snapshot.type === "error") return { ...snapshot, error: message };
+		if ("partial" in snapshot) return { ...snapshot, partial: message };
+		return snapshot;
 	}
 }
 
@@ -1568,7 +1691,7 @@ async function runLoopBody(
 					: undefined);
 			const escapedToolTransaction = config.fallbackManaged
 				? undefined
-				: new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope);
+				: new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope, "lossless");
 			const transaction = managedTransaction ?? escapedToolTransaction;
 			initialTransaction = undefined;
 			const attemptScope = transaction?.scope ?? scope;
@@ -1937,11 +2060,21 @@ async function runLoopBody(
 			// One provider invocation is committed before any tool can run.
 			transaction?.flush();
 			if (escapedToolTransaction) {
+				const acceptedMessage = escapedToolTransaction.acceptedAssistantSnapshot(message);
+				const acceptedIndex = currentContext.messages.lastIndexOf(message);
+				if (acceptedIndex >= 0) currentContext.messages[acceptedIndex] = acceptedMessage;
+				const producedIndex = newMessages.lastIndexOf(message);
+				if (producedIndex >= 0) newMessages[producedIndex] = acceptedMessage;
+				message = acceptedMessage;
 				// Tool-call updates are staged so an escaped turn can disappear
 				// atomically. Once accepted, drain every published update through the
 				// Agent/AgentSession consumers before dispatch: streaming edit guards
 				// can then abort the run before any tool execute() is entered.
-				if (!loopSignal.aborted && stream.hasActiveConsumer) await stream.waitForConsumerDrain(loopSignal);
+				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
+					if (loopSignal.aborted) break;
+					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
+					if (loopSignal.aborted) break;
+				}
 			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
@@ -2519,6 +2652,9 @@ async function streamAssistantResponse(
 								: event.partial;
 							context.messages.push(partialMessage);
 							addedPartial = true;
+							if (provisionalToolTransaction) {
+								config.onProvisionalAssistantMessageEvent?.(partialMessage, event);
+							}
 							stream.push({ type: "message_start", message: { ...partialMessage }, scope });
 							break;
 
@@ -2545,6 +2681,7 @@ async function streamAssistantResponse(
 								const partialEvent = config.fallbackManaged ? { ...event, partial: partialMessage } : event;
 								context.messages[context.messages.length - 1] = partialMessage;
 								if (provisionalToolTransaction) {
+									config.onProvisionalAssistantMessageEvent?.(partialMessage, partialEvent);
 									provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
 								} else {
 									config.onAssistantMessageEvent?.(partialMessage, partialEvent);

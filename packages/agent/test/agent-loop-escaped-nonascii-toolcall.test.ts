@@ -2,8 +2,9 @@ import { describe, expect, it } from "bun:test";
 import { Agent } from "@gajae-code/agent-core";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "@gajae-code/agent-core/types";
-import type { Message } from "@gajae-code/ai";
+import type { AssistantMessage, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import * as z from "zod/v4";
 import { createUserMessage } from "./helpers";
 
@@ -55,6 +56,47 @@ function escapedTurnWithText(id: string) {
 /** The same turn as the model would have produced it with literal UTF-8 on the wire. */
 function literalTurn(id: string) {
 	return { content: [{ type: "toolCall" as const, id, name: "ask", arguments: { question: QUESTION } }] };
+}
+
+const PROVIDER_USAGE = {
+	input: 7,
+	output: 11,
+	cacheRead: 13,
+	cacheWrite: 17,
+	totalTokens: 48,
+	premiumRequests: 2,
+	reasoningTokens: 5,
+	cttl: { ephemeral5m: 3, ephemeral1h: 14 },
+	server: { webSearch: 2, webFetch: 1 },
+	cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 10 },
+};
+
+function thinkingToolTurn(id: string, escaped = false) {
+	return {
+		content: [
+			{
+				type: "thinking" as const,
+				thinking: "provider reasoning",
+				thinkingSignature: "reasoning-signature",
+				itemId: "reasoning-item",
+				provenance: "mixed" as const,
+				summaryText: "summary",
+				rawText: "raw",
+			},
+			{
+				type: "toolCall" as const,
+				id,
+				name: "ask",
+				arguments: { question: QUESTION },
+				thoughtSignature: "tool-thought-signature",
+				...(escaped ? { escapedNonAsciiArguments: true } : {}),
+			},
+		],
+		usage: PROVIDER_USAGE,
+		responseId: "provider-response-id",
+		disabledFeatures: ["priority"],
+		providerPayload: { type: "openaiResponsesHistory" as const, provider: "mock", items: [{ id: "native-item" }] },
+	};
 }
 
 describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
@@ -127,6 +169,49 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		).toBe(false);
 		expect(events.filter(event => event.type === "turn_start")).toHaveLength(3);
 		expect(events.filter(event => event.type === "turn_end")).toHaveLength(2);
+	});
+
+	it("preserves provider-native thinking and usage metadata through accepted Agent state and replay", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const mock = createMockModel({
+			responses: [thinkingToolTurn("tc-defective", true), thinkingToolTurn("tc-accepted"), { content: ["done"] }],
+		});
+		const agent = new Agent({
+			initialState: { systemPrompt: [""], model: mock.model, tools: [askTool(executed)], messages: [] },
+			convertToLlm: identityConverter,
+			streamFn: mock.stream,
+		});
+
+		await agent.prompt("ask me");
+
+		const accepted = agent.state.messages.find(
+			(message): message is AssistantMessage =>
+				message.role === "assistant" &&
+				message.content.some(block => block.type === "toolCall" && block.id === "tc-accepted"),
+		);
+		expect(accepted).toBeDefined();
+		expect(accepted?.content[0]).toEqual(thinkingToolTurn("unused").content[0]);
+		expect(accepted?.usage).toEqual(PROVIDER_USAGE);
+		expect(accepted?.responseId).toBe("provider-response-id");
+		expect(accepted?.disabledFeatures).toEqual(["priority"]);
+		expect(accepted?.providerPayload).toEqual({
+			type: "openaiResponsesHistory",
+			provider: "mock",
+			items: [{ id: "native-item" }],
+		});
+		expect(
+			agent.state.messages.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(block => block.type === "toolCall" && block.id === "tc-defective"),
+			),
+		).toBe(false);
+		const replayed = mock.calls[2]?.context.messages.find(
+			(message): message is AssistantMessage =>
+				message.role === "assistant" &&
+				message.content.some(block => block.type === "toolCall" && block.id === "tc-accepted"),
+		);
+		expect(replayed).toEqual(accepted);
 	});
 
 	it("preserves all pre-existing history and removes only the defective assistant turn", async () => {
@@ -363,6 +448,160 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		}
 
 		expect(observed).toEqual(["toolcall_end", "execute"]);
+	});
+
+	it("does not dispatch when an accepted assistant callback aborts during commit", async () => {
+		let executions = 0;
+		const tool: AgentTool<typeof askSchema, Record<string, never>> = {
+			...askTool([]),
+			async execute() {
+				executions += 1;
+				return { content: [{ type: "text", text: "answered" }], details: {} };
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({ responses: [literalTurn("tc-abort")] });
+		const controller = new AbortController();
+		const config: AgentLoopConfig = {
+			model: mock.model,
+			convertToLlm: identityConverter,
+			onAssistantMessageEvent: (_message, event) => {
+				if (event.type === "toolcall_end") controller.abort();
+			},
+		};
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, controller.signal, mock.stream);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(executions).toBe(0);
+	});
+
+	it("promotes a detached accepted assistant for execution state and replay", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const mock = createMockModel({ responses: [{ content: ["done"] }] });
+		const providerOwned: AssistantMessage = {
+			role: "assistant",
+			content: thinkingToolTurn("tc-detached").content,
+			api: mock.model.api,
+			provider: mock.model.provider,
+			model: mock.model.id,
+			usage: structuredClone(PROVIDER_USAGE),
+			stopReason: "toolUse",
+			responseId: "provider-response-id",
+			disabledFeatures: ["priority"],
+			providerPayload: { type: "openaiResponsesHistory", provider: "mock", items: [{ id: "native-item" }] },
+			timestamp: Date.now(),
+		};
+		let calls = 0;
+		const streamFn: typeof mock.stream = (_model, llmContext, options) => {
+			if (calls++ > 0) return mock.stream(mock.model, llmContext, options);
+			const providerStream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				providerStream.push({ type: "start", partial: providerOwned });
+				providerStream.push({ type: "thinking_start", contentIndex: 0, partial: providerOwned });
+				providerStream.push({
+					type: "thinking_delta",
+					contentIndex: 0,
+					delta: "provider reasoning",
+					partial: providerOwned,
+				});
+				providerStream.push({
+					type: "thinking_end",
+					contentIndex: 0,
+					content: "provider reasoning",
+					partial: providerOwned,
+				});
+				providerStream.push({ type: "toolcall_start", contentIndex: 1, partial: providerOwned });
+				providerStream.push({
+					type: "toolcall_delta",
+					contentIndex: 1,
+					delta: JSON.stringify({ question: QUESTION }),
+					partial: providerOwned,
+				});
+				const toolCall = providerOwned.content[1];
+				if (toolCall?.type !== "toolCall") throw new Error("Expected tool call");
+				providerStream.push({ type: "toolcall_end", contentIndex: 1, toolCall, partial: providerOwned });
+				providerStream.push({ type: "done", reason: "toolUse", message: providerOwned });
+			});
+			return providerStream;
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		const accepted = (await stream.result()).find(
+			(message): message is AssistantMessage =>
+				message.role === "assistant" &&
+				message.content.some(block => block.type === "toolCall" && block.id === "tc-detached"),
+		);
+		expect(accepted).toBeDefined();
+		expect(accepted).not.toBe(providerOwned);
+		providerOwned.usage.reasoningTokens = 999;
+		providerOwned.disabledFeatures?.push("mutated");
+		providerOwned.providerPayload?.items.push({ id: "mutated" });
+		expect(accepted?.usage.reasoningTokens).toBe(5);
+		expect(accepted?.disabledFeatures).toEqual(["priority"]);
+		expect(accepted?.providerPayload).toEqual({
+			type: "openaiResponsesHistory",
+			provider: "mock",
+			items: [{ id: "native-item" }],
+		});
+		const replayed = mock.calls[0]?.context.messages.find(
+			(message): message is AssistantMessage =>
+				message.role === "assistant" &&
+				message.content.some(block => block.type === "toolCall" && block.id === "tc-detached"),
+		);
+		expect(replayed).toBe(accepted);
+	});
+
+	it("does not mask an ordinary unmanaged provider error with non-cloneable metadata", async () => {
+		const mock = createMockModel();
+		const streamFn: typeof mock.stream = () => {
+			const providerStream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const failure: AssistantMessage = {
+					role: "assistant",
+					content: [],
+					api: mock.model.api,
+					provider: mock.model.provider,
+					model: mock.model.id,
+					usage: structuredClone(PROVIDER_USAGE),
+					stopReason: "error",
+					errorMessage: "rate limited",
+					errorStatus: 429,
+					transportFailure: {
+						kind: "transport",
+						status: 429,
+						headers: new Headers({ "retry-after": "0" }) as unknown as Record<string, string>,
+					},
+					timestamp: Date.now(),
+				};
+				providerStream.push({ type: "error", reason: "error", error: failure });
+			});
+			return providerStream;
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [] };
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+
+		const stream = agentLoop([createUserMessage("ask me")], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// drain
+		}
+		const result = await stream.result();
+		const failure = result.findLast(message => message.role === "assistant");
+
+		expect(failure?.role === "assistant" ? failure.errorMessage : undefined).toBe("rate limited");
+		expect(failure?.role === "assistant" ? failure.errorStatus : undefined).toBe(429);
+		expect(failure?.role === "assistant" ? failure.transportFailure : undefined).toEqual({
+			kind: "transport",
+			status: 429,
+		});
 	});
 
 	it("rejects the call once the resample budget is spent", async () => {
