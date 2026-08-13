@@ -425,6 +425,40 @@ describe("owner subagent shutdown leases", () => {
 		await manager.dispose();
 	});
 
+	test("retains every watch across immediate terminal eviction", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+			},
+			retentionMs: 0,
+		});
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "immediately evicted watched completion", async () => gate.promise, {
+			ownerId: "owner-a",
+			metadata: { subagent: { id: "evicted-watched", agent: "executor", agentSource: "bundled" } },
+		});
+		const generation = manager.getJob(jobId)?.generation;
+		manager.watchJobs([jobId]);
+		manager.watchJobs([jobId]);
+		gate.resolve("done before eviction");
+		await manager.getJob(jobId)?.promise;
+		await Bun.sleep(10);
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(manager.isDeliverySuppressed(jobId, generation)).toBe(true);
+		expect(delivered).toEqual([]);
+
+		manager.unwatchJobs([jobId]);
+		expect(manager.isDeliverySuppressed(jobId, generation)).toBe(true);
+		await Bun.sleep(10);
+		expect(delivered).toEqual([]);
+
+		manager.unwatchJobs([jobId]);
+		await manager.drainDeliveries({ filter: { ownerId: "owner-a" }, timeoutMs: 100 });
+		expect(delivered).toEqual([jobId]);
+		await manager.dispose();
+	});
+
 	test("acknowledging another job preserves a watched completion", async () => {
 		const delivered: string[] = [];
 		const manager = new AsyncJobManager({

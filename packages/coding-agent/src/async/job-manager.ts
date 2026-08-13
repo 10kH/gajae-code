@@ -2368,7 +2368,6 @@ export class AsyncJobManager {
 		this.#deadLetteredDeliveryOwners.delete(jobId);
 		this.#suppressedDeliveries.delete(jobId);
 		if (job) this.#publishedTerminalGenerations.delete(job.generation);
-		this.#watchedJobs.delete(jobId);
 		this.#outputState.delete(jobId);
 	}
 
