@@ -10,15 +10,17 @@ instead of copying a long session by hand.
 /import-session <transcript-file> [--provider codex|claude]
 ```
 
-- Available in the interactive TUI and to ACP clients (both dispatch through the
-  unified builtin registry).
+- Available in the interactive TUI and trusted local startup command path. It is
+  deliberately excluded from ACP and remote-control transports because it reads
+  an operator-selected local file.
 - `<transcript-file>` is an explicit, user-selected export/transcript file
   (absolute or cwd-relative; quote paths containing spaces).
 - `--provider` narrows detection to one provider and fails closed on a
   mismatch. Without it, the format is detected deterministically from the file
   content.
-- On success, GJC creates a **new** session containing the reconstructed
-  context and switches to it. The previous session is left untouched on disk.
+- On success, GJC creates a **new** resumable session containing the reconstructed
+  context and reports its id. The active session is not switched automatically;
+  use `/resume` to select the import.
 
 There is intentionally no flag-less provider-directory mode: import never
 enumerates `~/.codex` / `~/.claude` or reads live provider process state. You

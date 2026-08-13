@@ -387,10 +387,11 @@ export async function materializeExternalSessionImport(
 		await manager.setSessionName(truncateText(title, MAX_TITLE_CHARS), "user");
 		await manager.ensureOnDisk();
 		await manager.flush();
-		await manager.close();
 
 		// Verify the written file reopens cleanly and is continuable before the
-		// caller switches to it; a failed verification discards the new file.
+		// caller switches to it. Keep the creating manager open so its captured
+		// managed destination authority remains valid throughout verification;
+		// closing it afterward releases that authority exactly once.
 		const reopened = await SessionManager.open(sessionFile, destination);
 		try {
 			if (!canContinuePersistedHistory(reopened.buildSessionContext().messages)) {
@@ -403,6 +404,7 @@ export async function materializeExternalSessionImport(
 		} finally {
 			await reopened.close().catch(() => {});
 		}
+		await manager.close();
 		return { targetSessionId, targetPath: sessionFile, title: truncateText(title, MAX_TITLE_CHARS), prepared };
 	} catch (error) {
 		await manager.close().catch(() => {});
