@@ -64,7 +64,7 @@ describe("status line path segment", () => {
 	it("strips the Projects root for symlink-equivalent aliases", () => {
 		if (process.platform === "win32") return;
 
-		const projectsRoot = path.join(os.homedir(), "Projects");
+		const projectsRoot = path.join(fs.realpathSync(os.homedir()), "Projects");
 		fs.mkdirSync(projectsRoot, { recursive: true });
 
 		const realProjectDir = fs.mkdtempSync(path.join(projectsRoot, "gjc-status-line-"));
@@ -74,7 +74,7 @@ describe("status line path segment", () => {
 
 		try {
 			fs.mkdirSync(nestedDir, { recursive: true });
-			fs.symlinkSync(os.homedir(), homeAlias, "dir");
+			fs.symlinkSync(fs.realpathSync(os.homedir()), homeAlias, "dir");
 
 			const aliasedDir = path.join(homeAlias, "Projects", path.basename(realProjectDir), "nested");
 			setProjectDir(aliasedDir);
@@ -143,7 +143,7 @@ describe("status line path segment", () => {
 	});
 
 	it("keeps the folder icon for paths outside any scratch root", () => {
-		const projectsRoot = path.join(os.homedir(), "Projects");
+		const projectsRoot = path.join(fs.realpathSync(os.homedir()), "Projects");
 		fs.mkdirSync(projectsRoot, { recursive: true });
 		const realProjectDir = fs.mkdtempSync(path.join(projectsRoot, "gjc-status-line-real-"));
 		try {

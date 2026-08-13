@@ -202,6 +202,7 @@ describe("AgentSession message pipeline", () => {
 	});
 
 	it("forwards stop reasons and reasoning summaries to extension handlers", async () => {
+		const agentEndDelivered = Promise.withResolvers<void>();
 		const extensionEmit = vi.fn(
 			async (
 				_event: {
@@ -221,8 +222,11 @@ describe("AgentSession message pipeline", () => {
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry: {} as never,
 			extensionRunner: {
-				emit: extensionEmit,
-				hasHandlers: (eventType: string) => eventType === "reasoning_summary_end",
+				emit: async (...args: Parameters<typeof extensionEmit>) => {
+					await extensionEmit(...args);
+					if (args[0]?.type === "agent_end") agentEndDelivered.resolve();
+				},
+				hasHandlers: (eventType: string) => eventType === "reasoning_summary_end" || eventType === "agent_end",
 			} as never,
 		});
 		sessions.push(session);
@@ -238,8 +242,7 @@ describe("AgentSession message pipeline", () => {
 				partial: createAssistantMessage("summary"),
 			},
 		} as never);
-		await Bun.sleep(0);
-		await Bun.sleep(0);
+		await agentEndDelivered.promise;
 
 		const emittedEvents = extensionEmit.mock.calls.map(([event]) => event);
 		expect(emittedEvents).toContainEqual({ type: "agent_end", messages: [], stopReason: "cancelled" });
