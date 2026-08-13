@@ -169,7 +169,7 @@ const EFFORT_CAPABLE_PREFIXES = [
 
 export function supportsReasoningEffort(modelId: string): boolean {
   const name = getCanonicalModelName(modelId);
-  if (!EFFORT_CAPABLE_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+  if (!EFFORT_CAPABLE_PREFIXES.some((prefix) => name === prefix || name.startsWith(`${prefix}-`))) {
     return false;
   }
   const model = resolveModels().find((entry) => getCanonicalModelName(entry.id) === name);
