@@ -105,8 +105,10 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * settles non-forum close responses. Generation 62 rejects replay-gap
  * authority claims that do not match the requested cursor, answer bounds,
  * and retained replay suffix.
+ * Generation 63 contains transient steady-heartbeat state and ownership-lock
+ * read failures and cleans every staged sidecar before retrying (#4200).
  */
-export const DAEMON_GENERATION = 62;
+export const DAEMON_GENERATION = 63;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 5

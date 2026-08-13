@@ -95,6 +95,24 @@ describe("bash resource lifecycle", () => {
 		}
 	});
 
+	it("clears the foreground auto-background deadline after an early completion", async () => {
+		settings.set("bash.autoBackground.enabled", false);
+		const sleep = vi.spyOn(Bun, "sleep");
+		const tool = new BashTool(makeToolSession(tempDir, settings));
+
+		try {
+			const result = await tool.execute("foreground-early-completion", {
+				command: "true",
+				timeout: 5,
+			});
+
+			expect(result.isError).not.toBe(true);
+			expect(sleep).not.toHaveBeenCalledWith(6_000);
+		} finally {
+			sleep.mockRestore();
+		}
+	});
+
 	it("repeated monitor jobs return native shell session count to baseline", async () => {
 		const baseline = getShellSessionCount();
 		const tool = new BashTool(makeToolSession(tempDir, settings));

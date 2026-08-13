@@ -5693,6 +5693,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				},
 			};
 		}
+		if (request.method === "ping") {
+			return { jsonrpc: "2.0", id, result: {} };
+		}
 		if (request.method === "tools/list") {
 			return { jsonrpc: "2.0", id, result: { tools: COORDINATOR_MCP_TOOL_NAMES.map(toolSchema) } };
 		}
