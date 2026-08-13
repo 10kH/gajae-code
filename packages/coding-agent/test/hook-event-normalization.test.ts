@@ -490,24 +490,50 @@ describe("production discovery integration", () => {
 		}
 	});
 
-	it("loads explicit configured hook paths without granting foreign directory authority", async () => {
+	it("loads explicit configured hook paths into session ExtensionRunner without foreign authority", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-hook-configured-"));
 		const configuredHook = path.join(root, "configured", "hook.ts");
 		const marker = path.join(root, "configured-executed");
+		const foreignMarker = path.join(root, "foreign-executed");
 		await fs.mkdir(path.dirname(configuredHook), { recursive: true });
+		await fs.mkdir(path.join(root, ".claude", "hooks", "pre"), { recursive: true });
 		await Bun.write(
 			configuredHook,
 			`export default (api) => api.on("tool_call", async () => { await Bun.write(${JSON.stringify(marker)}, "executed"); });\n`,
 		);
+		await Bun.write(
+			path.join(root, ".claude", "hooks", "pre", "read.ts"),
+			`await Bun.write(${JSON.stringify(foreignMarker)}, "imported"); export default () => undefined;\n`,
+		);
 
 		try {
-			const result = await discoverAndLoadHooks([path.relative(root, configuredHook)], root);
-			expect(result.errors).toEqual([]);
-			expect(result.hooks).toHaveLength(1);
-			expect(result.hooks[0]?.resolvedPath).toBe(configuredHook);
-			const handlers = result.hooks[0]?.handlers.get("tool_call") ?? [];
-			await handlers[0]?.({}, {});
+			const { session } = await createAgentSession({
+				cwd: root,
+				agentDir: root,
+				settings: Settings.isolated(),
+				sessionManager: SessionManager.inMemory(root),
+				hookPaths: [path.relative(root, configuredHook)],
+				skills: [],
+				rules: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				toolNames: ["__none__"],
+			});
+			try {
+				await session.extensionRunner?.emitToolCall({
+					type: "tool_call",
+					toolName: "read",
+					toolCallId: "configured-hook",
+					input: {},
+				});
+			} finally {
+				await session.dispose();
+			}
 			expect(await Bun.file(marker).text()).toBe("executed");
+			expect(await Bun.file(foreignMarker).exists()).toBe(false);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

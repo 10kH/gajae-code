@@ -386,8 +386,11 @@ function createHookExtensionFactory(hook: LoadedHook): ExtensionFactory {
 }
 
 /** Load normalized directory hooks and adapt them into the authoritative ExtensionRunner path. */
-export async function discoverAndLoadHookExtensions(cwd: string): Promise<LoadHookExtensionsResult> {
-	const loaded = await discoverAndLoadHooks([], cwd);
+export async function discoverAndLoadHookExtensions(
+	configuredPaths: string[],
+	cwd: string,
+): Promise<LoadHookExtensionsResult> {
+	const loaded = await discoverAndLoadHooks(configuredPaths, cwd);
 	return {
 		factories: loaded.hooks.map(hook => ({
 			factory: createHookExtensionFactory(hook),

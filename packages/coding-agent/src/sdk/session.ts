@@ -451,6 +451,8 @@ export interface CreateAgentSessionOptions {
 	extensions?: ExtensionFactory[];
 	/** Additional extension paths to load (merged with discovery). */
 	additionalExtensionPaths?: string[];
+	/** Explicit hook module paths to load in addition to native discovery. */
+	hookPaths?: string[];
 	/** Disable extension discovery (explicit paths still load). */
 	disableExtensionDiscovery?: boolean;
 	/**
@@ -2466,7 +2468,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		if (!options.disableExtensionDiscovery) {
 			try {
-				const hookExtensions = await discoverAndLoadHookExtensions(cwd);
+				const hookExtensions = await discoverAndLoadHookExtensions(options.hookPaths ?? [], cwd);
 				discoveredHookExtensions.push(...hookExtensions.factories);
 				for (const error of hookExtensions.errors) {
 					logger.warn("Rejected discovered hook", { path: error.path, error: error.error });
