@@ -794,6 +794,8 @@ export interface AgentSessionConfig {
 	providerSessionId?: string;
 	/** Optional auth-selection identity, distinct from logical/canonical and provider-cache identity. */
 	credentialSessionId?: string;
+	/** Opaque credential-store authority fingerprint for durable numeric session pins. */
+	credentialStoreIdentity?: string;
 	/** Optional provider-facing cache identity, distinct from logical session identity. */
 	providerCacheSessionId?: string;
 	/** Explicit provider affinity whose persisted transcript path scopes async ownership. */
@@ -2249,6 +2251,7 @@ export class AgentSession {
 	#ircRosterClaim: IrcRosterClaim | null = null;
 	#providerSessionId: string | undefined;
 	#credentialSessionId: string | undefined;
+	#credentialStoreIdentity: string | undefined;
 	#providerCacheSessionId: string | undefined;
 	readonly #asyncJobProviderSessionId: string | undefined;
 	#isDisposed = false;
@@ -3304,6 +3307,7 @@ export class AgentSession {
 		this.#agentRegistry = config.agentRegistry;
 		this.#providerSessionId = config.providerSessionId;
 		this.#credentialSessionId = config.credentialSessionId;
+		this.#credentialStoreIdentity = config.credentialStoreIdentity;
 		this.#providerCacheSessionId = config.providerCacheSessionId;
 		this.#asyncJobProviderSessionId = config.asyncJobProviderSessionId;
 		// Per-tool TTSR reminders are folded into the matched tool's result via this hook.
@@ -8506,6 +8510,9 @@ export class AgentSession {
 			scopeId,
 			provider,
 			pin: target.canonicalSelector,
+			...(target.canonicalSelector.kind === "id" && this.#credentialStoreIdentity
+				? { credentialStoreIdentity: this.#credentialStoreIdentity }
+				: {}),
 		});
 	}
 

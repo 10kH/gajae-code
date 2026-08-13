@@ -1551,7 +1551,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (entry.type !== "custom" || entry.customType !== "auth-credential-pin") continue;
 			const data = entry.data;
 			if (!data || typeof data !== "object") continue;
-			const record = data as { v?: unknown; scopeId?: unknown; provider?: unknown; pin?: unknown };
+			const record = data as {
+				v?: unknown;
+				scopeId?: unknown;
+				provider?: unknown;
+				pin?: unknown;
+				credentialStoreIdentity?: unknown;
+			};
 			if (record.v !== 1 || record.scopeId !== credentialSessionId || typeof record.provider !== "string") continue;
 			const pin = record.pin as { auto?: unknown; kind?: unknown; value?: unknown } | undefined;
 			// Durable replay must never abort session startup: a pinned account may
@@ -1567,6 +1573,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					(pin.kind === "id" || pin.kind === "email" || pin.kind === "account" || pin.kind === "project") &&
 					typeof pin.value === "string"
 				) {
+					if (pin.kind === "id" && record.credentialStoreIdentity !== startupAuthConfig?.credentialStoreIdentity) {
+						throw new Error("Durable numeric credential pin authority changed");
+					}
 					authStorage.setSessionCredentialSelector(credentialSessionId, record.provider, {
 						kind: pin.kind,
 						value: pin.value,
@@ -3620,6 +3629,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			asyncJobProviderSessionId: options.providerSessionId,
 			providerSessionId: options.providerSessionId,
 			credentialSessionId,
+			credentialStoreIdentity: startupAuthConfig?.credentialStoreIdentity,
 			providerCacheSessionId: providerSessionId,
 			forkContextSeed: options.forkContextSeed,
 			providerSessionState: options.providerSessionState,

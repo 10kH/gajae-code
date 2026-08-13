@@ -119,6 +119,7 @@ interface PersistedPresentation {
 interface PresentationSidecarFile {
 	version: 1;
 	authorities: Record<string, Record<string, PersistedPresentation>>;
+	sourceHealth?: Record<string, Record<string, CacheEntry>>;
 }
 
 function presentationRecordKey(provider: string, identityDigest: string): string {
@@ -176,6 +177,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	readonly #presentationAuthority: string;
 	#persistedPresentations = new Map<string, PersistedPresentation>();
 	#sidecarAuthorities: Record<string, Record<string, PersistedPresentation>> = {};
+	#persistedSourceHealth: Record<string, Record<string, CacheEntry>> = {};
 	#presentationReady: Promise<void>;
 	#presentationWriteChain: Promise<void> = Promise.resolve();
 	#closed = false;
@@ -236,6 +238,10 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 			const parsed = JSON.parse(raw) as Partial<PresentationSidecarFile>;
 			if (parsed.version !== PRESENTATION_SIDECAR_VERSION || !parsed.authorities) return;
 			this.#sidecarAuthorities = parsed.authorities;
+			this.#persistedSourceHealth = parsed.sourceHealth ?? {};
+			for (const [key, entry] of Object.entries(this.#persistedSourceHealth[this.#presentationAuthority] ?? {})) {
+				if (entry.expiresAtSec * 1000 > Date.now()) this.#cache.set(key, entry);
+			}
 			const records = this.#sidecarAuthorities[this.#presentationAuthority];
 			if (!records || typeof records !== "object") return;
 			const now = Date.now();
@@ -311,6 +317,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 						...this.#sidecarAuthorities,
 						[this.#presentationAuthority]: Object.fromEntries(this.#persistedPresentations),
 					},
+					sourceHealth: this.#persistedSourceHealth,
 				};
 				this.#sidecarAuthorities = parsed.authorities;
 				const directory = path.dirname(this.#presentationPath);
@@ -325,7 +332,9 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 				try {
 					await fs.writeFile(temporary, JSON.stringify(parsed), { flag: "wx", mode: 0o600 });
 					await fs.chmod(temporary, 0o600).catch(() => {});
-					await fs.rename(temporary, this.#presentationPath);
+					await fs.rename(temporary, this.#presentationPath).catch(error => {
+						if (!isEnoent(error)) throw error;
+					});
 				} finally {
 					await fs.unlink(temporary).catch(() => {});
 				}
@@ -801,7 +810,15 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	}
 
 	setCache(key: string, value: string, expiresAtSec: number): void {
-		this.#cache.set(key, { value, expiresAtSec });
+		const entry = { value, expiresAtSec };
+		this.#cache.set(key, entry);
+		if (key.startsWith("account_health:v1:source:")) {
+			this.#persistedSourceHealth[this.#presentationAuthority] = {
+				...(this.#persistedSourceHealth[this.#presentationAuthority] ?? {}),
+				[key]: entry,
+			};
+			this.#queuePresentationWrite();
+		}
 	}
 
 	cleanExpiredCache(): void {
@@ -1174,12 +1191,29 @@ function snapshotIdentityLabel(entry: SnapshotEntry): string | null {
 }
 
 function safePresentationUsageReport(report: UsageReport): SafeUsageReport {
+	const sanitize = (value: string): string =>
+		value
+			.replace(/bearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+			.replace(/(api[_-]?key|token|secret|authorization)[=:]\s*[^\s,;]+/gi, "$1=[redacted]")
+			.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, 160);
 	const { raw: _raw, metadata: _metadata, ...safe } = report;
 	return {
 		...safe,
 		limits: safe.limits.map(limit => {
 			const { accountId: _accountId, projectId: _projectId, orgId: _orgId, ...scope } = limit.scope;
-			return { ...limit, scope };
+			return {
+				...limit,
+				id: sanitize(limit.id),
+				label: sanitize(limit.label),
+				...(limit.window
+					? { window: { ...limit.window, id: sanitize(limit.window.id), label: sanitize(limit.window.label) } }
+					: {}),
+				...(limit.notes ? { notes: limit.notes.map(sanitize) } : {}),
+				scope,
+			};
 		}),
 	};
 }

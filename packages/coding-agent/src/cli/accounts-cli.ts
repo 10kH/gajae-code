@@ -222,7 +222,7 @@ async function writePersistentPin(
 		const patches: SettingsAtomicPatch[] = [{ path: "auth.credentialPins", op: "set", value: pins }];
 		const hasNumericPins = Object.values(pins).some(value => value.startsWith("id:"));
 		if (hasNumericPins) {
-			if (credentialStoreIdentity && existingStoreIdentity === credentialStoreIdentity) {
+			if (credentialStoreIdentity && (!existingStoreIdentity || existingStoreIdentity === credentialStoreIdentity)) {
 				patches.push({ path: "auth.credentialPinStoreIdentity", op: "set", value: credentialStoreIdentity });
 			} else if (!clear) {
 				throw new AccountsCommandError(
