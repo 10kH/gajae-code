@@ -1081,6 +1081,15 @@ export class SettingsSelectorComponent extends Container {
 					return;
 				}
 				if (def.path === "theme.dark" || def.path === "theme.light") {
+					// The theme commit persists through the controller, so it must honor
+					// the same invalid-config guard as every other durable write: report
+					// the repair error and leave the submenu open instead of no-oping.
+					if (!settings.canWriteDurableConfig()) {
+						this.callbacks.onError?.(
+							"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+						);
+						return;
+					}
 					if (!this.callbacks.onThemeCommit) return;
 					void this.callbacks.onThemeCommit(def.path, value, currentValue).then(accepted => {
 						if (accepted) done(value);
