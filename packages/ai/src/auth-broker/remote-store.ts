@@ -647,7 +647,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 		credentialId: number,
 		_credential: OAuthCredential,
 		signal?: AbortSignal,
-	): Promise<OAuthCredentials> {
+	): Promise<OAuthCredentials & { mcpBinding?: OAuthCredential["mcpBinding"] }> {
 		let entry: AuthCredentialSnapshotEntry;
 		try {
 			({ entry } = await this.#client.refreshCredential(credentialId, signal));
