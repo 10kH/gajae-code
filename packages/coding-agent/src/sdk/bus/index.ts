@@ -1249,8 +1249,6 @@ interface SessionRuntime {
 	};
 	/** Monotonic user-request boundary for deferred lean delivery. */
 	settlementWindow: number;
-	/** Provenance carried from an inbound message to the next assistant turn. */
-	nextTurnSettlementOrigin?: "user" | "autonomous";
 	/** Provenance of the currently executing assistant turn. */
 	currentTurnSettlementOrigin?: "user" | "autonomous" | "continuation";
 	/** Immutable settlement boundary captured when the current turn begins. */
@@ -8060,11 +8058,14 @@ export function createNotificationsExtension(
 	const isUserSettlementBoundary = (message: { role?: unknown; attribution?: unknown }): boolean =>
 		message.attribution === "user" || (message.role === "user" && message.attribution === undefined);
 
+	type SettlementOrigin = "user" | "autonomous" | "continuation";
+
 	const deferLeanReceipt = (
 		rt: SessionRuntime,
 		text: string,
 		messageRef?: string,
 		window: number = rt.currentTurnSettlementWindow ?? rt.settlementWindow,
+		origin: SettlementOrigin = rt.currentTurnSettlementOrigin ?? "continuation",
 	): void => {
 		if (window !== rt.settlementWindow) return;
 		const receipt = { text, ...(messageRef ? { messageRef } : {}) };
@@ -8073,7 +8074,7 @@ export function createNotificationsExtension(
 			rt.pendingSettled = { window, receipts: [receipt] };
 			return;
 		}
-		if (rt.currentTurnSettlementOrigin === "autonomous") {
+		if (origin === "autonomous") {
 			const prior = pending.receipts[pending.receipts.length - 1];
 			if (prior?.text === text) return;
 			// Keep the user-request receipt plus the newest autonomous outcome.
@@ -8112,7 +8113,7 @@ export function createNotificationsExtension(
 			// running so provisional-policy activation cannot reintroduce per-turn spam.
 			if (rt.verbosity === "lean" && rt.busy) {
 				for (const receipt of pending.receipts)
-					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window);
+					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window, receipt.origin);
 			} else {
 				const text = pending.receipts.map(receipt => receipt.text).join("\n\n");
 				const messageRef = pending.receipts.length === 1 ? pending.receipts[0]?.messageRef : undefined;
@@ -8161,7 +8162,6 @@ export function createNotificationsExtension(
 		// Streaming state is SDK-visible session truth (context.get isStreaming);
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
-		if (rt.currentTurnSettlementOrigin === undefined) rt.currentTurnSettlementOrigin = "continuation";
 		// A continuation re-enters the agent loop inside the same prompt and emits
 		// another `agent_start`. Only a queued follow-up's exact SDK token may
 		// claim its correlation; unrelated queue work must not consume it.
@@ -8195,12 +8195,10 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.turnSeq = (rt.turnSeq ?? 0) + 1;
-		rt.currentTurnSettlementOrigin = rt.nextTurnSettlementOrigin ?? "continuation";
-		// Direct user prompts are delivered after turn_start. Leave this unset until
-		// their message_end binds the opening turn; autonomous continuations inherit
-		// the stable window at their deferred write instead.
+		// Agent-loop prompts arrive after turn_start. The following non-assistant
+		// message binds this turn's provenance and boundary.
+		rt.currentTurnSettlementOrigin = undefined;
 		rt.currentTurnSettlementWindow = undefined;
-		rt.nextTurnSettlementOrigin = undefined;
 		if (!rt.notificationsActive) return;
 		// A new turn is live: re-open the live-stream window (see turnClosed).
 		rt.turnClosed = false;
@@ -8612,19 +8610,24 @@ export function createNotificationsExtension(
 		if (rt) {
 			const message = event.message as { role?: unknown; attribution?: unknown };
 			if (isUserSettlementBoundary(message)) {
-				rt.settlementWindow++;
-				rt.nextTurnSettlementOrigin = "user";
-				// Normal prompt lifecycle is agent_start → turn_start → user message_end.
-				// Bind only an opening turn: a later user input while a prior turn owns a
-				// boundary starts the next window without re-attributing stale output.
-				if (rt.currentTurnSettlementWindow === undefined) {
+				const openingTurn = rt.currentTurnSettlementOrigin === undefined;
+				const supersedingSettledTurn =
+					rt.currentTurnSettlementOrigin === "user" &&
+					(rt.pendingSettled !== undefined || rt.pendingFinal !== undefined);
+				// A provider batch can carry several user messages after one turn_start.
+				// They share that turn's boundary. A later user submission after the old
+				// turn has produced a receipt opens a new window but must not relabel the
+				// already-running turn as its response.
+				if (openingTurn || supersedingSettledTurn) rt.settlementWindow++;
+				if (openingTurn) {
 					rt.currentTurnSettlementWindow = rt.settlementWindow;
 					rt.currentTurnSettlementOrigin = "user";
 				}
 				rt.pendingSettled = undefined;
 				rt.pendingFinal = undefined;
-			} else if (message.role === "custom") {
-				rt.nextTurnSettlementOrigin = "autonomous";
+			} else if (message.role !== "assistant") {
+				rt.currentTurnSettlementWindow = rt.settlementWindow;
+				rt.currentTurnSettlementOrigin = "autonomous";
 			}
 		}
 		if (!rt?.notificationsActive || rt.redact) return;

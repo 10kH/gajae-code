@@ -542,11 +542,11 @@ test("lean preserves a user-request receipt when an autonomous continuation ackn
 		const { handlers, ctx, frames } = await setup();
 		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
 
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
 		await handlers.get("message_end")!(
 			{ type: "message_end", message: { role: "user", content: "Complete the request." } },
 			ctx,
 		);
-		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
 		await handlers.get("message_end")!(
 			{
 				type: "message_end",
@@ -563,12 +563,12 @@ test("lean preserves a user-request receipt when an autonomous continuation ackn
 			ctx,
 		);
 
-		// A background/subagent completion is a custom autonomous input, not a new user request.
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		// A background/subagent completion arrives after turn_start and is autonomous.
 		await handlers.get("message_end")!(
 			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
 			ctx,
 		);
-		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
 		await handlers.get("message_end")!(
 			{ type: "message_end", message: { role: "assistant", content: "Acknowledged background completion." } },
 			ctx,
@@ -663,11 +663,11 @@ test("an autonomous ask lead-in does not erase the prior user-request receipt", 
 			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Completion receipt." } },
 			ctx,
 		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
 		await handlers.get("message_end")!(
 			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
 			ctx,
 		);
-		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
 		await handlers.get("message_end")!(
 			{ type: "message_end", message: { role: "assistant", content: "Choose a follow-up action." } },
 			ctx,
@@ -725,6 +725,29 @@ test("a user-attributed custom message starts a new settlement window", async ()
 		await waitFor(() => turnStreams().length === 1, 3000, "user-attributed custom receipt");
 		expect(turnStreams()[0]!.text).toContain("Second receipt.");
 		expect(turnStreams()[0]!.text).not.toContain("First receipt.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("a batched user prompt shares one settlement window", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		for (const content of ["First batched input.", "Second batched input."])
+			await handlers.get("message_end")!({ type: "message_end", message: { role: "user", content } }, ctx);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Batched receipt." } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "batched receipt");
+		expect(turnStreams()[0]!.text).toContain("Batched receipt.");
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
@@ -811,12 +834,12 @@ test("lean bounds autonomous settlement composition to the receipt and latest ma
 		const { handlers, ctx, frames } = await setup();
 		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
 		const turn = async (turnIndex: number, text: string, autonomous = false): Promise<void> => {
+			await handlers.get("turn_start")!({ type: "turn_start", turnIndex }, ctx);
 			if (autonomous)
 				await handlers.get("message_end")!(
 					{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
 					ctx,
 				);
-			await handlers.get("turn_start")!({ type: "turn_start", turnIndex }, ctx);
 			await handlers.get("turn_end")!(
 				{ type: "turn_end", turnIndex, message: { role: "assistant", content: text } },
 				ctx,
