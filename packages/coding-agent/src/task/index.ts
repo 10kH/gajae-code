@@ -64,6 +64,7 @@ import { ArtifactManager } from "../session/artifacts";
 import { registerOwnedIfLineaged } from "../session/terminal-abort";
 import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
+import { loadBundledAgents } from "./agents";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
 import { createManagedTaskPersistence, renderSubagentUserPrompt, runSubprocess } from "./executor";
 import { adviseForkContextMode } from "./fork-context-advisory";
@@ -799,6 +800,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
 		const { agents } = await discoverAgents(session.cwd);
 		return new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
+	}
+
+	/** Create catalog metadata from bundled agents only, without ambient filesystem discovery. */
+	static async createForToolCatalog(session: ToolSession): Promise<TaskTool> {
+		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
+		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
+		return new TaskTool(session, loadBundledAgents(), publicRepositoryBinding(sessionRepositoryBinding));
 	}
 
 	/**
