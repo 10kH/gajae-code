@@ -5,6 +5,8 @@
 ## [0.13.2] - 2026-08-13
 
 ### Fixed
+- Non-finite overlay geometry can no longer turn frame padding into an infinite allocating loop on the main thread; margins, positions, offsets, and minimum widths now fall back to bounded terminal-relative values.
+
 - Kitty inline images are no longer deleted when live output moves their anchor above the viewport, so terminal-native scrollback keeps previously rendered images visible.
 
 - Fast double-Esc and triple-Esc sequences coalesced into one stdin chunk by tmux or SSH are now emitted as individual Escape presses, restoring draft-clear and selector gestures while preserving atomic Option-as-Meta sequences (#4312 by @Yeachan-Heo).
