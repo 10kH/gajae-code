@@ -55,7 +55,7 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 		expect(authority.stat("state.json")).toEqual({ ok: false, code: "closed" });
 	});
 
-	it("rejects traversal, symlinks, special files, and oversized content; accepts hard links", async () => {
+	it("rejects traversal, symlinks, special files, hard links, and oversized content", async () => {
 		const root = await temporaryDirectory();
 		const authority = openRecoveryFsRoot(root);
 		await fs.writeFile(path.join(root, "regular"), "trusted");
@@ -68,9 +68,7 @@ describe.skipIf(process.platform !== "linux")("native recovery filesystem author
 		expect(authority.stat("../outside")).toMatchObject({ ok: false, code: "invalid_path" });
 		expect(authority.read("link", 1024)).toMatchObject({ ok: false, code: "reparse_point" });
 		expect(authority.stat("receipt.fifo")).toMatchObject({ ok: false, code: "not_regular_file" });
-		const hardLinkStat = authority.stat("hard-link");
-		expect(hardLinkStat.ok).toBe(true);
-		if (hardLinkStat.ok) expect(hardLinkStat.identity?.nlink).toBe("2");
+		expect(authority.stat("hard-link")).toMatchObject({ ok: false, code: "hard_link" });
 		expect(authority.create("too-large", Buffer.alloc(64 * 1024 * 1024 + 1))).toMatchObject({
 			ok: false,
 			code: "content_too_large",

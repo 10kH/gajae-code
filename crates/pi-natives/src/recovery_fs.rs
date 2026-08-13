@@ -1881,6 +1881,9 @@ fn regular_identity(file: &File) -> Result<RecoveryFsIdentity, &'static str> {
 	if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
 		return Err("not_regular_file");
 	}
+	if stat.st_nlink != 1 {
+		return Err("hard_link");
+	}
 	Ok(RecoveryFsIdentity {
 		dev:      stat.st_dev.to_string(),
 		ino:      stat.st_ino.to_string(),
@@ -2086,6 +2089,9 @@ fn open_existing(root: &File, relative_path: &str, writable: bool) -> Result<Fil
 	if named.st_mode & libc::S_IFMT != libc::S_IFREG {
 		return Err("not_regular_file");
 	}
+	if named.st_nlink != 1 {
+		return Err("hard_link");
+	}
 	let flags = libc::O_CLOEXEC
 		| libc::O_NOFOLLOW
 		| if writable {
@@ -2195,6 +2201,9 @@ fn list_regular_descendants(
 				)?;
 			},
 			libc::S_IFREG => {
+				if metadata.st_nlink != 1 {
+					return Err("hard_link");
+				}
 				paths.push(relative_path);
 			},
 			libc::S_IFLNK => return Err("reparse_point"),

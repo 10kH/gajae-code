@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import type * as fs from "node:fs";
+import * as nodeFs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import { canContinuePersistedHistory } from "@gajae-code/agent-core";
@@ -59,9 +59,9 @@ interface ParsedSource {
 /** Read the explicit source file with fixed bounds. The source is never written. */
 async function readImportSource(sourcePath: string): Promise<{ text: string; bytes: number; sha256: string }> {
 	const resolved = path.resolve(sourcePath);
-	let stat: fs.Stats;
+	let handle: fsp.FileHandle;
 	try {
-		stat = await fsp.stat(resolved);
+		handle = await fsp.open(resolved, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);
 	} catch (error) {
 		const code = (error as NodeJS.ErrnoException).code;
 		if (code === "ENOENT") {
@@ -74,28 +74,66 @@ async function readImportSource(sourcePath: string): Promise<{ text: string; byt
 			{ retryable: true },
 		);
 	}
-	if (!stat.isFile()) {
-		throw new SessionImportError(
-			"invalid_request",
-			"read",
-			`Import source must be a regular file, not a directory or special file: ${sourcePath}`,
-		);
-	}
-	if (stat.size === 0) {
-		throw new SessionImportError("malformed_input", "parse", `Transcript file is empty: ${sourcePath}`);
-	}
-	if (stat.size > EXTERNAL_IMPORT_SOURCE_MAX_BYTES) {
-		throw new SessionImportError(
-			"content_too_large",
-			"read",
-			`Transcript is ${stat.size} bytes, exceeding the ${EXTERNAL_IMPORT_SOURCE_MAX_BYTES}-byte import limit. Export a shorter session or trim the file.`,
-			{ limitBytes: EXTERNAL_IMPORT_SOURCE_MAX_BYTES, observedBytes: stat.size },
-		);
-	}
-	let text: string;
 	try {
-		text = await fsp.readFile(resolved, "utf8");
+		const initial = await handle.stat({ bigint: true });
+		if (!initial.isFile()) {
+			throw new SessionImportError(
+				"invalid_request",
+				"read",
+				`Import source must be a regular file, not a directory or special file: ${sourcePath}`,
+			);
+		}
+		if (initial.size === 0n) {
+			throw new SessionImportError("malformed_input", "parse", `Transcript file is empty: ${sourcePath}`);
+		}
+		if (initial.size > BigInt(EXTERNAL_IMPORT_SOURCE_MAX_BYTES)) {
+			throw new SessionImportError(
+				"content_too_large",
+				"read",
+				`Transcript is ${initial.size} bytes, exceeding the ${EXTERNAL_IMPORT_SOURCE_MAX_BYTES}-byte import limit. Export a shorter session or trim the file.`,
+				{ limitBytes: EXTERNAL_IMPORT_SOURCE_MAX_BYTES, observedBytes: Number(initial.size) },
+			);
+		}
+		const bytes = Buffer.alloc(Number(initial.size));
+		let offset = 0;
+		while (offset < bytes.length) {
+			const read = await handle.read(bytes, offset, bytes.length - offset, offset);
+			if (read.bytesRead === 0) break;
+			offset += read.bytesRead;
+		}
+		if (offset !== bytes.length) {
+			throw new SessionImportError(
+				"source_changed",
+				"read",
+				"The transcript file changed while it was being read.",
+				{
+					retryable: true,
+				},
+			);
+		}
+		const terminal = await handle.stat({ bigint: true });
+		if (
+			terminal.dev !== initial.dev ||
+			terminal.ino !== initial.ino ||
+			terminal.nlink !== initial.nlink ||
+			terminal.size !== initial.size ||
+			terminal.mtimeNs !== initial.mtimeNs ||
+			terminal.ctimeNs !== initial.ctimeNs
+		) {
+			throw new SessionImportError(
+				"source_changed",
+				"read",
+				"The transcript file changed while it was being read. Re-export or retry with a stable file.",
+				{ retryable: true },
+			);
+		}
+		return {
+			text: bytes.toString("utf8"),
+			bytes: bytes.length,
+			sha256: createHash("sha256").update(bytes).digest("hex"),
+		};
 	} catch (error) {
+		if (error instanceof SessionImportError) throw error;
 		const code = (error as NodeJS.ErrnoException).code;
 		throw new SessionImportError(
 			"source_unreadable",
@@ -103,36 +141,9 @@ async function readImportSource(sourcePath: string): Promise<{ text: string; byt
 			`Transcript file cannot be read (${code ?? "unknown error"}): ${sourcePath}`,
 			{ retryable: true },
 		);
+	} finally {
+		await handle.close().catch(() => {});
 	}
-	const bytes = Buffer.byteLength(text, "utf8");
-	if (bytes > EXTERNAL_IMPORT_SOURCE_MAX_BYTES) {
-		throw new SessionImportError(
-			"content_too_large",
-			"read",
-			`Transcript is ${bytes} bytes, exceeding the ${EXTERNAL_IMPORT_SOURCE_MAX_BYTES}-byte import limit.`,
-			{ limitBytes: EXTERNAL_IMPORT_SOURCE_MAX_BYTES, observedBytes: bytes },
-		);
-	}
-	let after: fs.Stats;
-	try {
-		after = await fsp.stat(resolved);
-	} catch {
-		throw new SessionImportError(
-			"source_changed",
-			"read",
-			"The transcript file changed while it was being read. Re-export or retry with a stable file.",
-			{ retryable: true },
-		);
-	}
-	if (after.size !== stat.size || after.mtimeMs !== stat.mtimeMs || after.ino !== stat.ino) {
-		throw new SessionImportError(
-			"source_changed",
-			"read",
-			"The transcript file changed while it was being read. Re-export or retry with a stable file.",
-			{ retryable: true },
-		);
-	}
-	return { text, bytes, sha256: createHash("sha256").update(text, "utf8").digest("hex") };
 }
 
 function parseDetectedFormat(detection: ReturnType<typeof detectSessionImportFormat>, text: string): ParsedSource {
