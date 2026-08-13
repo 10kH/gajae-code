@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
-import { prompt } from "@gajae-code/utils";
+import { formatDuration, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
@@ -447,23 +447,47 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		const nowMs = this.#livenessNowMs ?? Date.now;
 		let lastEmitMs = nowMs();
 		let lastEmittedSignature: string | undefined;
+		let streamingDisabled = false;
+		let stopProgressTimer = (): void => {};
 		const emitIfChanged = (force: boolean): void => {
-			if (!onUpdate) return;
-			const result = this.#progressResult(manager, records, true);
-			const signature = subagentAwaitRenderedStateSignature(result.details?.subagents ?? []);
-			const t = nowMs();
-			const livenessDue = force || t - lastEmitMs >= livenessIntervalMs;
-			if (!livenessDue && signature === lastEmittedSignature) return;
-			lastEmittedSignature = signature;
-			lastEmitMs = t;
-			onUpdate(result);
+			if (!onUpdate || streamingDisabled) return;
+			try {
+				const result = this.#progressResult(manager, records, true);
+				const signature = subagentAwaitRenderedStateSignature(result.details?.subagents ?? []);
+				const t = nowMs();
+				const livenessDue = force || t - lastEmitMs >= livenessIntervalMs;
+				if (!livenessDue && signature === lastEmittedSignature) return;
+				lastEmittedSignature = signature;
+				lastEmitMs = t;
+				onUpdate(result);
+			} catch (error) {
+				// The liveness timer fires outside this function's promise chain, so a
+				// throwing progress consumer would otherwise escape `setInterval` as an
+				// uncaught exception, leave the wait's cleanup unreached, and let the
+				// interval keep firing and rethrowing for the rest of the await. Retire
+				// the streaming channel instead and keep waiting: losing progress output
+				// is recoverable, losing the timer and the watch registration is not.
+				streamingDisabled = true;
+				stopProgressTimer();
+				logger.warn("Subagent await progress update failed; streaming disabled for this wait", {
+					error: String(error),
+				});
+			}
 		};
-		const progressTimer =
-			onUpdate && heartbeatMs > 0 ? setInterval(() => emitIfChanged(false), heartbeatMs) : undefined;
-		emitIfChanged(true);
+		// The initial emission and the timer own process-lifetime resources together
+		// with the watch registration and the terminal-wait handle, so they all live
+		// inside one guarded span rather than straddling it.
+		let progressTimer: Timer | undefined;
 		let waitOutcome: "completed" | "timed_out_wait" | "interrupted";
 		let onAbort: (() => void) | undefined;
+		let terminalJobIds: string[] | undefined;
 		try {
+			progressTimer = onUpdate && heartbeatMs > 0 ? setInterval(() => emitIfChanged(false), heartbeatMs) : undefined;
+			stopProgressTimer = () => {
+				if (progressTimer) clearInterval(progressTimer);
+				progressTimer = undefined;
+			};
+			emitIfChanged(true);
 			const abortPromise = new Promise<"interrupted">(resolve => {
 				onAbort = () => resolve("interrupted");
 				if (signal?.aborted) onAbort();
@@ -477,14 +501,16 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 							Bun.sleep(timeoutMs).then(() => "timed_out_wait" as const),
 							abortPromise,
 						]);
+			if (waitOutcome === "completed") {
+				terminalJobIds = (await handle.result).terminalJobIds;
+				handle.acknowledge(terminalJobIds);
+			}
 		} finally {
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
-			if (progressTimer) clearInterval(progressTimer);
+			stopProgressTimer();
+			manager.unwatchJobs(watchedJobIds);
+			handle.close();
 		}
-		const waitResult = waitOutcome === "completed" ? await handle.result : undefined;
-		if (waitOutcome === "completed") handle.acknowledge(waitResult?.terminalJobIds);
-		manager.unwatchJobs(watchedJobIds);
-		handle.close();
 		const awaitOutcome: SubagentAwaitOutcome =
 			waitOutcome === "completed" ? "completed" : waitOutcome === "timed_out_wait" ? "timed_out" : "interrupted";
 		const finalRecords = this.#visibleRecordsByIds(
@@ -501,7 +527,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			awaitOutcome,
 			waitOutcome,
 			condition,
-			terminalIds: waitResult?.terminalJobIds,
+			terminalIds: terminalJobIds,
 		});
 	}
 
@@ -603,11 +629,10 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		records: SubagentRecord[],
 		attachLiveProgress = false,
 	): AgentToolResult<SubagentToolDetails> {
+		const subagents = this.#recordSnapshots(manager, records, false, "receipt", new Set(), attachLiveProgress);
 		return {
-			content: [{ type: "text", text: "" }],
-			details: {
-				subagents: this.#recordSnapshots(manager, records, false, "receipt", new Set(), attachLiveProgress),
-			},
+			content: [{ type: "text", text: awaitProgressSummary(subagents) }],
+			details: { subagents },
 		};
 	}
 
@@ -853,6 +878,27 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			guidance,
 		};
 	}
+}
+
+/**
+ * Human-readable line for streamed `await` progress.
+ *
+ * Consumers that render structured content (ACP) previously received an empty
+ * text block here, which made `extractStructuredText` fail and the mapper fall
+ * back to serializing the whole result object as the human-readable content. A
+ * real sentence keeps the elapsed time legible there and in any log that only
+ * shows tool text.
+ */
+function awaitProgressSummary(subagents: readonly SubagentSnapshot[]): string {
+	const waiting = subagents.filter(snapshot => !isTerminalStatus(snapshot.status));
+	if (waiting.length === 0) return "";
+	// Accumulate rather than spreading into Math.max: explicit `ids` are not
+	// capped by MAX_LIST_LIMIT, so a large await would hit the argument limit.
+	let longestMs = 0;
+	for (const snapshot of waiting) if (snapshot.durationMs > longestMs) longestMs = snapshot.durationMs;
+	return `Awaiting ${waiting.length} subagent(s) for ${formatDuration(longestMs)}: ${waiting
+		.map(snapshot => snapshot.id)
+		.join(", ")}`;
 }
 
 function isTerminalStatus(status: SubagentStatus): boolean {
