@@ -1,0 +1,46 @@
+name: PR contract
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-contract-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate exact-head PR contract
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+      - name: Check out trusted validator from immutable event base
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 1
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted-base
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.3.14"
+      - name: Validate body, exact head, immutable base, reviewer, and fast gate
+        env:
+          GITHUB_ACTOR: ${{ github.event.pull_request.user.login }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          validator=trusted-base/scripts/verify-pr-verdict.ts
+          if [ ! -f "$validator" ]; then
+            echo "Trusted base predates the PR contract validator; using the proposed validator for this one-time bootstrap. Future PRs always execute the immutable base copy."
+            validator=pr-head/scripts/verify-pr-verdict.ts
+          fi
+          bun "$validator" --event "$GITHUB_EVENT_PATH" --repo pr-head --trusted-root trusted-base
