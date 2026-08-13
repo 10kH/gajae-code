@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Print mode now requests a governed process exit after successful session teardown, so completed one-shot runs cannot be pinned by residual runtime handles; both stdout and stderr are drained first and the recorded exit code is preserved.
+
 ## [0.13.2] - 2026-08-13
 
 ### Added
