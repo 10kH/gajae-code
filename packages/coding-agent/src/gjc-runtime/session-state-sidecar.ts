@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@gajae-code/ai/core";
 import { normalizePathForComparison, postmortem } from "@gajae-code/utils";
 import { withFileLock } from "../config/file-lock";
-import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
+import { syncCoordinatorDirectory, syncCoordinatorFile, writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { reduceTerminalReceiptState } from "../sdk/receipt-state";
 import { TOOL_CATALOG } from "../tools/tool-catalog.generated";
 import { sessionRoot, sessionRuntimeDir } from "./session-layout";
@@ -668,9 +668,16 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 	);
 	try {
 		await fs.mkdir(path.dirname(readinessFile), { recursive: true });
-		await fs.writeFile(tempFile, `${JSON.stringify(marker)}\n`, { flag: "wx" });
+		const handle = await fs.open(tempFile, "wx", 0o600);
+		try {
+			await handle.writeFile(`${JSON.stringify(marker)}\n`);
+			await syncCoordinatorFile(handle);
+		} finally {
+			await handle.close();
+		}
 		try {
 			await fs.link(tempFile, readinessFile);
+			await syncCoordinatorDirectory(path.dirname(readinessFile));
 		} catch (error) {
 			if ((error as { code?: unknown }).code !== "EEXIST") throw runtimeReadinessMarkerConflict();
 			const raced = await readRuntimeInputReadyMarker(readinessFile);

@@ -126,7 +126,7 @@ async function writeExclusive(file: string, value: unknown): Promise<boolean> {
 	try {
 		await fs.link(temp, file);
 	} catch (error) {
-		await fs.unlink(temp).catch(() => {});
+		await fs.unlink(temp);
 		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
 			await syncCoordinatorDirectory(path.dirname(file));
 			return false;
