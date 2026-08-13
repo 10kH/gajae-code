@@ -764,6 +764,58 @@ function managedAttemptSnapshot<T>(value: T): T {
 	return managedAttemptSnapshotDetailed(value).snapshot;
 }
 
+const NON_CLONEABLE = Symbol("non-cloneable");
+
+/**
+ * Detach unmanaged provider metadata without normalizing the cloneable parts.
+ * A failed subtree is removed at its own property boundary; siblings retain
+ * their exact structured-clone representation. The bounded recursive path is
+ * used only after cloning the complete value fails.
+ */
+function losslessDetachedClone<T>(value: T): T {
+	try {
+		return structuredClone(value);
+	} catch {
+		let budget = MANAGED_SNAPSHOT_MAX_NODES;
+		const seen = new Map<object, unknown>();
+		const clone = (input: unknown): unknown | typeof NON_CLONEABLE => {
+			if (budget-- <= 0) return NON_CLONEABLE;
+			if (typeof input === "function" || typeof input === "symbol") return NON_CLONEABLE;
+			if (input === null || typeof input !== "object") return input;
+			if (nodeUtilTypes.isProxy(input)) return NON_CLONEABLE;
+			const prior = seen.get(input);
+			if (prior !== undefined) return prior;
+			try {
+				return structuredClone(input);
+			} catch {
+				// Only recurse into ordinary records/arrays. Host objects such as live
+				// Headers are stripped as one surface rather than flattened into a
+				// misleading normalized representation.
+				if (!Array.isArray(input)) {
+					const prototype = Object.getPrototypeOf(input);
+					if (prototype !== Object.prototype && prototype !== null) return NON_CLONEABLE;
+				}
+				const output: unknown[] | Record<string, unknown> = Array.isArray(input) ? [] : {};
+				seen.set(input, output);
+				for (const key of Object.keys(input)) {
+					const descriptor = Object.getOwnPropertyDescriptor(input, key);
+					if (!descriptor || !("value" in descriptor)) continue;
+					const child = clone(descriptor.value);
+					if (child !== NON_CLONEABLE) {
+						(output as Record<string, unknown>)[key] = child;
+					}
+				}
+				return output;
+			}
+		};
+		const cloned = clone(value);
+		if (cloned === NON_CLONEABLE) {
+			throw new ManagedAttemptSnapshotError();
+		}
+		return cloned as T;
+	}
+}
+
 /**
  * Recover the required assistant-message shell when a managed snapshot degrades
  * at its root (notably for Proxy-wrapped provider messages). Only known fields
@@ -1016,6 +1068,10 @@ class ManagedAttemptTransaction {
 		return this.#committed;
 	}
 
+	acceptedAssistantSnapshot(message: AssistantMessage): AssistantMessage {
+		return this.#assistantSnapshot(message);
+	}
+
 	discard(): void {
 		this.#batch = [];
 		this.#stagedBytes = 0;
@@ -1114,12 +1170,7 @@ class ManagedAttemptTransaction {
 	}
 
 	#losslessSnapshot<T>(value: T): T {
-		try {
-			return structuredClone(value);
-		} catch {
-			this.discard();
-			throw new ManagedAttemptSnapshotError();
-		}
+		return losslessDetachedClone(value);
 	}
 
 	#assistantSnapshot(message: AssistantMessage): AssistantMessage {
@@ -1967,11 +2018,21 @@ async function runLoopBody(
 			// One provider invocation is committed before any tool can run.
 			transaction?.flush();
 			if (escapedToolTransaction) {
+				const acceptedMessage = escapedToolTransaction.acceptedAssistantSnapshot(message);
+				const acceptedIndex = currentContext.messages.lastIndexOf(message);
+				if (acceptedIndex >= 0) currentContext.messages[acceptedIndex] = acceptedMessage;
+				const producedIndex = newMessages.lastIndexOf(message);
+				if (producedIndex >= 0) newMessages[producedIndex] = acceptedMessage;
+				message = acceptedMessage;
 				// Tool-call updates are staged so an escaped turn can disappear
 				// atomically. Once accepted, drain every published update through the
 				// Agent/AgentSession consumers before dispatch: streaming edit guards
 				// can then abort the run before any tool execute() is entered.
-				if (!loopSignal.aborted && stream.hasActiveConsumer) await stream.waitForConsumerDrain(loopSignal);
+				if (message.stopReason !== "aborted" && message.stopReason !== "error") {
+					if (loopSignal.aborted) break;
+					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(loopSignal);
+					if (loopSignal.aborted) break;
+				}
 			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
