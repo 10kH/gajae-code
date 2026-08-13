@@ -253,8 +253,11 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * Generation 160 introduces provider-local Telegram subscriptions, detached
  * cleanup, stable topic bindings, and explicit archive authority. Older daemons
  * retain attachment-level lifecycle coupling and may not serve this contract.
+ * Generation 161 completes that authority split: archive reasons and cleanup
+ * receipts are durable, topic recovery no longer reconstructs SDK endpoint
+ * authority, and replay generation cannot mutate lifecycle authority.
  */
-export const DAEMON_GENERATION = 160;
+export const DAEMON_GENERATION = 161;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
