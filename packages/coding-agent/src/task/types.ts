@@ -634,7 +634,6 @@ export interface TaskRoutingEvidence {
 	tier: "fast" | "balanced" | "strong";
 	requestedTier?: "fast" | "balanced" | "strong";
 	defaultTierApplied?: true;
-	source: "tiers" | { preset: string };
 	requestedSelector: string;
 	authResolvedModel?: string;
 	effectiveModel?: string;

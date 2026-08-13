@@ -19,9 +19,10 @@ import {
 	type AutoroutingSetup,
 	autoroutingProviderOrderHint,
 	evaluateAutoroutingProvenanceState,
-	resolveTierMap,
+	normalizeTierMap,
 	validateAutoroutingSetup,
 } from "../../config/autorouting-contract";
+
 import { isModelProfileProviderAvailable } from "../../config/model-profile-contract";
 import {
 	getModelProfilePresentation,
@@ -1644,7 +1645,7 @@ export class ModelSelectorComponent extends Container {
 			return;
 		}
 		const preview = this.#smartRoutingPreview(setup);
-		const tiers = resolveTierMap({ tiers: this.#settings.get("task.autorouting.tiers") });
+		const tiers = normalizeTierMap(this.#settings.get("task.autorouting.tiers"));
 		const provenance = this.#settings.get("task.autorouting.provenance");
 		this.#viewMode = "smart-routing";
 		this.#smartRoutingPanel = new SmartRoutingPanelComponent({
@@ -1652,7 +1653,6 @@ export class ModelSelectorComponent extends Container {
 			tiers,
 			provenance,
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
-			preset: this.#settings.get("task.autorouting.preset"),
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			readOnly: this.#smartRoutingReadOnly(),
 			stale: this.#smartRoutingIsStale(),
@@ -1687,10 +1687,9 @@ export class ModelSelectorComponent extends Container {
 		const preview = this.#smartRoutingPreview(setup);
 		panel.refreshState({
 			setup,
-			tiers: resolveTierMap({ tiers: this.#settings.get("task.autorouting.tiers") }),
+			tiers: normalizeTierMap(this.#settings.get("task.autorouting.tiers")),
 			provenance: this.#settings.get("task.autorouting.provenance"),
 			enabled: this.#settings.get("task.autorouting.enabled") === true,
-			preset: this.#settings.get("task.autorouting.preset"),
 			providerOrderHint: this.#providerOrderHintFor(setup.providers),
 			stale: this.#smartRoutingIsStale(),
 			preview,
