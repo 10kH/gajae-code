@@ -265,11 +265,11 @@ export function parseGhPrCreate(command: string): { bodyFile?: string; body?: st
 	return result;
 }
 
-async function validatePreflight(command: string, cwd: string, trustedRoot: string): Promise<PrValidationResult> {
+async function validatePreflight(command: string, cwd: string, trustedRoot: string, invocationCwd: string): Promise<PrValidationResult> {
 	const parsed = parseGhPrCreate(command);
 	if (parsed === null) return { ok: true, diagnostics: [] };
 	if (!parsed.bodyFile && parsed.body === undefined) return { ok: false, diagnostics: ["gh pr create must provide --body-file or --body so the PR verdict can be validated before submission."] };
-	const body = parsed.bodyFile ? await Bun.file(path.resolve(cwd, parsed.bodyFile)).text().catch(() => "") : parsed.body!;
+	const body = parsed.bodyFile ? await Bun.file(path.resolve(invocationCwd, parsed.bodyFile)).text().catch(() => "") : parsed.body!;
 	const baseRef = parsed.base ?? "dev";
 	const refreshBase = await git(["fetch", "--no-tags", "origin", "dev"], cwd);
 	if (refreshBase.exitCode !== 0) {
@@ -288,14 +288,16 @@ async function validatePreflight(command: string, cwd: string, trustedRoot: stri
 export async function main(argv: string[]): Promise<number> {
 	const repoIndex = argv.indexOf("--repo");
 	const trustedRootIndex = argv.indexOf("--trusted-root");
+	const invocationCwdIndex = argv.indexOf("--invocation-cwd");
 	const cwd = path.resolve(process.cwd(), repoIndex >= 0 && argv[repoIndex + 1] ? argv[repoIndex + 1]! : ".");
 	const trustedRoot = path.resolve(process.cwd(), trustedRootIndex >= 0 && argv[trustedRootIndex + 1] ? argv[trustedRootIndex + 1]! : ".");
+	const invocationCwd = path.resolve(process.cwd(), invocationCwdIndex >= 0 && argv[invocationCwdIndex + 1] ? argv[invocationCwdIndex + 1]! : cwd);
 	const eventIndex = argv.indexOf("--event");
 	const preflightIndex = argv.indexOf("--preflight-command");
 	const result = eventIndex >= 0 && argv[eventIndex + 1]
 		? await validateEvent(path.resolve(process.cwd(), argv[eventIndex + 1]!), cwd, trustedRoot)
 		: preflightIndex >= 0 && argv[preflightIndex + 1]
-			? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot)
+			? await validatePreflight(argv[preflightIndex + 1]!, cwd, trustedRoot, invocationCwd)
 			: { ok: false, diagnostics: ["Usage: bun scripts/verify-pr-verdict.ts --event <github-event.json> | --preflight-command <command>"] };
 	for (const diagnostic of result.diagnostics) console.error(`::error::${diagnostic}`);
 	if (result.ok && result.verdict) console.log(`PR contract valid: ${result.verdict.verdict} ${result.verdict.diffSha256}`);

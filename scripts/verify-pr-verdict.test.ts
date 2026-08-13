@@ -103,6 +103,11 @@ test("canonicalDiffSha256 hashes exact bytes", () => {
 	expect(canonicalDiffSha256("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 });
 
+test("hook keeps repository root separate from nested invocation cwd", async () => {
+	const hook = await Bun.file(new URL("../docs/examples/gjc-hooks/pre/bash.ts", import.meta.url)).text();
+	expect(hook).toContain('"--repo", repositoryRoot, "--invocation-cwd", invocationCwd');
+});
+
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("pull_request_target:");
