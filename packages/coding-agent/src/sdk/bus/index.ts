@@ -7654,7 +7654,11 @@ export function createNotificationsExtension(
 			runtime.redact = policy.redact;
 			runtime.verbosity = policy.verbosity;
 			runtime.stream = policy.stream;
-			if (redactionEnabled) terminalizeInFlightTools(runtime, runtime.id, "cancelled", true);
+			if (redactionEnabled) {
+				runtime.pendingFinal = undefined;
+				runtime.pendingSettled = undefined;
+				terminalizeInFlightTools(runtime, runtime.id, "cancelled", true);
+			}
 			else if (wasPolicySuspended && !policy.redact) settleProvisionalToolTerminals(runtime, runtime.id);
 		},
 		activate: binding => {
@@ -8571,12 +8575,13 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
 		if (rt) {
-			if ((event.message as { role?: unknown }).role === "user") {
+			const message = event.message as { role?: unknown; attribution?: unknown };
+			if (message.role === "user" || (message.role === "custom" && message.attribution === "user")) {
 				rt.settlementWindow++;
 				rt.nextTurnSettlementOrigin = "user";
 				rt.pendingSettled = undefined;
 				rt.pendingFinal = undefined;
-			} else if ((event.message as { role?: unknown }).role === "custom") {
+			} else if (message.role === "custom") {
 				rt.nextTurnSettlementOrigin = "autonomous";
 			}
 		}

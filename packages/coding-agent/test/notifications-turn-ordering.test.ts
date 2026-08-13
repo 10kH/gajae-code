@@ -593,6 +593,46 @@ test("lean preserves a user-request receipt when an autonomous continuation ackn
 	}
 }, 30000);
 
+test("a user-attributed custom message starts a new settlement window", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "First request." } },
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "First receipt." } },
+			ctx,
+		);
+
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: { role: "custom", customType: "skill-prompt", attribution: "user", content: "Second request." },
+			},
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "Second receipt." } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "user-attributed custom receipt");
+		expect(turnStreams()[0]!.text).toContain("Second receipt.");
+		expect(turnStreams()[0]!.text).not.toContain("First receipt.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 test("a new user request supersedes the preceding lean settlement window", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
