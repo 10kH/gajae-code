@@ -2,7 +2,12 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { appendCrashEvent, type CrashEvent, computeCrashFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
+import {
+	appendCrashEvent,
+	type CrashOccurrenceEvent,
+	computeCrashFingerprint,
+	formatCrashRecordMarker,
+} from "@gajae-code/utils";
 import {
 	CRASH_INDEX_MAX_SIGNATURES,
 	type CrashStatePaths,
@@ -28,7 +33,7 @@ async function tempPaths(): Promise<CrashStatePaths> {
 	};
 }
 
-function occurrence(fingerprint: string, recordId: string, at = NOW): CrashEvent {
+function occurrence(fingerprint: string, recordId: string, at = NOW): CrashOccurrenceEvent {
 	return {
 		kind: "occurrence",
 		fingerprint,
@@ -79,6 +84,20 @@ describe("compactCrashIndex", () => {
 		// Re-running with an empty journal must not change counts.
 		const again = await compactCrashIndex({ paths, now: NOW });
 		expect(again.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(8);
+	});
+
+	it("deduplicates a replayed rotated journal containing more than the recent id window", async () => {
+		const paths = await tempPaths();
+		const rotated = `${paths.events}.compacting-replay`;
+		for (let seed = 0; seed < 300; seed++)
+			appendCrashEvent(occurrence(fingerprintFor(40), recordId(40_000 + seed)), rotated);
+		const first = await compactCrashIndex({ paths, now: NOW });
+		expect(first.signatures[fingerprintFor(40)]?.lifetimeCount).toBe(300);
+		// Simulate publish-before-delete by recreating the exact rotated batch.
+		const journal = Array.from({ length: 300 }, (_, seed) => occurrence(fingerprintFor(40), recordId(40_000 + seed)));
+		for (const event of journal) appendCrashEvent(event, rotated);
+		const replayed = await compactCrashIndex({ paths, now: NOW });
+		expect(replayed.signatures[fingerprintFor(40)]?.lifetimeCount).toBe(300);
 	});
 
 	it("recovers a complete fingerprint-bound v1 record when its journal append was lost", async () => {
@@ -173,6 +192,25 @@ describe("compactCrashIndex", () => {
 		);
 		const index = await compactCrashIndex({ paths, now: NOW });
 		expect(index.retiredFingerprints).toContain(fingerprintFor(204));
+	});
+
+	it("fails closed when the retirement sidecar exists but is unreadable", async () => {
+		const paths = await tempPaths();
+		await fs.mkdir(`${paths.index}.retired`);
+		await expect(compactCrashIndex({ paths, now: NOW })).rejects.toThrow("Crash retirement ledger is unreadable");
+	});
+
+	it("keeps latest journal record metadata by timestamp rather than append order", async () => {
+		const paths = await tempPaths();
+		appendCrashEvent({ ...occurrence(fingerprintFor(41), recordId(410), NOW), messageClass: "newest" }, paths.events);
+		appendCrashEvent(
+			{ ...occurrence(fingerprintFor(41), recordId(411), NOW - 1000), messageClass: "older" },
+			paths.events,
+		);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[fingerprintFor(41)]?.lastSeen).toBe(NOW);
+		expect(index.signatures[fingerprintFor(41)]?.lastRecordId).toBe(recordId(410));
+		expect(index.signatures[fingerprintFor(41)]?.messageClass).toBe("newest");
 	});
 
 	it("supersedes retirement when a new journal occurrence revives the signature", async () => {
@@ -438,6 +476,7 @@ describe("parseCrashIndex", () => {
 		lastNudgedAt: 0,
 		overflow: false,
 		recentEventIds: [recordId(1)],
+		recentJournalDigests: [],
 		retiredFingerprints: [],
 		signatures: {
 			[fingerprintFor(1)]: {

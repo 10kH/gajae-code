@@ -12,7 +12,7 @@
  * v1 crash record whose fingerprint recomputes from its own diagnostic text.
  * Evicted reported or acknowledged signatures stay durably retired.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -42,6 +42,8 @@ export const CRASH_INDEX_MAX_SIGNATURES = 128;
 export const CRASH_INDEX_MAX_QUARANTINE = 3;
 /** Dedupe window for occurrence ids, so a re-merged journal cannot double-count. */
 const RECENT_EVENT_ID_LIMIT = 256;
+/** Whole rotated-journal digests retained to make publish-before-delete replay idempotent. */
+const RECENT_JOURNAL_DIGEST_LIMIT = 64;
 /** Timestamps outside this window are hostile-but-valid JSON and are rejected. */
 const MIN_TIMESTAMP_MS = Date.UTC(2020, 0, 1);
 const MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
@@ -82,6 +84,7 @@ export interface CrashIndex {
 	/** True when a new signature could not be stored because nothing was evictable. */
 	overflow: boolean;
 	recentEventIds: string[];
+	recentJournalDigests: string[];
 	/** Reported or acknowledged signatures evicted from the index; never recovered from the log. */
 	retiredFingerprints: string[];
 	signatures: Record<string, CrashSignatureEntry>;
@@ -113,6 +116,7 @@ export function emptyCrashIndex(): CrashIndex {
 		lastNudgedAt: 0,
 		overflow: false,
 		recentEventIds: [],
+		recentJournalDigests: [],
 		retiredFingerprints: [],
 		signatures: Object.create(null) as Record<string, CrashSignatureEntry>,
 	};
@@ -142,6 +146,7 @@ const INDEX_KEYS = new Set([
 	"lastNudgedAt",
 	"overflow",
 	"recentEventIds",
+	"recentJournalDigests",
 	"retiredFingerprints",
 	"signatures",
 ]);
@@ -253,6 +258,12 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 	if (typeof body.overflow !== "boolean") return undefined;
 	if (!Array.isArray(body.recentEventIds) || body.recentEventIds.length > RECENT_EVENT_ID_LIMIT) return undefined;
 	if (!body.recentEventIds.every(id => typeof id === "string" && /^[0-9a-f]{8,32}$/.test(id))) return undefined;
+	if (body.recentJournalDigests !== undefined) {
+		if (!Array.isArray(body.recentJournalDigests) || body.recentJournalDigests.length > RECENT_JOURNAL_DIGEST_LIMIT)
+			return undefined;
+		if (!body.recentJournalDigests.every(digest => typeof digest === "string" && /^[0-9a-f]{64}$/.test(digest)))
+			return undefined;
+	}
 	if (body.retiredFingerprints !== undefined) {
 		if (!Array.isArray(body.retiredFingerprints) || body.retiredFingerprints.length > CRASH_INDEX_MAX_SIGNATURES)
 			return undefined;
@@ -281,6 +292,7 @@ export function parseCrashIndex(raw: string, now: number = Date.now()): CrashInd
 		lastNudgedAt: body.lastNudgedAt as number,
 		overflow: body.overflow,
 		recentEventIds: [...(body.recentEventIds as string[])],
+		recentJournalDigests: [...((body.recentJournalDigests as string[] | undefined) ?? [])],
 		retiredFingerprints: [...((body.retiredFingerprints as string[] | undefined) ?? [])],
 		signatures,
 	};
@@ -340,9 +352,11 @@ async function quarantineIndex(indexPath: string, now: number): Promise<string |
 	return target;
 }
 
-async function readRetiredFingerprints(indexPath: string): Promise<string[]> {
-	const raw = await readNoFollow(retiredIndexPath(indexPath), CRASH_LOG_SCAN_MAX_BYTES);
-	return raw === undefined ? [] : (parseRetiredIndex(raw)?.fingerprints ?? []);
+async function readRetiredFingerprints(indexPath: string): Promise<string[] | undefined> {
+	const target = retiredIndexPath(indexPath);
+	const raw = await readNoFollow(target, CRASH_LOG_SCAN_MAX_BYTES);
+	if (raw !== undefined) return parseRetiredIndex(raw)?.fingerprints;
+	return (await crashLogExists(target)) === false ? [] : undefined;
 }
 
 async function crashLogExists(crashLogPath: string): Promise<boolean | undefined> {
@@ -446,10 +460,12 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	// the signature's explicit revival.
 	if (existing) {
 		existing.lifetimeCount += 1;
-		existing.lastSeen = Math.max(existing.lastSeen, event.at);
 		existing.firstSeen = Math.min(existing.firstSeen, event.at);
-		existing.lastRecordId = event.recordId;
-		if (event.messageClass) existing.messageClass = boundMessageClass(event.messageClass);
+		if (event.at >= existing.lastSeen) {
+			existing.lastSeen = event.at;
+			existing.lastRecordId = event.recordId;
+			if (event.messageClass) existing.messageClass = boundMessageClass(event.messageClass);
+		}
 		return true;
 	}
 	if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {
@@ -582,7 +598,9 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 			await quarantineIndex(paths.index, now);
 			index = emptyCrashIndex();
 		}
-		for (const fingerprint of await readRetiredFingerprints(paths.index)) {
+		const retiredFingerprints = await readRetiredFingerprints(paths.index);
+		if (retiredFingerprints === undefined) throw new Error("Crash retirement ledger is unreadable");
+		for (const fingerprint of retiredFingerprints) {
 			if (!index.retiredFingerprints.includes(fingerprint)) index.retiredFingerprints.push(fingerprint);
 		}
 		await pruneRetiredFingerprints(index, paths.crashLog);
@@ -591,10 +609,26 @@ export async function compactCrashIndex(options: CompactCrashIndexOptions = {}):
 		for (const file of drained) {
 			const contents = await readNoFollow(file, CRASH_JOURNAL_SCAN_MAX_BYTES);
 			if (contents === undefined) continue;
+			const digest = createHash("sha256").update(contents).digest("hex");
+			if (index.recentJournalDigests.includes(digest)) {
+				// A batch replay after main-index publish still heals a stale retirement
+				// sidecar, but must not reapply counts or other state transitions.
+				for (const line of contents.split("\n")) {
+					const event = parseCrashEventLine(line);
+					if (event?.kind === "occurrence")
+						index.retiredFingerprints = index.retiredFingerprints.filter(
+							fingerprint => fingerprint !== event.fingerprint,
+						);
+				}
+				continue;
+			}
 			for (const line of contents.split("\n")) {
 				const event = parseCrashEventLine(line);
 				if (event) applyCrashEvent(index, event, now);
 			}
+			index.recentJournalDigests.push(digest);
+			if (index.recentJournalDigests.length > RECENT_JOURNAL_DIGEST_LIMIT)
+				index.recentJournalDigests.splice(0, index.recentJournalDigests.length - RECENT_JOURNAL_DIGEST_LIMIT);
 		}
 
 		await recoverAndRecomputeRetainedCounts(index, paths.crashLog, now);
