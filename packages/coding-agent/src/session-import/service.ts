@@ -1250,3 +1250,15 @@ export function formatSessionImportBatch(result: SessionImportBatchResult): stri
 	});
 	return [`Codex session import: ${result.status}`, ...lines].join("\n");
 }
+
+/**
+ * Provider-neutral session import service (issue #3709).
+ *
+ * Pipeline: bounded read-only source load → format detection → provider adapter
+ * → normalization + fail-closed redaction → head/tail bounding → persistence
+ * into a NEW GJC session through the public SessionManager API.
+ *
+ * The source file is never written, moved, or enumerated. The live session is
+ * never touched by this module; callers switch sessions explicitly after a
+ * successful materialization.
+ */

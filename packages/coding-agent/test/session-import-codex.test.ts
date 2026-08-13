@@ -127,7 +127,7 @@ describe("Codex import sanitization", () => {
 describe.skipIf(process.platform !== "linux")("Codex session import", () => {
 	it("returns a failing local-headless status when import discovery fails", async () => {
 		const output: string[] = [];
-		const result = await executeLocalHeadlessBuiltinSlashCommand("/import-session codex missing-id", {
+		const result = await executeLocalHeadlessBuiltinSlashCommand("/import-session missing-id --provider codex", {
 			cwd: workspace,
 			output: (text: string) => output.push(text),
 		} as unknown as SlashCommandRuntime);

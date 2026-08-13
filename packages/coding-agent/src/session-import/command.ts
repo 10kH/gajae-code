@@ -11,7 +11,7 @@
  */
 
 import { parseCommandArgs } from "../utils/command-args";
-import { formatSessionImportError, importExternalSession } from "./service";
+import { formatProviderSessionImportError, importProviderSessionFile } from "./provider-service";
 import type { SessionImportCompleted, SessionImportProviderId } from "./types";
 
 export const IMPORT_SESSION_USAGE = "Usage: /import-session <transcript-file> [--provider codex|claude]";
@@ -65,13 +65,13 @@ export async function runSessionImportCommand(args: string, cwd: string): Promis
 	const parsed = parseImportSessionArgs(args);
 	if (parsed.kind === "error") return { kind: "error", message: parsed.message };
 	try {
-		const result = await importExternalSession({
+		const result = await importProviderSessionFile({
 			sourcePath: parsed.sourcePath,
 			...(parsed.provider ? { provider: parsed.provider } : {}),
 			cwd,
 		});
 		return { kind: "imported", result };
 	} catch (error) {
-		return { kind: "error", message: formatSessionImportError(error) };
+		return { kind: "error", message: formatProviderSessionImportError(error) };
 	}
 }

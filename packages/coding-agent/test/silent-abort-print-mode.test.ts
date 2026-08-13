@@ -196,7 +196,7 @@ describe("Print mode", () => {
 		expect(rows).toContainEqual({
 			type: "local_command_output",
 			command: "/import-session",
-			output: "Usage: /import-session codex [session-id ...]",
+			output: "Import failed: source_not_found [read] — Transcript file does not exist: unsupported",
 		});
 	});
 	it("does not render a silent-abort marker or overwrite a caller status", async () => {

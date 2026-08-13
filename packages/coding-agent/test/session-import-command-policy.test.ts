@@ -301,16 +301,20 @@ describe("session import command transport policy", () => {
 			},
 		} as unknown as TuiSlashCommandRuntime;
 		expect(await executeBuiltinSlashCommand("/import-session unsupported", tuiRuntime)).toBe(available);
-		expect(tuiOutput).toEqual(available ? ["Usage: /import-session codex [session-id ...]"] : []);
+		expect(tuiOutput).toEqual(
+			available ? ["Import failed: source_not_found [read] — Transcript file does not exist: unsupported"] : [],
+		);
 
 		const headlessOutput: string[] = [];
 		const headlessRuntime = {
 			output: (text: string) => headlessOutput.push(text),
 		} as unknown as SlashCommandRuntime;
 		expect(await executeLocalHeadlessBuiltinSlashCommand("/import-session unsupported", headlessRuntime)).toEqual(
-			available ? { consumed: true } : false,
+			available ? { consumed: true, exitCode: 1 } : false,
 		);
-		expect(headlessOutput).toEqual(available ? ["Usage: /import-session codex [session-id ...]"] : []);
+		expect(headlessOutput).toEqual(
+			available ? ["Import failed: source_not_found [read] — Transcript file does not exist: unsupported"] : [],
+		);
 	});
 
 	it.skipIf(process.platform !== "linux")(
@@ -331,7 +335,9 @@ describe("session import command transport policy", () => {
 				},
 			} as unknown as TuiSlashCommandRuntime;
 			expect(await executeBuiltinSlashCommand("/import-session unsupported", runtime)).toBe(true);
-			expect(output).toEqual(["Usage: /import-session codex [session-id ...]"]);
+			expect(output).toEqual([
+				"Import failed: source_not_found [read] — Transcript file does not exist: unsupported",
+			]);
 		},
 	);
 
@@ -344,8 +350,11 @@ describe("session import command transport policy", () => {
 			} as unknown as SlashCommandRuntime;
 			expect(await executeLocalHeadlessBuiltinSlashCommand("/import-session unsupported", runtime)).toEqual({
 				consumed: true,
+				exitCode: 1,
 			});
-			expect(output).toEqual(["Usage: /import-session codex [session-id ...]"]);
+			expect(output).toEqual([
+				"Import failed: source_not_found [read] — Transcript file does not exist: unsupported",
+			]);
 		},
 	);
 });

@@ -14,15 +14,15 @@ import { canContinuePersistedHistory } from "@gajae-code/agent-core";
 import { SessionManager } from "../src/session/session-manager";
 import { parseImportSessionArgs } from "../src/session-import/command";
 import { detectSessionImportFormat } from "../src/session-import/detect";
-import { redactImportedText } from "../src/session-import/redact";
 import {
-	formatSessionImportSummary,
-	importExternalSession,
-	prepareSessionImport,
-	SESSION_IMPORT_CONTEXT_CUSTOM_TYPE,
-	SESSION_IMPORT_PROVENANCE_CUSTOM_TYPE,
-	SESSION_IMPORT_SOURCE_MAX_BYTES,
-} from "../src/session-import/service";
+	EXTERNAL_IMPORT_CONTEXT_CUSTOM_TYPE,
+	EXTERNAL_IMPORT_PROVENANCE_CUSTOM_TYPE,
+	EXTERNAL_IMPORT_SOURCE_MAX_BYTES,
+	formatProviderSessionImportSummary,
+	importProviderSessionFile,
+	prepareExternalSessionImport,
+} from "../src/session-import/provider-service";
+import { redactImportedText } from "../src/session-import/redact";
 import { SessionImportError, type SessionImportProvenance } from "../src/session-import/types";
 import { ACP_BUILTIN_SLASH_COMMANDS } from "../src/slash-commands/acp-builtins";
 import { lookupBuiltinSlashCommand } from "../src/slash-commands/builtin-registry";
@@ -299,7 +299,7 @@ describe("Codex import normalization", () => {
 	it("maps messages, tool evidence, and provenance; quarantines unknown records", async () => {
 		const dir = makeTempDir();
 		const source = writeSource(dir, "rollout-2026-07-30T10-00-00.jsonl", CODEX_ROLLOUT);
-		const prepared = await prepareSessionImport({ sourcePath: source });
+		const prepared = await prepareExternalSessionImport({ sourcePath: source });
 
 		expect(prepared.conversation.provider).toBe("codex");
 		expect(prepared.conversation.format).toBe("codex-rollout-jsonl");
@@ -333,7 +333,7 @@ describe("Codex import normalization", () => {
 		const dir = makeTempDir();
 		const broken = `${CODEX_ROLLOUT.split("\n").slice(0, 3).join("\n")}\n{not json\n${CODEX_ROLLOUT.split("\n").slice(3, 5).join("\n")}`;
 		const source = writeSource(dir, "rollout.jsonl", broken);
-		const prepared = await prepareSessionImport({ sourcePath: source });
+		const prepared = await prepareExternalSessionImport({ sourcePath: source });
 		expect(prepared.counts.quarantined).toBe(1);
 		expect(prepared.conversation.messages.length).toBeGreaterThan(0);
 	});
@@ -343,7 +343,7 @@ describe("Claude import normalization", () => {
 	it("maps Claude Code transcripts with summaries, tool evidence, and meta filtering", async () => {
 		const dir = makeTempDir();
 		const source = writeSource(dir, `${CLAUDE_SESSION_ID}.jsonl`, CLAUDE_CODE_TRANSCRIPT);
-		const prepared = await prepareSessionImport({ sourcePath: source });
+		const prepared = await prepareExternalSessionImport({ sourcePath: source });
 
 		expect(prepared.conversation.provider).toBe("claude");
 		expect(prepared.conversation.format).toBe("claude-code-jsonl");
@@ -366,7 +366,7 @@ describe("Claude import normalization", () => {
 	it("maps claude.ai exports with conversation metadata", async () => {
 		const dir = makeTempDir();
 		const source = writeSource(dir, "conversations.json", CLAUDE_EXPORT);
-		const prepared = await prepareSessionImport({ sourcePath: source });
+		const prepared = await prepareExternalSessionImport({ sourcePath: source });
 
 		expect(prepared.conversation.provider).toBe("claude");
 		expect(prepared.conversation.format).toBe("claude-export-json");
@@ -380,7 +380,7 @@ describe("Claude import normalization", () => {
 	it("accepts a single-conversation export object", async () => {
 		const dir = makeTempDir();
 		const source = writeSource(dir, "conversation.json", JSON.stringify(JSON.parse(CLAUDE_EXPORT)[0]));
-		const prepared = await prepareSessionImport({ sourcePath: source, provider: "claude" });
+		const prepared = await prepareExternalSessionImport({ sourcePath: source, provider: "claude" });
 		expect(prepared.conversation.messages).toHaveLength(2);
 	});
 });
@@ -429,7 +429,7 @@ describe("import redaction", () => {
 			},
 		})}`;
 		const source = writeSource(dir, "rollout.jsonl", withSecret);
-		const prepared = await prepareSessionImport({ sourcePath: source });
+		const prepared = await prepareExternalSessionImport({ sourcePath: source });
 		expect(prepared.counts.redacted).toBeGreaterThanOrEqual(2);
 		expect(prepared.contextText).not.toContain("sk-AAAAAAAAAAAAAAAAAAAAAAAA");
 		expect(prepared.redactionKinds).toContain("secret-assignment");
@@ -440,7 +440,7 @@ describe("import bounds and malformed input", () => {
 	it("fails source_not_found for a missing file", async () => {
 		const dir = makeTempDir();
 		try {
-			await prepareSessionImport({ sourcePath: path.join(dir, "missing.jsonl") });
+			await prepareExternalSessionImport({ sourcePath: path.join(dir, "missing.jsonl") });
 			expect.unreachable();
 		} catch (error) {
 			expectImportError(error, "source_not_found");
@@ -450,7 +450,7 @@ describe("import bounds and malformed input", () => {
 	it("fails invalid_request for a directory source", async () => {
 		const dir = makeTempDir();
 		try {
-			await prepareSessionImport({ sourcePath: dir });
+			await prepareExternalSessionImport({ sourcePath: dir });
 			expect.unreachable();
 		} catch (error) {
 			expectImportError(error, "invalid_request");
@@ -461,7 +461,7 @@ describe("import bounds and malformed input", () => {
 		const dir = makeTempDir();
 		const source = writeSource(dir, "empty.jsonl", "");
 		try {
-			await prepareSessionImport({ sourcePath: source });
+			await prepareExternalSessionImport({ sourcePath: source });
 			expect.unreachable();
 		} catch (error) {
 			expectImportError(error, "malformed_input");
@@ -477,7 +477,7 @@ describe("import bounds and malformed input", () => {
 		});
 		const source = writeSource(dir, "rollout.jsonl", metaOnly);
 		try {
-			await prepareSessionImport({ sourcePath: source });
+			await prepareExternalSessionImport({ sourcePath: source });
 			expect.unreachable();
 		} catch (error) {
 			expectImportError(error, "malformed_input");
@@ -508,7 +508,7 @@ describe("import bounds and malformed input", () => {
 		}
 		const source = writeSource(dir, "rollout.jsonl", lines.join("\n"));
 		try {
-			await prepareSessionImport({ sourcePath: source });
+			await prepareExternalSessionImport({ sourcePath: source });
 			expect.unreachable();
 		} catch (error) {
 			const importError = expectImportError(error, "content_too_large");
@@ -519,13 +519,13 @@ describe("import bounds and malformed input", () => {
 	it("fails content_too_large over the source byte limit", async () => {
 		const dir = makeTempDir();
 		const source = path.join(dir, "huge.jsonl");
-		fs.writeFileSync(source, Buffer.alloc(SESSION_IMPORT_SOURCE_MAX_BYTES + 1, 0x61));
+		fs.writeFileSync(source, Buffer.alloc(EXTERNAL_IMPORT_SOURCE_MAX_BYTES + 1, 0x61));
 		try {
-			await prepareSessionImport({ sourcePath: source });
+			await prepareExternalSessionImport({ sourcePath: source });
 			expect.unreachable();
 		} catch (error) {
 			const importError = expectImportError(error, "content_too_large");
-			expect(importError.limitBytes).toBe(SESSION_IMPORT_SOURCE_MAX_BYTES);
+			expect(importError.limitBytes).toBe(EXTERNAL_IMPORT_SOURCE_MAX_BYTES);
 		}
 	});
 
@@ -557,7 +557,7 @@ describe("import bounds and malformed input", () => {
 			);
 		}
 		const source = writeSource(dir, "rollout.jsonl", lines.join("\n"));
-		const prepared = await prepareSessionImport({ sourcePath: source });
+		const prepared = await prepareExternalSessionImport({ sourcePath: source });
 		expect(prepared.provenance.truncated).toBe(true);
 		expect(prepared.counts.omitted).toBeGreaterThan(0);
 		expect(prepared.contextText).toContain("elided");
@@ -575,7 +575,7 @@ describe("session import materialization", () => {
 		const source = writeSource(dir, "rollout.jsonl", CODEX_ROLLOUT);
 		const sourceShaBefore = createHash("sha256").update(fs.readFileSync(source)).digest("hex");
 
-		const result = await importExternalSession({
+		const result = await importProviderSessionFile({
 			sourcePath: source,
 			cwd: dir,
 			destination,
@@ -592,7 +592,7 @@ describe("session import materialization", () => {
 
 		const provenanceEntry = lines
 			.map(line => JSON.parse(line))
-			.find(entry => entry.type === "custom" && entry.customType === SESSION_IMPORT_PROVENANCE_CUSTOM_TYPE);
+			.find(entry => entry.type === "custom" && entry.customType === EXTERNAL_IMPORT_PROVENANCE_CUSTOM_TYPE);
 		expect(provenanceEntry).toBeDefined();
 		const provenance = provenanceEntry.data as SessionImportProvenance;
 		expect(provenance.schemaVersion).toBe(1);
@@ -607,7 +607,7 @@ describe("session import materialization", () => {
 
 		const contextEntry = lines
 			.map(line => JSON.parse(line))
-			.find(entry => entry.type === "custom_message" && entry.customType === SESSION_IMPORT_CONTEXT_CUSTOM_TYPE);
+			.find(entry => entry.type === "custom_message" && entry.customType === EXTERNAL_IMPORT_CONTEXT_CUSTOM_TYPE);
 		expect(contextEntry).toBeDefined();
 		expect(contextEntry.display).toBe(true);
 		expect(contextEntry.content).toContain("drops the token parameter");
@@ -631,8 +631,8 @@ describe("session import materialization", () => {
 		const dir = makeTempDir();
 		const destination = path.join(dir, "sessions");
 		const source = writeSource(dir, "rollout.jsonl", CODEX_ROLLOUT);
-		const first = await importExternalSession({ sourcePath: source, cwd: dir, destination });
-		const second = await importExternalSession({ sourcePath: source, cwd: dir, destination });
+		const first = await importProviderSessionFile({ sourcePath: source, cwd: dir, destination });
+		const second = await importProviderSessionFile({ sourcePath: source, cwd: dir, destination });
 		expect(first.targetSessionId).not.toBe(second.targetSessionId);
 		expect(fs.existsSync(first.targetPath)).toBe(true);
 		expect(fs.existsSync(second.targetPath)).toBe(true);
@@ -642,10 +642,10 @@ describe("session import materialization", () => {
 		const dir = makeTempDir();
 		const destination = path.join(dir, "sessions");
 		const source = writeSource(dir, "conversations.json", CLAUDE_EXPORT);
-		const result = await importExternalSession({ sourcePath: source, cwd: dir, destination });
+		const result = await importProviderSessionFile({ sourcePath: source, cwd: dir, destination });
 		expect(result.title).toBe("Login redirect token fix");
 		expect(fs.existsSync(result.targetPath)).toBe(true);
-		const summary = formatSessionImportSummary(result);
+		const summary = formatProviderSessionImportSummary(result);
 		expect(summary).toContain("Claude");
 		expect(summary).toContain("not modified");
 	});
@@ -663,7 +663,7 @@ describe("session import materialization", () => {
 			},
 		})}`;
 		const source = writeSource(dir, "rollout.jsonl", withSecret);
-		const result = await importExternalSession({ sourcePath: source, cwd: dir, destination });
+		const result = await importProviderSessionFile({ sourcePath: source, cwd: dir, destination });
 		expect(result.prepared.counts.redacted).toBeGreaterThanOrEqual(1);
 		const persisted = fs.readFileSync(result.targetPath, "utf8");
 		expect(persisted).not.toContain("sk-ant-api03-AAAABBBBCCCCDDDDEEEEFFFFGGGG");
@@ -696,14 +696,14 @@ describe("/import-session command surface", () => {
 		expect(parseImportSessionArgs("/tmp/a.jsonl /tmp/b.jsonl").kind).toBe("error");
 	});
 
-	it("is registered for both TUI and ACP dispatch", () => {
+	it("is registered for trusted local dispatch and excluded from ACP", () => {
 		const spec = lookupBuiltinSlashCommand("import-session");
 		expect(spec).toBeDefined();
 		expect(spec?.handle).toBeDefined();
-		expect(spec?.handleTui).toBeDefined();
+		expect(spec?.acp).toBe(false);
+		expect(spec?.localHeadless).toBe(true);
 		expect(spec?.allowArgs).toBe(true);
 		const acp = ACP_BUILTIN_SLASH_COMMANDS.find(command => command.name === "import-session");
-		expect(acp).toBeDefined();
-		expect(acp?.input?.hint).toContain("--provider");
+		expect(acp).toBeUndefined();
 	});
 });

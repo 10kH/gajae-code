@@ -18,8 +18,6 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"agent_session:abortPromptAndWaitWithTerminal":
 		"internal terminal-abort fencing seam, threaded via terminalAbortSeams; not a user-facing SDK control seam",
 	"slash_command:settings": "visual/local-only command, not a user-facing SDK control seam",
-	"slash_command:import-session":
-		"local-only trusted command (acp: false, localHeadless: true) that imports external sessions on the operator's machine, not a user-facing SDK control seam",
 	"slash_command:theme": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:copy": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:changelog": "visual/local-only command, not a user-facing SDK control seam",

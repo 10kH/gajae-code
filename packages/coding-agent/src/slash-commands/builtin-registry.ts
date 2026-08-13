@@ -34,7 +34,7 @@ import {
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
 import { computeCacheMissCostSummary, formatCacheMissSummaryLines } from "../session/cache-economics";
-import { formatSessionImportBatch, importCodexSessions } from "../session-import";
+import { formatProviderSessionImportSummary, runSessionImportCommand } from "../session-import";
 import { formatModelOnboardingGuidance } from "../setup/model-onboarding-guidance";
 import {
 	addApiCompatibleProvider,
@@ -610,29 +610,19 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "import-session",
 		priority: 29,
-		description: "Import Codex sessions into native GJC history",
-		inlineHint: "codex [session-id ...]",
+		description: "Import a Codex or Claude transcript into native GJC history",
+		inlineHint: "<transcript-file> [--provider codex|claude]",
 		allowArgs: true,
 		acp: false,
 		localHeadless: true,
 		handle: async (command, runtime) => {
-			const tokens = command.args.trim().split(/\s+/u).filter(Boolean);
-			if (tokens[0] !== "codex") {
-				return usage("Usage: /import-session codex [session-id ...]", runtime);
+			const outcome = await runSessionImportCommand(command.args, runtime.cwd);
+			if (outcome.kind === "error") {
+				await runtime.output(outcome.message);
+				return { consumed: true, exitCode: 1 };
 			}
-			const ids = [...new Set(tokens.slice(1))];
-			if (ids.length > 256 || ids.some(id => id.length < 8 || id.length > 128 || !/^[A-Za-z0-9-]+$/u.test(id))) {
-				return usage(
-					"Usage: /import-session codex [session-id ...]\nSession IDs must be 8-128 letters, digits, or hyphens; maximum 256 IDs.",
-					runtime,
-				);
-			}
-			const result = await importCodexSessions(runtime.cwd, ids);
-			await runtime.output(formatSessionImportBatch(result));
-			return {
-				consumed: true,
-				...(result.status === "failed" || result.status === "partial" ? { exitCode: 1 } : {}),
-			};
+			await runtime.output(formatProviderSessionImportSummary(outcome.result));
+			return { consumed: true };
 		},
 	},
 	{
