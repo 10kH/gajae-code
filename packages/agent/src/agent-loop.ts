@@ -159,6 +159,14 @@ function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
 	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
 }
 
+/** Remove only the exact assistant response committed by its streaming attempt. */
+function removeCommittedAssistantMessage(messages: AgentMessage[], message: AssistantMessage): boolean {
+	const index = messages.lastIndexOf(message);
+	if (index < 0) return false;
+	messages.splice(index, 1);
+	return true;
+}
+
 function isComposerBashPolicyBlockedToolResult(result: ToolResultMessage): boolean {
 	return (
 		result.isError &&
@@ -1836,12 +1844,10 @@ async function runLoopBody(
 			) {
 				escapedNonAsciiResampleAttempt++;
 				// The defective turn was already committed to the context by the
-				// streaming path. Drop it so the resample neither replays the escaped
-				// arguments as history nor leaves a second assistant tail behind.
-				const escapedIndex = currentContext.messages.length - 1;
-				if (escapedIndex >= 0 && currentContext.messages[escapedIndex]?.role === "assistant") {
-					currentContext.messages.splice(escapedIndex, 1);
-				}
+				// streaming path. Remove that exact object rather than assuming it is
+				// still the tail: callbacks may append user/system history while the
+				// response settles, and none of that history belongs to this retry.
+				removeCommittedAssistantMessage(currentContext.messages, message);
 				continue;
 			}
 			escapedNonAsciiResampleAttempt = 0;
