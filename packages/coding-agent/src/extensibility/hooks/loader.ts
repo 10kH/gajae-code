@@ -247,11 +247,9 @@ export async function loadHooks(paths: string[], cwd: string): Promise<LoadHooks
 }
 
 /**
- * Discover and load hooks from all registered providers.
- * Uses the capability API to discover hook paths from:
- * 1. GJC native configs (.gjc/.pi hooks/)
- * 2. Installed plugins
- * 3. Other editor/IDE configurations
+ * Discover and load hooks from canonical native GJC configuration.
+ * Claude Code and Codex hook layouts remain registered capability providers for
+ * explicit import and diagnostics, but are not competing runtime authorities.
  *
  * Plus any explicitly configured paths from settings.
  */
@@ -274,7 +272,7 @@ export async function discoverAndLoadHooks(configuredPaths: string[], cwd: strin
 
 	// 1. Discover hooks via capability API and validate the provider descriptor
 	// against the canonical model before importing project-controlled code.
-	const discovered = await loadCapability<Hook>(hookCapability.id, { cwd });
+	const discovered = await loadCapability<Hook>(hookCapability.id, { cwd, providers: ["native"] });
 	for (const hook of discovered.items) {
 		const convention =
 			hook._source.provider === "native"
