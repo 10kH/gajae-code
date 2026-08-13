@@ -47,6 +47,7 @@ interface FakeAcpBuiltinSession {
 	getLastAssistantText: () => string | undefined;
 	messages: unknown[];
 	modelRegistry: {
+		authStorage: AgentSession["modelRegistry"]["authStorage"];
 		getApiKey(model: { provider: string; id: string }, sessionId?: string): Promise<string | undefined>;
 		resolveCanonicalModel?: (
 			canonicalId: string,
@@ -89,6 +90,24 @@ interface FakeAcpBuiltinSession {
 function createRuntime() {
 	const output: string[] = [];
 	const settings = Settings.isolated();
+	let credentialInventory: ReturnType<AgentSession["modelRegistry"]["authStorage"]["listCredentialInventory"]> = [];
+	const cachedUsage = new Map<
+		number,
+		ReturnType<AgentSession["modelRegistry"]["authStorage"]["getCachedUsageReport"]>
+	>();
+	const authStorage = {
+		listCredentialInventory: () => credentialInventory,
+		listCredentialRemovalTargets: () => [],
+		getGeneration: () => 0,
+		getCachedCredentialHealth: () => ({ status: "unknown", reason: null }),
+		getCachedUsageReport: (_provider: string, credentialId: number) => cachedUsage.get(credentialId),
+		getSessionCredentialRowId: () => undefined,
+		hasRuntimeApiKey: () => false,
+		hasConfigApiKey: () => false,
+		getEffectiveCredentialType: () => undefined,
+		peekCachedCredentialHealthForSource: () => ({ status: "unknown", reason: null }),
+		recordCredentialHealthForSource: () => {},
+	} as unknown as AgentSession["modelRegistry"]["authStorage"];
 	const session: FakeAcpBuiltinSession = {
 		memoryBackend: createMemoryBackendService(settings),
 		fastMode: false,
@@ -158,6 +177,7 @@ function createRuntime() {
 		getLastAssistantText: () => undefined,
 		messages: [],
 		modelRegistry: {
+			authStorage,
 			async getApiKey(_model: { provider: string; id: string }, _sessionId?: string) {
 				return "test-api-key";
 			},
@@ -179,7 +199,6 @@ function createRuntime() {
 		},
 		async refreshSshTool(_options?: { activateIfAvailable?: boolean }) {},
 	};
-	const typedSession = session as unknown as AgentSession & FakeAcpBuiltinSession;
 	const fakeSessionManager = {
 		_sessionFile: undefined as string | undefined,
 		_cwd: "/tmp/project",
@@ -233,10 +252,21 @@ function createRuntime() {
 			return true;
 		},
 	};
+	const typedSession = Object.assign(session, {
+		sessionManager: fakeSessionManager as unknown as SessionManager,
+	}) as unknown as AgentSession & FakeAcpBuiltinSession;
 	return {
 		output,
 		session,
 		fakeSessionManager,
+		setAccountUsage(
+			inventory: typeof credentialInventory,
+			usage: NonNullable<ReturnType<AgentSession["modelRegistry"]["authStorage"]["getCachedUsageReport"]>>,
+		): void {
+			credentialInventory = inventory;
+			cachedUsage.clear();
+			for (const row of inventory) cachedUsage.set(row.id, usage);
+		},
 		runtime: {
 			session: typedSession,
 			sessionManager: fakeSessionManager as unknown as SessionManager,
@@ -323,63 +353,97 @@ describe("ACP builtin slash commands", () => {
 	});
 
 	it("renders provider usage reports when the session can fetch them", async () => {
-		const { output, runtime } = createRuntime();
-		runtime.session.fetchUsageReports = async () => [
+		const { output, runtime, setAccountUsage } = createRuntime();
+		const now = Date.now();
+		setAccountUsage(
+			[
+				{
+					id: 1,
+					provider: "openai-codex",
+					credentialKind: "oauth",
+					identityLabel: "user@example.com",
+					disabled: false,
+					disabledCause: null,
+				},
+			],
 			{
-				provider: "openai-codex",
-				fetchedAt: Date.now(),
-				limits: [
-					{
-						id: "codex-5h",
-						label: "5 hours",
-						scope: { provider: "openai-codex", tier: "prolite", accountId: "account-1" },
-						window: { id: "5h", label: "5 hours", resetsAt: Date.now() + 60 * 60 * 1000 },
-						amount: { used: 0.24, usedFraction: 0.24, unit: "unknown" },
-					},
-				],
-				metadata: { email: "user@example.com" },
+				report: {
+					provider: "openai-codex",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "codex-5h",
+							label: "5 hours",
+							scope: { provider: "openai-codex", tier: "prolite", accountId: "account-1" },
+							window: { id: "5h", label: "5 hours", resetsAt: now + 60 * 60 * 1000 },
+							amount: { used: 0.24, usedFraction: 0.24, unit: "unknown" },
+						},
+					],
+					metadata: { email: "user@example.com" },
+				},
+				fetchedAt: now,
+				freshUntil: now + 60_000,
+				retainUntil: now + 86_400_000,
+				freshness: "fresh",
 			},
-		];
+		);
 
 		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("Openai Codex");
-		expect(output[0]).toContain("5 hours (prolite)");
-		expect(output[0]).toContain("user@example.com: 0.24 unknown used (76.0% left)");
-		expect(output[0]).toContain("resets in");
+		expect(output[0]).toContain("openai-codex:stored:1");
+		expect(output[0]).toContain("user@example.com");
+		expect(output[0]).toContain("5 hours: 0.24 unknown used (76.0% left)");
 	});
 
 	it("keeps one fallback account identity across multiple quota windows in one report", async () => {
-		const { output, runtime } = createRuntime();
-		runtime.session.fetchUsageReports = async () => [
+		const { output, runtime, setAccountUsage } = createRuntime();
+		const now = Date.now();
+		setAccountUsage(
+			[
+				{
+					id: 1,
+					provider: "grok-build",
+					credentialKind: "oauth",
+					identityLabel: "account 1",
+					disabled: false,
+					disabledCause: null,
+				},
+			],
 			{
-				provider: "grok-build",
-				fetchedAt: Date.now(),
-				limits: [
-					{
-						id: "grok-build:7d",
-						label: "SuperGrok monthly credits",
-						scope: { provider: "grok-build", windowId: "7d" },
-						window: { id: "7d", label: "Monthly credits", resetsAt: Date.now() + 20 * 86400_000 },
-						amount: { used: 25, usedFraction: 0.25, unit: "percent" },
-					},
-					{
-						id: "grok-build:weekly",
-						label: "SuperGrok weekly credits",
-						scope: { provider: "grok-build", windowId: "weekly" },
-						window: { id: "weekly", label: "Weekly", resetsAt: Date.now() + 6 * 86400_000 },
-						amount: { used: 6, usedFraction: 0.06, unit: "percent" },
-					},
-				],
-				metadata: {},
+				report: {
+					provider: "grok-build",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "grok-build:7d",
+							label: "SuperGrok monthly credits",
+							scope: { provider: "grok-build", windowId: "7d" },
+							window: { id: "7d", label: "Monthly credits", resetsAt: now + 20 * 86400_000 },
+							amount: { used: 25, usedFraction: 0.25, unit: "percent" },
+						},
+						{
+							id: "grok-build:weekly",
+							label: "SuperGrok weekly credits",
+							scope: { provider: "grok-build", windowId: "weekly" },
+							window: { id: "weekly", label: "Weekly", resetsAt: now + 6 * 86400_000 },
+							amount: { used: 6, usedFraction: 0.06, unit: "percent" },
+						},
+					],
+					metadata: {},
+				},
+				fetchedAt: now,
+				freshUntil: now + 60_000,
+				retainUntil: now + 86_400_000,
+				freshness: "fresh",
 			},
-		];
+		);
 
 		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
 
-		expect(output[0]?.match(/account 1:/g)).toHaveLength(2);
-		expect(output[0]).not.toContain("account 2:");
+		expect(output[0]?.match(/account 1/g)).toHaveLength(1);
+		expect(output[0]).toContain("SuperGrok monthly credits");
+		expect(output[0]).toContain("SuperGrok weekly credits");
 	});
 
 	it("returns false for unknown commands", async () => {
@@ -1413,26 +1477,43 @@ describe("wave 5 — adapters and polish", () => {
 
 	// /usage bar character
 	it("/usage: includes bar character when usedFraction is 0.5", async () => {
-		const { output, runtime } = createRuntime();
-		runtime.session.fetchUsageReports = async () => [
+		const { output, runtime, setAccountUsage } = createRuntime();
+		const now = Date.now();
+		setAccountUsage(
+			[
+				{
+					id: 1,
+					provider: "test-provider",
+					credentialKind: "oauth",
+					identityLabel: null,
+					disabled: false,
+					disabledCause: null,
+				},
+			],
 			{
-				provider: "test-provider",
-				fetchedAt: Date.now(),
-				limits: [
-					{
-						id: "test-limit",
-						label: "Monthly",
-						scope: { provider: "test-provider", tier: "pro", accountId: "acct-1" },
-						window: { id: "monthly", label: "monthly", resetsAt: Date.now() + 30 * 86400_000 },
-						amount: { used: 50, usedFraction: 0.5, unit: "requests" },
-					},
-				],
-				metadata: {},
+				report: {
+					provider: "test-provider",
+					fetchedAt: now,
+					limits: [
+						{
+							id: "test-limit",
+							label: "Monthly",
+							scope: { provider: "test-provider", tier: "pro", accountId: "acct-1" },
+							window: { id: "monthly", label: "monthly", resetsAt: now + 30 * 86400_000 },
+							amount: { used: 50, usedFraction: 0.5, unit: "requests" },
+						},
+					],
+					metadata: {},
+				},
+				fetchedAt: now,
+				freshUntil: now + 60_000,
+				retainUntil: now + 86_400_000,
+				freshness: "fresh",
 			},
-		];
+		);
 		const result = await executeAcpBuiltinSlashCommand("/usage", runtime);
 		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("█");
+		expect(output[0]).toContain("Monthly: 50.00 requests used (50.0% left)");
 	});
 
 	// /context breakdown

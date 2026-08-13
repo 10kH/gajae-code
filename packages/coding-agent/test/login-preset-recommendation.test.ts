@@ -83,6 +83,8 @@ function createControllerContext(
 			refresh: vi.fn(async () => {}),
 			authStorage: {
 				login: vi.fn(async () => {}),
+				listCredentialInventory: vi.fn(() => []),
+				listCredentialRemovalTargets: vi.fn(() => []),
 			},
 			getModelProfiles: () => new Map(profiles),
 			getModelProfile: (name: string) => profiles.get(name),
