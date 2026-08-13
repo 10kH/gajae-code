@@ -691,6 +691,48 @@ test("an autonomous ask lead-in does not erase the prior user-request receipt", 
 	}
 }, 30000);
 
+test("an autonomous tool continuation retains its provenance through a message-less turn", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Complete the request." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Completion receipt." } },
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "Autonomous update." } },
+			ctx,
+		);
+		// Tool-loop continuation has no new prompt message, so it must retain its autonomous provenance.
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 2 }, ctx);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 2, message: { role: "assistant", content: "Final autonomous outcome." } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "composed autonomous outcome");
+		expect(turnStreams()[0]!.text).toContain("Completion receipt.");
+		expect(turnStreams()[0]!.text).toContain("Final autonomous outcome.");
+		expect(turnStreams()[0]!.text).not.toContain("Autonomous update.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 test("a user-attributed custom message starts a new settlement window", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";

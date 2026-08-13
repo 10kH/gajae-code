@@ -8042,8 +8042,6 @@ export function createNotificationsExtension(
 	const resetTurnStreamState = (rt: SessionRuntime): void => {
 		rt.currentTurnText = undefined;
 		rt.preAskFlushedText = undefined;
-		rt.currentTurnSettlementOrigin = undefined;
-		rt.currentTurnSettlementWindow = undefined;
 		rt.liveRef = undefined;
 		rt.turnClosed = true;
 		rt.lastLiveAt = undefined;
@@ -8162,6 +8160,13 @@ export function createNotificationsExtension(
 		// Streaming state is SDK-visible session truth (context.get isStreaming);
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
+		// The first prompt message arrives after turn_start. A pre-existing deferred
+		// receipt means a message-less run is autonomous until a direct user prompt
+		// authoritatively overrides it; otherwise start unbound.
+		if (!rt.currentTurnSettlementOrigin && rt.pendingSettled) {
+			rt.currentTurnSettlementOrigin = "autonomous";
+			rt.currentTurnSettlementWindow = rt.settlementWindow;
+		} else if (!rt.currentTurnSettlementOrigin) rt.currentTurnSettlementWindow = undefined;
 		// A continuation re-enters the agent loop inside the same prompt and emits
 		// another `agent_start`. Only a queued follow-up's exact SDK token may
 		// claim its correlation; unrelated queue work must not consume it.
@@ -8195,10 +8200,9 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.turnSeq = (rt.turnSeq ?? 0) + 1;
-		// Agent-loop prompts arrive after turn_start. The following non-assistant
-		// message binds this turn's provenance and boundary.
-		rt.currentTurnSettlementOrigin = undefined;
-		rt.currentTurnSettlementWindow = undefined;
+		// Agent-loop prompts arrive after turn_start. Retain already-bound logical
+		// provenance across tool/message-less continuation turns; a user prompt can
+		// still authoritatively override framework-injected context below.
 		if (!rt.notificationsActive) return;
 		// A new turn is live: re-open the live-stream window (see turnClosed).
 		rt.turnClosed = false;
@@ -8345,6 +8349,10 @@ export function createNotificationsExtension(
 		// Intermediate tool-turn narration was held on turn_end; ask lead-ins were
 		// already flushed immediately and deduped via preAskFlushedText.
 		flushPendingSettled(rt, id);
+		// A terminal idle closes the logical settlement run. The next agent_start
+		// must establish provenance from its own prompt messages.
+		rt.currentTurnSettlementOrigin = undefined;
+		rt.currentTurnSettlementWindow = undefined;
 
 		// On idle, stream a context update with metadata (token/model usage +
 		// working-tree diff) unless redaction is on. Under verbose the agent's last
@@ -8610,7 +8618,7 @@ export function createNotificationsExtension(
 		if (rt) {
 			const message = event.message as { role?: unknown; attribution?: unknown };
 			if (isUserSettlementBoundary(message)) {
-				const openingTurn = rt.currentTurnSettlementOrigin === undefined;
+				const openingTurn = rt.currentTurnSettlementOrigin !== "user";
 				const supersedingSettledTurn =
 					rt.currentTurnSettlementOrigin === "user" &&
 					(rt.pendingSettled !== undefined || rt.pendingFinal !== undefined);
@@ -8619,7 +8627,7 @@ export function createNotificationsExtension(
 				// turn has produced a receipt opens a new window but must not relabel the
 				// already-running turn as its response.
 				if (openingTurn || supersedingSettledTurn) rt.settlementWindow++;
-				if (openingTurn) {
+				if (openingTurn || supersedingSettledTurn) {
 					rt.currentTurnSettlementWindow = rt.settlementWindow;
 					rt.currentTurnSettlementOrigin = "user";
 				}
