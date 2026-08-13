@@ -40,6 +40,33 @@ interface ParsedCrashRecord {
 	bound: boolean;
 }
 
+function findBoundFingerprint(
+	headline: string,
+	bodyLines: string[],
+	markerFingerprint: string,
+): ReturnType<typeof computeCrashFingerprint> | undefined {
+	for (let separator = headline.indexOf(":"); separator > 0; separator = headline.indexOf(":", separator + 1)) {
+		const name = headline.slice(0, separator).trim();
+		const firstMessageLine = headline.slice(separator + 1).trim();
+		for (let continuationCount = 0; continuationCount <= bodyLines.length; continuationCount++) {
+			const message = [firstMessageLine, ...bodyLines.slice(0, continuationCount)].join("\n");
+			const remaining = bodyLines.slice(continuationCount);
+			const stackPrefix = `${name}: ${message}`;
+			const stackCandidates = [remaining.join("\n").trimEnd()];
+			// Production object payloads are one serialized JSON line appended after
+			// the stack. V1 has no explicit delimiter, so also test that one-line
+			// suffix omission against the marker rather than trusting its syntax.
+			if (remaining.length > 0) stackCandidates.push(remaining.slice(0, -1).join("\n").trimEnd());
+			for (const stack of stackCandidates) {
+				if (stack.length > 0 && !stack.startsWith(stackPrefix)) continue;
+				const fingerprint = computeCrashFingerprint({ name, message, stack });
+				if (fingerprint.fingerprint === markerFingerprint) return fingerprint;
+			}
+		}
+	}
+	return undefined;
+}
+
 /**
  * Parse identity-bearing records out of raw crash-log text.
  *
@@ -73,29 +100,10 @@ function parseCandidates(contents: string): ParsedCrashRecord[] {
 		}
 		if (line.startsWith(`${CRASH_RECORD_MARKER} `)) {
 			const marker = parseCrashRecordMarker(line);
-			const separator = headline.indexOf(":");
-			if (marker && started && separator > 0) {
-				const errorName = headline.slice(0, separator).trim();
-				const message = headline.slice(separator + 1).trim();
+			if (marker && started) {
 				const rawBody = buffer.join("\n").trimEnd();
 				const bodyLines = rawBody.split("\n");
-				let fingerprint = computeCrashFingerprint({ name: errorName, message, stack: rawBody });
-				if (fingerprint.fingerprint !== marker.fingerprint) {
-					// Object throwables append a one-line allowlisted JSON payload after the
-					// stack, but v1 records carry no explicit stack/payload delimiter. Match
-					// the longest body prefix that reproduces the writer's marker so payload
-					// text cannot make an otherwise authentic record unbound.
-					for (let end = bodyLines.length - 1; end >= 0; end--) {
-						const candidate = computeCrashFingerprint({
-							name: errorName,
-							message,
-							stack: bodyLines.slice(0, end).join("\n").trimEnd(),
-						});
-						if (candidate.fingerprint !== marker.fingerprint) continue;
-						fingerprint = candidate;
-						break;
-					}
-				}
+				const fingerprint = findBoundFingerprint(headline, bodyLines, marker.fingerprint);
 				// A stack's first line repeats `Name: message`, which the header already
 				// carries; dropping it keeps the rendered report free of a duplicate.
 				const lines = buffer[0]?.trim() === headline.trim() ? buffer.slice(1) : buffer;
@@ -105,13 +113,13 @@ function parseCandidates(contents: string): ParsedCrashRecord[] {
 						fpv: marker.version,
 						recordId: marker.recordId,
 						at,
-						errorName: fingerprint.errorName,
-						messageClass: fingerprint.messageClass,
+						errorName: fingerprint?.errorName ?? "Error",
+						messageClass: fingerprint?.messageClass ?? "",
 						body: lines.join("\n").trimEnd(),
 						headline,
 					},
 					complete: false,
-					bound: marker.version === CRASH_FINGERPRINT_VERSION && fingerprint.fingerprint === marker.fingerprint,
+					bound: marker.version === CRASH_FINGERPRINT_VERSION && fingerprint !== undefined,
 				};
 				records.push(pending);
 			}

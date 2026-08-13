@@ -34,6 +34,21 @@ function boundRecord(recordId: string, message: string, body: string): { fingerp
 	};
 }
 
+function boundDiagnosticRecord(
+	recordId: string,
+	name: string,
+	message: string,
+	stack: string,
+): { fingerprint: string; text: string } {
+	const fingerprint = computeCrashFingerprint({ name, message, stack }, { installRoot: process.cwd() }).fingerprint;
+	return {
+		fingerprint,
+		text:
+			`2026-08-11T12:00:00.000Z pid=4242 [Uncaught Exception] ${name}: ${message}\n` +
+			`${stack}\n${formatCrashRecordMarker(fingerprint, 1, recordId)}\n\n`,
+	};
+}
+
 describe("parseCrashRecords", () => {
 	it("recovers identity-bearing records and ignores legacy ones", () => {
 		const log =
@@ -90,6 +105,26 @@ describe("parseCrashRecords", () => {
 			`{"phase":"startup","reason":"pending"}\n${formatCrashRecordMarker(valid.fingerprint, 1, "0123456789abcdef")}`,
 		);
 		expect(parseRecoverableCrashRecords(withPayload).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+	});
+
+	it("recovers production v1 records with a colon in the error name", () => {
+		const valid = boundDiagnosticRecord(
+			"1123456789abcdef",
+			"Provider:ProtocolError",
+			"stream failed",
+			"Provider:ProtocolError: stream failed\n    at frame (packages/coding-agent/src/x.ts:1:1)",
+		);
+		expect(parseRecoverableCrashRecords(valid.text).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
+	});
+
+	it("recovers production v1 records with a multiline message", () => {
+		const valid = boundDiagnosticRecord(
+			"2123456789abcdef",
+			"Error",
+			"first line\nsecond line",
+			"Error: first line\nsecond line\n    at frame (packages/coding-agent/src/x.ts:1:1)",
+		);
+		expect(parseRecoverableCrashRecords(valid.text).map(record => record.fingerprint)).toEqual([valid.fingerprint]);
 	});
 
 	it("rejects arbitrary-text identity decoys and mismatched markers", () => {

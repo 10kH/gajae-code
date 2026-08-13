@@ -434,6 +434,9 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	}
 
 	// occurrence
+	// Clear before deduplication: a replayed occurrence after main-index publish
+	// but before retirement-sidecar publish must still supersede a stale tombstone.
+	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => fingerprint !== event.fingerprint);
 	if (index.recentEventIds.includes(event.recordId)) return false;
 	index.recentEventIds.push(event.recordId);
 	if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
@@ -441,7 +444,6 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	// A journal occurrence is newer authority than a prior eviction tombstone.
 	// Clear it before capacity eviction so a full retirement ledger cannot block
 	// the signature's explicit revival.
-	index.retiredFingerprints = index.retiredFingerprints.filter(fingerprint => fingerprint !== event.fingerprint);
 	if (existing) {
 		existing.lifetimeCount += 1;
 		existing.lastSeen = Math.max(existing.lastSeen, event.at);

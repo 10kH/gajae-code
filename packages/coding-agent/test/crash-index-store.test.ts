@@ -210,6 +210,28 @@ describe("compactCrashIndex", () => {
 		expect(rebuilt.signatures[revived.fingerprint]).toBeDefined();
 	});
 
+	it("replayed revival clears a stale retirement sidecar before occurrence-id deduplication", async () => {
+		const paths = await tempPaths();
+		const revived = recoverableRecord(208, "interrupted revival", "2026-08-11T13:00:00.000Z");
+		appendCrashEvent(occurrence(revived.fingerprint, revived.recordId, NOW), paths.events);
+		await fs.writeFile(paths.crashLog, revived.text);
+		const active = await compactCrashIndex({ paths, now: NOW });
+		expect(active.signatures[revived.fingerprint]).toBeDefined();
+
+		// Simulate a crash after the main index published the occurrence id but
+		// before the retirement sidecar replacement removed its stale tombstone.
+		await fs.writeFile(
+			`${paths.index}.retired`,
+			`${JSON.stringify({ version: 1, fingerprints: [revived.fingerprint] })}\n`,
+		);
+		appendCrashEvent(occurrence(revived.fingerprint, revived.recordId, NOW), paths.events);
+		const replayed = await compactCrashIndex({ paths, now: NOW });
+		expect(replayed.retiredFingerprints).not.toContain(revived.fingerprint);
+		await fs.writeFile(paths.index, "not-json");
+		const rebuilt = await compactCrashIndex({ paths, now: NOW });
+		expect(rebuilt.signatures[revived.fingerprint]).toBeDefined();
+	});
+
 	it("prunes retired signatures with no retained record so sequential retirements never exhaust eviction", async () => {
 		const paths = await tempPaths();
 		for (let seed = 1; seed <= CRASH_INDEX_MAX_SIGNATURES; seed++)
