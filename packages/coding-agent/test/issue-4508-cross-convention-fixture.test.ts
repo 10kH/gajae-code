@@ -180,6 +180,11 @@ async function seedCollisionBundle(marker: string): Promise<void> {
 
 async function makeForeignHookDistinct(product: ImportedProduct, marker: string): Promise<void> {
 	const files = sourceFiles(product);
+	await fs.writeFile(
+		files.skill,
+		SKILL_CONTENT.replace("canonical runtime consumption", "foreign skill must stay inactive"),
+		"utf8",
+	);
 	await fs.writeFile(files.hook, hookContent(marker), "utf8");
 	const foreignMcpScript = MCP_SERVER_SCRIPT.replace("canonical-mcp-consumed", "foreign-mcp-consumed");
 	await fs.writeFile(
@@ -224,8 +229,10 @@ async function consumeCanonicalBundle(marker: string): Promise<{
 	});
 	const loadedSkill = loadedSkills.skills.find(skill => skill.name === SKILL_NAME);
 	expect(loadedSkill).toBeDefined();
+	expect(loadedSkill?.filePath).toBe(path.join(projectDir, ".gjc", "skills", SKILL_NAME, "SKILL.md"));
 	const body = await loadedSkill?.loadContent?.();
 	expect(body).toContain("canonical runtime consumption");
+	expect(body).not.toContain("foreign skill must stay inactive");
 
 	const created = await createAgentSession({
 		cwd: projectDir,
