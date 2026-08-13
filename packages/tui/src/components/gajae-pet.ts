@@ -1,3 +1,5 @@
+import { deflateSync } from "node:zlib";
+
 import {
 	OUROBOROS_HEART_STEPS,
 	OUROBOROS_IDLE_STEPS,
@@ -38,7 +40,8 @@ import {
  * RENDERING: buildGajaePixelFrames({ protocol, cellWidthPx, cellHeightPx,
  * targetRows: 2 }) scales the art to 2 terminal rows and encodes each frame
  * once. Kitty uses a native `Y=` sub-cell drop (set by the widget) to sit on the
- * composer border; sixel uses transparent top padding.
+ * composer border; sixel uses transparent top padding; iTerm2 uses an inline PNG
+ * sized to the reserved cell block.
  *
  * BEHAVIOR (timing, positioning, on/off) lives in
  * packages/coding-agent/src/modes/components/gajae-pet-widget.ts.
@@ -416,6 +419,72 @@ export function encodeGridSixel(
 	return `${out}\x1b\\`;
 }
 
+function pngChunk(type: string, data: Uint8Array): Uint8Array {
+	const typeBytes = Buffer.from(type, "ascii");
+	const payload = Buffer.concat([typeBytes, Buffer.from(data)]);
+	let crc = 0xffffffff;
+	for (const byte of payload) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+	}
+	crc = (crc ^ 0xffffffff) >>> 0;
+	const out = Buffer.allocUnsafe(12 + data.length);
+	out.writeUInt32BE(data.length, 0);
+	Buffer.from(payload).copy(out, 4);
+	out.writeUInt32BE(crc, 8 + data.length);
+	return out;
+}
+
+/** Encode a grid as an iTerm2 inline PNG. */
+export function encodeGridIterm2(
+	grid: string[],
+	scale: number,
+	_cellWidthPx: number,
+	_cellHeightPx: number,
+	topPaddingPx = 0,
+	bottomPaddingPx = 0,
+	palette: Palette = RED_PALETTE,
+): string {
+	const gw = grid[0].length;
+	const gh = grid.length;
+	const width = Math.round(gw * scale);
+	const spriteHeight = Math.round(gh * scale);
+	const height = spriteHeight + topPaddingPx + bottomPaddingPx;
+	const raw = Buffer.alloc((width * 4 + 1) * height);
+	for (let y = 0; y < height; y++) {
+		for (let x = 0; x < width; x++) {
+			const sourceY = y - topPaddingPx;
+			const rgb =
+				sourceY < 0
+					? null
+					: palette[grid[Math.min(gh - 1, Math.floor(sourceY / scale))][Math.min(gw - 1, Math.floor(x / scale))]];
+			const offset = y * (width * 4 + 1) + 1 + x * 4;
+			if (!rgb) continue;
+			raw[offset] = rgb[0];
+			raw[offset + 1] = rgb[1];
+			raw[offset + 2] = rgb[2];
+			raw[offset + 3] = 255;
+		}
+	}
+	const compressed = deflateSync(raw);
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(width, 0);
+	header.writeUInt32BE(height, 4);
+	header[8] = 8;
+	header[9] = 6;
+	const png = Buffer.concat([
+		Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+		pngChunk("IHDR", header),
+		pngChunk("IDAT", compressed),
+		pngChunk("IEND", new Uint8Array()),
+	]);
+	// Use explicit pixel dimensions. Cell dimensions are only a layout hint for
+	// the surrounding TUI; asking iTerm2 to fit a small PNG into a cell box makes
+	// it stretch or shrink differently from Kitty/Ghostty.
+	const params = `width=${width}px;height=${height}px;preserveAspectRatio=0;inline=1`;
+	return `\x1b]1337;File=${params}:${png.toString("base64")}\x07`;
+}
+
 /** Encode a bottom-aligned grid as kitty raw RGBA at `scale`. */
 export function encodeGridKitty(
 	grid: string[],
@@ -476,7 +545,7 @@ export interface GajaePixelFrames {
 	/** escape payload per logical frame (drawn at the current cursor cell) */
 	frames: Record<string, string>;
 	/** protocol the frames were encoded for */
-	protocol: "sixel" | "kitty";
+	protocol: "sixel" | "kitty" | "iterm2";
 	widthPx: number;
 	heightPx: number;
 	columns: number;
@@ -491,7 +560,7 @@ export interface GajaePixelFrames {
  * additions can opt into denser art without changing the terminal footprint.
  */
 export function buildGajaePixelFrames(options: {
-	protocol: "sixel" | "kitty";
+	protocol: "sixel" | "kitty" | "iterm2";
 	cellWidthPx: number;
 	cellHeightPx: number;
 	targetRows?: number;
@@ -500,6 +569,10 @@ export function buildGajaePixelFrames(options: {
 	/** Native sub-cell `Y=` pixel offset that drops the kitty sprite within its first cell. */
 	kittyCellYOffsetPx?: number;
 	kittyImageId?: number;
+	/** Transparent iTerm2-only top padding for half-cell vertical alignment. */
+	iterm2TopPaddingPx?: number;
+	/** Transparent iTerm2-only bottom padding inside the two-row canvas. */
+	iterm2BottomPaddingPx?: number;
 	/** Color skin for the sprite palette (default "red"). */
 	skin?: PetSkinId;
 }): GajaePixelFrames {
@@ -536,18 +609,28 @@ export function buildGajaePixelFrames(options: {
 		frames[name] =
 			options.protocol === "sixel"
 				? encodeGridSixel(grid, scale, topPaddingPx, skin.palette)
-				: encodeGridKitty(
-						grid,
-						scale,
-						imageId,
-						columns,
-						rows,
-						topPaddingPx,
-						options.kittyCellYOffsetPx ?? 0,
-						leftPaddingPx,
-						rightPaddingPx,
-						skin.palette,
-					);
+				: options.protocol === "iterm2"
+					? encodeGridIterm2(
+							grid,
+							scale,
+							options.cellWidthPx,
+							options.cellHeightPx,
+							options.iterm2TopPaddingPx ?? 0,
+							options.iterm2BottomPaddingPx ?? 0,
+							skin.palette,
+						)
+					: encodeGridKitty(
+							grid,
+							scale,
+							imageId,
+							columns,
+							rows,
+							topPaddingPx,
+							options.kittyCellYOffsetPx ?? 0,
+							leftPaddingPx,
+							rightPaddingPx,
+							skin.palette,
+						);
 	}
 
 	return { frames, protocol: options.protocol, widthPx, heightPx, columns, rows, rasterRows };

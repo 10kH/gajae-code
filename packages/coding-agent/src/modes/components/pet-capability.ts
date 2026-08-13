@@ -7,13 +7,13 @@ import {
 	TERMINAL,
 } from "@gajae-code/tui";
 
-export type PetPixelProtocol = "sixel" | "kitty";
+export type PetPixelProtocol = "sixel" | "kitty" | "iterm2";
 
-export const PET_UNAVAILABLE_DESCRIPTION = "Unavailable: requires compatible Kitty or Sixel overlay rendering";
+export const PET_UNAVAILABLE_DESCRIPTION = "Unavailable: requires compatible Kitty, iTerm2, or Sixel overlay rendering";
 export const PET_SAVED_UNAVAILABLE_DESCRIPTION =
-	"Saved, unavailable — requires compatible Kitty or Sixel overlay rendering";
+	"Saved, unavailable — requires compatible Kitty, iTerm2, or Sixel overlay rendering";
 export const PET_UNAVAILABLE_WARNING =
-	"⚠ Pets aren’t available in this terminal. Its image support isn’t compatible with Gajae Pet’s overlay rendering yet. Try Kitty, Ghostty, WezTerm, or a terminal with compatible Sixel support.";
+	"⚠ Pets aren’t available in this terminal. Its image support isn’t compatible with Gajae Pet’s overlay rendering yet. Try Kitty, Ghostty, WezTerm, iTerm2, or a terminal with compatible Sixel support.";
 const PET_MULTIPLEXER_UNAVAILABLE_WARNING =
 	"⚠ Gajae Pet graphics are unavailable inside tmux, screen, or zellij because image escapes are not forwarded end to end. Run gjc outside the multiplexer, or set PI_FORCE_IMAGE_PROTOCOL=sixel only when the full terminal chain supports Sixel.";
 
@@ -24,6 +24,7 @@ export function getPetUnavailableWarning(env: NodeJS.ProcessEnv = Bun.env): stri
 export function getPetPixelProtocol(): PetPixelProtocol | null {
 	if (TERMINAL.imageProtocol === ImageProtocol.Kitty) return "kitty";
 	if (TERMINAL.imageProtocol === ImageProtocol.Sixel) return "sixel";
+	if (TERMINAL.imageProtocol === ImageProtocol.Iterm2) return "iterm2";
 	return null;
 }
 

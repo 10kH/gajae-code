@@ -94,7 +94,7 @@ function makeWidget(
 		bottomOffset?: number;
 		isWorking?: () => boolean;
 		autoFlexGapMs?: [number, number] | null;
-		protocol?: "sixel" | "kitty" | null;
+		protocol?: "sixel" | "kitty" | "iterm2" | null;
 	} = {},
 ) {
 	const stubs = makeStubs(columns, rows);
@@ -143,6 +143,21 @@ describe("GajaePetWidget", () => {
 
 			expect(widget.mode).toBe("red");
 			expect(getEmitter()).toBeDefined();
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("keeps the full-size iTerm2 footprint at the composer boundary", () => {
+		const { widget, editorContainer, getRenderedWidth, getEmitter } = makeWidget(80, 30, { protocol: "iterm2" });
+		try {
+			widget.setMode("red");
+			editorContainer.render(80);
+			expect(getRenderedWidth()).toBe(80 - 5);
+			const payload = getEmitter()?.();
+			expect(payload).toContain("\x1b[28;76H");
+			expect(payload).toContain("\x1b]1337;File=");
+			expect(payload).toContain("width=36px;height=51px;preserveAspectRatio=0");
 		} finally {
 			widget.dispose();
 		}
