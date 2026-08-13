@@ -397,6 +397,34 @@ describe("owner subagent shutdown leases", () => {
 		await manager.dispose();
 	});
 
+	test("retains delivery suppression until every watcher releases the job", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+			},
+			retentionMs: 60_000,
+		});
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "multiply watched completion", async () => gate.promise, {
+			ownerId: "owner-a",
+			metadata: { subagent: { id: "multiply-watched", agent: "executor", agentSource: "bundled" } },
+		});
+		manager.watchJobs([jobId]);
+		manager.watchJobs([jobId]);
+		manager.unwatchJobs([jobId]);
+		gate.resolve("done while one watcher remains");
+		await manager.getJob(jobId)?.promise;
+		await Bun.sleep(10);
+		expect(manager.isDeliverySuppressed(jobId, manager.getJob(jobId)?.generation)).toBe(true);
+		expect(delivered).toEqual([]);
+
+		manager.unwatchJobs([jobId]);
+		await manager.drainDeliveries({ filter: { ownerId: "owner-a" }, timeoutMs: 100 });
+		expect(delivered).toEqual([jobId]);
+		await manager.dispose();
+	});
+
 	test("acknowledging another job preserves a watched completion", async () => {
 		const delivered: string[] = [];
 		const manager = new AsyncJobManager({

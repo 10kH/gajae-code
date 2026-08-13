@@ -449,6 +449,19 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		let lastEmittedSignature: string | undefined;
 		let streamingDisabled = false;
 		let stopProgressTimer = (): void => {};
+		const disableStreaming = (error: unknown): void => {
+			if (streamingDisabled) return;
+			streamingDisabled = true;
+			stopProgressTimer();
+			try {
+				logger.warn("Subagent await progress update failed; streaming disabled for this wait", {
+					error: safeThrownValue(error),
+				});
+			} catch {
+				// Diagnostics must never turn a recoverable progress-channel failure
+				// into an await or process-lifecycle failure.
+			}
+		};
 		const emitIfChanged = (force: boolean): void => {
 			if (!onUpdate || streamingDisabled) return;
 			try {
@@ -459,7 +472,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				if (!livenessDue && signature === lastEmittedSignature) return;
 				lastEmittedSignature = signature;
 				lastEmitMs = t;
-				onUpdate(result);
+				// A TypeScript void-return callback may still be implemented by an
+				// async function. Observe its runtime result so a rejected promise or
+				// thenable cannot become an unhandled rejection outside this span.
+				const updateResult = (onUpdate as (update: AgentToolResult<SubagentToolDetails>) => unknown)(result);
+				if (isPromiseLike(updateResult)) void Promise.resolve(updateResult).catch(disableStreaming);
 			} catch (error) {
 				// The liveness timer fires outside this function's promise chain, so a
 				// throwing progress consumer would otherwise escape `setInterval` as an
@@ -467,11 +484,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				// interval keep firing and rethrowing for the rest of the await. Retire
 				// the streaming channel instead and keep waiting: losing progress output
 				// is recoverable, losing the timer and the watch registration is not.
-				streamingDisabled = true;
-				stopProgressTimer();
-				logger.warn("Subagent await progress update failed; streaming disabled for this wait", {
-					error: String(error),
-				});
+				disableStreaming(error);
 			}
 		};
 		// The initial emission and the timer own process-lifetime resources together
@@ -899,6 +912,20 @@ function awaitProgressSummary(subagents: readonly SubagentSnapshot[]): string {
 	return `Awaiting ${waiting.length} subagent(s) for ${formatDuration(longestMs)}: ${waiting
 		.map(snapshot => snapshot.id)
 		.join(", ")}`;
+}
+
+function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
+	if ((typeof value !== "object" || value === null) && typeof value !== "function") return false;
+	return typeof (value as { then?: unknown }).then === "function";
+}
+
+function safeThrownValue(error: unknown): string {
+	try {
+		if (error instanceof Error) return error.message;
+		return String(error);
+	} catch {
+		return "[unprintable thrown value]";
+	}
 }
 
 function isTerminalStatus(status: SubagentStatus): boolean {

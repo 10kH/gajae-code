@@ -141,6 +141,163 @@ describe("subagent await progress consumer failure", () => {
 		warn.mockRestore();
 	});
 
+	it("contains a rejected initial emission without affecting the wait", async () => {
+		vi.useFakeTimers();
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const { jobId, gate } = addRunningChild(manager, "0-RejectOnInitial");
+		const observer = vi.fn(() => Promise.reject(new Error("initial rejection")));
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const controller = new AbortController();
+		const awaiting = tool.execute(
+			"await-reject-on-initial",
+			{ action: "await", ids: ["0-RejectOnInitial"], timeout_ms: 3_600_000, heartbeat_ms: 500 },
+			controller.signal,
+			observer,
+		);
+
+		await Promise.resolve();
+		await Promise.resolve();
+		vi.advanceTimersByTime(60_000);
+		expect(observer).toHaveBeenCalledTimes(1);
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0]?.[1]?.error).toBe("initial rejection");
+		expect(manager.getJob(jobId)?.status).toBe("running");
+
+		controller.abort();
+		await awaiting;
+		gate.resolve("done");
+		await manager.getJob(jobId)?.promise;
+		await manager.dispose({ timeoutMs: 100 });
+		warn.mockRestore();
+	});
+
+	it("contains a rejected timer emission and stops later progress", async () => {
+		vi.useFakeTimers();
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const { jobId, gate } = addRunningChild(manager, "0-RejectOnTick");
+		let calls = 0;
+		const observer = vi.fn(() => {
+			calls += 1;
+			return calls === 2 ? Promise.reject(new Error("timer rejection")) : undefined;
+		});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const controller = new AbortController();
+		const awaiting = tool.execute(
+			"await-reject-on-tick",
+			{ action: "await", ids: ["0-RejectOnTick"], timeout_ms: 3_600_000, heartbeat_ms: 500 },
+			controller.signal,
+			observer,
+		);
+
+		await Promise.resolve();
+		vi.advanceTimersByTime(15_000);
+		await Promise.resolve();
+		await Promise.resolve();
+		vi.advanceTimersByTime(60_000);
+		expect(observer).toHaveBeenCalledTimes(2);
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0]?.[1]?.error).toBe("timer rejection");
+
+		controller.abort();
+		await awaiting;
+		gate.resolve("done");
+		await manager.getJob(jobId)?.promise;
+		await manager.dispose({ timeoutMs: 100 });
+		warn.mockRestore();
+	});
+
+	it("contains a hostile non-stringifiable thrown value", async () => {
+		vi.useFakeTimers();
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const { jobId, gate } = addRunningChild(manager, "0-HostileThrow");
+		const hostile = Object.create(null) as { toString?: () => string };
+		hostile.toString = () => {
+			throw new Error("formatting escaped");
+		};
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const controller = new AbortController();
+		const awaiting = tool.execute(
+			"await-hostile-throw",
+			{ action: "await", ids: ["0-HostileThrow"], timeout_ms: 3_600_000 },
+			controller.signal,
+			() => {
+				throw hostile;
+			},
+		);
+
+		await Promise.resolve();
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0]?.[1]?.error).toBe("[unprintable thrown value]");
+		expect(manager.getJob(jobId)?.status).toBe("running");
+
+		controller.abort();
+		await awaiting;
+		gate.resolve("done");
+		await manager.getJob(jobId)?.promise;
+		await manager.dispose({ timeoutMs: 100 });
+		warn.mockRestore();
+	});
+
+	it("preserves sibling and future waits after one consumer rejects", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+			},
+			retentionMs: 10_000,
+		});
+		AsyncJobManager.setInstance(manager);
+		const tool = new SubagentTool(createSession());
+		const first = addRunningChild(manager, "0-SharedWait");
+		const failedController = new AbortController();
+		const siblingUpdates = vi.fn();
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		const failedAwait = tool.execute(
+			"await-shared-failed",
+			{ action: "await", ids: ["0-SharedWait"], timeout_ms: 3_600_000 },
+			failedController.signal,
+			() => Promise.reject(new Error("isolated rejection")),
+		);
+		const siblingAwait = tool.execute(
+			"await-shared-sibling",
+			{ action: "await", ids: ["0-SharedWait"], timeout_ms: 3_600_000 },
+			undefined,
+			siblingUpdates,
+		);
+
+		await Promise.resolve();
+		await Promise.resolve();
+		failedController.abort();
+		await failedAwait;
+		expect(manager.isDeliverySuppressed(first.jobId, manager.getJob(first.jobId)?.generation)).toBe(true);
+		first.gate.resolve("shared done");
+		const siblingResult = await siblingAwait;
+		expect(siblingResult.details?.awaitOutcome).toBe("completed");
+		expect(delivered).toEqual([]);
+		expect(siblingUpdates).toHaveBeenCalled();
+
+		const future = addRunningChild(manager, "0-FutureWait");
+		const futureUpdates = vi.fn();
+		const futureAwait = tool.execute(
+			"await-future",
+			{ action: "await", ids: ["0-FutureWait"], timeout_ms: 3_600_000 },
+			undefined,
+			futureUpdates,
+		);
+		future.gate.resolve("future done");
+		const futureResult = await futureAwait;
+		expect(futureResult.details?.awaitOutcome).toBe("completed");
+		expect(futureUpdates).toHaveBeenCalled();
+		expect(delivered).toEqual([]);
+		expect(warn).toHaveBeenCalledTimes(1);
+
+		await manager.dispose({ timeoutMs: 100 });
+		warn.mockRestore();
+	});
+
 	it("streams a readable summary so ACP does not fall back to a serialized receipt", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());

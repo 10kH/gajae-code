@@ -539,7 +539,7 @@ export class AsyncJobManager {
 	readonly #inFlightDeliveries: AsyncJobDelivery[] = [];
 	readonly #suppressedDeliveries = new Set<string>();
 	readonly #deliveryAckOwners = new Map<string, string>();
-	readonly #watchedJobs = new Set<string>();
+	readonly #watchedJobs = new Map<string, number>();
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #outputState = new Map<string, AsyncJobOutputState>();
 	readonly #ownerCleanups = new Map<string, Set<() => void>>();
@@ -2097,7 +2097,7 @@ export class AsyncJobManager {
 	watchJobs(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		for (const jobId of uniqueJobIds) {
-			this.#watchedJobs.add(jobId);
+			this.#watchedJobs.set(jobId, (this.#watchedJobs.get(jobId) ?? 0) + 1);
 		}
 		return uniqueJobIds.length;
 	}
@@ -2106,9 +2106,11 @@ export class AsyncJobManager {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		let removed = 0;
 		for (const jobId of uniqueJobIds) {
-			if (this.#watchedJobs.delete(jobId)) {
+			const watchers = this.#watchedJobs.get(jobId) ?? 0;
+			if (watchers === 1) {
+				this.#watchedJobs.delete(jobId);
 				removed += 1;
-			}
+			} else if (watchers > 1) this.#watchedJobs.set(jobId, watchers - 1);
 		}
 		if (removed > 0) this.#ensureDeliveryLoop();
 		return removed;
@@ -2450,7 +2452,7 @@ export class AsyncJobManager {
 	}
 
 	isDeliverySuppressed(jobId: string, generation?: string): boolean {
-		return this.#isDeliveryAcknowledged(jobId, generation) || this.#watchedJobs.has(jobId);
+		return this.#isDeliveryAcknowledged(jobId, generation) || (this.#watchedJobs.get(jobId) ?? 0) > 0;
 	}
 
 	#pruneEvictedDeadLetters(): void {
