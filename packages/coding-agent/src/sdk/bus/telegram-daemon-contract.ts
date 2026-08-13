@@ -258,9 +258,11 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * endpoint, through a single-flight coordinator keyed to the full provider
  * identity, and never awaits it on a lifecycle path. The daemon also sweeps
  * inert notification-dir debris at startup. Older daemons assume ownership is
- * proved before publication and do not perform that sweep.
+ * proved before publication and do not perform that sweep. Generation 165
+ * preserves a bounded lean settlement window across autonomous continuations,
+ * so the Telegram terminal receipt cannot lose a prior user-request result.
  */
-export const DAEMON_GENERATION = 164;
+export const DAEMON_GENERATION = 165;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
