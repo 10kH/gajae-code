@@ -7,7 +7,11 @@ import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { localBackend } from "@gajae-code/coding-agent/memory-backend/local-backend";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
-import { SessionContextTooLargeError, SessionManager } from "@gajae-code/coding-agent/session/session-manager";
+import {
+	SessionContextTooLargeError,
+	SessionManager,
+	SessionManagerTestHooks,
+} from "@gajae-code/coding-agent/session/session-manager";
 
 const createdDirs = new Set<string>();
 
@@ -20,6 +24,7 @@ describe("createAgentSession memory startup", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		delete SessionManagerTestHooks.sessionContextBudgetBytesOverride;
 		authStorage.close();
 		for (const dir of createdDirs) {
 			await fs.promises.rm(dir, { recursive: true, force: true });
@@ -72,9 +77,10 @@ describe("createAgentSession memory startup", () => {
 		createdDirs.add(cwd);
 		const modelRegistry = new ModelRegistry(authStorage);
 		const sessionManager = SessionManager.inMemory();
+		SessionManagerTestHooks.sessionContextBudgetBytesOverride = 1024;
 		sessionManager.appendMessage({
 			role: "user",
-			content: "x".repeat(34 * 1024 * 1024),
+			content: "x".repeat(2048),
 			timestamp: Date.now(),
 		});
 

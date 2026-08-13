@@ -273,7 +273,13 @@ function emitExternalStart(
 
 async function activityAfterSeq(stateFile: string, seq: number): Promise<Record<string, unknown>> {
 	for (let attempt = 0; attempt < 200; attempt++) {
-		const payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+		let payload: Record<string, unknown>;
+		try {
+			payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+		} catch {
+			await Bun.sleep(5);
+			continue;
+		}
 		const activity = payload.activity as Record<string, unknown> | undefined;
 		if (activity && activity.seq === seq) return activity;
 		await Bun.sleep(5);
@@ -282,8 +288,15 @@ async function activityAfterSeq(stateFile: string, seq: number): Promise<Record<
 }
 
 async function readActivity(stateFile: string): Promise<Record<string, unknown> | undefined> {
-	const payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
-	return payload.activity as Record<string, unknown> | undefined;
+	for (let attempt = 0; attempt < 200; attempt++) {
+		try {
+			const payload = JSON.parse(await Bun.file(stateFile).text()) as Record<string, unknown>;
+			return payload.activity as Record<string, unknown> | undefined;
+		} catch {
+			await Bun.sleep(5);
+		}
+	}
+	throw new Error("coordinator activity snapshot was never readable");
 }
 
 /** Wait until the sidecar stops writing, so the LAST published snapshot can be asserted. */
