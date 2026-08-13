@@ -8105,6 +8105,10 @@ export function createNotificationsExtension(
 			pending.receipts = [pending.receipts[0]!, receipt];
 			return;
 		}
+		if (origin === "continuation" && pending.receipts[0]?.origin === "user") {
+			pending.receipts = [pending.receipts[0]!, receipt];
+			return;
+		}
 		pending.receipts = [receipt];
 	};
 
