@@ -137,6 +137,7 @@ import {
 import { createReconciliationStore, type ReconciliationStore } from "../sdk/bus/reconciliation-store";
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
+import { markAutoroutingInactive } from "../sdk/host/internal-autorouting-state";
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
@@ -3026,6 +3027,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (notificationsExtensionEligible || sdkHostEligible) {
 			inlineExtensions.push(async api => {
 				try {
+					if (autoroutingInactive) markAutoroutingInactive(api);
 					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
@@ -3033,7 +3035,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
 							settings,
-							autoroutingInactive,
 
 							controller: notificationSessionController,
 							spawnedByGjc,
@@ -3087,7 +3088,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							brokerRegistrationRequired: lifecycleStartupCapability !== undefined,
 							createTransport: input => createSdkWebSocketTransport(input),
 							settings,
-							autoroutingInactive,
 							configOverrides: new Map(),
 							// INTERNAL terminal-abort seams, threaded directly from the
 							// owning session (NOT on the public extension context).
