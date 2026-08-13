@@ -20,6 +20,12 @@
 		"test",
 		"tests",
 		"scripts",
-		"bench"
+		"bench",
+		"**/*.test.ts",
+		"**/*.test.tsx",
+		"**/*.spec.ts",
+		"**/*.spec.tsx",
+		"**/*.bench.ts",
+		"**/fixtures/**"
 	]
 }
