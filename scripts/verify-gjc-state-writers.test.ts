@@ -63,3 +63,21 @@ test("detects namespace and fs.promises writes into .gjc", async () => {
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("detects dynamic fs bindings and indirect Bun.write aliases into .gjc", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-writer-dynamic-"));
+	try {
+		const directory = path.join(root, "packages", "coding-agent", "src");
+		await fs.mkdir(directory, { recursive: true });
+		await Bun.write(path.join(directory, "dynamic.ts"), 'const io = await import("node:fs/promises");\nawait io.writeFile(".gjc/a", "x");\n');
+		await Bun.write(path.join(directory, "destructured.ts"), 'const { writeFile: write } = await import("node:fs/promises");\nawait write(".gjc/b", "x");\n');
+		await Bun.write(path.join(directory, "bun-alias.ts"), 'const write = Bun.write;\nawait write(".gjc/c", "x");\n');
+		const result = await run(root);
+		expect(result.exitCode).toBe(1);
+		for (const file of ["dynamic.ts", "destructured.ts", "bun-alias.ts"]) {
+			expect(`${result.stdout}\n${result.stderr}`).toContain(file);
+		}
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});

@@ -126,6 +126,22 @@ function importedFsNamespaces(content: string): Set<string> {
 	return aliases;
 }
 
+function dynamicMutationBindings(content: string): { aliases: Set<string>; namespaces: Set<string> } {
+	const aliases = new Set<string>();
+	const namespaces = new Set<string>();
+	for (const match of content.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*await\s+import\(\s*["']node:fs(?:\/promises)?["']\s*\)/gu)) {
+		namespaces.add(match[1]!);
+	}
+	for (const match of content.matchAll(/(?:const|let|var)\s*\{([^}]+)\}\s*=\s*await\s+import\(\s*["']node:fs(?:\/promises)?["']\s*\)/gu)) {
+		for (const raw of match[1]!.split(",")) {
+			const binding = /^\s*([A-Za-z_$][\w$]*)(?:\s*:\s*([A-Za-z_$][\w$]*))?\s*$/u.exec(raw);
+			if (binding && MUTATION_EXPORTS.has(binding[1]!)) aliases.add(binding[2] ?? binding[1]!);
+		}
+	}
+	for (const match of content.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*Bun\.write\b/gu)) aliases.add(match[1]!);
+	return { aliases, namespaces };
+}
+
 function matchedApi(line: string, aliases: ReadonlySet<string>, namespaces: ReadonlySet<string>): string | null {
 	for (const re of MUTATION_API_PATTERNS) {
 		const m = re.exec(line);
@@ -192,6 +208,9 @@ function collectFindings(): Finding[] {
 		const content = fs.readFileSync(file, "utf8");
 		const mutationAliases = importedMutationAliases(content);
 		const fsNamespaces = importedFsNamespaces(content);
+		const dynamicBindings = dynamicMutationBindings(content);
+		for (const alias of dynamicBindings.aliases) mutationAliases.add(alias);
+		for (const namespace of dynamicBindings.namespaces) fsNamespaces.add(namespace);
 		const relative = path.relative(repoRoot, file);
 		const lines = content.split("\n");
 		for (let i = 0; i < lines.length; i++) {
