@@ -535,6 +535,175 @@ test("lean ask-free turns emit a single settled turn_stream only at agent_end", 
 	}
 }, 30000);
 
+test("lean preserves a user-request receipt when an autonomous continuation acknowledges a background notice", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Complete the request." } },
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{
+				type: "message_end",
+				message: { role: "assistant", content: "Completed: migrated all records and verified the result." },
+			},
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{
+				type: "turn_end",
+				turnIndex: 0,
+				message: { role: "assistant", content: "Completed: migrated all records and verified the result." },
+			},
+			ctx,
+		);
+
+		// A background/subagent completion is a custom autonomous input, not a new user request.
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "Acknowledged background completion." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{
+				type: "turn_end",
+				turnIndex: 1,
+				message: { role: "assistant", content: "Acknowledged background completion." },
+			},
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "composed settled receipt");
+		expect(turnStreams()[0]!.text).toContain("Completed: migrated all records and verified the result.");
+		expect(turnStreams()[0]!.text).toContain("Acknowledged background completion.");
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(true);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("a new user request supersedes the preceding lean settlement window", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "First request." } },
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "First receipt." } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Second request." } },
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "Second receipt." } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "superseding receipt");
+		expect(turnStreams()[0]!.text).toContain("Second receipt.");
+		expect(turnStreams()[0]!.text).not.toContain("First receipt.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("a user boundary suppresses a turn that started in the preceding settlement window", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "First request." } },
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		// A newly submitted user request opens a new window before the prior turn closes.
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Second request." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: "Stale first receipt." } },
+			ctx,
+		);
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: "Second receipt." } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "current-window receipt");
+		expect(turnStreams()[0]!.text).toContain("Second receipt.");
+		expect(turnStreams()[0]!.text).not.toContain("Stale first receipt.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean bounds autonomous settlement composition to the receipt and latest material update", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const turn = async (turnIndex: number, text: string, autonomous = false): Promise<void> => {
+			if (autonomous)
+				await handlers.get("message_end")!(
+					{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+					ctx,
+				);
+			await handlers.get("turn_start")!({ type: "turn_start", turnIndex }, ctx);
+			await handlers.get("turn_end")!(
+				{ type: "turn_end", turnIndex, message: { role: "assistant", content: text } },
+				ctx,
+			);
+		};
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Complete the request." } },
+			ctx,
+		);
+		await turn(0, "Completion receipt.");
+		await turn(1, "Material update one.", true);
+		await turn(2, "Material update two.", true);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+
+		await waitFor(() => turnStreams().length === 1, 3000, "bounded composed receipt");
+		expect(turnStreams()[0]!.text).toContain("Completion receipt.");
+		expect(turnStreams()[0]!.text).toContain("Material update two.");
+		expect(turnStreams()[0]!.text).not.toContain("Material update one.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 test("verbose still streams a finalized turn_stream at each turn_end", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";

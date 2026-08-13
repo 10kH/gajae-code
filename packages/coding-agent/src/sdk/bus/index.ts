@@ -1243,13 +1243,26 @@ interface SessionRuntime {
 	 * frames so a stale live edit can never be emitted after the finalized turn. */
 	turnClosed?: boolean;
 	/** Finalized while provisional policy was held; flush exactly once on stable activation. */
-	pendingFinal?: { text?: string; messageRef?: string };
+	pendingFinal?: { window: number; text?: string; messageRef?: string };
+	/** Monotonic user-request boundary for deferred lean delivery. */
+	settlementWindow: number;
+	/** Provenance carried from an inbound message to the next assistant turn. */
+	nextTurnSettlementOrigin?: "user" | "autonomous";
+	/** Provenance of the currently executing assistant turn. */
+	currentTurnSettlementOrigin?: "user" | "autonomous" | "continuation";
+	/** Immutable settlement boundary captured when the current turn begins. */
+	currentTurnSettlementWindow?: number;
 	/**
-	 * Lean-mode deferred final answer: latest assistant text observed at `turn_end`,
-	 * emitted once at `agent_end` so intermediate tool-turn narration does not flood
-	 * remote clients. Cleared after flush or when replaced by a newer turn.
+	 * Lean-mode deferred receipts for the current user-request settlement window.
+	 * Ordinary tool-loop turns retain latest-turn-wins behaviour. An autonomous
+	 * continuation has no new user request, so it appends instead of erasing the
+	 * prior receipt. The small fixed receipt bound prevents an unbounded idle wait
+	 * from retaining the full transcript.
 	 */
-	pendingSettled?: { text: string; messageRef?: string };
+	pendingSettled?: {
+		window: number;
+		receipts: Array<{ text: string; messageRef?: string }>;
+	};
 	/** SDK control frames received during provisional ownership; replayed only after stable activation. */
 	deferredInboundControls: Array<() => void>;
 	/** Started tool calls awaiting a terminal activity frame, keyed by tool call id. */
@@ -6645,6 +6658,7 @@ export function createNotificationsExtension(
 			policySuspended: true,
 			verbosity: "lean",
 			stream: false,
+			settlementWindow: 0,
 			policyGeneration: 0,
 			workflowGatePublicationEpoch: 0,
 			sessionTag: tag,
@@ -8030,18 +8044,39 @@ export function createNotificationsExtension(
 		rt.lastLiveText = undefined;
 	};
 
+	const deferLeanReceipt = (
+		rt: SessionRuntime,
+		text: string,
+		messageRef?: string,
+		window: number = rt.currentTurnSettlementWindow ?? rt.settlementWindow,
+	): void => {
+		if (window !== rt.settlementWindow) return;
+		const receipt = { text, ...(messageRef ? { messageRef } : {}) };
+		const pending = rt.pendingSettled;
+		if (!pending || pending.window !== window) {
+			rt.pendingSettled = { window, receipts: [receipt] };
+			return;
+		}
+		if (rt.currentTurnSettlementOrigin === "autonomous") {
+			const prior = pending.receipts[pending.receipts.length - 1];
+			if (prior?.text === text) return;
+			// Keep the user-request receipt plus the newest autonomous outcome.
+			pending.receipts = [pending.receipts[0]!, receipt];
+			return;
+		}
+		pending.receipts = [receipt];
+	};
+
 	const flushPendingFinal = (rt: SessionRuntime, id: string): void => {
 		const pending = rt.pendingFinal;
 		if (!pending) return;
 		rt.pendingFinal = undefined;
+		if (pending.window !== rt.settlementWindow) return;
 		if (pending.text && rt.notificationsActive && !rt.redact) {
 			// Under lean, hold intermediate finals until agent_end when the agent is still
 			// running so provisional-policy activation cannot reintroduce per-turn spam.
 			if (rt.verbosity === "lean" && rt.busy) {
-				rt.pendingSettled = {
-					text: pending.text,
-					...(pending.messageRef ? { messageRef: pending.messageRef } : {}),
-				};
+				deferLeanReceipt(rt, pending.text, pending.messageRef);
 			} else {
 				try {
 					pushSessionFrame(rt, {
@@ -8064,13 +8099,17 @@ export function createNotificationsExtension(
 	const flushPendingSettled = (rt: SessionRuntime, id: string): void => {
 		const settled = rt.pendingSettled;
 		rt.pendingSettled = undefined;
-		if (!settled?.text || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
+		if (!settled?.receipts.length || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
+		const text = settled.receipts.map(receipt => receipt.text).join("\n\n");
+		// A composition represents multiple finalized turns. It must be a fresh
+		// terminal message rather than editing either constituent turn's stream.
+		const messageRef = settled.receipts.length === 1 ? settled.receipts[0]?.messageRef : undefined;
 		const previousLiveRef = rt.liveRef;
-		if (settled.messageRef) rt.liveRef = settled.messageRef;
+		if (messageRef) rt.liveRef = messageRef;
 		try {
-			flushTurnText(rt, id, settled.text, true);
+			flushTurnText(rt, id, text, true);
 		} finally {
-			if (!settled.messageRef) rt.liveRef = previousLiveRef;
+			if (!messageRef) rt.liveRef = previousLiveRef;
 		}
 	};
 
@@ -8084,6 +8123,7 @@ export function createNotificationsExtension(
 		// Streaming state is SDK-visible session truth (context.get isStreaming);
 		// it is tracked regardless of whether notifications are active.
 		rt.busy = true;
+		if (rt.currentTurnSettlementOrigin === undefined) rt.currentTurnSettlementOrigin = "continuation";
 		// A continuation re-enters the agent loop inside the same prompt and emits
 		// another `agent_start`. Only a queued follow-up's exact SDK token may
 		// claim its correlation; unrelated queue work must not consume it.
@@ -8117,6 +8157,9 @@ export function createNotificationsExtension(
 		const rt = runtimes.get(id);
 		if (!rt) return;
 		rt.turnSeq = (rt.turnSeq ?? 0) + 1;
+		rt.currentTurnSettlementOrigin = rt.nextTurnSettlementOrigin ?? "continuation";
+		rt.currentTurnSettlementWindow = rt.settlementWindow;
+		rt.nextTurnSettlementOrigin = undefined;
 		if (!rt.notificationsActive) return;
 		// A new turn is live: re-open the live-stream window (see turnClosed).
 		rt.turnClosed = false;
@@ -8464,21 +8507,26 @@ export function createNotificationsExtension(
 				? undefined
 				: summaryFromMessage(event.message, turnTextMax());
 		if (rt.policySuspended) {
-			rt.pendingFinal = { text, messageRef: rt.liveRef };
+			rt.pendingFinal = {
+				window: rt.currentTurnSettlementWindow ?? rt.settlementWindow,
+				text,
+				messageRef: rt.liveRef,
+			};
 			rt.turnClosed = true;
 			return;
 		}
 		if (text) {
+			if (rt.currentTurnSettlementWindow !== undefined && rt.currentTurnSettlementWindow !== rt.settlementWindow) {
+				resetTurnStreamState(rt);
+				return;
+			}
 			if (rt.verbosity === "verbose") {
 				// Verbose: one finalized turn_stream per turn with assistant text.
 				flushTurnText(rt, id, text, true);
 			} else if (text !== rt.preAskFlushedText) {
 				// Lean: hold the latest answer until agent_end. Skip when this turn
 				// already flushed the same text as an ask lead-in (no duplicate at idle).
-				rt.pendingSettled = {
-					text,
-					...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
-				};
+				deferLeanReceipt(rt, text, rt.liveRef);
 			} else {
 				// Lead-in already flushed: drop any older deferred settled text so idle
 				// does not re-emit intermediate narration after the ask prompt (#2863).
@@ -8522,6 +8570,16 @@ export function createNotificationsExtension(
 		const id = sessionId(ctx);
 		const rt = runtimes.get(id);
 		rt?.emitPromptEvent(event);
+		if (rt) {
+			if ((event.message as { role?: unknown }).role === "user") {
+				rt.settlementWindow++;
+				rt.nextTurnSettlementOrigin = "user";
+				rt.pendingSettled = undefined;
+				rt.pendingFinal = undefined;
+			} else if ((event.message as { role?: unknown }).role === "custom") {
+				rt.nextTurnSettlementOrigin = "autonomous";
+			}
+		}
 		if (!rt?.notificationsActive || rt.redact) return;
 		// Capture the in-flight ASSISTANT text here (message_end is on the awaited
 		// extension path and ordered before tool_execution_start) so the pre-ask
