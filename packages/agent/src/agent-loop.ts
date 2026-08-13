@@ -14,6 +14,7 @@ import {
 	EventStream,
 	isZodSchema,
 	streamSimple,
+	type ToolChoice,
 	type ToolResultMessage,
 	type TSchema,
 	transportFailureFacts,
@@ -143,6 +144,29 @@ const standaloneOwnershipStates = new WeakMap<StandaloneRunOwnership, Standalone
  * bounded too.
  */
 const MAX_CONSECUTIVE_MALFORMED_TURNS = 5;
+
+/**
+ * How many times a single turn may be re-requested because its tool arguments
+ * arrived as `\uXXXX` escapes instead of literal UTF-8.
+ *
+ * The defect is a wire-format accident that resampling clears, so a small
+ * budget recovers the overwhelming majority of turns; past it the terminal
+ * per-call rejection takes over rather than spending the run on retries.
+ */
+const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
+
+/** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
+function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
+	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
+}
+
+/** Remove only the exact assistant response committed by its streaming attempt. */
+function removeCommittedAssistantMessage(messages: AgentMessage[], message: AssistantMessage): boolean {
+	const index = messages.lastIndexOf(message);
+	if (index < 0) return false;
+	messages.splice(index, 1);
+	return true;
+}
 
 function isComposerBashPolicyBlockedToolResult(result: ToolResultMessage): boolean {
 	return (
@@ -961,6 +985,10 @@ class ManagedAttemptTransaction {
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
 		const partial = managedAssistantShell(message, this.model);
+		if (this.#committed) {
+			this.onAssistantMessageEvent?.(partial, managedAssistantEventSnapshot(event, partial));
+			return;
+		}
 		this.#batch.push({
 			type: "assistant_event",
 			message: partial,
@@ -981,6 +1009,10 @@ class ManagedAttemptTransaction {
 		this.#stagedBytes = 0;
 		this.#stagedEventCount = 0;
 		this.#committed = true;
+	}
+
+	get committed(): boolean {
+		return this.#committed;
 	}
 
 	discard(): void {
@@ -1491,6 +1523,15 @@ async function runLoopBody(
 	// Fires at most one repaired resend per run for the reasoning-content replay
 	// breaker below (DeepSeek "reasoning_content ... must be passed back").
 	let reasoningContentRepairAttempted = false;
+	// Consecutive resamples spent on the current turn because its tool arguments
+	// arrived `\uXXXX`-escaped. Reset once a turn gets past the check, so every
+	// turn is judged on its own wire bytes.
+	let escapedNonAsciiResampleAttempt = 0;
+	// A queue-backed dynamic tool choice belongs to the logical turn, not to one
+	// wire attempt. Capture it once and replay it across escaped-argument
+	// resamples; reset only after a response is accepted for normal processing.
+	let escapedNonAsciiToolChoiceCaptured = false;
+	let escapedNonAsciiToolChoice: ToolChoice | undefined;
 	let previousMalformedToolSignatures = new Set<string>();
 	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider";
 	let pendingRecovery:
@@ -1520,11 +1561,15 @@ async function runLoopBody(
 			const scope =
 				initialScope ?? (firstTurn ? config.initialScope : undefined) ?? config.attemptMinter?.mint("main");
 			initialScope = undefined;
-			const transaction =
+			const managedTransaction =
 				initialTransaction ??
 				(config.fallbackManaged
 					? new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope)
 					: undefined);
+			const escapedToolTransaction = config.fallbackManaged
+				? undefined
+				: new ManagedAttemptTransaction(stream, config.onAssistantMessageEvent, config.model, scope);
+			const transaction = managedTransaction ?? escapedToolTransaction;
 			initialTransaction = undefined;
 			const attemptScope = transaction?.scope ?? scope;
 			lastAttemptScope = attemptScope;
@@ -1602,10 +1647,16 @@ async function runLoopBody(
 			// Stream assistant response
 			let recovered: HarmonyRecoveredToolCall | undefined;
 			let message: AssistantMessage;
-			const attemptTransaction = transaction;
+			const attemptTransaction = managedTransaction;
 			const recoveryAttempt = pendingRecovery;
 			const wasMalformedToolRecoveryAttempt = recoveryAttempt?.kind === "malformed-tool-call";
 			try {
+				const getLogicalTurnToolChoice = (): ToolChoice | undefined => {
+					if (escapedNonAsciiToolChoiceCaptured) return escapedNonAsciiToolChoice;
+					escapedNonAsciiToolChoice = config.getToolChoice?.();
+					escapedNonAsciiToolChoiceCaptured = true;
+					return escapedNonAsciiToolChoice;
+				};
 				const attemptConfig = attemptTransaction
 					? {
 							...config,
@@ -1634,7 +1685,7 @@ async function runLoopBody(
 					currentContext,
 					attemptConfig,
 					loopSignal,
-					attemptTransaction ? (attemptTransaction as unknown as EventStream<AgentEvent, AgentMessage[]>) : stream,
+					transaction ? (transaction as unknown as EventStream<AgentEvent, AgentMessage[]>) : stream,
 					telemetry,
 					invokeAgentSpan,
 					stepCounter,
@@ -1648,6 +1699,8 @@ async function runLoopBody(
 								forceAutoToolChoice: !wasMalformedToolRecoveryAttempt,
 							}
 						: undefined,
+					escapedToolTransaction,
+					recoveryAttempt ? undefined : { value: getLogicalTurnToolChoice() },
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -1795,6 +1848,40 @@ async function runLoopBody(
 				}
 			}
 
+			// Escaped-non-ASCII tool arguments: bounded turn resample.
+			//
+			// Arguments that spell a printable non-ASCII character as `\uXXXX`
+			// instead of literal UTF-8 are a wire-format defect, not a decision the
+			// model needs to be told about. The payload parses cleanly, but one
+			// mistyped nibble decodes to a different, equally valid character, so it
+			// can never be verified or repaired after the fact. Reporting it as a
+			// tool error spends the whole turn and writes the literal escape syntax
+			// back into the context the model samples from next. Drop the defective
+			// turn and re-request instead; the per-call rejection in
+			// `executeToolCalls` stays as the terminal answer once this budget is
+			// spent. Managed fallback owns its own retry policy, so this is scoped
+			// to the non-managed session path, matching the repairs above.
+			if (
+				!config.fallbackManaged &&
+				message.stopReason !== "error" &&
+				message.stopReason !== "aborted" &&
+				escapedNonAsciiResampleAttempt < MAX_ESCAPED_NONASCII_RESAMPLES &&
+				!escapedToolTransaction?.committed &&
+				hasEscapedNonAsciiToolCall(message)
+			) {
+				escapedNonAsciiResampleAttempt++;
+				escapedToolTransaction?.discard();
+				// The defective turn was already committed to the context by the
+				// streaming path. Remove that exact object rather than assuming it is
+				// still the tail: callbacks may append user/system history while the
+				// response settles, and none of that history belongs to this retry.
+				removeCommittedAssistantMessage(currentContext.messages, message);
+				continue;
+			}
+			escapedNonAsciiResampleAttempt = 0;
+			escapedNonAsciiToolChoiceCaptured = false;
+			escapedNonAsciiToolChoice = undefined;
+
 			const overflow = managedContextOverflow(message, config);
 			if (config.fallbackManaged && overflow) {
 				transaction?.discard();
@@ -1849,6 +1936,13 @@ async function runLoopBody(
 
 			// One provider invocation is committed before any tool can run.
 			transaction?.flush();
+			if (escapedToolTransaction) {
+				// Tool-call updates are staged so an escaped turn can disappear
+				// atomically. Once accepted, drain every published update through the
+				// Agent/AgentSession consumers before dispatch: streaming edit guards
+				// can then abort the run before any tool execute() is entered.
+				if (!loopSignal.aborted && stream.hasActiveConsumer) await stream.waitForConsumerDrain(loopSignal);
+			}
 			if (config.fallbackManaged && message.stopReason !== "error" && message.stopReason !== "aborted") {
 				await config.onManagedAttemptAccepted?.();
 			}
@@ -2094,6 +2188,8 @@ async function streamAssistantResponse(
 		disableTools?: boolean;
 		forceAutoToolChoice?: boolean;
 	},
+	provisionalToolTransaction?: ManagedAttemptTransaction,
+	toolChoiceOverride?: { value: ToolChoice | undefined },
 ): Promise<AssistantMessage> {
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
@@ -2156,7 +2252,11 @@ async function streamAssistantResponse(
 
 	// Synthetic recovery requests choose their tool mode explicitly below and
 	// must never consume a queued dynamic choice intended for an ordinary turn.
-	const dynamicToolChoice = recoveryMode ? undefined : config.getToolChoice?.();
+	const dynamicToolChoice = recoveryMode
+		? undefined
+		: toolChoiceOverride
+			? toolChoiceOverride.value
+			: config.getToolChoice?.();
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);
 	const harmonyAbortController = harmonyMitigationEnabled ? new AbortController() : undefined;
@@ -2444,7 +2544,11 @@ async function streamAssistantResponse(
 									: event.partial;
 								const partialEvent = config.fallbackManaged ? { ...event, partial: partialMessage } : event;
 								context.messages[context.messages.length - 1] = partialMessage;
-								config.onAssistantMessageEvent?.(partialMessage, partialEvent);
+								if (provisionalToolTransaction) {
+									provisionalToolTransaction.stageAssistantMessageEvent(partialMessage, partialEvent);
+								} else {
+									config.onAssistantMessageEvent?.(partialMessage, partialEvent);
+								}
 								if (signal?.aborted) continue;
 								stream.push({
 									type: "message_update",
@@ -2452,6 +2556,13 @@ async function streamAssistantResponse(
 									message: { ...partialMessage },
 									scope,
 								});
+								// Preserve ordinary text streaming. Once visible text is
+								// published, this response can no longer be silently resampled;
+								// a later escaped tool call therefore falls through to the
+								// existing terminal per-call rejection instead.
+								if (event.type === "text_start" || event.type === "text_delta" || event.type === "text_end") {
+									provisionalToolTransaction?.flush();
+								}
 							}
 							break;
 
