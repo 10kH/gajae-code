@@ -52,7 +52,12 @@ import {
 	createDefaultCodexTransportFactory,
 	publishCodexWake,
 } from "./codex-wake-publisher";
-import { appendCoordinatorFile, syncCoordinatorDirectory, writeCoordinatorAtomic } from "./durability";
+import {
+	appendCoordinatorFile,
+	ensureCoordinatorDirectory,
+	syncCoordinatorDirectory,
+	writeCoordinatorAtomic,
+} from "./durability";
 import {
 	createDefaultEventWebhookDelivery,
 	deliverEventWebhook,
@@ -856,15 +861,23 @@ function coordinatorLifecycleTarget(sessionCommand: string | null, cwd: string):
 }
 
 async function ensureDir(dir: string): Promise<void> {
-	await fs.mkdir(dir, { recursive: true });
+	await ensureCoordinatorDirectory(dir);
 }
 
 async function readJsonFile(file: string): Promise<unknown | null> {
+	let source: string;
 	try {
-		return JSON.parse(await fs.readFile(file, "utf8"));
+		source = await fs.readFile(file, "utf8");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		return null;
+	}
+	try {
+		return JSON.parse(source);
+	} catch (error) {
+		throw new Error(
+			`invalid coordinator projection ${file}: ${error instanceof Error ? error.message : String(error)}`,
+		);
 	}
 }
 
@@ -1133,11 +1146,14 @@ async function listJsonFiles(dir: string): Promise<unknown[]> {
 	try {
 		const entries = await fs.readdir(dir);
 		const values = await Promise.all(
-			entries.filter(entry => entry.endsWith(".json")).map(entry => readJsonFile(path.join(dir, entry))),
+			entries
+				.filter(entry => entry.endsWith(".json") && !entry.startsWith(".gjc-"))
+				.map(entry => readJsonFile(path.join(dir, entry))),
 		);
 		return values.filter(value => value !== null);
-	} catch {
-		return [];
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
 	}
 }
 
@@ -4048,7 +4064,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			for (const report of Object.values(canonical.reports))
 				await writeJsonFile(path.join(namespaceDir, "reports", `${report.report_id}.json`), report);
 			const canonicalTurnIds = new Set(Object.keys(canonical.turns));
-			for (const entry of await fs.readdir(turnsDir(namespaceDir)).catch(() => [])) {
+			const turnEntries = await fs.readdir(turnsDir(namespaceDir)).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+				throw error;
+			});
+			for (const entry of turnEntries) {
 				if (!entry.endsWith(".json")) continue;
 				const turnId = entry.slice(0, -5);
 				if (canonicalTurnIds.has(turnId)) continue;
@@ -4058,7 +4078,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			const reportsDirectory = path.join(namespaceDir, "reports");
 			const canonicalReportIds = new Set(Object.keys(canonical.reports));
-			for (const entry of await fs.readdir(reportsDirectory).catch(() => [])) {
+			const reportEntries = await fs.readdir(reportsDirectory).catch(error => {
+				if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+				throw error;
+			});
+			for (const entry of reportEntries) {
 				if (!entry.endsWith(".json")) continue;
 				const reportId = entry.slice(0, -5);
 				if (canonicalReportIds.has(reportId)) continue;

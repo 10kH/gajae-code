@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { withFileLock } from "../config/file-lock";
-import { appendCoordinatorFile, writeCoordinatorAtomic } from "./durability";
+import {
+	appendCoordinatorFile,
+	ensureCoordinatorDirectory,
+	syncCoordinatorDirectory,
+	writeCoordinatorAtomic,
+} from "./durability";
 import type { PrivateAskGateCodecV1, PublicReason } from "./question-gate-codec";
 
 export type CoordinatorSessionState =
@@ -312,7 +317,18 @@ export function transactionLockPath(paths: CoordinatorStatePaths, sessionId: str
 	return path.join(paths.sessions, safeSessionId(sessionId), "transaction.lock");
 }
 async function ensureNamespaceParents(paths: CoordinatorStatePaths): Promise<void> {
-	await fs.mkdir(paths.root, { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(paths.root);
+}
+
+async function removeCoordinatorStateFile(file: string): Promise<void> {
+	try {
+		await fs.lstat(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	await fs.rm(file);
+	await syncCoordinatorDirectory(path.dirname(file));
 }
 
 async function writeAtomic(file: string, value: unknown): Promise<void> {
@@ -339,8 +355,8 @@ function assertTransaction(transaction: CoordinatorSessionTransactionV1, namespa
 }
 export async function initializeCoordinatorNamespace(paths: CoordinatorStatePaths): Promise<void> {
 	await ensureNamespaceParents(paths);
-	await fs.mkdir(paths.sessions, { recursive: true, mode: 0o700 });
-	await fs.mkdir(path.dirname(paths.journal), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(paths.sessions);
+	await ensureCoordinatorDirectory(path.dirname(paths.journal));
 	await withFileLock(paths.registryLock, async () => {
 		const existing = await readJson<NamespaceRegistryV1>(paths.registry);
 		if (existing === null)
@@ -374,7 +390,7 @@ export async function withSessionTransaction<T>(
 	operation: (transaction: CoordinatorSessionTransactionV1) => Promise<T>,
 ): Promise<T> {
 	const file = transactionPath(paths, sessionId);
-	await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(path.dirname(file));
 	return await withFileLock(transactionLockPath(paths, sessionId), async () => {
 		const transaction = await readJson<CoordinatorSessionTransactionV1>(file);
 		if (!transaction) throw new Error("resource_gone");
@@ -487,7 +503,7 @@ export async function commitCreationWal(
 						entry.phase === "completed",
 				);
 				if (!priorDeleted) throw new Error("session_closing");
-				await fs.rm(transactionPath(paths, session.session_id), { force: true });
+				await removeCoordinatorStateFile(transactionPath(paths, session.session_id));
 				existing = null;
 			}
 			if (existing) {
@@ -631,7 +647,7 @@ export async function appendOutboxEvents(
 	paths: CoordinatorStatePaths,
 	transaction: CoordinatorSessionTransactionV1,
 ): Promise<void> {
-	await fs.mkdir(path.dirname(paths.journal), { recursive: true, mode: 0o700 });
+	await ensureCoordinatorDirectory(path.dirname(paths.journal));
 	await withFileLock(paths.journalLock, async () => {
 		const existing = await fs.readFile(paths.journal, "utf8").catch(error => {
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
