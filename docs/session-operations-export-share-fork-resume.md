@@ -38,7 +38,7 @@ The source is opened once with no-follow semantics and read through that retaine
 
 Each invocation creates one new session, verifies that it reopens with the same captured destination authority and reconstructs continuable history, then releases that authority. Imports are refused while the current session is streaming. Imported sessions do not replace the active session automatically; select the new session with `/resume`.
 
-The command is available only in the interactive TUI and trusted local startup command path. It is neither advertised nor dispatched over ACP or remote-control transports.
+The command is available only on Linux in the interactive TUI and trusted local startup command path. It is neither advertised nor dispatched over ACP or remote-control transports.
 ## Export and dump
 
 ### `/export [outputPath]` (interactive)

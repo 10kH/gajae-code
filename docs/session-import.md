@@ -10,7 +10,7 @@ instead of copying a long session by hand.
 /import-session <transcript-file> [--provider codex|claude]
 ```
 
-- Available in the interactive TUI and trusted local startup command path. It is
+- Available on Linux in the interactive TUI and trusted local startup command path. It is
   deliberately excluded from ACP and remote-control transports because it reads
   an operator-selected local file.
 - `<transcript-file>` is an explicit, user-selected export/transcript file
