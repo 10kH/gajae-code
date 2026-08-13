@@ -680,7 +680,10 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 		} catch (error) {
 			if ((error as { code?: unknown }).code !== "EEXIST") throw error;
 			const raced = await readRuntimeInputReadyMarker(readinessFile);
-			if (raced && raced.session_id === expected.sessionId && raced.launch_id === expected.launchId) return raced;
+			if (raced && raced.session_id === expected.sessionId && raced.launch_id === expected.launchId) {
+				await syncCoordinatorDirectory(path.dirname(readinessFile));
+				return raced;
+			}
 			throw runtimeReadinessMarkerConflict();
 		}
 		await syncCoordinatorDirectory(path.dirname(readinessFile));
