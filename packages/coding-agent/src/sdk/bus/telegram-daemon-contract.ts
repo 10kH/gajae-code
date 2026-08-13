@@ -6,6 +6,15 @@
 /** Protocol version the daemon advertises in its ClientHello. */
 export const NOTIFICATION_PROTOCOL_VERSION = 3;
 
+/** Telegram transport generation; independent from SDK lifecycle protocol changes. */
+export const TELEGRAM_TRANSPORT_GENERATION = 1;
+
+/** Notification event schema version; payload compatibility is versioned separately. */
+export const NOTIFICATION_EVENT_SCHEMA_VERSION = 1;
+
+/** SDK Router/lifecycle protocol negotiated by core, not by Telegram transport. */
+export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
+
 /**
  * Guarded behavior-inventory version for the current daemon build. Bump this
  * on every guarded daemon-behavior change independent of the wire version; it
@@ -241,8 +250,11 @@ export const NOTIFICATION_PROTOCOL_VERSION = 3;
  * binding fallback no longer spawns powershell.exe when it cannot bind a pid,
  * so older daemons that may still flash a console window during liveness polling
  * are fenced off (#4362).
+ * Generation 160 introduces provider-local Telegram subscriptions, detached
+ * cleanup, stable topic bindings, and explicit archive authority. Older daemons
+ * retain attachment-level lifecycle coupling and may not serve this contract.
  */
-export const DAEMON_GENERATION = 159;
+export const DAEMON_GENERATION = 160;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
