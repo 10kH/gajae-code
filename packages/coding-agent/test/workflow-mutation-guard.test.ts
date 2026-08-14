@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
+import * as autoresearchGit from "@gajae-code/coding-agent/autoresearch/git";
 import {
 	activeSnapshotPath,
 	modeStatePath,
@@ -749,7 +750,10 @@ describe("workflow mutation guard", () => {
 		expect(executing.blocked).toBe(false);
 	});
 
-	it("does not block product mutation while autoresearch is active", async () => {
+	it("blocks product mutation during an autoresearch mission that is not branch-isolated", async () => {
+		// Research-only is now enforced, not merely documented: off an
+		// `autoresearch/*` branch a mission would be editing the user's working
+		// branch, which the contract forbids.
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "autoresearch", "research");
 
@@ -759,7 +763,43 @@ describe("workflow mutation guard", () => {
 			tool: tool("write"),
 			args: { path: "src/product.ts", content: "x" },
 		});
-		expect(decision.blocked).toBe(false);
+		expect(decision.blocked).toBe(true);
+		expect(decision.message).toContain("research-only");
+	});
+
+	it("allows mutation while the autoresearch mission is isolated on an autoresearch/* branch", async () => {
+		// Branch isolation IS the authorization: edits are contained and revertible
+		// through keep/discard, so experiments are legitimate work.
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+		const branchSpy = vi
+			.spyOn(autoresearchGit, "getCurrentAutoresearchBranch")
+			.mockResolvedValue("autoresearch/decode-throughput-20260814");
+		try {
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: "src/product.ts", content: "x" },
+			});
+			expect(decision.blocked).toBe(false);
+		} finally {
+			branchSpy.mockRestore();
+		}
+	});
+
+	it("releases autoresearch mutation at its terminal phases", async () => {
+		const cwd = await makeTempRoot();
+		for (const phase of ["complete", "cancelled"]) {
+			await writeActiveSkill(cwd, "autoresearch", phase);
+			const decision = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: "src/product.ts", content: "x" },
+			});
+			expect(decision.blocked).toBe(false);
+		}
 	});
 
 	it("keeps blocking ralplan at the pre-approval terminal phases (final, handoff)", async () => {

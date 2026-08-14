@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
+import { getCurrentAutoresearchBranch } from "../autoresearch/git";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
 import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
@@ -26,10 +27,13 @@ export const RALPLAN_MUTATION_BLOCK_MESSAGE =
 	"Ralplan planning phase boundary: keep refining the consensus plan and persist plan artifacts through `gjc ralplan --write` (stage scratch files under a temp dir if needed). Product-code mutation tools and patch execution are blocked while ralplan is active; mutate only after the plan is approved and execution begins.";
 export const ULTRAGOAL_GOAL_PLANNING_MUTATION_BLOCK_MESSAGE =
 	"Ultragoal goal-planning phase boundary: finish goal planning and record goals through `gjc ultragoal` before editing code. Product-code mutation tools and patch execution are blocked until goal planning completes and execution begins.";
+export const AUTORESEARCH_MUTATION_BLOCK_MESSAGE =
+	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked unless the mission is isolated on an `autoresearch/*` branch, where experiment edits are contained and revertible. Run experiments through the mission `python` tool and the `autoresearch.sh` harness on an autoresearch branch, or finish the mission and hand off to an approved implementation workflow.";
 
 /** Resolve the phase-boundary block message for the active planning skill. */
 function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
 	if (skill === "ralplan") return RALPLAN_MUTATION_BLOCK_MESSAGE;
+	if (skill === "autoresearch") return AUTORESEARCH_MUTATION_BLOCK_MESSAGE;
 	if (skill === "ultragoal") return ULTRAGOAL_GOAL_PLANNING_MUTATION_BLOCK_MESSAGE;
 	return DEEP_INTERVIEW_MUTATION_BLOCK_MESSAGE;
 }
@@ -220,9 +224,12 @@ function modeStateMatchesContext(state: ModeState, sessionId?: string, threadId?
 	return true;
 }
 
-/** Workflow skills that have a pre-approval planning posture this guard enforces. `autoresearch` never does. */
-function isPlanningSkill(skill: string): skill is "deep-interview" | "ralplan" | "ultragoal" {
-	return skill === "deep-interview" || skill === "ralplan" || skill === "ultragoal";
+/** Canonical workflow skills whose active posture gates product-code mutation. */
+type MutationGatedSkill = "deep-interview" | "ralplan" | "ultragoal" | "autoresearch";
+
+/** Workflow skills whose active posture this guard enforces against product-code mutation. */
+function isPlanningSkill(skill: string): skill is MutationGatedSkill {
+	return skill === "deep-interview" || skill === "ralplan" || skill === "ultragoal" || skill === "autoresearch";
 }
 
 /**
@@ -233,14 +240,14 @@ function isPlanningSkill(skill: string): skill is "deep-interview" | "ralplan" |
  * `ultragoal` only blocks during `goal-planning`; once goals are created it is an
  * executor and mutates freely.
  */
-function isBlockingPlanningPhase(skill: "deep-interview" | "ralplan" | "ultragoal", phase: string): boolean {
+function isBlockingPlanningPhase(skill: MutationGatedSkill, phase: string): boolean {
 	const normalized = phase.trim().toLowerCase();
 	if (skill === "ultragoal") return normalized === "goal-planning";
 	return !getSkillManifest(skill).stopReleasingPhases.includes(normalized);
 }
 
 interface ActivePlanningSkill {
-	skill: "deep-interview" | "ralplan" | "ultragoal";
+	skill: MutationGatedSkill;
 	phase: string;
 }
 
@@ -1214,6 +1221,15 @@ export async function getWorkflowMutationDecision(
 		return { blocked: false, targets: [] };
 	}
 	if (input.forceOverride) return { blocked: false, targets: [] };
+	// Autoresearch is research-only, but running experiments IS its work. Branch
+	// isolation is the authorization: on an `autoresearch/*` branch every edit is
+	// contained and revertible via keep/discard, so mutation is allowed. Off that
+	// branch the mission would be editing the user's working branch, which the
+	// documented contract forbids. Checked live against the worktree rather than
+	// from recorded intent, because a user can switch branches mid-mission.
+	if (planning.skill === "autoresearch" && (await getCurrentAutoresearchBranch(input.cwd)) !== null) {
+		return { blocked: false, targets: targets.paths };
+	}
 	const message = planningPhaseBlockMessage(planning.skill);
 	// Bash during a planning phase blocks only when a filesystem mutation was
 	// actually recognized. Inspection, reads, and CLI invocations the scanner does
