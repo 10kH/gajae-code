@@ -34,8 +34,8 @@ import { loadAutoresearchDataContext, type RlmDataContext } from "../autoresearc
 import { type EnsureAutoresearchBranchResult, ensureAutoresearchBranch } from "../autoresearch/git";
 import { type ParsedHarnessOutput, parseHarnessOutput } from "../autoresearch/harness";
 import { renderAutoresearchIteratePrompt, renderAutoresearchSetupPrompt } from "../autoresearch/prompts";
-import { extractVerdictFromLedger, synthesizeAutoresearchReport } from "../autoresearch/report";
 import { autoresearchKernelOwnerId } from "../autoresearch/python-tool";
+import { extractVerdictFromLedger, synthesizeAutoresearchReport } from "../autoresearch/report";
 import {
 	AutoresearchRunsStore,
 	buildAutoresearchExperimentState,
