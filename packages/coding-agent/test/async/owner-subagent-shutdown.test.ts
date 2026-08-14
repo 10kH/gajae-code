@@ -459,6 +459,43 @@ describe("owner subagent shutdown leases", () => {
 		await manager.dispose();
 	});
 
+	test("does not suppress a reused job id with an evicted generation watch", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+			},
+			retentionMs: 0,
+		});
+		const firstGate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "first generation", async () => firstGate.promise, {
+			id: "reused-watched-job",
+			ownerId: "owner-a",
+		});
+		const firstGeneration = manager.getJob(jobId)?.generation;
+		const firstWatch = manager.watchJobGenerations([jobId]);
+		firstGate.resolve("first done");
+		await manager.getJob(jobId)?.promise;
+		await Bun.sleep(10);
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(manager.isDeliverySuppressed(jobId, firstGeneration)).toBe(true);
+
+		const secondJobId = manager.register("task", "second generation", async () => "second done", {
+			id: jobId,
+			ownerId: "owner-b",
+		});
+		const secondGeneration = manager.getJob(secondJobId)?.generation;
+		expect(secondGeneration).not.toBe(firstGeneration);
+		await manager.getJob(secondJobId)?.promise;
+		expect(await manager.drainDeliveries({ filter: { ownerId: "owner-b" }, timeoutMs: 100 })).toBe(true);
+		expect(delivered).toEqual([secondJobId]);
+
+		firstWatch.close();
+		expect(await manager.drainDeliveries({ filter: { ownerId: "owner-a" }, timeoutMs: 100 })).toBe(true);
+		expect(delivered).toEqual([secondJobId, jobId]);
+		await manager.dispose();
+	});
+
 	test("acknowledging another job preserves a watched completion", async () => {
 		const delivered: string[] = [];
 		const manager = new AsyncJobManager({

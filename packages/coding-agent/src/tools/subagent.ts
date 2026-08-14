@@ -436,7 +436,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			});
 		}
 		const watchedJobIds = targets.map(target => target.jobId).filter((jobId): jobId is string => jobId !== null);
-		manager.watchJobs(watchedJobIds);
+		const watchHandle = manager.watchJobGenerations(watchedJobIds);
 		const heartbeatMs = params.heartbeat_ms === undefined ? 500 : params.heartbeat_ms;
 		// Liveness interval: force a re-emit even when the rendered-state signature
 		// is stable so a healthy wait never looks like a hung session (#4465). The
@@ -521,7 +521,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		} finally {
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 			stopProgressTimer();
-			manager.unwatchJobs(watchedJobIds);
+			watchHandle.close();
 			handle.close();
 		}
 		const awaitOutcome: SubagentAwaitOutcome =

@@ -344,6 +344,10 @@ export interface AsyncJobWaitHandle {
 	close(): void;
 }
 
+export interface AsyncJobWatchHandle {
+	close(): number;
+}
+
 interface TerminalEvent {
 	generation: string;
 	jobId: string | null;
@@ -540,6 +544,7 @@ export class AsyncJobManager {
 	readonly #suppressedDeliveries = new Set<string>();
 	readonly #deliveryAckOwners = new Map<string, string>();
 	readonly #watchedJobs = new Map<string, number>();
+	readonly #watchedGenerations = new Map<string, number>();
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #outputState = new Map<string, AsyncJobOutputState>();
 	readonly #ownerCleanups = new Map<string, Set<() => void>>();
@@ -2094,6 +2099,34 @@ export class AsyncJobManager {
 		return this.getDeliveryState(filter).queued > 0;
 	}
 
+	watchJobGenerations(jobIds: string[]): AsyncJobWatchHandle {
+		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
+		const generations: string[] = [];
+		for (const jobId of uniqueJobIds) {
+			const generation = this.#jobs.get(jobId)?.generation;
+			if (!generation) continue;
+			generations.push(generation);
+			this.#watchedGenerations.set(generation, (this.#watchedGenerations.get(generation) ?? 0) + 1);
+		}
+		let closed = false;
+		return {
+			close: () => {
+				if (closed) return 0;
+				closed = true;
+				let removed = 0;
+				for (const generation of generations) {
+					const watchers = this.#watchedGenerations.get(generation) ?? 0;
+					if (watchers === 1) {
+						this.#watchedGenerations.delete(generation);
+						removed += 1;
+					} else if (watchers > 1) this.#watchedGenerations.set(generation, watchers - 1);
+				}
+				if (removed > 0) this.#ensureDeliveryLoop();
+				return removed;
+			},
+		};
+	}
+
 	watchJobs(jobIds: string[]): number {
 		const uniqueJobIds = Array.from(new Set(jobIds.map(id => id.trim()).filter(id => id.length > 0)));
 		for (const jobId of uniqueJobIds) {
@@ -2295,6 +2328,7 @@ export class AsyncJobManager {
 		this.#deliveryAckOwners.clear();
 		this.#waitGenerationAliases.clear();
 		this.#watchedJobs.clear();
+		this.#watchedGenerations.clear();
 		this.#outputState.clear();
 		this.#ownerCleanups.clear();
 		this.#subagentRecords.clear();
@@ -2451,7 +2485,12 @@ export class AsyncJobManager {
 	}
 
 	isDeliverySuppressed(jobId: string, generation?: string): boolean {
-		return this.#isDeliveryAcknowledged(jobId, generation) || (this.#watchedJobs.get(jobId) ?? 0) > 0;
+		const watchedGeneration = generation ?? this.#jobs.get(jobId)?.generation;
+		return (
+			this.#isDeliveryAcknowledged(jobId, generation) ||
+			(this.#watchedJobs.get(jobId) ?? 0) > 0 ||
+			(watchedGeneration !== undefined && (this.#watchedGenerations.get(watchedGeneration) ?? 0) > 0)
+		);
 	}
 
 	#pruneEvictedDeadLetters(): void {
