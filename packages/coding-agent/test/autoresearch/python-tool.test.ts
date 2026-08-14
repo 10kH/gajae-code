@@ -54,6 +54,7 @@ function toAgentTool(definition: ToolDefinition): AgentTool {
 function createMissionTool(options: {
 	cwd: string;
 	getMissionId: () => string | null;
+	sessionId?: string;
 	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => void;
 }): ToolDefinition {
 	return createAutoresearchPythonTool({
@@ -61,6 +62,7 @@ function createMissionTool(options: {
 		artifactsDir: path.join(options.cwd, "artifacts"),
 		notebook: new RlmNotebookWriter(path.join(options.cwd, "notebook.ipynb")),
 		getMissionId: options.getMissionId,
+		getSessionId: () => options.sessionId ?? "s1",
 		registerSessionCleanup: options.registerSessionCleanup ?? (() => {}),
 	});
 }
@@ -160,6 +162,7 @@ describe("autoresearch mission python tool", () => {
 			createMissionTool({
 				cwd: ".",
 				getMissionId: () => "mission-register",
+				sessionId: "s1",
 				registerSessionCleanup: cleanup => registered.push(cleanup),
 			});
 
@@ -193,7 +196,7 @@ describe("autoresearch mission python tool", () => {
 				expect(result.isError).toBeUndefined();
 				expect(textOf(result)).toContain("cleared");
 				expect(disposeSpy).toHaveBeenCalledTimes(1);
-				expect(disposeSpy).toHaveBeenCalledWith("autoresearch:mission-clear");
+				expect(disposeSpy).toHaveBeenCalledWith("autoresearch:s1:mission-clear");
 			} finally {
 				disposeSpy.mockRestore();
 			}
@@ -278,11 +281,12 @@ describe("autoresearch mission python tool", () => {
 				const registry = new Map<string, AgentTool>();
 				const { session, cwd, cleanup } = await createSessionFixture(registry);
 				sessionCleanups.push(cleanup);
-				const missionOwner = autoresearchKernelOwnerId("mission-f33");
-				expect(missionOwner).toBe("autoresearch:mission-f33");
+				const missionOwner = autoresearchKernelOwnerId("s1", "mission-f33");
+				expect(missionOwner).toBe("autoresearch:s1:mission-f33");
 				const missionTool = createMissionTool({
 					cwd,
 					getMissionId: () => "mission-f33",
+					sessionId: "s1",
 					registerSessionCleanup: registered => session.registerToolSessionCleanup(registered),
 				});
 				registry.set("python", toAgentTool(missionTool));
@@ -318,6 +322,7 @@ describe("autoresearch mission python tool", () => {
 					artifactsDir: path.join(tempDir.path(), "artifacts"),
 					notebook,
 					getMissionId: () => "mission-persist",
+					getSessionId: () => "s1",
 					registerSessionCleanup: () => {},
 				});
 
@@ -347,6 +352,7 @@ describe("autoresearch mission python tool", () => {
 					artifactsDir: path.join(tempDir.path(), "artifacts"),
 					notebook,
 					getMissionId: () => "mission-clear-kernel",
+					getSessionId: () => "s1",
 					registerSessionCleanup: () => {},
 				});
 

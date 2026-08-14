@@ -35,6 +35,7 @@ import { type EnsureAutoresearchBranchResult, ensureAutoresearchBranch } from ".
 import { type ParsedHarnessOutput, parseHarnessOutput } from "../autoresearch/harness";
 import { renderAutoresearchIteratePrompt, renderAutoresearchSetupPrompt } from "../autoresearch/prompts";
 import { extractVerdictFromLedger, synthesizeAutoresearchReport } from "../autoresearch/report";
+import { autoresearchKernelOwnerId } from "../autoresearch/python-tool";
 import {
 	AutoresearchRunsStore,
 	buildAutoresearchExperimentState,
@@ -139,6 +140,12 @@ export interface AutoresearchReadReceipt {
 	mission?: AutoresearchMission;
 	ledger: AutoresearchLedgerEvent[];
 	paths: AutoresearchPaths;
+	/**
+	 * GJC session id the mission state was read from. Callers deriving
+	 * session-scoped identity (notably the kernel owner id) MUST use this
+	 * instead of re-resolving, so every path agrees on one scope.
+	 */
+	sessionId: string;
 }
 
 export interface AutoresearchWriteReceipt {
@@ -363,6 +370,7 @@ export async function autoresearchRead(cwd: string, sessionId?: string | null): 
 		...(mission ? { mission } : {}),
 		ledger,
 		paths: getAutoresearchPaths(cwd, resolvedSessionId),
+		sessionId: resolvedSessionId,
 	};
 }
 
@@ -423,7 +431,9 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const existing = await readAutoresearchMission(cwd, resolvedSessionId);
-	if (existing) await disposeKernelSessionsByOwner(`autoresearch:${resolvedSessionId}:${existing.slug}`);
+	// Must go through the shared derivation: an inline template here is what
+	// drifted from the tool's owner id and left cleared kernels resident.
+	if (existing) await disposeKernelSessionsByOwner(autoresearchKernelOwnerId(resolvedSessionId, existing.slug));
 	const deleted = await removeFileAudited(paths.missionPath, {
 		cwd,
 		audit: {

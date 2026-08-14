@@ -110,8 +110,13 @@ export function createMissionPythonTool(input: MissionPythonToolInput) {
 		cwd: input.cwd,
 		artifactsDir: input.artifactsDir,
 		notebook: input.notebook,
-		getMissionId: () =>
-			`${input.sessionId ?? resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId}:${input.mission.slug}`,
+		// Session scope is passed explicitly rather than concatenated into the
+		// mission id: the old `${sessionId}:${slug}` smuggling made the two
+		// construction paths derive different owner ids.
+		getMissionId: () => input.mission.slug,
+		getSessionId: () =>
+			input.sessionId ??
+			resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId,
 		registerSessionCleanup: input.registerSessionCleanup,
 		managedWorkspaceVenv: input.managedWorkspaceVenv,
 	});

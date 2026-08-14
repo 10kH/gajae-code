@@ -24,18 +24,28 @@ import type { RlmCellResult } from "../rlm/types";
 export const AUTORESEARCH_PYTHON_TOOL_NAME = "python";
 
 /**
- * Kernel owner/session id for a mission. Distinct from the session's
- * `#evalKernelOwnerId` (spec f33) so mission kernels are reaped by the
- * mission-owned disposer, never by the eval-owner disposals.
+ * Kernel owner/session id for a mission.
+ *
+ * Scoped by BOTH the GJC session id and the mission slug. Distinct from the
+ * session's `#evalKernelOwnerId` (spec f33) so mission kernels are reaped by
+ * the mission-owned disposer, never by the eval-owner disposals.
+ *
+ * The session id is part of the key on purpose: a slug-only owner let two
+ * concurrent sessions running the same mission slug share one live kernel, and
+ * made the public `clear` verb (which resolves the session) target an owner the
+ * tool never used, so clearing left the live kernel resident. Both paths must
+ * go through this one derivation.
  */
-export function autoresearchKernelOwnerId(missionId: string): string {
-	return `autoresearch:${missionId}`;
+export function autoresearchKernelOwnerId(sessionId: string, missionId: string): string {
+	return `autoresearch:${sessionId}:${missionId}`;
 }
 
 /** Per-call mission execution context resolved by the tool before every call. */
 export interface AutoresearchPythonToolMissionContext {
 	/** Mission id (slug) used as the kernel owner suffix. */
 	missionId: string;
+	/** GJC session id that owns the mission, used as the kernel owner scope. */
+	sessionId: string;
 	/** Effective artifacts directory for kernel execution. */
 	artifactsDir: string;
 	/** Live notebook writer that records every executed cell. */
@@ -58,6 +68,12 @@ export interface AutoresearchPythonToolContext {
 	 * execute.
 	 */
 	getMissionId?: () => string | null | Promise<string | null>;
+	/**
+	 * Reads the GJC session id that scopes the mission kernel owner
+	 * (mission-bound path). Required alongside `getMissionId` so the derived
+	 * owner id matches the one the public `clear` verb targets.
+	 */
+	getSessionId?: () => string | null | Promise<string | null>;
 	/**
 	 * Per-call mission context resolver used by the discoverable builtin
 	 * wiring, where the loader only has the session and the active mission is
@@ -110,13 +126,15 @@ async function resolveMissionContext(
 	}
 	const missionId = (await context.getMissionId?.()) ?? null;
 	if (missionId === null) return null;
-	if (context.artifactsDir === undefined || context.notebook === undefined) {
+	const sessionId = (await context.getSessionId?.()) ?? null;
+	if (context.artifactsDir === undefined || context.notebook === undefined || sessionId === null) {
 		throw new Error(
-			"AutoresearchPythonTool requires getMissionContext, or getMissionId together with artifactsDir and notebook.",
+			"AutoresearchPythonTool requires getMissionContext, or getMissionId together with getSessionId, artifactsDir and notebook.",
 		);
 	}
 	return {
 		missionId,
+		sessionId,
 		artifactsDir: context.artifactsDir,
 		notebook: context.notebook,
 	};
@@ -170,7 +188,7 @@ export function createAutoresearchPythonTool(
 					isError: true,
 				};
 			}
-			const ownerId = autoresearchKernelOwnerId(missionContext.missionId);
+			const ownerId = autoresearchKernelOwnerId(missionContext.sessionId, missionContext.missionId);
 			seenOwnerIds.add(ownerId);
 			if (params.action === "clear") {
 				await disposeKernelSessionsByOwner(ownerId);
@@ -252,6 +270,7 @@ export function createAutoresearchSessionPythonTool(input: AutoresearchSessionPy
 			const { writer } = await openMissionNotebook(input.cwd, receipt.mission);
 			return {
 				missionId: receipt.mission.slug,
+				sessionId: receipt.sessionId,
 				artifactsDir: missionArtifactsDir(input.cwd, receipt.mission),
 				notebook: writer,
 			};

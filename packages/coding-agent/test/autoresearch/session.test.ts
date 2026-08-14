@@ -184,7 +184,9 @@ describe("autoresearch mission session wiring (kernel + notebook)", () => {
 			await writer.flush();
 
 			// Kernel owner id is scoped by both the mission and GJC session, never the eval owner.
-			expect(autoresearchKernelOwnerId(mission.slug)).toBe("autoresearch:cell-recording-mission");
+			expect(autoresearchKernelOwnerId(TEST_SESSION_ID, mission.slug)).toBe(
+				`autoresearch:${TEST_SESSION_ID}:cell-recording-mission`,
+			);
 			const options = executeSpy.mock.calls[0]![1] as pyExecutor.PythonExecutorOptions;
 			expect(options.sessionId).toBe("autoresearch:test-session:cell-recording-mission");
 			expect(options.kernelOwnerId).toBe("autoresearch:test-session:cell-recording-mission");

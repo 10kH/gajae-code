@@ -14,7 +14,7 @@ import {
 	AUTORESEARCH_PYTHON_TOOL_NO_MISSION_ERROR,
 	autoresearchKernelOwnerId,
 } from "../../src/autoresearch/python-tool";
-import { autoresearchWrite } from "../../src/gjc-runtime/autoresearch-runtime";
+import { autoresearchClear, autoresearchWrite } from "../../src/gjc-runtime/autoresearch-runtime";
 import { BUILTIN_TOOL_DESCRIPTORS, BUILTIN_TOOLS, createTools, type ToolSession } from "../../src/tools";
 
 const TEST_SESSION_ID = "test-session";
@@ -46,6 +46,7 @@ function textOf(result: AgentToolResult): string {
 function makeToolSession(
 	cwd: string,
 	registerSessionCleanup?: (cleanup: () => Promise<void> | void) => void,
+	sessionId: string = TEST_SESSION_ID,
 ): ToolSession {
 	const session: ToolSession = {
 		cwd,
@@ -56,7 +57,7 @@ function makeToolSession(
 		taskDepth: 0,
 		getSessionFile: () => null,
 		getSessionSpawns: () => null,
-		getSessionId: () => TEST_SESSION_ID,
+		getSessionId: () => sessionId,
 	};
 	if (registerSessionCleanup) {
 		session.registerSessionCleanup = cleanup => {
@@ -220,9 +221,66 @@ describe("autoresearch mission python tool — production builtin wiring", () =>
 			expect(result.isError).toBeUndefined();
 			expect(executeSpy).toHaveBeenCalledTimes(1);
 			const options = executeSpy.mock.calls[0]?.[1] as { sessionId: string; kernelOwnerId: string };
-			expect(options.sessionId).toBe(autoresearchKernelOwnerId("tokenizer-mission"));
-			expect(options.kernelOwnerId).toBe(autoresearchKernelOwnerId("tokenizer-mission"));
-			expect(options.kernelOwnerId).toBe("autoresearch:tokenizer-mission");
+			expect(options.sessionId).toBe(autoresearchKernelOwnerId(TEST_SESSION_ID, "tokenizer-mission"));
+			expect(options.kernelOwnerId).toBe(autoresearchKernelOwnerId(TEST_SESSION_ID, "tokenizer-mission"));
+			expect(options.kernelOwnerId).toBe(`autoresearch:${TEST_SESSION_ID}:tokenizer-mission`);
+		} finally {
+			executeSpy.mockRestore();
+		}
+	});
+
+	it("derives the same kernel owner as the public clear verb, so clearing reaps the live kernel", async () => {
+		// Regression: the live tool used a slug-only owner while `gjc autoresearch
+		// clear` disposed a session-scoped one, so clear never reached the running
+		// kernel and two sessions on the same slug shared state.
+		const cwd = tempDir();
+		await createMission(cwd, "owner-agreement-mission");
+		const executeSpy = vi.spyOn(pyExecutor, "executePython").mockResolvedValue(mockPythonResult());
+		const disposeSpy = vi.spyOn(pyExecutor, "disposeKernelSessionsByOwner").mockResolvedValue(undefined);
+		try {
+			const tool = await BUILTIN_TOOLS[AUTORESEARCH_PYTHON_TOOL_NAME](makeToolSession(cwd));
+			await tool!.execute("call-exec", { code: "x = 1" });
+			const liveOwner = (executeSpy.mock.calls[0]?.[1] as { kernelOwnerId: string }).kernelOwnerId;
+
+			// The public clear verb resolves its own owner from mission state.
+			await autoresearchClear(cwd, TEST_SESSION_ID);
+
+			expect(disposeSpy).toHaveBeenCalledWith(liveOwner);
+		} finally {
+			executeSpy.mockRestore();
+			disposeSpy.mockRestore();
+		}
+	});
+
+	it("scopes the kernel owner per session so two sessions on the same slug do not share a kernel", async () => {
+		const cwdA = tempDir();
+		const cwdB = tempDir();
+		await createMission(cwdA, "shared-slug");
+		const executeSpy = vi.spyOn(pyExecutor, "executePython").mockResolvedValue(mockPythonResult());
+		try {
+			const toolA = await BUILTIN_TOOLS[AUTORESEARCH_PYTHON_TOOL_NAME](makeToolSession(cwdA));
+			await toolA!.execute("a", { code: "x = 1" });
+			const ownerA = (executeSpy.mock.calls[0]?.[1] as { kernelOwnerId: string }).kernelOwnerId;
+
+			// Same slug, different GJC session id.
+			await autoresearchWrite({
+				cwd: cwdB,
+				objective: "Same slug, other session",
+				mode: "web",
+				deliverables: ["d"],
+				constraints: ["c"],
+				slug: "shared-slug",
+				sessionId: "other-session",
+			});
+			const toolB = await BUILTIN_TOOLS[AUTORESEARCH_PYTHON_TOOL_NAME](
+				makeToolSession(cwdB, undefined, "other-session"),
+			);
+			await toolB!.execute("b", { code: "y = 2" });
+			const ownerB = (executeSpy.mock.calls[1]?.[1] as { kernelOwnerId: string }).kernelOwnerId;
+
+			expect(ownerA).not.toBe(ownerB);
+			expect(ownerA).toContain(TEST_SESSION_ID);
+			expect(ownerB).toContain("other-session");
 		} finally {
 			executeSpy.mockRestore();
 		}
@@ -240,7 +298,7 @@ describe("autoresearch mission python tool — production builtin wiring", () =>
 			const cleared = await tool!.execute("call-clear", { action: "clear" });
 			expect(cleared.isError).toBeUndefined();
 			expect(textOf(cleared)).toContain("cleared");
-			expect(disposeSpy).toHaveBeenCalledWith("autoresearch:tokenizer-mission");
+			expect(disposeSpy).toHaveBeenCalledWith(`autoresearch:${TEST_SESSION_ID}:tokenizer-mission`);
 
 			// The clear action lives on the single `python` tool — no teardown tool
 			// is registered anywhere in the builtin registry.
@@ -291,8 +349,10 @@ describe("autoresearch mission python tool — production builtin wiring", () =>
 			// mission owner stays distinct from the session eval owner.
 			await session.dispose();
 			const disposedOwners = disposeSpy.mock.calls.map(call => call[0] as string);
-			expect(disposedOwners).toContain("autoresearch:discovery-mission");
-			const otherOwners = disposedOwners.filter(owner => owner !== "autoresearch:discovery-mission");
+			expect(disposedOwners).toContain(`autoresearch:${TEST_SESSION_ID}:discovery-mission`);
+			const otherOwners = disposedOwners.filter(
+				owner => owner !== `autoresearch:${TEST_SESSION_ID}:discovery-mission`,
+			);
 			expect(otherOwners).toHaveLength(1);
 			expect(otherOwners[0]?.startsWith("agent-session:")).toBe(true);
 			expect(cleanupRegistrarHolder.current).toBeDefined();
