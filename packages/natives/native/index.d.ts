@@ -51,6 +51,7 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
+
 /**
  * Long-lived macOS appearance observer.
  *
@@ -500,7 +501,7 @@ export declare function __piNativesPublishOutcomeV1(): void
  * `packages/natives/native/index.js` (which derives the name from
  * `package.json#version`).
  */
-export declare function __piNativesV0_13_1(): void
+export declare function __piNativesV0_13_2(): void
 
 /**
  * Apply conservative pre-execution rewrites to a bash command.
@@ -2087,11 +2088,13 @@ export declare function renameNoReplacePath(sourcePath: string, destinationPath:
 
 /**
  * Async variant of [`rename_no_replace_path`] scheduled on the libuv blocking
- * pool. Managed output publication awaits this boundary so a rename that
- * stalls in the kernel (oversized APFS directory namespaces, issue #4394)
- * blocks one pool thread instead of the agent's event loop: await timeouts,
- * sibling subagents, and watchdogs keep running, and a hung publication
- * degrades to one unresolved receipt rather than a frozen process.
+ * pool.
+ *
+ * Managed output publication awaits this boundary so a rename that stalls in
+ * the kernel (oversized APFS directory namespaces, issue #4394) blocks one
+ * pool thread instead of the agent's event loop: await timeouts, sibling
+ * subagents, and watchdogs keep running, and a hung publication degrades to
+ * one unresolved receipt rather than a frozen process.
  */
 export declare function renameNoReplacePathAsync(sourcePath: string, destinationPath: string): Promise<NativeNoReplaceResult>
 

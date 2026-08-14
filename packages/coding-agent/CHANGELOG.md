@@ -121,6 +121,26 @@
 - ACP `session/new` no longer fails with an uncertain-after-send internal error against a cold session host. Session-scoped commands were dispatched through `SessionRouter` on the SDK transport's one-shot default deadline (10s), which the first `models.list/current` (Q10) outruns whenever profile-provider credential collection has to refresh several OAuth providers — the reply landed after the deadline (measured 10002ms against an 11s answer), the outcome could then only be reported as uncertain after the frame was sent, and the ACP agent discarded the session it had just created while the immediate retry answered in ~260ms. Router-dispatched session requests now carry the long-lived session budget (two host heartbeat TTLs, matching the reconnect budget that already keeps these clients alive), and any caller-supplied timeout — coordinator prompt acknowledgement, lifecycle requests — still wins (#4258).
 ### Changed
 - macOS now emits the terminal BEL for completion, approval, and ask notifications by default when `notifications.terminalBell` has not been configured; an explicit setting still controls the behavior.
+## [0.13.2] - 2026-08-13
+
+### Added
+
+- Added a portable Stream Deck integration for cmux sessions, including a plugin manifest, reusable profile pages, action icons, installation scripts, and a guided setup document (#4308 by @Yeachan-Heo).
+- `/theme <name>` now switches the theme immediately without opening the selector. The name is validated against built-in and custom themes, persisted to the detected `theme.dark`/`theme.light` slot, and applied to the running session in one step (#4429 by @Yeachan-Heo).
+
+### Fixed
+
+- Anthropic thinking blocks emptied by `clear_thinking` now drop stale signatures before replay, preventing every subsequent request from failing with an invalid thinking-block signature (#4247, reported by @probepark).
+- Coalesced double-Esc and triple-Esc input now emits individual Escape presses under tmux and SSH, while split ambiguous Escape sequences stay buffered until a continuation or flush timeout resolves them (#4312 by @Yeachan-Heo).
+- Apple Terminal.app now retains its default keyboard mode when Kitty keyboard support is unavailable, preserving Korean/Hangul IME composition (#4297 by @Yeachan-Heo).
+- Managed output publication no longer freezes the resident event loop when a no-replace rename stalls in the kernel. Async publication now uses asynchronous file operations and native blocking-pool rename/link boundaries, while per-session stores reap scrubbed protocol remnants on a throttled, serialized schedule (#4396 by @Yeachan-Heo; fixes #4394).
+- The Telegram notification daemon now contains transient Windows state and ownership-lock read failures during steady heartbeat renewal instead of terminating its run loop; staging files are cleaned in a `finally` block, and only a proven ownership mismatch stops the owner (by @Yeachan-Heo; issue #4200).
+- Coordinator MCP now answers the standard `ping` keepalive with an empty result instead of `method not found`, preventing liveness clients from reconnecting repeatedly (#4412 by @developjik).
+- Task-launched canonical subagents no longer receive an ACP exact-config `toolsOnly` MCP manager that they are forbidden to reuse, restoring Planner, Architect, Critic, and Ralplan consensus launches (#4419 by @chlee1001).
+- The SDK broker's Windows process-liveness probe no longer opens a console window on every poll; its PowerShell fallback now passes `windowsHide` so a dead or inaccessible process cannot trigger a continuous focus-stealing terminal flash (#4346 by @Dayoooun).
+- Foreground Bash calls that finish before their auto-background deadline now cancel that deadline instead of leaving a sleep behind that keeps compiled print-mode processes alive (#4256 by @probepark).
+- Prompt suggestions now remain visible after cancelling another interactive action and returning to the composer (#4347 by @thegreatesthoneybee).
+
 ## [0.13.1] - 2026-08-11
 
 ### Added
