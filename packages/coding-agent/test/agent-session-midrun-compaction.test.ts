@@ -664,6 +664,13 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 			expect(canonicalPreamble).toBeDefined();
 			expect(canonicalContinuation).toBeDefined();
 			expect(canonicalServerResult).toBeDefined();
+			const canonicalCursorOrder = canonicalMessages.flatMap(message => {
+				if (message === canonicalPreamble) return ["preamble"];
+				if (message === canonicalServerResult) return ["server-result"];
+				if (message === canonicalContinuation) return ["continuation"];
+				return [];
+			});
+			expect(canonicalCursorOrder).toEqual(["preamble", "server-result", "continuation"]);
 			const cursorEvents = loop.agentEvents.flatMap(event => {
 				if (event.type !== "message_end") return [];
 				const content = JSON.stringify((event.message as { content?: unknown }).content ?? "");
@@ -686,6 +693,7 @@ describe("AgentSession mid-run compaction (issue #2035)", () => {
 					return content.includes("Cursor preamble and continuation") && content.includes("cursor-call");
 				}),
 			).toBe(false);
+			expect(canonicalMessages).not.toContainEqual(originalAnchor!);
 			expect(loop.events.filter(event => event.type === "agent_end")).toHaveLength(1);
 			expect(loop.streamCallCount()).toBe(2);
 		} finally {
