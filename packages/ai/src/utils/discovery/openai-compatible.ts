@@ -162,6 +162,26 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	const deduped = new Map<string, Model<TApi>>();
 	for (const entry of entries) {
+		const rawContextWindow =
+			typeof entry.max_model_len === "number" && entry.max_model_len > 0
+				? entry.max_model_len
+				: typeof entry.context_length === "number" && entry.context_length > 0
+					? entry.context_length
+					: typeof entry.context_window === "number" && entry.context_window > 0
+						? entry.context_window
+						: typeof entry.max_context_length === "number" && entry.max_context_length > 0
+							? entry.max_context_length
+							: typeof entry.max_position_embeddings === "number" && entry.max_position_embeddings > 0
+								? entry.max_position_embeddings
+								: UNK_CONTEXT_WINDOW;
+
+		const rawMaxTokens =
+			typeof entry.max_tokens === "number" && entry.max_tokens > 0
+				? entry.max_tokens
+				: typeof entry.max_output_tokens === "number" && entry.max_output_tokens > 0
+					? entry.max_output_tokens
+					: UNK_MAX_TOKENS;
+
 		const defaults: Model<TApi> = {
 			id: entry.id,
 			name: typeof entry.name === "string" && entry.name.length > 0 ? entry.name : entry.id,
@@ -171,8 +191,8 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 			reasoning: false,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: UNK_CONTEXT_WINDOW,
-			maxTokens: UNK_MAX_TOKENS,
+			contextWindow: rawContextWindow,
+			maxTokens: rawMaxTokens,
 		};
 
 		const mapped = options.mapModel?.(entry, defaults, context) ?? defaults;
