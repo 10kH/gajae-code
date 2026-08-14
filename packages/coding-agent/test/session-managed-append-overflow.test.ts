@@ -44,10 +44,10 @@ describe("SessionManager managed append overflow recovery", () => {
 			const sessionFile = manager.getSessionFile();
 			if (!sessionFile) throw new Error("Expected managed session file");
 
-			// Mock the store's appendExpectedSync to throw content_too_large,
+			// Mock the store's appendSync to throw content_too_large,
 			// simulating a transcript that has grown to the 64 MiB limit.
 			const appendSpy = vi
-				.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedSync")
+				.spyOn(ManagedSessionDescendantStore.prototype, "appendSync")
 				.mockImplementation(() => {
 					throw new Error("content_too_large");
 				});
@@ -106,7 +106,7 @@ describe("SessionManager managed append overflow recovery", () => {
 			await manager.ensureOnDisk();
 
 			const appendSpy = vi
-				.spyOn(ManagedSessionDescendantStore.prototype, "appendExpectedSync")
+				.spyOn(ManagedSessionDescendantStore.prototype, "appendSync")
 				.mockImplementation(() => {
 					throw new Error("some_other_error");
 				});

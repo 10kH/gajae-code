@@ -15807,7 +15807,7 @@ export class SessionManager {
 			// already been added to #fileEntries by #appendEntryWithinPersistenceFence.
 			if (err instanceof Error && err.message === "content_too_large") {
 				this.#rewriteFileSync();
-				if (publishResumeBreadcrumb) this.#writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+				if (publishResumeBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 				this.#readOnlyResume = false;
 				return;
 			}
