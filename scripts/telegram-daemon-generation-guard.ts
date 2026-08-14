@@ -470,6 +470,24 @@ export async function validateCurrentTreeManifest(): Promise<void> {
 		throw new Error("telegram-daemon-generation-guard: native authority digests do not byte-match the current tree");
 }
 
+/**
+ * Fail-closed current-tree validation for a manifest that was just regenerated and
+ * written to disk by the local {@link fixGenerations} bootstrap. Unlike
+ * `validateCurrentTreeManifest()` — which compares against the module-level
+ * `manifest` import and is stale until a repair commits — this byte-compares the
+ * provided on-disk manifest source against the current tree so a fresh digest
+ * bootstrap can pass its own strict check. It is only invoked from the explicit
+ * local developer fix path and must never gate normal/CI guard runs.
+ */
+export async function validateRegeneratedManifest(manifestSource: string, guardVersion: number | undefined): Promise<void> {
+	const diskManifest = JSON.parse(manifestSource) as GuardManifest;
+	if (guardVersion === undefined || diskManifest.contractVersion !== guardVersion)
+		throw new Error("telegram-daemon-generation-guard: post-fix manifest contract version does not match the guard script");
+	const expected = JSON.stringify(Object.entries(await currentTreeDigests()).sort());
+	const actual = JSON.stringify(Object.entries(diskManifest.digests).sort());
+	if (expected !== actual) throw new Error("telegram-daemon-generation-guard: post-fix manifest digests do not byte-match the current tree");
+}
+
 function bootstrapGuardContract(): void {
 	validateInventory();
 	validateManifest();
@@ -1267,13 +1285,10 @@ export async function fixGenerations(baseInput: string | undefined, options: { f
 		// --fix-generations bootstrap that regenerates stale semantic digests can pass its
 		// own strict current-tree check, while validateCurrentTreeManifest() (normal/CI
 		// guard) stays fail-closed against the pre-repair committed manifest.
-		const diskManifest = JSON.parse(await Bun.file(manifestTarget).text()) as GuardManifest;
-		const diskGuardVersion = guardContractVersion(await Bun.file(path.join(root, guardScript)).text());
-		if (diskGuardVersion === undefined || diskManifest.contractVersion !== diskGuardVersion)
-			throw new Error("telegram-daemon-generation-guard: post-fix manifest contract version does not match the guard script");
-		const expected = JSON.stringify(Object.entries(await currentTreeDigests()).sort());
-		const actual = JSON.stringify(Object.entries(diskManifest.digests).sort());
-		if (expected !== actual) throw new Error("telegram-daemon-generation-guard: post-fix manifest digests do not byte-match the current tree");
+		await validateRegeneratedManifest(
+			await Bun.file(manifestTarget).text(),
+			guardContractVersion(await Bun.file(path.join(root, guardScript)).text()),
+		);
 		// Re-evaluate base→updated-tree to confirm the normal guard would pass.
 		const updatedHead: Array<readonly [string, string | undefined]> = [];
 		for (const file of filePaths) updatedHead.push([file, await Bun.file(path.join(root, file)).text().catch(() => undefined)]);

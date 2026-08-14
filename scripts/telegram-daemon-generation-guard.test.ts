@@ -9,6 +9,7 @@ import {
 	currentTreeDigests,
 	declaration,
 	evaluate,
+	fixGenerations,
 	FIX_GENERATIONS_REMEDIATION,
 	GUARD_CONTRACT_VERSION,
 	isLegacyBootstrapBase,
@@ -21,6 +22,7 @@ import {
 	validateCurrentTreeManifest,
 	validateInventory,
 	validateManifest,
+	validateRegeneratedManifest,
 	validateSha,
 	writeManifest,
 } from "./telegram-daemon-generation-guard";
@@ -1082,6 +1084,42 @@ test("fails closed when a protected native authority declaration is missing or m
 			await rm(directory, { recursive: true, force: true });
 		}
 	}, 60000);
+
+	test("stale declaration digests fail strict validation but a regenerated manifest passes (fail-before / pass-after)", async () => {
+		// fail-before: a manifest whose semantic digests do not byte-match the current
+		// tree must be rejected by the strict current-tree comparison that normal/CI
+		// guard runs use, so a pre-repair stale manifest can never quietly pass.
+		const stale = {
+			...manifest,
+			digests: {
+				...manifest.digests,
+				"telegram:packages/coding-agent/src/sdk/bus/index.ts:createNotificationsExtension": "0".repeat(64),
+			},
+		};
+		await expect(
+			validateRegeneratedManifest(JSON.stringify(stale), GUARD_CONTRACT_VERSION),
+		).rejects.toThrow("post-fix manifest digests do not byte-match the current tree");
+		// pass-after: the manifest regenerated from the current tree (the exact output the
+		// local --fix-generations bootstrap writes to disk) must pass the same strict check.
+		const regenerated = await manifestForCurrentTree();
+		await expect(
+			validateRegeneratedManifest(JSON.stringify(regenerated), GUARD_CONTRACT_VERSION),
+		).resolves.toBeUndefined();
+		expect(regenerated.digests).toEqual(await currentTreeDigests());
+	}, 60000);
+
+	test("CI/guard environments reject the explicit local --fix-generations mutation path", async () => {
+		const previousCi = process.env.CI;
+		process.env.CI = "true";
+		try {
+			await expect(fixGenerations(undefined, {})).rejects.toThrow(
+				"explicit local developer command and must not run under CI or guard-event environments",
+			);
+		} finally {
+			if (previousCi === undefined) delete process.env.CI;
+			else process.env.CI = previousCi;
+		}
+	});
 
 	test("guard authority proves immutable event objects without pinning the mutable base ref", () => {
 		const head = "a".repeat(40);
