@@ -111,8 +111,7 @@ test("hook keeps repository root separate from nested invocation cwd", async () 
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("pull_request_target:");
-	expect(workflow).toContain("pull_request_review:");
-	expect(workflow).toContain("types: [submitted, edited, dismissed]");
+	expect(workflow).not.toContain("pull_request_review:");
 	expect(workflow).not.toContain("if: ${{ false }}");
 	expect(workflow).not.toMatch(/^\s+pull_request:\s*$/mu);
 	expect(workflow).toContain("permissions:\n  contents: read\n  pull-requests: read");
@@ -201,8 +200,7 @@ test("review events cannot launch or cancel the affected Dev CI pipeline", async
 	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
 	const prContract = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(devCi).not.toContain("pull_request_review:");
-	expect(prContract).toContain("pull_request_review:");
-	expect(prContract).toContain("types: [submitted, edited, dismissed]");
+	expect(prContract).not.toContain("pull_request_review:");
 	expect(prContract).not.toContain("affected-plan");
 	expect(prContract).not.toContain("evidence producer");
 });
