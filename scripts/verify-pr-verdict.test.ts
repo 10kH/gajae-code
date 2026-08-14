@@ -123,6 +123,10 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 	expect(workflow.match(/persist-credentials: false/gu)).toHaveLength(2);
 	expect(workflow).toContain("unset BUN_OPTIONS");
 	expect(workflow).toContain("empty_bunfig=\"$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml\"");
+	expect(workflow).toContain('if [[ ! -f "$trusted_root/scripts/verify-pr-verdict.ts" ]]');
+	expect(workflow).toContain("predates the trusted validator; Dev CI PR contract bootstrap remains authoritative");
+	expect(workflow).toMatch(/if \[\[ ! -f "\$trusted_root\/scripts\/verify-pr-verdict\.ts" \]\]; then[\s\S]*?exit 0[\s\S]*?bun --no-env-file/u);
+	expect(workflow).not.toContain('! -f "$repo_root/scripts/verify-pr-verdict.ts"');
 	expect(workflow).toContain("cd \"$trusted_root\"");
 	expect(workflow).toContain('bun --no-env-file --config="$empty_bunfig" "$trusted_root/scripts/verify-pr-verdict.ts"');
 	expect(workflow).toContain('--event "$GITHUB_EVENT_PATH" --repo "$repo_root" --trusted-root "$trusted_root"');

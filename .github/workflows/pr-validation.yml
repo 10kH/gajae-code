@@ -49,6 +49,10 @@ jobs:
           unset BUN_OPTIONS
           trusted_root="$PWD/trusted-base"
           repo_root="$PWD/pr-head"
+          if [[ ! -f "$trusted_root/scripts/verify-pr-verdict.ts" ]]; then
+            echo "::notice::immutable base ${{ github.event.pull_request.base.sha }} predates the trusted validator; Dev CI PR contract bootstrap remains authoritative"
+            exit 0
+          fi
           empty_bunfig="$RUNNER_TEMP/gjc-pr-contract-empty-bunfig.toml"
           printf '# trusted empty Bun configuration\n' > "$empty_bunfig"
           cd "$trusted_root"
