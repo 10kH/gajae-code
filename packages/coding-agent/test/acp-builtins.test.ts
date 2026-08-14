@@ -477,9 +477,16 @@ describe("ACP builtin slash commands", () => {
 
 	it("renders the deterministic empty stored-account inventory without probing", async () => {
 		const { output, runtime } = createRuntime();
+		runtime.session.fetchUsageReports = async () => {
+			throw new Error("plain /usage must not probe providers");
+		};
+		const fetchUsageReports = spyOn(runtime.session, "fetchUsageReports").mockRejectedValue(
+			new Error("plain /usage must not probe providers"),
+		);
 
 		await expect(executeAcpBuiltinSlashCommand("/usage", runtime)).resolves.toEqual({ consumed: true });
 
+		expect(fetchUsageReports).not.toHaveBeenCalled();
 		expect(output[0]).toContain("Accounts (cache only)");
 		expect(output[0]).not.toContain(":stored:");
 	});
