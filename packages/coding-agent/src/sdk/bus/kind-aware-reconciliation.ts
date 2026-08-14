@@ -523,7 +523,13 @@ export function createKindAwareReconciliation(
 				}),
 			);
 			const candidateIndex = indexRecords(candidate);
-			await store.transact(() => [...candidate.values()].map(record => ({ ...record })));
+			// Persist only when hydration settled accepted steers to uncertain: an
+			// unconditional transact emits a rename on every startup even for empty
+			// stores, which a test pause hook or slow fs can intercept before any
+			// prompt/skill admission — stalling reconciliationReady so a concurrent
+			// abort misses the not-yet-registered pending preflight entry (#4522).
+			const settledSteers = loaded.some(record => record.kind === "steer" && record.status === "accepted");
+			if (settledSteers) await store.transact(() => [...candidate.values()].map(record => ({ ...record })));
 			records = candidate;
 			clientRefIndex = candidateIndex;
 		};
