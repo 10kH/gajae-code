@@ -4784,6 +4784,17 @@ export class AgentSession {
 		// An already-released predecessor must not cost a microtask: external emitters
 		// and tests rely on canonical append being visible synchronously after
 		// emitExternalEvent returns whenever no admission is actually contended.
+		// Track the terminal assistant synchronously, before any admission wait:
+		// externally emitted terminals (host bridges, replays, tests) dispatch
+		// agent_end immediately after message_end, and the agent_end handler's
+		// post-turn read must see THIS stop even when this admission is still
+		// parked behind a contended predecessor — otherwise post-turn logic
+		// (deep-interview continuation, compaction, retry classification) runs
+		// against the previous turn's assistant.
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#lastAssistantMessage = event.message;
+		}
+
 		if (event.type === "message_end") {
 			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
 				await canonicalAdmission.predecessor.promise;
@@ -5103,9 +5114,9 @@ export class AgentSession {
 				this.#markTtsrInjected(this.#extractTtsrRuleNames(event.message.details));
 			}
 
-			// Track assistant message for auto-compaction (checked on agent_end)
+			// (#lastAssistantMessage is captured synchronously before the admission
+			// wait above; the block below handles assistant side effects only.)
 			if (event.message.role === "assistant") {
-				this.#lastAssistantMessage = event.message;
 				const assistantMsg = event.message as AssistantMessage;
 				const currentGrantsAnthropicPriority =
 					this.serviceTier === "priority" || this.serviceTier === "claude-only";
