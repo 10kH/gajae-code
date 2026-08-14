@@ -290,15 +290,29 @@ export async function retireRemovedGjcDefinitions(
 			results.push({ name, path: directory, status: "quarantined" });
 			continue;
 		}
-		// Timestamped so repeated retirements never collide and never overwrite an
-		// earlier quarantine.
-		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-		const quarantinedTo = path.join(targetRoot, "retired", `${name}.${stamp}`);
-		await fs.mkdir(path.dirname(quarantinedTo), { recursive: true });
+		const quarantinedTo = await reserveQuarantinePath(path.join(targetRoot, "retired"), name);
 		await fs.rename(directory, quarantinedTo);
 		results.push({ name, path: directory, quarantinedTo, status: "quarantined" });
 	}
 	return results;
+}
+
+/**
+ * Reserve a unique quarantine directory.
+ *
+ * A timestamp alone is not enough: two retirements inside the same millisecond
+ * resolve to the same path, which would silently overwrite the earlier
+ * quarantine. Disambiguate with a counter until an unused path is found.
+ */
+async function reserveQuarantinePath(retiredRoot: string, name: string): Promise<string> {
+	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+	await fs.mkdir(retiredRoot, { recursive: true });
+	const base = path.join(retiredRoot, `${name}.${stamp}`);
+	if (!(await directoryExists(base))) return base;
+	for (let attempt = 2; ; attempt += 1) {
+		const candidate = `${base}-${attempt}`;
+		if (!(await directoryExists(candidate))) return candidate;
+	}
 }
 
 async function directoryExists(candidate: string): Promise<boolean> {

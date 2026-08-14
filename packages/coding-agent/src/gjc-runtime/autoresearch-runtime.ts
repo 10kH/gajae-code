@@ -56,7 +56,6 @@ import {
 	appendJsonl,
 	persistedStateRevision,
 	readExistingStateForMutation,
-	removeFileAudited,
 	writeGuardedJsonAtomic,
 } from "./state-writer";
 import { assertSafePathComponent, CommandError, flagValue, hasFlag } from "./workflow-cli-common";
@@ -95,6 +94,8 @@ export interface AutoresearchPaths {
 	dir: string;
 	missionPath: string;
 	ledgerPath: string;
+	/** Quarantine root for retired missions: `<dir>/retired/<slug>.<timestamp>/`. */
+	retiredRoot: string;
 }
 
 /** Append-only session ledger row. */
@@ -161,6 +162,8 @@ export interface AutoresearchClearReceipt {
 	cleared: boolean;
 	missionPath: string;
 	ledgerEvent: AutoresearchLedgerEvent;
+	/** Where the retired mission's artifacts were quarantined, when one existed. */
+	retiredTo?: string;
 }
 
 export interface AutoresearchHandoffReceipt extends AutoresearchWriteReceipt {
@@ -227,6 +230,7 @@ export function getAutoresearchPaths(cwd: string, sessionId?: string | null): Au
 		dir,
 		missionPath: path.join(dir, "mission.json"),
 		ledgerPath: path.join(dir, "ledger.jsonl"),
+		retiredRoot: path.join(dir, "retired"),
 	};
 }
 
@@ -425,7 +429,28 @@ export async function autoresearchWrite(input: {
 	return { ok: true, mission, missionPath: paths.missionPath, intake: "cold", ledgerEvent };
 }
 
-/** clear verb: remove the mission artifact and record the kernel clear in the ledger. */
+/**
+ * Durable per-mission artifacts that live directly under the session
+ * autoresearch dir. `clear` must retire ALL of them, not just `mission.json`:
+ * leaving `ledger.jsonl` behind let a successor mission inherit the previous
+ * mission's `verdict_issued` / `critic_recorded` rows, so
+ * `extractVerdictFromLedger` surfaced a prior verdict as if it were the new
+ * mission's. `runs.jsonl` and `experiment.json` leaked run history and the
+ * metric contract the same way, and `runs/` holds the notebook and report.
+ */
+const AUTORESEARCH_MISSION_ARTIFACTS = ["mission.json", "ledger.jsonl", "runs.jsonl", "experiment.json"] as const;
+const AUTORESEARCH_RUNS_SUBDIR = "runs";
+
+/**
+ * clear verb: retire the entire mission working set and record the kernel clear.
+ *
+ * Artifacts are QUARANTINED to `<dir>/retired/<slug>.<timestamp>/`, never
+ * deleted, so a completed mission's evidence stays auditable while the
+ * successor mission starts from genuinely empty state. The `kernel_cleared` row
+ * is appended to the OUTGOING ledger before it is moved, so the retired ledger
+ * is a complete record that ends with its own clear and the successor's ledger
+ * starts empty rather than the clear silently vanishing from the audit trail.
+ */
 export async function autoresearchClear(cwd: string, sessionId?: string | null): Promise<AutoresearchClearReceipt> {
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
@@ -434,23 +459,58 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 	// Must go through the shared derivation: an inline template here is what
 	// drifted from the tool's owner id and left cleared kernels resident.
 	if (existing) await disposeKernelSessionsByOwner(autoresearchKernelOwnerId(resolvedSessionId, existing.slug));
-	const deleted = await removeFileAudited(paths.missionPath, {
-		cwd,
-		audit: {
-			category: "prune",
-			verb: "remove",
-			owner: "gjc-runtime",
-			skill: "autoresearch",
-			sessionId: resolvedSessionId,
-		},
-	});
+	// Close out the outgoing ledger first so the retired copy ends with its clear.
 	const ledgerEvent = await appendAutoresearchLedger(
 		cwd,
 		{ event: "kernel_cleared", slug: existing?.slug ?? "" },
 		resolvedSessionId,
 	);
+	const retiredTo = existing ? await retireAutoresearchMissionArtifacts(paths, existing.slug) : undefined;
+	const deleted = existing !== null;
 	await reconcileAutoresearchState(cwd, existing, resolvedSessionId, { active: false, phase: "complete" });
-	return { ok: true, cleared: deleted.deleted, missionPath: paths.missionPath, ledgerEvent };
+	return {
+		ok: true,
+		cleared: deleted,
+		missionPath: paths.missionPath,
+		ledgerEvent,
+		...(retiredTo ? { retiredTo } : {}),
+	};
+}
+
+/**
+ * Move every durable mission artifact aside into a uniquely-reserved directory.
+ *
+ * A timestamp alone collides when two clears land in the same millisecond,
+ * which would overwrite the earlier mission's evidence, so the directory is
+ * reserved with an exclusive mkdir and disambiguated with a counter.
+ */
+async function retireAutoresearchMissionArtifacts(paths: AutoresearchPaths, slug: string): Promise<string> {
+	const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+	await fs.mkdir(paths.retiredRoot, { recursive: true });
+	const base = path.join(paths.retiredRoot, `${slug}.${stamp}`);
+	let retiredTo = base;
+	for (let attempt = 1; ; attempt += 1) {
+		retiredTo = attempt === 1 ? base : `${base}-${attempt}`;
+		try {
+			await fs.mkdir(retiredTo);
+			break;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		}
+	}
+	for (const name of AUTORESEARCH_MISSION_ARTIFACTS) {
+		await moveIfPresent(path.join(paths.dir, name), path.join(retiredTo, name));
+	}
+	await moveIfPresent(path.join(paths.dir, AUTORESEARCH_RUNS_SUBDIR), path.join(retiredTo, AUTORESEARCH_RUNS_SUBDIR));
+	return retiredTo;
+}
+
+async function moveIfPresent(from: string, to: string): Promise<void> {
+	try {
+		await fs.rename(from, to);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
 }
 
 /* --------------------------- handoff intake --------------------------- */

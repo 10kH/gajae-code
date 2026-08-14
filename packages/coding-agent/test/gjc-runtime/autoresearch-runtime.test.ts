@@ -203,9 +203,15 @@ describe("autoresearch ledger", () => {
 			evaluator: "mission-agent",
 			slug: "tokenizer-mission",
 		}); // verdict_issued
-		await autoresearchClear(root); // kernel_cleared
+		const cleared = await autoresearchClear(root); // kernel_cleared
 
-		const ledger = (await autoresearchRead(root, TEST_SESSION_ID)).ledger;
+		// `clear` retires the ledger with the mission, so the full ordered trail
+		// lives in the retired copy rather than the live (now empty) one.
+		const retired = await Bun.file(path.join(cleared.retiredTo!, "ledger.jsonl")).text();
+		const ledger = retired
+			.split("\n")
+			.filter(line => line.trim() !== "")
+			.map(line => JSON.parse(line) as { event: string; eventId: string; timestamp: string });
 		expect(ledger.map(event => event.event)).toEqual([
 			"mission_created",
 			"mode_set",
@@ -237,7 +243,7 @@ describe("autoresearch ledger", () => {
 		expect(unchanged.ledgerEvent).toBeUndefined();
 	});
 
-	it("clear removes the mission and emits kernel_cleared", async () => {
+	it("clear retires the mission and leaves the successor ledger empty", async () => {
 		const root = await tempDir();
 		await autoresearchWrite(baseMission(root));
 		const clear = await autoresearchClear(root);
@@ -245,8 +251,68 @@ describe("autoresearch ledger", () => {
 		expect(clear.ledgerEvent.event).toBe("kernel_cleared");
 		const readBack = await autoresearchRead(root, TEST_SESSION_ID);
 		expect(readBack.exists).toBe(false);
-		const kinds = readBack.ledger.map(event => event.event);
+		// The outgoing ledger is retired with the mission, so a successor starts
+		// from genuinely empty state rather than inheriting prior events.
+		expect(readBack.ledger).toEqual([]);
+	});
+
+	it("retires the outgoing ledger complete with its own kernel_cleared row", async () => {
+		const root = await tempDir();
+		await autoresearchWrite(baseMission(root));
+		const clear = await autoresearchClear(root);
+
+		expect(clear.retiredTo).toBeDefined();
+		const retiredLedger = await Bun.file(path.join(clear.retiredTo!, "ledger.jsonl")).text();
+		const kinds = retiredLedger
+			.split("\n")
+			.filter(line => line.trim() !== "")
+			.map(line => (JSON.parse(line) as { event: string }).event);
+		// The audit trail is preserved, not erased: it ends with its own clear.
 		expect(kinds).toEqual(["mission_created", "kernel_cleared"]);
+		expect(await Bun.file(path.join(clear.retiredTo!, "mission.json")).exists()).toBe(true);
+	});
+
+	it("a successor mission cannot inherit the retired mission's verdict", async () => {
+		const root = await tempDir();
+		await autoresearchWrite(baseMission(root));
+		await autoresearchIssueVerdict({
+			cwd: root,
+			sessionId: TEST_SESSION_ID,
+			status: { state: "supported" },
+			evidence: ["prior-mission evidence"],
+			caveats: [],
+			evaluator: "mission-agent",
+		});
+		await autoresearchClear(root);
+
+		// Fresh mission in the SAME session must not see the prior verdict.
+		await autoresearchWrite({ ...baseMission(root), slug: "successor-mission" });
+		const successor = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(successor.mission?.slug).toBe("successor-mission");
+		expect(successor.ledger.map(event => event.event)).toEqual(["mission_created"]);
+		expect(JSON.stringify(successor.ledger)).not.toContain("prior-mission evidence");
+	});
+
+	it("clear on a session with no mission is a safe no-op and creates no retired dir", async () => {
+		const root = await tempDir();
+		const clear = await autoresearchClear(root);
+		expect(clear.cleared).toBe(false);
+		expect(clear.retiredTo).toBeUndefined();
+		expect(await Bun.file(getAutoresearchPaths(root, TEST_SESSION_ID).retiredRoot).exists()).toBe(false);
+	});
+
+	it("two clears in one session retire to distinct directories", async () => {
+		const root = await tempDir();
+		await autoresearchWrite(baseMission(root));
+		const first = await autoresearchClear(root);
+		await autoresearchWrite({ ...baseMission(root), slug: "second-mission" });
+		const second = await autoresearchClear(root);
+
+		expect(first.retiredTo).toBeDefined();
+		expect(second.retiredTo).toBeDefined();
+		expect(second.retiredTo).not.toBe(first.retiredTo);
+		expect(await Bun.file(path.join(first.retiredTo!, "mission.json")).exists()).toBe(true);
+		expect(await Bun.file(path.join(second.retiredTo!, "mission.json")).exists()).toBe(true);
 	});
 });
 
