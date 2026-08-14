@@ -810,6 +810,51 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(order).toEqual(["selection", "continuation"]);
 		expect(session.model).toBe(selectionModel);
 	});
+	it("keeps waitForIdle pending while a deferred continuation waits behind selection", async () => {
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, id: "selection-deferred-idle-model" };
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+			}
+			return originalGetApiKey(model, ...args);
+		});
+		const order: string[] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("continuation");
+		});
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutation: () => order.push("selection"),
+		});
+		await selectionValidationStarted.promise;
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		// The continuation is now parked behind the pending selection fence with
+		// no other in-flight work: waitForIdle must not report the session idle
+		// while that continuation is still waiting on the fence.
+		let idleReported = false;
+		const idle = session.waitForIdle().then(() => {
+			idleReported = true;
+		});
+		for (let i = 0; i < 20; i++) await Promise.resolve();
+		expect(idleReported).toBe(false);
+		releaseSelectionValidation.resolve();
+
+		await selection;
+		await idle;
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["selection", "continuation"]);
+		expect(session.model).toBe(selectionModel);
+	});
 
 	it("reschedules an AgentBusyError racing the queued-followup continue until delivery", async () => {
 		session.agent.followUp({

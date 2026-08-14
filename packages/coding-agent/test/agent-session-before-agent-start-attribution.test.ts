@@ -511,6 +511,72 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 
 		expect(promoted[0]).toBe("follow-up");
 	});
+	it("reserves an earlier follow-up before classifying a later prompt behind the same fence", async () => {
+		createSession();
+		await session.prompt("seed assistant tail");
+		await session.waitForIdle();
+		const releaseStartupBarrier = Promise.withResolvers<void>();
+		session.extendStartupTurnBarrier(releaseStartupBarrier.promise);
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-model" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		const followUpCommitStarted = Promise.withResolvers<void>();
+		const releaseFollowUpCommit = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+			}
+			return originalGetApiKey(model, ...args);
+		});
+		const promoted: string[] = [];
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		await selectionValidationStarted.promise;
+		// The explicit follow-up parks inside its asynchronous durable acceptance
+		// (onPreflightAcceptCommit) before #queueFollowUp records anything.
+		const first = session.sendUserMessage("first follow-up", {
+			queuedAtDispatch: true,
+			deliverAs: "followUp",
+			onPreflightAcceptCommit: async () => {
+				followUpCommitStarted.resolve();
+				await releaseFollowUpCommit.promise;
+			},
+			onQueuedPromoted: () => promoted.push("follow-up"),
+		});
+		// Let the selection fence settle so the follow-up dispatch reaches (and
+		// parks inside) its durable commit before the later prompt classifies.
+		releaseSelectionValidation.resolve();
+		await selection;
+		await followUpCommitStarted.promise;
+		// The later plain prompt classifies while the earlier follow-up is still
+		// awaiting its commit: it must observe the reserved follow-up ahead and
+		// queue as a follow-up behind it rather than starting a fresh run.
+		const second = session.sendUserMessage("later plain prompt", {
+			queuedAtDispatch: true,
+			onQueuedPromoted: () => promoted.push("plain"),
+		});
+		releaseFollowUpCommit.resolve();
+
+		await Promise.all([first, second]);
+		expect(session.pendingMessageCounts).toEqual({ steering: 0, followUp: 2, nextTurn: 0 });
+		const queuedFollowUps = session.agent.snapshotFollowUp();
+		expect(queuedFollowUps[0]).toMatchObject({
+			role: "user",
+			content: expect.arrayContaining([{ type: "text", text: "first follow-up" }]),
+		});
+		expect(queuedFollowUps[1]).toMatchObject({
+			role: "user",
+			content: expect.arrayContaining([{ type: "text", text: "later plain prompt" }]),
+		});
+		releaseStartupBarrier.resolve();
+		await session.waitForIdle();
+
+		expect(promoted[0]).toBe("follow-up");
+	});
 	it("rejects fresh queued SDK promotion when disposal starts during durable acceptance", async () => {
 		createSession();
 		const providerPrompt = vi.spyOn(session.agent, "prompt");
