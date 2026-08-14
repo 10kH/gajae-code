@@ -1886,6 +1886,7 @@ type SessionAdmissionEntry = {
 	ready: PromiseWithResolvers<void>;
 	settled: PromiseWithResolvers<void>;
 	released: boolean;
+	selectionFenceGeneration: number;
 	continuationCapability?: symbol;
 };
 
@@ -1987,7 +1988,10 @@ export class AgentSession {
 	#sessionAdmissionClosing = false;
 	#sessionAdmissionClosed = false;
 	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
+	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
+	#pendingSelectionFences = 0;
+	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#thinkingLevelMutationRevision = 0;
 	#thinkingVisibilityMutationRevision = 0;
@@ -2505,6 +2509,7 @@ export class AgentSession {
 	#terminalLineageSecret = crypto.randomUUID();
 	#promptGeneration = 0;
 	#promptPreflightAbortController = new AbortController();
+	#promptPreflightCancellationGeneration = 0;
 
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#temporaryProviderSessionScopes: TemporaryProviderSessionScopeRecord[] = [];
@@ -2568,6 +2573,12 @@ export class AgentSession {
 		return Object.assign(new AgentBusyError("Agent session admission is busy due to same-session reentrancy."), {
 			code: "busy",
 		});
+	}
+
+	#assertSessionAdmissionOpen(): void {
+		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
+			throw this.#sessionAdmissionBusyError();
+		}
 	}
 
 	/**
@@ -2647,12 +2658,12 @@ export class AgentSession {
 		body: (lease: SessionAdmissionLease) => Promise<T>,
 		signal?: AbortSignal,
 		continuationAdmission?: ScheduledContinuationAdmission,
-		options?: { allowDuringClosing?: boolean },
+		options?: {
+			allowDuringClosing?: boolean;
+			bypassSelectionFenceGeneration?: number;
+			allowPromptContinuationReentry?: boolean;
+		},
 	): Promise<T> {
-		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
-		if (kind === "prompt" && continuationAdmission === undefined) {
-			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
-		}
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) {
 			if (
@@ -2660,7 +2671,22 @@ export class AgentSession {
 				continuationAdmission.capability === owner.continuationCapability
 			)
 				return await body({ release: () => {} });
+			if (options?.allowPromptContinuationReentry === true && owner.kind === "prompt") {
+				return await body({ release: () => {} });
+			}
 			throw this.#sessionAdmissionBusyError();
+		}
+		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
+		const bypassesSelectionFence =
+			options?.bypassSelectionFenceGeneration !== undefined &&
+			options.bypassSelectionFenceGeneration < this.#selectionFenceGeneration;
+		if (
+			kind === "prompt" &&
+			continuationAdmission === undefined &&
+			!bypassesSelectionFence &&
+			this.#pendingSelectionFences > 0
+		) {
+			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
 		}
 		if (
 			this.#sessionAdmissionClosed ||
@@ -2683,6 +2709,7 @@ export class AgentSession {
 			ready: Promise.withResolvers<void>(),
 			settled: Promise.withResolvers<void>(),
 			released: false,
+			selectionFenceGeneration: this.#selectionFenceGeneration,
 			...(kind === "prompt" ? { continuationCapability: Symbol("scheduled-continuation") } : {}),
 		};
 		const releaseEntry = () => {
@@ -2739,6 +2766,7 @@ export class AgentSession {
 		const active = this.#activeSessionAdmission;
 		if (active?.kind === "prompt") {
 			this.#promptGeneration++;
+			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 		}
 		if (active) await active.settled.promise;
@@ -2832,6 +2860,17 @@ export class AgentSession {
 	#reserveDeferredAgentEndForContinuation(): symbol | undefined {
 		const pending = this.#pendingAgentEndEmit;
 		if (!pending) return undefined;
+		const hold = Symbol("deferred-agent-end-continuation");
+		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		return hold;
+	}
+
+	#restoreAndReserveDeferredAgentEndForContinuation(pending: AgentSessionEvent | undefined): symbol | undefined {
+		if (!pending) return undefined;
+		if (this.#pendingAgentEndEmit && this.#pendingAgentEndEmit !== pending) {
+			throw new Error("Cannot restore a deferred agent_end over a different pending terminal event");
+		}
+		this.#pendingAgentEndEmit = pending;
 		const hold = Symbol("deferred-agent-end-continuation");
 		this.#pendingAgentEndContinuationHolds.set(hold, pending);
 		return hold;
@@ -5469,8 +5508,14 @@ export class AgentSession {
 			onSkip?: () => void;
 			resourceRunId?: string;
 			leaseTask?: Promise<void>;
+			selectionFenceGeneration?: number;
 		},
 	): Promise<void> {
+		const selectionFenceGeneration =
+			options?.selectionFenceGeneration ??
+			this.#selectionFenceGenerationContext.getStore() ??
+			this.#sessionAdmissionContext.getStore()?.selectionFenceGeneration ??
+			this.#selectionFenceGeneration;
 		const delayMs = options?.delayMs ?? 0;
 		const resourceRunId = options?.resourceRunId;
 		const contextualLease = this.#runResourceLeaseContext.getStore();
@@ -5508,7 +5553,7 @@ export class AgentSession {
 				options.onSkip?.();
 				return;
 			}
-			await task(signal);
+			await this.#selectionFenceGenerationContext.run(selectionFenceGeneration, () => task(signal));
 		};
 		const scheduled = reservation?.ok
 			? this.#runResourceLeaseContext.run(reservation.lease, runScheduled)
@@ -5543,10 +5588,45 @@ export class AgentSession {
 		rescheduleOnBusy?: boolean;
 		/** Called when the scheduled continuation accepts its run (before agent_start). */
 		onRunAccepted?: (handle: AttemptRunHandle) => void;
+		/** Internal causal generation retained when a later continuation is deferred behind selection. */
+		selectionFenceGeneration?: number;
+		/** Internal predecessor publication hold retained across selection-fence deferral. */
+		predecessorAgentEndHold?: symbol;
+		/** Internal predecessor terminal event sequestered while waiting behind selection. */
+		deferredPredecessorAgentEnd?: AgentSessionEvent;
 	}): Promise<void> {
-		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
-			? this.#reserveDeferredAgentEndForContinuation()
-			: undefined;
+		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const selectionFenceGeneration =
+			options?.selectionFenceGeneration ??
+			this.#selectionFenceGenerationContext.getStore() ??
+			this.#sessionAdmissionContext.getStore()?.selectionFenceGeneration ??
+			continuationAdmission?.entry.selectionFenceGeneration ??
+			this.#selectionFenceGeneration;
+		if (this.#pendingSelectionFences > 0 && selectionFenceGeneration === this.#selectionFenceGeneration) {
+			const deferredPredecessorAgentEnd =
+				options?.deferredPredecessorAgentEnd ??
+				(options?.suppressPredecessorAgentEnd
+					? this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation())
+					: undefined);
+			const precedingSelectionFence = this.#selectionFenceTail;
+			const deferredPromptGeneration = options?.generation ?? this.#promptGeneration;
+			void precedingSelectionFence.then(() =>
+				this.#scheduleAgentContinue({
+					...options,
+					generation: deferredPromptGeneration,
+					selectionFenceGeneration,
+					deferredPredecessorAgentEnd,
+				}),
+			);
+			return Promise.resolve();
+		}
+		const predecessorAgentEndHold =
+			options?.predecessorAgentEndHold ??
+			(options?.deferredPredecessorAgentEnd
+				? this.#restoreAndReserveDeferredAgentEndForContinuation(options.deferredPredecessorAgentEnd)
+				: options?.suppressPredecessorAgentEnd
+					? this.#reserveDeferredAgentEndForContinuation()
+					: undefined);
 		let terminalized = false;
 		const skip = (
 			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
@@ -5566,7 +5646,6 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
-		const continuationAdmission = this.#captureScheduledContinuationAdmission();
 		let busyReschedules = 0;
 		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
 			const leaseSettlement = Promise.withResolvers<void>();
@@ -5720,6 +5799,10 @@ export class AgentSession {
 							},
 							scheduledSignal,
 							continuationAdmission,
+							{
+								bypassSelectionFenceGeneration: selectionFenceGeneration,
+								allowPromptContinuationReentry: true,
+							},
 						);
 					} catch (error) {
 						if (scheduledSignal.aborted) skip("aborted_signal");
@@ -5734,6 +5817,7 @@ export class AgentSession {
 					},
 					resourceRunId: options?.resourceRunId,
 					leaseTask: leaseSettlement.promise,
+					selectionFenceGeneration,
 				},
 			);
 		};
@@ -5815,8 +5899,13 @@ export class AgentSession {
 		return false;
 	}
 
-	#scheduleAutoContinuePrompt(generation: number, requireUnfinishedWork = true, resourceRunId?: string): void {
-		const predecessorAgentEndHold = this.#reserveDeferredAgentEndForContinuation();
+	#scheduleAutoContinuePrompt(
+		generation: number,
+		requireUnfinishedWork = true,
+		resourceRunId?: string,
+		deferredSelectionFenceGeneration?: number,
+		deferredPredecessorAgentEnd?: AgentSessionEvent,
+	): void {
 		const scheduledGeneration = generation;
 		const continuationAuthorized = async (
 			signal: AbortSignal,
@@ -5851,6 +5940,31 @@ export class AgentSession {
 			return authorized;
 		};
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const selectionFenceGeneration =
+			deferredSelectionFenceGeneration ??
+			this.#selectionFenceGenerationContext.getStore() ??
+			this.#sessionAdmissionContext.getStore()?.selectionFenceGeneration ??
+			continuationAdmission?.entry.selectionFenceGeneration ??
+			this.#selectionFenceGeneration;
+		if (this.#pendingSelectionFences > 0 && selectionFenceGeneration === this.#selectionFenceGeneration) {
+			const predecessorAgentEnd =
+				deferredPredecessorAgentEnd ??
+				this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation());
+			const precedingSelectionFence = this.#selectionFenceTail;
+			void precedingSelectionFence.then(() =>
+				this.#scheduleAutoContinuePrompt(
+					generation,
+					requireUnfinishedWork,
+					resourceRunId,
+					selectionFenceGeneration,
+					predecessorAgentEnd,
+				),
+			);
+			return;
+		}
+		const predecessorAgentEndHold = deferredPredecessorAgentEnd
+			? this.#restoreAndReserveDeferredAgentEndForContinuation(deferredPredecessorAgentEnd)
+			: this.#reserveDeferredAgentEndForContinuation();
 		void this.#schedulePostPromptTask(
 			async signal => {
 				try {
@@ -5886,6 +6000,7 @@ export class AgentSession {
 						},
 						signal,
 						continuationAdmission,
+						{ bypassSelectionFenceGeneration: selectionFenceGeneration },
 					);
 				} catch (error) {
 					if (signal.aborted) {
@@ -5901,6 +6016,7 @@ export class AgentSession {
 				delayMs: 0,
 				generation: scheduledGeneration,
 				resourceRunId,
+				selectionFenceGeneration,
 				onSkip: () => {
 					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
 					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -9443,6 +9559,8 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		if (expandPromptTemplates && text.startsWith("/skill:") && !options?.images?.length) {
@@ -9497,13 +9615,13 @@ export class AgentSession {
 		assertImagePlaceholdersHavePayload(expandedText, options?.images);
 		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
 		const claimsGenuineUserIntent = !options?.synthetic && options?.attribution !== "agent";
-		const owner = this.#sessionAdmissionContext.getStore();
-		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const admissionGeneration = this.#promptGeneration;
 		const admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
 			: this.#promptPreflightAbortController.signal;
-		await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+		if (this.#pendingSelectionFences > 0) {
+			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+		}
 		const deepInterviewUserIntentEpoch =
 			claimsGenuineUserIntent && !this.isStreaming ? this.#claimDeepInterviewUserIntent() : undefined;
 
@@ -11030,6 +11148,8 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: {
 			deliverAs?: "steer" | "followUp";
+			/** Preserve a busy SDK dispatch as queued work across an admission fence. */
+			queuedAtDispatch?: boolean;
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
@@ -11039,6 +11159,9 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		this.#assertSessionAdmissionOpen();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		if (typeof content !== "string" && !Array.isArray(content)) {
 			throw Object.assign(new Error("sendUserMessage requires string or content-array content."), {
@@ -11065,28 +11188,62 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		if (options?.deliverAs === "followUp") {
-			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+		const admissionSignal = options?.preflightSignal
+			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
+			: this.#promptPreflightAbortController.signal;
+		const preflightCancellationGeneration = this.#promptPreflightCancellationGeneration;
+		if (this.#pendingSelectionFences > 0) {
+			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+		}
+		const assertPreflightStillOpen = () => {
+			this.#assertSessionAdmissionOpen();
+			if (
+				options?.preflightSignal?.aborted ||
+				this.#promptPreflightCancellationGeneration !== preflightCancellationGeneration
+			) {
+				throw promptPreflightCancelledError();
+			}
+		};
+		assertPreflightStillOpen();
+		const queuedPlainPrompt = options?.queuedAtDispatch === true && options.deliverAs === undefined;
+		const queuedFollowUpAhead =
+			queuedPlainPrompt && (this.agent.snapshotFollowUp().length > 0 || this.#deferredSdkFollowUps.length > 0);
+		const queuedAtDispatchStartsFresh =
+			queuedPlainPrompt && !queuedFollowUpAhead && !this.agent.state.isStreaming && !this.#canAutoContinueForSteer();
+		const deliverAs =
+			options?.deliverAs ??
+			(queuedPlainPrompt
+				? queuedFollowUpAhead
+					? "followUp"
+					: queuedAtDispatchStartsFresh
+						? undefined
+						: "steer"
+				: undefined);
+
+		if (deliverAs === "followUp") {
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			assertPreflightStillOpen();
 			const queuedFollowUp = await this.#queueFollowUp(text, images, {
 				claimsGenuineUserIntent: true,
-				forceOneAtATime: Boolean(options.preflightSignal),
+				forceOneAtATime: Boolean(options?.preflightSignal || options?.queuedAtDispatch),
 				onPromoted: options?.onQueuedPromoted,
-				sdkRunToken: options.sdkRunToken,
+				sdkRunToken: options?.sdkRunToken,
 			});
 			const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
-			options.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
-			if (options.preflightSignal?.aborted) cancelQueuedFollowUp();
-			options.onPreflightAccepted?.();
+			options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
+			if (options?.preflightSignal?.aborted) cancelQueuedFollowUp();
+			options?.onPreflightAccepted?.();
 			return;
 		}
-		if (options?.deliverAs === "steer") {
-			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+		if (deliverAs === "steer") {
+			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			assertPreflightStillOpen();
 			await this.#queueSteer(text, images, {
 				claimsGenuineUserIntent: true,
 				onPromoted: options?.onQueuedPromoted,
 				external: true,
 			});
-			options.onPreflightAccepted?.();
+			options?.onPreflightAccepted?.();
 			return;
 		}
 
@@ -11097,6 +11254,7 @@ export class AgentSession {
 		// the message in the steering queue with no turn to consume it.
 		if (this.isStreaming) {
 			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+			assertPreflightStillOpen();
 			await this.#queueSteer(text, images, {
 				claimsGenuineUserIntent: true,
 				onPromoted: options?.onQueuedPromoted,
@@ -11107,11 +11265,28 @@ export class AgentSession {
 		}
 
 		// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
+		let queuedPromotionFired = false;
+		const fireQueuedPromotion = () => {
+			if (!queuedAtDispatchStartsFresh || queuedPromotionFired) return;
+			queuedPromotionFired = true;
+			options?.onQueuedPromoted?.();
+		};
 		await this.prompt(text, {
 			expandPromptTemplates: false,
 			images,
-			onPreflightAccepted: options?.onPreflightAccepted,
-			onPreflightAcceptCommit: options?.onPreflightAcceptCommit,
+			onPreflightAccepted: () => {
+				options?.onPreflightAccepted?.();
+				fireQueuedPromotion();
+			},
+			onPreflightAcceptCommit:
+				options?.onPreflightAcceptCommit || queuedAtDispatchStartsFresh
+					? async () => {
+							if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+							else options?.onPreflightAccepted?.();
+							assertPreflightStillOpen();
+							fireQueuedPromotion();
+						}
+					: undefined,
 			preflightSignal: options?.preflightSignal,
 		});
 	}
@@ -11492,6 +11667,7 @@ export class AgentSession {
 		this.#markRetryReplayUnsafe();
 		this.abortRetry();
 		this.#promptGeneration++;
+		this.#promptPreflightCancellationGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -11609,6 +11785,7 @@ export class AgentSession {
 	 * reset for the next admission. No run handle exists for a preflight prompt.
 	 */
 	cancelPendingPreflightForTerminalAbort(): void {
+		this.#promptPreflightCancellationGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
 	}
@@ -11847,6 +12024,7 @@ export class AgentSession {
 			// resetRetryReplaySafety) advances the epoch before minting, so the
 			// next turn after the abort gets a distinct (lineage, epoch) and is
 			// never captured by this scope (review thread P2).
+			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
 		}
@@ -13293,6 +13471,8 @@ export class AgentSession {
 		const expectedSessionId = this.sessionId;
 		const priorSelectionFence = this.#selectionFenceTail;
 		const selectionFence = Promise.withResolvers<void>();
+		this.#selectionFenceGeneration += 1;
+		this.#pendingSelectionFences += 1;
 		this.#selectionFenceTail = priorSelectionFence.then(() => selectionFence.promise);
 		void this.#selectionFenceTail.catch(() => {});
 		try {
@@ -13408,6 +13588,7 @@ export class AgentSession {
 			);
 		} finally {
 			selectionFence.resolve();
+			this.#pendingSelectionFences -= 1;
 		}
 	}
 	/**
@@ -18168,6 +18349,7 @@ export class AgentSession {
 					}
 					if (!preflightAccepted) {
 						await seam?.onPreflightAccepted?.();
+						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
 						preflightAccepted = true;
 					}
 					await this.agent.prompt(messages, options);

@@ -1317,6 +1317,7 @@ function createControlSurface(
 			onPreflightAcceptCommit: () => Promise<void>;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
 			onQueuedPromoted: () => void;
+			queuedAtDispatch: boolean;
 		}) => Promise<unknown>,
 		acceptedFields?: () => Record<string, unknown>,
 		allowCompletionFallback = false,
@@ -1392,6 +1393,7 @@ function createControlSurface(
 					// created at promotion so the submitting connection can
 					// terminal-abort that turn (review threads P1/P2).
 					onQueuedPromoted: () => onPromotedTurn?.(kind, correlation, requesterConnectionId),
+					queuedAtDispatch,
 				}),
 			);
 			void submission.then(
@@ -2316,10 +2318,10 @@ function createControlSurface(
 	};
 	return {
 		prompt: async (text, images, clientRef) =>
-			submit("prompt", clientRef, options =>
+			submit("prompt", clientRef, ({ queuedAtDispatch, ...options }) =>
 				api.sendUserMessage(
 					typeof images === "undefined" ? text : ([{ type: "text", text }, ...(images as never[])] as never),
-					options,
+					queuedAtDispatch ? { ...options, queuedAtDispatch: true } : options,
 				),
 			),
 		steer: async (text, clientRef) => {
@@ -2355,7 +2357,7 @@ function createControlSurface(
 		},
 		abortTerminal: terminalAbort,
 		abortAndPrompt: async text => {
-			ctx.abort();
+			await ctx.abort();
 			return await submit("prompt", undefined, options => api.sendUserMessage(text, options));
 		},
 		answerAsk: unavailable("ask.answer"),

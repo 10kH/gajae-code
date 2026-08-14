@@ -730,6 +730,87 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(session.model).toBe(selectionModel);
 	});
 
+	it("does not deadlock default selection waiting for an ownerless emergency continuation", async () => {
+		const releaseStartupBarrier = Promise.withResolvers<void>();
+		session.extendStartupTurnBarrier(releaseStartupBarrier.promise);
+		const compactionEnded = Promise.withResolvers<void>();
+		const runtimeSignals = getRuntimeSignals();
+		const pushRuntimeSignal = runtimeSignals.push.bind(runtimeSignals);
+		vi.spyOn(runtimeSignals, "push").mockImplementation((...signals) => {
+			const length = pushRuntimeSignal(...signals);
+			if (signals.includes("compaction:end:ok")) compactionEnded.resolve();
+			return length;
+		});
+		const order: string[] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("continuation");
+		});
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, id: "ownerless-selection-model" };
+		const selectionValidated = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			const apiKey = await originalGetApiKey(model, ...args);
+			if (model === selectionModel) selectionValidated.resolve();
+			return apiKey;
+		});
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		await compactionEnded.promise;
+
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutation: () => order.push("selection"),
+		});
+		await selectionValidated.promise;
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		releaseStartupBarrier.resolve();
+		await selection;
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["continuation", "selection"]);
+		expect(session.model).toBe(selectionModel);
+	});
+
+	it("keeps an ownerless emergency continuation scheduled later behind selection", async () => {
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, id: "selection-before-ownerless-model" };
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+			}
+			return originalGetApiKey(model, ...args);
+		});
+		const order: string[] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("continuation");
+		});
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutation: () => order.push("selection"),
+		});
+		await selectionValidationStarted.promise;
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		releaseSelectionValidation.resolve();
+
+		await selection;
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["selection", "continuation"]);
+		expect(session.model).toBe(selectionModel);
+	});
+
 	it("reschedules an AgentBusyError racing the queued-followup continue until delivery", async () => {
 		session.agent.followUp({
 			role: "custom",

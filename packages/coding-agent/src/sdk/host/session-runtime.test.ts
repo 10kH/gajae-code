@@ -434,6 +434,7 @@ describe("SessionSdkSessionRuntime", () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-unwind-promoted-"));
 		let idle = true;
 		let promoted: (() => void) | undefined;
+		const queuedDispositions: boolean[] = [];
 		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
 		const api = {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
@@ -446,10 +447,12 @@ describe("SessionSdkSessionRuntime", () => {
 							onPreflightAccepted?: () => void;
 							onPreflightAcceptCommit?: () => void;
 							onQueuedPromoted?: () => void;
+							queuedAtDispatch?: boolean;
 					  }
 					| undefined,
 			) =>
 				Promise.resolve(options?.onPreflightAcceptCommit?.()).then(() => {
+					queuedDispositions.push(options?.queuedAtDispatch === true);
 					promoted = options?.onQueuedPromoted;
 					options?.onPreflightAccepted?.();
 					return {};
@@ -509,6 +512,7 @@ describe("SessionSdkSessionRuntime", () => {
 			idle = false;
 			prompt("conn-b", "unwind-b");
 			await waitResponse("unwind-b");
+			expect(queuedDispositions).toEqual([false, true]);
 			expect(promoted).toBeDefined();
 			// The unwind continuation promotes the queued steer to its own run: the
 			// correlation hook fires before agent_start...
