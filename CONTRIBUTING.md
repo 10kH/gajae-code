@@ -62,3 +62,26 @@ The `CI` workflow publishes a scheduled nightly prerelease from `main` at 04:23 
 - The PR description explains what changed and why.
 - Relevant focused tests or checks are listed in the PR description.
 - User-facing changes include a changelog entry when appropriate.
+
+## Exact-head PR verdict gate
+
+Every pull request to `dev` must keep exactly one `gajae.pr-review-verdict.v1` line from the pull request template. The `PR contract / Validate exact-head PR contract` status is produced by a narrowly scoped `pull_request_target` workflow loaded from the trusted default branch. It has read-only permissions, receives no secrets, consumes no caches or artifacts, and executes only the base-owned validator while inspecting the event's immutable base and exact head. The validator recomputes the binary diff digest, requires the head to contain the base, runs the fast GJC state-writer scan against the PR-head bytes, and rejects self-approved `merge-approved` verdicts. `needs-human` and `merge-blocked` are valid review states but intentionally keep the status red until an independent reviewer records `merge-approved` for the current head.
+
+The first PR that introduces this workflow uses a trusted two-phase bootstrap. Phase 1 landed `Dev CI / PR contract bootstrap` directly on `dev`, so its inline validation exists in the immutable event base before the implementation PR is evaluated. Phase 2 enables the isolated `PR contract` consumer in this implementation PR. Review events run only that cheap, read-only contract workflow; they never launch or cancel the affected Dev CI pipeline. The validator still executes exclusively from the immutable event-base checkout and treats PR-head bytes as data.
+
+After the final commit and rebase, compute the digest with:
+
+```sh
+git fetch origin dev
+git merge-base --is-ancestor origin/dev HEAD
+git diff --binary --full-index --no-ext-diff origin/dev...HEAD | sha256sum
+bun scripts/verify-gjc-state-writers.ts --fail
+```
+
+The verdict line must use the resulting lowercase digest and name the independent GitHub reviewer whose effective `APPROVED` review targets the exact PR head:
+
+```text
+gajae.pr-review-verdict.v1 merge-approved sha256:<64-hex-digest> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<review-or-CI-reference>
+```
+
+GJC users can opt into fast feedback before `gh pr create` by copying `docs/examples/gjc-hooks/pre/bash.ts` to this checkout's `.gjc/hooks/pre/bash.ts`. Keep the hook project-local: installing it under `~/.gjc/agent` would incorrectly impose this repository's policy on unrelated repositories. The local hook is advisory and bypassable; the server-side status check is authoritative and covers humans and other runtimes.

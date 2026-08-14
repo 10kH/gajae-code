@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [dev]
     types: [opened, edited, synchronize, reopened, ready_for_review]
-  pull_request_review:
-    branches: [dev]
-    types: [submitted, edited, dismissed]
   workflow_dispatch:
     inputs:
       base_ref:
@@ -45,7 +42,7 @@ concurrency:
 jobs:
   pr-contract-bootstrap:
     name: PR contract bootstrap
-    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'pull_request_review' && github.event.review.state != 'commented') }}
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     permissions:
@@ -98,6 +95,10 @@ jobs:
             for (let page = 1; ; page++) { const response = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/pulls/${Bun.env.PR_NUMBER}/reviews?per_page=100&page=${page}`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } }); if (!response.ok) throw new Error(`Reviews API failed: ${response.status}`); const batch = await response.json(); reviews.push(...batch); if (batch.length < 100) break; }
             const latest = reviews.filter(review => review.user?.login?.toLowerCase() === reviewerId.toLowerCase() && review.state !== "COMMENTED" && review.commit_id === head).at(-1);
             if (latest?.state !== "APPROVED" || latest.commit_id !== head) throw new Error(`Reviewer ${reviewerId} lacks an effective exact-head approval.`);
+            const permissionResponse = await fetch(`https://api.github.com/repos/${Bun.env.GITHUB_REPOSITORY}/collaborators/${encodeURIComponent(reviewerId)}/permission`, { headers: { Accept: "application/vnd.github+json", Authorization: `Bearer ${Bun.env.GITHUB_TOKEN}`, "X-GitHub-Api-Version": "2022-11-28" } });
+            if (!permissionResponse.ok) throw new Error(`Reviewer permission lookup failed: ${permissionResponse.status}`);
+            const permission = (await permissionResponse.json()).permission;
+            if (!["admin", "maintain", "write"].includes(permission)) throw new Error(`Reviewer ${reviewerId} lacks repository review authority.`);
             console.log(`Bootstrap PR contract valid: ${digest}`);
           '
       - name: Run bootstrap G1 writer gate

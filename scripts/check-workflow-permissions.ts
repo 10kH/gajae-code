@@ -27,8 +27,13 @@ export const JOB_WRITE_ALLOWLIST: readonly { workflow: string; job: string; scop
 export const REQUIRED_READ_DEFAULT: readonly string[] = [
 	".github/workflows/ci.yml",
 	".github/workflows/dev-ci.yml",
+	".github/workflows/pr-validation.yml",
 	".github/workflows/public-site-sync.yml",
 ];
+
+const READ_SCOPE_ALLOWLIST: Readonly<Record<string, readonly string[]>> = {
+	".github/workflows/pr-validation.yml": ["contents", "pull-requests"],
+};
 
 const EXPECTED_WORKFLOW_DEFAULT = "an explicit least-privilege permissions block";
 const EXPECTED_SCOPE_VALUE = '"read", "write", or "none"';
@@ -111,7 +116,8 @@ function evaluateScopeMapping(
 		const permissionPath = `${pathPrefix}.${scope}`;
 		// On a required workflow default, every non-`contents` scope is forbidden
 		// outright; the exact-mapping pass below owns that path's single diagnostic.
-		if (requiredReadDefault && job === undefined && scope !== "contents") continue;
+		const allowedReadScopes = READ_SCOPE_ALLOWLIST[workflow] ?? ["contents"];
+		if (requiredReadDefault && job === undefined && !allowedReadScopes.includes(scope)) continue;
 		if (value === "write") {
 			if (job === undefined || !isAllowlisted(workflow, job, scope)) {
 				// Required workflows must be exactly `contents: read`, so "none" is not a
@@ -167,12 +173,17 @@ function evaluateWorkflowDefault(
 		}
 	}
 
-	// Required workflows must carry exactly `contents: read` -- extra read/none
-	// scopes are still a privilege expansion over the least-privilege default.
+	// Required workflows carry an explicit allowlisted read-scope mapping.
 	if (requiredReadDefault && isRecord(permissions)) {
+		const allowedReadScopes = READ_SCOPE_ALLOWLIST[workflow] ?? ["contents"];
 		for (const scope of Object.keys(permissions)) {
-			if (scope === "contents") continue;
-			workflowViolation(violations, workflow, `permissions.${scope}`, displayValue(permissions[scope]), "<absent>; required workflows declare exactly contents: read");
+			if (allowedReadScopes.includes(scope)) continue;
+			workflowViolation(violations, workflow, `permissions.${scope}`, displayValue(permissions[scope]), `<absent>; allowed read scopes are ${allowedReadScopes.join(", ")}`);
+		}
+		for (const scope of allowedReadScopes) {
+			if (permissions[scope] !== "read" && !hasViolationAt(violations, workflow, `permissions.${scope}`)) {
+				workflowViolation(violations, workflow, `permissions.${scope}`, hasOwn(permissions, scope) ? displayValue(permissions[scope]) : "<absent>", displayValue("read"));
+			}
 		}
 	}
 }

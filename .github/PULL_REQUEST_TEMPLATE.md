@@ -12,10 +12,10 @@
 
 ## GJC verdict
 
-<!-- Paste one exact-head verdict. Self-approval is BLOCK. If there was no independent architect/critic/human review, write needs-human and stop. -->
+<!-- Paste one exact-head verdict. reviewer-id is the independent reviewer's GitHub login. Self-approval is BLOCK. If there is no authenticated approving GitHub review for this exact head, write needs-human and stop. -->
 
 ```text
-gajae.pr-review-verdict.v1 <merge-approved|merge-blocked|needs-human> sha256:<exact-head-or-diff-hash> reviewer:<architect|critic|human> evidence:<ci-run-url-or-local-command>
+gajae.pr-review-verdict.v1 <merge-approved|merge-blocked|needs-human> sha256:<exact-base...head-diff-hash> reviewer:<architect|critic|human> reviewer-id:<identity> evidence:<ci-run-url-or-local-command>
 ```
 
 ---

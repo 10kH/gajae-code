@@ -9,6 +9,7 @@ import {
 
 const CI_WORKFLOW = ".github/workflows/ci.yml";
 const DEV_CI_WORKFLOW = ".github/workflows/dev-ci.yml";
+const PR_VALIDATION_WORKFLOW = ".github/workflows/pr-validation.yml";
 const repoRoot = `${import.meta.dir}/..`;
 
 async function parsedWorkflow(file: string): Promise<Record<string, unknown>> {
@@ -37,6 +38,7 @@ describe("workflow permission policy", () => {
 		expect(workflows.map(workflow => workflow.file)).toEqual([
 			".github/workflows/ci.yml",
 			".github/workflows/dev-ci.yml",
+			".github/workflows/pr-validation.yml",
 			".github/workflows/public-site-sync.yml",
 		]);
 	});
@@ -61,6 +63,17 @@ describe("workflow permission policy", () => {
 
 		expect(REQUIRED_READ_DEFAULT).toContain(DEV_CI_WORKFLOW);
 		expect(document.permissions).toEqual({ contents: "read" });
+		expect(jobWriteScopes(document)).toEqual([]);
+	});
+
+	test("pr-validation.yml has an exact read-scoped workflow default and no write job scope", async () => {
+		const workflows = await readWorkflowDocuments();
+		const prValidation = workflows.find(workflow => workflow.file === PR_VALIDATION_WORKFLOW);
+		expect(prValidation).toBeDefined();
+		const document = documentRecord(prValidation!.document);
+
+		expect(REQUIRED_READ_DEFAULT).toContain(PR_VALIDATION_WORKFLOW);
+		expect(document.permissions).toEqual({ contents: "read", "pull-requests": "read" });
 		expect(jobWriteScopes(document)).toEqual([]);
 	});
 
