@@ -205,6 +205,7 @@ interface ProfileProcessScanOptions {
 	platform?: NodeJS.Platform;
 	linuxPids?: readonly number[];
 	linuxExecutablePaths?: ReadonlyMap<number, string>;
+	signal?: AbortSignal;
 }
 
 async function liveLinuxPids(): Promise<number[]> {
@@ -238,17 +239,23 @@ async function findRunningChromeProfileWithOptions(
 	const candidates = bindings.Process.fromPath(exe).filter(p => p.status() === bindings.ProcessStatus.Running);
 	const seenPids = new Set(candidates.map(candidate => candidate.pid));
 	if ((options.platform ?? process.platform) === "linux" && candidates.length === 0) {
-		for (const pid of options.linuxPids ?? (await liveLinuxPids())) {
+		throwIfAborted(signal);
+		const linuxPids = options.linuxPids ?? (await liveLinuxPids());
+		throwIfAborted(signal);
+		for (const pid of linuxPids) {
+			throwIfAborted(signal);
 			if (seenPids.has(pid)) continue;
 			const candidate = bindings.Process.fromPid(pid);
 			if (!candidate || candidate.status() !== bindings.ProcessStatus.Running) continue;
 			const executablePath = await linuxExecutablePath(pid, options);
+			throwIfAborted(signal);
 			if (!executablePath || !isChromeProfileExecutable(executablePath)) continue;
 			seenPids.add(pid);
 			candidates.push(candidate);
 		}
 	}
 	for (const proc of candidates) {
+		throwIfAborted(signal);
 		let args: string[];
 		try {
 			args = proc.args();
@@ -276,7 +283,7 @@ export function findRunningChromeProfileForTest(
 	profile: { userDataDir: string; profileDirectory: string },
 	options: ProfileProcessScanOptions,
 ): Promise<RunningChromeProfile | null> {
-	return findRunningChromeProfileWithOptions(exe, profile, undefined, options);
+	return findRunningChromeProfileWithOptions(exe, profile, options.signal, options);
 }
 
 /**

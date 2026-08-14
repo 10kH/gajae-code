@@ -467,6 +467,22 @@ describe("Chrome profile browser mode (#809)", () => {
 		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
+	it("stops the Linux fallback before inspecting processes when aborted", async () => {
+		vi.spyOn(Process, "fromPath").mockReturnValue([]);
+		const fromPidSpy = vi.spyOn(Process, "fromPid");
+		const controller = new AbortController();
+		controller.abort();
+
+		await expect(
+			findRunningChromeProfileForTest(
+				"/snap/bin/chromium",
+				{ userDataDir: "/tmp/gjc-chrome", profileDirectory: "Default" },
+				{ platform: "linux", linuxPids: [321], signal: controller.signal },
+			),
+		).rejects.toThrow(/aborted/i);
+		expect(fromPidSpy).not.toHaveBeenCalled();
+	});
+
 	it("reuses matching profile CDP when remote debugging address is localhost", async () => {
 		mockRunningChromeProcess([
 			"--user-data-dir=/Users/me/Library/Application Support/Google/Chrome",
