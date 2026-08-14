@@ -113,7 +113,7 @@ test("workflow is trusted-default-branch-controlled, read-only, exact-head, and 
 	expect(workflow).toContain("pull_request_target:");
 	expect(workflow).toContain("pull_request_review:");
 	expect(workflow).toContain("types: [submitted, edited, dismissed]");
-	expect(workflow).toContain("if: ${{ false }}");
+	expect(workflow).not.toContain("if: ${{ false }}");
 	expect(workflow).not.toMatch(/^\s+pull_request:\s*$/mu);
 	expect(workflow).toContain("permissions:\n  contents: read\n  pull-requests: read");
 	expect(workflow).toContain("name: PR contract");
@@ -186,13 +186,23 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	const workflow = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
 	expect(workflow).toContain("pr-contract-bootstrap:");
 	expect(workflow).toContain("name: PR contract bootstrap");
-	expect(workflow).toContain("pull_request_review:");
+	expect(workflow).not.toContain("pull_request_review:");
+	expect(workflow).toContain("if: ${{ github.event_name == 'pull_request' }}");
 	expect(workflow).toContain("bun --no-env-file --config=\"$empty_bunfig\" -e '");
 	expect(workflow).toContain("repository: ${{ github.event.pull_request.head.repo.full_name }}");
 	expect(workflow).toContain("bun scripts/verify-gjc-state-writers.ts --fail --root .");
 	expect(workflow).toContain("Expected exactly one verdict line");
 	expect(workflow).toContain("effective exact-head approval");
-	expect(workflow).toContain("github.event.review.state != 'commented'");
 	expect(workflow).toContain('review.state !== "COMMENTED" && review.commit_id === head');
 	expect(workflow).not.toContain("pr-head/scripts/verify-pr-verdict.ts");
+});
+
+test("review events cannot launch or cancel the affected Dev CI pipeline", async () => {
+	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
+	const prContract = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
+	expect(devCi).not.toContain("pull_request_review:");
+	expect(prContract).toContain("pull_request_review:");
+	expect(prContract).toContain("types: [submitted, edited, dismissed]");
+	expect(prContract).not.toContain("affected-plan");
+	expect(prContract).not.toContain("evidence producer");
 });
