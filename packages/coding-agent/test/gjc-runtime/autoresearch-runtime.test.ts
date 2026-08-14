@@ -12,6 +12,7 @@ import {
 	autoresearchLogRun,
 	autoresearchRead,
 	autoresearchRecordCritic,
+	autoresearchRunsStore,
 	autoresearchWrite,
 	getAutoresearchPaths,
 	runNativeAutoresearchCommand,
@@ -313,6 +314,86 @@ describe("autoresearch ledger", () => {
 		expect(second.retiredTo).not.toBe(first.retiredTo);
 		expect(await Bun.file(path.join(first.retiredTo!, "mission.json")).exists()).toBe(true);
 		expect(await Bun.file(path.join(second.retiredTo!, "mission.json")).exists()).toBe(true);
+	});
+
+	it("persists a declared primary metric contract and feeds it to the experiment config", async () => {
+		const root = await tempDir();
+		await autoresearchWrite({
+			...baseMission(root),
+			primaryMetric: "tokens_per_second",
+			metricUnit: "tok/s",
+			metricDirection: "higher",
+		});
+
+		const readBack = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(readBack.mission?.primaryMetric).toBe("tokens_per_second");
+		expect(readBack.mission?.metricUnit).toBe("tok/s");
+		expect(readBack.mission?.metricDirection).toBe("higher");
+
+		// The whole point: the declared contract must reach the experiment config
+		// instead of silently defaulting to `metric` / lower-is-better.
+		const store = await autoresearchRunsStore(root, TEST_SESSION_ID);
+		expect(store.config?.primaryMetric).toBe("tokens_per_second");
+		expect(store.config?.direction).toBe("higher");
+		expect(store.config?.metricUnit).toBe("tok/s");
+	});
+
+	it("keeps the historical default when no metric is declared", async () => {
+		const root = await tempDir();
+		await autoresearchWrite(baseMission(root));
+
+		const readBack = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(readBack.mission?.primaryMetric).toBeUndefined();
+		expect(readBack.mission?.metricDirection).toBeUndefined();
+
+		const store = await autoresearchRunsStore(root, TEST_SESSION_ID);
+		expect(store.config?.primaryMetric).toBe("metric");
+		expect(store.config?.direction).toBe("lower");
+	});
+
+	it("rejects an invalid metric direction at the write boundary rather than coercing it", async () => {
+		const root = await tempDir();
+		await expect(autoresearchWrite({ ...baseMission(root), metricDirection: "ascending" })).rejects.toThrow(
+			/metric direction must be "higher" or "lower"/,
+		);
+		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
+	});
+
+	it("parses the metric contract from a handoff spec", async () => {
+		const root = await tempDir();
+		const specPath = path.join(root, "spec.md");
+		await fs.writeFile(
+			specPath,
+			[
+				"# Measure decode throughput",
+				"",
+				"autoresearch-mode: data",
+				"autoresearch-metric: decode_tokens_per_second",
+				"autoresearch-metric-unit: tok/s",
+				"autoresearch-metric-direction: higher",
+			].join("\n"),
+			"utf-8",
+		);
+
+		const receipt = await autoresearchHandoff({ cwd: root, specPath });
+
+		expect(receipt.mission.primaryMetric).toBe("decode_tokens_per_second");
+		expect(receipt.mission.metricUnit).toBe("tok/s");
+		expect(receipt.mission.metricDirection).toBe("higher");
+	});
+
+	it("rejects an invalid metric direction declared in a handoff spec", async () => {
+		const root = await tempDir();
+		const specPath = path.join(root, "spec.md");
+		await fs.writeFile(
+			specPath,
+			["# Goal", "", "autoresearch-mode: web", "autoresearch-metric-direction: sideways"].join("\n"),
+			"utf-8",
+		);
+
+		await expect(autoresearchHandoff({ cwd: root, specPath })).rejects.toThrow(
+			/metric direction must be "higher" or "lower"/,
+		);
 	});
 });
 

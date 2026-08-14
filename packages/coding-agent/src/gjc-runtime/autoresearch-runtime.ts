@@ -40,6 +40,7 @@ import {
 	AutoresearchRunsStore,
 	buildAutoresearchExperimentState,
 	createAutoresearchExperimentConfig,
+	type MetricDirection,
 } from "../autoresearch/runs";
 import { createMissionPythonTool, missionArtifactsDir, openMissionNotebook } from "../autoresearch/session";
 import { disposeKernelSessionsByOwner } from "../eval/py/executor";
@@ -88,6 +89,17 @@ export interface AutoresearchMission {
 	/** Absolute path of the deep-interview spec consumed by handoff intake. */
 	specPath?: string;
 	handedOffAt?: string;
+	/**
+	 * Primary metric contract for the mission's harness.
+	 *
+	 * Optional: a mission that declares none keeps the historical default
+	 * (`metric`, lower-is-better). When declared it MUST reach the experiment
+	 * config -- otherwise a mission whose research contract is
+	 * higher-is-better silently optimizes the wrong direction.
+	 */
+	primaryMetric?: string;
+	metricUnit?: string;
+	metricDirection?: MetricDirection;
 }
 
 export interface AutoresearchPaths {
@@ -260,6 +272,17 @@ function normalizeAutoresearchMission(value: unknown): AutoresearchMission {
 		...(typeof record.handedOffAt === "string" && record.handedOffAt.trim() !== ""
 			? { handedOffAt: record.handedOffAt }
 			: {}),
+		// Preserve the declared metric contract across read/write round-trips;
+		// dropping it here would silently reinstate the default direction.
+		...(typeof record.primaryMetric === "string" && record.primaryMetric.trim() !== ""
+			? { primaryMetric: record.primaryMetric.trim() }
+			: {}),
+		...(typeof record.metricUnit === "string" && record.metricUnit.trim() !== ""
+			? { metricUnit: record.metricUnit.trim() }
+			: {}),
+		...(record.metricDirection === "higher" || record.metricDirection === "lower"
+			? { metricDirection: record.metricDirection }
+			: {}),
 	};
 }
 
@@ -378,6 +401,35 @@ export async function autoresearchRead(cwd: string, sessionId?: string | null): 
 	};
 }
 
+/**
+ * Validate and normalize the optional primary-metric contract.
+ *
+ * Direction is validated at the write boundary exactly like mode: an
+ * unrecognized value is rejected rather than coerced, so a typo can never
+ * silently flip the mission to the default direction.
+ */
+function normalizeMetricContract(
+	input: { primaryMetric?: string; metricUnit?: string; metricDirection?: string },
+	context: string,
+): Pick<AutoresearchMission, "primaryMetric" | "metricUnit" | "metricDirection"> {
+	const result: Pick<AutoresearchMission, "primaryMetric" | "metricUnit" | "metricDirection"> = {};
+	const primaryMetric = input.primaryMetric?.trim();
+	if (primaryMetric) result.primaryMetric = primaryMetric;
+	const metricUnit = input.metricUnit?.trim();
+	if (metricUnit) result.metricUnit = metricUnit;
+	const direction = input.metricDirection?.trim().toLowerCase();
+	if (direction !== undefined && direction !== "") {
+		if (direction !== "higher" && direction !== "lower") {
+			throw new AutoresearchCommandError(
+				2,
+				`${context} metric direction must be "higher" or "lower"; received ${JSON.stringify(input.metricDirection)}. It is never inferred.`,
+			);
+		}
+		result.metricDirection = direction;
+	}
+	return result;
+}
+
 /** write verb: persist the mission after cold-intake clarification. Mode is required. */
 export async function autoresearchWrite(input: {
 	cwd: string;
@@ -387,6 +439,9 @@ export async function autoresearchWrite(input: {
 	constraints?: string[];
 	slug: string;
 	sessionId?: string | null;
+	primaryMetric?: string;
+	metricUnit?: string;
+	metricDirection?: string;
 }): Promise<AutoresearchWriteReceipt> {
 	const objective = input.objective.trim();
 	if (!objective) throw new AutoresearchCommandError(2, "autoresearch mission objective is required");
@@ -395,6 +450,7 @@ export async function autoresearchWrite(input: {
 	assertSafePathComponent(slug, "slug");
 	// AC-16: hard fail at the write boundary; mode is never inferred.
 	assertAutoresearchMode(input.mode, "write intake");
+	const metric = normalizeMetricContract(input, "write intake");
 	const resolvedSessionId =
 		input.sessionId?.trim() ||
 		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
@@ -410,6 +466,7 @@ export async function autoresearchWrite(input: {
 		intake: "cold",
 		createdAt: existing?.createdAt ?? now,
 		updatedAt: now,
+		...metric,
 	};
 	await persistAutoresearchMission({ cwd: input.cwd, sessionId: resolvedSessionId, mission });
 	let ledgerEvent: AutoresearchLedgerEvent | undefined;
@@ -516,6 +573,9 @@ async function moveIfPresent(from: string, to: string): Promise<void> {
 /* --------------------------- handoff intake --------------------------- */
 
 const AUTORESEARCH_MODE_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-mode\s*:\s*(web|mixed|data)\s*$/i;
+const AUTORESEARCH_METRIC_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-metric\s*:\s*(.+?)\s*$/i;
+const AUTORESEARCH_METRIC_UNIT_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-metric-unit\s*:\s*(.+?)\s*$/i;
+const AUTORESEARCH_METRIC_DIRECTION_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-metric-direction\s*:\s*(.+?)\s*$/i;
 const HEADING_RE = /^#{1,6}\s+(.+)$/;
 const BULLET_RE = /^[-*]\s+(.+)$/;
 const ACCEPTANCE_CRITERIA_DELIVERABLE_RE = /^[-*]\s+\[[ xX]\]\s+(.+)$/;
@@ -527,6 +587,9 @@ interface ParsedAutoresearchSpec {
 	deliverables: string[];
 	constraints: string[];
 	slug: string;
+	primaryMetric?: string;
+	metricUnit?: string;
+	metricDirection?: MetricDirection;
 }
 
 function sectionBullets(lines: string[], sectionNames: readonly string[]): string[] {
@@ -587,6 +650,23 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 				"Mode is never inferred from the presence of a data file.",
 		);
 	}
+	// Optional metric contract. Same declaration style as the mode line; the
+	// direction is validated rather than coerced.
+	const firstMatch = (re: RegExp): string | undefined => {
+		for (const line of lines) {
+			const found = re.exec(line.trim());
+			if (found) return found[1];
+		}
+		return undefined;
+	};
+	const metric = normalizeMetricContract(
+		{
+			primaryMetric: firstMatch(AUTORESEARCH_METRIC_DECLARATION_RE),
+			metricUnit: firstMatch(AUTORESEARCH_METRIC_UNIT_DECLARATION_RE),
+			metricDirection: firstMatch(AUTORESEARCH_METRIC_DIRECTION_DECLARATION_RE),
+		},
+		`autoresearch handoff intake at ${specPath}`,
+	);
 
 	const h1 = lines.find(line => /^#\s+\S/.test(line.trim()));
 	const objective =
@@ -607,6 +687,7 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 		deliverables: finalDeliverables,
 		constraints,
 		slug,
+		...metric,
 	};
 }
 
@@ -644,6 +725,9 @@ export async function autoresearchHandoff(input: {
 		updatedAt: now,
 		specPath: resolvedSpecPath,
 		handedOffAt: now,
+		...(parsed.primaryMetric === undefined ? {} : { primaryMetric: parsed.primaryMetric }),
+		...(parsed.metricUnit === undefined ? {} : { metricUnit: parsed.metricUnit }),
+		...(parsed.metricDirection === undefined ? {} : { metricDirection: parsed.metricDirection }),
 	};
 	await persistAutoresearchMission({ cwd: input.cwd, sessionId: resolvedSessionId, mission });
 	let ledgerEvent: AutoresearchLedgerEvent | undefined;
@@ -1179,7 +1263,11 @@ export async function autoresearchRunsStore(cwd: string, sessionId?: string | nu
 				createAutoresearchExperimentConfig({
 					name: mission.slug,
 					goal: mission.objective,
-					primaryMetric: "metric",
+					// A declared metric contract must win over the default, or a
+					// higher-is-better mission optimizes backwards.
+					primaryMetric: mission.primaryMetric ?? "metric",
+					...(mission.metricUnit === undefined ? {} : { metricUnit: mission.metricUnit }),
+					...(mission.metricDirection === undefined ? {} : { direction: mission.metricDirection }),
 					branch: null,
 				}),
 			);
