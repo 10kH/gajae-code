@@ -33,6 +33,22 @@ describe("profile-discovery", () => {
 			"/home/x/.config/google-chrome-unstable",
 			"/home/x/.config/chromium",
 		]);
+		expect(
+			chromeUserDataRoots({
+				platform: "linux",
+				home: "/home/x",
+				exists: () => false,
+				chromeUserDataDir: "/srv/chrome-default",
+				chromeConfigHome: "/srv/chrome-config",
+				xdgConfigHome: "/srv/xdg-ignored",
+			}),
+		).toEqual([
+			"/srv/chrome-default",
+			"/srv/chrome-config/google-chrome",
+			"/srv/chrome-config/google-chrome-beta",
+			"/srv/chrome-config/google-chrome-unstable",
+			"/srv/chrome-config/chromium",
+		]);
 		expect(chromeUserDataRoots(env({ platform: "darwin", home: "/Users/x", existing: [] }))).toEqual([
 			"/Users/x/Library/Application Support/Google/Chrome",
 			"/Users/x/Library/Application Support/Google/Chrome Beta",

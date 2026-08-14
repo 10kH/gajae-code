@@ -18,6 +18,12 @@ export interface DiscoveryEnv {
 	exists: (p: string) => boolean;
 	/** Windows LOCALAPPDATA override (tests / non-default installs). */
 	localAppData?: string;
+	/** Linux Chrome-specific default user-data override. */
+	chromeUserDataDir?: string;
+	/** Linux Chrome config-home override (takes precedence over XDG_CONFIG_HOME). */
+	chromeConfigHome?: string;
+	/** Linux XDG config-home override. */
+	xdgConfigHome?: string;
 }
 
 /** Candidate Chrome user-data roots for the platform (most common first). */
@@ -42,13 +48,16 @@ export function chromeUserDataRoots(env: DiscoveryEnv): string[] {
 				platformPath.join(localAppData, "Chromium", "User Data"),
 			];
 		}
-		default:
+		default: {
+			const configHome = env.chromeConfigHome ?? env.xdgConfigHome ?? platformPath.join(env.home, ".config");
 			return [
-				platformPath.join(env.home, ".config", "google-chrome"),
-				platformPath.join(env.home, ".config", "google-chrome-beta"),
-				platformPath.join(env.home, ".config", "google-chrome-unstable"),
-				platformPath.join(env.home, ".config", "chromium"),
+				...(env.chromeUserDataDir ? [env.chromeUserDataDir] : []),
+				platformPath.join(configHome, "google-chrome"),
+				platformPath.join(configHome, "google-chrome-beta"),
+				platformPath.join(configHome, "google-chrome-unstable"),
+				platformPath.join(configHome, "chromium"),
 			];
+		}
 	}
 }
 
@@ -77,5 +86,13 @@ export function discoverDefaultChromeProfile(
 
 /** Convenience wrapper using the live OS environment + fs. */
 export function defaultDiscoveryEnv(exists: (p: string) => boolean): DiscoveryEnv {
-	return { platform: process.platform, home: os.homedir(), exists };
+	return {
+		platform: process.platform,
+		home: os.homedir(),
+		exists,
+		...(process.env.LOCALAPPDATA ? { localAppData: process.env.LOCALAPPDATA } : {}),
+		...(process.env.CHROME_USER_DATA_DIR ? { chromeUserDataDir: process.env.CHROME_USER_DATA_DIR } : {}),
+		...(process.env.CHROME_CONFIG_HOME ? { chromeConfigHome: process.env.CHROME_CONFIG_HOME } : {}),
+		...(process.env.XDG_CONFIG_HOME ? { xdgConfigHome: process.env.XDG_CONFIG_HOME } : {}),
+	};
 }
