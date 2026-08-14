@@ -29,7 +29,30 @@ describe("profile-discovery", () => {
 	it("lists platform-appropriate roots", () => {
 		expect(chromeUserDataRoots(env({ platform: "linux", home: "/home/x", existing: [] }))).toEqual([
 			"/home/x/.config/google-chrome",
+			"/home/x/.config/google-chrome-beta",
+			"/home/x/.config/google-chrome-unstable",
 			"/home/x/.config/chromium",
+		]);
+		expect(chromeUserDataRoots(env({ platform: "darwin", home: "/Users/x", existing: [] }))).toEqual([
+			"/Users/x/Library/Application Support/Google/Chrome",
+			"/Users/x/Library/Application Support/Google/Chrome Beta",
+			"/Users/x/Library/Application Support/Google/Chrome Dev",
+			"/Users/x/Library/Application Support/Google/Chrome Canary",
+			"/Users/x/Library/Application Support/Chromium",
+		]);
+		expect(
+			chromeUserDataRoots({
+				platform: "win32",
+				home: "C:\\Users\\x",
+				localAppData: "C:\\Users\\x\\AppData\\Local",
+				exists: () => false,
+			}),
+		).toEqual([
+			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome\\User Data",
+			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome Beta\\User Data",
+			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome Dev\\User Data",
+			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome SxS\\User Data",
+			"C:\\Users\\x\\AppData\\Local\\Chromium\\User Data",
 		]);
 	});
 });

@@ -18,6 +18,7 @@ import {
 	isSafeCdpAddressForTest,
 } from "../../src/tools/browser/attach";
 import * as launch from "../../src/tools/browser/launch";
+import { chromeUserDataRoots } from "../../src/tools/browser/profile-discovery";
 import {
 	type AcquireBrowserOptions,
 	type BrowserHandle,
@@ -80,6 +81,10 @@ describe("Chrome profile browser mode (#809)", () => {
 	it("never treats Edge as the Chrome binary for saved-profile mode", () => {
 		expect(launch.isEdgeExecutable("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge")).toBe(true);
 		expect(launch.isEdgeExecutable("C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe")).toBe(true);
+		expect(launch.isEdgeExecutable("/usr/bin/microsoft-edge-stable")).toBe(true);
+		expect(launch.isEdgeExecutable("/usr/bin/microsoft-edge-beta")).toBe(true);
+		expect(launch.isEdgeExecutable("/usr/bin/microsoft-edge-dev")).toBe(true);
+		expect(launch.isEdgeExecutable("/var/lib/flatpak/exports/bin/com.microsoft.Edge")).toBe(true);
 		expect(launch.isEdgeExecutable("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")).toBe(false);
 		expect(launch.isEdgeExecutable("/usr/bin/chromium")).toBe(false);
 	});
@@ -195,6 +200,7 @@ describe("Chrome profile browser mode (#809)", () => {
 	});
 
 	it("requires an explicit user data directory with Chrome 136 remediation", () => {
+		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
 		expect(() =>
 			resolveBrowserKindForTest(
 				{ action: "open", app: { browser: "chrome", profile_directory: "Profile 10" } },
@@ -215,6 +221,7 @@ describe("Chrome profile browser mode (#809)", () => {
 	});
 
 	it("rejects an explicit default Chrome user data directory", () => {
+		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
 		expect(() =>
 			resolveBrowserKindForTest(
 				{
@@ -246,6 +253,43 @@ describe("Chrome profile browser mode (#809)", () => {
 		}
 	});
 
+	it("rejects every supported Chrome channel root while allowing custom roots", () => {
+		const matrix = [
+			{
+				platform: "darwin" as const,
+				home: "/Users/u",
+				expectedChannels: ["Chrome", "Chrome Beta", "Chrome Dev", "Chrome Canary", "Chromium"],
+			},
+			{
+				platform: "win32" as const,
+				home: "C:\\Users\\u",
+				localAppData: "C:\\Users\\u\\AppData\\Local",
+				expectedChannels: ["Chrome", "Chrome Beta", "Chrome Dev", "Chrome SxS", "Chromium"],
+			},
+			{
+				platform: "linux" as const,
+				home: "/home/u",
+				expectedChannels: ["google-chrome", "google-chrome-beta", "google-chrome-unstable", "chromium"],
+			},
+		];
+
+		for (const entry of matrix) {
+			const roots = chromeUserDataRoots({
+				platform: entry.platform,
+				home: entry.home,
+				exists: () => false,
+				...(entry.localAppData ? { localAppData: entry.localAppData } : {}),
+			});
+			expect(roots).toHaveLength(entry.expectedChannels.length);
+			for (const [index, root] of roots.entries()) {
+				expect(root).toContain(entry.expectedChannels[index]!);
+				expect(isDefaultChromeUserDataDirForTest(root, roots, entry.platform)).toBe(true);
+			}
+			const customRoot = entry.platform === "win32" ? "D:\\automation\\chrome" : "/tmp/automation-chrome";
+			expect(isDefaultChromeUserDataDirForTest(customRoot, roots, entry.platform)).toBe(false);
+		}
+	});
+
 	it("rejects an explicitly supplied Edge executable before launch", () => {
 		expect(() =>
 			resolveBrowserKindForTest(
@@ -260,6 +304,26 @@ describe("Chrome profile browser mode (#809)", () => {
 				makeSession("/work"),
 			),
 		).toThrow(/not Microsoft Edge/);
+	});
+
+	it("rejects an explicit Linux Edge path before checking omitted profile fields", () => {
+		expect(() =>
+			resolveBrowserKindForTest(
+				{ action: "open", app: { browser: "chrome", path: "/usr/bin/microsoft-edge-stable" } },
+				makeSession("/work"),
+			),
+		).toThrow(/not Microsoft Edge/);
+	});
+
+	it("allows Chrome and Chromium executables with custom data roots", () => {
+		for (const exe of ["/usr/bin/google-chrome-beta", "/usr/bin/chromium"]) {
+			expect(
+				resolveBrowserKindForTest(
+					{ action: "open", app: { browser: "chrome", path: exe, user_data_dir: "/tmp/gjc-chrome" } },
+					makeSession("/work"),
+				),
+			).toMatchObject({ path: exe, userDataDir: "/tmp/gjc-chrome", profileDirectory: "Default" });
+		}
 	});
 
 	it("refuses an already-running matching profile without attachable CDP", async () => {

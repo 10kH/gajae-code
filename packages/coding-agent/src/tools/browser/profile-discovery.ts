@@ -22,15 +22,33 @@ export interface DiscoveryEnv {
 
 /** Candidate Chrome user-data roots for the platform (most common first). */
 export function chromeUserDataRoots(env: DiscoveryEnv): string[] {
+	const platformPath = env.platform === "win32" ? path.win32 : path.posix;
 	switch (env.platform) {
 		case "darwin":
-			return [path.join(env.home, "Library", "Application Support", "Google", "Chrome")];
+			return [
+				platformPath.join(env.home, "Library", "Application Support", "Google", "Chrome"),
+				platformPath.join(env.home, "Library", "Application Support", "Google", "Chrome Beta"),
+				platformPath.join(env.home, "Library", "Application Support", "Google", "Chrome Dev"),
+				platformPath.join(env.home, "Library", "Application Support", "Google", "Chrome Canary"),
+				platformPath.join(env.home, "Library", "Application Support", "Chromium"),
+			];
 		case "win32": {
-			const localAppData = env.localAppData ?? path.join(env.home, "AppData", "Local");
-			return [path.join(localAppData, "Google", "Chrome", "User Data")];
+			const localAppData = env.localAppData ?? platformPath.join(env.home, "AppData", "Local");
+			return [
+				platformPath.join(localAppData, "Google", "Chrome", "User Data"),
+				platformPath.join(localAppData, "Google", "Chrome Beta", "User Data"),
+				platformPath.join(localAppData, "Google", "Chrome Dev", "User Data"),
+				platformPath.join(localAppData, "Google", "Chrome SxS", "User Data"),
+				platformPath.join(localAppData, "Chromium", "User Data"),
+			];
 		}
 		default:
-			return [path.join(env.home, ".config", "google-chrome"), path.join(env.home, ".config", "chromium")];
+			return [
+				platformPath.join(env.home, ".config", "google-chrome"),
+				platformPath.join(env.home, ".config", "google-chrome-beta"),
+				platformPath.join(env.home, ".config", "google-chrome-unstable"),
+				platformPath.join(env.home, ".config", "chromium"),
+			];
 	}
 }
 

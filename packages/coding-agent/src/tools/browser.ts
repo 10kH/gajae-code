@@ -138,17 +138,6 @@ export function resolveBrowserKindForTest(params: BrowserParams, session: ToolSe
  */
 function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, session: ToolSession): BrowserKind {
 	const profileDirectory = app.profile_directory ?? "Default";
-	if (!app.user_data_dir) {
-		throw new ToolError(
-			'app.user_data_dir is required for app.browser "chrome". Chrome 136+ disables remote debugging for the default Chrome data directory; pass a separate non-default user data directory, or attach to an already-authorized browser with app.cdp_url.',
-		);
-	}
-	const userDataDir = resolveToCwd(app.user_data_dir, session.cwd);
-	if (isDefaultChromeUserDataDir(userDataDir)) {
-		throw new ToolError(
-			`Refusing Chrome's default user data directory ${JSON.stringify(userDataDir)}. Chrome 136+ disables remote debugging there; pass a separate non-default app.user_data_dir, or use app.cdp_url for an already-authorized browser.`,
-		);
-	}
 	const exe = app.path ? resolveToCwd(app.path, session.cwd) : resolveSystemChromeForProfile();
 	if (!exe) {
 		throw new ToolError(
@@ -158,6 +147,17 @@ function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, sessio
 	if (isEdgeExecutable(canonicalPath(exe))) {
 		throw new ToolError(
 			'app.path for app.browser "chrome" must be Google Chrome or Chromium, not Microsoft Edge. Use Edge with app.path spawn mode and a separate profile, or pass a Chrome/Chromium executable.',
+		);
+	}
+	if (!app.user_data_dir) {
+		throw new ToolError(
+			'app.user_data_dir is required for app.browser "chrome". Chrome 136+ disables remote debugging for the default Chrome data directory; pass a separate non-default user data directory, or attach to an already-authorized browser with app.cdp_url.',
+		);
+	}
+	const userDataDir = resolveToCwd(app.user_data_dir, session.cwd);
+	if (isDefaultChromeUserDataDir(userDataDir)) {
+		throw new ToolError(
+			`Refusing Chrome's default user data directory ${JSON.stringify(userDataDir)}. Chrome 136+ disables remote debugging there; pass a separate non-default app.user_data_dir, or use app.cdp_url for an already-authorized browser.`,
 		);
 	}
 	return {

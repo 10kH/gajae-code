@@ -208,7 +208,15 @@ function systemChromiumCandidates(): string[] {
 			break;
 		}
 		case "linux": {
-			const names = ["google-chrome-stable", "google-chrome", "chromium", "chromium-browser", "chrome"];
+			const names = [
+				"google-chrome-stable",
+				"google-chrome",
+				"google-chrome-beta",
+				"google-chrome-unstable",
+				"chromium",
+				"chromium-browser",
+				"chrome",
+			];
 			for (const name of names) {
 				const found = $which(name);
 				if (found) candidates.push(found);
@@ -216,6 +224,8 @@ function systemChromiumCandidates(): string[] {
 			candidates.push(
 				"/usr/bin/google-chrome-stable",
 				"/usr/bin/google-chrome",
+				"/usr/bin/google-chrome-beta",
+				"/usr/bin/google-chrome-unstable",
 				"/usr/bin/chromium",
 				"/usr/bin/chromium-browser",
 				"/snap/bin/chromium",
@@ -239,6 +249,13 @@ function systemChromiumCandidates(): string[] {
 				path.join(programFiles, "Google\\Chrome\\Application\\chrome.exe"),
 				path.join(programFilesX86, "Google\\Chrome\\Application\\chrome.exe"),
 				path.join(localAppData, "Google\\Chrome\\Application\\chrome.exe"),
+				path.join(programFiles, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(programFilesX86, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome Beta\\Application\\chrome.exe"),
+				path.join(programFiles, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(programFilesX86, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome Dev\\Application\\chrome.exe"),
+				path.join(localAppData, "Google\\Chrome SxS\\Application\\chrome.exe"),
 				path.join(programFiles, "Chromium\\Application\\chrome.exe"),
 				path.join(localAppData, "Chromium\\Application\\chrome.exe"),
 				path.join(programFiles, "Microsoft\\Edge\\Application\\msedge.exe"),
@@ -269,7 +286,8 @@ function resolveSystemChromium(): string | undefined {
 }
 
 /** Edge is Chromium-based but keeps its own profile format under its own user data root. */
-const EDGE_EXECUTABLE_PATTERN = /(?:^|[/\\])(?:msedge(?:\.exe)?|Microsoft Edge(?: Beta| Dev| Canary)?)$/;
+const EDGE_EXECUTABLE_PATTERN =
+	/(?:^|[/\\])(?:msedge(?:\.exe)?|microsoft-edge(?:-(?:stable|beta|dev|canary))?|com\.microsoft\.Edge|Microsoft Edge(?: Beta| Dev| Canary)?)$/i;
 
 /** True for a Microsoft Edge executable path (excluded from Chrome profile mode). */
 export function isEdgeExecutable(candidate: string): boolean {
