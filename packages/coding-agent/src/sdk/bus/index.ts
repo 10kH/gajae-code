@@ -171,6 +171,21 @@ export {
 	runIdentityControlTerminalPath,
 } from "./control-drain-lease";
 
+export type NotificationInboundAdmission =
+	| { outcome: "accept" }
+	| { outcome: "drop"; reason: "inbound_fenced" | "policy_suspended" };
+
+/** Exact production admission decision for daemon-originated session inbound. */
+export function notificationInboundAdmission(input: {
+	inboundFenced: boolean;
+	policySuspended: boolean;
+	notificationOrigin: boolean;
+}): NotificationInboundAdmission {
+	if (input.inboundFenced) return { outcome: "drop", reason: "inbound_fenced" };
+	if (input.policySuspended && input.notificationOrigin) return { outcome: "drop", reason: "policy_suspended" };
+	return { outcome: "accept" };
+}
+
 const PROMPT_SETTLEMENT_DIAGNOSTIC_ENTRY_LIMIT = 8;
 const PROMPT_SETTLEMENT_DIAGNOSTIC_MAX_AGE_MS = 86_400_000;
 /**
@@ -6764,6 +6779,26 @@ export function createNotificationsExtension(
 				);
 			} catch {}
 		};
+		const sendInboundAck = (
+			connectionId: string,
+			inbound: { sessionId: string; updateId?: number },
+			state: "accepted" | "rejected" | "dropped",
+			reason?: "inbound_fenced" | "policy_suspended" | "invalid_input" | "injection_failed",
+		): void => {
+			if (typeof inbound.updateId !== "number") return;
+			try {
+				server.sendTo(
+					connectionId,
+					JSON.stringify({
+						type: "inbound_ack",
+						sessionId: inbound.sessionId,
+						updateId: inbound.updateId,
+						state,
+						...(reason ? { reason } : {}),
+					}),
+				);
+			} catch {}
+		};
 		try {
 			server.onSdkFrame((err, inbound) => {
 				if (err) {
@@ -7091,7 +7126,14 @@ export function createNotificationsExtension(
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
 			server.onInbound((err, inbound) => {
 				if (err || !inbound) return;
-				if (initializedRuntime.inboundFenced) {
+				const notificationOrigin = hostCapCache.get(inbound.connectionId)?.has(ASK_SELECTED_ACK_CAPABILITY);
+				const admission = notificationInboundAdmission({
+					inboundFenced: initializedRuntime.inboundFenced,
+					policySuspended: runtime?.policySuspended ?? false,
+					notificationOrigin: notificationOrigin ?? false,
+				});
+				if (admission.outcome === "drop" && admission.reason === "inbound_fenced") {
+					sendInboundAck(inbound.connectionId, inbound, "dropped", admission.reason);
 					// A fenced predecessor keeps its native server alive for the terminal
 					// response, so the daemon can still deliver here after it has already
 					// ACKed the user's Telegram message. Dropping without a diagnostic
@@ -7108,10 +7150,8 @@ export function createNotificationsExtension(
 					messageId?: number;
 					reason?: string;
 				};
-				const notificationOrigin = hostCapCache
-					.get(authenticatedInbound.connectionId)
-					?.has(ASK_SELECTED_ACK_CAPABILITY);
-				if (runtime?.policySuspended && notificationOrigin) {
+				if (admission.outcome === "drop") {
+					sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "dropped", admission.reason);
 					if (inbound.kind === "control_command") {
 						const frame = sdkInboundFrame(inbound.commandJson);
 						if (frame) {
@@ -7164,12 +7204,14 @@ export function createNotificationsExtension(
 				if (inbound.kind === "user_message") {
 					// Inject as a user turn (steers/continues the agent; the resulting
 					// turn streams back via the turn_end handler even when not idle).
-					// Record the update id so it can be acked as "consumed" on the next
-					// turn_start, and steer (vs start a fresh turn) when already busy.
+					// Session-side acceptance is explicit: the daemon must not leave its
+					// optimistic queued reaction in place when this live host rejects/drop.
 					const text = inbound.text ?? "";
 					const images = inbound.images ?? [];
-					if (!text && images.length === 0) return;
-					if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
+					if (!text && images.length === 0) {
+						sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "rejected", "invalid_input");
+						return;
+					}
 					const content: string | (TextContent | ImageContent)[] =
 						images.length > 0
 							? [
@@ -7186,7 +7228,15 @@ export function createNotificationsExtension(
 							: text;
 					try {
 						api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
+						if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
+						sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "accepted");
 					} catch (e) {
+						sendInboundAck(
+							authenticatedInbound.connectionId,
+							authenticatedInbound,
+							"rejected",
+							"injection_failed",
+						);
 						logger.warn(`notifications: sendUserMessage failed: ${String(e)}`);
 					}
 					return;
