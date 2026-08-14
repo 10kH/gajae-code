@@ -310,6 +310,16 @@ export function isChromeProfileExecutable(candidate: string): boolean {
 	return CHROME_PROFILE_EXECUTABLE_PATTERN.test(candidate);
 }
 
+/**
+ * Validate the executable identity used for profile mode. Most symlinks are
+ * judged by their resolved target so a renamed cross-brand browser cannot pass
+ * by alias. Snap's canonical `/snap/bin/chromium` launcher is the exception:
+ * it resolves to the generic `/usr/bin/snap` dispatcher by design.
+ */
+export function isChromeProfileExecutableForLaunch(candidate: string, resolvedCandidate: string): boolean {
+	return path.posix.normalize(candidate) === "/snap/bin/chromium" || isChromeProfileExecutable(resolvedCandidate);
+}
+
 let resolvedProfileChrome: string | null | undefined; // undefined = unchecked; null = not found
 
 /**

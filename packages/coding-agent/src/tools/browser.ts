@@ -6,7 +6,7 @@ import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
-import { isChromeProfileExecutable, isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
+import { isChromeProfileExecutableForLaunch, isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
 import { chromeUserDataRoots, defaultDiscoveryEnv } from "./browser/profile-discovery";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
@@ -145,7 +145,7 @@ function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, sessio
 		);
 	}
 	const canonicalExe = canonicalPath(exe);
-	if (!isChromeProfileExecutable(canonicalExe)) {
+	if (!isChromeProfileExecutableForLaunch(exe, canonicalExe)) {
 		throw new ToolError(
 			isEdgeExecutable(canonicalExe)
 				? 'app.path for app.browser "chrome" must be Google Chrome or Chromium, not Microsoft Edge. Use Edge with app.path spawn mode and a separate profile, or pass a Chrome/Chromium executable.'

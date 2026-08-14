@@ -105,6 +105,14 @@ describe("Chrome profile browser mode (#809)", () => {
 		}
 	});
 
+	it("preserves the canonical Snap Chromium launcher without trusting arbitrary aliases", () => {
+		expect(launch.isChromeProfileExecutableForLaunch("/snap/bin/chromium", "/usr/bin/snap")).toBe(true);
+		expect(launch.isChromeProfileExecutableForLaunch("/tmp/chromium", "/usr/bin/brave-browser")).toBe(false);
+		expect(launch.isChromeProfileExecutableForLaunch("/usr/bin/google-chrome", "/opt/google/chrome/chrome")).toBe(
+			true,
+		);
+	});
+
 	it("renders the effective Default profile name when it is omitted", () => {
 		expect(describeBrowserForTest({ action: "open", app: { browser: "chrome" } }, undefined)).toBe(
 			"Chrome profile Default",
