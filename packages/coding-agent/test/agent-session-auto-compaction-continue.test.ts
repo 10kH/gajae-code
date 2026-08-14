@@ -694,7 +694,7 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(promptSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not deadlock selection waiting for an inherited emergency continuation", async () => {
+	it("does not deadlock default selection waiting for an inherited emergency continuation", async () => {
 		const promptStarted = Promise.withResolvers<void>();
 		const releasePrompt = Promise.withResolvers<void>();
 		const order: string[] = [];
@@ -714,8 +714,11 @@ describe("AgentSession auto-compaction continuation", () => {
 
 		const activePrompt = session.prompt("active work");
 		await promptStarted.promise;
-		const selection = session.withSdkControlMutation(async () => {
-			order.push("selection");
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, id: "selection-model" };
+		const selection = session.setDefaultModelSelection(selectionModel, undefined, {
+			onAfterMutation: () => order.push("selection"),
 		});
 		releasePrompt.resolve();
 		await activePrompt;
@@ -724,6 +727,7 @@ describe("AgentSession auto-compaction continuation", () => {
 
 		expect(promptSpy).toHaveBeenCalledTimes(2);
 		expect(order).toEqual(["continuation", "selection"]);
+		expect(session.model).toBe(selectionModel);
 	});
 
 	it("reschedules an AgentBusyError racing the queued-followup continue until delivery", async () => {

@@ -554,6 +554,7 @@ describe("AgentSession durable default model selection", () => {
 		const lastModel = { ...targetModel(), id: "last" };
 		const firstDurableCommitEntered = Promise.withResolvers<void>();
 		const releaseFirstDurableCommit = Promise.withResolvers<void>();
+		const credentialProbe = vi.spyOn(modelRegistry, "getApiKey");
 		const originalDurableCommit = settings.commitAtomicBatchWithCurrent.bind(settings);
 		vi.spyOn(settings, "commitAtomicBatchWithCurrent").mockImplementation(async build => {
 			if ((await defaultSelectorFromBuild(build)) === "target-provider/first:low") {
@@ -567,9 +568,9 @@ describe("AgentSession durable default model selection", () => {
 		const firstSelection = session.setDefaultModelSelection(firstModel, Effort.Low);
 		await firstDurableCommitEntered.promise;
 		const lastSelection = session.setDefaultModelSelection(lastModel, Effort.High);
-		// With fail-fast credential probe outside the admission, the second
-		// selection's getApiKey can race concurrently. Serialization is proven
-		// by the final durable/model state, not by preflight timing.
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(credentialProbe.mock.calls.some(([model]) => model === lastModel)).toBe(false);
 		releaseFirstDurableCommit.resolve();
 		await Promise.all([firstSelection, lastSelection]);
 
