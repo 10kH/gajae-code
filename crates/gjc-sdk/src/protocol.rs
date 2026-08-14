@@ -1144,9 +1144,11 @@ pub enum InboundAckState {
 	Accepted,
 	/// Consumed by a turn (the agent has picked the message up).
 	Consumed,
-	/// Rejected before session injection; any optimistic client acknowledgement must be retracted.
+	/// Rejected before session injection; any optimistic client acknowledgement
+	/// must be retracted.
 	Rejected,
-	/// Dropped by a fenced or policy-suspended host; any optimistic client acknowledgement must be retracted.
+	/// Dropped by a fenced or policy-suspended host; any optimistic client
+	/// acknowledgement must be retracted.
 	Dropped,
 }
 
