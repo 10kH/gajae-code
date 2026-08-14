@@ -4313,10 +4313,11 @@ export class AgentSession {
 	}
 
 	#canonicalMessageAdmissionTail: Promise<void> = Promise.resolve();
-	#canonicalMessageAdmissions = new WeakMap<object, { predecessor: Promise<void>; release: () => void }>();
 
-	#reserveCanonicalMessageAdmission(event: AgentEvent): void {
-		if (event.type !== "message_end") return;
+	#reserveCanonicalMessageAdmission(
+		event: AgentEvent,
+	): { predecessor: Promise<void>; release: () => void } | undefined {
+		if (event.type !== "message_end") return undefined;
 		const predecessor = this.#canonicalMessageAdmissionTail;
 		const settled = Promise.withResolvers<void>();
 		let released = false;
@@ -4325,8 +4326,12 @@ export class AgentSession {
 			released = true;
 			settled.resolve();
 		};
-		this.#canonicalMessageAdmissions.set(event, { predecessor, release });
+		// The reservation is owned by this emission's handler: keying it by the
+		// event object would let a replayed/bridged duplicate emission overwrite
+		// it and leave the first handler awaiting a promise only its own handler
+		// will ever release.
 		this.#canonicalMessageAdmissionTail = settled.promise;
+		return { predecessor, release };
 	}
 
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
@@ -4336,7 +4341,7 @@ export class AgentSession {
 		// Reserve canonical message order synchronously. Agent listeners are not
 		// awaited, so a tool-result spill may yield while a later continuation
 		// otherwise overtakes it in persisted/display context.
-		this.#reserveCanonicalMessageAdmission(event);
+		const canonicalAdmission = this.#reserveCanonicalMessageAdmission(event);
 		const terminalOwner = event.type === "agent_end" ? getAgentTerminalOwnerContext(event) : undefined;
 		const maintenanceCheckpoint =
 			event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
@@ -4390,15 +4395,15 @@ export class AgentSession {
 					this.#postPromptLeases.set(eventLease.resourceRunId, eventLease);
 				if (eventLease) {
 					await this.#runResourceLeaseContext.run(eventLease, () =>
-						this.#handleAgentEvent(event, activePromptHandle),
+						this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission),
 					);
 				} else {
-					await this.#handleAgentEvent(event, activePromptHandle);
+					await this.#handleAgentEvent(event, activePromptHandle, canonicalAdmission);
 				}
 			} catch (error) {
 				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
 			} finally {
-				this.#canonicalMessageAdmissions.get(event)?.release();
+				canonicalAdmission?.release();
 				if (eventLease) {
 					const pendingAgentEnd =
 						event.type === "agent_end" && !maintenanceCheckpoint && this.#pendingAgentEndEmit === event
@@ -4606,7 +4611,11 @@ export class AgentSession {
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
-	#handleAgentEvent = async (event: AgentEvent, activePromptHandle?: string): Promise<void> => {
+	#handleAgentEvent = async (
+		event: AgentEvent,
+		activePromptHandle?: string,
+		canonicalAdmission?: { predecessor: Promise<void>; release: () => void },
+	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
 		if (
@@ -4757,8 +4766,7 @@ export class AgentSession {
 		// Only the admission predecessor and this event's own pre-admission work are
 		// inside the lane; release before extension delivery and unrelated post-work.
 		if (event.type === "message_end") {
-			const admission = this.#canonicalMessageAdmissions.get(event);
-			await admission?.predecessor;
+			await canonicalAdmission?.predecessor;
 			if (
 				(event.message.role === "hookMessage" || event.message.role === "custom") &&
 				!(event.message.role === "custom" && event.message.customType === "hindsight-recall")
@@ -4854,7 +4862,7 @@ export class AgentSession {
 					}
 				}
 			}
-			admission?.release();
+			canonicalAdmission?.release();
 		}
 
 		// Deobfuscate assistant message content for display emission — the LLM echoes back

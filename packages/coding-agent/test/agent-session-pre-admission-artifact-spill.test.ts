@@ -235,4 +235,50 @@ describe("AgentSession pre-admission artifact spill", () => {
 		expect(persisted.message).toEqual(toolResult);
 		expect(JSON.stringify(persisted.message)).not.toContain("artifact://");
 	});
+	it("keeps canonical admission live when the same message_end event object is emitted twice", async () => {
+		tempDir = TempDir.createSync("@gjc-pre-admission-spill-duplicate-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const agent = new Agent({
+			initialState: {
+				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+		});
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "tools.preAdmissionArtifactSpill": true }),
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "duplicate-emission",
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(40_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+
+		// A host bridge or replay can hand the agent the same event object twice
+		// before the first emission's spill finishes. The admission reservation
+		// must stay owned by each emission's own handler, so both admissions run
+		// and no later canonical admission is blocked forever.
+		const duplicateEvent = { type: "message_end", message: toolResult } as const;
+		agent.emitExternalEvent(duplicateEvent);
+		agent.emitExternalEvent(duplicateEvent);
+
+		await withTimeout(session.awaitSessionSettlement(), 5_000, "Duplicate emission deadlocked canonical admission");
+
+		const persistedToolResults = sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "message" && entry.message.role === "toolResult");
+		expect(persistedToolResults).toHaveLength(2);
+	});
 });
