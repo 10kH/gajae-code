@@ -4312,10 +4312,31 @@ export class AgentSession {
 		this.#coordinatorToolObservations.set(event, Object.freeze({ label, observedAt: new Date().toISOString() }));
 	}
 
+	#canonicalMessageAdmissionTail: Promise<void> = Promise.resolve();
+	#canonicalMessageAdmissions = new WeakMap<object, { predecessor: Promise<void>; release: () => void }>();
+
+	#reserveCanonicalMessageAdmission(event: AgentEvent): void {
+		if (event.type !== "message_end") return;
+		const predecessor = this.#canonicalMessageAdmissionTail;
+		const settled = Promise.withResolvers<void>();
+		let released = false;
+		const release = () => {
+			if (released) return;
+			released = true;
+			settled.resolve();
+		};
+		this.#canonicalMessageAdmissions.set(event, { predecessor, release });
+		this.#canonicalMessageAdmissionTail = settled.promise;
+	}
+
 	#trackAgentEvent = (event: AgentEvent): Promise<void> => {
 		// First statement of the listener: the observation must precede every claim,
 		// reservation, and async hop this handler performs.
 		this.#observeCoordinatorToolEvent(event);
+		// Reserve canonical message order synchronously. Agent listeners are not
+		// awaited, so a tool-result spill may yield while a later continuation
+		// otherwise overtakes it in persisted/display context.
+		this.#reserveCanonicalMessageAdmission(event);
 		const terminalOwner = event.type === "agent_end" ? getAgentTerminalOwnerContext(event) : undefined;
 		const maintenanceCheckpoint =
 			event.type === "agent_end" && event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted";
@@ -4377,6 +4398,7 @@ export class AgentSession {
 			} catch (error) {
 				logger.warn("Agent event handler failed", { event: event.type, error: String(error) });
 			} finally {
+				this.#canonicalMessageAdmissions.get(event)?.release();
 				if (eventLease) {
 					const pendingAgentEnd =
 						event.type === "agent_end" && !maintenanceCheckpoint && this.#pendingAgentEndEmit === event
@@ -4731,10 +4753,12 @@ export class AgentSession {
 			this.#silentAbortPending = false;
 		}
 
-		// Canonical persistence must happen synchronously before listener work can
-		// await: the EventStream FIFO drain then guarantees tool results and every
-		// steering message are in the branch before a maintenance rewrite starts.
+		// Canonical persistence follows synchronous message_end reservation order.
+		// Only the admission predecessor and this event's own pre-admission work are
+		// inside the lane; release before extension delivery and unrelated post-work.
 		if (event.type === "message_end") {
+			const admission = this.#canonicalMessageAdmissions.get(event);
+			await admission?.predecessor;
 			if (
 				(event.message.role === "hookMessage" || event.message.role === "custom") &&
 				!(event.message.role === "custom" && event.message.customType === "hindsight-recall")
@@ -4830,6 +4854,7 @@ export class AgentSession {
 					}
 				}
 			}
+			admission?.release();
 		}
 
 		// Deobfuscate assistant message content for display emission — the LLM echoes back
