@@ -177,7 +177,7 @@ describe("Chrome profile browser mode (#809)", () => {
 		]);
 	});
 
-	it("resolves app.browser chrome config using repo-consistent snake_case fields", () => {
+	it("resolves app.browser chrome config using repo-consistent snake_case fields", async () => {
 		const params: BrowserParams = {
 			action: "open",
 			app: {
@@ -190,7 +190,7 @@ describe("Chrome profile browser mode (#809)", () => {
 				cdp_port: 9444,
 			},
 		};
-		const kind = resolveBrowserKindForTest(params, makeSession("/work"));
+		const kind = await resolveBrowserKindForTest(params, makeSession("/work"));
 
 		expect(kind).toEqual({
 			kind: "chrome-profile",
@@ -212,10 +212,10 @@ describe("Chrome profile browser mode (#809)", () => {
 		});
 	});
 
-	it("defaults the executable and profile name when a non-default user data directory is explicit", () => {
+	it("defaults the executable and profile name when a non-default user data directory is explicit", async () => {
 		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
 
-		const kind = resolveBrowserKindForTest(
+		const kind = await resolveBrowserKindForTest(
 			{ action: "open", app: { browser: "chrome", user_data_dir: "profiles/automation" } },
 			makeSession("/work"),
 		);
@@ -231,30 +231,30 @@ describe("Chrome profile browser mode (#809)", () => {
 		});
 	});
 
-	it("requires an explicit user data directory with Chrome 136 remediation", () => {
+	it("requires an explicit user data directory with Chrome 136 remediation", async () => {
 		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
-		expect(() =>
+		await expect(
 			resolveBrowserKindForTest(
 				{ action: "open", app: { browser: "chrome", profile_directory: "Profile 10" } },
 				makeSession("/work"),
 			),
-		).toThrow(/Chrome 136\+ disables remote debugging.*app\.cdp_url/);
+		).rejects.toThrow(/Chrome 136\+ disables remote debugging.*app\.cdp_url/);
 	});
 
-	it("errors with remediation when no Chrome binary is installed", () => {
+	it("errors with remediation when no Chrome binary is installed", async () => {
 		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue(undefined);
 
-		expect(() =>
+		await expect(
 			resolveBrowserKindForTest(
 				{ action: "open", app: { browser: "chrome", user_data_dir: "profiles/automation" } },
 				makeSession("/work"),
 			),
-		).toThrow(/No Chrome\/Chromium executable found/);
+		).rejects.toThrow(/No Chrome\/Chromium executable found/);
 	});
 
-	it("rejects an explicit default Chrome user data directory", () => {
+	it("rejects an explicit default Chrome user data directory", async () => {
 		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
-		expect(() =>
+		await expect(
 			resolveBrowserKindForTest(
 				{
 					action: "open",
@@ -262,7 +262,7 @@ describe("Chrome profile browser mode (#809)", () => {
 				},
 				makeSession("/work"),
 			),
-		).toThrow(/Refusing Chrome's default user data directory/);
+		).rejects.toThrow(/Refusing Chrome's default user data directory/);
 	});
 
 	it("recognizes symlink aliases and case-insensitive Windows aliases of default roots", async () => {
@@ -272,9 +272,9 @@ describe("Chrome profile browser mode (#809)", () => {
 		await fs.mkdir(target);
 		await fs.symlink(target, alias);
 		try {
-			expect(isDefaultChromeUserDataDirForTest(alias, [target])).toBe(true);
+			expect(await isDefaultChromeUserDataDirForTest(alias, [target])).toBe(true);
 			expect(
-				isDefaultChromeUserDataDirForTest(
+				await isDefaultChromeUserDataDirForTest(
 					"c:\\users\\u\\appdata\\local\\google\\chrome\\user data",
 					["C:\\Users\\U\\AppData\\Local\\Google\\Chrome\\User Data"],
 					"win32",
@@ -285,7 +285,7 @@ describe("Chrome profile browser mode (#809)", () => {
 		}
 	});
 
-	it("rejects every supported Chrome channel root while allowing custom roots", () => {
+	it("rejects every supported Chrome channel root while allowing custom roots", async () => {
 		const matrix = [
 			{
 				platform: "darwin" as const,
@@ -325,15 +325,15 @@ describe("Chrome profile browser mode (#809)", () => {
 			expect(roots).toHaveLength(entry.expectedChannels.length);
 			for (const [index, root] of roots.entries()) {
 				expect(root).toContain(entry.expectedChannels[index]!);
-				expect(isDefaultChromeUserDataDirForTest(root, roots, entry.platform)).toBe(true);
+				expect(await isDefaultChromeUserDataDirForTest(root, roots, entry.platform)).toBe(true);
 			}
 			const customRoot = entry.platform === "win32" ? "D:\\automation\\chrome" : "/tmp/automation-chrome";
-			expect(isDefaultChromeUserDataDirForTest(customRoot, roots, entry.platform)).toBe(false);
+			expect(await isDefaultChromeUserDataDirForTest(customRoot, roots, entry.platform)).toBe(false);
 		}
 	});
 
-	it("rejects an explicitly supplied Edge executable before launch", () => {
-		expect(() =>
+	it("rejects an explicitly supplied Edge executable before launch", async () => {
+		await expect(
 			resolveBrowserKindForTest(
 				{
 					action: "open",
@@ -345,33 +345,33 @@ describe("Chrome profile browser mode (#809)", () => {
 				},
 				makeSession("/work"),
 			),
-		).toThrow(/not Microsoft Edge/);
+		).rejects.toThrow(/not Microsoft Edge/);
 	});
 
-	it("rejects an explicit Linux Edge path before checking omitted profile fields", () => {
-		expect(() =>
+	it("rejects an explicit Linux Edge path before checking omitted profile fields", async () => {
+		await expect(
 			resolveBrowserKindForTest(
 				{ action: "open", app: { browser: "chrome", path: "/usr/bin/microsoft-edge-stable" } },
 				makeSession("/work"),
 			),
-		).toThrow(/not Microsoft Edge/);
+		).rejects.toThrow(/not Microsoft Edge/);
 	});
 
-	it("rejects other Chromium browser brands before checking omitted profile fields", () => {
+	it("rejects other Chromium browser brands before checking omitted profile fields", async () => {
 		for (const executable of ["/usr/bin/brave-browser", "/usr/bin/vivaldi", "/usr/bin/opera"]) {
-			expect(() =>
+			await expect(
 				resolveBrowserKindForTest(
 					{ action: "open", app: { browser: "chrome", path: executable } },
 					makeSession("/work"),
 				),
-			).toThrow(/must be a Google Chrome or Chromium executable/);
+			).rejects.toThrow(/must be a Google Chrome or Chromium executable/);
 		}
 	});
 
-	it("allows Chrome and Chromium executables with custom data roots", () => {
+	it("allows Chrome and Chromium executables with custom data roots", async () => {
 		for (const exe of ["/usr/bin/google-chrome-beta", "/usr/bin/chromium"]) {
 			expect(
-				resolveBrowserKindForTest(
+				await resolveBrowserKindForTest(
 					{ action: "open", app: { browser: "chrome", path: exe, user_data_dir: "/tmp/gjc-chrome" } },
 					makeSession("/work"),
 				),

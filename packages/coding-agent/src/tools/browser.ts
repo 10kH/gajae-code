@@ -1,4 +1,4 @@
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt, untilAborted } from "@gajae-code/utils";
@@ -126,7 +126,7 @@ export interface BrowserToolDetails {
 	meta?: OutputMeta;
 }
 
-export function resolveBrowserKindForTest(params: BrowserParams, session: ToolSession): BrowserKind {
+export function resolveBrowserKindForTest(params: BrowserParams, session: ToolSession): Promise<BrowserKind> {
 	return resolveBrowserKind(params, session);
 }
 
@@ -136,7 +136,11 @@ export function resolveBrowserKindForTest(params: BrowserParams, session: ToolSe
  * Chrome 136+ refuses remote debugging against its default data directory, so
  * callers must explicitly provide a non-default user data directory.
  */
-function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, session: ToolSession): BrowserKind {
+async function resolveChromeProfileKind(
+	app: NonNullable<BrowserParams["app"]>,
+	session: ToolSession,
+	signal?: AbortSignal,
+): Promise<BrowserKind> {
 	const profileDirectory = app.profile_directory ?? "Default";
 	const exe = app.path ? resolveToCwd(app.path, session.cwd) : resolveSystemChromeForProfile();
 	if (!exe) {
@@ -144,7 +148,7 @@ function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, sessio
 			'No Chrome/Chromium executable found for app.browser "chrome". Install Chrome, or pass app.path with the binary path.',
 		);
 	}
-	const canonicalExe = canonicalPath(exe);
+	const canonicalExe = await canonicalPath(exe, process.platform, signal);
 	if (!isChromeProfileExecutableForLaunch(exe, canonicalExe)) {
 		throw new ToolError(
 			isEdgeExecutable(canonicalExe)
@@ -158,7 +162,7 @@ function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, sessio
 		);
 	}
 	const userDataDir = resolveToCwd(app.user_data_dir, session.cwd);
-	if (isDefaultChromeUserDataDir(userDataDir)) {
+	if (await isDefaultChromeUserDataDir(userDataDir, signal)) {
 		throw new ToolError(
 			`Refusing Chrome's default user data directory ${JSON.stringify(userDataDir)}. Chrome 136+ disables remote debugging there; pass a separate non-default app.user_data_dir, or use app.cdp_url for an already-authorized browser.`,
 		);
@@ -174,40 +178,55 @@ function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, sessio
 	};
 }
 
-function canonicalPath(candidate: string, platform: NodeJS.Platform = process.platform): string {
+async function canonicalPath(
+	candidate: string,
+	platform: NodeJS.Platform = process.platform,
+	signal?: AbortSignal,
+): Promise<string> {
 	let resolved = platform === "win32" ? path.win32.resolve(candidate) : path.resolve(candidate);
 	if (platform === process.platform) {
+		throwIfAborted(signal);
 		try {
-			resolved = fs.realpathSync.native(resolved);
+			resolved = await fs.realpath(resolved);
 		} catch {}
+		throwIfAborted(signal);
 	}
 	return platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
-function isDefaultChromeUserDataDir(candidate: string): boolean {
+function isDefaultChromeUserDataDir(candidate: string, signal?: AbortSignal): Promise<boolean> {
 	return isDefaultChromeUserDataDirForTest(
 		candidate,
-		chromeUserDataRoots(defaultDiscoveryEnv(fs.existsSync)),
+		chromeUserDataRoots(defaultDiscoveryEnv(() => false)),
 		process.platform,
+		signal,
 	);
 }
 
-export function isDefaultChromeUserDataDirForTest(
+export async function isDefaultChromeUserDataDirForTest(
 	candidate: string,
 	roots: readonly string[],
 	platform: NodeJS.Platform = process.platform,
-): boolean {
-	const canonicalCandidate = canonicalPath(candidate, platform);
-	return roots.some(root => canonicalPath(root, platform) === canonicalCandidate);
+	signal?: AbortSignal,
+): Promise<boolean> {
+	const canonicalCandidate = await canonicalPath(candidate, platform, signal);
+	for (const root of roots) {
+		if ((await canonicalPath(root, platform, signal)) === canonicalCandidate) return true;
+	}
+	return false;
 }
 
-function resolveBrowserKind(params: BrowserParams, session: ToolSession): BrowserKind {
+async function resolveBrowserKind(
+	params: BrowserParams,
+	session: ToolSession,
+	signal?: AbortSignal,
+): Promise<BrowserKind> {
 	const app = params.app;
 	if (app?.cdp_url) {
 		return { kind: "connected", cdpUrl: app.cdp_url.replace(/\/+$/, "") };
 	}
 	if (app?.browser === "chrome") {
-		return resolveChromeProfileKind(app, session);
+		return resolveChromeProfileKind(app, session, signal);
 	}
 	if (app?.path) {
 		const exe = resolveToCwd(app.path, session.cwd);
@@ -285,7 +304,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 		timeoutMs: number,
 		signal?: AbortSignal,
 	): Promise<AgentToolResult<BrowserToolDetails>> {
-		const kind = resolveBrowserKind(params, this.session);
+		const kind = await resolveBrowserKind(params, this.session, signal);
 		details.browser = kind.kind;
 
 		// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
