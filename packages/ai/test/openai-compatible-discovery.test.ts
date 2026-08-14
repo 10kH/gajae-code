@@ -127,7 +127,7 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 		// thresholds and collapse compact-input budgets to zero.
 		const body =
 			'{"object":"list","data":[{"id":"bad-limits","max_model_len":1e400,"context_length":1e400,"context_window":1e400,"max_context_length":1e400,"max_tokens":1e400}]}';
-		global.fetch = (async () =>
+		global.fetch = (async (_url: string | URL | Request) =>
 			new Response(body, { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
 
 		const models = await fetchOpenAICompatibleModels(options);
@@ -152,7 +152,7 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 	it("skips a malformed field and takes the next positive candidate", async () => {
 		const body =
 			'{"object":"list","data":[{"id":"mixed-model","max_model_len":1e400,"context_length":131072,"max_tokens":0}]}';
-		global.fetch = (async () =>
+		global.fetch = (async (_url: string | URL | Request) =>
 			new Response(body, { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
 
 		const models = await fetchOpenAICompatibleModels(options);
@@ -168,7 +168,7 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 			'{"id":"healthy","max_model_len":65536,"max_tokens":8192},' +
 			'{"id":"malformed","max_model_len":1e400,"max_tokens":-1},' +
 			'{"id":"bare"}]}';
-		global.fetch = (async () =>
+		global.fetch = (async (_url: string | URL | Request) =>
 			new Response(body, { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
 
 		const models = await fetchOpenAICompatibleModels(options);
