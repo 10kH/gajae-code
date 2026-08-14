@@ -31,6 +31,7 @@ describe("profile-discovery", () => {
 			"/home/x/.config/google-chrome",
 			"/home/x/.config/google-chrome-beta",
 			"/home/x/.config/google-chrome-unstable",
+			"/home/x/.config/google-chrome-canary",
 			"/home/x/.config/chromium",
 			"/home/x/.var/app/com.google.Chrome/config/google-chrome",
 			"/home/x/.var/app/org.chromium.Chromium/config/chromium",
@@ -51,6 +52,7 @@ describe("profile-discovery", () => {
 			"/srv/chrome-config/google-chrome",
 			"/srv/chrome-config/google-chrome-beta",
 			"/srv/chrome-config/google-chrome-unstable",
+			"/srv/chrome-config/google-chrome-canary",
 			"/srv/chrome-config/chromium",
 			"/home/x/.var/app/com.google.Chrome/config/google-chrome",
 			"/home/x/.var/app/org.chromium.Chromium/config/chromium",
@@ -78,6 +80,21 @@ describe("profile-discovery", () => {
 			"C:\\Users\\x\\AppData\\Local\\Google\\Chrome SxS\\User Data",
 			"C:\\Users\\x\\AppData\\Local\\Chromium\\User Data",
 		]);
+	});
+
+	it("joins profile paths with the requested platform semantics", () => {
+		const root = "C:\\Users\\x\\AppData\\Local\\Google\\Chrome Beta\\User Data";
+		const profileDir = `${root}\\Profile 2`;
+		const found = discoverDefaultChromeProfile(
+			{
+				platform: "win32",
+				home: "C:\\Users\\x",
+				localAppData: "C:\\Users\\x\\AppData\\Local",
+				exists: candidate => candidate === profileDir,
+			},
+			"Profile 2",
+		);
+		expect(found).toEqual({ userDataDir: root, profileDirectory: "Profile 2", profileDir });
 	});
 });
 

@@ -26,9 +26,13 @@ export interface DiscoveryEnv {
 	xdgConfigHome?: string;
 }
 
+function discoveryPath(env: DiscoveryEnv): typeof path.posix {
+	return env.platform === "win32" ? path.win32 : path.posix;
+}
+
 /** Candidate Chrome user-data roots for the platform (most common first). */
 export function chromeUserDataRoots(env: DiscoveryEnv): string[] {
-	const platformPath = env.platform === "win32" ? path.win32 : path.posix;
+	const platformPath = discoveryPath(env);
 	switch (env.platform) {
 		case "darwin":
 			return [
@@ -55,6 +59,7 @@ export function chromeUserDataRoots(env: DiscoveryEnv): string[] {
 				platformPath.join(configHome, "google-chrome"),
 				platformPath.join(configHome, "google-chrome-beta"),
 				platformPath.join(configHome, "google-chrome-unstable"),
+				platformPath.join(configHome, "google-chrome-canary"),
 				platformPath.join(configHome, "chromium"),
 				platformPath.join(env.home, ".var", "app", "com.google.Chrome", "config", "google-chrome"),
 				platformPath.join(env.home, ".var", "app", "org.chromium.Chromium", "config", "chromium"),
@@ -79,8 +84,9 @@ export function discoverDefaultChromeProfile(
 	env: DiscoveryEnv,
 	profileDirectory = "Default",
 ): DiscoveredProfile | null {
+	const platformPath = discoveryPath(env);
 	for (const userDataDir of chromeUserDataRoots(env)) {
-		const profileDir = path.join(userDataDir, profileDirectory);
+		const profileDir = platformPath.join(userDataDir, profileDirectory);
 		if (env.exists(profileDir)) {
 			return { userDataDir, profileDirectory, profileDir };
 		}

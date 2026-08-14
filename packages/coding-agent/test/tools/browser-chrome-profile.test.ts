@@ -273,6 +273,7 @@ describe("Chrome profile browser mode (#809)", () => {
 					"google-chrome",
 					"google-chrome-beta",
 					"google-chrome-unstable",
+					"google-chrome-canary",
 					"chromium",
 					"com.google.Chrome",
 					"org.chromium.Chromium",
