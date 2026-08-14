@@ -5,7 +5,11 @@ import * as path from "node:path";
 import { Process, ProcessStatus } from "@gajae-code/natives";
 import type { Browser } from "puppeteer-core";
 import type { ToolSession } from "../../src/sdk";
-import { type BrowserParams, resolveBrowserKindForTest } from "../../src/tools/browser";
+import {
+	type BrowserParams,
+	isDefaultChromeUserDataDirForTest,
+	resolveBrowserKindForTest,
+} from "../../src/tools/browser";
 import * as attach from "../../src/tools/browser/attach";
 import {
 	argsMatchChromeProfileForTest,
@@ -14,7 +18,6 @@ import {
 	isSafeCdpAddressForTest,
 } from "../../src/tools/browser/attach";
 import * as launch from "../../src/tools/browser/launch";
-import * as profileDiscovery from "../../src/tools/browser/profile-discovery";
 import {
 	type AcquireBrowserOptions,
 	type BrowserHandle,
@@ -161,68 +164,102 @@ describe("Chrome profile browser mode (#809)", () => {
 			noFocus: true,
 			cdpPort: 9444,
 		});
+		expect(params.app).toEqual({
+			browser: "chrome",
+			path: "bin/google-chrome",
+			user_data_dir: "profiles/chrome",
+			profile_directory: "Profile 10",
+			background: true,
+			no_focus: true,
+			cdp_port: 9444,
+		});
 	});
 
-	it("defaults chrome profile mode to the installed Chrome and its discovered default profile", () => {
+	it("defaults the executable and profile name when a non-default user data directory is explicit", () => {
 		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
-		const discover = vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue({
-			userDataDir: "/home/u/.config/google-chrome",
-			profileDirectory: "Default",
-			profileDir: "/home/u/.config/google-chrome/Default",
-		});
 
-		const kind = resolveBrowserKindForTest({ action: "open", app: { browser: "chrome" } }, makeSession("/work"));
+		const kind = resolveBrowserKindForTest(
+			{ action: "open", app: { browser: "chrome", user_data_dir: "profiles/automation" } },
+			makeSession("/work"),
+		);
 
 		expect(kind).toEqual({
 			kind: "chrome-profile",
 			path: "/usr/bin/google-chrome",
-			userDataDir: "/home/u/.config/google-chrome",
+			userDataDir: path.join("/work", "profiles/automation"),
 			profileDirectory: "Default",
 			background: false,
 			noFocus: false,
 			cdpPort: undefined,
 		});
-		expect(discover.mock.calls[0]?.[1]).toBe("Default");
 	});
 
-	it("discovers the user data dir for an explicitly requested profile directory", () => {
-		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
-		const discover = vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue({
-			userDataDir: "/home/u/.config/google-chrome",
-			profileDirectory: "Profile 10",
-			profileDir: "/home/u/.config/google-chrome/Profile 10",
-		});
-
-		const kind = resolveBrowserKindForTest(
-			{ action: "open", app: { browser: "chrome", profile_directory: "Profile 10" } },
-			makeSession("/work"),
-		);
-
-		expect(discover.mock.calls[0]?.[1]).toBe("Profile 10");
-		expect(kind).toMatchObject({
-			userDataDir: "/home/u/.config/google-chrome",
-			profileDirectory: "Profile 10",
-		});
+	it("requires an explicit user data directory with Chrome 136 remediation", () => {
+		expect(() =>
+			resolveBrowserKindForTest(
+				{ action: "open", app: { browser: "chrome", profile_directory: "Profile 10" } },
+				makeSession("/work"),
+			),
+		).toThrow(/Chrome 136\+ disables remote debugging.*app\.cdp_url/);
 	});
 
 	it("errors with remediation when no Chrome binary is installed", () => {
 		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue(undefined);
 
 		expect(() =>
-			resolveBrowserKindForTest({ action: "open", app: { browser: "chrome" } }, makeSession("/work")),
+			resolveBrowserKindForTest(
+				{ action: "open", app: { browser: "chrome", user_data_dir: "profiles/automation" } },
+				makeSession("/work"),
+			),
 		).toThrow(/No Chrome\/Chromium executable found/);
 	});
 
-	it("errors with remediation when the requested profile is not under the default roots", () => {
-		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
-		vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue(null);
-
+	it("rejects an explicit default Chrome user data directory", () => {
 		expect(() =>
 			resolveBrowserKindForTest(
-				{ action: "open", app: { browser: "chrome", profile_directory: "Profile 42" } },
+				{
+					action: "open",
+					app: { browser: "chrome", user_data_dir: path.join(os.homedir(), ".config/google-chrome") },
+				},
 				makeSession("/work"),
 			),
-		).toThrow(/Pass app\.user_data_dir/);
+		).toThrow(/Refusing Chrome's default user data directory/);
+	});
+
+	it("recognizes symlink aliases and case-insensitive Windows aliases of default roots", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "chrome-default-root-"));
+		const target = path.join(root, "actual");
+		const alias = path.join(root, "alias");
+		await fs.mkdir(target);
+		await fs.symlink(target, alias);
+		try {
+			expect(isDefaultChromeUserDataDirForTest(alias, [target])).toBe(true);
+			expect(
+				isDefaultChromeUserDataDirForTest(
+					"c:\\users\\u\\appdata\\local\\google\\chrome\\user data",
+					["C:\\Users\\U\\AppData\\Local\\Google\\Chrome\\User Data"],
+					"win32",
+				),
+			).toBe(true);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects an explicitly supplied Edge executable before launch", () => {
+		expect(() =>
+			resolveBrowserKindForTest(
+				{
+					action: "open",
+					app: {
+						browser: "chrome",
+						path: "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+						user_data_dir: "/tmp/chrome-automation",
+					},
+				},
+				makeSession("/work"),
+			),
+		).toThrow(/not Microsoft Edge/);
 	});
 
 	it("refuses an already-running matching profile without attachable CDP", async () => {

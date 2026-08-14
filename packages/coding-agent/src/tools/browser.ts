@@ -1,12 +1,13 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import { prompt, untilAborted } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
-import { resolveSystemChromeForProfile } from "./browser/launch";
-import { defaultDiscoveryEnv, discoverDefaultChromeProfile } from "./browser/profile-discovery";
+import { isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
+import { chromeUserDataRoots, defaultDiscoveryEnv } from "./browser/profile-discovery";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
 import { acquireTab, dropHeadlessTabs, getTab, releaseAllTabs, releaseTab, runInTab } from "./browser/tab-supervisor";
@@ -27,7 +28,7 @@ const appSchema = z.object({
 	browser: z.enum(["chrome"]).describe("existing browser profile mode").optional(),
 	user_data_dir: z
 		.string()
-		.describe("Chrome user data directory containing profiles (default: this OS's Chrome user data directory)")
+		.describe("non-default Chrome user data directory containing profiles (required for Chrome 136+ CDP)")
 		.optional(),
 	profile_directory: z
 		.string()
@@ -130,25 +131,33 @@ export function resolveBrowserKindForTest(params: BrowserParams, session: ToolSe
 }
 
 /**
- * Resolve guarded Chrome profile mode. Every field is optional: the executable
- * falls back to the installed Chrome/Chromium, the profile directory to
- * `"Default"`, and the user data dir to the discovered per-OS Chrome root.
+ * Resolve guarded Chrome profile mode. The executable falls back to the
+ * installed Chrome/Chromium and the profile directory to `"Default"`.
+ * Chrome 136+ refuses remote debugging against its default data directory, so
+ * callers must explicitly provide a non-default user data directory.
  */
 function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, session: ToolSession): BrowserKind {
 	const profileDirectory = app.profile_directory ?? "Default";
+	if (!app.user_data_dir) {
+		throw new ToolError(
+			'app.user_data_dir is required for app.browser "chrome". Chrome 136+ disables remote debugging for the default Chrome data directory; pass a separate non-default user data directory, or attach to an already-authorized browser with app.cdp_url.',
+		);
+	}
+	const userDataDir = resolveToCwd(app.user_data_dir, session.cwd);
+	if (isDefaultChromeUserDataDir(userDataDir)) {
+		throw new ToolError(
+			`Refusing Chrome's default user data directory ${JSON.stringify(userDataDir)}. Chrome 136+ disables remote debugging there; pass a separate non-default app.user_data_dir, or use app.cdp_url for an already-authorized browser.`,
+		);
+	}
 	const exe = app.path ? resolveToCwd(app.path, session.cwd) : resolveSystemChromeForProfile();
 	if (!exe) {
 		throw new ToolError(
 			'No Chrome/Chromium executable found for app.browser "chrome". Install Chrome, or pass app.path with the binary path.',
 		);
 	}
-	const userDataDir = app.user_data_dir
-		? resolveToCwd(app.user_data_dir, session.cwd)
-		: discoverDefaultChromeProfile(defaultDiscoveryEnv(fs.existsSync), profileDirectory)?.userDataDir;
-	if (!userDataDir) {
+	if (isEdgeExecutable(canonicalPath(exe))) {
 		throw new ToolError(
-			`No Chrome profile ${JSON.stringify(profileDirectory)} found under the default Chrome user data directories. ` +
-				"Pass app.user_data_dir (and app.profile_directory) explicitly.",
+			'app.path for app.browser "chrome" must be Google Chrome or Chromium, not Microsoft Edge. Use Edge with app.path spawn mode and a separate profile, or pass a Chrome/Chromium executable.',
 		);
 	}
 	return {
@@ -160,6 +169,33 @@ function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, sessio
 		noFocus: app.no_focus ?? false,
 		cdpPort: app.cdp_port,
 	};
+}
+
+function canonicalPath(candidate: string, platform: NodeJS.Platform = process.platform): string {
+	let resolved = platform === "win32" ? path.win32.resolve(candidate) : path.resolve(candidate);
+	if (platform === process.platform) {
+		try {
+			resolved = fs.realpathSync.native(resolved);
+		} catch {}
+	}
+	return platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+function isDefaultChromeUserDataDir(candidate: string): boolean {
+	return isDefaultChromeUserDataDirForTest(
+		candidate,
+		chromeUserDataRoots(defaultDiscoveryEnv(fs.existsSync)),
+		process.platform,
+	);
+}
+
+export function isDefaultChromeUserDataDirForTest(
+	candidate: string,
+	roots: readonly string[],
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	const canonicalCandidate = canonicalPath(candidate, platform);
+	return roots.some(root => canonicalPath(root, platform) === canonicalCandidate);
 }
 
 function resolveBrowserKind(params: BrowserParams, session: ToolSession): BrowserKind {
