@@ -46,11 +46,9 @@ describe("SessionManager managed append overflow recovery", () => {
 
 			// Mock the store's appendSync to throw content_too_large,
 			// simulating a transcript that has grown to the 64 MiB limit.
-			const appendSpy = vi
-				.spyOn(ManagedSessionDescendantStore.prototype, "appendSync")
-				.mockImplementation(() => {
-					throw new Error("content_too_large");
-				});
+			const appendSpy = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendSync").mockImplementation(() => {
+				throw new Error("content_too_large");
+			});
 
 			// This append should hit content_too_large and recover via #rewriteFileSync.
 			expect(() => manager.appendMessage({ role: "user", content: "after-overflow", timestamp: 2 })).not.toThrow();
@@ -105,11 +103,9 @@ describe("SessionManager managed append overflow recovery", () => {
 			manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
 			await manager.ensureOnDisk();
 
-			const appendSpy = vi
-				.spyOn(ManagedSessionDescendantStore.prototype, "appendSync")
-				.mockImplementation(() => {
-					throw new Error("some_other_error");
-				});
+			const appendSpy = vi.spyOn(ManagedSessionDescendantStore.prototype, "appendSync").mockImplementation(() => {
+				throw new Error("some_other_error");
+			});
 
 			// A non-content_too_large error should poison the session and throw.
 			let threw = false;

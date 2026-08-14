@@ -596,7 +596,6 @@ export async function reapScrubbedProtocolRemnants(
 	return reportScrubbedProtocolRemnantReap(reaped, failures);
 }
 
-
 const ACL_FAILURE_CODES = new Set(["acl_denied", "acl_io_error", "acl_present", "acl_malformed", "acl_unknown"]);
 const ACL_CLEAR_EVIDENCE = new Set(["cleared", "already_absent", "unsupported", "not_run"]);
 const GENERAL_FAILURE_CODES = new Set([
