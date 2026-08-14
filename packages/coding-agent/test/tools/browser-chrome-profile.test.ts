@@ -15,6 +15,7 @@ import {
 	argsMatchChromeProfileForTest,
 	findCdpAddressInArgsForTest,
 	findCdpPortInArgsForTest,
+	findRunningChromeProfileForTest,
 	isSafeCdpAddressForTest,
 } from "../../src/tools/browser/attach";
 import * as launch from "../../src/tools/browser/launch";
@@ -404,6 +405,58 @@ describe("Chrome profile browser mode (#809)", () => {
 				profileDirectory: "Profile 10",
 			}),
 		).resolves.toEqual({ pid: 123, cdpUrl: "http://127.0.0.1:9222" });
+	});
+
+	it("reuses a wrapper-launched Linux Chrome process by guarded profile arguments", async () => {
+		vi.spyOn(Process, "fromPath").mockReturnValue([]);
+		vi.spyOn(Process, "fromPid").mockImplementation(pid =>
+			pid === 321
+				? ({
+						pid,
+						status: () => ProcessStatus.Running,
+						args: () => [
+							"/opt/google/chrome/chrome",
+							"--user-data-dir=/tmp/gjc-chrome",
+							"--profile-directory=Default",
+							"--remote-debugging-port=9222",
+							"--remote-debugging-address=127.0.0.1",
+						],
+					} as Process)
+				: null,
+		);
+		mockSuccessfulCdpProbe();
+
+		await expect(
+			findRunningChromeProfileForTest(
+				"/usr/bin/google-chrome",
+				{ userDataDir: "/tmp/gjc-chrome", profileDirectory: "Default" },
+				{ platform: "linux", linuxPids: [321] },
+			),
+		).resolves.toEqual({ pid: 321, cdpUrl: "http://127.0.0.1:9222" });
+	});
+
+	it("does not reuse a non-Chrome process that spoofs profile arguments", async () => {
+		vi.spyOn(Process, "fromPath").mockReturnValue([]);
+		vi.spyOn(Process, "fromPid").mockReturnValue({
+			pid: 654,
+			status: () => ProcessStatus.Running,
+			args: () => [
+				"/usr/bin/brave-browser",
+				"--user-data-dir=/tmp/gjc-chrome",
+				"--profile-directory=Default",
+				"--remote-debugging-port=9222",
+			],
+		} as Process);
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+		await expect(
+			findRunningChromeProfileForTest(
+				"/snap/bin/chromium",
+				{ userDataDir: "/tmp/gjc-chrome", profileDirectory: "Default" },
+				{ platform: "linux", linuxPids: [654] },
+			),
+		).resolves.toBeNull();
+		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 
 	it("reuses matching profile CDP when remote debugging address is localhost", async () => {

@@ -1,8 +1,10 @@
+import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import type { Browser, Page } from "puppeteer-core";
 import { ToolError, throwIfAborted } from "../tool-errors";
+import { isChromeProfileExecutable } from "./launch";
 
 const ATTACH_TARGET_SKIP_PATTERN =
 	/request[\s_-]?handler|devtools|background[\s_-]?(?:page|host)|service[\s_-]?worker/i;
@@ -196,9 +198,45 @@ export async function findRunningChromeProfile(
 	profile: { userDataDir: string; profileDirectory: string },
 	signal?: AbortSignal,
 ): Promise<RunningChromeProfile | null> {
-	const candidates = nativeProcessBindings()
-		.Process.fromPath(exe)
-		.filter(p => p.status() === nativeProcessBindings().ProcessStatus.Running);
+	return findRunningChromeProfileWithOptions(exe, profile, signal, {});
+}
+
+interface ProfileProcessScanOptions {
+	platform?: NodeJS.Platform;
+	linuxPids?: readonly number[];
+}
+
+function liveLinuxPids(): number[] {
+	try {
+		return fs
+			.readdirSync("/proc", { withFileTypes: true })
+			.filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name))
+			.map(entry => Number.parseInt(entry.name, 10));
+	} catch {
+		return [];
+	}
+}
+
+async function findRunningChromeProfileWithOptions(
+	exe: string,
+	profile: { userDataDir: string; profileDirectory: string },
+	signal: AbortSignal | undefined,
+	options: ProfileProcessScanOptions,
+): Promise<RunningChromeProfile | null> {
+	const bindings = nativeProcessBindings();
+	const candidates = bindings.Process.fromPath(exe).filter(p => p.status() === bindings.ProcessStatus.Running);
+	const seenPids = new Set(candidates.map(candidate => candidate.pid));
+	const fallbackPids = new Set<number>();
+	if ((options.platform ?? process.platform) === "linux" && candidates.length === 0) {
+		for (const pid of options.linuxPids ?? liveLinuxPids()) {
+			if (seenPids.has(pid)) continue;
+			const candidate = bindings.Process.fromPid(pid);
+			if (!candidate || candidate.status() !== bindings.ProcessStatus.Running) continue;
+			seenPids.add(pid);
+			fallbackPids.add(pid);
+			candidates.push(candidate);
+		}
+	}
 	for (const proc of candidates) {
 		let args: string[];
 		try {
@@ -207,6 +245,7 @@ export async function findRunningChromeProfile(
 			continue;
 		}
 		if (!argsMatchChromeProfile(args, profile)) continue;
+		if (fallbackPids.has(proc.pid) && !isChromeProfileExecutable(args[0] ?? "")) continue;
 		const port = findCdpPortInArgs(args);
 		if (port !== null) {
 			const address = findCdpAddressInArgs(args);
@@ -220,6 +259,14 @@ export async function findRunningChromeProfile(
 		return { pid: proc.pid, cdpUrl: null };
 	}
 	return null;
+}
+
+export function findRunningChromeProfileForTest(
+	exe: string,
+	profile: { userDataDir: string; profileDirectory: string },
+	options: ProfileProcessScanOptions,
+): Promise<RunningChromeProfile | null> {
+	return findRunningChromeProfileWithOptions(exe, profile, undefined, options);
 }
 
 /**
