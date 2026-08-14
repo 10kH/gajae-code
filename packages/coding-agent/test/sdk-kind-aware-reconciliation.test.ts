@@ -42,12 +42,12 @@ describe("kind-aware reconciliation", () => {
 			rec.admit(kind, `ref-${kind}`);
 			await rec.noteAccepted(kind, { commandId: `c-${kind}`, turnId: `t-${kind}` }, `ref-${kind}`);
 			await rec.noteTransition(
-			kind,
-			{ commandId: `c-${kind}`, turnId: `t-${kind}` },
-			{
-				type: "agent_end",
-				content: { version: 1, type: "text", text: "😀".repeat(10_000), byteLength: 40_000, truncated: false },
-			},
+				kind,
+				{ commandId: `c-${kind}`, turnId: `t-${kind}` },
+				{
+					type: "agent_end",
+					content: { version: 1, type: "text", text: "😀".repeat(10_000), byteLength: 40_000, truncated: false },
+				},
 			);
 		}
 		const reopened = createKindAwareReconciliation({
