@@ -3123,6 +3123,28 @@
 		}
 	},
 	{
+		"sourceId": "agent_session:setCredentialPin",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "interactive session-scoped OAuth account selector mutation behind the locked /credential and OAuth selector surfaces; the public SDK has no credential-selection operation and must not gain credential authority implicitly",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:setCredentialAuto",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "interactive session-scoped OAuth AUTO-ranking mutation behind the locked /credential and OAuth selector surfaces; the public SDK has no credential-selection operation and must not gain credential authority implicitly",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
 		"sourceId": "agent_session:getPlanModeState",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",

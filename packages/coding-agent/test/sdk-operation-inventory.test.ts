@@ -93,6 +93,14 @@ describe("SDK operation inventory", () => {
 
 		const expected = new Map([
 			[
+				"agent_session:setCredentialPin",
+				"interactive session-scoped OAuth account selector mutation behind the locked /credential and OAuth selector surfaces; the public SDK has no credential-selection operation and must not gain credential authority implicitly",
+			],
+			[
+				"agent_session:setCredentialAuto",
+				"interactive session-scoped OAuth AUTO-ranking mutation behind the locked /credential and OAuth selector surfaces; the public SDK has no credential-selection operation and must not gain credential authority implicitly",
+			],
+			[
 				"agent_session:runMidRunMaintenanceForTests",
 				"test-only maintenance seam, not a user-facing SDK control seam",
 			],
