@@ -250,7 +250,8 @@ function systemChromiumCandidates(): string[] {
 	return candidates;
 }
 
-function resolveSystemChromium(): string | undefined {
+/** Installed Chrome/Chromium executable, or undefined when none is present. */
+export function resolveSystemChromium(): string | undefined {
 	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
 	const seen = new Set<string>();
 	for (const candidate of systemChromiumCandidates()) {

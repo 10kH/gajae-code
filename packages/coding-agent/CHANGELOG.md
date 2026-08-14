@@ -21,6 +21,7 @@
 
 ### Changed
 - Updated every bundled GLM model profile (`glm-eco`, `glm-medium`, and `glm-pro`) from ZAI GLM-5.2 to GLM-5.3.
+- `browser` Chrome profile mode (`app.browser: "chrome"`) no longer rejects calls that omit `path`, `user_data_dir`, or `profile_directory`. `{"app":{"browser":"chrome"}}` now resolves the installed Chrome/Chromium, the `"Default"` profile, and the per-OS Chrome user data directory containing it; explicit fields still override, and errors are raised only when no Chrome binary exists or the requested profile is absent from the default roots.
 - Defense-in-depth: when an Anthropic-origin assistant transcript message carrying directly adjacent `thinking`/`redacted_thinking` blocks is persisted, a single bounded warn is emitted per session manager instance — but only in development/test builds, never in production. The diagnostic names only the envelope shape (block count, adjacency presence, provider), never raw thinking text, signatures, redacted payloads, or transcript-path metadata. Storage is never mutated — the send-boundary collapse remains the wire source of truth; this is a read-only observation that helps surface upstream producers of the rejected shape (#4443).
 ### Fixed
 - Post-merge repair for #4542: `CHAT_DAEMON_GENERATIONS.discord` 64→65 and `.slack` 67→68 so the `SessionRouter` initial attachment replay change is generation-fenced for already-running Discord and Slack daemons. The semantic guard manifest is regenerated with the corrected generation and declaration digests.

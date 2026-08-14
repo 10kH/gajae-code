@@ -14,6 +14,7 @@ import {
 	isSafeCdpAddressForTest,
 } from "../../src/tools/browser/attach";
 import * as launch from "../../src/tools/browser/launch";
+import * as profileDiscovery from "../../src/tools/browser/profile-discovery";
 import {
 	type AcquireBrowserOptions,
 	type BrowserHandle,
@@ -153,6 +154,68 @@ describe("Chrome profile browser mode (#809)", () => {
 			noFocus: true,
 			cdpPort: 9444,
 		});
+	});
+
+	it("defaults chrome profile mode to the installed Chrome and its discovered default profile", () => {
+		vi.spyOn(launch, "resolveSystemChromium").mockReturnValue("/usr/bin/google-chrome");
+		const discover = vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue({
+			userDataDir: "/home/u/.config/google-chrome",
+			profileDirectory: "Default",
+			profileDir: "/home/u/.config/google-chrome/Default",
+		});
+
+		const kind = resolveBrowserKindForTest({ action: "open", app: { browser: "chrome" } }, makeSession("/work"));
+
+		expect(kind).toEqual({
+			kind: "chrome-profile",
+			path: "/usr/bin/google-chrome",
+			userDataDir: "/home/u/.config/google-chrome",
+			profileDirectory: "Default",
+			background: false,
+			noFocus: false,
+			cdpPort: undefined,
+		});
+		expect(discover.mock.calls[0]?.[1]).toBe("Default");
+	});
+
+	it("discovers the user data dir for an explicitly requested profile directory", () => {
+		vi.spyOn(launch, "resolveSystemChromium").mockReturnValue("/usr/bin/google-chrome");
+		const discover = vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue({
+			userDataDir: "/home/u/.config/google-chrome",
+			profileDirectory: "Profile 10",
+			profileDir: "/home/u/.config/google-chrome/Profile 10",
+		});
+
+		const kind = resolveBrowserKindForTest(
+			{ action: "open", app: { browser: "chrome", profile_directory: "Profile 10" } },
+			makeSession("/work"),
+		);
+
+		expect(discover.mock.calls[0]?.[1]).toBe("Profile 10");
+		expect(kind).toMatchObject({
+			userDataDir: "/home/u/.config/google-chrome",
+			profileDirectory: "Profile 10",
+		});
+	});
+
+	it("errors with remediation when no Chrome binary is installed", () => {
+		vi.spyOn(launch, "resolveSystemChromium").mockReturnValue(undefined);
+
+		expect(() =>
+			resolveBrowserKindForTest({ action: "open", app: { browser: "chrome" } }, makeSession("/work")),
+		).toThrow(/No Chrome\/Chromium executable found/);
+	});
+
+	it("errors with remediation when the requested profile is not under the default roots", () => {
+		vi.spyOn(launch, "resolveSystemChromium").mockReturnValue("/usr/bin/google-chrome");
+		vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue(null);
+
+		expect(() =>
+			resolveBrowserKindForTest(
+				{ action: "open", app: { browser: "chrome", profile_directory: "Profile 42" } },
+				makeSession("/work"),
+			),
+		).toThrow(/Pass app\.user_data_dir/);
 	});
 
 	it("refuses an already-running matching profile without attachable CDP", async () => {
