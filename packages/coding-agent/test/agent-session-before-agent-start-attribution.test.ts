@@ -577,6 +577,56 @@ describe("AgentSession before_agent_start attribution fallback", () => {
 
 		expect(promoted[0]).toBe("follow-up");
 	});
+	it("releases a follow-up reservation when terminal abort cancels the selection-fence wait", async () => {
+		createSession();
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const selectionModel = { ...currentModel, provider: "selection-provider", id: "selection-model" };
+		authStorage?.setRuntimeApiKey(selectionModel.provider, "selection-key");
+		const selectionValidationStarted = Promise.withResolvers<void>();
+		const releaseSelectionValidation = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model === selectionModel) {
+				selectionValidationStarted.resolve();
+				await releaseSelectionValidation.promise;
+			}
+			return originalGetApiKey(model, ...args);
+		});
+		// Park a selection fence so the follow-up dispatch parks inside its
+		// selection-fence wait holding an un-enqueued reservation.
+		const selection = session.setDefaultModelSelection(selectionModel, undefined);
+		await selectionValidationStarted.promise;
+		const cancelled = session.sendUserMessage("cancelled follow-up", {
+			queuedAtDispatch: true,
+			deliverAs: "followUp",
+		});
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		// Cancel the preflight while the dispatch still waits on the fence: the
+		// reservation must not outlive the rejection.
+		session.cancelPendingPreflightForTerminalAbort();
+
+		await expect(cancelled).rejects.toMatchObject({
+			code: "busy",
+			message: "Prompt preflight was cancelled before execution.",
+		});
+		releaseSelectionValidation.resolve();
+		await selection;
+
+		// A later plain queued prompt must classify as fresh (no leaked
+		// follow-up reservation ahead of it) and start its own run.
+		let promoted = false;
+		await session.sendUserMessage("later plain prompt", {
+			queuedAtDispatch: true,
+			onQueuedPromoted: () => {
+				promoted = true;
+			},
+		});
+		await session.waitForIdle();
+
+		expect(promoted).toBe(true);
+		expect(session.pendingMessageCounts.followUp).toBe(0);
+	});
 	it("rejects fresh queued SDK promotion when disposal starts during durable acceptance", async () => {
 		createSession();
 		const providerPrompt = vi.spyOn(session.agent, "prompt");

@@ -1991,12 +1991,12 @@ export class AgentSession {
 	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
 	#pendingSelectionFences = 0;
+	#settledSelectionFenceGeneration = 0;
 	#selectionFenceDeferredContinuations = new Map<number, number>();
 	#followUpReservationEpoch = 0;
 	/** Epochs of follow-up reservations still between reservation and durable enqueue. */
 	#activeFollowUpReservationEpochs = new Set<number>();
 	#followUpReservationDrainWaiters = new Set<() => void>();
-	#activeSelectionFenceGeneration: number | undefined;
 	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#thinkingLevelMutationRevision = 0;
@@ -2980,15 +2980,24 @@ export class AgentSession {
 		this.#resolveSessionSettlement();
 	}
 
-	/** Continuations parked behind selection fences this waiter must observe. */
+	/**
+	 * Continuations parked behind selection fences that idle waits must observe.
+	 *
+	 * Only deferrals whose fence has already settled are counted: their
+	 * deferred scheduling tail is (re-)entering within microtask time and the
+	 * session is not idle until it does. A deferral behind a still-pending
+	 * fence is invisible by construction — the fence owner's own completion may
+	 * causally depend on the very settlement the waiter would block on, so
+	 * counting it would reintroduce the selection self-deadlock (#4519). It
+	 * becomes observable the moment its fence settles, and either the
+	 * synchronous re-entry (`#endSelectionFenceDeferralTracking`) or the
+	 * promise-settled safety net clears it.
+	 */
 	#pendingSelectionFenceDeferredContinuations(): number {
-		const ownerGeneration = this.#activeSelectionFenceGeneration;
+		const settledGeneration = this.#settledSelectionFenceGeneration;
 		let total = 0;
 		for (const [generation, count] of this.#selectionFenceDeferredContinuations) {
-			// An in-flight selection never waits on continuations parked behind its
-			// own fence (or a later one it will itself sequence behind): that is
-			// the self-deadlock this fence exists to avoid.
-			if (ownerGeneration !== undefined && generation >= ownerGeneration) continue;
+			if (generation > settledGeneration) continue;
 			total += count;
 		}
 		return total;
@@ -11323,21 +11332,21 @@ export class AgentSession {
 			this.#followUpReservationDrainWaiters.clear();
 			for (const waiter of waiters) waiter();
 		};
-		if (this.#pendingSelectionFences > 0) {
-			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
-		}
-		const assertPreflightStillOpen = () => {
-			this.#assertSessionAdmissionOpen();
-			if (
-				options?.preflightSignal?.aborted ||
-				this.#promptPreflightCancellationGeneration !== preflightCancellationGeneration
-			) {
-				throw promptPreflightCancelledError();
+		try {
+			if (this.#pendingSelectionFences > 0) {
+				await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
 			}
-		};
-		assertPreflightStillOpen();
-		if (deliverAs === "followUp") {
-			try {
+			const assertPreflightStillOpen = () => {
+				this.#assertSessionAdmissionOpen();
+				if (
+					options?.preflightSignal?.aborted ||
+					this.#promptPreflightCancellationGeneration !== preflightCancellationGeneration
+				) {
+					throw promptPreflightCancelledError();
+				}
+			};
+			assertPreflightStillOpen();
+			if (deliverAs === "followUp") {
 				// Durable enqueue preserves reservation order: while an earlier
 				// follow-up dispatch is still between its reservation and its own
 				// durable enqueue, wait for those earlier reservations so this
@@ -11361,65 +11370,65 @@ export class AgentSession {
 				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
 				if (options?.preflightSignal?.aborted) cancelQueuedFollowUp();
 				options?.onPreflightAccepted?.();
-			} finally {
-				releaseFollowUpReservation();
+				return;
 			}
-			return;
-		}
-		if (deliverAs === "steer") {
-			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			assertPreflightStillOpen();
-			await this.#queueSteer(text, images, {
-				claimsGenuineUserIntent: true,
-				onPromoted: options?.onQueuedPromoted,
-				external: true,
-			});
-			options?.onPreflightAccepted?.();
-			return;
-		}
-
-		// No explicit delivery mode: only a live stream makes prompt() throw
-		// AgentBusyError, so queue the message as steering while streaming.
-		// Compaction is intentionally NOT diverted here: prompt() handles an
-		// in-flight compaction internally, and #queueSteer would otherwise park
-		// the message in the steering queue with no turn to consume it.
-		if (this.isStreaming) {
-			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			assertPreflightStillOpen();
-			await this.#queueSteer(text, images, {
-				claimsGenuineUserIntent: true,
-				onPromoted: options?.onQueuedPromoted,
-				external: true,
-			});
-			options?.onPreflightAccepted?.();
-			return;
-		}
-
-		// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
-		let queuedPromotionFired = false;
-		const fireQueuedPromotion = () => {
-			if (!freshAtReservation || queuedPromotionFired) return;
-			queuedPromotionFired = true;
-			options?.onQueuedPromoted?.();
-		};
-		await this.prompt(text, {
-			expandPromptTemplates: false,
-			images,
-			onPreflightAccepted: () => {
+			if (deliverAs === "steer") {
+				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+				assertPreflightStillOpen();
+				await this.#queueSteer(text, images, {
+					claimsGenuineUserIntent: true,
+					onPromoted: options?.onQueuedPromoted,
+					external: true,
+				});
 				options?.onPreflightAccepted?.();
-				fireQueuedPromotion();
-			},
-			onPreflightAcceptCommit:
-				options?.onPreflightAcceptCommit || freshAtReservation
-					? async () => {
-							if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-							else options?.onPreflightAccepted?.();
-							assertPreflightStillOpen();
-							fireQueuedPromotion();
-						}
-					: undefined,
-			preflightSignal: options?.preflightSignal,
-		});
+				return;
+			}
+
+			// No explicit delivery mode: only a live stream makes prompt() throw
+			// AgentBusyError, so queue the message as steering while streaming.
+			// Compaction is intentionally NOT diverted here: prompt() handles an
+			// in-flight compaction internally, and #queueSteer would otherwise park
+			// the message in the steering queue with no turn to consume it.
+			if (this.isStreaming) {
+				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+				assertPreflightStillOpen();
+				await this.#queueSteer(text, images, {
+					claimsGenuineUserIntent: true,
+					onPromoted: options?.onQueuedPromoted,
+					external: true,
+				});
+				options?.onPreflightAccepted?.();
+				return;
+			}
+
+			// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
+			let queuedPromotionFired = false;
+			const fireQueuedPromotion = () => {
+				if (!freshAtReservation || queuedPromotionFired) return;
+				queuedPromotionFired = true;
+				options?.onQueuedPromoted?.();
+			};
+			await this.prompt(text, {
+				expandPromptTemplates: false,
+				images,
+				onPreflightAccepted: () => {
+					options?.onPreflightAccepted?.();
+					fireQueuedPromotion();
+				},
+				onPreflightAcceptCommit:
+					options?.onPreflightAcceptCommit || freshAtReservation
+						? async () => {
+								if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+								else options?.onPreflightAccepted?.();
+								assertPreflightStillOpen();
+								fireQueuedPromotion();
+							}
+						: undefined,
+				preflightSignal: options?.preflightSignal,
+			});
+		} finally {
+			releaseFollowUpReservation();
+		}
 	}
 
 	/**
@@ -13605,7 +13614,6 @@ export class AgentSession {
 		this.#selectionFenceGeneration += 1;
 		this.#pendingSelectionFences += 1;
 		const selectionFenceGeneration = this.#selectionFenceGeneration;
-		this.#activeSelectionFenceGeneration = selectionFenceGeneration;
 		this.#selectionFenceTail = priorSelectionFence.then(() => selectionFence.promise);
 		void this.#selectionFenceTail.catch(() => {});
 		try {
@@ -13722,9 +13730,10 @@ export class AgentSession {
 		} finally {
 			selectionFence.resolve();
 			this.#pendingSelectionFences -= 1;
-			if (this.#activeSelectionFenceGeneration === selectionFenceGeneration) {
-				this.#activeSelectionFenceGeneration = undefined;
+			if (selectionFenceGeneration > this.#settledSelectionFenceGeneration) {
+				this.#settledSelectionFenceGeneration = selectionFenceGeneration;
 			}
+			this.#resolveSessionSettlement();
 		}
 	}
 	/**

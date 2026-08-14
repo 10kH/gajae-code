@@ -855,6 +855,52 @@ describe("AgentSession auto-compaction continuation", () => {
 		expect(order).toEqual(["selection", "continuation"]);
 		expect(session.model).toBe(selectionModel);
 	});
+	it("does not deadlock when a second selection reserves while a continuation waits behind the first", async () => {
+		const currentModel = session.model;
+		if (!currentModel) throw new Error("Expected session model");
+		const firstModel = { ...currentModel, id: "overlapping-selection-one" };
+		const secondModel = { ...currentModel, id: "overlapping-selection-two" };
+		const firstValidationStarted = Promise.withResolvers<void>();
+		const releaseFirstValidation = Promise.withResolvers<void>();
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, ...args) => {
+			if (model === firstModel) {
+				firstValidationStarted.resolve();
+				await releaseFirstValidation.promise;
+			}
+			return originalGetApiKey(model, ...args);
+		});
+		const order: string[] = [];
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("continuation");
+		});
+		// Selection A reserves generation 1 and parks inside credential probing.
+		const first = session.setDefaultModelSelection(firstModel, undefined, {
+			onAfterMutation: () => order.push("selection-one"),
+		});
+		await firstValidationStarted.promise;
+		// A continuation defers behind A's fence.
+		const message = assistantMessage();
+		sessionManager.appendMessage(message);
+		session.agent.emitExternalEvent({ type: "message_end", message });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
+		for (let i = 0; i < 10; i++) await Promise.resolve();
+		// Selection B reserves generation 2 while A is still parked and the
+		// generation-1 continuation is still deferred behind A's fence.
+		const second = session.setDefaultModelSelection(secondModel, undefined, {
+			onAfterMutation: () => order.push("selection-two"),
+		});
+		releaseFirstValidation.resolve();
+
+		await Promise.all([first, second]);
+		await session.waitForIdle();
+
+		expect(promptSpy).toHaveBeenCalledTimes(1);
+		expect(order).toContain("selection-one");
+		expect(order).toContain("selection-two");
+		expect(order).toContain("continuation");
+		expect(session.model).toBe(secondModel);
+	});
 
 	it("reschedules an AgentBusyError racing the queued-followup continue until delivery", async () => {
 		session.agent.followUp({
