@@ -1,4 +1,4 @@
-import * as fs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
@@ -204,16 +204,27 @@ export async function findRunningChromeProfile(
 interface ProfileProcessScanOptions {
 	platform?: NodeJS.Platform;
 	linuxPids?: readonly number[];
+	linuxExecutablePaths?: ReadonlyMap<number, string>;
 }
 
-function liveLinuxPids(): number[] {
+async function liveLinuxPids(): Promise<number[]> {
 	try {
-		return fs
-			.readdirSync("/proc", { withFileTypes: true })
+		const entries = await fs.readdir("/proc", { withFileTypes: true });
+		return entries
 			.filter(entry => entry.isDirectory() && /^\d+$/.test(entry.name))
 			.map(entry => Number.parseInt(entry.name, 10));
 	} catch {
 		return [];
+	}
+}
+
+async function linuxExecutablePath(pid: number, options: ProfileProcessScanOptions): Promise<string | null> {
+	const injected = options.linuxExecutablePaths?.get(pid);
+	if (injected) return injected;
+	try {
+		return await fs.readlink(`/proc/${pid}/exe`);
+	} catch {
+		return null;
 	}
 }
 
@@ -226,14 +237,14 @@ async function findRunningChromeProfileWithOptions(
 	const bindings = nativeProcessBindings();
 	const candidates = bindings.Process.fromPath(exe).filter(p => p.status() === bindings.ProcessStatus.Running);
 	const seenPids = new Set(candidates.map(candidate => candidate.pid));
-	const fallbackPids = new Set<number>();
 	if ((options.platform ?? process.platform) === "linux" && candidates.length === 0) {
-		for (const pid of options.linuxPids ?? liveLinuxPids()) {
+		for (const pid of options.linuxPids ?? (await liveLinuxPids())) {
 			if (seenPids.has(pid)) continue;
 			const candidate = bindings.Process.fromPid(pid);
 			if (!candidate || candidate.status() !== bindings.ProcessStatus.Running) continue;
+			const executablePath = await linuxExecutablePath(pid, options);
+			if (!executablePath || !isChromeProfileExecutable(executablePath)) continue;
 			seenPids.add(pid);
-			fallbackPids.add(pid);
 			candidates.push(candidate);
 		}
 	}
@@ -245,7 +256,6 @@ async function findRunningChromeProfileWithOptions(
 			continue;
 		}
 		if (!argsMatchChromeProfile(args, profile)) continue;
-		if (fallbackPids.has(proc.pid) && !isChromeProfileExecutable(args[0] ?? "")) continue;
 		const port = findCdpPortInArgs(args);
 		if (port !== null) {
 			const address = findCdpAddressInArgs(args);

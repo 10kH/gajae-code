@@ -430,7 +430,11 @@ describe("Chrome profile browser mode (#809)", () => {
 			findRunningChromeProfileForTest(
 				"/usr/bin/google-chrome",
 				{ userDataDir: "/tmp/gjc-chrome", profileDirectory: "Default" },
-				{ platform: "linux", linuxPids: [321] },
+				{
+					platform: "linux",
+					linuxPids: [321],
+					linuxExecutablePaths: new Map([[321, "/opt/google/chrome/chrome"]]),
+				},
 			),
 		).resolves.toEqual({ pid: 321, cdpUrl: "http://127.0.0.1:9222" });
 	});
@@ -441,7 +445,7 @@ describe("Chrome profile browser mode (#809)", () => {
 			pid: 654,
 			status: () => ProcessStatus.Running,
 			args: () => [
-				"/usr/bin/brave-browser",
+				"/opt/google/chrome/chrome",
 				"--user-data-dir=/tmp/gjc-chrome",
 				"--profile-directory=Default",
 				"--remote-debugging-port=9222",
@@ -453,7 +457,11 @@ describe("Chrome profile browser mode (#809)", () => {
 			findRunningChromeProfileForTest(
 				"/snap/bin/chromium",
 				{ userDataDir: "/tmp/gjc-chrome", profileDirectory: "Default" },
-				{ platform: "linux", linuxPids: [654] },
+				{
+					platform: "linux",
+					linuxPids: [654],
+					linuxExecutablePaths: new Map([[654, "/usr/bin/brave-browser"]]),
+				},
 			),
 		).resolves.toBeNull();
 		expect(fetchSpy).not.toHaveBeenCalled();
