@@ -269,7 +269,16 @@ describe("Chrome profile browser mode (#809)", () => {
 			{
 				platform: "linux" as const,
 				home: "/home/u",
-				expectedChannels: ["google-chrome", "google-chrome-beta", "google-chrome-unstable", "chromium"],
+				expectedChannels: [
+					"google-chrome",
+					"google-chrome-beta",
+					"google-chrome-unstable",
+					"chromium",
+					"com.google.Chrome",
+					"org.chromium.Chromium",
+					"snap/chromium/common/chromium",
+					"snap/chromium/current/.config/chromium",
+				],
 			},
 		];
 

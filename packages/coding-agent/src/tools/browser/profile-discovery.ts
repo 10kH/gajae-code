@@ -56,6 +56,10 @@ export function chromeUserDataRoots(env: DiscoveryEnv): string[] {
 				platformPath.join(configHome, "google-chrome-beta"),
 				platformPath.join(configHome, "google-chrome-unstable"),
 				platformPath.join(configHome, "chromium"),
+				platformPath.join(env.home, ".var", "app", "com.google.Chrome", "config", "google-chrome"),
+				platformPath.join(env.home, ".var", "app", "org.chromium.Chromium", "config", "chromium"),
+				platformPath.join(env.home, "snap", "chromium", "common", "chromium"),
+				platformPath.join(env.home, "snap", "chromium", "current", ".config", "chromium"),
 			];
 		}
 	}

@@ -32,6 +32,10 @@ describe("profile-discovery", () => {
 			"/home/x/.config/google-chrome-beta",
 			"/home/x/.config/google-chrome-unstable",
 			"/home/x/.config/chromium",
+			"/home/x/.var/app/com.google.Chrome/config/google-chrome",
+			"/home/x/.var/app/org.chromium.Chromium/config/chromium",
+			"/home/x/snap/chromium/common/chromium",
+			"/home/x/snap/chromium/current/.config/chromium",
 		]);
 		expect(
 			chromeUserDataRoots({
@@ -48,6 +52,10 @@ describe("profile-discovery", () => {
 			"/srv/chrome-config/google-chrome-beta",
 			"/srv/chrome-config/google-chrome-unstable",
 			"/srv/chrome-config/chromium",
+			"/home/x/.var/app/com.google.Chrome/config/google-chrome",
+			"/home/x/.var/app/org.chromium.Chromium/config/chromium",
+			"/home/x/snap/chromium/common/chromium",
+			"/home/x/snap/chromium/current/.config/chromium",
 		]);
 		expect(chromeUserDataRoots(env({ platform: "darwin", home: "/Users/x", existing: [] }))).toEqual([
 			"/Users/x/Library/Application Support/Google/Chrome",
