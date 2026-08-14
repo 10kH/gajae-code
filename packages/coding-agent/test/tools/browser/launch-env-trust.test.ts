@@ -25,6 +25,10 @@ const BROWSER_KEYS = [
 	"PUPPETEER_PROXY",
 	"PUPPETEER_PROXY_BYPASS_LOOPBACK",
 	"PUPPETEER_PROXY_IGNORE_CERT_ERRORS",
+	"LOCALAPPDATA",
+	"CHROME_USER_DATA_DIR",
+	"CHROME_CONFIG_HOME",
+	"XDG_CONFIG_HOME",
 ] as const;
 
 interface BrowserEnvOverrides {
@@ -32,6 +36,12 @@ interface BrowserEnvOverrides {
 	proxy: string | undefined;
 	proxyBypassLoopback: boolean;
 	ignoreCertErrors: boolean;
+	profileEnv: {
+		localAppData?: string;
+		chromeUserDataDir?: string;
+		chromeConfigHome?: string;
+		xdgConfigHome?: string;
+	};
 }
 
 const tempDirs: string[] = [];
@@ -83,6 +93,7 @@ describe("browser launch env trust boundary", () => {
 			proxy: undefined,
 			proxyBypassLoopback: false,
 			ignoreCertErrors: false,
+			profileEnv: {},
 		});
 	});
 
@@ -119,5 +130,27 @@ describe("browser launch env trust boundary", () => {
 		expect((await resolveIn(cwd, { PUPPETEER_EXECUTABLE_PATH: "/opt/chrome/chrome" })).executablePath).toBe(
 			"/opt/chrome/chrome",
 		);
+	});
+
+	it("ignores profile discovery roots planted by the project .env", async () => {
+		const cwd = projectDir(
+			"LOCALAPPDATA=/repo/windows\nCHROME_USER_DATA_DIR=/repo/data\nCHROME_CONFIG_HOME=/repo/chrome\nXDG_CONFIG_HOME=/repo/xdg\n",
+		);
+		expect((await resolveIn(cwd)).profileEnv).toEqual({});
+	});
+
+	it("honors profile discovery roots inherited from the launching shell", async () => {
+		const resolved = await resolveIn(projectDir(), {
+			LOCALAPPDATA: "/trusted/windows",
+			CHROME_USER_DATA_DIR: "/trusted/data",
+			CHROME_CONFIG_HOME: "/trusted/chrome",
+			XDG_CONFIG_HOME: "/trusted/xdg",
+		});
+		expect(resolved.profileEnv).toEqual({
+			localAppData: "/trusted/windows",
+			chromeUserDataDir: "/trusted/data",
+			chromeConfigHome: "/trusted/chrome",
+			xdgConfigHome: "/trusted/xdg",
+		});
 	});
 });

@@ -10,6 +10,7 @@
 
 import * as os from "node:os";
 import * as path from "node:path";
+import { $credentialEnv } from "@gajae-code/utils/env";
 
 export interface DiscoveryEnv {
 	platform: NodeJS.Platform;
@@ -96,13 +97,17 @@ export function discoverDefaultChromeProfile(
 
 /** Convenience wrapper using the live OS environment + fs. */
 export function defaultDiscoveryEnv(exists: (p: string) => boolean): DiscoveryEnv {
+	const localAppData = $credentialEnv("LOCALAPPDATA");
+	const chromeUserDataDir = $credentialEnv("CHROME_USER_DATA_DIR");
+	const chromeConfigHome = $credentialEnv("CHROME_CONFIG_HOME");
+	const xdgConfigHome = $credentialEnv("XDG_CONFIG_HOME");
 	return {
 		platform: process.platform,
 		home: os.homedir(),
 		exists,
-		...(process.env.LOCALAPPDATA ? { localAppData: process.env.LOCALAPPDATA } : {}),
-		...(process.env.CHROME_USER_DATA_DIR ? { chromeUserDataDir: process.env.CHROME_USER_DATA_DIR } : {}),
-		...(process.env.CHROME_CONFIG_HOME ? { chromeConfigHome: process.env.CHROME_CONFIG_HOME } : {}),
-		...(process.env.XDG_CONFIG_HOME ? { xdgConfigHome: process.env.XDG_CONFIG_HOME } : {}),
+		...(localAppData ? { localAppData } : {}),
+		...(chromeUserDataDir ? { chromeUserDataDir } : {}),
+		...(chromeConfigHome ? { chromeConfigHome } : {}),
+		...(xdgConfigHome ? { xdgConfigHome } : {}),
 	};
 }
