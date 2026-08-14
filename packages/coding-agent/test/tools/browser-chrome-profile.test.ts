@@ -74,6 +74,13 @@ describe("Chrome profile browser mode (#809)", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("never treats Edge as the Chrome binary for saved-profile mode", () => {
+		expect(launch.isEdgeExecutable("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge")).toBe(true);
+		expect(launch.isEdgeExecutable("C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe")).toBe(true);
+		expect(launch.isEdgeExecutable("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")).toBe(false);
+		expect(launch.isEdgeExecutable("/usr/bin/chromium")).toBe(false);
+	});
+
 	it("parses Chromium CDP and profile argv forms", () => {
 		expect(findCdpPortInArgsForTest(["--remote-debugging-port=9222"])).toBe(9222);
 		expect(findCdpPortInArgsForTest(["--remote-debugging-port", "9223"])).toBe(9223);
@@ -157,7 +164,7 @@ describe("Chrome profile browser mode (#809)", () => {
 	});
 
 	it("defaults chrome profile mode to the installed Chrome and its discovered default profile", () => {
-		vi.spyOn(launch, "resolveSystemChromium").mockReturnValue("/usr/bin/google-chrome");
+		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
 		const discover = vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue({
 			userDataDir: "/home/u/.config/google-chrome",
 			profileDirectory: "Default",
@@ -179,7 +186,7 @@ describe("Chrome profile browser mode (#809)", () => {
 	});
 
 	it("discovers the user data dir for an explicitly requested profile directory", () => {
-		vi.spyOn(launch, "resolveSystemChromium").mockReturnValue("/usr/bin/google-chrome");
+		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
 		const discover = vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue({
 			userDataDir: "/home/u/.config/google-chrome",
 			profileDirectory: "Profile 10",
@@ -199,7 +206,7 @@ describe("Chrome profile browser mode (#809)", () => {
 	});
 
 	it("errors with remediation when no Chrome binary is installed", () => {
-		vi.spyOn(launch, "resolveSystemChromium").mockReturnValue(undefined);
+		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue(undefined);
 
 		expect(() =>
 			resolveBrowserKindForTest({ action: "open", app: { browser: "chrome" } }, makeSession("/work")),
@@ -207,7 +214,7 @@ describe("Chrome profile browser mode (#809)", () => {
 	});
 
 	it("errors with remediation when the requested profile is not under the default roots", () => {
-		vi.spyOn(launch, "resolveSystemChromium").mockReturnValue("/usr/bin/google-chrome");
+		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
 		vi.spyOn(profileDiscovery, "discoverDefaultChromeProfile").mockReturnValue(null);
 
 		expect(() =>

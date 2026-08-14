@@ -250,21 +250,45 @@ function systemChromiumCandidates(): string[] {
 	return candidates;
 }
 
-/** Installed Chrome/Chromium executable, or undefined when none is present. */
-export function resolveSystemChromium(): string | undefined {
-	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
+function firstExecutableCandidate(candidates: string[], accept: (candidate: string) => boolean): string | undefined {
 	const seen = new Set<string>();
-	for (const candidate of systemChromiumCandidates()) {
+	for (const candidate of candidates) {
 		if (!candidate || seen.has(candidate)) continue;
 		seen.add(candidate);
-		if (isExecutableFile(candidate)) {
-			resolvedChromium = candidate;
-			logger.debug("Using system Chrome/Chromium", { path: candidate });
-			return candidate;
-		}
+		if (accept(candidate) && isExecutableFile(candidate)) return candidate;
 	}
-	resolvedChromium = null;
 	return undefined;
+}
+
+function resolveSystemChromium(): string | undefined {
+	if (resolvedChromium !== undefined) return resolvedChromium ?? undefined;
+	const found = firstExecutableCandidate(systemChromiumCandidates(), () => true);
+	resolvedChromium = found ?? null;
+	if (found) logger.debug("Using system Chrome/Chromium", { path: found });
+	return found;
+}
+
+/** Edge is Chromium-based but keeps its own profile format under its own user data root. */
+const EDGE_EXECUTABLE_PATTERN = /(?:^|[/\\])(?:msedge(?:\.exe)?|Microsoft Edge(?: Beta| Dev| Canary)?)$/;
+
+/** True for a Microsoft Edge executable path (excluded from Chrome profile mode). */
+export function isEdgeExecutable(candidate: string): boolean {
+	return EDGE_EXECUTABLE_PATTERN.test(candidate);
+}
+
+let resolvedProfileChrome: string | null | undefined; // undefined = unchecked; null = not found
+
+/**
+ * Installed Chrome/Chromium executable for saved-profile mode, or undefined when
+ * none is present. Edge is excluded on purpose: a discovered Chrome user data
+ * directory must never be opened by a different browser brand.
+ */
+export function resolveSystemChromeForProfile(): string | undefined {
+	if (resolvedProfileChrome !== undefined) return resolvedProfileChrome ?? undefined;
+	const found = firstExecutableCandidate(systemChromiumCandidates(), candidate => !isEdgeExecutable(candidate));
+	resolvedProfileChrome = found ?? null;
+	if (found) logger.debug("Using system Chrome/Chromium for profile mode", { path: found });
+	return found;
 }
 
 export interface LaunchHeadlessOptions {

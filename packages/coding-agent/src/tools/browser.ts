@@ -5,7 +5,7 @@ import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
-import { resolveSystemChromium } from "./browser/launch";
+import { resolveSystemChromeForProfile } from "./browser/launch";
 import { defaultDiscoveryEnv, discoverDefaultChromeProfile } from "./browser/profile-discovery";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
@@ -136,7 +136,7 @@ export function resolveBrowserKindForTest(params: BrowserParams, session: ToolSe
  */
 function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, session: ToolSession): BrowserKind {
 	const profileDirectory = app.profile_directory ?? "Default";
-	const exe = app.path ? resolveToCwd(app.path, session.cwd) : resolveSystemChromium();
+	const exe = app.path ? resolveToCwd(app.path, session.cwd) : resolveSystemChromeForProfile();
 	if (!exe) {
 		throw new ToolError(
 			'No Chrome/Chromium executable found for app.browser "chrome". Install Chrome, or pass app.path with the binary path.',
