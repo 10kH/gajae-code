@@ -42,8 +42,18 @@ Current retryable inputs are regex/string-classified:
 - provider-suggested retry wording, including OpenAI `retry your request` failures
 - network/connection/socket failures, refused/closed connections, upstream connect/reset-before-headers, socket hang up, timeout/timed out, fetch failed, terminated, retry delay wording, and unexpected socket close messages
 - canonical idle-stream watchdog stalls (`stream stalled while waiting for the next event`); in the legacy single-model path these remain retryable but use the bounded `retry.maxRetries` budget
+- local snapshot failures (`errorKind: "local_snapshot_failure"`, or the stable `Managed fallback attempt could not produce a serializable event snapshot` message prefix for restored sessions): the staged managed attempt was discarded before publication, so a content-free same-model re-issue is replay-safe
 
 Managed fallback uses structured transport facts and typed provider error codes when available. A structured classification of `other` becomes the bounded `unknown` fallback class; error prose cannot promote it to quota or transient. Regex classification is retained only as a legacy fallback.
+
+### Local snapshot failures (bounded same-model session retry)
+
+`local_snapshot_failure` is a local machinery fault, not provider evidence, so it gets a dedicated session retry class that deliberately bypasses the managed provider-fallback chain:
+
+- Bounded by `retry.maxRetries` (same budget in managed and single-model paths); on exhaustion the original local diagnostic surfaces unchanged.
+- Never charges the fallback controller (the started attempt's provisional charge is discarded), never advances models, never emits `model_fallback_switched`, and never mutates or rotates credentials.
+- Only content-free failures are eligible; a failure that carries visible or tool content surfaces immediately.
+- `retry.enabled: false` disables this retry even when a managed fallback chain is configured — the managed chain keeps its own availability policy, but the local-snapshot path is a session retry governed by `retry.*` settings.
 
 ## Retry lifecycle and state transitions
 
@@ -57,7 +67,7 @@ Session state used by retry:
 Flow (`#handleRetryableError`):
 
 1. Read `retry` settings group.
-2. If `retry.enabled === false`, stop immediately (`false`, no retry started).
+2. If `retry.enabled === false`, stop immediately (`false`, no retry started). This opt-out also covers local snapshot failures on managed chains; other managed provider-fallback failures keep their own chain policy.
 3. Increment `#retryAttempt`.
 4. Create `#retryPromise` once (first attempt in a chain).
 5. In the legacy single-model path, ordinary transient errors retry without an attempt limit, while canonical idle-stream watchdog stalls and unknown/no-code errors stop after `retry.maxRetries`. Managed fallback instead uses its controller's per-entry `fallback.maxAttempts` budget.

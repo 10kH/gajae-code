@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Managed fallback local snapshot failures now auto-recover with a bounded same-model retry (capped at `retry.maxRetries`) instead of terminating the turn: the discarded attempt is replay-safe and content-free, so the session re-issues the request without charging the provider fallback chain, advancing models, or mutating credentials. Exhausted retries still surface the explicit local diagnostic.
+
 - Fixed ACP `session/delete` retries so a durable artifact `cleanup_pending` result remains authoritative instead of re-closing the already-terminated session and misclassifying an unreaped Linux zombie as unverifiable SIGKILL uncertainty. Broker close now recognizes an identity-matching zombie as exited without weakening PID-reuse checks, and repeated deletes resume the authorized cleanup receipt idempotently.
 
 - Added `/extensions`, an interactive project/global `.gjc` manager for skills, hooks, MCPs, and explicit Claude Code/Codex imports with redacted previews and atomic rollback.

@@ -1010,6 +1010,7 @@ describe("managed attempt transaction", () => {
 		});
 		expect(outcomes).toBe(0);
 		expect(agent.state.error).toContain("local snapshot");
+		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_snapshot_failure");
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
 	});
 	it("normalizes null and incomplete tool-call blocks before managed dispatch", async () => {

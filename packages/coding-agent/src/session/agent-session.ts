@@ -1039,6 +1039,7 @@ type RetryErrorClassification =
 	| "empty_response"
 	| "transient"
 	| "local_unavailable"
+	| "local_snapshot"
 	| "unknown";
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
@@ -16986,7 +16987,8 @@ export class AgentSession {
 				classification === "transient" ||
 				classification === "unknown" ||
 				classification === "first_event_timeout" ||
-				classification === "empty_response"
+				classification === "empty_response" ||
+				classification === "local_snapshot"
 			);
 		}
 		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
@@ -17006,7 +17008,12 @@ export class AgentSession {
 			return true;
 		}
 		const classification = this.#classifyErrorForRetry(message);
-		return classification === "transient" || classification === "unknown" || classification === "first_event_timeout";
+		return (
+			classification === "transient" ||
+			classification === "unknown" ||
+			classification === "first_event_timeout" ||
+			classification === "local_snapshot"
+		);
 	}
 
 	#isTransientErrorMessage(errorMessage: string): boolean {
@@ -17096,10 +17103,16 @@ export class AgentSession {
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
+		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
 		if (this.#isTypedEmptyResponse(message)) return "empty_response";
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
+		// Managed-attempt snapshot failures from restored sessions may lack the
+		// typed error kind; match the stable message prefix as a fallback.
+		if (err.startsWith("Managed fallback attempt could not produce a serializable event snapshot")) {
+			return "local_snapshot";
+		}
 		// Provider safety refusals (e.g. Anthropic stop_reason "refusal" /
 		// "sensitive") are deterministic for the submitted context: replaying
 		// the identical conversation re-triggers the identical refusal, so an
@@ -17593,10 +17606,40 @@ export class AgentSession {
 			this.settings.has("retry.maxRetries") ||
 			this.settings.has("retry.baseDelayMs") ||
 			this.settings.has("retry.maxDelayMs");
-		// retry.enabled=false always surfaces immediately, matching the explicit
-		// user opt-out.
-		if (!managedFallback && !retrySettings.enabled) return false;
 		const classification = this.#classifyErrorForRetry(message);
+		const localSnapshot = classification === "local_snapshot";
+		// A local machinery failure must never stay charged against the provider
+		// fallback budget, no matter which local exit follows (disabled retry,
+		// visible-content surface, bounded retry, or exhaustion). Discard the
+		// started attempt's provisional charge up front; the discard is a no-op
+		// when no attempt is currently charged.
+		if (localSnapshot && managedFallback) controller.discardStartedAttempt();
+		// retry.enabled=false always surfaces immediately, matching the explicit
+		// user opt-out. The managed provider-fallback chain keeps its own
+		// availability policy, but the local-snapshot path is a session retry
+		// governed by retry.* settings, so the opt-out applies to it even when a
+		// managed chain is configured.
+		if (!retrySettings.enabled && (!managedFallback || localSnapshot)) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
+		}
+		// Local snapshot-machinery failure: the staged attempt was discarded
+		// before anything was published, so a content-free same-model re-issue is
+		// replay-safe. It deliberately carries no transport facts, so it must
+		// never charge the fallback chain, advance models, or mutate credentials
+		// — bounded local retry only, then surface the explicit local diagnostic.
+		if (localSnapshot && assistantMessageHasVisibleOrToolContent(message)) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
+		}
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
 		// Content-free message-only watchdog prose (wrapped canonical or bare
@@ -17630,7 +17673,11 @@ export class AgentSession {
 					}
 				: false;
 		}
-		const trigger = this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
+		const trigger:
+			| { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition }
+			| undefined = localSnapshot
+			? { class: "unknown" }
+			: this.#fallbackTriggerFor(message, !managedFallback, transportFailure);
 		if (!trigger) {
 			return managedOutcome
 				? this.#managedFallbackExhaustionDecision(message, message.errorMessage || "Model fallback attempt failed")
@@ -17665,7 +17712,13 @@ export class AgentSession {
 		// first-event timeout adds the typed, content-free, current-clean-scope
 		// requirement above; other transient watchdogs preserve legacy behavior.
 		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
-		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
+		if (
+			!managedFallback &&
+			!legacyRetryConfigured &&
+			!localSnapshot &&
+			!canReplayRotatedCredential &&
+			!canReplayEmptyResponse
+		) {
 			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
 			const canReplayCodexOverload = bareDefaultCodexOverload;
 			if (
@@ -17687,13 +17740,19 @@ export class AgentSession {
 			!managedFallback &&
 			classification === "transient" &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
-		const attemptsUsed = managedFallback ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
+		const attemptsUsed = managedFallback && !localSnapshot ? controller.attemptsUsed || 1 : this.#retryAttempt + 1;
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
-		let outcome = managedFallback
-			? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
-			: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
-				? "retry"
-				: "exhausted";
+		let outcome: "retry" | "advance" | "exhausted";
+		if (localSnapshot) {
+			// The provisional charge was already discarded at classification time.
+			outcome = attemptsUsed <= retrySettings.maxRetries ? "retry" : "exhausted";
+		} else {
+			outcome = managedFallback
+				? controller.onAttemptFailure(trigger.class, message.errorMessage || "Unknown error")
+				: legacyUnbounded || attemptsUsed <= retrySettings.maxRetries
+					? "retry"
+					: "exhausted";
+		}
 		// Credential rotation is unbounded: a fresh credential is a different
 		// retry dimension from transient-error backoff, so it overrides maxRetries
 		// exhaustion and forces an immediate same-model retry.
@@ -17712,6 +17771,16 @@ export class AgentSession {
 			}
 		}
 		if (outcome === "exhausted") {
+			if (localSnapshot) {
+				// Bounded local retries exhausted: surface the original local
+				// diagnostic without any provider-fallback attribution.
+				return managedOutcome
+					? {
+							type: "terminal",
+							terminal: { stopReason: "error", messages: [message] },
+						}
+					: false;
+			}
 			if (managedFallback) {
 				const errorMessage = this.#fallbackExhaustionError(controller);
 				this.emitNotice("error", errorMessage, "fallback");
@@ -17787,11 +17856,12 @@ export class AgentSession {
 				await this.#emitSessionEvent({
 					type: "auto_retry_start",
 					attempt: this.#retryAttempt,
-					maxAttempts: managedFallback
-						? controller.maxAttempts
-						: firstEventTimeout
-							? retrySettings.maxRetries + 1
-							: retrySettings.maxRetries,
+					maxAttempts:
+						managedFallback && !localSnapshot
+							? controller.maxAttempts
+							: firstEventTimeout
+								? retrySettings.maxRetries + 1
+								: retrySettings.maxRetries,
 					delayMs,
 					errorMessage,
 					unbounded: managedFallback ? false : legacyUnbounded,

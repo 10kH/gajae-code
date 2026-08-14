@@ -112,9 +112,14 @@ class ManagedAttemptBufferOverflowError extends Error {
 /**
  * Local snapshot-machinery failure. Deliberately carries no transport facts
  * or status, so managed fallback classification never treats it as a provider
- * retry trigger — it fails fast instead of burning the fallback chain.
+ * retry trigger — it never burns the fallback chain, advances models, or
+ * mutates credentials. The typed `local_snapshot_failure` kind lets session
+ * retry policy recover it as a bounded same-model retry instead: the staged
+ * attempt was discarded before publication, so a content-free re-issue is
+ * replay-safe and, in practice, a fresh stream clears the failure.
  */
 class ManagedAttemptSnapshotError extends Error {
+	readonly errorKind = "local_snapshot_failure" as const;
 	constructor() {
 		super(
 			"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
@@ -300,6 +305,7 @@ function managedContextOverflowOutcome(message: AssistantMessage, scope?: Attemp
 function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
 	const errorMessage = managedProperty(error, "message");
 	const transportFailure = managedTransportFailure(error);
+	const errorKind = managedProperty(error, "errorKind");
 	let fallbackMessage = "Managed fallback attempt failed";
 	if (typeof errorMessage === "string") fallbackMessage = errorMessage;
 	else {
@@ -326,6 +332,7 @@ function managedFailureMessage(error: unknown, config: AgentLoopConfig): Assista
 		stopReason: "error",
 		errorMessage: fallbackMessage,
 		...(transportFailure ? { transportFailure } : {}),
+		...(errorKind === "local_snapshot_failure" ? { errorKind: "local_snapshot_failure" as const } : {}),
 		timestamp: Date.now(),
 	};
 }

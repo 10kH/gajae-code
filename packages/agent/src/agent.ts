@@ -1976,6 +1976,7 @@ export class Agent {
 				stopReason: abortController.signal.aborted ? "aborted" : "error",
 				errorMessage: err?.message || String(err),
 				errorStatus: extractHttpStatusFromError({ status: err?.errorStatus }) ?? extractHttpStatusFromError(err),
+				...(err?.errorKind === "local_snapshot_failure" ? { errorKind: "local_snapshot_failure" as const } : {}),
 				timestamp: Date.now(),
 			} as AgentMessage;
 

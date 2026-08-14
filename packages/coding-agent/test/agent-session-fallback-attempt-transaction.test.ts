@@ -93,6 +93,62 @@ function typedFirstEventTimeoutStream(model: Model): AssistantMessageEventStream
 	});
 	return stream;
 }
+function collapsedSnapshotStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const collapsed = new Proxy(message, {
+			get() {
+				throw new Error("collapsed root");
+			},
+		});
+		stream.push({ type: "start", partial: collapsed });
+	});
+	return stream;
+}
+function prefixSnapshotErrorStream(model: Model, content: AssistantMessage["content"]): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			content,
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorMessage:
+				"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
+		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
 
 function zeroTokenEmptyStopStream(model: Model): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
@@ -254,7 +310,13 @@ describe("AgentSession managed fallback attempt transaction", () => {
 	function createSession(
 		streamFn: AgentOptions["streamFn"],
 		maxAttempts = 3,
-		options: { tools?: AgentTool[]; handler?: "context" | "message_end"; onHandler?: () => void } = {},
+		options: {
+			tools?: AgentTool[];
+			handler?: "context" | "message_end";
+			onHandler?: () => void;
+			settings?: Record<string, unknown>;
+			singleModelChain?: boolean;
+		} = {},
 	): { agent: Agent; primary: Model; fallback: Model } {
 		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallback = getBundledModel("openai", "gpt-4o-mini");
@@ -277,6 +339,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			"compaction.enabled": false,
 			"fallback.maxAttempts": maxAttempts,
 			"retry.baseDelayMs": 1,
+			...options.settings,
 		});
 		settings.setModelRole("default", selector(primary));
 		session = new AgentSession({
@@ -286,7 +349,11 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			modelRegistry,
 			extensionRunner,
 		});
-		session.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
+		session.setConfiguredModelChain(
+			"default",
+			options.singleModelChain ? [selector(primary)] : [selector(primary), selector(fallback)],
+			"test",
+		);
 		return { agent, primary, fallback };
 	}
 
@@ -704,6 +771,156 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(events.filter(event => event.type === "agent_end")).toHaveLength(1);
 		expect(session.messages).toHaveLength(2);
 		expect(session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+	});
+	it("auto-recovers a local snapshot failure with a bounded same-model retry", async () => {
+		let calls = 0;
+		createSession((model, context, options) => {
+			calls += 1;
+			if (calls === 1) return collapsedSnapshotStream(model);
+			return createMockModel({ responses: [{ content: ["recovered after snapshot failure"] }] }).stream(
+				model,
+				context,
+				options,
+			);
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("trigger the local snapshot failure"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toBe(2);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
+		// A local machinery failure must never advance the provider fallback chain.
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "recovered after snapshot failure" }],
+		});
+	});
+	it("honors retry.enabled=false for local snapshot failures on a managed chain", async () => {
+		let calls = 0;
+		createSession(
+			model => {
+				calls += 1;
+				return collapsedSnapshotStream(model);
+			},
+			3,
+			{ settings: { "retry.enabled": false } },
+		);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("disabled retry must surface immediately"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toBe(1);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: expect.stringContaining("local snapshot bug"),
+		});
+		// The local failure must not leave the provider fallback budget charged.
+		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
+			activeIndex: 0,
+			attemptsUsed: 0,
+			totalAttemptsUsed: 0,
+			tried: [],
+		});
+	});
+	it("does not retry a snapshot failure that carries visible content", async () => {
+		let calls = 0;
+		createSession(model => {
+			calls += 1;
+			return prefixSnapshotErrorStream(model, [{ type: "text", text: "partial output" }]);
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("content-bearing snapshot failure"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toBe(1);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: expect.stringContaining("local snapshot bug"),
+		});
+		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
+			activeIndex: 0,
+			attemptsUsed: 0,
+			totalAttemptsUsed: 0,
+			tried: [],
+		});
+	});
+	it("auto-recovers a prefix-classified snapshot failure on a single-model session", async () => {
+		let calls = 0;
+		createSession(
+			(model, context, options) => {
+				calls += 1;
+				if (calls === 1) return prefixSnapshotErrorStream(model, []);
+				return createMockModel({ responses: [{ content: ["single-model recovery"] }] }).stream(
+					model,
+					context,
+					options,
+				);
+			},
+			3,
+			{ singleModelChain: true },
+		);
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("single-model snapshot failure"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toBe(2);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(1);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "single-model recovery" }],
+		});
+	});
+	it("surfaces the local diagnostic after bounded snapshot-failure retries without provider fallback", async () => {
+		let calls = 0;
+		createSession(model => {
+			calls += 1;
+			return collapsedSnapshotStream(model);
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("trigger persistent local snapshot failures"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		// Initial attempt + retry.maxRetries (default 3) bounded retries.
+		expect(calls).toBe(4);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(3);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorKind: "local_snapshot_failure",
+			errorMessage: expect.stringContaining("local snapshot bug"),
+		});
+		// Every bounded local retry must have discharged its provisional charge.
+		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
+			activeIndex: 0,
+			attemptsUsed: 0,
+			totalAttemptsUsed: 0,
+			tried: [],
+		});
 	});
 	it("settles a rejected managed continuation without duplicate terminal events", async () => {
 		const { agent } = createSession(model => failedStream(model));
