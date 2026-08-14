@@ -137,6 +137,7 @@ async function probeCdpAt(port: number, signal?: AbortSignal): Promise<boolean> 
 		await res.body?.cancel();
 		return res.ok;
 	} catch {
+		throwIfAborted(signal);
 		return false;
 	}
 }
@@ -183,6 +184,7 @@ export async function findReusableCdp(
 		if (await probeCdpAt(port, signal)) {
 			return { cdpUrl: `http://127.0.0.1:${port}`, pid: proc.pid };
 		}
+		throwIfAborted(signal);
 	}
 	return null;
 }
@@ -272,6 +274,7 @@ async function findRunningChromeProfileWithOptions(
 			if (await probeCdpAt(port, signal)) {
 				return { pid: proc.pid, cdpUrl: `http://127.0.0.1:${port}` };
 			}
+			throwIfAborted(signal);
 		}
 		return { pid: proc.pid, cdpUrl: null };
 	}
