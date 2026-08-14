@@ -2442,6 +2442,7 @@ export class AgentSession {
 	/** Test-only abort outcome override for cancel-and-submit rollback coverage. */
 	#cancelAndSubmitAbortOutcomeProviderForTests: (() => Promise<AbortOutcome>) | undefined = undefined;
 	#postPromptTasks = new Set<Promise<void>>();
+	#postPromptTaskSelectionFenceGenerations = new Map<Promise<void>, number>();
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
 	#postPromptTasksAbortController = new AbortController();
@@ -5623,8 +5624,14 @@ export class AgentSession {
 		this.#postPromptTasksPromise = undefined;
 	}
 
-	#trackPostPromptTask(task: Promise<void>, lease?: RunResourceProducerLease, leaseTask: Promise<void> = task): void {
+	#trackPostPromptTask(
+		task: Promise<void>,
+		selectionFenceGeneration: number,
+		lease?: RunResourceProducerLease,
+		leaseTask: Promise<void> = task,
+	): void {
 		this.#postPromptTasks.add(task);
+		this.#postPromptTaskSelectionFenceGenerations.set(task, selectionFenceGeneration);
 		this.#ensurePostPromptTasksPromise();
 		if (lease) {
 			lease.track("post_prompt", "agent-session", leaseTask);
@@ -5634,6 +5641,7 @@ export class AgentSession {
 			.catch(() => {})
 			.finally(() => {
 				this.#postPromptTasks.delete(task);
+				this.#postPromptTaskSelectionFenceGenerations.delete(task);
 				if (this.#postPromptTasks.size === 0) this.#resolvePostPromptTasks();
 			});
 	}
@@ -5696,7 +5704,12 @@ export class AgentSession {
 		const scheduled = reservation?.ok
 			? this.#runResourceLeaseContext.run(reservation.lease, runScheduled)
 			: runScheduled();
-		this.#trackPostPromptTask(scheduled, reservation?.ok ? reservation.lease : undefined, options?.leaseTask);
+		this.#trackPostPromptTask(
+			scheduled,
+			selectionFenceGeneration,
+			reservation?.ok ? reservation.lease : undefined,
+			options?.leaseTask,
+		);
 		return scheduled;
 	}
 
@@ -6199,6 +6212,7 @@ export class AgentSession {
 		this.#postPromptTasksAbortController.abort();
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#postPromptTasks.clear();
+		this.#postPromptTaskSelectionFenceGenerations.clear();
 		this.#releaseDeferredAgentEndContinuations();
 		this.#resolveTtsrResume();
 		this.#resolvePostPromptTasks();
@@ -6233,6 +6247,19 @@ export class AgentSession {
 			}
 			break;
 		}
+	}
+
+	/**
+	 * A selection's scoped idle drain must not wait on work parked behind its
+	 * own fence, but it still needs to yield to post-prompt work that predates
+	 * that fence. Otherwise the drain can repeatedly await already-settled
+	 * session work while a timer-backed predecessor task is starved.
+	 */
+	async #waitForPostPromptTasksBeforeSelectionFence(selectionFenceGeneration: number): Promise<void> {
+		const precedingTasks = [...this.#postPromptTasks].filter(
+			task => (this.#postPromptTaskSelectionFenceGenerations.get(task) ?? 0) < selectionFenceGeneration,
+		);
+		if (precedingTasks.length > 0) await Promise.allSettled(precedingTasks);
 	}
 
 	/** Get TTSR injection payload and clear pending injections. */
@@ -7553,6 +7580,8 @@ export class AgentSession {
 			if (ignoreSelectionFenceGeneration === undefined) {
 				await this.agent.waitForIdle();
 				await this.#waitForPostPromptRecovery();
+			} else {
+				await this.#waitForPostPromptTasksBeforeSelectionFence(ignoreSelectionFenceGeneration);
 			}
 			await this.#waitForSessionSettlement(ignoreSelectionFenceGeneration);
 			if (
