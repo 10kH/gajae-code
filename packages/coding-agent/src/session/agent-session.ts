@@ -1929,6 +1929,22 @@ function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretOb
 	return { ...context, messages };
 }
 
+/**
+ * Canonical message_end admission slot. A reservation whose slot is already
+ * `released` needs no await at the canonical append site, so an uncontended
+ * admission never costs a microtask and external emitters keep synchronous
+ * visibility of the persisted append.
+ */
+interface CanonicalMessageAdmissionSlot {
+	promise: Promise<void>;
+	released: boolean;
+}
+
+interface CanonicalMessageAdmission {
+	predecessor: CanonicalMessageAdmissionSlot;
+	release: () => void;
+}
+
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -4312,25 +4328,25 @@ export class AgentSession {
 		this.#coordinatorToolObservations.set(event, Object.freeze({ label, observedAt: new Date().toISOString() }));
 	}
 
-	#canonicalMessageAdmissionTail: Promise<void> = Promise.resolve();
+	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
 
-	#reserveCanonicalMessageAdmission(
-		event: AgentEvent,
-	): { predecessor: Promise<void>; release: () => void } | undefined {
+	#reserveCanonicalMessageAdmission(event: AgentEvent): CanonicalMessageAdmission | undefined {
 		if (event.type !== "message_end") return undefined;
 		const predecessor = this.#canonicalMessageAdmissionTail;
 		const settled = Promise.withResolvers<void>();
+		const slot: CanonicalMessageAdmissionSlot = { promise: settled.promise, released: false };
 		let released = false;
 		const release = () => {
 			if (released) return;
 			released = true;
+			slot.released = true;
 			settled.resolve();
 		};
 		// The reservation is owned by this emission's handler: keying it by the
 		// event object would let a replayed/bridged duplicate emission overwrite
 		// it and leave the first handler awaiting a promise only its own handler
 		// will ever release.
-		this.#canonicalMessageAdmissionTail = settled.promise;
+		this.#canonicalMessageAdmissionTail = slot;
 		return { predecessor, release };
 	}
 
@@ -4614,7 +4630,7 @@ export class AgentSession {
 	#handleAgentEvent = async (
 		event: AgentEvent,
 		activePromptHandle?: string,
-		canonicalAdmission?: { predecessor: Promise<void>; release: () => void },
+		canonicalAdmission?: CanonicalMessageAdmission,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
@@ -4765,8 +4781,13 @@ export class AgentSession {
 		// Canonical persistence follows synchronous message_end reservation order.
 		// Only the admission predecessor and this event's own pre-admission work are
 		// inside the lane; release before extension delivery and unrelated post-work.
+		// An already-released predecessor must not cost a microtask: external emitters
+		// and tests rely on canonical append being visible synchronously after
+		// emitExternalEvent returns whenever no admission is actually contended.
 		if (event.type === "message_end") {
-			await canonicalAdmission?.predecessor;
+			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
+				await canonicalAdmission.predecessor.promise;
+			}
 			if (
 				(event.message.role === "hookMessage" || event.message.role === "custom") &&
 				!(event.message.role === "custom" && event.message.customType === "hindsight-recall")
