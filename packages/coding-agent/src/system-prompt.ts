@@ -11,7 +11,6 @@ import { systemPromptCapability } from "./capability/system-prompt";
 import type { SkillsSettings } from "./config/settings";
 import { type ContextFile, loadCapability, type SystemPrompt as SystemPromptFile } from "./discovery";
 import type { Skill } from "./extensibility/skills";
-import { masterModeSystemPromptSection } from "./master/prompt";
 import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
@@ -398,8 +397,6 @@ export interface BuildSystemPromptOptions {
 	 * safety, and the completion contract are retained. Default: false.
 	 */
 	subagent?: boolean;
-	/** Master session (`gjc master` / `--master`): appends the dedicated master-mode supervision section. */
-	masterMode?: boolean;
 }
 
 export interface BuildSystemPromptResult {
@@ -458,7 +455,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		secretsEnabled = false,
 		workspaceTree: providedWorkspaceTree,
 		subagent = false,
-		masterMode = false,
 	} = options;
 	const resolvedCwd = cwd ?? getProjectDir();
 
@@ -637,9 +633,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const projectPrompt = resolvedCustomPrompt ? "" : prompt.render(projectPromptTemplate, data).trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);
-	}
-	if (masterMode) {
-		systemPrompt.push(masterModeSystemPromptSection());
 	}
 
 	// Plugin system appendices are appended last as a lower-authority block; they
