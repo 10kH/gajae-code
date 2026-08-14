@@ -836,9 +836,10 @@ describe("AgentSession auto-compaction continuation", () => {
 		sessionManager.appendMessage(message);
 		session.agent.emitExternalEvent({ type: "message_end", message });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [message] });
-		// The continuation is now parked behind the pending selection fence with
-		// no other in-flight work: waitForIdle must not report the session idle
-		// while that continuation is still waiting on the fence.
+		// The continuation is now parked behind the pending selection fence,
+		// having claimed the predecessor agent_end: external waitForIdle must
+		// not report the session idle while that continuation is still waiting
+		// on the fence, even once every other in-flight work settles.
 		let idleReported = false;
 		const idle = session.waitForIdle().then(() => {
 			idleReported = true;

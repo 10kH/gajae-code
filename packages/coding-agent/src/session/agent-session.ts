@@ -1991,8 +1991,9 @@ export class AgentSession {
 	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
 	#pendingSelectionFences = 0;
-	#settledSelectionFenceGeneration = 0;
 	#selectionFenceDeferredContinuations = new Map<number, number>();
+	#scopedSettlementWaiters = new Set<() => void>();
+	#oldestPendingSelectionFenceGeneration = 0;
 	#followUpReservationEpoch = 0;
 	/** Epochs of follow-up reservations still between reservation and durable enqueue. */
 	#activeFollowUpReservationEpochs = new Set<number>();
@@ -2993,14 +2994,24 @@ export class AgentSession {
 	 * synchronous re-entry (`#endSelectionFenceDeferralTracking`) or the
 	 * promise-settled safety net clears it.
 	 */
-	#pendingSelectionFenceDeferredContinuations(): number {
-		const settledGeneration = this.#settledSelectionFenceGeneration;
+	#pendingSelectionFenceDeferredContinuations(ignoreGenerationFrom?: number): number {
 		let total = 0;
 		for (const [generation, count] of this.#selectionFenceDeferredContinuations) {
-			if (generation > settledGeneration) continue;
+			if (ignoreGenerationFrom !== undefined && generation >= ignoreGenerationFrom) continue;
 			total += count;
 		}
 		return total;
+	}
+
+	/**
+	 * Deferral generations that causally-upstream settlement work must ignore:
+	 * a deferral parked behind a still-pending selection fence cannot settle
+	 * before that fence resolves, and the fence owner's completion may itself
+	 * depend on this very settlement. Returns the oldest still-pending fence
+	 * generation, or undefined when no fence is pending.
+	 */
+	#turnSettlementDeferralFloor(): number | undefined {
+		return this.#pendingSelectionFences > 0 ? this.#oldestPendingSelectionFenceGeneration : undefined;
 	}
 
 	/**
@@ -3022,33 +3033,66 @@ export class AgentSession {
 		}
 	}
 
-	#isSessionSettlementPending(): boolean {
+	#isSessionSettlementPending(ignoreSelectionFenceGeneration?: number): boolean {
 		return (
 			this.#promptInFlightCount > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#agentEndPublicationInFlight > 0 ||
 			this.#pendingAgentEndContinuationHolds.size > 0 ||
-			this.#pendingSelectionFenceDeferredContinuations() > 0 ||
+			this.#pendingSelectionFenceDeferredContinuations(ignoreSelectionFenceGeneration) > 0 ||
 			this.#pendingAgentEndEmit !== undefined
 		);
 	}
 
 	#resolveSessionSettlement(): void {
-		if (this.#isSessionSettlementPending() || !this.#sessionSettlementResolve) return;
+		if (this.#isSessionSettlementPending() || !this.#sessionSettlementResolve) {
+			this.#wakeScopedSettlementWaiters();
+			return;
+		}
 		const resolve = this.#sessionSettlementResolve;
 		this.#sessionSettlementResolve = undefined;
 		this.#sessionSettlementPromise = undefined;
 		resolve();
+		this.#wakeScopedSettlementWaiters();
+	}
+	/** Re-evaluate every scoped settlement waiter (selection-internal drains). */
+	#wakeScopedSettlementWaiters(): void {
+		for (const check of [...this.#scopedSettlementWaiters]) check();
 	}
 
-	async #waitForSessionSettlement(): Promise<void> {
-		while (this.#isSessionSettlementPending()) {
-			if (!this.#sessionSettlementPromise) {
-				const { promise, resolve } = Promise.withResolvers<void>();
-				this.#sessionSettlementPromise = promise;
-				this.#sessionSettlementResolve = resolve;
+	/**
+	 * Wait for session settlement. `ignoreSelectionFenceGeneration` carries the
+	 * selection's own fence generation for its internal drain only (see
+	 * {@link waitForIdle}); external callers observe every unresolved
+	 * fence-deferred continuation.
+	 *
+	 * A scoped waiter registers a wake callback instead of sharing the strict
+	 * settlement promise: the strict promise may stay pending on a
+	 * fence-deferred continuation (correctly), and the selection that owns that
+	 * fence must not block behind it (#4519).
+	 */
+	async #waitForSessionSettlement(ignoreSelectionFenceGeneration?: number): Promise<void> {
+		while (this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)) {
+			if (ignoreSelectionFenceGeneration === undefined) {
+				if (!this.#sessionSettlementPromise) {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					this.#sessionSettlementPromise = promise;
+					this.#sessionSettlementResolve = resolve;
+				}
+				await this.#sessionSettlementPromise;
+				continue;
 			}
-			await this.#sessionSettlementPromise;
+			const wake = Promise.withResolvers<void>();
+			const check = () => {
+				if (!this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)) wake.resolve();
+			};
+			this.#scopedSettlementWaiters.add(check);
+			check();
+			try {
+				await wake.promise;
+			} finally {
+				this.#scopedSettlementWaiters.delete(check);
+			}
 		}
 	}
 
@@ -3085,7 +3129,12 @@ export class AgentSession {
 		// A post-prompt continuation runs before its predecessor prompt returns. Its
 		// publication must settle, but session-wide settlement can still be owned by
 		// that predecessor; waiting here would make each prompt wait on the other.
-		if (!predecessorPromptStillInFlight) await this.#waitForSessionSettlement();
+		// Deferrals behind still-pending selection fences are excluded here: they
+		// cannot settle before their fence resolves, and the fence owner may be
+		// waiting on this very settlement (#4519).
+		if (!predecessorPromptStillInFlight) {
+			await this.#waitForSessionSettlement(this.#turnSettlementDeferralFloor());
+		}
 		if (flushError) throw flushError;
 	}
 
@@ -7490,17 +7539,28 @@ export class AgentSession {
 	}
 
 	/** Wait until streaming and session settlement work are fully settled. */
-	async waitForIdle(): Promise<void> {
+	/**
+	 * Wait until streaming and session settlement work are fully settled.
+	 *
+	 * The internal-only `ignoreSelectionFenceGeneration` is used exclusively by
+	 * `setDefaultModelSelection`'s mid-selection drain: the selection must not
+	 * wait on work parked behind its own (or a later) fence — its agent run,
+	 * recovery, and deferrals — because that work is waiting on the selection
+	 * itself (#4519). External callers observe everything.
+	 */
+	async waitForIdle(ignoreSelectionFenceGeneration?: number): Promise<void> {
 		while (true) {
-			await this.agent.waitForIdle();
-			await this.#waitForPostPromptRecovery();
-			await this.#waitForSessionSettlement();
+			if (ignoreSelectionFenceGeneration === undefined) {
+				await this.agent.waitForIdle();
+				await this.#waitForPostPromptRecovery();
+			}
+			await this.#waitForSessionSettlement(ignoreSelectionFenceGeneration);
 			if (
 				!this.agent.state.isStreaming &&
 				!this.#retryPromise &&
 				!this.#ttsrResumePromise &&
 				!this.#postPromptTasksPromise &&
-				!this.#isSessionSettlementPending()
+				!this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)
 			)
 				return;
 		}
@@ -13614,6 +13674,9 @@ export class AgentSession {
 		this.#selectionFenceGeneration += 1;
 		this.#pendingSelectionFences += 1;
 		const selectionFenceGeneration = this.#selectionFenceGeneration;
+		if (this.#oldestPendingSelectionFenceGeneration === 0) {
+			this.#oldestPendingSelectionFenceGeneration = selectionFenceGeneration;
+		}
 		this.#selectionFenceTail = priorSelectionFence.then(() => selectionFence.promise);
 		void this.#selectionFenceTail.catch(() => {});
 		try {
@@ -13643,7 +13706,7 @@ export class AgentSession {
 				undefined,
 				{ allowDuringClosing: true },
 			);
-			await this.waitForIdle();
+			await this.waitForIdle(selectionFenceGeneration);
 			return await this.#withSessionAdmission(
 				"selection",
 				async () => {
@@ -13730,8 +13793,8 @@ export class AgentSession {
 		} finally {
 			selectionFence.resolve();
 			this.#pendingSelectionFences -= 1;
-			if (selectionFenceGeneration > this.#settledSelectionFenceGeneration) {
-				this.#settledSelectionFenceGeneration = selectionFenceGeneration;
+			if (this.#oldestPendingSelectionFenceGeneration === selectionFenceGeneration) {
+				this.#oldestPendingSelectionFenceGeneration = 0;
 			}
 			this.#resolveSessionSettlement();
 		}
