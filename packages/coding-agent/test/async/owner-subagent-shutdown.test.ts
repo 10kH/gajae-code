@@ -397,6 +397,105 @@ describe("owner subagent shutdown leases", () => {
 		await manager.dispose();
 	});
 
+	test("retains delivery suppression until every watcher releases the job", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+			},
+			retentionMs: 60_000,
+		});
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "multiply watched completion", async () => gate.promise, {
+			ownerId: "owner-a",
+			metadata: { subagent: { id: "multiply-watched", agent: "executor", agentSource: "bundled" } },
+		});
+		manager.watchJobs([jobId]);
+		manager.watchJobs([jobId]);
+		manager.unwatchJobs([jobId]);
+		gate.resolve("done while one watcher remains");
+		await manager.getJob(jobId)?.promise;
+		await Bun.sleep(10);
+		expect(manager.isDeliverySuppressed(jobId, manager.getJob(jobId)?.generation)).toBe(true);
+		expect(delivered).toEqual([]);
+
+		manager.unwatchJobs([jobId]);
+		await manager.drainDeliveries({ filter: { ownerId: "owner-a" }, timeoutMs: 100 });
+		expect(delivered).toEqual([jobId]);
+		await manager.dispose();
+	});
+
+	test("retains every watch across immediate terminal eviction", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+			},
+			retentionMs: 0,
+		});
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "immediately evicted watched completion", async () => gate.promise, {
+			ownerId: "owner-a",
+			metadata: { subagent: { id: "evicted-watched", agent: "executor", agentSource: "bundled" } },
+		});
+		const generation = manager.getJob(jobId)?.generation;
+		manager.watchJobs([jobId]);
+		manager.watchJobs([jobId]);
+		gate.resolve("done before eviction");
+		await manager.getJob(jobId)?.promise;
+		await Bun.sleep(10);
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(manager.isDeliverySuppressed(jobId, generation)).toBe(true);
+		expect(delivered).toEqual([]);
+
+		manager.unwatchJobs([jobId]);
+		expect(manager.isDeliverySuppressed(jobId, generation)).toBe(true);
+		await Bun.sleep(10);
+		expect(delivered).toEqual([]);
+
+		manager.unwatchJobs([jobId]);
+		await manager.drainDeliveries({ filter: { ownerId: "owner-a" }, timeoutMs: 100 });
+		expect(delivered).toEqual([jobId]);
+		await manager.dispose();
+	});
+
+	test("does not suppress a reused job id with an evicted generation watch", async () => {
+		const delivered: string[] = [];
+		const manager = new AsyncJobManager({
+			onJobComplete: async jobId => {
+				delivered.push(jobId);
+			},
+			retentionMs: 0,
+		});
+		const firstGate = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "first generation", async () => firstGate.promise, {
+			id: "reused-watched-job",
+			ownerId: "owner-a",
+		});
+		const firstGeneration = manager.getJob(jobId)?.generation;
+		const firstWatch = manager.watchJobGenerations([jobId]);
+		firstGate.resolve("first done");
+		await manager.getJob(jobId)?.promise;
+		await Bun.sleep(10);
+		expect(manager.getJob(jobId)).toBeUndefined();
+		expect(manager.isDeliverySuppressed(jobId, firstGeneration)).toBe(true);
+
+		const secondJobId = manager.register("task", "second generation", async () => "second done", {
+			id: jobId,
+			ownerId: "owner-b",
+		});
+		const secondGeneration = manager.getJob(secondJobId)?.generation;
+		expect(secondGeneration).not.toBe(firstGeneration);
+		await manager.getJob(secondJobId)?.promise;
+		expect(await manager.drainDeliveries({ filter: { ownerId: "owner-b" }, timeoutMs: 100 })).toBe(true);
+		expect(delivered).toEqual([secondJobId]);
+
+		firstWatch.close();
+		expect(await manager.drainDeliveries({ filter: { ownerId: "owner-a" }, timeoutMs: 100 })).toBe(true);
+		expect(delivered).toEqual([secondJobId, jobId]);
+		await manager.dispose();
+	});
+
 	test("acknowledging another job preserves a watched completion", async () => {
 		const delivered: string[] = [];
 		const manager = new AsyncJobManager({
