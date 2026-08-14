@@ -88,6 +88,11 @@ import {
 	TELEGRAM_MESSAGE_LIMIT,
 	TELEGRAM_PARSE_MODE,
 } from "./html-format";
+import {
+	InboundReactionSequencer,
+	inboundReactionRetractPayload,
+	inboundReactionSetPayload,
+} from "./inbound-reaction-ordering";
 import type { SessionCloseTarget, SessionCreateTarget, SessionResumeTarget } from "./index";
 import {
 	formatLifecycleOutcome,
@@ -4620,6 +4625,8 @@ export class TelegramNotificationDaemon {
 	> {
 		return this.dispatchState.inboundReactions;
 	}
+	/** Per-update inbound reaction ordering: serialized transitions, terminal states monotonic. */
+	readonly #inboundReactions = new InboundReactionSequencer();
 	/** SDK-owned service is the sole lifecycle executor and terminal authority. */
 	readonly #lifecycleService: AgentDirSessionLifecycleService;
 	/** Attempt tombstones live for the daemon lifetime so a commit key can never send twice. */
@@ -5600,25 +5607,19 @@ export class TelegramNotificationDaemon {
 				name: "inbound_ack",
 				matches: msg => msg.type === "inbound_ack" && typeof msg.updateId === "number",
 				handle: async (session, msg) => {
-					const target = this.inboundReactions.get(msg.updateId as number);
+					const updateId = msg.updateId as number;
+					const target = this.inboundReactions.get(updateId);
 					const action = inboundReactionAction(msg.state, target !== undefined);
 					if (!target || action === "none") return;
 					if (action === "queued") {
-						await this.setReaction(
-							target.messageId,
-							QUEUED_REACTION,
-							target.socketLease ?? this.#socketLease(session),
-						);
+						// Nonterminal: leave the correction target installed for the eventual
+						// consumed/retract ack, but skip a stale eyes once a terminal state
+						// already ran for this update (see #inboundReactionSequencer).
+						await this.#applyInboundReaction(updateId, target, QUEUED_REACTION, false, session);
 					} else if (action === "consumed") {
-						this.inboundReactions.delete(msg.updateId as number);
-						await this.setReaction(
-							target.messageId,
-							CONSUMED_REACTION,
-							target.socketLease ?? this.#socketLease(session),
-						);
+						await this.#applyInboundReaction(updateId, target, CONSUMED_REACTION, true, session);
 					} else if (action === "retract") {
-						this.inboundReactions.delete(msg.updateId as number);
-						await this.setReaction(target.messageId, "", target.socketLease ?? this.#socketLease(session));
+						await this.#applyInboundReaction(updateId, target, "", true, session);
 					}
 				},
 			})
@@ -9919,14 +9920,54 @@ export class TelegramNotificationDaemon {
 		if ((socketLease && !this.#leaseTokenAllows(socketLease)) || !(await this.pairedChatIsPrivate())) return;
 		try {
 			if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
-			await this.botApi.call("setMessageReaction", {
-				chat_id: this.opts.chatId,
-				message_id: messageId,
-				reaction: [{ type: "emoji", emoji }],
-			});
+			await this.botApi.call("setMessageReaction", inboundReactionSetPayload(this.opts.chatId, messageId, emoji));
 		} catch {
 			// Best-effort: reactions may be disallowed in the chat; never throw.
 		}
+	}
+
+	/**
+	 * Retract a native reaction by sending the empty reaction list the Bot API
+	 * requires; an empty `emoji` string is not a valid reaction and is silently
+	 * rejected, leaving the stale queued marker visible.
+	 */
+	private async retractReaction(
+		messageId: number,
+		socketLease?: { session: AttachmentSession; token: number; logicalSessionId: string },
+	): Promise<void> {
+		if ((socketLease && !this.#leaseTokenAllows(socketLease)) || !(await this.pairedChatIsPrivate())) return;
+		try {
+			if (socketLease && !this.#leaseTokenAllows(socketLease)) return;
+			await this.botApi.call("setMessageReaction", inboundReactionRetractPayload(this.opts.chatId, messageId));
+		} catch {
+			// Best-effort: reactions may be disallowed in the chat; never throw.
+		}
+	}
+
+	/**
+	 * Serialize and order inbound reaction transitions per update id through the
+	 * shared {@link InboundReactionSequencer}: Bot API calls stay ordered and a
+	 * late queued marker can never overwrite a terminal consumed/retraction.
+	 */
+	async #applyInboundReaction(
+		updateId: number,
+		target: {
+			messageId: number;
+			socketLease?: { session: AttachmentSession; token: number; logicalSessionId: string };
+		},
+		emoji: string,
+		terminal: boolean,
+		session: AttachmentSession,
+	): Promise<void> {
+		const lease = target.socketLease ?? this.#socketLease(session);
+		await this.#inboundReactions.apply(updateId, {
+			terminal,
+			effect: async () => {
+				if (emoji === "") await this.retractReaction(target.messageId, lease);
+				else await this.setReaction(target.messageId, emoji, lease);
+				if (terminal) this.inboundReactions.delete(updateId);
+			},
+		});
 	}
 
 	private startTypingTimer(): void {

@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { inboundReactionRetractPayload } from "../src/sdk/bus/inbound-reaction-ordering";
+import { notificationInboundAdmission } from "../src/sdk/bus/index";
 
 const root = path.resolve(import.meta.dir, "..");
 const bus = fs.readFileSync(path.join(root, "src/sdk/bus/index.ts"), "utf8");
@@ -17,9 +19,67 @@ test("production inbound gates emit explicit drop acknowledgements before return
 	expect(suspendedGate).toContain("return;");
 });
 
+test("production admission defers valid suspended controls instead of dropping them", () => {
+	// A policy-suspended notification-origin control_command is deferred to
+	// activate(), so it must NOT take the dropped-ack branch.
+	expect(
+		notificationInboundAdmission({
+			inboundFenced: false,
+			policySuspended: true,
+			notificationOrigin: true,
+			controlCommand: true,
+		}),
+	).toEqual({ outcome: "defer", reason: "policy_suspended" });
+	// A policy-suspended user_message from the same origin IS dropped.
+	expect(
+		notificationInboundAdmission({
+			inboundFenced: false,
+			policySuspended: true,
+			notificationOrigin: true,
+			controlCommand: false,
+		}),
+	).toEqual({ outcome: "drop", reason: "policy_suspended" });
+
+	// The production drop gate never sends a dropped ack on the defer path, and
+	// the defer path still enqueues the deferred control for later execution.
+	const deferStart = bus.indexOf('if (admission.outcome === "defer")');
+	expect(deferStart).toBeGreaterThan(0);
+	const dropStart = bus.indexOf('if (admission.outcome === "drop")', deferStart);
+	expect(dropStart).toBeGreaterThan(deferStart);
+	const deferGate = bus.slice(deferStart, dropStart);
+	expect(deferGate).toContain("deferredInboundControls.push");
+	expect(deferGate).not.toContain("sendInboundAck");
+	expect(deferGate).toContain("return;");
+	const dropGate = bus.slice(dropStart, dropStart + 1_200);
+	expect(dropGate).toContain('sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "dropped"');
+	expect(dropGate).toContain("return;");
+	// Only the drop path carries the policy-suspension diagnostic.
+	expect(deferGate).not.toContain("notification policy is suspended");
+});
+
+test("production user-message acceptance awaits session admission before acking", () => {
+	const userMessageStart = bus.indexOf('if (inbound.kind === "user_message")');
+	expect(userMessageStart).toBeGreaterThan(0);
+	const injection = bus.slice(userMessageStart, userMessageStart + 2_600);
+	expect(injection).toContain("await api.sendUserMessage(");
+	const acceptedIndex = injection.indexOf('"accepted"');
+	const awaitIndex = injection.indexOf("await api.sendUserMessage(");
+	expect(awaitIndex).toBeGreaterThan(-1);
+	expect(acceptedIndex).toBeGreaterThan(awaitIndex);
+	expect(injection).toContain('"rejected",\n\t\t\t\t\t\t\t"injection_failed"');
+});
+
 test("production daemon queues only on accepted and retracts rejected or dropped", () => {
 	expect(daemon).toContain('if (state === "accepted") return "queued"');
 	expect(daemon).toContain('if (state === "rejected" || state === "dropped") return "retract"');
 	expect(daemon).not.toContain("setReaction(inbound.messageId, QUEUED_REACTION");
-	expect(daemon).toMatch(/action === "retract"[\s\S]{0,300}this\.setReaction\(target\.messageId, ""/);
+});
+
+test("production daemon serializes reaction transitions and retracts with the empty reaction list", () => {
+	// Per-update serialization and terminal monotonicity come from the shared sequencer.
+	expect(daemon).toContain("#inboundReactions.apply(updateId, {");
+	// Retraction routes through the empty-list payload, not an empty emoji string.
+	expect(daemon).toContain("inboundReactionRetractPayload(this.opts.chatId, messageId)");
+	expect(daemon).not.toMatch(/setReaction\([^)]*,\s*""\s*[,)]/);
+	expect(JSON.stringify(inboundReactionRetractPayload("42", 1))).toContain('"reaction":[]');
 });

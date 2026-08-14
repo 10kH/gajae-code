@@ -173,16 +173,24 @@ export {
 
 export type NotificationInboundAdmission =
 	| { outcome: "accept" }
-	| { outcome: "drop"; reason: "inbound_fenced" | "policy_suspended" };
+	| { outcome: "drop"; reason: "inbound_fenced" | "policy_suspended" }
+	| { outcome: "defer"; reason: "policy_suspended" };
 
 /** Exact production admission decision for daemon-originated session inbound. */
 export function notificationInboundAdmission(input: {
 	inboundFenced: boolean;
 	policySuspended: boolean;
 	notificationOrigin: boolean;
+	controlCommand: boolean;
 }): NotificationInboundAdmission {
 	if (input.inboundFenced) return { outcome: "drop", reason: "inbound_fenced" };
-	if (input.policySuspended && input.notificationOrigin) return { outcome: "drop", reason: "policy_suspended" };
+	if (input.policySuspended && input.notificationOrigin) {
+		// Valid control commands are not dropped: they are deferred while policy is
+		// provisional and executed on activate. A terminal `dropped` ack would
+		// contradict that later execution and invite client-side retry duplication.
+		if (input.controlCommand) return { outcome: "defer", reason: "policy_suspended" };
+		return { outcome: "drop", reason: "policy_suspended" };
+	}
 	return { outcome: "accept" };
 }
 
@@ -7124,13 +7132,14 @@ export function createNotificationsExtension(
 
 			// Inbound free-text injection / in-thread config command from a session
 			// thread (forwarded by the daemon over the WS, fail-closed at the daemon).
-			server.onInbound((err, inbound) => {
+			server.onInbound(async (err, inbound) => {
 				if (err || !inbound) return;
 				const notificationOrigin = hostCapCache.get(inbound.connectionId)?.has(ASK_SELECTED_ACK_CAPABILITY);
 				const admission = notificationInboundAdmission({
 					inboundFenced: initializedRuntime.inboundFenced,
 					policySuspended: runtime?.policySuspended ?? false,
 					notificationOrigin: notificationOrigin ?? false,
+					controlCommand: inbound.kind === "control_command",
 				});
 				if (admission.outcome === "drop" && admission.reason === "inbound_fenced") {
 					sendInboundAck(inbound.connectionId, inbound, "dropped", admission.reason);
@@ -7150,28 +7159,31 @@ export function createNotificationsExtension(
 					messageId?: number;
 					reason?: string;
 				};
+				if (admission.outcome === "defer") {
+					// Provisional policy defers valid control commands to activate(); they are
+					// NOT dropped, so no terminal dropped acknowledgement is emitted. The
+					// control_command_result frame after execution is the authoritative reply.
+					const frame = sdkInboundFrame(inbound.commandJson);
+					if (frame) {
+						const suspendedRuntime = runtime;
+						runtime.deferredInboundControls.push(() => {
+							if (
+								runtimes.get(id) === suspendedRuntime &&
+								!suspendedRuntime.stopping &&
+								!suspendedRuntime.policySuspended
+							)
+								inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
+						});
+					}
+					return;
+				}
 				if (admission.outcome === "drop") {
 					sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "dropped", admission.reason);
-					if (inbound.kind === "control_command") {
-						const frame = sdkInboundFrame(inbound.commandJson);
-						if (frame) {
-							const suspendedRuntime = runtime;
-							runtime.deferredInboundControls.push(() => {
-								if (
-									runtimes.get(id) === suspendedRuntime &&
-									!suspendedRuntime.stopping &&
-									!suspendedRuntime.policySuspended
-								)
-									inboundSdkFrame?.(`seam:${inbound.requestId ?? "notification"}`, frame);
-							});
-						}
-					}
-					if (inbound.kind !== "control_command")
-						logger.warn(
-							`notifications: inbound ${inbound.kind} dropped: notification policy is suspended (updateId=${String(
-								(inbound as { updateId?: unknown }).updateId ?? "none",
-							)})`,
-						);
+					logger.warn(
+						`notifications: inbound ${inbound.kind} dropped: notification policy is suspended (updateId=${String(
+							(inbound as { updateId?: unknown }).updateId ?? "none",
+						)})`,
+					);
 					return;
 				}
 				if (inbound.kind === "control_command") {
@@ -7227,7 +7239,11 @@ export function createNotificationsExtension(
 								]
 							: text;
 					try {
-						api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
+						// sendUserMessage is async: admission (prompt preflight, session
+						// admission, steer queuing) settles only when the returned promise
+						// settles. Awaiting it is what lets a late rejection below map to a
+						// `rejected` ack instead of a false `accepted`.
+						await api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
 						if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
 						sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "accepted");
 					} catch (e) {
