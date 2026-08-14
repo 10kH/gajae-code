@@ -266,7 +266,7 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * in the daemon run loop, pre-poll stale-poller fencing, and fail-closed
  * watchdog behavior when stable identity authority is unavailable (#4403).
  */
-export const DAEMON_GENERATION = 166;
+export const DAEMON_GENERATION = 167;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7
