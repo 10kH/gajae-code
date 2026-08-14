@@ -135,6 +135,7 @@ async function probeCdpAt(port: number, signal?: AbortSignal): Promise<boolean> 
 	try {
 		const res = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: probeSignal });
 		await res.body?.cancel();
+		throwIfAborted(signal);
 		return res.ok;
 	} catch {
 		throwIfAborted(signal);

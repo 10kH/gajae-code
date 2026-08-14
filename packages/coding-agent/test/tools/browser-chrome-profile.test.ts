@@ -508,6 +508,34 @@ describe("Chrome profile browser mode (#809)", () => {
 		).rejects.toThrow(/aborted/i);
 	});
 
+	it("propagates cancellation that arrives while closing a successful CDP response", async () => {
+		mockRunningChromeProcess([
+			"--user-data-dir=/Users/me/Library/Application Support/Google/Chrome",
+			"--profile-directory=Profile 10",
+			"--remote-debugging-port=9222",
+		]);
+		const controller = new AbortController();
+		vi.spyOn(globalThis, "fetch").mockResolvedValue({
+			ok: true,
+			body: {
+				cancel: async () => {
+					controller.abort();
+				},
+			},
+		} as unknown as Response);
+
+		await expect(
+			attach.findRunningChromeProfile(
+				"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+				{
+					userDataDir: "/Users/me/Library/Application Support/Google/Chrome",
+					profileDirectory: "Profile 10",
+				},
+				controller.signal,
+			),
+		).rejects.toThrow(/aborted/i);
+	});
+
 	it("reuses matching profile CDP when remote debugging address is localhost", async () => {
 		mockRunningChromeProcess([
 			"--user-data-dir=/Users/me/Library/Application Support/Google/Chrome",
