@@ -193,6 +193,62 @@ test("redacts a persisted host failure during hydration", async () => {
 		await rm(stateRoot, { recursive: true, force: true });
 	}
 });
+test("retains terminal host reconciliation records past the 15-minute window", async () => {
+	// #4547: terminal records must stay canonical until per-kind capacity
+	// eviction; age must never expire them on the SDK-only host path.
+	const realNow = Date.now;
+	let clock = 1_000_000;
+	Date.now = () => clock;
+	try {
+		const reconciliation = createInvocationReconciliation();
+		const promptCorrelation = { commandId: "aged-command", turnId: "aged-turn" };
+		const skillCorrelation = { commandId: "aged-skill-command", turnId: "aged-skill-turn" };
+		reconciliation.admit("prompt", "aged-ref");
+		reconciliation.admit("skill", "aged-skill-ref");
+		await reconciliation.noteAccepted("prompt", promptCorrelation, "aged-ref");
+		await reconciliation.noteAccepted("skill", skillCorrelation, "aged-skill-ref");
+		await reconciliation.noteTransition("prompt", promptCorrelation, { type: "agent_end" });
+		await reconciliation.noteTransition("skill", skillCorrelation, { type: "agent_end" });
+
+		clock += 15 * 60_000 + 1;
+		expect(reconciliation.lookup("prompt", { clientRef: "aged-ref" })).toMatchObject({
+			status: "terminal_ok",
+		});
+		expect(reconciliation.lookup("skill", { clientRef: "aged-skill-ref" })).toMatchObject({
+			status: "terminal_ok",
+		});
+		expect(() => reconciliation.admit("prompt", "aged-ref")).toThrowError(/never reuse a clientRef/);
+	} finally {
+		Date.now = realNow;
+	}
+});
+
+test("capacity eviction still releases the clientRef and reports honest unknown", async () => {
+	// The removal of age eviction must not weaken the oldest-terminal-first
+	// capacity trim: at the cap the oldest terminal is evicted and its
+	// clientRef becomes admissible again with the prior outcome unknown.
+	const reconciliation = createInvocationReconciliation();
+	const first = { commandId: "capacity-command-1", turnId: "capacity-turn-1" };
+	reconciliation.admit("prompt", "capacity-ref-1");
+	await reconciliation.noteAccepted("prompt", first, "capacity-ref-1");
+	await reconciliation.noteTransition("prompt", first, { type: "agent_end" });
+	const TERMINAL_CAPACITY = 512;
+	for (let index = 2; index <= TERMINAL_CAPACITY + 1; index++) {
+		const correlation = { commandId: `capacity-command-${index}`, turnId: `capacity-turn-${index}` };
+		reconciliation.admit("prompt", `capacity-ref-${index}`);
+		await reconciliation.noteAccepted("prompt", correlation, `capacity-ref-${index}`);
+		await reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+	}
+	expect(reconciliation.lookup("prompt", { clientRef: "capacity-ref-1" })).toEqual({
+		status: "unknown",
+	});
+	expect(() => reconciliation.admit("prompt", "capacity-ref-1")).not.toThrow();
+	const retained = {
+		commandId: `capacity-command-${TERMINAL_CAPACITY + 1}`,
+		turnId: `capacity-turn-${TERMINAL_CAPACITY + 1}`,
+	};
+	expect(reconciliation.lookup("prompt", retained)).toMatchObject({ status: "terminal_ok" });
+});
 
 describe("SessionSdkSessionRuntime", () => {
 	test("has no notification adapter or native notification import edge", async () => {

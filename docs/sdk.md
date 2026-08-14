@@ -361,7 +361,7 @@ durable/preflight accept (SDK control path), not after skill completion. Query p
 status with `Q26` / `turn.result` and `kind: "skill"`. `skill.invoke_status`
 remains a legacy skill-only alias that injects the same `kind`. Kind-scoped indexes
 mean prompt and skill `clientRef` values never collide. Skill records use the same
-capacity/TTL limits, but an active skill record at restart settles with
+capacity/retention limits, but an active skill record at restart settles with
 `error.code = process_restart`.
 
 ## Correlated steer acknowledgement (Q30)
