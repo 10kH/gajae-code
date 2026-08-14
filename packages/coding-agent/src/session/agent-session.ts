@@ -4560,6 +4560,10 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	// Admission slot of the last message_end per assistant message, so the
+	// agent_end handler can join the terminal's canonical admission before any
+	// post-turn write reaches the branch.
+	#lastAssistantAdmissionByMessage = new WeakMap<AssistantMessage, CanonicalMessageAdmission | undefined>();
 	// Provider context construction must wait for this chain. Agent event listeners
 	// are synchronous dispatch only; their async work cannot otherwise gate the
 	// next tool-result provider request.
@@ -4790,9 +4794,13 @@ export class AgentSession {
 		// post-turn read must see THIS stop even when this admission is still
 		// parked behind a contended predecessor — otherwise post-turn logic
 		// (deep-interview continuation, compaction, retry classification) runs
-		// against the previous turn's assistant.
+		// against the previous turn's assistant. The per-message admission slot
+		// also lets agent_end processing wait for this admission to finish, so
+		// post-turn writes (continuation reminders, compaction rewrites) never
+		// reorder ahead of the branch entries they respond to.
 		if (event.type === "message_end" && event.message.role === "assistant") {
 			this.#lastAssistantMessage = event.message;
+			this.#lastAssistantAdmissionByMessage.set(event.message, canonicalAdmission);
 		}
 
 		if (event.type === "message_end") {
@@ -5300,6 +5308,16 @@ export class AgentSession {
 				.find((message): message is AssistantMessage => message.role === "assistant");
 			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
+			// Join the terminal's canonical admission before any post-turn write:
+			// an externally emitted terminal dispatches agent_end while its own
+			// admission may still be parked behind a contended predecessor, and a
+			// continuation reminder or compaction rewrite that runs first would
+			// persist ahead of the branch entries it responds to.
+			const terminalAdmission = msg ? this.#lastAssistantAdmissionByMessage.get(msg) : undefined;
+			if (msg) this.#lastAssistantAdmissionByMessage.delete(msg);
+			if (terminalAdmission && !terminalAdmission.predecessor.released) {
+				await terminalAdmission.predecessor.promise;
+			}
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				this.#resolveRetry();

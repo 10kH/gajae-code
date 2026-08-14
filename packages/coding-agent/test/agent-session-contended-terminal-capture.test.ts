@@ -129,14 +129,23 @@ describe("AgentSession contended terminal assistant capture (#4565 finding)", ()
 		// The terminal stop must have reached the deep-interview stop gate and
 		// scheduled its continuation. Stale capture -> hasToolCalls -> no call.
 		expect(continueSpy).toHaveBeenCalled();
-		const reminders = sessionManager
-			.getBranch()
-			.filter(
-				entry =>
-					entry.type === "message" &&
-					entry.message.role === "developer" &&
-					JSON.stringify(entry.message.content).includes("stop gate: gjc_skill_deep_interview_"),
-			);
-		expect(reminders.length).toBeGreaterThanOrEqual(1);
+		const entries = sessionManager.getBranch();
+		const reminderIndex = entries.findIndex(
+			entry =>
+				entry.type === "message" &&
+				entry.message.role === "developer" &&
+				JSON.stringify(entry.message.content).includes("stop gate: gjc_skill_deep_interview_"),
+		);
+		expect(reminderIndex).toBeGreaterThanOrEqual(0);
+		// FIFO on reload: the continuation reminder must persist AFTER the
+		// terminal assistant (and the gated tool result) it responds to.
+		const terminalIndex = entries.findIndex(
+			entry =>
+				entry.type === "message" &&
+				entry.message.role === "assistant" &&
+				JSON.stringify((entry.message as { content?: unknown }).content).includes("interview round complete"),
+		);
+		expect(terminalIndex).toBeGreaterThanOrEqual(0);
+		expect(reminderIndex).toBeGreaterThan(terminalIndex);
 	});
 });
