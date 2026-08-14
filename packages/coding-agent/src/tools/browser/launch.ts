@@ -108,12 +108,18 @@ export function resolveBrowserEnvOverridesForTest(): {
 	proxy: string | undefined;
 	proxyBypassLoopback: boolean;
 	ignoreCertErrors: boolean;
+	programFiles: string | undefined;
+	programFilesX86: string | undefined;
+	localAppData: string | undefined;
 } {
 	return {
 		executablePath: trustedBrowserEnv("PUPPETEER_EXECUTABLE_PATH"),
 		proxy: trustedBrowserEnv("PUPPETEER_PROXY"),
 		proxyBypassLoopback: browserLaunchFlagEnabled("PUPPETEER_PROXY_BYPASS_LOOPBACK"),
 		ignoreCertErrors: browserLaunchFlagEnabled("PUPPETEER_PROXY_IGNORE_CERT_ERRORS"),
+		programFiles: trustedBrowserEnv("ProgramFiles"),
+		programFilesX86: trustedBrowserEnv("ProgramFiles(x86)"),
+		localAppData: trustedBrowserEnv("LOCALAPPDATA"),
 	};
 }
 
@@ -244,9 +250,9 @@ function systemChromiumCandidates(): string[] {
 			break;
 		}
 		case "win32": {
-			const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
-			const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
-			const localAppData = process.env.LOCALAPPDATA ?? path.join(home, "AppData\\Local");
+			const programFiles = trustedBrowserEnv("ProgramFiles") ?? "C:\\Program Files";
+			const programFilesX86 = trustedBrowserEnv("ProgramFiles(x86)") ?? "C:\\Program Files (x86)";
+			const localAppData = trustedBrowserEnv("LOCALAPPDATA") ?? path.join(home, "AppData\\Local");
 			candidates.push(
 				path.join(programFiles, "Google\\Chrome\\Application\\chrome.exe"),
 				path.join(programFilesX86, "Google\\Chrome\\Application\\chrome.exe"),
@@ -296,6 +302,14 @@ export function isEdgeExecutable(candidate: string): boolean {
 	return EDGE_EXECUTABLE_PATTERN.test(candidate);
 }
 
+const CHROME_PROFILE_EXECUTABLE_PATTERN =
+	/(?:^|[/\\])(?:google-chrome(?:-(?:stable|beta|unstable|canary))?|chromium(?:-browser)?|chrome(?:\.exe)?|Google Chrome(?: Beta| Dev| Canary)?|Chromium|com\.google\.Chrome|org\.chromium\.Chromium)$/i;
+
+/** True only for executable names owned by Google Chrome or Chromium. */
+export function isChromeProfileExecutable(candidate: string): boolean {
+	return CHROME_PROFILE_EXECUTABLE_PATTERN.test(candidate);
+}
+
 let resolvedProfileChrome: string | null | undefined; // undefined = unchecked; null = not found
 
 /**
@@ -305,7 +319,7 @@ let resolvedProfileChrome: string | null | undefined; // undefined = unchecked; 
  */
 export function resolveSystemChromeForProfile(): string | undefined {
 	if (resolvedProfileChrome !== undefined) return resolvedProfileChrome ?? undefined;
-	const found = firstExecutableCandidate(systemChromiumCandidates(), candidate => !isEdgeExecutable(candidate));
+	const found = firstExecutableCandidate(systemChromiumCandidates(), isChromeProfileExecutable);
 	resolvedProfileChrome = found ?? null;
 	if (found) logger.debug("Using system Chrome/Chromium for profile mode", { path: found });
 	return found;

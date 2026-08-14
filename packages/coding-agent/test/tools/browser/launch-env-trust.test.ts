@@ -29,6 +29,8 @@ const BROWSER_KEYS = [
 	"CHROME_USER_DATA_DIR",
 	"CHROME_CONFIG_HOME",
 	"XDG_CONFIG_HOME",
+	"ProgramFiles",
+	"ProgramFiles(x86)",
 ] as const;
 
 interface BrowserEnvOverrides {
@@ -42,6 +44,9 @@ interface BrowserEnvOverrides {
 		chromeConfigHome?: string;
 		xdgConfigHome?: string;
 	};
+	programFiles?: string;
+	programFilesX86?: string;
+	localAppData?: string;
 }
 
 const tempDirs: string[] = [];
@@ -139,6 +144,13 @@ describe("browser launch env trust boundary", () => {
 		expect((await resolveIn(cwd)).profileEnv).toEqual({});
 	});
 
+	it("ignores Windows executable roots planted by the project .env", async () => {
+		const cwd = projectDir("ProgramFiles=/repo/programs\nLOCALAPPDATA=/repo/local\n");
+		const resolved = await resolveIn(cwd);
+		expect(resolved.programFiles).toBeUndefined();
+		expect(resolved.localAppData).toBeUndefined();
+	});
+
 	it("honors profile discovery roots inherited from the launching shell", async () => {
 		const resolved = await resolveIn(projectDir(), {
 			LOCALAPPDATA: "/trusted/windows",
@@ -152,5 +164,14 @@ describe("browser launch env trust boundary", () => {
 			chromeConfigHome: "/trusted/chrome",
 			xdgConfigHome: "/trusted/xdg",
 		});
+	});
+
+	it("honors Windows executable roots inherited from the launching shell", async () => {
+		const resolved = await resolveIn(projectDir(), {
+			ProgramFiles: "C:\\Trusted\\Programs",
+			LOCALAPPDATA: "C:\\Trusted\\Local",
+		});
+		expect(resolved.programFiles).toBe("C:\\Trusted\\Programs");
+		expect(resolved.localAppData).toBe("C:\\Trusted\\Local");
 	});
 });

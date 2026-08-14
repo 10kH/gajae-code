@@ -6,7 +6,7 @@ import * as z from "zod/v4";
 import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
 import type { ToolSession } from "../sdk";
 import { type BrowserActionStep, compileActionSteps } from "./browser/actions";
-import { isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
+import { isChromeProfileExecutable, isEdgeExecutable, resolveSystemChromeForProfile } from "./browser/launch";
 import { chromeUserDataRoots, defaultDiscoveryEnv } from "./browser/profile-discovery";
 import { acquireBrowser, type BrowserHandle, type BrowserKind, type BrowserKindTag } from "./browser/registry";
 import type { Observation, ScreenshotResult } from "./browser/tab-protocol";
@@ -144,9 +144,12 @@ function resolveChromeProfileKind(app: NonNullable<BrowserParams["app"]>, sessio
 			'No Chrome/Chromium executable found for app.browser "chrome". Install Chrome, or pass app.path with the binary path.',
 		);
 	}
-	if (isEdgeExecutable(canonicalPath(exe))) {
+	const canonicalExe = canonicalPath(exe);
+	if (!isChromeProfileExecutable(canonicalExe)) {
 		throw new ToolError(
-			'app.path for app.browser "chrome" must be Google Chrome or Chromium, not Microsoft Edge. Use Edge with app.path spawn mode and a separate profile, or pass a Chrome/Chromium executable.',
+			isEdgeExecutable(canonicalExe)
+				? 'app.path for app.browser "chrome" must be Google Chrome or Chromium, not Microsoft Edge. Use Edge with app.path spawn mode and a separate profile, or pass a Chrome/Chromium executable.'
+				: 'app.path for app.browser "chrome" must be a Google Chrome or Chromium executable. Other Chromium-based browsers must use app.path spawn mode with their own separate profile.',
 		);
 	}
 	if (!app.user_data_dir) {

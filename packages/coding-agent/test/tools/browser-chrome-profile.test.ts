@@ -27,6 +27,7 @@ import {
 	openChromeProfileHandle,
 	releaseBrowser,
 } from "../../src/tools/browser/registry";
+import { describeBrowserForTest } from "../../src/tools/browser/render";
 
 function makeSession(cwd: string): ToolSession {
 	return {
@@ -87,6 +88,27 @@ describe("Chrome profile browser mode (#809)", () => {
 		expect(launch.isEdgeExecutable("/var/lib/flatpak/exports/bin/com.microsoft.Edge")).toBe(true);
 		expect(launch.isEdgeExecutable("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")).toBe(false);
 		expect(launch.isEdgeExecutable("/usr/bin/chromium")).toBe(false);
+	});
+
+	it("accepts only Chrome and Chromium executable brands for profile mode", () => {
+		for (const executable of [
+			"/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+			"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+			"/usr/bin/google-chrome-unstable",
+			"/usr/bin/chromium-browser",
+			"/var/lib/flatpak/exports/bin/com.google.Chrome",
+		]) {
+			expect(launch.isChromeProfileExecutable(executable)).toBe(true);
+		}
+		for (const executable of ["/usr/bin/brave-browser", "/usr/bin/vivaldi", "/usr/bin/opera", "/usr/bin/firefox"]) {
+			expect(launch.isChromeProfileExecutable(executable)).toBe(false);
+		}
+	});
+
+	it("renders the effective Default profile name when it is omitted", () => {
+		expect(describeBrowserForTest({ action: "open", app: { browser: "chrome" } }, undefined)).toBe(
+			"Chrome profile Default",
+		);
 	});
 
 	it("parses Chromium CDP and profile argv forms", () => {
@@ -323,6 +345,17 @@ describe("Chrome profile browser mode (#809)", () => {
 				makeSession("/work"),
 			),
 		).toThrow(/not Microsoft Edge/);
+	});
+
+	it("rejects other Chromium browser brands before checking omitted profile fields", () => {
+		for (const executable of ["/usr/bin/brave-browser", "/usr/bin/vivaldi", "/usr/bin/opera"]) {
+			expect(() =>
+				resolveBrowserKindForTest(
+					{ action: "open", app: { browser: "chrome", path: executable } },
+					makeSession("/work"),
+				),
+			).toThrow(/must be a Google Chrome or Chromium executable/);
+		}
 	});
 
 	it("allows Chrome and Chromium executables with custom data roots", () => {
