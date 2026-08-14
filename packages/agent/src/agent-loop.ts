@@ -32,7 +32,7 @@ import {
 	neutralizeReservedControlTokens,
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
-import { sanitizeText } from "@gajae-code/utils";
+import { logger, sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,
@@ -96,6 +96,32 @@ export const MANAGED_ATTEMPT_MAX_STAGED_EVENTS = 10_000;
 export const MANAGED_ATTEMPT_MAX_STAGED_BYTES = 16 * 1024 * 1024;
 
 /**
+ * Closed set of local-failure sites. A bounded diagnostic may name only these
+ * literals: the log is shape-only, so no caller-supplied or provider-derived
+ * string may ever reach it.
+ */
+const MANAGED_LOCAL_FAILURE_STAGES = [
+	"shell.role",
+	"shell.content",
+	"event.snapshot",
+	"event.contentIndex",
+	"event.delta",
+	"event.content",
+	"event.toolcall",
+	"event.done.reason",
+	"event.error.reason",
+	"event.unknownType",
+	"staging.losslessSnapshot",
+	"staging.measure",
+	"staging.sanitize",
+	"staging.overflow",
+	"overflow.preMeasure",
+	"overflow.staged",
+] as const;
+type ManagedLocalFailureStage = (typeof MANAGED_LOCAL_FAILURE_STAGES)[number];
+const MANAGED_LOCAL_FAILURE_STAGE_SET: ReadonlySet<string> = new Set(MANAGED_LOCAL_FAILURE_STAGES);
+
+/**
  * Local staging failure: the provisional buffer limit was exceeded. Carries
  * NO transport facts or status by design — only original typed provider
  * transport facts may authorize provider fallback, so local buffer machinery
@@ -106,7 +132,7 @@ export const MANAGED_ATTEMPT_MAX_STAGED_BYTES = 16 * 1024 * 1024;
  */
 class ManagedAttemptBufferOverflowError extends Error {
 	readonly errorKind = "local_buffer_overflow" as const;
-	constructor() {
+	constructor(readonly stage: ManagedLocalFailureStage) {
 		super("Managed fallback attempt exceeded the provisional event buffer limit");
 		this.name = "ManagedAttemptBufferOverflowError";
 	}
@@ -123,7 +149,7 @@ class ManagedAttemptBufferOverflowError extends Error {
  */
 class ManagedAttemptSnapshotError extends Error {
 	readonly errorKind = "local_snapshot_failure" as const;
-	constructor() {
+	constructor(readonly stage: ManagedLocalFailureStage) {
 		super(
 			"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
 		);
@@ -855,9 +881,9 @@ function losslessDetachedClone<T>(value: T): T {
 function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]): AssistantMessage {
 	const detailed = managedAttemptSnapshotDetailed(value);
 	const source = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : value;
-	if (managedProperty(source, "role") !== "assistant") throw new ManagedAttemptSnapshotError();
+	if (managedProperty(source, "role") !== "assistant") throw new ManagedAttemptSnapshotError("shell.role");
 	const rawContent = managedAttemptSnapshot(managedProperty(source, "content"));
-	if (!Array.isArray(rawContent)) throw new ManagedAttemptSnapshotError();
+	if (!Array.isArray(rawContent)) throw new ManagedAttemptSnapshotError("shell.content");
 	const content = rawContent.flatMap(block => {
 		const normalized = managedAssistantContent(block);
 		return normalized ? [normalized] : [];
@@ -977,11 +1003,13 @@ function managedAssistantUsage(value: unknown): AssistantMessage["usage"] {
 
 function managedAssistantEventSnapshot(event: AssistantMessageEvent, message: AssistantMessage): AssistantMessageEvent {
 	const snapshot = managedAttemptSnapshot(event);
-	if (!isManagedPlainRecord(snapshot)) throw new ManagedAttemptSnapshotError();
+	if (!isManagedPlainRecord(snapshot)) throw new ManagedAttemptSnapshotError("event.snapshot");
 	const type = managedProperty(snapshot, "type");
 	const contentIndex = managedProperty(snapshot, "contentIndex");
 	const indexed = () => {
-		if (!Number.isInteger(contentIndex) || (contentIndex as number) < 0) throw new ManagedAttemptSnapshotError();
+		if (!Number.isInteger(contentIndex) || (contentIndex as number) < 0) {
+			throw new ManagedAttemptSnapshotError("event.contentIndex");
+		}
 		return contentIndex as number;
 	};
 	if (type === "start") return { type, partial: message };
@@ -999,34 +1027,77 @@ function managedAssistantEventSnapshot(event: AssistantMessageEvent, message: As
 		type === "toolcall_delta"
 	) {
 		const delta = managedProperty(snapshot, "delta");
-		if (typeof delta !== "string") throw new ManagedAttemptSnapshotError();
+		if (typeof delta !== "string") throw new ManagedAttemptSnapshotError("event.delta");
 		return { type, contentIndex: indexed(), delta, partial: message };
 	}
 	if (type === "text_end" || type === "thinking_end" || type === "reasoning_summary_end") {
 		const content = managedProperty(snapshot, "content");
-		if (typeof content !== "string") throw new ManagedAttemptSnapshotError();
+		if (typeof content !== "string") throw new ManagedAttemptSnapshotError("event.content");
 		return { type, contentIndex: indexed(), content, partial: message };
 	}
 	if (type === "toolcall_end") {
 		const toolCall = managedAssistantContent(managedProperty(snapshot, "toolCall"));
-		if (toolCall?.type !== "toolCall") throw new ManagedAttemptSnapshotError();
+		if (toolCall?.type !== "toolCall") throw new ManagedAttemptSnapshotError("event.toolcall");
 		return { type, contentIndex: indexed(), toolCall, partial: message };
 	}
 	if (type === "done") {
 		const reason = managedProperty(snapshot, "reason");
-		if (reason !== "stop" && reason !== "length" && reason !== "toolUse") throw new ManagedAttemptSnapshotError();
+		if (reason !== "stop" && reason !== "length" && reason !== "toolUse") {
+			throw new ManagedAttemptSnapshotError("event.done.reason");
+		}
 		return { type, reason, message };
 	}
 	if (type === "error") {
 		const reason = managedProperty(snapshot, "reason");
-		if (reason !== "aborted" && reason !== "error") throw new ManagedAttemptSnapshotError();
+		if (reason !== "aborted" && reason !== "error") throw new ManagedAttemptSnapshotError("event.error.reason");
 		return { type, reason, error: message };
 	}
-	throw new ManagedAttemptSnapshotError();
+	throw new ManagedAttemptSnapshotError("event.unknownType");
 }
 
 function isManagedPlainRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === "object" && !Array.isArray(value) && !nodeUtilTypes.isProxy(value);
+}
+
+/**
+ * Emit ONE bounded, shape-only diagnostic for a local managed-attempt failure
+ * (snapshot machinery or staging buffer). Names only the envelope shape — the
+ * failure stage, model identity, snapshot mode, staged counters, and (for
+ * content stages only) the content block count — never raw text, thinking,
+ * tool arguments, or any provider payload content. Emitted only for the
+ * module-private local error identities, so a foreign error cannot self-label
+ * into the log. Scoped to this stream invocation: not latched across
+ * invocations, matching the #4443 precedent.
+ */
+function warnManagedSnapshotFailure(
+	error: unknown,
+	config: AgentLoopConfig,
+	transaction: ManagedAttemptTransaction | undefined,
+): void {
+	// Identity, never self-labeling: only the module-private local error classes
+	// may produce this diagnostic. A foreign error that sets a matching
+	// `errorKind` (and could smuggle provider or prompt text in `stage`) is
+	// ignored here, so nothing outside this module can reach the log.
+	if (!(error instanceof ManagedAttemptSnapshotError) && !(error instanceof ManagedAttemptBufferOverflowError)) {
+		return;
+	}
+	// Defense in depth: even an in-module regression cannot widen the log past
+	// the closed stage vocabulary.
+	const stage = MANAGED_LOCAL_FAILURE_STAGE_SET.has(error.stage) ? error.stage : "unknown";
+	const diagnostic: Record<string, unknown> = {
+		stage,
+		errorKind: error.errorKind,
+		model: config.model.id,
+		provider: config.model.provider,
+		snapshotMode: transaction?.snapshotMode ?? "none",
+	};
+	const staged = transaction?.stagedShape() ?? { stagedEventCount: 0, stagedBytes: 0, contentBlockCount: 0 };
+	diagnostic.stagedEventCount = staged.stagedEventCount;
+	diagnostic.stagedBytes = staged.stagedBytes;
+	if (stage === "shell.content") {
+		diagnostic.contentBlockCount = staged.contentBlockCount;
+	}
+	logger.warn("agent: managed fallback attempt rejected a local snapshot", diagnostic);
 }
 
 /**
@@ -1041,6 +1112,8 @@ class ManagedAttemptTransaction {
 	> = [];
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
+	/** Shape snapshot retained across discard() for bounded failure diagnostics. */
+	#lastStagedShape: { stagedEventCount: number; stagedBytes: number; contentBlockCount: number } | undefined;
 	#discarded = false;
 	#committed = false;
 
@@ -1051,7 +1124,7 @@ class ManagedAttemptTransaction {
 			| undefined,
 		private readonly model: AgentLoopConfig["model"],
 		readonly scope?: AttemptScope,
-		private readonly snapshotMode: "managed" | "lossless" = "managed",
+		readonly snapshotMode: "managed" | "lossless" = "managed",
 	) {}
 
 	push(event: AgentEvent): void {
@@ -1103,12 +1176,48 @@ class ManagedAttemptTransaction {
 	}
 
 	discard(): void {
+		if (!this.#discarded) {
+			this.#lastStagedShape = {
+				stagedEventCount: this.#stagedEventCount,
+				stagedBytes: this.#stagedBytes,
+				contentBlockCount: this.#stagedContentBlockCount(),
+			};
+		}
 		this.#batch = [];
 		this.#stagedBytes = 0;
 		this.#stagedEventCount = 0;
 		this.#discarded = true;
 	}
 
+	/**
+	 * Shape-only view of what was staged when the attempt failed; never carries
+	 * content. Reports the retained pre-discard shape when the failing path
+	 * discarded the batch, and the live counters when it threw before discard.
+	 */
+	stagedShape(): { stagedEventCount: number; stagedBytes: number; contentBlockCount: number } {
+		return (
+			this.#lastStagedShape ?? {
+				stagedEventCount: this.#stagedEventCount,
+				stagedBytes: this.#stagedBytes,
+				contentBlockCount: this.#stagedContentBlockCount(),
+			}
+		);
+	}
+
+	#stagedContentBlockCount(): number {
+		for (let i = this.#batch.length - 1; i >= 0; i--) {
+			const item = this.#batch[i];
+			const message =
+				item.type === "assistant_event"
+					? item.message
+					: "message" in item.event
+						? (item.event.message as unknown)
+						: undefined;
+			const content = managedProperty(message, "content");
+			if (Array.isArray(content)) return content.length;
+		}
+		return 0;
+	}
 	#wouldOverflow(bytes: number): boolean {
 		return (
 			this.#stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS ||
@@ -1124,18 +1233,18 @@ class ManagedAttemptTransaction {
 				detached = this.#losslessSnapshot(snapshot);
 			} catch {
 				this.discard();
-				throw new ManagedAttemptSnapshotError();
+				throw new ManagedAttemptSnapshotError("staging.losslessSnapshot");
 			}
 			let detachedBytes: number;
 			try {
 				detachedBytes = managedAttemptTextEncoder.encode(JSON.stringify(detached)).byteLength;
 			} catch {
 				this.discard();
-				throw new ManagedAttemptSnapshotError();
+				throw new ManagedAttemptSnapshotError("staging.measure");
 			}
 			if (this.#wouldOverflow(detachedBytes)) {
 				this.discard();
-				throw new ManagedAttemptSnapshotError();
+				throw new ManagedAttemptSnapshotError("staging.overflow");
 			}
 			this.#batch.push({ type: "event", event: detached });
 			this.#stagedEventCount++;
@@ -1156,7 +1265,7 @@ class ManagedAttemptTransaction {
 		}
 		if (bytes !== undefined && this.#wouldOverflow(bytes)) {
 			this.discard();
-			throw new ManagedAttemptBufferOverflowError();
+			throw new ManagedAttemptBufferOverflowError("overflow.preMeasure");
 		}
 		const repaired = this.#repairAssistantEvent(event);
 		const detailed = managedAttemptSnapshotDetailed(repaired);
@@ -1182,11 +1291,11 @@ class ManagedAttemptTransaction {
 				// dedicated local error: it carries no transport facts, so it is
 				// non-retryable and can never be misattributed to the provider.
 				this.discard();
-				throw new ManagedAttemptSnapshotError();
+				throw new ManagedAttemptSnapshotError("staging.sanitize");
 			}
 			if (this.#wouldOverflow(bytes)) {
 				this.discard();
-				throw new ManagedAttemptBufferOverflowError();
+				throw new ManagedAttemptBufferOverflowError("overflow.staged");
 			}
 		}
 		this.#batch.push({ type: "event", event: snapshot });
@@ -1846,6 +1955,7 @@ async function runLoopBody(
 			} catch (err) {
 				if (!(err instanceof HarmonyLeakInterruption)) {
 					const failureMessage = managedFailureMessage(err, config);
+					if (config.fallbackManaged) warnManagedSnapshotFailure(err, config, transaction);
 					if (config.fallbackManaged && transaction && managedContextOverflow(failureMessage, config)) {
 						transaction.discard();
 						currentContext.messages.splice(contextMessageCount);

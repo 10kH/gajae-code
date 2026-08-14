@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { ManagedAttemptOutcome } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
 import { agentLoopContinue, sanitizedDetachedClone } from "@gajae-code/agent-core/agent-loop";
@@ -7,6 +7,23 @@ import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-co
 
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { logger } from "@gajae-code/utils";
+
+/**
+ * Capture the bounded local-failure diagnostics emitted for one run. Returns
+ * only the diagnostic payloads for `agent: managed fallback attempt rejected a
+ * local snapshot`, so assertions can prove shape-only fields are present and
+ * content-bearing fields are absent.
+ */
+function captureSnapshotDiagnostics(): Record<string, unknown>[] {
+	const captured: Record<string, unknown>[] = [];
+	vi.spyOn(logger, "warn").mockImplementation((message: string, payload?: unknown) => {
+		if (message === "agent: managed fallback attempt rejected a local snapshot") {
+			captured.push((payload ?? {}) as Record<string, unknown>);
+		}
+	});
+	return captured;
+}
 
 function assistantMessage(model: ReturnType<typeof createMockModel>["model"]): AssistantMessage {
 	return {
@@ -38,6 +55,10 @@ function expectManagedRunStart(events: string[]): void {
 }
 
 describe("managed attempt transaction", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
 	it("flushes a successful assistant lifecycle once and in provider order", async () => {
 		const mock = createMockModel({ responses: [{ content: ["accepted"] }] });
 		const agent = new Agent({
@@ -785,6 +806,7 @@ describe("managed attempt transaction", () => {
 		// duplicated by structuredClone. The nested witness getter counts deep
 		// reads: measurement reads it exactly once; a snapshot taken before
 		// the cap check would read it a second time.
+		const diagnostics = captureSnapshotDiagnostics();
 		const mock = createMockModel();
 		let witnessReads = 0;
 		const streamFn = () => {
@@ -826,6 +848,14 @@ describe("managed attempt transaction", () => {
 		expect(agent.state.error).toContain("provisional event buffer limit");
 		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_buffer_overflow");
 		expect(witnessReads).toBe(1);
+		// One bounded diagnostic per stream invocation, shape-only.
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({
+			errorKind: "local_buffer_overflow",
+			model: mock.model.id,
+			provider: mock.model.provider,
+			snapshotMode: "managed",
+		});
 	});
 
 	it("fails an over-limit provisional batch as a local error without consuming the chain", async () => {
@@ -986,7 +1016,8 @@ describe("managed attempt transaction", () => {
 		expect(callbacks[0]).toMatchObject({ type: "text_start", contentIndex: 0, partial: { role: "assistant" } });
 	});
 
-	it("fails a collapsed root proxy locally without managed retry authority", async () => {
+	it("fails a collapsed root proxy locally and reports a bounded shape-only diagnostic", async () => {
+		const diagnostics = captureSnapshotDiagnostics();
 		const mock = createMockModel();
 		const collapsed = new Proxy(assistantMessage(mock.model), {
 			get() {
@@ -1013,6 +1044,84 @@ describe("managed attempt transaction", () => {
 		expect(agent.state.error).toContain("local snapshot");
 		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_snapshot_failure");
 		expect(agent.state.messages.filter(message => message.role === "assistant")).toHaveLength(1);
+		// The diagnostic names the exact failing site and carries shape only:
+		// no raw text, thinking, tool arguments, or provider payload content.
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({
+			stage: "shell.role",
+			errorKind: "local_snapshot_failure",
+			model: mock.model.id,
+			provider: mock.model.provider,
+			snapshotMode: "managed",
+		});
+		expect(typeof diagnostics[0].stagedEventCount).toBe("number");
+		expect(typeof diagnostics[0].stagedBytes).toBe("number");
+		expect(Object.keys(diagnostics[0]).sort()).toEqual([
+			"errorKind",
+			"model",
+			"provider",
+			"snapshotMode",
+			"stage",
+			"stagedBytes",
+			"stagedEventCount",
+		]);
+	});
+	it("names the content stage and its block count when the assistant content shape is rejected", async () => {
+		const diagnostics = captureSnapshotDiagnostics();
+		const mock = createMockModel();
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					// A non-array `content` cannot be normalized into the managed
+					// assistant shell, so staging rejects it at the content stage.
+					const malformed = assistantMessage(mock.model) as unknown as { content: unknown };
+					malformed.content = { 0: { type: "text", text: "not an array" } };
+					stream.push({ type: "start", partial: malformed as unknown as AssistantMessage });
+				});
+				return stream;
+			},
+		});
+		let outcomes = 0;
+
+		await agent.prompt("run", {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: () => {
+				outcomes += 1;
+				return { type: "retry", continuation: () => {} };
+			},
+		});
+
+		expect(outcomes).toBe(0);
+		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_snapshot_failure");
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toMatchObject({ stage: "shell.content", errorKind: "local_snapshot_failure" });
+		expect(typeof diagnostics[0].contentBlockCount).toBe("number");
+	});
+	it("ignores a foreign error that self-labels a local failure kind", async () => {
+		const diagnostics = captureSnapshotDiagnostics();
+		const mock = createMockModel();
+		const marker = "SECRET-PROMPT-MATERIAL-do-not-log";
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				// A stream-side error that claims a local failure kind and tries to
+				// smuggle content through `stage`. Only the module-private local
+				// error identities may reach the diagnostic, so this logs nothing.
+				const forged = Object.assign(new Error("forged local failure"), {
+					errorKind: "local_snapshot_failure",
+					stage: marker,
+				});
+				throw forged;
+			},
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(agent.state.error).toContain("forged local failure");
+		expect(diagnostics).toHaveLength(0);
+		expect(JSON.stringify(diagnostics)).not.toContain(marker);
 	});
 	it("normalizes null and incomplete tool-call blocks before managed dispatch", async () => {
 		const mock = createMockModel();
