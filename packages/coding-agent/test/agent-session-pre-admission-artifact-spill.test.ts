@@ -325,10 +325,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 
 		// Gate the spill so the first tool result's admission is still pending when
 		// the assistant continuation is emitted; the continuation must wait for it.
-		let resolveSpillWrite!: () => void;
-		const spillGate = new Promise<void>(resolve => {
-			resolveSpillWrite = resolve;
-		});
+		const spillGate = Promise.withResolvers<void>();
 		const agent = new Agent({
 			initialState: {
 				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
@@ -339,7 +336,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 		});
 		const sessionManager = SessionManager.inMemory(tempDir.path());
 		(sessionManager as unknown as { saveArtifact: typeof sessionManager.saveArtifact }).saveArtifact = async () => {
-			await spillGate;
+			await spillGate.promise;
 			return { uri: "artifact://1", bytes: 4, sha256: "0".repeat(64) } as never;
 		};
 		session = new AgentSession({
@@ -387,7 +384,7 @@ describe("AgentSession pre-admission artifact spill", () => {
 			.flatMap(entry => (entry.type === "message" ? [entry.message.role] : []));
 		expect(rolesSoFar).toEqual([]);
 
-		resolveSpillWrite();
+		spillGate.resolve();
 		await withTimeout(session.awaitSessionSettlement(), 5_000, "Gated spill admission deadlocked");
 		const rolesAfter = sessionManager
 			.getBranch()

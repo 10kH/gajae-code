@@ -34,10 +34,7 @@ describe("AgentSession contended terminal assistant capture (#4565 finding)", ()
 		// Gate the oversized tool result's spill so the terminal assistant's
 		// admission predecessor stays in flight: the contended case the
 		// synchronous fast path cannot shortcut.
-		let resolveSpill!: () => void;
-		const spillGate = new Promise<void>(resolve => {
-			resolveSpill = resolve;
-		});
+		const spillGate = Promise.withResolvers<void>();
 		const agent = new Agent({
 			initialState: {
 				model: { ...model, contextWindow: 200_000, maxTokens: 128_000 },
@@ -48,7 +45,7 @@ describe("AgentSession contended terminal assistant capture (#4565 finding)", ()
 		});
 		sessionManager = SessionManager.inMemory(tempDir.path());
 		(sessionManager as unknown as { saveArtifact: typeof sessionManager.saveArtifact }).saveArtifact = async () => {
-			await spillGate;
+			await spillGate.promise;
 			return { uri: "artifact://1", bytes: 4, sha256: "0".repeat(64) } as never;
 		};
 		session = new AgentSession({
@@ -122,7 +119,7 @@ describe("AgentSession contended terminal assistant capture (#4565 finding)", ()
 		// The deep-interview stop check runs async durable state reads; allow
 		// them, then release the gate and settle.
 		await Bun.sleep(50);
-		resolveSpill();
+		spillGate.resolve();
 		await withTimeout(session.awaitSessionSettlement(), 5_000, "gated admission deadlocked");
 		await session.waitForIdle();
 
