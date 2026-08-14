@@ -654,6 +654,19 @@ function publishAgentEnd(
 export const MANAGED_SNAPSHOT_MAX_NODES = 100_000;
 
 /**
+ * The sanitizer's closed set of placeholder strings. A degraded snapshot can
+ * never distinguish these from provider-sent strings by value alone, so
+ * downstream shape checks treat a sentinel-valued field as "original value was
+ * non-cloneable", never as benign provider variance.
+ */
+const SANITIZER_SENTINELS: ReadonlySet<string> = new Set([
+	"[unserializable]",
+	"[accessor]",
+	"[truncated]",
+	"[Circular]",
+]);
+
+/**
  * Cycle-aware deep clone that always returns a detached, JSON-serializable
  * value. Used whenever a detached snapshot cannot be safely obtained or
  * measured: after `structuredClone` fails, and again when a (successfully
@@ -881,13 +894,31 @@ function losslessDetachedClone<T>(value: T): T {
 function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]): AssistantMessage {
 	const detailed = managedAttemptSnapshotDetailed(value);
 	const source = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : value;
+	// A root that could not be snapshotted into a plain record is a live
+	// Proxy (the sanitizer collapses proxies to a placeholder). Benign
+	// proxy-wrapped provider messages are repaired by reading through the
+	// proxy — the provider's own view — with every read guarded so a hostile
+	// trap can only degrade to undefined, never escape. `managedProperty`
+	// is exactly that guarded read.
 	if (managedProperty(source, "role") !== "assistant") throw new ManagedAttemptSnapshotError("shell.role");
 	const rawContent = managedAttemptSnapshot(managedProperty(source, "content"));
-	if (!Array.isArray(rawContent)) throw new ManagedAttemptSnapshotError("shell.content");
-	const content = rawContent.flatMap(block => {
-		const normalized = managedAssistantContent(block);
-		return normalized ? [normalized] : [];
-	});
+	// Benign providers occasionally deliver a string or missing content value.
+	// Degrade those to an empty content array — an empty assistant turn —
+	// instead of failing the whole managed run: the staged shell must stay
+	// schema-valid, and empty content is the neutral, side-effect-free
+	// degradation. A string is benign ONLY when the provider actually sent a
+	// string: when the whole-message snapshot degraded, the sanitizer replaces
+	// a non-cloneable content value (proxy, function, accessor) with one of
+	// its own sentinel strings, and mistaking that sentinel for provider
+	// variance would silently drop real content (tool calls) behind a
+	// successful empty turn. Sentinel-string content therefore stays
+	// fail-closed, as does every other non-array shape, so the named-site
+	// diagnostic can report shell.content.
+	const rawArray = Array.isArray(rawContent) ? rawContent : undefined;
+	const benignContent =
+		rawContent === undefined || (typeof rawContent === "string" && !SANITIZER_SENTINELS.has(rawContent));
+	if (rawArray === undefined && !benignContent) throw new ManagedAttemptSnapshotError("shell.content");
+	const content = rawArray === undefined ? [] : rawArray.flatMap(managedContentBlock);
 	const usage = managedAssistantUsage(managedAttemptSnapshot(managedProperty(source, "usage")));
 	const api = managedProperty(source, "api");
 	const provider = managedProperty(source, "provider");
@@ -925,6 +956,11 @@ function managedAssistantShell(value: unknown, model: AgentLoopConfig["model"]):
 		...(typeof errorMessage === "string" ? { errorMessage } : {}),
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
 	};
+}
+
+function managedContentBlock(block: unknown): AssistantMessage["content"] {
+	const normalized = managedAssistantContent(block);
+	return normalized ? [normalized] : [];
 }
 
 function managedAssistantContent(value: unknown): AssistantMessage["content"][number] | undefined {
@@ -1001,7 +1037,10 @@ function managedAssistantUsage(value: unknown): AssistantMessage["usage"] {
 	};
 }
 
-function managedAssistantEventSnapshot(event: AssistantMessageEvent, message: AssistantMessage): AssistantMessageEvent {
+export function managedAssistantEventSnapshot(
+	event: AssistantMessageEvent,
+	message: AssistantMessage,
+): AssistantMessageEvent {
 	const snapshot = managedAttemptSnapshot(event);
 	if (!isManagedPlainRecord(snapshot)) throw new ManagedAttemptSnapshotError("event.snapshot");
 	const type = managedProperty(snapshot, "type");
@@ -1042,16 +1081,19 @@ function managedAssistantEventSnapshot(event: AssistantMessageEvent, message: As
 	}
 	if (type === "done") {
 		const reason = managedProperty(snapshot, "reason");
-		if (reason !== "stop" && reason !== "length" && reason !== "toolUse") {
-			throw new ManagedAttemptSnapshotError("event.done.reason");
-		}
-		return { type, reason, message };
+		// Degrade out-of-vocabulary done reasons to "stop", matching the closed
+		// StopReason vocabulary already normalized by managedAssistantShell.
+		const normalized = reason === "stop" || reason === "length" || reason === "toolUse" ? reason : "stop";
+		return { type, reason: normalized, message };
 	}
 	if (type === "error") {
 		const reason = managedProperty(snapshot, "reason");
-		if (reason !== "aborted" && reason !== "error") throw new ManagedAttemptSnapshotError("event.error.reason");
-		return { type, reason, error: message };
+		const normalized = reason === "aborted" || reason === "error" ? reason : "error";
+		return { type, reason: normalized, error: message };
 	}
+	// An unknown string event type degrades to a terminal done/stop; a
+	// non-string type is malformed provider output that must fail fast.
+	if (typeof type === "string") return { type: "done", reason: "stop", message } as AssistantMessageEvent;
 	throw new ManagedAttemptSnapshotError("event.unknownType");
 }
 
