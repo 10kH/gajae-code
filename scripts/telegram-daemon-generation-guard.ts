@@ -8,7 +8,7 @@ import * as path from "node:path";
 
 const root = path.join(import.meta.dir, "..");
 const SHA = /^[0-9a-f]{40}$/i;
-export const GUARD_CONTRACT_VERSION = 50;
+export const GUARD_CONTRACT_VERSION = 51;
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
 const telegramDaemon = "packages/coding-agent/src/sdk/bus/telegram-daemon.ts";
 const telegramControl = "packages/coding-agent/src/sdk/bus/telegram-daemon-control.ts";
@@ -24,6 +24,14 @@ const config = "packages/coding-agent/src/sdk/bus/config.ts";
 const busIndex = "packages/coding-agent/src/sdk/bus/index.ts";
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
+
+/**
+ * The topic-registry durable-authority snapshot. The guard's deterministic
+ * repair path syncs this fixture's generation pin whenever the Telegram
+ * generation changes, so a valid bump can never leave the assertion stale
+ * while the exact pin still fails closed on accidental drift.
+ */
+const topicRegistryFixture = "packages/coding-agent/test/notifications-topic-registry.test.ts";
 const nativeAuthorityDeclarations = {
 	"crates/pi-natives/src/path_identity.rs": [
 		"retain_broker_publication",
@@ -1148,12 +1156,122 @@ export function replaceNumericLiteral(source: string, name: string, newValue: nu
 	return `${source.slice(0, location.start)}${String(newValue)}${source.slice(location.end)}`;
 }
 
+/**
+ * The exact title of the topic-registry durable-authority snapshot test. Its
+ * generation number must track DAEMON_GENERATION so behavior pinned to the
+ * registry contract is always acknowledged at each generation bump.
+ */
+const TOPIC_REGISTRY_GENERATION_PIN_TITLE = /^publishes exact durable authority generation \d+ at serving epoch \d+$/;
+
+function topicRegistryToBeLiteral(node: unknown): { start: number; end: number } | undefined {
+	if (!node || typeof node !== "object") return undefined;
+	const candidate = node as { type?: string; start?: number; end?: number; callee?: unknown; property?: unknown; object?: unknown; arguments?: unknown[]; [key: string]: unknown };
+	if (
+		candidate.type === "CallExpression" &&
+		candidate.callee &&
+		typeof candidate.callee === "object" &&
+		(candidate.callee as { type?: string; object?: unknown; property?: unknown }).type === "MemberExpression" &&
+		(candidate.callee as { property?: unknown }).property &&
+		typeof (candidate.callee as { property?: unknown }).property === "object" &&
+		(candidate.callee as { property: { type?: string; name?: string } }).property.type === "Identifier" &&
+		(candidate.callee as { property: { name?: string } }).property.name === "toBe" &&
+		(candidate.callee as { object?: unknown }).object &&
+		typeof (candidate.callee as { object?: unknown }).object === "object" &&
+		(candidate.callee as { object: { type?: string; callee?: unknown; arguments?: unknown[] } }).object.type === "CallExpression" &&
+		(candidate.callee as { object: { callee?: unknown } }).object.callee &&
+		typeof (candidate.callee as { object: { callee?: unknown } }).object.callee === "object" &&
+		(candidate.callee as { object: { callee: { type?: string; name?: string } } }).object.callee.type === "Identifier" &&
+		(candidate.callee as { object: { callee: { name?: string } } }).object.callee.name === "expect" &&
+		Array.isArray((candidate.callee as { object: { arguments?: unknown[] } }).object.arguments) &&
+		(candidate.callee as { object: { arguments: unknown[] } }).object.arguments[0] &&
+		typeof (candidate.callee as { object: { arguments: unknown[] } }).object.arguments[0] === "object" &&
+		(candidate.callee as { object: { arguments: Array<{ type?: string; name?: string }> } }).object.arguments[0].type === "Identifier" &&
+		(candidate.callee as { object: { arguments: Array<{ name?: string }> } }).object.arguments[0].name === "DAEMON_GENERATION" &&
+		Array.isArray(candidate.arguments) &&
+		candidate.arguments[0] &&
+		typeof candidate.arguments[0] === "object" &&
+		(candidate.arguments[0] as { type?: string }).type === "NumericLiteral" &&
+		typeof (candidate.arguments[0] as { start?: number }).start === "number" &&
+		typeof (candidate.arguments[0] as { end?: number }).end === "number"
+	) {
+		return { start: (candidate.arguments[0] as { start: number }).start, end: (candidate.arguments[0] as { end: number }).end };
+	}
+	for (const [key, child] of Object.entries(candidate)) {
+		if (key === "loc" || key === "extra") continue;
+		if (Array.isArray(child)) {
+			for (const item of child) {
+				const found = topicRegistryToBeLiteral(item);
+				if (found) return found;
+			}
+		} else {
+			const found = topicRegistryToBeLiteral(child);
+			if (found) return found;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * Locate the source spans of the topic-registry durable-authority generation
+ * pin: the generation digits inside the test title and the numeric literal of
+ * the `expect(DAEMON_GENERATION).toBe(...)` assertion inside that test. Uses the
+ * same AST-backed extraction as the guard so comments and similarly named text
+ * cannot match. Returns undefined when the pin test is missing or ambiguous.
+ */
+function topicRegistryGenerationPinLocation(source: string): { titleDigitsStart: number; titleDigitsEnd: number; toBeStart: number; toBeEnd: number } | undefined {
+	try {
+		const ast = parse(source, { sourceType: "module", plugins: ["typescript"] });
+		for (const statement of ast.program.body) {
+			if (statement.type !== "ExpressionStatement" || statement.expression.type !== "CallExpression") continue;
+			const call = statement.expression;
+			if (call.callee.type !== "Identifier" || call.callee.name !== "test" || call.arguments.length < 2) continue;
+			const title = call.arguments[0];
+			if (!title || title.type !== "StringLiteral") continue;
+			const raw = title.extra?.raw;
+			if (typeof raw !== "string" || typeof title.start !== "number" || !TOPIC_REGISTRY_GENERATION_PIN_TITLE.test(title.value)) continue;
+			const digits = /generation (\d+)/.exec(raw);
+			if (!digits) continue;
+			const titleDigitsStart = title.start + digits.index + "generation ".length;
+			const titleDigitsEnd = titleDigitsStart + digits[1]!.length;
+			const callback = call.arguments[1];
+			if (!callback || (callback.type !== "ArrowFunctionExpression" && callback.type !== "FunctionExpression")) continue;
+			const toBe = topicRegistryToBeLiteral(callback.body);
+			if (!toBe) continue;
+			return { titleDigitsStart, titleDigitsEnd, toBeStart: toBe.start, toBeEnd: toBe.end };
+		}
+		return undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** The pinned generation number the topic-registry durable-authority snapshot asserts. */
+export function topicRegistryGenerationPin(source: string): number | undefined {
+	const location = topicRegistryGenerationPinLocation(source);
+	if (!location) return undefined;
+	return Number(source.slice(location.toBeStart, location.toBeEnd));
+}
+
+/**
+ * Rewrite the topic-registry durable-authority generation pin (the test title
+ * digits and the `expect(DAEMON_GENERATION).toBe(...)` assertion) to a new
+ * integer, preserving all surrounding source formatting. Throws if the pin test
+ * is missing, ambiguous, or non-numeric — never silently writes a malformed edit.
+ */
+export function replaceTopicRegistryGenerationPin(source: string, newValue: number): string {
+	const location = topicRegistryGenerationPinLocation(source);
+	if (!location) throw new Error("telegram-daemon-generation-guard: the topic-registry durable-authority generation pin test must be present and unique to sync");
+	return `${source.slice(0, location.titleDigitsStart)}${String(newValue)}${source.slice(location.titleDigitsEnd, location.toBeStart)}${String(newValue)}${source.slice(location.toBeEnd)}`;
+}
+
 /** A single generation-constant repair edit. */
 export type GenerationEdit = { kind: "telegram" | "discord" | "slack"; file: string; from: number; to: number };
 
 /** The complete repair plan for one `--fix-generations` invocation. */
 export type RepairPlan = {
 	generationEdits: GenerationEdit[];
+	/** Deterministic sync of the topic-registry durable-authority snapshot pin. */
+	fixtureEdits: GenerationEdit[];
 	needsGuardPolicyAuthority: boolean;
 	guardContractEdit: { from: number; to: number } | undefined;
 	malformedDeclarations: string[];
@@ -1173,17 +1291,39 @@ export function computeRepairPlan(
 	baseInventory: Inventory = inventory,
 ): RepairPlan {
 	const decision = evaluate(base, head, inventory, baseInventory);
-	if (decision.malformedDeclarations.length > 0)
-		return { generationEdits: [], needsGuardPolicyAuthority: false, guardContractEdit: undefined, malformedDeclarations: decision.malformedDeclarations, noProtectedChanges: false };
+	const malformedDeclarations = [...decision.malformedDeclarations];
 	const generationEdits: GenerationEdit[] = [];
-	const telegramAffected = decision.protectedChanges.some(change => change.startsWith("telegram:"));
-	if (telegramAffected) {
-		const baseGen = generation(base.get(telegramContract));
-		const headGen = generation(head.get(telegramContract));
-		if (baseGen === undefined || headGen === undefined)
-			throw new Error("telegram-daemon-generation-guard: DAEMON_GENERATION is missing or non-numeric in base or head");
-		if (headGen <= baseGen) generationEdits.push({ kind: "telegram", file: telegramContract, from: headGen, to: baseGen + 1 });
+	const fixtureEdits: GenerationEdit[] = [];
+	let telegramTargetGeneration: number | undefined;
+	if (decision.malformedDeclarations.length === 0) {
+		const telegramAffected = decision.protectedChanges.some(change => change.startsWith("telegram:"));
+		if (telegramAffected) {
+			const baseGen = generation(base.get(telegramContract));
+			const headGen = generation(head.get(telegramContract));
+			if (baseGen === undefined || headGen === undefined)
+				throw new Error("telegram-daemon-generation-guard: DAEMON_GENERATION is missing or non-numeric in base or head");
+			if (headGen <= baseGen) generationEdits.push({ kind: "telegram", file: telegramContract, from: headGen, to: baseGen + 1 });
+			telegramTargetGeneration = headGen > baseGen ? headGen : baseGen + 1;
+		} else {
+			telegramTargetGeneration = generation(head.get(telegramContract));
+		}
+		// Deterministically reconcile the topic-registry durable-authority snapshot
+		// with the canonical head generation — whether the generation moved in this
+		// transition or is already current — so a valid bump can never leave the
+		// hard-coded pin stale. A present-but-malformed pin fails closed.
+		const baseFixture = base.get(topicRegistryFixture);
+		const headFixture = head.get(topicRegistryFixture);
+		if (telegramTargetGeneration !== undefined && baseFixture !== undefined && headFixture !== undefined) {
+			const headPin = topicRegistryGenerationPin(headFixture);
+			if (headPin === undefined) {
+				malformedDeclarations.push(`telegram:${topicRegistryFixture}:durable-authority-generation-pin`);
+			} else if (headPin !== telegramTargetGeneration) {
+				fixtureEdits.push({ kind: "telegram", file: topicRegistryFixture, from: headPin, to: telegramTargetGeneration });
+			}
+		}
 	}
+	if (malformedDeclarations.length > 0)
+		return { generationEdits: [], fixtureEdits: [], needsGuardPolicyAuthority: false, guardContractEdit: undefined, malformedDeclarations, noProtectedChanges: false };
 	for (const kind of ["discord", "slack"] as const) {
 		const affected = decision.protectedChanges.some(change => change.startsWith(`${kind}:`));
 		if (!affected) continue;
@@ -1201,7 +1341,7 @@ export function computeRepairPlan(
 			throw new Error("telegram-daemon-generation-guard: GUARD_CONTRACT_VERSION is missing or non-numeric in base");
 		guardContractEdit = { from: baseVersion, to: baseVersion + 1 };
 	}
-	return { generationEdits, needsGuardPolicyAuthority, guardContractEdit, malformedDeclarations: [], noProtectedChanges: decision.protectedChanges.length === 0 };
+	return { generationEdits, fixtureEdits, needsGuardPolicyAuthority, guardContractEdit, malformedDeclarations: [], noProtectedChanges: decision.protectedChanges.length === 0 };
 }
 
 /**
@@ -1222,6 +1362,7 @@ export async function fixGenerations(baseInput: string | undefined, options: { f
 	const filePaths = [
 		guardScript,
 		manifestScript,
+		topicRegistryFixture,
 		...new Set([
 			...Object.values(baseInventory).flatMap(inv => Object.keys(inv)),
 			...Object.values(protectedInventory).flatMap(inv => Object.keys(inv)),
@@ -1240,13 +1381,14 @@ export async function fixGenerations(baseInput: string | undefined, options: { f
 	if (plan.needsGuardPolicyAuthority && !options.fixGuardPolicy)
 		throw new Error("telegram-daemon-generation-guard: guard policy change requires a strictly higher GUARD_CONTRACT_VERSION; rerun with --fix-guard-policy to bump it automatically");
 	const hasGuardContractBump = plan.needsGuardPolicyAuthority && options.fixGuardPolicy === true && plan.guardContractEdit !== undefined;
-	if (plan.generationEdits.length === 0 && !hasGuardContractBump) {
+	if (plan.generationEdits.length === 0 && plan.fixtureEdits.length === 0 && !hasGuardContractBump) {
 		console.log(`telegram-daemon-generation-guard: v${GUARD_CONTRACT_VERSION} no generation bumps required`);
 		return;
 	}
 	// Snapshot every file that may be mutated so rollback restores the exact prior state.
 	const editFiles = new Set<string>();
 	for (const edit of plan.generationEdits) editFiles.add(edit.file);
+	for (const edit of plan.fixtureEdits) editFiles.add(edit.file);
 	if (hasGuardContractBump) editFiles.add(guardScript);
 	editFiles.add(manifestScript);
 	const snapshots = new Map<string, string | undefined>();
@@ -1259,6 +1401,11 @@ export async function fixGenerations(baseInput: string | undefined, options: { f
 				? replaceNumericLiteral(current, "DAEMON_GENERATION", edit.to)
 				: replaceNumericLiteral(current, "CHAT_DAEMON_GENERATIONS", edit.to, edit.kind);
 			await Bun.write(filePath, updated);
+		}
+		for (const edit of plan.fixtureEdits) {
+			const filePath = path.join(root, edit.file);
+			const current = await Bun.file(filePath).text();
+			await Bun.write(filePath, replaceTopicRegistryGenerationPin(current, edit.to));
 		}
 		if (hasGuardContractBump && plan.guardContractEdit) {
 			const guardPath = path.join(root, guardScript);
@@ -1305,6 +1452,7 @@ export async function fixGenerations(baseInput: string | undefined, options: { f
 		}
 		// Print a bounded, secret-free summary.
 		const parts: string[] = plan.generationEdits.map(edit => `${edit.kind} ${edit.from}→${edit.to}`);
+		for (const edit of plan.fixtureEdits) parts.push(`fixture ${edit.from}→${edit.to}`);
 		if (hasGuardContractBump && plan.guardContractEdit) parts.push(`guard-contract ${plan.guardContractEdit.from}→${plan.guardContractEdit.to}`);
 		console.log(`telegram-daemon-generation-guard: v${GUARD_CONTRACT_VERSION} applied ${parts.join(", ")}`);
 	} catch (error) {

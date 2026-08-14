@@ -265,6 +265,10 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * instead of root-only signalRoot), identity-fenced orphan-owner reconciliation
  * in the daemon run loop, pre-poll stale-poller fencing, and fail-closed
  * watchdog behavior when stable identity authority is unavailable (#4403).
+ * Generation 167 repairs the telegram daemon generation guard bootstrap so the
+ * generator's post-fix manifest check always byte-compares the regenerated disk
+ * manifest against the current tree, and auto-reaps pre-registry legacy stray
+ * Telegram daemons (#4533).
  */
 export const DAEMON_GENERATION = 167;
 

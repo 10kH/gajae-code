@@ -16,8 +16,10 @@ import {
 	manifestForCurrentTree,
 	protectedInventory,
 	replaceNumericLiteral,
+	replaceTopicRegistryGenerationPin,
 	TELEGRAM_LIFECYCLE_PROTECTED_DECLARATIONS,
 	TELEGRAM_SHUTDOWN_DRAIN_PROTECTED_DECLARATIONS,
+	topicRegistryGenerationPin,
 	validateCiInputs,
 	validateCurrentTreeManifest,
 	validateInventory,
@@ -29,6 +31,7 @@ import {
 
 const guardScript = "scripts/telegram-daemon-generation-guard.ts";
 const manifestScript = "scripts/telegram-daemon-generation-manifest.json";
+const topicRegistryFixture = "packages/coding-agent/test/notifications-topic-registry.test.ts";
 const stableEntries = (value: Record<string, string>) => JSON.stringify(Object.entries(value).sort());
 
 const telegramContract = "packages/coding-agent/src/sdk/bus/telegram-daemon-contract.ts";
@@ -1303,5 +1306,123 @@ describe("fix-generations auto-repair", () => {
 		const remediationMessage = `protected Telegram lifecycle change requires a strictly higher DAEMON_GENERATION: ${telegramChanges.join(", ")}\n${FIX_GENERATIONS_REMEDIATION}`;
 		expect(remediationMessage).toContain("--fix-generations");
 		expect(FIX_GENERATIONS_REMEDIATION).toContain("base-sha");
+	});
+
+	test("topicRegistryGenerationPin extracts the pinned durable-authority generation", () => {
+		const source = `test("publishes exact durable authority generation 166 at serving epoch 87", () => {
+	// Generation 58: parser-valid durable-fence promotion and rollback.
+	expect(DAEMON_GENERATION).toBe(166);
+	expect(SERVING_EPOCH).toBe(87);
+});`;
+		expect(topicRegistryGenerationPin(source)).toBe(166);
+		expect(topicRegistryGenerationPin('test("unrelated", () => { expect(DAEMON_GENERATION).toBe(5); });')).toBeUndefined();
+	});
+
+	test("replaceTopicRegistryGenerationPin rewrites title and assertion preserving formatting", () => {
+		const source = `import { DAEMON_GENERATION } from "../src/telegram-daemon-contract";
+
+test("publishes exact durable authority generation 166 at serving epoch 87", () => {
+	// Generation 166: complete owned process-group cleanup (#4403).
+	expect(DAEMON_GENERATION).toBe(166);
+	expect(SERVING_EPOCH).toBe(87);
+});`;
+		expect(replaceTopicRegistryGenerationPin(source, 167)).toBe(`import { DAEMON_GENERATION } from "../src/telegram-daemon-contract";
+
+test("publishes exact durable authority generation 167 at serving epoch 87", () => {
+	// Generation 166: complete owned process-group cleanup (#4403).
+	expect(DAEMON_GENERATION).toBe(167);
+	expect(SERVING_EPOCH).toBe(87);
+});`);
+	});
+
+	test("replaceTopicRegistryGenerationPin fails closed on a missing or malformed pin test", () => {
+		expect(() => replaceTopicRegistryGenerationPin('test("unrelated", () => {});', 167)).toThrow("must be present and unique to sync");
+		expect(() => replaceTopicRegistryGenerationPin('test("publishes exact durable authority generation 166 at serving epoch 87", () => { expect(DAEMON_GENERATION).toBe("stale"); });', 167)).toThrow("must be present and unique to sync");
+	});
+
+	test("computeRepairPlan syncs the fixture pin when the Telegram generation already moved in head", () => {
+		const base = repairFiles({ telegramGeneration: 166, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 167, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const fixtureSource = (generation: number) =>
+			`test("publishes exact durable authority generation ${generation} at serving epoch 87", () => {\n\texpect(DAEMON_GENERATION).toBe(${generation});\n});`;
+		base.set(topicRegistryFixture, fixtureSource(166));
+		head.set(topicRegistryFixture, fixtureSource(166));
+		const plan = computeRepairPlan(base, head, inventory);
+		// The author already bumped the contract; only the stale fixture needs syncing.
+		expect(plan.generationEdits).toEqual([]);
+		expect(plan.fixtureEdits).toEqual([{ kind: "telegram", file: topicRegistryFixture, from: 166, to: 167 }]);
+	});
+
+	test("computeRepairPlan emits the fixture edit alongside a forced contract bump", () => {
+		const base = repairFiles({ telegramGeneration: 166, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 166, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return false;" });
+		const fixtureSource = (generation: number) =>
+			`test("publishes exact durable authority generation ${generation} at serving epoch 87", () => {\n\texpect(DAEMON_GENERATION).toBe(${generation});\n});`;
+		base.set(topicRegistryFixture, fixtureSource(166));
+		head.set(topicRegistryFixture, fixtureSource(166));
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.generationEdits).toEqual([{ kind: "telegram", file: contractFile, from: 166, to: 167 }]);
+		expect(plan.fixtureEdits).toEqual([{ kind: "telegram", file: topicRegistryFixture, from: 166, to: 167 }]);
+	});
+
+	test("computeRepairPlan leaves the fixture untouched when the Telegram generation is unchanged", () => {
+		const base = repairFiles({ telegramGeneration: 166, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 166, discordGeneration: 64, slackGeneration: 67, telegramOwnership: "return true;" });
+		head.set(chatControl, (head.get(chatControl) ?? "").replace("return value !== null", "return Boolean(value)"));
+		const fixtureSource = (generation: number) =>
+			`test("publishes exact durable authority generation ${generation} at serving epoch 87", () => {\n\texpect(DAEMON_GENERATION).toBe(${generation});\n});`;
+		base.set(topicRegistryFixture, fixtureSource(166));
+		head.set(topicRegistryFixture, fixtureSource(166));
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.fixtureEdits).toEqual([]);
+	});
+
+	test("computeRepairPlan fails closed on a malformed fixture pin when Telegram changes", () => {
+		const base = repairFiles({ telegramGeneration: 166, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 167, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		base.set(topicRegistryFixture, `test("publishes exact durable authority generation 166 at serving epoch 87", () => {});`);
+		head.set(topicRegistryFixture, `test("publishes exact durable authority generation 166 at serving epoch 87", () => {});`);
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.malformedDeclarations).toContain(`telegram:${topicRegistryFixture}:durable-authority-generation-pin`);
+		expect(plan.fixtureEdits).toEqual([]);
+	});
+
+	test("computeRepairPlan reconciles a fixture stale against the already-current generation", () => {
+		// The exact composition that left dev red: the canonical generation moved
+		// earlier (already merged) but the snapshot pin was never synced. There is
+		// no transition to detect, so the fixture is reconciled with the canonical
+		// head generation directly.
+		const base = repairFiles({ telegramGeneration: 167, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 167, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const fixtureSource = (generation: number) =>
+			`test("publishes exact durable authority generation ${generation} at serving epoch 87", () => {\n\texpect(DAEMON_GENERATION).toBe(${generation});\n});`;
+		base.set(topicRegistryFixture, fixtureSource(166));
+		head.set(topicRegistryFixture, fixtureSource(166));
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.noProtectedChanges).toBe(true);
+		expect(plan.generationEdits).toEqual([]);
+		expect(plan.fixtureEdits).toEqual([{ kind: "telegram", file: topicRegistryFixture, from: 166, to: 167 }]);
+	});
+
+	test("computeRepairPlan leaves an already-synced fixture untouched", () => {
+		const base = repairFiles({ telegramGeneration: 167, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const head = repairFiles({ telegramGeneration: 167, discordGeneration: 63, slackGeneration: 66, telegramOwnership: "return true;" });
+		const fixtureSource = (generation: number) =>
+			`test("publishes exact durable authority generation ${generation} at serving epoch 87", () => {\n\texpect(DAEMON_GENERATION).toBe(${generation});\n});`;
+		base.set(topicRegistryFixture, fixtureSource(167));
+		head.set(topicRegistryFixture, fixtureSource(167));
+		const plan = computeRepairPlan(base, head, inventory);
+		expect(plan.fixtureEdits).toEqual([]);
+	});
+
+	test("the committed topic-registry fixture tracks the canonical Telegram generation", async () => {
+		const fixture = await Bun.file(topicRegistryFixture).text();
+		const contract = await Bun.file(telegramContract).text();
+		const declared = declaration(contract, "DAEMON_GENERATION");
+		expect(declared).toBeDefined();
+		const canonical = Number(/DAEMON_GENERATION\s*=\s*(\d+)/.exec(declared!)?.[1]);
+		expect(Number.isInteger(canonical)).toBe(true);
+		const pinned = topicRegistryGenerationPin(fixture);
+		expect(pinned).toBe(canonical);
 	});
 });
