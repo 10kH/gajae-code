@@ -824,6 +824,7 @@ describe("managed attempt transaction", () => {
 		// be consumed, and the failure surfaces as an explicit local error.
 		expect(outcomeCalls).toBe(0);
 		expect(agent.state.error).toContain("provisional event buffer limit");
+		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_buffer_overflow");
 		expect(witnessReads).toBe(1);
 	});
 

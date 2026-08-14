@@ -662,7 +662,7 @@ export interface Usage {
 }
 
 export type StopReason = "stop" | "length" | "toolUse" | "error" | "aborted";
-export type AssistantErrorKind = "provider_safety_stop" | "local_snapshot_failure";
+export type AssistantErrorKind = "provider_safety_stop" | "local_snapshot_failure" | "local_buffer_overflow";
 
 export interface OpenAIResponsesHistoryPayload {
 	type: "openaiResponsesHistory";

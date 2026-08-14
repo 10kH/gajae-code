@@ -122,7 +122,11 @@ function collapsedSnapshotStream(model: Model): AssistantMessageEventStream {
 	});
 	return stream;
 }
-function prefixSnapshotErrorStream(model: Model, content: AssistantMessage["content"]): AssistantMessageEventStream {
+function localErrorEventStream(
+	model: Model,
+	content: AssistantMessage["content"],
+	errorMessage: string,
+): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message: AssistantMessage = {
@@ -140,12 +144,37 @@ function prefixSnapshotErrorStream(model: Model, content: AssistantMessage["cont
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "error",
-			errorMessage:
-				"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
+			errorMessage,
 			timestamp: Date.now(),
 		};
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
+	});
+	return stream;
+}
+function oversizedEventStream(model: Model): AssistantMessageEventStream {
+	const stream = new AssistantMessageEventStream();
+	queueMicrotask(() => {
+		const message: AssistantMessage = {
+			role: "assistant",
+			// One byte over MANAGED_ATTEMPT_MAX_STAGED_BYTES so the provisional
+			// staging buffer rejects the event with a local overflow.
+			content: [{ type: "text", text: "x".repeat(16 * 1024 * 1024 + 1) }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		stream.push({ type: "start", partial: message });
 	});
 	return stream;
 }
@@ -837,7 +866,11 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		let calls = 0;
 		createSession(model => {
 			calls += 1;
-			return prefixSnapshotErrorStream(model, [{ type: "text", text: "partial output" }]);
+			return localErrorEventStream(
+				model,
+				[{ type: "text", text: "partial output" }],
+				"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
+			);
 		});
 		const events: AgentSessionEvent[] = [];
 		session!.subscribe(event => events.push(event));
@@ -865,7 +898,12 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		createSession(
 			(model, context, options) => {
 				calls += 1;
-				if (calls === 1) return prefixSnapshotErrorStream(model, []);
+				if (calls === 1)
+					return localErrorEventStream(
+						model,
+						[],
+						"Managed fallback attempt could not produce a serializable event snapshot (local snapshot bug, not a provider failure)",
+					);
 				return createMockModel({ responses: [{ content: ["single-model recovery"] }] }).stream(
 					model,
 					context,
@@ -915,6 +953,83 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			errorMessage: expect.stringContaining("local snapshot bug"),
 		});
 		// Every bounded local retry must have discharged its provisional charge.
+		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
+			activeIndex: 0,
+			attemptsUsed: 0,
+			totalAttemptsUsed: 0,
+			tried: [],
+		});
+	});
+	it("surfaces a typed buffer overflow immediately without retry or provider fallback", async () => {
+		let calls = 0;
+		createSession((model, context, options) => {
+			calls += 1;
+			if (calls === 1) return oversizedEventStream(model);
+			return createMockModel({ responses: [{ content: ["healthy after overflow"] }] }).stream(
+				model,
+				context,
+				options,
+			);
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("trigger the buffer overflow"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toBe(1);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorKind: "local_buffer_overflow",
+			errorMessage: expect.stringContaining("provisional event buffer limit"),
+		});
+		// A local staging failure must not leave the provider fallback budget charged.
+		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
+			activeIndex: 0,
+			attemptsUsed: 0,
+			totalAttemptsUsed: 0,
+			tried: [],
+		});
+
+		await withTimeout(session!.prompt("fresh prompt after overflow"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toBe(2);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "stop",
+			content: [{ type: "text", text: "healthy after overflow" }],
+		});
+	});
+	it("surfaces a prefix-classified buffer overflow without retry", async () => {
+		let calls = 0;
+		createSession(model => {
+			calls += 1;
+			return localErrorEventStream(
+				model,
+				[],
+				"Managed fallback attempt exceeded the provisional event buffer limit",
+			);
+		});
+		const events: AgentSessionEvent[] = [];
+		session!.subscribe(event => events.push(event));
+
+		await withTimeout(session!.prompt("prefix-classified buffer overflow"), "prompt");
+		await withTimeout(session!.waitForIdle(), "waitForIdle");
+
+		expect(calls).toBe(1);
+		expect(session!.isRetrying).toBe(false);
+		expect(events.filter(event => event.type === "auto_retry_start")).toHaveLength(0);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		expect(session!.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: expect.stringContaining("provisional event buffer limit"),
+		});
 		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
 			activeIndex: 0,
 			attemptsUsed: 0,

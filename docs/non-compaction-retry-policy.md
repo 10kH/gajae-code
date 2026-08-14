@@ -55,6 +55,13 @@ Managed fallback uses structured transport facts and typed provider error codes 
 - Only content-free failures are eligible; a failure that carries visible or tool content surfaces immediately.
 - `retry.enabled: false` disables this retry even when a managed fallback chain is configured — the managed chain keeps its own availability policy, but the local-snapshot path is a session retry governed by `retry.*` settings.
 
+### Local buffer overflows (surface immediately, no retry)
+
+`local_buffer_overflow` (`errorKind`, or the stable `Managed fallback attempt exceeded the provisional event buffer limit` message prefix for restored sessions) is the sibling local staging fault: the provisional managed-attempt buffer exceeded its cap. Unlike snapshot failures, re-streaming the same request reproduces the same oversized response, so it is never retried:
+
+- Surfaces immediately with the original local diagnostic, regardless of `retry.*` settings.
+- Like snapshot failures, it never charges the fallback controller (the started attempt's provisional charge is discarded), never advances models, never emits `model_fallback_switched`, and never mutates or rotates credentials.
+
 ## Retry lifecycle and state transitions
 
 Session state used by retry:

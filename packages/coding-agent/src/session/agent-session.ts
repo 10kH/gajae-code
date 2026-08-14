@@ -1040,6 +1040,7 @@ type RetryErrorClassification =
 	| "transient"
 	| "local_unavailable"
 	| "local_snapshot"
+	| "local_buffer_overflow"
 	| "unknown";
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
@@ -16988,7 +16989,8 @@ export class AgentSession {
 				classification === "unknown" ||
 				classification === "first_event_timeout" ||
 				classification === "empty_response" ||
-				classification === "local_snapshot"
+				classification === "local_snapshot" ||
+				classification === "local_buffer_overflow"
 			);
 		}
 		const trigger = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
@@ -17012,7 +17014,8 @@ export class AgentSession {
 			classification === "transient" ||
 			classification === "unknown" ||
 			classification === "first_event_timeout" ||
-			classification === "local_snapshot"
+			classification === "local_snapshot" ||
+			classification === "local_buffer_overflow"
 		);
 	}
 
@@ -17104,14 +17107,18 @@ export class AgentSession {
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
+		if (message.errorKind === "local_buffer_overflow") return "local_buffer_overflow";
 		if (this.#isTypedFirstEventTimeout(message)) return "first_event_timeout";
 		if (this.#isTypedEmptyResponse(message)) return "empty_response";
 		if (!message.errorMessage) return "none";
 		const err = message.errorMessage;
-		// Managed-attempt snapshot failures from restored sessions may lack the
-		// typed error kind; match the stable message prefix as a fallback.
+		// Managed-attempt local failures from restored sessions may lack the
+		// typed error kind; match the stable message prefixes as a fallback.
 		if (err.startsWith("Managed fallback attempt could not produce a serializable event snapshot")) {
 			return "local_snapshot";
+		}
+		if (err.startsWith("Managed fallback attempt exceeded the provisional event buffer limit")) {
+			return "local_buffer_overflow";
 		}
 		// Provider safety refusals (e.g. Anthropic stop_reason "refusal" /
 		// "sensitive") are deterministic for the submitted context: replaying
@@ -17608,12 +17615,26 @@ export class AgentSession {
 			this.settings.has("retry.maxDelayMs");
 		const classification = this.#classifyErrorForRetry(message);
 		const localSnapshot = classification === "local_snapshot";
+		const localBufferOverflow = classification === "local_buffer_overflow";
 		// A local machinery failure must never stay charged against the provider
 		// fallback budget, no matter which local exit follows (disabled retry,
-		// visible-content surface, bounded retry, or exhaustion). Discard the
-		// started attempt's provisional charge up front; the discard is a no-op
-		// when no attempt is currently charged.
-		if (localSnapshot && managedFallback) controller.discardStartedAttempt();
+		// visible-content surface, bounded retry, exhaustion, or the immediate
+		// buffer-overflow surface). Discard the started attempt's provisional
+		// charge up front; the discard is a no-op when no attempt is currently
+		// charged.
+		if ((localSnapshot || localBufferOverflow) && managedFallback) controller.discardStartedAttempt();
+		// Local staging-capacity failure: re-streaming the same request
+		// reproduces the same oversized response, so automatic retry only burns
+		// tokens. Surface the explicit local diagnostic immediately without
+		// provider-fallback attribution or credential mutation.
+		if (localBufferOverflow) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
+		}
 		// retry.enabled=false always surfaces immediately, matching the explicit
 		// user opt-out. The managed provider-fallback chain keeps its own
 		// availability policy, but the local-snapshot path is a session retry

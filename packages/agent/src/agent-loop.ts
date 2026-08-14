@@ -100,9 +100,12 @@ export const MANAGED_ATTEMPT_MAX_STAGED_BYTES = 16 * 1024 * 1024;
  * NO transport facts or status by design — only original typed provider
  * transport facts may authorize provider fallback, so local buffer machinery
  * must never masquerade as provider evidence or consume the fallback chain.
- * It is therefore non-retryable and surfaces as an explicit local error.
+ * The typed `local_buffer_overflow` kind lets session retry policy surface it
+ * immediately without any retry: re-streaming the same request reproduces the
+ * same oversized response, so an automatic re-issue only burns tokens.
  */
 class ManagedAttemptBufferOverflowError extends Error {
+	readonly errorKind = "local_buffer_overflow" as const;
 	constructor() {
 		super("Managed fallback attempt exceeded the provisional event buffer limit");
 		this.name = "ManagedAttemptBufferOverflowError";
@@ -332,7 +335,7 @@ function managedFailureMessage(error: unknown, config: AgentLoopConfig): Assista
 		stopReason: "error",
 		errorMessage: fallbackMessage,
 		...(transportFailure ? { transportFailure } : {}),
-		...(errorKind === "local_snapshot_failure" ? { errorKind: "local_snapshot_failure" as const } : {}),
+		...(errorKind === "local_snapshot_failure" || errorKind === "local_buffer_overflow" ? { errorKind } : {}),
 		timestamp: Date.now(),
 	};
 }
