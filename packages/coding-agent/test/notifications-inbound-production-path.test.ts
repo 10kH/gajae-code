@@ -57,16 +57,25 @@ test("production admission defers valid suspended controls instead of dropping t
 	expect(deferGate).not.toContain("notification policy is suspended");
 });
 
-test("production user-message acceptance awaits session admission before acking", () => {
+test("production user-message acceptance commits at preflight acceptance before the turn", () => {
 	const userMessageStart = bus.indexOf('if (inbound.kind === "user_message")');
 	expect(userMessageStart).toBeGreaterThan(0);
-	const injection = bus.slice(userMessageStart, userMessageStart + 2_600);
+	const injection = bus.slice(userMessageStart, userMessageStart + 3_200);
+	// Acceptance is signalled through the preflight-acceptance callbacks, which
+	// AgentSession fires after admission commits but before turn_start — not
+	// after the full prompt settles (which turn_start can out-race).
+	expect(injection).toContain("onPreflightAcceptCommit: acceptAdmission");
+	expect(injection).toContain("onPreflightAccepted: acceptAdmission");
+	// The ack is idempotent: the callback and the post-await fallback share one
+	// acceptedSent latch, so exactly one accepted ack per update id.
+	expect(injection).toContain("if (acceptedSent) return;");
+	expect(injection).toContain("acceptedSent = true;");
+	expect(injection).toContain("runtime.pendingInbound.add(inbound.updateId)");
+	// A rejection at any stage (preflight, admission, or later) still maps to a
+	// single rejected ack with the injection-failure reason.
 	expect(injection).toContain("await api.sendUserMessage(");
-	const acceptedIndex = injection.indexOf('"accepted"');
-	const awaitIndex = injection.indexOf("await api.sendUserMessage(");
-	expect(awaitIndex).toBeGreaterThan(-1);
-	expect(acceptedIndex).toBeGreaterThan(awaitIndex);
-	expect(injection).toContain('"rejected",\n\t\t\t\t\t\t\t"injection_failed"');
+	expect(injection).toContain('"rejected",');
+	expect(injection).toContain('"injection_failed"');
 });
 
 test("production daemon queues only on accepted and retracts rejected or dropped", () => {

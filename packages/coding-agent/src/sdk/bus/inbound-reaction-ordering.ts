@@ -19,10 +19,20 @@ export interface InboundReactionTransition {
 	readonly terminal: boolean;
 }
 
+/**
+ * Terminal tombstones are retained only for a bounded window of recent update
+ * ids. Telegram update ids are monotonically increasing per bot, so a stale
+ * `accepted` ack that could overwrite a terminal state always carries an id at
+ * or below the terminal one; ids far below the window are long-expired updates
+ * whose correction target no longer exists, so the daemon's own target lookup
+ * already ignores them.
+ */
+export const INBOUND_REACTION_TOMBSTONE_WINDOW = 512;
+
 export class InboundReactionSequencer {
 	/** Update ids whose reaction reached a terminal (consumed/retracted) state. */
-	readonly #terminal = new Set<number>();
-	/** Per-update serialization chain. */
+	readonly #terminal = new Map<number, true>();
+	/** Per-update serialization chain, deleted once settled. */
 	readonly #chains = new Map<number, Promise<void>>();
 
 	/** True once a terminal transition completed for this update. */
@@ -38,15 +48,47 @@ export class InboundReactionSequencer {
 		const run = async (): Promise<void> => {
 			if (this.#terminal.has(updateId)) return;
 			await transition.effect();
-			if (transition.terminal) this.#terminal.add(updateId);
+			if (transition.terminal) {
+				this.#terminal.set(updateId, true);
+				this.#evictStaleTombstones(updateId);
+			}
 		};
 		const prior = this.#chains.get(updateId) ?? Promise.resolve();
 		const next = prior.then(run, run);
+		// The chain is retained only while unsettled work exists for the update;
+		// once settled it is deleted so the map cannot grow without bound. The
+		// stored tail never rejects (both arms handle) so an unawaited chain can
+		// never surface an unhandled rejection.
+		const settled = next.then(
+			() => this.#chains.delete(updateId),
+			() => this.#chains.delete(updateId),
+		);
 		this.#chains.set(
 			updateId,
-			next.catch(() => undefined),
+			settled.then(() => undefined),
 		);
 		return next;
+	}
+
+	/** @internal Test-only: number of retained per-update chains. */
+	debugChainCount(): number {
+		return this.#chains.size;
+	}
+
+	/** @internal Test-only: number of retained terminal tombstones. */
+	debugTombstoneCount(): number {
+		return this.#terminal.size;
+	}
+
+	/** Keep only recent terminal tombstones relative to the newest terminal id. */
+	#evictStaleTombstones(newestTerminalId: number): void {
+		// Distance-based, not count-based: any terminal id further than the
+		// retention window below the newest terminal id is evicted regardless of
+		// how many tombstones are currently retained, so the map stays bounded by
+		// the window while near-term tombstones always survive.
+		for (const updateId of this.#terminal.keys()) {
+			if (newestTerminalId - updateId >= INBOUND_REACTION_TOMBSTONE_WINDOW) this.#terminal.delete(updateId);
+		}
 	}
 }
 

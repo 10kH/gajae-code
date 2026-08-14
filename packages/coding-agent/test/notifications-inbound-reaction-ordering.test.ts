@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	INBOUND_REACTION_TOMBSTONE_WINDOW,
 	InboundReactionSequencer,
 	inboundReactionRetractPayload,
 	inboundReactionSetPayload,
@@ -129,6 +130,63 @@ describe("inbound reaction transition ordering", () => {
 		expect(order).toEqual(["first", "second"]);
 		first.call.release();
 		await firstPromise;
+	});
+
+	test("settled chains are deleted so per-update state stays bounded", async () => {
+		const sequencer = new InboundReactionSequencer();
+		const effects: string[] = [];
+		for (let updateId = 1; updateId <= 50; updateId++) {
+			await sequencer.apply(updateId, {
+				terminal: true,
+				effect: async () => {
+					effects.push(`retract-${updateId}`);
+				},
+			});
+		}
+		expect(effects.length).toBe(50);
+		// After every transition settled there is no in-flight work left, so no
+		// per-update chain may be retained. (Tombstones are covered separately.)
+		expect(sequencer.debugChainCount()).toBe(0);
+	});
+
+	test("terminal tombstones evict only updates far outside the recent window", async () => {
+		const sequencer = new InboundReactionSequencer();
+		const near = 1_000;
+		const recent = 1_200;
+		// Two terminal updates inside one retention window of each other.
+		await sequencer.apply(near, { terminal: true, effect: async () => undefined });
+		await sequencer.apply(recent, { terminal: true, effect: async () => undefined });
+		expect(sequencer.isTerminal(near)).toBe(true);
+		expect(sequencer.isTerminal(recent)).toBe(true);
+
+		// A stale accepted for a still-retained terminal update is still ignored.
+		const staleEffects: string[] = [];
+		await sequencer.apply(recent, {
+			terminal: false,
+			effect: async () => {
+				staleEffects.push("queued");
+			},
+		});
+		expect(staleEffects).toEqual([]);
+
+		// A much newer terminal update evicts only tombstones outside the window;
+		// near-term ones survive so a late accepted cannot overwrite them.
+		const newest = near + INBOUND_REACTION_TOMBSTONE_WINDOW;
+		await sequencer.apply(newest, { terminal: true, effect: async () => undefined });
+		expect(sequencer.isTerminal(near)).toBe(false);
+		expect(sequencer.isTerminal(recent)).toBe(true);
+		expect(sequencer.isTerminal(newest)).toBe(true);
+		// Bounded: total retained tombstones never exceed the window.
+		expect(sequencer.debugTombstoneCount()).toBeLessThanOrEqual(INBOUND_REACTION_TOMBSTONE_WINDOW);
+	});
+
+	test("retained tombstone state stays bounded across many updates", async () => {
+		const sequencer = new InboundReactionSequencer();
+		for (let updateId = 1; updateId <= INBOUND_REACTION_TOMBSTONE_WINDOW * 3; updateId++) {
+			await sequencer.apply(updateId, { terminal: true, effect: async () => undefined });
+		}
+		expect(sequencer.debugTombstoneCount()).toBeLessThanOrEqual(INBOUND_REACTION_TOMBSTONE_WINDOW);
+		expect(sequencer.debugChainCount()).toBe(0);
 	});
 
 	test("set payload maps an emoji marker to the Bot API reaction array", () => {

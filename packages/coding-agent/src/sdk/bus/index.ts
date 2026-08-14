@@ -7238,14 +7238,28 @@ export function createNotificationsExtension(
 									),
 								]
 							: text;
-					try {
-						// sendUserMessage is async: admission (prompt preflight, session
-						// admission, steer queuing) settles only when the returned promise
-						// settles. Awaiting it is what lets a late rejection below map to a
-						// `rejected` ack instead of a false `accepted`.
-						await api.sendUserMessage(content, runtime?.busy ? { deliverAs: "steer" } : undefined);
+					let acceptedSent = false;
+					const acceptAdmission = (): void => {
+						// Fired by AgentSession's preflight acceptance: after admission has
+						// committed but before the turn starts. Registering the update id and
+						// acking here means turn_start can no longer race ahead of the
+						// pendingInbound registration it consumes.
+						if (acceptedSent) return;
+						acceptedSent = true;
 						if (runtime && typeof inbound.updateId === "number") runtime.pendingInbound.add(inbound.updateId);
 						sendInboundAck(authenticatedInbound.connectionId, authenticatedInbound, "accepted");
+					};
+					try {
+						// sendUserMessage is async and settles only after the full prompt, so
+						// acceptance is signalled by the preflight-acceptance callback instead
+						// of after the await; a rejection (preflight, admission, or later)
+						// still reaches the catch and maps to a rejected ack.
+						await api.sendUserMessage(content, {
+							...(runtime?.busy ? { deliverAs: "steer" as const } : {}),
+							onPreflightAcceptCommit: acceptAdmission,
+							onPreflightAccepted: acceptAdmission,
+						});
+						acceptAdmission();
 					} catch (e) {
 						sendInboundAck(
 							authenticatedInbound.connectionId,
