@@ -14,6 +14,12 @@
 ### Fixed
 - `exactReplacePath` now retries transient Windows destination-sharing violations (#4330): when another handle denies delete sharing on the destination, the pre-mutation destination open is retried a bounded 30 × 100 ms before failing, and an exhausted retry reports the specific `sharing_violation` category with the underlying hex NTSTATUS (`windowsErrorCode`, e.g. `0xC0000043`) instead of a bare `io_error`. Only the destination open is retried — never after any namespace mutation — so a retry can never publish twice, and permission, path-not-found, disk-full, and identity failures are never retried.
 
+## [0.13.2] - 2026-08-13
+
+### Added
+
+- `renameNoReplacePathAsync` and `linkNoReplacePathAsync` schedule checked no-replace namespace publication primitives on the native blocking-work pool, so managed output publication can await the rename/link syscall boundary without blocking the host event loop (#4396 by @Yeachan-Heo; fixes #4394).
+
 ## [0.13.1] - 2026-08-11
 
 ### Fixed
