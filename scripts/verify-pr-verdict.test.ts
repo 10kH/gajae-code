@@ -103,6 +103,12 @@ test("canonicalDiffSha256 hashes exact bytes", () => {
 	expect(canonicalDiffSha256("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 });
 
+test("server approval requires reviewer repository authority", async () => {
+	const source = await Bun.file(new URL("./verify-pr-verdict.ts", import.meta.url)).text();
+	expect(source).toContain("/collaborators/${encodeURIComponent(reviewerId)}/permission");
+	expect(source).toContain('["admin", "maintain", "write"]');
+});
+
 test("hook keeps repository root separate from nested invocation cwd", async () => {
 	const hook = await Bun.file(new URL("../docs/examples/gjc-hooks/pre/bash.ts", import.meta.url)).text();
 	expect(hook).toContain('"--repo", repositoryRoot, "--invocation-cwd", invocationCwd');
@@ -111,7 +117,8 @@ test("hook keeps repository root separate from nested invocation cwd", async () 
 test("workflow is trusted-default-branch-controlled, read-only, exact-head, and invokes only base code", async () => {
 	const workflow = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(workflow).toContain("pull_request_target:");
-	expect(workflow).not.toContain("pull_request_review:");
+	expect(workflow).toContain("pull_request_review:");
+	expect(workflow).toContain("types: [submitted, edited, dismissed]");
 	expect(workflow).not.toContain("if: ${{ false }}");
 	expect(workflow).not.toMatch(/^\s+pull_request:\s*$/mu);
 	expect(workflow).toContain("permissions:\n  contents: read\n  pull-requests: read");
@@ -196,6 +203,8 @@ test("dev CI carries immutable inline first-landing bootstrap validation", async
 	expect(workflow).toContain("bun scripts/verify-gjc-state-writers.ts --fail --root .");
 	expect(workflow).toContain("Expected exactly one verdict line");
 	expect(workflow).toContain("effective exact-head approval");
+	expect(workflow).toContain("lacks repository review authority");
+	expect(workflow).toContain("/collaborators/${encodeURIComponent(reviewerId)}/permission");
 	expect(workflow).toContain('review.state !== "COMMENTED" && review.commit_id === head');
 	expect(workflow).not.toContain("pr-head/scripts/verify-pr-verdict.ts");
 });
@@ -204,7 +213,8 @@ test("review events cannot launch or cancel the affected Dev CI pipeline", async
 	const devCi = await Bun.file(new URL("../.github/workflows/dev-ci.yml", import.meta.url)).text();
 	const prContract = await Bun.file(new URL("../.github/workflows/pr-validation.yml", import.meta.url)).text();
 	expect(devCi).not.toContain("pull_request_review:");
-	expect(prContract).not.toContain("pull_request_review:");
+	expect(prContract).toContain("pull_request_review:");
+	expect(prContract).toContain("types: [submitted, edited, dismissed]");
 	expect(prContract).not.toContain("affected-plan");
 	expect(prContract).not.toContain("evidence producer");
 });

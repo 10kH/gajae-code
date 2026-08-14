@@ -131,6 +131,10 @@ interface PullRequestReview {
 	user?: { login?: string };
 }
 
+interface CollaboratorPermission {
+	permission?: string;
+}
+
 async function authenticatedApproval(event: PullRequestEvent, reviewerId: string, headSha: string): Promise<{ login?: string; headSha?: string }> {
 	const repository = event.repository?.full_name;
 	const number = event.pull_request?.number;
@@ -157,6 +161,16 @@ async function authenticatedApproval(event: PullRequestEvent, reviewerId: string
 	);
 	const approval = reviewerReviews.at(-1);
 	if (approval?.state !== "APPROVED") return {};
+	const permissionResponse = await fetch(`https://api.github.com/repos/${repository}/collaborators/${encodeURIComponent(reviewerId)}/permission`, {
+		headers: {
+			Accept: "application/vnd.github+json",
+			Authorization: `Bearer ${token}`,
+			"X-GitHub-Api-Version": "2022-11-28",
+		},
+	});
+	if (!permissionResponse.ok) return {};
+	const collaborator = await permissionResponse.json() as CollaboratorPermission;
+	if (!new Set(["admin", "maintain", "write"]).has(collaborator.permission ?? "")) return {};
 	return approval ? { login: approval.user!.login, headSha: approval.commit_id } : {};
 }
 
