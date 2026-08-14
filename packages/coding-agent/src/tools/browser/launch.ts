@@ -317,7 +317,11 @@ export function isChromeProfileExecutable(candidate: string): boolean {
  * it resolves to the generic `/usr/bin/snap` dispatcher by design.
  */
 export function isChromeProfileExecutableForLaunch(candidate: string, resolvedCandidate: string): boolean {
-	return path.posix.normalize(candidate) === "/snap/bin/chromium" || isChromeProfileExecutable(resolvedCandidate);
+	return (
+		(path.posix.normalize(candidate) === "/snap/bin/chromium" &&
+			path.posix.normalize(resolvedCandidate) === "/usr/bin/snap") ||
+		isChromeProfileExecutable(resolvedCandidate)
+	);
 }
 
 let resolvedProfileChrome: string | null | undefined; // undefined = unchecked; null = not found
