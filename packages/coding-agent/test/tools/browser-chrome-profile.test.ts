@@ -285,6 +285,23 @@ describe("Chrome profile browser mode (#809)", () => {
 		}
 	});
 
+	it("cancels Chrome profile resolution without waiting for a stalled realpath", async () => {
+		const stalled = Promise.withResolvers<string>();
+		vi.spyOn(fs, "realpath").mockReturnValue(stalled.promise);
+		const controller = new AbortController();
+		const resolution = resolveBrowserKindForTest(
+			{
+				action: "open",
+				app: { browser: "chrome", path: "/usr/bin/google-chrome", user_data_dir: "/tmp/gjc-chrome" },
+			},
+			makeSession("/work"),
+			controller.signal,
+		);
+		controller.abort();
+
+		await expect(resolution).rejects.toThrow(/aborted/i);
+	});
+
 	it("rejects every supported Chrome channel root while allowing custom roots", async () => {
 		const matrix = [
 			{

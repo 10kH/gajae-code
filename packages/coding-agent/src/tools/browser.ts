@@ -126,8 +126,12 @@ export interface BrowserToolDetails {
 	meta?: OutputMeta;
 }
 
-export function resolveBrowserKindForTest(params: BrowserParams, session: ToolSession): Promise<BrowserKind> {
-	return resolveBrowserKind(params, session);
+export function resolveBrowserKindForTest(
+	params: BrowserParams,
+	session: ToolSession,
+	signal?: AbortSignal,
+): Promise<BrowserKind> {
+	return resolveBrowserKind(params, session, signal);
 }
 
 /**
@@ -187,7 +191,7 @@ async function canonicalPath(
 	if (platform === process.platform) {
 		throwIfAborted(signal);
 		try {
-			resolved = await fs.realpath(resolved);
+			resolved = signal ? await untilAborted(signal, () => fs.realpath(resolved)) : await fs.realpath(resolved);
 		} catch {}
 		throwIfAborted(signal);
 	}
