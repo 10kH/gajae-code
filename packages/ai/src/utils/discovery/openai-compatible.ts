@@ -1,6 +1,7 @@
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import * as z from "zod/v4";
 import type { Api, FetchImpl, Model, Provider } from "../../types";
+import { toNumber } from "../../utils";
 
 const MODELS_PATH = "/models";
 
@@ -162,25 +163,16 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	const deduped = new Map<string, Model<TApi>>();
 	for (const entry of entries) {
-		const rawContextWindow =
-			typeof entry.max_model_len === "number" && entry.max_model_len > 0
-				? entry.max_model_len
-				: typeof entry.context_length === "number" && entry.context_length > 0
-					? entry.context_length
-					: typeof entry.context_window === "number" && entry.context_window > 0
-						? entry.context_window
-						: typeof entry.max_context_length === "number" && entry.max_context_length > 0
-							? entry.max_context_length
-							: typeof entry.max_position_embeddings === "number" && entry.max_position_embeddings > 0
-								? entry.max_position_embeddings
-								: UNK_CONTEXT_WINDOW;
+		const rawContextWindow = firstPositiveModelNumber(
+			UNK_CONTEXT_WINDOW,
+			entry.max_model_len,
+			entry.context_length,
+			entry.context_window,
+			entry.max_context_length,
+			entry.max_position_embeddings,
+		);
 
-		const rawMaxTokens =
-			typeof entry.max_tokens === "number" && entry.max_tokens > 0
-				? entry.max_tokens
-				: typeof entry.max_output_tokens === "number" && entry.max_output_tokens > 0
-					? entry.max_output_tokens
-					: UNK_MAX_TOKENS;
+		const rawMaxTokens = firstPositiveModelNumber(UNK_MAX_TOKENS, entry.max_tokens, entry.max_output_tokens);
 
 		const defaults: Model<TApi> = {
 			id: entry.id,
@@ -263,4 +255,21 @@ function extractModelEntriesFromNode(node: unknown): ParsedOpenAICompatibleModel
 	}
 
 	return null;
+}
+
+/**
+ * First finite positive number among candidates, else the fallback.
+ *
+ * Rejects non-numbers, non-finite values (JSON `1e400` parses to
+ * `Infinity`), zero, and negatives so a malformed catalog field can never
+ * poison compaction thresholds or output budgets with `Infinity`.
+ */
+function firstPositiveModelNumber(fallback: number, ...candidates: readonly unknown[]): number {
+	for (const candidate of candidates) {
+		const value = toNumber(candidate);
+		if (value !== undefined && value > 0 && Number.isFinite(value)) {
+			return value;
+		}
+	}
+	return fallback;
 }
