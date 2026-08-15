@@ -451,7 +451,6 @@ export function createInvocationReconciliation(
 ): InvocationReconciliation {
 	const ACTIVE_CAPACITY = 256;
 	const TERMINAL_CAPACITY = 512;
-	const TERMINAL_TTL_MS = 15 * 60_000;
 	const records = new Map<string, InvocationRecord>();
 	const reservations = new Map<string, InvocationKind>();
 	const reservationCounts = new Map<InvocationKind, number>([
@@ -498,11 +497,11 @@ export function createInvocationReconciliation(
 		);
 		await pending;
 	};
+	// Retention contract (#4547): terminal records are never age-evicted; only
+	// the per-kind oldest-terminal-first capacity trim removes them, so a
+	// fire-and-wake consumer can still query the canonical terminal outcome
+	// until capacity eviction honestly reports `unknown`.
 	const cleanup = (): void => {
-		const now = Date.now();
-		for (const [recordKey, record] of records) {
-			if (record.terminalAt !== undefined && record.terminalAt + TERMINAL_TTL_MS <= now) records.delete(recordKey);
-		}
 		for (const kind of ["prompt", "skill"] as const) {
 			const terminal = [...records.entries()]
 				.filter(([, record]) => record.kind === kind && record.terminalAt !== undefined)
