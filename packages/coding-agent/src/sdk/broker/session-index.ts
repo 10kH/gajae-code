@@ -1182,7 +1182,7 @@ export class SessionIndex {
 			const probed = new Map<string, string | undefined>();
 			for (const row of reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).identities) {
 				const recordedIncarnation = row.hostIncarnation ?? row.processIncarnation;
-				if (recordedIncarnation === undefined) continue;
+				if (recordedIncarnation === undefined || !alive(row.pid)) continue;
 				probed.set(`${row.sessionId}\u0000${row.endpointGeneration}\u0000${row.pid}`, processIncarnation(row.pid));
 			}
 			return await withSessionIndexLock("conditional unregister", this.#agentDir, async () => {
