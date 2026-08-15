@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
-import { fetchOpenAICompatibleModels } from "../src/utils/discovery/openai-compatible";
+import { fetchOpenAICompatibleModels, resolveLoopbackOpenAIBaseUrl } from "../src/utils/discovery/openai-compatible";
 
 const originalFetch = global.fetch;
 
@@ -196,5 +196,31 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 		expect(models).not.toBeNull();
 		expect(models![0].contextWindow).toBe(262144);
 		expect(models![0].maxTokens).toBe(4096);
+	});
+
+	it("rejects oversized and aborted catalogs without producing partial models", async () => {
+		global.fetch = (async () =>
+			new Response('{"data":[]}', {
+				status: 200,
+				headers: { "content-length": "1000001", "content-type": "application/json" },
+			})) as unknown as typeof fetch;
+		expect(await fetchOpenAICompatibleModels(options)).toBeNull();
+
+		const controller = new AbortController();
+		controller.abort();
+		global.fetch = (async (...[_url, init]: Parameters<typeof fetch>) => {
+			expect(init?.signal?.aborted).toBe(true);
+			throw new DOMException("Aborted", "AbortError");
+		}) as unknown as typeof fetch;
+		expect(await fetchOpenAICompatibleModels({ ...options, signal: controller.signal })).toBeNull();
+	});
+
+	it("accepts only loopback endpoints for implicit local-provider overrides", () => {
+		expect(resolveLoopbackOpenAIBaseUrl("http://localhost:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
+			"http://localhost:8080/v1",
+		);
+		expect(resolveLoopbackOpenAIBaseUrl("https://provider.example/v1", "http://127.0.0.1:8080/v1")).toBe(
+			"http://127.0.0.1:8080/v1",
+		);
 	});
 });

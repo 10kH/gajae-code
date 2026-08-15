@@ -22,6 +22,7 @@
 - Added `/extensions`, an interactive project/global `.gjc` manager for skills, hooks, MCPs, and explicit Claude Code/Codex imports with redacted previews and atomic rollback.
 
 ### Added
+- Added implicit discovery and keyless local support for oMLX (`http://127.0.0.1:8080/v1`) with `OMLX_BASE_URL` and `OMLX_API_KEY` configuration.
 
 - Gajae Pet now renders in iTerm2 using bounded inline PNG frames, with the same reserved composer-side layout and lifecycle cleanup used by Kitty and Sixel.
 - Added the bundled `ouroboros` dark theme, translating the official navy, teal, green, and gold identity into terminal-safe semantic colors while retaining the pet's vivid `#AEE80E` lime and `#7092BE` cool-scale accents. Live previews now recolor the open `/theme` selector and Settings theme submenu instead of leaving their construction-time theme visible, and confirmation consistently settles the preview into the active appearance mapping.

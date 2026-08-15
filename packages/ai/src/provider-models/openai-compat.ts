@@ -8,6 +8,7 @@ import {
 	fetchOpenAICompatibleModels,
 	type OpenAICompatibleModelMapperContext,
 	type OpenAICompatibleModelRecord,
+	resolveLoopbackOpenAIBaseUrl,
 } from "../utils/discovery/openai-compatible";
 import { toFireworksPublicModelId } from "../utils/fireworks-model-id";
 import { getGitHubCopilotBaseUrl, OPENCODE_HEADERS, parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
@@ -226,7 +227,6 @@ function mapLmStudioModel(
 		),
 	};
 }
-
 function normalizeAnthropicBaseUrl(baseUrl: string | undefined, fallback: string): string {
 	const value = baseUrl?.trim();
 	if (!value) {
@@ -1394,6 +1394,30 @@ export function lmStudioModelManagerOptions(
 					const reference = references.get(defaults.id);
 					return mapLmStudioModel(entry, defaults, reference);
 				},
+			}),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// 12.6. oMLX (Apple Silicon MLX Local Server)
+// ---------------------------------------------------------------------------
+
+export interface OmlxModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = resolveLoopbackOpenAIBaseUrl(config?.baseUrl ?? Bun.env.OMLX_BASE_URL, "http://127.0.0.1:8080/v1");
+	return {
+		providerId: "omlx",
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels({
+				api: "openai-completions",
+				provider: "omlx",
+				baseUrl,
+				apiKey,
 			}),
 	};
 }

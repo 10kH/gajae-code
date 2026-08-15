@@ -1132,7 +1132,12 @@ function assistantMessageHasVisibleOrToolContent(message: AssistantMessage): boo
 
 function isLocalModelEndpoint(model: Model | undefined): boolean {
 	if (!model) return false;
-	if (model.provider === "ollama" || model.provider === "lm-studio" || model.provider === "llama.cpp") {
+	if (
+		model.provider === "ollama" ||
+		model.provider === "lm-studio" ||
+		model.provider === "llama.cpp" ||
+		model.provider === "omlx"
+	) {
 		return true;
 	}
 	try {

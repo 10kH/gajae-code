@@ -33,6 +33,7 @@ import {
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
+import { resolveLoopbackOpenAIBaseUrl } from "@gajae-code/ai/utils/discovery/openai-compatible";
 
 // Sentinel for local-only OAuth token (LM Studio, vLLM) — declared inline to avoid loading
 // any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts.
@@ -95,6 +96,14 @@ export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, 
 export { isAuthenticated, kNoAuth };
 
 const MAX_SESSION_CANONICAL_VARIANTS = 64;
+function firstPositiveDiscoveryNumber(...values: readonly unknown[]): number | undefined {
+	for (const value of values) {
+		const number =
+			typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+		if (Number.isFinite(number) && number > 0) return number;
+	}
+	return undefined;
+}
 function redactDiscoveryUrl(value: string | URL): string {
 	try {
 		const url = typeof value === "string" ? new URL(value) : value;
@@ -597,7 +606,8 @@ function getProviderBaseUrlEnvKeys(provider: string): string[] {
  * never the project `.env`.
  */
 function resolveProviderBaseUrlFromEnv(provider: string): string | undefined {
-	return $pickCredentialEnv(...getProviderBaseUrlEnvKeys(provider));
+	const baseUrl = $pickCredentialEnv(...getProviderBaseUrlEnvKeys(provider));
+	return provider === "omlx" && baseUrl ? resolveLoopbackOpenAIBaseUrl(baseUrl, "http://127.0.0.1:8080/v1") : baseUrl;
 }
 
 function normalizeLocalOpenAICompatBaseUrl(baseUrl: string): string {
@@ -1686,7 +1696,9 @@ export class ModelRegistry {
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
 		const liveBaseUrl =
-			providerConfig.discovery.type === "openai-models-list" || providerConfig.discovery.type === "lm-studio"
+			providerConfig.discovery.type === "openai-models-list" ||
+			providerConfig.discovery.type === "lm-studio" ||
+			providerConfig.discovery.type === "omlx"
 				? this.#normalizeOpenAIModelsListBaseUrl(
 						this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
 					)
@@ -1710,7 +1722,9 @@ export class ModelRegistry {
 		});
 	}
 	#sanitizeDiscoverableModelsForCache(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		return providerConfig.discovery.type === "openai-models-list" || providerConfig.discovery.type === "lm-studio"
+		return providerConfig.discovery.type === "openai-models-list" ||
+			providerConfig.discovery.type === "lm-studio" ||
+			providerConfig.discovery.type === "omlx"
 			? this.#stripModelBaseUrlQueries(models)
 			: models;
 	}
@@ -1762,6 +1776,18 @@ export class ModelRegistry {
 			// Implicit LM Studio auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("lm-studio");
 			this.#keylessProviders.add("lm-studio");
+		}
+		if (!configuredProviders.has("omlx") && !disabledProviders.has("omlx")) {
+			this.#discoveryManager.addProvider({
+				provider: "omlx",
+				api: "openai-completions",
+				baseUrl: resolveLoopbackOpenAIBaseUrl(Bun.env.OMLX_BASE_URL, "http://127.0.0.1:8080/v1"),
+				discovery: { type: "omlx" },
+				optional: true,
+			});
+			// Implicit oMLX auth is optional and may be added after startup.
+			this.#optionalAuthProviders.add("omlx");
+			this.#keylessProviders.add("omlx");
 		}
 	}
 
@@ -2454,6 +2480,7 @@ export class ModelRegistry {
 			case "llama.cpp":
 				return this.#discoverLlamaCppModels(providerConfig, apiKey);
 			case "lm-studio":
+			case "omlx":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 			case "models-dev":
@@ -2997,20 +3024,21 @@ export class ModelRegistry {
 			}
 			throw new Error(`HTTP ${response.status} from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
-		const payload = (await response.json()) as {
-			data?: Array<{ id: string; name?: string; context_length?: number }>;
-		};
-		const models = payload.data ?? [];
+		const payload: unknown = await response.json();
+		if (!isRecord(payload) || !Array.isArray(payload.data)) {
+			throw new Error(`Malformed OpenAI models-list response from ${redactDiscoveryUrl(modelsUrl)}`);
+		}
+		const models = payload.data;
 		const discovered: Model<Api>[] = [];
 		for (const item of models) {
+			if (!isRecord(item) || typeof item.id !== "string" || !item.id.trim()) continue;
 			const id = item.id;
-			if (!id) continue;
 			const referenceModel = resolveCustomModelReference(id);
 			const api = this.#resolveDiscoveredModelApi(providerConfig, id);
 			discovered.push(
 				enrichModelThinking({
 					id,
-					name: item.name ?? referenceModel?.name ?? id,
+					name: typeof item.name === "string" ? item.name : (referenceModel?.name ?? id),
 					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
@@ -3019,8 +3047,23 @@ export class ModelRegistry {
 					input: referenceModel?.input ?? ["text"],
 					output: referenceModel?.output,
 					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: item.context_length ?? referenceModel?.contextWindow ?? UNK_CONTEXT_WINDOW,
-					maxTokens: referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
+					contextWindow:
+						firstPositiveDiscoveryNumber(
+							item.max_model_len,
+							item.context_length,
+							item.context_window,
+							item.max_context_length,
+							referenceModel?.contextWindow,
+							UNK_CONTEXT_WINDOW,
+						) ?? UNK_CONTEXT_WINDOW,
+					maxTokens:
+						firstPositiveDiscoveryNumber(
+							item.max_completion_tokens,
+							item.max_tokens,
+							item.max_output_tokens,
+							referenceModel?.maxTokens,
+							UNK_MAX_TOKENS,
+						) ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
 					compat: {
 						...referenceModel?.compat,
@@ -3823,7 +3866,9 @@ export class ModelRegistry {
 					this.#normalizeDiscoveryEvidenceEndpoint(
 						discoveryType === "ollama"
 							? `${this.#normalizeOllamaBaseUrl(baseUrl)}/v1`
-							: discoveryType === "openai-models-list" || discoveryType === "lm-studio"
+							: discoveryType === "openai-models-list" ||
+									discoveryType === "lm-studio" ||
+									discoveryType === "omlx"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
 								: (baseUrl ?? ""),
 					);
