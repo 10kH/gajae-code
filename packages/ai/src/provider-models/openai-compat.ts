@@ -8,6 +8,7 @@ import {
 	fetchOpenAICompatibleModels,
 	type OpenAICompatibleModelMapperContext,
 	type OpenAICompatibleModelRecord,
+	resolveLoopbackOpenAIBaseUrl,
 } from "../utils/discovery/openai-compatible";
 import { toFireworksPublicModelId } from "../utils/fireworks-model-id";
 import { getGitHubCopilotBaseUrl, OPENCODE_HEADERS, parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
@@ -226,37 +227,6 @@ function mapLmStudioModel(
 		),
 	};
 }
-function mapOmlxModel(
-	entry: OpenAICompatibleModelRecord,
-	defaults: Model<"openai-completions">,
-	reference: Model<"openai-completions"> | undefined,
-): Model<"openai-completions"> {
-	const model = mapWithBundledReference(entry, defaults, reference);
-	return {
-		...model,
-		contextWindow: firstPositiveModelNumber(
-			model.contextWindow,
-			entry.max_model_len,
-			entry.context_length,
-			entry.max_context_length,
-			getNestedModelValue(entry, ["meta", "n_ctx"]),
-			getNestedModelValue(entry, ["details", "context_length"]),
-			getNestedModelValue(entry, ["details", "n_ctx"]),
-			getNestedModelValue(entry, ["meta", "n_ctx_train"]),
-		),
-		maxTokens: firstPositiveModelNumber(
-			model.maxTokens,
-			entry.max_completion_tokens,
-			entry.max_tokens,
-			entry.max_output_tokens,
-			getNestedModelValue(entry, ["details", "max_completion_tokens"]),
-			getNestedModelValue(entry, ["details", "max_tokens"]),
-			getNestedModelValue(entry, ["meta", "max_completion_tokens"]),
-			getNestedModelValue(entry, ["meta", "max_tokens"]),
-		),
-	};
-}
-
 function normalizeAnthropicBaseUrl(baseUrl: string | undefined, fallback: string): string {
 	const value = baseUrl?.trim();
 	if (!value) {
@@ -1439,8 +1409,7 @@ export interface OmlxModelManagerConfig {
 
 export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
-	const baseUrl = config?.baseUrl ?? Bun.env.OMLX_BASE_URL ?? "http://127.0.0.1:8080/v1";
-	const references = createBundledReferenceMap<"openai-completions">("omlx" as any);
+	const baseUrl = resolveLoopbackOpenAIBaseUrl(config?.baseUrl ?? Bun.env.OMLX_BASE_URL, "http://127.0.0.1:8080/v1");
 	return {
 		providerId: "omlx",
 		fetchDynamicModels: () =>
@@ -1449,10 +1418,6 @@ export function omlxModelManagerOptions(config?: OmlxModelManagerConfig): ModelM
 				provider: "omlx",
 				baseUrl,
 				apiKey,
-				mapModel: (entry, defaults) => {
-					const reference = references.get(defaults.id);
-					return mapOmlxModel(entry, defaults, reference);
-				},
 			}),
 	};
 }

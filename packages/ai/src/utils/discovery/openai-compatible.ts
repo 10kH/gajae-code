@@ -4,6 +4,7 @@ import type { Api, FetchImpl, Model, Provider } from "../../types";
 import { toNumber } from "../../utils";
 
 const MODELS_PATH = "/models";
+const MAX_MODELS_RESPONSE_BYTES = 1_000_000;
 
 /**
  * Minimal OpenAI-style model entry shape consumed by discovery.
@@ -102,6 +103,26 @@ export interface FetchOpenAICompatibleModelsOptions<TApi extends Api> {
 }
 
 /**
+ * Resolves an endpoint for an implicit local provider without allowing an
+ * environment override to turn its keyless discovery into a remote request.
+ */
+export function resolveLoopbackOpenAIBaseUrl(value: string | undefined, fallback: string): string {
+	const candidate = value?.trim();
+	if (!candidate) return fallback;
+	try {
+		const parsed = new URL(candidate);
+		const host = parsed.hostname.toLowerCase();
+		const isLoopback = host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
+		if ((parsed.protocol === "http:" || parsed.protocol === "https:") && isLoopback) {
+			return candidate;
+		}
+	} catch {
+		// Fall back to the fixed loopback endpoint below.
+	}
+	return fallback;
+}
+
+/**
  * Fetches and normalizes an OpenAI-compatible `/models` catalog.
  *
  * Returns `null` on transport/protocol failures.
@@ -129,7 +150,9 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 		response = await fetchImpl(buildModelsUrl(baseUrl), {
 			method: "GET",
 			headers: requestHeaders,
-			signal: options.signal,
+			signal: options.signal
+				? AbortSignal.any([options.signal, AbortSignal.timeout(5_000)])
+				: AbortSignal.timeout(5_000),
 		});
 	} catch {
 		return null;
@@ -145,7 +168,7 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	let payload: unknown;
 	try {
-		payload = await response.json();
+		payload = JSON.parse(await readModelsResponse(response));
 	} catch {
 		return null;
 	}
@@ -198,6 +221,39 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 	}
 
 	return Array.from(deduped.values()).sort((left, right) => left.id.localeCompare(right.id));
+}
+
+async function readModelsResponse(response: Response): Promise<string> {
+	const contentLength = Number(response.headers.get("content-length"));
+	if (Number.isFinite(contentLength) && contentLength > MAX_MODELS_RESPONSE_BYTES) {
+		throw new Error("OpenAI-compatible models response exceeds the size limit");
+	}
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+			total += value.byteLength;
+			if (total > MAX_MODELS_RESPONSE_BYTES) {
+				await reader.cancel();
+				throw new Error("OpenAI-compatible models response exceeds the size limit");
+			}
+			chunks.push(value);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	const body = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return new TextDecoder().decode(body);
 }
 
 function normalizeBaseUrl(baseUrl: string): string {

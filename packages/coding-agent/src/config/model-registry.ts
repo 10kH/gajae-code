@@ -33,6 +33,7 @@ import {
 	UNK_MAX_TOKENS,
 	unregisterCustomApis,
 } from "@gajae-code/ai/core";
+import { resolveLoopbackOpenAIBaseUrl } from "@gajae-code/ai/utils/discovery/openai-compatible";
 
 // Sentinel for local-only OAuth token (LM Studio, vLLM) — declared inline to avoid loading
 // any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts.
@@ -95,6 +96,14 @@ export type { CanonicalModelIndex, CanonicalModelRecord, CanonicalModelVariant, 
 export { isAuthenticated, kNoAuth };
 
 const MAX_SESSION_CANONICAL_VARIANTS = 64;
+function firstPositiveDiscoveryNumber(...values: readonly unknown[]): number | undefined {
+	for (const value of values) {
+		const number =
+			typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
+		if (Number.isFinite(number) && number > 0) return number;
+	}
+	return undefined;
+}
 function redactDiscoveryUrl(value: string | URL): string {
 	try {
 		const url = typeof value === "string" ? new URL(value) : value;
@@ -597,7 +606,8 @@ function getProviderBaseUrlEnvKeys(provider: string): string[] {
  * never the project `.env`.
  */
 function resolveProviderBaseUrlFromEnv(provider: string): string | undefined {
-	return $pickCredentialEnv(...getProviderBaseUrlEnvKeys(provider));
+	const baseUrl = $pickCredentialEnv(...getProviderBaseUrlEnvKeys(provider));
+	return provider === "omlx" && baseUrl ? resolveLoopbackOpenAIBaseUrl(baseUrl, "http://127.0.0.1:8080/v1") : baseUrl;
 }
 
 function normalizeLocalOpenAICompatBaseUrl(baseUrl: string): string {
@@ -1771,7 +1781,7 @@ export class ModelRegistry {
 			this.#discoveryManager.addProvider({
 				provider: "omlx",
 				api: "openai-completions",
-				baseUrl: Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8080/v1",
+				baseUrl: resolveLoopbackOpenAIBaseUrl(Bun.env.OMLX_BASE_URL, "http://127.0.0.1:8080/v1"),
 				discovery: { type: "omlx" },
 				optional: true,
 			});
@@ -3014,30 +3024,21 @@ export class ModelRegistry {
 			}
 			throw new Error(`HTTP ${response.status} from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
-		const payload = (await response.json()) as {
-			data?: Array<{
-				id: string;
-				name?: string;
-				context_length?: number;
-				max_model_len?: number;
-				context_window?: number;
-				max_context_length?: number;
-				max_tokens?: number;
-				max_completion_tokens?: number;
-				max_output_tokens?: number;
-			}>;
-		};
-		const models = payload.data ?? [];
+		const payload: unknown = await response.json();
+		if (!isRecord(payload) || !Array.isArray(payload.data)) {
+			throw new Error(`Malformed OpenAI models-list response from ${redactDiscoveryUrl(modelsUrl)}`);
+		}
+		const models = payload.data;
 		const discovered: Model<Api>[] = [];
 		for (const item of models) {
+			if (!isRecord(item) || typeof item.id !== "string" || !item.id.trim()) continue;
 			const id = item.id;
-			if (!id) continue;
 			const referenceModel = resolveCustomModelReference(id);
 			const api = this.#resolveDiscoveredModelApi(providerConfig, id);
 			discovered.push(
 				enrichModelThinking({
 					id,
-					name: item.name ?? referenceModel?.name ?? id,
+					name: typeof item.name === "string" ? item.name : (referenceModel?.name ?? id),
 					api,
 					provider: providerConfig.provider,
 					baseUrl: requestBaseUrl,
@@ -3047,18 +3048,22 @@ export class ModelRegistry {
 					output: referenceModel?.output,
 					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 					contextWindow:
-						item.max_model_len ??
-						item.context_length ??
-						item.context_window ??
-						item.max_context_length ??
-						referenceModel?.contextWindow ??
-						UNK_CONTEXT_WINDOW,
+						firstPositiveDiscoveryNumber(
+							item.max_model_len,
+							item.context_length,
+							item.context_window,
+							item.max_context_length,
+							referenceModel?.contextWindow,
+							UNK_CONTEXT_WINDOW,
+						) ?? UNK_CONTEXT_WINDOW,
 					maxTokens:
-						item.max_completion_tokens ??
-						item.max_tokens ??
-						item.max_output_tokens ??
-						referenceModel?.maxTokens ??
-						UNK_MAX_TOKENS,
+						firstPositiveDiscoveryNumber(
+							item.max_completion_tokens,
+							item.max_tokens,
+							item.max_output_tokens,
+							referenceModel?.maxTokens,
+							UNK_MAX_TOKENS,
+						) ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
 					compat: {
 						...referenceModel?.compat,

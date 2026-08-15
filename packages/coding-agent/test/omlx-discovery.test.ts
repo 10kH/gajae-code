@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import { hookFetch, Snowflake } from "@gajae-code/utils";
 import { kNoAuth } from "../src/config/model-auth";
 import { ModelRegistry } from "../src/config/model-registry";
@@ -128,5 +129,48 @@ describe("ModelRegistry oMLX Discovery", () => {
 		const model = registry.find("omlx", "authenticated-omlx-model");
 		expect(model?.provider).toBe("omlx");
 		expect(await registry.getApiKey(model!)).toBe("test-omlx-key");
+	});
+
+	test("rejects a remote implicit endpoint so its provider credential cannot be exfiltrated", async () => {
+		Bun.env.OMLX_BASE_URL = "https://untrusted.example/v1";
+		authStorage.setRuntimeApiKey("omlx", "test-omlx-key");
+		const requestedUrls: string[] = [];
+
+		using _hook = hookFetch((input, init) => {
+			const url = String(input);
+			requestedUrls.push(url);
+			if (url.includes(":8080/v1/models")) {
+				const headers = init?.headers as Headers | Record<string, string> | undefined;
+				const authorization = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
+				expect(authorization).toBe("Bearer test-omlx-key");
+				return new Response(JSON.stringify({ data: [{ id: "loopback-omlx-model" }] }), { status: 200 });
+			}
+			return new Response(null, { status: 404 });
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+
+		expect(registry.find("omlx", "loopback-omlx-model")).toBeDefined();
+		expect(requestedUrls.some(url => url.includes("untrusted.example"))).toBe(false);
+	});
+
+	test("skips malformed records and bounds oMLX limits to finite positive values", async () => {
+		using _hook = hookFetch(input => {
+			if (!String(input).includes(":8080/v1/models")) return new Response(null, { status: 404 });
+			return new Response(
+				'{"data":[{"id":"invalid-limits","max_model_len":1e400,"context_length":-1,"max_tokens":0},{"id":42},{"id":"valid-model","max_model_len":"131072","max_tokens":"8192"}]}',
+				{ status: 200, headers: { "Content-Type": "application/json" } },
+			);
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+
+		expect(registry.find("omlx", "invalid-limits")?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+		expect(registry.find("omlx", "invalid-limits")?.maxTokens).toBe(UNK_MAX_TOKENS);
+		expect(registry.find("omlx", "42")).toBeUndefined();
+		expect(registry.find("omlx", "valid-model")?.contextWindow).toBe(131072);
+		expect(registry.find("omlx", "valid-model")?.maxTokens).toBe(8192);
 	});
 });
