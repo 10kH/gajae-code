@@ -44,14 +44,34 @@
 | `d2f6e8a4` / #4468 | Include with strict pet-only settings allowance | Ouroboros pet/theme requires a bounded settings schema enum, pet/theme selectors, theme registration, and UI verification updates. These are accepted only as the minimum cohesive dependency of the pet feature; no general settings migration, MCP, customization migration, provider, model, or auth contract is admitted. |
 | `dfb1081c` / #4499 | Include | iTerm2 pet rendering is applied after #4468 because both update the pet widget and TUI pet renderer. It does not alter auth/provider/model or SDK lifecycle contracts. |
 
+## Owner-authorized expansion after the original audit
+
+The owner subsequently authorized a bounded provider/preset and stability expansion on the existing release branch. The following exact changes were added without importing the broader `dev` architecture:
+
+### Stability and security
+
+- #4385 Synthetic login validation: use the provider models endpoint instead of a retired hard-coded Kimi probe (`6de4096025`, changelog `e14189ec82`).
+- #4302 image-generation provider error hardening: redact credentials and bound response bodies (`08e3e4de22`, `b3ce4bb584`).
+- #4452 status-line scratch-root resolution at render time (`d27175a1c3`).
+- #4373 Windows replacement-receipt reconciliation over the release branch's existing managed-session storage fixes (`bc9417f4eb`).
+
+### Providers and presets
+
+- #4304 native TypeScript Kiro OAuth/CodeWhisperer provider (`7913ce221a`).
+- #4294 Muse Spark 1.2 open-weight catalog, profile, reasoning, cache-normalization, and routing closure (`6ff17fe082` through `efd850df86`).
+- #4377 direct xAI Grok 4.6 catalog and role profiles (`cb3eba7a93`, `8c7170a212`).
+- #4462 bundled Grok CLI 4.6 catalog and bounded effort parsing (`0ce9f10436`, `5a931cc529`, `4b15d708bf`).
+
+CHANGELOG conflicts were resolved by retaining the released 0.13.2 history and existing release entries while adding only the new Unreleased provider/preset records. Generated model data was merged with its source generators and must pass reproducibility tests before the release cut.
+
 ## Explicit exclusions
 
-- Authentication, provider, and model contracts
 - General settings, MCP, or customization migrations beyond the minimum cohesive pet dependencies listed above
 - SDK lifecycle or notification architecture
 - GJC master/supervisor work
 - Autorouting
 - Autoresearch
+- macOS TCC/signing change #4275 pending dedicated release-build and permission-identity validation
 - Version bump, release metadata cut, tag, publish, release execution, PR creation, or `main` mutation
 
 ## Integration order
