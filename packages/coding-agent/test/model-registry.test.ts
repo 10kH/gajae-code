@@ -3672,7 +3672,7 @@ describe("ModelRegistry", () => {
 			await Settings.init({
 				inMemory: true,
 				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama"],
+					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx"],
 				},
 			});
 			const requestedUrls: string[] = [];
@@ -3693,16 +3693,18 @@ describe("ModelRegistry", () => {
 			await Settings.init({
 				inMemory: true,
 				overrides: {
-					disabledProviders: ["llama.cpp", "lm-studio", "ollama"],
+					disabledProviders: ["llama.cpp", "lm-studio", "ollama", "omlx"],
 				},
 			});
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			expect(registry.getDiscoverableProviders()).not.toContain("ollama");
+			expect(registry.getDiscoverableProviders()).not.toContain("omlx");
 
 			settings.override("disabledProviders", []);
 			await registry.refresh("offline");
 
 			expect(registry.getDiscoverableProviders()).toContain("ollama");
+			expect(registry.getDiscoverableProviders()).toContain("omlx");
 		});
 		test("rebuilds implicit discovery when endpoint environment changes without models.json", async () => {
 			const firstBaseUrl = "http://127.0.0.1:21334";
