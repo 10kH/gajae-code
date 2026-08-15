@@ -12,6 +12,7 @@
 - Managed output publication no longer freezes the resident event loop when a no-replace rename stalls in the kernel; async publication uses blocking-pool native boundaries and per-session stores reap scrubbed protocol remnants (#4396).
 - Print mode now requests a governed process exit after successful session teardown, so completed one-shot runs cannot be pinned by residual runtime handles; both stdout and stderr are drained first and the recorded exit code is preserved.
 - `todo_write` no longer rejects a positional task handle without saying how to address a task. Callers reach for `id`/`index` because the tool result renders todos as a list, and raw validation rejects the unknown key before `execute` runs; positional-handle keys now explain that tasks are addressed by exact `task` content or by `phase`.
+- Escaped-non-ASCII tool-call turns in managed fallback are retried on the same model without charging the fallback chain or advancing it — the wire defect is a sampling accident, not provider evidence — bounded to two consecutive retries before the run terminates (#4515).
 
 ## [0.13.2] - 2026-08-13
 

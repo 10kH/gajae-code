@@ -9,6 +9,7 @@
 
 ### Fixed
 - Validate Synthetic API key via models endpoint, not retired Kimi probe (#4385).
+- Tool-call arguments that spell printable non-ASCII text as `\uXXXX` escapes are now flagged on the raw wire (`escapedNonAsciiArguments`) by the Anthropic, OpenAI Responses, and OpenAI Completions streams — after JSON decode the defect is unobservable, and a mistyped hex nibble silently becomes a different character (#4515).
 
 ## [0.13.2] - 2026-08-13
 

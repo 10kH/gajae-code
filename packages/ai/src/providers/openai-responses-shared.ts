@@ -30,7 +30,7 @@ import {
 } from "../types";
 import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
-import { isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
 const OPENAI_RESPONSES_PROGRESS_EVENT_TYPES = new Set([
@@ -735,20 +735,28 @@ export async function processResponsesStream<TApi extends Api>(
 				// Finalize onto the same block object stored in output.content, reading
 				// the matching entry's buffered partialJson first and only then the done
 				// item's arguments — never an adjacent item's buffer.
-				const args =
+				const rawArguments =
 					entry?.block.type === "toolCall" && entry.block.partialJson
-						? parseStreamingJson(entry.block.partialJson)
-						: parseStreamingJson(item.arguments || "{}");
+						? entry.block.partialJson
+						: item.arguments || "{}";
+				const args = parseStreamingJson(rawArguments);
+				// Detected on the raw wire text: after JSON decode an unnecessary
+				// `\uXXXX` escape is indistinguishable from legitimate literal UTF-8,
+				// so this is the only point where the defect is still observable.
+				const escapedNonAscii = findUnnecessaryUnicodeEscape(rawArguments) !== undefined;
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: args,
+					...(escapedNonAscii ? { escapedNonAsciiArguments: true } : {}),
 				};
 				if (entry?.block.type === "toolCall") {
 					entry.block.id = toolCall.id;
 					entry.block.name = toolCall.name;
 					entry.block.arguments = args;
+					if (escapedNonAscii) entry.block.escapedNonAsciiArguments = true;
+					else delete entry.block.escapedNonAsciiArguments;
 				}
 				const contentIndex = entry?.blockContentIndex ?? output.content.length - 1;
 				dropEntry(item.id, event.output_index);

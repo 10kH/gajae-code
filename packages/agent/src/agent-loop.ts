@@ -263,6 +263,15 @@ function managedContextOverflowOutcome(message: AssistantMessage, scope?: Attemp
 	return { type: "context_overflow_discarded", message, scope };
 }
 
+/** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
+function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
+	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
+}
+
+function managedEscapedArgumentsOutcome(message: AssistantMessage, scope?: AttemptScope): ManagedAttemptOutcome {
+	return { type: "escaped_arguments_discarded", message, scope };
+}
+
 function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
 	const errorMessage = managedProperty(error, "message");
 	const transportFailure = managedTransportFailure(error);
@@ -809,6 +818,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const intent = managedProperty(value, "intent");
 	const customWireName = managedProperty(value, "customWireName");
 	const incompleteArguments = managedProperty(value, "incompleteArguments");
+	const escapedNonAsciiArguments = managedProperty(value, "escapedNonAsciiArguments");
 	return {
 		type,
 		id,
@@ -818,6 +828,7 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 		...(typeof intent === "string" ? { intent } : {}),
 		...(typeof customWireName === "string" ? { customWireName } : {}),
 		...(typeof incompleteArguments === "boolean" ? { incompleteArguments } : {}),
+		...(typeof escapedNonAsciiArguments === "boolean" ? { escapedNonAsciiArguments } : {}),
 	};
 }
 
@@ -1771,6 +1782,35 @@ async function runLoopBody(
 					if (rejectedCommitted) currentContext.messages.splice(rejectedIndex, 1);
 					continue;
 				}
+			}
+
+			// Escaped-non-ASCII tool arguments: managed bounded turn resample.
+			//
+			// Arguments that spell a printable non-ASCII character as `\uXXXX`
+			// instead of literal UTF-8 are a wire-format defect, not a decision the
+			// model needs to be told about. The payload parses cleanly, but one
+			// mistyped nibble decodes to a different, equally valid character, so it
+			// can never be verified or repaired after the fact. Reporting it as a
+			// tool error spends the whole turn and writes the literal escape syntax
+			// back into the context the model samples from next. A managed
+			// invocation instead drops the defective turn and reports it through the
+			// typed `escaped_arguments_discarded` outcome so the session policy owns
+			// a bounded same-model retry; the defect is never treated as provider
+			// evidence, so the fallback chain never advances on it. Unmanaged runs
+			// keep the per-call rejection in `executeToolCalls` as the terminal
+			// answer.
+			if (
+				config.fallbackManaged &&
+				message.stopReason !== "error" &&
+				message.stopReason !== "aborted" &&
+				hasEscapedNonAsciiToolCall(message)
+			) {
+				transaction?.discard();
+				currentContext.messages.splice(contextMessageCount);
+				newMessages.splice(newMessageCount);
+				await config.onManagedAttemptOutcome?.(managedEscapedArgumentsOutcome(message, transaction?.scope));
+				stream.end(newMessages);
+				return;
 			}
 
 			const overflow = managedContextOverflow(message, config);
@@ -2741,6 +2781,20 @@ async function executeToolCalls(
 						`Tool call "${toolCall.name}" was cut off before its arguments finished streaming ` +
 							`(the response hit its output token limit). The partial arguments cannot be executed. ` +
 							`Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`,
+					);
+				}
+				if (toolCall.escapedNonAsciiArguments) {
+					record.argumentValidationFailed = true;
+					// The arguments decoded cleanly, but they were spelled as `\uXXXX`
+					// escapes rather than literal UTF-8. Hand-written hex is where models
+					// mistype digits, and every mistyped nibble decodes to a different but
+					// equally valid character — the payload is unverifiable and cannot be
+					// repaired after parsing, so it is rejected rather than executed on
+					// silently corrupted text.
+					throw new Error(
+						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
+							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
+							`so the call was not executed. Re-issue it writing every non-ASCII character literally.`,
 					);
 				}
 				if (!tool) {

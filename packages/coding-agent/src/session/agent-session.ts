@@ -954,6 +954,13 @@ type RetryErrorClassification =
 
 const BARE_DEFAULT_WATCHDOG_ERROR =
 	/^(?:[A-Za-z][A-Za-z0-9-]*(?: [A-Za-z][A-Za-z0-9-]*){0,3} )stream (?:timed out while waiting for the first event|stalled while waiting for the next event)$/;
+/**
+ * Consecutive same-model retries allowed for `escaped_arguments_discarded`
+ * managed outcomes before the run terminates. Mirrors the agent loop's
+ * escaped-non-ASCII resample budget on dev; enforced session-side here because
+ * a managed retry re-enters the loop as a fresh run.
+ */
+const MAX_ESCAPED_ARGUMENT_RETRIES = 2;
 const PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while waiting for the first event";
 const WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = `Error: ${PROVIDER_FIRST_EVENT_TIMEOUT_ERROR}`;
 const PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR = "Provider stream timed out while waiting for first event";
@@ -2030,6 +2037,7 @@ export class AgentSession {
 	#retryPromise: Promise<void> | undefined = undefined;
 	#retryResolve: (() => void) | undefined = undefined;
 	#defaultFallbackController: FallbackChainController | undefined;
+	#consecutiveEscapedArgumentRetries = 0;
 	#overflowMaintenanceAttempts = 0;
 	#defaultFallbackExhaustedLastTurn = false;
 	#fallbackInvocationId = 0;
@@ -15711,9 +15719,39 @@ export class AgentSession {
 	}
 
 	async #handleManagedAttemptOutcome(outcome: ManagedAttemptOutcome): Promise<ManagedAttemptDecision> {
+		if (outcome.type !== "escaped_arguments_discarded") this.#consecutiveEscapedArgumentRetries = 0;
 		if (outcome.type === "run_terminal") {
 			this.#defaultFallbackChain().resetAttemptBudget();
 			return { type: "terminal", terminal: { stopReason: outcome.reason } };
+		}
+		if (outcome.type === "escaped_arguments_discarded") {
+			// An escaped-non-ASCII wire defect is a sampling accident, not provider
+			// evidence: never charge the attempt, advance the chain, or suppress the
+			// selector. The loop already removed the defective turn from history, so
+			// this decision just re-issues the same request on the same model.
+			//
+			// The retry bound lives HERE, not in the loop: a managed retry re-enters
+			// the loop as a fresh run, so no loop-local budget survives it. After
+			// MAX_ESCAPED_ARGUMENT_RETRIES consecutive escaped-argument discards the
+			// run terminates with an error instead of ping-ponging forever against a
+			// model that deterministically emits escaped arguments. The counter
+			// resets on any other outcome.
+			this.#defaultFallbackChain().discardStartedAttempt();
+			this.#consecutiveEscapedArgumentRetries++;
+			if (this.#consecutiveEscapedArgumentRetries > MAX_ESCAPED_ARGUMENT_RETRIES) {
+				this.#consecutiveEscapedArgumentRetries = 0;
+				return {
+					type: "terminal",
+					terminal: { stopReason: "error", messages: [outcome.message] },
+				};
+			}
+			return {
+				type: "retry",
+				continuation: async ownership => {
+					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+					await this.agent.continue(this.#managedFallbackPromptOptions());
+				},
+			};
 		}
 		if (outcome.type === "context_overflow_discarded") {
 			// The provider invocation happened, but overflow is context maintenance rather

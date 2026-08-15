@@ -588,6 +588,16 @@ export interface ToolCall {
 	 * rejects the call with a retryable error instead.
 	 */
 	incompleteArguments?: boolean;
+	/**
+	 * Set when the provider saw the argument JSON spell a printable non-ASCII
+	 * character as a `\uXXXX` escape instead of literal UTF-8. Hand-written hex
+	 * is where models mistype digits, and a mistyped nibble decodes to a
+	 * different but equally valid character, so the decoded arguments cannot be
+	 * verified or repaired after parsing. The agent loop treats such a turn as a
+	 * sampling accident: managed runs discard and re-request it, and execution
+	 * rejects the call rather than running on silently corrupted text.
+	 */
+	escapedNonAsciiArguments?: boolean;
 }
 
 export interface Usage {
