@@ -2,8 +2,8 @@
 
 ## [Unreleased]
 
-### Added
-- Added async no-replace rename/link bindings so managed publication can keep kernel filesystem stalls off the resident event loop (#4396).
+### Fixed
+- `break_long_word` no longer spins forever on a lone ESC that is not a valid ANSI sequence inside an over-width word (e.g. binary tool output persisted in a session); a lone ESC is consumed as a zero-width scalar like `truncate`/`slice`/`visible_width` already did, restoring interactive resume of affected sessions (#4437).
 
 ## [0.13.2] - 2026-08-13
 

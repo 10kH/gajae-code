@@ -19,7 +19,11 @@ describe("escaped-non-ASCII tool arguments", () => {
 	it("managed: discards the defective turn and reports escaped_arguments_discarded", async () => {
 		const mock = createMockModel({
 			responses: [
-				{ content: [{ type: "toolCall", name: "echo", arguments: { text: "병목" }, escapedNonAsciiArguments: true }] },
+				{
+					content: [
+						{ type: "toolCall", name: "echo", arguments: { text: "병목" }, escapedNonAsciiArguments: true },
+					],
+				},
 			],
 		});
 		const executed: unknown[] = [];
@@ -61,7 +65,11 @@ describe("escaped-non-ASCII tool arguments", () => {
 	it("unmanaged: rejects the call per-call with an actionable error instead of executing it", async () => {
 		const mock = createMockModel({
 			responses: [
-				{ content: [{ type: "toolCall", name: "echo", arguments: { text: "병목" }, escapedNonAsciiArguments: true }] },
+				{
+					content: [
+						{ type: "toolCall", name: "echo", arguments: { text: "병목" }, escapedNonAsciiArguments: true },
+					],
+				},
 				{ content: ["done after rejection"] },
 			],
 		});
@@ -78,16 +86,17 @@ describe("escaped-non-ASCII tool arguments", () => {
 		expect(toolResults).toHaveLength(1);
 		const result = toolResults[0] as { isError?: boolean; content?: Array<{ type: string; text?: string }> };
 		expect(result.isError).toBe(true);
-		const text = (result.content ?? [])
-			.map(block => (block.type === "text" ? (block.text ?? "") : ""))
-			.join(" ");
+		const text = (result.content ?? []).map(block => (block.type === "text" ? (block.text ?? "") : "")).join(" ");
 		expect(text).toContain("\\uXXXX escapes");
 		expect(text).toContain("was not executed");
 	});
 
 	it("managed: a clean tool call executes normally with no outcome", async () => {
 		const mock = createMockModel({
-			responses: [{ content: [{ type: "toolCall", name: "echo", arguments: { text: "병목" } }] }, { content: ["ok"] }],
+			responses: [
+				{ content: [{ type: "toolCall", name: "echo", arguments: { text: "병목" } }] },
+				{ content: ["ok"] },
+			],
 		});
 		const executed: unknown[] = [];
 		const agent = new Agent({
