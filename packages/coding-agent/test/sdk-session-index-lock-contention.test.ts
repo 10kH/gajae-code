@@ -366,6 +366,41 @@ describe("SDK session index lock contention (#4544)", () => {
 		}
 	});
 
+	it("does not probe a dead pid while preparing an unregister projection", async () => {
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4595-unregister-dead-pid-"));
+		const index = await new SessionIndex(dir).open();
+		const live = await index.append(event("live-host"));
+		const deadProcess = Bun.spawn({ cmd: ["true"] });
+		await deadProcess.exited;
+		const deadPid = deadProcess.pid;
+		await index.append({ ...event("dead-host"), pid: deadPid, processIncarnation: "linux:1" });
+		const realProcessIncarnation = incarnationModule.processIncarnation;
+		const incarnation = vi
+			.spyOn(incarnationModule, "processIncarnation")
+			.mockImplementation(pid => realProcessIncarnation(pid));
+		try {
+			expect(
+				await index.unregisterIfCurrent({
+					sessionId: "live-host",
+					locator: { repo: "r", stateRoot: "q" },
+					endpointGeneration: 1,
+					pid: process.pid,
+					indexSeq: live.indexSeq,
+					processIncarnation: live.processIncarnation,
+					hostIncarnation: live.hostIncarnation,
+					identityProvenance: "composite",
+					ambiguous: false,
+					live: true,
+					terminal: false,
+					terminalUncertain: false,
+				}),
+			).toBe(true);
+			expect(incarnation).not.toHaveBeenCalledWith(deadPid);
+		} finally {
+			incarnation.mockRestore();
+		}
+	});
+
 	it("releases the lock when the critical section throws, and aborted acquisition fails fast", async () => {
 		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-4544-throw-"));
 		const index = await new SessionIndex(dir).open();
