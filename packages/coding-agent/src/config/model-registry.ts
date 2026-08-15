@@ -1686,7 +1686,9 @@ export class ModelRegistry {
 
 	#normalizeDiscoverableModels(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
 		const liveBaseUrl =
-			providerConfig.discovery.type === "openai-models-list" || providerConfig.discovery.type === "lm-studio"
+			providerConfig.discovery.type === "openai-models-list" ||
+			providerConfig.discovery.type === "lm-studio" ||
+			providerConfig.discovery.type === "omlx"
 				? this.#normalizeOpenAIModelsListBaseUrl(
 						this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
 					)
@@ -1710,7 +1712,9 @@ export class ModelRegistry {
 		});
 	}
 	#sanitizeDiscoverableModelsForCache(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		return providerConfig.discovery.type === "openai-models-list" || providerConfig.discovery.type === "lm-studio"
+		return providerConfig.discovery.type === "openai-models-list" ||
+			providerConfig.discovery.type === "lm-studio" ||
+			providerConfig.discovery.type === "omlx"
 			? this.#stripModelBaseUrlQueries(models)
 			: models;
 	}
@@ -1762,6 +1766,18 @@ export class ModelRegistry {
 			// Implicit LM Studio auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("lm-studio");
 			this.#keylessProviders.add("lm-studio");
+		}
+		if (!configuredProviders.has("omlx") && !disabledProviders.has("omlx")) {
+			this.#discoveryManager.addProvider({
+				provider: "omlx",
+				api: "openai-completions",
+				baseUrl: Bun.env.OMLX_BASE_URL || "http://127.0.0.1:8080/v1",
+				discovery: { type: "omlx" },
+				optional: true,
+			});
+			// Implicit oMLX auth is optional and may be added after startup.
+			this.#optionalAuthProviders.add("omlx");
+			this.#keylessProviders.add("omlx");
 		}
 	}
 
@@ -2454,6 +2470,7 @@ export class ModelRegistry {
 			case "llama.cpp":
 				return this.#discoverLlamaCppModels(providerConfig, apiKey);
 			case "lm-studio":
+			case "omlx":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 			case "models-dev":
@@ -2998,7 +3015,17 @@ export class ModelRegistry {
 			throw new Error(`HTTP ${response.status} from ${redactDiscoveryUrl(modelsUrl)}`);
 		}
 		const payload = (await response.json()) as {
-			data?: Array<{ id: string; name?: string; context_length?: number }>;
+			data?: Array<{
+				id: string;
+				name?: string;
+				context_length?: number;
+				max_model_len?: number;
+				context_window?: number;
+				max_context_length?: number;
+				max_tokens?: number;
+				max_completion_tokens?: number;
+				max_output_tokens?: number;
+			}>;
 		};
 		const models = payload.data ?? [];
 		const discovered: Model<Api>[] = [];
@@ -3019,8 +3046,19 @@ export class ModelRegistry {
 					input: referenceModel?.input ?? ["text"],
 					output: referenceModel?.output,
 					cost: referenceModel?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-					contextWindow: item.context_length ?? referenceModel?.contextWindow ?? UNK_CONTEXT_WINDOW,
-					maxTokens: referenceModel?.maxTokens ?? UNK_MAX_TOKENS,
+					contextWindow:
+						item.max_model_len ??
+						item.context_length ??
+						item.context_window ??
+						item.max_context_length ??
+						referenceModel?.contextWindow ??
+						UNK_CONTEXT_WINDOW,
+					maxTokens:
+						item.max_completion_tokens ??
+						item.max_tokens ??
+						item.max_output_tokens ??
+						referenceModel?.maxTokens ??
+						UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
 					compat: {
 						...referenceModel?.compat,
@@ -3823,7 +3861,9 @@ export class ModelRegistry {
 					this.#normalizeDiscoveryEvidenceEndpoint(
 						discoveryType === "ollama"
 							? `${this.#normalizeOllamaBaseUrl(baseUrl)}/v1`
-							: discoveryType === "openai-models-list" || discoveryType === "lm-studio"
+							: discoveryType === "openai-models-list" ||
+									discoveryType === "lm-studio" ||
+									discoveryType === "omlx"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
 								: (baseUrl ?? ""),
 					);

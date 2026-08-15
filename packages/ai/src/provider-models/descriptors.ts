@@ -32,6 +32,7 @@ import {
 	nanoGptModelManagerOptions,
 	nvidiaModelManagerOptions,
 	ollamaModelManagerOptions,
+	omlxModelManagerOptions,
 	openaiModelManagerOptions,
 	opencodeGoModelManagerOptions,
 	opencodeZenModelManagerOptions,
@@ -269,6 +270,9 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		catalog("LiteLLM", ["LITELLM_API_KEY"], { allowUnauthenticated: true }),
 	),
 	descriptor("lm-studio", "llama-3-8b", config => lmStudioModelManagerOptions(config), { allowUnauthenticated: true }),
+	descriptor("omlx", "Qwen3.5-122B-A10B-Q4", config => omlxModelManagerOptions(config), {
+		allowUnauthenticated: true,
+	}),
 	catalogDescriptor(
 		"vllm",
 		"gpt-oss-20b",
