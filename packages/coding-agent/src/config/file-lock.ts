@@ -331,6 +331,51 @@ async function releaseLock(lockPath: string, owner: FileLockOwnerToken): Promise
 	const outcome = await removeFileLockDirForGc(lockPath, owner);
 	if (outcome !== "removed") throw new Error(`Failed to release file lock: ${outcome}.`);
 }
+/**
+ * Bounded, actionable description of who holds `lockPath` at exhaustion time.
+ * Never a stealing authority: purely diagnostic, read once after the last retry.
+ */
+async function lockHolderDescription(lockPath: string): Promise<string> {
+	try {
+		const info = await readLockInfo(lockPath);
+		if (info) {
+			// A lock record carrying a foreign owner_host_id belongs to another
+			// machine (shared-volume topic registry): its pid is meaningful only
+			// on that host, so probing the same numeric pid here could mislabel a
+			// coincident local process as the holder. Report the owner host with
+			// unknown liveness instead.
+			if (info.owner_host_id !== undefined) {
+				return (
+					`held by pid ${info.pid} on host ${info.owner_host_id} (liveness unknown from this host)` +
+					` since ${new Date(info.timestamp).toISOString()}`
+				);
+			}
+			// Same-host holder: use the full liveness proof (pid alive AND, when the
+			// record carries a start_time, the start-time identity match) so a dead
+			// holder whose pid was already reused is not mislabeled "(live)".
+			const alive = ownerIsAlive(info);
+			return (
+				`held by pid ${info.pid}` +
+				(alive
+					? " (live)"
+					: ownerLiveness(info.pid) === "dead"
+						? " (dead but not reaped)"
+						: " (liveness unknown)") +
+				` since ${new Date(info.timestamp).toISOString()}`
+			);
+		}
+		try {
+			await fs.stat(path.join(lockPath, "info"));
+			return "held by an owner whose metadata is not yet readable";
+		} catch (error) {
+			if (!isEnoent(error)) throw error;
+		}
+		return "held by an unrecognized owner record";
+	} catch (error) {
+		return `held by an unreadable owner (${(error as Error).message})`;
+	}
+}
+
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
 	if (options.ownerHostId !== undefined && !options.ownerHostId) throw new Error("ownerHostId must be non-empty");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
@@ -356,7 +401,10 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 			opts.signal.removeEventListener("abort", onAbort);
 		}
 	}
-	throw new Error(`Failed to acquire lock for ${filePath} after ${opts.retries} attempts`);
+	throw new Error(
+		`Failed to acquire lock for ${filePath} after ${opts.retries} attempts: ${await lockHolderDescription(lockPath)} (${lockPath}); ` +
+			`a live owner is never displaced — if this is an SDK broker (gjc sdk status), it must finish or be stopped before retrying`,
+	);
 }
 
 /**
