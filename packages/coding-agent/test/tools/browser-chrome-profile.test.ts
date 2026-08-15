@@ -252,13 +252,42 @@ describe("Chrome profile browser mode (#809)", () => {
 		).rejects.toThrow(/No Chrome\/Chromium executable found/);
 	});
 
-	it("rejects an explicit default Chrome user data directory", async () => {
+	it("rejects an explicit default Chrome user data directory on every platform", async () => {
+		// Drive the refusal through the injectable seam with explicit platforms and
+		// homes: ambient `os.homedir()` on the host only proves the host's own
+		// default root (the darwin branch never lists `~/.config/google-chrome`,
+		// so the old form failed on macOS while the guard was correct).
+		const matrix: Array<{ platform: NodeJS.Platform; home: string; defaultRoot: string }> = [
+			{
+				platform: "darwin",
+				home: "/Users/u",
+				defaultRoot: path.posix.join("/Users/u", "Library", "Application Support", "Google", "Chrome"),
+			},
+			{
+				platform: "win32",
+				home: "C:\\Users\\u",
+				defaultRoot: "C:\\Users\\u\\AppData\\Local\\Google\\Chrome\\User Data",
+			},
+			{
+				platform: "linux",
+				home: "/home/u",
+				defaultRoot: path.posix.join("/home/u", ".config", "google-chrome"),
+			},
+		];
+		for (const entry of matrix) {
+			expect(await isDefaultChromeUserDataDirForTest(entry.defaultRoot, [entry.defaultRoot], entry.platform)).toBe(
+				true,
+			);
+		}
+		// End-to-end refusal keeps exercising the live resolution path, but with the
+		// host's actual platform default root instead of a Linux-only spelling.
+		const hostRoot = chromeUserDataRoots({ platform: process.platform, home: os.homedir(), exists: () => false })[0]!;
 		vi.spyOn(launch, "resolveSystemChromeForProfile").mockReturnValue("/usr/bin/google-chrome");
 		await expect(
 			resolveBrowserKindForTest(
 				{
 					action: "open",
-					app: { browser: "chrome", user_data_dir: path.join(os.homedir(), ".config/google-chrome") },
+					app: { browser: "chrome", user_data_dir: hostRoot },
 				},
 				makeSession("/work"),
 			),
