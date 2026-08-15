@@ -1929,6 +1929,22 @@ function deobfuscateSessionContext(context: SessionContext, obfuscator: SecretOb
 	return { ...context, messages };
 }
 
+/**
+ * Canonical message_end admission slot. A reservation whose slot is already
+ * `released` needs no await at the canonical append site, so an uncontended
+ * admission never costs a microtask and external emitters keep synchronous
+ * visibility of the persisted append.
+ */
+interface CanonicalMessageAdmissionSlot {
+	promise: Promise<void>;
+	released: boolean;
+}
+
+interface CanonicalMessageAdmission {
+	predecessor: CanonicalMessageAdmissionSlot;
+	release: () => void;
+}
+
 export class AgentSession {
 	#provisionalStreamingToolCallIds = new Set<string>();
 	readonly agent: Agent;
@@ -4312,25 +4328,25 @@ export class AgentSession {
 		this.#coordinatorToolObservations.set(event, Object.freeze({ label, observedAt: new Date().toISOString() }));
 	}
 
-	#canonicalMessageAdmissionTail: Promise<void> = Promise.resolve();
+	#canonicalMessageAdmissionTail: CanonicalMessageAdmissionSlot = { promise: Promise.resolve(), released: true };
 
-	#reserveCanonicalMessageAdmission(
-		event: AgentEvent,
-	): { predecessor: Promise<void>; release: () => void } | undefined {
+	#reserveCanonicalMessageAdmission(event: AgentEvent): CanonicalMessageAdmission | undefined {
 		if (event.type !== "message_end") return undefined;
 		const predecessor = this.#canonicalMessageAdmissionTail;
 		const settled = Promise.withResolvers<void>();
+		const slot: CanonicalMessageAdmissionSlot = { promise: settled.promise, released: false };
 		let released = false;
 		const release = () => {
 			if (released) return;
 			released = true;
+			slot.released = true;
 			settled.resolve();
 		};
 		// The reservation is owned by this emission's handler: keying it by the
 		// event object would let a replayed/bridged duplicate emission overwrite
 		// it and leave the first handler awaiting a promise only its own handler
 		// will ever release.
-		this.#canonicalMessageAdmissionTail = settled.promise;
+		this.#canonicalMessageAdmissionTail = slot;
 		return { predecessor, release };
 	}
 
@@ -4544,6 +4560,10 @@ export class AgentSession {
 
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
+	// Admission slot of the last message_end per assistant message, so the
+	// agent_end handler can join the terminal's canonical admission before any
+	// post-turn write reaches the branch.
+	#lastAssistantAdmissionByMessage = new WeakMap<AssistantMessage, CanonicalMessageAdmission | undefined>();
 	// Provider context construction must wait for this chain. Agent event listeners
 	// are synchronous dispatch only; their async work cannot otherwise gate the
 	// next tool-result provider request.
@@ -4614,7 +4634,7 @@ export class AgentSession {
 	#handleAgentEvent = async (
 		event: AgentEvent,
 		activePromptHandle?: string,
-		canonicalAdmission?: { predecessor: Promise<void>; release: () => void },
+		canonicalAdmission?: CanonicalMessageAdmission,
 	): Promise<void> => {
 		const attemptScope = (event as AgentEvent & { scope?: AttemptScope }).scope;
 
@@ -4765,8 +4785,28 @@ export class AgentSession {
 		// Canonical persistence follows synchronous message_end reservation order.
 		// Only the admission predecessor and this event's own pre-admission work are
 		// inside the lane; release before extension delivery and unrelated post-work.
+		// An already-released predecessor must not cost a microtask: external emitters
+		// and tests rely on canonical append being visible synchronously after
+		// emitExternalEvent returns whenever no admission is actually contended.
+		// Track the terminal assistant synchronously, before any admission wait:
+		// externally emitted terminals (host bridges, replays, tests) dispatch
+		// agent_end immediately after message_end, and the agent_end handler's
+		// post-turn read must see THIS stop even when this admission is still
+		// parked behind a contended predecessor — otherwise post-turn logic
+		// (deep-interview continuation, compaction, retry classification) runs
+		// against the previous turn's assistant. The per-message admission slot
+		// also lets agent_end processing wait for this admission to finish, so
+		// post-turn writes (continuation reminders, compaction rewrites) never
+		// reorder ahead of the branch entries they respond to.
+		if (event.type === "message_end" && event.message.role === "assistant") {
+			this.#lastAssistantMessage = event.message;
+			this.#lastAssistantAdmissionByMessage.set(event.message, canonicalAdmission);
+		}
+
 		if (event.type === "message_end") {
-			await canonicalAdmission?.predecessor;
+			if (canonicalAdmission && !canonicalAdmission.predecessor.released) {
+				await canonicalAdmission.predecessor.promise;
+			}
 			if (
 				(event.message.role === "hookMessage" || event.message.role === "custom") &&
 				!(event.message.role === "custom" && event.message.customType === "hindsight-recall")
@@ -5082,9 +5122,9 @@ export class AgentSession {
 				this.#markTtsrInjected(this.#extractTtsrRuleNames(event.message.details));
 			}
 
-			// Track assistant message for auto-compaction (checked on agent_end)
+			// (#lastAssistantMessage is captured synchronously before the admission
+			// wait above; the block below handles assistant side effects only.)
 			if (event.message.role === "assistant") {
-				this.#lastAssistantMessage = event.message;
 				const assistantMsg = event.message as AssistantMessage;
 				const currentGrantsAnthropicPriority =
 					this.serviceTier === "priority" || this.serviceTier === "claude-only";
@@ -5268,6 +5308,16 @@ export class AgentSession {
 				.find((message): message is AssistantMessage => message.role === "assistant");
 			const msg = this.#lastAssistantMessage ?? fallbackAssistant;
 			this.#lastAssistantMessage = undefined;
+			// Join the terminal's canonical admission before any post-turn write:
+			// an externally emitted terminal dispatches agent_end while its own
+			// admission may still be parked behind a contended predecessor, and a
+			// continuation reminder or compaction rewrite that runs first would
+			// persist ahead of the branch entries it responds to.
+			const terminalAdmission = msg ? this.#lastAssistantAdmissionByMessage.get(msg) : undefined;
+			if (msg) this.#lastAssistantAdmissionByMessage.delete(msg);
+			if (terminalAdmission && !terminalAdmission.predecessor.released) {
+				await terminalAdmission.predecessor.promise;
+			}
 			if (!msg) {
 				this.#lastSuccessfulYieldToolCallId = undefined;
 				this.#resolveRetry();
