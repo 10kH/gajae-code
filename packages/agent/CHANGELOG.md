@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-08-15
+
 ### Fixed
 - Emergency compaction now considers managed transcript file size so sessions compact before the managed per-file limit (#4411).
 - Managed runs discard assistant turns whose tool calls carried `\uXXXX`-escaped arguments and report them through the typed `escaped_arguments_discarded` outcome instead of executing unverifiable text; unmanaged runs reject such calls per-call with an actionable error (#4515).

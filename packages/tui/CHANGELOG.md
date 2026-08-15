@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-08-15
+
 ### Added
 - Added the Ouroboros pet component with frame data, selector integration, and animation lifecycle shared with the existing Gajae Pet (#4468).
 

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-08-15
+
 ### Added
 
 - Added first-class direct xAI `grok-4.6` catalog support over the existing xAI OAuth/subscription transport. Grok 4.5 exposes `low` through `high` reasoning effort and Grok 4.6 exposes `low` through `xhigh`.
