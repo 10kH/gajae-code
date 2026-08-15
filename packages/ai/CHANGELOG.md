@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added first-class direct xAI `grok-4.6` catalog support over the existing xAI OAuth/subscription transport. Grok 4.5 exposes `low` through `high` reasoning effort and Grok 4.6 exposes `low` through `xhigh`.
+- Added the authoritative OpenRouter `meta/muse-spark-1.2` catalog fallback with a 1,048,576-token context window and `minimal` through `xhigh` reasoning effort, so stale or credential-limited catalog generation still closes the Muse Spark preset alias deterministically.
+
+### Fixed
+- Validate Synthetic API key via models endpoint, not retired Kimi probe (#4385).
+- Tool-call arguments that spell printable non-ASCII text as `\uXXXX` escapes are now flagged on the raw wire (`escapedNonAsciiArguments`) by the Anthropic, OpenAI Responses, and OpenAI Completions streams — after JSON decode the defect is unobservable, and a mistyped hex nibble silently becomes a different character (#4515).
+
 ## [0.13.2] - 2026-08-13
 
 ### Fixed

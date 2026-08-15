@@ -58,6 +58,8 @@ const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effo
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
 const KIMI_K3_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
 const DEEPSEEK_V4_FLASH_0731_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High, Effort.Max];
+const GROK_4_5_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
+const GROK_4_6_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 
 const GPT_5_1_CODEX_MINI_EFFORTS: readonly Effort[] = [Effort.Medium, Effort.High];
 const CLOUDFLARE_AI_GATEWAY_BASE_URL = "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic";
@@ -206,9 +208,15 @@ export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): A
 export function applyGeneratedModelPolicies(models: ApiModel<Api>[]): void {
 	for (let index = 0; index < models.length; index++) {
 		const source = models[index]!;
+		if (source.provider === "xai" && (source.id === "grok-4.5" || source.id === "grok-4.6")) {
+			source.reasoning = true;
+		}
 		if (source.provider === "alibaba-token-plan" && source.id === "deepseek-v4-flash-0731") {
 			source.reasoning = true;
 			source.name = "DeepSeek V4 Flash 0731";
+		}
+		if (source.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
+			source.reasoning = true;
 		}
 		const model = refreshModelThinking(source);
 		applyGeneratedModelPolicy(model);
@@ -471,6 +479,9 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			requiresReasoningContentForToolCalls: true,
 		};
 	}
+	if (model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6")) {
+		model.maxTokens = Math.min(model.maxTokens, 64_000);
+	}
 	// MiniMax-M3's official Token Plan routes expose a 1M context window.
 	// Scope the correction to the four first-class regional MiniMax routes
 	// (canonical id plus the Anthropic Token Plan `[1m]` id); unrelated
@@ -664,6 +675,12 @@ function expandEffortRange(thinking: ThinkingConfig): readonly Effort[] {
 }
 
 function inferSupportedEfforts<TApi extends Api>(parsedModel: ParsedModel, model: ApiModel<TApi>): readonly Effort[] {
+	if (model.provider === "xai" && model.id === "grok-4.5") {
+		return GROK_4_5_EFFORTS;
+	}
+	if (model.provider === "xai" && model.id === "grok-4.6") {
+		return GROK_4_6_EFFORTS;
+	}
 	if (model.provider === "kimi-code" && model.id === "k3") {
 		return KIMI_K3_EFFORTS;
 	}
@@ -730,6 +747,13 @@ function inferAnthropicSupportedEfforts<TApi extends Api>(
 }
 
 function inferFallbackEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
+	// Meta documents Muse Spark 1.2 as accepting the full minimal..xhigh
+	// reasoning range. Keep that capability provider-independent so runtime
+	// model discovery/merge cannot downgrade the bundled OpenRouter entry to
+	// the generic openai-completions ceiling of `high`.
+	if (model.id.split("/").at(-1)?.toLowerCase() === "muse-spark-1.2") {
+		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
+	}
 	if (model.api === "anthropic-messages") {
 		return DEFAULT_REASONING_EFFORTS_WITH_XHIGH;
 	}

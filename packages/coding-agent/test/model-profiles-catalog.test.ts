@@ -119,6 +119,39 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		},
 	},
 	{
+		name: "open-weights-spark",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "muse-spark-1.2:low",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark-deepseek",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "deepseek-v4-flash:high",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
+		name: "open-weights-spark-luna",
+		requiredProviders: [],
+		mapping: {
+			default: "muse-spark-1.2:medium",
+			executor: "gpt-5.6-luna:high",
+			planner: "muse-spark-1.2:high",
+			critic: "muse-spark-1.2:high",
+			architect: "muse-spark-1.2:xhigh",
+		},
+	},
+	{
 		name: "open-weights-glm-deepseek",
 		requiredProviders: [],
 		mapping: {
@@ -332,7 +365,7 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 		requiredProviders: ["xai"],
 		mapping: {
 			default: "xai/grok-4.5:low",
-			executor: "xai/grok-4.5:minimal",
+			executor: "xai/grok-4.5:low",
 			planner: "xai/grok-4.5:low",
 			critic: "xai/grok-4.5:medium",
 			architect: "xai/grok-4.5:high",
@@ -358,6 +391,39 @@ const expectedProfiles: Array<{ name: string; requiredProviders: string[]; mappi
 			planner: "xai/grok-4.5:high",
 			critic: "xai/grok-4.5:high",
 			architect: "xai/grok-4.5:high",
+		},
+	},
+	{
+		name: "grok-46-eco",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:low",
+			executor: "xai/grok-4.6:low",
+			planner: "xai/grok-4.6:low",
+			critic: "xai/grok-4.6:medium",
+			architect: "xai/grok-4.6:high",
+		},
+	},
+	{
+		name: "grok-46-medium",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:medium",
+			executor: "xai/grok-4.6:low",
+			planner: "xai/grok-4.6:medium",
+			critic: "xai/grok-4.6:high",
+			architect: "xai/grok-4.6:high",
+		},
+	},
+	{
+		name: "grok-46-pro",
+		requiredProviders: ["xai"],
+		mapping: {
+			default: "xai/grok-4.6:xhigh",
+			executor: "xai/grok-4.6:medium",
+			planner: "xai/grok-4.6:high",
+			critic: "xai/grok-4.6:xhigh",
+			architect: "xai/grok-4.6:xhigh",
 		},
 	},
 	{
@@ -589,7 +655,7 @@ const fixedNonCodexComboMappings: Record<string, Partial<Record<Role, string>>> 
 };
 
 describe("built-in model profile catalog", () => {
-	test("contains exact 46-profile matrix cell-for-cell", () => {
+	test("contains exact 49-profile matrix cell-for-cell", () => {
 		expect(BUILTIN_MODEL_PROFILES.map(profile => profile.name)).toEqual(
 			expectedProfiles.map(profile => profile.name),
 		);
@@ -607,6 +673,9 @@ describe("built-in model profile catalog", () => {
 			"open-weights-deepseek",
 			"open-weights-kimi",
 			"open-weights-luna",
+			"open-weights-spark",
+			"open-weights-spark-deepseek",
+			"open-weights-spark-luna",
 			"open-weights-glm-deepseek",
 			"open-weights-kimi-deepseek",
 			"open-weights-kimi-glm",
@@ -738,6 +807,7 @@ describe("built-in model profile catalog", () => {
 		expect(
 			(modelsJson as Record<string, Record<string, unknown>>)["alibaba-token-plan"]?.["qwen3.8-max-preview"],
 		).toBeDefined();
+		expect((modelsJson as Record<string, Record<string, unknown>>).xai?.["grok-4.6"]).toBeDefined();
 	});
 
 	test("plain minimax provider does not appear in catalog or recommendations", () => {
@@ -760,6 +830,9 @@ describe("built-in model profile catalog", () => {
 			"grok-45-eco": "Grok 4.5 Eco",
 			"grok-45-medium": "Grok 4.5 Medium",
 			"grok-45-pro": "Grok 4.5 Pro",
+			"grok-46-eco": "Grok 4.6 Eco",
+			"grok-46-medium": "Grok 4.6 Medium",
+			"grok-46-pro": "Grok 4.6 Pro",
 		})) {
 			expect(getModelProfilePresentation(name)).toEqual({ displayName, providerGroup: "GROK" });
 		}
@@ -786,6 +859,9 @@ describe("built-in model profile catalog", () => {
 			"open-weights-deepseek",
 			"open-weights-kimi",
 			"open-weights-luna",
+			"open-weights-spark",
+			"open-weights-spark-deepseek",
+			"open-weights-spark-luna",
 			"open-weights-glm-deepseek",
 			"open-weights-kimi-deepseek",
 			"open-weights-kimi-glm",
@@ -801,7 +877,7 @@ describe("built-in model profile catalog", () => {
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-sgp", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-ams", profiles)?.name).toBe("mimo-medium");
 		expect(recommendModelProfileForProvider("xiaomi-token-plan-cn", profiles)?.name).toBe("mimo-medium");
-		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-medium");
+		expect(recommendModelProfileForProvider("xai", profiles)?.name).toBe("grok-46-medium");
 		expect(recommendModelProfileForProvider("grok-build", profiles)?.name).toBe("grok-build-pro");
 		expect(recommendModelProfileForProvider("cursor", profiles)?.name).toBe("cursor-medium");
 		expect(recommendModelProfileForProvider("alibaba-token-plan", profiles)?.name).toBe(

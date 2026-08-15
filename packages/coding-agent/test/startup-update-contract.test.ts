@@ -283,6 +283,7 @@ describe("startup update contract", () => {
 			let pipedInputReads = 0;
 			let sessionOptions: CreateAgentSessionOptions | undefined;
 			let initialMessage: string | undefined;
+			const quitCalls: number[] = [];
 			try {
 				const parsed =
 					testCase.expectedRunner === "acp"
@@ -315,8 +316,12 @@ describe("startup update contract", () => {
 						runners.push("print");
 						initialMessage = options.initialMessage;
 					},
+					quit: async code => {
+						quitCalls.push(code);
+					},
 				});
 				expect(checks, testCase.name).toBe(0);
+				expect(quitCalls, testCase.name).toEqual([]);
 				expect(runners, testCase.name).toEqual([testCase.expectedRunner]);
 				expect(pipedInputReads, testCase.name).toBe(testCase.expectedRunner === "acp" ? 0 : 1);
 				expect(initialMessage, testCase.name).toBe(testCase.expectedInitialMessage);
@@ -420,6 +425,7 @@ describe("startup update contract", () => {
 		let disposeCalls = 0;
 		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
 		const sessionResult = fakeSessionResult();
+		const quitCalls: number[] = [];
 		sessionResult.session.dispose = async () => {
 			disposeCalls += 1;
 		};
@@ -437,11 +443,15 @@ describe("startup update contract", () => {
 					process.exitCode = 78;
 					await session.dispose();
 				},
+				quit: async code => {
+					quitCalls.push(code);
+				},
 			});
 
 			expect(disposeCalls).toBe(1);
 			expect(cleanupSpy).toHaveBeenCalledTimes(1);
 			expect(process.exitCode).toBe(78);
+			expect(quitCalls).toEqual([78]);
 		} finally {
 			vi.restoreAllMocks();
 			process.exitCode = originalExitCode ?? 0;
@@ -456,6 +466,7 @@ describe("startup update contract", () => {
 		const originalNoTitle = Bun.env.PI_NO_TITLE;
 		const printFailure = new Error("print failed");
 		const cleanupSpy = vi.spyOn(postmortem, "cleanup").mockResolvedValue(undefined);
+		const quitCalls: number[] = [];
 		try {
 			await expect(
 				runRootCommand(rootArgs({ mode: "text" }), [], {
@@ -468,9 +479,13 @@ describe("startup update contract", () => {
 					runPrintMode: async () => {
 						throw printFailure;
 					},
+					quit: async code => {
+						quitCalls.push(code);
+					},
 				}),
 			).rejects.toBe(printFailure);
 			expect(cleanupSpy).toHaveBeenCalledTimes(1);
+			expect(quitCalls).toEqual([]);
 		} finally {
 			vi.restoreAllMocks();
 			authStorage.close();

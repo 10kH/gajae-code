@@ -3,11 +3,14 @@ import {
 	__animationSchedulerTestHooks,
 	Container,
 	getCellDimensions,
+	ImageProtocol,
 	setCellDimensions,
+	TERMINAL,
 	type TUI,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "../src/modes/components/custom-editor";
 import { GajaePetWidget, PetFramedEditor } from "../src/modes/components/gajae-pet-widget";
+import { getPetPixelProtocol } from "../src/modes/components/pet-capability";
 
 function makeStubs(columns = 80, rows = 30) {
 	const written: string[] = [];
@@ -94,7 +97,7 @@ function makeWidget(
 		bottomOffset?: number;
 		isWorking?: () => boolean;
 		autoFlexGapMs?: [number, number] | null;
-		protocol?: "sixel" | "kitty" | null;
+		protocol?: "sixel" | "kitty" | "iterm2" | null;
 	} = {},
 ) {
 	const stubs = makeStubs(columns, rows);
@@ -118,6 +121,24 @@ describe("GajaePetWidget", () => {
 		vi.restoreAllMocks();
 	});
 
+	it("selects iTerm2 directly but blocks raw graphics under multiplexers", () => {
+		const terminal = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
+		const originalProtocol = terminal.imageProtocol;
+		try {
+			terminal.imageProtocol = ImageProtocol.Iterm2;
+			expect(getPetPixelProtocol({})).toBe("iterm2");
+			expect(getPetPixelProtocol({ TMUX: "/tmp/tmux-1/default,1,0" })).toBeNull();
+			expect(getPetPixelProtocol({ STY: "screen.1" })).toBeNull();
+			expect(getPetPixelProtocol({ ZELLIJ: "1" })).toBeNull();
+
+			terminal.imageProtocol = ImageProtocol.Sixel;
+			expect(getPetPixelProtocol({ TMUX: "1", PI_FORCE_IMAGE_PROTOCOL: "sixel" })).toBe("sixel");
+			expect(getPetPixelProtocol({ TMUX: "1" })).toBeNull();
+		} finally {
+			terminal.imageProtocol = originalProtocol;
+		}
+	});
+
 	it("on: reserves a side area and registers the overlay emitter", () => {
 		const { widget, editorContainer, getEmitter, getRenderedWidth } = makeWidget();
 		try {
@@ -132,6 +153,69 @@ describe("GajaePetWidget", () => {
 			// Pet is inset one column from the right edge (x = 80 - 4 - 1 = 75 -> col 76).
 			expect(payload).toContain(`;${80 - 4 - 1 + 1}H`);
 		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("falls back an unavailable saved skin to RedGajae", () => {
+		const { widget, getEmitter } = makeWidget();
+		try {
+			widget.setMode("removed-skin");
+
+			expect(widget.mode).toBe("red");
+			expect(getEmitter()).toBeDefined();
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("keeps the full-size iTerm2 footprint at the composer boundary", () => {
+		const { widget, editorContainer, getRenderedWidth, getEmitter } = makeWidget(80, 30, { protocol: "iterm2" });
+		try {
+			widget.setMode("red");
+			editorContainer.render(80);
+			expect(getRenderedWidth()).toBe(80 - 5);
+			const payload = getEmitter()?.();
+			expect(payload).toContain("\x1b[28;76H");
+			expect(payload).toContain("\x1b]1337;File=");
+			expect(payload).toContain("width=36px;height=36px;preserveAspectRatio=0");
+			expect(payload).toEndWith("\x1b\\");
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("clears iTerm2 frames on animation, resize, disable, and dispose", () => {
+		vi.useFakeTimers();
+		const original = getCellDimensions();
+		const { widget, written, getEmitter, setTerminalSize } = makeWidget(80, 30, {
+			protocol: "iterm2",
+			autoFlexGapMs: null,
+		});
+		try {
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1b]1337;File=");
+			written.length = 0;
+
+			vi.advanceTimersByTime(1200);
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X") && chunk.includes("\x1b]1337;File="))).toBe(
+				true,
+			);
+
+			setCellDimensions({ widthPx: 12, heightPx: 24 });
+			vi.advanceTimersByTime(100);
+			expect(getEmitter()?.()).toContain("width=48px;height=48px");
+
+			setTerminalSize(12, 30);
+			expect(getEmitter()?.()).toContain("\x1b[28;76H\x1b[4X");
+			setTerminalSize(80, 30);
+			expect(getEmitter()?.()).toContain("\x1b]1337;File=");
+
+			written.length = 0;
+			widget.setMode("off");
+			expect(written.some(chunk => chunk.includes("\x1b[28;76H\x1b[4X"))).toBe(true);
+		} finally {
+			setCellDimensions(original);
 			widget.dispose();
 		}
 	});
@@ -609,6 +693,78 @@ describe("GajaePetWidget", () => {
 			vi.advanceTimersByTime(1500);
 			const danceFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
 			expect(danceFrames.size).toBeGreaterThanOrEqual(3);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("runs the Ouroboros infinity chase while working", () => {
+		vi.useFakeTimers();
+		const { widget, written } = makeWidget(80, 30, { isWorking: () => true, autoFlexGapMs: null });
+		try {
+			widget.setMode("ouroboros");
+			written.length = 0;
+
+			// One full retouched orbit is 8 × 220ms.
+			vi.advanceTimersByTime(2000);
+
+			const spinFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
+			expect(spinFrames.size).toBeGreaterThanOrEqual(8);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("occasionally leaves the Ouroboros work loop for heart and three-drop cry bursts", () => {
+		vi.useFakeTimers();
+		vi.spyOn(Math, "random").mockReturnValue(0);
+		const { widget, written } = makeWidget(80, 30, {
+			isWorking: () => true,
+			autoFlexGapMs: [500, 500],
+		});
+		try {
+			widget.setMode("ouroboros");
+			written.length = 0;
+
+			vi.advanceTimersByTime(15_000);
+			expect(widget.isFlexing).toBe(true);
+			const heartWrites = written.length;
+			vi.advanceTimersByTime(5_000);
+			expect(widget.isFlexing).toBe(false);
+
+			vi.advanceTimersByTime(12_500);
+			expect(widget.isFlexing).toBe(true);
+			expect(written.length).toBeGreaterThan(heartWrites);
+			vi.advanceTimersByTime(3_500);
+			expect(widget.isFlexing).toBe(false);
+
+			written.length = 0;
+			vi.advanceTimersByTime(1000);
+			const resumedSpinFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
+			expect(resumedSpinFrames.size).toBeGreaterThanOrEqual(4);
+		} finally {
+			widget.dispose();
+		}
+	});
+
+	it("enters and exits the Ouroboros work loop through its authored transition", () => {
+		vi.useFakeTimers();
+		let working = false;
+		const { widget, written } = makeWidget(80, 30, { isWorking: () => working, autoFlexGapMs: null });
+		try {
+			widget.setMode("ouroboros");
+			written.length = 0;
+
+			working = true;
+			vi.advanceTimersByTime(400);
+			const enterFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
+			expect(enterFrames.size).toBeGreaterThanOrEqual(3);
+
+			written.length = 0;
+			working = false;
+			vi.advanceTimersByTime(520);
+			const exitFrames = new Set(written.filter(chunk => chunk.includes("\x1b[?2026h")));
+			expect(exitFrames.size).toBeGreaterThanOrEqual(3);
 		} finally {
 			widget.dispose();
 		}

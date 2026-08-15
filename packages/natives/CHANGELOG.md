@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Added async no-replace rename/link bindings so managed publication can keep kernel filesystem stalls off the resident event loop (#4396).
+
 ## [0.13.2] - 2026-08-13
 
 ### Added

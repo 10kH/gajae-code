@@ -17,6 +17,7 @@ import { RETIRED_MODEL_KEYS } from "../src/model-retirements";
 import {
 	applyGeneratedModelPolicies,
 	CLOUDFLARE_FALLBACK_MODEL,
+	Effort,
 	linkOpenAIPromotionTargets,
 } from "../src/model-thinking";
 import prevModelsJson from "../src/models.json" with { type: "json" };
@@ -143,19 +144,70 @@ export function injectAlibabaTokenPlanModels(models: Model[]): void {
 		maxTokens: 65_536,
 		compat: { supportsDeveloperRole: false },
 	};
+	const qwenPreview: Model<"openai-responses"> = {
+		id: "qwen3.8-max-preview",
+		name: "Qwen3.8 Max Preview",
+		api: "openai-responses",
+		provider: "alibaba-token-plan",
+		baseUrl: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 65_536,
+		compat: { supportsDeveloperRole: false },
+	};
 	for (let index = models.length - 1; index >= 0; index--) {
 		const model = models[index]!;
 		if (model.provider === "alibaba-token-plan" && model.id === "qwen-3.8-max") {
 			models.splice(index, 1);
 		}
 	}
-	for (const metadata of [deepseek, qwen]) {
+	for (const metadata of [deepseek, qwen, qwenPreview]) {
 		const existing = models.find(model => model.provider === "alibaba-token-plan" && model.id === metadata.id);
 		if (existing) {
 			Object.assign(existing, metadata);
 		} else {
 			models.push(metadata);
 		}
+	}
+}
+
+/**
+ * Keep Muse Spark 1.2 available through OpenRouter when live catalog
+ * regeneration is unavailable or the bundled seed predates the release.
+ *
+ * Meta's model catalog and reasoning documentation are authoritative for the
+ * model id, context window, and effort range. OpenRouter's public catalog is
+ * authoritative for this provider route and pricing.
+ */
+export function injectMuseSparkModels(models: Model[]): void {
+	const metadata: Model<"openai-completions"> = {
+		id: "meta/muse-spark-1.2",
+		name: "Meta: Muse Spark 1.2",
+		api: "openai-completions",
+		provider: "openrouter",
+		baseUrl: "https://openrouter.ai/api/v1",
+		reasoning: true,
+		// GJC's current Model.input contract represents only text/image. Meta and
+		// OpenRouter also accept video, audio, and PDF/file inputs for this model;
+		// those modalities remain intentionally unadvertised until the shared model
+		// contract and request pipelines can represent them end to end.
+		input: ["text", "image"],
+		cost: { input: 1.25, output: 4.25, cacheRead: 0.15, cacheWrite: 0 },
+		contextWindow: 1_048_576,
+		maxTokens: 131_072,
+		thinking: {
+			mode: "effort",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.XHigh,
+		},
+	};
+	const existing = models.find(model => model.provider === metadata.provider && model.id === metadata.id);
+	if (existing) {
+		Object.assign(existing, metadata);
+	} else {
+		models.push(metadata);
 	}
 }
 
@@ -682,6 +734,9 @@ async function generateModels() {
 	injectAlibabaTokenPlanModels(allModels);
 	injectJetBrainsJunieModels(allModels);
 	applyGeneratedModelPolicies(allModels);
+	// This provider-specific correction must run after generic policy inference,
+	// which otherwise caps unknown OpenAI-compatible models at `high`.
+	injectMuseSparkModels(allModels);
 	linkOpenAIPromotionTargets(allModels);
 	injectImageGenerationModels(allModels);
 

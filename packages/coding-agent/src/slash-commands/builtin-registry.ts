@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { ThinkingLevel } from "@gajae-code/agent-core";
 import { type Model, modelsAreEqual } from "@gajae-code/ai/core";
 import { getOAuthProviders } from "@gajae-code/ai/utils/oauth";
-import { PET_SKINS, type PetMode, Spacer, Text } from "@gajae-code/tui";
+import { PET_SKIN_IDS, PET_SKINS, type PetMode, Spacer, Text } from "@gajae-code/tui";
 import { setProjectDir } from "@gajae-code/utils";
 import { jobElapsedMs } from "../async";
 import { activateModelProfile, materializeActiveModelProfileAssignments } from "../config/model-profile-activation";
@@ -12,6 +12,7 @@ import {
 	GJC_MODEL_ASSIGNMENT_TARGET_IDS,
 	GJC_MODEL_ASSIGNMENT_TARGETS,
 	type GjcModelAssignmentTargetId,
+	requiresExplicitThinkingChoice,
 } from "../config/model-registry";
 
 import {
@@ -70,8 +71,11 @@ function canClearComposer(runtime: BuiltinSlashCommandRuntime): boolean {
 
 const PET_COMMAND_OPTIONS: ReadonlyArray<{ name: string; mode: PetMode; description: string }> = [
 	{ name: "off", mode: "off", description: "Hide the pet" },
-	{ name: "RedGajae", mode: "red", description: PET_SKINS.red.description },
-	{ name: "BlueGajae", mode: "blue", description: PET_SKINS.blue.description },
+	...PET_SKIN_IDS.map(id => ({
+		name: PET_SKINS[id].label,
+		mode: id,
+		description: PET_SKINS[id].description,
+	})),
 ];
 const PET_COMMAND_HINT = `[${PET_COMMAND_OPTIONS.map(option => option.name).join("|")}]`;
 /**
@@ -870,6 +874,18 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 					return usage(modelSelectionUsage(runtime, resolution.failure.message), runtime);
 				}
 				const { selection } = resolution;
+				if (
+					selection.thinkingLevel === undefined &&
+					targetIds.some(targetId => requiresExplicitThinkingChoice(selection.model, targetId))
+				) {
+					return usage(
+						modelSelectionUsage(
+							runtime,
+							`Model ${selection.model.provider}/${selection.model.id} requires an explicit effort suffix.`,
+						),
+						runtime,
+					);
+				}
 				try {
 					const includesDefault = targetIds.includes("default");
 					const includesRoleAgent = targetIds.some(role => role !== "default");

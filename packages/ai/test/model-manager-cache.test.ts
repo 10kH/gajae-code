@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { readModelCache, writeModelCache } from "../src/model-cache";
 import { resolveProviderModels } from "../src/model-manager";
+import { Effort } from "../src/model-thinking";
 import type { Api, Model } from "../src/types";
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -224,5 +225,38 @@ describe("online-if-uncached model refresh", () => {
 				models: [expect.objectContaining({ id: "dynamic" })],
 			});
 		}
+	});
+
+	test("preserves Muse Spark xhigh after dynamic OpenRouter discovery merges", async () => {
+		const providerId = "openrouter";
+		const muse = {
+			...model(providerId, "meta/muse-spark-1.2"),
+			name: "Meta: Muse Spark 1.2",
+			baseUrl: "https://openrouter.ai/api/v1",
+			reasoning: true,
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+		};
+
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels: [muse],
+				cacheDbPath,
+				fetchDynamicModels: async () => [{ ...muse, reasoning: false, thinking: undefined }],
+			},
+			"online",
+		);
+
+		expect(result.models).toContainEqual(
+			expect.objectContaining({
+				id: "meta/muse-spark-1.2",
+				thinking: {
+					mode: "effort",
+					minLevel: Effort.Minimal,
+					maxLevel: Effort.XHigh,
+				},
+			}),
+		);
 	});
 });

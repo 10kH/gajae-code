@@ -125,6 +125,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		baseUrl.includes("fireworks.ai") ||
 		isDirectDeepseekApi;
 	const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
+	const isDirectXaiReasoningEffortModel = provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6");
 	const isMistral = provider === "mistral" || baseUrl.includes("mistral.ai");
 
 	// Hosts whose chat-completions endpoints are known to accept multiple
@@ -215,7 +216,7 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		sendSessionHeaders: false,
 		supportsResponsesSessionAffinity: false,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
-		supportsReasoningEffort: !isGrok && !isZai,
+		supportsReasoningEffort: (!isGrok && !isZai) || isDirectXaiReasoningEffortModel,
 		reasoningEffortMap,
 		supportsUsageInStreaming: !isCerebras,
 		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel || isOpenCodeGoReasoning,

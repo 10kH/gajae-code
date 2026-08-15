@@ -5,6 +5,7 @@ import {
 	type AssistantMessageEventStream,
 	type AuthCredentialSelector,
 	applyFinalCodexGpt56ContextCap,
+	applyGeneratedModelPolicies,
 	type CacheRetention,
 	CODEX_GPT_5_6_CONTEXT_CAP,
 	type Context,
@@ -170,6 +171,17 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 	critic: { id: "critic", tag: "CRITIC", name: "Critic", color: "error", settingsPath: "task.agentModelOverrides" },
 	image: { id: "image", tag: "IMAGE", name: "Image", color: "accent", settingsPath: "modelRoles" },
 };
+
+export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
+	if (model.reasoning !== true) return false;
+	if (
+		model.provider === "openai" ||
+		model.provider === "openai-codex" ||
+		(model.provider === "xai" && (model.id === "grok-4.5" || model.id === "grok-4.6"))
+	)
+		return true;
+	return role !== null && GJC_MODEL_ASSIGNMENT_TARGETS[role].settingsPath === "task.agentModelOverrides";
+}
 
 /** Alias for ModelRoleInfo - used for both built-in and custom roles */
 export type RoleInfo = ModelRoleInfo;
@@ -1634,7 +1646,9 @@ export class ModelRegistry {
 			const withTransport = providerOverride
 				? models.map(model => this.#applyProviderTransportOverride(model, providerOverride))
 				: models;
-			cachedModels.push(...this.#applyProviderModelOverrides(descriptor.providerId, withTransport));
+			const normalized = this.#applyProviderModelOverrides(descriptor.providerId, withTransport);
+			applyGeneratedModelPolicies(normalized);
+			cachedModels.push(...normalized);
 		}
 		return cachedModels;
 	}
@@ -1650,6 +1664,7 @@ export class ModelRegistry {
 					this.#applyProviderCompat(providerConfig.compat, [...models]),
 				),
 			);
+			applyGeneratedModelPolicies(normalized);
 			cachedModels.push(...normalized);
 		}
 		return cachedModels;

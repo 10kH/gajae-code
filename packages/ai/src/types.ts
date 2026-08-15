@@ -23,6 +23,7 @@ import type {
 import type { GoogleOptions } from "./providers/google";
 import type { GoogleGeminiCliOptions } from "./providers/google-gemini-cli";
 import type { GoogleVertexOptions } from "./providers/google-vertex";
+import type { KiroCodeWhispererOptions } from "./providers/kiro-codewhisperer";
 import type { OllamaChatOptions } from "./providers/ollama";
 import type { OpenAICodexResponsesOptions } from "./providers/openai-codex-responses";
 import type { OpenAICompletionsOptions } from "./providers/openai-completions";
@@ -43,7 +44,8 @@ export type KnownApi =
 	| "google-gemini-cli"
 	| "google-vertex"
 	| "ollama-chat"
-	| "cursor-agent";
+	| "cursor-agent"
+	| "kiro-codewhisperer-stream";
 export type Api = KnownApi | (string & {});
 export interface ApiOptionsMap {
 	"anthropic-messages": AnthropicOptions;
@@ -57,6 +59,7 @@ export interface ApiOptionsMap {
 	"google-vertex": GoogleVertexOptions;
 	"ollama-chat": OllamaChatOptions;
 	"cursor-agent": CursorOptions;
+	"kiro-codewhisperer-stream": KiroCodeWhispererOptions;
 }
 // Compile-time exhaustiveness check - this will fail if ApiOptionsMap doesn't have all KnownApi keys
 type _CheckExhaustive =
@@ -116,6 +119,7 @@ export interface ThinkingConfig {
 export const KNOWN_PROVIDERS = [
 	"alibaba-token-plan",
 	"amazon-bedrock",
+	"kiro",
 	"azure-openai",
 	"anthropic",
 	"google",
@@ -584,6 +588,16 @@ export interface ToolCall {
 	 * rejects the call with a retryable error instead.
 	 */
 	incompleteArguments?: boolean;
+	/**
+	 * Set when the provider saw the argument JSON spell a printable non-ASCII
+	 * character as a `\uXXXX` escape instead of literal UTF-8. Hand-written hex
+	 * is where models mistype digits, and a mistyped nibble decodes to a
+	 * different but equally valid character, so the decoded arguments cannot be
+	 * verified or repaired after parsing. The agent loop treats such a turn as a
+	 * sampling accident: managed runs discard and re-request it, and execution
+	 * rejects the call rather than running on silently corrupted text.
+	 */
+	escapedNonAsciiArguments?: boolean;
 }
 
 export interface Usage {

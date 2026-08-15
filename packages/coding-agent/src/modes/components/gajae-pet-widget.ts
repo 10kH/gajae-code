@@ -3,16 +3,17 @@ import {
 	buildGajaePixelFrames,
 	type Component,
 	type Container,
-	type GajaePixelFrameName,
 	type GajaePixelFrames,
 	getCellDimensions,
-	PARA_PARA_STEPS,
 	PET_SKINS,
+	type PetBurst,
+	type PetFrameName,
 	type PetMode,
 	type PetSkinId,
 	petBurstDurationMs,
 	petBurstFrame,
 	registerAnimationCallback,
+	resolvePetMode,
 	type TUI,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
@@ -66,21 +67,48 @@ function sameFootprint(left: SixelFootprint, right: SixelFootprint): boolean {
  */
 const petOverlayEmitterOwners = new WeakMap<TUI, GajaePetWidget>();
 
-/** Working animation: the shared para-para beats looped end to end. */
-const WORK_LOOP_TOTAL = PARA_PARA_STEPS.reduce((sum, [, ms]) => sum + ms, 0);
 /** Random gap between automatic claw flexes (fires while idle AND working). */
 const AUTO_FLEX_MIN_GAP_MS = 12_000;
 const AUTO_FLEX_MAX_GAP_MS = 40_000;
-// Deterministic idle loop: gaze around with a rare visor flicker.
-const IDLE_LOOP: Array<[GajaePixelFrameName, number]> = [
-	["base", 1100],
-	["gazeL", 350],
-	["base", 500],
-	["gazeR", 350],
-	["base", 800],
-	["flicker", 150],
-];
-const IDLE_LOOP_TOTAL = IDLE_LOOP.reduce((sum, [, ms]) => sum + ms, 0);
+
+function animationFrameAt(
+	steps: ReadonlyArray<readonly [PetFrameName, number]>,
+	now: number,
+	fallback: PetFrameName,
+): PetFrameName {
+	const total = steps.reduce((sum, [, ms]) => sum + ms, 0);
+	if (total <= 0) return fallback;
+	let elapsed = now % total;
+	for (const [frame, ms] of steps) {
+		if (elapsed < ms) return frame;
+		elapsed -= ms;
+	}
+	return fallback;
+}
+
+function animationFrameAtElapsed(
+	steps: ReadonlyArray<readonly [PetFrameName, number]>,
+	elapsed: number,
+	fallback: PetFrameName,
+): PetFrameName {
+	for (const [frame, ms] of steps) {
+		if (elapsed < ms) return frame;
+		elapsed -= ms;
+	}
+	return fallback;
+}
+
+function animationDuration(steps: ReadonlyArray<readonly [PetFrameName, number]>): number {
+	return steps.reduce((sum, [, ms]) => sum + ms, 0);
+}
+
+interface WorkTransition {
+	startedAt: number;
+	steps: ReadonlyArray<readonly [PetFrameName, number]>;
+}
+
+const OUROBOROS_WORK_BURST_MIN_GAP_MS = 14_000;
+const OUROBOROS_WORK_BURST_MAX_GAP_MS = 30_000;
 
 /**
  * Selector preview: fire the first burst this soon after a skin is previewed, so the
@@ -123,8 +151,8 @@ export class PetFramedEditor implements Component {
 }
 
 /**
- * The gajae pet: a 16x16 real-pixel sprite living in a reserved area beside
- * the composer. It is nearest-neighbor scaled to the two terminal rows occupied
+ * The gajae pet: a real-pixel sprite living in a reserved area beside the
+ * composer. It is nearest-neighbor scaled to the two terminal rows occupied
  * by an empty one-line composer and lifted one row so its feet meet the input
  * box's bottom edge.
  *
@@ -146,12 +174,17 @@ export class GajaePetWidget {
 	#getComposerBottomOffset: () => number;
 	#mode: PetMode = "off";
 	#pixel: GajaePixelFrames | undefined;
-	#frame: GajaePixelFrameName = "base";
+	#frame: PetFrameName = "base";
 	#animation: AnimationRegistration | undefined;
 	#flexUntil = 0;
+	#activeBurst: PetBurst | undefined;
 	#nextAutoFlexAt = 0;
+	#working = false;
+	#workTransition: WorkTransition | undefined;
+	#nextWorkBurstAt = 0;
+	#workBurstIndex = 0;
 	#autoFlexGapMs: [number, number] | null;
-	#forcedProtocol: "sixel" | "kitty" | undefined;
+	#forcedProtocol: "sixel" | "kitty" | "iterm2" | undefined;
 	/** Cell metrics the current frames were built for; a change triggers a rebuild. */
 	#builtCellW = 0;
 	#builtCellH = 0;
@@ -178,7 +211,7 @@ export class GajaePetWidget {
 		isWorking: () => boolean;
 		/** Rows rendered below the composer box (pet floor + hook widgets). */
 		getComposerBottomOffset: () => number;
-		forcePixelProtocol?: "sixel" | "kitty";
+		forcePixelProtocol?: "sixel" | "kitty" | "iterm2";
 		/** Random [min, max] ms between auto-flexes; null disables. */
 		autoFlexGapMs?: [number, number] | null;
 	}) {
@@ -195,7 +228,7 @@ export class GajaePetWidget {
 	}
 
 	/** Protocol available for the real-pixel pet, if any. */
-	static pixelProtocol(): "sixel" | "kitty" | null {
+	static pixelProtocol(): "sixel" | "kitty" | "iterm2" | null {
 		return getPetPixelProtocol();
 	}
 
@@ -207,8 +240,8 @@ export class GajaePetWidget {
 		return performance.now() < this.#flexUntil;
 	}
 
-	setMode(mode: PetMode): void {
-		this.#applyMode(mode, true);
+	setMode(mode: string): void {
+		this.#applyMode(resolvePetMode(mode), true);
 	}
 
 	/** Live preview during a selector: change the sprite without re-mounting the
@@ -237,6 +270,9 @@ export class GajaePetWidget {
 			this.#releaseOverlayEmitter();
 			this.#floorContainer.clear();
 			this.#pixel = undefined;
+			this.#workTransition = undefined;
+			this.#nextWorkBurstAt = 0;
+			this.#activeBurst = undefined;
 			this.#framedEditor.setReserve(0);
 			if (mountComposer) this.#mountEditor(false);
 			this.#ui.requestRender(true);
@@ -247,9 +283,14 @@ export class GajaePetWidget {
 		if (!protocol) return;
 		if (this.#mode !== "off") this.#writeImageCleanup();
 		this.#mode = mode;
-		this.#frame = "base";
+		this.#frame = PET_SKINS[mode].baseFrame;
 		this.#flexUntil = 0;
+		this.#activeBurst = undefined;
 		this.#nextAutoFlexAt = 0;
+		this.#working = this.#isWorking();
+		this.#workTransition = undefined;
+		this.#nextWorkBurstAt = 0;
+		this.#workBurstIndex = 0;
 		this.#buildPixel(protocol);
 		if (mountComposer) this.#mountEditor(true);
 		// The pet overlays the composer's bottom rows; no floor row is reserved, so
@@ -262,7 +303,7 @@ export class GajaePetWidget {
 	}
 
 	/** (Re)build the encoded frames for the current terminal cell metrics. */
-	#buildPixel(protocol: "sixel" | "kitty"): void {
+	#buildPixel(protocol: "sixel" | "kitty" | "iterm2"): void {
 		const cell = getCellDimensions();
 		this.#builtCellW = cell.widthPx;
 		this.#builtCellH = cell.heightPx;
@@ -276,10 +317,17 @@ export class GajaePetWidget {
 			skin,
 			cellWidthPx: cell.widthPx,
 			cellHeightPx: cell.heightPx,
+			// Encode iTerm2 at the same two-row pixel size as Kitty/Sixel. The
+			// iTerm2 protocol receives explicit pixel dimensions below, so it must
+			// not be reduced to a fractional cell canvas or it becomes undersized.
 			targetRows: 2,
 			sixelTopPaddingPx: protocol === "sixel" ? PET_SIXEL_DROP_PX : 0,
 			kittyCellYOffsetPx: protocol === "kitty" ? petKittyDropPx(cell.heightPx) : 0,
 			kittyImageId: protocol === "kitty" ? this.#kittyImageId : undefined,
+			// iTerm2 receives an explicit 1:1 pixel size; keep its raster inside the
+			// same two-row footprint reserved for Kitty and Sixel.
+			iterm2TopPaddingPx: 0,
+			iterm2BottomPaddingPx: 0,
 		});
 		this.#framedEditor.setReserve(this.#pixel.columns + PET_SIDE_MARGIN);
 	}
@@ -306,6 +354,9 @@ export class GajaePetWidget {
 			this.#releaseOverlayEmitter();
 			this.#mode = "off";
 			this.#pixel = undefined;
+			this.#workTransition = undefined;
+			this.#nextWorkBurstAt = 0;
+			this.#activeBurst = undefined;
 			this.#floorContainer.clear();
 			this.#framedEditor.setReserve(0);
 			// Restore the plain composer only while our framed wrapper is still
@@ -334,31 +385,46 @@ export class GajaePetWidget {
 		this.#mountEditor(this.#mode !== "off");
 	}
 
-	#pickFrame(now: number): GajaePixelFrameName {
+	#pickFrame(now: number): PetFrameName {
 		const mode = this.#mode;
 		if (mode === "off") return "base";
+		const skin = PET_SKINS[mode];
+		const working = this.#isWorking();
+		if (working !== this.#working) {
+			this.#working = working;
+			this.#flexUntil = 0;
+			this.#activeBurst = undefined;
+			this.#nextWorkBurstAt = 0;
+			const steps = working ? skin.workEnter : skin.workExit;
+			this.#workTransition = steps?.length ? { startedAt: now, steps } : undefined;
+		}
+		if (this.#workTransition) {
+			const elapsed = now - this.#workTransition.startedAt;
+			const duration = animationDuration(this.#workTransition.steps);
+			if (elapsed < duration) {
+				return animationFrameAtElapsed(this.#workTransition.steps, elapsed, skin.baseFrame);
+			}
+			this.#workTransition = undefined;
+		}
 		// Random idle burst → the skin's own animation, driven by its burst descriptor
 		// (RedGajae holds a flex; BlueGajae dances the para-para then sobs).
 		if (now < this.#flexUntil) {
-			const burst = PET_SKINS[mode].burst;
+			const burst = this.#activeBurst ?? skin.burst;
 			const elapsed = now - (this.#flexUntil - petBurstDurationMs(burst));
 			return petBurstFrame(burst, elapsed, now);
 		}
-		// Working → loop the shared para-para beats.
+		// Working → loop the selected skin's activity animation.
 		if (this.#isWorking()) {
-			let d = now % WORK_LOOP_TOTAL;
-			for (const [frame, ms] of PARA_PARA_STEPS) {
-				if (d < ms) return frame;
-				d -= ms;
-			}
-			return "base";
+			return animationFrameAt(skin.work, now, skin.baseFrame);
 		}
-		let t = now % IDLE_LOOP_TOTAL;
-		for (const [frame, ms] of IDLE_LOOP) {
-			if (t < ms) return frame;
-			t -= ms;
-		}
-		return "base";
+		return animationFrameAt(skin.idle, now, skin.baseFrame);
+	}
+
+	#scheduleWorkBurst(now: number): void {
+		this.#nextWorkBurstAt =
+			now +
+			OUROBOROS_WORK_BURST_MIN_GAP_MS +
+			Math.random() * (OUROBOROS_WORK_BURST_MAX_GAP_MS - OUROBOROS_WORK_BURST_MIN_GAP_MS);
 	}
 
 	#scheduleAutoFlex(now: number): void {
@@ -382,13 +448,27 @@ export class GajaePetWidget {
 		}
 		// Random show-off, both while idle and while working. Each skin's burst runs for
 		// its own length (RedGajae a brief flex; BlueGajae a para-para cycle plus sob).
-		if (this.#autoFlexGapMs && now >= this.#flexUntil) {
+		const skin = PET_SKINS[this.#mode];
+		const usesWorkBursts = this.#isWorking() && Boolean(skin.workBursts?.length);
+		if (this.#autoFlexGapMs && !usesWorkBursts && now >= this.#flexUntil) {
 			if (this.#nextAutoFlexAt === 0) {
 				this.#scheduleAutoFlex(now);
 			} else if (now >= this.#nextAutoFlexAt) {
 				const burstMs = petBurstDurationMs(PET_SKINS[this.#mode].burst);
+				this.#activeBurst = skin.burst;
 				this.#flexUntil = now + burstMs;
 				this.#scheduleAutoFlex(now + burstMs);
+			}
+		}
+		if (this.#isWorking() && !this.#workTransition && now >= this.#flexUntil && skin.workBursts?.length) {
+			if (this.#nextWorkBurstAt === 0) {
+				this.#scheduleWorkBurst(now);
+			} else if (now >= this.#nextWorkBurstAt) {
+				const burst = skin.workBursts[this.#workBurstIndex % skin.workBursts.length];
+				this.#workBurstIndex++;
+				this.#activeBurst = burst;
+				this.#flexUntil = now + petBurstDurationMs(burst);
+				this.#scheduleWorkBurst(this.#flexUntil);
 			}
 		}
 		const frame = this.#pickFrame(now);
@@ -412,7 +492,15 @@ export class GajaePetWidget {
 		// back onto the composer's bottom border per protocol (sixel via transparent
 		// top padding, kitty via a sub-cell Y offset baked into the frames).
 		const composerBottom = rows - this.#getComposerBottomOffset();
-		const y = composerBottom - pixel.rows - PET_RAISE_ROWS;
+		// iTerm2 anchors an inline image at the current cursor row. Keep the full
+		// sprite inside the composer rows and leave the HUD boundary below it.
+		// Keep the full-size iTerm2 sprite aligned with the composer like the
+		// cursor-neutral Kitty/Sixel overlays; only the protocol encoding differs.
+		// Nudge the iTerm2 image one terminal row upward while preserving its
+		// explicit 36px size and aspect ratio. Kitty/Sixel keep their established
+		// safety lift.
+		const safetyLift = PET_RAISE_ROWS;
+		const y = composerBottom - pixel.rows - safetyLift;
 		const x = columns - pixel.columns - PET_SIDE_MARGIN;
 		if (y < 0 || x < 0) return null;
 		return { x, y };
@@ -490,7 +578,7 @@ export class GajaePetWidget {
 		const { x, y } = pos;
 		let out = "";
 
-		if (pixel.protocol === "sixel") {
+		if (pixel.protocol === "sixel" || pixel.protocol === "iterm2") {
 			const footprint = { x, y, columns: pixel.columns, rows: pixel.rasterRows };
 			if (this.#lastSixelFootprint && !sameFootprint(this.#lastSixelFootprint, footprint)) {
 				out += this.#clearSixelFootprint(this.#lastSixelFootprint);

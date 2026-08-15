@@ -349,13 +349,24 @@ export type SizeValue = number | `${number}%`;
 /** Parse a SizeValue into absolute value given a reference size */
 function parseSizeValue(value: SizeValue | undefined, referenceSize: number): number | undefined {
 	if (value === undefined) return undefined;
-	if (typeof value === "number") return value;
+	if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
 	// Parse percentage string like "50%"
 	const match = value.match(/^(\d+(?:\.\d+)?)%$/);
 	if (match) {
-		return Math.floor((referenceSize * parseFloat(match[1])) / 100);
+		const percent = Number.parseFloat(match[1]);
+		if (!Number.isFinite(percent)) return undefined;
+		const parsed = Math.floor((referenceSize * percent) / 100);
+		return Number.isFinite(parsed) ? parsed : undefined;
 	}
 	return undefined;
+}
+
+function finiteNumber(value: number | undefined, fallback: number): number {
+	return value !== undefined && Number.isFinite(value) ? value : fallback;
+}
+
+function finiteNonNegative(value: number | undefined, fallback = 0): number {
+	return Math.max(0, finiteNumber(value, fallback));
 }
 
 const DISABLED_ENV_VALUES = new Set(["0", "false", "off", "no"]);
@@ -2480,10 +2491,10 @@ export class TUI extends Container {
 			typeof opt.margin === "number"
 				? { top: opt.margin, right: opt.margin, bottom: opt.margin, left: opt.margin }
 				: (opt.margin ?? {});
-		const marginTop = Math.max(0, margin.top ?? 0);
-		const marginRight = Math.max(0, margin.right ?? 0);
-		const marginBottom = Math.max(0, margin.bottom ?? 0);
-		const marginLeft = Math.max(0, margin.left ?? 0);
+		const marginTop = Math.min(finiteNonNegative(margin.top), Math.max(0, termHeight - 1));
+		const marginRight = Math.min(finiteNonNegative(margin.right), Math.max(0, termWidth - 1));
+		const marginBottom = Math.min(finiteNonNegative(margin.bottom), Math.max(0, termHeight - 1 - marginTop));
+		const marginLeft = Math.min(finiteNonNegative(margin.left), Math.max(0, termWidth - 1 - marginRight));
 
 		// Available space after margins
 		const availWidth = Math.max(1, termWidth - marginLeft - marginRight);
@@ -2492,14 +2503,15 @@ export class TUI extends Container {
 		// === Resolve width ===
 		let width = parseSizeValue(opt.width, termWidth) ?? Math.min(80, availWidth);
 		// Apply minWidth
-		if (opt.minWidth !== undefined) {
+		if (opt.minWidth !== undefined && Number.isFinite(opt.minWidth)) {
 			width = Math.max(width, opt.minWidth);
 		}
 		// Clamp to available space
 		width = Math.max(1, Math.min(width, availWidth));
 
 		// === Resolve maxHeight ===
-		let maxHeight = parseSizeValue(opt.maxHeight, termHeight);
+		const parsedMaxHeight = parseSizeValue(opt.maxHeight, termHeight);
+		let maxHeight = opt.maxHeight !== undefined && parsedMaxHeight === undefined ? availHeight : parsedMaxHeight;
 		// Clamp to available space
 		if (maxHeight !== undefined) {
 			maxHeight = Math.max(1, Math.min(maxHeight, availHeight));
@@ -2519,14 +2531,18 @@ export class TUI extends Container {
 				if (match) {
 					const maxRow = Math.max(0, availHeight - effectiveHeight);
 					const percent = parseFloat(match[1]) / 100;
-					row = marginTop + Math.floor(maxRow * percent);
+					row = Number.isFinite(percent)
+						? marginTop + Math.floor(maxRow * percent)
+						: this.#resolveAnchorRow(opt.anchor ?? "center", effectiveHeight, availHeight, marginTop);
 				} else {
 					// Invalid format, fall back to center
 					row = this.#resolveAnchorRow("center", effectiveHeight, availHeight, marginTop);
 				}
-			} else {
+			} else if (Number.isFinite(opt.row)) {
 				// Absolute row position
 				row = opt.row;
+			} else {
+				row = this.#resolveAnchorRow(opt.anchor ?? "center", effectiveHeight, availHeight, marginTop);
 			}
 		} else {
 			// Anchor-based (default: center)
@@ -2541,14 +2557,18 @@ export class TUI extends Container {
 				if (match) {
 					const maxCol = Math.max(0, availWidth - width);
 					const percent = parseFloat(match[1]) / 100;
-					col = marginLeft + Math.floor(maxCol * percent);
+					col = Number.isFinite(percent)
+						? marginLeft + Math.floor(maxCol * percent)
+						: this.#resolveAnchorCol(opt.anchor ?? "center", width, availWidth, marginLeft);
 				} else {
 					// Invalid format, fall back to center
 					col = this.#resolveAnchorCol("center", width, availWidth, marginLeft);
 				}
-			} else {
+			} else if (Number.isFinite(opt.col)) {
 				// Absolute column position
 				col = opt.col;
+			} else {
+				col = this.#resolveAnchorCol(opt.anchor ?? "center", width, availWidth, marginLeft);
 			}
 		} else {
 			// Anchor-based (default: center)
@@ -2557,8 +2577,8 @@ export class TUI extends Container {
 		}
 
 		// Apply offsets
-		if (opt.offsetY !== undefined) row += opt.offsetY;
-		if (opt.offsetX !== undefined) col += opt.offsetX;
+		row += finiteNumber(opt.offsetY, 0);
+		col += finiteNumber(opt.offsetX, 0);
 
 		// Clamp to terminal bounds (respecting margins)
 		row = Math.max(marginTop, Math.min(row, termHeight - marginBottom - effectiveHeight));
@@ -2648,6 +2668,9 @@ export class TUI extends Container {
 		// than the current content. Padding to it can cause the renderer to output hundreds/thousands of blank
 		// lines, effectively scrolling the terminal when an overlay is shown.
 		const workingHeight = Math.max(result.length, minLinesNeeded);
+		if (!Number.isFinite(workingHeight)) {
+			throw new Error("Overlay layout produced a non-finite working height");
+		}
 
 		// Extend result with empty lines if content is too short for overlay placement
 		while (result.length < workingHeight) {
@@ -4038,21 +4061,6 @@ export class TUI extends Container {
 		const nextLiveViewportTop = Math.max(0, newLines.length - height);
 		if (newLines.length < this.#previousLines.length && nextLiveViewportTop !== prevViewportTop) {
 			viewportRepaint(`content contraction changed viewport top (${prevViewportTop} -> ${nextLiveViewportTop})`);
-			return;
-		}
-		if (
-			appendedLines &&
-			nextLiveViewportTop > prevViewportTop &&
-			previousKittyPlacementSpans.some(placement =>
-				this.#kittyPlacementIntersectsRegion(placement, {
-					top: prevViewportTop,
-					bottom: prevViewportTop + height,
-				}),
-			)
-		) {
-			viewportRepaint(
-				`content append moved a Kitty placement viewport (${prevViewportTop} -> ${nextLiveViewportTop})`,
-			);
 			return;
 		}
 		if (distinctPostContractionRows) this.#scrollbackResumeViewportTop = undefined;

@@ -75,6 +75,8 @@ export type MockContent =
 			arguments: Record<string, unknown> | string;
 			/** Simulate a provider-flagged truncated call (cut off mid-arguments). */
 			incompleteArguments?: boolean;
+			/** Simulate a provider-flagged `\uXXXX`-escaped-arguments call. */
+			escapedNonAsciiArguments?: boolean;
 	  };
 
 /** One scripted response. */
@@ -423,6 +425,7 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 			name: input.name,
 			arguments: typeof input.arguments === "string" ? input.arguments : { ...input.arguments },
 			...(input.incompleteArguments ? { incompleteArguments: true } : {}),
+			...(input.escapedNonAsciiArguments ? { escapedNonAsciiArguments: true } : {}),
 		} as ToolCall;
 	}
 	return input;

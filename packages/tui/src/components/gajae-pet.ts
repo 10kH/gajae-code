@@ -1,11 +1,25 @@
+import * as zlib from "node:zlib";
+
+import {
+	OUROBOROS_HEART_STEPS,
+	OUROBOROS_IDLE_STEPS,
+	OUROBOROS_PIXEL_GRIDS,
+	OUROBOROS_WORK_CRY_STEPS,
+	OUROBOROS_WORK_ENTER_STEPS,
+	OUROBOROS_WORK_EXIT_STEPS,
+	OUROBOROS_WORK_HEART_STEPS,
+	OUROBOROS_WORK_STEPS,
+	type OuroborosFrameName,
+} from "./ouroboros-pet";
+
 /**
  * ┌─ GAJAE PET SPRITE SPEC ────────────────────────────────────────────────┐
- * The pet is a 16×16 pixel sprite drawn beside the composer. Everything here is
- * data: no PNGs, no assets — each frame is 16 strings of 16 chars, encoded to a
- * sixel or kitty escape at runtime. Author a new frame by drawing a grid.
+ * Pets are square pixel sprites drawn beside the composer. Everything here is
+ * data: no PNGs or binary assets. Current pet frames are 16×16 and render into
+ * the same terminal footprint.
  *
  * GRID RULES
- * - Exactly 16 rows × 16 columns. Only PALETTE keys below are valid chars.
+ * - Every frame within a skin has the same square dimensions.
  * - `.` = transparent. Keep the outer columns transparent so the sprite sits
  *   snug beside the input box (the widget reserves +1 column of slack).
  *
@@ -26,7 +40,8 @@
  * RENDERING: buildGajaePixelFrames({ protocol, cellWidthPx, cellHeightPx,
  * targetRows: 2 }) scales the art to 2 terminal rows and encodes each frame
  * once. Kitty uses a native `Y=` sub-cell drop (set by the widget) to sit on the
- * composer border; sixel uses transparent top padding.
+ * composer border; sixel uses transparent top padding; iTerm2 uses an inline PNG
+ * sized to the reserved cell block.
  *
  * BEHAVIOR (timing, positioning, on/off) lives in
  * packages/coding-agent/src/modes/components/gajae-pet-widget.ts.
@@ -34,17 +49,15 @@
  * ADD A FRAME: draw the grid → add its name to GajaePixelFrameName → register it in
  * PIXEL_GRIDS → reference it from an idle/work loop or a skin burst.
  *
- * ADD A PET (skin): append one entry to PET_SKINS below — { id, label, description,
- * palette, burst }. The id flows into PetSkinId/PetMode automatically, the settings
- * enum, `/pet` command and both selectors derive their options from PET_SKINS, and the
- * widget reads `burst` to animate — no other file needs editing. Recolor with a palette
- * spread (see BLUE_PALETTE); add frames only for poses the catalog lacks.
+ * ADD A PET (skin): append one PET_SKINS entry with its palette, frame registry,
+ * base/idle/work animations and burst. The id flows into PetSkinId/PetMode
+ * automatically; settings, `/pet`, and both selectors derive from PET_SKINS.
  * └────────────────────────────────────────────────────────────────────────┘
  */
 type Rgb = readonly [number, number, number];
 
 export type Palette = Record<string, Rgb | null>;
-export const PET_SKIN_IDS = ["red", "blue"] as const;
+export const PET_SKIN_IDS = ["red", "blue", "ouroboros"] as const;
 export type PetSkinId = (typeof PET_SKIN_IDS)[number];
 /** Every pet mode: "off" plus each skin id, in menu order. */
 export const PET_MODE_IDS = ["off", ...PET_SKIN_IDS] as const;
@@ -52,6 +65,11 @@ export type PetMode = (typeof PET_MODE_IDS)[number];
 /** Narrow an arbitrary string to a PetMode. */
 export function isPetMode(value: string): value is PetMode {
 	return (PET_MODE_IDS as readonly string[]).includes(value);
+}
+
+/** Resolve a persisted mode after a skin has been removed. Explicit "off" remains off. */
+export function resolvePetMode(value: string): PetMode {
+	return isPetMode(value) ? value : "red";
 }
 
 const RED_PALETTE: Palette = {
@@ -78,6 +96,15 @@ const BLUE_PALETTE: Palette = {
 	b: [125, 211, 252], // azure (belly)
 	A: [37, 120, 200], // muted blue (antenna)
 	w: [230, 247, 255], // foam (tear)
+};
+const OUROBOROS_PALETTE: Palette = {
+	".": null,
+	D: [20, 100, 48], // closed / crying eye
+	R: [174, 232, 14], // vivid lime body
+	r: [112, 146, 190], // cool blue underside (#7092BE)
+	G: [255, 231, 134], // pale-yellow eye
+	A: [255, 137, 180], // pink tongue and heart accent
+	w: [190, 231, 255], // tear
 };
 
 // ------------------------------------------------------------------------
@@ -188,6 +215,7 @@ export type GajaePixelFrameName =
 	| "cry1"
 	| "cry2"
 	| "cry3";
+export type PetFrameName = GajaePixelFrameName | OuroborosFrameName;
 
 const PIXEL_GRIDS: Record<GajaePixelFrameName, string[]> = {
 	base: F0,
@@ -210,6 +238,14 @@ export const PARA_PARA_STEPS: ReadonlyArray<readonly [GajaePixelFrameName, numbe
 	["flex", 480],
 	["base", 260],
 ];
+export const GAJAE_IDLE_STEPS: ReadonlyArray<readonly [GajaePixelFrameName, number]> = [
+	["base", 1100],
+	["gazeL", 350],
+	["base", 500],
+	["gazeR", 350],
+	["base", 800],
+	["flicker", 150],
+];
 
 /**
  * A skin's idle burst: a short intro sequence, then an optional looping tail. It drives
@@ -218,9 +254,9 @@ export const PARA_PARA_STEPS: ReadonlyArray<readonly [GajaePixelFrameName, numbe
  */
 export interface PetBurst {
 	/** Frames played once, in order, at the start of the burst. */
-	intro: ReadonlyArray<readonly [GajaePixelFrameName, number]>;
+	intro: ReadonlyArray<readonly [PetFrameName, number]>;
 	/** Frames cycled every `stepMs` for `ms` after the intro (a held or looping finish). */
-	tail?: { frames: readonly GajaePixelFrameName[]; stepMs: number; ms: number };
+	tail?: { frames: readonly PetFrameName[]; stepMs: number; ms: number };
 }
 
 /** Everything that defines a pet skin: identity, UI copy, colors and behavior. */
@@ -231,8 +267,16 @@ export interface PetSkin {
 	/** One-line selector/settings description. */
 	description: string;
 	palette: Palette;
+	frames: Readonly<Record<string, string[]>>;
+	baseFrame: PetFrameName;
+	idle: ReadonlyArray<readonly [PetFrameName, number]>;
+	workEnter?: ReadonlyArray<readonly [PetFrameName, number]>;
+	work: ReadonlyArray<readonly [PetFrameName, number]>;
+	workExit?: ReadonlyArray<readonly [PetFrameName, number]>;
 	/** Idle burst animation played between quiet idle loops. */
 	burst: PetBurst;
+	/** Optional variants that interrupt and then resume the work loop. */
+	workBursts?: readonly PetBurst[];
 }
 
 /** Skin registry — the single source for palettes, behavior and selector/command copy. */
@@ -242,6 +286,10 @@ export const PET_SKINS: Record<PetSkinId, PetSkin> = {
 		label: "RedGajae",
 		description: "The Red Crab, who likes to work-out.",
 		palette: RED_PALETTE,
+		frames: PIXEL_GRIDS,
+		baseFrame: "base",
+		idle: GAJAE_IDLE_STEPS,
+		work: PARA_PARA_STEPS,
 		burst: {
 			intro: PARA_PARA_STEPS,
 			tail: { frames: ["flex", "base"], stepMs: 200, ms: 1000 },
@@ -252,10 +300,30 @@ export const PET_SKINS: Record<PetSkinId, PetSkin> = {
 		label: "BlueGajae",
 		description: "The Blue Crab, who wants to rest.",
 		palette: BLUE_PALETTE,
+		frames: PIXEL_GRIDS,
+		baseFrame: "base",
+		idle: GAJAE_IDLE_STEPS,
+		work: PARA_PARA_STEPS,
 		burst: {
 			intro: PARA_PARA_STEPS,
 			tail: { frames: ["cry1", "cry2", "cry3"], stepMs: 110, ms: 990 },
 		},
+	},
+	ouroboros: {
+		id: "ouroboros",
+		label: "Ouroboros",
+		description: "The little snake who keeps going.",
+		palette: OUROBOROS_PALETTE,
+		frames: OUROBOROS_PIXEL_GRIDS,
+		baseFrame: "idle",
+		idle: OUROBOROS_IDLE_STEPS,
+		workEnter: OUROBOROS_WORK_ENTER_STEPS,
+		work: OUROBOROS_WORK_STEPS,
+		workExit: OUROBOROS_WORK_EXIT_STEPS,
+		burst: {
+			intro: OUROBOROS_HEART_STEPS,
+		},
+		workBursts: [{ intro: OUROBOROS_WORK_HEART_STEPS }, { intro: OUROBOROS_WORK_CRY_STEPS }],
 	},
 };
 
@@ -266,7 +334,7 @@ export function petBurstDurationMs(burst: PetBurst): number {
 }
 
 /** The frame to show `elapsed` ms into a burst (`now` cycles the looping tail). */
-export function petBurstFrame(burst: PetBurst, elapsed: number, now: number): GajaePixelFrameName {
+export function petBurstFrame(burst: PetBurst, elapsed: number, now: number): PetFrameName {
 	let t = elapsed;
 	for (const [frame, ms] of burst.intro) {
 		if (t < ms) return frame;
@@ -279,8 +347,10 @@ export function petBurstFrame(burst: PetBurst, elapsed: number, now: number): Ga
 
 /** Test-only access to logical art; production rendering still uses encoded frames. */
 export const __gajaePetTestHooks = {
-	getPixelGrid(name: GajaePixelFrameName): string[] {
-		return [...PIXEL_GRIDS[name]];
+	getPixelGrid(name: PetFrameName, skin: PetSkinId = "red"): string[] {
+		const grid = PET_SKINS[skin].frames[name];
+		if (!grid) throw new Error(`Unknown ${skin} pet frame: ${name}`);
+		return [...grid];
 	},
 };
 
@@ -349,6 +419,128 @@ export function encodeGridSixel(
 	return `${out}\x1b\\`;
 }
 
+const MAX_PET_PNG_DIMENSION = 16_384;
+const MAX_PET_PNG_RAW_BYTES = 64 * 1024 * 1024;
+const MAX_PET_FRAME_DIMENSION = 4_096;
+const MAX_PET_FRAME_RGBA_BYTES = 16 * 1024 * 1024;
+
+function pngChunk(type: string, data: Uint8Array): Uint8Array {
+	const typeBytes = Buffer.from(type, "ascii");
+	const payload = Buffer.concat([typeBytes, Buffer.from(data)]);
+	let crc = 0xffffffff;
+	for (const byte of payload) {
+		crc ^= byte;
+		for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+	}
+	crc = (crc ^ 0xffffffff) >>> 0;
+	const out = Buffer.allocUnsafe(12 + data.length);
+	out.writeUInt32BE(data.length, 0);
+	Buffer.from(payload).copy(out, 4);
+	out.writeUInt32BE(crc, 8 + data.length);
+	return out;
+}
+
+function validatePngGrid(
+	grid: string[],
+	scale: number,
+	topPaddingPx: number,
+	bottomPaddingPx: number,
+): {
+	gridWidth: number;
+	gridHeight: number;
+	width: number;
+	spriteHeight: number;
+	height: number;
+} {
+	const gridHeight = grid.length;
+	const gridWidth = grid[0]?.length ?? 0;
+	if (gridHeight === 0 || gridWidth === 0 || grid.some(row => row.length !== gridWidth)) {
+		throw new Error("iTerm2 pet grid must be non-empty and rectangular");
+	}
+	if (!Number.isFinite(scale) || scale <= 0) throw new Error("iTerm2 pet scale must be finite and positive");
+	for (const [name, value] of [
+		["top padding", topPaddingPx],
+		["bottom padding", bottomPaddingPx],
+	] as const) {
+		if (!Number.isSafeInteger(value) || value < 0)
+			throw new Error(`iTerm2 pet ${name} must be a non-negative integer`);
+	}
+	const width = Math.round(gridWidth * scale);
+	const spriteHeight = Math.round(gridHeight * scale);
+	const height = spriteHeight + topPaddingPx + bottomPaddingPx;
+	if (
+		!Number.isSafeInteger(width) ||
+		!Number.isSafeInteger(spriteHeight) ||
+		!Number.isSafeInteger(height) ||
+		width <= 0 ||
+		spriteHeight <= 0 ||
+		height <= 0 ||
+		width > MAX_PET_PNG_DIMENSION ||
+		height > MAX_PET_PNG_DIMENSION
+	) {
+		throw new Error("iTerm2 pet PNG dimensions are out of bounds");
+	}
+	const stride = width * 4 + 1;
+	const rawBytes = stride * height;
+	if (!Number.isSafeInteger(rawBytes) || rawBytes > MAX_PET_PNG_RAW_BYTES) {
+		throw new Error("iTerm2 pet PNG allocation is out of bounds");
+	}
+	return { gridWidth, gridHeight, width, spriteHeight, height };
+}
+
+/** Encode a grid as an iTerm2 inline PNG. */
+export function encodeGridIterm2(
+	grid: string[],
+	scale: number,
+	topPaddingPx = 0,
+	bottomPaddingPx = 0,
+	palette: Palette = RED_PALETTE,
+): string {
+	const { gridWidth, gridHeight, width, spriteHeight, height } = validatePngGrid(
+		grid,
+		scale,
+		topPaddingPx,
+		bottomPaddingPx,
+	);
+	const raw = Buffer.alloc((width * 4 + 1) * height);
+	for (let y = 0; y < height; y++) {
+		for (let x = 0; x < width; x++) {
+			const sourceY = y - topPaddingPx;
+			const rgb =
+				sourceY < 0 || sourceY >= spriteHeight
+					? null
+					: palette[
+							grid[Math.min(gridHeight - 1, Math.floor(sourceY / scale))][
+								Math.min(gridWidth - 1, Math.floor(x / scale))
+							]
+						];
+			const offset = y * (width * 4 + 1) + 1 + x * 4;
+			if (!rgb) continue;
+			raw[offset] = rgb[0];
+			raw[offset + 1] = rgb[1];
+			raw[offset + 2] = rgb[2];
+			raw[offset + 3] = 255;
+		}
+	}
+	const compressed = zlib.deflateSync(raw);
+	const header = Buffer.alloc(13);
+	header.writeUInt32BE(width, 0);
+	header.writeUInt32BE(height, 4);
+	header[8] = 8;
+	header[9] = 6;
+	const png = Buffer.concat([
+		Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+		pngChunk("IHDR", header),
+		pngChunk("IDAT", compressed),
+		pngChunk("IEND", new Uint8Array()),
+	]);
+	// Use explicit pixel dimensions. Cell dimensions are only a layout hint for
+	// the surrounding TUI; asking iTerm2 to fit a small PNG into a cell box makes
+	// it stretch or shrink differently from Kitty/Ghostty.
+	const params = `width=${width}px;height=${height}px;preserveAspectRatio=0;inline=1`;
+	return `\x1b]1337;File=${params}:${png.toString("base64")}\x1b\\`;
+}
+
 /** Encode a bottom-aligned grid as kitty raw RGBA at `scale`. */
 export function encodeGridKitty(
 	grid: string[],
@@ -407,9 +599,9 @@ export function encodeGridKitty(
 
 export interface GajaePixelFrames {
 	/** escape payload per logical frame (drawn at the current cursor cell) */
-	frames: Record<GajaePixelFrameName, string>;
+	frames: Record<string, string>;
 	/** protocol the frames were encoded for */
-	protocol: "sixel" | "kitty";
+	protocol: "sixel" | "kitty" | "iterm2";
 	widthPx: number;
 	heightPx: number;
 	columns: number;
@@ -420,11 +612,11 @@ export interface GajaePixelFrames {
 
 /**
  * Build overlay pixel frames exactly `targetRows` terminal rows tall when the
- * terminal cells permit it. Nearest-neighbor sampling preserves the 16x16 art
- * while allowing fractional scale factors such as 36px / 16px.
+ * terminal cells permit it. Each skin owns its source resolution so future
+ * additions can opt into denser art without changing the terminal footprint.
  */
 export function buildGajaePixelFrames(options: {
-	protocol: "sixel" | "kitty";
+	protocol: "sixel" | "kitty" | "iterm2";
 	cellWidthPx: number;
 	cellHeightPx: number;
 	targetRows?: number;
@@ -433,46 +625,95 @@ export function buildGajaePixelFrames(options: {
 	/** Native sub-cell `Y=` pixel offset that drops the kitty sprite within its first cell. */
 	kittyCellYOffsetPx?: number;
 	kittyImageId?: number;
+	/** Transparent iTerm2-only top padding for half-cell vertical alignment. */
+	iterm2TopPaddingPx?: number;
+	/** Transparent iTerm2-only bottom padding inside the two-row canvas. */
+	iterm2BottomPaddingPx?: number;
 	/** Color skin for the sprite palette (default "red"). */
 	skin?: PetSkinId;
 }): GajaePixelFrames {
 	const targetRows = options.targetRows ?? 2;
-	const gridSize = 16;
-	const scale = Math.max(1, (targetRows * options.cellHeightPx) / gridSize);
-	const widthPx = Math.round(gridSize * scale);
-	const visibleHeightPx = Math.round(gridSize * scale);
+	if (!Number.isFinite(options.cellWidthPx) || options.cellWidthPx <= 0) {
+		throw new Error("Pet cell width must be finite and positive");
+	}
+	if (!Number.isFinite(options.cellHeightPx) || options.cellHeightPx <= 0) {
+		throw new Error("Pet cell height must be finite and positive");
+	}
+	if (!Number.isFinite(targetRows) || targetRows <= 0) throw new Error("Pet target rows must be finite and positive");
+	const skin = PET_SKINS[options.skin ?? "red"];
+	const grids = Object.entries(skin.frames);
+	const firstGrid = grids[0]?.[1];
+	if (!firstGrid?.[0]) throw new Error(`Pet skin ${skin.id} has no pixel frames`);
+	const gridHeight = firstGrid.length;
+	const gridWidth = firstGrid[0].length;
+	for (const [name, grid] of grids) {
+		if (grid.length !== gridHeight || grid.some(row => row.length !== gridWidth)) {
+			throw new Error(`Pet frame ${skin.id}/${name} does not match ${gridWidth}x${gridHeight}`);
+		}
+	}
+	const scale = Math.max(1, (targetRows * options.cellHeightPx) / gridHeight);
+	const widthPx = Math.round(gridWidth * scale);
+	const visibleHeightPx = Math.round(gridHeight * scale);
 	const columns = Math.ceil(widthPx / options.cellWidthPx);
 	const rows = Math.ceil(visibleHeightPx / options.cellHeightPx);
 	const allocatedHeightPx = rows * options.cellHeightPx;
 	const topPaddingPx =
 		allocatedHeightPx - visibleHeightPx + (options.protocol === "sixel" ? (options.sixelTopPaddingPx ?? 0) : 0);
 	const heightPx = visibleHeightPx + topPaddingPx;
-	const rasterRows = Math.ceil(heightPx / options.cellHeightPx);
 	// Center the square sprite in its (cols * cellWidth) block, which the ceil()
 	// column rounding can make wider than the sprite itself.
 	const horizontalPaddingPx = Math.max(0, columns * options.cellWidthPx - widthPx);
 	const leftPaddingPx = Math.floor(horizontalPaddingPx / 2);
 	const rightPaddingPx = horizontalPaddingPx - leftPaddingPx;
+	const canvasWidthPx = widthPx + leftPaddingPx + rightPaddingPx;
+	if (
+		widthPx > MAX_PET_FRAME_DIMENSION ||
+		heightPx > MAX_PET_FRAME_DIMENSION ||
+		canvasWidthPx > MAX_PET_FRAME_DIMENSION ||
+		!Number.isSafeInteger(canvasWidthPx * heightPx * 4) ||
+		canvasWidthPx * heightPx * 4 > MAX_PET_FRAME_RGBA_BYTES
+	) {
+		throw new Error("Pet frame dimensions are out of bounds");
+	}
 	const imageId = options.kittyImageId ?? 0xc0de;
-	const palette = PET_SKINS[options.skin ?? "red"].palette;
-	const frames = {} as Record<GajaePixelFrameName, string>;
-	for (const name of Object.keys(PIXEL_GRIDS) as GajaePixelFrameName[]) {
+	const frames: Record<string, string> = {};
+	for (const [name, grid] of grids) {
 		frames[name] =
 			options.protocol === "sixel"
-				? encodeGridSixel(PIXEL_GRIDS[name], scale, topPaddingPx, palette)
-				: encodeGridKitty(
-						PIXEL_GRIDS[name],
-						scale,
-						imageId,
-						columns,
-						rows,
-						topPaddingPx,
-						options.kittyCellYOffsetPx ?? 0,
-						leftPaddingPx,
-						rightPaddingPx,
-						palette,
-					);
+				? encodeGridSixel(grid, scale, topPaddingPx, skin.palette)
+				: options.protocol === "iterm2"
+					? encodeGridIterm2(
+							grid,
+							scale,
+							options.iterm2TopPaddingPx ?? 0,
+							options.iterm2BottomPaddingPx ?? 0,
+							skin.palette,
+						)
+					: encodeGridKitty(
+							grid,
+							scale,
+							imageId,
+							columns,
+							rows,
+							topPaddingPx,
+							options.kittyCellYOffsetPx ?? 0,
+							leftPaddingPx,
+							rightPaddingPx,
+							skin.palette,
+						);
 	}
 
-	return { frames, protocol: options.protocol, widthPx, heightPx, columns, rows, rasterRows };
+	const protocolHeightPx =
+		options.protocol === "iterm2"
+			? visibleHeightPx + (options.iterm2TopPaddingPx ?? 0) + (options.iterm2BottomPaddingPx ?? 0)
+			: heightPx;
+	return {
+		frames,
+		protocol: options.protocol,
+		widthPx,
+		heightPx: protocolHeightPx,
+		columns,
+		rows,
+		rasterRows: Math.ceil(protocolHeightPx / options.cellHeightPx),
+	};
 }

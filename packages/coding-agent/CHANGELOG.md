@@ -2,9 +2,22 @@
 
 ## [Unreleased]
 
+### Added
+- Added Grok 4.6 to the bundled Grok CLI model catalog with bounded reasoning-effort parsing.
+- Added built-in `grok-46-{eco,medium,pro}` role profiles using the existing xAI OAuth/subscription provider, with supported reasoning-effort selection for Grok 4.5/4.6.
+- Added three provider-agnostic Muse Spark 1.2 presets: Muse Spark across all roles, plus DeepSeek and Luna executor variants.
+
+### Fixed
+- Managed sessions recover from `content_too_large` by rewriting live in-memory entries, and proactively compact before the managed transcript limit (#4411).
+- Managed output publication no longer freezes the resident event loop when a no-replace rename stalls in the kernel; async publication uses blocking-pool native boundaries and per-session stores reap scrubbed protocol remnants (#4396).
+- Print mode now requests a governed process exit after successful session teardown, so completed one-shot runs cannot be pinned by residual runtime handles; both stdout and stderr are drained first and the recorded exit code is preserved.
+- `todo_write` no longer rejects a positional task handle without saying how to address a task. Callers reach for `id`/`index` because the tool result renders todos as a list, and raw validation rejects the unknown key before `execute` runs; positional-handle keys now explain that tasks are addressed by exact `task` content or by `phase`.
+- Escaped-non-ASCII tool-call turns in managed fallback are retried on the same model without charging the fallback chain or advancing it — the wire defect is a sampling accident, not provider evidence — bounded to two consecutive retries before the run terminates (#4515).
+
 ## [0.13.2] - 2026-08-13
 
 ### Added
+- Added the bundled Ouroboros theme and pet, including transactional theme selection and RedGajae fallback (#4468).
 
 - Added a portable Stream Deck integration for cmux sessions, including a plugin manifest, reusable profile pages, action icons, installation scripts, and a guided setup document (#4308 by @Yeachan-Heo).
 - `/theme <name>` now switches the theme immediately without opening the selector. The name is validated against built-in and custom themes, persisted to the detected `theme.dark`/`theme.light` slot, and applied to the running session in one step (#4429 by @Yeachan-Heo).
@@ -102,6 +115,8 @@
 
 ### Added
 - Added a deterministic quick-lane task classifier (`classifyQuickLane`) exposed through a read-only `gjc quick-lane classify` command. It is an auditable classification surface that performs no routing and is NOT wired into runtime routing: it only prints whether a task request carries quick-lane eligibility signals (explicit file paths, issue/PR numbers, named symbols, explicit tests, numbered steps, acceptance criteria, error references, code blocks, or an explicit `force:`/`!` override) or deep-lane exclusions (vague, ambiguous, exploratory, risk-sensitive, or multi-file/cross-contract scope), and it never alters deep-path defaults. The classifier is deterministic and fail-closed: any exclusion forces the deep lane even when a concrete anchor is present. The #3984 routing decision remains open.
+
+- Gajae Pet now renders in iTerm2 using inline PNG frames, with the same reserved composer-side layout and lifecycle cleanup used by Kitty and Sixel.
 
 - `session.list` now supports bounded pages with opaque continuation cursors and stable snapshot sequences. Internal ACP, coordinator, CLI, and broker-restart consumers drain every page so existing session discovery remains complete.
 - Bounded-memory cold-session disk offloading is rollout-ready behind the `sessionMemory` settings namespace. `sessionMemory.mode` (default `"shadow"`) selects `off`/`shadow`/`enabled`: shadow measures without changing observable session behavior, and canary/default-on remain release-channel decisions rather than user-facing enum values. Fixed implementation budgets preserve the ≤64 MiB steady-state guarantee; transcript v5 stays authoritative and derived `.spill.*` sidecars remain disposable. Context materialization uses the typed `SessionContextTooLargeError` preflight, while `sessionMemory.contextOverflowRecovery` independently controls the async compact-once recovery path.

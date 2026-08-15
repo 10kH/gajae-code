@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Governed process exits now drain both stdout and stderr before terminating, preserving timing output and diagnostics when either stream is backpressured.
+
 ## [0.13.2] - 2026-08-13
 
 ## [0.13.1] - 2026-08-11
