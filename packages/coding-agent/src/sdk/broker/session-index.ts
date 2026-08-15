@@ -371,9 +371,12 @@ function projectIdentity(
 	// held (#4544): callers that already probed pass the observation in, and
 	// unlocked callers probe directly. On Windows a probe can spawn powershell.exe
 	// — an unbounded OS operation a machine-global critical section must not await.
+	// Dead pids are additionally never probed: the probe exists to fence pid reuse
+	// for a LIVE process, and for a dead pid it can only return undefined while
+	// costing a powershell.exe spawn per stale registration on Windows.
 	const probeKey = `${latest.sessionId}\u0000${latest.endpointGeneration}\u0000${latest.pid}`;
 	const currentIncarnation =
-		recordedIncarnation === undefined
+		recordedIncarnation === undefined || !pidAlive
 			? undefined
 			: probedIncarnations !== undefined
 				? probedIncarnations.get(probeKey)
