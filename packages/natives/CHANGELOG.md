@@ -15,6 +15,11 @@
 - Bounded each SDK connection's queued host-directed frames to the positioned-event replay-ring capacity. Slow or stalled subscribers now reject excess directed sends for replay recovery instead of retaining an unbounded in-memory writer backlog; accepted frames remain serialized through the same connection writer.
 - `exactReplacePath` now retries transient Windows destination-sharing violations (#4330): when another handle denies delete sharing on the destination, the pre-mutation destination open is retried a bounded 30 × 100 ms before failing, and an exhausted retry reports the specific `sharing_violation` category with the underlying hex NTSTATUS (`windowsErrorCode`, e.g. `0xC0000043`) instead of a bare `io_error`. Only the destination open is retried — never after any namespace mutation — so a retry can never publish twice, and permission, path-not-found, disk-full, and identity failures are never retried.
 
+## [0.13.3] - 2026-08-15
+
+### Fixed
+- `break_long_word` no longer spins forever on a lone ESC that is not a valid ANSI sequence inside an over-width word (e.g. binary tool output persisted in a session); a lone ESC is consumed as a zero-width scalar like `truncate`/`slice`/`visible_width` already did, restoring interactive resume of affected sessions (#4437).
+
 ## [0.13.2] - 2026-08-13
 
 ### Added

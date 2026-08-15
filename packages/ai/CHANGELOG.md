@@ -43,6 +43,18 @@
 - A long-lived process now recovers when the OAuth row it holds in memory is soft-disabled or replaced in the shared store by a peer (`invalid_grant` disable, credential removal, or a re-login that inserts a new row). The refresh lease answers `missing` for a row that is no longer active, which surfaced as `OAuth refresh credential disappeared` — an error the failure classifier reads as transient, so the vanished row was temp-blocked and retried for the life of the process while a valid re-login row sat unused in the store. Resumed sessions therefore failed every request with the misleading `No credentials found for <provider>` until the CLI was restarted, even though `gjc` had just been logged back in (observed as a per-request refresh-failure flood against `anthropic`). `#tryOAuthCredential` now detects that the attempted row is gone from the store, reloads the snapshot, and re-resolves within the existing reload budget, alongside the peer-rotation recovery it already performed.
 - OpenAI Responses streams now preserve canonical terminal function-call arguments when compatible relays such as llama.cpp emit an empty placeholder in `response.output_item.added`. Tool-call correlation also accepts llama.cpp’s `call_id`-only event shape, while conflicting streamed/terminal arguments, malformed terminal JSON, and terminal payloads that decode to something other than a JSON object fail closed instead of reaching execution. Argument source precedence is terminal item, then streamed deltas, then the `output_item.added` snapshot, so a relay that only ever populates the added snapshot keeps its real payload.
 
+## [0.13.3] - 2026-08-15
+
+### Added
+
+- Added first-class direct xAI `grok-4.6` catalog support over the existing xAI OAuth/subscription transport. Grok 4.5 exposes `low` through `high` reasoning effort and Grok 4.6 exposes `low` through `xhigh`.
+- Added a native TypeScript Kiro (Amazon Q Developer / CodeWhisperer) provider: AWS SSO OIDC device-code login, bearer-token transport to the CodeWhisperer streaming endpoint over `application/vnd.amazon.eventstream`, and a `kiro` model-manager descriptor for Claude 3.7 Sonnet (#4304).
+- Added the authoritative OpenRouter `meta/muse-spark-1.2` catalog fallback with a 1,048,576-token context window and `minimal` through `xhigh` reasoning effort, so stale or credential-limited catalog generation still closes the Muse Spark preset alias deterministically.
+
+### Fixed
+- Validate Synthetic API key via models endpoint, not retired Kimi probe (#4385).
+- Tool-call arguments that spell printable non-ASCII text as `\uXXXX` escapes are now flagged on the raw wire (`escapedNonAsciiArguments`) by the Anthropic, OpenAI Responses, and OpenAI Completions streams — after JSON decode the defect is unobservable, and a mistyped hex nibble silently becomes a different character (#4515).
+
 ## [0.13.2] - 2026-08-13
 
 ### Fixed

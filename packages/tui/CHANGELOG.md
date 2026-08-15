@@ -5,10 +5,6 @@
 ### Fixed
 - iTerm2 Gajae Pet frames now size their inline PNG to the geometry-derived reserved cell block instead of a fixed pixel box, preserving the authored sprite aspect ratio across terminal font, Retina, and cell-aspect geometries while leaving Kitty and Sixel encoding unchanged.
 
-- Non-finite overlay geometry can no longer turn frame padding into an infinite allocating loop on the main thread; margins, positions, offsets, and minimum widths now fall back to bounded terminal-relative values.
-
-- Kitty inline images are no longer deleted when live output moves their anchor above the viewport, so terminal-native scrollback keeps previously rendered images visible.
-
 - Layout-only animation and selector frames can now reuse an unchanged revisioned transcript subtree instead of rebuilding every off-screen transcript component, anchor row, and Kitty placement on each tick. Ordinary render requests remain conservative, and transcript revision, width, identity, and global invalidation changes still force a full subtree render.
 
 - A fast double-Esc (or triple-Esc) whose ESC bytes coalesce into one stdin chunk — which tmux always produces within its escape-time window, and SSH batching produces routinely — is now emitted as individual Escape key presses instead of a single `"\x1b\x1b"` sequence that parsed as the unbound `alt+escape` and silently swallowed both presses. This restores the double-Esc draft-clear and double-Esc selector gestures under tmux/SSH. Option-as-Meta sequences with a real continuation (e.g. Option+Up as `ESC ESC [ A`) remain atomic, and an ESC-cancelled incomplete sequence is still emitted whole.
@@ -17,6 +13,15 @@
 - A long run of Escape bytes arriving as many small reads no longer rescans the accumulated buffer on every read; only the two-byte ambiguous tail stays buffered, so 50,000 byte-by-byte Escape reads cost 50ms instead of 2.4s.
 - A long run of Escape bytes followed by another key now decodes in linear time instead of rescanning the remaining input on every step, which blocked the event loop for over a second on a 50,000-byte run.
 - Apple Terminal.app now retains its default keyboard mode when it does not support the Kitty keyboard protocol, avoiding the modifyOtherKeys fallback that breaks Korean/Hangul IME composition.
+
+## [0.13.3] - 2026-08-15
+
+### Added
+- Added the Ouroboros pet component with frame data, selector integration, and animation lifecycle shared with the existing Gajae Pet (#4468).
+
+### Fixed
+- Non-finite overlay geometry can no longer turn frame padding into an infinite allocating loop on the main thread; margins, positions, offsets, and minimum widths now fall back to bounded terminal-relative values (#4481).
+- Kitty inline images are no longer deleted when live output moves their anchor above the viewport, so terminal-native scrollback keeps previously rendered images visible (#4424).
 
 ## [0.13.2] - 2026-08-13
 
