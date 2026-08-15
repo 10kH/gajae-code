@@ -1886,6 +1886,7 @@ type SessionAdmissionEntry = {
 	ready: PromiseWithResolvers<void>;
 	settled: PromiseWithResolvers<void>;
 	released: boolean;
+	selectionFenceGeneration: number;
 	continuationCapability?: symbol;
 };
 
@@ -1987,7 +1988,17 @@ export class AgentSession {
 	#sessionAdmissionClosing = false;
 	#sessionAdmissionClosed = false;
 	#sessionAdmissionContext = new AsyncLocalStorage<SessionAdmissionEntry>();
+	#selectionFenceGenerationContext = new AsyncLocalStorage<number>();
 	#selectionFenceTail: Promise<void> = Promise.resolve();
+	#pendingSelectionFences = 0;
+	#selectionFenceDeferredContinuations = new Map<number, number>();
+	#scopedSettlementWaiters = new Set<() => void>();
+	#oldestPendingSelectionFenceGeneration = 0;
+	#followUpReservationEpoch = 0;
+	/** Epochs of follow-up reservations still between reservation and durable enqueue. */
+	#activeFollowUpReservationEpochs = new Set<number>();
+	#followUpReservationDrainWaiters = new Set<() => void>();
+	#selectionFenceGeneration = 0;
 	#defaultModelSelectionMutationRevision = 0;
 	#thinkingLevelMutationRevision = 0;
 	#thinkingVisibilityMutationRevision = 0;
@@ -2431,6 +2442,7 @@ export class AgentSession {
 	/** Test-only abort outcome override for cancel-and-submit rollback coverage. */
 	#cancelAndSubmitAbortOutcomeProviderForTests: (() => Promise<AbortOutcome>) | undefined = undefined;
 	#postPromptTasks = new Set<Promise<void>>();
+	#postPromptTaskSelectionFenceGenerations = new Map<Promise<void>, number>();
 	#postPromptTasksPromise: Promise<void> | undefined = undefined;
 	#postPromptTasksResolve: (() => void) | undefined = undefined;
 	#postPromptTasksAbortController = new AbortController();
@@ -2505,6 +2517,7 @@ export class AgentSession {
 	#terminalLineageSecret = crypto.randomUUID();
 	#promptGeneration = 0;
 	#promptPreflightAbortController = new AbortController();
+	#promptPreflightCancellationGeneration = 0;
 
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#temporaryProviderSessionScopes: TemporaryProviderSessionScopeRecord[] = [];
@@ -2568,6 +2581,12 @@ export class AgentSession {
 		return Object.assign(new AgentBusyError("Agent session admission is busy due to same-session reentrancy."), {
 			code: "busy",
 		});
+	}
+
+	#assertSessionAdmissionOpen(): void {
+		if (this.#sessionAdmissionClosing || this.#sessionAdmissionClosed || this.#isDisposed) {
+			throw this.#sessionAdmissionBusyError();
+		}
 	}
 
 	/**
@@ -2647,12 +2666,12 @@ export class AgentSession {
 		body: (lease: SessionAdmissionLease) => Promise<T>,
 		signal?: AbortSignal,
 		continuationAdmission?: ScheduledContinuationAdmission,
-		options?: { allowDuringClosing?: boolean },
+		options?: {
+			allowDuringClosing?: boolean;
+			bypassSelectionFenceGeneration?: number;
+			allowPromptContinuationReentry?: boolean;
+		},
 	): Promise<T> {
-		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
-		if (kind === "prompt" && continuationAdmission === undefined) {
-			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
-		}
 		const owner = this.#sessionAdmissionContext.getStore();
 		if (owner && !owner.released) {
 			if (
@@ -2660,7 +2679,22 @@ export class AgentSession {
 				continuationAdmission.capability === owner.continuationCapability
 			)
 				return await body({ release: () => {} });
+			if (options?.allowPromptContinuationReentry === true && owner.kind === "prompt") {
+				return await body({ release: () => {} });
+			}
 			throw this.#sessionAdmissionBusyError();
+		}
+		if (kind === "prompt") await awaitPromptInvocationPreflight(this.#awaitStartupTurnBarrier(), signal);
+		const bypassesSelectionFence =
+			options?.bypassSelectionFenceGeneration !== undefined &&
+			options.bypassSelectionFenceGeneration < this.#selectionFenceGeneration;
+		if (
+			kind === "prompt" &&
+			continuationAdmission === undefined &&
+			!bypassesSelectionFence &&
+			this.#pendingSelectionFences > 0
+		) {
+			await awaitPromptInvocationPreflight(this.#selectionFenceTail, signal);
 		}
 		if (
 			this.#sessionAdmissionClosed ||
@@ -2683,6 +2717,7 @@ export class AgentSession {
 			ready: Promise.withResolvers<void>(),
 			settled: Promise.withResolvers<void>(),
 			released: false,
+			selectionFenceGeneration: this.#selectionFenceGeneration,
 			...(kind === "prompt" ? { continuationCapability: Symbol("scheduled-continuation") } : {}),
 		};
 		const releaseEntry = () => {
@@ -2739,6 +2774,7 @@ export class AgentSession {
 		const active = this.#activeSessionAdmission;
 		if (active?.kind === "prompt") {
 			this.#promptGeneration++;
+			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 		}
 		if (active) await active.settled.promise;
@@ -2837,6 +2873,17 @@ export class AgentSession {
 		return hold;
 	}
 
+	#restoreAndReserveDeferredAgentEndForContinuation(pending: AgentSessionEvent | undefined): symbol | undefined {
+		if (!pending) return undefined;
+		if (this.#pendingAgentEndEmit && this.#pendingAgentEndEmit !== pending) {
+			throw new Error("Cannot restore a deferred agent_end over a different pending terminal event");
+		}
+		this.#pendingAgentEndEmit = pending;
+		const hold = Symbol("deferred-agent-end-continuation");
+		this.#pendingAgentEndContinuationHolds.set(hold, pending);
+		return hold;
+	}
+
 	#claimDeferredAgentEndForContinuation(hold: symbol | undefined): AgentSessionEvent | undefined {
 		if (!hold) return undefined;
 		const pending = this.#pendingAgentEndContinuationHolds.get(hold);
@@ -2894,33 +2941,159 @@ export class AgentSession {
 		}
 		lease.closeDiscovery();
 	}
+	/**
+	 * Keep a continuation parked behind a pending selection fence observable to
+	 * external idle waits. The deferral window is bounded: it ends when the
+	 * deferred invocation synchronously re-reserves its settlement markers
+	 * inside the scheduler (`#endSelectionFenceDeferralTracking`); the
+	 * promise-settled release is only the safety net for a deferral whose
+	 * re-entry never ran (disposed/aborted session).
+	 *
+	 * The counter is keyed by the fence generation it parks behind. The
+	 * selection that owns that fence must not wait on its own parked
+	 * continuations: its mid-selection `waitForIdle` is exactly what lets an
+	 * inherited continuation settle before the durable mutation, and waiting on
+	 * a continuation parked behind the fence the selection itself holds would
+	 * reintroduce the selection self-deadlock (#4519).
+	 */
+	#trackSelectionFenceDeferredContinuation(fenceGeneration: number, deferred: Promise<void>): void {
+		this.#selectionFenceDeferredContinuations.set(
+			fenceGeneration,
+			(this.#selectionFenceDeferredContinuations.get(fenceGeneration) ?? 0) + 1,
+		);
+		void deferred
+			.catch(() => {})
+			.finally(() => {
+				this.#endSelectionFenceDeferralTracking(fenceGeneration);
+			});
+	}
 
-	#isSessionSettlementPending(): boolean {
+	/**
+	 * End the deferral-limbo tracking window: called synchronously by the
+	 * deferred scheduling path once it has re-reserved its own settlement
+	 * markers (the predecessor hold and post-prompt task), so the counter no
+	 * longer covers the continuation's own execution.
+	 */
+	#endSelectionFenceDeferralTracking(fenceGeneration: number): void {
+		const pending = this.#selectionFenceDeferredContinuations.get(fenceGeneration) ?? 0;
+		if (pending <= 0) return;
+		if (pending === 1) this.#selectionFenceDeferredContinuations.delete(fenceGeneration);
+		else this.#selectionFenceDeferredContinuations.set(fenceGeneration, pending - 1);
+		this.#resolveSessionSettlement();
+	}
+
+	/**
+	 * Continuations parked behind selection fences that idle waits must observe.
+	 *
+	 * Only deferrals whose fence has already settled are counted: their
+	 * deferred scheduling tail is (re-)entering within microtask time and the
+	 * session is not idle until it does. A deferral behind a still-pending
+	 * fence is invisible by construction — the fence owner's own completion may
+	 * causally depend on the very settlement the waiter would block on, so
+	 * counting it would reintroduce the selection self-deadlock (#4519). It
+	 * becomes observable the moment its fence settles, and either the
+	 * synchronous re-entry (`#endSelectionFenceDeferralTracking`) or the
+	 * promise-settled safety net clears it.
+	 */
+	#pendingSelectionFenceDeferredContinuations(ignoreGenerationFrom?: number): number {
+		let total = 0;
+		for (const [generation, count] of this.#selectionFenceDeferredContinuations) {
+			if (ignoreGenerationFrom !== undefined && generation >= ignoreGenerationFrom) continue;
+			total += count;
+		}
+		return total;
+	}
+
+	/**
+	 * Deferral generations that causally-upstream settlement work must ignore:
+	 * a deferral parked behind a still-pending selection fence cannot settle
+	 * before that fence resolves, and the fence owner's completion may itself
+	 * depend on this very settlement. Returns the oldest still-pending fence
+	 * generation, or undefined when no fence is pending.
+	 */
+	#turnSettlementDeferralFloor(): number | undefined {
+		return this.#pendingSelectionFences > 0 ? this.#oldestPendingSelectionFenceGeneration : undefined;
+	}
+
+	/**
+	 * Wait until every follow-up reservation minted before `ownEpoch` has been
+	 * released, so a later dispatch can never durably enqueue ahead of an
+	 * earlier reserved follow-up. Resolves immediately when no earlier
+	 * reservation remains.
+	 */
+	async #waitForEarlierFollowUpReservations(
+		ownEpoch: number,
+		requesterSignal?: AbortSignal,
+		admissionSignal?: AbortSignal,
+	): Promise<void> {
+		while ([...this.#activeFollowUpReservationEpochs].some(epoch => epoch < ownEpoch)) {
+			if (requesterSignal?.aborted || admissionSignal?.aborted) throw promptPreflightCancelledError();
+			const drained = Promise.withResolvers<void>();
+			this.#followUpReservationDrainWaiters.add(drained.resolve);
+			await drained.promise;
+		}
+	}
+
+	#isSessionSettlementPending(ignoreSelectionFenceGeneration?: number): boolean {
 		return (
 			this.#promptInFlightCount > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#agentEndPublicationInFlight > 0 ||
 			this.#pendingAgentEndContinuationHolds.size > 0 ||
+			this.#pendingSelectionFenceDeferredContinuations(ignoreSelectionFenceGeneration) > 0 ||
 			this.#pendingAgentEndEmit !== undefined
 		);
 	}
 
 	#resolveSessionSettlement(): void {
-		if (this.#isSessionSettlementPending() || !this.#sessionSettlementResolve) return;
+		if (this.#isSessionSettlementPending() || !this.#sessionSettlementResolve) {
+			this.#wakeScopedSettlementWaiters();
+			return;
+		}
 		const resolve = this.#sessionSettlementResolve;
 		this.#sessionSettlementResolve = undefined;
 		this.#sessionSettlementPromise = undefined;
 		resolve();
+		this.#wakeScopedSettlementWaiters();
+	}
+	/** Re-evaluate every scoped settlement waiter (selection-internal drains). */
+	#wakeScopedSettlementWaiters(): void {
+		for (const check of [...this.#scopedSettlementWaiters]) check();
 	}
 
-	async #waitForSessionSettlement(): Promise<void> {
-		while (this.#isSessionSettlementPending()) {
-			if (!this.#sessionSettlementPromise) {
-				const { promise, resolve } = Promise.withResolvers<void>();
-				this.#sessionSettlementPromise = promise;
-				this.#sessionSettlementResolve = resolve;
+	/**
+	 * Wait for session settlement. `ignoreSelectionFenceGeneration` carries the
+	 * selection's own fence generation for its internal drain only (see
+	 * {@link waitForIdle}); external callers observe every unresolved
+	 * fence-deferred continuation.
+	 *
+	 * A scoped waiter registers a wake callback instead of sharing the strict
+	 * settlement promise: the strict promise may stay pending on a
+	 * fence-deferred continuation (correctly), and the selection that owns that
+	 * fence must not block behind it (#4519).
+	 */
+	async #waitForSessionSettlement(ignoreSelectionFenceGeneration?: number): Promise<void> {
+		while (this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)) {
+			if (ignoreSelectionFenceGeneration === undefined) {
+				if (!this.#sessionSettlementPromise) {
+					const { promise, resolve } = Promise.withResolvers<void>();
+					this.#sessionSettlementPromise = promise;
+					this.#sessionSettlementResolve = resolve;
+				}
+				await this.#sessionSettlementPromise;
+				continue;
 			}
-			await this.#sessionSettlementPromise;
+			const wake = Promise.withResolvers<void>();
+			const check = () => {
+				if (!this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)) wake.resolve();
+			};
+			this.#scopedSettlementWaiters.add(check);
+			check();
+			try {
+				await wake.promise;
+			} finally {
+				this.#scopedSettlementWaiters.delete(check);
+			}
 		}
 	}
 
@@ -2957,7 +3130,12 @@ export class AgentSession {
 		// A post-prompt continuation runs before its predecessor prompt returns. Its
 		// publication must settle, but session-wide settlement can still be owned by
 		// that predecessor; waiting here would make each prompt wait on the other.
-		if (!predecessorPromptStillInFlight) await this.#waitForSessionSettlement();
+		// Deferrals behind still-pending selection fences are excluded here: they
+		// cannot settle before their fence resolves, and the fence owner may be
+		// waiting on this very settlement (#4519).
+		if (!predecessorPromptStillInFlight) {
+			await this.#waitForSessionSettlement(this.#turnSettlementDeferralFloor());
+		}
 		if (flushError) throw flushError;
 	}
 
@@ -5446,8 +5624,14 @@ export class AgentSession {
 		this.#postPromptTasksPromise = undefined;
 	}
 
-	#trackPostPromptTask(task: Promise<void>, lease?: RunResourceProducerLease, leaseTask: Promise<void> = task): void {
+	#trackPostPromptTask(
+		task: Promise<void>,
+		selectionFenceGeneration: number,
+		lease?: RunResourceProducerLease,
+		leaseTask: Promise<void> = task,
+	): void {
 		this.#postPromptTasks.add(task);
+		this.#postPromptTaskSelectionFenceGenerations.set(task, selectionFenceGeneration);
 		this.#ensurePostPromptTasksPromise();
 		if (lease) {
 			lease.track("post_prompt", "agent-session", leaseTask);
@@ -5457,6 +5641,7 @@ export class AgentSession {
 			.catch(() => {})
 			.finally(() => {
 				this.#postPromptTasks.delete(task);
+				this.#postPromptTaskSelectionFenceGenerations.delete(task);
 				if (this.#postPromptTasks.size === 0) this.#resolvePostPromptTasks();
 			});
 	}
@@ -5469,8 +5654,14 @@ export class AgentSession {
 			onSkip?: () => void;
 			resourceRunId?: string;
 			leaseTask?: Promise<void>;
+			selectionFenceGeneration?: number;
 		},
 	): Promise<void> {
+		const selectionFenceGeneration =
+			options?.selectionFenceGeneration ??
+			this.#selectionFenceGenerationContext.getStore() ??
+			this.#sessionAdmissionContext.getStore()?.selectionFenceGeneration ??
+			this.#selectionFenceGeneration;
 		const delayMs = options?.delayMs ?? 0;
 		const resourceRunId = options?.resourceRunId;
 		const contextualLease = this.#runResourceLeaseContext.getStore();
@@ -5508,12 +5699,17 @@ export class AgentSession {
 				options.onSkip?.();
 				return;
 			}
-			await task(signal);
+			await this.#selectionFenceGenerationContext.run(selectionFenceGeneration, () => task(signal));
 		};
 		const scheduled = reservation?.ok
 			? this.#runResourceLeaseContext.run(reservation.lease, runScheduled)
 			: runScheduled();
-		this.#trackPostPromptTask(scheduled, reservation?.ok ? reservation.lease : undefined, options?.leaseTask);
+		this.#trackPostPromptTask(
+			scheduled,
+			selectionFenceGeneration,
+			reservation?.ok ? reservation.lease : undefined,
+			options?.leaseTask,
+		);
 		return scheduled;
 	}
 
@@ -5543,10 +5739,53 @@ export class AgentSession {
 		rescheduleOnBusy?: boolean;
 		/** Called when the scheduled continuation accepts its run (before agent_start). */
 		onRunAccepted?: (handle: AttemptRunHandle) => void;
+		/** Internal causal generation retained when a later continuation is deferred behind selection. */
+		selectionFenceGeneration?: number;
+		/** Internal predecessor publication hold retained across selection-fence deferral. */
+		predecessorAgentEndHold?: symbol;
+		/** Internal predecessor terminal event sequestered while waiting behind selection. */
+		deferredPredecessorAgentEnd?: AgentSessionEvent;
 	}): Promise<void> {
-		const predecessorAgentEndHold = options?.suppressPredecessorAgentEnd
-			? this.#reserveDeferredAgentEndForContinuation()
-			: undefined;
+		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const selectionFenceGeneration =
+			options?.selectionFenceGeneration ??
+			this.#selectionFenceGenerationContext.getStore() ??
+			this.#sessionAdmissionContext.getStore()?.selectionFenceGeneration ??
+			continuationAdmission?.entry.selectionFenceGeneration ??
+			this.#selectionFenceGeneration;
+		if (this.#pendingSelectionFences > 0 && selectionFenceGeneration === this.#selectionFenceGeneration) {
+			const deferredPredecessorAgentEnd =
+				options?.deferredPredecessorAgentEnd ??
+				(options?.suppressPredecessorAgentEnd
+					? this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation())
+					: undefined);
+			const precedingSelectionFence = this.#selectionFenceTail;
+			const deferredPromptGeneration = options?.generation ?? this.#promptGeneration;
+			const deferredScheduling = precedingSelectionFence.then(() => {
+				try {
+					this.#scheduleAgentContinue({
+						...options,
+						generation: deferredPromptGeneration,
+						selectionFenceGeneration,
+						deferredPredecessorAgentEnd,
+					});
+				} finally {
+					// The recursive call synchronously re-reserved its settlement
+					// markers (predecessor hold / post-prompt task); end the limbo
+					// window so the counter never spans the continuation run itself.
+					this.#endSelectionFenceDeferralTracking(selectionFenceGeneration);
+				}
+			});
+			this.#trackSelectionFenceDeferredContinuation(selectionFenceGeneration, deferredScheduling);
+			return Promise.resolve();
+		}
+		const predecessorAgentEndHold =
+			options?.predecessorAgentEndHold ??
+			(options?.deferredPredecessorAgentEnd
+				? this.#restoreAndReserveDeferredAgentEndForContinuation(options.deferredPredecessorAgentEnd)
+				: options?.suppressPredecessorAgentEnd
+					? this.#reserveDeferredAgentEndForContinuation()
+					: undefined);
 		let terminalized = false;
 		const skip = (
 			reason: "generation_changed" | "aborted_signal" | "queue_drained" | "handoff_in_progress" | "terminal_turn",
@@ -5566,7 +5805,6 @@ export class AgentSession {
 			options?.onError?.(error);
 		};
 		const scheduledGeneration = options?.generation;
-		const continuationAdmission = this.#captureScheduledContinuationAdmission();
 		let busyReschedules = 0;
 		const scheduleAttempt = (delayMs = options?.delayMs): Promise<void> => {
 			const leaseSettlement = Promise.withResolvers<void>();
@@ -5720,6 +5958,10 @@ export class AgentSession {
 							},
 							scheduledSignal,
 							continuationAdmission,
+							{
+								bypassSelectionFenceGeneration: selectionFenceGeneration,
+								allowPromptContinuationReentry: true,
+							},
 						);
 					} catch (error) {
 						if (scheduledSignal.aborted) skip("aborted_signal");
@@ -5734,6 +5976,7 @@ export class AgentSession {
 					},
 					resourceRunId: options?.resourceRunId,
 					leaseTask: leaseSettlement.promise,
+					selectionFenceGeneration,
 				},
 			);
 		};
@@ -5815,8 +6058,13 @@ export class AgentSession {
 		return false;
 	}
 
-	#scheduleAutoContinuePrompt(generation: number, requireUnfinishedWork = true, resourceRunId?: string): void {
-		const predecessorAgentEndHold = this.#reserveDeferredAgentEndForContinuation();
+	#scheduleAutoContinuePrompt(
+		generation: number,
+		requireUnfinishedWork = true,
+		resourceRunId?: string,
+		deferredSelectionFenceGeneration?: number,
+		deferredPredecessorAgentEnd?: AgentSessionEvent,
+	): void {
 		const scheduledGeneration = generation;
 		const continuationAuthorized = async (
 			signal: AbortSignal,
@@ -5851,6 +6099,36 @@ export class AgentSession {
 			return authorized;
 		};
 		const continuationAdmission = this.#captureScheduledContinuationAdmission();
+		const selectionFenceGeneration =
+			deferredSelectionFenceGeneration ??
+			this.#selectionFenceGenerationContext.getStore() ??
+			this.#sessionAdmissionContext.getStore()?.selectionFenceGeneration ??
+			continuationAdmission?.entry.selectionFenceGeneration ??
+			this.#selectionFenceGeneration;
+		if (this.#pendingSelectionFences > 0 && selectionFenceGeneration === this.#selectionFenceGeneration) {
+			const predecessorAgentEnd =
+				deferredPredecessorAgentEnd ??
+				this.#claimDeferredAgentEndForContinuation(this.#reserveDeferredAgentEndForContinuation());
+			const precedingSelectionFence = this.#selectionFenceTail;
+			const deferredScheduling = precedingSelectionFence.then(() => {
+				try {
+					this.#scheduleAutoContinuePrompt(
+						generation,
+						requireUnfinishedWork,
+						resourceRunId,
+						selectionFenceGeneration,
+						predecessorAgentEnd,
+					);
+				} finally {
+					this.#endSelectionFenceDeferralTracking(selectionFenceGeneration);
+				}
+			});
+			this.#trackSelectionFenceDeferredContinuation(selectionFenceGeneration, deferredScheduling);
+			return;
+		}
+		const predecessorAgentEndHold = deferredPredecessorAgentEnd
+			? this.#restoreAndReserveDeferredAgentEndForContinuation(deferredPredecessorAgentEnd)
+			: this.#reserveDeferredAgentEndForContinuation();
 		void this.#schedulePostPromptTask(
 			async signal => {
 				try {
@@ -5886,6 +6164,7 @@ export class AgentSession {
 						},
 						signal,
 						continuationAdmission,
+						{ bypassSelectionFenceGeneration: selectionFenceGeneration },
 					);
 				} catch (error) {
 					if (signal.aborted) {
@@ -5901,6 +6180,7 @@ export class AgentSession {
 				delayMs: 0,
 				generation: scheduledGeneration,
 				resourceRunId,
+				selectionFenceGeneration,
 				onSkip: () => {
 					this.#logCompactionContinuationSkipped("auto_continue_prompt", "aborted_signal");
 					this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
@@ -5932,6 +6212,7 @@ export class AgentSession {
 		this.#postPromptTasksAbortController.abort();
 		this.#postPromptTasksAbortController = new AbortController();
 		this.#postPromptTasks.clear();
+		this.#postPromptTaskSelectionFenceGenerations.clear();
 		this.#releaseDeferredAgentEndContinuations();
 		this.#resolveTtsrResume();
 		this.#resolvePostPromptTasks();
@@ -5966,6 +6247,19 @@ export class AgentSession {
 			}
 			break;
 		}
+	}
+
+	/**
+	 * A selection's scoped idle drain must not wait on work parked behind its
+	 * own fence, but it still needs to yield to post-prompt work that predates
+	 * that fence. Otherwise the drain can repeatedly await already-settled
+	 * session work while a timer-backed predecessor task is starved.
+	 */
+	async #waitForPostPromptTasksBeforeSelectionFence(selectionFenceGeneration: number): Promise<void> {
+		const precedingTasks = [...this.#postPromptTasks].filter(
+			task => (this.#postPromptTaskSelectionFenceGenerations.get(task) ?? 0) < selectionFenceGeneration,
+		);
+		if (precedingTasks.length > 0) await Promise.allSettled(precedingTasks);
 	}
 
 	/** Get TTSR injection payload and clear pending injections. */
@@ -7272,17 +7566,30 @@ export class AgentSession {
 	}
 
 	/** Wait until streaming and session settlement work are fully settled. */
-	async waitForIdle(): Promise<void> {
+	/**
+	 * Wait until streaming and session settlement work are fully settled.
+	 *
+	 * The internal-only `ignoreSelectionFenceGeneration` is used exclusively by
+	 * `setDefaultModelSelection`'s mid-selection drain: the selection must not
+	 * wait on work parked behind its own (or a later) fence — its agent run,
+	 * recovery, and deferrals — because that work is waiting on the selection
+	 * itself (#4519). External callers observe everything.
+	 */
+	async waitForIdle(ignoreSelectionFenceGeneration?: number): Promise<void> {
 		while (true) {
-			await this.agent.waitForIdle();
-			await this.#waitForPostPromptRecovery();
-			await this.#waitForSessionSettlement();
+			if (ignoreSelectionFenceGeneration === undefined) {
+				await this.agent.waitForIdle();
+				await this.#waitForPostPromptRecovery();
+			} else {
+				await this.#waitForPostPromptTasksBeforeSelectionFence(ignoreSelectionFenceGeneration);
+			}
+			await this.#waitForSessionSettlement(ignoreSelectionFenceGeneration);
 			if (
 				!this.agent.state.isStreaming &&
 				!this.#retryPromise &&
 				!this.#ttsrResumePromise &&
 				!this.#postPromptTasksPromise &&
-				!this.#isSessionSettlementPending()
+				!this.#isSessionSettlementPending(ignoreSelectionFenceGeneration)
 			)
 				return;
 		}
@@ -9443,6 +9750,8 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		if (expandPromptTemplates && text.startsWith("/skill:") && !options?.images?.length) {
@@ -9497,13 +9806,13 @@ export class AgentSession {
 		assertImagePlaceholdersHavePayload(expandedText, options?.images);
 		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
 		const claimsGenuineUserIntent = !options?.synthetic && options?.attribution !== "agent";
-		const owner = this.#sessionAdmissionContext.getStore();
-		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
 		const admissionGeneration = this.#promptGeneration;
 		const admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
 			: this.#promptPreflightAbortController.signal;
-		await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+		if (this.#pendingSelectionFences > 0) {
+			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+		}
 		const deepInterviewUserIntentEpoch =
 			claimsGenuineUserIntent && !this.isStreaming ? this.#claimDeepInterviewUserIntent() : undefined;
 
@@ -11030,6 +11339,8 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: {
 			deliverAs?: "steer" | "followUp";
+			/** Preserve a busy SDK dispatch as queued work across an admission fence. */
+			queuedAtDispatch?: boolean;
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
@@ -11039,6 +11350,9 @@ export class AgentSession {
 		},
 	): Promise<void> {
 		this.#assertRecoveryHydrationPromoted();
+		const owner = this.#sessionAdmissionContext.getStore();
+		if (owner && !owner.released) throw this.#sessionAdmissionBusyError();
+		this.#assertSessionAdmissionOpen();
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
 		if (typeof content !== "string" && !Array.isArray(content)) {
 			throw Object.assign(new Error("sendUserMessage requires string or content-array content."), {
@@ -11065,55 +11379,145 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		if (options?.deliverAs === "followUp") {
-			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			const queuedFollowUp = await this.#queueFollowUp(text, images, {
-				claimsGenuineUserIntent: true,
-				forceOneAtATime: Boolean(options.preflightSignal),
-				onPromoted: options?.onQueuedPromoted,
-				sdkRunToken: options.sdkRunToken,
-			});
-			const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
-			options.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
-			if (options.preflightSignal?.aborted) cancelQueuedFollowUp();
-			options.onPreflightAccepted?.();
-			return;
+		const admissionSignal = options?.preflightSignal
+			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
+			: this.#promptPreflightAbortController.signal;
+		const preflightCancellationGeneration = this.#promptPreflightCancellationGeneration;
+		// Classify and reserve follow-up order synchronously, before any await
+		// (selection fence or durable acceptance): a follow-up dispatch that is
+		// not yet durably enqueued must already count as ahead, or a later plain
+		// prompt admitted through the same window would classify itself as fresh
+		// delivery/steering and overtake it. The reservation is released once
+		// the durable enqueue settles either way, so a rejected or cancelled
+		// acceptance leaves no phantom ordering behind.
+		const queuedPlainPrompt = options?.queuedAtDispatch === true && options.deliverAs === undefined;
+		const hasFollowUpAhead = (): boolean =>
+			this.#activeFollowUpReservationEpochs.size > 0 ||
+			this.agent.snapshotFollowUp().length > 0 ||
+			this.#deferredSdkFollowUps.length > 0;
+		const followUpAheadAtReservation = queuedPlainPrompt && hasFollowUpAhead();
+		const freshAtReservation =
+			queuedPlainPrompt &&
+			!followUpAheadAtReservation &&
+			!this.agent.state.isStreaming &&
+			!this.#canAutoContinueForSteer();
+		const deliverAs =
+			options?.deliverAs ??
+			(queuedPlainPrompt
+				? followUpAheadAtReservation
+					? "followUp"
+					: freshAtReservation
+						? undefined
+						: "steer"
+				: undefined);
+		const followUpReservationEpoch = deliverAs === "followUp" ? ++this.#followUpReservationEpoch : undefined;
+		if (followUpReservationEpoch !== undefined) {
+			this.#activeFollowUpReservationEpochs.add(followUpReservationEpoch);
 		}
-		if (options?.deliverAs === "steer") {
-			if (options.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			await this.#queueSteer(text, images, {
-				claimsGenuineUserIntent: true,
-				onPromoted: options?.onQueuedPromoted,
-				external: true,
-			});
-			options.onPreflightAccepted?.();
-			return;
-		}
+		const releaseFollowUpReservation = () => {
+			if (followUpReservationEpoch === undefined) return;
+			this.#activeFollowUpReservationEpochs.delete(followUpReservationEpoch);
+			const waiters = [...this.#followUpReservationDrainWaiters];
+			this.#followUpReservationDrainWaiters.clear();
+			for (const waiter of waiters) waiter();
+		};
+		try {
+			if (this.#pendingSelectionFences > 0) {
+				await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
+			}
+			const assertPreflightStillOpen = () => {
+				this.#assertSessionAdmissionOpen();
+				if (
+					options?.preflightSignal?.aborted ||
+					this.#promptPreflightCancellationGeneration !== preflightCancellationGeneration
+				) {
+					throw promptPreflightCancelledError();
+				}
+			};
+			assertPreflightStillOpen();
+			if (deliverAs === "followUp") {
+				// Durable enqueue preserves reservation order: while an earlier
+				// follow-up dispatch is still between its reservation and its own
+				// durable enqueue, wait for those earlier reservations so this
+				// dispatch can never enqueue ahead of them.
+				if (followUpReservationEpoch !== undefined) {
+					await this.#waitForEarlierFollowUpReservations(
+						followUpReservationEpoch,
+						options?.preflightSignal,
+						admissionSignal,
+					);
+				}
+				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+				assertPreflightStillOpen();
+				const queuedFollowUp = await this.#queueFollowUp(text, images, {
+					claimsGenuineUserIntent: true,
+					forceOneAtATime: Boolean(options?.preflightSignal || options?.queuedAtDispatch),
+					onPromoted: options?.onQueuedPromoted,
+					sdkRunToken: options?.sdkRunToken,
+				});
+				const cancelQueuedFollowUp = () => queuedFollowUp.cancel();
+				options?.preflightSignal?.addEventListener("abort", cancelQueuedFollowUp, { once: true });
+				if (options?.preflightSignal?.aborted) cancelQueuedFollowUp();
+				options?.onPreflightAccepted?.();
+				return;
+			}
+			if (deliverAs === "steer") {
+				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+				assertPreflightStillOpen();
+				await this.#queueSteer(text, images, {
+					claimsGenuineUserIntent: true,
+					onPromoted: options?.onQueuedPromoted,
+					external: true,
+				});
+				options?.onPreflightAccepted?.();
+				return;
+			}
 
-		// No explicit delivery mode: only a live stream makes prompt() throw
-		// AgentBusyError, so queue the message as steering while streaming.
-		// Compaction is intentionally NOT diverted here: prompt() handles an
-		// in-flight compaction internally, and #queueSteer would otherwise park
-		// the message in the steering queue with no turn to consume it.
-		if (this.isStreaming) {
-			if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
-			await this.#queueSteer(text, images, {
-				claimsGenuineUserIntent: true,
-				onPromoted: options?.onQueuedPromoted,
-				external: true,
-			});
-			options?.onPreflightAccepted?.();
-			return;
-		}
+			// No explicit delivery mode: only a live stream makes prompt() throw
+			// AgentBusyError, so queue the message as steering while streaming.
+			// Compaction is intentionally NOT diverted here: prompt() handles an
+			// in-flight compaction internally, and #queueSteer would otherwise park
+			// the message in the steering queue with no turn to consume it.
+			if (this.isStreaming) {
+				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+				assertPreflightStillOpen();
+				await this.#queueSteer(text, images, {
+					claimsGenuineUserIntent: true,
+					onPromoted: options?.onQueuedPromoted,
+					external: true,
+				});
+				options?.onPreflightAccepted?.();
+				return;
+			}
 
-		// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
-		await this.prompt(text, {
-			expandPromptTemplates: false,
-			images,
-			onPreflightAccepted: options?.onPreflightAccepted,
-			onPreflightAcceptCommit: options?.onPreflightAcceptCommit,
-			preflightSignal: options?.preflightSignal,
-		});
+			// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
+			let queuedPromotionFired = false;
+			const fireQueuedPromotion = () => {
+				if (!freshAtReservation || queuedPromotionFired) return;
+				queuedPromotionFired = true;
+				options?.onQueuedPromoted?.();
+			};
+			await this.prompt(text, {
+				expandPromptTemplates: false,
+				images,
+				onPreflightAccepted: () => {
+					options?.onPreflightAccepted?.();
+					fireQueuedPromotion();
+				},
+				onPreflightAcceptCommit:
+					options?.onPreflightAcceptCommit || freshAtReservation
+						? async () => {
+								if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
+								else options?.onPreflightAccepted?.();
+								assertPreflightStillOpen();
+								fireQueuedPromotion();
+							}
+						: undefined,
+				preflightSignal: options?.preflightSignal,
+			});
+		} finally {
+			releaseFollowUpReservation();
+		}
 	}
 
 	/**
@@ -11492,6 +11896,7 @@ export class AgentSession {
 		this.#markRetryReplayUnsafe();
 		this.abortRetry();
 		this.#promptGeneration++;
+		this.#promptPreflightCancellationGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
 		this.#scheduledHiddenNextTurnGeneration = undefined;
@@ -11609,6 +12014,7 @@ export class AgentSession {
 	 * reset for the next admission. No run handle exists for a preflight prompt.
 	 */
 	cancelPendingPreflightForTerminalAbort(): void {
+		this.#promptPreflightCancellationGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
 	}
@@ -11847,6 +12253,7 @@ export class AgentSession {
 			// resetRetryReplaySafety) advances the epoch before minting, so the
 			// next turn after the abort gets a distinct (lineage, epoch) and is
 			// never captured by this scope (review thread P2).
+			this.#promptPreflightCancellationGeneration++;
 			this.#promptPreflightAbortController.abort();
 			this.#promptPreflightAbortController = new AbortController();
 		}
@@ -13293,6 +13700,12 @@ export class AgentSession {
 		const expectedSessionId = this.sessionId;
 		const priorSelectionFence = this.#selectionFenceTail;
 		const selectionFence = Promise.withResolvers<void>();
+		this.#selectionFenceGeneration += 1;
+		this.#pendingSelectionFences += 1;
+		const selectionFenceGeneration = this.#selectionFenceGeneration;
+		if (this.#oldestPendingSelectionFenceGeneration === 0) {
+			this.#oldestPendingSelectionFenceGeneration = selectionFenceGeneration;
+		}
 		this.#selectionFenceTail = priorSelectionFence.then(() => selectionFence.promise);
 		void this.#selectionFenceTail.catch(() => {});
 		try {
@@ -13322,7 +13735,7 @@ export class AgentSession {
 				undefined,
 				{ allowDuringClosing: true },
 			);
-			await this.waitForIdle();
+			await this.waitForIdle(selectionFenceGeneration);
 			return await this.#withSessionAdmission(
 				"selection",
 				async () => {
@@ -13408,6 +13821,11 @@ export class AgentSession {
 			);
 		} finally {
 			selectionFence.resolve();
+			this.#pendingSelectionFences -= 1;
+			if (this.#oldestPendingSelectionFenceGeneration === selectionFenceGeneration) {
+				this.#oldestPendingSelectionFenceGeneration = 0;
+			}
+			this.#resolveSessionSettlement();
 		}
 	}
 	/**
@@ -18168,6 +18586,7 @@ export class AgentSession {
 					}
 					if (!preflightAccepted) {
 						await seam?.onPreflightAccepted?.();
+						if (seam?.signal?.aborted) throw promptPreflightCancelledError();
 						preflightAccepted = true;
 					}
 					await this.agent.prompt(messages, options);
