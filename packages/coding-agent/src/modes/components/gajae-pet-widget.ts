@@ -448,7 +448,12 @@ export class GajaePetWidget {
 	}
 
 	remountComposer(): void {
-		if (this.#canMutateSharedUi()) this.#mountEditor(this.#mode !== "off");
+		// The composer container is shared with overlays (palette, selectors). A
+		// registered overlay owner or this widget may remount it; when no owner is
+		// registered the pet was never mounted, and remounting the plain editor is
+		// the same no-overlay restore the host would perform itself.
+		const owner = petOverlayEmitterOwners.get(this.#ui);
+		if (owner === undefined || owner === this) this.#mountEditor(this.#mode !== "off");
 	}
 
 	#syncWorkingState(now: number): PetSkinId | undefined {
