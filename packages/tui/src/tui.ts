@@ -2286,15 +2286,23 @@ export class TUI extends Container {
 			() => {
 				const hadRasterLease = this.#rasterLeases.size > 0;
 				this.#revokeRasterLeases("resize");
-				if (TERMINAL.imageProtocol || hadRasterLease) this.#queryCellSize(true);
+				// Only a pet raster lease needs refreshed cell metrics on resize; a
+				// plain resize keeps the historical byte stream (no cell query).
+				if (hadRasterLease) this.#queryCellSize(true);
 				this.invalidate();
-				this.notifyTerminalLifecycle({
-					kind: "explicit-cleanup",
-					source: "tui",
-					terminalGeneration: this.#terminalGeneration,
-				}).then(result => {
-					if (result.stillPending === 0) this.requestResizeRender();
-				});
+				if (this.#pendingTerminalCleanup.length > 0 || this.#rasterCleanup.size > 0) {
+					// Retained pet/cleanup output must be flushed before the resize
+					// repaint so it cannot interleave behind the new frame.
+					this.notifyTerminalLifecycle({
+						kind: "explicit-cleanup",
+						source: "tui",
+						terminalGeneration: this.#terminalGeneration,
+					}).then(result => {
+						if (result.stillPending === 0) this.requestResizeRender();
+					});
+				} else {
+					this.requestResizeRender();
+				}
 			},
 		);
 		if (this.#pendingTerminalCleanup.length > 0 || this.#rasterCleanup.size > 0) {
@@ -3963,7 +3971,7 @@ export class TUI extends Container {
 			this.#rasterLeases.size > 0 &&
 			this.#rasterCleanup.size === 0 &&
 			!visibleLines.some(line => TERMINAL.isImageLine(line));
-		let buffer = `\x1b[?2026h${deletePlan.output}${preserveRasterLeases ? "\x1b[?25l" : ""}`;
+		let buffer = `${preserveRasterLeases ? "\x1b[?2026h" : ""}${deletePlan.output}${preserveRasterLeases ? "\x1b[?25l" : ""}`;
 		if (!preserveRasterLeases) buffer += "\x1b[H";
 		const committedTranscriptRows: Array<number | null> = [];
 		for (let screenRow = 0; screenRow < height; screenRow++) {
