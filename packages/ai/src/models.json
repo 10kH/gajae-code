@@ -13127,7 +13127,7 @@
 			},
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -70240,7 +70240,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -70265,7 +70265,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -83854,7 +83854,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "budget",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
