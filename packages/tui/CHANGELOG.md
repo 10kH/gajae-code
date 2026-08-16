@@ -3,7 +3,9 @@
 ## [Unreleased]
 
 ### Fixed
-- iTerm2 Gajae Pet frames now size their inline PNG to the geometry-derived reserved cell block instead of a fixed pixel box, preserving the authored sprite aspect ratio across terminal font, Retina, and cell-aspect geometries while leaving Kitty and Sixel encoding unchanged.
+- iTerm2 pet capability probes now wait for pending input without disabling Kitty keyboard mode, disabling `modifyOtherKeys`, or detaching the live input handler.
+- iTerm2 Gajae Pet frames now carry a dedicated filename, so dragging one retains iTerm's native drag behavior while the coding agent can discard only the temporary pet pathname pasted back into its composer.
+- iTerm2 Gajae Pet now uses one animated GIF upload per meaningful state change and a raster lease that excludes its cell rectangle from generic TUI redraw erases, eliminating animation flicker while preserving geometry-derived art placement and leaving Kitty and Sixel encoding unchanged.
 
 - Layout-only animation and selector frames can now reuse an unchanged revisioned transcript subtree instead of rebuilding every off-screen transcript component, anchor row, and Kitty placement on each tick. Ordinary render requests remain conservative, and transcript revision, width, identity, and global invalidation changes still force a full subtree render.
 

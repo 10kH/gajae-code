@@ -69,10 +69,14 @@ import {
 	IrcLeftLaneComponent,
 	IrcSplitViewComponent,
 } from "./components/irc-sidebar";
+import { createNativePetTransport, type ItermPetTransport } from "./components/iterm-pet-transport";
 import {
+	getItermPetAvailability,
+	getItermPetUnavailableReason,
 	getPetUnavailableWarning,
 	isPetAvailable,
 	isPetCapabilityProbePending,
+	setVerifiedItermPetAvailability,
 	warnWhenPetCapabilitySettled,
 } from "./components/pet-capability";
 import type { ToolExecutionHandle } from "./components/tool-execution";
@@ -434,6 +438,20 @@ export class InteractiveMode implements InteractiveModeContext {
 	#resolvedSlashCommands: SlashCommand[] = [];
 	#baseReservedSlashCommandNames: Set<string> = new Set();
 	#cleanupUnsubscribe?: () => void;
+	#itermPetTransport?: ItermPetTransport;
+
+	/**
+	 * Pet-unavailable warning text. The iTerm transport reason is parenthesized
+	 * only when a transport actually reported one; non-iTerm terminals and a
+	 * probe still in flight keep the plain warning instead of "(unknown)".
+	 */
+	#petUnavailableStatusText(): string {
+		if (!this.#itermPetTransport || getItermPetAvailability() === undefined) return getPetUnavailableWarning();
+		const reason = getItermPetUnavailableReason();
+		return reason === undefined ? getPetUnavailableWarning() : `${getPetUnavailableWarning()} (${reason})`;
+	}
+
+	#petTransportAvailabilityUnsubscribe?: () => void;
 	#subprocessTeardownUnsubscribe?: () => void;
 	#petProtocolUnsubscribe?: () => void;
 	/** Cancels a startup pet-unavailable warning still awaiting probe settlement. */
@@ -620,6 +638,18 @@ export class InteractiveMode implements InteractiveModeContext {
 				}
 			},
 		});
+		this.#itermPetTransport = createNativePetTransport({ ui: this.ui });
+		if (this.#itermPetTransport) {
+			this.#petTransportAvailabilityUnsubscribe = this.#itermPetTransport.subscribe(availability => {
+				if (!availability.available) void this.petWidget?.suspendItermCapability();
+				setVerifiedItermPetAvailability(availability);
+				if (availability.available) {
+					if (availability.mode === "managed") this.ui.refreshImageCellSize();
+					const saved = settings.get("pet.mode");
+					if (saved !== "off" && this.petWidget && this.petWidget.mode === "off") this.petWidget.setMode(saved);
+				}
+			});
+		}
 		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
 		this.chatContainer = new Container();
 		this.#ircSplitView = new IrcSplitViewComponent(this.chatContainer, this.ircLedger, () => theme);
@@ -812,26 +842,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		// appears without the user re-running /pet.
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = onImageProtocolChanged(protocol => {
-			if (!protocol) return;
+			if (!protocol) {
+				void this.petWidget?.suspendItermCapability();
+				return;
+			}
 			const saved = settings.get("pet.mode");
 			if (saved !== "off" && this.petWidget && this.petWidget.mode === "off") {
 				this.petWidget.setMode(saved);
 			}
 		});
-		if (configuredPetMode !== "off" && !isPetAvailable()) {
-			// The async Sixel capability probe (started by TUI.start()) may still
-			// enable graphics; warn only once the capability question is settled
-			// so a supported terminal is never told it is incompatible.
-			this.#petUnavailableWarningDisposer?.();
-			this.#petUnavailableWarningDisposer = warnWhenPetCapabilitySettled({
-				probePending: isPetCapabilityProbePending(),
-				onUnavailable: () => {
-					this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
-					this.ui.requestRender();
-				},
-			});
-		}
-
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
 		this.editor.onViewportPageScroll = direction => {
@@ -880,6 +899,23 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		// Start the UI
 		this.ui.start();
+		if (this.#itermPetTransport) {
+			if (this.#itermPetTransport.availability.mode === "direct") void this.#itermPetTransport.probe();
+			else this.#itermPetTransport.startManagedPolling();
+		}
+		if (configuredPetMode !== "off" && !isPetAvailable()) {
+			// An async terminal capability probe may still enable graphics; warn only once
+			// the capability question is settled so a supported terminal is never told it
+			// is incompatible.
+			this.#petUnavailableWarningDisposer?.();
+			this.#petUnavailableWarningDisposer = warnWhenPetCapabilitySettled({
+				probePending: this.#itermPetTransport !== undefined || isPetCapabilityProbePending(),
+				onUnavailable: () => {
+					this.showStatus(theme.fg("warning", this.#petUnavailableStatusText()), { dim: false });
+					this.ui.requestRender();
+				},
+			});
+		}
 		pushTerminalTitle();
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.updateEditorChrome();
@@ -1323,7 +1359,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	 */
 	#commitPetMode(mode: PetMode, apply: (mode: PetMode) => void): boolean {
 		if (mode !== "off" && !isPetAvailable()) {
-			this.showStatus(theme.fg("warning", getPetUnavailableWarning()), { dim: false });
+			void this.#itermPetTransport?.retry();
+			this.showStatus(theme.fg("warning", this.#petUnavailableStatusText()), { dim: false });
 			this.ui.requestRender();
 			return false;
 		}
@@ -1384,6 +1421,8 @@ export class InteractiveMode implements InteractiveModeContext {
 			getComposerBottomOffset: () =>
 				this.petFloorContainer.render(this.ui.terminal.columns).length +
 				this.hookWidgetContainerBelow.render(this.ui.terminal.columns).length,
+			syncManagedItermCursor: (row, column) =>
+				this.#itermPetTransport?.refreshManagedClient(row, column) ?? Promise.resolve(false),
 		});
 	}
 
@@ -1537,6 +1576,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#petUnavailableWarningDisposer = undefined;
 		this.petWidget?.dispose();
 		this.petWidget = undefined;
+		this.#petTransportAvailabilityUnsubscribe?.();
+		this.#petTransportAvailabilityUnsubscribe = undefined;
+		void this.#itermPetTransport?.dispose();
+		this.#itermPetTransport = undefined;
+		setVerifiedItermPetAvailability(undefined);
 		this.#welcomeComponent?.dispose();
 		this.#welcomeComponent = undefined;
 		if (this.#sttController) {
@@ -1607,6 +1651,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		// This prevents escape sequences from leaking to the parent shell over slow SSH.
 		await this.ui.terminal.drainInput(1000);
 		popTerminalTitle();
+		await this.petWidget?.disposeAsync();
+		await this.#itermPetTransport?.dispose();
 		this.stop();
 
 		// Print resumption hint if this is a persisted session
