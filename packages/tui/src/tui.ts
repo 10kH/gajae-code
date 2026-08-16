@@ -5422,7 +5422,7 @@ export class TUI extends Container {
 			const emission = this.#postRenderEmitter?.();
 			if (emission) {
 				const overlay = typeof emission === "string" ? emission : emission.payload;
-				const overlayBuffer = `\x1b[?2026h\x1b7${overlay}\x1b8\x1b[?2026l`;
+				const overlayBuffer = this.#frameSynchronizedOutput(`\x1b7${overlay}\x1b8`);
 				if (this.#writeTerminal(overlayBuffer, true) && typeof emission !== "string") emission.onWritten?.();
 			}
 			if (!this.#imeCursorActive) return true;
