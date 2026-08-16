@@ -6451,6 +6451,47 @@ describe("ModelRegistry", () => {
 				{ provider: "discovery-provider", connectionKind: "credential" },
 			]);
 		});
+		test("reuses a fresh configured discovery cache with zero fetches on provider-tab revisit", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			let requests = 0;
+			using _hook = hookFetch(() => {
+				requests++;
+				return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+			expect(requests).toBeGreaterThan(0);
+			expect(registry.find("discovery-provider", "discovered-model")).toBeDefined();
+
+			// Same credentials and endpoint: the published provenance fingerprint
+			// matches, so a fresh-cache revisit must not touch the network.
+			const requestsAfterFetch = requests;
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+
+			expect(requests).toBe(requestsAfterFetch);
+			expect(registry.find("discovery-provider", "discovered-model")).toBeDefined();
+			const state = registry.getProviderDiscoveryState("discovery-provider");
+			expect(state?.status).toBe("ok");
+			// Cache-served revisit reports the cache row's fetch time, not "now".
+			const row = readModelCache(
+				"discovery-provider",
+				24 * 60 * 60 * 1000,
+				Date.now,
+				path.join(tempDir, "models.db"),
+			);
+			expect(state?.fetchedAt).toBe(row?.updatedAt);
+		});
 		test("refreshes configured discovery when round-robin credentials change", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {

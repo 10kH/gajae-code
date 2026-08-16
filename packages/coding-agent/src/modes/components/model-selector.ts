@@ -952,7 +952,10 @@ export class ModelSelectorComponent extends Container {
 
 		let refreshError: unknown;
 		try {
-			await this.#modelRegistry.refreshProvider(providerId);
+			// Cache-aware: a fresh discovery cache answers instantly instead of
+			// forcing a provider round-trip (hundreds of ms on remote gateways)
+			// on every provider-tab visit. Stale/missing cache still fetches.
+			await this.#modelRegistry.refreshProvider(providerId, "online-if-uncached");
 		} catch (error) {
 			refreshError = error;
 		}

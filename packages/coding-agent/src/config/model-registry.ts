@@ -2424,6 +2424,10 @@ export class ModelRegistry {
 					await this.#discoverModelsByProviderType(provider, apiKey),
 				),
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
+			// Mirrors the built-in descriptor path: fingerprint credential evidence +
+			// endpoint so a fresh cache row stays trusted across provider-tab visits
+			// under "online-if-uncached" instead of re-fetching every time.
+			cacheDynamicModelProvenance: Bun.hash(`${authGenerationBeforeDiscovery}\u0000${endpoint}`).toString(36),
 			canPublishCache: () => isCurrentEndpoint(),
 		});
 		const authGeneration =

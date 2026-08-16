@@ -49,6 +49,13 @@ export interface ProviderDiscoveryCallbacks<TProvider extends DiscoveryProvider>
 	fetchModels: (provider: TProvider, apiKey: string | undefined) => Promise<Model<Api>[]>;
 	getEvidenceGeneration?: (provider: TProvider) => string;
 	canPublishCache?: (provider: TProvider) => boolean;
+	/**
+	 * Stable fingerprint of the discovery fetch context (credential evidence +
+	 * endpoint). When supplied, the published cache row records it alongside the
+	 * discovered model ids so a later `online-if-uncached` refresh can trust a
+	 * fresh cache instead of treating the ids as provenance-less and re-fetching.
+	 */
+	cacheDynamicModelProvenance?: string;
 }
 
 /** Owns configured discovery inputs, status, cache lifecycle, and refresh generations. */
@@ -166,6 +173,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			staticModels: [],
 			cacheDbPath: callbacks.cacheDbPath,
 			cacheTtlMs: 24 * 60 * 60 * 1000,
+			cacheDynamicModelProvenance: callbacks.cacheDynamicModelProvenance,
 			canPublishCache: () =>
 				this.isCurrent(token) &&
 				(callbacks.getEvidenceGeneration === undefined ||
@@ -204,7 +212,9 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			status,
 			optional: provider.optional ?? false,
 			stale: result.stale || status === "cached",
-			fetchedAt: error ? cached?.updatedAt : Date.now(),
+			// Cache-served refreshes did not fetch now: report the row's actual
+			// fetch time instead of laundering it through Date.now().
+			fetchedAt: error || !result.fetched ? cached?.updatedAt : Date.now(),
 			models: result.models.map(model => model.id),
 			error,
 		};
