@@ -104,6 +104,7 @@ function createModelRegistry(options: ModelRegistryOptions): ModelRegistry {
 		hasConfiguredProviderAuth,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 		getModelProfiles: () => new Map(),
 		getApiKeyForProvider: async () => undefined,

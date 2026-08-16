@@ -1278,6 +1278,59 @@ describe("ModelRegistry", () => {
 			});
 			expect(resolved).toBe(initial);
 		});
+		test("getCanonicalModelSelections matches per-record resolution across the whole catalog", () => {
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const candidates = registry.getAll();
+			const selections = registry.getCanonicalModelSelections({ availableOnly: false, candidates });
+			const records = registry.getCanonicalModels({ availableOnly: false, candidates });
+
+			expect(selections.length).toBe(records.length);
+			expect(selections.length).toBeGreaterThan(0);
+			for (let index = 0; index < records.length; index += 1) {
+				const record = records[index]!;
+				const selection = selections[index]!;
+				expect(selection.record.id).toBe(record.id);
+				expect(selection.record.name).toBe(record.name);
+				expect(selection.record.variants).toEqual(record.variants);
+				const resolved = registry.resolveCanonicalModel(record.id, { availableOnly: false, candidates });
+				expect(selection.model).toBe(resolved);
+			}
+		});
+		test("getCanonicalModelSelections matches per-record resolution across option and candidate shapes", () => {
+			// Sticky state mutates per call, so each scenario runs batch and
+			// per-record passes in the same order on independent registries.
+			const scenarios = [
+				{ availableOnly: false, sessionId: undefined as string | undefined },
+				{ availableOnly: true, sessionId: undefined as string | undefined },
+				{ availableOnly: false, sessionId: "  batch-parity-session  " as string | undefined },
+				{ availableOnly: true, sessionId: "  batch-parity-session  " as string | undefined },
+			];
+			for (const scenario of scenarios) {
+				const batchRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+				const perRecordRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+				// Candidate subset: even-index models drop roughly half the catalog,
+				// exercising per-variant candidate-key filtering on both paths.
+				const candidates = batchRegistry.getAll().filter((_, index) => index % 2 === 0);
+				const options = {
+					availableOnly: scenario.availableOnly,
+					candidates,
+					sessionId: scenario.sessionId,
+				};
+				const selections = batchRegistry.getCanonicalModelSelections(options);
+				const records = perRecordRegistry.getCanonicalModels(options);
+
+				expect(selections.length).toBe(records.length);
+				for (let index = 0; index < records.length; index += 1) {
+					const resolved = perRecordRegistry.resolveCanonicalModel(records[index]!.id, options);
+					expect(selections[index]!.model).toBe(resolved);
+				}
+				if (scenario.sessionId !== undefined) {
+					expect(batchRegistry.getSessionCanonicalVariant("batch-parity-session")).toBe(
+						perRecordRegistry.getSessionCanonicalVariant("batch-parity-session"),
+					);
+				}
+			}
+		});
 		test("normalizes sticky session IDs when recording canonical variants", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const resolved = registry.resolveCanonicalModel("claude-sonnet-4-5", {
