@@ -14947,7 +14947,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "google-level",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -16092,6 +16092,31 @@
 			"thinking": {
 				"mode": "google-level",
 				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"gemini-3.7-flash": {
+			"id": "gemini-3.7-flash",
+			"name": "Gemini 3.7 Flash",
+			"api": "google-gemini-cli",
+			"provider": "google-gemini-cli",
+			"baseUrl": "https://cloudcode-pa.googleapis.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.75,
+				"output": 3.75,
+				"cacheRead": 0.075,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 65536,
+			"thinking": {
+				"mode": "google-level",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		}

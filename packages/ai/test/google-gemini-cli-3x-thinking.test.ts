@@ -81,6 +81,40 @@ describe("google-gemini-cli Gemini 3.x thinking mapping", () => {
 		expect(requestBody).toBeUndefined();
 	});
 
+	it("rejects unsupported gemini-3.7-flash minimal instead of promoting it", () => {
+		let requestBody: string | undefined;
+		using _hook = hookFetch((_input, init) => {
+			requestBody = typeof init?.body === "string" ? init.body : undefined;
+			return new Response('{"error":{"message":"bad request"}}', { status: 400 });
+		});
+
+		expect(() =>
+			streamSimple(createModel("gemini-3.7-flash"), context, {
+				apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+				reasoning: Effort.Minimal,
+			}),
+		).toThrow(/Supported efforts: low, medium, high/);
+		expect(requestBody).toBeUndefined();
+	});
+
+	it("uses thinkingLevel for gemini-3.7-flash when the effort is supported", async () => {
+		let requestBody: string | undefined;
+		using _hook = hookFetch((_input, init) => {
+			requestBody = typeof init?.body === "string" ? init.body : undefined;
+			return new Response('{"error":{"message":"bad request"}}', { status: 400 });
+		});
+
+		const stream = streamSimple(createModel("gemini-3.7-flash"), context, {
+			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+			reasoning: Effort.High,
+		});
+		await stream.result();
+
+		const thinking = extractThinking(requestBody);
+		expect(thinking?.thinkingLevel).toBe("HIGH");
+		expect(thinking?.thinkingBudget).toBeUndefined();
+	});
+
 	it("uses thinkingLevel for gemini-3.1-flash-preview", async () => {
 		let requestBody: string | undefined;
 		using _hook = hookFetch((_input, init) => {

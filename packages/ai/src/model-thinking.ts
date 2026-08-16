@@ -53,6 +53,9 @@ const DEFAULT_REASONING_EFFORTS_WITH_XHIGH_AND_MAX: readonly Effort[] = [
 ];
 const GEMINI_3_PRO_EFFORTS: readonly Effort[] = [Effort.Low, Effort.High];
 const GEMINI_3_FLASH_EFFORTS: readonly Effort[] = [Effort.Minimal, Effort.Low, Effort.Medium, Effort.High];
+// Gemini 3.7 Flash dropped `minimal`; the official API returns an error for it.
+// https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash
+const GEMINI_3_7_FLASH_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High];
 const GPT_5_2_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh];
 const GPT_5_6_PLUS_EFFORTS: readonly Effort[] = [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, Effort.Max];
 const GPT_5_5_DEFAULT_EFFORT = Effort.XHigh;
@@ -727,7 +730,13 @@ function inferGeminiSupportedEfforts(model: GeminiModel): readonly Effort[] {
 	if (!semverGte(model.version, "3.0")) {
 		return DEFAULT_REASONING_EFFORTS;
 	}
-	return model.kind === "pro" ? GEMINI_3_PRO_EFFORTS : GEMINI_3_FLASH_EFFORTS;
+	if (model.kind === "pro") {
+		return GEMINI_3_PRO_EFFORTS;
+	}
+	if (semverGte(model.version, "3.7")) {
+		return GEMINI_3_7_FLASH_EFFORTS;
+	}
+	return GEMINI_3_FLASH_EFFORTS;
 }
 
 function inferAnthropicSupportedEfforts<TApi extends Api>(

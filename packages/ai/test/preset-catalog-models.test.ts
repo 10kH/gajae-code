@@ -48,6 +48,37 @@ describe("preset catalog model entries", () => {
 		expect(model.thinking).toEqual({ mode: "google-level", minLevel: Effort.Minimal, maxLevel: Effort.High });
 	});
 
+	test("bundles google/gemini-3.7-flash flagship", () => {
+		const model = getBundledModel("google", "gemini-3.7-flash");
+
+		expect(model.id).toBe("gemini-3.7-flash");
+		expect(model.provider).toBe("google");
+		expect(model.api).toBe("google-generative-ai");
+		expect(model.baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
+		expect(model.name).toBe("Gemini 3.7 Flash");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toContain("image");
+		expect(model.contextWindow).toBe(1_048_576);
+		expect(model.maxTokens).toBe(65_536);
+		expect(model.cost).toEqual({ input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 });
+		expect(model.thinking).toEqual({ mode: "google-level", minLevel: Effort.Low, maxLevel: Effort.High });
+	});
+
+	test("bundles google-gemini-cli/gemini-3.7-flash", () => {
+		const model = getBundledModel("google-gemini-cli", "gemini-3.7-flash");
+
+		expect(model.id).toBe("gemini-3.7-flash");
+		expect(model.provider).toBe("google-gemini-cli");
+		expect(model.api).toBe("google-gemini-cli");
+		expect(model.baseUrl).toBe("https://cloudcode-pa.googleapis.com");
+		expect(model.name).toBe("Gemini 3.7 Flash");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toContain("image");
+		expect(model.contextWindow).toBe(1_048_576);
+		expect(model.maxTokens).toBe(65_536);
+		expect(model.thinking).toEqual({ mode: "google-level", minLevel: Effort.Low, maxLevel: Effort.High });
+	});
+
 	test("bundles minimax-code/MiniMax-M3 canonical id (issue #3896)", () => {
 		const model = getBundledModel("minimax-code", "MiniMax-M3");
 

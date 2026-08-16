@@ -134,6 +134,35 @@ describe("model thinking metadata", () => {
 		expect(() => mapEffortToGoogleThinkingLevel(model, Effort.Medium)).toThrow(/not supported/);
 	});
 
+	it("exposes Gemini 3.7 Flash low/medium/high and rejects minimal", () => {
+		const flash37 = createModel({
+			id: "gemini-3.7-flash",
+			api: "google-generative-ai",
+			provider: "google",
+		});
+		const flash36 = createModel({
+			id: "gemini-3.6-flash",
+			api: "google-generative-ai",
+			provider: "google",
+		});
+
+		expect(flash37.thinking).toEqual({
+			mode: "google-level",
+			minLevel: Effort.Low,
+			maxLevel: Effort.High,
+		});
+		expect(flash36.thinking).toEqual({
+			mode: "google-level",
+			minLevel: Effort.Minimal,
+			maxLevel: Effort.High,
+		});
+		expect(mapEffortToGoogleThinkingLevel(flash37, Effort.Low)).toBe("LOW");
+		expect(mapEffortToGoogleThinkingLevel(flash37, Effort.Medium)).toBe("MEDIUM");
+		expect(mapEffortToGoogleThinkingLevel(flash37, Effort.High)).toBe("HIGH");
+		expect(() => requireSupportedEffort(flash37, Effort.Minimal)).toThrow(/not supported/);
+		expect(requireSupportedEffort(flash36, Effort.Minimal)).toBe(Effort.Minimal);
+	});
+
 	it("encodes anthropic transport mode in metadata", () => {
 		const opus45 = createModel({
 			id: "claude-opus-4-5",
