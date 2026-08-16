@@ -22,6 +22,11 @@ const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const EMPTY_CACHE_TTL_MS = 5 * 60 * 1000;
 const CACHE_MAX_ENTRIES = 256;
 const REGISTRY_MAX_ENTRIES = 256;
+const CACHE_MUTATION_LOCK_STALE_MS = 5_000;
+
+type NativeExactUnlinkBindings = Pick<typeof import("@gajae-code/natives"), "exactUnlink">;
+
+let nativeExactUnlinkBindings: NativeExactUnlinkBindings | undefined;
 
 let cachePathOverride: string | undefined;
 let nowForTests: (() => number) | undefined;
@@ -30,6 +35,7 @@ let beforeMalformedDeleteForTests: (() => void) | undefined;
 let onCacheOpenForTests: (() => void) | undefined;
 let simulateCacheOperationErrorForTests: (() => Error | undefined) | undefined;
 let beforeCorruptRetireForTests: (() => void) | undefined;
+let beforeLockExactUnlinkForTests: ((lockPath: string) => void) | undefined;
 
 /**
  * Claude Mythos accepts tools but rejects forced tool use (Anthropic 400:
@@ -85,6 +91,7 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 	onCacheOpen?: () => void;
 	simulateOperationError?: () => Error | undefined;
 	beforeCorruptRetire?: () => void;
+	beforeLockExactUnlink?: (lockPath: string) => void;
 }): void {
 	cachePathOverride = options?.path;
 	nowForTests = options?.now;
@@ -93,19 +100,25 @@ export function configureToolChoiceCapabilityCacheForTests(options?: {
 	onCacheOpenForTests = options?.onCacheOpen;
 	simulateCacheOperationErrorForTests = options?.simulateOperationError;
 	beforeCorruptRetireForTests = options?.beforeCorruptRetire;
+	beforeLockExactUnlinkForTests = options?.beforeLockExactUnlink;
 	clearToolChoiceIncapabilityRegistryForTests();
 }
 
 /** Records a discovered maximum supported tool-choice level for a model. */
 export function markToolChoiceIncapability(model: Model<Api>, maxSupport: ToolChoiceSupport, reason?: string): void {
 	const key = toolChoiceRegistryKey(model);
-	hydrateToolChoiceCapability(key);
-	const existing = registry.get(key);
-	const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
-	registry.set(key, next);
-	const persisted = persistToolChoiceCapability(key, next);
-	if (persisted) registry.set(key, persisted.support);
-	registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
+	const releaseMutationLock = acquireCapabilityCacheMutationLock();
+	try {
+		hydrateToolChoiceCapability(key);
+		const existing = registry.get(key);
+		const next = existing && supportRank[existing] < supportRank[maxSupport] ? existing : maxSupport;
+		registry.set(key, next);
+		const persisted = persistToolChoiceCapability(key, next);
+		if (persisted) registry.set(key, persisted.support);
+		registryExpiresAt.set(key, (persisted?.observedAt ?? currentTime()) + CACHE_TTL_MS);
+	} finally {
+		releaseMutationLock?.();
+	}
 
 	if (!loggedRegistryKeys.has(key)) {
 		loggedRegistryKeys.add(key);
@@ -117,6 +130,100 @@ export function markToolChoiceIncapability(model: Model<Api>, maxSupport: ToolCh
 			maxSupport,
 			reason,
 		});
+	}
+}
+
+function acquireCapabilityCacheMutationLock(): (() => void) | undefined {
+	if (process.env.NODE_ENV === "test" && cachePathOverride === undefined) return;
+	const cachePath = cachePathOverride ?? getToolChoiceCapabilityCachePath();
+	const lockPath = `${cachePath}.mutation.lock`;
+	const sleeper = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+	const owner = `${process.pid}:${crypto.randomUUID()}`;
+	while (true) {
+		try {
+			fs.mkdirSync(path.dirname(cachePath), { recursive: true, mode: 0o700 });
+			const descriptor = fs.openSync(lockPath, "wx", 0o600);
+			fs.writeFileSync(descriptor, owner);
+			fs.closeSync(descriptor);
+			return () => {
+				try {
+					exactUnlinkCapabilityLock(lockPath, owner);
+				} catch {
+					// A crashed owner was already reaped.
+				}
+			};
+		} catch (error) {
+			if (!(error && typeof error === "object" && (error as { code?: unknown }).code === "EEXIST")) return;
+			try {
+				const lockOwner = fs.readFileSync(lockPath, "utf8");
+				const ownerPid = Number(lockOwner.split(":", 1)[0]);
+				const ownerIsAlive = Number.isSafeInteger(ownerPid) && ownerPid > 0 && isProcessAlive(ownerPid);
+				const staleOwner =
+					!ownerIsAlive && Date.now() - fs.statSync(lockPath).mtimeMs > CACHE_MUTATION_LOCK_STALE_MS;
+				if (staleOwner && !exactUnlinkCapabilityLock(lockPath, lockOwner)) {
+					Atomics.wait(sleeper, 0, 0, 10);
+					continue;
+				}
+			} catch {
+				// The lock changed while this waiter was being inspected.
+			}
+			Atomics.wait(sleeper, 0, 0, 10);
+		}
+	}
+}
+
+function exactUnlinkCapabilityLock(lockPath: string, expectedOwner: string): boolean {
+	// Open the lock first and read bytes + identity from the SAME descriptor: the
+	// pinned inode cannot be recycled or substituted while the handle is open, so
+	// a replacement owner that lands at the pathname after the read can never be
+	// mistaken for the record whose bytes authorized this removal.
+	const descriptor = fs.openSync(lockPath, "r");
+	let bytes: Buffer;
+	let stat: import("node:fs").BigIntStats;
+	try {
+		bytes = fs.readFileSync(descriptor);
+		if (bytes.toString("utf8") !== expectedOwner) return false;
+		stat = fs.fstatSync(descriptor, { bigint: true });
+		beforeLockExactUnlinkForTests?.(lockPath);
+		if (!stat.isFile()) return false;
+	} finally {
+		fs.closeSync(descriptor);
+	}
+	const parent = fs.statSync(path.dirname(lockPath), { bigint: true });
+	if (!parent.isDirectory()) return false;
+	if (!nativeExactUnlinkBindings)
+		nativeExactUnlinkBindings = require("@gajae-code/natives") as NativeExactUnlinkBindings;
+	const bindings = nativeExactUnlinkBindings;
+	const result = bindings.exactUnlink(lockPath, {
+		dev: stat.dev,
+		ino: stat.ino,
+		nlink: stat.nlink,
+		parentDev: parent.dev,
+		parentIno: parent.ino,
+		size: stat.size,
+		mtimeNs: stat.mtimeNs,
+		sha256: crypto.createHash("sha256").update(bytes).digest("hex"),
+		quarantineName: `.tool-choice-capability-lock-${crypto.randomUUID()}`,
+	});
+	return (
+		result.ok ||
+		(result.code === "cleanup_pending" &&
+			result.payloadDurable === true &&
+			result.detachedPath !== undefined &&
+			result.retainedSuccessorPath === undefined &&
+			result.retainedUnknownPath === undefined)
+	);
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		// EPERM means the process exists but may not be signalable; only ESRCH
+		// proves the pid is gone. Any other outcome is treated as alive so an
+		// uncertain owner is never reaped as stale.
+		return (error as { code?: string }).code !== "ESRCH";
 	}
 }
 

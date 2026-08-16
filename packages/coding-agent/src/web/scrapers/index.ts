@@ -161,13 +161,15 @@ export {
 	handleYouTube,
 };
 
-export const specialHandlers: SpecialHandler[] = [
+export const specialHandlers: SpecialHandler[] = [];
+
+specialHandlers.push(
 	// Git hosting
 	handleGitHubGist,
 	handleGitHub,
 	handleGitLab,
 	// Video/Media
-	handleYouTube,
+	(url, timeout, signal) => handleYouTube(url, timeout, signal),
 	handleVimeo,
 	handleSpotify,
 	handleDiscogs,
@@ -203,7 +205,7 @@ export const specialHandlers: SpecialHandler[] = [
 	handleBrew,
 	handlePyPI,
 	handleCratesIo,
-	handleDockerHub,
+	(url, timeout, signal) => handleDockerHub(url, timeout, signal),
 	handleFdroid,
 	handleFlathub,
 	handleGoPkg,
@@ -249,4 +251,4 @@ export const specialHandlers: SpecialHandler[] = [
 	handleSpdx,
 	handleWikidata,
 	handleWikipedia,
-];
+);
