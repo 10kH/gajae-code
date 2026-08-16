@@ -8578,6 +8578,25 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000
 		},
+		"gemini-3.7-flash-high": {
+			"id": "gemini-3.7-flash-high",
+			"name": "Gemini 3.7 Flash",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
 		"gemini-3.6-flash-low": {
 			"id": "gemini-3.6-flash-low",
 			"name": "Gemini 3.6 Flash Low",
@@ -8597,9 +8616,47 @@
 			"contextWindow": 200000,
 			"maxTokens": 64000
 		},
+		"gemini-3.7-flash-low": {
+			"id": "gemini-3.7-flash-low",
+			"name": "Gemini 3.7 Flash Low",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
 		"gemini-3.6-flash-medium": {
 			"id": "gemini-3.6-flash-medium",
 			"name": "Gemini 3.6 Flash Medium",
+			"api": "cursor-agent",
+			"provider": "cursor",
+			"baseUrl": "https://api2.cursor.sh",
+			"reasoning": false,
+			"input": [
+				"text"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 200000,
+			"maxTokens": 64000
+		},
+		"gemini-3.7-flash-medium": {
+			"id": "gemini-3.7-flash-medium",
+			"name": "Gemini 3.7 Flash Medium",
 			"api": "cursor-agent",
 			"provider": "cursor",
 			"baseUrl": "https://api2.cursor.sh",
@@ -13070,7 +13127,7 @@
 			},
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -14947,7 +15004,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "google-level",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -15728,6 +15785,31 @@
 				"maxLevel": "high"
 			}
 		},
+		"gemini-3.7-flash-high": {
+			"id": "gemini-3.7-flash-high",
+			"name": "Gemini 3.7 Flash (High) (Antigravity)",
+			"api": "google-gemini-cli",
+			"provider": "google-antigravity",
+			"baseUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 65536,
+			"thinking": {
+				"mode": "google-level",
+				"minLevel": "low",
+				"maxLevel": "high"
+			}
+		},
 		"gemini-3.6-flash-low": {
 			"id": "gemini-3.6-flash-low",
 			"name": "Gemini 3.6 Flash (Low) (Antigravity)",
@@ -15750,6 +15832,31 @@
 			"thinking": {
 				"mode": "google-level",
 				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"gemini-3.7-flash-low": {
+			"id": "gemini-3.7-flash-low",
+			"name": "Gemini 3.7 Flash (Low) (Antigravity)",
+			"api": "google-gemini-cli",
+			"provider": "google-antigravity",
+			"baseUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 65536,
+			"thinking": {
+				"mode": "google-level",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -15778,6 +15885,31 @@
 				"maxLevel": "high"
 			}
 		},
+		"gemini-3.7-flash-medium": {
+			"id": "gemini-3.7-flash-medium",
+			"name": "Gemini 3.7 Flash (Medium) (Antigravity)",
+			"api": "google-gemini-cli",
+			"provider": "google-antigravity",
+			"baseUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 65536,
+			"thinking": {
+				"mode": "google-level",
+				"minLevel": "low",
+				"maxLevel": "high"
+			}
+		},
 		"gemini-3.6-flash-tiered": {
 			"id": "gemini-3.6-flash-tiered",
 			"name": "gemini-3.6-flash-tiered",
@@ -15800,6 +15932,31 @@
 			"thinking": {
 				"mode": "google-level",
 				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"gemini-3.7-flash-tiered": {
+			"id": "gemini-3.7-flash-tiered",
+			"name": "gemini-3.7-flash-tiered",
+			"api": "google-gemini-cli",
+			"provider": "google-antigravity",
+			"baseUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 65536,
+			"thinking": {
+				"mode": "google-level",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -16092,6 +16249,31 @@
 			"thinking": {
 				"mode": "google-level",
 				"minLevel": "minimal",
+				"maxLevel": "high"
+			}
+		},
+		"gemini-3.7-flash": {
+			"id": "gemini-3.7-flash",
+			"name": "Gemini 3.7 Flash",
+			"api": "google-gemini-cli",
+			"provider": "google-gemini-cli",
+			"baseUrl": "https://cloudcode-pa.googleapis.com",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0.75,
+				"output": 3.75,
+				"cacheRead": 0.075,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 65536,
+			"thinking": {
+				"mode": "google-level",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		}
@@ -65703,7 +65885,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "google-level",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -70058,7 +70240,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -70083,7 +70265,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -83672,7 +83854,7 @@
 			"maxTokens": 65536,
 			"thinking": {
 				"mode": "budget",
-				"minLevel": "minimal",
+				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},

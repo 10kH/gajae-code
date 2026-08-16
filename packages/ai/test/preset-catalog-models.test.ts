@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { Effort } from "../src/model-thinking";
-import { getBundledModel } from "../src/models";
+import type { GeneratedProvider } from "../src/models";
+import { getBundledModel, getBundledModels, getBundledProviders } from "../src/models";
+
+function gemini37SiblingId(modelId: string): string {
+	return modelId.replaceAll("gemini-3.6-flash", "gemini-3.7-flash").replaceAll("gemini-3-6-flash", "gemini-3-7-flash");
+}
 
 describe("preset catalog model entries", () => {
 	test("bundles kimi-code/kimi-k2.7-code", () => {
@@ -46,6 +51,89 @@ describe("preset catalog model entries", () => {
 		expect(model.contextWindow).toBe(1_048_576);
 		expect(model.maxTokens).toBe(65_536);
 		expect(model.thinking).toEqual({ mode: "google-level", minLevel: Effort.Minimal, maxLevel: Effort.High });
+	});
+
+	test("bundles google/gemini-3.7-flash flagship", () => {
+		const model = getBundledModel("google", "gemini-3.7-flash");
+
+		expect(model.id).toBe("gemini-3.7-flash");
+		expect(model.provider).toBe("google");
+		expect(model.api).toBe("google-generative-ai");
+		expect(model.baseUrl).toBe("https://generativelanguage.googleapis.com/v1beta");
+		expect(model.name).toBe("Gemini 3.7 Flash");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toContain("image");
+		expect(model.contextWindow).toBe(1_048_576);
+		expect(model.maxTokens).toBe(65_536);
+		expect(model.cost).toEqual({ input: 0.75, output: 3.75, cacheRead: 0.075, cacheWrite: 0 });
+		expect(model.thinking).toEqual({ mode: "google-level", minLevel: Effort.Low, maxLevel: Effort.High });
+	});
+
+	test("bundles google-gemini-cli/gemini-3.7-flash", () => {
+		const model = getBundledModel("google-gemini-cli", "gemini-3.7-flash");
+
+		expect(model.id).toBe("gemini-3.7-flash");
+		expect(model.provider).toBe("google-gemini-cli");
+		expect(model.api).toBe("google-gemini-cli");
+		expect(model.baseUrl).toBe("https://cloudcode-pa.googleapis.com");
+		expect(model.name).toBe("Gemini 3.7 Flash");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toContain("image");
+		expect(model.contextWindow).toBe(1_048_576);
+		expect(model.maxTokens).toBe(65_536);
+		expect(model.thinking).toEqual({ mode: "google-level", minLevel: Effort.Low, maxLevel: Effort.High });
+	});
+
+	test("mirrors every bundled Gemini 3.6 Flash selector onto 3.7", () => {
+		const missing: string[] = [];
+		const mismatched: string[] = [];
+
+		for (const provider of getBundledProviders()) {
+			const models = getBundledModels(provider as GeneratedProvider);
+			for (const source of models) {
+				if (!/gemini-3[.-]6-flash/.test(source.id)) continue;
+				if (source.id.endsWith("-minimal")) continue;
+				const siblingId = gemini37SiblingId(source.id);
+				const sibling = getBundledModel(provider as GeneratedProvider, siblingId);
+				if (!sibling) {
+					missing.push(`${provider}/${siblingId}`);
+					continue;
+				}
+				if (
+					sibling.api !== source.api ||
+					sibling.provider !== source.provider ||
+					sibling.baseUrl !== source.baseUrl
+				) {
+					mismatched.push(`${provider}/${siblingId}`);
+				}
+			}
+		}
+
+		expect(missing).toEqual([]);
+		expect(mismatched).toEqual([]);
+		expect(getBundledModel("cursor", "gemini-3.7-flash-minimal")).toBeUndefined();
+	});
+
+	test("pins google-level Gemini 3.7 Flash thinking to low/medium/high", () => {
+		const selectors = [
+			["google", "gemini-3.7-flash"],
+			["google-gemini-cli", "gemini-3.7-flash"],
+			["google-antigravity", "gemini-3.7-flash-high"],
+			["google-antigravity", "gemini-3.7-flash-low"],
+			["google-antigravity", "gemini-3.7-flash-medium"],
+			["google-antigravity", "gemini-3.7-flash-tiered"],
+			["opencode-zen", "gemini-3.7-flash"],
+		] as const;
+
+		for (const [provider, id] of selectors) {
+			const model = getBundledModel(provider, id);
+			expect(model, `${provider}/${id}`).toBeDefined();
+			expect(model.thinking, `${provider}/${id}`).toEqual({
+				mode: "google-level",
+				minLevel: Effort.Low,
+				maxLevel: Effort.High,
+			});
+		}
 	});
 
 	test("bundles minimax-code/MiniMax-M3 canonical id (issue #3896)", () => {
