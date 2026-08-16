@@ -533,8 +533,14 @@ function createEmptyUsage(): AssistantMessage["usage"] {
 	};
 }
 
+/** @internal Exported for tests. */
+export function formatCodexUserAgent(platform: string, release: string, arch: string): string {
+	const sanitize = (value: string): string => value.replace(/[^\x20-\x7e]/g, "");
+	return `pi/${packageJson.version} (${sanitize(platform)} ${sanitize(release)}; ${sanitize(arch)})`;
+}
+
 function getCodexUserAgent(): string {
-	return `pi/${packageJson.version} (${os.platform()} ${os.release()}; ${os.arch()})`;
+	return formatCodexUserAgent(os.platform(), os.release(), os.arch());
 }
 
 function getCodexServiceTierCostMultiplier(
