@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.14.0] - 2026-08-17
 - Documented how to run GJC inside external agent shells. `README.md` gains a support-rated integration table for [Paseo](https://paseo.sh) (★★★★★ — `gjc setup paseo` writes a conformance-tested ACP provider), [Orca](https://onorca.dev) (★★★★ — GJC runs as a custom CLI agent per worktree), and [T3 Code](https://t3.codes) (★★★ experimental — no GJC harness exists upstream yet), and [`docs/terminal-app-integrations.md`](../../docs/terminal-app-integrations.md) carries the per-host setup, verification, cancel-semantics, and troubleshooting detail. The T3 Code row is deliberately marked unsupported rather than advertising an install command for a bridge that does not exist.
 - Added the `commandcode-goat` model profile for the Command Code GOAT provider, assigning GLM-5.3 to the default role, DeepSeek V4 Flash to execution, Kimi K3 to planning, GLM-5.2 to criticism, and DeepSeek V4 Pro to architecture.
 

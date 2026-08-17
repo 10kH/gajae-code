@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-17
+
 ### Fixed
 
 - Non-managed lossless response staging now commits its buffered lifecycle and switches to ordinary pass-through publication when the provisional event cap is reached, instead of turning a large reasoning-only response into a fatal `local_snapshot_failure`. Managed fallback attempts keep the strict bounded-buffer rejection required for atomic retry and provider-fallback isolation.
