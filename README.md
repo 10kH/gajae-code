@@ -464,7 +464,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/codebase-overview.md](docs/code
 
 ## Contributors & lineage
 
-Thanks to [Yeachan-Heo](https://github.com/Yeachan-Heo), [IYENTeam](https://github.com/IYENTeam), [HaD0Yun](https://github.com/HaD0Yun), and [probepark](https://github.com/probepark). GJC builds on lessons from a small family of agent harnesses; historical attribution lives in [NOTICE.md](NOTICE.md).
+Thanks to [Yeachan-Heo](https://github.com/Yeachan-Heo), [IYENTeam](https://github.com/IYENTeam), [HaD0Yun](https://github.com/HaD0Yun), [probepark](https://github.com/probepark), and [snowykr](https://github.com/snowykr). Repository maintainers and their GitHub access are listed in [MAINTAINERS.md](MAINTAINERS.md). GJC builds on lessons from a small family of agent harnesses; historical attribution lives in [NOTICE.md](NOTICE.md).
 
 ## License
 
