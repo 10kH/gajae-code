@@ -604,7 +604,7 @@ export function computeConfidence(
 export interface AutoresearchExperimentResult {
 	runNumber: number;
 	commit: string;
-	metric: number;
+	metric: number | null;
 	metrics: NumericMetricMap;
 	status: ExperimentStatus;
 	description: string;
@@ -654,7 +654,7 @@ export function buildAutoresearchExperimentState(
 		const result: AutoresearchExperimentResult = {
 			runNumber: run.runNumber,
 			commit: run.commitHash ?? "",
-			metric: run.metric ?? 0,
+			metric: run.metric,
 			metrics: { ...run.metrics },
 			status: run.status,
 			description: run.description ?? "",

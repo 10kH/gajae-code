@@ -169,7 +169,7 @@ export function renderDashboardLines(input: AutoresearchDashboardInput, width = 
 	}
 	if (best) {
 		let progress = `Best: ${formatNum(best.metric, state.metricUnit)} (#${best.runNumber})`;
-		if (baseline !== null && baseline !== 0 && best.metric !== baseline) {
+		if (baseline !== null && baseline !== 0 && best.metric !== null && best.metric !== baseline) {
 			const delta = ((best.metric - baseline) / baseline) * 100;
 			const sign = delta > 0 ? "+" : "";
 			progress += ` ${sign}${delta.toFixed(1)}%`;
@@ -271,9 +271,9 @@ function renderSecondarySummary(
 function findBestResult(state: AutoresearchExperimentState): AutoresearchExperimentResult | null {
 	let best: AutoresearchExperimentResult | null = null;
 	for (const result of state.results) {
-		if (result.segment !== state.currentSegment || result.status !== "keep" || result.flagged || result.metric <= 0)
-			continue;
-		if (!best || isBetter(result.metric, best.metric, state.bestDirection)) {
+		if (result.segment !== state.currentSegment || result.status !== "keep" || result.flagged) continue;
+		if (result.metric === null || result.metric <= 0) continue;
+		if (!best || best.metric === null || isBetter(result.metric, best.metric, state.bestDirection)) {
 			best = result;
 		}
 	}

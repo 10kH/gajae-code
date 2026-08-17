@@ -786,12 +786,21 @@ export async function autoresearchLogRun(input: {
 		resolveGjcSessionForWrite(input.cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const store = await autoresearchRunsStore(input.cwd, sessionId);
 	if (!store.config) throw new AutoresearchCommandError(2, "autoresearch run logging requires an active mission");
-	const started = await store.startRun({ command: "research observation" });
-	await store.completeRun(started.runId, {
+	// Reuse the caller-supplied pending run identity when it exists so runs.jsonl and
+	// the ledger reference the same run; otherwise synthesize one record.
+	const existing = store.listRuns().find(run => run.runId === runId);
+	let targetRunId: string;
+	if (existing && existing.status === null && existing.abandonedAt === null) {
+		targetRunId = existing.runId;
+	} else {
+		const started = await store.startRun({ command: "research observation" });
+		targetRunId = started.runId;
+	}
+	await store.completeRun(targetRunId, {
 		exitCode: status === "crash" || status === "checks_failed" ? 1 : 0,
 		timedOut: false,
 	});
-	await store.logRun(started.runId, {
+	await store.logRun(targetRunId, {
 		status,
 		description,
 		...(input.metric === undefined ? {} : { metric: input.metric }),
@@ -800,7 +809,7 @@ export async function autoresearchLogRun(input: {
 		input.cwd,
 		{
 			event: "run_logged",
-			run_id: runId,
+			run_id: targetRunId,
 			status,
 			description,
 			...(input.slug?.trim() ? { slug: input.slug.trim() } : {}),
@@ -1087,9 +1096,12 @@ export async function runNativeAutoresearchCommand(
 							ok: true,
 							cleared: receipt.cleared,
 							mission_path: receipt.missionPath,
+							...(receipt.retiredTo ? { retired_to: receipt.retiredTo } : {}),
 							ledger_event: receipt.ledgerEvent.event,
 						})
-					: `autoresearch cleared=${receipt.cleared}\nmission_path=${receipt.missionPath}\n`,
+					: `autoresearch cleared=${receipt.cleared}\nmission_path=${receipt.missionPath}\n${
+							receipt.retiredTo ? `retired_to=${receipt.retiredTo}\n` : ""
+						}`,
 			};
 		}
 		if (verb === "write") {
@@ -1099,6 +1111,9 @@ export async function runNativeAutoresearchCommand(
 				"--slug",
 				"--deliverable",
 				"--constraint",
+				"--primary-metric",
+				"--metric-unit",
+				"--metric-direction",
 				"--json",
 			]);
 			const objective = flagValue(args, "--goal");
@@ -1114,6 +1129,9 @@ export async function runNativeAutoresearchCommand(
 				slug,
 				deliverables: repeatedFlagValues(args, "--deliverable"),
 				constraints: repeatedFlagValues(args, "--constraint"),
+				primaryMetric: flagValue(args, "--primary-metric"),
+				metricUnit: flagValue(args, "--metric-unit"),
+				metricDirection: flagValue(args, "--metric-direction"),
 			});
 			await reconcileAutoresearchState(cwd, receipt.mission);
 			return {
@@ -1467,19 +1485,21 @@ function summarizePromptAsi(asi: unknown): string | null {
 	return summary.length > 0 ? summary.slice(0, 220) : null;
 }
 
-function formatPromptMetricValue(value: number, unit: string): string {
+function formatPromptMetricValue(value: number | null, unit: string): string {
+	if (value === null) return `n/a${unit ? ` ${unit}` : ""}`;
 	if (Number.isInteger(value)) return `${value}${unit}`;
 	return `${value.toFixed(2)}${unit}`;
 }
 
 function findPromptBestRun(state: {
-	results: Array<{ segment: number; status: string; metric: number; flagged: boolean; runNumber: number }>;
+	results: Array<{ segment: number; status: string; metric: number | null; flagged: boolean; runNumber: number }>;
 	currentSegment: number;
 	bestDirection: "lower" | "higher";
 }): { metric: number; runNumber: number } | null {
 	let best: { metric: number; runNumber: number } | null = null;
 	for (const result of state.results) {
 		if (result.segment !== state.currentSegment || result.status !== "keep" || result.flagged) continue;
+		if (result.metric === null) continue;
 		if (!best || (state.bestDirection === "lower" ? result.metric < best.metric : result.metric > best.metric)) {
 			best = { metric: result.metric, runNumber: result.runNumber };
 		}

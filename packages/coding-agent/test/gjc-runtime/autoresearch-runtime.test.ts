@@ -677,6 +677,75 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 			/could not read spec/,
 		);
 	});
+	it("clear receipts surface the retired artifact location", async () => {
+		const root = await tempDir();
+		await runNativeAutoresearchCommand(
+			["write", "--goal", "Measure parser throughput", "--mode", "data", "--slug", "parser-throughput"],
+			root,
+		);
+		const clear = await runNativeAutoresearchCommand(["clear", "--json"], root);
+		expect(clear.status).toBe(0);
+		const payload = JSON.parse(clear.stdout!) as { retired_to?: string };
+		expect(typeof payload.retired_to).toBe("string");
+		expect(payload.retired_to!.length).toBeGreaterThan(0);
+		expect(await Bun.file(path.join(payload.retired_to!, "mission.json")).text()).toContain("parser-throughput");
+		const humanClear = await runNativeAutoresearchCommand(["clear"], root);
+		expect(humanClear.status).toBe(0);
+	});
+
+	it("cold intake write accepts the primary metric contract flags", async () => {
+		const root = await tempDir();
+		const write = await runNativeAutoresearchCommand(
+			[
+				"write",
+				"--goal",
+				"Raise parser throughput",
+				"--mode",
+				"data",
+				"--slug",
+				"parser-throughput",
+				"--primary-metric",
+				"throughput",
+				"--metric-unit",
+				"ops/s",
+				"--metric-direction",
+				"higher",
+			],
+			root,
+		);
+		expect(write.status).toBe(0);
+		const read = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(read.mission?.primaryMetric).toBe("throughput");
+		expect(read.mission?.metricUnit).toBe("ops/s");
+		expect(read.mission?.metricDirection).toBe("higher");
+	});
+
+	it("log-run reuses the supplied pending run identity", async () => {
+		const root = await tempDir();
+		await runNativeAutoresearchCommand(
+			["write", "--goal", "Measure parser throughput", "--mode", "data", "--slug", "parser-throughput"],
+			root,
+		);
+		const paths = getAutoresearchPaths(root, TEST_SESSION_ID);
+		const store = await autoresearchRunsStore(root, TEST_SESSION_ID);
+		const started = await store.startRun({ command: "research observation" });
+		const runsPath = path.join(paths.dir, "runs.jsonl");
+		const result = await runNativeAutoresearchCommand(
+			["log-run", "--run-id", started.runId, "--status", "crash", "--description", "harness exploded"],
+			root,
+		);
+		expect(result.status).toBe(0);
+		const runs = (await Bun.file(runsPath).text())
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as { runId: string; status: string | null });
+		const target = runs.filter(run => run.runId === started.runId);
+		expect(target).toHaveLength(1);
+		expect(target[0].status).toBe("crash");
+		const ledger = (await autoresearchRead(root, TEST_SESSION_ID)).ledger;
+		const runLogged = ledger.filter(entry => entry.event === "run_logged");
+		expect(runLogged.map(entry => (entry as { run_id?: string }).run_id)).toEqual([started.runId]);
+	});
 });
 
 interface AutoresearchVerdictReceiptLike {
