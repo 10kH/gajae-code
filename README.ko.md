@@ -29,6 +29,7 @@
   <a href="#변경-전에-계획">워크플로</a> ·
   <a href="#토큰을-덜-쓰기">토큰 다이어트</a> ·
   <a href="#openclaw--hermes가-gjc를-부리게-하기">컨트롤러</a> ·
+  <a href="#paseo--orca--t3-code-안에서-gjc-돌리기">에이전트 셸</a> ·
   <a href="#문서">문서</a>
 </p>
 
@@ -244,6 +245,64 @@ The session command selector accepts only "gjc" or "gjc --worktree [name]".
 - [외부 컨트롤러 통합 가이드](docs/bot-integration.md) · [Coordinator MCP 브리지](docs/hermes-mcp-bridge.md)
 - [외부 컨트롤러 / 봇](docs/bot-integration.md) — 프로바이더 독립 스모크; [`docs/aside-integration.md`](docs/aside-integration.md)는 옵트인 검색/컨텍스트 사이드카를 다룹니다
 - [SDK & 와이어 프로토콜](docs/sdk.md) · [SDK 세션 CLI](docs/sdk-session-cli.md) · [외부 제어 준비도](docs/external-control-readiness.md)
+
+---
+
+## Paseo · Orca · T3 Code 안에서 GJC 돌리기
+
+터미널 대신 데스크톱/모바일 에이전트 셸을 쓰고 있다면, GJC는 대표적인 세 곳에 붙는다 — 지원 수준은 솔직하게 서로 다르다.
+
+<table>
+<tr>
+<th width="120">호스트</th><th width="110">지원 수준</th><th>얻는 것</th><th>설정</th>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://paseo.sh"><img src="https://www.google.com/s2/favicons?domain=paseo.sh&sz=64" width="28" alt="Paseo 로고" /><br/><strong>Paseo</strong></a><br/>
+  <sub><a href="https://github.com/getpaseo/paseo">저장소</a></sub>
+</td>
+<td align="center">★★★★★<br/><sub>1급 지원</sub></td>
+<td>GJC가 스스로 설치하는 네이티브 ACP 프로바이더. 모델 카탈로그, Default/Plan 모드, thinking 레벨, 실제 권한 승인 프롬프트, 소유 서브에이전트까지 끊는 취소, 모바일 제어.</td>
+<td><code>gjc setup paseo</code><br/><sub>이후 <code>paseo daemon restart</code></sub></td>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://onorca.dev"><img src="https://www.google.com/s2/favicons?domain=onorca.dev&sz=64" width="28" alt="Orca 로고" /><br/><strong>Orca</strong></a><br/>
+  <sub><a href="https://github.com/stablyai/orca">저장소</a></sub>
+</td>
+<td align="center">★★★★☆<br/><sub>필드 하나로 동작</sub></td>
+<td>GJC가 커스텀 CLI 에이전트로 실행되며 세션마다 워크트리가 분리된다. Orca의 diff 리뷰, 터미널 분할, SSH 워크트리, 모바일 컴패니언을 그대로 쓴다. 사용량 추적·계정 핫스왑은 아직 없다.</td>
+<td><strong>Settings → Agents</strong><br/>커맨드에 <code>gjc</code> 추가</td>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://t3.codes"><img src="https://www.google.com/s2/favicons?domain=t3.codes&sz=64" width="28" alt="T3 Code 로고" /><br/><strong>T3 Code</strong></a><br/>
+  <sub><a href="https://github.com/pingdotgg/t3code">저장소</a></sub>
+</td>
+<td align="center">★★★☆☆<br/><sub>실험적</sub></td>
+<td>T3 Code는 아직 Codex·Claude·Cursor·Grok·OpenCode 하네스만 제공하고 GJC 하네스가 업스트림에 없다. 지금은 나란히 띄워 쓰고, 네이티브 프로바이더는 작업 중이다.</td>
+<td><sub>아직 한 줄 설치는 없음 — 가이드 참고</sub></td>
+</tr>
+</table>
+
+Paseo는 이 블록 하나로 끝난다:
+
+```sh
+gjc setup paseo            # ACP 프로바이더 엔트리 작성 + 백업, 데몬은 절대 대신 재시작하지 않음
+paseo daemon restart
+paseo provider ls          # gjc가 `available`로 보여야 한다
+paseo run --provider gjc --cwd /path/to/repo "프롬프트"
+
+gjc setup paseo --check    # pass / stale / drift 진단, --json으로 기계 판독
+gjc setup paseo --remove   # GJC가 직접 만든 키만 롤백
+```
+
+Orca는 필드 하나다: GJC를 설치(`bun install -g @gajae-code/coding-agent`)하고 커맨드 `gjc`에 인자 없이 커스텀
+에이전트를 추가한다. Orca는 권한 우회 플래그가 있는 에이전트에 그 플래그를 미리 넣어 주는데, GJC는 설계상 그런
+플래그가 없다 — 인자는 비워 두고 GJC 자체 승인 게이트를 그대로 살려 둔다.
+
+**[전체 통합 가이드 → docs/terminal-app-integrations.md](docs/terminal-app-integrations.md)** — 호스트별 설정,
+검증, 취소 의미, 트러블슈팅 표, 그리고 각 호스트가 아직 닿지 못하는 영역까지.
 
 ---
 

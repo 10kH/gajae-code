@@ -29,6 +29,7 @@
   <a href="#plan-before-mutation">Workflow</a> ·
   <a href="#spend-fewer-tokens">Token Diet</a> ·
   <a href="#let-openclaw--hermes-drive-gjc">Controllers</a> ·
+  <a href="#run-gjc-inside-paseo-orca-or-t3-code">Agent Shells</a> ·
   <a href="#documentation">Docs</a>
 </p>
 
@@ -256,6 +257,65 @@ For a controller that drives one live session directly, every session also expos
 
 ---
 
+## Run GJC inside Paseo, Orca, or T3 Code
+
+Prefer a desktop/mobile agent shell over a bare terminal? GJC plugs into the three popular ones — at
+three honestly different levels of support.
+
+<table>
+<tr>
+<th width="120">Host</th><th width="110">Support</th><th>What you get</th><th>Setup</th>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://paseo.sh"><img src="https://www.google.com/s2/favicons?domain=paseo.sh&sz=64" width="28" alt="Paseo logo" /><br/><strong>Paseo</strong></a><br/>
+  <sub><a href="https://github.com/getpaseo/paseo">repo</a></sub>
+</td>
+<td align="center">★★★★★<br/><sub>first-class</sub></td>
+<td>Native ACP provider installed by GJC itself. Model catalog, Default/Plan modes, thinking levels, real permission prompts, cancel that can terminate owned subagents, mobile control.</td>
+<td><code>gjc setup paseo</code><br/><sub>then <code>paseo daemon restart</code></sub></td>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://onorca.dev"><img src="https://www.google.com/s2/favicons?domain=onorca.dev&sz=64" width="28" alt="Orca logo" /><br/><strong>Orca</strong></a><br/>
+  <sub><a href="https://github.com/stablyai/orca">repo</a></sub>
+</td>
+<td align="center">★★★★☆<br/><sub>works, one field</sub></td>
+<td>GJC runs as a custom CLI agent, one worktree per session, with Orca's diff review, terminal splits, SSH worktrees, and mobile companion. No usage tracking or account hot-swap yet.</td>
+<td><strong>Settings → Agents</strong><br/>add command <code>gjc</code></td>
+</tr>
+<tr>
+<td align="center">
+  <a href="https://t3.codes"><img src="https://www.google.com/s2/favicons?domain=t3.codes&sz=64" width="28" alt="T3 Code logo" /><br/><strong>T3 Code</strong></a><br/>
+  <sub><a href="https://github.com/pingdotgg/t3code">repo</a></sub>
+</td>
+<td align="center">★★★☆☆<br/><sub>experimental</sub></td>
+<td>T3 Code ships harnesses for Codex, Claude, Cursor, Grok and OpenCode only — there is no GJC harness upstream yet. Run GJC beside it; the native provider is in flight.</td>
+<td><sub>not one-command yet — see the guide</sub></td>
+</tr>
+</table>
+
+Paseo, in one paste:
+
+```sh
+gjc setup paseo            # writes the ACP provider entry, backs up, never restarts your daemon
+paseo daemon restart
+paseo provider ls          # gjc must read `available`
+paseo run --provider gjc --cwd /path/to/repo "your prompt"
+
+gjc setup paseo --check    # pass / stale / drift, with a machine-readable --json
+gjc setup paseo --remove   # rolls back only the keys GJC itself created
+```
+
+Orca, in one field: install GJC (`bun install -g @gajae-code/coding-agent`), then add a custom agent
+with command `gjc` and no arguments. Orca pre-fills a permission-bypass flag for agents that expose
+one — GJC has none by design, so leave the arguments empty and keep GJC's own approval gates.
+
+**[Full integration guide → docs/terminal-app-integrations.md](docs/terminal-app-integrations.md)** —
+per-host setup, verification, cancel semantics, troubleshooting tables, and what each host cannot reach yet.
+
+---
+
 ## Documentation
 
 Start at **[gajae-code.com](https://gajae-code.com)** or `docs/`:
@@ -263,6 +323,7 @@ Start at **[gajae-code.com](https://gajae-code.com)** or `docs/`:
 - [Install & updates](docs/install.md) · [Environment variables](docs/environment-variables.md) · [Keybindings](docs/keybindings.md) · [Themes](docs/theme.md)
 - [Models & providers](docs/models.md) · [Custom providers & multi-account routing](docs/custom-providers-and-multi-account.md) · [Multi-vendor profiles](docs/multi-vendor-profiles.md) · [Auth broker](docs/auth-broker-gateway.md)
 - [Customization authority, import, and trust](docs/customization.md) · [Skills](docs/skills.md) · [Hooks](docs/hooks.md) · [Standalone MCP](docs/standalone-mcp.md) · [Plugin bundles](docs/gjc-plugins.md)
+- [Terminal app integrations: Paseo · Orca · T3 Code](docs/terminal-app-integrations.md)
 - [Telegram](docs/telegram-onboarding.md) · [Bot integration](docs/bot-integration.md) · [SDK](docs/sdk.md) · [SDK session CLI](docs/sdk-session-cli.md)
 - [Sessions](docs/session.md) · [Compaction](docs/compaction.md) · [Memory](docs/memory.md) · [Secrets](docs/secrets.md)
 - [Codebase overview](docs/codebase-overview.md) · [Contributing / dev setup](CONTRIBUTING.md)
@@ -296,6 +357,9 @@ gjc setup defaults --check
 | Claude Code | `gjc --tmux` or `gjc --tmux --worktree <name>` | GJC does not become a Claude Code extension. |
 | OpenCode | `gjc` or `gjc --tmux` | External-runner workflow only today. |
 | Claw Code | `gjc --tmux --worktree <name>` | GJC does not install into or replace Claw Code. |
+| [Paseo](https://paseo.sh) | `gjc setup paseo` | GJC registers itself as an ACP provider and rolls itself back with `--remove`; Paseo owns its own config files. |
+| [Orca](https://onorca.dev) | `gjc` as a custom agent command | Orca launches GJC in its own worktree terminal; GJC keeps its own approval gates. |
+| [T3 Code](https://t3.codes) | none yet — experimental | No GJC harness upstream; run GJC beside it until the native provider lands. |
 | External controller / bot | Coordinator MCP, `gjc sdk session`, or a configured managed adapter | External controllers use broker-bound, credential-free surfaces rather than scrollback or direct endpoint transports. The host-neutral `gjc-sdk-*` skills compose `gjc sdk session` and install no coordinator integration. |
 
 For evaluating Aside as an opt-in search/context retrieval sidecar, see [`docs/aside-integration.md`](docs/aside-integration.md). For generic third-party bot setup and provider-independent smokes, see [`docs/bot-integration.md`](docs/bot-integration.md). For external-control readiness, see [`docs/external-control-readiness.md`](docs/external-control-readiness.md). For the wire protocol and machine interfaces, see [`docs/sdk.md`](docs/sdk.md).
