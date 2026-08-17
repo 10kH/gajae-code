@@ -1686,6 +1686,82 @@ describe("runSubprocess telemetry propagation", () => {
 		expect(forwarded.conversationId).toBeUndefined();
 	});
 
+	it("propagates a terminal local_buffer_overflow into localErrorSummary from the structured shape (#4618)", async () => {
+		// Free-form message deliberately carries marker text: the summary must
+		// be built from the structured shape only, never from this string.
+		const marker = "SECRET-PROMPT-MATERIAL-must-not-reach-receipt";
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: `Managed fallback attempt exceeded the provisional event buffer limit ... ${marker}`,
+				errorKind: "local_buffer_overflow",
+				bufferOverflow: {
+					stage: "overflow.staged",
+					exceeded: "bytes",
+					stagedEventCount: 9000,
+					stagedBytes: 4194304,
+					incomingEventBytes: 16777216,
+					maxStagedEvents: 10_000,
+					maxStagedBytes: 16 * 1024 * 1024,
+				},
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-overflow-propagation" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary).toMatchObject({
+			kind: "local_buffer_overflow",
+		});
+		expect(result.localErrorSummary?.summary).toContain("overflow.staged");
+		expect(result.localErrorSummary?.summary).toContain("exceeded=bytes");
+		expect(result.localErrorSummary?.summary).toContain("9000/10000 events");
+		expect(result.localErrorSummary?.summary).toContain("not a provider or context-window failure");
+		// Trust boundary: free-form message text never reaches the summary.
+		expect(result.localErrorSummary?.summary).not.toContain(marker);
+	});
+
+	it("degrades a self-labeled overflow without the structured shape to a neutral summary (#4618)", async () => {
+		const marker = "FORGED-TEXT-must-not-reach-parent";
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: `local_buffer_overflow: ${marker}`,
+				// Self-labeled kind WITHOUT the identity-checked shape.
+				errorKind: "local_buffer_overflow",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-forged-overflow-kind" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary?.kind).toBe("local_buffer_overflow");
+		// Neutral sentence only: the forged message text is not forwarded.
+		expect(result.localErrorSummary?.summary).not.toContain(marker);
+		expect(result.localErrorSummary?.summary).toContain("structured diagnostic unavailable");
+	});
+
+	it("keeps localErrorSummary undefined for an ordinary provider error (#4618 fallback isolation)", async () => {
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: "500 Internal Server Error",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-ordinary-error" });
+
+		expect(result.exitCode).toBe(1);
+		expect(result.localErrorSummary).toBeUndefined();
+		expect(result.error).toBe("500 Internal Server Error");
+	});
+
 	it("forwards no telemetry when the parent has none", async () => {
 		const createAgentSessionSpy = mockCreateAgentSession(buildSession());
 

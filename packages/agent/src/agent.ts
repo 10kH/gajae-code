@@ -25,7 +25,7 @@ import {
 	isCurrentComposerBashPolicyBlockedError,
 } from "@gajae-code/ai/providers/composer-discipline";
 import { extractHttpStatusFromError } from "@gajae-code/utils";
-import { agentLoop, agentLoopContinue } from "./agent-loop";
+import { agentLoop, agentLoopContinue, managedBufferOverflowDiagnostic } from "./agent-loop";
 import type { AppendOnlyContextManager } from "./append-only-context";
 import type { AttemptRunHandle, AttemptScope } from "./attempt-scope";
 import { createAttemptScopeAuthority } from "./attempt-scope";
@@ -2008,6 +2008,9 @@ export class Agent {
 				...(err?.errorKind === "local_snapshot_failure" || err?.errorKind === "local_buffer_overflow"
 					? { errorKind: err.errorKind as "local_snapshot_failure" | "local_buffer_overflow" }
 					: {}),
+				// Structured, identity-checked overflow shape so parent surfaces can
+				// render a trustworthy diagnostic without trusting errorMessage.
+				...(managedBufferOverflowDiagnostic(err) ? { bufferOverflow: managedBufferOverflowDiagnostic(err) } : {}),
 				timestamp: Date.now(),
 			} as AgentMessage;
 

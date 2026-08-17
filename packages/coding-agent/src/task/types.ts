@@ -427,6 +427,91 @@ export function createSetupFailureSummary(error: unknown): SetupFailureSummary {
 	};
 }
 
+/** Bounded, redaction-safe summary of a terminal local (non-provider) subagent failure. */
+export interface LocalErrorSummary {
+	kind: string;
+	summary: string;
+}
+
+/**
+ * Render the parent-facing summary of a structured overflow diagnostic. Built
+ * ONLY from the closed-vocabulary stage/exceeded literals and the numeric
+ * counters — no producer-controlled text participates, so a hostile or buggy
+ * child can inject nothing through this path (#4618).
+ */
+export function formatBufferOverflowSummary(overflow: {
+	stage: string;
+	exceeded: string;
+	stagedEventCount: number;
+	stagedBytes: number;
+	incomingEventBytes: number;
+	maxStagedEvents: number;
+	maxStagedBytes: number;
+}): string {
+	return (
+		`staging-buffer overflow at ${overflow.stage} (exceeded=${overflow.exceeded}); ` +
+		`retained ${overflow.stagedEventCount}/${overflow.maxStagedEvents} events, ` +
+		`${overflow.stagedBytes} staged bytes; rejected event ${overflow.incomingEventBytes} bytes; ` +
+		`projected ${overflow.stagedBytes + overflow.incomingEventBytes}/${overflow.maxStagedBytes} bytes. ` +
+		"Local gjc staging limit, not a provider or context-window failure; re-issuing reproduces it."
+	);
+}
+
+/**
+ * Build the safe parent-facing summary for a terminal local failure.
+ *
+ * Trust boundary: when the terminal message carries the agent runtime's
+ * structured `bufferOverflow` shape (attached only by an identity-checked
+ * `instanceof ManagedAttemptBufferOverflowError`), the summary is rendered
+ * exclusively from that shape's closed vocabulary and numbers. The free-form
+ * `errorMessage` is used ONLY for `local_snapshot_failure` (whose message is
+ * the runtime's own fixed sentence) — never for overflow, because a foreign
+ * error can self-label `errorKind` and stuff arbitrary text into `message`.
+ */
+export function createLocalErrorSummary(
+	kind: unknown,
+	message: string | undefined,
+	overflow?: {
+		stage: string;
+		exceeded: string;
+		stagedEventCount: number;
+		stagedBytes: number;
+		incomingEventBytes: number;
+		maxStagedEvents: number;
+		maxStagedBytes: number;
+	},
+): LocalErrorSummary {
+	const normalizedKind = kind === "local_buffer_overflow" || kind === "local_snapshot_failure" ? kind : "local";
+	if (normalizedKind === "local_buffer_overflow" && overflow) {
+		return {
+			kind: normalizedKind,
+			summary: formatBufferOverflowSummary(overflow),
+		};
+	}
+	if (normalizedKind === "local_buffer_overflow") {
+		// No structured shape means the kind did not come from the trusted
+		// runtime path; degrade to the neutral sentence rather than forward
+		// untrusted message text.
+		return {
+			kind: normalizedKind,
+			summary: "Local staging-buffer overflow; structured diagnostic unavailable.",
+		};
+	}
+	return {
+		kind: normalizedKind,
+		summary: createSetupFailureSummary(
+			message ? new Error(message) : new Error("Subagent failed with a local error."),
+		).summary,
+	};
+}
+
+const ASSISTANT_LOCAL_ERROR_KINDS: ReadonlySet<string> = new Set(["local_buffer_overflow", "local_snapshot_failure"]);
+
+/** Whether an assistant terminal message carries a known local (non-provider) failure kind. */
+export function isAssistantLocalErrorKind(kind: unknown): kind is "local_buffer_overflow" | "local_snapshot_failure" {
+	return typeof kind === "string" && ASSISTANT_LOCAL_ERROR_KINDS.has(kind);
+}
+
 export interface TaskRecoveryArtifactRef {
 	uri: string;
 	sizeBytes: number;
@@ -473,6 +558,8 @@ export interface SingleResult {
 	/** Whether the resolved subagent model ran under the effective fast service tier. */
 	fastMode?: boolean;
 	error?: string;
+	/** Safe summary of a terminal local (non-provider) failure kind, e.g. `local_buffer_overflow`. */
+	localErrorSummary?: LocalErrorSummary;
 	/** Safe diagnostic for a failure before the subagent sent its first LLM request. */
 	setupFailure?: SetupFailureSummary;
 	aborted?: boolean;

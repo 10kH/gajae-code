@@ -12,7 +12,7 @@ import { subagentRunOutcomeFromSingleResult } from "../../src/task";
 import { runSubprocess } from "../../src/task/executor";
 import { buildTaskReceipt } from "../../src/task/receipt";
 import type { AgentDefinition, AgentProgress } from "../../src/task/types";
-import { createSetupFailureSummary, type SingleResult } from "../../src/task/types";
+import { createLocalErrorSummary, createSetupFailureSummary, type SingleResult } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 import { capCodePointsAndBytes, SubagentTool } from "../../src/tools/implementations";
 import type { SubagentToolDetails } from "../../src/tools/subagent";
@@ -274,6 +274,109 @@ describe("SubagentTool", () => {
 		expect(snapshot?.setupFailureSummary?.length ?? 0).toBeLessThanOrEqual(280);
 		expect(getText(result)).toContain(`Setup failure: ${snapshot?.setupFailureSummary}`);
 		await manager.dispose({ timeoutMs: 100 });
+	});
+	it("propagates and renders a structured local_buffer_overflow through the full async path (#4618)", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const marker = "FORGED-MESSAGE-must-not-render";
+		const singleResult = {
+			aborted: false,
+			exitCode: 1,
+			localErrorSummary: createLocalErrorSummary("local_buffer_overflow", `cover ${marker} text`, {
+				stage: "overflow.staged",
+				exceeded: "events",
+				stagedEventCount: 10_000,
+				stagedBytes: 1_048_576,
+				incomingEventBytes: 512,
+				maxStagedEvents: 10_000,
+				maxStagedBytes: 16 * 1024 * 1024,
+			}),
+		} satisfies Pick<SingleResult, "aborted" | "exitCode" | "localErrorSummary">;
+		const jobId = manager.register(
+			"task",
+			"launching subagent",
+			async () => subagentRunOutcomeFromSingleResult("Subagent failed.", singleResult),
+			{
+				id: "job-local-overflow",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-Overflow", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+
+		await manager.getJob(jobId)?.promise;
+		const result = await tool.execute("subagent-overflow", { action: "inspect", ids: ["0-Overflow"] });
+		const snapshot = result.details?.subagents[0];
+
+		// Full async propagation: SingleResult -> outcome -> AsyncJob -> snapshot.
+		expect(snapshot?.status).toBe("failed");
+		expect(snapshot?.localErrorSummary?.kind).toBe("local_buffer_overflow");
+		expect(snapshot?.localErrorSummary?.summary).toContain("overflow.staged");
+		expect(snapshot?.localErrorSummary?.summary).toContain("10000/10000 events");
+		// Free-form message text never reaches the snapshot.
+		expect(snapshot?.localErrorSummary?.summary).not.toContain(marker);
+
+		// Tool output names the kind with kind-conditional guidance.
+		const text = getText(result);
+		expect(text).toContain("Local failure (local_buffer_overflow)");
+		expect(text).toContain("staging-buffer limit");
+
+		// Cached renderer path: body renders the summary and the await cache
+		// signature participates (rendering twice must not break).
+		const theme = await getThemeByName("red-claw");
+		if (!theme) throw new Error("Expected test theme");
+		const render = (value: SubagentToolDetails) =>
+			Bun.stripANSI(
+				subagentToolRenderer
+					.renderResult(
+						{ content: [{ type: "text", text: "" }], details: value },
+						{ expanded: true, isPartial: false },
+						theme,
+					)
+					.render(160)
+					.join("\n"),
+			);
+		subagentBodyCacheTestHooks.reset();
+		const details = result.details as SubagentToolDetails;
+		const rendered1 = render(details);
+		expect(rendered1).toContain("Local failure (local_buffer_overflow)");
+		expect(rendered1).toContain("overflow.staged");
+		expect(rendered1).not.toContain(marker);
+		const rendered2 = render(details);
+		expect(rendered2).toBe(rendered1);
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("renders local_snapshot_failure with serialization-defect guidance, not staging-limit guidance (#4618)", async () => {
+		const theme = await getThemeByName("red-claw");
+		if (!theme) throw new Error("Expected test theme");
+		const details: SubagentToolDetails = {
+			subagents: [
+				{
+					id: "0-SnapshotFailure",
+					jobId: "job-snapshot-failure",
+					status: "failed",
+					label: "launching subagent",
+					agent: "executor",
+					agentSource: "bundled",
+					durationMs: 1,
+					localErrorSummary: { kind: "local_snapshot_failure", summary: "serializer rejected the event" },
+				},
+			],
+		};
+		const rendered = Bun.stripANSI(
+			subagentToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "" }], details },
+					{ expanded: true, isPartial: false },
+					theme,
+				)
+				.render(160)
+				.join("\n"),
+		);
+		expect(rendered).toContain("Local failure (local_snapshot_failure): serializer rejected the event");
+		expect(rendered).toContain("event-serialization defect");
+		expect(rendered).toContain("safe to retry");
+		expect(rendered).not.toContain("staging-buffer limit");
 	});
 	it("renders setup failures and invalidates the static body cache when the cause changes", async () => {
 		const theme = await getThemeByName("red-claw");

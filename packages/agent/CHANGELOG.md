@@ -16,6 +16,7 @@
 ### Added
 
 - `toolFailureEnvelope` / `isToolFailureEnvelope` / `ToolFailureEnvelope` name the result details the loop attaches when a tool call fails without the tool returning details of its own. The guard matches only that envelope, so a consumer can tell it apart from a tool that reports a `failureKind` alongside its own details before dereferencing a tool-owned detail shape.
+- `ManagedAttemptBufferOverflowError` (`local_buffer_overflow`) now reports its full shape everywhere it can reach: the rejecting `stage`, which cap tripped (`exceeded: events|bytes|both`), the retained post-compaction staged event/byte counts, the rejected event's own serialized size, and both caps. The typed error carries this as a structured object, the terminal `AssistantMessage` carries an identity-checked `bufferOverflow` copy (only the module-private error class can attach it, so a foreign self-labeled error cannot), and the surfaced message keeps its stable prefix and appends the same shape-only values stating this is a local staging-buffer limit that reproduces on re-issue, not a provider or context-window failure. Previously every overflow surfaced as one static sentence with no way to tell an event-cap from a byte-cap trip or to distinguish it from a model-context problem (#4618).
 
 ## [0.14.0] - 2026-08-17
 
