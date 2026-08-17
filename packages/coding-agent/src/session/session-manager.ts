@@ -5569,6 +5569,48 @@ function rehydrateColdSpillValue(
 	return Object.fromEntries(entries);
 }
 
+/**
+ * Enforce the provider-facing invariant that a tool call's `arguments` is an
+ * object, after cold-spill rehydration has had its say.
+ *
+ * `rehydrateColdSpillRef` reports an unrecoverable payload by returning the
+ * human-readable `coldSpillUnavailable(...)` sentence, and a blob holding a
+ * non-object JSON value rehydrates as that value. Either outcome lands a
+ * non-object on `toolCall.arguments`, which every provider then forwards
+ * verbatim — Anthropic serializes it straight into `tool_use.input` and the
+ * request fails with `tool_use.input: Input should be a valid dictionary`.
+ * That rejection is fatal for the whole transcript, so one missing blob makes
+ * a session permanently unresumable with no actionable diagnostic.
+ *
+ * Degrade to the existing malformed-arguments contract instead: the recovered
+ * text is preserved under `recoveryNotice` for the reader, and the agent loop
+ * rejects just that call with reason-specific, retryable guidance rather than
+ * letting the provider reject the entire request.
+ */
+function enforceToolCallArgumentObjects(message: AgentMessage): AgentMessage {
+	if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
+	let changed = false;
+	const content = message.content.map(block => {
+		if (block.type !== "toolCall" || isRecord(block.arguments)) return block;
+		changed = true;
+		const recovered = block.arguments;
+		return {
+			...block,
+			arguments: {
+				recoveryNotice:
+					typeof recovered === "string"
+						? recovered
+						: `[Cold-spill payload for this tool call rehydrated as ${
+								recovered === null ? "null" : typeof recovered
+							}, not an object]`,
+			},
+			incompleteArguments: true,
+			incompleteArgumentsReason: "malformed" as const,
+		};
+	});
+	return changed ? ({ ...message, content } as AgentMessage) : message;
+}
+
 function rehydrateColdSpillEntry(
 	entry: SessionEntry,
 	blobStore: BlobStore,
@@ -5576,13 +5618,9 @@ function rehydrateColdSpillEntry(
 ): SessionEntry {
 	if (entry.type === "message") {
 		const marker = entry.evictedContent;
-		const message = rehydrateColdSpillValue(
-			entry.message,
-			marker,
-			blobStore,
-			"message",
-			residentStores,
-		) as AgentMessage;
+		const message = enforceToolCallArgumentObjects(
+			rehydrateColdSpillValue(entry.message, marker, blobStore, "message", residentStores) as AgentMessage,
+		);
 		return { ...entry, message };
 	}
 	if (entry.type === "custom_message") {
