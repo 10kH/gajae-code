@@ -1296,40 +1296,58 @@ describe("ModelRegistry", () => {
 				expect(selection.model).toBe(resolved);
 			}
 		});
-		test("getCanonicalModelSelections matches per-record resolution across option and candidate shapes", () => {
-			// Sticky state mutates per call, so each scenario runs batch and
-			// per-record passes in the same order on independent registries.
-			const scenarios = [
-				{ availableOnly: false, sessionId: undefined as string | undefined },
-				{ availableOnly: true, sessionId: undefined as string | undefined },
-				{ availableOnly: false, sessionId: "  batch-parity-session  " as string | undefined },
-				{ availableOnly: true, sessionId: "  batch-parity-session  " as string | undefined },
-			];
-			for (const scenario of scenarios) {
-				const batchRegistry = new ModelRegistry(authStorage, modelsJsonPath);
-				const perRecordRegistry = new ModelRegistry(authStorage, modelsJsonPath);
-				// Candidate subset: even-index models drop roughly half the catalog,
-				// exercising per-variant candidate-key filtering on both paths.
-				const candidates = batchRegistry.getAll().filter((_, index) => index % 2 === 0);
-				const options = {
-					availableOnly: scenario.availableOnly,
-					candidates,
-					sessionId: scenario.sessionId,
-				};
-				const selections = batchRegistry.getCanonicalModelSelections(options);
-				const records = perRecordRegistry.getCanonicalModels(options);
-
-				expect(selections.length).toBe(records.length);
-				for (let index = 0; index < records.length; index += 1) {
-					const resolved = perRecordRegistry.resolveCanonicalModel(records[index]!.id, options);
-					expect(selections[index]!.model).toBe(resolved);
-				}
-				if (scenario.sessionId !== undefined) {
-					expect(batchRegistry.getSessionCanonicalVariant("batch-parity-session")).toBe(
-						perRecordRegistry.getSessionCanonicalVariant("batch-parity-session"),
-					);
-				}
+		// Sticky state mutates per call, so each scenario runs batch and per-record
+		// passes in the same order on independent registries. Split into one test
+		// per scenario: a single combined test exceeded the default 5s test
+		// timeout on slower CI runners.
+		function assertBatchMatchesPerRecord(scenario: { availableOnly: boolean; sessionId: string | undefined }): void {
+			if (scenario.availableOnly) {
+				// Deterministic availability: without seeded credentials this
+				// scenario is vacuous locally (0 records) and environment-dependent
+				// in CI (ambient credentials enable arbitrary bundled providers).
+				authStorage.setRuntimeApiKey("anthropic", "equivalence-key");
+				authStorage.setRuntimeApiKey("openai", "equivalence-key");
 			}
+			const batchRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			const perRecordRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			// Candidate subset: even-index models drop roughly half the catalog,
+			// exercising per-variant candidate-key filtering on both paths.
+			const candidates = batchRegistry.getAll().filter((_, index) => index % 2 === 0);
+			const options = {
+				availableOnly: scenario.availableOnly,
+				candidates,
+				sessionId: scenario.sessionId,
+			};
+			const selections = batchRegistry.getCanonicalModelSelections(options);
+			const records = perRecordRegistry.getCanonicalModels(options);
+
+			expect(selections.length).toBe(records.length);
+			expect(selections.length).toBeGreaterThan(0);
+			for (let index = 0; index < records.length; index += 1) {
+				const resolved = perRecordRegistry.resolveCanonicalModel(records[index]!.id, options);
+				// Cross-registry comparison: assert the winning model (provider/id),
+				// not object identity — policy-applied models are distinct
+				// instances per registry even when structurally identical.
+				expect(selections[index]!.model?.provider).toBe(resolved?.provider);
+				expect(selections[index]!.model?.id).toBe(resolved?.id);
+			}
+			if (scenario.sessionId !== undefined) {
+				expect(batchRegistry.getSessionCanonicalVariant("batch-parity-session")).toBe(
+					perRecordRegistry.getSessionCanonicalVariant("batch-parity-session"),
+				);
+			}
+		}
+		test("getCanonicalModelSelections matches per-record resolution with full availability", () => {
+			assertBatchMatchesPerRecord({ availableOnly: false, sessionId: undefined });
+		});
+		test("getCanonicalModelSelections matches per-record resolution with availability filtering", () => {
+			assertBatchMatchesPerRecord({ availableOnly: true, sessionId: undefined });
+		});
+		test("getCanonicalModelSelections matches per-record resolution with a whitespace session id", () => {
+			assertBatchMatchesPerRecord({ availableOnly: false, sessionId: "  batch-parity-session  " });
+		});
+		test("getCanonicalModelSelections matches per-record resolution with availability and session id", () => {
+			assertBatchMatchesPerRecord({ availableOnly: true, sessionId: "  batch-parity-session  " });
 		});
 		test("normalizes sticky session IDs when recording canonical variants", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
