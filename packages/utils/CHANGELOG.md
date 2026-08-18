@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- The crash event journal carries a fourth event kind, `relayed`, recording that a signature was accepted by a configured crash upstream (`fingerprint`, `at`, and the 32-hex `eventId` the upstream returned). It serializes through the same bounded single-line path as every other event and parses under the same strictness — a malformed fingerprint, a non-lowercase-hex event id, or an out-of-range timestamp yields `undefined` rather than a partially populated event.
+
 ## [0.14.0] - 2026-08-17
 
 ### Added
