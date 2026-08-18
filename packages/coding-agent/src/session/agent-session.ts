@@ -14032,6 +14032,15 @@ export class AgentSession {
 	}
 
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
+		this.#applyThinkingLevel(level, persist, false);
+	}
+
+	/**
+	 * `operatorIntent` marks the appended branch entry as operator-chosen session
+	 * effort (issue #4695): only control surfaces may pass true, so model-default
+	 * appends never mint `session` scope in {@link getThinkingScopeForControl}.
+	 */
+	#applyThinkingLevel(level: ThinkingLevel | undefined, persist: boolean, operatorIntent: boolean): void {
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -14050,7 +14059,7 @@ export class AgentSession {
 		}
 
 		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			this.sessionManager.appendThinkingLevelChange(effectiveLevel, operatorIntent);
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
 	}
@@ -14061,9 +14070,13 @@ export class AgentSession {
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
 		const previousThinkingLevel = this.thinkingLevel;
 		if (!persist) {
-			this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+			this.#applyThinkingLevel(
+				level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
+				false,
+				true,
+			);
 			if (level === ThinkingLevel.Inherit || this.thinkingLevel === previousThinkingLevel) {
-				this.sessionManager.appendThinkingLevelChange(level);
+				this.sessionManager.appendThinkingLevelChange(level, true);
 			}
 			return;
 		}
@@ -14168,7 +14181,9 @@ export class AgentSession {
 			.getBranch()
 			.toReversed()
 			.find(entry => entry.type === "thinking_level_change");
-		return latest && latest.thinkingLevel !== ThinkingLevel.Inherit ? "session" : "global config";
+		return latest && latest.thinkingLevel !== ThinkingLevel.Inherit && latest.operatorIntent === true
+			? "session"
+			: "global config";
 	}
 
 	getThinkingVisibility(): "visible" | "hidden" {
@@ -14294,7 +14309,7 @@ export class AgentSession {
 		const nextLevel = levels[nextIndex];
 		if (!nextLevel) return undefined;
 
-		this.setThinkingLevel(nextLevel);
+		this.#applyThinkingLevel(nextLevel, false, true);
 		return nextLevel;
 	}
 
@@ -17768,6 +17783,19 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Apply a resolved chain selector's thinking suffix unless the operator
+	 * already set a session-scoped effort (Shift+Tab, /effort, thinking picker).
+	 * Profile suffixes like `:high` are defaults, not per-turn overrides.
+	 */
+	#thinkingLevelForResolvedFallback(
+		explicitThinkingLevel: boolean,
+		resolvedThinkingLevel: ThinkingLevel | undefined,
+	): ThinkingLevel | undefined {
+		if (this.getThinkingScopeForControl() === "session") return this.thinkingLevel;
+		return explicitThinkingLevel ? resolvedThinkingLevel : this.thinkingLevel;
+	}
+
 	async #ensureDefaultFallbackResolution(): Promise<void> {
 		const controller = this.#defaultFallbackChain();
 		if (controller.chain.entries.length < 2) return;
@@ -17792,7 +17820,9 @@ export class AgentSession {
 		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
 		const previousEditMode = this.#resolveActiveEditMode();
 		this.#setModelAuthoritatively(resolution.model, "restore");
-		this.setThinkingLevel(resolution.explicitThinkingLevel ? resolution.thinkingLevel : this.thinkingLevel);
+		this.setThinkingLevel(
+			this.#thinkingLevelForResolvedFallback(resolution.explicitThinkingLevel, resolution.thinkingLevel),
+		);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
@@ -18009,7 +18039,9 @@ export class AgentSession {
 			const to = selector;
 			const previousEditMode = this.#resolveActiveEditMode();
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
-			this.setThinkingLevel(resolved.explicitThinkingLevel ? resolved.thinkingLevel : this.thinkingLevel);
+			this.setThinkingLevel(
+				this.#thinkingLevelForResolvedFallback(resolved.explicitThinkingLevel, resolved.thinkingLevel),
+			);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			if (from !== to) {
 				this.#emit({
