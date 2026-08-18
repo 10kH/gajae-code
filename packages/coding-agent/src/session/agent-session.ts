@@ -14086,6 +14086,15 @@ export class AgentSession {
 	}
 
 	setThinkingLevel(level: ThinkingLevel | undefined, persist: boolean = false): void {
+		this.#applyThinkingLevel(level, persist, false);
+	}
+
+	/**
+	 * `operatorIntent` marks the appended branch entry as operator-chosen session
+	 * effort (issue #4695): only control surfaces may pass true, so model-default
+	 * appends never mint `session` scope in {@link getThinkingScopeForControl}.
+	 */
+	#applyThinkingLevel(level: ThinkingLevel | undefined, persist: boolean, operatorIntent: boolean): void {
 		if (persist) this.#assertDurableSettingsWritable();
 		this.#thinkingLevelMutationRevision++;
 		this.#thinkingLevelLiveMutationRevision++;
@@ -14104,7 +14113,7 @@ export class AgentSession {
 		}
 
 		if (isChanging) {
-			this.sessionManager.appendThinkingLevelChange(effectiveLevel);
+			this.sessionManager.appendThinkingLevelChange(effectiveLevel, operatorIntent);
 			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
 		}
 	}
@@ -14115,9 +14124,13 @@ export class AgentSession {
 	async setThinkingLevelForControl(level: ThinkingLevel, persist: boolean): Promise<void> {
 		const previousThinkingLevel = this.thinkingLevel;
 		if (!persist) {
-			this.setThinkingLevel(level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level);
+			this.#applyThinkingLevel(
+				level === ThinkingLevel.Inherit ? this.#getInheritedThinkingLevel() : level,
+				false,
+				true,
+			);
 			if (level === ThinkingLevel.Inherit || this.thinkingLevel === previousThinkingLevel) {
-				this.sessionManager.appendThinkingLevelChange(level);
+				this.sessionManager.appendThinkingLevelChange(level, true);
 			}
 			return;
 		}
@@ -14222,7 +14235,9 @@ export class AgentSession {
 			.getBranch()
 			.toReversed()
 			.find(entry => entry.type === "thinking_level_change");
-		return latest && latest.thinkingLevel !== ThinkingLevel.Inherit ? "session" : "global config";
+		return latest && latest.thinkingLevel !== ThinkingLevel.Inherit && latest.operatorIntent === true
+			? "session"
+			: "global config";
 	}
 
 	getThinkingVisibility(): "visible" | "hidden" {
@@ -14348,7 +14363,7 @@ export class AgentSession {
 		const nextLevel = levels[nextIndex];
 		if (!nextLevel) return undefined;
 
-		this.setThinkingLevel(nextLevel);
+		this.#applyThinkingLevel(nextLevel, false, true);
 		return nextLevel;
 	}
 

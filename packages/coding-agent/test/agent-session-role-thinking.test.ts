@@ -409,7 +409,7 @@ describe("AgentSession role model thinking behavior", () => {
 			"test",
 		);
 
-		session.setThinkingLevel(Effort.XHigh);
+		await session.setThinkingLevelForControl(Effort.XHigh, false);
 		expect(session.thinkingLevel).toBe(Effort.XHigh);
 		expect(session.getThinkingScopeForControl()).toBe("session");
 
@@ -417,6 +417,52 @@ describe("AgentSession role model thinking behavior", () => {
 		await session.waitForIdle();
 
 		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		expect(session.getThinkingScopeForControl()).toBe("session");
+	});
+
+	it("does not mint session scope from a model-default append (issue #4695)", async () => {
+		const primary = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const codex = getBundledModel("openai-codex", "gpt-5.5");
+		if (!codex) throw new Error("Expected openai-codex/gpt-5.5");
+		if (codex.thinking?.defaultLevel === undefined) throw new Error("gpt-5.5 expected to carry defaultLevel");
+
+		const agent = new Agent({
+			initialState: {
+				model: primary,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+				thinkingLevel: Effort.High,
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-model-default.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-model-default.yml"));
+		sessionSettings = Settings.isolated();
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: sessionSettings,
+			modelRegistry,
+		});
+
+		expect(session.getThinkingScopeForControl()).toBe("global config");
+		await session.setModelTemporary(codex);
+		expect(session.thinkingLevel).toBe(codex.thinking.defaultLevel);
+		expect(session.getThinkingScopeForControl()).toBe("global config");
+	});
+
+	it("treats a Shift+Tab cycle as operator session intent (issue #4695)", async () => {
+		const primary = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		await createSession({
+			initialModelId: primary.id,
+			initialThinkingLevel: Effort.High,
+			modelRoles: {},
+		});
+		const cycled = session.cycleThinkingLevel();
+		expect(cycled).toBeDefined();
 		expect(session.getThinkingScopeForControl()).toBe("session");
 	});
 });
