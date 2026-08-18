@@ -86,19 +86,36 @@ describe("recordHandledError", () => {
 		expect(await journalLines(store.journal)).toHaveLength(2);
 	});
 
-	it("stops admitting new fingerprints once the per-process bound is reached", async () => {
+	it("evicts the coldest fingerprint at the bound instead of going blind to new errors", async () => {
 		resetHandledErrorDedupeForTest();
 		const store = handledStore();
 		// The dedupe set is what keeps a tool failing in a loop from writing
 		// thousands of records, so it must itself be bounded rather than growing
 		// with the number of distinct failure classes a long session produces.
+		// Saturation must evict, not latch shut: a long-lived process that stops
+		// admitting new fingerprints past the cap loses all later telemetry.
 		for (let i = 0; i < 256; i++)
 			recordHandledError("Tool functions.read", new Error(`bounded failure ${i}`), {
 				path: store.log,
 			});
 		const admitted = await journalLines(store.journal);
-		expect(recordHandledError("Tool functions.read", new Error("one too many"), { path: store.log })).toBeUndefined();
-		expect(await journalLines(store.journal)).toHaveLength(admitted.length);
+		expect(admitted).toHaveLength(256);
+
+		// The 257th distinct fingerprint is admitted by evicting the coldest one.
+		expect(recordHandledError("Tool functions.read", new Error("one past the bound"), { path: store.log })).toBe(
+			store.log,
+		);
+		expect(await journalLines(store.journal)).toHaveLength(257);
+
+		// "bounded failure 0" was the coldest and is gone, so it records again;
+		// a still-hot fingerprint is deduped rather than evicted under pressure.
+		expect(recordHandledError("Tool functions.read", new Error("bounded failure 0"), { path: store.log })).toBe(
+			store.log,
+		);
+		expect(
+			recordHandledError("Tool functions.read", new Error("one past the bound"), { path: store.log }),
+		).toBeUndefined();
+		expect(await journalLines(store.journal)).toHaveLength(258);
 	});
 
 	it("does not trip the fatal journal latch", async () => {
