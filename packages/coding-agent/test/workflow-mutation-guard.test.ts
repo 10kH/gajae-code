@@ -767,9 +767,10 @@ describe("workflow mutation guard", () => {
 		expect(decision.message).toContain("research-only");
 	});
 
-	it("allows mutation while the autoresearch mission is isolated on an autoresearch/* branch", async () => {
-		// Branch isolation IS the authorization: edits are contained and revertible
-		// through keep/discard, so experiments are legitimate work.
+	it("keeps product mutation blocked on an autoresearch/* branch — branch name is not authorization", async () => {
+		// Research-only is enforced by PATH, never by branch name: an isolation
+		// branch contains keep/discard bookkeeping, it does not turn product
+		// edits into research.
 		const cwd = await makeTempRoot();
 		await writeActiveSkill(cwd, "autoresearch", "research");
 		const branchSpy = vi
@@ -782,10 +783,33 @@ describe("workflow mutation guard", () => {
 				tool: tool("write"),
 				args: { path: "src/product.ts", content: "x" },
 			});
-			expect(decision.blocked).toBe(false);
+			expect(decision.blocked).toBe(true);
+			expect(decision.message).toContain("research-only");
+
+			// The mission's own research artifact stays writable on that branch.
+			const harness = await getWorkflowMutationDecision({
+				cwd,
+				sessionId: "session-a",
+				tool: tool("write"),
+				args: { path: "autoresearch.sh", content: "#!/usr/bin/env bash\n" },
+			});
+			expect(harness.blocked).toBe(false);
 		} finally {
 			branchSpy.mockRestore();
 		}
+	});
+
+	it("keeps the mission research artifact writable during an autoresearch mission", async () => {
+		const cwd = await makeTempRoot();
+		await writeActiveSkill(cwd, "autoresearch", "research");
+
+		const decision = await getWorkflowMutationDecision({
+			cwd,
+			sessionId: "session-a",
+			tool: tool("write"),
+			args: { path: "autoresearch.sh", content: "#!/usr/bin/env bash\n" },
+		});
+		expect(decision.blocked).toBe(false);
 	});
 
 	it("releases autoresearch mutation at its terminal phases", async () => {

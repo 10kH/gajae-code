@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool } from "@gajae-code/agent-core";
 import { logger } from "@gajae-code/utils";
-import { getCurrentAutoresearchBranch } from "../autoresearch/git";
+import { isAutoresearchAuthorizedResearchPath } from "../autoresearch/git";
 import { expandApplyPatchToEntries } from "../edit/modes/apply-patch";
 import { GJC_SESSION_PREFIX, modeStatePath as sessionModeStatePath } from "../gjc-runtime/session-layout";
 import { resolveGjcSessionForRead } from "../gjc-runtime/session-resolution";
@@ -28,7 +28,7 @@ export const RALPLAN_MUTATION_BLOCK_MESSAGE =
 export const ULTRAGOAL_GOAL_PLANNING_MUTATION_BLOCK_MESSAGE =
 	"Ultragoal goal-planning phase boundary: finish goal planning and record goals through `gjc ultragoal` before editing code. Product-code mutation tools and patch execution are blocked until goal planning completes and execution begins.";
 export const AUTORESEARCH_MUTATION_BLOCK_MESSAGE =
-	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked unless the mission is isolated on an `autoresearch/*` branch, where experiment edits are contained and revertible. Run experiments through the mission `python` tool and the `autoresearch.sh` harness on an autoresearch branch, or finish the mission and hand off to an approved implementation workflow.";
+	"Autoresearch research-only boundary: this workflow produces findings, evidence, and a verdict — never product code. Product-code mutation tools and patch execution are blocked everywhere, on every branch. Mission research artifacts (`autoresearch.sh` at the workdir root and mission state through the sanctioned `gjc autoresearch` CLI) stay writable; run experiments through the mission `python` tool, or finish the mission and hand off to an approved implementation workflow.";
 
 /** Resolve the phase-boundary block message for the active planning skill. */
 function planningPhaseBlockMessage(skill: CanonicalGjcWorkflowSkill): string {
@@ -1221,13 +1221,16 @@ export async function getWorkflowMutationDecision(
 		return { blocked: false, targets: [] };
 	}
 	if (input.forceOverride) return { blocked: false, targets: [] };
-	// Autoresearch is research-only, but running experiments IS its work. Branch
-	// isolation is the authorization: on an `autoresearch/*` branch every edit is
-	// contained and revertible via keep/discard, so mutation is allowed. Off that
-	// branch the mission would be editing the user's working branch, which the
-	// documented contract forbids. Checked live against the worktree rather than
-	// from recorded intent, because a user can switch branches mid-mission.
-	if (planning.skill === "autoresearch" && (await getCurrentAutoresearchBranch(input.cwd)) !== null) {
+	// Autoresearch is research-only: it never edits product code, on any branch.
+	// The only agent-writable surface is the mission's own research artifact —
+	// the `autoresearch.sh` harness at the workdir root (mission state under
+	// `.gjc/**` is runtime-owned and only the sanctioned CLI writes it). A branch
+	// name is not authorization: an `autoresearch/*` branch isolates keep/discard
+	// bookkeeping, it does not turn product edits into research.
+	if (
+		planning.skill === "autoresearch" &&
+		targets.paths.every(p => isAutoresearchAuthorizedResearchPath(input.cwd, p))
+	) {
 		return { blocked: false, targets: targets.paths };
 	}
 	const message = planningPhaseBlockMessage(planning.skill);

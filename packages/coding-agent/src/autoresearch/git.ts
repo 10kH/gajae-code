@@ -14,7 +14,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as git from "../utils/git";
-import { normalizePathSpec } from "./harness";
+import { HARNESS_FILENAME, normalizePathSpec } from "./harness";
 
 export const AUTORESEARCH_BRANCH_PREFIX = "autoresearch/";
 const BRANCH_NAME_MAX_LENGTH = 48;
@@ -37,6 +37,22 @@ export function getCurrentAutoresearchBranch(workDir: string): Promise<string | 
 	return git.branch.current(workDir).then(currentBranch => {
 		return currentBranch?.startsWith(AUTORESEARCH_BRANCH_PREFIX) ? currentBranch : null;
 	});
+}
+
+/**
+ * True when `rawPath` is one of the mission's own research artifacts: the
+ * `autoresearch.sh` harness at the working-directory root. This is the complete
+ * agent-writable surface for an active mission — product code, manifests,
+ * dependencies, and every other path stay blocked by the research-only
+ * mutation guard regardless of branch name.
+ *
+ * Mission state under `.gjc/**` is intentionally NOT listed here: it is
+ * runtime-owned and only the sanctioned `gjc autoresearch` CLI writes it.
+ */
+export function isAutoresearchAuthorizedResearchPath(_cwd: string, rawPath: string): boolean {
+	const normalized = normalizePathSpec(rawPath);
+	if (normalized === ".") return false;
+	return normalized === HARNESS_FILENAME;
 }
 
 /**

@@ -1,17 +1,14 @@
 /**
  * End-to-end authorization check for the autoresearch research-only boundary.
  *
- * The unit coverage in `test/workflow-mutation-guard.test.ts` stubs
- * `getCurrentAutoresearchBranch`, which proves the guard's branching logic but
- * NOT that the real git read wires up. This suite drives the whole path against
- * a real repository: real `git init`, real branch creation through
- * `ensureAutoresearchBranch`, real `git checkout`, and the real guard decision
- * with nothing mocked.
+ * The guard authorizes by PATH, never by branch name: an active mission may
+ * write its own research artifact (`autoresearch.sh` at the workdir root) and
+ * nothing else — not product source, not anywhere in the repo tree, not even
+ * on an `autoresearch/*` isolation branch. Branch isolation exists for
+ * keep/discard bookkeeping; it is not mutation authority.
  *
- * That distinction matters because the authorization is deliberately read live
- * from the worktree rather than from recorded mission intent — a user can switch
- * branches mid-mission, and a stubbed test cannot catch a regression in the
- * actual branch read.
+ * Everything here runs against a real git repository with the production
+ * helpers — nothing is stubbed or mocked.
  */
 import { afterEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
@@ -40,11 +37,9 @@ function runGit(cwd: string, ...args: string[]): string {
 
 /**
  * A real git repository with one baseline commit and a product file to target.
- *
- * `.gjc/` is gitignored exactly as it is in a real GJC repo. That matters here:
- * mission state files are untracked, and an untracked-dirty worktree makes
- * `ensureAutoresearchBranch` take its degraded path (stay on the current branch
- * and warn) instead of creating the isolation branch.
+ * `.gjc/` is gitignored exactly as a real GJC repo does, so mission state files
+ * never dirty the worktree (untracked-dirty trees force the documented degraded
+ * branch path).
  */
 function initRepo(): string {
 	const dir = nodeFs.mkdtempSync(path.join(os.tmpdir(), "gjc-autoresearch-branch-auth-"));
@@ -97,25 +92,35 @@ function writeTool(): AgentTool {
 	} as AgentTool;
 }
 
-async function decideProductWrite(cwd: string) {
+async function decideWrite(cwd: string, targetPath: string) {
 	return getWorkflowMutationDecision({
 		cwd,
 		sessionId: TEST_SESSION_ID,
 		tool: writeTool(),
-		args: { path: "src/product.ts", content: "export const x = 2;\n" },
+		args: { path: targetPath, content: "export const x = 2;\n" },
 	});
 }
 
-describe("autoresearch branch-isolation authorization (real git, nothing stubbed)", () => {
-	it("blocks product mutation on the user's branch and allows it once isolated on autoresearch/*", async () => {
+describe("autoresearch research-only authorization (real git, nothing stubbed)", () => {
+	it("allows the mission harness artifact and blocks product mutation on the user's branch", async () => {
 		const cwd = initRepo();
 		await activateMission(cwd);
 
-		// On `main`: the mission would be editing the user's working branch.
 		expect(await getCurrentAutoresearchBranch(cwd)).toBeNull();
-		const onMain = await decideProductWrite(cwd);
+
+		// The one agent-writable research artifact: the harness at the workdir root.
+		const harness = await decideWrite(cwd, "autoresearch.sh");
+		expect(harness.blocked).toBe(false);
+
+		// Product source stays blocked on the user's branch.
+		const onMain = await decideWrite(cwd, "src/product.ts");
 		expect(onMain.blocked).toBe(true);
 		expect(onMain.message).toContain("research-only");
+	});
+
+	it("keeps product mutation blocked on the autoresearch isolation branch — branch name is not authorization", async () => {
+		const cwd = initRepo();
+		await activateMission(cwd);
 
 		// Create the isolation branch through the real production helper.
 		const ensured = await ensureAutoresearchBranch(cwd, "decode throughput");
@@ -124,38 +129,27 @@ describe("autoresearch branch-isolation authorization (real git, nothing stubbed
 		expect(branch.startsWith("autoresearch/")).toBe(true);
 		expect(await getCurrentAutoresearchBranch(cwd)).toBe(branch);
 
-		// Same mission, same tool, same target — now authorized by isolation.
-		const onBranch = await decideProductWrite(cwd);
-		expect(onBranch.blocked).toBe(false);
+		// Same mission, same tool, same product target — still blocked on the
+		// branch. Isolation contains keep/discard bookkeeping, it does not turn
+		// product edits into research.
+		const onBranch = await decideWrite(cwd, "src/product.ts");
+		expect(onBranch.blocked).toBe(true);
+		expect(onBranch.message).toContain("research-only");
+
+		// The harness artifact remains writable on the branch.
+		const harness = await decideWrite(cwd, "autoresearch.sh");
+		expect(harness.blocked).toBe(false);
 	});
 
-	it("re-blocks as soon as the worktree leaves the autoresearch branch mid-mission", async () => {
-		const cwd = initRepo();
-		await activateMission(cwd);
-		const ensured = await ensureAutoresearchBranch(cwd, "mid mission switch");
-		expect(ensured.ok).toBe(true);
-		expect((await decideProductWrite(cwd)).blocked).toBe(false);
-
-		// The whole reason the branch is read live rather than cached from mission
-		// state: a user can switch away while the mission is still active.
-		runGit(cwd, "checkout", "main");
-		expect(await getCurrentAutoresearchBranch(cwd)).toBeNull();
-
-		const afterSwitch = await decideProductWrite(cwd);
-		expect(afterSwitch.blocked).toBe(true);
-		expect(afterSwitch.message).toContain("research-only");
-	});
-
-	it("does not authorize a lookalike branch name that is not autoresearch/*", async () => {
+	it("does not authorize a lookalike harness path or nested harness copies", async () => {
 		const cwd = initRepo();
 		await activateMission(cwd);
 
-		// `autoresearch-scratch` shares a prefix-ish name but is not the isolated
-		// namespace, so keep/discard containment does not apply to it.
-		runGit(cwd, "checkout", "-b", "autoresearch-scratch");
-		expect(await getCurrentAutoresearchBranch(cwd)).toBeNull();
-
-		expect((await decideProductWrite(cwd)).blocked).toBe(true);
+		// Only the workdir-root harness is the mission artifact; copies planted
+		// elsewhere in the tree are not.
+		expect((await decideWrite(cwd, "src/autoresearch.sh")).blocked).toBe(true);
+		expect((await decideWrite(cwd, "scripts/autoresearch.sh")).blocked).toBe(true);
+		expect((await decideWrite(cwd, "docs/autoresearch.sh")).blocked).toBe(true);
 	});
 
 	it("releases mutation at a terminal mission phase even on the user's branch", async () => {
@@ -163,6 +157,6 @@ describe("autoresearch branch-isolation authorization (real git, nothing stubbed
 		await activateMission(cwd, "complete");
 
 		expect(await getCurrentAutoresearchBranch(cwd)).toBeNull();
-		expect((await decideProductWrite(cwd)).blocked).toBe(false);
+		expect((await decideWrite(cwd, "src/product.ts")).blocked).toBe(false);
 	});
 });
