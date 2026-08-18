@@ -10,6 +10,8 @@ export default class Ralplan extends Command {
 		'$ gjc ralplan --interactive --deliberate "<task description>"',
 		'$ gjc ralplan --write --stage planner --stage_n 1 --artifact "<markdown or path>"',
 		"$ gjc ralplan --write --stage critic --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT",
+		'$ gjc ralplan --worktree-root /abs/path/to/target-worktree "<task description>"',
+		"$ gjc ralplan --write --worktree-root /abs/path/to/target-worktree --session-id <owner> --run-id <run> --stage critic --stage_n 1 --artifact-env GJC_RALPLAN_ARTIFACT",
 	];
 
 	async run(): Promise<void> {
