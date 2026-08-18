@@ -26,7 +26,6 @@ export interface BuildCrashEnvelopeInput {
 	readonly release: string;
 	readonly platform: string;
 	readonly bunVersion: string;
-	readonly sentAt: number;
 	readonly dsn: SentryDsn;
 }
 
@@ -78,9 +77,7 @@ export function buildCrashEnvelope(input: BuildCrashEnvelopeInput): BuildCrashEn
 	if (!Number.isFinite(input.lifetimeCount) || input.lifetimeCount < 0) return reject("invalid lifetime count");
 	const firstSeen = coarseDate(input.firstSeen);
 	const lastSeen = coarseDate(input.lastSeen);
-	const sentAt = new Date(input.sentAt);
-	if (!firstSeen || !lastSeen || !Number.isFinite(input.sentAt) || Number.isNaN(sentAt.getTime()))
-		return reject("invalid timestamp");
+	if (!firstSeen || !lastSeen) return reject("invalid timestamp");
 
 	const errorName = sanitizeExternalCrashV1(input.errorName, CRASH_BODY_MAX_BYTES);
 	if (!errorName.ok) return reject(errorName.reason);
@@ -132,11 +129,7 @@ export function buildCrashEnvelope(input: BuildCrashEnvelopeInput): BuildCrashEn
 		length: Buffer.byteLength(payload, "utf8"),
 		content_type: "application/json",
 	});
-	// `sent_at` is transport metadata for clock-skew correction, and the receiver
-	// observes the true arrival time from the request itself, so coarsening it
-	// would hide nothing while breaking that correction. It deliberately stays
-	// exact; the crash's own timestamp above does not.
-	const envelopeHeader = JSON.stringify({ event_id: input.eventId, sent_at: sentAt.toISOString(), dsn });
+	const envelopeHeader = JSON.stringify({ event_id: input.eventId, dsn });
 	const body = `${envelopeHeader}\n${itemHeader}\n${payload}`;
 	if (Buffer.byteLength(body, "utf8") > CRASH_BODY_MAX_BYTES) return reject("envelope exceeds size limit");
 	return { ok: true, body, eventId: input.eventId };
