@@ -218,10 +218,11 @@ format, the same `redactCrashSecrets` scrubbing, the same v1 fingerprint, the sa
 `sanitizeExternalCrashV1` egress contract.
 
 Two bounds keep the capture path cheap enough to run inside a live turn. A fingerprint is
-recorded at most once per process, so a tool failing in a loop writes one record rather
-than thousands, and the dedupe set itself stops admitting new fingerprints past 256 entries
-so it cannot grow without limit. Capture never throws: a handled tool error must not become
-an unhandled one.
+recorded at most once while it stays hot, so a tool failing in a loop writes one record rather
+than thousands. The dedupe set itself is bounded at 256 entries with LRU eviction: at
+saturation the coldest fingerprint is evicted so a long-lived process keeps recording newly
+seen failure classes instead of going permanently blind past the cap. Capture never throws: a
+handled tool error must not become an unhandled one.
 
 Upstream, handled errors are relayed by the same code as fatal crashes and differ only by
 `level` (`error` rather than `fatal`). Fatal signatures are relayed first, so a noisy

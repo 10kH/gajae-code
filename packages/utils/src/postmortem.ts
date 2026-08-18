@@ -471,11 +471,15 @@ export interface HandledErrorRecordOptions {
 }
 
 /**
- * Record one handled (non-fatal) error, at most once per fingerprint per process.
+ * Record one handled (non-fatal) error, at most once per fingerprint while it
+ * stays hot.
  *
  * A handled error is only useful when its stack establishes a stable identity.
  * The bounded process-local set prevents one retry loop from turning routine
  * failures into disk churn while preserving the fatal crash store's signal.
+ * The set is LRU with a hard cap: at saturation the coldest fingerprint is
+ * evicted so a long-lived process keeps recording newly seen failure classes
+ * instead of going permanently blind past the cap.
  */
 export function recordHandledError(
 	label: string,
@@ -486,11 +490,16 @@ export function recordHandledError(
 		if (!(error instanceof Error) || typeof error.stack !== "string" || error.stack.length === 0) return undefined;
 		const fatal = describeFatal(error);
 		const fingerprint = computeCrashFingerprint(fatal).fingerprint;
-		if (
-			handledErrorFingerprints.has(fingerprint) ||
-			handledErrorFingerprints.size >= HANDLED_ERROR_FINGERPRINT_LIMIT
-		) {
+		if (handledErrorFingerprints.has(fingerprint)) {
+			// Still hot: dedupe, but refresh recency so an actively failing class
+			// is not the one evicted under pressure.
+			handledErrorFingerprints.delete(fingerprint);
+			handledErrorFingerprints.add(fingerprint);
 			return undefined;
+		}
+		if (handledErrorFingerprints.size >= HANDLED_ERROR_FINGERPRINT_LIMIT) {
+			const coldest = handledErrorFingerprints.values().next().value;
+			if (coldest !== undefined) handledErrorFingerprints.delete(coldest);
 		}
 		handledErrorFingerprints.add(fingerprint);
 		const written = writeCrashRecord(label, fatal, {
@@ -619,7 +628,7 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 	// Persist first: the rotation-immune record must land before any
 	// best-effort stderr output, so a slow or failing stderr cannot cost the
 	// crash record. Cleanup (which may itself hang or fail) runs afterwards.
-	const crashLogPath = writeCrashRecord(label, fatal);
+	const crashLogPath = recordFatalCrash(label, reason);
 	safeStderrWrite(formatFatalError(label, fatal));
 	if (crashLogPath) safeStderrWrite(`[${label}] crash recorded at ${crashLogPath}\n`);
 	if (!quietShutdownStarted) {
