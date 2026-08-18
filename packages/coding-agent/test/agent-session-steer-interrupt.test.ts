@@ -112,6 +112,168 @@ describe("AgentSession steer-on-interrupt", () => {
 		).toBe(true);
 	});
 
+	// Execution-drain path: the steer is queued while two shared tools run. Tool A
+	// completing lets the tool-execution steering check consume the steer
+	// (steeringMessagesFromExecution) and interrupt the remaining tools; tool B's
+	// unwind is where the user interrupt lands, aborting the run's signal before
+	// the loop reaches its execution-drain continue. That continue must requeue and
+	// break on an aborted signal, or the steer opens a turn born aborted.
+	it("delivers steering consumed mid-batch when a user abort lands while the interrupted sibling tool unwinds", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		let releaseA: (() => void) | undefined;
+		let releaseB: (() => void) | undefined;
+		let agentRef: Agent | undefined;
+		const bothStarted = { a: false, b: false };
+		let resolveBothStarted: () => void;
+		const bothStartedPromise = new Promise<void>(resolve => {
+			resolveBothStarted = resolve;
+		});
+		const markStarted = (which: "a" | "b") => {
+			bothStarted[which] = true;
+			if (bothStarted.a && bothStarted.b) resolveBothStarted();
+		};
+		const makeTool = (name: string, which: "a" | "b") => ({
+			name,
+			description: `Blocking tool ${name}.`,
+			parameters: { type: "object" as const, properties: {} },
+			execute: async () => {
+				markStarted(which);
+				await new Promise<void>(resolve => {
+					if (which === "a") releaseA = resolve;
+					else releaseB = resolve;
+				});
+				if (which === "b") {
+					// The user interrupt lands while the steer-interrupted sibling tool
+					// unwinds — after the steering check consumed the steer, before the
+					// loop reaches its execution-drain continue.
+					agentRef?.abort();
+				}
+				return { content: [{ type: "text" as const, text: `${name} finished` }] };
+			},
+		});
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", name: "toola", arguments: {} },
+						{ type: "toolCall", name: "toolb", arguments: {} },
+					],
+				},
+				{ content: ["handled steering"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [makeTool("toola", "a") as never, makeTool("toolb", "b") as never],
+				messages: [],
+			},
+			streamFn: mock.stream,
+		});
+		agentRef = agent;
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const running = session.prompt("run both tools");
+		await bothStartedPromise;
+		session.agent.steer(userMessage("stop and do this instead"));
+		// A completes first: the steering check consumes the queued steer and
+		// interrupts the batch. Only once the steer has left the queue does B's
+		// unwind land the user interrupt, so the run reaches its execution-drain
+		// continue with the steer consumed and the signal aborted.
+		releaseA?.();
+		while (session.agent.hasQueuedSteering()) await Bun.sleep(1);
+		releaseB?.();
+		await running.catch(() => {});
+		await session.abort({ cause: "user_interrupt" });
+		await session.waitForIdle();
+
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		expect(
+			session.agent.state.messages.some(
+				m => m.role === "user" && JSON.stringify(m.content).includes("stop and do this instead"),
+			),
+		).toBe(true);
+		const stopReasons = session.agent.state.messages
+			.filter(m => m.role === "assistant")
+			.map(m => (m as { stopReason?: string }).stopReason);
+		expect(stopReasons).toEqual(["toolUse", "stop"]);
+	});
+
+	// Sibling path to the in-flight-tool drain below: with the default immediate
+	// interrupt mode, the tool-execution steering check consumes a steer queued
+	// while the tool runs (steeringMessagesFromExecution) and unwinds the tool
+	// itself. A user interrupt that lands during that unwind aborts the run's
+	// signal AFTER the steer left the queue, so the post-turn drain never sees it.
+	// The execution-drain continue must apply the same aborted-run guard — requeue
+	// and break — or the steer is answered by a turn born aborted and the session
+	// goes idle.
+	it("delivers steering consumed by the tool-execution interrupt when a user abort lands during unwind", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		let releaseTool: (() => void) | undefined;
+		let agentRef: Agent | undefined;
+		const toolStarted = Promise.withResolvers<void>();
+		const blockingTool = {
+			name: "blocks",
+			description: "Blocks until released so the steering check consumes the queued steer.",
+			parameters: { type: "object" as const, properties: {} },
+			execute: async () => {
+				toolStarted.resolve();
+				await new Promise<void>(resolve => {
+					releaseTool = resolve;
+				});
+				// The user interrupt lands as the tool unwinds — after the steer was
+				// queued, before the loop's steering drains run — so the abort is
+				// fully landed when the tool-execution steering check consumes the
+				// steer into steeringMessagesFromExecution.
+				agentRef?.abort();
+				return { content: [{ type: "text" as const, text: "tool finished" }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", name: "blocks", arguments: {} }] },
+				{ content: ["handled steering"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [blockingTool as never], messages: [] },
+			streamFn: mock.stream,
+		});
+		agentRef = agent;
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const running = session.prompt("run the blocking tool");
+		await toolStarted.promise;
+		session.agent.steer(userMessage("stop and do this instead"));
+		releaseTool?.();
+		// The aborted run requeues the consumed steer and ends; awaiting the
+		// settled prompt guarantees the requeue landed. The session-level user
+		// interrupt then runs the resume check that starts a fresh run for it.
+		await running.catch(() => {});
+		await session.abort({ cause: "user_interrupt" });
+		await session.waitForIdle();
+
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		expect(
+			session.agent.state.messages.some(
+				m => m.role === "user" && JSON.stringify(m.content).includes("stop and do this instead"),
+			),
+		).toBe(true);
+		const stopReasons = session.agent.state.messages
+			.filter(m => m.role === "assistant")
+			.map(m => (m as { stopReason?: string }).stopReason);
+		expect(stopReasons).toEqual(["toolUse", "stop"]);
+	});
+
 	// A user interrupt that lands while a tool is executing aborts the run's signal
 	// without ending the loop: the loop still unwinds the tool and reaches its
 	// steering drain. Consuming the steer there opened a turn on the aborted

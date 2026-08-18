@@ -2583,8 +2583,16 @@ async function runLoopBody(
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
-				pendingMessages = steeringMessagesFromExecution;
-				continue;
+				// Same aborted-run guard as the drain below: the steer interrupt unwound
+				// the tools, and a user interrupt that landed during that unwind must not
+				// open the steering turn on the aborted signal. Hand the messages back
+				// and end the run so the resume path delivers them on a fresh one.
+				if (!loopSignal.aborted) {
+					pendingMessages = steeringMessagesFromExecution;
+					continue;
+				}
+				config.requeueSteeringMessages?.(steeringMessagesFromExecution);
+				break;
 			}
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
 			if (pendingMessages.length > 0) {
@@ -3304,7 +3312,11 @@ async function executeToolCalls(
 	}));
 
 	const checkSteering = async (): Promise<void> => {
-		if (!shouldInterruptImmediately || !getSteeringMessages || interruptState.triggered) {
+		// Never consume steering once the run's own signal is aborted: an aborted
+		// run cannot deliver it (the loop hands drained steering back and ends), and
+		// a tool task still unwinding can otherwise dequeue steering the drain just
+		// requeued — orphaning it in an execution result nobody reads.
+		if (!shouldInterruptImmediately || !getSteeringMessages || interruptState.triggered || signal?.aborted) {
 			return;
 		}
 		if (steeringCheck) {
