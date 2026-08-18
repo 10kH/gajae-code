@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
+import type { AgentOptions } from "@gajae-code/agent-core";
 import { Agent } from "@gajae-code/agent-core";
 import { Effort, getBundledModel } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -365,5 +367,56 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.thinkingLevel).toBe("off");
 		expect(session.cycleThinkingLevel()).toBe(Effort.Minimal);
 		expect(session.thinkingLevel).toBe(Effort.Minimal);
+	});
+	it("keeps a session thinking override across a suffixed default-chain re-resolution", async () => {
+		const primary = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!fallback) throw new Error("Expected openai/gpt-4o-mini");
+
+		const streamFn: AgentOptions["streamFn"] = (model, context, options) =>
+			createMockModel({ responses: [{ content: ["ok"] }] }).stream(model, context, options);
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: {
+				model: primary,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+				thinkingLevel: Effort.High,
+			},
+			streamFn,
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-session-effort.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+		modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-session-effort.yml"));
+
+		sessionSettings = Settings.isolated({
+			"compaction.enabled": false,
+			defaultThinkingLevel: Effort.High,
+		});
+		sessionSettings.setModelRole("default", `${primary.provider}/${primary.id}:high`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: sessionSettings,
+			modelRegistry,
+		});
+		session.setConfiguredModelChain(
+			"default",
+			[`${primary.provider}/${primary.id}:high`, `${fallback.provider}/${fallback.id}`],
+			"test",
+		);
+
+		session.setThinkingLevel(Effort.XHigh);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		expect(session.getThinkingScopeForControl()).toBe("session");
+
+		await session.prompt("keep session xhigh through chain re-resolution");
+		await session.waitForIdle();
+
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		expect(session.getThinkingScopeForControl()).toBe("session");
 	});
 });
