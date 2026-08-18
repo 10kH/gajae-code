@@ -5005,6 +5005,31 @@ function reportResidentBlobMissing(
 	return error;
 }
 
+/**
+ * Record one bounded line where a corrupted resident reference is fatal.
+ *
+ * The missing-blob lanes above report through `reportResidentBlobMissing`;
+ * a staged sentinel whose ref does not even parse failed closed with a bare
+ * `Error` that named no ref, kind, or session and left no record at all —
+ * the same observability gap one boundary over. The ref is bounded because a
+ * corrupted boundary is exactly where unbounded input appears.
+ */
+function reportInvalidResidentBlobRef(ref: string, kind: string, stores: ResidentBlobStores): Error {
+	const boundedRef = ref.length > 96 ? `${ref.slice(0, 96)}…` : ref;
+	logger.error("Resident blob reference invalid on a fail-closed path", {
+		phase: "stage-verify",
+		kind,
+		ref: boundedRef,
+		sessionId: stores.sessionId,
+		sessionFile: stores.sessionFile,
+	});
+	return new Error(
+		`Staged resident entry has an invalid blob reference: ${boundedRef}` +
+			(stores.sessionId ? ` (session ${stores.sessionId})` : "") +
+			(stores.sessionFile ? ` [${stores.sessionFile}]` : ""),
+	);
+}
+
 function residentBlobMissingPlaceholder(error: ResidentBlobMissingError): string {
 	return `[Session resident ${error.kind} blob missing: sha256:${error.hash}; original content unavailable]`;
 }
@@ -5148,7 +5173,7 @@ function assertResidentReferencesResolvableSync(entries: readonly FileEntry[], s
 			if (resolved.has(key)) return;
 			resolved.add(key);
 			const hash = parseBlobRef(value.ref);
-			if (hash === null) throw new Error("Staged resident entry has an invalid blob reference.");
+			if (hash === null) throw reportInvalidResidentBlobRef(value.ref, value.kind, stores);
 			const store = value.kind === "text" ? stores.textStore : stores.imageStore;
 			if (store.getSync(hash) === null) {
 				throw reportResidentBlobMissing(
@@ -5157,6 +5182,18 @@ function assertResidentReferencesResolvableSync(entries: readonly FileEntry[], s
 				);
 			}
 			return;
+		}
+		// A key-marked sentinel that failed the strict shape check is a corrupted
+		// boundary, not plain data: `containsResidentSentinel` already treats the
+		// key alone as a sentinel, so walking past it here would verify nothing and
+		// let the raw sentinel — internal key and all — persist into the transcript.
+		if ((value as { [RESIDENT_BLOB_SENTINEL_KEY]?: unknown })[RESIDENT_BLOB_SENTINEL_KEY] === true) {
+			const record = value as { kind?: unknown; ref?: unknown };
+			throw reportInvalidResidentBlobRef(
+				typeof record.ref === "string" ? record.ref : String(record.ref),
+				typeof record.kind === "string" ? record.kind : "unknown",
+				stores,
+			);
 		}
 		if (ArrayBuffer.isView(value) || seen.has(value)) return;
 		seen.add(value);
@@ -5259,6 +5296,15 @@ function materializeResidentEntriesForPersistenceSync<T extends FileEntry | Sess
 
 export function residentBlobSentinelForTests(kind: ResidentBlobKind, ref: string): ResidentBlobSentinel {
 	return residentBlobSentinel(kind, ref);
+}
+
+export function assertResidentReferencesResolvableForTests(
+	entries: readonly FileEntry[],
+	textStore: BlobStore,
+	imageStore: BlobStore = textStore,
+	binding: { sessionId?: string; sessionFile?: string } = {},
+): void {
+	assertResidentReferencesResolvableSync(entries, { textStore, imageStore, ...binding });
 }
 
 export function materializeResidentEntriesForPersistenceForTests<T>(
