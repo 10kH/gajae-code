@@ -671,15 +671,25 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 		path.dirname(readinessFile),
 		`.${path.basename(readinessFile)}.${process.pid}.${randomUUID()}.tmp`,
 	);
+	let result: RuntimeInputReadyMarker | null = null;
+	let primaryError: unknown;
 	try {
 		await ensureCoordinatorDirectory(path.dirname(readinessFile));
 		const handle = await fs.open(tempFile, "wx", 0o600);
+		let writeError: unknown;
 		try {
 			await handle.writeFile(`${JSON.stringify(marker)}\n`);
 			await syncCoordinatorFile(handle);
-		} finally {
-			await handle.close();
+		} catch (error) {
+			writeError = error;
 		}
+		try {
+			await handle.close();
+		} catch (closeError) {
+			if (writeError) throw new AggregateError([writeError, closeError], "readiness write and close failed");
+			throw closeError;
+		}
+		if (writeError) throw writeError;
 		try {
 			await fs.link(tempFile, readinessFile);
 		} catch (error) {
@@ -687,15 +697,29 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 			const raced = await readRuntimeInputReadyMarker(readinessFile);
 			if (raced && raced.session_id === expected.sessionId && raced.launch_id === expected.launchId) {
 				await syncCoordinatorDirectory(path.dirname(readinessFile));
-				return raced;
+				result = raced;
+			} else {
+				throw runtimeReadinessMarkerConflict();
 			}
-			throw runtimeReadinessMarkerConflict();
 		}
-		await syncCoordinatorDirectory(path.dirname(readinessFile));
-		return marker;
-	} finally {
-		await fs.rm(tempFile, { force: true });
+		if (result === null) {
+			await syncCoordinatorDirectory(path.dirname(readinessFile));
+			result = marker;
+		}
+	} catch (error) {
+		primaryError = error;
 	}
+	let cleanupError: unknown;
+	try {
+		await fs.rm(tempFile, { force: true });
+	} catch (error) {
+		cleanupError = error;
+	}
+	if (primaryError && cleanupError)
+		throw new AggregateError([primaryError, cleanupError], "readiness publication and cleanup failed");
+	if (primaryError) throw primaryError;
+	if (cleanupError) throw cleanupError;
+	return result;
 }
 
 function sameResolvedPath(left: string, right: string, platform: NodeJS.Platform = process.platform): boolean {

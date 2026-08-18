@@ -27,6 +27,20 @@ describe("Coordinator durability", () => {
 		expect(calls).toEqual(["directory-open"]);
 	});
 
+	it("accepts a Windows EACCES directory barrier while opening and syncing", async () => {
+		await syncCoordinatorDirectory("state", {
+			platform: "win32",
+			openDirectory: async () => Promise.reject(errno("EACCES")),
+		});
+		const handle = {
+			async sync(): Promise<void> {
+				throw errno("EACCES");
+			},
+			async close(): Promise<void> {},
+		} as fs.FileHandle;
+		await syncCoordinatorDirectory("state", { platform: "win32", openDirectory: async () => handle });
+	});
+
 	it("keeps unexpected Windows directory open failures fail-closed", async () => {
 		await expect(
 			syncCoordinatorDirectory("state", {
@@ -76,6 +90,26 @@ describe("Coordinator durability", () => {
 			} as fs.FileHandle;
 			await expect(
 				syncCoordinatorDirectory("state", { platform, openDirectory: async () => handle }),
+			).rejects.toMatchObject({ code });
+		}
+	});
+
+	it("propagates unsupported-code lookalikes at both directory barriers", async () => {
+		for (const code of ["ENOTSUP", "EOPNOTSUPP", "EINVAL"] as const) {
+			await expect(
+				syncCoordinatorDirectory("state", {
+					platform: "win32",
+					openDirectory: async () => Promise.reject(errno(code)),
+				}),
+			).rejects.toMatchObject({ code });
+			const handle = {
+				async sync(): Promise<void> {
+					throw errno(code);
+				},
+				async close(): Promise<void> {},
+			} as fs.FileHandle;
+			await expect(
+				syncCoordinatorDirectory("state", { platform: "win32", openDirectory: async () => handle }),
 			).rejects.toMatchObject({ code });
 		}
 	});
@@ -206,10 +240,12 @@ describe("Coordinator durability", () => {
 	});
 
 	it("classifies only documented Windows directory error codes", () => {
-		for (const code of ["EPERM", "ENOTSUP", "EOPNOTSUPP", "EINVAL"])
+		for (const code of ["EPERM", "EACCES"])
 			expect(isUnsupportedWindowsDirectorySyncError(errno(code), "win32")).toBe(true);
 		expect(isUnsupportedWindowsDirectorySyncError(errno("EIO"), "win32")).toBe(false);
-		expect(isUnsupportedWindowsDirectorySyncError(errno("EACCES"), "win32")).toBe(false);
+		for (const code of ["ENOTSUP", "EOPNOTSUPP", "EINVAL"])
+			expect(isUnsupportedWindowsDirectorySyncError(errno(code), "win32")).toBe(false);
+		expect(isUnsupportedWindowsDirectorySyncError(errno("EACCES"), "linux")).toBe(false);
 		expect(isUnsupportedWindowsDirectorySyncError(errno("EPERM"), "linux")).toBe(false);
 	});
 });

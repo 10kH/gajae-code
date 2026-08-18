@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, isKnownSinkPeerClosedError } from "@gajae-code/utils";
+import { getAgentDir, isKnownSinkPeerClosedError, logger } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
@@ -1687,8 +1687,17 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 		try {
 			codexWake = await maybeRecordCodexWake(namespaceDir, event);
 		} catch (error) {
-			await appendCodexWakeDiagnostic(namespaceDir, event, error);
-			throw error;
+			try {
+				await appendCodexWakeDiagnostic(namespaceDir, event, error);
+			} catch (diagnosticError) {
+				// The canonical event is already durable. Preserve that committed
+				// result even when the optional diagnostic cannot be persisted.
+				logger.warn("Coordinator Codex wake diagnostic persistence failed", {
+					eventId: event.id,
+					error: String(diagnosticError),
+				});
+			}
+			codexWake = null;
 		}
 		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff);
 		if (eventWebhookConfigs.has(namespaceDir)) enqueueEventWebhook(namespaceDir, event);
@@ -2469,10 +2478,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			throw error;
 		}
 	})();
+	// Startup replay is optional. Keep its rejection observable to callers that
+	// explicitly await the replay, but never let an unhandled replay rejection
+	// gate canonical question-state initialization.
+	void startupCodexWakeReplay.catch(() => undefined);
 	let questionStateReady: Promise<void> | null = null;
 
 	function ensureQuestionStateReady(): Promise<void> {
-		questionStateReady ??= startupCodexWakeReplay.then(() => initializeCoordinatorNamespace(questionPaths));
+		questionStateReady ??= initializeCoordinatorNamespace(questionPaths);
 		return questionStateReady;
 	}
 

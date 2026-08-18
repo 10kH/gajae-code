@@ -55,8 +55,9 @@ export function isUnsupportedWindowsDirectorySyncError(
 ): boolean {
 	if (platform !== "win32") return false;
 	const code = (error as NodeJS.ErrnoException | undefined)?.code;
-	// Bun reports EPERM when fsync is applied to a Windows directory handle.
-	return code === "EPERM" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "EINVAL";
+	// Windows directory-handle barriers use the established broker precedent:
+	// EPERM/EACCES are tolerated only for the directory open/sync operation.
+	return code === "EPERM" || code === "EACCES";
 }
 
 export async function syncCoordinatorDirectory(
