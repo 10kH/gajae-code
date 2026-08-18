@@ -2658,11 +2658,30 @@ async function runLoopBody(
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
-				pendingMessages = steeringMessagesFromExecution;
-				continue;
+				// Same aborted-run guard as the drain below: the steer interrupt unwound
+				// the tools, and a user interrupt that landed during that unwind must not
+				// open the steering turn on the aborted signal. Hand the messages back
+				// and end the run so the resume path delivers them on a fresh one.
+				if (!loopSignal.aborted) {
+					pendingMessages = steeringMessagesFromExecution;
+					continue;
+				}
+				config.requeueSteeringMessages?.(steeringMessagesFromExecution);
+				break;
 			}
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
-			if (pendingMessages.length > 0) continue;
+			if (pendingMessages.length > 0) {
+				// A user interrupt that lands while a tool is executing aborts this run's
+				// signal without ending the loop: the tool unwinds and execution reaches
+				// here. Continuing would open a turn on the aborted signal, which the
+				// provider rejects before the first token — the steer would be consumed
+				// and answered by nothing. Hand it back and end the run so the caller's
+				// resume starts a fresh one, which is the path that already works when no
+				// tool was in flight.
+				if (!loopSignal.aborted) continue;
+				config.requeueSteeringMessages?.(pendingMessages);
+				break;
+			}
 			if (config.shouldPause?.()) {
 				publishAgentEnd(
 					stream,
@@ -3368,7 +3387,11 @@ async function executeToolCalls(
 	}));
 
 	const checkSteering = async (): Promise<void> => {
-		if (!shouldInterruptImmediately || !getSteeringMessages || interruptState.triggered) {
+		// Never consume steering once the run's own signal is aborted: an aborted
+		// run cannot deliver it (the loop hands drained steering back and ends), and
+		// a tool task still unwinding can otherwise dequeue steering the drain just
+		// requeued — orphaning it in an execution result nobody reads.
+		if (!shouldInterruptImmediately || !getSteeringMessages || interruptState.triggered || signal?.aborted) {
 			return;
 		}
 		if (steeringCheck) {
