@@ -4756,8 +4756,18 @@ export function createNotificationsExtension(
 			reconciliation.cleanup();
 			for (const [key, tombstone] of promptTerminalTombstones)
 				if (tombstone.expiresAt <= now) promptTerminalTombstones.delete(key);
+			// Age-based eviction applies only after terminal publication has
+			// settled (`delivered`) or for fatal transport-level closures, which
+			// never publish by design. Active and terminal-in-progress records
+			// (`outcome_claimed`/`terminalizing`/`publication_closed`) must
+			// survive past the TTL so a long-running prompt's terminal event is
+			// never dropped before it reaches the positioned ring (#4691).
 			for (const [key, submission] of promptSubmissions)
-				if (submission.terminal && submission.createdAt + PROMPT_SUBMISSION_TTL_MS <= now)
+				if (
+					submission.terminal &&
+					(submission.phase === "delivered" || submission.fatal === true) &&
+					submission.createdAt + PROMPT_SUBMISSION_TTL_MS <= now
+				)
 					expirePromptDelivery(key, submission);
 		};
 		const abandonPrompt = (submission: PromptSubmission) => {
@@ -4855,7 +4865,13 @@ export function createNotificationsExtension(
 			// failures that race the durable write still emit correlated terminals.
 			cleanupPromptRecords();
 			while (promptSubmissions.size >= PROMPT_SUBMISSION_CAPACITY) {
-				const oldestTerminal = [...promptSubmissions.entries()].find(([, submission]) => submission.terminal);
+				// Capacity eviction likewise never drops a terminal-in-progress
+				// record (#4691): only publication-settled or fatal deliveries can
+				// be reclaimed; otherwise admission fails closed.
+				const oldestTerminal = [...promptSubmissions.entries()].find(
+					([, submission]) =>
+						submission.terminal && (submission.phase === "delivered" || submission.fatal === true),
+				);
 				if (!oldestTerminal)
 					throw Object.assign(
 						new Error("Too many active prompt submissions; reconcile or await terminal state."),
@@ -5108,7 +5124,17 @@ export function createNotificationsExtension(
 				return;
 			}
 			if (submission.deadlineTimer) clearTimeout(submission.deadlineTimer);
-			if (!recordPromptTerminal(correlation) || !runtime) return;
+			if (!recordPromptTerminal(correlation)) return;
+			if (!runtime) {
+				// The runtime (and with it the positioned ring) is gone, so the
+				// terminal can never be published from this process; expire the
+				// delivery record immediately instead of stranding a
+				// publication_closed record that cleanup may no longer evict (#4691).
+				const strandedKey = promptSubmissionKey(correlation);
+				const stranded = promptSubmissions.get(strandedKey);
+				if (stranded) expirePromptDelivery(strandedKey, stranded);
+				return;
+			}
 			if (
 				winner.kind === "failed" &&
 				extra?.diagnostic?.intentionalCancellation !== true &&
@@ -5175,6 +5201,13 @@ export function createNotificationsExtension(
 				// Event publication failed: the semantic terminal stands but the
 				// event bit stays false (no second event is ever emitted on replay).
 				logger.warn(`sdk: prompt terminal event publication failed: ${String(error)}`);
+				// Publication was attempted and failed, so retaining the delivery
+				// record can no longer serve publication; expire it (with its
+				// dedupe tombstone) instead of stranding a publication_closed
+				// record that cleanup may no longer evict (#4691).
+				const failedKey = promptSubmissionKey(correlation);
+				const stranded = promptSubmissions.get(failedKey);
+				if (stranded?.terminal) expirePromptDelivery(failedKey, stranded);
 			}
 		};
 		const emitPromptFailure = async (correlation: { commandId: string; turnId: string }, error: unknown) => {
