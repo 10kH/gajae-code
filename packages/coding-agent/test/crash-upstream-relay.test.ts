@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { appendCrashEvent, formatCrashRecordMarker } from "@gajae-code/utils";
 import type { CrashSignatureView, CrashStatePaths } from "../src/crash/index-store";
 import { compactCrashIndex, listCrashSignatures } from "../src/crash/index-store";
+import { crashRelayExitCode } from "../src/cli/crash-cli";
 import {
 	CRASH_UPSTREAM_DSN_ENV,
 	type CrashRelayConfig,
@@ -120,6 +121,14 @@ describe("readTrustedRelayConfig", () => {
 				settingsDouble({ "crashReport.upstream": "SENTRY", "crashReport.upstreamDsn": 42 }, {}),
 			),
 		).toEqual({ upstream: "off", dsn: "" });
+	});
+});
+
+describe("crash relay exit mapping", () => {
+	test("refused and failed loud relay batches exit non-zero", () => {
+		expect(crashRelayExitCode({ status: "ran", sent: 1, refused: 1, failed: 0 })).toBe(1);
+		expect(crashRelayExitCode({ status: "ran", sent: 1, refused: 0, failed: 1 })).toBe(1);
+		expect(crashRelayExitCode({ status: "ran", sent: 1, refused: 0, failed: 0 })).toBe(0);
 	});
 });
 
@@ -250,6 +259,47 @@ describe("relayCrashSignatures", () => {
 		const second = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
 		expect(second).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
 		expect(bodies).toHaveLength(2);
+	});
+
+	test("an occurrence appended during the POST remains due after the accepted envelope is stamped", async () => {
+		await seed();
+		const bodies: string[] = [];
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async (_url, init) => {
+				bodies.push(String(init.body));
+				await seed({ at: 1_700_000_999_000, recordId: "fedcba9876543210" });
+				return new Response("", { status: 200 });
+			},
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		const index = await compactCrashIndex({ paths });
+		const relayed = listCrashSignatures(index)[0];
+		expect(relayed?.relayedAt).toBe(1_700_000_900_000);
+		expect(relayed && isRelayDue(relayed)).toBe(true);
+	});
+
+	test("concurrent relays claim a signature before either can POST it", async () => {
+		await seed();
+		const bodies: string[] = [];
+		const postStarted = Promise.withResolvers<void>();
+		const postReleased = Promise.withResolvers<void>();
+		const fetchImpl: CrashRelayFetch = async (_url, init) => {
+			bodies.push(String(init.body));
+			postStarted.resolve();
+			await postReleased.promise;
+			return new Response("", { status: 200 });
+		};
+		const first = relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl });
+		await postStarted.promise;
+		const second = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl });
+		postReleased.resolve();
+		const firstOutcome = await first;
+		expect(firstOutcome).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(second).toEqual({ status: "ran", sent: 0, refused: 0, failed: 0 });
+		expect(bodies).toHaveLength(1);
 	});
 
 	test("a non-2xx response counts as failed and leaves the signature due", async () => {

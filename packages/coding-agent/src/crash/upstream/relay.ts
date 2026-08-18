@@ -19,6 +19,7 @@
  * compaction, where blocking and failing are both safe.
  */
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { normalizeCrashFrames, VERSION } from "@gajae-code/utils";
 import {
 	type CrashSignatureView,
@@ -41,6 +42,7 @@ export const CRASH_UPSTREAM_DSN_ENV = "GJC_CRASH_SENTRY_DSN";
  */
 const MAX_RELAY_PER_RUN = 8;
 const RELAY_TIMEOUT_MS = 10_000;
+const RELAY_CLAIM_TTL_MS = RELAY_TIMEOUT_MS * 2;
 
 export interface CrashRelayConfig {
 	readonly upstream: "off" | "sentry";
@@ -155,6 +157,31 @@ function coarsePlatform(): string {
 	return "Linux";
 }
 
+async function claimRelay(
+	paths: CrashStatePaths,
+	fingerprint: string,
+	eventId: string,
+	watermark: number,
+	now: number,
+): Promise<(() => Promise<void>) | undefined> {
+	const claimPath = path.join(path.dirname(paths.index), `.gjc-crash-relay-${fingerprint}`);
+	try {
+		const file = await fs.open(claimPath, "wx", 0o600);
+		await file.writeFile(`${JSON.stringify({ eventId, watermark })}\n`);
+		await file.close();
+		return async () => {
+			await fs.rm(claimPath, { force: true });
+		};
+	} catch (error) {
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") return undefined;
+		try {
+			const stat = await fs.stat(claimPath);
+			if (now - stat.mtimeMs > RELAY_CLAIM_TTL_MS) await fs.rm(claimPath, { force: true });
+		} catch {}
+		return undefined;
+	}
+}
+
 /**
  * Relay every due signature once. Never throws: a broken upstream, an offline
  * machine or a corrupt crash log must not be able to take down startup.
@@ -195,14 +222,18 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 	let failed = 0;
 
 	for (const signature of signatures) {
+		const eventId = newSentryEventId();
+		const releaseClaim = await claimRelay(paths, signature.fingerprint, eventId, signature.lastSeen, now());
+		if (!releaseClaim) continue;
 		const record = findLatestRecord(crashLog, signature.fingerprint);
 		if (!record) {
 			refused++;
+			await releaseClaim();
 			continue;
 		}
 
 		const envelope = buildCrashEnvelope({
-			eventId: newSentryEventId(),
+			eventId,
 			fingerprint: signature.fingerprint,
 			errorName: signature.errorName,
 			messageClass: signature.messageClass,
@@ -213,18 +244,19 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 			release,
 			platform,
 			bunVersion,
-			sentAt: now(),
 			dsn: resolved.dsn,
 		});
 		if (!envelope.ok) {
 			// Fail closed. Deliberately no retry with a reduced payload.
 			refused++;
+			await releaseClaim();
 			continue;
 		}
 
 		const accepted = await postEnvelope(fetchImpl, resolved.dsn, envelope.body, release);
 		if (!accepted) {
 			failed++;
+			await releaseClaim();
 			continue;
 		}
 
@@ -237,8 +269,9 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		// into the same fingerprint group.
 		await recordCrashStateEvent(
 			{ kind: "relayed", fingerprint: signature.fingerprint, at: signature.lastSeen, eventId: envelope.eventId },
-			{ paths },
+			{ paths, now: now() },
 		);
+		await releaseClaim();
 		sent++;
 	}
 

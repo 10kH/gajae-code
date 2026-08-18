@@ -28,7 +28,6 @@ function envelopeInput(overrides: Partial<BuildCrashEnvelopeInput> = {}): BuildC
 		release: "0.13.1",
 		platform: "darwin-arm64",
 		bunVersion: "1.3.14",
-		sentAt: Date.UTC(2026, 7, 12, 12, 0, 0),
 		dsn: DSN,
 		...overrides,
 	};
@@ -73,8 +72,12 @@ describe("buildCrashEnvelope", () => {
 		expect(lines).toHaveLength(3);
 		const itemHeader = JSON.parse(lines[1] ?? "") as { length: number };
 		const payload = JSON.parse(lines[2] ?? "") as Record<string, unknown>;
+		const header = JSON.parse(lines[0] ?? "") as Record<string, unknown>;
 		expect(itemHeader.length).toBe(Buffer.byteLength(lines[2] ?? "", "utf8"));
 		expect(payload.fingerprint).toEqual([FINGERPRINT]);
+		expect(header).not.toHaveProperty("sent_at");
+		expect(payload.timestamp).toBe(Date.UTC(2026, 7, 11) / 1000);
+		expect(result.body).not.toMatch(/T\d{2}:\d{2}:\d{2}/);
 		for (const forbidden of ["user", "server_name", "contexts", "breadcrumbs", "request"])
 			expect(payload).not.toHaveProperty(forbidden);
 		const exception = payload.exception as { values: { stacktrace: { frames: { function: string }[] } }[] };

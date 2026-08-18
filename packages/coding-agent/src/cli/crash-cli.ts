@@ -12,7 +12,7 @@ import { getCrashIndexPath } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import { compactCrashIndex, listCrashSignatures, resolveCrashStatePaths } from "../crash/index-store";
 import { type CrashReportIo, type CrashReportOutcome, runCrashReportFlow } from "../crash/report";
-import { readTrustedRelayConfig, relayCrashSignatures } from "../crash/upstream/relay";
+import { readTrustedRelayConfig, relayCrashSignatures, type CrashRelayOutcome } from "../crash/upstream/relay";
 import { runGhDefault } from "../utils/gh";
 
 function createIo(): CrashReportIo {
@@ -87,6 +87,11 @@ export async function runCrashListCommand(json: boolean): Promise<void> {
  * same gate: with `crashReport.upstream` off, it explains that and exits
  * non-zero rather than quietly doing nothing.
  */
+export function crashRelayExitCode(outcome: CrashRelayOutcome): number {
+	if (outcome.status === "skipped") return outcome.reason === "nothing-to-relay" ? 0 : 1;
+	return outcome.failed > 0 || outcome.refused > 0 ? 1 : 0;
+}
+
 export async function runCrashRelayCommand(settings: Settings): Promise<void> {
 	const outcome = await relayCrashSignatures({ config: readTrustedRelayConfig(settings) });
 	if (outcome.status === "skipped") {
@@ -97,7 +102,7 @@ export async function runCrashRelayCommand(settings: Settings): Promise<void> {
 			"nothing-to-relay": "No crash signatures are due for relay.",
 		};
 		process.stdout.write(`${explain[outcome.reason] ?? outcome.reason}\n`);
-		if (outcome.reason !== "nothing-to-relay") process.exitCode = 1;
+		process.exitCode = crashRelayExitCode(outcome);
 		return;
 	}
 	process.stdout.write(`relayed ${outcome.sent}, refused ${outcome.refused}, failed ${outcome.failed}\n`);
@@ -105,5 +110,5 @@ export async function runCrashRelayCommand(settings: Settings): Promise<void> {
 		process.stdout.write("refused signatures failed the outbound sanitizer and were not sent.\n");
 	// A partially refused batch is not a success. Automation that only reads the
 	// exit code must not conclude the whole set was delivered.
-	if (outcome.failed > 0 || outcome.refused > 0) process.exitCode = 1;
+	process.exitCode = crashRelayExitCode(outcome);
 }
