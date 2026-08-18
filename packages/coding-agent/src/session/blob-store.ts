@@ -1518,7 +1518,16 @@ export class ResidentBlobMissingError extends Error {
 		readonly sessionId?: string,
 		readonly sessionFile?: string,
 	) {
-		super(`Missing resident ${kind} blob: ${hash}`);
+		// Every construction site already passes the session binding, so leaving it
+		// out of the message meant a fail-closed abort surfaced a bare 64-hex hash:
+		// nothing named the transcript to inspect, the session, or even the resident
+		// cache as the subsystem. Both values are already logged elsewhere for this
+		// store, so rendering them here exposes no new class of information.
+		super(
+			`Missing resident ${kind} blob: ${hash}` +
+				(sessionId ? ` (session ${sessionId})` : "") +
+				(sessionFile ? ` [${sessionFile}]` : ""),
+		);
 		this.name = "ResidentBlobMissingError";
 	}
 }

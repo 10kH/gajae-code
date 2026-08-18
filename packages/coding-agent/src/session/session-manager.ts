@@ -4981,6 +4981,30 @@ interface ResidentBlobStores {
 	onResidentBlobMissing?: (kind: ResidentBlobKind, hash: string) => void;
 }
 
+/**
+ * Record one bounded line where a missing resident blob is fatal.
+ *
+ * The degrading legacy resolvers each warn on a miss and the demotion salvage
+ * reports its placeholders, so the recoverable cases were observable in the log
+ * while the turn-killing ones were not: a fail-closed abort left no record
+ * naming the blob, its kind, or its session. Placeholder substitution stays
+ * silent here because it is self-evidencing in the transcript and already has
+ * its own callback.
+ */
+function reportResidentBlobMissing(
+	error: ResidentBlobMissingError,
+	phase: "materialize" | "stage-verify" | "cold-spill",
+): ResidentBlobMissingError {
+	logger.error("Resident blob missing on a fail-closed path", {
+		phase,
+		kind: error.kind,
+		hash: error.hash,
+		sessionId: error.sessionId,
+		sessionFile: error.sessionFile,
+	});
+	return error;
+}
+
 function residentBlobMissingPlaceholder(error: ResidentBlobMissingError): string {
 	return `[Session resident ${error.kind} blob missing: sha256:${error.hash}; original content unavailable]`;
 }
@@ -5065,6 +5089,7 @@ function materializeResidentValueSync(
 				resolved = residentBlobMissingPlaceholder(err);
 				stores.onResidentBlobMissing?.(err.kind, err.hash);
 			} else {
+				if (err instanceof ResidentBlobMissingError) reportResidentBlobMissing(err, "materialize");
 				throw err;
 			}
 		}
@@ -5126,7 +5151,10 @@ function assertResidentReferencesResolvableSync(entries: readonly FileEntry[], s
 			if (hash === null) throw new Error("Staged resident entry has an invalid blob reference.");
 			const store = value.kind === "text" ? stores.textStore : stores.imageStore;
 			if (store.getSync(hash) === null) {
-				throw new ResidentBlobMissingError(hash, value.kind, stores.sessionId, stores.sessionFile);
+				throw reportResidentBlobMissing(
+					new ResidentBlobMissingError(hash, value.kind, stores.sessionId, stores.sessionFile),
+					"stage-verify",
+				);
 			}
 			return;
 		}
@@ -5344,16 +5372,17 @@ function isColdSpillArgumentsSentinel(value: unknown): value is Record<string, u
 function residentBlobBytesForColdSpill(value: ResidentBlobSentinel, promotion: ColdSpillResidentPromotion): Buffer {
 	const hash = parseBlobRef(value.ref);
 	if (!hash)
-		throw new ResidentBlobMissingError(
-			value.ref,
-			value.kind,
-			promotion.stores.sessionId,
-			promotion.stores.sessionFile,
+		throw reportResidentBlobMissing(
+			new ResidentBlobMissingError(value.ref, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile),
+			"cold-spill",
 		);
 	const store = value.kind === "text" ? promotion.stores.textStore : promotion.stores.imageStore;
 	const data = store.getSync(hash);
 	if (!data)
-		throw new ResidentBlobMissingError(hash, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile);
+		throw reportResidentBlobMissing(
+			new ResidentBlobMissingError(hash, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile),
+			"cold-spill",
+		);
 	promotion.stores.onResidentBlobRead?.(value.kind);
 	if (value.kind === "imageData") return Buffer.from(data.toString("base64"), "utf8");
 	return Buffer.from(data);
