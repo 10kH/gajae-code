@@ -398,7 +398,7 @@ export class CommandController {
 			const toolCalls = msg.content.filter((c): c is ToolCall => c.type === "toolCall");
 			for (let j = toolCalls.length - 1; j >= 0; j--) {
 				const tc = toolCalls[j];
-				if (tc.name === "bash" && typeof tc.arguments.command === "string") {
+				if (tc.name === "bash" && typeof tc.arguments?.command === "string") {
 					this.#doCopy(tc.arguments.command, "Copied last bash command to clipboard");
 					return;
 				}
