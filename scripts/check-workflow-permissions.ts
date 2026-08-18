@@ -22,6 +22,10 @@ export interface WorkflowInput {
 
 export const JOB_WRITE_ALLOWLIST: readonly { workflow: string; job: string; scope: string }[] = [
 	{ workflow: ".github/workflows/ci.yml", job: "publish", scope: "contents" },
+	// npm trusted publishing (OIDC) needs a GitHub identity token to mint a
+	// short-lived registry credential. It grants nothing in this repository, and
+	// it is what removes the long-lived NPM_TOKEN from the release path.
+	{ workflow: ".github/workflows/ci.yml", job: "publish", scope: "id-token" },
 ];
 
 export const REQUIRED_READ_DEFAULT: readonly string[] = [
@@ -39,7 +43,7 @@ const EXPECTED_WORKFLOW_DEFAULT = "an explicit least-privilege permissions block
 const EXPECTED_SCOPE_VALUE = '"read", "write", or "none"';
 const EXPECTED_NON_WRITE_SCOPE = '"read" or "none"';
 const EXPECTED_PERMISSION_VALUE = '"read-all" or a permissions mapping';
-const JOB_WRITE_ALLOWLIST_NOTE = 'only job "publish" in .github/workflows/ci.yml may hold contents: write';
+const JOB_WRITE_ALLOWLIST_NOTE = 'only job "publish" in .github/workflows/ci.yml may hold contents: write or id-token: write';
 
 type RecordValue = Record<string, unknown>;
 

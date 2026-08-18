@@ -51,8 +51,14 @@ describe("workflow permission policy", () => {
 
 		expect(REQUIRED_READ_DEFAULT).toContain(CI_WORKFLOW);
 		expect(document.permissions).toEqual({ contents: "read" });
-		expect(JOB_WRITE_ALLOWLIST).toEqual([{ workflow: CI_WORKFLOW, job: "publish", scope: "contents" }]);
-		expect(jobWriteScopes(document)).toEqual(["publish.contents"]);
+		// publish is the only job allowed to escalate: contents for the GitHub
+		// Release, and id-token for npm trusted publishing (OIDC), which is what
+		// keeps a long-lived registry credential out of the release path.
+		expect(JOB_WRITE_ALLOWLIST).toEqual([
+			{ workflow: CI_WORKFLOW, job: "publish", scope: "contents" },
+			{ workflow: CI_WORKFLOW, job: "publish", scope: "id-token" },
+		]);
+		expect(jobWriteScopes(document)).toEqual(["publish.contents", "publish.id-token"]);
 	});
 
 	test("dev-ci.yml has an exact read-scoped workflow default and no write job scope", async () => {

@@ -483,7 +483,7 @@ describe("native release binary coverage", () => {
 		expect(publish).toContain("gajae-production-release");
 		expect(publish).toContain("gajae-nightly-release");
 		expect(publish).toContain("Persist pre-publication package evidence");
-		expect(publish).toContain("NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
+		expect(publish).toContain("id-token: write");
 
 		expect(publish).toContain("softprops/action-gh-release");
 		expect(publish).toContain("draft: false");

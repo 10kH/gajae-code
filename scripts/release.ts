@@ -425,7 +425,19 @@ async function pushReleaseRefsAtomically(version: string): Promise<void> {
 	if (!/^[0-9a-f]{40}$/u.test(sourceCommit)) throw new Error("Cannot resolve release commit for atomic push");
 	const push = await git(releaseAtomicPushArgs(version)).quiet().nothrow();
 	if (push.exitCode !== 0) {
-		throw new Error(`Atomic push of main and v${version} was rejected; neither ref may be retried independently: ${outputOf(push) || `exit ${push.exitCode ?? "unknown"}`}`);
+		// Nothing reached origin, so the local tag created moments ago is the only
+		// artifact of this attempt. Leaving it behind makes the immutable-tag
+		// preflight reject the *same* version on the next run, forcing a version
+		// burn for a failure that published nothing. Drop it and let the operator
+		// retry this version once the push cause is resolved.
+		const rollback = await git(["tag", "--delete", `v${version}`]).quiet().nothrow();
+		const rollbackNote =
+			rollback.exitCode === 0
+				? `Local tag v${version} was removed, so this version can be retried.`
+				: `Local tag v${version} could not be removed; delete it before retrying (git tag -d v${version}).`;
+		throw new Error(
+			`Atomic push of main and v${version} was rejected; neither ref may be retried independently: ${outputOf(push) || `exit ${push.exitCode ?? "unknown"}`}. ${rollbackNote}`,
+		);
 	}
 	const tag = `v${version}`;
 	const remote = await git(["ls-remote", "origin", "refs/heads/main", `refs/tags/${tag}`, `refs/tags/${tag}^{}`]).quiet().nothrow();

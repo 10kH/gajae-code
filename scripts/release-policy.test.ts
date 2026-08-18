@@ -59,15 +59,21 @@ describe("stable release policy", () => {
 		expect(concurrency).not.toContain("cancel-in-progress: true");
 	});
 
-	test("npm token stays in an ephemeral credential file, never the home npmrc", async () => {
+	test("publishes through npm trusted publishing, with no long-lived credential in the release path", async () => {
 		const ci = await workflow();
 		const publish = jobSection(ci, "publish");
 
-		expect(publish).toContain("NPM_TOKEN: ${{ secrets.NPM_TOKEN }}");
-		expect(publish).toContain("NPM_CONFIG_USERCONFIG");
-		expect(publish).toContain('mktemp "$RUNNER_TEMP/npmrc.XXXXXX"');
-		expect(publish).toContain("trap 'rm -f \"$npm_config\"' EXIT");
+		// A stale _authToken outranks OIDC and fails closed as a registry 404
+		// that reads like a missing package, so no token may reach this job.
+		expect(publish).not.toContain("secrets.NPM_TOKEN");
+		expect(publish).not.toContain("NODE_AUTH_TOKEN:");
+		expect(publish).not.toContain("NPM_CONFIG_USERCONFIG");
+		expect(publish).not.toContain("_authToken");
 		expect(publish).not.toContain("~/.npmrc");
+
+		// OIDC needs the identity token and an npm new enough to exchange it.
+		expect(publish).toContain("id-token: write");
+		expect(publish).toContain("npm install -g npm@^11.5.1");
 	});
 
 	test("the publish job carries the stable finalization job name", async () => {
