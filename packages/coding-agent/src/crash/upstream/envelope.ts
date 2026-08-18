@@ -40,6 +40,20 @@ function coarseDate(epochMs: number): string | undefined {
 	return date.toISOString().slice(0, 10);
 }
 
+/**
+ * Seconds at UTC midnight of the given instant.
+ *
+ * Sentry requires an event `timestamp`, but the egress contract says exact
+ * crash times never leave the machine: a precise timestamp is a behavioural
+ * fingerprint of when a specific person was working. Truncating to the day
+ * keeps the field well-formed and keeps the resolution identical to the
+ * firstSeen/lastSeen dates the issue flow already publishes.
+ */
+function coarseEpochSeconds(epochMs: number): number | undefined {
+	const date = coarseDate(epochMs);
+	return date === undefined ? undefined : Date.parse(`${date}T00:00:00.000Z`) / 1000;
+}
+
 function reject(reason: string): BuildCrashEnvelopeResult {
 	return { ok: false, reason };
 }
@@ -84,9 +98,11 @@ export function buildCrashEnvelope(input: BuildCrashEnvelopeInput): BuildCrashEn
 
 	const dsn = toDsnString(input.dsn);
 	if (!dsn) return reject("invalid dsn");
+	const coarseTimestamp = coarseEpochSeconds(input.lastSeen);
+	if (coarseTimestamp === undefined) return reject("invalid timestamp");
 	const payload = JSON.stringify({
 		event_id: input.eventId,
-		timestamp: input.lastSeen / 1000,
+		timestamp: coarseTimestamp,
 		platform: "node",
 		level: "fatal",
 		logger: "gjc.crash",
@@ -116,6 +132,10 @@ export function buildCrashEnvelope(input: BuildCrashEnvelopeInput): BuildCrashEn
 		length: Buffer.byteLength(payload, "utf8"),
 		content_type: "application/json",
 	});
+	// `sent_at` is transport metadata for clock-skew correction, and the receiver
+	// observes the true arrival time from the request itself, so coarsening it
+	// would hide nothing while breaking that correction. It deliberately stays
+	// exact; the crash's own timestamp above does not.
 	const envelopeHeader = JSON.stringify({ event_id: input.eventId, sent_at: sentAt.toISOString(), dsn });
 	const body = `${envelopeHeader}\n${itemHeader}\n${payload}`;
 	if (Buffer.byteLength(body, "utf8") > CRASH_BODY_MAX_BYTES) return reject("envelope exceeds size limit");

@@ -2,13 +2,18 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { appendCrashEvent, formatCrashRecordMarker } from "@gajae-code/utils";
 import type { CrashSignatureView, CrashStatePaths } from "../src/crash/index-store";
+import { compactCrashIndex, listCrashSignatures } from "../src/crash/index-store";
 import {
 	CRASH_UPSTREAM_DSN_ENV,
 	type CrashRelayConfig,
+	type CrashRelayFetch,
 	isRelayDue,
+	readTrustedRelayConfig,
 	relayCrashSignatures,
 	resolveRelayDsn,
+	type TrustedRelaySettings,
 } from "../src/crash/upstream/relay";
 
 const DSN = "https://abc123@o1.ingest.sentry.io/4511929997721600";
@@ -76,9 +81,84 @@ describe("isRelayDue", () => {
 	});
 });
 
+describe("readTrustedRelayConfig", () => {
+	/**
+	 * The whole opt-in claim rests on this: `Settings.get` merges project `.gjc`
+	 * configuration, so reading through it would let opening a repository enable
+	 * the relay and choose its destination.
+	 */
+	function settingsDouble(
+		global: Partial<Record<string, unknown>>,
+		merged: Partial<Record<string, unknown>>,
+	): TrustedRelaySettings & { get(path: string): unknown } {
+		return {
+			getGlobal: path => global[path],
+			get: path => merged[path],
+		};
+	}
+
+	test("project configuration cannot enable the relay", () => {
+		const settings = settingsDouble({}, { "crashReport.upstream": "sentry", "crashReport.upstreamDsn": DSN });
+		expect(readTrustedRelayConfig(settings)).toEqual({ upstream: "off", dsn: "" });
+	});
+
+	test("project configuration cannot redirect an already-enabled relay", () => {
+		const settings = settingsDouble(
+			{ "crashReport.upstream": "sentry", "crashReport.upstreamDsn": DSN },
+			{ "crashReport.upstreamDsn": "https://evil@attacker.example.com/9" },
+		);
+		expect(readTrustedRelayConfig(settings).dsn).toBe(DSN);
+	});
+
+	test("an unset global value lands on off rather than a schema default", () => {
+		expect(readTrustedRelayConfig(settingsDouble({}, {}))).toEqual({ upstream: "off", dsn: "" });
+	});
+
+	test("a malformed hand-edited global value fails closed", () => {
+		expect(
+			readTrustedRelayConfig(
+				settingsDouble({ "crashReport.upstream": "SENTRY", "crashReport.upstreamDsn": 42 }, {}),
+			),
+		).toEqual({ upstream: "off", dsn: "" });
+	});
+});
+
 describe("relayCrashSignatures", () => {
 	let dir = "";
 	let paths: CrashStatePaths;
+
+	const RECORD_ID = "0123456789abcdef";
+	const STACK = "    at readFile (packages/coding-agent/src/tools/read.ts:12:9)";
+
+	/** Seed one journaled occurrence plus the crash-log record it points at. */
+	async function seed(overrides: { at?: number; fingerprint?: string; recordId?: string } = {}): Promise<void> {
+		const fingerprint = overrides.fingerprint ?? FINGERPRINT;
+		const recordId = overrides.recordId ?? RECORD_ID;
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint,
+				fpv: 1,
+				recordId,
+				at: overrides.at ?? 1_700_000_900_000,
+				errorName: "TypeError",
+				messageClass: "cannot read properties of <redacted>",
+			},
+			paths.events,
+		);
+		await fs.appendFile(
+			paths.crashLog,
+			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: cannot read properties of <redacted>\n` +
+				`${STACK}\n${formatCrashRecordMarker(fingerprint, 1, recordId)}\n\n`,
+		);
+	}
+
+	function accept(seen: string[]): CrashRelayFetch {
+		return async (_url, init) => {
+			seen.push(String(init.body));
+			return new Response(JSON.stringify({ id: "a".repeat(32) }), { status: 200 });
+		};
+	}
 
 	beforeEach(async () => {
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-relay-"));
@@ -133,5 +213,120 @@ describe("relayCrashSignatures", () => {
 			fetchImpl: async () => new Response("", { status: 200 }),
 		});
 		expect(outcome).toEqual({ status: "skipped", reason: "nothing-to-relay" });
+	});
+
+	test("posts one envelope per due signature and stamps it relayed", async () => {
+		await seed();
+		const bodies: string[] = [];
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: accept(bodies),
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(bodies).toHaveLength(1);
+
+		const index = await compactCrashIndex({ paths });
+		expect(listCrashSignatures(index)[0]?.relayedAt).toBe(1_700_000_900_000);
+	});
+
+	test("a rerun with no new occurrences sends nothing", async () => {
+		await seed();
+		const bodies: string[] = [];
+		await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		const second = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		expect(second).toEqual({ status: "skipped", reason: "nothing-to-relay" });
+		expect(bodies).toHaveLength(1);
+	});
+
+	test("an occurrence newer than the relayed watermark makes the signature due again", async () => {
+		await seed();
+		const bodies: string[] = [];
+		await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		// This is the race the watermark stamp exists for: a crash that landed after
+		// the snapshot must not be swallowed by the previous stamp.
+		await seed({ at: 1_700_000_999_000, recordId: "fedcba9876543210" });
+		const second = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		expect(second).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(bodies).toHaveLength(2);
+	});
+
+	test("a non-2xx response counts as failed and leaves the signature due", async () => {
+		await seed();
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async () => new Response("nope", { status: 429 }),
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 0, refused: 0, failed: 1 });
+		const index = await compactCrashIndex({ paths });
+		expect(listCrashSignatures(index)[0]?.relayedAt).toBeUndefined();
+	});
+
+	test("a transport rejection is contained and never escapes as a throw", async () => {
+		await seed();
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async () => {
+				throw new Error("offline");
+			},
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 0, refused: 0, failed: 1 });
+	});
+
+	test("a signature with no recoverable record is refused, not sent", async () => {
+		// Journal the occurrence but never write the crash-log record it names.
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: FINGERPRINT,
+				fpv: 1,
+				recordId: RECORD_ID,
+				at: 1_700_000_900_000,
+				errorName: "TypeError",
+				messageClass: "cannot read properties of <redacted>",
+			},
+			paths.events,
+		);
+		await fs.writeFile(paths.crashLog, "unrelated log content\n");
+		let called = 0;
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async () => {
+				called++;
+				return new Response("", { status: 200 });
+			},
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 0, refused: 1, failed: 0 });
+		expect(called).toBe(0);
+	});
+
+	test("never sends more than the per-run cap", async () => {
+		for (let i = 0; i < 4; i++)
+			await seed({ fingerprint: `${i}`.repeat(32), recordId: `${i}`.repeat(16), at: 1_700_000_900_000 + i });
+		const bodies: string[] = [];
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			maxPerRun: 2,
+			fetchImpl: accept(bodies),
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 2, refused: 0, failed: 0 });
+		expect(bodies).toHaveLength(2);
+	});
+
+	test("the emitted envelope carries no timestamp finer than a day", async () => {
+		await seed();
+		const bodies: string[] = [];
+		await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		const payload = JSON.parse(bodies[0]?.split("\n")[2] ?? "{}") as { timestamp: number };
+		expect(payload.timestamp % 86_400).toBe(0);
 	});
 });

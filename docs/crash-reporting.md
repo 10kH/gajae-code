@@ -150,8 +150,18 @@ default: `crashReport.upstream` defaults to `off`, and `crashReport.upstreamDsn`
 the Sentry DSN only when the upstream is enabled. With no DSN, network behavior does not
 change. No DSN is compiled into the binary, so there is no default destination.
 
+Both keys are read from the **user/global settings layer only**, never the merged view.
+Project `.gjc` configuration cannot enable the relay and cannot choose its destination, so
+opening an untrusted repository cannot turn on transmission or redirect crash signatures
+that were recorded before that repository existed on the machine. Values are re-validated
+on read: anything other than the literal `sentry` is treated as `off`, and a non-string DSN
+is treated as absent, so a hand-edited global config fails closed. The
+`GJC_CRASH_SENTRY_DSN` environment variable is only consulted once that trusted global
+opt-in is already on; it cannot enable the relay by itself.
+
 The relay never runs on the fatal path. It runs at the next startup during index
-compaction, preserving the crashing process's exactly-one-`O_APPEND` write. The exact
+compaction, preserving the crashing process's exactly-one-`O_APPEND` write. It is bounded
+to 8 signatures per run with a 10s per-request timeout. The exact
 payload keys that leave the machine are `event_id`, `timestamp`, `platform`, `level`,
 `logger`, `release`, `environment`, `fingerprint`, `exception.values[].type`,
 `.value`, `.stacktrace.frames[].filename`, `.function`, `.in_app`, `tags`, `extra`, and
@@ -164,9 +174,21 @@ text, source code, file contents, or credentials are included. The gjc fingerpri
 sent as Sentry's `fingerprint` array, making grouping ours rather than Sentry's heuristics:
 one upstream issue per gjc signature.
 
-The relay sends once per occurrence batch. A `relayed` journal event stamps `relayedAt`,
-so reruns do not resend unless `lastSeen` advanced. `relayedAt` is deliberately not an
-input to index eviction.
+Timestamps follow the same coarsening rule as the issue flow: the event `timestamp` is
+truncated to UTC midnight of the crash date, so an exact crash time -- which is a
+behavioural record of when a specific person was working -- never leaves the machine. The
+envelope's `sent_at` header stays exact because it is transport metadata for clock-skew
+correction and the receiver observes the true arrival time from the request regardless.
+
+The relay sends once per occurrence batch. A `relayed` journal event stamps `relayedAt`
+with the `lastSeen` watermark the accepted envelope actually represented, not the wall
+clock. An occurrence appended between the snapshot and the stamp therefore leaves the
+signature due again rather than being silently swallowed; the failure direction is at worst
+one duplicate event, which Sentry folds into the same fingerprint group. `relayedAt` is
+deliberately not an input to index eviction.
+
+`gjc crash relay` exits non-zero when any signature was refused by the sanitizer or failed
+in transport, so a partially delivered batch is never reported to automation as a success.
 
 The fingerprint remains a public, pseudonymous correlation token, not a confidentiality
 control. In addition to its local correlation role, it links the same crash class across
