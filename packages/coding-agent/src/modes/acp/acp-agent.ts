@@ -2848,15 +2848,17 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(id);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${id}`);
 		const modelPreset = this.#startupOptions?.modelPreset;
-		const [config, modelCatalog] = await Promise.all([
+		const [config, modelCatalog, activeProvidersResult] = await Promise.all([
 			record.adapter.query("config.list/get"),
 			modelPreset === undefined ? collectModelCatalog(record.adapter) : record.adapter.query("models.profiles.list"),
+			modelPreset === undefined ? collectActiveProviderIds(record.adapter) : Promise.resolve(undefined),
 		]);
-		// Resolve usable providers in parallel. Only an older session host that
-		// rejects `providers.list/active` with `operation_not_session_owned`
-		// falls back to the full catalog; operational failures fail closed so
-		// the active-provider contract is not silently widened.
-		const activeProviders = modelPreset === undefined ? await collectActiveProviderIds(record.adapter) : undefined;
+		// Resolved in the same batch above: the active-provider walk is independent of the config and
+		// catalog reads, so awaiting it afterwards only added its latency to session creation. Only an
+		// older session host that rejects `providers.list/active` with `operation_not_session_owned`
+		// falls back to the full catalog; operational failures fail closed so the active-provider
+		// contract is not silently widened.
+		const activeProviders = activeProvidersResult;
 		record.authFailure = undefined;
 		if (modelPreset !== undefined) {
 			const activePreset = configValues(config).get(MODEL_PRESET_CONFIG_KEY);
