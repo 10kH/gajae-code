@@ -12,7 +12,7 @@ import { getCrashIndexPath } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import { compactCrashIndex, listCrashSignatures, resolveCrashStatePaths } from "../crash/index-store";
 import { type CrashReportIo, type CrashReportOutcome, runCrashReportFlow } from "../crash/report";
-import { readTrustedRelayConfig, relayCrashSignatures, type CrashRelayOutcome } from "../crash/upstream/relay";
+import { type CrashRelayOutcome, readTrustedRelayConfig, relayCrashSignatures } from "../crash/upstream/relay";
 import { runGhDefault } from "../utils/gh";
 
 function createIo(): CrashReportIo {
