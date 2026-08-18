@@ -324,6 +324,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
 
 	/**
+	 * Returns steering messages that were dequeued for this run but cannot be
+	 * delivered by it, so the next run can pick them up.
+	 *
+	 * A user interrupt that lands while a tool is executing aborts the run's
+	 * signal without ending the loop: the loop still unwinds the tool and reaches
+	 * its steering drain. Continuing there would start a turn on an already
+	 * aborted signal, which the provider call rejects before the first token, so
+	 * the loop hands the messages back instead and ends the run.
+	 */
+	requeueSteeringMessages?: (messages: AgentMessage[]) => void;
+
+	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
 	 *
 	 * Called when the agent has no more tool calls and no steering messages.
