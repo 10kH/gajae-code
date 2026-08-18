@@ -27,7 +27,7 @@ import {
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
 import { compactCrashIndex, resolveCrashStatePaths } from "../crash/index-store";
 import { crashNudgeGate, maybeShowCrashNudge } from "../crash/nudge";
-import { relayCrashSignatures } from "../crash/upstream/relay";
+import { readTrustedRelayConfig, relayCrashSignatures } from "../crash/upstream/relay";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
 	ExtensionUIContext,
@@ -988,19 +988,16 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 
 		// Opt-in upstream relay. Deliberately separate from the nudge: the nudge is
-		// local-only, this one can reach the network. It self-gates on
-		// `crashReport.upstream` before touching any state, so the default `off`
-		// path costs one settings read and nothing else.
-		if (settings.get("crashReport.upstream") !== "off") {
+		// local-only, this one can reach the network. Configuration is read from the
+		// trusted global layer only, so opening a repository can neither enable it
+		// nor choose its destination, and the default `off` path costs one settings
+		// read and nothing else.
+		const crashRelayConfig = readTrustedRelayConfig(settings);
+		if (crashRelayConfig.upstream !== "off") {
 			const crashRelayTimer = setTimeout(() => {
 				void (async () => {
 					try {
-						const outcome = await relayCrashSignatures({
-							config: {
-								upstream: settings.get("crashReport.upstream"),
-								dsn: settings.get("crashReport.upstreamDsn") ?? "",
-							},
-						});
+						const outcome = await relayCrashSignatures({ config: crashRelayConfig });
 						logger.debug("Crash relay finished", { outcome });
 					} catch (error) {
 						logger.debug("Crash relay skipped", {

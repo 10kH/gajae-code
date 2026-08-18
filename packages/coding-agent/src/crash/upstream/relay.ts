@@ -48,6 +48,38 @@ export interface CrashRelayConfig {
 }
 
 /**
+ * The only settings surface the relay is allowed to read.
+ *
+ * `Settings.get` merges project `.gjc` configuration into the answer, so using
+ * it here would let merely opening a repository turn the relay on and choose
+ * its destination — an untrusted checkout could redirect crash signatures that
+ * were recorded long before it was cloned. Both keys are therefore read from
+ * the user/global layer only, which is exactly what `getGlobal` documents
+ * itself for.
+ */
+export interface TrustedRelaySettings {
+	getGlobal(path: "crashReport.upstream" | "crashReport.upstreamDsn"): unknown;
+}
+
+/**
+ * Resolve the relay configuration from the trusted layer.
+ *
+ * The values are re-validated rather than trusted by type. `getGlobal` reports
+ * whatever the hand-editable global config file holds, and it returns
+ * `undefined` instead of a schema default, so anything that is not literally
+ * `"sentry"` lands on `off` and anything that is not a string lands on an empty
+ * DSN. Both absent and malformed therefore fail closed.
+ */
+export function readTrustedRelayConfig(settings: TrustedRelaySettings): CrashRelayConfig {
+	const upstream = settings.getGlobal("crashReport.upstream");
+	const dsn = settings.getGlobal("crashReport.upstreamDsn");
+	return {
+		upstream: upstream === "sentry" ? "sentry" : "off",
+		dsn: typeof dsn === "string" ? dsn : "",
+	};
+}
+
+/**
  * The exact shape the relay uses. Narrower than `typeof fetch` on purpose: the
  * relay only ever issues one POST to a known URL, and depending on the full
  * runtime signature (Bun adds `preconnect`) would force every caller and test
@@ -196,8 +228,15 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 			continue;
 		}
 
+		// Stamp the watermark the envelope actually represented, not the wall clock.
+		// An occurrence appended between the snapshot above and this write advances
+		// `lastSeen` past what was sent; stamping `now()` would hide it behind
+		// `isRelayDue` and that occurrence would never be relayed. Stamping the
+		// snapshot's `lastSeen` leaves the signature due again, which is the
+		// conservative direction: at worst one duplicate event that Sentry folds
+		// into the same fingerprint group.
 		await recordCrashStateEvent(
-			{ kind: "relayed", fingerprint: signature.fingerprint, at: now(), eventId: envelope.eventId },
+			{ kind: "relayed", fingerprint: signature.fingerprint, at: signature.lastSeen, eventId: envelope.eventId },
 			{ paths },
 		);
 		sent++;
