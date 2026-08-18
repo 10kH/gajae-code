@@ -9,9 +9,7 @@ describe("sanitizeHeaderComponent", () => {
 	});
 
 	it("strips the non-ASCII Android kernel release characters", () => {
-		expect(sanitizeHeaderComponent("4.4.302-Minimal™-EAS-QTI_Haptic-R26")).toBe(
-			"4.4.302-Minimal-EAS-QTI_Haptic-R26",
-		);
+		expect(sanitizeHeaderComponent("4.4.302-Minimal™-EAS-QTI_Haptic-R26")).toBe("4.4.302-Minimal-EAS-QTI_Haptic-R26");
 	});
 
 	it("strips control characters", () => {

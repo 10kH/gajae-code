@@ -105,7 +105,7 @@ export function buildKimiCommonHeaders(): Readonly<Record<string, string>> {
 
 let memoizedKimiCommonHeaders: Readonly<Record<string, string>> | undefined;
 
-export let getKimiCommonHeaders = () => {
+export const getKimiCommonHeaders = () => {
 	memoizedKimiCommonHeaders ??= buildKimiCommonHeaders();
 	return memoizedKimiCommonHeaders;
 };

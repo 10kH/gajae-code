@@ -1,5 +1,5 @@
-import * as os from "node:os";
 import { describe, expect, it, vi } from "bun:test";
+import * as os from "node:os";
 import type { AuthStorage } from "@gajae-code/ai";
 import { hookFetch } from "@gajae-code/utils";
 import { AgentStorage } from "../../../src/session/agent-storage";

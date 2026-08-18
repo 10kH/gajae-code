@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as dns from "node:dns/promises";
-import * as os from "node:os";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import * as http from "node:http";
 import * as https from "node:https";
+import * as os from "node:os";
 import { Readable } from "node:stream";
 import type { Model } from "@gajae-code/ai";
 import type { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";

@@ -1,5 +1,5 @@
-import * as os from "node:os";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as os from "node:os";
 import { buildKimiCommonHeaders } from "@gajae-code/ai/utils/oauth/kimi";
 
 let hostnameSpy: ReturnType<typeof vi.spyOn>;
