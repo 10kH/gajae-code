@@ -640,6 +640,14 @@ export function transferSessionMessageIdentity(source: AgentMessage[], target: A
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
 	type: "thinking_level_change";
 	thinkingLevel?: string | null;
+	/**
+	 * True only when an operator effort surface (`setThinkingLevelForControl`,
+	 * Shift+Tab `cycleThinkingLevel`) recorded this entry. Model-driven appends
+	 * (model-switch `defaultLevel`, temporary model switches, context clears,
+	 * re-applies after model cycling) leave it unset so `getThinkingScopeForControl`
+	 * never mints session scope without operator effort intent (issue #4695).
+	 */
+	operatorIntent?: boolean;
 }
 
 export interface ModelChangeEntry extends SessionEntryBase {
@@ -3668,6 +3676,7 @@ function hasStrictSessionSchema(entries: readonly FileEntry[]): boolean {
 					typeof value.thinkingLevel !== "string"
 				)
 					return false;
+				if (value.operatorIntent !== undefined && typeof value.operatorIntent !== "boolean") return false;
 				break;
 			case "service_tier_change":
 				if (value.serviceTier !== null && typeof value.serviceTier !== "string") return false;
@@ -16645,13 +16654,14 @@ export class SessionManager {
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
-	appendThinkingLevelChange(thinkingLevel?: string): string {
+	appendThinkingLevelChange(thinkingLevel?: string, operatorIntent = false): string {
 		const entry: ThinkingLevelChangeEntry = {
 			type: "thinking_level_change",
 			id: this.#generateEntryId(),
 			parentId: this.#leafId,
 			timestamp: new Date().toISOString(),
 			thinkingLevel: thinkingLevel ?? null,
+			operatorIntent: operatorIntent || undefined,
 		};
 		this.#appendEntry(entry);
 		return entry.id;
