@@ -1,0 +1,230 @@
+/**
+ * Opt-in crash relay to a Sentry-compatible upstream.
+ *
+ * This is a **second, separate** egress channel from `gjc crash report`. The
+ * issue flow keeps its per-invocation, digest-confirmed consent boundary; this
+ * one is gated by configuration instead, and is therefore deliberately much
+ * narrower in what it can ever emit:
+ *
+ * 1. `crashReport.upstream` must be `sentry`. The default is `off`, and while
+ *    it is off this module performs no IO at all — not even a state read.
+ * 2. An operator must supply a DSN. No DSN literal is compiled into the binary,
+ *    so a build has no destination to fall back to; an unset DSN is a hard stop
+ *    and never means "use ours".
+ * 3. Every crash-derived byte must pass `sanitizeExternalCrashV1`. A refusal
+ *    drops that signature entirely. There is no less-sanitized fallback path.
+ *
+ * The relay never runs on the fatal path. A crashing process still does exactly
+ * one `O_APPEND` write and dies; relaying happens at the *next* startup, after
+ * compaction, where blocking and failing are both safe.
+ */
+import * as fs from "node:fs/promises";
+import { normalizeCrashFrames, VERSION } from "@gajae-code/utils";
+import {
+	type CrashSignatureView,
+	type CrashStatePaths,
+	compactCrashIndex,
+	listCrashSignatures,
+	recordCrashStateEvent,
+	resolveCrashStatePaths,
+} from "../index-store";
+import { findLatestRecord } from "../record-loader";
+import { parseSentryDsn, type SentryDsn } from "./dsn";
+import { buildCrashEnvelope, type CrashEventFrame, newSentryEventId, sentryAuthHeader } from "./envelope";
+
+/** Environment variable form of the DSN, for CI and one-off runs. */
+export const CRASH_UPSTREAM_DSN_ENV = "GJC_CRASH_SENTRY_DSN";
+
+/**
+ * Cap per startup. A crash loop can produce many signatures; a bounded batch
+ * keeps a pathological machine from turning startup into a network stall.
+ */
+const MAX_RELAY_PER_RUN = 8;
+const RELAY_TIMEOUT_MS = 10_000;
+
+export interface CrashRelayConfig {
+	readonly upstream: "off" | "sentry";
+	readonly dsn: string;
+}
+
+/**
+ * The exact shape the relay uses. Narrower than `typeof fetch` on purpose: the
+ * relay only ever issues one POST to a known URL, and depending on the full
+ * runtime signature (Bun adds `preconnect`) would force every caller and test
+ * double to fake surface this module never touches.
+ */
+export type CrashRelayFetch = (url: string, init: RequestInit) => Promise<Response>;
+
+export type CrashRelaySkip = "disabled" | "no-dsn" | "invalid-dsn" | "nothing-to-relay";
+
+export type CrashRelayOutcome =
+	| { readonly status: "skipped"; readonly reason: CrashRelaySkip }
+	| {
+			readonly status: "ran";
+			/** Signatures the upstream accepted and that are now stamped `relayedAt`. */
+			readonly sent: number;
+			/** Signatures dropped because the sanitizer refused a field. */
+			readonly refused: number;
+			/** Signatures the upstream rejected or that failed in transport. */
+			readonly failed: number;
+	  };
+
+export interface CrashRelayOptions {
+	readonly config: CrashRelayConfig;
+	readonly paths?: CrashStatePaths;
+	readonly env?: Record<string, string | undefined>;
+	readonly fetchImpl?: CrashRelayFetch;
+	readonly now?: () => number;
+	readonly maxPerRun?: number;
+	readonly platform?: string;
+	readonly release?: string;
+	readonly bunVersion?: string;
+}
+
+/**
+ * Resolve the destination. Explicit config wins over the environment so a
+ * machine-wide export cannot silently redirect a configured install.
+ */
+export function resolveRelayDsn(
+	config: CrashRelayConfig,
+	env: Record<string, string | undefined>,
+): { ok: true; dsn: SentryDsn } | { ok: false; reason: CrashRelaySkip } {
+	if (config.upstream !== "sentry") return { ok: false, reason: "disabled" };
+	const raw = config.dsn.trim() || (env[CRASH_UPSTREAM_DSN_ENV] ?? "").trim();
+	if (!raw) return { ok: false, reason: "no-dsn" };
+	const dsn = parseSentryDsn(raw);
+	if (!dsn) return { ok: false, reason: "invalid-dsn" };
+	return { ok: true, dsn };
+}
+
+/**
+ * A signature is due when it has never been relayed, or when new occurrences
+ * have landed since the last accepted send. Sentry groups by our fingerprint,
+ * so a repeat send updates that group's count rather than creating noise.
+ */
+export function isRelayDue(signature: CrashSignatureView): boolean {
+	const relayedAt = signature.relayedAt;
+	return relayedAt === undefined || relayedAt < signature.lastSeen;
+}
+
+/** Split a normalized `path#function` frame into Sentry's frame shape. */
+function toEventFrames(stack: string): CrashEventFrame[] {
+	return normalizeCrashFrames(stack).map(frame => {
+		const hash = frame.lastIndexOf("#");
+		return hash < 0
+			? { filename: frame, function: "<anonymous>" }
+			: { filename: frame.slice(0, hash), function: frame.slice(hash + 1) };
+	});
+}
+
+function coarsePlatform(): string {
+	if (process.platform === "darwin") return "macOS";
+	if (process.platform === "win32") return "Windows";
+	return "Linux";
+}
+
+/**
+ * Relay every due signature once. Never throws: a broken upstream, an offline
+ * machine or a corrupt crash log must not be able to take down startup.
+ */
+export async function relayCrashSignatures(options: CrashRelayOptions): Promise<CrashRelayOutcome> {
+	const env = options.env ?? process.env;
+	const resolved = resolveRelayDsn(options.config, env);
+	// Gate before any filesystem access: `off` must be indistinguishable from
+	// the feature not existing.
+	if (!resolved.ok) return { status: "skipped", reason: resolved.reason };
+
+	const paths = options.paths ?? resolveCrashStatePaths();
+	const fetchImpl = options.fetchImpl ?? fetch;
+	const now = options.now ?? Date.now;
+	const release = options.release ?? VERSION;
+	const platform = options.platform ?? coarsePlatform();
+	const bunVersion = options.bunVersion ?? Bun.version;
+	const limit = options.maxPerRun ?? MAX_RELAY_PER_RUN;
+
+	// Compaction is the same step the nudge and the CLI rely on: it folds the
+	// append-only journal into the index under the cross-process lock, so the
+	// counts we are about to relay are the reconciled ones.
+	const index = await compactCrashIndex({ paths, now: now() });
+	const signatures = listCrashSignatures(index).filter(isRelayDue).slice(0, limit);
+	if (signatures.length === 0) return { status: "skipped", reason: "nothing-to-relay" };
+
+	let crashLog = "";
+	try {
+		crashLog = await fs.readFile(paths.crashLog, "utf8");
+	} catch {
+		// A missing or unreadable log means no stack to attach; the signature
+		// metadata alone is not worth a send.
+		return { status: "skipped", reason: "nothing-to-relay" };
+	}
+
+	let sent = 0;
+	let refused = 0;
+	let failed = 0;
+
+	for (const signature of signatures) {
+		const record = findLatestRecord(crashLog, signature.fingerprint);
+		if (!record) {
+			refused++;
+			continue;
+		}
+
+		const envelope = buildCrashEnvelope({
+			eventId: newSentryEventId(),
+			fingerprint: signature.fingerprint,
+			errorName: signature.errorName,
+			messageClass: signature.messageClass,
+			frames: toEventFrames(record.body),
+			firstSeen: signature.firstSeen,
+			lastSeen: signature.lastSeen,
+			lifetimeCount: signature.lifetimeCount,
+			release,
+			platform,
+			bunVersion,
+			sentAt: now(),
+			dsn: resolved.dsn,
+		});
+		if (!envelope.ok) {
+			// Fail closed. Deliberately no retry with a reduced payload.
+			refused++;
+			continue;
+		}
+
+		const accepted = await postEnvelope(fetchImpl, resolved.dsn, envelope.body, release);
+		if (!accepted) {
+			failed++;
+			continue;
+		}
+
+		await recordCrashStateEvent(
+			{ kind: "relayed", fingerprint: signature.fingerprint, at: now(), eventId: envelope.eventId },
+			{ paths },
+		);
+		sent++;
+	}
+
+	return { status: "ran", sent, refused, failed };
+}
+
+/** POST one envelope. Any non-2xx, transport error or timeout is a plain false. */
+async function postEnvelope(
+	fetchImpl: CrashRelayFetch,
+	dsn: SentryDsn,
+	body: string,
+	release: string,
+): Promise<boolean> {
+	try {
+		const response = await fetchImpl(dsn.envelopeUrl, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/x-sentry-envelope",
+				"X-Sentry-Auth": sentryAuthHeader(dsn, release),
+			},
+			body,
+			signal: AbortSignal.timeout(RELAY_TIMEOUT_MS),
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
