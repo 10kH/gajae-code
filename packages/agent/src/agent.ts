@@ -1793,6 +1793,10 @@ export class Agent {
 				}
 				return queued;
 			},
+			requeueSteeringMessages: (messages: AgentMessage[]) => {
+				if (messages.length === 0) return;
+				this.#steeringQueue = [...messages, ...this.#steeringQueue];
+			},
 			getFollowUpMessages: async () => {
 				if (this.#activeRunId !== runId) {
 					return [];

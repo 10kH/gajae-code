@@ -112,6 +112,67 @@ describe("AgentSession steer-on-interrupt", () => {
 		).toBe(true);
 	});
 
+	// A user interrupt that lands while a tool is executing aborts the run's signal
+	// without ending the loop: the loop still unwinds the tool and reaches its
+	// steering drain. Consuming the steer there opened a turn on the aborted
+	// signal, which the provider rejects before the first token — so the steer was
+	// delivered and answered by an instantly-aborted turn, and the session went
+	// idle showing only "Operation aborted". Interrupting a tool must hand the
+	// steer to a fresh run instead.
+	it("delivers queued steering after interrupting an in-flight tool", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic test model to exist");
+		let releaseTool: (() => void) | undefined;
+		const toolStarted = Promise.withResolvers<void>();
+		const blockingTool = {
+			name: "blocks",
+			description: "Blocks until released so an interrupt can land mid-execution.",
+			parameters: { type: "object" as const, properties: {} },
+			execute: async () => {
+				toolStarted.resolve();
+				await new Promise<void>(resolve => {
+					releaseTool = resolve;
+				});
+				return { content: [{ type: "text" as const, text: "tool finished" }] };
+			},
+		};
+		const mock = createMockModel({
+			responses: [
+				{ content: [{ type: "toolCall", name: "blocks", arguments: {} }] },
+				{ content: ["handled steering"] },
+			],
+		});
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model, systemPrompt: ["Test"], tools: [blockingTool as never], messages: [] },
+			streamFn: mock.stream,
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false });
+		settings.setModelRole("default", `${model.provider}/${model.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+
+		const running = session.prompt("run the blocking tool");
+		await toolStarted.promise;
+
+		session.agent.steer(userMessage("stop and do this instead"));
+		await session.abort({ cause: "user_interrupt" });
+		releaseTool?.();
+		await running.catch(() => {});
+		await session.waitForIdle();
+
+		expect(session.agent.hasQueuedSteering()).toBe(false);
+		expect(
+			session.agent.state.messages.some(
+				m => m.role === "user" && JSON.stringify(m.content).includes("stop and do this instead"),
+			),
+		).toBe(true);
+		// The steer produced a real turn instead of a turn that was born aborted.
+		const stopReasons = session.agent.state.messages
+			.filter(m => m.role === "assistant")
+			.map(m => (m as { stopReason?: string }).stopReason);
+		expect(stopReasons).toEqual(["toolUse", "stop"]);
+	});
+
 	it("does not resume queued steering after a non-user abort", async () => {
 		session = buildSession([{ content: ["first done"] }, { content: ["should not run"] }]);
 
