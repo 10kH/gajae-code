@@ -17822,6 +17822,19 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Apply a resolved chain selector's thinking suffix unless the operator
+	 * already set a session-scoped effort (Shift+Tab, /effort, thinking picker).
+	 * Profile suffixes like `:high` are defaults, not per-turn overrides.
+	 */
+	#thinkingLevelForResolvedFallback(
+		explicitThinkingLevel: boolean,
+		resolvedThinkingLevel: ThinkingLevel | undefined,
+	): ThinkingLevel | undefined {
+		if (this.getThinkingScopeForControl() === "session") return this.thinkingLevel;
+		return explicitThinkingLevel ? resolvedThinkingLevel : this.thinkingLevel;
+	}
+
 	async #ensureDefaultFallbackResolution(): Promise<void> {
 		const controller = this.#defaultFallbackChain();
 		if (controller.chain.entries.length < 2) return;
@@ -17846,7 +17859,9 @@ export class AgentSession {
 		if (!resolution.model) throw new Error(this.#fallbackExhaustionError(controller));
 		const previousEditMode = this.#resolveActiveEditMode();
 		this.#setModelAuthoritatively(resolution.model, "restore");
-		this.setThinkingLevel(resolution.explicitThinkingLevel ? resolution.thinkingLevel : this.thinkingLevel);
+		this.setThinkingLevel(
+			this.#thinkingLevelForResolvedFallback(resolution.explicitThinkingLevel, resolution.thinkingLevel),
+		);
 		await this.#syncEditToolModeAfterModelChange(previousEditMode);
 	}
 
@@ -18063,7 +18078,9 @@ export class AgentSession {
 			const to = selector;
 			const previousEditMode = this.#resolveActiveEditMode();
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
-			this.setThinkingLevel(resolved.explicitThinkingLevel ? resolved.thinkingLevel : this.thinkingLevel);
+			this.setThinkingLevel(
+				this.#thinkingLevelForResolvedFallback(resolved.explicitThinkingLevel, resolved.thinkingLevel),
+			);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			if (from !== to) {
 				this.#emit({
