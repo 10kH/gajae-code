@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -681,6 +682,36 @@ interface DiscoveryProviderConfig {
 	cacheRetention?: CacheRetention;
 	discovery: ProviderDiscovery;
 	optional?: boolean;
+}
+
+/**
+ * Credential-safe fingerprint of the full effective configured-discovery
+ * request context. A published cache row is only trusted while every input
+ * that shaped the discovery request — credential evidence, normalized
+ * endpoint, effective request headers (config plus runtime overrides), and
+ * the semantic request-shape fields (discovery type, provider api, per-prefix
+ * api routing, models.dev catalog key) — is unchanged, so e.g. a tenant or
+ * project header change invalidates the authoritative catalog. The canonical
+ * context is digested with SHA-256 so raw header values (which may carry
+ * secrets) are never persisted or logged.
+ */
+function fingerprintConfiguredDiscoveryContext(
+	authGeneration: string,
+	endpoint: string,
+	providerConfig: DiscoveryProviderConfig,
+): string {
+	const sortEntries = (record: Record<string, string> | undefined) =>
+		Object.entries(record ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	const context = JSON.stringify({
+		authGeneration,
+		endpoint,
+		headers: sortEntries(providerConfig.headers).map(([name, value]) => [name.toLowerCase(), value]),
+		discoveryType: providerConfig.discovery.type,
+		api: providerConfig.api,
+		apiByModelPrefix: sortEntries(providerConfig.discovery.apiByModelPrefix),
+		modelsDevProvider: providerConfig.discovery.modelsDevProvider ?? "",
+	});
+	return crypto.createHash("sha256").update(context).digest("hex");
 }
 
 export interface CanonicalModelQueryOptions {
@@ -2424,10 +2455,16 @@ export class ModelRegistry {
 					await this.#discoverModelsByProviderType(provider, apiKey),
 				),
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
-			// Mirrors the built-in descriptor path: fingerprint credential evidence +
-			// endpoint so a fresh cache row stays trusted across provider-tab visits
-			// under "online-if-uncached" instead of re-fetching every time.
-			cacheDynamicModelProvenance: Bun.hash(`${authGenerationBeforeDiscovery}\u0000${endpoint}`).toString(36),
+			// Fingerprint the full effective discovery request context (credential
+			// evidence, endpoint, effective headers, and request shape) so a fresh
+			// cache row stays trusted across provider-tab visits under
+			// "online-if-uncached", while any change that alters what the endpoint
+			// would return — e.g. a tenant/project header — forces a re-fetch.
+			cacheDynamicModelProvenance: fingerprintConfiguredDiscoveryContext(
+				authGenerationBeforeDiscovery,
+				endpoint,
+				effectiveProviderConfig,
+			),
 			canPublishCache: () => isCurrentEndpoint(),
 		});
 		const authGeneration =

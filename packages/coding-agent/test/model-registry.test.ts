@@ -6510,6 +6510,45 @@ describe("ModelRegistry", () => {
 			);
 			expect(state?.fetchedAt).toBe(row?.updatedAt);
 		});
+		test("re-fetches configured discovery when an effective request header changes under constant credential and endpoint", async () => {
+			const discoveryConfigWithHeaders = (headers: Record<string, string>) => ({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+					headers,
+				},
+			});
+			writeRawModelsJson(discoveryConfigWithHeaders({ "X-Tenant-Id": "tenant-a" }));
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			let requests = 0;
+			const seenTenantHeaders: Array<string | null> = [];
+			using _hook = hookFetch((_input, init) => {
+				requests++;
+				seenTenantHeaders.push(new Headers(init?.headers).get("X-Tenant-Id"));
+				return new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+			expect(requests).toBeGreaterThan(0);
+			expect(seenTenantHeaders.at(-1)).toBe("tenant-a");
+			const requestsBeforeHeaderChange = requests;
+
+			// Same credential and endpoint, different tenant header: the cached
+			// catalog was discovered under a different effective request context,
+			// so the published provenance must not vouch for it — a fresh-cache
+			// visit has to re-fetch instead of serving the old tenant's models.
+			writeRawModelsJson(discoveryConfigWithHeaders({ "X-Tenant-Id": "tenant-b" }));
+			const rebootedRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			await rebootedRegistry.refreshProvider("discovery-provider", "online-if-uncached");
+
+			expect(requests).toBeGreaterThan(requestsBeforeHeaderChange);
+			expect(seenTenantHeaders.at(-1)).toBe("tenant-b");
+		});
 		test("refreshes configured discovery when round-robin credentials change", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
