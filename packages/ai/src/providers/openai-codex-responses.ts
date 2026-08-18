@@ -8,6 +8,7 @@ import {
 	fetchWithRetry,
 	logger,
 	readSseJson,
+	sanitizeHeaderComponent,
 	structuredCloneJSON,
 } from "@gajae-code/utils";
 import type OpenAI from "openai";
@@ -535,8 +536,7 @@ function createEmptyUsage(): AssistantMessage["usage"] {
 
 /** @internal Exported for tests. */
 export function formatCodexUserAgent(platform: string, release: string, arch: string): string {
-	const sanitize = (value: string): string => value.replace(/[^\x20-\x7e]/g, "");
-	return `pi/${packageJson.version} (${sanitize(platform)} ${sanitize(release)}; ${sanitize(arch)})`;
+	return `pi/${packageJson.version} (${sanitizeHeaderComponent(platform)} ${sanitizeHeaderComponent(release)}; ${sanitizeHeaderComponent(arch)})`;
 }
 
 function getCodexUserAgent(): string {
