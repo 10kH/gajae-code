@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { computeCrashFingerprint, parseCrashRecordMarker } from "../src/crash-fingerprint";
 import { parseCrashEventLine } from "../src/crash-journal";
-import { recordFatalCrash, recordHandledError, resetHandledErrorDedupeForTest } from "../src/postmortem";
+import { recordHandledError, resetHandledErrorDedupeForTest } from "../src/postmortem";
 
 function handledStore(): { readonly log: string; readonly journal: string } {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-handled-error-"));
