@@ -5,6 +5,8 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { EphemeralBlobStore, ResidentBlobMissingError, resolveTextBlobSync } from "../src/session/blob-store";
 import {
+	assertResidentReferencesResolvableForTests,
+	type FileEntry,
 	materializeResidentEntriesForPersistenceForTests,
 	residentBlobSentinelForTests,
 } from "../src/session/session-manager";
@@ -94,5 +96,66 @@ describe("the fail-closed resident path leaves a record", () => {
 		// as a fail-closed abort.
 		expect(JSON.stringify(materialized)).toContain("Session resident text blob missing");
 		expect(errorSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("a corrupted resident reference on a fail-closed path", () => {
+	function stageEntryWithRef(ref: string): FileEntry {
+		return {
+			type: "message",
+			id: "corrupt-entry",
+			parentId: null,
+			timestamp: new Date(0).toISOString(),
+			message: {
+				role: "user",
+				content: [{ type: "text", text: residentBlobSentinelForTests("text", ref) }],
+				timestamp: 0,
+			},
+		} as unknown as FileEntry;
+	}
+
+	test("fails closed naming the session and leaves a record", () => {
+		const store = makeStore();
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+
+		let thrown: unknown;
+		try {
+			assertResidentReferencesResolvableForTests([stageEntryWithRef("blob:not-a-sha-ref")], store, store, {
+				sessionId: "s-corrupt",
+				sessionFile: "/tmp/s-corrupt.jsonl",
+			});
+		} catch (error) {
+			thrown = error;
+		}
+
+		expect(thrown).toBeInstanceOf(Error);
+		expect((thrown as Error).message).toContain("invalid blob reference");
+		expect((thrown as Error).message).toContain("s-corrupt");
+		expect((thrown as Error).message).toContain("/tmp/s-corrupt.jsonl");
+		const reported = errorSpy.mock.calls.filter(
+			([message]) => message === "Resident blob reference invalid on a fail-closed path",
+		);
+		expect(reported).toHaveLength(1);
+		expect(reported[0]![1]).toMatchObject({
+			phase: "stage-verify",
+			kind: "text",
+			sessionId: "s-corrupt",
+			sessionFile: "/tmp/s-corrupt.jsonl",
+		});
+	});
+
+	test("bounds an unbounded corrupted ref in the record", () => {
+		const store = makeStore();
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		const hugeRef = `blob:${"x".repeat(4096)}`;
+
+		expect(() => assertResidentReferencesResolvableForTests([stageEntryWithRef(hugeRef)], store)).toThrow(
+			"invalid blob reference",
+		);
+		const reported = errorSpy.mock.calls.filter(
+			([message]) => message === "Resident blob reference invalid on a fail-closed path",
+		);
+		expect(reported).toHaveLength(1);
+		expect((reported[0]![1] as { ref: string }).ref.length).toBeLessThanOrEqual(97);
 	});
 });
