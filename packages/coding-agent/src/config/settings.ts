@@ -46,6 +46,7 @@ import {
 	type AtomicYamlConfigTransaction,
 	AtomicYamlConflictError,
 	type AtomicYamlPatch,
+	AtomicYamlRetargetError,
 	applyAtomicYamlPatches,
 	applyAtomicYamlPatchesWithCurrent,
 	atomicYamlPathHash,
@@ -1041,6 +1042,7 @@ export class Settings implements NotificationSettingsReader {
 			saveError = error;
 		}
 		await this.#refreshDurableSettings();
+		if (saveError instanceof AtomicYamlRetargetError) throw saveError;
 		if (this.#modified.size > 0 && !this.#pendingSaveSlot) {
 			this.#queueSave();
 			this.#releasePendingSaveSlot();
