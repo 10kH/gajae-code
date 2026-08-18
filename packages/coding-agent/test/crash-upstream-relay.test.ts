@@ -3,9 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { appendCrashEvent, formatCrashRecordMarker } from "@gajae-code/utils";
+import { crashRelayExitCode } from "../src/cli/crash-cli";
 import type { CrashSignatureView, CrashStatePaths } from "../src/crash/index-store";
 import { compactCrashIndex, listCrashSignatures } from "../src/crash/index-store";
-import { crashRelayExitCode } from "../src/cli/crash-cli";
 import {
 	CRASH_UPSTREAM_DSN_ENV,
 	type CrashRelayConfig,
