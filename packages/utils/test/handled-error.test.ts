@@ -102,12 +102,22 @@ describe("recordHandledError", () => {
 	});
 
 	it("does not trip the fatal journal latch", async () => {
-		resetHandledErrorDedupeForTest();
+		// The fatal journal latch is process-wide and never cleared, so this must
+		// run in a fresh process: sharing the test runner's process would let
+		// earlier suites consume the one fatal journal write this asserts on.
 		const handled = handledStore();
 		const fatal = handledStore();
+		const script = path.join(path.dirname(fatal.log), "latch.ts");
+		fs.writeFileSync(
+			script,
+			`import { recordFatalCrash, recordHandledError } from ${JSON.stringify(path.resolve(import.meta.dir, "../src/postmortem.ts"))};\n` +
+				`recordHandledError("Tool functions.read", new Error("handled failure"), { path: ${JSON.stringify(handled.log)} });\n` +
+				`const written = recordFatalCrash("Uncaught Exception", new Error("fatal failure"), { path: ${JSON.stringify(fatal.log)} });\n` +
+				`if (written !== ${JSON.stringify(fatal.log)}) process.exit(1);\n`,
+		);
+		const spawned = Bun.spawnSync({ cmd: [process.execPath, script], stdout: "pipe", stderr: "pipe" });
+		expect(spawned.exitCode).toBe(0);
 
-		recordHandledError("Tool functions.read", new Error("handled failure"), { path: handled.log });
-		expect(recordFatalCrash("Uncaught Exception", new Error("fatal failure"), { path: fatal.log })).toBe(fatal.log);
 		expect(await journalLines(handled.journal)).toHaveLength(1);
 		expect(await journalLines(path.join(path.dirname(fatal.log), "gjc-crash-events.jsonl"))).toHaveLength(1);
 	});
