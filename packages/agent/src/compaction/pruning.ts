@@ -233,9 +233,25 @@ interface PrunedToolArgumentsSentinel {
 
 const EDIT_TOOL_NAMES = new Set(["edit", "write", "apply_patch", "ast_edit"]);
 
+/**
+ * A tool call's arguments, or `undefined` when the persisted payload is not an
+ * object.
+ *
+ * `ToolCall.arguments` is typed non-nullable, but sessions written by an older
+ * cold-spill eviction path carry `arguments: null` where the spill sentinel
+ * should be. Reading `.path` off that null threw a TypeError that surfaced as
+ * `null is not an object (evaluating 'args.path')` and killed the turn, so
+ * every reader of persisted arguments must treat them as untrusted.
+ */
+function toolArguments(call: ToolCall): Record<string, unknown> | undefined {
+	const args = call.arguments;
+	return typeof args === "object" && args !== null ? args : undefined;
+}
+
 /** Extract the file-path argument from a tool call, when the tool has one. */
 function toolCallPath(call: ToolCall): string | undefined {
-	const args = call.arguments;
+	const args = toolArguments(call);
+	if (!args) return undefined;
 	const path = args.path ?? args.file_path ?? args.filePath;
 	return typeof path === "string" && path.length > 0 ? path : undefined;
 }
@@ -260,7 +276,7 @@ const APPLY_PATCH_HEADER = /^\*\*\* (?:((?:Add|Update|Delete) File)|(Move to)): 
 function editToolPathGroups(call: ToolCall): string[][] {
 	const path = toolCallPath(call);
 	if (path !== undefined) return [[path]];
-	const input = call.arguments.input;
+	const input = toolArguments(call)?.input;
 	if (typeof input !== "string") return [];
 	const groups: string[][] = [];
 	for (const match of input.matchAll(APPLY_PATCH_HEADER)) {
@@ -422,11 +438,13 @@ const IDEMPOTENT_BASH_COMMAND =
 
 function normalizedIdempotentBashCommand(call: ToolCall): string | undefined {
 	if (call.name !== "bash") return undefined;
-	const command = call.arguments.command;
+	const args = toolArguments(call);
+	if (!args) return undefined;
+	const command = args.command;
 	if (typeof command !== "string") return undefined;
 	const normalized = command.trim().replace(/\s+/g, " ");
 	if (/[;&|]/.test(normalized) || !IDEMPOTENT_BASH_COMMAND.test(normalized)) return undefined;
-	return JSON.stringify([normalized, typeof call.arguments.cwd === "string" ? call.arguments.cwd : undefined]);
+	return JSON.stringify([normalized, typeof args.cwd === "string" ? args.cwd : undefined]);
 }
 
 function toolTargetKey(call: ToolCall): string | undefined {
@@ -434,13 +452,15 @@ function toolTargetKey(call: ToolCall): string | undefined {
 	if (path !== undefined) return JSON.stringify([call.name, "path", path]);
 	const command = normalizedIdempotentBashCommand(call);
 	if (command !== undefined) return JSON.stringify([call.name, "command", command]);
-	const pattern = call.arguments.pattern;
+	const args = toolArguments(call);
+	if (!args) return undefined;
+	const pattern = args.pattern;
 	if (typeof pattern === "string" && pattern.length > 0) {
-		const paths = call.arguments.paths;
+		const paths = args.paths;
 		const pathList = Array.isArray(paths) ? paths.filter((p): p is string => typeof p === "string") : [];
-		const skip = typeof call.arguments.skip === "number" ? call.arguments.skip : 0;
-		const caseInsensitive = call.arguments.i === true;
-		const gitignore = call.arguments.gitignore !== false;
+		const skip = typeof args.skip === "number" ? args.skip : 0;
+		const caseInsensitive = args.i === true;
+		const gitignore = args.gitignore !== false;
 		return JSON.stringify([call.name, "pattern", pattern, pathList, skip, caseInsensitive, gitignore]);
 	}
 	return undefined;
