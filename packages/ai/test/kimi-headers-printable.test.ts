@@ -1,10 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as os from "node:os";
 import { buildKimiCommonHeaders } from "@gajae-code/ai/utils/oauth/kimi";
 
-let hostnameSpy: ReturnType<typeof vi.spyOn>;
-let releaseSpy: ReturnType<typeof vi.spyOn>;
-let versionSpy: ReturnType<typeof vi.spyOn>;
+let hostnameSpy: Mock<typeof os.hostname>;
+let releaseSpy: Mock<typeof os.release>;
+let versionSpy: Mock<typeof os.version>;
 
 beforeEach(() => {
 	hostnameSpy = vi.spyOn(os, "hostname");

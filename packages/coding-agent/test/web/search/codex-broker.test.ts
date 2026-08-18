@@ -62,9 +62,9 @@ describe("Codex web search broker auth", () => {
 	});
 
 	it("sanitizes non-ASCII OS components in the User-Agent header", async () => {
-		const platformSpy = vi.spyOn(os, "platform").mockReturnValue("linux" as ReturnType<typeof os.platform>);
+		const platformSpy = vi.spyOn(os, "platform").mockReturnValue("linux" as NodeJS.Platform);
 		const releaseSpy = vi.spyOn(os, "release").mockReturnValue("4.4.302-Minimal™-EAS-QTI_Haptic-R26");
-		const archSpy = vi.spyOn(os, "arch").mockReturnValue("arm64" as ReturnType<typeof os.arch>);
+		const archSpy = vi.spyOn(os, "arch").mockReturnValue("arm64" as NodeJS.Architecture);
 		const getOAuthAccess = vi.fn(async () => ({
 			accessToken: "broker-refreshed-access-token",
 			accountId: "broker-account-id",

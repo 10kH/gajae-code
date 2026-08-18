@@ -180,9 +180,9 @@ async function executeOpenRouter(signal?: AbortSignal) {
 describe("imageGenTool", () => {
 	it("sanitizes non-ASCII OS components in the codex image User-Agent header", async () => {
 		delete Bun.env.OPENAI_BASE_URL;
-		const platformSpy = vi.spyOn(os, "platform").mockReturnValue("linux" as ReturnType<typeof os.platform>);
+		const platformSpy = vi.spyOn(os, "platform").mockReturnValue("linux" as NodeJS.Platform);
 		const releaseSpy = vi.spyOn(os, "release").mockReturnValue("4.4.302-Minimal™-EAS-QTI_Haptic-R26");
-		const archSpy = vi.spyOn(os, "arch").mockReturnValue("arm64" as ReturnType<typeof os.arch>);
+		const archSpy = vi.spyOn(os, "arch").mockReturnValue("arm64" as NodeJS.Architecture);
 		let userAgent: string | undefined;
 
 		const codexModel = {
