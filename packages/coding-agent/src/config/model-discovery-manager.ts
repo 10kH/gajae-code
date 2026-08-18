@@ -106,15 +106,24 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 		this.#lastWarnings.delete(provider);
 	}
 
-	loadCached(provider: TProvider, cacheDbPath?: string): readonly Model<Api>[] {
+	loadCached(provider: TProvider, cacheDbPath?: string, expectedProvenance?: string): readonly Model<Api>[] {
 		const cache = readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
-		const models = applyFinalCodexGpt56ContextCap(cache?.models ?? []);
+		// A cache row whose dynamic models were discovered under a different
+		// request context (credential/endpoint/headers/shape fingerprint) must
+		// never seed the synchronous catalog: it belongs to a different
+		// discovery context (e.g. another tenant), not this one.
+		const provenanceMismatch =
+			cache?.dynamicModelIds !== undefined &&
+			expectedProvenance !== undefined &&
+			cache.dynamicModelProvenance !== expectedProvenance;
+		const usableCache = provenanceMismatch ? null : cache;
+		const models = applyFinalCodexGpt56ContextCap(usableCache?.models ?? []);
 		this.#states.set(provider.provider, {
 			provider: provider.provider,
-			status: cache ? "cached" : "idle",
+			status: usableCache ? "cached" : "idle",
 			optional: provider.optional ?? false,
-			stale: cache ? !cache.fresh || !cache.authoritative : false,
-			fetchedAt: cache?.updatedAt,
+			stale: usableCache ? !usableCache.fresh || !usableCache.authoritative : false,
+			fetchedAt: usableCache?.updatedAt,
 			models: models.map(model => model.id),
 		});
 		return this.#snapshot(models);

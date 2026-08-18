@@ -685,26 +685,25 @@ interface DiscoveryProviderConfig {
 }
 
 /**
- * Credential-safe fingerprint of the full effective configured-discovery
- * request context. A published cache row is only trusted while every input
- * that shaped the discovery request — credential evidence, normalized
- * endpoint, effective request headers (config plus runtime overrides), and
- * the semantic request-shape fields (discovery type, provider api, per-prefix
- * api routing, models.dev catalog key) — is unchanged, so e.g. a tenant or
- * project header change invalidates the authoritative catalog. The canonical
- * context is digested with SHA-256 so raw header values (which may carry
- * secrets) are never persisted or logged.
+ * Credential-safe fingerprint of the effective configured-discovery request
+ * identity: effective request headers (config plus runtime overrides,
+ * lowercased and sorted) and the semantic request-shape fields (discovery
+ * type, provider api, per-prefix api routing, models.dev catalog key). A
+ * published cache row is only trusted while this fingerprint is unchanged, so
+ * a tenant/project header change (or any other request-shape change)
+ * invalidates the authoritative catalog instead of silently serving the old
+ * context's models. It deliberately excludes credential evidence (the
+ * resolved key is not synchronously knowable at construction, and credential
+ * changes are already invalidated through the auth-evidence generation
+ * escalation) and the endpoint (runtime transport overrides legitimately
+ * redirect discovery to a signed variant of the same catalog, and endpoint
+ * changes keep their own invalidation paths). Raw header values (which may
+ * carry secrets) are never persisted or logged — only the SHA-256 digest.
  */
-function fingerprintConfiguredDiscoveryContext(
-	authGeneration: string,
-	endpoint: string,
-	providerConfig: DiscoveryProviderConfig,
-): string {
+function fingerprintConfiguredDiscoveryRequestShape(providerConfig: DiscoveryProviderConfig): string {
 	const sortEntries = (record: Record<string, string> | undefined) =>
 		Object.entries(record ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 	const context = JSON.stringify({
-		authGeneration,
-		endpoint,
 		headers: sortEntries(providerConfig.headers).map(([name, value]) => [name.toLowerCase(), value]),
 		discoveryType: providerConfig.discovery.type,
 		api: providerConfig.api,
@@ -1715,7 +1714,18 @@ export class ModelRegistry {
 	#loadCachedDiscoverableModels(): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
 		for (const providerConfig of this.#discoveryManager.providers) {
-			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath);
+			let expectedProvenance: string | undefined;
+			try {
+				const effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
+				expectedProvenance = fingerprintConfiguredDiscoveryRequestShape(effectiveConfig);
+			} catch {
+				// Configuration is not resolvable synchronously at construction:
+				// leave the gate unset rather than fail-closed on legitimate
+				// same-context cache reuse. Any real context change is still
+				// caught by the online refresh path's provenance check.
+				expectedProvenance = undefined;
+			}
+			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance);
 			const normalized = this.#applyProviderModelOverrides(
 				providerConfig.provider,
 				this.#normalizeDiscoverableModels(
@@ -2455,16 +2465,15 @@ export class ModelRegistry {
 					await this.#discoverModelsByProviderType(provider, apiKey),
 				),
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
-			// Fingerprint the full effective discovery request context (credential
-			// evidence, endpoint, effective headers, and request shape) so a fresh
-			// cache row stays trusted across provider-tab visits under
-			// "online-if-uncached", while any change that alters what the endpoint
-			// would return — e.g. a tenant/project header — forces a re-fetch.
-			cacheDynamicModelProvenance: fingerprintConfiguredDiscoveryContext(
-				authGenerationBeforeDiscovery,
-				endpoint,
-				effectiveProviderConfig,
-			),
+			// Publish the credential-independent request-identity fingerprint
+			// (effective headers, discovery type, provider api, per-prefix
+			// routing, models.dev catalog key) with the cache row. It carries
+			// the tenant/routing identity of the discovery context, so both the
+			// async refresh and the synchronous constructor-time cache load can
+			// keep a different context's rows out of the catalog;
+			// credential-evidence and endpoint changes are invalidated
+			// separately through their own escalation paths.
+			cacheDynamicModelProvenance: fingerprintConfiguredDiscoveryRequestShape(effectiveProviderConfig),
 			canPublishCache: () => isCurrentEndpoint(),
 		});
 		const authGeneration =

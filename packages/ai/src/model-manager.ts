@@ -206,11 +206,24 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const shouldUseFreshCacheAsAuthoritative =
 		strategy === "online-if-uncached" && (cache?.fresh ?? false) && hasAuthoritativeCache;
 	const dynamicFetchSucceeded = fetchedDynamicModels !== null;
-	const cacheModels = dynamicFetchSucceeded ? [] : normalizeModelList<TApi>(cache?.models ?? []);
+	// Stale-while-error fallback: cached dynamic rows may only serve when their
+	// provenance still matches the current request context. A fetch forced by a
+	// provenance mismatch means the cache belongs to a different discovery
+	// context (e.g. another tenant's header), so a failed refetch must fail
+	// closed on those rows instead of surfacing them as selectable models. The
+	// explicit "offline" strategy keeps serving last-known rows regardless:
+	// local-only mode has no network attempt whose failure would warrant
+	// withholding them.
+	const cacheModelsServeCurrentContext = !cacheProvenanceMismatch || strategy === "offline";
+	const cacheModels =
+		dynamicFetchSucceeded || !cacheModelsServeCurrentContext ? [] : normalizeModelList<TApi>(cache?.models ?? []);
 	const dynamicModels = fetchedDynamicModels ?? [];
 	const mergedWithCache = mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), cacheModels);
 	const models = applyFinalCodexGpt56ContextCap(mergeDynamicModels(mergedWithCache, dynamicModels));
-	const dynamicAuthoritative = !hasDynamicFetcher || dynamicFetchSucceeded || shouldUseFreshCacheAsAuthoritative;
+	const dynamicAuthoritative =
+		!hasDynamicFetcher ||
+		dynamicFetchSucceeded ||
+		(shouldUseFreshCacheAsAuthoritative && cacheModelsServeCurrentContext);
 	if (shouldFetchFromNetwork) {
 		if (dynamicFetchSucceeded) {
 			const snapshotModels = applyFinalCodexGpt56ContextCap(
@@ -230,17 +243,20 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			}
 		} else {
 			// Dynamic fetch failed — update cache with a non-authoritative snapshot so
-			// stale state remains visible while retry backoff still applies.
+			// stale state remains visible while retry backoff still applies. Rows
+			// from a mismatched provenance context are never republished: only the
+			// still-matching cache may backfill, and a provenance-mismatched cache
+			// contributes nothing.
 			const latestCache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath);
+			const fallbackCacheModels = cacheModelsServeCurrentContext
+				? normalizeModelList<TApi>(latestCache?.models ?? cache?.models ?? [])
+				: [];
 			if (options.canPublishCache?.() ?? true) {
 				writeModelCache(
 					options.providerId,
 					now(),
 					applyFinalCodexGpt56ContextCap(
-						mergeDynamicModels(
-							mergeModelSources(staticModels, modelsDevModels),
-							normalizeModelList<TApi>(latestCache?.models ?? cache?.models ?? []),
-						),
+						mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
 					),
 					false,
 					staticFingerprint,
