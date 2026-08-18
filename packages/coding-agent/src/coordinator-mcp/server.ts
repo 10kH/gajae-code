@@ -54,6 +54,7 @@ import {
 } from "./codex-wake-publisher";
 import {
 	appendCoordinatorFile,
+	CoordinatorPublicationUncertainError,
 	ensureCoordinatorDirectory,
 	syncCoordinatorDirectory,
 	writeCoordinatorAtomic,
@@ -888,7 +889,7 @@ async function removeCoordinatorFile(file: string): Promise<void> {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
 		throw error;
 	}
-	await fs.rm(file);
+	await fs.rm(file, { force: true });
 	await syncCoordinatorDirectory(path.dirname(file));
 }
 
@@ -1148,7 +1149,14 @@ async function listJsonFiles(dir: string): Promise<unknown[]> {
 		const values = await Promise.all(
 			entries
 				.filter(entry => entry.endsWith(".json") && !entry.startsWith(".gjc-"))
-				.map(entry => readJsonFile(path.join(dir, entry))),
+				.map(async entry => {
+					try {
+						return await readJsonFile(path.join(dir, entry));
+					} catch (error) {
+						logger.warn("Coordinator projection read failed", { path: entry, error: String(error) });
+						return null;
+					}
+				}),
 		);
 		return values.filter(value => value !== null);
 	} catch (error) {
@@ -1347,10 +1355,14 @@ function boundSummary(value: string): string {
 }
 
 async function readLatestEventSeq(namespaceDir: string): Promise<number> {
-	const sequence = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
+	let sequence: Record<string, unknown> | null = null;
+	try {
+		sequence = asRecord(await readJsonFile(eventSequenceFile(namespaceDir)));
+	} catch (error) {
+		logger.warn("Coordinator sequence cache unreadable; recovering from journal", { error: String(error) });
+	}
 	const seq = sequence?.seq;
-	if (typeof seq === "number" && Number.isInteger(seq) && seq >= 0) return seq;
-	let latestSeq = 0;
+	let latestSeq = typeof seq === "number" && Number.isInteger(seq) && seq >= 0 ? seq : 0;
 	for (const event of await readCoordinatorEvents(namespaceDir)) latestSeq = Math.max(latestSeq, event.seq);
 	return latestSeq;
 }
@@ -1416,10 +1428,17 @@ async function appendCodexWakeDiagnostic(
 	error: unknown,
 ): Promise<void> {
 	const line = `${new Date().toISOString()} event=${event.id} error=${codexWakeErrorCode(error)}\n`;
-	await appendCoordinatorFile(
-		path.join(namespaceDir, "codex-wake-errors.log"),
-		line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP),
-	);
+	try {
+		await appendCoordinatorFile(
+			path.join(namespaceDir, "codex-wake-errors.log"),
+			line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP),
+		);
+	} catch (diagnosticError) {
+		logger.warn("Coordinator Codex wake diagnostic persistence failed", {
+			eventId: event.id,
+			error: String(diagnosticError),
+		});
+	}
 }
 
 async function appendCodexWakePublishDiagnostic(
@@ -1428,10 +1447,17 @@ async function appendCodexWakePublishDiagnostic(
 	error: unknown,
 ): Promise<void> {
 	const line = `${new Date().toISOString()} wake=${event.key} error=${codexWakeErrorCode(error)}\n`;
-	await appendCoordinatorFile(
-		path.join(namespaceDir, "codex-wake-errors.log"),
-		line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP),
-	);
+	try {
+		await appendCoordinatorFile(
+			path.join(namespaceDir, "codex-wake-errors.log"),
+			line.slice(0, CODEX_WAKE_DIAGNOSTIC_CAP),
+		);
+	} catch (diagnosticError) {
+		logger.warn("Coordinator Codex wake publish diagnostic persistence failed", {
+			wakeKey: event.key,
+			error: String(diagnosticError),
+		});
+	}
 }
 
 async function autoBindDelegateCodexHandoff(
@@ -1624,15 +1650,14 @@ function enqueueCodexWakePublish(namespaceDir: string, handoff: CodexHandoffRegi
 	const tailKey = codexWakeTailKey(namespaceDir, handoff.thread_id);
 	const previous = codexWakePublishTails.get(tailKey) ?? Promise.resolve();
 	const next = previous
-		.then(() => publishPendingCodexWakes(namespaceDir, handoff.thread_id))
 		.catch(async error => {
 			await appendCodexWakeDiagnostic(
 				namespaceDir,
 				{ id: `wake-queue:${handoff.thread_id}` } as CoordinatorEvent,
 				error,
 			);
-			throw error;
-		});
+		})
+		.then(() => publishPendingCodexWakes(namespaceDir, handoff.thread_id));
 	codexWakePublishTails.set(tailKey, next);
 	void next
 		.catch(() => undefined)
@@ -3185,6 +3210,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	function sdkError(error: unknown): Record<string, unknown> {
 		if (error instanceof SdkClientError) return { ok: false, error: { code: error.code, message: error.message } };
+		if (error instanceof CoordinatorPublicationUncertainError)
+			return { ok: false, error: { code: "ambiguous", message: error.message } };
 		return {
 			ok: false,
 			error: { code: "unavailable", message: error instanceof Error ? error.message : String(error) },
@@ -3545,9 +3572,27 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					questionPaths,
 					async registry =>
 						Object.values(registry.deletions).find(
-							entry => entry.session_id === id && entry.phase === "completed",
+							entry => entry.session_id === id && entry.phase !== "completed",
 						) ?? null,
 				);
+				if (deletion?.phase === "broker_closed" || deletion?.phase === "cleanup_pending") {
+					await removeCoordinatorFile(sessionStateFile(namespaceDir, id));
+					await removeCoordinatorFile(activeTurnFile(namespaceDir, id));
+					await appendCoordinatorEvent(namespaceDir, {
+						kind: "session.reaped",
+						sessionId: id,
+						summary: `Session ${id} cleanup resumed`,
+						metadata: { recovered: true, closed: true },
+					});
+					await advanceDeletion(
+						questionPaths,
+						deletion.deletion_id,
+						"completed",
+						{ wal: true, turns: true, reports: false, session: true, events: true },
+						{ ok: true, closed: true },
+					);
+					return { ok: true, closed: true };
+				}
 				if (deletion?.safe_response) return deletion.safe_response as { ok: boolean; closed: boolean };
 				return { ok: false, reason: "unknown_session", closed: false };
 			}

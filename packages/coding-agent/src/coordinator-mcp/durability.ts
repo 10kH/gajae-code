@@ -16,6 +16,13 @@ export interface CoordinatorAtomicWriteOptions
 	rename?: (source: string, destination: string) => Promise<void>;
 }
 
+/** The file was published, but its final directory barrier did not complete. */
+export class CoordinatorPublicationUncertainError extends Error {
+	constructor(cause: unknown) {
+		super("coordinator publication outcome is uncertain", { cause });
+	}
+}
+
 export async function ensureCoordinatorDirectory(
 	directory: string,
 	options: CoordinatorDirectoryBarrierOptions = {},
@@ -104,7 +111,11 @@ export async function appendCoordinatorFile(
 	} finally {
 		await handle.close();
 	}
-	await syncCoordinatorDirectory(path.dirname(file), options);
+	try {
+		await syncCoordinatorDirectory(path.dirname(file), options);
+	} catch (error) {
+		throw new CoordinatorPublicationUncertainError(error);
+	}
 }
 
 /** Atomically publish a synced coordinator state file, then barrier its parent. */
@@ -115,22 +126,34 @@ export async function writeCoordinatorAtomic(
 ): Promise<void> {
 	await ensureCoordinatorDirectory(path.dirname(file), options);
 	const temporary = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+	let published = false;
 	try {
 		const handle = await fs.open(temporary, "wx", 0o600);
+		let writeError: unknown;
 		try {
 			await handle.writeFile(contents);
 			await syncCoordinatorFile(handle, options);
-		} finally {
-			await handle.close();
+		} catch (error) {
+			writeError = error;
 		}
+		try {
+			await handle.close();
+		} catch (closeError) {
+			if (writeError) throw new AggregateError([writeError, closeError], "coordinator write and close failed");
+			throw closeError;
+		}
+		if (writeError) throw writeError;
 		await (options.rename ?? fs.rename)(temporary, file);
+		published = true;
 		await syncCoordinatorDirectory(path.dirname(file), options);
 	} catch (error) {
 		try {
 			await fs.rm(temporary, { force: true });
 		} catch (cleanupError) {
+			if (published) throw new CoordinatorPublicationUncertainError(new AggregateError([error, cleanupError]));
 			throw new AggregateError([error, cleanupError], "coordinator atomic write and cleanup failed");
 		}
+		if (published) throw new CoordinatorPublicationUncertainError(error);
 		throw error;
 	}
 }

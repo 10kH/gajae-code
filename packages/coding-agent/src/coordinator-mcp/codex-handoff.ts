@@ -138,8 +138,21 @@ async function writeExclusive(file: string, value: unknown): Promise<boolean> {
 		}
 		throw error;
 	}
-	await syncCoordinatorDirectory(path.dirname(file));
-	await fs.unlink(temp);
+	let barrierError: unknown;
+	try {
+		await syncCoordinatorDirectory(path.dirname(file));
+	} catch (error) {
+		barrierError = error;
+	}
+	let cleanupError: unknown;
+	try {
+		await fs.unlink(temp);
+	} catch (error) {
+		cleanupError = error;
+	}
+	if (barrierError && cleanupError) throw new AggregateError([barrierError, cleanupError]);
+	if (barrierError) throw barrierError;
+	if (cleanupError) throw cleanupError;
 	await syncCoordinatorDirectory(path.dirname(file));
 	return true;
 }

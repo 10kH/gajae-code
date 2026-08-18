@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	appendCoordinatorFile,
+	CoordinatorPublicationUncertainError,
 	isUnsupportedWindowsDirectorySyncError,
 	syncCoordinatorDirectory,
 	syncCoordinatorFile,
@@ -234,6 +235,27 @@ describe("Coordinator durability", () => {
 				writeCoordinatorAtomic(file, "state", { rename: async () => Promise.reject(errno("EIO")) }),
 			).rejects.toMatchObject({ code: "EIO" });
 			expect((await fs.readdir(root)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reports an uncertain outcome after rename when the parent barrier fails", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-durability-"));
+		try {
+			const file = path.join(root, "state.json");
+			await expect(
+				writeCoordinatorAtomic(file, "state", {
+					openDirectory: async () =>
+						({
+							async sync(): Promise<void> {
+								throw errno("EIO");
+							},
+							async close(): Promise<void> {},
+						}) as fs.FileHandle,
+				}),
+			).rejects.toBeInstanceOf(CoordinatorPublicationUncertainError);
+			expect(await fs.readFile(file, "utf8")).toBe("state");
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

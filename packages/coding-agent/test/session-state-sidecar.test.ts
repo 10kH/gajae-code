@@ -2203,9 +2203,17 @@ describe("coordinator runtime state sidecar", () => {
 			await fs.writeFile(readinessFile, `${JSON.stringify(marker)}\n`);
 			throw Object.assign(new Error("exists"), { code: "EEXIST" });
 		});
+		const realOpen = fs.open;
+		let parentBarrierOpens = 0;
+		const open = spyOn(fs, "open").mockImplementation(async (...args) => {
+			if (args[0] === path.dirname(readinessFile)) parentBarrierOpens += 1;
+			return await realOpen(...args);
+		});
 		try {
 			await expect(persistCoordinatorRuntimeInputReady()).resolves.toEqual(marker);
+			expect(parentBarrierOpens).toBeGreaterThan(0);
 		} finally {
+			open.mockRestore();
 			link.mockRestore();
 		}
 	});
