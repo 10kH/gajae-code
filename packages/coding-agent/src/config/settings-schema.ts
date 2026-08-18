@@ -1612,6 +1612,28 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"crashReport.upstream": {
+		type: "enum",
+		values: ["off", "sentry"] as const,
+		default: "off",
+		ui: {
+			tab: "interaction",
+			label: "Crash Report Upstream",
+			description:
+				"Opt in to transmit sanitized crash signatures to an aggregation service for cross-install counting. Off sends nothing. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+		},
+	},
+	"crashReport.upstreamDsn": {
+		type: "string",
+		default: "",
+		ui: {
+			tab: "interaction",
+			label: "Crash Report Upstream DSN",
+			description:
+				"Sentry DSN for the opted-in upstream; ignored while Crash Report Upstream is off, and no default destination exists. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+		},
+	},
+
 	collapseChangelog: {
 		type: "boolean",
 		default: false,

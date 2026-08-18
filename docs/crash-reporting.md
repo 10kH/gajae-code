@@ -4,8 +4,10 @@ GJC writes a durable, rotation-immune crash log (`~/.gjc/agent/gjc-crash.log`) f
 fatal exception. This page documents how those records get a stable identity, how the
 counts are aggregated, and the privacy contract of the assisted reporting flow.
 
-**Nothing in this feature transmits anything without an explicit, per-invocation,
-digest-confirmed confirmation. Fully automatic issue creation is an explicit non-goal.**
+**The `gjc crash report` GitHub issue flow never transmits anything without an explicit,
+per-invocation, digest-confirmed confirmation. Fully automatic issue creation is an
+explicit non-goal. The separate Sentry upstream is default-off and config-gated; it
+transmits only fields approved by `sanitizeExternalCrashV1`.**
 
 ## 1. Fingerprinting (algorithm v1)
 
@@ -140,3 +142,32 @@ state only — **this piece never transmits anything**.
 - `crashReport.nudge: false` disables it. Honest default statement: the default-on nudge
   **does** change startup output by design (one line, bounded, rate-limited); transmission
   remains impossible without the full consent flow.
+
+## 5. Upstream relay (opt-in)
+
+This is a separate channel from `gjc crash report`, with separate rules. It is disabled by
+default: `crashReport.upstream` defaults to `off`, and `crashReport.upstreamDsn` supplies
+the Sentry DSN only when the upstream is enabled. With no DSN, network behavior does not
+change. No DSN is compiled into the binary, so there is no default destination.
+
+The relay never runs on the fatal path. It runs at the next startup during index
+compaction, preserving the crashing process's exactly-one-`O_APPEND` write. The exact
+payload keys that leave the machine are `event_id`, `timestamp`, `platform`, `level`,
+`logger`, `release`, `environment`, `fingerprint`, `exception.values[].type`,
+`.value`, `.stacktrace.frames[].filename`, `.function`, `.in_app`, `tags`, `extra`, and
+`sdk`. The payload excludes `user`, `server_name`, `contexts`, `breadcrumbs`, `request`,
+`modules`, environment variables, argv, and hostname.
+
+`sanitizeExternalCrashV1` is the egress contract. Any refusal drops that signature's
+send; the relay never falls back to a less-sanitized payload. Consequently no prompt
+text, source code, file contents, or credentials are included. The gjc fingerprint is
+sent as Sentry's `fingerprint` array, making grouping ours rather than Sentry's heuristics:
+one upstream issue per gjc signature.
+
+The relay sends once per occurrence batch. A `relayed` journal event stamps `relayedAt`,
+so reruns do not resend unless `lastSeen` advanced. `relayedAt` is deliberately not an
+input to index eviction.
+
+The fingerprint remains a public, pseudonymous correlation token, not a confidentiality
+control. In addition to its local correlation role, it links the same crash class across
+installs inside the upstream project.

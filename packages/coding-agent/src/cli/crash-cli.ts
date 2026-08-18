@@ -9,8 +9,10 @@
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { getCrashIndexPath } from "@gajae-code/utils";
+import type { Settings } from "../config/settings";
 import { compactCrashIndex, listCrashSignatures, resolveCrashStatePaths } from "../crash/index-store";
 import { type CrashReportIo, type CrashReportOutcome, runCrashReportFlow } from "../crash/report";
+import { relayCrashSignatures } from "../crash/upstream/relay";
 import { runGhDefault } from "../utils/gh";
 
 function createIo(): CrashReportIo {
@@ -75,4 +77,36 @@ export async function runCrashListCommand(json: boolean): Promise<void> {
 				`${state}\n    ${signature.errorName}: ${signature.messageClass.slice(0, 120)}\n`,
 		);
 	}
+}
+
+/**
+ * Batch-relay every due signature to the configured upstream.
+ *
+ * The startup relay is silent and best-effort; this is the loud form, so a
+ * refusal is reported as a refusal instead of being swallowed. It shares the
+ * same gate: with `crashReport.upstream` off, it explains that and exits
+ * non-zero rather than quietly doing nothing.
+ */
+export async function runCrashRelayCommand(settings: Settings): Promise<void> {
+	const outcome = await relayCrashSignatures({
+		config: {
+			upstream: settings.get("crashReport.upstream"),
+			dsn: settings.get("crashReport.upstreamDsn") ?? "",
+		},
+	});
+	if (outcome.status === "skipped") {
+		const explain: Record<string, string> = {
+			disabled: "crashReport.upstream is off; nothing was transmitted.",
+			"no-dsn": "No upstream DSN configured (crashReport.upstreamDsn or GJC_CRASH_SENTRY_DSN).",
+			"invalid-dsn": "The configured upstream DSN could not be parsed; refusing to send.",
+			"nothing-to-relay": "No crash signatures are due for relay.",
+		};
+		process.stdout.write(`${explain[outcome.reason] ?? outcome.reason}\n`);
+		if (outcome.reason !== "nothing-to-relay") process.exitCode = 1;
+		return;
+	}
+	process.stdout.write(`relayed ${outcome.sent}, refused ${outcome.refused}, failed ${outcome.failed}\n`);
+	if (outcome.refused > 0)
+		process.stdout.write("refused signatures failed the outbound sanitizer and were not sent.\n");
+	if (outcome.failed > 0) process.exitCode = 1;
 }
