@@ -33,7 +33,7 @@ import {
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
-import { logger, sanitizeText } from "@gajae-code/utils";
+import { $credentialEnv, logger, sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,
@@ -97,6 +97,127 @@ const intrinsicReflectApply = Reflect.apply;
  */
 export const MANAGED_ATTEMPT_MAX_STAGED_EVENTS = 10_000;
 export const MANAGED_ATTEMPT_MAX_STAGED_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Hard ceilings for the operator overrides. The caps exist to bound memory, so
+ * an override may raise them only within a range that still leaves the guard
+ * meaningful — near-`MAX_SAFE_INTEGER` values would trade a typed, bounded
+ * `local_buffer_overflow` for a process OOM, which is strictly harder to
+ * diagnose. Above-ceiling overrides clamp to the ceiling (matching the
+ * `GJC_SESSION_CONTEXT_BUDGET_BYTES` convention) instead of being honored.
+ *
+ * The ceilings are derived from a survivable PEAK-RSS budget, not from the
+ * counted-bytes number: sizing transiently materializes the JSON string and
+ * its UTF-8 encoding, and accepted input is then cloned and re-measured, so
+ * peak resident memory is a multiple of the counted bytes. The bytes ceiling
+ * is the peak budget divided by the measured multiplier, so an override at the
+ * ceiling still fits an ordinary host. The events ceiling is the object-count
+ * equivalent for the same budget at a conservative per-item floor.
+ */
+export const MANAGED_STAGED_PEAK_RSS_BUDGET_BYTES = 4 * 1024 * 1024 * 1024;
+export const MANAGED_STAGED_PEAK_RSS_FACTOR = 4;
+export const MANAGED_ATTEMPT_STAGED_EVENTS_CEILING = 2_000_000;
+export const MANAGED_ATTEMPT_STAGED_BYTES_CEILING = Math.floor(
+	MANAGED_STAGED_PEAK_RSS_BUDGET_BYTES / MANAGED_STAGED_PEAK_RSS_FACTOR,
+);
+
+function clampedStagedCap(
+	name: "GJC_FALLBACK_MAX_STAGED_EVENTS" | "GJC_FALLBACK_MAX_STAGED_BYTES",
+	fallback: number,
+	ceiling: number,
+): number {
+	// Resolve from TRUSTED environment sources only ($credentialEnv excludes the
+	// caller's cwd/.env overlay): these knobs ARE a defensive resource guard, so
+	// a repository-controlled .env must not be able to weaken (or tighten into
+	// failure) the staging bound. Values must be positive integers (digits
+	// only); anything else falls back to the default. Any digits-only positive
+	// decimal that is at or below the ceiling is honored verbatim, and any
+	// digits-only positive decimal above the ceiling — including ones beyond
+	// Number.MAX_SAFE_INTEGER, which a numeric parse would misclassify — clamps
+	// to the ceiling with a warning, exactly as documented.
+	const raw = $credentialEnv(name);
+	if (raw === undefined) return fallback;
+	if (parsePositiveEnvInt(raw) !== undefined) {
+		const parsed = parsePositiveEnvInt(raw)!;
+		if (parsed <= ceiling) return parsed;
+		logger.warn(`${name} clamped to ${ceiling}: the provisional staging guard must stay bounded`, {
+			requested: parsed,
+			ceiling,
+		});
+		return ceiling;
+	}
+	if (isPositiveDecimalDigits(raw) && decimalAtLeast(raw, ceiling + 1)) {
+		logger.warn(`${name} clamped to ${ceiling}: the provisional staging guard must stay bounded`, {
+			requested: raw,
+			ceiling,
+		});
+		return ceiling;
+	}
+	return fallback;
+}
+
+function parsePositiveEnvInt(raw: string): number | undefined {
+	const trimmed = raw.trim();
+	if (!trimmed || !/^\d+$/.test(trimmed)) return undefined;
+	const parsed = Number(trimmed);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** True when the value is a digits-only positive decimal string (no sign). */
+function isPositiveDecimalDigits(raw: string): boolean {
+	const trimmed = raw.trim();
+	return trimmed.length > 0 && /^\d+$/.test(trimmed) && trimmed.replace(/^0+/, "") !== "";
+}
+
+/**
+ * Lexical comparison of a digits-only decimal against a numeric threshold,
+ * valid past Number.MAX_SAFE_INTEGER: compare stripped-leading-zero digit
+ * length first, then digit by digit.
+ */
+function decimalAtLeast(raw: string, threshold: number): boolean {
+	const digits = raw.trim().replace(/^0+/, "");
+	const thresholdDigits = String(threshold).replace(/^0+/, "");
+	if (digits.length !== thresholdDigits.length) return digits.length > thresholdDigits.length;
+	return digits >= thresholdDigits;
+}
+
+/**
+ * Max events staged by a provisional managed-attempt transaction before it is
+ * rejected. Configurable via `GJC_FALLBACK_MAX_STAGED_EVENTS` (default
+ * `MANAGED_ATTEMPT_MAX_STAGED_EVENTS`, ceiling
+ * `MANAGED_ATTEMPT_STAGED_EVENTS_CEILING`). Read once per transaction so
+ * operators can raise the cap without a rebuild and tests can exercise the
+ * knob in-process. Values must be positive integers (digits only); invalid or
+ * non-positive values fall back to the default, and values above the ceiling
+ * clamp to it with a warning.
+ *
+ * @internal
+ */
+export function managedAttemptMaxStagedEvents(): number {
+	return clampedStagedCap(
+		"GJC_FALLBACK_MAX_STAGED_EVENTS",
+		MANAGED_ATTEMPT_MAX_STAGED_EVENTS,
+		MANAGED_ATTEMPT_STAGED_EVENTS_CEILING,
+	);
+}
+
+/**
+ * Max bytes staged by a provisional managed-attempt transaction before it is
+ * rejected. Configurable via `GJC_FALLBACK_MAX_STAGED_BYTES` (default
+ * `MANAGED_ATTEMPT_MAX_STAGED_BYTES`, ceiling
+ * `MANAGED_ATTEMPT_STAGED_BYTES_CEILING`). Read once per transaction; values
+ * must be positive integers (digits only), anything else falls back to the
+ * default, and values above the ceiling clamp to it with a warning.
+ *
+ * @internal
+ */
+export function managedAttemptMaxStagedBytes(): number {
+	return clampedStagedCap(
+		"GJC_FALLBACK_MAX_STAGED_BYTES",
+		MANAGED_ATTEMPT_MAX_STAGED_BYTES,
+		MANAGED_ATTEMPT_STAGED_BYTES_CEILING,
+	);
+}
 
 /**
  * Closed set of local-failure sites. A bounded diagnostic may name only these
@@ -1026,6 +1147,71 @@ function managedSnapshotJsonBytes(value: unknown): number | undefined {
 	}
 }
 
+/**
+ * Sentinel thrown from inside a `JSON.stringify` replacer to TERMINATE the
+ * serialization walk the moment the projected size crosses the budget.
+ * Returning a substituted value (e.g. "") would not abort: stringify keeps
+ * walking and keeps building the result string, materializing everything up to
+ * the limit — which is the OOM this guard exists to prevent. Throwing is the
+ * only way to stop the traversal (review finding at 2efaf269cd).
+ */
+const MANAGED_SIZE_SENTINEL = Symbol("gjc.managed-staging-size-exceeded");
+
+/**
+ * Pre-allocation size guard: reports whether serializing `value` as JSON would
+ * exceed `limit` bytes WITHOUT materializing the full JSON string or its UTF-8
+ * encoding. A `JSON.stringify` replacer counts bytes per chunk and throws the
+ * size sentinel as soon as the running total crosses the limit; the throw
+ * unwinds the walk immediately, so the transient cost stays at one chunk at a
+ * time and never approaches the full serialized size.
+ *
+ * Byte accounting uses the TextEncoder on string chunks (UTF-8 bytes, not
+ * UTF-16 code units) so non-ASCII content is not undercounted. Object keys are
+ * counted too, keeping the estimate a strict lower bound on the final size.
+ *
+ * Returns "over" when the limit would be exceeded, "under" when it definitely
+ * is not, and "unknown" when the value cannot be serialized at all (cyclic or
+ * JSON-hostile), which callers treat exactly like the existing `undefined`
+ * measurement results.
+ */
+function managedSnapshotExceedsBytes(value: unknown, limit: number): "over" | "under" | "unknown" {
+	let seen = 0;
+	const add = (n: number): void => {
+		seen += n;
+		if (seen > limit) throw MANAGED_SIZE_SENTINEL;
+	};
+	try {
+		const json = JSON.stringify(value, (key: string, chunk: unknown) => {
+			// Keys arrive through the replacer's key argument; count each key
+			// with its quotes and the following colon/separator.
+			if (key !== "") add(managedAttemptTextEncoder.encode(key).byteLength + 3);
+			if (typeof chunk === "string") {
+				add(managedAttemptTextEncoder.encode(chunk).byteLength + 2);
+			} else if (typeof chunk === "number" || typeof chunk === "boolean") {
+				add(String(chunk).length);
+			} else if (typeof chunk === "bigint") {
+				// BigInt is not JSON-serializable without toJSON; report unknown
+				// so the caller falls back to the exact measurement path.
+				throw MANAGED_SIZE_SENTINEL;
+			}
+			// Objects/arrays contribute delimiters; their contents are visited
+			// recursively by stringify itself and counted chunk by chunk.
+			return chunk;
+		});
+		if (json === undefined) return "unknown";
+		// Completed within the limit: the walk's chunk accounting under-counts
+		// structural bytes, so when the walk got close to the boundary, confirm
+		// with the exact size.
+		if (seen * 2 >= limit) {
+			return (managedSnapshotJsonBytes(value) ?? 0) > limit ? "over" : "under";
+		}
+		return "under";
+	} catch (error) {
+		if (error === MANAGED_SIZE_SENTINEL) return "over";
+		return "unknown";
+	}
+}
+
 function managedAttemptSnapshotDetailed<T>(value: T): { snapshot: T; jsonBytes?: number; sanitized: boolean } {
 	try {
 		const snapshot = structuredClone(value);
@@ -1476,7 +1662,7 @@ function warnManagedSnapshotFailure(
  */
 type ManagedAttemptBatchItem =
 	| { type: "event"; event: AgentEvent; bytes?: number }
-	| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent };
+	| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent; bytes?: number };
 
 /**
  * Streaming increments whose complete value is re-published by the block's own
@@ -1501,6 +1687,9 @@ class ManagedAttemptTransaction {
 	#batch: ManagedAttemptBatchItem[] = [];
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
+	/** Caps for this transaction, read once from the operator env knobs. */
+	readonly #maxStagedEvents = managedAttemptMaxStagedEvents();
+	readonly #maxStagedBytes = managedAttemptMaxStagedBytes();
 	/** Shape snapshot retained across discard() for bounded failure diagnostics. */
 	#lastStagedShape: { stagedEventCount: number; stagedBytes: number; contentBlockCount: number } | undefined;
 	#discarded = false;
@@ -1534,16 +1723,89 @@ class ManagedAttemptTransaction {
 	}
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
-		const partial = this.#assistantSnapshot(message);
 		if (this.#committed) {
-			this.onAssistantMessageEvent?.(partial, this.#assistantEventSnapshot(event, partial));
+			// Already published: nothing is retained, so the live pair can go
+			// straight to the consumer without a staging measurement. One
+			// snapshot serves as BOTH the callback message and the event's
+			// `partial`, preserving the paired-snapshot identity the direct
+			// callbacks were built on and avoiding a second full clone of the
+			// growing message.
+			const committedPartial = this.#assistantSnapshot(message);
+			this.onAssistantMessageEvent?.(committedPartial, this.#assistantEventSnapshot(event, committedPartial));
 			return;
 		}
+		// Every retained batch item must be charged against the caps BEFORE it
+		// is retained, including the assistant message/event pair: an uncharged
+		// snapshot would let actual retention exceed the caps while the counters
+		// still read under them. Two-phase guard so the allocation that could
+		// OOM never happens ahead of the check:
+		//   1. INCREMENTAL pre-check on the LIVE pair — a replacer walk that
+		//      stops as soon as the projected size crosses the cap, without
+		//      materializing the full JSON string or its UTF-8 encoding (review:
+		//      "size incrementally so serialization can stop before
+		//      materializing the whole value"). Only if the walk completes under
+		//      the cap is any snapshot taken.
+		//   2. EXACT accounting of the retained detached pair — a live class can
+		//      serialize compactly through a prototype `toJSON()` that
+		//      `structuredClone` drops, so the live measurement may undercount
+		//      what the retained snapshot actually holds (same convention as
+		//      `#stage`).
+		const liveBudget = this.#maxStagedBytes - this.#stagedBytes;
+		const liveExcess = managedSnapshotExceedsBytes([message, event], liveBudget);
+		if (liveExcess === "over") {
+			this.#compactSupersededFrames();
+			if (managedSnapshotExceedsBytes([message, event], this.#maxStagedBytes - this.#stagedBytes) === "over") {
+				if (this.snapshotMode === "lossless") {
+					this.flush();
+					// One snapshot for the whole callback pair (see the committed
+					// branch above): the callback message and `event.partial`
+					// must be the same object.
+					const flushedPartial = this.#assistantSnapshot(message);
+					this.onAssistantMessageEvent?.(flushedPartial, this.#assistantEventSnapshot(event, flushedPartial));
+					return;
+				}
+				this.discard();
+				throw new ManagedAttemptBufferOverflowError(
+					"overflow.staged",
+					this.#overflowShape("overflow.staged", liveBudget + 1),
+				);
+			}
+		}
+		const partial = this.#assistantSnapshot(message);
+		const snapshotEvent = this.#assistantEventSnapshot(event, partial);
+		let retainedBytes: number | undefined;
+		try {
+			retainedBytes = managedSnapshotJsonBytes([partial, snapshotEvent]);
+		} catch {
+			retainedBytes = undefined;
+		}
+		if (retainedBytes !== undefined && this.#wouldOverflow(retainedBytes)) {
+			this.#compactSupersededFrames();
+			if (this.#wouldOverflow(retainedBytes)) {
+				if (this.snapshotMode === "lossless") {
+					this.flush();
+					this.onAssistantMessageEvent?.(partial, snapshotEvent);
+					return;
+				}
+				this.discard();
+				throw new ManagedAttemptBufferOverflowError(
+					"overflow.staged",
+					this.#overflowShape("overflow.staged", retainedBytes ?? 0),
+				);
+			}
+		}
+		// The snapshot forms are JSON-safe by construction; if measurement still
+		// fails, charge the event count so the item-count bound always holds.
 		this.#batch.push({
 			type: "assistant_event",
 			message: partial,
-			event: this.#assistantEventSnapshot(event, partial),
+			event: snapshotEvent,
+			bytes: retainedBytes ?? 0,
 		});
+		this.#stagedEventCount += 1;
+		if (retainedBytes !== undefined) {
+			this.#stagedBytes += retainedBytes;
+		}
 	}
 
 	flush(): void {
@@ -1654,10 +1916,7 @@ class ManagedAttemptTransaction {
 		return 0;
 	}
 	#wouldOverflow(bytes: number): boolean {
-		return (
-			this.#stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS ||
-			this.#stagedBytes + bytes > MANAGED_ATTEMPT_MAX_STAGED_BYTES
-		);
+		return this.#stagedEventCount + 1 > this.#maxStagedEvents || this.#stagedBytes + bytes > this.#maxStagedBytes;
 	}
 	/**
 	 * Shape snapshot for a buffer-overflow diagnostic: the rejecting stage,
@@ -1675,16 +1934,20 @@ class ManagedAttemptTransaction {
 		incomingEventBytes: number,
 	): ManagedAttemptBufferOverflowError["overflow"] {
 		const staged = this.stagedShape();
-		const eventsExceeded = staged.stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS;
-		const bytesExceeded = staged.stagedBytes + incomingEventBytes > MANAGED_ATTEMPT_MAX_STAGED_BYTES;
+		// Derive from the transaction's effective (operator-configurable) caps,
+		// not the module constants: the diagnostic must name the limits that
+		// actually tripped, which can differ from the defaults when an override
+		// is active.
+		const eventsExceeded = staged.stagedEventCount + 1 > this.#maxStagedEvents;
+		const bytesExceeded = staged.stagedBytes + incomingEventBytes > this.#maxStagedBytes;
 		return {
 			stage,
 			exceeded: eventsExceeded && bytesExceeded ? "both" : eventsExceeded ? "events" : "bytes",
 			stagedEventCount: staged.stagedEventCount,
 			stagedBytes: staged.stagedBytes,
 			incomingEventBytes,
-			maxStagedEvents: MANAGED_ATTEMPT_MAX_STAGED_EVENTS,
-			maxStagedBytes: MANAGED_ATTEMPT_MAX_STAGED_BYTES,
+			maxStagedEvents: this.#maxStagedEvents,
+			maxStagedBytes: this.#maxStagedBytes,
 		};
 	}
 
@@ -1718,10 +1981,8 @@ class ManagedAttemptTransaction {
 				retained.push(item);
 				continue;
 			}
-			if (item.type === "event") {
-				reclaimedBytes += item.bytes ?? 0;
-				reclaimedEvents += 1;
-			}
+			reclaimedBytes += item.bytes ?? 0;
+			reclaimedEvents += 1;
 		}
 		if (retained.length === this.#batch.length) return false;
 		this.#batch = retained;
