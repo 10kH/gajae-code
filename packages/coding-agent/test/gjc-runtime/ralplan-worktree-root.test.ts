@@ -1,0 +1,330 @@
+import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
+
+const tempRoots: string[] = [];
+
+let priorSessionId: string | undefined;
+beforeAll(() => {
+	priorSessionId = process.env.GJC_SESSION_ID;
+});
+afterAll(async () => {
+	if (priorSessionId !== undefined) process.env.GJC_SESSION_ID = priorSessionId;
+	else delete process.env.GJC_SESSION_ID;
+	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, recursiveForce)));
+});
+const recursiveForce = { recursive: true, force: true } as const;
+
+async function tempDir(prefix = "gjc-ralplan-wt-"): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+	tempRoots.push(dir);
+	return dir;
+}
+
+async function git(args: string[], cwd: string): Promise<void> {
+	const proc = Bun.spawn(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+	const code = await proc.exited;
+	if (code !== 0) {
+		throw new Error(`git ${args.join(" ")} failed: ${await new Response(proc.stderr).text()}`);
+	}
+}
+
+/** Two scratch git repos: an intended target worktree and an unrelated dispatcher cwd. */
+async function initRepo(prefix?: string): Promise<string> {
+	const root = await tempDir(prefix);
+	await git(["init"], root);
+	await git(["-c", "user.email=test@gjc.local", "-c", "user.name=gjc-test", "commit", "--allow-empty", "-m", "init"], root);
+	return root;
+}
+
+async function pathExists(target: string): Promise<boolean> {
+	try {
+		await fs.stat(target);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function statePath(root: string, sessionId: string): string {
+	return path.join(root, ".gjc", `_session-${sessionId}`, "state", "ralplan-state.json");
+}
+
+function runDir(root: string, sessionId: string, runId: string): string {
+	return path.join(root, ".gjc", `_session-${sessionId}`, "plans", "ralplan", runId);
+}
+
+async function readState(root: string, sessionId: string): Promise<Record<string, unknown>> {
+	return JSON.parse(await fs.readFile(statePath(root, sessionId), "utf-8")) as Record<string, unknown>;
+}
+
+async function realpath(target: string): Promise<string> {
+	return await fs.realpath(target);
+}
+
+describe("ralplan --worktree-root explicit target binding (#4693)", () => {
+	it("keeps legacy no-target seed/write cwd-based", async () => {
+		const session = "wt-legacy";
+		const repo = await initRepo();
+		const seed = await runNativeRalplanCommand(["--session-id", session, "--json", "legacy task"], repo);
+		expect(seed.status).toBe(0);
+		const write = await runNativeRalplanCommand(
+			["--write", "--stage", "planner", "--stage_n", "1", "--session-id", session, "--run-id", session, "--artifact", "plan v1"],
+			repo,
+		);
+		expect(write.status).toBe(0);
+		expect(await pathExists(path.join(runDir(repo, session, session), "stage-01-planner.md"))).toBe(true);
+		const state = await readState(repo, session);
+		expect((state.repository_binding as { worktreeRoot?: string }).worktreeRoot).toBe(await realpath(repo));
+	});
+
+	it("routes seed and child-role writes from a different cwd into one explicit target tree", async () => {
+		const session = "wt-two-repo";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", target, "--session-id", session, "--json", "dispatch task"],
+			dispatcher,
+		);
+		expect(seed.status).toBe(0);
+		const seedPayload = JSON.parse(seed.stdout ?? "{}") as { repository_binding?: { worktreeRoot?: string } };
+		expect(seedPayload.repository_binding?.worktreeRoot).toBe(await realpath(target));
+
+		const planner = await runNativeRalplanCommand(
+			[
+				"--write", "--worktree-root", target, "--stage", "planner", "--stage_n", "1",
+				"--session-id", session, "--run-id", session, "--artifact", "plan v1",
+			],
+			dispatcher,
+		);
+		expect(planner.status).toBe(0);
+		const architect = await runNativeRalplanCommand(
+			[
+				"--write", "--worktree-root", target, "--stage", "architect", "--stage_n", "1",
+				"--session-id", session, "--run-id", session, "--artifact", "review v1",
+			],
+			dispatcher,
+		);
+		expect(architect.status).toBe(0);
+
+		// One owner state file, one run directory, one index ledger — all under the target.
+		const dir = runDir(target, session, session);
+		expect(await pathExists(path.join(dir, "stage-01-planner.md"))).toBe(true);
+		expect(await pathExists(path.join(dir, "stage-01-architect.md"))).toBe(true);
+		expect(await pathExists(path.join(dir, "index.jsonl"))).toBe(true);
+		expect(await pathExists(statePath(target, session))).toBe(true);
+		const indexRows = (await fs.readFile(path.join(dir, "index.jsonl"), "utf-8"))
+			.split("\n")
+			.filter(line => line.trim().length > 0);
+		expect(indexRows.length).toBe(2);
+
+		// The dispatcher cwd receives no ralplan state, artifact, ledger, or HUD writes.
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it("resolves a relative --worktree-root and a relative --artifact from the invoking cwd", async () => {
+		const session = "wt-relative";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const relativeTarget = path.relative(dispatcher, target);
+
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", relativeTarget, "--session-id", session, "--json", "relative task"],
+			dispatcher,
+		);
+		expect(seed.status).toBe(0);
+		const seedPayload = JSON.parse(seed.stdout ?? "{}") as { repository_binding?: { worktreeRoot?: string } };
+		expect(seedPayload.repository_binding?.worktreeRoot).toBe(await realpath(target));
+
+		await fs.writeFile(path.join(dispatcher, "plan.md"), "plan from dispatcher file\n");
+		const write = await runNativeRalplanCommand(
+			[
+				"--write", "--worktree-root", relativeTarget, "--stage", "planner", "--stage_n", "1",
+				"--session-id", session, "--run-id", session, "--artifact", "plan.md",
+			],
+			dispatcher,
+		);
+		expect(write.status).toBe(0);
+		const persisted = await fs.readFile(path.join(runDir(target, session, session), "stage-01-planner.md"), "utf-8");
+		expect(persisted).toBe("plan from dispatcher file\n");
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it("supports resume/restart: re-seed and later writes keep the same bound target run", async () => {
+		const session = "wt-resume";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+
+		const first = await runNativeRalplanCommand(
+			["--worktree-root", target, "--session-id", session, "--json", "resume task"],
+			dispatcher,
+		);
+		expect(first.status).toBe(0);
+		const second = await runNativeRalplanCommand(
+			["--worktree-root", target, "--session-id", session, "--json", "resume task"],
+			dispatcher,
+		);
+		expect(second.status).toBe(0);
+		const firstPayload = JSON.parse(first.stdout ?? "{}") as { run_id?: string };
+		const secondPayload = JSON.parse(second.stdout ?? "{}") as { run_id?: string };
+		expect(secondPayload.run_id).toBe(firstPayload.run_id);
+
+		// A legacy writer inside the bound worktree joins the same run tree.
+		const legacyWrite = await runNativeRalplanCommand(
+			[
+				"--write", "--stage", "planner", "--stage_n", "1",
+				"--session-id", session, "--run-id", session, "--artifact", "plan v1",
+			],
+			target,
+		);
+		expect(legacyWrite.status).toBe(0);
+		// A later explicit write from the dispatcher lands in the same single tree.
+		const explicitWrite = await runNativeRalplanCommand(
+			[
+				"--write", "--worktree-root", target, "--stage", "critic", "--stage_n", "1",
+				"--session-id", session, "--run-id", session, "--artifact", "critic v1", "--lane-verdict", "OKAY",
+			],
+			dispatcher,
+		);
+		expect(explicitWrite.status).toBe(0);
+		const dir = runDir(target, session, session);
+		expect(await pathExists(path.join(dir, "stage-01-planner.md"))).toBe(true);
+		expect(await pathExists(path.join(dir, "stage-01-critic.md"))).toBe(true);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it("rejects missing, non-directory, non-git, and subdirectory targets before any mutation", async () => {
+		const session = "wt-invalid";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const plainDir = await tempDir("gjc-ralplan-plain-");
+		const fileTarget = path.join(dispatcher, "a-file");
+		await fs.writeFile(fileTarget, "x");
+		const subdir = path.join(target, "sub");
+		await fs.mkdir(subdir);
+
+		const cases: Array<{ label: string; root: string; match: RegExp }> = [
+			{ label: "missing", root: path.join(target, "does-not-exist"), match: /does not exist/ },
+			{ label: "non-directory", root: fileTarget, match: /not a directory/ },
+			{ label: "non-git", root: plainDir, match: /not inside a git repository/ },
+			{ label: "subdirectory", root: subdir, match: /must be the git worktree root/ },
+		];
+		for (const { label, root, match } of cases) {
+			const seed = await runNativeRalplanCommand(
+				["--worktree-root", root, "--session-id", session, "--json", `${label} task`],
+				dispatcher,
+			);
+			expect(seed.status, label).toBe(2);
+			expect(seed.stderr ?? "", label).toMatch(match);
+			const write = await runNativeRalplanCommand(
+				[
+					"--write", "--worktree-root", root, "--stage", "planner", "--stage_n", "1",
+					"--session-id", session, "--run-id", session, "--artifact", "plan",
+				],
+				dispatcher,
+			);
+			expect(write.status, `${label} write`).toBe(2);
+			expect(write.stderr ?? "", `${label} write`).toMatch(match);
+			// No filesystem mutation anywhere.
+			expect(await pathExists(path.join(root, ".gjc")), label).toBe(false);
+		}
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(path.join(target, ".gjc"))).toBe(false);
+	});
+
+	it("rejects a linked worktree sharing commonDir when the run is bound to a different worktreeRoot", async () => {
+		const session = "wt-linked";
+		const target = await initRepo("gjc-ralplan-target-");
+		const linked = path.join(await tempDir("gjc-ralplan-linked-parent-"), "linked");
+		await git(["worktree", "add", "--detach", linked, "HEAD"], target);
+
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", target, "--session-id", session, "--json", "linked task"],
+			target,
+		);
+		expect(seed.status).toBe(0);
+
+		const write = await runNativeRalplanCommand(
+			[
+				"--write", "--worktree-root", linked, "--stage", "planner", "--stage_n", "1",
+				"--session-id", session, "--run-id", session, "--artifact", "plan v1",
+			],
+			target,
+		);
+		expect(write.status).toBe(2);
+		expect(write.stderr ?? "").toMatch(/holds no seeded ralplan run state|must exactly equal/);
+		// The linked worktree must not receive a fragmented ralplan tree.
+		expect(await pathExists(path.join(linked, ".gjc"))).toBe(false);
+	});
+
+	it("resets the per-iteration lane budget from the target ledger after a revision", async () => {
+		const session = "wt-budget";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		await fs.mkdir(path.join(target, ".gjc"), { recursive: true });
+		await fs.writeFile(path.join(target, ".gjc", "config.yml"), "gjc:\n  ralplan:\n    maxReviewPassesPerLane: 1\n");
+
+		const writeStage = (stage: string, stageN: number, artifact: string, extra: string[] = []) =>
+			runNativeRalplanCommand(
+				[
+					"--write", "--worktree-root", target, "--stage", stage, "--stage_n", String(stageN),
+					"--session-id", session, "--run-id", session, "--artifact", artifact, ...extra,
+				],
+				dispatcher,
+			);
+
+		expect((await runNativeRalplanCommand(["--worktree-root", target, "--session-id", session, "budget task"], dispatcher)).status).toBe(0);
+		expect((await writeStage("planner", 1, "plan v1")).status).toBe(0);
+		expect((await writeStage("architect", 1, "architect pass 1", ["--lane-verdict", "CLEAR"])).status).toBe(0);
+		// Revision in the target ledger opens consensus iteration 2 (fresh lane budget).
+		expect((await writeStage("revision", 2, "revision opener")).status).toBe(0);
+		// Exactly the false PLANNING-STUCK from the issue: this re-review must now pass.
+		const reReview = await writeStage("architect", 2, "architect pass 1 of iteration 2", ["--lane-verdict", "CLEAR"]);
+		expect(reReview.status).toBe(0);
+		expect(reReview.stderr ?? "").not.toMatch(/PLANNING-STUCK/);
+		const critic = await writeStage("critic", 2, "critic pass 1 of iteration 2", ["--lane-verdict", "OKAY"]);
+		expect(critic.status).toBe(0);
+
+		const dir = runDir(target, session, session);
+		expect(await pathExists(path.join(dir, "stage-02-architect.md"))).toBe(true);
+		expect(await pathExists(path.join(dir, "stage-02-critic.md"))).toBe(true);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it("keeps duplicate-write and owner-session conflict behavior in explicit-target mode", async () => {
+		const session = "wt-dedupe";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		expect((await runNativeRalplanCommand(["--worktree-root", target, "--session-id", session, "dedupe task"], dispatcher)).status).toBe(0);
+
+		const writePlanner = (artifact: string) =>
+			runNativeRalplanCommand(
+				[
+					"--write", "--worktree-root", target, "--stage", "planner", "--stage_n", "1",
+					"--session-id", session, "--run-id", session, "--artifact", artifact,
+				],
+				dispatcher,
+			);
+		expect((await writePlanner("plan v1")).status).toBe(0);
+		const duplicate = await writePlanner("plan v1");
+		expect(duplicate.status).toBe(0);
+		expect(duplicate.stdout ?? "").toMatch(/already persisted/);
+		const conflict = await writePlanner("plan v2 different content");
+		expect(conflict.status).toBe(2);
+		expect(conflict.stderr ?? "").toMatch(/refusing to overwrite/);
+
+		// A foreign session cannot write into the owned run.
+		const foreign = await runNativeRalplanCommand(
+			[
+				"--write", "--worktree-root", target, "--stage", "critic", "--stage_n", "1",
+				"--session-id", "wt-dedupe-other", "--run-id", session, "--artifact", "foreign critic",
+			],
+			dispatcher,
+		);
+		expect(foreign.status).toBe(2);
+		expect(foreign.stderr ?? "").toMatch(/is owned by session/);
+	});
+});
