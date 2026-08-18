@@ -37,6 +37,7 @@ import {
 	type ToolChoice,
 	type Usage,
 } from "@gajae-code/ai";
+import { recordHandledError } from "@gajae-code/utils/postmortem";
 import {
 	type Attributes,
 	type AttributeValue,
@@ -1876,6 +1877,11 @@ export function finishExecuteToolSpan(
 			status === "error" && options.errorObject instanceof Error
 				? options.errorObject.name || "Error"
 				: STATUS_ERROR_TYPE[status];
+	}
+	if (status === "error" && options.errorObject instanceof Error) {
+		try {
+			recordHandledError(`Tool ${options.toolName}`, options.errorObject);
+		} catch {}
 	}
 	if (!span) {
 		if (telemetry && !telemetry.spansEnabled) {

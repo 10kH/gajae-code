@@ -20,7 +20,13 @@
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { normalizeCrashFrames, VERSION } from "@gajae-code/utils";
+import {
+	getHandledErrorEventsPath,
+	getHandledErrorIndexPath,
+	getHandledErrorLogPath,
+	normalizeCrashFrames,
+	VERSION,
+} from "@gajae-code/utils";
 import {
 	type CrashSignatureView,
 	type CrashStatePaths,
@@ -103,9 +109,22 @@ export type CrashRelayOutcome =
 			readonly failed: number;
 	  };
 
+/**
+ * Severity of the store being relayed.
+ *
+ * Fatal crashes and handled tool failures live in separate files on purpose --
+ * handled errors are high-volume and would otherwise evict the rare, precious
+ * fatal records from a shared cap. They are relayed through the same code with
+ * the same egress contract, and differ upstream only by `level`, so a single
+ * project can hold both without the noisy class drowning the signal.
+ */
+export type CrashRelaySeverity = "fatal" | "error";
+
 export interface CrashRelayOptions {
 	readonly config: CrashRelayConfig;
 	readonly paths?: CrashStatePaths;
+	readonly handledPaths?: CrashStatePaths;
+	readonly severity?: CrashRelaySeverity;
 	readonly env?: Record<string, string | undefined>;
 	readonly fetchImpl?: CrashRelayFetch;
 	readonly now?: () => number;
@@ -200,6 +219,7 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 	const platform = options.platform ?? coarsePlatform();
 	const bunVersion = options.bunVersion ?? Bun.version;
 	const limit = options.maxPerRun ?? MAX_RELAY_PER_RUN;
+	const severity = options.severity ?? "fatal";
 
 	// Compaction is the same step the nudge and the CLI rely on: it folds the
 	// append-only journal into the index under the cross-process lock, so the
@@ -245,6 +265,7 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 			platform,
 			bunVersion,
 			dsn: resolved.dsn,
+			level: severity,
 		});
 		if (!envelope.ok) {
 			// Fail closed. Deliberately no retry with a reduced payload.
@@ -276,6 +297,39 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 	}
 
 	return { status: "ran", sent, refused, failed };
+}
+
+/** Paths of the handled-error store, which mirrors the fatal store in separate files. */
+export function resolveHandledErrorStatePaths(agentDir?: string): CrashStatePaths {
+	return {
+		index: getHandledErrorIndexPath(agentDir),
+		events: getHandledErrorEventsPath(agentDir),
+		crashLog: getHandledErrorLogPath(agentDir),
+	};
+}
+
+/**
+ * Relay both stores in one pass.
+ *
+ * Fatal crashes go first: they are rarer and more valuable, so when the
+ * per-run cap binds they must not be starved by a noisy handled-error class.
+ * The gate is evaluated once by the first call, and a skip there means the same
+ * skip applies to the second, so `off` still performs no IO at all.
+ */
+export async function relayAllSignatures(options: CrashRelayOptions): Promise<CrashRelayOutcome> {
+	const fatal = await relayCrashSignatures({ ...options, severity: "fatal" });
+	const handled = await relayCrashSignatures({
+		...options,
+		severity: "error",
+		paths: options.handledPaths ?? resolveHandledErrorStatePaths(),
+	});
+	if (fatal.status === "skipped" && handled.status === "skipped") return fatal;
+	return {
+		status: "ran",
+		sent: (fatal.status === "ran" ? fatal.sent : 0) + (handled.status === "ran" ? handled.sent : 0),
+		refused: (fatal.status === "ran" ? fatal.refused : 0) + (handled.status === "ran" ? handled.refused : 0),
+		failed: (fatal.status === "ran" ? fatal.failed : 0) + (handled.status === "ran" ? handled.failed : 0),
+	};
 }
 
 /** POST one envelope. Any non-2xx, transport error or timeout is a plain false. */

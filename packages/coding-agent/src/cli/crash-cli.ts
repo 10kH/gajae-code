@@ -12,7 +12,7 @@ import { getCrashIndexPath } from "@gajae-code/utils";
 import type { Settings } from "../config/settings";
 import { compactCrashIndex, listCrashSignatures, resolveCrashStatePaths } from "../crash/index-store";
 import { type CrashReportIo, type CrashReportOutcome, runCrashReportFlow } from "../crash/report";
-import { type CrashRelayOutcome, readTrustedRelayConfig, relayCrashSignatures } from "../crash/upstream/relay";
+import { type CrashRelayOutcome, readTrustedRelayConfig, relayAllSignatures } from "../crash/upstream/relay";
 import { runGhDefault } from "../utils/gh";
 
 function createIo(): CrashReportIo {
@@ -93,7 +93,7 @@ export function crashRelayExitCode(outcome: CrashRelayOutcome): number {
 }
 
 export async function runCrashRelayCommand(settings: Settings): Promise<void> {
-	const outcome = await relayCrashSignatures({ config: readTrustedRelayConfig(settings) });
+	const outcome = await relayAllSignatures({ config: readTrustedRelayConfig(settings) });
 	if (outcome.status === "skipped") {
 		const explain: Record<string, string> = {
 			disabled: "crashReport.upstream is off; nothing was transmitted.",

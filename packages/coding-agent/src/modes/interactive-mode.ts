@@ -27,7 +27,7 @@ import {
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
 import { compactCrashIndex, resolveCrashStatePaths } from "../crash/index-store";
 import { crashNudgeGate, maybeShowCrashNudge } from "../crash/nudge";
-import { readTrustedRelayConfig, relayCrashSignatures } from "../crash/upstream/relay";
+import { readTrustedRelayConfig, relayAllSignatures } from "../crash/upstream/relay";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
 	ExtensionUIContext,
@@ -997,7 +997,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			const crashRelayTimer = setTimeout(() => {
 				void (async () => {
 					try {
-						const outcome = await relayCrashSignatures({ config: crashRelayConfig });
+						const outcome = await relayAllSignatures({ config: crashRelayConfig });
 						logger.debug("Crash relay finished", { outcome });
 					} catch (error) {
 						logger.debug("Crash relay skipped", {
