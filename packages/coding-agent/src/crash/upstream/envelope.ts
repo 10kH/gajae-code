@@ -27,6 +27,8 @@ export interface BuildCrashEnvelopeInput {
 	readonly platform: string;
 	readonly bunVersion: string;
 	readonly dsn: SentryDsn;
+	/** Upstream severity. Defaults to `fatal`; handled tool failures use `error`. */
+	readonly level?: "fatal" | "error";
 }
 
 export type BuildCrashEnvelopeResult = { ok: true; body: string; eventId: string } | { ok: false; reason: string };
@@ -101,7 +103,7 @@ export function buildCrashEnvelope(input: BuildCrashEnvelopeInput): BuildCrashEn
 		event_id: input.eventId,
 		timestamp: coarseTimestamp,
 		platform: "node",
-		level: "fatal",
+		level: input.level ?? "fatal",
 		logger: "gjc.crash",
 		release: input.release,
 		environment: "production",

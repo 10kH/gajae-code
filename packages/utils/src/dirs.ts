@@ -591,6 +591,21 @@ export function getCrashIndexPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "gjc-crash-index.json", "state");
 }
 
+/** Get the handled error log path (~/.gjc/agent/gjc-error.log). */
+export function getHandledErrorLogPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-error.log", "state");
+}
+
+/** Get the handled error event journal path (~/.gjc/agent/gjc-error-events.jsonl). */
+export function getHandledErrorEventsPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-error-events.jsonl", "state");
+}
+
+/** Get the compacted handled error signature index path (~/.gjc/agent/gjc-error-index.json). */
+export function getHandledErrorIndexPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-error-index.json", "state");
+}
+
 /** Get the debug log path (~/.gjc/agent/gjc-debug.log). */
 export function getDebugLogPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, `${APP_NAME}-debug.log`, "state");

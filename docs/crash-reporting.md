@@ -193,3 +193,36 @@ in transport, so a partially delivered batch is never reported to automation as 
 The fingerprint remains a public, pseudonymous correlation token, not a confidentiality
 control. In addition to its local correlation role, it links the same crash class across
 installs inside the upstream project.
+
+## 6. Handled tool errors
+
+Sections 1-5 describe *fatal* crashes: `uncaughtException` and `unhandledRejection`. A tool
+that throws and is caught never reaches that path, so those failures were previously
+invisible to both `gjc crash list` and the relay.
+
+Handled tool errors are captured at `finishExecuteToolSpan`, which already holds the live
+`Error` with an intact stack. Capture is deliberately narrow: only `status === "error"`
+with an `Error` carrying a non-empty stack is recorded. Aborted calls, blocked calls, and
+non-`Error` throws are not, because without a stack the v1 fingerprint degrades to
+`<no-app-frame>` and every unrelated failure would collapse into one meaningless group.
+
+The same reasoning rules out hooking `logger.error`: of its call sites, nearly all pass
+`String(error)` or `error.message`, so the stack is already gone by the time the logger
+sees it.
+
+Handled errors get their own files -- `gjc-error.log`, `gjc-error-events.jsonl`,
+`gjc-error-index.json` -- rather than sharing the fatal store. They are high-volume and
+fatal crashes are rare and precious; under a shared cap the noisy class would evict the
+signal and break `gjc crash report`. Everything else is reused verbatim: the same record
+format, the same `redactCrashSecrets` scrubbing, the same v1 fingerprint, the same
+`sanitizeExternalCrashV1` egress contract.
+
+Two bounds keep the capture path cheap enough to run inside a live turn. A fingerprint is
+recorded at most once per process, so a tool failing in a loop writes one record rather
+than thousands, and the dedupe set itself stops admitting new fingerprints past 256 entries
+so it cannot grow without limit. Capture never throws: a handled tool error must not become
+an unhandled one.
+
+Upstream, handled errors are relayed by the same code as fatal crashes and differ only by
+`level` (`error` rather than `fatal`). Fatal signatures are relayed first, so a noisy
+handled class cannot starve them when the per-run cap binds.

@@ -12,6 +12,7 @@ import {
 	type CrashRelayFetch,
 	isRelayDue,
 	readTrustedRelayConfig,
+	relayAllSignatures,
 	relayCrashSignatures,
 	resolveRelayDsn,
 	type TrustedRelaySettings,
@@ -370,6 +371,66 @@ describe("relayCrashSignatures", () => {
 		});
 		expect(outcome).toEqual({ status: "ran", sent: 2, refused: 0, failed: 0 });
 		expect(bodies).toHaveLength(2);
+	});
+
+	test("relaying the handled store marks the events as error, not fatal", async () => {
+		await seed();
+		const bodies: string[] = [];
+		await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			severity: "error",
+			fetchImpl: accept(bodies),
+		});
+		const payload = JSON.parse(bodies[0]?.split("\n")[2] ?? "{}") as { level: string };
+		expect(payload.level).toBe("error");
+	});
+
+	test("relayAllSignatures covers both stores and keeps their levels distinct", async () => {
+		const handledDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-relay-handled-"));
+		const handledPaths: CrashStatePaths = {
+			index: path.join(handledDir, "gjc-error-index.json"),
+			events: path.join(handledDir, "gjc-error-events.jsonl"),
+			crashLog: path.join(handledDir, "gjc-error.log"),
+		};
+		try {
+			await seed();
+			// Same shape in the handled store, under a different fingerprint.
+			const handledFingerprint = "b".repeat(32);
+			appendCrashEvent(
+				{
+					kind: "occurrence",
+					fingerprint: handledFingerprint,
+					fpv: 1,
+					recordId: "abcdefabcdefabcd",
+					at: 1_700_000_900_000,
+					errorName: "ToolError",
+					messageClass: "tool failed",
+				},
+				handledPaths.events,
+			);
+			await fs.writeFile(
+				handledPaths.crashLog,
+				`2026-08-11T11:59:59.000Z pid=4242 [Tool functions.read] ToolError: tool failed\n` +
+					`${STACK}\n${formatCrashRecordMarker(handledFingerprint, 1, "abcdefabcdefabcd")}\n\n`,
+			);
+
+			const bodies: string[] = [];
+			const outcome = await relayAllSignatures({
+				config: config(),
+				paths,
+				handledPaths,
+				env: {},
+				fetchImpl: accept(bodies),
+			});
+			expect(outcome).toEqual({ status: "ran", sent: 2, refused: 0, failed: 0 });
+			const levels = bodies.map(body => (JSON.parse(body.split("\n")[2] ?? "{}") as { level: string }).level);
+			// Fatal is relayed first so a noisy handled class cannot starve it at the cap.
+			expect(levels).toEqual(["fatal", "error"]);
+		} finally {
+			await fs.rm(handledDir, { recursive: true, force: true });
+		}
 	});
 
 	test("the emitted envelope carries no timestamp finer than a day", async () => {
