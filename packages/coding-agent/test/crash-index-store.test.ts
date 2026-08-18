@@ -6,9 +6,12 @@ import {
 	appendCrashEvent,
 	type CrashOccurrenceEvent,
 	computeCrashFingerprint,
+	formatCrashEventLine,
 	formatCrashRecordMarker,
+	parseCrashEventLine,
 } from "@gajae-code/utils";
 import {
+	applyCrashEvent,
 	CRASH_INDEX_MAX_SIGNATURES,
 	type CrashStatePaths,
 	compactCrashIndex,
@@ -569,5 +572,112 @@ describe("listCrashSignatures", () => {
 			fingerprintFor(11),
 			fingerprintFor(10),
 		]);
+	});
+});
+
+describe("relayed crash events", () => {
+	const fingerprint = fingerprintFor(70);
+	const eventId = "0123456789abcdef0123456789abcdef";
+
+	it("round-trips all relayed fields through the journal format", () => {
+		const line = formatCrashEventLine({ kind: "relayed", fingerprint, at: NOW, eventId });
+
+		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId });
+	});
+
+	it.each([
+		["wrong length", "0123456789abcdef0123456789abcde"],
+		["uppercase hex", "0123456789ABCDEF0123456789ABCDEF"],
+		["non-hex", "0123456789abcdef0123456789abcdeg"],
+	])("rejects a relayed event id with %s", (_label, malformedEventId) => {
+		const line = `${"gjc-crash-event.v1"} ${JSON.stringify({ k: "relayed", fp: fingerprint, at: NOW, e: malformedEventId })}\n`;
+
+		expect(parseCrashEventLine(line)).toBeUndefined();
+	});
+
+	it("records relays monotonically for an existing signature", () => {
+		const index = parseCrashIndex(
+			JSON.stringify({
+				version: 1,
+				updatedAt: NOW,
+				lastNudgedAt: 0,
+				overflow: false,
+				recentEventIds: [],
+				signatures: {
+					[fingerprint]: {
+						fpv: 1,
+						errorName: "Error",
+						messageClass: "boom",
+						lifetimeCount: 1,
+						retainedCount: 0,
+						firstSeen: NOW,
+						lastSeen: NOW,
+						lastRecordId: recordId(70),
+					},
+				},
+			}),
+			NOW,
+		);
+		expect(index).toBeDefined();
+		if (!index) return;
+
+		const relay = { kind: "relayed" as const, fingerprint, at: NOW, eventId };
+		expect(applyCrashEvent(index, relay, NOW)).toBe(true);
+		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
+		expect(applyCrashEvent(index, relay, NOW)).toBe(false);
+		expect(applyCrashEvent(index, { ...relay, at: NOW - 1 }, NOW)).toBe(false);
+		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
+	});
+
+	it("does not create a signature for an unknown relay", () => {
+		const index = parseCrashIndex(
+			JSON.stringify({
+				version: 1,
+				updatedAt: NOW,
+				lastNudgedAt: 0,
+				overflow: false,
+				recentEventIds: [],
+				signatures: {},
+			}),
+			NOW,
+		);
+		expect(index).toBeDefined();
+		if (!index) return;
+
+		expect(applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId }, NOW)).toBe(false);
+		expect(index.signatures[fingerprint]).toBeUndefined();
+	});
+
+	it("accepts relayedAt and rejects an out-of-range value in the index", () => {
+		const entry = {
+			fpv: 1,
+			errorName: "Error",
+			messageClass: "boom",
+			lifetimeCount: 1,
+			retainedCount: 0,
+			firstSeen: NOW,
+			lastSeen: NOW,
+			lastRecordId: recordId(71),
+			relayedAt: NOW,
+		};
+		const valid = {
+			version: 1,
+			updatedAt: NOW,
+			lastNudgedAt: 0,
+			overflow: false,
+			recentEventIds: [],
+			signatures: { [fingerprint]: entry },
+		};
+
+		expect(parseCrashIndex(JSON.stringify(valid), NOW)?.signatures[fingerprint]?.relayedAt).toBe(NOW);
+		expect(
+			parseCrashIndex(
+				JSON.stringify({
+					...valid,
+					signatures: { [fingerprint]: { ...entry, relayedAt: NOW + 1e12 } },
+				}),
+				NOW,
+			),
+		).toBeUndefined();
 	});
 });

@@ -72,6 +72,8 @@ export interface CrashSignatureEntry {
 	reportedAt?: number;
 	reportedIssueUrl?: string;
 	acknowledgedAt?: number;
+	/** Epoch ms this signature was last accepted by the configured upstream. */
+	relayedAt?: number;
 	/** Issues this install already "+1"ed, so re-invocations cannot spam comments. */
 	commentedIssues?: string[];
 }
@@ -142,6 +144,7 @@ const ENTRY_KEYS = new Set([
 	"reportedAt",
 	"reportedIssueUrl",
 	"acknowledgedAt",
+	"relayedAt",
 	"commentedIssues",
 ]);
 const INDEX_KEYS = new Set([
@@ -228,6 +231,7 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	if (typeof raw.lastRecordId !== "string" || !/^[0-9a-f]{8,32}$/.test(raw.lastRecordId)) return undefined;
 	if (raw.reportedAt !== undefined && !isTimestamp(raw.reportedAt, now)) return undefined;
 	if (raw.acknowledgedAt !== undefined && !isTimestamp(raw.acknowledgedAt, now)) return undefined;
+	if (raw.relayedAt !== undefined && !isTimestamp(raw.relayedAt, now)) return undefined;
 	if (raw.reportedIssueUrl !== undefined && !isCleanString(raw.reportedIssueUrl, 256)) return undefined;
 	if (raw.commentedIssues !== undefined) {
 		if (!Array.isArray(raw.commentedIssues) || raw.commentedIssues.length > 32) return undefined;
@@ -246,6 +250,7 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	if (raw.reportedAt !== undefined) entry.reportedAt = raw.reportedAt;
 	if (raw.reportedIssueUrl !== undefined) entry.reportedIssueUrl = raw.reportedIssueUrl;
 	if (raw.acknowledgedAt !== undefined) entry.acknowledgedAt = raw.acknowledgedAt;
+	if (raw.relayedAt !== undefined) entry.relayedAt = raw.relayedAt;
 	if (raw.commentedIssues !== undefined) entry.commentedIssues = [...(raw.commentedIssues as string[])];
 	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) return undefined;
 	return entry;
@@ -428,6 +433,7 @@ function evictOne(index: CrashIndex): boolean {
 	for (const [fingerprint, entry] of Object.entries(index.signatures)) {
 		// Unreported signatures are never evicted: losing them is exactly the
 		// failure this feature exists to prevent.
+		// relayedAt is deliberately not an eviction input.
 		if (entry.reportedAt === undefined && entry.acknowledgedAt === undefined) continue;
 		if (entry.lastSeen < victimSeen) {
 			victim = fingerprint;
@@ -463,6 +469,12 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		if (existing.reportedAt !== undefined && existing.reportedAt >= event.at) return false;
 		existing.reportedAt = event.at;
 		existing.reportedIssueUrl = event.issueUrl;
+		return true;
+	}
+	if (event.kind === "relayed") {
+		if (!existing) return false;
+		if (existing.relayedAt !== undefined && existing.relayedAt >= event.at) return false;
+		existing.relayedAt = event.at;
 		return true;
 	}
 	if (event.kind === "acknowledged") {
