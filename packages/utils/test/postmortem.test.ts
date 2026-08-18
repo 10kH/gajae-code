@@ -19,9 +19,26 @@ interface FixtureResult {
 const fixturePath = path.join(import.meta.dir, "postmortem-fixture.ts");
 const utilsDirectory = path.join(import.meta.dir, "..");
 
+/**
+ * Every scenario here deliberately crashes a real subprocess, and the fatal
+ * handler writes to whatever `getCrashLogPath()` resolves to. Without an
+ * override that is the developer's own `~/.gjc/agent/gjc-crash.log`, so a test
+ * run injected a dozen `fixture: ...` signatures into their real crash store --
+ * visible in `gjc crash list`, offered up by `gjc crash report`, eligible for
+ * the opt-in upstream relay, and competing for the log's fixed byte cap against
+ * the genuine crash they might actually need to file.
+ *
+ * Redirect the whole store into a temp directory instead. This is scoped to the
+ * spawned child only; the parent test process is untouched. The directory is
+ * not created here because the crash writer already does `mkdirSync` on its
+ * target's parent.
+ */
+const fixtureAgentDir = path.join(os.tmpdir(), `gjc-postmortem-agent-${process.pid}-${Date.now()}`);
+
 async function captureProcess(command: string[], cwd: string): Promise<ScenarioResult> {
 	const proc = Bun.spawn(command, {
 		cwd,
+		env: { ...process.env, GJC_CODING_AGENT_DIR: fixtureAgentDir },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
