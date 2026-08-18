@@ -1225,6 +1225,20 @@
 					"type": "boolean",
 					"description": "At interactive startup, show one rate-limited line when unreported crash signatures exist. Reads local state only; nothing is ever transmitted without the explicit consent flow in `gjc crash report`.",
 					"default": true
+				},
+				"upstream": {
+					"type": "string",
+					"enum": [
+						"off",
+						"sentry"
+					],
+					"description": "Opt in to transmit sanitized crash signatures to an aggregation service for cross-install counting. Off sends nothing. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+					"default": "off"
+				},
+				"upstreamDsn": {
+					"type": "string",
+					"description": "Sentry DSN for the opted-in upstream; ignored while Crash Report Upstream is off, and no default destination exists. Only fields approved by `sanitizeExternalCrashV1` are sent; prompt text, source code, file contents, and credentials are excluded.",
+					"default": ""
 				}
 			},
 			"additionalProperties": false

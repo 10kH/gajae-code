@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { isKnownSinkPeerClosedError } from "../src/broken-pipe";
+import { parseCrashEventLine } from "../src/crash-journal";
+import { getCrashEventsPath, getCrashLogPath } from "../src/dirs";
 
 interface ScenarioResult {
 	stdout: string;
@@ -19,9 +21,26 @@ interface FixtureResult {
 const fixturePath = path.join(import.meta.dir, "postmortem-fixture.ts");
 const utilsDirectory = path.join(import.meta.dir, "..");
 
+/**
+ * Every scenario here deliberately crashes a real subprocess, and the fatal
+ * handler writes to whatever `getCrashLogPath()` resolves to. Without an
+ * override that is the developer's own `~/.gjc/agent/gjc-crash.log`, so a test
+ * run injected a dozen `fixture: ...` signatures into their real crash store --
+ * visible in `gjc crash list`, offered up by `gjc crash report`, eligible for
+ * the opt-in upstream relay, and competing for the log's fixed byte cap against
+ * the genuine crash they might actually need to file.
+ *
+ * Redirect the whole store into a temp directory instead. This is scoped to the
+ * spawned child only; the parent test process is untouched. The directory is
+ * not created here because the crash writer already does `mkdirSync` on its
+ * target's parent.
+ */
+const fixtureAgentDir = path.join(os.tmpdir(), `gjc-postmortem-agent-${process.pid}-${Date.now()}`);
+
 async function captureProcess(command: string[], cwd: string): Promise<ScenarioResult> {
 	const proc = Bun.spawn(command, {
 		cwd,
+		env: { ...process.env, GJC_CODING_AGENT_DIR: fixtureAgentDir },
 		stdout: "pipe",
 		stderr: "pipe",
 	});
@@ -332,5 +351,42 @@ describe("postmortem process stdout closed-stream family (EIO/EBADF, issue #3810
 		const result = await runScenario("non-stdout-eio-fatal");
 
 		expectOrdinaryFatal(result, "Uncaught Exception", "fixture: non-stdout EIO stays fatal");
+	}, 15_000);
+});
+
+describe("postmortem fixture crash-store isolation", () => {
+	it("writes crash records into fixtureAgentDir, journals the fatal occurrence, and leaves the real store untouched", async () => {
+		const readOrNull = async (target: string): Promise<string | null> => {
+			try {
+				return await fs.readFile(target, "utf8");
+			} catch {
+				return null;
+			}
+		};
+		const realLog = getCrashLogPath();
+		const realEvents = getCrashEventsPath();
+		const beforeLog = await readOrNull(realLog);
+		const beforeEvents = await readOrNull(realEvents);
+
+		const result = await runScenario("non-pipe-uncaught-exception");
+		expectOrdinaryFatal(result, "Uncaught Exception", "fixture: genuine fatal error");
+
+		// The process-level fatal handler must journal an occurrence beside the
+		// crash log it writes -- without it the crash is invisible to indexing,
+		// listing, nudging, and the upstream relay -- and must print the record
+		// path rather than stringifying the record object.
+		expect(result.stderr).toContain("crash recorded at ");
+		expect(result.stderr).not.toContain("[object Object]");
+
+		const fixtureLog = await Bun.file(getCrashLogPath(fixtureAgentDir)).text();
+		expect(fixtureLog).toContain("gjc-crash-record.v1 ");
+		const fixtureEventLines = (await Bun.file(getCrashEventsPath(fixtureAgentDir)).text())
+			.split("\n")
+			.filter(Boolean);
+		expect(fixtureEventLines.length).toBeGreaterThan(0);
+		expect(parseCrashEventLine(fixtureEventLines.at(-1) ?? "")?.kind).toBe("occurrence");
+
+		expect(await readOrNull(realLog)).toBe(beforeLog);
+		expect(await readOrNull(realEvents)).toBe(beforeEvents);
 	}, 15_000);
 });

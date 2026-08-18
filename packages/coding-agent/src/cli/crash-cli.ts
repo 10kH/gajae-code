@@ -9,8 +9,10 @@
 import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { getCrashIndexPath } from "@gajae-code/utils";
+import type { Settings } from "../config/settings";
 import { compactCrashIndex, listCrashSignatures, resolveCrashStatePaths } from "../crash/index-store";
 import { type CrashReportIo, type CrashReportOutcome, runCrashReportFlow } from "../crash/report";
+import { type CrashRelayOutcome, readTrustedRelayConfig, relayAllSignatures } from "../crash/upstream/relay";
 import { runGhDefault } from "../utils/gh";
 
 function createIo(): CrashReportIo {
@@ -75,4 +77,38 @@ export async function runCrashListCommand(json: boolean): Promise<void> {
 				`${state}\n    ${signature.errorName}: ${signature.messageClass.slice(0, 120)}\n`,
 		);
 	}
+}
+
+/**
+ * Batch-relay every due signature to the configured upstream.
+ *
+ * The startup relay is silent and best-effort; this is the loud form, so a
+ * refusal is reported as a refusal instead of being swallowed. It shares the
+ * same gate: with `crashReport.upstream` off, it explains that and exits
+ * non-zero rather than quietly doing nothing.
+ */
+export function crashRelayExitCode(outcome: CrashRelayOutcome): number {
+	if (outcome.status === "skipped") return outcome.reason === "nothing-to-relay" ? 0 : 1;
+	return outcome.failed > 0 || outcome.refused > 0 ? 1 : 0;
+}
+
+export async function runCrashRelayCommand(settings: Settings): Promise<void> {
+	const outcome = await relayAllSignatures({ config: readTrustedRelayConfig(settings) });
+	if (outcome.status === "skipped") {
+		const explain: Record<string, string> = {
+			disabled: "crashReport.upstream is off; nothing was transmitted.",
+			"no-dsn": "No upstream DSN configured (crashReport.upstreamDsn or GJC_CRASH_SENTRY_DSN).",
+			"invalid-dsn": "The configured upstream DSN could not be parsed; refusing to send.",
+			"nothing-to-relay": "No crash signatures are due for relay.",
+		};
+		process.stdout.write(`${explain[outcome.reason] ?? outcome.reason}\n`);
+		process.exitCode = crashRelayExitCode(outcome);
+		return;
+	}
+	process.stdout.write(`relayed ${outcome.sent}, refused ${outcome.refused}, failed ${outcome.failed}\n`);
+	if (outcome.refused > 0)
+		process.stdout.write("refused signatures failed the outbound sanitizer and were not sent.\n");
+	// A partially refused batch is not a success. Automation that only reads the
+	// exit code must not conclude the whole set was delivered.
+	process.exitCode = crashRelayExitCode(outcome);
 }
