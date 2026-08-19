@@ -1088,12 +1088,13 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 }
 
 /// Delete only the regular file that still has the supplied platform identity,
-/// without the exchange/quarantine protocol used by [`exact_unlink`]. This is
-/// reserved for already-detached inert debris: the operation first moves the
-/// pathname to the caller's private no-replace quarantine, verifies the moved
-/// object, and only then unlinks that private name. A successor published at
-/// the original pathname is therefore never consumed by cleanup, and this
-/// path cannot manufacture another exchange placeholder.
+/// without the exchange/quarantine protocol used by [`exact_unlink`].
+///
+/// This is reserved for already-detached inert debris: the operation first
+/// moves the pathname to the caller's private no-replace quarantine, verifies
+/// the moved object, and only then unlinks that private name. A successor
+/// published at the original pathname is therefore never consumed by cleanup,
+/// and this path cannot manufacture another exchange placeholder.
 #[napi]
 pub fn exact_unlink_direct(
 	path: String,
@@ -3568,9 +3569,8 @@ pub(crate) mod platform {
 				return close_parent(NativeExactUnlinkResult::failure("parent_mismatch"));
 			}
 		}
-		let quarantine = match CString::new(quarantine_name) {
-			Ok(value) => value,
-			Err(_) => return close_parent(NativeExactUnlinkResult::failure("invalid_request")),
+		let Ok(quarantine) = CString::new(quarantine_name) else {
+			return close_parent(NativeExactUnlinkResult::failure("invalid_request"));
 		};
 		match exact_regular_matches(parent_fd, &name, identity) {
 			Ok(true) => {},
