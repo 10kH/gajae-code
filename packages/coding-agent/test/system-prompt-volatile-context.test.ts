@@ -1,6 +1,10 @@
 import { describe, expect, it, setSystemTime } from "bun:test";
 import type { BuildSystemPromptResult } from "@gajae-code/coding-agent/system-prompt";
-import { buildSystemPrompt, buildVolatileProjectContext } from "@gajae-code/coding-agent/system-prompt";
+import {
+	buildSystemPrompt,
+	buildVolatileProjectContext,
+	getLocalTimeContext,
+} from "@gajae-code/coding-agent/system-prompt";
 import type { WorkspaceTree } from "@gajae-code/coding-agent/workspace-tree";
 import { hashPrefix } from "../../orchestration-token-benchmark/src/prefix-stability";
 
@@ -120,5 +124,58 @@ describe("volatile project context", () => {
 		expect(withoutTree).toContain("current working directory is '/tmp/project'");
 		expect(withoutTree).not.toContain("<workspace-tree>");
 		expect(withoutTree).not.toContain("</workspace-tree>");
+	});
+
+	it("renders the host local date and clock rather than the UTC calendar date", () => {
+		// 15:30Z is already the next calendar day in Seoul: a UTC-only date is a full
+		// day wrong for east-of-UTC users during their local morning.
+		const instant = new Date("2026-08-19T15:30:00Z");
+
+		expect(getLocalTimeContext(instant, "Asia/Seoul")).toEqual({
+			date: "2026-08-20 (Thu)",
+			time: "00:30 UTC+09:00 (Asia/Seoul)",
+		});
+		expect(getLocalTimeContext(instant, "America/New_York")).toEqual({
+			date: "2026-08-19 (Wed)",
+			time: "11:30 UTC-04:00 (America/New_York)",
+		});
+		expect(getLocalTimeContext(instant, "Asia/Kolkata")).toEqual({
+			date: "2026-08-19 (Wed)",
+			time: "21:00 UTC+05:30 (Asia/Kolkata)",
+		});
+		expect(getLocalTimeContext(instant, "UTC")).toEqual({
+			date: "2026-08-19 (Wed)",
+			time: "15:30 UTC+00:00 (UTC)",
+		});
+	});
+
+	it("defaults to the host zone and injects the clock plus UTC conversion guidance every turn", () => {
+		const instant = new Date("2026-08-19T15:30:00Z");
+		const host = getLocalTimeContext(instant);
+		const hostZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+		expect(host).toEqual(getLocalTimeContext(instant, hostZone));
+		expect(host.date).toMatch(/^\d{4}-\d{2}-\d{2} \([A-Z][a-z]{2}\)$/);
+		expect(host.time).toMatch(/^\d{2}:\d{2} UTC[+-]\d{2}:\d{2} \(.+\)$/);
+
+		const rendered = buildVolatileProjectContext({ cwd: "/tmp/project", now: instant });
+		expect(rendered).toContain(
+			`Today is ${host.date}, the local time is ${host.time}, and the current working directory is '/tmp/project'.`,
+		);
+		expect(rendered).toContain("convert them to the local timezone above when reporting times to the user");
+	});
+
+	it("keeps the local clock out of the stable system prefix", async () => {
+		const built = await buildSystemPrompt({
+			cwd: "/tmp/project",
+			workspaceTree: workspaceTree(""),
+			contextFiles: [],
+			skills: [],
+			toolNames: [],
+		});
+		const stablePrefix = built.systemPrompt.join("\n\n");
+
+		expect(stablePrefix).not.toContain("the local time is");
+		expect(stablePrefix).not.toContain("UTC+");
 	});
 });
