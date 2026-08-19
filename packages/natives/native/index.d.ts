@@ -94,7 +94,22 @@ export declare class MacOSPowerAssertion {
 export declare class NativeRetainedBrokerPublication {
   observe(): NativeBrokerPublicationObservation
   heartbeat(heartbeatAt: string): NativeBrokerPublicationOperation
+  /**
+   * Async variant of [`Self::heartbeat`] scheduled on the libuv blocking
+   * pool. The positional write is a blocking `pwrite` against retained
+   * authority, so running it on the JS thread lets a stalled filesystem
+   * freeze the whole process -- including the timers that are supposed to
+   * notice the stall.
+   */
+  heartbeatAsync(heartbeatAt: string): Promise<NativeBrokerPublicationOperation>
   sync(): NativeBrokerPublicationOperation
+  /**
+   * Async variant of [`Self::sync`] scheduled on the libuv blocking pool.
+   * `fsync` is unbounded by design -- it returns when the device says so --
+   * so on the JS thread it can stop timers, signal handlers, and broker
+   * completion for as long as the filesystem is wedged.
+   */
+  syncAsync(): Promise<NativeBrokerPublicationOperation>
   /**
    * Close discovery, owner record, lock directory, and SDK root in that
    * order.

@@ -64,11 +64,19 @@ class NativeRetainedBrokerDiscovery implements RetainedBrokerDiscovery {
 		const kind = this.#publication.observe().kind;
 		return kind === "owned" || kind === "absent" || kind === "replaced" || kind === "ambiguous" ? kind : "ambiguous";
 	}
+	/**
+	 * The positional write and its fsync run on the libuv blocking pool, never on
+	 * the JS thread. Both are unbounded -- an fsync returns when the device says so
+	 * -- and on the JS thread a wedged filesystem would stop the publication
+	 * watchdog, signal handling, and broker completion along with the write it is
+	 * blocking, leaving a process that cannot even notice it stopped publishing
+	 * (#4704).
+	 */
 	async heartbeat(heartbeatAt: number): Promise<boolean> {
 		if (this.#closed || !isFixedWidthHeartbeat(heartbeatAt)) return false;
-		const write = this.#publication.heartbeat(String(heartbeatAt));
+		const write = await this.#publication.heartbeatAsync(String(heartbeatAt));
 		if (write.kind !== "written") return false;
-		return this.#publication.sync().kind === "synced";
+		return (await this.#publication.syncAsync()).kind === "synced";
 	}
 	close(): void {
 		if (this.#closed) return;

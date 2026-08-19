@@ -1,8 +1,10 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, test, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as native from "@gajae-code/natives";
 import { Broker, setHeartbeatStallForTest, setLivenessGraceForTest } from "../src/sdk/broker/broker";
+import { publishBrokerDiscovery } from "../src/sdk/broker/discovery";
 
 // A short TTL drives the publication watchdog at `ttl/3`, so a liveness deadline
 // expressed in cadences expires in tens of milliseconds.
@@ -62,6 +64,47 @@ test("a broker that keeps publishing is never terminated by the liveness deadlin
 	setLivenessGraceForTest(broker, WATCHDOG_CADENCE_MS * 8);
 
 	expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 24)).toBe(false);
+});
+
+test("the retained heartbeat never runs its blocking write or fsync on the JS thread", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-liveness-thread-"));
+	roots.push(root);
+	const agentDir = path.join(root, "agent");
+	// The synchronous bindings block the thread until the device returns, which is
+	// what leaves the watchdog above unable to run at all. Reaching for them from
+	// the publication path is the regression, so they fail loudly here.
+	const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
+		observe: () => ({ kind: "owned" }),
+		heartbeat: () => {
+			throw new Error("blocking heartbeat write must not run on the JS thread");
+		},
+		sync: () => {
+			throw new Error("blocking fsync must not run on the JS thread");
+		},
+		heartbeatAsync: () => Promise.resolve({ kind: "written" }),
+		syncAsync: () => Promise.resolve({ kind: "synced" }),
+		close: () => ({ kind: "closed" }),
+	} as never);
+	const now = Date.now();
+	const publication = await publishBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "off-thread-owner",
+		pid: process.pid,
+		host: "127.0.0.1",
+		port: 1,
+		url: "ws://127.0.0.1:1",
+		token: "off-thread-token",
+		startedAt: now,
+		heartbeatAt: now,
+	});
+	try {
+		expect(await publication.heartbeat(now + 1)).toBe(true);
+	} finally {
+		publication.close();
+		retain.mockRestore();
+	}
 });
 
 test("a heartbeat that resumes before the deadline clears the accrued stall", async () => {

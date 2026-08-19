@@ -2,7 +2,10 @@
 
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::{
+	path::{Component, Path, PathBuf},
+	sync::Arc,
+};
 
 use napi::{
 	JsString,
@@ -28,7 +31,7 @@ pub struct NativeBrokerPublicationOperation {
 /// Retained no-follow authority for the SDK publication namespace.
 #[napi]
 pub struct NativeRetainedBrokerPublication {
-	inner: Mutex<Option<publication::RetainedPublication>>,
+	inner: Arc<Mutex<Option<publication::RetainedPublication>>>,
 }
 
 #[napi]
@@ -54,6 +57,28 @@ impl NativeRetainedBrokerPublication {
 		}
 	}
 
+	/// Async variant of [`Self::heartbeat`] scheduled on the libuv blocking
+	/// pool. The positional write is a blocking `pwrite` against retained
+	/// authority, so running it on the JS thread lets a stalled filesystem
+	/// freeze the whole process -- including the timers that are supposed to
+	/// notice the stall.
+	#[napi]
+	pub fn heartbeat_async(
+		&self,
+		heartbeat_at: String,
+	) -> task::Promise<NativeBrokerPublicationOperation> {
+		let inner = Arc::clone(&self.inner);
+		task::blocking("broker_publication_heartbeat", (), move |_| {
+			let mut guard = inner.lock();
+			Ok(NativeBrokerPublicationOperation {
+				kind: guard.as_mut().map_or_else(
+					|| "closed".to_owned(),
+					|publication| publication.heartbeat(&heartbeat_at),
+				),
+			})
+		})
+	}
+
 	#[napi]
 	pub fn sync(&self) -> NativeBrokerPublicationOperation {
 		let guard = self.inner.lock();
@@ -62,6 +87,23 @@ impl NativeRetainedBrokerPublication {
 				.as_ref()
 				.map_or_else(|| "closed".to_owned(), publication::RetainedPublication::sync),
 		}
+	}
+
+	/// Async variant of [`Self::sync`] scheduled on the libuv blocking pool.
+	/// `fsync` is unbounded by design -- it returns when the device says so --
+	/// so on the JS thread it can stop timers, signal handlers, and broker
+	/// completion for as long as the filesystem is wedged.
+	#[napi]
+	pub fn sync_async(&self) -> task::Promise<NativeBrokerPublicationOperation> {
+		let inner = Arc::clone(&self.inner);
+		task::blocking("broker_publication_sync", (), move |_| {
+			let guard = inner.lock();
+			Ok(NativeBrokerPublicationOperation {
+				kind: guard
+					.as_ref()
+					.map_or_else(|| "closed".to_owned(), publication::RetainedPublication::sync),
+			})
+		})
 	}
 
 	/// Close discovery, owner record, lock directory, and SDK root in that
@@ -84,7 +126,7 @@ pub fn retain_broker_publication(
 		publication::RetainedPublication::open(Path::new(&agent_dir)).ok_or_else(|| {
 			napi::Error::from_reason("Retained broker publication authority is unavailable.")
 		})?;
-	Ok(NativeRetainedBrokerPublication { inner: Mutex::new(Some(publication)) })
+	Ok(NativeRetainedBrokerPublication { inner: Arc::new(Mutex::new(Some(publication))) })
 }
 
 /// Result of resolving an existing directory to its stable platform identity.
@@ -8457,8 +8499,9 @@ mod retained_broker_publication_tests {
 		assert_eq!(publication.heartbeat("1234567890888"), "written");
 		assert!(!dir.0.join("sdk/broker.json").exists());
 
-		let retained =
-			NativeRetainedBrokerPublication { inner: parking_lot::Mutex::new(Some(publication)) };
+		let retained = NativeRetainedBrokerPublication {
+			inner: std::sync::Arc::new(parking_lot::Mutex::new(Some(publication))),
+		};
 		assert_eq!(retained.close().kind, "closed");
 		assert_eq!(retained.heartbeat("1234567890777".to_owned()).kind, "closed");
 		assert_eq!(retained.observe().kind, "ambiguous");
