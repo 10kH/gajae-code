@@ -1,6 +1,23 @@
 import { Command } from "@gajae-code/utils/cli";
 import { ensureWorkflowSettingsMigrated } from "../config/settings";
-import { runNativeRalplanCommand } from "../gjc-runtime/ralplan-runtime";
+import {
+	type RalplanCommandResult,
+	resolveRalplanTargetRoot,
+	runNativeRalplanCommand,
+} from "../gjc-runtime/ralplan-runtime";
+import { CommandError } from "../gjc-runtime/workflow-cli-common";
+
+/** Public CLI path: validate --worktree-root before any settings migration, then dispatch. */
+export async function runRalplanCliCommand(args: string[], cwd: string): Promise<RalplanCommandResult> {
+	try {
+		const target = await resolveRalplanTargetRoot(args, cwd);
+		await ensureWorkflowSettingsMigrated(target.root);
+	} catch (error) {
+		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
+		throw error;
+	}
+	return await runNativeRalplanCommand(args, cwd);
+}
 
 export default class Ralplan extends Command {
 	static description = "Run native GJC RALPLAN consensus planning workflow";
@@ -15,8 +32,7 @@ export default class Ralplan extends Command {
 	];
 
 	async run(): Promise<void> {
-		await ensureWorkflowSettingsMigrated(process.cwd());
-		const result = await runNativeRalplanCommand(this.argv, process.cwd());
+		const result = await runRalplanCliCommand(this.argv, process.cwd());
 		if (result.stdout) process.stdout.write(result.stdout);
 		if (result.stderr) process.stderr.write(result.stderr);
 		process.exitCode = result.status;
