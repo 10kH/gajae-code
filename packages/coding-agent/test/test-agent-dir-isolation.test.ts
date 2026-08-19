@@ -161,6 +161,7 @@ describe("provider environment isolation", () => {
 			AWS_DEFAULT_REGION: "us-west-2",
 			AWS_EC2_METADATA_DISABLED: "false",
 			AWS_BEARER_TOKEN_BEDROCK: "ambient-bedrock-token",
+			AWS_BEDROCK_SKIP_AUTH: "true",
 			GOOGLE_APPLICATION_CREDENTIALS: "/ambient/credentials.json",
 			HUGGINGFACE_HUB_TOKEN: "ambient-huggingface-token",
 			GITHUB_TOKEN: "ambient-github-token",
@@ -168,6 +169,12 @@ describe("provider environment isolation", () => {
 			SEARXNG_ENDPOINT: "https://search.example.test",
 			CLAUDE_CODE_CLIENT_KEY: "/ambient/client.key",
 			NODE_EXTRA_CA_CERTS: "/ambient/ca.pem",
+			HTTPS_PROXY: "https://proxy.example.test",
+			HTTP_PROXY: "http://proxy.example.test",
+			ALL_PROXY: "socks5://proxy.example.test",
+			https_proxy: "https://lower-proxy.example.test",
+			http_proxy: "http://lower-proxy.example.test",
+			all_proxy: "socks5://lower-proxy.example.test",
 			PATH: "/usr/bin",
 		};
 
