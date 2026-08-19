@@ -40,7 +40,7 @@ export function isFileWritePermissionError(error: unknown): boolean {
 }
 
 export function formatFileWriteError(error: unknown, dest: string, options: { destUnchanged?: boolean } = {}): string {
-	if (error instanceof FileWriteNotPublishedError) return error.message;
+	if (error instanceof FileWriteNotPublishedError && options.destUnchanged !== false) return error.message;
 	if (isEisdir(error)) {
 		return `Cannot write '${dest}': path is a directory.`;
 	}
