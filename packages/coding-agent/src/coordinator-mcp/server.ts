@@ -1482,7 +1482,7 @@ async function appendCodexWakePublishDiagnostic(
 	namespaceDir: string,
 	event: CodexWakeEventV1,
 	error: unknown,
-): Promise<void> {
+): Promise<unknown | null> {
 	const line = `${new Date().toISOString()} wake=${event.key} error=${codexWakeErrorCode(error)}\n`;
 	try {
 		await appendCoordinatorFile(
@@ -1494,7 +1494,9 @@ async function appendCodexWakePublishDiagnostic(
 			wakeKey: event.key,
 			error: String(diagnosticError),
 		});
+		return diagnosticError;
 	}
+	return null;
 }
 
 async function autoBindDelegateCodexHandoff(
@@ -1648,12 +1650,19 @@ async function publishRecordedCodexWake(
 	try {
 		published = await publishCodexWake({ handoff, event, transportFactory });
 	} catch (error) {
-		await appendCodexWakePublishDiagnostic(namespaceDir, event, error);
-		await updateCodexWakeEvent(namespaceDir, event.key, {
-			status: "failed",
-			attempts_delta: 1,
-			last_error: codexWakeErrorCode(error),
-		});
+		const diagnosticError = await appendCodexWakePublishDiagnostic(namespaceDir, event, error);
+		try {
+			await updateCodexWakeEvent(namespaceDir, event.key, {
+				status: "failed",
+				attempts_delta: 1,
+				last_error: codexWakeErrorCode(error),
+			});
+		} catch (stateError) {
+			throw new AggregateError(
+				[error, stateError, ...(diagnosticError ? [diagnosticError] : [])],
+				"Codex wake publication and failure-state persistence failed",
+			);
+		}
 		return "failed";
 	}
 	await updateCodexWakeEvent(namespaceDir, event.key, {
@@ -3481,7 +3490,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const sessionId = remoteSession.value;
 			if (!sessionId) throw error;
 			try {
-				await brokerSession(cwd, "session.close", { sessionId }, `${sessionId}:compensate-create`);
+				brokerResult(await brokerSession(cwd, "session.close", { sessionId }, `${sessionId}:compensate-create`));
 			} catch (closeError) {
 				throw new SdkClientError(
 					UNOBSERVED_COMPENSATION_CODE,
@@ -3537,8 +3546,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	async function canonicalBrokerWorkspace(cwd: string): Promise<string> {
 		try {
 			return await (services.canonicalizePath ?? (value => fs.realpath(value)))(cwd);
-		} catch {
-			throw new SdkClientError("not_found", "Coordinator workspace cannot be resolved.");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT")
+				throw new SdkClientError("not_found", "Coordinator workspace cannot be resolved.");
+			throw error;
 		}
 	}
 
@@ -4899,7 +4910,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 												idempotencyKey,
 											),
 										);
-										sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
+										const createdSessionId = optionalString(created.sessionId ?? created.session_id);
+										if (!createdSessionId)
+											throw new SdkClientError(
+												UNOBSERVED_COMPENSATION_CODE,
+												"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
+												{ creation_response: created },
+											);
+										sessionId = safeExternalId("session", createdSessionId);
 										remoteSession.value = sessionId;
 										const createdCwd = await canonicalBrokerWorkspace(
 											optionalString(created.cwd) ?? canonicalCwd,
@@ -5168,7 +5186,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										"SDK broker did not prepare the requested session.",
 									);
 								}
-								sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
+								const createdSessionId = optionalString(created.sessionId ?? created.session_id);
+								if (!createdSessionId)
+									throw new SdkClientError(
+										UNOBSERVED_COMPENSATION_CODE,
+										"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
+										{ creation_response: created },
+									);
+								sessionId = safeExternalId("session", createdSessionId);
 								remoteSession.value = sessionId;
 								const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
 								const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);

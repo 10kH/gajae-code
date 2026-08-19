@@ -154,10 +154,14 @@ describe("codex wake finally/diagnostic error masking (#4545)", () => {
 			sessionId: "session-1",
 			summary: "masking recovery",
 		});
-		await awaitCodexWakePublishesForTest(namespace).catch(() => undefined);
+		const wakeFailure = await awaitCodexWakePublishesForTest(namespace).then(
+			() => undefined,
+			(error: unknown) => error,
+		);
 
 		expect(observed).toMatchObject({ kind: "turn.completed", session_id: "session-1" });
-		await expect(awaitCodexWakePublishesForTest(namespace)).resolves.toBeUndefined();
+		expect(wakeFailure).toBeInstanceOf(AggregateError);
+		expect((wakeFailure as AggregateError).errors[0]).toMatchObject({ code: "EIO" });
 	});
 
 	maskingIt("does not relabel a non-ENOENT handoff directory read failure as state corruption", async () => {

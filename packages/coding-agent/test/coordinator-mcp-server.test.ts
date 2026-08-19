@@ -947,6 +947,47 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		]);
 	});
 
+	it("leaves malformed remote creation outcomes retryable", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => (operation === "session.create" ? { ok: true, result: { cwd: root } } : undefined),
+		});
+		const args = { cwd: root, idempotency_key: "ambiguous-remote-create", allow_mutation: true };
+
+		const first = await server.callTool("gjc_coordinator_start_session", args);
+		const second = await server.callTool("gjc_coordinator_start_session", args);
+
+		expect(first).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(second).toEqual(first);
+		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(2);
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(0);
+	});
+
+	it("keeps compensation unobserved when broker close is rejected", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create")
+					return { ok: true, result: { sessionId: "close-rejected-session", cwd: root } };
+				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
+				if (operation === "session.close")
+					return { ok: false, error: { code: "close_refused", message: "close refused" } };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "close-rejected-compensation",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
+	});
+
 	it("preserves multiline delegated task text in one SDK turn.prompt control", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
