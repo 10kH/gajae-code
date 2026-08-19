@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isKnownSinkPeerClosedError, logger } from "@gajae-code/utils";
 import { normalizePathForComparison, VERSION } from "@gajae-code/utils/dirs";
+import { withFileLock } from "../config/file-lock";
 import {
 	COORDINATOR_MCP_PROTOCOL_VERSION,
 	COORDINATOR_MCP_SERVER_NAME,
@@ -1375,6 +1376,10 @@ function eventSequenceFile(namespaceDir: string): string {
 	return path.join(eventsDir(namespaceDir), "latest-seq.json");
 }
 
+function eventJournalLockFile(namespaceDir: string): string {
+	return path.join(eventsDir(namespaceDir), "event-journal.lock");
+}
+
 function boundSummary(value: string): string {
 	const normalized = value
 		.replace(/[\r\n\t]+/g, " ")
@@ -1720,25 +1725,29 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 
 	await previous.catch(() => undefined);
 	try {
-		const latestSeq = await readLatestEventSeq(namespaceDir);
-		const seq = latestSeq + 1;
-		const timestamp = new Date().toISOString();
-		const event: CoordinatorEvent = {
-			schema_version: 1,
-			seq,
-			id: `event-${seq.toString().padStart(12, "0")}`,
-			timestamp,
-			kind: input.kind,
-			summary: boundSummary(input.summary),
-			...(input.sessionId ? { session_id: input.sessionId } : {}),
-			...(input.turnId ? { turn_id: input.turnId } : {}),
-			...(input.questionId ? { question_id: input.questionId } : {}),
-			...(input.reportId ? { report_id: input.reportId } : {}),
-			...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
-			...(input.metadata ? { metadata: input.metadata } : {}),
-		};
-		await appendCoordinatorFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
-		await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
+		await ensureCoordinatorDirectory(eventsDir(namespaceDir));
+		const event = await withFileLock(eventJournalLockFile(namespaceDir), async () => {
+			const latestSeq = await readLatestEventSeq(namespaceDir);
+			const seq = latestSeq + 1;
+			const timestamp = new Date().toISOString();
+			const event: CoordinatorEvent = {
+				schema_version: 1,
+				seq,
+				id: `event-${seq.toString().padStart(12, "0")}`,
+				timestamp,
+				kind: input.kind,
+				summary: boundSummary(input.summary),
+				...(input.sessionId ? { session_id: input.sessionId } : {}),
+				...(input.turnId ? { turn_id: input.turnId } : {}),
+				...(input.questionId ? { question_id: input.questionId } : {}),
+				...(input.reportId ? { report_id: input.reportId } : {}),
+				...(input.payloadRef ? { payload_ref: input.payloadRef } : {}),
+				...(input.metadata ? { metadata: input.metadata } : {}),
+			};
+			await appendCoordinatorFile(eventJournalFile(namespaceDir), `${JSON.stringify(event)}\n`);
+			await writeJsonFile(eventSequenceFile(namespaceDir), { seq, updated_at: timestamp });
+			return event;
+		});
 		let codexWake: { handoff: CodexHandoffRegistrationV1; event: CodexWakeEventV1 | null } | null;
 		try {
 			codexWake = await maybeRecordCodexWake(namespaceDir, event);

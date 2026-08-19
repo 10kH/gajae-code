@@ -454,6 +454,39 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		).rejects.toThrow("state_corrupt");
 	});
 
+	it("serializes event sequence allocation across coordinator processes", async () => {
+		const root = await tempRoot();
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const marker = path.join(root, "start");
+		const modulePath = path.resolve(import.meta.dir, "../src/coordinator-mcp/server.ts");
+		const script = (writer: string) => `
+import { appendCoordinatorEventForTest } from ${JSON.stringify(modulePath)};
+while (!(await Bun.file(${JSON.stringify(marker)}).exists())) await Bun.sleep(1);
+console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(namespace)}, {
+	kind: "turn.completed",
+	summary: ${JSON.stringify(`writer:${writer}`)},
+})));
+`;
+		const first = Bun.spawn({ cmd: [process.execPath, "-e", script("one")], stdout: "pipe", stderr: "pipe" });
+		const second = Bun.spawn({ cmd: [process.execPath, "-e", script("two")], stdout: "pipe", stderr: "pipe" });
+		await Bun.sleep(10);
+		await Bun.write(marker, "");
+		const [firstExit, secondExit, firstOutput, secondOutput] = await Promise.all([
+			first.exited,
+			second.exited,
+			new Response(first.stdout).text(),
+			new Response(second.stdout).text(),
+		]);
+		expect([firstExit, secondExit]).toEqual([0, 0]);
+		const journal = await fs.readFile(path.join(namespace, "events", "event-journal.jsonl"), "utf8");
+		const events = journal
+			.trim()
+			.split("\n")
+			.map(line => JSON.parse(line) as { seq: number; summary: string });
+		expect(events.map(event => event.seq)).toEqual([1, 2]);
+		expect([firstOutput, secondOutput].every(output => output.includes('"seq"'))).toBe(true);
+	});
+
 	async function pingServer(root: string) {
 		const server = createCoordinatorMcpServer({
 			env: {
