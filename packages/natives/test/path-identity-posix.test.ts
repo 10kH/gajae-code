@@ -10,6 +10,7 @@ import {
 	exactRemoveDirectoryTree,
 	exactRestore,
 	exactUnlink,
+	exactUnlinkDirect,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyPathSecurity,
 } from "../native/index.js";
@@ -176,6 +177,31 @@ describe.skipIf(process.platform === "win32")("POSIX native path identity", () =
 			}),
 		).toEqual({ ok: false, code: "identity_mismatch" });
 		expect(await fs.readFile(file, "utf8")).toBe("replacement");
+	});
+
+	it("directly removes one authorized regular file without leaving exchange debris", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "pi-path-identity-posix-"));
+		temporaryDirectories.push(root);
+		const file = path.join(root, "stale-debris");
+		const directQuarantine = ".gjc-direct-unlink-test";
+		await fs.writeFile(file, "stale");
+		const stat = await fs.stat(file, { bigint: true });
+		const parent = await fs.stat(root, { bigint: true });
+
+		expect(
+			exactUnlinkDirect(file, {
+				dev: stat.dev,
+				ino: stat.ino,
+				parentDev: parent.dev,
+				parentIno: parent.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("stale"),
+				quarantineName: directQuarantine,
+			}),
+		).toEqual({ ok: true });
+		await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.stat(path.join(root, directQuarantine))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("removes one authorized hard-link name without deleting the remaining alias", async () => {

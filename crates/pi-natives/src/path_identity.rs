@@ -1086,6 +1086,28 @@ pub fn exact_unlink(path: String, identity: NativeExactFileIdentity) -> NativeEx
 	};
 	platform::exact_unlink(Path::new(&path), &identity)
 }
+
+/// Delete only the regular file that still has the supplied platform identity,
+/// without the exchange/quarantine protocol used by [`exact_unlink`].
+///
+/// This is reserved for already-detached inert debris: the operation first
+/// moves the pathname to the caller's private no-replace quarantine, verifies
+/// the moved object, and only then unlinks that private name. A successor
+/// published at the original pathname is therefore never consumed by cleanup,
+/// and this path cannot manufacture another exchange placeholder.
+#[napi]
+pub fn exact_unlink_direct(
+	path: String,
+	identity: NativeExactFileIdentity,
+) -> NativeExactUnlinkResult {
+	if path.contains('\0') {
+		return NativeExactUnlinkResult::failure("io_error");
+	}
+	let Some(identity) = exact_file_identity(&identity) else {
+		return NativeExactUnlinkResult::failure("identity_mismatch");
+	};
+	platform::exact_unlink_direct(Path::new(&path), &identity)
+}
 /// Atomically replace a staged regular file only after validating the exact
 /// staged source and expected destination.
 ///
@@ -3501,6 +3523,92 @@ pub(crate) mod platform {
 		// SAFETY: this function owns the walked parent descriptor exactly once.
 		unsafe { libc::close(parent_fd) };
 		result
+	}
+
+	/// Remove one regular file without invoking the exchange protocol. The
+	/// caller supplies a private, single-component quarantine name; the
+	/// no-replace rename is the mutation boundary that detaches whichever entry
+	/// currently occupies the public pathname. The detached entry is then
+	/// revalidated against the captured identity before its private name is
+	/// unlinked. A mismatch is restored with another no-replace rename whenever
+	/// the public pathname is still vacant.
+	pub(super) fn exact_unlink_direct(
+		path: &Path,
+		identity: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		if identity.directory || identity.detach_only {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		let Some(quarantine_name) = identity.quarantine_name.as_deref() else {
+			return NativeExactUnlinkResult::failure("quarantine_destination_required");
+		};
+		if quarantine_name.is_empty()
+			|| quarantine_name == "."
+			|| quarantine_name == ".."
+			|| quarantine_name.as_bytes().contains(&b'/')
+		{
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		let (parent_fd, name) = match open_parent_no_follow(path) {
+			Ok(value) => value,
+			Err(result) => return *result,
+		};
+		let close_parent = |result: NativeExactUnlinkResult| {
+			// SAFETY: this operation owns the walked parent descriptor exactly once.
+			unsafe { libc::close(parent_fd) };
+			result
+		};
+		if let Some((expected_dev, expected_ino)) = identity.parent_dev.zip(identity.parent_ino) {
+			// SAFETY: zero is valid initialized storage for fstat output.
+			let mut parent_stat: libc::stat = unsafe { std::mem::zeroed() };
+			// SAFETY: parent_fd is the retained walked parent descriptor.
+			if unsafe { libc::fstat(parent_fd, &mut parent_stat) } != 0
+				|| parent_stat.st_dev as u64 != expected_dev
+				|| parent_stat.st_ino as u64 != expected_ino
+			{
+				return close_parent(NativeExactUnlinkResult::failure("parent_mismatch"));
+			}
+		}
+		let Ok(quarantine) = CString::new(quarantine_name) else {
+			return close_parent(NativeExactUnlinkResult::failure("invalid_request"));
+		};
+		match exact_regular_matches(parent_fd, &name, identity) {
+			Ok(true) => {},
+			Ok(false) => return close_parent(NativeExactUnlinkResult::failure("identity_mismatch")),
+			Err(code) => return close_parent(NativeExactUnlinkResult::failure(code)),
+		}
+		if let Err(code) = rename_no_replace(parent_fd, parent_fd, &name, &quarantine) {
+			return close_parent(NativeExactUnlinkResult::failure(code));
+		}
+		let detached_path = path
+			.parent()
+			.unwrap_or_else(|| Path::new("."))
+			.join(quarantine_name)
+			.to_string_lossy()
+			.into_owned();
+		let detached_matches =
+			matches!(exact_regular_matches(parent_fd, &quarantine, identity), Ok(true));
+		if !detached_matches {
+			return if rename_no_replace(parent_fd, parent_fd, &quarantine, &name).is_ok() {
+				close_parent(NativeExactUnlinkResult::failure("identity_mismatch"))
+			} else {
+				close_parent(NativeExactUnlinkResult::detached_failure(
+					"identity_mismatch",
+					detached_path,
+				))
+			};
+		}
+		// SAFETY: parent_fd and the private quarantine name remain live; the
+		// detached entry was revalidated against the caller's exact identity.
+		if unsafe { libc::unlinkat(parent_fd, quarantine.as_ptr(), 0) } == 0 {
+			return close_parent(NativeExactUnlinkResult::success());
+		}
+		let code = security_code(&std::io::Error::last_os_error());
+		if rename_no_replace(parent_fd, parent_fd, &quarantine, &name).is_ok() {
+			close_parent(NativeExactUnlinkResult::failure(code))
+		} else {
+			close_parent(NativeExactUnlinkResult::detached_failure("cleanup_pending", detached_path))
+		}
 	}
 
 	fn exact_unlink_at(
@@ -6678,6 +6786,19 @@ mod platform {
 		}
 	}
 
+	/// Regular-file exact unlink on Windows already operates on the validated
+	/// handle, so the direct debris path can reuse it without creating a
+	/// quarantine or exchange placeholder.
+	pub(super) fn exact_unlink_direct(
+		path: &Path,
+		identity: &ExactFileIdentity,
+	) -> NativeExactUnlinkResult {
+		if identity.directory || identity.detach_only {
+			return NativeExactUnlinkResult::failure("invalid_request");
+		}
+		exact_unlink(path, identity)
+	}
+
 	pub(super) fn exact_restore(
 		detached_path: &Path,
 		original_path: &Path,
@@ -8064,6 +8185,9 @@ mod platform {
 		NativeExactUnlinkResult::failure("atomic_unavailable")
 	}
 	pub(super) fn exact_unlink(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
+		NativeExactUnlinkResult::failure("identity_unavailable")
+	}
+	pub(super) fn exact_unlink_direct(_: &Path, _: &ExactFileIdentity) -> NativeExactUnlinkResult {
 		NativeExactUnlinkResult::failure("identity_unavailable")
 	}
 	pub(super) fn exact_restore(
