@@ -3758,16 +3758,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return { ok: false, reason: "endpoint_stale", closed: false };
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+			const deletionPhase = await withNamespaceRegistry(
+				questionPaths,
+				async registry => registry.deletions[deletionId]?.phase,
+			);
+			const closeAlreadyProven = deletionPhase === "broker_closed" || deletionPhase === "cleanup_pending";
 			let workspace = "";
 			try {
 				workspace = await canonicalBrokerWorkspace(cwd);
-				const authority = await exactBrokerSessionAuthority(id, workspace);
-				if (
-					!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
-					authority.endpointGeneration !== persistedGeneration ||
-					authority.endpointIncarnation !== persistedIncarnation
-				)
-					return { ok: false, reason: "endpoint_stale", closed: false };
+				let authority: BrokerSessionAuthority | null = null;
+				if (!closeAlreadyProven) {
+					authority = await exactBrokerSessionAuthority(id, workspace);
+					if (
+						!sameCanonicalPath(authority.workspace, persistedWorkspace, platform) ||
+						authority.endpointGeneration !== persistedGeneration ||
+						authority.endpointIncarnation !== persistedIncarnation
+					)
+						return { ok: false, reason: "endpoint_stale", closed: false };
+				}
 				await ensureQuestionStateReady();
 				await ensureQuestionTransaction(id);
 				await withSessionTransaction(questionPaths, id, async transaction => {
@@ -3798,19 +3806,27 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					created_at: new Date().toISOString(),
 					updated_at: new Date().toISOString(),
 				});
-				strictBrokerSessionClose(
-					await brokerSession(
-						cwd,
-						"session.close",
-						{
-							sessionId: id,
-							endpointGeneration: authority.endpointGeneration,
-							endpointIncarnation: authority.endpointIncarnation,
-						},
-						`coordinator-reap:${id}:${authority.endpointIncarnation}`,
-					),
-					id,
-				);
+				if (!closeAlreadyProven) {
+					if (!authority) throw new Error("state_corrupt");
+					strictBrokerSessionClose(
+						await brokerSession(
+							cwd,
+							"session.close",
+							{
+								sessionId: id,
+								endpointGeneration: authority.endpointGeneration,
+								endpointIncarnation: authority.endpointIncarnation,
+							},
+							`coordinator-reap:${id}:${authority.endpointIncarnation}`,
+						),
+						id,
+					);
+					await advanceDeletion(questionPaths, deletionId, "broker_closed", undefined, {
+						ok: true,
+						closed: true,
+						session_id: id,
+					});
+				}
 			} catch (error) {
 				return {
 					ok: false,
@@ -3819,8 +3835,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					closed: false,
 				};
 			}
-			await advanceDeletion(questionPaths, deletionId, "broker_closed");
-
 			try {
 				const listing = await paginatedBrokerSessionList(workspace, { cwd: workspace });
 				const rows = jsonRecords(
@@ -4962,8 +4976,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 												"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
 												{ creation_response: created },
 											);
+										remoteSession.value = createdSessionId;
 										sessionId = safeExternalId("session", createdSessionId);
-										remoteSession.value = sessionId;
 										const createdCwd = await canonicalBrokerWorkspace(
 											optionalString(created.cwd) ?? canonicalCwd,
 										);
@@ -5210,8 +5224,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											"SDK broker did not prepare the requested session and returned no usable session identity.",
 											{ creation_response: created },
 										);
+									remoteSession.value = createdSessionId;
 									const unpreparedId = safeExternalId("session", createdSessionId);
-									remoteSession.value = unpreparedId;
 									let compensated = true;
 									if (unpreparedId) {
 										try {
@@ -5249,8 +5263,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										"SDK broker created a session but returned no usable session identity; the outcome is unobserved.",
 										{ creation_response: created },
 									);
+								remoteSession.value = createdSessionId;
 								sessionId = safeExternalId("session", createdSessionId);
-								remoteSession.value = sessionId;
 								const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
 								const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
 								session = normalizeSession({

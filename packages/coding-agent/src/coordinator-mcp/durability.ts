@@ -133,7 +133,10 @@ export async function appendCoordinatorFile(
 	try {
 		await handle.close();
 	} catch (closeError) {
-		if (writeError) throw new AggregateError([writeError, closeError], "coordinator append and close failed");
+		if (writeError) {
+			const writeErrors = writeError instanceof AggregateError ? writeError.errors : [writeError];
+			throw new AggregateError([...writeErrors, closeError], "coordinator append and close failed");
+		}
 		throw closeError;
 	}
 	if (writeError) throw writeError;

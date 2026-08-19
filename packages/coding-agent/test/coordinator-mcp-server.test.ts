@@ -1035,6 +1035,29 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
 
+	it("compensates a broker session before rejecting an unsafe coordinator identity", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create") return { ok: true, result: { sessionId: "../unsafe", cwd: root } };
+				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "unsafe-identity-compensation",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false });
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({ input: { sessionId: "../unsafe" } }),
+		]);
+	});
+
 	it("classifies a prepared-session response without identity as unobserved", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
@@ -3299,6 +3322,49 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			}),
 		]);
 		expect(await Bun.file(sessionFile).exists()).toBe(false);
+	});
+
+	it("does not repeat broker close after post-close verification becomes uncertain", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		let listCalls = 0;
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation !== "session.list") return undefined;
+				listCalls += 1;
+				if (listCalls === 2) return { ok: true, result: { sessions: "malformed" } };
+				return undefined;
+			},
+		});
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "reap-recovery-start",
+			allow_mutation: true,
+		});
+		expect(started).toMatchObject({ ok: true, session: { session_id: "created-session-1" } });
+		const sessionFile = path.join(
+			root,
+			".gjc",
+			"coordinator-state",
+			"local",
+			"repo",
+			"sessions",
+			"created-session-1.json",
+		);
+		const sessionRecord = JSON.parse(await fs.readFile(sessionFile, "utf8"));
+		await Bun.write(sessionFile, JSON.stringify({ ...sessionRecord, ephemeral: true }));
+
+		const first = await server.callTool("gjc_coordinator_stop_session", {
+			session_id: "created-session-1",
+			allow_mutation: true,
+		});
+		expect(first).toMatchObject({ ok: false, reason: "close_failed" });
+		const second = await server.callTool("gjc_coordinator_stop_session", {
+			session_id: "created-session-1",
+			allow_mutation: true,
+		});
+		expect(second).toMatchObject({ ok: true, closed: true });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
 
 	it("idle reaping selects only stale ephemeral coordinator records and uses incarnation-bound session.close", async () => {
