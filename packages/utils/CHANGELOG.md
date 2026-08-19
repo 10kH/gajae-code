@@ -11,6 +11,8 @@
 - `recordHandledError` captures non-fatal errors that were caught and handled, into a store parallel to the fatal one (`gjc-error.log`, `gjc-error-events.jsonl`, `gjc-error-index.json`) reachable via the new `getHandledErrorLogPath` / `getHandledErrorEventsPath` / `getHandledErrorIndexPath` resolvers. Separate files rather than a shared cap, because handled errors are high-volume and would otherwise evict the rare fatal records. Only an `Error` with a non-empty stack is recorded -- without a stack the v1 fingerprint degrades to `<no-app-frame>` and unrelated failures would collapse into one group. A fingerprint is recorded at most once while it stays hot; the dedupe set is bounded at 256 entries with LRU eviction, so a tool failing in a loop cannot flood the store and a long-lived process never goes blind to new failure classes. `writeCrashRecord` now returns the written record instead of appending the journal event itself, so the fatal path keeps its one-write latch while the handled path stays unlatched; record format, `redactCrashSecrets` scrubbing, and marker emission are unchanged and shared.
 - The crash event journal carries five event kinds; the new `relayed` kind records that a signature was accepted by a configured crash upstream (`fingerprint`, `at`, and the 32-hex `eventId` the upstream returned). It serializes through the same bounded single-line path as every other event and parses under the same strictness — a malformed fingerprint, a non-lowercase-hex event id, or an out-of-range timestamp yields `undefined` rather than a partially populated event.
 
+## [0.14.1] - 2026-08-18
+
 ## [0.14.0] - 2026-08-17
 
 ### Added
