@@ -21,6 +21,16 @@ export type AgentDirIsolationDecision =
 	/** An explicit, trusted, non-default pin: honor it. */
 	| { action: "honor"; agentDir: string };
 
+const AMBIENT_PROVIDER_ENV_PATTERN = /(?:_API_KEY|_AUTH_TOKEN|_OAUTH_TOKEN|_ACCESS_TOKEN|_BASE_URL)$/;
+const AMBIENT_PROVIDER_ENV_EXACT = new Set(["GH_TOKEN", "GITHUB_TOKEN", "HF_TOKEN", "COPILOT_GITHUB_TOKEN"]);
+
+/** Remove provider credentials and endpoints inherited from the operator shell. */
+export function stripAmbientProviderEnvironment(env: Record<string, string | undefined>): void {
+	for (const key of Object.keys(env)) {
+		if (AMBIENT_PROVIDER_ENV_PATTERN.test(key) || AMBIENT_PROVIDER_ENV_EXACT.has(key)) delete env[key];
+	}
+}
+
 /**
  * Minimal `KEY=value` reader for the caller's project `.env`.
  *

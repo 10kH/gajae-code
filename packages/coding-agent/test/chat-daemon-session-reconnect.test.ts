@@ -52,6 +52,7 @@ class FakeSlackProvider implements SlackProviderClient {
 	/** Every post this provider refused, so a test can settle on the refusal itself. */
 	readonly refused: string[] = [];
 	readonly completedClientMsgIds = new Set<string>();
+	reconciliationFailuresObserved = 0;
 	readonly transportHealthy = true;
 
 	async start(): Promise<void> {}
@@ -113,6 +114,7 @@ class FakeSlackProvider implements SlackProviderClient {
 	async findMessageByClientMsgId(): Promise<null> {
 		if (this.failReconciliations > 0) {
 			this.failReconciliations -= 1;
+			this.reconciliationFailuresObserved += 1;
 			throw new Error("slack reconciliation is unavailable");
 		}
 		return null;
@@ -551,6 +553,22 @@ async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<v
 	await Bun.sleep(25);
 }
 
+async function awaitPostAttempts(provider: FakeSlackProvider, text: string, count: number): Promise<void> {
+	for (
+		let attempt = 0;
+		attempt < 5_000 && provider.postAttempts.filter(post => post.text === text).length < count;
+		attempt++
+	)
+		await Bun.sleep(1);
+	expect(provider.postAttempts.filter(post => post.text === text)).toHaveLength(count);
+}
+
+async function awaitReconciliationFailures(provider: FakeSlackProvider, count: number): Promise<void> {
+	for (let attempt = 0; attempt < 5_000 && provider.reconciliationFailuresObserved < count; attempt++)
+		await Bun.sleep(1);
+	expect(provider.reconciliationFailuresObserved).toBeGreaterThanOrEqual(count);
+}
+
 async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): Promise<void> {
 	for (
 		let attempt = 0;
@@ -730,7 +748,7 @@ test("a superseded endpoint generation disposes the old attachment instead of re
 			await starting;
 
 			host.emit("before the roll");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			// The socket drops and the endpoint rolls before anything reattaches, so the
 			// attachment that owned the cursor is stale by the time reconcile runs.
@@ -807,7 +825,7 @@ test("a replayed frame at or below the cursor is dropped instead of published a 
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -833,7 +851,7 @@ test("stopping the runtime while a replay is pending neither hangs nor publishes
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -948,7 +966,7 @@ test("a replay refused past its retry budget rebuilds the attachment from its cu
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			host.drop();
 			host.emit("two");
@@ -1018,7 +1036,7 @@ test("a real 256-frame host ring loses only the sequences the host says it evict
 			reconcile();
 			host.accept(await awaitSocket(3));
 			await awaitReplayRequests(host, 3);
-			await Bun.sleep(100);
+			await awaitPosts(provider, 2);
 			// The replacement can retrieve only the newest 256 events, and the host says so:
 			// sequences 2-771 are gone, which costs "two" and "flood head" for good. No
 			// rebuild can re-fetch them, so the round concedes exactly that range and
@@ -1112,7 +1130,7 @@ test("a replay answered from a rolled generation retires the attachment instead 
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			// The host restarts its stream while this attachment is off the air, so the
 			// resume it issues names a generation the host no longer keeps a log for.
@@ -1418,7 +1436,7 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			// One transient refusal from the surface. Nothing published this sequence, so
 			// the cursor — whose only job is recording what was delivered — must still sit
@@ -1504,17 +1522,18 @@ test("an ambiguously acknowledged publication is not posted twice when reconcili
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			provider.acceptThenThrowPosts = 1;
 			host.emit("two");
 			await awaitPosts(provider, 2);
+			await awaitReconciliationFailures(provider, 1);
 
 			host.drop();
 			reconcile();
 			host.accept(await awaitSocket(2));
 			await awaitReplayRequests(host, 2);
-			await Bun.sleep(50);
+			await awaitPostAttempts(provider, "GJC notice\ntwo", 2);
 
 			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\none", "GJC notice\ntwo"]);
 			expect(
@@ -1532,7 +1551,7 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			// The surface is down for good. Holding the cursor below seq 2 forever would
 			// cost every later frame too, so the rounds are bounded: mirrors
@@ -1628,7 +1647,7 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 			await starting;
 
 			host.emit("one");
-			await awaitPosts(provider, 1);
+			await awaitCompletedPosts(provider, 1);
 
 			// A later frame is already queued behind the failing one. The rollback a
 			// naive fix would apply is defeated here: `enqueueFrame` swallows the

@@ -13,6 +13,7 @@ import {
 	decideAgentDirIsolation,
 	defaultAgentDirFor,
 	readProjectEnvFile,
+	stripAmbientProviderEnvironment,
 } from "../../../scripts/test-agent-dir-isolation";
 
 const HOME = "/home/operator";
@@ -143,6 +144,22 @@ describe("project .env reader", () => {
 	});
 });
 
+describe("provider environment isolation", () => {
+	test("removes ambient provider credentials and endpoints without touching unrelated variables", () => {
+		const env: Record<string, string | undefined> = {
+			OPENAI_API_KEY: "ambient-key",
+			OPENAI_BASE_URL: "https://provider.example.test/v1",
+			ANTHROPIC_AUTH_TOKEN: "ambient-token",
+			GITHUB_TOKEN: "ambient-github-token",
+			PATH: "/usr/bin",
+		};
+
+		stripAmbientProviderEnvironment(env);
+
+		expect(env).toEqual({ PATH: "/usr/bin" });
+	});
+});
+
 describe("preload fail-closed behavior (real preload path)", () => {
 	const preload = path.resolve(import.meta.dir, "../../../scripts/test-preload.ts");
 
@@ -205,5 +222,27 @@ describe("preload fail-closed behavior (real preload path)", () => {
 		expect(adopted).not.toBe(defaultAgentDir);
 		expect(path.basename(adopted).startsWith("gjc-test-agent-")).toBe(true);
 		await fs.promises.rm(adopted, { recursive: true, force: true });
+	}, 30_000);
+
+	test("strips ambient provider environment in the real preload", async () => {
+		const probe = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"--preload",
+				preload,
+				"-e",
+				"console.log(JSON.stringify({ openaiKey: process.env.OPENAI_API_KEY, openaiBaseUrl: process.env.OPENAI_BASE_URL, path: process.env.PATH }))",
+			],
+			env: {
+				...process.env,
+				OPENAI_API_KEY: "ambient-key",
+				OPENAI_BASE_URL: "https://provider.example.test/v1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		expect(probe.exitCode).toBe(0);
+		expect(JSON.parse(probe.stdout.toString())).toEqual({ path: process.env.PATH });
 	}, 30_000);
 });
