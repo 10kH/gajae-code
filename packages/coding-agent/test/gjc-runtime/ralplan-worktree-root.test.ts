@@ -643,6 +643,31 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		);
 		expect(blank.status).toBe(2);
 		expect(blank.stderr ?? "").toMatch(/requires a non-empty path/);
+		const trailing = await runNativeRalplanCommand(
+			["--session-id", session, "--json", "trailing task", "--worktree-root"],
+			dispatcher,
+		);
+		expect(trailing.status).toBe(2);
+		expect(trailing.stderr ?? "").toMatch(/requires a non-empty path/);
+		const trailingWrite = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--session-id",
+				session,
+				"--run-id",
+				session,
+				"--artifact",
+				"plan",
+				"--worktree-root",
+			],
+			dispatcher,
+		);
+		expect(trailingWrite.status).toBe(2);
+		expect(trailingWrite.stderr ?? "").toMatch(/requires a non-empty path/);
 		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
 		expect(await pathExists(path.join(target, ".gjc", `_session-${session}`))).toBe(false);
 

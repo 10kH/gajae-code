@@ -712,7 +712,12 @@ interface RalplanTargetRoot {
 
 async function resolveRalplanTargetRoot(args: readonly string[], invocationCwd: string): Promise<RalplanTargetRoot> {
 	const raw = flagValue(args, "--worktree-root");
-	if (raw === undefined) return { root: invocationCwd, explicit: false };
+	if (raw === undefined) {
+		if (hasFlag(args, "--worktree-root")) {
+			throw new RalplanCommandError(2, "--worktree-root requires a non-empty path");
+		}
+		return { root: invocationCwd, explicit: false };
+	}
 	const trimmed = raw.trim();
 	if (!trimmed) throw new RalplanCommandError(2, "--worktree-root requires a non-empty path");
 	const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(invocationCwd, trimmed);
