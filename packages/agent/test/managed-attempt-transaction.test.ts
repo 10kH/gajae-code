@@ -2665,15 +2665,22 @@ describe("managed snapshot benign degradation (PR #4538 salvage)", () => {
 		const terminal = agent.state.messages.at(-1) as AssistantMessage;
 		expect(terminal.errorKind).toBe("local_buffer_overflow");
 		expect(terminal.errorMessage).toContain("provisional event buffer limit");
-		// The event cap is the one that tripped: `exceeded` names it, the
-		// staged counter reports the retained post-compaction batch, and the
-		// projected event count crosses the limit.
+		// The event cap is the one that tripped: `exceeded` names exactly
+		// `events` (never `both`), the staged counter reports the retained
+		// post-compaction batch, and the projected event count crosses the
+		// limit while projected bytes stay under the byte cap — so a
+		// regression that stopped distinguishing an event-only trip fails here.
 		expect(terminal.errorMessage).toMatch(/stage=overflow\.(preMeasure|staged)/);
-		expect(terminal.errorMessage).toMatch(/exceeded=(events|both)/);
+		expect(terminal.errorMessage).toMatch(/exceeded=events/);
 		expect(terminal.errorMessage).toContain(`/${MANAGED_ATTEMPT_MAX_STAGED_EVENTS} events`);
 		expect(terminal.bufferOverflow?.maxStagedEvents).toBe(MANAGED_ATTEMPT_MAX_STAGED_EVENTS);
+		expect(terminal.bufferOverflow?.exceeded).toBe("events");
 		// Projected events (staged + 1) genuinely exceeded the cap at throw time.
 		expect(terminal.bufferOverflow!.stagedEventCount + 1).toBeGreaterThan(terminal.bufferOverflow!.maxStagedEvents);
+		// Projected bytes stayed under the byte cap, proving an event-only trip.
+		expect(terminal.bufferOverflow!.stagedBytes + terminal.bufferOverflow!.incomingEventBytes).toBeLessThanOrEqual(
+			terminal.bufferOverflow!.maxStagedBytes,
+		);
 		expect(terminal.errorMessage).toContain("local staging buffer limit, not a provider or context-window failure");
 	});
 });

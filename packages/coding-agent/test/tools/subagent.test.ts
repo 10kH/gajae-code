@@ -2,6 +2,11 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Agent } from "@gajae-code/agent-core";
+import { MANAGED_ATTEMPT_MAX_STAGED_BYTES } from "@gajae-code/agent-core/agent-loop";
+import type { AssistantMessage } from "@gajae-code/ai";
+import { createMockModel } from "@gajae-code/ai/providers/mock";
+import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { AsyncJobManager } from "../../src/async";
 import { kNoAuth } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -343,6 +348,104 @@ describe("SubagentTool", () => {
 		expect(rendered1).not.toContain(marker);
 		const rendered2 = render(details);
 		expect(rendered2).toBe(rendered1);
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
+	it("pins the full chain with a REAL staged-buffer overflow, including streaming render and width bounding (#4618)", async () => {
+		// A genuine overflow tripped by the agent runtime's own staging
+		// machinery (single event larger than the byte cap) — not a fabricated
+		// terminal shape. The real diagnostic then travels executor boundary ->
+		// SingleResult -> outcome -> AsyncJob -> snapshot -> renderer.
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "x".repeat(MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1) }],
+					api: mock.model.api,
+					provider: mock.model.provider,
+					model: mock.model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", partial });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		await agent.prompt("run", { fallbackManaged: true });
+		await agent.waitForIdle();
+		const terminal = agent.state.messages.at(-1) as AssistantMessage;
+		expect(terminal.errorKind).toBe("local_buffer_overflow");
+		expect(terminal.bufferOverflow?.exceeded).toBe("bytes");
+
+		// The executor trust boundary consumes the real producer shape: the
+		// closed-vocabulary validation accepts it and renders real counters.
+		const localErrorSummary = createLocalErrorSummary(
+			terminal.errorKind,
+			terminal.errorMessage,
+			terminal.bufferOverflow,
+		);
+		expect(localErrorSummary.kind).toBe("local_buffer_overflow");
+		expect(localErrorSummary.summary).toContain("overflow.preMeasure");
+		expect(localErrorSummary.summary).toContain("exceeded=bytes");
+
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const singleResult = {
+			aborted: false,
+			exitCode: 1,
+			localErrorSummary,
+		} satisfies Pick<SingleResult, "aborted" | "exitCode" | "localErrorSummary">;
+		const jobId = manager.register(
+			"task",
+			"launching subagent",
+			async () => subagentRunOutcomeFromSingleResult("Subagent failed.", singleResult),
+			{
+				id: "job-real-overflow",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-RealOverflow", agent: "planner", agentSource: "bundled" } },
+			},
+		);
+		await manager.getJob(jobId)?.promise;
+		const result = await tool.execute("subagent-real-overflow", { action: "inspect", ids: ["0-RealOverflow"] });
+		const snapshot = result.details?.subagents[0];
+		expect(snapshot?.status).toBe("failed");
+		expect(snapshot?.localErrorSummary?.summary).toContain("overflow.preMeasure");
+		expect(snapshot?.localErrorSummary?.summary).toContain(`${MANAGED_ATTEMPT_MAX_STAGED_BYTES}`);
+
+		// Streaming/dynamic render (isPartial: true) and terminal cached render
+		// both carry the real summary; every rendered line stays within the
+		// requested width and contains no raw tabs.
+		const theme = await getThemeByName("red-claw");
+		if (!theme) throw new Error("Expected test theme");
+		const details = result.details as SubagentToolDetails;
+		for (const isPartial of [true, false]) {
+			const width = 64;
+			const rendered = Bun.stripANSI(
+				subagentToolRenderer
+					.renderResult({ content: [{ type: "text", text: "" }], details }, { expanded: true, isPartial }, theme)
+					.render(width)
+					.join("\n"),
+			);
+			expect(rendered).toContain("Local failure (local_buffer_overflow)");
+			for (const line of rendered.split("\n")) {
+				expect(line).not.toContain("\t");
+				expect(Bun.stringWidth(line)).toBeLessThanOrEqual(width);
+			}
+		}
 		await manager.dispose({ timeoutMs: 100 });
 	});
 

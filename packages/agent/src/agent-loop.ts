@@ -1033,6 +1033,7 @@ const LOSSLESS_SNAPSHOT_KEYS = [
 	"errorStatus",
 	"transportFailure",
 	"disabledFeatures",
+	"bufferOverflow",
 	"providerPayload",
 	"timestamp",
 	"duration",
@@ -1178,6 +1179,14 @@ function managedAssistantShell(
 	delete safeMetadata.errorMessage;
 	delete safeMetadata.errorStatus;
 	delete safeMetadata.transportFailure;
+	// Local diagnostic authority fields are never foreign-provider-settable.
+	// errorKind/bufferOverflow on the terminal assistant message are attached
+	// ONLY by this module's own runtime-error paths (managedFailureMessage and
+	// the Agent catch), so a provider/stream payload that smuggles them through
+	// its message snapshot is stripped here — the executor's parent-facing
+	// summary may never trust a shape that arrived via provider data (#4618).
+	delete safeMetadata.errorKind;
+	delete safeMetadata.bufferOverflow;
 	return {
 		...safeMetadata,
 		role: "assistant",

@@ -448,10 +448,12 @@ describe("task result receipts", () => {
 		expect(receipt.preview).toContain("Task failed; local failure (local_snapshot_failure):");
 	});
 
-	it("degrades a foreign errorKind to the neutral local kind (#4618)", () => {
+	it("degrades a foreign errorKind to the neutral local kind with a fixed sentence (#4618)", () => {
+		// A self-labeled kind cannot forward free-form message text either:
+		// the summary is the fixed neutral sentence, never child-controlled.
 		const summary = createLocalErrorSummary("<script>alert(1)</script>", "boom");
 		expect(summary.kind).toBe("local");
-		expect(summary.summary).toBe("boom");
+		expect(summary.summary).toBe("Subagent failed with a local error.");
 	});
 
 	it("renders overflow summaries from the structured shape only and degrades shape-less overflow kinds (#4618)", () => {
@@ -460,7 +462,9 @@ describe("task result receipts", () => {
 		const withShape = createLocalErrorSummary("local_buffer_overflow", `prefix ${marker} suffix`, {
 			stage: "overflow.preMeasure",
 			exceeded: "both",
-			stagedEventCount: 9999,
+			// Internally consistent with the caps: projected events
+			// (10000 + 1) and projected bytes (16777000 + 4096) both cross.
+			stagedEventCount: 10_000,
 			stagedBytes: 16_777_000,
 			incomingEventBytes: 4096,
 			maxStagedEvents: 10_000,
@@ -468,7 +472,7 @@ describe("task result receipts", () => {
 		});
 		expect(withShape.summary).not.toContain(marker);
 		expect(withShape.summary).toContain("exceeded=both");
-		expect(withShape.summary).toContain("9999/10000 events");
+		expect(withShape.summary).toContain("10000/10000 events");
 		expect(withShape.summary).toContain("16777000 staged bytes");
 		expect(withShape.summary).toContain("rejected event 4096 bytes");
 		expect(withShape.summary).toContain("projected 16781096/16777216 bytes");

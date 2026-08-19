@@ -434,14 +434,82 @@ export interface LocalErrorSummary {
 }
 
 /**
- * Render the parent-facing summary of a structured overflow diagnostic. Built
+ * Closed stage vocabulary accepted at the executor trust boundary. Mirrors the
+ * agent runtime's `MANAGED_LOCAL_FAILURE_STAGES` overflow entries; a shape
+ * naming any other stage is rejected as untrusted (#4618).
+ */
+const LOCAL_OVERFLOW_STAGES: ReadonlySet<string> = new Set(["overflow.preMeasure", "overflow.staged"]);
+
+const isLocalOverflowCounter = (value: unknown): value is number =>
+	typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+
+/**
+ * Runtime-validate a structured overflow diagnostic at the consuming trust
+ * boundary. Presence on an `AssistantMessage` is NOT authenticity: a foreign
+ * provider/stream payload could set the field, so every value is checked —
+ * closed `stage`/`exceeded` literals and finite non-negative integer counters.
+ * Returns `undefined` for anything that fails, and the caller then degrades to
+ * a fixed neutral sentence instead of interpolating untrusted values (#4618).
+ */
+export function validateLocalOverflowShape(overflow: unknown):
+	| {
+			stage: string;
+			exceeded: "events" | "bytes" | "both";
+			stagedEventCount: number;
+			stagedBytes: number;
+			incomingEventBytes: number;
+			maxStagedEvents: number;
+			maxStagedBytes: number;
+	  }
+	| undefined {
+	if (!overflow || typeof overflow !== "object") return undefined;
+	const shape = overflow as Record<string, unknown>;
+	if (typeof shape.stage !== "string" || !LOCAL_OVERFLOW_STAGES.has(shape.stage)) return undefined;
+	if (shape.exceeded !== "events" && shape.exceeded !== "bytes" && shape.exceeded !== "both") return undefined;
+	const stagedEventCount = shape.stagedEventCount;
+	const stagedBytes = shape.stagedBytes;
+	const incomingEventBytes = shape.incomingEventBytes;
+	const maxStagedEvents = shape.maxStagedEvents;
+	const maxStagedBytes = shape.maxStagedBytes;
+	if (
+		!isLocalOverflowCounter(stagedEventCount) ||
+		!isLocalOverflowCounter(stagedBytes) ||
+		!isLocalOverflowCounter(incomingEventBytes) ||
+		!isLocalOverflowCounter(maxStagedEvents) ||
+		!isLocalOverflowCounter(maxStagedBytes)
+	) {
+		return undefined;
+	}
+	// The shape must be internally consistent with the cap it claims tripped,
+	// so a fabricated near-miss cannot masquerade as a real rejection.
+	const projectedEvents = stagedEventCount + 1;
+	const projectedBytes = stagedBytes + incomingEventBytes;
+	if (shape.exceeded === "events" || shape.exceeded === "both") {
+		if (projectedEvents <= maxStagedEvents) return undefined;
+	}
+	if (shape.exceeded === "bytes" || shape.exceeded === "both") {
+		if (projectedBytes <= maxStagedBytes) return undefined;
+	}
+	return {
+		stage: shape.stage,
+		exceeded: shape.exceeded,
+		stagedEventCount,
+		stagedBytes,
+		incomingEventBytes,
+		maxStagedEvents,
+		maxStagedBytes,
+	};
+}
+
+/**
+ * Render the parent-facing summary of a validated overflow diagnostic. Built
  * ONLY from the closed-vocabulary stage/exceeded literals and the numeric
  * counters — no producer-controlled text participates, so a hostile or buggy
  * child can inject nothing through this path (#4618).
  */
 export function formatBufferOverflowSummary(overflow: {
 	stage: string;
-	exceeded: string;
+	exceeded: "events" | "bytes" | "both";
 	stagedEventCount: number;
 	stagedBytes: number;
 	incomingEventBytes: number;
@@ -457,51 +525,46 @@ export function formatBufferOverflowSummary(overflow: {
 	);
 }
 
+/** Fixed, bounded summary for a terminal snapshot failure — never free-form child text (#4618). */
+const LOCAL_SNAPSHOT_FAILURE_SUMMARY =
+	"Managed fallback could not produce a serializable event snapshot (local snapshot bug, not a provider failure).";
+
 /**
  * Build the safe parent-facing summary for a terminal local failure.
  *
- * Trust boundary: when the terminal message carries the agent runtime's
- * structured `bufferOverflow` shape (attached only by an identity-checked
- * `instanceof ManagedAttemptBufferOverflowError`), the summary is rendered
- * exclusively from that shape's closed vocabulary and numbers. The free-form
- * `errorMessage` is used ONLY for `local_snapshot_failure` (whose message is
- * the runtime's own fixed sentence) — never for overflow, because a foreign
- * error can self-label `errorKind` and stuff arbitrary text into `message`.
+ * Trust boundary: the structured `bufferOverflow` shape is runtime-validated
+ * (`validateLocalOverflowShape`) before any value is interpolated — closed
+ * literals and checked integers only. A shape that fails validation, or an
+ * overflow kind with no shape at all, degrades to a fixed neutral sentence.
+ * `local_snapshot_failure` uses a fixed sentence too: regex redaction cannot
+ * make arbitrary child message text safe to embed in a parent receipt.
  */
 export function createLocalErrorSummary(
 	kind: unknown,
-	message: string | undefined,
-	overflow?: {
-		stage: string;
-		exceeded: string;
-		stagedEventCount: number;
-		stagedBytes: number;
-		incomingEventBytes: number;
-		maxStagedEvents: number;
-		maxStagedBytes: number;
-	},
+	_message: string | undefined,
+	overflow?: unknown,
 ): LocalErrorSummary {
 	const normalizedKind = kind === "local_buffer_overflow" || kind === "local_snapshot_failure" ? kind : "local";
-	if (normalizedKind === "local_buffer_overflow" && overflow) {
+	if (normalizedKind === "local_buffer_overflow") {
+		const validated = validateLocalOverflowShape(overflow);
 		return {
 			kind: normalizedKind,
-			summary: formatBufferOverflowSummary(overflow),
+			summary: validated
+				? formatBufferOverflowSummary(validated)
+				: "Local staging-buffer overflow; structured diagnostic unavailable.",
 		};
 	}
-	if (normalizedKind === "local_buffer_overflow") {
-		// No structured shape means the kind did not come from the trusted
-		// runtime path; degrade to the neutral sentence rather than forward
-		// untrusted message text.
+	if (normalizedKind === "local_snapshot_failure") {
 		return {
 			kind: normalizedKind,
-			summary: "Local staging-buffer overflow; structured diagnostic unavailable.",
+			// Fixed text: a self-labeled foreign error can set the kind, and no
+			// free-form message — redacted or not — is forwarded to the parent.
+			summary: LOCAL_SNAPSHOT_FAILURE_SUMMARY,
 		};
 	}
 	return {
 		kind: normalizedKind,
-		summary: createSetupFailureSummary(
-			message ? new Error(message) : new Error("Subagent failed with a local error."),
-		).summary,
+		summary: "Subagent failed with a local error.",
 	};
 }
 

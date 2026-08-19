@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-### Added
+### Fixed
+- Local diagnostic authority fields are no longer foreign-settable through the managed snapshot shell (#4618). `managedAssistantShell` spreads the provider/stream message snapshot into the rebuilt assistant message; a payload that smuggled `errorKind` or `bufferOverflow` through that spread could masquerade as the runtime's own identity-checked diagnostic at the parent boundary. Both fields are now stripped from the snapshot spread — they are attached only by the module's own runtime-error paths (`managedFailureMessage` and the Agent catch), which never route through the shell.
 
 - `Agent.waitForSteeringArrival(signal)` resolves when steering is queued without consuming it, so wait-style tools can end their observation early.
 
