@@ -841,4 +841,85 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(result.stderr ?? "").toMatch(/does not exist/);
 		expect(await pathExists(path.join(dispatcher, ".gjc", "config.yml"))).toBe(false);
 	});
+	it("rejects a forged detached HEAD that is not a git commit object", async () => {
+		const session = "wt-forged-detached";
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const fake = await tempDir("gjc-ralplan-forged-detached-");
+		await fs.mkdir(path.join(fake, ".git"));
+		await fs.writeFile(path.join(fake, ".git", "HEAD"), "not-a-commit\n");
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", fake, "--session-id", session, "--json", "forged detached"],
+			dispatcher,
+		);
+		expect(seed.status).toBe(2);
+		expect(seed.stderr ?? "").toMatch(/not a valid git worktree|not inside a git repository/);
+		expect(await pathExists(path.join(fake, ".gjc"))).toBe(false);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it("rejects a forged ref HEAD that does not resolve in the object database", async () => {
+		const session = "wt-forged-ref";
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const fake = await tempDir("gjc-ralplan-forged-ref-");
+		await fs.mkdir(path.join(fake, ".git", "refs", "heads"), { recursive: true });
+		await fs.writeFile(path.join(fake, ".git", "HEAD"), "ref: refs/heads/main\n");
+		await fs.writeFile(
+			path.join(fake, ".git", "refs", "heads", "main"),
+			"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n",
+		);
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", fake, "--session-id", session, "--json", "forged ref"],
+			dispatcher,
+		);
+		expect(seed.status).toBe(2);
+		expect(seed.stderr ?? "").toMatch(/not a valid git worktree|not inside a git repository/);
+		expect(await pathExists(path.join(fake, ".gjc"))).toBe(false);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it("rejects a target whose .gjc is a symlink outside the worktree", async () => {
+		const session = "wt-gjc-symlink";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const outside = await tempDir("gjc-ralplan-gjc-outside-");
+		await fs.symlink(outside, path.join(target, ".gjc"));
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", target, "--session-id", session, "--json", "symlink gjc"],
+			dispatcher,
+		);
+		expect(seed.status).toBe(2);
+		expect(seed.stderr ?? "").toMatch(/symlinked \.gjc|escapes the target worktree/);
+		expect(await pathExists(path.join(outside, `_session-${session}`))).toBe(false);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it("rejects an in-cwd artifact symlink so a swapped path cannot be followed", async () => {
+		const session = "wt-artifact-nofollow";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const outsider = await tempDir("gjc-ralplan-outside-swap-");
+		await fs.writeFile(path.join(outsider, "secret.md"), "external bytes\n");
+		await fs.symlink(path.join(outsider, "secret.md"), path.join(dispatcher, "plan.md"));
+		expect(
+			(
+				await runNativeRalplanCommand(
+					["--worktree-root", target, "--session-id", session, "nofollow task"],
+					dispatcher,
+				)
+			).status,
+		).toBe(0);
+		const write = await runNativeRalplanCommand(
+			explicitWriteArgs({
+				worktreeRoot: target,
+				stage: "planner",
+				stageN: 1,
+				session,
+				artifact: "plan.md",
+			}),
+			dispatcher,
+		);
+		expect(write.status).toBe(2);
+		expect(write.stderr ?? "").toMatch(/escapes the invoking cwd|failed to read --artifact/);
+		expect(await pathExists(path.join(runDir(target, session, session), "stage-01-planner.md"))).toBe(false);
+	});
 });

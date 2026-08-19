@@ -1,12 +1,13 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
+import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isSettingsInitialized, Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
-import { head, repo } from "../utils/git";
+import { repo } from "../utils/git";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import {
 	formatRalplanStagePresence,
@@ -758,8 +759,11 @@ export async function resolveRalplanTargetRoot(
 	if (!repository) {
 		throw new RalplanCommandError(2, `ralplan --worktree-root is not inside a git repository: ${canonical}`);
 	}
-	const headState = await head.resolve(canonical);
-	if (!headState?.commit) {
+	const verified = Bun.spawn(["git", "-C", canonical, "rev-parse", "--verify", "HEAD^{commit}"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if ((await verified.exited) !== 0) {
 		throw new RalplanCommandError(2, `ralplan --worktree-root is not a valid git worktree: ${canonical}`);
 	}
 	let worktreeRoot: string;
@@ -776,6 +780,64 @@ export async function resolveRalplanTargetRoot(
 	}
 	return { root: canonical, explicit: true };
 }
+
+async function assertExplicitTargetGjcNotSymlinked(root: string): Promise<void> {
+	const gjcRoot = path.join(root, ".gjc");
+	let st: fssync.Stats;
+	try {
+		st = await fs.lstat(gjcRoot);
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") return;
+		throw new RalplanCommandError(2, `failed to inspect ${gjcRoot}: ${err.message}`);
+	}
+	if (st.isSymbolicLink()) {
+		throw new RalplanCommandError(2, `ralplan --worktree-root refuses a symlinked .gjc root: ${gjcRoot}`);
+	}
+	const realGjc = await fs.realpath(gjcRoot);
+	const realRoot = await fs.realpath(root);
+	const relative = path.relative(realRoot, realGjc);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) {
+		throw new RalplanCommandError(2, `ralplan --worktree-root .gjc escapes the target worktree: ${gjcRoot}`);
+	}
+}
+
+async function readConfinedArtifactFile(candidate: string, confineRoot: string): Promise<string> {
+	let realRoot: string;
+	try {
+		realRoot = await fs.realpath(confineRoot);
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
+	}
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(candidate, fssync.constants.O_RDONLY | fssync.constants.O_NOFOLLOW);
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
+	}
+	try {
+		const opened = await handle.stat();
+		if (!opened.isFile()) {
+			throw new RalplanCommandError(2, `ralplan --artifact is not a regular file: ${candidate}`);
+		}
+		const fdPath = `/proc/self/fd/${handle.fd}`;
+		let openedIdentity: string;
+		try {
+			openedIdentity = await fs.realpath(fdPath);
+		} catch {
+			openedIdentity = path.resolve(candidate);
+		}
+		const relative = path.relative(realRoot, openedIdentity);
+		if (relative.startsWith("..") || path.isAbsolute(relative)) {
+			throw new RalplanCommandError(2, `ralplan --artifact path escapes the invoking cwd: ${candidate}`);
+		}
+		return await handle.readFile("utf-8");
+	} finally {
+		await handle.close();
+	}
+}
 async function resolveArtifactContent(
 	rawArtifact: string,
 	cwd: string,
@@ -786,21 +848,7 @@ async function resolveArtifactContent(
 	try {
 		const stat = await fs.stat(candidate);
 		if (stat.isFile()) {
-			if (options.confineRoot) {
-				let realRoot: string;
-				let realCandidate: string;
-				try {
-					realRoot = await fs.realpath(options.confineRoot);
-					realCandidate = await fs.realpath(candidate);
-				} catch (error) {
-					const err = error as NodeJS.ErrnoException;
-					throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
-				}
-				const relative = path.relative(realRoot, realCandidate);
-				if (relative.startsWith("..") || path.isAbsolute(relative)) {
-					throw new RalplanCommandError(2, `ralplan --artifact path escapes the invoking cwd: ${candidate}`);
-				}
-			}
+			if (options.confineRoot) return await readConfinedArtifactFile(candidate, options.confineRoot);
 			return await fs.readFile(candidate, "utf-8");
 		}
 	} catch (error) {
@@ -1986,6 +2034,7 @@ async function handleArtifactWrite(
 	// file resolution. Validation happens here, before any state/artifact write.
 	const target = await resolveRalplanTargetRoot(args, cwd);
 	const persistCwd = target.root;
+	if (target.explicit) await assertExplicitTargetGjcNotSymlinked(persistCwd);
 	const resolved = await resolveArtifactArgs(args, persistCwd, cwd, {
 		confineArtifactRoot: target.explicit ? cwd : undefined,
 	});
@@ -2381,6 +2430,7 @@ async function handleConsensusHandoff(args: readonly string[], cwd: string): Pro
 	// #4693: explicit --worktree-root seeds and binds the run at the selected
 	// canonical worktree instead of the ambient invocation cwd.
 	const target = await resolveRalplanTargetRoot(args, cwd);
+	if (target.explicit) await assertExplicitTargetGjcNotSymlinked(target.root);
 	const resolved = resolveConsensusArgs(args, target.root);
 	if (!resolved.task) {
 		throw new RalplanCommandError(2, 'gjc ralplan requires a task description, e.g. `gjc ralplan "<task>"`.');

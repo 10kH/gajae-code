@@ -656,6 +656,24 @@ Project executor override body.
 		expect(content).toContain(
 			"gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --session-id <owner-session-id> --run-id <run-id> --stage <type> --stage_n <N> --artifact",
 		);
+		expect(content).not.toMatch(/gjc ralplan --write --stage /);
+		expect(content).toContain(
+			"gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage planner",
+		);
+		expect(content).toContain(
+			"gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage architect",
+		);
+		expect(content).toContain("gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage critic");
+		expect(content).toContain(
+			"gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage disposition",
+		);
+		expect(content).toContain(
+			"gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage revision",
+		);
+		expect(content).toContain(
+			"gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage post-interview",
+		);
+		expect(content).toContain("gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --stage final");
 		expect(content).toContain("--stage planner");
 		expect(content).toContain("--stage architect");
 		expect(content).toContain("--stage critic");
