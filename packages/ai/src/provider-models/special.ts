@@ -1,4 +1,6 @@
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import { once } from "@gajae-code/utils";
+
 import type { ModelManagerOptions } from "../model-manager";
 import { buildZCodeSourceHeaders } from "../providers/anthropic";
 import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
@@ -91,8 +93,9 @@ export function glmZcodeModelManagerOptions(
 	config: GlmZcodeModelManagerConfig = {},
 ): ModelManagerOptions<"anthropic-messages"> {
 	const apiKey = config.apiKey;
-	const baseUrl = (config.baseUrl ?? GLM_ZCODE_ANTHROPIC_BASE_URL).replace(/\/+$/, "");
+	const baseUrl = GLM_ZCODE_ANTHROPIC_BASE_URL;
 	const references = createBundledReferenceMap<"anthropic-messages">("glm-zcode");
+
 	return {
 		providerId: "glm-zcode",
 		...(apiKey
@@ -116,8 +119,11 @@ export function glmZcodeModelManagerOptions(
 									id: defaults.id,
 									name: typeof entry.name === "string" && entry.name.length > 0 ? entry.name : reference.name,
 									baseUrl,
-									contextWindow: defaults.contextWindow > 0 ? defaults.contextWindow : reference.contextWindow,
-									maxTokens: defaults.maxTokens > 0 ? defaults.maxTokens : reference.maxTokens,
+									contextWindow:
+										defaults.contextWindow === UNK_CONTEXT_WINDOW
+											? reference.contextWindow
+											: defaults.contextWindow,
+									maxTokens: defaults.maxTokens === UNK_MAX_TOKENS ? reference.maxTokens : defaults.maxTokens,
 								};
 							},
 						}),
