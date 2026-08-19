@@ -7,6 +7,7 @@ import {
 	createHerdrReporter,
 	type HerdrReportProcess,
 	type HerdrSessionEvent,
+	installHerdrReporter,
 	resolveHerdrPaneEnvironment,
 	sanitizeHerdrPaneTitle,
 	syncHerdrPaneTitle,
@@ -117,6 +118,95 @@ describe("resolveHerdrPaneEnvironment", () => {
 				},
 			}),
 		).toBeNull();
+	});
+
+	it("defers to the ancestor gjc that already owns the pane", () => {
+		expect(
+			resolveHerdrPaneEnvironment({
+				env: paneEnv({ GJC_HERDR_PANE_OWNER: "pane-7:100" }),
+				which: () => "/usr/bin/herdr",
+				pid: 200,
+			}),
+		).toBeNull();
+	});
+
+	it("still reports when the standing claim is this process's own", () => {
+		expect(
+			resolveHerdrPaneEnvironment({
+				env: paneEnv({ GJC_HERDR_PANE_OWNER: "pane-7:100" }),
+				which: () => "/usr/bin/herdr",
+				pid: 100,
+			}),
+		).toEqual({ paneId: "pane-7", binPath: "/usr/bin/herdr" });
+	});
+
+	it("ignores a claim inherited from a different pane", () => {
+		expect(
+			resolveHerdrPaneEnvironment({
+				env: paneEnv({ GJC_HERDR_PANE_OWNER: "pane-3:100" }),
+				which: () => "/usr/bin/herdr",
+				pid: 200,
+			}),
+		).toEqual({ paneId: "pane-7", binPath: "/usr/bin/herdr" });
+	});
+
+	it("splits the claim correctly for a Herdr pane id that contains a colon", () => {
+		// Real Herdr pane ids look like `wT:p1`, so the pid delimiter is the last
+		// colon, not the first.
+		const env = paneEnv({ HERDR_PANE_ID: "wT:p1", GJC_HERDR_PANE_OWNER: "wT:p1:100" });
+		expect(resolveHerdrPaneEnvironment({ env, which: () => "/usr/bin/herdr", pid: 200 })).toBeNull();
+		expect(resolveHerdrPaneEnvironment({ env, which: () => "/usr/bin/herdr", pid: 100 })).toEqual({
+			paneId: "wT:p1",
+			binPath: "/usr/bin/herdr",
+		});
+	});
+});
+
+describe("herdr pane ownership", () => {
+	it("stamps the claim into the environment that spawned children inherit", () => {
+		const env = paneEnv();
+		installHerdrReporter(eventSource().subscribe, {
+			env,
+			spawn: recordingSpawn().spawn,
+			which: () => "/usr/bin/herdr",
+			pid: 4242,
+		});
+
+		expect(env.GJC_HERDR_PANE_OWNER).toBe("pane-7:4242");
+	});
+
+	it("keeps a nested gjc from claiming or releasing its parent's pane", () => {
+		// A session shelling out to `gjc doctor` hands the child the same
+		// HERDR_PANE_ID. Before the claim marker the child registered as the pane's
+		// agent and, on exit, released that authority and cleared the title; because
+		// Herdr's per-source sequence is a monotonic watermark seeded from the wall
+		// clock, every later report from the parent fell below the child's watermark
+		// and the pane disappeared from the agent list until it was restarted.
+		const env = paneEnv();
+		const parent = recordingSpawn();
+		const parentSource = eventSource();
+		installHerdrReporter(parentSource.subscribe, {
+			env,
+			spawn: parent.spawn,
+			which: () => "/usr/bin/herdr",
+			pid: 100,
+		});
+		expect(parent.calls).toHaveLength(1);
+
+		const nested = recordingSpawn();
+		const nestedSource = eventSource();
+		const nestedOptions = { env, spawn: nested.spawn, which: () => "/usr/bin/herdr", pid: 200 };
+		const nestedReporter = installHerdrReporter(nestedSource.subscribe, nestedOptions);
+		syncHerdrPaneTitle("nested doctor run", nestedOptions);
+
+		expect(nestedReporter).toBeNull();
+		expect(nestedSource.attached).toBe(false);
+		expect(nested.calls).toHaveLength(0);
+
+		// The parent keeps reporting for the pane it owns.
+		parentSource.emit({ type: "agent_start" });
+		expect(parent.calls.map(call => call.command.at(-3))).toEqual(["idle", "working"]);
+		expect(env.GJC_HERDR_PANE_OWNER).toBe("pane-7:100");
 	});
 });
 
