@@ -157,6 +157,9 @@ describe("provider environment isolation", () => {
 			OPENAI_BASE_URL: "https://provider.example.test/v1",
 			ANTHROPIC_AUTH_TOKEN: "ambient-token",
 			AWS_PROFILE: "ambient-profile",
+			AWS_REGION: "us-east-1",
+			AWS_DEFAULT_REGION: "us-west-2",
+			AWS_EC2_METADATA_DISABLED: "false",
 			AWS_BEARER_TOKEN_BEDROCK: "ambient-bedrock-token",
 			GOOGLE_APPLICATION_CREDENTIALS: "/ambient/credentials.json",
 			HUGGINGFACE_HUB_TOKEN: "ambient-huggingface-token",
@@ -164,6 +167,7 @@ describe("provider environment isolation", () => {
 			PERPLEXITY_COOKIES: "ambient-cookies",
 			SEARXNG_ENDPOINT: "https://search.example.test",
 			CLAUDE_CODE_CLIENT_KEY: "/ambient/client.key",
+			NODE_EXTRA_CA_CERTS: "/ambient/ca.pem",
 			PATH: "/usr/bin",
 		};
 
