@@ -45,8 +45,9 @@ afterEach(async () => {
 	roots.length = 0;
 });
 
-test("a broker whose heartbeat write never settles self-terminates", async () => {
+test("a broker whose heartbeat write never settles self-terminates and leaves its lock reclaimable", async () => {
 	const broker = await startBroker();
+	const ownerRecord = path.join(broker.settings.agentDir, "sdk", "broker.lock", "owner.json");
 	setLivenessGraceForTest(broker, WATCHDOG_CADENCE_MS * 4);
 	// The observation keeps reporting "owned" and nothing throws, so no fence is
 	// ever armed. This is the state that survived 13.6 hours in #4704: alive,
@@ -54,7 +55,14 @@ test("a broker whose heartbeat write never settles self-terminates", async () =>
 	// and refused to reclaim a lock whose owner pid was still alive.
 	setHeartbeatStallForTest(broker, true);
 
+	// Completion resolves with the heartbeat still unresolved, which also proves
+	// the teardown's synchronous `publication.close()` did not wait for it.
 	expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 40)).toBe(true);
+
+	// lost-root deliberately keeps the lock record: this process is exiting, and
+	// the dead-owner reclaim (#3963) is what hands it to the successor. Taking it
+	// over is covered by sdk-broker-restart's stale-lock takeover tests.
+	expect(JSON.parse(await fs.readFile(ownerRecord, "utf8"))).toMatchObject({ pid: process.pid });
 });
 
 test("a broker that keeps publishing is never terminated by the liveness deadline", async () => {
@@ -70,9 +78,10 @@ test("the retained heartbeat never runs its blocking write or fsync on the JS th
 	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-liveness-thread-"));
 	roots.push(root);
 	const agentDir = path.join(root, "agent");
-	// The synchronous bindings block the thread until the device returns, which is
-	// what leaves the watchdog above unable to run at all. Reaching for them from
-	// the publication path is the regression, so they fail loudly here.
+	// The write and its fsync block until the device returns, which is what leaves
+	// the watchdog above unable to run at all. The synchronous bindings are gone
+	// from the native surface for that reason; these stubs stand in their place so
+	// a reintroduced JS-thread call fails loudly instead of silently wedging.
 	const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
 		observe: () => ({ kind: "owned" }),
 		heartbeat: () => {
