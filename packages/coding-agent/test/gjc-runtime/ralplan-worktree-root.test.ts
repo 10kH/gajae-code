@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { runNativeRalplanCommand } from "@gajae-code/coding-agent/gjc-runtime/ralplan-runtime";
+import { runRalplanCliCommand } from "../../src/commands/ralplan";
+import ralplanPersistenceTemplate from "../../src/prompts/agent-fragments/ralplan-persistence.md" with { type: "text" };
 
 const tempRoots: string[] = [];
 const recursiveForce = { recursive: true, force: true } as const;
@@ -722,5 +724,121 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		const state = await readState(target, session);
 		expect(state.planning_stuck).toEqual(expect.objectContaining({ marker: "PLANNING-STUCK" }));
 		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+	it("rejects a fake .git directory that is not a valid worktree before mutation", async () => {
+		const session = "wt-fake-git";
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const fake = await tempDir("gjc-ralplan-fake-git-");
+		await fs.mkdir(path.join(fake, ".git"));
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", fake, "--session-id", session, "--json", "fake git task"],
+			dispatcher,
+		);
+		expect(seed.status).toBe(2);
+		expect(seed.stderr ?? "").toMatch(/not a valid git worktree|not inside a git repository/);
+		expect(await pathExists(path.join(fake, ".gjc"))).toBe(false);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
+
+	it("rejects duplicate --worktree-root flags before mutation", async () => {
+		const session = "wt-dup-flag";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const seed = await runNativeRalplanCommand(
+			["--worktree-root", target, "--session-id", session, "--json", "dup task", "--worktree-root"],
+			dispatcher,
+		);
+		expect(seed.status).toBe(2);
+		expect(seed.stderr ?? "").toMatch(/at most once|requires a non-empty path/);
+		const write = await runNativeRalplanCommand(
+			[
+				"--write",
+				"--worktree-root",
+				target,
+				"--stage",
+				"planner",
+				"--stage_n",
+				"1",
+				"--session-id",
+				session,
+				"--run-id",
+				session,
+				"--artifact",
+				"plan",
+				"--worktree-root",
+			],
+			dispatcher,
+		);
+		expect(write.status).toBe(2);
+		expect(write.stderr ?? "").toMatch(/at most once|requires a non-empty path/);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+		expect(await pathExists(path.join(target, ".gjc"))).toBe(false);
+	});
+
+	it("rejects an explicit-target --artifact file that escapes the invoking cwd", async () => {
+		const session = "wt-artifact-escape";
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const outsider = await tempDir("gjc-ralplan-outside-artifact-");
+		const secret = path.join(outsider, "secret.md");
+		await fs.writeFile(secret, "should not be ingested\n");
+		expect(
+			(
+				await runNativeRalplanCommand(
+					["--worktree-root", target, "--session-id", session, "escape task"],
+					dispatcher,
+				)
+			).status,
+		).toBe(0);
+		const write = await runNativeRalplanCommand(
+			explicitWriteArgs({
+				worktreeRoot: target,
+				stage: "planner",
+				stageN: 1,
+				session,
+				artifact: secret,
+			}),
+			dispatcher,
+		);
+		expect(write.status).toBe(2);
+		expect(write.stderr ?? "").toMatch(/escapes the invoking cwd/);
+		expect(await pathExists(path.join(runDir(target, session, session), "stage-01-planner.md"))).toBe(false);
+	});
+
+	it("renders --worktree-root on the bundled role persistence command", () => {
+		expect(ralplanPersistenceTemplate).toMatch(
+			/gjc ralplan --write --worktree-root <repository_binding\.worktreeRoot>/,
+		);
+	});
+
+	it("public CLI validates --worktree-root before migrating dispatcher settings", async () => {
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		await fs.mkdir(path.join(dispatcher, ".gjc"), { recursive: true });
+		const settingsPath = path.join(dispatcher, ".gjc", "settings.json");
+		await fs.writeFile(settingsPath, JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
+		const missing = path.join(dispatcher, "does-not-exist");
+		const probe = path.join(import.meta.dir, "../fixtures/ralplan-cli-worktree-root-probe.ts");
+		const proc = Bun.spawn(
+			[process.execPath, probe, "--worktree-root", missing, "--session-id", "cli-nomut", "--json", "task"],
+			{
+				cwd: dispatcher,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env, GJC_SESSION_ID: undefined },
+			},
+		);
+		const status = await proc.exited;
+		const stderr = await new Response(proc.stderr).text();
+		expect(status).toBe(2);
+		expect(stderr).toMatch(/does not exist/);
+		expect(await pathExists(settingsPath)).toBe(true);
+		expect(await pathExists(path.join(dispatcher, ".gjc", "config.yml"))).toBe(false);
+		const result = await runRalplanCliCommand(
+			["--worktree-root", missing, "--session-id", "cli-nomut", "--json", "task"],
+			dispatcher,
+		);
+		expect(result.status).toBe(2);
+		expect(result.stderr ?? "").toMatch(/does not exist/);
+		expect(await pathExists(path.join(dispatcher, ".gjc", "config.yml"))).toBe(false);
 	});
 });

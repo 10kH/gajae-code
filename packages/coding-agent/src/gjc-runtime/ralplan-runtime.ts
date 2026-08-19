@@ -6,7 +6,7 @@ import { isSettingsInitialized, Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
-import { repo } from "../utils/git";
+import { head, repo } from "../utils/git";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import {
 	formatRalplanStagePresence,
@@ -710,13 +710,22 @@ interface RalplanTargetRoot {
 	explicit: boolean;
 }
 
-async function resolveRalplanTargetRoot(args: readonly string[], invocationCwd: string): Promise<RalplanTargetRoot> {
-	const raw = flagValue(args, "--worktree-root");
-	if (raw === undefined) {
-		if (hasFlag(args, "--worktree-root")) {
-			throw new RalplanCommandError(2, "--worktree-root requires a non-empty path");
-		}
-		return { root: invocationCwd, explicit: false };
+export async function resolveRalplanTargetRoot(
+	args: readonly string[],
+	invocationCwd: string,
+): Promise<RalplanTargetRoot> {
+	const occurrences: number[] = [];
+	for (let index = 0; index < args.length; index += 1) {
+		if (args[index] === "--worktree-root") occurrences.push(index);
+	}
+	if (occurrences.length === 0) return { root: invocationCwd, explicit: false };
+	if (occurrences.length > 1) {
+		throw new RalplanCommandError(2, "ralplan --worktree-root may be supplied at most once");
+	}
+	const flagIndex = occurrences[0]!;
+	const raw = args[flagIndex + 1];
+	if (raw === undefined || raw.startsWith("-")) {
+		throw new RalplanCommandError(2, "--worktree-root requires a non-empty path");
 	}
 	const trimmed = raw.trim();
 	if (!trimmed) throw new RalplanCommandError(2, "--worktree-root requires a non-empty path");
@@ -736,6 +745,10 @@ async function resolveRalplanTargetRoot(args: readonly string[], invocationCwd: 
 	if (!repository) {
 		throw new RalplanCommandError(2, `ralplan --worktree-root is not inside a git repository: ${canonical}`);
 	}
+	const headState = await head.resolve(canonical);
+	if (!headState?.commit) {
+		throw new RalplanCommandError(2, `ralplan --worktree-root is not a valid git worktree: ${canonical}`);
+	}
 	let worktreeRoot: string;
 	try {
 		worktreeRoot = await fs.realpath(repository.repoRoot);
@@ -750,13 +763,35 @@ async function resolveRalplanTargetRoot(args: readonly string[], invocationCwd: 
 	}
 	return { root: canonical, explicit: true };
 }
-async function resolveArtifactContent(rawArtifact: string, cwd: string): Promise<string> {
+async function resolveArtifactContent(
+	rawArtifact: string,
+	cwd: string,
+	options: { confineRoot?: string } = {},
+): Promise<string> {
 	if (isRestrictedRoleAgentBash()) return rawArtifact;
 	const candidate = path.isAbsolute(rawArtifact) ? rawArtifact : path.resolve(cwd, rawArtifact);
 	try {
 		const stat = await fs.stat(candidate);
-		if (stat.isFile()) return await fs.readFile(candidate, "utf-8");
+		if (stat.isFile()) {
+			if (options.confineRoot) {
+				let realRoot: string;
+				let realCandidate: string;
+				try {
+					realRoot = await fs.realpath(options.confineRoot);
+					realCandidate = await fs.realpath(candidate);
+				} catch (error) {
+					const err = error as NodeJS.ErrnoException;
+					throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
+				}
+				const relative = path.relative(realRoot, realCandidate);
+				if (relative.startsWith("..") || path.isAbsolute(relative)) {
+					throw new RalplanCommandError(2, `ralplan --artifact path escapes the invoking cwd: ${candidate}`);
+				}
+			}
+			return await fs.readFile(candidate, "utf-8");
+		}
 	} catch (error) {
+		if (error instanceof RalplanCommandError) throw error;
 		const err = error as NodeJS.ErrnoException;
 		if (err.code !== "ENOENT" && err.code !== "ENOTDIR") {
 			throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
@@ -1432,6 +1467,7 @@ async function resolveArtifactArgs(
 	args: readonly string[],
 	cwd: string,
 	artifactBaseCwd: string = cwd,
+	options: { confineArtifactRoot?: string } = {},
 ): Promise<ResolvedArtifactArgs> {
 	const stage = flagValue(args, "--stage");
 	if (!stage) throw new RalplanCommandError(2, "--stage is required for ralplan --write");
@@ -1470,7 +1506,9 @@ async function resolveArtifactArgs(
 	const artifact =
 		artifactEnvName !== undefined
 			? (process.env[GJC_RALPLAN_ARTIFACT_ENV] ?? "")
-			: await resolveArtifactContent(rawArtifact!, artifactBaseCwd);
+			: await resolveArtifactContent(rawArtifact!, artifactBaseCwd, {
+					confineRoot: options.confineArtifactRoot,
+				});
 	if (artifact === "") {
 		throw new RalplanCommandError(2, "artifact content is empty");
 	}
@@ -1935,17 +1973,18 @@ async function handleArtifactWrite(
 	// file resolution. Validation happens here, before any state/artifact write.
 	const target = await resolveRalplanTargetRoot(args, cwd);
 	const persistCwd = target.root;
-	const resolved = await resolveArtifactArgs(args, persistCwd, cwd);
+	const resolved = await resolveArtifactArgs(args, persistCwd, cwd, {
+		confineArtifactRoot: target.explicit ? cwd : undefined,
+	});
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);
 	// Fail closed before stage persistence / path writes when cwd drifted to a sibling repo.
 	const repositoryBinding = await enforceRalplanRepositoryBinding(persistCwd, resolved.sessionId, {
 		exactWorktreeRoot: target.explicit,
 	});
-	// Artifact file paths (when --artifact points at a file) must stay under the bound root.
-	// In explicit-target mode the --artifact input file is intentionally resolved from
-	// the invoking cwd (dispatcher/role lane), which legitimately lives outside the
-	// bound target root, so the containment assertion applies to cwd-based mode only.
+	// Artifact file paths (when --artifact points at a file) must stay under the bound
+	// worktree in cwd-based mode. Explicit-target mode confines the file to the
+	// invoking cwd (including realpath/symlink escape) before the content is read.
 	const rawArtifact = flagValue(args, "--artifact");
 	if (rawArtifact && !isRestrictedRoleAgentBash()) {
 		const candidate = path.isAbsolute(rawArtifact) ? rawArtifact : path.resolve(cwd, rawArtifact);

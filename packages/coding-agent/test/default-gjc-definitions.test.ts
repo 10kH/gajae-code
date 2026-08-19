@@ -647,7 +647,7 @@ Project executor override body.
 		const content = ralplan?.content ?? "";
 
 		expect(content).toContain(
-			"gjc ralplan --write --session-id <owner-session-id> --run-id <run-id> --stage <type> --stage_n <N> --artifact",
+			"gjc ralplan --write --worktree-root <repository_binding.worktreeRoot> --session-id <owner-session-id> --run-id <run-id> --stage <type> --stage_n <N> --artifact",
 		);
 		expect(content).toContain("--stage planner");
 		expect(content).toContain("--stage architect");
