@@ -369,6 +369,7 @@ export class Agent {
 		scope?: AttemptScope,
 	) => Promise<AgentMessage[]>;
 	#steeringQueue: AgentMessage[] = [];
+	#steeringWaiters = new Set<() => void>();
 	#followUpQueue: AgentMessage[] = [];
 	#followUpForceOneAtATime = new WeakSet<AgentMessage>();
 	#steeringMode: "all" | "one-at-a-time";
@@ -1051,6 +1052,30 @@ export class Agent {
 	steer(m: AgentMessage) {
 		assertUserImagePlaceholdersHavePayload([m]);
 		this.#steeringQueue.push(m);
+		for (const notify of [...this.#steeringWaiters]) notify();
+	}
+
+	/**
+	 * Resolves when a steering message is queued (or is already queued), or when
+	 * `signal` aborts. The queue is not consumed. Long observation tools use this
+	 * to end their wait early so a busy user message is handled at the next tool
+	 * boundary instead of after the full wait window.
+	 */
+	waitForSteeringArrival(signal: AbortSignal): Promise<void> {
+		if (this.#steeringQueue.length > 0 || signal.aborted) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let settled = false;
+		const settle = () => {
+			if (settled) return;
+			settled = true;
+			this.#steeringWaiters.delete(settle);
+			signal.removeEventListener("abort", settle);
+			resolve();
+		};
+		this.#steeringWaiters.add(settle);
+		signal.addEventListener("abort", settle, { once: true });
+		if (this.#steeringQueue.length > 0 || signal.aborted) settle();
+		return promise;
 	}
 
 	/**

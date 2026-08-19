@@ -50,6 +50,27 @@ describe("Agent steering queue introspection", () => {
 		expect(after[1]).toMatchObject({ content: "b" });
 	});
 
+	it("waitForSteeringArrival resolves on arrival, on a pre-queued steer, and on abort without consuming", async () => {
+		const agent = new Agent();
+
+		// Arrival: a pending wait resolves when a steer is queued, and the queue survives.
+		const pending = agent.waitForSteeringArrival(new AbortController().signal);
+		agent.steer(userMessage("arrived"));
+		await pending;
+		expect(agent.hasQueuedSteering()).toBe(true);
+
+		// Already queued: resolves immediately.
+		await agent.waitForSteeringArrival(new AbortController().signal);
+
+		// Abort: a wait on an empty queue resolves when its signal aborts.
+		agent.clearSteeringQueue();
+		const controller = new AbortController();
+		const abortable = agent.waitForSteeringArrival(controller.signal);
+		controller.abort();
+		await abortable;
+		expect(agent.hasQueuedSteering()).toBe(false);
+	});
+
 	it("restoreSteering is a no-op for an empty snapshot", () => {
 		const agent = new Agent();
 		agent.steer(userMessage("b"));
