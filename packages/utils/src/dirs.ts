@@ -187,7 +187,7 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
 function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
-	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
+	if (Object.hasOwn(parseEnvFile(path.join(process.cwd(), ".env")), name)) return undefined;
 	return value;
 }
 
@@ -309,15 +309,14 @@ class DirResolver {
  * every redirect the credential boundary is meant to reject.
  *
  * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
- * it applies the same conservative ambiguity rule directly: a value that matches
- * what the project `.env` sets is not honoured. An operator whose environment
- * happens to carry the identical value loses the override, which is the same
- * trade-off `resolveLiveCredentialEnvValue` already makes.
+ * it applies the same conservative ambiguity rule directly: any key declared
+ * by the project `.env` is not honoured. This also covers dotenv-expanded
+ * values whose runtime value differs from the declaration text.
  */
 function trustedAgentDirOverrideFor(name: "GJC_CODING_AGENT_DIR" | "PI_CODING_AGENT_DIR"): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
-	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
+	if (Object.hasOwn(parseEnvFile(path.join(process.cwd(), ".env")), name)) return undefined;
 	return value;
 }
 
@@ -369,6 +368,11 @@ export function getAgentDir(): string {
  */
 export function getTrustedAgentFile(filename: string): string {
 	return path.join(getAgentDir(), filename);
+}
+
+/** Whether the current checkout declares an environment key in its `.env`. */
+export function isProjectEnvDeclaration(name: string): boolean {
+	return Object.hasOwn(parseEnvFile(path.join(process.cwd(), ".env")), name);
 }
 
 /** Get the project-local config directory (.gjc). */

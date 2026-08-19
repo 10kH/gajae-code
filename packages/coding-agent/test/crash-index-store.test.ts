@@ -12,6 +12,7 @@ import {
 } from "@gajae-code/utils";
 import {
 	applyCrashEvent,
+	CRASH_INDEX_ENTRY_MAX_BYTES,
 	CRASH_INDEX_MAX_SIGNATURES,
 	type CrashStatePaths,
 	compactCrashIndex,
@@ -528,6 +529,31 @@ describe("parseCrashIndex", () => {
 
 	it("accepts a well-formed index", () => {
 		expect(parseCrashIndex(JSON.stringify(valid), NOW)?.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(2);
+	});
+
+	it("accepts a maximum-sized legacy entry while deriving its relay watermark", () => {
+		const legacyEntry = {
+			...valid.signatures[fingerprintFor(1)],
+			messageClass: "x".repeat(512),
+			commentedIssues: [
+				`https://github.com/Yeachan-Heo/gajae-code/issues/${"x".repeat(180)}`,
+				`https://x/${"y".repeat(50)}`,
+			],
+		};
+		const legacySize = Buffer.byteLength(JSON.stringify(legacyEntry), "utf8");
+		const upgradedSize = Buffer.byteLength(
+			JSON.stringify({ ...legacyEntry, lastAppendRecordId: legacyEntry.lastRecordId }),
+			"utf8",
+		);
+		expect(legacySize).toBeLessThanOrEqual(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(upgradedSize).toBeGreaterThan(CRASH_INDEX_ENTRY_MAX_BYTES);
+
+		const parsed = parseCrashIndex(
+			JSON.stringify({ ...valid, signatures: { [fingerprintFor(1)]: legacyEntry } }),
+			NOW,
+		);
+		expect(parsed?.signatures[fingerprintFor(1)]).toBeDefined();
+		expect(parsed?.signatures[fingerprintFor(1)]?.lastAppendRecordId).toBeUndefined();
 	});
 
 	it.each([
