@@ -660,19 +660,27 @@ export async function appendOutboxEvents(
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
 			throw error;
 		});
-		const ids = new Set(
-			existing
-				.split("\n")
-				.filter(Boolean)
-				.map(line => {
-					try {
-						return (JSON.parse(line) as { id?: unknown }).id;
-					} catch {
-						return null;
-					}
-				})
-				.filter((id): id is string => typeof id === "string"),
-		);
+		const ids = new Set<string>();
+		for (const rawLine of existing.split("\n")) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				throw new Error("state_corrupt");
+			}
+			if (
+				typeof parsed !== "object" ||
+				parsed === null ||
+				Array.isArray(parsed) ||
+				typeof (parsed as { id?: unknown }).id !== "string" ||
+				(parsed as { id: string }).id.length === 0 ||
+				ids.has((parsed as { id: string }).id)
+			)
+				throw new Error("state_corrupt");
+			ids.add((parsed as { id: string }).id);
+		}
 		const events = Object.values(transaction.outbox).filter(event => !event.emitted && !ids.has(event.id));
 		if (events.length > 0) {
 			await appendCoordinatorFile(paths.journal, `${events.map(event => JSON.stringify(event)).join("\n")}\n`);
