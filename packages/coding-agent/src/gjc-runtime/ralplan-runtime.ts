@@ -1,11 +1,13 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Dirent } from "node:fs";
+import * as fssync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isSettingsInitialized, Settings } from "../config/settings";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { buildRalplanHudSummary } from "../skill-state/workflow-hud";
 import { WORKFLOW_STATE_VERSION } from "../skill-state/workflow-state-contract";
+import { repo } from "../utils/git";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import {
 	formatRalplanStagePresence,
@@ -649,6 +651,7 @@ const VALUE_FLAGS = new Set([
 	"--fallback-stage-n",
 	"--fallback-receipt-path",
 	"--lane-verdict",
+	"--worktree-root",
 ]);
 
 export function isRalplanArtifactWriteInvocation(args: readonly string[]): boolean {
@@ -691,13 +694,152 @@ function defaultRunId(now: Date = new Date()): string {
 	return `${yyyy}-${mm}-${dd}-${hh}${min}-${suffix}`;
 }
 
-async function resolveArtifactContent(rawArtifact: string, cwd: string): Promise<string> {
+/* --------------------------- target worktree root --------------------------- */
+
+/**
+ * Explicit target-worktree routing (#4693). `--worktree-root <path>` selects the
+ * canonical git worktree that owns every ralplan persistence root (run state,
+ * stage artifacts, index ledger, HUD state, stuck markers, and review-budget
+ * accounting) regardless of the writer process's ambient cwd. Without the flag,
+ * behavior stays cwd-based. The invoking cwd is retained only for resolving a
+ * relative `--artifact` input file.
+ */
+interface RalplanTargetRoot {
+	/** Canonical persistence root: the invocation cwd, or the --worktree-root target. */
+	root: string;
+	/** True when the caller explicitly selected the target via --worktree-root. */
+	explicit: boolean;
+}
+
+export async function resolveRalplanTargetRoot(
+	args: readonly string[],
+	invocationCwd: string,
+): Promise<RalplanTargetRoot> {
+	const occurrences: number[] = [];
+	for (let index = 0; index < args.length; index += 1) {
+		if (args[index] === "--worktree-root") occurrences.push(index);
+	}
+	if (occurrences.length === 0) return { root: invocationCwd, explicit: false };
+	if (occurrences.length > 1) {
+		throw new RalplanCommandError(2, "ralplan --worktree-root may be supplied at most once");
+	}
+	const flagIndex = occurrences[0]!;
+	const raw = args[flagIndex + 1];
+	if (raw === undefined || raw.startsWith("-")) {
+		throw new RalplanCommandError(2, "--worktree-root requires a non-empty path");
+	}
+	const trimmed = raw.trim();
+	if (!trimmed) throw new RalplanCommandError(2, "--worktree-root requires a non-empty path");
+	const resolved = path.isAbsolute(trimmed) ? trimmed : path.resolve(invocationCwd, trimmed);
+	// Canonicalize (and prove existence) before any state or artifact write.
+	let canonical: string;
+	try {
+		canonical = await fs.realpath(resolved);
+	} catch {
+		throw new RalplanCommandError(2, `ralplan --worktree-root does not exist: ${resolved}`);
+	}
+	const stat = await fs.stat(canonical);
+	if (!stat.isDirectory()) {
+		throw new RalplanCommandError(2, `ralplan --worktree-root is not a directory: ${canonical}`);
+	}
+	const repository = await repo.resolve(canonical);
+	if (!repository) {
+		throw new RalplanCommandError(2, `ralplan --worktree-root is not inside a git repository: ${canonical}`);
+	}
+	const verified = Bun.spawn(["git", "-C", canonical, "rev-parse", "--verify", "HEAD^{commit}"], {
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	if ((await verified.exited) !== 0) {
+		throw new RalplanCommandError(2, `ralplan --worktree-root is not a valid git worktree: ${canonical}`);
+	}
+	let worktreeRoot: string;
+	try {
+		worktreeRoot = await fs.realpath(repository.repoRoot);
+	} catch {
+		worktreeRoot = path.resolve(repository.repoRoot);
+	}
+	if (worktreeRoot !== canonical) {
+		throw new RalplanCommandError(
+			2,
+			`ralplan --worktree-root must be the git worktree root (${worktreeRoot}), not a subdirectory: ${canonical}`,
+		);
+	}
+	return { root: canonical, explicit: true };
+}
+
+export async function assertExplicitTargetGjcNotSymlinked(root: string): Promise<void> {
+	const gjcRoot = path.join(root, ".gjc");
+	let st: fssync.Stats;
+	try {
+		st = await fs.lstat(gjcRoot);
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		if (err.code === "ENOENT") return;
+		throw new RalplanCommandError(2, `failed to inspect ${gjcRoot}: ${err.message}`);
+	}
+	if (st.isSymbolicLink()) {
+		throw new RalplanCommandError(2, `ralplan --worktree-root refuses a symlinked .gjc root: ${gjcRoot}`);
+	}
+	const realGjc = await fs.realpath(gjcRoot);
+	const realRoot = await fs.realpath(root);
+	const relative = path.relative(realRoot, realGjc);
+	if (relative.startsWith("..") || path.isAbsolute(relative)) {
+		throw new RalplanCommandError(2, `ralplan --worktree-root .gjc escapes the target worktree: ${gjcRoot}`);
+	}
+}
+
+async function readConfinedArtifactFile(candidate: string, confineRoot: string): Promise<string> {
+	let realRoot: string;
+	try {
+		realRoot = await fs.realpath(confineRoot);
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
+	}
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(candidate, fssync.constants.O_RDONLY | fssync.constants.O_NOFOLLOW);
+	} catch (error) {
+		const err = error as NodeJS.ErrnoException;
+		throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
+	}
+	try {
+		const opened = await handle.stat();
+		if (!opened.isFile()) {
+			throw new RalplanCommandError(2, `ralplan --artifact is not a regular file: ${candidate}`);
+		}
+		const fdPath = `/proc/self/fd/${handle.fd}`;
+		let openedIdentity: string;
+		try {
+			openedIdentity = await fs.realpath(fdPath);
+		} catch {
+			throw new RalplanCommandError(2, `ralplan --artifact identity could not be established: ${candidate}`);
+		}
+		const relative = path.relative(realRoot, openedIdentity);
+		if (relative.startsWith("..") || path.isAbsolute(relative)) {
+			throw new RalplanCommandError(2, `ralplan --artifact path escapes the invoking cwd: ${candidate}`);
+		}
+		return await handle.readFile("utf-8");
+	} finally {
+		await handle.close();
+	}
+}
+async function resolveArtifactContent(
+	rawArtifact: string,
+	cwd: string,
+	options: { confineRoot?: string } = {},
+): Promise<string> {
 	if (isRestrictedRoleAgentBash()) return rawArtifact;
 	const candidate = path.isAbsolute(rawArtifact) ? rawArtifact : path.resolve(cwd, rawArtifact);
 	try {
 		const stat = await fs.stat(candidate);
-		if (stat.isFile()) return await fs.readFile(candidate, "utf-8");
+		if (stat.isFile()) {
+			if (options.confineRoot) return await readConfinedArtifactFile(candidate, options.confineRoot);
+			return await fs.readFile(candidate, "utf-8");
+		}
 	} catch (error) {
+		if (error instanceof RalplanCommandError) throw error;
 		const err = error as NodeJS.ErrnoException;
 		if (err.code !== "ENOENT" && err.code !== "ENOTDIR") {
 			throw new RalplanCommandError(2, `failed to read --artifact ${candidate}: ${err.message}`);
@@ -741,7 +883,11 @@ async function readActiveRunId(cwd: string, sessionId: string): Promise<string |
  * Read the authoritative repository binding from ralplan run state and fail closed
  * when the active cwd no longer matches (handoff / QA / stage write) (#2901).
  */
-async function enforceRalplanRepositoryBinding(cwd: string, sessionId: string): Promise<RepositoryBinding> {
+async function enforceRalplanRepositoryBinding(
+	cwd: string,
+	sessionId: string,
+	options: { exactWorktreeRoot?: boolean } = {},
+): Promise<RepositoryBinding> {
 	const statePath = ralplanStatePath(cwd, sessionId);
 	const existingRead = await readExistingStateForMutation(statePath);
 	if (existingRead.kind === "corrupt") {
@@ -751,16 +897,45 @@ async function enforceRalplanRepositoryBinding(cwd: string, sessionId: string): 
 		);
 	}
 	if (existingRead.kind === "absent") {
+		if (options.exactWorktreeRoot) {
+			// Explicit-target mode declares the run lives exactly at the selected
+			// worktree. A missing seed there means the target does not own this run
+			// (e.g. a linked worktree that merely shares commonDir): fail before any
+			// filesystem mutation instead of stamping fragmented authority (#4693).
+			throw new RalplanCommandError(
+				2,
+				`ralplan --worktree-root ${cwd} holds no seeded ralplan run state for session ${sessionId}; seed the run at the target worktree first, or pass the seeded run's repository_binding.worktreeRoot`,
+			);
+		}
 		// No prior seed — capture live authority so subsequent handoffs still have a stamp.
 		return publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
 	}
 	const raw = existingRead.value.repository_binding ?? existingRead.value.repositoryBinding;
-	try {
-		if (raw === undefined) {
-			// Legacy seeds without a field: stamp current cwd and require future writes match it.
-			return publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+	if (raw === undefined) {
+		if (options.exactWorktreeRoot) {
+			throw new RalplanCommandError(
+				2,
+				`ralplan run state at ${statePath} predates repository binding; re-seed the run at the target worktree`,
+			);
 		}
+		// Legacy seeds without a field: stamp current cwd and require future writes match it.
+		return publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
+	}
+	try {
 		const binding = parseRepositoryBinding(raw);
+		if (options.exactWorktreeRoot) {
+			// #4693: explicit-target mode requires exact canonical worktreeRoot
+			// equality with the seeded run binding; a linked worktree that only
+			// shares commonDir is a different artifact root and is rejected.
+			const active = await captureRepositoryBinding(cwd);
+			if (path.resolve(active.worktreeRoot) !== path.resolve(binding.worktreeRoot)) {
+				throw new RepositoryBindingError(
+					"identity_mismatch",
+					`ralplan explicit target worktree must exactly equal the run's bound worktreeRoot (linked worktrees sharing one commonDir are not accepted in --worktree-root mode). target=${active.worktreeRoot} bound=${binding.worktreeRoot}`,
+				);
+			}
+			return publicRepositoryBinding(binding);
+		}
 		await assertCwdMatchesRepositoryBinding(cwd, binding);
 		return publicRepositoryBinding(binding);
 	} catch (error) {
@@ -1336,7 +1511,12 @@ async function resolveArtifactSessionId(args: readonly string[], cwd: string, ex
 	return ownerSessionId;
 }
 
-async function resolveArtifactArgs(args: readonly string[], cwd: string): Promise<ResolvedArtifactArgs> {
+async function resolveArtifactArgs(
+	args: readonly string[],
+	cwd: string,
+	artifactBaseCwd: string = cwd,
+	options: { confineArtifactRoot?: string } = {},
+): Promise<ResolvedArtifactArgs> {
 	const stage = flagValue(args, "--stage");
 	if (!stage) throw new RalplanCommandError(2, "--stage is required for ralplan --write");
 	assertKnownStage(stage);
@@ -1374,7 +1554,9 @@ async function resolveArtifactArgs(args: readonly string[], cwd: string): Promis
 	const artifact =
 		artifactEnvName !== undefined
 			? (process.env[GJC_RALPLAN_ARTIFACT_ENV] ?? "")
-			: await resolveArtifactContent(rawArtifact!, cwd);
+			: await resolveArtifactContent(rawArtifact!, artifactBaseCwd, {
+					confineRoot: options.confineArtifactRoot,
+				});
 	if (artifact === "") {
 		throw new RalplanCommandError(2, "artifact content is empty");
 	}
@@ -1834,18 +2016,30 @@ async function handleArtifactWrite(
 	cwd: string,
 	agentDir?: string,
 ): Promise<RalplanCommandResult> {
-	const resolved = await resolveArtifactArgs(args, cwd);
+	// #4693: explicit --worktree-root binds every persistence root to the selected
+	// canonical worktree; the invocation cwd survives only for --artifact input
+	// file resolution. Validation happens here, before any state/artifact write.
+	const target = await resolveRalplanTargetRoot(args, cwd);
+	const persistCwd = target.root;
+	if (target.explicit) await assertExplicitTargetGjcNotSymlinked(persistCwd);
+	const resolved = await resolveArtifactArgs(args, persistCwd, cwd, {
+		confineArtifactRoot: target.explicit ? cwd : undefined,
+	});
 	const persistedRoleState = parsePersistedRoleStateArgs(args, resolved.stage);
 	const laneVerdict = parseLaneVerdictArgs(args, resolved.stage, resolved.stageN);
 	// Fail closed before stage persistence / path writes when cwd drifted to a sibling repo.
-	const repositoryBinding = await enforceRalplanRepositoryBinding(cwd, resolved.sessionId);
-	// Artifact file paths (when --artifact points at a file) must stay under the bound root.
+	const repositoryBinding = await enforceRalplanRepositoryBinding(persistCwd, resolved.sessionId, {
+		exactWorktreeRoot: target.explicit,
+	});
+	// Artifact file paths (when --artifact points at a file) must stay under the bound
+	// worktree in cwd-based mode. Explicit-target mode confines the file to the
+	// invoking cwd (including realpath/symlink escape) before the content is read.
 	const rawArtifact = flagValue(args, "--artifact");
 	if (rawArtifact && !isRestrictedRoleAgentBash()) {
 		const candidate = path.isAbsolute(rawArtifact) ? rawArtifact : path.resolve(cwd, rawArtifact);
 		try {
 			const stat = await fs.stat(candidate);
-			if (stat.isFile()) {
+			if (stat.isFile() && !target.explicit) {
 				assertPathUnderRepositoryBinding(repositoryBinding, candidate);
 			}
 		} catch (error) {
@@ -1859,7 +2053,7 @@ async function handleArtifactWrite(
 	// Read the ledger once before persistence. The dedupe guard, both gates, and
 	// disposition provenance consume this same snapshot so no additional ledger
 	// read can slip between gate evaluation and persistence.
-	const indexLoad = await loadRalplanIndexForCap(cwd, resolved.sessionId, resolved.runId);
+	const indexLoad = await loadRalplanIndexForCap(persistCwd, resolved.sessionId, resolved.runId);
 
 	// Disposition stage: fail-closed parse/normalize with authoritative receipts (#2902).
 	const normalizedArtifact =
@@ -1880,14 +2074,14 @@ async function handleArtifactWrite(
 				`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${existingArtifact.path}: an artifact with different content already exists (existing sha256=${existingArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
 			);
 		}
-		if (resolved.stage === "final") await ensureFinalPendingApproval(cwd, resolved, existingArtifact);
-		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, cwd, repositoryBinding);
+		if (resolved.stage === "final") await ensureFinalPendingApproval(persistCwd, resolved, existingArtifact);
+		return await buildDeduplicatedResult(resolved, existingArtifact, sha256, persistCwd, repositoryBinding);
 	}
 
 	// `persistArtifact` writes the artifact before its ledger row. If a process crashed
 	// in that gap, an identical retry repairs the row and remains a normal deduplicated
 	// receipt; a differing retry retains the ordinary no-overwrite refusal.
-	const onDiskArtifact = await findOnDiskStageArtifact(cwd, resolved);
+	const onDiskArtifact = await findOnDiskStageArtifact(persistCwd, resolved);
 	if (onDiskArtifact) {
 		if (onDiskArtifact.sha256 !== sha256) {
 			throw new RalplanCommandError(
@@ -1895,9 +2089,9 @@ async function handleArtifactWrite(
 				`refusing to overwrite ralplan ${resolved.stage} stage ${resolved.stageN} at ${onDiskArtifact.path}: an artifact with different content already exists (existing sha256=${onDiskArtifact.sha256}, new sha256=${sha256}). Use a new --stage_n to record another pass.`,
 			);
 		}
-		if (resolved.stage === "final") await ensureFinalPendingApproval(cwd, resolved, onDiskArtifact);
+		if (resolved.stage === "final") await ensureFinalPendingApproval(persistCwd, resolved, onDiskArtifact);
 		const repairedArtifact = await repairMissingStageArtifactLedger(
-			cwd,
+			persistCwd,
 			resolved,
 			onDiskArtifact,
 			resolved.stage === "final" ? unavailableRalplanFinalAdmission() : undefined,
@@ -1905,19 +2099,19 @@ async function handleArtifactWrite(
 		let appliedPersistedRoleState: PersistedRoleStateUpdate | undefined;
 		if (
 			persistedRoleState &&
-			(await applyPersistedRoleStateUpdate(cwd, resolved.sessionId, persistedRoleState, resolved.runId))
+			(await applyPersistedRoleStateUpdate(persistCwd, resolved.sessionId, persistedRoleState, resolved.runId))
 		) {
 			appliedPersistedRoleState = persistedRoleState;
 		}
 		let appliedLaneVerdict: LaneVerdictUpdate | undefined;
-		if (laneVerdict && (await applyLaneVerdictUpdate(cwd, resolved.sessionId, laneVerdict, resolved.runId))) {
+		if (laneVerdict && (await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict, resolved.runId))) {
 			appliedLaneVerdict = laneVerdict;
 		}
 		return await buildDeduplicatedResult(
 			resolved,
 			repairedArtifact,
 			sha256,
-			cwd,
+			persistCwd,
 			repositoryBinding,
 			appliedLaneVerdict,
 			appliedPersistedRoleState,
@@ -1935,10 +2129,10 @@ async function handleArtifactWrite(
 	// run-scoped lock or CAS admission exists, intentionally matching #3165's
 	// check-then-persist exposure.
 	const [onDiskOpeners, onDiskLaneArtifacts, iterationLimit, laneLimit] = await Promise.all([
-		countRalplanOnDiskOpeners(cwd, resolved.sessionId, resolved.runId),
-		countRalplanOnDiskLaneArtifacts(cwd, resolved.sessionId, resolved.runId),
-		resolveRalplanMaxIterations(cwd, agentDir),
-		resolveRalplanMaxReviewPassesPerLane(cwd, agentDir),
+		countRalplanOnDiskOpeners(persistCwd, resolved.sessionId, resolved.runId),
+		countRalplanOnDiskLaneArtifacts(persistCwd, resolved.sessionId, resolved.runId),
+		resolveRalplanMaxIterations(persistCwd, agentDir),
+		resolveRalplanMaxReviewPassesPerLane(persistCwd, agentDir),
 	]);
 	const capDecision = evaluateRalplanIterationCap({
 		rows: indexLoad.rows,
@@ -1947,7 +2141,7 @@ async function handleArtifactWrite(
 		iterationFloor: onDiskOpeners,
 	});
 	if (!capDecision.allowed) {
-		await recordRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId, capDecision.reason);
+		await recordRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId, capDecision.reason);
 		return buildPlanningStuckResult({
 			json: resolved.json,
 			stage: resolved.stage,
@@ -1964,7 +2158,7 @@ async function handleArtifactWrite(
 		onDiskLaneCounts: onDiskLaneArtifacts,
 	});
 	if (!laneBudgetDecision.allowed) {
-		await recordRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId, laneBudgetDecision.reason);
+		await recordRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId, laneBudgetDecision.reason);
 		return buildLaneBudgetStuckResult({
 			json: resolved.json,
 			stage: resolved.stage,
@@ -1980,26 +2174,29 @@ async function handleArtifactWrite(
 		// Resolve and validate the configured admission before any final artifact or
 		// state write. The ledger row below is the durable receipt for deduplicated
 		// retries; state is only a current-session projection.
-		autoHandoff = await resolveRalplanAutoHandoff(cwd, {
+		autoHandoff = await resolveRalplanAutoHandoff(persistCwd, {
 			agentDir,
-			planningStuck: await readRalplanPlanningStuck(cwd, resolved.sessionId, resolved.runId),
+			planningStuck: await readRalplanPlanningStuck(persistCwd, resolved.sessionId, resolved.runId),
 		});
 	}
 	// Keep run-state `current_phase` coherent with the stage being persisted.
-	await persistActiveRunId(cwd, resolved.sessionId, resolved.runId, resolved.stage);
-	const persisted = await persistArtifact(resolved, cwd, content, sha256, autoHandoff);
+	await persistActiveRunId(persistCwd, resolved.sessionId, resolved.runId, resolved.stage);
+	const persisted = await persistArtifact(resolved, persistCwd, content, sha256, autoHandoff);
 	if (persistedRoleState) {
-		await applyPersistedRoleStateUpdate(cwd, resolved.sessionId, persistedRoleState);
+		await applyPersistedRoleStateUpdate(persistCwd, resolved.sessionId, persistedRoleState);
 	}
 	if (laneVerdict) {
-		await applyLaneVerdictUpdate(cwd, resolved.sessionId, laneVerdict);
+		await applyLaneVerdictUpdate(persistCwd, resolved.sessionId, laneVerdict);
 	}
 	if (autoHandoff) {
-		await persistRalplanFinalAdmission(cwd, resolved.sessionId, resolved.runId, autoHandoff);
+		await persistRalplanFinalAdmission(persistCwd, resolved.sessionId, resolved.runId, autoHandoff);
 	}
-	await writeSessionActivityMarker(cwd, resolved.sessionId, { writer: "ralplan-runtime", path: persisted.path });
+	await writeSessionActivityMarker(persistCwd, resolved.sessionId, {
+		writer: "ralplan-runtime",
+		path: persisted.path,
+	});
 	await syncRalplanHud({
-		cwd,
+		cwd: persistCwd,
 		sessionId: resolved.sessionId,
 		stage: persisted.stage,
 		runId: persisted.runId,
@@ -2166,6 +2363,7 @@ function resolveConsensusArgs(args: readonly string[], cwd: string): ConsensusHa
 async function seedRalplanState(
 	cwd: string,
 	resolved: ConsensusHandoffArgs,
+	explicitTarget = false,
 ): Promise<{ statePath: string; runId: string; repositoryBinding: RepositoryBinding }> {
 	const statePath = ralplanStatePath(cwd, resolved.sessionId);
 	// Reuse an existing run id when present so a re-invocation of `gjc ralplan "task"` doesn't
@@ -2177,7 +2375,7 @@ async function seedRalplanState(
 	// When an active seed already carries authority, re-entry must match it (fail closed).
 	// Otherwise stamp the current cwd as the durable binding for this run.
 	const repositoryBinding = existingRunId
-		? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId)
+		? await enforceRalplanRepositoryBinding(cwd, resolved.sessionId, { exactWorktreeRoot: explicitTarget })
 		: publicRepositoryBinding(await captureRepositoryBinding(cwd, { displayPath: cwd }));
 	const payload: Record<string, unknown> = {
 		active: true,
@@ -2216,14 +2414,18 @@ async function seedRalplanState(
 }
 
 async function handleConsensusHandoff(args: readonly string[], cwd: string): Promise<RalplanCommandResult> {
-	const resolved = resolveConsensusArgs(args, cwd);
+	// #4693: explicit --worktree-root seeds and binds the run at the selected
+	// canonical worktree instead of the ambient invocation cwd.
+	const target = await resolveRalplanTargetRoot(args, cwd);
+	if (target.explicit) await assertExplicitTargetGjcNotSymlinked(target.root);
+	const resolved = resolveConsensusArgs(args, target.root);
 	if (!resolved.task) {
 		throw new RalplanCommandError(2, 'gjc ralplan requires a task description, e.g. `gjc ralplan "<task>"`.');
 	}
-	const { statePath, runId, repositoryBinding } = await seedRalplanState(cwd, resolved);
+	const { statePath, runId, repositoryBinding } = await seedRalplanState(target.root, resolved, target.explicit);
 	const mode = resolved.deliberate ? "deliberate" : "short";
 	await syncRalplanHud({
-		cwd,
+		cwd: target.root,
 		sessionId: resolved.sessionId,
 		stage: "planner",
 		runId,
