@@ -1129,15 +1129,17 @@ export class Broker {
 		}
 	}
 	async #observePublication(writeHeartbeat: boolean): Promise<void> {
-		if (!this.#publication || this.#publicationState === "stopping") return;
+		const publication = this.#publication;
+		if (!publication || this.#publicationState === "stopping") return;
 		let observation: BrokerPublicationObservation;
 		try {
-			observation = publicationObservationOverridesForTest.get(this) ?? (await this.#publication.observeAsync());
+			observation = publicationObservationOverridesForTest.get(this) ?? (await publication.observeAsync());
 		} catch {
 			this.#fence("observation-ambiguous");
 			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
 			return;
 		}
+		if (this.#stopping || this.#publication !== publication) return;
 		if (observation === "owned") {
 			// Recover the cached publication state synchronously with the observation
 			// so request admission does not lag behind the awaited heartbeat IO.
