@@ -368,7 +368,7 @@ export async function listCodexHandoffs(namespaceDir: string): Promise<CodexHand
 		names = await fs.readdir(directory);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw new Error("state_corrupt");
+		throw error;
 	}
 	const handoffs: CodexHandoffRegistrationV1[] = [];
 	for (const name of names) {
@@ -482,7 +482,7 @@ export async function listCodexWakeEvents(namespaceDir: string, workUnit?: strin
 		names = await fs.readdir(directory);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-		throw new Error("state_corrupt");
+		throw error;
 	}
 	const events: CodexWakeEventV1[] = [];
 	for (const name of names) {
