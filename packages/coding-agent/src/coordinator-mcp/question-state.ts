@@ -189,6 +189,9 @@ export interface OutboxEventV1 {
 	payload: Record<string, string | number | boolean | null>;
 	emitted: boolean;
 }
+function isOutboxEntity(value: unknown): value is OutboxEventV1["entity"] {
+	return value === "turn" || value === "question" || value === "report" || value === "session" || value === "deletion";
+}
 export interface CoordinatorSessionTransactionV1 {
 	schema_version: 1;
 	namespace_id: string;
@@ -660,7 +663,7 @@ export async function appendOutboxEvents(
 			if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
 			throw error;
 		});
-		const ids = new Set<string>();
+		const existingEvents = new Map<string, OutboxEventV1>();
 		for (const rawLine of existing.split("\n")) {
 			const line = rawLine.trim();
 			if (!line) continue;
@@ -670,18 +673,36 @@ export async function appendOutboxEvents(
 			} catch {
 				throw new Error("state_corrupt");
 			}
+			const candidate = parsed as Partial<OutboxEventV1>;
 			if (
 				typeof parsed !== "object" ||
 				parsed === null ||
 				Array.isArray(parsed) ||
-				typeof (parsed as { id?: unknown }).id !== "string" ||
-				(parsed as { id: string }).id.length === 0 ||
-				ids.has((parsed as { id: string }).id)
+				typeof candidate.id !== "string" ||
+				candidate.id.length === 0 ||
+				typeof candidate.transaction_revision !== "number" ||
+				!Number.isSafeInteger(candidate.transaction_revision) ||
+				candidate.transaction_revision <= 0 ||
+				typeof candidate.kind !== "string" ||
+				!candidate.kind ||
+				!isOutboxEntity(candidate.entity) ||
+				typeof candidate.entity_id !== "string" ||
+				!candidate.entity_id ||
+				typeof candidate.payload !== "object" ||
+				candidate.payload === null ||
+				typeof candidate.emitted !== "boolean" ||
+				existingEvents.has(candidate.id)
 			)
 				throw new Error("state_corrupt");
-			ids.add((parsed as { id: string }).id);
+			existingEvents.set(candidate.id, candidate as OutboxEventV1);
 		}
-		const events = Object.values(transaction.outbox).filter(event => !event.emitted && !ids.has(event.id));
+		const events = Object.values(transaction.outbox).filter(event => {
+			if (event.emitted) return false;
+			const existing = existingEvents.get(event.id);
+			if (!existing) return true;
+			if (JSON.stringify(existing) !== JSON.stringify(event)) throw new Error("state_corrupt");
+			return false;
+		});
 		if (events.length > 0) {
 			await appendCoordinatorFile(paths.journal, `${events.map(event => JSON.stringify(event)).join("\n")}\n`);
 		}
