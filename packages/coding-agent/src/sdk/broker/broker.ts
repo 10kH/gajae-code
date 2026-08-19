@@ -1141,16 +1141,19 @@ export class Broker {
 		}
 		if (this.#stopping || this.#publication !== publication) return;
 		if (observation === "owned") {
-			// Recover the cached publication state synchronously with the observation
-			// so request admission does not lag behind the awaited heartbeat IO.
-			// The heartbeat write that follows re-checks fresh publication authority
-			// and fences (downgrading this optimistic recovery) if ownership changed
-			// between the observation and the write.
+			// Recover the cached publication state from the observation, but keep
+			// startup admission closed until the heartbeat write has revalidated fresh
+			// authority. A replacement can win between this observation and that write;
+			// reopening here would admit lifecycle work under stale authority.
 			this.#publicationState = "healthy-owned";
-			this.#startupAdmissions.reopen();
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
-			if (writeHeartbeat) await this.#writeHeartbeat();
+			if (writeHeartbeat) {
+				await this.#writeHeartbeat();
+				if (this.#stopping || this.#publication !== publication || this.#publicationState !== "healthy-owned")
+					return;
+			}
+			this.#startupAdmissions.reopen();
 			if (this.#publicationState === "healthy-owned") await this.#checkpointSessionHeartbeats();
 			return;
 		}
