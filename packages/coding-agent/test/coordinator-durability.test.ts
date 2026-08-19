@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -192,6 +192,30 @@ describe("Coordinator durability", () => {
 			).rejects.toMatchObject({ code: "EIO" });
 			expect(calls).toEqual(["file-sync"]);
 		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves append write and close failures and leaves no staged artifact", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-durability-"));
+		const file = path.join(root, "event-journal.jsonl");
+		const realOpen = fs.open;
+		const open = spyOn(fs, "open").mockImplementation(async (...args) => {
+			if (args[0] === file)
+				return {
+					async writeFile(): Promise<void> {
+						throw errno("EIO");
+					},
+					async close(): Promise<void> {
+						throw errno("EACCES");
+					},
+				} as unknown as fs.FileHandle;
+			return await realOpen(...args);
+		});
+		try {
+			await expect(appendCoordinatorFile(file, "event\n")).rejects.toBeInstanceOf(AggregateError);
+		} finally {
+			open.mockRestore();
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});

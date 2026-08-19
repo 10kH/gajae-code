@@ -121,40 +121,52 @@ async function writeAtomic(file: string, value: unknown): Promise<void> {
 async function writeExclusive(file: string, value: unknown): Promise<boolean> {
 	await ensureCoordinatorDirectory(path.dirname(file));
 	const temp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-	const handle = await fs.open(temp, "wx", 0o600);
+	let linked = false;
+	let result = false;
+	let primaryError: unknown;
 	try {
-		await handle.writeFile(JSON.stringify(value));
-		await syncCoordinatorFile(handle);
-	} finally {
-		await handle.close();
-	}
-	try {
-		await fs.link(temp, file);
-	} catch (error) {
-		await fs.unlink(temp);
-		if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-			await syncCoordinatorDirectory(path.dirname(file));
-			return false;
+		const handle = await fs.open(temp, "wx", 0o600);
+		let writeError: unknown;
+		try {
+			await handle.writeFile(JSON.stringify(value));
+			await syncCoordinatorFile(handle);
+		} catch (error) {
+			writeError = error;
 		}
-		throw error;
-	}
-	let barrierError: unknown;
-	try {
-		await syncCoordinatorDirectory(path.dirname(file));
+		try {
+			await handle.close();
+		} catch (closeError) {
+			if (writeError) throw new AggregateError([writeError, closeError], "exclusive write and close failed");
+			throw closeError;
+		}
+		if (writeError) throw writeError;
+		try {
+			await fs.link(temp, file);
+			linked = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			await syncCoordinatorDirectory(path.dirname(file));
+			result = false;
+		}
+		if (linked) {
+			await syncCoordinatorDirectory(path.dirname(file));
+			result = true;
+		}
 	} catch (error) {
-		barrierError = error;
+		primaryError = error;
 	}
 	let cleanupError: unknown;
 	try {
 		await fs.unlink(temp);
 	} catch (error) {
-		cleanupError = error;
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") cleanupError = error;
 	}
-	if (barrierError && cleanupError) throw new AggregateError([barrierError, cleanupError]);
-	if (barrierError) throw barrierError;
+	if (primaryError && cleanupError)
+		throw new AggregateError([primaryError, cleanupError], "exclusive publication and cleanup failed");
+	if (primaryError) throw primaryError;
 	if (cleanupError) throw cleanupError;
-	await syncCoordinatorDirectory(path.dirname(file));
-	return true;
+	if (linked) await syncCoordinatorDirectory(path.dirname(file));
+	return result;
 }
 
 async function readJson<T>(file: string): Promise<T | null> {

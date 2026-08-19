@@ -109,12 +109,20 @@ export async function appendCoordinatorFile(
 ): Promise<void> {
 	await ensureCoordinatorDirectory(path.dirname(file), options);
 	const handle = await fs.open(file, "a", 0o600);
+	let writeError: unknown;
 	try {
 		await handle.writeFile(contents);
 		await syncCoordinatorFile(handle, options);
-	} finally {
-		await handle.close();
+	} catch (error) {
+		writeError = error;
 	}
+	try {
+		await handle.close();
+	} catch (closeError) {
+		if (writeError) throw new AggregateError([writeError, closeError], "coordinator append and close failed");
+		throw closeError;
+	}
+	if (writeError) throw writeError;
 	try {
 		await syncCoordinatorDirectory(path.dirname(file), options);
 	} catch (error) {

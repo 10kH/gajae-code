@@ -324,8 +324,15 @@ async function removeCoordinatorStateFile(file: string): Promise<void> {
 	try {
 		await fs.lstat(file);
 	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
-		throw error;
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		try {
+			await fs.stat(path.dirname(file));
+		} catch (parentError) {
+			if ((parentError as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw parentError;
+		}
+		await syncCoordinatorDirectory(path.dirname(file));
+		return;
 	}
 	await fs.rm(file);
 	await syncCoordinatorDirectory(path.dirname(file));
