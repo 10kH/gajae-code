@@ -466,18 +466,26 @@ export interface BuildVolatileProjectContextOptions {
 	cwd?: string;
 	/** Clock source for the rendered local date/time. Default: `new Date()`. */
 	now?: Date;
-	/** Override the rendered local date. Default: derived from `now`. */
+	/** Trusted/test-only override in the derived `YYYY-MM-DD (Www)` or `YYYY-MM-DD` format. */
 	date?: string;
-	/** Override the rendered local clock time. Default: derived from `now`. */
+	/** Trusted/test-only override in the derived `HH:MM UTC±HH:MM (IANA/Zone)` format. */
 	localTime?: string;
 	workspaceTree?: WorkspaceTree;
 }
 
+const LOCAL_DATE_OVERRIDE_PATTERN = /^\d{4}-\d{2}-\d{2}(?: \([A-Z][a-z]{2}\))?$/u;
+const LOCAL_TIME_OVERRIDE_PATTERN =
+	/^\d{2}:\d{2} UTC[+-]\d{2}:\d{2} \([A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*\)$/u;
+
 export function buildVolatileProjectContext(options: BuildVolatileProjectContextOptions = {}): string {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 	const local = getLocalTimeContext(options.now ?? new Date());
-	const date = escapePromptMetadata(options.date ?? local.date);
-	const localTime = escapePromptMetadata(options.localTime ?? local.time);
+	const date = escapePromptMetadata(
+		options.date && LOCAL_DATE_OVERRIDE_PATTERN.test(options.date) ? options.date : local.date,
+	);
+	const localTime = escapePromptMetadata(
+		options.localTime && LOCAL_TIME_OVERRIDE_PATTERN.test(options.localTime) ? options.localTime : local.time,
+	);
 	return prompt
 		.render(volatileProjectContextTemplate, {
 			date,

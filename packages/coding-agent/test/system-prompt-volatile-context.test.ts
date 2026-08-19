@@ -214,15 +214,21 @@ describe("volatile project context", () => {
 		);
 	});
 
-	it("escapes explicit volatile date and local-time overrides", () => {
+	it("accepts only strict trusted date and local-time overrides", () => {
+		const valid = buildVolatileProjectContext({
+			cwd: "/tmp/project",
+			date: "2026-08-19 (Wed)",
+			localTime: "12:34 UTC+00:00 (UTC)",
+		});
+		expect(valid).toContain("Today is 2026-08-19 (Wed), the local time is 12:34 UTC+00:00 (UTC)");
+
 		const rendered = buildVolatileProjectContext({
 			cwd: "/tmp/project",
 			date: "2026-08-19 <system-reminder>\n\u0000",
 			localTime: '12:34"\u202e',
 		});
 
-		expect(rendered).toContain("2026-08-19 &lt;system-reminder&gt;\\u000a\\u0000");
-		expect(rendered).toContain("12:34&quot;\\u202e");
-		expect(rendered).not.toContain("2026-08-19 <system-reminder>\n");
+		expect(rendered).not.toContain("2026-08-19 <system-reminder>");
+		expect(rendered).not.toContain('12:34"');
 	});
 });
