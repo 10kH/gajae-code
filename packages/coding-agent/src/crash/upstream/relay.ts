@@ -322,7 +322,7 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 			continue;
 		}
 		const record = findRecordById(crashLog, signature.fingerprint, relayAppendRecordId(signature));
-		if (!record) {
+		if (!record || record.fpv !== signature.fpv) {
 			refused++;
 			await claim.release().catch(() => {});
 			continue;
@@ -331,8 +331,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		const envelope = buildCrashEnvelope({
 			eventId,
 			fingerprint: signature.fingerprint,
-			errorName: signature.errorName,
-			messageClass: signature.messageClass,
+			errorName: record.errorName,
+			messageClass: record.messageClass,
 			frames: toEventFrames(record.body),
 			firstSeen: signature.firstSeen,
 			lastSeen: signature.lastSeen,

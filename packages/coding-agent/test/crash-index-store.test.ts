@@ -595,9 +595,7 @@ describe("parseCrashIndex", () => {
 			NOW,
 		);
 		expect(parsed?.signatures[fingerprintFor(1)]).toBeDefined();
-		expect(parsed?.signatures[fingerprintFor(1)]?.lastAppendRecordId).toBe(
-			valid.signatures[fingerprintFor(1)]?.lastRecordId,
-		);
+		expect(parsed?.signatures[fingerprintFor(1)]?.lastAppendRecordId).toBeUndefined();
 	});
 
 	it.each([
