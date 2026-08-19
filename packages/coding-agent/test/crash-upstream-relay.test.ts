@@ -651,6 +651,25 @@ describe("relayCrashSignatures", () => {
 		expect(called).toBe(0);
 	});
 
+	test("a symlinked crash log is refused before any post", async () => {
+		await seed();
+		const target = path.join(dir, "outside-crash.log");
+		await fs.rename(paths.crashLog, target);
+		await fs.symlink(target, paths.crashLog);
+		let called = 0;
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async () => {
+				called++;
+				return new Response("", { status: 200 });
+			},
+		});
+		expect(outcome).toEqual({ status: "skipped", reason: "nothing-to-relay" });
+		expect(called).toBe(0);
+	});
+
 	test("never sends more than the per-run cap", async () => {
 		for (let i = 0; i < 4; i++) {
 			const label = String.fromCharCode(97 + i);

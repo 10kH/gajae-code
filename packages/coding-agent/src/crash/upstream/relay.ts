@@ -56,6 +56,25 @@ export const CRASH_UPSTREAM_DSN_ENV = "GJC_CRASH_SENTRY_DSN";
 const MAX_RELAY_PER_RUN = 8;
 const RELAY_TIMEOUT_MS = 10_000;
 const RELAY_CLAIM_TTL_MS = RELAY_TIMEOUT_MS * 2;
+const CRASH_LOG_READ_MAX_BYTES = 1024 * 1024;
+const NOFOLLOW = typeof fs.constants.O_NOFOLLOW === "number" ? fs.constants.O_NOFOLLOW : 0;
+
+async function readCrashLogNoFollow(filePath: string): Promise<string | undefined> {
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(filePath, fs.constants.O_RDONLY | NOFOLLOW);
+		const stat = await handle.stat();
+		if (!stat.isFile()) return undefined;
+		const length = Math.min(stat.size, CRASH_LOG_READ_MAX_BYTES);
+		const buffer = Buffer.allocUnsafe(length);
+		await handle.read(buffer, 0, length, Math.max(0, stat.size - length));
+		return buffer.toString("utf8");
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => {});
+	}
+}
 
 export interface CrashRelayConfig {
 	readonly upstream: "off" | "sentry";
@@ -299,10 +318,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		.slice(0, limit);
 	if (signatures.length === 0) return { status: "skipped", reason: "nothing-to-relay" };
 
-	let crashLog = "";
-	try {
-		crashLog = await fs.readFile(paths.crashLog, "utf8");
-	} catch {
+	const crashLog = await readCrashLogNoFollow(paths.crashLog);
+	if (crashLog === undefined) {
 		// A missing or unreadable log means no stack to attach; the signature
 		// metadata alone is not worth a send.
 		return { status: "skipped", reason: "nothing-to-relay" };
