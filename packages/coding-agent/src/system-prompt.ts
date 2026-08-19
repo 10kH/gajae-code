@@ -456,7 +456,8 @@ export function getLocalTimeContext(now: Date = new Date(), timeZone?: string): 
 		logger.warn("Could not resolve host timezone for volatile project context; falling back to UTC", {
 			error: String(error),
 		});
-		const iso = now.toISOString();
+		const fallbackNow = Number.isFinite(now.getTime()) ? now : new Date(0);
+		const iso = fallbackNow.toISOString();
 		return { date: iso.slice(0, 10), time: `${iso.slice(11, 16)} UTC+00:00 (UTC)` };
 	}
 }
@@ -475,8 +476,8 @@ export interface BuildVolatileProjectContextOptions {
 export function buildVolatileProjectContext(options: BuildVolatileProjectContextOptions = {}): string {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 	const local = getLocalTimeContext(options.now ?? new Date());
-	const date = options.date ?? local.date;
-	const localTime = options.localTime ?? local.time;
+	const date = escapePromptMetadata(options.date ?? local.date);
+	const localTime = escapePromptMetadata(options.localTime ?? local.time);
 	return prompt
 		.render(volatileProjectContextTemplate, {
 			date,

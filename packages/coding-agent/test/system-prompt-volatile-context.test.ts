@@ -149,6 +149,29 @@ describe("volatile project context", () => {
 		});
 	});
 
+	it("tracks daylight-saving transitions and falls back for an invalid zone", () => {
+		expect(getLocalTimeContext(new Date("2026-03-08T06:30:00Z"), "America/New_York")).toEqual({
+			date: "2026-03-08 (Sun)",
+			time: "01:30 UTC-05:00 (America/New_York)",
+		});
+		expect(getLocalTimeContext(new Date("2026-03-08T07:30:00Z"), "America/New_York")).toEqual({
+			date: "2026-03-08 (Sun)",
+			time: "03:30 UTC-04:00 (America/New_York)",
+		});
+		expect(getLocalTimeContext(new Date("2026-11-01T05:30:00Z"), "America/New_York")).toEqual({
+			date: "2026-11-01 (Sun)",
+			time: "01:30 UTC-04:00 (America/New_York)",
+		});
+		expect(getLocalTimeContext(new Date("2026-11-01T06:30:00Z"), "America/New_York")).toEqual({
+			date: "2026-11-01 (Sun)",
+			time: "01:30 UTC-05:00 (America/New_York)",
+		});
+		expect(getLocalTimeContext(new Date("2026-08-19T15:30:00Z"), "Invalid/Timezone")).toEqual({
+			date: "2026-08-19",
+			time: "15:30 UTC+00:00 (UTC)",
+		});
+	});
+
 	it("defaults to the host zone and injects the clock plus UTC conversion guidance every turn", () => {
 		const instant = new Date("2026-08-19T15:30:00Z");
 		const host = getLocalTimeContext(instant);
@@ -162,7 +185,7 @@ describe("volatile project context", () => {
 		expect(rendered).toContain(
 			`Today is ${host.date}, the local time is ${host.time}, and the current working directory is '/tmp/project'.`,
 		);
-		expect(rendered).toContain("convert them to the local timezone above when reporting times to the user");
+		expect(rendered).toContain("convert timestamps that are explicitly UTC to the local timezone above");
 	});
 
 	it("keeps the local clock out of the stable system prefix", async () => {
@@ -177,5 +200,29 @@ describe("volatile project context", () => {
 
 		expect(stablePrefix).not.toContain("the local time is");
 		expect(stablePrefix).not.toContain("UTC+");
+	});
+
+	it("falls back to a deterministic UTC context for invalid dates", () => {
+		const invalidDate = new Date(Number.NaN);
+
+		expect(getLocalTimeContext(invalidDate, "Invalid/Timezone")).toEqual({
+			date: "1970-01-01",
+			time: "00:00 UTC+00:00 (UTC)",
+		});
+		expect(buildVolatileProjectContext({ cwd: "/tmp/project", now: invalidDate })).toContain(
+			"Today is 1970-01-01, the local time is 00:00 UTC+00:00 (UTC)",
+		);
+	});
+
+	it("escapes explicit volatile date and local-time overrides", () => {
+		const rendered = buildVolatileProjectContext({
+			cwd: "/tmp/project",
+			date: "2026-08-19 <system-reminder>\n\u0000",
+			localTime: '12:34"\u202e',
+		});
+
+		expect(rendered).toContain("2026-08-19 &lt;system-reminder&gt;\\u000a\\u0000");
+		expect(rendered).toContain("12:34&quot;\\u202e");
+		expect(rendered).not.toContain("2026-08-19 <system-reminder>\n");
 	});
 });
