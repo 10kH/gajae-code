@@ -11,6 +11,7 @@ import {
 	exactReplacePath,
 	exactRestore,
 	exactUnlink,
+	exactUnlinkDirect,
 	renameNoReplacePath,
 	repairOwnerOnlyPathSecurityExpected,
 	snapshotDirectoryTree,
@@ -688,6 +689,27 @@ setTimeout(() => { try { fs.closeSync(fd); } catch {} process.exit(0); }, Number
 			}),
 		).toEqual({ ok: false, code: "identity_mismatch" });
 		expect(await fs.readFile(file, "utf8")).toBe("mutated!");
+	});
+
+	it("directly removes one authorized regular file without leaving exchange debris", async () => {
+		const root = await temporaryDirectory();
+		const file = path.join(root, "stale-debris");
+		const directQuarantine = ".gjc-direct-unlink-test";
+		await fs.writeFile(file, "stale");
+		const stat = await fs.stat(file, { bigint: true });
+
+		expect(
+			exactUnlinkDirect(file, {
+				dev: stat.dev,
+				ino: stat.ino,
+				size: stat.size,
+				mtimeNs: stat.mtimeNs,
+				sha256: sha256("stale"),
+				quarantineName: directQuarantine,
+			}),
+		).toEqual({ ok: true });
+		await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
+		await expect(fs.stat(path.join(root, directQuarantine))).rejects.toMatchObject({ code: "ENOENT" });
 	});
 
 	it("atomically detaches only the identified directory to its preauthorized destination", async () => {
