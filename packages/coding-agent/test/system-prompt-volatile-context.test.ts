@@ -227,8 +227,15 @@ describe("volatile project context", () => {
 			date: "2026-08-19 <system-reminder>\n\u0000",
 			localTime: '12:34"\u202e',
 		});
+		const impossible = buildVolatileProjectContext({
+			cwd: "/tmp/project",
+			date: "2026-99-99 (Wed)",
+			localTime: "25:99 UTC+99:99 (UTC)",
+		});
 
 		expect(rendered).not.toContain("2026-08-19 <system-reminder>");
 		expect(rendered).not.toContain('12:34"');
+		expect(impossible).not.toContain("2026-99-99");
+		expect(impossible).not.toContain("25:99 UTC+99:99");
 	});
 });

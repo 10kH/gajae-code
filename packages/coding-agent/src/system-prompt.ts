@@ -473,18 +473,47 @@ export interface BuildVolatileProjectContextOptions {
 	workspaceTree?: WorkspaceTree;
 }
 
-const LOCAL_DATE_OVERRIDE_PATTERN = /^\d{4}-\d{2}-\d{2}(?: \([A-Z][a-z]{2}\))?$/u;
+const LOCAL_DATE_OVERRIDE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})(?: \(([A-Z][a-z]{2})\))?$/u;
 const LOCAL_TIME_OVERRIDE_PATTERN =
-	/^\d{2}:\d{2} UTC[+-]\d{2}:\d{2} \([A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*\)$/u;
+	/^(\d{2}):(\d{2}) UTC([+-])(\d{2}):(\d{2}) \(([A-Za-z0-9_+-]+(?:\/[A-Za-z0-9_+-]+)*)\)$/u;
+
+function isValidLocalDateOverride(value: string): boolean {
+	const match = LOCAL_DATE_OVERRIDE_PATTERN.exec(value);
+	if (!match) return false;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const instant = new Date(Date.UTC(2000, month - 1, day));
+	instant.setUTCFullYear(year);
+	if (
+		instant.getUTCFullYear() !== year ||
+		instant.getUTCMonth() !== month - 1 ||
+		instant.getUTCDate() !== day
+	)
+		return false;
+	const weekday = match[4];
+	if (!weekday) return true;
+	return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][instant.getUTCDay()] === weekday;
+}
+
+function isValidLocalTimeOverride(value: string): boolean {
+	const match = LOCAL_TIME_OVERRIDE_PATTERN.exec(value);
+	if (!match) return false;
+	const hour = Number(match[1]);
+	const minute = Number(match[2]);
+	const offsetHour = Number(match[4]);
+	const offsetMinute = Number(match[5]);
+	return hour < 24 && minute < 60 && offsetHour < 24 && offsetMinute < 60;
+}
 
 export function buildVolatileProjectContext(options: BuildVolatileProjectContextOptions = {}): string {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 	const local = getLocalTimeContext(options.now ?? new Date());
 	const date = escapePromptMetadata(
-		options.date && LOCAL_DATE_OVERRIDE_PATTERN.test(options.date) ? options.date : local.date,
+		options.date && isValidLocalDateOverride(options.date) ? options.date : local.date,
 	);
 	const localTime = escapePromptMetadata(
-		options.localTime && LOCAL_TIME_OVERRIDE_PATTERN.test(options.localTime) ? options.localTime : local.time,
+		options.localTime && isValidLocalTimeOverride(options.localTime) ? options.localTime : local.time,
 	);
 	return prompt
 		.render(volatileProjectContextTemplate, {
