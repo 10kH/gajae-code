@@ -5151,25 +5151,36 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										idempotencyKey,
 									),
 								);
+								const createdSessionId = optionalString(created.sessionId ?? created.session_id);
 								/**
 								 * Preparation is only real when the broker proves it. A create that
 								 * silently published readiness would leave a live session whose root
 								 * is already claimed, so the session is closed rather than reported
-								 * as prepared.
+								 * what the schema promises. Reject a non-boolean before any mutation.
 								 */
 								if (preparesExistingThread && created.readiness !== "prepared") {
-									const unpreparedId = optionalString(created.sessionId ?? created.session_id);
+									if (!createdSessionId)
+										throw new SdkClientError(
+											UNOBSERVED_COMPENSATION_CODE,
+											"SDK broker did not prepare the requested session and returned no usable session identity.",
+											{ creation_response: created },
+										);
+									const unpreparedId = safeExternalId("session", createdSessionId);
+									remoteSession.value = unpreparedId;
 									let compensated = true;
 									if (unpreparedId) {
-										compensated = await brokerSession(
-											cwd,
-											"session.close",
-											{ sessionId: unpreparedId },
-											`${idempotencyKey}:unprepared-close`,
-										).then(
-											() => true,
-											() => false,
-										);
+										try {
+											brokerResult(
+												await brokerSession(
+													cwd,
+													"session.close",
+													{ sessionId: unpreparedId },
+													`${idempotencyKey}:unprepared-close`,
+												),
+											);
+										} catch {
+											compensated = false;
+										}
 									}
 									// A swallowed compensation leaves a live, untracked session while
 									// idempotency seals the failure, so exact retries only replay the
@@ -5186,7 +5197,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 										"SDK broker did not prepare the requested session.",
 									);
 								}
-								const createdSessionId = optionalString(created.sessionId ?? created.session_id);
 								if (!createdSessionId)
 									throw new SdkClientError(
 										UNOBSERVED_COMPENSATION_CODE,

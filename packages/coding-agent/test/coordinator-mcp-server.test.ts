@@ -988,6 +988,49 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
 	});
 
+	it("does not seal a prepared-session failure when compensation is rejected", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create")
+					return { ok: true, result: { sessionId: "unprepared-session", readiness: "ready", cwd: root } };
+				if (operation === "session.close")
+					return { ok: false, error: { code: "close_refused", message: "close refused" } };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepared-close-rejected",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(2);
+	});
+
+	it("classifies a prepared-session response without identity as unobserved", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation =>
+				operation === "session.create" ? { ok: true, result: { readiness: "ready", cwd: root } } : undefined,
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			prepare_existing_thread: true,
+			idempotency_key: "prepared-missing-identity",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(0);
+	});
+
 	it("preserves multiline delegated task text in one SDK turn.prompt control", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
