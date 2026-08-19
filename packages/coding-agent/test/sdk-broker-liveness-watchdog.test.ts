@@ -181,6 +181,35 @@ test("a stale watchdog observation cannot reopen startup admission after lost-ro
 	}
 });
 
+test("a stale watchdog observation cannot mutate a restarted broker generation", async () => {
+	const originalRetain = native.retainBrokerPublication;
+	const observation = Promise.withResolvers<{ kind: "owned" }>();
+	let retainCount = 0;
+	const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(agentDir => {
+		const publication = originalRetain(agentDir);
+		retainCount += 1;
+		if (retainCount !== 1) return publication;
+		return {
+			observe: publication.observe.bind(publication),
+			observeAsync: () => observation.promise,
+			heartbeatAsync: publication.heartbeatAsync.bind(publication),
+			syncAsync: publication.syncAsync.bind(publication),
+			close: publication.close.bind(publication),
+		} as never;
+	});
+	try {
+		const broker = await startBroker();
+		await Bun.sleep(WATCHDOG_CADENCE_MS * 2);
+		await broker.stop();
+		await broker.start();
+		observation.resolve({ kind: "owned" });
+		await Bun.sleep(0);
+		expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
+	} finally {
+		retain.mockRestore();
+	}
+});
+
 test("a heartbeat that resumes before the deadline clears the accrued stall", async () => {
 	const broker = await startBroker();
 	setLivenessGraceForTest(broker, WATCHDOG_CADENCE_MS * 12);
