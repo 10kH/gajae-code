@@ -1350,10 +1350,7 @@ export class SessionIndex {
 	async #rotate(): Promise<void> {
 		await this.#snapshotUnderLock();
 		const file = logFor(this.#agentDir);
-		const temporary = `${file}.${process.pid}.tmp`;
-		await fs.writeFile(temporary, "", { mode: 0o600 });
-		await fs.rename(temporary, file);
-		await syncDirectory(file);
+		await replaceAtomically(file, "");
 		this.#logOffset = 0;
 	}
 

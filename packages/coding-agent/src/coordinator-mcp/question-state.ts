@@ -691,10 +691,24 @@ export async function appendOutboxEvents(
 				typeof candidate.payload !== "object" ||
 				candidate.payload === null ||
 				typeof candidate.emitted !== "boolean" ||
+				!candidate.id.startsWith("txn:") ||
 				existingEvents.has(candidate.id)
 			)
 				throw new Error("state_corrupt");
 			existingEvents.set(candidate.id, candidate as OutboxEventV1);
+		}
+		for (const event of Object.values(transaction.outbox)) {
+			if (
+				event.id !==
+				deterministicOutboxId(
+					transaction.session_id,
+					event.transaction_revision,
+					event.kind,
+					event.entity,
+					event.entity_id,
+				)
+			)
+				throw new Error("state_corrupt");
 		}
 		const events = Object.values(transaction.outbox).filter(event => {
 			if (event.emitted) return false;

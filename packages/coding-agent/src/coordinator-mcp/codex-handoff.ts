@@ -443,7 +443,7 @@ export async function updateCodexWakeEvent(
 	const file = eventPathForKey(namespaceDir, key);
 	if (patch.status !== undefined && !["pending", "published", "acked", "failed"].includes(patch.status))
 		throw new Error("invalid_wake_event_status");
-	if (patch.attempts_delta !== undefined && !Number.isInteger(patch.attempts_delta))
+	if (patch.attempts_delta !== undefined && (!Number.isSafeInteger(patch.attempts_delta) || patch.attempts_delta < 0))
 		throw new Error("invalid_attempts_delta");
 	return await withFileLock(file, async () => {
 		const event = await readJson<CodexWakeEventV1>(file);

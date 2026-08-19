@@ -1390,10 +1390,12 @@ async function readLatestEventSeq(namespaceDir: string): Promise<number> {
 	} catch (error) {
 		logger.warn("Coordinator sequence cache unreadable; recovering from journal", { error: String(error) });
 	}
+	const events = await readCoordinatorEvents(namespaceDir);
+	const journalSeq = events.at(-1)?.seq ?? 0;
 	const seq = sequence?.seq;
-	let latestSeq = typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0;
-	for (const event of await readCoordinatorEvents(namespaceDir)) latestSeq = Math.max(latestSeq, event.seq);
-	return latestSeq;
+	if (typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0 && seq > journalSeq)
+		throw new Error("state_corrupt");
+	return journalSeq;
 }
 
 const eventAppendQueues = new Map<string, Promise<unknown>>();
@@ -1808,7 +1810,10 @@ async function readCoordinatorEvents(namespaceDir: string): Promise<CoordinatorE
 			seenSeqs.add(event.seq);
 			events.push(event);
 		}
-		return events.sort((left, right) => left.seq - right.seq);
+		events.sort((left, right) => left.seq - right.seq);
+		for (let index = 0; index < events.length; index += 1)
+			if (events[index]!.seq !== index + 1) throw new Error("state_corrupt");
+		return events;
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 		throw error;
