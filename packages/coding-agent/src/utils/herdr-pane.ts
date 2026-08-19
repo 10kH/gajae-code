@@ -25,6 +25,14 @@ import { logger } from "@gajae-code/utils";
 const HERDR_ENV = "HERDR_ENV";
 const HERDR_PANE_ID_ENV = "HERDR_PANE_ID";
 const HERDR_BIN_PATH_ENV = "HERDR_BIN_PATH";
+/**
+ * Stamped into the environment by the process that claims a pane, and therefore
+ * inherited by everything it spawns. Herdr's pane variables are inherited the
+ * same way, so without this marker a nested gjc — an agent shelling out to
+ * `gjc doctor`, a scripted `gjc -p`, a subagent — looks exactly like the pane's
+ * own session and claims the very same `custom:gjc` authority.
+ */
+const HERDR_PANE_OWNER_ENV = "GJC_HERDR_PANE_OWNER";
 const HERDR_COMMAND = "herdr";
 const AGENT_LABEL = "gjc";
 const SOURCE = "custom:gjc";
@@ -81,6 +89,9 @@ export interface HerdrReportProcess {
 export interface HerdrReporterOptions {
 	env?: NodeJS.ProcessEnv;
 	which?: (command: string) => string | null;
+	/** Identity written into the ownership marker. Injectable so the nested-process
+	 * case is testable without actually forking. */
+	pid?: number;
 	spawn?: (
 		command: string[],
 		options: { env: NodeJS.ProcessEnv; stdin: "ignore"; stdout: "ignore"; stderr: "ignore" },
@@ -119,6 +130,9 @@ function defaultSpawn(
  * unverified path scavenged from an install layout is a command this process
  * would execute, and PATH/`HERDR_BIN_PATH` are the trust boundary Herdr itself
  * documents.
+ *
+ * Also returns null when an ancestor gjc already owns this pane, so a nested
+ * invocation reports nothing at all.
  */
 export function resolveHerdrPaneEnvironment(options: HerdrReporterOptions = {}): HerdrPaneEnvironment | null {
 	const env = options.env ?? process.env;
@@ -131,6 +145,14 @@ export function resolveHerdrPaneEnvironment(options: HerdrReporterOptions = {}):
 	// by the herdr CLI as an option.
 	if (!paneId || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(paneId)) return null;
 
+	// A descendant must stay silent: it would claim the pane away from the session
+	// the user is actually looking at, and on exit it releases that authority and
+	// clears the title. Herdr's per-source sequence is a monotonic watermark, and
+	// the descendant seeds its own from a later wall clock, so every subsequent
+	// report from the real session is below the watermark and dropped. The pane
+	// then vanishes from the agent list until the session is restarted.
+	if (!ownsPane(env, paneId, options.pid ?? process.pid)) return null;
+
 	const configured = env[HERDR_BIN_PATH_ENV]?.trim();
 	if (configured) return { paneId, binPath: configured };
 
@@ -142,6 +164,21 @@ export function resolveHerdrPaneEnvironment(options: HerdrReporterOptions = {}):
 		logger.debug("herdr binary lookup failed", { error: String(error) });
 		return null;
 	}
+}
+
+/**
+ * Whether this process may report for `paneId`. True when nothing has claimed
+ * the pane yet, or when the standing claim is this process's own. A claim for a
+ * different pane is ignored rather than trusted: a stale marker inherited from
+ * an unrelated pane must not silence a legitimate session.
+ */
+function ownsPane(env: NodeJS.ProcessEnv, paneId: string, pid: number): boolean {
+	const claim = env[HERDR_PANE_OWNER_ENV]?.trim();
+	if (!claim) return true;
+	const separator = claim.lastIndexOf(":");
+	if (separator <= 0) return true;
+	if (claim.slice(0, separator) !== paneId) return true;
+	return claim.slice(separator + 1) === String(pid);
 }
 
 /** Build the argv for a state report. Exported for tests. */
@@ -352,6 +389,13 @@ export function installHerdrReporter(
 ): HerdrReporter | null {
 	const paneEnv = resolveHerdrPaneEnvironment(options);
 	if (!paneEnv) return null;
+
+	// Claim the pane before the first report. Written to the live environment so
+	// every process this session spawns inherits it and defers to this one; the
+	// claim dies with the process, which is exactly when the pane is up for grabs
+	// again.
+	const env = options.env ?? process.env;
+	env[HERDR_PANE_OWNER_ENV] = `${paneEnv.paneId}:${options.pid ?? process.pid}`;
 
 	const reporter = createHerdrReporter(paneEnv, subscribe, options);
 	// `exit` handlers must be synchronous; release() only spawns and returns.
