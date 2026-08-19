@@ -84,6 +84,7 @@ test("the retained heartbeat never runs its blocking write or fsync on the JS th
 	// a reintroduced JS-thread call fails loudly instead of silently wedging.
 	const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
 		observe: () => ({ kind: "owned" }),
+		observeAsync: () => Promise.resolve({ kind: "owned" }),
 		heartbeat: () => {
 			throw new Error("blocking heartbeat write must not run on the JS thread");
 		},
@@ -112,6 +113,33 @@ test("the retained heartbeat never runs its blocking write or fsync on the JS th
 		expect(await publication.heartbeat(now + 1)).toBe(true);
 	} finally {
 		publication.close();
+		retain.mockRestore();
+	}
+});
+
+test("the watchdog observes retained publication asynchronously", async () => {
+	const originalRetain = native.retainBrokerPublication;
+	const synchronousObserve = vi.fn(() => {
+		throw new Error("watchdog must not use synchronous publication observation");
+	});
+	const asynchronousObserve = vi.fn(async () => ({ kind: "owned" as const }));
+	const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(agentDir => {
+		const publication = originalRetain(agentDir);
+		return {
+			observe: synchronousObserve,
+			observeAsync: asynchronousObserve,
+			heartbeatAsync: publication.heartbeatAsync.bind(publication),
+			syncAsync: publication.syncAsync.bind(publication),
+			close: publication.close.bind(publication),
+		} as never;
+	});
+	try {
+		const broker = await startBroker();
+		setHeartbeatStallForTest(broker, true);
+		await Bun.sleep(WATCHDOG_CADENCE_MS * 2);
+		expect(asynchronousObserve).toHaveBeenCalled();
+		expect(synchronousObserve).not.toHaveBeenCalled();
+	} finally {
 		retain.mockRestore();
 	}
 });

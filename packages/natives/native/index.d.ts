@@ -99,6 +99,8 @@ export declare class NativeRetainedBrokerPublication {
    * writer lock, so an unresolved heartbeat cannot block it.
    */
   observe(): NativeBrokerPublicationObservation
+  /** Read-only observation on the libuv blocking pool for watchdog paths. */
+  observeAsync(): Promise<NativeBrokerPublicationObservation>
   /**
    * Positional heartbeat write on the libuv blocking pool. The write is an
    * unbounded `pwrite` against retained authority: on the JS thread a stalled
@@ -889,12 +891,13 @@ export declare function exactUnlink(path: string, identity: NativeExactFileIdent
 
 /**
  * Delete only the regular file that still has the supplied platform identity,
- * without the exchange/quarantine protocol used by [`exact_unlink`]. This is
- * reserved for already-detached inert debris: the operation first moves the
- * pathname to the caller's private no-replace quarantine, verifies the moved
- * object, and only then unlinks that private name. A successor published at
- * the original pathname is therefore never consumed by cleanup, and this
- * path cannot manufacture another exchange placeholder.
+ * without the exchange/quarantine protocol used by [`exact_unlink`].
+ *
+ * This is reserved for already-detached inert debris: the operation first
+ * moves the pathname to the caller's private no-replace quarantine, verifies
+ * the moved object, and only then unlinks that private name. A successor
+ * published at the original pathname is therefore never consumed by cleanup,
+ * and this path cannot manufacture another exchange placeholder.
  */
 export declare function exactUnlinkDirect(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
