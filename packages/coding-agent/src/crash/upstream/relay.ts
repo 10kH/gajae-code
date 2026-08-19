@@ -175,7 +175,7 @@ export function isRelayDue(signature: CrashSignatureView): boolean {
 	// retain their timestamp coverage compatibility until a new append exists.
 	if (signature.lastAppendRecordId !== undefined) {
 		if (signature.relayedRecordId !== undefined) return signature.relayedRecordId !== appendId;
-		return signature.relayedAt === undefined || signature.relayedAt < signature.lastSeen;
+		return true;
 	}
 	if (signature.relayedRecordId !== undefined) {
 		if (signature.relayedRecordId === appendId) return false;

@@ -262,9 +262,8 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 		firstSeen: raw.firstSeen,
 		lastSeen: raw.lastSeen,
 		lastRecordId: raw.lastRecordId,
-		// Legacy entries do not carry append order. Recovery reconstructs it from
-		// the append-only crash log; keeping it absent here preserves downgrade
-		// wall-clock compatibility until that reconstruction has evidence.
+		// Legacy entries do not carry append order. Keep it absent until a new
+		// journal occurrence supplies authoritative append-order evidence.
 		...(typeof raw.lastAppendRecordId === "string" ? { lastAppendRecordId: raw.lastAppendRecordId } : {}),
 	};
 	const optional: readonly [keyof CrashSignatureEntry, unknown][] = [
@@ -636,11 +635,6 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 				if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
 					index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
 			}
-		} else if (entry.lastAppendRecordId === undefined) {
-			// A legacy index may have no append watermark. The recoverable log is
-			// authoritative for the latest appended identity, including backdated
-			// and equal-time records.
-			entry.lastAppendRecordId = lastAppended.recordId;
 		}
 	}
 }

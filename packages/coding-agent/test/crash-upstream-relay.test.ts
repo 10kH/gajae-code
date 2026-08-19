@@ -97,7 +97,7 @@ describe("isRelayDue", () => {
 	});
 
 	test("a legacy relayedAt covering lastSeen is not due after upgrade", () => {
-		expect(isRelayDue(signature({ relayedAt: 1_700_000_900_000 }))).toBe(false);
+		expect(isRelayDue(signature({ lastAppendRecordId: undefined, relayedAt: 1_700_000_900_000 }))).toBe(false);
 	});
 
 	test("a legacy relayedAt older than lastSeen is due after upgrade", () => {
