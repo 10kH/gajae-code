@@ -1,6 +1,7 @@
 import { Command } from "@gajae-code/utils/cli";
 import { ensureWorkflowSettingsMigrated } from "../config/settings";
 import {
+	assertExplicitTargetGjcNotSymlinked,
 	type RalplanCommandResult,
 	resolveRalplanTargetRoot,
 	runNativeRalplanCommand,
@@ -11,6 +12,7 @@ import { CommandError } from "../gjc-runtime/workflow-cli-common";
 export async function runRalplanCliCommand(args: string[], cwd: string): Promise<RalplanCommandResult> {
 	try {
 		const target = await resolveRalplanTargetRoot(args, cwd);
+		if (target.explicit) await assertExplicitTargetGjcNotSymlinked(target.root);
 		await ensureWorkflowSettingsMigrated(target.root);
 	} catch (error) {
 		if (error instanceof CommandError) return { status: error.exitStatus, stderr: `${error.message}\n` };
