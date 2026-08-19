@@ -1105,7 +1105,8 @@ export class Broker {
 		return process.hrtime.bigint() - this.#publishedAt >= BigInt(this.#livenessGraceMs()) * 1_000_000n;
 	}
 	async #watchPublication(writeHeartbeat = true): Promise<void> {
-		if (!this.#publication || this.#publicationState === "stopping") return;
+		const publication = this.#publication;
+		if (!publication || this.#publicationState === "stopping") return;
 		// Evaluated before any await, and on every tick even while an earlier tick is
 		// still in flight, so a stalled chain cannot starve the only path that ends it.
 		// The lock is deliberately left behind: this process is about to exit, and the
@@ -1123,18 +1124,18 @@ export class Broker {
 		if (this.#watchInFlight) return;
 		this.#watchInFlight = true;
 		try {
-			await this.#observePublication(writeHeartbeat);
+			await this.#observePublication(publication, writeHeartbeat);
 		} finally {
-			this.#watchInFlight = false;
+			if (this.#publication === publication) this.#watchInFlight = false;
 		}
 	}
-	async #observePublication(writeHeartbeat: boolean): Promise<void> {
-		const publication = this.#publication;
-		if (!publication || this.#publicationState === "stopping") return;
+	async #observePublication(publication: RetainedBrokerDiscovery, writeHeartbeat: boolean): Promise<void> {
+		if (this.#publication !== publication || this.#publicationState === "stopping") return;
 		let observation: BrokerPublicationObservation;
 		try {
 			observation = publicationObservationOverridesForTest.get(this) ?? (await publication.observeAsync());
 		} catch {
+			if (this.#stopping || this.#publication !== publication) return;
 			this.#fence("observation-ambiguous");
 			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
 			return;
@@ -1149,7 +1150,7 @@ export class Broker {
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
 			if (writeHeartbeat) {
-				await this.#writeHeartbeat();
+				await this.#writeHeartbeat(publication);
 				if (this.#stopping || this.#publication !== publication || this.#publicationState !== "healthy-owned")
 					return;
 			}
@@ -1160,20 +1161,23 @@ export class Broker {
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
 		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
 	}
-	async #writeHeartbeat(): Promise<void> {
-		if (!this.discovery || !this.#publication || this.#publicationState === "stopping") return;
+	async #writeHeartbeat(publication: RetainedBrokerDiscovery): Promise<void> {
+		if (!this.discovery || this.#publication !== publication || this.#publicationState === "stopping") return;
 		const stall = heartbeatStallOverridesForTest.get(this);
 		if (stall) await stall.promise;
 		const heartbeatAt = Date.now();
 		try {
-			if (!(await heartbeatBrokerDiscoveryRetained(this.#publication, heartbeatAt))) {
+			if (!(await heartbeatBrokerDiscoveryRetained(publication, heartbeatAt))) {
+				if (this.#stopping || this.#publication !== publication) return;
 				this.#fence("heartbeat-ambiguous");
 				return;
 			}
 		} catch {
+			if (this.#stopping || this.#publication !== publication) return;
 			this.#fence("heartbeat-ambiguous");
 			return;
 		}
+		if (this.#stopping || this.#publication !== publication) return;
 		// The durable write landed, so liveness is proven for this cycle whatever the
 		// authority re-check below decides about this broker's cached state.
 		this.#publishedAt = process.hrtime.bigint();
@@ -1184,7 +1188,8 @@ export class Broker {
 	}
 	async heartbeat(): Promise<void> {
 		if (this.#publicationState !== "healthy-owned") return;
-		await this.#writeHeartbeat();
+		const publication = this.#publication;
+		if (publication) await this.#writeHeartbeat(publication);
 	}
 	/** Re-observes provably live session hosts and checkpoints their liveness. */
 	async heartbeatSessions(now = Date.now()): Promise<number> {
