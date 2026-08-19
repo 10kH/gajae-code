@@ -1,7 +1,11 @@
 import { once } from "@gajae-code/utils";
 import type { ModelManagerOptions } from "../model-manager";
+import { buildZCodeSourceHeaders } from "../providers/anthropic";
 import { fetchOpenCodexModels, OPENCODEX_MODEL_CACHE_TTL_MS } from "../providers/openai-opencodex-responses";
 import { fetchCodexModels } from "../utils/discovery/codex";
+import { fetchOpenAICompatibleModels } from "../utils/discovery/openai-compatible";
+import { GLM_ZCODE_ANTHROPIC_BASE_URL } from "../utils/oauth/glm-zcode";
+import { createBundledReferenceMap } from "./bundled-references";
 export function openCodexModelManagerOptions(): ModelManagerOptions<"openai-responses"> {
 	return {
 		providerId: "opencodex",
@@ -78,12 +82,48 @@ export function zaiModelManagerOptions(_config: ZaiModelManagerConfig = {}): Mod
 // GLM ZCode (unofficial Z.AI OAuth)
 // ---------------------------------------------------------------------------
 
-export interface GlmZcodeModelManagerConfig {}
+export interface GlmZcodeModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
 
 export function glmZcodeModelManagerOptions(
-	_config: GlmZcodeModelManagerConfig = {},
+	config: GlmZcodeModelManagerConfig = {},
 ): ModelManagerOptions<"anthropic-messages"> {
-	return { providerId: "glm-zcode" };
+	const apiKey = config.apiKey;
+	const baseUrl = (config.baseUrl ?? GLM_ZCODE_ANTHROPIC_BASE_URL).replace(/\/+$/, "");
+	const references = createBundledReferenceMap<"anthropic-messages">("glm-zcode");
+	return {
+		providerId: "glm-zcode",
+		...(apiKey
+			? {
+					fetchDynamicModels: () =>
+						fetchOpenAICompatibleModels({
+							api: "anthropic-messages",
+							provider: "glm-zcode",
+							baseUrl: baseUrl.endsWith("/v1") ? baseUrl : `${baseUrl}/v1`,
+							apiKey,
+							headers: {
+								...buildZCodeSourceHeaders(),
+								"anthropic-version": "2023-06-01",
+								"anthropic-dangerous-direct-browser-access": "true",
+							},
+							mapModel: (entry, defaults) => {
+								const reference = references.get(defaults.id);
+								if (!reference) return defaults;
+								return {
+									...reference,
+									id: defaults.id,
+									name: typeof entry.name === "string" && entry.name.length > 0 ? entry.name : reference.name,
+									baseUrl,
+									contextWindow: defaults.contextWindow > 0 ? defaults.contextWindow : reference.contextWindow,
+									maxTokens: defaults.maxTokens > 0 ? defaults.maxTokens : reference.maxTokens,
+								};
+							},
+						}),
+				}
+			: undefined),
+	};
 }
 // ---------------------------------------------------------------------------
 // JetBrains Junie (JetBrains AI Service, Ingrazzio gateway)

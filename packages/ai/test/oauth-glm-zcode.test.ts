@@ -5,6 +5,7 @@ import * as path from "node:path";
 
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { getBundledModel } from "../src/models";
+import { glmZcodeModelManagerOptions } from "../src/provider-models/special";
 import {
 	buildAnthropicClientOptions,
 	buildAnthropicHeaders,
@@ -22,6 +23,7 @@ import {
 	isGlmZcodeOAuthConfigured,
 	refreshGlmZcodeToken,
 } from "../src/utils/oauth/glm-zcode";
+
 import { withEnv } from "./helpers";
 
 const originalFetch = global.fetch;
@@ -264,6 +266,29 @@ describe("GLM ZCode OAuth login provider", () => {
 		expect(model).toBeDefined();
 		expect(model.provider).toBe("glm-zcode");
 		expect(model.api).toBe("anthropic-messages");
+	});
+
+	it("discovers the current GLM catalog through the authenticated ZCode model endpoint", async () => {
+		const requests: Array<{ url: string; headers: Headers }> = [];
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+			requests.push({ url: String(input), headers: new Headers(init?.headers) });
+			return new Response(JSON.stringify({ data: [{ id: "glm-5.3", name: "GLM-5.3", context_length: 200000 }] }), {
+				headers: { "Content-Type": "application/json" },
+			});
+		}) as typeof fetch;
+		try {
+			const models = await fetchDynamicModels();
+			expect(models?.map(model => model.id)).toEqual(["glm-5.3"]);
+			expect(requests[0]?.url).toBe(`${GLM_ZCODE_ANTHROPIC_BASE_URL}/v1/models`);
+			expect(requests[0]?.headers.get("authorization")).toBe(`Bearer ${MINTED_KEY}`);
+			expect(requests[0]?.headers.get("x-zcode-agent")).toBe("glm");
+		} finally {
+			global.fetch = originalFetch;
+		}
 	});
 
 	it("pins the request base to api.z.ai even if model.baseUrl was polluted", () => {
