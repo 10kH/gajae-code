@@ -698,8 +698,8 @@ describe("SDK broker identity and discovery", () => {
 		}) as typeof setInterval);
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
 			observe: () => ({ kind: "owned" }),
-			heartbeat: () => ({ kind: ++heartbeatAttempts === 1 ? "failed" : "written" }),
-			sync: () => ({ kind: "synced" }),
+			heartbeatAsync: () => Promise.resolve({ kind: ++heartbeatAttempts === 1 ? "failed" : "written" }),
+			syncAsync: () => Promise.resolve({ kind: "synced" }),
 			close: () => ({ kind: "closed" }),
 		} as never);
 		const broker = new Broker({ agentDir: dir });
@@ -732,8 +732,8 @@ describe("SDK broker identity and discovery", () => {
 		}) as typeof setInterval);
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
 			observe: () => ({ kind: observation }),
-			heartbeat: () => ({ kind: ++heartbeatAttempts === 1 ? "failed" : "written" }),
-			sync: () => ({ kind: "synced" }),
+			heartbeatAsync: () => Promise.resolve({ kind: ++heartbeatAttempts === 1 ? "failed" : "written" }),
+			syncAsync: () => Promise.resolve({ kind: "synced" }),
 			close: () => ({ kind: "closed" }),
 		} as never);
 		const broker = new Broker({ agentDir: dir });
