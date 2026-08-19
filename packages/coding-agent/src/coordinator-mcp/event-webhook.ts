@@ -1,5 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { $credentialEnv } from "@gajae-code/utils/env";
 import { withFileLock } from "../config/file-lock";
 
 /**
@@ -27,12 +28,19 @@ interface WebhookDeliveryRecord {
 	last_error: string | null;
 }
 
+/** Result of one webhook POST attempt; 2xx is ok, anything else carries the reason. */
+interface WebhookPostOutcome {
+	ok: boolean;
+	status: number | null;
+	error: string | null;
+}
+
 export interface WebhookDelivery {
 	/** Called with the exact JSON body to POST and per-attempt request options. */
 	post(
 		body: string,
 		options: { url: string; token: string | null; timeoutMs: number; signal: AbortSignal },
-	): Promise<{ ok: boolean; status: number | null; error: string | null }>;
+	): Promise<WebhookPostOutcome>;
 	/** Test seam: delay between retries; default is `Bun.sleep`. */
 	sleep(ms: number): Promise<void>;
 	/** Monotonic-ish clock for deadline math; default is `Date.now`. */
@@ -74,8 +82,24 @@ const WEBHOOK_BACKOFF_CAP_MS = 15_000;
 const WEBHOOK_ERROR_CAP = 240;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 
-export function parseEventWebhookConfig(env: NodeJS.ProcessEnv): EventWebhookConfig | null {
-	const rawUrl = env.GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL?.trim();
+/**
+ * Trusted-source resolution for the five webhook variables. Egress destination
+ * and the token-file path must never come from the caller's cwd `.env` overlay:
+ * Bun loads that overlay into `process.env`, so a raw `process.env` read would
+ * let any repository select where coordinator journal rows are POSTed.
+ * `$credentialEnv` consults only the inherited environment and GJC/user-owned
+ * env files, exactly like the crash relay's DSN. Callers that own a fully
+ * controlled environment (tests, rendered hermes blocks) pass `explicitEnv`;
+ * production entry points must omit it and resolve through the trusted source.
+ */
+function webhookEnvValue(explicitEnv: NodeJS.ProcessEnv | undefined, name: string): string | undefined {
+	const explicit = explicitEnv?.[name]?.trim();
+	if (explicit) return explicit;
+	return $credentialEnv(name)?.trim() || undefined;
+}
+
+export function parseEventWebhookConfig(explicitEnv?: NodeJS.ProcessEnv): EventWebhookConfig | null {
+	const rawUrl = webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL");
 	if (!rawUrl) return null;
 	let parsed: URL;
 	try {
@@ -86,7 +110,7 @@ export function parseEventWebhookConfig(env: NodeJS.ProcessEnv): EventWebhookCon
 	const hostname = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
 	if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && LOOPBACK_HOSTS.has(hostname)))
 		throw new Error("coordinator_event_webhook_url_not_allowed");
-	const rawSessions = env.GJC_COORDINATOR_MCP_EVENT_WEBHOOK_SESSION_IDS?.trim();
+	const rawSessions = webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_SESSION_IDS");
 	const sessionIds = rawSessions
 		? new Set(
 				rawSessions
@@ -95,14 +119,20 @@ export function parseEventWebhookConfig(env: NodeJS.ProcessEnv): EventWebhookCon
 					.filter(value => /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(value)),
 			)
 		: null;
-	const tokenFile = env.GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE?.trim() ?? "";
+	const tokenFile = webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE") ?? "";
 	if (tokenFile !== "" && !path.isAbsolute(tokenFile)) throw new Error("coordinator_event_webhook_token_file_invalid");
-	const timeoutRaw = Number.parseInt(env.GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS ?? "", 10);
+	const timeoutRaw = Number.parseInt(
+		webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS") ?? "",
+		10,
+	);
 	const timeoutMs =
 		Number.isFinite(timeoutRaw) && timeoutRaw > 0
 			? Math.min(timeoutRaw, MAX_EVENT_WEBHOOK_TIMEOUT_MS)
 			: DEFAULT_EVENT_WEBHOOK_TIMEOUT_MS;
-	const attemptsRaw = Number.parseInt(env.GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS ?? "", 10);
+	const attemptsRaw = Number.parseInt(
+		webhookEnvValue(explicitEnv, "GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS") ?? "",
+		10,
+	);
 	const maxAttempts =
 		Number.isFinite(attemptsRaw) && attemptsRaw > 0
 			? Math.min(attemptsRaw, MAX_EVENT_WEBHOOK_MAX_ATTEMPTS)
@@ -191,7 +221,7 @@ export async function deliverEventWebhook(
 			const controller = new AbortController();
 			const timer = setTimeout(() => controller.abort(), config.timeoutMs);
 			timer.unref?.();
-			let outcome: Awaited<ReturnType<WebhookDelivery["post"]>>;
+			let outcome: WebhookPostOutcome;
 			try {
 				outcome = await delivery.post(body, {
 					url: config.url,

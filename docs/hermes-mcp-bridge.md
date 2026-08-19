@@ -226,7 +226,7 @@ Each event is a bounded JSONL record with `schema_version`, monotonic namespace-
 
 Issue #4706: the journal can additionally be pushed to one operator-configured webhook. This is delivery of **existing** rows only — no new event kinds, no MCP transport change (`push_subscriptions` stays `false`).
 
-Configuration is env-only and default-off; no MCP tool can set, read, or unset it:
+Configuration is env-only, default-off, and resolved through the **trusted credential environment** (inherited shell environment and GJC/user-owned env files) — the checkout's `.env` cannot supply these values, so a repository cannot choose where coordinator rows are POSTed. No MCP tool can set, read, or unset it:
 
 | Variable | Effect |
 |---|---|

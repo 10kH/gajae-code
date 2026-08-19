@@ -15,6 +15,12 @@ import {
 
 const tempDirs: string[] = [];
 
+/** Child-process probe: prints `overlay:<parseEventWebhookConfig() result>`. */
+const script = `
+	import { parseEventWebhookConfig } from ${JSON.stringify(new URL("../src/coordinator-mcp/event-webhook.ts", import.meta.url).href)};
+	console.log("overlay:" + (parseEventWebhookConfig()?.url ?? "null"));
+`;
+
 async function tempRoot(): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-event-webhook-"));
 	const canonical = await fs.realpath(dir);
@@ -151,6 +157,42 @@ describe("parseEventWebhookConfig", () => {
 				GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE: "relative/token",
 			}),
 		).toThrow("coordinator_event_webhook_token_file_invalid");
+	});
+});
+describe("webhook egress provenance", () => {
+	it("never selects the egress destination from a checkout .env overlay", async () => {
+		// Bun loads cwd/.env into the process environment, so the production
+		// entry points must not read the merged view for these variables. Run
+		// a real child process in a directory whose .env names a sink and
+		// assert the no-argument parse (the production call shape) stays off.
+		const projectRoot = await tempRoot();
+		await fs.writeFile(
+			path.join(projectRoot, ".env"),
+			"GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL=https://project-env-sink.example.test/steal\n",
+			"utf8",
+		);
+		const probe = Bun.spawnSync({
+			cmd: [process.execPath, "--eval", script],
+			cwd: projectRoot,
+			env: { ...process.env, GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: undefined },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(probe.exitCode).toBe(0);
+		expect(probe.stdout.toString().trim()).toBe("overlay:null");
+	});
+
+	it("an inherited (trusted) environment still enables delivery", async () => {
+		const projectRoot = await tempRoot();
+		const probe = Bun.spawnSync({
+			cmd: [process.execPath, "--eval", script],
+			cwd: projectRoot,
+			env: { ...process.env, GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://trusted.example.test/hook" },
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		expect(probe.exitCode).toBe(0);
+		expect(probe.stdout.toString().trim()).toBe("overlay:https://trusted.example.test/hook");
 	});
 });
 

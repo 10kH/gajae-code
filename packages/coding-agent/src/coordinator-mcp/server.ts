@@ -2432,7 +2432,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	);
 	let eventWebhookConfig: EventWebhookConfig | null;
 	try {
-		eventWebhookConfig = parseEventWebhookConfig(env);
+		// `env` here may be the merged process environment, which Bun has
+		// already loaded the cwd `.env` overlay into; that is not a trusted
+		// source for an egress destination. Only an explicitly provided
+		// operator env (rendered hermes block, tests) may select it.
+		eventWebhookConfig = parseEventWebhookConfig(options.env);
 	} catch (error) {
 		// Fail closed: an invalid webhook config disables delivery rather than
 		// crashing the whole coordinator bridge. `gjc coordinator doctor`

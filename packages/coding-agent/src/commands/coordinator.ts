@@ -58,7 +58,7 @@ function coordinatorDoctorPayload(): {
 	let eventWebhookStatus: "pass" | "fail" = "pass";
 	let eventWebhookDetail = "unset; coordinator behavior unchanged";
 	try {
-		const parsed = parseEventWebhookConfig(process.env);
+		const parsed = parseEventWebhookConfig();
 		if (parsed) {
 			eventWebhookDetail = `opt-in webhook delivery enabled for ${parsed.url}${
 				parsed.sessionIds ? ` scoped to ${parsed.sessionIds.size} session(s)` : ""
