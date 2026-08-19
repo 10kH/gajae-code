@@ -1183,8 +1183,9 @@ async function listJsonFiles(dir: string): Promise<unknown[]> {
 					try {
 						return await readJsonFile(path.join(dir, entry));
 					} catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
 						logger.warn("Coordinator projection read failed", { path: entry, error: String(error) });
-						return null;
+						throw error;
 					}
 				}),
 		);
@@ -3702,37 +3703,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return { ok: false, reason: "endpoint_stale", closed: false };
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
-			await ensureQuestionStateReady();
-			await ensureQuestionTransaction(id);
-			await withSessionTransaction(questionPaths, id, async transaction => {
-				const now = new Date().toISOString();
-				transaction.requests.operations[deletionId] = {
-					operation_id: deletionId,
-					tool: "gjc_coordinator_stop_session",
-					key_digest: deletionKey,
-					request_digest: deletionKey,
-					local_id: id,
-					phase: "remote_started",
-					intent: { kind: "reap", endpoint_incarnation: persistedIncarnation },
-					created_at: now,
-					updated_at: now,
-				};
-			});
-			await recordDeletionIntent(questionPaths, {
-				deletion_id: deletionId,
-				session_id: id,
-				endpoint_incarnation: persistedIncarnation,
-				operation_id: deletionId,
-				key_digest: deletionKey,
-				request_digest: deletionKey,
-				close_key: deletionId,
-				phase: "intent",
-				cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
-				authority_digest: deletionKey,
-				created_at: new Date().toISOString(),
-				updated_at: new Date().toISOString(),
-			});
-
 			let workspace = "";
 			try {
 				workspace = await canonicalBrokerWorkspace(cwd);
@@ -3743,6 +3713,36 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					authority.endpointIncarnation !== persistedIncarnation
 				)
 					return { ok: false, reason: "endpoint_stale", closed: false };
+				await ensureQuestionStateReady();
+				await ensureQuestionTransaction(id);
+				await withSessionTransaction(questionPaths, id, async transaction => {
+					const now = new Date().toISOString();
+					transaction.requests.operations[deletionId] = {
+						operation_id: deletionId,
+						tool: "gjc_coordinator_stop_session",
+						key_digest: deletionKey,
+						request_digest: deletionKey,
+						local_id: id,
+						phase: "remote_started",
+						intent: { kind: "reap", endpoint_incarnation: persistedIncarnation },
+						created_at: now,
+						updated_at: now,
+					};
+				});
+				await recordDeletionIntent(questionPaths, {
+					deletion_id: deletionId,
+					session_id: id,
+					endpoint_incarnation: persistedIncarnation,
+					operation_id: deletionId,
+					key_digest: deletionKey,
+					request_digest: deletionKey,
+					close_key: deletionId,
+					phase: "intent",
+					cleanup: { wal: false, turns: false, reports: false, session: false, events: false },
+					authority_digest: deletionKey,
+					created_at: new Date().toISOString(),
+					updated_at: new Date().toISOString(),
+				});
 				brokerResult(
 					await brokerSession(
 						cwd,

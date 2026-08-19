@@ -674,6 +674,23 @@ export async function appendOutboxEvents(
 				throw new Error("state_corrupt");
 			}
 			const candidate = parsed as Partial<OutboxEventV1>;
+			const identity = typeof candidate.id === "string" ? candidate.id.split(":") : [];
+			const identityRevision = identity.length >= 6 ? Number(identity[2]) : Number.NaN;
+			const identityEntity = identity.length >= 6 ? identity[4] : undefined;
+			const identityEntityId = identity.length >= 6 ? identity.slice(5).join(":") : "";
+			const identitySession = identity.length >= 6 ? identity[1] : "";
+			const identityKind = identity.length >= 6 ? identity[3] : "";
+			const canonicalIdentity =
+				identity.length >= 6 &&
+				identity[0] === "txn" &&
+				identitySession &&
+				Number.isSafeInteger(identityRevision) &&
+				identityRevision > 0 &&
+				identityKind &&
+				isOutboxEntity(identityEntity) &&
+				identityEntityId &&
+				candidate.id ===
+					deterministicOutboxId(identitySession, identityRevision, identityKind, identityEntity, identityEntityId);
 			if (
 				typeof parsed !== "object" ||
 				parsed === null ||
@@ -691,7 +708,8 @@ export async function appendOutboxEvents(
 				typeof candidate.payload !== "object" ||
 				candidate.payload === null ||
 				typeof candidate.emitted !== "boolean" ||
-				!candidate.id.startsWith("txn:") ||
+				!canonicalIdentity ||
+				candidate.transaction_revision !== identityRevision ||
 				existingEvents.has(candidate.id)
 			)
 				throw new Error("state_corrupt");
