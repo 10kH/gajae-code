@@ -295,6 +295,9 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 		if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= CRASH_INDEX_ENTRY_MAX_BYTES)
 			(entry as unknown as Record<string, unknown>)[key] = value;
 	}
+	if (raw.relayedRecordId !== undefined && entry.relayedRecordId !== raw.relayedRecordId) return undefined;
+	if (Array.isArray(raw.commentedIssues) && raw.commentedIssues.length > 0 && entry.commentedIssues === undefined)
+		return undefined;
 	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) return undefined;
 	return entry;
 }

@@ -257,11 +257,15 @@ class DirResolver {
 			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", snapshot)) ??
 			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", snapshot)) ??
 			CONFIG_DIR_NAME;
-		const declaredHome = snapshot.values.HOME ?? snapshot.values.USERPROFILE;
-		const runtimeHome = process.env.HOME ?? process.env.USERPROFILE;
+		const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+		const fallbackHomeKey = authoritativeHomeKey === "HOME" ? "USERPROFILE" : "HOME";
+		const declaredHome = snapshot.values[authoritativeHomeKey] ?? snapshot.values[fallbackHomeKey];
+		const runtimeHome = process.env[authoritativeHomeKey] ?? process.env[fallbackHomeKey];
 		this.#trustedHome =
 			declaredHome !== undefined &&
-			(snapshot.dynamic.has("HOME") || snapshot.dynamic.has("USERPROFILE") || declaredHome === runtimeHome)
+			(snapshot.dynamic.has(authoritativeHomeKey) ||
+				snapshot.dynamic.has(fallbackHomeKey) ||
+				declaredHome === runtimeHome)
 				? path.parse(process.cwd()).root
 				: os.homedir();
 		this.configRoot = path.join(this.#trustedHome, this.#configDirName);

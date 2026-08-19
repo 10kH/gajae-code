@@ -5,9 +5,9 @@ import type { FileType as FileTypeEnum, glob as globFn } from "@gajae-code/nativ
 import {
 	CONFIG_DIR_NAME,
 	getConfigDirName,
-	getConfigRootDir,
 	getPluginsDir,
 	getProjectDir,
+	getTrustedHomeDir,
 	logger,
 	parseFrontmatter,
 	tryParseJson,
@@ -796,7 +796,7 @@ export function parseClaudePluginsRegistry(content: string): ClaudePluginsRegist
 export async function resolveActiveProjectRegistryPath(cwd: string): Promise<string | null> {
 	// Pass 1: walk up looking for an existing .gjc/ directory (nearest wins).
 	// Stop before the provenance-checked home — ~/.gjc/ is the user-level config dir, not a project root.
-	const homeDir = path.dirname(getConfigRootDir());
+	const homeDir = getTrustedHomeDir();
 	let dir = path.resolve(cwd);
 	while (dir !== homeDir) {
 		try {
@@ -846,7 +846,7 @@ export async function resolveOrDefaultProjectRegistryPath(cwd: string): Promise<
 	// Home directory must not be treated as a project root: the fallback path would alias
 	// getInstalledPluginsRegistryPath(), causing MarketplaceManager to load the same file
 	// as both user and project registry and producing duplicates / disambiguation errors.
-	if (path.resolve(cwd) === path.dirname(getConfigRootDir())) return undefined;
+	if (path.resolve(cwd) === getTrustedHomeDir()) return undefined;
 	return path.join(cwd, getConfigDirName(), "plugins", "installed_plugins.json");
 }
 

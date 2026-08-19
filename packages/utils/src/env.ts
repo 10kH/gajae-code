@@ -92,11 +92,15 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 // files for the credential-only snapshot.
 const projectSnapshot = loadProjectEnv();
 const projectEnv = projectSnapshot.values;
-const declaredHome = projectEnv.HOME ?? projectEnv.USERPROFILE;
-const runtimeHome = process.env.HOME ?? process.env.USERPROFILE;
+const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+const fallbackHomeKey = authoritativeHomeKey === "HOME" ? "USERPROFILE" : "HOME";
+const declaredHome = projectEnv[authoritativeHomeKey] ?? projectEnv[fallbackHomeKey];
+const runtimeHome = process.env[authoritativeHomeKey] ?? process.env[fallbackHomeKey];
 const rejectProjectHome =
 	declaredHome !== undefined &&
-	(projectSnapshot.dynamic.has("HOME") || projectSnapshot.dynamic.has("USERPROFILE") || declaredHome === runtimeHome);
+	(projectSnapshot.dynamic.has(authoritativeHomeKey) ||
+		projectSnapshot.dynamic.has(fallbackHomeKey) ||
+		declaredHome === runtimeHome);
 const trustedEnvHome = rejectProjectHome ? path.parse(process.cwd()).root : os.homedir();
 
 // Eagerly parse the trusted user's env files and the project .env (from cwd)
