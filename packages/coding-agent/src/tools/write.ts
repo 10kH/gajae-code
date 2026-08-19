@@ -17,6 +17,7 @@ import type { ToolSession } from "../sdk";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { parseArchivePathCandidates } from "./archive-reader";
+import { formatFileWriteError } from "./atomic-file-write";
 import { assertEditableFile } from "./auto-generated-guard";
 import {
 	type ConflictEntry,
@@ -748,9 +749,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				try {
 					await bridgePromise;
 				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
+					throw new ToolError(formatFileWriteError(error, absolutePath));
 				}
 				invalidateFsScanAfterWrite(absolutePath);
+				this.session.fileReadCache?.invalidate(absolutePath);
 				const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 				let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
 				if (stripped) {
@@ -759,8 +761,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return { content: [{ type: "text", text: resultText }], details: {} };
 			}
 
-			const diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
+			let diagnostics: FileDiagnosticsResult | undefined;
+			try {
+				diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
+			} catch (error) {
+				throw new ToolError(formatFileWriteError(error, absolutePath));
+			}
 			invalidateFsScanAfterWrite(absolutePath);
+			this.session.fileReadCache?.invalidate(absolutePath);
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 			let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;

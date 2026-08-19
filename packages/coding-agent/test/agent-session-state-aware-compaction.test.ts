@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage } from "@gajae-code/ai";
+import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -392,6 +392,31 @@ describe("AgentSession state-aware compaction", () => {
 		expect(skillContext).toContain("&amp;");
 		expect(skillContext).not.toContain("</additional-context>");
 		expect(skillContext).not.toContain("\n");
+	});
+	it("includes recent write paths in compaction-state extraContext", async () => {
+		const writeCall = assistantMessage("stop");
+		writeCall.content = [
+			{
+				type: "toolCall",
+				id: "write-recent",
+				name: "write",
+				arguments: { path: "frontend/e2e/zzop-repro.spec.ts", content: "test" },
+			},
+		];
+		session.agent.appendMessage(writeCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "write-recent",
+			toolName: "write",
+			content: [{ type: "text", text: "Successfully wrote 4 bytes to frontend/e2e/zzop-repro.spec.ts" }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		seedCompactionHistory();
+		await session.compact();
+		const options = compactSpy.mock.calls[0]?.[5];
+		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
+		expect(files).toContain("frontend/e2e/zzop-repro.spec.ts");
 	});
 
 	it("continues synthetic auto-continue for an active nonterminal workflow", async () => {

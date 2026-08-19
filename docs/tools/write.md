@@ -11,6 +11,7 @@
   - `packages/coding-agent/src/lsp/index.ts` — format-on-write and diagnostics writethrough.
   - `packages/coding-agent/src/tools/auto-generated-guard.ts` — block overwriting generated files.
   - `packages/coding-agent/src/tools/fs-cache-invalidation.ts` — invalidate shared FS scan caches after writes.
+  - `packages/coding-agent/src/tools/atomic-file-write.ts` — sibling temp + rename so a failed write never leaves a 0-byte destination.
   - `packages/coding-agent/src/tools/plan-mode-guard.ts` — resolve paths and enforce plan-mode write policy.
 
 ## Inputs
@@ -66,15 +67,15 @@ Single-shot result.
 6. Otherwise the tool treats `path` as a plain filesystem file.
    - `enforcePlanModeWrite(..., { op: "create" })` runs before path resolution.
    - Existing files are checked by `assertEditableFile()` to block overwriting detected generated files.
-   - The session’s writethrough callback writes content. With LSP enabled and `lsp.formatOnWrite` / `lsp.diagnosticsOnWrite` settings on, `createLspWritethrough()` may format content, sync it through LSP servers, save it, and collect diagnostics. Otherwise `writethroughNoop()` writes directly with `Bun.write()` or `file.write()`.
-   - `invalidateFsScanAfterWrite()` runs on the file path.
+   - The session’s writethrough callback writes content. With LSP enabled and `lsp.formatOnWrite` / `lsp.diagnosticsOnWrite` settings on, `createLspWritethrough()` may format content, sync it through LSP servers, save it, and collect diagnostics. Otherwise `writethroughNoop()` writes through `writeFileAtomically()` (sibling temp, then rename). Permission errors (`EACCES`/`EPERM`/`EROFS`) become a `ToolError` that says the original file was left unchanged.
+   - `invalidateFsScanAfterWrite()` and `fileReadCache.invalidate()` run on the file path.
 7. The tool returns a text result and optional diagnostics metadata.
 
 ## Modes / Variants
 ### Plain file path
 - Target is any path that does not resolve as an archive selector and does not resolve as an existing-or-new SQLite selector.
 - Existing files are overwritten.
-- `write.ts` does not call `fs.mkdir()` on this path; parent-directory creation is only implemented in the archive branch.
+- Parent directories are created by `writeFileAtomically()`. A failed write never truncates an existing destination to 0 bytes.
 
 Example:
 

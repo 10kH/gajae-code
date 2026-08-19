@@ -6,6 +6,7 @@ import type { BunFile } from "bun";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
+import { writeFileAtomically } from "../tools/atomic-file-write";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -741,15 +742,11 @@ export async function writethroughNoop(
 	dst: string,
 	content: string,
 	_signal?: AbortSignal,
-	file?: BunFile,
+	_file?: BunFile,
 	_batch?: LspWritethroughBatchRequest,
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
-	if (file) {
-		await file.write(content);
-	} else {
-		await Bun.write(dst, content);
-	}
+	await writeFileAtomically(dst, content);
 	return undefined;
 }
 
@@ -906,7 +903,7 @@ async function runLspWritethrough(
 	cwd: string,
 	options: ResolvedWritethroughOptions,
 	signal?: AbortSignal,
-	file?: BunFile,
+	_file?: BunFile,
 	deferred?: {
 		onDeferredDiagnostics: (diagnostics: FileDiagnosticsResult) => void;
 		signal: AbortSignal;
@@ -916,12 +913,12 @@ async function runLspWritethrough(
 	const config = getConfig(cwd);
 	const servers = getServersForFile(config, dst);
 	if (servers.length === 0) {
-		return writethroughNoop(dst, content, signal, file);
+		return writethroughNoop(dst, content, signal, _file);
 	}
 	const { lspServers, customLinterServers } = splitServers(servers);
 
 	let finalContent = content;
-	const writeContent = async (value: string) => (file ? file.write(value) : Bun.write(dst, value));
+	const writeContent = async (value: string) => writeFileAtomically(dst, value);
 	const getWritePromise = once(() => writeContent(finalContent));
 	const useCustomFormatter = enableFormat && customLinterServers.length > 0;
 

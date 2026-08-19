@@ -1436,6 +1436,21 @@ interface ResolvedSqliteReadPath {
 function isClientAuthorityDenial(error: unknown): boolean {
 	const code =
 		typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+	// OS errno codes are transport/availability failures, not an ACP permission
+	// decision. Treating `EPERM`/`EACCES` as denials skipped the disk fallback
+	// for files that already existed on disk.
+	if (
+		code === "EPERM" ||
+		code === "EACCES" ||
+		code === "ENOENT" ||
+		code === "EIO" ||
+		code === "EBUSY" ||
+		code === "EROFS" ||
+		code === "EISDIR" ||
+		code === "ENOTDIR"
+	) {
+		return false;
+	}
 	// ACP clients surface refusals as an application error; -32001 is the reserved
 	// client-authority denial code and -32603 covers hosts without a dedicated code.
 	if (code === "permission_denied" || code === "forbidden" || code === -32001 || code === -32603) return true;
@@ -2395,6 +2410,44 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (!bridge?.capabilities.readTextFile || !bridge.readTextFile) return undefined;
 		return bridge.readTextFile({ path: absolutePath, ...options });
 	}
+	async #readMissingPathThroughBridge(
+		absolutePath: string,
+		parsed: ParsedSelector,
+		_localReadPath: string,
+		truncation: TruncationDirection | undefined,
+		signal: AbortSignal | undefined,
+	): Promise<AgentToolResult<ReadToolDetails> | undefined> {
+		const bridgePromise = this.#routeReadThroughBridge(absolutePath);
+		if (bridgePromise === undefined) return undefined;
+		throwIfAborted(signal);
+		try {
+			const bridgeText = await bridgePromise;
+			const direction = resolveEffectiveDirection(truncation, "local-bare-stream", this.session.settings);
+			if (isMultiRange(parsed) && parsed.kind === "lines") {
+				return this.#buildInMemoryMultiRangeResult(bridgeText, parsed.ranges, {
+					details: { resolvedPath: absolutePath },
+					sourcePath: absolutePath,
+					entityLabel: "file",
+					raw: isRawSelector(parsed),
+					truncationDirection: direction,
+					cacheLinesFor: absolutePath,
+				});
+			}
+			const { offset, limit } = selToOffsetLimit(parsed);
+			return this.#buildInMemoryTextResult(bridgeText, offset, limit, {
+				details: { resolvedPath: absolutePath },
+				sourcePath: absolutePath,
+				entityLabel: "file",
+				raw: isRawSelector(parsed),
+				cacheLinesFor: absolutePath,
+				truncationDirection: direction,
+			});
+		} catch (error) {
+			if (isClientAuthorityDenial(error)) throw error;
+			logger.warn("ACP fs readTextFile failed for a path missing on disk", { path: absolutePath, error });
+			return undefined;
+		}
+	}
 
 	async #trySummarize(absolutePath: string, fileSize: number, signal?: AbortSignal): Promise<SummaryResult | null> {
 		if (fileSize > MAX_SUMMARY_BYTES) return null;
@@ -2663,6 +2716,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			isDirectory = stat.isDirectory();
 		} catch (error) {
 			if (isNotFoundError(error)) {
+				const bridged = await this.#readMissingPathThroughBridge(
+					absolutePath,
+					parsed,
+					localReadPath,
+					params.truncation,
+					signal,
+				);
+				if (bridged) return bridged;
 				// Attempt unique suffix resolution before falling back to fuzzy suggestions
 				if (!isRemoteMountPath(absolutePath)) {
 					const suffixMatch = await findUniqueSuffixMatch(localReadPath, this.session.cwd, signal);
