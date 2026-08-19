@@ -1369,7 +1369,7 @@ async function readLatestEventSeq(namespaceDir: string): Promise<number> {
 		logger.warn("Coordinator sequence cache unreadable; recovering from journal", { error: String(error) });
 	}
 	const seq = sequence?.seq;
-	let latestSeq = typeof seq === "number" && Number.isInteger(seq) && seq >= 0 ? seq : 0;
+	let latestSeq = typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0 ? seq : 0;
 	for (const event of await readCoordinatorEvents(namespaceDir)) latestSeq = Math.max(latestSeq, event.seq);
 	return latestSeq;
 }

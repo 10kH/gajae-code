@@ -654,6 +654,7 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 		if (existing.session_id !== expected.sessionId || existing.launch_id !== expected.launchId) {
 			throw runtimeReadinessMarkerConflict();
 		}
+		await syncCoordinatorDirectory(path.dirname(readinessFile));
 		return existing;
 	}
 
@@ -715,10 +716,19 @@ export async function persistCoordinatorRuntimeInputReady(): Promise<RuntimeInpu
 	} catch (error) {
 		cleanupError = error;
 	}
-	if (primaryError && cleanupError)
-		throw new AggregateError([primaryError, cleanupError], "readiness publication and cleanup failed");
-	if (primaryError) throw primaryError;
-	if (cleanupError) throw cleanupError;
+	let cleanupBarrierError: unknown;
+	if (!cleanupError) {
+		try {
+			await syncCoordinatorDirectory(path.dirname(readinessFile));
+		} catch (error) {
+			cleanupBarrierError = error;
+		}
+	}
+	const failures = [primaryError, cleanupError, cleanupBarrierError].filter(
+		(error): error is unknown => error !== undefined,
+	);
+	if (failures.length > 1) throw new AggregateError(failures, "readiness publication and cleanup failed");
+	if (failures.length === 1) throw failures[0];
 	return result;
 }
 

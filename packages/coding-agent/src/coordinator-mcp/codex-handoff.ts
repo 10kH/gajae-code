@@ -124,8 +124,10 @@ async function writeExclusive(file: string, value: unknown): Promise<boolean> {
 	let linked = false;
 	let result = false;
 	let primaryError: unknown;
+	let tempCreated = false;
 	try {
 		const handle = await fs.open(temp, "wx", 0o600);
+		tempCreated = true;
 		let writeError: unknown;
 		try {
 			await handle.writeFile(JSON.stringify(value));
@@ -156,16 +158,26 @@ async function writeExclusive(file: string, value: unknown): Promise<boolean> {
 		primaryError = error;
 	}
 	let cleanupError: unknown;
-	try {
-		await fs.unlink(temp);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ENOENT") cleanupError = error;
+	if (tempCreated) {
+		try {
+			await fs.unlink(temp);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") cleanupError = error;
+		}
 	}
-	if (primaryError && cleanupError)
-		throw new AggregateError([primaryError, cleanupError], "exclusive publication and cleanup failed");
-	if (primaryError) throw primaryError;
-	if (cleanupError) throw cleanupError;
-	if (linked) await syncCoordinatorDirectory(path.dirname(file));
+	let cleanupBarrierError: unknown;
+	if (tempCreated && !cleanupError) {
+		try {
+			await syncCoordinatorDirectory(path.dirname(file));
+		} catch (error) {
+			cleanupBarrierError = error;
+		}
+	}
+	const failures = [primaryError, cleanupError, cleanupBarrierError].filter(
+		(error): error is unknown => error !== undefined,
+	);
+	if (failures.length > 1) throw new AggregateError(failures, "exclusive publication and cleanup failed");
+	if (failures.length === 1) throw failures[0];
 	return result;
 }
 
