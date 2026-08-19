@@ -1012,6 +1012,29 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(2);
 	});
 
+	it("treats a malformed compensation close response as unobserved", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create")
+					return { ok: true, result: { sessionId: "malformed-close-session", cwd: root } };
+				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
+				if (operation === "session.close") return {};
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "malformed-close-compensation",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false, error: { code: "broker_compensation_unobserved" } });
+		expect(controls.filter(control => control.operation === "session.close")).toHaveLength(1);
+	});
+
 	it("classifies a prepared-session response without identity as unobserved", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

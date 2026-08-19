@@ -3490,7 +3490,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const sessionId = remoteSession.value;
 			if (!sessionId) throw error;
 			try {
-				brokerResult(await brokerSession(cwd, "session.close", { sessionId }, `${sessionId}:compensate-create`));
+				strictBrokerResult(
+					await brokerSession(cwd, "session.close", { sessionId }, `${sessionId}:compensate-create`),
+					"session.close",
+				);
 			} catch (closeError) {
 				throw new SdkClientError(
 					UNOBSERVED_COMPENSATION_CODE,
@@ -3512,6 +3515,25 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			);
 		}
 		return asRecord(response?.result) ?? response ?? {};
+	}
+
+	function strictBrokerResult(value: unknown, operation: string): Record<string, unknown> {
+		const response = asRecord(value);
+		if (response?.ok === false) brokerResult(response);
+		if (response?.ok !== true || !Object.hasOwn(response, "result"))
+			throw new SdkClientError(
+				UNOBSERVED_COMPENSATION_CODE,
+				`SDK broker returned a malformed ${operation} response; the lifecycle outcome is unobserved.`,
+				{ response },
+			);
+		const result = asRecord(response.result);
+		if (!result)
+			throw new SdkClientError(
+				UNOBSERVED_COMPENSATION_CODE,
+				`SDK broker returned a malformed ${operation} result; the lifecycle outcome is unobserved.`,
+				{ response },
+			);
+		return result;
 	}
 
 	async function paginatedBrokerSessionList(
@@ -3754,7 +3776,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					created_at: new Date().toISOString(),
 					updated_at: new Date().toISOString(),
 				});
-				brokerResult(
+				strictBrokerResult(
 					await brokerSession(
 						cwd,
 						"session.close",
@@ -3765,6 +3787,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						},
 						`coordinator-reap:${id}:${authority.endpointIncarnation}`,
 					),
+					"session.close",
 				);
 			} catch (error) {
 				return {
@@ -5170,13 +5193,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									let compensated = true;
 									if (unpreparedId) {
 										try {
-											brokerResult(
+											strictBrokerResult(
 												await brokerSession(
 													cwd,
 													"session.close",
 													{ sessionId: unpreparedId },
 													`${idempotencyKey}:unprepared-close`,
 												),
+												"session.close",
 											);
 										} catch {
 											compensated = false;
