@@ -53,6 +53,13 @@ import {
 	publishCodexWake,
 } from "./codex-wake-publisher";
 import {
+	createDefaultEventWebhookDelivery,
+	deliverEventWebhook,
+	type EventWebhookConfig,
+	parseEventWebhookConfig,
+	type WebhookDelivery,
+} from "./event-webhook";
+import {
 	type CoordinatorModelProfileLoader,
 	loadCoordinatorModelProfiles,
 	resolveCoordinatorMpreset,
@@ -192,6 +199,7 @@ interface CoordinatorServices {
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
 	canonicalizePath?: (value: string) => Promise<string>;
 	codexTransportFactory?: CodexTransportFactory;
+	eventWebhookDelivery?: WebhookDelivery;
 }
 
 interface CoordinatorMcpServerOptions {
@@ -1342,6 +1350,47 @@ async function readLatestEventSeq(namespaceDir: string): Promise<number> {
 const eventAppendQueues = new Map<string, Promise<unknown>>();
 const codexWakeTransportFactories = new Map<string, CodexTransportFactory>();
 const codexWakePublishTails = new Map<string, Promise<void>>();
+const eventWebhookConfigs = new Map<string, EventWebhookConfig | null>();
+const eventWebhookDeliveries = new Map<string, WebhookDelivery>();
+const eventWebhookTails = new Map<string, Promise<void>>();
+const EVENT_WEBHOOK_ERROR_CAP = 240;
+
+async function appendEventWebhookDiagnostic(namespaceDir: string, eventId: string, error: unknown): Promise<void> {
+	const code =
+		error instanceof Error && /^[a-z0-9_]+$/.test(error.message)
+			? error.message.slice(0, EVENT_WEBHOOK_ERROR_CAP)
+			: "event_webhook_delivery_failed";
+	const line = `${new Date().toISOString()} event=${eventId} error=${code}\n`;
+	try {
+		await fs.appendFile(path.join(namespaceDir, "event-webhook-errors.log"), line.slice(0, 512), { mode: 0o600 });
+	} catch {
+		// Diagnostics are best-effort; sink problems must never propagate upward.
+	}
+}
+
+function enqueueEventWebhook(namespaceDir: string, event: CoordinatorEvent): void {
+	const config = eventWebhookConfigs.get(namespaceDir);
+	if (config === null || config === undefined) return;
+	const delivery = eventWebhookDeliveries.get(namespaceDir);
+	if (!delivery) return;
+	const previous = eventWebhookTails.get(namespaceDir) ?? Promise.resolve();
+	const next = previous
+		.then(async () => {
+			await deliverEventWebhook(namespaceDir, config, event, () => JSON.stringify(event), delivery);
+		})
+		.catch(async error => {
+			await appendEventWebhookDiagnostic(namespaceDir, event.id, error);
+		});
+	eventWebhookTails.set(namespaceDir, next);
+	void next.finally(() => {
+		if (eventWebhookTails.get(namespaceDir) === next) eventWebhookTails.delete(namespaceDir);
+	});
+}
+
+/** Test-only helper that waits for queued event webhook deliveries in a namespace. */
+export async function awaitEventWebhookDeliveriesForTest(namespaceDir: string): Promise<void> {
+	await Promise.all([...eventWebhookTails.entries()].filter(([key]) => key === namespaceDir).map(([, tail]) => tail));
+}
 
 const CODEX_WAKE_ERROR_CAP = 240;
 const CODEX_WAKE_DIAGNOSTIC_CAP = 512;
@@ -1642,6 +1691,7 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 			return null;
 		});
 		if (codexWake) enqueueCodexWakePublish(namespaceDir, codexWake.handoff);
+		if (eventWebhookConfigs.has(namespaceDir)) enqueueEventWebhook(namespaceDir, event);
 		return event;
 	} finally {
 		release();
@@ -2380,6 +2430,30 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		namespaceDir,
 		services.codexTransportFactory ?? createDefaultCodexTransportFactory(),
 	);
+	let eventWebhookConfig: EventWebhookConfig | null;
+	try {
+		eventWebhookConfig = parseEventWebhookConfig(env);
+	} catch (error) {
+		// Fail closed: an invalid webhook config disables delivery rather than
+		// crashing the whole coordinator bridge. `gjc coordinator doctor`
+		// surfaces the same error as a failing check.
+		eventWebhookConfig = null;
+		const reason = error instanceof Error ? error.message : "coordinator_event_webhook_invalid";
+		void (async () => {
+			try {
+				await fs.mkdir(namespaceDir, { recursive: true });
+				await fs.appendFile(
+					path.join(namespaceDir, "event-webhook-errors.log"),
+					`${new Date().toISOString()} config_error=${reason}\n`,
+					{ mode: 0o600 },
+				);
+			} catch {
+				// Diagnostics are best-effort; delivery stays disabled either way.
+			}
+		})();
+	}
+	eventWebhookConfigs.set(namespaceDir, eventWebhookConfig);
+	eventWebhookDeliveries.set(namespaceDir, services.eventWebhookDelivery ?? createDefaultEventWebhookDelivery());
 	void (async () => {
 		try {
 			for (const handoff of await listCodexHandoffs(namespaceDir)) enqueueCodexWakePublish(namespaceDir, handoff);

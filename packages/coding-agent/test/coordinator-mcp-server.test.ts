@@ -11,6 +11,7 @@ import {
 import {
 	appendCoordinatorEventForTest,
 	awaitCodexWakePublishesForTest,
+	awaitEventWebhookDeliveriesForTest,
 	createCoordinatorMcpServer,
 } from "../src/coordinator-mcp/server";
 import { withSessionStateFileLock } from "../src/gjc-runtime/session-state-lock";
@@ -90,6 +91,11 @@ type SdkControlServerOptions = {
 	codexTransportFactory?: NonNullable<
 		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
 	>["codexTransportFactory"];
+	eventWebhookDelivery?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["eventWebhookDelivery"];
+	/** Extra env layered into the coordinator server env for webhook opt-in tests. */
+	eventWebhookEnv?: Record<string, string>;
 };
 function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(control => control.operation !== "session.list");
@@ -269,6 +275,7 @@ async function createSdkControlServer(
 			...(serverOptions.promptAckTimeoutMs === undefined
 				? {}
 				: { GJC_COORDINATOR_MCP_PROMPT_ACK_TIMEOUT_MS: String(serverOptions.promptAckTimeoutMs) }),
+			...(serverOptions.eventWebhookEnv ?? {}),
 		},
 		platform: serverOptions.platform,
 		services: {
@@ -276,6 +283,7 @@ async function createSdkControlServer(
 			resolveModelProfiles: () => new Map([["codex-eco", { name: "codex-eco" }]]),
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
+			eventWebhookDelivery: serverOptions.eventWebhookDelivery,
 			connectBroker: async () =>
 				({
 					global: async (
@@ -2971,6 +2979,100 @@ describe("Coordinator MCP canonical SDK controls", () => {
 			"report.written",
 		]);
 		expect(lifecycleControls(controls)).toEqual([]);
+	});
+	it("delivers the same journal row to the opt-in webhook and over MCP with the same id", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const posts: Array<{ body: string; token: string | null }> = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			eventWebhookEnv: { GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://sink.example.test/hook" },
+			eventWebhookDelivery: {
+				post: async (body, options) => {
+					posts.push({ body, token: options.token });
+					return { ok: true, status: 200, error: null };
+				},
+				sleep: async () => {},
+				now: () => Date.now(),
+			},
+		});
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "Awaiting SDK turn completion.",
+			idempotency_key: "report-webhook-1",
+			allow_mutation: true,
+		});
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await awaitEventWebhookDeliveriesForTest(namespace);
+		const events = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
+		const journalRows = events.events as Array<Record<string, unknown>>;
+		expect(journalRows.map(row => row.kind)).toEqual([
+			"session.state_changed",
+			"session.registered",
+			"report.written",
+		]);
+		const delivered = posts.map(post => JSON.parse(post.body) as Record<string, unknown>);
+		expect(delivered.map(row => row.id)).toEqual(journalRows.map(row => row.id));
+		expect(delivered.map(row => row.seq)).toEqual(journalRows.map(row => row.seq));
+		// One POST per row, same logical body, no token by default.
+		expect(posts).toHaveLength(3);
+		expect(posts.every(post => post.token === null)).toBe(true);
+	});
+	it("posts nothing to any webhook when no webhook is configured", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const posts: string[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			eventWebhookDelivery: {
+				post: async body => {
+					posts.push(body);
+					return { ok: true, status: 200, error: null };
+				},
+				sleep: async () => {},
+				now: () => Date.now(),
+			},
+		});
+		await registerSdkSession(server, root);
+		await server.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "No webhook configured.",
+			idempotency_key: "report-no-webhook-1",
+			allow_mutation: true,
+		});
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await awaitEventWebhookDeliveriesForTest(namespace);
+		expect(posts).toEqual([]);
+		await expect(fs.readdir(path.join(namespace, "webhook-outbox"))).rejects.toMatchObject({
+			code: "ENOENT",
+		});
+		const events = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
+		expect((events.events as unknown[]).length).toBeGreaterThan(0);
+	});
+	it("disables webhook delivery instead of crashing when webhook config is invalid", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const posts: string[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			eventWebhookEnv: { GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "http://169.254.169.254/latest/meta-data" },
+			eventWebhookDelivery: {
+				post: async body => {
+					posts.push(body);
+					return { ok: true, status: 200, error: null };
+				},
+				sleep: async () => {},
+				now: () => Date.now(),
+			},
+		});
+		await registerSdkSession(server, root);
+		const events = await server.callTool("gjc_coordinator_watch_events", { after_seq: 0 });
+		expect((events.events as unknown[]).length).toBeGreaterThan(0);
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await awaitEventWebhookDeliveriesForTest(namespace);
+		expect(posts).toEqual([]);
+		const diagnostic = await fs.readFile(path.join(namespace, "event-webhook-errors.log"), "utf8");
+		expect(diagnostic).toContain("coordinator_event_webhook_url_not_allowed");
 	});
 	it("closes an idle ephemeral coordinator session through incarnation-bound broker lifecycle authority", async () => {
 		const root = await tempRoot();
