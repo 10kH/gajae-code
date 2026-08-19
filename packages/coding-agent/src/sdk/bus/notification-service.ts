@@ -16,11 +16,16 @@ import * as fsSync from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
-let nativeNotificationBindings: typeof import("@gajae-code/natives") | undefined;
+type NativeExactUnlinkBinding = typeof import("@gajae-code/natives")["exactUnlink"];
+type NativeNotificationBindings = typeof import("@gajae-code/natives") & {
+	exactUnlinkDirect: NativeExactUnlinkBinding;
+};
 
-function nativeNotification(): typeof import("@gajae-code/natives") {
+let nativeNotificationBindings: NativeNotificationBindings | undefined;
+
+function nativeNotification(): NativeNotificationBindings {
 	if (!nativeNotificationBindings)
-		nativeNotificationBindings = require("@gajae-code/natives") as typeof import("@gajae-code/natives");
+		nativeNotificationBindings = require("@gajae-code/natives") as NativeNotificationBindings;
 	return nativeNotificationBindings;
 }
 
@@ -200,10 +205,12 @@ export const NATIVE_PATH_IDENTITY_CONTRACT_VERSION = 1;
  * final path component at mutation time. A final-component file symlink stays
  * `reparse_point` (including TOCTOU replacement after JS preflight).
  */
-export function exactUnlinkNotificationFile(
+
+function exactUnlinkNotificationFileAtBoundary(
 	file: string,
 	identity: NotificationEndpointFileIdentity,
 	quarantineName: string,
+	direct: boolean,
 ): NotificationExactUnlinkResult {
 	let target = file;
 	try {
@@ -222,7 +229,9 @@ export function exactUnlinkNotificationFile(
 	} catch {
 		// Missing/unreadable paths fall through; the native call reports the failure.
 	}
-	const result = nativeNotification().exactUnlink(target, { ...identity, quarantineName });
+	const native = nativeNotification();
+	if (direct && typeof native.exactUnlinkDirect !== "function") return { ok: false, code: "native_unavailable" };
+	const result = (direct ? native.exactUnlinkDirect : native.exactUnlink)(target, { ...identity, quarantineName });
 	return {
 		ok: result.ok,
 		code: result.code,
@@ -233,12 +242,30 @@ export function exactUnlinkNotificationFile(
 	};
 }
 
+export function exactUnlinkNotificationFile(
+	file: string,
+	identity: NotificationEndpointFileIdentity,
+	quarantineName: string,
+): NotificationExactUnlinkResult {
+	return exactUnlinkNotificationFileAtBoundary(file, identity, quarantineName, false);
+}
+
+/** Remove inert debris without routing it through native exchange cleanup. */
+function exactUnlinkNotificationDebrisFile(
+	file: string,
+	identity: NotificationEndpointFileIdentity,
+): NotificationExactUnlinkResult {
+	return exactUnlinkNotificationFileAtBoundary(file, identity, `.gjc-direct-unlink-${crypto.randomUUID()}`, true);
+}
+
 /** Minimal filesystem surface the service needs; injectable for tests. */
 export interface NotificationServiceFs {
 	readdir(dir: string): Promise<string[]>;
 	readFile(file: string, encoding: "utf8"): Promise<string>;
 	readEndpointFile(file: string): Promise<NotificationEndpointFile>;
 	exactUnlink(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
+	/** Identity-bound direct unlink reserved for inert exchange debris. */
+	unlinkExact(file: string, identity: NotificationEndpointFileIdentity): Promise<NotificationExactUnlinkResult>;
 	unlink(file: string): Promise<void>;
 	writeFile?(file: string, data: string, opts?: WriteFileOptions): Promise<void>;
 	stat?(file: string): Promise<{ mtimeMs: number }>;
@@ -250,6 +277,7 @@ const nodeServiceFs: NotificationServiceFs = {
 	readEndpointFile: readNotificationEndpointFile,
 	exactUnlink: async (file, identity) =>
 		exactUnlinkNotificationFile(file, identity, `.gjc-delete-notification-endpoint-${crypto.randomUUID()}.json`),
+	unlinkExact: async (file, identity) => exactUnlinkNotificationDebrisFile(file, identity),
 	unlink: file => fsPromises.unlink(file),
 	writeFile: (file, data, opts) => fsPromises.writeFile(file, data, opts),
 	stat: file => fsPromises.stat(file),
@@ -457,6 +485,18 @@ function unreadableEndpointResult(file: string): NotificationEndpointClassificat
 	return isCanonicalLifecycleArtifactName(path.basename(file)) ? { kind: "non-endpoint" } : { kind: "unreadable" };
 }
 
+function isEndpointRecordForFile(name: string, record: Record<string, unknown>): boolean {
+	if (isLifecycleArtifact(record) || typeof record.url !== "string" || typeof record.token !== "string") return false;
+	if (!isNativeExchangeDebrisName(name)) return true;
+	// A quarantine-shaped basename is only a debris hint. A publisher successor
+	// may legitimately occupy that pathname, so retain endpoint authority when
+	// the payload proves that it belongs to the current filename. Detached
+	// endpoint bytes retain their original sessionId and therefore fail closed as
+	// debris instead of being re-quarantined.
+	const declaredSessionId = record.sessionId;
+	return declaredSessionId === undefined || declaredSessionId === path.basename(name, ".json");
+}
+
 /**
  * Read and classify one endpoint candidate. The returned identity belongs to
  * exactly the bytes inspected and is required for any later deletion.
@@ -466,11 +506,6 @@ export async function classifyNotificationEndpoint(
 	file: string,
 	pidAlive: (pid: number) => boolean,
 ): Promise<NotificationEndpointClassification> {
-	// A native exchange debris path is never an endpoint publication. Routing a
-	// quarantine target into the exact-unlink exchange would re-quarantine it and
-	// manufacture fresh debris, and could re-attack a live successor that reused
-	// the pathname. Leave it for the identity-bound debris sweep.
-	if (isNativeExchangeDebrisName(path.basename(file))) return { kind: "non-endpoint" };
 	let endpoint: NotificationEndpointFile;
 	let raw: string;
 	try {
@@ -483,13 +518,14 @@ export async function classifyNotificationEndpoint(
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
-		return unreadableEndpointResult(file);
+		return isNativeExchangeDebrisName(path.basename(file))
+			? { kind: "non-endpoint" }
+			: unreadableEndpointResult(file);
 	}
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { kind: "non-endpoint" };
 	if (path.basename(file) === "broker.json") return { kind: "non-endpoint" };
 	const rec = parsed as Record<string, unknown>;
-	if (isLifecycleArtifact(rec) || typeof rec.url !== "string" || typeof rec.token !== "string")
-		return { kind: "non-endpoint" };
+	if (!isEndpointRecordForFile(path.basename(file), rec)) return { kind: "non-endpoint" };
 	const view: NotificationEndpointView = {
 		sessionId: typeof rec.sessionId === "string" ? rec.sessionId : path.basename(file, ".json"),
 		pid: safePositiveInteger(rec.pid),
@@ -612,9 +648,10 @@ function isNativeExchangeDebrisName(name: string): boolean {
 
 async function listEndpointFiles(fs: NotificationServiceFs, dir: string): Promise<string[]> {
 	try {
-		return (await fs.readdir(dir)).filter(
-			name => name.endsWith(".json") && !isSharedSdkArtifact(name) && !isNativeExchangeDebrisName(name),
-		);
+		// Do not exclude quarantine-shaped names here. A live endpoint successor
+		// can reuse one of those names; classification below decides whether the
+		// bytes are a publication or detached debris from the exchange.
+		return (await fs.readdir(dir)).filter(name => name.endsWith(".json") && !isSharedSdkArtifact(name));
 	} catch {
 		return [];
 	}
@@ -1605,6 +1642,23 @@ export async function sweepNotificationDebris(input: {
 			failures += 1;
 			continue;
 		}
+		if (DEBRIS_ENDPOINT_QUARANTINE.test(name)) {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(candidate.bytes.toString("utf8"));
+			} catch {
+				parsed = undefined;
+			}
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				// A valid endpoint publication wins over the basename hint. Recovery's
+				// endpoint pass owns its liveness decision; the debris sweep must not
+				// delete a live successor merely because its name resembles quarantine.
+				if (isEndpointRecordForFile(name, parsed as Record<string, unknown>)) {
+					kept += 1;
+					continue;
+				}
+			}
+		}
 		const mtimeMs = Number(candidate.identity.mtimeNs / 1_000_000n);
 		const olderThanMinAge = Number.isFinite(mtimeMs) && now() - mtimeMs > minAgeMs;
 		const deadWriter =
@@ -1647,7 +1701,11 @@ export async function sweepNotificationDebris(input: {
 				failures += 1;
 				continue;
 			}
-			await fs.unlink(file);
+			const removedResult = await fs.unlinkExact(file, candidate.identity);
+			if (!removedResult.ok) {
+				failures += 1;
+				continue;
+			}
 			removed.push(name);
 		} catch {
 			failures += 1;

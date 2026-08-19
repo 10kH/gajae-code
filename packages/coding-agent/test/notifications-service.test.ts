@@ -42,6 +42,8 @@ function mockFs(
 		onAcquireExclusive?: (file: string, store: Map<string, string>) => void;
 		/** Fires immediately before identity-bound endpoint deletion. */
 		onExactUnlink?: (file: string, store: Map<string, string>) => void;
+		/** Fires immediately before identity-bound direct debris deletion. */
+		onUnlinkExact?: (file: string, store: Map<string, string>) => void;
 		exactUnlinkResult?: (file: string) => NotificationExactUnlinkResult | undefined;
 		rejectEndpointFiles?: Set<string>;
 		/** Per-file mtimeMs for the optional `stat` capability; absent files throw ENOENT. */
@@ -133,6 +135,24 @@ function mockFs(
 			opts.onExactUnlink?.(file, store);
 			const configured = opts.exactUnlinkResult?.(file);
 			if (configured) return configured;
+			if (opts.failUnlink?.has(file)) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+			const value = store.get(file);
+			if (value === undefined) throw enoent();
+			const bytes = Buffer.from(value);
+			const revision = revisions.get(file) ?? 0;
+			const matches =
+				identity.dev === 1n &&
+				identity.ino === BigInt(revision) &&
+				identity.size === BigInt(bytes.length) &&
+				identity.mtimeNs === mtimeNsFor(file) &&
+				identity.sha256 === crypto.createHash("sha256").update(bytes).digest("hex");
+			if (!matches) return { ok: false, code: "identity_mismatch" };
+			store.delete(file);
+			unlinked.push(file);
+			return { ok: true };
+		},
+		async unlinkExact(file, identity) {
+			opts.onUnlinkExact?.(file, store);
 			if (opts.failUnlink?.has(file)) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
 			const value = store.get(file);
 			if (value === undefined) throw enoent();
@@ -1327,18 +1347,17 @@ describe("notification-service stale debris sweep", () => {
 		expect(report.kept).toBe(1);
 	});
 
-	test("a candidate replaced between the staleness check and deletion is retained as a failure", async () => {
-		// Identity-bound deletion: the successor's bytes differ, so exactUnlink
-		// reports identity_mismatch and the live replacement survives.
+	test("a successor published immediately before direct debris deletion is retained as a failure", async () => {
+		// The successor lands after the sweep's inspection and immediately before
+		// the identity-bound delete operation. The direct operation must refuse the
+		// replacement rather than unlinking the live publication.
 		const debris = path.join(dir, "transition-005aa822-3f0b-45c9-bd39-e7047b1d3be4");
 		const { fs, store, unlinked } = mockFs(
 			{ [debris]: "stale-quarantine" },
 			{
 				mtimes: { [debris]: OLD },
-				onReadEndpointFile: (file, files, readIndex) => {
-					// The removal re-checks identity right before unlink; replace the
-					// aged debris on that re-read so the live successor is retained.
-					if (file === debris && readIndex === 1) files.set(file, "live-successor-content");
+				onUnlinkExact: (file, files) => {
+					if (file === debris) files.set(file, "live-successor-content");
 				},
 			},
 		);
@@ -1557,6 +1576,45 @@ describe("notification-service bounded notify recovery (#4701)", () => {
 			[path.basename(quarantineA), path.basename(quarantineB), path.basename(placeholder)].sort(),
 		);
 		expect(debrisCount(store)).toBe(0);
+	});
+
+	test("a live endpoint successor cannot be hidden by a quarantine-shaped basename", async () => {
+		const successorSessionId = path.basename(quarantineB, ".json");
+		const successor = JSON.stringify({
+			version: 1,
+			sessionId: successorSessionId,
+			url: "ws://127.0.0.1:32976",
+			token: "successor-token",
+			pid: 1000,
+		});
+		const { fs, store, unlinked } = mockFs(
+			{
+				[liveEndpoint]: liveEndpointBody,
+				// This object is genuine detached endpoint bytes and is not a successor:
+				// its session identity does not match the quarantine pathname.
+				[quarantineA]: JSON.stringify({ sessionId: "detached-session", url: "ws://x", token: "t", pid: 999 }),
+				[quarantineB]: successor,
+				[placeholder]: "",
+			},
+			{ mtimes: { [quarantineA]: OLD, [quarantineB]: OLD, [placeholder]: OLD } },
+		);
+		const health = await checkNotificationHealth({
+			settings,
+			stateRoot,
+			deps: { fs, now: () => NOW, pidAlive: pid => pid === 1000 },
+		});
+		const report = await recoverNotifications({
+			settings,
+			stateRoot,
+			deps: { fs, now: () => NOW, pidAlive: pid => pid === 1000 },
+		});
+
+		expect(health.endpoints).toMatchObject({ total: 2, live: 2, dead: 0, unknown: 0, unreadable: 0 });
+		expect(report.endpointsKept).toBe(2);
+		expect(report.endpointsRemoved).toEqual([]);
+		expect(store.get(quarantineB)).toBe(successor);
+		expect(unlinked).not.toContain(quarantineB);
+		expect(report.debrisRemoved?.sort()).toEqual([path.basename(quarantineA), path.basename(placeholder)].sort());
 	});
 
 	test("unreadable/unknown endpoint handling is bounded and not inflated by debris", async () => {

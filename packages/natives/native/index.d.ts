@@ -51,7 +51,6 @@ export declare class ComputerController {
   keypress(expectedEpoch: number | undefined | null, keys: Array<string>): void
   wait(expectedEpoch: number | undefined | null, ms: number): void
 }
-
 /**
  * Long-lived macOS appearance observer.
  *
@@ -866,6 +865,17 @@ export declare function exactRestore(detachedPath: string, originalPath: string,
  * validation failures as typed results rather than deleting a replacement.
  */
 export declare function exactUnlink(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
+
+/**
+ * Delete only the regular file that still has the supplied platform identity,
+ * without the exchange/quarantine protocol used by [`exact_unlink`]. This is
+ * reserved for already-detached inert debris: the operation first moves the
+ * pathname to the caller's private no-replace quarantine, verifies the moved
+ * object, and only then unlinks that private name. A successor published at
+ * the original pathname is therefore never consumed by cleanup, and this
+ * path cannot manufacture another exchange placeholder.
+ */
+export declare function exactUnlinkDirect(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
  * Execute a brush shell command.
