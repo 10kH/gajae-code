@@ -1760,13 +1760,15 @@ function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
 async function readCoordinatorEvents(namespaceDir: string): Promise<CoordinatorEvent[]> {
 	try {
 		const content = await fs.readFile(eventJournalFile(namespaceDir), "utf8");
-		return content
-			.split("\n")
-			.map(line => line.trim())
-			.filter(Boolean)
-			.map(parseCoordinatorEvent)
-			.filter((event): event is CoordinatorEvent => event !== null)
-			.sort((left, right) => left.seq - right.seq);
+		const events: CoordinatorEvent[] = [];
+		for (const rawLine of content.split("\n")) {
+			const line = rawLine.trim();
+			if (!line) continue;
+			const event = parseCoordinatorEvent(line);
+			if (!event) throw new Error("state_corrupt");
+			events.push(event);
+		}
+		return events.sort((left, right) => left.seq - right.seq);
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
 		throw error;

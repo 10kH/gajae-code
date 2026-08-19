@@ -431,6 +431,17 @@ async function registerSdkSession(server: ReturnType<typeof createCoordinatorMcp
 }
 
 describe("Coordinator MCP canonical SDK controls", () => {
+	it("fails closed instead of reusing a sequence after a malformed journal line", async () => {
+		const root = await tempRoot();
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		const journal = path.join(namespace, "events", "event-journal.jsonl");
+		await fs.mkdir(path.dirname(journal), { recursive: true });
+		await fs.writeFile(journal, '{"schema_version":1,"seq":4,"kind":"turn.completed"}\n{torn', "utf8");
+		await expect(
+			appendCoordinatorEventForTest(namespace, { kind: "turn.completed", summary: "must not reuse seq" }),
+		).rejects.toThrow("state_corrupt");
+	});
+
 	async function pingServer(root: string) {
 		const server = createCoordinatorMcpServer({
 			env: {
