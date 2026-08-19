@@ -1090,7 +1090,7 @@ bar`,
 			expect(output.includes("\x1b]8;;\x07")).toBeTruthy();
 		});
 
-		it("should keep wrapped URLs inside a single OSC 8 hyperlink span", () => {
+		it("should keep every wrapped URL fragment clickable with the same OSC 8 target (#4711)", () => {
 			const markdown = new Markdown(
 				"Visit https://example.com/really/long/path/that/will/wrap/on/narrow/width for more",
 				0,
@@ -1100,14 +1100,46 @@ bar`,
 
 			const lines = markdown.render(32);
 			expect(lines.length).toBeGreaterThan(1);
-			const output = lines.join("\n");
-			const openMatches =
-				output.match(
-					/\x1b\]8;;https:\/\/example\.com\/really\/long\/path\/that\/will\/wrap\/on\/narrow\/width\x07/g,
-				) || [];
-			const closeMatches = output.match(/\x1b\]8;;\x07/g) || [];
-			expect(openMatches.length).toBe(1);
-			expect(closeMatches.length).toBeGreaterThan(0);
+			const url = "https://example.com/really/long/path/that/will/wrap/on/narrow/width";
+			const open = `\x1b]8;;${url}\x07`;
+			// Each wrapped row that renders URL text carries its own open with
+			// the identical target and self-closes, so the TUI per-line
+			// terminator cannot strand continuation rows as plain text.
+			const urlRows = lines.filter(line => line.includes(open));
+			// Every row that renders any URL characters carries the open; rows
+			// without URL characters ("Visit", "for more") never do.
+			const plainRows = lines.map(line =>
+				line
+					.replaceAll(/\x1b\]8;;[^\x07]*\x07/g, "")
+					.replaceAll(/\x1b\[[0-9;]*m/g, "")
+					.trim(),
+			);
+			for (const [index, plain] of plainRows.entries()) {
+				const hasUrlChars = /[a-z]/iu.test(plain.replace(/^visit\s*/iu, "").replace(/\s*for more$/iu, ""));
+				expect(lines[index].includes(open)).toBe(hasUrlChars);
+			}
+			expect(urlRows.length).toBeGreaterThanOrEqual(2);
+			for (const line of urlRows) {
+				const opens = line.match(new RegExp(open.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\\\$&"), "g")) ?? [];
+				expect(opens.length).toBe(1);
+				expect(line.includes("\x1b]8;;\x07")).toBe(true);
+			}
+			// Reassembling the URL rows' non-plain text reconstructs the URL.
+			const reassembled = lines
+				.map(line =>
+					line
+						.replaceAll(/\x1b\]8;;[^\x07]*\x07/g, "")
+						.replaceAll(/\x1b\[[0-9;]*m/g, "")
+						.trim(),
+				)
+				.map(plain =>
+					plain
+						.replace(/^visit\s*/iu, "")
+						.replace(/\s*for more$/iu, "")
+						.trim(),
+				)
+				.join("");
+			expect(reassembled).toBe(url);
 		});
 
 		it("should show URL for explicit markdown links with different text", () => {

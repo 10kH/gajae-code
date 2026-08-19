@@ -370,6 +370,73 @@ fn is_sgr_u16(seq: &[u16]) -> bool {
 	seq.len() >= 3 && seq[1] == b'[' as u16 && *seq.last().unwrap() == b'm' as u16
 }
 
+/// OSC 8 hyperlink state carried across soft-wrapped rows (issue #4711).
+///
+/// SGR state already survives wrapping via [`AnsiState`]; the hyperlink open
+/// sequence must too, or every continuation row of a wrapped URL renders as
+/// plain non-clickable text. The tracked open sequence is the verbatim input
+/// bytes (BEL- or ST-terminated) so re-emission cannot alter link ids/URIs.
+#[derive(Default)]
+struct Osc8State {
+	/// Active OSC 8 open sequence (`ESC ] 8 ; params ; URI` + terminator).
+	open: Vec<u16>,
+}
+
+impl Osc8State {
+	const CLOSE_BEL: &'static [u16] =
+		&[ESC, b']' as u16, b'8' as u16, b';' as u16, b';' as u16, 0x07];
+
+	#[inline]
+	const fn is_active(&self) -> bool {
+		!self.open.is_empty()
+	}
+
+	/// Record an OSC 8 sequence. Open sequences with a non-empty URI activate
+	/// the link; close sequences (empty URI) deactivate it. Other OSC payloads
+	/// leave link state untouched.
+	fn apply(&mut self, seq: &[u16]) {
+		if !is_osc8_u16(seq) {
+			return;
+		}
+		// Slice between `ESC ] 8 ;` and the terminator (BEL or ST).
+		let terminator_len = if *seq.last().unwrap() == 0x07 { 1 } else { 2 };
+		let body = &seq[4..seq.len() - terminator_len];
+		let uri_start = body
+			.iter()
+			.position(|&b| b == b';' as u16)
+			.map_or(0, |p| p + 1);
+		self.open.clear();
+		if uri_start < body.len() {
+			self.open.extend_from_slice(seq);
+		}
+	}
+
+	/// Close any active link so it cannot bleed into padding or later text.
+	#[inline]
+	fn write_close(&self, out: &mut Vec<u16>) {
+		if self.is_active() {
+			out.extend_from_slice(Self::CLOSE_BEL);
+		}
+	}
+
+	/// Re-emit the active open sequence on a continuation row.
+	#[inline]
+	fn write_open(&self, out: &mut Vec<u16>) {
+		if self.is_active() {
+			out.extend_from_slice(&self.open);
+		}
+	}
+}
+
+#[inline]
+fn is_osc8_u16(seq: &[u16]) -> bool {
+	seq.len() >= 6
+		&& seq[0] == ESC
+		&& seq[1] == b']' as u16
+		&& seq[2] == b'8' as u16
+		&& seq[3] == b';' as u16
+}
+
 // ============================================================================
 // Grapheme / Width
 // ============================================================================
@@ -381,6 +448,22 @@ const fn ascii_cell_width_u16(u: u16, tab_width: usize) -> usize {
 		b'\t' => tab_width,
 		0x20..=0x7e => 1,
 		_ => 0,
+	}
+}
+
+/// Scan text for OSC 8 sequences and update link state (mirrors
+/// [`update_state_from_text`] for SGR).
+fn update_osc8_from_text(data: &[u16], osc8: &mut Osc8State) {
+	let mut i = 0usize;
+	while i < data.len() {
+		if data[i] == ESC
+			&& let Some(seq_len) = ansi_seq_len_u16(data, i)
+		{
+			osc8.apply(&data[i..i + seq_len]);
+			i += seq_len;
+			continue;
+		}
+		i += 1;
 	}
 }
 
@@ -705,13 +788,14 @@ fn break_long_word(
 	width: usize,
 	tab_width: usize,
 	state: &mut AnsiState,
+	osc8: &mut Osc8State,
 ) -> SmallVec<[Vec<u16>; 4]> {
 	let mut lines = SmallVec::<[Vec<u16>; 4]>::new();
 	let mut current_line = Vec::<u16>::new();
 	write_active_codes(state, &mut current_line);
+	osc8.write_open(&mut current_line);
 	let mut current_width = 0usize;
 	let mut i = 0usize;
-
 	while i < word.len() {
 		if word[i] == ESC {
 			if let Some(seq_len) = ansi_seq_len_u16(word, i) {
@@ -719,12 +803,13 @@ fn break_long_word(
 				current_line.extend_from_slice(seq);
 				if is_sgr_u16(seq) {
 					state.apply_sgr_u16(&seq[2..seq_len - 1]);
+				} else {
+					osc8.apply(seq);
 				}
 				i += seq_len;
 				continue;
 			}
 			// A lone ESC that does not start a recognizable ANSI sequence
-			// (e.g. binary tool output persisted into a session). Consume it
 			// as a zero-width scalar like truncate/slice do; without this the
 			// segment scan below stops at the ESC without advancing `i` and
 			// the outer loop never terminates.
@@ -748,9 +833,11 @@ fn break_long_word(
 				let gw = ascii_cell_width_u16(u, tab_width);
 				if current_width + gw > width {
 					write_line_end_reset(state, &mut current_line);
+					osc8.write_close(&mut current_line);
 					lines.push(current_line);
 					current_line = Vec::new();
 					write_active_codes(state, &mut current_line);
+					osc8.write_open(&mut current_line);
 					current_width = 0;
 				}
 				current_line.push(u);
@@ -760,8 +847,10 @@ fn break_long_word(
 			let _ = for_each_grapheme_u16_slow(seg, tab_width, |gu16, gw| {
 				if current_width + gw > width {
 					write_line_end_reset(state, &mut current_line);
+					osc8.write_close(&mut current_line);
 					lines.push(std::mem::take(&mut current_line));
 					write_active_codes(state, &mut current_line);
+					osc8.write_open(&mut current_line);
 					current_width = 0;
 				}
 				current_line.extend_from_slice(gu16);
@@ -784,6 +873,17 @@ fn wrap_single_line(line: &[u16], width: usize, tab_width: usize) -> SmallVec<[V
 	}
 
 	if visible_width_u16(line, tab_width) <= width {
+		// Fast path: no wrap break, but an unterminated OSC 8 span still must
+		// not leak past this row into margins/padding appended by callers
+		// (Text.render, tui.ts) or into whatever a direct native consumer
+		// emits next (#4711 review P2).
+		let mut osc8 = Osc8State::default();
+		update_osc8_from_text(line, &mut osc8);
+		if osc8.is_active() {
+			let mut row = line.to_vec();
+			osc8.write_close(&mut row);
+			return smallvec![row];
+		}
 		return smallvec![line.to_vec()];
 	}
 
@@ -792,20 +892,26 @@ fn wrap_single_line(line: &[u16], width: usize, tab_width: usize) -> SmallVec<[V
 	let mut current_line = Vec::<u16>::new();
 	let mut current_width = 0usize;
 	let mut state = AnsiState::new();
+	let mut osc8 = Osc8State::default();
 
 	for token in tokens {
 		let token_width = visible_width_u16(&token, tab_width);
 		let is_whitespace = token_is_whitespace(&token);
 
 		if token_width > width && !is_whitespace {
-			if !current_line.is_empty() {
+			// Same escape-only guard as the final flush: after dropped boundary
+			// whitespace, current_line can hold only the re-emitted state
+			// prefix. Pushing it here would emit a zero-width blank row before
+			// the broken word's rows (#4711 review P2).
+			if visible_width_u16(&current_line, tab_width) > 0 {
 				write_line_end_reset(&state, &mut current_line);
+				osc8.write_close(&mut current_line);
 				wrapped.push(current_line);
 				current_line = Vec::new();
 				current_width = 0;
 			}
 
-			let mut broken = break_long_word(&token, width, tab_width, &mut state);
+			let mut broken = break_long_word(&token, width, tab_width, &mut state, &mut osc8);
 			if let Some(last) = broken.pop() {
 				wrapped.extend(broken);
 				current_line = last;
@@ -819,10 +925,21 @@ fn wrap_single_line(line: &[u16], width: usize, tab_width: usize) -> SmallVec<[V
 			let mut line_to_wrap = current_line;
 			trim_end_spaces_in_place(&mut line_to_wrap);
 			write_line_end_reset(&state, &mut line_to_wrap);
+			osc8.write_close(&mut line_to_wrap);
 			wrapped.push(line_to_wrap);
 
 			current_line = Vec::new();
+			// A whitespace token dropped at the wrap boundary carries its own
+			// escape transitions (notably an OSC 8 close attached to the boundary
+			// spaces). Apply them BEFORE the continuation prefix re-emits active
+			// state, or the stale open leaks onto this row and links the following
+			// text to the old target (#4711 review P1).
+			if is_whitespace {
+				update_state_from_text(&token, &mut state);
+				update_osc8_from_text(&token, &mut osc8);
+			}
 			write_active_codes(&state, &mut current_line);
+			osc8.write_open(&mut current_line);
 			if is_whitespace {
 				current_width = 0;
 			} else {
@@ -835,10 +952,23 @@ fn wrap_single_line(line: &[u16], width: usize, tab_width: usize) -> SmallVec<[V
 		}
 
 		update_state_from_text(&token, &mut state);
+		update_osc8_from_text(&token, &mut osc8);
 	}
 
 	if !current_line.is_empty() {
-		wrapped.push(current_line);
+		// Trim BEFORE the synthesized close: the cleanup loop below cannot trim
+		// past a BEL terminator, so closing first would preserve trailing
+		// spaces inside the link on the final row (#4711 review P2).
+		trim_end_spaces_in_place(&mut current_line);
+		// Skip an escape-only final row (zero visible width): after a dropped
+		// boundary-whitespace token the buffer can hold just the re-emitted
+		// state prefix (SGR restore, OSC 8 open) with no visible characters.
+		// Emitting it would add a blank visual row and, for an unterminated
+		// link, a phantom clickable row (#4711 review P2).
+		if visible_width_u16(&current_line, tab_width) > 0 {
+			osc8.write_close(&mut current_line);
+			wrapped.push(current_line);
+		}
 	}
 
 	for line in &mut wrapped {
@@ -893,10 +1023,20 @@ fn wrap_text_with_ansi_impl(
 ///
 /// Returns UTF-16 lines with active SGR codes carried across line boundaries.
 #[napi]
-pub fn wrap_text_with_ansi(text: JsString, width: u32, tab_width: u32) -> Result<Vec<Utf16String>> {
-	let text_u16 = text.into_utf16()?;
+pub fn wrap_text_with_ansi(
+	text: Utf16String,
+	width: u32,
+	tab_width: u32,
+) -> Result<Vec<Utf16String>> {
+	// Take `Utf16String`, not `JsString::into_utf16()`: the latter slices its
+	// buffer with the capacity (`utf16_len + 1`) instead of the written count,
+	// so the NUL terminator napi writes rides along as a phantom trailing
+	// U+0000. That zero-width phantom is normally trimmed from row output, but
+	// a synthesized OSC 8 close appended after it (an unterminated hyperlink
+	// that soft-wraps, #4711) would trap it mid-row and leak a control byte
+	// into selection/copy text. `Utf16String`'s conversion truncates correctly.
 	let tab_width = clamp_tab_width_for_ops(tab_width);
-	let lines = wrap_text_with_ansi_impl(text_u16.as_slice(), width as usize, tab_width);
+	let lines = wrap_text_with_ansi_impl(&text, width as usize, tab_width);
 	Ok(lines.into_iter().map(build_utf16_string).collect())
 }
 
@@ -1712,5 +1852,368 @@ mod tests {
 
 		assert!(rendered.iter().any(|line| line.contains("$x$")), "{rendered:?}");
 		assert!(!rendered.iter().any(|line| line.contains("\\$5 and $")), "{rendered:?}");
+	}
+
+	fn osc8_open(uri: &str) -> String {
+		format!("\x1b]8;;{uri}\x07")
+	}
+
+	const OSC8_CLOSE: &str = "\x1b]8;;\x07";
+
+	fn visible_plain(line: &[u16]) -> String {
+		let text = String::from_utf16_lossy(line);
+		regex_strip_osc(&text)
+	}
+
+	fn regex_strip_osc(text: &str) -> String {
+		let mut out = String::with_capacity(text.len());
+		let bytes: Vec<char> = text.chars().collect();
+		let mut i = 0usize;
+		while i < bytes.len() {
+			if bytes[i] == '\x1b' && i + 1 < bytes.len() && bytes[i + 1] == ']' {
+				let mut j = i + 2;
+				while j < bytes.len() {
+					if bytes[j] == '\x07' {
+						j += 1;
+						break;
+					}
+					if bytes[j] == '\x1b' && j + 1 < bytes.len() && bytes[j + 1] == '\\' {
+						j += 2;
+						break;
+					}
+					j += 1;
+				}
+				i = j;
+				continue;
+			}
+			if bytes[i] == '\x1b' && i + 1 < bytes.len() && bytes[i + 1] == '[' {
+				let mut j = i + 2;
+				while j < bytes.len() && !((0x40..=0x7e).contains(&(bytes[j] as u32))) {
+					j += 1;
+				}
+				i = j + 1;
+				continue;
+			}
+			out.push(bytes[i]);
+			i += 1;
+		}
+		out
+	}
+
+	fn osc8_uris(line: &[u16]) -> Vec<String> {
+		// Non-close OSC 8 opens with their URI payload.
+		let text = String::from_utf16_lossy(line);
+		let bytes: Vec<char> = text.chars().collect();
+		let mut out = Vec::new();
+		let mut i = 0usize;
+		while i < bytes.len() {
+			if bytes[i] == '\x1b' && i + 1 < bytes.len() && bytes[i + 1] == ']' {
+				let mut j = i + 2;
+				let mut body = String::new();
+				let mut closed = false;
+				while j < bytes.len() {
+					if bytes[j] == '\x07' {
+						j += 1;
+						closed = true;
+						break;
+					}
+					if bytes[j] == '\x1b' && j + 1 < bytes.len() && bytes[j + 1] == '\\' {
+						j += 2;
+						closed = true;
+						break;
+					}
+					body.push(bytes[j]);
+					j += 1;
+				}
+				if closed && (body.starts_with("8;")) && body.len() > 3 {
+					out.push(body[3..].to_string());
+				}
+				i = j;
+				continue;
+			}
+			i += 1;
+		}
+		out
+	}
+
+	#[test]
+	fn test_wrap_carries_osc8_hyperlink_across_soft_wrap() {
+		// Issue #4711: continuation rows of a wrapped URL must keep the open.
+		let url = "https://example.com/a/very/long/url/that/wraps/over/two/lines/when/narrow";
+		let data = to_u16(&format!("docs {}{}{}{}", osc8_open(url), url, OSC8_CLOSE, " trailing"));
+		let lines = wrap_text_with_ansi_impl(&data, 20, DEFAULT_TAB_WIDTH);
+
+		assert_eq!(visible_plain(&lines[0]), "docs");
+		assert_eq!(visible_plain(lines.last().unwrap()), "trailing");
+		let fragments = &lines[1..lines.len() - 1];
+		assert!(fragments.len() >= 2);
+		for line in fragments {
+			assert_eq!(osc8_uris(line), vec![url.to_string()]);
+			let text = visible_plain(line);
+			assert!(url.contains(&text), "fragment {text:?} not from URL");
+		}
+		let reassembled: String = fragments.iter().map(|line| visible_plain(line)).collect();
+		assert_eq!(reassembled, url);
+	}
+
+	#[test]
+	fn test_wrap_carries_osc8_hyperlink_over_three_or_more_rows() {
+		let url = "https://example.com/a/very/long/url/that/wraps/over/two/lines/when/narrow";
+		for width in [12usize, 8, 6] {
+			let data = to_u16(&format!("{}{}{}", osc8_open(url), url, OSC8_CLOSE));
+			let lines = wrap_text_with_ansi_impl(&data, width, DEFAULT_TAB_WIDTH);
+			assert!(lines.len() >= 3, "width {width} produced {} rows", lines.len());
+			for line in &lines {
+				assert_eq!(osc8_uris(line), vec![url.to_string()]);
+				assert!(!visible_plain(line).is_empty());
+			}
+			let reassembled: String = lines.iter().map(|line| visible_plain(line)).collect();
+			assert_eq!(reassembled, url);
+		}
+	}
+
+	#[test]
+	fn test_wrap_closes_osc8_at_row_ends_and_does_not_leak_into_plain_rows() {
+		let url = "https://example.com/a/very/long/url/that/wraps/over/two/lines/when/narrow";
+		let data = to_u16(&format!("docs {}{}{}{}", osc8_open(url), url, OSC8_CLOSE, " trailing"));
+		for width in [6usize, 8, 12, 20, 40, 60, 80, 90] {
+			let lines = wrap_text_with_ansi_impl(&data, width, DEFAULT_TAB_WIDTH);
+			for line in &lines {
+				let text = visible_plain(line);
+				let uris = osc8_uris(line);
+				let is_plain = text == "docs"
+					|| text == "trailing"
+					|| text.is_empty()
+					|| text.split_whitespace().all(|w| {
+						w == "docs"
+							|| w == "trailing"
+							|| "trailing".contains(w) && w.chars().all(|c| "trailing".contains(c))
+					});
+				if is_plain {
+					assert!(uris.is_empty(), "plain row {text:?} carries link at width {width}");
+				} else {
+					assert_eq!(uris, vec![url.to_string()], "url row at width {width}: {text:?}");
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn test_wrap_does_not_carry_osc8_across_hard_newline() {
+		let url = "https://example.com/a/very/long/url";
+		let data = to_u16(&format!("{}{}{}\nadjacent plain text", osc8_open(url), url, OSC8_CLOSE));
+		let lines = wrap_text_with_ansi_impl(&data, 20, DEFAULT_TAB_WIDTH);
+		let split = lines
+			.iter()
+			.position(|line| visible_plain(line).starts_with("adjacent"))
+			.expect("hard-break line missing");
+		for line in &lines[split..] {
+			assert!(osc8_uris(line).is_empty());
+			assert!(!String::from_utf16_lossy(line).contains("\x1b]8;"));
+		}
+		for line in &lines[..split] {
+			assert_eq!(osc8_uris(line), vec![url.to_string()]);
+		}
+	}
+
+	#[test]
+	fn test_wrap_does_not_link_text_after_unclosed_osc8_hard_newline() {
+		let url = "https://example.com/a/very/long/url";
+		let data = to_u16(&format!("{}short\nnext-line", osc8_open(url)));
+		let lines = wrap_text_with_ansi_impl(&data, 40, DEFAULT_TAB_WIDTH);
+		assert_eq!(lines.len(), 2);
+		assert_eq!(osc8_uris(&lines[0]), vec![url.to_string()]);
+		assert!(osc8_uris(&lines[1]).is_empty());
+		assert!(!String::from_utf16_lossy(&lines[1]).contains("\x1b]8;"));
+	}
+
+	#[test]
+	fn test_wrap_unterminated_osc8_that_wraps_emits_no_control_bytes() {
+		// Guards the napi bridge regression (#4711 red-team): an unterminated
+		// link that soft-wraps gets a synthesized close on its final row, and
+		// nothing — including a phantom trailing NUL from input conversion —
+		// may sit between the display text and that close.
+		let url = "https://example.com/a/very/long/url/that/wraps/over/two/lines/when/narrow";
+		for width in [20usize, 12, 8] {
+			let data = to_u16(&format!("{}{}", osc8_open(url), url));
+			let lines = wrap_text_with_ansi_impl(&data, width, DEFAULT_TAB_WIDTH);
+			assert!(lines.len() >= 3, "width {width} produced {} rows", lines.len());
+			for line in &lines {
+				assert!(!line.contains(&0u16), "NUL leaked at width {width}");
+				assert_eq!(osc8_uris(line), vec![url.to_string()]);
+			}
+			let reassembled: String = lines.iter().map(|line| visible_plain(line)).collect();
+			assert_eq!(reassembled, url);
+		}
+	}
+
+	#[test]
+	fn test_wrap_applies_close_in_dropped_boundary_whitespace_before_prefix() {
+		// #4711 review P1: the tokenizer attaches the close to the whitespace
+		// token; that token is dropped at the wrap boundary, so its OSC
+		// transition must land before the continuation prefix re-emits the
+		// active open — otherwise the following text renders linked to the
+		// already-closed target.
+		let url = "https://x.test/";
+		let data = to_u16(&format!("{}foo{} bar", osc8_open(url), OSC8_CLOSE));
+		for width in [3usize, 4, 5] {
+			let lines = wrap_text_with_ansi_impl(&data, width, DEFAULT_TAB_WIDTH);
+			assert_eq!(visible_plain(&lines[0]), "foo");
+			assert_eq!(osc8_uris(&lines[0]), vec![url.to_string()]);
+			for line in &lines[1..] {
+				assert!(
+					osc8_uris(line).is_empty(),
+					"stale open at width {width}: {:?}",
+					String::from_utf16_lossy(line)
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn test_wrap_closes_unterminated_osc8_on_no_wrap_fast_path() {
+		// #4711 review P2: a link that fits on one row must still self-close,
+		// or it leaks into caller-appended margins/padding and beyond.
+		let url = "https://x.test/";
+		let data = to_u16(&format!("{}foo", osc8_open(url)));
+		let lines = wrap_text_with_ansi_impl(&data, 40, DEFAULT_TAB_WIDTH);
+		assert_eq!(lines.len(), 1);
+		assert_eq!(osc8_uris(&lines[0]), vec![url.to_string()]);
+		assert!(String::from_utf16_lossy(&lines[0]).ends_with(OSC8_CLOSE));
+
+		// Already-terminated input is not double-closed; plain text untouched.
+		let closed = to_u16(&format!("{}foo{}", osc8_open(url), OSC8_CLOSE));
+		let closed_lines = wrap_text_with_ansi_impl(&closed, 40, DEFAULT_TAB_WIDTH);
+		assert_eq!(closed_lines.len(), 1);
+		assert_eq!(visible_plain(&closed_lines[0]), "foo");
+		let plain = to_u16("foo bar");
+		let plain_lines = wrap_text_with_ansi_impl(&plain, 40, DEFAULT_TAB_WIDTH);
+		assert_eq!(plain_lines.len(), 1);
+		assert_eq!(plain_lines[0], plain);
+	}
+
+	#[test]
+	fn test_wrap_trims_final_row_before_synthesized_close() {
+		// #4711 review P2: trailing spaces on the final row of an unterminated
+		// wrapped link must be trimmed BEFORE the close is appended, or the
+		// BEL terminator shields them from the cleanup trim.
+		let url = "https://x.test/";
+		let data = to_u16(&format!("{}abcdefgh  ", osc8_open(url)));
+		let lines = wrap_text_with_ansi_impl(&data, 5, DEFAULT_TAB_WIDTH);
+		let last = String::from_utf16_lossy(lines.last().unwrap());
+		assert!(last.contains("fgh") && !last.contains("fgh  "), "trailing spaces kept: {last:?}");
+		assert!(last.ends_with(OSC8_CLOSE));
+		let reassembled: String = lines.iter().map(|line| visible_plain(line)).collect();
+		assert_eq!(reassembled, "abcdefgh");
+	}
+
+	#[test]
+	fn test_wrap_does_not_emit_escape_only_continuation_row() {
+		// #4711 review P2: trailing boundary whitespace after an unterminated
+		// link must not produce a phantom zero-width (OSC-only) row, which
+		// renders as a blank line and stays clickable.
+		let url = "https://x.test/";
+		for width in [2usize, 3, 5] {
+			let data = to_u16(&format!("{}foo ", osc8_open(url)));
+			let lines = wrap_text_with_ansi_impl(&data, width, DEFAULT_TAB_WIDTH);
+			for line in &lines {
+				assert!(
+					visible_width_u16(line, DEFAULT_TAB_WIDTH) > 0,
+					"escape-only row at width {width}: {:?}",
+					String::from_utf16_lossy(line)
+				);
+			}
+			// Width 5 fits "foo " untouched on the fast path; wrapping widths
+			// drop the boundary space per the standard whitespace contract.
+			let reassembled: String = lines.iter().map(|line| visible_plain(line)).collect();
+			assert!(reassembled == "foo" || reassembled == "foo ");
+			assert_eq!(osc8_uris(&lines[0]), vec![url.to_string()]);
+
+			// Dropped whitespace before an over-width word (break-long-word
+			// path) must not emit an escape-only row either.
+			let broken = to_u16(&format!("{}foo longword", osc8_open(url)));
+			for line in wrap_text_with_ansi_impl(&broken, width, DEFAULT_TAB_WIDTH) {
+				assert!(visible_width_u16(&line, DEFAULT_TAB_WIDTH) > 0);
+			}
+
+			// SGR-styled input keeps the same no-phantom-row guarantee.
+			let sgr = to_u16("\x1b[31mfoo ");
+			for line in wrap_text_with_ansi_impl(&sgr, width, DEFAULT_TAB_WIDTH) {
+				assert!(visible_width_u16(&line, DEFAULT_TAB_WIDTH) > 0);
+			}
+		}
+	}
+
+	#[test]
+	fn test_wrap_reemits_st_terminated_osc8_open_verbatim() {
+		let url = "https://example.com/a/very/long/url/that/wraps/over/two/lines/when/narrow";
+		let open_st = format!("\x1b]8;;{url}\x1b\\");
+		let close_st = "\x1b]8;;\x1b\\";
+		let data = to_u16(&format!("docs {open_st}{url}{close_st} trailing"));
+		let lines = wrap_text_with_ansi_impl(&data, 20, DEFAULT_TAB_WIDTH);
+		let fragments = &lines[1..lines.len() - 1];
+		assert!(fragments.len() >= 2);
+		for line in fragments {
+			let text = String::from_utf16_lossy(line);
+			assert!(text.contains(&open_st), "ST open not verbatim: {text:?}");
+		}
+	}
+
+	#[test]
+	fn test_wrap_keeps_distinct_osc8_targets_for_multiple_urls() {
+		let first = "https://a.test/one/long/url/that/wraps/across/rows";
+		let second = "https://b.test/two/long/url/that/wraps/across/rows";
+		let data = to_u16(&format!(
+			"see {}{}, and {}{}.",
+			osc8_open(first),
+			first,
+			osc8_open(second),
+			second
+		));
+		let lines = wrap_text_with_ansi_impl(&data, 20, DEFAULT_TAB_WIDTH);
+		let mut seen_first = false;
+		let mut seen_second = false;
+		for line in &lines {
+			for uri in osc8_uris(line) {
+				assert!(uri == first || uri == second, "extended uri: {uri:?}");
+				if uri == first {
+					seen_first = true;
+				} else {
+					seen_second = true;
+				}
+			}
+		}
+		assert!(seen_first && seen_second);
+	}
+
+	#[test]
+	fn test_wrap_carries_osc8_with_wide_unicode_and_sgr() {
+		let url = "https://example.com/a/very/long/url/that/wraps/over/two/lines/when/narrow";
+		// Wide Korean text before the link.
+		let data = to_u16(&format!("\u{c554}\u{b8e8} {}{}{}", osc8_open(url), url, OSC8_CLOSE));
+		let lines = wrap_text_with_ansi_impl(&data, 20, DEFAULT_TAB_WIDTH);
+		assert_eq!(visible_plain(&lines[0]), "\u{c554}\u{b8e8}");
+		for line in &lines[1..] {
+			assert_eq!(osc8_uris(line), vec![url.to_string()]);
+		}
+
+		// Underlined link: style restore and link open both continue.
+		let styled = to_u16(&format!("see \x1b[4m{}{}\x1b[24m now", osc8_open(url), url));
+		let styled_lines = wrap_text_with_ansi_impl(&styled, 20, DEFAULT_TAB_WIDTH);
+		for line in &styled_lines {
+			if !osc8_uris(line).is_empty() {
+				assert!(String::from_utf16_lossy(line).starts_with("\x1b[4m"));
+			}
+		}
+	}
+
+	#[test]
+	fn test_wrap_plain_text_has_no_osc8() {
+		let data = to_u16("just some words that wrap across rows");
+		let lines = wrap_text_with_ansi_impl(&data, 10, DEFAULT_TAB_WIDTH);
+		assert!(lines.len() > 1);
+		for line in &lines {
+			assert!(!String::from_utf16_lossy(line).contains("\x1b]8;"));
+		}
 	}
 }
