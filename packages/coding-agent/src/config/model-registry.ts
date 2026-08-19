@@ -730,7 +730,7 @@ function resolveApiKeyConfig(keyConfig: string): string | undefined {
 
 function resolveApiKeyEnvConfig(envKey: string | undefined): string | undefined {
 	if (!envKey) return undefined;
-	return Bun.env[envKey];
+	return $rotatingCredentialEnv(envKey);
 }
 
 function toPositiveNumberOrUndefined(value: unknown): number | undefined {
@@ -1833,7 +1833,6 @@ export class ModelRegistry {
 		for (const [providerName, providerConfig] of providerEntries) {
 			if (providerConfig.apiKeyEnv) {
 				this.#configuredApiKeyEnvNames.add(providerConfig.apiKeyEnv);
-				this.#customProviderApiKeyEnvNames.set(providerName, providerConfig.apiKeyEnv);
 			}
 			if (providerConfig.apiKey) this.#configuredApiKeyEnvNames.add(providerConfig.apiKey);
 			if (providerConfig.openaiCompat?.apiKeyEnv)
@@ -1843,15 +1842,21 @@ export class ModelRegistry {
 			if (providerConfig.webSearch) this.#providerWebSearchModes.set(providerName, providerConfig.webSearch);
 			const providerApiKeyConfig = providerConfig.apiKey ?? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv);
 			const localOpenAICompat = providerConfig.openaiCompat;
+			const rotatingApiKeyEnv = providerConfig.apiKey
+				? undefined
+				: (providerConfig.apiKeyEnv ?? (localOpenAICompat?.apiKey ? undefined : localOpenAICompat?.apiKeyEnv));
+			if (rotatingApiKeyEnv) this.#customProviderApiKeyEnvNames.set(providerName, rotatingApiKeyEnv);
 			const localOpenAICompatApiKeyConfig = localOpenAICompat
-				? (localOpenAICompat.apiKey ?? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv))
+				? localOpenAICompat.apiKey
+					? resolveApiKeyConfig(localOpenAICompat.apiKey)
+					: resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
 				: undefined;
 			if (localOpenAICompat) {
 				const localOpenAICompatBaseUrl = normalizeLocalOpenAICompatBaseUrl(localOpenAICompat.baseUrl);
-				const localCompatResolvedKey = localOpenAICompat.apiKeyEnv
-					? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
-					: localOpenAICompat.apiKey
-						? resolveApiKeyConfig(localOpenAICompat.apiKey)
+				const localCompatResolvedKey = localOpenAICompat.apiKey
+					? resolveApiKeyConfig(localOpenAICompat.apiKey)
+					: localOpenAICompat.apiKeyEnv
+						? resolveApiKeyEnvConfig(localOpenAICompat.apiKeyEnv)
 						: undefined;
 				overrides.set(providerName, {
 					baseUrl: localOpenAICompatBaseUrl,
@@ -1932,10 +1937,10 @@ export class ModelRegistry {
 			// bearer in models.yml (e.g. for an auth-gateway baseUrl), that bearer
 			// must authenticate the outbound request.
 			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
-				const resolved = providerConfig.apiKeyEnv
-					? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
-					: providerConfig.apiKey
-						? resolveApiKeyConfig(providerConfig.apiKey)
+				const resolved = providerConfig.apiKey
+					? resolveApiKeyConfig(providerConfig.apiKey)
+					: providerConfig.apiKeyEnv
+						? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
 						: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
 				if (resolved) this.authStorage.setConfigApiKey(providerName, resolved);
@@ -3405,10 +3410,10 @@ export class ModelRegistry {
 			const modelDefs = providerConfig.models ?? [];
 			if (modelDefs.length === 0) continue; // Override-only, no custom models
 			if (providerConfig.apiKey || providerConfig.apiKeyEnv) {
-				const resolved = providerConfig.apiKeyEnv
-					? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
-					: providerConfig.apiKey
-						? resolveApiKeyConfig(providerConfig.apiKey)
+				const resolved = providerConfig.apiKey
+					? resolveApiKeyConfig(providerConfig.apiKey)
+					: providerConfig.apiKeyEnv
+						? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
 						: undefined;
 				if (resolved) this.#customProviderApiKeys.set(providerName, resolved);
 				if (resolved) this.authStorage.setConfigApiKey(providerName, resolved);
@@ -3422,7 +3427,11 @@ export class ModelRegistry {
 					providerConfig.baseUrl!,
 					providerConfig.api as Api | undefined,
 					providerConfig.headers,
-					providerConfig.apiKeyEnv ? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv) : providerConfig.apiKey,
+					providerConfig.apiKey
+						? resolveApiKeyConfig(providerConfig.apiKey)
+						: providerConfig.apiKeyEnv
+							? resolveApiKeyEnvConfig(providerConfig.apiKeyEnv)
+							: undefined,
 					providerConfig.authHeader,
 					providerCompat,
 					providerConfig.requestTransform,
@@ -4078,6 +4087,7 @@ export class ModelRegistry {
 			baseUrl?: string;
 		} = {},
 	): Promise<string | undefined> {
+		this.#refreshRotatingConfigApiKey(provider);
 		if (!options.ignoreCredentiallessFallback && this.#isCredentiallessProvider(provider)) {
 			return kNoAuth;
 		}
