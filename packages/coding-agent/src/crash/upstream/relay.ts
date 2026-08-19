@@ -22,7 +22,18 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getTrustedAgentFile, normalizeCrashFrames, VERSION } from "@gajae-code/utils";
+import {
+	getCrashEventsPath,
+	getCrashIndexPath,
+	getCrashLogPath,
+	getHandledErrorEventsPath,
+	getHandledErrorIndexPath,
+	getHandledErrorLogPath,
+	getTrustedAgentFile,
+	isProjectEnvDeclaration,
+	normalizeCrashFrames,
+	VERSION,
+} from "@gajae-code/utils";
 import { $credentialEnv } from "@gajae-code/utils/env";
 import {
 	type CrashSignatureView,
@@ -185,22 +196,25 @@ function relayEventId(signature: CrashSignatureView): string {
 }
 
 /**
- * Automatic relay stores live under the provenance-checked agent directory.
- * These resolvers never consult XDG state, even when `$XDG_STATE_HOME/gjc` exists.
+ * Automatic relay stores use the normal XDG state location only when the XDG
+ * value came from a trusted environment. `dirs.ts` rejects checkout `.env`
+ * declarations before resolving these paths, including dotenv-expanded values.
  */
 export function resolveTrustedRelayStatePaths(): CrashStatePaths {
+	const useTrustedAgent = isProjectEnvDeclaration("XDG_STATE_HOME");
 	return {
-		index: getTrustedAgentFile("gjc-crash-index.json"),
-		events: getTrustedAgentFile("gjc-crash-events.jsonl"),
-		crashLog: getTrustedAgentFile("gjc-crash.log"),
+		index: useTrustedAgent ? getTrustedAgentFile("gjc-crash-index.json") : getCrashIndexPath(),
+		events: useTrustedAgent ? getTrustedAgentFile("gjc-crash-events.jsonl") : getCrashEventsPath(),
+		crashLog: useTrustedAgent ? getTrustedAgentFile("gjc-crash.log") : getCrashLogPath(),
 	};
 }
 
 export function resolveTrustedHandledRelayStatePaths(): CrashStatePaths {
+	const useTrustedAgent = isProjectEnvDeclaration("XDG_STATE_HOME");
 	return {
-		index: getTrustedAgentFile("gjc-error-index.json"),
-		events: getTrustedAgentFile("gjc-error-events.jsonl"),
-		crashLog: getTrustedAgentFile("gjc-error.log"),
+		index: useTrustedAgent ? getTrustedAgentFile("gjc-error-index.json") : getHandledErrorIndexPath(),
+		events: useTrustedAgent ? getTrustedAgentFile("gjc-error-events.jsonl") : getHandledErrorEventsPath(),
+		crashLog: useTrustedAgent ? getTrustedAgentFile("gjc-error.log") : getHandledErrorLogPath(),
 	};
 }
 
@@ -257,10 +271,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 	// the feature not existing.
 	if (!resolved.ok) return { status: "skipped", reason: resolved.reason };
 
-	// Relay historical crashes only from the provenance-checked agent
-	// directory. Ordinary crash-state resolvers honor XDG_STATE_HOME, which a
-	// repository `.env` can set and populate with a `gjc` child; those files
-	// are untrusted for automatic egress.
+	// The shared directory resolver permits trusted XDG state and rejects XDG
+	// values declared by the checkout's `.env` before they can select a store.
 	const paths = options.paths ?? resolveTrustedRelayStatePaths();
 	const fetchImpl = options.fetchImpl ?? fetch;
 	const now = options.now ?? Date.now;

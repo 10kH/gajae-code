@@ -70,7 +70,7 @@ export interface CrashSignatureEntry {
 	lastSeen: number;
 	lastRecordId: string;
 	/** Journal-append-order occurrence id, independent of display-time `lastSeen`. */
-	lastAppendRecordId: string;
+	lastAppendRecordId?: string;
 	reportedAt?: number;
 	reportedIssueUrl?: string;
 	acknowledgedAt?: number;
@@ -270,6 +270,13 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	if (raw.relayedAt !== undefined) entry.relayedAt = raw.relayedAt;
 	if (raw.relayedRecordId !== undefined) entry.relayedRecordId = raw.relayedRecordId;
 	if (raw.commentedIssues !== undefined) entry.commentedIssues = [...(raw.commentedIssues as string[])];
+	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) {
+		// A legacy entry may already occupy the complete serialized budget. The
+		// derived append watermark is redundant for that format, because the old
+		// lastRecordId remains the only known append-order id. Keep the entry
+		// readable rather than quarantining an otherwise valid index during upgrade.
+		if (raw.lastAppendRecordId === undefined) delete entry.lastAppendRecordId;
+	}
 	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) return undefined;
 	return entry;
 }

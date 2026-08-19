@@ -51,11 +51,11 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 		if (!isSafeEnvName(key) || value === undefined || !isSafeEnvValue(value)) continue;
 
 		// Bun may have already loaded cwd/.env before JS runs. It does not expose the
-		// source of each entry, so an exact match with projectEnv is ambiguous. Use
-		// the safer credential rule: ambiguous project matches are excluded from the
-		// credential-only inherited snapshot, while remaining available through $env.
-		const projectValue = resolveFileEnvValue(projectEnv, key);
-		if (projectValue !== undefined && projectValue === value) continue;
+		// source of each entry, so any project declaration is ambiguous, including a
+		// dotenv-expanded value that differs from the declaration text. Exclude it
+		// from the credential-only inherited snapshot, while keeping it available
+		// through $env.
+		if (Object.hasOwn(projectEnv, key)) continue;
 
 		result[key] = value;
 	}
@@ -100,12 +100,7 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 	const trimmed = value.trim();
 	if (trimmed.length === 0) return undefined;
 
-	const projectValue = resolveFileEnvValue(projectEnv, name);
-	if (
-		projectValue !== undefined &&
-		projectValue === trimmed &&
-		resolveFileEnvValue(inheritedEnv, name) === undefined
-	) {
+	if (Object.hasOwn(projectEnv, name) && resolveFileEnvValue(inheritedEnv, name) === undefined) {
 		return undefined;
 	}
 
