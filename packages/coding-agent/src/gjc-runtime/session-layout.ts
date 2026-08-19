@@ -125,6 +125,15 @@ export function sessionLogsDir(cwd: string, gjcSessionId: string): string {
 export function sessionRuntimeDir(cwd: string, gjcSessionId: string): string {
 	return path.join(sessionRoot(cwd, gjcSessionId), "runtime");
 }
+export function sessionIpykernelsDir(cwd: string, gjcSessionId: string): string {
+	return path.join(sessionRoot(cwd, gjcSessionId), "ipykernels");
+}
+export function sessionIpykernelsArtifactsDir(cwd: string, gjcSessionId: string): string {
+	return path.join(sessionIpykernelsDir(cwd, gjcSessionId), "artifacts");
+}
+export function pythonKernelTranscriptPath(cwd: string, gjcSessionId: string, dirName: string): string {
+	return path.join(sessionIpykernelsDir(cwd, gjcSessionId), dirName, "transcript.jsonl");
+}
 export function sessionAutoresearchDir(cwd: string, gjcSessionId: string): string {
 	return path.join(sessionRoot(cwd, gjcSessionId), "autoresearch");
 }

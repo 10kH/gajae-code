@@ -35,6 +35,8 @@ export interface PythonExecutorOptions {
 	kernelOwnerId?: string;
 	/** Kernel mode (session reuse vs per-call) */
 	kernelMode?: PythonKernelMode;
+	/** Called when a retained session kernel is acquired or replaced. */
+	onKernelStart?: (kernelInstanceId: string) => void;
 	/** Restart the kernel before executing */
 	reset?: boolean;
 	/** Session file path for accessing task outputs */
@@ -107,6 +109,7 @@ export interface PythonResult {
 interface PythonSession {
 	sessionId: string;
 	kernel: PythonKernel;
+	kernelInstanceId: string;
 	bridgeCapability?: string;
 	ownerIds: Set<string>;
 	hasFallbackOwner: boolean;
@@ -365,6 +368,7 @@ async function acquireSession(sessionId: string, cwd: string, options: PythonExe
 			const session: PythonSession = {
 				sessionId,
 				kernel,
+				kernelInstanceId: crypto.randomUUID(),
 				bridgeCapability: options.bridge?.capability,
 				ownerIds: new Set(),
 				hasFallbackOwner: false,
@@ -447,6 +451,7 @@ async function replaceSessionKernel(
 			throw new PythonExecutionCancelledError(false);
 		}
 		session.kernel = next;
+		session.kernelInstanceId = crypto.randomUUID();
 		session.bridgeCapability = nextCapability;
 	} catch (err) {
 		await next?.shutdown().catch(() => undefined);
@@ -716,6 +721,7 @@ async function executeOnSession(code: string, cwd: string, options: PythonExecut
 	if (options.bridge && session.bridgeCapability) {
 		options.bridge.capability = session.bridgeCapability;
 	}
+	options.onKernelStart?.(session.kernelInstanceId);
 	return await runQueued(session, options, async () => {
 		if (options.signal?.aborted) {
 			throw new PythonExecutionCancelledError(isTimedOutCancellation(options.signal.reason, options.signal));
@@ -728,6 +734,7 @@ async function executeOnSession(code: string, cwd: string, options: PythonExecut
 			if (sessions.get(session.sessionId) !== session) {
 				throw new PythonExecutionCancelledError(false);
 			}
+			options.onKernelStart?.(session.kernelInstanceId);
 		}
 		try {
 			return await executeWithKernel(session.kernel, code, options);
@@ -742,6 +749,7 @@ async function executeOnSession(code: string, cwd: string, options: PythonExecut
 			if (sessions.get(session.sessionId) !== session) {
 				throw new PythonExecutionCancelledError(false);
 			}
+			options.onKernelStart?.(session.kernelInstanceId);
 			return await executeWithKernel(session.kernel, code, options);
 		}
 	});
