@@ -781,7 +781,7 @@ export async function resolveRalplanTargetRoot(
 	return { root: canonical, explicit: true };
 }
 
-async function assertExplicitTargetGjcNotSymlinked(root: string): Promise<void> {
+export async function assertExplicitTargetGjcNotSymlinked(root: string): Promise<void> {
 	const gjcRoot = path.join(root, ".gjc");
 	let st: fssync.Stats;
 	try {
@@ -827,7 +827,7 @@ async function readConfinedArtifactFile(candidate: string, confineRoot: string):
 		try {
 			openedIdentity = await fs.realpath(fdPath);
 		} catch {
-			openedIdentity = path.resolve(candidate);
+			throw new RalplanCommandError(2, `ralplan --artifact identity could not be established: ${candidate}`);
 		}
 		const relative = path.relative(realRoot, openedIdentity);
 		if (relative.startsWith("..") || path.isAbsolute(relative)) {

@@ -922,4 +922,27 @@ describe("ralplan --worktree-root explicit target binding (#4693)", () => {
 		expect(write.stderr ?? "").toMatch(/escapes the invoking cwd|failed to read --artifact/);
 		expect(await pathExists(path.join(runDir(target, session, session), "stage-01-planner.md"))).toBe(false);
 	});
+	it("public CLI refuses a symlinked target .gjc before settings migration", async () => {
+		const target = await initRepo("gjc-ralplan-target-");
+		const dispatcher = await initRepo("gjc-ralplan-dispatcher-");
+		const outside = await tempDir("gjc-ralplan-gjc-outside-cli-");
+		await fs.writeFile(path.join(outside, "settings.json"), JSON.stringify({ "gjc.ralplan.maxIterations": 7 }));
+		await fs.symlink(outside, path.join(target, ".gjc"));
+		const probe = path.join(import.meta.dir, "../fixtures/ralplan-cli-worktree-root-probe.ts");
+		const proc = Bun.spawn(
+			[process.execPath, probe, "--worktree-root", target, "--session-id", "cli-gjc-symlink", "--json", "task"],
+			{
+				cwd: dispatcher,
+				stdout: "pipe",
+				stderr: "pipe",
+				env: { ...process.env },
+			},
+		);
+		const status = await proc.exited;
+		const stderr = await new Response(proc.stderr).text();
+		expect(status).toBe(2);
+		expect(stderr).toMatch(/symlinked \.gjc|escapes the target worktree/);
+		expect(await pathExists(path.join(outside, "config.yml"))).toBe(false);
+		expect(await pathExists(path.join(dispatcher, ".gjc"))).toBe(false);
+	});
 });
