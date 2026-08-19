@@ -123,19 +123,37 @@ describe("resolveHerdrPaneEnvironment", () => {
 	it("defers to the ancestor gjc that already owns the pane", () => {
 		expect(
 			resolveHerdrPaneEnvironment({
-				env: paneEnv({ GJC_HERDR_PANE_OWNER: "pane-7:100" }),
+				env: paneEnv({
+					GJC_HERDR_PANE_OWNER: JSON.stringify({
+						version: 1,
+						paneId: "pane-7",
+						pid: 100,
+						incarnation: "linux:100",
+						token: "ancestor-token-100",
+					}),
+				}),
 				which: () => "/usr/bin/herdr",
 				pid: 200,
+				processIncarnation: () => "linux:100",
 			}),
 		).toBeNull();
 	});
 
 	it("still reports when the standing claim is this process's own", () => {
+		const env = paneEnv();
+		installHerdrReporter(eventSource().subscribe, {
+			env,
+			spawn: recordingSpawn().spawn,
+			which: () => "/usr/bin/herdr",
+			pid: 100,
+			processIncarnation: () => "linux:100",
+		});
 		expect(
 			resolveHerdrPaneEnvironment({
-				env: paneEnv({ GJC_HERDR_PANE_OWNER: "pane-7:100" }),
+				env,
 				which: () => "/usr/bin/herdr",
 				pid: 100,
+				processIncarnation: () => "linux:100",
 			}),
 		).toEqual({ paneId: "pane-7", binPath: "/usr/bin/herdr" });
 	});
@@ -143,22 +161,120 @@ describe("resolveHerdrPaneEnvironment", () => {
 	it("ignores a claim inherited from a different pane", () => {
 		expect(
 			resolveHerdrPaneEnvironment({
-				env: paneEnv({ GJC_HERDR_PANE_OWNER: "pane-3:100" }),
+				env: paneEnv({
+					GJC_HERDR_PANE_OWNER: JSON.stringify({
+						version: 1,
+						paneId: "pane-3",
+						pid: 100,
+						incarnation: "linux:100",
+						token: "foreign-pane-token",
+					}),
+				}),
 				which: () => "/usr/bin/herdr",
 				pid: 200,
 			}),
 		).toEqual({ paneId: "pane-7", binPath: "/usr/bin/herdr" });
 	});
 
-	it("splits the claim correctly for a Herdr pane id that contains a colon", () => {
-		// Real Herdr pane ids look like `wT:p1`, so the pid delimiter is the last
-		// colon, not the first.
-		const env = paneEnv({ HERDR_PANE_ID: "wT:p1", GJC_HERDR_PANE_OWNER: "wT:p1:100" });
-		expect(resolveHerdrPaneEnvironment({ env, which: () => "/usr/bin/herdr", pid: 200 })).toBeNull();
-		expect(resolveHerdrPaneEnvironment({ env, which: () => "/usr/bin/herdr", pid: 100 })).toEqual({
-			paneId: "wT:p1",
+	it("handles a Herdr pane id that contains a colon", () => {
+		const env = paneEnv({
+			HERDR_PANE_ID: "wT:p1",
+			GJC_HERDR_PANE_OWNER: JSON.stringify({
+				version: 1,
+				paneId: "wT:p1",
+				pid: 100,
+				incarnation: "linux:100",
+				token: "colon-pane-token",
+			}),
+		});
+		expect(
+			resolveHerdrPaneEnvironment({
+				env,
+				which: () => "/usr/bin/herdr",
+				pid: 200,
+				processIncarnation: () => "linux:100",
+			}),
+		).toBeNull();
+	});
+
+	it("reclaims a marker after PID reuse", () => {
+		const env = paneEnv({
+			GJC_HERDR_PANE_OWNER: JSON.stringify({
+				version: 1,
+				paneId: "pane-7",
+				pid: 100,
+				incarnation: "linux:old",
+				token: "reused-pid-token",
+			}),
+		});
+		expect(
+			resolveHerdrPaneEnvironment({
+				env,
+				which: () => "/usr/bin/herdr",
+				pid: 200,
+				processIncarnation: () => "linux:new",
+			}),
+		).toEqual({ paneId: "pane-7", binPath: "/usr/bin/herdr" });
+		expect(env.GJC_HERDR_PANE_OWNER).toBeUndefined();
+	});
+
+	it("reclaims a marker after the parent exits", () => {
+		const env = paneEnv({
+			GJC_HERDR_PANE_OWNER: JSON.stringify({
+				version: 1,
+				paneId: "pane-7",
+				pid: 100,
+				incarnation: "linux:dead",
+				token: "dead-parent-token",
+			}),
+		});
+		expect(
+			resolveHerdrPaneEnvironment({
+				env,
+				which: () => "/usr/bin/herdr",
+				pid: 200,
+				processIncarnation: () => undefined,
+			}),
+		).toEqual({ paneId: "pane-7", binPath: "/usr/bin/herdr" });
+		expect(env.GJC_HERDR_PANE_OWNER).toBeUndefined();
+	});
+
+	it("fails closed when a non-Linux owner probe is unverifiable", () => {
+		const env = paneEnv({
+			GJC_HERDR_PANE_OWNER: JSON.stringify({
+				version: 1,
+				paneId: "pane-7",
+				pid: 100,
+				incarnation: "darwin:1:2",
+				token: "unverifiable-owner",
+			}),
+		});
+		expect(
+			resolveHerdrPaneEnvironment({
+				env,
+				which: () => "/usr/bin/herdr",
+				pid: 200,
+				processProbe: () => ({ state: "unverifiable" }),
+			}),
+		).toBeNull();
+		expect(env.GJC_HERDR_PANE_OWNER).toBeDefined();
+	});
+
+	it("does not trust a same-process marker supplied through the environment", () => {
+		const env = paneEnv({
+			GJC_HERDR_PANE_OWNER: JSON.stringify({
+				version: 1,
+				paneId: "pane-7",
+				pid: process.pid,
+				incarnation: "linux:spoofed",
+				token: "spoofed-token-123456",
+			}),
+		});
+		expect(resolveHerdrPaneEnvironment({ env, which: () => "/usr/bin/herdr" })).toEqual({
+			paneId: "pane-7",
 			binPath: "/usr/bin/herdr",
 		});
+		expect(env.GJC_HERDR_PANE_OWNER).toBeUndefined();
 	});
 });
 
@@ -172,7 +288,39 @@ describe("herdr pane ownership", () => {
 			pid: 4242,
 		});
 
-		expect(env.GJC_HERDR_PANE_OWNER).toBe("pane-7:4242");
+		const marker = JSON.parse(env.GJC_HERDR_PANE_OWNER ?? "null") as {
+			paneId?: string;
+			pid?: number;
+			version?: number;
+		};
+		expect(marker).toMatchObject({ version: 1, paneId: "pane-7", pid: 4242 });
+	});
+
+	it("clears its inherited claim when released", () => {
+		const env = paneEnv();
+		const reporter = installHerdrReporter(eventSource().subscribe, {
+			env,
+			spawn: recordingSpawn().spawn,
+			which: () => "/usr/bin/herdr",
+			pid: 4242,
+		});
+
+		reporter?.release();
+		expect(env.GJC_HERDR_PANE_OWNER).toBeUndefined();
+	});
+
+	it("clears the exact claim even when identity probing is transient", () => {
+		const env = paneEnv();
+		let probes = 0;
+		const reporter = installHerdrReporter(eventSource().subscribe, {
+			env,
+			spawn: recordingSpawn().spawn,
+			which: () => "/usr/bin/herdr",
+			processIncarnation: () => `linux:${++probes}`,
+		});
+
+		reporter?.release();
+		expect(env.GJC_HERDR_PANE_OWNER).toBeUndefined();
 	});
 
 	it("keeps a nested gjc from claiming or releasing its parent's pane", () => {
@@ -190,12 +338,19 @@ describe("herdr pane ownership", () => {
 			spawn: parent.spawn,
 			which: () => "/usr/bin/herdr",
 			pid: 100,
+			processIncarnation: () => "linux:100",
 		});
 		expect(parent.calls).toHaveLength(1);
 
 		const nested = recordingSpawn();
 		const nestedSource = eventSource();
-		const nestedOptions = { env, spawn: nested.spawn, which: () => "/usr/bin/herdr", pid: 200 };
+		const nestedOptions = {
+			env,
+			spawn: nested.spawn,
+			which: () => "/usr/bin/herdr",
+			pid: 200,
+			processIncarnation: () => "linux:100",
+		};
 		const nestedReporter = installHerdrReporter(nestedSource.subscribe, nestedOptions);
 		syncHerdrPaneTitle("nested doctor run", nestedOptions);
 
@@ -206,7 +361,8 @@ describe("herdr pane ownership", () => {
 		// The parent keeps reporting for the pane it owns.
 		parentSource.emit({ type: "agent_start" });
 		expect(parent.calls.map(call => call.command.at(-3))).toEqual(["idle", "working"]);
-		expect(env.GJC_HERDR_PANE_OWNER).toBe("pane-7:100");
+		const marker = JSON.parse(env.GJC_HERDR_PANE_OWNER ?? "null") as { paneId?: string; pid?: number };
+		expect(marker).toMatchObject({ paneId: "pane-7", pid: 100 });
 	});
 });
 
@@ -328,7 +484,13 @@ describe("herdr reporter state machine", () => {
 	it("assigns strictly increasing sequence numbers including the release", () => {
 		const { calls, spawn } = recordingSpawn();
 		const source = eventSource();
-		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+		const reporter = installHerdrReporter(source.subscribe, {
+			env: paneEnv(),
+			spawn,
+			which: () => "/usr/bin/herdr",
+		});
+		expect(reporter).not.toBeNull();
+		if (!reporter) throw new Error("expected Herdr reporter");
 
 		source.emit({ type: "agent_start" });
 		source.emit({ type: "agent_end" });
@@ -350,10 +512,15 @@ describe("herdr reporter state machine", () => {
 		// would be dropped and the session would be missing from the sidebar.
 		const first = recordingSpawn();
 		const firstSource = eventSource();
-		const firstReporter = createHerdrReporter(PANE, firstSource.subscribe, { env: paneEnv(), spawn: first.spawn });
+		const firstReporter = installHerdrReporter(firstSource.subscribe, {
+			env: paneEnv(),
+			spawn: first.spawn,
+			which: () => "/usr/bin/herdr",
+		});
+		expect(firstReporter).not.toBeNull();
 		firstSource.emit({ type: "agent_start" });
 		firstSource.emit({ type: "agent_end" });
-		firstReporter.release();
+		firstReporter?.release();
 
 		await Bun.sleep(2);
 		const second = recordingSpawn();
@@ -368,13 +535,27 @@ describe("herdr reporter state machine", () => {
 		expect(firstOfSecond).toBeGreaterThan(lastOfFirst);
 	});
 
+	it("does not reuse a sequence seed for reporters created in one tick", () => {
+		const first = recordingSpawn();
+		createHerdrReporter(PANE, eventSource().subscribe, { env: paneEnv(), spawn: first.spawn });
+		const second = recordingSpawn();
+		createHerdrReporter(PANE, eventSource().subscribe, { env: paneEnv(), spawn: second.spawn });
+
+		expect(Number(second.calls[0]?.command.at(-1))).toBeGreaterThan(Number(first.calls[0]?.command.at(-1)));
+	});
+
 	it("releases the authority exactly once and unsubscribes", () => {
 		const { calls, spawn } = recordingSpawn();
 		const source = eventSource();
-		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+		const reporter = installHerdrReporter(source.subscribe, {
+			env: paneEnv(),
+			spawn,
+			which: () => "/usr/bin/herdr",
+		});
+		expect(reporter).not.toBeNull();
 
-		reporter.release();
-		reporter.release();
+		reporter?.release();
+		reporter?.release();
 
 		expect(source.attached).toBe(false);
 		expect(source.unsubscribeCount).toBe(1);
@@ -392,14 +573,27 @@ describe("herdr reporter state machine", () => {
 	it("ignores events and reports after release", () => {
 		const { calls, spawn } = recordingSpawn();
 		const source = eventSource();
-		const reporter = createHerdrReporter(PANE, source.subscribe, { env: paneEnv(), spawn });
+		const reporter = installHerdrReporter(source.subscribe, {
+			env: paneEnv(),
+			spawn,
+			which: () => "/usr/bin/herdr",
+		});
+		expect(reporter).not.toBeNull();
 
-		reporter.release();
+		reporter?.release();
 		source.emit({ type: "agent_start" });
-		reporter.report("working");
+		reporter?.report("working");
 
 		// idle at startup, then release-agent and the title retraction.
 		expect(calls).toHaveLength(3);
+	});
+
+	it("does not release pane authority from the uninstalled reporter", () => {
+		const { calls, spawn } = recordingSpawn();
+		const reporter = createHerdrReporter(PANE, eventSource().subscribe, { env: paneEnv(), spawn });
+
+		reporter.release();
+		expect(calls).toHaveLength(1);
 	});
 
 	it("keeps reporting after a spawn throws synchronously", () => {
