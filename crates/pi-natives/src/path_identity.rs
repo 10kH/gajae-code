@@ -2,7 +2,13 @@
 
 #[cfg(any(unix, test))]
 use std::io::{self, Read};
-use std::path::{Component, Path, PathBuf};
+use std::{
+	path::{Component, Path, PathBuf},
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
+};
 
 use napi::{
 	JsString,
@@ -25,51 +31,176 @@ pub struct NativeBrokerPublicationOperation {
 	pub kind: String,
 }
 
+/// Retained descriptors plus the serialization state for the two blocking
+/// primitives.
+///
+/// `writer` is acquired **only** on the libuv blocking pool. It is held across
+/// an unbounded `pwrite`/`fsync`, so any JS-thread path that took it would
+/// inherit that stall -- which is the whole failure this type exists to avoid
+/// (#4704). Observation and close therefore never touch it: they need the
+/// descriptors, not the write ordering.
+struct RetainedPublicationHandle {
+	publication: publication::RetainedPublication,
+	writer:      Mutex<()>,
+	closed:      AtomicBool,
+}
+
+impl RetainedPublicationHandle {
+	/// Run one blocking primitive under the single-writer lock. Never call this
+	/// from the JS thread.
+	fn write_serialized(
+		&self,
+		operation: impl FnOnce(&publication::RetainedPublication) -> String,
+	) -> String {
+		let _writer = self.writer.lock();
+		// Close wins every race it enters: an unresolved worker must not commit a
+		// heartbeat against authority the owner has already given up.
+		if self.closed.load(Ordering::Acquire) {
+			return "closed".to_owned();
+		}
+		operation(&self.publication)
+	}
+}
+
 /// Retained no-follow authority for the SDK publication namespace.
 #[napi]
 pub struct NativeRetainedBrokerPublication {
-	inner: Mutex<Option<publication::RetainedPublication>>,
+	/// Locked only long enough to clone or take the pointer, never across native
+	/// I/O, so acquiring it is bounded by memory access alone.
+	handle: Mutex<Option<Arc<RetainedPublicationHandle>>>,
+}
+
+impl NativeRetainedBrokerPublication {
+	fn retain(publication: publication::RetainedPublication) -> Self {
+		Self {
+			handle: Mutex::new(Some(Arc::new(RetainedPublicationHandle {
+				publication,
+				writer: Mutex::new(()),
+				closed: AtomicBool::new(false),
+			}))),
+		}
+	}
+
+	fn acquire(&self) -> Option<Arc<RetainedPublicationHandle>> {
+		self.handle.lock().clone()
+	}
+
+	/// Drive the pool's heartbeat body on the calling thread. Test-only: nothing
+	/// in production may run this off the blocking pool.
+	#[cfg(test)]
+	fn heartbeat_blocking(&self, heartbeat_at: &str) -> String {
+		run_heartbeat(self.acquire(), heartbeat_at)
+	}
+
+	/// Drive the pool's sync body on the calling thread. Test-only.
+	#[cfg(test)]
+	fn sync_blocking(&self) -> String {
+		run_sync(self.acquire())
+	}
+}
+
+/// The heartbeat body the blocking pool runs, shared with native lifecycle
+/// tests so they exercise the production path rather than a copy of it.
+fn run_heartbeat(handle: Option<Arc<RetainedPublicationHandle>>, heartbeat_at: &str) -> String {
+	handle.map_or_else(
+		|| "closed".to_owned(),
+		|handle| handle.write_serialized(|publication| publication.heartbeat(heartbeat_at)),
+	)
+}
+
+/// The sync body the blocking pool runs.
+fn run_sync(handle: Option<Arc<RetainedPublicationHandle>>) -> String {
+	handle.map_or_else(
+		|| "closed".to_owned(),
+		|handle| handle.write_serialized(publication::RetainedPublication::sync),
+	)
+}
+
+/// The read-only observation body the blocking pool runs for the watchdog.
+fn run_observe(handle: Option<Arc<RetainedPublicationHandle>>) -> String {
+	handle.map_or_else(
+		|| "ambiguous".to_owned(),
+		|handle| {
+			if handle.closed.load(Ordering::Acquire) {
+				"ambiguous".to_owned()
+			} else {
+				handle.publication.observe()
+			}
+		},
+	)
 }
 
 #[napi]
 impl NativeRetainedBrokerPublication {
+	/// Read-only observation. Deliberately synchronous: it is the authority
+	/// boundary that must not admit an await between proof and effect. It reads
+	/// descriptor identity only -- no write, no fsync -- and never takes the
+	/// writer lock, so an unresolved heartbeat cannot block it.
 	#[napi]
 	pub fn observe(&self) -> NativeBrokerPublicationObservation {
-		let guard = self.inner.lock();
 		NativeBrokerPublicationObservation {
-			kind: guard
-				.as_ref()
-				.map_or_else(|| "ambiguous".to_owned(), publication::RetainedPublication::observe),
-		}
-	}
-
-	#[napi]
-	pub fn heartbeat(&self, heartbeat_at: String) -> NativeBrokerPublicationOperation {
-		let mut guard = self.inner.lock();
-		NativeBrokerPublicationOperation {
-			kind: guard.as_mut().map_or_else(
-				|| "closed".to_owned(),
-				|publication| publication.heartbeat(&heartbeat_at),
+			kind: self.acquire().map_or_else(
+				|| "ambiguous".to_owned(),
+				|handle| {
+					if handle.closed.load(Ordering::Acquire) {
+						"ambiguous".to_owned()
+					} else {
+						handle.publication.observe()
+					}
+				},
 			),
 		}
 	}
 
+	/// Read-only observation on the libuv blocking pool for watchdog paths.
 	#[napi]
-	pub fn sync(&self) -> NativeBrokerPublicationOperation {
-		let guard = self.inner.lock();
-		NativeBrokerPublicationOperation {
-			kind: guard
-				.as_ref()
-				.map_or_else(|| "closed".to_owned(), publication::RetainedPublication::sync),
-		}
+	pub fn observe_async(&self) -> task::Promise<NativeBrokerPublicationObservation> {
+		let handle = self.acquire();
+		task::blocking("broker_publication_observe", (), move |_| {
+			Ok(NativeBrokerPublicationObservation { kind: run_observe(handle) })
+		})
 	}
 
-	/// Close discovery, owner record, lock directory, and SDK root in that
-	/// order.
+	/// Positional heartbeat write on the libuv blocking pool. The write is an
+	/// unbounded `pwrite` against retained authority: on the JS thread a stalled
+	/// filesystem would freeze the whole process, including the timers that are
+	/// supposed to notice the stall.
+	#[napi]
+	pub fn heartbeat_async(
+		&self,
+		heartbeat_at: String,
+	) -> task::Promise<NativeBrokerPublicationOperation> {
+		let handle = self.acquire();
+		task::blocking("broker_publication_heartbeat", (), move |_| {
+			Ok(NativeBrokerPublicationOperation { kind: run_heartbeat(handle, &heartbeat_at) })
+		})
+	}
+
+	/// `fsync` on the libuv blocking pool. It returns when the device says so,
+	/// which is never bounded, so it may not run on the JS thread either.
+	#[napi]
+	pub fn sync_async(&self) -> task::Promise<NativeBrokerPublicationOperation> {
+		let handle = self.acquire();
+		task::blocking("broker_publication_sync", (), move |_| {
+			Ok(NativeBrokerPublicationOperation { kind: run_sync(handle) })
+		})
+	}
+
+	/// Give up discovery, owner record, lock directory, and SDK root authority.
+	///
+	/// Detaches the handle without waiting for anything: an unresolved worker
+	/// keeps its own `Arc` alive, observes the closed flag, and returns `closed`
+	/// without committing, and the descriptors are released when that last
+	/// reference drops on the pool thread. A shutdown blocked behind an
+	/// unbounded write is exactly the wedge this must not reproduce.
 	#[napi]
 	pub fn close(&self) -> NativeBrokerPublicationOperation {
-		let mut guard = self.inner.lock();
-		guard.take();
+		// The guard is dropped on this statement, before the flag store, so the
+		// handle lock is never held across anything but the take itself.
+		let detached = self.handle.lock().take();
+		if let Some(handle) = detached {
+			handle.closed.store(true, Ordering::Release);
+		}
 		NativeBrokerPublicationOperation { kind: "closed".to_owned() }
 	}
 }
@@ -84,7 +215,7 @@ pub fn retain_broker_publication(
 		publication::RetainedPublication::open(Path::new(&agent_dir)).ok_or_else(|| {
 			napi::Error::from_reason("Retained broker publication authority is unavailable.")
 		})?;
-	Ok(NativeRetainedBrokerPublication { inner: Mutex::new(Some(publication)) })
+	Ok(NativeRetainedBrokerPublication::retain(publication))
 }
 
 /// Result of resolving an existing directory to its stable platform identity.
@@ -1483,7 +1614,7 @@ mod publication {
 			"ambiguous".to_owned()
 		}
 
-		pub(super) fn heartbeat(&mut self, _: &str) -> String {
+		pub(super) fn heartbeat(&self, _: &str) -> String {
 			"ambiguous".to_owned()
 		}
 
@@ -8457,10 +8588,10 @@ mod retained_broker_publication_tests {
 		assert_eq!(publication.heartbeat("1234567890888"), "written");
 		assert!(!dir.0.join("sdk/broker.json").exists());
 
-		let retained =
-			NativeRetainedBrokerPublication { inner: parking_lot::Mutex::new(Some(publication)) };
+		let retained = NativeRetainedBrokerPublication::retain(publication);
 		assert_eq!(retained.close().kind, "closed");
-		assert_eq!(retained.heartbeat("1234567890777".to_owned()).kind, "closed");
+		assert_eq!(retained.heartbeat_blocking("1234567890777"), "closed");
+		assert_eq!(retained.sync_blocking(), "closed");
 		assert_eq!(retained.observe().kind, "ambiguous");
 	}
 
@@ -8475,6 +8606,58 @@ mod retained_broker_publication_tests {
 
 		assert_eq!(publication.observe(), "replaced");
 		assert_eq!(publication.heartbeat("not-a-timestamp"), "ambiguous");
+	}
+
+	/// The shutdown contract under an unresolved blocking worker (#4704).
+	///
+	/// A real stalled `pwrite`/`fsync` cannot be produced on demand, but what it
+	/// does to this type is exact and reproducible: it occupies the
+	/// single-writer lock for an unbounded time. A thread parked while holding
+	/// that lock is therefore a faithful stand-in, and it is the state the JS
+	/// thread used to deadlock against -- `close()` and `observe()` took the
+	/// same mutex.
+	#[test]
+	fn close_and_observe_never_wait_on_an_unresolved_blocking_worker() {
+		let dir = TempDir::new();
+		publish(&dir.0);
+		let publication = RetainedPublication::open(&dir.0).expect("retain published objects");
+		let retained = std::sync::Arc::new(NativeRetainedBrokerPublication::retain(publication));
+		let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+		let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+		let worker_handle = std::sync::Arc::clone(&retained);
+		let worker = std::thread::spawn(move || {
+			let handle = worker_handle.acquire().expect("retained handle");
+			handle.write_serialized(|_| {
+				entered_tx.send(()).expect("report worker entry");
+				release_rx.recv().expect("await worker release");
+				"written".to_owned()
+			})
+		});
+		entered_rx
+			.recv_timeout(std::time::Duration::from_secs(10))
+			.expect("worker must hold the single-writer lock");
+
+		// Both run on the JS thread in production and must return regardless of the
+		// parked worker. A regression here hangs the test rather than failing it,
+		// which is the honest signal: that is what it does to the broker.
+		assert_eq!(retained.observe().kind, "owned");
+		assert_eq!(retained.close().kind, "closed");
+		assert_eq!(retained.observe().kind, "ambiguous");
+
+		// Authority is given up immediately, so work queued behind the parked worker
+		// is refused instead of committing against abandoned authority.
+		let queued = {
+			let queued_handle = std::sync::Arc::clone(&retained);
+			std::thread::spawn(move || queued_handle.heartbeat_blocking("1234567890111"))
+		};
+
+		release_tx.send(()).expect("release the parked worker");
+		// The in-flight worker still completes and propagates its own result: close
+		// detaches, it does not cancel or poison what was already committed.
+		assert_eq!(worker.join().expect("worker thread"), "written");
+		assert_eq!(queued.join().expect("queued thread"), "closed");
+		assert_eq!(retained.heartbeat_blocking("1234567890222"), "closed");
+		assert_eq!(retained.sync_blocking(), "closed");
 	}
 }
 
