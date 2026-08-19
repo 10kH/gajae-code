@@ -168,6 +168,7 @@ describe("provider environment isolation", () => {
 			GOOGLE_APPLICATION_CREDENTIALS: "/ambient/credentials.json",
 			HUGGINGFACE_HUB_TOKEN: "ambient-huggingface-token",
 			GITHUB_TOKEN: "ambient-github-token",
+			GITLAB_TOKEN: "ambient-gitlab-token",
 			PERPLEXITY_COOKIES: "ambient-cookies",
 			SEARXNG_ENDPOINT: "https://search.example.test",
 			CLAUDE_CODE_CLIENT_KEY: "/ambient/client.key",
@@ -180,6 +181,8 @@ describe("provider environment isolation", () => {
 			https_proxy: "https://lower-proxy.example.test",
 			http_proxy: "http://lower-proxy.example.test",
 			all_proxy: "socks5://lower-proxy.example.test",
+			ZCODE_APP_VERSION: "ambient-version",
+			ZCODE_RELEASE_CHANNEL: "ambient-channel",
 			PATH: "/usr/bin",
 		};
 
