@@ -830,23 +830,43 @@ export async function collectActiveProviderIds(
 const MAX_MODEL_CATALOG_PAGES = 100;
 
 /**
- * Collect every page of `models.list/current` (Q10) into one catalog so the
- * active-provider filter never drops models that only appear on later pages.
- * The SDK pages Q10 at a fixed byte target (256 KiB), which a fully
- * configured catalog can exceed. Returns the same
- * `{ result: { page: { items } } }` envelope `pageItems` consumes.
+ * Validate one `models.list/current` response and return its page. The SDK pages
+ * Q10 at a fixed byte target (256 KiB), which a fully configured catalog can
+ * exceed, so every page shape failure fails closed instead of silently dropping
+ * models the active-provider filter would need.
  */
-export async function collectModelCatalog(adapter: Pick<AcpSdkAdapter, "query">): Promise<unknown> {
+interface ModelCatalogPage {
+	items: unknown[];
+	complete?: unknown;
+	continuationCursor?: unknown;
+}
+
+function requireCatalogPage(response: unknown): ModelCatalogPage {
+	const page = queryPage(response);
+	if (!page) throw new AcpSdkAdapterError("protocol_error", "models.list/current returned no page.");
+	if (!Array.isArray(page.items))
+		throw new AcpSdkAdapterError("protocol_error", "models.list/current returned a malformed page.");
+	return page as ModelCatalogPage;
+}
+
+async function collectModelCatalogContinuation(
+	adapter: Pick<AcpSdkAdapter, "query">,
+	firstPage: ModelCatalogPage,
+): Promise<unknown[]> {
+	if (firstPage.complete === true) return [];
+	if (typeof firstPage.continuationCursor !== "string")
+		throw new AcpSdkAdapterError(
+			"protocol_error",
+			"models.list/current page is incomplete without a continuation cursor.",
+		);
+	let cursor: string | undefined = firstPage.continuationCursor;
 	const items: unknown[] = [];
-	let cursor: string | undefined;
-	for (let pageCount = 0; pageCount < MAX_MODEL_CATALOG_PAGES; pageCount++) {
+	// Page 1 was already consumed by the caller, so the remaining budget is one shorter.
+	for (let pageCount = 1; pageCount < MAX_MODEL_CATALOG_PAGES; pageCount++) {
 		const response = await adapter.query("models.list/current", {}, cursor);
-		const page = queryPage(response);
-		if (!page) throw new AcpSdkAdapterError("protocol_error", "models.list/current returned no page.");
-		if (!Array.isArray(page.items))
-			throw new AcpSdkAdapterError("protocol_error", "models.list/current returned a malformed page.");
+		const page = requireCatalogPage(response);
 		items.push(...page.items);
-		if (page.complete === true) return { result: { page: { items } } };
+		if (page.complete === true) return items;
 		if (typeof page.continuationCursor !== "string")
 			throw new AcpSdkAdapterError(
 				"protocol_error",
@@ -855,6 +875,32 @@ export async function collectModelCatalog(adapter: Pick<AcpSdkAdapter, "query">)
 		cursor = page.continuationCursor;
 	}
 	throw new AcpSdkAdapterError("protocol_error", "models.list/current exceeded the page budget.");
+}
+
+/**
+ * Collect the model catalog (Q10) and the active-provider set (Q29) under one
+ * credential ordering. Assembling the first Q10 page is what finalizes host-side
+ * credential state — expired or invalid OAuth credentials are refreshed or
+ * disabled while that snapshot is built, and continuation pages replay the
+ * frozen revision without further side effects — so Q29 must not start until
+ * page 1 has resolved. Starting both together would let Q29 snapshot pre-refresh
+ * credential state and mix catalog rows and provider availability from different
+ * credential states. After page 1, the provider walk overlaps the remaining
+ * catalog pages instead of adding its latency after them.
+ */
+export async function collectModelCatalogAndActiveProviders(
+	adapter: Pick<AcpSdkAdapter, "query">,
+): Promise<{ modelCatalog: unknown; activeProviders: ReadonlySet<string> | undefined }> {
+	const firstResponse = await adapter.query("models.list/current");
+	const firstPage = requireCatalogPage(firstResponse);
+	const [remaining, activeProviders] = await Promise.all([
+		collectModelCatalogContinuation(adapter, firstPage),
+		collectActiveProviderIds(adapter),
+	]);
+	return {
+		modelCatalog: { result: { page: { items: [...firstPage.items, ...remaining] } } },
+		activeProviders,
+	};
 }
 
 const THINKING_CONFIG_OPTIONS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"].map(value => ({
@@ -2848,15 +2894,26 @@ export class AcpAgent implements Agent {
 		const record = this.#sessions.get(id);
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${id}`);
 		const modelPreset = this.#startupOptions?.modelPreset;
-		const [config, modelCatalog] = await Promise.all([
+		const [config, sessionCatalog] = await Promise.all([
 			record.adapter.query("config.list/get"),
-			modelPreset === undefined ? collectModelCatalog(record.adapter) : record.adapter.query("models.profiles.list"),
+			modelPreset === undefined
+				? collectModelCatalogAndActiveProviders(record.adapter)
+				: record.adapter
+						.query("models.profiles.list")
+						.then((profiles): { modelCatalog: unknown; activeProviders: undefined } => ({
+							modelCatalog: profiles,
+							activeProviders: undefined,
+						})),
 		]);
-		// Resolve usable providers in parallel. Only an older session host that
-		// rejects `providers.list/active` with `operation_not_session_owned`
-		// falls back to the full catalog; operational failures fail closed so
-		// the active-provider contract is not silently widened.
-		const activeProviders = modelPreset === undefined ? await collectActiveProviderIds(record.adapter) : undefined;
+		// The active-provider walk overlaps the catalog inside the batch above, but
+		// only after the first models.list/current page has finalized host-side
+		// credential state, so catalog rows and provider availability never mix
+		// pre- and post-refresh credential snapshots. Only an older session host
+		// that rejects `providers.list/active` with `operation_not_session_owned`
+		// falls back to the full catalog; operational failures fail closed so the
+		// active-provider contract is not silently widened.
+		const modelCatalog = sessionCatalog.modelCatalog;
+		const activeProviders = sessionCatalog.activeProviders;
 		record.authFailure = undefined;
 		if (modelPreset !== undefined) {
 			const activePreset = configValues(config).get(MODEL_PRESET_CONFIG_KEY);

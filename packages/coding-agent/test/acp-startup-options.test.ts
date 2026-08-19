@@ -11,7 +11,7 @@ import {
 	applyAcpPermissionMode,
 	applyAcpStartupOptions,
 	collectActiveProviderIds,
-	collectModelCatalog,
+	collectModelCatalogAndActiveProviders,
 	createAcpReverseConnection,
 	paginateAcpSessions,
 } from "../src/modes/acp/acp-agent";
@@ -362,7 +362,7 @@ test("ACP fails open only for an unsupported providers.list/active query", async
 	await expect(collectActiveProviderIds(operational)).rejects.toThrow("timed out");
 });
 test("ACP collects every model-catalog page before filtering", async () => {
-	const pages = [
+	const catalogPages = [
 		{
 			id: "1",
 			ok: true,
@@ -385,11 +385,135 @@ test("ACP collects every model-catalog page before filtering", async () => {
 		},
 	];
 	const adapter = {
-		query: async (_query: string, _input: unknown, cursor?: string) => (cursor === "cursor-2" ? pages[1] : pages[0]),
+		query: async (query: string, _input: unknown, cursor?: string) =>
+			query === "providers.list/active"
+				? {
+						id: "p",
+						ok: true,
+						page: { items: [{ provider: "anthropic", connectionKind: "credential" }], complete: true },
+					}
+				: cursor === "cursor-2"
+					? catalogPages[1]
+					: catalogPages[0],
 	} as never;
-	const catalog = await collectModelCatalog(adapter);
-	const items = (catalog as { result: { page: { items: unknown[] } } }).result.page.items;
+	const { modelCatalog, activeProviders } = await collectModelCatalogAndActiveProviders(adapter);
+	const items = (modelCatalog as { result: { page: { items: unknown[] } } }).result.page.items;
 	expect(items.map(item => (item as { id: string }).id)).toEqual(["deepseek-v4-flash", "gpt-5.6", "claude-opus"]);
+	expect(activeProviders).toEqual(new Set(["anthropic"]));
+});
+
+test("ACP starts providers.list/active only after the first catalog page resolves", async () => {
+	const events: string[] = [];
+	const pageTwo = Promise.withResolvers<{ id: string; ok: boolean; page: { items: unknown[]; complete: boolean } }>();
+	const providersStarted = Promise.withResolvers<void>();
+	let pageTwoBlocked = false;
+	const adapter = {
+		query: async (query: string, _input: unknown, cursor?: string) => {
+			if (query === "models.list/current" && cursor === undefined) {
+				events.push("catalog-page-1:start");
+				await Bun.sleep(10);
+				events.push("catalog-page-1:end");
+				return { id: "1", ok: true, page: { items: [], complete: false, continuationCursor: "cursor-2" } };
+			}
+			if (query === "models.list/current") {
+				events.push("catalog-page-2:start");
+				pageTwoBlocked = true;
+				const response = await pageTwo.promise;
+				pageTwoBlocked = false;
+				events.push("catalog-page-2:end");
+				return response;
+			}
+			events.push("providers:start");
+			providersStarted.resolve();
+			events.push("providers:end");
+			return { id: "3", ok: true, page: { items: [], complete: true } };
+		},
+	} as never;
+	const catalog = collectModelCatalogAndActiveProviders(adapter);
+	await providersStarted.promise;
+	// The provider walk must not begin before the first catalog page has fully
+	// resolved (credential side effects finalize there), but it must overlap the
+	// remaining catalog pages instead of waiting for the whole walk.
+	expect(events.indexOf("providers:start")).toBeGreaterThan(events.indexOf("catalog-page-1:end"));
+	expect(events.indexOf("catalog-page-2:start")).toBeGreaterThanOrEqual(events.indexOf("catalog-page-1:end"));
+	expect(pageTwoBlocked).toBe(true);
+	pageTwo.resolve({ id: "2", ok: true, page: { items: [], complete: true } });
+	await catalog;
+	expect(events).toContain("catalog-page-2:end");
+	expect(events).toContain("providers:end");
+});
+
+test("ACP combined catalog walk keeps the unsupported-host fallback", async () => {
+	const catalogPage = {
+		id: "1",
+		ok: true,
+		page: { items: [{ provider: "openai-codex", id: "gpt-5.6", name: "GPT 5.6" }], complete: true },
+	};
+	const unsupported = {
+		query: async (query: string) => {
+			if (query === "providers.list/active")
+				throw Object.assign(new Error("not installed"), { code: "operation_not_session_owned" });
+			return catalogPage;
+		},
+	} as never;
+	const { modelCatalog, activeProviders } = await collectModelCatalogAndActiveProviders(unsupported);
+	expect(activeProviders).toBeUndefined();
+	const items = (modelCatalog as { result: { page: { items: unknown[] } } }).result.page.items;
+	expect(items).toHaveLength(1);
+	// Operational provider-walk failures still fail closed.
+	const operational = {
+		query: async (query: string) => {
+			if (query === "providers.list/active") throw Object.assign(new Error("timed out"), { code: "timeout" });
+			return catalogPage;
+		},
+	} as never;
+	await expect(collectModelCatalogAndActiveProviders(operational)).rejects.toThrow("timed out");
+});
+
+test("ACP provider snapshot observes credential state finalized by the first catalog page", async () => {
+	// Controlled OAuth-refresh interleaving: assembling the first catalog page
+	// disables a provider whose credential turned out to be invalid (the host-side
+	// Q10 side effect). The provider walk must observe that finalized state, never
+	// a pre-refresh snapshot, no matter how the two walks interleave afterwards.
+	const usableProviders = new Set(["opencode-go", "openai-codex"]);
+	let providerCalls = 0;
+	const adapter = {
+		query: async (query: string, _input: unknown, cursor?: string) => {
+			if (query === "models.list/current" && cursor === undefined) {
+				await Bun.sleep(5);
+				// Host-side refresh finalizes mid-page: openai-codex is disabled.
+				usableProviders.delete("openai-codex");
+				return {
+					id: "1",
+					ok: true,
+					page: {
+						items: [
+							{ provider: "opencode-go", id: "deepseek-v4-flash", name: "DeepSeek V4 Flash" },
+							{ provider: "openai-codex", id: "gpt-5.6", name: "GPT 5.6" },
+						],
+						complete: false,
+						continuationCursor: "cursor-2",
+					},
+				};
+			}
+			if (query === "models.list/current") {
+				await Bun.sleep(5);
+				return { id: "2", ok: true, page: { items: [], complete: true } };
+			}
+			providerCalls += 1;
+			return {
+				id: "3",
+				ok: true,
+				page: {
+					items: [...usableProviders].map(provider => ({ provider, connectionKind: "credential" })),
+					complete: true,
+				},
+			};
+		},
+	} as never;
+	const { activeProviders } = await collectModelCatalogAndActiveProviders(adapter);
+	expect(providerCalls).toBe(1);
+	expect(activeProviders).toEqual(new Set(["opencode-go"]));
 });
 
 test("ACP hides unavailable presets but retains an unavailable active preset", () => {
