@@ -1468,6 +1468,7 @@ mod publication {
 		let flags = (if write { libc::O_RDWR } else { libc::O_RDONLY })
 			| libc::O_CLOEXEC
 			| libc::O_NOFOLLOW
+			| libc::O_NONBLOCK
 			| if directory { libc::O_DIRECTORY } else { 0 };
 		// SAFETY: `name` is a live NUL-terminated path and `flags` contains only
 		// valid open(2) flags. A non-negative descriptor is uniquely transferred
@@ -8532,8 +8533,14 @@ mod owner_only_security_tests {
 #[cfg(all(test, unix))]
 mod retained_broker_publication_tests {
 	use std::{
+		ffi::CString,
+		os::unix::ffi::OsStrExt,
 		path::PathBuf,
-		sync::atomic::{AtomicU64, Ordering},
+		sync::{
+			atomic::{AtomicU64, Ordering},
+			mpsc,
+		},
+		time::Duration,
 	};
 
 	use super::{NativeRetainedBrokerPublication, publication::RetainedPublication};
@@ -8606,6 +8613,32 @@ mod retained_broker_publication_tests {
 
 		assert_eq!(publication.observe(), "replaced");
 		assert_eq!(publication.heartbeat("not-a-timestamp"), "ambiguous");
+	}
+
+	#[test]
+	fn retained_publication_does_not_block_on_an_owner_fifo() {
+		let dir = TempDir::new();
+		publish(&dir.0);
+		let owner = dir.0.join("sdk/broker.lock/owner.json");
+		std::fs::remove_file(&owner).expect("remove regular owner record");
+		let owner_name = CString::new(owner.as_os_str().as_bytes()).expect("owner path has no NUL");
+		assert_eq!(unsafe { libc::mkfifo(owner_name.as_ptr(), 0o600) }, 0, "create owner FIFO");
+		std::fs::write(dir.0.join("sdk/broker.json"), b"{\"ownerId\":\"foreign\"}\n")
+			.expect("write malformed discovery record");
+
+		let (sender, receiver) = mpsc::channel();
+		let root = dir.0.clone();
+		let worker =
+			std::thread::spawn(move || sender.send(RetainedPublication::open(&root).is_some()));
+		assert!(
+			!receiver
+				.recv_timeout(Duration::from_secs(2))
+				.expect("owner FIFO must not block")
+		);
+		worker
+			.join()
+			.expect("retained publication probe thread must not panic")
+			.expect("retained publication result must be delivered");
 	}
 
 	/// The shutdown contract under an unresolved blocking worker (#4704).
