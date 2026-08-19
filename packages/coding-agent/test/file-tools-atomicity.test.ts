@@ -57,13 +57,14 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		const dest = path.join(tmpDir, "backend", "app", "routers", "automation_snapshots.py");
 		await fs.mkdir(path.dirname(dest), { recursive: true });
 		await fs.writeFile(dest, "original = True\n");
-		const original = spyOn(Bun, "write").mockImplementation(async target => {
-			if (String(target).includes(".tmp")) {
+		const realOpen = fs.open.bind(fs);
+		const original = spyOn(fs, "open").mockImplementation(async (target, flags) => {
+			if (String(target).includes(".tmp") && flags === "wx") {
 				const error = new Error("EPERM: Operation not permitted") as Error & { code: string };
 				error.code = "EPERM";
 				throw error;
 			}
-			throw new Error(`unexpected Bun.write to ${String(target)}`);
+			return realOpen(target, flags);
 		});
 		try {
 			await expect(writeFileAtomically(dest, "mutated = True\n")).rejects.toMatchObject({ code: "EPERM" });
@@ -77,13 +78,14 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 
 	it("does not create a 0-byte destination when a new-file staged write fails", async () => {
 		const dest = path.join(tmpDir, "new-file.py");
-		const original = spyOn(Bun, "write").mockImplementation(async target => {
-			if (String(target).includes(".tmp")) {
+		const realOpen = fs.open.bind(fs);
+		const original = spyOn(fs, "open").mockImplementation(async (target, flags) => {
+			if (String(target).includes(".tmp") && flags === "wx") {
 				const error = new Error("EPERM: Operation not permitted") as Error & { code: string };
 				error.code = "EPERM";
 				throw error;
 			}
-			throw new Error(`unexpected Bun.write to ${String(target)}`);
+			return realOpen(target, flags);
 		});
 		try {
 			await expect(writeFileAtomically(dest, "print('hi')\n")).rejects.toMatchObject({ code: "EPERM" });
@@ -99,7 +101,7 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 	});
 
 	it("surfaces a permission error without leaving a 0-byte file in a read-only directory", async () => {
-		if (typeof process.getuid === "function" && process.getuid() === 0) return;
+		if (process.platform === "win32" || (typeof process.getuid === "function" && process.getuid() === 0)) return;
 		const locked = path.join(tmpDir, "locked");
 		await fs.mkdir(locked);
 		await fs.chmod(locked, 0o555);
@@ -182,5 +184,56 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		const session = createSession(tmpDir, { fileReadCache: cache });
 		await new WriteTool(session).execute("cache-write", { path: dest, content: "new line\n" });
 		expect(cache.get(dest)).toBeNull();
+	});
+
+	it("writes through a destination symlink without replacing the link", async () => {
+		const target = path.join(tmpDir, "real.ts");
+		const link = path.join(tmpDir, "alias.ts");
+		await fs.writeFile(target, "old\n");
+		await fs.symlink(target, link);
+		await writeFileAtomically(link, "new\n");
+		expect(await fs.readFile(target, "utf8")).toBe("new\n");
+		expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+		expect(await fs.readlink(link)).toBe(target);
+	});
+
+	it("retries exclusive temp creation when a sibling name already exists", async () => {
+		const dest = path.join(tmpDir, "retry.ts");
+		const realOpen = fs.open.bind(fs);
+		let collisions = 0;
+		const original = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			if (String(target).includes(".tmp") && flags === "wx" && collisions < 1) {
+				collisions += 1;
+				const error = new Error("EEXIST: file already exists") as Error & { code: string };
+				error.code = "EEXIST";
+				throw error;
+			}
+			return realOpen(target, flags, mode);
+		});
+		try {
+			await writeFileAtomically(dest, "after retry\n");
+			expect(collisions).toBe(1);
+			expect(await fs.readFile(dest, "utf8")).toBe("after retry\n");
+		} finally {
+			original.mockRestore();
+		}
+	});
+
+	it("does not summarize a denied ACP file from disk", async () => {
+		const dest = path.join(tmpDir, "denied.ts");
+		await fs.writeFile(dest, "export function secret() { return 1; }\nexport function other() { return 2; }\n");
+		const bridge: ClientBridge = {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => {
+				const error = new Error("permission denied by client") as Error & { code: string };
+				error.code = "permission_denied";
+				throw error;
+			},
+		};
+		await expect(
+			new ReadTool(createSession(tmpDir, { getClientBridge: () => bridge })).execute("summary-denied", {
+				path: dest,
+			}),
+		).rejects.toThrow(/permission denied by client/);
 	});
 });

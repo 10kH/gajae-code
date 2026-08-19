@@ -135,7 +135,7 @@ content: ""
 - Filesystem
   - Creates or overwrites plain files.
   - Rewrites entire archive files when writing an archive entry.
-  - Creates parent directories for archive files only.
+  - Creates parent directories for plain files and archive files.
   - Mutates existing SQLite databases; never creates a new SQLite DB.
 - Subprocesses / native bindings
   - Uses Bun SQLite bindings via `bun:sqlite`.

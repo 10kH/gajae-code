@@ -2422,7 +2422,16 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		throwIfAborted(signal);
 		try {
 			const bridgeText = await bridgePromise;
-			const direction = resolveEffectiveDirection(truncation, "local-bare-stream", this.session.settings);
+			if (parsed.kind === "conflicts") return undefined;
+			const bareEligible = parsed.kind === "none";
+			const route = isMultiRange(parsed)
+				? "local-multi-range"
+				: bareEligible
+					? "local-bare-stream"
+					: isRawSelector(parsed)
+						? "local-raw"
+						: "local-range";
+			const direction = resolveEffectiveDirection(truncation, route, this.session.settings);
 			if (isMultiRange(parsed) && parsed.kind === "lines") {
 				return this.#buildInMemoryMultiRangeResult(bridgeText, parsed.ranges, {
 					details: { resolvedPath: absolutePath },
@@ -2455,10 +2464,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		try {
 			throwIfAborted(signal);
 			const bridgePromise = this.#routeReadThroughBridge(absolutePath);
-			const code =
-				bridgePromise !== undefined
-					? await bridgePromise.catch(() => Bun.file(absolutePath).text())
-					: await Bun.file(absolutePath).text();
+			let code: string;
+			if (bridgePromise !== undefined) {
+				try {
+					code = await bridgePromise;
+				} catch (error) {
+					if (isClientAuthorityDenial(error)) throw error;
+					code = await Bun.file(absolutePath).text();
+				}
+			} else {
+				code = await Bun.file(absolutePath).text();
+			}
 			throwIfAborted(signal);
 			if (countTextLines(code) > MAX_SUMMARY_LINES) return null;
 
@@ -2469,7 +2485,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				minBodyLines: this.session.settings.get("read.summarize.minBodyLines"),
 				minCommentLines: this.session.settings.get("read.summarize.minCommentLines"),
 			});
-		} catch {
+		} catch (error) {
+			if (isClientAuthorityDenial(error)) throw error;
 			return null;
 		}
 	}

@@ -418,6 +418,34 @@ describe("AgentSession state-aware compaction", () => {
 		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
 		expect(files).toContain("frontend/e2e/zzop-repro.spec.ts");
 	});
+	it("does not auto-continue from recent file mutations alone", async () => {
+		const writeCall = assistantMessage("stop");
+		writeCall.content = [
+			{
+				type: "toolCall",
+				id: "write-done",
+				name: "write",
+				arguments: { path: "frontend/e2e/zzop-repro.spec.ts", content: "test" },
+			},
+		];
+		session.agent.appendMessage(writeCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "write-done",
+			toolName: "write",
+			content: [{ type: "text", text: "Successfully wrote 4 bytes to frontend/e2e/zzop-repro.spec.ts" }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+		await compact();
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(notices).toContain("Auto-continue skipped: no unfinished work detected");
+	});
 
 	it("continues synthetic auto-continue for an active nonterminal workflow", async () => {
 		await seedActiveSkillState("active");
