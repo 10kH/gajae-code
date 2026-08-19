@@ -262,20 +262,24 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 		firstSeen: raw.firstSeen,
 		lastSeen: raw.lastSeen,
 		lastRecordId: raw.lastRecordId,
+		// Derive the append watermark for legacy entries, but retain it as the
+		// authoritative ordering identity. Optional reporting metadata is
+		// compacted below when an old entry already fills the byte budget.
 		lastAppendRecordId: typeof raw.lastAppendRecordId === "string" ? raw.lastAppendRecordId : raw.lastRecordId,
 	};
-	if (raw.reportedAt !== undefined) entry.reportedAt = raw.reportedAt;
-	if (raw.reportedIssueUrl !== undefined) entry.reportedIssueUrl = raw.reportedIssueUrl;
-	if (raw.acknowledgedAt !== undefined) entry.acknowledgedAt = raw.acknowledgedAt;
-	if (raw.relayedAt !== undefined) entry.relayedAt = raw.relayedAt;
-	if (raw.relayedRecordId !== undefined) entry.relayedRecordId = raw.relayedRecordId;
-	if (raw.commentedIssues !== undefined) entry.commentedIssues = [...(raw.commentedIssues as string[])];
-	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) {
-		// A legacy entry may already occupy the complete serialized budget. The
-		// derived append watermark is redundant for that format, because the old
-		// lastRecordId remains the only known append-order id. Keep the entry
-		// readable rather than quarantining an otherwise valid index during upgrade.
-		if (raw.lastAppendRecordId === undefined) delete entry.lastAppendRecordId;
+	const optional: readonly [keyof CrashSignatureEntry, unknown][] = [
+		["reportedAt", raw.reportedAt],
+		["reportedIssueUrl", raw.reportedIssueUrl],
+		["acknowledgedAt", raw.acknowledgedAt],
+		["relayedAt", raw.relayedAt],
+		["relayedRecordId", raw.relayedRecordId],
+		["commentedIssues", raw.commentedIssues === undefined ? undefined : [...(raw.commentedIssues as string[])]],
+	];
+	for (const [key, value] of optional) {
+		if (value === undefined) continue;
+		const candidate = { ...entry, [key]: value };
+		if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= CRASH_INDEX_ENTRY_MAX_BYTES)
+			(entry as unknown as Record<string, unknown>)[key] = value;
 	}
 	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) return undefined;
 	return entry;
@@ -452,14 +456,6 @@ function boundMessageClass(value: string): string {
 	return bytes.subarray(0, end).toString("utf8");
 }
 
-function dropOversizedDerivedWatermark(entry: CrashSignatureEntry): void {
-	if (
-		entry.lastAppendRecordId !== undefined &&
-		Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES
-	)
-		delete entry.lastAppendRecordId;
-}
-
 function evictOne(index: CrashIndex): boolean {
 	let victim: string | undefined;
 	let victimSeen = Number.POSITIVE_INFINITY;
@@ -550,7 +546,6 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 			existing.lastRecordId = event.recordId;
 			if (event.messageClass) existing.messageClass = boundMessageClass(event.messageClass);
 		}
-		dropOversizedDerivedWatermark(existing);
 		return true;
 	}
 	if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {

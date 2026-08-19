@@ -42,7 +42,7 @@ import {
 	listCrashSignatures,
 	recordCrashStateEvent,
 } from "../index-store";
-import { findLatestRecord } from "../record-loader";
+import { findRecordById } from "../record-loader";
 import { parseSentryDsn, type SentryDsn } from "./dsn";
 import { buildCrashEnvelope, type CrashEventFrame, sentryAuthHeader } from "./envelope";
 
@@ -314,7 +314,7 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 			if (claim.status === "failed") failed++;
 			continue;
 		}
-		const record = findLatestRecord(crashLog, signature.fingerprint);
+		const record = findRecordById(crashLog, signature.fingerprint, relayAppendRecordId(signature));
 		if (!record) {
 			refused++;
 			await claim.release().catch(() => {});

@@ -215,6 +215,17 @@ export function getConfigAgentDirName(): string {
 type XdgCategory = "data" | "state" | "cache";
 
 /**
+ * Resolve the home used for trusted agent state. Bun overlays a checkout's
+ * `.env` before module initialization, so `os.homedir()` can already reflect
+ * an attacker-controlled HOME. A checkout declaration therefore fails closed
+ * to the filesystem root rather than trusting any environment-derived home.
+ */
+function trustedHome(): string {
+	if (!isProjectEnvDeclaration("HOME")) return os.homedir();
+	return path.parse(process.cwd()).root;
+}
+
+/**
  * Resolves and caches all gajae-code directory paths. On Linux, when XDG environment
  * variables are set, paths are redirected under $XDG_*_HOME/gjc/. A new
  * instance is created whenever the agent directory changes, which naturally
@@ -233,7 +244,7 @@ class DirResolver {
 	readonly #agentCache = new Map<string, string>();
 
 	constructor(agentDirOverride?: string) {
-		this.configRoot = path.join(os.homedir(), getConfigDirName());
+		this.configRoot = path.join(trustedHome(), getConfigDirName());
 
 		const defaultAgent = path.join(this.configRoot, "agent");
 		this.agentDir = agentDirOverride ? path.resolve(agentDirOverride) : defaultAgent;
@@ -341,7 +352,7 @@ let dirs = new DirResolver(trustedAgentDirOverride());
 // test mocks of `os.homedir()`. `getPluginsDir(home)` compares against this so
 // production callers (`home === RESOLVER_HOME`) hit the XDG-aware resolver while
 // tests passing a temp HOME short-circuit to a deterministic path.
-const RESOLVER_HOME = os.homedir();
+const RESOLVER_HOME = trustedHome();
 
 // =============================================================================
 // Root directories

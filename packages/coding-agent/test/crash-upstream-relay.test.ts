@@ -553,6 +553,38 @@ describe("relayCrashSignatures", () => {
 		expect(called).toBe(0);
 	});
 
+	test("a same-fingerprint record with a mismatched append id is refused", async () => {
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: FINGERPRINT,
+				fpv: 1,
+				recordId: RECORD_ID,
+				at: 1_700_000_900_000,
+				errorName: "TypeError",
+				messageClass: "cannot read properties of <redacted>",
+			},
+			paths.events,
+		);
+		await fs.writeFile(
+			paths.crashLog,
+			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: forged body\n` +
+				`${STACK}\n${formatCrashRecordMarker(FINGERPRINT, 1, "fedcba9876543210")}\n\n`,
+		);
+		let called = 0;
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async () => {
+				called++;
+				return new Response("", { status: 200 });
+			},
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 0, refused: 1, failed: 0 });
+		expect(called).toBe(0);
+	});
+
 	test("never sends more than the per-run cap", async () => {
 		for (let i = 0; i < 4; i++)
 			await seed({ fingerprint: `${i}`.repeat(32), recordId: `${i}`.repeat(16), at: 1_700_000_900_000 + i });
@@ -777,6 +809,28 @@ describe("relay trust boundary against a hostile checkout", () => {
 			expect(filePath.startsWith(hostileAgent)).toBe(false);
 			expect(filePath.startsWith(result.agent)).toBe(true);
 		}
+	});
+
+	test("a checkout .env HOME declaration cannot redirect trusted relay state", async () => {
+		const hostileHome = path.join(dir, "checkout-home");
+		await fs.mkdir(hostileHome, { recursive: true });
+		await Bun.write(path.join(dir, ".env"), "HOME=$HOSTILE_HOME\n");
+		const relayPath = path.resolve(import.meta.dir, "../src/crash/upstream/relay.ts");
+		const dirsPath = path.resolve(import.meta.dir, "../../utils/src/dirs.ts");
+		const out = await runInCheckout(
+			`import { getAgentDir } from ${JSON.stringify(dirsPath)};\n` +
+				`import { resolveTrustedHandledRelayStatePaths, resolveTrustedRelayStatePaths } from ${JSON.stringify(relayPath)};\n` +
+				`console.log(JSON.stringify({ agent: getAgentDir(), fatal: resolveTrustedRelayStatePaths(), handled: resolveTrustedHandledRelayStatePaths() }));\n`,
+			{ HOME: hostileHome, HOSTILE_HOME: hostileHome },
+		);
+		const result = JSON.parse(out) as {
+			agent: string;
+			fatal: CrashStatePaths;
+			handled: CrashStatePaths;
+		};
+		expect(result.agent.startsWith(hostileHome)).toBe(false);
+		for (const store of [result.fatal, result.handled])
+			for (const filePath of Object.values(store)) expect(filePath.startsWith(hostileHome)).toBe(false);
 	});
 
 	test("trusted XDG state remains the relay store when set outside the checkout", async () => {

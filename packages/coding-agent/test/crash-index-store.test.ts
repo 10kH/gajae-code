@@ -125,11 +125,11 @@ describe("compactCrashIndex", () => {
 
 		const compacted = await compactCrashIndex({ paths, now: NOW });
 		expect(compacted.signatures[fingerprint]?.lifetimeCount).toBe(2);
-		expect(compacted.signatures[fingerprint]?.lastAppendRecordId).toBeUndefined();
+		expect(compacted.signatures[fingerprint]?.lastAppendRecordId).toBe(recordId(21));
 
 		const reparsed = parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW);
 		expect(reparsed?.signatures[fingerprint]?.lifetimeCount).toBe(2);
-		expect(reparsed?.signatures[fingerprint]?.lastAppendRecordId).toBeUndefined();
+		expect(reparsed?.signatures[fingerprint]?.lastAppendRecordId).toBe(recordId(21));
 	});
 
 	it("deduplicates a replayed rotated journal containing more than the recent id window", async () => {
@@ -595,7 +595,9 @@ describe("parseCrashIndex", () => {
 			NOW,
 		);
 		expect(parsed?.signatures[fingerprintFor(1)]).toBeDefined();
-		expect(parsed?.signatures[fingerprintFor(1)]?.lastAppendRecordId).toBeUndefined();
+		expect(parsed?.signatures[fingerprintFor(1)]?.lastAppendRecordId).toBe(
+			valid.signatures[fingerprintFor(1)]?.lastRecordId,
+		);
 	});
 
 	it.each([
