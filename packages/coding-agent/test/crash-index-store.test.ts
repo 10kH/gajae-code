@@ -97,12 +97,16 @@ describe("compactCrashIndex", () => {
 		const legacyEntry = {
 			fpv: 1,
 			errorName: "Error",
-			messageClass: "x".repeat(512),
+			messageClass: "x".repeat(200),
 			lifetimeCount: 1,
 			retainedCount: 0,
 			firstSeen: NOW - 1000,
 			lastSeen: NOW,
 			lastRecordId: firstRecordId,
+			relayedAt: NOW - 100,
+			relayedRecordId: firstRecordId,
+			reportedAt: NOW - 50,
+			reportedIssueUrl: `https://github.com/Yeachan-Heo/gajae-code/issues/${"r".repeat(180)}`,
 			commentedIssues: [
 				`https://github.com/Yeachan-Heo/gajae-code/issues/${"x".repeat(180)}`,
 				`https://x/${"y".repeat(50)}`,
@@ -126,6 +130,8 @@ describe("compactCrashIndex", () => {
 		const compacted = await compactCrashIndex({ paths, now: NOW });
 		expect(compacted.signatures[fingerprint]?.lifetimeCount).toBe(2);
 		expect(compacted.signatures[fingerprint]?.lastAppendRecordId).toBe(recordId(21));
+		expect(compacted.signatures[fingerprint]?.relayedRecordId).toBe(firstRecordId);
+		expect(compacted.signatures[fingerprint]?.commentedIssues).toContain(`https://x/${"y".repeat(50)}`);
 
 		const reparsed = parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW);
 		expect(reparsed?.signatures[fingerprint]?.lifetimeCount).toBe(2);

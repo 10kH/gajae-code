@@ -11,6 +11,27 @@ import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
 
+function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
+	const cwd = process.cwd();
+	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
+	const files = [
+		".env",
+		".env.local",
+		...(nodeEnv ? [`.env.${nodeEnv}`] : []),
+		...(nodeEnv ? [`.env.${nodeEnv}.local`] : []),
+	];
+	const values: Record<string, string> = {};
+	const dynamic = new Set<string>();
+	for (const file of files) {
+		const parsed = parseEnvFile(path.join(cwd, file));
+		for (const [key, value] of Object.entries(parsed)) {
+			values[key] = value;
+			if (/[$`]/.test(value)) dynamic.add(key);
+		}
+	}
+	return { values, dynamic };
+}
+
 function resolveFileEnvValue(file: Record<string, string>, name: string): string | undefined {
 	if (!isSafeEnvName(name)) return undefined;
 	const value = file[name];
@@ -56,7 +77,7 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 		// its runtime value. Exclude those from the credential-only snapshot while
 		// keeping them available through $env.
 		const projectValue = resolveFileEnvValue(projectEnv, key);
-		if (projectValue !== undefined && (projectValue === value || /[$`]/.test(projectValue))) continue;
+		if (projectValue !== undefined && (projectSnapshot.dynamic.has(key) || projectValue === value)) continue;
 
 		result[key] = value;
 	}
@@ -66,8 +87,12 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 // Parse the current project's .env first. Bun may have overlaid HOME from it
 // before this module runs, so a declared HOME must never select user credential
 // files for the credential-only snapshot.
-const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
-const trustedEnvHome = Object.hasOwn(projectEnv, "HOME") ? path.parse(process.cwd()).root : os.homedir();
+const projectSnapshot = loadProjectEnv();
+const projectEnv = projectSnapshot.values;
+const trustedEnvHome =
+	Object.hasOwn(projectEnv, "HOME") || Object.hasOwn(projectEnv, "USERPROFILE")
+		? path.parse(process.cwd()).root
+		: os.homedir();
 
 // Eagerly parse the trusted user's env files and the project .env (from cwd)
 const homeShellEnv = {
@@ -112,7 +137,9 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 	if (
 		Object.hasOwn(projectEnv, name) &&
 		resolveFileEnvValue(inheritedEnv, name) === undefined &&
-		(trimmed === resolveFileEnvValue(projectEnv, name) || trimmed === projectLoadedEnv[name])
+		(projectSnapshot.dynamic.has(name) ||
+			trimmed === resolveFileEnvValue(projectEnv, name) ||
+			trimmed === projectLoadedEnv[name])
 	) {
 		return undefined;
 	}

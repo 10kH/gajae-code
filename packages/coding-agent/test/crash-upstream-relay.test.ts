@@ -596,7 +596,7 @@ describe("relayCrashSignatures", () => {
 		);
 		await fs.writeFile(
 			paths.crashLog,
-			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: forged body\n` +
+			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: cannot read properties of <redacted>\n` +
 				`${STACK}\n${formatCrashRecordMarker(FINGERPRINT, 1, "fedcba9876543210")}\n\n`,
 		);
 		let called = 0;

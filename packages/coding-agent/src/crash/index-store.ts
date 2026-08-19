@@ -266,16 +266,31 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 		// journal occurrence supplies authoritative append-order evidence.
 		...(typeof raw.lastAppendRecordId === "string" ? { lastAppendRecordId: raw.lastAppendRecordId } : {}),
 	};
+	// Preserve idempotency and append-order watermarks before display metadata.
+	// A legacy entry may be exactly at the 1 KiB cap; dropping these fields would
+	// make a successful relay/comment look new on every subsequent invocation.
 	const optional: readonly [keyof CrashSignatureEntry, unknown][] = [
-		["reportedAt", raw.reportedAt],
-		["reportedIssueUrl", raw.reportedIssueUrl],
-		["acknowledgedAt", raw.acknowledgedAt],
 		["relayedAt", raw.relayedAt],
 		["relayedRecordId", raw.relayedRecordId],
 		["commentedIssues", raw.commentedIssues === undefined ? undefined : [...(raw.commentedIssues as string[])]],
+		["reportedAt", raw.reportedAt],
+		["reportedIssueUrl", raw.reportedIssueUrl],
+		["acknowledgedAt", raw.acknowledgedAt],
 	];
 	for (const [key, value] of optional) {
 		if (value === undefined) continue;
+		if (key === "commentedIssues" && Array.isArray(value)) {
+			// Keep the newest idempotency markers that fit.  Silently dropping the
+			// whole list would make a capped entry comment the same issue again.
+			for (let start = 0; start < value.length; start++) {
+				const candidate = { ...entry, [key]: value.slice(start) };
+				if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= CRASH_INDEX_ENTRY_MAX_BYTES) {
+					(entry as unknown as Record<string, unknown>)[key] = value.slice(start);
+					break;
+				}
+			}
+			continue;
+		}
 		const candidate = { ...entry, [key]: value };
 		if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= CRASH_INDEX_ENTRY_MAX_BYTES)
 			(entry as unknown as Record<string, unknown>)[key] = value;

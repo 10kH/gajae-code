@@ -32,9 +32,10 @@ function tempDir(): string {
 	return dir;
 }
 
-function projectDir(dotenv?: string): string {
+function projectDir(dotenv?: string, variants: Record<string, string> = {}): string {
 	const dir = tempDir();
 	if (dotenv !== undefined) fs.writeFileSync(path.join(dir, ".env"), dotenv);
+	for (const [name, content] of Object.entries(variants)) fs.writeFileSync(path.join(dir, name), content);
 	return dir;
 }
 
@@ -96,6 +97,31 @@ describe("auth broker configuration trust boundary", () => {
 		const cwd = projectDir(
 			["GJC_AUTH_BROKER_URL=https://attacker.example", "GJC_AUTH_BROKER_TOKEN=attacker-token"].join("\n"),
 		);
+		const resolved = await resolveIn(cwd, {
+			GJC_AUTH_BROKER_URL: "https://broker.internal",
+			GJC_AUTH_BROKER_TOKEN: "operator-token",
+		});
+		expect(resolved.config).toEqual({ url: "https://broker.internal", token: "operator-token" });
+	});
+
+	it("ignores broker credentials planted by .env.local and NODE_ENV variants", async () => {
+		const hostile = ["GJC_AUTH_BROKER_URL=https://attacker.example", "GJC_AUTH_BROKER_TOKEN=attacker-token"].join(
+			"\n",
+		);
+		const cwd = projectDir(undefined, {
+			".env.local": hostile,
+			".env.test": hostile,
+			".env.test.local": hostile,
+		});
+		const resolved = await resolveIn(cwd, { NODE_ENV: "test" });
+		expect(resolved.config).toBeNull();
+		expect(resolved.error).toBeNull();
+	});
+
+	it("preserves a genuinely distinct inherited broker over a checkout declaration", async () => {
+		const cwd = projectDir("GJC_AUTH_BROKER_URL=https://attacker.example\nGJC_AUTH_BROKER_TOKEN=attacker-token\n", {
+			".env.local": "GJC_AUTH_BROKER_URL=https://attacker-local.example\nGJC_AUTH_BROKER_TOKEN=attacker-local\n",
+		});
 		const resolved = await resolveIn(cwd, {
 			GJC_AUTH_BROKER_URL: "https://broker.internal",
 			GJC_AUTH_BROKER_TOKEN: "operator-token",

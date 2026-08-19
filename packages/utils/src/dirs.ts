@@ -169,6 +169,20 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
 	return trimmed;
 }
 
+function projectEnvSnapshot(cwd = process.cwd()): { values: Record<string, string>; dynamic: Set<string> } {
+	const nodeEnv = process.env.NODE_ENV;
+	const files = [".env", ".env.local", ...(nodeEnv ? [`.env.${nodeEnv}`, `.env.${nodeEnv}.local`] : [])];
+	const values: Record<string, string> = {};
+	const dynamic = new Set<string>();
+	for (const file of files) {
+		for (const [key, value] of Object.entries(parseEnvFile(path.join(cwd, file)))) {
+			values[key] = value;
+			if (/[$`]/.test(value)) dynamic.add(key);
+		}
+	}
+	return { values, dynamic };
+}
+
 /** Get the config directory name relative to home (e.g. ".gjc" or PI_CONFIG_DIR override). */
 /**
  * Config-directory name, rejected when it comes from the caller's project `.env`.
@@ -187,8 +201,9 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
 function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
-	const projectValue = parseEnvFile(path.join(process.cwd(), ".env"))[name];
-	if (projectValue !== undefined && (projectValue === value || /[$`]/.test(projectValue))) return undefined;
+	const project = projectEnvSnapshot();
+	const projectValue = project.values[name];
+	if (projectValue !== undefined && (project.dynamic.has(name) || projectValue === value)) return undefined;
 	return value;
 }
 
@@ -221,7 +236,8 @@ type XdgCategory = "data" | "state" | "cache";
  * to the filesystem root rather than trusting any environment-derived home.
  */
 function trustedHome(): string {
-	if (!isProjectEnvDeclaration("HOME")) return os.homedir();
+	const project = projectEnvSnapshot();
+	if (!Object.hasOwn(project.values, "HOME") && !Object.hasOwn(project.values, "USERPROFILE")) return os.homedir();
 	return path.parse(process.cwd()).root;
 }
 
@@ -234,6 +250,7 @@ function trustedHome(): string {
 class DirResolver {
 	readonly configRoot: string;
 	readonly agentDir: string;
+	readonly #projectEnv: { values: Record<string, string>; dynamic: Set<string> };
 
 	// Per-category base dirs. Without XDG, all three equal configRoot / agentDir.
 	// With XDG on Linux, they point to $XDG_*_HOME/gjc/.
@@ -244,6 +261,7 @@ class DirResolver {
 	readonly #agentCache = new Map<string, string>();
 
 	constructor(agentDirOverride?: string) {
+		this.#projectEnv = projectEnvSnapshot();
 		this.configRoot = path.join(trustedHome(), getConfigDirName());
 
 		const defaultAgent = path.join(this.configRoot, "agent");
@@ -284,6 +302,10 @@ class DirResolver {
 			state: xdgState ?? this.agentDir,
 			cache: xdgCache ?? this.agentDir,
 		};
+	}
+
+	isProjectEnvDeclaration(name: string): boolean {
+		return Object.hasOwn(this.#projectEnv.values, name);
 	}
 
 	/** Config-root subdirectory, with optional XDG override. */
@@ -328,8 +350,9 @@ class DirResolver {
 function trustedAgentDirOverrideFor(name: "GJC_CODING_AGENT_DIR" | "PI_CODING_AGENT_DIR"): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
-	const projectValue = parseEnvFile(path.join(process.cwd(), ".env"))[name];
-	if (projectValue !== undefined && (projectValue === value || /[$`]/.test(projectValue))) return undefined;
+	const project = projectEnvSnapshot();
+	const projectValue = project.values[name];
+	if (projectValue !== undefined && (project.dynamic.has(name) || projectValue === value)) return undefined;
 	return value;
 }
 
@@ -385,7 +408,7 @@ export function getTrustedAgentFile(filename: string): string {
 
 /** Whether the current checkout declares an environment key in its `.env`. */
 export function isProjectEnvDeclaration(name: string): boolean {
-	return Object.hasOwn(parseEnvFile(path.join(process.cwd(), ".env")), name);
+	return dirs.isProjectEnvDeclaration(name);
 }
 
 /** Get the project-local config directory (.gjc). */
