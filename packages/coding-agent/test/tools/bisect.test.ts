@@ -78,6 +78,11 @@ describe("parseFirstBadCommit", () => {
 		expect(parseFirstBadCommit("abc1234 is the first bad commit")).toBe("abc1234");
 	});
 
+	it("accepts git-version whitespace and trailing annotations", () => {
+		expect(parseFirstBadCommit("  abc1234 is the first bad commit  \r\ncommit abc1234")).toBe("abc1234");
+		expect(parseFirstBadCommit("abc1234 is the first bad commit (detected by bisect)\n")).toBe("abc1234");
+	});
+
 	it("returns null before the search has converged", () => {
 		expect(parseFirstBadCommit("Bisecting: 3 revisions left to test after this (roughly 2 steps)")).toBeNull();
 	});
