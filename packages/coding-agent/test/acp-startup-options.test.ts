@@ -404,6 +404,9 @@ test("ACP collects every model-catalog page before filtering", async () => {
 
 test("ACP starts providers.list/active only after the first catalog page resolves", async () => {
 	const events: string[] = [];
+	const pageTwo = Promise.withResolvers<{ id: string; ok: boolean; page: { items: unknown[]; complete: boolean } }>();
+	const providersStarted = Promise.withResolvers<void>();
+	let pageTwoBlocked = false;
 	const adapter = {
 		query: async (query: string, _input: unknown, cursor?: string) => {
 			if (query === "models.list/current" && cursor === undefined) {
@@ -413,21 +416,30 @@ test("ACP starts providers.list/active only after the first catalog page resolve
 				return { id: "1", ok: true, page: { items: [], complete: false, continuationCursor: "cursor-2" } };
 			}
 			if (query === "models.list/current") {
-				events.push("catalog-page-2");
-				return { id: "2", ok: true, page: { items: [], complete: true } };
+				events.push("catalog-page-2:start");
+				pageTwoBlocked = true;
+				const response = await pageTwo.promise;
+				pageTwoBlocked = false;
+				events.push("catalog-page-2:end");
+				return response;
 			}
 			events.push("providers:start");
-			await Bun.sleep(1);
+			providersStarted.resolve();
 			events.push("providers:end");
 			return { id: "3", ok: true, page: { items: [], complete: true } };
 		},
 	} as never;
-	await collectModelCatalogAndActiveProviders(adapter);
+	const catalog = collectModelCatalogAndActiveProviders(adapter);
+	await providersStarted.promise;
 	// The provider walk must not begin before the first catalog page has fully
 	// resolved (credential side effects finalize there), but it must overlap the
 	// remaining catalog pages instead of waiting for the whole walk.
 	expect(events.indexOf("providers:start")).toBeGreaterThan(events.indexOf("catalog-page-1:end"));
-	expect(events.indexOf("catalog-page-2")).toBeGreaterThanOrEqual(events.indexOf("catalog-page-1:end"));
+	expect(events.indexOf("catalog-page-2:start")).toBeGreaterThanOrEqual(events.indexOf("catalog-page-1:end"));
+	expect(pageTwoBlocked).toBe(true);
+	pageTwo.resolve({ id: "2", ok: true, page: { items: [], complete: true } });
+	await catalog;
+	expect(events).toContain("catalog-page-2:end");
 	expect(events).toContain("providers:end");
 });
 
