@@ -628,6 +628,54 @@ describe("relayCrashSignatures", () => {
 		}
 	});
 
+	test("relayAllSignatures shares the per-run cap across fatal and handled stores", async () => {
+		const handledDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-relay-cap-"));
+		const handledPaths: CrashStatePaths = {
+			index: path.join(handledDir, "gjc-error-index.json"),
+			events: path.join(handledDir, "gjc-error-events.jsonl"),
+			crashLog: path.join(handledDir, "gjc-error.log"),
+		};
+		try {
+			for (let i = 0; i < 3; i++)
+				await seed({ fingerprint: `${i}`.repeat(32), recordId: `${i}`.repeat(16), at: 1_700_000_900_000 + i });
+			for (let i = 0; i < 3; i++) {
+				const fingerprint = `${i + 3}`.repeat(32);
+				const rec = `${i + 3}`.repeat(16);
+				appendCrashEvent(
+					{
+						kind: "occurrence",
+						fingerprint,
+						fpv: 1,
+						recordId: rec,
+						at: 1_700_000_900_000 + i,
+						errorName: "ToolError",
+						messageClass: "tool failed",
+					},
+					handledPaths.events,
+				);
+				await fs.appendFile(
+					handledPaths.crashLog,
+					`2026-08-11T11:59:59.000Z pid=4242 [Tool functions.read] ToolError: tool failed\n` +
+						`${STACK}\n${formatCrashRecordMarker(fingerprint, 1, rec)}\n\n`,
+				);
+			}
+			const bodies: string[] = [];
+			const outcome = await relayAllSignatures({
+				config: config(),
+				paths,
+				handledPaths,
+				env: {},
+				maxPerRun: 4,
+				fetchImpl: accept(bodies),
+			});
+			expect(outcome).toEqual({ status: "ran", sent: 4, refused: 0, failed: 0 });
+			const levels = bodies.map(body => (JSON.parse(body.split("\n")[2] ?? "{}") as { level: string }).level);
+			expect(levels).toEqual(["fatal", "fatal", "fatal", "error"]);
+		} finally {
+			await fs.rm(handledDir, { recursive: true, force: true });
+		}
+	});
+
 	test("the emitted envelope carries no timestamp finer than a day", async () => {
 		await seed();
 		const bodies: string[] = [];
