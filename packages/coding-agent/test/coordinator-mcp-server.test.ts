@@ -1020,7 +1020,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				if (operation === "session.create")
 					return { ok: true, result: { sessionId: "malformed-close-session", cwd: root } };
 				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
-				if (operation === "session.close") return {};
+				if (operation === "session.close") return { ok: true, result: {} };
 				return undefined;
 			},
 		});

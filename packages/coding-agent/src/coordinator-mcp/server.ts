@@ -3490,9 +3490,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const sessionId = remoteSession.value;
 			if (!sessionId) throw error;
 			try {
-				strictBrokerResult(
+				strictBrokerSessionClose(
 					await brokerSession(cwd, "session.close", { sessionId }, `${sessionId}:compensate-create`),
-					"session.close",
+					sessionId,
 				);
 			} catch (closeError) {
 				throw new SdkClientError(
@@ -3532,6 +3532,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				UNOBSERVED_COMPENSATION_CODE,
 				`SDK broker returned a malformed ${operation} result; the lifecycle outcome is unobserved.`,
 				{ response },
+			);
+		return result;
+	}
+
+	function strictBrokerSessionClose(value: unknown, expectedSessionId: string): Record<string, unknown> {
+		const result = strictBrokerResult(value, "session.close");
+		const sessionId = optionalString(result.sessionId ?? result.session_id);
+		if (sessionId !== expectedSessionId)
+			throw new SdkClientError(
+				UNOBSERVED_COMPENSATION_CODE,
+				"SDK broker returned no proof that the expected session was closed.",
+				{ expected_session_id: expectedSessionId, result },
 			);
 		return result;
 	}
@@ -3715,7 +3727,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					);
 					return { ok: true, closed: true };
 				}
-				if (deletion?.safe_response) return deletion.safe_response as { ok: boolean; closed: boolean };
+				if (deletion?.safe_response) {
+					const safeResponse = asRecord(deletion.safe_response);
+					const safeSessionId = optionalString(safeResponse?.session_id ?? safeResponse?.sessionId);
+					if (
+						safeResponse?.ok === true &&
+						safeResponse.closed === true &&
+						(safeSessionId === null || safeSessionId === id)
+					)
+						return deletion.safe_response as { ok: boolean; closed: boolean };
+					throw new SdkClientError("state_corrupt", "Persisted reap response does not prove completed cleanup.");
+				}
 				return { ok: false, reason: "unknown_session", closed: false };
 			}
 
@@ -3776,7 +3798,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					created_at: new Date().toISOString(),
 					updated_at: new Date().toISOString(),
 				});
-				strictBrokerResult(
+				strictBrokerSessionClose(
 					await brokerSession(
 						cwd,
 						"session.close",
@@ -3787,7 +3809,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						},
 						`coordinator-reap:${id}:${authority.endpointIncarnation}`,
 					),
-					"session.close",
+					id,
 				);
 			} catch (error) {
 				return {
@@ -5193,14 +5215,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									let compensated = true;
 									if (unpreparedId) {
 										try {
-											strictBrokerResult(
+											strictBrokerSessionClose(
 												await brokerSession(
 													cwd,
 													"session.close",
 													{ sessionId: unpreparedId },
 													`${idempotencyKey}:unprepared-close`,
 												),
-												"session.close",
+												unpreparedId,
 											);
 										} catch {
 											compensated = false;

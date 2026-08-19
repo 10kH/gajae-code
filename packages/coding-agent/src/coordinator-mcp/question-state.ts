@@ -707,6 +707,7 @@ export async function appendOutboxEvents(
 				!candidate.entity_id ||
 				typeof candidate.payload !== "object" ||
 				candidate.payload === null ||
+				Array.isArray(candidate.payload) ||
 				typeof candidate.emitted !== "boolean" ||
 				!canonicalIdentity ||
 				candidate.transaction_revision !== identityRevision ||
