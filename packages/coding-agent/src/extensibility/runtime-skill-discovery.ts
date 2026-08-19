@@ -9,6 +9,7 @@ import { scanClaudeProjectSkills, scanClaudeUserSkills } from "../discovery/clau
 import { scanCodexProjectSkills, scanCodexUserSkills } from "../discovery/codex";
 import { compareSkillOrder, SOURCE_PATHS, scanSkillsFromDir } from "../discovery/helpers";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
+import { expandTilde } from "../tools/path-utils";
 import type { Skill } from "./skills";
 
 export type RuntimeSkillDiscoverySource = "project" | "user";
@@ -114,6 +115,23 @@ function getUserSkillDirs(home: string): string[] {
 			path.join(home, configuredLegacyDir, "skills"),
 			path.join(home, ".gjc", "skills"),
 		]),
+	];
+}
+
+/**
+ * Directories named by `skills.customDirectories`, which session startup loads
+ * through `loadSkills`. Discovery scans them too so a configured skill cannot be
+ * invocable and unfindable at the same time.
+ *
+ * Naming a directory is explicit consent, so these are not gated on scope trust
+ * — the same rule `loadSkills` applies. They resolve at user level, so a
+ * project-scoped query excludes them.
+ */
+function getCustomSkillDirs(policy: SkillsSettings | undefined, home: string): string[] {
+	const configured = policy?.customDirectories;
+	if (!Array.isArray(configured)) return [];
+	return [
+		...new Set(configured.filter(dir => typeof dir === "string" && dir.trim()).map(dir => expandTilde(dir, home))),
 	];
 }
 
@@ -350,6 +368,13 @@ export async function discoverRuntimeSkills(
 			);
 		}
 	}
+	if ((source === "all" || source === "user") && policy?.enabled === true) {
+		for (const dir of getCustomSkillDirs(policy, home)) {
+			scanJobs.push(
+				scanProjectOrUserDir({ cwd: options.cwd, home, repoRoot: home }, dir, "user", `custom ${dir}`, "user"),
+			);
+		}
+	}
 
 	const settled = await Promise.all(scanJobs.map(job => job.catch(error => ({ error: String(error), label: "" }))));
 
@@ -427,6 +452,16 @@ export async function findRuntimeSkillByName(
 	}
 	if (sourceEnabled("user", policy)) {
 		for (const dir of getUserSkillDirs(home)) {
+			scanJobs.push(
+				scanSkillsFromDir(
+					{ cwd, home, repoRoot: home },
+					{ dir, providerId: "runtime", level: "user", requireDescription: true },
+				).then(result => result.items.map(skill => ({ skill, source: "user" as const }))),
+			);
+		}
+	}
+	if (policy?.enabled === true) {
+		for (const dir of getCustomSkillDirs(policy, home)) {
 			scanJobs.push(
 				scanSkillsFromDir(
 					{ cwd, home, repoRoot: home },
