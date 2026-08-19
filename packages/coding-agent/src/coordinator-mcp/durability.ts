@@ -78,15 +78,19 @@ export async function syncCoordinatorDirectory(
 		if (!isUnsupportedWindowsDirectorySyncError(error, options.platform)) throw error;
 		return;
 	}
+	let syncError: unknown;
 	try {
-		try {
-			await handle.sync();
-		} catch (error) {
-			if (!isUnsupportedWindowsDirectorySyncError(error, options.platform)) throw error;
-		}
-	} finally {
-		await handle.close();
+		await handle.sync();
+	} catch (error) {
+		if (!isUnsupportedWindowsDirectorySyncError(error, options.platform)) syncError = error;
 	}
+	try {
+		await handle.close();
+	} catch (closeError) {
+		if (syncError) throw new AggregateError([syncError, closeError], "coordinator directory sync and close failed");
+		throw closeError;
+	}
+	if (syncError) throw syncError;
 }
 
 /** File durability is never best-effort: callers must abort on every failure. */

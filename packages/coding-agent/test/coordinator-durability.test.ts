@@ -63,6 +63,20 @@ describe("Coordinator durability", () => {
 		).rejects.toMatchObject({ code: "EIO" });
 	});
 
+	it("preserves both directory sync and close failures", async () => {
+		const handle = {
+			async sync(): Promise<void> {
+				throw errno("EIO");
+			},
+			async close(): Promise<void> {
+				throw errno("EACCES");
+			},
+		} as fs.FileHandle;
+		await expect(
+			syncCoordinatorDirectory("state", { platform: "linux", openDirectory: async () => handle }),
+		).rejects.toBeInstanceOf(AggregateError);
+	});
+
 	it("accepts only unsupported Windows directory barriers after file durability", async () => {
 		const calls: string[] = [];
 		const handle = {
