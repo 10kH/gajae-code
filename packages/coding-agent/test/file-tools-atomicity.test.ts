@@ -219,6 +219,94 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
+	it("preserves exact mode bits when replacing an existing file", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "mode-preserved.ts");
+		await fs.writeFile(dest, "old\n", { mode: 0o640 });
+		await fs.chmod(dest, 0o640);
+		await writeFileAtomically(dest, "new\n");
+		expect((await fs.stat(dest)).mode & 0o777).toBe(0o640);
+	});
+
+	it("does not replace an unwritable target through a writable parent", async () => {
+		if (process.platform === "win32" || (typeof process.getuid === "function" && process.getuid() === 0)) return;
+		const parent = path.join(tmpDir, "writable-parent");
+		const dest = path.join(parent, "unwritable.ts");
+		await fs.mkdir(parent);
+		await fs.writeFile(dest, "original\n");
+		await fs.chmod(dest, 0o444);
+		try {
+			await expect(writeFileAtomically(dest, "replacement\n")).rejects.toThrow(/Permission denied|EACCES|EPERM/);
+			expect(await fs.readFile(dest, "utf8")).toBe("original\n");
+		} finally {
+			await fs.chmod(dest, 0o644);
+		}
+	});
+
+	it("cleans an owned staging file when publication fails", async () => {
+		const dest = path.join(tmpDir, "rename-fails.ts");
+		await fs.writeFile(dest, "original\n");
+		const realRename = fs.rename.bind(fs);
+		const original = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (String(from).includes(".tmp")) {
+				const error = new Error("EIO: publication failed") as Error & { code: string };
+				error.code = "EIO";
+				throw error;
+			}
+			return realRename(from, to);
+		});
+		try {
+			await expect(writeFileAtomically(dest, "replacement\n")).rejects.toMatchObject({ code: "EIO" });
+			expect(await fs.readFile(dest, "utf8")).toBe("original\n");
+			expect((await fs.readdir(path.dirname(dest))).some(name => name.endsWith(".tmp"))).toBe(false);
+		} finally {
+			original.mockRestore();
+		}
+	});
+
+	it("rejects a symlink escape from the session-scoped gjc-local root", async () => {
+		if (process.platform === "win32") return;
+		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "atomic-trust-test");
+		const outside = path.join(tmpDir, "outside-secret.ts");
+		const link = path.join(sessionRoot, "alias.ts");
+		await fs.mkdir(sessionRoot, { recursive: true });
+		await fs.writeFile(outside, "outside\n");
+		await fs.symlink(outside, link);
+		try {
+			await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
+			expect(await fs.readFile(outside, "utf8")).toBe("outside\n");
+		} finally {
+			await fs.rm(sessionRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes rebuilt archive bytes atomically", async () => {
+		const archivePath = path.join(tmpDir, "archive.tar");
+		await fs.writeFile(archivePath, await new Bun.Archive({ "pkg/old.txt": "old\n" }).bytes());
+		const realOpen = fs.open.bind(fs);
+		const original = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			if (String(target).includes(".tmp") && flags === "wx") {
+				const error = new Error("EPERM: archive publication denied") as Error & { code: string };
+				error.code = "EPERM";
+				throw error;
+			}
+			return realOpen(target, flags, mode);
+		});
+		try {
+			await expect(
+				new WriteTool(createSession(tmpDir)).execute("archive-atomic", {
+					path: `${archivePath}:pkg/new.txt`,
+					content: "new\n",
+				}),
+			).rejects.toThrow(/Permission denied writing/);
+			const files = await new Bun.Archive(await fs.readFile(archivePath)).files();
+			expect(await files.get("pkg/old.txt")?.text()).toBe("old\n");
+			expect(files.has("pkg/new.txt")).toBe(false);
+		} finally {
+			original.mockRestore();
+		}
+	});
+
 	it("does not summarize a denied ACP file from disk", async () => {
 		const dest = path.join(tmpDir, "denied.ts");
 		await fs.writeFile(dest, "export function secret() { return 1; }\nexport function other() { return 2; }\n");

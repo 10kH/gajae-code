@@ -499,19 +499,32 @@ const MAX_RECENT_FILE_MUTATIONS = 12;
 function collectFileMutationPaths(toolName: string, args: unknown): string[] {
 	if (!FILE_MUTATION_TOOLS.has(toolName) || !args || typeof args !== "object" || Array.isArray(args)) return [];
 	const record = args as Record<string, unknown>;
+	const paths: string[] = [];
+	const addPath = (value: unknown) => {
+		if (typeof value === "string" && value.length > 0 && !paths.includes(value)) paths.push(value);
+	};
 	const directPath = getStringProperty(record, "path") ?? getStringProperty(record, "file_path");
-	if (directPath) return [directPath];
+	addPath(directPath);
 
-	const paths = collectStringPaths(record.paths);
-	if (paths.length > 0) return paths;
+	for (const path of collectStringPaths(record.paths)) addPath(path);
+	const edits = Array.isArray(record.edits) ? record.edits : [];
+	for (const edit of edits) {
+		if (!edit || typeof edit !== "object" || Array.isArray(edit)) continue;
+		addPath(getStringProperty(edit as Record<string, unknown>, "rename"));
+	}
 
 	const input = getStringProperty(record, "input");
-	if (!input) return [];
-	try {
-		return expandApplyPatchToEntries({ input }).map(entry => entry.path);
-	} catch {
-		return [];
+	if (input) {
+		try {
+			for (const entry of expandApplyPatchToEntries({ input })) {
+				addPath(entry.path);
+				addPath(entry.rename);
+			}
+		} catch {
+			// If the edit input is not an apply_patch envelope, retain direct paths.
+		}
 	}
+	return paths;
 }
 
 function collectRecentFileMutations(messages: readonly AgentMessage[]): string[] {

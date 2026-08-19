@@ -88,6 +88,23 @@ describe("read tool ACP fs routing", () => {
 		}
 	});
 
+	it("does not fall back to a disk secret when the ACP provider denies the read", async () => {
+		const filePath = path.join(tmpDir, "secret.ts");
+		await fs.writeFile(filePath, "export const secret = 'disk-only';\n");
+		const bridge: ClientBridge = {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => {
+				const error = new Error("Request rejected");
+				error.name = "permission_denied";
+				throw error;
+			},
+		};
+
+		await expect(
+			new ReadTool(createSession(tmpDir, bridge)).execute("denied-reverse-read", { path: filePath }),
+		).rejects.toThrow("Request rejected");
+	});
+
 	it("applies requested line ranges to bridge content exactly once", async () => {
 		const filePath = path.join(tmpDir, "range.txt");
 		await fs.writeFile(filePath, "disk one\ndisk two\ndisk three\n");

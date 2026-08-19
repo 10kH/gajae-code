@@ -1434,8 +1434,17 @@ interface ResolvedSqliteReadPath {
  * still fall back so an unreachable bridge cannot break local reads.
  */
 function isClientAuthorityDenial(error: unknown): boolean {
-	const code =
+	const directCode =
 		typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
+	const namedCode = error instanceof Error ? error.name : undefined;
+	const nestedCode =
+		typeof error === "object" &&
+		error !== null &&
+		"data" in error &&
+		typeof (error as { data?: unknown }).data === "object"
+			? ((error as { data?: { code?: unknown } }).data?.code ?? undefined)
+			: undefined;
+	const code = directCode ?? nestedCode ?? namedCode;
 	// OS errno codes are transport/availability failures, not an ACP permission
 	// decision. Treating `EPERM`/`EACCES` as denials skipped the disk fallback
 	// for files that already existed on disk.

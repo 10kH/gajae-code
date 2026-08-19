@@ -17,7 +17,7 @@ import type { ToolSession } from "../sdk";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { parseArchivePathCandidates } from "./archive-reader";
-import { formatFileWriteError } from "./atomic-file-write";
+import { formatFileWriteError, writeFileAtomically } from "./atomic-file-write";
 import { assertEditableFile } from "./auto-generated-guard";
 import {
 	type ConflictEntry,
@@ -276,9 +276,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			try {
 				const { zipSync } = await loadFflate();
 				const zipBuffer = zipSync(zipEntries);
-				await Bun.write(resolvedArchivePath.absolutePath, zipBuffer);
+				await writeFileAtomically(resolvedArchivePath.absolutePath, zipBuffer);
 			} catch (error) {
-				throw new ToolError(error instanceof Error ? error.message : String(error));
+				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}
 		} else {
 			const archiveEntries: Record<string, string | File> = {};
@@ -305,9 +305,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			archiveEntries[resolvedArchivePath.archiveSubPath] = content;
 
 			try {
-				await Bun.Archive.write(resolvedArchivePath.absolutePath, archiveEntries);
+				const archive = new Bun.Archive(archiveEntries);
+				const archiveBytes = await archive.bytes();
+				await writeFileAtomically(resolvedArchivePath.absolutePath, archiveBytes);
 			} catch (error) {
-				throw new ToolError(error instanceof Error ? error.message : String(error));
+				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}
 		}
 

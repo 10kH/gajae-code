@@ -477,6 +477,65 @@ describe("AgentSession state-aware compaction", () => {
 		expect(files).toContain("src/second.ts");
 	});
 
+	it("includes edit rename source and destination in compaction-state extraContext", async () => {
+		const editCall = assistantMessage("stop");
+		editCall.content = [
+			{
+				type: "toolCall",
+				id: "edit-rename-recent",
+				name: "edit",
+				arguments: {
+					path: "src/old.ts",
+					edits: [{ op: "update", rename: "src/new.ts" }],
+				},
+			},
+		];
+		session.agent.appendMessage(editCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "edit-rename-recent",
+			toolName: "edit",
+			content: [{ type: "text", text: "Successfully edited src/old.ts" }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		seedCompactionHistory();
+		await session.compact();
+		const options = compactSpy.mock.calls[0]?.[5];
+		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
+		expect(files).toContain("src/old.ts");
+		expect(files).toContain("src/new.ts");
+	});
+
+	it("includes apply_patch rename source and destination in compaction-state extraContext", async () => {
+		const applyPatchCall = assistantMessage("stop");
+		applyPatchCall.content = [
+			{
+				type: "toolCall",
+				id: "apply-patch-rename-recent",
+				name: "apply_patch",
+				arguments: {
+					input: "*** Begin Patch\n*** Update File: src/old.ts\n*** Move to: src/new.ts\n@@\n-old\n+new\n*** End Patch",
+				},
+			},
+		];
+		session.agent.appendMessage(applyPatchCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "apply-patch-rename-recent",
+			toolName: "apply_patch",
+			content: [{ type: "text", text: "Applied patch." }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		seedCompactionHistory();
+		await session.compact();
+		const options = compactSpy.mock.calls[0]?.[5];
+		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
+		expect(files).toContain("src/old.ts");
+		expect(files).toContain("src/new.ts");
+	});
+
 	it("continues synthetic auto-continue for an active nonterminal workflow", async () => {
 		await seedActiveSkillState("active");
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
