@@ -485,11 +485,7 @@ function isValidLocalDateOverride(value: string): boolean {
 	const day = Number(match[3]);
 	const instant = new Date(Date.UTC(2000, month - 1, day));
 	instant.setUTCFullYear(year);
-	if (
-		instant.getUTCFullYear() !== year ||
-		instant.getUTCMonth() !== month - 1 ||
-		instant.getUTCDate() !== day
-	)
+	if (instant.getUTCFullYear() !== year || instant.getUTCMonth() !== month - 1 || instant.getUTCDate() !== day)
 		return false;
 	const weekday = match[4];
 	if (!weekday) return true;
