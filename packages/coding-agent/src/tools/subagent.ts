@@ -494,6 +494,7 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		let waitOutcome: "completed" | "timed_out_wait" | "interrupted";
 		let onAbort: (() => void) | undefined;
 		let terminalJobIds: string[] | undefined;
+		const steeringWaitAbort = new AbortController();
 		try {
 			progressTimer = onUpdate && heartbeatMs > 0 ? setInterval(() => emitIfChanged(false), heartbeatMs) : undefined;
 			stopProgressTimer = () => {
@@ -506,6 +507,12 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				if (signal?.aborted) onAbort();
 				else signal?.addEventListener("abort", onAbort, { once: true });
 			});
+			// A busy user message must not sit behind this observation window: end
+			// the wait as interrupted so the parent's tool boundary handles the
+			// steer next, while the awaited children keep running.
+			const steeringArrival = this.session.waitForUserSteering
+				? [this.session.waitForUserSteering(steeringWaitAbort.signal).then(() => "interrupted" as const)]
+				: [];
 			waitOutcome =
 				targetsAlreadyTerminal && !signal?.aborted
 					? "completed"
@@ -513,12 +520,14 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 							handle.result.then(() => "completed" as const),
 							Bun.sleep(timeoutMs).then(() => "timed_out_wait" as const),
 							abortPromise,
+							...steeringArrival,
 						]);
 			if (waitOutcome === "completed") {
 				terminalJobIds = (await handle.result).terminalJobIds;
 				handle.acknowledge(terminalJobIds);
 			}
 		} finally {
+			steeringWaitAbort.abort();
 			if (signal && onAbort) signal.removeEventListener("abort", onAbort);
 			stopProgressTimer();
 			watchHandle.close();

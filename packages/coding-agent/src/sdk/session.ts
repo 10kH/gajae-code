@@ -2002,6 +2002,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			trackEvalExecution: (execution, abortController) =>
 				session ? session.trackEvalExecution(execution, abortController) : execution,
 			getAsyncJobManager: () => asyncJobManager,
+			waitForUserSteering: signal => {
+				if (agent) return agent.waitForSteeringArrival(signal);
+				const { promise, resolve } = Promise.withResolvers<void>();
+				if (signal.aborted) resolve();
+				else signal.addEventListener("abort", () => resolve(), { once: true });
+				return promise;
+			},
 			// Subagents inherit the parent's manager; its registered endpoint is
 			// authoritative for owned-registration keying and endpoint-first
 			// manager lookup (the child's own id is never registered), so tools

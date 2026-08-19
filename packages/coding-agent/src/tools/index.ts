@@ -220,6 +220,8 @@ export interface ToolSession {
 	requestForegroundBashBackground?: () => boolean;
 	/** Get the session-owned or inherited async job manager. */
 	getAsyncJobManager?: () => AsyncJobManager | undefined;
+	/** Resolves when the session queues user steering (or `signal` aborts) without consuming it; wait-style tools use this to end their observation early. */
+	waitForUserSteering?: (signal: AbortSignal) => Promise<void>;
 	/** Get session ID */
 	getSessionId?: () => string | null;
 	/** Get credential-selection session identity. */

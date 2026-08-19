@@ -510,6 +510,51 @@ describe("SubagentTool", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 
+	it("ends a live await when user steering arrives and leaves the child running", async () => {
+		const manager = createManager();
+		let steeringResolve: (() => void) | undefined;
+		const toolSession = {
+			...createSession(),
+			waitForUserSteering: (signal: AbortSignal) => {
+				const steering = Promise.withResolvers<void>();
+				const onAbort = () => steering.resolve();
+				steeringResolve = steering.resolve;
+				if (signal.aborted) steering.resolve();
+				else signal.addEventListener("abort", onAbort, { once: true });
+				return steering.promise;
+			},
+		} as ToolSession;
+		const tool = new SubagentTool(toolSession);
+		const child = Promise.withResolvers<string>();
+		const jobId = manager.register("task", "steer-interruptible subagent", async () => child.promise, {
+			id: "job-steer-wait",
+			ownerId: "0-Main",
+			metadata: { subagent: { id: "0-SteerWait", agent: "executor", agentSource: "bundled" } },
+		});
+
+		const awaiting = tool.execute("subagent-await-steer", {
+			action: "await",
+			ids: ["0-SteerWait"],
+			timeout_ms: 1_500,
+		});
+		const deadline = Date.now() + 1_000;
+		while (!steeringResolve) {
+			if (Date.now() >= deadline) throw new Error("await never registered the steering waiter");
+			await Bun.sleep(2);
+		}
+		steeringResolve();
+		const receipt = await awaiting;
+
+		expect(receipt.details?.awaitOutcome).toBe("interrupted");
+		expect(receipt.details?.subagents[0]?.status).toBe("running");
+		expect(manager.getJob(jobId)?.status).toBe("running");
+
+		child.resolve("child finished after the user steer");
+		await manager.getJob(jobId)?.promise;
+		expect(manager.getJob(jobId)?.status).toBe("completed");
+		await manager.dispose({ timeoutMs: 100 });
+	});
+
 	it("interrupts only a live parent await and leaves the child running", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
