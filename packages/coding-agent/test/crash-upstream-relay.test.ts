@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { appendCrashEvent, formatCrashRecordMarker } from "@gajae-code/utils";
 import { crashRelayExitCode } from "../src/cli/crash-cli";
 import type { CrashSignatureView, CrashStatePaths } from "../src/crash/index-store";
-import { compactCrashIndex, listCrashSignatures } from "../src/crash/index-store";
+import { compactCrashIndex, listCrashSignatures, readCrashIndex } from "../src/crash/index-store";
 import {
 	CRASH_UPSTREAM_DSN_ENV,
 	type CrashRelayConfig,
@@ -36,6 +36,7 @@ function signature(overrides: Partial<CrashSignatureView> = {}): CrashSignatureV
 		firstSeen: 1_700_000_000_000,
 		lastSeen: 1_700_000_900_000,
 		lastRecordId: "rec-1",
+		lastAppendRecordId: "rec-1",
 		...overrides,
 	};
 }
@@ -74,12 +75,54 @@ describe("isRelayDue", () => {
 		expect(isRelayDue(signature())).toBe(true);
 	});
 
-	test("a signature relayed after its last occurrence is not due", () => {
-		expect(isRelayDue(signature({ relayedAt: 1_700_000_900_001 }))).toBe(false);
+	test("a signature relayed for its latest append is not due", () => {
+		expect(isRelayDue(signature({ relayedRecordId: "rec-1" }))).toBe(false);
 	});
 
-	test("new occurrences since the last relay make it due again", () => {
-		expect(isRelayDue(signature({ relayedAt: 1_700_000_800_000 }))).toBe(true);
+	test("a same-millisecond or backdated newer record remains due", () => {
+		expect(
+			isRelayDue(
+				signature({
+					relayedAt: 1_700_000_900_000,
+					relayedRecordId: "other-record",
+					lastAppendRecordId: "rec-2",
+				}),
+			),
+		).toBe(true);
+	});
+
+	test("a legacy relayedAt covering lastSeen is not due after upgrade", () => {
+		expect(isRelayDue(signature({ relayedAt: 1_700_000_900_000 }))).toBe(false);
+	});
+
+	test("a legacy relayedAt older than lastSeen is due after upgrade", () => {
+		expect(isRelayDue(signature({ relayedAt: 1_700_000_000_000 }))).toBe(true);
+	});
+
+	test("a downgrade that advanced relayedAt does not retransmit on re-upgrade", () => {
+		expect(
+			isRelayDue(
+				signature({
+					lastRecordId: "rec-2",
+					lastAppendRecordId: "rec-2",
+					relayedRecordId: "rec-1",
+					relayedAt: 1_700_000_900_000,
+				}),
+			),
+		).toBe(false);
+	});
+
+	test("a backdated append after a modern send stays due even when relayedAt covers lastSeen", () => {
+		expect(
+			isRelayDue(
+				signature({
+					lastRecordId: "rec-1",
+					lastAppendRecordId: "rec-2",
+					relayedRecordId: "rec-1",
+					relayedAt: 1_700_000_900_000,
+				}),
+			),
+		).toBe(true);
 	});
 });
 
@@ -239,6 +282,7 @@ describe("relayCrashSignatures", () => {
 
 		const index = await compactCrashIndex({ paths });
 		expect(listCrashSignatures(index)[0]?.relayedAt).toBe(1_700_000_900_000);
+		expect(listCrashSignatures(index)[0]?.relayedRecordId).toBe(RECORD_ID);
 	});
 
 	test("a rerun with no new occurrences sends nothing", async () => {
@@ -248,6 +292,54 @@ describe("relayCrashSignatures", () => {
 		const second = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
 		expect(second).toEqual({ status: "skipped", reason: "nothing-to-relay" });
 		expect(bodies).toHaveLength(1);
+	});
+
+	test("a legacy relayedAt covering lastSeen does not retransmit after upgrade", async () => {
+		await seed();
+		const compacted = await compactCrashIndex({ paths });
+		const entry = compacted.signatures[FINGERPRINT];
+		expect(entry).toBeDefined();
+		if (!entry) return;
+		const { lastAppendRecordId: _ignored, ...legacy } = entry;
+		await Bun.write(
+			paths.index,
+			`${JSON.stringify({
+				...compacted,
+				signatures: { [FINGERPRINT]: { ...legacy, relayedAt: entry.lastSeen } },
+			})}\n`,
+		);
+		const bodies: string[] = [];
+		const outcome = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		expect(outcome).toEqual({ status: "skipped", reason: "nothing-to-relay" });
+		expect(bodies).toHaveLength(0);
+	});
+
+	test("downgrade then re-upgrade does not retransmit when relayedAt still covers lastSeen", async () => {
+		await seed();
+		await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept([]) });
+		const compacted = await compactCrashIndex({ paths });
+		const entry = compacted.signatures[FINGERPRINT];
+		expect(entry?.relayedRecordId).toBe(RECORD_ID);
+		if (!entry) return;
+		await Bun.write(
+			paths.index,
+			`${JSON.stringify({
+				...compacted,
+				signatures: {
+					[FINGERPRINT]: {
+						...entry,
+						lastRecordId: "9999888877776666",
+						lastAppendRecordId: "9999888877776666",
+						relayedAt: entry.lastSeen,
+						relayedRecordId: RECORD_ID,
+					},
+				},
+			})}\n`,
+		);
+		const bodies: string[] = [];
+		const outcome = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		expect(outcome).toEqual({ status: "skipped", reason: "nothing-to-relay" });
+		expect(bodies).toHaveLength(0);
 	});
 
 	test("an occurrence newer than the relayed watermark makes the signature due again", async () => {
@@ -280,6 +372,69 @@ describe("relayCrashSignatures", () => {
 		const relayed = listCrashSignatures(index)[0];
 		expect(relayed?.relayedAt).toBe(1_700_000_900_000);
 		expect(relayed && isRelayDue(relayed)).toBe(true);
+	});
+
+	test("a backdated occurrence appended during the POST remains due after the watermark stamp", async () => {
+		await seed();
+		const bodies: string[] = [];
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async (_url, init) => {
+				bodies.push(String(init.body));
+				await seed({ at: 1_700_000_100_000, recordId: "aaaabbbbccccdddd" });
+				return new Response("", { status: 200 });
+			},
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		const index = await compactCrashIndex({ paths });
+		const relayed = listCrashSignatures(index)[0];
+		expect(relayed?.lastSeen).toBe(1_700_000_900_000);
+		expect(relayed?.lastRecordId).toBe(RECORD_ID);
+		expect(relayed?.lastAppendRecordId).toBe("aaaabbbbccccdddd");
+		expect(relayed?.relayedRecordId).toBe(RECORD_ID);
+		expect(relayed && isRelayDue(relayed)).toBe(true);
+		const second = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		expect(second).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(bodies).toHaveLength(2);
+	});
+
+	test("a journal append failure after 2xx leaves no watermark and retries the same event id", async () => {
+		await seed();
+		const bodies: string[] = [];
+		const first = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async (_url, init) => {
+				bodies.push(String(init.body));
+				await fs.rm(paths.events, { force: true });
+				await fs.mkdir(paths.events);
+				return new Response(JSON.stringify({ id: "a".repeat(32) }), { status: 200 });
+			},
+		});
+		expect(first).toEqual({ status: "ran", sent: 0, refused: 0, failed: 1 });
+		expect(await Bun.file(paths.index).exists()).toBe(true);
+		const afterFail = await readCrashIndex(paths);
+		expect(listCrashSignatures(afterFail)[0]?.relayedAt).toBeUndefined();
+		expect(listCrashSignatures(afterFail)[0]?.relayedRecordId).toBeUndefined();
+
+		await fs.rm(paths.events, { recursive: true, force: true });
+		const second = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: accept(bodies),
+		});
+		expect(second).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(bodies).toHaveLength(2);
+		const firstId = (JSON.parse(bodies[0]?.split("\n")[2] ?? "{}") as { event_id?: string }).event_id;
+		const secondId = (JSON.parse(bodies[1]?.split("\n")[2] ?? "{}") as { event_id?: string }).event_id;
+		expect(firstId).toMatch(/^[0-9a-f]{32}$/);
+		expect(secondId).toBe(firstId);
+		const afterRetry = await compactCrashIndex({ paths });
+		expect(listCrashSignatures(afterRetry)[0]?.relayedRecordId).toBe(RECORD_ID);
 	});
 
 	test("concurrent relays claim a signature before either can POST it", async () => {
@@ -327,6 +482,46 @@ describe("relayCrashSignatures", () => {
 			},
 		});
 		expect(outcome).toEqual({ status: "ran", sent: 0, refused: 0, failed: 1 });
+	});
+
+	test.each([307, 308])("refuses %i redirects without issuing a follow-up request", async status => {
+		await seed();
+		let requests = 0;
+		const outcome = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			fetchImpl: async (_url, init) => {
+				requests++;
+				expect(init.redirect).toBe("error");
+				expect(init.credentials).toBe("omit");
+				return new Response("", { status, headers: { Location: "https://attacker.invalid/envelope" } });
+			},
+		});
+		expect(outcome).toEqual({ status: "ran", sent: 0, refused: 0, failed: 1 });
+		expect(requests).toBe(1);
+	});
+
+	test("retries a failed post after releasing its claim", async () => {
+		await seed();
+		let requests = 0;
+		const fetchImpl: CrashRelayFetch = async () => {
+			requests++;
+			return new Response("", { status: requests === 1 ? 429 : 200 });
+		};
+		expect(await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl })).toEqual({
+			status: "ran",
+			sent: 0,
+			refused: 0,
+			failed: 1,
+		});
+		expect(await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl })).toEqual({
+			status: "ran",
+			sent: 1,
+			refused: 0,
+			failed: 0,
+		});
+		expect(requests).toBe(2);
 	});
 
 	test("a signature with no recoverable record is refused, not sent", async () => {
@@ -433,11 +628,216 @@ describe("relayCrashSignatures", () => {
 		}
 	});
 
+	test("relayAllSignatures shares the per-run cap across fatal and handled stores", async () => {
+		const handledDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-relay-cap-"));
+		const handledPaths: CrashStatePaths = {
+			index: path.join(handledDir, "gjc-error-index.json"),
+			events: path.join(handledDir, "gjc-error-events.jsonl"),
+			crashLog: path.join(handledDir, "gjc-error.log"),
+		};
+		try {
+			for (let i = 0; i < 3; i++)
+				await seed({ fingerprint: `${i}`.repeat(32), recordId: `${i}`.repeat(16), at: 1_700_000_900_000 + i });
+			for (let i = 0; i < 3; i++) {
+				const fingerprint = `${i + 3}`.repeat(32);
+				const rec = `${i + 3}`.repeat(16);
+				appendCrashEvent(
+					{
+						kind: "occurrence",
+						fingerprint,
+						fpv: 1,
+						recordId: rec,
+						at: 1_700_000_900_000 + i,
+						errorName: "ToolError",
+						messageClass: "tool failed",
+					},
+					handledPaths.events,
+				);
+				await fs.appendFile(
+					handledPaths.crashLog,
+					`2026-08-11T11:59:59.000Z pid=4242 [Tool functions.read] ToolError: tool failed\n` +
+						`${STACK}\n${formatCrashRecordMarker(fingerprint, 1, rec)}\n\n`,
+				);
+			}
+			const bodies: string[] = [];
+			const outcome = await relayAllSignatures({
+				config: config(),
+				paths,
+				handledPaths,
+				env: {},
+				maxPerRun: 4,
+				fetchImpl: accept(bodies),
+			});
+			expect(outcome).toEqual({ status: "ran", sent: 4, refused: 0, failed: 0 });
+			const levels = bodies.map(body => (JSON.parse(body.split("\n")[2] ?? "{}") as { level: string }).level);
+			expect(levels).toEqual(["fatal", "fatal", "fatal", "error"]);
+		} finally {
+			await fs.rm(handledDir, { recursive: true, force: true });
+		}
+	});
+
 	test("the emitted envelope carries no timestamp finer than a day", async () => {
 		await seed();
 		const bodies: string[] = [];
 		await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
 		const payload = JSON.parse(bodies[0]?.split("\n")[2] ?? "{}") as { timestamp: number };
 		expect(payload.timestamp % 86_400).toBe(0);
+	});
+});
+
+/**
+ * The relay's trust boundary is enforced at module import: `$credentialEnv`
+ * excludes the checkout's `.env` overlay, and the default state root is the
+ * agent dir rather than anything `XDG_STATE_HOME` can move. Both properties are
+ * therefore only observable in a fresh process whose cwd/environment is the
+ * hostile one, so these regressions spawn one (review: snowykr P1 #2/#3).
+ */
+describe("relay trust boundary against a hostile checkout", () => {
+	let dir = "";
+
+	beforeEach(async () => {
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-relay-trust-"));
+	});
+
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	async function runInCheckout(source: string, env: Record<string, string | undefined> = {}): Promise<string> {
+		const script = path.join(dir, "probe.ts");
+		await Bun.write(script, source);
+		const childEnv: Record<string, string | undefined> = { ...Bun.env, ...env };
+		delete childEnv.GJC_CODING_AGENT_DIR;
+		delete childEnv.PI_CODING_AGENT_DIR;
+		delete childEnv.GJC_CONFIG_DIR;
+		delete childEnv.PI_CONFIG_DIR;
+		for (const [key, value] of Object.entries(env)) {
+			if (value === undefined) delete childEnv[key];
+			else childEnv[key] = value;
+		}
+		const child = Bun.spawn(["bun", script], {
+			cwd: dir,
+			env: childEnv,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
+		return stdout.trim();
+	}
+
+	test("a DSN present only in the checkout's .env cannot select the relay destination", async () => {
+		const hostile = "https://attacker@evil.example/999";
+		await Bun.write(path.join(dir, ".env"), `${CRASH_UPSTREAM_DSN_ENV}=${hostile}\n`);
+		const resolverPath = path.resolve(import.meta.dir, "../src/crash/upstream/relay.ts");
+		const out = await runInCheckout(
+			`import { resolveRelayDsn } from ${JSON.stringify(resolverPath)};\n` +
+				`const r = resolveRelayDsn({ upstream: "sentry", dsn: "" });\n` +
+				`console.log(JSON.stringify(r.ok ? { ok: true, host: r.dsn.envelopeUrl } : r));\n`,
+		);
+		const result = JSON.parse(out);
+		expect(result.ok).toBe(false);
+		expect(result.reason).toBe("no-dsn");
+		expect(out).not.toContain("evil.example");
+	});
+
+	test("hostile repo XDG_STATE_HOME with a gjc child cannot feed fatal or handled stores", async () => {
+		const hostileState = path.join(dir, "hostile-state");
+		const xdgRoot = path.join(hostileState, "gjc");
+		const trustedAgent = path.join(dir, ".gjc", "agent");
+		await fs.mkdir(xdgRoot, { recursive: true });
+		await fs.mkdir(trustedAgent, { recursive: true });
+
+		const forgedFatal = "c".repeat(32);
+		const forgedHandled = "d".repeat(32);
+		const stack = "    at readFile (packages/coding-agent/src/tools/read.ts:12:9)";
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: forgedFatal,
+				fpv: 1,
+				recordId: "1111222233334444",
+				at: 1_700_000_900_000,
+				errorName: "TypeError",
+				messageClass: "forged fatal",
+			},
+			path.join(xdgRoot, "gjc-crash-events.jsonl"),
+		);
+		await Bun.write(
+			path.join(xdgRoot, "gjc-crash.log"),
+			`2026-08-11T11:59:59.000Z pid=1 [Uncaught Exception] TypeError: forged fatal\n` +
+				`${stack}\n${formatCrashRecordMarker(forgedFatal, 1, "1111222233334444")}\n\n`,
+		);
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: forgedHandled,
+				fpv: 1,
+				recordId: "5555666677778888",
+				at: 1_700_000_900_000,
+				errorName: "ToolError",
+				messageClass: "forged handled",
+			},
+			path.join(xdgRoot, "gjc-error-events.jsonl"),
+		);
+		await Bun.write(
+			path.join(xdgRoot, "gjc-error.log"),
+			`2026-08-11T11:59:59.000Z pid=1 [Tool functions.read] ToolError: forged handled\n` +
+				`${stack}\n${formatCrashRecordMarker(forgedHandled, 1, "5555666677778888")}\n\n`,
+		);
+
+		await Bun.write(path.join(dir, ".env"), `XDG_STATE_HOME=${hostileState}\n`);
+		const relayPath = path.resolve(import.meta.dir, "../src/crash/upstream/relay.ts");
+		const dirsPath = path.resolve(import.meta.dir, "../../utils/src/dirs.ts");
+		const storePath = path.resolve(import.meta.dir, "../src/crash/index-store.ts");
+		const out = await runInCheckout(
+			`import { getCrashIndexPath, getHandledErrorIndexPath } from ${JSON.stringify(dirsPath)};\n` +
+				`import { resolveCrashStatePaths } from ${JSON.stringify(storePath)};\n` +
+				`import { relayAllSignatures, resolveTrustedHandledRelayStatePaths, resolveTrustedRelayStatePaths } from ${JSON.stringify(relayPath)};\n` +
+				`const posts = [];\n` +
+				`const outcome = await relayAllSignatures({\n` +
+				`  config: { upstream: "sentry", dsn: ${JSON.stringify(DSN)} },\n` +
+				`  env: {},\n` +
+				`  fetchImpl: async (_url, init) => { posts.push(String(init.body)); return new Response("", { status: 200 }); },\n` +
+				`});\n` +
+				`console.log(JSON.stringify({\n` +
+				`  outcome,\n` +
+				`  posts,\n` +
+				`  trusted: resolveTrustedRelayStatePaths(),\n` +
+				`  trustedHandled: resolveTrustedHandledRelayStatePaths(),\n` +
+				`  xdgFatal: resolveCrashStatePaths(),\n` +
+				`  xdgHandled: getHandledErrorIndexPath(),\n` +
+				`  crashIndexXdg: getCrashIndexPath(),\n` +
+				`}));\n`,
+			{
+				XDG_STATE_HOME: hostileState,
+				HOME: dir,
+			},
+		);
+		const result = JSON.parse(out) as {
+			outcome: { status: string; reason?: string; sent?: number };
+			posts: string[];
+			trusted: { index: string; events: string; crashLog: string };
+			trustedHandled: { index: string; events: string; crashLog: string };
+			xdgFatal: { index: string };
+			xdgHandled: string;
+			crashIndexXdg: string;
+		};
+		expect(result.outcome).toEqual({ status: "skipped", reason: "nothing-to-relay" });
+		expect(result.posts).toEqual([]);
+		for (const store of [result.trusted, result.trustedHandled]) {
+			for (const filePath of Object.values(store)) {
+				expect(filePath.startsWith(trustedAgent)).toBe(true);
+				expect(filePath.startsWith(hostileState)).toBe(false);
+			}
+		}
+		expect(result.crashIndexXdg.startsWith(xdgRoot)).toBe(true);
+		expect(result.xdgHandled.startsWith(xdgRoot)).toBe(true);
+		expect(out).not.toContain(forgedFatal);
+		expect(out).not.toContain(forgedHandled);
 	});
 });

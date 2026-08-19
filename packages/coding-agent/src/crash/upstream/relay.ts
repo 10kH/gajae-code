@@ -18,28 +18,24 @@
  * one `O_APPEND` write and dies; relaying happens at the *next* startup, after
  * compaction, where blocking and failing are both safe.
  */
+
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import {
-	getHandledErrorEventsPath,
-	getHandledErrorIndexPath,
-	getHandledErrorLogPath,
-	normalizeCrashFrames,
-	VERSION,
-} from "@gajae-code/utils";
+import { getTrustedAgentFile, normalizeCrashFrames, VERSION } from "@gajae-code/utils";
+import { $credentialEnv } from "@gajae-code/utils/env";
 import {
 	type CrashSignatureView,
 	type CrashStatePaths,
 	compactCrashIndex,
 	listCrashSignatures,
 	recordCrashStateEvent,
-	resolveCrashStatePaths,
 } from "../index-store";
 import { findLatestRecord } from "../record-loader";
 import { parseSentryDsn, type SentryDsn } from "./dsn";
-import { buildCrashEnvelope, type CrashEventFrame, newSentryEventId, sentryAuthHeader } from "./envelope";
+import { buildCrashEnvelope, type CrashEventFrame, sentryAuthHeader } from "./envelope";
 
-/** Environment variable form of the DSN, for CI and one-off runs. */
+/** Trusted environment variable form of the DSN, for CI and one-off runs. */
 export const CRASH_UPSTREAM_DSN_ENV = "GJC_CRASH_SENTRY_DSN";
 
 /**
@@ -140,10 +136,13 @@ export interface CrashRelayOptions {
  */
 export function resolveRelayDsn(
 	config: CrashRelayConfig,
-	env: Record<string, string | undefined>,
+	env: Record<string, string | undefined> = {},
 ): { ok: true; dsn: SentryDsn } | { ok: false; reason: CrashRelaySkip } {
 	if (config.upstream !== "sentry") return { ok: false, reason: "disabled" };
-	const raw = config.dsn.trim() || (env[CRASH_UPSTREAM_DSN_ENV] ?? "").trim();
+	// `env` is an injection seam only. Production resolution uses
+	// `$credentialEnv`, which excludes the checkout's `.env` overlay.
+	const raw =
+		config.dsn.trim() || (env[CRASH_UPSTREAM_DSN_ENV] ?? $credentialEnv(CRASH_UPSTREAM_DSN_ENV) ?? "").trim();
 	if (!raw) return { ok: false, reason: "no-dsn" };
 	const dsn = parseSentryDsn(raw);
 	if (!dsn) return { ok: false, reason: "invalid-dsn" };
@@ -151,13 +150,58 @@ export function resolveRelayDsn(
 }
 
 /**
- * A signature is due when it has never been relayed, or when new occurrences
- * have landed since the last accepted send. Sentry groups by our fingerprint,
- * so a repeat send updates that group's count rather than creating noise.
+ * A signature is due when new journal-append-order occurrences exist after the
+ * last durable watermark. `lastSeen` is display-time only and must not hide a
+ * backdated occurrence. Legacy indexes that only have `relayedAt` stay covered
+ * when that wall-clock stamp still covers `lastSeen`. After a downgrade that
+ * advanced `relayedAt` without rewriting `relayedRecordId`, the same lastSeen
+ * coverage applies only when the latest append is also the lastSeen record.
  */
 export function isRelayDue(signature: CrashSignatureView): boolean {
-	const relayedAt = signature.relayedAt;
-	return relayedAt === undefined || relayedAt < signature.lastSeen;
+	const appendId = signature.lastAppendRecordId ?? signature.lastRecordId;
+	if (signature.relayedRecordId !== undefined) {
+		if (signature.relayedRecordId === appendId) return false;
+		if (
+			signature.relayedAt !== undefined &&
+			signature.relayedAt >= signature.lastSeen &&
+			appendId === signature.lastRecordId
+		) {
+			return false;
+		}
+		return true;
+	}
+	return signature.relayedAt === undefined || signature.relayedAt < signature.lastSeen;
+}
+
+function relayAppendRecordId(signature: CrashSignatureView): string {
+	return signature.lastAppendRecordId ?? signature.lastRecordId;
+}
+
+function relayEventId(signature: CrashSignatureView): string {
+	return createHash("sha256")
+		.update(`${signature.fingerprint}:${relayAppendRecordId(signature)}`)
+		.digest("hex")
+		.slice(0, 32);
+}
+
+/**
+ * Automatic relay stores live under the provenance-checked agent directory.
+ * These resolvers never consult XDG state, even when `$XDG_STATE_HOME/gjc` exists.
+ */
+export function resolveTrustedRelayStatePaths(): CrashStatePaths {
+	return {
+		index: getTrustedAgentFile("gjc-crash-index.json"),
+		events: getTrustedAgentFile("gjc-crash-events.jsonl"),
+		crashLog: getTrustedAgentFile("gjc-crash.log"),
+	};
+}
+
+export function resolveTrustedHandledRelayStatePaths(): CrashStatePaths {
+	return {
+		index: getTrustedAgentFile("gjc-error-index.json"),
+		events: getTrustedAgentFile("gjc-error-events.jsonl"),
+		crashLog: getTrustedAgentFile("gjc-error.log"),
+	};
 }
 
 /** Split a normalized `path#function` frame into Sentry's frame shape. */
@@ -182,22 +226,24 @@ async function claimRelay(
 	eventId: string,
 	watermark: number,
 	now: number,
-): Promise<(() => Promise<void>) | undefined> {
+): Promise<
+	{ readonly status: "claimed"; readonly release: () => Promise<void> } | { readonly status: "contended" | "failed" }
+> {
 	const claimPath = path.join(path.dirname(paths.index), `.gjc-crash-relay-${fingerprint}`);
 	try {
 		const file = await fs.open(claimPath, "wx", 0o600);
 		await file.writeFile(`${JSON.stringify({ eventId, watermark })}\n`);
 		await file.close();
-		return async () => {
-			await fs.rm(claimPath, { force: true });
-		};
+		return { status: "claimed", release: () => fs.rm(claimPath, { force: true }) };
 	} catch (error) {
-		if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") return undefined;
+		if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") return { status: "failed" };
 		try {
 			const stat = await fs.stat(claimPath);
 			if (now - stat.mtimeMs > RELAY_CLAIM_TTL_MS) await fs.rm(claimPath, { force: true });
-		} catch {}
-		return undefined;
+		} catch {
+			return { status: "failed" };
+		}
+		return { status: "contended" };
 	}
 }
 
@@ -206,13 +252,16 @@ async function claimRelay(
  * machine or a corrupt crash log must not be able to take down startup.
  */
 export async function relayCrashSignatures(options: CrashRelayOptions): Promise<CrashRelayOutcome> {
-	const env = options.env ?? process.env;
-	const resolved = resolveRelayDsn(options.config, env);
+	const resolved = resolveRelayDsn(options.config, options.env);
 	// Gate before any filesystem access: `off` must be indistinguishable from
 	// the feature not existing.
 	if (!resolved.ok) return { status: "skipped", reason: resolved.reason };
 
-	const paths = options.paths ?? resolveCrashStatePaths();
+	// Relay historical crashes only from the provenance-checked agent
+	// directory. Ordinary crash-state resolvers honor XDG_STATE_HOME, which a
+	// repository `.env` can set and populate with a `gjc` child; those files
+	// are untrusted for automatic egress.
+	const paths = options.paths ?? resolveTrustedRelayStatePaths();
 	const fetchImpl = options.fetchImpl ?? fetch;
 	const now = options.now ?? Date.now;
 	const release = options.release ?? VERSION;
@@ -225,7 +274,10 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 	// append-only journal into the index under the cross-process lock, so the
 	// counts we are about to relay are the reconciled ones.
 	const index = await compactCrashIndex({ paths, now: now() });
-	const signatures = listCrashSignatures(index).filter(isRelayDue).slice(0, limit);
+	const signatures = listCrashSignatures(index)
+		.filter(isRelayDue)
+		.sort((a, b) => a.firstSeen - b.firstSeen || a.fingerprint.localeCompare(b.fingerprint))
+		.slice(0, limit);
 	if (signatures.length === 0) return { status: "skipped", reason: "nothing-to-relay" };
 
 	let crashLog = "";
@@ -242,13 +294,18 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 	let failed = 0;
 
 	for (const signature of signatures) {
-		const eventId = newSentryEventId();
-		const releaseClaim = await claimRelay(paths, signature.fingerprint, eventId, signature.lastSeen, now());
-		if (!releaseClaim) continue;
+		// Retrying after an accepted POST but before the local state event becomes
+		// durable must reuse the same upstream event identity.
+		const eventId = relayEventId(signature);
+		const claim = await claimRelay(paths, signature.fingerprint, eventId, signature.lastSeen, now());
+		if (claim.status !== "claimed") {
+			if (claim.status === "failed") failed++;
+			continue;
+		}
 		const record = findLatestRecord(crashLog, signature.fingerprint);
 		if (!record) {
 			refused++;
-			await releaseClaim();
+			await claim.release().catch(() => {});
 			continue;
 		}
 
@@ -270,14 +327,14 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		if (!envelope.ok) {
 			// Fail closed. Deliberately no retry with a reduced payload.
 			refused++;
-			await releaseClaim();
+			await claim.release().catch(() => {});
 			continue;
 		}
 
 		const accepted = await postEnvelope(fetchImpl, resolved.dsn, envelope.body, release);
 		if (!accepted) {
 			failed++;
-			await releaseClaim();
+			await claim.release().catch(() => {});
 			continue;
 		}
 
@@ -288,23 +345,37 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		// snapshot's `lastSeen` leaves the signature due again, which is the
 		// conservative direction: at worst one duplicate event that Sentry folds
 		// into the same fingerprint group.
-		await recordCrashStateEvent(
-			{ kind: "relayed", fingerprint: signature.fingerprint, at: signature.lastSeen, eventId: envelope.eventId },
-			{ paths, now: now() },
-		);
-		await releaseClaim();
-		sent++;
+		try {
+			await recordCrashStateEvent(
+				{
+					kind: "relayed",
+					fingerprint: signature.fingerprint,
+					at: signature.lastSeen,
+					eventId: envelope.eventId,
+					recordId: relayAppendRecordId(signature),
+				},
+				{ paths, now: now() },
+			);
+			sent++;
+		} catch {
+			// The upstream may have accepted, but delivery is not complete until
+			// the local idempotency watermark is durable.
+			failed++;
+		} finally {
+			await claim.release().catch(() => {});
+		}
 	}
 
 	return { status: "ran", sent, refused, failed };
 }
 
-/** Paths of the handled-error store, which mirrors the fatal store in separate files. */
+/** Paths of the handled-error store. Never XDG: a supplied directory is joined directly. */
 export function resolveHandledErrorStatePaths(agentDir?: string): CrashStatePaths {
+	if (!agentDir) return resolveTrustedHandledRelayStatePaths();
 	return {
-		index: getHandledErrorIndexPath(agentDir),
-		events: getHandledErrorEventsPath(agentDir),
-		crashLog: getHandledErrorLogPath(agentDir),
+		index: path.join(agentDir, "gjc-error-index.json"),
+		events: path.join(agentDir, "gjc-error-events.jsonl"),
+		crashLog: path.join(agentDir, "gjc-error.log"),
 	};
 }
 
@@ -313,15 +384,25 @@ export function resolveHandledErrorStatePaths(agentDir?: string): CrashStatePath
  *
  * Fatal crashes go first: they are rarer and more valuable, so when the
  * per-run cap binds they must not be starved by a noisy handled-error class.
- * The gate is evaluated once by the first call, and a skip there means the same
- * skip applies to the second, so `off` still performs no IO at all.
+ * The cap is shared across both stores. The gate is evaluated once by the
+ * first call, and a skip there means the same skip applies to the second, so
+ * `off` still performs no IO at all.
  */
 export async function relayAllSignatures(options: CrashRelayOptions): Promise<CrashRelayOutcome> {
-	const fatal = await relayCrashSignatures({ ...options, severity: "fatal" });
+	const limit = options.maxPerRun ?? MAX_RELAY_PER_RUN;
+	const fatal = await relayCrashSignatures({ ...options, severity: "fatal", maxPerRun: limit });
+	const consumed = fatal.status === "ran" ? fatal.sent + fatal.refused + fatal.failed : 0;
+	const remaining = Math.max(0, limit - consumed);
+	if (remaining === 0) {
+		return fatal.status === "skipped"
+			? fatal
+			: { status: "ran", sent: fatal.sent, refused: fatal.refused, failed: fatal.failed };
+	}
 	const handled = await relayCrashSignatures({
 		...options,
 		severity: "error",
-		paths: options.handledPaths ?? resolveHandledErrorStatePaths(),
+		maxPerRun: remaining,
+		paths: options.handledPaths ?? resolveTrustedHandledRelayStatePaths(),
 	});
 	if (fatal.status === "skipped" && handled.status === "skipped") return fatal;
 	return {
@@ -347,6 +428,8 @@ async function postEnvelope(
 				"X-Sentry-Auth": sentryAuthHeader(dsn, release),
 			},
 			body,
+			redirect: "error",
+			credentials: "omit",
 			signal: AbortSignal.timeout(RELAY_TIMEOUT_MS),
 		});
 		return response.ok;

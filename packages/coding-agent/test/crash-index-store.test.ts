@@ -113,9 +113,24 @@ describe("compactCrashIndex", () => {
 			lifetimeCount: 1,
 			retainedCount: 1,
 			lastRecordId: recovered.recordId,
+			lastAppendRecordId: recovered.recordId,
 		});
 		expect(index.signatures[recovered.fingerprint]?.reportedAt).toBeUndefined();
 		expect(index.signatures[recovered.fingerprint]?.acknowledgedAt).toBeUndefined();
+	});
+
+	it("recovers lastAppendRecordId from log order rather than display-time lastSeen", async () => {
+		const paths = await tempPaths();
+		const newer = recoverableRecord(200, "same recovered class", "2026-08-11T12:00:00.000Z");
+		const backdated = recoverableRecord(201, "same recovered class", "2026-08-11T11:00:00.000Z");
+		expect(backdated.fingerprint).toBe(newer.fingerprint);
+		await fs.writeFile(paths.crashLog, newer.text + backdated.text);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[newer.fingerprint]).toMatchObject({
+			lastSeen: Date.parse("2026-08-11T12:00:00.000Z"),
+			lastRecordId: newer.recordId,
+			lastAppendRecordId: backdated.recordId,
+		});
 	});
 
 	it("deduplicates every delayed journal event for more than 256 recovered records", async () => {
@@ -227,6 +242,7 @@ describe("compactCrashIndex", () => {
 		const index = await compactCrashIndex({ paths, now: NOW });
 		expect(index.signatures[fingerprintFor(41)]?.lastSeen).toBe(NOW);
 		expect(index.signatures[fingerprintFor(41)]?.lastRecordId).toBe(recordId(410));
+		expect(index.signatures[fingerprintFor(41)]?.lastAppendRecordId).toBe(recordId(411));
 		expect(index.signatures[fingerprintFor(41)]?.messageClass).toBe("newest");
 	});
 
@@ -580,9 +596,45 @@ describe("relayed crash events", () => {
 	const eventId = "0123456789abcdef0123456789abcdef";
 
 	it("round-trips all relayed fields through the journal format", () => {
-		const line = formatCrashEventLine({ kind: "relayed", fingerprint, at: NOW, eventId });
+		const recordId = "1".repeat(16);
+		const line = formatCrashEventLine({ kind: "relayed", fingerprint, at: NOW, eventId, recordId });
 
+		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId, recordId });
+	});
+
+	it("accepts a legacy relayed journal line without a record id", () => {
+		const line = `gjc-crash-event.v1 ${JSON.stringify({ k: "relayed", fp: fingerprint, at: NOW, e: eventId })}\n`;
 		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId });
+	});
+
+	it("applies a legacy relayed line as lastSeen coverage without dropping the watermark", () => {
+		const index = parseCrashIndex(
+			JSON.stringify({
+				version: 1,
+				updatedAt: NOW,
+				lastNudgedAt: 0,
+				overflow: false,
+				recentEventIds: [],
+				signatures: {
+					[fingerprint]: {
+						fpv: 1,
+						errorName: "Error",
+						messageClass: "boom",
+						lifetimeCount: 1,
+						retainedCount: 0,
+						firstSeen: NOW,
+						lastSeen: NOW,
+						lastRecordId: recordId(70),
+					},
+				},
+			}),
+			NOW,
+		);
+		expect(index).toBeDefined();
+		if (!index) return;
+		expect(applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId }, NOW)).toBe(true);
+		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
+		expect(index.signatures[fingerprint]?.relayedRecordId).toBe(recordId(70));
 	});
 
 	it.each([
@@ -621,7 +673,7 @@ describe("relayed crash events", () => {
 		expect(index).toBeDefined();
 		if (!index) return;
 
-		const relay = { kind: "relayed" as const, fingerprint, at: NOW, eventId };
+		const relay = { kind: "relayed" as const, fingerprint, at: NOW, eventId, recordId: recordId(1) };
 		expect(applyCrashEvent(index, relay, NOW)).toBe(true);
 		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
 		expect(applyCrashEvent(index, relay, NOW)).toBe(false);
@@ -644,7 +696,9 @@ describe("relayed crash events", () => {
 		expect(index).toBeDefined();
 		if (!index) return;
 
-		expect(applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId }, NOW)).toBe(false);
+		expect(
+			applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId, recordId: recordId(1) }, NOW),
+		).toBe(false);
 		expect(index.signatures[fingerprint]).toBeUndefined();
 	});
 

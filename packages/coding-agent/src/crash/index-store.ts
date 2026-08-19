@@ -69,11 +69,15 @@ export interface CrashSignatureEntry {
 	firstSeen: number;
 	lastSeen: number;
 	lastRecordId: string;
+	/** Journal-append-order occurrence id, independent of display-time `lastSeen`. */
+	lastAppendRecordId: string;
 	reportedAt?: number;
 	reportedIssueUrl?: string;
 	acknowledgedAt?: number;
 	/** Epoch ms this signature was last accepted by the configured upstream. */
 	relayedAt?: number;
+	/** Occurrence record represented by the durable upstream watermark. */
+	relayedRecordId?: string;
 	/** Issues this install already "+1"ed, so re-invocations cannot spam comments. */
 	commentedIssues?: string[];
 }
@@ -141,10 +145,12 @@ const ENTRY_KEYS = new Set([
 	"firstSeen",
 	"lastSeen",
 	"lastRecordId",
+	"lastAppendRecordId",
 	"reportedAt",
 	"reportedIssueUrl",
 	"acknowledgedAt",
 	"relayedAt",
+	"relayedRecordId",
 	"commentedIssues",
 ]);
 const INDEX_KEYS = new Set([
@@ -229,9 +235,19 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	if (!isTimestamp(raw.firstSeen, now) || !isTimestamp(raw.lastSeen, now)) return undefined;
 	if (raw.lastSeen < raw.firstSeen) return undefined;
 	if (typeof raw.lastRecordId !== "string" || !/^[0-9a-f]{8,32}$/.test(raw.lastRecordId)) return undefined;
+	if (
+		raw.lastAppendRecordId !== undefined &&
+		(typeof raw.lastAppendRecordId !== "string" || !/^[0-9a-f]{8,32}$/.test(raw.lastAppendRecordId))
+	)
+		return undefined;
 	if (raw.reportedAt !== undefined && !isTimestamp(raw.reportedAt, now)) return undefined;
 	if (raw.acknowledgedAt !== undefined && !isTimestamp(raw.acknowledgedAt, now)) return undefined;
 	if (raw.relayedAt !== undefined && !isTimestamp(raw.relayedAt, now)) return undefined;
+	if (
+		raw.relayedRecordId !== undefined &&
+		(typeof raw.relayedRecordId !== "string" || !/^[0-9a-f]{8,32}$/.test(raw.relayedRecordId))
+	)
+		return undefined;
 	if (raw.reportedIssueUrl !== undefined && !isCleanString(raw.reportedIssueUrl, 256)) return undefined;
 	if (raw.commentedIssues !== undefined) {
 		if (!Array.isArray(raw.commentedIssues) || raw.commentedIssues.length > 32) return undefined;
@@ -246,11 +262,13 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 		firstSeen: raw.firstSeen,
 		lastSeen: raw.lastSeen,
 		lastRecordId: raw.lastRecordId,
+		lastAppendRecordId: typeof raw.lastAppendRecordId === "string" ? raw.lastAppendRecordId : raw.lastRecordId,
 	};
 	if (raw.reportedAt !== undefined) entry.reportedAt = raw.reportedAt;
 	if (raw.reportedIssueUrl !== undefined) entry.reportedIssueUrl = raw.reportedIssueUrl;
 	if (raw.acknowledgedAt !== undefined) entry.acknowledgedAt = raw.acknowledgedAt;
 	if (raw.relayedAt !== undefined) entry.relayedAt = raw.relayedAt;
+	if (raw.relayedRecordId !== undefined) entry.relayedRecordId = raw.relayedRecordId;
 	if (raw.commentedIssues !== undefined) entry.commentedIssues = [...(raw.commentedIssues as string[])];
 	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) return undefined;
 	return entry;
@@ -473,8 +491,17 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	}
 	if (event.kind === "relayed") {
 		if (!existing) return false;
+		if (event.recordId !== undefined) {
+			if (existing.relayedRecordId === event.recordId) return false;
+			existing.relayedAt = event.at;
+			existing.relayedRecordId = event.recordId;
+			return true;
+		}
 		if (existing.relayedAt !== undefined && existing.relayedAt >= event.at) return false;
 		existing.relayedAt = event.at;
+		if (event.at >= existing.lastSeen) {
+			existing.relayedRecordId = existing.lastAppendRecordId ?? existing.lastRecordId;
+		}
 		return true;
 	}
 	if (event.kind === "acknowledged") {
@@ -502,6 +529,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	if (existing) {
 		existing.lifetimeCount += 1;
 		existing.firstSeen = Math.min(existing.firstSeen, event.at);
+		existing.lastAppendRecordId = event.recordId;
 		if (event.at >= existing.lastSeen) {
 			existing.lastSeen = event.at;
 			existing.lastRecordId = event.recordId;
@@ -524,6 +552,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		firstSeen: event.at,
 		lastSeen: event.at,
 		lastRecordId: event.recordId,
+		lastAppendRecordId: event.recordId,
 	};
 	return true;
 }
@@ -567,7 +596,8 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 	for (const [fingerprint, records] of recordsByFingerprint) {
 		const oldest = records.reduce((candidate, record) => (record.at < candidate.at ? record : candidate));
 		const newest = records.reduce((candidate, record) => (record.at >= candidate.at ? record : candidate));
-		if (!oldest || !newest) continue;
+		const lastAppended = records[records.length - 1];
+		if (!oldest || !newest || !lastAppended) continue;
 		let entry = index.signatures[fingerprint];
 		if (!entry) {
 			if (index.retiredFingerprints.includes(fingerprint)) continue;
@@ -585,6 +615,7 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 				firstSeen: oldest.at,
 				lastSeen: newest.at,
 				lastRecordId: newest.recordId,
+				lastAppendRecordId: lastAppended.recordId,
 			};
 			index.signatures[fingerprint] = entry;
 			for (const record of records) {
@@ -719,7 +750,7 @@ export async function recordCrashStateEvent(
 ): Promise<CrashIndex> {
 	const paths = options.paths ?? resolveCrashStatePaths();
 	await fs.mkdir(path.dirname(paths.events), { recursive: true, mode: 0o700 });
-	appendCrashEvent(event, paths.events);
+	if (!appendCrashEvent(event, paths.events)) throw new Error("Crash state journal append failed");
 	return compactCrashIndex({ paths, now: options.now });
 }
 
