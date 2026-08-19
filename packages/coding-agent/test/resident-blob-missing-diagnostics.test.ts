@@ -8,6 +8,7 @@ import {
 	assertResidentReferencesResolvableForTests,
 	type FileEntry,
 	materializeResidentEntriesForPersistenceForTests,
+	materializeResidentEntriesThrowingForTests,
 	residentBlobSentinelForTests,
 } from "../src/session/session-manager";
 
@@ -96,6 +97,40 @@ describe("the fail-closed resident path leaves a record", () => {
 		// as a fail-closed abort.
 		expect(JSON.stringify(materialized)).toContain("Session resident text blob missing");
 		expect(errorSpy).not.toHaveBeenCalled();
+	});
+
+	test("a fail-closed materialize throw leaves one record carrying the session binding", () => {
+		const store = makeStore();
+		const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+		const entry = {
+			type: "message",
+			id: "materialize-entry",
+			parentId: null,
+			timestamp: new Date(0).toISOString(),
+			message: {
+				role: "user",
+				content: [{ type: "text", text: residentBlobSentinelForTests("text", MISSING_REF) }],
+				timestamp: 0,
+			},
+		} as unknown as FileEntry;
+
+		expect(() =>
+			materializeResidentEntriesThrowingForTests([entry], store, store, {
+				sessionId: "s-materialize",
+				sessionFile: "/tmp/s-materialize.jsonl",
+			}),
+		).toThrow("Missing resident text blob");
+		const reported = errorSpy.mock.calls.filter(
+			([message]) => message === "Resident blob missing on a fail-closed path",
+		);
+		expect(reported).toHaveLength(1);
+		expect(reported[0]![1]).toMatchObject({
+			phase: "materialize",
+			kind: "text",
+			hash: MISSING_HASH,
+			sessionId: "s-materialize",
+			sessionFile: "/tmp/s-materialize.jsonl",
+		});
 	});
 });
 

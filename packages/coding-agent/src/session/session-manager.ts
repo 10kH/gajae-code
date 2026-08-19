@@ -5030,6 +5030,16 @@ function reportInvalidResidentBlobRef(ref: string, kind: string, stores: Residen
 	);
 }
 
+/** Coerce a corrupted sentinel's ref to text without letting a hostile toString through. */
+function safeResidentRefText(ref: unknown): string {
+	if (typeof ref === "string") return ref;
+	try {
+		return String(ref);
+	} catch {
+		return "<unprintable ref>";
+	}
+}
+
 function residentBlobMissingPlaceholder(error: ResidentBlobMissingError): string {
 	return `[Session resident ${error.kind} blob missing: sha256:${error.hash}; original content unavailable]`;
 }
@@ -5172,8 +5182,9 @@ function assertResidentReferencesResolvableSync(entries: readonly FileEntry[], s
 			const key = `${value.kind}:${value.ref}`;
 			if (resolved.has(key)) return;
 			resolved.add(key);
-			const hash = parseBlobRef(value.ref);
-			if (hash === null) throw reportInvalidResidentBlobRef(value.ref, value.kind, stores);
+			// The strict sentinel gate above already required isBlobRef(value.ref), so
+			// the parse cannot fail here; non-parsing refs are the corrupted lane below.
+			const hash = parseBlobRef(value.ref) as string;
 			const store = value.kind === "text" ? stores.textStore : stores.imageStore;
 			if (store.getSync(hash) === null) {
 				throw reportResidentBlobMissing(
@@ -5190,7 +5201,7 @@ function assertResidentReferencesResolvableSync(entries: readonly FileEntry[], s
 		if ((value as { [RESIDENT_BLOB_SENTINEL_KEY]?: unknown })[RESIDENT_BLOB_SENTINEL_KEY] === true) {
 			const record = value as { kind?: unknown; ref?: unknown };
 			throw reportInvalidResidentBlobRef(
-				typeof record.ref === "string" ? record.ref : String(record.ref),
+				safeResidentRefText(record.ref),
 				typeof record.kind === "string" ? record.kind : "unknown",
 				stores,
 			);
@@ -5305,6 +5316,19 @@ export function assertResidentReferencesResolvableForTests(
 	binding: { sessionId?: string; sessionFile?: string } = {},
 ): void {
 	assertResidentReferencesResolvableSync(entries, { textStore, imageStore, ...binding });
+}
+
+export function materializeResidentEntriesThrowingForTests<T>(
+	entries: T[],
+	textStore: BlobStore,
+	imageStore: BlobStore = textStore,
+	binding: { sessionId?: string; sessionFile?: string } = {},
+): T[] {
+	return materializeResidentEntriesSync(entries as Array<T & FileEntry>, {
+		textStore,
+		imageStore,
+		...binding,
+	}) as T[];
 }
 
 export function materializeResidentEntriesForPersistenceForTests<T>(
@@ -7479,6 +7503,8 @@ export class SessionManager {
 				textStore: sourceTextStore,
 				imageStore: source.sourceStores.imageStore,
 				textFallback: source.sourceStores.textFallback,
+				sessionId: target.sessionId,
+				sessionFile: target.sessionFile || undefined,
 				onResidentBlobMissing: source.sourceStores.onResidentBlobMissing,
 			},
 
