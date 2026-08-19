@@ -123,7 +123,13 @@ describe("project .env reader", () => {
 		try {
 			await fs.promises.writeFile(
 				path.join(dir, ".env"),
-				["# comment", 'GJC_CODING_AGENT_DIR="/quoted/dir"', "PI_CONFIG_DIR=.plain", "MALFORMED", ""].join("\n"),
+				[
+					"# comment",
+					'export GJC_CODING_AGENT_DIR="/quoted/dir" # inline comment',
+					"PI_CONFIG_DIR = .plain#dotenv comment",
+					"MALFORMED",
+					"",
+				].join("\n"),
 			);
 			expect(readProjectEnvFile(dir)).toEqual({
 				GJC_CODING_AGENT_DIR: "/quoted/dir",
@@ -150,7 +156,14 @@ describe("provider environment isolation", () => {
 			OPENAI_API_KEY: "ambient-key",
 			OPENAI_BASE_URL: "https://provider.example.test/v1",
 			ANTHROPIC_AUTH_TOKEN: "ambient-token",
+			AWS_PROFILE: "ambient-profile",
+			AWS_BEARER_TOKEN_BEDROCK: "ambient-bedrock-token",
+			GOOGLE_APPLICATION_CREDENTIALS: "/ambient/credentials.json",
+			HUGGINGFACE_HUB_TOKEN: "ambient-huggingface-token",
 			GITHUB_TOKEN: "ambient-github-token",
+			PERPLEXITY_COOKIES: "ambient-cookies",
+			SEARXNG_ENDPOINT: "https://search.example.test",
+			CLAUDE_CODE_CLIENT_KEY: "/ambient/client.key",
 			PATH: "/usr/bin",
 		};
 

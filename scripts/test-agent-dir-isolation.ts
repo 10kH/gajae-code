@@ -22,7 +22,37 @@ export type AgentDirIsolationDecision =
 	| { action: "honor"; agentDir: string };
 
 const AMBIENT_PROVIDER_ENV_PATTERN = /(?:_API_KEY|_AUTH_TOKEN|_OAUTH_TOKEN|_ACCESS_TOKEN|_BASE_URL)$/;
-const AMBIENT_PROVIDER_ENV_EXACT = new Set(["GH_TOKEN", "GITHUB_TOKEN", "HF_TOKEN", "COPILOT_GITHUB_TOKEN"]);
+const AMBIENT_PROVIDER_ENV_EXACT = new Set([
+	"ANTHROPIC_CUSTOM_HEADERS",
+	"AWS_ACCESS_KEY_ID",
+	"AWS_BEARER_TOKEN_BEDROCK",
+	"AWS_BEARER_TOKEN_KIRO",
+	"AWS_CONFIG_FILE",
+	"AWS_PROFILE",
+	"AWS_SECRET_ACCESS_KEY",
+	"AWS_SESSION_TOKEN",
+	"AWS_SHARED_CREDENTIALS_FILE",
+	"CLAUDE_CODE_CLIENT_CERT",
+	"CLAUDE_CODE_CLIENT_KEY",
+	"CLAUDE_CODE_USE_FOUNDRY",
+	"CLAUDE_CONFIG_DIR",
+	"CODEX_HOME",
+	"COPILOT_GITHUB_TOKEN",
+	"GCLOUD_PROJECT",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
+	"GOOGLE_APPLICATION_CREDENTIALS",
+	"GOOGLE_CLOUD_LOCATION",
+	"GOOGLE_CLOUD_PROJECT",
+	"HF_TOKEN",
+	"HUGGINGFACE_HUB_TOKEN",
+	"PERPLEXITY_COOKIES",
+	"QWEN_PORTAL_API_KEY",
+	"SEARXNG_BASIC_PASSWORD",
+	"SEARXNG_BASIC_USERNAME",
+	"SEARXNG_ENDPOINT",
+	"SEARXNG_TOKEN",
+]);
 
 /** Remove provider credentials and endpoints inherited from the operator shell. */
 export function stripAmbientProviderEnvironment(env: Record<string, string | undefined>): void {
@@ -52,10 +82,26 @@ export function readProjectEnvFile(cwd: string): Record<string, string> {
 	for (const line of raw.split("\n")) {
 		const trimmed = line.trim();
 		if (!trimmed || trimmed.startsWith("#")) continue;
-		const eq = trimmed.indexOf("=");
-		if (eq <= 0) continue;
-		const key = trimmed.slice(0, eq).trim();
-		let value = trimmed.slice(eq + 1).trim();
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(trimmed);
+		if (!match) continue;
+		const key = match[1]!;
+		let value = match[2]!.trim();
+		let quote: '"' | "'" | undefined;
+		for (let index = 0; index < value.length; index++) {
+			const char = value[index];
+			if (char === "\\") {
+				index++;
+				continue;
+			}
+			if ((char === '"' || char === "'") && (!quote || quote === char)) {
+				quote = quote ? undefined : char;
+				continue;
+			}
+			if (char === "#" && !quote) {
+				value = value.slice(0, index).trimEnd();
+				break;
+			}
+		}
 		if (
 			value.length >= 2 &&
 			((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
