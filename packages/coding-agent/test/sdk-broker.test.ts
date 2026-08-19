@@ -698,6 +698,7 @@ describe("SDK broker identity and discovery", () => {
 		}) as typeof setInterval);
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
 			observe: () => ({ kind: "owned" }),
+			observeAsync: () => Promise.resolve({ kind: "owned" }),
 			heartbeatAsync: () => Promise.resolve({ kind: ++heartbeatAttempts === 1 ? "failed" : "written" }),
 			syncAsync: () => Promise.resolve({ kind: "synced" }),
 			close: () => ({ kind: "closed" }),
@@ -732,6 +733,7 @@ describe("SDK broker identity and discovery", () => {
 		}) as typeof setInterval);
 		const retain = vi.spyOn(native, "retainBrokerPublication").mockReturnValue({
 			observe: () => ({ kind: observation }),
+			observeAsync: () => Promise.resolve({ kind: observation }),
 			heartbeatAsync: () => Promise.resolve({ kind: ++heartbeatAttempts === 1 ? "failed" : "written" }),
 			syncAsync: () => Promise.resolve({ kind: "synced" }),
 			close: () => ({ kind: "closed" }),
@@ -878,7 +880,9 @@ describe("SDK broker identity and discovery", () => {
 			const retainedRoot = path.join(dir, "retained-sdk");
 			await fs.rename(path.join(dir, "sdk"), retainedRoot);
 			watchdog!();
-			// Admission checks the synchronous fence before any request normalization or IO.
+			// The watchdog observes on the blocking pool; admission sees the fence after
+			// that observation settles, before request normalization or IO.
+			await new Promise(resolve => setTimeout(resolve, 0));
 			expect(await broker.handleRequest("session.list", {})).toEqual({
 				ok: false,
 				error: { code: "unavailable", message: "broker publication is unavailable" },
@@ -886,6 +890,7 @@ describe("SDK broker identity and discovery", () => {
 
 			await fs.rename(retainedRoot, path.join(dir, "sdk"));
 			watchdog!();
+			await new Promise(resolve => setTimeout(resolve, 0));
 			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
 		} finally {
 			interval.mockRestore();
@@ -893,10 +898,9 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("recovers request admission synchronously with the watchdog observation, not after the heartbeat write", async () => {
+	it("recovers request admission after the watchdog observation, not after the heartbeat write", async () => {
 		// Regression: #watchPublication must restore the cached publicationState
-		// before the awaited heartbeat IO so a request that follows the watchdog
-		// in the same async tick sees healthy ownership without an extra sleep.
+		// after its off-thread observation and before the awaited heartbeat IO.
 		const dir = await temp();
 		let watchdog: (() => void) | undefined;
 		const realSetInterval = globalThis.setInterval;
@@ -915,8 +919,8 @@ describe("SDK broker identity and discovery", () => {
 			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: false });
 
 			await fs.rename(retainedRoot, path.join(dir, "sdk"));
-			// No sleep, no extra microtask drain between the watchdog and the request.
 			watchdog!();
+			await new Promise(resolve => setTimeout(resolve, 0));
 			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
 		} finally {
 			interval.mockRestore();

@@ -116,6 +116,20 @@ fn run_sync(handle: Option<Arc<RetainedPublicationHandle>>) -> String {
 	)
 }
 
+/// The read-only observation body the blocking pool runs for the watchdog.
+fn run_observe(handle: Option<Arc<RetainedPublicationHandle>>) -> String {
+	handle.map_or_else(
+		|| "ambiguous".to_owned(),
+		|handle| {
+			if handle.closed.load(Ordering::Acquire) {
+				"ambiguous".to_owned()
+			} else {
+				handle.publication.observe()
+			}
+		},
+	)
+}
+
 #[napi]
 impl NativeRetainedBrokerPublication {
 	/// Read-only observation. Deliberately synchronous: it is the authority
@@ -136,6 +150,15 @@ impl NativeRetainedBrokerPublication {
 				},
 			),
 		}
+	}
+
+	/// Read-only observation on the libuv blocking pool for watchdog paths.
+	#[napi]
+	pub fn observe_async(&self) -> task::Promise<NativeBrokerPublicationObservation> {
+		let handle = self.acquire();
+		task::blocking("broker_publication_observe", (), move |_| {
+			Ok(NativeBrokerPublicationObservation { kind: run_observe(handle) })
+		})
 	}
 
 	/// Positional heartbeat write on the libuv blocking pool. The write is an

@@ -1130,9 +1130,9 @@ export class Broker {
 	}
 	async #observePublication(writeHeartbeat: boolean): Promise<void> {
 		if (!this.#publication || this.#publicationState === "stopping") return;
-		let observation: ReturnType<RetainedBrokerDiscovery["observe"]>;
+		let observation: BrokerPublicationObservation;
 		try {
-			observation = publicationObservationOverridesForTest.get(this) ?? this.#publication.observe();
+			observation = publicationObservationOverridesForTest.get(this) ?? (await this.#publication.observeAsync());
 		} catch {
 			this.#fence("observation-ambiguous");
 			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
