@@ -42,7 +42,7 @@ const DEFAULT_LOCAL_TOKEN = "lm-studio-local";
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
-import { $pickCredentialEnv, isRecord, logger } from "@gajae-code/utils";
+import { $pickCredentialEnv, $rotatingCredentialEnv, isRecord, logger } from "@gajae-code/utils";
 import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { isValidThemeColor, type ThemeColor } from "../modes/theme/theme";
 import {
@@ -1259,6 +1259,7 @@ export class ModelRegistry {
 	#availableModelsEnvFingerprint: string | undefined;
 	#sessionCanonicalVariants = new Map<string, string>();
 	#customProviderApiKeys: Map<string, string> = new Map();
+	#customProviderApiKeyEnvNames: Map<string, string> = new Map();
 	#providerWebSearchModes: Map<string, WebSearchMode> = new Map();
 	#keylessProviders: Set<string> = new Set();
 	#optionalAuthProviders: Set<string> = new Set();
@@ -1424,6 +1425,7 @@ export class ModelRegistry {
 		}
 		this.#modelsConfigFile.invalidate();
 		this.#customProviderApiKeys.clear();
+		this.#customProviderApiKeyEnvNames.clear();
 		this.#providerWebSearchModes.clear();
 		this.#keylessProviders.clear();
 		this.#optionalAuthProviders.clear();
@@ -1829,7 +1831,10 @@ export class ModelRegistry {
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
 
 		for (const [providerName, providerConfig] of providerEntries) {
-			if (providerConfig.apiKeyEnv) this.#configuredApiKeyEnvNames.add(providerConfig.apiKeyEnv);
+			if (providerConfig.apiKeyEnv) {
+				this.#configuredApiKeyEnvNames.add(providerConfig.apiKeyEnv);
+				this.#customProviderApiKeyEnvNames.set(providerName, providerConfig.apiKeyEnv);
+			}
 			if (providerConfig.apiKey) this.#configuredApiKeyEnvNames.add(providerConfig.apiKey);
 			if (providerConfig.openaiCompat?.apiKeyEnv)
 				this.#configuredApiKeyEnvNames.add(providerConfig.openaiCompat.apiKeyEnv);
@@ -4015,6 +4020,7 @@ export class ModelRegistry {
 			signal?: AbortSignal;
 		} = {},
 	): Promise<string | undefined> {
+		this.#refreshRotatingConfigApiKey(model.provider);
 		return this.#getApiKeyOrNoAuth(model.provider, () =>
 			this.authStorage.getApiKey(model.provider, sessionId, {
 				baseUrl: model.baseUrl,
@@ -4039,6 +4045,7 @@ export class ModelRegistry {
 			signal?: AbortSignal;
 		} = {},
 	): Promise<string | undefined> {
+		this.#refreshRotatingConfigApiKey(provider);
 		return this.#getApiKeyOrNoAuth(provider, () =>
 			this.authStorage.getApiKey(provider, sessionId, {
 				baseUrl,
@@ -4047,6 +4054,20 @@ export class ModelRegistry {
 				signal: options.signal,
 			}),
 		);
+	}
+
+	#refreshRotatingConfigApiKey(provider: string): void {
+		const envName = this.#customProviderApiKeyEnvNames.get(provider);
+		if (!envName) return;
+		const resolved = $rotatingCredentialEnv(envName);
+		if (resolved === this.#customProviderApiKeys.get(provider)) return;
+		if (resolved === undefined) {
+			this.#customProviderApiKeys.delete(provider);
+			this.authStorage.removeConfigApiKey(provider);
+			return;
+		}
+		this.#customProviderApiKeys.set(provider, resolved);
+		this.authStorage.setConfigApiKey(provider, resolved);
 	}
 
 	async #peekApiKeyForProvider(

@@ -1179,6 +1179,29 @@ describe("ModelRegistry", () => {
 				restoreKey();
 			}
 		});
+		test("resolves a rotated custom apiKeyEnv on the next credential request", async () => {
+			const keyEnv = `GJC_TEST_ROTATING_PROVIDER_KEY_${Snowflake.next()}`;
+			const restoreKey = setEnvForTest(keyEnv, "initial-env-key");
+			try {
+				writeRawModelsJson({
+					"rotating-provider": {
+						baseUrl: "https://rotating-provider.example/v1",
+						api: "openai-responses",
+						apiKeyEnv: keyEnv,
+						models: [{ id: "rotating-model" }],
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await expect(registry.getApiKeyForProvider("rotating-provider")).resolves.toBe("initial-env-key");
+				Bun.env[keyEnv] = "rotated-env-key";
+				await expect(registry.getApiKeyForProvider("rotating-provider")).resolves.toBe("rotated-env-key");
+				delete Bun.env[keyEnv];
+				await expect(registry.getApiKeyForProvider("rotating-provider")).resolves.toBeUndefined();
+			} finally {
+				restoreKey();
+			}
+		});
 		test("refresh reloads custom apiKey environment-name values without a models file change", async () => {
 			const keyEnv = `GJC_TEST_REFRESH_PROVIDER_API_KEY_${Snowflake.next()}`;
 			const restoreKey = setEnvForTest(keyEnv, "initial-env-key");

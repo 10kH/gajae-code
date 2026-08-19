@@ -137,6 +137,30 @@ export function $credentialEnv(name: string): string | undefined {
 }
 
 /**
+ * Resolve a credential that may rotate in the trusted agent `.env` while this
+ * process remains alive.
+ *
+ * Presence in the agent file establishes that file as the credential's
+ * authority, even when the launching shell inherited an older value. This is
+ * what lets an atomic token rotation repair a long-lived shell instead of
+ * falling back to its revoked snapshot. Removal is authoritative too, so a
+ * deleted token cannot silently reappear from that snapshot. Project `.env`
+ * files are never consulted; shell values retain their normal precedence for
+ * names the agent file does not own.
+ */
+export function $rotatingCredentialEnv(name: string): string | undefined {
+	const initialAgentValue = resolveFileEnvValue(agentEnv, name);
+	const liveAgentValue = resolveFileEnvValue(parseEnvFile(path.join(getAgentDir(), ".env")), name);
+	if (initialAgentValue === undefined && liveAgentValue === undefined) return $credentialEnv(name);
+	return (
+		liveAgentValue ??
+		resolveFileEnvValue(piEnv, name) ??
+		resolveFileEnvValue(homeEnv, name) ??
+		resolveFileEnvValue(homeShellEnv, name)
+	);
+}
+
+/**
  * Resolve the first credential env value from the given keys, excluding cwd/.env overlays.
  */
 export function $pickCredentialEnv(...keys: string[]): string | undefined {
