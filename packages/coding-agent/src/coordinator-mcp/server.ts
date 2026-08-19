@@ -3469,6 +3469,29 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return result;
 	}
 
+	async function withRemoteSessionCompensation<T>(
+		cwd: string,
+		remoteSession: { value: string | null },
+		operation: () => Promise<T>,
+	): Promise<T> {
+		try {
+			return await operation();
+		} catch (error) {
+			const sessionId = remoteSession.value;
+			if (!sessionId) throw error;
+			try {
+				await brokerSession(cwd, "session.close", { sessionId }, `${sessionId}:compensate-create`);
+			} catch (closeError) {
+				throw new SdkClientError(
+					UNOBSERVED_COMPENSATION_CODE,
+					`Coordinator creation failed after remote session ${sessionId} was created, and compensation failed.`,
+					{ primary: error, compensation: closeError, session_id: sessionId },
+				);
+			}
+			throw error;
+		}
+	}
+
 	function brokerResult(value: unknown): Record<string, unknown> {
 		const response = asRecord(value);
 		if (response?.ok === false) {
@@ -4779,215 +4802,225 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					idempotencyKey,
 					canonicalArgs,
 					async () => {
-						const delegate = async () => {
-							let sessionId: string;
-							let session: Record<string, unknown>;
-							let reusedSession = false;
-							let creationKey: string | null = null;
-							if (reusedSessionId) {
-								sessionId = reusedSessionId;
-								const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
-								if (!existing)
-									return {
-										ok: false,
-										error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
-									};
-								const sessionMpreset = optionalString(existing.mpreset);
-								if (mpresetResolution.mpreset !== null && sessionMpreset !== mpresetResolution.mpreset) {
-									return {
-										ok: false,
-										reason: "mpreset_conflict",
-										session_id: sessionId,
-										session_mpreset: sessionMpreset,
-										requested_mpreset: mpresetResolution.mpreset,
-									};
-								}
-								const existingCwd = optionalString(existing.cwd);
-								if (
-									!existingCwd ||
-									!sameCanonicalPath(await canonicalBrokerWorkspace(existingCwd), canonicalCwd, platform)
-								)
-									return {
-										ok: false,
-										error: {
-											code: "workspace_mismatch",
-											message: "Coordinator session is bound to another workspace.",
-										},
-									};
-								const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
-								if (
-									!sameCanonicalPath(
-										optionalString(existing.broker_workspace) ?? "",
-										canonicalCwd,
-										platform,
-									) ||
-									existing.endpoint_generation !== binding.endpointGeneration ||
-									optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
-								)
-									return {
-										ok: false,
-										error: {
-											code: "endpoint_stale",
-											message: "Coordinator session endpoint incarnation binding is stale.",
-										},
-									};
-								session = normalizeSession({
-									...existing,
-									session_id: sessionId,
-									cwd: canonicalCwd,
-									broker_workspace: binding.workspace,
-									endpoint_generation: binding.endpointGeneration,
-									endpoint_incarnation: binding.endpointIncarnation,
-								});
-								reusedSession = true;
-							} else {
-								const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
-								if (creation.request.phase === "completed" && creation.request.safe_response)
-									return creation.request.safe_response;
-								creationKey = creation.keyDigest;
-								if (creation.request.canonical_create_intent) {
-									session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
-									await bindCreationRequest(
-										questionPaths,
-										creation.keyDigest,
-										creation.request.canonical_create_intent,
-									);
-									await commitCreationWal(
-										questionPaths,
-										creation.keyDigest,
-										creation.request.canonical_create_intent,
-									);
-									sessionId = creation.request.canonical_create_intent.session.session_id;
-								} else {
-									const created = brokerResult(
-										await brokerSession(
-											canonicalCwd,
-											"session.create",
-											{
-												cwd: canonicalCwd,
-												target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
-												...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-												// Thread the coordinator state dir so the broker-spawned runtime
-												// writes terminal state to the coordinator-shared file (#2549).
-												coordinatorStateDir: namespaceDir,
+						const remoteSession = { value: null as string | null };
+						const delegate = async () =>
+							withRemoteSessionCompensation(canonicalCwd, remoteSession, async () => {
+								let sessionId: string;
+								let session: Record<string, unknown>;
+								let reusedSession = false;
+								let creationKey: string | null = null;
+								if (reusedSessionId) {
+									sessionId = reusedSessionId;
+									const existing = asRecord(await readJsonFile(sessionFile(sessionId)));
+									if (!existing)
+										return {
+											ok: false,
+											error: { code: "not_found", message: `Coordinator session not found: ${sessionId}` },
+										};
+									const sessionMpreset = optionalString(existing.mpreset);
+									if (mpresetResolution.mpreset !== null && sessionMpreset !== mpresetResolution.mpreset) {
+										return {
+											ok: false,
+											reason: "mpreset_conflict",
+											session_id: sessionId,
+											session_mpreset: sessionMpreset,
+											requested_mpreset: mpresetResolution.mpreset,
+										};
+									}
+									const existingCwd = optionalString(existing.cwd);
+									if (
+										!existingCwd ||
+										!sameCanonicalPath(await canonicalBrokerWorkspace(existingCwd), canonicalCwd, platform)
+									)
+										return {
+											ok: false,
+											error: {
+												code: "workspace_mismatch",
+												message: "Coordinator session is bound to another workspace.",
 											},
-											idempotencyKey,
-										),
-									);
-									sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
-									const createdCwd = await canonicalBrokerWorkspace(
-										optionalString(created.cwd) ?? canonicalCwd,
-									);
-									const binding = await exactBrokerSessionBinding(sessionId, createdCwd);
+										};
+									const binding = await exactBrokerSessionBinding(sessionId, canonicalCwd);
+									if (
+										!sameCanonicalPath(
+											optionalString(existing.broker_workspace) ?? "",
+											canonicalCwd,
+											platform,
+										) ||
+										existing.endpoint_generation !== binding.endpointGeneration ||
+										optionalString(existing.endpoint_incarnation) !== binding.endpointIncarnation
+									)
+										return {
+											ok: false,
+											error: {
+												code: "endpoint_stale",
+												message: "Coordinator session endpoint incarnation binding is stale.",
+											},
+										};
 									session = normalizeSession({
+										...existing,
 										session_id: sessionId,
-										cwd: createdCwd,
-										ephemeral: true,
-										created_at: new Date().toISOString(),
-										...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+										cwd: canonicalCwd,
 										broker_workspace: binding.workspace,
 										endpoint_generation: binding.endpointGeneration,
 										endpoint_incarnation: binding.endpointIncarnation,
 									});
-									const intent: CanonicalCreateIntentV1 = {
-										kind: "delegate",
-										workflow: delegateWorkflow,
-										session: canonicalCreationSnapshot(session),
-										remote_create_key: creation.request.remote_create_key,
-										initial_state: "running",
-										initial_prompt: {
-											text: taggedPrompt,
-											caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
-										},
-										initial_events: [],
-									};
-									await bindCreationRequest(questionPaths, creation.keyDigest, intent);
-									await commitCreationWal(questionPaths, creation.keyDigest, intent);
+									reusedSession = true;
+								} else {
+									const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+									if (creation.request.phase === "completed" && creation.request.safe_response)
+										return creation.request.safe_response;
+									creationKey = creation.keyDigest;
+									if (creation.request.canonical_create_intent) {
+										session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+										await bindCreationRequest(
+											questionPaths,
+											creation.keyDigest,
+											creation.request.canonical_create_intent,
+										);
+										await commitCreationWal(
+											questionPaths,
+											creation.keyDigest,
+											creation.request.canonical_create_intent,
+										);
+										sessionId = creation.request.canonical_create_intent.session.session_id;
+									} else {
+										const created = brokerResult(
+											await brokerSession(
+												canonicalCwd,
+												"session.create",
+												{
+													cwd: canonicalCwd,
+													target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
+													...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+													// Thread the coordinator state dir so the broker-spawned runtime
+													// writes terminal state to the coordinator-shared file (#2549).
+													coordinatorStateDir: namespaceDir,
+												},
+												idempotencyKey,
+											),
+										);
+										sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
+										remoteSession.value = sessionId;
+										const createdCwd = await canonicalBrokerWorkspace(
+											optionalString(created.cwd) ?? canonicalCwd,
+										);
+										const binding = await exactBrokerSessionBinding(sessionId, createdCwd);
+										session = normalizeSession({
+											session_id: sessionId,
+											cwd: createdCwd,
+											ephemeral: true,
+											created_at: new Date().toISOString(),
+											...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+											broker_workspace: binding.workspace,
+											endpoint_generation: binding.endpointGeneration,
+											endpoint_incarnation: binding.endpointIncarnation,
+										});
+										const intent: CanonicalCreateIntentV1 = {
+											kind: "delegate",
+											workflow: delegateWorkflow,
+											session: canonicalCreationSnapshot(session),
+											remote_create_key: creation.request.remote_create_key,
+											initial_state: "running",
+											initial_prompt: {
+												text: taggedPrompt,
+												caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
+											},
+											initial_events: [],
+										};
+										await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+										await commitCreationWal(questionPaths, creation.keyDigest, intent);
+									}
 								}
-							}
-							await writeJsonFile(sessionFile(sessionId), session);
-							const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);
-							if (previousActiveTurn && args.queue !== true && args.force !== true) {
-								return {
-									ok: false,
-									error: {
-										code: "active_turn_exists",
-										message: `Session ${sessionId} already has active turn ${previousActiveTurn.turn_id}.`,
+								await writeJsonFile(sessionFile(sessionId), session);
+								const previousActiveTurn = await readActiveTurn(namespaceDir, sessionId);
+								if (previousActiveTurn && args.queue !== true && args.force !== true) {
+									return {
+										ok: false,
+										error: {
+											code: "active_turn_exists",
+											message: `Session ${sessionId} already has active turn ${previousActiveTurn.turn_id}.`,
+										},
+										turn_id: previousActiveTurn.turn_id,
+									};
+								}
+								const operation =
+									args.force === true
+										? "turn.abort_and_prompt"
+										: args.queue === true
+											? "turn.follow_up"
+											: "turn.prompt";
+								const promptKey = await claimCanonicalPrompt(
+									sessionId,
+									taggedPrompt,
+									operation,
+									idempotencyKey,
+								);
+								const result = await controlSession(session, operation, { text: taggedPrompt }, idempotencyKey);
+								const acknowledgement = requirePromptAcknowledgement(result);
+								const turn = await recordAcceptedPrompt(
+									sessionId,
+									taggedPrompt,
+									operation,
+									previousActiveTurn,
+									acknowledgement,
+									promptKey,
+								);
+								const codexHandoff = await autoBindDelegateCodexHandoff(
+									namespaceDir,
+									canonicalCwd,
+									sessionId,
+									turn.turn_id,
+									delegateWorkflow,
+									explicitHostWorkUnit,
+								);
+								await appendCoordinatorEvent(namespaceDir, {
+									kind: "delegation.started",
+									sessionId,
+									turnId: turn.turn_id,
+									summary: `Delegated ${delegateWorkflow} via ${name} on session ${sessionId}`,
+									metadata: {
+										workflow: delegateWorkflow,
+										tool_name: name,
+										reused_session: reusedSession,
+										sdk_operation: operation,
 									},
-									turn_id: previousActiveTurn.turn_id,
-								};
-							}
-							const operation =
-								args.force === true
-									? "turn.abort_and_prompt"
-									: args.queue === true
-										? "turn.follow_up"
-										: "turn.prompt";
-							const promptKey = await claimCanonicalPrompt(sessionId, taggedPrompt, operation, idempotencyKey);
-							const result = await controlSession(session, operation, { text: taggedPrompt }, idempotencyKey);
-							const acknowledgement = requirePromptAcknowledgement(result);
-							const turn = await recordAcceptedPrompt(
-								sessionId,
-								taggedPrompt,
-								operation,
-								previousActiveTurn,
-								acknowledgement,
-								promptKey,
-							);
-							const codexHandoff = await autoBindDelegateCodexHandoff(
-								namespaceDir,
-								canonicalCwd,
-								sessionId,
-								turn.turn_id,
-								delegateWorkflow,
-								explicitHostWorkUnit,
-							);
-							await appendCoordinatorEvent(namespaceDir, {
-								kind: "delegation.started",
-								sessionId,
-								turnId: turn.turn_id,
-								summary: `Delegated ${delegateWorkflow} via ${name} on session ${sessionId}`,
-								metadata: {
+								});
+								const response = {
+									ok: true,
 									workflow: delegateWorkflow,
 									tool_name: name,
-									reused_session: reusedSession,
-									sdk_operation: operation,
-								},
+									session_id: sessionId,
+									turn_id: turn.turn_id,
+									active_turn_id: turn.delivery.queued ? (previousActiveTurn?.turn_id ?? null) : turn.turn_id,
+									status: turn.status,
+									queued: turn.delivery.queued,
+									delivered: turn.delivery.delivered,
+									delivery: turn.delivery,
+									session: publicCoordinatorSession(session),
+									session_state: publicCoordinatorSessionState(
+										await readSessionState(namespaceDir, sessionId),
+									),
+									turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+									result: publicSdkAcknowledgement(acknowledgement),
+									codex_handoff: codexHandoff,
+									...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
+								};
+								if (creationKey) {
+									await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
+									await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
+								}
+								return args.await_completion === true
+									? {
+											...response,
+											completion: await awaitTurnPayload(
+												turn.turn_id,
+												sessionId,
+												args.timeout_ms,
+												args.poll_interval_ms,
+											),
+										}
+									: response;
 							});
-							const response = {
-								ok: true,
-								workflow: delegateWorkflow,
-								tool_name: name,
-								session_id: sessionId,
-								turn_id: turn.turn_id,
-								active_turn_id: turn.delivery.queued ? (previousActiveTurn?.turn_id ?? null) : turn.turn_id,
-								status: turn.status,
-								queued: turn.delivery.queued,
-								delivered: turn.delivery.delivered,
-								delivery: turn.delivery,
-								session: publicCoordinatorSession(session),
-								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
-								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-								result: publicSdkAcknowledgement(acknowledgement),
-								codex_handoff: codexHandoff,
-								...(hasTask && hasPrompt ? { prompt_alias_ignored: true } : {}),
-							};
-							if (creationKey) {
-								await advanceCreationReceipt(questionPaths, creationKey, "projected", response);
-								await advanceCreationReceipt(questionPaths, creationKey, "completed", response);
-							}
-							return args.await_completion === true
-								? {
-										...response,
-										completion: await awaitTurnPayload(
-											turn.turn_id,
-											sessionId,
-											args.timeout_ms,
-											args.poll_interval_ms,
-										),
-									}
-								: response;
-						};
 						return reusedSessionId ? await withSessionTransition(reusedSessionId, delegate) : await delegate();
 					},
 					true,
@@ -5071,148 +5104,158 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					idempotencyKey,
 					canonicalArgs,
 					async () => {
-						const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
-						if (creation.request.phase === "completed" && creation.request.safe_response)
-							return creation.request.safe_response;
-						let created: Record<string, unknown>;
-						let session: Record<string, unknown>;
-						let sessionId: string;
-						if (creation.request.canonical_create_intent) {
-							session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
-							sessionId = creation.request.canonical_create_intent.session.session_id;
-							created = { session_id: sessionId };
-						} else {
-							created = brokerResult(
-								await brokerSession(
-									cwd,
-									"session.create",
-									{
+						const remoteSession = { value: null as string | null };
+						return await withRemoteSessionCompensation(cwd, remoteSession, async () => {
+							const creation = await claimProductionCreation(name, idempotencyKey, canonicalArgs);
+							if (creation.request.phase === "completed" && creation.request.safe_response)
+								return creation.request.safe_response;
+							let created: Record<string, unknown>;
+							let session: Record<string, unknown>;
+							let sessionId: string;
+							if (creation.request.canonical_create_intent) {
+								session = sessionFromCreationSnapshot(creation.request.canonical_create_intent.session);
+								sessionId = creation.request.canonical_create_intent.session.session_id;
+								created = { session_id: sessionId };
+							} else {
+								created = brokerResult(
+									await brokerSession(
 										cwd,
-										target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
-										...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
-										...(preparesExistingThread ? { readiness: "deferred" } : {}),
-										// Thread the coordinator state dir so the broker-spawned runtime
-										// writes terminal state to the coordinator-shared file (#2549).
-										coordinatorStateDir: namespaceDir,
-									},
-									idempotencyKey,
-								),
-							);
-							/**
-							 * Preparation is only real when the broker proves it. A create that
-							 * silently published readiness would leave a live session whose root
-							 * is already claimed, so the session is closed rather than reported
-							 * as prepared.
-							 */
-							if (preparesExistingThread && created.readiness !== "prepared") {
-								const unpreparedId = optionalString(created.sessionId ?? created.session_id);
-								let compensated = true;
-								if (unpreparedId) {
-									compensated = await brokerSession(
-										cwd,
-										"session.close",
-										{ sessionId: unpreparedId },
-										`${idempotencyKey}:unprepared-close`,
-									).then(
-										() => true,
-										() => false,
+										"session.create",
+										{
+											cwd,
+											target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
+											...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+											...(preparesExistingThread ? { readiness: "deferred" } : {}),
+											// Thread the coordinator state dir so the broker-spawned runtime
+											// writes terminal state to the coordinator-shared file (#2549).
+											coordinatorStateDir: namespaceDir,
+										},
+										idempotencyKey,
+									),
+								);
+								/**
+								 * Preparation is only real when the broker proves it. A create that
+								 * silently published readiness would leave a live session whose root
+								 * is already claimed, so the session is closed rather than reported
+								 * as prepared.
+								 */
+								if (preparesExistingThread && created.readiness !== "prepared") {
+									const unpreparedId = optionalString(created.sessionId ?? created.session_id);
+									let compensated = true;
+									if (unpreparedId) {
+										compensated = await brokerSession(
+											cwd,
+											"session.close",
+											{ sessionId: unpreparedId },
+											`${idempotencyKey}:unprepared-close`,
+										).then(
+											() => true,
+											() => false,
+										);
+									}
+									// A swallowed compensation leaves a live, untracked session while
+									// idempotency seals the failure, so exact retries only replay the
+									// cached error and never reach the session again. Name the session
+									// and mark the outcome unobserved so the key is not sealed.
+									if (!compensated)
+										throw new SdkClientError(
+											UNOBSERVED_COMPENSATION_CODE,
+											`SDK broker did not prepare the requested session, and closing the unprepared session ${unpreparedId} failed; it may still be running.`,
+										);
+									remoteSession.value = null;
+									throw new SdkClientError(
+										"broker_request_unavailable",
+										"SDK broker did not prepare the requested session.",
 									);
 								}
-								// A swallowed compensation leaves a live, untracked session while
-								// idempotency seals the failure, so exact retries only replay the
-								// cached error and never reach the session again. Name the session
-								// and mark the outcome unobserved so the key is not sealed.
-								if (!compensated)
-									throw new SdkClientError(
-										UNOBSERVED_COMPENSATION_CODE,
-										`SDK broker did not prepare the requested session, and closing the unprepared session ${unpreparedId} failed; it may still be running.`,
-									);
-								throw new SdkClientError(
-									"broker_request_unavailable",
-									"SDK broker did not prepare the requested session.",
-								);
+								sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
+								remoteSession.value = sessionId;
+								const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
+								const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
+								session = normalizeSession({
+									session_id: sessionId,
+									cwd: sessionCwd,
+									...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+									broker_workspace: binding.workspace,
+									endpoint_generation: binding.endpointGeneration,
+									endpoint_incarnation: binding.endpointIncarnation,
+								});
 							}
-							sessionId = safeExternalId("session", created.sessionId ?? created.session_id);
-							const sessionCwd = await canonicalBrokerWorkspace(optionalString(created.cwd) ?? cwd);
-							const binding = await exactBrokerSessionBinding(sessionId, sessionCwd);
-							session = normalizeSession({
-								session_id: sessionId,
-								cwd: sessionCwd,
-								...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
-								broker_workspace: binding.workspace,
-								endpoint_generation: binding.endpointGeneration,
-								endpoint_incarnation: binding.endpointIncarnation,
-							});
-						}
-						const intent: CanonicalCreateIntentV1 = {
-							kind: "start",
-							session: canonicalCreationSnapshot(session),
-							remote_create_key: creation.request.remote_create_key,
-							initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
-							initial_prompt: prompt
-								? { text: prompt, caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex") }
-								: null,
-							initial_events: [],
-						};
-						await bindCreationRequest(questionPaths, creation.keyDigest, intent);
-						await commitCreationWal(questionPaths, creation.keyDigest, intent);
-						await writeJsonFile(sessionFile(sessionId), session);
-						const lifecycle = publicLifecycleReceipt(created, sessionId);
-						if (prompt) {
-							const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
-							const result = await controlSession(session, "turn.prompt", { text: prompt }, idempotencyKey);
-							const acknowledgement = requirePromptAcknowledgement(result);
-							const turn = await recordAcceptedPrompt(
+							const intent: CanonicalCreateIntentV1 = {
+								kind: "start",
+								session: canonicalCreationSnapshot(session),
+								remote_create_key: creation.request.remote_create_key,
+								initial_state: prompt ? "running" : preparesExistingThread ? "prepared" : "ready_for_input",
+								initial_prompt: prompt
+									? {
+											text: prompt,
+											caller_key_digest: createHash("sha256").update(idempotencyKey).digest("hex"),
+										}
+									: null,
+								initial_events: [],
+							};
+							await bindCreationRequest(questionPaths, creation.keyDigest, intent);
+							await commitCreationWal(questionPaths, creation.keyDigest, intent);
+							await writeJsonFile(sessionFile(sessionId), session);
+							const lifecycle = publicLifecycleReceipt(created, sessionId);
+							if (prompt) {
+								const promptKey = await claimCanonicalPrompt(sessionId, prompt, "turn.prompt", idempotencyKey);
+								const result = await controlSession(session, "turn.prompt", { text: prompt }, idempotencyKey);
+								const acknowledgement = requirePromptAcknowledgement(result);
+								const turn = await recordAcceptedPrompt(
+									sessionId,
+									prompt,
+									"turn.prompt",
+									null,
+									acknowledgement,
+									promptKey,
+								);
+								const response = {
+									ok: true,
+									session: publicCoordinatorSession(session),
+									session_id: sessionId,
+									lifecycle,
+									turn_id: turn.turn_id,
+									active_turn_id: turn.turn_id,
+									status: turn.status,
+									queued: turn.delivery.queued,
+									delivered: turn.delivery.delivered,
+									operation: "turn.prompt",
+									turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
+									result: publicSdkAcknowledgement(acknowledgement),
+									session_state: publicCoordinatorSessionState(
+										await readSessionState(namespaceDir, sessionId),
+									),
+								};
+								await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
+								await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
+								return response;
+							}
+							const sessionState = await writeSessionState(
+								namespaceDir,
 								sessionId,
-								prompt,
-								"turn.prompt",
-								null,
-								acknowledgement,
-								promptKey,
+								preparesExistingThread ? "prepared" : "ready_for_input",
+								{ live: null, reason: null },
 							);
+							await appendCoordinatorEvent(namespaceDir, {
+								kind: "session.started",
+								sessionId,
+								summary: preparesExistingThread
+									? `Session ${sessionId} prepared through SDK lifecycle control`
+									: `Session ${sessionId} started through SDK lifecycle control`,
+								payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
+							});
 							const response = {
 								ok: true,
 								session: publicCoordinatorSession(session),
-								session_id: sessionId,
+								session_state: publicCoordinatorSessionState(sessionState),
 								lifecycle,
-								turn_id: turn.turn_id,
-								active_turn_id: turn.turn_id,
-								status: turn.status,
-								queued: turn.delivery.queued,
-								delivered: turn.delivery.delivered,
-								operation: "turn.prompt",
-								turn: boundedPublicValue(turn, { remaining: COORDINATOR_IDEMPOTENCY_RESPONSE_BYTE_CAP }),
-								result: publicSdkAcknowledgement(acknowledgement),
-								session_state: publicCoordinatorSessionState(await readSessionState(namespaceDir, sessionId)),
+								...(preparesExistingThread ? { session_id: sessionId, state: "prepared" as const } : {}),
 							};
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
 							await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
 							return response;
-						}
-						const sessionState = await writeSessionState(
-							namespaceDir,
-							sessionId,
-							preparesExistingThread ? "prepared" : "ready_for_input",
-							{ live: null, reason: null },
-						);
-						await appendCoordinatorEvent(namespaceDir, {
-							kind: "session.started",
-							sessionId,
-							summary: preparesExistingThread
-								? `Session ${sessionId} prepared through SDK lifecycle control`
-								: `Session ${sessionId} started through SDK lifecycle control`,
-							payloadRef: path.relative(namespaceDir, sessionFile(sessionId)),
 						});
-						const response = {
-							ok: true,
-							session: publicCoordinatorSession(session),
-							session_state: publicCoordinatorSessionState(sessionState),
-							lifecycle,
-							...(preparesExistingThread ? { session_id: sessionId, state: "prepared" as const } : {}),
-						};
-						await advanceCreationReceipt(questionPaths, creation.keyDigest, "projected", response);
-						await advanceCreationReceipt(questionPaths, creation.keyDigest, "completed", response);
-						return response;
 					},
 					true,
 					response => isUnobservedCompensation(response) || isRouterRequestAmbiguous(response),

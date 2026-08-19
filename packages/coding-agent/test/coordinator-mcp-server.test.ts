@@ -922,6 +922,31 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.map(control => control.operation)).toEqual(["session.create", "session.list"]);
 	});
 
+	it("compensates a remote session when local binding fails after creation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, [], undefined, undefined, {
+			globalResult: operation => {
+				if (operation === "session.create")
+					return { ok: true, result: { sessionId: "unbound-session", cwd: root } };
+				if (operation === "session.list") return { ok: true, result: { sessions: [] } };
+				return undefined;
+			},
+		});
+
+		const result = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			idempotency_key: "compensate-unbound-session",
+			allow_mutation: true,
+		});
+
+		expect(result).toMatchObject({ ok: false });
+		expect(controls.filter(control => control.operation === "session.create")).toHaveLength(1);
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({ input: { sessionId: "unbound-session" } }),
+		]);
+	});
+
 	it("preserves multiline delegated task text in one SDK turn.prompt control", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
