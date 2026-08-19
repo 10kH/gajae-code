@@ -343,6 +343,44 @@ describe("relayCrashSignatures", () => {
 		expect(bodies).toHaveLength(0);
 	});
 
+	test("a backdated append after legacy upgrade remains due", async () => {
+		await seed();
+		const compacted = await compactCrashIndex({ paths });
+		const entry = compacted.signatures[FINGERPRINT];
+		expect(entry).toBeDefined();
+		if (!entry) return;
+		const { lastAppendRecordId: _append, relayedRecordId: _relayed, ...legacy } = entry;
+		await Bun.write(
+			paths.index,
+			`${JSON.stringify({
+				...compacted,
+				signatures: { [FINGERPRINT]: { ...legacy, relayedAt: entry.lastSeen } },
+			})}\n`,
+		);
+		const recordId = "fedcba9876543210";
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: FINGERPRINT,
+				fpv: 1,
+				recordId,
+				at: 1_700_000_899_000,
+				errorName: "TypeError",
+				messageClass: "cannot read properties of <redacted>",
+			},
+			paths.events,
+		);
+		await fs.appendFile(
+			paths.crashLog,
+			`2026-08-11T11:59:58.000Z pid=4242 [Uncaught Exception] TypeError: cannot read properties of <redacted>\n` +
+				`${STACK}\n${formatCrashRecordMarker(FINGERPRINT, 1, recordId)}\n\n`,
+		);
+		const bodies: string[] = [];
+		const outcome = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		expect(outcome).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(bodies).toHaveLength(1);
+	});
+
 	test("downgrade then re-upgrade does not retransmit when relayedAt still covers lastSeen", async () => {
 		await seed();
 		await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept([]) });
@@ -779,7 +817,13 @@ describe("relay trust boundary against a hostile checkout", () => {
 	async function runInCheckout(source: string, env: Record<string, string | undefined> = {}): Promise<string> {
 		const script = path.join(dir, "probe.ts");
 		await Bun.write(script, source);
-		const childEnv: Record<string, string | undefined> = { ...Bun.env, ...env };
+		const childEnv: Record<string, string | undefined> = {
+			PATH: Bun.env.PATH ?? "/usr/bin:/bin",
+			HOME: dir,
+			TMPDIR: path.join(dir, "tmp"),
+			NODE_ENV: env.NODE_ENV,
+			...env,
+		};
 		delete childEnv.GJC_CODING_AGENT_DIR;
 		delete childEnv.PI_CODING_AGENT_DIR;
 		delete childEnv.GJC_CONFIG_DIR;
@@ -980,8 +1024,8 @@ describe("relay trust boundary against a hostile checkout", () => {
 				expect(filePath.startsWith(hostileState)).toBe(false);
 			}
 		}
-		expect(result.crashIndexXdg.startsWith(xdgRoot)).toBe(true);
-		expect(result.xdgHandled.startsWith(xdgRoot)).toBe(true);
+		expect(result.crashIndexXdg.startsWith(xdgRoot)).toBe(false);
+		expect(result.xdgHandled.startsWith(xdgRoot)).toBe(false);
 		expect(out).not.toContain(forgedFatal);
 		expect(out).not.toContain(forgedHandled);
 	});

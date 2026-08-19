@@ -14,11 +14,14 @@ export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
 function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string> } {
 	const cwd = process.cwd();
 	const nodeEnv = process.env.NODE_ENV || Bun.env.NODE_ENV;
+	// Match Bun's dotenv precedence. Validate before interpolation so a hostile
+	// NODE_ENV cannot introduce separators or `..` path segments.
+	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
 	const files = [
 		".env",
-		".env.local",
-		...(nodeEnv ? [`.env.${nodeEnv}`] : []),
-		...(nodeEnv ? [`.env.${nodeEnv}.local`] : []),
+		...(validNodeEnv ? [`.env.${validNodeEnv}`] : []),
+		...(validNodeEnv !== "test" ? [".env.local"] : []),
+		...(validNodeEnv ? [`.env.${validNodeEnv}.local`] : []),
 	];
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
@@ -89,10 +92,12 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 // files for the credential-only snapshot.
 const projectSnapshot = loadProjectEnv();
 const projectEnv = projectSnapshot.values;
-const trustedEnvHome =
-	Object.hasOwn(projectEnv, "HOME") || Object.hasOwn(projectEnv, "USERPROFILE")
-		? path.parse(process.cwd()).root
-		: os.homedir();
+const declaredHome = projectEnv.HOME ?? projectEnv.USERPROFILE;
+const runtimeHome = process.env.HOME ?? process.env.USERPROFILE;
+const rejectProjectHome =
+	declaredHome !== undefined &&
+	(projectSnapshot.dynamic.has("HOME") || projectSnapshot.dynamic.has("USERPROFILE") || declaredHome === runtimeHome);
+const trustedEnvHome = rejectProjectHome ? path.parse(process.cwd()).root : os.homedir();
 
 // Eagerly parse the trusted user's env files and the project .env (from cwd)
 const homeShellEnv = {
@@ -102,7 +107,8 @@ const homeShellEnv = {
 	...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
 	...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
 };
-const homeEnv = parseEnvFile(path.join(trustedEnvHome, ".env"));
+const homeEnv =
+	path.resolve(trustedEnvHome) === path.resolve(process.cwd()) ? {} : parseEnvFile(path.join(trustedEnvHome, ".env"));
 const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
 const initialTrustedAgentEnv = readTrustedAgentEnv();

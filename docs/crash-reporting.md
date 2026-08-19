@@ -159,10 +159,11 @@ is treated as absent, so a hand-edited global config fails closed. The
 `GJC_CRASH_SENTRY_DSN` environment variable is only consulted once that trusted global
 opt-in is already on; it cannot enable the relay by itself.
 
-The automatic relay reads fatal and handled stores only from the provenance-checked
-agent directory (`getTrustedAgentFile`), never from the XDG-aware state resolver. A
-checkout `.env` that sets `XDG_STATE_HOME` and creates `$XDG_STATE_HOME/gjc` can still
-move ordinary crash-index paths, but those files are not uploaded.
+The automatic relay reads fatal and handled stores from the shared provenance-checked
+resolver. Trusted inherited XDG state (`XDG_STATE_HOME` and its data/cache peers) is
+used when its value is outside checkout dotenv provenance; when the checkout declares
+an XDG value, relay falls back to the trusted agent directory (`getTrustedAgentFile`)
+instead. Checkout-controlled XDG paths are never uploaded.
 
 The relay never runs on the fatal path. It runs at the next **interactive** startup during index
 compaction; other modes can explicitly invoke `gjc crash relay`, preserving the crashing
