@@ -118,34 +118,39 @@ export function parseShellEnvFile(filePath: string): Record<string, string> {
  * conservative.
  */
 export function parseEnvFile(filePath: string): Record<string, string> {
-	const result: Record<string, string> = {};
 	try {
-		const content = fs.readFileSync(filePath, "utf-8");
-		for (const line of content.split("\n")) {
-			const trimmed = line.trim();
-			// Skip comments and blank lines
-			if (!trimmed || trimmed.startsWith("#")) continue;
-
-			const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(trimmed);
-			if (!match) continue;
-
-			const key = match[1];
-			if (!isValidEnvName(key)) continue;
-
-			// Strip an unquoted trailing `# comment` the way Bun's dotenv loader
-			// does (`KEY=v#note` loads as `v`); quoted `#` survives.
-			let value = stripInlineDotenvComment(match[2] ?? "").trim();
-
-			// Remove surrounding quotes (" or ')
-			if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-				value = value.slice(1, -1);
-			}
-			if (!isSafeEnvValue(value)) continue;
-
-			result[key] = value;
-		}
+		return parseEnvFileContent(fs.readFileSync(filePath, "utf-8"));
 	} catch {
 		// File doesn't exist or can't be read - return empty result
+		return {};
+	}
+}
+
+/** Parse dotenv content that has already been read from a trusted file. */
+export function parseEnvFileContent(content: string): Record<string, string> {
+	const result: Record<string, string> = {};
+	for (const line of content.split("\n")) {
+		const trimmed = line.trim();
+		// Skip comments and blank lines
+		if (!trimmed || trimmed.startsWith("#")) continue;
+
+		const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(trimmed);
+		if (!match) continue;
+
+		const key = match[1];
+		if (!isValidEnvName(key)) continue;
+
+		// Strip an unquoted trailing `# comment` the way Bun's dotenv loader
+		// does (`KEY=v#note` loads as `v`); quoted `#` survives.
+		let value = stripInlineDotenvComment(match[2] ?? "").trim();
+
+		// Remove surrounding quotes (" or ')
+		if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+			value = value.slice(1, -1);
+		}
+		if (!isSafeEnvValue(value)) continue;
+
+		result[key] = value;
 	}
 
 	return result;

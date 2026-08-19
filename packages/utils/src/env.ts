@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, getConfigRootDir } from "./dirs";
@@ -5,7 +6,7 @@ import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
-import { parseEnvFile, parseShellEnvFile } from "./env-file";
+import { parseEnvFile, parseEnvFileContent, parseShellEnvFile } from "./env-file";
 
 // Re-exported so the public surface of this module is unchanged.
 export { isValidEnvName, parseEnvFile, parseShellEnvFile } from "./env-file";
@@ -16,6 +17,31 @@ function resolveFileEnvValue(file: Record<string, string>, name: string): string
 	if (value === undefined || !isSafeEnvValue(value)) return undefined;
 	const trimmed = value.trim();
 	return trimmed.length > 0 ? trimmed : undefined;
+}
+
+type TrustedAgentEnvRead =
+	| { status: "missing"; values: Record<string, string> }
+	| { status: "unavailable"; values: Record<string, string> }
+	| { status: "ok"; values: Record<string, string> };
+
+function readTrustedAgentEnv(): TrustedAgentEnvRead {
+	const filePath = path.join(getAgentDir(), ".env");
+	let fileDescriptor: number | undefined;
+	try {
+		const linkStats = fs.lstatSync(filePath);
+		if (!linkStats.isFile()) return { status: "unavailable", values: {} };
+		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+		fileDescriptor = fs.openSync(filePath, fs.constants.O_RDONLY | noFollow);
+		const fileStats = fs.fstatSync(fileDescriptor);
+		if (!fileStats.isFile()) return { status: "unavailable", values: {} };
+		const content = fs.readFileSync(fileDescriptor, "utf-8");
+		return { status: "ok", values: parseEnvFileContent(content) };
+	} catch (error) {
+		const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+		return code === "ENOENT" ? { status: "missing", values: {} } : { status: "unavailable", values: {} };
+	} finally {
+		if (fileDescriptor !== undefined) fs.closeSync(fileDescriptor);
+	}
 }
 
 function filterCredentialInheritedEnv(env: Record<string, string | undefined>): Record<string, string> {
@@ -48,8 +74,10 @@ const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
 const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
 const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
+const initialTrustedAgentEnv = readTrustedAgentEnv();
 
 const inheritedEnv = filterCredentialInheritedEnv(Bun.env);
+const rotatingAgentEnvNames = new Set(Object.keys(agentEnv));
 
 export function $inheritedEnv(name: string): string | undefined {
 	const snapshotValue = resolveFileEnvValue(inheritedEnv, name);
@@ -149,15 +177,13 @@ export function $credentialEnv(name: string): string | undefined {
  * names the agent file does not own.
  */
 export function $rotatingCredentialEnv(name: string): string | undefined {
-	const initialAgentValue = resolveFileEnvValue(agentEnv, name);
-	const liveAgentValue = resolveFileEnvValue(parseEnvFile(path.join(getAgentDir(), ".env")), name);
-	if (initialAgentValue === undefined && liveAgentValue === undefined) return $credentialEnv(name);
-	return (
-		liveAgentValue ??
-		resolveFileEnvValue(piEnv, name) ??
-		resolveFileEnvValue(homeEnv, name) ??
-		resolveFileEnvValue(homeShellEnv, name)
-	);
+	if (!isSafeEnvName(name)) return undefined;
+	const agentRead = readTrustedAgentEnv();
+	if (agentRead.status === "ok" && Object.hasOwn(agentRead.values, name)) rotatingAgentEnvNames.add(name);
+	if (initialTrustedAgentEnv.status === "unavailable" && !rotatingAgentEnvNames.has(name)) return undefined;
+	if (!rotatingAgentEnvNames.has(name)) return $credentialEnv(name);
+	if (agentRead.status !== "ok") return undefined;
+	return resolveFileEnvValue(agentRead.values, name);
 }
 
 /**
