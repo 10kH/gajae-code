@@ -273,6 +273,142 @@ if ($credentialEnv("LIVE_PROVIDER_KEY") !== undefined) {
 			dir,
 		);
 	});
+
+	it("reloads credentials whose inherited value came from the trusted agent env", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-rotating-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		const agentEnvPath = path.join(agentDir, ".env");
+		fs.writeFileSync(agentEnvPath, "ROTATING_PROVIDER_KEY=old-token\n");
+
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import * as fs from "node:fs";
+import { $rotatingCredentialEnv } from ${JSON.stringify(envSourceUrl)};
+
+if ($rotatingCredentialEnv("ROTATING_PROVIDER_KEY") !== "old-token") {
+	throw new Error("initial agent credential was not resolved");
+}
+fs.writeFileSync(${JSON.stringify(path.join(agentDir, ".env.next"))}, "ROTATING_PROVIDER_KEY=new-token\\n");
+fs.renameSync(${JSON.stringify(path.join(agentDir, ".env.next"))}, ${JSON.stringify(agentEnvPath)});
+if ($rotatingCredentialEnv("ROTATING_PROVIDER_KEY") !== "new-token") {
+	throw new Error("rotated agent credential was not reloaded");
+}
+const concurrentValues = await Promise.all(
+	Array.from({ length: 32 }, () => Promise.resolve($rotatingCredentialEnv("ROTATING_PROVIDER_KEY"))),
+);
+if (concurrentValues.some(value => value !== "new-token")) {
+	throw new Error("concurrent credential reads observed an inconsistent value");
+}
+fs.writeFileSync(${JSON.stringify(path.join(agentDir, ".env.next"))}, "");
+fs.renameSync(${JSON.stringify(path.join(agentDir, ".env.next"))}, ${JSON.stringify(agentEnvPath)});
+if ($rotatingCredentialEnv("ROTATING_PROVIDER_KEY") !== undefined) {
+	throw new Error("removed agent credential must not fall back to its stale inherited value");
+}
+`,
+			{
+				HOME: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+				ROTATING_PROVIDER_KEY: "old-token",
+			},
+			dir,
+		);
+	});
+
+	it("keeps shell precedence for names never owned by the agent env", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-shell-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(path.join(dir, ".env"), "PROJECT_ONLY_PROVIDER_KEY=project-token\n");
+
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $rotatingCredentialEnv } from ${JSON.stringify(envSourceUrl)};
+
+if ($rotatingCredentialEnv("SHELL_ONLY_PROVIDER_KEY") !== "shell-token") {
+	throw new Error("a name never owned by the agent env lost shell precedence");
+}
+if ($rotatingCredentialEnv("PROJECT_ONLY_PROVIDER_KEY") !== undefined) {
+	throw new Error("project dotenv must remain excluded from rotating credential resolution");
+}
+`,
+			{
+				HOME: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+				SHELL_ONLY_PROVIDER_KEY: "shell-token",
+			},
+			dir,
+		);
+	});
+
+	it("lets the trusted agent env replace a stale inherited credential", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-pinned-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		const agentEnvPath = path.join(agentDir, ".env");
+		fs.writeFileSync(agentEnvPath, "PINNED_PROVIDER_KEY=agent-token\n");
+
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import * as fs from "node:fs";
+import { $rotatingCredentialEnv } from ${JSON.stringify(envSourceUrl)};
+
+fs.writeFileSync(${JSON.stringify(agentEnvPath)}, "PINNED_PROVIDER_KEY=rotated-agent-token\\n");
+if ($rotatingCredentialEnv("PINNED_PROVIDER_KEY") !== "rotated-agent-token") {
+	throw new Error("the trusted agent credential did not replace the stale inherited value");
+}
+`,
+			{
+				HOME: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+				PINNED_PROVIDER_KEY: "explicit-shell-token",
+			},
+			dir,
+		);
+	});
+
+	it("fails closed for a symlinked or unreadable trusted agent env", () => {
+		if (process.platform === "win32") return;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-link-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		const agentEnvPath = path.join(agentDir, ".env");
+		const outsideEnvPath = path.join(dir, "outside.env");
+		fs.writeFileSync(agentEnvPath, "UNSAFE_PROVIDER_KEY=old-token\n");
+		fs.writeFileSync(outsideEnvPath, "UNSAFE_PROVIDER_KEY=outside-token\n");
+
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import * as fs from "node:fs";
+import { $rotatingCredentialEnv } from ${JSON.stringify(envSourceUrl)};
+
+fs.rmSync(${JSON.stringify(agentEnvPath)});
+fs.symlinkSync(${JSON.stringify(outsideEnvPath)}, ${JSON.stringify(agentEnvPath)});
+if ($rotatingCredentialEnv("UNSAFE_PROVIDER_KEY") !== undefined) {
+	throw new Error("a symlinked agent env must not provide credentials");
+}
+fs.rmSync(${JSON.stringify(agentEnvPath)});
+fs.mkdirSync(${JSON.stringify(agentEnvPath)});
+if ($rotatingCredentialEnv("UNSAFE_PROVIDER_KEY") !== undefined) {
+	throw new Error("an unreadable agent env shape must fail closed");
+}
+`,
+			{
+				HOME: home,
+				GJC_CODING_AGENT_DIR: agentDir,
+				UNSAFE_PROVIDER_KEY: "old-token",
+			},
+			dir,
+		);
+	});
 });
 
 describe("$pickCredentialEnv", () => {

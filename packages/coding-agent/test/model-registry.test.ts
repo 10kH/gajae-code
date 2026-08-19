@@ -1179,6 +1179,68 @@ describe("ModelRegistry", () => {
 				restoreKey();
 			}
 		});
+		test("resolves a rotated custom apiKeyEnv on the next credential request", async () => {
+			const keyEnv = `GJC_TEST_ROTATING_PROVIDER_KEY_${Snowflake.next()}`;
+			const restoreKey = setEnvForTest(keyEnv, "initial-env-key");
+			try {
+				writeRawModelsJson({
+					"rotating-provider": {
+						baseUrl: "https://rotating-provider.example/v1",
+						api: "openai-responses",
+						apiKeyEnv: keyEnv,
+						models: [{ id: "rotating-model" }],
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await expect(registry.getApiKeyForProvider("rotating-provider")).resolves.toBe("initial-env-key");
+				Bun.env[keyEnv] = "rotated-env-key";
+				await expect(registry.getApiKeyForProvider("rotating-provider")).resolves.toBe("rotated-env-key");
+				delete Bun.env[keyEnv];
+				await expect(registry.getApiKeyForProvider("rotating-provider")).resolves.toBeUndefined();
+			} finally {
+				restoreKey();
+			}
+		});
+		test("refreshes openaiCompat apiKeyEnv and preserves a literal apiKey", async () => {
+			const compatKeyEnv = `GJC_TEST_ROTATING_COMPAT_KEY_${Snowflake.next()}`;
+			const literalKeyEnv = `GJC_TEST_LITERAL_API_KEY_ENV_${Snowflake.next()}`;
+			const restoreCompatKey = setEnvForTest(compatKeyEnv, "compat-initial-key");
+			const restoreLiteralKey = setEnvForTest(literalKeyEnv, "env-shadow-key");
+			try {
+				writeRawModelsJson({
+					"compat-rotating-provider": {
+						baseUrl: "https://compat-rotating-provider.example/v1",
+						api: "openai-responses",
+						openaiCompat: {
+							baseUrl: "https://compat-rotating-provider.example/v1",
+							apiKeyEnv: compatKeyEnv,
+						},
+					},
+					"literal-provider": {
+						baseUrl: "https://literal-provider.example/v1",
+						api: "openai-responses",
+						apiKey: "literal-config-key",
+						apiKeyEnv: literalKeyEnv,
+						models: [{ id: "literal-model" }],
+					},
+				});
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+				await expect(registry.getApiKeyForProvider("compat-rotating-provider")).resolves.toBe("compat-initial-key");
+				Bun.env[compatKeyEnv] = "compat-rotated-key";
+				await expect(registry.getApiKeyForProvider("compat-rotating-provider")).resolves.toBe("compat-rotated-key");
+				delete Bun.env[compatKeyEnv];
+				await expect(registry.getApiKeyForProvider("compat-rotating-provider")).resolves.toBeUndefined();
+
+				await expect(registry.getApiKeyForProvider("literal-provider")).resolves.toBe("literal-config-key");
+				delete Bun.env[literalKeyEnv];
+				await expect(registry.getApiKeyForProvider("literal-provider")).resolves.toBe("literal-config-key");
+			} finally {
+				restoreCompatKey();
+				restoreLiteralKey();
+			}
+		});
 		test("refresh reloads custom apiKey environment-name values without a models file change", async () => {
 			const keyEnv = `GJC_TEST_REFRESH_PROVIDER_API_KEY_${Snowflake.next()}`;
 			const restoreKey = setEnvForTest(keyEnv, "initial-env-key");
