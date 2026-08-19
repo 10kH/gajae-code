@@ -1728,6 +1728,7 @@ async function appendCoordinatorEvent(namespaceDir: string, input: CoordinatorEv
 		await ensureCoordinatorDirectory(eventsDir(namespaceDir));
 		const event = await withFileLock(eventJournalLockFile(namespaceDir), async () => {
 			const latestSeq = await readLatestEventSeq(namespaceDir);
+			if (!Number.isSafeInteger(latestSeq) || latestSeq >= Number.MAX_SAFE_INTEGER) throw new Error("state_corrupt");
 			const seq = latestSeq + 1;
 			const timestamp = new Date().toISOString();
 			const event: CoordinatorEvent = {

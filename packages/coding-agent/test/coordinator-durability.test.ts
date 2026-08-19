@@ -178,11 +178,15 @@ describe("Coordinator durability", () => {
 		try {
 			const file = path.join(root, "event-journal.jsonl");
 			const calls: string[] = [];
+			let failSync = true;
 			await expect(
 				appendCoordinatorFile(file, "event\n", {
 					syncFile: async () => {
 						calls.push("file-sync");
-						throw errno("EIO");
+						if (failSync) {
+							failSync = false;
+							throw errno("EIO");
+						}
 					},
 					openDirectory: async () => {
 						calls.push("directory-open");
@@ -190,7 +194,7 @@ describe("Coordinator durability", () => {
 					},
 				}),
 			).rejects.toMatchObject({ code: "EIO" });
-			expect(calls).toEqual(["file-sync"]);
+			expect(calls).toEqual(["file-sync", "file-sync"]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -214,6 +218,35 @@ describe("Coordinator durability", () => {
 		});
 		try {
 			await expect(appendCoordinatorFile(file, "event\n")).rejects.toBeInstanceOf(AggregateError);
+		} finally {
+			open.mockRestore();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rolls back a partial append before surfacing the write failure", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-durability-"));
+		const file = path.join(root, "event-journal.jsonl");
+		await fs.writeFile(file, "prior\n");
+		const realOpen = fs.open;
+		const open = spyOn(fs, "open").mockImplementation(async (...args) => {
+			if (args[0] === file)
+				return {
+					async writeFile(): Promise<void> {
+						await fs.appendFile(file, "partial");
+						throw errno("EIO");
+					},
+					async truncate(length: number): Promise<void> {
+						await fs.truncate(file, length);
+					},
+					async sync(): Promise<void> {},
+					async close(): Promise<void> {},
+				} as unknown as fs.FileHandle;
+			return await realOpen(...args);
+		});
+		try {
+			await expect(appendCoordinatorFile(file, "next\n")).rejects.toMatchObject({ code: "EIO" });
+			expect(await fs.readFile(file, "utf8")).toBe("prior\n");
 		} finally {
 			open.mockRestore();
 			await fs.rm(root, { recursive: true, force: true });

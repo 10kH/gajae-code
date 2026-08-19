@@ -108,6 +108,12 @@ export async function appendCoordinatorFile(
 	options: CoordinatorDirectoryBarrierOptions & CoordinatorFileDurabilityOptions = {},
 ): Promise<void> {
 	await ensureCoordinatorDirectory(path.dirname(file), options);
+	let originalSize = 0;
+	try {
+		originalSize = (await fs.stat(file)).size;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
 	const handle = await fs.open(file, "a", 0o600);
 	let writeError: unknown;
 	try {
@@ -115,6 +121,14 @@ export async function appendCoordinatorFile(
 		await syncCoordinatorFile(handle, options);
 	} catch (error) {
 		writeError = error;
+	}
+	if (writeError) {
+		try {
+			await handle.truncate(originalSize);
+			await syncCoordinatorFile(handle, options);
+		} catch (rollbackError) {
+			writeError = new AggregateError([writeError, rollbackError], "coordinator append rollback failed");
+		}
 	}
 	try {
 		await handle.close();
