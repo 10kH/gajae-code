@@ -144,6 +144,43 @@ test("the watchdog observes retained publication asynchronously", async () => {
 	}
 });
 
+test("a stale watchdog observation cannot reopen startup admission after lost-root", async () => {
+	const originalRetain = native.retainBrokerPublication;
+	const observation = Promise.withResolvers<{ kind: "owned" }>();
+	let observed = false;
+	const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(agentDir => {
+		const publication = originalRetain(agentDir);
+		return {
+			observe: publication.observe.bind(publication),
+			observeAsync: () => {
+				observed = true;
+				return observation.promise;
+			},
+			heartbeatAsync: publication.heartbeatAsync.bind(publication),
+			syncAsync: publication.syncAsync.bind(publication),
+			close: publication.close.bind(publication),
+		} as never;
+	});
+	try {
+		const broker = await startBroker();
+		setLivenessGraceForTest(broker, WATCHDOG_CADENCE_MS * 4);
+		await Bun.sleep(WATCHDOG_CADENCE_MS * 2);
+		expect(observed).toBe(true);
+		expect(await completedWithin(broker, WATCHDOG_CADENCE_MS * 10)).toBe(true);
+
+		observation.resolve({ kind: "owned" });
+		await Bun.sleep(0);
+		const admission = await broker.runStartup(
+			1,
+			{ now: Date.now, sleep: async () => undefined },
+			async () => "admitted",
+		);
+		expect(admission.status).toBe("admission_refused");
+	} finally {
+		retain.mockRestore();
+	}
+});
+
 test("a heartbeat that resumes before the deadline clears the accrued stall", async () => {
 	const broker = await startBroker();
 	setLivenessGraceForTest(broker, WATCHDOG_CADENCE_MS * 12);
