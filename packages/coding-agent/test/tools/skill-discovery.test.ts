@@ -674,4 +674,87 @@ describe("SkillDiscoveryTool", () => {
 		expect(diagnostics.some(message => message.includes("no parseable frontmatter"))).toBe(true);
 		expect(diagnostics.some(message => message.includes("missing a description"))).toBe(true);
 	});
+	// skills.customDirectories feeds the session skill list through loadSkills. When
+	// discovery skipped it, a configured skill was invocable by exact name and absent
+	// from every search, so it could only be used by someone who already knew it existed.
+	it("discovers skills from skills.customDirectories", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-cwd-"));
+		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-root-"));
+		await makeSkill(custom, "vendor-helper", "Vendor helper skill for invoicing");
+		const settings = runtimeSkillSettings({ "skills.customDirectories": [custom] });
+
+		const tool = new SkillDiscoveryTool(createSession(cwd, { settings }));
+		const result = await tool.execute("call", { query: "invoicing" });
+
+		expect(result.details?.candidates).toEqual([
+			expect.objectContaining({
+				name: "vendor-helper",
+				source: "user",
+				path: path.join(custom, "vendor-helper", "SKILL.md"),
+			}),
+		]);
+	});
+
+	it("resolves a skills.customDirectories skill by name", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-byname-cwd-"));
+		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-byname-root-"));
+		await makeSkill(custom, "vendor-runbook", "Vendor runbook skill", "Runbook body.");
+		const settings = runtimeSkillSettings({ "skills.customDirectories": [custom] });
+
+		const sent: Array<{ content: string }> = [];
+		const tool = new SkillTool(
+			createSession(cwd, {
+				skills: [],
+				settings,
+				sendCustomMessage: async message => {
+					sent.push({ content: String(message.content) });
+				},
+			}),
+		);
+		await tool.execute("call", { name: "vendor-runbook" });
+
+		expect(sent).toHaveLength(1);
+		expect(sent[0].content).toContain("Runbook body.");
+	});
+
+	// Naming a directory is explicit consent, so custom directories stay visible when
+	// ambient user-scope discovery is switched off. loadSkills applies the same rule.
+	it("keeps custom directories visible when user scope trust is disabled", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-cwd-"));
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-home-"));
+		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-root-"));
+		const originalHome = process.env.HOME;
+		process.env.HOME = home;
+		try {
+			await makeSkill(path.join(home, ".gjc", "skills"), "ambient-helper", "Ambient user skill");
+			await makeSkill(custom, "declared-helper", "Declared custom skill");
+			const settings = runtimeSkillSettings({
+				"skills.trustUserSkills": false,
+				"skills.customDirectories": [custom],
+			});
+
+			const result = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
+			const names = (result.details?.candidates ?? []).map(candidate => candidate.name);
+
+			expect(names).toContain("declared-helper");
+			expect(names).not.toContain("ambient-helper");
+		} finally {
+			if (originalHome === undefined) delete process.env.HOME;
+			else process.env.HOME = originalHome;
+		}
+	});
+
+	it("stops scanning custom directories when skills.enabled is false", async () => {
+		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-off-cwd-"));
+		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-off-root-"));
+		await makeSkill(custom, "disabled-helper", "Disabled custom skill");
+		const settings = runtimeSkillSettings({
+			"skills.enabled": false,
+			"skills.customDirectories": [custom],
+		});
+
+		const result = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
+
+		expect(result.details?.candidates).toEqual([]);
+	});
 });
