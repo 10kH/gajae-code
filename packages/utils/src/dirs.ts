@@ -361,6 +361,15 @@ export function setAgentDir(dir: string): void {
 export function getAgentDir(): string {
 	return dirs.agentDir;
 }
+/**
+ * Join a file under the provenance-checked agent directory, never the XDG
+ * state category. Automatic crash relay must not follow `XDG_STATE_HOME`:
+ * a checkout `.env` can set that variable and create `$XDG_STATE_HOME/gjc`,
+ * which the ordinary state resolver would then treat as the crash store.
+ */
+export function getTrustedAgentFile(filename: string): string {
+	return path.join(getAgentDir(), filename);
+}
 
 /** Get the project-local config directory (.gjc). */
 export function getProjectAgentDir(cwd: string = getProjectDir()): string {

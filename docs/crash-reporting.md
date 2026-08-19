@@ -159,8 +159,14 @@ is treated as absent, so a hand-edited global config fails closed. The
 `GJC_CRASH_SENTRY_DSN` environment variable is only consulted once that trusted global
 opt-in is already on; it cannot enable the relay by itself.
 
-The relay never runs on the fatal path. It runs at the next startup during index
-compaction, preserving the crashing process's exactly-one-`O_APPEND` write. It is bounded
+The automatic relay reads fatal and handled stores only from the provenance-checked
+agent directory (`getTrustedAgentFile`), never from the XDG-aware state resolver. A
+checkout `.env` that sets `XDG_STATE_HOME` and creates `$XDG_STATE_HOME/gjc` can still
+move ordinary crash-index paths, but those files are not uploaded.
+
+The relay never runs on the fatal path. It runs at the next **interactive** startup during index
+compaction; other modes can explicitly invoke `gjc crash relay`, preserving the crashing
+process's exactly-one-`O_APPEND` write. It is bounded
 to 8 signatures per run with a 10s per-request timeout. The exact
 payload keys that leave the machine are `event_id`, `timestamp`, `platform`, `level`,
 `logger`, `release`, `environment`, `fingerprint`, `exception.values[].type`,
@@ -177,15 +183,19 @@ one upstream issue per gjc signature.
 Timestamps follow the same coarsening rule as the issue flow: the event `timestamp` is
 truncated to UTC midnight of the crash date, so an exact crash time -- which is a
 behavioural record of when a specific person was working -- never leaves the machine. The
-envelope's `sent_at` header stays exact because it is transport metadata for clock-skew
-correction and the receiver observes the true arrival time from the request regardless.
+envelope omits `sent_at`; the receiver observes the true arrival time from the request.
 
-The relay sends once per occurrence batch. A `relayed` journal event stamps `relayedAt`
-with the `lastSeen` watermark the accepted envelope actually represented, not the wall
-clock. An occurrence appended between the snapshot and the stamp therefore leaves the
-signature due again rather than being silently swallowed; the failure direction is at worst
-one duplicate event, which Sentry folds into the same fingerprint group. `relayedAt` is
-deliberately not an input to index eviction.
+The relay sends once per occurrence batch. A `relayed` journal event stores the
+journal-append-order record id represented by the accepted envelope, independently of
+the display-time `lastSeen` maximum. An occurrence appended between the snapshot and
+the durable stamp therefore leaves the signature due again even when its timestamp is
+equal or backdated. Existing indexes that only have `relayedAt` stay covered when that
+stamp still covers `lastSeen`; a downgrade that advanced `relayedAt` without rewriting
+`relayedRecordId` is treated the same when the latest append is also the lastSeen
+record. The event id is derived from that fingerprint and append-order record id, so a
+retry after upstream acceptance but before local durability uses the same upstream
+identity. A failed journal append after a 2xx POST is a failed send: no durable
+watermark is written.
 
 `gjc crash relay` exits non-zero when any signature was refused by the sanitizer or failed
 in transport, so a partially delivered batch is never reported to automation as a success.
