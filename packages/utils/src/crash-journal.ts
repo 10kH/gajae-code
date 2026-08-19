@@ -54,8 +54,8 @@ export interface CrashRelayedEvent {
 	readonly at: number;
 	/** Sentry event id accepted upstream: 32 lowercase hex. */
 	readonly eventId: string;
-	/** Exact occurrence record represented by the accepted envelope. */
-	readonly recordId: string;
+	/** Exact occurrence record represented by the accepted envelope. Absent on legacy pre-record-id relay lines. */
+	readonly recordId?: string;
 }
 
 export interface CrashAcknowledgedEvent {
@@ -172,8 +172,14 @@ export function parseCrashEventLine(line: string): CrashEvent | undefined {
 		case "relayed": {
 			if (!fingerprint) return undefined;
 			if (typeof body.e !== "string" || !/^[0-9a-f]{32}$/.test(body.e)) return undefined;
-			if (typeof body.r !== "string" || !/^[0-9a-f]{8,32}$/.test(body.r)) return undefined;
-			return { kind: "relayed", fingerprint, at, eventId: body.e, recordId: body.r };
+			if (body.r !== undefined && (typeof body.r !== "string" || !/^[0-9a-f]{8,32}$/.test(body.r))) return undefined;
+			return {
+				kind: "relayed",
+				fingerprint,
+				at,
+				eventId: body.e,
+				...(typeof body.r === "string" ? { recordId: body.r } : {}),
+			};
 		}
 		case "acknowledged": {
 			if (!fingerprint) return undefined;

@@ -119,6 +119,20 @@ describe("compactCrashIndex", () => {
 		expect(index.signatures[recovered.fingerprint]?.acknowledgedAt).toBeUndefined();
 	});
 
+	it("recovers lastAppendRecordId from log order rather than display-time lastSeen", async () => {
+		const paths = await tempPaths();
+		const newer = recoverableRecord(200, "same recovered class", "2026-08-11T12:00:00.000Z");
+		const backdated = recoverableRecord(201, "same recovered class", "2026-08-11T11:00:00.000Z");
+		expect(backdated.fingerprint).toBe(newer.fingerprint);
+		await fs.writeFile(paths.crashLog, newer.text + backdated.text);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[newer.fingerprint]).toMatchObject({
+			lastSeen: Date.parse("2026-08-11T12:00:00.000Z"),
+			lastRecordId: newer.recordId,
+			lastAppendRecordId: backdated.recordId,
+		});
+	});
+
 	it("deduplicates every delayed journal event for more than 256 recovered records", async () => {
 		const paths = await tempPaths();
 		const records = Array.from({ length: 300 }, (_, seed) =>
@@ -586,6 +600,41 @@ describe("relayed crash events", () => {
 		const line = formatCrashEventLine({ kind: "relayed", fingerprint, at: NOW, eventId, recordId });
 
 		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId, recordId });
+	});
+
+	it("accepts a legacy relayed journal line without a record id", () => {
+		const line = `gjc-crash-event.v1 ${JSON.stringify({ k: "relayed", fp: fingerprint, at: NOW, e: eventId })}\n`;
+		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId });
+	});
+
+	it("applies a legacy relayed line as lastSeen coverage without dropping the watermark", () => {
+		const index = parseCrashIndex(
+			JSON.stringify({
+				version: 1,
+				updatedAt: NOW,
+				lastNudgedAt: 0,
+				overflow: false,
+				recentEventIds: [],
+				signatures: {
+					[fingerprint]: {
+						fpv: 1,
+						errorName: "Error",
+						messageClass: "boom",
+						lifetimeCount: 1,
+						retainedCount: 0,
+						firstSeen: NOW,
+						lastSeen: NOW,
+						lastRecordId: recordId(70),
+					},
+				},
+			}),
+			NOW,
+		);
+		expect(index).toBeDefined();
+		if (!index) return;
+		expect(applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId }, NOW)).toBe(true);
+		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
+		expect(index.signatures[fingerprint]?.relayedRecordId).toBe(recordId(70));
 	});
 
 	it.each([

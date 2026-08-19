@@ -491,9 +491,17 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 	}
 	if (event.kind === "relayed") {
 		if (!existing) return false;
-		if (existing.relayedRecordId === event.recordId) return false;
+		if (event.recordId !== undefined) {
+			if (existing.relayedRecordId === event.recordId) return false;
+			existing.relayedAt = event.at;
+			existing.relayedRecordId = event.recordId;
+			return true;
+		}
+		if (existing.relayedAt !== undefined && existing.relayedAt >= event.at) return false;
 		existing.relayedAt = event.at;
-		existing.relayedRecordId = event.recordId;
+		if (event.at >= existing.lastSeen) {
+			existing.relayedRecordId = existing.lastAppendRecordId ?? existing.lastRecordId;
+		}
 		return true;
 	}
 	if (event.kind === "acknowledged") {
@@ -588,7 +596,8 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 	for (const [fingerprint, records] of recordsByFingerprint) {
 		const oldest = records.reduce((candidate, record) => (record.at < candidate.at ? record : candidate));
 		const newest = records.reduce((candidate, record) => (record.at >= candidate.at ? record : candidate));
-		if (!oldest || !newest) continue;
+		const lastAppended = records[records.length - 1];
+		if (!oldest || !newest || !lastAppended) continue;
 		let entry = index.signatures[fingerprint];
 		if (!entry) {
 			if (index.retiredFingerprints.includes(fingerprint)) continue;
@@ -606,7 +615,7 @@ async function recoverAndRecomputeRetainedCounts(index: CrashIndex, crashLogPath
 				firstSeen: oldest.at,
 				lastSeen: newest.at,
 				lastRecordId: newest.recordId,
-				lastAppendRecordId: newest.recordId,
+				lastAppendRecordId: lastAppended.recordId,
 			};
 			index.signatures[fingerprint] = entry;
 			for (const record of records) {

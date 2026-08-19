@@ -167,7 +167,7 @@ move ordinary crash-index paths, but those files are not uploaded.
 The relay never runs on the fatal path. It runs at the next **interactive** startup during index
 compaction; other modes can explicitly invoke `gjc crash relay`, preserving the crashing
 process's exactly-one-`O_APPEND` write. It is bounded
-to 8 signatures per run with a 10s per-request timeout. The exact
+to 8 signatures per run across both fatal and handled stores, with fatal first, and a 10s per-request timeout. The exact
 payload keys that leave the machine are `event_id`, `timestamp`, `platform`, `level`,
 `logger`, `release`, `environment`, `fingerprint`, `exception.values[].type`,
 `.value`, `.stacktrace.frames[].filename`, `.function`, `.in_app`, `tags`, `extra`, and

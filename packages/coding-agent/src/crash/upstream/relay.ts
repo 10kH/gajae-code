@@ -384,14 +384,24 @@ export function resolveHandledErrorStatePaths(agentDir?: string): CrashStatePath
  *
  * Fatal crashes go first: they are rarer and more valuable, so when the
  * per-run cap binds they must not be starved by a noisy handled-error class.
- * The gate is evaluated once by the first call, and a skip there means the same
- * skip applies to the second, so `off` still performs no IO at all.
+ * The cap is shared across both stores. The gate is evaluated once by the
+ * first call, and a skip there means the same skip applies to the second, so
+ * `off` still performs no IO at all.
  */
 export async function relayAllSignatures(options: CrashRelayOptions): Promise<CrashRelayOutcome> {
-	const fatal = await relayCrashSignatures({ ...options, severity: "fatal" });
+	const limit = options.maxPerRun ?? MAX_RELAY_PER_RUN;
+	const fatal = await relayCrashSignatures({ ...options, severity: "fatal", maxPerRun: limit });
+	const consumed = fatal.status === "ran" ? fatal.sent + fatal.refused + fatal.failed : 0;
+	const remaining = Math.max(0, limit - consumed);
+	if (remaining === 0) {
+		return fatal.status === "skipped"
+			? fatal
+			: { status: "ran", sent: fatal.sent, refused: fatal.refused, failed: fatal.failed };
+	}
 	const handled = await relayCrashSignatures({
 		...options,
 		severity: "error",
+		maxPerRun: remaining,
 		paths: options.handledPaths ?? resolveTrustedHandledRelayStatePaths(),
 	});
 	if (fatal.status === "skipped" && handled.status === "skipped") return fatal;
