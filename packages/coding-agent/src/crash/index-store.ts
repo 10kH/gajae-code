@@ -452,6 +452,14 @@ function boundMessageClass(value: string): string {
 	return bytes.subarray(0, end).toString("utf8");
 }
 
+function dropOversizedDerivedWatermark(entry: CrashSignatureEntry): void {
+	if (
+		entry.lastAppendRecordId !== undefined &&
+		Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES
+	)
+		delete entry.lastAppendRecordId;
+}
+
 function evictOne(index: CrashIndex): boolean {
 	let victim: string | undefined;
 	let victimSeen = Number.POSITIVE_INFINITY;
@@ -542,6 +550,7 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 			existing.lastRecordId = event.recordId;
 			if (event.messageClass) existing.messageClass = boundMessageClass(event.messageClass);
 		}
+		dropOversizedDerivedWatermark(existing);
 		return true;
 	}
 	if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {

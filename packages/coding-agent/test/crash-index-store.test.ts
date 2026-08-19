@@ -90,6 +90,48 @@ describe("compactCrashIndex", () => {
 		expect(again.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(8);
 	});
 
+	it("keeps a maximum-sized legacy entry readable after a later occurrence compaction", async () => {
+		const paths = await tempPaths();
+		const fingerprint = fingerprintFor(2);
+		const firstRecordId = recordId(20);
+		const legacyEntry = {
+			fpv: 1,
+			errorName: "Error",
+			messageClass: "x".repeat(512),
+			lifetimeCount: 1,
+			retainedCount: 0,
+			firstSeen: NOW - 1000,
+			lastSeen: NOW,
+			lastRecordId: firstRecordId,
+			commentedIssues: [
+				`https://github.com/Yeachan-Heo/gajae-code/issues/${"x".repeat(180)}`,
+				`https://x/${"y".repeat(50)}`,
+			],
+		};
+		const index = {
+			version: 1,
+			updatedAt: NOW,
+			lastNudgedAt: 0,
+			overflow: false,
+			recentEventIds: [firstRecordId],
+			recentJournalDigests: [],
+			recoveredRecordIds: [],
+			retiredFingerprints: [],
+			signatures: { [fingerprint]: legacyEntry },
+		};
+		expect(Buffer.byteLength(JSON.stringify(legacyEntry), "utf8")).toBeLessThanOrEqual(CRASH_INDEX_ENTRY_MAX_BYTES);
+		await fs.writeFile(paths.index, `${JSON.stringify(index)}\n`);
+		appendCrashEvent({ ...occurrence(fingerprint, recordId(21), NOW - 500), messageClass: "" }, paths.events);
+
+		const compacted = await compactCrashIndex({ paths, now: NOW });
+		expect(compacted.signatures[fingerprint]?.lifetimeCount).toBe(2);
+		expect(compacted.signatures[fingerprint]?.lastAppendRecordId).toBeUndefined();
+
+		const reparsed = parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW);
+		expect(reparsed?.signatures[fingerprint]?.lifetimeCount).toBe(2);
+		expect(reparsed?.signatures[fingerprint]?.lastAppendRecordId).toBeUndefined();
+	});
+
 	it("deduplicates a replayed rotated journal containing more than the recent id window", async () => {
 		const paths = await tempPaths();
 		const rotated = `${paths.events}.compacting-replay`;
