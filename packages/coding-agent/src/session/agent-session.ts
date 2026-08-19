@@ -496,18 +496,34 @@ interface CompactionStateSnapshot {
 const FILE_MUTATION_TOOLS = new Set(["write", "edit", "apply_patch", "ast_edit"]);
 const MAX_RECENT_FILE_MUTATIONS = 12;
 
+function collectFileMutationPaths(toolName: string, args: unknown): string[] {
+	if (!FILE_MUTATION_TOOLS.has(toolName) || !args || typeof args !== "object" || Array.isArray(args)) return [];
+	const record = args as Record<string, unknown>;
+	const directPath = getStringProperty(record, "path") ?? getStringProperty(record, "file_path");
+	if (directPath) return [directPath];
+
+	const paths = collectStringPaths(record.paths);
+	if (paths.length > 0) return paths;
+
+	const input = getStringProperty(record, "input");
+	if (!input) return [];
+	try {
+		return expandApplyPatchToEntries({ input }).map(entry => entry.path);
+	} catch {
+		return [];
+	}
+}
+
 function collectRecentFileMutations(messages: readonly AgentMessage[]): string[] {
-	const callsById = new Map<string, string>();
+	const callsById = new Map<string, string[]>();
 	for (const message of messages) {
 		if (message.role !== "assistant") continue;
 		const content = (message as AssistantMessage).content;
 		if (!Array.isArray(content)) continue;
 		for (const block of content) {
 			if (block.type !== "toolCall" || !FILE_MUTATION_TOOLS.has(block.name)) continue;
-			const args = block.arguments;
-			if (typeof args !== "object" || args === null) continue;
-			const filePath = (args as { path?: unknown }).path;
-			if (typeof filePath === "string" && filePath.length > 0) callsById.set(block.id, filePath);
+			const paths = collectFileMutationPaths(block.name, block.arguments).filter(path => path.length > 0);
+			if (paths.length > 0) callsById.set(block.id, paths);
 		}
 	}
 	const seen = new Set<string>();
@@ -517,10 +533,15 @@ function collectRecentFileMutations(messages: readonly AgentMessage[]): string[]
 		if (message.role !== "toolResult") continue;
 		const result = message as { toolName?: string; toolCallId?: string; isError?: boolean };
 		if (result.isError || !result.toolName || !FILE_MUTATION_TOOLS.has(result.toolName)) continue;
-		const filePath = result.toolCallId ? callsById.get(result.toolCallId) : undefined;
-		if (!filePath || seen.has(filePath)) continue;
-		seen.add(filePath);
-		paths.push(filePath);
+		const filePaths = result.toolCallId ? callsById.get(result.toolCallId) : undefined;
+		if (!filePaths) continue;
+		for (let pathIndex = filePaths.length - 1; pathIndex >= 0; pathIndex--) {
+			const filePath = filePaths[pathIndex];
+			if (!filePath || seen.has(filePath)) continue;
+			seen.add(filePath);
+			paths.push(filePath);
+			if (paths.length >= MAX_RECENT_FILE_MUTATIONS) break;
+		}
 		if (paths.length >= MAX_RECENT_FILE_MUTATIONS) break;
 	}
 	return paths;

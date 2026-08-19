@@ -447,6 +447,36 @@ describe("AgentSession state-aware compaction", () => {
 		expect(notices).toContain("Auto-continue skipped: no unfinished work detected");
 	});
 
+	it("includes multi-path AST edits in compaction-state extraContext", async () => {
+		const astEditCall = assistantMessage("stop");
+		astEditCall.content = [
+			{
+				type: "toolCall",
+				id: "ast-edit-recent",
+				name: "ast_edit",
+				arguments: {
+					paths: ["src/first.ts", "src/second.ts"],
+					ops: [{ pat: "old", out: "new" }],
+				},
+			},
+		];
+		session.agent.appendMessage(astEditCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "ast-edit-recent",
+			toolName: "ast_edit",
+			content: [{ type: "text", text: "Applied 2 replacements in 2 files." }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		seedCompactionHistory();
+		await session.compact();
+		const options = compactSpy.mock.calls[0]?.[5];
+		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
+		expect(files).toContain("src/first.ts");
+		expect(files).toContain("src/second.ts");
+	});
+
 	it("continues synthetic auto-continue for an active nonterminal workflow", async () => {
 		await seedActiveSkillState("active");
 		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
