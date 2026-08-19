@@ -51,11 +51,12 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 		if (!isSafeEnvName(key) || value === undefined || !isSafeEnvValue(value)) continue;
 
 		// Bun may have already loaded cwd/.env before JS runs. It does not expose the
-		// source of each entry, so any project declaration is ambiguous, including a
-		// dotenv-expanded value that differs from the declaration text. Exclude it
-		// from the credential-only inherited snapshot, while keeping it available
-		// through $env.
-		if (Object.hasOwn(projectEnv, key)) continue;
+		// source of each entry, so a matching project declaration is ambiguous. A
+		// dynamic dotenv declaration is also ambiguous even when expansion changes
+		// its runtime value. Exclude those from the credential-only snapshot while
+		// keeping them available through $env.
+		const projectValue = resolveFileEnvValue(projectEnv, key);
+		if (projectValue !== undefined && (projectValue === value || /[$`]/.test(projectValue))) continue;
 
 		result[key] = value;
 	}
@@ -75,6 +76,9 @@ const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
 const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
 const initialTrustedAgentEnv = readTrustedAgentEnv();
+const projectLoadedEnv: Record<string, string | undefined> = Object.fromEntries(
+	Object.keys(projectEnv).map(key => [key, Bun.env[key]]),
+);
 
 const inheritedEnv = filterCredentialInheritedEnv(Bun.env);
 const rotatingAgentEnvNames = new Set(Object.keys(agentEnv));
@@ -100,7 +104,11 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 	const trimmed = value.trim();
 	if (trimmed.length === 0) return undefined;
 
-	if (Object.hasOwn(projectEnv, name) && resolveFileEnvValue(inheritedEnv, name) === undefined) {
+	if (
+		Object.hasOwn(projectEnv, name) &&
+		resolveFileEnvValue(inheritedEnv, name) === undefined &&
+		(trimmed === resolveFileEnvValue(projectEnv, name) || trimmed === projectLoadedEnv[name])
+	) {
 		return undefined;
 	}
 
