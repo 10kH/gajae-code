@@ -266,7 +266,7 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 			);
 		}
 
-		let outcome: BisectOutcome;
+		let outcome: BisectOutcome | undefined;
 		// Defensive reset in case a previous aborted bisect left state behind; a
 		// no-op when not bisecting (reset never throws).
 		await git.bisect.reset(cwd, signal);
@@ -318,6 +318,7 @@ export class BisectTool implements AgentTool<typeof bisectSchema, BisectToolDeta
 			await git.reset(cwd, { hard: true }).catch(() => {});
 			await git.bisect.reset(cwd);
 		}
+		if (!outcome) throw new ToolError("git bisect ended without producing a result.");
 
 		// Never claim a clean restore we did not actually achieve.
 		const restoreLine = await describeRestore(cwd);
