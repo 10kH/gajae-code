@@ -170,6 +170,13 @@ export function resolveRelayDsn(
  */
 export function isRelayDue(signature: CrashSignatureView): boolean {
 	const appendId = signature.lastAppendRecordId ?? signature.lastRecordId;
+	// Modern entries with a durable relay record id use exact identity. Legacy
+	// entries upgraded from a wall-clock-only relay have no relayedRecordId, so
+	// retain their timestamp coverage compatibility until a new append exists.
+	if (signature.lastAppendRecordId !== undefined) {
+		if (signature.relayedRecordId !== undefined) return signature.relayedRecordId !== appendId;
+		return signature.relayedAt === undefined || signature.relayedAt < signature.lastSeen;
+	}
 	if (signature.relayedRecordId !== undefined) {
 		if (signature.relayedRecordId === appendId) return false;
 		if (

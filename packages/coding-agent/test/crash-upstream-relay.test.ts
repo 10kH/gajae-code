@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { appendCrashEvent, formatCrashRecordMarker } from "@gajae-code/utils";
+import { appendCrashEvent, computeCrashFingerprint, formatCrashRecordMarker } from "@gajae-code/utils";
 import { crashRelayExitCode } from "../src/cli/crash-cli";
 import type { CrashSignatureView, CrashStatePaths } from "../src/crash/index-store";
 import { compactCrashIndex, listCrashSignatures, readCrashIndex } from "../src/crash/index-store";
@@ -19,7 +19,12 @@ import {
 } from "../src/crash/upstream/relay";
 
 const DSN = "https://abc123@o1.ingest.sentry.io/4511929997721600";
-const FINGERPRINT = "a".repeat(32);
+const STACK = "    at readFile (packages/coding-agent/src/tools/read.ts:12:9)";
+const FINGERPRINT = computeCrashFingerprint({
+	name: "TypeError",
+	message: "cannot read properties of <redacted>",
+	stack: STACK,
+}).fingerprint;
 
 function config(overrides: Partial<CrashRelayConfig> = {}): CrashRelayConfig {
 	return { upstream: "sentry", dsn: DSN, ...overrides };
@@ -104,7 +109,7 @@ describe("isRelayDue", () => {
 			isRelayDue(
 				signature({
 					lastRecordId: "rec-2",
-					lastAppendRecordId: "rec-2",
+					lastAppendRecordId: undefined,
 					relayedRecordId: "rec-1",
 					relayedAt: 1_700_000_900_000,
 				}),
@@ -117,6 +122,19 @@ describe("isRelayDue", () => {
 			isRelayDue(
 				signature({
 					lastRecordId: "rec-1",
+					lastAppendRecordId: "rec-2",
+					relayedRecordId: "rec-1",
+					relayedAt: 1_700_000_900_000,
+				}),
+			),
+		).toBe(true);
+	});
+
+	test("an equal-time append after a modern send stays due by record identity", () => {
+		expect(
+			isRelayDue(
+				signature({
+					lastRecordId: "rec-2",
 					lastAppendRecordId: "rec-2",
 					relayedRecordId: "rec-1",
 					relayedAt: 1_700_000_900_000,
@@ -181,11 +199,22 @@ describe("relayCrashSignatures", () => {
 	let paths: CrashStatePaths;
 
 	const RECORD_ID = "0123456789abcdef";
-	const STACK = "    at readFile (packages/coding-agent/src/tools/read.ts:12:9)";
 
 	/** Seed one journaled occurrence plus the crash-log record it points at. */
 	async function seed(overrides: { at?: number; fingerprint?: string; recordId?: string } = {}): Promise<void> {
-		const fingerprint = overrides.fingerprint ?? FINGERPRINT;
+		const markerHint = overrides.fingerprint
+			? ({
+					["a".repeat(32)]: "alpha",
+					["b".repeat(32)]: "bravo",
+					["c".repeat(32)]: "charlie",
+				}[overrides.fingerprint] ?? "variant")
+			: undefined;
+		const messageClass = overrides.fingerprint
+			? `cannot read properties of <redacted> (${markerHint})`
+			: "cannot read properties of <redacted>";
+		const fingerprint = overrides.fingerprint
+			? computeCrashFingerprint({ name: "TypeError", message: messageClass, stack: STACK }).fingerprint
+			: FINGERPRINT;
 		const recordId = overrides.recordId ?? RECORD_ID;
 		appendCrashEvent(
 			{
@@ -195,13 +224,13 @@ describe("relayCrashSignatures", () => {
 				recordId,
 				at: overrides.at ?? 1_700_000_900_000,
 				errorName: "TypeError",
-				messageClass: "cannot read properties of <redacted>",
+				messageClass,
 			},
 			paths.events,
 		);
 		await fs.appendFile(
 			paths.crashLog,
-			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: cannot read properties of <redacted>\n` +
+			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: ${messageClass}\n` +
 				`${STACK}\n${formatCrashRecordMarker(fingerprint, 1, recordId)}\n\n`,
 		);
 	}
@@ -321,17 +350,16 @@ describe("relayCrashSignatures", () => {
 		const entry = compacted.signatures[FINGERPRINT];
 		expect(entry?.relayedRecordId).toBe(RECORD_ID);
 		if (!entry) return;
+		const { lastAppendRecordId: _dropped, relayedRecordId: _legacyDropped, ...downgraded } = entry;
 		await Bun.write(
 			paths.index,
 			`${JSON.stringify({
 				...compacted,
 				signatures: {
 					[FINGERPRINT]: {
-						...entry,
+						...downgraded,
 						lastRecordId: "9999888877776666",
-						lastAppendRecordId: "9999888877776666",
 						relayedAt: entry.lastSeen,
-						relayedRecordId: RECORD_ID,
 					},
 				},
 			})}\n`,
@@ -586,8 +614,10 @@ describe("relayCrashSignatures", () => {
 	});
 
 	test("never sends more than the per-run cap", async () => {
-		for (let i = 0; i < 4; i++)
-			await seed({ fingerprint: `${i}`.repeat(32), recordId: `${i}`.repeat(16), at: 1_700_000_900_000 + i });
+		for (let i = 0; i < 4; i++) {
+			const label = String.fromCharCode(97 + i);
+			await seed({ fingerprint: label.repeat(32), recordId: `${i}`.repeat(16), at: 1_700_000_900_000 + i });
+		}
 		const bodies: string[] = [];
 		const outcome = await relayCrashSignatures({
 			config: config(),
@@ -624,7 +654,11 @@ describe("relayCrashSignatures", () => {
 		try {
 			await seed();
 			// Same shape in the handled store, under a different fingerprint.
-			const handledFingerprint = "b".repeat(32);
+			const handledFingerprint = computeCrashFingerprint({
+				name: "ToolError",
+				message: "tool failed",
+				stack: STACK,
+			}).fingerprint;
 			appendCrashEvent(
 				{
 					kind: "occurrence",
@@ -668,10 +702,17 @@ describe("relayCrashSignatures", () => {
 			crashLog: path.join(handledDir, "gjc-error.log"),
 		};
 		try {
-			for (let i = 0; i < 3; i++)
-				await seed({ fingerprint: `${i}`.repeat(32), recordId: `${i}`.repeat(16), at: 1_700_000_900_000 + i });
 			for (let i = 0; i < 3; i++) {
-				const fingerprint = `${i + 3}`.repeat(32);
+				const label = String.fromCharCode(97 + i);
+				await seed({ fingerprint: label.repeat(32), recordId: `${i}`.repeat(16), at: 1_700_000_900_000 + i });
+			}
+			for (let i = 0; i < 3; i++) {
+				const messageClass = `tool failed (${String.fromCharCode(100 + i)})`;
+				const fingerprint = computeCrashFingerprint({
+					name: "ToolError",
+					message: messageClass,
+					stack: STACK,
+				}).fingerprint;
 				const rec = `${i + 3}`.repeat(16);
 				appendCrashEvent(
 					{
@@ -681,13 +722,13 @@ describe("relayCrashSignatures", () => {
 						recordId: rec,
 						at: 1_700_000_900_000 + i,
 						errorName: "ToolError",
-						messageClass: "tool failed",
+						messageClass,
 					},
 					handledPaths.events,
 				);
 				await fs.appendFile(
 					handledPaths.crashLog,
-					`2026-08-11T11:59:59.000Z pid=4242 [Tool functions.read] ToolError: tool failed\n` +
+					`2026-08-11T11:59:59.000Z pid=4242 [Tool functions.read] ToolError: ${messageClass}\n` +
 						`${STACK}\n${formatCrashRecordMarker(fingerprint, 1, rec)}\n\n`,
 				);
 			}

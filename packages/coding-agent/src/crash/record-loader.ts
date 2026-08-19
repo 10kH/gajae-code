@@ -150,7 +150,7 @@ export function findLatestRecord(contents: string, fingerprint: string): LoadedC
 
 /** Identity-bearing record bound to the indexed append-order identity. */
 export function findRecordById(contents: string, fingerprint: string, recordId: string): LoadedCrashRecord | undefined {
-	return parseCrashRecords(contents).find(
+	return parseRecoverableCrashRecords(contents).find(
 		record => record.fingerprint === fingerprint && record.recordId === recordId,
 	);
 }

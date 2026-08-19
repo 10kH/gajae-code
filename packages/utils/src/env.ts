@@ -63,18 +63,23 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 	return result;
 }
 
-// Eagerly parse the user's $HOME/.env and the current project's .env (from cwd)
+// Parse the current project's .env first. Bun may have overlaid HOME from it
+// before this module runs, so a declared HOME must never select user credential
+// files for the credential-only snapshot.
+const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
+const trustedEnvHome = Object.hasOwn(projectEnv, "HOME") ? path.parse(process.cwd()).root : os.homedir();
+
+// Eagerly parse the trusted user's env files and the project .env (from cwd)
 const homeShellEnv = {
-	...parseShellEnvFile(path.join(os.homedir(), ".zshenv")),
-	...parseShellEnvFile(path.join(os.homedir(), ".zprofile")),
-	...parseShellEnvFile(path.join(os.homedir(), ".zshrc")),
-	...parseShellEnvFile(path.join(os.homedir(), ".bash_profile")),
-	...parseShellEnvFile(path.join(os.homedir(), ".bashrc")),
+	...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
+	...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
+	...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
+	...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
+	...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
 };
-const homeEnv = parseEnvFile(path.join(os.homedir(), ".env"));
+const homeEnv = parseEnvFile(path.join(trustedEnvHome, ".env"));
 const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
 const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
-const projectEnv = parseEnvFile(path.join(process.cwd(), ".env"));
 const initialTrustedAgentEnv = readTrustedAgentEnv();
 const projectLoadedEnv: Record<string, string | undefined> = Object.fromEntries(
 	Object.keys(projectEnv).map(key => [key, Bun.env[key]]),
