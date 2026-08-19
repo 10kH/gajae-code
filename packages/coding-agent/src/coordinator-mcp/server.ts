@@ -1782,7 +1782,8 @@ function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
 			typeof event.timestamp !== "string" ||
 			typeof event.summary !== "string" ||
 			typeof event.kind !== "string" ||
-			!COORDINATOR_EVENT_KINDS.has(event.kind)
+			!COORDINATOR_EVENT_KINDS.has(event.kind) ||
+			event.id !== `event-${event.seq.toString().padStart(12, "0")}`
 		)
 			return null;
 		return event as CoordinatorEvent;
@@ -1795,11 +1796,16 @@ async function readCoordinatorEvents(namespaceDir: string): Promise<CoordinatorE
 	try {
 		const content = await fs.readFile(eventJournalFile(namespaceDir), "utf8");
 		const events: CoordinatorEvent[] = [];
+		const seenIds = new Set<string>();
+		const seenSeqs = new Set<number>();
 		for (const rawLine of content.split("\n")) {
 			const line = rawLine.trim();
 			if (!line) continue;
 			const event = parseCoordinatorEvent(line);
 			if (!event) throw new Error("state_corrupt");
+			if (seenIds.has(event.id) || seenSeqs.has(event.seq)) throw new Error("state_corrupt");
+			seenIds.add(event.id);
+			seenSeqs.add(event.seq);
 			events.push(event);
 		}
 		return events.sort((left, right) => left.seq - right.seq);

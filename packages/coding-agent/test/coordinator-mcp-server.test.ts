@@ -438,7 +438,7 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		await fs.mkdir(path.dirname(journal), { recursive: true });
 		await fs.writeFile(
 			journal,
-			'{"schema_version":1,"seq":4,"id":"event-4","timestamp":"2026-08-19T00:00:00.000Z","kind":"turn.completed","summary":"complete"}\n{torn',
+			'{"schema_version":1,"seq":4,"id":"event-000000000004","timestamp":"2026-08-19T00:00:00.000Z","kind":"turn.completed","summary":"complete"}\n{torn',
 			"utf8",
 		);
 		await expect(

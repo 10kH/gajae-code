@@ -159,13 +159,25 @@ export async function writeCoordinatorAtomic(
 		published = true;
 		await syncCoordinatorDirectory(path.dirname(file), options);
 	} catch (error) {
+		let cleanupError: unknown;
 		try {
 			await fs.rm(temporary, { force: true });
-		} catch (cleanupError) {
-			if (published) throw new CoordinatorPublicationUncertainError(new AggregateError([error, cleanupError]));
-			throw new AggregateError([error, cleanupError], "coordinator atomic write and cleanup failed");
+		} catch (cleanupFailure) {
+			cleanupError = cleanupFailure;
 		}
-		if (published) throw new CoordinatorPublicationUncertainError(error);
-		throw error;
+		let cleanupBarrierError: unknown;
+		if (!cleanupError && !published) {
+			try {
+				await syncCoordinatorDirectory(path.dirname(file), options);
+			} catch (barrierError) {
+				cleanupBarrierError = barrierError;
+			}
+		}
+		const failures = [error, cleanupError, cleanupBarrierError].filter(
+			(value): value is unknown => value !== undefined,
+		);
+		if (published) throw new CoordinatorPublicationUncertainError(new AggregateError(failures));
+		if (failures.length === 1) throw failures[0];
+		throw new AggregateError(failures, "coordinator atomic write and cleanup failed");
 	}
 }
