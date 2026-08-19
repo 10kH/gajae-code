@@ -4981,6 +4981,65 @@ interface ResidentBlobStores {
 	onResidentBlobMissing?: (kind: ResidentBlobKind, hash: string) => void;
 }
 
+/**
+ * Record one bounded line where a missing resident blob is fatal.
+ *
+ * The degrading legacy resolvers each warn on a miss and the demotion salvage
+ * reports its placeholders, so the recoverable cases were observable in the log
+ * while the turn-killing ones were not: a fail-closed abort left no record
+ * naming the blob, its kind, or its session. Placeholder substitution stays
+ * silent here because it is self-evidencing in the transcript and already has
+ * its own callback.
+ */
+function reportResidentBlobMissing(
+	error: ResidentBlobMissingError,
+	phase: "materialize" | "stage-verify" | "cold-spill",
+): ResidentBlobMissingError {
+	logger.error("Resident blob missing on a fail-closed path", {
+		phase,
+		kind: error.kind,
+		hash: error.hash,
+		sessionId: error.sessionId,
+		sessionFile: error.sessionFile,
+	});
+	return error;
+}
+
+/**
+ * Record one bounded line where a corrupted resident reference is fatal.
+ *
+ * The missing-blob lanes above report through `reportResidentBlobMissing`;
+ * a staged sentinel whose ref does not even parse failed closed with a bare
+ * `Error` that named no ref, kind, or session and left no record at all —
+ * the same observability gap one boundary over. The ref is bounded because a
+ * corrupted boundary is exactly where unbounded input appears.
+ */
+function reportInvalidResidentBlobRef(ref: string, kind: string, stores: ResidentBlobStores): Error {
+	const boundedRef = ref.length > 96 ? `${ref.slice(0, 96)}…` : ref;
+	logger.error("Resident blob reference invalid on a fail-closed path", {
+		phase: "stage-verify",
+		kind,
+		ref: boundedRef,
+		sessionId: stores.sessionId,
+		sessionFile: stores.sessionFile,
+	});
+	return new Error(
+		`Staged resident entry has an invalid blob reference: ${boundedRef}` +
+			(stores.sessionId ? ` (session ${stores.sessionId})` : "") +
+			(stores.sessionFile ? ` [${stores.sessionFile}]` : ""),
+	);
+}
+
+/** Coerce a corrupted sentinel's ref to text without letting a hostile toString through. */
+function safeResidentRefText(ref: unknown): string {
+	if (typeof ref === "string") return ref;
+	try {
+		return String(ref);
+	} catch {
+		return "<unprintable ref>";
+	}
+}
+
 function residentBlobMissingPlaceholder(error: ResidentBlobMissingError): string {
 	return `[Session resident ${error.kind} blob missing: sha256:${error.hash}; original content unavailable]`;
 }
@@ -5065,6 +5124,7 @@ function materializeResidentValueSync(
 				resolved = residentBlobMissingPlaceholder(err);
 				stores.onResidentBlobMissing?.(err.kind, err.hash);
 			} else {
+				if (err instanceof ResidentBlobMissingError) reportResidentBlobMissing(err, "materialize");
 				throw err;
 			}
 		}
@@ -5122,13 +5182,29 @@ function assertResidentReferencesResolvableSync(entries: readonly FileEntry[], s
 			const key = `${value.kind}:${value.ref}`;
 			if (resolved.has(key)) return;
 			resolved.add(key);
-			const hash = parseBlobRef(value.ref);
-			if (hash === null) throw new Error("Staged resident entry has an invalid blob reference.");
+			// The strict sentinel gate above already required isBlobRef(value.ref), so
+			// the parse cannot fail here; non-parsing refs are the corrupted lane below.
+			const hash = parseBlobRef(value.ref) as string;
 			const store = value.kind === "text" ? stores.textStore : stores.imageStore;
 			if (store.getSync(hash) === null) {
-				throw new ResidentBlobMissingError(hash, value.kind, stores.sessionId, stores.sessionFile);
+				throw reportResidentBlobMissing(
+					new ResidentBlobMissingError(hash, value.kind, stores.sessionId, stores.sessionFile),
+					"stage-verify",
+				);
 			}
 			return;
+		}
+		// A key-marked sentinel that failed the strict shape check is a corrupted
+		// boundary, not plain data: `containsResidentSentinel` already treats the
+		// key alone as a sentinel, so walking past it here would verify nothing and
+		// let the raw sentinel — internal key and all — persist into the transcript.
+		if ((value as { [RESIDENT_BLOB_SENTINEL_KEY]?: unknown })[RESIDENT_BLOB_SENTINEL_KEY] === true) {
+			const record = value as { kind?: unknown; ref?: unknown };
+			throw reportInvalidResidentBlobRef(
+				safeResidentRefText(record.ref),
+				typeof record.kind === "string" ? record.kind : "unknown",
+				stores,
+			);
 		}
 		if (ArrayBuffer.isView(value) || seen.has(value)) return;
 		seen.add(value);
@@ -5231,6 +5307,28 @@ function materializeResidentEntriesForPersistenceSync<T extends FileEntry | Sess
 
 export function residentBlobSentinelForTests(kind: ResidentBlobKind, ref: string): ResidentBlobSentinel {
 	return residentBlobSentinel(kind, ref);
+}
+
+export function assertResidentReferencesResolvableForTests(
+	entries: readonly FileEntry[],
+	textStore: BlobStore,
+	imageStore: BlobStore = textStore,
+	binding: { sessionId?: string; sessionFile?: string } = {},
+): void {
+	assertResidentReferencesResolvableSync(entries, { textStore, imageStore, ...binding });
+}
+
+export function materializeResidentEntriesThrowingForTests<T>(
+	entries: T[],
+	textStore: BlobStore,
+	imageStore: BlobStore = textStore,
+	binding: { sessionId?: string; sessionFile?: string } = {},
+): T[] {
+	return materializeResidentEntriesSync(entries as Array<T & FileEntry>, {
+		textStore,
+		imageStore,
+		...binding,
+	}) as T[];
 }
 
 export function materializeResidentEntriesForPersistenceForTests<T>(
@@ -5344,16 +5442,17 @@ function isColdSpillArgumentsSentinel(value: unknown): value is Record<string, u
 function residentBlobBytesForColdSpill(value: ResidentBlobSentinel, promotion: ColdSpillResidentPromotion): Buffer {
 	const hash = parseBlobRef(value.ref);
 	if (!hash)
-		throw new ResidentBlobMissingError(
-			value.ref,
-			value.kind,
-			promotion.stores.sessionId,
-			promotion.stores.sessionFile,
+		throw reportResidentBlobMissing(
+			new ResidentBlobMissingError(value.ref, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile),
+			"cold-spill",
 		);
 	const store = value.kind === "text" ? promotion.stores.textStore : promotion.stores.imageStore;
 	const data = store.getSync(hash);
 	if (!data)
-		throw new ResidentBlobMissingError(hash, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile);
+		throw reportResidentBlobMissing(
+			new ResidentBlobMissingError(hash, value.kind, promotion.stores.sessionId, promotion.stores.sessionFile),
+			"cold-spill",
+		);
 	promotion.stores.onResidentBlobRead?.(value.kind);
 	if (value.kind === "imageData") return Buffer.from(data.toString("base64"), "utf8");
 	return Buffer.from(data);
@@ -7404,6 +7503,8 @@ export class SessionManager {
 				textStore: sourceTextStore,
 				imageStore: source.sourceStores.imageStore,
 				textFallback: source.sourceStores.textFallback,
+				sessionId: target.sessionId,
+				sessionFile: target.sessionFile || undefined,
 				onResidentBlobMissing: source.sourceStores.onResidentBlobMissing,
 			},
 

@@ -18,7 +18,7 @@ import { MemorySessionStorage } from "@gajae-code/coding-agent/session/session-s
 
 import type { RecoveryFsRoot } from "@gajae-code/natives";
 import * as native from "@gajae-code/natives";
-import { getAgentDir, getResidentCacheRootDir, getTerminalSessionsDir, setAgentDir } from "@gajae-code/utils";
+import { getAgentDir, getResidentCacheRootDir, getTerminalSessionsDir, logger, setAgentDir } from "@gajae-code/utils";
 import { ManagedSessionDescendantStore } from "../src/session/internal/managed-session-storage";
 
 const originalAgentDir = getAgentDir();
@@ -496,7 +496,20 @@ describe("resident-store transition seam", () => {
 		try {
 			const stagedRead = vi.spyOn(MemoryBlobStore.prototype, "getSync").mockReturnValue(null);
 			try {
-				expect(() => predecessor.sm.commitPreparedNewSession(prepared)).toThrow("Missing resident text blob");
+				// A fail-closed resident abort must leave a record. #4670 gave the
+				// placeholder salvage its own report; the paths that still throw had
+				// none, while the non-fatal legacy resolvers warn on every miss.
+				const residentErrors = vi.spyOn(logger, "error").mockImplementation(() => {});
+				try {
+					expect(() => predecessor.sm.commitPreparedNewSession(prepared)).toThrow("Missing resident text blob");
+					const reported = residentErrors.mock.calls.filter(
+						([message]) => message === "Resident blob missing on a fail-closed path",
+					);
+					expect(reported).toHaveLength(1);
+					expect(reported[0]![1]).toMatchObject({ phase: "stage-verify", kind: "text" });
+				} finally {
+					residentErrors.mockRestore();
+				}
 			} finally {
 				stagedRead.mockRestore();
 			}
