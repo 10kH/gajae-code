@@ -436,9 +436,21 @@ describe("Coordinator MCP canonical SDK controls", () => {
 		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
 		const journal = path.join(namespace, "events", "event-journal.jsonl");
 		await fs.mkdir(path.dirname(journal), { recursive: true });
-		await fs.writeFile(journal, '{"schema_version":1,"seq":4,"kind":"turn.completed"}\n{torn', "utf8");
+		await fs.writeFile(
+			journal,
+			'{"schema_version":1,"seq":4,"id":"event-4","timestamp":"2026-08-19T00:00:00.000Z","kind":"turn.completed","summary":"complete"}\n{torn',
+			"utf8",
+		);
 		await expect(
 			appendCoordinatorEventForTest(namespace, { kind: "turn.completed", summary: "must not reuse seq" }),
+		).rejects.toThrow("state_corrupt");
+		await fs.writeFile(
+			journal,
+			'{"schema_version":1,"seq":9007199254740992,"id":"unsafe","timestamp":"2026-08-19T00:00:00.000Z","kind":"turn.completed","summary":"unsafe"}\n',
+			"utf8",
+		);
+		await expect(
+			appendCoordinatorEventForTest(namespace, { kind: "turn.completed", summary: "must not reuse unsafe seq" }),
 		).rejects.toThrow("state_corrupt");
 	});
 

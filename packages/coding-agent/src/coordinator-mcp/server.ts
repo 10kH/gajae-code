@@ -323,6 +323,28 @@ type CoordinatorEventKind =
 	| "tmux.delivery_failed"
 	| "delegation.started";
 
+const COORDINATOR_EVENT_KINDS: ReadonlySet<string> = new Set<CoordinatorEventKind>([
+	"session.registered",
+	"session.started",
+	"session.reaped",
+	"session.state_changed",
+	"turn.queued",
+	"turn.delivering",
+	"turn.active",
+	"turn.acknowledged",
+	"turn.waiting_for_answer",
+	"turn.completed",
+	"turn.failed",
+	"turn.cancelled",
+	"turn.superseded",
+	"question.opened",
+	"question.answered",
+	"report.written",
+	"tmux.delivery_succeeded",
+	"tmux.delivery_failed",
+	"delegation.started",
+]);
+
 interface CoordinatorEvent {
 	schema_version: 1;
 	seq: number;
@@ -1749,9 +1771,21 @@ export async function appendCoordinatorEventForTest(
 
 function parseCoordinatorEvent(line: string): CoordinatorEvent | null {
 	try {
-		const event = JSON.parse(line) as CoordinatorEvent;
-		if (typeof event.seq !== "number" || typeof event.kind !== "string") return null;
-		return event;
+		const event = JSON.parse(line) as Partial<CoordinatorEvent>;
+		if (
+			event.schema_version !== 1 ||
+			typeof event.seq !== "number" ||
+			!Number.isSafeInteger(event.seq) ||
+			event.seq < 0 ||
+			typeof event.id !== "string" ||
+			event.id.length === 0 ||
+			typeof event.timestamp !== "string" ||
+			typeof event.summary !== "string" ||
+			typeof event.kind !== "string" ||
+			!COORDINATOR_EVENT_KINDS.has(event.kind)
+		)
+			return null;
+		return event as CoordinatorEvent;
 	} catch {
 		return null;
 	}
@@ -3585,6 +3619,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						) ?? null,
 				);
 				if (deletion?.phase === "broker_closed" || deletion?.phase === "cleanup_pending") {
+					await removeCoordinatorFile(sessionFile(id));
 					await removeCoordinatorFile(sessionStateFile(namespaceDir, id));
 					await removeCoordinatorFile(activeTurnFile(namespaceDir, id));
 					await appendCoordinatorEvent(namespaceDir, {
