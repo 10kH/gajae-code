@@ -92,27 +92,33 @@ export declare class MacOSPowerAssertion {
 
 /** Retained no-follow authority for the SDK publication namespace. */
 export declare class NativeRetainedBrokerPublication {
-  observe(): NativeBrokerPublicationObservation
-  heartbeat(heartbeatAt: string): NativeBrokerPublicationOperation
   /**
-   * Async variant of [`Self::heartbeat`] scheduled on the libuv blocking
-   * pool. The positional write is a blocking `pwrite` against retained
-   * authority, so running it on the JS thread lets a stalled filesystem
-   * freeze the whole process -- including the timers that are supposed to
-   * notice the stall.
+   * Read-only observation. Deliberately synchronous: it is the authority
+   * boundary that must not admit an await between proof and effect. It reads
+   * descriptor identity only -- no write, no fsync -- and never takes the
+   * writer lock, so an unresolved heartbeat cannot block it.
+   */
+  observe(): NativeBrokerPublicationObservation
+  /**
+   * Positional heartbeat write on the libuv blocking pool. The write is an
+   * unbounded `pwrite` against retained authority: on the JS thread a stalled
+   * filesystem would freeze the whole process, including the timers that are
+   * supposed to notice the stall.
    */
   heartbeatAsync(heartbeatAt: string): Promise<NativeBrokerPublicationOperation>
-  sync(): NativeBrokerPublicationOperation
   /**
-   * Async variant of [`Self::sync`] scheduled on the libuv blocking pool.
-   * `fsync` is unbounded by design -- it returns when the device says so --
-   * so on the JS thread it can stop timers, signal handlers, and broker
-   * completion for as long as the filesystem is wedged.
+   * `fsync` on the libuv blocking pool. It returns when the device says so,
+   * which is never bounded, so it may not run on the JS thread either.
    */
   syncAsync(): Promise<NativeBrokerPublicationOperation>
   /**
-   * Close discovery, owner record, lock directory, and SDK root in that
-   * order.
+   * Give up discovery, owner record, lock directory, and SDK root authority.
+   *
+   * Detaches the handle without waiting for anything: an unresolved worker
+   * keeps its own `Arc` alive, observes the closed flag, and returns `closed`
+   * without committing, and the descriptors are released when that last
+   * reference drops on the pool thread. A shutdown blocked behind an
+   * unbounded write is exactly the wedge this must not reproduce.
    */
   close(): NativeBrokerPublicationOperation
 }
