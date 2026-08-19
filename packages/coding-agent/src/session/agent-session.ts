@@ -1042,6 +1042,8 @@ const PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = "Provider stream timed out while wait
 const WRAPPED_PROVIDER_FIRST_EVENT_TIMEOUT_ERROR = `Error: ${PROVIDER_FIRST_EVENT_TIMEOUT_ERROR}`;
 const PROVIDER_FIRST_EVENT_TIMEOUT_WITHOUT_ARTICLE_ERROR = "Provider stream timed out while waiting for first event";
 const BARE_DEFAULT_CODEX_OVERLOAD_ERROR = /^Codex error event(?:: .*)? \(code=server_is_overloaded(?:, [^)]+)*\)$/;
+/** Anthropic's typed capacity-overload `error.type`, the only overload code admitted below. */
+const ANTHROPIC_OVERLOADED_ERROR_TYPE = "overloaded_error";
 const KIMI_CODE_FIRST_EVENT_TIMEOUT_MESSAGES = {
 	"anthropic-messages": new Set([
 		PROVIDER_FIRST_EVENT_TIMEOUT_ERROR,
@@ -1110,6 +1112,40 @@ function isBareDefaultCodexOverload(message: AssistantMessage): boolean {
 	return (
 		message.api === "openai-codex-responses" &&
 		BARE_DEFAULT_CODEX_OVERLOAD_ERROR.test(message.errorMessage ?? "") &&
+		!hasBareDefaultRetryDisqualifyingFacts(message) &&
+		!assistantMessageHasVisibleOrToolContent(message)
+	);
+}
+
+/**
+ * True when the whole error message is Anthropic's own typed capacity-overload
+ * envelope. The provider's `overloaded_error` can arrive as a statusless SSE
+ * error event, so the envelope is the only structured evidence available: it is
+ * parsed as JSON and both the outer `type` and the nested `error.type` must
+ * match exactly. Prose is never inspected, so a message that merely mentions
+ * being overloaded cannot authorize a replay.
+ */
+function isAnthropicOverloadedEnvelope(errorMessage: string | undefined): boolean {
+	if (!errorMessage) return false;
+	const trimmed = errorMessage.trim();
+	if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return false;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return false;
+	}
+	if (typeof parsed !== "object" || parsed === null) return false;
+	if ((parsed as { type?: unknown }).type !== "error") return false;
+	const error = (parsed as { error?: unknown }).error;
+	if (typeof error !== "object" || error === null) return false;
+	return (error as { type?: unknown }).type === ANTHROPIC_OVERLOADED_ERROR_TYPE;
+}
+
+function isBareDefaultAnthropicOverload(message: AssistantMessage): boolean {
+	return (
+		message.api === "anthropic-messages" &&
+		isAnthropicOverloadedEnvelope(message.errorMessage) &&
 		!hasBareDefaultRetryDisqualifyingFacts(message) &&
 		!assistantMessageHasVisibleOrToolContent(message)
 	);
@@ -18284,21 +18320,24 @@ export class AgentSession {
 		if (!managedFallback && assistantMessageHasVisibleOrToolContent(message)) {
 			return false;
 		}
-		// Bare defaults retain their narrow watchdog and Codex admissions. A
-		// first-event timeout adds the typed, content-free, current-clean-scope
-		// requirement above; other transient watchdogs preserve legacy behavior.
+		// Bare defaults retain their narrow watchdog and provider capacity-overload
+		// admissions. A first-event timeout adds the typed, content-free,
+		// current-clean-scope requirement above; other transient watchdogs preserve
+		// legacy behavior. A provider overload is admitted only from that provider's
+		// own typed overload code on a content-free attempt carrying no conflicting
+		// transport facts, so replaying it cannot duplicate observable work.
 		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
-			const bareDefaultCodexOverload = isBareDefaultCodexOverload(message);
-			const canReplayCodexOverload = bareDefaultCodexOverload;
+			const canReplayProviderOverload =
+				isBareDefaultCodexOverload(message) || isBareDefaultAnthropicOverload(message);
 			if (
-				(!canReplayCodexOverload &&
+				(!canReplayProviderOverload &&
 					!this.#isTypedFirstEventTimeout(message) &&
 					!messageOnlyWatchdogTimeout &&
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
-				(!canReplayCodexOverload &&
+				(!canReplayProviderOverload &&
 					!firstEventTimeout &&
 					!messageOnlyWatchdogTimeout &&
 					!this.#hasCleanRetryReplaySafety)
