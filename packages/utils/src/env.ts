@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getConfigRootDir } from "./dirs";
+import { getAgentDir, getConfigRootDir, getTrustedHomeDir } from "./dirs";
 import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
@@ -51,7 +51,12 @@ type TrustedAgentEnvRead =
 	| { status: "ok"; values: Record<string, string> };
 
 function readTrustedAgentEnv(): TrustedAgentEnvRead {
-	const filePath = path.join(getAgentDir(), ".env");
+	let filePath: string;
+	try {
+		filePath = path.join(getAgentDir(), ".env");
+	} catch {
+		return { status: "unavailable", values: {} };
+	}
 	let fileDescriptor: number | undefined;
 	try {
 		const linkStats = fs.lstatSync(filePath);
@@ -101,20 +106,36 @@ const rejectProjectHome =
 	declaredHome !== undefined &&
 	runtimeHome !== undefined &&
 	(projectSnapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
-const trustedEnvHome = rejectProjectHome ? path.parse(process.cwd()).root : os.homedir();
+let trustedEnvHome: string | undefined;
+try {
+	trustedEnvHome = rejectProjectHome ? getTrustedHomeDir() : os.homedir();
+} catch {
+	// No trustworthy account home means no user credential files are trusted.
+	trustedEnvHome = undefined;
+}
 
 // Eagerly parse the trusted user's env files and the project .env (from cwd)
-const homeShellEnv = {
-	...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
-	...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
-	...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
-	...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
-	...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
-};
+const homeShellEnv = trustedEnvHome
+	? {
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zshenv")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zprofile")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".zshrc")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".bash_profile")),
+			...parseShellEnvFile(path.join(trustedEnvHome, ".bashrc")),
+		}
+	: {};
 const homeEnv =
-	path.resolve(trustedEnvHome) === path.resolve(process.cwd()) ? {} : parseEnvFile(path.join(trustedEnvHome, ".env"));
-const piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
-const agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
+	trustedEnvHome && path.resolve(trustedEnvHome) !== path.resolve(process.cwd())
+		? parseEnvFile(path.join(trustedEnvHome, ".env"))
+		: {};
+let piEnv: Record<string, string> = {};
+let agentEnv: Record<string, string> = {};
+try {
+	piEnv = parseEnvFile(path.join(getConfigRootDir(), ".env"));
+	agentEnv = parseEnvFile(path.join(getAgentDir(), ".env"));
+} catch {
+	// Keep credential resolution fail-closed when trusted user state is unavailable.
+}
 const initialTrustedAgentEnv = readTrustedAgentEnv();
 const projectLoadedEnv: Record<string, string | undefined> = Object.fromEntries(
 	Object.keys(projectEnv).map(key => [key, Bun.env[key]]),

@@ -234,6 +234,26 @@ if ($credentialEnv("HOME_TRUSTED_KEY") !== "trusted-home") throw new Error("non-
 			dir,
 		);
 	});
+
+	it("preserves inherited credentials when a hostile project HOME overlays the runtime HOME", () => {
+		if (process.platform === "win32") return;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-hostile-home-"));
+		const hostileHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-hostile-home-root-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, hostileHome, agentDir);
+		fs.writeFileSync(path.join(hostileHome, ".env"), "HOSTILE_HOME_CREDENTIAL=must-not-load\n");
+		fs.writeFileSync(path.join(dir, ".env"), "HOME=$HOSTILE_HOME\n");
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv } from ${JSON.stringify(envSourceUrl)};
+if ($credentialEnv("HOSTILE_HOME_CREDENTIAL") !== undefined) throw new Error("hostile HOME credential was loaded");
+if ($credentialEnv("PRESERVED_OPERATOR_CREDENTIAL") !== "operator-value") throw new Error("inherited credential was dropped");
+`,
+			{ HOME: hostileHome, GJC_CODING_AGENT_DIR: agentDir, PRESERVED_OPERATOR_CREDENTIAL: "operator-value" },
+			dir,
+		);
+	});
 	it("does not read provider credentials from the current project's .env overlay", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-"));
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));

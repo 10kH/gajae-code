@@ -184,6 +184,7 @@ function projectEnvSnapshot(cwd = process.cwd()): { values: Record<string, strin
 		for (const [key, value] of Object.entries(parseEnvFile(path.join(cwd, file)))) {
 			values[key] = value;
 			if (/[$`]/.test(value)) dynamic.add(key);
+			else dynamic.delete(key);
 		}
 	}
 	return { values, dynamic };

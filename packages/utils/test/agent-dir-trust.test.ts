@@ -20,6 +20,9 @@ const PROBE_VAR = "GJC_TRUST_PROBE_VALUE";
 
 interface Resolved {
 	agentDir: string;
+	configRoot: string;
+	pluginsDir: string;
+	pythonGatewayDir: string;
 	probeValue: string | null;
 }
 
@@ -152,5 +155,38 @@ describe("agent directory trust boundary", () => {
 			PI_CODING_AGENT_DIR: piDir,
 		});
 		expect(resolved.agentDir).toBe(gjcDir);
+	});
+
+	it("uses the static higher-precedence dotenv layer for agent and XDG resolution", async () => {
+		if (process.platform !== "linux") return;
+		const operatorAgent = agentDirWith("from-layered-operator-agent");
+		const home = tempDir();
+		const xdgState = tempDir();
+		const staticXdgState = tempDir();
+		const xdgData = tempDir();
+		const xdgCache = tempDir();
+		for (const root of [xdgState, xdgData, xdgCache]) fs.mkdirSync(path.join(root, "gjc"), { recursive: true });
+		const cwd = projectDir(
+			`GJC_CODING_AGENT_DIR=$LOWER_DYNAMIC\nGJC_CONFIG_DIR=.layered\nXDG_STATE_HOME=$LOWER_STATE\n`,
+		);
+		fs.writeFileSync(
+			path.join(cwd, ".env.local"),
+			"GJC_CODING_AGENT_DIR=/tmp/static-project-agent\nGJC_CONFIG_DIR=.layered-static\nXDG_STATE_HOME=" +
+				staticXdgState +
+				"\n",
+		);
+		const resolved = await resolveIn(cwd, {
+			HOME: home,
+			NODE_ENV: "production",
+			GJC_CODING_AGENT_DIR: operatorAgent,
+			GJC_CONFIG_DIR: ".operator-config",
+			XDG_STATE_HOME: xdgState,
+			XDG_DATA_HOME: xdgData,
+			XDG_CACHE_HOME: xdgCache,
+		});
+		expect(resolved.agentDir).toBe(operatorAgent);
+		expect(resolved.configRoot).toBe(path.join(home, ".operator-config"));
+		expect(resolved.pythonGatewayDir).toBe(path.join(operatorAgent, "python-gateway"));
+		expect(resolved.pluginsDir).toBe(path.join(home, ".operator-config", "plugins"));
 	});
 });
