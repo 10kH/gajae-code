@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getAgentDir, getConfigRootDir, getTrustedHomeDir } from "./dirs";
+import { canonicalEnvKey, getAgentDir, getConfigRootDir, getTrustedHomeDir } from "./dirs";
 import { isSafeEnvName, isSafeEnvValue } from "./spawn-env";
 
 export { filterProcessEnv, isSafeEnvName, isSafeEnvValue } from "./spawn-env";
@@ -27,7 +27,10 @@ function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string
 	const dynamic = new Set<string>();
 	for (const file of files) {
 		const parsed = parseEnvFile(path.join(cwd, file));
-		for (const [key, value] of Object.entries(parsed)) {
+		for (const [rawKey, value] of Object.entries(parsed)) {
+			// Windows environment names are case-insensitive, so the guard lookups
+			// below must see the same key Bun loaded into `process.env`.
+			const key = canonicalEnvKey(rawKey);
 			values[key] = value;
 			// Track dynamic provenance only for the winning declaration.
 			if (/[$`]/.test(value)) dynamic.add(key);
@@ -39,7 +42,7 @@ function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string
 
 function resolveFileEnvValue(file: Record<string, string>, name: string): string | undefined {
 	if (!isSafeEnvName(name)) return undefined;
-	const value = file[name];
+	const value = file[canonicalEnvKey(name)];
 	if (value === undefined || !isSafeEnvValue(value)) return undefined;
 	const trimmed = value.trim();
 	return trimmed.length > 0 ? trimmed : undefined;
@@ -87,7 +90,8 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 		// its runtime value. Exclude those from the credential-only snapshot while
 		// keeping them available through $env.
 		const projectValue = resolveFileEnvValue(projectEnv, key);
-		if (projectValue !== undefined && (projectSnapshot.dynamic.has(key) || projectValue === value)) continue;
+		if (projectValue !== undefined && (projectSnapshot.dynamic.has(canonicalEnvKey(key)) || projectValue === value))
+			continue;
 
 		result[key] = value;
 	}
@@ -100,12 +104,13 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 const projectSnapshot = loadProjectEnv();
 const projectEnv = projectSnapshot.values;
 const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
-const declaredHome = projectEnv[authoritativeHomeKey];
+const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
+const declaredHome = projectEnv[declaredHomeKey];
 const runtimeHome = process.env[authoritativeHomeKey];
 const rejectProjectHome =
 	declaredHome !== undefined &&
 	runtimeHome !== undefined &&
-	(projectSnapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
+	(projectSnapshot.dynamic.has(declaredHomeKey) || declaredHome === runtimeHome);
 let trustedEnvHome: string | undefined;
 try {
 	trustedEnvHome = rejectProjectHome ? getTrustedHomeDir() : os.homedir();
@@ -166,11 +171,11 @@ function resolveLiveCredentialEnvValue(name: string): string | undefined {
 	if (trimmed.length === 0) return undefined;
 
 	if (
-		Object.hasOwn(projectEnv, name) &&
+		Object.hasOwn(projectEnv, canonicalEnvKey(name)) &&
 		resolveFileEnvValue(inheritedEnv, name) === undefined &&
-		(projectSnapshot.dynamic.has(name) ||
+		(projectSnapshot.dynamic.has(canonicalEnvKey(name)) ||
 			trimmed === resolveFileEnvValue(projectEnv, name) ||
-			trimmed === projectLoadedEnv[name])
+			trimmed === projectLoadedEnv[canonicalEnvKey(name)])
 	) {
 		return undefined;
 	}

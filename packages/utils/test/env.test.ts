@@ -254,6 +254,27 @@ if ($credentialEnv("PRESERVED_OPERATOR_CREDENTIAL") !== "operator-value") throw 
 			dir,
 		);
 	});
+	it("keeps POSIX environment names case-sensitive when folding Windows declarations", () => {
+		if (process.platform === "win32") return;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-case-"));
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-case-home-"));
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-agent-"));
+		tempDirs.push(dir, home, agentDir);
+		fs.writeFileSync(path.join(home, ".env"), "HOME_TRUSTED_KEY=trusted-home\n");
+		// On POSIX `home` and `HOME` are distinct variables, so a lowercase
+		// declaration must not make the authoritative home ambiguous. Folding it
+		// would drop the trusted home's credentials on every POSIX host.
+		fs.writeFileSync(path.join(dir, ".env"), "home=$ATTACKER_HOME\n");
+		const envSourceUrl = pathToFileURL(path.resolve(import.meta.dir, "../src/env.ts")).href;
+		runEnvIsolationScript(
+			`
+import { $credentialEnv } from ${JSON.stringify(envSourceUrl)};
+if ($credentialEnv("HOME_TRUSTED_KEY") !== "trusted-home") throw new Error("lowercase home declaration folded into HOME on POSIX");
+`,
+			{ HOME: home, GJC_CODING_AGENT_DIR: agentDir },
+			dir,
+		);
+	});
 	it("does not read provider credentials from the current project's .env overlay", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-credential-"));
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-utils-env-home-"));

@@ -169,6 +169,17 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
 	return trimmed;
 }
 
+/**
+ * Windows environment variable names are case-insensitive, so a project dotenv
+ * line `userprofile=...` is what `process.env.USERPROFILE` resolves to. Every
+ * provenance lookup here is spelled in upper case, so the snapshot must be
+ * keyed the same way or the declaration is invisible to the guard while still
+ * being live in the process. POSIX names are case-sensitive and must not fold.
+ */
+export function canonicalEnvKey(name: string): string {
+	return process.platform === "win32" ? name.toUpperCase() : name;
+}
+
 function projectEnvSnapshot(cwd = process.cwd()): { values: Record<string, string>; dynamic: Set<string> } {
 	const nodeEnv = process.env.NODE_ENV;
 	const validNodeEnv = nodeEnv && /^[A-Za-z0-9_-]+$/.test(nodeEnv) ? nodeEnv : undefined;
@@ -181,7 +192,8 @@ function projectEnvSnapshot(cwd = process.cwd()): { values: Record<string, strin
 	const values: Record<string, string> = {};
 	const dynamic = new Set<string>();
 	for (const file of files) {
-		for (const [key, value] of Object.entries(parseEnvFile(path.join(cwd, file)))) {
+		for (const [rawKey, value] of Object.entries(parseEnvFile(path.join(cwd, file)))) {
+			const key = canonicalEnvKey(rawKey);
 			values[key] = value;
 			if (/[$`]/.test(value)) dynamic.add(key);
 			else dynamic.delete(key);
@@ -213,8 +225,9 @@ function trustedValue(
 ): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
-	const projectValue = project.values[name];
-	if (projectValue !== undefined && (project.dynamic.has(name) || projectValue === value)) return undefined;
+	const key = canonicalEnvKey(name);
+	const projectValue = project.values[key];
+	if (projectValue !== undefined && (project.dynamic.has(key) || projectValue === value)) return undefined;
 	return value;
 }
 
@@ -280,7 +293,8 @@ class DirResolver {
 			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", snapshot)) ??
 			CONFIG_DIR_NAME;
 		const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
-		const declaredHome = snapshot.values[authoritativeHomeKey];
+		const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
+		const declaredHome = snapshot.values[declaredHomeKey];
 		// Only the platform-authoritative variable can select the trusted home.
 		// In particular, do not let the opposite platform variable (or a project
 		// dotenv value overlaid into it) redirect user state when this is absent.
@@ -294,7 +308,7 @@ class DirResolver {
 		// genuinely env-independent.
 		const independentAccountHome = accountHome !== undefined && accountHome !== runtimeHome ? accountHome : undefined;
 		const ambiguousHome =
-			declaredHome !== undefined && (snapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
+			declaredHome !== undefined && (snapshot.dynamic.has(declaredHomeKey) || declaredHome === runtimeHome);
 		this.#trustedHome = ambiguousHome
 			? (independentAccountHome ?? path.parse(process.cwd()).root)
 			: (runtimeHome ??
@@ -367,7 +381,7 @@ class DirResolver {
 	}
 
 	isProjectEnvDeclaration(name: string): boolean {
-		return Object.hasOwn(this.#projectEnv.values, name);
+		return Object.hasOwn(this.#projectEnv.values, canonicalEnvKey(name));
 	}
 
 	/** Config-root subdirectory, with optional XDG override. */
