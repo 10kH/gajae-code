@@ -305,6 +305,29 @@ describe("authoritative home resolution", () => {
 		expect(probed.after.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
 	});
 
+	it("keeps an inherited agent dir off XDG at startup when it equals the default path", async () => {
+		// An agent directory inherited from the environment names one directory. If
+		// eligibility were decided by path equality alone, an override that happens
+		// to equal `<home>/.gjc/agent` would be routed into `$XDG_DATA_HOME/gjc` from
+		// the very first resolution: `getAgentDir()` would report the named directory
+		// while `agent.db` lived somewhere else entirely.
+		//
+		// `setAgentDir()` is the opposite statement -- it re-selects the default
+		// profile, XDG included -- and that contract stays pinned by
+		// `dirs-python-gateway.test.ts`.
+		const home = await tempDir();
+		const xdgDataHome = await tempDir();
+		await fs.mkdir(path.join(xdgDataHome, "gjc"), { recursive: true });
+		const override = path.join(home, CONFIG_DIR_NAME, "agent");
+		await fs.mkdir(override, { recursive: true });
+
+		const probed = await probe({ agentDirOverride: override, secondHome: await tempDir(), home, xdgDataHome });
+
+		expect(probed.before.agentDir).toBe(override);
+		expect(probed.before.agentDb).toBe(path.join(override, "agent.db"));
+		expect(probed.before.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
+	});
+
 	it("honors an explicit non-authoritative home for plugins without moving the resolver", async () => {
 		// `getPluginsDir(home)` is the documented escape hatch for callers that
 		// carry their own home. It must not disturb the authoritative resolution.
