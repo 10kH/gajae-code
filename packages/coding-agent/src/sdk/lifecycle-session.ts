@@ -34,6 +34,12 @@ export type CreateLifecycleAgentSessionOptions = Omit<CreateAgentSessionOptions,
 	 * selector, forwarded as {@link CreateAgentSessionOptions.modelPattern} so
 	 * the session resolves it through the same staged selector resolver the CLI
 	 * `--model` flag uses (after extension providers register).
+	 *
+	 * Resolution is strict: if this child's registry cannot resolve the pin to
+	 * exactly this model, construction fails and the partial session is
+	 * disposed instead of continuing into startup profile application, which
+	 * would otherwise activate `modelProfile.default`/`mpreset` while the
+	 * coordinator reports the requested pin.
 	 */
 	modelId?: string;
 	/**
@@ -76,6 +82,27 @@ export async function createLifecycleAgentSession(
 			[lifecycleMcpStartupTimeoutOption]?: number;
 		};
 		const result = await createAgentSession(internalOptions);
+		// Explicit model pin (#4707) is a guarantee, not a preference. The
+		// coordinator validated the selector against its own registry; this child
+		// owns the registry that actually serves requests, and the two can drift
+		// (a model removed, a provider disabled, an extension that failed to
+		// register). On drift `createAgentSession` returns a session with no model
+		// plus a fallback warning, and the startup profile pass that runs next
+		// would activate `modelProfile.default`/`mpreset` instead — publishing
+		// success on a model the caller never asked for. Fail before readiness and
+		// before any profile application, and dispose the partial session.
+		if (modelId !== undefined) {
+			const active = result.session.model;
+			const activeSelector = active ? `${active.provider}/${active.id}` : undefined;
+			if (!activeSelector || activeSelector.toLowerCase() !== modelId.toLowerCase()) {
+				await result.session.dispose().catch(() => {});
+				throw new Error(
+					`Model "${modelId}" not found. Use --list-models to see available models.${
+						activeSelector ? ` Session resolved ${activeSelector} instead.` : ""
+					}`,
+				);
+			}
+		}
 		if (!result.session.extensionRunner)
 			capability.settleFailure(capability.normalizeFailure("registration", "runner_absent"));
 		if (!result.startDeferredMemoryBackend)

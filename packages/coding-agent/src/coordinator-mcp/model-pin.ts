@@ -1,5 +1,6 @@
+import type { AuthStorage } from "@gajae-code/ai/core";
 import { ModelRegistry } from "../config/model-registry";
-import { type ResolveCliModelResult, resolveCliModel } from "../config/model-resolver";
+import { formatModelString, type ResolveCliModelResult, resolveCliModel } from "../config/model-resolver";
 import { discoverAuthStorage } from "../sdk/session";
 
 const MAX_ECHOED_MODEL_LENGTH = 256;
@@ -15,23 +16,34 @@ const MAX_ECHOED_MODEL_LENGTH = 256;
  */
 export type CoordinatorModelRegistryLoader = () => ModelRegistry | Promise<ModelRegistry>;
 
-let cachedRegistry: Promise<ModelRegistry> | undefined;
-
 /**
- * Default loader: one offline-refreshed registry per coordinator process.
- * `refresh("offline")` reuses the on-disk discovery cache and never performs
- * network I/O, so validating a pin cannot hang a coordinator tool call; the
- * spawned session host still owns live discovery and final application.
+ * Builds a loader that keeps one registry instance per coordinator process and
+ * re-refreshes it on every validation. `refresh("offline")` reuses the on-disk
+ * discovery cache and never performs network I/O, so validating a pin cannot
+ * hang a coordinator tool call; the spawned session host still owns live
+ * discovery and final application.
+ *
+ * The refresh is per validation rather than once per process: a permanently
+ * cached snapshot would keep rejecting models added after the first pin and —
+ * worse — keep accepting models removed since, handing a prevalidated selector
+ * to a child that can no longer resolve it.
  */
-export const loadCoordinatorModelRegistry: CoordinatorModelRegistryLoader = () => {
-	cachedRegistry ??= (async () => {
-		const storage = await discoverAuthStorage();
-		const registry = new ModelRegistry(storage);
+export function createCoordinatorModelRegistryLoader(
+	discoverStorage: () => Promise<AuthStorage>,
+): CoordinatorModelRegistryLoader {
+	let cachedRegistry: Promise<ModelRegistry> | undefined;
+	return async () => {
+		cachedRegistry ??= discoverStorage().then(storage => new ModelRegistry(storage));
+		const registry = await cachedRegistry;
 		await registry.refresh("offline");
 		return registry;
-	})();
-	return cachedRegistry;
-};
+	};
+}
+
+/** Default coordinator registry loader, bound to this host's auth storage. */
+export const loadCoordinatorModelRegistry: CoordinatorModelRegistryLoader = createCoordinatorModelRegistryLoader(() =>
+	discoverAuthStorage(),
+);
 
 export type CoordinatorModelResolution =
 	| { ok: true; model: string | null }
@@ -44,12 +56,17 @@ export type CoordinatorModelResolution =
  * Only an absent (`undefined`/`null`) value is a no-op (`model: null`); any
  * other value that fails to resolve is a caller error and is rejected rather
  * than silently launching on the default resolution. The resolved value is the
- * canonical `provider/model` selector `resolveCliModel` returns (including any
- * thinking suffix the id itself encodes), so `cursor/claude-fable-5-xhigh`
- * pins exactly the variant the CLI would select. Unknown ids fail closed with
- * the CLI's `Model "..." not found. Use --list-models ...` error before any
- * broker mutation or idempotency record, so no session is ever created on a
- * different model.
+ * concrete `provider/id` of the model `resolveCliModel` selects, so
+ * `cursor/claude-fable-5-xhigh` pins exactly the variant the CLI would select
+ * and the child re-resolves an unambiguous exact reference rather than a
+ * canonical alias whose local ranking could pick a different variant. That
+ * concrete form is also what the child asserts against its own registry, so
+ * registry drift between coordinator and child is a hard failure rather than a
+ * silent substitution.
+ *
+ * Unknown ids fail closed with the CLI's `Model "..." not found. Use
+ * --list-models ...` error before any broker mutation or idempotency record,
+ * so no session is ever created on a different model.
  */
 export async function resolveCoordinatorModel(
 	raw: unknown,
@@ -67,6 +84,5 @@ export async function resolveCoordinatorModel(
 			model: echoed,
 			error: resolved.error ?? "No models available. Check your installation or add models to models.json.",
 		};
-	const selector = resolved.selector ?? `${resolved.model.provider}/${resolved.model.id}`;
-	return { ok: true, model: selector };
+	return { ok: true, model: formatModelString(resolved.model) };
 }
