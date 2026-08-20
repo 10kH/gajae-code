@@ -384,7 +384,7 @@ interface AttachedRuntimeHarness {
 	/** Fires one reconcile pass, exactly as the runtime's own interval does. */
 	reconcile: () => void;
 	/** Waits for the real router to finish delivery and advance a sequence cursor. */
-	awaitFrameSettlement: (seq: number) => Promise<void>;
+	awaitFrameSettlement: (generation: number, seq: number, count?: number) => Promise<void>;
 	/** Supersedes the indexed attachment with a newer endpoint generation. */
 	supersede: () => Promise<void>;
 }
@@ -426,12 +426,15 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 
 		const provider = new FakeSlackProvider();
 		let reconcileTick: (() => void) | undefined;
-		const settledSequences = new Set<number>();
-		const settlementWaiters = new Map<number, PromiseWithResolvers<void>>();
-		const awaitFrameSettlement = async (seq: number): Promise<void> => {
-			if (settledSequences.has(seq)) return;
+		const settledSequences = new Map<string, number>();
+		const settlementWaiters = new Map<string, Array<{ count: number; waiter: PromiseWithResolvers<void> }>>();
+		const awaitFrameSettlement = async (generation: number, seq: number, count = 1): Promise<void> => {
+			const key = `${generation}:${seq}`;
+			if ((settledSequences.get(key) ?? 0) >= count) return;
 			const waiter = Promise.withResolvers<void>();
-			settlementWaiters.set(seq, waiter);
+			const waiters = settlementWaiters.get(key) ?? [];
+			waiters.push({ count, waiter });
+			settlementWaiters.set(key, waiters);
 			await waiter.promise;
 		};
 		runtime = new ChatDaemonRuntime(
@@ -453,12 +456,24 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 			{
 				createSlackProvider: () => provider,
 				routerDeps: {
-					onFrameSettled: (_attachment, frame) => {
+					onFrameSettled: (attachment, frame) => {
 						const seq = typeof frame.seq === "number" && Number.isSafeInteger(frame.seq) ? frame.seq : undefined;
 						if (seq === undefined) return;
-						settledSequences.add(seq);
-						settlementWaiters.get(seq)?.resolve();
-						settlementWaiters.delete(seq);
+						const key = `${attachment.generation}:${seq}`;
+						const count = (settledSequences.get(key) ?? 0) + 1;
+						settledSequences.set(key, count);
+						const pending = settlementWaiters.get(key);
+						if (pending) {
+							const remaining = pending.filter(entry => {
+								if (entry.count <= count) {
+									entry.waiter.resolve();
+									return false;
+								}
+								return true;
+							});
+							if (remaining.length === 0) settlementWaiters.delete(key);
+							else settlementWaiters.set(key, remaining);
+						}
 					},
 					setInterval: ((callback: () => void) => {
 						reconcileTick = callback;
@@ -1563,7 +1578,7 @@ test("an ambiguously acknowledged publication is not posted twice when reconcili
 			host.emit("two");
 			await awaitPosts(provider, 2);
 			await awaitReconciliationFailures(provider, 1);
-			await awaitFrameSettlement(2);
+			await awaitFrameSettlement(GENERATION, 2);
 
 			host.drop();
 			reconcile();
@@ -1625,54 +1640,57 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 }, 20_000);
 
 test("a rolled endpoint's first frame gets its own delivery budget, not the previous generation's", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile, supersede }) => {
-		await withSerializedFakeTransport(async () => {
-			const host = new FakeSessionHost();
-			const starting = runtime.start();
-			host.accept(await awaitSocket(1));
-			await starting;
+	await withAttachedSessionRuntime(
+		async ({ runtime, provider, warnings, reconcile, supersede, awaitFrameSettlement }) => {
+			await withSerializedFakeTransport(async () => {
+				const host = new FakeSessionHost();
+				const starting = runtime.start();
+				host.accept(await awaitSocket(1));
+				await starting;
 
-			// Two rounds spent on this generation's seq 1 — one short of conceding it.
-			provider.failPosts = 2;
-			host.emit("old one");
-			await awaitRefusals(provider, 1);
-			await Bun.sleep(50);
-			reconcile();
-			host.accept(await awaitSocket(2));
-			await awaitRefusals(provider, 2);
-			await Bun.sleep(50);
+				// Two rounds spent on this generation's seq 1 — one short of conceding it.
+				provider.failPosts = 2;
+				host.emit("old one");
+				await awaitRefusals(provider, 1);
+				await Bun.sleep(50);
+				reconcile();
+				host.accept(await awaitSocket(2));
+				await awaitRefusals(provider, 2);
+				await awaitFrameSettlement(GENERATION, 1, 2);
+				await Bun.sleep(50);
 
-			// The endpoint rolls, so the replacement attachment opens a fresh sequence space
-			// whose seq 1 is a different frame. The rounds the old stream spent buy it
-			// nothing: charging them here would concede a frame refused exactly once.
-			await supersede();
-			host.roll();
-			provider.failPosts = 1;
-			reconcile();
-			host.accept(await awaitSocket(3));
-			await awaitReplayRequests(host, 3);
-			host.emit("new one");
-			await awaitRefusals(provider, 3);
-			await Bun.sleep(50);
-			expect(warnings.filter(line => line.includes("conceded seq"))).toEqual([]);
-			expect(warnings).toContain(
-				`chat daemon replay barrier failed (publication failed at seq 1 (slack provider is unavailable)); rebuilding session ${SESSION_ID} at generation ${GENERATION + 1} from seq 0.`,
-			);
+				// The endpoint rolls, so the replacement attachment opens a fresh sequence space
+				// whose seq 1 is a different frame. The rounds the old stream spent buy it
+				// nothing: charging them here would concede a frame refused exactly once.
+				await supersede();
+				host.roll();
+				provider.failPosts = 1;
+				reconcile();
+				host.accept(await awaitSocket(3));
+				await awaitReplayRequests(host, 3);
+				host.emit("new one");
+				await awaitRefusals(provider, 3);
+				await Bun.sleep(50);
+				expect(warnings.filter(line => line.includes("conceded seq"))).toEqual([]);
+				expect(warnings).toContain(
+					`chat daemon replay barrier failed (publication failed at seq 1 (slack provider is unavailable)); rebuilding session ${SESSION_ID} at generation ${GENERATION + 1} from seq 0.`,
+				);
 
-			// Refused once, so it still sits above the cursor and the rebuild re-serves it.
-			reconcile();
-			host.accept(await awaitSocket(4));
-			await awaitPosts(provider, 1);
-			await Bun.sleep(20);
-			expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\nnew one"]);
-			expect(host.replayRequests).toEqual([
-				{ sinceGeneration: GENERATION, sinceSeq: 0 },
-				{ sinceGeneration: GENERATION, sinceSeq: 0 },
-				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
-				{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
-			]);
-		});
-	});
+				// Refused once, so it still sits above the cursor and the rebuild re-serves it.
+				reconcile();
+				host.accept(await awaitSocket(4));
+				await awaitPosts(provider, 1);
+				await Bun.sleep(20);
+				expect(provider.posts.map(post => post.text)).toEqual(["GJC notice\nnew one"]);
+				expect(host.replayRequests).toEqual([
+					{ sinceGeneration: GENERATION, sinceSeq: 0 },
+					{ sinceGeneration: GENERATION, sinceSeq: 0 },
+					{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
+					{ sinceGeneration: GENERATION + 1, sinceSeq: 0 },
+				]);
+			});
+		},
+	);
 }, 20_000);
 test("a frame queued behind a failed publication cannot advance the cursor past it", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
