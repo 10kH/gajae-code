@@ -172,6 +172,22 @@ describe("Anthropic truncated tool calls", () => {
 		expect(result.stopReason).toBe("error");
 	});
 
+	it("marks a complete duplicate-index orphan non-executable before the integrity error", async () => {
+		const result = await run([
+			messageStart("msg_complete_orphan"),
+			toolStart(0, "tool_complete_orphan"),
+			toolDelta(0, '{"path":"orphan.ts"}'),
+			toolStart(0, "tool_replacement"),
+		]);
+
+		const tools = toolCalls(result);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("reused an active content block index");
+		expect(tools).toHaveLength(2);
+		expect(tools[0]).toMatchObject({ incompleteArguments: true, incompleteArgumentsReason: "ambiguous" });
+		expect(tools[1]).toMatchObject({ incompleteArguments: true, incompleteArgumentsReason: "ambiguous" });
+	});
+
 	it("does not parse a replacement call after a duplicate index aborts the stream", async () => {
 		const result = await run([
 			messageStart("msg_same_id_tool_use"),

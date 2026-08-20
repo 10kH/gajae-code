@@ -2053,9 +2053,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const trackBlockByAnthropicIndex = (anthropicIndex: number, block: Block) => {
 				const orphaned = blocksByAnthropicIndex.get(anthropicIndex);
 				if (orphaned) {
-					if (orphaned.type === "toolCall" && !isCompleteJson(orphaned.partialJson)) {
+					if (orphaned.type === "toolCall") {
 						orphaned.incompleteArguments = true;
-						orphaned.incompleteArgumentsReason = "truncated";
+						orphaned.incompleteArgumentsReason = "ambiguous";
 						truncatedToolCalls.add(orphaned);
 					}
 					if (block.type === "toolCall") {
