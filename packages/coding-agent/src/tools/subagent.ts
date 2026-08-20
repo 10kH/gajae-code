@@ -767,11 +767,18 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (!attachLiveProgress) return {};
 		const liveProgressAvailable = manager.hasLiveSubagent(record.subagentId);
 		if (!liveProgressAvailable) return { liveProgressAvailable: false };
-		// AgentProgress includes model-generated deltas, tool arguments, nested
-		// task details, and arbitrary tool output. None is an approved public
-		// subagent payload, so await receipts expose only liveness. Terminal public
-		// output continues through the bounded result/error receipt and agent://.
-		return { liveProgressAvailable: true };
+		// `progress` is renderer-only. It travels in `details`, which the await
+		// panel consumes to show the user what their own subagent is doing; the
+		// model-visible `content` is `awaitProgressSummary()`, which emits nothing
+		// but counts, duration and ids. So the model-deltas/tool-arguments concern
+		// does not apply to this field on this path -- dropping it only blanked the
+		// live panel and made the emit signature constant. Terminal public output
+		// still goes through the bounded result/error receipt and agent://.
+		const progress = manager.getSubagentProgress(record.subagentId);
+		return {
+			liveProgressAvailable: true,
+			...(progress ? { progress } : {}),
+		};
 	}
 
 	#recordSnapshot(

@@ -744,3 +744,52 @@ describe("subagent await emit gating", () => {
 		await manager.dispose({ timeoutMs: 100 });
 	});
 });
+
+describe("subagent await progress visibility boundary", () => {
+	afterEach(() => {
+		AsyncJobManager.resetForTests();
+	});
+
+	it("carries live progress in details for the renderer and never in model-visible content", async () => {
+		// This boundary is why `progress` is safe to carry, and it is the fact a
+		// previous change got wrong: the renderer reads `details`, while the model
+		// only ever sees `content`, which `awaitProgressSummary()` builds from
+		// counts, duration and ids alone. Removing the field on the belief that it
+		// reached the model blanked the live panel and froze the emit signature.
+		// Pin the boundary so that conclusion cannot be drawn from the field's
+		// shape again.
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const jobId = manager.register(
+			"task",
+			"visibility subagent",
+			async () => {
+				await Bun.sleep(150);
+				return "done";
+			},
+			{
+				id: "job-vis",
+				ownerId: "0-Main",
+				metadata: { subagent: { id: "0-Vis", agent: "executor", agentSource: "bundled" } },
+			},
+		);
+		manager.registerSubagentRecord(runningRecord("0-Vis", jobId));
+		manager.recordSubagentProgress(
+			"0-Vis",
+			makeProgress({ id: "0-Vis", currentTool: "read", recentOutput: ["secret-marker-text"] }),
+		);
+
+		const result = await tool.execute("await", { action: "await", ids: ["0-Vis"], timeout_ms: 5 });
+
+		const snap = result.details?.subagents.find(s => s.id === "0-Vis");
+		expect(snap?.progress?.currentTool).toBe("read");
+		expect(snap?.progress?.recentOutput).toContain("secret-marker-text");
+
+		const modelText = result.content.map(part => ("text" in part ? part.text : "")).join("\n");
+		expect(modelText).not.toContain("secret-marker-text");
+		expect(modelText).toContain("0-Vis");
+
+		manager.cancelSubagent("0-Vis", { ownerId: "0-Main" });
+		await manager.dispose({ timeoutMs: 100 });
+	});
+});
