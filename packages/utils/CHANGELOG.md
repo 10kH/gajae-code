@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+- Crash journal and postmortem support for the opt-in upstream relay: relayed-upstream transitions are journaled and indexed, with bounded queues and LRU-bounded handled-error dedupe.
+
+### Fixed
+- Postmortem tests no longer write into the real crash store; they isolate into a fresh store per run.
+- Rotating agent environment credentials reload correctly and rotation writes are hardened against partial reads.
+
 ## [0.14.1] - 2026-08-18
 
 ## [0.14.0] - 2026-08-17

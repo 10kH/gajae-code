@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+- A steer that interrupts an in-flight tool is delivered instead of dropped, and the remaining abort-race gaps in steer-after-tool-interrupt are closed; a live subagent await ends when user steering arrives.
+- The escaped-non-ASCII em-dash exemption is bounded to display-only tools (#4627).
+
 ## [0.14.1] - 2026-08-18
 - Compaction pruning no longer kills the turn when a persisted `toolCall.arguments` is `null`. Sessions written by an earlier cold-spill eviction path store `null` where the spill sentinel belongs, and the staleness index dereferenced that payload unguarded, so reloading such a session threw `null is not an object (evaluating 'args.path')` as a turn-fatal error instead of skipping the one unusable call. `ToolCall.arguments` is typed non-nullable, so no type check flagged the gap. Every read of a persisted argument bag — path extraction, `apply_patch` header parsing, idempotent-bash keys, and search target keys — now treats a non-object payload as absent. The original arguments are not lost: the eviction marker still names the blob and rehydration restores them.
 
