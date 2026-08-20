@@ -742,10 +742,14 @@ export async function writethroughNoop(
 	dst: string,
 	content: string,
 	_signal?: AbortSignal,
-	_file?: BunFile,
+	file?: BunFile,
 	_batch?: LspWritethroughBatchRequest,
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
+	if (file !== undefined) {
+		file.write(content);
+		return undefined;
+	}
 	await writeFileAtomically(dst, content);
 	return undefined;
 }
@@ -903,7 +907,7 @@ async function runLspWritethrough(
 	cwd: string,
 	options: ResolvedWritethroughOptions,
 	signal?: AbortSignal,
-	_file?: BunFile,
+	file?: BunFile,
 	deferred?: {
 		onDeferredDiagnostics: (diagnostics: FileDiagnosticsResult) => void;
 		signal: AbortSignal;
@@ -913,7 +917,7 @@ async function runLspWritethrough(
 	const config = getConfig(cwd);
 	const servers = getServersForFile(config, dst);
 	if (servers.length === 0) {
-		return writethroughNoop(dst, content, signal, _file);
+		return writethroughNoop(dst, content, signal, file);
 	}
 	const { lspServers, customLinterServers } = splitServers(servers);
 
@@ -921,11 +925,18 @@ async function runLspWritethrough(
 	let publishedContent = false;
 	const writeContent = async (value: string) => {
 		try {
-			await writeFileAtomically(dst, value);
+			if (file !== undefined) file.write(value);
+			else await writeFileAtomically(dst, value);
 			publishedContent = true;
 		} catch (error) {
-			if (publishedContent && error instanceof FileWriteNotPublishedError) {
-				throw new FileWriteNotPublishedError(dst, error.cause, { destUnchanged: false });
+			if (error instanceof FileWriteNotPublishedError) {
+				if (publishedContent) {
+					throw new FileWriteNotPublishedError(dst, error.cause, {
+						destUnchanged: false,
+						publicationState: "published",
+					});
+				}
+				throw error;
 			}
 			throw error;
 		}
@@ -994,7 +1005,8 @@ async function runLspWritethrough(
 				});
 			}
 		});
-	} catch {
+	} catch (error) {
+		if (error instanceof FileWriteNotPublishedError) throw error;
 		if (timedOut) {
 			formatter = undefined;
 			diagnostics = undefined;

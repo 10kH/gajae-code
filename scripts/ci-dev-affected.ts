@@ -65,6 +65,11 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // replace, direct-basename test selection and owner fallback tasks.
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
+	"packages/coding-agent/src/tools/atomic-file-write.ts": ["packages/coding-agent/test/file-tools-atomicity.test.ts"],
+	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
+	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
+	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
+	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
 	"packages/ai/src/providers/anthropic.ts": [
 		"packages/ai/test/anthropic-truncated-toolcall.test.ts",
 		"packages/ai/test/anthropic-stream-envelope.test.ts",

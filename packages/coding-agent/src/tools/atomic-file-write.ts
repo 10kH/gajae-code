@@ -32,6 +32,10 @@ import { hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/
 
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
+const WINDOWS_RENAME_BACKOFF_MS = [10, 25, 50, 100, 200] as const;
+const WINDOWS_SHARING_VIOLATION_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+
+export type FileWritePublicationState = "not_published" | "published" | "unknown";
 
 interface ExistingFileMetadata {
 	mode: number;
@@ -50,13 +54,19 @@ interface ResolvedPublishPath {
 export class FileWriteNotPublishedError extends Error {
 	readonly dest: string;
 	readonly destUnchanged: boolean;
+	readonly publicationState: FileWritePublicationState;
 	override readonly cause: unknown;
-	constructor(dest: string, cause: unknown, options: { destUnchanged?: boolean } = {}) {
+	constructor(
+		dest: string,
+		cause: unknown,
+		options: { destUnchanged?: boolean; publicationState?: FileWritePublicationState } = {},
+	) {
 		const destUnchanged = options.destUnchanged ?? true;
 		super(formatFileWriteError(cause, dest, { destUnchanged }));
 		this.name = "FileWriteNotPublishedError";
 		this.dest = dest;
 		this.destUnchanged = destUnchanged;
+		this.publicationState = options.publicationState ?? (destUnchanged ? "not_published" : "unknown");
 		this.cause = cause;
 		if (isFsError(cause)) {
 			(this as Error & { code?: string }).code = cause.code;
@@ -91,6 +101,10 @@ export interface WriteFileAtomicallyOptions {
 	 * `<tmpdir>/gjc-local/<session-id>`.
 	 */
 	trustBoundary?: string;
+	/** Platform override used by deterministic retry tests. */
+	platform?: NodeJS.Platform;
+	/** Sleep seam used by deterministic retry tests. */
+	sleep?: (delayMs: number) => Promise<void>;
 }
 
 function tempPathFor(dest: string): string {
@@ -217,6 +231,98 @@ async function cleanupOwnedTemp(tmp: string, cause: unknown): Promise<void> {
 	}
 }
 
+function isWindowsSharingViolation(error: unknown): boolean {
+	return isFsError(error) && WINDOWS_SHARING_VIOLATION_CODES.has(error.code);
+}
+
+async function renameIntoPlace(
+	from: string,
+	to: string,
+	platform: NodeJS.Platform,
+	sleep: (delayMs: number) => Promise<void>,
+): Promise<void> {
+	try {
+		await fs.rename(from, to);
+		return;
+	} catch (error) {
+		if (platform !== "win32" || !isWindowsSharingViolation(error)) throw error;
+		let lastError: unknown = error;
+		for (const delay of WINDOWS_RENAME_BACKOFF_MS) {
+			await sleep(delay);
+			try {
+				await fs.rename(from, to);
+				return;
+			} catch (retryError) {
+				lastError = retryError;
+				if (!isWindowsSharingViolation(retryError)) throw retryError;
+			}
+		}
+		throw lastError;
+	}
+}
+
+/**
+ * Windows permits another process to share writes while denying delete/rename.
+ * In that narrow case preserve the existing inode and perform a rollback-capable
+ * in-place replacement. Hard-linked files never enter this path: they are
+ * rejected before staging because a failed write cannot safely preserve every
+ * alias with a pathname replacement contract.
+ */
+async function replaceInPlaceAfterSharingViolation(
+	dest: string,
+	tmp: string,
+	platform: NodeJS.Platform,
+): Promise<void> {
+	if (platform !== "win32") throw new Error("in-place sharing fallback is Windows-only");
+	const original = new Uint8Array(await Bun.file(dest).arrayBuffer());
+	const replacement = new Uint8Array(await Bun.file(tmp).arrayBuffer());
+	const handle = await fs.open(dest, "r+");
+	let failure: unknown;
+	let committed = false;
+	try {
+		try {
+			await handle.writeFile(replacement);
+			await handle.sync();
+			await handle.truncate(replacement.byteLength);
+			await handle.sync();
+			committed = true;
+		} catch (error) {
+			try {
+				await handle.writeFile(original);
+				await handle.truncate(original.byteLength);
+				await handle.sync();
+			} catch (rollbackError) {
+				failure = new FileWriteNotPublishedError(
+					dest,
+					new AggregateError([error, rollbackError], "In-place write rollback failed."),
+					{ destUnchanged: false, publicationState: "unknown" },
+				);
+			}
+			if (failure === undefined) failure = error;
+		}
+	} finally {
+		try {
+			await handle.close();
+		} catch (closeError) {
+			if (committed) {
+				failure = new FileWriteNotPublishedError(dest, closeError, {
+					destUnchanged: false,
+					publicationState: "published",
+				});
+			} else if (failure === undefined) {
+				failure = closeError;
+			}
+		}
+	}
+	if (failure !== undefined) {
+		if (failure instanceof FileWriteNotPublishedError) throw failure;
+		throw new FileWriteNotPublishedError(dest, failure, {
+			destUnchanged: !committed,
+			publicationState: committed ? "published" : "not_published",
+		});
+	}
+}
+
 /**
  * Revalidate the resolved destination immediately before publication so a
  * symlink retargeted while staging cannot silently repoint the write at a
@@ -258,6 +364,8 @@ export async function writeFileAtomically(
 ): Promise<void> {
 	let publishPath = dest;
 	try {
+		const platform = options.platform ?? process.platform;
+		const sleep = options.sleep ?? (async (delayMs: number): Promise<void> => await Bun.sleep(delayMs));
 		const trustBoundary = options.trustBoundary ?? sessionLocalRootFor(dest);
 		const resolved = await resolvePublishPath(dest);
 		publishPath = resolved.publishPath;
@@ -295,7 +403,26 @@ export async function writeFileAtomically(
 				// The staged file lives beside the destination, so rename is one
 				// same-directory atomic publication. A failed rename leaves the
 				// destination untouched and the owned staging file is cleaned below.
-				await fs.rename(tmp, publishPath);
+				try {
+					await renameIntoPlace(tmp, publishPath, platform, sleep);
+				} catch (error) {
+					if (existing !== undefined && platform === "win32" && isWindowsSharingViolation(error)) {
+						await replaceInPlaceAfterSharingViolation(publishPath, tmp, platform);
+						try {
+							await fs.unlink(tmp);
+						} catch (cleanupError) {
+							owned = false;
+							throw new FileWriteNotPublishedError(
+								dest,
+								new AggregateError([error, cleanupError], "Published bytes could not be cleaned up."),
+								{ destUnchanged: false, publicationState: "published" },
+							);
+						}
+						owned = false;
+						return;
+					}
+					throw error;
+				}
 				owned = false;
 				return;
 			} catch (error) {

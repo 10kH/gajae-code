@@ -76,6 +76,8 @@ Single-shot result.
 - Target is any path that does not resolve as an archive selector and does not resolve as an existing-or-new SQLite selector.
 - Existing files are overwritten.
 - Parent directories are created by `writeFileAtomically()`. A failed write never truncates an existing destination to 0 bytes.
+- Existing referents must be writable and are checked before publication. Hard-linked regular files are rejected rather than silently leaving aliases with stale bytes; this preserves the no-truncate guarantee instead of switching to an unsafe in-place fallback.
+- On Windows, a writable file held with write sharing but without delete sharing falls back to a rollback-capable in-place update after bounded rename retries, preserving the existing inode and editability.
 
 Example:
 

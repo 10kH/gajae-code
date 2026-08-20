@@ -1353,6 +1353,19 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(tasks[2]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
 	});
+	test("file-tool sources schedule their ACP and publication regression suites", () => {
+		const expected: Record<string, string> = {
+			"packages/coding-agent/src/tools/atomic-file-write.ts": "packages/coding-agent/test/file-tools-atomicity.test.ts",
+			"packages/coding-agent/src/tools/read.ts": "packages/coding-agent/test/read-acp-fs.test.ts",
+			"packages/coding-agent/src/tools/write.ts": "packages/coding-agent/test/write-acp-fs.test.ts",
+			"packages/coding-agent/src/lsp/index.ts": "packages/coding-agent/test/tools/lsp-batching.test.ts",
+			"packages/coding-agent/src/config/model-registry.ts": "packages/coding-agent/test/model-registry-runtime-provider.test.ts",
+		};
+		for (const [source, testFile] of Object.entries(expected)) {
+			const tasks = targeted([source]);
+			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
+		}
+	});
 	test("native path identity changes select the POSIX regression suite", () => {
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");

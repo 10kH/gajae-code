@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { createLspWritethrough } from "@gajae-code/coding-agent/lsp";
+import { createLspWritethrough, writethroughNoop } from "@gajae-code/coding-agent/lsp";
 import * as lspConfig from "@gajae-code/coding-agent/lsp/config";
 import { TempDir } from "@gajae-code/utils";
 import type { ServerConfig } from "../../src/lsp/types";
@@ -68,6 +68,14 @@ describe("createLspWritethrough batching", () => {
 		expect(await Bun.file(filePath).text()).toBe("const single = true;\n");
 	});
 
+	it("honors the exported BunFile writethrough target", async () => {
+		const requestedPath = path.join(tempDir.path(), "requested.ts");
+		const virtualTargetPath = path.join(tempDir.path(), "virtual-target.ts");
+		await writethroughNoop(requestedPath, "virtual content\n", undefined, Bun.file(virtualTargetPath));
+		expect(await Bun.file(virtualTargetPath).text()).toBe("virtual content\n");
+		expect(await Bun.file(requestedPath).exists()).toBe(false);
+	});
+
 	it("reports a later publication failure as potentially replacing an earlier write", async () => {
 		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
 		const client = {
@@ -97,5 +105,19 @@ describe("createLspWritethrough batching", () => {
 			destUnchanged: false,
 		});
 		expect(writes).toBeGreaterThan(1);
+	});
+
+	it("keeps a no-server publication failure marked unchanged", async () => {
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([]);
+		const filePath = path.join(tempDir.path(), "no-server-failure.ts");
+		vi.spyOn(atomicFileWrite, "writeFileAtomically").mockRejectedValue(
+			new FileWriteNotPublishedError(filePath, Object.assign(new Error("EIO"), { code: "EIO" })),
+		);
+		const writethrough = createLspWritethrough(tempDir.path(), { enableFormat: false });
+		await expect(writethrough(filePath, "const unchanged = true;\n")).rejects.toMatchObject({
+			destUnchanged: true,
+			publicationState: "not_published",
+		});
 	});
 });

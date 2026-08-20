@@ -767,7 +767,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			try {
 				diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
 			} catch (error) {
-				throw new ToolError(formatFileWriteError(error, absolutePath, { destUnchanged: true }));
+				throw new ToolError(formatFileWriteError(error, absolutePath));
 			}
 			invalidateFsScanAfterWrite(absolutePath);
 			this.session.fileReadCache?.invalidate(absolutePath);

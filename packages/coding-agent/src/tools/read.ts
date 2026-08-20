@@ -1429,11 +1429,12 @@ interface ResolvedSqliteReadPath {
  * Directories return a formatted listing with modification times.
  */
 /**
- * A client-authority denial is a decision, not a transport failure: falling back to
- * disk would bypass the permission the client just refused. Availability failures
- * still fall back so an unreachable bridge cannot break local reads.
+ * Only an explicit bridge transport-unavailable marker authorizes falling back to
+ * the agent host's disk. Raw OS errno values, including EACCES/EPERM, are
+ * ambiguous at this boundary: treating them as transport failures can bypass a
+ * remote client's access decision by reading the path locally.
  */
-function isClientAuthorityDenial(error: unknown): boolean {
+function isExplicitTransportUnavailable(error: unknown): boolean {
 	const directCode =
 		typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
 	const namedCode = error instanceof Error ? error.name : undefined;
@@ -1445,26 +1446,11 @@ function isClientAuthorityDenial(error: unknown): boolean {
 			? ((error as { data?: { code?: unknown } }).data?.code ?? undefined)
 			: undefined;
 	const code = directCode ?? nestedCode ?? namedCode;
-	// OS errno codes are transport/availability failures, not an ACP permission
-	// decision. Treating `EPERM`/`EACCES` as denials skipped the disk fallback
-	// for files that already existed on disk.
-	if (
-		code === "EPERM" ||
-		code === "EACCES" ||
-		code === "ENOENT" ||
-		code === "EIO" ||
-		code === "EBUSY" ||
-		code === "EROFS" ||
-		code === "EISDIR" ||
-		code === "ENOTDIR"
-	) {
-		return false;
-	}
-	// ACP clients surface refusals as an application error; -32001 is the reserved
-	// client-authority denial code and -32603 covers hosts without a dedicated code.
-	if (code === "permission_denied" || code === "forbidden" || code === -32001 || code === -32603) return true;
-	const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-	return /permission denied|not permitted|access denied|forbidden/i.test(message);
+	return code === "transport_unavailable" || code === "bridge_unavailable";
+}
+
+function isClientAuthorityDenial(error: unknown): boolean {
+	return !isExplicitTransportUnavailable(error);
 }
 
 export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {

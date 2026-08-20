@@ -144,7 +144,7 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		expect(textOf(readResult)).toContain("fromBridge");
 	});
 
-	it("falls back to disk when ACP read fails with an OS EPERM errno", async () => {
+	it("fails closed when ACP read returns an ambiguous OS permission errno", async () => {
 		const dest = path.join(tmpDir, "on-disk.ts");
 		await fs.writeFile(dest, "export const fromDisk = true;\n");
 		const bridge: ClientBridge = {
@@ -155,11 +155,9 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 				throw error;
 			},
 		};
-		const result = await new ReadTool(createSession(tmpDir, { getClientBridge: () => bridge })).execute(
-			"eperm-fallback",
-			{ path: dest },
-		);
-		expect(textOf(result)).toContain("fromDisk");
+		await expect(
+			new ReadTool(createSession(tmpDir, { getClientBridge: () => bridge })).execute("eperm-denied", { path: dest }),
+		).rejects.toThrow(/EPERM/);
 	});
 
 	it("does not fall back to disk for a structured ACP permission denial", async () => {
@@ -205,6 +203,7 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		const original = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
 			if (String(target).includes(".tmp") && flags === "wx" && collisions < 1) {
 				collisions += 1;
+				await fs.writeFile(String(target), "pre-existing collision\n");
 				const error = new Error("EEXIST: file already exists") as Error & { code: string };
 				error.code = "EEXIST";
 				throw error;
@@ -215,7 +214,11 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 			await writeFileAtomically(dest, "after retry\n");
 			expect(collisions).toBe(1);
 			expect(await fs.readFile(dest, "utf8")).toBe("after retry\n");
+			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toHaveLength(1);
 		} finally {
+			for (const name of await fs.readdir(tmpDir)) {
+				if (name.endsWith(".tmp")) await fs.rm(path.join(tmpDir, name), { force: true });
+			}
 			original.mockRestore();
 		}
 	});
@@ -432,6 +435,27 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 			expect((await fs.readdir(path.dirname(dest))).some(name => name.endsWith(".tmp"))).toBe(false);
 		} finally {
 			original.mockRestore();
+		}
+	});
+
+	it("keeps writable Windows files editable when delete-sharing blocks rename", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "windows-share.ts");
+		await fs.writeFile(dest, "old\n");
+		const rename = spyOn(fs, "rename").mockRejectedValue(Object.assign(new Error("EBUSY"), { code: "EBUSY" }));
+		const delays: number[] = [];
+		try {
+			await writeFileAtomically(dest, "new\n", {
+				platform: "win32",
+				sleep: async delay => {
+					delays.push(delay);
+				},
+			});
+			expect(delays).toEqual([10, 25, 50, 100, 200]);
+			expect(await fs.readFile(dest, "utf8")).toBe("new\n");
+			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			rename.mockRestore();
 		}
 	});
 
