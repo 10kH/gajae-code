@@ -1179,13 +1179,23 @@ export class AcpAgent implements Agent {
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
+	/**
+	 * Sessions this connection actually owns, i.e. ones it created or attached to.
+	 * Destructive lifecycle control gates on this set, never on `#knownSessionCwds`.
+	 *
+	 * `session/list` legitimately populates `#knownSessionCwds` for every session a
+	 * shared broker reports, so treating that map as ownership let a second ACP
+	 * connection enumerate another connection's sessions and then close or delete
+	 * them. Knowing a session's cwd is not authority over its lifecycle.
+	 */
+	readonly #ownedSessionIds = new Set<string>();
 	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
 	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
 	readonly #sessionEpochs = new Map<string, number>();
 	readonly #tearingDown = new Map<string, number>();
-	readonly #closing = new Map<string, Promise<CloseSessionResponse>>();
+	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
@@ -1322,6 +1332,7 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
+		this.#ownedSessionIds.add(id);
 		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
@@ -1377,6 +1388,7 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
+		this.#ownedSessionIds.add(id);
 		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
@@ -1427,70 +1439,83 @@ export class AcpAgent implements Agent {
 
 	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
-		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		// ACP close has no cwd. Only connection-owned sessions may reach broker lifecycle control.
+		if (!this.#ownedSessionIds.has(params.sessionId)) return Promise.resolve({});
+		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		if (!cwd) return Promise.resolve({});
-		const existing = this.#closing.get(params.sessionId);
-		if (existing) return existing;
-		const deferred = Promise.withResolvers<CloseSessionResponse>();
-		this.#closing.set(params.sessionId, deferred.promise);
-		void this.#closeOwnedSession(params.sessionId).then(deferred.resolve, deferred.reject);
-		const cleanup = deferred.promise.finally(() => {
-			if (this.#closing.get(params.sessionId) === deferred.promise) this.#closing.delete(params.sessionId);
+		return this.#enqueueLifecycleOperation(params.sessionId, async () => {
+			// A preceding delete in the same lifecycle chain already completed the terminal operation.
+			if (!this.#ownedSessionIds.has(params.sessionId) && !this.#sessions.has(params.sessionId)) return {};
+			return this.#closeOwnedSession(params.sessionId);
 		});
-		void cleanup.catch(() => undefined);
-		return deferred.promise;
 	}
 
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		const pendingLocator = this.#pendingDeleteLocators.get(params.sessionId);
+		// Capture authority before joining the lifecycle chain: an admitted delete must
+		// remain authorized when a preceding close retires connection ownership.
+		if (!this.#ownedSessionIds.has(params.sessionId) && pendingLocator === undefined) return {};
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId) ?? pendingLocator?.cwd;
-		// ACP's delete request has no cwd. Unknown ids remain the protocol no-op,
-		// while the broker can reconstruct an authenticated pending locator from its durable ledger.
-		if (!cwd) {
-			await (await this.#brokerAdapter()).global(
-				"session.delete",
-				{ sessionId: params.sessionId },
-				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
-			);
-			return {};
-		}
-		this.#beginTeardown(params.sessionId);
-		try {
-			// A retained delete locator proves the prior attempt already completed
-			// connection/process teardown and reached durable artifact cleanup. Re-closing
-			// that terminal session can only replace the authoritative cleanup_pending
-			// result with unrelated close uncertainty, so retries resume deletion directly.
-			await this.#teardownSession(params.sessionId, "deleted", pendingLocator === undefined || record !== undefined);
-			let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
-			if (!saved) {
-				try {
-					saved = await this.#resolveSavedSession(params.sessionId, cwd);
-				} catch (error) {
-					if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
-						this.#knownSessionCwds.delete(params.sessionId);
-						this.#knownSessionMcpServers.delete(params.sessionId);
-						this.#knownSessionMetadata.delete(params.sessionId);
-						return {};
-					}
-					throw error;
-				}
+		return this.#enqueueLifecycleOperation(params.sessionId, async () => {
+			// ACP's delete request has no cwd. Unknown ids remain the protocol no-op,
+			// while the broker can reconstruct an authenticated pending locator from its durable ledger.
+			if (!cwd) {
+				await (await this.#brokerAdapter()).global(
+					"session.delete",
+					{ sessionId: params.sessionId },
+					this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
+				);
+				return {};
 			}
-			this.#pendingDeleteLocators.set(params.sessionId, { cwd, path: saved });
-			await (await this.#brokerAdapter()).global(
-				"session.delete",
-				{ sessionId: params.sessionId, sessionPath: saved, cwd, target: { path: cwd } },
-				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
-			);
-			this.#knownSessionCwds.delete(params.sessionId);
-			this.#knownSessionMcpServers.delete(params.sessionId);
-			this.#knownSessionMetadata.delete(params.sessionId);
-			this.#pendingDeleteLocators.delete(params.sessionId);
-			return {};
-		} finally {
-			this.#finishTeardown(params.sessionId);
-		}
+			this.#beginTeardown(params.sessionId);
+			try {
+				// A preceding close in the lifecycle chain already completed process teardown.
+				// Continue with durable deletion instead of re-closing an already-dead process.
+				const teardownCompleted =
+					!this.#ownedSessionIds.has(params.sessionId) && !this.#sessions.has(params.sessionId);
+				if (!teardownCompleted) {
+					// A retained delete locator proves the prior attempt already completed
+					// connection/process teardown and reached durable artifact cleanup. Re-closing
+					// that terminal session can only replace the authoritative cleanup_pending
+					// result with unrelated close uncertainty, so retries resume deletion directly.
+					await this.#teardownSession(
+						params.sessionId,
+						"deleted",
+						pendingLocator === undefined || record !== undefined,
+					);
+				}
+				let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
+				if (!saved) {
+					try {
+						saved = await this.#resolveSavedSession(params.sessionId, cwd);
+					} catch (error) {
+						if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
+							this.#knownSessionCwds.delete(params.sessionId);
+							this.#ownedSessionIds.delete(params.sessionId);
+							this.#knownSessionMcpServers.delete(params.sessionId);
+							this.#knownSessionMetadata.delete(params.sessionId);
+							return {};
+						}
+						throw error;
+					}
+				}
+				this.#pendingDeleteLocators.set(params.sessionId, { cwd, path: saved });
+				await (await this.#brokerAdapter()).global(
+					"session.delete",
+					{ sessionId: params.sessionId, sessionPath: saved, cwd, target: { path: cwd } },
+					this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
+				);
+				this.#knownSessionCwds.delete(params.sessionId);
+				this.#ownedSessionIds.delete(params.sessionId);
+				this.#knownSessionMcpServers.delete(params.sessionId);
+				this.#knownSessionMetadata.delete(params.sessionId);
+				this.#pendingDeleteLocators.delete(params.sessionId);
+				return {};
+			} finally {
+				this.#finishTeardown(params.sessionId);
+			}
+		});
 	}
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1957,6 +1982,20 @@ export class AcpAgent implements Agent {
 		else this.#tearingDown.delete(id);
 	}
 
+	#enqueueLifecycleOperation<T>(id: string, operation: () => Promise<T>): Promise<T> {
+		const previous = this.#lifecycleOperations.get(id) ?? Promise.resolve();
+		const result = previous.catch(() => undefined).then(operation);
+		const settled = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#lifecycleOperations.set(id, settled);
+		void settled.finally(() => {
+			if (this.#lifecycleOperations.get(id) === settled) this.#lifecycleOperations.delete(id);
+		});
+		return result;
+	}
+
 	#lifecycleIdempotencyKey(id: string, operation: "session.close" | "session.delete"): string {
 		return `acp:${operation}:${id}`;
 	}
@@ -2181,6 +2220,7 @@ export class AcpAgent implements Agent {
 			this.#pendingRouterAdapters.delete(id);
 			this.#pendingRouterFrames.delete(id);
 			this.#knownSessionCwds.set(id, cwd);
+			this.#ownedSessionIds.add(id);
 			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
 			this.#assertSessionEpoch(id, epoch);
 			// A successful attachment establishes a new live-owner epoch. Any locator
@@ -2197,6 +2237,7 @@ export class AcpAgent implements Agent {
 					await this.#teardownSession(id, "attachment failed", false);
 				} finally {
 					this.#knownSessionCwds.delete(id);
+					this.#ownedSessionIds.delete(id);
 					this.#knownSessionMcpServers.delete(id);
 				}
 			} else if (adapter) {
@@ -2262,6 +2303,7 @@ export class AcpAgent implements Agent {
 	async #discardNewSession(id: string): Promise<void> {
 		await this.#teardownSession(id, "discarded", true);
 		this.#knownSessionCwds.delete(id);
+		this.#ownedSessionIds.delete(id);
 		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 	}
@@ -2275,6 +2317,7 @@ export class AcpAgent implements Agent {
 			if (attaching) await Promise.allSettled([attaching.task]);
 			await this.#teardownSession(id, "closed", true);
 			this.#knownSessionCwds.delete(id);
+			this.#ownedSessionIds.delete(id);
 			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			return {};
@@ -2290,7 +2333,7 @@ export class AcpAgent implements Agent {
 	 */
 	async #teardownSession(id: string, reason: string, closeRemote: boolean): Promise<void> {
 		const record = this.#sessions.get(id);
-		const ownershipBound = record !== undefined || this.#knownSessionCwds.has(id);
+		const ownershipBound = record !== undefined || this.#ownedSessionIds.has(id);
 		this.#beginTeardown(id);
 		try {
 			this.#advanceSessionEpoch(id);
@@ -3564,11 +3607,12 @@ export class AcpAgent implements Agent {
 		this.#attaching.clear();
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
+		this.#ownedSessionIds.clear();
 		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
-		if (this.#closing.size === 0) this.#closing.clear();
+		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();
 		this.#tearingDown.clear();
 		if (this.#broker) {
 			const broker = this.#broker;

@@ -1223,14 +1223,21 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const observer = new AcpAgent({ signal: observerAbort.signal } as unknown as AgentSideConnection, { agentDir });
 	await bounded(observer.listSessions({}), "observer list");
 	const brokerRequestCount = brokerRequests.length;
+	// Enumerating a session through `session/list` must not confer destructive
+	// lifecycle authority over it. Both calls resolve as local no-ops, and the
+	// decisive assertion is that neither reaches the broker: a `session.delete`
+	// here would mean one connection could destroy another connection's session
+	// after merely listing it.
 	expect(await bounded(observer.closeSession({ sessionId: created.sessionId }), "observer close")).toEqual({});
 	expect(await bounded(observer.deleteSession({ sessionId: created.sessionId }), "observer delete")).toEqual({});
-	expect(brokerRequests).toHaveLength(brokerRequestCount + 1);
-	expect(brokerRequests.at(-1)).toMatchObject({
-		operation: "session.delete",
-		input: { sessionId: created.sessionId },
-		idempotencyKey: `acp:session.delete:${created.sessionId}`,
-	});
+	expect(brokerRequests).toHaveLength(brokerRequestCount);
+	expect(
+		brokerRequests.filter(
+			request =>
+				(request.operation === "session.delete" || request.operation === "session.close") &&
+				(request.input as { sessionId?: string } | undefined)?.sessionId === created.sessionId,
+		),
+	).toHaveLength(0);
 	observerAbort.abort();
 
 	await bounded(agent.loadSession({ sessionId: created.sessionId, cwd, mcpServers: [] }), "owned session reload");
