@@ -580,6 +580,99 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
+	it("creates no directories outside the trust boundary for a dangling symlink escape", async () => {
+		if (process.platform === "win32") return;
+		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "atomic-dangling-test");
+		const outsideRoot = path.join(tmpDir, "outside-root");
+		// The link target does not exist, and neither do its parents. Resolving it
+		// escapes the session root, so nothing under outsideRoot may be created.
+		const danglingTarget = path.join(outsideRoot, "attacker", "nested", "payload.ts");
+		const link = path.join(sessionRoot, "dangling.ts");
+		await fs.mkdir(sessionRoot, { recursive: true });
+		await fs.symlink(danglingTarget, link);
+		try {
+			await expect(writeFileAtomically(link, "must-not-write\n")).rejects.toThrow(/outside trust boundary/);
+			// The pre-mkdir boundary check is what this pins: creating parents first
+			// would materialize an attacker-selected tree before refusing to publish.
+			expect(await Bun.file(danglingTarget).exists()).toBe(false);
+			await expect(fs.stat(outsideRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await fs.rm(sessionRoot, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses the Windows in-place fallback when the destination inode was replaced", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "win-substituted.ts");
+		await fs.writeFile(dest, "authorized-original\n");
+		const realRename = fs.rename.bind(fs);
+		// Every rename attempt reports a sharing violation, and a concurrent writer
+		// substitutes a different inode at the same pathname during the retry
+		// backoff -- i.e. strictly after the pre-publication identity check, so only
+		// the fallback's own revalidation can catch it. The in-place fallback mutates
+		// by pathname, so it must refuse rather than overwrite the successor.
+		let renameAttempts = 0;
+		const rename = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (String(to) === dest) {
+				renameAttempts++;
+				if (renameAttempts === 1) {
+					// Publish a genuinely distinct inode. Deleting and recreating in place
+					// is not enough: ext4 reuses the just-freed inode number, so the
+					// substitution would be indistinguishable from the authorized file.
+					const successor = path.join(tmpDir, "win-successor-source.ts");
+					await fs.writeFile(successor, "successor-inode\n");
+					await realRename(successor, dest);
+				}
+				throw Object.assign(new Error("EBUSY"), { code: "EBUSY" });
+			}
+			return realRename(from as PathLike, to as PathLike);
+		});
+		try {
+			await expect(
+				writeFileAtomically(dest, "ours\n", { platform: "win32", sleep: async () => {} }),
+			).rejects.toMatchObject({ destUnchanged: true, publicationState: "not_published" });
+			// The successor must survive untouched, and the report must be truthful.
+			expect(await fs.readFile(dest, "utf8")).toBe("successor-inode\n");
+			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			rename.mockRestore();
+		}
+	});
+
+	it("refuses publication when the parent directory is replaced while staging", async () => {
+		if (process.platform === "win32") return;
+		const parent = path.join(tmpDir, "volatile-parent");
+		await fs.mkdir(parent, { recursive: true });
+		const dest = path.join(parent, "target.ts");
+		await fs.writeFile(dest, "original\n");
+		// Swap the parent for a *different* directory at the same path, after the
+		// temp is staged and just before publication. The realpath string is
+		// unchanged, so only dev/ino identity detects it. The staged temp is carried
+		// into the replacement so publication would otherwise succeed there.
+		const realStat = fs.stat.bind(fs);
+		let swapped = false;
+		const stat = spyOn(fs, "stat").mockImplementation((async (target: PathLike, opts?: any) => {
+			const isTemp = String(target).includes(".tmp");
+			if (!swapped && isTemp) {
+				swapped = true;
+				const staged = String(target);
+				const replacement = path.join(tmpDir, "replacement-parent");
+				await fs.mkdir(replacement, { recursive: true });
+				await fs.writeFile(path.join(replacement, "target.ts"), "successor\n");
+				await fs.copyFile(staged, path.join(replacement, path.basename(staged)));
+				await fs.rm(parent, { recursive: true, force: true });
+				await fs.rename(replacement, parent);
+			}
+			return realStat(target, opts);
+		}) as typeof fs.stat);
+		try {
+			await expect(writeFileAtomically(dest, "ours\n")).rejects.toThrow(/parent was retargeted while staging/);
+			expect(await fs.readFile(dest, "utf8")).toBe("successor\n");
+		} finally {
+			stat.mockRestore();
+		}
+	});
+
 	it("publishes rebuilt archive bytes atomically", async () => {
 		const archivePath = path.join(tmpDir, "archive.tar");
 		await fs.writeFile(archivePath, await new Bun.Archive({ "pkg/old.txt": "old\n" }).bytes());

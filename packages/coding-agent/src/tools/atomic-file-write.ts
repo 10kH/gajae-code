@@ -195,6 +195,12 @@ function sessionLocalRootFor(lexicalDest: string): string | undefined {
  * Reject publication when the resolved referent's real parent (and therefore
  * the referent itself) leaves the trust boundary. The boundary root is
  * realpathed so a symlinked `gjc-local` root cannot smuggle a write out.
+ *
+ * This must run before any directory is created. A dangling symlink inside a
+ * trusted root resolves to a path outside it, so creating parents first would
+ * let an attacker-selected directory tree be materialized outside the sandbox
+ * before publication is refused. Missing ancestors therefore resolve
+ * lexically (`realpathOrSelf` tolerates ENOENT) and are still boundary-checked.
  */
 async function assertWithinTrustBoundary(publishPath: string, trustBoundary: string): Promise<void> {
 	const boundary = path.resolve(trustBoundary);
@@ -203,6 +209,25 @@ async function assertWithinTrustBoundary(publishPath: string, trustBoundary: str
 	if (!pathIsWithin(realParent, realBoundary)) {
 		throw new Error(`write target '${publishPath}' resolves outside trust boundary '${trustBoundary}'`);
 	}
+}
+
+/**
+ * Identity of the publication parent directory. A realpath string alone cannot
+ * detect a parent that was unlinked and replaced by a different directory at
+ * the same path: the string still matches while the rename would publish into
+ * the replacement. Pin device and inode instead.
+ */
+interface ParentIdentity {
+	realpath: string;
+	dev: number;
+	ino: number;
+}
+
+async function captureParentIdentity(publishPath: string): Promise<ParentIdentity> {
+	const parent = path.dirname(publishPath);
+	const realpath = await realpathOrSelf(parent);
+	const stat = await fs.stat(parent);
+	return { realpath, dev: stat.dev, ino: stat.ino };
 }
 
 /**
@@ -303,8 +328,26 @@ async function replaceInPlaceAfterSharingViolation(
 	dest: string,
 	tmp: string,
 	platform: NodeJS.Platform,
+	expectedExisting: ExistingFileMetadata,
 ): Promise<void> {
 	if (platform !== "win32") throw new Error("in-place sharing fallback is Windows-only");
+	// This fallback mutates the destination by pathname instead of publishing a
+	// staged inode, so it must re-establish that the pathname still names the
+	// file we were authorized to replace. Rename retries and their backoff give a
+	// concurrent writer time to substitute a different inode; overwriting that
+	// one in place would be an unauthorized mutation with no rollback source.
+	// `dest` is already the resolved referent, so lstat identity here is the same
+	// inode the pre-staging check authorized.
+	const current = (await resolvePublishPath(dest)).existing;
+	if (current === undefined || !sameFileIdentity(current, expectedExisting)) {
+		throw new FileWriteNotPublishedError(
+			dest,
+			new Error(
+				`destination '${dest}' was replaced before the in-place fallback; refusing to overwrite a different file`,
+			),
+			{ destUnchanged: true, publicationState: "not_published" },
+		);
+	}
 	const original = new Uint8Array(await Bun.file(dest).arrayBuffer());
 	const replacement = new Uint8Array(await Bun.file(tmp).arrayBuffer());
 	const handle = await fs.open(dest, "r+");
@@ -367,14 +410,18 @@ async function assertPublishTargetStillIntended(
 	publishPath: string,
 	trustBoundary: string | undefined,
 	expectedExisting: ExistingFileMetadata | undefined,
-	expectedParentRealpath: string,
+	expectedParent: ParentIdentity,
 ): Promise<void> {
 	const after = await resolvePublishPath(dest);
 	if (after.publishPath !== publishPath) {
 		throw new Error(`destination '${dest}' was retargeted while staging; refusing to overwrite a different file`);
 	}
-	const currentParentRealpath = await realpathOrSelf(path.dirname(publishPath));
-	if (currentParentRealpath !== expectedParentRealpath) {
+	const currentParent = await captureParentIdentity(publishPath);
+	if (
+		currentParent.realpath !== expectedParent.realpath ||
+		currentParent.dev !== expectedParent.dev ||
+		currentParent.ino !== expectedParent.ino
+	) {
 		throw new Error(
 			`destination '${dest}' parent was retargeted while staging; refusing to overwrite a different file`,
 		);
@@ -403,11 +450,20 @@ export async function writeFileAtomically(
 		const trustBoundary = options.trustBoundary ?? sessionLocalRootFor(dest);
 		const resolved = await resolvePublishPath(dest);
 		publishPath = resolved.publishPath;
-		await fs.mkdir(path.dirname(publishPath), { recursive: true });
-		const expectedParentRealpath = await realpathOrSelf(path.dirname(publishPath));
+		// Boundary first, then create parents. A dangling symlink inside a trusted
+		// root resolves outside it, so creating directories before this check would
+		// materialize an attacker-selected tree outside the sandbox and only then
+		// refuse to publish.
 		if (trustBoundary !== undefined) {
 			await assertWithinTrustBoundary(publishPath, trustBoundary);
 		}
+		await fs.mkdir(path.dirname(publishPath), { recursive: true });
+		// Re-check after creation: `mkdir -p` follows existing symlinked ancestors,
+		// so the post-creation parent is the one publication must be bound to.
+		if (trustBoundary !== undefined) {
+			await assertWithinTrustBoundary(publishPath, trustBoundary);
+		}
+		const expectedParent = await captureParentIdentity(publishPath);
 		const existing = resolved.existing;
 		if (existing !== undefined && existing.nlink > 1) {
 			throw new Error(
@@ -433,7 +489,7 @@ export async function writeFileAtomically(
 				if (existing !== undefined) {
 					await preserveExistingMetadata(tmp, existing);
 				}
-				await assertPublishTargetStillIntended(dest, publishPath, trustBoundary, existing, expectedParentRealpath);
+				await assertPublishTargetStillIntended(dest, publishPath, trustBoundary, existing, expectedParent);
 				// The staged file lives beside the destination, so rename is one
 				// same-directory atomic publication. A failed rename leaves the
 				// destination untouched and the owned staging file is cleaned below.
@@ -441,7 +497,7 @@ export async function writeFileAtomically(
 					await renameIntoPlace(tmp, publishPath, platform, sleep);
 				} catch (error) {
 					if (existing !== undefined && platform === "win32" && isWindowsSharingViolation(error)) {
-						await replaceInPlaceAfterSharingViolation(publishPath, tmp, platform);
+						await replaceInPlaceAfterSharingViolation(publishPath, tmp, platform, existing);
 						try {
 							await fs.unlink(tmp);
 						} catch (cleanupError) {
