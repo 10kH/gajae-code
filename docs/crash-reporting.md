@@ -208,9 +208,14 @@ resolver, not to raw `HOME`/`USERPROFILE` values supplied by a checkout. Externa
 configuration; values declared by the current checkout's `.env` cannot redirect trusted agent files
 or the relay's input stores. A checkout may still declare an XDG variable for ordinary project-facing
 caches, so those paths can move, but they are never trusted crash-report input.
-If a checkout declares `HOME` in its `.env`, the resolver uses the OS account home
-instead of treating that declaration as a trusted user root. It never uses a filesystem
-root as the refusal sentinel for user state.
+If a checkout declares `HOME` in its `.env`, the resolver uses an account home that is
+independent evidence — one that does not merely echo the runtime home (the Linux
+`/etc/passwd` lookup qualifies; a runtime `userInfo().homedir` that only mirrors the
+environment variable does not, which is the failure #4773 reported on identities
+without a local passwd entry). When no such home exists, the trusted home resolves to
+the filesystem-root sentinel, user state is marked unavailable, and every user-scope
+accessor refuses — credential resolution stays fail-closed and never reads a
+checkout-controlled home.
 
 Project discovery uses the nearest existing `.gjc` directory, then the checkout's `.git` root as a
 fallback anchor. With an explicit project scope and neither anchor, the resolver uses `<cwd>/.gjc`
