@@ -28,10 +28,16 @@ import { SessionManager } from "../src/session/session-manager";
 
 const selector = (model: Model) => `${model.provider}/${model.id}`;
 
-function safetyStopStream(model: Model, refusal: string): AssistantMessageEventStream {
+function safetyStopStream(
+	model: Model,
+	refusal: string,
+	transportFacts?: { status: number },
+): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
-		const message: AssistantMessage = {
+		const message: AssistantMessage & {
+			transportFailure?: { kind: "transport"; status: number };
+		} = {
 			role: "assistant",
 			content: [],
 			api: model.api,
@@ -48,6 +54,12 @@ function safetyStopStream(model: Model, refusal: string): AssistantMessageEventS
 			stopReason: "error",
 			errorKind: "provider_safety_stop",
 			errorMessage: refusal,
+			...(transportFacts
+				? {
+						errorStatus: transportFacts.status,
+						transportFailure: { kind: "transport" as const, status: transportFacts.status },
+					}
+				: {}),
 			timestamp: Date.now(),
 		};
 		stream.push({ type: "start", partial: message });
@@ -160,6 +172,44 @@ describe("provider safety stop hint e2e (#4650)", () => {
 		const display = formatProviderSafetyStopDisplayError(last as AssistantMessage, "openai/gpt-4o-mini");
 		expect(display).toBe(`${refusal}\n${hint}`);
 		expect(display?.startsWith(refusal)).toBe(true);
+	});
+
+	it("does not advance a multi-model chain when a safety stop has transport facts", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const alternate = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !alternate) throw new Error("Expected bundled test models");
+		const calls: string[] = [];
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: ((model, _context, _options) => {
+				calls.push(selector(model));
+				return safetyStopStream(model, "Refusal (safety): transport-backed stop", { status: 400 });
+			}) satisfies AgentOptions["streamFn"],
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "retry.baseDelayMs": 1 });
+		settings.set("modelRoles", { default: [selector(primary), selector(alternate)] });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		const events: AgentSessionEvent[] = [];
+		session.subscribe(event => events.push(event));
+
+		await session.prompt("trigger transport-backed safety stop");
+		await session.waitForIdle();
+
+		expect(calls).toEqual([selector(primary)]);
+		expect(events.filter(event => event.type === "model_fallback_switched")).toHaveLength(0);
+		const last = [...session.state.messages].reverse().find(message => message.role === "assistant");
+		expect(last).toMatchObject({
+			stopReason: "error",
+			errorKind: "provider_safety_stop",
+			errorStatus: 400,
+			transportFailure: { kind: "transport", status: 400 },
+		});
 	});
 
 	it("falls back to bounded static guidance when no alternate is configured", async () => {
