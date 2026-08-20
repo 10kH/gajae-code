@@ -4,7 +4,7 @@ import { formatDuration, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
-import type { AgentProgress, AgentSource } from "../task/types";
+import type { AgentProgress, AgentSource, LocalErrorSummary } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
 import { replaceTabs } from "./render-utils";
@@ -85,6 +85,8 @@ export interface SubagentSnapshot {
 	errorText?: string;
 	/** Safe setup failure cause retained from the executor launch path. */
 	setupFailureSummary?: string;
+	/** Safe, bounded summary of a terminal local (non-provider) failure (e.g. local_buffer_overflow). */
+	localErrorSummary?: LocalErrorSummary;
 	resultPreview?: string;
 	outputRef?: string;
 	truncated?: boolean;
@@ -780,6 +782,22 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 			if (snapshot.description) lines.push(`Description: ${snapshot.description}`);
 			if (snapshot.outputRef) lines.push(`Output: ${snapshot.outputRef}`);
 			if (snapshot.setupFailureSummary) lines.push(`Setup failure: ${snapshot.setupFailureSummary}`);
+			if (snapshot.localErrorSummary) {
+				const local = snapshot.localErrorSummary;
+				lines.push(`Local failure (${local.kind}): ${local.summary}`);
+				// Guidance is kind-conditional: an overflow is a local staging
+				// limit that reproduces on re-issue; a snapshot failure is a
+				// serialization defect, which re-issuing does NOT reproduce.
+				if (local.kind === "local_buffer_overflow") {
+					lines.push(
+						"This is a local gjc staging-buffer limit, not a provider or context-window failure; the same request reproduces it.",
+					);
+				} else if (local.kind === "local_snapshot_failure") {
+					lines.push(
+						"This is a local gjc event-serialization defect, not a provider failure; re-issuing is safe to retry.",
+					);
+				}
+			}
 			if (snapshot.assignment) lines.push("Assignment:", "```", snapshot.assignment, "```");
 			if (snapshot.steerMessage) {
 				lines.push(`Steer (${snapshot.steerState ?? "queued"}):`, "```", snapshot.steerMessage, "```");
@@ -909,6 +927,14 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 				: {}),
 			...(job.setupFailureSummary
 				? { setupFailureSummary: sanitizeText(job.setupFailureSummary, RECEIPT_PREVIEW_WIDTH) }
+				: {}),
+			...(job.localErrorSummary
+				? {
+						localErrorSummary: {
+							kind: job.localErrorSummary.kind,
+							summary: sanitizeText(job.localErrorSummary.summary, RECEIPT_PREVIEW_WIDTH),
+						},
+					}
 				: {}),
 			...(outputRef ? { outputRef } : {}),
 			...(runningTimeoutGuidance ? { guidance: runningTimeoutGuidance } : {}),

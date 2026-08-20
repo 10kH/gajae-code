@@ -67,8 +67,11 @@ import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
+	createLocalErrorSummary,
 	createSetupFailureSummary,
 	hasCompleteUsageCostBreakdown,
+	isAssistantLocalErrorKind,
+	type LocalErrorSummary,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	type ModelSubstitutionWarning,
@@ -1470,6 +1473,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const runSubagent = async (): Promise<{
 		exitCode: number;
 		error?: string;
+		localErrorSummary?: LocalErrorSummary;
 		aborted?: boolean;
 		abortReason?: string;
 		setupFailure?: SetupFailureSummary;
@@ -1478,6 +1482,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		const sessionAbortController = new AbortController();
 		let exitCode = 0;
 		let error: string | undefined;
+		let localErrorSummary: LocalErrorSummary | undefined;
 		let aborted = false;
 		let abortReasonText: string | undefined;
 		let setupFailure: SetupFailureSummary | undefined;
@@ -2106,6 +2111,21 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				} else if (lastAssistant.stopReason === "error") {
 					exitCode = 1;
 					error ??= lastAssistant.errorMessage || "Subagent failed";
+					// A terminal local (non-provider) failure carries an actionable
+					// kind: surface it in the parent receipt instead of the generic
+					// "Task failed; error recorded." preview (#4618). Overflow
+					// summaries are built ONLY from the structured, identity-checked
+					// `bufferOverflow` shape - never the free-form `errorMessage`,
+					// which a foreign self-labeled error can fill with arbitrary
+					// text. A self-labeled overflow WITHOUT the shape degrades to a
+					// neutral sentence instead of forwarding message text.
+					if (isAssistantLocalErrorKind(lastAssistant.errorKind)) {
+						localErrorSummary = createLocalErrorSummary(
+							lastAssistant.errorKind,
+							lastAssistant.errorMessage ?? error,
+							lastAssistant.bufferOverflow,
+						);
+					}
 				}
 				if (paused) {
 					exitCode = 0;
@@ -2158,6 +2178,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		return {
 			exitCode,
 			error,
+			localErrorSummary,
 			aborted,
 			abortReason: aborted ? abortReasonText : undefined,
 			setupFailure,
@@ -2319,6 +2340,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		fastMode: progress.fastMode,
 		error: exitCode !== 0 && stderr ? stderr : undefined,
 		setupFailure: done.setupFailure,
+		localErrorSummary: done.localErrorSummary,
 		aborted: wasAborted,
 		abortReason: finalAbortReason,
 		paused,

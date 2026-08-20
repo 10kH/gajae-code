@@ -287,6 +287,20 @@ function renderSubagentSnapshotBody(
 	if (snapshot.setupFailureSummary) {
 		lines.push(`  ${theme.fg("error", `Setup failure: ${snapshot.setupFailureSummary}`)}`);
 	}
+	if (snapshot.localErrorSummary) {
+		const local = snapshot.localErrorSummary;
+		lines.push(`  ${theme.fg("error", `Local failure (${local.kind}): ${local.summary}`)}`);
+		// Kind-conditional guidance: an overflow is a staging limit that
+		// reproduces on re-issue; a snapshot failure is a serialization
+		// defect. Rendering the wrong one mislabels the failure mode.
+		const guidance =
+			local.kind === "local_buffer_overflow"
+				? "Local gjc staging-buffer limit, not a provider or context-window failure; re-issuing reproduces it."
+				: local.kind === "local_snapshot_failure"
+					? "Local gjc event-serialization defect, not a provider failure; safe to retry."
+					: undefined;
+		if (guidance) lines.push(`  ${theme.fg("dim", guidance)}`);
+	}
 	if (snapshot.assignment) {
 		lines.push(`  ${theme.fg("dim", "Assignment:")}`);
 		for (const al of snapshot.assignment.split("\n")) lines.push(`    ${theme.fg("toolOutput", replaceTabs(al))}`);
@@ -412,7 +426,7 @@ export const subagentToolRenderer = {
 
 				snapshotSignatures ??= subagents.map(
 					snapshot =>
-						`${subagentAwaitRenderedStateSignature([snapshot], result.details)}:${snapshot.setupFailureSummary ?? ""}`,
+						`${subagentAwaitRenderedStateSignature([snapshot], result.details)}:${snapshot.setupFailureSummary ?? ""}:${snapshot.localErrorSummary?.summary ?? ""}`,
 				);
 				subagents.forEach((snapshot, index) => {
 					// Fresh per-subagent status line (cheap), then a cached or dynamic body.
