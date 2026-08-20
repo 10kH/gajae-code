@@ -17,6 +17,23 @@ const SESSION_ID = "chat-reconnect-session";
 const GENERATION = 4;
 const wallClockNow = Date.now;
 
+// Bun may execute test bodies concurrently, while withFakeTransport temporarily
+// replaces process-global WebSocket, timer, and Date implementations. Serialize
+// only those global-scope mutations; the individual reconnect scenarios still
+// exercise their real concurrent frame/replay interleavings inside the scope.
+let fakeTransportTail = Promise.resolve();
+async function withSerializedFakeTransport(run: Parameters<typeof withFakeTransport>[0]): Promise<void> {
+	const previous = fakeTransportTail;
+	const next = Promise.withResolvers<void>();
+	fakeTransportTail = next.promise;
+	await previous;
+	try {
+		await withFakeTransport(run);
+	} finally {
+		next.resolve();
+	}
+}
+
 function currentHostIncarnation(): string {
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Current process incarnation is unavailable.");
@@ -366,6 +383,8 @@ interface AttachedRuntimeHarness {
 	warnings: string[];
 	/** Fires one reconcile pass, exactly as the runtime's own interval does. */
 	reconcile: () => void;
+	/** Waits for the real router to finish delivery and advance a sequence cursor. */
+	awaitFrameSettlement: (seq: number) => Promise<void>;
 	/** Supersedes the indexed attachment with a newer endpoint generation. */
 	supersede: () => Promise<void>;
 }
@@ -407,6 +426,14 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 
 		const provider = new FakeSlackProvider();
 		let reconcileTick: (() => void) | undefined;
+		const settledSequences = new Set<number>();
+		const settlementWaiters = new Map<number, PromiseWithResolvers<void>>();
+		const awaitFrameSettlement = async (seq: number): Promise<void> => {
+			if (settledSequences.has(seq)) return;
+			const waiter = Promise.withResolvers<void>();
+			settlementWaiters.set(seq, waiter);
+			await waiter.promise;
+		};
 		runtime = new ChatDaemonRuntime(
 			{
 				kind: "slack",
@@ -426,6 +453,13 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 			{
 				createSlackProvider: () => provider,
 				routerDeps: {
+					onFrameSettled: (_attachment, frame) => {
+						const seq = typeof frame.seq === "number" && Number.isSafeInteger(frame.seq) ? frame.seq : undefined;
+						if (seq === undefined) return;
+						settledSequences.add(seq);
+						settlementWaiters.get(seq)?.resolve();
+						settlementWaiters.delete(seq);
+					},
 					setInterval: ((callback: () => void) => {
 						reconcileTick = callback;
 						return 0;
@@ -441,6 +475,7 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 			provider,
 			warnings,
 			reconcile: () => reconcileTick?.(),
+			awaitFrameSettlement,
 			supersede: async () => {
 				await index.append({
 					type: "host_registered",
@@ -681,7 +716,7 @@ test("chat daemon startup isolates an unreachable indexed endpoint from a health
 });
 test("an unreachable attached chat session exhausts its long-lived reconnect budget without blocking startup", async () => {
 	await withAttachedSessionRuntime(async ({ runtime }) => {
-		await withFakeTransport(async clock => {
+		await withSerializedFakeTransport(async clock => {
 			const starting = runtime.start();
 			await awaitSocket(1);
 			const observed = await drainReconnects(clock);
@@ -705,7 +740,7 @@ test("an unreachable attached chat session exhausts its long-lived reconnect bud
 
 test("an established chat attachment that loses its open socket resumes from its last acknowledged event", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -741,7 +776,7 @@ test("an established chat attachment that loses its open socket resumes from its
 
 test("a superseded endpoint generation disposes the old attachment instead of resuming it", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -777,7 +812,7 @@ test("a superseded endpoint generation disposes the old attachment instead of re
 
 test("a live frame delivered before the resume replay answers is published in sequence, once", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -818,7 +853,7 @@ test("a live frame delivered before the resume replay answers is published in se
 
 test("a replayed frame at or below the cursor is dropped instead of published a second time", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -844,7 +879,7 @@ test("a replayed frame at or below the cursor is dropped instead of published a 
 
 test("stopping the runtime while a replay is pending neither hangs nor publishes what is held", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -873,7 +908,7 @@ test("stopping the runtime while a replay is pending neither hangs nor publishes
 
 test("a supersession while a replay is pending discards it instead of replaying onto the new attachment", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -914,7 +949,7 @@ test("a supersession while a replay is pending discards it instead of replaying 
 
 test("a replay refused on a live socket loses no event and leaves the cursor below the gap", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -959,7 +994,7 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 
 test("a replay refused past its retry budget rebuilds the attachment from its cursor", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1008,7 +1043,7 @@ test("a replay refused past its retry budget rebuilds the attachment from its cu
 
 test("a real 256-frame host ring loses only the sequences the host says it evicted", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost(256);
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1073,7 +1108,7 @@ test("a real 256-frame host ring loses only the sequences the host says it evict
 }, 30_000);
 test("a retention gap at the initial attach keeps delivering instead of rebuilding forever", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			// A two-frame ring that has already rolled past its first event. The daemon
 			// attaches from zero, so the host answers with the suffix it still holds and
 			// states that sequence 1 is gone — a gap no retry and no rebuild can close.
@@ -1123,7 +1158,7 @@ test("a retention gap at the initial attach keeps delivering instead of rebuildi
 }, 20_000);
 test("a replay answered from a rolled generation retires the attachment instead of publishing it", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, supersede }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1166,7 +1201,7 @@ test("a replay answered from a rolled generation retires the attachment instead 
 
 test("a replay whose gap never states its range fails the barrier instead of publishing behind it", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1205,7 +1240,7 @@ test("a replay whose gap never states its range fails the barrier instead of pub
 }, 20_000);
 test("a gap that concedes sequences this cursor never asked about is refused, not skipped", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			host.emit("retained one");
 			host.emit("retained two");
@@ -1249,7 +1284,7 @@ test("a gap that concedes sequences this cursor never asked about is refused, no
 
 test("a gap that concedes sequences the same answer returns is refused, not skipped", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			host.emit("retained one");
 			host.emit("retained two");
@@ -1288,7 +1323,7 @@ test("a gap that concedes sequences the same answer returns is refused, not skip
 
 test("a conceded gap carries the cursor over the loss even when the retained suffix is filtered away", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			// A two-frame ring that evicted seq 1 and kept only capability-gated
 			// sequences: the host still holds seq 2 and 3, but strips both from this
 			// connection's answer. So the concession arrives with an empty suffix, and
@@ -1330,7 +1365,7 @@ test("a conceded gap carries the cursor over the loss even when the retained suf
 }, 20_000);
 test("a conceded gap publishes the sequences live delivery already carried instead of dropping them", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, warnings }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost(2);
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1429,7 +1464,7 @@ test("a conceded gap publishes the sequences live delivery already carried inste
 
 test("a frame the surface refused stays above the cursor and is re-served by the next replay", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1466,7 +1501,7 @@ test("a frame the surface refused stays above the cursor and is re-served by the
 
 test("an ambiguously acknowledged Slack session-ready publication is not posted twice", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1492,7 +1527,7 @@ test("an ambiguously acknowledged Slack session-ready publication is not posted 
 }, 20_000);
 test("an ambiguously acknowledged Discord session-ready publication is not posted twice", async () => {
 	await withAttachedDiscordRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1514,8 +1549,8 @@ test("an ambiguously acknowledged Discord session-ready publication is not poste
 	});
 }, 20_000);
 test("an ambiguously acknowledged publication is not posted twice when reconciliation fails", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
-		await withFakeTransport(async () => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement }) => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1528,6 +1563,7 @@ test("an ambiguously acknowledged publication is not posted twice when reconcili
 			host.emit("two");
 			await awaitPosts(provider, 2);
 			await awaitReconciliationFailures(provider, 1);
+			await awaitFrameSettlement(2);
 
 			host.drop();
 			reconcile();
@@ -1544,7 +1580,7 @@ test("an ambiguously acknowledged publication is not posted twice when reconcili
 }, 20_000);
 test("a surface that refuses a frame for good concedes it instead of wedging the stream", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1590,7 +1626,7 @@ test("a surface that refuses a frame for good concedes it instead of wedging the
 
 test("a rolled endpoint's first frame gets its own delivery budget, not the previous generation's", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile, supersede }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
@@ -1640,7 +1676,7 @@ test("a rolled endpoint's first frame gets its own delivery budget, not the prev
 }, 20_000);
 test("a frame queued behind a failed publication cannot advance the cursor past it", async () => {
 	await withAttachedSessionRuntime(async ({ runtime, provider, warnings, reconcile }) => {
-		await withFakeTransport(async () => {
+		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
 			host.accept(await awaitSocket(1));
