@@ -2023,8 +2023,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const blocks = output.content as Block[];
 			const blocksByAnthropicIndex = new Map<number, Block>();
 			const truncatedToolCalls = new Set<ToolCall>();
-			let sawTerminalStopReason = false;
-			let sawDuplicateContentBlockIndex = false;
 			// Bounded diagnostic for degraded primitive increments: at most one
 			// warning per delta type per stream invocation, naming only the
 			// envelope shape (delta type and received typeof) — never the payload.
@@ -2060,9 +2058,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 						orphaned.incompleteArgumentsReason = "truncated";
 						truncatedToolCalls.add(orphaned);
 					}
-					delete (orphaned as { index?: number }).index;
-					delete (orphaned as { partialJson?: string }).partialJson;
-					sawDuplicateContentBlockIndex = true;
+					if (block.type === "toolCall") {
+						block.incompleteArguments = true;
+						block.incompleteArgumentsReason = "ambiguous";
+					}
+					throw new Error("Anthropic stream reused an active content block index");
 				}
 				blocksByAnthropicIndex.set(anthropicIndex, block);
 			};
@@ -2077,7 +2077,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				output.stopReason = "stop";
 				firstTokenTime = undefined;
 				truncatedToolCalls.clear();
-				sawTerminalStopReason = false;
 			};
 			const idleTimeoutMs =
 				options?.streamIdleTimeoutMs ??
@@ -2402,7 +2401,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 										partial: output,
 									});
 								} else if (block.type === "toolCall") {
-									if (!isCompleteJson(block.partialJson)) truncatedToolCalls.add(block);
+									if (!isCompleteJson(block.partialJson)) {
+										truncatedToolCalls.add(block);
+										block.incompleteArguments = true;
+										block.incompleteArgumentsReason = "truncated";
+									}
 									if (block.partialJson.trim()) {
 										const parsedArguments: unknown = parseStreamingJson(block.partialJson);
 										if (
@@ -2434,7 +2437,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							if (rawStopReason) {
 								output.stopReason = isProviderSafetyStop ? "error" : mapStopReason(rawStopReason);
 								sawTerminalEnvelope = true;
-								sawTerminalStopReason = true;
 							}
 							if (isProviderSafetyStop) {
 								sawProviderSafetyStop = true;
@@ -2903,10 +2905,8 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				delete (block as { index?: number }).index;
 				if (block.type === "toolCall") {
 					truncatedToolCalls.add(block);
-					if (isCompleteJson(block.partialJson)) {
-						block.incompleteArguments = true;
-						block.incompleteArgumentsReason = "truncated";
-					}
+					block.incompleteArguments = true;
+					block.incompleteArgumentsReason = "truncated";
 					if (block.partialJson.trim()) {
 						block.arguments = parseStreamingJson(block.partialJson);
 						if (findUnnecessaryUnicodeEscape(block.partialJson)) {
@@ -2917,16 +2917,11 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				}
 			}
 			blocksByAnthropicIndex.clear();
-			if (output.stopReason === "length" || !sawTerminalStopReason) {
-				for (const block of output.content) {
-					if (block.type === "toolCall" && truncatedToolCalls.has(block)) {
-						block.incompleteArguments = true;
-						block.incompleteArgumentsReason = "truncated";
-					}
+			for (const block of output.content) {
+				if (block.type === "toolCall" && truncatedToolCalls.has(block)) {
+					block.incompleteArguments = true;
+					block.incompleteArgumentsReason = "truncated";
 				}
-			}
-			if (sawDuplicateContentBlockIndex) {
-				throw new Error("Anthropic stream reused an active content block index");
 			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
