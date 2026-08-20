@@ -22,18 +22,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import {
-	getCrashEventsPath,
-	getCrashIndexPath,
-	getCrashLogPath,
-	getHandledErrorEventsPath,
-	getHandledErrorIndexPath,
-	getHandledErrorLogPath,
-	getTrustedAgentFile,
-	isProjectEnvDeclaration,
-	normalizeCrashFrames,
-	VERSION,
-} from "@gajae-code/utils";
+import { getTrustedAgentFile, normalizeCrashFrames, VERSION } from "@gajae-code/utils";
 import { $credentialEnv } from "@gajae-code/utils/env";
 import {
 	type CrashSignatureView,
@@ -227,20 +216,18 @@ function relayEventId(signature: CrashSignatureView): string {
  * declarations before resolving these paths, including dotenv-expanded values.
  */
 export function resolveTrustedRelayStatePaths(): CrashStatePaths {
-	const useTrustedAgent = isProjectEnvDeclaration("XDG_STATE_HOME");
 	return {
-		index: useTrustedAgent ? getTrustedAgentFile("gjc-crash-index.json") : getCrashIndexPath(),
-		events: useTrustedAgent ? getTrustedAgentFile("gjc-crash-events.jsonl") : getCrashEventsPath(),
-		crashLog: useTrustedAgent ? getTrustedAgentFile("gjc-crash.log") : getCrashLogPath(),
+		index: getTrustedAgentFile("gjc-crash-index.json"),
+		events: getTrustedAgentFile("gjc-crash-events.jsonl"),
+		crashLog: getTrustedAgentFile("gjc-crash.log"),
 	};
 }
 
 export function resolveTrustedHandledRelayStatePaths(): CrashStatePaths {
-	const useTrustedAgent = isProjectEnvDeclaration("XDG_STATE_HOME");
 	return {
-		index: useTrustedAgent ? getTrustedAgentFile("gjc-error-index.json") : getHandledErrorIndexPath(),
-		events: useTrustedAgent ? getTrustedAgentFile("gjc-error-events.jsonl") : getHandledErrorEventsPath(),
-		crashLog: useTrustedAgent ? getTrustedAgentFile("gjc-error.log") : getHandledErrorLogPath(),
+		index: getTrustedAgentFile("gjc-error-index.json"),
+		events: getTrustedAgentFile("gjc-error-events.jsonl"),
+		crashLog: getTrustedAgentFile("gjc-error.log"),
 	};
 }
 

@@ -937,7 +937,7 @@ describe("relay trust boundary against a hostile checkout", () => {
 			for (const filePath of Object.values(store)) expect(filePath.startsWith(hostileHome)).toBe(false);
 	});
 
-	test("trusted XDG state remains the relay store when set outside the checkout", async () => {
+	test("automatic relay remains on the trusted agent store despite XDG state", async () => {
 		const xdgState = path.join(dir, "trusted-state");
 		await fs.mkdir(path.join(xdgState, "gjc"), { recursive: true });
 		const relayPath = path.resolve(import.meta.dir, "../src/crash/upstream/relay.ts");
@@ -949,7 +949,7 @@ describe("relay trust boundary against a hostile checkout", () => {
 		const result = JSON.parse(out) as { fatal: CrashStatePaths; handled: CrashStatePaths };
 		for (const store of [result.fatal, result.handled]) {
 			for (const filePath of Object.values(store))
-				expect(filePath.startsWith(path.join(xdgState, "gjc"))).toBe(true);
+				expect(filePath.startsWith(path.join(dir, ".gjc", "agent"))).toBe(true);
 		}
 	});
 
