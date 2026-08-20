@@ -1035,6 +1035,46 @@ describe("SDK broker identity and discovery", () => {
 			["io-other error", /sdk\/broker\.json could not be opened \(other error\)/],
 			["future-reason", /sdk\/broker\.json withheld publication authority \(future-reason\)/],
 		];
+		// `unsupported-platform` is the Windows acquisition refusal: the object in
+		// the native message is the directory authority targets, and the rendering
+		// must name the unimplemented platform, never a stage that did not run.
+		const platformCases: [string, string, RegExp][] = [
+			["sdk", "unsupported-platform", /retained publication authority is not implemented on this platform/],
+		];
+		for (const [object, reason, expected] of platformCases) {
+			const dir = await temp();
+			const nativeFailure = new Error(
+				`Retained broker publication authority is unavailable. [retained-publication object=${object}; reason=${reason}]`,
+			);
+			const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+				throw nativeFailure;
+			});
+			try {
+				const refusal = await publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "unsupported-platform",
+					ownerId: "unsupported-platform",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "unsupported-platform-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}).then(
+					() => undefined,
+					(error: unknown) => error as Error,
+				);
+				expect(refusal?.message).toMatch(expected);
+				expect(refusal?.message).not.toContain("could not be opened");
+				expect(refusal?.message).not.toContain("current observed state");
+				expect(refusal?.cause).toBe(nativeFailure);
+			} finally {
+				retain.mockRestore();
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		}
 		for (const [reason, expected] of cases) {
 			const dir = await temp();
 			const nativeFailure = new Error(
