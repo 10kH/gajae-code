@@ -767,11 +767,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (!attachLiveProgress) return {};
 		const liveProgressAvailable = manager.hasLiveSubagent(record.subagentId);
 		if (!liveProgressAvailable) return { liveProgressAvailable: false };
-		const progress = manager.getSubagentProgress(record.subagentId);
-		return {
-			liveProgressAvailable: true,
-			...(progress ? { progress } : {}),
-		};
+		// AgentProgress includes model-generated deltas, tool arguments, nested
+		// task details, and arbitrary tool output. None is an approved public
+		// subagent payload, so await receipts expose only liveness. Terminal public
+		// output continues through the bounded result/error receipt and agent://.
+		return { liveProgressAvailable: true };
 	}
 
 	#recordSnapshot(

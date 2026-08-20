@@ -265,6 +265,7 @@ export const subagentToolRenderer = {
 		}
 
 		const runningCount = subagents.filter(s => s.status === "running").length;
+		const failedCount = subagents.filter(s => s.status === "failed" || s.status === "not_found").length;
 		const interrupted = result.details?.interrupted === true;
 
 		// Each snapshot's rendered-state signature is constant for this component
@@ -280,14 +281,16 @@ export const subagentToolRenderer = {
 				// it is never gated by the heavy body cache.
 				const header = renderStatusLine(
 					{
-						icon: interrupted ? "warning" : runningCount > 0 ? "info" : "success",
+						icon: interrupted ? "warning" : runningCount > 0 ? "info" : failedCount > 0 ? "error" : "success",
 						spinnerFrame: !interrupted && runningCount > 0 ? options.spinnerFrame : undefined,
-						title: interrupted ? "Subagent await interrupted" : "Subagent",
+						title: interrupted ? "Subagent await interrupted" : failedCount > 0 ? "Subagent failed" : "Subagent",
 						description: interrupted
 							? "child subagents continue"
 							: runningCount > 0
 								? `awaiting ${runningCount} of ${subagents.length}`
-								: `${subagents.length} ${subagents.length === 1 ? "subagent" : "subagents"}`,
+								: failedCount > 0
+									? `${failedCount} ${failedCount === 1 ? "subagent" : "subagents"} failed`
+									: `${subagents.length} ${subagents.length === 1 ? "subagent" : "subagents"}`,
 					},
 					theme,
 				);

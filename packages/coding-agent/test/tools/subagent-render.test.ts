@@ -179,6 +179,14 @@ describe("subagentToolRenderer", () => {
 		expect(out).not.toContain("ctrl+s");
 	});
 
+	it("renders a failed aggregate await as an error", () => {
+		const out = render({
+			subagents: [snapshot({ id: "0-Fail", status: "failed", errorText: "stream stalled" })],
+		});
+		expect(out).toContain("Subagent failed");
+		expect(out).toContain("1 subagent failed");
+	});
+
 	it("caps the result preview at one line collapsed and at four lines expanded (AC2)", () => {
 		const details: SubagentToolDetails = {
 			subagents: [
