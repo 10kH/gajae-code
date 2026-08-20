@@ -80,6 +80,81 @@ describe("online-if-uncached model refresh", () => {
 		expect(result.models.map(entry => entry.id)).toEqual(["static", "cached"]);
 	});
 
+	test("refreshes a fresh legacy cache when provenance enables dynamic discovery", async () => {
+		const providerId = "cache-legacy-dynamic-catalog";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		let discoveryCalls = 0;
+		writeModelCache(providerId, now, staticModels, true, fingerprint(staticModels), cacheDbPath);
+
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: provenance,
+				now: () => now,
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return [model(providerId, "dynamic")];
+				},
+			},
+			"online-if-uncached",
+		);
+
+		expect(discoveryCalls).toBe(1);
+		expect(result.fetched).toBe(true);
+		expect(result.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
+		expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toMatchObject({
+			authoritative: true,
+			dynamicModelIds: ["dynamic"],
+			dynamicModelProvenance: provenance,
+		});
+	});
+
+	test("coalesces concurrent failed refreshes of a legacy provenance cache", async () => {
+		const providerId = "cache-concurrent-legacy-dynamic-catalog";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		const fetchStarted = Promise.withResolvers<void>();
+		const releaseFetch = Promise.withResolvers<void>();
+		let discoveryCalls = 0;
+		writeModelCache(providerId, now, staticModels, true, fingerprint(staticModels), cacheDbPath);
+		const options = {
+			providerId,
+			staticModels,
+			cacheDbPath,
+			cacheDynamicModelProvenance: provenance,
+			now: () => now,
+			fetchDynamicModels: async () => {
+				discoveryCalls += 1;
+				fetchStarted.resolve();
+				await releaseFetch.promise;
+				return null;
+			},
+		};
+
+		const first = resolveProviderModels<Api>(options, "online-if-uncached");
+		await fetchStarted.promise;
+		const second = resolveProviderModels<Api>(options, "online-if-uncached");
+		expect(discoveryCalls).toBe(1);
+
+		releaseFetch.resolve();
+		const [firstResult, secondResult] = await Promise.all([first, second]);
+		expect(firstResult.stale).toBe(true);
+		expect(secondResult.stale).toBe(true);
+		expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toMatchObject({
+			authoritative: false,
+			dynamicModelIds: [],
+			dynamicModelProvenance: provenance,
+		});
+
+		await resolveProviderModels<Api>(options, "online-if-uncached");
+		expect(discoveryCalls).toBe(1);
+	});
+
 	test("retains authoritative dynamic IDs separately from merged static models", async () => {
 		const providerId = "cache-authoritative-ids";
 		const staticModels = [model(providerId, "static")];
@@ -285,6 +360,37 @@ describe("online-if-uncached model refresh", () => {
 		expect(discoveryCalls).toBe(1);
 		expect(atBoundary.stale).toBe(false);
 		expect(atBoundary.models.some(entry => entry.id === "network")).toBe(true);
+	});
+
+	test("preserves retry backoff after discovery fails without provenance", async () => {
+		const providerId = "cache-failed-discovery-without-provenance";
+		const staticModels = [model(providerId, "static")];
+		const cachedAt = 1_700_000_000_000;
+		let now = cachedAt;
+		let discoveryCalls = 0;
+		const options = {
+			providerId,
+			staticModels,
+			cacheDbPath,
+			now: () => now,
+			fetchDynamicModels: async () => {
+				discoveryCalls += 1;
+				return null;
+			},
+		};
+
+		await resolveProviderModels<Api>(options, "online-if-uncached");
+		expect(discoveryCalls).toBe(1);
+		expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)?.dynamicModelIds).toBeUndefined();
+
+		now = cachedAt + NON_AUTHORITATIVE_RETRY_MS - 1;
+		const beforeBoundary = await resolveProviderModels<Api>(options, "online-if-uncached");
+		expect(discoveryCalls).toBe(1);
+		expect(beforeBoundary.stale).toBe(true);
+
+		now = cachedAt + NON_AUTHORITATIVE_RETRY_MS;
+		await resolveProviderModels<Api>(options, "online-if-uncached");
+		expect(discoveryCalls).toBe(2);
 	});
 
 	test("falls back safely when discovery throws or returns null", async () => {

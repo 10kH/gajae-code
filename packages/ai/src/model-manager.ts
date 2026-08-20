@@ -8,6 +8,14 @@ import type { Api, Model, Provider } from "./types";
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
 
+// A legacy row has no dynamic-ID marker, so concurrent cold-start resolutions
+// would otherwise all fetch before the first one can publish that marker.
+const legacyDynamicRefreshes = new Map<string, Promise<void>>();
+
+function legacyDynamicRefreshKey(providerId: Provider, cacheDbPath: string | undefined, provenance: string): string {
+	return `${cacheDbPath ?? "<default>"}\0${providerId}\0${provenance}`;
+}
+
 /**
  * Controls when dynamic endpoint models should be fetched.
  */
@@ -124,6 +132,43 @@ function passModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
  * Later sources override earlier ones by model id.
  */
 export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPayload = unknown>(
+	options: ModelManagerOptions<TApi, TModelsDevPayload>,
+	strategy: ModelRefreshStrategy = "online-if-uncached",
+): Promise<ModelResolutionResult<TApi>> {
+	const provenance = options.cacheDynamicModelProvenance;
+	const now = options.now ?? Date.now;
+	const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+	const legacyCache = readModelCache<TApi>(options.providerId, ttlMs, now, options.cacheDbPath);
+	if (
+		strategy === "offline" ||
+		typeof options.fetchDynamicModels !== "function" ||
+		provenance === undefined ||
+		legacyCache === null ||
+		legacyCache.dynamicModelIds !== undefined
+	) {
+		return resolveProviderModelsUncoalesced(options, strategy);
+	}
+
+	const refreshKey = legacyDynamicRefreshKey(options.providerId, options.cacheDbPath, provenance);
+	const inFlightRefresh = legacyDynamicRefreshes.get(refreshKey);
+	if (inFlightRefresh) {
+		await inFlightRefresh;
+		return resolveProviderModelsUncoalesced(options, strategy);
+	}
+
+	const refreshCompletion = Promise.withResolvers<void>();
+	legacyDynamicRefreshes.set(refreshKey, refreshCompletion.promise);
+	try {
+		return await resolveProviderModelsUncoalesced(options, strategy);
+	} finally {
+		if (legacyDynamicRefreshes.get(refreshKey) === refreshCompletion.promise) {
+			legacyDynamicRefreshes.delete(refreshKey);
+		}
+		refreshCompletion.resolve();
+	}
+}
+
+async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsDevPayload = unknown>(
 	options: ModelManagerOptions<TApi, TModelsDevPayload>,
 	strategy: ModelRefreshStrategy = "online-if-uncached",
 ): Promise<ModelResolutionResult<TApi>> {
