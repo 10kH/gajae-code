@@ -520,15 +520,16 @@ function evictOne(index: CrashIndex): boolean {
  * first thing sacrificed.  Build the candidate first so callers never see a
  * partially-mutated entry when even the mandatory fields cannot fit.
  */
-function withRefusalWatermark(
-	existing: CrashSignatureEntry,
-	recordId: string,
-	contractVersion: string,
-): CrashSignatureEntry | undefined {
-	const candidate = { ...existing, relayRefusedRecordId: recordId, relayRefusedVersion: contractVersion };
+function normalizeEntryForPersistence(candidate: CrashSignatureEntry): CrashSignatureEntry | undefined {
 	const fits = (value: CrashSignatureEntry): boolean =>
 		Buffer.byteLength(JSON.stringify(value), "utf8") <= CRASH_INDEX_ENTRY_MAX_BYTES;
 	if (fits(candidate)) return candidate;
+	if (candidate.commentedIssues !== undefined) {
+		for (let start = 0; start < candidate.commentedIssues.length; start++) {
+			const trimmed = { ...candidate, commentedIssues: candidate.commentedIssues.slice(start) };
+			if (fits(trimmed)) return trimmed;
+		}
+	}
 
 	// Report/display metadata is advisory and can be reconstructed from the
 	// journal or re-entered by the user. Relay watermarks are intentionally not
@@ -543,6 +544,14 @@ function withRefusalWatermark(
 		if (fits(candidate)) return candidate;
 	}
 	return undefined;
+}
+
+function withRefusalWatermark(
+	existing: CrashSignatureEntry,
+	recordId: string,
+	contractVersion: string,
+): CrashSignatureEntry | undefined {
+	return normalizeEntryForPersistence({ ...existing, relayRefusedRecordId: recordId, relayRefusedVersion: contractVersion });
 }
 
 /** Apply one journal event to the in-memory index. Returns whether it changed anything. */
@@ -608,21 +617,28 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		return false;
 	}
 	if (index.recentEventIds.includes(event.recordId)) return false;
-	index.recentEventIds.push(event.recordId);
-	if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
-		index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
 	// A journal occurrence is newer authority than a prior eviction tombstone.
 	// Clear it before capacity eviction so a full retirement ledger cannot block
 	// the signature's explicit revival.
 	if (existing) {
-		existing.lifetimeCount += 1;
-		existing.firstSeen = Math.min(existing.firstSeen, event.at);
-		existing.lastAppendRecordId = event.recordId;
+		const updated: CrashSignatureEntry = {
+			...existing,
+			lifetimeCount: existing.lifetimeCount + 1,
+			firstSeen: Math.min(existing.firstSeen, event.at),
+			lastAppendRecordId: event.recordId,
+		};
 		if (event.at >= existing.lastSeen) {
-			existing.lastSeen = event.at;
-			existing.lastRecordId = event.recordId;
-			if (event.messageClass) existing.messageClass = boundMessageClass(event.messageClass);
+			updated.lastSeen = event.at;
+			updated.lastRecordId = event.recordId;
+			if (event.messageClass) updated.messageClass = boundMessageClass(event.messageClass);
 		}
+		const normalized = normalizeEntryForPersistence(updated);
+		if (!normalized) return false;
+		for (const key of Object.keys(existing)) delete (existing as unknown as Record<string, unknown>)[key];
+		Object.assign(existing, normalized);
+		index.recentEventIds.push(event.recordId);
+		if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
+			index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
 		return true;
 	}
 	if (Object.keys(index.signatures).length >= CRASH_INDEX_MAX_SIGNATURES && !evictOne(index)) {
@@ -642,6 +658,9 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		lastRecordId: event.recordId,
 		lastAppendRecordId: event.recordId,
 	};
+	index.recentEventIds.push(event.recordId);
+	if (index.recentEventIds.length > RECENT_EVENT_ID_LIMIT)
+		index.recentEventIds.splice(0, index.recentEventIds.length - RECENT_EVENT_ID_LIMIT);
 	return true;
 }
 

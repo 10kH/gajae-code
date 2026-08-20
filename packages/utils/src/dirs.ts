@@ -264,8 +264,8 @@ class DirResolver {
 
 	// Per-category base dirs. Without XDG, all three equal configRoot / agentDir.
 	// With XDG on Linux, they point to $XDG_*_HOME/gjc/.
-	readonly #rootDirs: Record<XdgCategory, string>;
-	readonly #agentDirs: Record<XdgCategory, string>;
+	#rootDirs: Record<XdgCategory, string>;
+	#agentDirs: Record<XdgCategory, string>;
 
 	readonly #rootCache = new Map<string, string>();
 	readonly #agentCache = new Map<string, string>();
@@ -278,17 +278,14 @@ class DirResolver {
 			CONFIG_DIR_NAME;
 		const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
 		const fallbackHomeKey = authoritativeHomeKey === "HOME" ? "USERPROFILE" : "HOME";
-		const declaredHome = snapshot.values[authoritativeHomeKey] ?? snapshot.values[fallbackHomeKey];
+		const declaredHome = snapshot.values[authoritativeHomeKey];
 		const runtimeHome = process.env[authoritativeHomeKey] ?? process.env[fallbackHomeKey];
 		const accountHome = accountHomeFromSystem();
 		const ambiguousHome =
 			declaredHome !== undefined &&
-			(snapshot.dynamic.has(authoritativeHomeKey) ||
-				snapshot.dynamic.has(fallbackHomeKey) ||
-				declaredHome === runtimeHome);
+			(snapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
 		this.#trustedHome = ambiguousHome
 			? (accountHome ??
-				runtimeHome ??
 				(() => {
 					throw new Error("Unable to determine a trustworthy account home directory");
 				})())
@@ -305,40 +302,32 @@ class DirResolver {
 		this.agentDir = agentDirOverride ? path.resolve(agentDirOverride) : defaultAgent;
 		const isDefault = this.agentDir === defaultAgent;
 
-		// XDG is a Linux convention. On other platforms, or for non-default
-		// profiles, all categories resolve to the legacy paths.
+		this.#rootDirs = { data: this.configRoot, state: this.configRoot, cache: this.configRoot };
+		this.#agentDirs = { data: this.agentDir, state: this.agentDir, cache: this.agentDir };
+		this.refreshCategoryDirs(snapshot, isDefault);
+	}
+
+	private refreshCategoryDirs(snapshot: { values: Record<string, string>; dynamic: Set<string> }, isDefault = this.agentDir === path.join(this.configRoot, "agent")): void {
 		let xdgData: string | undefined;
 		let xdgState: string | undefined;
 		let xdgCache: string | undefined;
 		if ((process.platform === "linux" || process.platform === "darwin") && isDefault) {
 			const resolveIf = (envVar: string) => {
 				const value = trustedValue(envVar, snapshot);
-				if (value) {
-					try {
-						const joined = path.join(value, APP_NAME);
-						if (fs.existsSync(joined)) {
-							return joined;
-						}
-					} catch {}
+				if (!value) return undefined;
+				try {
+					const joined = path.join(value, APP_NAME);
+					return fs.existsSync(joined) ? joined : undefined;
+				} catch {
+					return undefined;
 				}
-				return undefined;
 			};
 			xdgData = resolveIf("XDG_DATA_HOME");
 			xdgState = resolveIf("XDG_STATE_HOME");
 			xdgCache = resolveIf("XDG_CACHE_HOME");
 		}
-
-		this.#rootDirs = {
-			data: xdgData ?? this.configRoot,
-			state: xdgState ?? this.configRoot,
-			cache: xdgCache ?? this.configRoot,
-		};
-		// XDG flattens the agent/ prefix: ~/.gjc/agent/sessions → $XDG_DATA_HOME/gjc/sessions
-		this.#agentDirs = {
-			data: xdgData ?? this.agentDir,
-			state: xdgState ?? this.agentDir,
-			cache: xdgCache ?? this.agentDir,
-		};
+		this.#rootDirs = { data: xdgData ?? this.configRoot, state: xdgState ?? this.configRoot, cache: xdgCache ?? this.configRoot };
+		this.#agentDirs = { data: xdgData ?? this.agentDir, state: xdgState ?? this.agentDir, cache: xdgCache ?? this.agentDir };
 	}
 
 	/** Refresh caller-supplied config-dir overrides without replacing the trust snapshot. */
@@ -348,9 +337,12 @@ class DirResolver {
 			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", this.#projectEnv)) ??
 			CONFIG_DIR_NAME;
 		if (next === this.#configDirName) return;
+		const nextConfigRoot = path.join(this.#trustedHome, next);
+		const nextAgentDir = this.#agentDirOverride ? this.agentDir : path.join(nextConfigRoot, "agent");
 		this.#configDirName = next;
-		this.configRoot = path.join(this.#trustedHome, next);
-		if (!this.#agentDirOverride) this.agentDir = path.join(this.configRoot, "agent");
+		this.configRoot = nextConfigRoot;
+		this.agentDir = nextAgentDir;
+		this.refreshCategoryDirs(this.#projectEnv);
 		this.#rootCache.clear();
 		this.#agentCache.clear();
 	}
@@ -361,6 +353,7 @@ class DirResolver {
 
 	/** Config-root subdirectory, with optional XDG override. */
 	rootSubdir(subdir: string, xdg?: XdgCategory): string {
+		this.refreshConfigDirOverride();
 		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 		const cached = this.#rootCache.get(subdir);
 		if (cached) return cached;
@@ -372,6 +365,7 @@ class DirResolver {
 
 	/** Agent subdirectory, with optional XDG override. */
 	agentSubdir(userAgentDir: string | undefined, subdir: string, xdg?: XdgCategory): string {
+		this.refreshConfigDirOverride();
 		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 		if (!userAgentDir || userAgentDir === this.agentDir) {
 			const cached = this.#agentCache.get(subdir);

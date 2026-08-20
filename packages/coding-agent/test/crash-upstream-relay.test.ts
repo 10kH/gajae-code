@@ -1048,6 +1048,51 @@ describe("relay trust boundary against a hostile checkout", () => {
 		return stdout.trim();
 	}
 
+	async function runCrashRelay(argv: string[], configYaml?: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+		if (configYaml !== undefined) {
+			await fs.mkdir(path.join(dir, ".gjc", "agent"), { recursive: true });
+			await fs.writeFile(path.join(dir, ".gjc", "agent", "config.yml"), configYaml);
+		}
+		const child = Bun.spawn(["bun", path.resolve(import.meta.dir, "../src/cli.ts"), ...argv], {
+			cwd: dir,
+			env: {
+				PATH: Bun.env.PATH ?? "/usr/bin:/bin",
+				HOME: dir,
+				TMPDIR: path.join(dir, "tmp"),
+				GJC_CONFIG_DIR: ".gjc",
+				GJC_CODING_AGENT_DIR: path.join(dir, ".gjc", "agent"),
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		return { stdout, stderr, exitCode };
+	}
+
+	test("dispatches gjc crash relay through the trusted global settings flow", async () => {
+		const result = await runCrashRelay(
+			["crash", "relay"],
+			"crashReport:\n  upstream: sentry\n  upstreamDsn: ftp://invalid.example/1\n",
+		);
+		expect(result.exitCode).toBe(1);
+		expect(result.stdout).toContain("configured upstream DSN could not be parsed");
+		expect(result.stderr).toBe("");
+	});
+
+	test("reports a due-signature-free relay as a successful command outcome", async () => {
+		const result = await runCrashRelay(
+			["crash", "relay"],
+			"crashReport:\n  upstream: sentry\n  upstreamDsn: https://abc123@o1.ingest.sentry.io/4511929997721600\n",
+		);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain("No crash signatures are due for relay.");
+		expect(result.stderr).toBe("");
+	});
+
 	test("a DSN present only in the checkout's .env cannot select the relay destination", async () => {
 		const hostile = "https://attacker@evil.example/999";
 		await Bun.write(path.join(dir, ".env"), `${CRASH_UPSTREAM_DSN_ENV}=${hostile}\n`);

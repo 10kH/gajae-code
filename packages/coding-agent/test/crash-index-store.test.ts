@@ -125,6 +125,9 @@ describe("compactCrashIndex", () => {
 			signatures: { [fingerprint]: legacyEntry },
 		};
 		expect(Buffer.byteLength(JSON.stringify(legacyEntry), "utf8")).toBeLessThanOrEqual(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(
+			Buffer.byteLength(JSON.stringify({ ...legacyEntry, lastAppendRecordId: recordId(21) }), "utf8"),
+		).toBeGreaterThan(CRASH_INDEX_ENTRY_MAX_BYTES);
 		await fs.writeFile(paths.index, `${JSON.stringify(index)}\n`);
 		appendCrashEvent({ ...occurrence(fingerprint, recordId(21), NOW - 500), messageClass: "" }, paths.events);
 
@@ -137,6 +140,7 @@ describe("compactCrashIndex", () => {
 		const reparsed = parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW);
 		expect(reparsed?.signatures[fingerprint]?.lifetimeCount).toBe(2);
 		expect(reparsed?.signatures[fingerprint]?.lastAppendRecordId).toBe(recordId(21));
+		expect(reparsed?.signatures[fingerprint]?.relayedRecordId).toBe(firstRecordId);
 	});
 
 	it("persists refusal markers at the exact entry cap by dropping report metadata", () => {
