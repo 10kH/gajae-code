@@ -1020,6 +1020,55 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
+	it("names the acquisition stage the native layer refused, not always the open", async () => {
+		// The native reason carries the stage that refused. Rendering every reason as
+		// a failed open would state something the native layer never reported -- a
+		// read of an already-open descriptor, or an fstat, is not an open failure --
+		// and the whole point of this diagnostic is that its claim is exact.
+		if (process.platform === "win32") return;
+		const cases: [string, RegExp][] = [
+			["errno-EPERM", /sdk\/broker\.json could not be opened \(EPERM\)/],
+			["read-operation would block", /sdk\/broker\.json could not be read \(operation would block\)/],
+			["clone-too many open files", /sdk\/broker\.json could not be inspected \(too many open files\)/],
+			["metadata", /sdk\/broker\.json could not be inspected(?!\s*\()/],
+			["metadata-permission denied", /sdk\/broker\.json could not be inspected \(permission denied\)/],
+			["io-other error", /sdk\/broker\.json could not be opened \(other error\)/],
+			["future-reason", /sdk\/broker\.json withheld publication authority \(future-reason\)/],
+		];
+		for (const [reason, expected] of cases) {
+			const dir = await temp();
+			const nativeFailure = new Error(
+				`Retained broker publication authority is unavailable. [retained-publication object=sdk/broker.json; reason=${reason}]`,
+			);
+			const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+				throw nativeFailure;
+			});
+			try {
+				const refusal = await publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "stage-named",
+					ownerId: "stage-named",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "stage-named-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}).then(
+					() => undefined,
+					(error: unknown) => error as Error,
+				);
+				expect(refusal?.message).toMatch(expected);
+				expect(refusal?.message).not.toContain("current observed state");
+				expect(refusal?.cause).toBe(nativeFailure);
+			} finally {
+				retain.mockRestore();
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		}
+	});
 	it("escapes control and bidi characters in the diagnostic agent directory", async () => {
 		if (process.platform === "win32") return;
 		const root = await temp();
