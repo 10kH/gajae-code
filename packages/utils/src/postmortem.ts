@@ -12,10 +12,10 @@ import inspector from "node:inspector";
 import * as path from "node:path";
 import { isMainThread } from "node:worker_threads";
 import { BROKEN_PIPE_EXIT_CODE, createProcessStdoutEpipeClassifier } from "./broken-pipe";
-import { computeCrashFingerprint, formatCrashRecordMarker } from "./crash-fingerprint";
-import { appendFatalCrashEvent } from "./crash-journal";
+import { type CrashFingerprint, computeCrashFingerprint, formatCrashRecordMarker } from "./crash-fingerprint";
+import { appendCrashEvent, appendFatalCrashEvent } from "./crash-journal";
 import { redactCrashSecrets } from "./crash-redaction";
-import { getCrashEventsPath, getCrashLogPath } from "./dirs";
+import { getCrashEventsPath, getCrashLogPath, getHandledErrorEventsPath, getHandledErrorLogPath } from "./dirs";
 import * as logger from "./logger";
 import { safeStderrWrite } from "./safe-stderr";
 
@@ -444,7 +444,93 @@ function boundCrashRecord(report: string, maxBytes: number = CRASH_RECORD_MAX_BY
  * `process.exit`. Returns the path written, or `undefined` on failure.
  */
 export function recordFatalCrash(label: string, reason: unknown, options: CrashRecordOptions = {}): string | undefined {
-	return writeCrashRecord(label, describeFatal(reason), options);
+	const written = writeCrashRecord(label, describeFatal(reason), options);
+	if (!written) return undefined;
+	appendFatalCrashEvent(
+		{
+			kind: "occurrence",
+			fingerprint: written.fingerprint.fingerprint,
+			fpv: written.fingerprint.version,
+			recordId: written.recordId,
+			at: written.now.getTime(),
+			errorName: written.fingerprint.errorName,
+			messageClass: written.fingerprint.messageClass,
+		},
+		getCrashEventsTarget(written.target, options.path),
+	);
+	return written.target;
+}
+
+const handledErrorFingerprints = new Set<string>();
+const HANDLED_ERROR_FINGERPRINT_LIMIT = 256;
+
+export interface HandledErrorRecordOptions {
+	/** Override the log target; defaults to `getHandledErrorLogPath()`. */
+	readonly path?: string;
+	readonly now?: Date;
+}
+
+/**
+ * Record one handled (non-fatal) error, at most once per fingerprint while it
+ * stays hot.
+ *
+ * A handled error is only useful when its stack establishes a stable identity.
+ * The bounded process-local set prevents one retry loop from turning routine
+ * failures into disk churn while preserving the fatal crash store's signal.
+ * The set is LRU with a hard cap: at saturation the coldest fingerprint is
+ * evicted so a long-lived process keeps recording newly seen failure classes
+ * instead of going permanently blind past the cap.
+ */
+export function recordHandledError(
+	label: string,
+	error: unknown,
+	options: HandledErrorRecordOptions = {},
+): string | undefined {
+	try {
+		if (!(error instanceof Error) || typeof error.stack !== "string" || error.stack.length === 0) return undefined;
+		const fatal = describeFatal(error);
+		const fingerprint = computeCrashFingerprint(fatal).fingerprint;
+		if (handledErrorFingerprints.has(fingerprint)) {
+			// Still hot: dedupe, but refresh recency so an actively failing class
+			// is not the one evicted under pressure.
+			handledErrorFingerprints.delete(fingerprint);
+			handledErrorFingerprints.add(fingerprint);
+			return undefined;
+		}
+		if (handledErrorFingerprints.size >= HANDLED_ERROR_FINGERPRINT_LIMIT) {
+			const coldest = handledErrorFingerprints.values().next().value;
+			if (coldest !== undefined) handledErrorFingerprints.delete(coldest);
+		}
+		handledErrorFingerprints.add(fingerprint);
+		const written = writeCrashRecord(label, fatal, {
+			path: options.path ?? getHandledErrorLogPath(),
+			now: options.now,
+		});
+		if (!written) {
+			handledErrorFingerprints.delete(fingerprint);
+			return undefined;
+		}
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: written.fingerprint.fingerprint,
+				fpv: written.fingerprint.version,
+				recordId: written.recordId,
+				at: written.now.getTime(),
+				errorName: written.fingerprint.errorName,
+				messageClass: written.fingerprint.messageClass,
+			},
+			getHandledErrorEventsTarget(written.target, options.path),
+		);
+		return written.target;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Reset handled-error process dedupe so isolated tests can exercise repeats. */
+export function resetHandledErrorDedupeForTest(): void {
+	handledErrorFingerprints.clear();
 }
 
 interface CrashRecordOptions {
@@ -452,7 +538,30 @@ interface CrashRecordOptions {
 	now?: Date;
 }
 
-function writeCrashRecord(label: string, fatal: FatalDiagnostic, options: CrashRecordOptions = {}): string | undefined {
+interface WrittenCrashRecord {
+	readonly target: string;
+	readonly now: Date;
+	readonly fingerprint: CrashFingerprint;
+	readonly recordId: string;
+}
+
+function getCrashEventsTarget(target: string, configuredPath: string | undefined): string {
+	return configuredPath === undefined
+		? getCrashEventsPath()
+		: path.join(path.dirname(target), path.basename(getCrashEventsPath()));
+}
+
+function getHandledErrorEventsTarget(target: string, configuredPath: string | undefined): string {
+	return configuredPath === undefined
+		? getHandledErrorEventsPath()
+		: path.join(path.dirname(target), path.basename(getHandledErrorEventsPath()));
+}
+
+function writeCrashRecord(
+	label: string,
+	fatal: FatalDiagnostic,
+	options: CrashRecordOptions = {},
+): WrittenCrashRecord | undefined {
 	try {
 		const target = options.path ?? getCrashLogPath();
 		const now = options.now ?? new Date();
@@ -489,26 +598,7 @@ function writeCrashRecord(label: string, fatal: FatalDiagnostic, options: CrashR
 		try {
 			fs.chmodSync(target, 0o600);
 		} catch {}
-		// The journal always lives beside the crash log it describes, so an
-		// overridden crash-log path (tests, alternate agent dirs) keeps its events
-		// in the same scope instead of leaking into the user's agent dir.
-		const eventsPath =
-			options.path === undefined
-				? getCrashEventsPath()
-				: path.join(path.dirname(target), path.basename(getCrashEventsPath()));
-		appendFatalCrashEvent(
-			{
-				kind: "occurrence",
-				fingerprint: fingerprint.fingerprint,
-				fpv: fingerprint.version,
-				recordId,
-				at: now.getTime(),
-				errorName: fingerprint.errorName,
-				messageClass: fingerprint.messageClass,
-			},
-			eventsPath,
-		);
-		return target;
+		return { target, now, fingerprint, recordId };
 	} catch {
 		return undefined;
 	}
@@ -538,7 +628,7 @@ async function handleFatalError(label: string, reason: unknown, cleanupReason: R
 	// Persist first: the rotation-immune record must land before any
 	// best-effort stderr output, so a slow or failing stderr cannot cost the
 	// crash record. Cleanup (which may itself hang or fail) runs afterwards.
-	const crashLogPath = writeCrashRecord(label, fatal);
+	const crashLogPath = recordFatalCrash(label, reason);
 	safeStderrWrite(formatFatalError(label, fatal));
 	if (crashLogPath) safeStderrWrite(`[${label}] crash recorded at ${crashLogPath}\n`);
 	if (!quietShutdownStarted) {

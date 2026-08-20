@@ -609,6 +609,21 @@ const BROKER_PUBLICATION_GRACE_MS = 15_000;
 // its own deadline, generous enough to absorb transient filesystem faults and far
 // longer than the loss grace.
 const BROKER_AMBIGUITY_GRACE_MS = 120_000;
+// Both deadlines above are armed by a fence, and a fence is only reachable from an
+// observation that returned or an error that was thrown. Every step of the
+// publication tick is IO that can do neither: the session-index lock, the retained
+// heartbeat write, the host checkpoint. A tick whose awaits never settle therefore
+// fences nothing, and the process stays alive holding its port and its lock while
+// its published heartbeat ages past the TTL peers read it with -- and peers refuse
+// to reclaim a lock whose owner pid is alive, so the deadlock is permanent (#4704).
+// Liveness is proven by publishing, not by being scheduled, so this deadline runs
+// from the last *successful* publication and is the only bound that survives a
+// stalled tick.
+const BROKER_LIVENESS_GRACE_MS = 60_000;
+// The floor must still be a multiple of the peer-visible TTL: with a longer TTL
+// configured, a fixed floor would terminate a broker whose published heartbeat is
+// still fresh to every reader.
+const BROKER_LIVENESS_TTL_MULTIPLIER = 4;
 const BROKER_SETTLEMENT_MS = 2_000;
 
 export interface StartupAdmissionTiming {
@@ -754,6 +769,8 @@ const terminalPersistenceHooksForTest = new WeakMap<Broker, () => void>();
 const ambiguityGraceOverridesForTest = new WeakMap<Broker, number>();
 const publicationObservationOverridesForTest = new WeakMap<Broker, BrokerPublicationObservation>();
 const lockArtifactGraceOverridesForTest = new WeakMap<Broker, number>();
+const livenessGraceOverridesForTest = new WeakMap<Broker, number>();
+const heartbeatStallOverridesForTest = new WeakMap<Broker, PromiseWithResolvers<void>>();
 
 export class Broker {
 	readonly settings: ResolvedBrokerSettings;
@@ -770,6 +787,8 @@ export class Broker {
 	#publicationState: BrokerPublicationState = "healthy-owned";
 	#lossAt: bigint | null = null;
 	#ambiguousAt: bigint | null = null;
+	#publishedAt: bigint | null = null;
+	#watchInFlight = false;
 	#stopping = false;
 	#transport: BrokerTransport | null = null;
 	#heartbeatTimer: NodeJS.Timeout | null = null;
@@ -943,6 +962,8 @@ export class Broker {
 		this.#publicationState = "healthy-owned";
 		this.#lossAt = null;
 		this.#ambiguousAt = null;
+		this.#publishedAt = null;
+		this.#watchInFlight = false;
 		await Promise.all([this.ledger.assertSupportedStateVersions(), readBrokerDiscovery(this.settings.agentDir)]);
 		await fs.mkdir(path.dirname(this.#lock), { recursive: true, mode: 0o700 });
 		for (;;) {
@@ -1012,6 +1033,7 @@ export class Broker {
 			};
 			this.#publication = await publishBrokerDiscovery(this.settings.agentDir, this.discovery);
 			this.#publicationState = "healthy-owned";
+			this.#publishedAt = process.hrtime.bigint();
 			const cadenceMs = Math.max(
 				10,
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
@@ -1063,45 +1085,102 @@ export class Broker {
 		const ambiguityGraceMs = ambiguityGraceOverridesForTest.get(this) ?? BROKER_AMBIGUITY_GRACE_MS;
 		return this.#ambiguousAt !== null && now - this.#ambiguousAt >= BigInt(ambiguityGraceMs) * 1_000_000n;
 	}
+	/**
+	 * The wall-clock bound on unproven liveness, never shorter than the window peers
+	 * use to judge the published heartbeat stale.
+	 */
+	#livenessGraceMs(): number {
+		return (
+			livenessGraceOverridesForTest.get(this) ??
+			Math.max(BROKER_LIVENESS_GRACE_MS, this.settings.heartbeatTtlMs * BROKER_LIVENESS_TTL_MULTIPLIER)
+		);
+	}
+	/**
+	 * Whether no publication has succeeded within the liveness grace. Unlike the fence
+	 * deadlines this needs no observation and no thrown error, so it still fires when
+	 * the publication chain is stalled inside an await that never settles.
+	 */
+	#unprovenBeyondLivenessDeadline(): boolean {
+		if (this.#publishedAt === null) return false;
+		return process.hrtime.bigint() - this.#publishedAt >= BigInt(this.#livenessGraceMs()) * 1_000_000n;
+	}
 	async #watchPublication(writeHeartbeat = true): Promise<void> {
-		if (!this.#publication || this.#publicationState === "stopping") return;
-		let observation: ReturnType<RetainedBrokerDiscovery["observe"]>;
+		const publication = this.#publication;
+		if (!publication || this.#publicationState === "stopping") return;
+		// Evaluated before any await, and on every tick even while an earlier tick is
+		// still in flight, so a stalled chain cannot starve the only path that ends it.
+		// The lock is deliberately left behind: this process is about to exit, and the
+		// dead-owner reclaim (#3963) is what hands it to the successor.
+		if (this.#unprovenBeyondLivenessDeadline()) {
+			logger.error(
+				`sdk broker: no publication has succeeded in ${this.#livenessGraceMs()}ms; terminating so peers can reclaim the lock (#4704)`,
+			);
+			void this.#complete("lost-root");
+			return;
+		}
+		// Ticks must not stack behind a stalled one: each would add another pending
+		// heartbeat write against the same retained handle for as long as the process
+		// lives.
+		if (this.#watchInFlight) return;
+		this.#watchInFlight = true;
 		try {
-			observation = publicationObservationOverridesForTest.get(this) ?? this.#publication.observe();
+			await this.#observePublication(publication, writeHeartbeat);
+		} finally {
+			if (this.#publication === publication) this.#watchInFlight = false;
+		}
+	}
+	async #observePublication(publication: RetainedBrokerDiscovery, writeHeartbeat: boolean): Promise<void> {
+		if (this.#publication !== publication || this.#publicationState === "stopping") return;
+		let observation: BrokerPublicationObservation;
+		try {
+			observation = publicationObservationOverridesForTest.get(this) ?? (await publication.observeAsync());
 		} catch {
+			if (this.#stopping || this.#publication !== publication) return;
 			this.#fence("observation-ambiguous");
 			if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
 			return;
 		}
+		if (this.#stopping || this.#publication !== publication) return;
 		if (observation === "owned") {
-			// Recover the cached publication state synchronously with the observation
-			// so request admission does not lag behind the awaited heartbeat IO.
-			// The heartbeat write that follows re-checks fresh publication authority
-			// and fences (downgrading this optimistic recovery) if ownership changed
-			// between the observation and the write.
+			// Recover the cached publication state from the observation, but keep
+			// startup admission closed until the heartbeat write has revalidated fresh
+			// authority. A replacement can win between this observation and that write;
+			// reopening here would admit lifecycle work under stale authority.
 			this.#publicationState = "healthy-owned";
-			this.#startupAdmissions.reopen();
 			this.#lossAt = null;
 			this.#ambiguousAt = null;
-			if (writeHeartbeat) await this.#writeHeartbeat();
+			if (writeHeartbeat) {
+				await this.#writeHeartbeat(publication);
+				if (this.#stopping || this.#publication !== publication || this.#publicationState !== "healthy-owned")
+					return;
+			}
+			this.#startupAdmissions.reopen();
 			if (this.#publicationState === "healthy-owned") await this.#checkpointSessionHeartbeats();
 			return;
 		}
 		this.#fence(observation === "ambiguous" ? "observation-ambiguous" : "suspect-unpublished");
 		if (this.#fencedBeyondDeadline()) void this.#complete("lost-root");
 	}
-	async #writeHeartbeat(): Promise<void> {
-		if (!this.discovery || !this.#publication || this.#publicationState === "stopping") return;
+	async #writeHeartbeat(publication: RetainedBrokerDiscovery): Promise<void> {
+		if (!this.discovery || this.#publication !== publication || this.#publicationState === "stopping") return;
+		const stall = heartbeatStallOverridesForTest.get(this);
+		if (stall) await stall.promise;
 		const heartbeatAt = Date.now();
 		try {
-			if (!(await heartbeatBrokerDiscoveryRetained(this.#publication, heartbeatAt))) {
+			if (!(await heartbeatBrokerDiscoveryRetained(publication, heartbeatAt))) {
+				if (this.#stopping || this.#publication !== publication) return;
 				this.#fence("heartbeat-ambiguous");
 				return;
 			}
 		} catch {
+			if (this.#stopping || this.#publication !== publication) return;
 			this.#fence("heartbeat-ambiguous");
 			return;
 		}
+		if (this.#stopping || this.#publication !== publication) return;
+		// The durable write landed, so liveness is proven for this cycle whatever the
+		// authority re-check below decides about this broker's cached state.
+		this.#publishedAt = process.hrtime.bigint();
 		const recovery = this.runSynchronousEffectWithFreshPublicationAuthority(() => {
 			this.discovery = { ...this.discovery!, heartbeatAt };
 		});
@@ -1109,7 +1188,8 @@ export class Broker {
 	}
 	async heartbeat(): Promise<void> {
 		if (this.#publicationState !== "healthy-owned") return;
-		await this.#writeHeartbeat();
+		const publication = this.#publication;
+		if (publication) await this.#writeHeartbeat(publication);
 	}
 	/** Re-observes provably live session hosts and checkpoints their liveness. */
 	async heartbeatSessions(now = Date.now()): Promise<number> {
@@ -1625,6 +1705,27 @@ export function setAmbiguityGraceForTest(broker: Broker, graceMs: number | undef
 export function setLockArtifactGraceForTest(broker: Broker, graceMs: number | undefined): void {
 	if (graceMs === undefined) lockArtifactGraceOverridesForTest.delete(broker);
 	else lockArtifactGraceOverridesForTest.set(broker, graceMs);
+}
+
+/** Test-only hook for shortening the bounded liveness deadline. */
+export function setLivenessGraceForTest(broker: Broker, graceMs: number | undefined): void {
+	if (graceMs === undefined) livenessGraceOverridesForTest.delete(broker);
+	else livenessGraceOverridesForTest.set(broker, graceMs);
+}
+
+/**
+ * Test-only hook for stalling the heartbeat write, reproducing a publication tick
+ * whose awaited IO does not settle. Clearing it releases the stalled tick the way
+ * recovered IO would, instead of abandoning it forever.
+ */
+export function setHeartbeatStallForTest(broker: Broker, stalled: boolean): void {
+	const stall = heartbeatStallOverridesForTest.get(broker);
+	if (stalled) {
+		if (!stall) heartbeatStallOverridesForTest.set(broker, Promise.withResolvers<void>());
+		return;
+	}
+	heartbeatStallOverridesForTest.delete(broker);
+	stall?.resolve();
 }
 
 /** Test-only hook for forcing the observation the publication watchdog sees. */

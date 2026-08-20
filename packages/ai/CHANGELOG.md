@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+- Grok Build now gets the same 300s idle window as other long-turn providers, so turns no longer stall waiting on a shorter default.
+- `getCachedUsageReport` surfaces cached usage for API-key credentials, not only OAuth accounts (#4686).
+- The auth gateway accepts explicit `null` fields on openai-chat requests instead of rejecting the payload (#4667).
+
 ## [0.14.1] - 2026-08-18
 - Anthropic clients now set an SDK request `timeout` derived from the first-event window (`resolveAnthropicSdkRequestTimeoutMs`; 300s by default for Anthropic, floored at the env/default first-event window, disabled by an explicit `streamFirstEventTimeoutMs: 0`). The Anthropic first-event watchdog deliberately arms only after response headers arrive, so a connection that silently died before headers — the exact failure mode of recent Anthropic stream instability right after a completed tool call — was previously bounded only by the SDK's 10-minute default per attempt multiplied by its internal retry budget, observable as an endless "Working…" spinner for up to an hour with no error, no retry indicator, and no automatic recovery. This mirrors the existing `resolveOpenAISdkRequestTimeoutMs` stalled-before-headers bound on the OpenAI family.
 - oMLX OpenAI-compatible completions now send `chat_template_kwargs.reasoning_effort` with `enable_thinking` when `thinkingFormat` is `qwen-chat-template`. Discovered oMLX models are treated as reasoning models with `low`/`medium`/`high` effort so local Qwen presets can differentiate roles without swapping weights.

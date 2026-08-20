@@ -10,6 +10,7 @@ import type * as path from "node:path";
 import { APP_NAME, getAgentDir } from "@gajae-code/utils";
 import { YAML } from "bun";
 import chalk from "chalk";
+import { AtomicYamlReplaceError, AtomicYamlRetargetError } from "../config/atomic-yaml-patch";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { mergeModelProfiles } from "../config/model-profiles";
 import { ModelsConfigFile } from "../config/model-registry";
@@ -388,6 +389,68 @@ function handleGet(key: string | undefined, flags: { json?: boolean; showSecrets
 	console.log(formatValue(displayValue));
 }
 
+/**
+ * `settings.set`/`unset` are synchronous in-memory writes whose persistence runs in the
+ * background, so a mutating command that returns without flushing reports success from the
+ * merged in-memory view even when the durable save later fails. On filesystems where the
+ * native exact replacement is unavailable (NFS answers `atomic_unavailable`), `config.yml`
+ * is refused a fallback and never updated, yet the command still printed a success line and
+ * exited 0 -- the setting silently reverts on the next process. Await the durable save and
+ * fail loudly instead.
+ */
+const SAFE_NESTED_DIAGNOSTIC_PATTERN =
+	/\b(?:atomic_[a-z0-9_]+|destination_[a-z0-9_]+|source_[a-z0-9_]+|cleanup_[a-z0-9_]+|E[A-Z0-9_]+)\b/i;
+
+function errorCode(error: unknown): string | undefined {
+	if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+	const code = (error as { code?: unknown }).code;
+	return typeof code === "string" && code.length > 0 ? code : undefined;
+}
+
+function errorCause(error: unknown): unknown {
+	if (typeof error !== "object" || error === null || !("cause" in error)) return undefined;
+	return (error as { cause?: unknown }).cause;
+}
+
+function nestedCauseDiagnostic(cause: unknown): string | undefined {
+	const code = errorCode(cause);
+	if (code && /^[A-Z][A-Z0-9_]{1,63}$/.test(code)) return code;
+	const message = cause instanceof Error ? cause.message : typeof cause === "string" ? cause : undefined;
+	const match = message?.match(SAFE_NESTED_DIAGNOSTIC_PATTERN);
+	return match?.[0]?.slice(0, 64);
+}
+
+function persistenceDiagnostic(error: unknown): string {
+	if (error instanceof AtomicYamlRetargetError) {
+		return "config target changed during save; retry after restoring the original target";
+	}
+	const code = errorCode(error);
+	const cause = errorCause(error);
+	if (error instanceof AtomicYamlReplaceError) {
+		const detail = nestedCauseDiagnostic(cause);
+		return detail ? `atomic replacement failed (${detail})` : "atomic replacement failed";
+	}
+	if (code) {
+		if (cause !== undefined) {
+			const nested = nestedCauseDiagnostic(cause);
+			return nested ? `${code}: ${nested}` : code;
+		}
+		return code;
+	}
+	const nested = nestedCauseDiagnostic(error);
+	if (nested) return nested;
+	return "unknown persistence failure";
+}
+
+async function persistOrExit(): Promise<void> {
+	try {
+		await settings.flushOrThrow();
+	} catch (err) {
+		console.error(chalk.red(`Failed to persist setting: ${persistenceDiagnostic(err)}`));
+		process.exit(1);
+	}
+}
+
 async function handleSet(
 	key: string | undefined,
 	value: string | undefined,
@@ -412,6 +475,8 @@ async function handleSet(
 		console.error(chalk.red(String(err)));
 		process.exit(1);
 	}
+
+	await persistOrExit();
 
 	const newValue = settings.get(def.path);
 	const displayValue = redactConfigValue(def.path, newValue, flags.showSecrets);
@@ -441,6 +506,8 @@ async function handleReset(key: string | undefined, flags: { json?: boolean }): 
 	const defaultValue = getDefault(path);
 	if (defaultValue === undefined) settings.unset(path);
 	else settings.set(path, defaultValue as SettingValue<typeof path>);
+
+	await persistOrExit();
 
 	if (flags.json) {
 		console.log(JSON.stringify({ key: def.path, value: defaultValue }));

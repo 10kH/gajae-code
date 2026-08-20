@@ -93,12 +93,35 @@ export declare class MacOSPowerAssertion {
 
 /** Retained no-follow authority for the SDK publication namespace. */
 export declare class NativeRetainedBrokerPublication {
-  observe(): NativeBrokerPublicationObservation
-  heartbeat(heartbeatAt: string): NativeBrokerPublicationOperation
-  sync(): NativeBrokerPublicationOperation
   /**
-   * Close discovery, owner record, lock directory, and SDK root in that
-   * order.
+   * Read-only observation. Deliberately synchronous: it is the authority
+   * boundary that must not admit an await between proof and effect. It reads
+   * descriptor identity only -- no write, no fsync -- and never takes the
+   * writer lock, so an unresolved heartbeat cannot block it.
+   */
+  observe(): NativeBrokerPublicationObservation
+  /** Read-only observation on the libuv blocking pool for watchdog paths. */
+  observeAsync(): Promise<NativeBrokerPublicationObservation>
+  /**
+   * Positional heartbeat write on the libuv blocking pool. The write is an
+   * unbounded `pwrite` against retained authority: on the JS thread a stalled
+   * filesystem would freeze the whole process, including the timers that are
+   * supposed to notice the stall.
+   */
+  heartbeatAsync(heartbeatAt: string): Promise<NativeBrokerPublicationOperation>
+  /**
+   * `fsync` on the libuv blocking pool. It returns when the device says so,
+   * which is never bounded, so it may not run on the JS thread either.
+   */
+  syncAsync(): Promise<NativeBrokerPublicationOperation>
+  /**
+   * Give up discovery, owner record, lock directory, and SDK root authority.
+   *
+   * Detaches the handle without waiting for anything: an unresolved worker
+   * keeps its own `Arc` alive, observes the closed flag, and returns `closed`
+   * without committing, and the descriptors are released when that last
+   * reference drops on the pool thread. A shutdown blocked behind an
+   * unbounded write is exactly the wedge this must not reproduce.
    */
   close(): NativeBrokerPublicationOperation
 }
@@ -866,6 +889,18 @@ export declare function exactRestore(detachedPath: string, originalPath: string,
  * validation failures as typed results rather than deleting a replacement.
  */
 export declare function exactUnlink(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
+
+/**
+ * Delete only the regular file that still has the supplied platform identity,
+ * without the exchange/quarantine protocol used by [`exact_unlink`].
+ *
+ * This is reserved for already-detached inert debris: the operation first
+ * moves the pathname to the caller's private no-replace quarantine, verifies
+ * the moved object, and only then unlinks that private name. A successor
+ * published at the original pathname is therefore never consumed by cleanup,
+ * and this path cannot manufacture another exchange placeholder.
+ */
+export declare function exactUnlinkDirect(path: string, identity: NativeExactFileIdentity): NativeExactUnlinkResult
 
 /**
  * Execute a brush shell command.

@@ -181,8 +181,10 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
  * recovering every endpoint and credential redirect the boundary rejects.
  *
  * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
- * it applies the same conservative ambiguity rule directly, matching how
- * `GJC_CODING_AGENT_DIR` is treated.
+ * it applies the same conservative ambiguity rule directly: a value that matches
+ * what the project `.env` sets is not honoured. An operator whose environment
+ * happens to carry the identical value loses the override, which is the same
+ * trade-off `resolveLiveCredentialEnvValue` already makes.
  */
 function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string | undefined {
 	const value = process.env[name];
@@ -360,6 +362,20 @@ export function setAgentDir(dir: string): void {
 /** Get the agent config directory (~/.gjc/agent). */
 export function getAgentDir(): string {
 	return dirs.agentDir;
+}
+/**
+ * Join a file under the provenance-checked agent directory, never the XDG
+ * state category. Automatic crash relay must not follow `XDG_STATE_HOME`:
+ * a checkout `.env` can set that variable and create `$XDG_STATE_HOME/gjc`,
+ * which the ordinary state resolver would then treat as the crash store.
+ */
+export function getTrustedAgentFile(filename: string): string {
+	return path.join(getAgentDir(), filename);
+}
+
+/** Whether the current checkout declares an environment key in its `.env`. */
+export function isProjectEnvDeclaration(name: string): boolean {
+	return Object.hasOwn(parseEnvFile(path.join(process.cwd(), ".env")), name);
 }
 
 /** Get the project-local config directory (.gjc). */
@@ -609,6 +625,21 @@ export function getCrashEventsPath(agentDir?: string): string {
 /** Get the compacted crash signature index path (~/.gjc/agent/gjc-crash-index.json). */
 export function getCrashIndexPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "gjc-crash-index.json", "state");
+}
+
+/** Get the handled error log path (~/.gjc/agent/gjc-error.log). */
+export function getHandledErrorLogPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-error.log", "state");
+}
+
+/** Get the handled error event journal path (~/.gjc/agent/gjc-error-events.jsonl). */
+export function getHandledErrorEventsPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-error-events.jsonl", "state");
+}
+
+/** Get the compacted handled error signature index path (~/.gjc/agent/gjc-error-index.json). */
+export function getHandledErrorIndexPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "gjc-error-index.json", "state");
 }
 
 /** Get the debug log path (~/.gjc/agent/gjc-debug.log). */

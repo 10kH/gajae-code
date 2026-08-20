@@ -324,6 +324,18 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	getSteeringMessages?: () => Promise<AgentMessage[]>;
 
 	/**
+	 * Returns steering messages that were dequeued for this run but cannot be
+	 * delivered by it, so the next run can pick them up.
+	 *
+	 * A user interrupt that lands while a tool is executing aborts the run's
+	 * signal without ending the loop: the loop still unwinds the tool and reaches
+	 * its steering drain. Continuing there would start a turn on an already
+	 * aborted signal, which the provider call rejects before the first token, so
+	 * the loop hands the messages back instead and ends the run.
+	 */
+	requeueSteeringMessages?: (messages: AgentMessage[]) => void;
+
+	/**
 	 * Returns follow-up messages to process after the agent would otherwise stop.
 	 *
 	 * Called when the agent has no more tool calls and no steering messages.
@@ -698,6 +710,18 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * - function: `_i` is NOT injected; intent is derived dynamically from (potentially partial / streaming) args.
 	 */
 	intent?: "omit" | "optional" | "require" | ((args: Partial<Static<TParameters>>) => string | undefined);
+	/**
+	 * Argument fields (dotted paths into the arguments object) that render to
+	 * the user as pure display text — question wording and option labels, never
+	 * ids, metadata, or persisted records. The agent loop uses this to bound the
+	 * escaped-non-ASCII terminal rejection AFTER the resample budget is spent:
+	 * when every non-ASCII character under these fields is benign typographic
+	 * punctuation (e.g. an em-dash a JSON encoder escaped), the call executes
+	 * instead of failing closed. Every other field of these arguments — and
+	 * every field of every other tool — keeps the fail-closed rejection for
+	 * unverified `\uXXXX` payloads.
+	 */
+	displaySafeEscapedArgFields?: readonly string[];
 
 	/** The main execution callback for this tool. */
 	execute: AgentToolExecFn<TParameters, TDetails, TTheme>;

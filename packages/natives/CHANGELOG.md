@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+- Retained SDK broker heartbeat and watchdog observation run off the JS thread, and shutdown/observation no longer hold the retained writer lock (#4704).
+- Notification debris cleanup binds to native identity instead of re-quarantining native exchange debris on recovery.
+
 ## [0.14.1] - 2026-08-18
 ### Fixed
 

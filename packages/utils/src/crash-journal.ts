@@ -22,7 +22,12 @@ export const CRASH_EVENT_KIND = "gjc-crash-event.v1";
 /** Preview cap for the message class carried by an event. */
 export const CRASH_EVENT_MESSAGE_MAX_BYTES = 256;
 
-export type CrashEvent = CrashOccurrenceEvent | CrashReportedEvent | CrashAcknowledgedEvent | CrashNudgedEvent;
+export type CrashEvent =
+	| CrashOccurrenceEvent
+	| CrashReportedEvent
+	| CrashRelayedEvent
+	| CrashAcknowledgedEvent
+	| CrashNudgedEvent;
 
 export interface CrashOccurrenceEvent {
 	readonly kind: "occurrence";
@@ -41,6 +46,16 @@ export interface CrashReportedEvent {
 	readonly issueUrl: string;
 	/** Set when the submission was a "+1" comment rather than a new issue. */
 	readonly commented?: boolean;
+}
+
+export interface CrashRelayedEvent {
+	readonly kind: "relayed";
+	readonly fingerprint: string;
+	readonly at: number;
+	/** Sentry event id accepted upstream: 32 lowercase hex. */
+	readonly eventId: string;
+	/** Exact occurrence record represented by the accepted envelope. Absent on legacy pre-record-id relay lines. */
+	readonly recordId?: string;
 }
 
 export interface CrashAcknowledgedEvent {
@@ -94,9 +109,11 @@ export function formatCrashEventLine(event: CrashEvent): string {
 							u: sanitizeEventText(truncateUtf8(event.issueUrl, 256)),
 							...(event.commented ? { c: 1 } : {}),
 						}
-					: event.kind === "acknowledged"
-						? { k: "acknowledged", fp: event.fingerprint, at: event.at }
-						: { k: "nudged", at: event.at };
+					: event.kind === "relayed"
+						? { k: "relayed", fp: event.fingerprint, at: event.at, e: event.eventId, r: event.recordId }
+						: event.kind === "acknowledged"
+							? { k: "acknowledged", fp: event.fingerprint, at: event.at }
+							: { k: "nudged", at: event.at };
 		return `${CRASH_EVENT_KIND} ${JSON.stringify(body)}\n`;
 	};
 
@@ -151,6 +168,18 @@ export function parseCrashEventLine(line: string): CrashEvent | undefined {
 			if (!fingerprint) return undefined;
 			if (typeof body.u !== "string" || body.u.length === 0) return undefined;
 			return { kind: "reported", fingerprint, at, issueUrl: sanitizeEventText(body.u), commented: body.c === 1 };
+		}
+		case "relayed": {
+			if (!fingerprint) return undefined;
+			if (typeof body.e !== "string" || !/^[0-9a-f]{32}$/.test(body.e)) return undefined;
+			if (body.r !== undefined && (typeof body.r !== "string" || !/^[0-9a-f]{8,32}$/.test(body.r))) return undefined;
+			return {
+				kind: "relayed",
+				fingerprint,
+				at,
+				eventId: body.e,
+				...(typeof body.r === "string" ? { recordId: body.r } : {}),
+			};
 		}
 		case "acknowledged": {
 			if (!fingerprint) return undefined;

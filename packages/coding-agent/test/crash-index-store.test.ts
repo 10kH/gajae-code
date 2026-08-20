@@ -6,9 +6,13 @@ import {
 	appendCrashEvent,
 	type CrashOccurrenceEvent,
 	computeCrashFingerprint,
+	formatCrashEventLine,
 	formatCrashRecordMarker,
+	parseCrashEventLine,
 } from "@gajae-code/utils";
 import {
+	applyCrashEvent,
+	CRASH_INDEX_ENTRY_MAX_BYTES,
 	CRASH_INDEX_MAX_SIGNATURES,
 	type CrashStatePaths,
 	compactCrashIndex,
@@ -110,9 +114,24 @@ describe("compactCrashIndex", () => {
 			lifetimeCount: 1,
 			retainedCount: 1,
 			lastRecordId: recovered.recordId,
+			lastAppendRecordId: recovered.recordId,
 		});
 		expect(index.signatures[recovered.fingerprint]?.reportedAt).toBeUndefined();
 		expect(index.signatures[recovered.fingerprint]?.acknowledgedAt).toBeUndefined();
+	});
+
+	it("recovers lastAppendRecordId from log order rather than display-time lastSeen", async () => {
+		const paths = await tempPaths();
+		const newer = recoverableRecord(200, "same recovered class", "2026-08-11T12:00:00.000Z");
+		const backdated = recoverableRecord(201, "same recovered class", "2026-08-11T11:00:00.000Z");
+		expect(backdated.fingerprint).toBe(newer.fingerprint);
+		await fs.writeFile(paths.crashLog, newer.text + backdated.text);
+		const index = await compactCrashIndex({ paths, now: NOW });
+		expect(index.signatures[newer.fingerprint]).toMatchObject({
+			lastSeen: Date.parse("2026-08-11T12:00:00.000Z"),
+			lastRecordId: newer.recordId,
+			lastAppendRecordId: backdated.recordId,
+		});
 	});
 
 	it("deduplicates every delayed journal event for more than 256 recovered records", async () => {
@@ -224,6 +243,7 @@ describe("compactCrashIndex", () => {
 		const index = await compactCrashIndex({ paths, now: NOW });
 		expect(index.signatures[fingerprintFor(41)]?.lastSeen).toBe(NOW);
 		expect(index.signatures[fingerprintFor(41)]?.lastRecordId).toBe(recordId(410));
+		expect(index.signatures[fingerprintFor(41)]?.lastAppendRecordId).toBe(recordId(411));
 		expect(index.signatures[fingerprintFor(41)]?.messageClass).toBe("newest");
 	});
 
@@ -511,6 +531,31 @@ describe("parseCrashIndex", () => {
 		expect(parseCrashIndex(JSON.stringify(valid), NOW)?.signatures[fingerprintFor(1)]?.lifetimeCount).toBe(2);
 	});
 
+	it("accepts a maximum-sized legacy entry while deriving its relay watermark", () => {
+		const legacyEntry = {
+			...valid.signatures[fingerprintFor(1)],
+			messageClass: "x".repeat(512),
+			commentedIssues: [
+				`https://github.com/Yeachan-Heo/gajae-code/issues/${"x".repeat(180)}`,
+				`https://x/${"y".repeat(50)}`,
+			],
+		};
+		const legacySize = Buffer.byteLength(JSON.stringify(legacyEntry), "utf8");
+		const upgradedSize = Buffer.byteLength(
+			JSON.stringify({ ...legacyEntry, lastAppendRecordId: legacyEntry.lastRecordId }),
+			"utf8",
+		);
+		expect(legacySize).toBeLessThanOrEqual(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(upgradedSize).toBeGreaterThan(CRASH_INDEX_ENTRY_MAX_BYTES);
+
+		const parsed = parseCrashIndex(
+			JSON.stringify({ ...valid, signatures: { [fingerprintFor(1)]: legacyEntry } }),
+			NOW,
+		);
+		expect(parsed?.signatures[fingerprintFor(1)]).toBeDefined();
+		expect(parsed?.signatures[fingerprintFor(1)]?.lastAppendRecordId).toBeUndefined();
+	});
+
 	it.each([
 		["unknown top-level key", { ...valid, extra: 1 }],
 		[
@@ -569,5 +614,150 @@ describe("listCrashSignatures", () => {
 			fingerprintFor(11),
 			fingerprintFor(10),
 		]);
+	});
+});
+
+describe("relayed crash events", () => {
+	const fingerprint = fingerprintFor(70);
+	const eventId = "0123456789abcdef0123456789abcdef";
+
+	it("round-trips all relayed fields through the journal format", () => {
+		const recordId = "1".repeat(16);
+		const line = formatCrashEventLine({ kind: "relayed", fingerprint, at: NOW, eventId, recordId });
+
+		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId, recordId });
+	});
+
+	it("accepts a legacy relayed journal line without a record id", () => {
+		const line = `gjc-crash-event.v1 ${JSON.stringify({ k: "relayed", fp: fingerprint, at: NOW, e: eventId })}\n`;
+		expect(parseCrashEventLine(line)).toEqual({ kind: "relayed", fingerprint, at: NOW, eventId });
+	});
+
+	it("applies a legacy relayed line as lastSeen coverage without dropping the watermark", () => {
+		const index = parseCrashIndex(
+			JSON.stringify({
+				version: 1,
+				updatedAt: NOW,
+				lastNudgedAt: 0,
+				overflow: false,
+				recentEventIds: [],
+				signatures: {
+					[fingerprint]: {
+						fpv: 1,
+						errorName: "Error",
+						messageClass: "boom",
+						lifetimeCount: 1,
+						retainedCount: 0,
+						firstSeen: NOW,
+						lastSeen: NOW,
+						lastRecordId: recordId(70),
+					},
+				},
+			}),
+			NOW,
+		);
+		expect(index).toBeDefined();
+		if (!index) return;
+		expect(applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId }, NOW)).toBe(true);
+		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
+		expect(index.signatures[fingerprint]?.relayedRecordId).toBe(recordId(70));
+	});
+
+	it.each([
+		["wrong length", "0123456789abcdef0123456789abcde"],
+		["uppercase hex", "0123456789ABCDEF0123456789ABCDEF"],
+		["non-hex", "0123456789abcdef0123456789abcdeg"],
+	])("rejects a relayed event id with %s", (_label, malformedEventId) => {
+		const line = `${"gjc-crash-event.v1"} ${JSON.stringify({ k: "relayed", fp: fingerprint, at: NOW, e: malformedEventId })}\n`;
+
+		expect(parseCrashEventLine(line)).toBeUndefined();
+	});
+
+	it("records relays monotonically for an existing signature", () => {
+		const index = parseCrashIndex(
+			JSON.stringify({
+				version: 1,
+				updatedAt: NOW,
+				lastNudgedAt: 0,
+				overflow: false,
+				recentEventIds: [],
+				signatures: {
+					[fingerprint]: {
+						fpv: 1,
+						errorName: "Error",
+						messageClass: "boom",
+						lifetimeCount: 1,
+						retainedCount: 0,
+						firstSeen: NOW,
+						lastSeen: NOW,
+						lastRecordId: recordId(70),
+					},
+				},
+			}),
+			NOW,
+		);
+		expect(index).toBeDefined();
+		if (!index) return;
+
+		const relay = { kind: "relayed" as const, fingerprint, at: NOW, eventId, recordId: recordId(1) };
+		expect(applyCrashEvent(index, relay, NOW)).toBe(true);
+		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
+		expect(applyCrashEvent(index, relay, NOW)).toBe(false);
+		expect(applyCrashEvent(index, { ...relay, at: NOW - 1 }, NOW)).toBe(false);
+		expect(index.signatures[fingerprint]?.relayedAt).toBe(NOW);
+	});
+
+	it("does not create a signature for an unknown relay", () => {
+		const index = parseCrashIndex(
+			JSON.stringify({
+				version: 1,
+				updatedAt: NOW,
+				lastNudgedAt: 0,
+				overflow: false,
+				recentEventIds: [],
+				signatures: {},
+			}),
+			NOW,
+		);
+		expect(index).toBeDefined();
+		if (!index) return;
+
+		expect(
+			applyCrashEvent(index, { kind: "relayed", fingerprint, at: NOW, eventId, recordId: recordId(1) }, NOW),
+		).toBe(false);
+		expect(index.signatures[fingerprint]).toBeUndefined();
+	});
+
+	it("accepts relayedAt and rejects an out-of-range value in the index", () => {
+		const entry = {
+			fpv: 1,
+			errorName: "Error",
+			messageClass: "boom",
+			lifetimeCount: 1,
+			retainedCount: 0,
+			firstSeen: NOW,
+			lastSeen: NOW,
+			lastRecordId: recordId(71),
+			relayedAt: NOW,
+		};
+		const valid = {
+			version: 1,
+			updatedAt: NOW,
+			lastNudgedAt: 0,
+			overflow: false,
+			recentEventIds: [],
+			signatures: { [fingerprint]: entry },
+		};
+
+		expect(parseCrashIndex(JSON.stringify(valid), NOW)?.signatures[fingerprint]?.relayedAt).toBe(NOW);
+		expect(
+			parseCrashIndex(
+				JSON.stringify({
+					...valid,
+					signatures: { [fingerprint]: { ...entry, relayedAt: NOW + 1e12 } },
+				}),
+				NOW,
+			),
+		).toBeUndefined();
 	});
 });

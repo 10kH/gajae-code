@@ -3,7 +3,9 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getConfigRootDir, setAgentDir } from "@gajae-code/utils";
+import { YAML } from "bun";
 import { inspectConfigFile, runConfigCommand } from "../src/cli/config-cli";
+import { FileLockTestHooks } from "../src/config/file-lock";
 import { resetSettingsForTest } from "../src/config/settings";
 
 let testAgentDir = "";
@@ -347,4 +349,136 @@ it("redacts invalid secret settings in doctor output", async () => {
 	const report = await inspectConfigFile(configPath);
 	expect(report.invalidValues).toContainEqual({ path: "notifications.telegram.botToken", value: "<redacted>" });
 	expect(JSON.stringify(report)).not.toContain(secret);
+});
+
+describe("config CLI durable persistence", () => {
+	// `settings.set` only mutates the in-memory view; the durable write runs in the
+	// background. A mutating command that reports from that view claims success even when
+	// config.yml was never updated -- which is the normal outcome wherever the durable save
+	// is refused (on NFS the native exact replacement reports `atomic_unavailable` and the
+	// config writer declines a fallback). The command must fail loudly, because a success
+	// line for a setting that silently reverts on the next process is worse than an error.
+	it("fails the set command when the setting cannot be persisted", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation(((): never => {
+			throw new Error("process.exit");
+		}) as never);
+		// Load settings (and open the settings database) first, then revoke write access to
+		// the agent directory so only the durable config.yml replace fails: the atomic write
+		// stages a sibling temp file, which an unwritable directory refuses.
+		await runConfigCommand({ action: "get", key: "colorBlindMode", flags: { json: true } });
+		await fs.chmod(testAgentDir, 0o500);
+
+		try {
+			await expect(
+				runConfigCommand({ action: "set", key: "colorBlindMode", value: "true", flags: { json: true } }),
+			).rejects.toThrow("process.exit");
+		} finally {
+			await fs.chmod(testAgentDir, 0o700);
+		}
+
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		const errors = errorSpy.mock.calls.map(call => Bun.stripANSI(String(call[0] ?? "")));
+		expect(errors.some(line => line.includes("Failed to persist setting"))).toBe(true);
+		const diagnostic = errors.join("\n");
+		expect(diagnostic).toMatch(/EACCES|atomic replacement failed|atomic_unavailable/);
+		expect(diagnostic).not.toContain(testAgentDir);
+		expect(diagnostic).not.toContain("true");
+		const logs = logSpy.mock.calls.map(call => Bun.stripANSI(String(call[0] ?? "")));
+		expect(logs.some(line => line.includes('"value": true') || line.includes('"value":true'))).toBe(false);
+	});
+
+	it("writes the value to config.yml before reporting success", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({ action: "set", key: "colorBlindMode", value: "true", flags: { json: true } });
+
+		const contents = await fs.readFile(path.join(testAgentDir, "config.yml"), "utf8");
+		expect(contents).toContain("colorBlindMode");
+		const logs = logSpy.mock.calls.map(call => String(call[0] ?? ""));
+		expect(logs.some(line => line.includes('"colorBlindMode"'))).toBe(true);
+	});
+
+	it("durably saves reset before reporting success", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+		await runConfigCommand({ action: "set", key: "colorBlindMode", value: "true", flags: { json: true } });
+		logSpy.mockClear();
+		await runConfigCommand({ action: "reset", key: "colorBlindMode", flags: { json: true } });
+
+		const payload = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as { key: string; value: unknown };
+		expect(payload).toEqual({ key: "colorBlindMode", value: false });
+		const persisted = YAML.parse(await fs.readFile(path.join(testAgentDir, "config.yml"), "utf8")) as {
+			colorBlindMode?: unknown;
+		};
+		expect(persisted.colorBlindMode).toBe(false);
+	});
+
+	it("fails reset without success output when the durable save is denied", async () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation(((): never => {
+			throw new Error("process.exit");
+		}) as never);
+
+		await runConfigCommand({ action: "set", key: "colorBlindMode", value: "true", flags: { json: true } });
+		logSpy.mockClear();
+		await fs.chmod(testAgentDir, 0o500);
+
+		try {
+			await expect(
+				runConfigCommand({ action: "reset", key: "colorBlindMode", flags: { json: true } }),
+			).rejects.toThrow("process.exit");
+		} finally {
+			await fs.chmod(testAgentDir, 0o700);
+		}
+
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(logSpy).not.toHaveBeenCalled();
+		expect(errorSpy.mock.calls.map(call => String(call[0] ?? "")).join("\n")).toContain("Failed to persist setting");
+	});
+
+	it("does not retry a retargeted config save onto the new symlink target", async () => {
+		const realTarget = path.join(testAgentDir, "real-config.yml");
+		const otherTarget = path.join(testAgentDir, "other-config.yml");
+		const configPath = path.join(testAgentDir, "config.yml");
+		const initialConfig = "configSchemaVersion: 1\ncolorBlindMode: false\n";
+		await fs.writeFile(realTarget, initialConfig, "utf8");
+		await fs.writeFile(otherTarget, initialConfig, "utf8");
+		await fs.symlink(realTarget, configPath);
+		resetSettingsForTest();
+
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		await runConfigCommand({ action: "get", key: "colorBlindMode", flags: { json: true } });
+		logSpy.mockClear();
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitSpy = vi.spyOn(process, "exit").mockImplementation(((): never => {
+			throw new Error("process.exit");
+		}) as never);
+		const originalHook = FileLockTestHooks.afterParentMkdir;
+		let retargeted = false;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (retargeted || !lockPath.endsWith("real-config.yml.lock")) return;
+			retargeted = true;
+			await fs.rm(configPath, { force: true });
+			await fs.symlink(otherTarget, configPath);
+		};
+
+		try {
+			await expect(
+				runConfigCommand({ action: "set", key: "colorBlindMode", value: "true", flags: { json: true } }),
+			).rejects.toThrow("process.exit");
+		} finally {
+			FileLockTestHooks.afterParentMkdir = originalHook;
+		}
+
+		expect(retargeted).toBe(true);
+		expect(exitSpy).toHaveBeenCalledWith(1);
+		expect(await fs.readFile(realTarget, "utf8")).toBe(initialConfig);
+		expect(await fs.readFile(otherTarget, "utf8")).toBe(initialConfig);
+		const diagnostic = errorSpy.mock.calls.map(call => Bun.stripANSI(String(call[0] ?? ""))).join("\n");
+		expect(diagnostic).toContain("config target changed during save");
+		expect(diagnostic).not.toContain(testAgentDir);
+	});
 });

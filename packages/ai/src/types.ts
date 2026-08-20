@@ -608,8 +608,13 @@ export interface ToolCall {
 	 * `\uXXXX` escape instead of literal UTF-8. Such a payload parses cleanly but
 	 * is unverifiable: one mistyped hex digit decodes to a different, equally
 	 * valid character, so the text can be silently wrong with no in-band evidence.
-	 * The agent loop rejects the call with a retryable error instead of executing
-	 * it. Escapes that are required (control characters) or unavoidable (lone
+	 * The agent loop resamples the turn unconditionally a bounded number of
+	 * times and then rejects the call instead of executing it. The single
+	 * bounded after-budget exception is a tool that enumerated its display
+	 * fields (`displaySafeEscapedArgFields`) whose non-ASCII content is benign
+	 * typographic punctuation — rendered question text, never executable
+	 * content, ids, or durable metadata.
+	 * Escapes that are required (control characters) or unavoidable (lone
 	 * surrogates) never set this.
 	 */
 	escapedNonAsciiArguments?: boolean;
@@ -799,6 +804,7 @@ export type RawArgumentRejectionCode =
 	| "ask-intent-review-requires-positive-round"
 	| "ask-intent-contract-requires-non-empty-authority"
 	| "ask-deep-interview-metadata-requires-deep-interview-gate"
+	| "ask-round-zero-metadata-requires-full-topology-fields"
 	| "todo-write-unknown-root-key"
 	| "todo-write-unknown-op-entry-key"
 	| "todo-write-unknown-op-value"

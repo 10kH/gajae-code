@@ -24,6 +24,7 @@ function indexWith(
 		firstSeen: NOW - 10 * 24 * 60 * 60 * 1000,
 		lastSeen: NOW - 60_000,
 		lastRecordId: "abcdef0123456789",
+		lastAppendRecordId: "abcdef0123456789",
 		...overrides,
 	};
 	return index;

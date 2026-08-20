@@ -1,6 +1,7 @@
 /** Print-mode output, terminal-status, and stdout-ownership regressions. */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { AssistantMessage, Message, ToolResultMessage } from "@gajae-code/ai";
+import { CONTEXT_OVERFLOW_EXIT_CODE, runPrintMode } from "../src/modes/print-mode";
 import type { AgentSession } from "../src/session/agent-session";
 import { SILENT_ABORT_MARKER } from "../src/session/messages";
 
@@ -166,7 +167,6 @@ describe("Print mode", () => {
 	});
 
 	it("prints each session configuration warning to stderr once", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];
 		installImmediateStderrMock(stderrOutput);
 		installImmediateStdoutMock();
@@ -177,7 +177,6 @@ describe("Print mode", () => {
 		expect(stderrOutput).toEqual([`Warning: ${warning}\n`]);
 	});
 	it("dispatches trusted local headless commands without prompting and keeps JSON output valid", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stdoutOutput: string[] = [];
 		installImmediateStdoutMock(stdoutOutput);
 		const tracking = createPrintModeTrackingSession();
@@ -200,7 +199,6 @@ describe("Print mode", () => {
 		});
 	});
 	it("does not render a silent-abort marker or overwrite a caller status", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];
 		installImmediateStderrMock(stderrOutput);
 		installImmediateStdoutMock();
@@ -219,7 +217,6 @@ describe("Print mode", () => {
 	});
 
 	it("sets ordinary terminal errors to status 1 without calling process.exit", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];
 		installImmediateStderrMock(stderrOutput);
 		installImmediateStdoutMock();
@@ -236,9 +233,53 @@ describe("Print mode", () => {
 		expect(process.exitCode).toBe(1);
 		expect(exitSpy).not.toHaveBeenCalled();
 	});
+	it("prints the safety-stop hint after the raw refusal for provider safety stops (#4650)", async () => {
+		const stderrOutput: string[] = [];
+		installImmediateStderrMock(stderrOutput);
+		installImmediateStdoutMock();
+
+		await runPrintMode(
+			createMockSession([
+				makeAssistantMessage({
+					stopReason: "error",
+					errorKind: "provider_safety_stop",
+					errorMessage: "Refusal (no details provided)",
+					content: [],
+				}),
+			]),
+			{ mode: "text" },
+		);
+
+		const stderr = stderrOutput.join("");
+		expect(stderr).toContain("Refusal (no details provided)");
+		expect(stderr.indexOf("Refusal (no details provided)")).toBeLessThan(stderr.indexOf("Provider safety stop"));
+		expect(stderr).toContain("manual model switch");
+		expect(process.exitCode).toBe(1);
+	});
+
+	it("prints no safety-stop hint for unrelated terminal errors", async () => {
+		const stderrOutput: string[] = [];
+		installImmediateStderrMock(stderrOutput);
+		installImmediateStdoutMock();
+
+		await runPrintMode(
+			createMockSession([
+				makeAssistantMessage({
+					stopReason: "error",
+					errorKind: undefined,
+					errorMessage: "429 rate limit exceeded",
+					content: [],
+				}),
+			]),
+			{ mode: "text" },
+		);
+
+		const stderr = stderrOutput.join("");
+		expect(stderr).toContain("429 rate limit exceeded");
+		expect(stderr).not.toContain("Provider safety stop");
+	});
 
 	it("leaves terminal status unchanged when the caller suppresses print-mode status handling", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];
 		installImmediateStderrMock(stderrOutput);
 		installImmediateStdoutMock();
@@ -256,7 +297,6 @@ describe("Print mode", () => {
 	});
 
 	it("prints the last assistant text after a trailing tool result without changing an existing success-path status", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stdoutOutput: string[] = [];
 		installImmediateStderrMock([]);
 		installImmediateStdoutMock(stdoutOutput);
@@ -270,7 +310,6 @@ describe("Print mode", () => {
 	});
 
 	it("sets context overflow to status 78 after an immediate stderr write without calling process.exit", async () => {
-		const { runPrintMode, CONTEXT_OVERFLOW_EXIT_CODE } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];
 		installImmediateStderrMock(stderrOutput);
 		installImmediateStdoutMock();
@@ -294,7 +333,6 @@ describe("Print mode", () => {
 	});
 
 	it("waits for a backpressured stderr write before disposal while retaining status 1", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];
 		let stderrQuiesced = false;
 		let stderrQuiescedWhenDisposed: boolean | undefined;
@@ -324,7 +362,6 @@ describe("Print mode", () => {
 	});
 
 	it("keeps context-overflow terminal handling out of JSON mode", async () => {
-		const { runPrintMode, CONTEXT_OVERFLOW_EXIT_CODE } = await import("../src/modes/print-mode");
 		const stderrOutput: string[] = [];
 		installImmediateStderrMock(stderrOutput);
 		installImmediateStdoutMock();
@@ -344,7 +381,6 @@ describe("Print mode", () => {
 	});
 
 	it("does not install a text-mode session listener", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		installImmediateStdoutMock();
 		const tracking = createPrintModeTrackingSession({
@@ -358,7 +394,6 @@ describe("Print mode", () => {
 	});
 
 	it("continues JSON event processing after a callback EPIPE and disposes before unsubscribing", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const tracking = createPrintModeTrackingSession({
 			header: { type: "session", id: "header" },
@@ -395,7 +430,6 @@ describe("Print mode", () => {
 	});
 
 	it("continues JSON event processing after an owned stdout EPIPE event", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const tracking = createPrintModeTrackingSession({
 			header: { type: "session", id: "header" },
@@ -421,7 +455,6 @@ describe("Print mode", () => {
 	});
 
 	it("propagates a non-pipe stdout callback failure after session disposal", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const failure = new Error("stdout callback failed");
 		const tracking = createPrintModeTrackingSession({
@@ -438,7 +471,6 @@ describe("Print mode", () => {
 	});
 
 	it("propagates a non-pipe stdout EventEmitter failure after session disposal", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const failure = new Error("stdout event failed");
 		const tracking = createPrintModeTrackingSession({
@@ -455,7 +487,6 @@ describe("Print mode", () => {
 	});
 
 	it("keeps the JSON subscriber through disposal-time output and late stdout errors", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const tracking = createPrintModeTrackingSession({
 			disposeEvents: [{ type: "session_disposed", id: "final" }],
@@ -483,7 +514,6 @@ describe("Print mode", () => {
 	});
 
 	it("does not suppress ERR_STREAM_DESTROYED before an EPIPE has latched", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const destroyed = stdoutError("ERR_STREAM_DESTROYED");
 		const tracking = createPrintModeTrackingSession({
@@ -499,7 +529,6 @@ describe("Print mode", () => {
 	});
 
 	it("suppresses a destroyed-stream error only after an owned EPIPE latches", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const tracking = createPrintModeTrackingSession({
 			messages: [makeAssistantMessage({ content: [{ type: "text", text: "draft" }] })],
@@ -517,7 +546,6 @@ describe("Print mode", () => {
 	});
 
 	it("preserves both a stdout failure and a disposal failure", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const writeFailure = new Error("stdout write failed");
 		const disposeFailure = new Error("dispose failed");
@@ -542,7 +570,6 @@ describe("Print mode", () => {
 	});
 
 	it("removes only the stdout listener it owns", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		installImmediateStderrMock([]);
 		const externalListener = () => {};
 		process.stdout.on("error", externalListener);
@@ -561,7 +588,6 @@ describe("Print mode", () => {
 
 describe("Print mode slash-command expansion", () => {
 	it("hands bundled slash commands to the session before the first prompt", async () => {
-		const { runPrintMode } = await import("../src/modes/print-mode");
 		const tracking = createPrintModeTrackingSession();
 		installImmediateStdoutMock();
 

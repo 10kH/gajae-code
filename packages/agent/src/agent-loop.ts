@@ -195,6 +195,75 @@ function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
 	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
 }
 
+/**
+ * The complete set of non-ASCII characters an escaped payload may decode to and
+ * still execute on a display-safe tool after the resample budget: U+2014 EM DASH
+ * only. This is the exact character JSON encoders spell as `\u2014` that
+ * motivated the false positive — an English question text like "sessions —
+ * in-process?" with no other non-ASCII. Curated deliberately: a mistyped nibble
+ * here can only produce another punctuation/letter codepoint, and any such
+ * landing (or any other escaped character at all) keeps the fail-closed
+ * rejection. Currency, math, full-width, separator, letter, mark, number, and
+ * surrogate escapes all stay rejected everywhere.
+ */
+const DISPLAY_SAFE_ESCAPED_CODEPOINTS = new Set([0x2014]);
+
+/** Structural type for tools that opt specific argument fields into display-safe handling. */
+type DisplaySafeEscapedTool = AgentTool<TSchema> & {
+	/** Argument fields (dotted paths into the arguments object) that render to the user as display text. */
+	displaySafeEscapedArgFields?: readonly string[];
+};
+
+/**
+ * Whether a non-ASCII codepoint is benign typographic punctuation that a JSON
+ * encoder may escape in display text. See {@link DISPLAY_SAFE_ESCAPED_CODEPOINTS}.
+ */
+function isDisplaySafeEscapedCodepoint(cp: number): boolean {
+	return DISPLAY_SAFE_ESCAPED_CODEPOINTS.has(cp);
+}
+
+/**
+ * Walk the decoded arguments and decide whether the escaped payload is
+ * display-safe: every non-ASCII character must live inside one of the tool's
+ * declared display-field paths (dotted, array-index-free: `questions.question`
+ * matches every question in the `questions` array) AND be benign typographic
+ * punctuation. Any non-ASCII outside the display fields — ids, metadata,
+ * persisted records, or an object key — keeps the fail-closed rejection, as
+ * does any non-benign codepoint inside them.
+ */
+function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, args: Record<string, unknown>): boolean {
+	const fields = (tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields;
+	if (!fields || fields.length === 0) return false;
+	const prefixes = [...fields];
+	const isDisplayPath = (path: string): boolean =>
+		prefixes.some(field => path === field || path.startsWith(`${field}.`));
+	const walk = (node: unknown, path: string): boolean => {
+		if (typeof node === "string") {
+			for (const ch of node) {
+				const cp = ch.codePointAt(0);
+				if (cp === undefined || cp < 0x80) continue;
+				// Outside the display fields no non-ASCII is tolerated at all;
+				// inside them only the curated punctuation set is.
+				if (!isDisplayPath(path) || !isDisplaySafeEscapedCodepoint(cp)) return false;
+			}
+			return true;
+		}
+		if (Array.isArray(node)) return node.every(item => walk(item, path));
+		if (typeof node === "object" && node !== null) {
+			for (const [key, value] of Object.entries(node)) {
+				// Field names are structural identifiers; the display fields have
+				// fixed ASCII names, so a non-ASCII key is never exempted.
+				for (const ch of key) {
+					const cp = ch.codePointAt(0);
+					if (cp !== undefined && cp >= 0x80) return false;
+				}
+				if (!walk(value, path === "" ? key : `${path}.${key}`)) return false;
+			}
+		}
+		return true;
+	};
+	return walk(args, "");
+}
 /** Remove only the exact assistant response committed by its streaming attempt. */
 function removeCommittedAssistantMessage(messages: AgentMessage[], message: AssistantMessage): boolean {
 	const index = messages.lastIndexOf(message);
@@ -2364,6 +2433,12 @@ async function runLoopBody(
 			// typed `escaped_arguments_discarded` outcome so the session policy
 			// owns a bounded same-model retry; the defect is never treated as
 			// provider evidence, so the fallback chain never advances on it.
+			//
+			// The budget runs unconditionally for escaped payloads: even a
+			// display-safe tool (whose terminal exemption lives in
+			// `executeToolCalls`) resamples here first, so the model always gets
+			// its chances to emit literal UTF-8 and the fallback stays rare
+			// rather than becoming the default path.
 			if (
 				message.stopReason !== "error" &&
 				message.stopReason !== "aborted" &&
@@ -2583,11 +2658,30 @@ async function runLoopBody(
 			stream.push({ type: "turn_end", message, toolResults, scope: attemptScope });
 
 			if (steeringMessagesFromExecution && steeringMessagesFromExecution.length > 0) {
-				pendingMessages = steeringMessagesFromExecution;
-				continue;
+				// Same aborted-run guard as the drain below: the steer interrupt unwound
+				// the tools, and a user interrupt that landed during that unwind must not
+				// open the steering turn on the aborted signal. Hand the messages back
+				// and end the run so the resume path delivers them on a fresh one.
+				if (!loopSignal.aborted) {
+					pendingMessages = steeringMessagesFromExecution;
+					continue;
+				}
+				config.requeueSteeringMessages?.(steeringMessagesFromExecution);
+				break;
 			}
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
-			if (pendingMessages.length > 0) continue;
+			if (pendingMessages.length > 0) {
+				// A user interrupt that lands while a tool is executing aborts this run's
+				// signal without ending the loop: the tool unwinds and execution reaches
+				// here. Continuing would open a turn on the aborted signal, which the
+				// provider rejects before the first token — the steer would be consumed
+				// and answered by nothing. Hand it back and end the run so the caller's
+				// resume starts a fresh one, which is the path that already works when no
+				// tool was in flight.
+				if (!loopSignal.aborted) continue;
+				config.requeueSteeringMessages?.(pendingMessages);
+				break;
+			}
 			if (config.shouldPause?.()) {
 				publishAgentEnd(
 					stream,
@@ -3293,7 +3387,11 @@ async function executeToolCalls(
 	}));
 
 	const checkSteering = async (): Promise<void> => {
-		if (!shouldInterruptImmediately || !getSteeringMessages || interruptState.triggered) {
+		// Never consume steering once the run's own signal is aborted: an aborted
+		// run cannot deliver it (the loop hands drained steering back and ends), and
+		// a tool task still unwinding can otherwise dequeue steering the drain just
+		// requeued — orphaning it in an execution result nobody reads.
+		if (!shouldInterruptImmediately || !getSteeringMessages || interruptState.triggered || signal?.aborted) {
 			return;
 		}
 		if (steeringCheck) {
@@ -3487,14 +3585,18 @@ async function executeToolCalls(
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
 					throw new Error(detail);
 				}
-				if (toolCall.escapedNonAsciiArguments) {
+				if (toolCall.escapedNonAsciiArguments && !isDisplaySafeEscapedArguments(tool, argsForExecution)) {
 					record.argumentValidationFailed = true;
 					// The arguments decoded cleanly, but they were spelled as `\uXXXX`
 					// escapes rather than literal UTF-8. Hand-written hex is where models
 					// mistype digits, and every mistyped nibble decodes to a different but
 					// equally valid character — the payload is unverifiable and cannot be
 					// repaired after parsing, so it is rejected rather than executed on
-					// silently corrupted text.
+					// silently corrupted text. The one bounded exception is a tool that
+					// declared its arguments display-only (see
+					// isDisplaySafeEscapedArguments): user-facing question text whose
+					// only non-ASCII characters are benign typographic punctuation is
+					// not the Hangul-mistype corruption this guard exists to stop.
 					throw new Error(
 						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
 							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +

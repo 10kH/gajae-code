@@ -27,6 +27,7 @@ import {
 import { isSettingsInitialized, type Settings, settings } from "../config/settings";
 import { compactCrashIndex, resolveCrashStatePaths } from "../crash/index-store";
 import { crashNudgeGate, maybeShowCrashNudge } from "../crash/nudge";
+import { readTrustedRelayConfig, relayAllSignatures } from "../crash/upstream/relay";
 import { DEFAULT_GJC_DEFINITION_NAMES } from "../defaults/gjc-defaults";
 import type {
 	ExtensionUIContext,
@@ -984,6 +985,28 @@ export class InteractiveMode implements InteractiveModeContext {
 				})();
 			}, 0);
 			crashNudgeTimer.unref?.();
+		}
+
+		// Opt-in upstream relay. Deliberately separate from the nudge: the nudge is
+		// local-only, this one can reach the network. Configuration is read from the
+		// trusted global layer only, so opening a repository can neither enable it
+		// nor choose its destination, and the default `off` path costs one settings
+		// read and nothing else.
+		const crashRelayConfig = readTrustedRelayConfig(settings);
+		if (crashRelayConfig.upstream !== "off") {
+			const crashRelayTimer = setTimeout(() => {
+				void (async () => {
+					try {
+						const outcome = await relayAllSignatures({ config: crashRelayConfig });
+						logger.debug("Crash relay finished", { outcome });
+					} catch (error) {
+						logger.debug("Crash relay skipped", {
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				})();
+			}, 0);
+			crashRelayTimer.unref?.();
 		}
 
 		if (starReminderGate.schedule) {
