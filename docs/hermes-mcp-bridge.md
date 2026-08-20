@@ -222,6 +222,29 @@ Each event is a bounded JSONL record with `schema_version`, monotonic namespace-
 
 `gjc_coordinator_read_coordination_status` keeps its existing report fields and now also includes `latest_event_seq` plus recent event summaries for snapshot-style consumers.
 
+### Opt-in webhook delivery of journal rows
+
+Issue #4706: the journal can additionally be pushed to one operator-configured webhook. This is delivery of **existing** rows only — no new event kinds, no MCP transport change (`push_subscriptions` stays `false`).
+
+Configuration is env-only, default-off, and resolved through the **trusted credential environment** (inherited shell environment and GJC/user-owned env files) — the checkout's `.env` cannot supply these values, so a repository cannot choose where coordinator rows are POSTed. No MCP tool can set, read, or unset it:
+
+| Variable | Effect |
+|---|---|
+|`GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL`|Destination. `https:` anywhere, or `http:` loopback only (`127.0.0.1`, `::1`, `localhost`). Unset or empty = feature fully off.|
+|`GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE`|Absolute path to a file whose trimmed content is sent as `Authorization: Bearer …`. Raw tokens are never accepted inline.|
+|`GJC_COORDINATOR_MCP_EVENT_WEBHOOK_SESSION_IDS`|Optional comma-separated allowlist; only rows carrying one of these `session_id` values are delivered.|
+|`GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS`|Per-attempt request timeout, default 5000, capped at 30000.|
+|`GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS`|Delivery attempts per row, default 5, capped at 10, with exponential backoff (500ms base, 15s cap).|
+
+Delivery contract:
+
+- The POST body is the exact native journal row already returned by `watch_events` (`schema_version`, `seq`, `id`, `timestamp`, `kind`, …). At-least-once: sinks dedupe on the stable `id`.
+- Delivery runs off the journal append path through a durable per-row outbox (`webhook-outbox/` under the namespace), so a restart resumes pending rows and a dead sink never delays or rewrites terminal turn/session persistence. Retries and exhaustion are bounded; failures are logged to `event-webhook-errors.log` without failing turns.
+- POSTs follow no redirects and send `content-type: application/json`.
+- `gjc coordinator doctor` reports the resolved webhook state (enabled + destination, or unset) as an `event_webhook` check.
+
+`watch_events` long-poll remains the source of truth; the webhook is a parallel opt-in sink for the same rows, targeted at orchestrators that cannot stay attached to the MCP session.
+
 ## Generic controller config snippet
 
 ```json

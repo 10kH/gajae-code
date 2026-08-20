@@ -4,6 +4,7 @@ import {
 	COORDINATOR_MCP_SERVER_NAME,
 	COORDINATOR_MCP_TOOL_NAMES,
 } from "../coordinator/contract";
+import { parseEventWebhookConfig } from "../coordinator-mcp/event-webhook";
 import { buildCoordinatorMcpConfig } from "../coordinator-mcp/policy";
 
 function writeJson(value: unknown): void {
@@ -54,6 +55,20 @@ function coordinatorDoctorPayload(): {
 		status: config.namespace.profile && config.namespace.repo ? "pass" : "warn",
 		detail: `profile=${config.namespace.profile ?? "<unset>"} repo=${config.namespace.repo ?? "<unset>"}`,
 	});
+	let eventWebhookStatus: "pass" | "fail" = "pass";
+	let eventWebhookDetail = "unset; coordinator behavior unchanged";
+	try {
+		const parsed = parseEventWebhookConfig();
+		if (parsed) {
+			eventWebhookDetail = `opt-in webhook delivery enabled for ${parsed.url}${
+				parsed.sessionIds ? ` scoped to ${parsed.sessionIds.size} session(s)` : ""
+			}`;
+		}
+	} catch (error) {
+		eventWebhookStatus = "fail";
+		eventWebhookDetail = error instanceof Error ? error.message : "coordinator_event_webhook_invalid";
+	}
+	checks.push({ id: "event_webhook", status: eventWebhookStatus, detail: eventWebhookDetail });
 	return { ok: checks.every(check => check.status !== "fail"), checks };
 }
 

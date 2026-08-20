@@ -321,6 +321,11 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | `GJC_COORDINATOR_MCP_SETUP_MANAGED_BY` | Marker written by `gjc setup hermes` for safe managed config updates. |
 | `GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION` | Managed setup schema version written by `gjc setup hermes`. |
 | `GJC_COORDINATOR_MCP_SETUP_SIGNATURE` | Deterministic managed setup signature used to detect safe updates versus unmanaged conflicts. |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL` | Opt-in webhook destination for existing `watch_events` journal rows (`https:` anywhere, or `http:` loopback only). Unset or empty = the feature is fully off. Resolved through the trusted credential environment, never the checkout's `.env`; a project `.env` cannot select where coordinator rows are POSTed. No redirect following. |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TOKEN_FILE` | Absolute path to a file whose trimmed content is sent as `Authorization: Bearer …`; raw tokens are never accepted inline in env. Resolved through the trusted credential environment. |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_SESSION_IDS` | Optional comma-separated session-id allowlist; only journal rows carrying one of these `session_id` values are delivered. |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_TIMEOUT_MS` | Per-attempt webhook POST timeout (default `5000`, capped at `30000`). |
+| `GJC_COORDINATOR_MCP_EVENT_WEBHOOK_MAX_ATTEMPTS` | Delivery attempts per journal row (default `5`, capped at `10`) with exponential backoff (`500ms` base, `15s` cap) through a durable per-row outbox. |
 
 ### Google Vertex AI
 
