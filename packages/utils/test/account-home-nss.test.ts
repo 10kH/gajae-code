@@ -46,13 +46,24 @@ async function resolveWith(env: Record<string, string | undefined>, cwd = import
 	return stdout.trim().split("\n").at(-1) ?? "";
 }
 
-/** The account home as NSS reports it, independent of any environment variable. */
+/**
+ * The account home as NSS reports it, independent of any environment variable.
+ *
+ * Returns `undefined` when NSS cannot answer, including when `getent` is absent
+ * entirely: `Bun.spawn` *throws* on a missing executable rather than returning a
+ * non-zero exit, so a minimal or distroless host would otherwise fail this suite
+ * instead of skipping the assertions that need an account entry.
+ */
 async function nssHome(): Promise<string | undefined> {
-	const proc = Bun.spawn(["getent", "passwd", String(os.userInfo().uid)], { stdout: "pipe", stderr: "ignore" });
-	const stdout = await new Response(proc.stdout).text();
-	if ((await proc.exited) !== 0) return undefined;
-	const home = stdout.split("\n")[0]?.split(":")[5];
-	return home && path.isAbsolute(home) ? home : undefined;
+	try {
+		const proc = Bun.spawn(["getent", "passwd", String(os.userInfo().uid)], { stdout: "pipe", stderr: "ignore" });
+		const stdout = await new Response(proc.stdout).text();
+		if ((await proc.exited) !== 0) return undefined;
+		const home = stdout.split("\n")[0]?.split(":")[5];
+		return home && path.isAbsolute(home) ? home : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 describe("account home is resolved through the OS account database", () => {

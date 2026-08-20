@@ -97,13 +97,18 @@ async function accountHomeOfRunningUser(): Promise<string> {
 		// NSS, matching production: reading `/etc/passwd` directly would disagree
 		// with the resolver for any LDAP- or SSSD-backed account, which has no local
 		// entry, and report a false failure.
-		const uid = os.userInfo().uid;
-		const proc = Bun.spawn(["getent", "passwd", String(uid)], { stdout: "pipe", stderr: "ignore" });
-		const stdout = await new Response(proc.stdout).text();
-		if ((await proc.exited) === 0) {
-			const home = stdout.split("\n")[0]?.split(":")[5];
-			if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
-		}
+		// `Bun.spawn` throws when the executable is missing rather than returning a
+		// non-zero exit, so a host without `getent` must fall through to the portable
+		// path instead of failing the suite.
+		try {
+			const uid = os.userInfo().uid;
+			const proc = Bun.spawn(["getent", "passwd", String(uid)], { stdout: "pipe", stderr: "ignore" });
+			const stdout = await new Response(proc.stdout).text();
+			if ((await proc.exited) === 0) {
+				const home = stdout.split("\n")[0]?.split(":")[5];
+				if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+			}
+		} catch {}
 	}
 	return os.userInfo().homedir;
 }
