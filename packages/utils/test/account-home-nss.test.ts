@@ -160,8 +160,9 @@ function skip(reason: string): void {
 }
 
 describe("account home is resolved through the OS account database", () => {
-	it("scopes NSS cache entries by effective UID and never leaks across transitions", async () => {
-		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
+	const itLinux = it.skipIf(process.platform !== "linux");
+
+	itLinux("scopes NSS cache entries by effective UID and never leaks across transitions", async () => {
 		const homeA = await tempDir();
 		const homeAAfterMappingChange = await tempDir();
 		const result = await runUidCacheProbe(homeA, homeAAfterMappingChange);
@@ -177,8 +178,7 @@ describe("account home is resolved through the OS account database", () => {
 		expect(result.nssCalls).toBe(3);
 	});
 
-	it("reports the same home NSS does, not the inherited environment", async () => {
-		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
+	itLinux("reports the same home NSS does, not the inherited environment", async () => {
 		const account = await nssHome();
 		if (!account) return skip("no NSS account entry for this uid; nothing to assert against");
 
@@ -187,8 +187,7 @@ describe("account home is resolved through the OS account database", () => {
 		expect(await resolveWith({ HOME: undefined })).toBe(account);
 	});
 
-	it("ignores a hostile home that the account database contradicts", async () => {
-		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
+	itLinux("ignores a hostile home that the account database contradicts", async () => {
 		const account = await nssHome();
 		if (!account) return skip("no NSS account entry for this uid; nothing to assert against");
 
@@ -202,8 +201,7 @@ describe("account home is resolved through the OS account database", () => {
 		}
 	});
 
-	it("never promotes a cached environment-derived home to independent evidence", async () => {
-		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
+	itLinux("never promotes a cached environment-derived home to independent evidence", async () => {
 		// The failure this guards, reproduced against the real resolver:
 		//
 		// With NSS unavailable the account lookup falls back to
@@ -268,8 +266,7 @@ describe("account home is resolved through the OS account database", () => {
 		}
 	});
 
-	it("still resolves an absolute home when the NSS front end is unavailable", async () => {
-		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
+	itLinux("still resolves an absolute home when the NSS front end is unavailable", async () => {
 		// Minimal and distroless images ship no `getent`, and `Bun.spawnSync` throws
 		// outright when the executable is missing rather than returning a non-zero
 		// exit. The failure is injected into the resolver's own lookup so this
@@ -312,8 +309,7 @@ describe("account home is resolved through the OS account database", () => {
 		}
 	});
 
-	it("accepts an NSS home that corroborates the runtime home", async () => {
-		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
+	itLinux("accepts an NSS home that corroborates the runtime home", async () => {
 		const account = await nssHome();
 		if (!account) return skip("no NSS account entry for this uid; nothing to assert against");
 
