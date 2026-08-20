@@ -126,6 +126,8 @@ export interface SessionRouterDeps {
 	createBrokerClient?: () => Promise<SessionRouterClient>;
 	/** Receives only an opaque capability and correlated provider-neutral frames. */
 	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => Promise<void> | void;
+	/** Test/runtime observer invoked after a frame's delivery and cursor update settle. */
+	onFrameSettled?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void;
 	onAttachment?: (attachment: SessionAttachment) => Promise<void> | void;
 	/** Called only after the opaque capability becomes externally current. */
 	onAttachmentReady?: (attachment: SessionAttachment) => Promise<void> | void;
@@ -405,9 +407,11 @@ export class SessionRouter {
 	}
 
 	/** Exposed for deterministic callers and reconciliation tests. */
-	async reconcile(): Promise<void> {
-		await this.#serialReconcile(this.#runEpoch, true);
-		// Periodic reconciliation may have published an attachment while its
+	async reconcile(options: { waitForReplay?: boolean } = {}): Promise<void> {
+		const waitForReplay = options.waitForReplay ?? true;
+		await this.#serialReconcile(this.#runEpoch, !waitForReplay);
+		if (!waitForReplay) return;
+		// Periodic reconciliation may have published an attachment while its initial replay
 		// initial replay continues on that attachment's isolated ready tail.
 		// Explicit callers retain the historical synchronous contract without
 		// putting any ready tail back onto the fleet-wide reconcile tail.
@@ -1518,14 +1522,16 @@ export class SessionRouter {
 				}
 				const publicationId =
 					seq !== undefined && ownsSequence ? `${attached.sessionId}:${attached.generation}:${seq}` : undefined;
+				let notificationFrame: SessionRouterFrame;
 				try {
-					const notificationFrame = publicationId === undefined ? correlated : { ...correlated, publicationId };
+					notificationFrame = publicationId === undefined ? correlated : { ...correlated, publicationId };
 					this.#dispatchNotificationFrame(attached, notificationFrame);
 					await this.#deps.onFrame?.(attached.capability, notificationFrame);
 				} catch (error) {
 					if (!this.#attachmentLive(attached)) return;
 					if (seq === undefined || !ownsSequence) throw error;
 					this.#failDelivery(attached, seq, error);
+					this.#deps.onFrameSettled?.(attached.capability, { ...correlated, seq });
 					return;
 				}
 				if (!this.#attachmentLive(attached)) return;
@@ -1534,6 +1540,8 @@ export class SessionRouter {
 					this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
 					if (seq > attached.cursor.seq) attached.cursor.seq = seq;
 				}
+				if (seq !== undefined && ownsSequence)
+					this.#deps.onFrameSettled?.(attached.capability, { ...notificationFrame, seq });
 			});
 		this.#frameTails.set(attached.id, current);
 		void current.then(

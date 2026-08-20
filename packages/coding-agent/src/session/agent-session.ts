@@ -10971,7 +10971,7 @@ export class AgentSession {
 		if (this.isRetrying) return false;
 		const messages = this.agent.state.messages;
 		const last = messages[messages.length - 1];
-		return last?.role === "assistant";
+		return last?.role === "assistant" || last?.role === "bashExecution" || last?.role === "pythonExecution";
 	}
 
 	queueDeferredMessage(message: CustomMessage): void {

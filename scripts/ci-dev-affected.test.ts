@@ -1278,6 +1278,15 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(tasks[2]?.command).toEqual(["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
 	});
 
+	test("Anthropic provider changes add their stream regressions without bypassing owner fallback coverage", () => {
+		const tasks = targeted(["packages/ai/src/providers/anthropic.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/ai/test/anthropic-truncated-toolcall.test.ts");
+		expect(keys).toContain("test:packages/ai/test/anthropic-stream-envelope.test.ts");
+		expect(keys).toContain("root-check");
+		expect(keys).toContain("native-linux-x64");
+	});
+
 	test("a CI workflow change plans yaml-parse + ci-selftest + ci-dry-run + workflow-permissions", () => {
 		const tasks = targeted([".github/workflows/dev-ci.yml"]);
 		expect(tasks.map(task => task.key).sort()).toEqual(["ci-dry-run", "ci-selftest", "workflow-permissions", "yaml-parse"]);
