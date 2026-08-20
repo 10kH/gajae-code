@@ -1179,6 +1179,16 @@ export class AcpAgent implements Agent {
 	readonly #attaching = new Map<string, PendingAttachment>();
 	readonly #resolvingExisting = new Map<string, PendingAttachment>();
 	readonly #knownSessionCwds = new Map<string, string>();
+	/**
+	 * Sessions this connection actually owns, i.e. ones it created or attached to.
+	 * Destructive lifecycle control gates on this set, never on `#knownSessionCwds`.
+	 *
+	 * `session/list` legitimately populates `#knownSessionCwds` for every session a
+	 * shared broker reports, so treating that map as ownership let a second ACP
+	 * connection enumerate another connection's sessions and then close or delete
+	 * them. Knowing a session's cwd is not authority over its lifecycle.
+	 */
+	readonly #ownedSessionIds = new Set<string>();
 	readonly #knownSessionMcpServers = new Map<string, SessionLifecycleMcpServer[]>();
 	readonly #knownSessionMetadata = new Map<string, { title?: string; updatedAt?: string }>();
 	readonly #pendingDeleteLocators = new Map<string, { cwd: string; path: string }>();
@@ -1322,6 +1332,7 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
+		this.#ownedSessionIds.add(id);
 		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
@@ -1377,6 +1388,7 @@ export class AcpAgent implements Agent {
 		);
 		const id = sessionId(result);
 		this.#knownSessionCwds.set(id, params.cwd);
+		this.#ownedSessionIds.add(id);
 		this.#knownSessionMcpServers.set(id, mcpServers);
 		try {
 			await this.#attach(id, params.cwd, undefined, result);
@@ -1427,8 +1439,9 @@ export class AcpAgent implements Agent {
 
 	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
-		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		// ACP close has no cwd. Only connection-owned sessions may reach broker lifecycle control.
+		if (!this.#ownedSessionIds.has(params.sessionId)) return Promise.resolve({});
+		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		if (!cwd) return Promise.resolve({});
 		const existing = this.#closing.get(params.sessionId);
 		if (existing) return existing;
@@ -1445,6 +1458,9 @@ export class AcpAgent implements Agent {
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		const pendingLocator = this.#pendingDeleteLocators.get(params.sessionId);
+		// A retained delete locator is itself proof of prior ownership: only the owning
+		// connection can have started that delete. Anything else must be owned outright.
+		if (!this.#ownedSessionIds.has(params.sessionId) && pendingLocator === undefined) return {};
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId) ?? pendingLocator?.cwd;
 		// ACP's delete request has no cwd. Unknown ids remain the protocol no-op,
 		// while the broker can reconstruct an authenticated pending locator from its durable ledger.
@@ -1470,6 +1486,7 @@ export class AcpAgent implements Agent {
 				} catch (error) {
 					if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
 						this.#knownSessionCwds.delete(params.sessionId);
+						this.#ownedSessionIds.delete(params.sessionId);
 						this.#knownSessionMcpServers.delete(params.sessionId);
 						this.#knownSessionMetadata.delete(params.sessionId);
 						return {};
@@ -1484,6 +1501,7 @@ export class AcpAgent implements Agent {
 				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
 			);
 			this.#knownSessionCwds.delete(params.sessionId);
+			this.#ownedSessionIds.delete(params.sessionId);
 			this.#knownSessionMcpServers.delete(params.sessionId);
 			this.#knownSessionMetadata.delete(params.sessionId);
 			this.#pendingDeleteLocators.delete(params.sessionId);
@@ -2181,6 +2199,7 @@ export class AcpAgent implements Agent {
 			this.#pendingRouterAdapters.delete(id);
 			this.#pendingRouterFrames.delete(id);
 			this.#knownSessionCwds.set(id, cwd);
+			this.#ownedSessionIds.add(id);
 			await applyAcpPermissionMode(adapter, this.#clientCapabilities);
 			this.#assertSessionEpoch(id, epoch);
 			// A successful attachment establishes a new live-owner epoch. Any locator
@@ -2197,6 +2216,7 @@ export class AcpAgent implements Agent {
 					await this.#teardownSession(id, "attachment failed", false);
 				} finally {
 					this.#knownSessionCwds.delete(id);
+					this.#ownedSessionIds.delete(id);
 					this.#knownSessionMcpServers.delete(id);
 				}
 			} else if (adapter) {
@@ -2262,6 +2282,7 @@ export class AcpAgent implements Agent {
 	async #discardNewSession(id: string): Promise<void> {
 		await this.#teardownSession(id, "discarded", true);
 		this.#knownSessionCwds.delete(id);
+		this.#ownedSessionIds.delete(id);
 		this.#knownSessionMcpServers.delete(id);
 		this.#knownSessionMetadata.delete(id);
 	}
@@ -2275,6 +2296,7 @@ export class AcpAgent implements Agent {
 			if (attaching) await Promise.allSettled([attaching.task]);
 			await this.#teardownSession(id, "closed", true);
 			this.#knownSessionCwds.delete(id);
+			this.#ownedSessionIds.delete(id);
 			this.#knownSessionMcpServers.delete(id);
 			this.#knownSessionMetadata.delete(id);
 			return {};
@@ -2290,7 +2312,7 @@ export class AcpAgent implements Agent {
 	 */
 	async #teardownSession(id: string, reason: string, closeRemote: boolean): Promise<void> {
 		const record = this.#sessions.get(id);
-		const ownershipBound = record !== undefined || this.#knownSessionCwds.has(id);
+		const ownershipBound = record !== undefined || this.#ownedSessionIds.has(id);
 		this.#beginTeardown(id);
 		try {
 			this.#advanceSessionEpoch(id);
@@ -3564,6 +3586,7 @@ export class AcpAgent implements Agent {
 		this.#attaching.clear();
 		this.#resolvingExisting.clear();
 		this.#knownSessionCwds.clear();
+		this.#ownedSessionIds.clear();
 		this.#knownSessionMcpServers.clear();
 		this.#knownSessionMetadata.clear();
 		this.#pendingDeleteLocators.clear();

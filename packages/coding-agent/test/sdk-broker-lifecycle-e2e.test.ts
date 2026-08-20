@@ -5072,3 +5072,38 @@ test("lifecycle cleanup receipt parser rejects hostile bounded inputs without to
 		await fs.rm(root, { recursive: true, force: true });
 	}
 });
+
+test("session/list does not grant a second ACP connection destructive lifecycle control", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-acp-list-ownership-"));
+	const agentDir = path.join(root, "agent");
+	const cwd = path.join(root, "repo");
+	await fs.mkdir(cwd, { recursive: true });
+	brokerDirs.push(agentDir);
+	try {
+		// Both connections share one broker, which is the situation that makes
+		// enumeration dangerous: `session/list` reports sessions the caller does
+		// not own, and knowing their cwd must not become authority over them.
+		const owner = new AcpAgent({ signal: new AbortController().signal } as never, { agentDir });
+		const stranger = new AcpAgent({ signal: new AbortController().signal } as never, { agentDir });
+
+		const created = await owner.newSession({ cwd, mcpServers: [] } as never);
+		const sessionId = created.sessionId;
+
+		const listed = await stranger.listSessions({ cwd } as never);
+		expect(listed.sessions.some((s: { sessionId: string }) => s.sessionId === sessionId)).toBe(true);
+
+		// Enumeration succeeded; destructive control must still be refused. Both
+		// return the protocol no-op rather than throwing, so the session's survival
+		// is the assertion that matters.
+		expect(await stranger.closeSession({ sessionId } as never)).toEqual({});
+		expect(await stranger.deleteSession({ sessionId } as never)).toEqual({});
+
+		const afterAttack = await owner.listSessions({ cwd } as never);
+		expect(afterAttack.sessions.some((s: { sessionId: string }) => s.sessionId === sessionId)).toBe(true);
+
+		// The owner is unaffected by the refusal and can still close its own session.
+		expect(await owner.closeSession({ sessionId } as never)).toEqual({});
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 30_000);
