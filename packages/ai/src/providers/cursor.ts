@@ -474,6 +474,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			let resolveH2: (() => void) | undefined;
+			let rejectH2: ((error: unknown) => void) | undefined;
+			const messageQueue = createCursorMessageQueueForTest(error => {
+				log("error", "handleServerMessage", { error: String(error) });
+			});
 
 			h2Request.on("data", (chunk: Buffer) => {
 				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
@@ -500,28 +504,35 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
-						void handleServerMessage(
-							serverMessage,
-							output,
-							stream,
-							state,
-							blobStore,
-							h2Request!,
-							options?.execHandlers,
-							options?.onToolResult,
-							usageState,
-							requestContextTools,
-							onConversationCheckpoint,
-						).catch(error => {
-							log("error", "handleServerMessage", { error: String(error) });
-						});
+						// Serialize handlers: exec messages can be asynchronous, and resolving the
+						// request on turnEnded before prior handlers finish loses their responses.
+						messageQueue.enqueue(() =>
+							handleServerMessage(
+								serverMessage,
+								output,
+								stream,
+								state,
+								blobStore,
+								h2Request!,
+								options?.execHandlers,
+								options?.onToolResult,
+								usageState,
+								requestContextTools,
+								onConversationCheckpoint,
+							),
+						);
 
 						// Resolve only on explicit turnEnded. stopReason defaults to "stop"
 						// and is not a reliable signal for stream completion.
-						if (isTurnEnded && resolveH2) {
-							const r = resolveH2;
-							resolveH2 = undefined;
-							r();
+						if (isTurnEnded) {
+							messageQueue.drain().then(() => {
+								if (resolveH2) {
+									const r = resolveH2;
+									resolveH2 = undefined;
+									rejectH2 = undefined;
+									r();
+								}
+							});
 						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
@@ -546,6 +557,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			await new Promise<void>((resolve, reject) => {
 				resolveH2 = resolve;
+				rejectH2 = reject;
 
 				h2Request!.on("trailers", trailers => {
 					const status = trailers["grpc-status"];
@@ -556,15 +568,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				});
 
 				h2Request!.on("end", () => {
-					resolveH2 = undefined;
-					if (endStreamError) {
-						reject(endStreamError);
-						return;
-					}
-					resolve();
+					messageQueue.drain().then(() => {
+						resolveH2 = undefined;
+						rejectH2 = undefined;
+						if (endStreamError) reject(endStreamError);
+						else resolve();
+					});
 				});
 
-				h2Request!.on("error", reject);
+				h2Request!.on("error", error => {
+					if (rejectH2) rejectH2(error);
+				});
 
 				if (options?.signal) {
 					options.signal.addEventListener("abort", () => {
@@ -1345,6 +1359,9 @@ async function handleExecServerMessage(
 			synthesizeCursorExecToolCall(output, stream, toolCallId, "search", {
 				pattern: args.literal === true ? piEscapeRegexLiteral(args.pattern) : args.pattern,
 				paths: [args.glob ? piJoinPath(args.path, args.glob) : args.path || "."],
+				// The model-facing search schema uses `i: true` for
+				// case-insensitive matching. Keep the field absent otherwise.
+				...(args.ignoreCase === true ? { i: true } : {}),
 				context: args.context,
 				limit: piLimit(args.limit),
 			});
@@ -1544,6 +1561,26 @@ export async function resolveExecHandler<TArgs, TResult>(
 		const message = error instanceof Error ? error.message : String(error);
 		return { execResult: buildError(message) };
 	}
+}
+
+/** Exported for deterministic coverage of ordered server-message handling. */
+export function createCursorMessageQueueForTest(onError?: (error: unknown) => void): {
+	enqueue(handler: () => void | Promise<void>): Promise<void>;
+	drain(): Promise<void>;
+} {
+	let chain = Promise.resolve();
+	return {
+		enqueue(handler) {
+			const result = chain.then(handler);
+			chain = result.catch(error => {
+				onError?.(error);
+			});
+			return result;
+		},
+		drain() {
+			return chain;
+		},
+	};
 }
 
 function splitExecHandlerResult<TResult>(result: CursorExecHandlerResult<TResult>): {
@@ -2417,6 +2454,8 @@ function processInteractionUpdate(
 			state.setThinkingBlock(null);
 		}
 	} else if (updateCase === "toolCallStarted" && isExecOwnedToolCall(update.message.value.toolCall)) {
+		// Pi stream call IDs and exec IDs are distinct namespaces; without a shared
+		// correlation field, suppress the streamed variant and synthesize from exec.
 		log("exec", "streamedToolCallOwnedByExec", { case: update.message.value.toolCall?.tool?.case });
 	} else if (updateCase === "toolCallStarted") {
 		const toolCall = update.message.value.toolCall;

@@ -125,4 +125,16 @@ describe("cursor native toolCall JSON safety", () => {
 			arguments: { command: "pwd", timeoutMs: 1000 },
 		});
 	});
+
+	it("keeps server call IDs paired with decoded native tool blocks", () => {
+		const blocks = [
+			buildNativeToolCallBlock({ shellToolCall: { args: { command: "first" } } }, "call-first", 0),
+			buildNativeToolCallBlock({ shellToolCall: { args: { command: "second" } } }, "call-second", 1),
+		];
+
+		expect(blocks).toEqual([
+			expect.objectContaining({ id: "call-first", arguments: { command: "first" } }),
+			expect.objectContaining({ id: "call-second", arguments: { command: "second" } }),
+		]);
+	});
 });

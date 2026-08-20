@@ -2,6 +2,7 @@ import { describe, expect, it } from "bun:test";
 import {
 	buildCursorHistoryForTest,
 	buildCursorSystemPromptJsons,
+	createCursorMessageQueueForTest,
 	resolveExecHandler,
 	streamCursor,
 } from "../src/providers/cursor";
@@ -113,6 +114,52 @@ describe("Cursor resolveExecHandler execHandlers binding", () => {
 			toolCallId: "exact-call-id",
 			toolName: "read",
 		});
+	});
+});
+
+describe("Cursor server message ordering", () => {
+	it("waits for a slow handler before turn completion", async () => {
+		const queue = createCursorMessageQueueForTest();
+		const events: string[] = [];
+		let releaseSlow!: () => void;
+		const slow = new Promise<void>(resolve => {
+			releaseSlow = resolve;
+		});
+
+		queue.enqueue(async () => {
+			await slow;
+			events.push("exec-response");
+		});
+		const turnDone = queue.enqueue(() => {
+			events.push("turn-ended");
+		});
+		let finalized = false;
+		const finalizedPromise = queue.drain().then(() => {
+			finalized = true;
+		});
+
+		await Promise.resolve();
+		expect(finalized).toBe(false);
+		releaseSlow();
+		await turnDone;
+		await finalizedPromise;
+		expect(events).toEqual(["exec-response", "turn-ended"]);
+	});
+
+	it("continues in order after a rejected handler", async () => {
+		const queue = createCursorMessageQueueForTest();
+		const events: string[] = [];
+		const rejected = queue.enqueue(async () => {
+			events.push("first");
+			throw new Error("handler failed");
+		});
+		const next = queue.enqueue(() => {
+			events.push("second");
+		});
+
+		await expect(rejected).rejects.toThrow("handler failed");
+		await next;
+		expect(events).toEqual(["first", "second"]);
 	});
 });
 
