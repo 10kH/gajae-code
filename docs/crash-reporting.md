@@ -159,11 +159,10 @@ is treated as absent, so a hand-edited global config fails closed. The
 `GJC_CRASH_SENTRY_DSN` environment variable is only consulted once that trusted global
 opt-in is already on; it cannot enable the relay by itself.
 
-The automatic relay reads fatal and handled stores from the shared provenance-checked
-resolver. Trusted inherited XDG state (`XDG_STATE_HOME` and its data/cache peers) is
-used when its value is outside checkout dotenv provenance; when the checkout declares
-an XDG value, relay falls back to the trusted agent directory (`getTrustedAgentFile`)
-instead. Checkout-controlled XDG paths are never uploaded.
+The automatic relay always reads fatal and handled stores from the trusted agent
+directory (`getTrustedAgentFile`); it never uses XDG-selected paths as automatic-egress
+input. Ordinary crash state operations may still use trusted inherited XDG state, but
+checkout-controlled XDG paths are never uploaded.
 
 The relay never runs on the fatal path. It runs at the next **interactive** startup during index
 compaction; other modes can explicitly invoke `gjc crash relay`, preserving the crashing
@@ -209,8 +208,9 @@ resolver, not to raw `HOME`/`USERPROFILE` values supplied by a checkout. Externa
 configuration; values declared by the current checkout's `.env` cannot redirect trusted agent files
 or the relay's input stores. A checkout may still declare an XDG variable for ordinary project-facing
 caches, so those paths can move, but they are never trusted crash-report input.
-If a checkout declares `HOME` in its `.env`, the resolver deliberately falls back to the
-filesystem root for user state rather than trusting that declaration.
+If a checkout declares `HOME` in its `.env`, the resolver uses the OS account home
+instead of treating that declaration as a trusted user root. It never uses a filesystem
+root as the refusal sentinel for user state.
 
 Project discovery uses the nearest existing `.gjc` directory, then the checkout's `.git` root as a
 fallback anchor. With an explicit project scope and neither anchor, the resolver uses `<cwd>/.gjc`

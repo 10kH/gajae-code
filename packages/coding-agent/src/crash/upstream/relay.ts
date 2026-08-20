@@ -246,9 +246,9 @@ async function persistRefusal(
 }
 
 /**
- * Automatic relay stores use the normal XDG state location only when the XDG
- * value came from a trusted environment. `dirs.ts` rejects checkout `.env`
- * declarations before resolving these paths, including dotenv-expanded values.
+ * Automatic relay always reads the trusted agent stores. XDG-aware paths remain
+ * available to ordinary crash state operations, but never select automatic-egress
+ * input files.
  */
 export function resolveTrustedRelayStatePaths(): CrashStatePaths {
 	return {
