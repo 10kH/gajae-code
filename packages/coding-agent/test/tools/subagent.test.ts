@@ -91,6 +91,38 @@ describe("SubagentTool", () => {
 		AsyncJobManager.resetForTests();
 	});
 
+	it("keeps a failed subagent's public structured output visible to inspect and await", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const publicReview = '{"overall_correctness":"incorrect","summary":"Public review"}';
+		const jobId = manager.register("task", "stalled review", async () => ({ kind: "failed", text: publicReview }), {
+			id: "job-stalled-review",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-StalledReview",
+					agent: "architect",
+					agentSource: "bundled",
+					assignment: "Review the change.",
+				},
+			},
+		});
+		await manager.getJob(jobId)?.promise;
+
+		for (const action of ["inspect", "await"] as const) {
+			const result = await tool.execute(`subagent-${action}-failed-review`, {
+				action,
+				ids: ["0-StalledReview"],
+				verbosity: "full",
+			});
+			const snapshot = result.details?.subagents[0];
+			expect(snapshot?.status).toBe("failed");
+			expect(snapshot?.errorText).toBe(publicReview);
+			expect(getText(result)).toContain("Error preview:");
+			expect(getText(result)).toContain(publicReview);
+		}
+	});
+
 	it("lists only visible task jobs with subagent metadata", async () => {
 		const manager = createManager();
 		const tool = new SubagentTool(createSession("0-Main"));
