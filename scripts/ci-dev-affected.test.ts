@@ -94,11 +94,34 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(guard).toContain("rebase onto current ${GITHUB_BASE_REF}");
 	});
 
+	test("skips every code-validation job when a pull request body is edited", async () => {
+		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
+		// `edited` must stay in the trigger list: the verdict line lives in the PR
+		// body, so `pr-contract-bootstrap` has to re-check it on every body change.
+		expect(workflow).toContain("types: [opened, edited, synchronize, reopened, ready_for_review]");
+		expect(workflow).toContain("  pr-contract-bootstrap:\n    name: PR contract bootstrap\n    if: ${{ github.event_name == 'pull_request' }}");
+
+		// Every job that validates code must opt out of that event. A body edit
+		// changes no tree, so running them re-queues an identical matrix and
+		// cancel-in-progress kills the run that was already doing the work.
+		// Roots need an explicit guard; the rest inherit it by depending on a
+		// skipped `affected-plan` (their conditions read its outputs) or on a
+		// skipped `affected` result.
+		for (const root of ["affected-plan", "affected-evidence-producer", "affected", "gjc-state-gates", "gjc-state-gates-matrix"]) {
+			const start = workflow.indexOf(`\n  ${root}:\n`);
+			expect(start).toBeGreaterThan(0);
+			const guard = workflow.slice(start, workflow.indexOf("\n    runs-on:", start));
+			expect(guard).toContain("github.event.action != 'edited'");
+		}
+	});
+
 	test("uses a detached finalized evidence producer and artifact-ID consumer", async () => {
 		const workflow = await Bun.file(path.join(import.meta.dir, "..", ".github", "workflows", "dev-ci.yml")).text();
 		expect(workflow).toContain("affected-evidence-producer:");
 		expect(workflow).toContain("name: Affected path validation / evidence producer");
-		expect(workflow).toContain("  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}");
+		expect(workflow).toContain(
+			"  affected:\n    name: Affected path validation\n    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}",
+		);
 		expect(workflow).toContain("needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]");
 		expect(workflow).toContain("artifact_id: ${{ steps.upload-evidence.outputs.artifact-id }}");
 		expect(workflow).toContain("artifact_digest: ${{ steps.upload-evidence.outputs.artifact-digest }}");
@@ -131,7 +154,9 @@ describe("dev-ci canonical-plan workflow contract", () => {
 		expect(workflow).toContain("remains a required producer audit binding");
 		expect(workflow).not.toContain("continue-on-error");
 		const protectedJob = workflow.slice(workflow.indexOf("  affected:\n"), workflow.indexOf("\n  gjc-state-gates-matrix:"));
-		expect(protectedJob).toContain("if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}");
+		expect(protectedJob).toContain(
+			"if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}",
+		);
 		expect(protectedJob).toContain("name: Validate finalized affected evidence");
 		expect(protectedJob).not.toContain("continue-on-error");
 		const validationStart = protectedJob.indexOf("name: Validate finalized affected evidence");

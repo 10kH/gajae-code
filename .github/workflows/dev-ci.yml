@@ -110,7 +110,12 @@ jobs:
   # exact diff via CI_DEV_CHANGED_PATHS instead of re-resolving the base ref.
   affected-plan:
     name: Affected path validation / plan
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
+    # A PR body edit changes no code, so the whole code-validation DAG below is
+    # skipped for it. `edited` stays in the trigger list because the verdict line
+    # lives in the body and `pr-contract-bootstrap` must re-check it; that job is
+    # independent of this one. Without this guard every verdict update cancelled
+    # the in-flight run and re-queued the full matrix against an identical tree.
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
 
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -702,7 +707,9 @@ jobs:
   # validates the finalized bundle downloaded by its immutable artifact ID.
   affected-evidence-producer:
     name: Affected path validation / evidence producer
-    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
+    # `always()` would otherwise run this after a skipped plan and fail trying to
+    # download the plan artifact that was never produced.
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
     needs: [affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -791,7 +798,7 @@ jobs:
 
   affected:
     name: Affected path validation
-    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
     needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -867,7 +874,8 @@ jobs:
 
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
+    # No `affected-plan` dependency, so this needs its own body-edit guard.
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
 
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -902,7 +910,7 @@ jobs:
   # Branch protection must keep requiring this stable aggregate status.
   gjc-state-gates:
     name: gjc-state-gates
-    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
     needs: [gjc-state-gates-matrix]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
