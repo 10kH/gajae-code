@@ -83,6 +83,7 @@ import {
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { GLM_ZCODE_ANTHROPIC_BASE_URL } from "../utils/oauth/glm-zcode";
 import { notifyProviderResponse } from "../utils/provider-response";
+import { applyProviderSafetyStop } from "../utils/provider-safety-stop";
 import { isCopilotTransientModelError } from "../utils/retry";
 import { getRetryAfterMsFromHeaders } from "../utils/retry-after";
 import { resolveRetryBudget } from "../utils/retry-budget";
@@ -2464,7 +2465,14 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								sawProviderSafetyStop = true;
 								sawTerminalEnvelope = true;
 								output.stopReason = "error";
-								output.errorKind = "provider_safety_stop";
+								// Mint the terminal kind with adapter provenance: the
+								// structured refusal signal was parsed from the stream
+								// delta, so the mark (not the wire field) carries the
+								// authority (#4777).
+								applyProviderSafetyStop(
+									output,
+									stopDetails?.type === "refusal" ? "refusal" : (rawStopReason ?? "refusal"),
+								);
 								if (stopDetails?.type === "refusal") {
 									const explanation = stopDetails.explanation?.trim();
 									const category = stopDetails.category;
