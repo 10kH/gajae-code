@@ -11,13 +11,7 @@ import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
-import {
-	collectProviderDegradationGroups,
-	hasActiveProviderRetryInProgress,
-	providerProgressAgeLabel,
-	providerRetryPhaseLabel,
-} from "../task/provider-retry-status";
-import { renderSubagentLiveProgress } from "../task/render";
+import { providerRetryPhaseLabel } from "../task/provider-retry-status";
 import { Ellipsis, Hasher, renderStatusLine } from "../tui";
 import {
 	formatDuration,
@@ -27,7 +21,12 @@ import {
 	type ToolUIStatus,
 	truncateToWidth,
 } from "./render-utils";
-import { type SubagentSnapshot, type SubagentToolDetails, subagentAwaitRenderedStateSignature } from "./subagent";
+import {
+	type SubagentLiveProgress,
+	type SubagentSnapshot,
+	type SubagentToolDetails,
+	subagentAwaitRenderedStateSignature,
+} from "./subagent";
 
 export { subagentAwaitRenderedStateSignature } from "./subagent";
 
@@ -87,6 +86,30 @@ export const subagentBodyCacheTestHooks = {
 function snapshotHasActiveRetry(snapshot: SubagentSnapshot): boolean {
 	if (snapshot.liveProgressAvailable === false || !snapshot.progress) return false;
 	return hasActiveProviderRetryInProgress(snapshot.progress);
+}
+
+function hasActiveProviderRetryInProgress(progress: SubagentLiveProgress): boolean {
+	return progress.status === "running" && progress.retryState !== undefined;
+}
+
+function providerProgressAgeLabel(progress: SubagentLiveProgress["retryState"], nowMs: number): string {
+	if (progress?.lastProviderProgressAtMs === undefined) return "no provider events yet";
+	const ageSeconds = Math.max(0, Math.floor((nowMs - progress.lastProviderProgressAtMs) / 1000));
+	return `last provider progress ${ageSeconds}s ago`;
+}
+
+function collectProviderDegradationGroups(
+	progress: readonly SubagentLiveProgress[],
+): Array<{ provider: string; count: number }> {
+	const counts = new Map<string, number>();
+	for (const item of progress) {
+		if (item.status !== "running" || !item.retryState) continue;
+		const provider = item.retryState.provider ?? "provider";
+		counts.set(provider, (counts.get(provider) ?? 0) + 1);
+	}
+	return Array.from(counts, ([provider, count]) => ({ provider, count }))
+		.filter(group => group.count > 1)
+		.sort((a, b) => b.count - a.count || a.provider.localeCompare(b.provider));
 }
 
 function boundSubagentBodyLines(lines: string[], width: number): string[] {
@@ -166,6 +189,72 @@ function renderSubagentStatusLine(snapshot: SubagentSnapshot, theme: Theme, spin
 	return `${icon} ${id} ${status} ${duration}`;
 }
 
+function renderSubagentLiveProgress(
+	progress: SubagentLiveProgress,
+	expanded: boolean,
+	theme: Theme,
+	spinnerFrame?: number,
+	staticTime = false,
+): string[] {
+	const lines: string[] = [];
+	const prefix = theme.fg("dim", theme.tree.last);
+	const iconColor = progress.status === "failed" || progress.status === "aborted" ? "error" : "accent";
+	const icon = formatStatusIcon(
+		progress.status === "completed" ? "success" : progress.status === "failed" ? "error" : "info",
+		theme,
+		progress.status === "running" ? spinnerFrame : undefined,
+	);
+	let statusLine = `${prefix} ${theme.fg(iconColor, icon)} ${theme.fg("accent", progress.id)}`;
+	if (progress.fastMode && theme.icon.fast) statusLine += ` ${theme.icon.fast}`;
+	if (progress.retryState && progress.status === "running") {
+		statusLine += ` ${theme.fg("warning", "provider degraded")}`;
+	}
+	lines.push(statusLine);
+
+	const continuePrefix = "   ";
+	if (progress.status === "running") {
+		const tool = progress.currentTool ?? progress.recentTool;
+		if (tool) lines.push(`${continuePrefix}${theme.tree.hook} ${theme.fg("muted", tool)}`);
+	}
+	if (progress.recentOutputSummary) {
+		const count = progress.recentOutputSummary.lineCount;
+		lines.push(
+			`${continuePrefix}${theme.tree.hook} ${theme.fg("dim", `recent output available (${count} ${count === 1 ? "line" : "lines"})`)}`,
+		);
+	}
+	if (progress.retryState && progress.status === "running") {
+		const retry = progress.retryState;
+		const attemptLabel = retry.unbounded
+			? `attempt ${retry.attempt}, unbounded`
+			: `attempt ${retry.attempt} of ${retry.maxAttempts}, bounded`;
+		const progressAge = staticTime ? "" : ` · ${providerProgressAgeLabel(retry, Date.now())}`;
+		let waitLabel = "";
+		if (!staticTime) {
+			const remainingMs = Math.max(0, retry.startedAtMs + retry.delayMs - Date.now());
+			waitLabel = remainingMs > 0 ? ` in ${formatDuration(remainingMs)}` : " now";
+		}
+		lines.push(
+			`${continuePrefix}${theme.tree.hook} ${theme.fg("warning", `${providerRetryPhaseLabel(retry.kind)} · retrying ${attemptLabel}${waitLabel}${progressAge}`)}`,
+		);
+	}
+	if (progress.retryFailure && progress.status !== "running") {
+		const attempts = progress.retryFailure.attempt;
+		lines.push(
+			`${continuePrefix}${theme.tree.hook} ${theme.fg("error", `auto-retry gave up after ${attempts} attempt${attempts === 1 ? "" : "s"}`)}`,
+		);
+	}
+	if (
+		expanded &&
+		progress.status === "running" &&
+		!progress.currentTool &&
+		!progress.recentTool &&
+		!progress.recentOutputSummary
+	) {
+		lines.push(`${continuePrefix}${theme.fg("dim", "running, no approved activity summary yet")}`);
+	}
+	return lines;
+}
+
 // Heavy per-subagent body. The cache path uses staticTime=true; the bounded dynamic
 // path opts into wall-clock displays when an active retry exists in the nested tree.
 function renderSubagentSnapshotBody(
@@ -220,7 +309,7 @@ function renderSubagentSnapshotBody(
 			lines.push(`  ${pl}`);
 		}
 	} else if (snapshot.liveProgressAvailable && (snapshot.status === "running" || snapshot.status === "queued")) {
-		lines.push(`  ${theme.fg("dim", "running, no activity yet")}`);
+		lines.push(`  ${theme.fg("dim", "running, no approved activity summary yet")}`);
 	}
 
 	const preview = snapshot.errorText?.trim() || snapshot.resultText?.trim();

@@ -4,7 +4,7 @@ import { formatDuration, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { type AsyncJob, AsyncJobManager, jobElapsedMs, type SubagentRecord } from "../async";
 import subagentDescription from "../prompts/tools/subagent.md" with { type: "text" };
-import type { AgentProgress, AgentSource, TaskToolDetails } from "../task/types";
+import type { AgentProgress, AgentSource } from "../task/types";
 import { Ellipsis, truncateToWidth } from "../tui";
 import type { ToolSession } from "./index";
 import { replaceTabs } from "./render-utils";
@@ -92,8 +92,8 @@ export interface SubagentSnapshot {
 	steerMessage?: string;
 	steerState?: "queued" | "resume_queued" | "resume_started";
 	steerPauseRequested?: boolean;
-	/** Live streaming progress for the awaited subagent (await panel only; UI detail). */
-	progress?: AgentProgress;
+	/** Bounded live progress approved for the await panel and public tool details. */
+	progress?: SubagentLiveProgress;
 	/** True when a live in-session progress producer exists for this subagent. */
 	liveProgressAvailable?: boolean;
 	/** Model the subagent actually runs on (after any auth fallback). */
@@ -104,6 +104,63 @@ export interface SubagentSnapshot {
 	modelFellBack?: boolean;
 	/** True when the effective subagent provider is in fast mode. */
 	fastMode?: boolean;
+}
+
+/**
+ * Public await-panel progress. This is deliberately not `AgentProgress`: raw
+ * progress contains model deltas, tool arguments, arbitrary output, and nested
+ * task payloads that must never enter tool-result, ACP, or telemetry envelopes.
+ */
+export interface SubagentLiveProgress {
+	id: string;
+	status: AgentProgress["status"];
+	currentTool?: string;
+	recentTool?: string;
+	recentOutputSummary?: { lineCount: number };
+	fastMode?: boolean;
+	retryState?: {
+		attempt: number;
+		maxAttempts: number;
+		unbounded?: boolean;
+		kind: NonNullable<AgentProgress["retryState"]>["kind"];
+		provider?: string;
+		lastProviderProgressAtMs?: number;
+		delayMs: number;
+		startedAtMs: number;
+	};
+	retryFailure?: { attempt: number };
+}
+
+function toSubagentLiveProgress(progress: AgentProgress): SubagentLiveProgress {
+	return {
+		id: progress.id,
+		status: progress.status,
+		...(progress.currentTool ? { currentTool: progress.currentTool } : {}),
+		...(progress.currentTool === undefined && progress.recentTools[0]
+			? { recentTool: progress.recentTools[0].tool }
+			: {}),
+		...(progress.recentOutput.length > 0
+			? { recentOutputSummary: { lineCount: Math.min(progress.recentOutput.length, 6) } }
+			: {}),
+		...(progress.fastMode ? { fastMode: true } : {}),
+		...(progress.retryState
+			? {
+					retryState: {
+						attempt: progress.retryState.attempt,
+						maxAttempts: progress.retryState.maxAttempts,
+						...(progress.retryState.unbounded ? { unbounded: true } : {}),
+						kind: progress.retryState.kind,
+						...(progress.retryState.provider ? { provider: progress.retryState.provider } : {}),
+						...(progress.retryState.lastProviderProgressAtMs !== undefined
+							? { lastProviderProgressAtMs: progress.retryState.lastProviderProgressAtMs }
+							: {}),
+						delayMs: progress.retryState.delayMs,
+						startedAtMs: progress.retryState.startedAtMs,
+					},
+				}
+			: {}),
+		...(progress.retryFailure ? { retryFailure: { attempt: progress.retryFailure.attempt } } : {}),
+	};
 }
 
 export type SubagentAwaitOutcome = "completed" | "timed_out" | "interrupted";
@@ -767,11 +824,11 @@ export class SubagentTool implements AgentTool<typeof subagentSchema, SubagentTo
 		if (!attachLiveProgress) return {};
 		const liveProgressAvailable = manager.hasLiveSubagent(record.subagentId);
 		if (!liveProgressAvailable) return { liveProgressAvailable: false };
-		// AgentProgress includes model-generated deltas, tool arguments, nested
-		// task details, and arbitrary tool output. None is an approved public
-		// subagent payload, so await receipts expose only liveness. Terminal public
-		// output continues through the bounded result/error receipt and agent://.
-		return { liveProgressAvailable: true };
+		const progress = manager.getSubagentProgress(record.subagentId);
+		return {
+			liveProgressAvailable: true,
+			...(progress ? { progress: toSubagentLiveProgress(progress) } : {}),
+		};
 	}
 
 	#recordSnapshot(
@@ -1063,36 +1120,15 @@ function canonicalizeSnapshotForSignature(snapshot: SubagentSnapshot): unknown {
 	};
 }
 
-function canonicalizeProgressForSignature(progress: AgentProgress): unknown {
+function canonicalizeProgressForSignature(progress: SubagentLiveProgress): unknown {
 	return {
 		id: progress.id,
-		agent: progress.agent,
-		agentSource: progress.agentSource,
 		status: progress.status,
-		task: progress.task,
-		assignment: progress.assignment ?? null,
-		description: progress.description ?? null,
-		lastIntent: progress.lastIntent ?? null,
 		currentTool: progress.currentTool ?? null,
-		currentToolArgs: progress.currentToolArgs ?? null,
-		// currentToolStartMs intentionally excluded (only drives elapsed rendering).
-		recentTools: progress.recentTools.map(tool => ({ tool: tool.tool, args: tool.args })),
-		recentOutput: progress.recentOutput,
-		toolCount: progress.toolCount,
-		tokens: progress.tokens,
-		contextTokens: progress.contextTokens ?? null,
-		contextWindow: progress.contextWindow ?? null,
-		cost: progress.cost,
-		modelOverride: progress.modelOverride ?? null,
-		modelSubstitutionWarning: progress.modelSubstitutionWarning ?? null,
-		// The nested task panel renders this, so it must reach the signature or a
-		// fast-mode-only change would render differently while comparing byte-identical,
-		// suppressing the very update that introduces the glyph.
+		recentTool: progress.recentTool ?? null,
+		recentOutputSummary: progress.recentOutputSummary ?? null,
 		fastMode: progress.fastMode ?? false,
-		// durationMs intentionally excluded (time-derived).
-		extractedToolData: progress.extractedToolData
-			? canonicalizeExtractedToolDataForSignature(progress.extractedToolData)
-			: null,
+		retryFailure: progress.retryFailure ?? null,
 		retryState: progress.retryState
 			? {
 					attempt: progress.retryState.attempt,
@@ -1101,52 +1137,7 @@ function canonicalizeProgressForSignature(progress: AgentProgress): unknown {
 					kind: progress.retryState.kind,
 					provider: progress.retryState.provider ?? null,
 					delayMs: progress.retryState.delayMs,
-					errorMessage: progress.retryState.errorMessage,
-					// startedAtMs intentionally excluded (drives countdown only).
 				}
 			: null,
-		retryFailure: progress.retryFailure ?? null,
-		inflightTaskDetails: progress.inflightTaskDetails
-			? canonicalizeTaskDetailsForSignature(progress.inflightTaskDetails)
-			: null,
 	};
-}
-
-/**
- * Nested `task` data (`extractedToolData.task` and `inflightTaskDetails`) is the
- * one place the await signature reaches into a live, ticking structure: nested
- * `AgentProgress` carries the same time-derived fields excluded above, and
- * `TaskToolDetails` adds `totalDurationMs` / per-result `durationMs`. Signing it
- * wholesale would defeat idle gating whenever an awaited subagent is itself inside
- * a live `task` call, so these helpers canonicalize the rendered, non-time subset
- * recursively (mutually recursive with `canonicalizeProgressForSignature`).
- */
-function canonicalizeExtractedToolDataForSignature(data: Record<string, unknown[]>): Record<string, unknown> {
-	const out: Record<string, unknown> = {};
-	for (const key of Object.keys(data)) {
-		// Only the `task` key holds time-ticking `TaskToolDetails`; other handler
-		// data (yield/report_finding/generic) is stable and passes through as-is.
-		out[key] = key === "task" ? (data[key] as TaskToolDetails[]).map(canonicalizeTaskDetailsForSignature) : data[key];
-	}
-	return out;
-}
-
-function canonicalizeTaskDetailsForSignature(details: TaskToolDetails): unknown {
-	// `extractedToolData` is an untyped boundary (`Record<string, unknown[]>`), so
-	// guard each field instead of trusting the `TaskToolDetails` cast.
-	return {
-		// totalDurationMs intentionally excluded (time-derived).
-		results: Array.isArray(details.results) ? details.results.map(canonicalizeTaskResultForSignature) : null,
-		progress: Array.isArray(details.progress) ? details.progress.map(canonicalizeProgressForSignature) : null,
-		async: details.async
-			? { state: details.async.state, jobId: details.async.jobId, type: details.async.type }
-			: null,
-	};
-}
-
-function canonicalizeTaskResultForSignature(result: TaskToolDetails["results"][number]): unknown {
-	// Completed results do not tick, but drop `durationMs` so the only time-derived
-	// field in the receipt can never reintroduce idle churn.
-	const { durationMs: _durationMs, ...rest } = result;
-	return rest;
 }
