@@ -15,6 +15,7 @@ import {
 	type ComposerSubmissionOptions,
 	canApplyComposerSubmission,
 	type InteractiveModeContext,
+	stopInteractiveActivityIndicator,
 } from "../../modes/types";
 import type { AgentSessionEvent, QueuedMessageEditEntry } from "../../session/agent-session";
 import { SKILL_PROMPT_MESSAGE_TYPE, type SkillPromptDetails } from "../../session/messages";
@@ -356,8 +357,24 @@ export class InputController {
 			if (this.ctx.cancelPendingSubmission()) {
 				return true;
 			}
-			this.restoreQueuedMessagesToEditor({ abort: true });
-			return true;
+			const hasCancellableWork =
+				this.ctx.hasPendingSubmission() ||
+				this.ctx.session.queuedMessageCount > 0 ||
+				(this.ctx.compactionQueuedMessages?.length ?? 0) > 0 ||
+				this.ctx.session.isStreaming ||
+				this.ctx.session.isCompacting;
+			if (hasCancellableWork) {
+				this.restoreQueuedMessagesToEditor({ abort: true });
+				return true;
+			}
+			// The loader outlived its turn and no submission is pending (a started
+			// submission still inside prompt preflight stays cancellable above, so
+			// Esc aborts it instead of letting it start later), so nothing is
+			// cancellable even though the busy indicator is still mounted (#4741).
+			// Stop the stale indicator so completed work clears the busy state and
+			// keep evaluating the remaining states; when none match, the key falls
+			// through to idle semantics instead of a no-op abort that swallows it.
+			stopInteractiveActivityIndicator(this.ctx);
 		}
 		if (options.processes && this.ctx.session.isBashRunning) {
 			this.ctx.session.abortBash();
@@ -440,7 +457,7 @@ export class InputController {
 			if (isClearKey && !isInterruptKey) {
 				if (this.#handlePendingSteerInterrupt()) return { consume: true };
 				if (
-					!this.#handleCancellableWorkEscape({
+					this.#handleCancellableWorkEscape({
 						loading: true,
 						processes: true,
 						modes: true,
@@ -449,10 +466,12 @@ export class InputController {
 						streaming: true,
 					})
 				) {
-					return undefined;
+					this.#resetEscapeGestures();
+					return { consume: true };
 				}
-				this.#resetEscapeGestures();
-				return { consume: true };
+				// A stale loader was stopped and nothing else consumed the clear key:
+				// release it to the editor so the idle clear path still runs (#4741).
+				return undefined;
 			}
 			if (this.ctx.hasActiveBtw() && this.ctx.handleBtwEscape()) {
 				this.#resetEscapeGestures();

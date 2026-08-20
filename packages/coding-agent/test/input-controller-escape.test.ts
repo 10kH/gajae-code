@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
 import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
@@ -81,6 +81,8 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 		cancelPendingSubmission: ReturnType<typeof vi.fn>;
 		clearQueue: ReturnType<typeof vi.fn>;
 		ensureLoadingAnimation: ReturnType<typeof vi.fn>;
+		stopLoadingAnimation: Mock<() => void>;
+		hasPendingSubmission: Mock<() => boolean>;
 		handleBtwCommand: ReturnType<typeof vi.fn>;
 		handleBtwEscape: ReturnType<typeof vi.fn>;
 		hasActiveBtw: ReturnType<typeof vi.fn>;
@@ -108,6 +110,7 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 	const retryNow = vi.fn();
 	const addMessageToChat = vi.fn();
 	const cancelPendingSubmission = vi.fn(() => false);
+	const hasPendingSubmission = vi.fn(() => false);
 	const clearQueue = vi.fn(() => ({ steering: [], followUp: [] }));
 	const onInputCallback = vi.fn();
 	const prompt = vi.fn();
@@ -164,6 +167,9 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
 	});
 
+	const stopLoadingAnimation = vi.fn(() => {
+		ctx.loadingAnimation = undefined;
+	});
 	ctx = {
 		settings: { get: () => undefined } as unknown as InteractiveModeContext["settings"],
 		editor: editor as unknown as InteractiveModeContext["editor"],
@@ -219,7 +225,9 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 		onInputCallback,
 		addMessageToChat,
 		cancelPendingSubmission,
+		hasPendingSubmission,
 		ensureLoadingAnimation,
+		stopLoadingAnimation,
 		finishPendingSubmission: vi.fn(),
 		flushPendingBashComponents: vi.fn(),
 		markPendingSubmissionStarted: vi.fn(() => true),
@@ -253,8 +261,10 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 			retryNow,
 			addMessageToChat,
 			cancelPendingSubmission,
+			hasPendingSubmission,
 			clearQueue,
 			ensureLoadingAnimation,
+			stopLoadingAnimation,
 			handleBtwCommand,
 			handleBtwEscape,
 			hasActiveBtw,
@@ -355,6 +365,7 @@ describe("InputController escape behavior", () => {
 	it("falls back to aborting the active session when no pending optimistic submission exists", () => {
 		const { ctx, editor, spies } = createContext();
 		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
@@ -447,6 +458,106 @@ describe("InputController escape behavior", () => {
 		expect(spies.cancelPendingSubmission).not.toHaveBeenCalled();
 		expect(spies.clearQueue).not.toHaveBeenCalled();
 		expect(spies.abort).toHaveBeenCalledTimes(1);
+	});
+	it("keeps aborting a started submission that is still inside prompt preflight (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		// markPendingSubmissionAlready flipped `started`, so cancelPendingSubmission
+		// returns false, and session.prompt() has not flipped isStreaming yet (it is
+		// still awaiting its startup barrier/selection fence). The submission is
+		// still pending, so Esc must abort it — not stop the loader as stale and let
+		// the prompt begin later despite the user's cancellation.
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		spies.hasPendingSubmission.mockReturnValue(true);
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).not.toHaveBeenCalled();
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledWith(expect.objectContaining({ cause: "user_interrupt" }));
+	});
+	it("clears a stale working loader instead of swallowing Esc after work completed (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		// Completed work: the turn settled (not streaming/compacting, nothing
+		// queued) but the busy indicator never unmounted. Esc must stop the
+		// stale loader, fall through to idle semantics, and never abort.
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		editor.setText("draft message");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).toHaveBeenCalledTimes(1);
+		expect(ctx.loadingAnimation).toBeUndefined();
+		expect(spies.abort).not.toHaveBeenCalled();
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+		// Fall-through is the idle draft-clear gesture, not a silent no-op.
+		expect(spies.showStatus).toHaveBeenCalledWith("press Esc again to clear");
+		expect(editor.getText()).toBe("draft message");
+
+		// The second press now lands on an idle composer and clears the draft.
+		editor.onEscape?.();
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
+
+	it("still restores queued work behind a loader after the turn ended (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		(ctx.session as { queuedMessageCount: number }).queuedMessageCount = 2;
+		spies.clearQueue.mockReturnValue({ steering: ["queued steer"], followUp: [] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).not.toHaveBeenCalled();
+		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("queued steer");
+	});
+
+	it("clears the stale loader through the global Ctrl+C listener after work completed (#4741)", () => {
+		const { ctx, editor, inputListeners, spies } = createContext();
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		editor.setText("draft message");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const first = inputListeners[0]?.("\x03");
+		// The listener stopped the stale loader and released the clear key to the
+		// editor, whose idle clear path empties the composer instead of a no-op abort.
+		expect(first).toBeUndefined();
+		expect(spies.stopLoadingAnimation).toHaveBeenCalledTimes(1);
+		expect(ctx.loadingAnimation).toBeUndefined();
+		expect(spies.abort).not.toHaveBeenCalled();
+		if (!first?.consume) editor.onClear?.();
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+	});
+	it("restores the empty-editor double-Esc gesture behind a stale loader after work completed (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).toHaveBeenCalledTimes(1);
+		expect(spies.abort).not.toHaveBeenCalled();
+
+		// The gesture window survives the stale-loader stop: the second Esc
+		// reaches the idle double-Esc action instead of being swallowed.
+		const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
+		try {
+			ctx.lastEscapeTime = 10_000 - 100;
+			editor.onEscape?.();
+		} finally {
+			now.mockRestore();
+		}
+		expect(ctx.showTreeSelector).toHaveBeenCalledTimes(1);
 	});
 
 	it("cancels compaction even when the composer contains a draft", () => {
@@ -572,6 +683,7 @@ describe("InputController escape behavior", () => {
 				name: "loading",
 				setup: (ctx: InteractiveModeContext) => {
 					ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+					(ctx.session as { isStreaming: boolean }).isStreaming = true;
 				},
 				assert: (spies: ReturnType<typeof createContext>["spies"]) => expect(spies.clearQueue).toHaveBeenCalled(),
 			},
