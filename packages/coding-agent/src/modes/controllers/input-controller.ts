@@ -220,9 +220,13 @@ export class InputController {
 			case "app.queue.togglePane":
 				return true;
 			case "app.message.sendNow":
+				// `sendNow()` falls back to `getQueuedMessageEntries()[0]`, which returns
+				// only visible steering/follow-up entries, so advertising the action for
+				// hidden next-turn context enabled a keybinding whose only outcome is
+				// "No visible queued message to send".
 				return (
 					this.ctx.session.isStreaming &&
-					(this.ctx.editor.getText().trim().length > 0 || this.ctx.session.queuedMessageCount > 0)
+					(this.ctx.editor.getText().trim().length > 0 || this.ctx.session.drainableQueuedMessageCount > 0)
 				);
 			default:
 				return true;
@@ -357,9 +361,14 @@ export class InputController {
 			if (this.ctx.cancelPendingSubmission()) {
 				return true;
 			}
+			// Only count queues this handler can actually drain. The aggregate
+			// `queuedMessageCount` also counts hidden next-turn context, which
+			// `restoreQueuedMessagesToEditor()` never returns and which survives turn
+			// completion by design, so gating on the aggregate left a permanently
+			// nonzero count that made every press a no-op abort — the #4741 lockout.
 			const hasCancellableWork =
 				this.ctx.hasPendingSubmission() ||
-				this.ctx.session.queuedMessageCount > 0 ||
+				this.ctx.session.drainableQueuedMessageCount > 0 ||
 				(this.ctx.compactionQueuedMessages?.length ?? 0) > 0 ||
 				this.ctx.session.isStreaming ||
 				this.ctx.session.isCompacting;
@@ -880,8 +889,11 @@ export class InputController {
 			}
 		}
 
-		// Empty submit while streaming with queued messages: flush queues immediately
-		if (!text && this.ctx.session.isStreaming && this.ctx.session.queuedMessageCount > 0) {
+		// Empty submit while streaming with queued messages: flush queues immediately.
+		// Only drainable queues justify the abort — aborting for hidden next-turn
+		// context would kill the live turn without flushing anything, since that
+		// context is not delivered by the resume path this abort relies on.
+		if (!text && this.ctx.session.isStreaming && this.ctx.session.drainableQueuedMessageCount > 0) {
 			// Abort current stream and let queued messages be processed
 			await this.#abortInteractive();
 			return;

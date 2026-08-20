@@ -57,6 +57,27 @@ type FakeEditor = {
 type FakeInputListenerResult = { consume?: boolean; data?: string } | undefined;
 type FakeInputListener = (data: string) => FakeInputListenerResult;
 
+/**
+ * Set the fake session's queue accounting the way AgentSession derives it:
+ * `queuedMessageCount` aggregates all three queues while
+ * `drainableQueuedMessageCount` counts only the steering/follow-up entries the
+ * restore/clear handlers can actually return. Tests must never set them
+ * independently, or a guard reading the wrong one would still look correct.
+ */
+function setQueueCounts(
+	ctx: InteractiveModeContext,
+	counts: { steering?: number; followUp?: number; nextTurn?: number },
+): void {
+	const steering = counts.steering ?? 0;
+	const followUp = counts.followUp ?? 0;
+	const nextTurn = counts.nextTurn ?? 0;
+	Object.assign(ctx.session as unknown as Record<string, unknown>, {
+		queuedMessageCount: steering + followUp + nextTurn,
+		drainableQueuedMessageCount: steering + followUp,
+		pendingMessageCounts: { steering, followUp, nextTurn },
+	});
+}
+
 function createSubmission(input: {
 	text: string;
 	images?: InteractiveModeContext["pendingImages"];
@@ -188,6 +209,8 @@ function createContext(options: { interruptKeys?: string[]; clearKeys?: string[]
 			isBashRunning: false,
 			isEvalRunning: false,
 			queuedMessageCount: 0,
+			drainableQueuedMessageCount: 0,
+			pendingMessageCounts: { steering: 0, followUp: 0, nextTurn: 0 },
 			hasQueuedSteering: false,
 			messages: [],
 			extensionRunner: undefined,
@@ -506,7 +529,7 @@ describe("InputController escape behavior", () => {
 	it("still restores queued work behind a loader after the turn ended (#4741)", () => {
 		const { ctx, editor, spies } = createContext();
 		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
-		(ctx.session as { queuedMessageCount: number }).queuedMessageCount = 2;
+		setQueueCounts(ctx, { steering: 2 });
 		spies.clearQueue.mockReturnValue({ steering: ["queued steer"], followUp: [] });
 		const controller = new InputController(ctx);
 
@@ -517,6 +540,127 @@ describe("InputController escape behavior", () => {
 		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
 		expect(spies.abort).toHaveBeenCalledTimes(1);
 		expect(editor.getText()).toBe("queued steer");
+	});
+
+	it("restores a follow-up-only queue behind a loader after the turn ended (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		// Follow-up entries are drainable too: `clearQueue()` returns them, so the
+		// loader is real work and Esc must restore + abort rather than stop it.
+		setQueueCounts(ctx, { followUp: 1 });
+		spies.clearQueue.mockReturnValue({ steering: [], followUp: ["queued follow-up"] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).not.toHaveBeenCalled();
+		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("queued follow-up");
+	});
+
+	it("restores a compaction-only queue behind a loader after the turn ended (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		// Compaction queues live on the controller context, not the session, and are
+		// drained by the same handler, so they also keep the loader classified live.
+		ctx.compactionQueuedMessages = [{ text: "queued during compaction", mode: "followUp" }];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).not.toHaveBeenCalled();
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("queued during compaction");
+		expect(ctx.compactionQueuedMessages).toEqual([]);
+	});
+
+	it("recovers Esc behind a stale loader when only hidden next-turn context is queued (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		// A `todo_write` failure during the turn queued a hidden reminder with
+		// `deliverAs: "nextTurn"` and no `triggerTurn`, so it deliberately survives
+		// turn completion and the aggregate `queuedMessageCount` stays nonzero
+		// forever. The restore/clear handlers never drain it, so gating on the
+		// aggregate made every press a no-op abort and locked the user out.
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		setQueueCounts(ctx, { nextTurn: 1 });
+		editor.setText("draft message");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).toHaveBeenCalledTimes(1);
+		expect(ctx.loadingAnimation).toBeUndefined();
+		expect(spies.abort).not.toHaveBeenCalled();
+		// The hidden entry is neither delivered nor cleared by recovery.
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+		expect(ctx.session.pendingMessageCounts.nextTurn).toBe(1);
+		expect(spies.showStatus).toHaveBeenCalledWith("press Esc again to clear");
+		expect(editor.getText()).toBe("draft message");
+
+		editor.onEscape?.();
+		expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("");
+		expect(ctx.session.pendingMessageCounts.nextTurn).toBe(1);
+	});
+
+	it("releases Ctrl+C to the editor behind a stale loader with hidden next-turn context (#4741)", () => {
+		const { ctx, editor, inputListeners, spies } = createContext();
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		setQueueCounts(ctx, { nextTurn: 1 });
+		editor.setText("draft message");
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		const first = inputListeners[0]?.("\x03");
+
+		expect(first).toBeUndefined();
+		expect(spies.stopLoadingAnimation).toHaveBeenCalledTimes(1);
+		expect(spies.abort).not.toHaveBeenCalled();
+		expect(spies.clearQueue).not.toHaveBeenCalled();
+		if (!first?.consume) editor.onClear?.();
+		expect(editor.getText()).toBe("");
+		expect(ctx.session.pendingMessageCounts.nextTurn).toBe(1);
+	});
+
+	it("still aborts a drainable queue that coexists with hidden next-turn context (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		// Concurrent queues: a visible steer plus hidden context. The visible entry
+		// is drainable, so this is live work — recovery must not reclassify it.
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		setQueueCounts(ctx, { steering: 1, nextTurn: 2 });
+		spies.clearQueue.mockReturnValue({ steering: ["queued steer"], followUp: [] });
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).not.toHaveBeenCalled();
+		expect(spies.clearQueue).toHaveBeenCalledTimes(1);
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(editor.getText()).toBe("queued steer");
+		// Aborting drainable work leaves the hidden queue untouched.
+		expect(ctx.session.pendingMessageCounts.nextTurn).toBe(2);
+	});
+
+	it("keeps aborting a retrying session behind a loader with hidden next-turn context (#4741)", () => {
+		const { ctx, editor, spies } = createContext();
+		// Retry keeps the loader mounted with no drainable queue; the streaming
+		// flag is what marks it live, and hidden context must not change that.
+		ctx.loadingAnimation = {} as InteractiveModeContext["loadingAnimation"];
+		setQueueCounts(ctx, { nextTurn: 1 });
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+		editor.onEscape?.();
+
+		expect(spies.stopLoadingAnimation).not.toHaveBeenCalled();
+		expect(spies.abort).toHaveBeenCalledTimes(1);
+		expect(ctx.session.pendingMessageCounts.nextTurn).toBe(1);
 	});
 
 	it("clears the stale loader through the global Ctrl+C listener after work completed (#4741)", () => {
@@ -543,16 +687,21 @@ describe("InputController escape behavior", () => {
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
-		editor.onEscape?.();
-
-		expect(spies.stopLoadingAnimation).toHaveBeenCalledTimes(1);
-		expect(spies.abort).not.toHaveBeenCalled();
-
-		// The gesture window survives the stale-loader stop: the second Esc
-		// reaches the idle double-Esc action instead of being swallowed.
+		// One controlled clock across both presses: the first Esc must arm the real
+		// timing window itself. Overwriting `lastEscapeTime` by hand would pass even
+		// if the recovered press never reached the empty-editor branch at all.
 		const now = vi.spyOn(Date, "now").mockReturnValue(10_000);
 		try {
-			ctx.lastEscapeTime = 10_000 - 100;
+			editor.onEscape?.();
+
+			expect(spies.stopLoadingAnimation).toHaveBeenCalledTimes(1);
+			expect(spies.abort).not.toHaveBeenCalled();
+			// Armed by the recovered press, not by the test.
+			expect(ctx.lastEscapeTime).toBe(10_000);
+			expect(ctx.showTreeSelector).not.toHaveBeenCalled();
+
+			// Second press inside the window reaches the idle double-Esc action.
+			now.mockReturnValue(10_100);
 			editor.onEscape?.();
 		} finally {
 			now.mockRestore();

@@ -11581,6 +11581,21 @@ export class AgentSession {
 	get queuedMessageCount(): number {
 		return this.#steeringMessages.length + this.#followUpMessages.length + this.#pendingNextTurnMessages.length;
 	}
+	/**
+	 * Number of pending messages a user-facing drain can actually deliver back:
+	 * exactly the steering and follow-up queues that `clearQueue()`,
+	 * `popLastQueuedMessage()`, and `getQueuedMessageEntries()` operate on.
+	 *
+	 * Hidden next-turn context is deliberately excluded. Those entries are
+	 * authored by the agent (e.g. a `todo_write` failure reminder queued with
+	 * `deliverAs: "nextTurn"` and no `triggerTurn`), are never returned by the
+	 * drain handlers, and deliberately survive turn completion — so a UI gate
+	 * that counted them would report permanently pending work that no key press
+	 * can clear, locking the user out of their own input (#4741).
+	 */
+	get drainableQueuedMessageCount(): number {
+		return this.#steeringMessages.length + this.#followUpMessages.length;
+	}
 	/** Typed pending-message counts per queue (steering, follow-up, next-turn). */
 	get pendingMessageCounts(): { steering: number; followUp: number; nextTurn: number } {
 		return {
