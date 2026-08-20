@@ -88,6 +88,65 @@ describe("read tool ACP fs routing", () => {
 		}
 	});
 
+	it("does not fall back to a disk secret when the ACP provider denies the read", async () => {
+		const filePath = path.join(tmpDir, "secret.ts");
+		await fs.writeFile(filePath, "export const secret = 'disk-only';\n");
+		const bridge: ClientBridge = {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => {
+				const error = new Error("Request rejected");
+				error.name = "permission_denied";
+				throw error;
+			},
+		};
+
+		await expect(
+			new ReadTool(createSession(tmpDir, bridge)).execute("denied-reverse-read", { path: filePath }),
+		).rejects.toThrow("Request rejected");
+	});
+
+	it("treats a neutral EACCES bridge error as a denial", async () => {
+		const filePath = path.join(tmpDir, "ambiguous.ts");
+		await fs.writeFile(filePath, "export const local = true;\n");
+		const bridge: ClientBridge = {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => {
+				throw Object.assign(new Error("bridge rejected request"), { code: "EACCES" });
+			},
+		};
+		await expect(
+			new ReadTool(createSession(tmpDir, bridge)).execute("denied-eacces", { path: filePath }),
+		).rejects.toThrow("bridge rejected request");
+	});
+
+	it("falls back only for an explicit transport-unavailable bridge error", async () => {
+		const filePath = path.join(tmpDir, "transport-fallback.ts");
+		await fs.writeFile(filePath, "export const local = true;\n");
+		const bridge: ClientBridge = {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => {
+				throw Object.assign(new Error("bridge transport unavailable"), { code: "transport_unavailable" });
+			},
+		};
+		const result = await new ReadTool(createSession(tmpDir, bridge)).execute("transport-fallback", {
+			path: filePath,
+		});
+		expect(textOutput(result)).toContain("export const local = true;");
+	});
+
+	it("uses the ACP buffer for a missing path with a range and normal truncation routing", async () => {
+		const filePath = path.join(tmpDir, "missing-buffer.ts");
+		const bridge: ClientBridge = {
+			capabilities: { readTextFile: true },
+			readTextFile: async () => "one\ntwo\nthree\nfour\n",
+		};
+		const result = await new ReadTool(createSession(tmpDir, bridge)).execute("missing-range", {
+			path: `${filePath}:2+1`,
+		});
+		const text = textOutput(result);
+		expect(text).toContain("two");
+	});
+
 	it("applies requested line ranges to bridge content exactly once", async () => {
 		const filePath = path.join(tmpDir, "range.txt");
 		await fs.writeFile(filePath, "disk one\ndisk two\ndisk three\n");

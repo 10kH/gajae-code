@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun";
+import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { selectCanaryTests } from "./ci-risk-canary-manifest";
@@ -65,6 +66,11 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // replace, direct-basename test selection and owner fallback tasks.
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
+	"packages/coding-agent/src/tools/atomic-file-write.ts": ["packages/coding-agent/test/file-tools-atomicity.test.ts"],
+	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
+	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
+	"packages/coding-agent/src/lsp/index.ts": ["packages/coding-agent/test/tools/lsp-batching.test.ts"],
+	"packages/coding-agent/src/config/model-registry.ts": ["packages/coding-agent/test/model-registry-runtime-provider.test.ts"],
 	"packages/ai/src/providers/anthropic.ts": [
 		"packages/ai/test/anthropic-truncated-toolcall.test.ts",
 		"packages/ai/test/anthropic-stream-envelope.test.ts",
@@ -282,8 +288,8 @@ async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	const normalizedPaths = normalizeChangedPaths(paths);
 	const packages = await getWorkspacePackages();
 	const legacy = resolvePlanMode() === "pr"
-		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles())
-		: planTasks(normalizedPaths, packages);
+		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles(), true)
+		: planTasks(normalizedPaths, packages, true);
 	if (normalizedPaths.length > 0 && normalizedPaths.every(isDocOrChangelogPath)) return legacy;
 	return appendBuildTasks(legacy, normalizedPaths, packages, await loadBuildInventory());
 }
@@ -730,7 +736,11 @@ function readStringMap(value: unknown): Record<string, string> | undefined {
 	return Object.fromEntries(entries);
 }
 
-export function planTasks(paths: readonly string[], packages: readonly WorkspacePackage[]): Task[] {
+export function planTasks(
+	paths: readonly string[],
+	packages: readonly WorkspacePackage[],
+	validateTestPaths = false,
+): Task[] {
 	const tasks = new Map<string, Task>();
 	// Mirror of the docs-index gate in planTargetedTasks: docs/ is the source the
 	// embedded index is generated from, so either side changing must run its gate.
@@ -836,7 +846,12 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 // Native builds are added once (native-linux-x64) only when a planned task needs
 // the addon at runtime; the dedicated job restores it from cache when no native
 // source changed, so PRs never rebuild native per shard.
-export function planTargetedTasks(paths: readonly string[], packages: readonly WorkspacePackage[], testFiles: readonly string[]): Task[] {
+export function planTargetedTasks(
+	paths: readonly string[],
+	packages: readonly WorkspacePackage[],
+	testFiles: readonly string[],
+	validateTestPaths = false,
+): Task[] {
 	const tasks = new Map<string, Task>();
 	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
 	// A docs edit is cheap, but it is not free: docs/ is the source the embedded docs
@@ -880,7 +895,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 			add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
 			for (const testFile of behavioralTestsFor(changedPath)) {
-				addTestFileTask(tasks, testFile);
+				addTestFileTask(tasks, testFile, validateTestPaths);
 			}
 			continue;
 		}
@@ -911,10 +926,10 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 
 		const mappedTests = mappedTestsFor(changedPath, packages, testFiles);
 		for (const testFile of mappedTests) {
-			addTestFileTask(tasks, testFile);
+			addTestFileTask(tasks, testFile, validateTestPaths);
 		}
 		for (const testFile of behavioralTestsFor(changedPath)) {
-			addTestFileTask(tasks, testFile);
+			addTestFileTask(tasks, testFile, validateTestPaths);
 		}
 		if (isCodingAgentShardOneCoveragePath(changedPath)) {
 			addCodingAgentTestShard(tasks, 1);
@@ -973,7 +988,8 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 
 // Add a task that runs exactly one test file. Keyed as `test:<repo-relative-path>`
 // so the matrix shard name stays small and directly traceable to the file.
-function addTestFileTask(tasks: Map<string, Task>, testFile: string): void {
+function addTestFileTask(tasks: Map<string, Task>, testFile: string, requireExisting = false): void {
+	if (requireExisting && !fsSync.existsSync(path.join(repoRoot, testFile))) return;
 	add(tasks, `test:${testFile}`, `Test ${testFile}`, ["bun", "test", testFile]);
 }
 

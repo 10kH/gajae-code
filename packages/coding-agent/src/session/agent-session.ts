@@ -490,6 +490,74 @@ interface CompactionStateSnapshot {
 	activeSkills: Array<{ skill: string; phase: string }>;
 	queuedMessages: boolean;
 	lastAssistantStopReason: StopReason | undefined;
+	recentFileMutations: string[];
+}
+
+const FILE_MUTATION_TOOLS = new Set(["write", "edit", "apply_patch", "ast_edit"]);
+const MAX_RECENT_FILE_MUTATIONS = 12;
+
+function collectFileMutationPaths(toolName: string, args: unknown): string[] {
+	if (!FILE_MUTATION_TOOLS.has(toolName) || !args || typeof args !== "object" || Array.isArray(args)) return [];
+	const record = args as Record<string, unknown>;
+	const paths: string[] = [];
+	const addPath = (value: unknown) => {
+		if (typeof value === "string" && value.length > 0 && !paths.includes(value)) paths.push(value);
+	};
+	const directPath = getStringProperty(record, "path") ?? getStringProperty(record, "file_path");
+	addPath(directPath);
+
+	for (const path of collectStringPaths(record.paths)) addPath(path);
+	const edits = Array.isArray(record.edits) ? record.edits : [];
+	for (const edit of edits) {
+		if (!edit || typeof edit !== "object" || Array.isArray(edit)) continue;
+		addPath(getStringProperty(edit as Record<string, unknown>, "rename"));
+	}
+
+	const input = getStringProperty(record, "input");
+	if (input) {
+		try {
+			for (const entry of expandApplyPatchToEntries({ input })) {
+				addPath(entry.path);
+				addPath(entry.rename);
+			}
+		} catch {
+			// If the edit input is not an apply_patch envelope, retain direct paths.
+		}
+	}
+	return paths;
+}
+
+function collectRecentFileMutations(messages: readonly AgentMessage[]): string[] {
+	const callsById = new Map<string, string[]>();
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		const content = (message as AssistantMessage).content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			if (block.type !== "toolCall" || !FILE_MUTATION_TOOLS.has(block.name)) continue;
+			const paths = collectFileMutationPaths(block.name, block.arguments).filter(path => path.length > 0);
+			if (paths.length > 0) callsById.set(block.id, paths);
+		}
+	}
+	const seen = new Set<string>();
+	const paths: string[] = [];
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		if (message.role !== "toolResult") continue;
+		const result = message as { toolName?: string; toolCallId?: string; isError?: boolean };
+		if (result.isError || !result.toolName || !FILE_MUTATION_TOOLS.has(result.toolName)) continue;
+		const filePaths = result.toolCallId ? callsById.get(result.toolCallId) : undefined;
+		if (!filePaths) continue;
+		for (let pathIndex = filePaths.length - 1; pathIndex >= 0; pathIndex--) {
+			const filePath = filePaths[pathIndex];
+			if (!filePath || seen.has(filePath)) continue;
+			seen.add(filePath);
+			paths.push(filePath);
+			if (paths.length >= MAX_RECENT_FILE_MUTATIONS) break;
+		}
+		if (paths.length >= MAX_RECENT_FILE_MUTATIONS) break;
+	}
+	return paths;
 }
 
 /** Escape XML-ish metacharacters and flatten newlines so state text cannot break compaction prompt framing. */
@@ -11867,6 +11935,7 @@ export class AgentSession {
 			activeSkills: [],
 			queuedMessages: false,
 			lastAssistantStopReason: undefined,
+			recentFileMutations: [],
 		};
 		try {
 			const goalState = this.getGoalModeState();
@@ -11921,6 +11990,13 @@ export class AgentSession {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		try {
+			snapshot.recentFileMutations = collectRecentFileMutations(this.messages);
+		} catch (error) {
+			logger.warn("Failed to read recent file mutations for compaction snapshot", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		return snapshot;
 	}
 
@@ -11942,6 +12018,10 @@ export class AgentSession {
 		if (snapshot.openTodos.length > 0) {
 			const todos = snapshot.openTodos.map(todo => sanitizeCompactionStateText(todo, 120));
 			context.push(`Open todos: ${todos.join("; ")}`);
+		}
+		if (snapshot.recentFileMutations.length > 0) {
+			const files = snapshot.recentFileMutations.map(filePath => sanitizeCompactionStateText(filePath, 120));
+			context.push(`Recent file mutations: ${files.join("; ")}`);
 		}
 		return context;
 	}

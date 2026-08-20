@@ -281,8 +281,9 @@ export class ReverseLeaseRuntime {
 			throw new ReverseLeaseError("not_lease_owner");
 		this.#takeOutstanding(id);
 		if (error) {
-			const rejection = new Error(error.message);
+			const rejection = new Error(error.message) as Error & { code: string };
 			rejection.name = error.code;
+			rejection.code = error.code;
 			request.reject(rejection);
 		} else request.resolve(result);
 	}
