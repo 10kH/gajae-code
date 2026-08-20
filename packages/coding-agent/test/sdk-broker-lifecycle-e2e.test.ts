@@ -5103,6 +5103,17 @@ test("session/list does not grant a second ACP connection destructive lifecycle 
 
 		// The owner is unaffected by the refusal and can still close its own session.
 		expect(await owner.closeSession({ sessionId } as never)).toEqual({});
+
+		// Admission to both operations happens while this connection still owns the
+		// session. They must serialize, and delete must treat the preceding close's
+		// completed teardown as success instead of trying to close the dead process again.
+		const concurrent = await owner.newSession({ cwd, mcpServers: [] } as never);
+		await expect(
+			Promise.all([
+				owner.closeSession({ sessionId: concurrent.sessionId } as never),
+				owner.deleteSession({ sessionId: concurrent.sessionId } as never),
+			]),
+		).resolves.toEqual([{}, {}]);
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}

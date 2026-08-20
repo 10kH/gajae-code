@@ -1195,7 +1195,7 @@ export class AcpAgent implements Agent {
 	readonly #pendingCloseIdempotencyKeys = new Map<string, string>();
 	readonly #sessionEpochs = new Map<string, number>();
 	readonly #tearingDown = new Map<string, number>();
-	readonly #closing = new Map<string, Promise<CloseSessionResponse>>();
+	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
@@ -1443,72 +1443,79 @@ export class AcpAgent implements Agent {
 		if (!this.#ownedSessionIds.has(params.sessionId)) return Promise.resolve({});
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId);
 		if (!cwd) return Promise.resolve({});
-		const existing = this.#closing.get(params.sessionId);
-		if (existing) return existing;
-		const deferred = Promise.withResolvers<CloseSessionResponse>();
-		this.#closing.set(params.sessionId, deferred.promise);
-		void this.#closeOwnedSession(params.sessionId).then(deferred.resolve, deferred.reject);
-		const cleanup = deferred.promise.finally(() => {
-			if (this.#closing.get(params.sessionId) === deferred.promise) this.#closing.delete(params.sessionId);
+		return this.#enqueueLifecycleOperation(params.sessionId, async () => {
+			// A preceding delete in the same lifecycle chain already completed the terminal operation.
+			if (!this.#ownedSessionIds.has(params.sessionId) && !this.#sessions.has(params.sessionId)) return {};
+			return this.#closeOwnedSession(params.sessionId);
 		});
-		void cleanup.catch(() => undefined);
-		return deferred.promise;
 	}
 
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
 		const record = this.#sessions.get(params.sessionId);
 		const pendingLocator = this.#pendingDeleteLocators.get(params.sessionId);
-		// A retained delete locator is itself proof of prior ownership: only the owning
-		// connection can have started that delete. Anything else must be owned outright.
+		// Capture authority before joining the lifecycle chain: an admitted delete must
+		// remain authorized when a preceding close retires connection ownership.
 		if (!this.#ownedSessionIds.has(params.sessionId) && pendingLocator === undefined) return {};
 		const cwd = record?.cwd ?? this.#knownSessionCwds.get(params.sessionId) ?? pendingLocator?.cwd;
-		// ACP's delete request has no cwd. Unknown ids remain the protocol no-op,
-		// while the broker can reconstruct an authenticated pending locator from its durable ledger.
-		if (!cwd) {
-			await (await this.#brokerAdapter()).global(
-				"session.delete",
-				{ sessionId: params.sessionId },
-				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
-			);
-			return {};
-		}
-		this.#beginTeardown(params.sessionId);
-		try {
-			// A retained delete locator proves the prior attempt already completed
-			// connection/process teardown and reached durable artifact cleanup. Re-closing
-			// that terminal session can only replace the authoritative cleanup_pending
-			// result with unrelated close uncertainty, so retries resume deletion directly.
-			await this.#teardownSession(params.sessionId, "deleted", pendingLocator === undefined || record !== undefined);
-			let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
-			if (!saved) {
-				try {
-					saved = await this.#resolveSavedSession(params.sessionId, cwd);
-				} catch (error) {
-					if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
-						this.#knownSessionCwds.delete(params.sessionId);
-						this.#ownedSessionIds.delete(params.sessionId);
-						this.#knownSessionMcpServers.delete(params.sessionId);
-						this.#knownSessionMetadata.delete(params.sessionId);
-						return {};
-					}
-					throw error;
-				}
+		return this.#enqueueLifecycleOperation(params.sessionId, async () => {
+			// ACP's delete request has no cwd. Unknown ids remain the protocol no-op,
+			// while the broker can reconstruct an authenticated pending locator from its durable ledger.
+			if (!cwd) {
+				await (await this.#brokerAdapter()).global(
+					"session.delete",
+					{ sessionId: params.sessionId },
+					this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
+				);
+				return {};
 			}
-			this.#pendingDeleteLocators.set(params.sessionId, { cwd, path: saved });
-			await (await this.#brokerAdapter()).global(
-				"session.delete",
-				{ sessionId: params.sessionId, sessionPath: saved, cwd, target: { path: cwd } },
-				this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
-			);
-			this.#knownSessionCwds.delete(params.sessionId);
-			this.#ownedSessionIds.delete(params.sessionId);
-			this.#knownSessionMcpServers.delete(params.sessionId);
-			this.#knownSessionMetadata.delete(params.sessionId);
-			this.#pendingDeleteLocators.delete(params.sessionId);
-			return {};
-		} finally {
-			this.#finishTeardown(params.sessionId);
-		}
+			this.#beginTeardown(params.sessionId);
+			try {
+				// A preceding close in the lifecycle chain already completed process teardown.
+				// Continue with durable deletion instead of re-closing an already-dead process.
+				const teardownCompleted =
+					!this.#ownedSessionIds.has(params.sessionId) && !this.#sessions.has(params.sessionId);
+				if (!teardownCompleted) {
+					// A retained delete locator proves the prior attempt already completed
+					// connection/process teardown and reached durable artifact cleanup. Re-closing
+					// that terminal session can only replace the authoritative cleanup_pending
+					// result with unrelated close uncertainty, so retries resume deletion directly.
+					await this.#teardownSession(
+						params.sessionId,
+						"deleted",
+						pendingLocator === undefined || record !== undefined,
+					);
+				}
+				let saved = pendingLocator?.cwd === cwd ? pendingLocator.path : undefined;
+				if (!saved) {
+					try {
+						saved = await this.#resolveSavedSession(params.sessionId, cwd);
+					} catch (error) {
+						if (error instanceof AcpSdkAdapterError && error.code === "not_found") {
+							this.#knownSessionCwds.delete(params.sessionId);
+							this.#ownedSessionIds.delete(params.sessionId);
+							this.#knownSessionMcpServers.delete(params.sessionId);
+							this.#knownSessionMetadata.delete(params.sessionId);
+							return {};
+						}
+						throw error;
+					}
+				}
+				this.#pendingDeleteLocators.set(params.sessionId, { cwd, path: saved });
+				await (await this.#brokerAdapter()).global(
+					"session.delete",
+					{ sessionId: params.sessionId, sessionPath: saved, cwd, target: { path: cwd } },
+					this.#lifecycleIdempotencyKey(params.sessionId, "session.delete"),
+				);
+				this.#knownSessionCwds.delete(params.sessionId);
+				this.#ownedSessionIds.delete(params.sessionId);
+				this.#knownSessionMcpServers.delete(params.sessionId);
+				this.#knownSessionMetadata.delete(params.sessionId);
+				this.#pendingDeleteLocators.delete(params.sessionId);
+				return {};
+			} finally {
+				this.#finishTeardown(params.sessionId);
+			}
+		});
 	}
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
@@ -1973,6 +1980,20 @@ export class AcpAgent implements Agent {
 		const remaining = (this.#tearingDown.get(id) ?? 1) - 1;
 		if (remaining > 0) this.#tearingDown.set(id, remaining);
 		else this.#tearingDown.delete(id);
+	}
+
+	#enqueueLifecycleOperation<T>(id: string, operation: () => Promise<T>): Promise<T> {
+		const previous = this.#lifecycleOperations.get(id) ?? Promise.resolve();
+		const result = previous.catch(() => undefined).then(operation);
+		const settled = result.then(
+			() => undefined,
+			() => undefined,
+		);
+		this.#lifecycleOperations.set(id, settled);
+		void settled.finally(() => {
+			if (this.#lifecycleOperations.get(id) === settled) this.#lifecycleOperations.delete(id);
+		});
+		return result;
 	}
 
 	#lifecycleIdempotencyKey(id: string, operation: "session.close" | "session.delete"): string {
@@ -3591,7 +3612,7 @@ export class AcpAgent implements Agent {
 		this.#knownSessionMetadata.clear();
 		this.#pendingDeleteLocators.clear();
 		this.#pendingCloseIdempotencyKeys.clear();
-		if (this.#closing.size === 0) this.#closing.clear();
+		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();
 		this.#tearingDown.clear();
 		if (this.#broker) {
 			const broker = this.#broker;
