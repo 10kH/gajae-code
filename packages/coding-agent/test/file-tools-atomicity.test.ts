@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import type { PathLike, StatOptions } from "node:fs";
-import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,7 +8,6 @@ import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridg
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
-import * as natives from "@gajae-code/natives";
 import { FileReadCache } from "../src/edit/file-read-cache";
 import { writeFileAtomically } from "../src/tools/atomic-file-write";
 
@@ -301,7 +299,7 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		expect(await fs.readFile(peer, "utf8")).toBe("original\n");
 	});
 
-	it("rejects a destination identity swap during publication", async () => {
+	it("rejects a destination identity swap detected before publication", async () => {
 		if (process.platform === "win32") return;
 		const dest = path.join(tmpDir, "identity-swap.ts");
 		const replacement = path.join(tmpDir, "identity-replacement.ts");
@@ -328,27 +326,22 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
-	it("uses the native identity-bound primitive at the publication boundary", async () => {
-		if (process.platform === "win32") return;
-		const dest = path.join(tmpDir, "native-boundary.ts");
-		const successor = path.join(tmpDir, "native-successor.ts");
-		const displaced = path.join(tmpDir, "native-displaced.ts");
-		await fs.writeFile(dest, "original\n");
-		await fs.writeFile(successor, "successor\n");
-		const realExactReplace = natives.exactReplacePath;
-		const original = spyOn(natives, "exactReplacePath").mockImplementation(
-			(sourcePath, destinationPath, expectedSource, expectedDestination) => {
-				fsSync.renameSync(destinationPath, displaced);
-				fsSync.renameSync(successor, destinationPath);
-				return realExactReplace(sourcePath, destinationPath, expectedSource, expectedDestination);
-			},
-		);
+	it("publishes through a same-directory atomic rename", async () => {
+		const dest = path.join(tmpDir, "plain-rename.ts");
+		const renamed: string[] = [];
+		const realRename = fs.rename.bind(fs);
+		const original = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			renamed.push(`${String(from)} -> ${String(to)}`);
+			return realRename(from, to);
+		});
 		try {
-			await expect(writeFileAtomically(dest, "must-not-overwrite\n")).rejects.toThrow(/identity_mismatch/);
-			expect(await fs.readFile(dest, "utf8")).toBe("successor\n");
+			await writeFileAtomically(dest, "published\n");
+			expect(renamed).toHaveLength(1);
+			expect(path.dirname(renamed[0]!.split(" -> ")[0])).toBe(path.dirname(dest));
+			expect(await fs.readFile(dest, "utf8")).toBe("published\n");
+			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 		} finally {
 			original.mockRestore();
-			await fs.rm(displaced, { force: true });
 		}
 	});
 
@@ -432,10 +425,7 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 	it("cleans an owned staging file when publication fails", async () => {
 		const dest = path.join(tmpDir, "rename-fails.ts");
 		await fs.writeFile(dest, "original\n");
-		const original = spyOn(natives, "exactReplacePath").mockImplementation(() => ({
-			ok: false,
-			code: "EIO",
-		}));
+		const original = spyOn(fs, "rename").mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
 		try {
 			await expect(writeFileAtomically(dest, "replacement\n")).rejects.toMatchObject({ code: "EIO" });
 			expect(await fs.readFile(dest, "utf8")).toBe("original\n");
@@ -448,10 +438,7 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 	it("reports cleanup failure without claiming the staged file was removed", async () => {
 		const dest = path.join(tmpDir, "unlink-fails.ts");
 		await fs.writeFile(dest, "original\n");
-		const replace = spyOn(natives, "exactReplacePath").mockImplementation(() => ({
-			ok: false,
-			code: "EIO",
-		}));
+		const rename = spyOn(fs, "rename").mockRejectedValue(Object.assign(new Error("EIO"), { code: "EIO" }));
 		const realUnlink = fs.unlink.bind(fs);
 		const unlink = spyOn(fs, "unlink").mockImplementation(async target => {
 			if (String(target).includes(".tmp")) {
@@ -463,8 +450,19 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 			await expect(writeFileAtomically(dest, "replacement\n")).rejects.toThrow(/Failed to clean up staging file/);
 			expect((await fs.readdir(path.dirname(dest))).some(name => name.endsWith(".tmp"))).toBe(true);
 		} finally {
-			replace.mockRestore();
+			rename.mockRestore();
 			unlink.mockRestore();
+		}
+	});
+
+	it("leaves no staging residue across three successful writes", async () => {
+		const destinations = ["success-one.ts", "success-two.ts", "success-three.ts"].map(name =>
+			path.join(tmpDir, name),
+		);
+		for (const [index, dest] of destinations.entries()) {
+			await writeFileAtomically(dest, `success ${index}\n`);
+			expect(await fs.readFile(dest, "utf8")).toBe(`success ${index}\n`);
+			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 		}
 	});
 

@@ -20,38 +20,18 @@
  * Existing-file mode and ownership are re-applied after staging so a process
  * umask or replacement inode never changes the target's identity. Hard-linked
  * targets are rejected because replacement would split their link group, and
- * the target identity is revalidated inside the native conditional publication
- * primitive. The staged
- * bytes are synced before publication; directory fsync is intentionally not
+ * target identity is revalidated before the final same-directory rename. The
+ * staged bytes are synced before publication; directory fsync is intentionally not
  * promised because Windows reports EPERM for it (#4457).
  */
 
-import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
 import { hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
 
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
-
-type NativeAtomicPublishBindings = {
-	exactReplacePath: (
-		sourcePath: string,
-		destinationPath: string,
-		expectedSource: NativeExactFileIdentity,
-		expectedDestination: NativeExactFileIdentity,
-	) => NativeExactUnlinkResult;
-	renameNoReplacePath: (sourcePath: string, destinationPath: string) => NativeNoReplaceResult;
-};
-
-let nativeAtomicPublishBindings: NativeAtomicPublishBindings | undefined;
-
-function getNativeAtomicPublishBindings(): NativeAtomicPublishBindings {
-	nativeAtomicPublishBindings ??= require("@gajae-code/natives") as NativeAtomicPublishBindings;
-	return nativeAtomicPublishBindings;
-}
 
 interface ExistingFileMetadata {
 	mode: number;
@@ -61,11 +41,6 @@ interface ExistingFileMetadata {
 	dev: number;
 	ino: number;
 }
-
-type NativePublicationError = Error & {
-	code?: string;
-	publicationUncertain?: boolean;
-};
 
 interface ResolvedPublishPath {
 	publishPath: string;
@@ -121,59 +96,6 @@ export interface WriteFileAtomicallyOptions {
 function tempPathFor(dest: string): string {
 	const unique = `${process.pid}.${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 8)}`;
 	return path.join(path.dirname(dest), `.${path.basename(dest)}.${unique}.tmp`);
-}
-
-function sha256(bytes: ArrayBuffer): string {
-	return crypto.createHash("sha256").update(new Uint8Array(bytes)).digest("hex");
-}
-
-async function captureExactFileIdentity(file: string): Promise<NativeExactFileIdentity | undefined> {
-	try {
-		const [bytes, stat, parent] = await Promise.all([
-			Bun.file(file).arrayBuffer(),
-			fs.stat(file, { bigint: true }),
-			fs.stat(path.dirname(file), { bigint: true }),
-		]);
-		return {
-			dev: stat.dev,
-			ino: stat.ino,
-			nlink: stat.nlink,
-			parentDev: parent.dev,
-			parentIno: parent.ino,
-			size: stat.size,
-			mtimeNs: stat.mtimeNs,
-			directory: false,
-			detachOnly: false,
-			sha256: sha256(bytes),
-		};
-	} catch (error) {
-		if (isEnoent(error)) return undefined;
-		throw error;
-	}
-}
-
-function nativePublicationError(
-	operation: string,
-	code: string | undefined,
-	publicationUncertain = false,
-): NativePublicationError {
-	const error = new Error(
-		publicationUncertain
-			? `${operation} reached an uncertain publication state (${code ?? "unknown"}).`
-			: `${operation} failed (${code ?? "unknown"}).`,
-	) as NativePublicationError;
-	if (code !== undefined) error.code = code;
-	if (publicationUncertain) error.publicationUncertain = true;
-	return error;
-}
-
-function hasRetainedPublication(result: NativeExactUnlinkResult): boolean {
-	return (
-		result.detachedPath !== undefined ||
-		result.retainedSuccessorPath !== undefined ||
-		result.retainedPlaceholderPath !== undefined ||
-		result.retainedUnknownPath !== undefined
-	);
 }
 
 function eisdir(dest: string): Error & { code: string } {
@@ -370,51 +292,11 @@ export async function writeFileAtomically(
 					await preserveExistingMetadata(tmp, existing);
 				}
 				await assertPublishTargetStillIntended(dest, publishPath, trustBoundary, existing, expectedParentRealpath);
-				if (existing === undefined) {
-					// A plain rename would allow a concurrent creator to be overwritten
-					// after the JavaScript identity check. Fail closed when the native
-					// no-replace primitive cannot establish the publication boundary.
-					const published = getNativeAtomicPublishBindings().renameNoReplacePath(tmp, publishPath);
-					if (!published.ok) {
-						const uncertain = published.mutationState !== "not_committed";
-						if (uncertain) owned = false;
-						throw nativePublicationError("Atomic creation", published.code, uncertain);
-					}
-					owned = false;
-				} else {
-					// The native exchange validates both identities in the same namespace
-					// transaction. Do not fall back to pathname rename: validation and a
-					// plain rename are otherwise separable under a concurrent writer.
-					const expectedDestination = await captureExactFileIdentity(publishPath);
-					if (expectedDestination === undefined) {
-						throw new Error(`destination '${dest}' disappeared while staging`);
-					}
-					if (
-						Number(expectedDestination.dev) !== existing.dev ||
-						Number(expectedDestination.ino) !== existing.ino ||
-						Number(expectedDestination.nlink ?? -1n) !== existing.nlink
-					) {
-						throw new Error(
-							`destination '${dest}' was replaced while staging; refusing to overwrite a different file`,
-						);
-					}
-					const expectedSource = await captureExactFileIdentity(tmp);
-					if (expectedSource === undefined) {
-						throw new Error(`staging file '${tmp}' disappeared before publication`);
-					}
-					const published = getNativeAtomicPublishBindings().exactReplacePath(
-						tmp,
-						publishPath,
-						expectedSource,
-						expectedDestination,
-					);
-					if (!published.ok) {
-						const uncertain = hasRetainedPublication(published);
-						if (uncertain) owned = false;
-						throw nativePublicationError("Atomic replacement", published.code, uncertain);
-					}
-					owned = false;
-				}
+				// The staged file lives beside the destination, so rename is one
+				// same-directory atomic publication. A failed rename leaves the
+				// destination untouched and the owned staging file is cleaned below.
+				await fs.rename(tmp, publishPath);
+				owned = false;
 				return;
 			} catch (error) {
 				lastError = error;
@@ -429,11 +311,6 @@ export async function writeFileAtomically(
 		throw lastError;
 	} catch (error) {
 		if (error instanceof FileWriteNotPublishedError) throw error;
-		const publicationUncertain =
-			error !== null &&
-			typeof error === "object" &&
-			"publicationUncertain" in error &&
-			error.publicationUncertain === true;
-		throw new FileWriteNotPublishedError(dest, error, { destUnchanged: !publicationUncertain });
+		throw new FileWriteNotPublishedError(dest, error);
 	}
 }
