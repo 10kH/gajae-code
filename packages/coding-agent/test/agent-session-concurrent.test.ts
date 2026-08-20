@@ -269,16 +269,26 @@ describe("AgentSession concurrent prompt guard", () => {
 	});
 	it("immediate sendUserMessage after abort starts a successor turn instead of parking in steer", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
-		let streamCalls = 0;
 		const agent = new Agent({
 			getApiKey: () => "test-key",
 			initialState: { model, systemPrompt: ["Test"], tools: [] },
-			streamFn: (_model, _context, options) => {
-				const call = ++streamCalls;
+			// Branch on the newest user message, NOT a stream-call counter: the
+			// session reports `isStreaming` before `streamFn` runs, so the aborted
+			// turn's dispatch races the abort. Keyed on a counter, the SUCCESSOR turn
+			// could take the blocking branch and hang the test whenever the first
+			// turn's dispatch had not landed yet.
+			streamFn: (_model, context, options) => {
+				const lastUser = [...(context?.messages ?? [])].reverse().find(message => message.role === "user");
+				const text =
+					lastUser && Array.isArray(lastUser.content)
+						? lastUser.content
+								.map(part => (typeof part === "object" && part.type === "text" ? part.text : ""))
+								.join("")
+						: "";
 				const signal = options?.signal;
 				const stream = new AssistantMessageEventStream();
 				queueMicrotask(() => {
-					if (call === 1) {
+					if (text === "First message") {
 						stream.push({ type: "start", partial: createAssistantMessage("") });
 						const abortStream = () => {
 							stream.push({
