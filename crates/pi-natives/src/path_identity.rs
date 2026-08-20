@@ -1500,14 +1500,14 @@ mod publication {
 	) -> Result<File, RetainedPublicationOpenFailure> {
 		open_result(path, directory, write).map_err(|error| RetainedPublicationOpenFailure {
 			object,
-			reason: error
-				.raw_os_error()
-				.map(|code| format!("errno-{}", errno_name(code)))
-				.unwrap_or_else(|| format!("io-{}", error.kind())),
+			reason: error.raw_os_error().map_or_else(
+				|| format!("io-{}", error.kind()),
+				|code| format!("errno-{}", errno_name(code)),
+			),
 		})
 	}
 
-	fn errno_name(errno: i32) -> &'static str {
+	const fn errno_name(errno: i32) -> &'static str {
 		match errno {
 			libc::EACCES => "EACCES",
 			libc::EISDIR => "EISDIR",
@@ -1663,12 +1663,21 @@ mod publication {
 mod publication {
 	use std::path::Path;
 
+	#[derive(Debug)]
+	pub(super) struct RetainedPublicationOpenFailure {
+		pub(super) object: &'static str,
+		pub(super) reason: String,
+	}
+
 	/// Windows retained HANDLE/FileIdInfo authority is intentionally unavailable
 	/// until its reparse-safe implementation lands; acquisition fails closed.
 	pub(super) struct RetainedPublication;
 	impl RetainedPublication {
-		pub(super) fn open(_: &Path) -> Option<Self> {
-			None
+		pub(super) fn open(_: &Path) -> Result<Self, RetainedPublicationOpenFailure> {
+			Err(RetainedPublicationOpenFailure {
+				object: "sdk",
+				reason: "unsupported-platform".to_owned(),
+			})
 		}
 
 		pub(super) fn observe(&self) -> String {
@@ -1681,6 +1690,23 @@ mod publication {
 
 		pub(super) fn sync(&self) -> String {
 			"ambiguous".to_owned()
+		}
+	}
+
+	#[cfg(test)]
+	mod tests {
+		use std::path::Path;
+
+		use super::RetainedPublication;
+
+		#[test]
+		fn retained_publication_reports_structured_unsupported_platform_failure() {
+			let failure = match RetainedPublication::open(Path::new("sdk")) {
+				Ok(_) => panic!("Windows retention is unavailable"),
+				Err(failure) => failure,
+			};
+			assert_eq!(failure.object, "sdk");
+			assert_eq!(failure.reason, "unsupported-platform");
 		}
 	}
 }
