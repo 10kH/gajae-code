@@ -300,6 +300,58 @@ describe("GLM ZCode OAuth login provider", () => {
 			global.fetch = originalFetch;
 		}
 	});
+	it("inherits same-family GLM metadata for IDs bundled under zai but not glm-zcode", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(JSON.stringify({ data: [{ id: "glm-5.1", name: "GLM-5.1" }] }), {
+				headers: { "Content-Type": "application/json" },
+			})) as unknown as typeof fetch;
+		try {
+			const models = await fetchDynamicModels();
+			const inherited = models?.find(model => model.id === "glm-5.1");
+			// glm-5.1 is bundled under zai (same family, same anthropic base);
+			// discovery must not degrade it to generic unknown metadata.
+			expect(inherited).toMatchObject({
+				provider: "glm-zcode",
+				api: "anthropic-messages",
+				baseUrl: GLM_ZCODE_ANTHROPIC_BASE_URL,
+				reasoning: true,
+				contextWindow: 200_000,
+				maxTokens: 131_072,
+			});
+			expect(inherited?.thinking).toMatchObject({ mode: "budget", minLevel: "minimal", maxLevel: "xhigh" });
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it("strips control sequences from catalog-provided model names", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					data: [
+						{ id: "glm-5.3", name: "\u001b]0;pwned\u0007GLM-5.3\n\u000bErase-Line" },
+						{ id: "glm-5.2", name: "\u0000\u007f" },
+					],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			)) as unknown as typeof fetch;
+		try {
+			const models = await fetchDynamicModels();
+			expect(models?.find(model => model.id === "glm-5.3")?.name).toBe("GLM-5.3 Erase-Line");
+			// A name that sanitizes to empty falls back to the bundled reference name.
+			expect(models?.find(model => model.id === "glm-5.2")?.name).toBe("GLM-5.2");
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
 
 	it("keeps static models when no GLM ZCode credential is configured", () => {
 		expect(glmZcodeModelManagerOptions().fetchDynamicModels).toBeUndefined();

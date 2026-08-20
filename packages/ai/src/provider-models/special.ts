@@ -1,5 +1,5 @@
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
-import { once } from "@gajae-code/utils";
+import { once, sanitizeText } from "@gajae-code/utils";
 
 import type { ModelManagerOptions } from "../model-manager";
 import { buildZCodeSourceHeaders } from "../providers/anthropic";
@@ -94,7 +94,14 @@ export function glmZcodeModelManagerOptions(
 ): ModelManagerOptions<"anthropic-messages"> {
 	const apiKey = config.apiKey;
 	const baseUrl = GLM_ZCODE_ANTHROPIC_BASE_URL;
-	const references = createBundledReferenceMap<"anthropic-messages">("glm-zcode");
+	const providerRefs = createBundledReferenceMap<"anthropic-messages">("glm-zcode");
+	// Same-family GLM references: the thin `glm-zcode` slice bundles only the
+	// newest model, while the `zai` slice carries the rest of the GLM family
+	// with real capabilities (reasoning, thinking, limits). Resolving through
+	// both keeps a newly selectable GLM model from degrading to generic
+	// unknown metadata; the provider/base are rewritten below.
+	const familyRefs = createBundledReferenceMap<"anthropic-messages">("zai");
+	const resolveReference = (modelId: string) => providerRefs.get(modelId) ?? familyRefs.get(modelId);
 
 	return {
 		providerId: "glm-zcode",
@@ -112,12 +119,20 @@ export function glmZcodeModelManagerOptions(
 								"anthropic-dangerous-direct-browser-access": "true",
 							},
 							mapModel: (entry, defaults) => {
-								const reference = references.get(defaults.id);
+								const reference = resolveReference(defaults.id);
 								if (!reference) return defaults;
+								// The remote catalog is provider-controlled text that ends up
+								// rendered in the TUI model selector; strip ANSI/OSC and other
+								// control sequences at the discovery boundary.
+								const remoteName =
+									typeof entry.name === "string" && entry.name.length > 0
+										? sanitizeText(entry.name).replace(/\s+/g, " ").trim()
+										: "";
 								return {
 									...reference,
 									id: defaults.id,
-									name: typeof entry.name === "string" && entry.name.length > 0 ? entry.name : reference.name,
+									provider: "glm-zcode",
+									name: remoteName.length > 0 ? remoteName.slice(0, 200) : reference.name,
 									baseUrl,
 									contextWindow:
 										defaults.contextWindow === UNK_CONTEXT_WINDOW
