@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -226,7 +226,6 @@ describe("skills", () => {
 		it("never loads Claude/Codex convention skills at runtime; they are import sources only", async () => {
 			const tempHomeDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-skills-home-"));
 			const tempProjectDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-skills-project-"));
-			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHomeDir);
 
 			try {
 				for (const root of [
@@ -259,7 +258,6 @@ describe("skills", () => {
 				expect(skills.map(skill => skill.name)).toEqual(["native-project-skill"]);
 				expect(skills[0]?.source).toBe("native:project");
 			} finally {
-				homedirSpy.mockRestore();
 				await fs.rm(tempProjectDir, { recursive: true, force: true });
 				await fs.rm(tempHomeDir, { recursive: true, force: true });
 			}
@@ -402,7 +400,6 @@ description: Skill loaded from a tilde-expanded custom directory.
 		it("discovers native project and user skills with zero configuration", async () => {
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-zero-config-skills-"));
 			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-zero-config-home-"));
-			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 			try {
 				for (const [root, name] of [
 					[path.join(tempDir, ".gjc", "skills", "project-skill"), "project-skill"],
@@ -423,7 +420,6 @@ description: Skill loaded from a tilde-expanded custom directory.
 				const { skills } = await loadSkills({ cwd: tempDir, home: tempHome });
 				expect(skills.map(skill => skill.name).sort()).toEqual(["project-skill", "user-skill"]);
 			} finally {
-				homedirSpy.mockRestore();
 				await fs.rm(tempDir, { recursive: true, force: true });
 				await fs.rm(tempHome, { recursive: true, force: true });
 			}
@@ -432,7 +428,6 @@ description: Skill loaded from a tilde-expanded custom directory.
 		it("project scope shadows user scope, and the nearest project ancestor wins", async () => {
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-precedence-skills-"));
 			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-precedence-home-"));
-			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 			try {
 				// Mark the repo root so the ancestor walk covers the nested package.
 				await fs.mkdir(path.join(tempDir, ".git"));
@@ -471,7 +466,6 @@ description: Skill loaded from a tilde-expanded custom directory.
 					path.join(tempHome, ".gjc", "agent", "skills", "shared"),
 				);
 			} finally {
-				homedirSpy.mockRestore();
 				await fs.rm(tempDir, { recursive: true, force: true });
 				await fs.rm(tempHome, { recursive: true, force: true });
 			}
@@ -480,7 +474,6 @@ description: Skill loaded from a tilde-expanded custom directory.
 		it("keeps the legacy alias working and never lets disk skills replace bundled workflows", async () => {
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-protected-skills-"));
 			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-protected-home-"));
-			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 			try {
 				const root = path.join(tempDir, ".gjc", "skills", "ralplan");
 				await fs.mkdir(root, { recursive: true });
@@ -501,7 +494,6 @@ description: Skill loaded from a tilde-expanded custom directory.
 				const legacyDisabled = await loadSkills({ cwd: tempDir, home: tempHome, enablePiProject: false });
 				expect(legacyDisabled.skills).toHaveLength(0);
 			} finally {
-				homedirSpy.mockRestore();
 				await fs.rm(tempDir, { recursive: true, force: true });
 				await fs.rm(tempHome, { recursive: true, force: true });
 			}
@@ -510,7 +502,6 @@ description: Skill loaded from a tilde-expanded custom directory.
 		it("trust flags disable their scope while the master switch disables everything", async () => {
 			const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trust-skills-"));
 			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trust-home-"));
-			const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(tempHome);
 			try {
 				const write = async (root: string, name: string) => {
 					await fs.mkdir(root, { recursive: true });
@@ -539,7 +530,6 @@ description: Skill loaded from a tilde-expanded custom directory.
 				const masterOff = await loadSkills({ cwd: tempDir, home: tempHome, enabled: false });
 				expect(masterOff.skills).toHaveLength(0);
 			} finally {
-				homedirSpy.mockRestore();
 				await fs.rm(tempDir, { recursive: true, force: true });
 				await fs.rm(tempHome, { recursive: true, force: true });
 			}
