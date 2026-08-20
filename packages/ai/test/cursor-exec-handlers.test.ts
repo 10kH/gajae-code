@@ -89,6 +89,31 @@ describe("Cursor resolveExecHandler execHandlers binding", () => {
 		// Should get error result (handler threw accessing undefined.sentinel)
 		expect(execResult).toEqual({ tag: "error", message: expect.any(String) });
 	});
+
+	it("preserves the handler-provided toolResult call ID", async () => {
+		const { execResult, toolResult } = await resolveExecHandler<{ path: string }, { result: string }>(
+			{ path: "/tmp/foo" },
+			async () => ({
+				role: "toolResult",
+				toolCallId: "exact-call-id",
+				toolName: "read",
+				content: [{ type: "text", text: "contents" }],
+				isError: false,
+				timestamp: 1,
+			}),
+			undefined,
+			toolResult => ({ result: toolResult.toolCallId }),
+			() => ({ result: "rejected" }),
+			() => ({ result: "error" }),
+		);
+
+		expect(execResult).toEqual({ result: "exact-call-id" });
+		expect(toolResult).toMatchObject({
+			role: "toolResult",
+			toolCallId: "exact-call-id",
+			toolName: "read",
+		});
+	});
 });
 
 describe("Cursor system prompt encoding", () => {
