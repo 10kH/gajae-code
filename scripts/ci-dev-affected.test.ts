@@ -1240,10 +1240,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/test/sdk-session-index-lock-contention.test.ts",
 			"packages/coding-agent/src/sdk/broker/process-incarnation.ts",
 			"packages/coding-agent/src/config/file-lock.ts",
+			// canonicalEnvKey() folds project-dotenv provenance keys on win32 only,
+			// so a Linux shard exercises an identity function and proves nothing.
+			"packages/utils/src/dirs.ts",
+			"packages/utils/src/env.ts",
+			"packages/utils/test/env-provenance.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
 		}
+		// Neighbouring utils paths must not drag the windows-latest job in.
+		expect(isWindowsSessionPathRegressionPath("packages/utils/src/logger.ts")).toBe(false);
+		expect(isWindowsSessionPathRegressionPath("packages/utils/test/env.test.ts")).toBe(false);
 		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-store.ts")).toBe(false);
 		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});

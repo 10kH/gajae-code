@@ -441,6 +441,13 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/coding-agent/test/sdk-session-index-lock-contention.test.ts" ||
 		changedPath === "packages/coding-agent/src/sdk/broker/process-incarnation.ts" ||
 		changedPath === "packages/coding-agent/src/config/file-lock.ts" ||
+		// Windows environment names are case-insensitive while the project-dotenv
+		// provenance snapshot is keyed exactly, so `canonicalEnvKey()` folds on
+		// win32 only. That branch is an identity function on Ubuntu, meaning a
+		// Linux shard cannot verify it; route these to the windows-latest job.
+		changedPath === "packages/utils/src/dirs.ts" ||
+		changedPath === "packages/utils/src/env.ts" ||
+		changedPath === "packages/utils/test/env-provenance.windows.test.ts" ||
 		changedPath === "packages/natives/native/loader-state.js" ||
 		changedPath === "scripts/host-detect.ts"
 	);
