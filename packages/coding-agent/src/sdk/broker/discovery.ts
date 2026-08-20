@@ -73,11 +73,28 @@ function boundedAgentDir(agentDir: string): string {
 }
 
 function sanitizedAgentDir(agentDir: string): string {
-	const sanitized = agentDir.replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/gu, character => {
+	const sanitized = agentDir.replace(/[\p{Cc}\p{Cf}\u2028\u2029]/gu, character => {
 		const codePoint = character.codePointAt(0) ?? 0;
 		return `\\u${codePoint.toString(16).padStart(4, "0")}`;
 	});
 	return boundedAgentDir(sanitized);
+}
+
+const NATIVE_RETAINED_FAILURE = /\[retained-publication object=([^;\]]+); reason=([^\]]+)\]$/;
+
+function nativeRetainedObstruction(error: unknown): string | undefined {
+	if (!(error instanceof Error)) return undefined;
+	const match = NATIVE_RETAINED_FAILURE.exec(error.message);
+	if (!match) return undefined;
+	const [, object, reason] = match;
+	if (reason === "heartbeat-missing") return `${object} has no heartbeatAt field`;
+	if (reason === "heartbeat-width")
+		return `${object} heartbeatAt is not a fixed-width ${FIXED_WIDTH_HEARTBEAT_DIGITS}-digit timestamp`;
+	if (reason === "non-regular") return `${object} is not a regular file`;
+	if (reason === "errno-ENOENT") return `${object} is missing`;
+	if (reason === "errno-EISDIR") return `${object} is not a regular file`;
+	if (reason.startsWith("errno-")) return `${object} could not be opened (${reason.slice("errno-".length)})`;
+	return `${object} could not be opened (${reason})`;
 }
 
 /**
@@ -197,12 +214,19 @@ function requireRetainedBrokerPublication(agentDir: string): NativeRetainedBroke
 		return retainBrokerPublication(agentDir);
 	} catch (error) {
 		// Fail closed exactly as before; only name the condition on the way out.
-		const obstruction = describeWithheldPublicationAuthority(agentDir);
-		if (!obstruction) throw error;
+		const obstruction = nativeRetainedObstruction(error);
+		if (obstruction) {
+			throw new Error(
+				`${error instanceof Error ? error.message : String(error)} (${obstruction}; agent directory ${sanitizedAgentDir(agentDir)})`,
+				{ cause: error },
+			);
+		}
+		const observed = describeWithheldPublicationAuthority(agentDir);
+		if (!observed) throw error;
 		// The obstruction precedes the agent directory, and the directory is
 		// bounded, so a long valid path cannot truncate the named object away.
 		throw new Error(
-			`${error instanceof Error ? error.message : String(error)} (${obstruction}; agent directory ${sanitizedAgentDir(agentDir)})`,
+			`${error instanceof Error ? error.message : String(error)} (current observed state: ${observed}; agent directory ${sanitizedAgentDir(agentDir)})`,
 			{ cause: error },
 		);
 	}

@@ -718,9 +718,9 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message).toMatch(/sdk is a symlink/);
+			expect(refusal?.message).toMatch(/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/);
 			// The native refusal stays authoritative and is retained verbatim as cause.
-			expect((refusal?.cause as Error | undefined)?.message).toBe(
+			expect((refusal?.cause as Error | undefined)?.message).toContain(
 				"Retained broker publication authority is unavailable.",
 			);
 		} finally {
@@ -960,15 +960,13 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	});
-	it("does not blame a lock record kind the native layer never constrains", async () => {
-		// `RetainedPublication::open` opens `owner.json` read-only with no kind
-		// constraint and accepts, for example, a directory there. Naming its kind
-		// would blame an object the native never rejected and hide the real later
-		// obstruction.
+	it("rejects a non-regular owner record before granting publication authority", async () => {
+		// Retained publication acquisition validates the owner descriptor kind before
+		// returning authority, preventing a special-file admission window.
 		if (process.platform === "win32") return;
 		const dir = await temp();
 		await fs.mkdir(path.join(dir, "sdk", "broker.lock", "owner.json"), { recursive: true, mode: 0o700 });
-		const intact = {
+		const discovery = {
 			version: 1 as const,
 			protocolVersion: 3 as const,
 			packageGeneration: "test",
@@ -984,23 +982,11 @@ describe("SDK broker identity and discovery", () => {
 		try {
 			// The unmocked native accepts this layout, which is what makes a kind
 			// complaint about it an invented condition.
-			const accepted = await publishBrokerDiscovery(dir, intact);
-			accepted.close();
-
-			const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
-				syncFs.writeFileSync(brokerDiscoveryPath(dir), '{"heartbeatAt":12}\n');
-				throw new Error("Retained broker publication authority is unavailable.");
-			});
-			try {
-				const refusal = await publishBrokerDiscovery(dir, intact).then(
-					() => undefined,
-					(error: unknown) => error as Error,
-				);
-				expect(refusal?.message).toMatch(/broker\.json heartbeatAt is not a fixed-width 13-digit timestamp/);
-				expect(refusal?.message).not.toMatch(/owner\.json/);
-			} finally {
-				retain.mockRestore();
-			}
+			const refusal = await publishBrokerDiscovery(dir, discovery).then(
+				() => undefined,
+				(error: unknown) => error as Error,
+			);
+			expect(refusal?.message).toMatch(/owner\.json is not a regular file/);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
@@ -1028,8 +1014,8 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message).toMatch(/sdk\/broker\.lock is not a directory/);
-			expect((refusal?.cause as Error | undefined)?.message).toBe(nativeRefusal.message);
+			expect(refusal?.message).toMatch(/sdk\/broker\.lock could not be opened \(ENOTDIR\)/);
+			expect((refusal?.cause as Error | undefined)?.message).toContain(nativeRefusal.message);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
@@ -1098,7 +1084,7 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message.slice(0, 512)).toMatch(/sdk is a symlink/);
+			expect(refusal?.message.slice(0, 512)).toMatch(/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/);
 			// The bound only matters because this message is what the durable startup
 			// marker persists, so assert through the marker rather than the throw.
 			await writeBrokerStartupFailureMarker(root, {
@@ -1107,7 +1093,9 @@ describe("SDK broker identity and discovery", () => {
 				signal: null,
 				pid: process.pid,
 			});
-			expect((await readBrokerStartupFailureMarker(root))?.reason).toMatch(/sdk is a symlink/);
+			expect((await readBrokerStartupFailureMarker(root))?.reason).toMatch(
+				/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/,
+			);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 			await fs.rm(host, { recursive: true, force: true });
@@ -1154,7 +1142,9 @@ describe("SDK broker identity and discovery", () => {
 				signal: null,
 				pid: process.pid,
 			});
-			expect((await readBrokerStartupFailureMarker(dir))?.reason).toMatch(/sdk is a symlink/);
+			expect((await readBrokerStartupFailureMarker(dir))?.reason).toMatch(
+				/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/,
+			);
 		} finally {
 			spy.mockRestore();
 			await fs.rm(dir, { recursive: true, force: true });
