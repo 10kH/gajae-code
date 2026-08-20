@@ -236,7 +236,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	}
 
 	const cwd = options.cwd ?? getProjectDir();
-	const home = options.home ?? getTrustedHomeDir();
+	const home = getTrustedHomeDir();
 	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
 	const repoRoot = await findRepoRoot(cwd);
 	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot };

@@ -1,10 +1,11 @@
 import * as fs from "node:fs/promises";
 import { getProjectDir, getTrustedHomeDir } from "@gajae-code/utils";
+import { findRepoRoot } from "../capability/fs";
 import { skillCapability } from "../capability/skill";
 import type { SourceMeta } from "../capability/types";
 import type { SkillsSettings } from "../config/settings";
 import { resolveSkillScopeTrust } from "../config/skill-settings-defaults";
-import { type Skill as CapabilitySkill, loadCapability } from "../discovery";
+import { type Skill as CapabilitySkill, getCapability } from "../discovery";
 import { compareSkillOrder, scanSkillsFromDir } from "../discovery/helpers";
 import type { SkillPromptDetails } from "../session/messages";
 import { CANONICAL_GJC_WORKFLOW_SKILLS } from "../skill-state/canonical-skills";
@@ -159,7 +160,11 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// Use capability API to load all skills. `all` (rather than `items`) keeps
 	// shadowed duplicates so this function can apply the documented precedence
 	// itself: project scope beats user scope.
-	const result = await loadCapability<CapabilitySkill>(skillCapability.id, { cwd, home, disabledExtensions });
+	const nativeProvider = getCapability<CapabilitySkill>(skillCapability.id)?.providers.find(
+		provider => provider.id === "native",
+	);
+	if (!nativeProvider) throw new Error("Native skill provider is unavailable");
+	const result = await nativeProvider.load({ cwd, home, repoRoot: await findRepoRoot(cwd) });
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();
@@ -185,7 +190,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	// precedence. `all` is already in native provider order with project dirs
 	// before user dirs; a stable sort by level lifts every project item above
 	// every user item, giving: project `.gjc/skills` > user roots.
-	const filteredSkills = result.all
+	const filteredSkills = result.items
 		.filter(capSkill => {
 			if (!isSourceEnabled(capSkill._source)) return false;
 			if (disabledSkillNames.has(capSkill.name)) return false;

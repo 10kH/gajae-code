@@ -78,8 +78,6 @@ export interface LoadOptions {
 	/** Only use these providers (by ID). Default: all registered */
 	providers?: string[];
 	/** Exclude these providers (by ID). Default: none */
-	/** Explicit user home for provider discovery. Default: getTrustedHomeDir(). */
-	home?: string;
 	excludeProviders?: string[];
 	/** Custom cwd. Default: getProjectDir() */
 	cwd?: string;
