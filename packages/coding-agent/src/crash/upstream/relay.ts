@@ -35,6 +35,9 @@ import { findRecordById } from "../record-loader";
 import { parseSentryDsn, type SentryDsn } from "./dsn";
 import { buildCrashEnvelope, type CrashEventFrame, sentryAuthHeader } from "./envelope";
 
+/** Version of the complete sanitizer/egress contract persisted in refusals. */
+export const SANITIZER_EGRESS_CONTRACT_VERSION = "sanitize-external-crash-v1";
+
 /** Trusted environment variable form of the DSN, for CI and one-off runs. */
 export const CRASH_UPSTREAM_DSN_ENV = "GJC_CRASH_SENTRY_DSN";
 
@@ -178,6 +181,11 @@ export function resolveRelayDsn(
  */
 export function isRelayDue(signature: CrashSignatureView): boolean {
 	const appendId = signature.lastAppendRecordId ?? signature.lastRecordId;
+	if (
+		signature.relayRefusedRecordId === appendId &&
+		signature.relayRefusedVersion === SANITIZER_EGRESS_CONTRACT_VERSION
+	)
+		return false;
 	// Modern entries with a durable relay record id use exact identity. Legacy
 	// entries upgraded from a wall-clock-only relay have no relayedRecordId, so
 	// retain their timestamp coverage compatibility until a new append exists.
@@ -208,6 +216,33 @@ function relayEventId(signature: CrashSignatureView): string {
 		.update(`${signature.fingerprint}:${relayAppendRecordId(signature)}`)
 		.digest("hex")
 		.slice(0, 32);
+}
+
+async function persistRefusal(
+	paths: CrashStatePaths,
+	signature: CrashSignatureView,
+	now: () => number,
+): Promise<boolean> {
+	try {
+		const index = await recordCrashStateEvent(
+			{
+				kind: "refused",
+				fingerprint: signature.fingerprint,
+				fpv: signature.fpv,
+				recordId: relayAppendRecordId(signature),
+				contractVersion: SANITIZER_EGRESS_CONTRACT_VERSION,
+				at: signature.lastSeen,
+			},
+			{ paths, now: now() },
+		);
+		const entry = index.signatures[signature.fingerprint];
+		return (
+			entry?.relayRefusedRecordId === relayAppendRecordId(signature) &&
+			entry.relayRefusedVersion === SANITIZER_EGRESS_CONTRACT_VERSION
+		);
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -327,7 +362,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		}
 		const record = findRecordById(crashLog, signature.fingerprint, relayAppendRecordId(signature));
 		if (!record || record.fpv !== signature.fpv) {
-			refused++;
+			if (await persistRefusal(paths, signature, now)) refused++;
+			else failed++;
 			await claim.release().catch(() => {});
 			continue;
 		}
@@ -349,7 +385,8 @@ export async function relayCrashSignatures(options: CrashRelayOptions): Promise<
 		});
 		if (!envelope.ok) {
 			// Fail closed. Deliberately no retry with a reduced payload.
-			refused++;
+			if (await persistRefusal(paths, signature, now)) refused++;
+			else failed++;
 			await claim.release().catch(() => {});
 			continue;
 		}

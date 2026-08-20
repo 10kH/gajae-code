@@ -78,6 +78,9 @@ export interface CrashSignatureEntry {
 	relayedAt?: number;
 	/** Occurrence record represented by the durable upstream watermark. */
 	relayedRecordId?: string;
+	/** Refusal marker for the exact record and sanitizer contract. */
+	relayRefusedRecordId?: string;
+	relayRefusedVersion?: string;
 	/** Issues this install already "+1"ed, so re-invocations cannot spam comments. */
 	commentedIssues?: string[];
 }
@@ -151,6 +154,8 @@ const ENTRY_KEYS = new Set([
 	"acknowledgedAt",
 	"relayedAt",
 	"relayedRecordId",
+	"relayRefusedRecordId",
+	"relayRefusedVersion",
 	"commentedIssues",
 ]);
 const INDEX_KEYS = new Set([
@@ -240,6 +245,12 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 		(typeof raw.lastAppendRecordId !== "string" || !/^[0-9a-f]{8,32}$/.test(raw.lastAppendRecordId))
 	)
 		return undefined;
+	if (
+		raw.relayRefusedRecordId !== undefined &&
+		(typeof raw.relayRefusedRecordId !== "string" || !/^[0-9a-f]{8,32}$/.test(raw.relayRefusedRecordId))
+	)
+		return undefined;
+	if (raw.relayRefusedVersion !== undefined && !isCleanString(raw.relayRefusedVersion, 64)) return undefined;
 	if (raw.reportedAt !== undefined && !isTimestamp(raw.reportedAt, now)) return undefined;
 	if (raw.acknowledgedAt !== undefined && !isTimestamp(raw.acknowledgedAt, now)) return undefined;
 	if (raw.relayedAt !== undefined && !isTimestamp(raw.relayedAt, now)) return undefined;
@@ -272,6 +283,8 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	const optional: readonly [keyof CrashSignatureEntry, unknown][] = [
 		["relayedAt", raw.relayedAt],
 		["relayedRecordId", raw.relayedRecordId],
+		["relayRefusedRecordId", raw.relayRefusedRecordId],
+		["relayRefusedVersion", raw.relayRefusedVersion],
 		["commentedIssues", raw.commentedIssues === undefined ? undefined : [...(raw.commentedIssues as string[])]],
 		["reportedAt", raw.reportedAt],
 		["reportedIssueUrl", raw.reportedIssueUrl],
@@ -296,6 +309,9 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 			(entry as unknown as Record<string, unknown>)[key] = value;
 	}
 	if (raw.relayedRecordId !== undefined && entry.relayedRecordId !== raw.relayedRecordId) return undefined;
+	if (raw.relayRefusedRecordId !== undefined && entry.relayRefusedRecordId !== raw.relayRefusedRecordId)
+		return undefined;
+	if (raw.relayRefusedVersion !== undefined && entry.relayRefusedVersion !== raw.relayRefusedVersion) return undefined;
 	if (Array.isArray(raw.commentedIssues) && raw.commentedIssues.length > 0 && entry.commentedIssues === undefined)
 		return undefined;
 	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) return undefined;
@@ -530,6 +546,25 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		if (event.at >= existing.lastSeen) {
 			existing.relayedRecordId = existing.lastAppendRecordId ?? existing.lastRecordId;
 		}
+		return true;
+	}
+	if (event.kind === "refused") {
+		if (!existing || existing.fpv !== event.fpv) return false;
+		if (existing.relayRefusedRecordId === event.recordId && existing.relayRefusedVersion === event.contractVersion)
+			return false;
+		if (
+			Buffer.byteLength(
+				JSON.stringify({
+					...existing,
+					relayRefusedRecordId: event.recordId,
+					relayRefusedVersion: event.contractVersion,
+				}),
+				"utf8",
+			) > CRASH_INDEX_ENTRY_MAX_BYTES
+		)
+			return false;
+		existing.relayRefusedRecordId = event.recordId;
+		existing.relayRefusedVersion = event.contractVersion;
 		return true;
 	}
 	if (event.kind === "acknowledged") {

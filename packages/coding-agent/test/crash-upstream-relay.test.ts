@@ -84,6 +84,23 @@ describe("isRelayDue", () => {
 		expect(isRelayDue(signature({ relayedRecordId: "rec-1" }))).toBe(false);
 	});
 
+	test("a refusal marker suppresses only the same record and contract", () => {
+		expect(
+			isRelayDue(
+				signature({
+					relayRefusedRecordId: "rec-1",
+					relayRefusedVersion: "sanitize-external-crash-v1",
+				}),
+			),
+		).toBe(false);
+		expect(
+			isRelayDue(signature({ relayRefusedRecordId: "rec-2", relayRefusedVersion: "sanitize-external-crash-v1" })),
+		).toBe(true);
+		expect(
+			isRelayDue(signature({ relayRefusedRecordId: "rec-1", relayRefusedVersion: "sanitize-external-crash-v2" })),
+		).toBe(true);
+	});
+
 	test("a same-millisecond or backdated newer record remains due", () => {
 		expect(
 			isRelayDue(
@@ -295,6 +312,119 @@ describe("relayCrashSignatures", () => {
 			fetchImpl: async () => new Response("", { status: 200 }),
 		});
 		expect(outcome).toEqual({ status: "skipped", reason: "nothing-to-relay" });
+	});
+
+	test("persistent refusals do not starve a newer safe signature", async () => {
+		for (let i = 0; i < 8; i++) {
+			const recordId = (i + 1).toString(16).padStart(16, "0");
+			const messageClass = `cannot read properties of <redacted> (missing-${i})`;
+			const fingerprint = computeCrashFingerprint({
+				name: "TypeError",
+				message: messageClass,
+				stack: STACK,
+			}).fingerprint;
+			appendCrashEvent(
+				{
+					kind: "occurrence",
+					fingerprint,
+					fpv: 1,
+					recordId,
+					at: 1_700_000_000_000 + i,
+					errorName: "TypeError",
+					messageClass,
+				},
+				paths.events,
+			);
+		}
+		const safeMessage = "cannot read properties of <redacted> (safe-new)";
+		const safeFingerprint = computeCrashFingerprint({
+			name: "TypeError",
+			message: safeMessage,
+			stack: STACK,
+		}).fingerprint;
+		const safeRecordId = "0000000000000010";
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: safeFingerprint,
+				fpv: 1,
+				recordId: safeRecordId,
+				at: 1_700_000_000_100,
+				errorName: "TypeError",
+				messageClass: safeMessage,
+			},
+			paths.events,
+		);
+		await fs.appendFile(
+			paths.crashLog,
+			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: ${safeMessage}\n` +
+				`${STACK}\n${formatCrashRecordMarker(safeFingerprint, 1, safeRecordId)}\n\n`,
+		);
+
+		const firstBodies: string[] = [];
+		const first = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			maxPerRun: 8,
+			fetchImpl: accept(firstBodies),
+		});
+		expect(first).toEqual({ status: "ran", sent: 0, refused: 8, failed: 0 });
+		expect(firstBodies).toHaveLength(0);
+
+		const secondBodies: string[] = [];
+		const second = await relayCrashSignatures({
+			config: config(),
+			paths,
+			env: {},
+			maxPerRun: 8,
+			fetchImpl: accept(secondBodies),
+		});
+		expect(second).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(secondBodies).toHaveLength(1);
+	});
+
+	test("a refusal retries when the represented record id changes", async () => {
+		const firstRecordId = "1111111111111111";
+		await fs.writeFile(paths.crashLog, "unrelated crash text\n");
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: FINGERPRINT,
+				fpv: 1,
+				recordId: firstRecordId,
+				at: 1_700_000_900_000,
+				errorName: "TypeError",
+				messageClass: "cannot read properties of <redacted>",
+			},
+			paths.events,
+		);
+		const firstBodies: string[] = [];
+		const first = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(firstBodies) });
+		expect(first).toEqual({ status: "ran", sent: 0, refused: 1, failed: 0 });
+
+		const secondRecordId = "2222222222222222";
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: FINGERPRINT,
+				fpv: 1,
+				recordId: secondRecordId,
+				at: 1_700_000_900_001,
+				errorName: "TypeError",
+				messageClass: "cannot read properties of <redacted>",
+			},
+			paths.events,
+		);
+		await fs.appendFile(
+			paths.crashLog,
+			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: cannot read properties of <redacted>\n` +
+				`${STACK}\n${formatCrashRecordMarker(FINGERPRINT, 1, secondRecordId)}\n\n`,
+		);
+		const secondBodies: string[] = [];
+		const second = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(secondBodies) });
+		expect(second).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(secondBodies).toHaveLength(1);
 	});
 
 	test("posts one envelope per due signature and stamps it relayed", async () => {
