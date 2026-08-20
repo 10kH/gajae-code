@@ -2295,10 +2295,17 @@ describe("SessionRouter dispatch authority", () => {
 		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
 		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://hb.test", token: "v1", pid: 42 }));
 		let refreshIfChangedCalls = 0;
+		let openCalls = 0;
+		let refreshCalls = 0;
+		let listSessionsCalls = 0;
 		const sent: Record<string, unknown>[] = [];
 		const index = {
-			open: async () => {},
-			refresh: async () => {},
+			open: async () => {
+				openCalls++;
+			},
+			refresh: async () => {
+				refreshCalls++;
+			},
 			refreshIfChanged: async () => {
 				refreshIfChangedCalls++;
 				return true;
@@ -2306,23 +2313,26 @@ describe("SessionRouter dispatch authority", () => {
 			get indexSeq() {
 				return 1;
 			},
-			listSessions: () => ({
-				indexSeq: 1,
-				sessions: [
-					{
-						sessionId,
-						locator: { repo, stateRoot },
-						endpointGeneration: 1,
-						pid: 42,
-						endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
-						live: true,
-						indexSeq: 1,
-						ambiguous: false,
-						terminal: false,
-					},
-				],
-				warnings: [],
-			}),
+			listSessions: () => {
+				listSessionsCalls++;
+				return {
+					indexSeq: 1,
+					sessions: [
+						{
+							sessionId,
+							locator: { repo, stateRoot },
+							endpointGeneration: 1,
+							pid: 42,
+							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+							live: true,
+							indexSeq: 1,
+							ambiguous: false,
+							terminal: false,
+						},
+					],
+					warnings: [],
+				};
+			},
 		} as unknown as SessionIndex;
 		const router = new SessionRouter({
 			agentDir,
@@ -2345,6 +2355,7 @@ describe("SessionRouter dispatch authority", () => {
 			const attachment = router.attachment(sessionId);
 			expect(attachment?.isCurrent()).toBe(true);
 			const baseline = refreshIfChangedCalls;
+			const lockedBaseline = { open: openCalls, refresh: refreshCalls, listSessions: listSessionsCalls };
 			await attachment!.sendMaintenance?.("lease-9");
 			// Exactly the heartbeat frame shape — no command traffic can take this
 			// path — and no reconcile was triggered.
@@ -2355,6 +2366,13 @@ describe("SessionRouter dispatch authority", () => {
 				},
 			]);
 			expect(refreshIfChangedCalls).toBe(baseline);
+			// The 5s heartbeat must never re-enter the LOCKED index path (#4730
+			// review): its authority check reads only the endpoint record, so a
+			// regression that routes it back through #readEndpoint (which ends in a
+			// locked index refresh) restores the exact per-session cost #4689 removed.
+			expect(openCalls).toBe(lockedBaseline.open);
+			expect(refreshCalls).toBe(lockedBaseline.refresh);
+			expect(listSessionsCalls).toBe(lockedBaseline.listSessions);
 		} finally {
 			await router.stop();
 		}
