@@ -2461,6 +2461,18 @@ export class AgentSession {
 	 *  surface a red "Operation aborted" line; cleared by a later non-silent abort
 	 *  or by `abort`'s safety net when no aborted message_end is produced. */
 	#silentAbortPending = false;
+	/** In-flight `abort()` unwind. Fresh prompts wait so they cannot steer into the dying turn. */
+	#abortUnwind: Promise<void> | undefined;
+	#abortEpoch = 0;
+	/**
+	 * Monotonic count of ADMITTED abort requests, advanced synchronously on every
+	 * `#abortWithOutcome` entry — including an abort that shares an already
+	 * in-flight unwind rather than starting its own. A prompt that waits for an
+	 * unwind captures this value and refuses to resume if it advanced while it
+	 * waited: abort is terminal, so work admitted before the user's latest abort
+	 * must never start just because the physical unwind was shared.
+	 */
+	#abortAdmissionEpoch = 0;
 	/** Monotonic counter for `enqueueCustomMessageDisplay` tag generation;
 	 *  combined with `Date.now()` so tags stay unique even across rapid
 	 *  same-tick enqueues. */
@@ -2512,6 +2524,7 @@ export class AgentSession {
 		nonEditDeterminations: 0,
 	};
 	#promptInFlightCount = 0;
+	#inFlightGenerations: number[] = [];
 	#agentEventHandlersInFlight = 0;
 	#queuedExtensionEventCount = 0;
 	#extensionTurnGeneration = 0;
@@ -2822,9 +2835,17 @@ export class AgentSession {
 
 	#beginInFlight(): void {
 		this.#promptInFlightCount++;
+		this.#inFlightGenerations.push(this.#abortEpoch);
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
 		}
+	}
+
+	/** True while a live agent loop or a non-aborted in-flight prompt owns the session. */
+	#isLiveTurnBusy(): boolean {
+		if (this.agent.state.isStreaming) return true;
+		if (!this.isStreaming) return false;
+		return this.#inFlightGenerations.every(generation => generation === this.#abortEpoch);
 	}
 	/**
 	 * Allocate a FRESH prompt attempt/lineage for an allowed owned-completion
@@ -2873,6 +2894,27 @@ export class AgentSession {
 
 	#isPromptPreflightCancelled(generation: number, signal: AbortSignal): boolean {
 		return signal.aborted || this.#promptGeneration !== generation;
+	}
+
+	/**
+	 * Wait for the in-flight abort unwind, then prove no LATER abort was admitted
+	 * while waiting. Overlapping aborts share one physical unwind, so awaiting
+	 * `#abortUnwind` alone cannot distinguish "the abort I raced" from "a second
+	 * abort the user issued after me". Returns false when the caller must not
+	 * resume; the caller then rejects as a cancelled preflight rather than
+	 * starting a successor the user already aborted.
+	 *
+	 * Loops because an abort admitted during the wait can install its own unwind:
+	 * the fence only opens once no unwind is in flight and the admission epoch has
+	 * stopped advancing.
+	 */
+	async #awaitAbortUnwindFence(): Promise<boolean> {
+		const admissionEpoch = this.#abortAdmissionEpoch;
+		while (this.#abortUnwind !== undefined) {
+			await this.#abortUnwind;
+			if (this.#abortAdmissionEpoch !== admissionEpoch) return false;
+		}
+		return this.#abortAdmissionEpoch === admissionEpoch;
 	}
 
 	#throwIfPromptPreflightCancelled(generation: number, signal: AbortSignal): void {
@@ -3090,6 +3132,41 @@ export class AgentSession {
 	#wakeScopedSettlementWaiters(): void {
 		for (const check of [...this.#scopedSettlementWaiters]) check();
 	}
+	#abortedTurnTerminalPending(): boolean {
+		return (
+			this.#promptInFlightCount > 0 ||
+			this.#agentEventHandlersInFlight > 0 ||
+			this.#pendingAgentEndEmit !== undefined ||
+			this.#agentEndPublicationInFlight > 0
+		);
+	}
+
+	/** Wait for the aborted turn's agent_end handler and publication, not just agent idle. */
+	async #awaitAbortedTurnTerminal(): Promise<void> {
+		await Promise.resolve();
+		await this.#agentEndHandlingPromise;
+		this.#flushPendingAgentEnd();
+		await this.#agentEndPublicationPromise;
+		while (this.#abortedTurnTerminalPending()) {
+			const wake = Promise.withResolvers<void>();
+			const check = () => {
+				if (!this.#abortedTurnTerminalPending()) wake.resolve();
+			};
+			this.#scopedSettlementWaiters.add(check);
+			check();
+			try {
+				const waiters: Array<Promise<void>> = [wake.promise];
+				if (this.#agentEventHandlersInFlight > 0) waiters.push(this.#agentEndHandlingPromise);
+				if (this.#agentEndPublicationInFlight > 0) waiters.push(this.#agentEndPublicationPromise);
+				await Promise.race(waiters);
+			} finally {
+				this.#scopedSettlementWaiters.delete(check);
+			}
+			this.#flushPendingAgentEnd();
+			await this.#agentEndHandlingPromise;
+			await this.#agentEndPublicationPromise;
+		}
+	}
 
 	/**
 	 * Wait for session settlement. `ignoreSelectionFenceGeneration` carries the
@@ -3129,6 +3206,7 @@ export class AgentSession {
 
 	#endInFlight(): unknown {
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
+		if (this.#inFlightGenerations.length > 0) this.#inFlightGenerations.shift();
 		if (this.#promptInFlightCount !== 0) return undefined;
 
 		this.#releasePowerAssertion();
@@ -9849,18 +9927,31 @@ export class AgentSession {
 		assertImagePlaceholdersHavePayload(expandedText, options?.images);
 		const workflowIntentDiff = options?.synthetic ? null : buildWorkflowIntentDiff(expandedText);
 		const claimsGenuineUserIntent = !options?.synthetic && options?.attribution !== "agent";
-		const admissionGeneration = this.#promptGeneration;
-		const admissionSignal = options?.preflightSignal
+		let admissionGeneration = this.#promptGeneration;
+		let admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
 			: this.#promptPreflightAbortController.signal;
 		if (this.#pendingSelectionFences > 0) {
 			await awaitPromptInvocationPreflight(this.#selectionFenceTail, admissionSignal);
 		}
+		let waitedForAbortUnwind = false;
+		if (this.#abortUnwind) {
+			// A LATER abort admitted while this prompt waited keeps abort terminal:
+			// the successor is refused instead of refreshing its generation and
+			// starting work the user already aborted twice.
+			if (!(await this.#awaitAbortUnwindFence())) throw promptPreflightCancelledError();
+			admissionGeneration = this.#promptGeneration;
+			admissionSignal = options?.preflightSignal
+				? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
+				: this.#promptPreflightAbortController.signal;
+			waitedForAbortUnwind = true;
+		}
 		const deepInterviewUserIntentEpoch =
 			claimsGenuineUserIntent && !this.isStreaming ? this.#claimDeepInterviewUserIntent() : undefined;
 
-		// If streaming, queue via steer() or followUp() based on option
-		if (this.isStreaming) {
+		// If streaming, queue via steer() or followUp() based on option.
+		// Abort unwind is awaited above so a successor is not busy against leftover in-flight.
+		if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 			if (!options?.streamingBehavior) {
 				throw new AgentBusyError();
 			}
@@ -11422,10 +11513,21 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		const admissionSignal = options?.preflightSignal
+		let admissionSignal = options?.preflightSignal
 			? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
 			: this.#promptPreflightAbortController.signal;
-		const preflightCancellationGeneration = this.#promptPreflightCancellationGeneration;
+		let preflightCancellationGeneration = this.#promptPreflightCancellationGeneration;
+		let waitedForAbortUnwind = false;
+		if (this.#abortUnwind && options?.deliverAs === undefined) {
+			// Same terminal-abort fence as `prompt()`: an overlapping second abort
+			// refuses this retained submission instead of letting it start late.
+			if (!(await this.#awaitAbortUnwindFence())) throw promptPreflightCancelledError();
+			preflightCancellationGeneration = this.#promptPreflightCancellationGeneration;
+			admissionSignal = options?.preflightSignal
+				? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
+				: this.#promptPreflightAbortController.signal;
+			waitedForAbortUnwind = true;
+		}
 		// Classify and reserve follow-up order synchronously, before any await
 		// (selection fence or durable acceptance): a follow-up dispatch that is
 		// not yet durably enqueued must already count as ahead, or a later plain
@@ -11433,7 +11535,14 @@ export class AgentSession {
 		// delivery/steering and overtake it. The reservation is released once
 		// the durable enqueue settles either way, so a rejected or cancelled
 		// acceptance leaves no phantom ordering behind.
-		const queuedPlainPrompt = options?.queuedAtDispatch === true && options.deliverAs === undefined;
+		// A busy SDK dispatch is only queued while the agent loop is live.
+		// Abort unwind is not a live loop: queuedAtDispatch from that window
+		// must not divert a fresh prompt into the dying turn's steer queue.
+		// Keep the original busy-dispatch bit for promotion/ownership: after
+		// unwind the successor starts its own turn and must fire onQueuedPromoted
+		// so SDK pending correlation is not dropped.
+		const dispatchedWhileBusy = options?.queuedAtDispatch === true && options.deliverAs === undefined;
+		const queuedPlainPrompt = dispatchedWhileBusy && this.agent.state.isStreaming;
 		const hasFollowUpAhead = (): boolean =>
 			this.#activeFollowUpReservationEpochs.size > 0 ||
 			this.agent.snapshotFollowUp().length > 0 ||
@@ -11444,6 +11553,7 @@ export class AgentSession {
 			!followUpAheadAtReservation &&
 			!this.agent.state.isStreaming &&
 			!this.#canAutoContinueForSteer();
+		const promoteAfterAbortUnwind = waitedForAbortUnwind && dispatchedWhileBusy && !followUpAheadAtReservation;
 		const deliverAs =
 			options?.deliverAs ??
 			(queuedPlainPrompt
@@ -11521,7 +11631,9 @@ export class AgentSession {
 			// Compaction is intentionally NOT diverted here: prompt() handles an
 			// in-flight compaction internally, and #queueSteer would otherwise park
 			// the message in the steering queue with no turn to consume it.
-			if (this.isStreaming) {
+			// Abort unwind is awaited before classification so a successor is not
+			// parked in the dying turn's steer queue.
+			if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
 				await this.#queueSteer(text, images, {
@@ -11536,7 +11648,7 @@ export class AgentSession {
 			// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
 			let queuedPromotionFired = false;
 			const fireQueuedPromotion = () => {
-				if (!freshAtReservation || queuedPromotionFired) return;
+				if ((!freshAtReservation && !promoteAfterAbortUnwind) || queuedPromotionFired) return;
 				queuedPromotionFired = true;
 				options?.onQueuedPromoted?.();
 			};
@@ -11548,7 +11660,7 @@ export class AgentSession {
 					fireQueuedPromotion();
 				},
 				onPreflightAcceptCommit:
-					options?.onPreflightAcceptCommit || freshAtReservation
+					options?.onPreflightAcceptCommit || freshAtReservation || promoteAfterAbortUnwind
 						? async () => {
 								if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 								else options?.onPreflightAccepted?.();
@@ -11954,6 +12066,7 @@ export class AgentSession {
 		this.#markRetryReplayUnsafe();
 		this.abortRetry();
 		this.#promptGeneration++;
+		this.#abortEpoch++;
 		this.#promptPreflightCancellationGeneration++;
 		this.#promptPreflightAbortController.abort();
 		this.#promptPreflightAbortController = new AbortController();
@@ -11977,66 +12090,94 @@ export class AgentSession {
 			| "internal";
 		silent?: boolean;
 	}): Promise<AbortOutcome> {
-		this.#abortOptions(options);
-		const postPromptDrain = this.#cancelPostPromptTasks();
-		const managedLogicalRunId =
-			this.#defaultFallbackChain().chain.entries.length > 1 ? this.agent.currentManagedLogicalRunId : undefined;
-		this.agent.abort();
-		const cleanup = Promise.all([postPromptDrain, this.agent.waitForIdle()]).then(
-			() => ({ kind: "settled" as const }),
-			(cause: unknown) => ({ kind: "error" as const, cause }),
-		);
-		cleanup.catch(() => {});
-		let outcome: AbortOutcome;
-		if (options?.timeoutMs !== undefined && options.timeoutMs > 0) {
-			outcome = await Promise.race([
-				cleanup,
-				Bun.sleep(options.timeoutMs).then(() => ({ kind: "timeout" as const })),
-			]);
-			if (outcome.kind === "timeout") {
-				this.#abandonPostPromptTasks();
-				const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
-				try {
-					if (forceAbortLogicalRunId !== undefined)
-						this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
-					else this.agent.forceAbort("Abort cleanup timed out");
-				} catch {
-					this.agent.forceAbort("Abort cleanup timed out");
-				}
-				this.emitNotice(
-					"warning",
-					"Abort cleanup timed out; forced session recovery. The previous provider stream or tool may still be unwinding in the background.",
-					"abort",
-				);
-			}
-		} else {
-			outcome = await cleanup;
+		// Advance the admission epoch SYNCHRONOUSLY, before any await and before the
+		// shared-unwind branch. A second abort that piggybacks on the first unwind
+		// still creates a cancellation fence, so a prompt admitted between the two
+		// aborts is refused rather than started after the shared unwind resolves.
+		this.#abortAdmissionEpoch++;
+		if (this.#abortUnwind) {
+			// The shared unwind already ran `#abortOptions` for the FIRST abort, so this
+			// abort must still apply the effects that are specific to its own request.
+			//
+			// Cancellation fence: a prompt admitted before this abort keeps a live
+			// generation and preflight signal otherwise, and would start after the
+			// shared unwind resolves — work the user has already aborted twice.
+			this.#promptPreflightCancellationGeneration++;
+			this.#promptPreflightAbortController.abort();
+			this.#promptPreflightAbortController = new AbortController();
+			// Abort visibility is per-request: a later real abort must not inherit an
+			// earlier silent abort's suppression and swallow the user-visible notice.
+			if (options?.silent !== true) this.#silentAbortPending = false;
+			await this.#abortUnwind;
+			return { kind: "settled" };
 		}
+		const unwind = Promise.withResolvers<void>();
+		this.#abortUnwind = unwind.promise;
 		try {
-			await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
-			if (managedLogicalRunId !== undefined)
-				this.agent.requestRunTerminal(managedLogicalRunId, { stopReason: "cancelled" });
-			this.#flushPendingBackgroundExchanges();
-			this.#flushPendingAgentEnd();
-			if (
-				!this.#cancelAndSubmitInProgress &&
-				(options?.cause ?? "internal") === "user_interrupt" &&
-				this.agent.hasQueuedSteering()
-			) {
-				this.#scheduleAgentContinue({
-					delayMs: 1,
-					generation: this.#promptGeneration,
-					shouldContinue: () => this.agent.hasQueuedSteering(),
-					rescheduleOnBusy: true,
-					continueQueuedOnly: true,
-				});
+			this.#abortOptions(options);
+			const postPromptDrain = this.#cancelPostPromptTasks();
+			const managedLogicalRunId =
+				this.#defaultFallbackChain().chain.entries.length > 1 ? this.agent.currentManagedLogicalRunId : undefined;
+			this.agent.abort();
+			const cleanup = Promise.all([postPromptDrain, this.agent.waitForIdle()]).then(
+				() => ({ kind: "settled" as const }),
+				(cause: unknown) => ({ kind: "error" as const, cause }),
+			);
+			cleanup.catch(() => {});
+			let outcome: AbortOutcome;
+			if (options?.timeoutMs !== undefined && options.timeoutMs > 0) {
+				outcome = await Promise.race([
+					cleanup,
+					Bun.sleep(options.timeoutMs).then(() => ({ kind: "timeout" as const })),
+				]);
+				if (outcome.kind === "timeout") {
+					this.#abandonPostPromptTasks();
+					const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
+					try {
+						if (forceAbortLogicalRunId !== undefined)
+							this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
+						else this.agent.forceAbort("Abort cleanup timed out");
+					} catch {
+						this.agent.forceAbort("Abort cleanup timed out");
+					}
+					this.emitNotice(
+						"warning",
+						"Abort cleanup timed out; forced session recovery. The previous provider stream or tool may still be unwinding in the background.",
+						"abort",
+					);
+				}
+			} else {
+				outcome = await cleanup;
 			}
-			return outcome;
-		} catch (cause) {
-			return { kind: "error", cause };
+			try {
+				await this.#goalRuntime.onTaskAborted({ reason: options?.goalReason ?? "interrupted" });
+				if (managedLogicalRunId !== undefined)
+					this.agent.requestRunTerminal(managedLogicalRunId, { stopReason: "cancelled" });
+				this.#flushPendingBackgroundExchanges();
+				await this.#awaitAbortedTurnTerminal();
+				if (
+					!this.#cancelAndSubmitInProgress &&
+					(options?.cause ?? "internal") === "user_interrupt" &&
+					this.agent.hasQueuedSteering()
+				) {
+					this.#scheduleAgentContinue({
+						delayMs: 1,
+						generation: this.#promptGeneration,
+						shouldContinue: () => this.agent.hasQueuedSteering(),
+						rescheduleOnBusy: true,
+						continueQueuedOnly: true,
+					});
+				}
+				return outcome;
+			} catch (cause) {
+				return { kind: "error", cause };
+			} finally {
+				this.#silentAbortPending = false;
+				if (this.#toolChoiceQueue.hasInFlight) this.#toolChoiceQueue.reject("aborted");
+			}
 		} finally {
-			this.#silentAbortPending = false;
-			if (this.#toolChoiceQueue.hasInFlight) this.#toolChoiceQueue.reject("aborted");
+			this.#abortUnwind = undefined;
+			unwind.resolve();
 		}
 	}
 

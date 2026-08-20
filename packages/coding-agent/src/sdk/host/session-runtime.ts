@@ -2351,8 +2351,8 @@ function createControlSurface(
 				// Follow-ups never start inline; ownership correlates at promotion.
 				true,
 			),
-		abort: () => {
-			ctx.abort();
+		abort: async () => {
+			await Promise.resolve(ctx.abort()).catch(() => undefined);
 			return { aborted: true };
 		},
 		abortTerminal: terminalAbort,
@@ -2573,6 +2573,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
 				drainedInvocations?: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+				openLifecycleBatches: Array<{
+					invocations: Array<{
+						kind: InvocationKind;
+						correlation: InvocationCorrelation;
+						connectionId: string | undefined;
+					}>;
+				}>;
 				disposeGate?: () => void;
 		  }
 		| undefined;
@@ -2594,6 +2601,28 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const emitLifecycle = async (type: "agent_start" | "agent_end", ctx: ExtensionContext): Promise<void> => {
 		const current = active;
 		if (!current) return;
+		const adoptLifecycleBatch = (
+			batch:
+				| Array<{
+						kind: InvocationKind;
+						correlation: InvocationCorrelation;
+						connectionId: string | undefined;
+				  }>
+				| undefined,
+		): void => {
+			if (!batch || batch.length === 0) {
+				current.activeInvocation = undefined;
+				current.drainedInvocations = undefined;
+				activePromptOwnerHolder.connectionIds = undefined;
+				return;
+			}
+			current.activeInvocation = batch[0];
+			current.drainedInvocations = batch.map(({ kind, correlation }) => ({ kind, correlation }));
+			const owners = new Set<string>();
+			for (const entry of batch) if (entry.connectionId !== undefined) owners.add(entry.connectionId);
+			activePromptOwnerHolder.connectionIds = owners;
+		};
+		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		if (type === "agent_start") {
 			// Drain EVERY entry admitted for this run: a continuation may promote
 			// several follow-ups (each with its own requester correlation) into one
@@ -2603,19 +2632,24 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// continuation agent_start with an empty queue leaves the current owner
 			// untouched (review thread P1).
 			const drained = current.pending.splice(0);
-			current.activeInvocation = drained[0];
 			if (drained.length > 0) {
-				const owners = new Set<string>();
-				for (const entry of drained) if (entry.connectionId !== undefined) owners.add(entry.connectionId);
-				activePromptOwnerHolder.connectionIds = owners;
-				// A single run may drain several follow-ups promoted together; each
-				// has its own durable record that must reach terminal state, so keep
-				// the full batch for the transition pass below (review thread P1).
-				current.drainedInvocations = drained.map(({ kind, correlation }) => ({ kind, correlation }));
+				current.openLifecycleBatches.push({ invocations: drained });
+				adoptLifecycleBatch(drained);
+				if (current.activeInvocation?.kind === "prompt") {
+					current.deadlineManager.onAccepted(current.activeInvocation.correlation);
+				}
 			}
-			if (current.activeInvocation?.kind === "prompt") {
-				current.deadlineManager.onAccepted(current.activeInvocation.correlation);
-			}
+			transitions = drained.map(({ kind, correlation }) => ({ kind, correlation }));
+		} else {
+			// Pair this agent_end with the oldest unmatched start. A delayed
+			// aborted-turn end that lands after a successor agent_start must
+			// terminalize the aborted invocation, never the successor.
+			const ended = current.openLifecycleBatches[0];
+			transitions = ended
+				? ended.invocations.map(({ kind, correlation }) => ({ kind, correlation }))
+				: current.activeInvocation
+					? [current.activeInvocation]
+					: [];
 		}
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
@@ -2624,12 +2658,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// recorded as observed=false, never rethrown into the api handler.
 		let observed = true;
 		try {
-			const transitions =
-				current.drainedInvocations && current.drainedInvocations.length > 0
-					? current.drainedInvocations
-					: current.activeInvocation
-						? [current.activeInvocation]
-						: [];
 			for (const invocation of transitions) {
 				await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, { type } as never);
 				if ((type as string) === "agent_end" || (type as string) === "agent_failed") {
@@ -2641,20 +2669,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			observed = false;
 		}
 		if (type === "agent_end") {
-			if (current.activeInvocation?.kind === "prompt") {
-				current.deadlineManager.clear(current.activeInvocation.correlation);
-			} else if (current.drainedInvocations) {
-				for (const inv of current.drainedInvocations)
-					if (inv.kind === "prompt") current.deadlineManager.clear(inv.correlation);
-			}
-			current.activeInvocation = undefined;
-			current.drainedInvocations = undefined;
-			// The turn is over: no connection owns it anymore. Clearing here means
-			// an abort against a later agent-initiated turn (monitor/cron
-			// follow-up) finds no owner and fails closed, instead of letting the
-			// previous prompt's owner stop a turn it did not submit (review
-			// thread P1).
-			activePromptOwnerHolder.connectionIds = undefined;
+			if (current.openLifecycleBatches.length > 0) current.openLifecycleBatches.shift();
+			for (const invocation of transitions)
+				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
+			adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
 			// Resolve EVERY concurrent waiter for the aborted turn: the turn emits
 			// exactly one agent_end, and each admitted abort of it must observe the
 			// same publication result rather than a single latest-wins slot (review
@@ -2727,6 +2745,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			kind: InvocationKind;
 			correlation: InvocationCorrelation;
 			connectionId: string | undefined;
+		}> = [];
+		const openLifecycleBatches: Array<{
+			invocations: Array<{
+				kind: InvocationKind;
+				correlation: InvocationCorrelation;
+				connectionId: string | undefined;
+			}>;
 		}> = [];
 		const configRevision = { current: 0 };
 		let acceptingGateResolutions = true;
@@ -3003,6 +3028,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			steerReconciliation,
 			deadlineManager,
 			pending,
+			openLifecycleBatches,
 			registerBroker,
 			fenceGateResolutions: () => {
 				acceptingGateResolutions = false;
@@ -3031,6 +3057,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					steerReconciliation,
 					deadlineManager,
 					pending,
+					openLifecycleBatches,
 					registerBroker,
 					fenceGateResolutions: () => {
 						acceptingGateResolutions = false;

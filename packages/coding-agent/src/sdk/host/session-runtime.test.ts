@@ -2534,6 +2534,96 @@ describe("post-acceptance invocation terminalization", () => {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
+	test("immediate prompt after abort ack is not terminalized by the aborted turn's delayed agent_end", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-immediate-prompt-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const successorStarted = Promise.withResolvers<void>();
+			let prompts = 0;
+			const harness = await invocationHarness("abort-immediate-prompt", cwd, {
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) {
+						await firstInflight.promise;
+						return;
+					}
+					successorStarted.resolve();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			await harness.emit("agent_start");
+			expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true });
+			firstInflight.reject(Object.assign(new Error("turn aborted"), { code: "aborted" }));
+			const second = await harness.control("turn.prompt", { text: "successor" });
+			expect(second.ok).toBe(true);
+			const secondIds = { commandId: second.result?.commandId, turnId: second.result?.turnId };
+			expect(secondIds.commandId).not.toBe(firstIds.commandId);
+			expect(secondIds.turnId).not.toBe(firstIds.turnId);
+			await harness.emit("agent_start");
+			await successorStarted.promise;
+			await harness.emit("agent_end");
+			expect(await harness.query("turn.prompt_status", secondIds)).toMatchObject({
+				result: { status: expect.stringMatching(/accepted|in_flight/) },
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", firstIds)).toMatchObject({
+				status: "failed",
+				error: { code: "aborted" },
+			});
+			await harness.emit("agent_end");
+			expect(await settledStatus(harness, "turn.prompt_status", secondIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("abort_and_prompt starts exactly one successor and is not duplicated by delayed abort teardown", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-and-prompt-once-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const abortReleased = Promise.withResolvers<void>();
+			let prompts = 0;
+			const harness = await invocationHarness("abort-and-prompt-once", cwd, {
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) {
+						await firstInflight.promise;
+						return;
+					}
+				},
+				abort: () => abortReleased.promise,
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			const replacement = harness.control("turn.abort_and_prompt", { text: "replacement" });
+			firstInflight.reject(Object.assign(new Error("turn aborted"), { code: "aborted" }));
+			await harness.emit("agent_end");
+			abortReleased.resolve();
+			const accepted = await replacement;
+			expect(accepted.ok).toBe(true);
+			const successorIds = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end");
+			expect(await settledStatus(harness, "turn.prompt_status", successorIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
 
 	test("a failed skill invocation still reports a terminal failed status", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-skill-"));
