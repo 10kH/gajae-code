@@ -151,9 +151,17 @@ async function runUidCacheProbe(homeA: string, homeAAfterMappingChange: string):
 	return JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as UidCacheProbeResult;
 }
 
+/**
+ * Report why a case cannot run here instead of passing vacuously. A silent
+ * `return` is indistinguishable from a real assertion in CI output.
+ */
+function skip(reason: string): void {
+	console.warn(`SKIP: ${reason}`);
+}
+
 describe("account home is resolved through the OS account database", () => {
 	it("scopes NSS cache entries by effective UID and never leaks across transitions", async () => {
-		if (process.platform !== "linux") return;
+		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
 		const homeA = await tempDir();
 		const homeAAfterMappingChange = await tempDir();
 		const result = await runUidCacheProbe(homeA, homeAAfterMappingChange);
@@ -170,9 +178,9 @@ describe("account home is resolved through the OS account database", () => {
 	});
 
 	it("reports the same home NSS does, not the inherited environment", async () => {
-		if (process.platform !== "linux") return;
+		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
 		const account = await nssHome();
-		if (!account) return; // No NSS account for this uid; nothing to assert against.
+		if (!account) return skip("no NSS account entry for this uid; nothing to assert against");
 
 		// HOME removed entirely: nothing environment-derived is left to echo, so a
 		// correct lookup still names the account home.
@@ -180,9 +188,9 @@ describe("account home is resolved through the OS account database", () => {
 	});
 
 	it("ignores a hostile home that the account database contradicts", async () => {
-		if (process.platform !== "linux") return;
+		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
 		const account = await nssHome();
-		if (!account) return;
+		if (!account) return skip("no NSS account entry for this uid; nothing to assert against");
 
 		const hostile = await tempDir();
 		try {
@@ -195,7 +203,7 @@ describe("account home is resolved through the OS account database", () => {
 	});
 
 	it("never promotes a cached environment-derived home to independent evidence", async () => {
-		if (process.platform !== "linux") return;
+		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
 		// The failure this guards, reproduced against the real resolver:
 		//
 		// With NSS unavailable the account lookup falls back to
@@ -261,7 +269,7 @@ describe("account home is resolved through the OS account database", () => {
 	});
 
 	it("still resolves an absolute home when the NSS front end is unavailable", async () => {
-		if (process.platform !== "linux") return;
+		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
 		// Minimal and distroless images ship no `getent`, and `Bun.spawnSync` throws
 		// outright when the executable is missing rather than returning a non-zero
 		// exit. The failure is injected into the resolver's own lookup so this
@@ -305,9 +313,9 @@ describe("account home is resolved through the OS account database", () => {
 	});
 
 	it("accepts an NSS home that corroborates the runtime home", async () => {
-		if (process.platform !== "linux") return;
+		if (process.platform !== "linux") return skip("NSS account lookup is Linux-only");
 		const account = await nssHome();
-		if (!account) return;
+		if (!account) return skip("no NSS account entry for this uid; nothing to assert against");
 
 		// A checkout can declare HOME dynamically, which makes the home ambiguous no
 		// matter what it resolves to. The account lookup then decides. When NSS --

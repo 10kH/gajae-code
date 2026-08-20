@@ -250,42 +250,13 @@ describe("authoritative home resolution", () => {
 		expect(getConfigRootDir()).toBe(path.join(ambient, CONFIG_DIR_NAME));
 	});
 
-	it("keeps an operator override on its storage lane when it equals the new default path", async () => {
-		// An explicit `GJC_CODING_AGENT_DIR` that happens to equal
-		// `<newHome>/.gjc/agent` must not start following `$XDG_DATA_HOME` after a
-		// home refresh: the agent dir would look unchanged while `agent.db` silently
-		// moved to `$XDG_DATA_HOME/gjc/agent.db`. Only a genuinely default agent dir
-		// may follow XDG.
-		const firstHome = await tempDir();
-		const secondHome = await tempDir();
-		const xdgDataHome = await tempDir();
-		await fs.mkdir(path.join(xdgDataHome, "gjc"), { recursive: true });
-		// The override is exactly the default path under the *second* home.
-		const override = path.join(secondHome, CONFIG_DIR_NAME, "agent");
-		await fs.mkdir(override, { recursive: true });
-
-		const probed = await probe({ agentDirOverride: override, secondHome, home: firstHome, xdgDataHome });
-
-		// At startup, before any home refresh: the constructor must decide XDG
-		// eligibility from the override state, not from path equality. Asserting
-		// only the post-refresh lane leaves the constructor free to route an
-		// operator-selected agent dir into `$XDG_DATA_HOME` on first resolution.
-		expect(probed.before.agentDir).toBe(override);
-		expect(probed.before.agentDb).toBe(path.join(override, "agent.db"));
-		expect(probed.before.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
-
-		expect(probed.after.agentDir).toBe(override);
-		expect(probed.after.agentDb).toBe(path.join(override, "agent.db"));
-		expect(probed.after.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
-	});
-
 	it("keeps an agent directory on one storage lane across a home refresh", async () => {
 		// Naming the default profile explicitly IS the default profile, XDG included
 		// (pinned by dirs-python-gateway.test.ts). What must never happen is a lane
-		// change: an agent directory that was not XDG-eligible at construction must
-		// not become eligible because a home refresh made its path coincide with the
-		// new default. `getAgentDir()` would look unchanged while `agent.db` moved
-		// into `$XDG_DATA_HOME/gjc`.
+		// *change*: an agent directory decided at construction must not be re-decided
+		// from path shape because a home refresh made it coincide with the new
+		// default. `getAgentDir()` would look unchanged while `agent.db` moved into
+		// `$XDG_DATA_HOME/gjc` -- the same store read through two roots.
 		const firstHome = await tempDir();
 		const secondHome = await tempDir();
 		const xdgDataHome = await tempDir();
@@ -299,8 +270,6 @@ describe("authoritative home resolution", () => {
 
 		expect(probed.before.agentDir).toBe(override);
 		expect(probed.before.agentDb).toBe(path.join(override, "agent.db"));
-		// After the refresh the path now equals `<secondHome>/.gjc/agent`, so a
-		// path-shape recomputation would flip it onto the XDG lane.
 		expect(probed.after.agentDir).toBe(override);
 		expect(probed.after.agentDb).toBe(probed.before.agentDb);
 		expect(probed.after.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
