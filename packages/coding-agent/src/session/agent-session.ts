@@ -18391,8 +18391,9 @@ export class AgentSession {
 		}
 		// A typed provider safety stop is terminal even when managed fallback is
 		// enabled. Preserve the original refusal instead of treating the absent
-		// fallback trigger as chain exhaustion.
-		if (classification === "terminal") {
+		// fallback trigger as chain exhaustion; do not broaden this to every
+		// untyped terminal classification.
+		if (message.errorKind === "provider_safety_stop") {
 			return managedOutcome
 				? {
 						type: "terminal",
