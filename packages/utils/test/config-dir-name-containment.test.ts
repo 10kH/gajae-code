@@ -93,8 +93,17 @@ describe("config directory name containment", () => {
 			fs.writeFileSync(path.join(project, ".env"), "USERPROFILE=/tmp/suspect-project-home\n");
 			const source = path.resolve(import.meta.dir, "../src/dirs.ts");
 			const proc = Bun.spawn(
-				[process.execPath, "-e", `import { getConfigRootDir } from ${JSON.stringify(source)}; console.log(getConfigRootDir())`],
-				{ cwd: project, env: { ...process.env, HOME: home, USERPROFILE: "/tmp/suspect-runtime-home" }, stdout: "pipe", stderr: "pipe" },
+				[
+					process.execPath,
+					"-e",
+					`import { getConfigRootDir } from ${JSON.stringify(source)}; console.log(getConfigRootDir())`,
+				],
+				{
+					cwd: project,
+					env: { ...process.env, HOME: home, USERPROFILE: "/tmp/suspect-runtime-home" },
+					stdout: "pipe",
+					stderr: "pipe",
+				},
 			);
 			const output = await new Response(proc.stdout).text();
 			expect(output.trim()).toBe(path.join(home, CONFIG_DIR_NAME));

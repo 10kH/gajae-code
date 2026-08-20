@@ -282,8 +282,7 @@ class DirResolver {
 		const runtimeHome = process.env[authoritativeHomeKey] ?? process.env[fallbackHomeKey];
 		const accountHome = accountHomeFromSystem();
 		const ambiguousHome =
-			declaredHome !== undefined &&
-			(snapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
+			declaredHome !== undefined && (snapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
 		this.#trustedHome = ambiguousHome
 			? (accountHome ??
 				(() => {
@@ -307,7 +306,10 @@ class DirResolver {
 		this.refreshCategoryDirs(snapshot, isDefault);
 	}
 
-	private refreshCategoryDirs(snapshot: { values: Record<string, string>; dynamic: Set<string> }, isDefault = this.agentDir === path.join(this.configRoot, "agent")): void {
+	private refreshCategoryDirs(
+		snapshot: { values: Record<string, string>; dynamic: Set<string> },
+		isDefault = this.agentDir === path.join(this.configRoot, "agent"),
+	): void {
 		let xdgData: string | undefined;
 		let xdgState: string | undefined;
 		let xdgCache: string | undefined;
@@ -326,8 +328,16 @@ class DirResolver {
 			xdgState = resolveIf("XDG_STATE_HOME");
 			xdgCache = resolveIf("XDG_CACHE_HOME");
 		}
-		this.#rootDirs = { data: xdgData ?? this.configRoot, state: xdgState ?? this.configRoot, cache: xdgCache ?? this.configRoot };
-		this.#agentDirs = { data: xdgData ?? this.agentDir, state: xdgState ?? this.agentDir, cache: xdgCache ?? this.agentDir };
+		this.#rootDirs = {
+			data: xdgData ?? this.configRoot,
+			state: xdgState ?? this.configRoot,
+			cache: xdgCache ?? this.configRoot,
+		};
+		this.#agentDirs = {
+			data: xdgData ?? this.agentDir,
+			state: xdgState ?? this.agentDir,
+			cache: xdgCache ?? this.agentDir,
+		};
 	}
 
 	/** Refresh caller-supplied config-dir overrides without replacing the trust snapshot. */

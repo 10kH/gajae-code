@@ -7,8 +7,8 @@ import {
 	getConfigDirName,
 	getLogsDir,
 	getPluginsDir,
-	getPythonGatewayDir,
 	getPuppeteerDir,
+	getPythonGatewayDir,
 	setAgentDir,
 } from "../src/dirs";
 import { Snowflake } from "../src/snowflake";
