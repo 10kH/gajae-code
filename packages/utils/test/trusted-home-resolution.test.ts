@@ -352,6 +352,18 @@ describe("authoritative home resolution", () => {
 		expect(getTrustedHomeDir()).toBe(planted);
 	});
 
+	it("short-circuits an explicit plugin home when authoritative home is unavailable", async () => {
+		const explicit = await tempDir();
+		const root = path.parse(process.cwd()).root;
+		vi.spyOn(os, "homedir").mockReturnValue(root);
+		vi.spyOn(os, "userInfo").mockImplementation(() => {
+			throw new Error("account identity unavailable");
+		});
+		if (process.platform !== "win32") vi.spyOn(process, "geteuid").mockReturnValue(65534);
+
+		expect(getPluginsDir(explicit)).toBe(path.join(explicit, CONFIG_DIR_NAME, "plugins"));
+	});
+
 	it("never treats the project directory as the home", async () => {
 		// Project scope (`<cwd>/.gjc`) and user scope (`<home>/.gjc`) must stay
 		// distinct: collapsing them is what makes a checkout's `.gjc` readable as

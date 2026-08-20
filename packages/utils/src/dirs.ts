@@ -231,6 +231,14 @@ function trustedValue(
 	return value;
 }
 
+function resolveConfigDirName(project: { values: Record<string, string>; dynamic: Set<string> }): string {
+	return (
+		sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", project)) ??
+		sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", project)) ??
+		CONFIG_DIR_NAME
+	);
+}
+
 /**
  * A home directory is usable only when it is absolute and resolves to somewhere
  * strictly below a filesystem root. A relative value would anchor user state
@@ -436,10 +444,7 @@ class DirResolver {
 
 	constructor(agentDirOverride?: string, snapshot = projectEnvSnapshot()) {
 		this.#projectEnv = snapshot;
-		this.#configDirName =
-			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", snapshot)) ??
-			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", snapshot)) ??
-			CONFIG_DIR_NAME;
+		this.#configDirName = resolveConfigDirName(snapshot);
 		this.#trustedHome = resolveTrustedHome(snapshot);
 		this.configRoot = path.join(this.#trustedHome, this.#configDirName);
 
@@ -523,10 +528,7 @@ class DirResolver {
 	 * so reads and writes cannot straddle two different homes.
 	 */
 	refreshConfigDirOverride(): void {
-		const nextConfigDirName =
-			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", this.#projectEnv)) ??
-			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", this.#projectEnv)) ??
-			CONFIG_DIR_NAME;
+		const nextConfigDirName = resolveConfigDirName(this.#projectEnv);
 		const nextHome = resolveTrustedHome(this.#projectEnv);
 		if (nextConfigDirName === this.#configDirName && nextHome === this.#trustedHome) return;
 		const nextConfigRoot = path.join(nextHome, nextConfigDirName);
@@ -706,8 +708,16 @@ export function getLogPath(date = new Date()): string {
  * form — XDG semantics are preserved.
  */
 export function getPluginsDir(home?: string): string {
-	if (home !== undefined && home !== dirs.trustedHome) {
-		return path.join(home, getConfigDirName(), "plugins");
+	if (home !== undefined) {
+		const explicitPath = () => path.join(home, resolveConfigDirName(dirs.trustSnapshot), "plugins");
+		try {
+			if (home !== dirs.trustedHome) return explicitPath();
+		} catch {
+			// An explicit home is the caller's documented escape hatch. If the
+			// authoritative home is unavailable, do not let its fail-closed resolver
+			// prevent a caller-owned plugin path from being returned.
+			return explicitPath();
+		}
 	}
 	return dirs.rootSubdir("plugins", "data");
 }
