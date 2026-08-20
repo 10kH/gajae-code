@@ -231,21 +231,145 @@ function trustedValue(
 	return value;
 }
 
-function accountHomeFromSystem(): string | undefined {
+/**
+ * A home directory is usable only when it is absolute and resolves to somewhere
+ * strictly below a filesystem root. A relative value would anchor user state
+ * beneath whatever the current directory happens to be, and a root would place
+ * it at `/.gjc`.
+ *
+ * The root test normalizes first, because a root has many spellings: `/.`, `//`,
+ * `/foo/..` and `C:\x\..` are all roots that a raw string comparison against
+ * `path.parse(home).root` misses, and `path.join(home, ".gjc")` would happily
+ * produce `/.gjc` from every one of them.
+ *
+ * The **original spelling** is returned, never the normalized form. Provenance
+ * compares the declared dotenv value against this result, and both sides must
+ * stay in the same spelling: canonicalizing only this side would make
+ * `HOME=/tmp/base/../attacker` compare unequal to its own declaration and let a
+ * project-planted home through as if it were operator-supplied.
+ */
+function usableHome(home: string | undefined): string | undefined {
+	if (!home || !path.isAbsolute(home)) return undefined;
+	const normalized = path.resolve(home);
+	return normalized === path.parse(normalized).root ? undefined : home;
+}
+
+/**
+ * The account home for the running uid, read through the operating system's own
+ * account database.
+ *
+ * On Linux this must go through NSS rather than parsing `/etc/passwd`: LDAP and
+ * SSSD accounts have no local passwd entry, and a direct file read would miss
+ * them and fall through to an environment-derived value. `getent passwd` is the
+ * NSS front end, so it resolves local and directory-backed accounts alike.
+ *
+ * Only an **environment-independent** result is memoized, and only on success.
+ * The NSS answer cannot change during a process lifetime, so caching it is safe.
+ * The `os.userInfo()` fallback is different: Bun derives `homedir` from `$HOME`,
+ * so caching it would freeze one side of the independence comparison in
+ * {@link resolveTrustedHome}. A planted home that was live at first resolution
+ * would stay cached, and once the runtime home moved it would no longer *equal*
+ * the runtime home -- passing the echo check and being promoted to independent
+ * evidence. Provenance is carried with the value so that can never happen.
+ */
+let accountHomeCache: { home: string; envDerived: boolean } | undefined;
+
+/** The uid's home field from the NSS account database, or undefined. */
+function nssAccountHome(uid: number): string | undefined {
+	try {
+		// Spawned with an empty environment so nothing the caller controls (HOME,
+		// NSS module configuration, locale) can steer the answer.
+		const result = Bun.spawnSync({
+			cmd: ["getent", "passwd", String(uid)],
+			env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin", LC_ALL: "C" },
+			stdout: "pipe",
+			stderr: "ignore",
+		});
+		if (result.exitCode !== 0) return undefined;
+		// `getent` echoes passwd-format records; the home directory is field 6.
+		const line = new TextDecoder().decode(result.stdout).split("\n")[0];
+		return usableHome(line?.split(":")[5]);
+	} catch {
+		return undefined;
+	}
+}
+
+function accountHomeFromSystem(): { home: string; envDerived: boolean } | undefined {
+	if (accountHomeCache !== undefined) return accountHomeCache;
 	try {
 		const info = os.userInfo();
 		if (process.platform === "linux") {
-			const line = fs
-				.readFileSync("/etc/passwd", "utf8")
-				.split("\n")
-				.find(candidate => candidate.split(":")[2] === String(info.uid));
-			const home = line?.split(":")[5];
-			if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+			const nss = nssAccountHome(info.uid);
+			if (nss !== undefined) {
+				// NSS is environment-independent and stable: safe to memoize.
+				accountHomeCache = { home: nss, envDerived: false };
+				return accountHomeCache;
+			}
 		}
-		const home = info.homedir;
-		if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+		// `os.userInfo().homedir` is the portable path for macOS and Windows, and on
+		// Linux is reached only when NSS is unavailable. Bun derives it from `$HOME`,
+		// so it is re-read every time and never cached, and it is flagged so the
+		// caller can refuse to treat it as independent evidence.
+		const fallback = usableHome(info.homedir);
+		if (fallback !== undefined) return { home: fallback, envDerived: true };
 	} catch {}
 	return undefined;
+}
+
+/**
+ * Resolve the authoritative home for user-scope state.
+ *
+ * Two properties must hold together, and pinning either one alone breaks the
+ * other (issue #4761):
+ *
+ * 1. **Provenance.** Bun overlays a checkout's `.env` into `process.env` before
+ *    any module runs, so a repository can plant HOME/USERPROFILE and redirect
+ *    user state — including the `.env` files `$credentialEnv` treats as trusted.
+ *    When the platform-authoritative variable is indistinguishable from the
+ *    value the project dotenv declares, the OS account database wins instead.
+ * 2. **Call-time resolution.** The trusted home is *derived*, never snapshotted
+ *    at module load. A resolution frozen at import silently loses every
+ *    user-scope location whenever the runtime home is established or changed
+ *    after this module initializes — which is exactly how user-scope skill and
+ *    MCP discovery regressed.
+ *
+ * `os.homedir()` is the runtime candidate: on POSIX it reflects HOME, on Windows
+ * USERPROFILE, and it falls back to the account database on its own. Reading it
+ * per call is what makes the contract call-time; the provenance comparison above
+ * is what keeps an untrusted mutable home from being honored.
+ */
+function resolveTrustedHome(project: { values: Record<string, string>; dynamic: Set<string> }): string {
+	const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+	const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
+	const declaredHome = project.values[declaredHomeKey];
+	// A relative or filesystem-root runtime home would anchor user state beneath
+	// the current directory (or at `/`), so it is not a usable candidate no matter
+	// how it was supplied. Validate it exactly as the account home is validated.
+	const runtimeHome = usableHome(os.homedir());
+	// Only the platform-authoritative variable can select the home. In particular,
+	// do not let the opposite platform variable (or a project dotenv value
+	// overlaid into it) redirect user state when this is absent.
+	const ambiguousHome =
+		declaredHome !== undefined && (project.dynamic.has(declaredHomeKey) || declaredHome === runtimeHome);
+	// The account lookup is consulted lazily. It can spawn the NSS front end, and
+	// this resolver runs on every directory access, so an unambiguous runtime home
+	// -- the ordinary CLI path -- must never pay for it.
+	if (!ambiguousHome && runtimeHome !== undefined) return runtimeHome;
+
+	const accountHome = accountHomeFromSystem();
+	if (ambiguousHome) {
+		// The account home is independent evidence only when it is not itself derived
+		// from the environment. An `os.userInfo()` fallback echoes `$HOME`, so a
+		// project-declared home would otherwise come back as its own justification.
+		// Fail closed: with no independent evidence the resolver yields a filesystem
+		// root, which `#homeAvailable` rejects, rather than honoring the declared
+		// home. Issue #4773 owns widening that fallback; do not weaken it here.
+		if (accountHome === undefined || accountHome.envDerived) return path.parse(process.cwd()).root;
+		return accountHome.home;
+	}
+	// No usable runtime home: fall back to whatever the account database reports.
+	if (accountHome !== undefined) return accountHome.home;
+	throw new Error("Unable to determine a trustworthy account home directory");
 }
 export function getConfigAgentDirName(): string {
 	return `${getConfigDirName()}/agent`;
@@ -258,16 +382,14 @@ export function getConfigAgentDirName(): string {
 type XdgCategory = "data" | "state" | "cache";
 
 /**
- * Resolve the home used for trusted agent state. Bun overlays a checkout's
- * `.env` before module initialization, so `os.homedir()` can already reflect
- * an attacker-controlled HOME. Prefer the OS account database, which is not
- * affected by a hostile HOME/USERPROFILE overlay.
- */
-/**
  * Resolves and caches all gajae-code directory paths. On Linux, when XDG environment
  * variables are set, paths are redirected under $XDG_*_HOME/gjc/. A new
  * instance is created whenever the agent directory changes, which naturally
  * invalidates all cached paths.
+ *
+ * The trusted home is re-derived on each access (see {@link resolveTrustedHome})
+ * and every cached path is rebuilt when it changes, so a home established or
+ * mocked after module load is honored without weakening the provenance rule.
  */
 class DirResolver {
 	configRoot: string;
@@ -275,8 +397,12 @@ class DirResolver {
 	readonly #projectEnv: { values: Record<string, string>; dynamic: Set<string> };
 	#configDirName: string;
 	readonly #agentDirOverride: boolean;
-	readonly #trustedHome: string;
-	readonly #homeAvailable: boolean;
+	#trustedHome: string;
+	/**
+	 * Whether this resolver's agent directory may follow `$XDG_*_HOME`, decided
+	 * once at construction and never re-derived from the path afterwards.
+	 */
+	#xdgEligible: boolean;
 
 	// Per-category base dirs. Without XDG, all three equal configRoot / agentDir.
 	// With XDG on Linux, they point to $XDG_*_HOME/gjc/.
@@ -292,46 +418,37 @@ class DirResolver {
 			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", snapshot)) ??
 			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", snapshot)) ??
 			CONFIG_DIR_NAME;
-		const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
-		const declaredHomeKey = canonicalEnvKey(authoritativeHomeKey);
-		const declaredHome = snapshot.values[declaredHomeKey];
-		// Only the platform-authoritative variable can select the trusted home.
-		// In particular, do not let the opposite platform variable (or a project
-		// dotenv value overlaid into it) redirect user state when this is absent.
-		const runtimeHome = process.env[authoritativeHomeKey];
-		const accountHome = accountHomeFromSystem();
-		// The account home is independent evidence only when it does not merely
-		// echo the runtime home. Bun resolves `os.userInfo().homedir` from `$HOME`
-		// on macOS (unlike Node, which reads the passwd database), so a
-		// project-declared home would otherwise come back as its own justification
-		// and re-enter the trusted set. Only the Linux `/etc/passwd` lookup is
-		// genuinely env-independent.
-		const independentAccountHome = accountHome !== undefined && accountHome !== runtimeHome ? accountHome : undefined;
-		const ambiguousHome =
-			declaredHome !== undefined && (snapshot.dynamic.has(declaredHomeKey) || declaredHome === runtimeHome);
-		this.#trustedHome = ambiguousHome
-			? (independentAccountHome ?? path.parse(process.cwd()).root)
-			: (runtimeHome ??
-				accountHome ??
-				(() => {
-					throw new Error("Unable to determine a trustworthy account home directory");
-				})());
-		this.#homeAvailable = this.#trustedHome !== path.parse(this.#trustedHome).root;
+		this.#trustedHome = resolveTrustedHome(snapshot);
 		this.configRoot = path.join(this.#trustedHome, this.#configDirName);
 
 		const defaultAgent = path.join(this.configRoot, "agent");
 		this.#agentDirOverride = Boolean(agentDirOverride);
 		this.agentDir = agentDirOverride ? path.resolve(agentDirOverride) : defaultAgent;
+		// Naming the default agent profile explicitly selects the default profile,
+		// XDG categories included: `setAgentDir(<home>/<configDir>/agent)` is how a
+		// caller returns to it, and `dirs-python-gateway.test.ts` pins that. So the
+		// initial decision is path equality.
 		const isDefault = this.agentDir === defaultAgent;
+		// That decision is then *sticky*. Recomputing it later from path shape is
+		// what let a pinned agent directory silently change storage lane when a home
+		// refresh made it coincide with the new default: `getAgentDir()` looked
+		// unchanged while `agent.db` moved into `$XDG_DATA_HOME/gjc`.
+		this.#xdgEligible = isDefault;
 
 		this.#rootDirs = { data: this.configRoot, state: this.configRoot, cache: this.configRoot };
 		this.#agentDirs = { data: this.agentDir, state: this.agentDir, cache: this.agentDir };
 		this.refreshCategoryDirs(snapshot, isDefault);
 	}
 
+	/**
+	 * `isDefault` decides whether the agent directory may follow `$XDG_*_HOME`.
+	 * It defaults to a path comparison, but an explicitly selected agent directory
+	 * must never switch storage lanes just because it happens to equal the
+	 * home-derived default — callers that know the override state pass it in.
+	 */
 	private refreshCategoryDirs(
 		snapshot: { values: Record<string, string>; dynamic: Set<string> },
-		isDefault = this.agentDir === path.join(this.configRoot, "agent"),
+		isDefault = !this.#agentDirOverride && this.agentDir === path.join(this.configRoot, "agent"),
 	): void {
 		let xdgData: string | undefined;
 		let xdgState: string | undefined;
@@ -363,21 +480,40 @@ class DirResolver {
 		};
 	}
 
-	/** Refresh caller-supplied config-dir overrides without replacing the trust snapshot. */
+	/**
+	 * Re-derive the trusted home and the caller-supplied config-dir override
+	 * without replacing the trust snapshot.
+	 *
+	 * Both inputs are call-time: the home comes from {@link resolveTrustedHome}
+	 * (provenance-checked, never an import-time snapshot) and the config-dir name
+	 * from the trusted-value rule. When either changes, the config root, the
+	 * default agent dir, the XDG category dirs and both path caches are rebuilt
+	 * so reads and writes cannot straddle two different homes.
+	 */
 	refreshConfigDirOverride(): void {
-		const next =
+		const nextConfigDirName =
 			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", this.#projectEnv)) ??
 			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", this.#projectEnv)) ??
 			CONFIG_DIR_NAME;
-		if (next === this.#configDirName) return;
-		const nextConfigRoot = path.join(this.#trustedHome, next);
+		const nextHome = resolveTrustedHome(this.#projectEnv);
+		if (nextConfigDirName === this.#configDirName && nextHome === this.#trustedHome) return;
+		const nextConfigRoot = path.join(nextHome, nextConfigDirName);
 		const nextAgentDir = this.#agentDirOverride ? this.agentDir : path.join(nextConfigRoot, "agent");
-		this.#configDirName = next;
+		this.#trustedHome = nextHome;
+		this.#configDirName = nextConfigDirName;
 		this.configRoot = nextConfigRoot;
 		this.agentDir = nextAgentDir;
-		this.refreshCategoryDirs(this.#projectEnv);
+		// Reuse the construction-time decision rather than re-deriving it, so an
+		// agent directory never changes storage lane just because a home refresh made
+		// its path coincide with (or diverge from) the new default.
+		this.refreshCategoryDirs(this.#projectEnv, this.#xdgEligible);
 		this.#rootCache.clear();
 		this.#agentCache.clear();
+	}
+
+	/** Whether the resolved home is a real directory rather than a filesystem root. */
+	get #homeAvailable(): boolean {
+		return this.#trustedHome !== path.parse(this.#trustedHome).root;
 	}
 
 	isProjectEnvDeclaration(name: string): boolean {
@@ -415,9 +551,11 @@ class DirResolver {
 		return this.#configDirName;
 	}
 	get trustedHome(): string {
+		this.refreshConfigDirOverride();
 		return this.#trustedHome;
 	}
 	assertHomeAvailable(): void {
+		this.refreshConfigDirOverride();
 		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 	}
 	get trustSnapshot(): { values: Record<string, string>; dynamic: Set<string> } {
@@ -431,12 +569,6 @@ const trustedAgentOverride =
 	trustedValue("PI_CODING_AGENT_DIR", INITIAL_PROJECT_SNAPSHOT);
 let dirs = new DirResolver(trustedAgentOverride, INITIAL_PROJECT_SNAPSHOT);
 
-// Anchor home for the resolver. Captured at module load to stay stable across
-// test mocks of `os.homedir()`. `getPluginsDir(home)` compares against this so
-// production callers (`home === RESOLVER_HOME`) hit the XDG-aware resolver while
-// tests passing a temp HOME short-circuit to a deterministic path.
-const RESOLVER_HOME = dirs.trustedHome;
-
 // =============================================================================
 // Root directories
 // =============================================================================
@@ -448,7 +580,14 @@ export function getConfigRootDir(): string {
 	return dirs.configRoot;
 }
 
-/** Stable, provenance-checked home captured by the resolver lifetime snapshot. */
+/**
+ * The authoritative home for user-scope state.
+ *
+ * Provenance-checked and resolved at call time: a home established or changed
+ * after this module loaded is honored, while a home the project dotenv could
+ * have planted is rejected in favor of the OS account database. See
+ * {@link resolveTrustedHome}.
+ */
 export function getTrustedHomeDir(): string {
 	dirs.assertHomeAvailable();
 	return dirs.trustedHome;
@@ -521,14 +660,15 @@ export function getLogPath(date = new Date()): string {
  * Get the plugins directory (~/.gjc/plugins or its XDG equivalent).
  *
  * No-arg form (production callers) goes through the XDG-aware DirResolver so
- * reads and writes always agree. The optional `home` parameter is for test
- * isolation: when it differs from `os.homedir()` it short-circuits the resolver
- * and returns `<home>/<configDir>/plugins` so tests with a temp HOME get a
- * deterministic path. Passing `os.homedir()` explicitly is identical to the
- * no-arg form — XDG semantics are preserved.
+ * reads and writes always agree. The optional `home` parameter names an explicit
+ * home: when it differs from the authoritative home resolved right now it
+ * short-circuits the resolver and returns `<home>/<configDir>/plugins`, giving
+ * callers that carry their own home (and tests with a temp HOME) a deterministic
+ * path. Passing the authoritative home explicitly is identical to the no-arg
+ * form — XDG semantics are preserved.
  */
 export function getPluginsDir(home?: string): string {
-	if (home !== undefined && home !== RESOLVER_HOME) {
+	if (home !== undefined && home !== dirs.trustedHome) {
 		return path.join(home, getConfigDirName(), "plugins");
 	}
 	return dirs.rootSubdir("plugins", "data");

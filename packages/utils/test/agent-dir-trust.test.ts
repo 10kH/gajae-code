@@ -92,15 +92,18 @@ async function resolveWithoutPlatformHome(cwd: string, hostileHome: string): Pro
 }
 
 /** The account home of the running user, from the passwd database on Linux. */
-function accountHomeOfRunningUser(): string {
+async function accountHomeOfRunningUser(): Promise<string> {
 	if (process.platform === "linux") {
-		const uid = String(os.userInfo().uid);
-		const line = fs
-			.readFileSync("/etc/passwd", "utf8")
-			.split("\n")
-			.find(candidate => candidate.split(":")[2] === uid);
-		const home = line?.split(":")[5];
-		if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+		// NSS, matching production: reading `/etc/passwd` directly would disagree
+		// with the resolver for any LDAP- or SSSD-backed account, which has no local
+		// entry, and report a false failure.
+		const uid = os.userInfo().uid;
+		const proc = Bun.spawn(["getent", "passwd", String(uid)], { stdout: "pipe", stderr: "ignore" });
+		const stdout = await new Response(proc.stdout).text();
+		if ((await proc.exited) === 0) {
+			const home = stdout.split("\n")[0]?.split(":")[5];
+			if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+		}
 	}
 	return os.userInfo().homedir;
 }
@@ -231,7 +234,7 @@ describe("agent directory trust boundary", () => {
 		// Expect the passwd database directly: a parent-side os.userInfo().homedir
 		// follows an isolated HOME, while the child probe has HOME deleted and
 		// resolves the real account home.
-		const accountHome = accountHomeOfRunningUser();
+		const accountHome = await accountHomeOfRunningUser();
 		expect(resolved.trustedHome).toBe(accountHome);
 		expect(resolved.trustedHome).not.toBe(hostileHome);
 		expect(resolved.configRoot).toBe(path.join(accountHome, ".gjc"));
@@ -242,7 +245,7 @@ describe("agent directory trust boundary", () => {
 		const cwd = projectDir("SOMETHING_ELSE=1\n");
 		const hostileHome = tempDir();
 		const resolved = await resolveWithoutPlatformHome(cwd, hostileHome);
-		const accountHome = accountHomeOfRunningUser();
+		const accountHome = await accountHomeOfRunningUser();
 		expect(resolved.trustedHome).toBe(accountHome);
 		expect(resolved.trustedHome).not.toBe(hostileHome);
 		expect(resolved.configRoot).toBe(path.join(accountHome, ".gjc"));

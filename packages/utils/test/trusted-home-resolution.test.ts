@@ -1,0 +1,330 @@
+import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import {
+	CONFIG_DIR_NAME,
+	getAgentDir,
+	getConfigRootDir,
+	getPluginsDir,
+	getTrustedConfigRootDir,
+	getTrustedHomeDir,
+} from "../src/dirs";
+
+const PROBE = path.join(import.meta.dir, "fixtures", "agent-dir-override-probe.ts");
+
+interface ProbeResolved {
+	trustedHome: string;
+	agentDir: string;
+	configRoot: string;
+	agentDb: string;
+}
+
+interface ProbeResult {
+	overrideDeclared: string | null;
+	before: ProbeResolved;
+	after: ProbeResolved;
+}
+
+/**
+ * Resolve the agent directory in a child process, before and after the home
+ * changes. Runs out of process so the parent's module-level resolver is never
+ * mutated: `setAgentDir` installs an override resolver and cannot install a
+ * default one, so an in-process restore would latch that override.
+ */
+async function probe(options: {
+	agentDirOverride: string | null;
+	secondHome: string;
+	home?: string;
+	xdgDataHome?: string;
+}): Promise<ProbeResult> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	delete env.GJC_CODING_AGENT_DIR;
+	delete env.PI_CODING_AGENT_DIR;
+	delete env.GJC_CONFIG_DIR;
+	delete env.PI_CONFIG_DIR;
+	delete env.XDG_DATA_HOME;
+	if (options.xdgDataHome) env.XDG_DATA_HOME = options.xdgDataHome;
+	if (options.agentDirOverride) env.GJC_CODING_AGENT_DIR = options.agentDirOverride;
+	if (options.home) {
+		// Only the platform-authoritative variable selects the home, and the
+		// opposite one is cleared so an inherited value cannot shadow it. The
+		// second home arrives through an `os.homedir()` mock in the fixture, which
+		// already resolves USERPROFILE on Windows.
+		const homeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
+		const unusedHomeKey = process.platform === "win32" ? "HOME" : "USERPROFILE";
+		env[homeKey] = options.home;
+		delete env[unusedHomeKey];
+	}
+	env.GJC_PROBE_SECOND_HOME = options.secondHome;
+
+	const proc = Bun.spawn([process.execPath, PROBE], { cwd: import.meta.dir, env, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
+	return JSON.parse(stdout.trim()) as ProbeResult;
+}
+
+/**
+ * The authoritative home for user-scope state must satisfy two properties at
+ * once (issue #4761):
+ *
+ * 1. It is resolved at **call time**, not snapshotted at module load. A home
+ *    established or changed after `dirs.ts` initializes must be honored —
+ *    freezing it silently drops every user-scope location, which is how
+ *    user-scope skill and MCP discovery regressed on `d9fabc8f5a`.
+ * 2. It stays **provenance-checked**. A checkout's `.env` is overlaid into
+ *    `process.env` before any module runs, so a home the project dotenv could
+ *    have planted must never be honored; the OS account database wins instead.
+ *    That rule is exercised out-of-process in `agent-dir-trust.test.ts`, which
+ *    can control cwd and the inherited environment; here we pin the in-process
+ *    half — the resolution that discovery actually calls.
+ */
+
+const tempDirs: string[] = [];
+
+async function tempDir(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-trusted-home-"));
+	tempDirs.push(dir);
+	return dir;
+}
+
+afterEach(async () => {
+	vi.restoreAllMocks();
+	await Promise.all(tempDirs.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+});
+
+describe("authoritative home resolution", () => {
+	it("follows a home that only becomes visible after module load", async () => {
+		// The regression: `dirs.ts` had already initialized by the time this
+		// mock is installed, so an import-time snapshot keeps returning the
+		// ambient home and every user-scope path points at the wrong place.
+		const before = getTrustedHomeDir();
+		const planted = await tempDir();
+		expect(planted).not.toBe(before);
+
+		vi.spyOn(os, "homedir").mockReturnValue(planted);
+		expect(getTrustedHomeDir()).toBe(planted);
+	});
+
+	it("re-points the home-derived config root and plugins dir at the resolved home", async () => {
+		// Discovery reads user-scope skills from `<configRoot>/agent/skills` and
+		// user-scope MCP from `<configRoot>/agent/mcp.json`. Everything derived from
+		// the home must move together, or reads and writes straddle two homes.
+		const planted = await tempDir();
+		vi.spyOn(os, "homedir").mockReturnValue(planted);
+
+		expect(getConfigRootDir()).toBe(path.join(planted, CONFIG_DIR_NAME));
+		expect(getTrustedConfigRootDir()).toBe(path.join(planted, CONFIG_DIR_NAME));
+		expect(getPluginsDir()).toBe(path.join(planted, CONFIG_DIR_NAME, "plugins"));
+	});
+
+	it("keeps every cached path consistent when the home changes twice", async () => {
+		// The resolver caches subdirectory paths. A stale cache is the same defect
+		// as a stale snapshot, so a second change must invalidate the first.
+		const first = await tempDir();
+		const second = await tempDir();
+		const spy = vi.spyOn(os, "homedir").mockReturnValue(first);
+		expect(getConfigRootDir()).toBe(path.join(first, CONFIG_DIR_NAME));
+		expect(getPluginsDir()).toBe(path.join(first, CONFIG_DIR_NAME, "plugins"));
+
+		spy.mockReturnValue(second);
+		expect(getTrustedHomeDir()).toBe(second);
+		expect(getConfigRootDir()).toBe(path.join(second, CONFIG_DIR_NAME));
+		expect(getPluginsDir()).toBe(path.join(second, CONFIG_DIR_NAME, "plugins"));
+	});
+
+	it("restores the ambient home once the override is gone", async () => {
+		const ambient = getTrustedHomeDir();
+		const planted = await tempDir();
+		const spy = vi.spyOn(os, "homedir").mockReturnValue(planted);
+		expect(getTrustedHomeDir()).toBe(planted);
+
+		spy.mockRestore();
+		expect(getTrustedHomeDir()).toBe(ambient);
+		expect(getConfigRootDir()).toBe(path.join(ambient, CONFIG_DIR_NAME));
+	});
+
+	it("never anchors user state at a filesystem root", async () => {
+		// A bare root would place user state at `/.gjc`. It is rejected as a
+		// candidate, so resolution falls through to the account home rather than
+		// adopting the root and failing later.
+		const root = path.parse(process.cwd()).root;
+		vi.spyOn(os, "homedir").mockReturnValue(root);
+
+		const resolved = getTrustedHomeDir();
+		expect(resolved).not.toBe(root);
+		expect(path.isAbsolute(resolved)).toBe(true);
+		expect(getConfigRootDir()).toBe(path.join(resolved, CONFIG_DIR_NAME));
+	});
+
+	it("never anchors user state beneath the working directory for a relative home", async () => {
+		// Bun returns `HOME` verbatim, so a relative value would put the config
+		// root, agent dir and plugins dir under whatever cwd happens to be. The
+		// runtime home must be held to the same standard as the account home.
+		vi.spyOn(os, "homedir").mockReturnValue("relative/evil");
+
+		const resolved = getTrustedHomeDir();
+		expect(path.isAbsolute(resolved)).toBe(true);
+		expect(resolved).not.toBe("relative/evil");
+		expect(resolved).not.toBe(path.resolve("relative/evil"));
+		expect(getConfigRootDir().startsWith(process.cwd() + path.sep)).toBe(false);
+		expect(getPluginsDir().startsWith(process.cwd() + path.sep)).toBe(false);
+	});
+
+	it("rejects every spelling of a filesystem root, not just the canonical one", async () => {
+		// A root has many spellings. Comparing the raw string against
+		// `path.parse(home).root` misses `/.`, `//`, `/..` and `/foo/..`, and
+		// `path.join(home, ".gjc")` turns every one of them into `/.gjc`.
+		const root = path.parse(process.cwd()).root;
+		for (const alias of ["/.", "//", "/..", "/foo/..", "/./", "/../.."]) {
+			const spy = vi.spyOn(os, "homedir").mockReturnValue(alias);
+			const resolved = getTrustedHomeDir();
+			expect(resolved).not.toBe(alias);
+			expect(path.resolve(resolved)).not.toBe(root);
+			expect(getConfigRootDir()).not.toBe(path.join(root, CONFIG_DIR_NAME));
+			spy.mockRestore();
+		}
+	});
+
+	it("resolves an empty runtime home to an absolute account home", async () => {
+		// An empty string is neither absolute nor a root; it must not survive as a
+		// candidate and produce a bare `/.gjc`.
+		vi.spyOn(os, "homedir").mockReturnValue("");
+
+		const resolved = getTrustedHomeDir();
+		expect(path.isAbsolute(resolved)).toBe(true);
+		expect(resolved).not.toBe(path.parse(process.cwd()).root);
+	});
+
+	// The two agent-directory lanes run out of process. `setAgentDir` can only
+	// install an *override* resolver, so an in-process restore would latch
+	// `#agentDirOverride` on a resolver that started out as the default and pin
+	// later tests to a deleted temp dir. A subprocess cannot leak into this
+	// worker's module-level resolver at all, which is what the `before` snapshot
+	// in each result proves.
+	it("pins an operator override and re-roots a default agent dir, without touching this worker", async () => {
+		// Both lanes and the isolation check run in one ordered test so the parent
+		// agent directory is observed directly before and after the probes.
+		// `getConfigRootDir()` cannot stand in for that: it is home-derived and
+		// stays correct even when `#agentDirOverride` is latched, so it would pass
+		// against exactly the defect this is meant to rule out.
+		const parentAgentDirBefore = getAgentDir();
+
+		// Lane 1: `GJC_CODING_AGENT_DIR` is an explicit operator selection, not a
+		// home-derived path. Re-deriving the home must not drag it around.
+		const override = await tempDir();
+		const overrideSecondHome = await tempDir();
+		const pinned = await probe({ agentDirOverride: override, secondHome: overrideSecondHome });
+
+		expect(pinned.overrideDeclared).toBe(override);
+		expect(pinned.before.agentDir).toBe(override);
+		// The home moved, so config root follows; the operator's agent dir does not.
+		expect(pinned.after.trustedHome).toBe(overrideSecondHome);
+		expect(pinned.after.configRoot).toBe(path.join(overrideSecondHome, CONFIG_DIR_NAME));
+		expect(pinned.after.agentDir).toBe(override);
+		expect(pinned.after.agentDb).toBe(pinned.before.agentDb);
+
+		// Lane 2: without an override the agent dir is home-derived, so user-scope
+		// skills (`<agentDir>/skills`) and MCP (`<agentDir>/mcp.json`) must follow
+		// the resolved home. This is the discovery path that regressed.
+		const firstHome = await tempDir();
+		const secondHome = await tempDir();
+		const rerooted = await probe({ agentDirOverride: null, secondHome, home: firstHome });
+
+		expect(rerooted.overrideDeclared).toBeNull();
+		expect(rerooted.before.trustedHome).toBe(firstHome);
+		expect(rerooted.before.agentDir).toBe(path.join(firstHome, CONFIG_DIR_NAME, "agent"));
+		expect(rerooted.after.trustedHome).toBe(secondHome);
+		expect(rerooted.after.agentDir).toBe(path.join(secondHome, CONFIG_DIR_NAME, "agent"));
+		expect(rerooted.after.configRoot).toBe(path.join(secondHome, CONFIG_DIR_NAME));
+
+		// Isolation: neither child mutated this worker's resolver. Asserting the
+		// agent directory itself is what proves no override was latched here.
+		expect(getAgentDir()).toBe(parentAgentDirBefore);
+		const ambient = getTrustedHomeDir();
+		expect(getConfigRootDir()).toBe(path.join(ambient, CONFIG_DIR_NAME));
+	});
+
+	it("keeps an operator override on its storage lane when it equals the new default path", async () => {
+		// An explicit `GJC_CODING_AGENT_DIR` that happens to equal
+		// `<newHome>/.gjc/agent` must not start following `$XDG_DATA_HOME` after a
+		// home refresh: the agent dir would look unchanged while `agent.db` silently
+		// moved to `$XDG_DATA_HOME/gjc/agent.db`. Only a genuinely default agent dir
+		// may follow XDG.
+		const firstHome = await tempDir();
+		const secondHome = await tempDir();
+		const xdgDataHome = await tempDir();
+		await fs.mkdir(path.join(xdgDataHome, "gjc"), { recursive: true });
+		// The override is exactly the default path under the *second* home.
+		const override = path.join(secondHome, CONFIG_DIR_NAME, "agent");
+		await fs.mkdir(override, { recursive: true });
+
+		const probed = await probe({ agentDirOverride: override, secondHome, home: firstHome, xdgDataHome });
+
+		// At startup, before any home refresh: the constructor must decide XDG
+		// eligibility from the override state, not from path equality. Asserting
+		// only the post-refresh lane leaves the constructor free to route an
+		// operator-selected agent dir into `$XDG_DATA_HOME` on first resolution.
+		expect(probed.before.agentDir).toBe(override);
+		expect(probed.before.agentDb).toBe(path.join(override, "agent.db"));
+		expect(probed.before.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
+
+		expect(probed.after.agentDir).toBe(override);
+		expect(probed.after.agentDb).toBe(path.join(override, "agent.db"));
+		expect(probed.after.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
+	});
+
+	it("keeps an agent directory on one storage lane across a home refresh", async () => {
+		// Naming the default profile explicitly IS the default profile, XDG included
+		// (pinned by dirs-python-gateway.test.ts). What must never happen is a lane
+		// change: an agent directory that was not XDG-eligible at construction must
+		// not become eligible because a home refresh made its path coincide with the
+		// new default. `getAgentDir()` would look unchanged while `agent.db` moved
+		// into `$XDG_DATA_HOME/gjc`.
+		const firstHome = await tempDir();
+		const secondHome = await tempDir();
+		const xdgDataHome = await tempDir();
+		await fs.mkdir(path.join(xdgDataHome, "gjc"), { recursive: true });
+		// Not the default under the startup home, but exactly the default under the
+		// home the resolver refreshes to.
+		const override = path.join(secondHome, CONFIG_DIR_NAME, "agent");
+		await fs.mkdir(override, { recursive: true });
+
+		const probed = await probe({ agentDirOverride: override, secondHome, home: firstHome, xdgDataHome });
+
+		expect(probed.before.agentDir).toBe(override);
+		expect(probed.before.agentDb).toBe(path.join(override, "agent.db"));
+		// After the refresh the path now equals `<secondHome>/.gjc/agent`, so a
+		// path-shape recomputation would flip it onto the XDG lane.
+		expect(probed.after.agentDir).toBe(override);
+		expect(probed.after.agentDb).toBe(probed.before.agentDb);
+		expect(probed.after.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
+	});
+
+	it("honors an explicit non-authoritative home for plugins without moving the resolver", async () => {
+		// `getPluginsDir(home)` is the documented escape hatch for callers that
+		// carry their own home. It must not disturb the authoritative resolution.
+		const planted = await tempDir();
+		vi.spyOn(os, "homedir").mockReturnValue(planted);
+		const explicit = await tempDir();
+
+		expect(getPluginsDir(explicit)).toBe(path.join(explicit, CONFIG_DIR_NAME, "plugins"));
+		// Passing the authoritative home is identical to the no-arg form.
+		expect(getPluginsDir(planted)).toBe(getPluginsDir());
+		expect(getTrustedHomeDir()).toBe(planted);
+	});
+
+	it("never treats the project directory as the home", async () => {
+		// Project scope (`<cwd>/.gjc`) and user scope (`<home>/.gjc`) must stay
+		// distinct: collapsing them is what makes a checkout's `.gjc` readable as
+		// trusted user state.
+		const planted = await tempDir();
+		vi.spyOn(os, "homedir").mockReturnValue(planted);
+		expect(getConfigRootDir()).not.toBe(path.join(process.cwd(), CONFIG_DIR_NAME));
+		expect(getTrustedHomeDir()).not.toBe(process.cwd());
+	});
+});
