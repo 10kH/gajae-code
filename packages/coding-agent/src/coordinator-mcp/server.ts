@@ -2566,6 +2566,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 	eventWebhookConfigs.set(namespaceDir, eventWebhookConfig);
 	eventWebhookDeliveries.set(namespaceDir, services.eventWebhookDelivery ?? createDefaultEventWebhookDelivery());
+	const startupEventWebhookReplay = (async () => {
+		if (eventWebhookConfig === null) return;
+		try {
+			for (const event of await readCoordinatorEvents(namespaceDir)) enqueueEventWebhook(namespaceDir, event);
+			await awaitEventWebhookDeliveriesForTest(namespaceDir);
+		} catch (error) {
+			await appendEventWebhookDiagnostic(namespaceDir, "startup-replay", error);
+		}
+	})();
+	void startupEventWebhookReplay;
 	const startupCodexWakeReplay = (async () => {
 		try {
 			for (const handoff of await listCodexHandoffs(namespaceDir)) {

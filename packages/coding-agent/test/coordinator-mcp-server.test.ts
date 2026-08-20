@@ -3230,6 +3230,60 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(posts).toHaveLength(3);
 		expect(posts.every(post => post.token === null)).toBe(true);
 	});
+	it("replays committed journal rows after restart and repairs an interrupted outbox publication", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const firstPosts: string[] = [];
+		const webhookEnv = { GJC_COORDINATOR_MCP_EVENT_WEBHOOK_URL: "https://sink.example.test/hook" };
+		const firstServer = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			eventWebhookEnv: webhookEnv,
+			eventWebhookDelivery: {
+				post: async body => {
+					firstPosts.push(body);
+					return { ok: true, status: 200, error: null };
+				},
+				sleep: async () => {},
+				now: () => Date.now(),
+			},
+		});
+		await registerSdkSession(firstServer, root);
+		await firstServer.callTool("gjc_coordinator_report_status", {
+			session_id: "visible-session",
+			status: "blocked",
+			summary: "Committed before restart.",
+			idempotency_key: "report-webhook-restart-1",
+			allow_mutation: true,
+		});
+		const namespace = path.join(root, ".gjc", "coordinator-state", "local", "repo");
+		await awaitEventWebhookDeliveriesForTest(namespace);
+		const journalRows = (await firstServer.callTool("gjc_coordinator_watch_events", { after_seq: 0 }))
+			.events as Array<Record<string, unknown>>;
+		const outboxDir = path.join(namespace, "webhook-outbox");
+		const firstEventId = String(journalRows[0]!.id);
+		await fs.rm(outboxDir, { recursive: true, force: true });
+		await fs.mkdir(outboxDir, { recursive: true });
+		await fs.writeFile(path.join(outboxDir, `${firstEventId}.json`), '{"schema_version":1', "utf8");
+
+		const replayedPosts: string[] = [];
+		await createSdkControlServer(root, [], [], undefined, undefined, undefined, undefined, {
+			eventWebhookEnv: webhookEnv,
+			eventWebhookDelivery: {
+				post: async body => {
+					replayedPosts.push(body);
+					return { ok: true, status: 200, error: null };
+				},
+				sleep: async () => {},
+				now: () => Date.now(),
+			},
+		});
+		await awaitEventWebhookDeliveriesForTest(namespace);
+
+		expect(replayedPosts.map(body => JSON.parse(body).id)).toEqual(journalRows.map(row => row.id));
+		expect(JSON.parse(await fs.readFile(path.join(outboxDir, `${firstEventId}.json`), "utf8"))).toMatchObject({
+			event_id: firstEventId,
+			status: "delivered",
+		});
+	});
 	it("posts nothing to any webhook when no webhook is configured", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
