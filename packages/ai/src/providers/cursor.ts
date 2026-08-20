@@ -32,6 +32,24 @@ import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import { CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import { CURSOR_CLIENT_VERSION } from "./cursor/client-version";
+import {
+	buildPiBashError,
+	buildPiBashResult,
+	buildPiEditError,
+	buildPiEditRejected,
+	buildPiEditResult,
+	buildPiFindError,
+	buildPiFindResult,
+	buildPiGrepError,
+	buildPiGrepResult,
+	buildPiLsError,
+	buildPiLsResult,
+	buildPiReadError,
+	buildPiReadResult,
+	buildPiWriteError,
+	buildPiWriteRejected,
+	buildPiWriteResult,
+} from "./cursor/exec-modern";
 import type { McpToolDefinition } from "./cursor/gen/agent_pb";
 import {
 	AgentClientMessageSchema,
@@ -1224,6 +1242,97 @@ async function handleExecServerMessage(
 			sendExecClientMessage(h2Request, execMsg, "computerUseResult", execResult);
 			return;
 		}
+		case "piReadArgs": {
+			const call = { args: execMsg.message.value, toolCallId: crypto.randomUUID() };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piRead?.bind(execHandlers),
+				onToolResult,
+				buildPiReadResult,
+				buildPiReadError,
+				buildPiReadError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piReadResult", execResult);
+			return;
+		}
+		case "piBashArgs": {
+			const call = { args: execMsg.message.value, toolCallId: crypto.randomUUID() };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piBash?.bind(execHandlers),
+				onToolResult,
+				buildPiBashResult,
+				buildPiBashError,
+				buildPiBashError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piBashResult", execResult);
+			return;
+		}
+		case "piEditArgs": {
+			const call = { args: execMsg.message.value, toolCallId: crypto.randomUUID() };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piEdit?.bind(execHandlers),
+				onToolResult,
+				buildPiEditResult,
+				buildPiEditRejected,
+				buildPiEditError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piEditResult", execResult);
+			return;
+		}
+		case "piWriteArgs": {
+			const call = { args: execMsg.message.value, toolCallId: crypto.randomUUID() };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piWrite?.bind(execHandlers),
+				onToolResult,
+				buildPiWriteResult,
+				buildPiWriteRejected,
+				buildPiWriteError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piWriteResult", execResult);
+			return;
+		}
+		case "piGrepArgs": {
+			const call = { args: execMsg.message.value, toolCallId: crypto.randomUUID() };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piGrep?.bind(execHandlers),
+				onToolResult,
+				buildPiGrepResult,
+				buildPiGrepError,
+				buildPiGrepError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piGrepResult", execResult);
+			return;
+		}
+		case "piFindArgs": {
+			const call = { args: execMsg.message.value, toolCallId: crypto.randomUUID() };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piFind?.bind(execHandlers),
+				onToolResult,
+				buildPiFindResult,
+				buildPiFindError,
+				buildPiFindError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piFindResult", execResult);
+			return;
+		}
+		case "piLsArgs": {
+			const call = { args: execMsg.message.value, toolCallId: crypto.randomUUID() };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piLs?.bind(execHandlers),
+				onToolResult,
+				buildPiLsResult,
+				buildPiLsError,
+				buildPiLsError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piLsResult", execResult);
+			return;
+		}
 		default: {
 			log("warn", "unhandledExecMessage", { execCase });
 			// Send a bare ExecClientMessage (id + execId only, no typed result) so the
@@ -1240,19 +1349,16 @@ async function handleExecServerMessage(
 	}
 }
 
-function sendExecClientMessage<T>(
+function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["message"]["case"]>>(
 	h2Request: http2.ClientHttp2Stream,
 	execMsg: ExecServerMessage,
-	messageCase: ExecClientMessage["message"]["case"],
-	value: T,
+	messageCase: TCase,
+	value: Extract<ExecClientMessage["message"], { case: TCase }>["value"],
 ): void {
 	const execClientMessage = create(ExecClientMessageSchema, {
 		id: execMsg.id,
 		execId: execMsg.execId,
-		message: {
-			case: messageCase,
-			value: value as any,
-		},
+		message: { case: messageCase, value } as ExecClientMessage["message"],
 	});
 
 	const clientMessage = create(AgentClientMessageSchema, {

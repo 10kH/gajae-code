@@ -13,6 +13,20 @@ import type {
 	LsArgs,
 	LsResult,
 	McpResult,
+	PiBashExecArgs,
+	PiBashExecResult,
+	PiEditExecArgs,
+	PiEditExecResult,
+	PiFindExecArgs,
+	PiFindExecResult,
+	PiGrepExecArgs,
+	PiGrepExecResult,
+	PiLsExecArgs,
+	PiLsExecResult,
+	PiReadExecArgs,
+	PiReadExecResult,
+	PiWriteExecArgs,
+	PiWriteExecResult,
 	ReadArgs,
 	ReadResult,
 	ShellArgs,
@@ -796,6 +810,11 @@ export interface CursorShellStreamCallbacks {
 	onStderr(data: string): void;
 }
 
+export interface CursorPiCall<TArgs> {
+	args: TArgs;
+	toolCallId: string;
+}
+
 export interface CursorExecHandlers {
 	read?: (args: ReadArgs) => Promise<CursorExecHandlerResult<ReadResult>>;
 	ls?: (args: LsArgs) => Promise<CursorExecHandlerResult<LsResult>>;
@@ -809,6 +828,13 @@ export interface CursorExecHandlers {
 	) => Promise<CursorExecHandlerResult<ShellResult>>;
 	diagnostics?: (args: DiagnosticsArgs) => Promise<CursorExecHandlerResult<DiagnosticsResult>>;
 	mcp?: (call: CursorMcpCall) => Promise<CursorExecHandlerResult<McpResult>>;
+	piRead?: (call: CursorPiCall<PiReadExecArgs>) => Promise<CursorExecHandlerResult<PiReadExecResult>>;
+	piBash?: (call: CursorPiCall<PiBashExecArgs>) => Promise<CursorExecHandlerResult<PiBashExecResult>>;
+	piEdit?: (call: CursorPiCall<PiEditExecArgs>) => Promise<CursorExecHandlerResult<PiEditExecResult>>;
+	piWrite?: (call: CursorPiCall<PiWriteExecArgs>) => Promise<CursorExecHandlerResult<PiWriteExecResult>>;
+	piGrep?: (call: CursorPiCall<PiGrepExecArgs>) => Promise<CursorExecHandlerResult<PiGrepExecResult>>;
+	piFind?: (call: CursorPiCall<PiFindExecArgs>) => Promise<CursorExecHandlerResult<PiFindExecResult>>;
+	piLs?: (call: CursorPiCall<PiLsExecArgs>) => Promise<CursorExecHandlerResult<PiLsExecResult>>;
 	onToolResult?: CursorToolResultHandler;
 }
 

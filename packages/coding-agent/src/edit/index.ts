@@ -337,7 +337,10 @@ export class EditTool implements AgentTool<TInput> {
 	readonly #vimTool: VimTool;
 	readonly #pendingDeferredFetches = new Map<string, AbortController>();
 
-	constructor(private readonly session: ToolSession) {
+	constructor(
+		private readonly session: ToolSession,
+		private readonly modeOverride?: EditMode,
+	) {
 		const { PI_EDIT_FUZZY: editFuzzy = "auto", PI_EDIT_FUZZY_THRESHOLD: editFuzzyThreshold = "auto" } = Bun.env;
 
 		// Fail fast on an invalid forced env variant; the shared resolver owns
@@ -350,7 +353,7 @@ export class EditTool implements AgentTool<TInput> {
 	}
 
 	get mode(): EditMode {
-		return resolveEditMode(this.session);
+		return this.modeOverride ?? resolveEditMode(this.session);
 	}
 
 	get description(): string {

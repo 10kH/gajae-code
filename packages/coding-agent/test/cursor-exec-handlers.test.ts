@@ -15,6 +15,10 @@ import {
 	DiagnosticsArgsSchema,
 	GrepArgsSchema,
 	LsArgsSchema,
+	PiEditExecArgsSchema,
+	PiEditReplacementSchema,
+	PiReadExecArgsSchema,
+	PiWriteExecArgsSchema,
 	ReadArgsSchema,
 	ShellArgsSchema,
 	WriteArgsSchema,
@@ -71,6 +75,89 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 			expect(result.role).toBe("toolResult");
 			expect(result.isError).toBeFalsy();
 		}
+	});
+});
+
+describe("CursorExecHandlers modern Pi writes", () => {
+	it("routes pi_edit through the dedicated replace-mode tool", async () => {
+		const calls: Array<Record<string, unknown>> = [];
+		const editTool = {
+			...makeTool("edit"),
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				calls.push(args);
+				return { content: [{ type: "text" as const, text: "edited" }], details: { diff: "-old\n+new" } };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map(),
+			getEditReplaceTool: () => editTool,
+		} as never);
+
+		const result = await handlers.piEdit({
+			toolCallId: "edit-1",
+			args: create(PiEditExecArgsSchema, {
+				path: "src/a.ts",
+				edits: [
+					create(PiEditReplacementSchema, { oldText: "old", newText: "new" }),
+					create(PiEditReplacementSchema, { oldText: "before", newText: "after" }),
+				],
+			}),
+		});
+
+		expect(calls).toEqual([
+			{
+				path: "src/a.ts",
+				edits: [
+					{ old_text: "old", new_text: "new" },
+					{ old_text: "before", new_text: "after" },
+				],
+			},
+		]);
+		expect(result.toolName).toBe("edit");
+		expect(result.isError).toBe(false);
+	});
+
+	it("routes pi_write content without changing it", async () => {
+		const calls: Array<Record<string, unknown>> = [];
+		const writeTool = {
+			...makeTool("write"),
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				calls.push(args);
+				return { content: [{ type: "text" as const, text: "written" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map([["write", writeTool]]),
+		} as never);
+
+		await handlers.piWrite({
+			toolCallId: "write-1",
+			args: create(PiWriteExecArgsSchema, { path: "src/new.ts", content: "export {};\n" }),
+		});
+		expect(calls).toEqual([{ path: "src/new.ts", content: "export {};\n" }]);
+	});
+
+	it("maps pi_read offset and limit to an exact raw selector", async () => {
+		const calls: Array<Record<string, unknown>> = [];
+		const readTool = {
+			...makeTool("read"),
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				calls.push(args);
+				return { content: [{ type: "text" as const, text: "lines" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map([["read", readTool]]),
+		} as never);
+
+		await handlers.piRead({
+			toolCallId: "read-1",
+			args: create(PiReadExecArgsSchema, { path: "src/a.ts", offset: 5, limit: 3 }),
+		});
+		expect(calls).toEqual([{ path: "src/a.ts:raw:5+3" }]);
 	});
 });
 

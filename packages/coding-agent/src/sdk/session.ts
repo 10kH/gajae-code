@@ -64,6 +64,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
+import { EditTool } from "../edit";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
@@ -2977,9 +2978,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 
 		let cursorEventEmitter: ((event: AgentEvent) => void) | undefined;
+		const rawCursorReplaceEditTool = toolRegistry.has("edit") ? new EditTool(toolSession, "replace") : undefined;
+		const cursorReplaceEditTool: AgentTool | undefined = rawCursorReplaceEditTool
+			? extensionRunner
+				? (new ExtensionToolWrapper(rawCursorReplaceEditTool, extensionRunner) as AgentTool)
+				: (rawCursorReplaceEditTool as AgentTool)
+			: undefined;
 		const cursorExecHandlers = new CursorExecHandlers({
 			cwd,
 			tools: toolRegistry,
+			getEditReplaceTool: () => cursorReplaceEditTool,
 			getToolContext: () => toolContextStore.getContext(),
 			emitEvent: event => cursorEventEmitter?.(event),
 			createEventEmitter: () => agent.createExternalEventEmitterForCurrentRun(),
