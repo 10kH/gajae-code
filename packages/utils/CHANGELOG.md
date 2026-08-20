@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Project dotenv declarations are now excluded from credential and agent-directory provenance even when Bun expands their values before startup, preventing repository-controlled redirects of trusted state and egress (#4715).
 
 ### Fixed
 - `postmortem.test.ts` no longer writes its crash fixtures into the developer's real crash store. Every scenario there deliberately crashes a subprocess, and the fatal handler resolved `getCrashLogPath()` with no override, so each run injected a dozen `fixture: ...` signatures into `~/.gjc/agent/gjc-crash.log` -- visible in `gjc crash list`, offered up by `gjc crash report`, eligible for the opt-in upstream relay, and competing for the log's fixed byte cap against a genuine crash the developer might need to file. The spawned fixtures now run under a temp `GJC_CODING_AGENT_DIR`, and the tests assert the fixture store received the records and the real store was untouched.
