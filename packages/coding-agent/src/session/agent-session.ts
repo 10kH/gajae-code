@@ -18242,6 +18242,7 @@ export class AgentSession {
 		}
 		const firstEventTimeout = classification === "first_event_timeout";
 		const emptyResponse = classification === "empty_response";
+		const canReplayProviderOverload = isBareDefaultCodexOverload(message) || isBareDefaultAnthropicOverload(message);
 		const reportedRetryMaxAttempts = transportFailure?.retryMaxAttempts;
 		if (reportedRetryMaxAttempts !== undefined) {
 			this.#providerRetryMaxAttempts = Math.min(
@@ -18328,8 +18329,6 @@ export class AgentSession {
 		// transport facts, so replaying it cannot duplicate observable work.
 		const canReplayEmptyResponse = emptyResponse && (this.#retryAttempt === 0 || this.#hasCleanRetryReplaySafety);
 		if (!managedFallback && !legacyRetryConfigured && !canReplayRotatedCredential && !canReplayEmptyResponse) {
-			const canReplayProviderOverload =
-				isBareDefaultCodexOverload(message) || isBareDefaultAnthropicOverload(message);
 			if (
 				(!canReplayProviderOverload &&
 					!this.#isTypedFirstEventTimeout(message) &&
@@ -18337,10 +18336,7 @@ export class AgentSession {
 					(hasBareDefaultRetryDisqualifyingFacts(message) ||
 						(classification !== "transient" && classification !== "first_event_timeout") ||
 						!BARE_DEFAULT_WATCHDOG_ERROR.test(message.errorMessage ?? ""))) ||
-				(!canReplayProviderOverload &&
-					!firstEventTimeout &&
-					!messageOnlyWatchdogTimeout &&
-					!this.#hasCleanRetryReplaySafety)
+				(!firstEventTimeout && !messageOnlyWatchdogTimeout && !this.#hasCleanRetryReplaySafety)
 			) {
 				return false;
 			}
@@ -18348,6 +18344,7 @@ export class AgentSession {
 		const legacyUnbounded =
 			!managedFallback &&
 			classification === "transient" &&
+			!canReplayProviderOverload &&
 			!this.#isIdleStreamStallErrorMessage(message.errorMessage ?? "");
 
 		const failedSelector = managedFallback ? controller.currentSelector() : undefined;
