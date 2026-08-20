@@ -332,6 +332,223 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	}, 15_000);
 
+	/**
+	 * Session for abort-lifecycle ordering. The turn whose newest user message is
+	 * `BLOCKING_PROMPT` streams until aborted; any other turn terminates on its
+	 * own. Dispatch is keyed on message CONTENT rather than a call counter: the
+	 * provider dispatch for the aborted turn races the abort itself, so a counter
+	 * cannot reliably identify which turn a stream belongs to. `dispatched`
+	 * therefore doubles as the exact list of turns that actually reached the
+	 * provider, which is what "no successor started" has to assert.
+	 * `successorOutcome` selects whether a successor turn completes or errors.
+	 */
+	const BLOCKING_PROMPT = "First message";
+	async function createAbortLifecycleSession(
+		dbName: string,
+		successorOutcome: "complete" | "error" = "complete",
+	): Promise<{
+		agent: Agent;
+		dispatched: () => string[];
+		userTexts: () => string[];
+	}> {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		const dispatched: string[] = [];
+		const textOf = (message: Message | undefined): string =>
+			message && Array.isArray(message.content)
+				? message.content.map(part => (typeof part === "object" && part.type === "text" ? part.text : "")).join("")
+				: "";
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, context, options) => {
+				const text = textOf([...(context?.messages ?? [])].reverse().find(message => message.role === "user"));
+				dispatched.push(text);
+				const signal = options?.signal;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (text === BLOCKING_PROMPT) {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						const abortStream = () => {
+							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
+						};
+						if (signal?.aborted) abortStream();
+						else signal?.addEventListener("abort", abortStream, { once: true });
+						return;
+					}
+					const message = createAssistantMessage("successor ok");
+					stream.push({ type: "start", partial: message });
+					if (successorOutcome === "error") {
+						stream.push({ type: "error", reason: "error", error: createAssistantMessage("successor failed") });
+						return;
+					}
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir, dbName));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		return {
+			agent,
+			dispatched: () => [...dispatched],
+			userTexts: () => agent.state.messages.filter(message => message.role === "user").map(textOf),
+		};
+	}
+
+	/**
+	 * The #4753 overlapping-abort regression. Abort A installs the unwind, prompt P
+	 * is admitted and parks on it, then abort B shares that same physical unwind.
+	 * All three enter synchronously in one tick, so the interleaving is exact and
+	 * does not depend on timers. Before the abort-admission fence, B acknowledged
+	 * success and P then refreshed its generation and started a successor turn:
+	 * the user aborted twice and work began anyway.
+	 */
+	it("a second abort fences a prompt retained by the first abort's unwind (#4753 overlapping abort)", async () => {
+		const { dispatched, userTexts } = await createAbortLifecycleSession("testauth-overlap-abort.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+
+		const abortA = session.abort({ cause: "user_interrupt" });
+		const retained = session.sendUserMessage("retained prompt", { queuedAtDispatch: true });
+		const abortB = session.abort({ cause: "user_interrupt" });
+
+		// Both aborts acknowledge; abort stays terminal for the prompt between them.
+		await abortA;
+		await abortB;
+		await expect(retained).rejects.toMatchObject({ name: "PromptPreflightCancelledError" });
+
+		// No successor: the retained prompt never reached the provider and never
+		// entered the transcript.
+		await session.waitForIdle();
+		await Bun.sleep(50);
+		expect(dispatched()).not.toContain("retained prompt");
+		expect(userTexts()).not.toContain("retained prompt");
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(session.isStreaming).toBe(false);
+
+		await firstPrompt.catch(() => {});
+	}, 15_000);
+
+	it("a retained prompt survives a single abort and is delivered exactly once (#4753)", async () => {
+		const { dispatched, userTexts } = await createAbortLifecycleSession("testauth-retained-once.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+
+		const aborting = session.abort({ cause: "user_interrupt" });
+		let promoted = 0;
+		const retained = session.sendUserMessage("retained prompt", {
+			queuedAtDispatch: true,
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
+
+		await aborting;
+		await retained;
+		await session.waitForIdle();
+		await Bun.sleep(50);
+
+		// Delivered once, as exactly one successor turn that reached the provider once.
+		expect(userTexts().filter(text => text === "retained prompt")).toEqual(["retained prompt"]);
+		expect(dispatched().filter(text => text === "retained prompt")).toEqual(["retained prompt"]);
+		expect(promoted).toBe(1);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		await firstPrompt.catch(() => {});
+	}, 20_000);
+
+	it("queued steering is still resumed after an abort unwind (#4753)", async () => {
+		const { userTexts } = await createAbortLifecycleSession("testauth-abort-steering.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+
+		// Explicit steering is delivered into the aborted turn's queue, then the
+		// abort's user_interrupt resume path promotes it to its own turn.
+		await session.sendUserMessage("queued steer", { deliverAs: "steer" });
+		await session.abort({ cause: "user_interrupt" });
+		await firstPrompt.catch(() => {});
+		await waitFor(() => userTexts().includes("queued steer"), 5_000);
+		await session.waitForIdle();
+
+		expect(userTexts().filter(text => text === "queued steer")).toEqual(["queued steer"]);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	}, 20_000);
+
+	it("rapid repeated aborts all settle and leave the session idle (#4753)", async () => {
+		const { dispatched } = await createAbortLifecycleSession("testauth-rapid-abort.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+
+		// Four same-tick aborts share one physical unwind; each must still settle.
+		const aborts = [
+			session.abort({ cause: "user_interrupt" }),
+			session.abort({ cause: "user_interrupt" }),
+			session.abort({ cause: "user_interrupt" }),
+			session.abort({ cause: "user_interrupt" }),
+		];
+		for (const settled of await Promise.allSettled(aborts)) expect(settled.status).toBe("fulfilled");
+		// A later abort, after the shared unwind completed, is still terminal.
+		await session.abort({ cause: "user_interrupt" });
+
+		await session.waitForIdle();
+		expect(session.isStreaming).toBe(false);
+		// No turn other than the aborted one ever reached the provider.
+		expect(dispatched().filter(text => text !== BLOCKING_PROMPT)).toEqual([]);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		await firstPrompt.catch(() => {});
+	}, 15_000);
+
+	it("a prompt admitted after the abort settled runs to execution completion (#4753)", async () => {
+		const { dispatched, userTexts } = await createAbortLifecycleSession("testauth-post-abort.db");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+		await session.abort({ cause: "user_interrupt" });
+		await firstPrompt.catch(() => {});
+
+		// The fence is terminal only for prompts admitted BEFORE an abort; a prompt
+		// admitted after it settled runs a normal turn to completion.
+		await session.sendUserMessage("after abort settled");
+		await session.waitForIdle();
+
+		expect(userTexts()).toContain("after abort settled");
+		expect(dispatched().filter(text => text !== BLOCKING_PROMPT)).toEqual(["after abort settled"]);
+		expect(session.isStreaming).toBe(false);
+	}, 15_000);
+
+	it("a successor turn that errors leaves the session idle and abortable (#4753)", async () => {
+		const { dispatched, userTexts } = await createAbortLifecycleSession("testauth-successor-error.db", "error");
+
+		const firstPrompt = session.prompt(BLOCKING_PROMPT);
+		await waitFor(() => session.agent.state.isStreaming);
+		await session.abort({ cause: "user_interrupt" });
+		await firstPrompt.catch(() => {});
+
+		// The successor is admitted and started, then its execution fails.
+		await session.sendUserMessage("failing successor").catch(() => {});
+		await session.waitForIdle();
+
+		expect(userTexts()).toContain("failing successor");
+		expect(dispatched().filter(text => text !== BLOCKING_PROMPT)).toEqual(["failing successor"]);
+		expect(session.isStreaming).toBe(false);
+		// An execution error is not an abort: a later abort still settles cleanly.
+		await session.abort({ cause: "user_interrupt" });
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+	}, 15_000);
+
 	it("sendUserMessage rejects absent content with a typed invalid_input error without crashing", async () => {
 		await createSession();
 

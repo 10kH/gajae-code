@@ -2464,6 +2464,15 @@ export class AgentSession {
 	/** In-flight `abort()` unwind. Fresh prompts wait so they cannot steer into the dying turn. */
 	#abortUnwind: Promise<void> | undefined;
 	#abortEpoch = 0;
+	/**
+	 * Monotonic count of ADMITTED abort requests, advanced synchronously on every
+	 * `#abortWithOutcome` entry — including an abort that shares an already
+	 * in-flight unwind rather than starting its own. A prompt that waits for an
+	 * unwind captures this value and refuses to resume if it advanced while it
+	 * waited: abort is terminal, so work admitted before the user's latest abort
+	 * must never start just because the physical unwind was shared.
+	 */
+	#abortAdmissionEpoch = 0;
 	/** Monotonic counter for `enqueueCustomMessageDisplay` tag generation;
 	 *  combined with `Date.now()` so tags stay unique even across rapid
 	 *  same-tick enqueues. */
@@ -2885,6 +2894,27 @@ export class AgentSession {
 
 	#isPromptPreflightCancelled(generation: number, signal: AbortSignal): boolean {
 		return signal.aborted || this.#promptGeneration !== generation;
+	}
+
+	/**
+	 * Wait for the in-flight abort unwind, then prove no LATER abort was admitted
+	 * while waiting. Overlapping aborts share one physical unwind, so awaiting
+	 * `#abortUnwind` alone cannot distinguish "the abort I raced" from "a second
+	 * abort the user issued after me". Returns false when the caller must not
+	 * resume; the caller then rejects as a cancelled preflight rather than
+	 * starting a successor the user already aborted.
+	 *
+	 * Loops because an abort admitted during the wait can install its own unwind:
+	 * the fence only opens once no unwind is in flight and the admission epoch has
+	 * stopped advancing.
+	 */
+	async #awaitAbortUnwindFence(): Promise<boolean> {
+		const admissionEpoch = this.#abortAdmissionEpoch;
+		while (this.#abortUnwind !== undefined) {
+			await this.#abortUnwind;
+			if (this.#abortAdmissionEpoch !== admissionEpoch) return false;
+		}
+		return this.#abortAdmissionEpoch === admissionEpoch;
 	}
 
 	#throwIfPromptPreflightCancelled(generation: number, signal: AbortSignal): void {
@@ -9906,7 +9936,10 @@ export class AgentSession {
 		}
 		let waitedForAbortUnwind = false;
 		if (this.#abortUnwind) {
-			await this.#abortUnwind;
+			// A LATER abort admitted while this prompt waited keeps abort terminal:
+			// the successor is refused instead of refreshing its generation and
+			// starting work the user already aborted twice.
+			if (!(await this.#awaitAbortUnwindFence())) throw promptPreflightCancelledError();
 			admissionGeneration = this.#promptGeneration;
 			admissionSignal = options?.preflightSignal
 				? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
@@ -11486,7 +11519,9 @@ export class AgentSession {
 		let preflightCancellationGeneration = this.#promptPreflightCancellationGeneration;
 		let waitedForAbortUnwind = false;
 		if (this.#abortUnwind && options?.deliverAs === undefined) {
-			await this.#abortUnwind;
+			// Same terminal-abort fence as `prompt()`: an overlapping second abort
+			// refuses this retained submission instead of letting it start late.
+			if (!(await this.#awaitAbortUnwindFence())) throw promptPreflightCancelledError();
 			preflightCancellationGeneration = this.#promptPreflightCancellationGeneration;
 			admissionSignal = options?.preflightSignal
 				? AbortSignal.any([this.#promptPreflightAbortController.signal, options.preflightSignal])
@@ -12055,7 +12090,24 @@ export class AgentSession {
 			| "internal";
 		silent?: boolean;
 	}): Promise<AbortOutcome> {
+		// Advance the admission epoch SYNCHRONOUSLY, before any await and before the
+		// shared-unwind branch. A second abort that piggybacks on the first unwind
+		// still creates a cancellation fence, so a prompt admitted between the two
+		// aborts is refused rather than started after the shared unwind resolves.
+		this.#abortAdmissionEpoch++;
 		if (this.#abortUnwind) {
+			// The shared unwind already ran `#abortOptions` for the FIRST abort, so this
+			// abort must still apply the effects that are specific to its own request.
+			//
+			// Cancellation fence: a prompt admitted before this abort keeps a live
+			// generation and preflight signal otherwise, and would start after the
+			// shared unwind resolves — work the user has already aborted twice.
+			this.#promptPreflightCancellationGeneration++;
+			this.#promptPreflightAbortController.abort();
+			this.#promptPreflightAbortController = new AbortController();
+			// Abort visibility is per-request: a later real abort must not inherit an
+			// earlier silent abort's suppression and swallow the user-visible notice.
+			if (options?.silent !== true) this.#silentAbortPending = false;
 			await this.#abortUnwind;
 			return { kind: "settled" };
 		}
