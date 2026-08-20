@@ -24,8 +24,15 @@ const DIRS = path.join(import.meta.dir, "..", "src", "dirs.ts");
 /** Patched copies of `dirs.ts`; they must sit beside the original so its relative imports resolve. */
 const scratch: string[] = [];
 
+/** A temporary directory, created portably and removed after the test. */
+async function tempDir(): Promise<string> {
+	const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-account-home-"));
+	scratch.push(dir);
+	return dir;
+}
+
 afterEach(async () => {
-	await Promise.all(scratch.splice(0).map(file => fs.rm(file, { force: true })));
+	await Promise.all(scratch.splice(0).map(entry => fs.rm(entry, { recursive: true, force: true })));
 });
 
 /** Resolve the trusted home in a child process under a controlled environment. */
@@ -82,13 +89,13 @@ describe("account home is resolved through the OS account database", () => {
 		const account = await nssHome();
 		if (!account) return;
 
-		const hostile = await Bun.$`mktemp -d`.text().then(out => out.trim());
+		const hostile = await tempDir();
 		try {
 			// POSIX HOME absent and a hostile USERPROFILE present: the non-authoritative
 			// variable must never select the home on Linux.
 			expect(await resolveWith({ HOME: undefined, USERPROFILE: hostile })).toBe(account);
 		} finally {
-			await Bun.$`rm -rf ${hostile}`.quiet();
+			await fs.rm(hostile, { recursive: true, force: true });
 		}
 	});
 
@@ -104,8 +111,8 @@ describe("account home is resolved through the OS account database", () => {
 		//
 		// A dynamic dotenv declaration keeps `ambiguousHome` true throughout, so the
 		// resolver must fail closed both before and after the home moves.
-		const attacker = (await Bun.$`mktemp -d`.text()).trim();
-		const project = (await Bun.$`mktemp -d`.text()).trim();
+		const attacker = await tempDir();
+		const project = await tempDir();
 		try {
 			await Bun.write(path.join(project, ".env"), "HOME=$GJC_TEST_EVIL\n");
 			// Point the resolver's own NSS lookup at a command that cannot exist, so
@@ -154,7 +161,7 @@ describe("account home is resolved through the OS account database", () => {
 			expect(first).toBe("REFUSED");
 			expect(second).toBe("REFUSED");
 		} finally {
-			await Bun.$`rm -rf ${attacker} ${project}`.quiet();
+			await Promise.all([attacker, project].map(dir => fs.rm(dir, { recursive: true, force: true })));
 		}
 	});
 
@@ -164,7 +171,7 @@ describe("account home is resolved through the OS account database", () => {
 		// outright when the executable is missing rather than returning a non-zero
 		// exit. The failure is injected into the resolver's own lookup so this
 		// exercises the real fallback path instead of simulating it alongside.
-		const work = (await Bun.$`mktemp -d`.text()).trim();
+		const work = await tempDir();
 		try {
 			const source = await Bun.file(DIRS).text();
 			const broken = source.replace('cmd: ["getent", "passwd", String(uid)],', 'cmd: ["gjc-no-such-nss-binary"],');
@@ -181,7 +188,7 @@ describe("account home is resolved through the OS account database", () => {
 
 			// An honest operator home with no dotenv declaration: the lookup failure
 			// must degrade to the runtime home, not take the process down.
-			const home = (await Bun.$`mktemp -d`.text()).trim();
+			const home = await tempDir();
 			const env: Record<string, string> = {};
 			for (const [key, value] of Object.entries(process.env)) {
 				if (value !== undefined) env[key] = value;
@@ -196,9 +203,9 @@ describe("account home is resolved through the OS account database", () => {
 			const resolved = stdout.trim().split("\n").at(-1) ?? "";
 			expect(resolved).toBe(home);
 			expect(path.isAbsolute(resolved)).toBe(true);
-			await Bun.$`rm -rf ${home}`.quiet();
+			await fs.rm(home, { recursive: true, force: true });
 		} finally {
-			await Bun.$`rm -rf ${work}`.quiet();
+			await fs.rm(work, { recursive: true, force: true });
 		}
 	});
 
@@ -213,13 +220,13 @@ describe("account home is resolved through the OS account database", () => {
 		// same path, that is corroboration, not the self-justifying echo the guard
 		// exists to catch. Refusing it locks a legitimate operator out of their own
 		// user state whenever their HOME agrees with their account entry.
-		const project = (await Bun.$`mktemp -d`.text()).trim();
+		const project = await tempDir();
 		try {
 			await Bun.write(path.join(project, ".env"), "HOME=$GJC_TEST_DYNAMIC\n");
 			const resolved = await resolveWith({ HOME: account, GJC_TEST_DYNAMIC: account }, project);
 			expect(resolved).toBe(account);
 		} finally {
-			await Bun.$`rm -rf ${project}`.quiet();
+			await fs.rm(project, { recursive: true, force: true });
 		}
 	});
 
@@ -227,18 +234,18 @@ describe("account home is resolved through the OS account database", () => {
 		// Provenance compares the declared dotenv value against the runtime home. If
 		// either side were canonicalized without the other, `HOME=/tmp/x/../y` would
 		// compare unequal to its own declaration and be honored as operator-supplied.
-		const base = (await Bun.$`mktemp -d`.text()).trim();
+		const base = await tempDir();
 		const real = path.join(base, "attacker");
 		const aliased = path.join(base, "decoy", "..", "attacker");
-		const project = (await Bun.$`mktemp -d`.text()).trim();
+		const project = await tempDir();
 		try {
-			await Bun.$`mkdir -p ${real} ${path.join(base, "decoy")}`.quiet();
+			await Promise.all([real, path.join(base, "decoy")].map(dir => fs.mkdir(dir, { recursive: true })));
 			await Bun.write(path.join(project, ".env"), `HOME=${aliased}\n`);
 			const resolved = await resolveWith({ HOME: aliased }, project);
 			expect(resolved).not.toBe(aliased);
 			expect(resolved).not.toBe(real);
 		} finally {
-			await Bun.$`rm -rf ${base} ${project}`.quiet();
+			await Promise.all([base, project].map(dir => fs.rm(dir, { recursive: true, force: true })));
 		}
 	});
 });
