@@ -32,3 +32,10 @@ Recorded under `artifacts/release-0.14.2/gate/`:
 ## v0.14.2-nightly tag disposition
 
 The pre-existing `v0.14.2-nightly.20260818150120.32217566985.gd49c40a6c3c0` tag points at the unpatched main tip. It does **not** block the exact stable `v0.14.2` tag (release tooling and CI treat suffix-bearing tags as non-stable). Decision: **leave it untouched** — do not move, retag, or delete; nightly-tag hygiene belongs to the nightly workflow owner, not this release.
+
+## Terminal-review dispositions
+
+Two behavioral findings from the terminal review concern code that is **byte-identical to `dev`** (zero diff). To preserve cherry-pick fidelity, they are accepted as upstream issues for `dev` follow-up rather than patched divergently in this release:
+
+- `packages/coding-agent/src/utils/herdr-pane.ts` (`persistSequenceFloor`/`nextSequence`): best-effort Herdr state reports perform synchronous fs calls (`readFileSync`/`mkdirSync`/`writeFileSync`/`renameSync`) that can block the event loop under slow or contended temp storage, contradicting the path's "never blocks" contract.
+- `packages/utils/src/postmortem.ts` (`handleFatalError`): `describeFatal(reason)` runs twice (once for the local snapshot, once inside `recordFatalCrash`), so a throwable with stateful or throwing getters can produce mismatched crash fingerprints between stderr and the persisted record.
