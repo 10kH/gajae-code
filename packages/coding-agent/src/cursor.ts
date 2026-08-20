@@ -41,6 +41,7 @@ interface CursorExecBridgeOptions {
 	cwd: string;
 	tools: Map<string, AgentTool>;
 	getEditReplaceTool?: () => AgentTool | undefined;
+	createSearchTool?: (options: { context?: number; totalMatchLimit?: number }) => AgentTool | undefined;
 	getToolContext?: () => AgentToolContext | undefined;
 	emitEvent?: CursorExecEventEmitter;
 	createEventEmitter?: () => ((event: AgentEvent) => void) | undefined;
@@ -119,6 +120,7 @@ async function executeTool(
 		result = buildToolErrorResult(message);
 		isError = true;
 	}
+	isError ||= result.isError === true;
 
 	const sanitizedFinalResult: AgentToolResult<unknown> = {
 		content: result.content.map(c => (c.type === "text" ? { ...c, text: sanitizeText(c.text) } : c)),
@@ -444,13 +446,17 @@ export class CursorExecHandlers implements ICursorExecHandlers {
 	}
 
 	async piGrep(call: Parameters<NonNullable<ICursorExecHandlers["piGrep"]>>[0]) {
-		const { pattern, path, glob, ignoreCase, literal, limit } = call.args;
-		return executeTool(this.#optionsForCall(), "search", call.toolCallId, {
+		const { pattern, path, glob, ignoreCase, literal, context, limit } = call.args;
+		const perCallSearch = this.options.createSearchTool?.({
+			context: context === undefined ? undefined : Math.max(0, Math.floor(context)),
+			totalMatchLimit: piLimit(limit),
+		});
+		const args: Record<string, unknown> = {
 			pattern: literal === true ? piEscapeRegexLiteral(pattern) : pattern,
 			paths: [glob ? piJoinPath(path, glob) : path || "."],
-			i: ignoreCase === true ? true : undefined,
-			limit: piLimit(limit),
-		});
+		};
+		if (ignoreCase === true) args.i = true;
+		return executeTool(this.#optionsForCall(), "search", call.toolCallId, args, perCallSearch);
 	}
 
 	async piFind(call: Parameters<NonNullable<ICursorExecHandlers["piFind"]>>[0]) {

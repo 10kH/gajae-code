@@ -159,6 +159,67 @@ describe("CursorExecHandlers modern Pi writes", () => {
 		});
 		expect(calls).toEqual([{ path: "src/a.ts:raw:5+3" }]);
 	});
+
+	it("propagates non-throwing edit failures", async () => {
+		const editTool = {
+			...makeTool("edit"),
+			execute: async () => ({
+				content: [{ type: "text" as const, text: "one replacement failed" }],
+				details: { diff: "-old\n+new" },
+				isError: true,
+			}),
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map(),
+			getEditReplaceTool: () => editTool,
+		} as never);
+
+		const result = await handlers.piEdit({
+			toolCallId: "edit-error",
+			args: create(PiEditExecArgsSchema, {
+				path: "src/a.ts",
+				edits: [create(PiEditReplacementSchema, { oldText: "old", newText: "new" })],
+			}),
+		});
+		expect(result.isError).toBe(true);
+	});
+
+	it("passes pi_grep constraints through a scoped tool, not strict-schema kwargs", async () => {
+		const calls: Array<Record<string, unknown>> = [];
+		const factoryOptions: Array<Record<string, unknown>> = [];
+		const searchTool = {
+			...makeTool("search"),
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				calls.push(args);
+				return { content: [{ type: "text" as const, text: "match" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map([["search", searchTool]]),
+			createSearchTool: (options: Record<string, unknown>) => {
+				factoryOptions.push(options);
+				return searchTool;
+			},
+		} as never);
+
+		await handlers.piGrep({
+			toolCallId: "grep-1",
+			args: {
+				$typeName: "agent.v1.PiGrepExecArgs",
+				pattern: "needle",
+				path: "src",
+				glob: "**/*.ts",
+				context: 3,
+				limit: 7,
+				ignoreCase: true,
+				literal: false,
+			},
+		});
+		expect(factoryOptions).toEqual([{ context: 3, totalMatchLimit: 7 }]);
+		expect(calls).toEqual([{ pattern: "needle", paths: ["src/**/*.ts"], i: true }]);
+	});
 });
 
 describe("CursorExecHandlers grep empty pattern guard (#501)", () => {

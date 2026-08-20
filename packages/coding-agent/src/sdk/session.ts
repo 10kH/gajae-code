@@ -66,6 +66,7 @@ import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
+import { SearchTool } from "../tools/search";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
@@ -2934,6 +2935,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolRegistry.set(tool.name, wrapped);
 			}
 		}
+		const cursorEditGranted = toolRegistry.has("edit");
+		const rawCursorReplaceEditTool = cursorEditGranted ? new EditTool(toolSession, "replace") : undefined;
+		const cursorReplaceEditTool: AgentTool | undefined = rawCursorReplaceEditTool
+			? extensionRunner
+				? (new ExtensionToolWrapper(rawCursorReplaceEditTool, extensionRunner) as AgentTool)
+				: (rawCursorReplaceEditTool as AgentTool)
+			: undefined;
 		if (model?.provider === "cursor") {
 			toolRegistry.delete("edit");
 			builtinCandidateTools = builtinCandidateTools.filter(tool => tool.name !== "edit");
@@ -2978,16 +2986,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		};
 
 		let cursorEventEmitter: ((event: AgentEvent) => void) | undefined;
-		const rawCursorReplaceEditTool = toolRegistry.has("edit") ? new EditTool(toolSession, "replace") : undefined;
-		const cursorReplaceEditTool: AgentTool | undefined = rawCursorReplaceEditTool
-			? extensionRunner
-				? (new ExtensionToolWrapper(rawCursorReplaceEditTool, extensionRunner) as AgentTool)
-				: (rawCursorReplaceEditTool as AgentTool)
-			: undefined;
 		const cursorExecHandlers = new CursorExecHandlers({
 			cwd,
 			tools: toolRegistry,
 			getEditReplaceTool: () => cursorReplaceEditTool,
+			createSearchTool: options => {
+				if (!toolRegistry.has("search")) return undefined;
+				const search = new SearchTool(toolSession, options);
+				return extensionRunner
+					? (new ExtensionToolWrapper(search as unknown as AgentTool, extensionRunner) as AgentTool)
+					: (search as unknown as AgentTool);
+			},
 			getToolContext: () => toolContextStore.getContext(),
 			emitEvent: event => cursorEventEmitter?.(event),
 			createEventEmitter: () => agent.createExternalEventEmitterForCurrentRun(),
