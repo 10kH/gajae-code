@@ -70,7 +70,12 @@ describe("fresh-process test harness contracts", () => {
 		const assignedShards = Array.from({ length: 8 }, (_, index) => index + 1).filter(shard =>
 			selectShard(files, { index: shard, total: 8 }).includes(regression),
 		);
-		expect(assignedShards).toEqual([8]);
+		expect(assignedShards).toHaveLength(1);
+		const regressionIndex = files.indexOf(regression);
+		expect(regressionIndex).toBeGreaterThanOrEqual(0);
+		const expectedShard = (regressionIndex % 8) + 1;
+		expect(assignedShards).toEqual([expectedShard]);
+		expect(selectShard(files, { index: expectedShard, total: 8 })).toContain(regression);
 	});
 
 	test("keeps Bun shard assignment deterministic", () => {
