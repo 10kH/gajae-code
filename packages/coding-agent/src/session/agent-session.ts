@@ -3102,6 +3102,41 @@ export class AgentSession {
 	#wakeScopedSettlementWaiters(): void {
 		for (const check of [...this.#scopedSettlementWaiters]) check();
 	}
+	#abortedTurnTerminalPending(): boolean {
+		return (
+			this.#promptInFlightCount > 0 ||
+			this.#agentEventHandlersInFlight > 0 ||
+			this.#pendingAgentEndEmit !== undefined ||
+			this.#agentEndPublicationInFlight > 0
+		);
+	}
+
+	/** Wait for the aborted turn's agent_end handler and publication, not just agent idle. */
+	async #awaitAbortedTurnTerminal(): Promise<void> {
+		await Promise.resolve();
+		await this.#agentEndHandlingPromise;
+		this.#flushPendingAgentEnd();
+		await this.#agentEndPublicationPromise;
+		while (this.#abortedTurnTerminalPending()) {
+			const wake = Promise.withResolvers<void>();
+			const check = () => {
+				if (!this.#abortedTurnTerminalPending()) wake.resolve();
+			};
+			this.#scopedSettlementWaiters.add(check);
+			check();
+			try {
+				const waiters: Array<Promise<void>> = [wake.promise];
+				if (this.#agentEventHandlersInFlight > 0) waiters.push(this.#agentEndHandlingPromise);
+				if (this.#agentEndPublicationInFlight > 0) waiters.push(this.#agentEndPublicationPromise);
+				await Promise.race(waiters);
+			} finally {
+				this.#scopedSettlementWaiters.delete(check);
+			}
+			this.#flushPendingAgentEnd();
+			await this.#agentEndHandlingPromise;
+			await this.#agentEndPublicationPromise;
+		}
+	}
 
 	/**
 	 * Wait for session settlement. `ignoreSelectionFenceGeneration` carries the
@@ -12067,8 +12102,7 @@ export class AgentSession {
 				if (managedLogicalRunId !== undefined)
 					this.agent.requestRunTerminal(managedLogicalRunId, { stopReason: "cancelled" });
 				this.#flushPendingBackgroundExchanges();
-				this.#flushPendingAgentEnd();
-				await this.#agentEndPublicationPromise;
+				await this.#awaitAbortedTurnTerminal();
 				if (
 					!this.#cancelAndSubmitInProgress &&
 					(options?.cause ?? "internal") === "user_interrupt" &&
