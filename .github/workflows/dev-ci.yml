@@ -417,6 +417,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           bun test ./packages/natives/test/windows-avx2-probe.windows.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          bun test ./packages/utils/test/env-provenance.windows.test.ts
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 
   windows-native-build-toolchain:
