@@ -607,12 +607,8 @@ describe("anthropic stream envelope handling", () => {
 		}
 		const result = await stream.result();
 
-		// The orphaned block keeps its streamed arguments and sheds internal
-		// stream-only fields; the replacement block owns subsequent deltas.
-		expect(result.content).toEqual([
-			{ type: "toolCall", id: "tool_orphaned", name: "bash", arguments: { command: "pwd" } },
-			{ type: "toolCall", id: "tool_replacement", name: "bash", arguments: { command: "ls" } },
-		]);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage ?? "").toMatch(/reused an active content block index/i);
 	});
 
 	it("round-trips OAuth tool prefixes without stripping original tool names that contain the prefix", () => {
@@ -1432,5 +1428,47 @@ describe("anthropic stream envelope handling", () => {
 		expect(proxiedControl).toEqual({ type: "ephemeral" });
 		// Non-Claude models on unknown compatible endpoints receive no generated caching.
 		expect(cacheControls[3]).toBeUndefined();
+	});
+	it("coerces a non-string thinking increment to an empty string instead of forwarding the live value", async () => {
+		const thinkingModel: Model<"anthropic-messages"> = {
+			...model,
+			id: "claude-sonnet-4-6",
+			thinking: { mode: "anthropic-adaptive", minLevel: Effort.Minimal, maxLevel: Effort.Max },
+		};
+		vi.spyOn(Messages.prototype, "create").mockImplementation(
+			() =>
+				createMockRequest([
+					{
+						type: "message_start",
+						message: { id: "msg_zai_thinking", usage: { input_tokens: 0, output_tokens: 0 } },
+					},
+					{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } },
+					{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: 1 } },
+					{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta" } },
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "thinking_delta", thinking: "later" },
+					},
+					{ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: 7 } },
+					{
+						type: "content_block_delta",
+						index: 0,
+						delta: { type: "signature_delta", signature: "sig_ok" },
+					},
+					{ type: "content_block_stop", index: 0 },
+					{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+					{ type: "message_stop" },
+				]) as never,
+		);
+
+		const stream = streamAnthropic(thinkingModel, context, { apiKey: "sk-ant-test", thinkingEnabled: true });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		const deltas = events.filter(event => event.type === "thinking_delta");
+		expect(deltas.map(event => event.delta)).toEqual(["", "", "later"]);
+		expect(result.content).toEqual([{ type: "thinking", thinking: "later", thinkingSignature: "sig_ok" }]);
 	});
 });

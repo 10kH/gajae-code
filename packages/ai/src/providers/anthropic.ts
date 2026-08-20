@@ -2023,7 +2023,21 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const blocks = output.content as Block[];
 			const blocksByAnthropicIndex = new Map<number, Block>();
 			const truncatedToolCalls = new Set<ToolCall>();
-			let sawTerminalStopReason = false;
+			// Bounded diagnostic for degraded primitive increments: at most one
+			// warning per delta type per stream invocation, naming only the
+			// envelope shape (delta type and received typeof) — never the payload.
+			const degradedIncrementDiagnostics = new Set<string>();
+			const noteDegradedIncrement = (deltaType: string, received: unknown): void => {
+				if (degradedIncrementDiagnostics.has(deltaType)) return;
+				degradedIncrementDiagnostics.add(deltaType);
+				logger.warn("anthropic: degraded non-string stream increment to empty string", {
+					model: model.id,
+					provider: model.provider,
+					deltaType,
+					receivedType: received === null ? "null" : typeof received,
+				});
+			};
+
 			// Derive from the ACTUAL request shape, not the option default: the request
 			// only sends `display: "summarized"` on specific paths (adaptive display is
 			// omitted for models where supportsAdaptiveThinkingDisplay is false). Defaulting
@@ -2037,25 +2051,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				return { block, contentIndex: blocks.indexOf(block) };
 			};
 			const trackBlockByAnthropicIndex = (anthropicIndex: number, block: Block) => {
-				// A duplicate start for an active index is a provider-envelope violation;
-				// finalize the orphaned block so no internal stream fields leak into output.
 				const orphaned = blocksByAnthropicIndex.get(anthropicIndex);
 				if (orphaned) {
-					if (orphaned.type === "toolCall") {
-						if (!isCompleteJson(orphaned.partialJson)) {
-							orphaned.incompleteArguments = true;
-							orphaned.incompleteArgumentsReason = "truncated";
-							truncatedToolCalls.add(orphaned);
-						}
-						if (orphaned.partialJson.trim()) {
-							orphaned.arguments = parseStreamingJson(orphaned.partialJson);
-							if (findUnnecessaryUnicodeEscape(orphaned.partialJson)) {
-								orphaned.escapedNonAsciiArguments = true;
-							}
-						}
-					}
-					delete (orphaned as { index?: number }).index;
-					delete (orphaned as { partialJson?: string }).partialJson;
+					throw new Error("Anthropic stream reused an active content block index");
 				}
 				blocksByAnthropicIndex.set(anthropicIndex, block);
 			};
@@ -2070,7 +2068,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				output.stopReason = "stop";
 				firstTokenTime = undefined;
 				truncatedToolCalls.clear();
-				sawTerminalStopReason = false;
 			};
 			const idleTimeoutMs =
 				options?.streamIdleTimeoutMs ??
@@ -2105,7 +2102,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				// Retries reset output.content; drop stale block correlations from the aborted attempt.
 				blocksByAnthropicIndex.clear();
 				truncatedToolCalls.clear();
-				sawTerminalStopReason = false;
 				activeAbortTracker = createAbortSourceTracker(options?.signal);
 				let firstEventTimeoutAbortError: FirstEventTimeoutError | undefined;
 				const idleTimeoutAbortError = new Error("Anthropic stream stalled while waiting for the next event");
@@ -2253,13 +2249,21 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								trackBlockByAnthropicIndex(event.index, block);
 							} else if (event.content_block.type === "tool_use") {
 								streamedReplayUnsafeContent = true;
+								const initialArguments: unknown = event.content_block.input;
+								if (
+									initialArguments === null ||
+									typeof initialArguments !== "object" ||
+									Array.isArray(initialArguments)
+								) {
+									throw new Error("Anthropic tool_use started with non-object arguments");
+								}
 								const block: Block = {
 									type: "toolCall",
 									id: event.content_block.id,
 									name: isOAuthToken
 										? stripClaudeToolPrefix(event.content_block.name)
 										: event.content_block.name,
-									arguments: (event.content_block.input as Record<string, unknown>) ?? {},
+									arguments: initialArguments as Record<string, unknown>,
 									partialJson: "",
 									index: event.index,
 								};
@@ -2275,32 +2279,42 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							if (event.delta.type === "text_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "text") {
-									block.text += event.delta.text;
+									const rawTextDelta: unknown = event.delta.text;
+									if (typeof rawTextDelta !== "string") {
+										noteDegradedIncrement("text_delta", rawTextDelta);
+									}
+									const textDelta = typeof rawTextDelta === "string" ? rawTextDelta : "";
+									block.text += textDelta;
 									stream.push({
 										type: "text_delta",
 										contentIndex: index,
-										delta: event.delta.text,
+										delta: textDelta,
 										partial: output,
 									});
 								}
 							} else if (event.delta.type === "thinking_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
-									block.thinking += event.delta.thinking;
+									const rawThinkingDelta: unknown = event.delta.thinking;
+									if (typeof rawThinkingDelta !== "string") {
+										noteDegradedIncrement("thinking_delta", rawThinkingDelta);
+									}
+									const thinkingDelta = typeof rawThinkingDelta === "string" ? rawThinkingDelta : "";
+									block.thinking += thinkingDelta;
 									if (summarizedThinking) {
-										const summary = (reasoningBuffers.get(block) ?? "") + event.delta.thinking;
+										const summary = (reasoningBuffers.get(block) ?? "") + thinkingDelta;
 										reasoningBuffers.set(block, summary);
 										stream.push({
 											type: "reasoning_summary_delta",
 											contentIndex: index,
-											delta: event.delta.thinking,
+											delta: thinkingDelta,
 											partial: output,
 										});
 									} else {
 										stream.push({
 											type: "thinking_delta",
 											contentIndex: index,
-											delta: event.delta.thinking,
+											delta: thinkingDelta,
 											partial: output,
 										});
 									}
@@ -2308,12 +2322,26 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							} else if (event.delta.type === "input_json_delta") {
 								const { block, contentIndex: index } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "toolCall") {
-									block.partialJson += event.delta.partial_json;
+									const rawJsonDelta: unknown = event.delta.partial_json;
+									if (typeof rawJsonDelta !== "string") {
+										// Tool-argument fragments are positional JSON text: erasing or
+										// coercing any malformed increment (primitive OR object/function)
+										// assembles valid-but-wrong arguments — e.g. `{"n":1` + numeric
+										// primitive erased to "" + `3}` parses as {"n":13} and executes.
+										// Prose/thinking/signature anomalies are safe to degrade; tool
+										// arguments fail the turn closed. The payload never enters the
+										// error.
+										throw new Error(
+											"Anthropic stream sent a non-string input_json_delta tool-argument increment; failing the turn instead of assembling wrong tool arguments",
+										);
+									}
+									const jsonDelta = rawJsonDelta;
+									block.partialJson += jsonDelta;
 									block.arguments = parseStreamingJson(block.partialJson);
 									stream.push({
 										type: "toolcall_delta",
 										contentIndex: index,
-										delta: event.delta.partial_json,
+										delta: jsonDelta,
 										partial: output,
 									});
 								}
@@ -2321,7 +2349,12 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								const { block } = getBlockByAnthropicIndex(event.index);
 								if (block && block.type === "thinking") {
 									block.thinkingSignature = block.thinkingSignature || "";
-									block.thinkingSignature += event.delta.signature;
+									const rawSignatureDelta: unknown = event.delta.signature;
+									if (typeof rawSignatureDelta === "string") {
+										block.thinkingSignature += rawSignatureDelta;
+									} else {
+										noteDegradedIncrement("signature_delta", rawSignatureDelta);
+									}
 								}
 							}
 						} else if (event.type === "content_block_stop") {
@@ -2361,7 +2394,15 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								} else if (block.type === "toolCall") {
 									if (!isCompleteJson(block.partialJson)) truncatedToolCalls.add(block);
 									if (block.partialJson.trim()) {
-										block.arguments = parseStreamingJson(block.partialJson);
+										const parsedArguments: unknown = parseStreamingJson(block.partialJson);
+										if (
+											parsedArguments === null ||
+											typeof parsedArguments !== "object" ||
+											Array.isArray(parsedArguments)
+										) {
+											throw new Error("Anthropic tool_use completed with non-object arguments");
+										}
+										block.arguments = parsedArguments as Record<string, unknown>;
 										if (findUnnecessaryUnicodeEscape(block.partialJson)) {
 											block.escapedNonAsciiArguments = true;
 										}
@@ -2383,7 +2424,6 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							if (rawStopReason) {
 								output.stopReason = isProviderSafetyStop ? "error" : mapStopReason(rawStopReason);
 								sawTerminalEnvelope = true;
-								sawTerminalStopReason = true;
 							}
 							if (isProviderSafetyStop) {
 								sawProviderSafetyStop = true;
@@ -2862,12 +2902,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 				}
 			}
 			blocksByAnthropicIndex.clear();
-			if (output.stopReason === "length" || !sawTerminalStopReason) {
-				for (const block of output.content) {
-					if (block.type === "toolCall" && truncatedToolCalls.has(block)) {
-						block.incompleteArguments = true;
-						block.incompleteArgumentsReason = "truncated";
-					}
+			for (const block of output.content) {
+				if (block.type === "toolCall" && truncatedToolCalls.has(block)) {
+					block.incompleteArguments = true;
+					block.incompleteArgumentsReason = "truncated";
 				}
 			}
 			output.duration = Date.now() - startTime;
