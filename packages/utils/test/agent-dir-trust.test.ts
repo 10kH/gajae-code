@@ -19,6 +19,7 @@ const PROBE = path.join(import.meta.dir, "fixtures", "agent-dir-trust-probe.ts")
 const PROBE_VAR = "GJC_TRUST_PROBE_VALUE";
 
 interface Resolved {
+	trustedHome: string;
 	agentDir: string;
 	configRoot: string;
 	pluginsDir: string;
@@ -64,6 +65,25 @@ async function resolveIn(cwd: string, overrides: Record<string, string> = {}): P
 	env.HOME = tempDir();
 	Object.assign(env, overrides);
 
+	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`probe failed (${exitCode}): ${stderr}`);
+	return JSON.parse(stdout.trim()) as Resolved;
+}
+
+async function resolveWithoutPlatformHome(cwd: string, hostileHome: string): Promise<Resolved> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	if (process.platform === "win32") {
+		delete env.USERPROFILE;
+		env.HOME = hostileHome;
+	} else {
+		delete env.HOME;
+		env.USERPROFILE = hostileHome;
+	}
 	const proc = Bun.spawn([process.execPath, PROBE], { cwd, env, stdout: "pipe", stderr: "pipe" });
 	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 	const exitCode = await proc.exited;
@@ -188,5 +208,25 @@ describe("agent directory trust boundary", () => {
 		expect(resolved.configRoot).toBe(path.join(home, ".operator-config"));
 		expect(resolved.pythonGatewayDir).toBe(path.join(operatorAgent, "python-gateway"));
 		expect(resolved.pluginsDir).toBe(path.join(home, ".operator-config", "plugins"));
+	});
+
+	it("uses the account home when POSIX HOME is absent despite hostile USERPROFILE", async () => {
+		if (process.platform === "win32") return;
+		const cwd = projectDir("SOMETHING_ELSE=1\n");
+		const hostileHome = tempDir();
+		const resolved = await resolveWithoutPlatformHome(cwd, hostileHome);
+		expect(resolved.trustedHome).toBe(os.userInfo().homedir);
+		expect(resolved.trustedHome).not.toBe(hostileHome);
+		expect(resolved.configRoot).toBe(path.join(os.userInfo().homedir, ".gjc"));
+	});
+
+	it("uses the account home when Windows USERPROFILE is absent despite hostile HOME", async () => {
+		if (process.platform !== "win32") return;
+		const cwd = projectDir("SOMETHING_ELSE=1\n");
+		const hostileHome = tempDir();
+		const resolved = await resolveWithoutPlatformHome(cwd, hostileHome);
+		expect(resolved.trustedHome).toBe(os.userInfo().homedir);
+		expect(resolved.trustedHome).not.toBe(hostileHome);
+		expect(resolved.configRoot).toBe(path.join(os.userInfo().homedir, ".gjc"));
 	});
 });

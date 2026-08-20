@@ -278,9 +278,11 @@ class DirResolver {
 			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", snapshot)) ??
 			CONFIG_DIR_NAME;
 		const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
-		const fallbackHomeKey = authoritativeHomeKey === "HOME" ? "USERPROFILE" : "HOME";
 		const declaredHome = snapshot.values[authoritativeHomeKey];
-		const runtimeHome = process.env[authoritativeHomeKey] ?? process.env[fallbackHomeKey];
+		// Only the platform-authoritative variable can select the trusted home.
+		// In particular, do not let the opposite platform variable (or a project
+		// dotenv value overlaid into it) redirect user state when this is absent.
+		const runtimeHome = process.env[authoritativeHomeKey];
 		const accountHome = accountHomeFromSystem();
 		const ambiguousHome =
 			declaredHome !== undefined && (snapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
