@@ -412,13 +412,7 @@ class DirResolver {
 	readonly #rootCache = new Map<string, string>();
 	readonly #agentCache = new Map<string, string>();
 
-	constructor(
-		agentDirOverride?: string,
-		snapshot = projectEnvSnapshot(),
-		// `setAgentDir()` names a profile; an inherited `GJC_CODING_AGENT_DIR` names a
-		// directory. Only the former re-selects the default profile by equality.
-		options: { defaultProfileWhenEqual?: boolean } = {},
-	) {
+	constructor(agentDirOverride?: string, snapshot = projectEnvSnapshot()) {
 		this.#projectEnv = snapshot;
 		this.#configDirName =
 			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", snapshot)) ??
@@ -430,14 +424,18 @@ class DirResolver {
 		const defaultAgent = path.join(this.configRoot, "agent");
 		this.#agentDirOverride = Boolean(agentDirOverride);
 		this.agentDir = agentDirOverride ? path.resolve(agentDirOverride) : defaultAgent;
-		// An agent directory inherited from the environment is an explicit selection
-		// of one directory, so it never follows `$XDG_*_HOME` -- not even when it
-		// equals the default path, which would otherwise route `agent.db` into
-		// `$XDG_DATA_HOME/gjc` while `getAgentDir()` still reported the named
-		// directory. `setAgentDir()` is the opposite statement: it re-selects the
-		// default *profile*, XDG included (pinned by `dirs-python-gateway.test.ts`).
-		const isDefault =
-			this.agentDir === defaultAgent && (!this.#agentDirOverride || options.defaultProfileWhenEqual === true);
+		// An agent directory equal to the home-derived default *is* the default
+		// profile, XDG categories included, however it arrived.
+		//
+		// Deciding this from override state instead was tried and reverted: it is
+		// unobservably wrong. `setAgentDir()` exports `GJC_CODING_AGENT_DIR`, so a
+		// child process inherits the same value the parent set programmatically and
+		// cannot tell the two apart. Treating the inherited form as "not default"
+		// put parent and child on different storage lanes for one logical profile --
+		// the parent reading `$XDG_STATE_HOME/gjc/python-gateway` while the child
+		// read `<agentDir>/python-gateway`. Splitting a live store in half is worse
+		// than the narrower complaint it was meant to answer.
+		const isDefault = this.agentDir === defaultAgent;
 		// That decision is then *sticky*. Recomputing it later from path shape is
 		// what let a pinned agent directory silently change storage lane when a home
 		// refresh made it coincide with the new default: `getAgentDir()` looked
@@ -613,14 +611,11 @@ export function getTrustedConfigRootDir(): string {
  * Set the coding agent directory. Creates a fresh resolver, invalidating all
  * cached paths.
  *
- * Naming the default agent path through this entry point *selects the default
- * profile*, XDG categories included -- that is how a caller returns to it, and
- * `dirs-python-gateway.test.ts` pins it. An agent directory inherited from the
- * environment is a different statement: it names one specific directory, so it
- * keeps its own storage lane even when it happens to equal the default.
+ * This also exports `GJC_CODING_AGENT_DIR`, so child processes inherit the same
+ * selection and resolve the same storage lane.
  */
 export function setAgentDir(dir: string): void {
-	dirs = new DirResolver(dir, dirs.trustSnapshot, { defaultProfileWhenEqual: true });
+	dirs = new DirResolver(dir, dirs.trustSnapshot);
 	process.env.GJC_CODING_AGENT_DIR = dir;
 }
 

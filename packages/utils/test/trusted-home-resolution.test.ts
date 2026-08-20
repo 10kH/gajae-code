@@ -12,6 +12,7 @@ import {
 } from "../src/dirs";
 
 const PROBE = path.join(import.meta.dir, "fixtures", "agent-dir-override-probe.ts");
+const DIRS = path.join(import.meta.dir, "..", "src", "dirs.ts");
 
 interface ProbeResolved {
 	trustedHome: string;
@@ -305,27 +306,44 @@ describe("authoritative home resolution", () => {
 		expect(probed.after.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
 	});
 
-	it("keeps an inherited agent dir off XDG at startup when it equals the default path", async () => {
-		// An agent directory inherited from the environment names one directory. If
-		// eligibility were decided by path equality alone, an override that happens
-		// to equal `<home>/.gjc/agent` would be routed into `$XDG_DATA_HOME/gjc` from
-		// the very first resolution: `getAgentDir()` would report the named directory
-		// while `agent.db` lived somewhere else entirely.
-		//
-		// `setAgentDir()` is the opposite statement -- it re-selects the default
-		// profile, XDG included -- and that contract stays pinned by
-		// `dirs-python-gateway.test.ts`.
+	it("puts a parent and its child on the same storage lane for one profile", async () => {
+		// `setAgentDir()` exports `GJC_CODING_AGENT_DIR`, so a child inherits the
+		// exact value the parent set programmatically and cannot distinguish the two.
+		// If an inherited agent dir equal to the default were treated as "not the
+		// default profile", parent and child would read one logical store through two
+		// different lanes -- the parent under `$XDG_STATE_HOME/gjc`, the child under
+		// `<agentDir>` -- silently splitting live state in half.
 		const home = await tempDir();
-		const xdgDataHome = await tempDir();
-		await fs.mkdir(path.join(xdgDataHome, "gjc"), { recursive: true });
-		const override = path.join(home, CONFIG_DIR_NAME, "agent");
-		await fs.mkdir(override, { recursive: true });
+		const xdgStateHome = await tempDir();
+		await fs.mkdir(path.join(xdgStateHome, "gjc"), { recursive: true });
+		const defaultAgent = path.join(home, CONFIG_DIR_NAME, "agent");
+		await fs.mkdir(defaultAgent, { recursive: true });
 
-		const probed = await probe({ agentDirOverride: override, secondHome: await tempDir(), home, xdgDataHome });
+		const read = async (env: Record<string, string>): Promise<string> => {
+			const childEnv: Record<string, string> = {};
+			for (const [key, value] of Object.entries(process.env)) {
+				if (value !== undefined) childEnv[key] = value;
+			}
+			delete childEnv.GJC_CODING_AGENT_DIR;
+			delete childEnv.PI_CODING_AGENT_DIR;
+			delete childEnv.GJC_CONFIG_DIR;
+			delete childEnv.PI_CONFIG_DIR;
+			Object.assign(childEnv, env);
+			const source = `import { getPythonGatewayDir } from ${JSON.stringify(DIRS)};\nconsole.log(getPythonGatewayDir());`;
+			const proc = Bun.spawn([process.execPath, "-e", source], { env: childEnv, stdout: "pipe", stderr: "pipe" });
+			const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+			if ((await proc.exited) !== 0) throw new Error(`probe failed: ${err}`);
+			return out.trim().split("\n").at(-1) ?? "";
+		};
 
-		expect(probed.before.agentDir).toBe(override);
-		expect(probed.before.agentDb).toBe(path.join(override, "agent.db"));
-		expect(probed.before.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
+		const withoutOverride = await read({ HOME: home, XDG_STATE_HOME: xdgStateHome });
+		const withInherited = await read({
+			HOME: home,
+			XDG_STATE_HOME: xdgStateHome,
+			GJC_CODING_AGENT_DIR: defaultAgent,
+		});
+
+		expect(withInherited).toBe(withoutOverride);
 	});
 
 	it("honors an explicit non-authoritative home for plugins without moving the resolver", async () => {
