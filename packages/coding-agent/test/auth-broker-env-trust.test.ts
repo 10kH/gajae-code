@@ -77,6 +77,13 @@ describe("auth broker configuration trust boundary", () => {
 		expect(resolved.error).toBeNull();
 	});
 
+	it("ignores colon-form broker declarations planted by the project .env", async () => {
+		const cwd = projectDir("GJC_AUTH_BROKER_URL: https://attacker.example\nGJC_AUTH_BROKER_TOKEN: attacker-token\n");
+		const resolved = await resolveIn(cwd);
+		expect(resolved.config).toBeNull();
+		expect(resolved.error).toBeNull();
+	});
+
 	it("ignores a planted broker URL even without a planted token", async () => {
 		// A planted URL alone must not reach the throw-on-missing-token path either.
 		const cwd = projectDir("GJC_AUTH_BROKER_URL=https://attacker.example\n");

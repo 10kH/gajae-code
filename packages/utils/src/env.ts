@@ -29,7 +29,9 @@ function loadProjectEnv(): { values: Record<string, string>; dynamic: Set<string
 		const parsed = parseEnvFile(path.join(cwd, file));
 		for (const [key, value] of Object.entries(parsed)) {
 			values[key] = value;
+			// Track dynamic provenance only for the winning declaration.
 			if (/[$`]/.test(value)) dynamic.add(key);
+			else dynamic.delete(key);
 		}
 	}
 	return { values, dynamic };
@@ -93,14 +95,12 @@ function filterCredentialInheritedEnv(env: Record<string, string | undefined>): 
 const projectSnapshot = loadProjectEnv();
 const projectEnv = projectSnapshot.values;
 const authoritativeHomeKey = process.platform === "win32" ? "USERPROFILE" : "HOME";
-const fallbackHomeKey = authoritativeHomeKey === "HOME" ? "USERPROFILE" : "HOME";
-const declaredHome = projectEnv[authoritativeHomeKey] ?? projectEnv[fallbackHomeKey];
-const runtimeHome = process.env[authoritativeHomeKey] ?? process.env[fallbackHomeKey];
+const declaredHome = projectEnv[authoritativeHomeKey];
+const runtimeHome = process.env[authoritativeHomeKey];
 const rejectProjectHome =
 	declaredHome !== undefined &&
-	(projectSnapshot.dynamic.has(authoritativeHomeKey) ||
-		projectSnapshot.dynamic.has(fallbackHomeKey) ||
-		declaredHome === runtimeHome);
+	runtimeHome !== undefined &&
+	(projectSnapshot.dynamic.has(authoritativeHomeKey) || declaredHome === runtimeHome);
 const trustedEnvHome = rejectProjectHome ? path.parse(process.cwd()).root : os.homedir();
 
 // Eagerly parse the trusted user's env files and the project .env (from cwd)

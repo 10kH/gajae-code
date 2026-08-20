@@ -312,8 +312,10 @@ function parseEntry(value: unknown, now: number): CrashSignatureEntry | undefine
 	if (raw.relayRefusedRecordId !== undefined && entry.relayRefusedRecordId !== raw.relayRefusedRecordId)
 		return undefined;
 	if (raw.relayRefusedVersion !== undefined && entry.relayRefusedVersion !== raw.relayRefusedVersion) return undefined;
-	if (Array.isArray(raw.commentedIssues) && raw.commentedIssues.length > 0 && entry.commentedIssues === undefined)
-		return undefined;
+	// A legacy entry may be exactly at the cap.  Display/report metadata is
+	// bounded normalization fodder, so it is safe to drop when upgrading it;
+	// refusing the whole entry would lose the occurrence and make a later
+	// journal merge quarantine an otherwise valid index.
 	if (Buffer.byteLength(JSON.stringify(entry), "utf8") > CRASH_INDEX_ENTRY_MAX_BYTES) return undefined;
 	return entry;
 }
@@ -511,6 +513,38 @@ function evictOne(index: CrashIndex): boolean {
 	return true;
 }
 
+/**
+ * Add a refusal watermark without allowing optional presentation/report data
+ * to make the entry unpersistable at the hard 1 KiB boundary.  The marker is
+ * the durable safety property; older display metadata is deliberately the
+ * first thing sacrificed.  Build the candidate first so callers never see a
+ * partially-mutated entry when even the mandatory fields cannot fit.
+ */
+function withRefusalWatermark(
+	existing: CrashSignatureEntry,
+	recordId: string,
+	contractVersion: string,
+): CrashSignatureEntry | undefined {
+	const candidate = { ...existing, relayRefusedRecordId: recordId, relayRefusedVersion: contractVersion };
+	const fits = (value: CrashSignatureEntry): boolean =>
+		Buffer.byteLength(JSON.stringify(value), "utf8") <= CRASH_INDEX_ENTRY_MAX_BYTES;
+	if (fits(candidate)) return candidate;
+
+	// Report/display metadata is advisory and can be reconstructed from the
+	// journal or re-entered by the user. Relay watermarks are intentionally not
+	// in this list: dropping one would make a successful/refused batch repeat.
+	for (const key of ["commentedIssues", "reportedIssueUrl", "reportedAt", "acknowledgedAt"] as const) {
+		delete candidate[key];
+		if (fits(candidate)) return candidate;
+	}
+	// Keep the error identity while shrinking only its human-facing preview.
+	if (candidate.messageClass) {
+		candidate.messageClass = boundMessageClass(candidate.messageClass.slice(0, 128));
+		if (fits(candidate)) return candidate;
+	}
+	return undefined;
+}
+
 /** Apply one journal event to the in-memory index. Returns whether it changed anything. */
 export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: number): boolean {
 	if (event.at > now + MAX_FUTURE_SKEW_MS || event.at < MIN_TIMESTAMP_MS) return false;
@@ -552,19 +586,10 @@ export function applyCrashEvent(index: CrashIndex, event: CrashEvent, now: numbe
 		if (!existing || existing.fpv !== event.fpv) return false;
 		if (existing.relayRefusedRecordId === event.recordId && existing.relayRefusedVersion === event.contractVersion)
 			return false;
-		if (
-			Buffer.byteLength(
-				JSON.stringify({
-					...existing,
-					relayRefusedRecordId: event.recordId,
-					relayRefusedVersion: event.contractVersion,
-				}),
-				"utf8",
-			) > CRASH_INDEX_ENTRY_MAX_BYTES
-		)
-			return false;
-		existing.relayRefusedRecordId = event.recordId;
-		existing.relayRefusedVersion = event.contractVersion;
+		const updated = withRefusalWatermark(existing, event.recordId, event.contractVersion);
+		if (!updated) return false;
+		for (const key of Object.keys(existing)) delete (existing as unknown as Record<string, unknown>)[key];
+		Object.assign(existing, updated);
 		return true;
 	}
 	if (event.kind === "acknowledged") {

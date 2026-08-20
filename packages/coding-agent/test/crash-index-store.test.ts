@@ -14,6 +14,7 @@ import {
 	applyCrashEvent,
 	CRASH_INDEX_ENTRY_MAX_BYTES,
 	CRASH_INDEX_MAX_SIGNATURES,
+	type CrashSignatureEntry,
 	type CrashStatePaths,
 	compactCrashIndex,
 	listCrashSignatures,
@@ -136,6 +137,57 @@ describe("compactCrashIndex", () => {
 		const reparsed = parseCrashIndex(await fs.readFile(paths.index, "utf8"), NOW);
 		expect(reparsed?.signatures[fingerprint]?.lifetimeCount).toBe(2);
 		expect(reparsed?.signatures[fingerprint]?.lastAppendRecordId).toBe(recordId(21));
+	});
+
+	it("persists refusal markers at the exact entry cap by dropping report metadata", () => {
+		const fingerprint = fingerprintFor(22);
+		const index = {
+			version: 1,
+			updatedAt: NOW,
+			lastNudgedAt: 0,
+			overflow: false,
+			recentEventIds: [],
+			recentJournalDigests: [],
+			recoveredRecordIds: [],
+			retiredFingerprints: [],
+			signatures: {
+				[fingerprint]: {
+					fpv: 1,
+					errorName: "Error",
+					messageClass: "x".repeat(512),
+					lifetimeCount: 1,
+					retainedCount: 1,
+					firstSeen: NOW - 1,
+					lastSeen: NOW,
+					lastRecordId: recordId(22),
+					lastAppendRecordId: recordId(22),
+					relayedAt: NOW - 1,
+					relayedRecordId: recordId(22),
+					reportedAt: NOW - 1,
+					reportedIssueUrl: `https://github.com/example/issues/${"r".repeat(180)}`,
+					commentedIssues: [`https://github.com/example/issues/${"c".repeat(180)}`],
+				},
+			},
+		};
+		const entry = index.signatures[fingerprint] as CrashSignatureEntry;
+		expect(Buffer.byteLength(JSON.stringify(entry), "utf8")).toBeGreaterThan(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(
+			applyCrashEvent(
+				index,
+				{
+					kind: "refused",
+					fingerprint,
+					fpv: 1,
+					recordId: recordId(22),
+					contractVersion: "sanitize-external-crash-v1",
+					at: NOW,
+				},
+				NOW,
+			),
+		).toBe(true);
+		expect(Buffer.byteLength(JSON.stringify(entry), "utf8")).toBeLessThanOrEqual(CRASH_INDEX_ENTRY_MAX_BYTES);
+		expect(entry.relayRefusedRecordId).toBe(recordId(22));
+		expect(entry.relayRefusedVersion).toBe("sanitize-external-crash-v1");
 	});
 
 	it("deduplicates a replayed rotated journal containing more than the recent id window", async () => {

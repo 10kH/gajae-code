@@ -453,6 +453,58 @@ describe("relayCrashSignatures", () => {
 		expect(bodies).toHaveLength(1);
 	});
 
+	test("persists an exact-cap refusal across restart and relays a newer occurrence", async () => {
+		await seed();
+		const compacted = await compactCrashIndex({ paths });
+		const entry = compacted.signatures[FINGERPRINT];
+		expect(entry).toBeDefined();
+		if (!entry) return;
+		const { lastAppendRecordId: _ignored, ...legacy } = entry;
+		await Bun.write(
+			paths.index,
+			`${JSON.stringify({
+				...compacted,
+				signatures: {
+					[FINGERPRINT]: {
+						...legacy,
+						messageClass: "x".repeat(200),
+						reportedAt: entry.lastSeen,
+						reportedIssueUrl: `https://github.com/example/issues/${"r".repeat(180)}`,
+						commentedIssues: [`https://github.com/example/issues/${"c".repeat(180)}`],
+					},
+				},
+			})}\n`,
+		);
+		await fs.writeFile(paths.crashLog, "unrelated crash text\n");
+		const refused = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept([]) });
+		expect(refused).toEqual({ status: "ran", sent: 0, refused: 1, failed: 0 });
+		const restarted = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept([]) });
+		expect(restarted).toEqual({ status: "skipped", reason: "nothing-to-relay" });
+
+		const newerRecordId = "2222222222222222";
+		appendCrashEvent(
+			{
+				kind: "occurrence",
+				fingerprint: FINGERPRINT,
+				fpv: 1,
+				recordId: newerRecordId,
+				at: 1_700_000_900_001,
+				errorName: "TypeError",
+				messageClass: "cannot read properties of <redacted>",
+			},
+			paths.events,
+		);
+		await fs.appendFile(
+			paths.crashLog,
+			`2026-08-11T11:59:59.000Z pid=4242 [Uncaught Exception] TypeError: cannot read properties of <redacted>\n` +
+				`${STACK}\n${formatCrashRecordMarker(FINGERPRINT, 1, newerRecordId)}\n\n`,
+		);
+		const bodies: string[] = [];
+		const relayed = await relayCrashSignatures({ config: config(), paths, env: {}, fetchImpl: accept(bodies) });
+		expect(relayed).toEqual({ status: "ran", sent: 1, refused: 0, failed: 0 });
+		expect(bodies).toHaveLength(1);
+	});
+
 	test("a legacy relayedAt covering lastSeen does not retransmit after upgrade", async () => {
 		await seed();
 		const compacted = await compactCrashIndex({ paths });

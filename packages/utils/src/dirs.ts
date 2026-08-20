@@ -214,6 +214,23 @@ function trustedValue(
 	if (projectValue !== undefined && (project.dynamic.has(name) || projectValue === value)) return undefined;
 	return value;
 }
+
+function accountHomeFromSystem(): string | undefined {
+	try {
+		const info = os.userInfo();
+		if (process.platform === "linux") {
+			const line = fs
+				.readFileSync("/etc/passwd", "utf8")
+				.split("\n")
+				.find(candidate => candidate.split(":")[2] === String(info.uid));
+			const home = line?.split(":")[5];
+			if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+		}
+		const home = info.homedir;
+		if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+	} catch {}
+	return undefined;
+}
 export function getConfigAgentDirName(): string {
 	return `${getConfigDirName()}/agent`;
 }
@@ -227,8 +244,8 @@ type XdgCategory = "data" | "state" | "cache";
 /**
  * Resolve the home used for trusted agent state. Bun overlays a checkout's
  * `.env` before module initialization, so `os.homedir()` can already reflect
- * an attacker-controlled HOME. A checkout declaration therefore fails closed
- * to the filesystem root rather than trusting any environment-derived home.
+ * an attacker-controlled HOME. Prefer the OS account database, which is not
+ * affected by a hostile HOME/USERPROFILE overlay.
  */
 /**
  * Resolves and caches all gajae-code directory paths. On Linux, when XDG environment
@@ -237,11 +254,13 @@ type XdgCategory = "data" | "state" | "cache";
  * invalidates all cached paths.
  */
 class DirResolver {
-	readonly configRoot: string;
-	readonly agentDir: string;
+	configRoot: string;
+	agentDir: string;
 	readonly #projectEnv: { values: Record<string, string>; dynamic: Set<string> };
-	readonly #configDirName: string;
+	#configDirName: string;
+	readonly #agentDirOverride: boolean;
 	readonly #trustedHome: string;
+	readonly #homeAvailable: boolean;
 
 	// Per-category base dirs. Without XDG, all three equal configRoot / agentDir.
 	// With XDG on Linux, they point to $XDG_*_HOME/gjc/.
@@ -261,16 +280,28 @@ class DirResolver {
 		const fallbackHomeKey = authoritativeHomeKey === "HOME" ? "USERPROFILE" : "HOME";
 		const declaredHome = snapshot.values[authoritativeHomeKey] ?? snapshot.values[fallbackHomeKey];
 		const runtimeHome = process.env[authoritativeHomeKey] ?? process.env[fallbackHomeKey];
-		this.#trustedHome =
+		const accountHome = accountHomeFromSystem();
+		const ambiguousHome =
 			declaredHome !== undefined &&
 			(snapshot.dynamic.has(authoritativeHomeKey) ||
 				snapshot.dynamic.has(fallbackHomeKey) ||
-				declaredHome === runtimeHome)
-				? path.parse(process.cwd()).root
-				: os.homedir();
+				declaredHome === runtimeHome);
+		this.#trustedHome = ambiguousHome
+			? (accountHome ??
+				runtimeHome ??
+				(() => {
+					throw new Error("Unable to determine a trustworthy account home directory");
+				})())
+			: (runtimeHome ??
+				accountHome ??
+				(() => {
+					throw new Error("Unable to determine a trustworthy account home directory");
+				})());
+		this.#homeAvailable = this.#trustedHome !== path.parse(this.#trustedHome).root;
 		this.configRoot = path.join(this.#trustedHome, this.#configDirName);
 
 		const defaultAgent = path.join(this.configRoot, "agent");
+		this.#agentDirOverride = Boolean(agentDirOverride);
 		this.agentDir = agentDirOverride ? path.resolve(agentDirOverride) : defaultAgent;
 		const isDefault = this.agentDir === defaultAgent;
 
@@ -310,12 +341,27 @@ class DirResolver {
 		};
 	}
 
+	/** Refresh caller-supplied config-dir overrides without replacing the trust snapshot. */
+	refreshConfigDirOverride(): void {
+		const next =
+			sanitizeConfigDirName(trustedValue("GJC_CONFIG_DIR", this.#projectEnv)) ??
+			sanitizeConfigDirName(trustedValue("PI_CONFIG_DIR", this.#projectEnv)) ??
+			CONFIG_DIR_NAME;
+		if (next === this.#configDirName) return;
+		this.#configDirName = next;
+		this.configRoot = path.join(this.#trustedHome, next);
+		if (!this.#agentDirOverride) this.agentDir = path.join(this.configRoot, "agent");
+		this.#rootCache.clear();
+		this.#agentCache.clear();
+	}
+
 	isProjectEnvDeclaration(name: string): boolean {
 		return Object.hasOwn(this.#projectEnv.values, name);
 	}
 
 	/** Config-root subdirectory, with optional XDG override. */
 	rootSubdir(subdir: string, xdg?: XdgCategory): string {
+		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 		const cached = this.#rootCache.get(subdir);
 		if (cached) return cached;
 		const base = xdg ? this.#rootDirs[xdg] : this.configRoot;
@@ -326,6 +372,7 @@ class DirResolver {
 
 	/** Agent subdirectory, with optional XDG override. */
 	agentSubdir(userAgentDir: string | undefined, subdir: string, xdg?: XdgCategory): string {
+		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 		if (!userAgentDir || userAgentDir === this.agentDir) {
 			const cached = this.#agentCache.get(subdir);
 			if (cached) return cached;
@@ -342,6 +389,9 @@ class DirResolver {
 	}
 	get trustedHome(): string {
 		return this.#trustedHome;
+	}
+	assertHomeAvailable(): void {
+		if (!this.#homeAvailable) throw new Error("User state is unavailable: no trustworthy home directory");
 	}
 	get trustSnapshot(): { values: Record<string, string>; dynamic: Set<string> } {
 		return this.#projectEnv;
@@ -366,16 +416,21 @@ const RESOLVER_HOME = dirs.trustedHome;
 
 /** Get the config root directory (~/.gjc). */
 export function getConfigRootDir(): string {
+	dirs.refreshConfigDirOverride();
+	dirs.assertHomeAvailable();
 	return dirs.configRoot;
 }
 
 /** Stable, provenance-checked home captured by the resolver lifetime snapshot. */
 export function getTrustedHomeDir(): string {
+	dirs.assertHomeAvailable();
 	return dirs.trustedHome;
 }
 
 /** Stable trusted config root; preserves the configured nested config-dir name. */
 export function getTrustedConfigRootDir(): string {
+	dirs.refreshConfigDirOverride();
+	dirs.assertHomeAvailable();
 	return dirs.configRoot;
 }
 
@@ -387,10 +442,13 @@ export function setAgentDir(dir: string): void {
 
 /** Get the agent config directory (~/.gjc/agent). */
 export function getAgentDir(): string {
+	dirs.refreshConfigDirOverride();
+	dirs.assertHomeAvailable();
 	return dirs.agentDir;
 }
 
 export function getConfigDirName(): string {
+	dirs.refreshConfigDirOverride();
 	return dirs.configDirName;
 }
 /**
