@@ -1538,10 +1538,8 @@ export class SessionRouter {
 					this.#removeRecoveredFrame(attached.sessionId, attached.generation, seq);
 					if (seq > attached.cursor.seq) attached.cursor.seq = seq;
 				}
-				this.#deps.onFrameSettled?.(
-					attached.capability,
-					seq === undefined ? notificationFrame : { ...notificationFrame, seq },
-				);
+				if (seq !== undefined && ownsSequence)
+					this.#deps.onFrameSettled?.(attached.capability, { ...notificationFrame, seq });
 			});
 		this.#frameTails.set(attached.id, current);
 		void current.then(
