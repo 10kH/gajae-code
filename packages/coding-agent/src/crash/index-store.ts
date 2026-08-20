@@ -551,7 +551,11 @@ function withRefusalWatermark(
 	recordId: string,
 	contractVersion: string,
 ): CrashSignatureEntry | undefined {
-	return normalizeEntryForPersistence({ ...existing, relayRefusedRecordId: recordId, relayRefusedVersion: contractVersion });
+	return normalizeEntryForPersistence({
+		...existing,
+		relayRefusedRecordId: recordId,
+		relayRefusedVersion: contractVersion,
+	});
 }
 
 /** Apply one journal event to the in-memory index. Returns whether it changed anything. */

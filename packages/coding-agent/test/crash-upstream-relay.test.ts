@@ -1048,7 +1048,10 @@ describe("relay trust boundary against a hostile checkout", () => {
 		return stdout.trim();
 	}
 
-	async function runCrashRelay(argv: string[], configYaml?: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+	async function runCrashRelay(
+		argv: string[],
+		configYaml?: string,
+	): Promise<{ stdout: string; stderr: string; exitCode: number }> {
 		if (configYaml !== undefined) {
 			await fs.mkdir(path.join(dir, ".gjc", "agent"), { recursive: true });
 			await fs.writeFile(path.join(dir, ".gjc", "agent", "config.yml"), configYaml);
