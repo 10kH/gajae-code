@@ -311,7 +311,13 @@ describe("AgentSession concurrent prompt guard", () => {
 		const firstPrompt = session.prompt("First message");
 		await waitFor(() => session.agent.state.isStreaming);
 		const aborting = session.abort();
-		const successor = session.sendUserMessage("successor after abort");
+		let promoted = 0;
+		const successor = session.sendUserMessage("successor after abort", {
+			queuedAtDispatch: true,
+			onQueuedPromoted: () => {
+				promoted += 1;
+			},
+		});
 		await aborting;
 		await waitFor(() => {
 			const lastUser = [...agent.state.messages].reverse().find(message => message.role === "user");
@@ -321,6 +327,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			);
 		}, 3_000);
 		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		expect(promoted).toBe(1);
 		await successor.catch(() => {});
 		await firstPrompt.catch(() => {});
 	}, 15_000);

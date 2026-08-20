@@ -11468,8 +11468,11 @@ export class AgentSession {
 		// A busy SDK dispatch is only queued while the agent loop is live.
 		// Abort unwind is not a live loop: queuedAtDispatch from that window
 		// must not divert a fresh prompt into the dying turn's steer queue.
-		const queuedPlainPrompt =
-			options?.queuedAtDispatch === true && options.deliverAs === undefined && this.agent.state.isStreaming;
+		// Keep the original busy-dispatch bit for promotion/ownership: after
+		// unwind the successor starts its own turn and must fire onQueuedPromoted
+		// so SDK pending correlation is not dropped.
+		const dispatchedWhileBusy = options?.queuedAtDispatch === true && options.deliverAs === undefined;
+		const queuedPlainPrompt = dispatchedWhileBusy && this.agent.state.isStreaming;
 		const hasFollowUpAhead = (): boolean =>
 			this.#activeFollowUpReservationEpochs.size > 0 ||
 			this.agent.snapshotFollowUp().length > 0 ||
@@ -11480,6 +11483,7 @@ export class AgentSession {
 			!followUpAheadAtReservation &&
 			!this.agent.state.isStreaming &&
 			!this.#canAutoContinueForSteer();
+		const promoteAfterAbortUnwind = waitedForAbortUnwind && dispatchedWhileBusy && !followUpAheadAtReservation;
 		const deliverAs =
 			options?.deliverAs ??
 			(queuedPlainPrompt
@@ -11574,7 +11578,7 @@ export class AgentSession {
 			// Use prompt() with expandPromptTemplates: false to skip command handling and template expansion
 			let queuedPromotionFired = false;
 			const fireQueuedPromotion = () => {
-				if (!freshAtReservation || queuedPromotionFired) return;
+				if ((!freshAtReservation && !promoteAfterAbortUnwind) || queuedPromotionFired) return;
 				queuedPromotionFired = true;
 				options?.onQueuedPromoted?.();
 			};
@@ -11586,7 +11590,7 @@ export class AgentSession {
 					fireQueuedPromotion();
 				},
 				onPreflightAcceptCommit:
-					options?.onPreflightAcceptCommit || freshAtReservation
+					options?.onPreflightAcceptCommit || freshAtReservation || promoteAfterAbortUnwind
 						? async () => {
 								if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 								else options?.onPreflightAccepted?.();
