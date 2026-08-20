@@ -14,7 +14,7 @@
 - Fixed agent steering losing or racing user input: a steer that interrupts an in-flight tool is delivered, the remaining abort-race gaps in steer-after-tool-interrupt are closed, and a live subagent await ends when user steering arrives instead of hanging.
 - Fixed rotating agent environment credentials not being reloaded and hardened the rotation path so concurrent readers never observe a partially written credential set.
 - Fixed the config CLI reporting success when a setting was not durably saved, and made retargeted CLI persistence fail closed instead of writing to an unintended target.
-- Fixed session robustness: a fatal resident blob now names the session and leaves a record; the corrupted-sentinel lane the strict check walked past is closed; the transition materialize lane is bound and the dead invalid-ref guard dropped; and cold-spill recovery no longer kills the turn when a blob is unreadable.
+- Fixed session robustness: a fatal resident blob now names the session and leaves a record; the corrupted-sentinel lane the strict check walked past is closed; and the transition materialize lane is bound and the dead invalid-ref guard dropped.
 - Fixed notification/herdr integration: recovery no longer re-quarantines native exchange debris, debris cleanup binds to native identity, pane authority binds to process identity so a nested gjc cannot release its parent pane's agent authority, and the native lint gate is satisfied.
 - Fixed `/usage` not surfacing cached usage for API-key credentials in `getCachedUsageReport` (#4686), and made the account-inventory usage tests hermetic on credential-free hosts (#4663).
 - Fixed the auth gateway rejecting explicit `null` fields on openai-chat requests (#4667).
