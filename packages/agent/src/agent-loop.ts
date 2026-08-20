@@ -1193,6 +1193,15 @@ function managedAssistantShell(
 	const transportFailure = managedTransportFailure(value);
 	const errorMessage = managedProperty(source, "errorMessage");
 	const errorStatus = managedProperty(source, "errorStatus");
+	// `provider_safety_stop` is the one provider-owned diagnostic that must cross
+	// this managed snapshot boundary: AgentSession uses it to keep the terminal
+	// stop terminal and to render the manual model-switch hint. Read only the
+	// closed literal, and only on an errored assistant turn; local diagnostic
+	// kinds remain runtime-owned and are never copied from provider data.
+	const errorKind =
+		stopReason === "error" && managedProperty(source, "errorKind") === "provider_safety_stop"
+			? ("provider_safety_stop" as const)
+			: undefined;
 	const safeMetadata: Record<string, unknown> = isManagedPlainRecord(detailed.snapshot)
 		? { ...detailed.snapshot }
 		: {};
@@ -1200,11 +1209,9 @@ function managedAssistantShell(
 	delete safeMetadata.errorStatus;
 	delete safeMetadata.transportFailure;
 	// Local diagnostic authority fields are never foreign-provider-settable.
-	// errorKind/bufferOverflow on the terminal assistant message are attached
-	// ONLY by this module's own runtime-error paths (managedFailureMessage and
-	// the Agent catch), so a provider/stream payload that smuggles them through
-	// its message snapshot is stripped here — the executor's parent-facing
-	// summary may never trust a shape that arrived via provider data (#4618).
+	// `provider_safety_stop` was read explicitly above; all other errorKind values
+	// are stripped here so a provider/stream payload cannot self-label a local
+	// runtime failure in the executor's parent-facing summary (#4618).
 	delete safeMetadata.errorKind;
 	delete safeMetadata.bufferOverflow;
 	return {
@@ -1219,6 +1226,7 @@ function managedAssistantShell(
 		timestamp: typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : Date.now(),
 		...(transportFailure ? { transportFailure } : {}),
 		...(typeof errorMessage === "string" ? { errorMessage } : {}),
+		...(errorKind ? { errorKind } : {}),
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
 	};
 }

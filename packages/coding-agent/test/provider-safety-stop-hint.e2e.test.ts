@@ -56,7 +56,11 @@ function safetyStopStream(model: Model, refusal: string): AssistantMessageEventS
 	return stream;
 }
 
-function genericErrorStream(model: Model): AssistantMessageEventStream {
+function genericErrorStream(
+	model: Model,
+	errorMessage = "401 unauthorized: invalid api key",
+	errorKind?: AssistantMessage["errorKind"],
+): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
 		const message: AssistantMessage = {
@@ -74,7 +78,8 @@ function genericErrorStream(model: Model): AssistantMessageEventStream {
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "error",
-			errorMessage: "401 unauthorized: invalid api key",
+			errorMessage,
+			...(errorKind ? { errorKind } : {}),
 			timestamp: Date.now(),
 		};
 		stream.push({ type: "start", partial: message });
@@ -200,5 +205,33 @@ describe("provider safety stop hint e2e (#4650)", () => {
 		await session.waitForIdle();
 		const last = [...session.state.messages].reverse().find(message => message.role === "assistant");
 		expect(resolveProviderSafetyStopHint(last as AssistantMessage, session)).toBeUndefined();
+	});
+
+	it("does not forge a typed safety stop from ordinary refusal prose", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primary) throw new Error("Expected bundled test model");
+		const agent = new Agent({
+			getApiKey: provider => `${provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: ((model, _context, _options) =>
+				genericErrorStream(
+					model,
+					"The provider refused this malformed request",
+				)) satisfies AgentOptions["streamFn"],
+		});
+		const settings = Settings.isolated({ "compaction.enabled": false, "retry.baseDelayMs": 1 });
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry: new ModelRegistry(authStorage),
+		});
+		await session.prompt("trigger ordinary refusal");
+		await session.waitForIdle();
+		const last = [...session.state.messages]
+			.reverse()
+			.find(message => message.role === "assistant") as AssistantMessage;
+		expect(last.errorKind).toBeUndefined();
+		expect(resolveProviderSafetyStopHint(last, session)).toBeUndefined();
 	});
 });

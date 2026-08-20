@@ -101,6 +101,50 @@ describe("managed attempt transaction", () => {
 		expectManagedRunStart(events);
 	});
 
+	it("separates provider envelope kinds from runtime-authored diagnostics", async () => {
+		// These values are deliberately supplied by the provider envelope. The
+		// runtime-authored local kinds tested below and in the local snapshot/
+		// overflow cases must not be confused with this untrusted input surface.
+		const cases = [
+			{
+				errorKind: "provider_safety_stop" as const,
+				stopReason: "error" as const,
+				expected: "provider_safety_stop" as const,
+			},
+			{ errorKind: "provider_safety_stop" as const, stopReason: "stop" as const, expected: undefined },
+			{ errorKind: "local_buffer_overflow" as const, stopReason: "error" as const, expected: undefined },
+			{ errorKind: undefined, stopReason: "error" as const, expected: undefined },
+		];
+
+		for (const { errorKind, stopReason, expected } of cases) {
+			const mock = createMockModel();
+			const streamFn = () => {
+				const stream = new AssistantMessageEventStream();
+				const message: AssistantMessage = {
+					...assistantMessage(mock.model),
+					stopReason,
+					errorMessage: "provider response",
+					...(errorKind ? { errorKind } : {}),
+				};
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			};
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn,
+			});
+
+			await agent.prompt("run", { fallbackManaged: true });
+
+			const terminal = agent.state.messages.at(-1);
+			expect(terminal?.role).toBe("assistant");
+			expect((terminal as AssistantMessage).errorKind).toBe(expected);
+		}
+	});
+
 	it("commits a detached accepted message when a managed partial is not structured-cloneable", async () => {
 		const mock = createMockModel();
 		let liveMessage: AssistantMessage | undefined;
