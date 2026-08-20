@@ -73,7 +73,102 @@ async function nssHome(): Promise<string | undefined> {
 	}
 }
 
+interface UidCacheProbeResult {
+	first: string;
+	uidB: string[];
+	uidAAgain: string;
+	uidAAfterMappingChange: string;
+	nssCalls: number;
+}
+
+/** Exercise the cache with a deterministic NSS/identity seam in a child process. */
+async function runUidCacheProbe(homeA: string, homeAAfterMappingChange: string): Promise<UidCacheProbeResult> {
+	const source = await Bun.file(DIRS).text();
+	const identityStart = source.indexOf("function accountIdentity");
+	const nssCommentStart = source.indexOf("/** The uid's home field", identityStart);
+	const nssStart = source.indexOf("function nssAccountHome", nssCommentStart);
+	const accountStart = source.indexOf("function accountHomeFromSystem", nssStart);
+	expect(identityStart).toBeGreaterThanOrEqual(0);
+	expect(nssCommentStart).toBeGreaterThan(identityStart);
+	expect(nssStart).toBeGreaterThan(nssCommentStart);
+	expect(accountStart).toBeGreaterThan(nssStart);
+
+	const identityReplacement = `function accountIdentity(info: os.UserInfo): AccountIdentity {
+	const uid = Number(process.env.GJC_TEST_EFFECTIVE_UID ?? info.uid);
+	return { key: \`${process.platform}:uid=\${uid}:user=\${info.username}\`, uid };
+	}
+
+	`;
+	const withIdentitySeam = source.slice(0, identityStart) + identityReplacement + source.slice(nssCommentStart);
+	const nssReplacement = `function nssAccountHome(uid: number): string | undefined {
+	const state = globalThis as typeof globalThis & { GJC_TEST_NSS_CALLS?: number };
+	state.GJC_TEST_NSS_CALLS = (state.GJC_TEST_NSS_CALLS ?? 0) + 1;
+	return usableHome(process.env[\`GJC_TEST_NSS_HOME_\${uid}\`]);
+	}
+
+	`;
+	const patched =
+		withIdentitySeam.slice(0, withIdentitySeam.indexOf("function nssAccountHome")) +
+		nssReplacement +
+		withIdentitySeam.slice(withIdentitySeam.indexOf("function accountHomeFromSystem"));
+	const patchedPath = path.join(path.dirname(DIRS), `dirs-uid-cache-${Bun.randomUUIDv7()}.ts`);
+	scratch.push(patchedPath);
+	await Bun.write(patchedPath, patched);
+
+	const project = await tempDir();
+	await Bun.write(path.join(project, ".env"), "HOME=$GJC_TEST_RUNTIME_HOME\n");
+	const probePath = path.join(project, "uid-cache-probe.ts");
+	await Bun.write(
+		probePath,
+		[
+			`import { getTrustedHomeDir } from ${JSON.stringify(patchedPath)};`,
+			"const state = globalThis as typeof globalThis & { GJC_TEST_NSS_CALLS?: number };",
+			'const read = () => { try { return getTrustedHomeDir(); } catch { return "REFUSED"; } };',
+			"const first = read();",
+			'process.env.GJC_TEST_EFFECTIVE_UID = "2001";',
+			"const uidB = await Promise.all([Promise.resolve().then(read), Promise.resolve().then(read)]);",
+			'process.env.GJC_TEST_EFFECTIVE_UID = "1000";',
+			"const uidAAgain = read();",
+			`process.env.GJC_TEST_NSS_HOME_1000 = ${JSON.stringify(homeAAfterMappingChange)};`,
+			"const uidAAfterMappingChange = read();",
+			"console.log(JSON.stringify({ first, uidB, uidAAgain, uidAAfterMappingChange, nssCalls: state.GJC_TEST_NSS_CALLS ?? 0 }));",
+		].join("\n"),
+	);
+
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (value !== undefined) env[key] = value;
+	}
+	env.HOME = await tempDir();
+	env.GJC_TEST_RUNTIME_HOME = env.HOME;
+	env.GJC_TEST_EFFECTIVE_UID = "1000";
+	env.GJC_TEST_NSS_HOME_1000 = homeA;
+	delete env.GJC_TEST_NSS_HOME_2001;
+	const proc = Bun.spawn([process.execPath, probePath], { cwd: project, env, stdout: "pipe", stderr: "pipe" });
+	const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+	const exitCode = await proc.exited;
+	if (exitCode !== 0) throw new Error(`uid cache probe failed (${exitCode}): ${stderr}`);
+	return JSON.parse(stdout.trim().split("\n").at(-1) ?? "{}") as UidCacheProbeResult;
+}
+
 describe("account home is resolved through the OS account database", () => {
+	it("scopes NSS cache entries by effective UID and never leaks across transitions", async () => {
+		if (process.platform !== "linux") return;
+		const homeA = await tempDir();
+		const homeAAfterMappingChange = await tempDir();
+		const result = await runUidCacheProbe(homeA, homeAAfterMappingChange);
+
+		expect(result.first).toBe(homeA);
+		expect(result.uidB).toEqual(["REFUSED", "REFUSED"]);
+		expect(result.uidAAgain).toBe(homeA);
+		// A's cached NSS answer is safely reused after B fails; the changed mapping
+		// must not alter A's already-established per-UID result.
+		expect(result.uidAAfterMappingChange).toBe(homeA);
+		// One initial A lookup plus both concurrent failed B lookups; no lookup for
+		// A after the identity returns, proving the cache is per identity.
+		expect(result.nssCalls).toBe(3);
+	});
+
 	it("reports the same home NSS does, not the inherited environment", async () => {
 		if (process.platform !== "linux") return;
 		const account = await nssHome();

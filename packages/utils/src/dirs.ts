@@ -264,7 +264,10 @@ function usableHome(home: string | undefined): string | undefined {
  * NSS front end, so it resolves local and directory-backed accounts alike.
  *
  * Only an **environment-independent** result is memoized, and only on success.
- * The NSS answer cannot change during a process lifetime, so caching it is safe.
+ * The cache is keyed by the effective account identity, not by process lifetime:
+ * a setuid or container identity transition must never reuse another uid's home.
+ * The NSS answer cannot change during one identity's process lifetime, so
+ * per-identity caching is safe.
  * The `os.userInfo()` fallback is different: Bun derives `homedir` from `$HOME`,
  * so caching it would freeze one side of the independence comparison in
  * {@link resolveTrustedHome}. A planted home that was live at first resolution
@@ -272,7 +275,18 @@ function usableHome(home: string | undefined): string | undefined {
  * the runtime home -- passing the echo check and being promoted to independent
  * evidence. Provenance is carried with the value so that can never happen.
  */
-let accountHomeCache: { home: string; envDerived: boolean } | undefined;
+type AccountHome = { home: string; envDerived: boolean };
+type AccountIdentity = { key: string; uid: number };
+
+const accountHomeCache = new Map<string, AccountHome>();
+
+function accountIdentity(info: os.UserInfo<string>): AccountIdentity {
+	const uid = process.platform === "win32" ? info.uid : (process.geteuid?.() ?? info.uid);
+	return {
+		key: `${process.platform}:uid=${uid}:user=${info.username}`,
+		uid,
+	};
+}
 
 /** The uid's home field from the NSS account database, or undefined. */
 function nssAccountHome(uid: number): string | undefined {
@@ -294,16 +308,19 @@ function nssAccountHome(uid: number): string | undefined {
 	}
 }
 
-function accountHomeFromSystem(): { home: string; envDerived: boolean } | undefined {
-	if (accountHomeCache !== undefined) return accountHomeCache;
+function accountHomeFromSystem(): AccountHome | undefined {
 	try {
 		const info = os.userInfo();
+		const identity = accountIdentity(info);
+		const cached = accountHomeCache.get(identity.key);
+		if (cached !== undefined) return cached;
 		if (process.platform === "linux") {
-			const nss = nssAccountHome(info.uid);
+			const nss = nssAccountHome(identity.uid);
 			if (nss !== undefined) {
 				// NSS is environment-independent and stable: safe to memoize.
-				accountHomeCache = { home: nss, envDerived: false };
-				return accountHomeCache;
+				const result = { home: nss, envDerived: false };
+				accountHomeCache.set(identity.key, result);
+				return result;
 			}
 		}
 		// `os.userInfo().homedir` is the portable path for macOS and Windows, and on
@@ -312,7 +329,12 @@ function accountHomeFromSystem(): { home: string; envDerived: boolean } | undefi
 		// caller can refuse to treat it as independent evidence.
 		const fallback = usableHome(info.homedir);
 		if (fallback !== undefined) return { home: fallback, envDerived: true };
-	} catch {}
+	} catch {
+		// Do not retain or consult a prior identity's result when the current
+		// identity cannot be observed. An unavailable uid is not evidence for any
+		// other uid and must fail closed instead of inheriting stale state.
+		return undefined;
+	}
 	return undefined;
 }
 
