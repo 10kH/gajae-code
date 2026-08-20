@@ -35,9 +35,21 @@ on:
 permissions:
   contents: read
 
+# A body-only `edited` run must not share the validation group: joining it would
+# cancel the in-progress validation for the identical tree before any job-level
+# guard is evaluated, leaving the SHA with no completed validation while skipped
+# required jobs still report success. Such runs get their own group and never
+# cancel anything. `edited` also fires for title and base changes -- those are
+# real validation events and stay in the normal group.
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' && 'dev-ci-virtual-integration' || format('{0}-{1}', github.workflow, github.ref) }}
-  cancel-in-progress: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') }}
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch' && inputs.head_sha != '' && 'dev-ci-virtual-integration'
+    || (github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null)
+    && format('{0}-{1}-body-edit', github.workflow, github.ref)
+    || format('{0}-{1}', github.workflow, github.ref) }}
+  cancel-in-progress: >-
+    ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '')
+    && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
 
 jobs:
   pr-contract-bootstrap:
@@ -115,7 +127,7 @@ jobs:
     # lives in the body and `pr-contract-bootstrap` must re-check it; that job is
     # independent of this one. Without this guard every verdict update cancelled
     # the in-flight run and re-queued the full matrix against an identical tree.
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
 
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -709,7 +721,7 @@ jobs:
     name: Affected path validation / evidence producer
     # `always()` would otherwise run this after a skipped plan and fail trying to
     # download the plan artifact that was never produced.
-    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
     needs: [affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -798,7 +810,7 @@ jobs:
 
   affected:
     name: Affected path validation
-    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
     needs: [affected-evidence-producer, affected-plan, affected-native, affected-shards, telegram-daemon-generation, windows-dev-doctor, windows-native-build-toolchain, windows-telegram-daemon-safety, affected-darwin-arm64-tab-worker-smoke]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
@@ -875,7 +887,7 @@ jobs:
   gjc-state-gates-matrix:
     name: gjc-state-gates / ${{ matrix.group }}
     # No `affected-plan` dependency, so this needs its own body-edit guard.
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
 
     runs-on: ubuntu-22.04
     timeout-minutes: 10
@@ -910,7 +922,7 @@ jobs:
   # Branch protection must keep requiring this stable aggregate status.
   gjc-state-gates:
     name: gjc-state-gates
-    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && github.event.action != 'edited' }}
+    if: ${{ always() && !(github.event_name == 'workflow_dispatch' && inputs.head_sha != '') && !(github.event_name == 'pull_request' && github.event.action == 'edited' && github.event.changes.body != null && github.event.changes.title == null && github.event.changes.base == null) }}
     needs: [gjc-state-gates-matrix]
     runs-on: ubuntu-22.04
     timeout-minutes: 5
