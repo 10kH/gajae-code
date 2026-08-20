@@ -250,6 +250,7 @@ describe("skills", () => {
 				// never loaded as session skills. Only the native location loads.
 				const { skills } = await loadSkills({
 					cwd: tempProjectDir,
+					home: tempHomeDir,
 					enableCodexUser: true,
 					enableClaudeUser: true,
 					enableClaudeProject: true,
@@ -419,7 +420,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				// No explicit settings at all: filesystem skill discovery is on by
 				// default and every canonical native location is loaded. Claude/Codex
 				// convention copies are import sources and never load directly.
-				const { skills } = await loadSkills({ cwd: tempDir });
+				const { skills } = await loadSkills({ cwd: tempDir, home: tempHome });
 				expect(skills.map(skill => skill.name).sort()).toEqual(["project-skill", "user-skill"]);
 			} finally {
 				homedirSpy.mockRestore();
@@ -447,7 +448,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 				await write(path.join(tempDir, ".gjc", "skills", "shared"), "shared", "root body");
 				await write(path.join(nested, ".gjc", "skills", "shared"), "shared", "nested body");
 
-				const { skills, warnings } = await loadSkills({ cwd: nested });
+				const { skills, warnings } = await loadSkills({ cwd: nested, home: tempHome });
 				const shared = skills.find(skill => skill.name === "shared");
 				expect(shared).toBeDefined();
 				expect(shared?.source).toBe("native:project");
@@ -458,14 +459,14 @@ description: Skill loaded from a tilde-expanded custom directory.
 
 				// Drop the nested copy: the repo-root project copy still beats user.
 				await fs.rm(path.join(nested, ".gjc"), { recursive: true, force: true });
-				const { skills: next } = await loadSkills({ cwd: nested });
+				const { skills: next } = await loadSkills({ cwd: nested, home: tempHome });
 				expect(next.find(skill => skill.name === "shared")?.filePath).toContain(
 					path.join(tempDir, ".gjc", "skills", "shared"),
 				);
 
 				// Drop all project copies: the user copy finally wins.
 				await fs.rm(path.join(tempDir, ".gjc"), { recursive: true, force: true });
-				const { skills: userWins } = await loadSkills({ cwd: nested });
+				const { skills: userWins } = await loadSkills({ cwd: nested, home: tempHome });
 				expect(userWins.find(skill => skill.name === "shared")?.filePath).toContain(
 					path.join(tempHome, ".gjc", "agent", "skills", "shared"),
 				);
@@ -492,12 +493,12 @@ description: Skill loaded from a tilde-expanded custom directory.
 				// surface), but the session merge in sdk/session.ts keeps the bundled
 				// definition authoritative (covered by sdk-skills.test.ts) and the
 				// project-scope copy is diagnosed as a protected-name collision.
-				const { skills, warnings } = await loadSkills({ cwd: tempDir });
+				const { skills, warnings } = await loadSkills({ cwd: tempDir, home: tempHome });
 				expect(skills.some(skill => skill.name === "ralplan")).toBe(true);
 				expect(warnings.some(w => w.message.includes("bundled GJC workflow skill"))).toBe(true);
 
 				// The legacy alias still disables the scope explicitly.
-				const legacyDisabled = await loadSkills({ cwd: tempDir, enablePiProject: false });
+				const legacyDisabled = await loadSkills({ cwd: tempDir, home: tempHome, enablePiProject: false });
 				expect(legacyDisabled.skills).toHaveLength(0);
 			} finally {
 				homedirSpy.mockRestore();
@@ -521,16 +522,21 @@ description: Skill loaded from a tilde-expanded custom directory.
 				await write(path.join(tempDir, ".gjc", "skills", "project-helper"), "project-helper");
 				await write(path.join(tempHome, ".gjc", "agent", "skills", "user-helper"), "user-helper");
 
-				const userOff = await loadSkills({ cwd: tempDir, trustUserSkills: false });
+				const userOff = await loadSkills({ cwd: tempDir, home: tempHome, trustUserSkills: false });
 				expect(userOff.skills.map(s => s.name)).toEqual(["project-helper"]);
 
-				const projectOff = await loadSkills({ cwd: tempDir, trustProjectSkills: false });
+				const projectOff = await loadSkills({ cwd: tempDir, home: tempHome, trustProjectSkills: false });
 				expect(projectOff.skills.map(s => s.name)).toEqual(["user-helper"]);
 
-				const allOff = await loadSkills({ cwd: tempDir, trustProjectSkills: false, trustUserSkills: false });
+				const allOff = await loadSkills({
+					cwd: tempDir,
+					home: tempHome,
+					trustProjectSkills: false,
+					trustUserSkills: false,
+				});
 				expect(allOff.skills).toHaveLength(0);
 
-				const masterOff = await loadSkills({ cwd: tempDir, enabled: false });
+				const masterOff = await loadSkills({ cwd: tempDir, home: tempHome, enabled: false });
 				expect(masterOff.skills).toHaveLength(0);
 			} finally {
 				homedirSpy.mockRestore();
