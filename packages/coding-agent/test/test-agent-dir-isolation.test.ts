@@ -277,4 +277,31 @@ describe("preload fail-closed behavior (real preload path)", () => {
 		expect(probe.exitCode).toBe(0);
 		expect(JSON.parse(probe.stdout.toString())).toEqual({ path: process.env.PATH });
 	}, 30_000);
+
+	test("preserves explicit E2E provider credentials in the real preload", async () => {
+		const probe = Bun.spawnSync({
+			cmd: [
+				process.execPath,
+				"--preload",
+				preload,
+				"-e",
+				"console.log(JSON.stringify({ e2e: process.env.E2E, openaiKey: process.env.OPENAI_API_KEY, openaiBaseUrl: process.env.OPENAI_BASE_URL }))",
+			],
+			env: {
+				...process.env,
+				E2E: "1",
+				OPENAI_API_KEY: "e2e-key",
+				OPENAI_BASE_URL: "https://e2e-provider.example.test/v1",
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+
+		expect(probe.exitCode).toBe(0);
+		expect(JSON.parse(probe.stdout.toString())).toMatchObject({
+			e2e: "1",
+			openaiKey: "e2e-key",
+			openaiBaseUrl: "https://e2e-provider.example.test/v1",
+		});
+	}, 30_000);
 });

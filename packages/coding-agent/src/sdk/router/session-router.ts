@@ -407,9 +407,11 @@ export class SessionRouter {
 	}
 
 	/** Exposed for deterministic callers and reconciliation tests. */
-	async reconcile(): Promise<void> {
-		await this.#serialReconcile(this.#runEpoch, true);
-		// Periodic reconciliation may have published an attachment while its
+	async reconcile(options: { waitForReplay?: boolean } = {}): Promise<void> {
+		const waitForReplay = options.waitForReplay ?? true;
+		await this.#serialReconcile(this.#runEpoch, !waitForReplay);
+		if (!waitForReplay) return;
+		// Periodic reconciliation may have published an attachment while its initial replay
 		// initial replay continues on that attachment's isolated ready tail.
 		// Explicit callers retain the historical synchronous contract without
 		// putting any ready tail back onto the fleet-wide reconcile tail.
