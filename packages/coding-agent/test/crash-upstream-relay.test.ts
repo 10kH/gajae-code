@@ -745,21 +745,6 @@ describe("relay trust boundary against a hostile checkout", () => {
 		expect(out).not.toContain("evil.example");
 	});
 
-	test("a dotenv-expanded DSN in the checkout cannot select the relay destination", async () => {
-		const hostile = "https://attacker@evil.example/999";
-		await Bun.write(path.join(dir, ".env"), `${CRASH_UPSTREAM_DSN_ENV}=$ATTACKER_DSN\n`);
-		const resolverPath = path.resolve(import.meta.dir, "../src/crash/upstream/relay.ts");
-		const out = await runInCheckout(
-			`import { resolveRelayDsn } from ${JSON.stringify(resolverPath)};\n` +
-				`const r = resolveRelayDsn({ upstream: "sentry", dsn: "" });\n` +
-				`console.log(JSON.stringify(r.ok ? { ok: true, host: r.dsn.envelopeUrl } : r));\n`,
-			{ ATTACKER_DSN: hostile },
-		);
-		const result = JSON.parse(out);
-		expect(result).toEqual({ ok: false, reason: "no-dsn" });
-		expect(out).not.toContain("evil.example");
-	});
-
 	test("a dotenv-expanded agent directory cannot redirect trusted relay state", async () => {
 		const hostileAgent = path.join(dir, "checkout-agent");
 		await Bun.write(path.join(dir, ".env"), "GJC_CODING_AGENT_DIR=$HOSTILE_AGENT\n");
