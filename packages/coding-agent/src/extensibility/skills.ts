@@ -127,7 +127,6 @@ const BUILT_IN_SKILL_NAMES = new Set<string>(CANONICAL_GJC_WORKFLOW_SKILLS);
  */
 export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadSkillsResult> {
 	const {
-		home = getTrustedHomeDir(),
 		cwd = getProjectDir(),
 		enabled = true,
 		customDirectories = [],
@@ -140,6 +139,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	if (!enabled) {
 		return { skills: [], warnings: [] };
 	}
+	const home = options.home ?? getTrustedHomeDir();
 
 	const projectTrusted = resolveSkillScopeTrust(options, "project");
 	const userTrusted = resolveSkillScopeTrust(options, "user");
