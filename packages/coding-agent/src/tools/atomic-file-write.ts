@@ -120,6 +120,8 @@ export interface WriteFileAtomicallyOptions {
 	platform?: NodeJS.Platform;
 	/** Sleep seam used by deterministic retry tests. */
 	sleep?: (delayMs: number) => Promise<void>;
+	/** Test seam invoked after the fallback handle is opened and before mutation. */
+	beforeInPlaceMutation?: () => Promise<void>;
 }
 
 function tempPathFor(dest: string): string {
@@ -254,6 +256,36 @@ function sameFileIdentity(left: ExistingFileMetadata, right: ExistingFileMetadat
 	);
 }
 
+function metadataFromStat(stat: {
+	mode: number;
+	uid: number;
+	gid: number;
+	nlink: number;
+	dev: number;
+	ino: number;
+}): ExistingFileMetadata {
+	return {
+		mode: stat.mode,
+		uid: stat.uid,
+		gid: stat.gid,
+		nlink: stat.nlink,
+		dev: stat.dev,
+		ino: stat.ino,
+	};
+}
+
+async function readWholeFileAtPositionZero(handle: fs.FileHandle): Promise<Uint8Array> {
+	const stat = await handle.stat();
+	const bytes = new Uint8Array(stat.size);
+	let read = 0;
+	while (read < bytes.byteLength) {
+		const result = await handle.read(bytes, read, bytes.byteLength - read, read);
+		if (result.bytesRead === 0) throw new Error(`in-place read stalled at ${read} of ${bytes.byteLength} bytes`);
+		read += result.bytesRead;
+	}
+	return bytes;
+}
+
 async function preserveExistingMetadata(tmp: string, existing: ExistingFileMetadata): Promise<void> {
 	const staged = await fs.stat(tmp);
 	if (staged.uid !== existing.uid || staged.gid !== existing.gid) {
@@ -329,6 +361,7 @@ async function replaceInPlaceAfterSharingViolation(
 	tmp: string,
 	platform: NodeJS.Platform,
 	expectedExisting: ExistingFileMetadata,
+	beforeMutation?: () => Promise<void>,
 ): Promise<void> {
 	if (platform !== "win32") throw new Error("in-place sharing fallback is Windows-only");
 	// This fallback mutates the destination by pathname instead of publishing a
@@ -336,44 +369,66 @@ async function replaceInPlaceAfterSharingViolation(
 	// file we were authorized to replace. Rename retries and their backoff give a
 	// concurrent writer time to substitute a different inode; overwriting that
 	// one in place would be an unauthorized mutation with no rollback source.
-	// `dest` is already the resolved referent, so lstat identity here is the same
-	// inode the pre-staging check authorized.
-	const current = (await resolvePublishPath(dest)).existing;
-	if (current === undefined || !sameFileIdentity(current, expectedExisting)) {
-		throw new FileWriteNotPublishedError(
-			dest,
-			new Error(
-				`destination '${dest}' was replaced before the in-place fallback; refusing to overwrite a different file`,
-			),
-			{ destUnchanged: true, publicationState: "not_published" },
-		);
-	}
-	const original = new Uint8Array(await Bun.file(dest).arrayBuffer());
+	// Open the pathname first, then bind all reads and writes to that handle. A
+	// pathname read followed by a later open can read one inode and mutate its
+	// successor. The handle identity and pathname identity are both checked
+	// immediately before the first mutation; a race therefore fails closed and
+	// never writes the successor.
 	const replacement = new Uint8Array(await Bun.file(tmp).arrayBuffer());
 	const handle = await fs.open(dest, "r+");
+	let original: Uint8Array | undefined;
 	let failure: unknown;
 	let committed = false;
+	let mutationStarted = false;
 	try {
 		try {
+			const opened = metadataFromStat(await handle.stat());
+			if (!sameFileIdentity(opened, expectedExisting)) {
+				throw new FileWriteNotPublishedError(
+					dest,
+					new Error(`destination '${dest}' changed before the in-place fallback was opened`),
+					{ destUnchanged: true, publicationState: "not_published" },
+				);
+			}
+			original = await readWholeFileAtPositionZero(handle);
+			if (beforeMutation) await beforeMutation();
+			const current = (await resolvePublishPath(dest)).existing;
+			const bound = metadataFromStat(await handle.stat());
+			if (
+				current === undefined ||
+				!sameFileIdentity(current, expectedExisting) ||
+				!sameFileIdentity(bound, expectedExisting)
+			) {
+				throw new FileWriteNotPublishedError(
+					dest,
+					new Error(
+						`destination '${dest}' was replaced before the in-place fallback mutation; refusing to overwrite a different file`,
+					),
+					{ destUnchanged: true, publicationState: "not_published" },
+				);
+			}
 			// Write at an explicit absolute position: handle.writeFile() appends from
 			// the handle's current offset, so a retry or rollback after a partial
 			// write would otherwise land mid-file and interleave bytes.
+			mutationStarted = true;
 			await writeWholeFileAtPositionZero(handle, replacement);
 			await handle.sync();
 			await handle.truncate(replacement.byteLength);
 			await handle.sync();
 			committed = true;
 		} catch (error) {
-			try {
-				await writeWholeFileAtPositionZero(handle, original);
-				await handle.truncate(original.byteLength);
-				await handle.sync();
-			} catch (rollbackError) {
-				failure = new FileWriteNotPublishedError(
-					dest,
-					new AggregateError([error, rollbackError], "In-place write rollback failed."),
-					{ destUnchanged: false, publicationState: "unknown" },
-				);
+			if (original !== undefined && mutationStarted) {
+				try {
+					await writeWholeFileAtPositionZero(handle, original);
+					await handle.truncate(original.byteLength);
+					await handle.sync();
+				} catch (rollbackError) {
+					failure = new FileWriteNotPublishedError(
+						dest,
+						new AggregateError([error, rollbackError], "In-place write rollback failed."),
+						{ destUnchanged: false, publicationState: "unknown" },
+					);
+				}
 			}
 			if (failure === undefined) failure = error;
 		}
@@ -497,7 +552,13 @@ export async function writeFileAtomically(
 					await renameIntoPlace(tmp, publishPath, platform, sleep);
 				} catch (error) {
 					if (existing !== undefined && platform === "win32" && isWindowsSharingViolation(error)) {
-						await replaceInPlaceAfterSharingViolation(publishPath, tmp, platform, existing);
+						await replaceInPlaceAfterSharingViolation(
+							publishPath,
+							tmp,
+							platform,
+							existing,
+							options.beforeInPlaceMutation,
+						);
 						try {
 							await fs.unlink(tmp);
 						} catch (cleanupError) {

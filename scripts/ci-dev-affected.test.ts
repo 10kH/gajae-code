@@ -1366,6 +1366,11 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
 		}
 	});
+	test("never emits a runnable task for a nonexistent test path", () => {
+		const missing = "packages/coding-agent/test/write-acp-fs-missing.test.ts";
+		const tasks = planTargetedTasks([missing], targetingPackages, [...testFiles, missing], true);
+		expect(tasks.map(task => task.key)).not.toContain(`test:${missing}`);
+	});
 	test("native path identity changes select the POSIX regression suite", () => {
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");

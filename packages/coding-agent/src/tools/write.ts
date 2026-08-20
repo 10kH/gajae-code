@@ -1,6 +1,5 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
@@ -249,11 +248,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 		resolvedArchivePath: ResolvedArchiveWritePath,
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const isZip = resolvedArchivePath.absolutePath.toLowerCase().endsWith(".zip");
-
-		const parentDir = path.dirname(resolvedArchivePath.absolutePath);
-		if (parentDir && parentDir !== ".") {
-			await fs.mkdir(parentDir, { recursive: true });
-		}
 
 		if (isZip) {
 			const zipEntries: Record<string, Uint8Array> = {};

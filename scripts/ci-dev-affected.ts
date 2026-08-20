@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { $ } from "bun";
+import * as fsSync from "node:fs";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { selectCanaryTests } from "./ci-risk-canary-manifest";
@@ -287,8 +288,8 @@ async function resolvePlannedTasks(paths: readonly string[]): Promise<Task[]> {
 	const normalizedPaths = normalizeChangedPaths(paths);
 	const packages = await getWorkspacePackages();
 	const legacy = resolvePlanMode() === "pr"
-		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles())
-		: planTasks(normalizedPaths, packages);
+		? planTargetedTasks(normalizedPaths, packages, await gatherTestFiles(), true)
+		: planTasks(normalizedPaths, packages, true);
 	if (normalizedPaths.length > 0 && normalizedPaths.every(isDocOrChangelogPath)) return legacy;
 	return appendBuildTasks(legacy, normalizedPaths, packages, await loadBuildInventory());
 }
@@ -735,7 +736,11 @@ function readStringMap(value: unknown): Record<string, string> | undefined {
 	return Object.fromEntries(entries);
 }
 
-export function planTasks(paths: readonly string[], packages: readonly WorkspacePackage[]): Task[] {
+export function planTasks(
+	paths: readonly string[],
+	packages: readonly WorkspacePackage[],
+	validateTestPaths = false,
+): Task[] {
 	const tasks = new Map<string, Task>();
 	// Mirror of the docs-index gate in planTargetedTasks: docs/ is the source the
 	// embedded index is generated from, so either side changing must run its gate.
@@ -841,7 +846,12 @@ export function planTasks(paths: readonly string[], packages: readonly Workspace
 // Native builds are added once (native-linux-x64) only when a planned task needs
 // the addon at runtime; the dedicated job restores it from cache when no native
 // source changed, so PRs never rebuild native per shard.
-export function planTargetedTasks(paths: readonly string[], packages: readonly WorkspacePackage[], testFiles: readonly string[]): Task[] {
+export function planTargetedTasks(
+	paths: readonly string[],
+	packages: readonly WorkspacePackage[],
+	testFiles: readonly string[],
+	validateTestPaths = false,
+): Task[] {
 	const tasks = new Map<string, Task>();
 	const relevant = paths.filter(changedPath => !isDocOrChangelogPath(changedPath));
 	// A docs edit is cheap, but it is not free: docs/ is the source the embedded docs
@@ -885,7 +895,7 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 			add(tasks, "rust-check", "Rust check", ["bun", "run", "check:rs"]);
 			add(tasks, "rust-test", "Rust tests", ["bun", "run", "test:rs"]);
 			for (const testFile of behavioralTestsFor(changedPath)) {
-				addTestFileTask(tasks, testFile);
+				addTestFileTask(tasks, testFile, validateTestPaths);
 			}
 			continue;
 		}
@@ -916,10 +926,10 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 
 		const mappedTests = mappedTestsFor(changedPath, packages, testFiles);
 		for (const testFile of mappedTests) {
-			addTestFileTask(tasks, testFile);
+			addTestFileTask(tasks, testFile, validateTestPaths);
 		}
 		for (const testFile of behavioralTestsFor(changedPath)) {
-			addTestFileTask(tasks, testFile);
+			addTestFileTask(tasks, testFile, validateTestPaths);
 		}
 		if (isCodingAgentShardOneCoveragePath(changedPath)) {
 			addCodingAgentTestShard(tasks, 1);
@@ -978,7 +988,8 @@ export function planTargetedTasks(paths: readonly string[], packages: readonly W
 
 // Add a task that runs exactly one test file. Keyed as `test:<repo-relative-path>`
 // so the matrix shard name stays small and directly traceable to the file.
-function addTestFileTask(tasks: Map<string, Task>, testFile: string): void {
+function addTestFileTask(tasks: Map<string, Task>, testFile: string, requireExisting = false): void {
+	if (requireExisting && !fsSync.existsSync(path.join(repoRoot, testFile))) return;
 	add(tasks, `test:${testFile}`, `Test ${testFile}`, ["bun", "test", testFile]);
 }
 

@@ -601,6 +601,28 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
+	it("does not mkdir an archive path before rejecting a boundary escape", async () => {
+		if (process.platform === "win32") return;
+		const sessionRoot = path.join(os.tmpdir(), "gjc-local", "archive-boundary-test");
+		const outsideRoot = path.join(tmpDir, "archive-outside-root");
+		const danglingArchive = path.join(outsideRoot, "attacker", "nested", "payload.zip");
+		const link = path.join(sessionRoot, "archive-link.zip");
+		await fs.mkdir(sessionRoot, { recursive: true });
+		await fs.symlink(danglingArchive, link);
+		try {
+			await expect(
+				new WriteTool(createSession(tmpDir)).execute("archive-boundary", {
+					path: `${link}:payload.txt`,
+					content: "must not publish\n",
+				}),
+			).rejects.toThrow(/outside trust boundary/);
+			expect(await Bun.file(danglingArchive).exists()).toBe(false);
+			await expect(fs.stat(outsideRoot)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await fs.rm(sessionRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("refuses the Windows in-place fallback when the destination inode was replaced", async () => {
 		if (process.platform === "win32") return;
 		const dest = path.join(tmpDir, "win-substituted.ts");
@@ -634,6 +656,34 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 			// The successor must survive untouched, and the report must be truthful.
 			expect(await fs.readFile(dest, "utf8")).toBe("successor-inode\n");
 			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			rename.mockRestore();
+		}
+	});
+
+	it("fails closed when the pathname changes after fallback validation", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "win-post-open-race.ts");
+		const successor = path.join(tmpDir, "win-post-open-successor.ts");
+		await fs.writeFile(dest, "authorized-original\n");
+		const realRename = fs.rename.bind(fs);
+		const rename = spyOn(fs, "rename").mockRejectedValue(Object.assign(new Error("EBUSY"), { code: "EBUSY" }));
+		let raced = false;
+		try {
+			await expect(
+				writeFileAtomically(dest, "ours\n", {
+					platform: "win32",
+					sleep: async () => {},
+					beforeInPlaceMutation: async () => {
+						if (raced) return;
+						raced = true;
+						await fs.writeFile(successor, "successor-inode\n");
+						await realRename(successor, dest);
+					},
+				}),
+			).rejects.toMatchObject({ destUnchanged: true, publicationState: "not_published" });
+			expect(raced).toBe(true);
+			expect(await fs.readFile(dest, "utf8")).toBe("successor-inode\n");
 		} finally {
 			rename.mockRestore();
 		}
