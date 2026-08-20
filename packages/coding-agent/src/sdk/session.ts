@@ -64,7 +64,9 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
+import { EditTool } from "../edit";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
+import { SearchTool } from "../tools/search";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
@@ -210,6 +212,14 @@ type McpNotificationEntry = {
 	serverName: string;
 	uri: string;
 };
+
+/** Capture the cursor edit grant before the model-facing edit entry is removed. */
+export function captureCursorEditTool<T>(
+	toolRegistry: ReadonlyMap<string, unknown>,
+	createReplaceTool: () => T,
+): T | undefined {
+	return toolRegistry.has("edit") ? createReplaceTool() : undefined;
+}
 
 function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessage<AsyncResultDetails> | null {
 	if (entries.length === 0) return null;
@@ -2933,6 +2943,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolRegistry.set(tool.name, wrapped);
 			}
 		}
+		const rawCursorReplaceEditTool = captureCursorEditTool(toolRegistry, () => new EditTool(toolSession, "replace"));
+		const cursorReplaceEditTool: AgentTool | undefined = rawCursorReplaceEditTool
+			? extensionRunner
+				? (new ExtensionToolWrapper(rawCursorReplaceEditTool, extensionRunner) as AgentTool)
+				: (rawCursorReplaceEditTool as AgentTool)
+			: undefined;
 		if (model?.provider === "cursor") {
 			toolRegistry.delete("edit");
 			builtinCandidateTools = builtinCandidateTools.filter(tool => tool.name !== "edit");
@@ -2980,6 +2996,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const cursorExecHandlers = new CursorExecHandlers({
 			cwd,
 			tools: toolRegistry,
+			getEditReplaceTool: () => cursorReplaceEditTool,
+			createSearchTool: options => {
+				if (!toolRegistry.has("search")) return undefined;
+				const search = new SearchTool(toolSession, options);
+				return extensionRunner
+					? (new ExtensionToolWrapper(search as unknown as AgentTool, extensionRunner) as AgentTool)
+					: (search as unknown as AgentTool);
+			},
 			getToolContext: () => toolContextStore.getContext(),
 			emitEvent: event => cursorEventEmitter?.(event),
 			createEventEmitter: () => agent.createExternalEventEmitterForCurrentRun(),

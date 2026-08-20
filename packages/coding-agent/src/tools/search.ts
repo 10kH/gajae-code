@@ -230,6 +230,13 @@ export interface SearchToolDetails {
 	missingPaths?: string[];
 }
 
+export interface SearchToolOptions {
+	/** Per-call symmetric context width used by Cursor's native Pi grep frame. */
+	context?: number;
+	/** Per-call total match cap used by Cursor's native Pi grep frame. */
+	totalMatchLimit?: number;
+}
+
 type SearchParams = z.infer<typeof searchSchema>;
 
 export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDetails> {
@@ -247,7 +254,10 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 	readonly parameters = searchSchema;
 	readonly strict = true;
 
-	constructor(private readonly session: ToolSession) {}
+	constructor(
+		private readonly session: ToolSession,
+		private readonly options: SearchToolOptions = {},
+	) {}
 
 	async execute(
 		_toolCallId: string,
@@ -293,8 +303,12 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 							`or pass a UTF-8 text member.`,
 					);
 				}
-				const normalizedContextBefore = this.session.settings.get("search.contextBefore");
-				const normalizedContextAfter = this.session.settings.get("search.contextAfter");
+				const normalizedContextBefore = this.options.context ?? this.session.settings.get("search.contextBefore");
+				const normalizedContextAfter = this.options.context ?? this.session.settings.get("search.contextAfter");
+				const nativeMatchCap =
+					this.options.totalMatchLimit === undefined
+						? INTERNAL_TOTAL_CAP
+						: Math.min(INTERNAL_TOTAL_CAP, this.options.totalMatchLimit + 1);
 				const ignoreCase = i ?? false;
 				const useGitignore = gitignore ?? true;
 				const patternHasNewline = normalizedPattern.includes("\n") || normalizedPattern.includes("\\n");
@@ -362,7 +376,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 									hidden: true,
 									gitignore: useGitignore,
 									cache: false,
-									maxCount: INTERNAL_TOTAL_CAP,
+									maxCount: nativeMatchCap,
 									contextBefore: normalizedContextBefore,
 									contextAfter: normalizedContextAfter,
 									maxColumns: DEFAULT_MAX_COLUMN,
@@ -397,7 +411,7 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 								hidden: true,
 								gitignore: useGitignore,
 								cache: false,
-								maxCount: INTERNAL_TOTAL_CAP,
+								maxCount: nativeMatchCap,
 								contextBefore: normalizedContextBefore,
 								contextAfter: normalizedContextAfter,
 								maxColumns: DEFAULT_MAX_COLUMN,
@@ -468,6 +482,12 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 							}
 						}
 					}
+				}
+				const explicitMatchLimitReached =
+					this.options.totalMatchLimit !== undefined &&
+					(selectedMatches.length > this.options.totalMatchLimit || result.limitReached);
+				if (this.options.totalMatchLimit !== undefined && selectedMatches.length > this.options.totalMatchLimit) {
+					selectedMatches.length = this.options.totalMatchLimit;
 				}
 				const nextSkip = skipFiles + windowFiles.length;
 				const limitMessage = fileLimitReached
@@ -608,7 +628,11 @@ export class SearchTool implements AgentTool<typeof searchSchema, SearchToolDeta
 					})),
 					truncated,
 					fileLimitReached: fileLimitReached ? DEFAULT_FILE_LIMIT : undefined,
-					perFileLimitReached: perFileLimitReached ? perFileMatchCap : undefined,
+					perFileLimitReached: explicitMatchLimitReached
+						? this.options.totalMatchLimit
+						: perFileLimitReached
+							? perFileMatchCap
+							: undefined,
 					displayContent: displayText,
 					missingPaths: missingPaths.length > 0 ? missingPaths : undefined,
 				};

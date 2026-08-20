@@ -10,6 +10,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { captureCursorEditTool } from "../src/sdk/session";
 
 const authStorages: AuthStorage[] = [];
 
@@ -580,5 +581,24 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		} finally {
 			await session.dispose();
 		}
+	});
+});
+
+describe("Cursor edit grant capture", () => {
+	it("captures replace mode before the model-facing edit entry is removed", () => {
+		const toolRegistry = new Map<string, unknown>([["edit", { name: "edit" }]]);
+		const replaceTool = captureCursorEditTool(toolRegistry, () => ({ mode: "replace" }));
+
+		toolRegistry.delete("edit");
+
+		expect(replaceTool).toEqual({ mode: "replace" });
+	});
+
+	it("does not create a replace tool without an edit grant", () => {
+		const toolRegistry = new Map<string, unknown>();
+		const createReplaceTool = vi.fn(() => ({ mode: "replace" }));
+
+		expect(captureCursorEditTool(toolRegistry, createReplaceTool)).toBeUndefined();
+		expect(createReplaceTool).not.toHaveBeenCalled();
 	});
 });

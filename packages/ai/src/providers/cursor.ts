@@ -26,12 +26,39 @@ import type {
 	ToolResultMessage,
 } from "../types";
 import { normalizeSystemPrompts } from "../utils";
+import { kCursorExecResolved } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { findUnnecessaryUnicodeEscape, parseStreamingJson } from "../utils/json-parse";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import { CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
 import { CURSOR_CLIENT_VERSION } from "./cursor/client-version";
+import {
+	buildMcpStateResult,
+	buildNeutralHookResult,
+	buildPiBashError,
+	buildPiBashResult,
+	buildPiEditError,
+	buildPiEditRejected,
+	buildPiEditResult,
+	buildPiFindError,
+	buildPiFindResult,
+	buildPiGrepError,
+	buildPiGrepResult,
+	buildPiLsError,
+	buildPiLsResult,
+	buildPiReadError,
+	buildPiReadResult,
+	buildPiWriteError,
+	buildPiWriteRejected,
+	buildPiWriteResult,
+	piEscapeRegexLiteral,
+	piJoinPath,
+	piLimit,
+	piLsPath,
+	piReadDisplayPath,
+	piTimeout,
+} from "./cursor/exec-modern";
 import type { McpToolDefinition } from "./cursor/gen/agent_pb";
 import {
 	AgentClientMessageSchema,
@@ -60,6 +87,7 @@ import {
 	type ExecClientMessage,
 	ExecClientMessageSchema,
 	ExecClientStreamCloseSchema,
+	ExecClientThrowSchema,
 	type ExecServerMessage,
 	FetchErrorSchema,
 	FetchResultSchema,
@@ -87,6 +115,7 @@ import {
 	LsRejectedSchema,
 	LsResultSchema,
 	LsSuccessSchema,
+	McpAllowlistPrecheckResultSchema,
 	McpErrorSchema,
 	McpImageContentSchema,
 	McpResultSchema,
@@ -109,6 +138,7 @@ import {
 	SelectedContextSchema,
 	SelectedImageSchema,
 	SetBlobResultSchema,
+	ShellAllowlistPrecheckResultSchema,
 	type ShellArgs,
 	ShellFailureSchema,
 	ShellRejectedSchema,
@@ -123,6 +153,7 @@ import {
 	ShellSuccessSchema,
 	UserMessageActionSchema,
 	UserMessageSchema,
+	WebFetchAllowlistPrecheckResultSchema,
 	WriteErrorSchema,
 	WriteRejectedSchema,
 	WriteResultSchema,
@@ -443,6 +474,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			let resolveH2: (() => void) | undefined;
+			let rejectH2: ((error: unknown) => void) | undefined;
+			const messageQueue = createCursorMessageQueueForTest(error => {
+				log("error", "handleServerMessage", { error: String(error) });
+			});
 
 			h2Request.on("data", (chunk: Buffer) => {
 				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
@@ -469,28 +504,35 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 						const isTurnEnded =
 							serverMessage.message.case === "interactionUpdate" &&
 							serverMessage.message.value.message?.case === "turnEnded";
-						void handleServerMessage(
-							serverMessage,
-							output,
-							stream,
-							state,
-							blobStore,
-							h2Request!,
-							options?.execHandlers,
-							options?.onToolResult,
-							usageState,
-							requestContextTools,
-							onConversationCheckpoint,
-						).catch(error => {
-							log("error", "handleServerMessage", { error: String(error) });
-						});
+						// Serialize handlers: exec messages can be asynchronous, and resolving the
+						// request on turnEnded before prior handlers finish loses their responses.
+						messageQueue.enqueue(() =>
+							handleServerMessage(
+								serverMessage,
+								output,
+								stream,
+								state,
+								blobStore,
+								h2Request!,
+								options?.execHandlers,
+								options?.onToolResult,
+								usageState,
+								requestContextTools,
+								onConversationCheckpoint,
+							),
+						);
 
 						// Resolve only on explicit turnEnded. stopReason defaults to "stop"
 						// and is not a reliable signal for stream completion.
-						if (isTurnEnded && resolveH2) {
-							const r = resolveH2;
-							resolveH2 = undefined;
-							r();
+						if (isTurnEnded) {
+							messageQueue.drain().then(() => {
+								if (resolveH2) {
+									const r = resolveH2;
+									resolveH2 = undefined;
+									rejectH2 = undefined;
+									r();
+								}
+							});
 						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
@@ -515,6 +557,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 			await new Promise<void>((resolve, reject) => {
 				resolveH2 = resolve;
+				rejectH2 = reject;
 
 				h2Request!.on("trailers", trailers => {
 					const status = trailers["grpc-status"];
@@ -525,15 +568,17 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				});
 
 				h2Request!.on("end", () => {
-					resolveH2 = undefined;
-					if (endStreamError) {
-						reject(endStreamError);
-						return;
-					}
-					resolve();
+					messageQueue.drain().then(() => {
+						resolveH2 = undefined;
+						rejectH2 = undefined;
+						if (endStreamError) reject(endStreamError);
+						else resolve();
+					});
 				});
 
-				h2Request!.on("error", reject);
+				h2Request!.on("error", error => {
+					if (rejectH2) rejectH2(error);
+				});
 
 				if (options?.signal) {
 					options.signal.addEventListener("abort", () => {
@@ -608,7 +653,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 	return stream;
 };
 
-type ToolCallState = ToolCall & { index: number; partialJson?: string; kind: "mcp" | "todo_write" | "native" };
+type ToolCallState = ToolCall & {
+	index: number;
+	partialJson?: string;
+	kind: "mcp" | "todo_write" | "native" | "cursor-exec";
+	[kCursorExecResolved]?: true;
+};
 
 interface BlockState {
 	currentTextBlock: (TextContent & { index: number }) | null;
@@ -653,6 +703,8 @@ async function handleServerMessage(
 			execHandlers,
 			onToolResult,
 			requestContextTools,
+			output,
+			stream,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
@@ -1009,6 +1061,8 @@ async function handleExecServerMessage(
 	execHandlers: CursorExecHandlers | undefined,
 	onToolResult: CursorToolResultHandler | undefined,
 	requestContextTools: McpToolDefinition[],
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
@@ -1224,35 +1278,212 @@ async function handleExecServerMessage(
 			sendExecClientMessage(h2Request, execMsg, "computerUseResult", execResult);
 			return;
 		}
+		case "piReadArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", {
+				path: piReadDisplayPath(args.path, args.offset, args.limit),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piRead?.bind(execHandlers),
+				onToolResult,
+				buildPiReadResult,
+				buildPiReadError,
+				buildPiReadError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piReadResult", execResult);
+			return;
+		}
+		case "piBashArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "bash", {
+				command: args.command,
+				timeout: piTimeout(args.timeout),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piBash?.bind(execHandlers),
+				onToolResult,
+				buildPiBashResult,
+				buildPiBashError,
+				buildPiBashError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piBashResult", execResult);
+			return;
+		}
+		case "piEditArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "edit", {
+				path: args.path,
+				edits: args.edits.map(edit => ({ old_text: edit.oldText, new_text: edit.newText })),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piEdit?.bind(execHandlers),
+				onToolResult,
+				buildPiEditResult,
+				buildPiEditRejected,
+				buildPiEditError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piEditResult", execResult);
+			return;
+		}
+		case "piWriteArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "write", {
+				path: args.path,
+				content: args.content,
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piWrite?.bind(execHandlers),
+				onToolResult,
+				buildPiWriteResult,
+				buildPiWriteRejected,
+				buildPiWriteError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piWriteResult", execResult);
+			return;
+		}
+		case "piGrepArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "search", {
+				pattern: args.literal === true ? piEscapeRegexLiteral(args.pattern) : args.pattern,
+				paths: [args.glob ? piJoinPath(args.path, args.glob) : args.path || "."],
+				// The model-facing search schema uses `i: true` for
+				// case-insensitive matching. Keep the field absent otherwise.
+				...(args.ignoreCase === true ? { i: true } : {}),
+				context: args.context,
+				limit: piLimit(args.limit),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piGrep?.bind(execHandlers),
+				onToolResult,
+				buildPiGrepResult,
+				buildPiGrepError,
+				buildPiGrepError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piGrepResult", execResult);
+			return;
+		}
+		case "piFindArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "find", {
+				paths: [piJoinPath(args.path, args.pattern)],
+				limit: piLimit(args.limit),
+			});
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piFind?.bind(execHandlers),
+				onToolResult,
+				buildPiFindResult,
+				buildPiFindError,
+				buildPiFindError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piFindResult", execResult);
+			return;
+		}
+		case "piLsArgs": {
+			const args = execMsg.message.value;
+			const toolCallId = crypto.randomUUID();
+			synthesizeCursorExecToolCall(output, stream, toolCallId, "read", { path: piLsPath(args.path) });
+			const call = { args, toolCallId };
+			const { execResult } = await resolveExecHandler(
+				call,
+				execHandlers?.piLs?.bind(execHandlers),
+				onToolResult,
+				buildPiLsResult,
+				buildPiLsError,
+				buildPiLsError,
+			);
+			sendExecClientMessage(h2Request, execMsg, "piLsResult", execResult);
+			return;
+		}
+		case "mcpStateExecArgs": {
+			sendExecClientMessage(
+				h2Request,
+				execMsg,
+				"mcpStateExecResult",
+				buildMcpStateResult(requestContextTools, execMsg.message.value.serverIdentifiers),
+			);
+			return;
+		}
+		case "executeHookArgs": {
+			const execResult = buildNeutralHookResult(execMsg.message.value.request);
+			if (!execResult) {
+				sendExecClientThrow(
+					h2Request,
+					execMsg,
+					`Unsupported hook request: ${execMsg.message.value.request?.request.case ?? "unset"}`,
+					"unknown_hook_request",
+				);
+				return;
+			}
+			sendExecClientMessage(h2Request, execMsg, "executeHookResult", execResult);
+			return;
+		}
+		case "shellAllowlistPrecheckArgs": {
+			sendExecClientMessage(
+				h2Request,
+				execMsg,
+				"shellAllowlistPrecheckResult",
+				create(ShellAllowlistPrecheckResultSchema, { allowlisted: false }),
+			);
+			return;
+		}
+		case "mcpAllowlistPrecheckArgs": {
+			sendExecClientMessage(
+				h2Request,
+				execMsg,
+				"mcpAllowlistPrecheckResult",
+				create(McpAllowlistPrecheckResultSchema, { allowlisted: false }),
+			);
+			return;
+		}
+		case "webFetchAllowlistPrecheckArgs": {
+			sendExecClientMessage(
+				h2Request,
+				execMsg,
+				"webFetchAllowlistPrecheckResult",
+				create(WebFetchAllowlistPrecheckResultSchema, { allowlisted: false }),
+			);
+			return;
+		}
 		default: {
 			log("warn", "unhandledExecMessage", { execCase });
-			// Send a bare ExecClientMessage (id + execId only, no typed result) so the
-			// server gets an acknowledgement and doesn't hang waiting forever.
-			const ack = create(ExecClientMessageSchema, {
-				id: execMsg.id,
-				execId: execMsg.execId,
-			});
-			const clientMessage = create(AgentClientMessageSchema, {
-				message: { case: "execClientMessage", value: ack },
-			});
-			h2Request.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+			sendExecClientThrow(
+				h2Request,
+				execMsg,
+				`No handler for exec message of type ${execCase}`,
+				"exec_variant_unsupported",
+			);
 		}
 	}
 }
 
-function sendExecClientMessage<T>(
+function sendExecClientMessage<TCase extends NonNullable<ExecClientMessage["message"]["case"]>>(
 	h2Request: http2.ClientHttp2Stream,
 	execMsg: ExecServerMessage,
-	messageCase: ExecClientMessage["message"]["case"],
-	value: T,
+	messageCase: TCase,
+	value: Extract<ExecClientMessage["message"], { case: TCase }>["value"],
 ): void {
 	const execClientMessage = create(ExecClientMessageSchema, {
 		id: execMsg.id,
 		execId: execMsg.execId,
-		message: {
-			case: messageCase,
-			value: value as any,
-		},
+		message: { case: messageCase, value } as ExecClientMessage["message"],
 	});
 
 	const clientMessage = create(AgentClientMessageSchema, {
@@ -1263,6 +1494,25 @@ function sendExecClientMessage<T>(
 	h2Request.write(frameConnectMessage(responseBytes));
 
 	log("execClientMessage", messageCase, value);
+}
+
+function sendExecClientThrow(
+	h2Request: http2.ClientHttp2Stream,
+	execMsg: ExecServerMessage,
+	error: string,
+	errorCode: string,
+): void {
+	const controlMessage = create(ExecClientControlMessageSchema, {
+		message: {
+			case: "throw",
+			value: create(ExecClientThrowSchema, { id: execMsg.id, error, errorCode }),
+		},
+	});
+	const clientMessage = create(AgentClientMessageSchema, {
+		message: { case: "execClientControlMessage", value: controlMessage },
+	});
+	h2Request.write(frameConnectMessage(toBinary(AgentClientMessageSchema, clientMessage)));
+	sendExecClientStreamClose(h2Request, execMsg);
 }
 
 function sendExecClientStreamClose(h2Request: http2.ClientHttp2Stream, execMsg: ExecServerMessage): void {
@@ -1311,6 +1561,26 @@ export async function resolveExecHandler<TArgs, TResult>(
 		const message = error instanceof Error ? error.message : String(error);
 		return { execResult: buildError(message) };
 	}
+}
+
+/** Exported for deterministic coverage of ordered server-message handling. */
+export function createCursorMessageQueueForTest(onError?: (error: unknown) => void): {
+	enqueue(handler: () => void | Promise<void>): Promise<void>;
+	drain(): Promise<void>;
+} {
+	let chain = Promise.resolve();
+	return {
+		enqueue(handler) {
+			const result = chain.then(handler);
+			chain = result.catch(error => {
+				onError?.(error);
+			});
+			return result;
+		},
+		drain() {
+			return chain;
+		},
+	};
 }
 
 function splitExecHandlerResult<TResult>(result: CursorExecHandlerResult<TResult>): {
@@ -1866,12 +2136,15 @@ interface CursorTodoItem {
 
 interface CursorUpdateTodosToolCall {
 	updateTodosToolCall?: { args?: { todos?: CursorTodoItem[] } };
+	tool?: { case?: string; value?: { args?: { todos?: CursorTodoItem[] } } };
 }
 
 function buildTodoWriteArgs(toolCall: CursorUpdateTodosToolCall): {
 	todos: Array<{ id?: string; content: string; activeForm: string; status: "pending" | "in_progress" | "completed" }>;
 } | null {
-	const todos = toolCall.updateTodosToolCall?.args?.todos;
+	const updateCall =
+		toolCall.tool?.case === "updateTodosToolCall" ? toolCall.tool.value : toolCall.updateTodosToolCall;
+	const todos = updateCall?.args?.todos;
 	if (!todos) return null;
 	return {
 		todos: todos.map(todo => ({
@@ -1984,11 +2257,45 @@ export function cursorJsonSafeValueForTest(value: unknown): unknown {
 	return cursorJsonSafeValue(value);
 }
 
+function selectMcpToolCall(toolCall: any): any {
+	return toolCall?.tool?.case === "mcpToolCall" ? toolCall.tool.value : toolCall?.mcpToolCall;
+}
+
+const CURSOR_EXEC_OWNED_TOOL_CASES = new Set([
+	"piReadToolCall",
+	"piBashToolCall",
+	"piEditToolCall",
+	"piWriteToolCall",
+	"piGrepToolCall",
+	"piFindToolCall",
+	"piLsToolCall",
+]);
+
+function isExecOwnedToolCall(toolCall: any): boolean {
+	return CURSOR_EXEC_OWNED_TOOL_CASES.has(toolCall?.tool?.case);
+}
+
 export function buildNativeToolCallBlock(
 	toolCall: Record<string, unknown>,
 	callId: string,
 	index: number,
 ): ToolCallState | null {
+	const oneof = toolCall.tool as { case?: string; value?: unknown } | undefined;
+	if (oneof?.case && oneof.value && typeof oneof.value === "object") {
+		const args = (oneof.value as { args?: unknown }).args;
+		const convertedArgs = cursorJsonSafeValue(args ?? oneof.value);
+		return {
+			type: "toolCall",
+			id: callId,
+			name: cursorNativeToolName(oneof.case),
+			arguments:
+				convertedArgs && typeof convertedArgs === "object" && !Array.isArray(convertedArgs)
+					? (convertedArgs as Record<string, unknown>)
+					: { raw: convertedArgs },
+			index,
+			kind: "native",
+		};
+	}
 	for (const [key, payload] of Object.entries(toolCall)) {
 		if (!/ToolCall$/.test(key) || !payload || typeof payload !== "object") continue;
 		if (key === "mcpToolCall" || key === "updateTodosToolCall") continue;
@@ -2067,6 +2374,30 @@ function buildMcpErrorResult(error: string) {
 	});
 }
 
+function synthesizeCursorExecToolCall(
+	output: AssistantMessage,
+	stream: AssistantMessageEventStream,
+	toolCallId: string,
+	name: string,
+	args: Record<string, unknown>,
+): void {
+	const block: ToolCallState = {
+		type: "toolCall",
+		id: toolCallId,
+		name,
+		arguments: cursorJsonSafeValue(args) as Record<string, unknown>,
+		index: output.content.length,
+		kind: "cursor-exec",
+		[kCursorExecResolved]: true,
+	};
+	output.content.push(block);
+	const contentIndex = output.content.length - 1;
+	stream.push({ type: "toolcall_start", contentIndex, partial: output });
+	delete (block as Partial<ToolCallState>).index;
+	delete (block as Partial<ToolCallState>).kind;
+	stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
+}
+
 function processInteractionUpdate(
 	update: any,
 	output: AssistantMessage,
@@ -2122,10 +2453,14 @@ function processInteractionUpdate(
 			});
 			state.setThinkingBlock(null);
 		}
+	} else if (updateCase === "toolCallStarted" && isExecOwnedToolCall(update.message.value.toolCall)) {
+		// Pi stream call IDs and exec IDs are distinct namespaces; without a shared
+		// correlation field, suppress the streamed variant and synthesize from exec.
+		log("exec", "streamedToolCallOwnedByExec", { case: update.message.value.toolCall?.tool?.case });
 	} else if (updateCase === "toolCallStarted") {
 		const toolCall = update.message.value.toolCall;
 		if (toolCall) {
-			const mcpCall = toolCall.mcpToolCall;
+			const mcpCall = selectMcpToolCall(toolCall);
 			if (mcpCall) {
 				const args = mcpCall.args || {};
 				const block: ToolCallState = {
@@ -2186,7 +2521,7 @@ function processInteractionUpdate(
 		if (state.currentToolCall) {
 			const toolCall = update.message.value.toolCall;
 			if (state.currentToolCall.kind === "mcp") {
-				const decodedArgs = decodeMcpArgsMap(toolCall?.mcpToolCall?.args?.args);
+				const decodedArgs = decodeMcpArgsMap(selectMcpToolCall(toolCall)?.args?.args);
 				if (decodedArgs) {
 					state.currentToolCall.arguments = decodedArgs;
 				}

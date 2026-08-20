@@ -32,6 +32,7 @@ import {
 	neutralizeReservedControlTokens,
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
+import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
 import { logger, sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
 import {
@@ -2797,7 +2798,9 @@ async function runLoopBody(
 				// Create placeholder tool results for any tool calls in the aborted message
 				// This maintains the tool_use/tool_result pairing that the API requires
 				type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
-				const toolCalls = message.content.filter((c): c is ToolCallContent => c.type === "toolCall");
+				const toolCalls = message.content.filter(
+					(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
 					const result = createAbortedToolResult(toolCall, stream, message.stopReason, message.errorMessage);
@@ -2827,7 +2830,10 @@ async function runLoopBody(
 			}
 
 			// Check for tool calls
-			const toolCalls = message.content.filter(c => c.type === "toolCall");
+			type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
+			const toolCalls = message.content.filter(
+				(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+			);
 			hasMoreToolCalls = toolCalls.length > 0;
 
 			const toolResults: ToolResultMessage[] = [];
@@ -3595,7 +3601,9 @@ async function executeToolCalls(
 		afterToolCall,
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
-	const toolCalls = assistantMessage.content.filter((c): c is ToolCallContent => c.type === "toolCall");
+	const toolCalls = assistantMessage.content.filter(
+		(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+	);
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;
