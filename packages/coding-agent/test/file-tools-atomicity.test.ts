@@ -438,6 +438,31 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
+	it("documents last-writer-wins when a successor is published after validation", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "post-validation-swap.ts");
+		await fs.writeFile(dest, "original\n");
+		// Publish a different regular file at the destination pathname strictly
+		// between the final identity check and the committing rename. This is the
+		// window rename(2) cannot close; the write is expected to win.
+		const realRename = fs.rename.bind(fs);
+		const rename = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+			if (String(to) === dest) {
+				await fs.writeFile(dest, "successor-from-another-writer\n");
+			}
+			return realRename(from as PathLike, to as PathLike);
+		});
+		try {
+			await writeFileAtomically(dest, "ours\n");
+			// Documented contract: last writer wins, and the publication is whole --
+			// never a mix of the successor and our bytes.
+			expect(await fs.readFile(dest, "utf8")).toBe("ours\n");
+			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			rename.mockRestore();
+		}
+	});
+
 	it("keeps writable Windows files editable when delete-sharing blocks rename", async () => {
 		if (process.platform === "win32") return;
 		const dest = path.join(tmpDir, "windows-share.ts");
@@ -455,6 +480,55 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 			expect(await fs.readFile(dest, "utf8")).toBe("new\n");
 			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
 		} finally {
+			rename.mockRestore();
+		}
+	});
+
+	it("restores the original byte-exactly when the Windows in-place fallback fails", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "windows-rollback.ts");
+		// Longer than the replacement so a rollback written at an advanced offset
+		// would leave trailing original bytes behind instead of restoring exactly.
+		const original = "original-content-that-is-longer\n";
+		await fs.writeFile(dest, original);
+		const rename = spyOn(fs, "rename").mockRejectedValue(Object.assign(new Error("EBUSY"), { code: "EBUSY" }));
+		const realOpen = fs.open.bind(fs);
+		const open = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			const handle = await realOpen(target as PathLike, flags as string, mode as number);
+			if (String(target) !== dest) return handle;
+			// Accept the replacement's first chunk, then fail. This is the real
+			// hazard: the handle offset has advanced, so a rollback that writes from
+			// the current position interleaves instead of restoring from byte 0.
+			const realWrite = handle.write.bind(handle);
+			const realWriteFile = handle.writeFile.bind(handle);
+			let writeCalls = 0;
+			const partiallyAcceptThenFail = async (bytes: Uint8Array): Promise<never> => {
+				// Unpositioned write: accepting a prefix advances the handle offset, so a
+				// rollback that also writes unpositioned resumes mid-file.
+				await realWrite(bytes.subarray(0, 4));
+				throw Object.assign(new Error("EIO: write failed"), { code: "EIO" });
+			};
+			handle.write = (async (...args: any[]) => {
+				writeCalls++;
+				if (writeCalls === 1) return partiallyAcceptThenFail(args[0] as Uint8Array);
+				return realWrite(...(args as [any]));
+			}) as typeof handle.write;
+			handle.writeFile = (async (...args: any[]) => {
+				writeCalls++;
+				if (writeCalls === 1) return partiallyAcceptThenFail(args[0] as Uint8Array);
+				return realWriteFile(...(args as [any]));
+			}) as typeof handle.writeFile;
+			return handle;
+		});
+		try {
+			await expect(
+				writeFileAtomically(dest, "new\n", { platform: "win32", sleep: async () => {} }),
+			).rejects.toMatchObject({ publicationState: "not_published", destUnchanged: true });
+			// The reported state must match reality: byte-exact original, no mixing.
+			expect(await fs.readFile(dest, "utf8")).toBe(original);
+			expect((await fs.readdir(tmpDir)).filter(name => name.endsWith(".tmp"))).toEqual([]);
+		} finally {
+			open.mockRestore();
 			rename.mockRestore();
 		}
 	});

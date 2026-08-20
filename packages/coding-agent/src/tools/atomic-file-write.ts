@@ -1,5 +1,20 @@
 /**
- * Crash-atomic user-file writes for the write/edit/LSP writethrough path.
+ * Fail-atomic user-file writes for the write/edit/LSP writethrough path.
+ *
+ * The guarantee is visibility, not crash durability: a failed write never
+ * publishes partial or truncated bytes, and the destination is left byte-
+ * identical. It is deliberately NOT crash-atomic -- the parent directory is
+ * never fsynced, so a rename can be lost across a system crash.
+ *
+ * Publication is last-writer-wins, not conditional. Identity is revalidated
+ * immediately before the rename, which rejects a destination that was replaced
+ * or retargeted while staging, but `rename(2)` commits against the pathname:
+ * a writer that publishes a successor inside the window between that check and
+ * the rename is overwritten. Closing that window needs an OS conditional-
+ * replace primitive; the exchange-based one available here was removed because
+ * it validated only after committing and leaked protocol debris into user
+ * directories on every successful write. `write` is a last-writer-wins tool by
+ * contract, so this is the documented behavior rather than a silent race.
  *
  * `Bun.write` truncates the destination then copies bytes. A permission or IO
  * failure after that truncate leaves a 0-byte target even though the tool
@@ -268,6 +283,22 @@ async function renameIntoPlace(
  * rejected before staging because a failed write cannot safely preserve every
  * alias with a pathname replacement contract.
  */
+/**
+ * Write `bytes` as the file's entire leading content starting at absolute
+ * position 0, looping until every byte is accepted. `FileHandle.writeFile()`
+ * writes from the handle's current position, which makes it unsafe for a
+ * rollback that must reproduce the original bytes exactly.
+ */
+async function writeWholeFileAtPositionZero(handle: fs.FileHandle, bytes: Uint8Array): Promise<void> {
+	let written = 0;
+	while (written < bytes.byteLength) {
+		const result = await handle.write(bytes, written, bytes.byteLength - written, written);
+		if (result.bytesWritten === 0)
+			throw new Error(`in-place write stalled at ${written} of ${bytes.byteLength} bytes`);
+		written += result.bytesWritten;
+	}
+}
+
 async function replaceInPlaceAfterSharingViolation(
 	dest: string,
 	tmp: string,
@@ -281,14 +312,17 @@ async function replaceInPlaceAfterSharingViolation(
 	let committed = false;
 	try {
 		try {
-			await handle.writeFile(replacement);
+			// Write at an explicit absolute position: handle.writeFile() appends from
+			// the handle's current offset, so a retry or rollback after a partial
+			// write would otherwise land mid-file and interleave bytes.
+			await writeWholeFileAtPositionZero(handle, replacement);
 			await handle.sync();
 			await handle.truncate(replacement.byteLength);
 			await handle.sync();
 			committed = true;
 		} catch (error) {
 			try {
-				await handle.writeFile(original);
+				await writeWholeFileAtPositionZero(handle, original);
 				await handle.truncate(original.byteLength);
 				await handle.sync();
 			} catch (rollbackError) {

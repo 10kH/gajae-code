@@ -747,7 +747,7 @@ export async function writethroughNoop(
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
 	if (file !== undefined) {
-		file.write(content);
+		await file.write(content);
 		return undefined;
 	}
 	await writeFileAtomically(dst, content);
@@ -925,7 +925,7 @@ async function runLspWritethrough(
 	let publishedContent = false;
 	const writeContent = async (value: string) => {
 		try {
-			if (file !== undefined) file.write(value);
+			if (file !== undefined) await file.write(value);
 			else await writeFileAtomically(dst, value);
 			publishedContent = true;
 		} catch (error) {

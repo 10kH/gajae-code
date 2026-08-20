@@ -133,6 +133,16 @@ path: "data/app.sqlite:users:42"
 content: ""
 ```
 
+## Publication contract
+
+Plain-file writes stage to a sibling temp and publish with a same-directory `rename(2)`. A write that fails at any point before that rename leaves the destination byte-identical to its prior contents -- a failed write never truncates the target or leaves a 0-byte file -- and the staging file it created is removed. Successful writes leave no residue beside the destination.
+
+The staged bytes are fsynced before publication, but the parent directory is not, so publication is **not** crash-durable: a rename can be lost across a system crash.
+
+Overwrites are **last-writer-wins**. Destination identity is revalidated immediately before the rename, which rejects a target that was replaced or retargeted while staging, but the rename commits against the pathname. A concurrent writer that publishes a successor between that check and the rename is overwritten rather than detected.
+
+Destination symlinks are followed: the referent is replaced and the link is preserved. Hard-linked targets are rejected, because replacement would split the link group.
+
 ## Side Effects
 - Filesystem
   - Creates or overwrites plain files.

@@ -76,6 +76,29 @@ describe("createLspWritethrough batching", () => {
 		expect(await Bun.file(requestedPath).exists()).toBe(false);
 	});
 
+	it("propagates a rejecting BunFile write instead of reporting success", async () => {
+		const failure = Object.assign(new Error("EIO: simulated device failure"), { code: "EIO" });
+		const file = {
+			// Rejects on a later microtask so an unawaited call cannot be caught by
+			// the caller's synchronous try/catch.
+			write: async () => {
+				await Bun.sleep(0);
+				throw failure;
+			},
+		} as unknown as Bun.BunFile;
+
+		await expect(
+			writethroughNoop(path.join(tempDir.path(), "rejecting.ts"), "content\n", undefined, file),
+		).rejects.toMatchObject({ code: "EIO" });
+
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([]);
+		const writethrough = createLspWritethrough(tempDir.path(), { enableFormat: true, enableDiagnostics: true });
+		await expect(
+			writethrough(path.join(tempDir.path(), "rejecting-lsp.ts"), "content\n", undefined, file),
+		).rejects.toMatchObject({ code: "EIO" });
+	});
+
 	it("reports a later publication failure as potentially replacing an earlier write", async () => {
 		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
 		const client = {
