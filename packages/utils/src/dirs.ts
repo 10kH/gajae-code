@@ -471,13 +471,16 @@ class DirResolver {
 
 	/**
 	 * `isDefault` decides whether the agent directory may follow `$XDG_*_HOME`.
-	 * It defaults to a path comparison, but an explicitly selected agent directory
-	 * must never switch storage lanes just because it happens to equal the
-	 * home-derived default — callers that know the override state pass it in.
+	 *
+	 * It is always supplied by the caller and never defaulted: the only correct
+	 * value is the construction-time decision held in `#xdgEligible`, and
+	 * re-deriving it from path shape is exactly the bug that let a directory
+	 * change storage lane when a home refresh made its path coincide with the
+	 * new default.
 	 */
 	private refreshCategoryDirs(
 		snapshot: { values: Record<string, string>; dynamic: Set<string> },
-		isDefault = !this.#agentDirOverride && this.agentDir === path.join(this.configRoot, "agent"),
+		isDefault: boolean,
 	): void {
 		let xdgData: string | undefined;
 		let xdgState: string | undefined;
@@ -622,7 +625,7 @@ export function getTrustedHomeDir(): string {
 	return dirs.trustedHome;
 }
 
-/** Stable trusted config root; preserves the configured nested config-dir name. */
+/** Trusted config root, resolved at call time; preserves the configured nested config-dir name. */
 export function getTrustedConfigRootDir(): string {
 	dirs.refreshConfigDirOverride();
 	dirs.assertHomeAvailable();

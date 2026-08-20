@@ -123,7 +123,7 @@ async function runUidCacheProbe(homeA: string, homeAAfterMappingChange: string):
 		[
 			`import { getTrustedHomeDir } from ${JSON.stringify(patchedPath)};`,
 			"const state = globalThis as typeof globalThis & { GJC_TEST_NSS_CALLS?: number };",
-			'const read = () => { try { return getTrustedHomeDir(); } catch { return "REFUSED"; } };',
+			'const read = () => { try { return getTrustedHomeDir(); } catch (error) { if (String(error).includes("no trustworthy home directory")) return "REFUSED"; throw error; } };',
 			"const first = read();",
 			'process.env.GJC_TEST_EFFECTIVE_UID = "2001";',
 			"const uidB = await Promise.all([Promise.resolve().then(read), Promise.resolve().then(read)]);",
@@ -229,7 +229,7 @@ describe("account home is resolved through the OS account database", () => {
 				'import { vi } from "bun:test";',
 				'import * as os from "node:os";',
 				`import { getTrustedHomeDir } from ${JSON.stringify(brokenPath)};`,
-				'const read = () => { try { return getTrustedHomeDir(); } catch { return "REFUSED"; } };',
+				'const read = () => { try { return getTrustedHomeDir(); } catch (error) { if (String(error).includes("no trustworthy home directory")) return "REFUSED"; throw error; } };',
 				"const first = read();",
 				'vi.spyOn(os, "homedir").mockReturnValue("/tmp");',
 				"console.log(JSON.stringify({ first, second: read() }));",

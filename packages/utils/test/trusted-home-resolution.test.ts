@@ -275,6 +275,30 @@ describe("authoritative home resolution", () => {
 		expect(probed.after.agentDb).not.toBe(path.join(xdgDataHome, "gjc", "agent.db"));
 	});
 
+	it("keeps an XDG-eligible agent dir on XDG after a home refresh makes it non-default", async () => {
+		// The converse of the case above. A dir that WAS the default at construction
+		// stays XDG-eligible even once a home refresh makes its path no longer equal
+		// the default. Without stickiness the recomputation flips it off the XDG lane
+		// mid-process, so `agent.db` would move out of `$XDG_DATA_HOME/gjc` while the
+		// agent dir itself never changed.
+		const firstHome = await tempDir();
+		const secondHome = await tempDir();
+		const xdgDataHome = await tempDir();
+		await fs.mkdir(path.join(xdgDataHome, "gjc"), { recursive: true });
+		// Exactly the default under the *startup* home, so it starts XDG-eligible;
+		// after the refresh to `secondHome` the same path is no longer the default.
+		const agentDir = path.join(firstHome, CONFIG_DIR_NAME, "agent");
+		await fs.mkdir(agentDir, { recursive: true });
+
+		const probed = await probe({ agentDirOverride: agentDir, secondHome, home: firstHome, xdgDataHome });
+
+		expect(probed.before.agentDir).toBe(agentDir);
+		expect(probed.before.agentDb).toBe(path.join(xdgDataHome, "gjc", "agent.db"));
+		// The home moved and the path is no longer default-shaped, but the lane holds.
+		expect(probed.after.agentDir).toBe(agentDir);
+		expect(probed.after.agentDb).toBe(probed.before.agentDb);
+	});
+
 	it("puts a parent and its child on the same storage lane for one profile", async () => {
 		// `setAgentDir()` exports `GJC_CODING_AGENT_DIR`, so a child inherits the
 		// exact value the parent set programmatically and cannot distinguish the two.
