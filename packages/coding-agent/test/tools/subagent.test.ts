@@ -11,7 +11,7 @@ import type { AgentSession, PromptOptions } from "../../src/session/agent-sessio
 import { subagentRunOutcomeFromSingleResult } from "../../src/task";
 import { runSubprocess } from "../../src/task/executor";
 import { buildTaskReceipt } from "../../src/task/receipt";
-import type { AgentDefinition } from "../../src/task/types";
+import type { AgentDefinition, AgentProgress } from "../../src/task/types";
 import { createSetupFailureSummary, type SingleResult } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
 import { capCodePointsAndBytes, SubagentTool } from "../../src/tools/implementations";
@@ -89,6 +89,81 @@ async function inspectCompletedSubagent(
 describe("SubagentTool", () => {
 	afterEach(() => {
 		AsyncJobManager.resetForTests();
+	});
+
+	it("keeps a failed subagent's public structured output visible to inspect and await", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const publicReview = '{"overall_correctness":"incorrect","summary":"Public review"}';
+		const jobId = manager.register("task", "stalled review", async () => ({ kind: "failed", text: publicReview }), {
+			id: "job-stalled-review",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: {
+					id: "0-StalledReview",
+					agent: "architect",
+					agentSource: "bundled",
+					assignment: "Review the change.",
+				},
+			},
+		});
+		await manager.getJob(jobId)?.promise;
+
+		for (const action of ["inspect", "await"] as const) {
+			const result = await tool.execute(`subagent-${action}-failed-review`, {
+				action,
+				ids: ["0-StalledReview"],
+				verbosity: "full",
+			});
+			const snapshot = result.details?.subagents[0];
+			expect(snapshot?.status).toBe("failed");
+			expect(snapshot?.errorText).toBe(publicReview);
+			expect(getText(result)).toContain("Error preview:");
+			expect(getText(result)).toContain(publicReview);
+		}
+	});
+
+	it("does not expose live provider thinking through await progress", async () => {
+		const manager = createManager();
+		const tool = new SubagentTool(createSession());
+		const gate = Promise.withResolvers<string>();
+		manager.register("task", "live subagent", async () => gate.promise, {
+			id: "job-private-progress",
+			ownerId: "0-Main",
+			metadata: {
+				subagent: { id: "0-PrivateProgress", agent: "executor", agentSource: "bundled", assignment: "Work." },
+			},
+		});
+		const progress: AgentProgress = {
+			index: 0,
+			id: "0-PrivateProgress",
+			agent: "executor",
+			agentSource: "bundled",
+			status: "running",
+			task: "Work.",
+			recentTools: [],
+			recentOutput: ["PRIVATE_THINKING_MUST_NOT_ESCAPE"],
+			toolCount: 0,
+			tokens: 0,
+			cost: 0,
+			durationMs: 0,
+		};
+		manager.recordSubagentProgress("0-PrivateProgress", progress);
+		manager.registerLiveHandle("0-PrivateProgress", {
+			requestPause: () => {},
+			injectMessage: async () => {},
+		});
+
+		const result = await tool.execute("subagent-await-private-progress", {
+			action: "await",
+			ids: ["0-PrivateProgress"],
+			timeout_ms: 1,
+		});
+		const snapshot = result.details?.subagents[0];
+		expect(snapshot?.progress).toBeUndefined();
+		expect(getText(result)).not.toContain("PRIVATE_THINKING_MUST_NOT_ESCAPE");
+		gate.resolve("done");
+		await manager.getJob("job-private-progress")?.promise;
 	});
 
 	it("lists only visible task jobs with subagent metadata", async () => {

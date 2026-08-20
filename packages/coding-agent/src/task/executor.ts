@@ -556,6 +556,7 @@ interface FinalizeSubprocessOutputArgs {
 	rawOutput: string;
 	exitCode: number;
 	stderr: string;
+	terminalFailure?: boolean;
 	doneAborted: boolean;
 	signalAborted: boolean;
 	yieldItems?: YieldItem[];
@@ -619,7 +620,7 @@ function buildPlaceholderYieldOutcome(
 
 export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): FinalizeSubprocessOutputResult {
 	let { rawOutput, exitCode, stderr } = args;
-	const { yieldItems, doneAborted, signalAborted, outputSchema } = args;
+	const { yieldItems, terminalFailure = false, doneAborted, signalAborted, outputSchema } = args;
 	let abortedViaYield = false;
 	const hasYield = Array.isArray(yieldItems) && yieldItems.length > 0;
 
@@ -673,8 +674,15 @@ export function finalizeSubprocessOutput(args: FinalizeSubprocessOutputArgs): Fi
 								const errorMessage = err instanceof Error ? err.message : String(err);
 								rawOutput = `{"error":"Failed to serialize yield data: ${errorMessage}"}`;
 							}
-							exitCode = 0;
-							stderr = "";
+							// A valid yield can preserve policy-safe public review output after a
+							// terminal provider failure, but it cannot convert that failed run
+							// into a successful subagent result. A normal yield starts with a
+							// non-zero provisional exit code, so use the explicit terminal fact
+							// rather than the provisional code to distinguish the two cases.
+							if (!terminalFailure) {
+								exitCode = 0;
+								stderr = "";
+							}
 						}
 					}
 				}
@@ -2183,6 +2191,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		rawOutput,
 		exitCode,
 		stderr,
+		terminalFailure: done.error !== undefined || Boolean(done.aborted),
 		doneAborted: Boolean(done.aborted),
 		signalAborted: Boolean(signal?.aborted),
 		yieldItems,
