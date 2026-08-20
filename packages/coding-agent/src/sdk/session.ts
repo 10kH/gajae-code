@@ -213,6 +213,14 @@ type McpNotificationEntry = {
 	uri: string;
 };
 
+/** Capture the cursor edit grant before the model-facing edit entry is removed. */
+export function captureCursorEditTool<T>(
+	toolRegistry: ReadonlyMap<string, unknown>,
+	createReplaceTool: () => T,
+): T | undefined {
+	return toolRegistry.has("edit") ? createReplaceTool() : undefined;
+}
+
 function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessage<AsyncResultDetails> | null {
 	if (entries.length === 0) return null;
 	// Partition denied owned-completion entries out ENTIRELY before batch
@@ -2935,8 +2943,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolRegistry.set(tool.name, wrapped);
 			}
 		}
-		const cursorEditGranted = toolRegistry.has("edit");
-		const rawCursorReplaceEditTool = cursorEditGranted ? new EditTool(toolSession, "replace") : undefined;
+		const rawCursorReplaceEditTool = captureCursorEditTool(toolRegistry, () => new EditTool(toolSession, "replace"));
 		const cursorReplaceEditTool: AgentTool | undefined = rawCursorReplaceEditTool
 			? extensionRunner
 				? (new ExtensionToolWrapper(rawCursorReplaceEditTool, extensionRunner) as AgentTool)
