@@ -92,11 +92,12 @@ describe("PythonExecutorOptions.onKernelStart", () => {
 			.mockResolvedValueOnce(dyingKernel as unknown as PythonKernelInstance)
 			.mockResolvedValueOnce(replacementKernel as unknown as PythonKernelInstance);
 		const started: string[] = [];
+		const onKernelStart = vi.fn((id: string) => started.push(id));
 		const options = {
 			cwd: "/tmp/python-kernel-start-mid-execute",
 			sessionId: "kernel-start-mid-execute",
 			kernelMode: "session" as const,
-			onKernelStart: (id: string) => started.push(id),
+			onKernelStart,
 		};
 
 		const result = await executePython("dies then retries", options);
@@ -108,9 +109,11 @@ describe("PythonExecutorOptions.onKernelStart", () => {
 		expect(dyingKernel.execute).toHaveBeenCalledTimes(1);
 		expect(replacementKernel.execute).toHaveBeenCalledTimes(1);
 		expect(result.exitCode).toBe(0);
-		const replacementCallOrder = replacementKernel.execute.mock.invocationCallOrder[0];
-		if (replacementCallOrder === undefined) throw new Error("replacement kernel never executed");
-		expect(started).toHaveLength(2);
+		const replacementCallbackOrder = onKernelStart.mock.invocationCallOrder[1];
+		const replacementExecuteOrder = replacementKernel.execute.mock.invocationCallOrder[0];
+		if (replacementCallbackOrder === undefined) throw new Error("replacement identity was never reported");
+		if (replacementExecuteOrder === undefined) throw new Error("replacement kernel never executed");
+		expect(replacementCallbackOrder).toBeLessThan(replacementExecuteOrder);
 	});
 
 	it("does not invoke onKernelStart for execute-per-call mode", async () => {
