@@ -104,4 +104,13 @@ describe("python kernel transcript", () => {
 			}),
 		);
 	});
+
+	it("rejects transcript directory components that contain separators or traversal", () => {
+		for (const unsafe of ["../escape", "..", "a/b", "a\\b", "", "  "]) {
+			expect(() => pythonKernelTranscriptPath("/tmp/x", TEST_SESSION_ID, unsafe)).toThrow();
+		}
+		// A well-formed {datetime}-{uuid} component stays inside ipykernels/.
+		const ok = pythonKernelTranscriptPath("/tmp/x", TEST_SESSION_ID, "20260819T000000Z-abc123");
+		expect(ok).toContain(path.join("ipykernels", "20260819T000000Z-abc123", "transcript.jsonl"));
+	});
 });

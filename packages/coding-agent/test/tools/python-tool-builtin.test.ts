@@ -353,6 +353,14 @@ describe("builtin session Python tool", () => {
 		expect(noSession.isError).toBe(true);
 		expect(textOf(noSession)).toContain("requires a GJC session id");
 
+		// The null-session contract binds clear too: actionable error, no owner
+		// disposal, and no transcript state.
+		const disposalsBeforeNullClear = disposeSpy.mock.calls.length;
+		const noSessionClear = await executeTool(noSessionTool, { action: "clear" });
+		expect(noSessionClear.isError).toBe(true);
+		expect(textOf(noSessionClear)).toContain("requires a GJC session id");
+		expect(disposeSpy.mock.calls.length).toBe(disposalsBeforeNullClear);
+
 		const cleared = await executeTool(tool, { action: "clear" });
 		expect(cleared.isError).toBeUndefined();
 		expect(disposeSpy).toHaveBeenCalledWith(pythonKernelOwnerId(TEST_SESSION_ID));

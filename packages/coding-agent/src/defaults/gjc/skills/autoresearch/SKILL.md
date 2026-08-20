@@ -39,7 +39,7 @@ gjc autoresearch clear
 - `--spec <path>` — handoff intake from a persisted deep-interview spec; asks zero questions.
 - `"<goal>"` or bare invocation — cold intake; goal, constraints, and deliverables must be clarified before research begins.
 - `read --json` — current mission artifact plus the append-only ledger snapshot.
-- `clear` — remove the mission artifact and record the kernel clear in the ledger.
+- `clear` — retire the mission artifact and its working set, recording `mission_cleared` in the ledger. This never touches the session `python` REPL kernel; reset that with the `python` tool's own `clear` action.
 
 ## Use when
 

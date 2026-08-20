@@ -78,6 +78,41 @@ describe("PythonExecutorOptions.onKernelStart", () => {
 		expect(replacementKernel.execute).toHaveBeenCalledTimes(1);
 	});
 
+	it("reports the replacement id before the retry when the kernel dies mid-execute", async () => {
+		const dyingKernel = new FakeKernel();
+		const replacementKernel = new FakeKernel();
+		// The retained kernel throws from execute() and is dead by the time the
+		// executor inspects it, driving the mid-execute replace-and-retry branch.
+		dyingKernel.execute = vi.fn(async () => {
+			dyingKernel.alive = false;
+			throw new Error("kernel died mid-execute");
+		});
+		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });
+		vi.spyOn(pythonKernel.PythonKernel, "start")
+			.mockResolvedValueOnce(dyingKernel as unknown as PythonKernelInstance)
+			.mockResolvedValueOnce(replacementKernel as unknown as PythonKernelInstance);
+		const started: string[] = [];
+		const options = {
+			cwd: "/tmp/python-kernel-start-mid-execute",
+			sessionId: "kernel-start-mid-execute",
+			kernelMode: "session" as const,
+			onKernelStart: (id: string) => started.push(id),
+		};
+
+		const result = await executePython("dies then retries", options);
+
+		// Acquisition reports the dying kernel's id, then the replacement id is
+		// reported BEFORE the retry executes on the fresh kernel.
+		expect(started).toHaveLength(2);
+		expect(started[1]).not.toBe(started[0]);
+		expect(dyingKernel.execute).toHaveBeenCalledTimes(1);
+		expect(replacementKernel.execute).toHaveBeenCalledTimes(1);
+		expect(result.exitCode).toBe(0);
+		const replacementCallOrder = replacementKernel.execute.mock.invocationCallOrder[0];
+		if (replacementCallOrder === undefined) throw new Error("replacement kernel never executed");
+		expect(started).toHaveLength(2);
+	});
+
 	it("does not invoke onKernelStart for execute-per-call mode", async () => {
 		const kernel = new FakeKernel();
 		vi.spyOn(pythonKernel, "checkPythonKernelAvailability").mockResolvedValue({ ok: true });

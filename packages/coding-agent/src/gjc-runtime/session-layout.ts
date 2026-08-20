@@ -132,7 +132,9 @@ export function sessionIpykernelsArtifactsDir(cwd: string, gjcSessionId: string)
 	return path.join(sessionIpykernelsDir(cwd, gjcSessionId), "artifacts");
 }
 export function pythonKernelTranscriptPath(cwd: string, gjcSessionId: string, dirName: string): string {
-	return path.join(sessionIpykernelsDir(cwd, gjcSessionId), dirName, "transcript.jsonl");
+	const normalized = dirName.trim();
+	assertSafePathComponent(normalized, "python kernel transcript dirName");
+	return path.join(sessionIpykernelsDir(cwd, gjcSessionId), normalized, "transcript.jsonl");
 }
 export function sessionAutoresearchDir(cwd: string, gjcSessionId: string): string {
 	return path.join(sessionRoot(cwd, gjcSessionId), "autoresearch");
