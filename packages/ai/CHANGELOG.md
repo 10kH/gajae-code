@@ -15,6 +15,13 @@
 - `ToolCall.escapedNonAsciiArguments` doc updated: the agent loop resamples unconditionally then rejects terminally, with a single bounded after-budget exception for tools that enumerated display fields (`displaySafeEscapedArgFields`) whose non-ASCII content is benign typographic punctuation. The scanner itself is unchanged and still flags every non-ASCII escape (#4627).
 - The auth-gateway `/v1/chat/completions` request schema now accepts explicit `null` for unset optional fields and for message `content`. Clients that serialize an omitted option as `null` (Aside, LangChain, LiteLLM, Vercel AI SDK style serializers) — a shape api.openai.com accepts — were rejected with a zod `invalid_union` 400 before a single token streamed, surfacing in client UIs as a generic connection failure. `null` is now collapsed to `undefined` at the schema boundary (and to `""` for required `system`/`developer`/`user` content), so every downstream consumer keeps the existing `T | undefined` shape.
 
+## [0.14.2] - 2026-08-20
+
+### Fixed
+- Grok Build now gets the same 300s idle window as other long-turn providers, so turns no longer stall waiting on a shorter default.
+- `getCachedUsageReport` surfaces cached usage for API-key credentials, not only OAuth accounts (#4686).
+- The auth gateway accepts explicit `null` fields on openai-chat requests instead of rejecting the payload (#4667).
+
 ## [0.14.1] - 2026-08-18
 - Anthropic clients now set an SDK request `timeout` derived from the first-event window (`resolveAnthropicSdkRequestTimeoutMs`; 300s by default for Anthropic, floored at the env/default first-event window, disabled by an explicit `streamFirstEventTimeoutMs: 0`). The Anthropic first-event watchdog deliberately arms only after response headers arrive, so a connection that silently died before headers — the exact failure mode of recent Anthropic stream instability right after a completed tool call — was previously bounded only by the SDK's 10-minute default per attempt multiplied by its internal retry budget, observable as an endless "Working…" spinner for up to an hour with no error, no retry indicator, and no automatic recovery. This mirrors the existing `resolveOpenAISdkRequestTimeoutMs` stalled-before-headers bound on the OpenAI family.
 - oMLX OpenAI-compatible completions now send `chat_template_kwargs.reasoning_effort` with `enable_thinking` when `thinkingFormat` is `qwen-chat-template`. Discovered oMLX models are treated as reasoning models with `low`/`medium`/`high` effort so local Qwen presets can differentiate roles without swapping weights.
