@@ -13,11 +13,18 @@
  *     (a wrong constant or bad FFI signature would disagree);
  *   - the whole default detection chain spawns zero subprocesses.
  */
-import { describe, expect, it, vi } from "bun:test";
+import { describe, expect, it, setDefaultTimeout, vi } from "bun:test";
 import * as childProcess from "node:child_process";
 import { detectWin32Avx2Support } from "../native/loader-state.js";
 
 const isWindows = process.platform === "win32";
+const WINDOWS_AVX2_LIVE_TEST_TIMEOUT_MS = 10_000;
+const WINDOWS_AVX2_PROBE_BUDGET_MS = 5_000;
+
+// The fallback kills PowerShell before Bun's normal 5 s test budget. The live
+// suite gets a larger budget so it can observe the bounded kill/reap path on a
+// cold Windows image without leaving a dangling child behind.
+setDefaultTimeout(WINDOWS_AVX2_LIVE_TEST_TIMEOUT_MS);
 
 describe("windows AVX2 probe live execution (#4652)", () => {
 	it.skipIf(!isWindows)("in-process kernel32 probe returns a decisive boolean on a real Windows host", () => {
@@ -47,8 +54,13 @@ describe("windows AVX2 probe live execution (#4652)", () => {
 			// On GitHub windows-latest runners PowerShell 5.1 is the stock
 			// `powershell.exe`; the Add-Type DllImport must succeed and print a
 			// parseable boolean. Hidden or not, correctness is what we assert here.
+			const startedAt = performance.now();
 			const result = detectWin32Avx2Support(() => undefined);
+			const elapsedMs = performance.now() - startedAt;
 			expect(typeof result).toBe("boolean");
+			// A timeout must return before Bun's default budget even when the image
+			// makes PowerShell unavailable or unresponsive.
+			expect(elapsedMs).toBeLessThan(WINDOWS_AVX2_PROBE_BUDGET_MS);
 		},
 	);
 });

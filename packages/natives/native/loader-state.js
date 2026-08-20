@@ -246,17 +246,46 @@ export function cachedEmbeddedExtractionIsFresh({ targetPath, embeddedPath, size
 // above pay nothing for variant detection, subprocess spawns, or fs probes.
 // =========================================================================
 
-function runCommand(command, args) {
+// Keep the synchronous fallback below Bun's default 5 s test budget. The
+// remaining margin covers spawnSync's return path after the kill is delivered
+// and prevents a wedged PowerShell process from starving native loading.
+const WIN32_AVX2_PROBE_TIMEOUT_MS = 4_000;
+const WIN32_AVX2_PROBE_MAX_BUFFER = 4 * 1024;
+const WIN32_AVX2_PROBE_WARNING_CODE = "GJC_WIN32_AVX2_PROBE";
+
+function emitWin32Avx2ProbeDiagnostic(kind) {
+	process.emitWarning(`Windows AVX2 probe inconclusive (${kind}); using baseline variant.`, {
+		code: WIN32_AVX2_PROBE_WARNING_CODE,
+	});
+}
+
+function spawnFailureDiagnostic(result) {
+	if (result.error?.code === "ETIMEDOUT" || result.signal === "SIGKILL") return "timeout";
+	if (result.error) return "spawn_error";
+	if (result.status !== 0) return "nonzero_exit";
+	return "non_decisive_output";
+}
+
+function runCommand(command, args, report) {
 	try {
 		// `windowsHide` keeps probes console-less: from a detached, console-less
 		// parent (e.g. the SDK broker) spawning a console app like powershell.exe
 		// would otherwise allocate and flash a visible console window per call
 		// (#4652). It is ignored on POSIX.
-		const result = childProcess.spawnSync(command, args, { encoding: "utf-8", windowsHide: true });
-		if (result.error) return null;
-		if (result.status !== 0) return null;
+		const result = childProcess.spawnSync(command, args, {
+			encoding: "utf-8",
+			windowsHide: true,
+			timeout: WIN32_AVX2_PROBE_TIMEOUT_MS,
+			killSignal: "SIGKILL",
+			maxBuffer: WIN32_AVX2_PROBE_MAX_BUFFER,
+		});
+		if (result.error || result.status !== 0) {
+			report?.(spawnFailureDiagnostic(result));
+			return null;
+		}
 		return (result.stdout || "").trim();
 	} catch {
+		report?.("spawn_error");
 		return null;
 	}
 }
@@ -287,21 +316,30 @@ function probeWin32Avx2InProcess() {
 // Hidden PowerShell fallback. `Add-Type` P/Invoke works on both stock Windows
 // PowerShell 5.1 (.NET Framework, which has no System.Runtime.Intrinsics) and
 // pwsh 7+. Any probe failure fails safe to `false` (baseline variant).
-function probeWin32Avx2ViaPowerShell(run = runCommand) {
+function probeWin32Avx2ViaPowerShell(run = runCommand, report = emitWin32Avx2ProbeDiagnostic) {
 	const output = run("powershell.exe", [
 		"-NoProfile",
 		"-NonInteractive",
 		"-Command",
 		"Add-Type -Namespace GjcNative -Name Cpu -MemberDefinition '[DllImport(\"kernel32.dll\")] public static extern bool IsProcessorFeaturePresent(int feature);'; " +
 			`[GjcNative.Cpu]::IsProcessorFeaturePresent(${WIN32_PF_AVX2_INSTRUCTIONS_AVAILABLE})`,
-	]);
-	return output !== null && output.toLowerCase() === "true";
+	], report);
+	if (output === null) return false;
+	const normalized = output.toLowerCase();
+	if (normalized === "true") return true;
+	if (normalized === "false") return false;
+	report("non_decisive_output");
+	return false;
 }
 
-export function detectWin32Avx2Support(probe = probeWin32Avx2InProcess, run = runCommand) {
+export function detectWin32Avx2Support(
+	probe = probeWin32Avx2InProcess,
+	run = runCommand,
+	report = emitWin32Avx2ProbeDiagnostic,
+) {
 	const probed = probe();
 	if (probed !== undefined) return probed;
-	return probeWin32Avx2ViaPowerShell(run);
+	return probeWin32Avx2ViaPowerShell(run, report);
 }
 
 function getVariantOverride() {
