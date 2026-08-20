@@ -20,19 +20,38 @@
  * Existing-file mode and ownership are re-applied after staging so a process
  * umask or replacement inode never changes the target's identity. Hard-linked
  * targets are rejected because replacement would split their link group, and
- * the target identity is revalidated immediately before rename. The staged
+ * the target identity is revalidated inside the native conditional publication
+ * primitive. The staged
  * bytes are synced before publication; directory fsync is intentionally not
  * promised because Windows reports EPERM for it (#4457).
  */
+
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { NativeExactFileIdentity, NativeExactUnlinkResult, NativeNoReplaceResult } from "@gajae-code/natives";
 import { hasFsCode, isEacces, isEisdir, isEnoent, isFsError } from "@gajae-code/utils";
 
-const WINDOWS_RENAME_BACKOFF_MS = [10, 25, 50, 100, 200] as const;
-const WINDOWS_SHARING_VIOLATION_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
+
+type NativeAtomicPublishBindings = {
+	exactReplacePath: (
+		sourcePath: string,
+		destinationPath: string,
+		expectedSource: NativeExactFileIdentity,
+		expectedDestination: NativeExactFileIdentity,
+	) => NativeExactUnlinkResult;
+	renameNoReplacePath: (sourcePath: string, destinationPath: string) => NativeNoReplaceResult;
+};
+
+let nativeAtomicPublishBindings: NativeAtomicPublishBindings | undefined;
+
+function getNativeAtomicPublishBindings(): NativeAtomicPublishBindings {
+	nativeAtomicPublishBindings ??= require("@gajae-code/natives") as NativeAtomicPublishBindings;
+	return nativeAtomicPublishBindings;
+}
 
 interface ExistingFileMetadata {
 	mode: number;
@@ -43,6 +62,11 @@ interface ExistingFileMetadata {
 	ino: number;
 }
 
+type NativePublicationError = Error & {
+	code?: string;
+	publicationUncertain?: boolean;
+};
+
 interface ResolvedPublishPath {
 	publishPath: string;
 	existing?: ExistingFileMetadata;
@@ -50,11 +74,14 @@ interface ResolvedPublishPath {
 
 export class FileWriteNotPublishedError extends Error {
 	readonly dest: string;
+	readonly destUnchanged: boolean;
 	override readonly cause: unknown;
-	constructor(dest: string, cause: unknown) {
-		super(formatFileWriteError(cause, dest, { destUnchanged: true }));
+	constructor(dest: string, cause: unknown, options: { destUnchanged?: boolean } = {}) {
+		const destUnchanged = options.destUnchanged ?? true;
+		super(formatFileWriteError(cause, dest, { destUnchanged }));
 		this.name = "FileWriteNotPublishedError";
 		this.dest = dest;
+		this.destUnchanged = destUnchanged;
 		this.cause = cause;
 		if (isFsError(cause)) {
 			(this as Error & { code?: string }).code = cause.code;
@@ -96,27 +123,57 @@ function tempPathFor(dest: string): string {
 	return path.join(path.dirname(dest), `.${path.basename(dest)}.${unique}.tmp`);
 }
 
-async function renameIntoPlace(from: string, to: string): Promise<void> {
+function sha256(bytes: ArrayBuffer): string {
+	return crypto.createHash("sha256").update(new Uint8Array(bytes)).digest("hex");
+}
+
+async function captureExactFileIdentity(file: string): Promise<NativeExactFileIdentity | undefined> {
 	try {
-		await fs.rename(from, to);
-		return;
+		const [bytes, stat, parent] = await Promise.all([
+			Bun.file(file).arrayBuffer(),
+			fs.stat(file, { bigint: true }),
+			fs.stat(path.dirname(file), { bigint: true }),
+		]);
+		return {
+			dev: stat.dev,
+			ino: stat.ino,
+			nlink: stat.nlink,
+			parentDev: parent.dev,
+			parentIno: parent.ino,
+			size: stat.size,
+			mtimeNs: stat.mtimeNs,
+			directory: false,
+			detachOnly: false,
+			sha256: sha256(bytes),
+		};
 	} catch (error) {
-		if (process.platform !== "win32" || !isFsError(error) || !WINDOWS_SHARING_VIOLATION_CODES.has(error.code)) {
-			throw error;
-		}
+		if (isEnoent(error)) return undefined;
+		throw error;
 	}
-	let lastError: unknown;
-	for (const delay of WINDOWS_RENAME_BACKOFF_MS) {
-		await Bun.sleep(delay);
-		try {
-			await fs.rename(from, to);
-			return;
-		} catch (error) {
-			lastError = error;
-			if (!isFsError(error) || !WINDOWS_SHARING_VIOLATION_CODES.has(error.code)) throw error;
-		}
-	}
-	throw lastError;
+}
+
+function nativePublicationError(
+	operation: string,
+	code: string | undefined,
+	publicationUncertain = false,
+): NativePublicationError {
+	const error = new Error(
+		publicationUncertain
+			? `${operation} reached an uncertain publication state (${code ?? "unknown"}).`
+			: `${operation} failed (${code ?? "unknown"}).`,
+	) as NativePublicationError;
+	if (code !== undefined) error.code = code;
+	if (publicationUncertain) error.publicationUncertain = true;
+	return error;
+}
+
+function hasRetainedPublication(result: NativeExactUnlinkResult): boolean {
+	return (
+		result.detachedPath !== undefined ||
+		result.retainedSuccessorPath !== undefined ||
+		result.retainedPlaceholderPath !== undefined ||
+		result.retainedUnknownPath !== undefined
+	);
 }
 
 function eisdir(dest: string): Error & { code: string } {
@@ -211,7 +268,14 @@ async function assertExistingTargetWritable(publishPath: string): Promise<void> 
 }
 
 function sameFileIdentity(left: ExistingFileMetadata, right: ExistingFileMetadata): boolean {
-	return left.dev === right.dev && left.ino === right.ino;
+	return (
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.nlink === right.nlink &&
+		left.mode === right.mode &&
+		left.uid === right.uid &&
+		left.gid === right.gid
+	);
 }
 
 async function preserveExistingMetadata(tmp: string, existing: ExistingFileMetadata): Promise<void> {
@@ -306,7 +370,51 @@ export async function writeFileAtomically(
 					await preserveExistingMetadata(tmp, existing);
 				}
 				await assertPublishTargetStillIntended(dest, publishPath, trustBoundary, existing, expectedParentRealpath);
-				await renameIntoPlace(tmp, publishPath);
+				if (existing === undefined) {
+					// A plain rename would allow a concurrent creator to be overwritten
+					// after the JavaScript identity check. Fail closed when the native
+					// no-replace primitive cannot establish the publication boundary.
+					const published = getNativeAtomicPublishBindings().renameNoReplacePath(tmp, publishPath);
+					if (!published.ok) {
+						const uncertain = published.mutationState !== "not_committed";
+						if (uncertain) owned = false;
+						throw nativePublicationError("Atomic creation", published.code, uncertain);
+					}
+					owned = false;
+				} else {
+					// The native exchange validates both identities in the same namespace
+					// transaction. Do not fall back to pathname rename: validation and a
+					// plain rename are otherwise separable under a concurrent writer.
+					const expectedDestination = await captureExactFileIdentity(publishPath);
+					if (expectedDestination === undefined) {
+						throw new Error(`destination '${dest}' disappeared while staging`);
+					}
+					if (
+						Number(expectedDestination.dev) !== existing.dev ||
+						Number(expectedDestination.ino) !== existing.ino ||
+						Number(expectedDestination.nlink ?? -1n) !== existing.nlink
+					) {
+						throw new Error(
+							`destination '${dest}' was replaced while staging; refusing to overwrite a different file`,
+						);
+					}
+					const expectedSource = await captureExactFileIdentity(tmp);
+					if (expectedSource === undefined) {
+						throw new Error(`staging file '${tmp}' disappeared before publication`);
+					}
+					const published = getNativeAtomicPublishBindings().exactReplacePath(
+						tmp,
+						publishPath,
+						expectedSource,
+						expectedDestination,
+					);
+					if (!published.ok) {
+						const uncertain = hasRetainedPublication(published);
+						if (uncertain) owned = false;
+						throw nativePublicationError("Atomic replacement", published.code, uncertain);
+					}
+					owned = false;
+				}
 				return;
 			} catch (error) {
 				lastError = error;
@@ -321,6 +429,11 @@ export async function writeFileAtomically(
 		throw lastError;
 	} catch (error) {
 		if (error instanceof FileWriteNotPublishedError) throw error;
-		throw new FileWriteNotPublishedError(dest, error);
+		const publicationUncertain =
+			error !== null &&
+			typeof error === "object" &&
+			"publicationUncertain" in error &&
+			error.publicationUncertain === true;
+		throw new FileWriteNotPublishedError(dest, error, { destUnchanged: !publicationUncertain });
 	}
 }

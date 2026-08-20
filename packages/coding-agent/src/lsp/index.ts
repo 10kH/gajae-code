@@ -6,7 +6,7 @@ import type { BunFile } from "bun";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
-import { writeFileAtomically } from "../tools/atomic-file-write";
+import { FileWriteNotPublishedError, writeFileAtomically } from "../tools/atomic-file-write";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -918,7 +918,18 @@ async function runLspWritethrough(
 	const { lspServers, customLinterServers } = splitServers(servers);
 
 	let finalContent = content;
-	const writeContent = async (value: string) => writeFileAtomically(dst, value);
+	let publishedContent = false;
+	const writeContent = async (value: string) => {
+		try {
+			await writeFileAtomically(dst, value);
+			publishedContent = true;
+		} catch (error) {
+			if (publishedContent && error instanceof FileWriteNotPublishedError) {
+				throw new FileWriteNotPublishedError(dst, error.cause, { destUnchanged: false });
+			}
+			throw error;
+		}
+	};
 	const getWritePromise = once(() => writeContent(finalContent));
 	const useCustomFormatter = enableFormat && customLinterServers.length > 0;
 

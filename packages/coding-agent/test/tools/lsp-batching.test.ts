@@ -3,6 +3,9 @@ import * as path from "node:path";
 import { createLspWritethrough } from "@gajae-code/coding-agent/lsp";
 import * as lspConfig from "@gajae-code/coding-agent/lsp/config";
 import { TempDir } from "@gajae-code/utils";
+import type { ServerConfig } from "../../src/lsp/types";
+import * as atomicFileWrite from "../../src/tools/atomic-file-write";
+import { FileWriteNotPublishedError } from "../../src/tools/atomic-file-write";
 
 describe("createLspWritethrough batching", () => {
 	let tempDir: TempDir;
@@ -63,5 +66,36 @@ describe("createLspWritethrough batching", () => {
 		expect(getServersSpy).toHaveBeenCalledTimes(1);
 		expect(loadConfigSpy).toHaveBeenCalledTimes(1);
 		expect(await Bun.file(filePath).text()).toBe("const single = true;\n");
+	});
+
+	it("reports a later publication failure as potentially replacing an earlier write", async () => {
+		vi.spyOn(lspConfig, "loadConfig").mockReturnValue({ servers: {}, idleTimeoutMs: undefined });
+		const client = {
+			format: async () => "const formatted = true;\n",
+			lint: async () => [],
+		};
+		const server: ServerConfig = {
+			command: "custom-formatter",
+			fileTypes: ["ts"],
+			rootMarkers: [],
+			createClient: () => client,
+		};
+		vi.spyOn(lspConfig, "getServersForFile").mockReturnValue([["custom", server]]);
+		const filePath = path.join(tempDir.path(), "later-failure.ts");
+		let writes = 0;
+		const atomicFailure = new FileWriteNotPublishedError(
+			filePath,
+			Object.assign(new Error("EIO: publication failed"), { code: "EIO" }),
+		);
+		vi.spyOn(atomicFileWrite, "writeFileAtomically").mockImplementation(async () => {
+			writes += 1;
+			if (writes > 1) throw atomicFailure;
+		});
+
+		const writethrough = createLspWritethrough(tempDir.path(), { enableFormat: true });
+		await expect(writethrough(filePath, "const original = true;\n")).rejects.toMatchObject({
+			destUnchanged: false,
+		});
+		expect(writes).toBeGreaterThan(1);
 	});
 });

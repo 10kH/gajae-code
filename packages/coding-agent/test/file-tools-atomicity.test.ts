@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import type { PathLike, StatOptions } from "node:fs";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -7,6 +9,7 @@ import type { ClientBridge } from "@gajae-code/coding-agent/session/client-bridg
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { ReadTool } from "@gajae-code/coding-agent/tools/read";
 import { WriteTool } from "@gajae-code/coding-agent/tools/write";
+import * as natives from "@gajae-code/natives";
 import { FileReadCache } from "../src/edit/file-read-cache";
 import { writeFileAtomically } from "../src/tools/atomic-file-write";
 
@@ -257,6 +260,36 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
+	it("re-applies ownership when the staged inode has different metadata", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "ownership-reapplied.ts");
+		await fs.writeFile(dest, "old\n", { mode: 0o640 });
+		const before = await fs.stat(dest);
+		const realStat = fs.stat.bind(fs);
+		const realChown = fs.chown.bind(fs);
+		const chowns: Array<{ uid: number; gid: number }> = [];
+		const statImplementation = async (target: PathLike, options?: StatOptions) => {
+			const result = options === undefined ? await realStat(target) : await realStat(target, options);
+			if (result === undefined) return result;
+			if (String(target).includes(".tmp") && options?.bigint !== true) {
+				return Object.assign(result, { uid: before.uid + 1, gid: before.gid + 1 });
+			}
+			return result;
+		};
+		const stat = spyOn(fs, "stat").mockImplementation(statImplementation as typeof fs.stat);
+		const chown = spyOn(fs, "chown").mockImplementation(async (_target, uid, gid) => {
+			chowns.push({ uid, gid });
+			await realChown(dest, before.uid, before.gid);
+		});
+		try {
+			await writeFileAtomically(dest, "new\n");
+			expect(chowns).toEqual([{ uid: before.uid, gid: before.gid }]);
+		} finally {
+			stat.mockRestore();
+			chown.mockRestore();
+		}
+	});
+
 	it("rejects hard-linked destinations instead of splitting the link group", async () => {
 		if (process.platform === "win32") return;
 		const dest = path.join(tmpDir, "hard-linked.ts");
@@ -292,6 +325,30 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		} finally {
 			original.mockRestore();
 			await fs.rm(originalPath, { force: true });
+		}
+	});
+
+	it("uses the native identity-bound primitive at the publication boundary", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "native-boundary.ts");
+		const successor = path.join(tmpDir, "native-successor.ts");
+		const displaced = path.join(tmpDir, "native-displaced.ts");
+		await fs.writeFile(dest, "original\n");
+		await fs.writeFile(successor, "successor\n");
+		const realExactReplace = natives.exactReplacePath;
+		const original = spyOn(natives, "exactReplacePath").mockImplementation(
+			(sourcePath, destinationPath, expectedSource, expectedDestination) => {
+				fsSync.renameSync(destinationPath, displaced);
+				fsSync.renameSync(successor, destinationPath);
+				return realExactReplace(sourcePath, destinationPath, expectedSource, expectedDestination);
+			},
+		);
+		try {
+			await expect(writeFileAtomically(dest, "must-not-overwrite\n")).rejects.toThrow(/identity_mismatch/);
+			expect(await fs.readFile(dest, "utf8")).toBe("successor\n");
+		} finally {
+			original.mockRestore();
+			await fs.rm(displaced, { force: true });
 		}
 	});
 
@@ -339,6 +396,24 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		}
 	});
 
+	it("cleans a staged file when syncing bytes fails", async () => {
+		const dest = path.join(tmpDir, "sync-fails.ts");
+		const realOpen = fs.open.bind(fs);
+		const original = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			const handle = await realOpen(target, flags, mode);
+			if (String(target).includes(".tmp") && flags === "wx") {
+				spyOn(handle, "sync").mockRejectedValue(Object.assign(new Error("EIO: sync failed"), { code: "EIO" }));
+			}
+			return handle;
+		});
+		try {
+			await expect(writeFileAtomically(dest, "must-fail\n")).rejects.toMatchObject({ code: "EIO" });
+			expect((await fs.readdir(path.dirname(dest))).some(name => name.endsWith(".tmp"))).toBe(false);
+		} finally {
+			original.mockRestore();
+		}
+	});
+
 	it("does not replace an unwritable target through a writable parent", async () => {
 		if (process.platform === "win32" || (typeof process.getuid === "function" && process.getuid() === 0)) return;
 		const parent = path.join(tmpDir, "writable-parent");
@@ -357,21 +432,39 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 	it("cleans an owned staging file when publication fails", async () => {
 		const dest = path.join(tmpDir, "rename-fails.ts");
 		await fs.writeFile(dest, "original\n");
-		const realRename = fs.rename.bind(fs);
-		const original = spyOn(fs, "rename").mockImplementation(async (from, to) => {
-			if (String(from).includes(".tmp")) {
-				const error = new Error("EIO: publication failed") as Error & { code: string };
-				error.code = "EIO";
-				throw error;
-			}
-			return realRename(from, to);
-		});
+		const original = spyOn(natives, "exactReplacePath").mockImplementation(() => ({
+			ok: false,
+			code: "EIO",
+		}));
 		try {
 			await expect(writeFileAtomically(dest, "replacement\n")).rejects.toMatchObject({ code: "EIO" });
 			expect(await fs.readFile(dest, "utf8")).toBe("original\n");
 			expect((await fs.readdir(path.dirname(dest))).some(name => name.endsWith(".tmp"))).toBe(false);
 		} finally {
 			original.mockRestore();
+		}
+	});
+
+	it("reports cleanup failure without claiming the staged file was removed", async () => {
+		const dest = path.join(tmpDir, "unlink-fails.ts");
+		await fs.writeFile(dest, "original\n");
+		const replace = spyOn(natives, "exactReplacePath").mockImplementation(() => ({
+			ok: false,
+			code: "EIO",
+		}));
+		const realUnlink = fs.unlink.bind(fs);
+		const unlink = spyOn(fs, "unlink").mockImplementation(async target => {
+			if (String(target).includes(".tmp")) {
+				throw Object.assign(new Error("EIO: unlink failed"), { code: "EIO" });
+			}
+			return realUnlink(target);
+		});
+		try {
+			await expect(writeFileAtomically(dest, "replacement\n")).rejects.toThrow(/Failed to clean up staging file/);
+			expect((await fs.readdir(path.dirname(dest))).some(name => name.endsWith(".tmp"))).toBe(true);
+		} finally {
+			replace.mockRestore();
+			unlink.mockRestore();
 		}
 	});
 
