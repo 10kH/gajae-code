@@ -9,7 +9,7 @@ import * as native from "@gajae-code/natives";
 import { getSessionsDir } from "@gajae-code/utils";
 
 import { lifecycleArgs } from "../src/commands/sdk";
-import { Broker, type BrokerResponse } from "../src/sdk/broker/broker";
+import { Broker, type BrokerResponse, setPublicationObservationForTest } from "../src/sdk/broker/broker";
 import * as brokerDiscovery from "../src/sdk/broker/discovery";
 import {
 	type BrokerDiscovery,
@@ -1391,20 +1391,24 @@ describe("SDK broker identity and discovery", () => {
 
 			const retainedRoot = path.join(dir, "retained-sdk");
 			await fs.rename(path.join(dir, "sdk"), retainedRoot);
+			// The filesystem rename is real; force the native-equivalent observation so
+			// this test does not race the blocking-pool descriptor check on a loaded CI
+			// runner. The fail-closed admission transition remains the behavior under test.
+			setPublicationObservationForTest(broker, "absent");
 			watchdog!();
-			// The watchdog observes on the blocking pool; admission sees the fence after
-			// that observation settles, before request normalization or IO.
-			await new Promise(resolve => setTimeout(resolve, 0));
+			await Bun.sleep(0);
 			expect(await broker.handleRequest("session.list", {})).toEqual({
 				ok: false,
 				error: { code: "unavailable", message: "broker publication is unavailable" },
 			});
 
 			await fs.rename(retainedRoot, path.join(dir, "sdk"));
+			setPublicationObservationForTest(broker, "owned");
 			watchdog!();
-			await new Promise(resolve => setTimeout(resolve, 0));
+			await Bun.sleep(0);
 			expect(await broker.handleRequest("session.list", {})).toMatchObject({ ok: true });
 		} finally {
+			setPublicationObservationForTest(broker, undefined);
 			interval.mockRestore();
 			await broker.stop();
 			await fs.rm(dir, { recursive: true, force: true });
