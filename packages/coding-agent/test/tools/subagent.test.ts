@@ -47,6 +47,85 @@ function getText(result: { content: Array<{ type: string; text?: string }> }): s
 	return result.content.find(part => part.type === "text")?.text ?? "";
 }
 
+/**
+ * Trip a genuine staged-buffer overflow in the agent runtime (a single event
+ * larger than the byte cap) and return the settled agent, so its real terminal
+ * message can drive the executor chain (#4618).
+ */
+async function runOverflowAgent(): Promise<Agent> {
+	const mock = createMockModel();
+	const agent = new Agent({
+		initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+		streamFn: () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "x".repeat(MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1) }],
+					api: mock.model.api,
+					provider: mock.model.provider,
+					model: mock.model.id,
+					usage: {
+						input: 0,
+						output: 0,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: 0,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					stopReason: "stop",
+					timestamp: Date.now(),
+				};
+				stream.push({ type: "start", partial });
+			});
+			return stream;
+		},
+	});
+	await agent.prompt("run", { fallbackManaged: true });
+	await agent.waitForIdle();
+	return agent;
+}
+
+const runSubprocessBaseOptions = {
+	cwd: "/tmp",
+	agent: { name: "planner", description: "test", systemPrompt: "test", source: "bundled" } as AgentDefinition,
+	task: "read a large spec",
+	index: 0,
+	settings: Settings.isolated(),
+	modelRegistry: {
+		refresh: async () => {},
+		getAvailable: () => [],
+		getApiKey: async () => kNoAuth,
+	} as never,
+	enableLsp: false,
+};
+
+/** Session stub whose last assistant message is the real overflow terminal. */
+function mockCreateAgentSessionWithTerminal(terminal: AssistantMessage) {
+	const session = {
+		agent: { state: { systemPrompt: ["test"] } },
+		sessionManager: { appendSessionInit: () => {} },
+		extensionRunner: undefined,
+		get messages() {
+			return [terminal];
+		},
+		state: { messages: [terminal] },
+		getActiveToolNames: () => ["read", "yield"],
+		setActiveToolsByName: async () => {},
+		setConfiguredModelChain: () => {},
+		seedDefaultFallbackResolution: () => {},
+		subscribe: () => () => {},
+		prompt: async (_text: string, options?: PromptOptions) => {
+			await options?.onPreflightAcceptCommit?.();
+		},
+		waitForIdle: async () => {},
+		getLastAssistantMessage: () => terminal,
+		abort: async () => {},
+		dispose: async () => {},
+	} as unknown as AgentSession;
+	return vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({ session } as never);
+}
+
 const PREVIEW_TIERS = [
 	{ name: "receipt", bytes: 1_024, codePoints: 280, verbosity: "receipt" },
 	{ name: "preview", bytes: 8_192, codePoints: 2_000, verbosity: "preview" },
@@ -354,61 +433,40 @@ describe("SubagentTool", () => {
 	it("pins the full chain with a REAL staged-buffer overflow, including streaming render and width bounding (#4618)", async () => {
 		// A genuine overflow tripped by the agent runtime's own staging
 		// machinery (single event larger than the byte cap) — not a fabricated
-		// terminal shape. The real diagnostic then travels executor boundary ->
-		// SingleResult -> outcome -> AsyncJob -> snapshot -> renderer.
-		const mock = createMockModel();
-		const streamFn = () => {
-			const stream = new AssistantMessageEventStream();
-			queueMicrotask(() => {
-				const partial: AssistantMessage = {
-					role: "assistant",
-					content: [{ type: "text", text: "x".repeat(MANAGED_ATTEMPT_MAX_STAGED_BYTES + 1) }],
-					api: mock.model.api,
-					provider: mock.model.provider,
-					model: mock.model.id,
-					usage: {
-						input: 0,
-						output: 0,
-						cacheRead: 0,
-						cacheWrite: 0,
-						totalTokens: 0,
-						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-					},
-					stopReason: "stop",
-					timestamp: Date.now(),
-				};
-				stream.push({ type: "start", partial });
-			});
-			return stream;
-		};
-		const agent = new Agent({
-			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
-			streamFn,
-		});
-		await agent.prompt("run", { fallbackManaged: true });
-		await agent.waitForIdle();
+		// terminal shape — driven through the REAL chain: runSubprocess ->
+		// SingleResult -> buildTaskReceipt -> outcome -> AsyncJob -> snapshot ->
+		// renderer.
+		const agent = await runOverflowAgent();
 		const terminal = agent.state.messages.at(-1) as AssistantMessage;
 		expect(terminal.errorKind).toBe("local_buffer_overflow");
 		expect(terminal.bufferOverflow?.exceeded).toBe("bytes");
 
-		// The executor trust boundary consumes the real producer shape: the
-		// closed-vocabulary validation accepts it and renders real counters.
-		const localErrorSummary = createLocalErrorSummary(
-			terminal.errorKind,
-			terminal.errorMessage,
-			terminal.bufferOverflow,
-		);
-		expect(localErrorSummary.kind).toBe("local_buffer_overflow");
-		expect(localErrorSummary.summary).toContain("overflow.preMeasure");
-		expect(localErrorSummary.summary).toContain("exceeded=bytes");
+		const spy = mockCreateAgentSessionWithTerminal(terminal);
+		let singleResult: SingleResult;
+		try {
+			singleResult = (await runSubprocess({
+				...runSubprocessBaseOptions,
+				id: "0-RealOverflow",
+			})) as SingleResult;
+		} finally {
+			spy.mockRestore();
+		}
+
+		// Executor trust boundary: the real producer shape validates and renders
+		// real counters instead of the generic "error recorded" preview.
+		expect(singleResult.exitCode).toBe(1);
+		expect(singleResult.localErrorSummary?.kind).toBe("local_buffer_overflow");
+		expect(singleResult.localErrorSummary?.summary).toContain("overflow.preMeasure");
+		expect(singleResult.localErrorSummary?.summary).toContain("exceeded=bytes");
+
+		// Receipt construction: the parent-visible preview names the local kind.
+		const receipt = buildTaskReceipt(singleResult);
+		expect(receipt.status).toBe("failed");
+		expect(receipt.preview).toContain("local failure (local_buffer_overflow)");
+		expect(receipt.preview).not.toContain("Task failed; error recorded.");
 
 		const manager = createManager();
 		const tool = new SubagentTool(createSession());
-		const singleResult = {
-			aborted: false,
-			exitCode: 1,
-			localErrorSummary,
-		} satisfies Pick<SingleResult, "aborted" | "exitCode" | "localErrorSummary">;
 		const jobId = manager.register(
 			"task",
 			"launching subagent",

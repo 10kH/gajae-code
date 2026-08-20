@@ -20,6 +20,7 @@ import {
 	managedDirectoryRoot,
 } from "../../src/session/internal/managed-session-storage";
 import { createManagedTaskPersistence, runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "../../src/task/executor";
+import { buildTaskReceipt } from "../../src/task/receipt";
 
 import {
 	type AgentDefinition,
@@ -1842,6 +1843,28 @@ describe("runSubprocess telemetry propagation", () => {
 		expect(result.localErrorSummary?.kind).toBe("local_snapshot_failure");
 		expect(result.localErrorSummary?.summary).toContain("serializable event snapshot");
 		expect(result.localErrorSummary?.summary).not.toContain(marker);
+	});
+
+	it("keeps a forged local errorKind out of the receipt when the runtime never produced one (#4618)", async () => {
+		// The agent runtime strips `errorKind` from any terminal message it did
+		// not itself produce from an identity-checked local error, so a provider
+		// failure never arrives here labeled local. Pin the executor's behavior
+		// for that contract: no local summary, ordinary provider error text.
+		const session = createMockSession(({ state }) => {
+			state.messages.push({
+				...createAssistantStopMessage(""),
+				stopReason: "error",
+				errorMessage: "upstream stream terminated unexpectedly",
+			});
+		});
+		mockCreateAgentSession(session);
+
+		const result = await runSubprocess({ ...baseOptions, id: "subagent-unlabeled-provider-error" });
+		const receipt = buildTaskReceipt(result);
+
+		expect(result.localErrorSummary).toBeUndefined();
+		expect(receipt.preview).not.toContain("local failure");
+		expect(receipt.preview).not.toContain("staging-buffer");
 	});
 
 	it("keeps localErrorSummary undefined for an ordinary provider error (#4618 fallback isolation)", async () => {

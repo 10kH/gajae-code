@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Fixed
+- A foreign error that self-declares a local failure kind no longer gets one either (#4618). `errorKind` and the structured `bufferOverflow` shape now come from a single identity-checked extractor (`managedLocalErrorDiagnostic`) used by both terminal-message producers — `managedFailureMessage` and the `Agent` run catch. Previously the shape was identity-gated but the label was not, so a provider or custom-stream failure carrying `errorKind: "local_buffer_overflow"` reached the parent receipt preview as `Local staging-buffer overflow; structured diagnostic unavailable.` and pointed whoever read it at the wrong subsystem.
 - Local diagnostic authority fields are no longer foreign-settable through the managed snapshot shell (#4618). `managedAssistantShell` spreads the provider/stream message snapshot into the rebuilt assistant message; a payload that smuggled `errorKind` or `bufferOverflow` through that spread could masquerade as the runtime's own identity-checked diagnostic at the parent boundary. Both fields are now stripped from the snapshot spread — they are attached only by the module's own runtime-error paths (`managedFailureMessage` and the Agent catch), which never route through the shell.
 
 - `Agent.waitForSteeringArrival(signal)` resolves when steering is queued without consuming it, so wait-style tools can end their observation early.

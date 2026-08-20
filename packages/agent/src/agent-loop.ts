@@ -454,7 +454,9 @@ function managedContextOverflowOutcome(message: AssistantMessage, scope?: Attemp
 function managedFailureMessage(error: unknown, config: AgentLoopConfig): AssistantMessage {
 	const errorMessage = managedProperty(error, "message");
 	const transportFailure = managedTransportFailure(error);
-	const errorKind = managedProperty(error, "errorKind");
+	// One identity-checked source for BOTH local-diagnostic fields: a foreign
+	// error that self-labels `errorKind` gets neither (#4618).
+	const localDiagnostic = managedLocalErrorDiagnostic(error);
 	let fallbackMessage = "Managed fallback attempt failed";
 	if (typeof errorMessage === "string") fallbackMessage = errorMessage;
 	else {
@@ -484,11 +486,7 @@ function managedFailureMessage(error: unknown, config: AgentLoopConfig): Assista
 		stopReason: "error",
 		errorMessage: fallbackMessage,
 		...(transportFailure ? { transportFailure } : {}),
-		...(errorKind === "local_snapshot_failure" || errorKind === "local_buffer_overflow" ? { errorKind } : {}),
-		// Identity-checked structured overflow shape (see
-		// managedBufferOverflowDiagnostic): only the module-private error class
-		// can populate it, so a foreign self-labeled error gets no shape.
-		...(managedBufferOverflowDiagnostic(error) ? { bufferOverflow: managedBufferOverflowDiagnostic(error) } : {}),
+		...(localDiagnostic ?? {}),
 		timestamp: Date.now(),
 	};
 }
@@ -788,25 +786,47 @@ export interface ManagedBufferOverflowDiagnostic {
 }
 
 /**
- * Identity-checked extraction of the structured overflow diagnostic. Returns
- * `undefined` unless the error is genuinely `instanceof` the module-private
- * `ManagedAttemptBufferOverflowError` — a foreign error that merely sets
- * `errorKind: "local_buffer_overflow"` fails the identity check and gets no
- * diagnostic. Downstream consumers MUST use this instead of trusting
- * `errorKind`/`errorMessage` when rendering parent-facing summaries (#4618).
+ * The complete set of local-diagnostic authority fields a terminal
+ * `AssistantMessage` may carry. Produced only by
+ * {@link managedLocalErrorDiagnostic}, so `errorKind` and `bufferOverflow`
+ * always travel together from one identity check.
  */
-export function managedBufferOverflowDiagnostic(error: unknown): ManagedBufferOverflowDiagnostic | undefined {
-	if (!(error instanceof ManagedAttemptBufferOverflowError)) return undefined;
-	const overflow = error.overflow;
-	return {
-		stage: MANAGED_LOCAL_FAILURE_STAGE_SET.has(overflow.stage) ? overflow.stage : "unknown",
-		exceeded: overflow.exceeded === "events" || overflow.exceeded === "bytes" ? overflow.exceeded : "both",
-		stagedEventCount: overflow.stagedEventCount,
-		stagedBytes: overflow.stagedBytes,
-		incomingEventBytes: overflow.incomingEventBytes,
-		maxStagedEvents: overflow.maxStagedEvents,
-		maxStagedBytes: overflow.maxStagedBytes,
-	};
+export interface ManagedLocalErrorDiagnostic {
+	errorKind: "local_snapshot_failure" | "local_buffer_overflow";
+	bufferOverflow?: ManagedBufferOverflowDiagnostic;
+}
+
+/**
+ * Single identity-checked source of local-failure authority. Returns
+ * `undefined` unless the error is genuinely `instanceof` one of this module's
+ * private local-failure classes — a foreign error that merely sets
+ * `errorKind: "local_buffer_overflow"` fails the identity check and receives
+ * NEITHER the kind nor the structured shape, so a provider or custom-stream
+ * failure can never be reported to the parent as a local staging-buffer
+ * overflow (#4618).
+ *
+ * Every producer of a terminal assistant message (`managedFailureMessage` and
+ * the `Agent` run catch) MUST derive both fields from this function instead of
+ * reading `errorKind`/`errorMessage` off the thrown value.
+ */
+export function managedLocalErrorDiagnostic(error: unknown): ManagedLocalErrorDiagnostic | undefined {
+	if (error instanceof ManagedAttemptBufferOverflowError) {
+		const overflow = error.overflow;
+		return {
+			errorKind: "local_buffer_overflow",
+			bufferOverflow: {
+				stage: MANAGED_LOCAL_FAILURE_STAGE_SET.has(overflow.stage) ? overflow.stage : "unknown",
+				exceeded: overflow.exceeded === "events" || overflow.exceeded === "bytes" ? overflow.exceeded : "both",
+				stagedEventCount: overflow.stagedEventCount,
+				stagedBytes: overflow.stagedBytes,
+				incomingEventBytes: overflow.incomingEventBytes,
+				maxStagedEvents: overflow.maxStagedEvents,
+				maxStagedBytes: overflow.maxStagedBytes,
+			},
+		};
+	}
+	if (error instanceof ManagedAttemptSnapshotError) return { errorKind: "local_snapshot_failure" };
+	return undefined;
 }
 
 /**

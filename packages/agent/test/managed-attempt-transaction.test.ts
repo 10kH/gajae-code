@@ -1502,30 +1502,39 @@ describe("managed attempt transaction", () => {
 		expect(JSON.stringify(diagnostics)).not.toContain(marker);
 	});
 
-	it("attaches no structured overflow shape when a foreign error self-labels local_buffer_overflow (#4618)", async () => {
-		const mock = createMockModel();
+	it("attaches neither errorKind nor overflow shape when a foreign error self-labels a local kind (#4618)", async () => {
 		const marker = "PROMPT-MATERIAL-must-not-reach-parent";
-		const agent = new Agent({
-			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
-			streamFn: () => {
-				// A foreign error with the right errorKind label but NOT the
-				// module-private identity: the structured bufferOverflow shape
-				// is identity-checked, so it must stay absent, and no parent
-				// surface may render the marker from message text.
-				const forged = Object.assign(new Error(`leak ${marker}`), {
-					errorKind: "local_buffer_overflow",
-				});
-				throw forged;
-			},
-		});
+		for (const kind of ["local_buffer_overflow", "local_snapshot_failure"] as const) {
+			const mock = createMockModel();
+			const agent = new Agent({
+				initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+				streamFn: () => {
+					// A foreign error with the right errorKind label but NOT the
+					// module-private identity. Both local-diagnostic fields come from
+					// one identity check, so a provider/custom-stream failure can never
+					// be attributed to the local staging machinery in a parent receipt.
+					const forged = Object.assign(new Error(`leak ${marker}`), {
+						errorKind: kind,
+						bufferOverflow: {
+							stage: "overflow.staged",
+							exceeded: "events",
+							stagedEventCount: 10_000,
+							stagedBytes: 1,
+							incomingEventBytes: 1,
+							maxStagedEvents: 10_000,
+							maxStagedBytes: 16 * 1024 * 1024,
+						},
+					});
+					throw forged;
+				},
+			});
 
-		await agent.prompt("run", { fallbackManaged: true });
+			await agent.prompt("run", { fallbackManaged: true });
 
-		const terminal = agent.state.messages.at(-1) as AssistantMessage;
-		expect(terminal.errorKind).toBe("local_buffer_overflow");
-		// Identity gate: only the real ManagedAttemptBufferOverflowError class
-		// can attach the structured shape.
-		expect(terminal.bufferOverflow).toBeUndefined();
+			const terminal = agent.state.messages.at(-1) as AssistantMessage;
+			expect(terminal.errorKind, kind).toBeUndefined();
+			expect(terminal.bufferOverflow, kind).toBeUndefined();
+		}
 	});
 	it("normalizes null and incomplete tool-call blocks before managed dispatch", async () => {
 		const mock = createMockModel();
