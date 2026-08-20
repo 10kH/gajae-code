@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-08-20
+
 ### Added
 - Added an opt-in crash upstream relay for cross-install aggregation. Handled tool errors are captured and relayed to a configurable Sentry upstream; relayed-upstream state transitions are journaled and indexed; and the relay is hardened across the trust boundary (no unsigned provenance), delivery watermarks (no replay races), egress and durability (bounded queues, LRU-bounded handled dedupe, restored fatal-occurrence journaling), and recovery/provenance paths closed by exact-head review. The generated config schema was regenerated after the global-only relay settings. Off by default; enabling requires explicit operator opt-in.
 - Added a manual-switch hint after provider safety stops: when a provider halts a turn for a safety reason, the session now surfaces that the operator can switch models/providers manually instead of leaving the stop unexplained (#4650, #4653).

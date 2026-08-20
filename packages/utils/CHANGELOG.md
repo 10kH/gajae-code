@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-08-20
+
 ### Added
 - Crash journal and postmortem support for the opt-in upstream relay: relayed-upstream transitions are journaled and indexed, with bounded queues and LRU-bounded handled-error dedupe.
 

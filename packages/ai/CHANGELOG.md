@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-08-20
+
 ### Fixed
 - Grok Build now gets the same 300s idle window as other long-turn providers, so turns no longer stall waiting on a shorter default.
 - `getCachedUsageReport` surfaces cached usage for API-key credentials, not only OAuth accounts (#4686).

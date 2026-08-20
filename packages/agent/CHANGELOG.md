@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.14.2] - 2026-08-20
+
 ### Fixed
 - A steer that interrupts an in-flight tool is delivered instead of dropped, and the remaining abort-race gaps in steer-after-tool-interrupt are closed; a live subagent await ends when user steering arrives.
 - The escaped-non-ASCII em-dash exemption is bounded to display-only tools (#4627).
