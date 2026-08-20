@@ -54,8 +54,9 @@ export interface ProviderSafetyStopHintSession {
 /** Whether an assistant message terminated as a provider safety stop (typed or legacy-persisted). */
 export function isProviderSafetyStop(message: AssistantMessage): boolean {
 	return (
-		message.errorKind === "provider_safety_stop" ||
-		(message.errorMessage !== undefined && isLegacyProviderSafetyStopMessage(message.errorMessage))
+		message.stopReason === "error" &&
+		(message.errorKind === "provider_safety_stop" ||
+			(message.errorMessage !== undefined && isLegacyProviderSafetyStopMessage(message.errorMessage)))
 	);
 }
 
