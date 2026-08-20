@@ -63,6 +63,16 @@ describe("fresh-process test harness contracts", () => {
 		expect(files).not.toContain("packages/ai/test/anthropic-cache-eval.integration.test.ts");
 	});
 
+	test("assigns the provider safety-stop regression to exactly one normal coding-agent shard", async () => {
+		const files = await enumerateTestFiles("packages/coding-agent", path.join(import.meta.dir, ".."));
+		const regression = "packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts";
+		expect(files).toContain(regression);
+		const assignedShards = Array.from({ length: 8 }, (_, index) => index + 1).filter(shard =>
+			selectShard(files, { index: shard, total: 8 }).includes(regression),
+		);
+		expect(assignedShards).toEqual([8]);
+	});
+
 	test("keeps Bun shard assignment deterministic", () => {
 		const files = ["a", "b", "c", "d", "e"];
 		expect(selectShard(files, { index: 1, total: 2 })).toEqual(["a", "c", "e"]);

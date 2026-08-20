@@ -17693,6 +17693,10 @@ export class AgentSession {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
 		const transportFailure = message.transportFailure;
+		// Transport facts normally bypass typed classification in managed fallback.
+		// A provider safety stop must still remain terminal on that path.
+		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop" && transportFailure)
+			return false;
 		const contextWindow = this.model?.contextWindow ?? 0;
 		if (classifyContextOverflow(message, transportFailure, contextWindow)) return false;
 		const managedFallback = this.#defaultFallbackChain().chain.entries.length > 1;
@@ -18165,6 +18169,7 @@ export class AgentSession {
 		// result is returned verbatim below. Narrowing it away here would silently
 		// disable the terminal-403 guard in `#markFailedCredential`.
 	): { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition } | undefined {
+		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop") return undefined;
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
 		if (transport.class !== "other") return transport;
@@ -18378,6 +18383,18 @@ export class AgentSession {
 		// one producer-boundary diagnostic immediately without provider-fallback
 		// attribution or credential mutation.
 		if (localSnapshot || localBufferOverflow) {
+			return managedOutcome
+				? {
+						type: "terminal",
+						terminal: { stopReason: "error", messages: [message] },
+					}
+				: false;
+		}
+		// A typed provider safety stop is terminal even when managed fallback is
+		// enabled. Preserve the original refusal instead of treating the absent
+		// fallback trigger as chain exhaustion; do not broaden this to every
+		// untyped terminal classification.
+		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop") {
 			return managedOutcome
 				? {
 						type: "terminal",

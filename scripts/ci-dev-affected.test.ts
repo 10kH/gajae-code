@@ -1094,8 +1094,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		dir: "packages/coding-agent",
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
-	const targetingPackages: WorkspacePackage[] = [codingAgent];
+	const agentCore: WorkspacePackage = {
+		name: "@gajae-code/agent-core",
+		dir: "packages/agent",
+		manifest: { name: "@gajae-code/agent-core", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const targetingPackages: WorkspacePackage[] = [agentCore, codingAgent];
 	const testFiles = [
+		"packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts",
 		"packages/coding-agent/test/edit/foo.test.ts",
 		"packages/coding-agent/test/edit/bar.test.ts",
 		"packages/coding-agent/test/cli.test.ts",
@@ -1111,6 +1117,30 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	function targeted(paths: readonly string[]) {
 		return planTargetedTasks(paths, targetingPackages, testFiles);
 	}
+
+	test("provider envelope changes select the safety-stop regression once without broad shards", () => {
+		const tasks = targeted(["packages/agent/src/agent-loop.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys.filter(key => key === "test:packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts")).toHaveLength(1);
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
+		expect(keys).toContain("check:@gajae-code/agent-core");
+	});
+
+	test("push routing keeps the regression inside the normal eight-shard suite", () => {
+		const pushCodingAgent: WorkspacePackage = {
+			...codingAgent,
+			manifest: {
+				...codingAgent.manifest,
+				dependencies: { "@gajae-code/agent-core": "workspace:*" },
+			},
+		};
+		const tasks = planTasks(["packages/agent/src/agent-loop.ts"], [agentCore, pushCodingAgent]);
+		const shardKeys = tasks
+			.map(task => task.key)
+			.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(shardKeys).toHaveLength(8);
+		expect(tasks.filter(task => task.key === "test:packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts")).toHaveLength(0);
+	});
 
 	test("a single coding-agent test change runs only that test, not the whole package suite", () => {
 		const tasks = targeted(["packages/coding-agent/test/edit/foo.test.ts"]);
