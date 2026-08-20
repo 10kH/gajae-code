@@ -311,9 +311,10 @@ class DirResolver {
  * every redirect the credential boundary is meant to reject.
  *
  * `env.ts` imports this module, so the check cannot go through `$credentialEnv`;
- * it applies the same conservative ambiguity rule directly: any key declared
- * by the project `.env` is not honoured. This also covers dotenv-expanded
- * values whose runtime value differs from the declaration text.
+ * it applies the same conservative ambiguity rule directly: a value that matches
+ * what the project `.env` sets is not honoured. An operator whose environment
+ * happens to carry the identical value loses the override, which is the same
+ * trade-off `resolveLiveCredentialEnvValue` already makes.
  */
 function trustedAgentDirOverrideFor(name: "GJC_CODING_AGENT_DIR" | "PI_CODING_AGENT_DIR"): string | undefined {
 	const value = process.env[name];
