@@ -58,6 +58,13 @@ export async function lifecycleArgs(
 		unknownFlags: new Map(),
 		...(request.operation === "session.resume" ? { resume: request.sessionPath } : {}),
 		...(request.modelPreset ? { mpreset: request.modelPreset } : {}),
+		// Explicit model pin (#4707): coordinator-resolved `provider/model`
+		// selector applied exactly like CLI `--model`. createAgentSession
+		// resolves it through the same staged selector resolver, and startup
+		// model-profile application then overrides the activated profile with
+		// this explicit selection (main.ts applyStartupModelProfilesWithPolicy),
+		// matching `gjc --mpreset p --model m` precedence.
+		...(request.modelId ? { model: request.modelId } : {}),
 		...(request.operation === "session.fork"
 			? {
 					fork: request.sourceSessionPath ?? request.sourceSessionId,
@@ -554,6 +561,7 @@ export async function runSessionHost(
 				...(mcpConfigPath ? { mcpConfigPath } : {}),
 				...(mcpStartupTimeoutMs !== undefined ? { mcpStartupTimeoutMs } : {}),
 				...(request.readiness ? { readiness: request.readiness } : {}),
+				...(request.modelId ? { modelId: request.modelId } : {}),
 			});
 		} catch (error) {
 			throw await registrationFailure(error);

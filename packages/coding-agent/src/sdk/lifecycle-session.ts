@@ -30,6 +30,13 @@ export type CreateLifecycleAgentSessionResult =
  */
 export type CreateLifecycleAgentSessionOptions = Omit<CreateAgentSessionOptions, "deferMemoryBackendStartup"> & {
 	/**
+	 * Explicit model pin (#4707): the coordinator-resolved `provider/model`
+	 * selector, forwarded as {@link CreateAgentSessionOptions.modelPattern} so
+	 * the session resolves it through the same staged selector resolver the CLI
+	 * `--model` flag uses (after extension providers register).
+	 */
+	modelId?: string;
+	/**
 	 * Startup budget for ACP lifecycle MCP launches, in milliseconds. Set only
 	 * when the lifecycle request supplies `mcpServers`; ordinary consumers keep
 	 * the manager's short default ceiling.
@@ -50,9 +57,13 @@ export async function createLifecycleAgentSession(
 	const rollback = new SdkStartupRollbackTracker();
 	const capability = new SdkStartupCapability(rollback, options.readiness ?? "immediate");
 	try {
-		const { mcpStartupTimeoutMs, readiness: _readiness, ...sessionOptions } = options;
+		const { modelId, mcpStartupTimeoutMs, readiness: _readiness, ...sessionOptions } = options;
 		const internalOptions = {
 			...sessionOptions,
+			// Explicit model pin (#4707): resolve through the staged selector
+			// resolver after extension providers register (modelPattern), so the
+			// pin matches CLI `--model` semantics instead of bypassing them.
+			...(modelId !== undefined ? { modelPattern: modelId } : {}),
 			// Memory startup (rollout summarisation) issues one LLM request per
 			// claimed rollout, so its duration scales with the backlog. Keeping it
 			// inside the broker's readiness window is what kills the child at the

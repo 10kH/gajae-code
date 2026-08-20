@@ -68,6 +68,11 @@ import {
 	type WebhookDelivery,
 } from "./event-webhook";
 import {
+	type CoordinatorModelRegistryLoader,
+	loadCoordinatorModelRegistry,
+	resolveCoordinatorModel,
+} from "./model-pin";
+import {
 	type CoordinatorModelProfileLoader,
 	loadCoordinatorModelProfiles,
 	resolveCoordinatorMpreset,
@@ -205,6 +210,7 @@ interface CoordinatorServices {
 	readSdkBrokerDiscovery?: (agentDir: string) => Promise<BrokerDiscovery | null>;
 	getAgentDir?: () => string;
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
+	resolveModelRegistry?: CoordinatorModelRegistryLoader;
 	canonicalizePath?: (value: string) => Promise<string>;
 	codexTransportFactory?: CodexTransportFactory;
 	eventWebhookDelivery?: WebhookDelivery;
@@ -423,6 +429,11 @@ function toolSchema(name: CoordinatorToolName): {
 		description:
 			"Optional GJC model profile (`gjc --mpreset <profile>`). Unknown names are rejected with the available-profile listing.",
 	};
+	const modelPin = {
+		type: "string",
+		description:
+			"Optional explicit model pin (`gjc --model <provider/model>`, e.g. cursor/claude-fable-5-xhigh). Unknown ids are rejected with the same not-found error as the CLI; when both model and mpreset are given, the explicit model wins exactly like `gjc --mpreset <p> --model <m>`.",
+	};
 
 	const common = { type: "object", properties: {} as Record<string, unknown> };
 	const idempotencyKey = {
@@ -469,6 +480,7 @@ function toolSchema(name: CoordinatorToolName): {
 							"Create the session prepared instead of ready: no readiness is published and no initial prompt is accepted until gjc_coordinator_activate_session proves activation.",
 					},
 					mpreset,
+					model: modelPin,
 					idempotency_key: idempotencyKey,
 					allow_mutation: allowMutation,
 				},
@@ -752,11 +764,7 @@ function toolSchema(name: CoordinatorToolName): {
 						description: "When reusing a session with an active turn, supersede it before sending.",
 					},
 					mpreset,
-
-					model: {
-						type: "string",
-						description: "Optional model hint passed in prompt metadata; no provider default is implied.",
-					},
+					model: modelPin,
 					await_completion: { type: "boolean", description: "If true, poll the turn until terminal or timeout." },
 					timeout_ms: {
 						type: "number",
@@ -1256,7 +1264,7 @@ function publicCoordinatorSession(session: Record<string, unknown>): Record<stri
 	const result: Record<string, unknown> = {
 		session_id: firstString(session, ["session_id", "sessionId"]) ?? "unknown",
 	};
-	for (const key of ["cwd", "created_at", "mpreset"]) {
+	for (const key of ["cwd", "created_at", "mpreset", "model"]) {
 		const value = session[key];
 		if (typeof value === "string") result[key] = value;
 	}
@@ -2528,6 +2536,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 	const platform = options.platform ?? process.platform;
 	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
+	const loadModelRegistry = services.resolveModelRegistry ?? loadCoordinatorModelRegistry;
 	const namespaceDir = path.join(
 		config.stateRoot,
 		config.namespace.profile ?? "unscoped-profile",
@@ -4845,13 +4854,24 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						available_profiles: mpresetResolution.available_profiles,
 					};
 				}
+				// Explicit model pin (#4707): same CLI-grammar validation as
+				// start_session, applied to the fresh delegate session.
+				const modelResolution = await resolveCoordinatorModel(args.model, loadModelRegistry);
+				if (!modelResolution.ok) {
+					return {
+						ok: false,
+						reason: modelResolution.reason,
+						model: modelResolution.model,
+						error: { code: "unknown_model", message: modelResolution.error },
+					};
+				}
 				const hasTask = typeof args.task === "string" && args.task.trim().length > 0;
 				const hasPrompt = typeof args.prompt === "string" && args.prompt.trim().length > 0;
 				const task = hasTask ? String(args.task) : hasPrompt ? String(args.prompt) : null;
 				if (!task) return { ok: false, reason: "task_required" };
 				const taggedPrompt = workflowPrompt(delegateWorkflow, name, canonicalCwd, task, {
 					mutationRequested: args.allow_mutation === true,
-					model: typeof args.model === "string" ? args.model : null,
+					model: modelResolution.model,
 				});
 				const reusedSessionId = args.session_id == null ? undefined : safeExternalId("session", args.session_id);
 				const explicitHostWorkUnit =
@@ -4868,7 +4888,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					queue: args.queue === true,
 					force: args.force === true,
 					mpreset: mpresetResolution.mpreset,
-					model: typeof args.model === "string" ? args.model : null,
+					model: modelResolution.model,
 					await_completion: args.await_completion === true,
 					...(args.await_completion === true
 						? { timeout_ms: args.timeout_ms, poll_interval_ms: args.poll_interval_ms }
@@ -4905,6 +4925,16 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											session_id: sessionId,
 											session_mpreset: sessionMpreset,
 											requested_mpreset: mpresetResolution.mpreset,
+										};
+									}
+									const sessionModel = optionalString(existing.model);
+									if (modelResolution.model !== null && sessionModel !== modelResolution.model) {
+										return {
+											ok: false,
+											reason: "model_conflict",
+											session_id: sessionId,
+											session_model: sessionModel,
+											requested_model: modelResolution.model,
 										};
 									}
 									const existingCwd = optionalString(existing.cwd);
@@ -4972,6 +5002,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 													cwd: canonicalCwd,
 													target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
 													...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+													...(modelResolution.model ? { modelId: modelResolution.model } : {}),
 													// Thread the coordinator state dir so the broker-spawned runtime
 													// writes terminal state to the coordinator-shared file (#2549).
 													coordinatorStateDir: namespaceDir,
@@ -4998,6 +5029,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											ephemeral: true,
 											created_at: new Date().toISOString(),
 											...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+											...(modelResolution.model ? { model: modelResolution.model } : {}),
 											broker_workspace: binding.workspace,
 											endpoint_generation: binding.endpointGeneration,
 											endpoint_incarnation: binding.endpointIncarnation,
@@ -5148,6 +5180,18 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						available_profiles: mpresetResolution.available_profiles,
 					};
 				}
+				// Explicit model pin (#4707): resolve with CLI grammar before any
+				// broker mutation or idempotency record so an unknown id can never
+				// create a session on a different model.
+				const modelResolution = await resolveCoordinatorModel(args.model, loadModelRegistry);
+				if (!modelResolution.ok) {
+					return {
+						ok: false,
+						reason: modelResolution.reason,
+						model: modelResolution.model,
+						error: { code: "unknown_model", message: modelResolution.error },
+					};
+				}
 				const prompt = typeof args.prompt === "string" && args.prompt.length > 0 ? args.prompt : null;
 				/**
 				 * A prepared session is deliberately not ready for input: its readiness
@@ -5182,6 +5226,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				const canonicalArgs = {
 					cwd,
 					mpreset: mpresetResolution.mpreset,
+					model: modelResolution.model,
 					...(prompt ? { prompt } : {}),
 					...(preparesExistingThread ? { prepare_existing_thread: true } : {}),
 					allow_mutation: true,
@@ -5212,6 +5257,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											cwd,
 											target: coordinatorLifecycleTarget(config.sessionCommand, cwd),
 											...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
+											...(modelResolution.model ? { modelId: modelResolution.model } : {}),
 											...(preparesExistingThread ? { readiness: "deferred" } : {}),
 											// Thread the coordinator state dir so the broker-spawned runtime
 											// writes terminal state to the coordinator-shared file (#2549).
@@ -5281,6 +5327,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 									session_id: sessionId,
 									cwd: sessionCwd,
 									...(mpresetResolution.mpreset ? { mpreset: mpresetResolution.mpreset } : {}),
+									...(modelResolution.model ? { model: modelResolution.model } : {}),
 									broker_workspace: binding.workspace,
 									endpoint_generation: binding.endpointGeneration,
 									endpoint_incarnation: binding.endpointIncarnation,
