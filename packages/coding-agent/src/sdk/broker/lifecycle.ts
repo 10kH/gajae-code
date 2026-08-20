@@ -244,6 +244,14 @@ export interface SessionLifecycleLaunchRequest {
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
 	/** Broker-issued effect marker which the child echoes only after host readiness. */
 	effectMarker?: string;
+	/**
+	 * Explicit `provider/model` pin with `gjc --model` grammar (#4707). The
+	 * coordinator resolves it before the broker; the session host applies it
+	 * exactly like a CLI `--model` selection, so it wins over `modelPreset`
+	 * (mirroring CLI precedence where an explicit `--model` overrides
+	 * activated profiles).
+	 */
+	modelId?: string;
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
 	worktree?: SessionLifecycleWorktreeTarget;
@@ -385,6 +393,7 @@ export function readSessionLifecycleLaunchRequest(
 		(request.sessionIdentity !== undefined && !isSessionLifecycleTranscriptIdentity(request.sessionIdentity)) ||
 		(request.effectMarker !== undefined &&
 			(typeof request.effectMarker !== "string" || !/^[A-Za-z0-9._-]{1,128}$/.test(request.effectMarker))) ||
+		(request.modelId !== undefined && (typeof request.modelId !== "string" || !request.modelId.trim())) ||
 		(request.modelPreset !== undefined && (typeof request.modelPreset !== "string" || !request.modelPreset)) ||
 		(request.mcpServers !== undefined && !isSessionLifecycleMcpServers(request.mcpServers)) ||
 		!hasValidLifecycleDeadlines(
@@ -427,6 +436,13 @@ type SessionLaunch = {
 	sourceCwd?: string;
 	sessionPath?: string;
 	sessionIdentity?: SessionLifecycleTranscriptIdentity;
+	/**
+	 * Explicit `provider/model` pin with `gjc --model` grammar (#4707). Applied
+	 * by the session host exactly like a CLI `--model` selection, so it wins
+	 * over `modelPreset` (mirroring CLI precedence where an explicit `--model`
+	 * overrides activated profiles).
+	 */
+	modelId?: string;
 	modelPreset?: string;
 	mcpServers?: SessionLifecycleMcpServer[];
 	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
@@ -2840,6 +2856,14 @@ async function launchInput(
 		if (typeof validatedModelPreset !== "string") return validatedModelPreset;
 		modelPreset = validatedModelPreset;
 	}
+	// An explicit model pin (#4707) is coordinator-resolved before it reaches
+	// the broker; the broker only guards shape here. It deliberately does NOT
+	// shadow modelPreset: both are threaded to the child, whose startup applies
+	// the profile first and then overrides it with the explicit model exactly
+	// like `gjc --mpreset p --model m` behaves on the CLI.
+	const modelId = text(input.modelId)?.trim();
+	if (input.modelId !== undefined && !modelId)
+		return fail("invalid_input", "modelId must be a non-empty explicit provider/model selector.");
 	const worktree = lifecycleWorktreeTarget(input);
 	if (worktree === null || (worktree !== undefined && requestedCwd === undefined))
 		return fail("invalid_input", "Lifecycle worktree target is invalid.");
@@ -2896,6 +2920,7 @@ async function launchInput(
 			id: randomUUID(),
 			cwd,
 			root: resolvedRoot,
+			modelId,
 			modelPreset,
 			mcpServers,
 			worktree,
@@ -2916,6 +2941,7 @@ async function launchInput(
 			cwd,
 			root: resolvedRoot,
 			sessionPath: saved.path,
+			modelId,
 			sessionIdentity: saved.identity,
 			modelPreset,
 			mcpServers,
@@ -2942,6 +2968,7 @@ async function launchInput(
 		sourceSessionPath: source.path,
 		sourceSessionIdentity: source.identity,
 		sourceCwd,
+		modelId,
 		modelPreset,
 		mcpServers,
 		worktree,
@@ -3645,6 +3672,7 @@ async function executeLifecycleResponse(
 			...(launch.sessionPath ? { sessionPath: launch.sessionPath } : {}),
 			...(launch.sessionIdentity ? { sessionIdentity: launch.sessionIdentity } : {}),
 			...(launch.modelPreset ? { modelPreset: launch.modelPreset } : {}),
+			...(launch.modelId ? { modelId: launch.modelId } : {}),
 			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
 			...(launch.readiness ? { readiness: launch.readiness } : {}),

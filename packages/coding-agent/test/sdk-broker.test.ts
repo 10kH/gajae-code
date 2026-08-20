@@ -250,6 +250,36 @@ it("SDK lifecycle model presets reach the session host parser", async () => {
 	}
 });
 
+it("SDK lifecycle explicit model pins reach the session host parser and validate shape", async () => {
+	const agentDir = await temp();
+	const cwd = path.join(agentDir, "repo");
+	await fs.mkdir(cwd);
+	const request = readSessionLifecycleLaunchRequest(
+		JSON.stringify({
+			operation: "session.create",
+			sessionId: "session-1",
+			stateRoot: path.join(cwd, ".gjc", "state"),
+			cwd,
+			modelId: "cursor/claude-fable-5-xhigh",
+			...deriveLifecycleDeadlines(Date.now(), 10_000),
+		}),
+	);
+	try {
+		expect(request.modelId).toBe("cursor/claude-fable-5-xhigh");
+		expect((await lifecycleArgs(request, cwd, agentDir)).model).toBe("cursor/claude-fable-5-xhigh");
+		expect(() =>
+			readSessionLifecycleLaunchRequest(
+				JSON.stringify({
+					...request,
+					modelId: "   ",
+				}),
+			),
+		).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 it("SDK lifecycle launch requests preserve validated ACP MCP transports", async () => {
 	const agentDir = await temp();
 	const cwd = path.join(agentDir, "repo");
