@@ -267,6 +267,63 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 		await send.catch(() => {});
 	});
+	it("immediate sendUserMessage after abort starts a successor turn instead of parking in steer", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let streamCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			streamFn: (_model, _context, options) => {
+				const call = ++streamCalls;
+				const signal = options?.signal;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					if (call === 1) {
+						stream.push({ type: "start", partial: createAssistantMessage("") });
+						const abortStream = () => {
+							stream.push({
+								type: "error",
+								reason: "aborted",
+								error: createAssistantMessage("Aborted"),
+							});
+						};
+						if (signal?.aborted) {
+							abortStream();
+							return;
+						}
+						signal?.addEventListener("abort", abortStream, { once: true });
+						return;
+					}
+					const message = createAssistantMessage("successor ok");
+					stream.push({ type: "start", partial: message });
+					stream.push({ type: "done", reason: "stop", message });
+				});
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.inMemory();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth-abort-immediate.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({ agent, sessionManager, settings: Settings.isolated(), modelRegistry });
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.agent.state.isStreaming);
+		const aborting = session.abort();
+		const successor = session.sendUserMessage("successor after abort");
+		await aborting;
+		await waitFor(() => {
+			const lastUser = [...agent.state.messages].reverse().find(message => message.role === "user");
+			const content = lastUser?.content[0];
+			return Boolean(
+				content && typeof content === "object" && "text" in content && content.text === "successor after abort",
+			);
+		}, 3_000);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		await successor.catch(() => {});
+		await firstPrompt.catch(() => {});
+	}, 15_000);
 
 	it("sendUserMessage rejects absent content with a typed invalid_input error without crashing", async () => {
 		await createSession();

@@ -2849,9 +2849,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
 			hasQueuedMessages: () => session.queuedMessageCount > 0,
-			abort: () => {
-				session.abort();
-			},
+			abort: () => session.abort(),
 			settings,
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext);
