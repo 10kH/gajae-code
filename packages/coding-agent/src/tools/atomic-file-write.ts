@@ -17,10 +17,12 @@
  *
  * Staging uses exclusive create (`wx`) so a colliding leftover temp is never
  * truncated or unlinked; only the temp this call created is cleaned on failure.
- * Existing-file mode bits are re-applied after staging so a process umask never
- * narrows a replaced file's permissions, and effective write authorization on an
- * existing referent is checked before rename so a writable parent cannot bypass
- * a read-only or ACL-denied target.
+ * Existing-file mode and ownership are re-applied after staging so a process
+ * umask or replacement inode never changes the target's identity. Hard-linked
+ * targets are rejected because replacement would split their link group, and
+ * the target identity is revalidated immediately before rename. The staged
+ * bytes are synced before publication; directory fsync is intentionally not
+ * promised because Windows reports EPERM for it (#4457).
  */
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -31,6 +33,20 @@ const WINDOWS_RENAME_BACKOFF_MS = [10, 25, 50, 100, 200] as const;
 const WINDOWS_SHARING_VIOLATION_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
 const TEMP_CREATE_ATTEMPTS = 8;
 const DEFAULT_FILE_MODE = 0o666;
+
+interface ExistingFileMetadata {
+	mode: number;
+	uid: number;
+	gid: number;
+	nlink: number;
+	dev: number;
+	ino: number;
+}
+
+interface ResolvedPublishPath {
+	publishPath: string;
+	existing?: ExistingFileMetadata;
+}
 
 export class FileWriteNotPublishedError extends Error {
 	readonly dest: string;
@@ -111,7 +127,7 @@ function eisdir(dest: string): Error & { code: string } {
 	return error;
 }
 
-async function resolvePublishPath(dest: string, depth = 0): Promise<{ publishPath: string; existingMode?: number }> {
+async function resolvePublishPath(dest: string, depth = 0): Promise<ResolvedPublishPath> {
 	if (depth > 40) {
 		throw new Error(`ELOOP: too many symbolic links, write '${dest}'`);
 	}
@@ -122,23 +138,21 @@ async function resolvePublishPath(dest: string, depth = 0): Promise<{ publishPat
 			const target = await fs.readlink(dest);
 			return resolvePublishPath(path.resolve(path.dirname(dest), target), depth + 1);
 		}
-		return { publishPath: dest, existingMode: lst.mode };
+		return {
+			publishPath: dest,
+			existing: {
+				mode: lst.mode,
+				uid: lst.uid,
+				gid: lst.gid,
+				nlink: lst.nlink,
+				dev: lst.dev,
+				ino: lst.ino,
+			},
+		};
 	} catch (error) {
 		if (!isEnoent(error)) throw error;
 		return { publishPath: dest };
 	}
-}
-
-async function writeExclusiveTemp(tmp: string, content: string | Uint8Array, mode: number): Promise<void> {
-	const handle = await fs.open(tmp, "wx", mode);
-	try {
-		await handle.writeFile(content);
-	} catch (error) {
-		await handle.close().catch(() => {});
-		await fs.unlink(tmp).catch(() => {});
-		throw error;
-	}
-	await handle.close();
 }
 
 function pathIsWithin(target: string, root: string): boolean {
@@ -148,7 +162,8 @@ function pathIsWithin(target: string, root: string): boolean {
 async function realpathOrSelf(p: string): Promise<string> {
 	try {
 		return await fs.realpath(p);
-	} catch {
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
 		return path.resolve(p);
 	}
 }
@@ -195,6 +210,27 @@ async function assertExistingTargetWritable(publishPath: string): Promise<void> 
 	await handle.close();
 }
 
+function sameFileIdentity(left: ExistingFileMetadata, right: ExistingFileMetadata): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function preserveExistingMetadata(tmp: string, existing: ExistingFileMetadata): Promise<void> {
+	const staged = await fs.stat(tmp);
+	if (staged.uid !== existing.uid || staged.gid !== existing.gid) {
+		await fs.chown(tmp, existing.uid, existing.gid);
+	}
+	await fs.chmod(tmp, existing.mode);
+}
+
+async function cleanupOwnedTemp(tmp: string, cause: unknown): Promise<void> {
+	try {
+		await fs.unlink(tmp);
+	} catch (cleanupError) {
+		if (isEnoent(cleanupError)) return;
+		throw new AggregateError([cause, cleanupError], `Failed to clean up staging file '${tmp}'.`);
+	}
+}
+
 /**
  * Revalidate the resolved destination immediately before publication so a
  * symlink retargeted while staging cannot silently repoint the write at a
@@ -204,10 +240,25 @@ async function assertPublishTargetStillIntended(
 	dest: string,
 	publishPath: string,
 	trustBoundary: string | undefined,
+	expectedExisting: ExistingFileMetadata | undefined,
+	expectedParentRealpath: string,
 ): Promise<void> {
 	const after = await resolvePublishPath(dest);
 	if (after.publishPath !== publishPath) {
 		throw new Error(`destination '${dest}' was retargeted while staging; refusing to overwrite a different file`);
+	}
+	const currentParentRealpath = await realpathOrSelf(path.dirname(publishPath));
+	if (currentParentRealpath !== expectedParentRealpath) {
+		throw new Error(
+			`destination '${dest}' parent was retargeted while staging; refusing to overwrite a different file`,
+		);
+	}
+	if (expectedExisting === undefined) {
+		if (after.existing !== undefined) {
+			throw new Error(`destination '${dest}' appeared while staging; refusing to overwrite a different file`);
+		}
+	} else if (after.existing === undefined || !sameFileIdentity(after.existing, expectedExisting)) {
+		throw new Error(`destination '${dest}' was replaced while staging; refusing to overwrite a different file`);
 	}
 	if (trustBoundary !== undefined) {
 		await assertWithinTrustBoundary(after.publishPath, trustBoundary);
@@ -225,11 +276,17 @@ export async function writeFileAtomically(
 		const resolved = await resolvePublishPath(dest);
 		publishPath = resolved.publishPath;
 		await fs.mkdir(path.dirname(publishPath), { recursive: true });
+		const expectedParentRealpath = await realpathOrSelf(path.dirname(publishPath));
 		if (trustBoundary !== undefined) {
 			await assertWithinTrustBoundary(publishPath, trustBoundary);
 		}
-		const mode = resolved.existingMode ?? DEFAULT_FILE_MODE;
-		if (resolved.existingMode !== undefined) {
+		const existing = resolved.existing;
+		if (existing !== undefined && existing.nlink > 1) {
+			throw new Error(
+				`Cannot atomically replace hard-linked file '${dest}': replacement would split its link group.`,
+			);
+		}
+		if (existing !== undefined) {
 			await assertExistingTargetWritable(publishPath);
 		}
 		let lastError: unknown;
@@ -237,14 +294,18 @@ export async function writeFileAtomically(
 			const tmp = tempPathFor(publishPath);
 			let owned = false;
 			try {
-				await writeExclusiveTemp(tmp, content, mode);
+				const handle = await fs.open(tmp, "wx", existing?.mode ?? DEFAULT_FILE_MODE);
 				owned = true;
-				if (resolved.existingMode !== undefined) {
-					// Restore exact existing mode bits: the `wx` open applied the
-					// process umask, which would otherwise silently narrow them.
-					await fs.chmod(tmp, resolved.existingMode);
+				try {
+					await handle.writeFile(content);
+					await handle.sync();
+				} finally {
+					await handle.close();
 				}
-				await assertPublishTargetStillIntended(dest, publishPath, trustBoundary);
+				if (existing !== undefined) {
+					await preserveExistingMetadata(tmp, existing);
+				}
+				await assertPublishTargetStillIntended(dest, publishPath, trustBoundary, existing, expectedParentRealpath);
 				await renameIntoPlace(tmp, publishPath);
 				return;
 			} catch (error) {
@@ -253,7 +314,7 @@ export async function writeFileAtomically(
 				// collision file: leave it alone and try a fresh sibling name.
 				if (hasFsCode(error, "EEXIST") && !owned) continue;
 				// Any failure after we exclusively created the temp must not leak it.
-				if (owned) await fs.unlink(tmp).catch(() => {});
+				if (owned) await cleanupOwnedTemp(tmp, error);
 				throw error;
 			}
 		}

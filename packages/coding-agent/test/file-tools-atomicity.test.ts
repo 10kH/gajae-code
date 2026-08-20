@@ -228,6 +228,117 @@ describe("file tool atomicity and read-after-write (#4734)", () => {
 		expect((await fs.stat(dest)).mode & 0o777).toBe(0o640);
 	});
 
+	it("preserves ownership and syncs staged bytes before publication", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "metadata-preserved.ts");
+		await fs.writeFile(dest, "old\n", { mode: 0o640 });
+		const before = await fs.stat(dest);
+		const realOpen = fs.open.bind(fs);
+		let syncs = 0;
+		const original = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			const handle = await realOpen(target, flags, mode);
+			if (String(target).includes(".tmp") && flags === "wx") {
+				const realSync = handle.sync.bind(handle);
+				spyOn(handle, "sync").mockImplementation(async () => {
+					syncs += 1;
+					return realSync();
+				});
+			}
+			return handle;
+		});
+		try {
+			await writeFileAtomically(dest, "new\n");
+			const after = await fs.stat(dest);
+			expect(syncs).toBe(1);
+			expect(after.uid).toBe(before.uid);
+			expect(after.gid).toBe(before.gid);
+		} finally {
+			original.mockRestore();
+		}
+	});
+
+	it("rejects hard-linked destinations instead of splitting the link group", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "hard-linked.ts");
+		const peer = path.join(tmpDir, "hard-linked-peer.ts");
+		await fs.writeFile(dest, "original\n");
+		await fs.link(dest, peer);
+		await expect(writeFileAtomically(dest, "replacement\n")).rejects.toThrow(/hard-linked/);
+		expect(await fs.readFile(dest, "utf8")).toBe("original\n");
+		expect(await fs.readFile(peer, "utf8")).toBe("original\n");
+	});
+
+	it("rejects a destination identity swap during publication", async () => {
+		if (process.platform === "win32") return;
+		const dest = path.join(tmpDir, "identity-swap.ts");
+		const replacement = path.join(tmpDir, "identity-replacement.ts");
+		const originalPath = path.join(tmpDir, "identity-original.ts");
+		await fs.writeFile(dest, "original\n");
+		await fs.writeFile(replacement, "replacement\n");
+		const realRename = (from: string, to: string) => fs.rename(from, to);
+		let swapped = false;
+		const realChmod = fs.chmod.bind(fs) as (target: string, mode: number) => Promise<void>;
+		const original = spyOn(fs, "chmod").mockImplementation(async (target, mode) => {
+			if (String(target).includes(".tmp") && !swapped) {
+				swapped = true;
+				await realRename(dest, originalPath);
+				await realRename(replacement, dest);
+			}
+			return realChmod(String(target), mode as number);
+		});
+		try {
+			await expect(writeFileAtomically(dest, "must-not-overwrite\n")).rejects.toThrow(/replaced while staging/);
+			expect(await fs.readFile(dest, "utf8")).toBe("replacement\n");
+		} finally {
+			original.mockRestore();
+			await fs.rm(originalPath, { force: true });
+		}
+	});
+
+	it("does not flatten non-ENOENT trust-boundary resolution errors", async () => {
+		const dest = path.join(tmpDir, "realpath-error.ts");
+		const error = new Error("EIO: realpath failed") as Error & { code: string };
+		error.code = "EIO";
+		const original = spyOn(fs, "realpath").mockRejectedValueOnce(error);
+		try {
+			await expect(writeFileAtomically(dest, "must-fail\n", { trustBoundary: tmpDir })).rejects.toMatchObject({
+				code: "EIO",
+			});
+			expect(
+				await fs.stat(dest).then(
+					() => true,
+					() => false,
+				),
+			).toBe(false);
+		} finally {
+			original.mockRestore();
+		}
+	});
+
+	it("cleans a staged file when its close fails", async () => {
+		const dest = path.join(tmpDir, "close-fails.ts");
+		const realOpen = fs.open.bind(fs);
+		const original = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
+			const handle = await realOpen(target, flags, mode);
+			if (String(target).includes(".tmp") && flags === "wx") {
+				const realClose = handle.close.bind(handle);
+				spyOn(handle, "close").mockImplementation(async () => {
+					await realClose();
+					const error = new Error("EIO: close failed") as Error & { code: string };
+					error.code = "EIO";
+					throw error;
+				});
+			}
+			return handle;
+		});
+		try {
+			await expect(writeFileAtomically(dest, "must-fail\n")).rejects.toMatchObject({ code: "EIO" });
+			expect((await fs.readdir(path.dirname(dest))).some(name => name.endsWith(".tmp"))).toBe(false);
+		} finally {
+			original.mockRestore();
+		}
+	});
+
 	it("does not replace an unwritable target through a writable parent", async () => {
 		if (process.platform === "win32" || (typeof process.getuid === "function" && process.getuid() === 0)) return;
 		const parent = path.join(tmpDir, "writable-parent");
