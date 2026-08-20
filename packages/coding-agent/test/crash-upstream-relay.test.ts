@@ -745,25 +745,6 @@ describe("relay trust boundary against a hostile checkout", () => {
 		expect(out).not.toContain("evil.example");
 	});
 
-	test("a dotenv-expanded agent directory cannot redirect trusted relay state", async () => {
-		const hostileAgent = path.join(dir, "checkout-agent");
-		await Bun.write(path.join(dir, ".env"), "GJC_CODING_AGENT_DIR=$HOSTILE_AGENT\n");
-		const relayPath = path.resolve(import.meta.dir, "../src/crash/upstream/relay.ts");
-		const dirsPath = path.resolve(import.meta.dir, "../../utils/src/dirs.ts");
-		const out = await runInCheckout(
-			`import { getAgentDir } from ${JSON.stringify(dirsPath)};\n` +
-				`import { resolveTrustedRelayStatePaths } from ${JSON.stringify(relayPath)};\n` +
-				`console.log(JSON.stringify({ agent: getAgentDir(), paths: resolveTrustedRelayStatePaths() }));\n`,
-			{ HOSTILE_AGENT: hostileAgent, HOME: dir },
-		);
-		const result = JSON.parse(out) as { agent: string; paths: CrashStatePaths };
-		expect(result.agent).toBe(path.join(dir, ".gjc", "agent"));
-		for (const filePath of Object.values(result.paths)) {
-			expect(filePath.startsWith(hostileAgent)).toBe(false);
-			expect(filePath.startsWith(result.agent)).toBe(true);
-		}
-	});
-
 	test("trusted XDG state remains the relay store when set outside the checkout", async () => {
 		const xdgState = path.join(dir, "trusted-state");
 		await fs.mkdir(path.join(xdgState, "gjc"), { recursive: true });

@@ -187,7 +187,7 @@ function sanitizeConfigDirName(value: string | undefined): string | undefined {
 function trustedConfigDirName(name: "GJC_CONFIG_DIR" | "PI_CONFIG_DIR"): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
-	if (Object.hasOwn(parseEnvFile(path.join(process.cwd(), ".env")), name)) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
 	return value;
 }
 
@@ -316,7 +316,7 @@ class DirResolver {
 function trustedAgentDirOverrideFor(name: "GJC_CODING_AGENT_DIR" | "PI_CODING_AGENT_DIR"): string | undefined {
 	const value = process.env[name];
 	if (!value) return undefined;
-	if (Object.hasOwn(parseEnvFile(path.join(process.cwd(), ".env")), name)) return undefined;
+	if (parseEnvFile(path.join(process.cwd(), ".env"))[name] === value) return undefined;
 	return value;
 }
 
