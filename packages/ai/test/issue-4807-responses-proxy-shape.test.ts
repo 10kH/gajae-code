@@ -99,12 +99,15 @@ describe("issue #4807 proxy wire shape", () => {
 		expect(payload.input[3]).toMatchObject({ type: "function_call_output", call_id: "call_B", output: "saved b" });
 		expect(payload.input[4]).toMatchObject({ type: "function_call_output", call_id: "call_A", output: "saved a" });
 
-		// One user message after all outputs, carrying every image in result order.
+		// One user message after all outputs, carrying every image in result
+		// order, each group labeled with its call id (#4807 attribution).
 		expect(payload.input[5]).toMatchObject({
 			role: "user",
 			content: [
 				{ type: "input_text", text: "Attached image(s) from tool result:" },
+				{ type: "input_text", text: "call_id=call_B" },
 				{ type: "input_image", detail: "auto", image_url: `data:image/png;base64,${PNG_B}` },
+				{ type: "input_text", text: "call_id=call_A" },
 				{ type: "input_image", detail: "auto", image_url: `data:image/png;base64,${PNG_A}` },
 			],
 		});

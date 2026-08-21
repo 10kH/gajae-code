@@ -135,8 +135,11 @@ describe("issue #4807: parallel image tool results keep tool_result adjacency", 
 		const imageMessage = userMessages.at(-1) as { content: Array<Record<string, unknown>> };
 		expect(imageMessage.content[0]).toMatchObject({ type: "input_text" });
 		expect(imageMessage.content.filter(c => c.type === "input_image")).toHaveLength(2);
-		expect(imageMessage.content[1]).toMatchObject({ image_url: `data:image/png;base64,${PNG_B}` });
-		expect(imageMessage.content[2]).toMatchObject({ image_url: `data:image/png;base64,${PNG_A}` });
+		// Each image group is labeled with its call id (#4807 attribution).
+		expect(imageMessage.content[1]).toMatchObject({ type: "input_text", text: "call_id=call_B" });
+		expect(imageMessage.content[2]).toMatchObject({ image_url: `data:image/png;base64,${PNG_B}` });
+		expect(imageMessage.content[3]).toMatchObject({ type: "input_text", text: "call_id=call_A" });
+		expect(imageMessage.content[4]).toMatchObject({ image_url: `data:image/png;base64,${PNG_A}` });
 
 		// The images land strictly after every output of the turn.
 		const lastOutputIndex = Math.max(...outputs.map(o => input.indexOf(o)));
@@ -267,7 +270,8 @@ describe("issue #4807: parallel image tool results keep tool_result adjacency", 
 		expect(outputItem.output).toBe("saved a");
 		const imageMessage = input.at(-1) as { content: Array<Record<string, unknown>> };
 		expect(imageMessage.content.filter(c => c.type === "input_image")).toHaveLength(1);
-		expect(imageMessage.content[1]).toMatchObject({ image_url: `data:image/png;base64,${PNG_A}` });
+		expect(imageMessage.content[1]).toMatchObject({ type: "input_text", text: "call_id=call_A" });
+		expect(imageMessage.content[2]).toMatchObject({ image_url: `data:image/png;base64,${PNG_A}` });
 	});
 
 	it("no longer produces the deterministic Anthropic 400 on proxy replay", async () => {

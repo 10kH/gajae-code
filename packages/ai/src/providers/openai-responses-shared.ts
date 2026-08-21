@@ -417,6 +417,12 @@ function appendResponsesToolResultOutput(
 	if (imageParts.length === 0) {
 		imageParts.push({ type: "input_text", text: "Attached image(s) from tool result:" } satisfies ResponseInputText);
 	}
+	// Label each result's image group with its call id so parallel results keep
+	// image-to-call attribution inside the single collected user message (#4807).
+	imageParts.push({
+		type: "input_text",
+		text: `call_id=${normalized.callId}`,
+	} satisfies ResponseInputText);
 	for (const block of toolResult.content) {
 		if (block.type === "image") {
 			imageParts.push({
