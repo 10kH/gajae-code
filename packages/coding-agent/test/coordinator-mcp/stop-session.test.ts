@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { buildCoordinatorMcpConfig } from "../../src/coordinator-mcp/policy";
+import { coordinatorStatePaths } from "../../src/coordinator-mcp/question-state";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SdkClient } from "../../src/sdk/client/client";
@@ -46,6 +48,16 @@ async function createServer(
 	const controls: BrokerControl[] = [];
 	let closeAttempts = 0;
 	const closedSessionIds = new Set<string>();
+	const env: NodeJS.ProcessEnv = {
+		GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+		GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
+		GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+		GJC_COORDINATOR_MCP_PROFILE: "local",
+		GJC_COORDINATOR_MCP_REPO: "repo",
+		...(options.forceStop ? { GJC_COORDINATOR_MCP_FORCE_STOP: "1" } : {}),
+	};
+	const config = buildCoordinatorMcpConfig(env);
+	const registryFile = coordinatorStatePaths(stateRoot, config.namespace.identity).registry;
 
 	async function brokerSessions(): Promise<Array<Record<string, unknown>>> {
 		const sessionsDir = path.join(stateRoot, "local", "repo", "sessions");
@@ -84,14 +96,7 @@ async function createServer(
 		heartbeatAt: Date.now(),
 	});
 	const server = createCoordinatorMcpServer({
-		env: {
-			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
-			GJC_COORDINATOR_MCP_STATE_ROOT: stateRoot,
-			GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
-			GJC_COORDINATOR_MCP_PROFILE: "local",
-			GJC_COORDINATOR_MCP_REPO: "repo",
-			...(options.forceStop ? { GJC_COORDINATOR_MCP_FORCE_STOP: "1" } : {}),
-		},
+		env,
 		services: {
 			getAgentDir: () => agentDir,
 			connectBroker: async () =>
@@ -123,6 +128,7 @@ async function createServer(
 	return {
 		server,
 		controls,
+		registryFile,
 		sessionFile: (id: string) => path.join(stateRoot, "local", "repo", "sessions", `${id}.json`),
 	};
 }
@@ -183,8 +189,9 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 
 	it("closes an idle ephemeral session through the SDK broker and removes only coordinator metadata", async () => {
 		const root = await tempRoot();
-		const { server, controls, sessionFile } = await createServer(root);
+		const { server, controls, registryFile, sessionFile } = await createServer(root);
 		await writeSession(sessionFile("ephemeral"), root, "ephemeral", { ephemeral: true });
+		expect(await Bun.file(registryFile).exists()).toBe(false);
 
 		expect(
 			await server.callTool("gjc_coordinator_stop_session", { session_id: "ephemeral", allow_mutation: true }),
@@ -200,6 +207,20 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 			}),
 		]);
 		expect(await Bun.file(sessionFile("ephemeral")).exists()).toBe(false);
+	});
+
+	it("fails closed on a malformed existing namespace registry", async () => {
+		const root = await tempRoot();
+		const { server, controls, registryFile, sessionFile } = await createServer(root);
+		await writeSession(sessionFile("malformed"), root, "malformed", { ephemeral: true });
+		await fs.mkdir(path.dirname(registryFile), { recursive: true });
+		await Bun.write(registryFile, "{}");
+
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", { session_id: "malformed", allow_mutation: true }),
+		).toMatchObject({ ok: false, reason: "state_corrupt" });
+		expect(await Bun.file(sessionFile("malformed")).exists()).toBe(true);
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([]);
 	});
 
 	it("retains coordinator metadata when the SDK broker cannot verify closure", async () => {
@@ -412,12 +433,12 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 					getAgentDir: () => agentDir,
 					connectBroker: async () =>
 						({
-							global: async (op: string, _input: Record<string, unknown>) => {
+							global: async (op: string, input: Record<string, unknown>) => {
 								if (op === "session.list")
 									return { ok: true, result: { sessions: sawClose ? [rotatedRow] : [liveRow] } };
 								if (op === "session.close") {
 									sawClose = true;
-									return { ok: true, result: {} };
+									return { ok: true, result: { sessionId: input.sessionId } };
 								}
 								return { ok: true, result: {} };
 							},
@@ -431,8 +452,7 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 				session_id: "rotated",
 				allow_mutation: true,
 			});
-			expect(res.ok).toBe(false);
-			expect((res as any).reason === "endpoint_stale" || (res as any).detail === "endpoint_stale").toBe(true);
+			expect(res).toMatchObject({ ok: false, reason: "endpoint_stale" });
 			expect(await Bun.file(`${stateRoot}/local/repo/sessions/rotated.json`).exists()).toBe(true);
 		});
 
@@ -486,12 +506,12 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 					getAgentDir: () => agentDir,
 					connectBroker: async () =>
 						({
-							global: async (op: string) => {
+							global: async (op: string, input: Record<string, unknown>) => {
 								if (op === "session.list")
 									return { ok: true, result: { sessions: sawClose ? [ambRow] : [liveRow] } };
 								if (op === "session.close") {
 									sawClose = true;
-									return { ok: true, result: {} };
+									return { ok: true, result: { sessionId: input.sessionId } };
 								}
 								return { ok: true, result: {} };
 							},
@@ -501,7 +521,8 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 			});
 			await writeSession(`${stateRoot}/local/repo/sessions/amb.json`, root, "amb", { ephemeral: true });
 			const res = await srv.callTool("gjc_coordinator_stop_session", { session_id: "amb", allow_mutation: true });
-			expect(res.ok).toBe(false);
+			expect(res).toMatchObject({ ok: false, reason: "close_failed", detail: "endpoint_stale" });
+			expect(sawClose).toBe(true);
 			expect(await Bun.file(`${stateRoot}/local/repo/sessions/amb.json`).exists()).toBe(true);
 		});
 
@@ -545,12 +566,12 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 					getAgentDir: () => agentDir,
 					connectBroker: async () =>
 						({
-							global: async (op: string) => {
+							global: async (op: string, input: Record<string, unknown>) => {
 								if (op === "session.list")
 									return { ok: true, result: { sessions: sawClose ? [liveRow] : [liveRow] } };
 								if (op === "session.close") {
 									sawClose = true;
-									return { ok: true, result: {} };
+									return { ok: true, result: { sessionId: input.sessionId } };
 								}
 								return { ok: true, result: {} };
 							},
@@ -565,7 +586,8 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 				session_id: "still-live",
 				allow_mutation: true,
 			});
-			expect(res.ok).toBe(false);
+			expect(res).toMatchObject({ ok: false, reason: "endpoint_stale" });
+			expect(sawClose).toBe(true);
 			expect(await Bun.file(`${stateRoot}/local/repo/sessions/still-live.json`).exists()).toBe(true);
 		});
 	});
