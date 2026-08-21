@@ -2593,12 +2593,22 @@ describe("openai-codex streaming", () => {
 	it.each([
 		// codex-lb masks the anchor fault's specific code to invalid_request_error
 		// and keeps only the canonical not-found/expired prose; the same masking it
-		// already applies to codex_previous_response_stale.
-		["canonical not-found prose with masked code", "Previous response with id 'resp_1' not found."],
-		["canonical not-found prose without a code", "Previous response with id 'resp_1' not found."],
-		["expired prose with masked code", "The previous response 'resp_1' has expired."],
-		["unknown-anchor prose", "Unknown previous response 'resp_1'."],
-	])("recovers a Codex stale anchor worded as %s", async (label, providerMessage) => {
+		// already applies to codex_previous_response_stale. The third element
+		// controls whether the event carries the masked code at all.
+		["canonical not-found prose with masked code", "Previous response with id 'resp_1' not found.", true],
+		["canonical not-found prose without a code", "Previous response with id 'resp_1' not found.", false],
+		["expired prose with masked code", "The previous response 'resp_1' has expired.", true],
+		["unknown-anchor prose", "Unknown previous response 'resp_1'.", true],
+		// Cross-sentence coincidence inside the 48-char window is a deliberate
+		// trade-off: the anchor-sent + one-shot + zero-content gates bound the
+		// worst case to one extra full-context request, so ambiguity resolves
+		// toward recovery instead of killing the turn.
+		[
+			"cross-sentence stale qualifier",
+			"The requested resource was not found in the archive. Please inspect the previous response.",
+			true,
+		],
+	])("recovers a Codex stale anchor worded as %s", async (_label, providerMessage, includeCode) => {
 		const tempDir = TempDir.createSync("@pi-codex-anchor-prose-");
 		setAgentDir(tempDir.path());
 		const token = createCodexTestToken();
@@ -2607,7 +2617,7 @@ describe("openai-codex streaming", () => {
 			throw new Error("SSE fallback should not be called");
 		});
 		global.fetch = fetchMock as unknown as typeof fetch;
-		const includeCode = label !== "canonical not-found prose without a code";
+		global.fetch = fetchMock as unknown as typeof fetch;
 
 		class AnchorProseWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
@@ -2687,6 +2697,18 @@ describe("openai-codex streaming", () => {
 		["message id fault in prose", "Unknown message ID in previous response."],
 		["item fault in prose", "Unknown item in previous response."],
 		["function call fault in prose", "Previous response's function call is invalid."],
+		// The fault noun may FOLLOW the anchor phrase as well: the sub-field guard
+		// applies on both sides of the reference.
+		["tool call fault after the anchor phrase", "Unknown previous response tool call."],
+		["output item fault after the anchor phrase", "Unknown previous response output item."],
+		["call id fault after the anchor phrase", "Unknown previous response call id fc_1."],
+		// Span bound and line bound: a stale qualifier more than 48 chars from the
+		// reference, or across a line break, is not an anchor-stale message.
+		[
+			"stale qualifier beyond the span bound",
+			"Previous response 'resp_1' referenced by this very long request identifier string is no longer available.",
+		],
+		["stale qualifier across a line break", "The previous response\nwith id 'resp_1' was not found."],
 	])("keeps a %s fatal instead of replaying full context", async (_label, providerMessage) => {
 		const tempDir = TempDir.createSync("@pi-codex-anchor-prose-nearmiss-");
 		setAgentDir(tempDir.path());

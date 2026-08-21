@@ -123,9 +123,12 @@ const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_foun
 // with a stale qualifier on either side, so the anchor is cleared and the turn
 // retried with full context instead of killing the session.
 //
-// Deliberately requires the `previous_response_id` field token rather than prose
-// like "previous response ... ID": a deterministic history fault such as
-// `Previous response's tool call ID is malformed.` must stay fatal, since
+// The compact form deliberately requires the `previous_response_id` field token
+// and is unguarded: a message naming the field itself is about the anchor. Prose
+// references are guarded separately below — the division of labor is compact
+// token (unguarded, field-naming) vs prose phrase (guarded, fault-noun checked
+// on both sides of the anchor phrase), since a deterministic history fault such
+// as `Previous response's tool call ID is malformed.` must stay fatal:
 // replaying it re-sends the same offending item.
 const CODEX_PREVIOUS_RESPONSE_ID_TOKEN = String.raw`previous[ _-]response[ _-]id`;
 // Prose anchor reference ("Previous response with id 'resp_1' not found."):
@@ -146,7 +149,10 @@ const CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE = new RegExp(
 	"i",
 );
 const CODEX_PREVIOUS_RESPONSE_STALE_PROSE_MESSAGE = new RegExp(
-	`(?:${CODEX_ANCHOR_STALE_QUALIFIER})(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}` +
+	// Qualifier-first alternative also rejects a sub-field token FOLLOWING the
+	// anchor phrase (`Unknown previous response tool call.`): the fault noun can
+	// sit on either side of the reference, so the guard must too.
+	`(?:${CODEX_ANCHOR_STALE_QUALIFIER})(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}(?![^\\n]{0,48}(?:${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD}))` +
 		`|${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})`,
 	"i",
 );
