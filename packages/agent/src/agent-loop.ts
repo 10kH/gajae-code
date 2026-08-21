@@ -345,13 +345,17 @@ function managedContextOverflow(message: AssistantMessage, config: AgentLoopConf
 }
 
 /** Managed fallback owns retry policy; only attached typed transport facts may discard an attempt. */
-function managedProperty(value: unknown, key: string): unknown {
-	if (!value || typeof value !== "object") return undefined;
+function managedPropertyRead(value: unknown, key: string): { ok: boolean; value: unknown } {
+	if (!value || typeof value !== "object") return { ok: true, value: undefined };
 	try {
-		return Reflect.get(value, key);
+		return { ok: true, value: Reflect.get(value, key) };
 	} catch {
-		return undefined;
+		return { ok: false, value: undefined };
 	}
+}
+
+function managedProperty(value: unknown, key: string): unknown {
+	return managedPropertyRead(value, key).value;
 }
 
 function managedTransportFailure(failure: unknown) {
@@ -430,9 +434,20 @@ function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
  * or Proxy-trapped final message is rebuilt as a plain mutable copy instead of
  * letting the strip abort the run.
  */
+
 function sanitizeProviderSafetyStopProvenance(message: AssistantMessage): AssistantMessage {
-	if (message.errorKind !== "provider_safety_stop" || isManagedProviderSafetyStopAuthenticated(message)) {
+	const errorKindRead = managedPropertyRead(message, "errorKind");
+	if (
+		errorKindRead.ok &&
+		(errorKindRead.value !== "provider_safety_stop" || isManagedProviderSafetyStopAuthenticated(message))
+	) {
 		return message;
+	}
+	const detached = managedAttemptSnapshotDetailed(message).snapshot;
+	if (isManagedPlainRecord(detached)) {
+		const rebuilt = { ...detached } as AssistantMessage;
+		delete rebuilt.errorKind;
+		return rebuilt;
 	}
 	try {
 		delete message.errorKind;
@@ -1216,6 +1231,7 @@ function managedAssistantShell(
 	value: unknown,
 	model: AgentLoopConfig["model"],
 	degradedFieldDiagnostics: Set<string> = new Set<string>(),
+	transferSafetyStopAuthority = false,
 ): AssistantMessage {
 	const detailed = managedAttemptSnapshotDetailed(value);
 	const snapshotRecord = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : undefined;
@@ -1316,7 +1332,9 @@ function managedAssistantShell(
 	// sanitize, so an unauthenticated label never reaches here. Mark the
 	// runtime-owned destination only when this source is already authenticated;
 	// no public AI API can perform this transfer (#4777 review).
-	if (errorKind && isManagedProviderSafetyStopAuthenticated(value)) managedProviderSafetyStops.add(rebuilt);
+	if (transferSafetyStopAuthority && errorKind && isManagedProviderSafetyStopAuthenticated(value)) {
+		managedProviderSafetyStops.add(rebuilt);
+	}
 	return rebuilt;
 }
 
@@ -2882,7 +2900,7 @@ async function runLoopBody(
 				return;
 			}
 			if (attemptTransaction) {
-				message = managedAssistantShell(message, config.model);
+				message = managedAssistantShell(message, config.model, new Set<string>(), true);
 				const index = currentContext.messages.length - 1;
 				if (index >= 0 && currentContext.messages[index]?.role === "assistant") {
 					currentContext.messages[index] = message;
@@ -3589,7 +3607,7 @@ async function streamAssistantResponse(
 						case "error": {
 							const finished = sanitizeProviderSafetyStopProvenance(await finishResponse());
 							const finalMessage = config.fallbackManaged
-								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics)
+								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 								: finished;
 							promoteTypedEmptyResponseStop(finalMessage);
 							if (addedPartial) {
@@ -3613,7 +3631,7 @@ async function streamAssistantResponse(
 
 			const finished = sanitizeProviderSafetyStopProvenance(await finishResponse());
 			const trailing = config.fallbackManaged
-				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics)
+				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;
 			await finishChat(trailing);
 			return trailing;

@@ -2476,7 +2476,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									output,
 									stopDetails?.type === "refusal" ? "refusal" : (rawStopReason ?? "refusal"),
 									PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
-									options?.fetch,
+									options?.fetch ?? options?.client,
 								);
 								if (stopDetails?.type === "refusal") {
 									const explanation = stopDetails.explanation?.trim();

@@ -83,6 +83,17 @@ describe("provider safety-stop provenance authority", () => {
 		expect(isProviderSafetyStopAuthenticated(unmarked)).toBe(false);
 	});
 
+	test("fails closed when a caller controls the adapter transport seam", () => {
+		for (const callerTransport of [() => undefined, {}]) {
+			const forged = message();
+			expect(
+				mintProviderSafetyStop(forged, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY, callerTransport),
+			).toBe(false);
+			expect(forged.errorKind).toBeUndefined();
+			expect(isProviderSafetyStopAuthenticated(forged)).toBe(false);
+		}
+	});
+
 	test("a structurally forged capability cannot mint authority", () => {
 		const forged = message();
 		const forgedCapability = {} as Parameters<typeof mintProviderSafetyStop>[2];
