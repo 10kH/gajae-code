@@ -7,7 +7,7 @@ source: "GJC-native workflow skill rebuilt from the deprecated autoresearch exte
 
 # Autoresearch Workflow
 
-Use when the user asks for `autoresearch`, or gives a bounded research goal whose deliverable is a defensible verdict rather than code ("find out", "investigate", "benchmark and report").
+Use when the user asks for `autoresearch`, or gives a bounded research goal whose deliverable is a defensible verdict rather than code ("find out", "investigate", "benchmark and draw a conclusion").
 
 ## Usage
 
@@ -39,7 +39,7 @@ gjc autoresearch clear
 - `--spec <path>` — handoff intake from a persisted deep-interview spec; asks zero questions.
 - `"<goal>"` or bare invocation — cold intake; goal, constraints, and deliverables must be clarified before research begins.
 - `read --json` — current mission artifact plus the append-only ledger snapshot.
-- `clear` — remove the mission artifact and record the kernel clear in the ledger.
+- `clear` — retire the mission artifact and its working set, recording `mission_cleared` in the ledger. This never touches the session `python` REPL kernel; reset that with the `python` tool's own `clear` action.
 
 ## Use when
 
@@ -91,7 +91,7 @@ Iterate existing experiments with baseline/keep/discard discipline. Log every ru
 
 ## Persistent Python
 
-The mission `python` tool holds a persistent kernel across calls: variables, imports, and loaded data survive from call to call like notebook cells, and every call is recorded as a cell in the mission notebook. The tool is inactive until a mission is active, and its kernel is owned by the mission (`autoresearch:<mission-id>`). Clearing the kernel is an action on that same tool (`action: "clear"`); the mission clears it when the mission ends.
+The `python` tool provides a persistent session REPL: variables, imports, and loaded data survive across calls. It is available without an active mission, uses the distinct `python:<session-id>` kernel owner, and appends every execution to the session JSONL transcript. Clearing its kernel is an action on the same tool (`action: "clear"`); session cleanup also disposes it.
 
 ## Completion
 
@@ -99,8 +99,8 @@ The mission ends on one mission-level structured verdict: `status` (structured d
 
 ## Artifacts
 
-- `.gjc/_session-{sessionid}/autoresearch/` — mission artifact, append-only JSONL ledger, session-scoped run records, mission notebook, and synthesized report (plus the TUI run-table dashboard).
-- The ledger appends `mission_created`, `mode_set`, `run_logged`, `verdict_issued`, `critic_recorded`, and `kernel_cleared` events; verdict and critic receipts ride on their events as structured data.
+- `.gjc/_session-{sessionid}/autoresearch/` — mission artifact, append-only JSONL ledger, session-scoped run records (plus the TUI run-table dashboard).
+- The ledger appends `mission_created`, `mode_set`, `run_logged`, `verdict_issued`, `critic_recorded`, and `mission_cleared` events; verdict and critic receipts ride on their events as structured data.
 - Persist everything through `gjc autoresearch`; never hand-edit `.gjc/` (no direct `write`/`edit`/`ast_edit` against `.gjc/` paths without an explicit force override).
 - On interruption, resume via `gjc autoresearch read --json`; do not read or edit `.gjc/_session-{sessionid}/autoresearch/` files directly.
 

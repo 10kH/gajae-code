@@ -3720,13 +3720,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			const session = asRecord(await readJsonFile(sessionFile(id)));
 			if (!session) {
 				await ensureQuestionStateReady();
-				const deletion = await withNamespaceRegistry(
-					questionPaths,
-					async registry =>
-						Object.values(registry.deletions).find(
-							entry => entry.session_id === id && entry.phase !== "completed",
-						) ?? null,
-				);
+				const deletion = await withNamespaceRegistry(questionPaths, async registry => {
+					const matching = Object.values(registry.deletions).filter(entry => entry.session_id === id);
+					return (
+						matching.find(entry => entry.phase !== "completed") ??
+						matching.find(entry => entry.safe_response !== undefined) ??
+						null
+					);
+				});
 				if (deletion?.phase === "broker_closed" || deletion?.phase === "cleanup_pending") {
 					await removeCoordinatorFile(sessionFile(id));
 					await removeCoordinatorFile(sessionStateFile(namespaceDir, id));
@@ -3777,6 +3778,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				return { ok: false, reason: "endpoint_stale", closed: false };
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
+			await ensureQuestionStateReady();
 			const deletionPhase = await withNamespaceRegistry(
 				questionPaths,
 				async registry => registry.deletions[deletionId]?.phase,

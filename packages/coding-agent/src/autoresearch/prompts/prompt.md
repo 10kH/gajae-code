@@ -21,7 +21,7 @@ You are running a research-only evidence loop. Do not modify product code, manif
 
 ### Available tools
 
-- `python` — the persistent mission kernel. Variables, imports, and loaded data survive across calls like notebook cells, and every call is recorded as a cell in the mission notebook.
+- `python` — a persistent session REPL. Variables, imports, and loaded data survive across calls.
 - `bash` — run an existing benchmark command. Output is captured automatically; `METRIC name=value` and `ASI key=value` lines are parsed back to you, with any other output treated as noise.
 - Run ledger — record each experiment result and flag suspect runs; flagged runs are excluded from baseline and best-metric math.
 

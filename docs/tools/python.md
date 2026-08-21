@@ -1,19 +1,18 @@
 # python
 
-> Execute Python in the persistent autoresearch mission kernel.
+> Execute Python in a persistent session-owned REPL with an append-only JSONL transcript.
 
-> **Notice:** this tool is only usable inside an `autoresearch` mission. For ordinary one-off code execution use [`eval`](./eval.md), which runs in a session-scoped kernel. Both tools drive the same Python kernel implementation; they differ in who owns the kernel and how long it lives.
+> **Notice:** this tool is available without an active `autoresearch` mission. For multi-language or one-off code execution use [`eval`](./eval.md); both tools use the same Python execution stack but retain separate kernels.
 
 ## Source
 
-- Entry: `packages/coding-agent/src/autoresearch/python-tool.ts`
+- Entry: `packages/coding-agent/src/tools/python.ts`
 - Model-facing prompt: `packages/coding-agent/src/prompts/tools/python.md`
 - Registration: `packages/coding-agent/src/tools/descriptors.ts` (`loadMode: "discoverable"`)
 - Key collaborators:
-  - `packages/coding-agent/src/autoresearch/session.ts` — mission-bound construction, notebook + artifacts dir
-  - `packages/coding-agent/src/gjc-runtime/autoresearch-runtime.ts` — mission resolution (`autoresearchRead`)
+  - `packages/coding-agent/src/gjc-runtime/python-transcript.ts` — runtime-owned append-only JSONL transcript recording
+  - `packages/coding-agent/src/gjc-runtime/session-layout.ts` — session-rooted transcript and artifact paths
   - `packages/coding-agent/src/eval/py/executor.ts` — kernel session retention and `disposeKernelSessionsByOwner`
-  - `packages/coding-agent/src/rlm/notebook.ts` — notebook cell recording
   - `docs/python-repl.md` — Python kernel/gateway internals
 
 ## Availability
@@ -31,30 +30,29 @@ Activation replaces the active set, so callers must pass the full merged list of
 
 There is deliberately **no** separate teardown tool. Clearing the kernel is an action on this same tool.
 
-## Mission resolution and fail-closed behavior
+## Session resolution
 
-The active mission is resolved **on every call** from `.gjc/_session-{sessionid}/autoresearch/`, not cached at construction. Two outcomes refuse the call:
+Every call resolves the current GJC session id. `execute` and `clear` return an actionable error when no session id is available, because the kernel owner and session-rooted paths cannot be derived. No active `autoresearch` mission is required.
 
-- **No mission** — returns an error result naming `gjc autoresearch` as the way to start one.
-- **Unreadable or corrupt mission state** — returns the same error with the underlying reason appended.
-
-In both cases no kernel is started. The tool never falls back to a session-scoped or ad-hoc kernel, so a refusal always means the mission itself needs attention.
+The REPL runs in the session cwd and retains variables, imports, and loaded data across `execute` calls for that session.
 
 ## Kernel ownership and teardown
 
-The kernel owner id is `autoresearch:<mission-id>`, deliberately distinct from the session's eval kernel owner so the two never alias and a mission kernel is never reaped as collateral of eval cleanup.
+The kernel owner id is `python:<session-id>`, deliberately distinct from the `eval` owner so the two never alias and cleanup remains scoped to the owning session.
 
-Every owner the tool has touched is disposed on:
+The session's kernel is disposed on:
 
 - the `clear` action,
-- graceful session dispose,
+- session cleanup, including a session identity transition,
 - signal exit (Ctrl-C).
 
-`disposeKernelSessionsByOwner` is idempotent, so `clear` followed by session exit is not a double free. The signal path drains **both** tool-cleanup registries, because the SDK binds a tool's `registerSessionCleanup` to the transition registry rather than the session one — draining only the latter orphaned the subprocess on interrupt.
+`gjc autoresearch clear` clears autoresearch state only; it does not dispose a Python kernel.
 
-## Notebook recording
+## Transcript recording
 
-Each `execute` is appended as a cell to the mission notebook under the session autoresearch runs directory, which is what lets the synthesized mission report replay the analysis. `clear` records no cell.
+The runtime records one JSONL entry per `execute` at `.gjc/_session-{sessionid}/ipykernels/{datetime}-{kernelid}/transcript.jsonl`, containing `timestamp`, `code`, `output`, `exitCode`, `cancelled`, and `truncated`. `{kernelid}` is the executor identity captured when the kernel is acquired, so a real kernel replacement uses a new transcript directory. `clear` records no entry.
+
+Display artifacts use the stable session-rooted directory `.gjc/_session-{sessionid}/ipykernels/artifacts`, rather than a per-kernel transcript directory.
 
 ## Related
 

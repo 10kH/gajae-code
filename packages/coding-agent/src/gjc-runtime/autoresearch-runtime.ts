@@ -21,7 +21,7 @@
  *
  * The ledger is append-only and carries the six event kinds: `mission_created`,
  * `mode_set`, `run_logged`, `verdict_issued`, `critic_recorded`,
- * `kernel_cleared`. A mission completes only on a structured best-effort
+ * `mission_cleared`. A mission completes only on a structured best-effort
  * verdict (status, evidence, caveats, evaluator); an optional critic pass
  * records a `critic_receipt` whose evaluator identity is distinct from the
  * mission agent.
@@ -34,16 +34,12 @@ import { loadAutoresearchDataContext, type RlmDataContext } from "../autoresearc
 import { type EnsureAutoresearchBranchResult, ensureAutoresearchBranch } from "../autoresearch/git";
 import { type ParsedHarnessOutput, parseHarnessOutput } from "../autoresearch/harness";
 import { renderAutoresearchIteratePrompt, renderAutoresearchSetupPrompt } from "../autoresearch/prompts";
-import { autoresearchKernelOwnerId } from "../autoresearch/python-tool";
-import { extractVerdictFromLedger, synthesizeAutoresearchReport } from "../autoresearch/report";
 import {
 	AutoresearchRunsStore,
 	buildAutoresearchExperimentState,
 	createAutoresearchExperimentConfig,
 	type MetricDirection,
 } from "../autoresearch/runs";
-import { createMissionPythonTool, missionArtifactsDir, openMissionNotebook } from "../autoresearch/session";
-import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import { syncSkillActiveState } from "../skill-state/active-state";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { sessionAutoresearchDir } from "./session-layout";
@@ -72,7 +68,7 @@ export const AUTORESEARCH_LEDGER_EVENT_KINDS = [
 	"run_logged",
 	"verdict_issued",
 	"critic_recorded",
-	"kernel_cleared",
+	"mission_cleared",
 ] as const;
 export type AutoresearchLedgerEventKind = (typeof AUTORESEARCH_LEDGER_EVENT_KINDS)[number];
 
@@ -489,21 +485,20 @@ export async function autoresearchWrite(input: {
 /**
  * Durable per-mission artifacts that live directly under the session
  * autoresearch dir. `clear` must retire ALL of them, not just `mission.json`:
- * leaving `ledger.jsonl` behind let a successor mission inherit the previous
- * mission's `verdict_issued` / `critic_recorded` rows, so
- * `extractVerdictFromLedger` surfaced a prior verdict as if it were the new
- * mission's. `runs.jsonl` and `experiment.json` leaked run history and the
- * metric contract the same way, and `runs/` holds the notebook and report.
+ * leaving `ledger.jsonl` behind lets a successor mission inherit the previous
+ * mission's `verdict_issued` / `critic_recorded` rows. `runs.jsonl` and
+ * `experiment.json` leak run history and the metric contract, and `runs/`
+ * holds per-run artifacts the same way.
  */
 const AUTORESEARCH_MISSION_ARTIFACTS = ["mission.json", "ledger.jsonl", "runs.jsonl", "experiment.json"] as const;
 const AUTORESEARCH_RUNS_SUBDIR = "runs";
 
 /**
- * clear verb: retire the entire mission working set and record the kernel clear.
+ * clear verb: retire the entire mission working set and record the mission clear.
  *
  * Artifacts are QUARANTINED to `<dir>/retired/<slug>.<timestamp>/`, never
  * deleted, so a completed mission's evidence stays auditable while the
- * successor mission starts from genuinely empty state. The `kernel_cleared` row
+ * successor mission starts from genuinely empty state. The `mission_cleared` row
  * is appended to the OUTGOING ledger before it is moved, so the retired ledger
  * is a complete record that ends with its own clear and the successor's ledger
  * starts empty rather than the clear silently vanishing from the audit trail.
@@ -513,13 +508,10 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const existing = await readAutoresearchMission(cwd, resolvedSessionId);
-	// Must go through the shared derivation: an inline template here is what
-	// drifted from the tool's owner id and left cleared kernels resident.
-	if (existing) await disposeKernelSessionsByOwner(autoresearchKernelOwnerId(resolvedSessionId, existing.slug));
 	// Close out the outgoing ledger first so the retired copy ends with its clear.
 	const ledgerEvent = await appendAutoresearchLedger(
 		cwd,
-		{ event: "kernel_cleared", slug: existing?.slug ?? "" },
+		{ event: "mission_cleared", slug: existing?.slug ?? "" },
 		resolvedSessionId,
 	);
 	const retiredTo = existing ? await retireAutoresearchMissionArtifacts(paths, existing.slug) : undefined;
@@ -913,7 +905,6 @@ function renderAutoresearchHelp(): string {
 		"  $ gjc autoresearch log-run --run-id <id> --status <status> --description <text> [--metric <number>] [--json]",
 		"  $ gjc autoresearch verdict --status-json <object> --evidence <text> --evaluator <id> [--caveat <text>] [--json]",
 		"  $ gjc autoresearch critic --status-json <object> --evidence <text> --evaluator <id> [--caveat <text>] [--json]",
-		"  $ gjc autoresearch report [--summary <text>] [--json]",
 		"",
 		"INTAKE",
 		"  --spec=<path>    Handoff intake: read a persisted deep-interview spec and start research",
@@ -924,11 +915,10 @@ function renderAutoresearchHelp(): string {
 		"  bare invocation  Cold intake (no goal text).",
 		"  write            Persist a clarified cold-intake mission. Mode and slug are required.",
 		"  read             Read the current mission and append-only ledger.",
-		"  clear            Dispose the mission kernel and clear the mission artifact.",
+		"  clear            Clear the mission artifact and retire its working set.",
 		"  log-run          Append one research run receipt to the mission ledger.",
 		"  verdict          Append the structured mission verdict receipt.",
 		"  critic           Append an optional structured critic receipt.",
-		"  report           Synthesize the mission report from the notebook and ledger.",
 		"      --json       Output a machine-readable receipt.",
 		"",
 		"STATE",
@@ -1195,14 +1185,10 @@ export async function runNativeAutoresearchCommand(
 			return { status: 0, stdout: renderCliWriteReceipt({ ok: true, receipt }) };
 		}
 		if (verb === "report") {
-			assertOnlyAutoresearchFlags(args.slice(1), ["--summary", "--json"]);
-			const reportPath = await autoresearchMissionReport(cwd, flagValue(args, "--summary"));
-			return {
-				status: 0,
-				stdout: hasFlag(args, "--json")
-					? renderCliWriteReceipt({ ok: true, report_path: reportPath })
-					: `autoresearch report_path=${reportPath}\n`,
-			};
+			throw new AutoresearchCommandError(
+				2,
+				'unknown verb "report" — the report verb was removed; missions end at verdict and the ledger is the record',
+			);
 		}
 		const specPath = flagValue(args, "--spec");
 		if (specPath !== undefined) {
@@ -1252,10 +1238,10 @@ export async function runNativeAutoresearchCommand(
 /* ------------------------------ capability surface ------------------------------ */
 
 /**
- * Rebuilt autoresearch capability surface. Each of the eight capabilities is
- * reachable from the runtime through a thin, mission-state-aware wrapper. All
- * of them are read-only with respect to the ledger — none append events; the
- * verbs above remain the only writers.
+ * Rebuilt autoresearch capability surface. Each capability is reachable from
+ * the runtime through a thin, mission-state-aware wrapper. All are read-only
+ * with respect to the ledger — none append events; the verbs above remain the
+ * only writers.
  */
 
 /** 1. Branch isolation: ensure the worktree is on an `autoresearch/*` branch. */
@@ -1316,47 +1302,6 @@ export async function autoresearchDashboardText(cwd: string, sessionId?: string 
 		},
 	};
 	return renderExpandedDashboard(input, width);
-}
-
-/** 5. Persistent kernel + notebook: build the mission `python` tool bound to the mission. */
-export async function autoresearchMissionPythonTool(cwd: string, sessionId?: string | null) {
-	const mission = await readAutoresearchMission(cwd, sessionId);
-	if (!mission) return null;
-	const resolvedSessionId =
-		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
-	const { writer, paths } = await openMissionNotebook(cwd, mission, resolvedSessionId);
-	const tool = createMissionPythonTool({
-		cwd,
-		mission,
-		artifactsDir: missionArtifactsDir(cwd, mission, resolvedSessionId),
-		notebook: writer,
-		registerSessionCleanup: () => {},
-		sessionId: resolvedSessionId,
-	});
-	return { tool, notebook: writer, paths, mission };
-}
-
-/** 6. Synthesized report: notebook cells + final summary, carrying the mission verdict. */
-export async function autoresearchMissionReport(
-	cwd: string,
-	summary?: string,
-	sessionId?: string | null,
-): Promise<string> {
-	const mission = await readAutoresearchMission(cwd, sessionId);
-	if (!mission) throw new AutoresearchCommandError(2, "autoresearch report requires an active mission");
-	const resolvedSessionId =
-		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
-	const { writer, paths } = await openMissionNotebook(cwd, mission, resolvedSessionId);
-	const ledger = await readAutoresearchLedger(cwd, sessionId);
-	const verdict = extractVerdictFromLedger(ledger);
-	await synthesizeAutoresearchReport({
-		paths,
-		notebook: writer,
-		mission,
-		summary,
-		verdict,
-	});
-	return paths.reportPath;
 }
 
 export async function autoresearchDataContext(

@@ -325,8 +325,8 @@ const loaders: Record<string, Loader> = {
 	task: session => cached("task", () => import("../task")).then(module => module.TaskTool.create(session)),
 	subagent: session => cached("subagent", () => import("./subagent")).then(module => new module.SubagentTool(session)),
 	python: session =>
-		cached("python", () => import("../autoresearch/python-tool")).then(module =>
-			module.createAutoresearchSessionPythonTool({
+		cached("python", () => import("./python")).then(module =>
+			module.createSessionPythonTool({
 				cwd: session.cwd,
 				getSessionId: () => session.getSessionId?.() ?? null,
 				registerSessionCleanup: (cleanup: () => Promise<void> | void) => {
@@ -417,7 +417,7 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 		[
 			"python",
 			"Python",
-			"Execute Python in the persistent autoresearch mission kernel (every call is recorded as a notebook cell)",
+			"Execute Python in a persistent per-session REPL kernel (every call is appended to the session transcript)",
 			"discoverable",
 		],
 		["calc", "Calc", "Evaluate a mathematical expression", "discoverable"],
