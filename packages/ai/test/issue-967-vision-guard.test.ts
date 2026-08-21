@@ -169,10 +169,12 @@ describe("issue #967 vision guard", () => {
 		const payload: unknown[] = [];
 		appendResponsesToolResultMessages(
 			payload as never,
-			makeToolResult([
-				{ type: "text", text: "saved plot to /tmp/plot.png" },
-				{ type: "image", mimeType: "image/png", data: "ZmFrZQ==" },
-			]),
+			[
+				makeToolResult([
+					{ type: "text", text: "saved plot to /tmp/plot.png" },
+					{ type: "image", mimeType: "image/png", data: "ZmFrZQ==" },
+				]),
+			],
 			model,
 			true,
 			new Set(["call_1"]),

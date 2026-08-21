@@ -40,6 +40,7 @@ import {
 	type Tool,
 	type ToolCall,
 	type ToolChoice,
+	type ToolResultMessage,
 } from "../types";
 import {
 	createOpenAIResponsesHistoryPayload,
@@ -2942,8 +2943,27 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 	// `function_call_output` (OpenAI rejects mismatched pairs).
 	const customCallIds = new Set<string>();
 	const knownCallIds = new Set<string>();
+	// Consecutive tool results are batched into one append call so every output
+	// of the turn stays contiguous before the collected image user message;
+	// per-result image user messages interleave with sibling outputs and break
+	// tool_use→tool_result adjacency through Anthropic-translating proxies (#4807).
+	let pendingToolResults: ToolResultMessage[] = [];
+	const flushPendingToolResults = (): void => {
+		if (pendingToolResults.length === 0) return;
+		appendResponsesToolResultMessages(messages, pendingToolResults, model, false, knownCallIds, customCallIds);
+		pendingToolResults = [];
+	};
 
 	for (const msg of transformedMessages) {
+		if (msg.role === "toolResult") {
+			pendingToolResults.push(msg);
+			msgIndex += 1;
+			continue;
+		}
+		// Flush pending tool results before any non-tool-result message so the
+		// batched outputs (and their collected image user message) stay directly
+		// after their assistant tool-call turn, never behind later turns (#4807).
+		flushPendingToolResults();
 		if (msg.role === "user" || msg.role === "developer") {
 			const providerPayload = (msg as { providerPayload?: AssistantMessage["providerPayload"] }).providerPayload;
 			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider);
@@ -3012,15 +3032,9 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				messages.push(...outputItems);
 			}
 			msgIndex += 1;
-			continue;
 		}
-
-		if (msg.role === "toolResult") {
-			appendResponsesToolResultMessages(messages, msg, model, false, knownCallIds, customCallIds);
-		}
-
-		msgIndex += 1;
 	}
+	flushPendingToolResults();
 
 	return messages;
 }

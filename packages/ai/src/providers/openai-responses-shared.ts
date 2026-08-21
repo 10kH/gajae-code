@@ -327,13 +327,57 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 
 export function appendResponsesToolResultMessages<TApi extends Api>(
 	messages: ResponseInput,
-	toolResult: ToolResultMessage,
+	toolResults: readonly ToolResultMessage[],
 	model: Model<TApi>,
 	strictResponsesPairing: boolean,
 	knownCallIds: ReadonlySet<string>,
 	customCallIds?: ReadonlySet<string>,
 ): void {
 	const supportsImages = model.input.includes("image");
+	const imageParts: ResponseInputContent[] = [];
+
+	for (const toolResult of toolResults) {
+		appendResponsesToolResultOutput(
+			messages,
+			imageParts,
+			toolResult,
+			supportsImages,
+			strictResponsesPairing,
+			knownCallIds,
+			customCallIds,
+		);
+	}
+
+	if (imageParts.length === 0) {
+		return;
+	}
+
+	messages.push({ role: "user", content: imageParts });
+}
+
+/**
+ * Append the Responses items for one tool result of a batch (#4807).
+ *
+ * Emits the paired `function_call_output` / `custom_tool_call_output` in
+ * `messages` — keeping every output of the batch contiguous — and collects
+ * supported image blocks into `imageParts` instead of emitting a standalone
+ * user message per result. A per-result image user message interleaves with
+ * sibling outputs of the same assistant tool-call turn; once an OpenAI
+ * Responses → Anthropic Messages proxy groups consecutive outputs into the
+ * single user message carrying `tool_result` blocks, the interleaved image
+ * user message splits that group and leaves a `tool_use` without its
+ * immediately-following `tool_result`, which Anthropic rejects with a 400 on
+ * every replay of the poisoned tail.
+ */
+function appendResponsesToolResultOutput(
+	messages: ResponseInput,
+	imageParts: ResponseInputContent[],
+	toolResult: ToolResultMessage,
+	supportsImages: boolean,
+	strictResponsesPairing: boolean,
+	knownCallIds: ReadonlySet<string>,
+	customCallIds?: ReadonlySet<string>,
+): void {
 	const textResult = toolResult.content
 		.filter((block): block is TextContent => block.type === "text")
 		.map(block => block.text)
@@ -370,19 +414,24 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 		return;
 	}
 
-	const contentParts: ResponseInputContent[] = [
-		{ type: "input_text", text: "Attached image(s) from tool result:" } satisfies ResponseInputText,
-	];
+	if (imageParts.length === 0) {
+		imageParts.push({ type: "input_text", text: "Attached image(s) from tool result:" } satisfies ResponseInputText);
+	}
+	// Label each result's image group with its call id so parallel results keep
+	// image-to-call attribution inside the single collected user message (#4807).
+	imageParts.push({
+		type: "input_text",
+		text: `call_id=${normalized.callId}`,
+	} satisfies ResponseInputText);
 	for (const block of toolResult.content) {
 		if (block.type === "image") {
-			contentParts.push({
+			imageParts.push({
 				type: "input_image",
 				detail: "auto",
 				image_url: `data:${block.mimeType};base64,${block.data}`,
 			} satisfies ResponseInputImage);
 		}
 	}
-	messages.push({ role: "user", content: contentParts });
 }
 
 export interface ProcessResponsesStreamOptions {
