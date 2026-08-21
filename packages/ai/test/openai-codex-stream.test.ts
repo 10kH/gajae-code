@@ -2617,7 +2617,6 @@ describe("openai-codex streaming", () => {
 			throw new Error("SSE fallback should not be called");
 		});
 		global.fetch = fetchMock as unknown as typeof fetch;
-		global.fetch = fetchMock as unknown as typeof fetch;
 
 		class AnchorProseWebSocket extends MockWebSocket {
 			constructor(url: string, options?: { headers?: WsHeaders }) {
@@ -2702,6 +2701,9 @@ describe("openai-codex streaming", () => {
 		["tool call fault after the anchor phrase", "Unknown previous response tool call."],
 		["output item fault after the anchor phrase", "Unknown previous response output item."],
 		["call id fault after the anchor phrase", "Unknown previous response call id fc_1."],
+		// ... and after the QUALIFIER in the token-first ordering.
+		["sub-field fault after the qualifier", "Previous response includes an unknown tool call."],
+		["output item fault after the qualifier", "Previous response contains an invalid output item."],
 		// Span bound and line bound: a stale qualifier more than 48 chars from the
 		// reference, or across a line break, is not an anchor-stale message.
 		[

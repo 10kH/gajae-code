@@ -149,11 +149,12 @@ const CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE = new RegExp(
 	"i",
 );
 const CODEX_PREVIOUS_RESPONSE_STALE_PROSE_MESSAGE = new RegExp(
-	// Qualifier-first alternative also rejects a sub-field token FOLLOWING the
-	// anchor phrase (`Unknown previous response tool call.`): the fault noun can
-	// sit on either side of the reference, so the guard must too.
+	// The fault noun can sit on EITHER side of the anchor phrase AND on either
+	// side of the qualifier (`Unknown previous response tool call.`,
+	// `Previous response includes an unknown tool call.`), so every alternative
+	// carries both the tempered inter-token scan and a post-anchor lookahead.
 	`(?:${CODEX_ANCHOR_STALE_QUALIFIER})(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}(?![^\\n]{0,48}(?:${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD}))` +
-		`|${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})`,
+		`|${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})(?![^\\n]{0,48}(?:${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD}))`,
 	"i",
 );
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
