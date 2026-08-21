@@ -436,16 +436,23 @@ describe("GLM ZCode OAuth login provider", () => {
 							context_length: 1e308,
 							max_tokens: 1e308,
 						},
+						{
+							id: "glm-safe-future",
+							name: "\u0000\u007f",
+							context_length: 1e308,
+							max_tokens: 1e308,
+						},
 					],
 				}),
 				{ headers: { "Content-Type": "application/json" } },
 			)) as unknown as typeof fetch;
 		try {
-			const discovered = (await fetchDynamicModels())?.[0];
-			expect(discovered?.name).toBe("glm-future");
-			expect(discovered?.name).not.toMatch(/[\x00-\x1f\x7f]/);
-			expect(discovered?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
-			expect(discovered?.maxTokens).toBe(UNK_MAX_TOKENS);
+			const discovered = await fetchDynamicModels();
+			expect(discovered?.map(model => model.id)).toEqual(["glm-safe-future"]);
+			expect(discovered?.[0]?.name).toBe("glm-safe-future");
+			expect(discovered?.[0]?.name).not.toMatch(/[\x00-\x1f\x7f]/);
+			expect(discovered?.[0]?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+			expect(discovered?.[0]?.maxTokens).toBe(UNK_MAX_TOKENS);
 		} finally {
 			global.fetch = originalFetch;
 		}

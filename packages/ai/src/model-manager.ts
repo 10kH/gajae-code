@@ -5,6 +5,7 @@ import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import type { Api, Model, Provider } from "./types";
+import { isSafeCatalogModelId } from "./utils/discovery/openai-compatible";
 
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
@@ -118,7 +119,7 @@ function passModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 			continue;
 		}
 		const candidate = item as { id?: unknown; provider?: unknown };
-		if (typeof candidate.id !== "string") {
+		if (!isSafeCatalogModelId(candidate.id)) {
 			continue;
 		}
 		if (typeof candidate.provider === "string" && isRetiredModelKey(candidate.provider, candidate.id)) {
@@ -652,7 +653,7 @@ function isModelLike(value: unknown): value is Model<Api> {
 		contextWindow?: unknown;
 		maxTokens?: unknown;
 	};
-	if (typeof v.id !== "string" || v.id.length === 0) {
+	if (!isSafeCatalogModelId(v.id)) {
 		return false;
 	}
 	if (typeof v.name !== "string" || v.name.length === 0) {
