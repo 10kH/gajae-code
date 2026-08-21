@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { AuthStorage, type Model } from "@gajae-code/ai";
 import {
 	createSdkHostModelRegistryLoader,
@@ -106,5 +108,55 @@ describe("resolveSdkHostModel", () => {
 			model: "cursor/composer-2.5",
 		});
 		expect((await resolveSdkHostModel("cursor/default", loader)).ok).toBe(false);
+	});
+
+	it("binds each registry to its explicit models path", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-host-model-paths-"));
+		const firstStorage = await AuthStorage.create(path.join(root, "first-auth.db"));
+		const secondStorage = await AuthStorage.create(path.join(root, "second-auth.db"));
+		const firstModelsPath = path.join(root, "first", "models.yml");
+		const secondModelsPath = path.join(root, "second", "models.yml");
+		const modelsFile = (id: string) =>
+			`providers:\n  fixture:\n    baseUrl: http://127.0.0.1:1/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: ${id}\n        name: ${id}\n        contextWindow: 32768\n        maxTokens: 4096\n`;
+		try {
+			await fs.mkdir(path.dirname(firstModelsPath), { recursive: true });
+			await fs.mkdir(path.dirname(secondModelsPath), { recursive: true });
+			await fs.writeFile(firstModelsPath, modelsFile("first-model"));
+			await fs.writeFile(secondModelsPath, modelsFile("second-model"));
+
+			const firstLoader = createSdkHostModelRegistryLoader(async () => firstStorage, firstModelsPath);
+			const secondLoader = createSdkHostModelRegistryLoader(async () => secondStorage, secondModelsPath);
+			expect(await resolveSdkHostModel("fixture/first-model", firstLoader)).toEqual({
+				ok: true,
+				model: "fixture/first-model",
+			});
+			expect((await resolveSdkHostModel("fixture/second-model", firstLoader)).ok).toBe(false);
+			expect(await resolveSdkHostModel("fixture/second-model", secondLoader)).toEqual({
+				ok: true,
+				model: "fixture/second-model",
+			});
+			expect((await resolveSdkHostModel("fixture/first-model", secondLoader)).ok).toBe(false);
+		} finally {
+			firstStorage.close();
+			secondStorage.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("retries registry initialization after a transient failure", async () => {
+		const storage = await AuthStorage.create(":memory:");
+		let attempts = 0;
+		const loader = createSdkHostModelRegistryLoader(async () => {
+			attempts += 1;
+			if (attempts === 1) throw new Error("transient storage failure");
+			return storage;
+		});
+		try {
+			await expect(resolveSdkHostModel("cursor/default", loader)).rejects.toThrow("transient storage failure");
+			expect(await resolveSdkHostModel("cursor/default", loader)).toEqual({ ok: true, model: "cursor/default" });
+			expect(attempts).toBe(2);
+		} finally {
+			storage.close();
+		}
 	});
 });

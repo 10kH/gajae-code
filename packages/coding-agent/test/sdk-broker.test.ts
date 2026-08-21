@@ -283,8 +283,16 @@ it("SDK lifecycle explicit model pins reach the session host parser and validate
 it("SDK broker resolves explicit model pins at the host boundary", async () => {
 	const agentDir = await temp();
 	await fs.mkdir(agentDir, { recursive: true });
+	await fs.writeFile(
+		path.join(agentDir, "models.yml"),
+		"providers:\n  fixture:\n    baseUrl: http://127.0.0.1:1/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: broker-model\n        name: Broker Model\n        contextWindow: 32768\n        maxTokens: 4096\n",
+	);
 	const broker = new Broker({ agentDir });
 	try {
+		await expect(broker.handleRequest("model.resolve", { model: "fixture/broker-model" })).resolves.toMatchObject({
+			ok: true,
+			result: { ok: true, model: "fixture/broker-model" },
+		});
 		await expect(broker.handleRequest("model.resolve", { model: "cursor/default" })).resolves.toMatchObject({
 			ok: true,
 			result: { ok: true, model: "cursor/default" },
