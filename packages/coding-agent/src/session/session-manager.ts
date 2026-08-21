@@ -23,7 +23,7 @@ function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
 const cwdTransitionAls = new AsyncLocalStorage<symbol>();
-type CwdReadLeaseContext = { active: boolean };
+type CwdReadLeaseContext = { active: boolean; owner: symbol };
 const cwdReadLeaseAls = new AsyncLocalStorage<CwdReadLeaseContext>();
 const CWD_NOFOLLOW_OPEN_FLAGS =
 	fs.constants.O_RDONLY |
@@ -7191,6 +7191,7 @@ export class SessionManager {
 	/** Serializes model, SDK, and ACP cwd transitions; dispose joins this tail. */
 	#cwdTransitionTail: Promise<void> = Promise.resolve();
 	#cwdTransitionOwner: symbol | undefined;
+	#cwdReadLeaseOwner = Symbol("cwd-read-lease-owner");
 	#cwdGeneration = 0;
 	/** Number of tool executions currently holding a shared read lease on `cwd`. */
 	#cwdReaderCount = 0;
@@ -10556,7 +10557,7 @@ export class SessionManager {
 		// outer lease's async context. Re-entering that lease must not wait behind
 		// a writer that is already queued: the writer is waiting for the outer
 		// lease, and waiting here would deadlock the session permanently.
-		if (activeReadLease?.active) return fn();
+		if (activeReadLease?.active && activeReadLease.owner === this.#cwdReadLeaseOwner) return fn();
 		const owner = this.#cwdTransitionOwner;
 		// The writer's own async context already holds exclusive access; taking a
 		// read lease there would wait on itself.
@@ -10568,7 +10569,7 @@ export class SessionManager {
 			this.#cwdReadersDrained = resolve;
 		}
 		this.#cwdReaderCount += 1;
-		const readLease: CwdReadLeaseContext = { active: true };
+		const readLease: CwdReadLeaseContext = { active: true, owner: this.#cwdReadLeaseOwner };
 		return cwdReadLeaseAls.run(readLease, async () => {
 			try {
 				return await fn();
