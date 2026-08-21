@@ -41,15 +41,24 @@ const STRUCTURED_REFUSAL_SIGNALS: ReadonlySet<string> = new Set([
 /**
  * Mint terminal authority only from a first-party adapter parse site. The
  * capability is branded by a module-private symbol and is not available from
- * the public `@gajae-code/ai` surface. An unrecognized structured signal fails
- * closed, so adapter mistakes remain fallback-eligible.
+ * the public `@gajae-code/ai` surface. A caller-supplied fetch is also not a
+ * trusted adapter invocation: its response can be fabricated without any
+ * provider contact, so adapter call sites pass that seam explicitly and fail
+ * closed when it is present. An unrecognized structured signal fails closed,
+ * so adapter mistakes remain fallback-eligible.
  */
 export function mintProviderSafetyStop(
 	message: AssistantMessage,
 	signal: string,
 	capability: ProviderSafetyStopAdapterCapability,
+	callerFetch?: unknown,
 ): boolean {
-	if (capability !== PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY || !STRUCTURED_REFUSAL_SIGNALS.has(signal)) return false;
+	if (
+		capability !== PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY ||
+		callerFetch !== undefined ||
+		!STRUCTURED_REFUSAL_SIGNALS.has(signal)
+	)
+		return false;
 	authenticatedProviderSafetyStops.add(message);
 	message.errorKind = "provider_safety_stop";
 	return true;

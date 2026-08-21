@@ -28,6 +28,7 @@
 ## [0.14.2] - 2026-08-20
 
 ### Fixed
+- Public provider adapter calls that inject a custom `fetch` can no longer mint terminal safety-stop authority from fabricated OpenAI, Anthropic, or Google responses; the adapter provenance boundary fails closed until a trusted invocation or authenticated transport exists (#4777 review).
 - Grok Build now gets the same 300s idle window as other long-turn providers, so turns no longer stall waiting on a shorter default.
 - `getCachedUsageReport` surfaces cached usage for API-key credentials, not only OAuth accounts (#4686).
 - The auth gateway accepts explicit `null` fields on openai-chat requests instead of rejecting the payload (#4667).

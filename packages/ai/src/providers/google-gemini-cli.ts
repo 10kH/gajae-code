@@ -572,7 +572,12 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 							hasContent = true;
 							// Adapter-minted terminal authority from the parsed
 							// structured finish reason (#4777).
-							mintProviderSafetyStop(output, candidate.finishReason, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+							mintProviderSafetyStop(
+								output,
+								candidate.finishReason,
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+								options?.fetch,
+							);
 							output.stopReason = "error";
 						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 							output.stopReason = mapStopReasonString(candidate.finishReason);
@@ -587,7 +592,12 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 						hasContent = true;
 						if (isGooglePromptSafetyStopReason(blockReason)) {
 							// Prompt-level block reason: adapter-minted authority (#4777).
-							mintProviderSafetyStop(output, blockReason, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+							mintProviderSafetyStop(
+								output,
+								blockReason,
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+								options?.fetch,
+							);
 							output.stopReason = "error";
 						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 							output.stopReason = "error";

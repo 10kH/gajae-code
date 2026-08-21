@@ -1281,9 +1281,13 @@ function managedAssistantShell(
 		stopReason === "error" && managedProperty(source, "errorKind") === "provider_safety_stop"
 			? ("provider_safety_stop" as const)
 			: undefined;
-	const safeMetadata: Record<string, unknown> = isManagedPlainRecord(detailed.snapshot)
-		? { ...detailed.snapshot }
-		: {};
+	const safeMetadata: Record<string, unknown> = {};
+	if (isManagedPlainRecord(detailed.snapshot)) {
+		for (const key of Object.keys(detailed.snapshot)) {
+			const metadata = managedProperty(detailed.snapshot, key);
+			if (metadata !== undefined) safeMetadata[key] = metadata;
+		}
+	}
 	delete safeMetadata.errorMessage;
 	delete safeMetadata.errorStatus;
 	delete safeMetadata.transportFailure;

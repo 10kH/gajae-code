@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+- Managed assistant reconstruction now copies provider metadata through guarded property reads instead of an unguarded spread, so accessor-trapped metadata degrades without aborting the attempt or creating managed retry authority (#4777 review).
+
 
 ### Fixed
 - Provider safety-stop messages now retain their explicitly allowlisted `errorKind: "provider_safety_stop"` through managed assistant snapshots and remain terminal even when transport facts are present on a multi-model fallback chain, while provider payloads still cannot forge the runtime-owned local diagnostic kinds (#4777).

@@ -4,7 +4,9 @@ import {
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 } from "../src/adapter-internals/provider-safety-stop";
 import * as publicAi from "../src/index";
-import type { AssistantMessage } from "../src/types";
+import { getBundledModel } from "../src/models";
+import { streamOpenAICompletions } from "../src/providers/openai-completions";
+import type { AssistantMessage, Context, FetchImpl, Model } from "../src/types";
 import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 
 function message(): AssistantMessage {
@@ -29,6 +31,31 @@ function message(): AssistantMessage {
 }
 
 describe("provider safety-stop provenance authority", () => {
+	test("does not mint from a public OpenAI adapter with caller-supplied fetch", async () => {
+		const model = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+		const context: Context = {
+			messages: [{ role: "user", content: "hello", timestamp: 0 }],
+		};
+		const fetchImpl: FetchImpl = (async () =>
+			new Response(
+				JSON.stringify({
+					error: { message: "filtered", type: "invalid_request_error", code: "content_filter" },
+				}),
+				{ status: 429, headers: { "Content-Type": "application/json" } },
+			)) as FetchImpl;
+
+		const result = await streamOpenAICompletions(model, context, {
+			apiKey: "caller-key",
+			fetch: fetchImpl,
+			requestMaxRetries: 0,
+			streamMaxRetries: 0,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+	});
+
 	test("public AI exports expose verification only, never the minting operation", () => {
 		const publicSurface = publicAi as unknown as Record<string, unknown>;
 		expect(publicSurface.applyProviderSafetyStop).toBeUndefined();
