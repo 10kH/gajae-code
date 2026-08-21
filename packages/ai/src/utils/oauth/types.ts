@@ -44,6 +44,7 @@ export type OAuthProvider =
 	| "opencode-go"
 	| "opencode-zen"
 	| "opengateway"
+	| "openrouter"
 	| "parallel"
 	| "perplexity"
 	| "qianfan"

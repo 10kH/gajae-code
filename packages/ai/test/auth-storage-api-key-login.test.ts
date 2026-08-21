@@ -8,6 +8,7 @@ import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import * as deepseekModule from "../src/utils/oauth/deepseek";
 import * as kagiModule from "../src/utils/oauth/kagi";
 import * as ollamaCloudModule from "../src/utils/oauth/ollama-cloud";
+import * as openrouterModule from "../src/utils/oauth/openrouter";
 
 function countCredentialRows(dbPath: string, provider: string): number {
 	const db = new Database(dbPath, { readonly: true });
@@ -29,6 +30,7 @@ describe("AuthStorage api-key login replacement", () => {
 	let loginDeepSeekSpy: Mock<typeof deepseekModule.loginDeepSeek>;
 	let loginKagiSpy: Mock<typeof kagiModule.loginKagi>;
 	let loginOllamaCloudSpy: Mock<typeof ollamaCloudModule.loginOllamaCloud>;
+	let loginOpenRouterSpy: Mock<typeof openrouterModule.loginOpenRouter>;
 
 	beforeEach(async () => {
 		tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-ai-auth-api-key-login-"));
@@ -38,6 +40,7 @@ describe("AuthStorage api-key login replacement", () => {
 		loginDeepSeekSpy = vi.spyOn(deepseekModule, "loginDeepSeek");
 		loginKagiSpy = vi.spyOn(kagiModule, "loginKagi");
 		loginOllamaCloudSpy = vi.spyOn(ollamaCloudModule, "loginOllamaCloud");
+		loginOpenRouterSpy = vi.spyOn(openrouterModule, "loginOpenRouter");
 	});
 
 	afterEach(async () => {
@@ -128,5 +131,24 @@ describe("AuthStorage api-key login replacement", () => {
 		expect(stored.credential.key).toBe("same-deepseek-key");
 		expect(store.getApiKey("deepseek")).toBe("same-deepseek-key");
 		expect(await authStorage.getApiKey("deepseek", "session-deepseek-relogin")).toBe("same-deepseek-key");
+	});
+
+	it("stores OpenRouter login credentials as a reusable api-key credential", async () => {
+		if (!store || !authStorage || !dbPath) throw new Error("test setup failed");
+
+		loginOpenRouterSpy.mockResolvedValueOnce("or-test-key");
+
+		await authStorage.login("openrouter", { onAuth: () => {}, onPrompt: async () => "" });
+
+		expect(countCredentialRows(dbPath, "openrouter")).toBe(1);
+		const credentials = store.listAuthCredentials("openrouter");
+		expect(credentials).toHaveLength(1);
+		const [stored] = credentials;
+		expect(stored?.credential.type).toBe("api_key");
+		if (stored?.credential.type !== "api_key") {
+			throw new Error("expected stored api-key credential");
+		}
+		expect(stored.credential.key).toBe("or-test-key");
+		expect(await authStorage.getApiKey("openrouter", "session-openrouter")).toBe("or-test-key");
 	});
 });
