@@ -280,6 +280,25 @@ it("SDK lifecycle explicit model pins reach the session host parser and validate
 	}
 });
 
+it("SDK broker resolves explicit model pins at the host boundary", async () => {
+	const agentDir = await temp();
+	await fs.mkdir(agentDir, { recursive: true });
+	const broker = new Broker({ agentDir });
+	try {
+		await expect(broker.handleRequest("model.resolve", { model: "cursor/default" })).resolves.toMatchObject({
+			ok: true,
+			result: { ok: true, model: "cursor/default" },
+		});
+		await expect(broker.handleRequest("model.resolve", { model: "cursor:not-a-model" })).resolves.toMatchObject({
+			ok: true,
+			result: { ok: false, reason: "unknown_model", model: "cursor:not-a-model" },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 it("SDK lifecycle launch requests preserve validated ACP MCP transports", async () => {
 	const agentDir = await temp();
 	const cwd = path.join(agentDir, "repo");

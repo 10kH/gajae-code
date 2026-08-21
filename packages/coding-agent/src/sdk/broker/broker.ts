@@ -6,6 +6,7 @@ import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
+import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
 import {
 	type DirectoryMigrationPolicy,
 	listManagedSessionCandidates,
@@ -27,9 +28,7 @@ import {
 	redactBrokerDiscovery,
 } from "./discovery";
 import { deriveIdempotencyIdentity } from "./identity";
-
 import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
-
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
@@ -798,6 +797,7 @@ export class Broker {
 	#completion!: Promise<void>;
 	#resolveCompletion!: () => void;
 	#rejectCompletion!: (error: unknown) => void;
+	readonly #resolveModelPin: SdkHostModelResolver;
 	constructor(settings: BrokerSettings) {
 		this.settings = {
 			agentDir: settings.agentDir,
@@ -808,6 +808,7 @@ export class Broker {
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
+		this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
 		const completion = Promise.withResolvers<void>();
 		this.#completion = completion.promise;
@@ -1498,6 +1499,13 @@ export class Broker {
 			return page;
 		}
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
+		if (operation === "model.resolve") {
+			try {
+				return { ok: true, result: await this.#resolveModelPin(input.model) };
+			} catch {
+				return error("unavailable", "SDK host model resolution is unavailable.");
+			}
+		}
 		if (operation === "broker.lookup_lifecycle") {
 			const requestedOperation = typeof input.operation === "string" ? input.operation : undefined;
 			const requestedFingerprint = typeof input.fingerprint === "string" ? input.fingerprint : undefined;
