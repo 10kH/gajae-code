@@ -32,6 +32,7 @@ import {
 	BUILTIN_TOOLS,
 	HIDDEN_TOOL_DESCRIPTORS,
 	LazyAgentTool,
+	PLATFORM_EXCLUDED_TOOL_DESCRIPTORS,
 	resolveEffectiveDiscoveryMode,
 	type ToolAvailabilityContext,
 } from "./descriptors";
@@ -49,6 +50,18 @@ export type { WriteToolDetails, WriteToolInput } from "./write";
 
 /** Tool type (AgentTool from pi-ai) */
 export type Tool = AgentTool<any, any, any>;
+
+/** Built-in automation surfaces that an SDK host may back with its own transport. */
+export type AutomationToolName = "browser" | "computer";
+
+/**
+ * Host-owned implementations for the built-in automation surfaces.
+ *
+ * Each implementation must use the matching built-in name. The normal
+ * AgentTool execute signature carries cancellation through its AbortSignal,
+ * while the implementation owns the model-facing schema and description.
+ */
+export type AutomationTools = Partial<Record<AutomationToolName, Tool>>;
 
 export type ContextFileEntry = {
 	path: string;
@@ -543,7 +556,11 @@ export function resolveEvalBackends(session: ToolSession): EvalBackendsAllowance
 /**
  * Create tools from the descriptor registry.
  */
-export async function createTools(session: ToolSession, toolNames?: string[]): Promise<Tool[]> {
+export async function createTools(
+	session: ToolSession,
+	toolNames?: string[],
+	automationTools: AutomationTools = {},
+): Promise<Tool[]> {
 	const includeYield = session.requireYieldTool === true;
 	const enableLsp = session.enableLsp ?? true;
 	let requestedTools =
@@ -624,8 +641,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		allowEval,
 		discoveryActive,
 	};
-	const allToolDescriptors: Record<string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]> = {
+	const builtinToolDescriptors: Record<string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]> = {
 		...BUILTIN_TOOL_DESCRIPTORS,
+		...(automationTools.computer && !BUILTIN_TOOL_DESCRIPTORS.computer
+			? { computer: PLATFORM_EXCLUDED_TOOL_DESCRIPTORS.computer }
+			: {}),
+	};
+	const allToolDescriptors: Record<string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]> = {
+		...builtinToolDescriptors,
 		...HIDDEN_TOOL_DESCRIPTORS,
 	};
 	const allToolDescriptorEntries = Object.entries(allToolDescriptors) as Array<
@@ -650,13 +673,21 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const filteredRequestedTools = requestedTools
 		?.map(name => allToolsByRequestName.get(name))
 		.filter((entry): entry is [string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]] => entry !== undefined)
-		.filter(([, descriptor]) => descriptor.isAvailable(session, availabilityContext));
+		.filter(
+			([name, descriptor]) =>
+				automationTools[name as AutomationToolName] !== undefined ||
+				descriptor.isAvailable(session, availabilityContext),
+		);
 	const baseEntries =
 		filteredRequestedTools !== undefined
 			? filteredRequestedTools.filter(([name]) => name !== "resolve")
 			: [
-					...Object.entries(BUILTIN_TOOL_DESCRIPTORS)
-						.filter(([, descriptor]) => descriptor.isAvailable(session, availabilityContext))
+					...Object.entries(builtinToolDescriptors)
+						.filter(
+							([name, descriptor]) =>
+								automationTools[name as AutomationToolName] !== undefined ||
+								descriptor.isAvailable(session, availabilityContext),
+						)
 						.map(([name, descriptor]) => [name, descriptor] as const),
 					...(includeYield ? ([["yield", HIDDEN_TOOL_DESCRIPTORS.yield]] as const) : []),
 				];
@@ -667,6 +698,10 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		),
 	);
 	const materialize = async ([name, descriptor]: readonly [string, (typeof BUILTIN_TOOL_DESCRIPTORS)[string]]) => {
+		const externalAutomationTool = automationTools[name as AutomationToolName];
+		if (externalAutomationTool) {
+			return wrapToolWithMetaNotice(new LazyAgentTool(descriptor, externalAutomationTool, undefined, session));
+		}
 		const defer =
 			effectiveDiscoveryMode !== "off" &&
 			descriptor.metadata.loadMode === "discoverable" &&

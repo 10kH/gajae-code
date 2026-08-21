@@ -163,6 +163,8 @@ import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
 import {
+	type AutomationToolName,
+	type AutomationTools,
 	BUILTIN_TOOL_DESCRIPTORS,
 	BUILTIN_TOOLS,
 	computeEssentialBuiltinNames,
@@ -184,6 +186,8 @@ import {
 	lifecycleStartupCapabilityOption,
 	type SdkStartupCapability,
 } from "./startup-capability";
+
+export type { AutomationToolName, AutomationTools } from "../tools";
 
 type AsyncResultEntry = {
 	jobId: string;
@@ -450,6 +454,13 @@ export interface CreateAgentSessionOptions {
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
+	/**
+	 * Host-owned implementations for the built-in `browser` and `computer`
+	 * surfaces. These are materialized as built-ins, retain built-in provenance
+	 * and activation behavior, and receive cancellation through AgentTool's
+	 * AbortSignal. A matching custom or extension tool is rejected.
+	 */
+	automationTools?: AutomationTools;
 	/** Explicit parent/phase used to load active GJC sub-skill tools for this session. */
 	gjcSubskillToolContext?: { parent: string; phase: string; sessionId?: string; cwd?: string };
 	/** Inline extensions (merged with discovery). */
@@ -1256,7 +1267,31 @@ function findDeferredExactMcpToolNameCollisions(
 	return [...collisions];
 }
 
+const AUTOMATION_TOOL_NAMES = new Set<AutomationToolName>(["browser", "computer"]);
+
+function validateAutomationTools(options: CreateAgentSessionOptions): AutomationTools {
+	const automationTools = options.automationTools ?? {};
+	const entries = Object.entries(automationTools);
+	for (const [name, tool] of entries) {
+		if (!AUTOMATION_TOOL_NAMES.has(name as AutomationToolName)) {
+			throw new Error(`Unsupported SDK automation tool name: ${name}`);
+		}
+		if (!tool || tool.name !== name) {
+			throw new Error(`SDK automation tool ${name} must expose the built-in name ${JSON.stringify(name)}`);
+		}
+	}
+	const externalNames = new Set(entries.map(([name]) => name));
+	const collisions = [
+		...new Set((options.customTools ?? []).map(tool => tool.name).filter(name => externalNames.has(name))),
+	];
+	if (collisions.length > 0) {
+		throw new Error(`SDK automation tools cannot collide with custom tools: ${collisions.join(", ")}`);
+	}
+	return automationTools;
+}
+
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const automationTools = validateAutomationTools(options);
 	const lifecycleStartupCapability = (
 		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
 	)[lifecycleStartupCapabilityOption];
@@ -2174,7 +2209,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 
 		// Create built-in tools (already wrapped with meta notice formatting)
-		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
+		const builtinTools = await logger.time(
+			"createAllTools",
+			createTools,
+			toolSession,
+			options.toolNames,
+			automationTools,
+		);
 
 		// A top-level session loads MCP tools from three bounded surfaces: a
 		// caller-supplied exact config (`--mcp-config`), conventional native
@@ -2895,6 +2936,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			wrappedExtensionTools = (options.customTools ?? [])
 				.filter(isCustomTool)
 				.map(tool => CustomToolAdapter.wrap(tool, customToolContext));
+		}
+		const automationToolNames = new Set(Object.keys(automationTools));
+		const automationToolCollisions = [
+			...new Set(wrappedExtensionTools.map(tool => tool.name).filter(name => automationToolNames.has(name))),
+		];
+		if (automationToolCollisions.length > 0) {
+			throw new Error(
+				`SDK automation tools cannot collide with extension or MCP tools: ${automationToolCollisions.join(", ")}`,
+			);
 		}
 
 		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled)
