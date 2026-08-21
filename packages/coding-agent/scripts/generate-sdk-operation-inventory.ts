@@ -79,8 +79,10 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"internal cwd-rebinding helper for owned MCP authority after move_session, not a user-facing SDK control seam",
 	"agent_session:replaceNamedCustomTools":
 		"internal cwd-rebinding helper for named custom tools after move_session, not a user-facing SDK control seam",
-	"agent_session:recreatePythonTool":
-		"internal cwd-rebinding helper that recreates the python tool after move_session, not a user-facing SDK control seam",
+	"agent_session:replaceSkills":
+		"internal cwd-rebinding helper for session skills after move_session, not a user-facing SDK control seam",
+	"agent_session:retireWorkspaceTreeForRescope":
+		"internal cwd-rebinding helper that retires the cached workspace tree after move_session, not a user-facing SDK control seam",
 	"agent_session:getDeepInterviewAskStage":
 		"internal AskTool schema-selection accessor, not a user-facing SDK control seam",
 	"agent_session:peekQueueInvoker": "internal accessor/plumbing, not a user-facing control seam",

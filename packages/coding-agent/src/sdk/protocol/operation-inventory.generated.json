@@ -2480,17 +2480,6 @@
 		}
 	},
 	{
-		"sourceId": "agent_session:recreatePythonTool",
-		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
-		"sourceKind": "agent_session",
-		"decision": "exclude",
-		"rationale": "internal cwd-rebinding helper that recreates the python tool after move_session, not a user-facing SDK control seam",
-		"exclusionMetadata": {
-			"adapterMappings": "not_applicable",
-			"testIds": "not_applicable"
-		}
-	},
-	{
 		"sourceId": "agent_session:getActiveSkillPhase",
 		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
 		"sourceKind": "agent_session",
@@ -3732,6 +3721,28 @@
 		"sourceKind": "agent_session",
 		"decision": "exclude",
 		"rationale": "internal accessor/plumbing, not a user-facing control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:replaceSkills",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal cwd-rebinding helper for session skills after move_session, not a user-facing SDK control seam",
+		"exclusionMetadata": {
+			"adapterMappings": "not_applicable",
+			"testIds": "not_applicable"
+		}
+	},
+	{
+		"sourceId": "agent_session:retireWorkspaceTreeForRescope",
+		"sourceFile": "packages/coding-agent/src/session/agent-session.ts",
+		"sourceKind": "agent_session",
+		"decision": "exclude",
+		"rationale": "internal cwd-rebinding helper that retires the cached workspace tree after move_session, not a user-facing SDK control seam",
 		"exclusionMetadata": {
 			"adapterMappings": "not_applicable",
 			"testIds": "not_applicable"
