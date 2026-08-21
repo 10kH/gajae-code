@@ -989,8 +989,7 @@ export class SessionIndex {
 		// file would be misclassified as append-only, and the reader would tail
 		// from its last offset while caching a stale compacted projection.
 		if (
-			prior &&
-			prior.log.exists &&
+			prior?.log.exists &&
 			stamp.log.exists &&
 			stamp.log.ino === prior.log.ino &&
 			stamp.log.size > prior.log.size &&
@@ -1301,7 +1300,11 @@ export class SessionIndex {
 		);
 	}
 	async #refreshUnderLock(): Promise<void> {
-		await this.#tailUnderLock();
+		// A newly constructed reader has no replay cursor. Refresh must still load
+		// snapshot-carried authority before tailing the empty log; otherwise a cold
+		// router starting after compaction projects no sessions until a later append.
+		if (this.#events.length === 0 && this.#logOffset === 0) await this.#replayUnderLock();
+		else await this.#tailUnderLock();
 		await this.#writeAuditUnderLock();
 		// #tailUnderLock may delegate to #replayUnderLock (which re-captures);
 		// capturing here covers the tail-only and missing-log paths.

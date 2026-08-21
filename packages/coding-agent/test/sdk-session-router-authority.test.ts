@@ -2124,6 +2124,7 @@ describe("SessionRouter dispatch authority", () => {
 			await router.start();
 			expect(router.attachment(sessionId)?.isCurrent()).toBe(true);
 			await router.stop();
+			closedClients = 0;
 
 			replaceInHook = true;
 			await router.start();
@@ -2132,6 +2133,7 @@ describe("SessionRouter dispatch authority", () => {
 			expect(replacedIno).not.toBe(originalStat.ino);
 			// The replacement is refused at the commit point, so nothing is published.
 			expect(router.attachment(sessionId) ?? undefined).toBeUndefined();
+			expect(closedClients).toBe(1);
 		} finally {
 			await router.stop();
 		}

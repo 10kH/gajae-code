@@ -467,6 +467,10 @@ export class SessionRouter {
 			this.#lastReconciledIndexSeq = -1;
 		}
 		try {
+			// Seed a cold reader from the snapshot before the forced authority refresh.
+			// Forced passes must not reopen the index repeatedly, but startup still
+			// needs the one-time open/replay boundary for compacted indexes.
+			await this.#index.open();
 			await this.#serialReconcile(runEpoch, false, true);
 			if (!this.#running(runEpoch)) return;
 			const timer = (this.#deps.setInterval ?? setInterval)(
@@ -1490,7 +1494,6 @@ export class SessionRouter {
 			await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
 			return false;
 		}
-		const endpoint = proven.endpoint;
 		if (!skipReplay) attached.barrier.held ??= [];
 		attached.published = true;
 		attached.publication.resolve();

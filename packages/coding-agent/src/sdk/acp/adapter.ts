@@ -278,13 +278,11 @@ export class AcpSdkAdapter {
 		}
 		if (this.#router) {
 			if (!this.#attachment?.isCurrent()) return;
+			if (this.#attachment) assertMaintenanceCapability(this.#attachment);
 			await this.#activateProviders();
 		} else {
 			await this.#activateProviders();
 		}
-		// Reject an unsupported attachment at SETUP rather than letting leases
-		// silently stop renewing later (#4730 review).
-		if (this.#router && this.#attachment) assertMaintenanceCapability(this.#attachment);
 		this.#heartbeat ??= setInterval(
 			() => void this.#heartbeatLeases().catch(error => this.#reportReconnectFailure(error)),
 			this.#heartbeatMs,

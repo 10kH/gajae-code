@@ -581,6 +581,16 @@ describe("SDK session index", () => {
 		expect(replay.listSessions().warnings).toEqual([]);
 		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual(["one", "two", "three", "four"]);
 	});
+	it("refreshes a cold reader from a compacted snapshot", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-cold-refresh-"));
+		const writer = await new SessionIndex(dir).open();
+		await writer.append(event("snapshot-only"));
+		await writer.compact();
+
+		const cold = new SessionIndex(dir);
+		await cold.refresh();
+		expect(cold.listSessions().sessions.map(session => session.sessionId)).toEqual(["snapshot-only"]);
+	});
 	it("rotates repeatedly while concurrent writers and readers preserve every event", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
 		const writers = await Promise.all([new SessionIndex(dir).open(), new SessionIndex(dir).open()]);
