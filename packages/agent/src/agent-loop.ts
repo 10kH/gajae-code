@@ -1330,6 +1330,8 @@ function managedAssistantShell(
 	// no public AI API can perform this transfer (#4777 review).
 	if (transferSafetyStopAuthority && errorKind && isManagedProviderSafetyStopAuthenticated(value)) {
 		managedProviderSafetyStops.add(rebuilt);
+		revokeProviderSafetyStop(value);
+		if (typeof value === "object" && value !== null) managedProviderSafetyStops.delete(value);
 	}
 	return rebuilt;
 }
@@ -3202,11 +3204,15 @@ async function streamAssistantResponse(
 	const managedDegradedFieldDiagnostics = new Set<string>();
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
+	// Revoke before invoking any caller-controlled transform so it cannot retain
+	// a live authenticated object and restore its role for a later custom stream.
+	expireProviderSafetyStopAuthority(messages);
+	if (messages !== context.messages) expireProviderSafetyStopAuthority(context.messages);
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal, scope);
 	}
 
-	// Expire residual terminal safety-stop authority before this dispatch:
+	// Expire residual terminal safety-stop authority again after the transform:
 	// committed history (including a previously adjudicated stop) is handed
 	// to the stream through convertToLlm below, and a live mark would let a
 	// custom stream re-use the authenticated object to forge a terminal

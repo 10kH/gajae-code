@@ -7,6 +7,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@gajae-code/utils";
 import {
+	isProviderSafetyStopAdapterInvocation,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 } from "../adapter-internals/provider-safety-stop";
@@ -577,6 +578,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 								candidate.finishReason,
 								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 								options?.fetch,
+								isProviderSafetyStopAdapterInvocation(options),
 							);
 							output.stopReason = "error";
 						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
@@ -597,6 +599,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 								blockReason,
 								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 								options?.fetch,
+								isProviderSafetyStopAdapterInvocation(options),
 							);
 							output.stopReason = "error";
 						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {

@@ -2,6 +2,8 @@ import type { AssistantMessage } from "../types";
 
 /** This module is intentionally outside the package export map. */
 const PROVIDER_SAFETY_STOP_ADAPTER_BRAND = Symbol("provider-safety-stop-adapter-brand");
+const PROVIDER_SAFETY_STOP_INVOCATION_BRAND = Symbol("provider-safety-stop-invocation-brand");
+const PROVIDER_SAFETY_STOP_INVOCATION_KEY = Symbol("provider-safety-stop-invocation");
 
 export type ProviderSafetyStopAdapterCapability = {
 	readonly [PROVIDER_SAFETY_STOP_ADAPTER_BRAND]: true;
@@ -11,6 +13,39 @@ export type ProviderSafetyStopAdapterCapability = {
 export const PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY = Object.freeze({
 	[PROVIDER_SAFETY_STOP_ADAPTER_BRAND]: true,
 }) as ProviderSafetyStopAdapterCapability;
+
+export type ProviderSafetyStopAdapterInvocation = {
+	readonly [PROVIDER_SAFETY_STOP_INVOCATION_BRAND]: true;
+};
+
+export const PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION = Object.freeze({
+	[PROVIDER_SAFETY_STOP_INVOCATION_BRAND]: true,
+}) as ProviderSafetyStopAdapterInvocation;
+
+function hasCallerTransport(options: object): boolean {
+	try {
+		return Reflect.get(options, "fetch") !== undefined || Reflect.get(options, "client") !== undefined;
+	} catch {
+		return true;
+	}
+}
+
+/** Attach runtime-owned adapter authority only when no caller transport seam is present. */
+export function withProviderSafetyStopAdapterInvocation<T extends object>(options: T): T {
+	if (hasCallerTransport(options)) return options;
+	return { ...options, [PROVIDER_SAFETY_STOP_INVOCATION_KEY]: PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION } as T;
+}
+
+export function isProviderSafetyStopAdapterInvocation(value: unknown): ProviderSafetyStopAdapterInvocation | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	try {
+		return Reflect.get(value, PROVIDER_SAFETY_STOP_INVOCATION_KEY) === PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION
+			? PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 const authenticatedProviderSafetyStops = new WeakSet<object>();
 
@@ -53,10 +88,12 @@ export function mintProviderSafetyStop(
 	signal: string,
 	capability: ProviderSafetyStopAdapterCapability,
 	callerTransport?: unknown,
+	adapterInvocation?: ProviderSafetyStopAdapterInvocation,
 ): boolean {
 	if (
 		capability !== PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY ||
 		callerTransport !== undefined ||
+		adapterInvocation !== PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION ||
 		!STRUCTURED_REFUSAL_SIGNALS.has(signal)
 	)
 		return false;

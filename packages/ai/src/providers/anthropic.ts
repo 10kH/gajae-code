@@ -21,6 +21,7 @@ import {
 	readSseEvents,
 } from "@gajae-code/utils";
 import {
+	isProviderSafetyStopAdapterInvocation,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 } from "../adapter-internals/provider-safety-stop";
@@ -2477,6 +2478,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 									stopDetails?.type === "refusal" ? "refusal" : (rawStopReason ?? "refusal"),
 									PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 									options?.fetch ?? options?.client,
+									isProviderSafetyStopAdapterInvocation(options),
 								);
 								if (stopDetails?.type === "refusal") {
 									const explanation = stopDetails.explanation?.trim();

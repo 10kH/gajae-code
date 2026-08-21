@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import type { AssistantMessageEvent, Context, Model } from "@gajae-code/ai/types";
+import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
+
+function trustedOptions(): { apiKey: string } {
+	return withProviderSafetyStopAdapterInvocation({ apiKey: "test" });
+}
 
 const originalFetch = global.fetch;
 afterEach(() => {
@@ -93,7 +98,7 @@ describe("chat-completions: provider safety stops", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+		const result = await streamOpenAICompletions(model(), context(), trustedOptions()).result();
 		expect(result.errorKind).toBe("provider_safety_stop");
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Provider finish_reason: content_filter");
@@ -102,7 +107,7 @@ describe("chat-completions: provider safety stops", () => {
 	it("classifies a streamed refusal as a safety stop despite an ordinary finish reason", async () => {
 		global.fetch = mockFetch([chunk({ refusal: "I cannot help with that." }, "stop"), "[DONE]"]);
 
-		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+		const result = await streamOpenAICompletions(model(), context(), trustedOptions()).result();
 		expect(result.errorKind).toBe("provider_safety_stop");
 		expect(result.stopReason).toBe("error");
 		expect(result.content).toEqual([{ type: "text", text: "I cannot help with that." }]);
@@ -127,7 +132,7 @@ describe("chat-completions: provider safety stops", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+		const result = await streamOpenAICompletions(model(), context(), trustedOptions()).result();
 		expect(result.content.some(block => block.type === "toolCall")).toBe(true);
 		expect(result.errorKind).toBe("provider_safety_stop");
 		expect(result.stopReason).toBe("error");
@@ -139,7 +144,7 @@ describe("chat-completions: provider safety stops", () => {
 			"[DONE]",
 		]);
 
-		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+		const result = await streamOpenAICompletions(model(), context(), trustedOptions()).result();
 		expect(result.errorKind).toBe("provider_safety_stop");
 		expect(result.stopReason).toBe("error");
 		expect(result.content).toEqual([{ type: "text", text: "I cannot help with that. Here is ordinary content." }]);
@@ -148,7 +153,7 @@ describe("chat-completions: provider safety stops", () => {
 	it("keeps the content-filter error after an earlier refusal", async () => {
 		global.fetch = mockFetch([chunk({ refusal: "I cannot help with that." }), chunk({}, "content_filter"), "[DONE]"]);
 
-		const result = await streamOpenAICompletions(model(), context(), { apiKey: "test" }).result();
+		const result = await streamOpenAICompletions(model(), context(), trustedOptions()).result();
 		expect(result.errorKind).toBe("provider_safety_stop");
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Provider finish_reason: content_filter");
@@ -159,7 +164,7 @@ describe("chat-completions: provider safety stops", () => {
 			error: { code: "content_filter", message: "Prompt rejected by policy" },
 		});
 
-		const stream = streamOpenAICompletions(model(), context(), { apiKey: "test" });
+		const stream = streamOpenAICompletions(model(), context(), trustedOptions());
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) events.push(event);
 		const result = await stream.result();
@@ -180,7 +185,7 @@ describe("chat-completions: provider safety stops", () => {
 			},
 		});
 
-		const stream = streamOpenAICompletions(model(), context(), { apiKey: "test" });
+		const stream = streamOpenAICompletions(model(), context(), trustedOptions());
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) events.push(event);
 		const result = await stream.result();

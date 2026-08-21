@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
 import { streamGoogleGenAI } from "../src/providers/google-shared";
 import { collectEvents, createBaseModel, createSseResponse } from "./openai-tool-choice-test-helpers";
 
@@ -85,7 +86,7 @@ async function streamGoogleResponse(response: unknown | unknown[], api: GoogleSt
 		const stream = streamGoogleGenAI({
 			model,
 			api,
-			options: undefined,
+			options: withProviderSafetyStopAdapterInvocation({}),
 			prepare: () => ({
 				params: { model: model.id, contents: [] },
 				url: "https://google.example.test/stream",

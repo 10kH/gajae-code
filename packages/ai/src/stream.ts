@@ -7,6 +7,7 @@ import {
 	extractHttpStatusFromError,
 	getTrustedHomeDir,
 } from "@gajae-code/utils";
+import { withProviderSafetyStopAdapterInvocation } from "./adapter-internals/provider-safety-stop";
 import { assertManagedAttempt, classifyFallbackTrigger, type TransportFailureFacts } from "./utils/fallback-transport";
 
 const managedAttemptValidated = Symbol("managedAttemptValidated");
@@ -339,7 +340,11 @@ export function stream<TApi extends Api>(
 
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
-		return streamGoogleVertex(model as Model<"google-vertex">, context, options as GoogleVertexOptions);
+		return streamGoogleVertex(
+			model as Model<"google-vertex">,
+			context,
+			withProviderSafetyStopAdapterInvocation((options || {}) as GoogleVertexOptions),
+		);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
@@ -355,7 +360,7 @@ export function stream<TApi extends Api>(
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
-	const providerOptions = { ...options, apiKey };
+	const providerOptions = withProviderSafetyStopAdapterInvocation({ ...options, apiKey });
 
 	const api: Api = model.api;
 	switch (api) {

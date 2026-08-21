@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../src/adapter-internals/provider-safety-stop";
 import * as publicAi from "../src/index";
 import { getBundledModel } from "../src/models";
@@ -66,7 +67,15 @@ describe("provider safety-stop provenance authority", () => {
 	test("mints the typed kind only for structured first-party refusal signals", () => {
 		for (const signal of ["refusal", "sensitive", "content_filter", "SAFETY", "JAILBREAK", "RECITATION"]) {
 			const marked = message();
-			expect(mintProviderSafetyStop(marked, signal, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY)).toBe(true);
+			expect(
+				mintProviderSafetyStop(
+					marked,
+					signal,
+					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+					undefined,
+					PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+				),
+			).toBe(true);
 			expect(marked.errorKind).toBe("provider_safety_stop");
 			expect(isProviderSafetyStopAuthenticated(marked)).toBe(true);
 		}
@@ -75,9 +84,15 @@ describe("provider safety-stop provenance authority", () => {
 	test("fails closed on an unrecognized signal: no kind, no authority", () => {
 		const unmarked = message();
 		unmarked.errorKind = "provider_safety_stop";
-		expect(mintProviderSafetyStop(unmarked, "totally-not-a-refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY)).toBe(
-			false,
-		);
+		expect(
+			mintProviderSafetyStop(
+				unmarked,
+				"totally-not-a-refusal",
+				PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+				undefined,
+				PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+			),
+		).toBe(false);
 		// The pre-existing wire-assignable field stays exactly as unauthenticated
 		// as it was; the adapter bug degraded to ordinary fallback, not a mint.
 		expect(isProviderSafetyStopAuthenticated(unmarked)).toBe(false);
@@ -94,6 +109,13 @@ describe("provider safety-stop provenance authority", () => {
 		}
 	});
 
+	test("requires the runtime-owned adapter invocation token", () => {
+		const untrusted = message();
+		expect(mintProviderSafetyStop(untrusted, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY)).toBe(false);
+		expect(untrusted.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(untrusted)).toBe(false);
+	});
+
 	test("a structurally forged capability cannot mint authority", () => {
 		const forged = message();
 		const forgedCapability = {} as Parameters<typeof mintProviderSafetyStop>[2];
@@ -104,7 +126,15 @@ describe("provider safety-stop provenance authority", () => {
 
 	test("a public consumer cannot clone authority from a genuine marked source", () => {
 		const marked = message();
-		expect(mintProviderSafetyStop(marked, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY)).toBe(true);
+		expect(
+			mintProviderSafetyStop(
+				marked,
+				"refusal",
+				PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+				undefined,
+				PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+			),
+		).toBe(true);
 
 		const forgedDestination = { ...marked };
 		expect(isProviderSafetyStopAuthenticated(marked)).toBe(true);
@@ -114,7 +144,15 @@ describe("provider safety-stop provenance authority", () => {
 
 	test("data alone is never authenticated: clones, JSON round-trips, and fresh copies lose authority", () => {
 		const marked = message();
-		expect(mintProviderSafetyStop(marked, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY)).toBe(true);
+		expect(
+			mintProviderSafetyStop(
+				marked,
+				"refusal",
+				PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+				undefined,
+				PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+			),
+		).toBe(true);
 
 		const cloned = structuredClone(marked);
 		expect(cloned.errorKind).toBe("provider_safety_stop");

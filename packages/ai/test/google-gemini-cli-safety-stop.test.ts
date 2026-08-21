@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
 import { streamGoogleGeminiCli } from "../src/providers/google-gemini-cli";
 import type { Context, Model } from "../src/types";
 import { collectEvents, createSseResponse } from "./openai-tool-choice-test-helpers";
@@ -42,7 +43,9 @@ async function streamResponse(provider: GeminiCliProvider, chunks: unknown[]) {
 	}) as unknown as typeof fetch;
 	try {
 		const stream = streamGoogleGeminiCli(createModel(provider), context, {
-			apiKey: JSON.stringify({ token: "token", projectId: "project" }),
+			...withProviderSafetyStopAdapterInvocation({
+				apiKey: JSON.stringify({ token: "token", projectId: "project" }),
+			}),
 		});
 		const events = await collectEvents(stream);
 		return { events, requestCount, result: await stream.result() };

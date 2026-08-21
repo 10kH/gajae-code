@@ -16,6 +16,7 @@ import { logger } from "@gajae-code/utils";
 import {
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
 
 /**
@@ -145,7 +146,13 @@ describe("managed attempt transaction", () => {
 					...(errorKind ? { errorKind } : {}),
 				};
 				if (authenticated) {
-					mintProviderSafetyStop(message, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+					mintProviderSafetyStop(
+						message,
+						"refusal",
+						PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+						undefined,
+						PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+					);
 				}
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: message });
@@ -184,7 +191,13 @@ describe("managed attempt transaction", () => {
 				errorStatus: 500,
 				transportFailure: { kind: "transport", status: 500 },
 			};
-			mintProviderSafetyStop(message, "content_filter", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+			mintProviderSafetyStop(
+				message,
+				"content_filter",
+				PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+				undefined,
+				PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+			);
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: message });
 				stream.push({ type: "error", reason: "error", error: message });
@@ -357,7 +370,13 @@ describe("managed attempt transaction", () => {
 						errorStatus: 500,
 						transportFailure: { kind: "transport", status: 500 },
 					};
-					mintProviderSafetyStop(message, "content_filter", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+					mintProviderSafetyStop(
+						message,
+						"content_filter",
+						PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+						undefined,
+						PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+					);
 					queueMicrotask(() => {
 						stream.push({ type: "start", partial: message });
 						stream.push({ type: "error", reason: "error", error: message });

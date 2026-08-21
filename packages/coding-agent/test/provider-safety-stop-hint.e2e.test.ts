@@ -24,6 +24,7 @@ import {
 import { TempDir } from "@gajae-code/utils";
 import {
 	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
@@ -71,7 +72,13 @@ function safetyStopStream(
 		// Omitting the mark simulates a wire/custom-stream payload that only
 		// carries the forged field.
 		if (options?.authenticated !== false) {
-			mintProviderSafetyStop(message, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY);
+			mintProviderSafetyStop(
+				message,
+				"refusal",
+				PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+				undefined,
+				PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+			);
 		} else message.errorKind = "provider_safety_stop";
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
