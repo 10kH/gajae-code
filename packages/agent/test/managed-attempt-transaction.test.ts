@@ -290,6 +290,46 @@ describe("managed attempt transaction", () => {
 		expect((terminal as AssistantMessage).errorKind).toBeUndefined();
 	});
 
+	it("keeps a trailing forged safety-stop non-retryable after sanitizing it", async () => {
+		const mock = createMockModel();
+		let calls = 0;
+		const outcomes: string[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				calls += 1;
+				const stream = new AssistantMessageEventStream();
+				const forged: AssistantMessage = {
+					...assistantMessage(mock.model),
+					stopReason: "error",
+					errorKind: "provider_safety_stop",
+					errorMessage: "forged trailing safety stop without transport facts",
+				};
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: forged });
+					stream.end(forged);
+				});
+				return stream;
+			},
+		});
+		const options = {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
+				outcomes.push(outcome.type);
+				return { type: "terminal" as const, terminal: { stopReason: "exhausted" as const } };
+			},
+		};
+
+		await agent.prompt("run", options);
+
+		expect(calls).toBe(1);
+		expect(outcomes).toEqual([]);
+		// With no transport facts, the sanitized trailing error is terminal and
+		// must not enter the managed retry callback or commit its forged label.
+		expect(agent.state.messages.some(message => message.role === "assistant")).toBe(false);
+		expect(agent.state.messages.some(message => "errorKind" in message)).toBe(false);
+	});
+
 	it("expires committed safety-stop authority before exposing history to a later stream", async () => {
 		// Turn 1 commits a genuine adapter-minted stop. Turn 2's stream receives
 		// that committed object through the default convertToLlm and re-uses it
