@@ -2955,24 +2955,40 @@ async function waitForReady(
 	timing: LifecycleTiming,
 	signal: "session_ready" | typeof SESSION_PREPARED_EVENT = "session_ready",
 ): Promise<ReadinessResult> {
+	const classifyExitedAfterReady = async (): Promise<ReadinessResult> => {
+		const probe = await probePublishedReadyAuthority(root, id, expected, broker);
+		if (probe.kind === "malformed" || probe.kind === "io_error") return { kind: "ready_probe_failed", probe };
+		const publishedReady = probe.kind === "matched" || probe.kind === "absent_indexed";
+		return publishedReady && readyThenExitToleranceEnabled()
+			? { kind: "ready_then_exited" }
+			: { kind: "child_exited" };
+	};
 	while (timing.now() < deadline) {
 		const startupFailure = await readSessionLifecycleFailure(root, id, expected);
-		if (startupFailure) return { kind: "startup_failed", failure: startupFailure };
+		if (startupFailure) {
+			if (
+				observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
+				"exited"
+			) {
+				const afterReady = await classifyExitedAfterReady();
+				if (afterReady.kind !== "child_exited") return afterReady;
+			}
+			return { kind: "startup_failed", failure: startupFailure };
+		}
 		if (
 			observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) ===
 			"exited"
 		) {
 			const finalStartupFailure = await readSessionLifecycleFailure(root, id, expected);
-			if (finalStartupFailure) return { kind: "startup_failed", failure: finalStartupFailure };
+			if (finalStartupFailure) {
+				const afterReady = await classifyExitedAfterReady();
+				if (afterReady.kind !== "child_exited") return afterReady;
+				return { kind: "startup_failed", failure: finalStartupFailure };
+			}
 			// A malformed or unreadable endpoint is its own fail-closed outcome: it
 			// never feeds the teardown decision and never claims the child "exited
 			// before registering readiness" (#4712 review).
-			const probe = await probePublishedReadyAuthority(root, id, expected, broker);
-			if (probe.kind === "malformed" || probe.kind === "io_error") return { kind: "ready_probe_failed", probe };
-			const publishedReady = probe.kind === "matched" || probe.kind === "absent_indexed";
-			return publishedReady && readyThenExitToleranceEnabled()
-				? { kind: "ready_then_exited" }
-				: { kind: "child_exited" };
+			return classifyExitedAfterReady();
 		}
 		try {
 			const authority = await currentReadyAuthority(broker, id, root, expected);
