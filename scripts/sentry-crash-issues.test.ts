@@ -8,6 +8,7 @@ import {
 	fileApprovalStore,
 	fingerprintOf,
 	fingerprintFromTagPayload,
+	ghChildEnv,
 	issueBody,
 	issueTitle,
 	main,
@@ -319,6 +320,28 @@ describe("batch safety", () => {
 
 	test("sanitizes the dry-run culprit with the same renderer as issue bodies", () => {
 		expect(previewCulprit("readFile`@everyone /private/secret")).toBe("readFile'(at)everyone <path>");
+	});
+});
+
+describe("gh child environment", () => {
+	test("pins the host to github.com instead of inheriting a redirecting GH_HOST", () => {
+		const env = ghChildEnv({
+			PATH: "/usr/bin",
+			HOME: "/home/operator",
+			GH_TOKEN: "gh-token",
+			GH_HOST: "attacker.example",
+			SENTRY_AUTH_TOKEN: "sentry-token",
+			SENTRY_DEVNOGARI_AUTH_TOKEN: "sentry-token-2",
+		});
+		expect(env.GH_HOST).toBe("github.com");
+		expect(env.GH_TOKEN).toBe("gh-token");
+		expect(env.PATH).toBe("/usr/bin");
+		expect(Object.keys(env)).not.toContain("SENTRY_AUTH_TOKEN");
+		expect(Object.keys(env)).not.toContain("SENTRY_DEVNOGARI_AUTH_TOKEN");
+	});
+
+	test("keeps the pinned host even when GH_HOST is the only variable set", () => {
+		expect(ghChildEnv({ GH_HOST: "ghe.internal" })).toEqual({ GH_HOST: "github.com" });
 	});
 });
 

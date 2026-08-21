@@ -87,8 +87,30 @@ const GH_ENV_ALLOWLIST = [
 	"PATHEXT",
 	"GH_TOKEN",
 	"GITHUB_TOKEN",
-	"GH_HOST",
 ] as const;
+/**
+ * `GH_HOST` is deliberately absent from the allowlist: inheriting it would let
+ * an environment override redirect issue lookups, creates, and the credential
+ * itself to an arbitrary host. The child pins the host to github.com instead,
+ * matching the canonical URL contract `findExistingIssue` enforces on results.
+ */
+const GH_PINNED_HOST = "github.com";
+
+/**
+ * Build the sanitized `gh` child environment from a source record. Pure and
+ * exported so the trust boundary (no Sentry tokens, no host redirect, tokens
+ * and platform basics kept) is regression-tested without spawning `gh`.
+ */
+export function ghChildEnv(source: Record<string, string | undefined>): Record<string, string> {
+	const env: Record<string, string> = Object.fromEntries(
+		GH_ENV_ALLOWLIST.flatMap(name => {
+			const value = source[name];
+			return value === undefined ? [] : ([[name, value]] as const);
+		}),
+	);
+	env.GH_HOST = GH_PINNED_HOST;
+	return env;
+}
 
 interface Options {
 	apply: boolean;
@@ -333,13 +355,7 @@ export async function fingerprintOf(issueId: string, token: string): Promise<Fin
 }
 
 async function gh(args: readonly string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-	const env = Object.fromEntries(
-		GH_ENV_ALLOWLIST.flatMap(name => {
-			const value = Bun.env[name];
-			return value === undefined ? [] : [[name, value]];
-		}),
-	);
-	const child = Bun.spawn(["gh", ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore", env });
+	const child = Bun.spawn(["gh", ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore", env: ghChildEnv(Bun.env) });
 	const timer = setTimeout(() => child.kill(), GH_TIMEOUT_MS);
 	try {
 		const [stdout, stderr, exitCode] = await Promise.all([
