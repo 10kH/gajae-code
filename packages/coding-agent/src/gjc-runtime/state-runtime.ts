@@ -14,7 +14,13 @@ import {
 	syncSkillActiveState,
 } from "../skill-state/active-state";
 import { initialPhaseForSkill } from "../skill-state/initial-phase";
-import { buildRalplanHudSummary, buildUltragoalHudSummary, deriveDeepInterviewHud } from "../skill-state/workflow-hud";
+import {
+	buildAutoresearchHudSummary,
+	buildRalplanHudSummary,
+	buildUltragoalHudSummary,
+	deriveDeepInterviewHud,
+} from "../skill-state/workflow-hud";
+
 import {
 	type AuditEntry,
 	buildWorkflowStateReceipt,
@@ -919,20 +925,20 @@ function buildHudForMode(
 			});
 		}
 		case "autoresearch": {
-			const missionPhase =
-				typeof payload.current_phase === "string" ? (payload.current_phase as string) : (phase ?? "intake");
-			const mode = typeof payload.mode === "string" ? (payload.mode as string) : undefined;
-			const intake = typeof payload.intake === "string" ? (payload.intake as string) : undefined;
-			const slug = typeof payload.slug === "string" ? (payload.slug as string) : undefined;
+			const missionPhase = typeof payload.current_phase === "string" ? payload.current_phase : (phase ?? "intake");
+			const mode = typeof payload.mode === "string" ? payload.mode : undefined;
+			const intake = typeof payload.intake === "string" ? payload.intake : undefined;
+			const slug = typeof payload.slug === "string" ? payload.slug : undefined;
 			const specPath =
 				typeof payload.spec_path === "string"
-					? (payload.spec_path as string)
+					? payload.spec_path
 					: typeof payload.specPath === "string"
-						? (payload.specPath as string)
+						? payload.specPath
 						: undefined;
+
 			const verdict =
 				payload.verdict && typeof payload.verdict === "object" && !Array.isArray(payload.verdict)
-					? (payload.verdict as { status?: unknown })
+					? (payload.verdict as Record<string, unknown>)
 					: undefined;
 			const verdictValue = verdict
 				? typeof verdict.status === "string"
@@ -941,21 +947,25 @@ function buildHudForMode(
 						? JSON.stringify(verdict.status).slice(0, 40)
 						: undefined
 				: undefined;
-			const chips: WorkflowHudSummary["chips"] = [
-				...(missionPhase === "verdict"
-					? [{ label: "verdict", value: verdictValue ?? "issued", priority: 5, severity: "success" as const }]
-					: []),
-				{ label: "phase", value: missionPhase, priority: 10 },
-				...(mode ? [{ label: "mode", value: mode, priority: 20 }] : []),
-				...(intake ? [{ label: "intake", value: intake, priority: 30 }] : []),
-				...(specPath ? [{ label: "spec", value: specPath, priority: 40 }] : []),
-			];
-			return {
-				version: 1,
-				...(slug ? { summary: `autoresearch mission ${slug}` } : {}),
-				chips,
-				updated_at: updatedAt,
-			};
+			const rawExperiments = Array.isArray(payload.experiments) ? payload.experiments : [];
+			const experimentStatuses = rawExperiments
+				.map(item =>
+					item && typeof item === "object" && typeof (item as Record<string, unknown>).status === "string"
+						? ((item as Record<string, unknown>).status as string)
+						: undefined,
+				)
+				.filter((status): status is string => Boolean(status));
+			return buildAutoresearchHudSummary({
+				phase: missionPhase,
+				mode,
+				intake,
+				slug,
+				verdict: verdictValue,
+				specPath,
+				experimentCount: experimentStatuses.length,
+				experimentStatuses,
+				updatedAt,
+			});
 		}
 		default:
 			return undefined;
