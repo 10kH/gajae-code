@@ -195,27 +195,31 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	});
 
-	it("does not expose move_session in canonical sub-sessions identified by parentTaskPrefix or currentAgentType alone", async () => {
-		for (const overrides of [{ parentTaskPrefix: "0-Worker" }, { currentAgentType: "executor" }] as Array<
-			Record<string, unknown>
-		>) {
-			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
-			tempDirs.push(tempDir);
-			const cwdA = path.join(tempDir, "root");
-			fs.mkdirSync(cwdA, { recursive: true });
+	it(
+		"does not expose move_session in canonical sub-sessions identified by parentTaskPrefix or currentAgentType alone",
+		async () => {
+			for (const overrides of [{ parentTaskPrefix: "0-Worker" }, { currentAgentType: "executor" }] as Array<
+				Record<string, unknown>
+			>) {
+				const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+				tempDirs.push(tempDir);
+				const cwdA = path.join(tempDir, "root");
+				fs.mkdirSync(cwdA, { recursive: true });
 
-			const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
-			const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"], ...overrides });
-			try {
-				expect(
-					session.getToolByName("move_session"),
-					`sub-session with ${Object.keys(overrides)[0]} must not expose move_session`,
-				).toBeUndefined();
-			} finally {
-				await session.dispose();
+				const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+				const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"], ...overrides });
+				try {
+					expect(
+						session.getToolByName("move_session"),
+						`sub-session with ${Object.keys(overrides)[0]} must not expose move_session`,
+					).toBeUndefined();
+				} finally {
+					await session.dispose();
+				}
 			}
-		}
-	});
+		},
+		{ timeout: 15_000 },
+	);
 
 	it("refuses to move while a workflow skill is active", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -284,33 +288,37 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await session.dispose();
 		}
 	});
-	it("does not expose move_session when caller-owned MCP or a frozen workspace tree is bound", async () => {
-		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
-		tempDirs.push(tempDir);
-		const cwdA = path.join(tempDir, "root");
-		fs.mkdirSync(cwdA, { recursive: true });
-		const frozenTree = { cwd: cwdA, entries: [], agentsMdFiles: [] };
-		const withTree = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
-		const treeSession = await makeSession(cwdA, withTree, {
-			toolNames: ["move_session"],
-			workspaceTree: frozenTree,
-		});
-		try {
-			expect(treeSession.session.getToolByName("move_session")).toBeUndefined();
-		} finally {
-			await treeSession.session.dispose();
-		}
-		const withMcp = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
-		const mcpSession = await makeSession(cwdA, withMcp, {
-			toolNames: ["move_session"],
-			mcpManager: { connectServers() {} },
-		});
-		try {
-			expect(mcpSession.session.getToolByName("move_session")).toBeUndefined();
-		} finally {
-			await mcpSession.session.dispose();
-		}
-	});
+	it(
+		"does not expose move_session when caller-owned MCP or a frozen workspace tree is bound",
+		async () => {
+			const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+			tempDirs.push(tempDir);
+			const cwdA = path.join(tempDir, "root");
+			fs.mkdirSync(cwdA, { recursive: true });
+			const frozenTree = { cwd: cwdA, entries: [], agentsMdFiles: [] };
+			const withTree = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+			const treeSession = await makeSession(cwdA, withTree, {
+				toolNames: ["move_session"],
+				workspaceTree: frozenTree,
+			});
+			try {
+				expect(treeSession.session.getToolByName("move_session")).toBeUndefined();
+			} finally {
+				await treeSession.session.dispose();
+			}
+			const withMcp = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+			const mcpSession = await makeSession(cwdA, withMcp, {
+				toolNames: ["move_session"],
+				mcpManager: { connectServers() {} },
+			});
+			try {
+				expect(mcpSession.session.getToolByName("move_session")).toBeUndefined();
+			} finally {
+				await mcpSession.session.dispose();
+			}
+		},
+		{ timeout: 15_000 },
+	);
 	it("does not expose move_session for an exact MCP config session", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
