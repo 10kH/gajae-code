@@ -27,7 +27,14 @@ export function e2eApiKey(envVar: string): string | undefined {
 	return Bun.env[envVar];
 }
 
-const AUTH_PATH = path.join(getAgentDir(), "testauth.db");
+/**
+ * Resolved at use time, never import time: the agent dir is call-time state
+ * (#4761, #4772), so an import-time constant keeps pointing at the home in
+ * effect when this module first loaded (#4786).
+ */
+function authPath(): string {
+	return path.join(getAgentDir(), "testauth.db");
+}
 
 type ApiKeyCredential = {
 	type: "api_key";
@@ -44,7 +51,7 @@ type AuthStorage = Record<string, AuthCredential>;
 
 async function loadAuthStorage(): Promise<AuthStorage> {
 	try {
-		const content = await Bun.file(AUTH_PATH).text();
+		const content = await Bun.file(authPath()).text();
 		return JSON.parse(content);
 	} catch (err) {
 		if (isEnoent(err)) return {};
@@ -53,8 +60,9 @@ async function loadAuthStorage(): Promise<AuthStorage> {
 }
 
 async function saveAuthStorage(storage: AuthStorage): Promise<void> {
-	await Bun.write(AUTH_PATH, JSON.stringify(storage, null, 2));
-	await fs.chmod(AUTH_PATH, 0o600);
+	const target = authPath();
+	await Bun.write(target, JSON.stringify(storage, null, 2));
+	await fs.chmod(target, 0o600);
 }
 
 /**
