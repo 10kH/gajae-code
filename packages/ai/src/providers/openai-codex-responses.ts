@@ -123,15 +123,38 @@ const CODEX_PREVIOUS_RESPONSE_STALE_CODES = new Set(["previous_response_not_foun
 // with a stale qualifier on either side, so the anchor is cleared and the turn
 // retried with full context instead of killing the session.
 //
-// Deliberately requires the `previous_response_id` field token rather than prose
-// like "previous response ... ID": a deterministic history fault such as
-// `Previous response's tool call ID is malformed.` must stay fatal, since
+// The compact form deliberately requires the `previous_response_id` field token
+// and is unguarded: a message naming the field itself is about the anchor. Prose
+// references are guarded separately below — the division of labor is compact
+// token (unguarded, field-naming) vs prose phrase (guarded, fault-noun checked
+// on both sides of the anchor phrase), since a deterministic history fault such
+// as `Previous response's tool call ID is malformed.` must stay fatal:
 // replaying it re-sends the same offending item.
 const CODEX_PREVIOUS_RESPONSE_ID_TOKEN = String.raw`previous[ _-]response[ _-]id`;
+// Prose anchor reference ("Previous response with id 'resp_1' not found."):
+// the canonical `previous_response_not_found` wording, which codex-lb re-codes
+// as `invalid_request_error` the same way it re-codes the anchor-expiry fault
+// to `codex_previous_response_stale`. The compact token above cannot match it,
+// so the recovery path missed these and the session died.
+const CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN = `previous[ _-]response`;
+// Sub-field faults INSIDE the previous response (tool call / call id / message
+// id / item) are deterministic history faults: replaying full context re-sends
+// the same offending item. Tempering the qualifier⇄token scan against these
+// tokens keeps them fatal while pure anchor-stale prose still matches.
+const CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD = `tool[ _]calls?|function[ _]calls?|custom[ _]tools?|call[ _-]?ids?|message[ _]?ids?|items?\\b|output[ _-]?items?`;
 const CODEX_ANCHOR_STALE_QUALIFIER = String.raw`invalid|expired|unknown|stale|not[ _-]?found|no longer`;
 const CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE = new RegExp(
 	`(?:${CODEX_ANCHOR_STALE_QUALIFIER})[^\\n]{0,48}?${CODEX_PREVIOUS_RESPONSE_ID_TOKEN}` +
 		`|${CODEX_PREVIOUS_RESPONSE_ID_TOKEN}[^\\n]{0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})`,
+	"i",
+);
+const CODEX_PREVIOUS_RESPONSE_STALE_PROSE_MESSAGE = new RegExp(
+	// The fault noun can sit on EITHER side of the anchor phrase AND on either
+	// side of the qualifier (`Unknown previous response tool call.`,
+	// `Previous response includes an unknown tool call.`), so every alternative
+	// carries both the tempered inter-token scan and a post-anchor lookahead.
+	`(?:${CODEX_ANCHOR_STALE_QUALIFIER})(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}(?![^\\n]{0,48}(?:${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD}))` +
+		`|${CODEX_PREVIOUS_RESPONSE_PROSE_TOKEN}(?:(?!${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD})[^\\n]){0,48}?(?:${CODEX_ANCHOR_STALE_QUALIFIER})(?![^\\n]{0,48}(?:${CODEX_PREVIOUS_RESPONSE_STALE_SUBFIELD_GUARD}))`,
 	"i",
 );
 const CODEX_RETRYABLE_EVENT_CODES = new Set(["model_error", "server_error", "internal_error"]);
@@ -1855,7 +1878,10 @@ function isCodexPreviousResponseNotFound(error: unknown): boolean {
 	if (typeof error.code === "string" && CODEX_PREVIOUS_RESPONSE_STALE_CODES.has(error.code)) return true;
 	// Raw provider message only — `error.message` carries appended `code=` metadata
 	// that would supply the stale qualifier the provider never sent.
-	return CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE.test(error.providerMessage);
+	return (
+		CODEX_PREVIOUS_RESPONSE_STALE_MESSAGE.test(error.providerMessage) ||
+		CODEX_PREVIOUS_RESPONSE_STALE_PROSE_MESSAGE.test(error.providerMessage)
+	);
 }
 
 async function tryRecoverCodexPreviousResponseNotFound(
