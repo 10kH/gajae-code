@@ -11,7 +11,7 @@
  * refuse targets outside the project `.gjc/` tree.
  *
  * Intake contract (AC-14..AC-16): two entrypoints write the one mission
- * artifact. Handoff intake (`--spec <path>`) consumes a persisted deep-interview
+ * artifact. Spec intake (`intake --spec <path>`, or the bare `--spec` flag) consumes a persisted deep-interview
  * spec and asks zero clarification questions; cold intake (positional goal or
  * bare invocation) signals that goal/constraints/deliverables clarification must
  * run before research begins and writes nothing. The mission mode is one of
@@ -82,7 +82,7 @@ export interface AutoresearchMission {
 	intake: AutoresearchIntakeKind;
 	createdAt: string;
 	updatedAt: string;
-	/** Absolute path of the deep-interview spec consumed by handoff intake. */
+	/** Absolute path of the deep-interview spec consumed by spec intake. */
 	specPath?: string;
 	handedOffAt?: string;
 	/**
@@ -174,7 +174,7 @@ export interface AutoresearchClearReceipt {
 	retiredTo?: string;
 }
 
-export interface AutoresearchHandoffReceipt extends AutoresearchWriteReceipt {
+export interface AutoresearchIntakeReceipt extends AutoresearchWriteReceipt {
 	specPath: string;
 }
 
@@ -562,7 +562,7 @@ async function moveIfPresent(from: string, to: string): Promise<void> {
 	}
 }
 
-/* --------------------------- handoff intake --------------------------- */
+/* ---------------------------- spec intake ---------------------------- */
 
 const AUTORESEARCH_MODE_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-mode\s*:\s*(web|mixed|data)\s*$/i;
 const AUTORESEARCH_METRIC_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-metric\s*:\s*(.+?)\s*$/i;
@@ -611,10 +611,7 @@ function sanitizeSpecSlug(value: string): string {
 		.replace(/[^a-z0-9._-]+/g, "-")
 		.replace(/^-+|-+$/g, "");
 	if (normalized === "") {
-		throw new AutoresearchCommandError(
-			2,
-			"autoresearch handoff intake could not derive a mission slug from the spec",
-		);
+		throw new AutoresearchCommandError(2, "autoresearch spec intake could not derive a mission slug from the spec");
 	}
 	return normalized;
 }
@@ -638,7 +635,7 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 	if (!mode) {
 		throw new AutoresearchCommandError(
 			2,
-			`autoresearch handoff intake requires the spec to declare its mission mode explicitly with a line like "autoresearch-mode: web" (one of web, mixed, data) at ${specPath}. ` +
+			`autoresearch spec intake requires the spec to declare its mission mode explicitly with a line like "autoresearch-mode: web" (one of web, mixed, data) at ${specPath}. ` +
 				"Mode is never inferred from the presence of a data file.",
 		);
 	}
@@ -657,7 +654,7 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 			metricUnit: firstMatch(AUTORESEARCH_METRIC_UNIT_DECLARATION_RE),
 			metricDirection: firstMatch(AUTORESEARCH_METRIC_DIRECTION_DECLARATION_RE),
 		},
-		`autoresearch handoff intake at ${specPath}`,
+		`autoresearch spec intake at ${specPath}`,
 	);
 
 	const h1 = lines.find(line => /^#\s+\S/.test(line.trim()));
@@ -683,12 +680,12 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 	};
 }
 
-/** handoff verb: `--spec` intake — read the spec, write the mission, ask zero questions. */
-export async function autoresearchHandoff(input: {
+/** Spec intake (`intake --spec <path>` or bare `--spec`): read the spec, write the mission, ask zero questions. The persisted intake kind stays "handoff" (seeded by a deep-interview handoff). */
+export async function autoresearchIntake(input: {
 	cwd: string;
 	specPath: string;
 	sessionId?: string | null;
-}): Promise<AutoresearchHandoffReceipt> {
+}): Promise<AutoresearchIntakeReceipt> {
 	const resolvedSpecPath = path.resolve(input.cwd, input.specPath);
 	let specText: string;
 	try {
@@ -696,7 +693,7 @@ export async function autoresearchHandoff(input: {
 	} catch (error) {
 		throw new AutoresearchCommandError(
 			2,
-			`autoresearch handoff intake could not read spec at ${resolvedSpecPath}: ${error instanceof Error ? error.message : String(error)}`,
+			`autoresearch spec intake could not read spec at ${resolvedSpecPath}: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
 	const parsed = parseAutoresearchSpec(specText, resolvedSpecPath);
@@ -899,6 +896,7 @@ function renderAutoresearchHelp(): string {
 		"",
 		"USAGE",
 		"  $ gjc autoresearch [--spec <path>] [--json] [goal...]",
+		"  $ gjc autoresearch intake --spec <path> [--json]",
 		"  $ gjc autoresearch read [--json]",
 		"  $ gjc autoresearch clear [--json]",
 		"  $ gjc autoresearch write --goal <goal> --mode <web|mixed|data> --slug <slug> [--deliverable <text>] [--constraint <text>] [--json]",
@@ -907,7 +905,7 @@ function renderAutoresearchHelp(): string {
 		"  $ gjc autoresearch critic --status-json <object> --evidence <text> --evaluator <id> [--caveat <text>] [--json]",
 		"",
 		"INTAKE",
-		"  --spec=<path>    Handoff intake: read a persisted deep-interview spec and start research",
+		"  intake --spec    Spec intake: read a persisted deep-interview spec and start research",
 		"                   with zero clarification questions. The spec must declare its mission",
 		"                   mode explicitly (a line like `autoresearch-mode: web`).",
 		"  positional goal  Cold intake: signals that goal/constraints/deliverables clarification",
@@ -993,7 +991,7 @@ function extractPositionalGoal(args: readonly string[]): string {
 	return parts.join(" ").trim();
 }
 
-function renderHandoffIntakeText(receipt: AutoresearchHandoffReceipt): string {
+function renderSpecIntakeText(receipt: AutoresearchIntakeReceipt): string {
 	return [
 		`autoresearch intake=handoff slug=${receipt.mission.slug}`,
 		`mode=${receipt.mission.mode}`,
@@ -1190,13 +1188,20 @@ export async function runNativeAutoresearchCommand(
 				'unknown verb "report" — the report verb was removed; missions end at verdict and the ledger is the record',
 			);
 		}
-		const specPath = flagValue(args, "--spec");
-		if (specPath !== undefined) {
-			if (specPath.trim() === "") {
+		if (verb === "handoff") {
+			throw new AutoresearchCommandError(
+				2,
+				'unknown verb "handoff" — for spec intake use `gjc autoresearch intake --spec <path>`; for workflow handoff invoke the next skill directly (/skill:<callee>) or run `gjc state autoresearch handoff --to <callee>`',
+			);
+		}
+		if (verb === "intake") {
+			assertOnlyAutoresearchFlags(args.slice(1), ["--spec", "--json"]);
+			const intakeSpecPath = requiredFlagValue(args, "--spec").trim();
+			if (intakeSpecPath === "") {
 				return { status: 2, stderr: "--spec requires a non-empty path\n" };
 			}
 			const json = hasFlag(args, "--json");
-			const receipt = await autoresearchHandoff({ cwd, specPath: specPath.trim() });
+			const receipt = await autoresearchIntake({ cwd, specPath: intakeSpecPath });
 			await reconcileAutoresearchState(cwd, receipt.mission);
 			return {
 				status: 0,
@@ -1211,7 +1216,31 @@ export async function runNativeAutoresearchCommand(
 							spec_path: receipt.specPath,
 							ledger_event: receipt.ledgerEvent?.event,
 						})
-					: renderHandoffIntakeText(receipt),
+					: renderSpecIntakeText(receipt),
+			};
+		}
+		const specPath = flagValue(args, "--spec");
+		if (specPath !== undefined) {
+			if (specPath.trim() === "") {
+				return { status: 2, stderr: "--spec requires a non-empty path\n" };
+			}
+			const json = hasFlag(args, "--json");
+			const receipt = await autoresearchIntake({ cwd, specPath: specPath.trim() });
+			await reconcileAutoresearchState(cwd, receipt.mission);
+			return {
+				status: 0,
+				intake: "handoff",
+				missionCreated: true,
+				stdout: json
+					? renderCliWriteReceipt({
+							ok: true,
+							intake: "handoff",
+							mission: receipt.mission,
+							mission_path: receipt.missionPath,
+							spec_path: receipt.specPath,
+							ledger_event: receipt.ledgerEvent?.event,
+						})
+					: renderSpecIntakeText(receipt),
 			};
 		}
 		const goal = extractPositionalGoal(args);

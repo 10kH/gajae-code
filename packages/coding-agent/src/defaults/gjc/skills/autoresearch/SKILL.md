@@ -36,7 +36,7 @@ gjc autoresearch read --json
 gjc autoresearch clear
 ```
 
-- `--spec <path>` — handoff intake from a persisted deep-interview spec; asks zero questions.
+- `intake --spec <path>` (or the bare `--spec` flag) — spec intake from a persisted deep-interview spec; asks zero questions.
 - `"<goal>"` or bare invocation — cold intake; goal, constraints, and deliverables must be clarified before research begins.
 - `read --json` — current mission artifact plus the append-only ledger snapshot.
 - `clear` — retire the mission artifact and its working set, recording `mission_cleared` in the ledger. This never touches the session `python` REPL kernel; reset that with the `python` tool's own `clear` action.
@@ -55,9 +55,9 @@ gjc autoresearch clear
 
 Both intakes write the same mission artifact (`objective`, `mode`, `deliverables`, `constraints`, `slug`).
 
-### Handoff intake
+### Spec intake
 
-`gjc autoresearch --spec <path>` reads a persisted deep-interview spec and starts the mission with **zero clarification questions**. The spec MUST declare its mission mode explicitly (a line like `autoresearch-mode: web`); a missing or invalid declaration is a hard fail. The consumed spec path and handoff time are recorded on the mission artifact.
+`gjc autoresearch intake --spec <path>` (or the bare `--spec` flag) reads a persisted deep-interview spec and starts the mission with **zero clarification questions**. The spec MUST declare its mission mode explicitly (a line like `autoresearch-mode: web`); a missing or invalid declaration is a hard fail. The consumed spec path and handoff time are recorded on the mission artifact.
 
 ### Cold intake
 
