@@ -23,6 +23,8 @@ function nativeSessionManager(): typeof import("@gajae-code/natives") {
 	return require("@gajae-code/natives") as typeof import("@gajae-code/natives");
 }
 const cwdTransitionAls = new AsyncLocalStorage<symbol>();
+type CwdReadLeaseContext = { active: boolean };
+const cwdReadLeaseAls = new AsyncLocalStorage<CwdReadLeaseContext>();
 const CWD_NOFOLLOW_OPEN_FLAGS =
 	fs.constants.O_RDONLY |
 	(typeof fs.constants.O_DIRECTORY === "number" ? fs.constants.O_DIRECTORY : 0) |
@@ -10549,6 +10551,12 @@ export class SessionManager {
 	 * acquisition stays authoritative until the lease is released.
 	 */
 	async runWithCwdReadLease<T>(fn: () => Promise<T>): Promise<T> {
+		const activeReadLease = cwdReadLeaseAls.getStore();
+		// Nested tool dispatch (for example eval -> tool bridge) inherits the
+		// outer lease's async context. Re-entering that lease must not wait behind
+		// a writer that is already queued: the writer is waiting for the outer
+		// lease, and waiting here would deadlock the session permanently.
+		if (activeReadLease?.active) return fn();
 		const owner = this.#cwdTransitionOwner;
 		// The writer's own async context already holds exclusive access; taking a
 		// read lease there would wait on itself.
@@ -10560,16 +10568,20 @@ export class SessionManager {
 			this.#cwdReadersDrained = resolve;
 		}
 		this.#cwdReaderCount += 1;
-		try {
-			return await fn();
-		} finally {
-			this.#cwdReaderCount -= 1;
-			if (this.#cwdReaderCount === 0) {
-				const drained = this.#cwdReadersDrained;
-				this.#cwdReadersDrained = undefined;
-				drained?.();
+		const readLease: CwdReadLeaseContext = { active: true };
+		return cwdReadLeaseAls.run(readLease, async () => {
+			try {
+				return await fn();
+			} finally {
+				readLease.active = false;
+				this.#cwdReaderCount -= 1;
+				if (this.#cwdReaderCount === 0) {
+					const drained = this.#cwdReadersDrained;
+					this.#cwdReadersDrained = undefined;
+					drained?.();
+				}
 			}
-		}
+		});
 	}
 
 	/** Wait for any in-flight exclusive cwd transition to settle. */

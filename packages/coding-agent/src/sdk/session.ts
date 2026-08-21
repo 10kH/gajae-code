@@ -1351,7 +1351,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let agent: Agent;
 	let session!: AgentSession;
+	let sessionManager!: SessionManager;
 	let hasSession = false;
+	let processCwdClaimed = false;
 	let hasRegistered = false;
 	let asyncJobManager: AsyncJobManager | undefined;
 	let asyncJobManagerAdmitted = false;
@@ -1475,7 +1477,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 		applyConfiguredSearchTimeout(settings);
 
-		const sessionManager =
+		sessionManager =
 			options.sessionManager ??
 			(await logger.time("sessionManager", async () => {
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
@@ -2184,8 +2186,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				agentsMdFiles: [],
 			});
 			workspaceTreePromise.catch(() => {});
-			session?.retireWorkspaceTreeForRescope();
-			await session?.refreshBaseSystemPrompt();
+			try {
+				session?.retireWorkspaceTreeForRescope();
+				await session?.refreshBaseSystemPrompt();
+			} catch (error) {
+				logger.warn("Committed session rescope could not refresh the post-move prompt", {
+					error: safeErrorForLog(error),
+					cwd: to,
+				});
+			}
 		};
 
 		const toolSession: ToolSession = {
@@ -2427,9 +2436,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										await applyRescopedReadState(sessionManager.getCwd());
 										try {
 											await session?.refreshSshTool({ activateIfAvailable: true });
-										} catch {
+										} catch (error) {
 											// Non-fatal: the session has moved; the SSH tool refreshes
 											// on its next activation attempt.
+											logger.warn("Committed session rescope could not refresh the SSH tool", {
+												error: safeErrorForLog(error),
+												cwd: sessionManager.getCwd(),
+											});
 										}
 										return { from, to: sessionManager.getCwd() };
 									} finally {
@@ -2572,7 +2585,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// the claim, so its rescope leaves process-global state (chdir,
 			// capabilities, plugin caches, browser tab cwd) untouched.
 			if (!isCanonicalSubSession && path.resolve(process.cwd()) === path.resolve(sessionManager.getCwd())) {
-				SessionManager.claimProcessCwdOwnership(sessionManager);
+				processCwdClaimed = SessionManager.claimProcessCwdOwnership(sessionManager);
 			}
 			if (asyncJobManager) {
 				// Register under the session endpoint so concurrent sessions'
@@ -4398,6 +4411,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cleanupDiagnostic: safeCleanupDiagnosticForLog(cleanupDiagnostic),
 			});
 		} finally {
+			if (processCwdClaimed) {
+				SessionManager.releaseProcessCwdOwnership(sessionManager);
+				processCwdClaimed = false;
+			}
 			releaseLocalProtocolOverride();
 			try {
 				closeOwnedAuthStorage();

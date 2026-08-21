@@ -595,6 +595,70 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	});
 
+	it("re-enters nested read leases while a writer is queued and releases after abort", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const outerEntered = Promise.withResolvers<void>();
+		const allowNested = Promise.withResolvers<void>();
+		const nestedEntered = Promise.withResolvers<void>();
+		const outer = sessionManager.runWithCwdReadLease(async () => {
+			outerEntered.resolve();
+			await allowNested.promise;
+			await expect(
+				sessionManager.runWithCwdReadLease(async () => {
+					nestedEntered.resolve();
+					throw new Error("nested tool aborted");
+				}),
+			).rejects.toThrow("nested tool aborted");
+		});
+		await outerEntered.promise;
+		const writer = sessionManager.runExclusiveCwdTransition(() => sessionManager.moveTo(repoB));
+		await Bun.sleep(20);
+		allowNested.resolve();
+		await nestedEntered.promise;
+		await outer;
+		await writer;
+		expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+		await sessionManager.close();
+	});
+
+	it("releases process-cwd ownership when construction fails before AgentSession", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = process.cwd();
+		const failedManager = SessionManager.inMemory(cwdA);
+		try {
+			await expect(
+				makeSession(cwdA, failedManager, {
+					agentDir: tempDir,
+					extensions: [
+						() => {
+							throw new Error("construction failed");
+						},
+					],
+				}),
+			).rejects.toThrow("construction failed");
+			expect(SessionManager.isProcessCwdOwner(failedManager)).toBe(false);
+			const replacementManager = SessionManager.inMemory(cwdA);
+			const { session } = await makeSession(cwdA, replacementManager, {
+				agentDir: tempDir,
+				toolNames: ["move_session"],
+			});
+			try {
+				expect(SessionManager.isProcessCwdOwner(replacementManager)).toBe(true);
+			} finally {
+				await session.dispose();
+			}
+			await replacementManager.close();
+		} finally {
+			await failedManager.close();
+		}
+	});
+
 	it("holds a cwd read lease across a tool's whole execution, not just its admission", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
@@ -853,6 +917,30 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			expect(textContent(result)).toContain("repo-b");
 			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
 			await expect(moveTool.execute("move-post-publication-retry", { path: "repo-b" })).rejects.toThrow(
+				/already been rescoped/,
+			);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("keeps a committed move successful when post-move prompt refresh throws", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			session.refreshBaseSystemPrompt = async () => {
+				throw new Error("post-move prompt refresh exploded");
+			};
+			const moveTool = session.getToolByName("move_session")!;
+			const result = await moveTool.execute("move-refresh-fail", { path: "repo-b" });
+			expect(textContent(result)).toContain("repo-b");
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+			await expect(moveTool.execute("move-refresh-retry", { path: "repo-b" })).rejects.toThrow(
 				/already been rescoped/,
 			);
 		} finally {
