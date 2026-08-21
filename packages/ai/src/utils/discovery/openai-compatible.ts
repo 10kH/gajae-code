@@ -5,6 +5,17 @@ import { toNumber } from "../../utils";
 
 const MODELS_PATH = "/models";
 const MAX_MODELS_RESPONSE_BYTES = 1_000_000;
+const MAX_CATALOG_MODEL_ID_LENGTH = 200;
+
+/** Catalog identities are rendered and used for routing; unsafe values are dropped, never rewritten. */
+export function isSafeCatalogModelId(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.trim().length > 0 &&
+		value.length <= MAX_CATALOG_MODEL_ID_LENGTH &&
+		!/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+	);
+}
 
 /**
  * Minimal OpenAI-style model entry shape consumed by discovery.
@@ -186,6 +197,9 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 
 	const deduped = new Map<string, Model<TApi>>();
 	for (const entry of entries) {
+		if (!isSafeCatalogModelId(entry.id)) {
+			continue;
+		}
 		const rawContextWindow = firstPositiveModelNumber(
 			UNK_CONTEXT_WINDOW,
 			entry.max_model_len,
@@ -211,7 +225,7 @@ export async function fetchOpenAICompatibleModels<TApi extends Api>(
 		};
 
 		const mapped = options.mapModel?.(entry, defaults, context) ?? defaults;
-		if (!mapped || typeof mapped.id !== "string" || mapped.id.length === 0) {
+		if (!mapped || !isSafeCatalogModelId(mapped.id)) {
 			continue;
 		}
 		if (options.filterModel && !options.filterModel(entry, mapped)) {
@@ -314,16 +328,17 @@ function extractModelEntriesFromNode(node: unknown): ParsedOpenAICompatibleModel
 }
 
 /**
- * First finite positive number among candidates, else the fallback.
+ * First positive safe integer among candidates, else the fallback.
  *
- * Rejects non-numbers, non-finite values (JSON `1e400` parses to
- * `Infinity`), zero, and negatives so a malformed catalog field can never
- * poison compaction thresholds or output budgets with `Infinity`.
+ * Rejects non-numbers, non-finite values (JSON `1e400` parses to `Infinity`),
+ * fractions, values outside the safe integer range, zero, and negatives so a
+ * malformed catalog field can never poison compaction thresholds or output
+ * budgets.
  */
 function firstPositiveModelNumber(fallback: number, ...candidates: readonly unknown[]): number {
 	for (const candidate of candidates) {
 		const value = toNumber(candidate);
-		if (value !== undefined && value > 0 && Number.isFinite(value)) {
+		if (value !== undefined && Number.isSafeInteger(value) && value > 0) {
 			return value;
 		}
 	}

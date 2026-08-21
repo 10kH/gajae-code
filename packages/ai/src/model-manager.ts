@@ -1,12 +1,26 @@
+import { sanitizeText } from "@gajae-code/utils";
 import { applyFinalCodexGpt56ContextCap } from "./context-cap-policy";
 import { insertModelCacheIfAbsent, readModelCache, updateModelCacheIfUnchanged, writeModelCache } from "./model-cache";
 import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
 import type { Api, Model, Provider } from "./types";
+import { isSafeCatalogModelId } from "./utils/discovery/openai-compatible";
 
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
+
+// Coalescing guards the implicit cold-start strategy only: an explicit
+// "online" refresh owns its fetch so a newer probe can always supersede an
+// older in-flight refresh (the registry pins that ordering), and callers never
+// block behind a refresh whose completion they may be expected to unblock.
+// A legacy or missing row has no dynamic-ID marker, so concurrent cold-start
+// resolutions would otherwise all fetch before the first one can publish it.
+const legacyDynamicRefreshes = new Map<string, Promise<void>>();
+
+function legacyDynamicRefreshKey(providerId: Provider, cacheDbPath: string | undefined, provenance: string): string {
+	return `${cacheDbPath ?? "<default>"}\0${providerId}\0${provenance}`;
+}
 
 /**
  * Controls when dynamic endpoint models should be fetched.
@@ -105,13 +119,14 @@ function passModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 			continue;
 		}
 		const candidate = item as { id?: unknown; provider?: unknown };
-		if (typeof candidate.id !== "string") {
+		if (!isSafeCatalogModelId(candidate.id)) {
 			continue;
 		}
 		if (typeof candidate.provider === "string" && isRetiredModelKey(candidate.provider, candidate.id)) {
 			continue;
 		}
-		out.push(enrichModelThinking(item as Model<TApi>));
+		const model = enrichModelThinking(item as Model<TApi>);
+		out.push({ ...model, name: sanitizeModelDisplayName(model.name, model.id) });
 	}
 	applyGeneratedModelPolicies(out as Model<Api>[]);
 	return applyFinalCodexGpt56ContextCap(out);
@@ -124,6 +139,42 @@ function passModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
  * Later sources override earlier ones by model id.
  */
 export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPayload = unknown>(
+	options: ModelManagerOptions<TApi, TModelsDevPayload>,
+	strategy: ModelRefreshStrategy = "online-if-uncached",
+): Promise<ModelResolutionResult<TApi>> {
+	const provenance = options.cacheDynamicModelProvenance;
+	const now = options.now ?? Date.now;
+	const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
+	const legacyCache = readModelCache<TApi>(options.providerId, ttlMs, now, options.cacheDbPath);
+	if (
+		strategy !== "online-if-uncached" ||
+		typeof options.fetchDynamicModels !== "function" ||
+		provenance === undefined ||
+		(legacyCache !== null && legacyCache.dynamicModelIds !== undefined)
+	) {
+		return resolveProviderModelsUncoalesced(options, strategy);
+	}
+
+	const refreshKey = legacyDynamicRefreshKey(options.providerId, options.cacheDbPath, provenance);
+	const inFlightRefresh = legacyDynamicRefreshes.get(refreshKey);
+	if (inFlightRefresh) {
+		await inFlightRefresh;
+		return resolveProviderModelsUncoalesced(options, strategy);
+	}
+
+	const refreshCompletion = Promise.withResolvers<void>();
+	legacyDynamicRefreshes.set(refreshKey, refreshCompletion.promise);
+	try {
+		return await resolveProviderModelsUncoalesced(options, strategy);
+	} finally {
+		if (legacyDynamicRefreshes.get(refreshKey) === refreshCompletion.promise) {
+			legacyDynamicRefreshes.delete(refreshKey);
+		}
+		refreshCompletion.resolve();
+	}
+}
+
+async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsDevPayload = unknown>(
 	options: ModelManagerOptions<TApi, TModelsDevPayload>,
 	strategy: ModelRefreshStrategy = "online-if-uncached",
 ): Promise<ModelResolutionResult<TApi>> {
@@ -144,10 +195,19 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const cacheProvenanceMismatch =
 		cache !== null &&
 		(cache.dynamicModelIds !== undefined ? !cacheDynamicModelIdsCurrent : requiresBoundDynamicCache);
+	// A provider that supplies cache provenance has opted into live-catalog
+	// authority. Rows written before that provider enabled discovery have no
+	// dynamic IDs, so they must be synchronized once rather than suppressing
+	// the first live fetch for their full TTL.
+	const cacheNeedsInitialDynamicRefresh =
+		hasDynamicFetcher &&
+		options.cacheDynamicModelProvenance !== undefined &&
+		!options.cacheDynamicModelProvenance.startsWith("gajae:non-cacheable-") &&
+		cache?.dynamicModelIds === undefined;
 	const hasAuthoritativeCache =
 		!hasDynamicFetcher ||
 		((cache?.authoritative ?? false) &&
-			(requiresBoundDynamicCache
+			(!cacheNeedsInitialDynamicRefresh && requiresBoundDynamicCache
 				? cacheDynamicModelIdsCurrent
 				: cache?.dynamicModelIds === undefined || cacheDynamicModelIdsCurrent));
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
@@ -160,7 +220,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 		// models in a bound context, and is non-authoritative — so its refetch
 		// cadence follows the standard non-authoritative retry backoff instead
 		// of hammering a failing endpoint on every provider-tab visit.
-		cacheProvenanceMismatch && cache?.dynamicModelIds !== undefined && strategy !== "offline"
+		(cacheNeedsInitialDynamicRefresh || (cacheProvenanceMismatch && cache?.dynamicModelIds !== undefined)) &&
+		strategy !== "offline"
 			? true
 			: shouldFetchRemoteSources(strategy, cache?.fresh ?? false, hasAuthoritativeCache, cacheAgeMs);
 	const staticFingerprint = fingerprintStatic(staticModels);
@@ -268,6 +329,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				latestCache,
 				options.cacheDynamicModelProvenance,
 			);
+			const latestCacheIsLegacy =
+				cache?.dynamicModelIds === undefined && latestCache !== null && latestCache.dynamicModelIds === undefined;
 			const fallbackCacheModels = latestCacheMatchesCurrentContext
 				? normalizeModelList<TApi>(latestCache.models)
 				: [];
@@ -276,7 +339,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				const snapshotModels = applyFinalCodexGpt56ContextCap(
 					mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
 				);
-				if (latestCacheMatchesCurrentContext) {
+				if (latestCacheMatchesCurrentContext || latestCacheIsLegacy) {
 					const updated = updateModelCacheIfUnchanged(
 						options.providerId,
 						latestCache.updatedAt,
@@ -288,6 +351,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 						false,
 						staticFingerprint,
 						dbPath,
+						options.cacheDynamicModelProvenance === undefined ? undefined : [],
+						options.cacheDynamicModelProvenance,
 					);
 					if (!updated) cacheModels = [];
 				} else if (latestCache == null) {
@@ -298,6 +363,8 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 						false,
 						staticFingerprint,
 						dbPath,
+						options.cacheDynamicModelProvenance === undefined ? undefined : [],
+						options.cacheDynamicModelProvenance,
 					);
 					if (!inserted) cacheModels = [];
 				}
@@ -494,7 +561,10 @@ function mergeDynamicModel<TApi extends Api>(existingModel: Model<TApi>, dynamic
 		...dynamicModel,
 		api: existingModel.api,
 		baseUrl,
-		name: preferDiscoveryName(dynamicModel.name, existingModel.name, dynamicModel.id),
+		name: sanitizeModelDisplayName(
+			preferDiscoveryName(dynamicModel.name, existingModel.name, dynamicModel.id),
+			dynamicModel.id,
+		),
 		reasoning: existingModel.reasoning || dynamicModel.reasoning,
 		input: supportsImage ? ["text", "image"] : ["text"],
 		cost: {
@@ -532,6 +602,15 @@ function preferDiscoveryName(discoveryName: string, fallbackName: string, modelI
 	return normalizedDiscoveryName;
 }
 
+const MODEL_DISPLAY_NAME_MAX_LENGTH = 200;
+
+function sanitizeModelDisplayName(name: string, modelId: string): string {
+	const sanitizedName = sanitizeText(name).replace(/\s+/g, " ").trim().slice(0, MODEL_DISPLAY_NAME_MAX_LENGTH);
+	if (sanitizedName.length > 0) return sanitizedName;
+	const sanitizedId = sanitizeText(modelId).replace(/\s+/g, " ").trim().slice(0, MODEL_DISPLAY_NAME_MAX_LENGTH);
+	return sanitizedId || "Unnamed model";
+}
+
 function preferDiscoveryLimit(discoveryLimit: number, fallbackLimit: number): number {
 	if (!Number.isFinite(discoveryLimit) || discoveryLimit <= 0) {
 		return fallbackLimit;
@@ -551,7 +630,7 @@ function normalizeModelList<TApi extends Api>(value: unknown): Model<TApi>[] {
 		if (isModelLike(item) && !isRetiredModel(item)) {
 			const model = enrichModelThinking(item as Model<TApi>);
 			model.longContextPricing = undefined;
-			models.push(model);
+			models.push({ ...model, name: sanitizeModelDisplayName(model.name, model.id) });
 		}
 	}
 	applyGeneratedModelPolicies(models as Model<Api>[]);
@@ -574,7 +653,7 @@ function isModelLike(value: unknown): value is Model<Api> {
 		contextWindow?: unknown;
 		maxTokens?: unknown;
 	};
-	if (typeof v.id !== "string" || v.id.length === 0) {
+	if (!isSafeCatalogModelId(v.id)) {
 		return false;
 	}
 	if (typeof v.name !== "string" || v.name.length === 0) {

@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
-import { fetchOpenAICompatibleModels, resolveLoopbackOpenAIBaseUrl } from "../src/utils/discovery/openai-compatible";
+import {
+	fetchOpenAICompatibleModels,
+	isSafeCatalogModelId,
+	resolveLoopbackOpenAIBaseUrl,
+} from "../src/utils/discovery/openai-compatible";
 
 const originalFetch = global.fetch;
 
@@ -27,6 +31,26 @@ const options = {
 };
 
 describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () => {
+	it("drops unsafe raw and mapped catalog identities instead of renaming them", async () => {
+		respondWithModels([
+			{ id: "safe-model" },
+			{ id: "\u001b[31munsafe-model" },
+			{ id: "mapped-source" },
+			{ id: "   " },
+			{ id: "x".repeat(201) },
+		]);
+
+		const models = await fetchOpenAICompatibleModels({
+			...options,
+			mapModel: (entry, defaults) =>
+				entry.id === "mapped-source" ? { ...defaults, id: "\u001b[mapped" } : defaults,
+		});
+
+		expect(models?.map(model => model.id)).toEqual(["safe-model"]);
+		expect(isSafeCatalogModelId("safe-model")).toBe(true);
+		expect(isSafeCatalogModelId("\u001b[31munsafe-model")).toBe(false);
+	});
+
 	it("parses max_model_len for contextWindow from OpenAI-compatible /v1/models response", async () => {
 		respondWithModels([
 			{

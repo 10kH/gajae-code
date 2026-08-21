@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 
 import { AuthStorage, SqliteAuthCredentialStore } from "../src/auth-storage";
 import { getBundledModel } from "../src/models";
@@ -10,6 +11,7 @@ import {
 	buildAnthropicClientOptions,
 	buildAnthropicHeaders,
 	buildZCodeSourceHeaders,
+	resolveGlmZcodeAnthropicBaseUrl,
 } from "../src/providers/anthropic";
 import { isOAuthToken } from "../src/utils/anthropic-auth";
 import { getOAuthProviders, refreshOAuthToken } from "../src/utils/oauth";
@@ -348,6 +350,109 @@ describe("GLM ZCode OAuth login provider", () => {
 			expect(models?.find(model => model.id === "glm-5.3")?.name).toBe("GLM-5.3 Erase-Line");
 			// A name that sanitizes to empty falls back to the bundled reference name.
 			expect(models?.find(model => model.id === "glm-5.2")?.name).toBe("GLM-5.2");
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it("sanitizes and bounds names for unbundled catalog models", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					data: [{ id: "glm-future", name: `\u001b]0;pwned\u0007GLM Future\n${"x".repeat(300)}` }],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			)) as unknown as typeof fetch;
+		try {
+			const discovered = (await fetchDynamicModels())?.find(model => model.id === "glm-future");
+			expect(discovered?.name).toStartWith("GLM Future ");
+			expect(discovered?.name).toHaveLength(200);
+			expect(discovered?.name).toMatch(/^[^\x00-\x1f\x7f]*$/);
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it("uses the configured trusted GLM endpoint for discovery and requests", async () => {
+		await withEnv({ ZCODE_PLAN_ANTHROPIC_BASE_URL: "https://zai-gateway.example.test/anthropic/" }, async () => {
+			const requests: string[] = [];
+			const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+			const fetchDynamicModels = options.fetchDynamicModels;
+			if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+			const originalFetch = global.fetch;
+			global.fetch = (async (input: string | URL | Request) => {
+				requests.push(String(input));
+				return new Response(JSON.stringify({ data: [{ id: "glm-5.2" }] }), {
+					headers: { "Content-Type": "application/json" },
+				});
+			}) as typeof fetch;
+			try {
+				const models = await fetchDynamicModels();
+				expect(models?.[0]?.baseUrl).toBe("https://zai-gateway.example.test/anthropic");
+				expect(requests).toEqual(["https://zai-gateway.example.test/anthropic/v1/models"]);
+				const model = getBundledModel("glm-zcode", "glm-5.2") as Parameters<
+					typeof buildAnthropicClientOptions
+				>[0]["model"];
+				expect(buildAnthropicClientOptions({ model, apiKey: MINTED_KEY }).baseURL).toBe(
+					"https://zai-gateway.example.test/anthropic",
+				);
+			} finally {
+				global.fetch = originalFetch;
+			}
+		});
+	});
+
+	it("falls back from hostile GLM endpoint values", async () => {
+		for (const value of [
+			"http://evil.example.test/anthropic",
+			"javascript:alert(1)",
+			"https://user:password@evil.example.test/anthropic",
+			"https://evil.example.test/anthropic?token=secret",
+			"https://evil.example.test/anthropic#fragment",
+			"https://evil.example.test/a\nX: y",
+		] as const) {
+			await withEnv({ ZCODE_PLAN_ANTHROPIC_BASE_URL: value }, async () => {
+				expect(resolveGlmZcodeAnthropicBaseUrl()).toBe(GLM_ZCODE_ANTHROPIC_BASE_URL);
+			});
+		}
+	});
+
+	it("bounds hostile unbundled IDs and metadata", async () => {
+		const options = glmZcodeModelManagerOptions({ apiKey: MINTED_KEY });
+		const fetchDynamicModels = options.fetchDynamicModels;
+		if (!fetchDynamicModels) throw new Error("GLM ZCode discovery is not configured");
+		const originalFetch = global.fetch;
+		global.fetch = (async () =>
+			new Response(
+				JSON.stringify({
+					data: [
+						{
+							id: "glm-\u001b[31mfuture",
+							name: "\u0000\u007f",
+							context_length: 1e308,
+							max_tokens: 1e308,
+						},
+						{
+							id: "glm-safe-future",
+							name: "\u0000\u007f",
+							context_length: 1e308,
+							max_tokens: 1e308,
+						},
+					],
+				}),
+				{ headers: { "Content-Type": "application/json" } },
+			)) as unknown as typeof fetch;
+		try {
+			const discovered = await fetchDynamicModels();
+			expect(discovered?.map(model => model.id)).toEqual(["glm-safe-future"]);
+			expect(discovered?.[0]?.name).toBe("glm-safe-future");
+			expect(discovered?.[0]?.name).not.toMatch(/[\x00-\x1f\x7f]/);
+			expect(discovered?.[0]?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+			expect(discovered?.[0]?.maxTokens).toBe(UNK_MAX_TOKENS);
 		} finally {
 			global.fetch = originalFetch;
 		}
