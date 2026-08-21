@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+
 ### Added
 
 - Added an SDK `automationTools` option for host-owned `browser` and `computer` implementations. External automation retains built-in activation and provenance, receives the normal abort signal, works independently of the default browser/platform gates, and fails closed on custom, extension, or MCP name collisions (#4809).
@@ -11,6 +12,10 @@
 - Workflow handoffs out of autoresearch now transit properly: `/skill:deep-interview`, `/skill:ralplan`, and `/skill:ultragoal` chain from any live autoresearch phase (`intake`/`research`/`verdict`), and ralplan's `final` phase chains via its manifest terminal states; ralplan/ultragoal live phases still require the explicit write-to-handoff step. `gjc autoresearch clear` remains the finalize-only exit.
 - Breaking: autoresearch spec intake is now the explicit `intake` verb (`gjc autoresearch intake --spec <path>`; the bare `--spec` flag form still works). The ambiguous `handoff` verb token is rejected with disambiguation hints instead of silently becoming a cold-intake goal — workflow handoff lives at `/skill:<callee>` (or `gjc state autoresearch handoff --to <callee>`).
 - Subagents now start correctly on Bun 1.4 when extension tools provide custom renderers. `RegisteredToolAdapter` installs its renderer adapters before proxying the definition, avoiding a write through the proxy's getter-only property while preserving the no-renderer fallback path.
+
+### Fixed
+
+- `/logout` (and `gjc accounts logout`) now remove stored API-key credentials, not just OAuth rows. The interactive logout and the CLI only enumerated `oauth` inventory, so API-key logins (OpenCode Go/Zen, Cursor, Venice, DeepSeek, …) were rejected with `API-key credentials are not managed here`; both paths now remove stored credentials of either kind.
 - Queued SDK prompts now retain their dispatch-time ownership across selection fences instead of reclassifying from a contradictory later streaming snapshot. Fresh promotion, earlier follow-up ordering, and terminal-abort cancellation are reachable again, while `/btw` test fixtures now model the user-drainable queue count required by the current empty-submit contract.
 - Coordinator stop and idle-reap now initialize canonical namespace state before reading durable deletion recovery. Fresh or upgraded projection-only sessions were misreported as `state_corrupt` before the broker close was attempted, and completed deletion receipts were excluded from the idempotent missing-session lookup; both paths now preserve strict malformed-state rejection while allowing safe cleanup and replay.
 - Fixed provider safety-stop classification being lost before session persistence (#4777). The managed provider-envelope boundary now preserves only the allowlisted `provider_safety_stop` kind, typed safety stops remain terminal even with transport facts on a multi-model fallback chain, and the regression e2e test is selected both by the focused affected-path route and exactly one normal coding-agent shard.

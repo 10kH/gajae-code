@@ -6159,9 +6159,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			provider === undefined
 				? (this.#listAllStmt.all() as AuthRow[])
 				: (this.#listAllByProviderStmt.all(provider) as AuthRow[]);
-		return rows
-			.filter(row => row.credential_type === "oauth")
-			.map(row => ({ id: row.id, provider: row.provider, expectedRevision: row.revision }));
+		return rows.map(row => ({ id: row.id, provider: row.provider, expectedRevision: row.revision }));
 	}
 	removeAuthCredentialsHard(
 		provider: string,
@@ -6179,7 +6177,6 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 				if (
 					!row ||
 					row.provider !== provider ||
-					row.credential_type !== "oauth" ||
 					row.revision !== target.expectedRevision
 				) {
 					currentIds.push(row?.id ?? target.id);

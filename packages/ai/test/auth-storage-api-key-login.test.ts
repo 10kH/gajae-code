@@ -151,4 +151,24 @@ describe("AuthStorage api-key login replacement", () => {
 		expect(stored.credential.key).toBe("or-test-key");
 		expect(await authStorage.getApiKey("openrouter", "session-openrouter")).toBe("or-test-key");
 	});
+
+	it("lists api-key credentials as removal targets and hard-removes them (logout)", async () => {
+		if (!store || !authStorage || !dbPath) throw new Error("test setup failed");
+
+		loginOpenRouterSpy.mockResolvedValueOnce("or-test-key");
+		await authStorage.login("openrouter", { onAuth: () => {}, onPrompt: async () => "" });
+		expect(countCredentialRows(dbPath, "openrouter")).toBe(1);
+
+		const targets = store.listCredentialRemovalTargets("openrouter");
+		expect(targets).toHaveLength(1);
+		expect(targets[0]?.provider).toBe("openrouter");
+
+		const result = store.removeAuthCredentialsHard(
+			"openrouter",
+			targets.map(target => ({ id: target.id, provider: "openrouter", expectedRevision: target.expectedRevision })),
+		);
+		expect(result.kind).toBe("removed");
+		expect(countCredentialRows(dbPath, "openrouter")).toBe(0);
+		expect(store.getApiKey("openrouter")).toBeNull();
+	});
 });
