@@ -834,6 +834,32 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 		}
 	});
 
+	it("reports a committed move when final move metadata fails after publication", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const originalMoveTo = sessionManager.moveTo.bind(sessionManager);
+			sessionManager.moveTo = async (newCwd, options) => {
+				await originalMoveTo(newCwd, options);
+				throw new Error("post-publication metadata exploded");
+			};
+			const moveTool = session.getToolByName("move_session")!;
+			const result = await moveTool.execute("move-post-publication-fail", { path: "repo-b" });
+			expect(textContent(result)).toContain("repo-b");
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+			await expect(moveTool.execute("move-post-publication-retry", { path: "repo-b" })).rejects.toThrow(
+				/already been rescoped/,
+			);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("re-roots project context files and the workspace tree at the new cwd", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
 		tempDirs.push(tempDir);
