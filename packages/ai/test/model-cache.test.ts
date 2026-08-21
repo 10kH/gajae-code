@@ -3,7 +3,13 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { closeModelCache, readModelCache, updateModelCacheIfUnchanged, writeModelCache } from "../src/model-cache";
+import {
+	closeModelCache,
+	insertModelCacheIfAbsent,
+	readModelCache,
+	updateModelCacheIfUnchanged,
+	writeModelCache,
+} from "../src/model-cache";
 import type { Model } from "../src/types";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
@@ -203,6 +209,44 @@ describe("model cache migrations", () => {
 		expect(
 			readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => observedAt, dbPath)?.models[0]?.name,
 		).toBe("Concurrent B");
+	});
+
+	it("inserts a cache row only when the provider is absent", () => {
+		const insertedAt = 1_700_000_000_000;
+		const tombstone = createModel("tombstone", "Tombstone");
+		const writer = createModel("writer", "Writer");
+
+		expect(insertModelCacheIfAbsent("ollama-cloud", insertedAt, [tombstone], false, "static-tombstone", dbPath)).toBe(
+			true,
+		);
+		expect(readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => insertedAt, dbPath)).toMatchObject({
+			authoritative: false,
+			updatedAt: insertedAt,
+			staticFingerprint: "static-tombstone",
+			models: [expect.objectContaining({ id: "tombstone" })],
+		});
+
+		writeModelCache(
+			"ollama-cloud",
+			insertedAt + 1,
+			[writer],
+			true,
+			"static-writer",
+			dbPath,
+			["writer"],
+			"provenance-w",
+		);
+		expect(
+			insertModelCacheIfAbsent("ollama-cloud", insertedAt + 2, [tombstone], false, "static-tombstone", dbPath),
+		).toBe(false);
+		expect(readModelCache<"openai-completions">("ollama-cloud", TTL_MS, () => insertedAt + 1, dbPath)).toMatchObject({
+			authoritative: true,
+			updatedAt: insertedAt + 1,
+			staticFingerprint: "static-writer",
+			dynamicModelIds: ["writer"],
+			dynamicModelProvenance: "provenance-w",
+			models: [expect.objectContaining({ id: "writer" })],
+		});
 	});
 
 	it("closes only the exact shared database owner before root removal", async () => {

@@ -157,6 +157,38 @@ export function writeModelCache<TApi extends Api>(
 	}
 }
 
+export function insertModelCacheIfAbsent<TApi extends Api>(
+	providerId: string,
+	updatedAt: number,
+	models: Model<TApi>[],
+	authoritative: boolean,
+	staticFingerprint: string,
+	dbPath?: string,
+	dynamicModelIds?: readonly string[],
+	dynamicModelProvenance?: string,
+): boolean {
+	try {
+		const result = getDb(dbPath).run(
+			`INSERT INTO model_cache (provider_id, version, updated_at, authoritative, static_fingerprint, dynamic_model_ids, dynamic_model_provenance, models)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(provider_id) DO NOTHING`,
+			[
+				providerId,
+				CACHE_SCHEMA_VERSION,
+				updatedAt,
+				authoritative ? 1 : 0,
+				staticFingerprint,
+				dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds),
+				dynamicModelProvenance ?? null,
+				JSON.stringify(models),
+			],
+		);
+		return result.changes === 1;
+	} catch {
+		return false;
+	}
+}
+
 export function updateModelCacheIfUnchanged<TApi extends Api>(
 	providerId: string,
 	expectedUpdatedAt: number,

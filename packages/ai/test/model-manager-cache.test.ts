@@ -423,6 +423,37 @@ describe("online-if-uncached model refresh", () => {
 		expect(cache?.models.map(entry => entry.id)).toEqual(["static", "dynamic-b"]);
 	});
 
+	test("inserts a non-authoritative tombstone when a failed fetch has no cache row", async () => {
+		for (const staticIds of [[], ["static"]] as const) {
+			const providerId = `cache-failed-fetch-missing-row-tombstone-${staticIds.length === 0 ? "empty" : "static"}`;
+			const staticModels = staticIds.map(id => model(providerId, id));
+			const now = 1_700_000_000_000;
+
+			expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toBeNull();
+
+			const result = await resolveProviderModels<Api>(
+				{
+					providerId,
+					staticModels,
+					cacheDbPath,
+					now: () => now,
+					fetchDynamicModels: async () => null,
+				},
+				"online",
+			);
+
+			expect(result.models.map(entry => entry.id)).toEqual([...staticIds]);
+			expect(result.dynamicModelIds).toBeUndefined();
+			expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toMatchObject({
+				authoritative: false,
+				updatedAt: now,
+				dynamicModelIds: undefined,
+				dynamicModelProvenance: undefined,
+				models: staticIds.map(id => expect.objectContaining({ id })),
+			});
+		}
+	});
+
 	test("fails closed when a failed fetch re-reads a same-provenance row with inconsistent or absent dynamic IDs", async () => {
 		for (const inconsistentIds of [undefined, ["dynamic-a"]] as const) {
 			const providerId = `cache-failed-fetch-inconsistent-ids-${inconsistentIds === undefined ? "absent" : "mismatch"}`;

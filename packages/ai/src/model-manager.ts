@@ -1,5 +1,5 @@
 import { applyFinalCodexGpt56ContextCap } from "./context-cap-policy";
-import { readModelCache, updateModelCacheIfUnchanged, writeModelCache } from "./model-cache";
+import { insertModelCacheIfAbsent, readModelCache, updateModelCacheIfUnchanged, writeModelCache } from "./model-cache";
 import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
@@ -264,22 +264,35 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				? normalizeModelList<TApi>(latestCache.models)
 				: [];
 			cacheModels = fallbackCacheModels;
-			if ((options.canPublishCache?.() ?? true) && latestCacheMatchesCurrentContext) {
-				const updated = updateModelCacheIfUnchanged(
-					options.providerId,
-					latestCache.updatedAt,
-					latestCache.dynamicModelIds,
-					latestCache.dynamicModelProvenance,
-					latestCache.models,
-					now(),
-					applyFinalCodexGpt56ContextCap(
-						mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
-					),
-					false,
-					staticFingerprint,
-					dbPath,
+			if (options.canPublishCache?.() ?? true) {
+				const snapshotModels = applyFinalCodexGpt56ContextCap(
+					mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
 				);
-				if (!updated) cacheModels = [];
+				if (latestCacheMatchesCurrentContext) {
+					const updated = updateModelCacheIfUnchanged(
+						options.providerId,
+						latestCache.updatedAt,
+						latestCache.dynamicModelIds,
+						latestCache.dynamicModelProvenance,
+						latestCache.models,
+						now(),
+						snapshotModels,
+						false,
+						staticFingerprint,
+						dbPath,
+					);
+					if (!updated) cacheModels = [];
+				} else if (latestCache == null) {
+					const inserted = insertModelCacheIfAbsent(
+						options.providerId,
+						now(),
+						snapshotModels,
+						false,
+						staticFingerprint,
+						dbPath,
+					);
+					if (!inserted) cacheModels = [];
+				}
 			}
 		}
 	}
