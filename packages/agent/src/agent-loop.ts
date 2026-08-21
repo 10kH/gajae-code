@@ -129,13 +129,14 @@ function clampedStagedCap(
 	// Resolve from TRUSTED environment sources only ($credentialEnv excludes the
 	// caller's cwd/.env overlay): these knobs ARE a defensive resource guard, so
 	// a repository-controlled .env must not be able to weaken (or tighten into
-	// failure) the staging bound. Values must be positive integers (digits
-	// only); anything else falls back to the default. Any digits-only positive
+	// failure) the staging bound. Values must be positive integers (digits only
+	// after the trusted resolver's surrounding-whitespace normalization);
+	// anything else falls back to the default. Any digits-only positive
 	// decimal that is at or below the ceiling is honored verbatim, and any
 	// digits-only positive decimal above the ceiling — including ones beyond
 	// Number.MAX_SAFE_INTEGER, which a numeric parse would misclassify — clamps
 	// to the ceiling with a warning, exactly as documented.
-	const raw = $credentialEnv(name);
+	const raw = $credentialEnv(name)?.trim();
 	if (raw === undefined) return fallback;
 	if (parsePositiveEnvInt(raw) !== undefined) {
 		const parsed = parsePositiveEnvInt(raw)!;
@@ -157,16 +158,14 @@ function clampedStagedCap(
 }
 
 function parsePositiveEnvInt(raw: string): number | undefined {
-	const trimmed = raw.trim();
-	if (!trimmed || !/^\d+$/.test(trimmed)) return undefined;
-	const parsed = Number(trimmed);
+	if (!raw || !/^\d+$/.test(raw)) return undefined;
+	const parsed = Number(raw);
 	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 /** True when the value is a digits-only positive decimal string (no sign). */
 function isPositiveDecimalDigits(raw: string): boolean {
-	const trimmed = raw.trim();
-	return trimmed.length > 0 && /^\d+$/.test(trimmed) && trimmed.replace(/^0+/, "") !== "";
+	return raw.length > 0 && /^\d+$/.test(raw) && raw.replace(/^0+/, "") !== "";
 }
 
 /**
@@ -175,7 +174,7 @@ function isPositiveDecimalDigits(raw: string): boolean {
  * length first, then digit by digit.
  */
 function decimalAtLeast(raw: string, threshold: number): boolean {
-	const digits = raw.trim().replace(/^0+/, "");
+	const digits = raw.replace(/^0+/, "");
 	const thresholdDigits = String(threshold).replace(/^0+/, "");
 	if (digits.length !== thresholdDigits.length) return digits.length > thresholdDigits.length;
 	return digits >= thresholdDigits;
@@ -187,7 +186,8 @@ function decimalAtLeast(raw: string, threshold: number): boolean {
  * `MANAGED_ATTEMPT_MAX_STAGED_EVENTS`, ceiling
  * `MANAGED_ATTEMPT_STAGED_EVENTS_CEILING`). Read once per transaction so
  * operators can raise the cap without a rebuild and tests can exercise the
- * knob in-process. Values must be positive integers (digits only); invalid or
+ * knob in-process. Values must be positive integers after the trusted
+ * resolver ignores surrounding whitespace; invalid or
  * non-positive values fall back to the default, and values above the ceiling
  * clamp to it with a warning.
  *
@@ -206,7 +206,8 @@ export function managedAttemptMaxStagedEvents(): number {
  * rejected. Configurable via `GJC_FALLBACK_MAX_STAGED_BYTES` (default
  * `MANAGED_ATTEMPT_MAX_STAGED_BYTES`, ceiling
  * `MANAGED_ATTEMPT_STAGED_BYTES_CEILING`). Read once per transaction; values
- * must be positive integers (digits only), anything else falls back to the
+ * must be positive integers after the trusted resolver ignores surrounding
+ * whitespace, anything else falls back to the
  * default, and values above the ceiling clamp to it with a warning.
  *
  * @internal
@@ -1159,15 +1160,11 @@ const MANAGED_SIZE_SENTINEL = Symbol("gjc.managed-staging-size-exceeded");
 
 /**
  * Pre-allocation size guard: reports whether serializing `value` as JSON would
- * exceed `limit` bytes WITHOUT materializing the full JSON string or its UTF-8
- * encoding. A `JSON.stringify` replacer counts bytes per chunk and throws the
- * size sentinel as soon as the running total crosses the limit; the throw
- * unwinds the walk immediately, so the transient cost stays at one chunk at a
- * time and never approaches the full serialized size.
- *
- * Byte accounting uses the TextEncoder on string chunks (UTF-8 bytes, not
- * UTF-16 code units) so non-ASCII content is not undercounted. Object keys are
- * counted too, keeping the estimate a strict lower bound on the final size.
+ * exceed `limit` bytes WITHOUT materializing the full JSON string or cloning
+ * the value. This walks the JSON surface directly and charges every token,
+ * including quotes, escapes, separators, delimiters, nulls, and array holes.
+ * Strings are counted by code point, so a large string never needs a second
+ * full-size escaped copy just to measure it.
  *
  * Returns "over" when the limit would be exceeded, "under" when it definitely
  * is not, and "unknown" when the value cannot be serialized at all (cyclic or
@@ -1176,35 +1173,110 @@ const MANAGED_SIZE_SENTINEL = Symbol("gjc.managed-staging-size-exceeded");
  */
 function managedSnapshotExceedsBytes(value: unknown, limit: number): "over" | "under" | "unknown" {
 	let seen = 0;
-	const add = (n: number): void => {
-		seen += n;
+	const add = (bytes: number): void => {
+		seen += bytes;
 		if (seen > limit) throw MANAGED_SIZE_SENTINEL;
 	};
-	try {
-		const json = JSON.stringify(value, (key: string, chunk: unknown) => {
-			// Keys arrive through the replacer's key argument; count each key
-			// with its quotes and the following colon/separator.
-			if (key !== "") add(managedAttemptTextEncoder.encode(key).byteLength + 3);
-			if (typeof chunk === "string") {
-				add(managedAttemptTextEncoder.encode(chunk).byteLength + 2);
-			} else if (typeof chunk === "number" || typeof chunk === "boolean") {
-				add(String(chunk).length);
-			} else if (typeof chunk === "bigint") {
-				// BigInt is not JSON-serializable without toJSON; report unknown
-				// so the caller falls back to the exact measurement path.
-				throw MANAGED_SIZE_SENTINEL;
-			}
-			// Objects/arrays contribute delimiters; their contents are visited
-			// recursively by stringify itself and counted chunk by chunk.
-			return chunk;
-		});
-		if (json === undefined) return "unknown";
-		// Completed within the limit: the walk's chunk accounting under-counts
-		// structural bytes, so when the walk got close to the boundary, confirm
-		// with the exact size.
-		if (seen * 2 >= limit) {
-			return (managedSnapshotJsonBytes(value) ?? 0) > limit ? "over" : "under";
+	const addString = (text: string): void => {
+		add(1);
+		for (let index = 0; index < text.length; ) {
+			const codePoint = text.codePointAt(index);
+			if (codePoint === undefined) throw new Error("missing string code point");
+			if (codePoint === 0x22 || codePoint === 0x5c) add(2);
+			else if (
+				codePoint === 0x08 ||
+				codePoint === 0x09 ||
+				codePoint === 0x0a ||
+				codePoint === 0x0c ||
+				codePoint === 0x0d
+			)
+				add(2);
+			else if (codePoint <= 0x1f) add(6);
+			else if (codePoint <= 0x7f) add(1);
+			else if (codePoint <= 0x7ff) add(2);
+			else if (codePoint <= 0xffff) add(3);
+			else add(4);
+			index += codePoint > 0xffff ? 2 : 1;
 		}
+		add(1);
+	};
+	const seenObjects = new WeakSet<object>();
+	const prepare = (input: unknown, key: string): { omitted: boolean; value?: unknown } => {
+		if ((typeof input !== "object" || input === null) && typeof input !== "function") {
+			return { omitted: false, value: input };
+		}
+		try {
+			const toJSON = (input as { toJSON?: unknown }).toJSON;
+			const value = typeof toJSON === "function" ? toJSON.call(input, key) : input;
+			return {
+				omitted: value === undefined || typeof value === "function" || typeof value === "symbol",
+				value,
+			};
+		} catch {
+			throw new Error("JSON toJSON failed");
+		}
+	};
+	const walkPrepared = (input: unknown, inArray: boolean): boolean => {
+		if (input === null) {
+			add(4);
+			return true;
+		}
+		if (input === undefined || typeof input === "function" || typeof input === "symbol") {
+			if (inArray) add(4);
+			return inArray;
+		}
+		if (typeof input === "string") {
+			addString(input);
+			return true;
+		}
+		if (typeof input === "boolean") {
+			add(input ? 4 : 5);
+			return true;
+		}
+		if (typeof input === "number") {
+			const encoded = JSON.stringify(input);
+			if (encoded === undefined) throw new Error("JSON number failed");
+			add(managedAttemptTextEncoder.encode(encoded).byteLength);
+			return true;
+		}
+		if (typeof input === "bigint") throw new Error("JSON bigint failed");
+		if (typeof input !== "object") throw new Error("JSON value failed");
+		if (seenObjects.has(input)) throw new Error("JSON cycle detected");
+		seenObjects.add(input);
+		try {
+			if (Array.isArray(input)) {
+				add(1);
+				for (let index = 0; index < input.length; index++) {
+					if (index > 0) add(1);
+					const prepared = prepare(input[index], String(index));
+					if (prepared.omitted) add(4);
+					else walkPrepared(prepared.value, true);
+				}
+				add(1);
+				return true;
+			}
+			add(1);
+			let emitted = 0;
+			const record = input as Record<string, unknown>;
+			for (const property of Object.keys(input)) {
+				const prepared = prepare(record[property], property);
+				if (prepared.omitted) continue;
+				if (emitted > 0) add(1);
+				emitted++;
+				addString(property);
+				add(1);
+				walkPrepared(prepared.value, false);
+			}
+			add(1);
+			return true;
+		} finally {
+			seenObjects.delete(input);
+		}
+	};
+	try {
+		const prepared = prepare(value, "");
+		if (prepared.omitted) return "unknown";
+		walkPrepared(prepared.value, false);
 		return "under";
 	} catch (error) {
 		if (error === MANAGED_SIZE_SENTINEL) return "over";
@@ -1994,6 +2066,12 @@ class ManagedAttemptTransaction {
 	#stage(event: AgentEvent): void {
 		if (this.snapshotMode === "lossless") {
 			const snapshot = this.#repairAssistantEvent(event);
+			const rawExcess = managedSnapshotExceedsBytes(snapshot, this.#maxStagedBytes - this.#stagedBytes);
+			if (rawExcess === "over") {
+				this.flush();
+				this.push(event);
+				return;
+			}
 			let rawBytes: number | undefined;
 			try {
 				rawBytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
@@ -2029,19 +2107,11 @@ class ManagedAttemptTransaction {
 			this.#stagedBytes += detachedBytes;
 			return;
 		}
-		// Measure the raw event FIRST so an oversized payload is rejected
-		// before the snapshot duplicates it — the staged-byte cap exists to
-		// bound memory, so cloning ahead of the check would defeat it.
-		// Cyclic/JSON-hostile events cannot be pre-measured; only those fall
-		// through to snapshot-then-measure, where the sanitized detached form
-		// is the cycle-safe estimator.
-		let bytes: number | undefined;
-		try {
-			bytes = managedAttemptTextEncoder.encode(JSON.stringify(event)).byteLength;
-		} catch {
-			bytes = undefined;
-		}
-		if (bytes !== undefined && this.#wouldOverflow(bytes)) {
+		// Walk the raw event FIRST so an oversized payload is rejected before the
+		// managed snapshot duplicates it. Cyclic/JSON-hostile events fall through
+		// to the sanitized detached form below, which is the cycle-safe estimator.
+		const rawExcess = managedSnapshotExceedsBytes(event, this.#maxStagedBytes - this.#stagedBytes);
+		if (rawExcess === "over") {
 			// A long turn reaches the cap through accumulated streaming increments,
 			// not through one oversized payload. Reclaim the superseded increments
 			// first; only a batch that still cannot fit is a real local overflow.
@@ -2049,11 +2119,11 @@ class ManagedAttemptTransaction {
 			// volume that still cannot fit even after reclamation), because #4610
 			// made the pre-compaction shape describe deltas it already reclaimed.
 			this.#compactSupersededFrames();
-			if (this.#wouldOverflow(bytes)) {
+			if (managedSnapshotExceedsBytes(event, this.#maxStagedBytes - this.#stagedBytes) === "over") {
 				this.discard();
 				throw new ManagedAttemptBufferOverflowError(
 					"overflow.preMeasure",
-					this.#overflowShape("overflow.preMeasure", bytes),
+					this.#overflowShape("overflow.preMeasure", this.#maxStagedBytes - this.#stagedBytes + 1),
 				);
 			}
 		}
@@ -2065,7 +2135,7 @@ class ManagedAttemptTransaction {
 		// removes that serializer and exposes a larger or JSON-hostile own value.
 		// Reusing the live pre-measure would therefore accept an unserializable
 		// snapshot or undercount the retained bytes.
-		bytes = detailed.jsonBytes;
+		const bytes = detailed.jsonBytes;
 		if (bytes === undefined) {
 			// The sanitizer's output is total (detached, JSON-safe), so this is
 			// unreachable unless the sanitizer itself regresses. Fail as a

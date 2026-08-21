@@ -1734,6 +1734,17 @@ describe("managed attempt transaction", () => {
 		}
 	});
 
+	it("accepts trusted staged-cap values with surrounding whitespace", () => {
+		const previous = process.env.GJC_FALLBACK_MAX_STAGED_EVENTS;
+		process.env.GJC_FALLBACK_MAX_STAGED_EVENTS = " 2 ";
+		try {
+			expect(managedAttemptMaxStagedEvents()).toBe(2);
+		} finally {
+			if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_EVENTS;
+			else process.env.GJC_FALLBACK_MAX_STAGED_EVENTS = previous;
+		}
+	});
+
 	it("retains queued follow-up input when its managed attempt is discarded for retry", async () => {
 		const mock = createMockModel({ responses: [{ content: ["initial"] }, { content: ["retried"] }] });
 		let calls = 0;
