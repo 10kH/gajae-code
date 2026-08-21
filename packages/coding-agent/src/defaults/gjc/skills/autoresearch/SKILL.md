@@ -107,3 +107,10 @@ The mission ends on one mission-level structured verdict: `status` (structured d
 ## Boundary
 
 Autoresearch produces research findings and a verdict; it never implements. Downstream implementation goes through the normal approval-gated path (planning → pending approval → explicitly approved execution).
+
+## Ending a mission
+
+Two exits, both one step:
+
+- **Hand off to planning/clarification**: invoke `/skill:ralplan`, `/skill:deep-interview`, or `/skill:ultragoal` directly — autoresearch is handoff-ready at any phase (`intake`/`research`/`verdict`), and the skill tool performs the atomic state handoff itself. No `gjc state` preparation is needed.
+- **Finalize only**: `gjc autoresearch clear` retires the mission artifact and its working set, appends `mission_cleared` to the ledger, and marks the workflow complete — no handoff target required.
