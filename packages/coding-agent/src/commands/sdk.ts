@@ -56,6 +56,7 @@ export async function lifecycleArgs(
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
+		...(process.env.GJC_SDK_TEST_IN_MEMORY_SESSION === "1" ? { noSession: true } : {}),
 		...(request.operation === "session.resume" ? { resume: request.sessionPath } : {}),
 		...(request.modelPreset ? { mpreset: request.modelPreset } : {}),
 		// Explicit model pin (#4707): coordinator-resolved `provider/model`
@@ -728,6 +729,18 @@ export async function runSessionHost(
 	// Readiness is published; the session is live. Memory startup issues one LLM
 	// request per queued rollout, so it must run outside the readiness window and
 	// its failure must never take the session down.
+	if (process.env.GJC_SDK_TEST_EXIT_AFTER_READY === cwd) {
+		process.stderr.write("GJC_SDK_TEST_EXIT_AFTER_READY\n");
+		process.exit(7);
+	}
+	if (process.env.GJC_SDK_TEST_REJECT_AFTER_READY === cwd) {
+		// Simulates the post-readiness liveness watcher rejecting. With the
+		// post-ready startup receipt removed, this unhandled rejection kills the
+		// host without writing any startup receipt; the broker must classify the
+		// death from published ready authority plus proven exit.
+		void Promise.reject(new Error("GJC_SDK_TEST_REJECT_AFTER_READY"));
+		await Bun.sleep(5_000);
+	}
 	startMemoryBackendAfterReadiness(startDeferredMemoryBackend);
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);

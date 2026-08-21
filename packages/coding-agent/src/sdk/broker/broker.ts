@@ -65,6 +65,8 @@ export type BrokerErrorCode =
 	| "resource_gone"
 	| "invalid_input"
 	| "spawn_failed"
+	| "ready_then_exited"
+	| "endpoint_unreadable"
 	| "startup_admission_timeout"
 	| "startup_admission_refused"
 	| "readiness_timeout"
