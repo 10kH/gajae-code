@@ -439,9 +439,9 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{ from: "research", to: "handoff", verb: "handoff" },
 			{ from: "verdict", to: "handoff", verb: "handoff" },
 		],
-		verbs: [...stateVerbs(), ...plannedVerbs(PLANNED_ADMIN_VERBS)],
+		verbs: [...stateVerbs(), ...positionalVerbs(["intake"]), ...plannedVerbs(PLANNED_ADMIN_VERBS)],
 		typedArgs: [
-			{ name: "spec", type: "string", appliesToVerbs: ["handoff"] },
+			{ name: "spec", type: "string", required: true, appliesToVerbs: ["intake"] },
 			{ name: "goal", type: "string", appliesToVerbs: ["write"] },
 			{
 				name: "mode",
@@ -453,7 +453,7 @@ export const WORKFLOW_MANIFEST: Record<CanonicalGjcWorkflowSkill, SkillManifest>
 			{
 				name: "json",
 				type: "boolean",
-				appliesToVerbs: ["read", "write", "clear", "handoff"],
+				appliesToVerbs: ["read", "write", "clear", "intake", "handoff"],
 			},
 			{ name: "args", type: "string", planned: true },
 			{ name: "metadata-json", type: "string", planned: true },

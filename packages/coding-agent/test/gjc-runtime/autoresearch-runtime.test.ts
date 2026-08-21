@@ -7,7 +7,7 @@ import {
 	type AutoresearchMode,
 	autoresearchClear,
 	autoresearchDashboardText,
-	autoresearchHandoff,
+	autoresearchIntake,
 	autoresearchIssueVerdict,
 	autoresearchLogRun,
 	autoresearchRead,
@@ -375,7 +375,7 @@ describe("autoresearch ledger", () => {
 			"utf-8",
 		);
 
-		const receipt = await autoresearchHandoff({ cwd: root, specPath });
+		const receipt = await autoresearchIntake({ cwd: root, specPath });
 
 		expect(receipt.mission.primaryMetric).toBe("decode_tokens_per_second");
 		expect(receipt.mission.metricUnit).toBe("tok/s");
@@ -391,7 +391,7 @@ describe("autoresearch ledger", () => {
 			"utf-8",
 		);
 
-		await expect(autoresearchHandoff({ cwd: root, specPath })).rejects.toThrow(
+		await expect(autoresearchIntake({ cwd: root, specPath })).rejects.toThrow(
 			/metric direction must be "higher" or "lower"/,
 		);
 	});
@@ -674,9 +674,41 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		const result = await runNativeAutoresearchCommand(["--help"], root);
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("--spec");
-		expect(result.stdout).toContain("Handoff intake");
+		expect(result.stdout).toContain("Spec intake");
+		expect(result.stdout).toContain("intake --spec");
 		expect(result.stdout).toContain("Cold intake");
 		expect(result.stdout).not.toContain("report");
+		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
+	});
+
+	it("intake verb consumes a spec exactly like the bare --spec flag", async () => {
+		const root = await tempDir();
+		const specPath = path.join(root, "deep-interview-intake-verb.md");
+		await Bun.write(
+			specPath,
+			"# Deep Interview Spec: Intake Verb\n\nautoresearch-mode: web\n\n## Goal\nProbe the intake verb.\n",
+		);
+		const result = await runNativeAutoresearchCommand(["intake", "--spec", specPath, "--json"], root);
+		expect(result.status).toBe(0);
+		expect(result.intake).toBe("handoff");
+		const payload = JSON.parse(result.stdout ?? "") as { ok: boolean; intake: string; mission: { slug: string } };
+		expect(payload.ok).toBe(true);
+		expect(payload.intake).toBe("handoff");
+		const receipt = await autoresearchRead(root, TEST_SESSION_ID);
+		expect(receipt.exists).toBe(true);
+		expect(receipt.mission?.intake).toBe("handoff");
+	});
+
+	it("rejects the ambiguous handoff verb with both disambiguation hints", async () => {
+		const root = await tempDir();
+		for (const args of [["handoff"], ["handoff", "--spec", "x.md"], ["handoff", "--json"]]) {
+			const result = await runNativeAutoresearchCommand(args, root);
+			expect(result.status).toBe(2);
+			expect(result.stderr).toContain('unknown verb "handoff"');
+			expect(result.stderr).toContain("gjc autoresearch intake --spec");
+			expect(result.stderr).toContain("gjc state autoresearch handoff --to");
+		}
+		// The rejected verb must never fall through to cold intake or create a mission.
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
 	});
 
@@ -688,11 +720,11 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		// data file sits right next to it: mode is never inferred (AC-16).
 		await fs.writeFile(path.join(root, "DATA.md"), "# dataset\n", "utf-8");
 		await fs.writeFile(specPath, "# Spec\n\n## Goal\n\nMeasure throughput.\n", "utf-8");
-		await expect(autoresearchHandoff({ cwd: root, specPath })).rejects.toThrow(/mission mode explicitly/);
+		await expect(autoresearchIntake({ cwd: root, specPath })).rejects.toThrow(/mission mode explicitly/);
 
 		// With the mode declared, handoff intake succeeds and asks zero questions.
 		await fs.writeFile(specPath, "# Spec\n\nautoresearch-mode: data\n\n## Goal\n\nMeasure throughput.\n", "utf-8");
-		const receipt = await autoresearchHandoff({ cwd: root, specPath });
+		const receipt = await autoresearchIntake({ cwd: root, specPath });
 
 		expect(receipt.mission.mode).toBe("data");
 		expect(receipt.specPath).toBe(specPath);
@@ -703,7 +735,7 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 
 	it("handoff intake fails closed when the spec path does not exist", async () => {
 		const root = await tempDir();
-		await expect(autoresearchHandoff({ cwd: root, specPath: path.join(root, "missing-spec.md") })).rejects.toThrow(
+		await expect(autoresearchIntake({ cwd: root, specPath: path.join(root, "missing-spec.md") })).rejects.toThrow(
 			/could not read spec/,
 		);
 	});
