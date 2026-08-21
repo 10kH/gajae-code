@@ -40,6 +40,7 @@ import {
 	type Tool,
 	type ToolCall,
 	type ToolChoice,
+	type ToolResultMessage,
 } from "../types";
 import {
 	createOpenAIResponsesHistoryPayload,
@@ -2942,6 +2943,16 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 	// `function_call_output` (OpenAI rejects mismatched pairs).
 	const customCallIds = new Set<string>();
 	const knownCallIds = new Set<string>();
+	// Consecutive tool results are batched into one append call so every output
+	// of the turn stays contiguous before the collected image user message;
+	// per-result image user messages interleave with sibling outputs and break
+	// tool_use→tool_result adjacency through Anthropic-translating proxies (#4807).
+	let pendingToolResults: ToolResultMessage[] = [];
+	const flushPendingToolResults = (): void => {
+		if (pendingToolResults.length === 0) return;
+		appendResponsesToolResultMessages(messages, pendingToolResults, model, false, knownCallIds, customCallIds);
+		pendingToolResults = [];
+	};
 
 	for (const msg of transformedMessages) {
 		if (msg.role === "user" || msg.role === "developer") {
@@ -3016,11 +3027,15 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 		}
 
 		if (msg.role === "toolResult") {
-			appendResponsesToolResultMessages(messages, msg, model, false, knownCallIds, customCallIds);
+			pendingToolResults.push(msg);
+			msgIndex += 1;
+			continue;
 		}
+		flushPendingToolResults();
 
 		msgIndex += 1;
 	}
+	flushPendingToolResults();
 
 	return messages;
 }

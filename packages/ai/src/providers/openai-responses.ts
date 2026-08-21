@@ -22,6 +22,7 @@ import {
 	type StreamOptions,
 	type Tool,
 	type ToolChoice,
+	type ToolResultMessage,
 } from "../types";
 import {
 	createOpenAIResponsesHistoryPayload,
@@ -800,7 +801,30 @@ function convertConversationMessages(
 	const transformedMessages = transformMessages(context.messages, model, normalizeResponsesToolCallIdForTransform);
 
 	let msgIndex = 0;
+	// Consecutive tool results are batched into one append call so every output
+	// of the turn stays contiguous before the collected image user message;
+	// per-result image user messages interleave with sibling outputs and break
+	// tool_use→tool_result adjacency through Anthropic-translating proxies (#4807).
+	let pendingToolResults: ToolResultMessage[] = [];
+	const flushPendingToolResults = (): void => {
+		if (pendingToolResults.length === 0) return;
+		appendResponsesToolResultMessages(
+			messages,
+			pendingToolResults,
+			model,
+			strictResponsesPairing,
+			knownCallIds,
+			customCallIds,
+		);
+		pendingToolResults = [];
+	};
 	for (const msg of transformedMessages) {
+		if (msg.role === "toolResult") {
+			pendingToolResults.push(msg);
+			msgIndex++;
+			continue;
+		}
+		flushPendingToolResults();
 		if (msg.role === "user" || msg.role === "developer") {
 			const providerPayload = (msg as { providerPayload?: AssistantMessage["providerPayload"] }).providerPayload;
 			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider);
@@ -851,11 +875,10 @@ function convertConversationMessages(
 			);
 			if (outputItems.length === 0) continue;
 			messages.push(...outputItems);
-		} else if (msg.role === "toolResult") {
-			appendResponsesToolResultMessages(messages, msg, model, strictResponsesPairing, knownCallIds, customCallIds);
 		}
 		msgIndex++;
 	}
+	flushPendingToolResults();
 
 	return repairOrphanResponsesToolOutputs(messages);
 }
