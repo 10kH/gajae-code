@@ -311,6 +311,23 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			await mcpSession.session.dispose();
 		}
 	});
+	it("does not expose move_session for an exact MCP config session", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		fs.mkdirSync(cwdA, { recursive: true });
+		const mcpConfigPath = path.join(tempDir, "mcp.json");
+		fs.writeFileSync(mcpConfigPath, "{}\n");
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, {
+			mcpConfigPath,
+		});
+		try {
+			expect(session.getToolByName("move_session")).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
 
 	it("refuses to rescope outside the current session directory", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
@@ -781,6 +798,39 @@ describe("move_session tool (agent-invokable session rescope)", () => {
 			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
 		} finally {
 			await session.dispose();
+		}
+	});
+
+	it("restores process cwd and retries when flush fails before the durable move", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `gjc-move-session-${Snowflake.next()}-`));
+		tempDirs.push(tempDir);
+		const cwdA = path.join(tempDir, "root");
+		const repoB = path.join(cwdA, "repo-b");
+		fs.mkdirSync(repoB, { recursive: true });
+		const restoreProcessCwd = process.cwd();
+		process.chdir(cwdA);
+		const sessionManager = SessionManager.create(cwdA, SessionManager.managedDestination(cwdA, tempDir));
+		const { session } = await makeSession(cwdA, sessionManager, { toolNames: ["move_session"] });
+		try {
+			const originalFlush = sessionManager.flush.bind(sessionManager);
+			let failOnce = true;
+			sessionManager.flush = async () => {
+				if (failOnce) {
+					failOnce = false;
+					throw new Error("flush exploded");
+				}
+				return originalFlush();
+			};
+			const moveTool = session.getToolByName("move_session")!;
+			await expect(moveTool.execute("move-flush-fail", { path: "repo-b" })).rejects.toThrow(/flush exploded/);
+			expect(sessionManager.getCwd()).toBe(cwdA);
+			expect(process.cwd()).toBe(cwdA);
+			const retry = await moveTool.execute("move-flush-retry", { path: "repo-b" });
+			expect(textContent(retry)).toContain("repo-b");
+			expect(sessionManager.getCwd()).toBe(fs.realpathSync(repoB));
+		} finally {
+			await session.dispose();
+			process.chdir(restoreProcessCwd);
 		}
 	});
 

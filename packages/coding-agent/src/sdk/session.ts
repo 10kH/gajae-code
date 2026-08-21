@@ -2085,27 +2085,46 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					error: error instanceof Error ? error.message : String(error),
 				});
 			}
-			if (ownsMcpManager) {
+			if (!options.mcpManager && explicitMcpConfigPath === undefined) {
 				const previousManager = mcpManager;
 				if (previousManager) await previousManager.disconnectAll().catch(() => {});
+				pluginMcpToolNames.length = 0;
+				conventionalMcpToolNames.length = 0;
 				let nextManager: MCPManager | undefined;
 				try {
 					const loaded = await loadAllMCPConfigs(to, {
+						agentDir,
 						enableProjectConfig: settings.has("mcp.enableProjectConfig")
 							? settings.get("mcp.enableProjectConfig")
 							: true,
 						autoloadOnly: true,
 						nativeOnly: true,
 					});
-					const { configs } = await buildPluginMcpConfigs({ cwd: to });
-					const mergedConfigs = { ...loaded.configs, ...configs };
+					const { configs: pluginConfigs } = await buildPluginMcpConfigs({ cwd: to });
+					const pluginNames = new Set(Object.keys(pluginConfigs));
+					const mergedConfigs = { ...loaded.configs, ...pluginConfigs };
+					const mergedSources = {
+						...loaded.sources,
+						...Object.fromEntries(
+							Object.keys(pluginConfigs).map(name => [
+								name,
+								{ provider: "gjc-plugins", providerName: "GJC plugin bundle", level: "project" as const },
+							]),
+						),
+					};
 					if (Object.keys(mergedConfigs).length > 0) {
 						nextManager = new MCPManager(to, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
 						nextManager.setAuthStorage(authStorage);
 						wireMcpManagerCallbacks(nextManager);
-						const result = await nextManager.connectServers(mergedConfigs, loaded.sources as never);
+						const result = await nextManager.connectServers(mergedConfigs, mergedSources as never);
 						nextCustomTools.push(...(result.tools as CustomTool[]));
 						nextCwdCapturing.push(...result.tools.map(tool => tool.name));
+						for (const tool of result.tools) {
+							const serverName = tool.mcpServerName;
+							if (serverName === undefined) continue;
+							if (pluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
+							else conventionalMcpToolNames.push(tool.name);
+						}
 					}
 				} catch (error) {
 					logger.warn("Failed to recreate MCP authority after session rescope", {
@@ -2218,6 +2237,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			!options.bashRestrictionProfile &&
 			(options.bashAllowedPrefixes ?? []).length === 0 &&
 			!options.mcpManager &&
+			explicitMcpConfigPath === undefined &&
 			options.workspaceTree === undefined
 				? {
 						rescopeSessionCwd: (() => {
@@ -2242,6 +2262,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									if (moveConsumed) {
 										throw new Error(
 											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
+										);
+									}
+									if (session?.getEffectiveActiveWorkflowSkillState()) {
+										throw new Error(
+											"A workflow skill became active while waiting for the cwd transition; finish or exit it before rescoping.",
 										);
 									}
 									const from = sessionManager.getCwd();
@@ -2294,6 +2319,43 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									// root both satisfy that, so acting on it would chdir the process
 									// and clear process-global caches underneath the sibling.
 									const ownsProcessCwd = SessionManager.isProcessCwdOwner(sessionManager);
+									const restoreLaunchRoot = async (failure: unknown): Promise<never> => {
+										const restoreErrors: Error[] = [];
+										if (ownsProcessCwd) {
+											try {
+												setProjectDir(canonicalFrom);
+												if (path.resolve(process.cwd()) !== path.resolve(canonicalFrom)) {
+													throw new Error("Process cwd did not restore to the launch root.");
+												}
+											} catch (error) {
+												restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
+											}
+											try {
+												resetCapabilities();
+												const restoreRegistry = await resolveActiveProjectRegistryPath(canonicalFrom).catch(
+													() => undefined,
+												);
+												clearPluginRootsAndCaches(restoreRegistry ? [restoreRegistry] : undefined);
+											} catch (error) {
+												restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
+											}
+										}
+										try {
+											await rebindCwdCapturingAuthority(canonicalFrom);
+										} catch (error) {
+											restoreErrors.push(error instanceof Error ? error : new Error(String(error)));
+										}
+										if (restoreErrors.length > 0) {
+											throw new AggregateError(
+												restoreErrors,
+												"Failed to restore launch-root rescope authority.",
+												{
+													cause: failure,
+												},
+											);
+										}
+										throw failure;
+									};
 									try {
 										// Every fallible step that the moved session depends on runs
 										// BEFORE the session-file commit, so a failure here leaves the
@@ -2315,7 +2377,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 										try {
 											if (ownsProcessCwd) {
 												resetCapabilities();
-												await shutdownAllLspClients();
 												const projectRegistry = await resolveActiveProjectRegistryPath(canonicalTarget);
 												clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
 											}
@@ -2327,34 +2388,39 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 											rescopeFailure = error;
 										}
 										if (rescopeFailure !== undefined) {
-											// Restore the launch root's authority so the still-unmoved
-											// session keeps working tools instead of a torn-down set.
-											if (ownsProcessCwd) setProjectDir(canonicalFrom);
-											if (ownsProcessCwd) {
-												resetCapabilities();
-												const restoreRegistry = await resolveActiveProjectRegistryPath(canonicalFrom).catch(
-													() => undefined,
-												);
-												clearPluginRootsAndCaches(restoreRegistry ? [restoreRegistry] : undefined);
-											}
-											await rebindCwdCapturingAuthority(canonicalFrom).catch(restoreError => {
-												logger.warn(
-													"Failed to restore launch-root tool authority after a rejected rescope",
-													{
-														error: safeErrorForLog(restoreError),
-													},
-												);
-											});
-											throw rescopeFailure;
+											await restoreLaunchRoot(rescopeFailure);
 										}
-										await sessionManager.flush();
-										// Commit last: `moveTo` re-validates the pinned identity through
-										// the still-open handle at the state-changing boundary.
-										await sessionManager.moveTo(canonicalTarget, {
-											expectedIdentity,
-											targetHandle,
-										});
+										try {
+											await sessionManager.flush();
+											// Commit last: `moveTo` re-validates the pinned identity through
+											// the still-open handle at the state-changing boundary.
+											await sessionManager.moveTo(canonicalTarget, {
+												expectedIdentity,
+												targetHandle,
+											});
+										} catch (error) {
+											const committedCwd = sessionManager.getCwd();
+											const stayedAtLaunchRoot = path.resolve(committedCwd) === path.resolve(from);
+											if (stayedAtLaunchRoot) await restoreLaunchRoot(error);
+											// SessionManager can publish the durable move before a later metadata
+											// write fails. Treat that state as committed rather than reporting a
+											// rejection after the session has moved.
+											moveConsumed = true;
+											logger.warn("Session rescope committed before finalization failed", {
+												error: safeErrorForLog(error),
+												cwd: committedCwd,
+											});
+										}
 										moveConsumed = true;
+										if (ownsProcessCwd) {
+											try {
+												await shutdownAllLspClients();
+											} catch (error) {
+												logger.warn("Failed to reset launch-root LSP clients after session rescope", {
+													error: safeErrorForLog(error),
+												});
+											}
+										}
 										// Cwd-derived read-only state the prompt and subagents consume.
 										// Best-effort by design: the move is committed, and a failed
 										// re-discovery must not present a committed move as a failure.
