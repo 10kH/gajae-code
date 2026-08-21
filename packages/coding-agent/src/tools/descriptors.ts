@@ -244,6 +244,7 @@ function defaultAvailabilityContext(session: ToolSession): ToolAvailabilityConte
 
 function availableFor(name: string, session: ToolSession, context = defaultAvailabilityContext(session)): boolean {
 	if (name === "goal") return context.goalEnabled === true;
+	if (name === "move_session") return typeof session.rescopeSessionCwd === "function";
 	if (context.goalStateToolNames?.includes(name)) return context.goalEnabled === true;
 	if (name === "lsp") return (context.enableLsp ?? true) && Boolean(session.settings.get("lsp.enabled"));
 	if (name === "eval") return context.allowEval ?? true;
@@ -296,6 +297,9 @@ function cached(key: string, load: () => Promise<any>): Promise<any> {
 	}
 	return promise;
 }
+export function evictCachedTool(key: string): void {
+	moduleCache.delete(key);
+}
 
 const loaders: Record<string, Loader> = {
 	read: session => cached("read", () => import("./read")).then(module => new module.ReadTool(session)),
@@ -328,6 +332,7 @@ const loaders: Record<string, Loader> = {
 		cached("python", () => import("./python")).then(module =>
 			module.createSessionPythonTool({
 				cwd: session.cwd,
+				getCwd: () => session.cwd,
 				getSessionId: () => session.getSessionId?.() ?? null,
 				registerSessionCleanup: (cleanup: () => Promise<void> | void) => {
 					session.registerSessionCleanup?.(cleanup);
@@ -360,6 +365,8 @@ const loaders: Record<string, Loader> = {
 	skill: session => cached("skill", () => import("./skill")).then(module => module.SkillTool.createIf(session)),
 	goal: session =>
 		cached("goal", () => import("../goals/tools/goal-tool")).then(module => new module.GoalTool(session)),
+	move_session: session =>
+		cached("move_session", () => import("./move-session")).then(module => new module.MoveSessionTool(session)),
 	yield: session => cached("yield", () => import("./yield")).then(module => new module.YieldTool(session)),
 	report_finding: _session => cached("review", () => import("./review")).then(module => module.reportFindingTool),
 	resolve: session => cached("resolve", () => import("./resolve")).then(module => new module.ResolveTool(session)),
@@ -445,6 +452,7 @@ const names: Array<[name: string, label: string, summary: string | undefined, lo
 		["write", "Write", "Write content to a file", "discoverable"],
 		["skill", "Skill", "Chain into another available skill", "essential"],
 		["goal", "Goal", undefined, "essential"],
+		["move_session", "Move Session", undefined, "essential"],
 	];
 
 const descriptorRawArgumentValidations: Readonly<Record<string, ToolDescriptorMetadata["rawArgumentValidation"]>> = {
