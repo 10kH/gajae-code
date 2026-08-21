@@ -2,6 +2,7 @@
 
 import * as path from "node:path";
 import { zodToWireSchema } from "../packages/ai/src/utils/schema/wire";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../packages/coding-agent/src/config/autorouting-contract";
 import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
 import { ModelsConfigSchema } from "../packages/coding-agent/src/config/models-config-schema";
 
@@ -176,6 +177,7 @@ function constrainedRecordSelectorSchema(valueSchema: {
 	return {
 		type: "string",
 		minLength: 1,
+		maxLength: AUTOROUTING_SELECTOR_MAX_LENGTH,
 		pattern: valueSchema.pattern,
 		not: { pattern: "^\\s*[pP][iI]/" },
 		description: valueSchema.description,

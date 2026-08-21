@@ -326,7 +326,13 @@ const AUTOROUTING_SETUP_JSON_SCHEMA: JsonSchemaObject = {
 		},
 		models: {
 			type: "array",
-			items: { type: "string", minLength: 1, maxLength: 256, pattern: AUTOROUTING_SELECTOR_PATTERN },
+			items: {
+				type: "string",
+				minLength: 1,
+				maxLength: 256,
+				pattern: AUTOROUTING_SELECTOR_PATTERN,
+				not: { pattern: "^\\s*[pP][iI]/" },
+			},
 		},
 	},
 	additionalProperties: false,

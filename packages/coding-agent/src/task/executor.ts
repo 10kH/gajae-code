@@ -2804,7 +2804,6 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	const candidates = options.autoroutingCandidates.filter(selector => selector.length > 0);
 	const durablePublicationAvailable =
 		options.managedPersistence !== undefined ||
-		options.parentArtifactManager !== undefined ||
 		(typeof options.sessionFile === "string" && options.sessionFile.length > 0);
 	const routedOptions = options.routing ? { ...options.routing, ...skips } : options.routing;
 	if (candidates.length === 0)
