@@ -179,6 +179,16 @@ export interface ToolSession {
 	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
 	workspaceTree?: WorkspaceTree;
 	/** Pre-loaded skills */
+	/**
+	 * Explicit user home for runtime skill discovery. Tests construct sessions
+	 * against an isolated home because the trusted-home resolver deliberately
+	 * ignores `$HOME` on Linux (it reads the NSS account database instead), so a
+	 * `process.env.HOME` override cannot steer user-scope discovery there.
+	 *
+	 * Production sessions leave this unset and the trusted OS home governs.
+	 * Runtime discovery only; never threaded into capability loading.
+	 */
+	home?: string;
 	skills?: Skill[];
 	/** Currently executing skill prompt, when this tool session is inside one. */
 	getActiveSkillState?: () => Pick<SkillActiveEntry, "skill" | "session_id"> | undefined;

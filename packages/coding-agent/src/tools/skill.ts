@@ -122,7 +122,12 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 
 			const skill =
 				skills.find(s => s.name === requestedName) ??
-				(await findRuntimeSkillByName(this.#session.cwd, requestedName, this.#getRuntimeSkillPolicy()));
+				(await findRuntimeSkillByName(
+					this.#session.cwd,
+					requestedName,
+					this.#getRuntimeSkillPolicy(),
+					this.#session.home,
+				));
 			if (!skill) {
 				const available = skills.map(s => s.name).sort();
 				const hint =
