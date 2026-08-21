@@ -3202,23 +3202,19 @@ export class SelectorController {
 		try {
 			const authStorage = this.ctx.session.modelRegistry.authStorage;
 			const inventory = authStorage.listCredentialInventory(providerId).filter(row => row.provider === providerId);
-			const oauthRows = inventory.filter(row => row.credentialKind === "oauth");
 			const removalTargetsById = new Map(
 				authStorage.listCredentialRemovalTargets(providerId).map(target => [target.id, target]),
 			);
-			const oauthRemovalTargets = oauthRows
+			const removable = inventory
 				.map(row => removalTargetsById.get(row.id))
 				.filter((target): target is CredentialRemovalTarget => target !== undefined);
-			// OAuth rows stored locally but not removable locally are broker-managed.
-			if (oauthRows.length > 0 && oauthRemovalTargets.length === 0) {
+			// Credentials stored locally but not removable locally are broker-managed.
+			if (inventory.length > 0 && removable.length === 0) {
 				this.ctx.showError(
 					`Logout is broker-managed for ${providerId}; run \`gjc auth-broker logout ${providerId}\` on the broker host.`,
 				);
 				return;
 			}
-			const removable = inventory
-				.map(row => removalTargetsById.get(row.id))
-				.filter((target): target is CredentialRemovalTarget => target !== undefined);
 			const selected = targets ? targets : removable;
 			if (selected.length === 0) {
 				this.ctx.showError(`No stored credentials to remove for ${providerId}.`);

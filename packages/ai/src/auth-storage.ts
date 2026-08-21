@@ -1676,12 +1676,12 @@ export class AuthStorage {
 		return this.#store.listCredentialInventory?.(provider) ?? [];
 	}
 
-	/** Return local OAuth hard-removal action targets, including disabled rows. */
+	/** Return local credential hard-removal action targets, including disabled rows. */
 	listCredentialRemovalTargets(provider?: string): CredentialRemovalTarget[] {
 		return this.#store.listCredentialRemovalTargets?.(provider) ?? [];
 	}
 
-	/** Remove selected local OAuth rows atomically; conflict leaves all rows intact. */
+	/** Remove selected local credential rows atomically; conflict leaves all rows intact. */
 	removeAuthCredentialsHard(
 		provider: string,
 		targets: readonly CredentialRemovalTarget[],

@@ -383,7 +383,7 @@ function addStoredRows(
 			authStorage.getSessionCredentialRowId(record.provider, sessionId) === record.id;
 		const canPin =
 			record.credentialKind === "oauth" && !record.disabled && canPinStoredOAuth(authStorage, record.provider);
-		const canRemove = record.credentialKind === "oauth" && removalTargetIds.has(record.id);
+		const canRemove = removalTargetIds.has(record.id);
 		rows.push({
 			id: sourceId(record.provider, "stored", record.id),
 			credentialId: record.id,

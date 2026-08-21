@@ -287,6 +287,7 @@ function accountMatches(row: CredentialInventoryRecord, rawAccount: string): boo
 	const value = rawAccount.trim();
 	if (value.length === 0) return false;
 	if (/^[1-9]\d*$/.test(value) && row.id === Number(value)) return true;
+	if (/^id:[1-9]\d*$/i.test(value) && row.id === Number(value.slice(3))) return true;
 	const identity = inventoryIdentity(row);
 	return identity?.toLowerCase() === value.toLowerCase();
 }
