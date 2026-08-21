@@ -2828,7 +2828,7 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 	"skill": {
 		"name": "skill",
 		"label": "Skill",
-		"description": "Invoke another available skill in the current turn.\n\n<conditions>\n- A SKILL document instructs you to chain into another skill on completion (e.g. ralplan → ultragoal)\n- You finished one skill's workflow and the next step requires another skill's full prompt context\n</conditions>\n\n<instruction>\n- `name` is the skill name as it appears in `/skill:<name>` (e.g. `ralplan`, `ultragoal`, `autoresearch`, `deep-interview`)\n- `args` is the free-form argument string the skill would receive after `/skill:<name>` on the command line\n- The tool loads the callee's SKILL.md into the current turn and handles native workflow caller→callee state handoff when the caller is one of the built-in GJC workflows.\n- The chain is refused while a native workflow caller is still active. If your current skill is one of `deep-interview`, `ralplan`, `ultragoal`, or `autoresearch` and has not yet reached a terminal phase, prepare it first with `gjc state <skill> write --input '{\"current_phase\":\"handoff\"}' --json`; no other handoff command is needed. Runtime project/user skills do not use `gjc state <skill>`.\n- Call once per chain step. To chain `A → B → C`, A calls `skill(B)`; B's next agent turn calls `skill(C)`.\n</instruction>\n\n<critical>\n- Do NOT use this tool to \"remind yourself\" of a skill you're already running. The current SKILL.md is already in your context.\n- Do NOT chain into the same skill recursively. If a skill's flow needs another iteration, follow its in-document instructions.\n- `name` MUST be one concrete skill name, NOT a glob or wildcard. Passing `*`, `?`, or a pattern like `git-*` is rejected immediately — the `--skills '*'` launch filter is unrelated to this tool's `name`.\n- The chained skill's planning/execution-boundary rules still apply. Chaining does not grant execution approval.\n</critical>\n\n<examples>\n# Hand off from ralplan to ultragoal after an approved plan\n{\"name\": \"ultragoal\", \"args\": \"track execution of .gjc/plans/ralplan/<run-id>/pending-approval.md\"}\n\n# Trigger deep-interview with no arguments\n{\"name\": \"deep-interview\"}\n</examples>",
+		"description": "Invoke another available skill in the current turn.\n\n<conditions>\n- A SKILL document instructs you to chain into another skill on completion (e.g. ralplan → ultragoal)\n- You finished one skill's workflow and the next step requires another skill's full prompt context\n</conditions>\n\n<instruction>\n- `name` is the skill name as it appears in `/skill:<name>` (e.g. `ralplan`, `ultragoal`, `autoresearch`, `deep-interview`)\n- `args` is the free-form argument string the skill would receive after `/skill:<name>` on the command line\n- The tool loads the callee's SKILL.md into the current turn and handles native workflow caller→callee state handoff when the caller is one of the built-in GJC workflows.\n- The chain is refused while a native workflow caller is still mid-flight. `autoresearch` chains from any of its phases (`intake`/`research`/`verdict`) — a research mission is always handoff-ready. `deep-interview` chains once its final spec is persisted (phase `handoff`), and `ralplan` chains from `final` or `handoff`. Only a mid-flight `ralplan` or `ultragoal` needs preparation first: `gjc state <skill> write --input '{\"current_phase\":\"handoff\"}' --json`; no other handoff command is needed. Runtime project/user skills do not use `gjc state <skill>`.\n- Call once per chain step. To chain `A → B → C`, A calls `skill(B)`; B's next agent turn calls `skill(C)`.\n</instruction>\n\n<critical>\n- Do NOT use this tool to \"remind yourself\" of a skill you're already running. The current SKILL.md is already in your context.\n- Do NOT chain into the same skill recursively. If a skill's flow needs another iteration, follow its in-document instructions.\n- `name` MUST be one concrete skill name, NOT a glob or wildcard. Passing `*`, `?`, or a pattern like `git-*` is rejected immediately — the `--skills '*'` launch filter is unrelated to this tool's `name`.\n- The chained skill's planning/execution-boundary rules still apply. Chaining does not grant execution approval.\n</critical>\n\n<examples>\n# Hand off from ralplan to ultragoal after an approved plan\n{\"name\": \"ultragoal\", \"args\": \"track execution of .gjc/plans/ralplan/<run-id>/pending-approval.md\"}\n\n# Trigger deep-interview with no arguments\n{\"name\": \"deep-interview\"}\n</examples>",
 		"parameters": {
 			"type": "object",
 			"properties": {
@@ -2883,6 +2883,30 @@ export const TOOL_CATALOG: Readonly<Record<string, ToolCatalogEntry>> = {
 		"strict": true,
 		"deferrable": false,
 		"loadMode": "essential",
+		"intent": "omit"
+	},
+	"move_session": {
+		"name": "move_session",
+		"label": "Move Session",
+		"description": "Rescope the session to a narrower working directory.\n\nUse this only when the session's working directory is a broad launcher root (for example a\nmulti-repo workspace like `~/Projects`) and the task has clearly converged on one subdirectory\nor repository: after this call, every later turn resolves relative paths and the bash default\ncwd from the new directory, and project-scoped plugins/capabilities reload for it.\n\n- `path` must be an existing directory; relative paths resolve against the current session cwd.\n  The canonical target must be strictly inside the current session directory — moves to a\n  parent, a sibling project, or an unrelated absolute path are refused.\n- A session can be moved this way at most once, and never while another move is running; a\n  rejected call does not consume the move. Use it once the target repo is identified — not\n  speculatively — because the session file and caches move with the session.\n- This tool is unavailable in subagent sessions and restricted profiles; ask the top-level\n  session to rescope instead.",
+		"parameters": {
+			"type": "object",
+			"properties": {
+				"path": {
+					"type": "string",
+					"description": "target directory: absolute, or relative to the current session cwd"
+				}
+			},
+			"required": [
+				"path"
+			],
+			"additionalProperties": false
+		},
+		"strict": true,
+		"deferrable": false,
+		"loadMode": "essential",
+		"nonAbortable": true,
+		"concurrency": "exclusive",
 		"intent": "omit"
 	},
 	"yield": {

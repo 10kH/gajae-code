@@ -1,3 +1,5 @@
+import * as nodeFs from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
 	Agent,
@@ -33,6 +35,7 @@ import {
 	postmortem,
 	prompt,
 	Snowflake,
+	setProjectDir,
 } from "@gajae-code/utils";
 import {
 	createAppendOnlyContextManager,
@@ -46,7 +49,7 @@ import {
 	isBackgroundJobSupportEnabled,
 	jobElapsedMs,
 } from "../async";
-import { loadCapability } from "../capability";
+import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
 import { resolveModelProfileName } from "../config/model-profile-contract";
@@ -72,6 +75,7 @@ import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
 import { initializeWithSettings } from "../discovery";
+import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { TtsrManager } from "../export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../extensibility/custom-tools/types";
@@ -111,6 +115,7 @@ import type { HindsightSessionState } from "../hindsight/state";
 import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
+import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -133,7 +138,6 @@ import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
-
 import type { SecretObfuscator } from "../secrets";
 import { AgentSession, type ForkContextSeed } from "../session/agent-session";
 import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "../session/auth-storage";
@@ -1408,7 +1412,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
 		};
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
-		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd });
+		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
+		// so services resolve the LIVE session cwd per activation instead of
+		// capturing the launch root. Before the manager exists the launch cwd is the
+		// only truth available, and it is also the manager's initial cwd.
+		let liveSessionManager: SessionManager | undefined;
+		const getLiveCwd = (): string => liveSessionManager?.getCwd() ?? cwd;
+		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd: getLiveCwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
 		if (!options.modelRegistry) {
@@ -1470,6 +1480,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			(await logger.time("sessionManager", async () => {
 				return SessionManager.create(cwd, SessionManager.managedDestination(cwd, agentDir));
 			}));
+		liveSessionManager = sessionManager;
 		const logicalSessionId = sessionManager.getSessionId();
 		// Fork-context seeds carry conversation content only, never provider identity:
 		// a shared continuity id would make concurrent subagents present the same
@@ -1911,7 +1922,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			contextFilesResultPromise,
 			raceWithDeadline("buildWorkspaceTree", workspaceTreePromise),
 		]);
-		const contextFiles = contextFilesResult.contextFiles;
+		// Mutable: a rescope re-discovers cwd-derived project instructions so the
+		// model is never shown the launcher root's AGENTS.md alongside the new cwd.
+		let contextFiles = contextFilesResult.contextFiles;
+		let liveWorkspaceTree: WorkspaceTree | undefined = resolvedWorkspaceTree;
 		const discoveredContextFileWarnings = contextFilesResult.warnings;
 
 		const backgroundJobsEnabled = isBackgroundJobSupportEnabled(settings);
@@ -2019,6 +2033,142 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			if (model) return formatModelString(model);
 			return undefined;
 		};
+		let mcpManager: MCPManager | undefined = options.mcpManager;
+		let ownsMcpManager = false;
+		const cwdCapturingToolNames: string[] = [];
+		const notificationDebounceTimers = new Map<string, Timer>();
+		const wireMcpManagerCallbacks = (manager: MCPManager): void => {
+			manager.setOnPromptsChanged(serverName => {
+				const promptCommands = buildMCPPromptCommands(manager);
+				session.setMCPPromptCommands(promptCommands);
+				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
+			});
+			manager.setOnResourcesChanged((serverName, uri) => {
+				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
+				if (!settings.get("mcp.notifications")) return;
+				const debounceMs = settings.get("mcp.notificationDebounceMs");
+				const key = `${serverName}:${uri}`;
+				const existing = notificationDebounceTimers.get(key);
+				if (existing) clearTimeout(existing);
+				notificationDebounceTimers.set(
+					key,
+					setTimeout(() => {
+						notificationDebounceTimers.delete(key);
+						if (!settings.get("mcp.notifications")) return;
+						session.yieldQueue.enqueue<McpNotificationEntry>("mcp-notification", { serverName, uri });
+					}, debounceMs),
+				);
+			});
+		};
+		const rebindCwdCapturingAuthority = async (to: string): Promise<void> => {
+			if (!session) return;
+			if (options.mcpManager && !ownsMcpManager) {
+				throw new Error(
+					"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
+				);
+			}
+			await session.refreshGjcSubskillTools();
+			const previousCwdCapturing = [...cwdCapturingToolNames];
+			const nextCwdCapturing: string[] = [];
+			const nextCustomTools: CustomTool[] = [];
+			try {
+				const declarations = await getGjcPluginToolDeclarations(to);
+				const pluginToolResult = await loadAlwaysOnPluginTools({
+					cwd: to,
+					reservedToolNames: session.getAllToolNames().filter(name => !previousCwdCapturing.includes(name)),
+					declarations,
+				});
+				nextCustomTools.push(...pluginToolResult.tools);
+				nextCwdCapturing.push(...pluginToolResult.tools.map(tool => tool.name));
+			} catch (error) {
+				logger.warn("Failed to reload always-on plugin tools after session rescope", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			if (ownsMcpManager) {
+				const previousManager = mcpManager;
+				if (previousManager) await previousManager.disconnectAll().catch(() => {});
+				let nextManager: MCPManager | undefined;
+				try {
+					const loaded = await loadAllMCPConfigs(to, {
+						enableProjectConfig: settings.has("mcp.enableProjectConfig")
+							? settings.get("mcp.enableProjectConfig")
+							: true,
+						autoloadOnly: true,
+						nativeOnly: true,
+					});
+					const { configs } = await buildPluginMcpConfigs({ cwd: to });
+					const mergedConfigs = { ...loaded.configs, ...configs };
+					if (Object.keys(mergedConfigs).length > 0) {
+						nextManager = new MCPManager(to, null, { sharedPoolIdleMs: settings.get("mcp.sharedPoolIdleMs") });
+						nextManager.setAuthStorage(authStorage);
+						wireMcpManagerCallbacks(nextManager);
+						const result = await nextManager.connectServers(mergedConfigs, loaded.sources as never);
+						nextCustomTools.push(...(result.tools as CustomTool[]));
+						nextCwdCapturing.push(...result.tools.map(tool => tool.name));
+					}
+				} catch (error) {
+					logger.warn("Failed to recreate MCP authority after session rescope", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				mcpManager = nextManager;
+				ownsMcpManager = Boolean(nextManager);
+				await session.replaceOwnedMcpManager(nextManager);
+				await session.refreshMCPTools((nextManager?.getTools() ?? []) as CustomTool[]);
+			}
+			cwdCapturingToolNames.length = 0;
+			cwdCapturingToolNames.push(...nextCwdCapturing);
+			await session.replaceNamedCustomTools(
+				previousCwdCapturing.filter(name => !nextCustomTools.some(tool => tool.name === name)),
+				nextCustomTools,
+			);
+		};
+
+		/**
+		 * Re-discover the cwd-derived read-only state the model is shown after a
+		 * committed rescope: project instructions, skills, and the workspace tree.
+		 * Without this the volatile message pairs the NEW cwd with the launch
+		 * root's AGENTS.md and tree, and subagents inherit the same mismatch.
+		 */
+		const applyRescopedReadState = async (to: string): Promise<void> => {
+			try {
+				const rediscovered = await loadContextFilesResultInternal({ cwd: to });
+				contextFiles = rediscovered.contextFiles;
+			} catch (error) {
+				logger.warn("Failed to re-discover context files after session rescope", {
+					error: safeErrorForLog(error),
+				});
+			}
+			if (options.skills === undefined && settings.get("skills.enabled")) {
+				try {
+					const reloaded = await loadSkills({
+						...settings.getGroup("skills"),
+						cwd: to,
+						disabledExtensions: settings.get("disabledExtensions"),
+					});
+					skills = withEmbeddedDefaultGjcSkills(reloaded.skills);
+					if (!options.parentTaskPrefix) setActiveSkills(skills);
+					await session?.replaceSkills(skills);
+				} catch (error) {
+					logger.warn("Failed to reload skills after session rescope", { error: safeErrorForLog(error) });
+				}
+			}
+			// The launch-bound tree is retired immediately: a stale root-scoped tree is
+			// worse than none, and the next turn re-scans at the new cwd.
+			liveWorkspaceTree = undefined;
+			workspaceTreePromise = Promise.resolve({
+				rootPath: to,
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			});
+			workspaceTreePromise.catch(() => {});
+			session?.retireWorkspaceTreeForRescope();
+			await session?.refreshBaseSystemPrompt();
+		};
+
 		const toolSession: ToolSession = {
 			get cwd() {
 				return sessionManager.getCwd();
@@ -2033,14 +2183,197 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return !requestedToolNames || requestedToolNames.includes("edit");
 			},
 			skipPythonPreflight: options.skipPythonPreflight,
-			contextFiles,
-			workspaceTree: resolvedWorkspaceTree,
-			skills,
+			// Getters, not snapshots: subagents launched after a rescope inherit the
+			// CURRENT cwd's context files, skills, and tree rather than the launch
+			// root's, which would otherwise pair the new cwd with retired instructions.
+			get contextFiles() {
+				return contextFiles;
+			},
+			get workspaceTree() {
+				return liveWorkspaceTree;
+			},
+			get skills() {
+				return skills;
+			},
 			eventBus,
 			outputSchema: options.outputSchema,
 			requireYieldTool: options.requireYieldTool,
 			taskDepth: options.taskDepth ?? 0,
 			currentAgentType: options.currentAgentType,
+			// Agent-invokable session rescope (#4629). Provided only where
+			// relocation is safe: canonical top-level sessions (the same
+			// isCanonicalSubSession predicate that gates SDK hosting — taskDepth 0,
+			// no parentTaskPrefix, no currentAgentType) without a restricted bash
+			// surface. Runs the same sequence as the text/ACP `/move` handler so
+			// tool path resolution, the bash default cwd, and plugin caches follow
+			// the move. Unlike the user-driven `/move`, the model-invoked accessor
+			// is bound to at most one successful move per session, rejects
+			// re-entrant calls, refuses to move while a workflow skill is active
+			// (its cwd-local state and guards stay pinned to the launch root), and
+			// only narrows: the canonical target must be a strict descendant of
+			// the canonical current cwd, so an injected or speculative call cannot
+			// widen the session's tool/write scope to a parent, a sibling project,
+			// or an arbitrary absolute path.
+			...(!isCanonicalSubSession &&
+			!options.bashRestrictionProfile &&
+			(options.bashAllowedPrefixes ?? []).length === 0 &&
+			!options.mcpManager &&
+			options.workspaceTree === undefined
+				? {
+						rescopeSessionCwd: (() => {
+							let moveConsumed = false;
+							return async (target: string): Promise<{ from: string; to: string }> => {
+								if (moveConsumed) {
+									throw new Error(
+										"This session has already been rescoped; only one agent-invoked move is allowed per session.",
+									);
+								}
+								if (session?.getEffectiveActiveWorkflowSkillState()) {
+									throw new Error(
+										"A workflow skill is active in this session; finish or exit it before rescoping.",
+									);
+								}
+								if (options.mcpManager && !ownsMcpManager) {
+									throw new Error(
+										"Cannot rescope a session with caller-owned MCP authority; recreate the session at the target cwd.",
+									);
+								}
+								return sessionManager.runExclusiveCwdTransition(async () => {
+									if (moveConsumed) {
+										throw new Error(
+											"This session has already been rescoped; only one agent-invoked move is allowed per session.",
+										);
+									}
+									const from = sessionManager.getCwd();
+									const resolvedPath = path.resolve(from, target);
+									let canonicalFrom: string;
+									let canonicalTarget: string;
+									try {
+										canonicalFrom = await fs.realpath(from);
+										canonicalTarget = await fs.realpath(resolvedPath);
+									} catch {
+										throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+									}
+									if (!(await fs.stat(canonicalTarget)).isDirectory()) {
+										throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+									}
+									const relative = path.relative(canonicalFrom, canonicalTarget);
+									if (relative === "") {
+										throw new Error(
+											`Target ${canonicalTarget} is the current session directory; nothing to move.`,
+										);
+									}
+									if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+										throw new Error(
+											`Refusing to rescope outside the current session directory: ${canonicalTarget} is not within ${canonicalFrom}. move_session only narrows the session scope; ask the user to restart or /move for a broader relocation.`,
+										);
+									}
+									let targetHandle: nodeFs.promises.FileHandle | undefined;
+									let expectedIdentity: { dev: bigint; ino: bigint };
+									try {
+										targetHandle = await SessionManager.openNoFollowDirectory(canonicalTarget);
+										const opened = await targetHandle.stat({ bigint: true });
+										if (!opened.isDirectory()) {
+											throw new Error(`Directory does not exist or is not a directory: ${resolvedPath}`);
+										}
+										expectedIdentity = { dev: opened.dev, ino: opened.ino };
+										await fs.access(canonicalTarget, nodeFs.constants.R_OK | nodeFs.constants.X_OK);
+									} catch (error) {
+										await targetHandle?.close().catch(() => {});
+										if (error instanceof Error && error.message.startsWith("Directory does not exist")) {
+											throw error;
+										}
+										throw new Error(
+											`Directory identity or access unavailable: ${canonicalTarget}${
+												error instanceof Error ? ` (${error.message})` : ""
+											}`,
+										);
+									}
+									// Process-cwd authority is an explicit claim, never inferred from
+									// `process.cwd() === from`: sibling sessions launched at the same
+									// root both satisfy that, so acting on it would chdir the process
+									// and clear process-global caches underneath the sibling.
+									const ownsProcessCwd = SessionManager.isProcessCwdOwner(sessionManager);
+									try {
+										// Every fallible step that the moved session depends on runs
+										// BEFORE the session-file commit, so a failure here leaves the
+										// session exactly where it was and the tool call is a clean
+										// rejection rather than a half-moved session.
+										if (ownsProcessCwd) {
+											setProjectDir(canonicalTarget);
+											try {
+												// `setProjectDir` chdirs a NAME. Confirm the process actually
+												// landed on the pinned directory, so a path replaced after
+												// the name checks cannot escape the validated descendant.
+												await SessionManager.assertProcessCwdIdentity(expectedIdentity);
+											} catch (error) {
+												setProjectDir(canonicalFrom);
+												throw error;
+											}
+										}
+										let rescopeFailure: unknown;
+										try {
+											if (ownsProcessCwd) {
+												resetCapabilities();
+												await shutdownAllLspClients();
+												const projectRegistry = await resolveActiveProjectRegistryPath(canonicalTarget);
+												clearPluginRootsAndCaches(projectRegistry ? [projectRegistry] : undefined);
+											}
+											// Plugin/MCP/Python authority must be rebound successfully
+											// before committing; swallowing a failure here is what leaves
+											// a moved session holding launch-root tool authority.
+											await rebindCwdCapturingAuthority(canonicalTarget);
+										} catch (error) {
+											rescopeFailure = error;
+										}
+										if (rescopeFailure !== undefined) {
+											// Restore the launch root's authority so the still-unmoved
+											// session keeps working tools instead of a torn-down set.
+											if (ownsProcessCwd) setProjectDir(canonicalFrom);
+											if (ownsProcessCwd) {
+												resetCapabilities();
+												const restoreRegistry = await resolveActiveProjectRegistryPath(canonicalFrom).catch(
+													() => undefined,
+												);
+												clearPluginRootsAndCaches(restoreRegistry ? [restoreRegistry] : undefined);
+											}
+											await rebindCwdCapturingAuthority(canonicalFrom).catch(restoreError => {
+												logger.warn(
+													"Failed to restore launch-root tool authority after a rejected rescope",
+													{
+														error: safeErrorForLog(restoreError),
+													},
+												);
+											});
+											throw rescopeFailure;
+										}
+										await sessionManager.flush();
+										// Commit last: `moveTo` re-validates the pinned identity through
+										// the still-open handle at the state-changing boundary.
+										await sessionManager.moveTo(canonicalTarget, {
+											expectedIdentity,
+											targetHandle,
+										});
+										moveConsumed = true;
+										// Cwd-derived read-only state the prompt and subagents consume.
+										// Best-effort by design: the move is committed, and a failed
+										// re-discovery must not present a committed move as a failure.
+										await applyRescopedReadState(sessionManager.getCwd());
+										try {
+											await session?.refreshSshTool({ activateIfAvailable: true });
+										} catch {
+											// Non-fatal: the session has moved; the SSH tool refreshes
+											// on its next activation attempt.
+										}
+										return { from, to: sessionManager.getCwd() };
+									} finally {
+										await targetHandle.close().catch(() => {});
+									}
+								});
+							};
+						})(),
+					}
+				: {}),
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
 			assertEvalExecutionAllowed: () => session?.assertEvalExecutionAllowed(),
@@ -2168,6 +2501,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (!options.parentTaskPrefix) {
 			setActiveSkills(skills);
 			setActiveRules([...rulebookRules, ...alwaysApplyRules]);
+			// Claim process-cwd authority for the FIRST top-level session launched at
+			// the process cwd. A later sibling launched at the same root does not get
+			// the claim, so its rescope leaves process-global state (chdir,
+			// capabilities, plugin caches, browser tab cwd) untouched.
+			if (!isCanonicalSubSession && path.resolve(process.cwd()) === path.resolve(sessionManager.getCwd())) {
+				SessionManager.claimProcessCwdOwnership(sessionManager);
+			}
 			if (asyncJobManager) {
 				// Register under the session endpoint so concurrent sessions'
 				// owned work settles in the correct manager (review thread P1).
@@ -2223,8 +2563,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// written by `gjc mcp add`; disabled by `--no-mcp`), and plugin-bundle
 		// MCP servers (created below after `customTools` is populated). Existing
 		// caller-supplied managers remain available for legacy in-process callers.
-		let mcpManager: MCPManager | undefined = options.mcpManager;
-		let ownsMcpManager = false;
 		const customTools: CustomTool[] = [];
 		const exactMcpToolNames: string[] = [];
 		const pluginMcpToolNames: string[] = [];
@@ -2314,7 +2652,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				reservedToolNames: [...getReservedSubskillToolNames(), ...customTools.map(tool => tool.name)],
 				declarations: gjcToolDeclarations,
 			});
-			if (pluginToolResult.tools.length > 0) customTools.push(...pluginToolResult.tools);
+			if (pluginToolResult.tools.length > 0) {
+				customTools.push(...pluginToolResult.tools);
+				cwdCapturingToolNames.push(...pluginToolResult.tools.map(tool => tool.name));
+			}
 			for (const q of pluginToolResult.quarantine) {
 				gjcFindings.add({ identity: q.identity, surfaceId: q.surfaceId, code: q.code, message: q.message });
 				logger.warn("Quarantined GJC plugin surface", { plugin: q.plugin, surface: q.surfaceId, code: q.code });
@@ -2344,6 +2685,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const resultTools = result.tools as CustomTool[];
 				exactMcpToolNames.push(...resultTools.map(tool => tool.name));
 				customTools.push(...resultTools);
+				cwdCapturingToolNames.push(...resultTools.map(tool => tool.name));
 				if (result.errors.size > 0 || result.tools.length === 0) {
 					logger.warn("MCP tools could not be loaded.");
 				}
@@ -2438,6 +2780,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
+							cwdCapturingToolNames.push(...result.tools.map(tool => tool.name));
 							const connectedPluginNames = new Set(
 								result.connectedServers.filter(name => pluginNames.has(name)),
 							);
@@ -3129,7 +3472,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const appendPrompt: string | undefined = memoryInstructions ?? undefined;
 			let pluginSystemAppendices = "";
 			try {
-				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd });
+				pluginSystemAppendices = await renderAlwaysOnSystemAppendices({ cwd: getLiveCwd() });
 			} catch (error) {
 				gjcProducersComplete = false;
 				logger.warn("Failed to render GJC plugin system appendices", { error: safeErrorForLog(error) });
@@ -3143,7 +3486,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			// `unavailable` rather than a stale generation.
 			if (gjcProducersComplete) gjcRuntimeStore.publish(gjcFindings.snapshot(), gjcPassEpoch);
 			const defaultPrompt = await buildSystemPromptInternal({
-				cwd,
+				// Live cwd: the prompt is rebuilt after a rescope, and describing the
+				// retired launcher root there is what makes the model pick wrong paths.
+				cwd: getLiveCwd(),
 				skills,
 				contextFiles,
 				tools: promptTools,
@@ -3676,7 +4021,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			convertToLlm: convertToLlmFinal,
 			rebuildSystemPrompt,
 			getMcpServerInstructions:
-				explicitMcpConfigPath === undefined && mcpManager ? () => mcpManager.getServerInstructions() : undefined,
+				explicitMcpConfigPath === undefined ? () => mcpManager?.getServerInstructions() : undefined,
 			workspaceTree: options.workspaceTree ?? (workspaceTreeMode === "eager" ? resolvedWorkspaceTree : undefined),
 			workspaceTreeService: options.workspaceTree ? undefined : runtimeServices.workspaceTree,
 			networkPrewarmService: runtimeServices.networkPrewarm,
@@ -3868,35 +4213,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					void session.refreshMCPTools(tools);
 				});
 			}
-			// Wire prompt refresh → rebuild MCP prompt slash commands
-			mcpManager.setOnPromptsChanged(serverName => {
-				const promptCommands = buildMCPPromptCommands(mcpManager);
-				session.setMCPPromptCommands(promptCommands);
-				logger.debug("MCP prompt commands refreshed", { path: `mcp:${serverName}` });
-			});
-			const notificationDebounceTimers = new Map<string, Timer>();
 			const clearDebounceTimers = () => {
 				for (const timer of notificationDebounceTimers.values()) clearTimeout(timer);
 				notificationDebounceTimers.clear();
 			};
 			postmortem.register("mcp-notification-cleanup", clearDebounceTimers);
-			mcpManager.setOnResourcesChanged((serverName, uri) => {
-				logger.debug("MCP resources changed", { path: `mcp:${serverName}`, uri });
-				if (!settings.get("mcp.notifications")) return;
-				const debounceMs = settings.get("mcp.notificationDebounceMs");
-				const key = `${serverName}:${uri}`;
-				const existing = notificationDebounceTimers.get(key);
-				if (existing) clearTimeout(existing);
-				notificationDebounceTimers.set(
-					key,
-					setTimeout(() => {
-						notificationDebounceTimers.delete(key);
-						// Re-check: user may have disabled notifications during the debounce window
-						if (!settings.get("mcp.notifications")) return;
-						session.yieldQueue.enqueue<McpNotificationEntry>("mcp-notification", { serverName, uri });
-					}, debounceMs),
-				);
-			});
+			wireMcpManagerCallbacks(mcpManager);
 		}
 
 		// Constructor-time workflow-gate tool restoration is deferred by one

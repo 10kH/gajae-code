@@ -2377,7 +2377,7 @@ export class AgentSession {
 	 */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	readonly #disposeAsyncJobManager: boolean;
-	readonly #ownedMcpManager: MCPManager | undefined;
+	#ownedMcpManager: MCPManager | undefined;
 	#startupTurnBarrier: Promise<void> | undefined;
 	#pendingPythonMessages: Array<{
 		message: PythonExecutionMessage;
@@ -2482,6 +2482,8 @@ export class AgentSession {
 	#workspaceTreeService: LazyService<WorkspaceTreeRuntime> | undefined;
 	#onWorkspaceTreeReady: ((tree: WorkspaceTree) => void | Promise<void>) | undefined;
 	#networkPrewarmService: LazyService<NetworkPrewarmRuntime> | undefined;
+	/** Set by `applyRescopedCwdState`: forces the next turn to re-scan at the new cwd. */
+	#pendingWorkspaceTreeRescope = false;
 	/** Throttle cache for the per-turn volatile workspace-tree scan (see #buildVolatileProjectContextMessage). */
 	#cachedWorkspaceTree: WorkspaceTree | undefined;
 	#cachedWorkspaceTreeAt = 0;
@@ -3919,6 +3921,61 @@ export class AgentSession {
 			...(this.#activeSkillState.sessionId ? { session_id: this.#activeSkillState.sessionId } : {}),
 		};
 	}
+	/**
+	 * Live prompt marker or restored durable workflow — the effective state the
+	 * cwd-local mutation guard must honor after resume.
+	 */
+	getEffectiveActiveWorkflowSkillState(): { skill: string; sessionId: string } | undefined {
+		const currentSessionId = this.sessionManager.getSessionId();
+		const inMemory = this.#activeSkillState;
+		if (
+			inMemory &&
+			(!inMemory.sessionId || inMemory.sessionId === currentSessionId) &&
+			isCanonicalGjcWorkflowSkill(inMemory.skill)
+		) {
+			return { skill: inMemory.skill, sessionId: inMemory.sessionId ?? currentSessionId };
+		}
+		if (
+			this.#restoredWorkflowSkillState?.sessionId === currentSessionId &&
+			isCanonicalGjcWorkflowSkill(this.#restoredWorkflowSkillState.skill)
+		) {
+			return this.#restoredWorkflowSkillState;
+		}
+		return undefined;
+	}
+
+	/** Replace the session-owned MCP manager after a cwd rescope. */
+	async replaceOwnedMcpManager(next: MCPManager | undefined): Promise<void> {
+		const previous = this.#ownedMcpManager;
+		if (previous && previous !== next) {
+			await previous.disconnectAll().catch(() => {});
+			if (MCPManager.instance() === previous) MCPManager.setInstance(undefined);
+		}
+		this.#ownedMcpManager = next;
+		if (next && MCPManager.instance() === undefined) MCPManager.setInstance(next);
+	}
+
+	/** Swap named custom/project tools after a cwd rescope. */
+	async replaceNamedCustomTools(previousNames: readonly string[], nextTools: CustomTool[]): Promise<void> {
+		const previous = new Set(previousNames);
+		const previousActive = this.getActiveToolNames();
+		for (const name of previous) this.#toolRegistry.delete(name);
+		const getCustomToolContext = () => this.#getCustomToolContext();
+		const added: string[] = [];
+		for (const customTool of nextTools) {
+			const wrapped = CustomToolAdapter.wrap(customTool, getCustomToolContext) as AgentTool;
+			const finalTool = (
+				this.#extensionRunner ? new ExtensionToolWrapper(wrapped, this.#extensionRunner) : wrapped
+			) as AgentTool;
+			this.#toolRegistry.set(finalTool.name, finalTool);
+			added.push(finalTool.name);
+		}
+		this.#invalidateDiscoveryCaches();
+		await this.#applyActiveToolsByName([
+			...previousActive.filter(name => !previous.has(name)),
+			...added.filter(name => !previous.has(name) || previousActive.includes(name)),
+		]);
+	}
 
 	/** Best-effort accessor for the active skill's `current_phase` field from
 	 *  its persisted mode-state file. Used by the `skill` tool to enforce the
@@ -3949,13 +4006,7 @@ export class AgentSession {
 	/** Provider-facing ask metadata must expose only the active deep-interview phase. */
 	getDeepInterviewAskStage(): "topology" | "post-topology" | undefined {
 		const currentSessionId = this.sessionManager.getSessionId();
-		const inMemory = this.#activeSkillState;
-		const active =
-			inMemory && (!inMemory.sessionId || inMemory.sessionId === currentSessionId)
-				? inMemory
-				: this.#restoredWorkflowSkillState?.sessionId === currentSessionId
-					? this.#restoredWorkflowSkillState
-					: undefined;
+		const active = this.getEffectiveActiveWorkflowSkillState();
 		if (active?.skill !== "deep-interview") return undefined;
 		try {
 			assertNonEmptyGjcSessionId(currentSessionId, "AgentSession.getDeepInterviewAskStage");
@@ -7525,6 +7576,7 @@ export class AgentSession {
 	}
 
 	async #dispose(): Promise<void> {
+		await this.sessionManager.joinCwdTransition();
 		const admissionClosed = this.#closeSessionAdmission();
 		this.#isDisposed = true;
 		// Reject new direct Python starts as soon as disposal begins (synchronously,
@@ -8353,6 +8405,35 @@ export class AgentSession {
 			},
 		}) as T;
 	}
+	#wrapToolForCwdTransitionFence<T extends AgentTool>(tool: T): T {
+		if (tool.name === "move_session") return tool;
+		return new Proxy(tool, {
+			get: (target, prop) => {
+				if (prop !== "execute") return Reflect.get(target, prop, target);
+				return async (
+					toolCallId: string,
+					args: unknown,
+					signal: AbortSignal | undefined,
+					onUpdate: never,
+					ctx: never,
+				) => {
+					return await this.sessionManager.runWithCwdReadLease(async () => {
+						const admittedGeneration = this.sessionManager.getCwdGeneration();
+						const result = await target.execute(toolCallId, args as never, signal, onUpdate, ctx);
+						// The lease keeps writers out for the whole execution, so this can
+						// only trip if a caller bypassed the lease; surface it rather than
+						// returning a result computed against a retired cwd.
+						if (this.sessionManager.getCwdGeneration() !== admittedGeneration) {
+							throw new Error(
+								"Session working directory changed while this tool executed; retry against the new cwd.",
+							);
+						}
+						return result;
+					});
+				};
+			},
+		}) as T;
+	}
 
 	/**
 	/** Wrap a tool with the workflow mutation guard before permissions or execution. */
@@ -8400,16 +8481,18 @@ export class AgentSession {
 		let wrappersByVersion = this.#guardedToolWrapperCache.get(tool);
 		const cached = wrappersByVersion?.get(cacheKey);
 		if (cached) return cached as T;
-		const wrapped = this.#wrapToolForWorkflowMutationGuard(
-			this.#wrapToolForAcpPermission(
-				guardToolForUltragoalAsk(
-					tool,
-					() => this.sessionManager.getCwd(),
-					() => ({
-						activeSkillState: this.getActiveSkillState(),
-						sessionId: this.sessionManager.getSessionId(),
-					}),
-					() => this.getSessionAgentDir(),
+		const wrapped = this.#wrapToolForCwdTransitionFence(
+			this.#wrapToolForWorkflowMutationGuard(
+				this.#wrapToolForAcpPermission(
+					guardToolForUltragoalAsk(
+						tool,
+						() => this.sessionManager.getCwd(),
+						() => ({
+							activeSkillState: this.getActiveSkillState(),
+							sessionId: this.sessionManager.getSessionId(),
+						}),
+						() => this.getSessionAgentDir(),
+					),
 				),
 			),
 		);
@@ -9920,18 +10003,26 @@ export class AgentSession {
 			this.#cachedWorkspaceTreeAt = Date.now();
 			this.#initialWorkspaceTree = undefined;
 			includeTree = this.#cachedWorkspaceTree;
-		} else if (Date.now() - this.#cachedWorkspaceTreeAt >= VOLATILE_TREE_TTL_MS) {
+		} else if (
+			this.#pendingWorkspaceTreeRescope ||
+			Date.now() - this.#cachedWorkspaceTreeAt >= VOLATILE_TREE_TTL_MS
+		) {
+			// A rescope retires the cached tree regardless of TTL, and must re-scan
+			// rather than reuse the launch-root snapshot the service already holds.
+			const rescoped = this.#pendingWorkspaceTreeRescope;
+			this.#pendingWorkspaceTreeRescope = false;
 			if (this.#workspaceTreeService) {
-				const firstWorkspaceTree = this.#cachedWorkspaceTreeAt === 0;
+				const firstWorkspaceTree = this.#cachedWorkspaceTreeAt === 0 && !rescoped;
 				const runtime = await this.#workspaceTreeService.get("first-turn-barrier");
 				this.#cachedWorkspaceTree = firstWorkspaceTree ? runtime.snapshot : await runtime.refresh();
-				publishStableWorkspaceTree = firstWorkspaceTree;
+				publishStableWorkspaceTree = firstWorkspaceTree || rescoped;
 			} else {
 				try {
 					this.#cachedWorkspaceTree = await buildWorkspaceTree(cwd, { timeoutMs: 5000 });
 				} catch {
 					this.#cachedWorkspaceTree = undefined;
 				}
+				publishStableWorkspaceTree = rescoped;
 			}
 			this.#cachedWorkspaceTreeAt = Date.now();
 			includeTree = this.#cachedWorkspaceTree;
@@ -11924,6 +12015,27 @@ export class AgentSession {
 	/** Skills loaded by SDK (always includes bundled GJC workflow defaults unless explicitly overridden by SDK callers) */
 	get skills(): readonly Skill[] {
 		return this.#skills;
+	}
+
+	/**
+	 * Install the skill set discovered at a newly rescoped cwd (`move_session`).
+	 * Project-scoped skills belong to the directory they were discovered in, so
+	 * they must not survive a move out of it.
+	 */
+	async replaceSkills(skills: Skill[]): Promise<void> {
+		this.#skills = skills;
+		await this.refreshBaseSystemPrompt();
+	}
+
+	/**
+	 * Retire the cached workspace tree after a rescope so the next turn re-scans
+	 * at the new cwd instead of re-presenting the abandoned launcher root.
+	 */
+	retireWorkspaceTreeForRescope(): void {
+		this.#initialWorkspaceTree = undefined;
+		this.#cachedWorkspaceTree = undefined;
+		this.#cachedWorkspaceTreeAt = 0;
+		this.#pendingWorkspaceTreeRescope = true;
 	}
 
 	/** Skill loading warnings captured by SDK */
