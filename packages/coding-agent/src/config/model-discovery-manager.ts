@@ -113,9 +113,10 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 		// never seed the synchronous catalog: it belongs to a different
 		// discovery context (e.g. another tenant), not this one.
 		const provenanceMismatch =
-			cache?.dynamicModelIds !== undefined &&
-			expectedProvenance !== undefined &&
-			cache.dynamicModelProvenance !== expectedProvenance;
+			cache !== null &&
+			(cache.dynamicModelIds === undefined ||
+				expectedProvenance === undefined ||
+				cache.dynamicModelProvenance !== expectedProvenance);
 		const usableCache = provenanceMismatch ? null : cache;
 		const models = applyFinalCodexGpt56ContextCap(usableCache?.models ?? []);
 		this.#states.set(provider.provider, {
@@ -147,14 +148,20 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 	): Promise<DiscoveryMergeInput> {
 		const token = this.beginRefresh(provider.provider);
 		const cached = readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, callbacks.cacheDbPath);
-		const cachedModels = applyFinalCodexGpt56ContextCap(cached?.models ?? []);
+		const cacheEligible =
+			cached !== null &&
+			(callbacks.cacheDynamicModelProvenance === undefined ||
+				(cached.dynamicModelIds !== undefined &&
+					cached.dynamicModelProvenance === callbacks.cacheDynamicModelProvenance));
+		const eligibleCache = cacheEligible ? cached : null;
+		const cachedModels = applyFinalCodexGpt56ContextCap(eligibleCache?.models ?? []);
 		const unauthenticated = (models: readonly Model<Api>[]): DiscoveryMergeInput =>
 			this.#complete(token, models, {
 				provider: provider.provider,
 				status: "unauthenticated",
 				optional: provider.optional ?? false,
-				stale: cached !== null,
-				fetchedAt: cached?.updatedAt,
+				stale: eligibleCache !== null,
+				fetchedAt: eligibleCache?.updatedAt,
 				models: models.map(model => model.id),
 			});
 
@@ -208,7 +215,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				? "cached"
 				: "unavailable"
 			: strategy === "offline"
-				? cached
+				? eligibleCache
 					? "cached"
 					: "idle"
 				: result.models.length > 0
@@ -223,7 +230,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			stale: result.stale || status === "cached",
 			// Cache-served refreshes did not fetch now: report the row's actual
 			// fetch time instead of laundering it through Date.now().
-			fetchedAt: error || !result.fetched ? cached?.updatedAt : Date.now(),
+			fetchedAt: error || !result.fetched ? eligibleCache?.updatedAt : Date.now(),
 			models: result.models.map(model => model.id),
 			error,
 		};

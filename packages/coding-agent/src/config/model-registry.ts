@@ -686,31 +686,41 @@ interface DiscoveryProviderConfig {
 
 /**
  * Credential-safe fingerprint of the effective configured-discovery request
- * identity: effective request headers (config plus runtime overrides,
- * lowercased and sorted) and the semantic request-shape fields (discovery
- * type, provider api, per-prefix api routing, models.dev catalog key). A
+ * identity: non-secret credential evidence, normalized endpoint, effective
+ * request headers (config plus runtime overrides, lowercased and sorted), and
+ * the semantic request-shape fields (discovery type, provider api, per-prefix
+ * api routing, models.dev catalog key). A
  * published cache row is only trusted while this fingerprint is unchanged, so
  * a tenant/project header change (or any other request-shape change)
  * invalidates the authoritative catalog instead of silently serving the old
- * context's models. It deliberately excludes credential evidence (the
- * resolved key is not synchronously knowable at construction, and credential
- * changes are already invalidated through the auth-evidence generation
- * escalation) and the endpoint (runtime transport overrides legitimately
- * redirect discovery to a signed variant of the same catalog, and endpoint
- * changes keep their own invalidation paths). Raw header values (which may
- * carry secrets) are never persisted or logged — only the SHA-256 digest.
+ * context's models. Raw credentials, endpoint authority, and header values
+ * never persist or reach logs — only the SHA-256 digest does.
  */
-function fingerprintConfiguredDiscoveryRequestShape(providerConfig: DiscoveryProviderConfig): string {
+function fingerprintConfiguredDiscoveryRequestShape(
+	providerConfig: DiscoveryProviderConfig,
+	authEvidence: string,
+	endpoint: string,
+): string {
 	const sortEntries = (record: Record<string, string> | undefined) =>
 		Object.entries(record ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
 	const context = JSON.stringify({
+		authEvidence,
+		endpoint,
 		headers: sortEntries(providerConfig.headers).map(([name, value]) => [name.toLowerCase(), value]),
 		discoveryType: providerConfig.discovery.type,
 		api: providerConfig.api,
 		apiByModelPrefix: sortEntries(providerConfig.discovery.apiByModelPrefix),
 		modelsDevProvider: providerConfig.discovery.modelsDevProvider ?? "",
 	});
-	return crypto.createHash("sha256").update(context).digest("hex");
+	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
+}
+
+function fingerprintDescriptorDiscoveryProvenance(authEvidence: string, endpoint: string): string {
+	return crypto
+		.createHash("sha256")
+		.update("gajae:model-discovery-provenance\0")
+		.update(JSON.stringify({ authEvidence, endpoint }))
+		.digest("hex");
 }
 
 export interface CanonicalModelQueryOptions {
@@ -1694,7 +1704,11 @@ export class ModelRegistry {
 				continue;
 			}
 			const cache = readModelCache<Api>(descriptor.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
-			if (!cache) {
+			const expectedProvenance = fingerprintDescriptorDiscoveryProvenance(
+				this.#getProviderEvidenceGeneration(descriptor.providerId),
+				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? ""),
+			);
+			if (!cache || cache.dynamicModelIds === undefined || cache.dynamicModelProvenance !== expectedProvenance) {
 				continue;
 			}
 			const models = cache.models.map(model =>
@@ -1717,12 +1731,13 @@ export class ModelRegistry {
 			let expectedProvenance: string | undefined;
 			try {
 				const effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
-				expectedProvenance = fingerprintConfiguredDiscoveryRequestShape(effectiveConfig);
+				expectedProvenance = fingerprintConfiguredDiscoveryRequestShape(
+					effectiveConfig,
+					this.#getProviderEvidenceGeneration(effectiveConfig.provider),
+					this.#normalizeDiscoveryEvidenceEndpoint(effectiveConfig.baseUrl ?? ""),
+				);
 			} catch {
-				// Configuration is not resolvable synchronously at construction:
-				// leave the gate unset rather than fail-closed on legitimate
-				// same-context cache reuse. Any real context change is still
-				// caught by the online refresh path's provenance check.
+				// A context that cannot be fully derived cannot vouch for a cache row.
 				expectedProvenance = undefined;
 			}
 			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance);
@@ -1779,10 +1794,23 @@ export class ModelRegistry {
 			: models;
 	}
 	#stripModelBaseUrlQueries(models: readonly Model<Api>[]): Model<Api>[] {
-		return models.map(model => (model.baseUrl ? { ...model, baseUrl: stripUrlQuery(model.baseUrl) } : model));
+		return models.map(model => {
+			if (!model.baseUrl) return model;
+			try {
+				const parsed = new URL(model.baseUrl);
+				parsed.username = "";
+				parsed.password = "";
+				parsed.search = "";
+				parsed.hash = "";
+				return { ...model, baseUrl: parsed.toString().replace(/\/$/, "") };
+			} catch {
+				return { ...model, baseUrl: stripUrlQuery(model.baseUrl).replace(/\/\/[^/@]+@/, "//") };
+			}
+		});
 	}
 	#restoreLiveDiscoveryBaseUrl(modelBaseUrl: string | undefined, liveBaseUrl: string | undefined): string | undefined {
-		if (!modelBaseUrl || !liveBaseUrl?.includes("?")) return modelBaseUrl;
+		if (!modelBaseUrl || !liveBaseUrl || (!liveBaseUrl.includes("?") && !liveBaseUrl.includes("@")))
+			return modelBaseUrl;
 		return this.#normalizeDiscoveryEvidenceEndpoint(stripUrlQuery(modelBaseUrl)) ===
 			this.#normalizeDiscoveryEvidenceEndpoint(stripUrlQuery(liveBaseUrl))
 			? liveBaseUrl
@@ -2465,15 +2493,12 @@ export class ModelRegistry {
 					await this.#discoverModelsByProviderType(provider, apiKey),
 				),
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
-			// Publish the credential-independent request-identity fingerprint
-			// (effective headers, discovery type, provider api, per-prefix
-			// routing, models.dev catalog key) with the cache row. It carries
-			// the tenant/routing identity of the discovery context, so both the
-			// async refresh and the synchronous constructor-time cache load can
-			// keep a different context's rows out of the catalog;
-			// credential-evidence and endpoint changes are invalidated
-			// separately through their own escalation paths.
-			cacheDynamicModelProvenance: fingerprintConfiguredDiscoveryRequestShape(effectiveProviderConfig),
+			// Persist only a digest of the complete effective discovery context.
+			cacheDynamicModelProvenance: fingerprintConfiguredDiscoveryRequestShape(
+				effectiveProviderConfig,
+				authGenerationBeforeDiscovery,
+				endpoint,
+			),
 			canPublishCache: () => isCurrentEndpoint(),
 		});
 		const authGeneration =
@@ -2709,7 +2734,7 @@ export class ModelRegistry {
 			const manager = createModelManager({
 				...options,
 				cacheDbPath: this.#cacheDbPath,
-				cacheDynamicModelProvenance: Bun.hash(`${authGeneration}\u0000${endpoint}`).toString(36),
+				cacheDynamicModelProvenance: fingerprintDescriptorDiscoveryProvenance(authGeneration, endpoint),
 				canPublishCache: isCurrentDiscovery,
 				...(options.fetchDynamicModels
 					? {
@@ -3187,7 +3212,11 @@ export class ModelRegistry {
 		try {
 			const parsed = new URL(endpoint);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
-			return `${parsed.protocol}//${parsed.host}${trimmedPath}${parsed.search}`;
+			const authorityEvidence =
+				parsed.username || parsed.password
+					? crypto.createHash("sha256").update(`${parsed.username}:${parsed.password}`).digest("hex")
+					: "";
+			return `${parsed.protocol}//${parsed.host}${trimmedPath}${parsed.search};authority=${authorityEvidence}`;
 		} catch {
 			return endpoint.replace(/\/+$/g, "");
 		}
@@ -3227,7 +3256,8 @@ export class ModelRegistry {
 			const parsed = new URL(raw);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
 			parsed.pathname = trimmedPath.endsWith("/v1") ? trimmedPath || "/v1" : `${trimmedPath}/v1`;
-			return `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
+			parsed.hash = "";
+			return parsed.toString().replace(/\/$/, "");
 		} catch {
 			return raw;
 		}

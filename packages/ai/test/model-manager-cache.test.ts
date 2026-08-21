@@ -48,14 +48,24 @@ describe("online-if-uncached model refresh", () => {
 		const cachedModels = [...staticModels, model(providerId, "cached")];
 		let discoveryCalls = 0;
 		const now = 1_700_000_000_000;
-		writeModelCache(providerId, now, cachedModels, true, fingerprint(staticModels), cacheDbPath);
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		writeModelCache(
+			providerId,
+			now,
+			cachedModels,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["cached"],
+			provenance,
+		);
 
 		const result = await resolveProviderModels<Api>(
 			{
 				providerId,
 				staticModels,
 				cacheDbPath,
-				cacheDynamicModelProvenance: "credential-a\u0000https://provider-a.example.test",
+				cacheDynamicModelProvenance: provenance,
 				now: () => now,
 				fetchDynamicModels: async () => {
 					discoveryCalls += 1;
