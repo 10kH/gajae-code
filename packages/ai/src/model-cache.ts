@@ -200,21 +200,27 @@ export function updateModelCacheIfUnchanged<TApi extends Api>(
 	authoritative: boolean,
 	staticFingerprint: string,
 	dbPath?: string,
+	dynamicModelIds?: readonly string[],
+	dynamicModelProvenance?: string,
 ): boolean {
 	try {
 		const expectedIds = expectedDynamicModelIds === undefined ? null : JSON.stringify(expectedDynamicModelIds);
 		const provenance = expectedDynamicModelProvenance ?? null;
+		const nextIds = dynamicModelIds === undefined ? null : JSON.stringify(dynamicModelIds);
+		const nextProvenance = dynamicModelProvenance ?? null;
 		const expectedModelsJson = JSON.stringify(expectedModels);
 		const result = getDb(dbPath).run(
 			`UPDATE model_cache
-			 SET updated_at = ?, authoritative = ?, static_fingerprint = ?, dynamic_model_ids = NULL,
-			     dynamic_model_provenance = NULL, models = ?
+			 SET updated_at = ?, authoritative = ?, static_fingerprint = ?, dynamic_model_ids = ?,
+			     dynamic_model_provenance = ?, models = ?
 			 WHERE provider_id = ? AND updated_at = ?
 			   AND dynamic_model_ids IS ? AND dynamic_model_provenance IS ? AND models = ?`,
 			[
 				updatedAt,
 				authoritative ? 1 : 0,
 				staticFingerprint,
+				nextIds,
+				nextProvenance,
 				JSON.stringify(models),
 				providerId,
 				expectedUpdatedAt,

@@ -194,10 +194,19 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 	const cacheProvenanceMismatch =
 		cache !== null &&
 		(cache.dynamicModelIds !== undefined ? !cacheDynamicModelIdsCurrent : requiresBoundDynamicCache);
+	// A provider that supplies cache provenance has opted into live-catalog
+	// authority. Rows written before that provider enabled discovery have no
+	// dynamic IDs, so they must be synchronized once rather than suppressing
+	// the first live fetch for their full TTL.
+	const cacheNeedsInitialDynamicRefresh =
+		hasDynamicFetcher &&
+		options.cacheDynamicModelProvenance !== undefined &&
+		!options.cacheDynamicModelProvenance.startsWith("gajae:non-cacheable-") &&
+		cache?.dynamicModelIds === undefined;
 	const hasAuthoritativeCache =
 		!hasDynamicFetcher ||
 		((cache?.authoritative ?? false) &&
-			(requiresBoundDynamicCache
+			(!cacheNeedsInitialDynamicRefresh && requiresBoundDynamicCache
 				? cacheDynamicModelIdsCurrent
 				: cache?.dynamicModelIds === undefined || cacheDynamicModelIdsCurrent));
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
@@ -210,7 +219,8 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 		// models in a bound context, and is non-authoritative — so its refetch
 		// cadence follows the standard non-authoritative retry backoff instead
 		// of hammering a failing endpoint on every provider-tab visit.
-		cacheProvenanceMismatch && cache?.dynamicModelIds !== undefined && strategy !== "offline"
+		(cacheNeedsInitialDynamicRefresh || (cacheProvenanceMismatch && cache?.dynamicModelIds !== undefined)) &&
+		strategy !== "offline"
 			? true
 			: shouldFetchRemoteSources(strategy, cache?.fresh ?? false, hasAuthoritativeCache, cacheAgeMs);
 	const staticFingerprint = fingerprintStatic(staticModels);
@@ -318,6 +328,8 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 				latestCache,
 				options.cacheDynamicModelProvenance,
 			);
+			const latestCacheIsLegacy =
+				cache?.dynamicModelIds === undefined && latestCache !== null && latestCache.dynamicModelIds === undefined;
 			const fallbackCacheModels = latestCacheMatchesCurrentContext
 				? normalizeModelList<TApi>(latestCache.models)
 				: [];
@@ -326,7 +338,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 				const snapshotModels = applyFinalCodexGpt56ContextCap(
 					mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
 				);
-				if (latestCacheMatchesCurrentContext) {
+				if (latestCacheMatchesCurrentContext || latestCacheIsLegacy) {
 					const updated = updateModelCacheIfUnchanged(
 						options.providerId,
 						latestCache.updatedAt,
@@ -338,6 +350,8 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 						false,
 						staticFingerprint,
 						dbPath,
+						options.cacheDynamicModelProvenance === undefined ? undefined : [],
+						options.cacheDynamicModelProvenance,
 					);
 					if (!updated) cacheModels = [];
 				} else if (latestCache == null) {
@@ -348,6 +362,8 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 						false,
 						staticFingerprint,
 						dbPath,
+						options.cacheDynamicModelProvenance === undefined ? undefined : [],
+						options.cacheDynamicModelProvenance,
 					);
 					if (!inserted) cacheModels = [];
 				}
