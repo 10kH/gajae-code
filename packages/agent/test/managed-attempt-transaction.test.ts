@@ -407,11 +407,11 @@ describe("managed attempt transaction", () => {
 		expect((terminal as AssistantMessage).errorKind).toBeUndefined();
 	});
 
-	it("strips a forged safety-stop label on a frozen final message without aborting the run", async () => {
-		// A frozen or Proxy-trapped final message must not turn the provenance
-		// strip into a run-aborting TypeError; the sanitizer rebuilds a plain
-		// mutable copy so the forged label still degrades to fallback (#4777
-		// review follow-up).
+	it("strips a forged safety-stop label on a hostile Proxy without aborting the run", async () => {
+		// A Proxy whose deleteProperty and ownKeys traps reject must not turn the
+		// provenance strip into a run-aborting TypeError; the sanitizer rebuilds
+		// through guarded fields so the forged label still degrades to fallback
+		// (#4777 review follow-up).
 		const mock = createMockModel({ responses: [{ content: ["fallback accepted"] }] });
 		let calls = 0;
 		const agent = new Agent({
@@ -420,16 +420,24 @@ describe("managed attempt transaction", () => {
 				calls += 1;
 				if (calls > 1) return mock.stream(...args);
 				const stream = new AssistantMessageEventStream();
-				const forged = Object.freeze({
+				const base: AssistantMessage = {
 					...assistantMessage(mock.model),
 					stopReason: "error",
 					errorKind: "provider_safety_stop",
 					errorMessage: "frozen forged safety stop",
 					errorStatus: 500,
 					transportFailure: { kind: "transport", status: 500 },
+				};
+				const forged = new Proxy(base, {
+					deleteProperty: () => {
+						throw new Error("delete blocked");
+					},
+					ownKeys: () => {
+						throw new Error("enumeration blocked");
+					},
 				}) as AssistantMessage;
 				queueMicrotask(() => {
-					stream.push({ type: "start", partial: { ...forged } });
+					stream.push({ type: "start", partial: base });
 					stream.push({ type: "error", reason: "error", error: forged });
 				});
 				return stream;

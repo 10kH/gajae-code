@@ -573,11 +573,12 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	stream: AssistantMessageEventStream;
 	model: Model<T>;
 	options: { signal?: AbortSignal; fetch?: unknown } | undefined;
+	callerFetch?: unknown;
 	/** Vertex preserves `textSignature` on streamed text deltas; google-generative-ai does not. */
 	retainTextSignature?: boolean;
 	onFirstToken?: () => void;
 }): Promise<void> {
-	const { googleStream, output, stream, model, options, retainTextSignature, onFirstToken } = args;
+	const { googleStream, output, stream, model, options, callerFetch, retainTextSignature, onFirstToken } = args;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 	let currentBlock: TextContent | ThinkingContent | null = null;
@@ -669,7 +670,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 					output,
 					candidate.finishReason,
 					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
-					options?.fetch,
+					callerFetch,
 				);
 				output.stopReason = "error";
 			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
@@ -685,7 +686,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 			if (isGooglePromptSafetyStopReason(blockReason)) {
 				// Prompt-level block reasons carry the same adapter-minted
 				// authority as candidate finish reasons (#4777).
-				mintProviderSafetyStop(output, blockReason, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY, options?.fetch);
+				mintProviderSafetyStop(output, blockReason, PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY, callerFetch);
 				output.stopReason = "error";
 			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 				output.stopReason = "error";
@@ -978,6 +979,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				stream,
 				model,
 				options,
+				callerFetch: plan.fetch ?? options?.fetch,
 				retainTextSignature,
 				onFirstToken: () => {
 					firstTokenTime = Date.now();

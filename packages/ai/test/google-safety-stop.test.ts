@@ -78,23 +78,49 @@ const promptBlockReasonFixtures = {
 
 async function streamGoogleResponse(response: unknown | unknown[], api: GoogleStreamApi = "google-generative-ai") {
 	const model = createBaseModel(api);
-	const stream = streamGoogleGenAI({
-		model,
-		api,
-		options: undefined,
-		prepare: () => ({
-			params: { model: model.id, contents: [] },
-			url: "https://google.example.test/stream",
-			headers: {},
-			fetch: async () => createSseResponse(Array.isArray(response) ? response : [response]),
-		}),
-	});
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = (async () =>
+		createSseResponse(Array.isArray(response) ? response : [response])) as unknown as typeof fetch;
+	try {
+		const stream = streamGoogleGenAI({
+			model,
+			api,
+			options: undefined,
+			prepare: () => ({
+				params: { model: model.id, contents: [] },
+				url: "https://google.example.test/stream",
+				headers: {},
+			}),
+		});
 
-	await collectEvents(stream);
-	return stream.result();
+		await collectEvents(stream);
+		return stream.result();
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 }
 
 describe("Google safety stops", () => {
+	it("does not authenticate a safety chunk from caller-selected prepare fetch", async () => {
+		const model = createBaseModel("google-generative-ai");
+		const stream = streamGoogleGenAI({
+			model,
+			api: "google-generative-ai",
+			options: undefined,
+			prepare: () => ({
+				params: { model: model.id, contents: [] },
+				url: "https://google.example.test/stream",
+				headers: {},
+				fetch: async () => createSseResponse([{ candidates: [{ finishReason: "SAFETY" }] }]),
+			}),
+		});
+
+		await collectEvents(stream);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorKind).toBeUndefined();
+	});
+
 	it("classifies the exhaustive candidate finish-reason partition", async () => {
 		for (const finishReason of candidateFinishReasonFixtures.commonSafety) {
 			const result = await streamGoogleResponse({ candidates: [{ finishReason }] });

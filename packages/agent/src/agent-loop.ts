@@ -435,7 +435,10 @@ function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
  * letting the strip abort the run.
  */
 
-function sanitizeProviderSafetyStopProvenance(message: AssistantMessage): AssistantMessage {
+function sanitizeProviderSafetyStopProvenance(
+	message: AssistantMessage,
+	model: AgentLoopConfig["model"],
+): AssistantMessage {
 	const errorKindRead = managedPropertyRead(message, "errorKind");
 	if (
 		errorKindRead.ok &&
@@ -449,14 +452,7 @@ function sanitizeProviderSafetyStopProvenance(message: AssistantMessage): Assist
 		delete rebuilt.errorKind;
 		return rebuilt;
 	}
-	try {
-		delete message.errorKind;
-		return message;
-	} catch {
-		const rebuilt: AssistantMessage = { ...message };
-		delete rebuilt.errorKind;
-		return rebuilt;
-	}
+	return managedAssistantShell(message, model);
 }
 
 /**
@@ -3605,7 +3601,7 @@ async function streamAssistantResponse(
 
 						case "done":
 						case "error": {
-							const finished = sanitizeProviderSafetyStopProvenance(await finishResponse());
+							const finished = sanitizeProviderSafetyStopProvenance(await finishResponse(), config.model);
 							const finalMessage = config.fallbackManaged
 								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 								: finished;
@@ -3629,7 +3625,7 @@ async function streamAssistantResponse(
 				closeIterator();
 			}
 
-			const finished = sanitizeProviderSafetyStopProvenance(await finishResponse());
+			const finished = sanitizeProviderSafetyStopProvenance(await finishResponse(), config.model);
 			const trailing = config.fallbackManaged
 				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
 				: finished;

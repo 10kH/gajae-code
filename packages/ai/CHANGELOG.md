@@ -29,6 +29,7 @@
 
 ### Fixed
 - Safety-stop minting now fails closed for caller-controlled adapter transport seams, including injected Anthropic clients and custom fetch implementations, so public provider entry points cannot turn fabricated refusal envelopes into terminal authority (#4777 review).
+- Google adapter safety-stop minting now tracks the fetch selected by caller-supplied `prepare()` plans, preventing a forged safety chunk from becoming terminal authority when `options.fetch` is absent.
 - Public provider adapter calls that inject a custom `fetch` can no longer mint terminal safety-stop authority from fabricated OpenAI, Anthropic, or Google responses; the adapter provenance boundary fails closed until a trusted invocation or authenticated transport exists (#4777 review).
 - Grok Build now gets the same 300s idle window as other long-turn providers, so turns no longer stall waiting on a shorter default.
 - `getCachedUsageReport` surfaces cached usage for API-key credentials, not only OAuth accounts (#4686).
