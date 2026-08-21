@@ -9,6 +9,10 @@ import type { Api, Model, Provider } from "./types";
 const DEFAULT_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
 
+// Coalescing guards the implicit cold-start strategy only: an explicit
+// "online" refresh owns its fetch so a newer probe can always supersede an
+// older in-flight refresh (the registry pins that ordering), and callers never
+// block behind a refresh whose completion they may be expected to unblock.
 // A legacy or missing row has no dynamic-ID marker, so concurrent cold-start
 // resolutions would otherwise all fetch before the first one can publish it.
 const legacyDynamicRefreshes = new Map<string, Promise<void>>();
@@ -142,7 +146,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	const ttlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
 	const legacyCache = readModelCache<TApi>(options.providerId, ttlMs, now, options.cacheDbPath);
 	if (
-		strategy === "offline" ||
+		strategy !== "online-if-uncached" ||
 		typeof options.fetchDynamicModels !== "function" ||
 		provenance === undefined ||
 		(legacyCache !== null && legacyCache.dynamicModelIds !== undefined)

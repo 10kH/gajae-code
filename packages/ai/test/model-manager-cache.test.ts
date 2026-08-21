@@ -188,6 +188,41 @@ describe("online-if-uncached model refresh", () => {
 		expect(secondResult.models.map(entry => entry.id)).toEqual(["static", "dynamic"]);
 	});
 
+	test("keeps explicit online refreshes independent of cold-start coalescing", async () => {
+		const providerId = "cache-explicit-online-not-coalesced";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		const fetches: Array<PromiseWithResolvers<void>["resolve"]> = [];
+		let discoveryCalls = 0;
+		const options = {
+			providerId,
+			staticModels,
+			cacheDbPath,
+			cacheDynamicModelProvenance: provenance,
+			now: () => now,
+			fetchDynamicModels: async () => {
+				const callIndex = discoveryCalls + 1;
+				discoveryCalls = callIndex;
+				const gate = Promise.withResolvers<void>();
+				fetches.push(gate.resolve);
+				await gate.promise;
+				return [model(providerId, `dynamic-${callIndex}`)];
+			},
+		};
+
+		const older = resolveProviderModels<Api>(options, "online");
+		await Bun.sleep(0);
+		const newer = resolveProviderModels<Api>(options, "online");
+		await Bun.sleep(0);
+		// An explicit refresh owns its fetch: neither call waits on the other.
+		expect(discoveryCalls).toBe(2);
+		for (const release of fetches) release();
+		const [olderResult, newerResult] = await Promise.all([older, newer]);
+		expect(olderResult.models.map(entry => entry.id)).toEqual(["static", "dynamic-1"]);
+		expect(newerResult.models.map(entry => entry.id)).toEqual(["static", "dynamic-2"]);
+	});
+
 	test("sanitizes poisoned cached display names", async () => {
 		const providerId = "cache-poisoned-display-name";
 		const now = 1_700_000_000_000;
