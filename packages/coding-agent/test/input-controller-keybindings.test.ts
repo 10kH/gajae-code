@@ -3,6 +3,8 @@ import { afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:t
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Container } from "@gajae-code/tui";
+import { getDefaultTabWidth, setDefaultTabWidth } from "@gajae-code/utils";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { formatKeyHint as formatKeyHintForPlatform } from "../src/config/keybindings";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
@@ -197,6 +199,10 @@ async function createContext(options?: {
 	const editorContainer = {
 		clear: vi.fn(() => {
 			editorContainerChildren.length = 0;
+		}),
+		detachChild: vi.fn((child: unknown) => {
+			const index = editorContainerChildren.indexOf(child);
+			if (index >= 0) editorContainerChildren.splice(index, 1);
 		}),
 		addChild: vi.fn((child: unknown) => {
 			editorContainerChildren.push(child);
@@ -708,6 +714,50 @@ describe("InputController keybinding setup", () => {
 		expect(queues.sessionQueuedMessages).toEqual(["newest session queue"]);
 		expect(spies.removeQueuedMessageForEditing).toHaveBeenCalledWith("followUp:0");
 		expect(spies.updatePendingMessagesDisplay).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps a real composer alive across queued-message selector open/restore", async () => {
+		const { InputController, ctx, queues } = await createContext();
+		const editor = new CustomEditor(defaultEditorTheme);
+		const editorContainer = new Container();
+		editorContainer.addChild(editor);
+		ctx.editor = editor as unknown as InteractiveModeContext["editor"];
+		ctx.editorContainer = editorContainer as unknown as InteractiveModeContext["editorContainer"];
+		queues.editorContainerChildren = editorContainer.children as unknown[];
+		const defaultWidth = getDefaultTabWidth();
+		const otherWidth = defaultWidth === 3 ? 4 : 3;
+		const invalidations = { count: 0 };
+		const originalInvalidate = editor.invalidate.bind(editor);
+		editor.invalidate = () => {
+			invalidations.count += 1;
+			originalInvalidate();
+		};
+		try {
+			editor.setText("current draft");
+			queues.sessionQueuedMessages.push("older session queue", "newest session queue");
+			const controller = new InputController(ctx);
+
+			for (let cycle = 0; cycle < 3; cycle += 1) {
+				controller.handleDequeue();
+				const selector = editorContainer.children[0];
+				if (!(selector instanceof QueuedMessageSelectorComponent)) {
+					throw new Error("Expected queued message selector to be shown");
+				}
+				expect(editorContainer.children).toEqual([selector]);
+				selector.handleInput("\x1b");
+
+				expect(editorContainer.children).toEqual([editor]);
+				setDefaultTabWidth(otherWidth);
+				setDefaultTabWidth(defaultWidth);
+			}
+
+			expect(invalidations.count).toBeGreaterThan(3);
+			editor.handleInput("x");
+			expect(editor.getText()).toBe("current draftx");
+		} finally {
+			setDefaultTabWidth(defaultWidth);
+			editor.dispose();
+		}
 	});
 
 	it("deletes the selected queued message from the selector", async () => {
