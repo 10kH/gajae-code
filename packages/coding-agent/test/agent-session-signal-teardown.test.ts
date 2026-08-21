@@ -96,37 +96,37 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 	});
 
 	it("drains tool-registered cleanups so a non-eval owner is not orphaned on signal exit", async () => {
-		// An autoresearch mission registers its kernel under its own owner id, which is
-		// deliberately distinct from the session's eval owner (spec f33). Before the
-		// signal path drained these, Ctrl-C left the subprocess running.
-		const missionOwner = "autoresearch:mission-1";
+		// A session Python REPL owns its kernel under `python:<session-id>`, deliberately
+		// distinct from the session eval owner. Before signal teardown drained tool cleanups,
+		// Ctrl-C left that tool-owned subprocess running.
+		const pythonOwner = "python:session-1";
 		const reaped: string[] = [];
 		session!.registerToolSessionCleanup(async () => {
-			reaped.push(missionOwner);
+			reaped.push(pythonOwner);
 		});
 
 		await session!.disposeChildSubprocesses();
 
-		expect(reaped).toEqual([missionOwner]);
-		// The mission owner is not the eval owner the built-in disposals target.
-		expect(disposeKernels.mock.calls[0]?.[0]).not.toBe(missionOwner);
+		expect(reaped).toEqual([pythonOwner]);
+		// The Python REPL owner is not the eval owner targeted by built-in disposal.
+		expect(disposeKernels.mock.calls[0]?.[0]).not.toBe(pythonOwner);
 	});
 
 	it("drains transition-registered cleanups, which is where the SDK actually puts tool cleanups", async () => {
 		// The SDK binds a tool's `registerSessionCleanup` to
 		// registerToolSessionTransitionCleanup (sdk/session.ts), so a discoverable
-		// builtin like the autoresearch mission python tool lands in the TRANSITION
+		// builtin session Python REPL (`python:<session-id>`) lands in the TRANSITION
 		// set, not the one registerToolSessionCleanup fills. Draining only the latter
 		// passed every test while still orphaning the kernel on Ctrl-C in production.
-		const missionOwner = "autoresearch:mission-2";
+		const pythonOwner = "python:session-2";
 		const reaped: string[] = [];
 		session!.registerToolSessionTransitionCleanup(async () => {
-			reaped.push(missionOwner);
+			reaped.push(pythonOwner);
 		});
 
 		await session!.disposeChildSubprocesses();
 
-		expect(reaped).toEqual([missionOwner]);
+		expect(reaped).toEqual([pythonOwner]);
 	});
 
 	it("drains both cleanup sets on a single signal teardown", async () => {
@@ -177,7 +177,7 @@ describe("AgentSession.disposeChildSubprocesses (#698 signal teardown)", () => {
 
 	it("never rejects when a tool cleanup throws", async () => {
 		session!.registerToolSessionCleanup(() => {
-			throw new Error("mission kernel dispose boom");
+			throw new Error("Python REPL kernel dispose boom");
 		});
 
 		await expect(session!.disposeChildSubprocesses()).resolves.toBeUndefined();

@@ -204,7 +204,7 @@ describe("autoresearch ledger", () => {
 			evaluator: "mission-agent",
 			slug: "tokenizer-mission",
 		}); // verdict_issued
-		const cleared = await autoresearchClear(root); // kernel_cleared
+		const cleared = await autoresearchClear(root); // mission_cleared
 
 		// `clear` retires the ledger with the mission, so the full ordered trail
 		// lives in the retired copy rather than the live (now empty) one.
@@ -219,7 +219,7 @@ describe("autoresearch ledger", () => {
 			"run_logged",
 			"critic_recorded",
 			"verdict_issued",
-			"kernel_cleared",
+			"mission_cleared",
 		]);
 		expect(new Set(ledger.map(event => event.event))).toEqual(new Set(AUTORESEARCH_LEDGER_EVENT_KINDS));
 		for (const event of ledger) {
@@ -249,7 +249,7 @@ describe("autoresearch ledger", () => {
 		await autoresearchWrite(baseMission(root));
 		const clear = await autoresearchClear(root);
 		expect(clear.cleared).toBe(true);
-		expect(clear.ledgerEvent.event).toBe("kernel_cleared");
+		expect(clear.ledgerEvent.event).toBe("mission_cleared");
 		const readBack = await autoresearchRead(root, TEST_SESSION_ID);
 		expect(readBack.exists).toBe(false);
 		// The outgoing ledger is retired with the mission, so a successor starts
@@ -257,7 +257,7 @@ describe("autoresearch ledger", () => {
 		expect(readBack.ledger).toEqual([]);
 	});
 
-	it("retires the outgoing ledger complete with its own kernel_cleared row", async () => {
+	it("retires the outgoing ledger complete with its own mission_cleared row", async () => {
 		const root = await tempDir();
 		await autoresearchWrite(baseMission(root));
 		const clear = await autoresearchClear(root);
@@ -269,7 +269,7 @@ describe("autoresearch ledger", () => {
 			.filter(line => line.trim() !== "")
 			.map(line => (JSON.parse(line) as { event: string }).event);
 		// The audit trail is preserved, not erased: it ends with its own clear.
-		expect(kinds).toEqual(["mission_created", "kernel_cleared"]);
+		expect(kinds).toEqual(["mission_created", "mission_cleared"]);
 		expect(await Bun.file(path.join(clear.retiredTo!, "mission.json")).exists()).toBe(true);
 	});
 
@@ -577,7 +577,7 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		expect(readPayload.ledger.map(entry => entry.event)).toEqual(["mission_created"]);
 		const cleared = await runNativeAutoresearchCommand(["clear", "--json"], root);
 		expect(cleared.status).toBe(0);
-		expect(JSON.parse(cleared.stdout!)).toMatchObject({ cleared: true, ledger_event: "kernel_cleared" });
+		expect(JSON.parse(cleared.stdout!)).toMatchObject({ cleared: true, ledger_event: "mission_cleared" });
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
 	});
 
@@ -591,7 +591,7 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		expect(result.stderr).toContain("invalid path component");
 	});
 
-	it("records run, critic, verdict, and report through public CLI verbs", async () => {
+	it("records run, critic, and verdict through public CLI verbs", async () => {
 		const root = await tempDir();
 		await runNativeAutoresearchCommand(
 			["write", "--goal", "Measure parser throughput", "--mode", "data", "--slug", "parser-throughput"],
@@ -612,9 +612,6 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 			root,
 		);
 		expect(verdict.status).toBe(0);
-		const report = await runNativeAutoresearchCommand(["report", "--summary", "Measured parser throughput"], root);
-		expect(report.status).toBe(0);
-		expect(report.stdout).toContain("report_path=");
 		const ledger = (await autoresearchRead(root, TEST_SESSION_ID)).ledger;
 		expect(ledger.map(entry => entry.event)).toEqual([
 			"mission_created",
@@ -628,9 +625,6 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		expect(
 			(await Bun.file(path.join(getAutoresearchPaths(root, TEST_SESSION_ID).dir, "runs.jsonl")).text()).trim(),
 		).not.toBe("");
-		const reportPath = report.stdout!.match(/report_path=(.+)\n/)?.[1];
-		if (!reportPath) throw new Error("missing report path");
-		expect(await Bun.file(reportPath).text()).toContain("Critic review");
 	});
 
 	it("rejects unknown flags", async () => {
@@ -640,13 +634,49 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 		expect(result.stderr).toContain("unknown flag");
 	});
 
-	it("renders help without touching any session state", async () => {
+	it("retires report explicitly instead of treating it as cold intake", async () => {
+		const root = await tempDir();
+
+		const bare = await runNativeAutoresearchCommand(["report"], root);
+		expect(bare.status).toBe(2);
+		expect(bare.stderr).toContain('unknown verb "report"');
+
+		const json = await runNativeAutoresearchCommand(["report", "--json"], root);
+		expect(json.status).toBe(2);
+		expect(json.stderr).toContain('unknown verb "report"');
+		expect(json.stdout).toBeUndefined();
+	});
+
+	it("keeps the existing no-mission ledger-verb boundary observable", async () => {
+		const root = await tempDir();
+		const run = await runNativeAutoresearchCommand(
+			["log-run", "--run-id", "run-1", "--status", "keep", "--description", "baseline"],
+			root,
+		);
+		expect(run.status).toBe(2);
+		expect(run.stderr).toContain("autoresearch run logging requires an active mission");
+
+		// The current runtime deliberately permits a ledger-only verdict without a mission.
+		// This pins the live boundary; the plan's broader no-mission wording needs a production
+		// decision rather than a test-only semantic change.
+		const verdict = await runNativeAutoresearchCommand(
+			["verdict", "--status-json", '{"verdict":"best_effort"}', "--evidence", "measured", "--evaluator", "agent"],
+			root,
+		);
+		expect(verdict.status).toBe(0);
+		expect((await autoresearchRead(root, TEST_SESSION_ID)).ledger.map(entry => entry.event)).toEqual([
+			"verdict_issued",
+		]);
+	});
+
+	it("renders help without mentioning the retired report verb or touching session state", async () => {
 		const root = await tempDir();
 		const result = await runNativeAutoresearchCommand(["--help"], root);
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("--spec");
 		expect(result.stdout).toContain("Handoff intake");
 		expect(result.stdout).toContain("Cold intake");
+		expect(result.stdout).not.toContain("report");
 		expect((await autoresearchRead(root, TEST_SESSION_ID)).exists).toBe(false);
 	});
 

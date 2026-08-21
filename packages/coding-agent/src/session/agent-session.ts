@@ -7695,12 +7695,12 @@ export class AgentSession {
 			disposeVmContextsByOwner(kernelOwnerId).catch((error: unknown) =>
 				logger.warn("signal teardown: disposeVmContextsByOwner failed", { error }),
 			),
-			// Tool-owned resources (e.g. an autoresearch mission's persistent Python
+			// Tool-owned resources (e.g. the python tool's persistent per-session
 			// kernel) register their own disposer keyed by an owner id that is NOT
 			// #evalKernelOwnerId, so the two disposals above never reach them. Drain
 			// BOTH cleanup sets here inside the same budget: the SDK binds a tool's
 			// `registerSessionCleanup` to registerToolSessionTransitionCleanup, so a
-			// mission kernel lands in the transition set while a directly-registered
+			// python REPL kernel lands in the transition set while a directly-registered
 			// cleanup lands in the other. Graceful dispose drains both; draining only
 			// one here left signal exit orphaning the subprocess. Each runner clears
 			// its set, so a graceful dispose running first makes this a no-op rather
