@@ -32,7 +32,7 @@ import { type JsonSchemaValidationIssue, validateJsonSchemaValue } from "@gajae-
 import * as canonicalSdk from "@gajae-code/coding-agent/sdk";
 import { logger, prompt, untilAborted } from "@gajae-code/utils";
 import { AsyncJobManager } from "../async";
-import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../config/autorouting-contract";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import { ModelRegistry } from "../config/model-registry";
 import { formatModelString, resolveModelOverrideWithAuthFallback } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
@@ -73,11 +73,11 @@ import { persistTaskTokenLog, taskTokenLogFromUsage } from "./token-log";
 import {
 	type AgentDefinition,
 	type AgentProgress,
-	createLocalErrorSummary,
 	type AutoroutingAttempt,
 	type AutoroutingAttemptCode,
 	type AutoroutingPreflightFailure,
 	assertRoutingEvidenceInvariant,
+	createLocalErrorSummary,
 	createSetupFailureSummary,
 	hasCompleteUsageCostBreakdown,
 	isAssistantLocalErrorKind,
@@ -231,7 +231,7 @@ export interface ExecutorOptions {
 	routing?: TaskRoutingEvidence;
 	/** Ordered, normalized autorouting candidates for the cross-phase preflight ledger. */
 	autoroutingCandidates?: string[];
-	autoroutingSkips?: Array<{ selector: string; code: import("../config/autorouting-contract").AutoroutingReasonCode }>;
+	autoroutingSkips?: Array<{ selector: string; code: AutoroutingReasonCode }>;
 	autoroutingPreflightErrors?: Map<string, unknown>;
 	autoroutingPreflight?: boolean;
 	autoroutingAttemptId?: string;
@@ -2696,7 +2696,7 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 export function boundedSelector(value: string): string {
 	const bounded = value
 		.normalize("NFKC")
-		.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+		.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu, "")
 		.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH);
 	return bounded || "<omitted-selector>";
 }
@@ -2802,6 +2802,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// model that never passed preflight. Only bound the copies that reach evidence/telemetry
 	// (attempts, skips, requestedSelector), never the selector actually used for modelOverride.
 	const candidates = options.autoroutingCandidates.filter(selector => selector.length > 0);
+	const durablePublicationAvailable =
+		options.managedPersistence !== undefined ||
+		options.parentArtifactManager !== undefined ||
+		(typeof options.sessionFile === "string" && options.sessionFile.length > 0);
 	const routedOptions = options.routing ? { ...options.routing, ...skips } : options.routing;
 	if (candidates.length === 0)
 		return preflightTerminalResult({ ...options, routing: routedOptions }, attempts, "all_candidates_skipped");
@@ -2851,7 +2855,11 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			...options,
 			autoroutingPreflight: false,
 			preflightProbe: false,
-			preflightDurable: true,
+			// A synchronous Task may have no child transcript or artifact authority. In
+			// that case there is nothing durable to publish at the provider fence, so
+			// execute the accepted candidate through the artifact-only path instead of
+			// asking an in-memory SessionManager to commit a nonexistent staged session.
+			preflightDurable: durablePublicationAvailable,
 			autoroutingAttemptId: `${options.id}-${consumed.size}`,
 			modelOverride: [selector],
 			parentActiveModelPattern: undefined,

@@ -9,10 +9,10 @@
 import { createHash } from "node:crypto";
 import type { Api, Model } from "@gajae-code/ai/core";
 import {
-	AUTOROUTING_SELECTOR_PATTERN,
 	AUTOROUTING_TIERS,
 	type AutoroutingSetup,
 	type AutoroutingTier,
+	isValidAutoroutingSelector,
 	type TierMap,
 } from "./autorouting-contract";
 import {
@@ -136,8 +136,8 @@ function buildAllowlist(setup: AutoroutingSetup): Set<string> | undefined {
 function selectorWithEffort(model: Model<Api>, effort: TierEffort | undefined): string {
 	const selector = formatModelString(model);
 	const generated = effort === undefined ? selector : `${selector}:${effort}`;
-	if (!new RegExp(AUTOROUTING_SELECTOR_PATTERN).test(generated)) {
-		throw new Error(`Generated selector does not match autorouting grammar: ${generated}`);
+	if (!isValidAutoroutingSelector(generated)) {
+		throw new Error(`Generated selector does not match autorouting grammar or length bound: ${generated}`);
 	}
 	return generated;
 }

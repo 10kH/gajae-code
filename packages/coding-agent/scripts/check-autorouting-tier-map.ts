@@ -41,7 +41,7 @@ function modelKey(provider: string, id: string): string {
 }
 
 function isImageGenerationOnly(model: CommittedCatalogModel): boolean {
-	return Array.isArray(model.output) && model.output.includes("image");
+	return Array.isArray(model.output) && model.output.length > 0 && model.output.every(output => output === "image");
 }
 
 export function isInAutoroutingGateScope(provider: string, id: string, model: CommittedCatalogModel): boolean {

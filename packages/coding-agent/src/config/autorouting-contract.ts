@@ -50,7 +50,8 @@ export type AutoroutingProvenance = {
 export const AUTOROUTING_SELECTOR_MAX_LENGTH = 256;
 
 /** The exact selector grammar published by the generated config schema. */
-export const AUTOROUTING_SELECTOR_PATTERN = "^[^/\\s*?\\[]+\\/[^\\s*?\\[]+(?::(?:minimal|low|medium|high|xhigh))?$";
+export const AUTOROUTING_SELECTOR_PATTERN =
+	"^[^/\\s*?\\[\\x00-\\x1F\\x7F-\\x9F\\u2028\\u2029]+\\/[^\\s*?\\[\\x00-\\x1F\\x7F-\\x9F\\u2028\\u2029]+(?::(?:minimal|low|medium|high|xhigh))?$";
 
 export const AUTOROUTING_SELECTOR_DESCRIPTION =
 	"provider/modelId with an optional valid thinking suffix (:minimal|low|medium|high|xhigh), no globs, no bare model ids, no pi/<role> role aliases.";

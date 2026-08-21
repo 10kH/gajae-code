@@ -1,8 +1,9 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai/core";
+import type { FallbackTriggerClass } from "@gajae-code/ai/utils/fallback-transport";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
-import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../config/autorouting-contract";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
 import type { SpawnRoiReconciliation } from "./roi-reconciliation";
@@ -609,7 +610,7 @@ export type AutoroutingPreflightFailure =
 			op: "auth_resolve" | "session_open" | "tool_bootstrap" | "preflight_validation";
 			transient: boolean;
 	  }
-	| { kind: "transport"; class: import("@gajae-code/ai/utils/fallback-transport").FallbackTriggerClass };
+	| { kind: "transport"; class: FallbackTriggerClass };
 
 export type AutoroutingAttemptCode =
 	| "probe_passed"
@@ -628,7 +629,7 @@ export type AutoroutingAttempt = {
 
 export type AutoroutingSkip = {
 	selector: string;
-	code: import("../config/autorouting-contract").AutoroutingReasonCode;
+	code: AutoroutingReasonCode;
 };
 
 export interface TaskRoutingEvidence {
@@ -660,8 +661,15 @@ const AUTOROUTING_ATTEMPT_CODES = new Set<AutoroutingAttemptCode>([
 	"unclassified_terminal",
 ]);
 
+const ROUTING_UNSAFE_TEXT_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+
 function validBoundedSelector(value: unknown): value is string {
-	return typeof value === "string" && value.length > 0 && value.length <= AUTOROUTING_SELECTOR_MAX_LENGTH;
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= AUTOROUTING_SELECTOR_MAX_LENGTH &&
+		!ROUTING_UNSAFE_TEXT_RE.test(value)
+	);
 }
 
 export function assertRoutingEvidenceInvariant(evidence: TaskRoutingEvidence): void {
@@ -671,13 +679,12 @@ export function assertRoutingEvidenceInvariant(evidence: TaskRoutingEvidence): v
 		(!evidence.effectiveModel || evidence.effectiveModel.length > AUTOROUTING_SELECTOR_MAX_LENGTH)
 	)
 		throw new Error("Invalid effective routing model.");
+	if (!validBoundedSelector(evidence.requestedSelector)) throw new Error("Invalid requested routing selector.");
 	if (evidence.authResolvedModel && evidence.authResolvedModel === evidence.effectiveModel)
 		throw new Error("authResolvedModel must differ from effectiveModel when present.");
 	if (evidence.authResolvedModel !== undefined && !validBoundedSelector(evidence.authResolvedModel))
 		throw new Error("Invalid auth-resolved routing model.");
 
-	if (evidence.requestedSelector.length > AUTOROUTING_SELECTOR_MAX_LENGTH)
-		throw new Error("Invalid requested routing selector.");
 	if (evidence.skips && evidence.skips.length > 16) throw new Error("Too many autorouting skips.");
 	if (evidence.attempts && evidence.attempts.length > 6) throw new Error("Too many autorouting attempts.");
 	if (

@@ -46,6 +46,18 @@ describe("autorouting tier-map CI gate", () => {
 		expect(result.skippedKeys).toEqual(["qianfan/deepseek-v3.2"]);
 	});
 
+	it("keeps text-capable multimodal models in scope and excludes image-only models", () => {
+		const catalog = {
+			vision: {
+				"text-image": { provider: "vision", id: "text-image", output: ["text", "image"] },
+				"image-only": { provider: "vision", id: "image-only", output: ["image"] },
+			},
+		};
+		const result = getAutoroutingTierMapGateReport(catalog);
+		expect(result.inScopeKeys).toEqual(["vision/text-image"]);
+		expect(result.unlabeledKeys).toEqual(["vision/text-image"]);
+	});
+
 	it("rejects a skip entry with an empty rationale", () => {
 		const catalog = {
 			qianfan: { "deepseek-v3.2": { provider: "qianfan", id: "deepseek-v3.2", reasoning: false, input: ["text"] } },

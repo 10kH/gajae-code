@@ -1048,11 +1048,12 @@ describe("autorouting boundary red-team: malformed evidence and hostile selector
 		const hostile = ["../escape/model", "provider/\u0000\u0001", `provider/${"x".repeat(10_000)}`, "аlpha/model"];
 		const perSelectorIssues = hostile.map(selector => validateAutoroutingLocal({ tiers: { fast: [selector] } }));
 		const localIssues = perSelectorIssues.flat();
-		// The selector grammar caps length at the routing-evidence bound, so the over-long
-		// entry is rejected here, before it can execute and fail finalization; the other
-		// hostile shapes stay grammar-valid and flow to the executor's sanitization paths.
+		// The selector grammar caps length at the routing-evidence bound and rejects
+		// control bytes before they can reach routing; the other hostile shapes remain
+		// grammar-valid and flow to the executor's sanitization paths.
 		const overLongIssues = perSelectorIssues[2];
-		const toleratedIssues = [0, 1, 3].flatMap(index => perSelectorIssues[index]);
+		const controlIssues = perSelectorIssues[1];
+		const toleratedIssues = [0, 3].flatMap(index => perSelectorIssues[index]);
 		let controlOnlyError = "";
 		try {
 			await runSubprocess({
@@ -1081,7 +1082,11 @@ describe("autorouting boundary red-team: malformed evidence and hostile selector
 			localIssueDetails: localIssues.map(issue => issue.detail),
 			controlOnlyError,
 		};
-		const pass = overLongIssues.length > 0 && toleratedIssues.length === 0 && controlOnlyError.length === 0;
+		const pass =
+			overLongIssues.length > 0 &&
+			controlIssues.length > 0 &&
+			toleratedIssues.length === 0 &&
+			controlOnlyError.length === 0;
 		record(
 			"hostile-selector-sanitization",
 			"AC12",

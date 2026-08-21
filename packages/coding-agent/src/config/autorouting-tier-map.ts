@@ -72,7 +72,7 @@ export const CURATED_TIER_LABELS = {
 	],
 } as const satisfies CuratedTierLabels;
 
-/** Generated from packages/ai/src/models.json at feature land: 3917 in-scope baseline skips. */
+/** Generated from packages/ai/src/models.json at feature land: 3919 in-scope baseline skips. */
 export const TIER_MAP_SKIP_LIST = {
 	"cloudflare-ai-gateway/openai/gpt-4.1": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"cloudflare-ai-gateway/openai/gpt-4.1-mini": { rationale: "post-rebase catalog addition from dev; not yet curated" },
@@ -4323,6 +4323,7 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai-codex/gpt-5.4-nano": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-5.5": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai-codex/gpt-5.6-luna": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
+	"openai-codex/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/codex-mini-latest": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-4-turbo": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
@@ -4362,6 +4363,7 @@ export const TIER_MAP_SKIP_LIST = {
 	"openai/gpt-5.6-luna": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-5.6-sol": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/gpt-5.6-terra": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
+	"openai/gpt-image-2": { baseline: true, rationale: "multimodal catalog addition; not yet curated" },
 	"openai/gpt-realtime-2.1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1": { baseline: true, rationale: "pre-feature baseline; not yet curated" },
 	"openai/o1-pro": { baseline: true, rationale: "pre-feature baseline; not yet curated" },

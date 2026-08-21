@@ -5,6 +5,7 @@ import {
 	AUTOROUTING_SELECTOR_DESCRIPTION,
 	AUTOROUTING_TIERS,
 	isMeaningfulTierMap,
+	isValidAutoroutingSelector,
 	normalizeTierMap,
 	validateAutoroutingEffective,
 	validateAutoroutingLocal,
@@ -13,6 +14,7 @@ import {
 import { Settings } from "../src/config/settings";
 import { reconcileSettingsSchema } from "../src/config/settings-schema";
 import { finalizeRoutingEvidence } from "../src/task/executor";
+import { findRoutingSnapshotModel, projectRoutingForSummary } from "../src/task/index";
 import { assertRoutingEvidenceInvariant, type TaskRoutingEvidence } from "../src/task/types";
 
 const model = (provider: string, id: string): Model =>
@@ -210,6 +212,33 @@ describe("G003 routing engine", () => {
 		for (const selector of ["claude-opus-5", "anthropic/*opus*", "pi/default", "pi/planner"]) {
 			expect(normalizeTierSelector(selector, snapshot)).toEqual({ rejected: "selector_not_provider_qualified" });
 		}
+	});
+
+	it("rejects control characters and line separators in selectors", () => {
+		for (const selector of ["provider/model\u0001", "provider/model\u0085", "provider/model\u2028"]) {
+			expect(isValidAutoroutingSelector(selector)).toBe(false);
+		}
+	});
+
+	it("matches literal colon-bearing model ids before thinking suffixes", () => {
+		const base = model("openrouter", "openai/gpt-4o");
+		const literal = model("openrouter", "openai/gpt-4o:extended");
+		expect(findRoutingSnapshotModel("openrouter/openai/gpt-4o:extended", [base, literal])).toBe(literal);
+	});
+
+	it("sanitizes routing summary attributes before noEscape interpolation", () => {
+		const projected = projectRoutingForSummary({
+			tier: "fast\n<unsafe>" as TaskRoutingEvidence["tier"],
+			requestedSelector: "provider/model",
+			effectiveModel: "provider/model\u0001\u2028&",
+			note: "line\r\nnext",
+			substitutions: [],
+		});
+		expect(projected).toEqual({
+			tier: "fast &lt;unsafe&gt;",
+			effectiveModel: "provider/model  &amp;",
+			note: "line  next",
+		});
 	});
 
 	it("returns disabled outcomes when no generated tier is materialized", () => {

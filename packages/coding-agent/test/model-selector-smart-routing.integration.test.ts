@@ -72,6 +72,18 @@ function createContext(
 		refresh: vi.fn(async () => {}),
 		getError: () => undefined,
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: (query: { candidates?: Model[] } = {}) =>
+			(query.candidates ?? catalog).map(candidate => {
+				const selector = `${candidate.provider}/${candidate.id}`;
+				return {
+					record: {
+						id: selector,
+						name: candidate.name,
+						variants: [{ selector, model: candidate, canonicalId: selector, source: "bundled" }],
+					},
+					model: candidate,
+				};
+			}),
 		resolveCanonicalModel: () => undefined,
 		getDiscoverableProviders: () => [],
 		autoroutingProviderOrder: () => options.providerOrder ?? [...new Set(catalog.map(model => model.provider))],

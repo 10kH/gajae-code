@@ -579,8 +579,8 @@ describe("builtin /routing slash command", () => {
 	});
 
 	it("strips terminal control sequences from hand-edited selectors", () => {
-		// The selector grammar rejects whitespace but not ESC/BEL, so a hand-edited
-		// tier can still smuggle control bytes into the rendered status.
+		// The selector grammar rejects control bytes before they can reach status
+		// rendering, so malformed hand-edited tiers fail closed.
 		const settings = Settings.isolated({ "task.autorouting.enabled": true } as never);
 		settings.set("task.autorouting.tiers", {
 			balanced: ["anthropic/\x1b]0;pwned\x07evil-model"],
@@ -592,10 +592,9 @@ describe("builtin /routing slash command", () => {
 			provenance: settings.get("task.autorouting.provenance"),
 		});
 
-		expect(report).toContain("Autorouting: on");
+		expect(report).toContain("Autorouting: off");
 		expect(report).not.toContain("\x1b");
 		expect(report).not.toContain("\x07");
-		expect(report).toContain("evil-model");
 	});
 
 	it("bounds a pathologically long chain", () => {

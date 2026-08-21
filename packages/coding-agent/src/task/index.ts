@@ -27,7 +27,7 @@ import {
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
 import { normalizeTierSelector, type RoutingOutcome, resolveTaskRouting } from "../config/autorouting";
-import type { AutoroutingReasonCode } from "../config/autorouting-contract";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
@@ -498,6 +498,27 @@ export function resolveForkContextMaxTokens(configured: number, model: Model | u
 	return normalizeForkContextCap(configured, fallback, Number.MAX_SAFE_INTEGER);
 }
 
+const ROUTING_SUMMARY_UNSAFE_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
+
+function sanitizeRoutingSummaryValue(value: string): string {
+	return value.normalize("NFKC").replace(ROUTING_SUMMARY_UNSAFE_RE, " ").slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH);
+}
+
+export function findRoutingSnapshotModel(selector: string, routingSnapshot: readonly Model[]): Model | undefined {
+	const slash = selector.indexOf("/");
+	if (slash <= 0) return undefined;
+	const provider = selector.slice(0, slash).toLowerCase();
+	const modelId = selector.slice(slash + 1);
+	const providerMatches = routingSnapshot.filter(candidate => candidate.provider.toLowerCase() === provider);
+	return (
+		providerMatches.find(candidate => candidate.id === modelId) ??
+		providerMatches.find(candidate => {
+			const suffixMatch = modelId.match(/^(.*):(minimal|low|medium|high|xhigh)$/u);
+			return suffixMatch !== null && candidate.id === suffixMatch[1];
+		})
+	);
+}
+
 /**
  * Project routing evidence into the XML-attribute-safe display view consumed by
  * the task-summary template. The template runtime uses noEscape, so every
@@ -508,9 +529,11 @@ export function projectRoutingForSummary(
 ): { tier: string; effectiveModel: string; note: string } | undefined {
 	if (!routing) return undefined;
 	return {
-		tier: escapeXmlAttribute(routing.tier),
-		effectiveModel: escapeXmlAttribute(routing.effectiveModel ?? routing.requestedSelector),
-		note: escapeXmlAttribute(routing.note ?? ""),
+		tier: escapeXmlAttribute(sanitizeRoutingSummaryValue(routing.tier)),
+		effectiveModel: escapeXmlAttribute(
+			sanitizeRoutingSummaryValue(routing.effectiveModel ?? routing.requestedSelector),
+		),
+		note: escapeXmlAttribute(sanitizeRoutingSummaryValue(routing.note ?? "")),
 	};
 }
 
@@ -610,7 +633,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		this.#sessionRepositoryBinding = sessionRepositoryBinding;
 	}
 
-	#runSubprocess(options: Parameters<typeof runSubprocess>[0]): ReturnType<typeof runSubprocess> {
+	#runSubprocess(options: Parameters<typeof runSubprocess>[0]): Promise<SingleResult> {
 		return (this.#testRunSubprocess ?? runSubprocess)(options);
 	}
 
@@ -2061,14 +2084,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips, preflightErrors };
 				const authenticated: string[] = [];
 				for (const selector of candidates) {
-					const slash = selector.indexOf("/");
-					const provider = selector.slice(0, slash).toLowerCase();
-					const modelId = selector.slice(slash + 1);
-					const model = routingSnapshot.find(
-						candidate =>
-							candidate.provider.toLowerCase() === provider &&
-							(modelId === candidate.id || modelId.startsWith(`${candidate.id}:`)),
-					);
+					const model = findRoutingSnapshotModel(selector, routingSnapshot);
 					if (!model) {
 						skips.push({ selector, code: "snapshot_missing" });
 						continue;

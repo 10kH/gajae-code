@@ -45,6 +45,16 @@ describe("autorouting generator", () => {
 		expect(first).toEqual(second);
 	});
 
+	it("rejects generated selectors that exceed the runtime contract", () => {
+		const id = "x".repeat(251);
+		const labels = { [`alpha/${id}`]: [{ tier: "fast" as const, rank: 1 }] } satisfies CuratedTierLabels;
+		expect(() =>
+			generateTierChains({ schema: 1, providers: ["alpha"] }, { labels, skips: {}, version: 1 }, [
+				model("alpha", id),
+			]),
+		).toThrow(/length bound/);
+	});
+
 	it("orders by provider declaration, then curation rank, and is stable under catalog permutation", () => {
 		const catalog = [model("alpha", "slow"), model("gamma", "fast"), model("beta", "fast"), model("alpha", "fast")];
 		const setup = { schema: 1 as const, providers: ["beta", "alpha", "gamma"] };

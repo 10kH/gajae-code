@@ -326,7 +326,7 @@ const AUTOROUTING_SETUP_JSON_SCHEMA: JsonSchemaObject = {
 		},
 		models: {
 			type: "array",
-			items: { type: "string", pattern: AUTOROUTING_SELECTOR_PATTERN },
+			items: { type: "string", minLength: 1, maxLength: 256, pattern: AUTOROUTING_SELECTOR_PATTERN },
 		},
 	},
 	additionalProperties: false,
@@ -3614,6 +3614,8 @@ export const SETTINGS_SCHEMA = {
 		keys: AUTOROUTING_TIERS,
 		valueSchema: {
 			type: "autorouting-selector-value",
+			minLength: 1,
+			maxLength: 256,
 			pattern: AUTOROUTING_SELECTOR_PATTERN,
 			description: AUTOROUTING_SELECTOR_DESCRIPTION,
 		},
