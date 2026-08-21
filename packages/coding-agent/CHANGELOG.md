@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an SDK `automationTools` option for host-owned `browser` and `computer` implementations. External automation retains built-in activation and provenance, receives the normal abort signal, works independently of the default browser/platform gates, and fails closed on custom, extension, or MCP name collisions (#4809).
+
 ### Changed
 
 - Workflow handoffs out of autoresearch now transit properly: `/skill:deep-interview`, `/skill:ralplan`, and `/skill:ultragoal` chain from any live autoresearch phase (`intake`/`research`/`verdict`), and ralplan's `final` phase chains via its manifest terminal states; ralplan/ultragoal live phases still require the explicit write-to-handoff step. `gjc autoresearch clear` remains the finalize-only exit.
