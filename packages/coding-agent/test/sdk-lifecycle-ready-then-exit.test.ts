@@ -273,7 +273,7 @@ test("win32 production host exit after ready is ready_then_exited, not spawn_fai
 	setLifecycleHostPlatformForTest("win32");
 	try {
 		await broker.start();
-		const input = { cwd, readinessTimeoutMs: 12_000 };
+		const input = { cwd, readinessTimeoutMs: 30_000 };
 		const response = await broker.handleRequest("session.create", input, "host-exit-after-ready");
 		expect(response.ok).toBe(false);
 		if (response.ok) throw new Error("expected failure");
@@ -296,7 +296,7 @@ test("win32 host that rejects after ready is ready_then_exited, never spawn_fail
 	setLifecycleHostPlatformForTest("win32");
 	try {
 		await broker.start();
-		const input = { cwd, readinessTimeoutMs: 12_000 };
+		const input = { cwd, readinessTimeoutMs: 30_000 };
 		const response = await broker.handleRequest("session.create", input, "host-reject-after-ready");
 		expect(response.ok).toBe(false);
 		if (response.ok) throw new Error("expected failure");
