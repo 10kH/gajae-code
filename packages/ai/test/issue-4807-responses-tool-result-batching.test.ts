@@ -93,24 +93,35 @@ function translateToAnthropic(input: Array<Record<string, unknown>>): {
 	ok: boolean;
 	unansweredToolUseIds: string[];
 } {
-	const answered = new Set<string>();
-	const toolUseIds: string[] = [];
-	for (let index = 0; index < input.length; index++) {
-		const item = input[index]!;
+	const unansweredToolUseIds: string[] = [];
+	let pendingToolUseIds: string[] = [];
+	let collectedOutputIds = new Set<string>();
+	let turnOpen = false;
+	// A proxy groups the contiguous output run into the immediately following
+	// user message as `tool_result` blocks. Any boundary item (user message or
+	// other non-output item) closes the turn: every pending tool_use must have
+	// been answered in the run directly before it, exactly like Anthropic.
+	const closeTurn = (): void => {
+		for (const id of pendingToolUseIds) {
+			if (!collectedOutputIds.has(id)) unansweredToolUseIds.push(id);
+		}
+		pendingToolUseIds = [];
+		collectedOutputIds = new Set();
+		turnOpen = false;
+	};
+	for (const item of input) {
 		if (item.type === "function_call" || item.type === "custom_tool_call") {
-			toolUseIds.push(item.call_id as string);
+			pendingToolUseIds.push(item.call_id as string);
+			turnOpen = true;
 			continue;
 		}
-		if (!isOutputItem(item)) continue;
-		// All outputs directly after the last call batch belong to one user message.
-		let cursor = index;
-		while (cursor < input.length && isOutputItem(input[cursor]!)) {
-			answered.add(input[cursor]!.call_id as string);
-			cursor++;
+		if (isOutputItem(item)) {
+			collectedOutputIds.add(item.call_id as string);
+			continue;
 		}
-		index = cursor - 1;
+		if (turnOpen) closeTurn();
 	}
-	const unansweredToolUseIds = toolUseIds.filter(id => !answered.has(id));
+	closeTurn();
 	return { ok: unansweredToolUseIds.length === 0, unansweredToolUseIds };
 }
 
@@ -285,6 +296,24 @@ describe("issue #4807: parallel image tool results keep tool_result adjacency", 
 		const { ok, unansweredToolUseIds } = translateToAnthropic(input);
 		expect(unansweredToolUseIds).toEqual([]);
 		expect(ok).toBe(true);
+	});
+
+	it("proxy simulator rejects the legacy interleaved image shape (negative fixture)", () => {
+		// The exact pre-#4807 encoder output: a standalone image user message
+		// splits the sibling outputs, so the proxy's grouped user message answers
+		// only call_B and Anthropic rejects the replay for call_A.
+		const legacyInput: Array<Record<string, unknown>> = [
+			{ role: "user", content: "render both" },
+			{ type: "function_call", call_id: "call_A" },
+			{ type: "function_call", call_id: "call_B" },
+			{ type: "function_call_output", call_id: "call_B", output: "saved b" },
+			{ role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${PNG_B}` }] },
+			{ type: "function_call_output", call_id: "call_A", output: "saved a" },
+			{ role: "user", content: [{ type: "input_image", image_url: `data:image/png;base64,${PNG_A}` }] },
+		];
+		const { ok, unansweredToolUseIds } = translateToAnthropic(legacyInput);
+		expect(ok).toBe(false);
+		expect(unansweredToolUseIds).toEqual(["call_A"]);
 	});
 
 	it("helper batches multiple results with ids preserved and custom calls intact", () => {
