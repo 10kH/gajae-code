@@ -139,6 +139,58 @@ describe("OAuth selector filtering", () => {
 			authStorage.close();
 		}
 	});
+	test("logout lists and removes api-key rows alongside oauth rows (mixed provider)", async () => {
+		const authStorage = await AuthStorage.create(":memory:");
+		const removed: unknown[][] = [];
+		let selector: OAuthSelectorComponent | undefined;
+
+		try {
+			await authStorage.set("anthropic", [
+				{
+					type: "oauth",
+					access: "access-account-a",
+					refresh: "refresh-account-a",
+					expires: Date.now() + 60_000,
+					accountId: "account-a",
+					email: "a@example.com",
+				},
+				{ type: "api_key", key: "sk-mixed-provider-key" },
+			]);
+			selector = new OAuthSelectorComponent(
+				"logout",
+				authStorage,
+				() => {},
+				() => {},
+				{
+					accountProviderId: "anthropic",
+					onAccountRemove: targets => {
+						removed.push([...targets]);
+					},
+				},
+			);
+
+			// Both credential kinds are listed and selectable in logout mode.
+			const rendered = renderedText(selector);
+			expect(rendered).toContain("a@example.com");
+			expect(rendered).toContain("API key · row 2");
+
+			// Cursor starts on the oauth row; move down to the api-key row.
+			selector.handleInput("\x1b[B");
+			selector.handleInput("\n");
+			expect(removed).toHaveLength(0);
+			expect(renderedText(selector)).toContain("Remove this account? Enter to confirm, Esc to cancel");
+
+			selector.handleInput("\n");
+
+			expect(removed).toHaveLength(1);
+			const [targets] = removed;
+			expect(targets).toHaveLength(1);
+			expect(String(JSON.stringify(targets))).toContain('"id":2');
+		} finally {
+			selector?.dispose();
+			authStorage.close();
+		}
+	});
 
 	test("OAuth account choices are disabled while an API-key override is active", async () => {
 		const authStorage = await AuthStorage.create(":memory:");

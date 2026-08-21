@@ -3198,51 +3198,29 @@ export class SelectorController {
 		}
 	}
 
-	async #handleOAuthLogout(providerId: string, targets?: readonly CredentialRemovalTarget[]): Promise<void> {
+	async #handleLogout(providerId: string, targets?: readonly CredentialRemovalTarget[]): Promise<void> {
 		try {
 			const authStorage = this.ctx.session.modelRegistry.authStorage;
-			const inventory = authStorage.listCredentialInventory(providerId);
-			const oauthRows = inventory.filter(row => row.provider === providerId && row.credentialKind === "oauth");
+			const inventory = authStorage.listCredentialInventory(providerId).filter(row => row.provider === providerId);
 			const removalTargetsById = new Map(
 				authStorage.listCredentialRemovalTargets(providerId).map(target => [target.id, target]),
 			);
-			const oauthRemovalTargets = oauthRows
+			const removable = inventory
 				.map(row => removalTargetsById.get(row.id))
 				.filter((target): target is CredentialRemovalTarget => target !== undefined);
-			if (oauthRows.length > 0 && oauthRemovalTargets.length === 0) {
+			// Credentials stored locally but not removable locally are broker-managed.
+			if (inventory.length > 0 && removable.length === 0) {
 				this.ctx.showError(
 					`Logout is broker-managed for ${providerId}; run \`gjc auth-broker logout ${providerId}\` on the broker host.`,
 				);
 				return;
 			}
-			if (targets) {
-				if (targets.length === 0) {
-					this.ctx.showError(
-						`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`,
-					);
-					return;
-				}
-				const result = authStorage.removeAuthCredentialsHard(providerId, targets);
-				if (result.kind !== "removed") {
-					this.ctx.showError(
-						"Logout failed: account inventory changed; no credentials were removed. Retry /logout.",
-					);
-					return;
-				}
-				await clearPersistentPinForRemovedRows(this.ctx.settings, providerId, inventory, result.ids);
-				await this.ctx.session.modelRegistry.refresh();
-				this.ctx.showStatus(
-					`Successfully removed ${result.ids.length} OAuth account${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
-				);
+			const selected = targets ? targets : removable;
+			if (selected.length === 0) {
+				this.ctx.showError(`No stored credentials to remove for ${providerId}.`);
 				return;
 			}
-			if (oauthRemovalTargets.length === 0) {
-				this.ctx.showError(
-					`No OAuth accounts to remove for ${providerId}; API-key credentials are not managed here.`,
-				);
-				return;
-			}
-			const result = authStorage.removeAuthCredentialsHard(providerId, oauthRemovalTargets);
+			const result = authStorage.removeAuthCredentialsHard(providerId, selected);
 			if (result.kind !== "removed") {
 				this.ctx.showError("Logout failed: account inventory changed; no credentials were removed. Retry /logout.");
 				return;
@@ -3250,7 +3228,7 @@ export class SelectorController {
 			await clearPersistentPinForRemovedRows(this.ctx.settings, providerId, inventory, result.ids);
 			await this.ctx.session.modelRegistry.refresh();
 			this.ctx.showStatus(
-				`Successfully removed ${result.ids.length} OAuth account${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
+				`Successfully removed ${result.ids.length} stored credential${result.ids.length === 1 ? "" : "s"} from ${providerId}.`,
 			);
 		} catch (error: unknown) {
 			this.ctx.showError(`Logout failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -3273,11 +3251,11 @@ export class SelectorController {
 			const hasOAuthInventory = authStorage
 				.listCredentialInventory(selectedProviderId)
 				.some(row => row.provider === selectedProviderId && row.credentialKind === "oauth");
-			const hasRemovableOAuth = authStorage
+			const hasRemovableCredential = authStorage
 				.listCredentialRemovalTargets(selectedProviderId)
 				.some(target => target.provider === selectedProviderId);
-			if (mode === "logout" && hasOAuthInventory && !hasRemovableOAuth) {
-				await this.#handleOAuthLogout(selectedProviderId);
+			if (mode === "logout" && hasOAuthInventory && !hasRemovableCredential) {
+				await this.#handleLogout(selectedProviderId);
 				return;
 			}
 			if (hasOAuthInventory && !options?.manualCode) {
@@ -3312,7 +3290,7 @@ export class SelectorController {
 								await this.#handleOAuthLogin(selectedProviderId, options);
 							},
 							onAccountRemove: async targets => {
-								await this.#handleOAuthLogout(selectedProviderId, targets);
+								await this.#handleLogout(selectedProviderId, targets);
 								selector.stopValidation();
 								done();
 							},
@@ -3326,32 +3304,8 @@ export class SelectorController {
 				await this.#handleOAuthLogin(selectedProviderId, options);
 				return;
 			}
-			if (!hasRemovableOAuth) {
-				await this.#handleOAuthLogout(selectedProviderId);
-				return;
-			}
-			this.showSelector(done => {
-				let selector: OAuthSelectorComponent;
-				selector = new OAuthSelectorComponent(
-					"logout",
-					authStorage,
-					() => undefined,
-					() => {
-						selector.stopValidation();
-						done();
-						this.ctx.ui.requestRender();
-					},
-					{
-						accountProviderId: selectedProviderId,
-						onAccountRemove: async targets => {
-							await this.#handleOAuthLogout(selectedProviderId, targets);
-							selector.stopValidation();
-							done();
-						},
-					},
-				);
-				return { component: selector, focus: selector };
-			});
+			// mode === "logout" with no OAuth accounts: remove stored api-key credentials directly.
+			await this.#handleLogout(selectedProviderId);
 			return;
 		}
 

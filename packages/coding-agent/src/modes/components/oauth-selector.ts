@@ -146,15 +146,15 @@ export class OAuthSelectorComponent extends Container {
 			this.#authStorage.hasRuntimeApiKey(provider) ||
 			this.#authStorage.hasConfigApiKey(provider) ||
 			Boolean(getEnvApiKey(provider));
-		const rows = inventory.filter(row => this.#mode === "login" || row.credentialKind === "oauth");
+		const rows = this.#mode === "logout" ? inventory : inventory.filter(row => row.credentialKind === "oauth");
 		this.#accountEntries = rows.map(row => ({
 			kind: "account" as const,
 			row,
 			target: targets.get(row.id),
 			selectable:
-				row.credentialKind === "oauth" &&
-				!apiKeyOverrideActive &&
-				(this.#mode === "login" ? !row.disabled : targets.has(row.id)),
+				this.#mode === "login"
+					? row.credentialKind === "oauth" && !apiKeyOverrideActive && !row.disabled
+					: targets.has(row.id),
 		}));
 		if (this.#mode === "login") {
 			this.#accountEntries.push(
@@ -441,8 +441,8 @@ export class OAuthSelectorComponent extends Container {
 			this.#statusMessage = undefined;
 			this.stopValidation();
 			if (selected.kind === "account") {
-				if (selected.row.credentialKind !== "oauth") return;
 				if (this.#mode === "login") {
+					if (selected.row.credentialKind !== "oauth") return;
 					void this.#onAccountSelect?.({ kind: "id", value: String(selected.row.id) });
 				} else if (selected.target) {
 					this.#confirmOrArmAccountRemoval([selected.target], "Remove this account?");

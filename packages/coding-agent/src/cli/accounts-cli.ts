@@ -287,6 +287,7 @@ function accountMatches(row: CredentialInventoryRecord, rawAccount: string): boo
 	const value = rawAccount.trim();
 	if (value.length === 0) return false;
 	if (/^[1-9]\d*$/.test(value) && row.id === Number(value)) return true;
+	if (/^id:[1-9]\d*$/i.test(value) && row.id === Number(value.slice(3))) return true;
 	const identity = inventoryIdentity(row);
 	return identity?.toLowerCase() === value.toLowerCase();
 }
@@ -297,7 +298,6 @@ function removalCandidates(
 ): Array<{ row: CredentialInventoryRecord; target: CredentialRemovalTarget }> {
 	const targetById = new Map(targets.map(target => [target.id, target]));
 	return inventory
-		.filter(row => row.credentialKind === "oauth")
 		.map(row => ({ row, target: targetById.get(row.id) }))
 		.filter((entry): entry is { row: CredentialInventoryRecord; target: CredentialRemovalTarget } => !!entry.target);
 }
@@ -310,10 +310,10 @@ function throwLogoutResolutionError(
 	const lines =
 		candidates.length > 0
 			? ["Safe candidates:", ...candidates.map(candidate => formatCandidate(candidate.row))]
-			: ["No OAuth account candidates found."];
+			: ["No removable credentials found."];
 	const prefix = account
 		? `Account ${JSON.stringify(account)} for ${provider} was missing or ambiguous.`
-		: `No removable OAuth accounts found for ${provider}.`;
+		: `No removable stored credentials found for ${provider}.`;
 	throw new AccountsCommandError(`${prefix} No credentials were removed.\n${lines.join("\n")}`);
 }
 
@@ -351,7 +351,7 @@ async function runLogout(providerArg: string | undefined, flags: AccountsCommand
 		if (flags.json) writeJson({ ok: true, provider, removedIds: [...result.ids] });
 		else
 			writeText([
-				`Removed ${result.ids.length} OAuth account${result.ids.length === 1 ? "" : "s"} from ${provider}.`,
+				`Removed ${result.ids.length} stored credential${result.ids.length === 1 ? "" : "s"} from ${provider}.`,
 			]);
 	} finally {
 		storage.close();

@@ -181,6 +181,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "openrouter",
+		name: "OpenRouter",
+		available: true,
+	},
+	{
 		id: "zai",
 		name: "Z.AI (GLM Coding Plan)",
 		available: true,
@@ -408,6 +413,7 @@ export async function refreshOAuthToken(
 		case "zai":
 		case "qianfan":
 		case "venice":
+		case "openrouter":
 		case "minimax-code":
 		case "minimax-code-cn":
 		case "moonshot":

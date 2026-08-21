@@ -1676,12 +1676,12 @@ export class AuthStorage {
 		return this.#store.listCredentialInventory?.(provider) ?? [];
 	}
 
-	/** Return local OAuth hard-removal action targets, including disabled rows. */
+	/** Return local credential hard-removal action targets, including disabled rows. */
 	listCredentialRemovalTargets(provider?: string): CredentialRemovalTarget[] {
 		return this.#store.listCredentialRemovalTargets?.(provider) ?? [];
 	}
 
-	/** Remove selected local OAuth rows atomically; conflict leaves all rows intact. */
+	/** Remove selected local credential rows atomically; conflict leaves all rows intact. */
 	removeAuthCredentialsHard(
 		provider: string,
 		targets: readonly CredentialRemovalTarget[],
@@ -3062,6 +3062,12 @@ export class AuthStorage {
 			case "venice": {
 				const { loginVenice } = await import("./utils/oauth/venice");
 				const apiKey = await loginVenice(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
+			case "openrouter": {
+				const { loginOpenRouter } = await import("./utils/oauth/openrouter");
+				const apiKey = await loginOpenRouter(ctrl);
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
@@ -6153,9 +6159,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 			provider === undefined
 				? (this.#listAllStmt.all() as AuthRow[])
 				: (this.#listAllByProviderStmt.all(provider) as AuthRow[]);
-		return rows
-			.filter(row => row.credential_type === "oauth")
-			.map(row => ({ id: row.id, provider: row.provider, expectedRevision: row.revision }));
+		return rows.map(row => ({ id: row.id, provider: row.provider, expectedRevision: row.revision }));
 	}
 	removeAuthCredentialsHard(
 		provider: string,
@@ -6170,12 +6174,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					.get(target.id) as
 					| { id?: number; provider?: string; credential_type?: string; revision?: number }
 					| undefined;
-				if (
-					!row ||
-					row.provider !== provider ||
-					row.credential_type !== "oauth" ||
-					row.revision !== target.expectedRevision
-				) {
+				if (!row || row.provider !== provider || row.revision !== target.expectedRevision) {
 					currentIds.push(row?.id ?? target.id);
 				}
 			}
