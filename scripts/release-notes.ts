@@ -102,9 +102,10 @@ export function shippedCoverage(pullRequest: CandidatePullRequest, shippedOids: 
 }
 
 /**
- * A subject-embedded `(#N)` is authoritative: the merge that produced the
- * commit wrote it. Otherwise the smallest candidate this release actually
- * ships wins, and an unshipped candidate is rejected outright.
+ * A subject-embedded `(#N)` identifies the intended pull request, but it is
+ * credited only when the release ships at least the same coverage threshold
+ * as an API-discovered candidate. Otherwise the smallest candidate this
+ * release actually ships wins, and an unshipped candidate is rejected.
  */
 export function attributeCommit(
 	commit: ReleaseCommit,
@@ -115,7 +116,9 @@ export function attributeCommit(
 	const referenced = parseSubjectPullRequestRef(commit.subject);
 	if (referenced !== undefined) {
 		const pullRequest = input.pullRequestsByNumber.get(referenced);
-		if (pullRequest) return { kind: "pull-request", pullRequest };
+		if (pullRequest && shippedCoverage(pullRequest, shippedOids) >= SHIPPED_COVERAGE_THRESHOLD) {
+			return { kind: "pull-request", pullRequest };
+		}
 	}
 
 	const normalized = normalizeSubject(commit.subject);
@@ -250,9 +253,15 @@ async function loadPullRequest(repo: string, number: number): Promise<CandidateP
 }
 
 async function candidateNumbers(repo: string, sha: string): Promise<number[]> {
-	const raw = await gh(["api", `repos/${repo}/commits/${sha}/pulls`, "--jq", "[.[]|select(.merged_at!=null)|.number]"]);
+	const raw = await gh([
+		"api",
+		"--paginate",
+		`repos/${repo}/commits/${sha}/pulls?per_page=100`,
+		"--jq",
+		".[] | select(.merged_at != null) | .number",
+	]);
 	if (raw.trim() === "") return [];
-	return JSON.parse(raw) as number[];
+	return raw.trim().split(/\s+/u).map(Number);
 }
 
 /** Picks the earliest MERGED pull request by merge timestamp, not creation time. */
@@ -267,14 +276,19 @@ export function earliestMergedPullRequest(pullRequests: readonly { number: numbe
 }
 
 async function firstMergedPullRequest(repo: string, author: string): Promise<number | undefined> {
-	// The search API cannot sort by merge time, so fetch a bounded created-asc
-	// window and select the minimum merge timestamp.
+	// The search API cannot sort by merge time and its CLI JSON surface does not
+	// expose merge timestamps reliably. Paginate the REST search results and
+	// select the minimum explicit merge timestamp across the complete result set.
 	const raw = await gh([
-		"search", "prs", "--repo", repo, "--author", author, "--merged",
-		"--sort", "created", "--order", "asc", "--limit", "50", "--json", "number,mergedAt",
+		"api",
+		"--paginate",
+		`search/issues?q=repo:${repo}+author:${author}+is:pr+is:merged&sort=created&order=asc&per_page=100`,
+		"--jq",
+		".items[] | select(.pull_request.merged_at != null) | {number, mergedAt: .pull_request.merged_at} | @json",
 	]);
 	if (raw.trim() === "") return undefined;
-	return earliestMergedPullRequest(JSON.parse(raw) as { number: number; mergedAt: string }[]);
+	const pullRequests = raw.trim().split(/\r?\n/u).map(line => JSON.parse(line) as { number: number; mergedAt: string });
+	return earliestMergedPullRequest(pullRequests);
 }
 
 /**

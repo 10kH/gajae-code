@@ -85,7 +85,7 @@ describe("shipped coverage", () => {
 
 describe("attribution", () => {
 	test("a subject reference wins over any candidate", () => {
-		const referenced = pullRequest(4666, "fix(ai): bound the Anthropic connect phase", ["fix(ai): bound the Anthropic connect phase"]);
+		const referenced = pullRequest(4666, "fix(ai): bound the Anthropic connect phase", ["fix(ai): bound the Anthropic connect phase"], "Yeachan-Heo", ["aaa"]);
 		const contained = pullRequest(4430, "feat(autoresearch)!: replace the team workflow", ["fix(ai): bound the connect phase (#4666)"]);
 		const subject = "fix(ai): bound the connect phase (#4666)";
 
@@ -97,6 +97,20 @@ describe("attribution", () => {
 		);
 
 		expect(attribution).toEqual({ kind: "pull-request", pullRequest: referenced });
+	});
+
+	test("rejects a referenced pull request when the release ships below the coverage threshold", () => {
+		const referenced = pullRequest(4667, "fix(ai): partially shipped", ["fix(ai): partially shipped", "second", "third", "fourth"], "Yeachan-Heo", ["o1", "o2", "o3", "o4"]);
+		const shipped = commit("o1", "fix(ai): partially shipped (#4667)");
+
+		const attribution = attributeCommit(
+			shipped,
+			{ candidatesBySha: new Map(), pullRequestsByNumber: new Map([[4667, referenced]]) },
+			new Set([normalizeSubject(shipped.subject)]),
+			new Set(["o1"]),
+		);
+
+		expect(attribution).toEqual({ kind: "commit", commit: shipped });
 	});
 
 	test("rejects a containing pull request the release does not ship", () => {
@@ -199,7 +213,7 @@ describe("notes body", () => {
 	});
 
 	test("credits a pull request once even when several of its commits ship", () => {
-		const pr = pullRequest(4607, "feat(provider): add oMLX profiles", ["first (#4607)", "second (#4607)"]);
+		const pr = pullRequest(4607, "feat(provider): add oMLX profiles", ["first (#4607)", "second (#4607)"], "Yeachan-Heo", ["a1", "a2"]);
 		const body = notes({
 			commits: [commit("a1", "first (#4607)"), commit("a2", "second (#4607)")],
 			pullRequestsByNumber: new Map([[4607, pr]]),
@@ -221,8 +235,8 @@ describe("notes body", () => {
 	});
 
 	test("lists a contributor whose first merged pull request is in this release", () => {
-		const first = pullRequest(4635, "fix(usage): preserve probe limits", ["fix(usage): preserve probe limits (#4635)"], "asdfqwerzxcc");
-		const repeat = pullRequest(4666, "fix(ai): bound the connect phase", ["fix(ai): bound the connect phase (#4666)"]);
+		const first = pullRequest(4635, "fix(usage): preserve probe limits", ["fix(usage): preserve probe limits (#4635)"], "asdfqwerzxcc", ["c1"]);
+		const repeat = pullRequest(4666, "fix(ai): bound the connect phase", ["fix(ai): bound the connect phase (#4666)"], "Yeachan-Heo", ["c2"]);
 		const body = notes({
 			commits: [commit("c1", "fix(usage): preserve probe limits (#4635)"), commit("c2", "fix(ai): bound the connect phase (#4666)")],
 			pullRequestsByNumber: new Map([
@@ -304,5 +318,16 @@ describe("first merged pull request selection", () => {
 			{ number: 9, mergedAt: "2026-01-15T00:00:00Z" },
 			{ number: 7, mergedAt: "2026-01-15T00:00:00Z" },
 		])).toBe(7);
+	});
+
+	test("considers an earliest merge beyond the first fifty results", () => {
+		const laterCreated = Array.from({ length: 50 }, (_, index) => ({
+			number: index + 1,
+			mergedAt: `2026-02-${String(index + 1).padStart(2, "0")}T00:00:00Z`,
+		}));
+		expect(earliestMergedPullRequest([
+			...laterCreated,
+			{ number: 999, mergedAt: "2026-01-01T00:00:00Z" },
+		])).toBe(999);
 	});
 });
