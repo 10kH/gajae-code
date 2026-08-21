@@ -10,10 +10,15 @@
  * project/user skills have no native workflow mode-state, so they are dispatched
  * directly and tracked by the prompt observer instead.
  *
- * Canonical workflow chaining is refused unless the caller's `current_phase` is
- * in `{complete, completed, handoff, failed, cancelled, canceled, inactive}`.
- * The agent declares readiness either by writing `current_phase: "handoff"` to
- * its mode-state or by running the handoff verb directly.
+ * Canonical workflow chaining is refused unless the caller's phase permits it:
+ * the generic terminal set `{complete, completed, handoff, failed, cancelled,
+ * canceled, inactive}`, the caller's manifest-declared terminal states (e.g.
+ * ralplan `final`), or — for autoresearch only — any phase with a declared
+ * handoff edge (`intake`/`research`/`verdict`): a research mission never
+ * mutates and guards no approval gate, its mission state is durable, so an
+ * ongoing or verdict-complete mission may hand off to planning at any point.
+ * ralplan/ultragoal keep the explicit write-to-handoff step for live phases:
+ * their mid-flight chaining is exactly what the approval-gate guard blocks.
  */
 
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
@@ -23,6 +28,7 @@ import { resolveSubskillActivationForSkillInvocation } from "../extensibility/gj
 import { findRuntimeSkillByName } from "../extensibility/runtime-skill-discovery";
 import { buildSkillPromptMessage } from "../extensibility/skills";
 import { runNativeStateCommand } from "../gjc-runtime/state-runtime";
+import { getSkillManifest } from "../gjc-runtime/workflow-manifest";
 import skillDescription from "../prompts/tools/skill.md" with { type: "text" };
 import { SKILL_PROMPT_MESSAGE_TYPE } from "../session/messages";
 import { isCanonicalGjcWorkflowSkill } from "../skill-state/active-state";
@@ -30,6 +36,25 @@ import type { ToolSession } from ".";
 import { ToolError } from "./tool-errors";
 
 const TERMINAL_PHASES = new Set(["complete", "completed", "handoff", "failed", "cancelled", "canceled", "inactive"]);
+
+/**
+ * Whether the active canonical workflow's phase permits chaining into another
+ * skill. Generic terminal phases always chain; manifest terminal states cover
+ * skill-specific termini the generic set misses (ralplan "final"); and
+ * autoresearch chains from any phase with a manifest handoff edge because a
+ * research mission is safely abandonable mid-flight (read-only, durable
+ * mission state, no approval gate). ralplan/ultragoal deliberately stay
+ * blocked in live phases so mid-consensus or mid-execution chaining still
+ * requires the explicit write-to-handoff step.
+ */
+function phasePermitsChain(skill: string, phase: string): boolean {
+	if (TERMINAL_PHASES.has(phase)) return true;
+	if (!isCanonicalGjcWorkflowSkill(skill)) return false;
+	const manifest = getSkillManifest(skill);
+	if (manifest.terminalStates.includes(phase)) return true;
+	if (skill !== "autoresearch") return false;
+	return manifest.transitions.some(transition => transition.from === phase && transition.to === "handoff");
+}
 
 const skillSchema = z.object({
 	name: z.string().describe("skill name as it appears in /skill:<name>"),
@@ -122,7 +147,12 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 
 			const skill =
 				skills.find(s => s.name === requestedName) ??
-				(await findRuntimeSkillByName(this.#session.cwd, requestedName, this.#getRuntimeSkillPolicy()));
+				(await findRuntimeSkillByName(
+					this.#session.cwd,
+					requestedName,
+					this.#getRuntimeSkillPolicy(),
+					this.#session.home,
+				));
 			if (!skill) {
 				const available = skills.map(s => s.name).sort();
 				const hint =
@@ -137,9 +167,9 @@ export class SkillTool implements AgentTool<typeof skillSchema, SkillToolDetails
 			// so there is no `gjc state <skill>` command to run for them.
 			if (activeSkill && isCanonicalGjcWorkflowSkill(activeSkill)) {
 				const phase = (this.#session.getActiveSkillPhase?.() ?? "running").trim().toLowerCase();
-				if (!TERMINAL_PHASES.has(phase)) {
+				if (!phasePermitsChain(activeSkill, phase)) {
 					throw new ToolError(
-						`skill tool: refusing to chain from "${activeSkill}" (phase=${phase}) into "${requestedName}". Finalize the current skill (gjc state ${activeSkill} write --input '{"current_phase":"handoff"}' --json) or run gjc state ${activeSkill} handoff --to ${requestedName} --json directly before chaining.`,
+						`skill tool: refusing to chain from "${activeSkill}" (phase=${phase}) into "${requestedName}". Run gjc state ${activeSkill} handoff --to ${requestedName} --json directly, or finalize the current skill first (gjc state ${activeSkill} write --input '{"current_phase":"handoff"}' --json) before chaining.`,
 					);
 				}
 				const cwd = this.#session.cwd;

@@ -103,13 +103,10 @@ describe("SkillDiscoveryTool", () => {
 	it("discovers user runtime skills from ~/.gjc/skills", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skills-cwd-"));
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-skills-home-"));
-		const originalHome = process.env.HOME;
-		process.env.HOME = home;
 		try {
 			await makeSkill(path.join(home, ".gjc", "skills"), "user-helper", "User helper skill");
 			const settings = runtimeSkillSettings();
-
-			const tool = new SkillDiscoveryTool(createSession(cwd, { settings }));
+			const tool = new SkillDiscoveryTool(createSession(cwd, { settings, home }));
 			const result = await tool.execute("call", { source: "user" });
 			const details = result.details;
 			expect(details).toBeDefined();
@@ -117,8 +114,8 @@ describe("SkillDiscoveryTool", () => {
 			expect(details!.candidates.map(candidate => candidate.name)).toContain("user-helper");
 			expect(details!.candidates.find(candidate => candidate.name === "user-helper")?.source).toBe("user");
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
+			await fs.rm(cwd, { recursive: true, force: true });
+			await fs.rm(home, { recursive: true, force: true });
 		}
 	});
 
@@ -127,13 +124,14 @@ describe("SkillDiscoveryTool", () => {
 		const cwd = path.join(home, "work", "project", "nested");
 		await fs.mkdir(cwd, { recursive: true });
 		await makeSkill(path.join(home, ".gjc", "skills"), "home-helper", "Home helper skill", "Home body.");
-		const originalHome = process.env.HOME;
-		process.env.HOME = home;
 		try {
 			const projectOnly = runtimeSkillSettings({ "skills.enablePiUser": false });
-			const discovery = await new SkillDiscoveryTool(createSession(cwd, { settings: projectOnly })).execute("call", {
-				source: "project",
-			});
+			const discovery = await new SkillDiscoveryTool(createSession(cwd, { settings: projectOnly, home })).execute(
+				"call",
+				{
+					source: "project",
+				},
+			);
 			expect(discovery.details?.candidates).toEqual([]);
 
 			const sent: Array<{ content: string; details?: unknown }> = [];
@@ -141,6 +139,7 @@ describe("SkillDiscoveryTool", () => {
 				createSession(cwd, {
 					skills: [],
 					settings: projectOnly,
+					home,
 					sendCustomMessage: async message => {
 						sent.push({ content: String(message.content), details: message.details });
 					},
@@ -150,16 +149,14 @@ describe("SkillDiscoveryTool", () => {
 			expect(sent).toHaveLength(0);
 
 			const userEnabled = runtimeSkillSettings({ "skills.enablePiProject": false });
-			const userDiscovery = await new SkillDiscoveryTool(createSession(cwd, { settings: userEnabled })).execute(
-				"call",
-				{ source: "user" },
-			);
+			const userDiscovery = await new SkillDiscoveryTool(
+				createSession(cwd, { settings: userEnabled, home }),
+			).execute("call", { source: "user" });
 			expect(userDiscovery.details?.candidates).toEqual([
 				expect.objectContaining({ name: "home-helper", source: "user" }),
 			]);
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
+			await fs.rm(home, { recursive: true, force: true });
 		}
 	});
 
@@ -295,7 +292,6 @@ describe("SkillDiscoveryTool", () => {
 	it("discovers canonical and legacy user roots in native precedence order", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-root-cwd-"));
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-root-home-"));
-		const originalHome = process.env.HOME;
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
@@ -303,7 +299,6 @@ describe("SkillDiscoveryTool", () => {
 		const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 
 		try {
-			process.env.HOME = home;
 			process.env.GJC_CONFIG_DIR = "/absolute-looking-gjc";
 			process.env.PI_CONFIG_DIR = ".decoy-pi";
 			process.env.GJC_CODING_AGENT_DIR = path.join(home, ".decoy-agent");
@@ -329,12 +324,11 @@ describe("SkillDiscoveryTool", () => {
 			await makeSkill(path.join(home, ".decoy-pi-agent", "skills"), "pi-decoy", "PI decoy user skill");
 			await makeSkill(path.join(home, ".xdg-decoy", "gjc", "agent", "skills"), "xdg-decoy", "XDG decoy user skill");
 
-			const result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
-				"call",
-				{
-					source: "user",
-				},
-			);
+			const result = await new SkillDiscoveryTool(
+				createSession(cwd, { settings: runtimeSkillSettings(), home }),
+			).execute("call", {
+				source: "user",
+			});
 			expect(result.details?.candidates).toEqual([
 				expect.objectContaining({
 					name: "historical",
@@ -345,15 +339,13 @@ describe("SkillDiscoveryTool", () => {
 			]);
 
 			const allSources = await new SkillDiscoveryTool(
-				createSession(cwd, { settings: runtimeSkillSettings() }),
+				createSession(cwd, { settings: runtimeSkillSettings(), home }),
 			).execute("call", {});
 			expect(allSources.details?.candidates).toEqual([
 				expect.objectContaining({ name: "historical", source: "user" }),
 				expect.objectContaining({ name: "shared", description: "Project user skill", source: "project" }),
 			]);
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
 			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
@@ -372,11 +364,9 @@ describe("SkillDiscoveryTool", () => {
 	it("uses the default and PI_CONFIG_DIR canonical user roots", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-canonical-cwd-"));
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-user-canonical-home-"));
-		const originalHome = process.env.HOME;
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		try {
-			process.env.HOME = home;
 			delete process.env.GJC_CONFIG_DIR;
 			delete process.env.PI_CONFIG_DIR;
 			await makeSkill(
@@ -385,19 +375,18 @@ describe("SkillDiscoveryTool", () => {
 				"Default canonical user skill",
 			);
 			await makeSkill(path.join(home, ".gjc", "skills"), "default-canonical", "Default legacy user skill");
-			let result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
-				"call",
-				{
-					source: "user",
-				},
-			);
+			let result = await new SkillDiscoveryTool(
+				createSession(cwd, { settings: runtimeSkillSettings(), home }),
+			).execute("call", {
+				source: "user",
+			});
 			expect(result.details?.candidates).toEqual([
 				expect.objectContaining({ name: "default-canonical", description: "Default canonical user skill" }),
 			]);
 
 			process.env.PI_CONFIG_DIR = ".pi-config";
 			await makeSkill(path.join(home, ".pi-config", "agent", "skills"), "pi-canonical", "PI canonical user skill");
-			result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
+			result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings(), home })).execute(
 				"call",
 				{
 					source: "user",
@@ -408,8 +397,6 @@ describe("SkillDiscoveryTool", () => {
 				"pi-canonical",
 			]);
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
 			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
@@ -471,9 +458,7 @@ describe("SkillDiscoveryTool", () => {
 	it("applies policy before realpath/name dedup, then query, sort, and limit", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-discovery-pipeline-"));
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skill-discovery-pipeline-home-"));
-		const originalHome = process.env.HOME;
 		try {
-			process.env.HOME = home;
 			const skillsDir = path.join(cwd, ".gjc", "skills");
 			const alphaPath = await makeSkill(skillsDir, "alpha", "Sort alpha", "Alpha body.");
 			await fs.symlink(path.dirname(alphaPath), path.join(skillsDir, "zz-alias-alpha"), "dir");
@@ -487,27 +472,24 @@ describe("SkillDiscoveryTool", () => {
 			await makeSkill(skillsDir, "zulu", "Sort zulu", "Zulu body.");
 
 			const userOnly = await new SkillDiscoveryTool(
-				createSession(cwd, { settings: runtimeSkillSettings({ "skills.enablePiProject": false }) }),
+				createSession(cwd, { settings: runtimeSkillSettings({ "skills.enablePiProject": false }), home }),
 			).execute("call", { query: "lower-only" });
 			expect(userOnly.details?.candidates).toEqual([
 				expect.objectContaining({ name: "alpha", path: userAlphaPath, source: "user" }),
 			]);
 
 			const dedupBeforeQuery = await new SkillDiscoveryTool(
-				createSession(cwd, { settings: runtimeSkillSettings() }),
+				createSession(cwd, { settings: runtimeSkillSettings(), home }),
 			).execute("call", { query: "lower-only" });
 			expect(dedupBeforeQuery.details?.candidates).toEqual([]);
 
-			const result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
-				"call",
-				{ query: "sort", limit: 1 },
-			);
+			const result = await new SkillDiscoveryTool(
+				createSession(cwd, { settings: runtimeSkillSettings(), home }),
+			).execute("call", { query: "sort", limit: 1 });
 			expect(result.details?.candidates).toEqual([
 				expect.objectContaining({ name: "alpha", description: "Sort alpha", path: alphaPath, source: "project" }),
 			]);
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
 			await fs.rm(cwd, { recursive: true, force: true });
 			await fs.rm(home, { recursive: true, force: true });
 		}
@@ -518,27 +500,28 @@ describe("SkillDiscoveryTool", () => {
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-skills-policy-home-"));
 		await makeSkill(path.join(cwd, ".gjc", "skills"), "project-helper", "Project helper skill", "Project body.");
 		await makeSkill(path.join(home, ".gjc", "skills"), "user-helper", "User helper skill", "User body.");
-		const originalHome = process.env.HOME;
-		process.env.HOME = home;
 		try {
 			const projectDisabled = runtimeSkillSettings({ "skills.enablePiProject": false });
-			let result = await new SkillDiscoveryTool(createSession(cwd, { settings: projectDisabled })).execute(
+			let result = await new SkillDiscoveryTool(createSession(cwd, { settings: projectDisabled, home })).execute(
 				"call",
 				{},
 			);
 			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual(["user-helper"]);
 			await expect(
 				new SkillTool(
-					createSession(cwd, { skills: [], settings: projectDisabled, sendCustomMessage: async () => {} }),
+					createSession(cwd, { skills: [], settings: projectDisabled, home, sendCustomMessage: async () => {} }),
 				).execute("call", { name: "project-helper" }),
 			).rejects.toThrow(/unknown skill/);
 
 			const userDisabled = runtimeSkillSettings({ "skills.enablePiUser": false });
-			result = await new SkillDiscoveryTool(createSession(cwd, { settings: userDisabled })).execute("call", {});
+			result = await new SkillDiscoveryTool(createSession(cwd, { settings: userDisabled, home })).execute(
+				"call",
+				{},
+			);
 			expect(result.details?.candidates.map(candidate => candidate.name)).toEqual(["project-helper"]);
 			await expect(
 				new SkillTool(
-					createSession(cwd, { skills: [], settings: userDisabled, sendCustomMessage: async () => {} }),
+					createSession(cwd, { skills: [], settings: userDisabled, home, sendCustomMessage: async () => {} }),
 				).execute("call", { name: "user-helper" }),
 			).rejects.toThrow(/unknown skill/);
 
@@ -547,20 +530,17 @@ describe("SkillDiscoveryTool", () => {
 				runtimeSkillSettings({ "skills.includeSkills": ["user-*"] }),
 				runtimeSkillSettings({ disabledExtensions: ["skill:project-helper"] }),
 			]) {
-				result = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {
+				result = await new SkillDiscoveryTool(createSession(cwd, { settings, home })).execute("call", {
 					source: "project",
 				});
 				expect(result.details?.candidates).toEqual([]);
 				await expect(
-					new SkillTool(createSession(cwd, { skills: [], settings, sendCustomMessage: async () => {} })).execute(
-						"call",
-						{ name: "project-helper" },
-					),
+					new SkillTool(
+						createSession(cwd, { skills: [], settings, home, sendCustomMessage: async () => {} }),
+					).execute("call", { name: "project-helper" }),
 				).rejects.toThrow(/unknown skill/);
 			}
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
 		}
 	});
 
@@ -591,18 +571,15 @@ describe("SkillDiscoveryTool", () => {
 	it("applies runtime precedence: project .gjc beats user, convention copies stay import candidates", async () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-precedence-"));
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-convention-precedence-home-"));
-		const originalHome = process.env.HOME;
-		process.env.HOME = home;
 		try {
 			await makeSkill(path.join(home, ".gjc", "skills"), "shared", "User copy");
 			await makeSkill(path.join(cwd, ".codex", "skills"), "shared", "Codex copy");
 			await makeSkill(path.join(cwd, ".claude", "skills"), "shared", "Claude copy");
 			const nativePath = await makeSkill(path.join(cwd, ".gjc", "skills"), "shared", "Native copy");
 
-			const result = await new SkillDiscoveryTool(createSession(cwd, { settings: runtimeSkillSettings() })).execute(
-				"call",
-				{ query: "shared" },
-			);
+			const result = await new SkillDiscoveryTool(
+				createSession(cwd, { settings: runtimeSkillSettings(), home }),
+			).execute("call", { query: "shared" });
 			expect(result.details?.candidates).toEqual([
 				expect.objectContaining({
 					name: "shared",
@@ -620,13 +597,11 @@ describe("SkillDiscoveryTool", () => {
 			// convention copies remain import candidates with enablement guidance.
 			await fs.rm(path.join(cwd, ".gjc"), { recursive: true, force: true });
 			const userWins = await new SkillDiscoveryTool(
-				createSession(cwd, { settings: runtimeSkillSettings() }),
+				createSession(cwd, { settings: runtimeSkillSettings(), home }),
 			).execute("call", { query: "shared" });
 			expect(userWins.details?.candidates[0]?.path).toContain(path.join(".gjc", "skills", "shared"));
 			expect(userWins.details?.candidates[0]?.source).toBe("user");
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
 		}
 	});
 
@@ -723,8 +698,6 @@ describe("SkillDiscoveryTool", () => {
 		const cwd = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-cwd-"));
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-home-"));
 		const custom = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-customdir-untrusted-root-"));
-		const originalHome = process.env.HOME;
-		process.env.HOME = home;
 		try {
 			await makeSkill(path.join(home, ".gjc", "skills"), "ambient-helper", "Ambient user skill");
 			await makeSkill(custom, "declared-helper", "Declared custom skill");
@@ -733,14 +706,12 @@ describe("SkillDiscoveryTool", () => {
 				"skills.customDirectories": [custom],
 			});
 
-			const result = await new SkillDiscoveryTool(createSession(cwd, { settings })).execute("call", {});
+			const result = await new SkillDiscoveryTool(createSession(cwd, { settings, home })).execute("call", {});
 			const names = (result.details?.candidates ?? []).map(candidate => candidate.name);
 
 			expect(names).toContain("declared-helper");
 			expect(names).not.toContain("ambient-helper");
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
 		}
 	});
 

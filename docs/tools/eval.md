@@ -4,7 +4,7 @@
 
 > **Notice:** Do not shell out to `python -c`/`python -e`, `bun -e`, or `node -e` via the `bash` tool for ad-hoc code execution. Use this tool instead — it gives you persistent state across cells, structured `display()` output, image/JSON capture, and proper cancellation/timeout handling that one-shot `-e`/`-c` invocations cannot provide.
 
-> **Not to be confused with [`python`](./python.md).** `eval` runs in a **session-scoped** kernel and is the general-purpose choice. The `python` tool runs in a kernel owned by an active `autoresearch` mission and records every call as a notebook cell; it is unavailable outside a mission. Both drive the same underlying Python kernel implementation — see [Kernel ownership](../python-repl.md#kernel-ownership).
+> **Not to be confused with [`python`](./python.md).** `eval` runs in a **session-scoped** kernel and is the general-purpose choice. The `python` tool is a session-owned persistent REPL with its own `python:<session-id>` owner and an append-only JSONL transcript; it requires no active `autoresearch` mission. Both drive the same underlying Python kernel implementation — see [Kernel ownership](../python-repl.md#kernel-ownership).
 
 ## Source
 - Entry: `packages/coding-agent/src/tools/eval.ts`

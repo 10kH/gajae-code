@@ -1094,8 +1094,14 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		dir: "packages/coding-agent",
 		manifest: { name: "@gajae-code/coding-agent", scripts: { check: "biome check .", test: "bun test" } },
 	};
-	const targetingPackages: WorkspacePackage[] = [codingAgent];
+	const agentCore: WorkspacePackage = {
+		name: "@gajae-code/agent-core",
+		dir: "packages/agent",
+		manifest: { name: "@gajae-code/agent-core", scripts: { check: "biome check .", test: "bun test" } },
+	};
+	const targetingPackages: WorkspacePackage[] = [agentCore, codingAgent];
 	const testFiles = [
+		"packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts",
 		"packages/coding-agent/test/edit/foo.test.ts",
 		"packages/coding-agent/test/edit/bar.test.ts",
 		"packages/coding-agent/test/cli.test.ts",
@@ -1111,6 +1117,30 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	function targeted(paths: readonly string[]) {
 		return planTargetedTasks(paths, targetingPackages, testFiles);
 	}
+
+	test("provider envelope changes select the safety-stop regression once without broad shards", () => {
+		const tasks = targeted(["packages/agent/src/agent-loop.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys.filter(key => key === "test:packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts")).toHaveLength(1);
+		expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([]);
+		expect(keys).toContain("check:@gajae-code/agent-core");
+	});
+
+	test("push routing keeps the regression inside the normal eight-shard suite", () => {
+		const pushCodingAgent: WorkspacePackage = {
+			...codingAgent,
+			manifest: {
+				...codingAgent.manifest,
+				dependencies: { "@gajae-code/agent-core": "workspace:*" },
+			},
+		};
+		const tasks = planTasks(["packages/agent/src/agent-loop.ts"], [agentCore, pushCodingAgent]);
+		const shardKeys = tasks
+			.map(task => task.key)
+			.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(shardKeys).toHaveLength(8);
+		expect(tasks.filter(task => task.key === "test:packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts")).toHaveLength(0);
+	});
 
 	test("a single coding-agent test change runs only that test, not the whole package suite", () => {
 		const tasks = targeted(["packages/coding-agent/test/edit/foo.test.ts"]);
@@ -1240,10 +1270,18 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/test/sdk-session-index-lock-contention.test.ts",
 			"packages/coding-agent/src/sdk/broker/process-incarnation.ts",
 			"packages/coding-agent/src/config/file-lock.ts",
+			// canonicalEnvKey() folds project-dotenv provenance keys on win32 only,
+			// so a Linux shard exercises an identity function and proves nothing.
+			"packages/utils/src/dirs.ts",
+			"packages/utils/src/env.ts",
+			"packages/utils/test/env-provenance.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
 		}
+		// Neighbouring utils paths must not drag the windows-latest job in.
+		expect(isWindowsSessionPathRegressionPath("packages/utils/src/logger.ts")).toBe(false);
+		expect(isWindowsSessionPathRegressionPath("packages/utils/test/env.test.ts")).toBe(false);
 		expect(isWindowsSessionPathRegressionPath("packages/coding-agent/src/session/session-store.ts")).toBe(false);
 		expect(needsWindowsSessionPathRegression(["packages/coding-agent/src/edit/foo.ts"])).toBe(false);
 	});
@@ -1314,6 +1352,24 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		});
 		expect(tasks[2]?.command).toEqual(["bun", "run", "ci:test:smoke"]);
 		expect(keys.filter(key => key === "native-linux-x64")).toHaveLength(1);
+	});
+	test("file-tool sources schedule their ACP and publication regression suites", () => {
+		const expected: Record<string, string> = {
+			"packages/coding-agent/src/tools/atomic-file-write.ts": "packages/coding-agent/test/file-tools-atomicity.test.ts",
+			"packages/coding-agent/src/tools/read.ts": "packages/coding-agent/test/read-acp-fs.test.ts",
+			"packages/coding-agent/src/tools/write.ts": "packages/coding-agent/test/write-acp-fs.test.ts",
+			"packages/coding-agent/src/lsp/index.ts": "packages/coding-agent/test/tools/lsp-batching.test.ts",
+			"packages/coding-agent/src/config/model-registry.ts": "packages/coding-agent/test/model-registry-runtime-provider.test.ts",
+		};
+		for (const [source, testFile] of Object.entries(expected)) {
+			const tasks = targeted([source]);
+			expect(tasks.map(task => task.key)).toContain(`test:${testFile}`);
+		}
+	});
+	test("never emits a runnable task for a nonexistent test path", () => {
+		const missing = "packages/coding-agent/test/write-acp-fs-missing.test.ts";
+		const tasks = planTargetedTasks([missing], targetingPackages, [...testFiles, missing], true);
+		expect(tasks.map(task => task.key)).not.toContain(`test:${missing}`);
 	});
 	test("native path identity changes select the POSIX regression suite", () => {
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);

@@ -405,6 +405,29 @@ with `requestedProfile` where applicable, whole exact `availableProfiles` entrie
 that fit the detail budget, and `discoveryQuery: "models.profiles.list"`. The
 discovery pointer is authoritative when the bounded error cannot include every ID.
 
+The same lifecycle operations accept an optional `modelId`: an explicit
+`provider/model` pin with `gjc --model` grammar (#4707). Coordinators resolve it
+against the full model registry (the CLI `--model` surface, not the
+authenticated-only subset) before sending the create request, so unknown ids are
+rejected before any session exists. The broker guards only its shape; the child
+applies it exactly like a CLI `--model` selection, which also means an explicit
+`modelId` wins over `modelPreset` when both are supplied — the same precedence as
+`gjc --mpreset <profile> --model <model>`. The full effective order is:
+
+```
+modelId pin  >  modelPreset  >  configured modelProfile.default  >  role/resume/default
+```
+
+The pin is a guarantee, not a preference. The coordinator validates against its
+own registry and the child owns the registry that actually serves requests, so
+the two can drift (a model removed, a provider disabled, an extension that
+failed to register). On drift the child fails session construction before
+readiness and before any profile application, disposes the partial session, and
+reports an error naming the pinned selector — it never publishes success on a
+substituted model. Coordinator validation refreshes the registry per request
+(offline, from the on-disk discovery cache) so ids added or removed after an
+earlier pin are judged against current contents.
+
 ### Active provider query (Q29)
 
 `Q29` / `providers.list/active` pages the providers currently eligible for model

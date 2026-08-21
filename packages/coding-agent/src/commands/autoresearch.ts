@@ -6,6 +6,7 @@ export default class Autoresearch extends Command {
 	static description = "Run native GJC Autoresearch workflow commands";
 	static strict = false;
 	static examples = [
+		"$ gjc autoresearch intake --spec <deep-interview-spec.md> --json",
 		"$ gjc autoresearch --spec <deep-interview-spec.md> --json",
 		'$ gjc autoresearch "<goal>"',
 		"$ gjc autoresearch",

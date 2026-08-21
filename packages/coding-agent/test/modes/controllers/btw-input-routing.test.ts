@@ -42,6 +42,7 @@ function createHarness(options: { btwOpen?: boolean; accepted?: boolean; streami
 			isBashRunning: false,
 			isEvalRunning: false,
 			queuedMessageCount: 1,
+			drainableQueuedMessageCount: 1,
 			hasQueuedSteering: false,
 			messages: [{ role: "user", content: "existing" }],
 			extensionRunner: undefined,

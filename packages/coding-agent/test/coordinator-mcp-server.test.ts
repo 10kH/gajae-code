@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Model } from "@gajae-code/ai";
 import {
 	type CodexHandoffOriginV1,
 	readCodexHandoff,
@@ -96,6 +97,10 @@ type SdkControlServerOptions = {
 	>["eventWebhookDelivery"];
 	/** Extra env layered into the coordinator server env for webhook opt-in tests. */
 	eventWebhookEnv?: Record<string, string>;
+	/** Injectable model registry for coordinator `model` pin tests. */
+	modelRegistry?: NonNullable<
+		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+	>["resolveModelRegistry"];
 };
 function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(control => control.operation !== "session.list");
@@ -281,6 +286,7 @@ async function createSdkControlServer(
 		services: {
 			getAgentDir: () => agentDir,
 			resolveModelProfiles: () => new Map([["codex-eco", { name: "codex-eco" }]]),
+			...(serverOptions.modelRegistry ? { resolveModelRegistry: serverOptions.modelRegistry } : {}),
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
 			eventWebhookDelivery: serverOptions.eventWebhookDelivery,
@@ -1567,6 +1573,130 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				"utf8",
 			),
 		).resolves.toContain('"mpreset": "codex-eco"');
+	});
+	const pinnedModel = (provider: string, id: string): Model =>
+		({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
+	const pinnedModelRegistry = (models: Model[]) =>
+		(() => ({ getAll: () => models })) as unknown as NonNullable<
+			NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
+		>["resolveModelRegistry"];
+
+	it("passes a resolved explicit model pin into the SDK lifecycle create request and persists it with the session", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			modelRegistry: pinnedModelRegistry([
+				pinnedModel("cursor", "claude-fable-5-xhigh"),
+				pinnedModel("cursor", "composer-2.5"),
+			]),
+		});
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			model: "cursor/claude-fable-5-xhigh",
+			idempotency_key: "model-start",
+			allow_mutation: true,
+		});
+		expect(started).toMatchObject({
+			ok: true,
+			session: { session_id: "created-session-1", model: "cursor/claude-fable-5-xhigh" },
+		});
+		expect(lifecycleControls(controls)).toEqual([
+			{
+				operation: "session.create",
+				input: {
+					cwd: root,
+					target: { path: root },
+					modelId: "cursor/claude-fable-5-xhigh",
+					coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
+				},
+				idempotencyKey: "model-start",
+			},
+		]);
+		await expect(
+			fs.readFile(
+				path.join(root, ".gjc", "coordinator-state", "local", "repo", "sessions", "created-session-1.json"),
+				"utf8",
+			),
+		).resolves.toContain('"model": "cursor/claude-fable-5-xhigh"');
+	});
+
+	it("keeps both mpreset and an explicit model pin, with the model winning in the child", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			modelRegistry: pinnedModelRegistry([pinnedModel("cursor", "default")]),
+		});
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			mpreset: "codex-eco",
+			model: "cursor/default",
+			idempotency_key: "preset-and-model",
+			allow_mutation: true,
+		});
+		expect(started).toMatchObject({ ok: true, session: { mpreset: "codex-eco", model: "cursor/default" } });
+		expect(lifecycleControls(controls)).toEqual([
+			{
+				operation: "session.create",
+				input: {
+					cwd: root,
+					target: { path: root },
+					modelPreset: "codex-eco",
+					modelId: "cursor/default",
+					coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
+				},
+				idempotencyKey: "preset-and-model",
+			},
+		]);
+	});
+
+	it("rejects an unknown model pin before any session creation", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			modelRegistry: pinnedModelRegistry([pinnedModel("cursor", "claude-fable-5-xhigh")]),
+		});
+		const rejected = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			model: "cursor:fable5-xhigh",
+			idempotency_key: "unknown-model-start",
+			allow_mutation: true,
+		});
+		expect(rejected).toMatchObject({
+			ok: false,
+			reason: "unknown_model",
+			model: "cursor:fable5-xhigh",
+		});
+		const error = (rejected as { error?: { message?: string } }).error?.message ?? "";
+		expect(error).toContain("not found");
+		expect(error).toContain("--list-models");
+		expect(lifecycleControls(controls)).toEqual([]);
+	});
+
+	it("resolves a delegate model pin into the lifecycle create request and prompt", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			modelRegistry: pinnedModelRegistry([pinnedModel("cursor", "composer-2.5")]),
+		});
+		const delegated = await server.callTool("gjc_delegate_plan", {
+			cwd: root,
+			task: "plan the thing",
+			model: "cursor/composer-2.5",
+			idempotency_key: "delegate-model",
+			allow_mutation: true,
+		});
+		expect(delegated).toMatchObject({
+			ok: true,
+			session: { model: "cursor/composer-2.5" },
+		});
+		expect(controls.filter(control => control.operation === "session.create").map(control => control.input)).toEqual([
+			{
+				cwd: root,
+				target: { path: root },
+				modelId: "cursor/composer-2.5",
+				coordinatorStateDir: path.join(root, ".gjc", "coordinator-state", "local", "repo"),
+			},
+		]);
 	});
 	it("keeps lifecycle endpoint credentials out of start_session results", async () => {
 		const root = await tempRoot();

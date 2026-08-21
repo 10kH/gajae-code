@@ -250,6 +250,36 @@ it("SDK lifecycle model presets reach the session host parser", async () => {
 	}
 });
 
+it("SDK lifecycle explicit model pins reach the session host parser and validate shape", async () => {
+	const agentDir = await temp();
+	const cwd = path.join(agentDir, "repo");
+	await fs.mkdir(cwd);
+	const request = readSessionLifecycleLaunchRequest(
+		JSON.stringify({
+			operation: "session.create",
+			sessionId: "session-1",
+			stateRoot: path.join(cwd, ".gjc", "state"),
+			cwd,
+			modelId: "cursor/claude-fable-5-xhigh",
+			...deriveLifecycleDeadlines(Date.now(), 10_000),
+		}),
+	);
+	try {
+		expect(request.modelId).toBe("cursor/claude-fable-5-xhigh");
+		expect((await lifecycleArgs(request, cwd, agentDir)).model).toBe("cursor/claude-fable-5-xhigh");
+		expect(() =>
+			readSessionLifecycleLaunchRequest(
+				JSON.stringify({
+					...request,
+					modelId: "   ",
+				}),
+			),
+		).toThrow("GJC_SDK_LIFECYCLE_REQUEST is invalid.");
+	} finally {
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 it("SDK lifecycle launch requests preserve validated ACP MCP transports", async () => {
 	const agentDir = await temp();
 	const cwd = path.join(agentDir, "repo");
@@ -1018,6 +1048,95 @@ describe("SDK broker identity and discovery", () => {
 			expect((refusal?.cause as Error | undefined)?.message).toContain(nativeRefusal.message);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+	it("names the acquisition stage the native layer refused, not always the open", async () => {
+		// The native reason carries the stage that refused. Rendering every reason as
+		// a failed open would state something the native layer never reported -- a
+		// read of an already-open descriptor, or an fstat, is not an open failure --
+		// and the whole point of this diagnostic is that its claim is exact.
+		if (process.platform === "win32") return;
+		const cases: [string, RegExp][] = [
+			["errno-EPERM", /sdk\/broker\.json could not be opened \(EPERM\)/],
+			["read-operation would block", /sdk\/broker\.json could not be read \(operation would block\)/],
+			["clone-too many open files", /sdk\/broker\.json could not be inspected \(too many open files\)/],
+			["metadata", /sdk\/broker\.json could not be inspected(?!\s*\()/],
+			["metadata-permission denied", /sdk\/broker\.json could not be inspected \(permission denied\)/],
+			["io-other error", /sdk\/broker\.json could not be opened \(other error\)/],
+			["future-reason", /sdk\/broker\.json withheld publication authority \(future-reason\)/],
+		];
+		// `unsupported-platform` is the Windows acquisition refusal: the object in
+		// the native message is the directory authority targets, and the rendering
+		// must name the unimplemented platform, never a stage that did not run.
+		const platformCases: [string, string, RegExp][] = [
+			["sdk", "unsupported-platform", /retained publication authority is not implemented on this platform/],
+		];
+		for (const [object, reason, expected] of platformCases) {
+			const dir = await temp();
+			const nativeFailure = new Error(
+				`Retained broker publication authority is unavailable. [retained-publication object=${object}; reason=${reason}]`,
+			);
+			const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+				throw nativeFailure;
+			});
+			try {
+				const refusal = await publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "unsupported-platform",
+					ownerId: "unsupported-platform",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "unsupported-platform-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}).then(
+					() => undefined,
+					(error: unknown) => error as Error,
+				);
+				expect(refusal?.message).toMatch(expected);
+				expect(refusal?.message).not.toContain("could not be opened");
+				expect(refusal?.message).not.toContain("current observed state");
+				expect(refusal?.cause).toBe(nativeFailure);
+			} finally {
+				retain.mockRestore();
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		}
+		for (const [reason, expected] of cases) {
+			const dir = await temp();
+			const nativeFailure = new Error(
+				`Retained broker publication authority is unavailable. [retained-publication object=sdk/broker.json; reason=${reason}]`,
+			);
+			const retain = vi.spyOn(native, "retainBrokerPublication").mockImplementation(() => {
+				throw nativeFailure;
+			});
+			try {
+				const refusal = await publishBrokerDiscovery(dir, {
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "stage-named",
+					ownerId: "stage-named",
+					pid: process.pid,
+					host: "127.0.0.1",
+					port: 1,
+					url: "ws://127.0.0.1:1",
+					token: "stage-named-token",
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				}).then(
+					() => undefined,
+					(error: unknown) => error as Error,
+				);
+				expect(refusal?.message).toMatch(expected);
+				expect(refusal?.message).not.toContain("current observed state");
+				expect(refusal?.cause).toBe(nativeFailure);
+			} finally {
+				retain.mockRestore();
+				await fs.rm(dir, { recursive: true, force: true });
+			}
 		}
 	});
 	it("escapes control and bidi characters in the diagnostic agent directory", async () => {

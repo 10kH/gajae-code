@@ -18,9 +18,16 @@ export interface DetectCompiledBinaryInput {
 
 export function detectCompiledBinary(input: DetectCompiledBinaryInput): boolean;
 
+export type Win32Avx2ProbeDiagnostic = "timeout" | "spawn_error" | "nonzero_exit" | "non_decisive_output";
+
 export function detectWin32Avx2Support(
 	probe?: () => boolean | undefined,
-	command?: (file: string, args: string[]) => string | null,
+	command?: (
+		file: string,
+		args: string[],
+		report?: (diagnostic: Win32Avx2ProbeDiagnostic) => void,
+	) => string | null,
+	report?: (diagnostic: Win32Avx2ProbeDiagnostic) => void,
 ): boolean;
 
 export interface GetAddonFilenamesInput {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:
 import * as path from "node:path";
 import { Agent } from "@gajae-code/agent-core";
 import * as compactionModule from "@gajae-code/agent-core/compaction";
-import type { AssistantMessage } from "@gajae-code/ai";
+import type { AssistantMessage, ToolResultMessage } from "@gajae-code/ai";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
@@ -392,6 +392,148 @@ describe("AgentSession state-aware compaction", () => {
 		expect(skillContext).toContain("&amp;");
 		expect(skillContext).not.toContain("</additional-context>");
 		expect(skillContext).not.toContain("\n");
+	});
+	it("includes recent write paths in compaction-state extraContext", async () => {
+		const writeCall = assistantMessage("stop");
+		writeCall.content = [
+			{
+				type: "toolCall",
+				id: "write-recent",
+				name: "write",
+				arguments: { path: "frontend/e2e/zzop-repro.spec.ts", content: "test" },
+			},
+		];
+		session.agent.appendMessage(writeCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "write-recent",
+			toolName: "write",
+			content: [{ type: "text", text: "Successfully wrote 4 bytes to frontend/e2e/zzop-repro.spec.ts" }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		seedCompactionHistory();
+		await session.compact();
+		const options = compactSpy.mock.calls[0]?.[5];
+		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
+		expect(files).toContain("frontend/e2e/zzop-repro.spec.ts");
+	});
+	it("does not auto-continue from recent file mutations alone", async () => {
+		const writeCall = assistantMessage("stop");
+		writeCall.content = [
+			{
+				type: "toolCall",
+				id: "write-done",
+				name: "write",
+				arguments: { path: "frontend/e2e/zzop-repro.spec.ts", content: "test" },
+			},
+		];
+		session.agent.appendMessage(writeCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "write-done",
+			toolName: "write",
+			content: [{ type: "text", text: "Successfully wrote 4 bytes to frontend/e2e/zzop-repro.spec.ts" }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue();
+		const notices: string[] = [];
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+		await compact();
+		expect(promptSpy).not.toHaveBeenCalled();
+		expect(notices).toContain("Auto-continue skipped: no unfinished work detected");
+	});
+
+	it("includes multi-path AST edits in compaction-state extraContext", async () => {
+		const astEditCall = assistantMessage("stop");
+		astEditCall.content = [
+			{
+				type: "toolCall",
+				id: "ast-edit-recent",
+				name: "ast_edit",
+				arguments: {
+					paths: ["src/first.ts", "src/second.ts"],
+					ops: [{ pat: "old", out: "new" }],
+				},
+			},
+		];
+		session.agent.appendMessage(astEditCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "ast-edit-recent",
+			toolName: "ast_edit",
+			content: [{ type: "text", text: "Applied 2 replacements in 2 files." }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		seedCompactionHistory();
+		await session.compact();
+		const options = compactSpy.mock.calls[0]?.[5];
+		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
+		expect(files).toContain("src/first.ts");
+		expect(files).toContain("src/second.ts");
+	});
+
+	it("includes edit rename source and destination in compaction-state extraContext", async () => {
+		const editCall = assistantMessage("stop");
+		editCall.content = [
+			{
+				type: "toolCall",
+				id: "edit-rename-recent",
+				name: "edit",
+				arguments: {
+					path: "src/old.ts",
+					edits: [{ op: "update", rename: "src/new.ts" }],
+				},
+			},
+		];
+		session.agent.appendMessage(editCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "edit-rename-recent",
+			toolName: "edit",
+			content: [{ type: "text", text: "Successfully edited src/old.ts" }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		seedCompactionHistory();
+		await session.compact();
+		const options = compactSpy.mock.calls[0]?.[5];
+		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
+		expect(files).toContain("src/old.ts");
+		expect(files).toContain("src/new.ts");
+	});
+
+	it("includes apply_patch rename source and destination in compaction-state extraContext", async () => {
+		const applyPatchCall = assistantMessage("stop");
+		applyPatchCall.content = [
+			{
+				type: "toolCall",
+				id: "apply-patch-rename-recent",
+				name: "apply_patch",
+				arguments: {
+					input: "*** Begin Patch\n*** Update File: src/old.ts\n*** Move to: src/new.ts\n@@\n-old\n+new\n*** End Patch",
+				},
+			},
+		];
+		session.agent.appendMessage(applyPatchCall);
+		session.agent.appendMessage({
+			role: "toolResult",
+			toolCallId: "apply-patch-rename-recent",
+			toolName: "apply_patch",
+			content: [{ type: "text", text: "Applied patch." }],
+			isError: false,
+			timestamp: Date.now(),
+		} as ToolResultMessage);
+		seedCompactionHistory();
+		await session.compact();
+		const options = compactSpy.mock.calls[0]?.[5];
+		const files = options?.extraContext?.find(context => context.startsWith("Recent file mutations:")) ?? "";
+		expect(files).toContain("src/old.ts");
+		expect(files).toContain("src/new.ts");
 	});
 
 	it("continues synthetic auto-continue for an active nonterminal workflow", async () => {

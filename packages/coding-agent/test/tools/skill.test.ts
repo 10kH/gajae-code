@@ -213,13 +213,11 @@ describe("SkillTool", () => {
 	it("uses runtime fallback through createIf while session skills retain name precedence", async () => {
 		const cwd = await makeTempCwd();
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-home-"));
-		const originalHome = process.env.HOME;
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		let unrelated: Skill | undefined;
 		let preloaded: Skill | undefined;
 		try {
-			process.env.HOME = home;
 			process.env.GJC_CONFIG_DIR = ".gjc";
 			delete process.env.PI_CONFIG_DIR;
 			const runtimePath = await makeRuntimeSkill(
@@ -230,7 +228,7 @@ describe("SkillTool", () => {
 			);
 			unrelated = await makeSkill("unrelated", "Unrelated body.");
 			const captured: CapturedSend[] = [];
-			const session = createSession(cwd, [unrelated], captured, { settings: runtimeSkillSettings() });
+			const session = createSession(cwd, [unrelated], captured, { settings: runtimeSkillSettings(), home });
 
 			const tool = SkillTool.createIf(session);
 			expect(tool).not.toBeNull();
@@ -251,8 +249,6 @@ describe("SkillTool", () => {
 			expect(preloadedCaptured[0]?.message.content).not.toContain("Runtime fallback body.");
 			expect(preloadedResult.details?.path).toBe(preloaded.filePath);
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
 			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
@@ -267,7 +263,6 @@ describe("SkillTool", () => {
 	it("uses exact runtime fallback precedence across project, canonical, configured, and historical roots", async () => {
 		const cwd = await makeTempCwd();
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "skill-tool-runtime-precedence-home-"));
-		const originalHome = process.env.HOME;
 		const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 		const originalPiConfigDir = process.env.PI_CONFIG_DIR;
 		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
@@ -275,7 +270,6 @@ describe("SkillTool", () => {
 		const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
 		let loaded: Skill | undefined;
 		try {
-			process.env.HOME = home;
 			delete process.env.GJC_CONFIG_DIR;
 			delete process.env.PI_CONFIG_DIR;
 			const gjcAgentDecoyDir = path.join(home, "gjc-agent-decoy");
@@ -292,7 +286,9 @@ describe("SkillTool", () => {
 			);
 			const captured: CapturedSend[] = [];
 			loaded = await makeSkill("loaded", "Loaded");
-			const tool = SkillTool.createIf(createSession(cwd, [loaded], captured, { settings: runtimeSkillSettings() }))!;
+			const tool = SkillTool.createIf(
+				createSession(cwd, [loaded], captured, { settings: runtimeSkillSettings(), home }),
+			)!;
 			const defaultResult = await tool.execute("call-default-canonical", { name: "default-canonical" });
 			expect(captured.at(-1)?.message.content).toContain("Default canonical body.");
 			expect(defaultResult.details?.path).toBe(defaultCanonicalPath);
@@ -409,8 +405,6 @@ describe("SkillTool", () => {
 			expect(captured).toHaveLength(capturedBeforeDecoys);
 			expect([gjcDecoyPath, piDecoyPath, xdgDecoyPath]).not.toContain(piResult.details?.path);
 		} finally {
-			if (originalHome === undefined) delete process.env.HOME;
-			else process.env.HOME = originalHome;
 			if (originalGjcConfigDir === undefined) delete process.env.GJC_CONFIG_DIR;
 			else process.env.GJC_CONFIG_DIR = originalGjcConfigDir;
 			if (originalPiConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
@@ -712,6 +706,81 @@ describe("SkillTool", () => {
 			const rp = await readModeState(cwd, "ralplan", "s1");
 			expect(rp?.active).toBe(true);
 			expect(rp?.handoff_from).toBe("deep-interview");
+		});
+	}
+
+	// Manifest-driven chain permissions (autoresearch handoff-ready at any live
+	// phase; ralplan "final" is a manifest terminal state the generic set misses;
+	// ralplan/ultragoal live phases stay blocked).
+	for (const [phase, callee] of [
+		["research", "deep-interview"],
+		["verdict", "ralplan"],
+		["intake", "ralplan"],
+	] as const) {
+		it(`allows autoresearch (phase=${phase}) to chain into ${callee} without a pre-write`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, "autoresearch", phase, "s1");
+			const autoresearch = await makeSkill("autoresearch", "---\nname: autoresearch\n---\nResearch");
+			const target = await makeSkill(callee, `---\nname: ${callee}\n---\nBody`);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [autoresearch, target], captured, {
+				getActiveSkillState: () => ({ skill: "autoresearch", session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			const result = await tool.execute("call-1", { name: callee });
+			expect(result.details?.name).toBe(callee);
+			expect(captured).toHaveLength(1);
+			const ar = await readModeState(cwd, "autoresearch", "s1");
+			expect(ar?.active).toBe(false);
+			expect(ar?.current_phase).toBe("handoff");
+			expect(ar?.handoff_to).toBe(callee);
+			const promoted = await readModeState(cwd, callee, "s1");
+			expect(promoted?.active).toBe(true);
+			expect(promoted?.handoff_from).toBe("autoresearch");
+		});
+	}
+
+	it("allows ralplan (phase=final, manifest terminal) to chain into ultragoal", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "final", "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ralplan, ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "final",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ultragoal" });
+		expect(result.details?.name).toBe("ultragoal");
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(false);
+		expect(rp?.handoff_to).toBe("ultragoal");
+		const ug = await readModeState(cwd, "ultragoal", "s1");
+		expect(ug?.active).toBe(true);
+	});
+
+	for (const [caller, phase, callee] of [
+		["ralplan", "planner", "ultragoal"],
+		["ultragoal", "active", "ralplan"],
+	] as const) {
+		it(`still refuses ${caller} mid-flight chaining (phase=${phase})`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, caller, phase, "s1");
+			const callerSkill = await makeSkill(caller, `---\nname: ${caller}\n---\nBody`);
+			const target = await makeSkill(callee, `---\nname: ${callee}\n---\nBody`);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [callerSkill, target], captured, {
+				getActiveSkillState: () => ({ skill: caller, session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			await expect(tool.execute("call-1", { name: callee })).rejects.toThrow(/refusing to chain/);
+			expect(captured).toHaveLength(0);
 		});
 	}
 

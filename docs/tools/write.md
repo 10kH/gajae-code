@@ -11,6 +11,7 @@
   - `packages/coding-agent/src/lsp/index.ts` — format-on-write and diagnostics writethrough.
   - `packages/coding-agent/src/tools/auto-generated-guard.ts` — block overwriting generated files.
   - `packages/coding-agent/src/tools/fs-cache-invalidation.ts` — invalidate shared FS scan caches after writes.
+  - `packages/coding-agent/src/tools/atomic-file-write.ts` — sibling temp + rename so a failed write never leaves a 0-byte destination.
   - `packages/coding-agent/src/tools/plan-mode-guard.ts` — resolve paths and enforce plan-mode write policy.
 
 ## Inputs
@@ -52,9 +53,9 @@ Single-shot result.
 1. `WriteTool.execute()` in `packages/coding-agent/src/tools/write.ts` strips `LINE+ID|` hashline prefixes from `content` when the session is in hashline display mode.
 2. It calls `#resolveArchiveWritePath()` first. That uses `parseArchivePathCandidates()` from `packages/coding-agent/src/tools/archive-reader.ts`, checks candidate archive files on disk, and falls back to the longest matching archive suffix even when the archive file does not exist yet.
 3. Archive writes call `enforcePlanModeWrite(..., { op: exists ? "update" : "create" })`, then `#writeArchiveEntry()`.
-   - The parent directory of the archive file is created with `fs.mkdir(..., { recursive: true })`.
-   - `.zip` archives are read with `fflate.unzipSync()`, the target entry is replaced in an in-memory map, and the archive is rewritten with `fflate.zipSync()` + `Bun.write()`.
-   - `.tar`, `.tar.gz`, and `.tgz` archives are read with `Bun.Archive`, existing entries are copied into an object map, the target entry is replaced, and `Bun.Archive.write()` rewrites the archive.
+   - `.zip` archives are read with `fflate.unzipSync()`, the target entry is replaced in an in-memory map, and the complete archive is reconstructed with `fflate.zipSync()` and published through the same guarded sibling-temp atomic writer as plain files.
+   - `.tar`, `.tar.gz`, and `.tgz` archives are read with `Bun.Archive`, existing entries are copied into an object map, the target entry is replaced, and `Bun.Archive.bytes()` reconstructs the archive before atomic publication.
+   - The reconstructed ZIP/TAR bytes are published through `writeFileAtomically()`, which creates parents only after trust-boundary validation. A failed reconstruction or publication leaves an existing archive byte-identical and removes the owned staging file.
    - `invalidateFsScanAfterWrite()` runs on the archive file path.
 4. If the path is not treated as an archive, `execute()` calls `#resolveSqliteWritePath()`. That uses `parseSqlitePathCandidates()` and `isSqliteFile()` from `packages/coding-agent/src/tools/sqlite-reader.ts`. Existing non-SQLite files suppress the SQLite path interpretation.
 5. SQLite writes call `enforcePlanModeWrite(..., { op: "update" })`, then `#writeSqliteRow()`.
@@ -66,15 +67,17 @@ Single-shot result.
 6. Otherwise the tool treats `path` as a plain filesystem file.
    - `enforcePlanModeWrite(..., { op: "create" })` runs before path resolution.
    - Existing files are checked by `assertEditableFile()` to block overwriting detected generated files.
-   - The session’s writethrough callback writes content. With LSP enabled and `lsp.formatOnWrite` / `lsp.diagnosticsOnWrite` settings on, `createLspWritethrough()` may format content, sync it through LSP servers, save it, and collect diagnostics. Otherwise `writethroughNoop()` writes directly with `Bun.write()` or `file.write()`.
-   - `invalidateFsScanAfterWrite()` runs on the file path.
+   - The session’s writethrough callback writes content. With LSP enabled and `lsp.formatOnWrite` / `lsp.diagnosticsOnWrite` settings on, `createLspWritethrough()` may format content, sync it through LSP servers, save it, and collect diagnostics. Otherwise `writethroughNoop()` writes through `writeFileAtomically()` (sibling temp, then rename). Permission errors (`EACCES`/`EPERM`/`EROFS`) become a `ToolError` that says the original file was left unchanged.
+   - `invalidateFsScanAfterWrite()` and `fileReadCache.invalidate()` run on the file path.
 7. The tool returns a text result and optional diagnostics metadata.
 
 ## Modes / Variants
 ### Plain file path
 - Target is any path that does not resolve as an archive selector and does not resolve as an existing-or-new SQLite selector.
 - Existing files are overwritten.
-- `write.ts` does not call `fs.mkdir()` on this path; parent-directory creation is only implemented in the archive branch.
+- Parent directories are created by `writeFileAtomically()`. A failed write never truncates an existing destination to 0 bytes.
+- Existing referents must be writable and are checked before publication. Hard-linked regular files are rejected rather than silently leaving aliases with stale bytes; this preserves the no-truncate guarantee instead of switching to an unsafe in-place fallback.
+- On Windows, a writable file held with write sharing but without delete sharing falls back to a rollback-capable in-place update after bounded rename retries, preserving the existing inode and editability.
 
 Example:
 
@@ -88,7 +91,7 @@ content: "hello\n"
 - Supported archive suffixes come from `parseArchivePathCandidates()`: `.tar`, `.tar.gz`, `.tgz`, `.zip`.
 - The inner path is normalized to `/`, strips empty and `.` segments, rejects `..`, and rejects directory targets ending in `/`.
 - Rewrites the whole archive file after replacing one entry.
-- Creates the parent directory for the archive file if needed.
+- Creates the parent directory only inside the guarded atomic publication path after destination trust validation.
 
 Example:
 
@@ -130,11 +133,21 @@ path: "data/app.sqlite:users:42"
 content: ""
 ```
 
+## Publication contract
+
+Plain-file writes stage to a sibling temp and publish with a same-directory `rename(2)`. A write that fails at any point before that rename leaves the destination byte-identical to its prior contents -- a failed write never truncates the target or leaves a 0-byte file -- and the staging file it created is removed. Successful writes leave no residue beside the destination.
+
+The staged bytes are fsynced before publication, but the parent directory is not, so publication is **not** crash-durable: a rename can be lost across a system crash.
+
+Overwrites are **last-writer-wins**. Destination identity is revalidated immediately before the rename, which rejects a target that was replaced or retargeted while staging, but the rename commits against the pathname. A concurrent writer that publishes a successor between that check and the rename is overwritten rather than detected.
+
+Destination symlinks are followed: the referent is replaced and the link is preserved. Hard-linked targets are rejected, because replacement would split the link group.
+
 ## Side Effects
 - Filesystem
   - Creates or overwrites plain files.
-  - Rewrites entire archive files when writing an archive entry.
-  - Creates parent directories for archive files only.
+  - Reconstructs and atomically publishes entire archive files when writing an archive entry; failed publication preserves an existing archive and cleans owned staging residue.
+  - Creates parent directories for plain files and archive files only after the destination boundary has been validated.
   - Mutates existing SQLite databases; never creates a new SQLite DB.
 - Subprocesses / native bindings
   - Uses Bun SQLite bindings via `bun:sqlite`.
@@ -171,7 +184,7 @@ content: ""
 ## Notes
 - Archive path detection runs before SQLite detection. A path that matches an archive selector is never treated as SQLite.
 - SQLite detection declines when an existing file with a `.sqlite` / `.db` suffix is present but does not have SQLite magic bytes; then the path falls back to a plain file write.
-- ZIP entry content is encoded with `new TextEncoder().encode(content)` in `#writeArchiveEntry()`. Non-ZIP archive writes pass the string directly to `Bun.Archive.write()`.
+- ZIP entry content is encoded with `new TextEncoder().encode(content)` in `#writeArchiveEntry()`. Non-ZIP archive entries are reconstructed with `Bun.Archive.bytes()` and both formats publish through `writeFileAtomically()`.
 - The prompt forbids two common anti-patterns: using `write` for routine edits that should use `edit`, and creating `*.md` / `README` files unless explicitly requested. It also forbids emojis unless requested.
 - Plain file writes report byte count using `cleanContent.length`, which is UTF-16 code units in JS, not an on-disk byte measurement.
 - `stripWriteContent()` only removes hashline prefixes when the session’s file display mode has `hashLines` enabled; otherwise content is written unchanged.

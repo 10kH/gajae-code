@@ -106,4 +106,35 @@ describe("cursor native toolCall JSON safety", () => {
 		});
 		expect(JSON.parse(JSON.stringify(block?.arguments))).toEqual(block?.arguments);
 	});
+
+	it("decodes protobuf oneof tool variants instead of flattened fixtures only", () => {
+		const block = buildNativeToolCallBlock(
+			{
+				tool: {
+					case: "shellToolCall",
+					value: { args: { command: "pwd", timeoutMs: 1000 } },
+				},
+			},
+			"call-oneof",
+			0,
+		);
+		expect(block).toMatchObject({
+			type: "toolCall",
+			id: "call-oneof",
+			name: "bash",
+			arguments: { command: "pwd", timeoutMs: 1000 },
+		});
+	});
+
+	it("keeps server call IDs paired with decoded native tool blocks", () => {
+		const blocks = [
+			buildNativeToolCallBlock({ shellToolCall: { args: { command: "first" } } }, "call-first", 0),
+			buildNativeToolCallBlock({ shellToolCall: { args: { command: "second" } } }, "call-second", 1),
+		];
+
+		expect(blocks).toEqual([
+			expect.objectContaining({ id: "call-first", arguments: { command: "first" } }),
+			expect.objectContaining({ id: "call-second", arguments: { command: "second" } }),
+		]);
+	});
 });

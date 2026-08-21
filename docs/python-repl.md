@@ -119,17 +119,19 @@ Unknown magic names raise `NameError: UsageError: ...` inside the cell.
 Retained kernels are keyed by an **owner id**, and there are two kinds of owner:
 
 - **Session-owned** (the `eval` tool) — derived from the session file plus cwd as described above. Reaped when the session disposes.
-- **Explicitly-owned** (the `autoresearch` mission `python` tool) — the caller supplies `kernelOwnerId`, which is `autoresearch:<mission-id>`. This is deliberately distinct from the session's eval owner id so the two never alias and a mission kernel is never reaped as collateral of eval cleanup.
+- **Explicitly-owned** (the `python` tool) — the caller supplies `kernelOwnerId`, which is `python:<session-id>`. This is deliberately distinct from the session's eval owner id so the two never alias and a Python REPL kernel is never reaped as collateral of eval cleanup.
 
 `disposeKernelSessionsByOwner(ownerId)` disposes every retained kernel for one owner and is idempotent, so disposing an owner twice is not a double free.
 
 Owner-scoped kernels are reaped on all three exits:
 
-- the owning tool's own teardown action (for the mission tool, `action: "clear"`),
-- graceful session dispose, which drains both tool-cleanup registries,
+- the owning tool's own teardown action (for `python`, `action: "clear"`),
+- session cleanup, which also handles session identity transitions,
 - signal exit (Ctrl-C), via `disposeChildSubprocesses`, which also drains both registries inside a single bounded budget.
 
-That last point matters: a tool registering through the SDK's `registerSessionCleanup` lands in the **transition** cleanup registry, not the session one. Draining only the session registry on signal exit left explicitly-owned kernels running after Ctrl-C while graceful dispose looked correct.
+`gjc autoresearch clear` clears autoresearch state only; it does not dispose a Python kernel.
+
+A tool registering through the SDK's `registerSessionCleanup` lands in the **transition** cleanup registry, not the session one. Draining only the session registry on signal exit left explicitly-owned kernels running after Ctrl-C while graceful dispose looked correct.
 
 ### Multi-cell behavior in a single tool call
 

@@ -81,7 +81,9 @@ URL selectors are parsed separately in `packages/coding-agent/src/tools/fetch.ts
    - `#readSqlite()` dispatches on `parseSqliteSelector()`.
 6. Otherwise it treats the input as a local filesystem path.
    - `resolveReadPath()` expands `~`, resolves relative to session cwd, treats bare `/` as session cwd, and retries macOS screenshot/NFD/curly-quote variants.
-   - If the path does not exist, `findUniqueSuffixMatch()` does a workspace glob-based unique suffix lookup (skipped for remote mounts).
+   - If the path does not exist on disk and an ACP `readTextFile` bridge is present, the editor buffer is tried before suffix lookup so a just-written client buffer is not reported as missing.
+   - Bridge failures fail closed by default: only an explicit `transport_unavailable` or `bridge_unavailable` code authorizes falling back to the agent host's disk. Structured denials (`permission_denied`, `-32001`) and raw OS errno values (`EPERM`, `EACCES`, …) do **not** fall back, because an errno at this boundary is ambiguous and reading the path locally would bypass a remote client's access decision.
+   - If the path still does not exist, `findUniqueSuffixMatch()` does a workspace glob-based unique suffix lookup (skipped for remote mounts).
 7. Directories go through `#readDirectory()`.
 8. Non-directories branch by content type:
    - image metadata / inline image

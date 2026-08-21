@@ -8,10 +8,7 @@ import {
 	autoresearchDashboardText,
 	autoresearchDataContext,
 	autoresearchHarnessOutput,
-	autoresearchIssueVerdict,
 	autoresearchIteratePrompt,
-	autoresearchMissionPythonTool,
-	autoresearchMissionReport,
 	autoresearchRunsStore,
 	autoresearchSetupPrompt,
 	autoresearchWrite,
@@ -95,39 +92,7 @@ describe("autoresearch capability surface reachable from the runtime", () => {
 		expect(dashboard).toContain("Best: 12ms (#2)");
 	});
 
-	it("5: the mission python tool + notebook writer are reachable from the runtime", async () => {
-		const root = await tempDir();
-		await seedMissionWithRuns(root, "data");
-		const handle = await autoresearchMissionPythonTool(root, TEST_SESSION_ID);
-		expect(handle).not.toBeNull();
-		expect(handle!.tool.name).toBe("python");
-		expect(path.basename(handle!.paths.notebookPath)).toBe("notebook.ipynb");
-		expect(handle!.notebook.cellCount).toBe(0);
-		expect(handle!.mission.slug).toBe("tokenizer-mission");
-	});
-
-	it("6: the mission report is reachable and carries the verdict", async () => {
-		const root = await tempDir();
-		await seedMissionWithRuns(root, "mixed");
-		await autoresearchIssueVerdict({
-			cwd: root,
-			status: { verdict: "best_effort", confidence: 0.8 },
-			evidence: ["latency down 14%"],
-			caveats: [],
-			evaluator: "mission-agent",
-			slug: "tokenizer-mission",
-		});
-
-		const report = await autoresearchMissionReport(root, "Final summary", TEST_SESSION_ID);
-		const content = await Bun.file(report).text();
-		expect(content).toContain("# Autoresearch report: Optimize the tokenizer hot path");
-		expect(content).toContain("Final summary");
-		expect(content).toContain("## Verdict");
-		expect(content).toContain("- Evaluator: mission-agent");
-		expect(content).toContain("latency down 14%");
-	});
-
-	it("7: data context is gated by mission mode through the runtime", async () => {
+	it("5: data context is gated by mission mode through the runtime", async () => {
 		const root = await tempDir();
 		await fs.writeFile(path.join(root, "DATA.md"), "# dataset\n", "utf-8");
 
@@ -150,7 +115,7 @@ describe("autoresearch capability surface reachable from the runtime", () => {
 		expect(context!.content).toContain("# dataset");
 	});
 
-	it("8: both phase prompts are reachable from the runtime", async () => {
+	it("6: both phase prompts are reachable from the runtime", async () => {
 		const root = await tempDir();
 		await seedMissionWithRuns(root, "data");
 

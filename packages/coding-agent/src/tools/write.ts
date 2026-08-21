@@ -1,6 +1,5 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
@@ -17,6 +16,7 @@ import type { ToolSession } from "../sdk";
 import { Ellipsis, Hasher, type RenderCache, renderStatusLine, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import { parseArchivePathCandidates } from "./archive-reader";
+import { formatFileWriteError, writeFileAtomically } from "./atomic-file-write";
 import { assertEditableFile } from "./auto-generated-guard";
 import {
 	type ConflictEntry,
@@ -249,11 +249,6 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 	): Promise<AgentToolResult<WriteToolDetails>> {
 		const isZip = resolvedArchivePath.absolutePath.toLowerCase().endsWith(".zip");
 
-		const parentDir = path.dirname(resolvedArchivePath.absolutePath);
-		if (parentDir && parentDir !== ".") {
-			await fs.mkdir(parentDir, { recursive: true });
-		}
-
 		if (isZip) {
 			const zipEntries: Record<string, Uint8Array> = {};
 
@@ -275,9 +270,9 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			try {
 				const { zipSync } = await loadFflate();
 				const zipBuffer = zipSync(zipEntries);
-				await Bun.write(resolvedArchivePath.absolutePath, zipBuffer);
+				await writeFileAtomically(resolvedArchivePath.absolutePath, zipBuffer);
 			} catch (error) {
-				throw new ToolError(error instanceof Error ? error.message : String(error));
+				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}
 		} else {
 			const archiveEntries: Record<string, string | File> = {};
@@ -304,9 +299,11 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			archiveEntries[resolvedArchivePath.archiveSubPath] = content;
 
 			try {
-				await Bun.Archive.write(resolvedArchivePath.absolutePath, archiveEntries);
+				const archive = new Bun.Archive(archiveEntries);
+				const archiveBytes = await archive.bytes();
+				await writeFileAtomically(resolvedArchivePath.absolutePath, archiveBytes);
 			} catch (error) {
-				throw new ToolError(error instanceof Error ? error.message : String(error));
+				throw new ToolError(formatFileWriteError(error, resolvedArchivePath.absolutePath, { destUnchanged: true }));
 			}
 		}
 
@@ -748,9 +745,10 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				try {
 					await bridgePromise;
 				} catch (error) {
-					throw new ToolError(error instanceof Error ? error.message : String(error));
+					throw new ToolError(formatFileWriteError(error, absolutePath));
 				}
 				invalidateFsScanAfterWrite(absolutePath);
+				this.session.fileReadCache?.invalidate(absolutePath);
 				const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 				let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;
 				if (stripped) {
@@ -759,8 +757,14 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				return { content: [{ type: "text", text: resultText }], details: {} };
 			}
 
-			const diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
+			let diagnostics: FileDiagnosticsResult | undefined;
+			try {
+				diagnostics = await this.#writethrough(absolutePath, cleanContent, signal, undefined, batchRequest);
+			} catch (error) {
+				throw new ToolError(formatFileWriteError(error, absolutePath));
+			}
 			invalidateFsScanAfterWrite(absolutePath);
+			this.session.fileReadCache?.invalidate(absolutePath);
 
 			const displayPath = formatPathRelativeToCwd(absolutePath, this.session.cwd);
 			let resultText = `Successfully wrote ${cleanContent.length} bytes to ${displayPath}`;

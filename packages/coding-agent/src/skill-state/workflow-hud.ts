@@ -248,6 +248,47 @@ export function buildRalplanHudSummary(state: RalplanHudState): WorkflowHudSumma
 	};
 }
 
+export interface AutoresearchHudState extends WorkflowGateHudState {
+	phase: string;
+	mode?: string;
+	intake?: string;
+	slug?: string;
+	specPath?: string;
+	verdict?: string;
+	experimentCount?: number;
+	experimentStatuses?: string[];
+	updatedAt?: string;
+}
+
+export function buildAutoresearchHudSummary(state: AutoresearchHudState): WorkflowHudSummary {
+	const statuses = state.experimentStatuses ?? [];
+	const total = Math.max(state.experimentCount ?? statuses.length, statuses.length);
+	const kept = statuses.filter(status => status === "keep").length;
+	const crash = statuses.filter(status => status === "crash").length;
+	const checksFailed = statuses.filter(status => status === "checks_failed").length;
+	const chips: Array<WorkflowHudChip | null> = [
+		...(state.phase === "verdict" ? [chip("verdict", state.verdict ?? "issued", 5)] : []),
+		chip("phase", state.phase, 10),
+		...(total > 0 ? [chip("exp", `${kept}/${total}`, 20)] : []),
+		crash > 0 ? { label: "crash", value: String(crash), priority: 4, severity: "warning" } : null,
+		checksFailed > 0
+			? { label: "checks_failed", value: String(checksFailed), priority: 5, severity: "warning" }
+			: null,
+		chip("mode", state.mode, 30),
+		chip("intake", state.intake, 40),
+		chip("spec", state.specPath, 45),
+		...gateChips(state, 50),
+	];
+	const visibleChips =
+		total === 0 && state.phase !== "verdict" ? compactChips([chip("phase", state.phase, 10)]) : compactChips(chips);
+	return {
+		version: 1,
+		...(state.slug ? { summary: `autoresearch mission ${state.slug}` } : {}),
+		chips: visibleChips,
+		...(state.updatedAt ? { updated_at: state.updatedAt } : {}),
+	};
+}
+
 export function buildUltragoalHudSummary(state: UltragoalHudState): WorkflowHudSummary {
 	const total = state.goals.length;
 	const complete = state.counts.complete ?? 0;

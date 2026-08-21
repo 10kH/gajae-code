@@ -1391,14 +1391,21 @@ export class ManagedSessionDescendantStore {
 		try {
 			const directory = fs.opendirSync(this.#baseDir);
 			try {
+				// The limit bounds receipt reconciliation work, so it counts receipts —
+				// not every dirent in the directory. Counting all entries conflated
+				// "this scope has too many receipts to reconcile" with "this directory
+				// has many files", so a scope whose bulk was inert zero-byte remnants
+				// aborted before examining a single receipt (observed: 50,003 dirents,
+				// 0 receipts) and every mutation failed permanently. Unbounded receipt
+				// growth is still rejected, which is the case the limit exists for.
 				let examined = 0;
 				for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
-					examined++;
-					if (examined > REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT)
-						throw new Error("managed_replace_cleanup_receipt_limit_exceeded");
 					const name = entry.name;
 					if (!name.startsWith(".gjc-replace-receipt-pending-") && !name.startsWith(".gjc-replace-cleanup-"))
 						continue;
+					examined++;
+					if (examined > REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT)
+						throw new Error("managed_replace_cleanup_receipt_limit_exceeded");
 					if (name.startsWith(".gjc-replace-receipt-pending-")) {
 						this.#reconcilePendingReplacementReceipt(path.join(this.#baseDir, name));
 						continue;
@@ -1427,9 +1434,21 @@ export class ManagedSessionDescendantStore {
 
 	#beforeMutation(): void {
 		this.#assertBound();
+		// Reaping is scheduled BEFORE reconciliation, not after. The receipt scan
+		// throws `managed_replace_cleanup_receipt_limit_exceeded` once the bound
+		// directory exceeds the dirent scan limit, and the only thing that brings a
+		// directory back under that limit is this reaper. Scheduling it after the
+		// scan made the recovery unreachable exactly when it was needed: a scope
+		// that crossed the limit failed every mutation forever, so tool-output
+		// eviction could never persist and its originals stayed resident in heap
+		// until the non-disableable emergency compaction floor cut the session
+		// (observed: 50,003 dirents, 47,043 of them zero-byte remnants, 55 failed
+		// evictions and 9 heap compactions in one day). Reaping is throttled,
+		// asynchronous, and never fails the triggering mutation, so hoisting it
+		// cannot make a healthy scope worse.
+		this.#scheduleRemnantReap();
 		this.#reconcileReplacementCleanupReceipts();
 		this.#assertBound();
-		this.#scheduleRemnantReap();
 	}
 
 	/**

@@ -7,7 +7,7 @@ source: "GJC-native workflow skill rebuilt from the deprecated autoresearch exte
 
 # Autoresearch Workflow
 
-Use when the user asks for `autoresearch`, or gives a bounded research goal whose deliverable is a defensible verdict rather than code ("find out", "investigate", "benchmark and report").
+Use when the user asks for `autoresearch`, or gives a bounded research goal whose deliverable is a defensible verdict rather than code ("find out", "investigate", "benchmark and draw a conclusion").
 
 ## Usage
 
@@ -36,10 +36,10 @@ gjc autoresearch read --json
 gjc autoresearch clear
 ```
 
-- `--spec <path>` — handoff intake from a persisted deep-interview spec; asks zero questions.
+- `intake --spec <path>` (or the bare `--spec` flag) — spec intake from a persisted deep-interview spec; asks zero questions.
 - `"<goal>"` or bare invocation — cold intake; goal, constraints, and deliverables must be clarified before research begins.
 - `read --json` — current mission artifact plus the append-only ledger snapshot.
-- `clear` — remove the mission artifact and record the kernel clear in the ledger.
+- `clear` — retire the mission artifact and its working set, recording `mission_cleared` in the ledger. This never touches the session `python` REPL kernel; reset that with the `python` tool's own `clear` action.
 
 ## Use when
 
@@ -55,9 +55,9 @@ gjc autoresearch clear
 
 Both intakes write the same mission artifact (`objective`, `mode`, `deliverables`, `constraints`, `slug`).
 
-### Handoff intake
+### Spec intake
 
-`gjc autoresearch --spec <path>` reads a persisted deep-interview spec and starts the mission with **zero clarification questions**. The spec MUST declare its mission mode explicitly (a line like `autoresearch-mode: web`); a missing or invalid declaration is a hard fail. The consumed spec path and handoff time are recorded on the mission artifact.
+`gjc autoresearch intake --spec <path>` (or the bare `--spec` flag) reads a persisted deep-interview spec and starts the mission with **zero clarification questions**. The spec MUST declare its mission mode explicitly (a line like `autoresearch-mode: web`); a missing or invalid declaration is a hard fail. The consumed spec path and handoff time are recorded on the mission artifact.
 
 ### Cold intake
 
@@ -91,7 +91,7 @@ Iterate existing experiments with baseline/keep/discard discipline. Log every ru
 
 ## Persistent Python
 
-The mission `python` tool holds a persistent kernel across calls: variables, imports, and loaded data survive from call to call like notebook cells, and every call is recorded as a cell in the mission notebook. The tool is inactive until a mission is active, and its kernel is owned by the mission (`autoresearch:<mission-id>`). Clearing the kernel is an action on that same tool (`action: "clear"`); the mission clears it when the mission ends.
+The `python` tool provides a persistent session REPL: variables, imports, and loaded data survive across calls. It is available without an active mission, uses the distinct `python:<session-id>` kernel owner, and appends every execution to the session JSONL transcript. Clearing its kernel is an action on the same tool (`action: "clear"`); session cleanup also disposes it.
 
 ## Completion
 
@@ -99,11 +99,18 @@ The mission ends on one mission-level structured verdict: `status` (structured d
 
 ## Artifacts
 
-- `.gjc/_session-{sessionid}/autoresearch/` — mission artifact, append-only JSONL ledger, session-scoped run records, mission notebook, and synthesized report (plus the TUI run-table dashboard).
-- The ledger appends `mission_created`, `mode_set`, `run_logged`, `verdict_issued`, `critic_recorded`, and `kernel_cleared` events; verdict and critic receipts ride on their events as structured data.
+- `.gjc/_session-{sessionid}/autoresearch/` — mission artifact, append-only JSONL ledger, session-scoped run records (plus the TUI run-table dashboard).
+- The ledger appends `mission_created`, `mode_set`, `run_logged`, `verdict_issued`, `critic_recorded`, and `mission_cleared` events; verdict and critic receipts ride on their events as structured data.
 - Persist everything through `gjc autoresearch`; never hand-edit `.gjc/` (no direct `write`/`edit`/`ast_edit` against `.gjc/` paths without an explicit force override).
 - On interruption, resume via `gjc autoresearch read --json`; do not read or edit `.gjc/_session-{sessionid}/autoresearch/` files directly.
 
 ## Boundary
 
 Autoresearch produces research findings and a verdict; it never implements. Downstream implementation goes through the normal approval-gated path (planning → pending approval → explicitly approved execution).
+
+## Ending a mission
+
+Two exits, both one step:
+
+- **Hand off to planning/clarification**: invoke `/skill:ralplan`, `/skill:deep-interview`, or `/skill:ultragoal` directly — autoresearch is handoff-ready at any phase (`intake`/`research`/`verdict`), and the skill tool performs the atomic state handoff itself. No `gjc state` preparation is needed.
+- **Finalize only**: `gjc autoresearch clear` retires the mission artifact and its working set, appends `mission_cleared` to the ledger, and marks the workflow complete — no handoff target required.

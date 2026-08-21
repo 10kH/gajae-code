@@ -411,6 +411,19 @@ describe("status line multi-row wrapping (statusLine.maxRows)", () => {
 		expect(wrapped.some(row => strip(row).includes(LONG_NAME))).toBe(true);
 	});
 
+	it("accounts for wrapped skill HUD rows as separate status rows", () => {
+		const component = buildComponent(2);
+		component.updateSettings({ showSkillHud: true });
+		component.setSkillHudEntriesForTest([
+			{ skill: "deep-interview", phase: "interviewing" },
+			{ skill: "autoresearch", phase: "research" },
+		]);
+		const rows = component.render(20);
+		const hudRows = rows.filter(row => strip(row).includes("◆"));
+		expect(hudRows.length).toBe(2);
+		expect(hudRows.every(row => visibleWidth(row) <= 20)).toBe(true);
+	});
+
 	it("caps wrapping at maxRows", () => {
 		const wrapped = buildComponent(2).render(8);
 		expect(wrapped.length).toBeLessThanOrEqual(2);

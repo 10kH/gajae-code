@@ -11,7 +11,7 @@
  * refuse targets outside the project `.gjc/` tree.
  *
  * Intake contract (AC-14..AC-16): two entrypoints write the one mission
- * artifact. Handoff intake (`--spec <path>`) consumes a persisted deep-interview
+ * artifact. Spec intake (`intake --spec <path>`, or the bare `--spec` flag) consumes a persisted deep-interview
  * spec and asks zero clarification questions; cold intake (positional goal or
  * bare invocation) signals that goal/constraints/deliverables clarification must
  * run before research begins and writes nothing. The mission mode is one of
@@ -21,7 +21,7 @@
  *
  * The ledger is append-only and carries the six event kinds: `mission_created`,
  * `mode_set`, `run_logged`, `verdict_issued`, `critic_recorded`,
- * `kernel_cleared`. A mission completes only on a structured best-effort
+ * `mission_cleared`. A mission completes only on a structured best-effort
  * verdict (status, evidence, caveats, evaluator); an optional critic pass
  * records a `critic_receipt` whose evaluator identity is distinct from the
  * mission agent.
@@ -34,17 +34,14 @@ import { loadAutoresearchDataContext, type RlmDataContext } from "../autoresearc
 import { type EnsureAutoresearchBranchResult, ensureAutoresearchBranch } from "../autoresearch/git";
 import { type ParsedHarnessOutput, parseHarnessOutput } from "../autoresearch/harness";
 import { renderAutoresearchIteratePrompt, renderAutoresearchSetupPrompt } from "../autoresearch/prompts";
-import { autoresearchKernelOwnerId } from "../autoresearch/python-tool";
-import { extractVerdictFromLedger, synthesizeAutoresearchReport } from "../autoresearch/report";
 import {
 	AutoresearchRunsStore,
 	buildAutoresearchExperimentState,
 	createAutoresearchExperimentConfig,
 	type MetricDirection,
 } from "../autoresearch/runs";
-import { createMissionPythonTool, missionArtifactsDir, openMissionNotebook } from "../autoresearch/session";
-import { disposeKernelSessionsByOwner } from "../eval/py/executor";
 import { syncSkillActiveState } from "../skill-state/active-state";
+import { buildAutoresearchHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { sessionAutoresearchDir } from "./session-layout";
 import {
@@ -72,7 +69,7 @@ export const AUTORESEARCH_LEDGER_EVENT_KINDS = [
 	"run_logged",
 	"verdict_issued",
 	"critic_recorded",
-	"kernel_cleared",
+	"mission_cleared",
 ] as const;
 export type AutoresearchLedgerEventKind = (typeof AUTORESEARCH_LEDGER_EVENT_KINDS)[number];
 
@@ -86,7 +83,7 @@ export interface AutoresearchMission {
 	intake: AutoresearchIntakeKind;
 	createdAt: string;
 	updatedAt: string;
-	/** Absolute path of the deep-interview spec consumed by handoff intake. */
+	/** Absolute path of the deep-interview spec consumed by spec intake. */
 	specPath?: string;
 	handedOffAt?: string;
 	/**
@@ -178,7 +175,7 @@ export interface AutoresearchClearReceipt {
 	retiredTo?: string;
 }
 
-export interface AutoresearchHandoffReceipt extends AutoresearchWriteReceipt {
+export interface AutoresearchIntakeReceipt extends AutoresearchWriteReceipt {
 	specPath: string;
 }
 
@@ -489,21 +486,20 @@ export async function autoresearchWrite(input: {
 /**
  * Durable per-mission artifacts that live directly under the session
  * autoresearch dir. `clear` must retire ALL of them, not just `mission.json`:
- * leaving `ledger.jsonl` behind let a successor mission inherit the previous
- * mission's `verdict_issued` / `critic_recorded` rows, so
- * `extractVerdictFromLedger` surfaced a prior verdict as if it were the new
- * mission's. `runs.jsonl` and `experiment.json` leaked run history and the
- * metric contract the same way, and `runs/` holds the notebook and report.
+ * leaving `ledger.jsonl` behind lets a successor mission inherit the previous
+ * mission's `verdict_issued` / `critic_recorded` rows. `runs.jsonl` and
+ * `experiment.json` leak run history and the metric contract, and `runs/`
+ * holds per-run artifacts the same way.
  */
 const AUTORESEARCH_MISSION_ARTIFACTS = ["mission.json", "ledger.jsonl", "runs.jsonl", "experiment.json"] as const;
 const AUTORESEARCH_RUNS_SUBDIR = "runs";
 
 /**
- * clear verb: retire the entire mission working set and record the kernel clear.
+ * clear verb: retire the entire mission working set and record the mission clear.
  *
  * Artifacts are QUARANTINED to `<dir>/retired/<slug>.<timestamp>/`, never
  * deleted, so a completed mission's evidence stays auditable while the
- * successor mission starts from genuinely empty state. The `kernel_cleared` row
+ * successor mission starts from genuinely empty state. The `mission_cleared` row
  * is appended to the OUTGOING ledger before it is moved, so the retired ledger
  * is a complete record that ends with its own clear and the successor's ledger
  * starts empty rather than the clear silently vanishing from the audit trail.
@@ -513,13 +509,10 @@ export async function autoresearchClear(cwd: string, sessionId?: string | null):
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	const paths = getAutoresearchPaths(cwd, resolvedSessionId);
 	const existing = await readAutoresearchMission(cwd, resolvedSessionId);
-	// Must go through the shared derivation: an inline template here is what
-	// drifted from the tool's owner id and left cleared kernels resident.
-	if (existing) await disposeKernelSessionsByOwner(autoresearchKernelOwnerId(resolvedSessionId, existing.slug));
 	// Close out the outgoing ledger first so the retired copy ends with its clear.
 	const ledgerEvent = await appendAutoresearchLedger(
 		cwd,
-		{ event: "kernel_cleared", slug: existing?.slug ?? "" },
+		{ event: "mission_cleared", slug: existing?.slug ?? "" },
 		resolvedSessionId,
 	);
 	const retiredTo = existing ? await retireAutoresearchMissionArtifacts(paths, existing.slug) : undefined;
@@ -570,7 +563,7 @@ async function moveIfPresent(from: string, to: string): Promise<void> {
 	}
 }
 
-/* --------------------------- handoff intake --------------------------- */
+/* ---------------------------- spec intake ---------------------------- */
 
 const AUTORESEARCH_MODE_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-mode\s*:\s*(web|mixed|data)\s*$/i;
 const AUTORESEARCH_METRIC_DECLARATION_RE = /^(?:[-*]\s+)?autoresearch-metric\s*:\s*(.+?)\s*$/i;
@@ -619,10 +612,7 @@ function sanitizeSpecSlug(value: string): string {
 		.replace(/[^a-z0-9._-]+/g, "-")
 		.replace(/^-+|-+$/g, "");
 	if (normalized === "") {
-		throw new AutoresearchCommandError(
-			2,
-			"autoresearch handoff intake could not derive a mission slug from the spec",
-		);
+		throw new AutoresearchCommandError(2, "autoresearch spec intake could not derive a mission slug from the spec");
 	}
 	return normalized;
 }
@@ -646,7 +636,7 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 	if (!mode) {
 		throw new AutoresearchCommandError(
 			2,
-			`autoresearch handoff intake requires the spec to declare its mission mode explicitly with a line like "autoresearch-mode: web" (one of web, mixed, data) at ${specPath}. ` +
+			`autoresearch spec intake requires the spec to declare its mission mode explicitly with a line like "autoresearch-mode: web" (one of web, mixed, data) at ${specPath}. ` +
 				"Mode is never inferred from the presence of a data file.",
 		);
 	}
@@ -665,7 +655,7 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 			metricUnit: firstMatch(AUTORESEARCH_METRIC_UNIT_DECLARATION_RE),
 			metricDirection: firstMatch(AUTORESEARCH_METRIC_DIRECTION_DECLARATION_RE),
 		},
-		`autoresearch handoff intake at ${specPath}`,
+		`autoresearch spec intake at ${specPath}`,
 	);
 
 	const h1 = lines.find(line => /^#\s+\S/.test(line.trim()));
@@ -691,12 +681,12 @@ function parseAutoresearchSpec(specText: string, specPath: string): ParsedAutore
 	};
 }
 
-/** handoff verb: `--spec` intake — read the spec, write the mission, ask zero questions. */
-export async function autoresearchHandoff(input: {
+/** Spec intake (`intake --spec <path>` or bare `--spec`): read the spec, write the mission, ask zero questions. The persisted intake kind stays "handoff" (seeded by a deep-interview handoff). */
+export async function autoresearchIntake(input: {
 	cwd: string;
 	specPath: string;
 	sessionId?: string | null;
-}): Promise<AutoresearchHandoffReceipt> {
+}): Promise<AutoresearchIntakeReceipt> {
 	const resolvedSpecPath = path.resolve(input.cwd, input.specPath);
 	let specText: string;
 	try {
@@ -704,7 +694,7 @@ export async function autoresearchHandoff(input: {
 	} catch (error) {
 		throw new AutoresearchCommandError(
 			2,
-			`autoresearch handoff intake could not read spec at ${resolvedSpecPath}: ${error instanceof Error ? error.message : String(error)}`,
+			`autoresearch spec intake could not read spec at ${resolvedSpecPath}: ${error instanceof Error ? error.message : String(error)}`,
 		);
 	}
 	const parsed = parseAutoresearchSpec(specText, resolvedSpecPath);
@@ -805,7 +795,7 @@ export async function autoresearchLogRun(input: {
 		description,
 		...(input.metric === undefined ? {} : { metric: input.metric }),
 	});
-	return await appendAutoresearchLedger(
+	const ledgerEvent = await appendAutoresearchLedger(
 		input.cwd,
 		{
 			event: "run_logged",
@@ -817,6 +807,9 @@ export async function autoresearchLogRun(input: {
 		},
 		sessionId,
 	);
+	const mission = await readAutoresearchMission(input.cwd, sessionId);
+	if (mission) await reconcileAutoresearchState(input.cwd, mission, sessionId, { phase: "research" });
+	return ledgerEvent;
 }
 
 /** Record the optional per-mission critic pass; its evaluator is distinct from the mission agent. */
@@ -907,16 +900,16 @@ function renderAutoresearchHelp(): string {
 		"",
 		"USAGE",
 		"  $ gjc autoresearch [--spec <path>] [--json] [goal...]",
+		"  $ gjc autoresearch intake --spec <path> [--json]",
 		"  $ gjc autoresearch read [--json]",
 		"  $ gjc autoresearch clear [--json]",
 		"  $ gjc autoresearch write --goal <goal> --mode <web|mixed|data> --slug <slug> [--deliverable <text>] [--constraint <text>] [--json]",
 		"  $ gjc autoresearch log-run --run-id <id> --status <status> --description <text> [--metric <number>] [--json]",
 		"  $ gjc autoresearch verdict --status-json <object> --evidence <text> --evaluator <id> [--caveat <text>] [--json]",
 		"  $ gjc autoresearch critic --status-json <object> --evidence <text> --evaluator <id> [--caveat <text>] [--json]",
-		"  $ gjc autoresearch report [--summary <text>] [--json]",
 		"",
 		"INTAKE",
-		"  --spec=<path>    Handoff intake: read a persisted deep-interview spec and start research",
+		"  intake --spec    Spec intake: read a persisted deep-interview spec and start research",
 		"                   with zero clarification questions. The spec must declare its mission",
 		"                   mode explicitly (a line like `autoresearch-mode: web`).",
 		"  positional goal  Cold intake: signals that goal/constraints/deliverables clarification",
@@ -924,11 +917,10 @@ function renderAutoresearchHelp(): string {
 		"  bare invocation  Cold intake (no goal text).",
 		"  write            Persist a clarified cold-intake mission. Mode and slug are required.",
 		"  read             Read the current mission and append-only ledger.",
-		"  clear            Dispose the mission kernel and clear the mission artifact.",
+		"  clear            Clear the mission artifact and retire its working set.",
 		"  log-run          Append one research run receipt to the mission ledger.",
 		"  verdict          Append the structured mission verdict receipt.",
 		"  critic           Append an optional structured critic receipt.",
-		"  report           Synthesize the mission report from the notebook and ledger.",
 		"      --json       Output a machine-readable receipt.",
 		"",
 		"STATE",
@@ -1003,7 +995,7 @@ function extractPositionalGoal(args: readonly string[]): string {
 	return parts.join(" ").trim();
 }
 
-function renderHandoffIntakeText(receipt: AutoresearchHandoffReceipt): string {
+function renderSpecIntakeText(receipt: AutoresearchIntakeReceipt): string {
 	return [
 		`autoresearch intake=handoff slug=${receipt.mission.slug}`,
 		`mode=${receipt.mission.mode}`,
@@ -1039,6 +1031,32 @@ async function reconcileAutoresearchState(
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	try {
+		const ledger = await readAutoresearchLedger(cwd, resolvedSessionId);
+		const store = await AutoresearchRunsStore.open(cwd, resolvedSessionId);
+		const latestVerdict = [...ledger]
+			.reverse()
+			.find(event => event.event === "verdict_issued" && event.verdictReceipt);
+		const verdictReceipt = latestVerdict?.verdictReceipt as AutoresearchVerdictReceipt | undefined;
+		const verdictStatus = verdictReceipt?.status;
+		const verdict = verdictStatus
+			? typeof verdictStatus.verdict === "string"
+				? verdictStatus.verdict
+				: typeof verdictStatus.status === "string"
+					? verdictStatus.status
+					: undefined
+			: undefined;
+		const hud = mission
+			? buildAutoresearchHudSummary({
+					phase: options.phase ?? "research",
+					mode: mission.mode,
+					intake: mission.intake,
+					slug: mission.slug,
+					specPath: mission.specPath,
+					verdict,
+					experimentStatuses: store.listLoggedRuns().flatMap(run => (run.status ? [run.status] : [])),
+					updatedAt: new Date().toISOString(),
+				})
+			: undefined;
 		await syncSkillActiveState({
 			cwd,
 			skill: "autoresearch",
@@ -1046,13 +1064,10 @@ async function reconcileAutoresearchState(
 			phase: options.phase ?? "research",
 			sessionId: resolvedSessionId,
 			source: "gjc-autoresearch-native",
-			hud: {
+			hud: hud ?? {
 				version: 1,
-				summary: mission ? `autoresearch mission ${mission.slug}` : "autoresearch mission cleared",
-				chips: [
-					...(mission ? [{ label: "mode", value: mission.mode }] : []),
-					...(mission ? [{ label: "intake", value: mission.intake }] : []),
-				],
+				summary: "autoresearch mission cleared",
+				chips: [],
 				updated_at: new Date().toISOString(),
 			},
 		});
@@ -1195,22 +1210,25 @@ export async function runNativeAutoresearchCommand(
 			return { status: 0, stdout: renderCliWriteReceipt({ ok: true, receipt }) };
 		}
 		if (verb === "report") {
-			assertOnlyAutoresearchFlags(args.slice(1), ["--summary", "--json"]);
-			const reportPath = await autoresearchMissionReport(cwd, flagValue(args, "--summary"));
-			return {
-				status: 0,
-				stdout: hasFlag(args, "--json")
-					? renderCliWriteReceipt({ ok: true, report_path: reportPath })
-					: `autoresearch report_path=${reportPath}\n`,
-			};
+			throw new AutoresearchCommandError(
+				2,
+				'unknown verb "report" — the report verb was removed; missions end at verdict and the ledger is the record',
+			);
 		}
-		const specPath = flagValue(args, "--spec");
-		if (specPath !== undefined) {
-			if (specPath.trim() === "") {
+		if (verb === "handoff") {
+			throw new AutoresearchCommandError(
+				2,
+				'unknown verb "handoff" — for spec intake use `gjc autoresearch intake --spec <path>`; for workflow handoff invoke the next skill directly (/skill:<callee>) or run `gjc state autoresearch handoff --to <callee>`',
+			);
+		}
+		if (verb === "intake") {
+			assertOnlyAutoresearchFlags(args.slice(1), ["--spec", "--json"]);
+			const intakeSpecPath = requiredFlagValue(args, "--spec").trim();
+			if (intakeSpecPath === "") {
 				return { status: 2, stderr: "--spec requires a non-empty path\n" };
 			}
 			const json = hasFlag(args, "--json");
-			const receipt = await autoresearchHandoff({ cwd, specPath: specPath.trim() });
+			const receipt = await autoresearchIntake({ cwd, specPath: intakeSpecPath });
 			await reconcileAutoresearchState(cwd, receipt.mission);
 			return {
 				status: 0,
@@ -1225,7 +1243,31 @@ export async function runNativeAutoresearchCommand(
 							spec_path: receipt.specPath,
 							ledger_event: receipt.ledgerEvent?.event,
 						})
-					: renderHandoffIntakeText(receipt),
+					: renderSpecIntakeText(receipt),
+			};
+		}
+		const specPath = flagValue(args, "--spec");
+		if (specPath !== undefined) {
+			if (specPath.trim() === "") {
+				return { status: 2, stderr: "--spec requires a non-empty path\n" };
+			}
+			const json = hasFlag(args, "--json");
+			const receipt = await autoresearchIntake({ cwd, specPath: specPath.trim() });
+			await reconcileAutoresearchState(cwd, receipt.mission);
+			return {
+				status: 0,
+				intake: "handoff",
+				missionCreated: true,
+				stdout: json
+					? renderCliWriteReceipt({
+							ok: true,
+							intake: "handoff",
+							mission: receipt.mission,
+							mission_path: receipt.missionPath,
+							spec_path: receipt.specPath,
+							ledger_event: receipt.ledgerEvent?.event,
+						})
+					: renderSpecIntakeText(receipt),
 			};
 		}
 		const goal = extractPositionalGoal(args);
@@ -1252,10 +1294,10 @@ export async function runNativeAutoresearchCommand(
 /* ------------------------------ capability surface ------------------------------ */
 
 /**
- * Rebuilt autoresearch capability surface. Each of the eight capabilities is
- * reachable from the runtime through a thin, mission-state-aware wrapper. All
- * of them are read-only with respect to the ledger — none append events; the
- * verbs above remain the only writers.
+ * Rebuilt autoresearch capability surface. Each capability is reachable from
+ * the runtime through a thin, mission-state-aware wrapper. All are read-only
+ * with respect to the ledger — none append events; the verbs above remain the
+ * only writers.
  */
 
 /** 1. Branch isolation: ensure the worktree is on an `autoresearch/*` branch. */
@@ -1316,47 +1358,6 @@ export async function autoresearchDashboardText(cwd: string, sessionId?: string 
 		},
 	};
 	return renderExpandedDashboard(input, width);
-}
-
-/** 5. Persistent kernel + notebook: build the mission `python` tool bound to the mission. */
-export async function autoresearchMissionPythonTool(cwd: string, sessionId?: string | null) {
-	const mission = await readAutoresearchMission(cwd, sessionId);
-	if (!mission) return null;
-	const resolvedSessionId =
-		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
-	const { writer, paths } = await openMissionNotebook(cwd, mission, resolvedSessionId);
-	const tool = createMissionPythonTool({
-		cwd,
-		mission,
-		artifactsDir: missionArtifactsDir(cwd, mission, resolvedSessionId),
-		notebook: writer,
-		registerSessionCleanup: () => {},
-		sessionId: resolvedSessionId,
-	});
-	return { tool, notebook: writer, paths, mission };
-}
-
-/** 6. Synthesized report: notebook cells + final summary, carrying the mission verdict. */
-export async function autoresearchMissionReport(
-	cwd: string,
-	summary?: string,
-	sessionId?: string | null,
-): Promise<string> {
-	const mission = await readAutoresearchMission(cwd, sessionId);
-	if (!mission) throw new AutoresearchCommandError(2, "autoresearch report requires an active mission");
-	const resolvedSessionId =
-		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
-	const { writer, paths } = await openMissionNotebook(cwd, mission, resolvedSessionId);
-	const ledger = await readAutoresearchLedger(cwd, sessionId);
-	const verdict = extractVerdictFromLedger(ledger);
-	await synthesizeAutoresearchReport({
-		paths,
-		notebook: writer,
-		mission,
-		summary,
-		verdict,
-	});
-	return paths.reportPath;
 }
 
 export async function autoresearchDataContext(

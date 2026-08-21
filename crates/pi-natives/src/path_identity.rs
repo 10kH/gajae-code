@@ -1507,14 +1507,25 @@ mod publication {
 		})
 	}
 
-	const fn errno_name(errno: i32) -> &'static str {
+	/// Closed errno vocabulary for the acquisition diagnostic. Only fixed
+	/// labels leave the native layer, and every errno `open(2)` can answer
+	/// these objects with is named: an unnamed one would surface as `UNKNOWN`
+	/// and lose the actionable part of the diagnostic this failure carries.
+	pub(super) const fn errno_name(errno: i32) -> &'static str {
 		match errno {
 			libc::EACCES => "EACCES",
+			libc::EAGAIN => "EAGAIN",
 			libc::EISDIR => "EISDIR",
 			libc::ELOOP => "ELOOP",
-			libc::ENOTDIR => "ENOTDIR",
+			libc::EMFILE => "EMFILE",
+			libc::ENAMETOOLONG => "ENAMETOOLONG",
+			libc::ENFILE => "ENFILE",
 			libc::ENOENT => "ENOENT",
+			libc::ENOMEM => "ENOMEM",
+			libc::ENOTDIR => "ENOTDIR",
 			libc::ENXIO => "ENXIO",
+			libc::EOVERFLOW => "EOVERFLOW",
+			libc::EPERM => "EPERM",
 			_ => "UNKNOWN",
 		}
 	}
@@ -1656,6 +1667,38 @@ mod publication {
 				"ambiguous".to_owned()
 			}
 		}
+	}
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+	use super::publication::errno_name;
+
+	#[test]
+	fn errno_name_covers_every_open_refusal_the_diagnostic_can_report() {
+		for (errno, name) in [
+			(libc::EACCES, "EACCES"),
+			(libc::EAGAIN, "EAGAIN"),
+			(libc::EISDIR, "EISDIR"),
+			(libc::ELOOP, "ELOOP"),
+			(libc::EMFILE, "EMFILE"),
+			(libc::ENAMETOOLONG, "ENAMETOOLONG"),
+			(libc::ENFILE, "ENFILE"),
+			(libc::ENOENT, "ENOENT"),
+			(libc::ENOMEM, "ENOMEM"),
+			(libc::ENOTDIR, "ENOTDIR"),
+			(libc::ENXIO, "ENXIO"),
+			(libc::EOVERFLOW, "EOVERFLOW"),
+			(libc::EPERM, "EPERM"),
+		] {
+			assert_eq!(errno_name(errno), name, "errno {errno} must keep its fixed label");
+		}
+	}
+
+	#[test]
+	fn errno_name_keeps_an_unlisted_errno_inside_the_closed_vocabulary() {
+		assert_eq!(errno_name(0), "UNKNOWN");
+		assert_eq!(errno_name(-1), "UNKNOWN");
 	}
 }
 

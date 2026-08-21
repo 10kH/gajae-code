@@ -91,6 +91,27 @@ async function resolveWithoutPlatformHome(cwd: string, hostileHome: string): Pro
 	return JSON.parse(stdout.trim()) as Resolved;
 }
 
+/** The account home of the running user, from the passwd database on Linux. */
+async function accountHomeOfRunningUser(): Promise<string> {
+	if (process.platform === "linux") {
+		// NSS, matching production: reading `/etc/passwd` directly would disagree
+		// with the resolver for any LDAP- or SSSD-backed account, which has no local
+		// entry, and report a false failure.
+		// `Bun.spawn` throws when the executable is missing rather than returning a
+		// non-zero exit, so a host without `getent` must fall through to the portable
+		// path instead of failing the suite.
+		try {
+			const uid = os.userInfo().uid;
+			const proc = Bun.spawn(["getent", "passwd", String(uid)], { stdout: "pipe", stderr: "ignore" });
+			const stdout = await new Response(proc.stdout).text();
+			if ((await proc.exited) === 0) {
+				const home = stdout.split("\n")[0]?.split(":")[5];
+				if (home && path.isAbsolute(home) && home !== path.parse(home).root) return home;
+			}
+		} catch {}
+	}
+	return os.userInfo().homedir;
+}
 describe("agent directory trust boundary", () => {
 	it("honors an agent directory inherited from the launching shell", async () => {
 		const agentDir = agentDirWith("from-operator-agent-env");
@@ -215,9 +236,13 @@ describe("agent directory trust boundary", () => {
 		const cwd = projectDir("SOMETHING_ELSE=1\n");
 		const hostileHome = tempDir();
 		const resolved = await resolveWithoutPlatformHome(cwd, hostileHome);
-		expect(resolved.trustedHome).toBe(os.userInfo().homedir);
+		// Expect the passwd database directly: a parent-side os.userInfo().homedir
+		// follows an isolated HOME, while the child probe has HOME deleted and
+		// resolves the real account home.
+		const accountHome = await accountHomeOfRunningUser();
+		expect(resolved.trustedHome).toBe(accountHome);
 		expect(resolved.trustedHome).not.toBe(hostileHome);
-		expect(resolved.configRoot).toBe(path.join(os.userInfo().homedir, ".gjc"));
+		expect(resolved.configRoot).toBe(path.join(accountHome, ".gjc"));
 	});
 
 	it("uses the account home when Windows USERPROFILE is absent despite hostile HOME", async () => {
@@ -225,8 +250,9 @@ describe("agent directory trust boundary", () => {
 		const cwd = projectDir("SOMETHING_ELSE=1\n");
 		const hostileHome = tempDir();
 		const resolved = await resolveWithoutPlatformHome(cwd, hostileHome);
-		expect(resolved.trustedHome).toBe(os.userInfo().homedir);
+		const accountHome = await accountHomeOfRunningUser();
+		expect(resolved.trustedHome).toBe(accountHome);
 		expect(resolved.trustedHome).not.toBe(hostileHome);
-		expect(resolved.configRoot).toBe(path.join(os.userInfo().homedir, ".gjc"));
+		expect(resolved.configRoot).toBe(path.join(accountHome, ".gjc"));
 	});
 });

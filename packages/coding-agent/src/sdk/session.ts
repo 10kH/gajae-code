@@ -64,7 +64,9 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
+import { EditTool } from "../edit";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
+import { SearchTool } from "../tools/search";
 import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
@@ -161,6 +163,8 @@ import { AgentOutputManager } from "../task/output-manager";
 import { parseThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "../thinking";
 import { isMCPBridgeTool, selectRestorableDiscoveredBuiltinToolNames } from "../tool-discovery/tool-index";
 import {
+	type AutomationToolName,
+	type AutomationTools,
 	BUILTIN_TOOL_DESCRIPTORS,
 	BUILTIN_TOOLS,
 	computeEssentialBuiltinNames,
@@ -182,6 +186,8 @@ import {
 	lifecycleStartupCapabilityOption,
 	type SdkStartupCapability,
 } from "./startup-capability";
+
+export type { AutomationToolName, AutomationTools } from "../tools";
 
 type AsyncResultEntry = {
 	jobId: string;
@@ -210,6 +216,14 @@ type McpNotificationEntry = {
 	serverName: string;
 	uri: string;
 };
+
+/** Capture the cursor edit grant before the model-facing edit entry is removed. */
+export function captureCursorEditTool<T>(
+	toolRegistry: ReadonlyMap<string, unknown>,
+	createReplaceTool: () => T,
+): T | undefined {
+	return toolRegistry.has("edit") ? createReplaceTool() : undefined;
+}
 
 function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): CustomMessage<AsyncResultDetails> | null {
 	if (entries.length === 0) return null;
@@ -440,6 +454,13 @@ export interface CreateAgentSessionOptions {
 
 	/** Custom tools to register (in addition to built-in tools). Accepts both CustomTool and ToolDefinition. */
 	customTools?: (CustomTool | ToolDefinition)[];
+	/**
+	 * Host-owned implementations for the built-in `browser` and `computer`
+	 * surfaces. These are materialized as built-ins, retain built-in provenance
+	 * and activation behavior, and receive cancellation through AgentTool's
+	 * AbortSignal. A matching custom or extension tool is rejected.
+	 */
+	automationTools?: AutomationTools;
 	/** Explicit parent/phase used to load active GJC sub-skill tools for this session. */
 	gjcSubskillToolContext?: { parent: string; phase: string; sessionId?: string; cwd?: string };
 	/** Inline extensions (merged with discovery). */
@@ -1246,7 +1267,31 @@ function findDeferredExactMcpToolNameCollisions(
 	return [...collisions];
 }
 
+const AUTOMATION_TOOL_NAMES = new Set<AutomationToolName>(["browser", "computer"]);
+
+function validateAutomationTools(options: CreateAgentSessionOptions): AutomationTools {
+	const automationTools = options.automationTools ?? {};
+	const entries = Object.entries(automationTools);
+	for (const [name, tool] of entries) {
+		if (!AUTOMATION_TOOL_NAMES.has(name as AutomationToolName)) {
+			throw new Error(`Unsupported SDK automation tool name: ${name}`);
+		}
+		if (!tool || tool.name !== name) {
+			throw new Error(`SDK automation tool ${name} must expose the built-in name ${JSON.stringify(name)}`);
+		}
+	}
+	const externalNames = new Set(entries.map(([name]) => name));
+	const collisions = [
+		...new Set((options.customTools ?? []).map(tool => tool.name).filter(name => externalNames.has(name))),
+	];
+	if (collisions.length > 0) {
+		throw new Error(`SDK automation tools cannot collide with custom tools: ${collisions.join(", ")}`);
+	}
+	return automationTools;
+}
+
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
+	const automationTools = validateAutomationTools(options);
 	const lifecycleStartupCapability = (
 		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
 	)[lifecycleStartupCapabilityOption];
@@ -2164,7 +2209,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		);
 
 		// Create built-in tools (already wrapped with meta notice formatting)
-		const builtinTools = await logger.time("createAllTools", createTools, toolSession, options.toolNames);
+		const builtinTools = await logger.time(
+			"createAllTools",
+			createTools,
+			toolSession,
+			options.toolNames,
+			automationTools,
+		);
 
 		// A top-level session loads MCP tools from three bounded surfaces: a
 		// caller-supplied exact config (`--mcp-config`), conventional native
@@ -2849,9 +2900,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model: agent.state.model,
 			isIdle: () => !session.isStreaming,
 			hasQueuedMessages: () => session.queuedMessageCount > 0,
-			abort: () => {
-				session.abort();
-			},
+			abort: () => session.abort(),
 			settings,
 		});
 		const toolContextStore = new ToolContextStore(getSessionContext);
@@ -2887,6 +2936,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			wrappedExtensionTools = (options.customTools ?? [])
 				.filter(isCustomTool)
 				.map(tool => CustomToolAdapter.wrap(tool, customToolContext));
+		}
+		const automationToolNames = new Set(Object.keys(automationTools));
+		const automationToolCollisions = [
+			...new Set(wrappedExtensionTools.map(tool => tool.name).filter(name => automationToolNames.has(name))),
+		];
+		if (automationToolCollisions.length > 0) {
+			throw new Error(
+				`SDK automation tools cannot collide with extension or MCP tools: ${automationToolCollisions.join(", ")}`,
+			);
 		}
 
 		// All built-in tools are active (conditional tools like git/ask return null from factory if disabled)
@@ -2935,6 +2993,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				toolRegistry.set(tool.name, wrapped);
 			}
 		}
+		const rawCursorReplaceEditTool = captureCursorEditTool(toolRegistry, () => new EditTool(toolSession, "replace"));
+		const cursorReplaceEditTool: AgentTool | undefined = rawCursorReplaceEditTool
+			? extensionRunner
+				? (new ExtensionToolWrapper(rawCursorReplaceEditTool, extensionRunner) as AgentTool)
+				: (rawCursorReplaceEditTool as AgentTool)
+			: undefined;
 		if (model?.provider === "cursor") {
 			toolRegistry.delete("edit");
 			builtinCandidateTools = builtinCandidateTools.filter(tool => tool.name !== "edit");
@@ -2982,6 +3046,14 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const cursorExecHandlers = new CursorExecHandlers({
 			cwd,
 			tools: toolRegistry,
+			getEditReplaceTool: () => cursorReplaceEditTool,
+			createSearchTool: options => {
+				if (!toolRegistry.has("search")) return undefined;
+				const search = new SearchTool(toolSession, options);
+				return extensionRunner
+					? (new ExtensionToolWrapper(search as unknown as AgentTool, extensionRunner) as AgentTool)
+					: (search as unknown as AgentTool);
+			},
 			getToolContext: () => toolContextStore.getContext(),
 			emitEvent: event => cursorEventEmitter?.(event),
 			createEventEmitter: () => agent.createExternalEventEmitterForCurrentRun(),

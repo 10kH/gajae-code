@@ -6,6 +6,7 @@ import type { BunFile } from "bun";
 import { type Theme, theme } from "../modes/theme/theme";
 import lspDescription from "../prompts/tools/lsp.md" with { type: "text" };
 import type { ToolSession } from "../tools";
+import { FileWriteNotPublishedError, writeFileAtomically } from "../tools/atomic-file-write";
 import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
 import { ToolAbortError, ToolError, throwIfAborted } from "../tools/tool-errors";
 import { clampTimeout } from "../tools/tool-timeouts";
@@ -745,11 +746,11 @@ export async function writethroughNoop(
 	_batch?: LspWritethroughBatchRequest,
 	_getDeferred?: (dst: string) => WritethroughDeferredHandle | undefined,
 ): Promise<FileDiagnosticsResult | undefined> {
-	if (file) {
+	if (file !== undefined) {
 		await file.write(content);
-	} else {
-		await Bun.write(dst, content);
+		return undefined;
 	}
+	await writeFileAtomically(dst, content);
 	return undefined;
 }
 
@@ -921,7 +922,25 @@ async function runLspWritethrough(
 	const { lspServers, customLinterServers } = splitServers(servers);
 
 	let finalContent = content;
-	const writeContent = async (value: string) => (file ? file.write(value) : Bun.write(dst, value));
+	let publishedContent = false;
+	const writeContent = async (value: string) => {
+		try {
+			if (file !== undefined) await file.write(value);
+			else await writeFileAtomically(dst, value);
+			publishedContent = true;
+		} catch (error) {
+			if (error instanceof FileWriteNotPublishedError) {
+				if (publishedContent) {
+					throw new FileWriteNotPublishedError(dst, error.cause, {
+						destUnchanged: false,
+						publicationState: "published",
+					});
+				}
+				throw error;
+			}
+			throw error;
+		}
+	};
 	const getWritePromise = once(() => writeContent(finalContent));
 	const useCustomFormatter = enableFormat && customLinterServers.length > 0;
 
@@ -986,7 +1005,8 @@ async function runLspWritethrough(
 				});
 			}
 		});
-	} catch {
+	} catch (error) {
+		if (error instanceof FileWriteNotPublishedError) throw error;
 		if (timedOut) {
 			formatter = undefined;
 			diagnostics = undefined;

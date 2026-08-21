@@ -32,6 +32,7 @@ import {
 	neutralizeReservedControlTokens,
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
+import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
 import { logger, sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
 import {
@@ -45,6 +46,7 @@ import {
 	shouldMitigateHarmonyLeak,
 	signalListLabel,
 } from "./harmony-leak";
+import escapedNonAsciiRecoveryPrompt from "./prompts/escaped-nonascii-recovery.md" with { type: "text" };
 import repeatedToolFailureRecoveryPrompt from "./prompts/repeated-tool-failure-recovery.md" with { type: "text" };
 import { type AgentRunCoverage, type AgentRunSummary, ToolCallBlockedError } from "./run-collector";
 import {
@@ -238,6 +240,8 @@ const MAX_CONSECUTIVE_MALFORMED_TURNS = 5;
  * budget recovers the overwhelming majority of turns; past it the terminal
  * per-call rejection takes over rather than spending the run on retries.
  */
+export const ESCAPED_NONASCII_RECOVERY_PROMPT = escapedNonAsciiRecoveryPrompt;
+
 const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
 
 /** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
@@ -1193,6 +1197,15 @@ function managedAssistantShell(
 	const transportFailure = managedTransportFailure(value);
 	const errorMessage = managedProperty(source, "errorMessage");
 	const errorStatus = managedProperty(source, "errorStatus");
+	// `provider_safety_stop` is the one provider-owned diagnostic that must cross
+	// this managed snapshot boundary: AgentSession uses it to keep the terminal
+	// stop terminal and to render the manual model-switch hint. Read only the
+	// closed literal, and only on an errored assistant turn; local diagnostic
+	// kinds remain runtime-owned and are never copied from provider data.
+	const errorKind =
+		stopReason === "error" && managedProperty(source, "errorKind") === "provider_safety_stop"
+			? ("provider_safety_stop" as const)
+			: undefined;
 	const safeMetadata: Record<string, unknown> = isManagedPlainRecord(detailed.snapshot)
 		? { ...detailed.snapshot }
 		: {};
@@ -1200,11 +1213,9 @@ function managedAssistantShell(
 	delete safeMetadata.errorStatus;
 	delete safeMetadata.transportFailure;
 	// Local diagnostic authority fields are never foreign-provider-settable.
-	// errorKind/bufferOverflow on the terminal assistant message are attached
-	// ONLY by this module's own runtime-error paths (managedFailureMessage and
-	// the Agent catch), so a provider/stream payload that smuggles them through
-	// its message snapshot is stripped here — the executor's parent-facing
-	// summary may never trust a shape that arrived via provider data (#4618).
+	// `provider_safety_stop` was read explicitly above; all other errorKind values
+	// are stripped here so a provider/stream payload cannot self-label a local
+	// runtime failure in the executor's parent-facing summary (#4618).
 	delete safeMetadata.errorKind;
 	delete safeMetadata.bufferOverflow;
 	return {
@@ -1219,6 +1230,7 @@ function managedAssistantShell(
 		timestamp: typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : Date.now(),
 		...(transportFailure ? { transportFailure } : {}),
 		...(typeof errorMessage === "string" ? { errorMessage } : {}),
+		...(errorKind ? { errorKind } : {}),
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
 	};
 }
@@ -2328,14 +2340,16 @@ async function runLoopBody(
 	let escapedNonAsciiToolChoiceCaptured = false;
 	let escapedNonAsciiToolChoice: ToolChoice | undefined;
 	let previousMalformedToolSignatures = new Set<string>();
-	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider";
+	type SyntheticRecoveryKind = "malformed-tool-call" | "composer-bash-policy" | "provider" | "escaped-nonascii";
 	let pendingRecovery:
 		| {
 				kind: SyntheticRecoveryKind;
 				inserted: boolean;
 				syntheticMessage?: UserMessage;
 		  }
-		| undefined;
+		| undefined = config.transientRecoveryMessage
+		? { kind: "escaped-nonascii", inserted: true, syntheticMessage: config.transientRecoveryMessage }
+		: undefined;
 	let malformedToolRecoveryAttempted = false;
 	let composerBashPolicyRecoveryAttempted = false;
 	// Deterministic terminal circuit breaker for argument-validation loops.
@@ -2445,6 +2459,11 @@ async function runLoopBody(
 			const attemptTransaction = managedTransaction;
 			const recoveryAttempt = pendingRecovery;
 			const wasMalformedToolRecoveryAttempt = recoveryAttempt?.kind === "malformed-tool-call";
+			// An escaped-non-ASCII steering resample is a re-request of the SAME
+			// logical turn, not a diagnostic detour: tools stay enabled and the
+			// captured logical-turn tool choice is replayed, so a queue-backed
+			// "required" still lands on the accepted attempt.
+			const wasEscapedNonAsciiRecoveryAttempt = recoveryAttempt?.kind === "escaped-nonascii";
 			try {
 				const getLogicalTurnToolChoice = (): ToolChoice | undefined => {
 					if (escapedNonAsciiToolChoiceCaptured) return escapedNonAsciiToolChoice;
@@ -2465,7 +2484,9 @@ async function runLoopBody(
 							? COMPOSER_BASH_POLICY_RECOVERY_PROMPT
 							: recoveryAttempt.kind === "malformed-tool-call"
 								? repeatedToolFailureRecoveryPrompt
-								: undefined;
+								: recoveryAttempt.kind === "escaped-nonascii"
+									? escapedNonAsciiRecoveryPrompt
+									: undefined;
 					if (recoveryContent) {
 						recoveryAttempt.syntheticMessage = {
 							role: "user",
@@ -2491,11 +2512,13 @@ async function runLoopBody(
 						? {
 								syntheticMessage: recoveryAttempt.syntheticMessage,
 								disableTools: wasMalformedToolRecoveryAttempt,
-								forceAutoToolChoice: !wasMalformedToolRecoveryAttempt,
+								forceAutoToolChoice: !wasMalformedToolRecoveryAttempt && !wasEscapedNonAsciiRecoveryAttempt,
 							}
 						: undefined,
 					escapedToolTransaction,
-					recoveryAttempt ? undefined : { value: getLogicalTurnToolChoice() },
+					recoveryAttempt && !wasEscapedNonAsciiRecoveryAttempt
+						? undefined
+						: { value: getLogicalTurnToolChoice() },
 				);
 				const detection = detectHarmonyLeakInAssistantMessage(message);
 				if (detection && shouldMitigateHarmonyLeak(config.model, detection)) {
@@ -2656,18 +2679,21 @@ async function runLoopBody(
 				}
 			}
 
-			// Escaped-non-ASCII tool arguments: bounded turn resample.
+			// Escaped-non-ASCII tool arguments: bounded steered turn resample.
 			//
 			// Arguments that spell a printable non-ASCII character as `\uXXXX`
-			// instead of literal UTF-8 are a wire-format defect, not a decision the
-			// model needs to be told about. The payload parses cleanly, but one
-			// mistyped nibble decodes to a different, equally valid character, so it
-			// can never be verified or repaired after the fact. Reporting it as a
-			// tool error spends the whole turn and writes the literal escape syntax
-			// back into the context the model samples from next. Drop the defective
-			// turn and re-request instead; the per-call rejection in
-			// `executeToolCalls` stays as the terminal answer once this budget is
-			// spent. Managed fallback reports the discarded attempt through the
+			// instead of literal UTF-8 are a wire-format defect. The payload parses
+			// cleanly, but one mistyped nibble decodes to a different, equally valid
+			// character, so it can never be verified or repaired after the fact.
+			// Reporting it as a tool error spends the whole turn and writes the
+			// literal escape syntax back into the context the model samples from
+			// next. Drop the defective turn and re-request with a transient
+			// steering instruction instead: models that escape deterministically
+			// (rather than as a sampling accident) reproduce the identical defect
+			// on a blind resample, so the retry names the defect without ever
+			// committing the escape syntax — or the instruction — to durable
+			// history. The per-call rejection in `executeToolCalls` stays as the
+			// terminal answer once this budget is spent. Managed fallback reports the discarded attempt through the
 			// typed `escaped_arguments_discarded` outcome so the session policy
 			// owns a bounded same-model retry; the defect is never treated as
 			// provider evidence, so the fallback chain never advances on it.
@@ -2696,7 +2722,10 @@ async function runLoopBody(
 				// outcome below; the policy owns the same-model bounded retry and
 				// only falls back once it declines. The wire defect is not provider
 				// evidence, so the outcome deliberately carries no transport facts
-				// and the fallback chain never advances on it.
+				// and the fallback chain never advances on it. The outcome names
+				// whether a steering instruction already rode this attempt, so the
+				// policy's retry continuation can carry it exactly once instead of
+				// blindly re-requesting the same defective spelling.
 				if (config.fallbackManaged) {
 					transaction?.discard();
 					currentContext.messages.splice(contextMessageCount);
@@ -2704,10 +2733,19 @@ async function runLoopBody(
 					await config.onManagedAttemptOutcome?.({
 						type: "escaped_arguments_discarded",
 						message,
+						steeringPending: recoveryAttempt?.kind !== "escaped-nonascii",
 						scope: transaction?.scope,
 					});
 					stream.end(newMessages);
 					return;
+				}
+				// Steer the in-loop retry: name the defect in a transient synthetic
+				// message so a deterministic escaper has a reason to change its
+				// spelling. Never displace a different pending recovery (e.g. the
+				// one-shot malformed-tool-call turn): its mode and one-shot
+				// accounting must survive an escaped resample inside it.
+				if (!pendingRecovery || pendingRecovery.kind === "escaped-nonascii") {
+					pendingRecovery = { kind: "escaped-nonascii", inserted: false };
 				}
 				continue;
 			}
@@ -2797,7 +2835,9 @@ async function runLoopBody(
 				// Create placeholder tool results for any tool calls in the aborted message
 				// This maintains the tool_use/tool_result pairing that the API requires
 				type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
-				const toolCalls = message.content.filter((c): c is ToolCallContent => c.type === "toolCall");
+				const toolCalls = message.content.filter(
+					(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+				);
 				const toolResults: ToolResultMessage[] = [];
 				for (const toolCall of toolCalls) {
 					const result = createAbortedToolResult(toolCall, stream, message.stopReason, message.errorMessage);
@@ -2827,7 +2867,10 @@ async function runLoopBody(
 			}
 
 			// Check for tool calls
-			const toolCalls = message.content.filter(c => c.type === "toolCall");
+			type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
+			const toolCalls = message.content.filter(
+				(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+			);
 			hasMoreToolCalls = toolCalls.length > 0;
 
 			const toolResults: ToolResultMessage[] = [];
@@ -3119,10 +3162,13 @@ async function streamAssistantResponse(
 
 	// Synthetic recovery requests choose their tool mode explicitly below and
 	// must never consume a queued dynamic choice intended for an ordinary turn.
-	const dynamicToolChoice = recoveryMode
-		? undefined
-		: toolChoiceOverride
-			? toolChoiceOverride.value
+	// An explicit toolChoiceOverride is the exception: it carries the already-
+	// captured logical-turn choice for a steering resample of that same turn,
+	// so replaying it never double-consumes the queue.
+	const dynamicToolChoice = toolChoiceOverride
+		? toolChoiceOverride.value
+		: recoveryMode
+			? undefined
 			: config.getToolChoice?.();
 	const dynamicReasoning = config.getReasoning?.();
 	const harmonyMitigationEnabled = isHarmonyLeakMitigationTarget(config.model);
@@ -3595,7 +3641,9 @@ async function executeToolCalls(
 		afterToolCall,
 	} = config;
 	type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
-	const toolCalls = assistantMessage.content.filter((c): c is ToolCallContent => c.type === "toolCall");
+	const toolCalls = assistantMessage.content.filter(
+		(c): c is ToolCallContent => c.type === "toolCall" && !isCursorExecResolved(c),
+	);
 	const emittedToolResults: ToolResultMessage[] = [];
 	const toolCallInfos = toolCalls.map(call => ({ id: call.id, name: call.name }));
 	const batchId = `${assistantMessage.timestamp ?? Date.now()}_${toolCalls[0]?.id ?? "batch"}`;

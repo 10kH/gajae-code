@@ -66,6 +66,42 @@ describe("SessionManager signature persistence", () => {
 		expect(assistant.content[2]).toMatchObject({ type: "toolCall", id: "tool_1", thoughtSignature: "" });
 	});
 
+	it("round-trips provider safety-stop classification across session reopen", async () => {
+		using tempDir = TempDir.createSync("@pi-session-provider-safety-stop-");
+		const session = SessionManager.create(tempDir.path(), tempDir.path());
+
+		session.appendMessage({ role: "user", content: "blocked request", timestamp: 1 });
+		session.appendMessage({
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "error",
+			errorKind: "provider_safety_stop",
+			errorMessage: "Refusal (safety): Policy violation",
+			timestamp: 2,
+		} satisfies AssistantMessage);
+		await session.flush();
+
+		const reloaded = await SessionManager.open(session.getSessionFile()!);
+		const assistant = getAssistantMessage(reloaded);
+		expect(assistant).toMatchObject({
+			stopReason: "error",
+			errorKind: "provider_safety_stop",
+			errorMessage: "Refusal (safety): Policy violation",
+		});
+		await reloaded.close();
+	});
+
 	it("externalizes provider image data URLs and restores preserved history payloads across reload", async () => {
 		using tempDir = TempDir.createSync("@pi-session-provider-image-persistence-");
 		const session = SessionManager.create(tempDir.path(), tempDir.path());

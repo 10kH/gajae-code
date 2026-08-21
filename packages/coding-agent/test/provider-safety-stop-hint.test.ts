@@ -79,6 +79,9 @@ describe("isProviderSafetyStop", () => {
 				makeAssistant({ errorKind: undefined, errorMessage: "upstream said refusal once but retried ok" }),
 			),
 		).toBe(false);
+		expect(isProviderSafetyStop(makeAssistant({ stopReason: "stop", errorKind: "provider_safety_stop" }))).toBe(
+			false,
+		);
 	});
 });
 

@@ -46,8 +46,71 @@ describe("windows AVX2 probe hides its subprocess (#4652)", () => {
 			// In-process probe unavailable → hidden PowerShell fallback runs.
 			expect(detectWin32Avx2Support(() => undefined)).toBe(true);
 			expect(calls.length).toBe(1);
-			expect(calls[0]?.options).toMatchObject({ windowsHide: true, encoding: "utf-8" });
+			expect(calls[0]?.options).toMatchObject({
+				windowsHide: true,
+				encoding: "utf-8",
+				timeout: 4_000,
+				killSignal: "SIGKILL",
+				maxBuffer: 4 * 1024,
+			});
 			expect(calls[0]?.command).toBe("powershell.exe");
+		} finally {
+			spawnSync.mockRestore();
+		}
+	});
+
+	it("fails closed on timeout and captures only a bounded diagnostic", () => {
+		const diagnostics: string[] = [];
+		const spawnSync = vi.spyOn(childProcess, "spawnSync").mockReturnValue({
+			error: Object.assign(new Error("secret command and environment"), { code: "ETIMEDOUT" }),
+			status: null,
+			signal: "SIGKILL",
+			stdout: "True",
+			stderr: "secret stderr",
+		} as never);
+		try {
+			expect(
+				detectWin32Avx2Support(
+					() => undefined,
+					undefined,
+					diagnostic => diagnostics.push(diagnostic),
+				),
+			).toBe(false);
+			expect(diagnostics).toEqual(["timeout"]);
+			expect(spawnSync.mock.calls[0]?.[2]).toMatchObject({ timeout: 4_000, killSignal: "SIGKILL" });
+		} finally {
+			spawnSync.mockRestore();
+		}
+	});
+
+	it("fails closed on spawn errors and non-decisive output", () => {
+		const diagnostics: string[] = [];
+		const spawnSync = vi.spyOn(childProcess, "spawnSync").mockReturnValue({
+			error: Object.assign(new Error("secret command and environment"), { code: "EACCES" }),
+			status: null,
+			signal: null,
+			stdout: "",
+			stderr: "secret stderr",
+		} as never);
+		try {
+			expect(
+				detectWin32Avx2Support(
+					() => undefined,
+					undefined,
+					diagnostic => diagnostics.push(diagnostic),
+				),
+			).toBe(false);
+			expect(diagnostics).toEqual(["spawn_error"]);
+
+			spawnSync.mockReturnValue(win32SpawnResult("True\nFalse") as never);
+			expect(
+				detectWin32Avx2Support(
+					() => undefined,
+					undefined,
+					diagnostic => diagnostics.push(diagnostic),
+				),
+			).toBe(false);
+			expect(diagnostics).toEqual(["spawn_error", "non_decisive_output"]);
 		} finally {
 			spawnSync.mockRestore();
 		}
@@ -122,7 +185,10 @@ describe("windows AVX2 probe hides its subprocess (#4652)", () => {
 		expect(probeBlock).not.toContain("powershell.exe");
 		// The fallback's powershell spawn only happens through runCommand, which
 		// is windowsHide-guarded (asserted above).
-		expect(source).toMatch(/spawnSync\(command, args, \{ encoding: "utf-8", windowsHide: true \}\)/);
+		expect(source).toContain("spawnSync(command, args, {");
+		expect(source).toContain('encoding: "utf-8"');
+		expect(source).toContain("windowsHide: true");
+		expect(source).toContain("timeout: WIN32_AVX2_PROBE_TIMEOUT_MS");
 	});
 });
 
@@ -188,7 +254,14 @@ describe("scripts/host-detect Windows AVX2 detection (#4652)", () => {
 			expect(hostDetect.detectWin32Avx2Support(() => undefined)).toBe(true);
 			expect(spawnSync).toHaveBeenCalledTimes(1);
 			const options = spawnSync.mock.calls[0]?.[1];
-			expect(options).toMatchObject({ windowsHide: true, stdout: "pipe", stderr: "pipe" });
+			expect(options).toMatchObject({
+				windowsHide: true,
+				stdout: "pipe",
+				stderr: "pipe",
+				timeout: 4_000,
+				killSignal: "SIGKILL",
+				maxBuffer: 4 * 1024,
+			});
 		} finally {
 			spawnSync.mockRestore();
 		}

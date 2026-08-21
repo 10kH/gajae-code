@@ -93,8 +93,18 @@ function nativeRetainedObstruction(error: unknown): string | undefined {
 	if (reason === "non-regular") return `${object} is not a regular file`;
 	if (reason === "errno-ENOENT") return `${object} is missing`;
 	if (reason === "errno-EISDIR") return `${object} is not a regular file`;
+	if (reason === "unsupported-platform") return "retained publication authority is not implemented on this platform";
+	// The native reason names the stage that refused, so the prose must not
+	// claim an open failed when the descriptor was already open: `errno-`/`io-`
+	// come from the open itself, `read-` from reading the published record, and
+	// `clone-`/`metadata` from inspecting an object already opened.
 	if (reason.startsWith("errno-")) return `${object} could not be opened (${reason.slice("errno-".length)})`;
-	return `${object} could not be opened (${reason})`;
+	if (reason.startsWith("io-")) return `${object} could not be opened (${reason.slice("io-".length)})`;
+	if (reason.startsWith("read-")) return `${object} could not be read (${reason.slice("read-".length)})`;
+	if (reason.startsWith("clone-")) return `${object} could not be inspected (${reason.slice("clone-".length)})`;
+	if (reason === "metadata") return `${object} could not be inspected`;
+	if (reason.startsWith("metadata-")) return `${object} could not be inspected (${reason.slice("metadata-".length)})`;
+	return `${object} withheld publication authority (${reason})`;
 }
 
 /**

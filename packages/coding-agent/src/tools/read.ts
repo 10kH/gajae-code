@@ -1429,18 +1429,28 @@ interface ResolvedSqliteReadPath {
  * Directories return a formatted listing with modification times.
  */
 /**
- * A client-authority denial is a decision, not a transport failure: falling back to
- * disk would bypass the permission the client just refused. Availability failures
- * still fall back so an unreachable bridge cannot break local reads.
+ * Only an explicit bridge transport-unavailable marker authorizes falling back to
+ * the agent host's disk. Raw OS errno values, including EACCES/EPERM, are
+ * ambiguous at this boundary: treating them as transport failures can bypass a
+ * remote client's access decision by reading the path locally.
  */
-function isClientAuthorityDenial(error: unknown): boolean {
-	const code =
+function isExplicitTransportUnavailable(error: unknown): boolean {
+	const directCode =
 		typeof error === "object" && error !== null && "code" in error ? (error as { code?: unknown }).code : undefined;
-	// ACP clients surface refusals as an application error; -32001 is the reserved
-	// client-authority denial code and -32603 covers hosts without a dedicated code.
-	if (code === "permission_denied" || code === "forbidden" || code === -32001 || code === -32603) return true;
-	const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-	return /permission denied|not permitted|access denied|forbidden/i.test(message);
+	const namedCode = error instanceof Error ? error.name : undefined;
+	const nestedCode =
+		typeof error === "object" &&
+		error !== null &&
+		"data" in error &&
+		typeof (error as { data?: unknown }).data === "object"
+			? ((error as { data?: { code?: unknown } }).data?.code ?? undefined)
+			: undefined;
+	const code = directCode ?? nestedCode ?? namedCode;
+	return code === "transport_unavailable" || code === "bridge_unavailable";
+}
+
+function isClientAuthorityDenial(error: unknown): boolean {
+	return !isExplicitTransportUnavailable(error);
 }
 
 export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
@@ -2395,6 +2405,53 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		if (!bridge?.capabilities.readTextFile || !bridge.readTextFile) return undefined;
 		return bridge.readTextFile({ path: absolutePath, ...options });
 	}
+	async #readMissingPathThroughBridge(
+		absolutePath: string,
+		parsed: ParsedSelector,
+		_localReadPath: string,
+		truncation: TruncationDirection | undefined,
+		signal: AbortSignal | undefined,
+	): Promise<AgentToolResult<ReadToolDetails> | undefined> {
+		const bridgePromise = this.#routeReadThroughBridge(absolutePath);
+		if (bridgePromise === undefined) return undefined;
+		throwIfAborted(signal);
+		try {
+			const bridgeText = await bridgePromise;
+			if (parsed.kind === "conflicts") return undefined;
+			const bareEligible = parsed.kind === "none";
+			const route = isMultiRange(parsed)
+				? "local-multi-range"
+				: bareEligible
+					? "local-bare-stream"
+					: isRawSelector(parsed)
+						? "local-raw"
+						: "local-range";
+			const direction = resolveEffectiveDirection(truncation, route, this.session.settings);
+			if (isMultiRange(parsed) && parsed.kind === "lines") {
+				return this.#buildInMemoryMultiRangeResult(bridgeText, parsed.ranges, {
+					details: { resolvedPath: absolutePath },
+					sourcePath: absolutePath,
+					entityLabel: "file",
+					raw: isRawSelector(parsed),
+					truncationDirection: direction,
+					cacheLinesFor: absolutePath,
+				});
+			}
+			const { offset, limit } = selToOffsetLimit(parsed);
+			return this.#buildInMemoryTextResult(bridgeText, offset, limit, {
+				details: { resolvedPath: absolutePath },
+				sourcePath: absolutePath,
+				entityLabel: "file",
+				raw: isRawSelector(parsed),
+				cacheLinesFor: absolutePath,
+				truncationDirection: direction,
+			});
+		} catch (error) {
+			if (isClientAuthorityDenial(error)) throw error;
+			logger.warn("ACP fs readTextFile failed for a path missing on disk", { path: absolutePath, error });
+			return undefined;
+		}
+	}
 
 	async #trySummarize(absolutePath: string, fileSize: number, signal?: AbortSignal): Promise<SummaryResult | null> {
 		if (fileSize > MAX_SUMMARY_BYTES) return null;
@@ -2402,10 +2459,17 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 		try {
 			throwIfAborted(signal);
 			const bridgePromise = this.#routeReadThroughBridge(absolutePath);
-			const code =
-				bridgePromise !== undefined
-					? await bridgePromise.catch(() => Bun.file(absolutePath).text())
-					: await Bun.file(absolutePath).text();
+			let code: string;
+			if (bridgePromise !== undefined) {
+				try {
+					code = await bridgePromise;
+				} catch (error) {
+					if (isClientAuthorityDenial(error)) throw error;
+					code = await Bun.file(absolutePath).text();
+				}
+			} else {
+				code = await Bun.file(absolutePath).text();
+			}
 			throwIfAborted(signal);
 			if (countTextLines(code) > MAX_SUMMARY_LINES) return null;
 
@@ -2416,7 +2480,8 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 				minBodyLines: this.session.settings.get("read.summarize.minBodyLines"),
 				minCommentLines: this.session.settings.get("read.summarize.minCommentLines"),
 			});
-		} catch {
+		} catch (error) {
+			if (isClientAuthorityDenial(error)) throw error;
 			return null;
 		}
 	}
@@ -2663,6 +2728,14 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 			isDirectory = stat.isDirectory();
 		} catch (error) {
 			if (isNotFoundError(error)) {
+				const bridged = await this.#readMissingPathThroughBridge(
+					absolutePath,
+					parsed,
+					localReadPath,
+					params.truncation,
+					signal,
+				);
+				if (bridged) return bridged;
 				// Attempt unique suffix resolution before falling back to fuzzy suggestions
 				if (!isRemoteMountPath(absolutePath)) {
 					const suffixMatch = await findUniqueSuffixMatch(localReadPath, this.session.cwd, signal);

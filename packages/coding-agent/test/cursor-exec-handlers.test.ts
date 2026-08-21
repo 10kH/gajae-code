@@ -15,6 +15,10 @@ import {
 	DiagnosticsArgsSchema,
 	GrepArgsSchema,
 	LsArgsSchema,
+	PiEditExecArgsSchema,
+	PiEditReplacementSchema,
+	PiReadExecArgsSchema,
+	PiWriteExecArgsSchema,
 	ReadArgsSchema,
 	ShellArgsSchema,
 	WriteArgsSchema,
@@ -71,6 +75,150 @@ describe("CursorExecHandlers detached invocation (#484)", () => {
 			expect(result.role).toBe("toolResult");
 			expect(result.isError).toBeFalsy();
 		}
+	});
+});
+
+describe("CursorExecHandlers modern Pi writes", () => {
+	it("routes pi_edit through the dedicated replace-mode tool", async () => {
+		const calls: Array<Record<string, unknown>> = [];
+		const editTool = {
+			...makeTool("edit"),
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				calls.push(args);
+				return { content: [{ type: "text" as const, text: "edited" }], details: { diff: "-old\n+new" } };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map(),
+			getEditReplaceTool: () => editTool,
+		} as never);
+
+		const result = await handlers.piEdit({
+			toolCallId: "edit-1",
+			args: create(PiEditExecArgsSchema, {
+				path: "src/a.ts",
+				edits: [
+					create(PiEditReplacementSchema, { oldText: "old", newText: "new" }),
+					create(PiEditReplacementSchema, { oldText: "before", newText: "after" }),
+				],
+			}),
+		});
+
+		expect(calls).toEqual([
+			{
+				path: "src/a.ts",
+				edits: [
+					{ old_text: "old", new_text: "new" },
+					{ old_text: "before", new_text: "after" },
+				],
+			},
+		]);
+		expect(result.toolName).toBe("edit");
+		expect(result.isError).toBe(false);
+	});
+
+	it("routes pi_write content without changing it", async () => {
+		const calls: Array<Record<string, unknown>> = [];
+		const writeTool = {
+			...makeTool("write"),
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				calls.push(args);
+				return { content: [{ type: "text" as const, text: "written" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map([["write", writeTool]]),
+		} as never);
+
+		await handlers.piWrite({
+			toolCallId: "write-1",
+			args: create(PiWriteExecArgsSchema, { path: "src/new.ts", content: "export {};\n" }),
+		});
+		expect(calls).toEqual([{ path: "src/new.ts", content: "export {};\n" }]);
+	});
+
+	it("maps pi_read offset and limit to an exact raw selector", async () => {
+		const calls: Array<Record<string, unknown>> = [];
+		const readTool = {
+			...makeTool("read"),
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				calls.push(args);
+				return { content: [{ type: "text" as const, text: "lines" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map([["read", readTool]]),
+		} as never);
+
+		await handlers.piRead({
+			toolCallId: "read-1",
+			args: create(PiReadExecArgsSchema, { path: "src/a.ts", offset: 5, limit: 3 }),
+		});
+		expect(calls).toEqual([{ path: "src/a.ts:raw:5+3" }]);
+	});
+
+	it("propagates non-throwing edit failures", async () => {
+		const editTool = {
+			...makeTool("edit"),
+			execute: async () => ({
+				content: [{ type: "text" as const, text: "one replacement failed" }],
+				details: { diff: "-old\n+new" },
+				isError: true,
+			}),
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map(),
+			getEditReplaceTool: () => editTool,
+		} as never);
+
+		const result = await handlers.piEdit({
+			toolCallId: "edit-error",
+			args: create(PiEditExecArgsSchema, {
+				path: "src/a.ts",
+				edits: [create(PiEditReplacementSchema, { oldText: "old", newText: "new" })],
+			}),
+		});
+		expect(result.isError).toBe(true);
+	});
+
+	it("passes pi_grep constraints through a scoped tool, not strict-schema kwargs", async () => {
+		const calls: Array<Record<string, unknown>> = [];
+		const factoryOptions: Array<Record<string, unknown>> = [];
+		const searchTool = {
+			...makeTool("search"),
+			execute: async (_toolCallId: string, args: Record<string, unknown>) => {
+				calls.push(args);
+				return { content: [{ type: "text" as const, text: "match" }], details: {} };
+			},
+		} as unknown as AgentTool;
+		const handlers = new CursorExecHandlers({
+			cwd: process.cwd(),
+			tools: new Map([["search", searchTool]]),
+			createSearchTool: (options: Record<string, unknown>) => {
+				factoryOptions.push(options);
+				return searchTool;
+			},
+		} as never);
+
+		await handlers.piGrep({
+			toolCallId: "grep-1",
+			args: {
+				$typeName: "agent.v1.PiGrepExecArgs",
+				pattern: "needle",
+				path: "src",
+				glob: "**/*.ts",
+				context: 3,
+				limit: 7,
+				ignoreCase: true,
+				literal: false,
+			},
+		});
+		expect(factoryOptions).toEqual([{ context: 3, totalMatchLimit: 7 }]);
+		expect(calls).toEqual([{ pattern: "needle", paths: ["src/**/*.ts"], i: true }]);
 	});
 });
 
