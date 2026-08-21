@@ -48,14 +48,24 @@ describe("online-if-uncached model refresh", () => {
 		const cachedModels = [...staticModels, model(providerId, "cached")];
 		let discoveryCalls = 0;
 		const now = 1_700_000_000_000;
-		writeModelCache(providerId, now, cachedModels, true, fingerprint(staticModels), cacheDbPath);
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		writeModelCache(
+			providerId,
+			now,
+			cachedModels,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["cached"],
+			provenance,
+		);
 
 		const result = await resolveProviderModels<Api>(
 			{
 				providerId,
 				staticModels,
 				cacheDbPath,
-				cacheDynamicModelProvenance: "credential-a\u0000https://provider-a.example.test",
+				cacheDynamicModelProvenance: provenance,
 				now: () => now,
 				fetchDynamicModels: async () => {
 					discoveryCalls += 1;
@@ -337,6 +347,284 @@ describe("online-if-uncached model refresh", () => {
 		);
 
 		expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toBeNull();
+	});
+
+	test("does not consume or overwrite a concurrent cache row from another discovery context after a failed fetch", async () => {
+		const providerId = "cache-failed-fetch-cross-context-race";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenanceA = "credential-a\u0000https://provider-a.example.test";
+		const provenanceB = "credential-b\u0000https://provider-b.example.test";
+		const modelsA = [...staticModels, model(providerId, "dynamic-a")];
+		const modelsB = [...staticModels, model(providerId, "dynamic-b")];
+		writeModelCache(
+			providerId,
+			now,
+			modelsA,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic-a"],
+			provenanceA,
+		);
+
+		const fetchControl: {
+			started: () => void;
+			resume: (value: readonly Model<Api>[] | null) => void;
+		} = {
+			started() {},
+			resume() {},
+		};
+		const fetchStartedGate = new Promise<void>(resolve => {
+			fetchControl.started = resolve;
+		});
+		const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
+			fetchControl.resume = resolve;
+		});
+		const pending = resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: provenanceA,
+				now: () => now,
+				fetchDynamicModels: async () => {
+					fetchControl.started();
+					return fetchResumeGate;
+				},
+			},
+			"online",
+		);
+
+		await fetchStartedGate;
+		writeModelCache(
+			providerId,
+			now + 1,
+			modelsB,
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic-b"],
+			provenanceB,
+		);
+		fetchControl.resume(null);
+
+		const result = await pending;
+		expect(result.models.map(entry => entry.id)).not.toContain("dynamic-b");
+		expect(result.dynamicModelIds ?? []).not.toContain("dynamic-b");
+
+		const cache = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now + 1, cacheDbPath);
+		expect(cache).toMatchObject({
+			authoritative: true,
+			updatedAt: now + 1,
+			dynamicModelIds: ["dynamic-b"],
+			dynamicModelProvenance: provenanceB,
+		});
+		expect(cache?.models.map(entry => entry.id)).toEqual(["static", "dynamic-b"]);
+	});
+
+	test("inserts a non-authoritative tombstone when a failed fetch has no cache row", async () => {
+		for (const staticIds of [[], ["static"]] as const) {
+			const providerId = `cache-failed-fetch-missing-row-tombstone-${staticIds.length === 0 ? "empty" : "static"}`;
+			const staticModels = staticIds.map(id => model(providerId, id));
+			const now = 1_700_000_000_000;
+
+			expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toBeNull();
+
+			const result = await resolveProviderModels<Api>(
+				{
+					providerId,
+					staticModels,
+					cacheDbPath,
+					now: () => now,
+					fetchDynamicModels: async () => null,
+				},
+				"online",
+			);
+
+			expect(result.models.map(entry => entry.id)).toEqual([...staticIds]);
+			expect(result.dynamicModelIds).toBeUndefined();
+			expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toMatchObject({
+				authoritative: false,
+				updatedAt: now,
+				dynamicModelIds: undefined,
+				dynamicModelProvenance: undefined,
+				models: staticIds.map(id => expect.objectContaining({ id })),
+			});
+		}
+	});
+
+	test("applies non-authoritative retry backoff to a bound failed-fetch tombstone instead of refetching on every visit", async () => {
+		const providerId = "cache-tombstone-retry-backoff";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		let discoveryCalls = 0;
+
+		// Failed fetch with no prior row: a non-authoritative tombstone lands.
+		const failed = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return null;
+				},
+			},
+			"online",
+		);
+		expect(failed.models.map(entry => entry.id)).toEqual(["static"]);
+		expect(discoveryCalls).toBe(1);
+		expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toMatchObject({
+			authoritative: false,
+		});
+
+		// A fresh-but-non-authoritative tombstone must not force a network
+		// attempt on the next non-offline visit: the standard retry backoff
+		// applies, so online-if-uncached answers from the row without fetching.
+		const revisit = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now + 1000,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return [model(providerId, "dynamic")];
+				},
+			},
+			"online-if-uncached",
+		);
+		expect(revisit.fetched).toBe(false);
+		expect(discoveryCalls).toBe(1);
+		expect(revisit.models.map(entry => entry.id)).toEqual(["static"]);
+
+		// Once the row ages past the retry interval, the fetch resumes.
+		const afterBackoff = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now + 1000 + NON_AUTHORITATIVE_RETRY_MS,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return [model(providerId, "dynamic")];
+				},
+			},
+			"online-if-uncached",
+		);
+		expect(afterBackoff.fetched).toBe(true);
+		expect(discoveryCalls).toBe(2);
+	});
+
+	test("fails closed when a failed fetch re-reads a same-provenance row with inconsistent or absent dynamic IDs", async () => {
+		for (const inconsistentIds of [undefined, ["dynamic-a"]] as const) {
+			const providerId = `cache-failed-fetch-inconsistent-ids-${inconsistentIds === undefined ? "absent" : "mismatch"}`;
+			const staticModels = [model(providerId, "static")];
+			const now = 1_700_000_000_000;
+			const provenanceA = "credential-a\u0000https://provider-a.example.test";
+			writeModelCache(
+				providerId,
+				now,
+				[...staticModels, model(providerId, "dynamic-a")],
+				true,
+				fingerprint(staticModels),
+				cacheDbPath,
+				["dynamic-a"],
+				provenanceA,
+			);
+
+			const fetchControl: {
+				started: () => void;
+				resume: (value: readonly Model<Api>[] | null) => void;
+			} = {
+				started() {},
+				resume() {},
+			};
+			const fetchStartedGate = new Promise<void>(resolve => {
+				fetchControl.started = resolve;
+			});
+			const fetchResumeGate = new Promise<readonly Model<Api>[] | null>(resolve => {
+				fetchControl.resume = resolve;
+			});
+			const pending = resolveProviderModels<Api>(
+				{
+					providerId,
+					staticModels,
+					cacheDbPath,
+					cacheDynamicModelProvenance: provenanceA,
+					now: () => now,
+					fetchDynamicModels: async () => {
+						fetchControl.started();
+						return fetchResumeGate;
+					},
+				},
+				"online",
+			);
+
+			await fetchStartedGate;
+			writeModelCache(
+				providerId,
+				now + 1,
+				[...staticModels, model(providerId, "inconsistent")],
+				true,
+				fingerprint(staticModels),
+				cacheDbPath,
+				inconsistentIds,
+				provenanceA,
+			);
+			fetchControl.resume(null);
+
+			const result = await pending;
+			expect(result.models.map(entry => entry.id)).not.toContain("inconsistent");
+			expect(result.dynamicModelIds ?? []).not.toContain("inconsistent");
+
+			const cache = readModelCache<Api>(providerId, CACHE_TTL_MS, () => now + 1, cacheDbPath);
+			expect(cache).toMatchObject({
+				authoritative: true,
+				updatedAt: now + 1,
+				dynamicModelIds: inconsistentIds,
+				dynamicModelProvenance: provenanceA,
+			});
+			expect(cache?.models.map(entry => entry.id)).toEqual(["static", "inconsistent"]);
+		}
+	});
+
+	test("falls back to same-context cached models when a later dynamic fetch fails", async () => {
+		const providerId = "cache-failed-fetch-same-context";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		writeModelCache(
+			providerId,
+			now,
+			[...staticModels, model(providerId, "dynamic-a")],
+			true,
+			fingerprint(staticModels),
+			cacheDbPath,
+			["dynamic-a"],
+			provenance,
+		);
+
+		const result = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				cacheDynamicModelProvenance: provenance,
+				now: () => now,
+				fetchDynamicModels: async () => null,
+			},
+			"online",
+		);
+
+		expect(result.models.map(entry => entry.id)).toEqual(["static", "dynamic-a"]);
+		expect(result.dynamicModelIds).toBeUndefined();
 	});
 
 	test("does not downgrade an authoritative cache when the failed-fetch guard denies publication", async () => {

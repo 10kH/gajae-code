@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
@@ -683,6 +684,78 @@ interface DiscoveryProviderConfig {
 	optional?: boolean;
 }
 
+const REUSABLE_DISCOVERY_HEADER_NAMES = new Set([
+	"accept",
+	"content-type",
+	"openai-organization",
+	"openai-project",
+	"x-organization-id",
+	"x-project-id",
+	"x-routing-id",
+	"x-tenant-id",
+	"x-workspace-id",
+]);
+
+function isSensitiveDiscoveryHeader(name: string): boolean {
+	// Persist values only for a small, audited set of request-shaping headers.
+	// Unknown headers fail closed because their semantics cannot be inferred from
+	// their names (for example, CF-Access-Jwt-Assertion carries a credential).
+	return !REUSABLE_DISCOVERY_HEADER_NAMES.has(name.toLowerCase());
+}
+
+/**
+ * Credential-safe fingerprint of the effective configured-discovery request
+ * identity: non-secret credential evidence, normalized endpoint, effective
+ * request headers (config plus runtime overrides, lowercased and sorted), and
+ * the semantic request-shape fields (discovery type, provider api, per-prefix
+ * api routing, models.dev catalog key). A
+ * published cache row is only trusted while this fingerprint is unchanged, so
+ * a tenant/project header change (or any other request-shape change)
+ * invalidates the authoritative catalog instead of silently serving the old
+ * context's models. Configurations containing secret-bearing headers are not
+ * fingerprinted or persisted at all because an unsalted digest would permit
+ * offline guessing of low-entropy values.
+ */
+function fingerprintConfiguredDiscoveryRequestShape(
+	providerConfig: DiscoveryProviderConfig,
+	authEvidence: string,
+	endpoint: string,
+): string | undefined {
+	const sortEntries = (record: Record<string, string> | undefined) =>
+		Object.entries(record ?? {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	try {
+		const parsed = new URL(providerConfig.baseUrl ?? "");
+		if (parsed.username || parsed.password || parsed.search) return undefined;
+	} catch {
+		return undefined;
+	}
+	if (Object.keys(providerConfig.headers ?? {}).some(isSensitiveDiscoveryHeader)) return undefined;
+	const context = JSON.stringify({
+		authEvidence,
+		endpoint,
+		headers: sortEntries(providerConfig.headers).map(([name, value]) => [name.toLowerCase(), value]),
+		discoveryType: providerConfig.discovery.type,
+		api: providerConfig.api,
+		apiByModelPrefix: sortEntries(providerConfig.discovery.apiByModelPrefix),
+		modelsDevProvider: providerConfig.discovery.modelsDevProvider ?? "",
+	});
+	return crypto.createHash("sha256").update("gajae:model-discovery-provenance\0").update(context).digest("hex");
+}
+
+function fingerprintDescriptorDiscoveryProvenance(authEvidence: string, endpoint: string): string | undefined {
+	try {
+		const parsed = new URL(endpoint);
+		if (parsed.username || parsed.password || parsed.search) return undefined;
+	} catch {
+		return undefined;
+	}
+	return crypto
+		.createHash("sha256")
+		.update("gajae:model-discovery-provenance\0")
+		.update(JSON.stringify({ authEvidence, endpoint }))
+		.digest("hex");
+}
+
 export interface CanonicalModelQueryOptions {
 	availableOnly?: boolean;
 	candidates?: readonly Model<Api>[];
@@ -690,6 +763,12 @@ export interface CanonicalModelQueryOptions {
 	sessionId?: string;
 	/** Credential-selection session used to classify effective provider auth. Defaults to sessionId. */
 	credentialSessionId?: string;
+}
+
+/** One canonical record with its winning variant resolved, from a batch query. */
+export interface CanonicalModelSelection {
+	record: CanonicalModelRecord;
+	model: Model<Api> | undefined;
 }
 
 /** Result of loading custom models from models.json */
@@ -1240,6 +1319,18 @@ interface ModelManagerDiscoveryOptions {
 	authGeneration: string;
 	apiKey: string | undefined;
 	endpoint: string;
+	endpointContainsUserinfo: boolean;
+}
+
+interface ConfiguredDiscoveryResult {
+	provider: string;
+	current: boolean;
+	models: Model<Api>[];
+	authGeneration: string;
+	configurationGeneration: number;
+	endpoint: string;
+	fetched: boolean;
+	clearPublishedModelIds?: readonly string[];
 }
 
 /**
@@ -1658,7 +1749,16 @@ export class ModelRegistry {
 				continue;
 			}
 			const cache = readModelCache<Api>(descriptor.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
-			if (!cache) {
+			const expectedProvenance = fingerprintDescriptorDiscoveryProvenance(
+				this.#getProviderEvidenceGeneration(descriptor.providerId),
+				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? ""),
+			);
+			if (
+				expectedProvenance === undefined ||
+				!cache ||
+				cache.dynamicModelIds === undefined ||
+				cache.dynamicModelProvenance !== expectedProvenance
+			) {
 				continue;
 			}
 			const models = cache.models.map(model =>
@@ -1678,12 +1778,33 @@ export class ModelRegistry {
 	#loadCachedDiscoverableModels(): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
 		for (const providerConfig of this.#discoveryManager.providers) {
-			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath);
+			let expectedProvenance: string | undefined;
+			try {
+				const effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
+				expectedProvenance = fingerprintConfiguredDiscoveryRequestShape(
+					effectiveConfig,
+					this.#getProviderEvidenceGeneration(effectiveConfig.provider),
+					this.#normalizeDiscoveryEvidenceEndpoint(effectiveConfig.baseUrl ?? ""),
+				);
+			} catch {
+				// A context that cannot be fully derived cannot vouch for a cache row.
+				expectedProvenance = undefined;
+			}
+			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance);
+			// Cache rows persist sanitized transport metadata (no headers), so a
+			// rebooted registry re-derives the provider transport override from the
+			// same source the live publish path uses — mirroring the cached
+			// descriptor path — instead of serving header-less models until the
+			// next successful online discovery.
+			const providerOverride = this.#resolveProviderOverride(providerConfig.provider);
+			const withTransport = providerOverride
+				? models.map(model => this.#applyProviderTransportOverride(model, providerOverride))
+				: models;
 			const normalized = this.#applyProviderModelOverrides(
 				providerConfig.provider,
 				this.#normalizeDiscoverableModels(
 					providerConfig,
-					this.#applyProviderCompat(providerConfig.compat, [...models]),
+					this.#applyProviderCompat(providerConfig.compat, [...withTransport]),
 				),
 			);
 			applyGeneratedModelPolicies(normalized);
@@ -1724,22 +1845,48 @@ export class ModelRegistry {
 			};
 		});
 	}
-	#sanitizeDiscoverableModelsForCache(providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
-		return providerConfig.discovery.type === "openai-models-list" ||
-			providerConfig.discovery.type === "lm-studio" ||
-			providerConfig.discovery.type === "omlx"
-			? this.#stripModelBaseUrlQueries(models)
-			: models;
+	#sanitizeDiscoverableModelsForCache(_providerConfig: DiscoveryProviderConfig, models: Model<Api>[]): Model<Api>[] {
+		return this.#stripModelBaseUrlQueries(models).map(model => ({
+			...model,
+			headers: undefined,
+		}));
 	}
 	#stripModelBaseUrlQueries(models: readonly Model<Api>[]): Model<Api>[] {
-		return models.map(model => (model.baseUrl ? { ...model, baseUrl: stripUrlQuery(model.baseUrl) } : model));
+		return models.map(model => {
+			if (!model.baseUrl) return model;
+			try {
+				const parsed = new URL(model.baseUrl);
+				parsed.username = "";
+				parsed.password = "";
+				parsed.search = "";
+				parsed.hash = "";
+				return { ...model, baseUrl: parsed.toString().replace(/\/$/, "") };
+			} catch {
+				const { baseUrl: _baseUrl, ...withoutBaseUrl } = model;
+				return withoutBaseUrl as Model<Api>;
+			}
+		});
+	}
+	#stripUrlUserinfo(url: string | undefined): string | undefined {
+		if (!url) return url;
+		try {
+			const parsed = new URL(url);
+			if (!parsed.username && !parsed.password) return url;
+			parsed.username = "";
+			parsed.password = "";
+			return parsed.toString();
+		} catch {
+			return undefined;
+		}
 	}
 	#restoreLiveDiscoveryBaseUrl(modelBaseUrl: string | undefined, liveBaseUrl: string | undefined): string | undefined {
-		if (!modelBaseUrl || !liveBaseUrl?.includes("?")) return modelBaseUrl;
-		return this.#normalizeDiscoveryEvidenceEndpoint(stripUrlQuery(modelBaseUrl)) ===
+		if (!modelBaseUrl || !liveBaseUrl) return this.#stripUrlUserinfo(modelBaseUrl);
+		const restored =
+			this.#normalizeDiscoveryEvidenceEndpoint(stripUrlQuery(modelBaseUrl)) !==
 			this.#normalizeDiscoveryEvidenceEndpoint(stripUrlQuery(liveBaseUrl))
-			? liveBaseUrl
-			: modelBaseUrl;
+				? modelBaseUrl
+				: liveBaseUrl;
+		return this.#stripUrlUserinfo(restored);
 	}
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
@@ -2133,17 +2280,7 @@ export class ModelRegistry {
 		).filter(provider => !disabledProviders.has(provider.provider));
 		const configuredDiscoveriesPromise =
 			selectedDiscoverableProviders.length === 0
-				? Promise.resolve(
-						[] as Array<{
-							provider: string;
-							current: boolean;
-							models: Model<Api>[];
-							authGeneration: string;
-							configurationGeneration: number;
-							endpoint: string;
-							fetched: boolean;
-						}>,
-					)
+				? Promise.resolve([] as ConfiguredDiscoveryResult[])
 				: Promise.all(
 						selectedDiscoverableProviders.map(provider => this.#discoverProviderModels(provider, strategy)),
 					);
@@ -2242,6 +2379,11 @@ export class ModelRegistry {
 		const configuredDiscoveries = new Map(currentConfiguredDiscoveryResults.map(result => [result.provider, result]));
 		const configuredDiscovered = currentConfiguredDiscoveryResults.flatMap(result => result.models);
 		const discovered = [...configuredDiscovered, ...currentBuiltInDiscovered];
+		const clearPublishedModelIds = new Map(
+			currentConfiguredDiscoveryResults
+				.filter(result => result.current && result.clearPublishedModelIds !== undefined)
+				.map(result => [result.provider, new Set(result.clearPublishedModelIds ?? [])]),
+		);
 		for (const provider of selectedDiscoverableProviders) {
 			const evidence = configuredDiscoveryEvidence.get(provider.provider);
 			const discovery = configuredDiscoveries.get(provider.provider);
@@ -2272,7 +2414,19 @@ export class ModelRegistry {
 			}
 		}
 		this.#rebuildProviderActivity();
+		if (clearPublishedModelIds.size > 0) {
+			this.#models = this.#models.filter(model => {
+				const ids = clearPublishedModelIds.get(model.provider);
+				return (
+					!ids?.has(model.id) ||
+					(this.#providerActivity.get(model.provider)?.staticModelIds.has(model.id) ?? false)
+				);
+			});
+		}
 		if (discovered.length === 0) {
+			if (clearPublishedModelIds.size > 0) {
+				this.#rebuildCanonicalIndex();
+			}
 			return;
 		}
 		const discoveredModels = this.#applyHardcodedModelPolicies(
@@ -2300,15 +2454,7 @@ export class ModelRegistry {
 	async #discoverProviderModels(
 		providerConfig: DiscoveryProviderConfig,
 		strategy: ModelRefreshStrategy,
-	): Promise<{
-		provider: string;
-		current: boolean;
-		models: Model<Api>[];
-		authGeneration: string;
-		configurationGeneration: number;
-		endpoint: string;
-		fetched: boolean;
-	}> {
+	): Promise<ConfiguredDiscoveryResult> {
 		const provider = providerConfig.provider;
 		const preflightEpoch = this.#optionalAuthPreflightEpoch;
 		const preflightGeneration = (this.#optionalAuthPreflightGenerations.get(provider) ?? 0) + 1;
@@ -2394,10 +2540,32 @@ export class ModelRegistry {
 			endpoint ===
 			this.#normalizeDiscoveryEvidenceEndpoint(this.#effectiveDiscoveryProviderConfig(providerConfig).baseUrl ?? "");
 		const evidence = this.#configuredDiscoveryEvidence.get(provider);
+		const cacheDynamicModelProvenance = fingerprintConfiguredDiscoveryRequestShape(
+			effectiveProviderConfig,
+			authGenerationBeforeDiscovery,
+			endpoint,
+		);
+		if (cacheDynamicModelProvenance === undefined && strategy === "offline") {
+			const previouslyPublishedModelIds = [...(evidence?.modelIds ?? [])];
+			this.#configuredDiscoveryEvidence.delete(provider);
+			return {
+				provider: effectiveProviderConfig.provider,
+				current: true,
+				models: [],
+				authGeneration: authGenerationBeforeDiscovery,
+				configurationGeneration: preflightAuthConfigurationGeneration,
+				endpoint,
+				fetched: false,
+				clearPublishedModelIds: previouslyPublishedModelIds,
+			};
+		}
+		const cacheLookupProvenance =
+			cacheDynamicModelProvenance ?? `gajae:non-cacheable-configured:${crypto.randomUUID()}`;
 		const refreshStrategy =
 			strategy === "online-if-uncached" &&
-			evidence !== undefined &&
-			(evidence.authGeneration !== authGenerationBeforeDiscovery || evidence.endpoint !== endpoint)
+			(cacheDynamicModelProvenance === undefined ||
+				(evidence !== undefined &&
+					(evidence.authGeneration !== authGenerationBeforeDiscovery || evidence.endpoint !== endpoint)))
 				? "online"
 				: strategy;
 		const mergeInput = await this.#discoveryManager.discover(effectiveProviderConfig, refreshStrategy, {
@@ -2418,7 +2586,8 @@ export class ModelRegistry {
 					await this.#discoverModelsByProviderType(provider, apiKey),
 				),
 			getEvidenceGeneration: provider => this.#getProviderEvidenceGeneration(provider.provider, preflightApiKey),
-			canPublishCache: () => isCurrentEndpoint(),
+			cacheDynamicModelProvenance: cacheLookupProvenance,
+			canPublishCache: isCurrentEndpoint,
 		});
 		const authGeneration =
 			mergeInput.authGeneration ??
@@ -2603,6 +2772,7 @@ export class ModelRegistry {
 					authGeneration,
 					apiKey,
 					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(baseUrl ?? ""),
+					endpointContainsUserinfo: this.#urlContainsUserinfo(baseUrl ?? ""),
 				});
 			}
 		}
@@ -2617,13 +2787,13 @@ export class ModelRegistry {
 				isAuthenticated(key)
 			) {
 				const managerOptions = descriptor.createOptions(key);
+				const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? "";
 				options.push({
 					options: managerOptions,
 					authGeneration,
 					apiKey: apiKeyValue,
-					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(
-						this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? "",
-					),
+					endpoint: this.#normalizeDiscoveryEvidenceEndpoint(baseUrl),
+					endpointContainsUserinfo: this.#urlContainsUserinfo(baseUrl),
 				});
 			}
 		}
@@ -2631,7 +2801,7 @@ export class ModelRegistry {
 	}
 
 	async #discoverWithModelManager(
-		{ options, authGeneration, apiKey, endpoint }: ModelManagerDiscoveryOptions,
+		{ options, authGeneration, apiKey, endpoint, endpointContainsUserinfo }: ModelManagerDiscoveryOptions,
 		strategy: ModelRefreshStrategy,
 	): Promise<Model<Api>[]> {
 		const generation = (this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) + 1;
@@ -2643,6 +2813,16 @@ export class ModelRegistry {
 			this.#providerOverrides.get("xiaomi")?.baseUrl === undefined &&
 			resolveProviderBaseUrlFromEnv("xiaomi") === undefined;
 		let credentialDerivedEndpoint: string | undefined;
+		const reusableCacheProvenance = endpointContainsUserinfo
+			? undefined
+			: fingerprintDescriptorDiscoveryProvenance(authGeneration, endpoint);
+		if (reusableCacheProvenance === undefined && strategy === "offline") return [];
+		// Signed/userinfo endpoints may still publish a sanitized best-effort row,
+		// but each refresh gets a new opaque nonce. The nonce contains no endpoint
+		// secret and can never match a previous invocation, so constructor loads,
+		// stale fallback, and online-if-uncached reuse all fail closed.
+		const cacheDynamicModelProvenance =
+			reusableCacheProvenance ?? `gajae:non-cacheable-endpoint:${crypto.randomUUID()}`;
 		const isCurrentDiscovery = () =>
 			(this.#descriptorDiscoveryGenerations.get(options.providerId) ?? 0) === generation &&
 			this.#getProviderEvidenceGeneration(options.providerId, apiKey) === authGeneration &&
@@ -2653,7 +2833,7 @@ export class ModelRegistry {
 			const manager = createModelManager({
 				...options,
 				cacheDbPath: this.#cacheDbPath,
-				cacheDynamicModelProvenance: Bun.hash(`${authGeneration}\u0000${endpoint}`).toString(36),
+				cacheDynamicModelProvenance,
 				canPublishCache: isCurrentDiscovery,
 				...(options.fetchDynamicModels
 					? {
@@ -3136,6 +3316,14 @@ export class ModelRegistry {
 			return endpoint.replace(/\/+$/g, "");
 		}
 	}
+	#urlContainsUserinfo(endpoint: string): boolean {
+		try {
+			const parsed = new URL(endpoint);
+			return Boolean(parsed.username || parsed.password);
+		} catch {
+			return false;
+		}
+	}
 	#isCredentiallessProvider(provider: string): boolean {
 		let fallbackMatchesCurrentEvidence = false;
 		const fallbackEvidenceGeneration = this.#credentiallessAuthFallbackProviders.get(provider);
@@ -3171,7 +3359,8 @@ export class ModelRegistry {
 			const parsed = new URL(raw);
 			const trimmedPath = parsed.pathname.replace(/\/+$/g, "");
 			parsed.pathname = trimmedPath.endsWith("/v1") ? trimmedPath || "/v1" : `${trimmedPath}/v1`;
-			return `${parsed.protocol}//${parsed.host}${parsed.pathname}${parsed.search}`;
+			parsed.hash = "";
+			return parsed.toString().replace(/\/$/, "");
 		} catch {
 			return raw;
 		}
@@ -3278,10 +3467,15 @@ export class ModelRegistry {
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
 		const withTransportOverride = this.#applyProviderTransportOverride(model, override);
+		const sanitizedBaseUrl = this.#stripUrlUserinfo(withTransportOverride.baseUrl);
+		const sanitizedTransport: Model<Api> =
+			sanitizedBaseUrl === withTransportOverride.baseUrl
+				? withTransportOverride
+				: { ...withTransportOverride, ...(sanitizedBaseUrl === undefined ? {} : { baseUrl: sanitizedBaseUrl }) };
 		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
 		return modelCompat
-			? { ...withTransportOverride, compat: mergeCompat(withTransportOverride.compat, modelCompat) }
-			: withTransportOverride;
+			? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
+			: sanitizedTransport;
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
 		if (this.#runtimeProviderOverrides.size === 0) return models;
@@ -3459,21 +3653,45 @@ export class ModelRegistry {
 		return [...this.#configuredProviderIds];
 	}
 
-	#isModelAvailable(model: Model<Api>, disabledProviders = getDisabledProviderIdsFromSettings()): boolean {
+	#isModelAvailable(
+		model: Model<Api>,
+		disabledProviders: ReadonlySet<string> = getDisabledProviderIdsFromSettings(),
+	): boolean {
 		return (
 			!disabledProviders.has(model.provider) &&
 			(this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider))
 		);
 	}
+	/** Per-query precomputed variant filter inputs; plan fields are authoritative when provided. */
+	#buildCanonicalVariantFilterPlan(options: CanonicalModelQueryOptions | undefined): {
+		candidateKeys: Set<string> | undefined;
+		disabledProviders: ReadonlySet<string> | undefined;
+	} {
+		return {
+			candidateKeys: options?.candidates
+				? new Set(options.candidates.map(candidate => formatCanonicalVariantSelector(candidate)))
+				: undefined,
+			disabledProviders: options?.availableOnly ? getDisabledProviderIdsFromSettings() : undefined,
+		};
+	}
 
 	#filterCanonicalVariants(
 		record: CanonicalModelRecord,
 		options: CanonicalModelQueryOptions | undefined,
+		plan?: { candidateKeys: Set<string> | undefined; disabledProviders: ReadonlySet<string> | undefined },
 	): CanonicalModelVariant[] {
-		const candidateKeys = options?.candidates
-			? new Set(options.candidates.map(candidate => formatCanonicalVariantSelector(candidate)))
-			: undefined;
-		const disabledProviders = options?.availableOnly ? getDisabledProviderIdsFromSettings() : undefined;
+		const candidateKeys =
+			plan !== undefined
+				? plan.candidateKeys
+				: options?.candidates
+					? new Set(options.candidates.map(candidate => formatCanonicalVariantSelector(candidate)))
+					: undefined;
+		const disabledProviders =
+			plan !== undefined
+				? plan.disabledProviders
+				: options?.availableOnly
+					? getDisabledProviderIdsFromSettings()
+					: undefined;
 		return record.variants.filter(variant => {
 			if (candidateKeys && !candidateKeys.has(variant.selector)) return false;
 			if (options?.availableOnly && !this.#isModelAvailable(variant.model, disabledProviders)) return false;
@@ -3572,7 +3790,13 @@ export class ModelRegistry {
 	#resolveCanonicalVariant(
 		variants: readonly CanonicalModelVariant[],
 		sessionId?: string,
-		options: { providerRankFirst?: boolean; exactnessKey?: string; credentialSessionId?: string } = {},
+		options: {
+			providerRankFirst?: boolean;
+			exactnessKey?: string;
+			credentialSessionId?: string;
+			providerRank?: Map<string, number>;
+			modelOrder?: Map<string, number>;
+		} = {},
 	): CanonicalModelVariant | undefined {
 		if (variants.length === 0) return undefined;
 		const normalizedSessionId = sessionId?.trim();
@@ -3585,9 +3809,10 @@ export class ModelRegistry {
 			return stickyVariant;
 		}
 		if (normalizedSessionId && stickySelector) this.#sessionCanonicalVariants.delete(normalizedSessionId);
-		const policy = this.#buildProviderSelectionPolicy(options.credentialSessionId ?? normalizedSessionId);
-		const providerRank = this.#providerRankMap(policy);
-		const modelOrder = this.#catalogModelOrder();
+		const providerRank =
+			options.providerRank ??
+			this.#providerRankMap(this.#buildProviderSelectionPolicy(options.credentialSessionId ?? normalizedSessionId));
+		const modelOrder = options.modelOrder ?? this.#catalogModelOrder();
 		const sourceRank: Record<CanonicalModelVariant["source"], number> = {
 			override: 1,
 			bundled: 1,
@@ -3609,9 +3834,10 @@ export class ModelRegistry {
 	}
 
 	getCanonicalModels(options?: CanonicalModelQueryOptions): CanonicalModelRecord[] {
+		const filterPlan = this.#buildCanonicalVariantFilterPlan(options);
 		const records: CanonicalModelRecord[] = [];
 		for (const record of this.#canonicalIndex.records) {
-			const variants = this.#filterCanonicalVariants(record, options);
+			const variants = this.#filterCanonicalVariants(record, options, filterPlan);
 			if (variants.length === 0) {
 				continue;
 			}
@@ -3622,6 +3848,36 @@ export class ModelRegistry {
 			});
 		}
 		return records;
+	}
+
+	/**
+	 * Batch form of {@link resolveCanonicalModel} over every canonical record:
+	 * one candidate-key set, one provider policy, and one catalog order for the
+	 * whole query instead of per record. `model` is `undefined` only when a
+	 * record has surviving variants but none can win resolution.
+	 */
+	getCanonicalModelSelections(options?: CanonicalModelQueryOptions): CanonicalModelSelection[] {
+		const filterPlan = this.#buildCanonicalVariantFilterPlan(options);
+		const providerRank = this.#providerRankMap(
+			this.#buildProviderSelectionPolicy(options?.credentialSessionId ?? options?.sessionId?.trim()),
+		);
+		const modelOrder = this.#catalogModelOrder();
+		const selections: CanonicalModelSelection[] = [];
+		for (const record of this.#canonicalIndex.records) {
+			const variants = this.#filterCanonicalVariants(record, options, filterPlan);
+			if (variants.length === 0) {
+				continue;
+			}
+			const resolved = this.#resolveCanonicalVariant(variants, options?.sessionId, {
+				providerRankFirst: true,
+				credentialSessionId: options?.credentialSessionId,
+				providerRank,
+				modelOrder,
+			});
+			if (resolved && options?.sessionId) this.#rememberCanonicalVariant(options.sessionId, resolved.selector);
+			selections.push({ record: { id: record.id, name: record.name, variants }, model: resolved?.model });
+		}
+		return selections;
 	}
 
 	getCanonicalVariants(canonicalId: string, options?: CanonicalModelQueryOptions): CanonicalModelVariant[] {

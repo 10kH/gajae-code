@@ -61,6 +61,7 @@ function createSelector(
 			hasConfiguredProviderAuth: () => false,
 			getDiscoverableProviders: () => [],
 			getCanonicalModels: () => [],
+			getCanonicalModelSelections: () => [],
 			resolveCanonicalModel: () => undefined,
 		} as unknown as ModelRegistry);
 	const ui = {
@@ -423,6 +424,16 @@ describe("ModelSelector canonical model selection", () => {
 					variants: [{ canonicalId: "claude-sonnet", selector: selectorValue, model, source: "bundled" }],
 				},
 			],
+			getCanonicalModelSelections: () => [
+				{
+					record: {
+						id: "claude-sonnet",
+						name: "Claude Sonnet",
+						variants: [{ canonicalId: "claude-sonnet", selector: selectorValue, model, source: "bundled" }],
+					},
+					model,
+				},
+			],
 			resolveCanonicalModel: () => model,
 		} as unknown as ModelRegistry;
 
@@ -470,6 +481,7 @@ describe("ModelSelector canonical model selection", () => {
 			getAvailable: () => availableModels,
 			getDiscoverableProviders: () => ["ollama-cloud"],
 			getCanonicalModels: () => [],
+			getCanonicalModelSelections: () => [],
 			resolveCanonicalModel: () => undefined,
 			getProviderDiscoveryState: () => ({
 				provider: "ollama-cloud",
@@ -503,7 +515,7 @@ describe("ModelSelector canonical model selection", () => {
 		await Bun.sleep(0);
 		installTestTheme();
 
-		expect(refreshProvider).toHaveBeenCalledWith("ollama-cloud");
+		expect(refreshProvider).toHaveBeenCalledWith("ollama-cloud", "online-if-uncached");
 		const rendered = normalizeRenderedText(selector.render(220).join("\n"));
 		expect(rendered).toContain("deepseek-v4-pro");
 		expect(rendered).not.toContain("Provider has not been refreshed yet");
@@ -887,6 +899,7 @@ describe("ModelSelector canonical model selection", () => {
 			hasConfiguredProviderAuth: () => false,
 			getDiscoverableProviders: () => [],
 			getCanonicalModels: () => [],
+			getCanonicalModelSelections: () => [],
 			resolveCanonicalModel: () => undefined,
 		} as unknown as ModelRegistry;
 
@@ -970,6 +983,7 @@ function createFastSelector(args: {
 		hasConfiguredProviderAuth: () => false,
 		getDiscoverableProviders: () => [],
 		getCanonicalModels: () => [],
+		getCanonicalModelSelections: () => [],
 		resolveCanonicalModel: () => undefined,
 	} as unknown as ModelRegistry;
 	const ui = { requestRender: vi.fn() } as unknown as TUI;

@@ -49,6 +49,13 @@ export interface ProviderDiscoveryCallbacks<TProvider extends DiscoveryProvider>
 	fetchModels: (provider: TProvider, apiKey: string | undefined) => Promise<Model<Api>[]>;
 	getEvidenceGeneration?: (provider: TProvider) => string;
 	canPublishCache?: (provider: TProvider) => boolean;
+	/**
+	 * Stable fingerprint of the discovery fetch context (credential evidence +
+	 * endpoint). When supplied, the published cache row records it alongside the
+	 * discovered model ids so a later `online-if-uncached` refresh can trust a
+	 * fresh cache instead of treating the ids as provenance-less and re-fetching.
+	 */
+	cacheDynamicModelProvenance?: string;
 }
 
 /** Owns configured discovery inputs, status, cache lifecycle, and refresh generations. */
@@ -99,15 +106,25 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 		this.#lastWarnings.delete(provider);
 	}
 
-	loadCached(provider: TProvider, cacheDbPath?: string): readonly Model<Api>[] {
+	loadCached(provider: TProvider, cacheDbPath?: string, expectedProvenance?: string): readonly Model<Api>[] {
 		const cache = readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
-		const models = applyFinalCodexGpt56ContextCap(cache?.models ?? []);
+		// A cache row whose dynamic models were discovered under a different
+		// request context (credential/endpoint/headers/shape fingerprint) must
+		// never seed the synchronous catalog: it belongs to a different
+		// discovery context (e.g. another tenant), not this one.
+		const provenanceMismatch =
+			cache !== null &&
+			(cache.dynamicModelIds === undefined ||
+				expectedProvenance === undefined ||
+				cache.dynamicModelProvenance !== expectedProvenance);
+		const usableCache = provenanceMismatch ? null : cache;
+		const models = applyFinalCodexGpt56ContextCap(usableCache?.models ?? []);
 		this.#states.set(provider.provider, {
 			provider: provider.provider,
-			status: cache ? "cached" : "idle",
+			status: usableCache ? "cached" : "idle",
 			optional: provider.optional ?? false,
-			stale: cache ? !cache.fresh || !cache.authoritative : false,
-			fetchedAt: cache?.updatedAt,
+			stale: usableCache ? !usableCache.fresh || !usableCache.authoritative : false,
+			fetchedAt: usableCache?.updatedAt,
 			models: models.map(model => model.id),
 		});
 		return this.#snapshot(models);
@@ -131,14 +148,20 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 	): Promise<DiscoveryMergeInput> {
 		const token = this.beginRefresh(provider.provider);
 		const cached = readModelCache<Api>(provider.provider, 24 * 60 * 60 * 1000, Date.now, callbacks.cacheDbPath);
-		const cachedModels = applyFinalCodexGpt56ContextCap(cached?.models ?? []);
+		const cacheEligible =
+			cached !== null &&
+			(callbacks.cacheDynamicModelProvenance === undefined ||
+				(cached.dynamicModelIds !== undefined &&
+					cached.dynamicModelProvenance === callbacks.cacheDynamicModelProvenance));
+		const eligibleCache = cacheEligible ? cached : null;
+		const cachedModels = applyFinalCodexGpt56ContextCap(eligibleCache?.models ?? []);
 		const unauthenticated = (models: readonly Model<Api>[]): DiscoveryMergeInput =>
 			this.#complete(token, models, {
 				provider: provider.provider,
 				status: "unauthenticated",
 				optional: provider.optional ?? false,
-				stale: cached !== null,
-				fetchedAt: cached?.updatedAt,
+				stale: eligibleCache !== null,
+				fetchedAt: eligibleCache?.updatedAt,
 				models: models.map(model => model.id),
 			});
 
@@ -166,6 +189,7 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 			staticModels: [],
 			cacheDbPath: callbacks.cacheDbPath,
 			cacheTtlMs: 24 * 60 * 60 * 1000,
+			cacheDynamicModelProvenance: callbacks.cacheDynamicModelProvenance,
 			canPublishCache: () =>
 				this.isCurrent(token) &&
 				(callbacks.getEvidenceGeneration === undefined ||
@@ -191,20 +215,27 @@ export class ModelDiscoveryManager<TProvider extends DiscoveryProvider> {
 				? "cached"
 				: "unavailable"
 			: strategy === "offline"
-				? cached
+				? eligibleCache
 					? "cached"
 					: "idle"
 				: result.models.length > 0
 					? result.stale
 						? "cached"
 						: "ok"
-					: "empty";
+					: result.fetched
+						? "empty"
+						: // No fetch happened (non-authoritative retry backoff, or an
+							// ineligible cache) and no eligible row served models: the
+							// provider is unvalidated, not authoritatively empty.
+							"unavailable";
 		const state: ProviderDiscoveryState = {
 			provider: provider.provider,
 			status,
 			optional: provider.optional ?? false,
 			stale: result.stale || status === "cached",
-			fetchedAt: error ? cached?.updatedAt : Date.now(),
+			// Cache-served refreshes did not fetch now: report the row's actual
+			// fetch time instead of laundering it through Date.now().
+			fetchedAt: error || !result.fetched ? eligibleCache?.updatedAt : Date.now(),
 			models: result.models.map(model => model.id),
 			error,
 		};

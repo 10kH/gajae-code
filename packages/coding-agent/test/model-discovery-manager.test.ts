@@ -92,7 +92,8 @@ describe("ModelDiscoveryManager", () => {
 		});
 		expect(failedResult).toMatchObject({
 			current: true,
-			state: { status: "cached", stale: true, error: "connection refused", models: ["live"] },
+			models: [],
+			state: { status: "unavailable", stale: true, error: "connection refused", models: [] },
 			warning: "connection refused",
 		});
 	});
