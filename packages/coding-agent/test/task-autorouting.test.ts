@@ -224,6 +224,8 @@ describe("G003 routing engine", () => {
 		const base = model("openrouter", "openai/gpt-4o");
 		const literal = model("openrouter", "openai/gpt-4o:extended");
 		expect(findRoutingSnapshotModel("openrouter/openai/gpt-4o:extended", [base, literal])).toBe(literal);
+		const thinking = model("anthropic", "claude-opus-5");
+		expect(findRoutingSnapshotModel("anthropic/claude-opus-5:max", [thinking])).toBe(thinking);
 	});
 
 	it("sanitizes routing summary attributes before noEscape interpolation", () => {

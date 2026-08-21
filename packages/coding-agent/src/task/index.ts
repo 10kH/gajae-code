@@ -35,6 +35,7 @@ import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" wit
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
+import { splitSelectorThinkingSuffix } from "../thinking";
 import { formatBytes, formatDuration } from "../tools/render-utils";
 import { escapeXmlAttribute } from "../utils/xml-escape";
 import {
@@ -513,8 +514,10 @@ export function findRoutingSnapshotModel(selector: string, routingSnapshot: read
 	return (
 		providerMatches.find(candidate => candidate.id === modelId) ??
 		providerMatches.find(candidate => {
-			const suffixMatch = modelId.match(/^(.*):(minimal|low|medium|high|xhigh)$/u);
-			return suffixMatch !== null && candidate.id === suffixMatch[1];
+			const suffix = splitSelectorThinkingSuffix(modelId);
+			return (
+				suffix.invalidSuffix === undefined && suffix.thinkingLevel !== undefined && candidate.id === suffix.selector
+			);
 		})
 	);
 }
