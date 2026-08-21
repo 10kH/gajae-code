@@ -2955,6 +2955,15 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 	};
 
 	for (const msg of transformedMessages) {
+		if (msg.role === "toolResult") {
+			pendingToolResults.push(msg);
+			msgIndex += 1;
+			continue;
+		}
+		// Flush pending tool results before any non-tool-result message so the
+		// batched outputs (and their collected image user message) stay directly
+		// after their assistant tool-call turn, never behind later turns (#4807).
+		flushPendingToolResults();
 		if (msg.role === "user" || msg.role === "developer") {
 			const providerPayload = (msg as { providerPayload?: AssistantMessage["providerPayload"] }).providerPayload;
 			const historyItems = getOpenAIResponsesHistoryItems(providerPayload, model.provider);
@@ -3023,17 +3032,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				messages.push(...outputItems);
 			}
 			msgIndex += 1;
-			continue;
 		}
-
-		if (msg.role === "toolResult") {
-			pendingToolResults.push(msg);
-			msgIndex += 1;
-			continue;
-		}
-		flushPendingToolResults();
-
-		msgIndex += 1;
 	}
 	flushPendingToolResults();
 

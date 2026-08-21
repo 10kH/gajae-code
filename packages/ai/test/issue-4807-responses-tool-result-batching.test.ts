@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { convertCodexResponsesMessages } from "../src/providers/openai-codex-responses";
 import { streamOpenAIResponses } from "../src/providers/openai-responses";
 import { appendResponsesToolResultMessages } from "../src/providers/openai-responses-shared";
 import type { AssistantMessage, Context, Model, ToolResultMessage } from "../src/types";
@@ -306,9 +307,12 @@ describe("issue #4807: parallel image tool results keep tool_result adjacency", 
 			customCallIds,
 		);
 
-		expect(messages.map(m => (m as { type: string }).type)).toEqual([
+		// The image-bearing batch emits outputs first, then exactly one trailing
+		// user message carrying the collected image blocks.
+		expect(messages.map(m => (m as { type?: string; role?: string }).type ?? "user")).toEqual([
 			"function_call_output",
 			"custom_tool_call_output",
+			"user",
 		]);
 		expect((messages[0] as { call_id: string }).call_id).toBe("call_A");
 		expect((messages[1] as { call_id: string }).call_id).toBe("call_C");
@@ -318,5 +322,42 @@ describe("issue #4807: parallel image tool results keep tool_result adjacency", 
 		expect(userMessages).toHaveLength(1);
 		const imageMessage = userMessages[0] as { content: Array<Record<string, unknown>> };
 		expect(imageMessage.content.filter(c => c.type === "input_image")).toHaveLength(1);
+	});
+
+	it("Codex converter flushes batched outputs before the next user message, not at the end", () => {
+		const codexModel = {
+			...makeVisionModel(),
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+		} as unknown as Model<"openai-codex-responses">;
+		const codexAssistant: AssistantMessage = {
+			...makeAssistant(),
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+		};
+		const items = convertCodexResponsesMessages(codexModel, {
+			messages: [
+				{ role: "user", content: "render both", timestamp: 0 },
+				codexAssistant,
+				makeImageResult("call_B", "saved b", PNG_B),
+				makeImageResult("call_A", "saved a", PNG_A),
+				{ role: "user", content: "next turn", timestamp: 5 },
+			],
+		} as Context);
+
+		// Outputs (and the collected image user message) must land directly after
+		// the assistant tool-call turn — never behind the following user turn.
+		const kinds = items.map(
+			item => (item as { type?: string; role?: string }).type ?? (item as { role: string }).role,
+		);
+		expect(kinds).toEqual([
+			"user",
+			"function_call",
+			"function_call",
+			"function_call_output",
+			"function_call_output",
+			"user", // collected images
+			"user", // next turn
+		]);
 	});
 });
