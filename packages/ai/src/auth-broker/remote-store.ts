@@ -75,7 +75,18 @@ const BACKGROUND_BACKOFF_MAX_MS = 30_000;
 const PRESENTATION_FRESH_MS = 5 * 60_000;
 const PRESENTATION_RETENTION_MS = 24 * 60 * 60_000;
 const PRESENTATION_SIDECAR_VERSION = 1;
-const DEFAULT_PRESENTATION_SIDECAR = path.join(getConfigRootDir(), "auth-broker-presentations.json");
+/**
+ * Default location of the redacted presentation sidecar.
+ *
+ * Derived when a store is constructed, never at import time: the trusted
+ * config root is call-time state (#4761, #4772), so an import-time constant
+ * keeps pointing at the home that was in effect when this module first loaded
+ * and a process can read and write one logical profile through two different
+ * roots (#4786).
+ */
+function defaultPresentationSidecarPath(): string {
+	return path.join(getConfigRootDir(), "auth-broker-presentations.json");
+}
 
 function emptySnapshot(): SnapshotResponse {
 	return {
@@ -194,7 +205,7 @@ export class RemoteAuthCredentialStore implements AuthCredentialStore {
 	constructor(opts: RemoteAuthCredentialStoreOptions) {
 		this.#client = opts.client;
 		this.#streamSnapshots = opts.streamSnapshots ?? true;
-		this.#presentationPath = opts.presentationPath ?? DEFAULT_PRESENTATION_SIDECAR;
+		this.#presentationPath = opts.presentationPath ?? defaultPresentationSidecarPath();
 		this.#presentationAuthority = createHash("sha256").update(this.#client.baseUrl).digest("hex");
 		this.#applySnapshot(opts.initialSnapshot ?? emptySnapshot(), opts.initialSnapshot?.generation ?? 0, false);
 		this.#setInventoryState("pending", this.#generation, {
