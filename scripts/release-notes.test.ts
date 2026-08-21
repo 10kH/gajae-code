@@ -25,6 +25,7 @@ function pullRequest(
 	commitSubjects: readonly string[],
 	author = "Yeachan-Heo",
 	commitOids?: readonly string[],
+	mergeCommitOid?: string,
 ): CandidatePullRequest {
 	return {
 		number,
@@ -32,6 +33,7 @@ function pullRequest(
 		author,
 		commitSubjects,
 		commitOids: commitOids ?? commitSubjects.map((_, index) => `${number}-oid-${index}`),
+		...(mergeCommitOid === undefined ? {} : { mergeCommitOid }),
 	};
 }
 
@@ -81,6 +83,11 @@ describe("shipped coverage", () => {
 	test("treats a pull request with no commits as unshipped instead of dividing by zero", () => {
 		expect(shippedCoverage(pullRequest(1, "empty", []), new Set(["a"]))).toBe(0);
 	});
+
+	test("accepts a shipped squash commit when branch OIDs differ", () => {
+		const pr = pullRequest(4608, "fix(provider): squash the release fix", ["branch commit"], "Yeachan-Heo", ["branch-oid"], "squash-oid");
+		expect(shippedCoverage(pr, new Set(["squash-oid"]))).toBe(1);
+	});
 });
 
 describe("attribution", () => {
@@ -111,6 +118,20 @@ describe("attribution", () => {
 		);
 
 		expect(attribution).toEqual({ kind: "commit", commit: shipped });
+	});
+
+	test("credits a referenced pull request through its squash commit", () => {
+		const referenced = pullRequest(4668, "fix(ai): squash attribution", ["branch commit"], "Yeachan-Heo", ["branch-oid"], "squash-oid");
+		const shipped = commit("squash-oid", "fix(ai): squash attribution (#4668)");
+
+		const attribution = attributeCommit(
+			shipped,
+			{ candidatesBySha: new Map(), pullRequestsByNumber: new Map([[4668, referenced]]) },
+			new Set([normalizeSubject(shipped.subject)]),
+			new Set(["squash-oid"]),
+		);
+
+		expect(attribution).toEqual({ kind: "pull-request", pullRequest: referenced });
 	});
 
 	test("rejects a containing pull request the release does not ship", () => {

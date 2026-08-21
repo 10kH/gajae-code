@@ -19,8 +19,9 @@
  *     can still be the only candidate.
  *
  * So a candidate pull request is accepted only when this release actually
- * ships it (see `SHIPPED_COVERAGE_THRESHOLD`); otherwise the entry falls back
- * to a commit link, which can never advertise unshipped work.
+ * ships it (see `SHIPPED_COVERAGE_THRESHOLD`), including the squash/merge OID
+ * GitHub assigns when a PR lands; otherwise the entry falls back to a commit
+ * link, which can never advertise unshipped work.
  *
  * Usage:
  *   bun scripts/release-notes.ts --base <tag> --head <rev> --repo <owner/name> --out <path>
@@ -57,6 +58,8 @@ export interface CandidatePullRequest {
 	commitSubjects: readonly string[];
 	/** OIDs of every commit the pull request contains (coverage is by identity). */
 	commitOids: readonly string[];
+	/** Squash or merge commit OID on the target repository, when GitHub provides it. */
+	mergeCommitOid?: string;
 }
 
 export type Attribution =
@@ -88,11 +91,14 @@ export function parseSubjectPullRequestRef(subject: string): number | undefined 
 
 /**
  * Share of `pullRequest`'s commits this release ships, compared by commit
- * OID (cherry-pick origins included). Subject text cannot be used here:
+ * OID (cherry-pick origins included). A shipped squash/merge OID is definitive
+ * evidence even when none of the branch commit OIDs survive on the target
+ * branch. Subject text cannot be used here:
  * duplicate subjects would count one shipped commit multiple times and push
  * a partially shipped candidate over the credit threshold.
  */
 export function shippedCoverage(pullRequest: CandidatePullRequest, shippedOids: ReadonlySet<string>): number {
+	if (pullRequest.mergeCommitOid !== undefined && shippedOids.has(pullRequest.mergeCommitOid)) return 1;
 	if (pullRequest.commitOids.length === 0) return 0;
 	let shipped = 0;
 	for (const oid of pullRequest.commitOids) {
@@ -104,8 +110,9 @@ export function shippedCoverage(pullRequest: CandidatePullRequest, shippedOids: 
 /**
  * A subject-embedded `(#N)` identifies the intended pull request, but it is
  * credited only when the release ships at least the same coverage threshold
- * as an API-discovered candidate. Otherwise the smallest candidate this
- * release actually ships wins, and an unshipped candidate is rejected.
+ * as an API-discovered candidate, including its squash/merge OID. Otherwise
+ * the smallest candidate this release actually ships wins, and an unshipped
+ * candidate is rejected.
  */
 export function attributeCommit(
 	commit: ReleaseCommit,
@@ -243,12 +250,15 @@ async function loadPullRequest(repo: string, number: number): Promise<CandidateP
 		author: { login: string };
 		commits: { messageHeadline: string; oid: string }[];
 	};
+	const mergeCommitRaw = await gh(["api", `repos/${repo}/pulls/${number}`, "--jq", ".merge_commit_sha // \"\""]);
+	const mergeCommitOid = mergeCommitRaw.trim();
 	return {
 		number: parsed.number,
 		title: parsed.title,
 		author: parsed.author.login,
 		commitSubjects: parsed.commits.map(commit => commit.messageHeadline),
 		commitOids: parsed.commits.map(commit => commit.oid),
+		...(mergeCommitOid === "" ? {} : { mergeCommitOid }),
 	};
 }
 
