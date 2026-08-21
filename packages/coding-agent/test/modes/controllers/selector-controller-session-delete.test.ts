@@ -11,6 +11,7 @@ type TestContext = InteractiveModeContext & {
 	editorContainer: {
 		children: unknown[];
 		clear: () => void;
+		detachChild: (child: unknown) => void;
 		addChild: (child: unknown) => void;
 	};
 };

@@ -504,6 +504,10 @@ export class MCPCommandController {
 		);
 
 		// Replace editor with wizard
+		// The composer is reusable across overlays; detach it before clearing so
+		// clear() disposes only the transient wizard, not the editor's
+		// tab-width listener / paste state (disposal is terminal).
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(wizard);
 		this.ctx.ui.setFocus(wizard);

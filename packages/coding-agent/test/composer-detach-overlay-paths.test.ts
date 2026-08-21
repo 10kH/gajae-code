@@ -1,22 +1,28 @@
 import { describe, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Container, Input } from "@gajae-code/tui";
-import { getAgentDir, getLogsDir, setAgentDir, setDefaultTabWidth } from "@gajae-code/utils";
+import { getAgentDir, getDefaultTabWidth, getLogsDir, setAgentDir, setDefaultTabWidth } from "@gajae-code/utils";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { AsyncJobManager } from "../src/async";
 import { DebugSelectorComponent } from "../src/debug";
 import { DebugLogViewerComponent } from "../src/debug/log-viewer";
 import { RawSseViewerComponent } from "../src/debug/raw-sse";
+import { BorderedLoader } from "../src/modes/components/bordered-loader";
 import { CustomEditor } from "../src/modes/components/custom-editor";
+import { PetFramedEditor } from "../src/modes/components/gajae-pet-widget";
 import { JobsOverlayComponent } from "../src/modes/components/jobs-overlay";
+import { MCPAddWizard } from "../src/modes/components/runtime-mcp-add-wizard";
 import { TasksPaneComponent } from "../src/modes/components/tasks-pane";
+import { CommandController } from "../src/modes/controllers/command-controller";
+import { MCPCommandController } from "../src/modes/controllers/runtime-mcp-command-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { JobsObserver } from "../src/modes/jobs-observer";
 import { SessionObserverRegistry } from "../src/modes/session-observer-registry";
 import { TasksAggregator } from "../src/modes/tasks-aggregator";
-import { getThemeByName, setThemeInstance } from "../src/modes/theme/theme";
+import { getCurrentThemeName, getThemeByName, initTheme, setTheme, setThemeInstance } from "../src/modes/theme/theme";
 import type { InteractiveModeContext } from "../src/modes/types";
 
 const testTheme = await getThemeByName("red-claw");
@@ -32,8 +38,9 @@ if (!testTheme) throw new Error("Failed to load red-claw test theme");
  * attached silently kills that listener; every later restore re-mounts a dead
  * editor and runtime tab-width changes stop re-deriving composer layout.
  *
- * Each test drives the exact production open path through SelectorController
- * (or DebugSelectorComponent for the /debug viewers), closes it the way
+ * Each test drives the exact production open path through its real controller
+ * (SelectorController, CommandController, MCPCommandController, or
+ * DebugSelectorComponent for the /debug viewers), closes it the way
  * production closes it, and then asserts the composer's tab-width listener
  * still fires across overlay cycles — the invalidation probe from
  * gajae-pet-widget.test.ts. The trailing "red control" block proves the probe
@@ -41,8 +48,10 @@ if (!testTheme) throw new Error("Failed to load red-claw test theme");
  */
 
 const CANCEL_KEY = "\u001b";
+const CTRL_C_KEY = "\x03";
 const SELECT_CONFIRM_KEY = "\r";
 const SELECT_DOWN_KEY = "\u001b[B";
+const WAIT_TIMEOUT_MS = 5_000;
 
 function countInvalidations(editor: CustomEditor): { count: number } {
 	const invalidations = { count: 0 };
@@ -124,16 +133,114 @@ function expectDisposedEditorStopsInvalidating(
 	expect(invalidations.count).toBe(disposedCount);
 }
 
+/**
+ * Bounded condition wait: no unbounded polls and no fixed timing assumptions.
+ * Fails loudly with `description` when the condition never holds.
+ */
+async function waitUntil(condition: () => boolean, description: string): Promise<void> {
+	const deadline = Date.now() + WAIT_TIMEOUT_MS;
+	while (!condition()) {
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${description}`);
+		await Bun.sleep(1);
+	}
+}
+
+/** Process-global state this fixture mutates, snapshotted for exact restore. */
+interface LifecycleGlobalsSnapshot {
+	tabWidth: number;
+	themeName: string | undefined;
+}
+
+/**
+ * Snapshot the fixture's process-global state before a test mutates it, so
+ * the finally block restores the exact prior values instead of hard-resetting
+ * theme/tab width to constants and leaking them into later suites.
+ */
+function snapshotLifecycleGlobals(): LifecycleGlobalsSnapshot {
+	return { tabWidth: getDefaultTabWidth(), themeName: getCurrentThemeName() };
+}
+
+/** Exact-inverse restore of {@link snapshotLifecycleGlobals}. */
+async function restoreLifecycleGlobals(snapshot: LifecycleGlobalsSnapshot): Promise<void> {
+	setDefaultTabWidth(snapshot.tabWidth);
+	// The theme module exposes no live-instance getter, so restore through its
+	// public API: a real prior name reloads that theme, and an unresolvable
+	// prior (never initialized, or another suite's in-memory instance) falls
+	// back to the canonical initTheme() default state.
+	if (snapshot.themeName && snapshot.themeName !== "<in-memory>") {
+		await setTheme(snapshot.themeName);
+	} else {
+		await initTheme();
+	}
+}
+
+function restoreEnvVar(name: string, original: string | undefined): void {
+	if (original === undefined) delete process.env[name];
+	else process.env[name] = original;
+}
+
+/**
+ * Pin the config-root and agent-dir resolution to exclusively owned
+ * directories for one test.
+ *
+ * Both config-dir selectors (`GJC_CONFIG_DIR` and its legacy alias
+ * `PI_CONFIG_DIR`) are pinned to the same per-run unique name — `GJC_CONFIG_DIR`
+ * takes precedence, so pinning only the alias would let a caller-provided
+ * override redirect resolution (and cleanup) outside this run's tree. The
+ * agent directory gets its own mkdtemp root. The resolved config root is
+ * asserted to sit inside the exclusive name before anything is seeded, so a
+ * resolver that refuses the override (e.g. a project-env provenance clash)
+ * fails the test loudly instead of touching the real `~/.gjc`. The returned
+ * restore closure puts the exact prior environment and agent directory back
+ * and removes both exclusive trees.
+ */
+async function pinExclusiveDirState(): Promise<{ restore: () => Promise<void> }> {
+	const originalAgentDir = getAgentDir();
+	const originalConfigDir = process.env.PI_CONFIG_DIR;
+	const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
+	const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
+	const agentRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-composer-detach-agent-"));
+	const configName = `gjc-composer-detach-${randomUUID()}`;
+	process.env.GJC_CONFIG_DIR = configName;
+	process.env.PI_CONFIG_DIR = configName;
+	setAgentDir(agentRoot);
+	const exclusiveRoot = path.join(os.homedir(), configName);
+	const configRoot = path.dirname(getLogsDir());
+	if (!configRoot.startsWith(exclusiveRoot)) {
+		throw new Error(`config root ${configRoot} escaped the exclusive test tree ${exclusiveRoot}`);
+	}
+	return {
+		restore: async () => {
+			restoreEnvVar("PI_CONFIG_DIR", originalConfigDir);
+			restoreEnvVar("GJC_CONFIG_DIR", originalGjcConfigDir);
+			// setAgentDir re-exports GJC_CODING_AGENT_DIR, so restore it after.
+			setAgentDir(originalAgentDir);
+			restoreEnvVar("GJC_CODING_AGENT_DIR", originalCodingAgentDir);
+			await fs.rm(agentRoot, { recursive: true, force: true });
+			await fs.rm(configRoot, { recursive: true, force: true });
+		},
+	};
+}
+
+/** Seed today's dated log under an exclusive config root for #handleViewLogs. */
+async function seedExclusiveDatedLog(): Promise<void> {
+	const logsDir = getLogsDir();
+	await fs.mkdir(logsDir, { recursive: true });
+	const today = new Date().toISOString().slice(0, 10);
+	await Bun.write(path.join(logsDir, `gjc.${today}.log`), "seeded log line\n");
+}
+
 describe("reusable composer lifecycle across remaining overlay open paths (#4657)", () => {
-	test("jobs overlay open does not dispose the reusable composer", () => {
-		setThemeInstance(testTheme);
+	test("jobs overlay open does not dispose the reusable composer", async () => {
+		const globals = snapshotLifecycleGlobals();
 		const harness = makeComposerHarness();
 		const invalidations = countInvalidations(harness.editor);
 		const controller = new SelectorController(harness.ctx);
 		const defaultWidth = 3;
-		setDefaultTabWidth(defaultWidth);
 
 		try {
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
 			const observer = new JobsObserver(new AsyncJobManager({ onJobComplete: async () => {} }), undefined);
 			let previous = 0;
 			for (let cycle = 0; cycle < 4; cycle += 1) {
@@ -148,19 +255,21 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 			expect(previous).toBeGreaterThanOrEqual(4);
 			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
 		} finally {
-			setDefaultTabWidth(4);
+			harness.editorContainer.clear();
+			await restoreLifecycleGlobals(globals);
 		}
 	});
 
-	test("tasks pane open does not dispose the reusable composer", () => {
-		setThemeInstance(testTheme);
+	test("tasks pane open does not dispose the reusable composer", async () => {
+		const globals = snapshotLifecycleGlobals();
 		const harness = makeComposerHarness();
 		const invalidations = countInvalidations(harness.editor);
 		const controller = new SelectorController(harness.ctx);
 		const defaultWidth = 3;
-		setDefaultTabWidth(defaultWidth);
 
 		try {
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
 			const manager = new AsyncJobManager({ onJobComplete: async () => {} });
 			const observer = new JobsObserver(manager, undefined);
 			const aggregator = new TasksAggregator(manager, observer, new SessionObserverRegistry(), undefined);
@@ -177,37 +286,25 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 			expect(previous).toBeGreaterThanOrEqual(4);
 			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
 		} finally {
-			setDefaultTabWidth(4);
+			harness.editorContainer.clear();
+			await restoreLifecycleGlobals(globals);
 		}
 	});
 
 	test("debug log and raw-SSE viewer opens do not dispose the reusable composer", async () => {
-		setThemeInstance(testTheme);
+		const globals = snapshotLifecycleGlobals();
 		const { harness, controller } = makeDebugHarness();
 		const invalidations = countInvalidations(harness.editor);
 		const defaultWidth = 3;
-		setDefaultTabWidth(defaultWidth);
-
-		// Seed today's dated log under a per-run config dir so the real
-		// #handleViewLogs path mounts the real viewer without touching the
-		// operator's real ~/.gjc/logs. PI_CONFIG_DIR is a trusted single dir NAME
-		// (see dirs.ts getConfigDirName); a fresh resolver picks it up on
-		// setAgentDir, and cleanup removes the whole tree. Snapshot every piece
-		// of process-global directory state BEFORE mutating it and restore all
-		// of it in the finally below — setAgentDir also writes
-		// GJC_CODING_AGENT_DIR, so that env var is restored too.
-		const originalAgentDir = getAgentDir();
-		const originalConfigDir = process.env.PI_CONFIG_DIR;
-		const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
-		const configName = `gjc-test-composer-detach-${Date.now().toString(36)}`;
-		const today = new Date().toISOString().slice(0, 10);
+		// Seed today's dated log under an exclusively owned config root so the
+		// real #handleViewLogs path mounts the real viewer without touching the
+		// operator's real config tree.
+		const dirState = await pinExclusiveDirState();
 
 		try {
-			process.env.PI_CONFIG_DIR = configName;
-			setAgentDir(path.join(os.tmpdir(), configName));
-			const logsDir = getLogsDir();
-			await fs.mkdir(logsDir, { recursive: true });
-			await fs.writeFile(path.join(logsDir, `gjc.${today}.log`), "seeded log line\n", "utf8");
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
+			await seedExclusiveDatedLog();
 
 			// The production /debug entry: showDebugSelector goes through the real
 			// SelectorController.showSelector generic open boundary, so the open
@@ -230,18 +327,14 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 				selector.handleInput(SELECT_CONFIRM_KEY);
 				// DebugSelectorComponent calls done() (restore) then opens the real
 				// viewer through the exact production path under test.
-				const deadline = Date.now() + 2_000;
-				while (
-					(harness.editorContainer.children[0] === harness.editor ||
-						harness.editorContainer.children[0] instanceof DebugSelectorComponent) &&
-					Date.now() < deadline
-				) {
-					await Bun.sleep(1);
-				}
-				expect(harness.editorContainer.children.length).toBe(1);
+				await waitUntil(
+					() =>
+						harness.editorContainer.children.length === 1 &&
+						harness.editorContainer.children[0] !== harness.editor &&
+						!(harness.editorContainer.children[0] instanceof DebugSelectorComponent),
+					"the debug viewer to mount",
+				);
 				const viewer = harness.editorContainer.children[0];
-				expect(viewer).not.toBe(harness.editor);
-				expect(viewer).not.toBeInstanceOf(DebugSelectorComponent);
 				// Concrete per-branch proof BEFORE the shared lifecycle probe: the
 				// logs index must mount a DebugLogViewerComponent and the raw-SSE
 				// index a RawSseViewerComponent, so a menu reorder or dispatch
@@ -268,22 +361,212 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 			expect(previous).toBeGreaterThanOrEqual(4);
 			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
 		} finally {
-			if (originalConfigDir === undefined) delete process.env.PI_CONFIG_DIR;
-			else process.env.PI_CONFIG_DIR = originalConfigDir;
-			if (originalCodingAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
-			else process.env.GJC_CODING_AGENT_DIR = originalCodingAgentDir;
-			setAgentDir(originalAgentDir);
-			setDefaultTabWidth(4);
-			await fs.rm(path.join(os.homedir(), configName), { recursive: true, force: true });
+			harness.editorContainer.clear();
+			await dirState.restore();
+			await restoreLifecycleGlobals(globals);
+		}
+	});
+
+	test("stale /debug log load does not replace a newer overlay owner", async () => {
+		const globals = snapshotLifecycleGlobals();
+		const { harness, controller } = makeDebugHarness();
+		const invalidations = countInvalidations(harness.editor);
+		const defaultWidth = 3;
+		const dirState = await pinExclusiveDirState();
+
+		try {
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
+			await seedExclusiveDatedLog();
+
+			controller.showDebugSelector();
+			const selector = harness.editorContainer.children.find(child => child instanceof DebugSelectorComponent);
+			if (!selector) throw new Error("Expected the debug selector to mount");
+			// Select "logs" (menu index 5): onSelect restores the composer
+			// synchronously and then starts the async log-source load.
+			for (let step = 0; step < 5; step += 1) selector.handleInput(SELECT_DOWN_KEY);
+			selector.handleInput(SELECT_CONFIRM_KEY);
+			// Before any event-loop turn, a newer overlay seizes the editor
+			// container exactly as the production open paths do. The pending log
+			// load must then discard its viewer instead of clearing and mounting
+			// over the new owner.
+			const observer = new JobsObserver(new AsyncJobManager({ onJobComplete: async () => {} }), undefined);
+			controller.showJobsOverlay(observer);
+			const overlay = harness.editorContainer.children.find(
+				(child): child is JobsOverlayComponent => child instanceof JobsOverlayComponent,
+			);
+			if (!overlay) throw new Error("Expected the jobs overlay to mount");
+
+			// Settle window: the stale log continuation (if it wrongly mounts)
+			// runs within this bounded sleep; the assertion below is structural.
+			await Bun.sleep(100);
+			expect(harness.editorContainer.children).toEqual([overlay]);
+			// The composer stayed alive (detached, never disposed) and the newer
+			// owner was never cleared away.
+			const previous = expectTabWidthToggleInvalidates(invalidations, 0, defaultWidth);
+			expect(previous).toBeGreaterThan(0);
+			// Red control precondition: the composer must be mounted (not just
+			// alive-but-detached) for the disposed-editor probe, so close the
+			// overlay the production way first.
+			overlay?.handleInput(CANCEL_KEY);
+			expect(harness.editorContainer.children).toEqual([harness.editor]);
+			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
+		} finally {
+			harness.editorContainer.clear();
+			await dirState.restore();
+			await restoreLifecycleGlobals(globals);
+		}
+	});
+	test("/debug log viewer opens over the pet-wrapped composer", async () => {
+		const globals = snapshotLifecycleGlobals();
+		const harness = makeComposerHarness();
+		const invalidations = countInvalidations(harness.editor);
+		const defaultWidth = 3;
+		const dirState = await pinExclusiveDirState();
+
+		try {
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
+			await seedExclusiveDatedLog();
+
+			// Production pet path: InteractiveMode.restoreComposer delegates to
+			// GajaePetWidget.remountComposer, which re-adds the PetFramedEditor
+			// wrapper — not the bare editor — as the container's content. The
+			// wrapper has no dispose(), so clear() never disposes the editor,
+			// but a stale-owner guard that only checked for the bare editor as
+			// a direct child would refuse to mount the log viewer at all.
+			const framed = new PetFramedEditor(harness.editor);
+			const petCtx = {
+				...harness.ctx,
+				restoreComposer: () => {
+					harness.editorContainer.clear();
+					harness.editorContainer.addChild(framed);
+				},
+			} as unknown as InteractiveModeContext;
+			const controller = new SelectorController(petCtx);
+			const debugCtx = {
+				...petCtx,
+				showDebugSelector: () => controller.showDebugSelector(),
+			} as unknown as InteractiveModeContext;
+			const debugController = new SelectorController(debugCtx);
+
+			debugController.showDebugSelector();
+			const selector = harness.editorContainer.children.find(child => child instanceof DebugSelectorComponent);
+			if (!selector) throw new Error("Expected the debug selector to mount");
+			for (let step = 0; step < 5; step += 1) selector.handleInput(SELECT_DOWN_KEY);
+			selector.handleInput(SELECT_CONFIRM_KEY);
+			await waitUntil(
+				() => harness.editorContainer.children[0] instanceof DebugLogViewerComponent,
+				"the debug log viewer to mount over the pet-wrapped composer",
+			);
+			// The wrapped composer stayed alive while the viewer owns the container.
+			const previous = expectTabWidthToggleInvalidates(invalidations, 0, defaultWidth);
+			expect(previous).toBeGreaterThan(0);
+			// Production close: viewer exit re-opens the selector; canceling that
+			// restores through the pet-aware restoreComposer.
+			harness.editorContainer.children[0]?.handleInput?.(CANCEL_KEY);
+			expect(harness.editorContainer.children[0]).toBeInstanceOf(DebugSelectorComponent);
+			harness.editorContainer.children[0]?.handleInput?.(CANCEL_KEY);
+			expect(harness.editorContainer.children).toEqual([framed]);
+			const after = expectTabWidthToggleInvalidates(invalidations, previous, defaultWidth);
+			expect(after).toBeGreaterThan(previous);
+		} finally {
+			harness.editorContainer.clear();
+			await dirState.restore();
+			await restoreLifecycleGlobals(globals);
+		}
+	});
+
+	test("/share custom-share loader does not dispose the reusable composer", async () => {
+		const globals = snapshotLifecycleGlobals();
+		const harness = makeComposerHarness();
+		const invalidations = countInvalidations(harness.editor);
+		const defaultWidth = 3;
+		// loadCustomShare() resolves the handler from the agent directory; pin
+		// an exclusively owned root and seed a gated share.ts so the loader
+		// open state is observable before completion restores the composer.
+		const dirState = await pinExclusiveDirState();
+		const gateKey = `__gjcComposerDetachShareGate_${randomUUID()}`;
+		const shareGate = Promise.withResolvers<void>();
+		(globalThis as Record<string, unknown>)[gateKey] = shareGate.promise;
+		await Bun.write(
+			path.join(getAgentDir(), "share.ts"),
+			`export default async function () {\n\tawait (globalThis as any)["${gateKey}"];\n\treturn { message: "shared" };\n}\n`,
+		);
+
+		const shareCtx = {
+			...harness.ctx,
+			session: { exportToHtml: async () => {} },
+			openInBrowser: () => {},
+		} as unknown as InteractiveModeContext;
+		const controller = new CommandController(shareCtx);
+
+		try {
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
+			const shared = controller.handleShareCommand();
+			await waitUntil(
+				() => harness.editorContainer.children[0] instanceof BorderedLoader,
+				"the /share loader to mount",
+			);
+			expect(harness.editorContainer.children.length).toBe(1);
+			// The composer is detached, not disposed: the probe still fires while
+			// the loader owns the container.
+			let previous = expectTabWidthToggleInvalidates(invalidations, 0, defaultWidth);
+			// Release the custom share handler; production restores the composer.
+			shareGate.resolve();
+			await shared;
+			expect(harness.editorContainer.children).toEqual([harness.editor]);
+			previous = expectTabWidthToggleInvalidates(invalidations, previous, defaultWidth);
+			expect(previous).toBeGreaterThanOrEqual(2);
+			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
+		} finally {
+			shareGate.resolve();
+			delete (globalThis as Record<string, unknown>)[gateKey];
+			harness.editorContainer.clear();
+			await dirState.restore();
+			await restoreLifecycleGlobals(globals);
+		}
+	});
+
+	test("/mcp add wizard mount does not dispose the reusable composer", async () => {
+		const globals = snapshotLifecycleGlobals();
+		const harness = makeComposerHarness();
+		const invalidations = countInvalidations(harness.editor);
+		const controller = new MCPCommandController(harness.ctx);
+		const defaultWidth = 3;
+
+		try {
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
+			let previous = 0;
+			for (let cycle = 0; cycle < 2; cycle += 1) {
+				await controller.handle("/mcp add");
+				expect(harness.editorContainer.children.length).toBe(1);
+				expect(harness.editorContainer.children[0]).toBeInstanceOf(MCPAddWizard);
+				// The composer is detached, not disposed, while the wizard owns
+				// the container.
+				previous = expectTabWidthToggleInvalidates(invalidations, previous, defaultWidth);
+				// Production close: the wizard cancels through its interrupt key.
+				const wizard = harness.editorContainer.children[0];
+				expect(wizard).toBeInstanceOf(MCPAddWizard);
+				(wizard as MCPAddWizard).handleInput(CTRL_C_KEY);
+				expect(harness.editorContainer.children).toEqual([harness.editor]);
+				previous = expectTabWidthToggleInvalidates(invalidations, previous, defaultWidth);
+			}
+			expect(previous).toBeGreaterThanOrEqual(4);
+			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
+		} finally {
+			harness.editorContainer.clear();
+			await restoreLifecycleGlobals(globals);
 		}
 	});
 
 	test("OAuth API-key paste onPrompt does not dispose the reusable composer", async () => {
-		setThemeInstance(testTheme);
+		const globals = snapshotLifecycleGlobals();
 		const harness = makeComposerHarness();
 		const invalidations = countInvalidations(harness.editor);
 		const defaultWidth = 3;
-		setDefaultTabWidth(defaultWidth);
 
 		// Capture the production onPrompt callback (the exact closure under
 		// test) while stubbing everything around it.
@@ -316,23 +599,28 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 		const controller = new SelectorController(oauthCtx);
 
 		try {
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
 			let previous = 0;
 			for (let cycle = 0; cycle < 4; cycle += 1) {
 				const opened = controller.showOAuthSelector("login", "vllm");
 				// Drive the captured production onPrompt until the code input
 				// mounts (the promise resolves on submit).
 				const promptPromise = (async () => {
-					while (capturedPrompts.length === 0) await Bun.sleep(1);
+					await waitUntil(() => capturedPrompts.length > 0, "the production onPrompt callback");
 					const onPrompt = capturedPrompts.shift();
 					if (!onPrompt) throw new Error("Expected a captured onPrompt callback");
 					return onPrompt({ message: "Paste your API key" });
 				})();
-				await Bun.sleep(5);
-				// Find the mounted code Input and submit through it.
-				const codeInput = oauthCtx.editorContainer.children.find(
-					(child): child is Input =>
-						child instanceof Input && typeof (child as { onSubmit?: unknown }).onSubmit === "function",
-				);
+				// Find the mounted code Input through a bounded mount wait, not a
+				// fixed sleep.
+				const findCodeInput = (): Input | undefined =>
+					oauthCtx.editorContainer.children.find(
+						(child): child is Input =>
+							child instanceof Input && typeof (child as { onSubmit?: unknown }).onSubmit === "function",
+					);
+				await waitUntil(() => findCodeInput() !== undefined, "the API-key code input to mount");
+				const codeInput = findCodeInput();
 				if (!codeInput) throw new Error("Expected the API-key code input to mount");
 				for (const character of "sk-test") codeInput.handleInput(character);
 				codeInput.handleInput("\r");
@@ -344,7 +632,8 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 			expect(previous).toBeGreaterThanOrEqual(4);
 			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
 		} finally {
-			setDefaultTabWidth(4);
+			harness.editorContainer.clear();
+			await restoreLifecycleGlobals(globals);
 		}
 	});
 });

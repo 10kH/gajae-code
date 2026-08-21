@@ -17,6 +17,12 @@ function createContainer() {
 		addChild(child: unknown) {
 			this.children.push(child);
 		},
+		// Non-disposing detach, matching the Container contract the /share open
+		// paths rely on to keep the reusable composer alive across the loader.
+		detachChild(child: unknown) {
+			const index = this.children.indexOf(child);
+			if (index !== -1) this.children.splice(index, 1);
+		},
 		clear() {
 			this.children = [];
 		},

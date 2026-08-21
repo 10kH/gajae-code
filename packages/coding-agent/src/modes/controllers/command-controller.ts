@@ -188,6 +188,10 @@ export class CommandController {
 			const customShare = await loadCustomShare();
 			if (customShare) {
 				const loader = new BorderedLoader(this.ctx.ui, theme, "Sharing...");
+				// The composer is reusable across overlays; detach it before clearing so
+				// clear() disposes only the transient loader, not the editor's
+				// tab-width listener / paste state (disposal is terminal).
+				this.ctx.editorContainer.detachChild(this.ctx.editor);
 				this.ctx.editorContainer.clear();
 				this.ctx.editorContainer.addChild(loader);
 				this.ctx.ui.setFocus(loader);
@@ -244,6 +248,10 @@ export class CommandController {
 			return;
 		}
 
+		// The composer is reusable across overlays; detach it before clearing so
+		// clear() disposes only the transient loader, not the editor's
+		// tab-width listener / paste state (disposal is terminal).
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		const loader = new BorderedLoader(this.ctx.ui, theme, "Creating gist...");
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(loader);
