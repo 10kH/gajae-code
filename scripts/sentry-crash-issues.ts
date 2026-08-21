@@ -70,6 +70,17 @@ const MAX_PERMALINK_PATH_LENGTH = 2048;
 const MAX_ISSUE_BODY_BYTES = 48 * 1024;
 const SENTRY_LEVELS = new Set(["fatal", "error", "warning", "info", "debug"]);
 const SENTRY_SLUG = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ATTEMPT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const TRUSTED_GH_ROOTS = [
+	"/usr/bin/",
+	"/usr/local/bin/",
+	"/opt/homebrew/bin/",
+	"/opt/homebrew/Cellar/",
+	"/home/linuxbrew/.linuxbrew/bin/",
+	"/home/linuxbrew/.linuxbrew/Cellar/",
+	"C:\\Program Files\\GitHub CLI\\",
+	"C:\\Program Files (x86)\\GitHub CLI\\",
+] as const;
 const GH_ENV_ALLOWLIST = [
 	"PATH",
 	"HOME",
@@ -266,7 +277,7 @@ function renderCrashText(value: string, fallback: string): string {
 	return fenceCrashText(sanitizeField(value, fallback).replace(CRASH_MARKER_PATTERN, "<marker removed>"));
 }
 
-const COARSE_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const SENTRY_TIMESTAMP = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})?)?$/;
 const SHORT_ID = /^[\w.-]{1,32}$/;
 
 /**
@@ -285,9 +296,11 @@ export function toSentryIssue(raw: unknown): SentryIssue | undefined {
 	if (!shortId || !id || !SHORT_ID.test(shortId) || !/^\d{1,20}$/.test(id)) return undefined;
 	const count = asString(record.count);
 	if (count !== "" && !/^\d{1,12}$/.test(count)) return undefined;
-	const firstSeen = asString(record.firstSeen).slice(0, 10);
-	const lastSeen = asString(record.lastSeen).slice(0, 10);
-	if ((firstSeen && !COARSE_DATE.test(firstSeen)) || (lastSeen && !COARSE_DATE.test(lastSeen))) return undefined;
+	const firstSeenRaw = asString(record.firstSeen);
+	const lastSeenRaw = asString(record.lastSeen);
+	if ((firstSeenRaw && !SENTRY_TIMESTAMP.test(firstSeenRaw)) || (lastSeenRaw && !SENTRY_TIMESTAMP.test(lastSeenRaw))) return undefined;
+	const firstSeen = firstSeenRaw.slice(0, 10);
+	const lastSeen = lastSeenRaw.slice(0, 10);
 	const permalinkRaw = asString(record.permalink);
 	let permalink = "";
 	if (permalinkRaw) {
@@ -355,7 +368,8 @@ export async function fingerprintOf(issueId: string, token: string): Promise<Fin
 }
 
 async function gh(args: readonly string[]): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-	const child = Bun.spawn(["gh", ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore", env: ghChildEnv(Bun.env) });
+	const executable = await trustedGhExecutable();
+	const child = Bun.spawn([executable, ...args], { stdout: "pipe", stderr: "pipe", stdin: "ignore", env: ghChildEnv(Bun.env) });
 	const timer = setTimeout(() => child.kill(), GH_TIMEOUT_MS);
 	try {
 		const [stdout, stderr, exitCode] = await Promise.all([
@@ -367,6 +381,17 @@ async function gh(args: readonly string[]): Promise<{ ok: boolean; stdout: strin
 	} finally {
 		clearTimeout(timer);
 	}
+}
+
+async function trustedGhExecutable(): Promise<string> {
+	const resolved = Bun.which("gh");
+	if (!resolved) throw new Error("gh executable was not found in a trusted system path");
+	const realPath = await fs.realpath(resolved).catch(() => "");
+	if (!realPath || !TRUSTED_GH_ROOTS.some(root => realPath.startsWith(root)))
+		throw new Error("gh executable was not found in a trusted system path");
+	const stat = await fs.stat(realPath).catch(() => undefined);
+	if (!stat?.isFile() || (stat.mode & 0o111) === 0) throw new Error("gh executable was not found in a trusted system path");
+	return realPath;
 }
 
 /**
@@ -499,8 +524,9 @@ export interface ApprovalStore {
 	hasAnyFiled(manifest: ApprovalManifest): Promise<boolean>;
 	recordFiled(manifest: ApprovalManifest, url: string): Promise<void>;
 	hasPending(manifest: ApprovalManifest): Promise<boolean>;
+	pendingAttempt(manifest: ApprovalManifest): Promise<string | undefined>;
 	recordPending(manifest: ApprovalManifest): Promise<void>;
-	clearPending(manifest: ApprovalManifest): Promise<void>;
+	clearPending(manifest: ApprovalManifest, attemptId: string): Promise<boolean>;
 }
 
 export interface ApprovalManifest {
@@ -515,7 +541,7 @@ export interface ApprovalManifest {
 interface StoredApprovals {
 	approvals: ApprovalManifest[];
 	filed: { manifest: ApprovalManifest; url: string }[];
-	pending: ApprovalManifest[];
+	pending: { manifest: ApprovalManifest; attemptId: string }[];
 }
 
 function digest(parts: readonly string[]): string {
@@ -525,6 +551,11 @@ function digest(parts: readonly string[]): string {
 		hasher.update("\n");
 	}
 	return hasher.digest("hex");
+}
+
+function legacyPendingAttemptId(manifest: ApprovalManifest): string {
+	const hex = digest([JSON.stringify(manifest)]);
+	return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
 export function approvalManifest(row: TriageRow, options: Options): ApprovalManifest {
@@ -570,6 +601,12 @@ function isManifest(value: unknown): value is ApprovalManifest {
 	);
 }
 
+function isPending(value: unknown): value is { manifest: ApprovalManifest; attemptId: string } {
+	if (typeof value !== "object" || value === null) return false;
+	const record = value as { manifest?: unknown; attemptId?: unknown };
+	return isManifest(record.manifest) && typeof record.attemptId === "string" && ATTEMPT_ID.test(record.attemptId);
+}
+
 async function loadStoredApprovals(): Promise<StoredApprovals> {
 	const target = approvalStorePath();
 	const directory = path.dirname(target);
@@ -595,7 +632,13 @@ async function loadStoredApprovals(): Promise<StoredApprovals> {
 							typeof (value as { url?: unknown }).url === "string",
 					)
 				: [],
-			pending: Array.isArray(record.pending) ? record.pending.filter(isManifest) : [],
+			pending: Array.isArray(record.pending)
+				? record.pending.flatMap(value => {
+						if (isPending(value)) return [value];
+						if (isManifest(value)) return [{ manifest: value, attemptId: legacyPendingAttemptId(value) }];
+						return [];
+					})
+				: [],
 		};
 	} catch {
 		return { approvals: [], filed: [], pending: [] };
@@ -815,25 +858,31 @@ export const fileApprovalStore: ApprovalStore = {
 			const stored = await loadStoredApprovals();
 			if (!stored.filed.some(entry => entry.url === url && sameManifest(entry.manifest, manifest)))
 				stored.filed.push({ manifest, url });
-			stored.pending = stored.pending.filter(saved => !sameManifest(saved, manifest));
+			stored.pending = stored.pending.filter(saved => !sameManifest(saved.manifest, manifest));
 			await writeStoredApprovals(stored);
 		});
 	},
 	async hasPending(manifest: ApprovalManifest): Promise<boolean> {
-		return (await loadStoredApprovals()).pending.some(saved => sameManifest(saved, manifest));
+		return (await this.pendingAttempt(manifest)) !== undefined;
+	},
+	async pendingAttempt(manifest: ApprovalManifest): Promise<string | undefined> {
+		return (await loadStoredApprovals()).pending.find(saved => sameManifest(saved.manifest, manifest))?.attemptId;
 	},
 	async recordPending(manifest: ApprovalManifest): Promise<void> {
 		await withStoreMutation(async () => {
 			const stored = await loadStoredApprovals();
-			if (!stored.pending.some(saved => sameManifest(saved, manifest))) stored.pending.push(manifest);
+			if (!stored.pending.some(saved => sameManifest(saved.manifest, manifest))) stored.pending.push({ manifest, attemptId: randomUUID() });
 			await writeStoredApprovals(stored);
 		});
 	},
-	async clearPending(manifest: ApprovalManifest): Promise<void> {
-		await withStoreMutation(async () => {
+	async clearPending(manifest: ApprovalManifest, attemptId: string): Promise<boolean> {
+		return withStoreMutation(async () => {
 			const stored = await loadStoredApprovals();
-			stored.pending = stored.pending.filter(saved => !sameManifest(saved, manifest));
+			const before = stored.pending.length;
+			stored.pending = stored.pending.filter(saved => !(sameManifest(saved.manifest, manifest) && saved.attemptId === attemptId));
+			if (stored.pending.length === before) return false;
 			await writeStoredApprovals(stored);
+			return true;
 		});
 	},
 };
@@ -1015,26 +1064,41 @@ export async function main(argv: readonly string[], dependencies: MainDependenci
 			dependencies.writeStderr("--retry-pending must name a fingerprint present in this batch.\n");
 			return 2;
 		}
-		if (!(await dependencies.approvals.hasPending(manifest))) {
+		const pendingAttempt = await dependencies.approvals.pendingAttempt(manifest);
+		if (pendingAttempt === undefined) {
 			dependencies.writeStderr("--retry-pending names no in-flight create record for the currently rendered row.\n");
 			return 2;
 		}
-		await dependencies.approvals.clearPending(manifest);
+		const cleared = await dependencies.withCreationLock(() => dependencies.approvals.clearPending(manifest, pendingAttempt));
+		if (!cleared) {
+			dependencies.writeStderr("--retry-pending refused to clear a newer in-flight create record. Reconcile the current attempt explicitly.\n");
+			return 1;
+		}
 		dependencies.writeStdout(`cleared the in-flight create record for ${options.retryPending}; --apply may retry it.\n`);
 		return incomplete ? 1 : 0;
 	}
 
 	if (options.acknowledge !== undefined) {
-		const match = untrustedBodyMarkers.find(row => row.existingIssueUrl === options.acknowledge);
+		const acknowledgeUrl = options.acknowledge;
+		const match = untrustedBodyMarkers.find(row => row.existingIssueUrl === acknowledgeUrl);
 		if (!match) {
 			dependencies.writeStderr("--acknowledge must exactly match one currently withheld issue URL.\n");
 			return 2;
 		}
 		const manifest = manifests.get(match);
 		if (!manifest) return 1;
-		await dependencies.approvals.recordFiled(manifest, options.acknowledge);
-		await dependencies.approvals.consume(manifest);
-		dependencies.writeStdout(`acknowledged ${match.fingerprint} at ${options.acknowledge}\n`);
+		const acknowledged = await dependencies.withCreationLock(async () => {
+			const current = await dependencies.findExistingIssue(options.repo, match.fingerprint);
+			if (current.kind !== "untrusted" || current.url !== acknowledgeUrl) return false;
+			await dependencies.approvals.recordFiled(manifest, acknowledgeUrl);
+			await dependencies.approvals.consume(manifest);
+			return true;
+		});
+		if (!acknowledged) {
+			dependencies.writeStderr("--acknowledge refused because the exact issue URL is no longer the current withheld match.\n");
+			return 1;
+		}
+		dependencies.writeStdout(`acknowledged ${match.fingerprint} at ${acknowledgeUrl}\n`);
 		// The acknowledged row is still in this run's withheld set (it leaves on
 		// the next run), so it must not keep the run incomplete.
 		return skippedMalformed > 0 || collisions.length > 0 || unverified.length > 0 || untrustedBodyMarkers.length > 1 ? 1 : 0;

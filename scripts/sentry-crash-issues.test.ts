@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -178,6 +179,7 @@ describe("toSentryIssue", () => {
 		expect(toSentryIssue({ ...valid, shortId: "bad id!" })).toBeUndefined();
 		expect(toSentryIssue({ ...valid, shortId: "x".repeat(33) })).toBeUndefined();
 		expect(toSentryIssue({ ...valid, firstSeen: "garbage-day!" })).toBeUndefined();
+		expect(toSentryIssue({ ...valid, firstSeen: "2026-08-17 forged" })).toBeUndefined();
 		expect(toSentryIssue({ ...valid, permalink: "https://evil.example/i?token=1" })).toBeUndefined();
 		expect(toSentryIssue({ ...valid, permalink: "javascript:alert(1)" })).toBeUndefined();
 	});
@@ -379,7 +381,7 @@ describe("main orchestration", () => {
 			? [approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options())]
 			: [];
 		const filed: { manifest: ApprovalManifest; url: string }[] = [];
-		const pending: ApprovalManifest[] = [];
+		const pending: { manifest: ApprovalManifest; attemptId: string }[] = [];
 		return {
 			stdout,
 			stderr,
@@ -408,13 +410,15 @@ describe("main orchestration", () => {
 					recordFiled: async (manifest, url) => {
 						filed.push({ manifest, url });
 					},
-					hasPending: async manifest => pending.some(candidate => JSON.stringify(candidate) === JSON.stringify(manifest)),
+					hasPending: async manifest => pending.some(candidate => JSON.stringify(candidate.manifest) === JSON.stringify(manifest)),
+					pendingAttempt: async manifest => pending.find(candidate => JSON.stringify(candidate.manifest) === JSON.stringify(manifest))?.attemptId,
 					recordPending: async manifest => {
-						if (!pending.some(candidate => JSON.stringify(candidate) === JSON.stringify(manifest))) pending.push(manifest);
+						if (!pending.some(candidate => JSON.stringify(candidate.manifest) === JSON.stringify(manifest))) pending.push({ manifest, attemptId: randomUUID() });
 					},
-					clearPending: async manifest => {
-						const index = pending.findIndex(candidate => JSON.stringify(candidate) === JSON.stringify(manifest));
+					clearPending: async (manifest, attemptId) => {
+						const index = pending.findIndex(candidate => JSON.stringify(candidate.manifest) === JSON.stringify(manifest) && candidate.attemptId === attemptId);
 						if (index >= 0) pending.splice(index, 1);
+						return index >= 0;
 					},
 				},
 				withCreationLock: async action => action(),
@@ -540,8 +544,9 @@ describe("main orchestration", () => {
 				hasAnyFiled: async () => false,
 				recordFiled: async () => {},
 				hasPending: async () => false,
+				pendingAttempt: async () => undefined,
 				recordPending: async () => {},
-				clearPending: async () => {},
+				clearPending: async () => false,
 			},
 		});
 		await expect(main(["--approve", digestMatch![1]!], approving.dependencies)).resolves.toBe(0);
@@ -664,8 +669,9 @@ describe("main orchestration", () => {
 					recorded++;
 				},
 				hasPending: async candidate => JSON.stringify(candidate) === JSON.stringify(manifest),
+				pendingAttempt: async candidate => (JSON.stringify(candidate) === JSON.stringify(manifest) ? "attempt" : undefined),
 				recordPending: async () => {},
-				clearPending: async () => {},
+				clearPending: async () => false,
 			},
 		});
 		await expect(main(["--apply"], recovered.dependencies)).resolves.toBe(1);
@@ -689,6 +695,10 @@ describe("main orchestration", () => {
 				hasPending: async candidate => {
 					pendingReads++;
 					return fileApprovalStore.hasPending(candidate);
+				},
+				pendingAttempt: async candidate => {
+					pendingReads++;
+					return fileApprovalStore.pendingAttempt(candidate);
 				},
 			};
 			await fileApprovalStore.recordApprovals([manifest]);
@@ -797,6 +807,47 @@ describe("main orchestration", () => {
 			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
 			await fs.rm(home, { recursive: true, force: true });
 		}
+	});
+
+	test("--retry-pending cannot clear a newer concurrent attempt", async () => {
+		const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+		let attemptId = randomUUID();
+		let pending = true;
+		let injectedConcurrentAttempt = false;
+		const approvals: ApprovalStore = {
+			loadApprovals: async () => [manifest],
+			recordApprovals: async () => {},
+			consume: async () => {},
+			hasFiled: async () => false,
+			hasAnyFiled: async () => false,
+			recordFiled: async () => {},
+			hasPending: async () => pending,
+			pendingAttempt: async () => (pending ? attemptId : undefined),
+			recordPending: async () => {
+				attemptId = randomUUID();
+				pending = true;
+			},
+			clearPending: async (_candidate, candidateAttemptId) => {
+				if (!pending || candidateAttemptId !== attemptId) return false;
+				pending = false;
+				return true;
+			},
+		};
+		const setup = mainDependencies(true, {
+			approvals,
+			withCreationLock: async action => {
+				// The retry read the old nonce before entering this fence. Model an
+				// apply that published a new pending attempt in the interleaving.
+				if (!injectedConcurrentAttempt) {
+					injectedConcurrentAttempt = true;
+					await approvals.recordPending(manifest);
+				}
+				return action();
+			},
+		});
+		await expect(main(["--retry-pending", FINGERPRINT], setup.dependencies)).resolves.toBe(1);
+		expect(pending).toBe(true);
+		expect(setup.stderr.join(" ")).toContain("newer in-flight create record");
 	});
 
 	test("reports malformed rows distinctly from no-fingerprint skips and fails the run", async () => {
