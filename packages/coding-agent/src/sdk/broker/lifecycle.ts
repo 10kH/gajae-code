@@ -1023,10 +1023,26 @@ async function writeEffectMarker(root: string, id: string, marker: EffectMarker)
 export async function writeSessionLifecycleReady(root: string, id: string, effectMarker: string): Promise<void> {
 	const incarnation = processIncarnation(process.pid);
 	if (!incarnation) throw new Error("Lifecycle child has no readable OS incarnation.");
-	await fs.mkdir(path.join(root, "sdk"), { recursive: true, mode: 0o700 });
-	await fs.writeFile(lifecycleReadyPath(root, id), canonicalJson({ pid: process.pid, effectMarker, incarnation }), {
-		mode: 0o600,
-	});
+	const directory = path.join(root, "sdk");
+	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	const temporary = path.join(directory, `.${id}.lifecycle.ready.${randomUUID()}.tmp`);
+	const handle = await fs.open(
+		temporary,
+		fsSync.constants.O_CREAT | fsSync.constants.O_EXCL | fsSync.constants.O_WRONLY,
+		0o600,
+	);
+	try {
+		await handle.writeFile(canonicalJson({ pid: process.pid, effectMarker, incarnation }));
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+	try {
+		await fs.rename(temporary, lifecycleReadyPath(root, id));
+		await syncDirectory(directory);
+	} finally {
+		await fs.rm(temporary, { force: true });
+	}
 }
 
 export interface LifecycleTranscriptEvidence {
