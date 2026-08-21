@@ -6,6 +6,7 @@ import * as path from "node:path";
 import * as native from "@gajae-code/natives";
 import { ArtifactManager } from "../src/session/artifacts";
 import {
+	MANAGED_ARTIFACT_MAX_FILES,
 	ManagedSessionDescendantStore,
 	managedDirectoryRoot,
 	publishManagedFileNoReplace,
@@ -214,21 +215,25 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 		});
 	});
 
-	// Reproduces the observed production deadlock: a long-lived session scope
-	// accumulated 50,003 dirents of which 47,043 were inert zero-byte write-protocol
-	// remnants and 0 were receipts. The per-mutation receipt scan counted every
-	// dirent, so it threw `managed_replace_cleanup_receipt_limit_exceeded` before
-	// examining a single receipt, and the remnant reaper -- the only thing that could
-	// shrink the directory -- was scheduled after that throw and never ran. Every
-	// mutation then failed permanently, tool-output eviction could not persist, and
-	// the retained originals drove the session into the emergency heap floor.
+	// Reduces the observed production deadlock to its semantics: a long-lived
+	// session scope accumulated 50,003 dirents of which 47,043 were inert
+	// zero-byte write-protocol remnants and 0 were receipts. The per-mutation
+	// receipt scan counted every dirent, so it threw
+	// `managed_replace_cleanup_receipt_limit_exceeded` before examining a
+	// single receipt, and the remnant reaper -- the only thing that could
+	// shrink the directory -- was scheduled after that throw and never ran.
+	// Every mutation then failed permanently, tool-output eviction could not
+	// persist, and the retained originals drove the session into the
+	// emergency heap floor. Scale is reduced here; the over-limit dirents
+	// case is pinned by the test further below.
 	it("keeps mutating a scope saturated with inert remnants and reaps them", async () => {
 		await withTempDir("gjc-remnant-saturated-", async dir => {
 			const sessionDir = path.join(dir, "session");
 			await fsp.mkdir(sessionDir, { mode: 0o700 });
 
-			// Saturate the directory well past the receipt scan limit with aged,
-			// zero-byte remnants and no receipts at all -- the production shape.
+			// Aged zero-byte remnants far beyond the yield batch, with no
+			// receipts at all: remnants never count toward the receipt scan
+			// limit, and reaping stays reachable on a busy scope.
 			const remnantCount = 1200;
 			const aged: string[] = [];
 			for (let index = 0; index < remnantCount; index++) {
@@ -248,6 +253,150 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 			// A subsequent mutation still works on the drained scope.
 			store.publishNoReplaceSync("second.jsonl", Buffer.from("second\n"));
 			expect(await fsp.readFile(path.join(sessionDir, "second.jsonl"), "utf8")).toBe("second\n");
+		});
+	});
+
+	// The pre-fix regression at true scale: more dirents than
+	// REPLACEMENT_CLEANUP_RECEIPT_SCAN_LIMIT (= MANAGED_ARTIFACT_MAX_FILES),
+	// every one of them an inert remnant and none of them a receipt. Counting
+	// dirents instead of receipts aborted the scan before the reaper could
+	// ever run, so this is the exact shape that failed every mutation forever.
+	it("mutates a scope holding more inert remnants than the receipt scan limit", async () => {
+		await withTempDir("gjc-remnant-over-limit-", async dir => {
+			const sessionDir = path.join(dir, "session");
+			await fsp.mkdir(sessionDir, { mode: 0o700 });
+
+			const remnantCount = MANAGED_ARTIFACT_MAX_FILES + 50;
+			const stamp = new Date(Date.now() - 60 * 60 * 1000);
+			const remnantPath = (index: number) => path.join(sessionDir, `${REMNANT_PREFIX}limit-${index}`);
+			for (let index = 0; index < remnantCount; index++) {
+				fs.writeFileSync(remnantPath(index), "", { mode: 0o600 });
+				fs.utimesSync(remnantPath(index), stamp, stamp);
+			}
+			expect(fs.readdirSync(sessionDir).length).toBe(remnantCount);
+
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), sessionDir);
+			// Under the pre-fix per-dirent counting this throws
+			// `managed_replace_cleanup_receipt_limit_exceeded`; the limit
+			// must bound receipts, not directory occupancy.
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("transcript\n"));
+			expect(await fsp.readFile(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("transcript\n");
+
+			// The saturated scope keeps mutating.
+			store.publishNoReplaceSync("second.jsonl", Buffer.from("second\n"));
+			expect(await fsp.readFile(path.join(sessionDir, "second.jsonl"), "utf8")).toBe("second\n");
+
+			// Reaping stays reachable on the oversize scope and drains it
+			// fully (readdir order is not index order, so wait on the count).
+			await waitFor(async () => !fs.existsSync(remnantPath(0)), 60_000);
+			await waitFor(
+				async () => fs.readdirSync(sessionDir).filter(name => name.startsWith(REMNANT_PREFIX)).length === 0,
+				180_000,
+			);
+		});
+	}, 300_000);
+
+	it("fails closed on a corrupt replacement-cleanup receipt without deleting it", async () => {
+		await withTempDir("gjc-receipt-corrupt-", async dir => {
+			const sessionDir = path.join(dir, "session");
+			await fsp.mkdir(sessionDir, { mode: 0o700 });
+			const receiptPath = path.join(sessionDir, ".gjc-replace-cleanup-1-2-receipt-3-4.json");
+			const receiptBytes = Buffer.from("not a receipt");
+			await fsp.writeFile(receiptPath, receiptBytes, { mode: 0o600 });
+
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), sessionDir);
+			expect(() => store.publishNoReplaceSync("session.jsonl", Buffer.from("transcript\n"))).toThrow(
+				"managed_replace_cleanup_receipt_invalid",
+			);
+			// Fail-closed must not eat evidence: the receipt and its payload
+			// survive untouched, and nothing was published.
+			expect(await fsp.readFile(receiptPath)).toEqual(receiptBytes);
+			expect(fs.existsSync(path.join(sessionDir, "session.jsonl"))).toBe(false);
+		});
+	});
+
+	it("fails closed on an unparseable pending replacement receipt", async () => {
+		await withTempDir("gjc-receipt-pending-corrupt-", async dir => {
+			const sessionDir = path.join(dir, "session");
+			await fsp.mkdir(sessionDir, { mode: 0o700 });
+			const pendingPath = path.join(sessionDir, ".gjc-replace-receipt-pending-1");
+			await fsp.writeFile(pendingPath, "garbage", { mode: 0o600 });
+
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), sessionDir);
+			expect(() => store.publishNoReplaceSync("session.jsonl", Buffer.from("transcript\n"))).toThrow(
+				"managed_replace_cleanup_receipt_invalid",
+			);
+			expect(await fsp.readFile(pendingPath, "utf8")).toBe("garbage");
+			expect(fs.existsSync(path.join(sessionDir, "session.jsonl"))).toBe(false);
+		});
+	});
+
+	it("still schedules remnant reaping when reconciliation fails closed", async () => {
+		await withTempDir("gjc-receipt-fail-reap-", async dir => {
+			const sessionDir = path.join(dir, "session");
+			await fsp.mkdir(sessionDir, { mode: 0o700 });
+			const remnant = await seedRemnant(sessionDir, `${REMNANT_PREFIX}aged`, 60 * 60 * 1000);
+			await fsp.writeFile(path.join(sessionDir, ".gjc-replace-cleanup-1-2-receipt-3-4.json"), "not a receipt", {
+				mode: 0o600,
+			});
+
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), sessionDir);
+			expect(() => store.publishNoReplaceSync("session.jsonl", Buffer.from("transcript\n"))).toThrow(
+				"managed_replace_cleanup_receipt_invalid",
+			);
+			// The pre-fix ordering scheduled the reaper only after a successful
+			// scan, so a scope whose scan failed could never drain through its
+			// own mutations. Reaping must stay reachable even when the
+			// mutation itself fails closed.
+			await waitFor(async () => !fs.existsSync(remnant));
+		});
+	});
+
+	it("never reaps symlinks, hardlinks, directories, or non-empty and fresh remnants", async () => {
+		await withTempDir("gjc-remnant-refusal-", async dir => {
+			const sessionDir = path.join(dir, "session");
+			await fsp.mkdir(sessionDir, { mode: 0o700 });
+
+			const control = await seedRemnant(sessionDir, `${REMNANT_PREFIX}aged-control`, 60 * 60 * 1000);
+			const fresh = await seedRemnant(sessionDir, `${REMNANT_PREFIX}fresh`, 0);
+			const payload = await seedRemnant(sessionDir, `${REMNANT_PREFIX}payload`, 60 * 60 * 1000, new Uint8Array([7]));
+
+			// Aged remnant-named hardlink pair: the single-link capture fence
+			// must retain both names.
+			const hardlink = path.join(sessionDir, `${REMNANT_PREFIX}hardlink`);
+			const alias = path.join(sessionDir, "hardlink-alias");
+			await fsp.writeFile(hardlink, "", { mode: 0o600 });
+			await fsp.link(hardlink, alias);
+			const stamp = new Date(Date.now() - 60 * 60 * 1000);
+			await fsp.utimes(hardlink, stamp, stamp);
+
+			// Aged remnant-named directory with user data inside: never
+			// unlinked, never recursed into.
+			const nestedDir = path.join(sessionDir, `${REMNANT_PREFIX}directory`);
+			await fsp.mkdir(nestedDir, { mode: 0o700 });
+			await fsp.writeFile(path.join(nestedDir, "user-data"), "kept", { mode: 0o600 });
+
+			// Aged remnant-named symlink pointing outside the store: retained,
+			// and its target is never followed or deleted.
+			const outside = path.join(dir, "outside-target");
+			await fsp.writeFile(outside, "kept", { mode: 0o600 });
+			const symlink = path.join(sessionDir, `${REMNANT_PREFIX}symlink`);
+			if (process.platform !== "win32") await fsp.symlink(outside, symlink);
+
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), sessionDir);
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("transcript\n"));
+
+			await waitFor(async () => !fs.existsSync(control));
+			expect(fs.existsSync(fresh)).toBe(true);
+			expect(fs.existsSync(payload)).toBe(true);
+			expect(fs.existsSync(hardlink)).toBe(true);
+			expect(fs.existsSync(alias)).toBe(true);
+			expect(await fsp.readFile(path.join(nestedDir, "user-data"), "utf8")).toBe("kept");
+			if (process.platform !== "win32") {
+				expect(fs.existsSync(symlink)).toBe(true);
+				expect(await fsp.readFile(outside, "utf8")).toBe("kept");
+			}
+			expect(await fsp.readFile(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("transcript\n");
 		});
 	});
 });
