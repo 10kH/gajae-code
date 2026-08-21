@@ -213,6 +213,43 @@ describe("scrubbed protocol remnant reaping (issue #4394)", () => {
 			expect(await fsp.readFile(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("transcript\n");
 		});
 	});
+
+	// Reproduces the observed production deadlock: a long-lived session scope
+	// accumulated 50,003 dirents of which 47,043 were inert zero-byte write-protocol
+	// remnants and 0 were receipts. The per-mutation receipt scan counted every
+	// dirent, so it threw `managed_replace_cleanup_receipt_limit_exceeded` before
+	// examining a single receipt, and the remnant reaper -- the only thing that could
+	// shrink the directory -- was scheduled after that throw and never ran. Every
+	// mutation then failed permanently, tool-output eviction could not persist, and
+	// the retained originals drove the session into the emergency heap floor.
+	it("keeps mutating a scope saturated with inert remnants and reaps them", async () => {
+		await withTempDir("gjc-remnant-saturated-", async dir => {
+			const sessionDir = path.join(dir, "session");
+			await fsp.mkdir(sessionDir, { mode: 0o700 });
+
+			// Saturate the directory well past the receipt scan limit with aged,
+			// zero-byte remnants and no receipts at all -- the production shape.
+			const remnantCount = 1200;
+			const aged: string[] = [];
+			for (let index = 0; index < remnantCount; index++) {
+				aged.push(await seedRemnant(sessionDir, `${REMNANT_PREFIX}sat-${index}`, 60 * 60 * 1000));
+			}
+			expect(fs.readdirSync(sessionDir).length).toBe(remnantCount);
+
+			const store = new ManagedSessionDescendantStore(managedDirectoryRoot(dir), sessionDir);
+			// The mutation must succeed rather than throw the receipt-limit error.
+			store.publishNoReplaceSync("session.jsonl", Buffer.from("transcript\n"));
+			expect(await fsp.readFile(path.join(sessionDir, "session.jsonl"), "utf8")).toBe("transcript\n");
+
+			// Reaping was reachable, so the scope drains instead of staying wedged.
+			await waitFor(async () => !fs.existsSync(aged[0] as string));
+			await waitFor(async () => !fs.existsSync(aged[remnantCount - 1] as string));
+
+			// A subsequent mutation still works on the drained scope.
+			store.publishNoReplaceSync("second.jsonl", Buffer.from("second\n"));
+			expect(await fsp.readFile(path.join(sessionDir, "second.jsonl"), "utf8")).toBe("second\n");
+		});
+	});
 });
 
 describe("managed output generation publication over the async boundary", () => {
