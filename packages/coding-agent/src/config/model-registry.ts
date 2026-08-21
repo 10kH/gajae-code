@@ -1808,13 +1808,26 @@ export class ModelRegistry {
 			}
 		});
 	}
+	#stripUrlUserinfo(url: string | undefined): string | undefined {
+		if (!url) return url;
+		try {
+			const parsed = new URL(url);
+			if (!parsed.username && !parsed.password) return url;
+			parsed.username = "";
+			parsed.password = "";
+			return parsed.toString();
+		} catch {
+			return url.replace(/\/\/[^/@]+@/, "//");
+		}
+	}
 	#restoreLiveDiscoveryBaseUrl(modelBaseUrl: string | undefined, liveBaseUrl: string | undefined): string | undefined {
-		if (!modelBaseUrl || !liveBaseUrl || (!liveBaseUrl.includes("?") && !liveBaseUrl.includes("@")))
-			return modelBaseUrl;
-		return this.#normalizeDiscoveryEvidenceEndpoint(stripUrlQuery(modelBaseUrl)) ===
+		if (!modelBaseUrl || !liveBaseUrl) return this.#stripUrlUserinfo(modelBaseUrl);
+		const restored =
+			this.#normalizeDiscoveryEvidenceEndpoint(stripUrlQuery(modelBaseUrl)) !==
 			this.#normalizeDiscoveryEvidenceEndpoint(stripUrlQuery(liveBaseUrl))
-			? liveBaseUrl
-			: modelBaseUrl;
+				? modelBaseUrl
+				: liveBaseUrl;
+		return this.#stripUrlUserinfo(restored);
 	}
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
@@ -3364,10 +3377,15 @@ export class ModelRegistry {
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
 		const withTransportOverride = this.#applyProviderTransportOverride(model, override);
+		const sanitizedBaseUrl = this.#stripUrlUserinfo(withTransportOverride.baseUrl);
+		const sanitizedTransport: Model<Api> =
+			sanitizedBaseUrl === withTransportOverride.baseUrl
+				? withTransportOverride
+				: { ...withTransportOverride, ...(sanitizedBaseUrl === undefined ? {} : { baseUrl: sanitizedBaseUrl }) };
 		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
 		return modelCompat
-			? { ...withTransportOverride, compat: mergeCompat(withTransportOverride.compat, modelCompat) }
-			: withTransportOverride;
+			? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
+			: sanitizedTransport;
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
 		if (this.#runtimeProviderOverrides.size === 0) return models;

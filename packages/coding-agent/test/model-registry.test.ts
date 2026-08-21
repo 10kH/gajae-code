@@ -7115,6 +7115,33 @@ describe("ModelRegistry", () => {
 				JSON.stringify(readModelCache<Api>("discovery-provider", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)),
 			).not.toContain("runtime-secret");
 		});
+		test("strips runtime endpoint userinfo from discovered model URLs without changing path or query", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://configured.example.com/v1",
+					api: "openai-completions",
+					apiKey: "DISCOVERY_KEY",
+					discovery: { type: "openai-models-list" },
+				},
+			});
+			const secret = "raw-userinfo-secret";
+			using _hook = mockOpenAiCompatibleModels(
+				`https://runtime-user:${secret}@runtime.example.com/api/v1/models?tenant=alpha%2F`,
+				["runtime-model"],
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("discovery-provider", {
+				baseUrl: `https://runtime-user:${secret}@runtime.example.com/api/v1/?tenant=alpha%2F`,
+			});
+
+			await registry.refreshProvider("discovery-provider", "online");
+
+			const model = registry.find("discovery-provider", "runtime-model");
+			expect(model?.baseUrl).toBe("https://runtime.example.com/api/v1/?tenant=alpha%2F");
+			expect(model?.baseUrl).not.toContain("runtime-user");
+			expect(model?.baseUrl).not.toContain(secret);
+			expect(JSON.stringify(model)).not.toContain(secret);
+		});
 		test("does not restore configured discovery evidence after a transport override", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
