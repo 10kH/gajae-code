@@ -125,7 +125,7 @@ function createControllerContext() {
 	};
 	const ctx = {
 		ui: { setFocus: vi.fn(), requestRender: vi.fn() },
-		editorContainer: { clear: vi.fn(), addChild: vi.fn() },
+		editorContainer: { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() },
 		editor: {},
 		settings,
 		session,

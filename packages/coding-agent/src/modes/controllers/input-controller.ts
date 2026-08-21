@@ -1372,6 +1372,10 @@ export class InputController {
 					),
 			},
 		);
+		// The composer is reusable across overlays; detach it before clearing so
+		// clear() disposes only the transient selector, not the editor's
+		// tab-width listener (disposal is terminal).
+		this.ctx.editorContainer.detachChild(this.ctx.editor);
 		this.ctx.editorContainer.clear();
 		this.ctx.editorContainer.addChild(selector);
 		this.ctx.ui.setFocus(selector);
