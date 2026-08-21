@@ -11622,7 +11622,7 @@ export class AgentSession {
 		// unwind the successor starts its own turn and must fire onQueuedPromoted
 		// so SDK pending correlation is not dropped.
 		const dispatchedWhileBusy = options?.queuedAtDispatch === true && options.deliverAs === undefined;
-		const queuedPlainPrompt = dispatchedWhileBusy && this.agent.state.isStreaming;
+		const queuedPlainPrompt = dispatchedWhileBusy;
 		const hasFollowUpAhead = (): boolean =>
 			this.#activeFollowUpReservationEpochs.size > 0 ||
 			this.agent.snapshotFollowUp().length > 0 ||
