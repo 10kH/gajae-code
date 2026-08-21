@@ -277,6 +277,8 @@ test("win32 production host exit after ready is ready_then_exited, not spawn_fai
 		const response = await broker.handleRequest("session.create", input, "host-exit-after-ready");
 		expect(response.ok).toBe(false);
 		if (response.ok) throw new Error("expected failure");
+		if (response.error.code !== "ready_then_exited")
+			throw new Error(`unexpected lifecycle error: ${JSON.stringify(response.error)}`);
 		expect(response.error.code).toBe("ready_then_exited");
 		expect(response.error.message).toMatch(/became ready then exited before live admission/i);
 		expect(await broker.handleRequest("session.create", input, "host-exit-after-ready")).toEqual(response);
@@ -300,6 +302,8 @@ test("win32 host that rejects after ready is ready_then_exited, never spawn_fail
 		const response = await broker.handleRequest("session.create", input, "host-reject-after-ready");
 		expect(response.ok).toBe(false);
 		if (response.ok) throw new Error("expected failure");
+		if (response.error.code !== "ready_then_exited")
+			throw new Error(`unexpected lifecycle error: ${JSON.stringify(response.error)}`);
 		expect(response.error.code).toBe("ready_then_exited");
 		expect(response.error.code).not.toBe("spawn_failed");
 		expect(response.error.message).toMatch(/became ready then exited before live admission/i);
