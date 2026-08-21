@@ -1123,6 +1123,10 @@ function isLifecycleFailureArtifact(value: unknown): value is LifecycleFailureAr
 }
 
 async function syncDirectory(directory: string): Promise<void> {
+	// Windows does not support fsync on directory handles. File contents and
+	// lifecycle markers are still written through the normal atomic path; the
+	// directory durability barrier is a POSIX-only operation.
+	if (process.platform === "win32") return;
 	const handle = await fs.open(directory, fsSync.constants.O_RDONLY);
 	try {
 		await handle.sync();
