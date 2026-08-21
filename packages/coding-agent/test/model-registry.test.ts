@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -6382,6 +6383,7 @@ describe("ModelRegistry", () => {
 				);
 				const cached = readModelCache<Api>("lm-studio", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
 				expect(cached?.models[0]?.baseUrl).toBe("https://lm-studio.example/v1");
+				expect(cached?.dynamicModelProvenance).toStartWith("gajae:non-cacheable-configured:");
 				expect(JSON.stringify(cached)).not.toContain("lm-studio-secret");
 			} finally {
 				restoreApiKey();
@@ -6531,7 +6533,194 @@ describe("ModelRegistry", () => {
 			expect(requests).toBeGreaterThan(requestsBeforeHeaderChange);
 			expect(seenTenantHeaders.at(-1)).toBe("tenant-b");
 		});
-		test("binds userinfo opaquely while reusing an authenticated same-context cache after restart", async () => {
+		test("never persists secret-header-derived provenance and fails closed on cache reuse", async () => {
+			const secretHeaders = [
+				"aUtHoRiZaTiOn",
+				"X-API-KEY",
+				"Cookie",
+				"X-Custom-Service-Token",
+				"X-AuthToken",
+				"X-ClientSecret",
+				"X-DbPassword",
+				"X-ServiceCredential",
+				"X-CustomApiKey",
+				"X-Access-Key",
+				"X-Auth",
+				"X-Functions-Key",
+				"X-Signature",
+				"X-AccessKey",
+				"X-SignatureV1",
+				"CF-Access-Jwt-Assertion",
+				"X-Hockey-Team",
+				"X-Monkey-Id",
+				"X-Vendor-Nonce",
+			];
+			for (const headerName of secretHeaders) {
+				const config = (value: string) => ({
+					"discovery-provider": {
+						baseUrl: "https://discovery.example.com/v1",
+						api: "openai-responses",
+						discovery: { type: "openai-models-list" },
+						headers: { [headerName]: value },
+					},
+				});
+				writeRawModelsJson(config("pin-0001"));
+				authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+				let requests = 0;
+				using _hook = hookFetch(() => {
+					requests++;
+					return new Response(JSON.stringify({ data: [{ id: `secret-model-${requests}` }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				await registry.refreshProvider("discovery-provider", "online-if-uncached");
+				const row = readModelCache("discovery-provider", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+				const authEvidence = authStorage.getProviderEvidenceGeneration("discovery-provider", "credential-a");
+				const candidateDigests = ["pin-0000", "pin-0001", "pin-0002"].map(value =>
+					crypto
+						.createHash("sha256")
+						.update("gajae:model-discovery-provenance\0")
+						.update(
+							JSON.stringify({
+								authEvidence,
+								endpoint: "https://discovery.example.com/v1;authority=",
+								headers: [[headerName.toLowerCase(), value]],
+								discoveryType: "openai-models-list",
+								api: "openai-responses",
+								apiByModelPrefix: [],
+								modelsDevProvider: "",
+							}),
+						)
+						.digest("hex"),
+				);
+				expect(candidateDigests).not.toContain(row?.dynamicModelProvenance);
+				expect(row?.dynamicModelProvenance).toStartWith("gajae:non-cacheable-configured:");
+				expect(JSON.stringify(row?.models)).not.toContain("pin-0001");
+				expect(row?.models.every(model => model.headers === undefined)).toBe(true);
+
+				const requestsAfterFirstFetch = requests;
+				const offlineRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+				await offlineRegistry.refreshProvider("discovery-provider", "offline");
+				expect(requests).toBe(requestsAfterFirstFetch);
+				expect(offlineRegistry.find("discovery-provider", "secret-model-1")).toBeUndefined();
+
+				const sameSecretRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+				await sameSecretRegistry.refreshProvider("discovery-provider", "online-if-uncached");
+				expect(requests).toBeGreaterThan(requestsAfterFirstFetch);
+
+				writeRawModelsJson(config("pin-0002"));
+				const changedSecretRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+				const requestsBeforeChange = requests;
+				await changedSecretRegistry.refreshProvider("discovery-provider", "online-if-uncached");
+				expect(requests).toBeGreaterThan(requestsBeforeChange);
+			}
+		});
+		test("does not expose a prior non-secret cache after switching to secret headers offline", async () => {
+			const config = (headers: Record<string, string>) => ({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+					headers,
+				},
+			});
+			writeRawModelsJson(config({ "X-Tenant-Id": "tenant-a" }));
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "prior-tenant-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const first = new ModelRegistry(authStorage, modelsJsonPath);
+			await first.refreshProvider("discovery-provider", "online");
+			expect(first.find("discovery-provider", "prior-tenant-model")).toBeDefined();
+
+			writeRawModelsJson(config({ Authorization: "Bearer pin-0001" }));
+			const secretContext = new ModelRegistry(authStorage, modelsJsonPath);
+			await secretContext.refreshProvider("discovery-provider", "offline");
+			expect(secretContext.find("discovery-provider", "prior-tenant-model")).toBeUndefined();
+		});
+		test("removes already-published secret-context models on same-registry offline refresh", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					discovery: { type: "openai-models-list" },
+					headers: { Authorization: "Bearer pin-0001" },
+				},
+			});
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "secret-live-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("discovery-provider", "online");
+			expect(registry.find("discovery-provider", "secret-live-model")).toBeDefined();
+			await registry.refreshProvider("discovery-provider", "offline");
+			expect(registry.find("discovery-provider", "secret-live-model")).toBeUndefined();
+		});
+		test("preserves bundled same-id models when secret-context dynamic rows are cleared", async () => {
+			writeRawModelsJson({
+				anthropic: {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "anthropic-messages",
+					discovery: { type: "openai-models-list" },
+					headers: { Authorization: "Bearer pin-0001" },
+				},
+			});
+			authStorage.setRuntimeApiKey("anthropic", "credential-a");
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "claude-sonnet-4-5" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("anthropic", "online");
+			expect(registry.find("anthropic", "claude-sonnet-4-5")).toBeDefined();
+			await registry.refreshProvider("anthropic", "offline");
+			expect(registry.find("anthropic", "claude-sonnet-4-5")).toBeDefined();
+		});
+		test("keeps audited non-secret request-shaping headers cacheable", async () => {
+			for (const headerName of ["X-Tenant-Id", "X-Project-Id", "OpenAI-Organization"]) {
+				writeRawModelsJson({
+					"discovery-provider": {
+						baseUrl: "https://discovery.example.com/v1",
+						api: "openai-responses",
+						discovery: { type: "openai-models-list" },
+						headers: { [headerName]: "team-a" },
+					},
+				});
+				authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+				let requests = 0;
+				using _hook = hookFetch(() => {
+					requests++;
+					return new Response(JSON.stringify({ data: [{ id: "cacheable-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				});
+
+				const first = new ModelRegistry(authStorage, modelsJsonPath);
+				await first.refreshProvider("discovery-provider", "online-if-uncached");
+				const requestsAfterFirstFetch = requests;
+				const second = new ModelRegistry(authStorage, modelsJsonPath);
+				await second.refreshProvider("discovery-provider", "online-if-uncached");
+				expect(requests).toBe(requestsAfterFirstFetch);
+				expect(second.find("discovery-provider", "cacheable-model")).toBeDefined();
+			}
+		});
+		test("never persists userinfo-derived provenance or reuses its cache", async () => {
 			const config = (baseUrl: string) => ({
 				"discovery-provider": {
 					baseUrl,
@@ -6552,17 +6741,23 @@ describe("ModelRegistry", () => {
 			const firstRegistry = new ModelRegistry(authStorage, modelsJsonPath);
 			await firstRegistry.refreshProvider("discovery-provider", "online-if-uncached");
 			const requestsAfterFirstFetch = requests;
+			expect(
+				readModelCache("discovery-provider", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.dynamicModelProvenance,
+			).toStartWith("gajae:non-cacheable-configured:");
 
 			const sameContextRegistry = new ModelRegistry(authStorage, modelsJsonPath);
 			await sameContextRegistry.refreshProvider("discovery-provider", "online-if-uncached");
-			expect(requests).toBe(requestsAfterFirstFetch);
+			expect(requests).toBeGreaterThan(requestsAfterFirstFetch);
 			expect(sameContextRegistry.find("discovery-provider", "userinfo-model")).toBeDefined();
+			const offlineRegistry = new ModelRegistry(authStorage, modelsJsonPath);
+			await offlineRegistry.refreshProvider("discovery-provider", "offline");
+			expect(offlineRegistry.find("discovery-provider", "userinfo-model")).toBeUndefined();
 
 			await Bun.sleep(10);
 			writeRawModelsJson(config("https://tenant-b:tenant-b-secret@discovery.example.com/v1"));
 			const changedContextRegistry = new ModelRegistry(authStorage, modelsJsonPath);
 			await changedContextRegistry.refreshProvider("discovery-provider", "online-if-uncached");
-			expect(requests).toBeGreaterThan(requestsAfterFirstFetch);
+			expect(requests).toBeGreaterThan(requestsAfterFirstFetch + 1);
 		});
 		test("does not serve the previous tenant's cached models when a provenance-forced refetch fails", async () => {
 			const discoveryConfigWithHeaders = (headers: Record<string, string>) => ({
@@ -7084,6 +7279,7 @@ describe("ModelRegistry", () => {
 			const cached = readModelCache<Api>("discovery-provider", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
 			expect(cached?.models).toHaveLength(1);
 			expect(cached?.models[0]?.baseUrl).toBe("https://runtime.example.com/v1");
+			expect(cached?.dynamicModelProvenance).toStartWith("gajae:non-cacheable-configured:");
 			expect(JSON.stringify(cached)).not.toContain("runtime-secret");
 			expect(JSON.stringify(cached)).not.toContain("DISCOVERY_KEY");
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
@@ -7141,6 +7337,40 @@ describe("ModelRegistry", () => {
 			expect(model?.baseUrl).not.toContain("runtime-user");
 			expect(model?.baseUrl).not.toContain(secret);
 			expect(JSON.stringify(model)).not.toContain(secret);
+		});
+		test("drops malformed discovery URLs before persisting models", async () => {
+			const secret = "plain-secret-0001";
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: `https://user:${secret}@[bad/v1`,
+					api: "anthropic-messages",
+					discovery: { type: "models-dev", modelsDevProvider: "anthropic" },
+				},
+			});
+			authStorage.setRuntimeApiKey("discovery-provider", "credential-a");
+			using _hook = hookFetch(
+				() =>
+					new Response(
+						JSON.stringify({
+							anthropic: {
+								models: {
+									"malformed-url-model": {
+										name: "Malformed URL Model",
+										modalities: { input: ["text"] },
+										cost: { input: 1, output: 1 },
+										limit: { context: 8192, output: 1024 },
+									},
+								},
+							},
+						}),
+						{ status: 200, headers: { "Content-Type": "application/json" } },
+					),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("discovery-provider", "online");
+			const cached = readModelCache<Api>("discovery-provider", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
+			expect(JSON.stringify(cached)).not.toContain(secret);
+			expect(cached?.models.find(model => model.id === "malformed-url-model")?.baseUrl).toBeUndefined();
 		});
 		test("does not restore configured discovery evidence after a transport override", async () => {
 			writeRawModelsJson({
@@ -7352,7 +7582,36 @@ describe("ModelRegistry", () => {
 				);
 				const cached = readModelCache<Api>("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath);
 				expect(cached?.models[0]?.baseUrl).toBe("https://vllm.example.com/v1");
+				expect(cached?.dynamicModelProvenance).toStartWith("gajae:non-cacheable-endpoint:");
 				expect(JSON.stringify(cached)).not.toContain("descriptor-secret");
+			} finally {
+				restoreBaseUrl();
+			}
+		});
+		test("does not reuse descriptor caches for endpoints containing userinfo", async () => {
+			const restoreBaseUrl = setEnvForTest("VLLM_BASE_URL", "https://tenant-a:secret-a@vllm.example.com/v1");
+			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
+			let requests = 0;
+			using _hook = hookFetch(() => {
+				requests++;
+				return new Response(JSON.stringify({ data: [{ id: "userinfo-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			try {
+				const first = new ModelRegistry(authStorage, modelsJsonPath);
+				await first.refreshProvider("vllm", "online");
+				expect(
+					readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.dynamicModelProvenance,
+				).toStartWith("gajae:non-cacheable-endpoint:");
+				const requestsAfterFirstFetch = requests;
+				const second = new ModelRegistry(authStorage, modelsJsonPath);
+				await second.refreshProvider("vllm", "online-if-uncached");
+				expect(requests).toBeGreaterThan(requestsAfterFirstFetch);
+				const offline = new ModelRegistry(authStorage, modelsJsonPath);
+				await offline.refreshProvider("vllm", "offline");
+				expect(offline.find("vllm", "userinfo-vllm-model")).toBeUndefined();
 			} finally {
 				restoreBaseUrl();
 			}
