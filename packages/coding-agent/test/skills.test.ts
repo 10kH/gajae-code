@@ -345,8 +345,9 @@ enabled: false
 		});
 
 		it("should expand ~ in customDirectories", async () => {
-			const tempHomeSkillsDir = await fs.mkdtemp(path.join(os.homedir(), ".pi-skills-test-"));
-			const relativeToHome = path.relative(os.homedir(), tempHomeSkillsDir);
+			const tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-tilde-home-"));
+			const tempHomeSkillsDir = await fs.mkdtemp(path.join(tempHome, ".pi-skills-test-"));
+			const relativeToHome = path.relative(tempHome, tempHomeSkillsDir);
 			const tildeDir = `~/${relativeToHome.split(path.sep).join("/")}`;
 			const skillDir = path.join(tempHomeSkillsDir, "tilde-skill");
 			const skillPath = path.join(skillDir, "SKILL.md");
@@ -370,6 +371,7 @@ description: Skill loaded from a tilde-expanded custom directory.
 					enablePiUser: false,
 					enablePiProject: false,
 					customDirectories: [tildeDir],
+					home: tempHome,
 				});
 				const { skills: withoutTilde } = await loadSkills({
 					enableCodexUser: false,
@@ -378,11 +380,12 @@ description: Skill loaded from a tilde-expanded custom directory.
 					enablePiUser: false,
 					enablePiProject: false,
 					customDirectories: [tempHomeSkillsDir],
+					home: tempHome,
 				});
 				expect(withTilde.length).toBe(withoutTilde.length);
 				expect(withTilde.some(skill => skill.name === "tilde-skill")).toBe(true);
 			} finally {
-				await fs.rm(tempHomeSkillsDir, { recursive: true, force: true });
+				await fs.rm(tempHome, { recursive: true, force: true });
 			}
 		});
 
