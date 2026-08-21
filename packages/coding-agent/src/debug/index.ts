@@ -327,22 +327,27 @@ export class DebugSelectorComponent extends Container {
 	}
 
 	async #handleViewLogs(): Promise<void> {
+		// The selector restores the reusable composer synchronously before this
+		// async operation starts. Capture both the exact mounted child and the
+		// container revision so a stale completion cannot mistake a newer
+		// non-Container owner (RawSSE/Input) for the composer, or reclaim the
+		// same composer after a newer overlay has already opened and closed.
+		const expectedComposerMount =
+			this.ctx.editorContainer.children.length === 1 ? this.ctx.editorContainer.children[0] : undefined;
+		const expectedMountRevision = this.ctx.editorContainer.getRenderRevision();
 		try {
 			const logSource = await createDebugLogSource();
 			const logs = await logSource.getInitialText();
-			// The awaits above leave a window where a newer overlay can take
-			// over the editor container (or the UI can stop). Mounting then
-			// would clear() and dispose the current owner's UI. Verify the
-			// restore state this operation started from still holds — the
-			// composer live-mounted as the container's content, either as the
-			// editor itself or, when the pet widget is active, as a non-Container
-			// wrapper rendering it (restoreComposer remounts that wrapper).
-			// A stale completion discards its viewer without touching the
-			// active container.
-			const composerStillMounted =
-				this.ctx.editorContainer.hasLiveChild(this.ctx.editor) ||
-				this.ctx.editorContainer.children.some(child => !(child instanceof Container) && !("dispose" in child));
-			if (!composerStillMounted) return;
+			// The awaits above leave a window where a newer overlay can take over
+			// the editor container (or the UI can stop). Mount only when the exact
+			// child and the mount revision captured before the awaits still match.
+			if (
+				expectedComposerMount === undefined ||
+				this.ctx.editorContainer.getRenderRevision() !== expectedMountRevision ||
+				this.ctx.editorContainer.children.length !== 1 ||
+				this.ctx.editorContainer.children[0] !== expectedComposerMount
+			)
+				return;
 			if (!logs && !logSource.hasOlderLogs()) {
 				this.ctx.showWarning("No log entries found for today.");
 				return;

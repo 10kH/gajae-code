@@ -10,6 +10,7 @@ import { AsyncJobManager } from "../src/async";
 import { DebugSelectorComponent } from "../src/debug";
 import { DebugLogViewerComponent } from "../src/debug/log-viewer";
 import { RawSseViewerComponent } from "../src/debug/raw-sse";
+import { RawSseDebugBuffer } from "../src/debug/raw-sse-buffer";
 import { BorderedLoader } from "../src/modes/components/bordered-loader";
 import { CustomEditor } from "../src/modes/components/custom-editor";
 import { PetFramedEditor } from "../src/modes/components/gajae-pet-widget";
@@ -417,6 +418,57 @@ describe("reusable composer lifecycle across remaining overlay open paths (#4657
 			await restoreLifecycleGlobals(globals);
 		}
 	});
+
+	test("stale /debug log load does not replace newer RawSSE or Input owners", async () => {
+		const globals = snapshotLifecycleGlobals();
+		const { harness, controller } = makeDebugHarness();
+		const invalidations = countInvalidations(harness.editor);
+		const defaultWidth = 3;
+		const dirState = await pinExclusiveDirState();
+
+		try {
+			setThemeInstance(testTheme);
+			setDefaultTabWidth(defaultWidth);
+			await seedExclusiveDatedLog();
+
+			for (const ownerKind of ["raw-sse", "input"] as const) {
+				controller.showDebugSelector();
+				const selector = harness.editorContainer.children.find(child => child instanceof DebugSelectorComponent);
+				if (!selector) throw new Error("Expected the debug selector to mount");
+				for (let step = 0; step < 5; step += 1) selector.handleInput(SELECT_DOWN_KEY);
+				selector.handleInput(SELECT_CONFIRM_KEY);
+
+				const owner =
+					ownerKind === "raw-sse"
+						? new RawSseViewerComponent({
+								buffer: new RawSseDebugBuffer(),
+								terminalRows: 30,
+								onExit: () => {},
+							})
+						: new Input();
+				// Simulate a newer non-Container owner arriving before the pending
+				// log read resolves. Both components intentionally lack the
+				// structural marker the old guard used, so identity + revision are
+				// required to keep this regression meaningful.
+				harness.editorContainer.detachChild(harness.editor);
+				harness.editorContainer.clear();
+				harness.editorContainer.addChild(owner);
+
+				await Bun.sleep(100);
+				expect(harness.editorContainer.children).toEqual([owner]);
+				harness.editorContainer.detachChild(owner);
+				harness.editorContainer.clear();
+				harness.editorContainer.addChild(harness.editor);
+				expectTabWidthToggleInvalidates(invalidations, 0, defaultWidth);
+			}
+			expectDisposedEditorStopsInvalidating(harness.editor, harness.editorContainer, invalidations, defaultWidth);
+		} finally {
+			harness.editorContainer.clear();
+			await dirState.restore();
+			await restoreLifecycleGlobals(globals);
+		}
+	});
+
 	test("/debug log viewer opens over the pet-wrapped composer", async () => {
 		const globals = snapshotLifecycleGlobals();
 		const harness = makeComposerHarness();
