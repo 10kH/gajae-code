@@ -268,7 +268,9 @@ test("win32 production host exit after ready is ready_then_exited, not spawn_fai
 	const { root, cwd, agentDir } = await tempRoot("host-exit-after-ready");
 	const broker = new Broker({ agentDir });
 	const previous = process.env.GJC_SDK_TEST_EXIT_AFTER_READY;
+	const previousInMemory = process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
 	process.env.GJC_SDK_TEST_EXIT_AFTER_READY = cwd;
+	process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
 	setLifecycleHostPlatformForTest("win32");
 	try {
 		await broker.start();
@@ -284,6 +286,8 @@ test("win32 production host exit after ready is ready_then_exited, not spawn_fai
 	} finally {
 		if (previous === undefined) delete process.env.GJC_SDK_TEST_EXIT_AFTER_READY;
 		else process.env.GJC_SDK_TEST_EXIT_AFTER_READY = previous;
+		if (previousInMemory === undefined) delete process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+		else process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = previousInMemory;
 		setLifecycleHostPlatformForTest(undefined);
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
@@ -293,7 +297,9 @@ test("win32 host that rejects after ready is ready_then_exited, never spawn_fail
 	const { root, cwd, agentDir } = await tempRoot("host-reject-after-ready");
 	const broker = new Broker({ agentDir });
 	const previous = process.env.GJC_SDK_TEST_REJECT_AFTER_READY;
+	const previousInMemory = process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
 	process.env.GJC_SDK_TEST_REJECT_AFTER_READY = cwd;
+	process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = "1";
 	setLifecycleHostPlatformForTest("win32");
 	try {
 		await broker.start();
@@ -312,6 +318,8 @@ test("win32 host that rejects after ready is ready_then_exited, never spawn_fail
 	} finally {
 		if (previous === undefined) delete process.env.GJC_SDK_TEST_REJECT_AFTER_READY;
 		else process.env.GJC_SDK_TEST_REJECT_AFTER_READY = previous;
+		if (previousInMemory === undefined) delete process.env.GJC_SDK_TEST_IN_MEMORY_SESSION;
+		else process.env.GJC_SDK_TEST_IN_MEMORY_SESSION = previousInMemory;
 		setLifecycleHostPlatformForTest(undefined);
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });

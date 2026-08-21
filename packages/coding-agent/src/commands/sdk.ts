@@ -56,6 +56,7 @@ export async function lifecycleArgs(
 		messages: [],
 		fileArgs: [],
 		unknownFlags: new Map(),
+		...(process.env.GJC_SDK_TEST_IN_MEMORY_SESSION === "1" ? { noSession: true } : {}),
 		...(request.operation === "session.resume" ? { resume: request.sessionPath } : {}),
 		...(request.modelPreset ? { mpreset: request.modelPreset } : {}),
 		// Explicit model pin (#4707): coordinator-resolved `provider/model`
