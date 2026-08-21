@@ -254,7 +254,6 @@ export interface AutoresearchHudState extends WorkflowGateHudState {
 	intake?: string;
 	slug?: string;
 	specPath?: string;
-
 	verdict?: string;
 	experimentCount?: number;
 	experimentStatuses?: string[];
@@ -263,25 +262,29 @@ export interface AutoresearchHudState extends WorkflowGateHudState {
 
 export function buildAutoresearchHudSummary(state: AutoresearchHudState): WorkflowHudSummary {
 	const statuses = state.experimentStatuses ?? [];
-	const experimentCount = state.experimentCount ?? statuses.length;
-	const failures = statuses.filter(status => status === "crash" || status === "checks_failed").length;
+	const total = Math.max(state.experimentCount ?? statuses.length, statuses.length);
+	const kept = statuses.filter(status => status === "keep").length;
+	const crash = statuses.filter(status => status === "crash").length;
+	const checksFailed = statuses.filter(status => status === "checks_failed").length;
 	const chips: Array<WorkflowHudChip | null> = [
-		...gateChips(state, 50),
-		state.phase === "verdict" ? chip("verdict", state.verdict ?? "issued", 5, "success") : null,
+		...(state.phase === "verdict" ? [chip("verdict", state.verdict ?? "issued", 5)] : []),
 		chip("phase", state.phase, 10),
-		chip("mode", state.mode, 20),
-		...(experimentCount > 0
-			? [chip("experiments", `${experimentCount}/${statuses.filter(status => status === "keep").length}`, 30)]
-			: []),
-		failures > 0 ? { label: "failed", value: String(failures), priority: 4, severity: "warning" } : null,
+		...(total > 0 ? [chip("exp", `${kept}/${total}`, 20)] : []),
+		crash > 0 ? { label: "crash", value: String(crash), priority: 4, severity: "warning" } : null,
+		checksFailed > 0
+			? { label: "checks_failed", value: String(checksFailed), priority: 5, severity: "warning" }
+			: null,
+		chip("mode", state.mode, 30),
 		chip("intake", state.intake, 40),
 		chip("spec", state.specPath, 45),
+		...gateChips(state, 50),
 	];
-
+	const visibleChips =
+		total === 0 && state.phase !== "verdict" ? compactChips([chip("phase", state.phase, 10)]) : compactChips(chips);
 	return {
 		version: 1,
 		...(state.slug ? { summary: `autoresearch mission ${state.slug}` } : {}),
-		chips: compactChips(chips),
+		chips: visibleChips,
 		...(state.updatedAt ? { updated_at: state.updatedAt } : {}),
 	};
 }

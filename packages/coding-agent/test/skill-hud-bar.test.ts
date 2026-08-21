@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { renderSkillHudBar } from "../src/modes/components/skill-hud/render";
 import { STATUS_LINE_PRESETS } from "../src/modes/components/status-line/presets";
+import { theme } from "../src/modes/theme/theme";
 
 function visibleWidth(text: string): number {
 	return Bun.stripANSI(text).length;
@@ -36,7 +37,7 @@ describe("skill HUD bar renderer", () => {
 		expect(medium).toContain("experiments=2/4");
 		expect(medium).not.toContain("failed=1");
 		expect(tight).toContain("autoresearch");
-		expect(tight).toContain("[!");
+		expect(tight).toContain(theme?.status.warning ?? "[!]");
 	});
 
 	it("caps the HUD at two lines", () => {
@@ -44,6 +45,25 @@ describe("skill HUD bar renderer", () => {
 		const rendered = renderSkillHudBar(entries, 20);
 		expect(rendered).not.toBeNull();
 		expect(rendered?.split("\n").length).toBeLessThanOrEqual(2);
+	});
+
+	it("uses terminal-cell widths and keeps severity beside narrow content", () => {
+		const rendered = renderSkillHudBar(
+			[
+				{
+					skill: "가나다라마",
+					phase: "研究",
+					hud: { version: 1, chips: [{ label: "blocked", value: "yes", severity: "blocked" }] },
+				},
+			],
+			10,
+		);
+		expect(rendered).not.toBeNull();
+		const rows = (rendered ?? "").split("\n");
+		expect(rows.every(row => Bun.stringWidth(Bun.stripANSI(row)) > 0)).toBe(true);
+		expect(rows.every(row => Bun.stringWidth(Bun.stripANSI(row)) <= 10)).toBe(true);
+		expect(rows[0]).not.toBe("◆");
+		expect(rendered).toContain(theme?.status.error ?? "[!!]");
 	});
 
 	it("sanitizes dynamic text and truncates to width", () => {
@@ -90,7 +110,7 @@ describe("skill HUD bar renderer", () => {
 		expect(rendered).toContain("ralplan:planning consensus");
 		expect(rendered).toContain("stage=critic");
 		expect(rendered).toContain("verdict=ITERATE");
-		expect(rendered).toContain("[!");
+		expect(rendered).toContain(theme?.status.warning ?? "[!]");
 	});
 
 	it("sanitizes HUD chips and keeps constrained rendering within width", () => {
@@ -147,7 +167,7 @@ describe("skill HUD bar renderer", () => {
 		);
 		expect(rendered).toContain("deep-interview:interviewing");
 		expect(rendered).toContain("next=ask user for approval");
-		expect(rendered).toContain("[!!]");
+		expect(rendered).toContain(theme?.status.error ?? "[!!]");
 		expect(rendered).not.toContain("receipt=fresh");
 	});
 

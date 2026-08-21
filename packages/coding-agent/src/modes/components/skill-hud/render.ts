@@ -1,3 +1,4 @@
+import { truncateToWidth, visibleWidth } from "@gajae-code/tui";
 import {
 	collapsePlanningPipeline,
 	type SkillActiveEntry,
@@ -8,25 +9,14 @@ import { theme } from "../../theme/theme";
 
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 
+type WidthTier = "wide" | "medium" | "tight";
+
 function color(role: "border" | "accent" | "dim" | "muted" | "warning" | "error", text: string): string {
 	return theme?.fg(role, text) ?? text;
 }
 
 function statusSymbol(kind: "warning" | "error"): string {
 	return theme?.status[kind] ?? (kind === "error" ? "[!!]" : "[!]");
-}
-
-type WidthTier = "wide" | "medium" | "tight";
-
-function visibleWidth(text: string): number {
-	return text.replace(ANSI_PATTERN, "").length;
-}
-
-function truncateToWidth(text: string, maxWidth: number): string {
-	if (maxWidth <= 0) return "";
-	if (visibleWidth(text) <= maxWidth) return text;
-	const plain = text.replace(ANSI_PATTERN, "");
-	return maxWidth === 1 ? "…" : `${plain.slice(0, maxWidth - 1)}…`;
 }
 
 function sanitizeHudPart(value: string | undefined): string {
@@ -71,58 +61,99 @@ function formatChip(chip: WorkflowHudChip): string | null {
 	return role ? color(role, body) : color("dim", body);
 }
 
-function formatEntry(entry: SkillActiveEntry, tier: WidthTier): string {
+function keyMetricChip(skill: string, chips: readonly WorkflowHudChip[]): WorkflowHudChip | undefined {
+	const preferredBySkill: Record<string, readonly string[]> = {
+		"deep-interview": ["ambiguity"],
+		ralplan: ["iter", "round", "stage"],
+		ultragoal: ["goals", "current"],
+		autoresearch: ["exp", "experiments"],
+	};
+	const preferred = preferredBySkill[skill] ?? [];
+	return (
+		preferred.map(label => chips.find(chip => chip.label === label && !severityOf(chip))).find(Boolean) ??
+		chips.find(chip => !severityOf(chip))
+	);
+}
+
+function fitWithSuffix(prefix: string, suffix: string, width: number): string {
+	if (width <= 0) return "";
+	if (!suffix) return truncateToWidth(prefix, width);
+	const suffixWidth = visibleWidth(suffix);
+	if (suffixWidth >= width) return truncateToWidth(suffix, width);
+	return `${truncateToWidth(prefix, width - suffixWidth)}${suffix}`;
+}
+
+function formatEntry(entry: SkillActiveEntry, tier: WidthTier, width: number): string {
 	const skill = sanitizeHudPart(entry.skill);
 	const phase = sanitizeHudPart(entry.phase);
 	const base = phase ? `${skill}:${phase}` : skill;
 	const chips = [...(entry.hud?.chips ?? [])].sort(compareChips);
 	if (entry.stale === true) chips.unshift({ label: "stale", priority: 0, severity: "warning" });
-	if (workflowReceiptStatus(entry.receipt) === "stale")
+	if (workflowReceiptStatus(entry.receipt) === "stale") {
 		chips.unshift({ label: "receipt", value: "stale", priority: 1, severity: "warning" });
+	}
 
 	const severity =
 		chips.find(chip => chip.severity === "error" || chip.severity === "blocked")?.severity ??
 		chips.find(chip => chip.severity === "warning")?.severity;
-	if (tier === "tight") return `${color("accent", skill)}${severityGlyph(severity)}`;
-	const metric = chips.find(chip => !severityOf(chip));
+	const suffix = severity ? ` ${severityGlyph(severity)}` : "";
+	if (tier === "tight") return fitWithSuffix(color("accent", skill), suffix, width);
+
+	const metric = keyMetricChip(skill, chips);
 	if (tier === "medium") {
-		const metricText = metric ? formatChip(metric) : "";
-		return [color("accent", base), metricText, severityGlyph(severity)].filter(Boolean).join(" ");
+		const prefix = [color("accent", base), metric ? formatChip(metric) : ""].filter(Boolean).join(" ");
+		return fitWithSuffix(prefix, suffix, width);
 	}
+
 	const summary = sanitizeHudPart(entry.hud?.summary);
 	const details = chips.map(formatChip).filter((chip): chip is string => Boolean(chip));
-	return [color("accent", base), summary ? color("muted", summary) : "", ...details, severityGlyph(severity)]
-		.filter(Boolean)
-		.join(" ");
+	const prefix = [color("accent", base), summary ? color("muted", summary) : "", ...details].filter(Boolean).join(" ");
+	return fitWithSuffix(prefix, suffix, width);
 }
 
 export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: number): string | null {
 	const visible = collapsePlanningPipeline(entries.filter(entry => entry.active !== false));
 	const active = visible.filter(entry => sanitizeHudPart(entry.skill)).sort(compareEntries);
 	if (active.length === 0 || width <= 0) return null;
+
 	const tier = tierForWidth(width);
 	const rail = color("border", "◆");
 	const separator = color("dim", " + ");
-	const lines: string[] = [];
-	let current = rail;
+	const railPrefix = visibleWidth(rail) + 1 <= width ? `${rail} ` : "";
+	const rows: string[] = [];
+	let row = railPrefix;
+	let hasEntry = false;
+	let omitted = false;
+
 	for (const entry of active) {
-		const rendered = formatEntry(entry, tier);
-		const candidate = current === rail ? `${current} ${rendered}` : `${current}${separator}${rendered}`;
-		if (visibleWidth(candidate) <= width) {
-			current = candidate;
-		} else if (lines.length === 0) {
-			lines.push(truncateToWidth(current, width));
-			current = `${rail} ${rendered}`;
-		} else {
-			lines.push(truncateToWidth(`${current}…`, width));
-			current = "";
-			break;
+		const joiner = hasEntry ? separator : "";
+		const budget = Math.max(0, width - visibleWidth(row) - visibleWidth(joiner));
+		const fullRendered = formatEntry(entry, tier, 4096);
+		let rendered = visibleWidth(fullRendered) <= budget ? fullRendered : "";
+		if (!rendered) {
+			if (!hasEntry) {
+				row = "";
+				rendered = formatEntry(entry, tier, width);
+			} else if (rows.length === 0) {
+				rows.push(truncateToWidth(row, width));
+				row = railPrefix;
+				hasEntry = false;
+				const firstRowBudget = Math.max(0, width - visibleWidth(row));
+				rendered = visibleWidth(fullRendered) <= firstRowBudget ? fullRendered : formatEntry(entry, tier, width);
+			} else {
+				omitted = true;
+				break;
+			}
 		}
+		if (!rendered) continue;
+		row = `${row}${hasEntry ? separator : ""}${rendered}`;
+		hasEntry = true;
 	}
-	if (current.trim()) lines.push(truncateToWidth(current, width));
-	if (lines.length > 2) {
-		lines.length = 2;
-		lines[1] = truncateToWidth(lines[1] ?? "", width);
+
+	if (hasEntry) rows.push(truncateToWidth(row, width));
+	if (omitted && rows.length > 0) {
+		const last = rows.length - 1;
+		rows[last] = truncateToWidth(`${rows[last]}…`, width);
 	}
-	return lines.join("\n");
+	return rows.slice(0, 2).join("\n") || null;
 }

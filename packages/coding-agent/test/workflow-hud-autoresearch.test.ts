@@ -14,8 +14,9 @@ describe("autoresearch HUD summary", () => {
 		});
 		expect(summary.chips).toEqual(
 			expect.arrayContaining([
-				expect.objectContaining({ label: "experiments", value: "4/1" }),
-				expect.objectContaining({ label: "failed", value: "2", severity: "warning" }),
+				expect.objectContaining({ label: "exp", value: "1/4" }),
+				expect.objectContaining({ label: "crash", value: "1", severity: "warning" }),
+				expect.objectContaining({ label: "checks_failed", value: "1", severity: "warning" }),
 			]),
 		);
 	});
