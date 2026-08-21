@@ -6174,11 +6174,7 @@ export class SqliteAuthCredentialStore implements AuthCredentialStore {
 					.get(target.id) as
 					| { id?: number; provider?: string; credential_type?: string; revision?: number }
 					| undefined;
-				if (
-					!row ||
-					row.provider !== provider ||
-					row.revision !== target.expectedRevision
-				) {
+				if (!row || row.provider !== provider || row.revision !== target.expectedRevision) {
 					currentIds.push(row?.id ?? target.id);
 				}
 			}

@@ -3226,9 +3226,7 @@ export class SelectorController {
 			}
 			const result = authStorage.removeAuthCredentialsHard(providerId, selected);
 			if (result.kind !== "removed") {
-				this.ctx.showError(
-					"Logout failed: account inventory changed; no credentials were removed. Retry /logout.",
-				);
+				this.ctx.showError("Logout failed: account inventory changed; no credentials were removed. Retry /logout.");
 				return;
 			}
 			await clearPersistentPinForRemovedRows(this.ctx.settings, providerId, inventory, result.ids);
