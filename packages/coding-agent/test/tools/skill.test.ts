@@ -715,6 +715,81 @@ describe("SkillTool", () => {
 		});
 	}
 
+	// Manifest-driven chain permissions (autoresearch handoff-ready at any live
+	// phase; ralplan "final" is a manifest terminal state the generic set misses;
+	// ralplan/ultragoal live phases stay blocked).
+	for (const [phase, callee] of [
+		["research", "deep-interview"],
+		["verdict", "ralplan"],
+		["intake", "ralplan"],
+	] as const) {
+		it(`allows autoresearch (phase=${phase}) to chain into ${callee} without a pre-write`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, "autoresearch", phase, "s1");
+			const autoresearch = await makeSkill("autoresearch", "---\nname: autoresearch\n---\nResearch");
+			const target = await makeSkill(callee, `---\nname: ${callee}\n---\nBody`);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [autoresearch, target], captured, {
+				getActiveSkillState: () => ({ skill: "autoresearch", session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			const result = await tool.execute("call-1", { name: callee });
+			expect(result.details?.name).toBe(callee);
+			expect(captured).toHaveLength(1);
+			const ar = await readModeState(cwd, "autoresearch", "s1");
+			expect(ar?.active).toBe(false);
+			expect(ar?.current_phase).toBe("handoff");
+			expect(ar?.handoff_to).toBe(callee);
+			const promoted = await readModeState(cwd, callee, "s1");
+			expect(promoted?.active).toBe(true);
+			expect(promoted?.handoff_from).toBe("autoresearch");
+		});
+	}
+
+	it("allows ralplan (phase=final, manifest terminal) to chain into ultragoal", async () => {
+		const cwd = await makeTempCwd();
+		await writeCallerModeState(cwd, "ralplan", "final", "s1");
+		const ralplan = await makeSkill("ralplan", "---\nname: ralplan\n---\nPlan");
+		const ultragoal = await makeSkill("ultragoal", "---\nname: ultragoal\n---\nGo");
+		const captured: CapturedSend[] = [];
+		const session = createSession(cwd, [ralplan, ultragoal], captured, {
+			getActiveSkillState: () => ({ skill: "ralplan", session_id: "s1" }),
+			getActiveSkillPhase: () => "final",
+		});
+		const tool = SkillTool.createIf(session)!;
+
+		const result = await tool.execute("call-1", { name: "ultragoal" });
+		expect(result.details?.name).toBe("ultragoal");
+		const rp = await readModeState(cwd, "ralplan", "s1");
+		expect(rp?.active).toBe(false);
+		expect(rp?.handoff_to).toBe("ultragoal");
+		const ug = await readModeState(cwd, "ultragoal", "s1");
+		expect(ug?.active).toBe(true);
+	});
+
+	for (const [caller, phase, callee] of [
+		["ralplan", "planner", "ultragoal"],
+		["ultragoal", "active", "ralplan"],
+	] as const) {
+		it(`still refuses ${caller} mid-flight chaining (phase=${phase})`, async () => {
+			const cwd = await makeTempCwd();
+			await writeCallerModeState(cwd, caller, phase, "s1");
+			const callerSkill = await makeSkill(caller, `---\nname: ${caller}\n---\nBody`);
+			const target = await makeSkill(callee, `---\nname: ${callee}\n---\nBody`);
+			const captured: CapturedSend[] = [];
+			const session = createSession(cwd, [callerSkill, target], captured, {
+				getActiveSkillState: () => ({ skill: caller, session_id: "s1" }),
+				getActiveSkillPhase: () => phase,
+			});
+			const tool = SkillTool.createIf(session)!;
+
+			await expect(tool.execute("call-1", { name: callee })).rejects.toThrow(/refusing to chain/);
+			expect(captured).toHaveLength(0);
+		});
+	}
+
 	it("calls handoff CLI before dispatching the chained skill (ordering)", async () => {
 		const cwd = await makeTempCwd();
 		await writeCallerModeState(cwd, "deep-interview", "handoff", "s1");
