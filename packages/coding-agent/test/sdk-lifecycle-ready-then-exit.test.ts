@@ -21,7 +21,6 @@ async function tempRoot(label: string): Promise<{ root: string; cwd: string; age
 	const cwd = path.join(root, "workspace");
 	const agentDir = path.join(root, "agent");
 	await fs.mkdir(cwd, { recursive: true });
-	await fs.mkdir(agentDir, { recursive: true });
 	return { root, cwd, agentDir };
 }
 function bunEval(source: string): { file: string; args: string[] } {
