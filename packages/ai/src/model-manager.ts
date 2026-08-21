@@ -1,5 +1,5 @@
 import { applyFinalCodexGpt56ContextCap } from "./context-cap-policy";
-import { readModelCache, writeModelCache } from "./model-cache";
+import { readModelCache, updateModelCacheIfUnchanged, writeModelCache } from "./model-cache";
 import { isRetiredModel, isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
 import { type GeneratedProvider, getBundledModels } from "./models";
@@ -221,7 +221,7 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 	// local-only mode has no network attempt whose failure would warrant
 	// withholding them.
 	const cacheModelsServeCurrentContext = !cacheProvenanceMismatch || strategy === "offline";
-	const cacheModels =
+	let cacheModels =
 		dynamicFetchSucceeded || !cacheModelsServeCurrentContext ? [] : normalizeModelList<TApi>(cache?.models ?? []);
 	const dynamicModels = fetchedDynamicModels ?? [];
 	const mergedWithCache = mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), cacheModels);
@@ -249,17 +249,28 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 			}
 		} else {
 			// Dynamic fetch failed — update cache with a non-authoritative snapshot so
-			// stale state remains visible while retry backoff still applies. Rows
-			// from a mismatched provenance context are never republished: only the
-			// still-matching cache may backfill, and a provenance-mismatched cache
-			// contributes nothing.
+			// stale state remains visible while retry backoff still applies. Re-read
+			// the current row and trust only that row's provenance and dynamic IDs,
+			// not the initial cacheProvenanceMismatch snapshot. A concurrent writer
+			// may have replaced the provider row; if the latest row is unbound or
+			// belongs to another context, use no latest fallback and do not
+			// overwrite or downgrade it.
 			const latestCache = readModelCache<TApi>(options.providerId, ttlMs, now, dbPath);
-			const fallbackCacheModels = cacheModelsServeCurrentContext
-				? normalizeModelList<TApi>(latestCache?.models ?? cache?.models ?? [])
+			const latestCacheMatchesCurrentContext = cacheRowMatchesBoundDynamicProvenance(
+				latestCache,
+				options.cacheDynamicModelProvenance,
+			);
+			const fallbackCacheModels = latestCacheMatchesCurrentContext
+				? normalizeModelList<TApi>(latestCache.models)
 				: [];
-			if (options.canPublishCache?.() ?? true) {
-				writeModelCache(
+			cacheModels = fallbackCacheModels;
+			if ((options.canPublishCache?.() ?? true) && latestCacheMatchesCurrentContext) {
+				const updated = updateModelCacheIfUnchanged(
 					options.providerId,
+					latestCache.updatedAt,
+					latestCache.dynamicModelIds,
+					latestCache.dynamicModelProvenance,
+					latestCache.models,
 					now(),
 					applyFinalCodexGpt56ContextCap(
 						mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), fallbackCacheModels),
@@ -268,11 +279,18 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 					staticFingerprint,
 					dbPath,
 				);
+				if (!updated) cacheModels = [];
 			}
 		}
 	}
+	const returnedModels =
+		shouldFetchFromNetwork && !dynamicFetchSucceeded
+			? applyFinalCodexGpt56ContextCap(
+					mergeDynamicModels(mergeModelSources(staticModels, modelsDevModels), cacheModels),
+				)
+			: models;
 	return {
-		models,
+		models: returnedModels,
 		stale: !dynamicAuthoritative,
 		cacheFresh: cache?.fresh ?? false,
 		cacheAuthoritative: cache?.authoritative ?? false,
@@ -314,6 +332,29 @@ async function fetchDynamicModels<TApi extends Api>(
 	} catch {
 		return null;
 	}
+}
+
+function cacheRowMatchesBoundDynamicProvenance<
+	TCache extends {
+		models: readonly { id: string }[];
+		dynamicModelIds?: readonly string[];
+		dynamicModelProvenance?: string;
+	},
+>(
+	cache: TCache | null | undefined,
+	expectedProvenance: string | undefined,
+): cache is TCache & { dynamicModelIds: readonly string[]; dynamicModelProvenance: string } {
+	if (
+		cache == null ||
+		cache.dynamicModelIds === undefined ||
+		cache.dynamicModelProvenance === undefined ||
+		expectedProvenance === undefined ||
+		cache.dynamicModelProvenance !== expectedProvenance
+	) {
+		return false;
+	}
+	const modelIds = new Set(cache.models.map(model => model.id));
+	return cache.dynamicModelIds.every(id => modelIds.has(id));
 }
 
 function shouldFetchRemoteSources(

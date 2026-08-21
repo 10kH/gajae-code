@@ -156,3 +156,43 @@ export function writeModelCache<TApi extends Api>(
 		// Cache writes are best-effort; failures should not break model resolution.
 	}
 }
+
+export function updateModelCacheIfUnchanged<TApi extends Api>(
+	providerId: string,
+	expectedUpdatedAt: number,
+	expectedDynamicModelIds: readonly string[] | undefined,
+	expectedDynamicModelProvenance: string | undefined,
+	expectedModels: readonly Model<TApi>[],
+	updatedAt: number,
+	models: Model<TApi>[],
+	authoritative: boolean,
+	staticFingerprint: string,
+	dbPath?: string,
+): boolean {
+	try {
+		const expectedIds = expectedDynamicModelIds === undefined ? null : JSON.stringify(expectedDynamicModelIds);
+		const provenance = expectedDynamicModelProvenance ?? null;
+		const expectedModelsJson = JSON.stringify(expectedModels);
+		const result = getDb(dbPath).run(
+			`UPDATE model_cache
+			 SET updated_at = ?, authoritative = ?, static_fingerprint = ?, dynamic_model_ids = NULL,
+			     dynamic_model_provenance = NULL, models = ?
+			 WHERE provider_id = ? AND updated_at = ?
+			   AND dynamic_model_ids IS ? AND dynamic_model_provenance IS ? AND models = ?`,
+			[
+				updatedAt,
+				authoritative ? 1 : 0,
+				staticFingerprint,
+				JSON.stringify(models),
+				providerId,
+				expectedUpdatedAt,
+				expectedIds,
+				provenance,
+				expectedModelsJson,
+			],
+		);
+		return result.changes === 1;
+	} catch {
+		return false;
+	}
+}
