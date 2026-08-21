@@ -18,6 +18,7 @@ import {
 	runNativeAutoresearchCommand,
 } from "@gajae-code/coding-agent/gjc-runtime/autoresearch-runtime";
 import {
+	activeSnapshotPath,
 	autoresearchRlmArtifactRoot,
 	sessionAutoresearchDir,
 	sessionAutoresearchRunsDir,
@@ -602,6 +603,13 @@ describe("autoresearch intake (AC-14..AC-15)", () => {
 			root,
 		);
 		expect(run.status).toBe(0);
+		const activeState = JSON.parse(await fs.readFile(activeSnapshotPath(root, TEST_SESSION_ID), "utf-8")) as {
+			active_skills?: Array<{ skill?: string; hud?: { chips?: Array<{ label?: string; value?: string }> } }>;
+		};
+		const autoresearchEntry = activeState.active_skills?.find(entry => entry.skill === "autoresearch");
+		expect(autoresearchEntry?.hud?.chips).toEqual(
+			expect.arrayContaining([expect.objectContaining({ label: "exp", value: "1/1" })]),
+		);
 		const critic = await runNativeAutoresearchCommand(
 			["critic", "--status-json", '{"verdict":"OKAY"}', "--evidence", "reviewed", "--evaluator", "critic"],
 			root,

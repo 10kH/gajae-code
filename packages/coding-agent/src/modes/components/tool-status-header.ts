@@ -1050,7 +1050,9 @@ export class StatusLineComponent implements Component {
 		this.#refreshSkillHudInBackground();
 		const skillHud = this.#settings.showSkillHud === false ? null : renderSkillHudBar(this.#skillHudEntries, width);
 		if (skillHud) {
-			lines.push(skillHud);
+			for (const skillHudRow of skillHud.split("\n")) {
+				if (skillHudRow) lines.push(truncateToWidth(skillHudRow, width));
+			}
 		}
 
 		const statusRows = this.#buildStatusRows(width, this.#resolveMaxRows());

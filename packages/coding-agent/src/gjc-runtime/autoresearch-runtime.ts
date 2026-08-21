@@ -41,6 +41,7 @@ import {
 	type MetricDirection,
 } from "../autoresearch/runs";
 import { syncSkillActiveState } from "../skill-state/active-state";
+import { buildAutoresearchHudSummary } from "../skill-state/workflow-hud";
 import { renderCliWriteReceipt } from "./cli-write-receipt";
 import { sessionAutoresearchDir } from "./session-layout";
 import {
@@ -794,7 +795,7 @@ export async function autoresearchLogRun(input: {
 		description,
 		...(input.metric === undefined ? {} : { metric: input.metric }),
 	});
-	return await appendAutoresearchLedger(
+	const ledgerEvent = await appendAutoresearchLedger(
 		input.cwd,
 		{
 			event: "run_logged",
@@ -806,6 +807,9 @@ export async function autoresearchLogRun(input: {
 		},
 		sessionId,
 	);
+	const mission = await readAutoresearchMission(input.cwd, sessionId);
+	if (mission) await reconcileAutoresearchState(input.cwd, mission, sessionId, { phase: "research" });
+	return ledgerEvent;
 }
 
 /** Record the optional per-mission critic pass; its evaluator is distinct from the mission agent. */
@@ -1027,6 +1031,32 @@ async function reconcileAutoresearchState(
 	const resolvedSessionId =
 		sessionId?.trim() || resolveGjcSessionForWrite(cwd, { envSessionId: process.env.GJC_SESSION_ID }).gjcSessionId;
 	try {
+		const ledger = await readAutoresearchLedger(cwd, resolvedSessionId);
+		const store = await AutoresearchRunsStore.open(cwd, resolvedSessionId);
+		const latestVerdict = [...ledger]
+			.reverse()
+			.find(event => event.event === "verdict_issued" && event.verdictReceipt);
+		const verdictReceipt = latestVerdict?.verdictReceipt as AutoresearchVerdictReceipt | undefined;
+		const verdictStatus = verdictReceipt?.status;
+		const verdict = verdictStatus
+			? typeof verdictStatus.verdict === "string"
+				? verdictStatus.verdict
+				: typeof verdictStatus.status === "string"
+					? verdictStatus.status
+					: undefined
+			: undefined;
+		const hud = mission
+			? buildAutoresearchHudSummary({
+					phase: options.phase ?? "research",
+					mode: mission.mode,
+					intake: mission.intake,
+					slug: mission.slug,
+					specPath: mission.specPath,
+					verdict,
+					experimentStatuses: store.listLoggedRuns().flatMap(run => (run.status ? [run.status] : [])),
+					updatedAt: new Date().toISOString(),
+				})
+			: undefined;
 		await syncSkillActiveState({
 			cwd,
 			skill: "autoresearch",
@@ -1034,13 +1064,10 @@ async function reconcileAutoresearchState(
 			phase: options.phase ?? "research",
 			sessionId: resolvedSessionId,
 			source: "gjc-autoresearch-native",
-			hud: {
+			hud: hud ?? {
 				version: 1,
-				summary: mission ? `autoresearch mission ${mission.slug}` : "autoresearch mission cleared",
-				chips: [
-					...(mission ? [{ label: "mode", value: mission.mode }] : []),
-					...(mission ? [{ label: "intake", value: mission.intake }] : []),
-				],
+				summary: "autoresearch mission cleared",
+				chips: [],
 				updated_at: new Date().toISOString(),
 			},
 		});
