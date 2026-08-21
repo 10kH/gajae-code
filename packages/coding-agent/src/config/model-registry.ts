@@ -1791,11 +1791,20 @@ export class ModelRegistry {
 				expectedProvenance = undefined;
 			}
 			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance);
+			// Cache rows persist sanitized transport metadata (no headers), so a
+			// rebooted registry re-derives the provider transport override from the
+			// same source the live publish path uses — mirroring the cached
+			// descriptor path — instead of serving header-less models until the
+			// next successful online discovery.
+			const providerOverride = this.#resolveProviderOverride(providerConfig.provider);
+			const withTransport = providerOverride
+				? models.map(model => this.#applyProviderTransportOverride(model, providerOverride))
+				: models;
 			const normalized = this.#applyProviderModelOverrides(
 				providerConfig.provider,
 				this.#normalizeDiscoverableModels(
 					providerConfig,
-					this.#applyProviderCompat(providerConfig.compat, [...models]),
+					this.#applyProviderCompat(providerConfig.compat, [...withTransport]),
 				),
 			);
 			applyGeneratedModelPolicies(normalized);

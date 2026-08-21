@@ -454,6 +454,74 @@ describe("online-if-uncached model refresh", () => {
 		}
 	});
 
+	test("applies non-authoritative retry backoff to a bound failed-fetch tombstone instead of refetching on every visit", async () => {
+		const providerId = "cache-tombstone-retry-backoff";
+		const staticModels = [model(providerId, "static")];
+		const now = 1_700_000_000_000;
+		const provenance = "credential-a\u0000https://provider-a.example.test";
+		let discoveryCalls = 0;
+
+		// Failed fetch with no prior row: a non-authoritative tombstone lands.
+		const failed = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return null;
+				},
+			},
+			"online",
+		);
+		expect(failed.models.map(entry => entry.id)).toEqual(["static"]);
+		expect(discoveryCalls).toBe(1);
+		expect(readModelCache<Api>(providerId, CACHE_TTL_MS, () => now, cacheDbPath)).toMatchObject({
+			authoritative: false,
+		});
+
+		// A fresh-but-non-authoritative tombstone must not force a network
+		// attempt on the next non-offline visit: the standard retry backoff
+		// applies, so online-if-uncached answers from the row without fetching.
+		const revisit = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now + 1000,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return [model(providerId, "dynamic")];
+				},
+			},
+			"online-if-uncached",
+		);
+		expect(revisit.fetched).toBe(false);
+		expect(discoveryCalls).toBe(1);
+		expect(revisit.models.map(entry => entry.id)).toEqual(["static"]);
+
+		// Once the row ages past the retry interval, the fetch resumes.
+		const afterBackoff = await resolveProviderModels<Api>(
+			{
+				providerId,
+				staticModels,
+				cacheDbPath,
+				now: () => now + 1000 + NON_AUTHORITATIVE_RETRY_MS,
+				cacheDynamicModelProvenance: provenance,
+				fetchDynamicModels: async () => {
+					discoveryCalls += 1;
+					return [model(providerId, "dynamic")];
+				},
+			},
+			"online-if-uncached",
+		);
+		expect(afterBackoff.fetched).toBe(true);
+		expect(discoveryCalls).toBe(2);
+	});
+
 	test("fails closed when a failed fetch re-reads a same-provenance row with inconsistent or absent dynamic IDs", async () => {
 		for (const inconsistentIds of [undefined, ["dynamic-a"]] as const) {
 			const providerId = `cache-failed-fetch-inconsistent-ids-${inconsistentIds === undefined ? "absent" : "mismatch"}`;

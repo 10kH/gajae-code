@@ -152,7 +152,15 @@ export async function resolveProviderModels<TApi extends Api = Api, TModelsDevPa
 				: cache?.dynamicModelIds === undefined || cacheDynamicModelIdsCurrent));
 	const cacheAgeMs = cache ? now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 	const shouldFetchFromNetwork =
-		cacheProvenanceMismatch && strategy !== "offline"
+		// A bound row whose dynamic IDs are defined but stale belongs to a
+		// different discovery context: force the validation fetch immediately,
+		// on every non-offline visit, until a row for this context lands.
+		// A row with no dynamic IDs (a failed-fetch tombstone, or a legacy
+		// provenance-less row) cannot prove foreignness, never serves its
+		// models in a bound context, and is non-authoritative — so its refetch
+		// cadence follows the standard non-authoritative retry backoff instead
+		// of hammering a failing endpoint on every provider-tab visit.
+		cacheProvenanceMismatch && cache?.dynamicModelIds !== undefined && strategy !== "offline"
 			? true
 			: shouldFetchRemoteSources(strategy, cache?.fresh ?? false, hasAuthoritativeCache, cacheAgeMs);
 	const staticFingerprint = fingerprintStatic(staticModels);

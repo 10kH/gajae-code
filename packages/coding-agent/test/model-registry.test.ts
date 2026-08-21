@@ -6494,6 +6494,45 @@ describe("ModelRegistry", () => {
 			);
 			expect(state?.fetchedAt).toBe(row?.updatedAt);
 		});
+
+		test("restores non-secret provider transport headers on cached configured-discovery models after a reboot", async () => {
+			writeRawModelsJson({
+				"discovery-provider": {
+					baseUrl: "https://discovery.example.com/v1",
+					api: "openai-responses",
+					auth: "none",
+					discovery: { type: "openai-models-list" },
+					headers: { "X-Tenant-Id": "tenant-a" },
+				},
+			});
+			using _hook = hookFetch(
+				() =>
+					new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					}),
+			);
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refreshProvider("discovery-provider", "online-if-uncached");
+			const liveModel = registry.find("discovery-provider", "discovered-model");
+			expect(liveModel?.headers?.["X-Tenant-Id"]).toBe("tenant-a");
+			// The persisted cache row itself is header-sanitized.
+			const row = readModelCache(
+				"discovery-provider",
+				24 * 60 * 60 * 1000,
+				Date.now,
+				path.join(tempDir, "models.db"),
+			);
+			expect(row?.models[0]?.headers?.["X-Tenant-Id"]).toBeUndefined();
+
+			// A rebooted registry serves the same cache row synchronously and must
+			// re-derive the provider transport override, so the model keeps its
+			// non-secret request headers without waiting for an online refetch.
+			const rebooted = new ModelRegistry(authStorage, modelsJsonPath);
+			const rebootedModel = rebooted.find("discovery-provider", "discovered-model");
+			expect(rebootedModel).toBeDefined();
+			expect(rebootedModel?.headers?.["X-Tenant-Id"]).toBe("tenant-a");
+		});
 		test("re-fetches configured discovery when an effective request header changes under constant credential and endpoint", async () => {
 			const discoveryConfigWithHeaders = (headers: Record<string, string>) => ({
 				"discovery-provider": {
