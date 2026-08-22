@@ -408,6 +408,10 @@ export function createCustomToolSettings(settings: Settings | ExtensionSettings)
 				if (property === "getModelRole") return settings.getModelRole;
 				return blockedMethod;
 			},
+			set: () => blockedMethod(),
+			deleteProperty: () => blockedMethod(),
+			defineProperty: () => blockedMethod(),
+			setPrototypeOf: () => blockedMethod(),
 		});
 	}
 	const extensionSettings = createExtensionSettings(settings);
@@ -422,6 +426,10 @@ export function createCustomToolSettings(settings: Settings | ExtensionSettings)
 			const bound = value.bind(target);
 			return (...args: unknown[]) => cloneAndFreeze(bound(...args));
 		},
+		set: () => blockedMethod(),
+		deleteProperty: () => blockedMethod(),
+		defineProperty: () => blockedMethod(),
+		setPrototypeOf: () => blockedMethod(),
 	});
 }
 

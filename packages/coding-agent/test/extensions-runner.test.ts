@@ -151,6 +151,10 @@ describe("ExtensionRunner", () => {
 			expect(() => {
 				if (aggregateShell.env) aggregateShell.env.TEST_SETTING = "mutated";
 			}).toThrow();
+			expect(() => Reflect.set(compatibility, "mutated", true)).toThrow();
+			expect(() => Reflect.deleteProperty(compatibility, "mutated")).toThrow();
+			expect(() => Object.defineProperty(compatibility, "mutated", { value: true })).toThrow();
+			expect(() => Object.setPrototypeOf(compatibility, null)).toThrow();
 			expect(backing).toEqual({
 				modelRoles: { image: ["openai/gpt-image-2", "openrouter/google/gemini-3-pro-image-preview"] },
 				rules: [{ pattern: "git push", tool: "bash" }],
