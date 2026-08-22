@@ -202,6 +202,61 @@ export function isExplicitEmptyGhResult(exitCode: number, stderr: string): boole
 	if (exitCode === 0) return true;
 	return EXPLICIT_EMPTY_PATTERNS.some(pattern => pattern.test(stderr));
 }
+/**
+ * True for a GitHub rate-limit refusal, the one failure that is worth waiting
+ * out instead of failing the release: the request was well-formed and the quota
+ * replenishes on a known schedule.
+ */
+export function isRateLimitedGhResult(exitCode: number, stderr: string): boolean {
+	if (exitCode === 0) return false;
+	return /rate limit exceeded|secondary rate limit|abuse detection/iu.test(stderr);
+}
+
+/**
+ * Milliseconds to wait for a quota window to reopen, from a UNIX-second reset
+ * stamp. Clamped: a missing/absurd stamp still waits a usable minimum, and a
+ * far-future stamp cannot park the release for longer than the ceiling.
+ */
+export function rateLimitWaitMs(resetAtSeconds: number | undefined, nowMs: number, ceilingMs = 90_000): number {
+	const resetAtMs = resetAtSeconds === undefined ? Number.NaN : resetAtSeconds * 1000;
+	if (!Number.isFinite(resetAtMs)) return Math.min(15_000, ceilingMs);
+	return Math.min(Math.max(resetAtMs - nowMs + 2_000, 5_000), ceilingMs);
+}
+
+/** Live search-endpoint quota, or undefined when it cannot be read. */
+async function searchQuotaResetSeconds(): Promise<{ remaining: number; reset: number } | undefined> {
+	const result = await $`gh api rate_limit --jq '.resources.search | "\(.remaining) \(.reset)"'`.quiet().nothrow();
+	if (result.exitCode !== 0) return undefined;
+	const [remaining, reset] = result.stdout.toString().trim().split(/\s+/u).map(Number);
+	if (!Number.isFinite(remaining) || !Number.isFinite(reset)) return undefined;
+	return { remaining: remaining as number, reset: reset as number };
+}
+
+/**
+ * Search-endpoint call, paced against the live quota.
+ *
+ * Search is the scarce endpoint here — an installation token gets 30 requests a
+ * minute, and a large release window needs one paginated query per contributing
+ * author, which exhausts it. Notes must stay COMPLETE (see
+ * `isExplicitEmptyGhResult`: a partially reachable GitHub silently drops
+ * attribution and new-contributor detection, and an immutable publish cannot be
+ * redone), so a limit is waited out here rather than skipped.
+ */
+async function ghSearch(args: readonly string[]): Promise<string> {
+	for (let attempt = 0; ; attempt++) {
+		const quota = await searchQuotaResetSeconds();
+		if (quota && quota.remaining <= 1) {
+			await Bun.sleep(rateLimitWaitMs(quota.reset, Date.now()));
+		}
+		const result = await $`gh ${args}`.quiet().nothrow();
+		if (result.exitCode === 0) return result.stdout.toString();
+		const stderr = result.stderr.toString().trim();
+		if (attempt >= 5 || !isRateLimitedGhResult(result.exitCode, stderr)) {
+			throw new Error(`gh ${args.join(" ")} failed (exit ${result.exitCode}): ${stderr}`);
+		}
+		await Bun.sleep(rateLimitWaitMs((await searchQuotaResetSeconds())?.reset, Date.now()));
+	}
+}
 
 async function gh(args: readonly string[]): Promise<string> {
 	const result = await $`gh ${args}`.quiet().nothrow();
@@ -289,7 +344,7 @@ async function firstMergedPullRequest(repo: string, author: string): Promise<num
 	// The search API cannot sort by merge time and its CLI JSON surface does not
 	// expose merge timestamps reliably. Paginate the REST search results and
 	// select the minimum explicit merge timestamp across the complete result set.
-	const raw = await gh([
+	const raw = await ghSearch([
 		"api",
 		"--paginate",
 		`search/issues?q=repo:${repo}+author:${author}+is:pr+is:merged&sort=created&order=asc&per_page=100`,

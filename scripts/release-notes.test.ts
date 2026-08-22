@@ -7,6 +7,8 @@ import {
 	buildReleaseNotes,
 	earliestMergedPullRequest,
 	isExplicitEmptyGhResult,
+	isRateLimitedGhResult,
+	rateLimitWaitMs,
 	normalizeSubject,
 	parseReleaseNotesCli,
 	parseSubjectPullRequestRef,
@@ -350,5 +352,34 @@ describe("first merged pull request selection", () => {
 			...laterCreated,
 			{ number: 999, mergedAt: "2026-01-01T00:00:00Z" },
 		])).toBe(999);
+	});
+});
+
+describe("search quota pacing", () => {
+	test("classifies only rate-limit refusals as waitable", () => {
+		expect(
+			isRateLimitedGhResult(
+				1,
+				"gh: API rate limit exceeded for installation. If you reach out to GitHub Support ... (HTTP 403)",
+			),
+		).toBe(true);
+		expect(isRateLimitedGhResult(1, "You have exceeded a secondary rate limit")).toBe(true);
+		// A success is never a rate limit, and every other refusal still fails closed:
+		// notes derived from a partially reachable GitHub drop attribution silently.
+		expect(isRateLimitedGhResult(0, "")).toBe(false);
+		expect(isRateLimitedGhResult(1, "HTTP 403: Resource not accessible by integration")).toBe(false);
+		expect(isRateLimitedGhResult(1, "HTTP 500: Internal Server Error")).toBe(false);
+		expect(isRateLimitedGhResult(1, "could not resolve to a PullRequest")).toBe(false);
+	});
+
+	test("waits past the reported reset, with a floor and a ceiling", () => {
+		const now = 1_787_400_000_000;
+		expect(rateLimitWaitMs(now / 1000 + 30, now)).toBe(32_000);
+		// Already-elapsed and missing stamps still wait a usable minimum.
+		expect(rateLimitWaitMs(now / 1000 - 600, now)).toBe(5_000);
+		expect(rateLimitWaitMs(undefined, now)).toBe(15_000);
+		// A far-future stamp cannot park the release indefinitely.
+		expect(rateLimitWaitMs(now / 1000 + 86_400, now)).toBe(90_000);
+		expect(rateLimitWaitMs(Number.NaN, now)).toBe(15_000);
 	});
 });
