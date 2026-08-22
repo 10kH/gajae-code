@@ -1,6 +1,8 @@
 # Changelog
 
 ## [Unreleased]
+
+## [0.15.0] - 2026-08-22
 ### Fixed
 
 - Upgraded napi-rs to `napi` 3.12.2 / `napi-derive` 3.6.3. Under Bun 1.4.0 the generated argument-reference container for an async `#[napi]` method asserted on `napi_reference_unref` returning `napi_invalid_arg` during teardown, so an SDK session host aborted with SIGABRT (exit 134) instead of exiting 0 after a graceful `session.close`.
