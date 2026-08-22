@@ -68,7 +68,9 @@ describe("ExtensionRunner", () => {
 
 	describe("safe tool resolver", () => {
 		it("exposes the authoritative session settings to extension contexts", () => {
-			const settings = {} as Settings;
+			const settings = {
+				getModelRole: (role: string) => (role === "image" ? "openai/gpt-image-2" : undefined),
+			} as Settings;
 			const runner = new ExtensionRunner(
 				[],
 				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
@@ -79,7 +81,10 @@ describe("ExtensionRunner", () => {
 				settings,
 			);
 
-			expect(runner.createContext().settings).toBe(settings);
+			const exposed = runner.createContext().settings;
+			expect(exposed).not.toBe(settings);
+			expect(exposed?.getModelRole("image")).toBe("openai/gpt-image-2");
+			expect("get" in (exposed ?? {})).toBe(false);
 		});
 
 		it("exposes the live credential session identity to extension contexts", () => {

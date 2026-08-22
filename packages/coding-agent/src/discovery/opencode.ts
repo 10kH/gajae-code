@@ -24,11 +24,11 @@ import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
 import { readFile } from "../capability/fs";
-import { type Settings, settingsCapability } from "../capability/settings";
+import { type Settings as SettingsCapabilityItem, settingsCapability } from "../capability/settings";
 import { type Skill, skillCapability } from "../capability/skill";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import { settings } from "../config/settings";
+import type { Settings as RuntimeSettings } from "../config/settings";
 
 import {
 	buildExtensionModuleItems,
@@ -133,11 +133,14 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
  * Falls back to true (current behavior) when settings are not initialized,
  * e.g. inside discovery unit tests that run without Settings.init().
  */
-function readOpencodeCommandToggles(): { enableUser: boolean; enableProject: boolean } {
+function readOpencodeCommandToggles(activeSettings?: Pick<RuntimeSettings, "get">): {
+	enableUser: boolean;
+	enableProject: boolean;
+} {
 	try {
 		return {
-			enableUser: settings.get("commands.enableOpencodeUser") ?? true,
-			enableProject: settings.get("commands.enableOpencodeProject") ?? true,
+			enableUser: activeSettings?.get("commands.enableOpencodeUser") ?? true,
+			enableProject: activeSettings?.get("commands.enableOpencodeProject") ?? true,
 		};
 	} catch {
 		return { enableUser: true, enableProject: true };
@@ -145,7 +148,7 @@ function readOpencodeCommandToggles(): { enableUser: boolean; enableProject: boo
 }
 
 async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashCommand>> {
-	const { enableUser, enableProject } = readOpencodeCommandToggles();
+	const { enableUser, enableProject } = readOpencodeCommandToggles(ctx.settings);
 	const userCommandsDir = enableUser ? getUserPath(ctx, "opencode", "commands") : null;
 	const projectCommandsDir = enableProject ? getProjectPath(ctx, "opencode", "commands") : null;
 
@@ -193,8 +196,8 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 // Settings (opencode.json)
 // =============================================================================
 
-async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
-	const items: Settings[] = [];
+async function loadSettings(ctx: LoadContext): Promise<LoadResult<SettingsCapabilityItem>> {
+	const items: SettingsCapabilityItem[] = [];
 	const warnings: string[] = [];
 
 	// User-level: ~/.config/opencode/opencode.json

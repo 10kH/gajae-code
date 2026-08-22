@@ -31,6 +31,8 @@ export interface LoadContext {
 	userAgentDir?: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
+	/** Owning session settings for provider policy decisions. */
+	settings?: Settings;
 }
 
 /**

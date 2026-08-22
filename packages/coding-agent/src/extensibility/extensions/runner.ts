@@ -61,6 +61,7 @@ import type {
 	UserPythonEvent,
 	UserPythonEventResult,
 } from "./types";
+import { createExtensionSettings } from "./types";
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -617,7 +618,7 @@ export class ExtensionRunner {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
-			settings: this.settings,
+			settings: this.settings ? createExtensionSettings(this.settings) : undefined,
 			get credentialSessionId() {
 				return getCredentialSessionId();
 			},

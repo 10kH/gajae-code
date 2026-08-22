@@ -36,6 +36,7 @@ import type * as piCodingAgent from "@gajae-code/coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { ModelSelectorValue } from "../../config/model-selector-value";
 import type { Settings } from "../../config/settings";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
@@ -334,6 +335,16 @@ export interface ExtensionSessionMetadata {
 	currentAgentType?: string;
 }
 
+/** Non-sensitive session policy exposed to third-party extensions. */
+export interface ExtensionSettings {
+	getModelRole(role: string): ModelSelectorValue | undefined;
+}
+
+/** Create an extension-safe settings facade without exposing credentials or mutation APIs. */
+export function createExtensionSettings(settings: Pick<Settings, "getModelRole">): ExtensionSettings {
+	return Object.freeze({ getModelRole: settings.getModelRole.bind(settings) });
+}
+
 /**
  * Context passed to extension event handlers.
  */
@@ -361,8 +372,8 @@ export interface ExtensionContext {
 	sessionMetadata?: ExtensionSessionMetadata;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
-	/** Session settings for role and provider resolution. */
-	settings?: Settings;
+	/** Non-sensitive session settings for role resolution. */
+	settings?: ExtensionSettings;
 	/** Credential-selection identity, distinct from logical/provider cache identity. */
 	credentialSessionId?: string;
 	/** Current model (may be undefined) */

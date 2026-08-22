@@ -10,12 +10,12 @@ import type { Model, Static, TSchema } from "@gajae-code/ai/core";
 import type { Component } from "@gajae-code/tui";
 import type { Rule } from "../../capability/rule";
 import type { ModelRegistry } from "../../config/model-registry";
-import type { Settings } from "../../config/settings";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
 import type { HookUIContext } from "../../extensibility/hooks/types";
 import type { Theme } from "../../modes/theme/theme";
 import type { ReadonlySessionManager } from "../../session/session-manager";
 import type { TodoItem } from "../../tools/todo-write";
+import type { ExtensionSettings } from "../extensions/types";
 
 /** Alias for clarity */
 export type CustomToolUIContext = HookUIContext;
@@ -80,8 +80,8 @@ export interface CustomToolContext {
 	hasQueuedMessages(): boolean;
 	/** Abort the current agent operation (fire-and-forget, does not wait) */
 	abort(): void;
-	/** Settings instance for the current session. Prefer over the global singleton. */
-	settings?: Settings;
+	/** Non-sensitive settings for the current session. */
+	settings?: ExtensionSettings;
 }
 
 /** Session event passed to onSession callback */

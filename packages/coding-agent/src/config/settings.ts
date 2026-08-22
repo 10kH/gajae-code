@@ -605,17 +605,6 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	/**
-	 * Make an explicitly supplied settings instance available to legacy ambient
-	 * consumers without loading a second, unrelated durable scope.
-	 */
-	static adoptForLegacy(instance: Settings): void {
-		if (globalInstancePromise) return;
-		globalInitOptions = {};
-		globalInstance = instance;
-		globalInstancePromise = Promise.resolve(instance);
-	}
-
-	/**
 	 * Load settings for an explicit workspace without changing the global singleton.
 	 * Managed-session policy resolution must be bound to the workspace being opened.
 	 */
@@ -1566,7 +1555,7 @@ export class Settings implements NotificationSettingsReader {
 
 	async #loadProjectSettings(): Promise<RawSettings> {
 		try {
-			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd });
+			const result = await loadCapability(settingsCapability.id, { cwd: this.#cwd, settings: this });
 			let merged: RawSettings = {};
 			for (const item of result.items as SettingsCapabilityItem[]) {
 				if (item.level !== "project") continue;

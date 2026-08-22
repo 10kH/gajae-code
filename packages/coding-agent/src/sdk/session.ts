@@ -65,7 +65,7 @@ import {
 	type ScopedModelSelection,
 } from "../config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
-import { isSettingsInitialized, Settings, type SkillsSettings } from "../config/settings";
+import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
@@ -82,6 +82,7 @@ import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibi
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../extensibility/custom-tools/types";
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import {
+	createExtensionSettings,
 	type ExtensionContext,
 	type ExtensionFactory,
 	ExtensionRunner,
@@ -1432,14 +1433,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				releaseSettingsScope(settings);
 			}
 		};
-		// Keep legacy singleton consumers (bash, edit guards, and older extension code)
-		// initialized for SDK child hosts without making the session's role resolution
-		// depend on that process-global instance. Session-aware tool contexts carry the
-		// scope-local `settings` object directly.
-		if (!isSettingsInitialized()) {
-			if (options.settings) Settings.adoptForLegacy(settings);
-			else await logger.time("settings:legacy-global", Settings.init, { cwd, agentDir });
-		}
 		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
 		// so services resolve the LIVE session cwd per activation instead of
 		// capturing the launch root. Before the manager exists the launch cwd is the
@@ -2684,7 +2677,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Add web search tools
 		if (options.toolNames?.includes("web_search")) {
 			const { getSearchTools } = await import("../web/search");
-			customTools.push(...getSearchTools());
+			customTools.push(...getSearchTools(settings));
 		}
 
 		const getReservedSubskillToolNames = () => [
@@ -3393,7 +3386,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				isIdle: () => !session?.isStreaming,
 				hasQueuedMessages: () => (session?.queuedMessageCount ?? 0) > 0,
 				abort: () => session?.abort(),
-				settings,
+				settings: createExtensionSettings(settings),
 			});
 			wrappedExtensionTools = (options.customTools ?? [])
 				.filter(isCustomTool)

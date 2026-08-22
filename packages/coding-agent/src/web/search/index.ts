@@ -439,42 +439,47 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 	}
 }
 
-/** Web search tool as CustomTool (for TUI rendering support) */
-export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRenderDetails> = {
-	name: "web_search",
-	label: "Web Search",
-	description: prompt.render(webSearchDescription),
-	parameters: webSearchSchema,
+/** Web search tool as CustomTool (for TUI rendering support). */
+function createWebSearchCustomTool(activeSettings?: Settings): CustomTool<typeof webSearchSchema, SearchRenderDetails> {
+	return {
+		name: "web_search",
+		label: "Web Search",
+		description: prompt.render(webSearchDescription),
+		parameters: webSearchSchema,
 
-	async execute(
-		toolCallId: string,
-		params: SearchToolParams,
-		_onUpdate,
-		ctx: CustomToolContext,
-		signal?: AbortSignal,
-	) {
-		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
-		const sessionId = ctx.credentialSessionId ?? ctx.sessionManager.getSessionId();
-		return executeSearch(toolCallId, params, {
-			authStorage,
-			sessionId,
-			signal,
-			activeModelContext: ctx.model ? ctx.modelRegistry?.getActiveSearchModelContext(ctx.model) : undefined,
-			...searchPolicyFromSettings(ctx.settings),
-		});
-	},
+		async execute(
+			toolCallId: string,
+			params: SearchToolParams,
+			_onUpdate,
+			ctx: CustomToolContext,
+			signal?: AbortSignal,
+		) {
+			const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
+			const sessionId = ctx.credentialSessionId ?? ctx.sessionManager.getSessionId();
+			return executeSearch(toolCallId, params, {
+				authStorage,
+				sessionId,
+				signal,
+				activeModelContext: ctx.model ? ctx.modelRegistry?.getActiveSearchModelContext(ctx.model) : undefined,
+				...searchPolicyFromSettings(activeSettings),
+			});
+		},
 
-	renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
-		return renderSearchCall(args, options, theme);
-	},
+		renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
+			return renderSearchCall(args, options, theme);
+		},
 
-	renderResult(result, options: RenderResultOptions, theme: Theme) {
-		return renderSearchResult(result, options, theme);
-	},
-};
+		renderResult(result, options: RenderResultOptions, theme: Theme) {
+			return renderSearchResult(result, options, theme);
+		},
+	};
+}
 
-export function getSearchTools(): CustomTool<any, any>[] {
-	return [webSearchCustomTool];
+/** Backward-compatible standalone tool; session construction uses getSearchTools(settings). */
+export const webSearchCustomTool = createWebSearchCustomTool();
+
+export function getSearchTools(settings?: Settings): CustomTool<any, any>[] {
+	return [createWebSearchCustomTool(settings)];
 }
 
 export {

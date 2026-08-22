@@ -25,8 +25,7 @@ import {
 import * as z from "zod/v4";
 import packageJson from "../../package.json" with { type: "json" };
 import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
-import { resolveModelRoleValue } from "../config/model-resolver";
-import type { Settings } from "../config/settings";
+import { type ModelRoleSettings, resolveModelRoleValue } from "../config/model-resolver";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { isPrivateOrSpecialAddress, validatePublicHttpUrl } from "../web/insane/url-guard";
@@ -832,7 +831,7 @@ export const IMAGE_PROVIDER_DEFAULTS: Record<string, string> = {
  * image role is configured / no matching model is available.
  */
 export function resolveImageRoleModel(
-	settings: Settings,
+	settings: ModelRoleSettings,
 	modelRegistry: ModelRegistry,
 	options?: { sessionId?: string; credentialSessionId?: string },
 ): Model | undefined {
@@ -939,7 +938,7 @@ export function googleImageApiKeyFromEnvForTest(): string | undefined {
  */
 async function findImageApiKey(
 	modelRegistry: ModelRegistry,
-	settings: Settings,
+	settings: ModelRoleSettings,
 	sessionId?: string,
 	credentialSessionId?: string,
 ): Promise<ImageApiKey | null> {
@@ -1896,7 +1895,7 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 
 export async function getImageGenTools(
 	modelRegistry?: ModelRegistry,
-	settings?: Settings,
+	settings?: ModelRoleSettings,
 ): Promise<Array<CustomTool<typeof imageGenSchema, ImageGenToolDetails>>> {
 	// The tool is available when an image role model is configured and resolvable.
 	if (!modelRegistry || !settings) return [];
@@ -1907,7 +1906,7 @@ export async function getImageGenTools(
 
 export async function getImageGenToolsWithRegistry(
 	modelRegistry: ModelRegistry,
-	settings: Settings,
+	settings: ModelRoleSettings,
 ): Promise<Array<CustomTool<typeof imageGenSchema, ImageGenToolDetails>>> {
 	const imageModel = resolveImageRoleModel(settings, modelRegistry);
 	if (!imageModel) return [];
