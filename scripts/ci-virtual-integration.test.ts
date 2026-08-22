@@ -12,6 +12,7 @@ import {
 	materializeVirtualMerge,
 	removeVirtualMergeWorktree,
 	parseCanonicalVirtualIntegrationEvidence,
+	parseGreenDevRuns,
 	runCanaries,
 	selectAuthorityBase,
 	type GreenDevRun,
@@ -109,6 +110,14 @@ describe("authority base selection", () => {
 	function greenRun(headSha: string, databaseId: number): GreenDevRun {
 		return { headSha, databaseId, conclusion: "success" };
 	}
+
+	test("parses the GitHub workflow-runs API shape", () => {
+		expect(
+			parseGreenDevRuns({
+				workflow_runs: [{ head_sha: GREEN_A, id: 100, conclusion: "success" }],
+			}),
+		).toEqual([greenRun(GREEN_A, 100)]);
+	});
 
 	test("selects the newest reachable terminal-green dev push", () => {
 		// newest-first: GREEN_A is newer and reachable
