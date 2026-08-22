@@ -33,7 +33,7 @@ import {
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
-import { logger, sanitizeText } from "@gajae-code/utils";
+import { $credentialEnv, logger, sanitizeText } from "@gajae-code/utils";
 import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,
@@ -97,6 +97,154 @@ const intrinsicReflectApply = Reflect.apply;
  */
 export const MANAGED_ATTEMPT_MAX_STAGED_EVENTS = 10_000;
 export const MANAGED_ATTEMPT_MAX_STAGED_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Hard ceilings for the operator overrides. The caps exist to bound memory, so
+ * an override may raise them only within a range that still leaves the guard
+ * meaningful — near-`MAX_SAFE_INTEGER` values would trade a typed, bounded
+ * `local_buffer_overflow` for a process OOM, which is strictly harder to
+ * diagnose. Above-ceiling overrides clamp to the ceiling with a warning
+ * instead of being honored.
+ *
+ * The ceilings are derived from a survivable PEAK-RSS budget, not from the
+ * counted-bytes number: peak resident memory holds the live payload, its
+ * detached snapshot, and the retained batch simultaneously, so it is a
+ * multiple of the counted bytes. Sizing itself is walk-based (no JSON string
+ * or UTF-8 copy is materialized to measure), which is why the factor below
+ * covers the live value plus one detached copy plus batch retention with
+ * headroom. The bytes ceiling is the peak budget divided by that multiplier,
+ * so an override at the ceiling still fits an ordinary host. The events
+ * ceiling is the object-count equivalent for the same budget at a
+ * conservative per-item floor.
+ */
+export const MANAGED_STAGED_PEAK_RSS_BUDGET_BYTES = 4 * 1024 * 1024 * 1024;
+export const MANAGED_STAGED_PEAK_RSS_FACTOR = 4;
+export const MANAGED_ATTEMPT_STAGED_EVENTS_CEILING = 2_000_000;
+export const MANAGED_ATTEMPT_STAGED_BYTES_CEILING = Math.floor(
+	MANAGED_STAGED_PEAK_RSS_BUDGET_BYTES / MANAGED_STAGED_PEAK_RSS_FACTOR,
+);
+
+/**
+ * Warn once per distinct (knob, requested value) per process. The caps are
+ * re-read for every managed transaction — every streaming turn — so an
+ * unmemoized warning would re-log the same oversized operator value once per
+ * turn for the life of the process, embedding the full requested string in
+ * every record (log amplification). A bounded digest is logged instead of
+ * the raw value for the same reason.
+ */
+const clampedCapWarnings = new Set<string>();
+
+function warnClampedStagedCap(
+	name: "GJC_FALLBACK_MAX_STAGED_EVENTS" | "GJC_FALLBACK_MAX_STAGED_BYTES",
+	requested: number | string,
+	ceiling: number,
+): void {
+	// A parsed number is already bounded; only the raw decimal string (which
+	// the beyond-safe-integer path can supply at arbitrary length) is reduced
+	// to a length-and-prefix digest before it is embedded in a log record.
+	const requestedPayload =
+		typeof requested === "number" ? requested : `${requested.length} digits (starts ${requested.slice(0, 8)})`;
+	const key = `${name}:${String(requestedPayload)}`;
+	if (clampedCapWarnings.has(key)) return;
+	clampedCapWarnings.add(key);
+	logger.warn(`${name} clamped to ${ceiling}: the provisional staging guard must stay bounded`, {
+		requested: requestedPayload,
+		ceiling,
+	});
+}
+
+function clampedStagedCap(
+	name: "GJC_FALLBACK_MAX_STAGED_EVENTS" | "GJC_FALLBACK_MAX_STAGED_BYTES",
+	fallback: number,
+	ceiling: number,
+): number {
+	// Resolve from TRUSTED environment sources only ($credentialEnv excludes the
+	// caller's cwd/.env overlay): these knobs ARE a defensive resource guard, so
+	// a repository-controlled .env must not be able to weaken (or tighten into
+	// failure) the staging bound. Values must be positive integers (digits only
+	// after the trusted resolver's surrounding-whitespace normalization);
+	// anything else falls back to the default. Any digits-only positive
+	// decimal that is at or below the ceiling is honored verbatim, and any
+	// digits-only positive decimal above the ceiling — including ones beyond
+	// Number.MAX_SAFE_INTEGER, which a numeric parse would misclassify — clamps
+	// to the ceiling with a warning, exactly as documented.
+	const raw = $credentialEnv(name)?.trim();
+	if (raw === undefined) return fallback;
+	const parsed = parsePositiveEnvInt(raw);
+	if (parsed !== undefined) {
+		if (parsed <= ceiling) return parsed;
+		warnClampedStagedCap(name, parsed, ceiling);
+		return ceiling;
+	}
+	if (isPositiveDecimalDigits(raw) && decimalAtLeast(raw, ceiling + 1)) {
+		warnClampedStagedCap(name, raw, ceiling);
+		return ceiling;
+	}
+	return fallback;
+}
+
+function parsePositiveEnvInt(raw: string): number | undefined {
+	if (!raw || !/^\d+$/.test(raw)) return undefined;
+	const parsed = Number(raw);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+}
+
+/** True when the value is a digits-only positive decimal string (no sign). */
+function isPositiveDecimalDigits(raw: string): boolean {
+	return raw.length > 0 && /^\d+$/.test(raw) && raw.replace(/^0+/, "") !== "";
+}
+
+/**
+ * Lexical comparison of a digits-only decimal against a numeric threshold,
+ * valid past Number.MAX_SAFE_INTEGER: compare stripped-leading-zero digit
+ * length first, then digit by digit.
+ */
+function decimalAtLeast(raw: string, threshold: number): boolean {
+	const digits = raw.replace(/^0+/, "");
+	const thresholdDigits = String(threshold).replace(/^0+/, "");
+	if (digits.length !== thresholdDigits.length) return digits.length > thresholdDigits.length;
+	return digits >= thresholdDigits;
+}
+
+/**
+ * Max events staged by a provisional managed-attempt transaction before it is
+ * rejected. Configurable via `GJC_FALLBACK_MAX_STAGED_EVENTS` (default
+ * `MANAGED_ATTEMPT_MAX_STAGED_EVENTS`, ceiling
+ * `MANAGED_ATTEMPT_STAGED_EVENTS_CEILING`). Read once per transaction so
+ * operators can raise the cap without a rebuild and tests can exercise the
+ * knob in-process. Values must be positive integers after the trusted
+ * resolver ignores surrounding whitespace; invalid or
+ * non-positive values fall back to the default, and values above the ceiling
+ * clamp to it with a warning.
+ *
+ * @internal
+ */
+export function managedAttemptMaxStagedEvents(): number {
+	return clampedStagedCap(
+		"GJC_FALLBACK_MAX_STAGED_EVENTS",
+		MANAGED_ATTEMPT_MAX_STAGED_EVENTS,
+		MANAGED_ATTEMPT_STAGED_EVENTS_CEILING,
+	);
+}
+
+/**
+ * Max bytes staged by a provisional managed-attempt transaction before it is
+ * rejected. Configurable via `GJC_FALLBACK_MAX_STAGED_BYTES` (default
+ * `MANAGED_ATTEMPT_MAX_STAGED_BYTES`, ceiling
+ * `MANAGED_ATTEMPT_STAGED_BYTES_CEILING`). Read once per transaction; values
+ * must be positive integers after the trusted resolver ignores surrounding
+ * whitespace, anything else falls back to the
+ * default, and values above the ceiling clamp to it with a warning.
+ *
+ * @internal
+ */
+export function managedAttemptMaxStagedBytes(): number {
+	return clampedStagedCap(
+		"GJC_FALLBACK_MAX_STAGED_BYTES",
+		MANAGED_ATTEMPT_MAX_STAGED_BYTES,
+		MANAGED_ATTEMPT_STAGED_BYTES_CEILING,
+	);
+}
 
 /**
  * Closed set of local-failure sites. A bounded diagnostic may name only these
@@ -1017,25 +1165,418 @@ export function sanitizedDetachedClone<T>(value: T, maxNodes: number = MANAGED_S
  * detached clone when that validation fails so every accepted snapshot is
  * both isolated and JSON-serializable.
  */
-function managedSnapshotJsonBytes(value: unknown): number | undefined {
+/**
+ * Sentinel thrown from inside a size walk the moment the projected size
+ * crosses the budget. Returning a substituted value (e.g. "") would not
+ * abort a `JSON.stringify` walk (review finding at 2efaf269cd); throwing is
+ * the only way to terminate a traversal, and the walk-based oracles below
+ * rely on the same mechanism to stop before doing unbounded work.
+ */
+const MANAGED_SIZE_SENTINEL = Symbol("gjc.managed-staging-size-exceeded");
+
+/**
+ * Walk `value`'s JSON surface — exactly the surface `JSON.stringify` sees,
+ * including `toJSON` dispatch — and return the exact UTF-8 byte length of
+ * its serialization WITHOUT materializing the JSON string or its UTF-8
+ * encoding. Every serialized token is charged: quotes, escapes, separators,
+ * delimiters, nulls, array holes, and keys.
+ *
+ * A LONE surrogate (an unpaired UTF-16 unit; `codePointAt` yields the unit
+ * itself only when it is unpaired) is charged as the six-byte `\udXXX`
+ * escape `JSON.stringify` emits for it, not as its 3-byte UTF-8 encoding —
+ * the previous BMP charge undercounted surrogate-heavy strings by ~2x
+ * (exact-head 078e22c0 finding 2).
+ *
+ * Returns the byte count, `undefined` when the value cannot be serialized
+ * (cyclic or JSON-hostile), or throws {@link MANAGED_SIZE_SENTINEL} once
+ * the projected count crosses `limit`.
+ */
+/**
+ * Charge a string's exact serialized UTF-8 byte length: opening/closing
+ * quotes, per-code-point escaping, and lone-surrogate six-byte escapes.
+ * Printable-ASCII strings without `"` or `\` — the dominant case for
+ * streamed text, thinking, and tool-argument content — encode one byte per
+ * UTF-16 unit with no escapes, so they take a single native scan instead of
+ * a per-code-point JS loop. This keeps the walk-based oracles at native
+ * `JSON.stringify` cost for ordinary payloads instead of paying the slow
+ * path on every streaming delta.
+ */
+const MANAGED_PLAIN_ASCII = /[^\x20-\x21\x23-\x5b\x5d-\x7e]/;
+function managedChargeStringBytes(text: string, add: (bytes: number) => void): void {
+	add(1);
+	if (!MANAGED_PLAIN_ASCII.test(text)) {
+		add(text.length);
+		add(1);
+		return;
+	}
+	for (let index = 0; index < text.length; ) {
+		const codePoint = text.codePointAt(index);
+		if (codePoint === undefined) throw new Error("missing string code point");
+		if (codePoint === 0x22 || codePoint === 0x5c) add(2);
+		else if (
+			codePoint === 0x08 ||
+			codePoint === 0x09 ||
+			codePoint === 0x0a ||
+			codePoint === 0x0c ||
+			codePoint === 0x0d
+		)
+			add(2);
+		else if (codePoint <= 0x1f) add(6);
+		else if (codePoint >= 0xd800 && codePoint <= 0xdfff) add(6);
+		else if (codePoint <= 0x7f) add(1);
+		else if (codePoint <= 0x7ff) add(2);
+		else if (codePoint <= 0xffff) add(3);
+		else add(4);
+		index += codePoint > 0xffff ? 2 : 1;
+	}
+	add(1);
+}
+
+function managedJsonByteLengthWithin(value: unknown, limit: number): number | undefined {
+	let seen = 0;
+	const add = (bytes: number): void => {
+		seen += bytes;
+		if (seen > limit) throw MANAGED_SIZE_SENTINEL;
+	};
+	const addString = (text: string): void => managedChargeStringBytes(text, add);
+	const seenObjects = new WeakSet<object>();
+	const prepare = (input: unknown, key: string): { omitted: boolean; value?: unknown } => {
+		if ((typeof input !== "object" || input === null) && typeof input !== "function") {
+			return { omitted: false, value: input };
+		}
+		try {
+			const toJSON = (input as { toJSON?: unknown }).toJSON;
+			const value = typeof toJSON === "function" ? toJSON.call(input, key) : input;
+			return {
+				omitted: value === undefined || typeof value === "function" || typeof value === "symbol",
+				value,
+			};
+		} catch {
+			throw new Error("JSON toJSON failed");
+		}
+	};
+	const walkPrepared = (input: unknown, inArray: boolean): boolean => {
+		if (input === null) {
+			add(4);
+			return true;
+		}
+		if (input === undefined || typeof input === "function" || typeof input === "symbol") {
+			if (inArray) add(4);
+			return inArray;
+		}
+		if (typeof input === "string") {
+			addString(input);
+			return true;
+		}
+		if (typeof input === "boolean") {
+			add(input ? 4 : 5);
+			return true;
+		}
+		if (typeof input === "number") {
+			const encoded = JSON.stringify(input);
+			if (encoded === undefined) throw new Error("JSON number failed");
+			add(managedAttemptTextEncoder.encode(encoded).byteLength);
+			return true;
+		}
+		if (typeof input === "bigint") throw new Error("JSON bigint failed");
+		if (typeof input !== "object") throw new Error("JSON value failed");
+		if (seenObjects.has(input)) throw new Error("JSON cycle detected");
+		seenObjects.add(input);
+		try {
+			if (Array.isArray(input)) {
+				add(1);
+				for (let index = 0; index < input.length; index++) {
+					if (index > 0) add(1);
+					const prepared = prepare(input[index], String(index));
+					if (prepared.omitted) add(4);
+					else walkPrepared(prepared.value, true);
+				}
+				add(1);
+				return true;
+			}
+			add(1);
+			let emitted = 0;
+			const record = input as Record<string, unknown>;
+			for (const property of Object.keys(input)) {
+				const prepared = prepare(record[property], property);
+				// `JSON.stringify` omits undefined-valued record properties
+				// entirely (key, colon, and separator); charging them would
+				// overestimate and falsely reject healthy payloads.
+				if (prepared.omitted || prepared.value === undefined) continue;
+				if (emitted > 0) add(1);
+				emitted++;
+				addString(property);
+				add(1);
+				walkPrepared(prepared.value, false);
+			}
+			add(1);
+			return true;
+		} finally {
+			seenObjects.delete(input);
+		}
+	};
 	try {
-		const serialized = JSON.stringify(value);
-		return serialized === undefined ? undefined : managedAttemptTextEncoder.encode(serialized).byteLength;
-	} catch {
+		const prepared = prepare(value, "");
+		if (prepared.omitted) return undefined;
+		walkPrepared(prepared.value, false);
+		return seen;
+	} catch (error) {
+		if (error === MANAGED_SIZE_SENTINEL) throw error;
 		return undefined;
 	}
 }
 
-function managedAttemptSnapshotDetailed<T>(value: T): { snapshot: T; jsonBytes?: number; sanitized: boolean } {
+/**
+ * Pre-allocation size guard: reports whether serializing `value` as JSON
+ * would exceed `limit` bytes WITHOUT materializing the full JSON string or
+ * cloning the value. Walks the JSON surface directly and charges every
+ * token, including quotes, escapes, separators, delimiters, nulls, and
+ * array holes. Strings are charged by code point, so a large string never
+ * needs a second full-size escaped copy just to measure it.
+ *
+ * Returns "over" when the limit would be exceeded, "under" when it
+ * definitely is not, and "unknown" when the value cannot be serialized at
+ * all (cyclic or JSON-hostile), which callers treat exactly like the
+ * existing `undefined` measurement results.
+ */
+function managedSnapshotExceedsBytes(value: unknown, limit: number): "over" | "under" | "unknown" {
+	try {
+		const bytes = managedJsonByteLengthWithin(value, limit);
+		return bytes === undefined ? "unknown" : "under";
+	} catch (error) {
+		if (error === MANAGED_SIZE_SENTINEL) return "over";
+		return "unknown";
+	}
+}
+
+/**
+ * Per-node minimum charge for the structuredClone preflight. Cloning
+ * duplicates the object GRAPH — per-node headers, Map/Set entries, buffer
+ * contents — while immutable strings are only ever referenced, so a graph
+ * of millions of tiny nodes is cheap in counted JSON bytes yet allocates a
+ * large duplicate. Charging a per-node floor (a conservative minimum object
+ * size, far above the few JSON bytes such nodes serialize to) keeps the
+ * preflight an allocation bound, not just a serialization bound.
+ */
+const MANAGED_CLONE_NODE_OVERHEAD_BYTES = 64;
+
+/** Widest JSON literal any element of this typed-array kind can produce. */
+function managedTypedArrayJsonDigits(view: unknown): number {
+	if (view instanceof Uint8Array || view instanceof Int8Array || view instanceof Uint8ClampedArray) return 4;
+	if (view instanceof Uint16Array || view instanceof Int16Array) return 6;
+	if (view instanceof Uint32Array || view instanceof Int32Array || view instanceof Float32Array) return 11;
+	return 24;
+}
+
+/**
+ * Preflight the CLONE-VISIBLE surface — the graph `structuredClone` would
+ * actually duplicate — against `limit` WITHOUT cloning. The JSON-surface
+ * walk dispatches `toJSON`, so a live class can serialize compactly while
+ * `structuredClone` (which drops the prototype serializer) would copy a
+ * large own payload; this walk never dispatches `toJSON` and charges the
+ * clone-visible graph instead. It also charges clone-only allocations the
+ * JSON walk cannot see — Map/Set entries, ArrayBuffer/TypedArray bytes,
+ * bigint magnitudes — plus the per-node header floor.
+ *
+ * Reads go through own-property descriptors only, so hostile accessors are
+ * never invoked: an accessor's cloned size cannot be known without invoking
+ * it, and a value `structuredClone` cannot duplicate at all (functions,
+ * symbols) fails the clone anyway. Both surface as `"degrade"`, which
+ * callers divert to the bounded sanitizer walk.
+ *
+ * Returns `"over"` when the clone-visible surface exceeds `limit`,
+ * `"degrade"` when the surface cannot be bounded by walking it, and
+ * `"under"` when the clone allocation is bounded.
+ */
+function managedCloneSurfaceExceedsBudget(value: unknown, limit: number): "over" | "under" | "degrade" {
+	let seen = 0;
+	const add = (bytes: number): void => {
+		seen += bytes;
+		if (seen > limit) throw MANAGED_SIZE_SENTINEL;
+	};
+	const addString = (text: string): void => managedChargeStringBytes(text, add);
+	const readOwnValue = (input: object, key: string): { accessor: boolean; value?: unknown } => {
+		const descriptor = Object.getOwnPropertyDescriptor(input, key);
+		if (descriptor === undefined) return { accessor: false, value: undefined };
+		if (!("value" in descriptor)) return { accessor: true };
+		return { accessor: false, value: descriptor.value };
+	};
+	const seenObjects = new WeakSet<object>();
+	const walk = (input: unknown): void => {
+		if (input === null) {
+			add(4);
+			return;
+		}
+		if (typeof input === "function" || typeof input === "symbol") {
+			// structuredClone cannot duplicate these; degrade to the bounded
+			// sanitizer instead of discovering the failure by cloning.
+			throw new Error("clone surface uncloneable");
+		}
+		if (typeof input === "undefined") return;
+		if (typeof input === "string") {
+			addString(input);
+			return;
+		}
+		if (typeof input === "number") {
+			add(managedAttemptTextEncoder.encode(JSON.stringify(input)).byteLength);
+			return;
+		}
+		if (typeof input === "boolean") {
+			add(input ? 4 : 5);
+			return;
+		}
+		if (typeof input === "bigint") {
+			add(MANAGED_CLONE_NODE_OVERHEAD_BYTES + input.toString().length);
+			return;
+		}
+		if (typeof input !== "object") return;
+		// Refuse proxies by internal-slot brand BEFORE any reflective operation:
+		// `Object.keys`/`getOwnPropertyDescriptor` on a live proxy would dispatch
+		// its `ownKeys`/descriptor traps, and on a revoked proxy would throw —
+		// either way the walk must not run payload-controlled code. The bounded
+		// sanitizer collapses proxies to a placeholder without dispatching traps.
+		if (nodeUtilTypes.isProxy(input)) throw new Error("clone surface proxy");
+		if (seenObjects.has(input)) throw new Error("clone surface cycle");
+		seenObjects.add(input);
+		try {
+			add(MANAGED_CLONE_NODE_OVERHEAD_BYTES);
+			if (nodeUtilTypes.isDate(input)) {
+				add(32);
+				return;
+			}
+			if (nodeUtilTypes.isRegExp(input)) {
+				add(2 + (input as RegExp).source.length);
+				return;
+			}
+			if (nodeUtilTypes.isMap(input)) {
+				for (const [entryKey, entryValue] of Map.prototype.entries.call(input as Map<unknown, unknown>)) {
+					add(MANAGED_CLONE_NODE_OVERHEAD_BYTES);
+					walk(entryKey);
+					walk(entryValue);
+				}
+				return;
+			}
+			if (nodeUtilTypes.isSet(input)) {
+				for (const element of Set.prototype.values.call(input as Set<unknown>)) {
+					add(MANAGED_CLONE_NODE_OVERHEAD_BYTES);
+					walk(element);
+				}
+				return;
+			}
+			if (nodeUtilTypes.isArrayBuffer(input)) {
+				add((input as ArrayBuffer).byteLength);
+				return;
+			}
+			if (nodeUtilTypes.isTypedArray(input)) {
+				const view = input as unknown as Uint8Array;
+				add(view.byteLength + view.length * managedTypedArrayJsonDigits(view));
+				return;
+			}
+			if (nodeUtilTypes.isDataView(input)) {
+				add((input as DataView).byteLength);
+				return;
+			}
+			if (Array.isArray(input)) {
+				add(2);
+				for (let index = 0; index < input.length; index++) {
+					if (index > 0) add(1);
+					const read = readOwnValue(input, String(index));
+					if (read.accessor) throw new Error("clone surface accessor");
+					if (!Object.hasOwn(input, String(index)))
+						add(4); // array hole
+					else walk(read.value);
+				}
+				// Non-index own enumerable keys are cloned (allocation) even
+				// though JSON.stringify omits them from arrays; charge their
+				// graph so the preflight stays an allocation bound.
+				for (const key of Object.keys(input)) {
+					if (String(Number(key)) === key && Number(key) >= 0) continue;
+					const read = readOwnValue(input, key);
+					if (read.accessor) throw new Error("clone surface accessor");
+					addString(key);
+					walk(read.value);
+				}
+				return;
+			}
+			add(2);
+			let emitted = 0;
+			for (const key of Object.keys(input)) {
+				const read = readOwnValue(input, key);
+				if (read.accessor) throw new Error("clone surface accessor");
+				if (emitted > 0) add(1);
+				emitted++;
+				addString(key);
+				add(1);
+				walk(read.value);
+			}
+			return;
+		} finally {
+			seenObjects.delete(input);
+		}
+	};
+	try {
+		walk(value);
+		return "under";
+	} catch (error) {
+		if (error === MANAGED_SIZE_SENTINEL) return "over";
+		return "degrade";
+	}
+}
+
+/**
+ * Ceiling for unbounded standalone snapshot sizing (the shell paths outside
+ * a transaction). Shared by the transaction-cap default so a standalone
+ * snapshot is never larger than the default transaction budget.
+ */
+function currentStagedBytesCap(): number {
+	return managedAttemptMaxStagedBytes();
+}
+
+/**
+ * Exact serialized size of a staged snapshot, computed by walking the JSON
+ * surface. Replaces the previous `JSON.stringify` + `TextEncoder.encode`
+ * measurement, which materialized a full copy of the serialized value — and
+ * a second copy of its UTF-8 encoding — BEFORE the cap check could reject
+ * it: the budget-sized transient allocation the memory guard exists to
+ * prevent (exact-head 078e22c0 finding 1). Returns `undefined` when the
+ * value cannot be serialized, matching the previous measurement's failure
+ * mode so callers keep their sanitize fallbacks.
+ *
+ * @internal
+ */
+export function managedSnapshotJsonByteLength(value: unknown): number | undefined {
+	return managedJsonByteLengthWithin(value, Number.POSITIVE_INFINITY);
+}
+
+function managedAttemptSnapshotDetailed<T>(
+	value: T,
+	byteLimit?: number,
+): {
+	snapshot: T;
+	jsonBytes?: number;
+	sanitized: boolean;
+} {
+	// Preflight the CLONE-VISIBLE surface so the structuredClone allocation
+	// itself is bounded: a live class can serialize compactly through a
+	// prototype `toJSON()` that structuredClone drops, so a JSON-surface
+	// precheck alone cannot bound what the clone would duplicate — the clone
+	// allocated the over-cap duplicate before the typed overflow could run
+	// (exact-head 078e22c0 finding 1). Degrade through the bounded sanitizer
+	// walk, which never clones, never dispatches accessors, and is
+	// node-budgeted, instead of allocating the duplicate.
+	if (managedCloneSurfaceExceedsBudget(value, byteLimit ?? currentStagedBytesCap()) !== "under") {
+		const bounded = sanitizedDetachedClone(value);
+		return { snapshot: bounded, jsonBytes: managedSnapshotJsonByteLength(bounded), sanitized: true };
+	}
 	try {
 		const snapshot = structuredClone(value);
-		const jsonBytes = managedSnapshotJsonBytes(snapshot);
+		const jsonBytes = managedSnapshotJsonByteLength(snapshot);
 		if (jsonBytes !== undefined) return { snapshot, jsonBytes, sanitized: false };
 		const sanitized = sanitizedDetachedClone(snapshot);
-		return { snapshot: sanitized, jsonBytes: managedSnapshotJsonBytes(sanitized), sanitized: true };
+		return { snapshot: sanitized, jsonBytes: managedSnapshotJsonByteLength(sanitized), sanitized: true };
 	} catch {
 		const snapshot = sanitizedDetachedClone(value);
-		return { snapshot, jsonBytes: managedSnapshotJsonBytes(snapshot), sanitized: true };
+		return { snapshot, jsonBytes: managedSnapshotJsonByteLength(snapshot), sanitized: true };
 	}
 }
 
@@ -1077,8 +1618,19 @@ const LOSSLESS_SNAPSHOT_KEYS = [
  * A failed subtree is removed at its own property boundary; siblings retain
  * their exact structured-clone representation. The bounded recursive path is
  * used only after cloning the complete value fails.
+ *
+ * The `structuredClone` allocation is preflighted against the staged-bytes
+ * cap: a live payload class can serialize compactly through a prototype
+ * `toJSON()` the clone drops, so the JSON-surface budget alone does not
+ * bound what the clone duplicates. An over-budget clone surface collapses to
+ * the bounded sanitizer instead of allocating the duplicate — ordinary
+ * sessions never see this, because their transaction flushes and streams the
+ * live event through before reaching this clone.
  */
 function losslessDetachedClone<T>(value: T): T {
+	if (managedCloneSurfaceExceedsBudget(value, currentStagedBytesCap()) === "over") {
+		return sanitizedDetachedClone(value);
+	}
 	try {
 		const snapshot = structuredClone(value);
 		// `structuredClone()` preserves own bigint fields while removing a
@@ -1086,7 +1638,7 @@ function losslessDetachedClone<T>(value: T): T {
 		// serialize successfully while its detached clone cannot be staged.
 		// Lossless staging still preserves every JSON-safe clone verbatim; only
 		// the non-serializable detached form is sanitized.
-		return managedSnapshotJsonBytes(snapshot) !== undefined ? snapshot : sanitizedDetachedClone(snapshot);
+		return managedSnapshotJsonByteLength(snapshot) !== undefined ? snapshot : sanitizedDetachedClone(snapshot);
 	} catch {
 		// The managed sanitizer is explicitly bounded and total. Use it only to
 		// identify which top-level assistant metadata surfaces are cloneable; the
@@ -1127,7 +1679,7 @@ function losslessDetachedClone<T>(value: T): T {
 				}
 			}
 		}
-		return managedSnapshotJsonBytes(output) !== undefined ? (output as T) : sanitizedDetachedClone(output as T);
+		return managedSnapshotJsonByteLength(output) !== undefined ? (output as T) : sanitizedDetachedClone(output as T);
 	}
 }
 
@@ -1476,7 +2028,7 @@ function warnManagedSnapshotFailure(
  */
 type ManagedAttemptBatchItem =
 	| { type: "event"; event: AgentEvent; bytes?: number }
-	| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent };
+	| { type: "assistant_event"; message: AssistantMessage; event: AssistantMessageEvent; bytes?: number };
 
 /**
  * Streaming increments whose complete value is re-published by the block's own
@@ -1501,6 +2053,9 @@ class ManagedAttemptTransaction {
 	#batch: ManagedAttemptBatchItem[] = [];
 	#stagedEventCount = 0;
 	#stagedBytes = 0;
+	/** Caps for this transaction, read once from the operator env knobs. */
+	readonly #maxStagedEvents = managedAttemptMaxStagedEvents();
+	readonly #maxStagedBytes = managedAttemptMaxStagedBytes();
 	/** Shape snapshot retained across discard() for bounded failure diagnostics. */
 	#lastStagedShape: { stagedEventCount: number; stagedBytes: number; contentBlockCount: number } | undefined;
 	#discarded = false;
@@ -1534,16 +2089,103 @@ class ManagedAttemptTransaction {
 	}
 
 	stageAssistantMessageEvent(message: AssistantMessage, event: AssistantMessageEvent): void {
-		const partial = this.#assistantSnapshot(message);
 		if (this.#committed) {
-			this.onAssistantMessageEvent?.(partial, this.#assistantEventSnapshot(event, partial));
+			// Already published: nothing is retained, so the live pair can go
+			// straight to the consumer without a staging measurement. One
+			// snapshot serves as BOTH the callback message and the event's
+			// `partial`, preserving the paired-snapshot identity the direct
+			// callbacks were built on and avoiding a second full clone of the
+			// growing message.
+			const committedPartial = this.#assistantSnapshot(message);
+			this.onAssistantMessageEvent?.(committedPartial, this.#assistantEventSnapshot(event, committedPartial));
 			return;
 		}
+		// Every retained batch item must be charged against the caps BEFORE it
+		// is retained, including the assistant message/event pair: an uncharged
+		// snapshot would let actual retention exceed the caps while the counters
+		// still read under them. Two-phase guard so the allocation that could
+		// OOM never happens ahead of the check:
+		//   1. INCREMENTAL pre-check on the LIVE pair — a replacer walk that
+		//      stops as soon as the projected size crosses the cap, without
+		//      materializing the full JSON string or its UTF-8 encoding (review:
+		//      "size incrementally so serialization can stop before
+		//      materializing the whole value"). Only if the walk completes under
+		//      the cap is any snapshot taken.
+		//   2. EXACT accounting of the retained detached pair — a live class can
+		//      serialize compactly through a prototype `toJSON()` that
+		//      `structuredClone` drops, so the live measurement may undercount
+		//      what the retained snapshot actually holds (same convention as
+		//      `#stage`).
+		const liveBudget = this.#maxStagedBytes - this.#stagedBytes;
+		const liveExcess = managedSnapshotExceedsBytes([message, event], liveBudget);
+		if (liveExcess === "over") {
+			this.#compactSupersededFrames();
+			if (managedSnapshotExceedsBytes([message, event], this.#maxStagedBytes - this.#stagedBytes) === "over") {
+				if (this.snapshotMode === "lossless") {
+					this.flush();
+					// One snapshot for the whole callback pair (see the committed
+					// branch above): the callback message and `event.partial`
+					// must be the same object.
+					const flushedPartial = this.#assistantSnapshot(message);
+					this.onAssistantMessageEvent?.(flushedPartial, this.#assistantEventSnapshot(event, flushedPartial));
+					return;
+				}
+				// Report the POST-compaction remaining budget + 1 (a valid lower
+				// bound for the live pair's size, and arithmetically consistent
+				// with the post-compaction retained shape #overflowShape reports).
+				this.discard();
+				throw new ManagedAttemptBufferOverflowError(
+					"overflow.staged",
+					this.#overflowShape("overflow.staged", this.#maxStagedBytes - this.#stagedBytes + 1),
+				);
+			}
+		}
+		const partial = this.#assistantSnapshot(message);
+		const snapshotEvent = this.#assistantEventSnapshot(event, partial);
+		// Walk-based exact measure (no JSON string or UTF-8 copy materialized).
+		const retainedBytes = managedSnapshotJsonByteLength([partial, snapshotEvent]);
+		if (retainedBytes === undefined) {
+			// Fail CLOSED, exactly like the #stage twin on the same condition: an
+			// unmeasurable retained pair must not be retained uncharged (a 0-byte
+			// charge plus the skipped byte-cap gate would let actual retention
+			// exceed the caps while the counters still read under them). The
+			// snapshot forms are JSON-safe by construction, so this is only
+			// reachable if that construction regresses; it carries no transport
+			// facts and never burns the fallback chain. Lossless mode cannot
+			// fail the attempt: flush what is staged and publish the live pair.
+			if (this.snapshotMode === "lossless") {
+				this.flush();
+				this.onAssistantMessageEvent?.(partial, snapshotEvent);
+				return;
+			}
+			this.discard();
+			throw new ManagedAttemptSnapshotError("staging.measure");
+		}
+		if (this.#wouldOverflow(retainedBytes)) {
+			this.#compactSupersededFrames();
+			if (this.#wouldOverflow(retainedBytes)) {
+				if (this.snapshotMode === "lossless") {
+					this.flush();
+					this.onAssistantMessageEvent?.(partial, snapshotEvent);
+					return;
+				}
+				this.discard();
+				throw new ManagedAttemptBufferOverflowError(
+					"overflow.staged",
+					this.#overflowShape("overflow.staged", retainedBytes),
+				);
+			}
+		}
+		// Each frame's exact accounted size is retained so compaction can debit
+		// exactly what it reclaims instead of re-measuring the whole batch.
 		this.#batch.push({
 			type: "assistant_event",
 			message: partial,
-			event: this.#assistantEventSnapshot(event, partial),
+			event: snapshotEvent,
+			bytes: retainedBytes,
 		});
+		this.#stagedEventCount += 1;
+		this.#stagedBytes += retainedBytes;
 	}
 
 	flush(): void {
@@ -1654,10 +2296,7 @@ class ManagedAttemptTransaction {
 		return 0;
 	}
 	#wouldOverflow(bytes: number): boolean {
-		return (
-			this.#stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS ||
-			this.#stagedBytes + bytes > MANAGED_ATTEMPT_MAX_STAGED_BYTES
-		);
+		return this.#stagedEventCount + 1 > this.#maxStagedEvents || this.#stagedBytes + bytes > this.#maxStagedBytes;
 	}
 	/**
 	 * Shape snapshot for a buffer-overflow diagnostic: the rejecting stage,
@@ -1675,16 +2314,20 @@ class ManagedAttemptTransaction {
 		incomingEventBytes: number,
 	): ManagedAttemptBufferOverflowError["overflow"] {
 		const staged = this.stagedShape();
-		const eventsExceeded = staged.stagedEventCount + 1 > MANAGED_ATTEMPT_MAX_STAGED_EVENTS;
-		const bytesExceeded = staged.stagedBytes + incomingEventBytes > MANAGED_ATTEMPT_MAX_STAGED_BYTES;
+		// Derive from the transaction's effective (operator-configurable) caps,
+		// not the module constants: the diagnostic must name the limits that
+		// actually tripped, which can differ from the defaults when an override
+		// is active.
+		const eventsExceeded = staged.stagedEventCount + 1 > this.#maxStagedEvents;
+		const bytesExceeded = staged.stagedBytes + incomingEventBytes > this.#maxStagedBytes;
 		return {
 			stage,
 			exceeded: eventsExceeded && bytesExceeded ? "both" : eventsExceeded ? "events" : "bytes",
 			stagedEventCount: staged.stagedEventCount,
 			stagedBytes: staged.stagedBytes,
 			incomingEventBytes,
-			maxStagedEvents: MANAGED_ATTEMPT_MAX_STAGED_EVENTS,
-			maxStagedBytes: MANAGED_ATTEMPT_MAX_STAGED_BYTES,
+			maxStagedEvents: this.#maxStagedEvents,
+			maxStagedBytes: this.#maxStagedBytes,
 		};
 	}
 
@@ -1718,10 +2361,8 @@ class ManagedAttemptTransaction {
 				retained.push(item);
 				continue;
 			}
-			if (item.type === "event") {
-				reclaimedBytes += item.bytes ?? 0;
-				reclaimedEvents += 1;
-			}
+			reclaimedBytes += item.bytes ?? 0;
+			reclaimedEvents += 1;
 		}
 		if (retained.length === this.#batch.length) return false;
 		this.#batch = retained;
@@ -1733,13 +2374,27 @@ class ManagedAttemptTransaction {
 	#stage(event: AgentEvent): void {
 		if (this.snapshotMode === "lossless") {
 			const snapshot = this.#repairAssistantEvent(event);
-			let rawBytes: number | undefined;
-			try {
-				rawBytes = managedAttemptTextEncoder.encode(JSON.stringify(snapshot)).byteLength;
-			} catch {
-				rawBytes = undefined;
+			const rawExcess = managedSnapshotExceedsBytes(snapshot, this.#maxStagedBytes - this.#stagedBytes);
+			if (rawExcess === "over") {
+				this.flush();
+				this.push(event);
+				return;
 			}
+			// Walk-based exact measure: no full JSON string or UTF-8 encoding is
+			// materialized just to size the candidate (exact-head 078e22c0
+			// finding 1 applies to the lossless exact measure too).
+			const rawBytes = managedSnapshotJsonByteLength(snapshot);
 			if (rawBytes !== undefined && this.#wouldOverflow(rawBytes)) {
+				this.flush();
+				this.push(event);
+				return;
+			}
+			// Bound the structuredClone allocation inside the snapshot forms the
+			// same way the managed path does: a compact `toJSON()` surface can hide
+			// an over-budget clone-visible payload. Ordinary sessions flush and
+			// stream the LIVE event through rather than degrading it — the
+			// documented lossless contract — instead of staging a sanitized copy.
+			if (managedCloneSurfaceExceedsBudget(event, this.#maxStagedBytes - this.#stagedBytes) === "over") {
 				this.flush();
 				this.push(event);
 				return;
@@ -1751,10 +2406,8 @@ class ManagedAttemptTransaction {
 				this.discard();
 				throw new ManagedAttemptSnapshotError("staging.losslessSnapshot");
 			}
-			let detachedBytes: number;
-			try {
-				detachedBytes = managedAttemptTextEncoder.encode(JSON.stringify(detached)).byteLength;
-			} catch {
+			const detachedBytes = managedSnapshotJsonByteLength(detached);
+			if (detachedBytes === undefined) {
 				this.discard();
 				throw new ManagedAttemptSnapshotError("staging.measure");
 			}
@@ -1768,19 +2421,22 @@ class ManagedAttemptTransaction {
 			this.#stagedBytes += detachedBytes;
 			return;
 		}
-		// Measure the raw event FIRST so an oversized payload is rejected
-		// before the snapshot duplicates it — the staged-byte cap exists to
-		// bound memory, so cloning ahead of the check would defeat it.
-		// Cyclic/JSON-hostile events cannot be pre-measured; only those fall
-		// through to snapshot-then-measure, where the sanitized detached form
-		// is the cycle-safe estimator.
-		let bytes: number | undefined;
-		try {
-			bytes = managedAttemptTextEncoder.encode(JSON.stringify(event)).byteLength;
-		} catch {
-			bytes = undefined;
-		}
-		if (bytes !== undefined && this.#wouldOverflow(bytes)) {
+		// Walk the raw event FIRST so an oversized payload is rejected before the
+		// managed snapshot duplicates it. Both oracles run against the REMAINING
+		// budget: the JSON-surface walk bounds the serialized charge, and the
+		// clone-surface walk bounds the structuredClone ALLOCATION — a live class
+		// can serialize compactly through `toJSON()` while carrying a large own
+		// payload the clone would duplicate (exact-head 078e22c0 finding 1).
+		// Cyclic/JSON-hostile events fall through to the sanitized detached form
+		// below, which is the cycle-safe estimator.
+		const preflightOver = (): boolean => {
+			const remaining = this.#maxStagedBytes - this.#stagedBytes;
+			return (
+				managedSnapshotExceedsBytes(event, remaining) === "over" ||
+				managedCloneSurfaceExceedsBudget(event, remaining) === "over"
+			);
+		};
+		if (preflightOver()) {
 			// A long turn reaches the cap through accumulated streaming increments,
 			// not through one oversized payload. Reclaim the superseded increments
 			// first; only a batch that still cannot fit is a real local overflow.
@@ -1788,23 +2444,49 @@ class ManagedAttemptTransaction {
 			// volume that still cannot fit even after reclamation), because #4610
 			// made the pre-compaction shape describe deltas it already reclaimed.
 			this.#compactSupersededFrames();
-			if (this.#wouldOverflow(bytes)) {
+			if (preflightOver()) {
+				// Report the incoming event's real size (a bounded walk — the
+				// sentinel caps the count at twice the cap, so a hostile shared
+				// DAG cannot turn the diagnostic itself into unbounded work).
+				// The previous form passed `remaining + 1` evaluated AFTER
+				// discard() zeroed the counters, which fabricated the constant
+				// `maxStagedBytes + 1` and mislabeled every mixed overflow as a
+				// single-event blowout.
+				const remainingBytes = this.#maxStagedBytes - this.#stagedBytes;
+				const incomingBytes = (() => {
+					try {
+						// Bounded walk: the sentinel caps even this diagnostic's
+						// work at twice the cap. The remaining budget + 1 is the
+						// honest floor either way — the event demonstrably does
+						// not fit in what remains (that is why it is rejected),
+						// including when only the clone-visible surface tripped
+						// while the compact JSON surface reads small.
+						return Math.max(
+							managedJsonByteLengthWithin(event, this.#maxStagedBytes * 2) ?? 0,
+							remainingBytes + 1,
+						);
+					} catch {
+						// Unserializable or beyond twice the cap: the floor alone
+						// still arithmetically explains the rejection.
+						return remainingBytes + 1;
+					}
+				})();
 				this.discard();
 				throw new ManagedAttemptBufferOverflowError(
 					"overflow.preMeasure",
-					this.#overflowShape("overflow.preMeasure", bytes),
+					this.#overflowShape("overflow.preMeasure", incomingBytes),
 				);
 			}
 		}
 		const repaired = this.#repairAssistantEvent(event);
-		const detailed = managedAttemptSnapshotDetailed(repaired);
+		const detailed = managedAttemptSnapshotDetailed(repaired, this.#maxStagedBytes - this.#stagedBytes);
 		const snapshot = detailed.snapshot;
 		// Always account the exact detached value. A live custom class can use
 		// prototype `toJSON()` to serialize compactly while structuredClone
 		// removes that serializer and exposes a larger or JSON-hostile own value.
 		// Reusing the live pre-measure would therefore accept an unserializable
 		// snapshot or undercount the retained bytes.
-		bytes = detailed.jsonBytes;
+		const bytes = detailed.jsonBytes;
 		if (bytes === undefined) {
 			// The sanitizer's output is total (detached, JSON-safe), so this is
 			// unreachable unless the sanitizer itself regresses. Fail as a
