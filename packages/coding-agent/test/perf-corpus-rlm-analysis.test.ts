@@ -20,8 +20,12 @@ const bundleDirectory = path.dirname(driverPath);
 const canonicalBenchmarkPath = path.resolve(import.meta.dir, "../bench/perf-corpus.bench.ts");
 // The driver admits exactly one Bun runtime pin, so fixtures must track that
 // constant rather than a duplicated literal that silently rots on every pin bump.
-const pinnedBunVersion = (await Bun.file(driverPath).text()).match(/^BUN_VERSION = "([^"]+)"$/mu)?.[1];
-if (pinnedBunVersion === undefined) throw new Error("perf-corpus RLM driver BUN_VERSION pin is unavailable");
+function readPinnedBunVersion(driverSource: string): string {
+	const pin = driverSource.match(/^BUN_VERSION = "([^"]+)"$/mu)?.[1];
+	if (pin === undefined) throw new Error("perf-corpus RLM driver BUN_VERSION pin is unavailable");
+	return pin;
+}
+const pinnedBunVersion = readPinnedBunVersion(await Bun.file(driverPath).text());
 
 function runPerfCorpusBenchmark(): PerfCorpusReport {
 	const result = Bun.spawnSync([process.execPath, ...process.execArgv, canonicalBenchmarkPath], {
