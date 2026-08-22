@@ -300,6 +300,7 @@ export async function fixture(): Promise<AdapterFixture> {
 		generation: 1,
 		isCurrent: () => true,
 		send: async () => undefined,
+		sendMaintenance: () => {},
 	};
 	const acpRouter = {
 		request: async (
