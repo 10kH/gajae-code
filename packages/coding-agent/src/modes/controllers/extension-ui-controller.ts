@@ -921,6 +921,7 @@ export class ExtensionUiController {
 						compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 						hasUI: !this.ctx.isBackgrounded,
 						cwd: this.ctx.sessionManager.getCwd(),
+						settings: this.ctx.session.settings,
 						sessionManager: createReadonlySessionManager(this.ctx.session.sessionManager),
 						modelRegistry: this.ctx.session.modelRegistry,
 						model: this.ctx.session.model,
