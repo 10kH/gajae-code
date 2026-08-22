@@ -624,18 +624,18 @@ jobs:
       # required non-self reviewers and no administrator bypass, restrict its
       # deployment refs to the release refs, and protect `main` plus
       # `refs/tags/v*` creation with rulesets. Until then this gate is a hook.
-      if: ${{ needs.release_prepare.result == 'success' && needs.release_metadata.outputs.channel == 'stable' }}
+      # `always() &&` is load-bearing, not decoration: `nightly_gate` is an
+      # ANCESTOR of release_prepare and is skipped on every stable tag, and
+      # GitHub propagates a skipped ancestor to each descendant whose condition
+      # omits always(). Without it this job — and publish and release_finalize
+      # behind it — skip with zero steps on every stable tag while every build
+      # is green, which is exactly how v0.15.0 and v0.15.1 tagged and published
+      # nothing. release_prepare already carries always() for the same reason.
+      if: ${{ always() && needs.release_prepare.result == 'success' && needs.release_metadata.outputs.channel == 'stable' }}
       needs: [release_prepare, release_metadata]
       timeout-minutes: 30
       runs-on: ubuntu-22.04
-      # The environment gate IS a deployment: with an empty permission set the
-      # GITHUB_TOKEN cannot create one, and GitHub then skips this job outright
-      # (observed on v0.15.0/v0.15.1: skipped with zero steps the same second
-      # release_prepare succeeded, taking publish and release_finalize with it).
-      # Deployment creation is the only scope granted — no contents, no
-      # id-token — so this job still holds nothing that can publish.
-      permissions:
-         deployments: write
+      permissions: {}
       environment: npm-release
       steps:
          - name: Record release approval
@@ -661,7 +661,10 @@ jobs:
       # `main`, a tag ruleset for `refs/tags/v*` restricting creation to
       # maintainers, and the npm-release environment on release_approval
       # with required non-self reviewers and no admin bypass.
-      if: ${{ needs.release_prepare.result == 'success' && (needs.release_metadata.outputs.channel == 'nightly' || needs.release_approval.result == 'success') }}
+      # always(): see release_approval — the skipped nightly_gate ancestor
+      # otherwise skips this job on every stable tag. The gate itself is
+      # unchanged: nightly publishes on channel, stable only behind approval.
+      if: ${{ always() && needs.release_prepare.result == 'success' && (needs.release_metadata.outputs.channel == 'nightly' || needs.release_approval.result == 'success') }}
       needs: [release_prepare, release_approval, release_metadata]
       timeout-minutes: 45
       runs-on: ubuntu-22.04
@@ -792,7 +795,8 @@ jobs:
       # release evidence from the fixed publisher's receipt, creates the
       # GitHub Release, and verifies it. Repository code may execute here
       # because no npm credential capability exists in this job.
-      if: ${{ needs.publish.result == 'success' }}
+      # always(): see release_approval. Only a successful publish finalizes.
+      if: ${{ always() && needs.publish.result == 'success' }}
       needs: [publish, release_metadata]
       timeout-minutes: 45
       runs-on: ubuntu-22.04
