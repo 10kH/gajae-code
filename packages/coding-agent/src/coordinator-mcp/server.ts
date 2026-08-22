@@ -3500,7 +3500,13 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		services.resolveModelPin ??
 		(async (raw: unknown, cwd?: string): Promise<CoordinatorModelResolution> => {
 			if (raw === undefined || raw === null) return { ok: true, model: null };
-			const result = brokerResult(await brokerSession("", "model.resolve", { model: raw, cwd }));
+			const result = brokerResult(
+				await brokerSession("", "model.resolve", {
+					model: raw,
+					cwd,
+					target: coordinatorLifecycleTarget(config.sessionCommand, cwd ?? ""),
+				}),
+			);
 			if (result) {
 				if (result.ok === true && (result.model === null || typeof result.model === "string"))
 					return { ok: true, model: result.model };

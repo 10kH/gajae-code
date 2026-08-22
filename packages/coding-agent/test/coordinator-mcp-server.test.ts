@@ -1724,6 +1724,38 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		expect(controls.find(control => control.operation === "model.resolve")?.input).toMatchObject({ cwd: root });
 	});
 
+	it("passes the planned worktree target to model pin resolution", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			undefined,
+			undefined,
+			"gjc --worktree",
+			undefined,
+			{
+				globalResult: (operation, input) => {
+					if (operation === "model.resolve") {
+						expect(input.target).toMatchObject({ path: root, worktree: { enabled: true } });
+						return { ok: true, result: { ok: true, model: "cursor/default" } };
+					}
+					return undefined;
+				},
+			},
+		);
+
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			model: "cursor/default",
+			idempotency_key: "broker-model-pin-worktree",
+			allow_mutation: true,
+		});
+
+		expect(started).toMatchObject({ ok: true, session: { model: "cursor/default" } });
+	});
+
 	it("keeps lifecycle endpoint credentials out of start_session results", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];

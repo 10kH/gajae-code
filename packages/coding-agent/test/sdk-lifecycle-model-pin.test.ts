@@ -122,6 +122,14 @@ describe("lifecycle session explicit model pin", () => {
 		try {
 			expect(`${created.session.model?.provider}/${created.session.model?.id}`).toBe("anthropic/claude-sonnet-4-5");
 			expect(String(created.session.thinkingLevel)).toBe("high");
+			await applyStartupModelProfiles({
+				session: created.session,
+				settings,
+				modelRegistry: created.session.modelRegistry,
+				parsedArgs: { model: "anthropic/claude-sonnet-4-5:high" },
+				startupThinkingLevel: "high" as never,
+			});
+			expect(String(created.session.thinkingLevel)).toBe("high");
 		} finally {
 			await created.session.dispose();
 		}

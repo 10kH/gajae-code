@@ -6,6 +6,7 @@ import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
 import { logger } from "@gajae-code/utils";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
+import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
 import {
 	type DirectoryMigrationPolicy,
@@ -54,6 +55,22 @@ type ResolvedBrokerSettings = {
 	heartbeatTtlMs: number;
 	resolveDirectoryMigration: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
 };
+
+function modelResolutionCwd(input: Record<string, unknown>): string | undefined {
+	const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
+	if (!cwd) return undefined;
+	const target = input.target;
+	if (!target || typeof target !== "object" || Array.isArray(target)) return cwd;
+	const worktree = (target as Record<string, unknown>).worktree;
+	if (!worktree || typeof worktree !== "object" || Array.isArray(worktree)) return cwd;
+	if ((worktree as Record<string, unknown>).enabled !== true) return cwd;
+	const name = (worktree as Record<string, unknown>).name;
+	const planned =
+		typeof name === "string" && name.length > 0
+			? planLaunchWorktree(cwd, { enabled: true, detached: false, name })
+			: planLaunchWorktree(cwd, { enabled: true, detached: true, name: null });
+	return planned.enabled ? path.resolve(planned.worktreePath) : cwd;
+}
 
 export type BrokerErrorCode =
 	| "idempotency_conflict"
@@ -1501,7 +1518,7 @@ export class Broker {
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
 		if (operation === "model.resolve") {
 			try {
-				const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
+				const cwd = modelResolutionCwd(input);
 				return { ok: true, result: await this.#resolveModelPin(input.model, { cwd }) };
 			} catch {
 				return error("unavailable", "SDK host model resolution is unavailable.");
