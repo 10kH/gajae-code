@@ -13,10 +13,13 @@ import {
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 let savedSessionId: string | undefined;
+let savedGithubWorkspace: string | undefined;
 
 beforeAll(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
+	savedGithubWorkspace = process.env.GITHUB_WORKSPACE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	delete process.env.GITHUB_WORKSPACE;
 });
 
 async function tempDir(): Promise<string> {
@@ -27,12 +30,16 @@ async function tempDir(): Promise<string> {
 
 afterEach(async () => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	// Keep GITHUB_WORKSPACE deleted for hermetic change-set isolation; restore only in afterAll.
+	delete process.env.GITHUB_WORKSPACE;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 afterAll(() => {
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
+	if (savedGithubWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+	else process.env.GITHUB_WORKSPACE = savedGithubWorkspace;
 });
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
@@ -185,7 +192,7 @@ function executorQa(
 	};
 }
 
-function qualityGate(qa: Record<string, unknown>): string {
+function qualityGate(qa: Record<string, unknown>, sourceHash: string): string {
 	return JSON.stringify({
 		architectReview: {
 			architectureStatus: "CLEAR",
@@ -202,22 +209,22 @@ function qualityGate(qa: Record<string, unknown>): string {
 			fullRerun: true,
 			reviewCohort: {
 				reviewGeneration: 1,
-				sourceHash: "sha256:test-frozen-source",
+				sourceHash,
 				joined: true,
 				lanes: {
 					cleaner: {
 						status: "passed",
-						sourceHash: "sha256:test-frozen-source",
+						sourceHash,
 						evidence: "cleaner clean",
 						blockers: [],
 					},
 					architect: {
 						status: "CLEAR",
-						sourceHash: "sha256:test-frozen-source",
+						sourceHash,
 						evidence: "architect clear",
 						blockers: [],
 					},
-					qa: { status: "passed", sourceHash: "sha256:test-frozen-source", evidence: "qa passed", blockers: [] },
+					qa: { status: "passed", sourceHash, evidence: "qa passed", blockers: [] },
 				},
 			},
 			rerunCommands: ["bun test fixture"],
@@ -238,6 +245,12 @@ async function writeQaArtifacts(root: string): Promise<void> {
 }
 
 async function checkpoint(root: string, qa: Record<string, unknown>): Promise<string> {
+	const sourceHashResult = await runNativeUltragoalCommand(["quality-gate", "source-hash", "--json"], root);
+	const sourceHashPayload = JSON.parse(sourceHashResult.stdout ?? "{}") as { sourceHash?: unknown };
+	const sourceHash =
+		sourceHashResult.status === 0 && typeof sourceHashPayload.sourceHash === "string"
+			? sourceHashPayload.sourceHash
+			: "sha256:test-frozen-source";
 	const result = await runNativeUltragoalCommand(
 		[
 			"checkpoint",
@@ -248,7 +261,7 @@ async function checkpoint(root: string, qa: Record<string, unknown>): Promise<st
 			"--evidence",
 			"fixture complete",
 			"--quality-gate-json",
-			qualityGate(qa),
+			qualityGate(qa, sourceHash),
 		],
 		root,
 	);

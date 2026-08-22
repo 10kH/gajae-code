@@ -48,6 +48,7 @@ function sdkBusNatives(): NativeSdkBusBindings {
 type NotificationServer = NativeNotificationServer;
 
 import { $credentialEnv, logger, postmortem, VERSION } from "@gajae-code/utils";
+
 import { AsyncJobManager } from "../../async";
 import { Settings, validateSettingPatch } from "../../config/settings";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "../../extensibility/extensions";
@@ -100,6 +101,7 @@ import {
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
+import { isAutoroutingInactive, markAutoroutingInactive } from "../host/internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "../host/query";
 import type { SdkFrame } from "../host/types";
 import {
@@ -4017,7 +4019,6 @@ export function createNotificationsExtension(
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
-
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
@@ -6826,6 +6827,7 @@ export function createNotificationsExtension(
 				return { type: "query_response", ...response };
 			},
 		});
+		if (isAutoroutingInactive(api)) markAutoroutingInactive(sdkRuntime.host);
 		host = sdkRuntime.host;
 
 		// Install the runtime before either transport can expose the host. session_start

@@ -82,3 +82,9 @@ Agent spawning is disabled for this context.
 {{/list}}
 {{/if}}
 </agents>
+
+{{#if autoroutingActive}}
+<autorouting-guidance>
+Choose a tier by agent role/type, per-call complexity, and cost intent: fast for mechanical/lookup/high-volume work where cheap tokens are the point; balanced (default) for ordinary implementation/review lanes; strong for deep design, hard debugging, or high-stakes review where the cost is justified. Provider availability/auth is enforced by deterministic code and is never an input to tier choice. Omitting tier is fine and routes as balanced.
+</autorouting-guidance>
+{{/if}}

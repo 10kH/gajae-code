@@ -1,4 +1,8 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import type { Model } from "@gajae-code/ai";
+import { generateTierChains } from "@gajae-code/coding-agent/config/autorouting-generator";
+import { CURATED_TIER_MAP } from "@gajae-code/coding-agent/config/autorouting-tier-map";
+import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { getCurrentThemeName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
@@ -8,7 +12,23 @@ import {
 	executeBuiltinSlashCommand,
 	lookupBuiltinSlashCommand,
 } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
+import { buildAutoroutingStatusReport } from "@gajae-code/coding-agent/slash-commands/helpers/autorouting-status";
 import { ImageProtocol, TERMINAL } from "@gajae-code/tui";
+
+const model = (provider: string, id: string): Model =>
+	({
+		provider,
+		id,
+		name: id,
+		api: "openai-completions",
+		baseUrl: "https://example.invalid",
+		contextWindow: 128000,
+		maxTokens: 4096,
+		input: [],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		headers: {},
+		compat: {},
+	}) as unknown as Model;
 
 const mutableTerminal = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
 const originalImageProtocol = mutableTerminal.imageProtocol;
@@ -444,5 +464,154 @@ describe("builtin /theme slash command", () => {
 		expect(settingsSet).not.toHaveBeenCalled();
 		expect(showError).toHaveBeenCalledTimes(1);
 		expect(String(showError.mock.calls[0]?.[0])).toContain('Unknown theme "not-a-theme"');
+	});
+});
+
+describe("builtin /routing slash command", () => {
+	function createRoutingTuiRuntime(settingsValues: Record<string, unknown> = {}) {
+		const showModelSelector = vi.fn();
+		const showStatus = vi.fn();
+		const showError = vi.fn();
+		const setText = vi.fn();
+		const settings = Settings.isolated(settingsValues as never);
+		// Mirrors SelectorController.setAutoroutingEnabled: the only writer the
+		// command is allowed to use, so scoped/read-only guards stay in one place.
+		const setAutoroutingEnabled = vi.fn(async (enabled: boolean) => {
+			settings.set("task.autorouting.enabled", enabled);
+		});
+		const chatContainer = { addChild: vi.fn() };
+		const ctx = {
+			showModelSelector,
+			showStatus,
+			showError,
+			settings,
+			setAutoroutingEnabled,
+			chatContainer,
+			ui: { requestRender: vi.fn() },
+			editor: { setText },
+		} as unknown as InteractiveModeContext;
+
+		return {
+			runtime: { ctx, handleBackgroundCommand: () => undefined },
+			showModelSelector,
+			setAutoroutingEnabled,
+			settings,
+			setText,
+		};
+	}
+
+	it("opens the smart-routing panel directly when invoked without arguments", async () => {
+		const { runtime, showModelSelector, setText } = createRoutingTuiRuntime();
+
+		expect(await executeBuiltinSlashCommand("/routing", runtime)).toBe(true);
+
+		expect(showModelSelector).toHaveBeenCalledWith({ smartRoutingOnly: true });
+		expect(setText).toHaveBeenCalledWith("");
+	});
+
+	it("routes the toggle through the guarded controller entry point", async () => {
+		const { runtime, showModelSelector, setAutoroutingEnabled, settings } = createRoutingTuiRuntime();
+
+		expect(await executeBuiltinSlashCommand("/routing on", runtime)).toBe(true);
+		expect(setAutoroutingEnabled).toHaveBeenLastCalledWith(true);
+		expect(settings.get("task.autorouting.enabled")).toBe(true);
+
+		expect(await executeBuiltinSlashCommand("/routing off", runtime)).toBe(true);
+		expect(setAutoroutingEnabled).toHaveBeenLastCalledWith(false);
+		expect(settings.get("task.autorouting.enabled")).toBe(false);
+		expect(showModelSelector).not.toHaveBeenCalled();
+	});
+
+	it("reports settings-derived status labels", () => {
+		const base = Settings.isolated({
+			"task.autorouting.enabled": true,
+			"task.autorouting.tiers": { fast: ["anthropic/model"] },
+		});
+		const snapshot = () => ({
+			effective: base.getEffectiveAutorouting(),
+			tiers: base.get("task.autorouting.tiers"),
+			provenance: base.get("task.autorouting.provenance"),
+		});
+		expect(buildAutoroutingStatusReport(snapshot())).toContain("Autorouting: on (hand-authored tiers)");
+		expect(buildAutoroutingStatusReport({ ...snapshot(), provenance: undefined })).toContain("hand-authored tiers");
+		const catalog = [
+			model("anthropic", "claude-haiku-4-5"),
+			model("anthropic", "claude-sonnet-5"),
+			model("anthropic", "claude-opus-5"),
+		];
+		const generated = generateTierChains({ schema: 1, providers: ["anthropic"] }, CURATED_TIER_MAP, catalog);
+		const generatedSettings = Settings.isolated({
+			"task.autorouting.enabled": true,
+			"task.autorouting.tiers": generated.tiers,
+			"task.autorouting.provenance": {
+				schema: 1,
+				source: generated.sourceIdentity,
+				declarationFingerprint: generated.declarationFingerprint,
+				tiersFingerprint: generated.tiersFingerprint,
+			},
+		});
+		const generatedSnapshot = {
+			effective: generatedSettings.getEffectiveAutorouting(),
+			tiers: generatedSettings.get("task.autorouting.tiers"),
+			provenance: generatedSettings.get("task.autorouting.provenance"),
+		};
+		const generatedReport = buildAutoroutingStatusReport(generatedSnapshot);
+		expect(generatedReport).toContain("Autorouting: on (generated)");
+		expect(
+			buildAutoroutingStatusReport({
+				...generatedSnapshot,
+				provenance: { ...generatedSnapshot.provenance!, tiersFingerprint: "0".repeat(64) },
+			}),
+		).toContain("generated, hand-edited");
+		expect(
+			buildAutoroutingStatusReport({
+				...generatedSnapshot,
+				provenance: { ...generatedSnapshot.provenance!, tiersFingerprint: "bad" },
+			}),
+		).toContain("hand-authored tiers");
+		expect(
+			buildAutoroutingStatusReport({
+				effective: Settings.isolated().getEffectiveAutorouting(),
+				tiers: undefined,
+				provenance: undefined,
+			}),
+		).toContain("Autorouting: off");
+	});
+
+	it("strips terminal control sequences from hand-edited selectors", () => {
+		// The selector grammar rejects control bytes before they can reach status
+		// rendering, so malformed hand-edited tiers fail closed.
+		const settings = Settings.isolated({ "task.autorouting.enabled": true } as never);
+		settings.set("task.autorouting.tiers", {
+			balanced: ["anthropic/\x1b]0;pwned\x07evil-model"],
+		} as never);
+
+		const report = buildAutoroutingStatusReport({
+			effective: settings.getEffectiveAutorouting(),
+			tiers: settings.get("task.autorouting.tiers"),
+			provenance: settings.get("task.autorouting.provenance"),
+		});
+
+		expect(report).toContain("Autorouting: off");
+		expect(report).not.toContain("\x1b");
+		expect(report).not.toContain("\x07");
+	});
+
+	it("bounds a pathologically long chain", () => {
+		const settings = Settings.isolated({ "task.autorouting.enabled": true } as never);
+		settings.set("task.autorouting.tiers", {
+			fast: Array.from({ length: 40 }, (_, index) => `anthropic/model-${index}`),
+		} as never);
+
+		const fastLine = buildAutoroutingStatusReport({
+			effective: settings.getEffectiveAutorouting(),
+			tiers: settings.get("task.autorouting.tiers"),
+			provenance: settings.get("task.autorouting.provenance"),
+		})
+			.split("\n")
+			.find(line => line.trimStart().startsWith("fast:"));
+
+		expect(fastLine).toBeDefined();
+		expect(fastLine?.length).toBeLessThanOrEqual(220);
 	});
 });
