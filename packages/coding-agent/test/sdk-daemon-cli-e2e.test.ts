@@ -683,6 +683,46 @@ describe("SDK session CLI", () => {
 		expect(result.terminal).toBe(true);
 	}, 60_000);
 
+	it("keeps unpositioned live events visible after positioned lifecycle items", async () => {
+		// Router frames without a publication position are still evidence. They
+		// remain in the unpositioned segment and cannot reorder positioned state.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-unpositioned" },
+			},
+			{
+				type: "event",
+				generation: 1,
+				seq: 3,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const result = JSON.parse(tail.stdout).result as { terminal: boolean; items: Array<Record<string, unknown>> };
+		expect(result.items.map(item => ({ kind: item.kind, seq: item.seq }))).toEqual([
+			{ kind: "turn_start", seq: 2 },
+			{ kind: "turn_end", seq: 3 },
+			{ kind: "turn_end", seq: undefined },
+		]);
+		expect(result.terminal).toBe(true);
+	}, 60_000);
+
 	it("fails closed on a same-position conflict observed with close in one replay batch", async () => {
 		// A protocol conflict outranks a successful close completion, whichever
 		// order the two reach the fold within one batch.
@@ -964,6 +1004,36 @@ describe("SDK session CLI", () => {
 			duplicate: { exitCode: 0, closeItems: 1 },
 		});
 	}, 180_000);
+
+	it("fails closed when live lifecycle evidence conflicts with delayed replay", async () => {
+		// The Router delivers the live claim before the explicit replay response;
+		// the replayed claim must still fail closed rather than letting arrival
+		// order or an idle shortcut decide the lifecycle.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "protocol_error" } });
+	}, 60_000);
 
 	it("completes --until-idle in canonical order when frame arrival order delivers the newer terminal first", async () => {
 		// Canonical order is turn_end(A,1), turn_start(B,2), turn_end(B,3): turn B

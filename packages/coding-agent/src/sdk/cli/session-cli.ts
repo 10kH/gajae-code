@@ -765,8 +765,8 @@ function publicationSequence(publicationId: string): number | undefined {
 }
 
 function tailItemFromRouterFrame(frame: SessionRouterFrame): SdkTailItemV1 | undefined {
-	if (frame.publicationId === undefined || frame.name === undefined) return undefined;
-	const seq = publicationSequence(frame.publicationId);
+	if (frame.name === undefined) return undefined;
+	const seq = frame.publicationId === undefined ? undefined : publicationSequence(frame.publicationId);
 	return toTailItemV1(
 		{
 			kind: frame.name,
