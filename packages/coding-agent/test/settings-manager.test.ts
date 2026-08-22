@@ -118,7 +118,10 @@ describe("Settings", () => {
 
 		expect(scoped.getStorage()).not.toBe(global.getStorage());
 		await scoped.close();
-		expect(() => global.getStorage()?.getSettings()).not.toThrow();
+		const globalStorage = global.getStorage();
+		expect(globalStorage).not.toBeNull();
+		if (!globalStorage) throw new Error("Global settings storage was unexpectedly closed");
+		expect(globalStorage.getSettings()).toBeDefined();
 	});
 
 	it("distinguishes an absent first-event retry timeout from an explicit zero", () => {

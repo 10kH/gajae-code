@@ -1149,7 +1149,7 @@ export class Settings implements NotificationSettingsReader {
 	/** Flush and close storage owned by an isolated settings scope. */
 	async close(): Promise<void> {
 		if (!this.#isolatedStorage) return;
-		await this.flush();
+		await this.flushOrThrow();
 		this.#storage?.close();
 		this.#storage = null;
 	}
