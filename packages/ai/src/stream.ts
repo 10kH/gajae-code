@@ -808,7 +808,7 @@ function mapOptionsForApi<TApi extends Api>(
 	options?: SimpleStreamOptions,
 	apiKey?: string,
 ): OptionsForApi<TApi> {
-	const base = {
+	const base = copyProviderSafetyStopAdapterInvocation(options, {
 		temperature: options?.temperature,
 		topP: options?.topP,
 		topK: options?.topK,
@@ -835,7 +835,7 @@ function mapOptionsForApi<TApi extends Api>(
 		attemptScope: options?.attemptScope,
 		execHandlers: options?.execHandlers,
 		[managedAttemptValidated]: hasValidatedManagedAttempt(options),
-	};
+	});
 
 	switch (model.api) {
 		case "anthropic-messages": {

@@ -3,12 +3,15 @@ import { scheduler } from "node:timers/promises";
 import { Messages } from "@anthropic-ai/sdk/resources/messages/messages";
 import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
 import { Effort } from "../src/model-thinking";
+import { getBundledModel } from "../src/models";
 import {
 	applyClaudeToolPrefix,
 	streamAnthropic as streamAnthropicProvider,
 	stripClaudeToolPrefix,
 } from "../src/providers/anthropic";
+import { streamSimple } from "../src/stream";
 import type { AssistantMessageEvent, Context, Model, ProviderSessionState } from "../src/types";
+import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 
 type AnthropicStreamOptions = NonNullable<Parameters<typeof streamAnthropicProvider>[2]>;
 
@@ -1202,6 +1205,81 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.errorMessage).toBe("Content flagged by safety filters");
 		expect(result.errorKind).toBe("provider_safety_stop");
 	});
+
+	it("authenticates direct provider calls without caller transport seams", async () => {
+		const refusalEvents: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_direct_refusal",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "message_delta",
+				delta: {
+					stop_reason: "end_turn",
+					stop_details: { type: "refusal", category: "safety", explanation: "Direct refusal" },
+				},
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+			{ type: "message_stop" },
+		];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
+
+		const stream = streamAnthropicProvider(model, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+	});
+
+	it("preserves adapter provenance through streamSimple option mapping", async () => {
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!bundled) throw new Error("Expected bundled Anthropic model");
+		const refusalEvents: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_simple_refusal",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "message_delta",
+				delta: {
+					stop_reason: "end_turn",
+					stop_details: { type: "refusal", category: "safety", explanation: "Simple refusal" },
+				},
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+			{ type: "message_stop" },
+		];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
+
+		const stream = streamSimple(bundled, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+	});
+
 	it("keeps a safety stop terminal when later stop reasons and tool events arrive", async () => {
 		const eventsAfterSafety: MockAnthropicEvent[] = [
 			{

@@ -249,5 +249,6 @@ describe("provider safety-stop provenance authority", () => {
 		await expect(import(deepImport)).rejects.toThrow();
 		const manifest = (await import("../package.json", { with: { type: "json" } })).default;
 		expect(manifest.exports["./adapter-internals/*"]).toBeNull();
+		expect(manifest.exports["./adapter-internals/*.js"]).toBeNull();
 	});
 });
