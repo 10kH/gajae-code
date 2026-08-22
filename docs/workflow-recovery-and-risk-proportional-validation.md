@@ -36,8 +36,8 @@ Each compaction attempt fingerprints the projection's contract-relevant fields (
 
 Low-risk eligibility (the only case where redundant lanes may be omitted) requires **all** of:
 
-- a trusted, completely captured change set with a runtime-computed source-basis digest,
-- exactly one outstanding goal,
+- a trusted, completely captured change set with a runtime-computed source-basis digest (missing or unverified digest and incomplete capture both fail closed),
+- exactly one outstanding goal with known aggregate shape (unknown size fails closed),
 - no open review blockers,
 - no high-risk path (workflow enforcement itself, auth/security, native crates, SDK/extensibility public contract, agent-wire protocol, shared behavior registries), migration path, or computer-control-surface path.
 
@@ -46,7 +46,7 @@ Everything else — including a missing or untrusted change set — is high risk
 Omission mechanics:
 
 - The **QA lane can never be omitted**. Targeted verification and real-surface evidence stay mandatory at every boundary.
-- A leader presenting a reduced cohort must carry a top-level `validationLaneSelection` proof (`riskClass`, `reasons`, `omittedLanes`) that exactly mirrors the runtime-computed selection. Mismatches fail closed with typed diagnostics (`reduction_not_applicable`, `selection_mismatch`, `reasons_mismatch`, `omitted_lanes_mismatch`, `qa_lane_mandatory`, `selection_invalid`, `source_hash_mismatch`) and the full cohort requirement stays in force.
+- A leader presenting a reduced cohort must carry a top-level `validationLaneSelection` proof (`riskClass`, `reasons`, `omittedLanes`) that exactly mirrors the runtime-computed selection. Mismatches fail closed with typed diagnostics (`selection_mismatch`, `reasons_mismatch`, `omitted_lanes_mismatch`, `qa_lane_mandatory`, `selection_invalid`, `source_hash_mismatch`) and the full cohort requirement stays in force.
 - The **terminal critic** is proportional: `criticReview.verdict: OKAY` remains mandatory for final aggregates except when the run is single-goal, low-risk, blocker-free, **and** the immutable source basis is unchanged (`basisUnchanged`), in which case the already-joined cohort evidence satisfies the terminus without a duplicate critic read pass.
 
 ### Unchanged-basis rerun avoidance
