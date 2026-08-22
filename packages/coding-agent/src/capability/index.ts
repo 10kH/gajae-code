@@ -110,7 +110,12 @@ async function loadImpl<T>(
 	const contributingProviders: string[] = [];
 	const disabledExtensionIds = options.includeDisabled
 		? new Set<string>()
-		: new Set<string>(options.disabledExtensions ?? settings?.get("disabledExtensions") ?? []);
+		: new Set<string>(
+				options.disabledExtensions ??
+					options.settings?.get("disabledExtensions") ??
+					settings?.get("disabledExtensions") ??
+					[],
+			);
 
 	const results = await Promise.all(
 		providers.map(async provider => {
