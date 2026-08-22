@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { logger } from "@gajae-code/utils";
 import { Args, CliParseError, Command, Flags, renderCommandHelp } from "@gajae-code/utils/cli";
 import type { Args as ParsedArgs } from "../cli/args";
+import { parseModelString } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { applyStartupModelProfiles, createSessionManager } from "../main";
 import { initializeExtensions } from "../modes/runtime-init";
@@ -683,6 +684,7 @@ export async function runSessionHost(
 	};
 
 	try {
+		const startupThinkingLevel = request.modelId ? parseModelString(request.modelId)?.thinkingLevel : undefined;
 		const modelProfileStartup =
 			process.env.GJC_SDK_TEST_HANG_MODEL_PROFILE === cwd
 				? new Promise<void>(() => {})
@@ -691,6 +693,7 @@ export async function runSessionHost(
 						settings: session.settings,
 						modelRegistry: session.modelRegistry,
 						parsedArgs: parsed,
+						startupThinkingLevel,
 					});
 		await beforeCutoff(modelProfileStartup);
 		throwIfCutoff();

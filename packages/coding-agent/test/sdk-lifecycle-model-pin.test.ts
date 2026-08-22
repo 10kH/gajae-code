@@ -43,6 +43,7 @@ describe("lifecycle session explicit model pin", () => {
 		// The pin must apply on a credential the CLI would also accept; the issue's
 		// evidence is a stored Cursor credential without a usage probe.
 		authStorage.setRuntimeApiKey("cursor", "test-key");
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
 	});
 
 	afterEach(async () => {
@@ -104,6 +105,31 @@ describe("lifecycle session explicit model pin", () => {
 			});
 
 			expect(`${created.session.model?.provider}/${created.session.model?.id}`).toBe("cursor/composer-2.5");
+		} finally {
+			await created.session.dispose();
+		}
+	}, 30_000);
+
+	test("preserves an explicit thinking suffix through lifecycle validation", async () => {
+		const cwd = tempCwd();
+		const settings = Settings.isolated();
+		const created = await createLifecycleAgentSession({
+			...lifecycleOptions(cwd, settings),
+			modelId: "anthropic/claude-sonnet-4-5:high",
+		});
+
+		if ("failure" in created) throw new Error(`Lifecycle construction failed: ${created.failure.message}`);
+		try {
+			expect(`${created.session.model?.provider}/${created.session.model?.id}`).toBe("anthropic/claude-sonnet-4-5");
+			expect(String(created.session.thinkingLevel)).toBe("high");
+			await applyStartupModelProfiles({
+				session: created.session,
+				settings,
+				modelRegistry: created.session.modelRegistry,
+				parsedArgs: { model: "anthropic/claude-sonnet-4-5:high" },
+				startupThinkingLevel: "high" as never,
+			});
+			expect(String(created.session.thinkingLevel)).toBe("high");
 		} finally {
 			await created.session.dispose();
 		}
