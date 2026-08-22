@@ -95,7 +95,6 @@ function buildEntryTokens(entry: SkillActiveEntry, tier: WidthTier, width: numbe
 	if (
 		tier === "tight" &&
 		glyph &&
-		visibleWidth(glyph) > 1 &&
 		visibleWidth(glyph) <= width &&
 		visibleWidth(baseText) + 1 + visibleWidth(glyph) > width
 	) {
