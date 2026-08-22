@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import {
 	buildCursorHistoryForTest,
+	buildCursorRequestContextRules,
 	buildCursorSystemPromptJsons,
 	createCursorMessageQueueForTest,
 	resolveExecHandler,
@@ -164,6 +165,38 @@ describe("Cursor server message ordering", () => {
 });
 
 describe("Cursor system prompt encoding", () => {
+	it("maps normalized prompts to ordered USER/global Cursor rules", () => {
+		const rules = buildCursorRequestContextRules(["Primary instructions.", "", "Developer constraints."]);
+
+		expect(rules).toHaveLength(2);
+		expect(
+			rules.map(rule => ({
+				fullPath: rule.fullPath,
+				content: rule.content,
+				source: rule.source,
+				type: rule.type?.type.case,
+			})),
+		).toEqual([
+			{
+				fullPath: "/gjc/system-prompt/0.mdc",
+				content: "Primary instructions.",
+				source: 2,
+				type: "global",
+			},
+			{
+				fullPath: "/gjc/system-prompt/1.mdc",
+				content: "Developer constraints.",
+				source: 2,
+				type: "global",
+			},
+		]);
+	});
+
+	it("does not emit rules for missing or empty system prompts", () => {
+		expect(buildCursorRequestContextRules(undefined)).toEqual([]);
+		expect(buildCursorRequestContextRules(["", ""])).toEqual([]);
+	});
+
 	it("emits one Cursor system blob per ordered prompt", () => {
 		const jsons = buildCursorSystemPromptJsons(["Primary instructions.", "Developer constraints."]);
 		expect(jsons).toHaveLength(2);
