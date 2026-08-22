@@ -107,6 +107,7 @@ describe("AgentSession eager todo enforcement", () => {
 	let modelRegistry: ModelRegistry;
 	let settings: Settings;
 	let managedAppendSpy: ReturnType<typeof spyOn> | undefined;
+	let managedIdentityAppendSpy: ReturnType<typeof spyOn> | undefined;
 	let fileWriterSpy: ReturnType<typeof spyOn> | undefined;
 
 	let authStorage: AuthStorage | undefined;
@@ -211,6 +212,8 @@ describe("AgentSession eager todo enforcement", () => {
 		clearToolChoiceIncapabilityRegistryForTests();
 		managedAppendSpy?.mockRestore();
 		managedAppendSpy = undefined;
+		managedIdentityAppendSpy?.mockRestore();
+		managedIdentityAppendSpy = undefined;
 		fileWriterSpy?.mockRestore();
 		fileWriterSpy = undefined;
 		if (session) {
@@ -692,23 +695,38 @@ describe("AgentSession eager todo enforcement", () => {
 			});
 			const sendCustomMessage = spyOn(session, "sendCustomMessage").mockResolvedValue();
 			const realManagedAppend = ManagedSessionDescendantStore.prototype.appendSync;
+			const realManagedIdentityAppend = ManagedSessionDescendantStore.prototype.appendExpectedIdentitySync;
 			let rejectedSuccessfulTodo = false;
+			// Records the successful todo_write append as committed-then-failed. The manager
+			// only takes the unbound `appendSync` for the FIRST append of a transcript; every
+			// later append carries the expected identity, which is where the todo lands.
+			const rejectCommittedTodo = (staged: string): boolean => {
+				if (rejectedSuccessfulTodo) return false;
+				if (!staged.includes('"toolName":"todo_write"')) return false;
+				if (staged.includes('"failureKind":"persistence"')) return false;
+				rejectedSuccessfulTodo = true;
+				return true;
+			};
 			managedAppendSpy = spyOn(ManagedSessionDescendantStore.prototype, "appendSync").mockImplementation(function (
 				this: ManagedSessionDescendantStore,
 				relativePath,
 				bytes,
 			) {
-				const staged = new TextDecoder().decode(bytes);
-				if (
-					!rejectedSuccessfulTodo &&
-					staged.includes('"toolName":"todo_write"') &&
-					!staged.includes('"failureKind":"persistence"')
-				) {
-					rejectedSuccessfulTodo = true;
+				if (rejectCommittedTodo(new TextDecoder().decode(bytes))) {
 					realManagedAppend.call(this, relativePath, bytes);
 					throw new Error("managed append reported failure after commit");
 				}
 				return realManagedAppend.call(this, relativePath, bytes);
+			});
+			managedIdentityAppendSpy = spyOn(
+				ManagedSessionDescendantStore.prototype,
+				"appendExpectedIdentitySync",
+			).mockImplementation(function (this: ManagedSessionDescendantStore, relativePath, bytes, identity) {
+				if (rejectCommittedTodo(new TextDecoder().decode(bytes))) {
+					realManagedIdentityAppend.call(this, relativePath, bytes, identity);
+					throw new Error("managed append reported failure after commit");
+				}
+				return realManagedIdentityAppend.call(this, relativePath, bytes, identity);
 			});
 
 			scriptedResponses = [
