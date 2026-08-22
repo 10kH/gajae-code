@@ -335,8 +335,7 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 			// foreign-context risk, so a legacy row keeps serving its models through a
 			// failed refetch instead of blanking the catalog and overwriting the row
 			// with an empty snapshot.
-			const latestCacheServesLegacyRow =
-				latestCacheIsLegacy && options.cacheDynamicModelProvenance === undefined;
+			const latestCacheServesLegacyRow = latestCacheIsLegacy && options.cacheDynamicModelProvenance === undefined;
 			const fallbackCacheModels =
 				(latestCacheMatchesCurrentContext || latestCacheServesLegacyRow) && latestCache !== null
 					? normalizeModelList<TApi>(latestCache.models)
