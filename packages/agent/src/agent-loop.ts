@@ -14,7 +14,6 @@ import {
 	EventStream,
 	isProviderSafetyStopAuthenticated,
 	isZodSchema,
-	revokeProviderSafetyStop,
 	streamSimple,
 	type ToolChoice,
 	type ToolResultMessage,
@@ -36,6 +35,7 @@ import {
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
 import { $credentialEnv, logger, sanitizeText } from "@gajae-code/utils";
+import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
 import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,

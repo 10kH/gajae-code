@@ -116,6 +116,7 @@ describe("provider safety-stop provenance authority", () => {
 		const publicSurface = publicAi as unknown as Record<string, unknown>;
 		expect(publicSurface.applyProviderSafetyStop).toBeUndefined();
 		expect(typeof publicSurface.isProviderSafetyStopAuthenticated).toBe("function");
+		expect(publicSurface.revokeProviderSafetyStop).toBeUndefined();
 		expect(publicSurface.transferProviderSafetyStop).toBeUndefined();
 	});
 
