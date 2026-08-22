@@ -4,20 +4,37 @@ on:
 permissions:
    contents: read
 jobs:
-   plain:
+   meta:
+      runs-on: ubuntu-22.04
+      outputs:
+         channel: ${{ steps.release.outputs.channel }}
+      steps:
+         - id: release
+           shell: bash
+           run: |
+              set -euo pipefail
+              {
+                 echo "channel=stable"
+                 echo "version=9.9.9"
+              } >> "$GITHUB_OUTPUT"
+   prepare_like:
+      if: ${{ always() && ((needs.meta.outputs.channel == 'stable' && github.event_name != 'workflow_dispatch') || (needs.meta.outputs.channel == 'stable' && github.event_name == 'workflow_dispatch')) }}
+      needs: [meta]
       runs-on: ubuntu-22.04
       steps:
-         - run: echo "plain job ran"
-   with_env:
+         - run: echo "prepare_like ran with channel=${{ needs.meta.outputs.channel }}"
+   approval_like:
+      if: ${{ needs.prepare_like.result == 'success' && needs.meta.outputs.channel == 'stable' }}
+      needs: [prepare_like, meta]
       runs-on: ubuntu-22.04
       permissions:
          deployments: write
       environment: npm-release
       steps:
-         - run: echo "environment job ran"
-   with_env_no_perms:
+         - run: echo "approval_like ran"
+   approval_like_no_env:
+      if: ${{ needs.prepare_like.result == 'success' && needs.meta.outputs.channel == 'stable' }}
+      needs: [prepare_like, meta]
       runs-on: ubuntu-22.04
-      permissions: {}
-      environment: npm-release
       steps:
-         - run: echo "environment job without permissions ran"
+         - run: echo "approval_like_no_env ran"
