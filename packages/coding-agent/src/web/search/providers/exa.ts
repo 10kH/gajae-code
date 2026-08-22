@@ -7,6 +7,7 @@
  * them into a combined `answer` string on the SearchResponse.
  */
 import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai/core";
+import { settings } from "../../../config/settings";
 
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
@@ -173,7 +174,13 @@ export class ExaProvider extends SearchProvider {
 	readonly label = "Exa";
 
 	isAvailable(_authStorage: AuthStorage, activeSettings?: SearchProviderSettings): boolean {
-		if (activeSettings?.exa?.enabled === false || activeSettings?.exa?.enableSearch === false) return false;
+		try {
+			const enabled = activeSettings?.exa?.enabled ?? settings.get("exa.enabled");
+			const enableSearch = activeSettings?.exa?.enableSearch ?? settings.get("exa.enableSearch");
+			if (enabled === false || enableSearch === false) return false;
+		} catch {
+			// Settings may be uninitialized in standalone provider tests.
+		}
 		return !!getEnvApiKey("exa");
 	}
 

@@ -369,6 +369,50 @@ export function createExtensionSettings(
 	});
 }
 
+const CUSTOM_TOOL_ALLOWED_SETTINGS_METHODS = new Set<PropertyKey>([
+	"getAgentDir",
+	"getBashInterceptorRules",
+	"getCwd",
+	"getEditVariantForModel",
+	"getModelRoles",
+	"getPlansDirectory",
+	"getShellConfig",
+]);
+
+const CUSTOM_TOOL_SETTINGS_BLOCKED_MESSAGE = "Custom tool settings are read-only and secret paths are unavailable";
+
+/**
+ * Preserve the historical Settings-shaped custom-tool contract without exposing
+ * mutation APIs or unrestricted settings reads at runtime.
+ */
+
+export function createCustomToolSettings(settings: Settings | ExtensionSettings): Settings {
+	const blockedMethod = (): never => {
+		throw new Error(CUSTOM_TOOL_SETTINGS_BLOCKED_MESSAGE);
+	};
+	if (!("getCwd" in settings)) {
+		return new Proxy(Object.create(null) as Settings, {
+			get(_target, property) {
+				if (property === "get") return settings.get;
+				if (property === "getModelRole") return settings.getModelRole;
+				return blockedMethod;
+			},
+		});
+	}
+	const extensionSettings = createExtensionSettings(settings);
+
+	return new Proxy(settings, {
+		get(target, property, receiver) {
+			if (property === "get") return extensionSettings.get;
+			if (property === "getModelRole") return extensionSettings.getModelRole;
+			const value = Reflect.get(target, property, receiver);
+			if (typeof value !== "function") return value;
+			if (!CUSTOM_TOOL_ALLOWED_SETTINGS_METHODS.has(property)) return blockedMethod;
+			return value.bind(target);
+		},
+	});
+}
+
 /**
  * Context passed to extension event handlers.
  */

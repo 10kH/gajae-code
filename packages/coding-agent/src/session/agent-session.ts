@@ -274,7 +274,7 @@ import type {
 import {
 	type CompactOptions,
 	type ContextUsage,
-	createExtensionSettings,
+	createCustomToolSettings,
 	type ExtensionTranscriptEntry,
 } from "../extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
@@ -8925,7 +8925,7 @@ export class AgentSession {
 		const getCustomToolContext = (): CustomToolContext => ({
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
-			settings: createExtensionSettings(this.settings),
+			settings: createCustomToolSettings(this.settings),
 			credentialSessionId: this.credentialSessionId,
 			model: this.model,
 			isIdle: () => !this.isStreaming,
@@ -8970,7 +8970,7 @@ export class AgentSession {
 		return {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
-			settings: createExtensionSettings(this.settings),
+			settings: createCustomToolSettings(this.settings),
 			credentialSessionId: this.credentialSessionId,
 			model: this.model,
 			isIdle: () => !this.isStreaming,

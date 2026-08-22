@@ -1407,7 +1407,10 @@ export async function runRootCommand(
 				});
 			}
 		}
-		if (bareResumeCleanupFailed) return;
+		if (bareResumeCleanupFailed) {
+			if (!deps.suppressProcessExit) process.exitCode = 1;
+			return;
+		}
 	}
 
 	if (!initialThemeInitialized) {

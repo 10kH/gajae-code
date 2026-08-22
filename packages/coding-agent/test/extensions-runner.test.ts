@@ -15,7 +15,10 @@ import {
 	testSetExtensionHandlerTimeoutMs,
 	testSetSessionShutdownHandlerTimeoutMs,
 } from "@gajae-code/coding-agent/extensibility/extensions/runner";
-import type { ExtensionContext } from "@gajae-code/coding-agent/extensibility/extensions/types";
+import {
+	createCustomToolSettings,
+	type ExtensionContext,
+} from "@gajae-code/coding-agent/extensibility/extensions/types";
 
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -70,6 +73,7 @@ describe("ExtensionRunner", () => {
 		it("exposes the authoritative session settings to extension contexts", () => {
 			const settings = {
 				get: (path: string) => (path === "modelRoles" ? { image: "openai/gpt-image-2" } : undefined),
+				getCwd: () => tempDir.path(),
 				getModelRole: (role: string) => (role === "image" ? "openai/gpt-image-2" : undefined),
 			} as Settings;
 			const runner = new ExtensionRunner(
@@ -87,6 +91,10 @@ describe("ExtensionRunner", () => {
 			expect(exposed?.get("modelRoles")).toEqual({ image: "openai/gpt-image-2" });
 			expect(exposed?.getModelRole("image")).toBe("openai/gpt-image-2");
 			expect(exposed?.get("searxng.token")).toBeUndefined();
+			const compatibility = createCustomToolSettings(settings);
+			expect(compatibility.getCwd()).toBe(tempDir.path());
+			expect(compatibility.get("searxng.token")).toBeUndefined();
+			expect(() => compatibility.set("theme.dark", "dark")).toThrow();
 		});
 
 		it("exposes the live credential session identity to extension contexts", () => {

@@ -82,7 +82,7 @@ import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibi
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../extensibility/custom-tools/types";
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import {
-	createExtensionSettings,
+	createCustomToolSettings,
 	type ExtensionContext,
 	type ExtensionFactory,
 	ExtensionRunner,
@@ -828,7 +828,7 @@ function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
 	return {
 		sessionManager: ctx.sessionManager,
 		modelRegistry: ctx.modelRegistry,
-		settings: ctx.settings,
+		settings: ctx.settings ? createCustomToolSettings(ctx.settings) : undefined,
 		get credentialSessionId() {
 			return ctx.credentialSessionId;
 		},
@@ -3386,7 +3386,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				isIdle: () => !session?.isStreaming,
 				hasQueuedMessages: () => (session?.queuedMessageCount ?? 0) > 0,
 				abort: () => session?.abort(),
-				settings: createExtensionSettings(settings),
+				settings: createCustomToolSettings(settings),
 			});
 			wrappedExtensionTools = (options.customTools ?? [])
 				.filter(isCustomTool)
