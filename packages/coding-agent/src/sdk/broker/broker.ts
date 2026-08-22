@@ -1501,7 +1501,8 @@ export class Broker {
 		if (operation === "session.get_endpoint") return this.#endpoint(input);
 		if (operation === "model.resolve") {
 			try {
-				return { ok: true, result: await this.#resolveModelPin(input.model) };
+				const cwd = typeof input.cwd === "string" ? input.cwd : undefined;
+				return { ok: true, result: await this.#resolveModelPin(input.model, { cwd }) };
 			} catch {
 				return error("unavailable", "SDK host model resolution is unavailable.");
 			}

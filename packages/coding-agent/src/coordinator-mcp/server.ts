@@ -205,7 +205,7 @@ interface CoordinatorServices {
 	readSdkBrokerDiscovery?: (agentDir: string) => Promise<BrokerDiscovery | null>;
 	getAgentDir?: () => string;
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
-	resolveModelPin?: (raw: unknown) => Promise<CoordinatorModelResolution>;
+	resolveModelPin?: (raw: unknown, cwd?: string) => Promise<CoordinatorModelResolution>;
 	canonicalizePath?: (value: string) => Promise<string>;
 	codexTransportFactory?: CodexTransportFactory;
 	eventWebhookDelivery?: WebhookDelivery;
@@ -3498,9 +3498,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	const resolveModelPin =
 		services.resolveModelPin ??
-		(async (raw: unknown): Promise<CoordinatorModelResolution> => {
+		(async (raw: unknown, cwd?: string): Promise<CoordinatorModelResolution> => {
 			if (raw === undefined || raw === null) return { ok: true, model: null };
-			const result = brokerResult(await brokerSession("", "model.resolve", { model: raw }));
+			const result = brokerResult(await brokerSession("", "model.resolve", { model: raw, cwd }));
 			if (result) {
 				if (result.ok === true && (result.model === null || typeof result.model === "string"))
 					return { ok: true, model: result.model };
@@ -4876,7 +4876,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				// Explicit model pin (#4707) is resolved by the SDK host. The
 				// coordinator remains a transport/controller boundary and never loads
 				// session, settings, discovery, or MCP-manager authority.
-				const modelResolution = await resolveModelPin(args.model);
+				const modelResolution = await resolveModelPin(args.model, canonicalCwd);
 				if (!modelResolution.ok) {
 					return {
 						ok: false,
@@ -5202,7 +5202,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				}
 				// Explicit model pin (#4707): resolve with CLI grammar at the SDK host
 				// boundary before any coordinator mutation or lifecycle request.
-				const modelResolution = await resolveModelPin(args.model);
+				const modelResolution = await resolveModelPin(args.model, cwd);
 				if (!modelResolution.ok) {
 					return {
 						ok: false,

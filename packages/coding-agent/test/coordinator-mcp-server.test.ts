@@ -1721,6 +1721,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			"model.resolve",
 			"session.create",
 		]);
+		expect(controls.find(control => control.operation === "model.resolve")?.input).toMatchObject({ cwd: root });
 	});
 
 	it("keeps lifecycle endpoint credentials out of start_session results", async () => {

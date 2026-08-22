@@ -38,6 +38,10 @@ describe("resolveSdkHostModel", () => {
 				model: selector,
 			});
 		}
+		expect(await resolveSdkHostModel("cursor/default:high", registryWith(CURSOR_MODELS))).toEqual({
+			ok: true,
+			model: "cursor/default:high",
+		});
 	});
 
 	it("fails closed on unknown ids with the CLI not-found error", async () => {
@@ -193,6 +197,55 @@ describe("resolveSdkHostModel", () => {
 		} finally {
 			firstStorage.close();
 			secondStorage.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reloads provider order while a broker registry remains alive", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-host-provider-order-reload-"));
+		const storage = await AuthStorage.create(path.join(root, "auth.db"));
+		const modelsPath = path.join(root, "models.yml");
+		await fs.writeFile(
+			modelsPath,
+			`providers:
+  fixture-a:
+    baseUrl: http://127.0.0.1:1/v1
+    apiKey: fixture-key
+    api: openai-completions
+    models:
+      - id: shared
+        name: shared
+        contextWindow: 32768
+        maxTokens: 4096
+  fixture-b:
+    baseUrl: http://127.0.0.1:1/v1
+    apiKey: fixture-key
+    api: openai-completions
+    models:
+      - id: shared
+        name: shared
+        contextWindow: 32768
+        maxTokens: 4096
+`,
+		);
+		let order = ["fixture-b"];
+		const loader = createSdkHostModelRegistryLoader(
+			async () => storage,
+			modelsPath,
+			async () => Settings.isolated({ modelProviderOrder: order }),
+		);
+		try {
+			expect(await resolveSdkHostModel("shared", loader)).toEqual({
+				ok: true,
+				model: "fixture-b/shared",
+			});
+			order = ["fixture-a"];
+			expect(await resolveSdkHostModel("shared", loader)).toEqual({
+				ok: true,
+				model: "fixture-a/shared",
+			});
+		} finally {
+			storage.close();
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	});

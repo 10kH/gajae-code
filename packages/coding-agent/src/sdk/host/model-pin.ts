@@ -1,14 +1,25 @@
 import * as path from "node:path";
 import type { AuthStorage } from "@gajae-code/ai/core";
 import { ModelRegistry } from "../../config/model-registry";
-import { formatModelString, type ResolveCliModelResult, resolveCliModel } from "../../config/model-resolver";
+import {
+	formatModelSelectorValue,
+	formatModelString,
+	type ResolveCliModelResult,
+	resolveCliModel,
+} from "../../config/model-resolver";
 import { Settings } from "../../config/settings";
 import { discoverAuthStorage } from "../session";
 
 const MAX_ECHOED_MODEL_LENGTH = 256;
 
+export interface SdkHostModelResolveContext {
+	cwd?: string;
+}
+
 /** Registry loader owned by the SDK host, not by machine-facing adapters. */
-export type SdkHostModelRegistryLoader = () => ModelRegistry | Promise<ModelRegistry>;
+export type SdkHostModelRegistryLoader = (
+	context?: SdkHostModelResolveContext,
+) => ModelRegistry | Promise<ModelRegistry>;
 
 /**
  * Builds an offline model resolver for a single SDK host process.
@@ -19,12 +30,12 @@ export type SdkHostModelRegistryLoader = () => ModelRegistry | Promise<ModelRegi
 export function createSdkHostModelRegistryLoader(
 	discoverStorage: () => Promise<AuthStorage>,
 	modelsPath?: string,
-	loadSettings?: () => Promise<Pick<Settings, "get" | "getGlobal">>,
+	loadSettings?: (context?: SdkHostModelResolveContext) => Promise<Pick<Settings, "get" | "getGlobal">>,
 ): SdkHostModelRegistryLoader {
 	let cachedRegistry: Promise<ModelRegistry> | undefined;
-	return async () => {
+	return async (context?: SdkHostModelResolveContext) => {
 		if (cachedRegistry === undefined) {
-			const initializing = Promise.all([discoverStorage(), loadSettings?.()]).then(
+			const initializing = Promise.all([discoverStorage(), loadSettings?.(context)]).then(
 				([storage, registrySettings]) => new ModelRegistry(storage, modelsPath, registrySettings),
 			);
 			cachedRegistry = initializing;
@@ -36,6 +47,7 @@ export function createSdkHostModelRegistryLoader(
 			}
 		}
 		const registry = await cachedRegistry;
+		if (loadSettings) registry.setScopedSettings(await loadSettings(context));
 		await registry.refresh("offline");
 		return registry;
 	};
@@ -45,17 +57,21 @@ export type SdkHostModelResolution =
 	| { ok: true; model: string | null }
 	| { ok: false; reason: "unknown_model"; model: string; error: string };
 
-export type SdkHostModelResolver = (raw: unknown) => Promise<SdkHostModelResolution>;
+export type SdkHostModelResolver = (
+	raw: unknown,
+	context?: SdkHostModelResolveContext,
+) => Promise<SdkHostModelResolution>;
 
 /** Resolve the explicit model pin at the SDK host boundary. */
 export async function resolveSdkHostModel(
 	raw: unknown,
 	loadRegistry: SdkHostModelRegistryLoader,
+	context?: SdkHostModelResolveContext,
 ): Promise<SdkHostModelResolution> {
 	if (raw === undefined || raw === null) return { ok: true, model: null };
 	const requested = typeof raw === "string" ? raw : "";
 	const echoed = requested.trim().slice(0, MAX_ECHOED_MODEL_LENGTH);
-	const registry = await loadRegistry();
+	const registry = await loadRegistry(context);
 	const resolved: ResolveCliModelResult = resolveCliModel({ cliModel: requested, modelRegistry: registry });
 	if (!resolved.model)
 		return {
@@ -64,7 +80,10 @@ export async function resolveSdkHostModel(
 			model: echoed,
 			error: resolved.error ?? "No models available. Check your installation or add models to models.json.",
 		};
-	return { ok: true, model: formatModelString(resolved.model) };
+	return {
+		ok: true,
+		model: formatModelSelectorValue(formatModelString(resolved.model), resolved.thinkingLevel),
+	};
 }
 
 /** Default resolver used by the SDK broker host. */
@@ -72,7 +91,8 @@ export function createDefaultSdkHostModelResolver(agentDir: string): SdkHostMode
 	const loadRegistry = createSdkHostModelRegistryLoader(
 		() => discoverAuthStorage(agentDir),
 		path.join(agentDir, "models.yml"),
-		() => Settings.loadReadonly({ agentDir }),
+		context => Settings.loadReadonly({ agentDir, cwd: context?.cwd }),
 	);
-	return (raw: unknown): Promise<SdkHostModelResolution> => resolveSdkHostModel(raw, loadRegistry);
+	return (raw: unknown, context?: SdkHostModelResolveContext): Promise<SdkHostModelResolution> =>
+		resolveSdkHostModel(raw, loadRegistry, context);
 }

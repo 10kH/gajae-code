@@ -1387,7 +1387,7 @@ export class ModelRegistry {
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
-	readonly #settings: Pick<Settings, "get" | "getGlobal">;
+	#settings: Pick<Settings, "get" | "getGlobal">;
 	#lastStaticLoadMtime: number | null = null;
 	#lastStaticLoadEnvironmentFingerprint: string | undefined;
 	#staticModelsLoaded = false;
@@ -1435,6 +1435,11 @@ export class ModelRegistry {
 		return () => {
 			this.#catalogChangeListeners.delete(listener);
 		};
+	}
+
+	/** Replace the read-only settings snapshot used by profile-scoped resolution. */
+	setScopedSettings(settingsReader: Pick<Settings, "get" | "getGlobal">): void {
+		this.#settings = settingsReader;
 	}
 
 	/**
