@@ -75,7 +75,7 @@ import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
-import { initializeWithSettings } from "../discovery";
+import { initializeWithSettings, releaseSettingsScope } from "../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { TtsrManager } from "../export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibility/custom-commands";
@@ -1425,7 +1425,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 		closeOwnedSettings = async (): Promise<void> => {
-			if (ownsScopedSettings) await settings.close();
+			if (!ownsScopedSettings) return;
+			try {
+				await settings.close();
+			} finally {
+				releaseSettingsScope(settings);
+			}
 		};
 		// Keep legacy singleton consumers (bash, edit guards, and older extension code)
 		// initialized for SDK child hosts without making the session's role resolution

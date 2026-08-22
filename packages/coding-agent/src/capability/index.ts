@@ -266,6 +266,12 @@ export function initializeWithSettings(activeSettings: Settings): void {
 	for (const id of disabled) disabledProviders.add(id);
 }
 
+/** Remove a disposed session scope without disturbing a newer replacement. */
+export function releaseSettingsScope(activeSettings: Settings): void {
+	const cwd = path.normalize(activeSettings.getCwd());
+	if (settingsByCwd.get(cwd) === activeSettings) settingsByCwd.delete(cwd);
+}
+
 function assertDisabledProvidersWritable(activeSettings: Settings): void {
 	if (!activeSettings.canWriteDurableConfig()) {
 		throw new Error(

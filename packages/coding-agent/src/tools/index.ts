@@ -603,7 +603,14 @@ export async function createTools(
 		(requestedTools === undefined || requestedTools.includes("eval"))
 	) {
 		const { checkPythonKernelAvailability } = await import("../eval/py/kernel");
-		const availability = await logger.time("createTools:pythonCheck", checkPythonKernelAvailability, session.cwd);
+		const availability = await logger.time(
+			"createTools:pythonCheck",
+			checkPythonKernelAvailability,
+			session.cwd,
+			undefined,
+			undefined,
+			session.settings,
+		);
 		pythonAvailable = availability.ok;
 		if (!availability.ok) {
 			logger.warn("Python kernel unavailable and JS backend disabled; eval will be unavailable", {
