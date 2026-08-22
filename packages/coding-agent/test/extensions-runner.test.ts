@@ -82,6 +82,19 @@ describe("ExtensionRunner", () => {
 			expect(runner.createContext().settings).toBe(settings);
 		});
 
+		it("exposes the live credential session identity to extension contexts", () => {
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			runner.initialize({} as never, { getCredentialSessionId: () => "credential-session-1" } as never);
+
+			expect(runner.createContext().credentialSessionId).toBe("credential-session-1");
+		});
+
 		it("exposes only tool safe-summary metadata through extension context", () => {
 			const safeSummary = (kind: "args" | "result", value: unknown) =>
 				kind === "args" ? `safe:${String(value)}` : undefined;

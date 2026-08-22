@@ -828,6 +828,9 @@ function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
 		sessionManager: ctx.sessionManager,
 		modelRegistry: ctx.modelRegistry,
 		settings: ctx.settings,
+		get credentialSessionId() {
+			return ctx.credentialSessionId;
+		},
 		model: ctx.model,
 		isIdle: ctx.isIdle,
 		hasQueuedMessages: ctx.hasPendingMessages,
@@ -1416,7 +1419,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
 		};
-		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+		const ownsScopedSettings = options.settings === undefined;
+		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),

@@ -95,6 +95,23 @@ describe("Settings", () => {
 			warning.mockRestore();
 		}
 	});
+
+	it("loads SDK settings per scope instead of reusing the global singleton", async () => {
+		await Settings.init({ inMemory: true, cwd: projectDir, agentDir });
+		const secondProjectDir = path.join(testDir, "second-project");
+		fs.mkdirSync(getProjectAgentDir(secondProjectDir), { recursive: true });
+		await Bun.write(
+			path.join(getProjectAgentDir(secondProjectDir), "config.yml"),
+			YAML.stringify({ modelRoles: { image: "openai-codex/gpt-image-2" } }, null, 2),
+		);
+
+		const scoped = await Settings.loadForScope({ cwd: secondProjectDir, agentDir });
+
+		expect(scoped).not.toBe(Settings.instance);
+		expect(scoped.getModelRole("image")).toBe("openai-codex/gpt-image-2");
+		expect(Settings.instance.getModelRole("image")).toBeUndefined();
+	});
+
 	it("distinguishes an absent first-event retry timeout from an explicit zero", () => {
 		const absent = Settings.isolated();
 		expect(absent.get("retry.streamFirstEventTimeoutMs")).toBe(100_000);
