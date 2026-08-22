@@ -134,22 +134,23 @@ function ensurePythonResourceCleanup(): void {
 const sessions = new Map<string, PythonSession | InitializingPythonSession>();
 const retiringKernels = new Set<PythonKernel>();
 const settingsSessionIds = new WeakMap<Settings, number>();
-const sessionAliases = new Map<string, string>();
 let nextSettingsSessionId = 1;
 
 function scopedSessionId(sessionId: string, activeSettings: Settings | undefined): string {
-	if (!activeSettings) return sessionAliases.get(sessionId) ?? sessionId;
+	if (!activeSettings) {
+		const prefix = `${sessionId}:settings-`;
+		for (const existingSessionId of sessions.keys()) {
+			if (existingSessionId.startsWith(prefix)) return existingSessionId;
+		}
+		return sessionId;
+	}
 	const existing = settingsSessionIds.get(activeSettings);
 	if (existing !== undefined) {
-		const scoped = `${sessionId}:settings-${existing}`;
-		sessionAliases.set(sessionId, scoped);
-		return scoped;
+		return `${sessionId}:settings-${existing}`;
 	}
 	const id = nextSettingsSessionId++;
 	settingsSessionIds.set(activeSettings, id);
-	const scoped = `${sessionId}:settings-${id}`;
-	sessionAliases.set(sessionId, scoped);
-	return scoped;
+	return `${sessionId}:settings-${id}`;
 }
 
 async function shutdownOrRetainKernel(kernel: PythonKernel): Promise<void> {
