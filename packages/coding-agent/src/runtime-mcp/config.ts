@@ -7,6 +7,7 @@
 import { getMCPConfigPath } from "@gajae-code/utils";
 import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
+import type { Settings } from "../config/settings";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { loadMCPJsonFile } from "../discovery/mcp-json";
@@ -14,7 +15,6 @@ import { readDisabledServers } from "./config-writer";
 import { canonicalizeMCPEndpoint } from "./pool-key";
 import { isMCPProtocolPreference } from "./protocol";
 import type { MCPServerConfig } from "./types";
-import type { Settings } from "../config/settings";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
