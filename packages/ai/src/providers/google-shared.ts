@@ -3,6 +3,12 @@
  */
 
 import { extractHttpStatusFromError, readJsonl, readSseJson } from "@gajae-code/utils";
+import type { ProviderSafetyStopAdapterInvocation } from "../adapter-internals/provider-safety-stop";
+import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -568,12 +574,24 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	output: AssistantMessage;
 	stream: AssistantMessageEventStream;
 	model: Model<T>;
-	options: { signal?: AbortSignal } | undefined;
+	options: { signal?: AbortSignal; fetch?: unknown } | undefined;
+	callerFetch?: unknown;
+	adapterInvocation?: ProviderSafetyStopAdapterInvocation;
 	/** Vertex preserves `textSignature` on streamed text deltas; google-generative-ai does not. */
 	retainTextSignature?: boolean;
 	onFirstToken?: () => void;
 }): Promise<void> {
-	const { googleStream, output, stream, model, options, retainTextSignature, onFirstToken } = args;
+	const {
+		googleStream,
+		output,
+		stream,
+		model,
+		options,
+		callerFetch,
+		adapterInvocation,
+		retainTextSignature,
+		onFirstToken,
+	} = args;
 	const blocks = output.content;
 	const blockIndex = () => blocks.length - 1;
 	let currentBlock: TextContent | ThinkingContent | null = null;
@@ -658,7 +676,16 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 
 		if (candidate?.finishReason) {
 			if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
-				output.errorKind = PROVIDER_SAFETY_STOP;
+				// Terminal authority is minted by the adapter after parsing the
+				// structured candidate finish reason; a wire-assignable field
+				// alone never carries it (#4777).
+				mintProviderSafetyStop(
+					output,
+					candidate.finishReason,
+					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+					callerFetch,
+					adapterInvocation,
+				);
 				output.stopReason = "error";
 			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 				output.stopReason = mapStopReason(candidate.finishReason);
@@ -671,7 +698,15 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 		const blockReason = getGooglePromptBlockReason(chunk.promptFeedback);
 		if (blockReason) {
 			if (isGooglePromptSafetyStopReason(blockReason)) {
-				output.errorKind = PROVIDER_SAFETY_STOP;
+				// Prompt-level block reasons carry the same adapter-minted
+				// authority as candidate finish reasons (#4777).
+				mintProviderSafetyStop(
+					output,
+					blockReason,
+					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+					callerFetch,
+					adapterInvocation,
+				);
 				output.stopReason = "error";
 			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 				output.stopReason = "error";
@@ -964,6 +999,8 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 				stream,
 				model,
 				options,
+				callerFetch: plan.fetch ?? options?.fetch,
+				adapterInvocation: isProviderSafetyStopAdapterInvocation(options),
 				retainTextSignature,
 				onFirstToken: () => {
 					firstTokenTime = Date.now();

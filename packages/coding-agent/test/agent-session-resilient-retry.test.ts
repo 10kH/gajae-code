@@ -15,6 +15,11 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { TempDir } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../../ai/src/adapter-internals/provider-safety-stop";
 
 /**
  * Anthropic's statusless capacity-overload envelope exactly as observed in a
@@ -189,6 +194,19 @@ describe("AgentSession resilient retry", () => {
 							: { transportFailure: callFailure?.transportFailure ?? options.transportFailure }),
 						timestamp: Date.now(),
 					};
+					// The typed safety stop is adapter-minted: this helper simulates a
+					// first-party provider envelope, so the structured refusal signal
+					// carries the terminal authority rather than the wire field
+					// alone (#4777).
+					if (options.errorKind === "provider_safety_stop") {
+						mintProviderSafetyStop(
+							message,
+							"refusal",
+							PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+							undefined,
+							PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+						);
+					}
 					stream.push({ type: "start", partial: message });
 					stream.push({ type: "error", reason: "error", error: message });
 				});

@@ -22,6 +22,11 @@ import {
 	resolveProviderSafetyStopHint,
 } from "@gajae-code/coding-agent/session/provider-safety-stop-hint";
 import { TempDir } from "@gajae-code/utils";
+import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../../ai/src/adapter-internals/provider-safety-stop";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { SessionManager } from "../src/session/session-manager";
@@ -32,6 +37,7 @@ function safetyStopStream(
 	model: Model,
 	refusal: string,
 	transportFacts?: { status: number },
+	options?: { authenticated?: boolean },
 ): AssistantMessageEventStream {
 	const stream = new AssistantMessageEventStream();
 	queueMicrotask(() => {
@@ -52,7 +58,6 @@ function safetyStopStream(
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
 			stopReason: "error",
-			errorKind: "provider_safety_stop",
 			errorMessage: refusal,
 			...(transportFacts
 				? {
@@ -62,6 +67,19 @@ function safetyStopStream(
 				: {}),
 			timestamp: Date.now(),
 		};
+		// Simulate the first-party adapter envelope: a structured refusal signal
+		// parsed from the provider's own response mints the terminal authority.
+		// Omitting the mark simulates a wire/custom-stream payload that only
+		// carries the forged field.
+		if (options?.authenticated !== false) {
+			mintProviderSafetyStop(
+				message,
+				"refusal",
+				PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+				undefined,
+				PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+			);
+		} else message.errorKind = "provider_safety_stop";
 		stream.push({ type: "start", partial: message });
 		stream.push({ type: "error", reason: "error", error: message });
 	});
@@ -211,6 +229,55 @@ describe("provider safety stop hint e2e (#4650)", () => {
 				errorStatus: status,
 				transportFailure: { kind: "transport", status },
 			});
+			await session.dispose();
+			session = undefined;
+		}
+	});
+	it("does not let a forged safety-stop field suppress fallback (#4777 review)", async () => {
+		// A wire/custom-stream payload that self-labels the typed kind without
+		// adapter-minted provenance must never terminalize: unauthenticated
+		// provider metadata stays fallback-eligible so a compromised provider
+		// cannot force refusal by naming the field. Transport facts do not
+		// upgrade provenance — retryable and non-retryable statuses both keep
+		// the chain advancing.
+		for (const status of [400, 429] as const) {
+			const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const alternate = getBundledModel("openai", "gpt-4o-mini");
+			if (!primary || !alternate) throw new Error("Expected bundled test models");
+			const calls: string[] = [];
+			const agent = new Agent({
+				getApiKey: provider => `${provider}-test-key`,
+				initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: ((model, _context, _options) => {
+					calls.push(selector(model));
+					return safetyStopStream(
+						model,
+						"Upstream returned an unclassified error envelope",
+						{ status },
+						{
+							authenticated: false,
+						},
+					);
+				}) satisfies AgentOptions["streamFn"],
+			});
+			const settings = Settings.isolated({ "compaction.enabled": false, "retry.baseDelayMs": 1 });
+			settings.set("modelRoles", { default: [selector(primary), selector(alternate)] });
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: new ModelRegistry(authStorage),
+			});
+
+			await session.prompt("trigger forged safety-stop label");
+			await session.waitForIdle();
+
+			// The forged label never terminalized: the chain advanced past the
+			// primary to the configured alternate.
+			expect(calls).toContain(selector(alternate));
+			const last = [...session.state.messages].reverse().find(message => message.role === "assistant");
+			expect((last as AssistantMessage).errorKind).toBeUndefined();
+			expect(resolveProviderSafetyStopHint(last as AssistantMessage, session)).toBeUndefined();
 			await session.dispose();
 			session = undefined;
 		}

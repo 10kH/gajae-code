@@ -6,6 +6,11 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { scheduler } from "node:timers/promises";
 import { extractHttpStatusFromError, fetchWithRetry, readSseJson } from "@gajae-code/utils";
+import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { calculateCost } from "../models";
 import type {
 	Api,
@@ -566,7 +571,15 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					if (candidate?.finishReason) {
 						if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
 							hasContent = true;
-							output.errorKind = PROVIDER_SAFETY_STOP;
+							// Adapter-minted terminal authority from the parsed
+							// structured finish reason (#4777).
+							mintProviderSafetyStop(
+								output,
+								candidate.finishReason,
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+								options?.fetch,
+								isProviderSafetyStopAdapterInvocation(options),
+							);
 							output.stopReason = "error";
 						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 							output.stopReason = mapStopReasonString(candidate.finishReason);
@@ -580,7 +593,14 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					if (blockReason) {
 						hasContent = true;
 						if (isGooglePromptSafetyStopReason(blockReason)) {
-							output.errorKind = PROVIDER_SAFETY_STOP;
+							// Prompt-level block reason: adapter-minted authority (#4777).
+							mintProviderSafetyStop(
+								output,
+								blockReason,
+								PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+								options?.fetch,
+								isProviderSafetyStopAdapterInvocation(options),
+							);
 							output.stopReason = "error";
 						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
 							output.stopReason = "error";

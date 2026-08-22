@@ -14,6 +14,7 @@
  * containerized GJC deployments that route every LLM call through a
  * credential-holding sidecar so the container stays credential-free.
  */
+
 import { readSseJson } from "@gajae-code/utils";
 import type {
 	Api,
@@ -184,7 +185,9 @@ export function streamPiNative<TApi extends Api>(
 				response.body as ReadableStream<Uint8Array>,
 				signal,
 			)) {
-				if (event.type === "done" || event.type === "error") sawTerminal = true;
+				if (event.type === "done" || event.type === "error") {
+					sawTerminal = true;
+				}
 				stream.push(event);
 				// `stream.push` resolves `.result()` on `done`/`error`; subsequent
 				// pushes are silently dropped by the base class. We still iterate
