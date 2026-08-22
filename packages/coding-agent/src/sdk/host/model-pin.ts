@@ -32,17 +32,20 @@ export function createSdkHostModelRegistryLoader(
 	modelsPath?: string,
 	loadSettings?: (context?: SdkHostModelResolveContext) => Promise<Pick<Settings, "get" | "getGlobal">>,
 ): SdkHostModelRegistryLoader {
-	let cachedRegistry: Promise<ModelRegistry> | undefined;
+	const cachedRegistries = new Map<string, Promise<ModelRegistry>>();
 	return async (context?: SdkHostModelResolveContext) => {
+		const scopeKey = context?.cwd ?? "";
+		let cachedRegistry = cachedRegistries.get(scopeKey);
 		if (cachedRegistry === undefined) {
 			const initializing = Promise.all([discoverStorage(), loadSettings?.(context)]).then(
 				([storage, registrySettings]) => new ModelRegistry(storage, modelsPath, registrySettings),
 			);
+			cachedRegistries.set(scopeKey, initializing);
 			cachedRegistry = initializing;
 			try {
 				await initializing;
 			} catch (error) {
-				if (cachedRegistry === initializing) cachedRegistry = undefined;
+				if (cachedRegistries.get(scopeKey) === initializing) cachedRegistries.delete(scopeKey);
 				throw error;
 			}
 		}

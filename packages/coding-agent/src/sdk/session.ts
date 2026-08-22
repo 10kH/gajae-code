@@ -3224,14 +3224,23 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const matchPreferences = {
 				usageOrder: settings.getStorage()?.getModelUsageOrder(),
 			};
-			const { model: resolved } = parseModelPattern(options.modelPattern, availableModels, matchPreferences, {
-				modelRegistry,
-				sessionId: logicalSessionId,
-				credentialSessionId,
-			});
+			const { model: resolved, thinkingLevel: resolvedThinkingLevel } = parseModelPattern(
+				options.modelPattern,
+				availableModels,
+				matchPreferences,
+				{
+					modelRegistry,
+					sessionId: logicalSessionId,
+					credentialSessionId,
+				},
+			);
 			if (resolved) {
 				model = resolved;
 				modelFallbackMessage = undefined;
+				if (resolvedThinkingLevel !== undefined) {
+					thinkingLevel = resolvedThinkingLevel;
+					thinkingLevelFromSchemaDefault = false;
+				}
 				if (thinkingLevelFromSchemaDefault && resolved.thinking?.defaultLevel !== undefined) {
 					thinkingLevel = resolved.thinking.defaultLevel;
 					thinkingLevelFromSchemaDefault = false;

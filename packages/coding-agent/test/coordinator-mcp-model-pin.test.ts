@@ -250,6 +250,59 @@ describe("resolveSdkHostModel", () => {
 		}
 	});
 
+	it("keeps concurrent workspace validations isolated", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-host-provider-order-concurrent-"));
+		const storage = await AuthStorage.create(path.join(root, "auth.db"));
+		const modelsPath = path.join(root, "models.yml");
+		await fs.writeFile(
+			modelsPath,
+			`providers:
+  fixture-a:
+    baseUrl: http://127.0.0.1:1/v1
+    apiKey: fixture-key
+    api: openai-completions
+    models:
+      - id: shared
+        name: shared
+        contextWindow: 32768
+        maxTokens: 4096
+  fixture-b:
+    baseUrl: http://127.0.0.1:1/v1
+    apiKey: fixture-key
+    api: openai-completions
+    models:
+      - id: shared
+        name: shared
+        contextWindow: 32768
+        maxTokens: 4096
+`,
+		);
+		const workspaceA = path.join(root, "workspace-a");
+		const workspaceB = path.join(root, "workspace-b");
+		let settingsLoads = 0;
+		const loader = createSdkHostModelRegistryLoader(
+			async () => storage,
+			modelsPath,
+			async context => {
+				settingsLoads += 1;
+				if (context?.cwd === workspaceA) await Bun.sleep(20);
+				return Settings.isolated({ modelProviderOrder: [context?.cwd === workspaceA ? "fixture-a" : "fixture-b"] });
+			},
+		);
+		try {
+			const [resolvedA, resolvedB] = await Promise.all([
+				resolveSdkHostModel("shared", loader, { cwd: workspaceA }),
+				resolveSdkHostModel("shared", loader, { cwd: workspaceB }),
+			]);
+			expect(resolvedA).toEqual({ ok: true, model: "fixture-a/shared" });
+			expect(resolvedB).toEqual({ ok: true, model: "fixture-b/shared" });
+			expect(settingsLoads).toBeGreaterThanOrEqual(2);
+		} finally {
+			storage.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("retries registry initialization after a transient failure", async () => {
 		const storage = await AuthStorage.create(":memory:");
 		let attempts = 0;

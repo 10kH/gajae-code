@@ -1,3 +1,4 @@
+import { parseModelString } from "../config/model-resolver";
 import type { AgentSession } from "../session/agent-session";
 import { type CreateAgentSessionOptions, createAgentSession } from "./session";
 import {
@@ -94,7 +95,9 @@ export async function createLifecycleAgentSession(
 		if (modelId !== undefined) {
 			const active = result.session.model;
 			const activeSelector = active ? `${active.provider}/${active.id}` : undefined;
-			if (!activeSelector || activeSelector.toLowerCase() !== modelId.toLowerCase()) {
+			const expected = parseModelString(modelId);
+			const expectedSelector = expected ? `${expected.provider}/${expected.id}` : modelId;
+			if (!activeSelector || activeSelector.toLowerCase() !== expectedSelector.toLowerCase()) {
 				await result.session.dispose().catch(() => {});
 				throw new Error(
 					`Model "${modelId}" not found. Use --list-models to see available models.${
