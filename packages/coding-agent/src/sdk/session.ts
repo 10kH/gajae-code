@@ -1427,7 +1427,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		closeOwnedSettings = async (): Promise<void> => {
 			if (ownsScopedSettings) await settings.close();
 		};
-		};
 		// Keep legacy singleton consumers (bash, edit guards, and older extension code)
 		// initialized for SDK child hosts without making the session's role resolution
 		// depend on that process-global instance. Session-aware tool contexts carry the
