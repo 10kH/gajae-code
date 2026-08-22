@@ -11,30 +11,27 @@ jobs:
       steps:
          - id: release
            shell: bash
-           run: |
-              set -euo pipefail
-              {
-                 echo "channel=stable"
-                 echo "version=9.9.9"
-              } >> "$GITHUB_OUTPUT"
+           run: echo "channel=stable" >> "$GITHUB_OUTPUT"
+   skipped_gate:
+      if: ${{ false }}
+      runs-on: ubuntu-22.04
+      steps:
+         - run: echo "never"
    prepare_like:
-      if: ${{ always() && ((needs.meta.outputs.channel == 'stable' && github.event_name != 'workflow_dispatch') || (needs.meta.outputs.channel == 'stable' && github.event_name == 'workflow_dispatch')) }}
-      needs: [meta]
+      if: ${{ always() && needs.meta.outputs.channel == 'stable' }}
+      needs: [meta, skipped_gate]
       runs-on: ubuntu-22.04
       steps:
-         - run: echo "prepare_like ran with channel=${{ needs.meta.outputs.channel }}"
-   approval_like:
-      if: ${{ needs.prepare_like.result == 'success' && needs.meta.outputs.channel == 'stable' }}
-      needs: [prepare_like, meta]
-      runs-on: ubuntu-22.04
-      permissions:
-         deployments: write
-      environment: npm-release
-      steps:
-         - run: echo "approval_like ran"
-   approval_like_no_env:
+         - run: echo "prepare_like ran"
+   approval_no_always:
       if: ${{ needs.prepare_like.result == 'success' && needs.meta.outputs.channel == 'stable' }}
       needs: [prepare_like, meta]
       runs-on: ubuntu-22.04
       steps:
-         - run: echo "approval_like_no_env ran"
+         - run: echo "approval_no_always ran"
+   approval_with_always:
+      if: ${{ always() && needs.prepare_like.result == 'success' && needs.meta.outputs.channel == 'stable' }}
+      needs: [prepare_like, meta]
+      runs-on: ubuntu-22.04
+      steps:
+         - run: echo "approval_with_always ran"
