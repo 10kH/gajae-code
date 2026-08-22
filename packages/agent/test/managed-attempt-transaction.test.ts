@@ -1216,8 +1216,12 @@ describe("managed attempt transaction", () => {
 		// The staged-byte cap exists to bound memory: an over-limit event must
 		// be rejected from its measurement pass alone, WITHOUT first being
 		// duplicated by structuredClone. The nested witness getter counts deep
-		// reads: measurement reads it exactly once; a snapshot taken before
-		// the cap check would read it a second time.
+		// reads. The clone-surface preflight reads only through own-property
+		// descriptors and refuses accessors outright, so the getter is NEVER
+		// invoked — zero reads. The previously blocked implementation cloned
+		// before the cap check, and structuredClone invokes accessors, so it
+		// read the witness exactly once: any read at all is the regression
+		// signal; zero is the strengthened invariant.
 		const diagnostics = captureSnapshotDiagnostics();
 		const mock = createMockModel();
 		let witnessReads = 0;
@@ -1259,7 +1263,7 @@ describe("managed attempt transaction", () => {
 		expect(outcomeCalls).toBe(0);
 		expect(agent.state.error).toContain("provisional event buffer limit");
 		expect((agent.state.messages.at(-1) as AssistantMessage).errorKind).toBe("local_buffer_overflow");
-		expect(witnessReads).toBe(1);
+		expect(witnessReads).toBe(0);
 		// One bounded diagnostic per stream invocation, shape-only.
 		expect(diagnostics).toHaveLength(1);
 		expect(diagnostics[0]).toMatchObject({
@@ -1268,6 +1272,106 @@ describe("managed attempt transaction", () => {
 			provider: mock.model.provider,
 			snapshotMode: "managed",
 		});
+	});
+	it("rejects a toJSON-hidden clone-visible payload before any snapshot allocation", async () => {
+		// Exact-head 078e22c0 blocker: the live JSON surface (which dispatches
+		// `toJSON`) can be tiny while the clone-visible own payload the JSON
+		// walk never sees is huge. The rejection must come from the PRE-FLIGHT
+		// walks — stage `overflow.preMeasure`, before any snapshot work — not
+		// from `overflow.staged` after structuredClone has already duplicated
+		// the oversized payload. On the previously blocked head the JSON walk
+		// reads `{compact:true}` as under-budget, the clone allocates the full
+		// hidden payload, and only the detached measurement rejects it: the
+		// allocation the cap exists to prevent happened ahead of the guard.
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				(partial as unknown as Record<string, unknown>).providerPayload = {
+					envelope: new CompactLargeEnvelope(),
+				};
+				stream.push({ type: "start", partial });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		let outcomeCalls = 0;
+		const previous = process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+		process.env.GJC_FALLBACK_MAX_STAGED_BYTES = "2048";
+		try {
+			await agent.prompt("run", {
+				fallbackManaged: true,
+				onManagedAttemptOutcome: () => {
+					outcomeCalls += 1;
+					return { type: "retry", continuation: () => {} };
+				},
+			});
+			await agent.waitForIdle();
+			expect(outcomeCalls).toBe(0);
+			expect(agent.state.error).toContain("provisional event buffer limit");
+			const terminal = agent.state.messages.at(-1) as AssistantMessage;
+			expect(terminal.errorKind).toBe("local_buffer_overflow");
+			const overflow = (terminal as unknown as { bufferOverflow?: { stage: string } }).bufferOverflow;
+			expect(overflow?.stage).toBe("overflow.preMeasure");
+		} finally {
+			if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+			else process.env.GJC_FALLBACK_MAX_STAGED_BYTES = previous;
+		}
+	});
+
+	it("counts lone surrogates as their six-byte JSON escape when bounding staging", async () => {
+		// Exact-head 078e22c0 blocker: a lone surrogate encodes to 3 UTF-8
+		// bytes but `JSON.stringify` emits a six-byte `\udXXX` escape for it,
+		// so charging 3 undercounted surrogate-heavy strings by ~2x and let
+		// them pass the pre-check into a full serialization. The walk must
+		// charge the escape: 100 000 lone surrogates are 300 002 bytes at the
+		// old 3-byte charge (under the 400 KiB cap used here) but 600 002 as
+		// serialized JSON (over it). On the previously blocked head the
+		// pre-check passed and the detached measurement rejected the payload
+		// as `overflow.staged` after the fact; the walk must reject it up
+		// front as `overflow.preMeasure`.
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				const partial = assistantMessage(mock.model);
+				partial.content.push({ type: "text", text: "\uD800".repeat(100_000) });
+				stream.push({ type: "start", partial });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+		let outcomeCalls = 0;
+		const previous = process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+		process.env.GJC_FALLBACK_MAX_STAGED_BYTES = String(400 * 1024);
+		try {
+			await agent.prompt("run", {
+				fallbackManaged: true,
+				onManagedAttemptOutcome: () => {
+					outcomeCalls += 1;
+					return { type: "retry", continuation: () => {} };
+				},
+			});
+			await agent.waitForIdle();
+			expect(outcomeCalls).toBe(0);
+			expect(agent.state.error).toContain("provisional event buffer limit");
+			const terminal = agent.state.messages.at(-1) as AssistantMessage;
+			expect(terminal.errorKind).toBe("local_buffer_overflow");
+			const overflow = (terminal as unknown as { bufferOverflow?: { stage: string; maxStagedBytes: number } })
+				.bufferOverflow;
+			expect(overflow?.stage).toBe("overflow.preMeasure");
+			expect(overflow?.maxStagedBytes).toBe(400 * 1024);
+		} finally {
+			if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_BYTES;
+			else process.env.GJC_FALLBACK_MAX_STAGED_BYTES = previous;
+		}
 	});
 
 	it("fails an over-limit provisional batch as a local error without consuming the chain", async () => {
@@ -1603,9 +1707,38 @@ describe("managed attempt transaction", () => {
 				else process.env[name] = previous;
 			}
 		}
-		// Both clamp sites warn once each, naming the variable and the ceiling.
+		// Both clamp sites warn once each, naming the variable and the ceiling;
+		// the once-per-(knob, value) memoization still lets distinct values warn.
 		const clampWarnings = diagnostics.filter(entry => typeof entry.requested === "number");
 		expect(clampWarnings).toHaveLength(2);
+	});
+
+	it("clamps beyond-safe-integer overrides through the lexical decimal path", () => {
+		// 2^53 and 2^53+1 fail Number.isSafeInteger, so a purely numeric parse
+		// would misclassify them as invalid and silently fall back to the
+		// DEFAULT instead of the documented clamp — an operator asking for a
+		// huge cap would get 10 000 events / 16 MiB. The lexical comparison
+		// must clamp both to the ceiling, and the warning payload must be a
+		// bounded digest (never the arbitrarily long raw string embedded in a
+		// log record).
+		const warnings = captureStagedCapClampWarnings();
+		const previous = process.env.GJC_FALLBACK_MAX_STAGED_EVENTS;
+		for (const raw of ["9007199254740992", "9007199254740993", "9".repeat(64)]) {
+			process.env.GJC_FALLBACK_MAX_STAGED_EVENTS = raw;
+			expect(managedAttemptMaxStagedEvents()).toBe(2_000_000);
+		}
+		// The once-per-digest memoization collapses the two 2^53 values (same
+		// length, same 8-digit prefix) into one record and keeps the 64-digit
+		// one distinct — bounded logging without losing the clamp signal.
+		const digestWarnings = warnings.filter(entry => typeof entry.requested === "string");
+		expect(digestWarnings).toHaveLength(2);
+		for (const entry of digestWarnings) {
+			expect(String(entry.requested).length).toBeLessThanOrEqual(64);
+			expect(String(entry.requested)).toContain("digits");
+		}
+		expect(digestWarnings.every(entry => entry.ceiling === 2_000_000)).toBe(true);
+		if (previous === undefined) delete process.env.GJC_FALLBACK_MAX_STAGED_EVENTS;
+		else process.env.GJC_FALLBACK_MAX_STAGED_EVENTS = previous;
 	});
 
 	it("charges every retained batch item against the caps before retention", async () => {
