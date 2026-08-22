@@ -8,8 +8,10 @@ import { workflowReceiptStatus } from "../../../skill-state/workflow-state-contr
 import { theme } from "../../theme/theme";
 
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const MAX_HUD_ROWS = 2;
 
 type WidthTier = "wide" | "medium" | "tight";
+type HudToken = { text: string; mandatory: boolean; startsEntry?: boolean };
 
 function color(role: "border" | "accent" | "dim" | "muted" | "warning" | "error", text: string): string {
 	return theme?.fg(role, text) ?? text;
@@ -75,15 +77,7 @@ function keyMetricChip(skill: string, chips: readonly WorkflowHudChip[]): Workfl
 	);
 }
 
-function fitWithSuffix(prefix: string, suffix: string, width: number): string {
-	if (width <= 0) return "";
-	if (!suffix) return truncateToWidth(prefix, width);
-	const suffixWidth = visibleWidth(suffix);
-	if (suffixWidth >= width) return truncateToWidth(suffix, width);
-	return `${truncateToWidth(prefix, width - suffixWidth)}${suffix}`;
-}
-
-function formatEntry(entry: SkillActiveEntry, tier: WidthTier, width: number): string {
+function buildEntryTokens(entry: SkillActiveEntry, tier: WidthTier): HudToken[] {
 	const skill = sanitizeHudPart(entry.skill);
 	const phase = sanitizeHudPart(entry.phase);
 	const base = phase ? `${skill}:${phase}` : skill;
@@ -96,22 +90,40 @@ function formatEntry(entry: SkillActiveEntry, tier: WidthTier, width: number): s
 	const severity =
 		chips.find(chip => chip.severity === "error" || chip.severity === "blocked")?.severity ??
 		chips.find(chip => chip.severity === "warning")?.severity;
-	const suffix = severity ? ` ${severityGlyph(severity)}` : "";
-	if (tier === "tight") return fitWithSuffix(color("accent", skill), suffix, width);
+	const tokens: HudToken[] = [
+		{ text: color("accent", tier === "tight" ? skill : base), mandatory: true, startsEntry: true },
+	];
 
-	const metric = keyMetricChip(skill, chips);
+	const glyph = severityGlyph(severity);
+	if (glyph) tokens.push({ text: glyph, mandatory: true });
+
 	if (tier === "medium") {
-		const prefix = [color("accent", base), metric ? formatChip(metric) : ""].filter(Boolean).join(" ");
-		return fitWithSuffix(prefix, suffix, width);
+		const metric = keyMetricChip(skill, chips);
+		const metricText = metric ? formatChip(metric) : null;
+		if (metricText) tokens.push({ text: metricText, mandatory: false });
+		return tokens;
 	}
 
 	const summary = sanitizeHudPart(entry.hud?.summary);
-	const details = chips.map(formatChip).filter((chip): chip is string => Boolean(chip));
-	const prefix = [color("accent", base), summary ? color("muted", summary) : "", ...details].filter(Boolean).join(" ");
-	return fitWithSuffix(prefix, suffix, width);
+	if (summary) tokens.push({ text: color("muted", summary), mandatory: false });
+	for (const chip of chips) {
+		const formatted = formatChip(chip);
+		if (formatted) tokens.push({ text: formatted, mandatory: false });
+	}
+	return tokens;
 }
 
-export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: number): string | null {
+function appendOverflowMarker(row: string, width: number): string {
+	if (!row || width <= 0) return row;
+	return truncateToWidth(`${row}…`, width);
+}
+
+/**
+ * Render the HUD as physical rows rather than embedding a newline in one row.
+ * The bottom-pinned TUI layout counts array elements as rows; a newline inside
+ * one element corrupts that accounting and can overwrite the editor.
+ */
+export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: number): string[] | null {
 	const visible = collapsePlanningPipeline(entries.filter(entry => entry.active !== false));
 	const active = visible.filter(entry => sanitizeHudPart(entry.skill)).sort(compareEntries);
 	if (active.length === 0 || width <= 0) return null;
@@ -119,41 +131,60 @@ export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: n
 	const tier = tierForWidth(width);
 	const rail = color("border", "◆");
 	const separator = color("dim", " + ");
-	const railPrefix = visibleWidth(rail) + 1 <= width ? `${rail} ` : "";
+	const firstPrefix = visibleWidth(rail) + 1 <= width ? `${rail} ` : "";
+	const continuationPrefix = firstPrefix ? " ".repeat(visibleWidth(firstPrefix)) : "";
 	const rows: string[] = [];
-	let row = railPrefix;
-	let hasEntry = false;
+	let row = firstPrefix;
+	let rowIndex = 0;
+	let hasToken = false;
 	let omitted = false;
 
-	for (const entry of active) {
-		const joiner = hasEntry ? separator : "";
-		const budget = Math.max(0, width - visibleWidth(row) - visibleWidth(joiner));
-		const fullRendered = formatEntry(entry, tier, 4096);
-		let rendered = visibleWidth(fullRendered) <= budget ? fullRendered : "";
-		if (!rendered) {
-			if (!hasEntry) {
-				row = "";
-				rendered = formatEntry(entry, tier, width);
-			} else if (rows.length === 0) {
-				rows.push(truncateToWidth(row, width));
-				row = railPrefix;
-				hasEntry = false;
-				const firstRowBudget = Math.max(0, width - visibleWidth(row));
-				rendered = visibleWidth(fullRendered) <= firstRowBudget ? fullRendered : formatEntry(entry, tier, width);
-			} else {
-				omitted = true;
-				break;
-			}
+	const tryAppend = (token: HudToken, allowTruncate: boolean): boolean => {
+		let joiner = hasToken ? (token.startsEntry ? separator : " ") : "";
+		let available = width - visibleWidth(row) - visibleWidth(joiner);
+		if (!hasToken && visibleWidth(row) > 0 && visibleWidth(token.text) > available) {
+			row = "";
+			joiner = "";
+			available = width;
 		}
-		if (!rendered) continue;
-		row = `${row}${hasEntry ? separator : ""}${rendered}`;
-		hasEntry = true;
+		if (available <= 0) return false;
+		const text =
+			visibleWidth(token.text) <= available
+				? token.text
+				: allowTruncate
+					? truncateToWidth(token.text, available)
+					: "";
+		if (!text || visibleWidth(text) <= 0) return false;
+		row = `${row}${joiner}${text}`;
+		hasToken = true;
+		return true;
+	};
+
+	const startNextRow = (): boolean => {
+		if (rowIndex >= MAX_HUD_ROWS - 1) return false;
+		if (hasToken) rows.push(truncateToWidth(row, width));
+		rowIndex += 1;
+		row = continuationPrefix;
+		hasToken = false;
+		return true;
+	};
+
+	for (const entry of active) {
+		for (const token of buildEntryTokens(entry, tier)) {
+			if (tryAppend(token, false)) continue;
+			if (startNextRow() && tryAppend(token, false)) continue;
+			if (tryAppend(token, true)) continue;
+			if (token.mandatory && startNextRow() && tryAppend(token, true)) continue;
+			omitted = true;
+			break;
+		}
+		if (omitted) break;
 	}
 
-	if (hasEntry) rows.push(truncateToWidth(row, width));
+	if (hasToken) rows.push(truncateToWidth(row, width));
 	if (omitted && rows.length > 0) {
 		const last = rows.length - 1;
-		rows[last] = truncateToWidth(`${rows[last]}…`, width);
+		rows[last] = appendOverflowMarker(rows[last] ?? "", width);
 	}
-	return rows.slice(0, 2).join("\n") || null;
+	return rows.length > 0 ? rows.slice(0, MAX_HUD_ROWS) : null;
 }
