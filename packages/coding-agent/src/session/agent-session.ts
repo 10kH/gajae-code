@@ -20,6 +20,7 @@ import * as path from "node:path";
 import { scheduler } from "node:timers/promises";
 import * as util from "node:util";
 import {
+	AdaptiveCompactionTracker,
 	type AfterToolCallContext,
 	type AfterToolCallResult,
 	type Agent,
@@ -2430,6 +2431,7 @@ export class AgentSession {
 	// required to re-trigger. A content signature (not object identity) is used so
 	// it survives the message-array rebuild that compaction/prune perform.
 	#lastMidRunMaintenanceAnchorSignature: string | undefined = undefined;
+	#adaptiveCompactionTracker = new AdaptiveCompactionTracker();
 	#resourceSampler: () => EmergencyCompactionSample = () => this.#defaultResourceSample();
 	#retainedMemorySampler: (() => RetainedMemorySample) | undefined;
 
@@ -16380,7 +16382,8 @@ export class AgentSession {
 		// which breaks the provider prompt-cache prefix mid-epoch. Only prune at a
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens))
+		const adaptiveCompactionSettings = this.#recordAdaptiveCompactionCall(contextTokens, compactionSettings);
+		if (!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens))
 			return true;
 		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
 			relaxedMinimum: 0,
@@ -16391,7 +16394,7 @@ export class AgentSession {
 			!shouldCompact(
 				Math.max(0, contextTokens - pruneEstimate.tokensSaved),
 				contextWindow,
-				compactionSettings,
+				adaptiveCompactionSettings,
 				autoCompactionOutputReserveTokens,
 			)
 		) {
@@ -16399,7 +16402,8 @@ export class AgentSession {
 			if (ownershipSignal?.aborted) return false;
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+		const prunedCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
+		if (shouldCompact(contextTokens, contextWindow, prunedCompactionSettings, autoCompactionOutputReserveTokens)) {
 			// Try promotion first — if a larger model is available, switch instead of compacting
 			const promoted = await this.#tryContextPromotion(assistantMessage, ownershipSignal);
 			if (ownershipSignal?.aborted) return false;
@@ -16675,7 +16679,8 @@ export class AgentSession {
 		// Model maxTokens is a capability ceiling, not a per-turn reservation.
 		// Auto maintenance should track actual context fullness.
 		const autoCompactionOutputReserveTokens = 0;
-		if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+		const adaptiveCompactionSettings = this.#recordAdaptiveCompactionCall(contextTokens, compactionSettings);
+		if (!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens)) {
 			// Below the compaction threshold: optionally run evidence-gated maintenance
 			// pruning (opt-in, high savings + cache-epoch payback required).
 			await this.#maybeRunBelowThresholdMaintenancePrune();
@@ -16691,19 +16696,38 @@ export class AgentSession {
 			!shouldCompact(
 				Math.max(0, contextTokens - pruneEstimate.tokensSaved),
 				contextWindow,
-				compactionSettings,
+				adaptiveCompactionSettings,
 				autoCompactionOutputReserveTokens,
 			)
 		) {
 			const pruneResult = await this.#pruneToolOutputs(undefined, true);
 			if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 		}
-		if (shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+		const prunedCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
+		if (shouldCompact(contextTokens, contextWindow, prunedCompactionSettings, autoCompactionOutputReserveTokens)) {
 			await this.#runAutoCompaction("threshold", false, false, {
 				continueAfterMaintenance: false,
 				deferHandoffMaintenance: false,
 			});
 		}
+	}
+
+	#recordAdaptiveCompactionCall<T extends { adaptive?: { enabled: boolean; turnWindow: number } }>(
+		contextTokens: number,
+		settings: T,
+	): T {
+		if (!settings.adaptive?.enabled) return settings;
+		this.#adaptiveCompactionTracker.setWindowMs(settings.adaptive.turnWindow * 60_000);
+		this.#adaptiveCompactionTracker.recordCall(contextTokens);
+		return this.#compactionSettingsWithAdaptiveState(settings);
+	}
+
+	#compactionSettingsWithAdaptiveState<T extends { adaptive?: { enabled: boolean } }>(settings: T): T {
+		if (!settings.adaptive?.enabled) return settings;
+		return {
+			...settings,
+			adaptiveState: this.#adaptiveCompactionTracker.decisionState(),
+		};
 	}
 
 	#assistantEndedWithSuccessfulYield(assistantMessage: AssistantMessage): boolean {
@@ -18158,6 +18182,9 @@ export class AgentSession {
 			);
 			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 			if (autoCompactionSignal.aborted) return await emitAborted();
+			if (compactionSettings.adaptive?.enabled) {
+				this.#adaptiveCompactionTracker.recordCompact(tokensBefore);
+			}
 
 			const result: CompactionResult = {
 				summary,

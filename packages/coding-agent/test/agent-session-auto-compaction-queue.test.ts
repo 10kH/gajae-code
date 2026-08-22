@@ -263,6 +263,80 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
 	});
 
+	it("uses adaptive call rate to compact below the static threshold when enabled", async () => {
+		session.settings.set("compaction.thresholdPercent", 85);
+		session.settings.set("compaction.adaptive.enabled", true);
+		session.settings.set("compaction.adaptive.baseThresholdPercent", 85);
+		session.settings.set("compaction.adaptive.aggression", 0.5);
+		session.settings.set("compaction.adaptive.turnWindow", 15);
+		session.settings.set("compaction.adaptive.minThresholdPercent", 50);
+
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 152_000,
+				output: 1_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 153_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		const { promise: compactionDone, resolve: onCompactionDone } = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "auto_compaction_end") onCompactionDone();
+		});
+
+		for (let i = 0; i < 60; i++) {
+			session.agent.emitExternalEvent({ type: "message_end", message: { ...assistantMsg, timestamp: Date.now() } });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		}
+
+		await compactionDone;
+
+		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
+		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(true);
+	});
+
+	it("keeps the same below-threshold session un-compacted when adaptive is disabled", async () => {
+		session.settings.set("compaction.thresholdPercent", 85);
+		session.settings.set("compaction.adaptive.enabled", false);
+
+		const assistantMsg: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			stopReason: "stop",
+			usage: {
+				input: 152_000,
+				output: 1_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 153_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+
+		for (let i = 0; i < 60; i++) {
+			session.agent.emitExternalEvent({ type: "message_end", message: { ...assistantMsg, timestamp: Date.now() } });
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
+		}
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(getRuntimeSignals()).not.toContain("compaction:start:threshold");
+		expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
+	});
+
 	it("runs pre-continue compaction before resuming queued messages", async () => {
 		vi.useRealTimers();
 		session.settings.set("compaction.thresholdTokens", 1000);
