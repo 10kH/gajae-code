@@ -77,7 +77,7 @@ function keyMetricChip(skill: string, chips: readonly WorkflowHudChip[]): Workfl
 	);
 }
 
-function buildEntryTokens(entry: SkillActiveEntry, tier: WidthTier): HudToken[] {
+function buildEntryTokens(entry: SkillActiveEntry, tier: WidthTier, width: number): HudToken[] {
 	const skill = sanitizeHudPart(entry.skill);
 	const phase = sanitizeHudPart(entry.phase);
 	const base = phase ? `${skill}:${phase}` : skill;
@@ -91,15 +91,24 @@ function buildEntryTokens(entry: SkillActiveEntry, tier: WidthTier): HudToken[] 
 		chips.find(chip => chip.severity === "error" || chip.severity === "blocked")?.severity ??
 		chips.find(chip => chip.severity === "warning")?.severity;
 	const glyph = severityGlyph(severity);
+	const baseText = color("accent", tier === "tight" ? skill : base);
+	if (
+		tier === "tight" &&
+		glyph &&
+		visibleWidth(glyph) > 1 &&
+		visibleWidth(glyph) <= width &&
+		visibleWidth(baseText) + 1 + visibleWidth(glyph) > width
+	) {
+		return [{ text: glyph, mandatory: true, startsEntry: true }];
+	}
 	const tokens: HudToken[] = [
 		{
-			text: color("accent", tier === "tight" ? skill : base),
+			text: baseText,
 			mandatory: true,
 			startsEntry: true,
 			reserveAfter: glyph ? visibleWidth(` ${glyph}`) : 0,
 		},
 	];
-
 	if (glyph) tokens.push({ text: glyph, mandatory: true });
 
 	if (tier === "medium") {
@@ -188,7 +197,7 @@ export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: n
 	};
 
 	for (const entry of active) {
-		for (const token of buildEntryTokens(entry, tier)) {
+		for (const token of buildEntryTokens(entry, tier, width)) {
 			const append = (allowTruncate: boolean): boolean => {
 				const appended = tryAppend(token, allowTruncate);
 				if (appended && token.mandatory && !token.startsEntry) lastSeverityToken = token.text;
