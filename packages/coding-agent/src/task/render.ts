@@ -7,7 +7,7 @@
 import path from "node:path";
 import type { Component } from "@gajae-code/tui";
 import { Text } from "@gajae-code/tui";
-import { formatNumber, sanitizeText } from "@gajae-code/utils";
+import { formatNumber, sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import {
@@ -911,6 +911,16 @@ function renderAgentResult(result: TaskResultReceipt, isLast: boolean, expanded:
 				"warning",
 				truncateToWidth(replaceTabs(formatModelSubstitutionWarning(result.modelSubstitutionWarning)), 90),
 			)}`,
+		);
+	}
+	if (result.routing) {
+		const model = result.routing.effectiveModel ?? "not-executed";
+		const note = result.routing.note ? ` ${result.routing.note}` : "";
+		// effectiveModel is provider-reported and note is free-form diagnostic text;
+		// receipt validation bounds neither, and an embedded newline would inject a
+		// row past the width cap, so flatten to a single sanitized line.
+		lines.push(
+			`${continuePrefix}${theme.fg("dim", truncateToWidth(replaceTabs(sanitizeDisplayLine(`Routing: ${model}${note}`)), 90))}`,
 		);
 	}
 	if (result.roi?.lowRoi) {

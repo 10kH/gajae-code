@@ -52,6 +52,7 @@ import {
 import { loadCapability, reset as resetCapabilities } from "../capability";
 import { type Rule, ruleCapability, setActiveRules } from "../capability/rule";
 import type { SourceMeta } from "../capability/types";
+import { AUTOROUTING_INACTIVE_WARNING } from "../config/autorouting-contract";
 import { resolveModelProfileName } from "../config/model-profile-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { kNoAuth, ModelRegistry } from "../config/model-registry";
@@ -136,6 +137,7 @@ import {
 import { createReconciliationStore, type ReconciliationStore } from "../sdk/bus/reconciliation-store";
 import { NotificationSessionController } from "../sdk/bus/session-control";
 import { shouldHostSdk } from "../sdk/host";
+import { markAutoroutingInactive } from "../sdk/host/internal-autorouting-state";
 import { createSdkSessionRuntimeExtension, registerSdkOnlyNotificationCommand } from "../sdk/host/session-runtime";
 import { createSdkWebSocketTransport } from "../sdk/host/websocket-transport";
 import type { SecretObfuscator } from "../secrets";
@@ -1414,6 +1416,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
 		};
 		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+		const autoroutingInactive =
+			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
 		// so services resolve the LIVE session cwd per activation instead of
 		// capturing the launch root. Before the manager exists the launch cwd is the
@@ -3023,6 +3027,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		if (notificationsExtensionEligible || sdkHostEligible) {
 			inlineExtensions.push(async api => {
 				try {
+					if (autoroutingInactive) markAutoroutingInactive(api);
 					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
@@ -3030,6 +3035,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						const createNotificationsExtension = await notificationAdapterService.get("session-extension");
 						createNotificationsExtension(api, {
 							settings,
+
 							controller: notificationSessionController,
 							spawnedByGjc,
 							sdkHostModeSupported: options.sdkHostModeSupported,
@@ -4140,6 +4146,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		});
 		session.setActiveModelProfile(startupActiveModelProfile);
 		session.configWarnings.push(...contextFileWarnings);
+		// Determined once, here, where settings are already available. Keep the
+		// durable warning for interactive and print consumers; ACP delivery is
+		// carried by the host replay ring through the internal runtime seam above.
+		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {

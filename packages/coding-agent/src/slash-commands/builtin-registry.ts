@@ -44,6 +44,7 @@ import {
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
+import { buildAutoroutingStatusReport } from "./helpers/autorouting-status";
 import { buildContextReportText } from "./helpers/context-report";
 import { switchSessionCredentialCommand } from "./helpers/credential-switch";
 import { buildFastStatusReport } from "./helpers/fast-status-report";
@@ -1115,6 +1116,82 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 			}
 			runtime.ctx.showStatus("Usage: /fast [on|off|status]");
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "routing",
+		description: "Show or set up sub-agent model autorouting",
+		acpDescription: "Show or set up sub-agent model autorouting",
+		inlineHint: "[on|off|status]",
+		acpInputHint: "[on|off|status]",
+		subcommands: [
+			{ name: "on", description: "Enable autorouting" },
+			{ name: "off", description: "Disable autorouting" },
+			{ name: "status", description: "Show effective autorouting tiers" },
+		],
+		allowArgs: true,
+		handle: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			if (arg === "on" || arg === "off") {
+				try {
+					// Mirror SelectorController#assertSmartRoutingWritable: the non-TUI (ACP/SDK)
+					// dispatch path must honor the same scoped-session guard as the TUI controller,
+					// otherwise a --models-scoped session can toggle routing through /routing on|off.
+					if ((runtime.session.scopedModels?.length ?? 0) > 0) {
+						throw new Error("Smart-routing settings are read-only in a --models-scoped session.");
+					}
+					runtime.settings.set("task.autorouting.enabled", arg === "on");
+				} catch (err) {
+					return usage(`Failed to change autorouting: ${errorMessage(err)}`, runtime);
+				}
+				await runtime.output(
+					buildAutoroutingStatusReport({
+						effective: runtime.settings.getEffectiveAutorouting(),
+						tiers: runtime.settings.get("task.autorouting.tiers"),
+						provenance: runtime.settings.get("task.autorouting.provenance"),
+					}),
+				);
+
+				return commandConsumed();
+			}
+			if (arg === "" || arg === "status") {
+				await runtime.output(
+					buildAutoroutingStatusReport({
+						effective: runtime.settings.getEffectiveAutorouting(),
+						tiers: runtime.settings.get("task.autorouting.tiers"),
+						provenance: runtime.settings.get("task.autorouting.provenance"),
+					}),
+				);
+
+				return commandConsumed();
+			}
+			return usage("Usage: /routing [on|off|status]", runtime);
+		},
+		handleTui: async (command, runtime) => {
+			const arg = command.args.trim().toLowerCase();
+			runtime.ctx.editor.setText("");
+			if (arg === "") {
+				runtime.ctx.showModelSelector({ smartRoutingOnly: true });
+				return;
+			}
+			if (arg === "on" || arg === "off") {
+				// Route through the controller so the toggle honors the same
+				// scoped-session and durable-config guards as the panel.
+				await runtime.ctx.setAutoroutingEnabled(arg === "on");
+			} else if (arg !== "status") {
+				runtime.ctx.showStatus("Usage: /routing [on|off|status]");
+				return;
+			}
+			const report = buildAutoroutingStatusReport({
+				effective: runtime.ctx.settings.getEffectiveAutorouting(),
+				tiers: runtime.ctx.settings.get("task.autorouting.tiers"),
+				provenance: runtime.ctx.settings.get("task.autorouting.provenance"),
+			});
+			runtime.ctx.chatContainer.addChild(new Spacer(1));
+			runtime.ctx.chatContainer.addChild(new DynamicBorder());
+			runtime.ctx.chatContainer.addChild(new Text(report, 1, 0));
+			runtime.ctx.chatContainer.addChild(new DynamicBorder());
+			runtime.ctx.ui.requestRender();
 		},
 	},
 	{
