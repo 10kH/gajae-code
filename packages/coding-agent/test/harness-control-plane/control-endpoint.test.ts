@@ -14,6 +14,12 @@ let dir: string;
 let sock: string;
 let server: ControlServer | null = null;
 let rawServer: net.Server | null = null;
+/**
+ * Server-side sockets of the raw fixture servers. `close()` only resolves once
+ * every accepted connection is gone, and a connection this fixture half-closed
+ * stays open after the peer goes away, so the fixture destroys its own sockets.
+ */
+const rawSockets = new Set<net.Socket>();
 
 beforeEach(async () => {
 	// Keep the socket path short (AF_UNIX sun_path limit) by living directly in a temp dir.
@@ -24,6 +30,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	await server?.close();
+	for (const socket of rawSockets) socket.destroy();
+	rawSockets.clear();
 	await new Promise<void>(resolve => rawServer?.close(() => resolve()) ?? resolve());
 	rawServer = null;
 	await rm(dir, { recursive: true, force: true });
@@ -63,6 +71,7 @@ describe("control endpoint", () => {
 
 	it("rejects with EndpointUnreachableError when the owner accepts but never responds", async () => {
 		rawServer = net.createServer(socket => {
+			rawSockets.add(socket);
 			socket.on("data", () => {});
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -80,6 +89,7 @@ describe("control endpoint", () => {
 
 	it("rejects malformed owner frames as EndpointUnreachableError", async () => {
 		rawServer = net.createServer(socket => {
+			rawSockets.add(socket);
 			socket.end("not-json\n");
 		});
 		await new Promise<void>((resolve, reject) => {

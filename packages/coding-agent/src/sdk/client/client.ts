@@ -74,9 +74,47 @@ export interface SdkRequestOptions {
 	timeoutMs?: number;
 	idempotencyKey?: string;
 	confirm?: boolean;
+	/**
+	 * Synchronous pre-send observer for one request. Called after the
+	 * connection is live and validated, immediately before the frame is written
+	 * to the socket. Throwing aborts the dispatch: nothing is written, no sent
+	 * record is retained, and the request rejects with the thrown error, so the
+	 * caller may safely retry (pre-send semantics).
+	 */
+	beforeDispatch?: SdkBeforeDispatchHandler;
+	/**
+	 * Synchronous dispatch-boundary observer for one request. Called immediately
+	 * after the frame was handed to the socket — never before — and before any
+	 * other client work. From this point a transport close before the response
+	 * settles the request as `uncertain_after_send`; observer exceptions cannot
+	 * alter that settlement.
+	 */
+	onDispatch?: SdkDispatchHandler;
 }
-
 export type SdkFrame = Record<string, unknown>;
+/**
+ * Synchronous by contract. Returning a thenable (e.g. an `async` function) is a
+ * contract violation: pre-send the dispatch aborts retryably and the eventual
+ * rejection is sunk, never escaping to the process unhandled-rejection channel.
+ */
+export type SdkBeforeDispatchHandler = (request: SdkDispatchContext) => void;
+/**
+ * Synchronous by contract. A returned thenable's rejection is sunk; it can
+ * neither displace request settlement nor escape to the process
+ * unhandled-rejection channel.
+ */
+export type SdkDispatchHandler = (request: SdkDispatchContext) => void;
+
+/**
+ * Facts about one request at its dispatch boundary. `frame.id` is the exact
+ * correlated identity a response frame must carry to settle this request.
+ */
+export interface SdkDispatchContext {
+	readonly frame: SdkFrame;
+	/** Transport generation this request was written to. */
+	readonly connectionId: string | undefined;
+	readonly generation: number;
+}
 
 /** Request identity retained after an uncertain send for lifecycle reconciliation. */
 
@@ -157,6 +195,52 @@ function parseFrame(value: unknown): Frame {
 		throw new SdkClientError("protocol_error", "SDK server sent malformed JSON.", error);
 	}
 	throw new SdkClientError("protocol_error", "SDK server sent a malformed frame.");
+}
+/**
+ * Recursively freezes the parsed request frame handed to dispatch-boundary
+ * observers. The frame a consumer sees in `beforeDispatch`/`onDispatch` must be
+ * the exact immutable bytes-derived identity that went on the wire, so a
+ * mutating callback can never desynchronize the advertised identity or the
+ * reconciliation fingerprint from the request that was actually sent.
+ */
+function deepFreeze<T>(value: T): T {
+	if (value && typeof value === "object") {
+		for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+		Object.freeze(value);
+	}
+	return value;
+}
+
+type Thenable = { then?: unknown };
+
+/**
+ * Observers are synchronous by contract, but TypeScript happily accepts an
+ * `async` function where `() => void` is expected. A rejected promise returned
+ * by an observer would otherwise reach the process-level unhandled-rejection
+ * channel — terminating `--unhandled-rejections=strict` consumers — and a
+ * rejected `beforeDispatch` would silently not abort the dispatch. Observers
+ * that return a thenable are treated as a contract violation: detected
+ * explicitly, sunk here, and (pre-send) failed before the wire.
+ */
+function isThenable(value: unknown): value is Thenable {
+	return (
+		(typeof value === "object" || typeof value === "function") &&
+		value !== null &&
+		typeof (value as Thenable).then === "function"
+	);
+}
+
+function sinkThenable(value: unknown): void {
+	const thenable = value as { then: (onFulfilled: unknown, onRejected: (error: unknown) => void) => unknown };
+	try {
+		thenable.then(undefined, () => {
+			// Observer rejections never displace settlement; swallow them here
+			// so they cannot escape to the process unhandled-rejection channel.
+		});
+	} catch {
+		// A throwing then-accessor already surfaced synchronously to the caller
+		// of the observer; nothing further to sink.
+	}
 }
 
 function lifecycleFingerprint(operation: string, input: unknown): string {
@@ -255,9 +339,9 @@ export class SdkClient {
 		}
 	}
 
-	request(frame: SdkFrame, timeout?: number | { timeoutMs?: number; idempotencyKey?: string }): Promise<SdkFrame> {
-		const options = typeof timeout === "number" ? { timeoutMs: timeout } : (timeout ?? {});
-		return this.#request(frame, options) as Promise<SdkFrame>;
+	request(frame: SdkFrame, options?: number | SdkRequestOptions): Promise<SdkFrame> {
+		const resolved = typeof options === "number" ? { timeoutMs: options } : (options ?? {});
+		return this.#request(frame, resolved) as Promise<SdkFrame>;
 	}
 
 	close(): Promise<void> {
@@ -370,7 +454,18 @@ export class SdkClient {
 			...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey } : {}),
 		};
 		const serializedRequest = JSON.stringify(requestFrame);
-		const serializedFrame = JSON.parse(serializedRequest) as Frame;
+		const serializedFrame: Frame = deepFreeze(JSON.parse(serializedRequest) as Frame);
+		// Snapshot reconciliation identity from the exact serialized bytes BEFORE any
+		// observer runs. Callers own `options`, so rereading `options.idempotencyKey`
+		// or recomputing the fingerprint after a callback would let a mutating or
+		// getter-swapping observer diverge the retained record from the wire request.
+		const sentOperation = typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined;
+		const sentIdempotencyKey =
+			typeof serializedFrame.idempotencyKey === "string" ? serializedFrame.idempotencyKey : undefined;
+		const sentFingerprint =
+			typeof serializedFrame.operation === "string"
+				? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
+				: inputFingerprint(serializedFrame.input ?? {});
 		const deferred = Promise.withResolvers<unknown>();
 		const pending: Pending = {
 			incarnation,
@@ -397,26 +492,113 @@ export class SdkClient {
 			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket is not connected"));
 			return await deferred.promise;
 		}
+		if (options.beforeDispatch) {
+			try {
+				const observerResult = options.beforeDispatch({
+					frame: serializedFrame,
+					connectionId: this.connectionId,
+					generation: incarnation.generation,
+				});
+				if (isThenable(observerResult)) {
+					// An async observer cannot honor the synchronous pre-send
+					// contract: its abort decision is unavailable before the
+					// write. Sink the eventual rejection so it never escapes,
+					// and abort the dispatch pre-send (retryable, nothing on
+					// the wire).
+					sinkThenable(observerResult);
+					this.#settlePending(
+						id,
+						pending,
+						new SdkClientError(
+							"invalid_input",
+							"beforeDispatch must be synchronous; an async observer cannot gate the dispatch boundary.",
+						),
+						false,
+					);
+					return await deferred.promise;
+				}
+			} catch (error) {
+				// Pre-send abort: the wire never saw this request, so retirement
+				// must not retain a sent record or classify it as uncertain. The
+				// caller's own rejection comes back unchanged so it stays
+				// retryable and distinguishable from transport failure.
+				this.#settlePending(
+					id,
+					pending,
+					error instanceof Error ? error : new SdkClientError("invalid_input", String(error), error),
+					false,
+				);
+				return await deferred.promise;
+			}
+		}
+		// `beforeDispatch` is arbitrary synchronous caller code: it may have closed
+		// the client, retired this incarnation, settled this pending entry, or run
+		// the deadline past its end. Nothing about the pre-call validation still
+		// holds, so revalidate all of it before the wire write and bookkeeping.
+		if (this.#closed || this.#pending.get(id) !== pending || !this.#isActive(incarnation)) {
+			if (this.#pending.get(id) === pending)
+				this.#settlePending(
+					id,
+					pending,
+					new SdkClientError("connection_closed", "SDK client closed during dispatch"),
+				);
+			return await deferred.promise;
+		}
+		if (this.#deadline !== undefined && Date.now() >= this.#deadline) {
+			this.#settlePending(id, pending, this.#deadlineError());
+			return await deferred.promise;
+		}
+		if (incarnation.socket.readyState !== WebSocket.OPEN) {
+			this.#settlePending(id, pending, new SdkClientError("unavailable", "SDK WebSocket is not connected"));
+			return await deferred.promise;
+		}
+		// Handoff bookkeeping is reentrancy-safe: `sent` flips BEFORE the wire
+		// write so a send that synchronously triggers a close event or response
+		// retires this request as already-sent (uncertain_after_send on close,
+		// never pre-send), and the sent record is retained up-front for the same
+		// reason. Only a synchronous send THROW rolls the pre-write state back:
+		// nothing reached the transport, so the request stays retryable and
+		// non-uncertain with no record retained.
+		pending.sent = true;
+		this.#rememberSentRecord({
+			id,
+			operation: sentOperation,
+			idempotencyKey: sentIdempotencyKey,
+			fingerprint: sentFingerprint,
+		});
 		try {
 			incarnation.socket.send(serializedRequest);
-			pending.sent = true;
-			this.#rememberSentRecord({
-				id,
-				operation: typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined,
-				idempotencyKey: options.idempotencyKey,
-				fingerprint:
-					typeof serializedFrame.operation === "string"
-						? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
-						: inputFingerprint(serializedFrame.input ?? {}),
-			});
 		} catch (error) {
-			this.#settlePending(
-				id,
-				pending,
-				error instanceof SdkClientError
-					? error
-					: new SdkClientError("unavailable", "SDK WebSocket send failed", error),
-			);
+			if (this.#pending.get(id) === pending) {
+				// Nothing was accepted by the transport (the write threw before
+				// handoff), so this stays a retryable pre-send failure — unless a
+				// reentrant event already settled the request during the throw,
+				// in which case that settlement stands and must not be displaced.
+				pending.sent = false;
+				this.#sentRecords.delete(id);
+				this.#settlePending(
+					id,
+					pending,
+					error instanceof SdkClientError
+						? error
+						: new SdkClientError("unavailable", "SDK WebSocket send failed", error),
+				);
+			}
+			return await deferred.promise;
+		}
+		// Reconciliation identity was retained above the send so reentrant
+		// close/response handling finds it; nothing further to record here.
+		try {
+			const observerResult = options.onDispatch?.({
+				frame: serializedFrame,
+				connectionId: this.connectionId,
+				generation: incarnation.generation,
+			});
+			if (isThenable(observerResult)) sinkThenable(observerResult);
+		} catch {
+			// The frame was already handed to the socket. An observer failure can
+			// neither un-send it nor displace settlement, so the request stays
+			// pending for its response, deadline, or transport-close retirement.
 		}
 		return await deferred.promise;
 	}

@@ -25,28 +25,31 @@ function jobSection(workflowText: string, jobName: string): string {
 }
 
 describe("stable release policy", () => {
-	test("tag releases resolve metadata, build natives, then binaries, then publish npm + the GitHub Release", async () => {
+	test("tag releases resolve metadata, build natives, then binaries, then prepare, then publish npm, then finalize the GitHub Release", async () => {
 		const ci = await workflow();
-		const stages = ["release_metadata", "native", "binaries", "publish"];
+		const stages = ["release_metadata", "native", "binaries", "release_prepare", "release_approval", "publish", "release_finalize"];
 		const positions = stages.map(stage => ci.indexOf(`   ${stage}:`));
 		for (const position of positions) expect(position).toBeGreaterThanOrEqual(0);
 
 		expect(jobSection(ci, "native")).toContain("needs: [release_metadata]");
 		expect(jobSection(ci, "binaries")).toContain("needs: [native, release_metadata]");
-		expect(jobSection(ci, "publish")).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
+		expect(jobSection(ci, "release_prepare")).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
+		expect(jobSection(ci, "publish")).toContain("needs: [release_prepare, release_approval, release_metadata]");
+		expect(jobSection(ci, "release_finalize")).toContain("needs: [publish, release_metadata]");
 		for (const stage of ["native", "binaries"]) {
 			const section = jobSection(ci, stage);
 			expect(section).toContain("startsWith(github.ref, 'refs/tags/v')");
 			expect(section).toContain("inputs.rehearsal == 'tag-build-verify'");
 		}
+		const prepare = jobSection(ci, "release_prepare");
+		expect(prepare).toContain("needs.release_metadata.outputs.channel == 'stable'");
+		expect(prepare).toContain("github.event_name != 'workflow_dispatch'");
+		expect(prepare).toContain("--prepare-evidence --evidence-dir");
 		const publish = jobSection(ci, "publish");
-		expect(publish).toContain("needs.release_metadata.outputs.channel == 'stable'");
-		expect(publish).toContain("github.event_name != 'workflow_dispatch'");
-		expect(publish).toContain("--prepare-evidence --evidence-dir");
-		expect(publish).toContain("--publish-from-evidence");
-		expect(publish).toContain("gajae-production-release");
-		expect(publish).toContain("softprops/action-gh-release");
-		expect(publish).toContain("draft: false");
+		expect(publish).toContain("Publish sealed tarballs to npm");
+		const finalize = jobSection(ci, "release_finalize");
+		expect(finalize).toContain("softprops/action-gh-release");
+		expect(finalize).toContain("draft: false");
 	});
 
 	test("stable tags and nightly publication lanes are non-cancelling", async () => {
@@ -72,11 +75,187 @@ describe("stable release policy", () => {
 		expect(publish).not.toContain("~/.npmrc");
 
 		// OIDC needs the identity token and an npm new enough to exchange it.
+		// The CLI pin is exact and integrity-verifiable: a mutable range inside
+		// the credential-bearing job would let a drifting or compromised CLI
+		// publish.
 		expect(publish).toContain("id-token: write");
-		expect(publish).toContain("npm install -g npm@^11.5.1");
+		expect(publish).not.toMatch(/npm@[\^~]/u);
+		expect(publish).toContain('NPM_PIN_VERSION: "11.5.1"');
+		expect(publish).toContain("NPM_TARBALL_SHA512:");
+		expect(publish).toContain("sha512sum --check --strict");
+		expect(publish).toContain('npm install -g "$tmp/npm-${NPM_PIN_VERSION}.tgz"');
+		expect(publish).toContain('test "$(npm --version)" = "$NPM_PIN_VERSION"');
 	});
 
-	test("the publish job carries the stable finalization job name", async () => {
+	test("splits credential-free preparation from the minimal OIDC publish boundary", async () => {
+		const ci = await workflow();
+		const prepare = jobSection(ci, "release_prepare");
+		const publish = jobSection(ci, "publish");
+
+		// The preparation job does everything untrusted (dependency installs,
+		// repository scripts, GitHub API reads) with read-only scopes and must
+		// never hold the OIDC identity token or any write scope.
+		expect(prepare).toContain("contents: read");
+		expect(prepare).toContain("pull-requests: read");
+		expect(prepare).not.toContain("id-token");
+		expect(prepare).not.toMatch(/:\s*write/u);
+
+		// The publish job holds only the OIDC identity token — no repository
+		// scope — and performs only the irreversible publication from the fixed
+		// boundary.
+		expect(publish).not.toContain("contents: write");
+		expect(publish).toContain("id-token: write");
+		expect(publish).not.toContain("pull-requests");
+		expect(publish).not.toContain("release-notes.ts");
+		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
+	});
+
+	test("resolves and validates release notes before the irreversible npm publication", async () => {
+		const ci = await workflow();
+		const prepare = jobSection(ci, "release_prepare");
+		const publish = jobSection(ci, "publish");
+
+		// Notes derivation (history fetch + GitHub API + generation) lives in the
+		// preparation job, so any failure aborts the run before packages ship.
+		expect(prepare).toContain("Derive and validate release notes");
+		expect(prepare).toContain("bun scripts/release-notes.ts");
+		// The persisted body must be deterministic: a second derivation has to
+		// reproduce it byte-for-byte.
+		expect(prepare).toContain("cmp --silent");
+		// The finalize job consumes only the integrity-checked artifact and never
+		// regenerates the body.
+		const finalize = jobSection(ci, "release_finalize");
+		expect(finalize).toContain("Download validated release notes");
+		expect(finalize).toContain("Verify release notes integrity");
+		expect(finalize.indexOf("Verify release notes integrity")).toBeLessThan(finalize.indexOf("Create GitHub Release"));
+		expect(finalize).toContain("body_path: ${{ runner.temp }}/release-notes/release-notes.md");
+		expect(finalize).toContain("generate_release_notes: false");
+		// publish needs release_prepare (via release_approval), which guarantees
+		// notes exist and passed validation before npm publish can start.
+		expect(publish).toContain("needs.release_approval.result == 'success'");
+	});
+
+	test("selects the previous release anchor as an exact stable ancestor tag with a shell-safe empty fallback", async () => {
+		const ci = await workflow();
+		const prepare = jobSection(ci, "release_prepare");
+		const notesStart = prepare.indexOf("Derive and validate release notes");
+		expect(notesStart).toBeGreaterThanOrEqual(0);
+		const notes = prepare.slice(notesStart);
+
+		// Exact stable vX.Y.Z only: nightly/RC/unrelated tags cannot anchor the range.
+		expect(notes).toContain("^v[0-9]+\\.[0-9]+\\.[0-9]+$");
+		// Ancestor-only: a tag that does not lead to this release head is rejected.
+		expect(notes).toContain('git merge-base --is-ancestor "$tag" "$SOURCE_SHA"');
+		// The current release tag is never its own base.
+		expect(notes).toContain('[ "$tag" = "$TAG_NAME" ] && continue');
+		// No-candidate is the documented empty-notes fallback, implemented without
+		// pipelines that pipefail would turn into an abort (grep -vFx exits 1).
+		expect(notes).not.toContain("grep -vFx");
+		expect(notes).toContain(': > "$notes"');
+	});
+
+	test("gates stable tag releases on protected-main provenance with a ref-scoped OIDC subject", async () => {
+		const ci = await workflow();
+		const metadata = jobSection(ci, "release_metadata");
+		const publish = jobSection(ci, "publish");
+
+		// The tagged SHA must provably sit on the fetched origin/main line before
+		// anything in the release graph can run (publish needs release_metadata).
+		expect(metadata).toContain("Validate stable tag protected-main provenance");
+		expect(metadata).toContain("+refs/heads/main:refs/remotes/origin/main");
+		expect(metadata).toContain('git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/main');
+		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
+
+		// The OIDC subject must stay ref-scoped: an `environment:` would change
+		// the token subject away from the identity the npm trusted-publisher
+		// registrations (and the shipped v0.14.1 exchange) already prove. Owner
+		// prerequisites (main ruleset, v* tag-creation ruleset) are documented
+		// on the job instead.
+		expect(publish).not.toContain("environment:");
+	});
+
+	test("executes no checkout-controlled code inside the OIDC publish boundary", async () => {
+		const ci = await workflow();
+		const publish = jobSection(ci, "publish");
+
+		// The fixed publisher boundary: no checkout, no repository code, no
+		// dependency installation, no cache — only pinned actions and workflow
+		// shell operate on sha512-sealed artifacts.
+		expect(publish).not.toContain("actions/checkout@");
+		expect(publish).not.toContain("setup-bun@");
+		expect(publish).not.toContain("bun ");
+		expect(publish).not.toContain("scripts/");
+		expect(publish).not.toContain("bun install");
+		expect(publish).not.toContain("actions/cache@");
+		expect(publish).not.toContain("npm ci");
+		expect(publish).not.toContain("node_modules");
+		// The boundary re-verifies the sealed tarball bytes before publishing.
+		expect(publish).toContain("Publish sealed tarballs to npm");
+		expect(publish).toContain("sha512sum --check --strict");
+		expect(publish).toContain("gajae-release-oidc-publish-receipt-v1.json");
+	});
+
+	test("gates the OIDC boundary on the approval environment without changing the publish subject", async () => {
+		const ci = await workflow();
+		const approval = jobSection(ci, "release_approval");
+		const publish = jobSection(ci, "publish");
+
+		// The approval gate runs before publish and holds the environment hook
+		// with no permissions and no OIDC token, so publish's OIDC subject stays
+		// ref-scoped and the trusted-publisher registrations remain valid.
+		expect(approval).toContain("environment: npm-release");
+		expect(approval).toContain("permissions: {}");
+		expect(approval).not.toContain("id-token");
+		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
+		expect(publish).toContain("needs.release_approval.result == 'success'");
+		expect(publish).not.toContain("environment:");
+	});
+
+	test("keeps scheduled and manual nightlies out of the stable approval gate", async () => {
+		const ci = await workflow();
+		const approval = jobSection(ci, "release_approval");
+		const publish = jobSection(ci, "publish");
+
+		// The approval environment applies to stable releases only; nightlies
+		// stay unattended once required reviewers are configured.
+		expect(approval).toContain("needs.release_metadata.outputs.channel == 'stable'");
+		// publish runs for nightly without the approval result, but stable
+		// requires it.
+		expect(publish).toContain("needs.release_metadata.outputs.channel == 'nightly' || needs.release_approval.result == 'success'");
+		// release_approval depends on the preparation graph, not the other way.
+		expect(approval).toContain("needs: [release_prepare, release_metadata]");
+	});
+
+	test("keeps dependency resolution out of the publish dispatch", async () => {
+		const publishScript = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+
+		// Declaration checks (`bun x tsc`) resolve/execute packages: they must be
+		// dispatched only on the prepare path, never on --publish-from-evidence.
+		const prepareBranch = publishScript.slice(
+			publishScript.indexOf('command.mode === "prepare-evidence"'),
+			publishScript.indexOf("await publishFromExpectedEvidence"),
+		);
+		expect(prepareBranch).toContain("await checkTypeDeclarations()");
+		expect(publishScript.slice(publishScript.indexOf("await publishFromExpectedEvidence"))).not.toContain("checkTypeDeclarations");
+	});
+
+	test("pins the OIDC-capable Node bootstrap to an exact patch", async () => {
+		const ci = await workflow();
+		const publish = jobSection(ci, "publish");
+
+		expect(publish).toContain('node-version: "24.19.0"');
+		expect(publish).not.toContain('node-version: "24"');
+		expect(publish).not.toMatch(/node-version: "24\.[x*]/u);
+	});
+
+	test("keeps the release regression suites on the normal release CI path", async () => {
+		const manifest = JSON.parse(await Bun.file(path.join(repoRoot, "package.json")).text()) as { scripts: Record<string, string> };
+		const release = manifest.scripts["test:release"];
+		expect(release).toContain("scripts/release-notes.test.ts");
+		expect(release).toContain("scripts/release-retry.test.ts");
+	});
+
+	test("the release_finalize job carries the stable finalization job name", async () => {
 		const ci = await workflow();
 		// release.ts watches this exact job to confirm the release finalized.
 		expect(ci).toContain(`   ${STABLE_GITHUB_RELEASE_FINALIZATION_JOB_NAME}:`);
@@ -140,13 +319,13 @@ describe("stable release policy", () => {
 		expect(permissions).not.toMatch(/:\s+write(?:\s|$)/u);
 	});
 
-	// #3139 least-privilege invariant: only publish may hold contents write.
-	test("pins publish as the only job-level contents write permission", async () => {
+	// #3139 least-privilege invariant: only release_finalize may hold contents write.
+	test("pins release_finalize as the only job-level contents write permission", async () => {
 		const ci = await workflow();
 		const jobs = [...ci.slice(ci.indexOf("\njobs:")).matchAll(/^ {3}[a-z_][a-z0-9_]*:$/gmu)].map(job => job[0].trim().slice(0, -1));
 		for (const job of jobs) {
 			const section = jobSection(ci, job);
-			if (job === "publish") expect(section).toContain("contents: write");
+			if (job === "release_finalize") expect(section).toContain("contents: write");
 			else expect(section).not.toContain("contents: write");
 		}
 	});
@@ -157,6 +336,7 @@ describe("stable release policy", () => {
 		const gate = jobSection(ci, "nightly_gate");
 		const native = jobSection(ci, "native");
 		const binaries = jobSection(ci, "binaries");
+		const prepare = jobSection(ci, "release_prepare");
 		const publish = jobSection(ci, "publish");
 		const nativeAction = await Bun.file(path.join(repoRoot, ".github/actions/build-native/action.yml")).text();
 
@@ -178,23 +358,27 @@ describe("stable release policy", () => {
 		expect(nativeAction).toContain("bun scripts/nightly-release.ts stage");
 		expect(nativeAction).toContain("PI_NATIVE_PROFILE:");
 		expect(binaries).toContain("Stage nightly release version");
-		expect(publish).toContain("needs.nightly_gate.result == 'success'");
-		expect(publish).toContain("--release-channel \"$RELEASE_CHANNEL\"");
-		expect(publish).toContain("Persist pre-publication package evidence");
-		expect(publish).toContain("release-evidence-${{ needs.release_metadata.outputs.version }}");
-		expect(publish).toContain("Reject pre-existing release tag or release");
-		expect(publish).toContain("refusing upsert");
-		expect(publish).toContain("$2 ~ /\\^\\{\\}$/");
-		expect(publish).not.toContain("same-run retry");
-		expect(publish).toContain("fail_on_unmatched_files: true");
-		expect(publish).toContain("Verify immutable GitHub Release");
-		expect(publish.indexOf("Reject pre-existing release tag or release")).toBeLessThan(publish.indexOf("Publish packages to npm"));
-		expect(publish).toContain("gajae-nightly-release");
-		expect(publish).toContain("prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}");
-		expect(publish).toContain("make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}");
-		expect(publish).toContain("gajae-release-packages-expected-v1.json");
-		expect(publish).toContain("gajae-release-packages-v1.json");
-		expect(publish).toContain("gajae-release-channel-v1.json");
+		expect(prepare).toContain("needs.nightly_gate.result == 'success'");
+		expect(prepare).toContain("Stage nightly release version");
+		expect(prepare).toContain("Persist pre-publication package evidence");
+		expect(prepare).toContain("release-evidence-${{ needs.release_metadata.outputs.version }}");
+		expect(prepare).toContain("Reject pre-existing release tag or release");
+		expect(prepare).toContain("refusing upsert");
+		expect(prepare).toContain("$2 ~ /\\^\\{\\}$/");
+		expect(prepare).not.toContain("same-run retry");
+		// Every preparation-side validation lands before the publish job can run.
+		expect(prepare.indexOf("Reject pre-existing release tag or release")).toBeLessThan(prepare.indexOf("Derive and validate release notes"));
+		expect(publish).toContain("--tag=\"$npm_tag\"");
+		const finalize = jobSection(ci, "release_finalize");
+		expect(finalize).toContain("--release-channel \"$RELEASE_CHANNEL\"");
+		expect(finalize).toContain("fail_on_unmatched_files: true");
+		expect(finalize).toContain("Verify immutable GitHub Release");
+		expect(finalize.indexOf("Assemble final release evidence")).toBeLessThan(finalize.indexOf("Create GitHub Release"));
+		expect(finalize).toContain("prerelease: ${{ needs.release_metadata.outputs.channel == 'nightly' }}");
+		expect(finalize).toContain("make_latest: ${{ needs.release_metadata.outputs.channel != 'nightly' }}");
+		expect(finalize).toContain("gajae-release-packages-expected-v1.json");
+		expect(finalize).toContain("gajae-release-packages-v1.json");
+		expect(finalize).toContain("gajae-release-channel-v1.json");
 	});
 	test("updates owned Bun lock versions without re-resolving third-party packages", () => {
 		const lock = `{

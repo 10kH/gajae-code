@@ -9,7 +9,7 @@ import {
 	type SessionIndex,
 } from "../broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClient } from "../client/client";
+import { SdkClient, type SdkDispatchContext, type SdkDispatchHandler } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
 import {
 	type ActivatedPreparedSession,
@@ -93,7 +93,16 @@ export interface SessionRouterClient {
 	onFrame(handler: (frame: Record<string, unknown>) => void): () => void;
 	onReconnect?(handler: () => void): () => void;
 	connect?(): Promise<void>;
-	request(frame: Record<string, unknown>, options?: { timeoutMs?: number }): Promise<Record<string, unknown>>;
+	request(
+		frame: Record<string, unknown>,
+		options?: {
+			timeoutMs?: number;
+			/** Synchronous pre-send observer; a throw aborts the dispatch before the wire. */
+			beforeDispatch?: (context: SdkDispatchContext) => void;
+			/** Synchronous post-send boundary observer for transport-close-aware consumers. */
+			onDispatch?: (context: SdkDispatchContext) => void;
+		},
+	): Promise<Record<string, unknown>>;
 	/** Current private transport connection identity, surfaced only through its exact attachment. */
 	readonly connectionId?: string;
 
@@ -168,6 +177,28 @@ export interface SessionRouterOptions {
 	deps?: SessionRouterDeps;
 	/** Runtime-specific identity validation; Router supplies a conservative fallback. */
 	correlateFrame?: SessionRouterFrameCorrelator;
+}
+
+/**
+ * Builds the observer-facing frame for router dispatch callbacks: the injected
+ * session endpoint token (and any other credential-shaped field) is removed,
+ * and the result is deep-frozen so a malicious observer can neither read
+ * credentials nor mutate what the wire carries. The internal wire frame keeps
+ * the token; only the callback copy is redacted.
+ */
+function redactDispatchFrame(frame: Record<string, unknown>): Record<string, unknown> {
+	const redacted: Record<string, unknown> = { ...frame };
+	delete redacted.token;
+	const frozen = deepFreeze(redacted);
+	return frozen as Record<string, unknown>;
+}
+
+function deepFreeze<T>(value: T): T {
+	if (value && typeof value === "object") {
+		for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+		Object.freeze(value);
+	}
+	return value;
 }
 
 export type SessionRouterErrorPhase = "pre_send" | "ambiguous";
@@ -553,7 +584,11 @@ export class SessionRouter {
 		frame: Record<string, unknown>,
 		expectedGeneration?: number,
 		expectedAttachment?: SessionAttachment,
-		options?: { timeoutMs?: number },
+		options?: {
+			timeoutMs?: number;
+			beforeDispatch?: (context: SdkDispatchContext) => void;
+			onDispatch?: SdkDispatchHandler;
+		},
 	): Promise<Record<string, unknown>> {
 		const publishing = this.#sessions.get(sessionId);
 		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)
@@ -577,12 +612,38 @@ export class SessionRouter {
 				throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 			}
 		}
-		// A caller that sized its own budget keeps it; everything else gets the
-		// long-lived session budget instead of the transport's one-shot default,
-		// which a cold host's first credential-collecting query outruns (#4258).
-		const response = await attached.client.request(this.#prepareFrame(attached, frame), {
-			...options,
-			timeoutMs: options?.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+		// A caller that sized its own budget keeps its own; everything else gets
+		// the long-lived session budget instead of the transport's one-shot
+		// default, which a cold host's first credential-collecting query
+		// outruns (#4258).
+		// Dispatch observers must never see the injected session endpoint
+		// token: the wire frame alone carries credentials, and the observer
+		// context is a deep-frozen, token-redacted copy (#4640 review).
+		const wireFrame = this.#prepareFrame(attached, frame);
+		const { beforeDispatch, onDispatch, ...requestOptions } = options ?? {};
+		const response = await attached.client.request(wireFrame, {
+			...requestOptions,
+			timeoutMs: requestOptions.timeoutMs ?? SESSION_REQUEST_TIMEOUT_MS,
+			...(beforeDispatch
+				? {
+						beforeDispatch: (context: SdkDispatchContext) => {
+							return beforeDispatch({
+								...context,
+								frame: redactDispatchFrame(context.frame),
+							});
+						},
+					}
+				: {}),
+			...(onDispatch
+				? {
+						onDispatch: (context: SdkDispatchContext) => {
+							return onDispatch({
+								...context,
+								frame: redactDispatchFrame(context.frame),
+							});
+						},
+					}
+				: {}),
 		});
 		if (
 			!this.#attachmentPublished(attached) ||

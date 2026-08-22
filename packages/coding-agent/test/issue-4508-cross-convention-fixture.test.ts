@@ -19,6 +19,15 @@ const MCP_NAME = "cross-convention-server";
 const MCP_SECRET = "cross-convention-secret";
 const HOOK_TOOL = "read";
 const READ_TARGET = "fixture-target.txt";
+/** User-scope definition surfaces that an import must never create. */
+const USER_DEFINITION_SURFACES = new Set(["agents", "commands", "hooks", "mcp.json", "prompts", "skills"]);
+/**
+ * Declared connection window for the fixture server. Discovery only blocks
+ * session start for the declared window (capped by the manager's ceiling), and a
+ * server with no declared window gets the 250ms floor — far too short to spawn a
+ * runtime and complete an MCP handshake.
+ */
+const MCP_TIMEOUT_MS = 10_000;
 const SKILL_CONTENT = `---
 name: ${SKILL_NAME}
 description: Cross-convention fixture skill.
@@ -131,13 +140,14 @@ function claudeMcpConfig(script: string = MCP_SERVER_SCRIPT): string {
 				command: process.execPath,
 				args: ["-e", script],
 				env: { API_KEY: MCP_SECRET },
+				timeout: MCP_TIMEOUT_MS,
 			},
 		},
 	});
 }
 
 function codexMcpConfig(script: string = MCP_SERVER_SCRIPT): string {
-	return `[mcp_servers.${MCP_NAME}]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ["-e", ${JSON.stringify(script)}]\nenv = { API_KEY = ${JSON.stringify(MCP_SECRET)} }\n`;
+	return `[mcp_servers.${MCP_NAME}]\ncommand = ${JSON.stringify(process.execPath)}\nargs = ["-e", ${JSON.stringify(script)}]\nenv = { API_KEY = ${JSON.stringify(MCP_SECRET)} }\ntool_timeout_sec = ${MCP_TIMEOUT_MS / 1000}\n`;
 }
 
 async function seedConvention(product: ImportedProduct, marker: string): Promise<void> {
@@ -160,6 +170,7 @@ async function seedNative(marker: string): Promise<void> {
 					command: process.execPath,
 					args: ["-e", MCP_SERVER_SCRIPT],
 					env: { API_KEY: MCP_SECRET },
+					timeout: MCP_TIMEOUT_MS,
 				},
 			},
 		}),
@@ -296,7 +307,13 @@ afterEach(async () => {
 	vi.restoreAllMocks();
 	resetActiveSkillsForTests();
 	setAgentDir(originalAgentDir);
-	await expect(fs.readdir(homeDir)).resolves.toEqual(homeBefore);
+	// A session may write ordinary runtime state (logs, caches) under the user
+	// config root; the fixture's contract is that no imported DEFINITION ever
+	// lands in the user scope, and that nothing else appears in the home directory.
+	const homeEntries = await fs.readdir(homeDir);
+	expect(homeEntries.filter(entry => entry !== ".gjc")).toEqual(homeBefore);
+	const userConfigEntries = await fs.readdir(path.join(homeDir, ".gjc")).catch(() => [] as string[]);
+	expect(userConfigEntries.filter(entry => USER_DEFINITION_SURFACES.has(entry))).toEqual([]);
 	await fs.rm(root, { recursive: true, force: true });
 });
 

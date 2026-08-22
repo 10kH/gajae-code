@@ -419,9 +419,33 @@ describe("status line multi-row wrapping (statusLine.maxRows)", () => {
 			{ skill: "autoresearch", phase: "research" },
 		]);
 		const rows = component.render(20);
-		const hudRows = rows.filter(row => strip(row).includes("◆"));
+		const hudRows = rows.filter(row => /deep-interview|autoresearch/.test(strip(row)));
 		expect(hudRows.length).toBe(2);
-		expect(hudRows.every(row => visibleWidth(row) <= 20)).toBe(true);
+		expect(hudRows.every(row => !row.includes("\n") && visibleWidth(row) <= 20)).toBe(true);
+	});
+
+	it("keeps a long single HUD entry as separate pinned rows", () => {
+		const component = buildComponent(2);
+		component.updateSettings({ showSkillHud: true });
+		component.setSkillHudEntriesForTest([
+			{
+				skill: "ultragoal",
+				phase: "executing",
+				hud: {
+					version: 1,
+					summary: "long-running aggregate execution",
+					chips: [
+						{ label: "goals", value: "1/2", priority: 10 },
+						{ label: "current", value: "G002:Stabilize long HUD wrapping", priority: 20 },
+						{ label: "ledger", value: "goal_started:2026-08-22T02:27:00.000Z", priority: 30 },
+					],
+				},
+			},
+		]);
+		const rows = component.render(100);
+		const hudRows = rows.filter(row => /ultragoal|long-running|current=|ledger=/.test(strip(row)));
+		expect(hudRows).toHaveLength(2);
+		expect(hudRows.every(row => !row.includes("\n") && visibleWidth(row) <= 100)).toBe(true);
 	});
 
 	it("caps wrapping at maxRows", () => {
