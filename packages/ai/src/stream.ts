@@ -330,13 +330,13 @@ export function stream<TApi extends Api>(
 		if (!apiKey) {
 			throw new Error(formatMissingApiKeyError(model.provider));
 		}
+		const adapterOptions = isProviderSafetyStopModelTrusted(model)
+			? withProviderSafetyStopAdapterInvocation({ ...(options as SimpleStreamOptions | undefined), apiKey })
+			: { ...(options as SimpleStreamOptions | undefined), apiKey };
 		return streamFromLazyImport(
 			async () => {
 				const { streamGitLabDuo } = await import("./providers/gitlab-duo");
-				return streamGitLabDuo(model, context, {
-					...(options as SimpleStreamOptions | undefined),
-					apiKey,
-				});
+				return streamGitLabDuo(model, context, adapterOptions);
 			},
 			(options as StreamOptions | undefined)?.signal,
 		);
