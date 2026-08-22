@@ -400,8 +400,13 @@ function watchSocketReplacement(socketPath: string, onReplaced: () => void): () 
 			const stat = fs.lstatSync(socketPath);
 			// Herdr publishes a Unix-domain socket directly. Do not follow a
 			// symlink from an inherited environment into an unrelated directory.
+			// The inode's change time is part of the identity: Linux recycles
+			// inode numbers aggressively (an unlink+bind pair commonly rebinds
+			// the exact same dev:ino), so the number alone cannot distinguish a
+			// replaced socket from the untouched original — a recycled number is
+			// still a fresh inode, and a fresh inode has a fresh ctime.
 			return stat.isSocket()
-				? { kind: "socket", value: `${stat.dev}:${stat.ino}` }
+				? { kind: "socket", value: `${stat.dev}:${stat.ino}:${stat.ctimeMs}` }
 				: { kind: "invalid", reason: stat.isSymbolicLink() ? "symlink" : "not-a-socket" };
 		} catch (error) {
 			const code = (error as NodeJS.ErrnoException).code;
@@ -507,6 +512,15 @@ function watchSocketReplacement(socketPath: string, onReplaced: () => void): () 
 		replacementPending = true;
 		schedule();
 	}
+	// A directory event fired in the first moments after fs.watch registration
+	// is not guaranteed to be delivered — the watch is not yet accepting
+	// events on every runtime until the loop first spins, and an unlink+bind
+	// landing in that window is swallowed whole (verified against a witness
+	// watcher on Bun 1.4/linux). The identity comparison above has already
+	// run, so the only backstop is one deferred re-check: an unchanged
+	// identity makes it a no-op, and a replacement the watch never saw is
+	// still caught from its settled state.
+	schedule();
 	return () => {
 		closed = true;
 		if (settle) clearTimeout(settle);

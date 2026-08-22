@@ -975,6 +975,50 @@ describe("herdr server replacement", () => {
 			fs.rmSync(directory, { recursive: true, force: true });
 		}
 	});
+	it("re-asserts a replacement whose directory event is swallowed before the watch activates", async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-activation-"));
+		const socketPath = path.join(directory, "herdr.sock");
+		const { calls, spawn } = recordingSpawn();
+		const listen = async (): Promise<net.Server> => {
+			const server = net.createServer();
+			const ready = Promise.withResolvers<void>();
+			server.once("error", ready.reject);
+			server.listen(socketPath, ready.resolve);
+			await ready.promise;
+			return server;
+		};
+		const server = await listen();
+		const reporter = createHerdrReporter(
+			{ paneId: "pane-7", binPath: "/usr/bin/herdr", socketPath },
+			eventSource().subscribe,
+			{ env: paneEnv(), spawn },
+		);
+		// Unlink in the same synchronous tick as the install, before the event
+		// loop has spun once since the directory watch was registered: runtimes
+		// may swallow events raised in that activation window, so the reporter
+		// must still catch the replacement from its settled identity.
+		fs.unlinkSync(socketPath);
+		const replacement = await listen();
+		const before = calls.filter(call => call.command.includes("report-agent")).length;
+
+		try {
+			await new Promise<void>((resolve, reject) => {
+				const started = Date.now();
+				const poll = () => {
+					if (calls.filter(call => call.command.includes("report-agent")).length > before) return resolve();
+					if (Date.now() - started > 2_000)
+						return reject(new Error("replacement in the watch activation window was never re-asserted"));
+					setTimeout(poll, 25);
+				};
+				poll();
+			});
+		} finally {
+			reporter.release();
+			await new Promise<void>(resolve => replacement.close(() => resolve()));
+			await new Promise<void>(resolve => server.close(() => resolve()));
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
+	});
 
 	it("reasserts after an injected same-identity socket rename", () => {
 		const { calls, spawn } = recordingSpawn();
