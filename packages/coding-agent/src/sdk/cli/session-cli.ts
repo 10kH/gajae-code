@@ -86,6 +86,7 @@ const TAIL_OFFLINE_MAX_LINE_BYTES = 256 * 1024;
 const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
 
 const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end", "agent_failed"]);
+const START_TURN_KINDS = new Set(["turn_start", "agent_start"]);
 const CLOSE_EVENT_KINDS = new Set(["session_closed", "session_terminated"]);
 const DEFAULT_TAIL_KINDS = new Set([
 	"session_ready",
@@ -616,6 +617,122 @@ function mergeTailItems(
 	}
 }
 
+/** Canonical ring position of an event item, when the host stated one. */
+type TailSeqKey = { generation: number; seq: number };
+
+function isPositionCoordinate(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function malformedPositionError(
+	sessionId: string,
+	kind: string,
+	generation: unknown,
+	seq: unknown,
+): SdkSessionCliError {
+	return new SdkSessionCliError(
+		"protocol_error",
+		"The event ring stated an incomplete or invalid generation and sequence position.",
+		1,
+		{
+			sessionId,
+			kind,
+			...(generation === undefined ? {} : { generation }),
+			...(seq === undefined ? {} : { seq }),
+		},
+	);
+}
+
+/**
+ * Classifies a raw event-ring row's position claim before projection.
+ *
+ * `toTailItemV1` keeps a coordinate only when it is already a number, so a raw
+ * `null` — which is also what a non-finite JS number becomes once it crosses
+ * JSON — would lose its property presence and read as genuinely unpositioned.
+ * Presence is therefore decided on the raw row, where the claim still exists.
+ */
+function classifyRawEventPosition(event: unknown): "unpositioned" | "malformed" | "positioned" {
+	if (!isRecord(event)) return "unpositioned";
+	const hasGeneration = "generation" in event;
+	const hasSeq = "seq" in event;
+	if (!hasGeneration && !hasSeq) return "unpositioned";
+	return isPositionCoordinate(event.generation) && isPositionCoordinate(event.seq) ? "positioned" : "malformed";
+}
+
+/**
+ * Classifies an event-ring item's claimed position.
+ *
+ * Only a pair of non-negative safe integers is canonical. Claiming exactly one
+ * coordinate, or a negative, fractional, non-finite, or unsafe-integer value,
+ * is a malformed claim: the host stated a position it cannot substantiate, so
+ * it is never silently downgraded to unpositioned. Claiming neither coordinate
+ * is a genuine unpositioned event.
+ */
+function classifyTailPosition(item: SdkTailItemV1): TailSeqKey | "unpositioned" | "malformed" {
+	if (item.generation === undefined && item.seq === undefined) return "unpositioned";
+	if (!isPositionCoordinate(item.generation) || !isPositionCoordinate(item.seq)) return "malformed";
+	return { generation: item.generation, seq: item.seq };
+}
+
+function tailSeqKey(item: SdkTailItemV1): TailSeqKey | undefined {
+	const position = classifyTailPosition(item);
+	return typeof position === "string" ? undefined : position;
+}
+
+function compareTailSeqKeys(left: TailSeqKey, right: TailSeqKey): number {
+	return left.generation !== right.generation ? left.generation - right.generation : left.seq - right.seq;
+}
+
+/** Event items split by whether the host stated a canonical ring position. */
+type EventTailSegments = { positioned: SdkTailItemV1[]; unpositioned: SdkTailItemV1[] };
+
+/**
+ * Merges event items into canonical `(generation, seq)` order and returns only
+ * the ones observed for the first time.
+ *
+ * The Router's attach/live frames and the CLI's explicit replay are out-of-band
+ * with each other, so arrival order is not ring order: a live frame can be seen
+ * before an older replayed event resolves. Ordering is established at insertion
+ * rather than by sorting a completed arrival-order list, so the caller can fold
+ * lifecycle state against the same canonical positions the caller returns.
+ *
+ * Positioned and unpositioned events are kept in separate segments. An
+ * unpositioned event states no position, so it can neither be ordered against a
+ * positioned event nor act as an anchor that strands positioned events on
+ * either side of it; it stays visible in arrival order after the canonical
+ * segment.
+ */
+function mergeEventTailItems(
+	target: EventTailSegments,
+	seen: Set<string>,
+	items: SdkTailItemV1[],
+	include: (kind: string) => boolean,
+): { merged: SdkTailItemV1[]; malformed: SdkTailItemV1 | undefined } {
+	const merged: SdkTailItemV1[] = [];
+	for (const item of items) {
+		// Validated before dedupe, ordering, or state so a malformed claim can
+		// never occupy a key or influence turn state on its way to failing closed.
+		const position = classifyTailPosition(item);
+		if (position === "malformed") return { merged, malformed: item };
+		const key = tailItemKey(item);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		merged.push(item);
+		if (!include(item.kind)) continue;
+		if (position === "unpositioned") {
+			target.unpositioned.push(item);
+			continue;
+		}
+		let index = target.positioned.length;
+		for (; index > 0; index--) {
+			const previous = tailSeqKey(target.positioned[index - 1]!);
+			if (previous === undefined || compareTailSeqKeys(previous, position) <= 0) break;
+		}
+		target.positioned.splice(index, 0, item);
+	}
+	return { merged, malformed: undefined };
+}
+
 function eventGapToRetentionGap(
 	value: unknown,
 	frame: JsonRecord,
@@ -882,26 +999,101 @@ async function runLiveTail(
 ): Promise<unknown> {
 	const include = (kind: string): boolean =>
 		kind === "transcript" || args.allEvents === true || DEFAULT_TAIL_KINDS.has(kind);
-	const items: SdkTailItemV1[] = [];
-	const seen = new Set<string>();
+	// Retained transcript entries keep arrival order; event items are emitted as
+	// a canonical positioned segment followed by the arrival-ordered unpositioned
+	// segment.
+	const transcriptItems: SdkTailItemV1[] = [];
+	const eventItems: EventTailSegments = { positioned: [], unpositioned: [] };
+	const tailItems = (): SdkTailItemV1[] => [...transcriptItems, ...eventItems.positioned, ...eventItems.unpositioned];
+	// Independent dedupe domains. A transcript row may project the same kind,
+	// generation, and seq as a real event-ring row; one shared domain would let
+	// whichever arrived first suppress the other, and a transcript row is not
+	// event-ring authority, so it must never erase lifecycle or conflict
+	// evidence.
+	const seenTranscript = new Set<string>();
+	const seenEvents = new Set<string>();
 	let checkpoint: SdkCheckpointRecordV1 | undefined;
 	let gap: SdkRetentionGapV1 | undefined;
 	let liveReason: TailExitReason | undefined;
 	let resolveLive: ((reason: TailExitReason) => void) | undefined;
+	let rejectLive: ((error: SdkSessionCliError) => void) | undefined;
+	// Lifecycle state of the newest turn, tracked by canonical ring position
+	// rather than arrival order. A terminal event idles the turn and a start
+	// event reopens it, but only when that event is canonically at or after the
+	// event that last decided the state. An older terminal that arrives late
+	// therefore cannot complete a newer turn that is still running, and a newer
+	// terminal that arrives early is not undone by replayed history behind it.
+	let turnIdle = false;
+	let turnStateKey: TailSeqKey | undefined;
+	let closed = false;
+	// Lifecycle kind already claimed at each canonical position. A same-kind
+	// duplicate never reaches here (dedupe keys include kind), so any entry that
+	// disagrees is a host stating two different lifecycle kinds at one position.
+	const claimedLifecycleKinds = new Map<string, string>();
+	let malformed: SdkSessionCliError | undefined;
+
+	const applyLifecycle = (outcome: { merged: SdkTailItemV1[]; malformed: SdkTailItemV1 | undefined }): void => {
+		if (outcome.malformed !== undefined) {
+			const item = outcome.malformed;
+			malformed ??= malformedPositionError(sessionId, item.kind, item.generation, item.seq);
+			rejectLive?.(malformed);
+			return;
+		}
+		for (const item of outcome.merged) {
+			const isStart = START_TURN_KINDS.has(item.kind);
+			const isClose = CLOSE_EVENT_KINDS.has(item.kind);
+			const isLifecycle = isStart || isClose || TERMINAL_TURN_KINDS.has(item.kind);
+			const position = isLifecycle ? tailSeqKey(item) : undefined;
+			if (position !== undefined) {
+				// Every positioned lifecycle kind tail semantics consumes claims its
+				// position, close kinds included, and the claim is checked before any
+				// kind-specific handling. Checking it after close handling would let a
+				// close at a contested position win instead of failing closed, and
+				// checking it after the monotonic guard would silently skip a
+				// conflicting kind at an already-decided position.
+				const positionKey = `${position.generation}\u0000${position.seq}`;
+				const claimed = claimedLifecycleKinds.get(positionKey);
+				if (claimed !== undefined && claimed !== item.kind) {
+					malformed ??= new SdkSessionCliError(
+						"protocol_error",
+						"The event ring stated different lifecycle kinds at one generation and sequence.",
+						1,
+						{
+							sessionId,
+							generation: position.generation,
+							seq: position.seq,
+							kinds: [claimed, item.kind].sort(),
+						},
+					);
+					rejectLive?.(malformed);
+					return;
+				}
+				claimedLifecycleKinds.set(positionKey, item.kind);
+			}
+			if (isClose) closed = true;
+			if (!isStart && !TERMINAL_TURN_KINDS.has(item.kind)) continue;
+			// An unsequenced lifecycle event states no position, so it cannot be
+			// proven at or after a positioned state and must not supersede it. It
+			// stays visible in the emitted items either way.
+			if (position === undefined && turnStateKey !== undefined) continue;
+			if (position !== undefined && turnStateKey !== undefined && compareTailSeqKeys(position, turnStateKey) <= 0)
+				continue;
+			if (position !== undefined) turnStateKey = position;
+			turnIdle = !isStart;
+		}
+		if (closed) {
+			liveReason = "close";
+			resolveLive?.("close");
+			return;
+		}
+		if (args.untilIdle === true && turnIdle) resolveLive?.("idle");
+	};
 
 	const recordLiveFrame = (attachment: SessionAttachment, frame: SessionRouterFrame): void => {
 		if (attachment.sessionId !== sessionId) return;
 		const item = tailItemFromRouterFrame(frame);
 		if (!item) return;
-		mergeTailItems(items, seen, [item], include);
-		if (args.untilIdle === true && TERMINAL_TURN_KINDS.has(item.kind)) {
-			liveReason = "idle";
-			resolveLive?.("idle");
-		}
-		if (CLOSE_EVENT_KINDS.has(item.kind)) {
-			liveReason = "close";
-			resolveLive?.("close");
-		}
+		applyLifecycle(mergeEventTailItems(eventItems, seenEvents, [item], include));
 	};
 
 	return await withRouter(
@@ -943,8 +1135,8 @@ async function runLiveTail(
 				throwResponseFailure(response);
 				const page = extractTranscriptPage(response);
 				mergeTailItems(
-					items,
-					seen,
+					transcriptItems,
+					seenTranscript,
 					page.items.map(item => toTailItemV1(item, { kind: "transcript" })),
 					include,
 				);
@@ -977,13 +1169,28 @@ async function runLiveTail(
 						replayGap,
 					);
 			}
-			const replayItems = arrayOf(replay.events).map(event => toTailItemV1(event, { kind: "event" }));
-			mergeTailItems(items, seen, replayItems, include);
-			if (args.untilIdle === true && replayItems.some(item => TERMINAL_TURN_KINDS.has(item.kind)))
-				liveReason = "idle";
+			// Raw rows are validated before projection: `toTailItemV1` drops a
+			// non-numeric coordinate, so a null claim would otherwise reach the
+			// projected check as a genuinely unpositioned event.
+			const rawEvents = arrayOf(replay.events);
+			const malformedRaw = rawEvents.find(event => classifyRawEventPosition(event) === "malformed");
+			if (malformedRaw !== undefined) {
+				const raw = isRecord(malformedRaw) ? malformedRaw : {};
+				throw malformedPositionError(
+					sessionId,
+					typeof raw.kind === "string" ? raw.kind : "event",
+					raw.generation,
+					raw.seq,
+				);
+			}
+			const replayItems = rawEvents.map(event => toTailItemV1(event, { kind: "event" }));
+			applyLifecycle(mergeEventTailItems(eventItems, seenEvents, replayItems, include));
+			if (malformed !== undefined) throw malformed;
+			if (liveReason === undefined && args.untilIdle === true && turnIdle) liveReason = "idle";
 			if (liveReason === undefined) {
 				const completion = Promise.withResolvers<TailExitReason>();
 				resolveLive = completion.resolve;
+				rejectLive = completion.reject;
 				const timeoutMs = args.timeoutMs ?? 10_000;
 				const timer = setTimeout(
 					() =>
@@ -1002,6 +1209,7 @@ async function runLiveTail(
 				} finally {
 					clearTimeout(timer);
 					resolveLive = undefined;
+					rejectLive = undefined;
 				}
 			}
 			return {
@@ -1012,7 +1220,7 @@ async function runLiveTail(
 					session: row,
 					...(checkpoint === undefined ? {} : { checkpoint }),
 					...(gap === undefined ? {} : { gap }),
-					items,
+					items: tailItems(),
 					terminal: liveReason === "idle" || liveReason === "close",
 				},
 			};

@@ -82,8 +82,27 @@ transcript entries.
 
 - `--strict` fails closed with `retention_gap` (exit 1) when retained history
   or the event ring dropped entries before the checkpoint.
-- `--until-idle` exits once the observed event stream reaches a terminal turn
-  state.
+- `--until-idle` exits once the current turn reaches a terminal state. Lifecycle
+  events that carry a `(generation, seq)` position are reconciled and emitted in
+  that canonical order rather than arrival order, so a retained terminal event
+  from an earlier turn does not complete a newer turn that is still running, and
+  a terminal event observed live is not undone by replayed history that arrives
+  after it. Positioned event items are emitted canonically ahead of an
+  arrival-ordered segment of events that carry no position; such an event stays
+  visible but cannot supersede a positioned turn state. Different lifecycle
+  kinds claiming the same `(generation, seq)` fail closed with `protocol_error`
+  (exit 1) because no order between them can be proven, and that conflict
+  outranks an otherwise successful idle or close completion. A canonical
+  position is a pair of non-negative safe integers. An event-ring row that
+  states either coordinate property must state both validly; a row claiming only
+  one coordinate, or a null, negative, fractional, non-finite, or
+  unsafe-integer coordinate, fails closed with `protocol_error` rather than
+  being treated as unpositioned. Only a row that states neither coordinate is
+  unpositioned. Retained transcript entries are deduplicated independently of
+  event-ring rows and are not event-ring authority, so a transcript row that
+  projects the same kind and position as a real event never suppresses it. For a
+  specific prompt operation, `status <sessionId> <opRef>` remains the lossless
+  authority.
 - `--all-events` widens the emitted set to every event-ring kind.
 - `--cursor` resumes from a saved signed checkpoint claim. `session.checkpoint`
   verifies the unexpired claim and exchanges it for a fresh connection-owned
