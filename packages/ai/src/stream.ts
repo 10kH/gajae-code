@@ -7,7 +7,10 @@ import {
 	extractHttpStatusFromError,
 	getTrustedHomeDir,
 } from "@gajae-code/utils";
-import { withProviderSafetyStopAdapterInvocation } from "./adapter-internals/provider-safety-stop";
+import {
+	isProviderSafetyStopModelTrusted,
+	withProviderSafetyStopAdapterInvocation,
+} from "./adapter-internals/provider-safety-stop";
 import { assertManagedAttempt, classifyFallbackTrigger, type TransportFailureFacts } from "./utils/fallback-transport";
 
 const managedAttemptValidated = Symbol("managedAttemptValidated");
@@ -340,10 +343,13 @@ export function stream<TApi extends Api>(
 
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
+		const vertexOptions = (options || {}) as GoogleVertexOptions;
 		return streamGoogleVertex(
 			model as Model<"google-vertex">,
 			context,
-			withProviderSafetyStopAdapterInvocation((options || {}) as GoogleVertexOptions),
+			isProviderSafetyStopModelTrusted(model)
+				? withProviderSafetyStopAdapterInvocation(vertexOptions)
+				: vertexOptions,
 		);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
@@ -360,12 +366,15 @@ export function stream<TApi extends Api>(
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
-	const providerOptions = withProviderSafetyStopAdapterInvocation({ ...options, apiKey });
+	const providerOptions = { ...options, apiKey };
+	const adapterProviderOptions = isProviderSafetyStopModelTrusted(model)
+		? withProviderSafetyStopAdapterInvocation(providerOptions)
+		: providerOptions;
 
 	const api: Api = model.api;
 	switch (api) {
 		case "anthropic-messages": {
-			const anthropicOptions = providerOptions as AnthropicOptions;
+			const anthropicOptions = adapterProviderOptions as AnthropicOptions;
 			return streamAnthropic(model as Model<"anthropic-messages">, context, {
 				...anthropicOptions,
 				isOAuth: anthropicOptions.isOAuth ?? model.isOAuth,
@@ -373,32 +382,40 @@ export function stream<TApi extends Api>(
 		}
 
 		case "openai-completions":
-			return streamOpenAICompletions(model as Model<"openai-completions">, context, providerOptions as any);
+			return streamOpenAICompletions(model as Model<"openai-completions">, context, adapterProviderOptions as any);
 
 		case "openai-responses":
-			return streamOpenAIResponses(model as Model<"openai-responses">, context, providerOptions as any);
+			return streamOpenAIResponses(model as Model<"openai-responses">, context, adapterProviderOptions as any);
 
 		case "azure-openai-responses":
-			return streamAzureOpenAIResponses(model as Model<"azure-openai-responses">, context, providerOptions as any);
+			return streamAzureOpenAIResponses(
+				model as Model<"azure-openai-responses">,
+				context,
+				adapterProviderOptions as any,
+			);
 
 		case "openai-codex-responses":
-			return streamOpenAICodexResponses(model as Model<"openai-codex-responses">, context, providerOptions as any);
+			return streamOpenAICodexResponses(
+				model as Model<"openai-codex-responses">,
+				context,
+				adapterProviderOptions as any,
+			);
 
 		case "google-generative-ai":
-			return streamGoogle(model as Model<"google-generative-ai">, context, providerOptions);
+			return streamGoogle(model as Model<"google-generative-ai">, context, adapterProviderOptions);
 
 		case "google-gemini-cli":
 			return streamGoogleGeminiCli(
 				model as Model<"google-gemini-cli">,
 				context,
-				providerOptions as GoogleGeminiCliOptions,
+				adapterProviderOptions as GoogleGeminiCliOptions,
 			);
 
 		case "ollama-chat":
-			return streamOllama(model as Model<"ollama-chat">, context, providerOptions as OllamaChatOptions);
+			return streamOllama(model as Model<"ollama-chat">, context, adapterProviderOptions as OllamaChatOptions);
 
 		case "cursor-agent":
-			return streamCursor(model as Model<"cursor-agent">, context, providerOptions as CursorOptions);
+			return streamCursor(model as Model<"cursor-agent">, context, adapterProviderOptions as CursorOptions);
 
 		default:
 			throw new Error(`Unhandled API: ${api}`);

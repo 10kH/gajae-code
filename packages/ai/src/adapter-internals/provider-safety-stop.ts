@@ -1,9 +1,37 @@
-import type { AssistantMessage } from "../types";
+import type { Api, AssistantMessage, Model } from "../types";
 
 /** This module is intentionally outside the package export map. */
 const PROVIDER_SAFETY_STOP_ADAPTER_BRAND = Symbol("provider-safety-stop-adapter-brand");
 const PROVIDER_SAFETY_STOP_INVOCATION_BRAND = Symbol("provider-safety-stop-invocation-brand");
 const PROVIDER_SAFETY_STOP_INVOCATION_KEY = Symbol("provider-safety-stop-invocation");
+
+type ProviderSafetyStopModelIdentity = Pick<Model<Api>, "api" | "provider" | "id" | "baseUrl">;
+const trustedProviderSafetyStopModels = new WeakMap<object, string>();
+
+function providerSafetyStopModelIdentity(model: ProviderSafetyStopModelIdentity): string {
+	return `${model.api}\u0000${model.provider}\u0000${model.id}\u0000${model.baseUrl ?? ""}`;
+}
+
+/** Register an immutable catalog identity for first-party provider dispatch. */
+export function registerProviderSafetyStopModel(model: Model<Api>): void {
+	try {
+		trustedProviderSafetyStopModels.set(model, providerSafetyStopModelIdentity(model));
+	} catch {
+		// A malformed/hostile model must remain fallback-eligible.
+	}
+}
+
+/** Verify that a model is the unchanged identity of a bundled catalog entry. */
+export function isProviderSafetyStopModelTrusted(model: unknown): boolean {
+	if (typeof model !== "object" || model === null) return false;
+	const expected = trustedProviderSafetyStopModels.get(model);
+	if (expected === undefined) return false;
+	try {
+		return expected === providerSafetyStopModelIdentity(model as ProviderSafetyStopModelIdentity);
+	} catch {
+		return false;
+	}
+}
 
 export type ProviderSafetyStopAdapterCapability = {
 	readonly [PROVIDER_SAFETY_STOP_ADAPTER_BRAND]: true;

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import {
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
@@ -7,6 +7,7 @@ import {
 import * as publicAi from "../src/index";
 import { getBundledModel } from "../src/models";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
+import { stream } from "../src/stream";
 import type { AssistantMessage, Context, FetchImpl, Model } from "../src/types";
 import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 
@@ -55,6 +56,33 @@ describe("provider safety-stop provenance authority", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorKind).toBeUndefined();
 		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+	});
+
+	test("does not mint from a public stream when a caller redirects a cloned model", async () => {
+		const bundled = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">;
+		const model = { ...bundled, baseUrl: "https://attacker.example/v1" };
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					error: { message: "filtered", type: "invalid_request_error", code: "content_filter" },
+				}),
+				{ status: 429, headers: { "Content-Type": "application/json" } },
+			),
+		);
+		try {
+			const result = await stream(
+				model,
+				{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+				{ apiKey: "caller-key", requestMaxRetries: 0, streamMaxRetries: 0 },
+			).result();
+
+			expect(fetchSpy).toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorKind).toBeUndefined();
+			expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+		} finally {
+			fetchSpy.mockRestore();
+		}
 	});
 
 	test("public AI exports expose verification only, never the minting operation", () => {
