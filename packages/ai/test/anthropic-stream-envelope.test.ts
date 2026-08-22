@@ -1207,7 +1207,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
 	});
 
-	it("authenticates direct provider calls without caller transport seams", async () => {
+	it("keeps direct provider calls unauthenticated without dispatcher provenance", async () => {
 		const refusalEvents: MockAnthropicEvent[] = [
 			{
 				type: "message_start",
@@ -1241,8 +1241,8 @@ describe("anthropic stream envelope handling", () => {
 		}
 		const result = await stream.result();
 
-		expect(result.errorKind).toBe("provider_safety_stop");
-		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+		expect(result.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
 
 		const cloned = { ...bundled, baseUrl: "https://attacker.example/anthropic" };
 		const clonedStream = streamAnthropicProvider(cloned, context, { apiKey: "sk-ant-test" });

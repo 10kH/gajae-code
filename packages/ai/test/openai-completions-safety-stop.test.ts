@@ -81,14 +81,14 @@ function context(): Context {
 }
 
 describe("chat-completions: provider safety stops", () => {
-	it("authenticates direct calls for unchanged bundled models", async () => {
+	it("keeps direct calls unauthenticated without dispatcher provenance", async () => {
 		const bundled = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions"> | undefined;
 		if (!bundled) throw new Error("Expected bundled OpenAI model");
 		global.fetch = mockFetch([chunk({}, "content_filter"), "[DONE]"]);
 
 		const result = await streamOpenAICompletions(bundled, context(), { apiKey: "test" }).result();
-		expect(result.errorKind).toBe("provider_safety_stop");
-		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+		expect(result.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
 	});
 
 	it("keeps a content-filter safety stop when a later tool block finishes", async () => {
