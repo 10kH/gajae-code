@@ -628,7 +628,14 @@ jobs:
       needs: [release_prepare, release_metadata]
       timeout-minutes: 30
       runs-on: ubuntu-22.04
-      permissions: {}
+      # The environment gate IS a deployment: with an empty permission set the
+      # GITHUB_TOKEN cannot create one, and GitHub then skips this job outright
+      # (observed on v0.15.0/v0.15.1: skipped with zero steps the same second
+      # release_prepare succeeded, taking publish and release_finalize with it).
+      # Deployment creation is the only scope granted — no contents, no
+      # id-token — so this job still holds nothing that can publish.
+      permissions:
+         deployments: write
       environment: npm-release
       steps:
          - name: Record release approval
