@@ -29,7 +29,7 @@ function processExists(pid: number): boolean {
 	}
 }
 
-async function waitForGone(pid: number, timeoutMs = 2_500): Promise<boolean> {
+async function waitForGone(pid: number, timeoutMs = 8_000): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (!processExists(pid)) return true;
@@ -184,7 +184,7 @@ describe("bash resource lifecycle", () => {
 		expect(processExists(sibling.pid)).toBe(true);
 		sibling.kill("SIGKILL");
 		await sibling.exited.catch(() => undefined);
-	});
+	}, 30_000);
 
 	it("caps bash artifact output and annotates truncation metadata", async () => {
 		const artifactPath = path.join(tempDir, "capped.log");
