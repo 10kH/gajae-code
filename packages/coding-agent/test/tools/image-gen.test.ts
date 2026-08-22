@@ -900,6 +900,24 @@ describe("imageGenTool image transport capability enforcement", () => {
 });
 
 describe("imageGenTool modelRoles.image resolution", () => {
+	it("fails closed when the tool context has no session settings", async () => {
+		const ctx: CustomToolContext = {
+			sessionManager: {
+				getCwd: () => "/tmp",
+				getSessionId: () => "test-session",
+			} as unknown as ReadonlySessionManager,
+			modelRegistry: makeMockRegistry({}, [OPENAI_MODEL]),
+			model: OPENAI_MODEL,
+			isIdle: () => true,
+			hasQueuedMessages: () => false,
+			abort: () => {},
+		};
+
+		await expect(imageGenTool.execute("call-1", { subject: "a cat" }, undefined, ctx)).rejects.toThrow(
+			"Image generation requires session settings to resolve the image model role.",
+		);
+	});
+
 	it("returns no tools when no image role is set", async () => {
 		const modelRegistry = makeMockRegistry({}, [OPENAI_MODEL]);
 		const settings = makeMockSettings(undefined);

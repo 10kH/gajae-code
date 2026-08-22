@@ -36,6 +36,7 @@ import type * as piCodingAgent from "@gajae-code/coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { Settings } from "../../config/settings";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
@@ -360,6 +361,8 @@ export interface ExtensionContext {
 	sessionMetadata?: ExtensionSessionMetadata;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
+	/** Session settings for role and provider resolution. */
+	settings?: Settings;
 	/** Credential-selection identity, distinct from logical/provider cache identity. */
 	credentialSessionId?: string;
 	/** Current model (may be undefined) */

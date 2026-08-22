@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import type { Settings } from "@gajae-code/coding-agent/config/settings";
 import { discoverAndLoadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
@@ -66,6 +67,21 @@ describe("ExtensionRunner", () => {
 	};
 
 	describe("safe tool resolver", () => {
+		it("exposes the authoritative session settings to extension contexts", () => {
+			const settings = {} as Settings;
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				settings,
+			);
+
+			expect(runner.createContext().settings).toBe(settings);
+		});
+
 		it("exposes only tool safe-summary metadata through extension context", () => {
 			const safeSummary = (kind: "args" | "result", value: unknown) =>
 				kind === "args" ? `safe:${String(value)}` : undefined;

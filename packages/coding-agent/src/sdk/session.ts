@@ -827,6 +827,7 @@ function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
 	return {
 		sessionManager: ctx.sessionManager,
 		modelRegistry: ctx.modelRegistry,
+		settings: ctx.settings,
 		model: ctx.model,
 		isIdle: ctx.isIdle,
 		hasQueuedMessages: ctx.hasPendingMessages,
@@ -3312,6 +3313,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...(options.parentTaskPrefix ? { parentTaskPrefix: options.parentTaskPrefix } : {}),
 					...(options.currentAgentType ? { currentAgentType: options.currentAgentType } : {}),
 				},
+				settings,
 			);
 		}
 
