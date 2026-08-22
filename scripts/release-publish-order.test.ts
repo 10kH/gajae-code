@@ -196,6 +196,24 @@ describe("unscoped gajae-code package publication", () => {
 		}
 	});
 
+	test("seals the dependency-ordered plan into evidence and the fixed publish boundary consumes it", async () => {
+		// The OIDC publish job must publish in planExpectedEvidencePublication
+		// order, not evidence-array (name-sorted) order. The order is computed in
+		// the credential-free prepare job and sealed as an artifact.
+		const script = await Bun.file(path.join(repoRoot, "scripts/ci-release-publish.ts")).text();
+		expect(script).toContain('PUBLISH_ORDER_FILE = "gajae-release-publish-order-v1.json"');
+		expect(script).toContain("planExpectedEvidencePublication(expected.packages)");
+
+		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
+		const publish = workflowJob(workflow, "publish");
+		expect(publish).toContain("gajae-release-publish-order-v1.json");
+		expect(publish).toContain("for name in $(jq -r '.order[]'");
+		// No direct evidence-array iteration may remain in the boundary.
+		expect(publish).not.toContain(".packages[$index]");
+		// The boundary rejects a plan that does not cover exactly the expected set.
+		expect(publish).toContain("does not cover exactly the expected package set");
+	});
+
 	test("rejects duplicate, missing, and extra evidence records before publication", async () => {
 		const records = canonicalEvidenceRecords();
 		const published: string[] = [];
@@ -342,7 +360,8 @@ describe("immutable stable release contracts", () => {
 		const tag = "v1.2.3";
 
 		expect(releaseScript).toContain('await git(["tag", "--no-sign", `v${version}`]);');
-		expect(releaseScript).toContain('["ls-remote", "origin", "refs/heads/main", `refs/tags/${tag}`, `refs/tags/${tag}^{}`]');
+		expect(releaseScript).toContain('const remoteRefs = ["refs/heads/main", `refs/tags/${tag}`, `refs/tags/${tag}^{}`] as const;');
+		expect(releaseScript).toContain('["ls-remote", "origin", ...remoteRefs]');
 		expect(releaseScript).not.toContain('["ls-remote", "--refs", "origin", "refs/heads/main", `refs/tags/${tag}`]');
 		expect(() => assertAtomicPushRemoteState([
 			`${sourceCommit}\trefs/heads/main`,
@@ -462,36 +481,39 @@ describe("native release binary coverage", () => {
 		const workflow = await Bun.file(path.join(repoRoot, ".github/workflows/ci.yml")).text();
 		const native = workflowJob(workflow, "native");
 		const binaries = workflowJob(workflow, "binaries");
+		const prepare = workflowJob(workflow, "release_prepare");
 		const publish = workflowJob(workflow, "publish");
+		const finalize = workflowJob(workflow, "release_finalize");
 
 		for (const job of [native, binaries]) {
 			expect(job).toContain("startsWith(github.ref, 'refs/tags/v')");
 			expect(job).toContain("inputs.rehearsal == 'tag-build-verify'");
 			expect(job).toContain("inputs.rehearsal == 'nightly-release'");
 		}
-		expect(publish).toContain("needs.release_metadata.outputs.channel == 'stable'");
-		expect(publish).toContain("needs.release_metadata.outputs.channel == 'nightly'");
+		expect(prepare).toContain("needs.release_metadata.outputs.channel == 'stable'");
+		expect(prepare).toContain("needs.release_metadata.outputs.channel == 'nightly'");
 		expect(workflow).not.toContain("release_source_verify");
 		expect(workflow).not.toContain("verify exact source SHA passed a successful main CI run");
 
 		expect(native).toContain("needs: [release_metadata]");
 		expect(binaries).toContain("needs: [native, release_metadata]");
-		expect(publish).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
+		expect(prepare).toContain("needs: [native, binaries, release_metadata, nightly_gate]");
+		expect(publish).toContain("needs: [release_prepare, release_approval, release_metadata]");
+		expect(finalize).toContain("needs: [publish, release_metadata]");
 
-		expect(publish).toContain("--prepare-evidence --evidence-dir");
-		expect(publish).toContain("--publish-from-evidence");
-		expect(publish).toContain("gajae-production-release");
-		expect(publish).toContain("gajae-nightly-release");
-		expect(publish).toContain("Persist pre-publication package evidence");
+		expect(prepare).toContain("--prepare-evidence --evidence-dir");
+		expect(prepare).toContain("Persist pre-publication package evidence");
 		expect(publish).toContain("id-token: write");
+		expect(publish).toContain("Publish sealed tarballs to npm");
+		expect(finalize).toContain("--finalize-evidence");
 
-		expect(publish).toContain("softprops/action-gh-release");
-		expect(publish).toContain("draft: false");
-		expect(publish).toContain("release-binaries/gjc-*");
-		expect(publish).toContain("gajae-release-packages-v1.json");
-		expect(publish).toContain("gajae-release-channel-v1.json");
-		expect(publish).toContain("fail_on_unmatched_files: true");
-		expect(publish).toContain("Verify immutable GitHub Release");
+		expect(finalize).toContain("softprops/action-gh-release");
+		expect(finalize).toContain("draft: false");
+		expect(finalize).toContain("release-binaries/gjc-*");
+		expect(finalize).toContain("gajae-release-packages-v1.json");
+		expect(finalize).toContain("gajae-release-channel-v1.json");
+		expect(finalize).toContain("fail_on_unmatched_files: true");
+		expect(finalize).toContain("Verify immutable GitHub Release");
 
 		// The paranoid multi-job evidence/verify chain is gone.
 		for (const removed of [
