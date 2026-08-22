@@ -97,13 +97,17 @@ describe("Coordinator MCP runtime readiness", () => {
 			});
 			await waitFor(() => messageEndHandlerStarted, "message_end extension handler");
 
-			await session.abort();
+			// An untimed abort drains the aborted turn's event handlers, and the held
+			// message_end handler is exactly what that drain waits for, so the abort is
+			// observed in flight: awaiting it before releasing the barrier deadlocks.
+			const aborting = session.abort();
 			await Bun.sleep(25);
 			expect((await readState(stateFile)).state).toBe("running");
 			// The provider stream may have stopped already; readiness is the durable
 			// terminal state, which must remain running until the handler barrier clears.
 
 			messageEndBarrier.resolve();
+			await aborting;
 			await prompt.catch(() => {});
 			await waitFor(() => {
 				if (!fs.existsSync(stateFile)) return false;

@@ -3237,10 +3237,13 @@ export class AgentSession {
 			this.#scopedSettlementWaiters.add(check);
 			check();
 			try {
-				const waiters: Array<Promise<void>> = [wake.promise];
-				if (this.#agentEventHandlersInFlight > 0) waiters.push(this.#agentEndHandlingPromise);
-				if (this.#agentEndPublicationInFlight > 0) waiters.push(this.#agentEndPublicationPromise);
-				await Promise.race(waiters);
+				// Wait ONLY on the state-change wake. Racing the agent_end handling or
+				// publication promise here spins: an in-flight event handler that is not
+				// an agent_end (a `message_end` extension handler, say) leaves both of
+				// those already settled, so the race resolves immediately and the loop
+				// re-runs as a microtask, starving timers until the handler finishes.
+				// Every counter this loop reads wakes the scoped waiters when it drops.
+				await wake.promise;
 			} finally {
 				this.#scopedSettlementWaiters.delete(check);
 			}
@@ -4833,6 +4836,10 @@ export class AgentSession {
 				this.#agentEventHandlersInFlight = Math.max(0, this.#agentEventHandlersInFlight - 1);
 				this.#flushPendingAgentEnd();
 				agentEndHandled?.resolve();
+				// Every other in-flight counter republishes settlement when it drops; this
+				// one is read by the abort drain and the session settlement waiters too,
+				// so a handler finishing has to wake them or they wait on nothing.
+				this.#resolveSessionSettlement();
 			}
 		})();
 		if (eventLease) eventLease.track("post_prompt", "agent-session-event", handler);
