@@ -46,7 +46,7 @@ import {
 import { type ControlSurface, controlRequestFromFrame, dispatchControl } from "./control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "./control/runtime-gate";
 import { SessionSdkHost, type SessionSdkHostOptions } from "./host";
-import { isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
+import { clearAutoroutingInactive, isAutoroutingInactive, markAutoroutingInactive } from "./internal-autorouting-state";
 import { CursorRegistry, QueryHandlers, RevisionStore, type SessionSurface } from "./query";
 import {
 	createSdkCapabilities,
@@ -2536,6 +2536,9 @@ function createControlSurface(
 						markAutoroutingInactive(host);
 						if (host.started) host.emitAutoroutingInactiveNotice();
 					}
+				} else if (!isAutoroutingInactiveNow && wasAutoroutingInactive) {
+					const host = getRuntimeHost();
+					if (host) clearAutoroutingInactive(host);
 				}
 				return { patched: entries.map(([key]) => key), revision: String(configRevision.current) };
 			};

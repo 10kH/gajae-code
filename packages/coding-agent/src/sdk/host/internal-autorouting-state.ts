@@ -4,6 +4,10 @@ export function markAutoroutingInactive(target: object): void {
 	inactiveAutoroutingState.set(target, true);
 }
 
+export function clearAutoroutingInactive(target: object): void {
+	inactiveAutoroutingState.delete(target);
+}
+
 export function isAutoroutingInactive(target: unknown): boolean {
 	return typeof target === "object" && target !== null && inactiveAutoroutingState.get(target) === true;
 }

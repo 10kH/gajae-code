@@ -1199,6 +1199,7 @@ function sameCanonicalAutoroutingValue(left: unknown, right: unknown): boolean {
 
 function rawAutoroutingState(current: RawSettings): {
 	provenance?: AutoroutingProvenance;
+	setup?: AutoroutingSetup;
 	tiers?: unknown;
 } {
 	const task = current.task;
@@ -1208,6 +1209,7 @@ function rawAutoroutingState(current: RawSettings): {
 	const record = autorouting as Record<string, unknown>;
 	return {
 		provenance: record.provenance as AutoroutingProvenance | undefined,
+		setup: record.setup as AutoroutingSetup | undefined,
 		tiers: record.tiers,
 	};
 }
@@ -2454,6 +2456,7 @@ export class SelectorController {
 
 	async refreshSmartRouting(options?: { confirmHandEdit?: boolean }): Promise<SmartRoutingPreview> {
 		let preview: SmartRoutingPreview;
+		let expectedSetup: AutoroutingSetup;
 		try {
 			this.#assertSmartRoutingWritable();
 			const setup = this.ctx.settings.get("task.autorouting.setup");
@@ -2461,6 +2464,7 @@ export class SelectorController {
 			if (issues.length > 0 || setup === undefined) {
 				throw new Error("Cannot refresh smart routing without a valid recorded setup.");
 			}
+			expectedSetup = setup;
 			// Reseed the recorded declaration against the current provider priority:
 			// reorder to policy order and drop providers the catalog no longer offers.
 			// Refusing an empty result keeps a dead declaration from being persisted.
@@ -2475,11 +2479,13 @@ export class SelectorController {
 		}
 		return this.#runSmartRoutingIntent("Refresh", async () => {
 			await this.ctx.settings.commitAtomicBatchWithCurrent(current => {
-				this.#assertSmartRoutingNotHandEdited(
-					preview,
-					options?.confirmHandEdit === true,
-					rawAutoroutingState(current),
-				);
+				const currentState = rawAutoroutingState(current);
+				if (!sameCanonicalAutoroutingValue(currentState.setup, expectedSetup)) {
+					throw new Error(
+						"Smart-routing setup changed while refresh was preparing; refresh again to use current settings.",
+					);
+				}
+				this.#assertSmartRoutingNotHandEdited(preview, options?.confirmHandEdit === true, currentState);
 				return buildAutoroutingSettingsBatch({
 					tiers: preview.tiers,
 					setup: preview.setup,
