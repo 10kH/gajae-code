@@ -58,6 +58,17 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): voi
 	if (actual.length !== keys.length || actual.some(key => !keys.includes(key))) throw virtualIntegrationError("malformed evidence");
 }
 
+export function parseGreenDevRuns(value: unknown): GreenDevRun[] {
+	if (!isRecord(value) || !Array.isArray(value.workflow_runs) || !value.workflow_runs.every(run => isRecord(run))) {
+		throw virtualIntegrationError("green dev run list malformed");
+	}
+	return value.workflow_runs.map(run => ({
+		headSha: String(run.head_sha ?? ""),
+		databaseId: Number(run.id),
+		conclusion: String(run.conclusion ?? ""),
+	}));
+}
+
 function requiredEnv(name: string): string {
 	const value = Bun.env[name]?.trim();
 	if (!value) throw virtualIntegrationError(`missing ${name}`);
@@ -337,8 +348,9 @@ export async function runCanaries(options: {
 
 async function selectAuthorityBaseFromEnv(): Promise<AuthorityBase> {
 	const headSha = requiredEnv("CI_VI_HEAD_SHA");
+	const repository = requiredEnv("GITHUB_REPOSITORY");
 	// Fetch full history so ancestor checks resolve for any candidate base.
-	const listResult = await $`gh run list --workflow "Dev CI" --branch dev --event push --status success --limit 100 --json headSha,databaseId,conclusion`
+	const listResult = await $`gh api --method GET ${`repos/${repository}/actions/workflows/dev-ci.yml/runs?branch=dev&event=push&status=success&per_page=100`}`
 		.cwd(repoRoot)
 		.quiet()
 		.nothrow();
@@ -349,14 +361,7 @@ async function selectAuthorityBaseFromEnv(): Promise<AuthorityBase> {
 	} catch {
 		throw virtualIntegrationError("green dev run list malformed");
 	}
-	if (!Array.isArray(greenRuns) || !greenRuns.every(run => isRecord(run))) {
-		throw virtualIntegrationError("green dev run list malformed");
-	}
-	const typedGreenRuns: GreenDevRun[] = greenRuns.map(run => ({
-		headSha: String((run as Record<string, unknown>).headSha ?? ""),
-		databaseId: Number((run as Record<string, unknown>).databaseId),
-		conclusion: String((run as Record<string, unknown>).conclusion ?? ""),
-	}));
+	const typedGreenRuns = parseGreenDevRuns(greenRuns);
 	// Build the ancestor set of the candidate head once, then let the pure
 	// selector choose the newest reachable green dev push. rev-list is exact
 	// and bounded by the commit graph, so an unrelated green SHA can never be
