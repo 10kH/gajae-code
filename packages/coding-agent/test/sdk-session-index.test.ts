@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
+import { FileLockTestHooks } from "../src/config/file-lock";
 import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 
@@ -579,6 +580,16 @@ describe("SDK session index", () => {
 		const replay = await new SessionIndex(dir).open();
 		expect(replay.listSessions().warnings).toEqual([]);
 		expect(replay.listSessions().sessions.map(session => session.sessionId)).toEqual(["one", "two", "three", "four"]);
+	});
+	it("refreshes a cold reader from a compacted snapshot", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-cold-refresh-"));
+		const writer = await new SessionIndex(dir).open();
+		await writer.append(event("snapshot-only"));
+		await writer.compact();
+
+		const cold = new SessionIndex(dir);
+		await cold.refresh();
+		expect(cold.listSessions().sessions.map(session => session.sessionId)).toEqual(["snapshot-only"]);
 	});
 	it("rotates repeatedly while concurrent writers and readers preserve every event", async () => {
 		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-"));
@@ -1348,5 +1359,406 @@ describe("SDK session index", () => {
 		expect(index.listSessions().sessions).toEqual([
 			expect.objectContaining({ sessionId: "deleted", endpointGeneration: registration.endpointGeneration + 1 }),
 		]);
+	});
+	it("refreshIfChanged skips the locked rescan while the index is unchanged (#4689)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-"));
+		await new SessionIndex(dir).append(event("polled"));
+		const index = new SessionIndex(dir);
+		// First poll establishes the baseline stamp and loads state.
+		expect(await index.refreshIfChanged()).toBe(true);
+		expect(index.listSessions().sessions).toEqual([expect.objectContaining({ sessionId: "polled" })]);
+
+		// An unchanged index must not be re-read: count log reads across polls.
+		const logPath = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const readFile = fs.readFile.bind(fs);
+		let logReads = 0;
+		const spy = vi.spyOn(fs, "readFile").mockImplementation((async (file: unknown, options?: unknown) => {
+			if (path.resolve(String(file)) === logPath) logReads++;
+			return await readFile(file as Parameters<typeof fs.readFile>[0], options as BufferEncoding);
+		}) as typeof fs.readFile);
+		// Reads alone are not the regression that matters: the idle cost this fix
+		// removes is contention on the machine-global session-index lock. A change
+		// that put the unchanged path back under `withFileLock()` without reading
+		// would satisfy `logReads === 0` while restoring the exact starvation.
+		let lockAttempts = 0;
+		FileLockTestHooks.afterParentMkdir = () => {
+			lockAttempts++;
+		};
+		try {
+			for (let i = 0; i < 5; i++) expect(await index.refreshIfChanged()).toBe(false);
+			expect(logReads).toBe(0);
+			expect(lockAttempts).toBe(0);
+			expect(index.listSessions().sessions).toEqual([expect.objectContaining({ sessionId: "polled" })]);
+		} finally {
+			FileLockTestHooks.afterParentMkdir = undefined;
+			spy.mockRestore();
+		}
+	});
+	it("a changed index still takes the session-index lock, so the no-lock assertion discriminates (#4689)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-lock-"));
+		const writer = new SessionIndex(dir);
+		await writer.append(event("locked"));
+		const index = new SessionIndex(dir);
+		expect(await index.refreshIfChanged()).toBe(true);
+
+		let lockAttempts = 0;
+		FileLockTestHooks.afterParentMkdir = () => {
+			lockAttempts++;
+		};
+		try {
+			// Control: an unchanged poll is lock-free.
+			expect(await index.refreshIfChanged()).toBe(false);
+			expect(lockAttempts).toBe(0);
+			// A durable append must still reclassify under the index lock, proving the
+			// zero-lock assertion above is a real behavioral fence and not vacuous.
+			await writer.append(event("locked-2"));
+			lockAttempts = 0;
+			expect(await index.refreshIfChanged()).toBe(true);
+			expect(lockAttempts).toBeGreaterThan(0);
+			expect(index.indexSeq).toBe(writer.indexSeq);
+		} finally {
+			FileLockTestHooks.afterParentMkdir = undefined;
+		}
+	});
+	it("refreshIfChanged reloads after an external append and after log removal (#4689)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-reload-"));
+		const writer = new SessionIndex(dir);
+		await writer.append(event("first"));
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions).toEqual([expect.objectContaining({ sessionId: "first" })]);
+
+		await writer.append(event("second"));
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.indexSeq).toBe(writer.indexSeq);
+
+		await fs.rm(path.join(dir, "sdk", "sessions", "index.jsonl"));
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions).toEqual([]);
+	});
+	it("refreshIfChanged observes same-instance rotation compaction (#4689 review)", async () => {
+		// A self-rotation resets the log offset; the fast path must never accept
+		// the new stamp while pre-compaction events are still resident.
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-rotate-"));
+		// maxRows makes rotation drop rows, so stale pre-compaction memory is
+		// distinguishable from the compacted on-disk truth.
+		const index = new SessionIndex(dir, { maxRows: 10 });
+		// Direct-write a valid log right at the rotation threshold so the next
+		// append rotates. 15k small terminal rows ≈ 4.2 MiB.
+		const lines: string[] = [];
+		let seq = 0;
+		const now = Date.now();
+		for (let i = 0; i < 7500; i++) {
+			for (const type of ["host_registered", "host_unregistered"] as const) {
+				const unsigned = {
+					version: SDK_STATE_VERSION,
+					indexSeq: ++seq,
+					type,
+					sessionId: `old-${i}`,
+					locator: { repo: "/tmp/old", stateRoot: "/tmp/old/.gjc/state" },
+					endpointGeneration: 1,
+					pid: 2147480000 + i,
+					ts: now - (7500 - i) * 2000,
+				};
+				lines.push(
+					JSON.stringify({
+						...unsigned,
+						checksum: sessionIndexChecksum(unsigned as Parameters<typeof sessionIndexChecksum>[0]),
+					}),
+				);
+			}
+		}
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(sessionsDir, "index.jsonl"), `${lines.join("\n")}\n`);
+		await index.open();
+		expect(index.indexSeq).toBe(seq);
+		// This append crosses the 4 MiB rotation bound and rotates in-instance.
+		await index.append(event("trigger"));
+		const fresh = await new SessionIndex(dir, { maxRows: 10 }).open();
+		// Compaction must have dropped the bulk of the seeded rows.
+		expect(fresh.listSessions().sessions.length).toBeLessThan(100);
+		// The rotated instance must agree with a from-disk reader exactly.
+		expect(index.listSessions().sessions).toEqual(fresh.listSessions().sessions);
+		expect(index.indexSeq).toBe(fresh.indexSeq);
+		// And the fast path must not resurrect pre-compaction state.
+		expect(await index.refreshIfChanged()).toBe(false);
+		expect(index.listSessions().sessions).toEqual(fresh.listSessions().sessions);
+	});
+	it("refreshIfChanged never fast-paths a corrupt suffix (#4689 review)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-corrupt-"));
+		const writer = new SessionIndex(dir);
+		await writer.append(event("corrupt-me"));
+		await fs.appendFile(path.join(dir, "sdk", "sessions", "index.jsonl"), "broken\n");
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().warnings).not.toHaveLength(0);
+		// Corrupt state always reloads instead of taking the stamp fast path.
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().warnings).not.toHaveLength(0);
+	});
+	it("refreshIfChanged detects a same-size rename-replace whose timestamps collide (#4689)", async () => {
+		// The cheap path must not depend on timestamp resolution. A same-size
+		// rename-replace inside one filesystem tick reports identical size,
+		// mtimeMs and ctimeMs (measured here: the overwhelming majority of
+		// attempts), so a stamp built only from size+timestamps would report
+		// "unchanged" after a real snapshot replacement. The cooperative writer
+		// protocol replaces files by rename, which always installs a new inode,
+		// so the inode is the field that makes this detectable.
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-ino-"));
+		const writer = new SessionIndex(dir);
+		const first = await writer.append(event("ino-old"));
+		await writer.snapshot();
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["ino-old"]);
+
+		const snapPath = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+		const buildPayload = (sessionId: string) => {
+			const replacement = {
+				version: SDK_STATE_VERSION,
+				indexSeq: first.indexSeq,
+				type: "host_registered" as const,
+				sessionId,
+				locator: { repo: "r", stateRoot: "q" },
+				endpointGeneration: 1,
+				pid: process.pid,
+				ts: first.ts,
+			};
+			return JSON.stringify({
+				version: 3,
+				indexSeq: first.indexSeq,
+				events: [
+					{
+						...replacement,
+						checksum: sessionIndexChecksum(replacement as Parameters<typeof sessionIndexChecksum>[0]),
+					},
+				],
+			});
+		};
+		// Reproduce a natural timestamp collision: replace by rename until the
+		// post-replacement stat is indistinguishable from the pre-replacement
+		// stat on size+mtimeMs+ctimeMs, leaving the inode as the only signal.
+		let collided = false;
+		let detectedOnCollision = false;
+		let expected = "";
+		for (let attempt = 0; attempt < 200 && !collided; attempt++) {
+			const before = await fs.stat(snapPath);
+			expected = `ino-new-${String(attempt).padStart(3, "0")}`;
+			const payload = buildPayload(expected);
+			const staging = `${snapPath}.collide-${attempt}.tmp`;
+			await fs.writeFile(staging, payload);
+			await fs.rename(staging, snapPath);
+			const after = await fs.stat(snapPath);
+			collided =
+				after.size === before.size &&
+				after.mtimeMs === before.mtimeMs &&
+				after.ctimeMs === before.ctimeMs &&
+				after.ino !== before.ino;
+			// Always consume the poll from THIS iteration and keep its result:
+			// asserting a later refresh would test a call that sees no change.
+			const detected = await reader.refreshIfChanged();
+			if (collided) detectedOnCollision = detected;
+		}
+		// Deterministic evidence (#4730 review): the inode-difference branch must
+		// actually have been the only distinguishing signal. If this filesystem
+		// reports timestamps fine-grained enough that a same-size rename-replace
+		// is never metadata-identical, say so explicitly instead of silently
+		// passing through a generic path that proves nothing.
+		expect(collided).toBe(true);
+		expect(detectedOnCollision).toBe(true);
+		// Only the inode changed, and the poll from that exact iteration reported
+		// a change and fully replayed the replacement snapshot.
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual([expected]);
+	});
+	it("log growth plus an inode-only snapshot replacement replays instead of tailing (#4730 review)", async () => {
+		// The locked classifier may only tail when this is the SAME log grown in
+		// place AND the SAME snapshot file. A rename-over installs a new inode
+		// while size and timestamps can still match, so the combination -- log
+		// grew, snapshot swapped for a same-size/same-timestamp file -- must
+		// replay; tailing would cache a stale compacted projection and serve it as
+		// current. Each half is covered separately elsewhere; this pins the
+		// combination, and it is asserted through the real reader so a
+		// misclassification shows up as a divergent projection.
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-tail-ino-"));
+		const writer = new SessionIndex(dir);
+		const first = await writer.append(event("combo-a"));
+		await writer.snapshot();
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["combo-a"]);
+
+		const snapPath = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+		const before = await fs.stat(snapPath);
+		// Build a VALID signed snapshot of identical byte length naming a
+		// different session, so only a real replay can observe it.
+		const target = Number(before.size);
+		let swapped = "";
+		for (let pad = 0; pad < 500 && !swapped; pad++) {
+			const replacement = {
+				version: SDK_STATE_VERSION,
+				indexSeq: first.indexSeq,
+				type: "host_registered" as const,
+				sessionId: "combo-z",
+				locator: { repo: "r".repeat(1 + pad), stateRoot: "q" },
+				endpointGeneration: 1,
+				pid: process.pid,
+				ts: first.ts,
+			};
+			const candidate = JSON.stringify({
+				version: 3,
+				indexSeq: first.indexSeq,
+				events: [
+					{
+						...replacement,
+						checksum: sessionIndexChecksum(replacement as Parameters<typeof sessionIndexChecksum>[0]),
+					},
+				],
+			});
+			if (Buffer.byteLength(candidate) === target) swapped = candidate;
+		}
+		expect(swapped.length).toBeGreaterThan(0);
+
+		// Grow the log through the real writer so the log side looks append-only,
+		// then rename-replace the snapshot: same size, new inode.
+		await writer.append(event("combo-b"));
+		const staging = `${snapPath}.combo.tmp`;
+		await fs.writeFile(staging, swapped);
+		await fs.rename(staging, snapPath);
+		const after = await fs.stat(snapPath);
+		expect(Number(after.size)).toBe(target);
+		expect(after.ino).not.toBe(before.ino);
+
+		// The reader must converge on the writer's durable sequence and observe the
+		// replaced snapshot, not a tail-cached prefix of the old one.
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.indexSeq).toBe(writer.indexSeq);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toContain("combo-z");
+	});
+	it("refreshIfChanged fully replays same-size rewrites and snapshot-only changes (#4689 QA)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-rewrite-"));
+		const writer = new SessionIndex(dir);
+		await writer.append(event("alpha"));
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["alpha"]);
+
+		// Same-size in-place rewrite of the log: stamp changes, tail cannot see it.
+		const logPath = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const original = (await fs.readFile(logPath, "utf8")).trim();
+		const originalParsed = JSON.parse(original);
+		const rewritten: Record<string, unknown> = {
+			...originalParsed,
+			sessionId: "omega!",
+			ts: originalParsed.ts + 1,
+		};
+		delete rewritten.checksum;
+		// Pad to the identical byte length so size alone cannot detect the rewrite.
+		const lineFor = (obj: Record<string, unknown>) =>
+			`${JSON.stringify({ ...obj, checksum: sessionIndexChecksum(obj as never) })}\n`;
+		const target = original.length + 1;
+		// Tune sessionId/repo so the rewrite has the identical byte length and
+		// size alone cannot detect it.
+		while (lineFor(rewritten).length > target && (rewritten.sessionId as string).length > 1)
+			rewritten.sessionId = (rewritten.sessionId as string).slice(0, -1);
+		const pad = target - lineFor(rewritten).length;
+		expect(pad).toBeGreaterThanOrEqual(0);
+		if (pad > 0)
+			rewritten.locator = {
+				...(rewritten.locator as { repo: string; stateRoot: string }),
+				repo: `${(rewritten.locator as { repo: string }).repo}${"x".repeat(pad)}`,
+			};
+		const line = lineFor(rewritten);
+		expect(line.length).toBe(target);
+		await fs.writeFile(logPath, line);
+		// The stamp detects same-size rewrites by mtime/ctime; a fast test can
+		// write within the original tick, so move the timestamp explicitly.
+		const later = new Date(Date.now() + 5000);
+		await fs.utimes(logPath, later, later);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual([String(rewritten.sessionId)]);
+	});
+	it("refreshIfChanged fully replays a snapshot-only replacement (#4689 QA)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-snaponly-"));
+		const writer = new SessionIndex(dir);
+		const first = await writer.append(event("snap-old"));
+		await writer.snapshot();
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["snap-old"]);
+
+		// Replace only the snapshot payload; log untouched.
+		const replacement = {
+			version: SDK_STATE_VERSION,
+			indexSeq: first.indexSeq,
+			type: "host_registered" as const,
+			sessionId: "snap-new",
+			locator: { repo: "r", stateRoot: "q" },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: first.ts,
+		};
+		const snapshot = {
+			version: 3,
+			indexSeq: first.indexSeq,
+			events: [
+				{
+					...replacement,
+					checksum: sessionIndexChecksum(replacement as Parameters<typeof sessionIndexChecksum>[0]),
+				},
+			],
+		};
+		const snapFile = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+		await fs.writeFile(snapFile, JSON.stringify(snapshot));
+		const snapLater = new Date(Date.now() + 5000);
+		await fs.utimes(snapFile, snapLater, snapLater);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["snap-new"]);
+	});
+	it("refreshIfChanged reclassifies under the lock when a compaction lands mid-poll (#4689 review)", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-poll-race-"));
+		const logPath = path.join(dir, "sdk", "sessions", "index.jsonl");
+		const writer = new SessionIndex(dir);
+		await writer.append(event("base"));
+		await writer.snapshot();
+		// Post-rotation shape for the reader: snapshot carries "base", log is empty.
+		await fs.writeFile(logPath, "");
+		const reader = new SessionIndex(dir);
+		expect(await reader.refreshIfChanged()).toBe(true);
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["base"]);
+
+		// Append-only growth from the reader's viewpoint: log grows, snapshot untouched.
+		await writer.append(event("late"));
+		// A compaction lands between the reader's unlocked stat and its locked
+		// classification: snapshot rewritten through both events, log replaced empty.
+		const originalHook = FileLockTestHooks.afterParentMkdir;
+		let interleaved = false;
+		FileLockTestHooks.afterParentMkdir = async () => {
+			if (interleaved) return;
+			interleaved = true;
+			// Rotation shape, with raw file ops only (a SessionIndex op here would
+			// queue behind this very lock attempt on the per-path op queue). The
+			// existing snapshot carries "base"; the log carries only "late" (the
+			// log was truncated after the first snapshot, emulating rotation).
+			const snapPath = path.join(dir, "sdk", "sessions", "index.snapshot.json");
+			const prior = JSON.parse(await fs.readFile(snapPath, "utf8"));
+			const tail = (await fs.readFile(logPath, "utf8"))
+				.split("\n")
+				.filter(Boolean)
+				.map(line => JSON.parse(line));
+			const events = [...prior.events, ...tail];
+			const snap = { version: 3, indexSeq: events.at(-1).indexSeq, events };
+			await fs.writeFile(snapPath, JSON.stringify(snap));
+			await fs.writeFile(logPath, "");
+		};
+		try {
+			expect(await reader.refreshIfChanged()).toBe(true);
+		} finally {
+			FileLockTestHooks.afterParentMkdir = originalHook;
+		}
+		expect(interleaved).toBe(true);
+		// Without locked reclassification the tail read sees an empty log at
+		// offset 0 and keeps the stale projection; the locked path must replay.
+		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["base", "late"]);
 	});
 });

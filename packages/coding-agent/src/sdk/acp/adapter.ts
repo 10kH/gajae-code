@@ -129,6 +129,21 @@ function isLifecycleOperation(operation: string): boolean {
  * Pure ACP-to-SDK adapter. It deliberately owns neither an AgentSession nor an
  * ACP bridge: all session work is performed through authenticated v3 frames.
  */
+/**
+ * Provider leases are renewed only through the maintenance capability (#4689).
+ * An attachment without it must be rejected at the admission boundary with an
+ * explicit migration error: falling back to `send()` would restore the 5s
+ * heartbeat-forced locked index rescan, and accepting it silently would leave
+ * live leases quietly un-renewed until they expire.
+ */
+function assertMaintenanceCapability(attachment: SessionAttachment): void {
+	if (typeof attachment.sendMaintenance === "function") return;
+	throw new AcpSdkAdapterError(
+		"operation_prohibited",
+		"SDK session attachment does not implement sendMaintenance(leaseId); provider leases cannot be renewed. Update the attachment implementation to the current SessionAttachment capability.",
+	);
+}
+
 export class AcpSdkAdapter {
 	readonly #client?: SdkClient;
 	readonly #router?: SessionRouter;
@@ -186,6 +201,11 @@ export class AcpSdkAdapter {
 	acceptAttachment(attachment: SessionAttachment): void {
 		if (!this.#router || attachment.sessionId !== this.#sessionId)
 			throw new AcpSdkAdapterError("invalid_input", "ACP attachment does not match this session adapter.");
+		// Reject an attachment that cannot renew provider leases at the handoff
+		// boundary (#4730 review), not just at start(): acceptAttachment is the
+		// single admission point for the replacement/ready paths too, so a
+		// capability-less replacement can never silently take over live leases.
+		assertMaintenanceCapability(attachment);
 		this.#abortActiveReverseRequests();
 		this.#attachment = attachment;
 		this.#connectionId = undefined;
@@ -204,6 +224,11 @@ export class AcpSdkAdapter {
 	}
 
 	async attachmentReady(attachment: SessionAttachment): Promise<void> {
+		// Guard BEFORE the branch (#4730 review): the same-object path below never
+		// reaches acceptAttachment, so guarding only inside that one arm let a
+		// current attachment without the maintenance capability activate providers
+		// and acquire leases it can never renew.
+		assertMaintenanceCapability(attachment);
 		if (this.#attachment !== attachment) this.acceptAttachment(attachment);
 		else {
 			this.#abortActiveReverseRequests();
@@ -253,6 +278,7 @@ export class AcpSdkAdapter {
 		}
 		if (this.#router) {
 			if (!this.#attachment?.isCurrent()) return;
+			if (this.#attachment) assertMaintenanceCapability(this.#attachment);
 			await this.#activateProviders();
 		} else {
 			await this.#activateProviders();
@@ -578,13 +604,32 @@ export class AcpSdkAdapter {
 		if (!attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 		await Promise.resolve(attachment.send(frame));
 	}
+	/** Lease heartbeats are idempotent maintenance: they skip the authority reconcile (#4689). */
+	async #sendLeaseHeartbeat(leaseId: string): Promise<void> {
+		if (!this.#router)
+			throw new AcpSdkAdapterError(
+				"operation_prohibited",
+				"Live session sends require the current Router attachment.",
+			);
+		const attachment = this.#attachment;
+		if (!attachment?.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+		// Fail closed when the capability is absent (#4730 review). Falling back to
+		// send() would put the 5s heartbeat back on the locked authority reconcile,
+		// which is the exact idle cost this fix removes.
+		if (typeof attachment.sendMaintenance !== "function")
+			throw new SessionRouterError(
+				"pre_send",
+				"SDK session attachment does not support provider-lease maintenance heartbeats.",
+			);
+		await Promise.resolve(attachment.sendMaintenance(leaseId));
+	}
 
 	async #heartbeatLeases(): Promise<void> {
 		if (this.#closed) return;
 		try {
 			if (!this.#router) return;
 			if (!this.#attachment?.isCurrent()) return;
-			for (const leaseId of this.#leases.values()) await this.#sendSession({ type: "provider_heartbeat", leaseId });
+			for (const leaseId of this.#leases.values()) await this.#sendLeaseHeartbeat(leaseId);
 		} catch (error) {
 			if (error instanceof SessionRouterError && error.phase === "pre_send") return;
 			this.#reportReconnectFailure(error);

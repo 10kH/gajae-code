@@ -1287,17 +1287,17 @@ function normalizeSuppressedSelector(selector: string): string {
 	return `${parsed.provider}/${parsed.id}`;
 }
 
-function getDisabledProviderIdsFromSettings(): Set<string> {
+function getDisabledProviderIdsFromSettings(settingsReader: Pick<Settings, "get"> = settings): Set<string> {
 	try {
-		return new Set(settings.get("disabledProviders"));
+		return new Set(settingsReader.get("disabledProviders"));
 	} catch {
 		return new Set();
 	}
 }
 
-function getConfiguredProviderOrderFromSettings(): string[] {
+function getConfiguredProviderOrderFromSettings(settingsReader: Pick<Settings, "getGlobal"> = settings): string[] {
 	try {
-		const configured = settings.getGlobal("modelProviderOrder");
+		const configured = settingsReader.getGlobal("modelProviderOrder");
 		return Array.isArray(configured) ? configured.filter((value): value is string => typeof value === "string") : [];
 	} catch {
 		return [];
@@ -1387,6 +1387,7 @@ export class ModelRegistry {
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
+	#settings: Pick<Settings, "get" | "getGlobal">;
 	#lastStaticLoadMtime: number | null = null;
 	#lastStaticLoadEnvironmentFingerprint: string | undefined;
 	#staticModelsLoaded = false;
@@ -1414,7 +1415,9 @@ export class ModelRegistry {
 	constructor(
 		readonly authStorage: AuthStorage,
 		modelsPath?: string,
+		registrySettings?: Pick<Settings, "get" | "getGlobal">,
 	) {
+		this.#settings = registrySettings ?? settings;
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
 		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
@@ -1432,6 +1435,11 @@ export class ModelRegistry {
 		return () => {
 			this.#catalogChangeListeners.delete(listener);
 		};
+	}
+
+	/** Replace the read-only settings snapshot used by profile-scoped resolution. */
+	setScopedSettings(settingsReader: Pick<Settings, "get" | "getGlobal">): void {
+		this.#settings = settingsReader;
 	}
 
 	/**
@@ -1504,7 +1512,7 @@ export class ModelRegistry {
 
 	#reloadStaticModels(): void {
 		const currentMtime = this.#modelsConfigFile.getMtimeMs();
-		const disabledProviderKey = [...getDisabledProviderIdsFromSettings()].sort().join("\u0000");
+		const disabledProviderKey = [...getDisabledProviderIdsFromSettings(this.#settings)].sort().join("\u0000");
 		const environmentFingerprint = this.#getStaticLoadEnvironmentFingerprint();
 		if (
 			this.#staticModelsLoaded &&
@@ -1891,7 +1899,7 @@ export class ModelRegistry {
 	}
 
 	#addImplicitDiscoverableProviders(configuredProviders: Set<string>): void {
-		const disabledProviders = getDisabledProviderIdsFromSettings();
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		if (!configuredProviders.has("ollama") && !disabledProviders.has("ollama")) {
 			this.#discoveryManager.addProvider({
 				provider: "ollama",
@@ -2273,7 +2281,7 @@ export class ModelRegistry {
 		strategy: ModelRefreshStrategy,
 		providerFilter?: ReadonlySet<string>,
 	): Promise<void> {
-		const disabledProviders = getDisabledProviderIdsFromSettings();
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const selectedDiscoverableProviders = (
 			providerFilter
 				? this.#discoveryManager.providers.filter(provider => providerFilter.has(provider.provider))
@@ -2725,7 +2733,7 @@ export class ModelRegistry {
 				},
 			},
 		];
-		const disabledProviders = getDisabledProviderIdsFromSettings();
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const standardProviderDescriptors = PROVIDER_DESCRIPTORS.filter(
 			descriptor => !disabledProviders.has(descriptor.providerId) && !excludedProviderIds.has(descriptor.providerId),
 		);
@@ -3654,12 +3662,10 @@ export class ModelRegistry {
 		return [...this.#configuredProviderIds];
 	}
 
-	#isModelAvailable(
-		model: Model<Api>,
-		disabledProviders: ReadonlySet<string> = getDisabledProviderIdsFromSettings(),
-	): boolean {
+	#isModelAvailable(model: Model<Api>, disabledProviders?: ReadonlySet<string>): boolean {
+		const disabled = disabledProviders ?? getDisabledProviderIdsFromSettings(this.#settings);
 		return (
-			!disabledProviders.has(model.provider) &&
+			!disabled.has(model.provider) &&
 			(this.#keylessProviders.has(model.provider) || this.authStorage.hasAuth(model.provider))
 		);
 	}
@@ -3672,7 +3678,7 @@ export class ModelRegistry {
 			candidateKeys: options?.candidates
 				? new Set(options.candidates.map(candidate => formatCanonicalVariantSelector(candidate)))
 				: undefined,
-			disabledProviders: options?.availableOnly ? getDisabledProviderIdsFromSettings() : undefined,
+			disabledProviders: options?.availableOnly ? getDisabledProviderIdsFromSettings(this.#settings) : undefined,
 		};
 	}
 
@@ -3691,7 +3697,7 @@ export class ModelRegistry {
 			plan !== undefined
 				? plan.disabledProviders
 				: options?.availableOnly
-					? getDisabledProviderIdsFromSettings()
+					? getDisabledProviderIdsFromSettings(this.#settings)
 					: undefined;
 		return record.variants.filter(variant => {
 			if (candidateKeys && !candidateKeys.has(variant.selector)) return false;
@@ -3739,7 +3745,7 @@ export class ModelRegistry {
 			effectiveAuth.set(providerKey, this.#effectiveProviderAuth(model.provider, sessionId));
 		}
 		return createProviderSelectionPolicy({
-			explicitProviderOrder: getConfiguredProviderOrderFromSettings(),
+			explicitProviderOrder: getConfiguredProviderOrderFromSettings(this.#settings),
 			effectiveAuth,
 			catalogProviders,
 			catalogModels,
@@ -4064,7 +4070,7 @@ export class ModelRegistry {
 	 * This is a fast check that doesn't refresh OAuth tokens.
 	 */
 	getAvailable(): Model<Api>[] {
-		const disabledProviders = getDisabledProviderIdsFromSettings();
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		const disabledProviderKey = [...disabledProviders].sort().join("\u0000");
 		const envFingerprint = envAvailabilityFingerprint();
 		if (
@@ -4200,7 +4206,7 @@ export class ModelRegistry {
 	getActiveProviders(): ActiveProviderDescriptor[] {
 		try {
 			const descriptors: ActiveProviderDescriptor[] = [];
-			const disabledProviders = getDisabledProviderIdsFromSettings();
+			const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 			const available = this.#models.filter(model => this.#isModelAvailable(model, disabledProviders));
 			for (const model of available) {
 				const connectionKind = this.#activeConnectionKind(model);
@@ -4237,7 +4243,7 @@ export class ModelRegistry {
 	}
 
 	getDiscoverableProviders(): string[] {
-		const disabledProviders = getDisabledProviderIdsFromSettings();
+		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
 		return this.#discoveryManager.providers
 			.filter(provider => !disabledProviders.has(provider.provider))
 			.map(provider => provider.provider);

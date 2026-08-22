@@ -38,6 +38,7 @@ import {
 import type { SessionIndex } from "../src/sdk/broker/session-index";
 import { UnsupportedStateVersionError } from "../src/sdk/broker/state-version";
 import { type SdkClient, SdkClientError } from "../src/sdk/client/client";
+import { resolveSdkHostModel, type SdkHostModelRegistryLoader } from "../src/sdk/host/model-pin";
 import { type SessionRouterClient, SessionRouterError } from "../src/sdk/router";
 import { installExactIdentityNatives } from "./helpers/exact-identity-natives";
 import {
@@ -97,10 +98,10 @@ type SdkControlServerOptions = {
 	>["eventWebhookDelivery"];
 	/** Extra env layered into the coordinator server env for webhook opt-in tests. */
 	eventWebhookEnv?: Record<string, string>;
-	/** Injectable model registry for coordinator `model` pin tests. */
-	modelRegistry?: NonNullable<
+	/** Injectable host model resolver for coordinator `model` pin tests. */
+	modelResolver?: NonNullable<
 		NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
-	>["resolveModelRegistry"];
+	>["resolveModelPin"];
 };
 function lifecycleControls(controls: SdkControl[]): SdkControl[] {
 	return controls.filter(control => control.operation !== "session.list");
@@ -250,6 +251,7 @@ async function createSdkControlServer(
 	const routerIndex = {
 		open: async () => {},
 		refresh: async () => {},
+		refreshIfChanged: async () => true,
 		listSessions: () => ({
 			indexSeq: 1,
 			sessions: brokerSessions.map(session => {
@@ -286,7 +288,7 @@ async function createSdkControlServer(
 		services: {
 			getAgentDir: () => agentDir,
 			resolveModelProfiles: () => new Map([["codex-eco", { name: "codex-eco" }]]),
-			...(serverOptions.modelRegistry ? { resolveModelRegistry: serverOptions.modelRegistry } : {}),
+			...(serverOptions.modelResolver ? { resolveModelPin: serverOptions.modelResolver } : {}),
 			canonicalizePath: serverOptions.canonicalizePath,
 			codexTransportFactory: serverOptions.codexTransportFactory,
 			eventWebhookDelivery: serverOptions.eventWebhookDelivery,
@@ -1576,16 +1578,16 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 	});
 	const pinnedModel = (provider: string, id: string): Model =>
 		({ provider, id, name: id, api: "openai-responses", contextWindow: 1000, maxTokens: 1000 }) as Model;
-	const pinnedModelRegistry = (models: Model[]) =>
-		(() => ({ getAll: () => models })) as unknown as NonNullable<
-			NonNullable<Parameters<typeof createCoordinatorMcpServer>[0]>["services"]
-		>["resolveModelRegistry"];
+	const pinnedModelResolver = (models: Model[]) => {
+		const registry = (() => ({ getAll: () => models })) as unknown as SdkHostModelRegistryLoader;
+		return (raw: unknown) => resolveSdkHostModel(raw, registry);
+	};
 
 	it("passes a resolved explicit model pin into the SDK lifecycle create request and persists it with the session", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
-			modelRegistry: pinnedModelRegistry([
+			modelResolver: pinnedModelResolver([
 				pinnedModel("cursor", "claude-fable-5-xhigh"),
 				pinnedModel("cursor", "composer-2.5"),
 			]),
@@ -1624,7 +1626,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
-			modelRegistry: pinnedModelRegistry([pinnedModel("cursor", "default")]),
+			modelResolver: pinnedModelResolver([pinnedModel("cursor", "default")]),
 		});
 		const started = await server.callTool("gjc_coordinator_start_session", {
 			cwd: root,
@@ -1653,7 +1655,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
-			modelRegistry: pinnedModelRegistry([pinnedModel("cursor", "claude-fable-5-xhigh")]),
+			modelResolver: pinnedModelResolver([pinnedModel("cursor", "claude-fable-5-xhigh")]),
 		});
 		const rejected = await server.callTool("gjc_coordinator_start_session", {
 			cwd: root,
@@ -1676,7 +1678,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
-			modelRegistry: pinnedModelRegistry([pinnedModel("cursor", "composer-2.5")]),
+			modelResolver: pinnedModelResolver([pinnedModel("cursor", "composer-2.5")]),
 		});
 		const delegated = await server.callTool("gjc_delegate_plan", {
 			cwd: root,
@@ -1698,6 +1700,62 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			},
 		]);
 	});
+
+	it("routes the default model pin through the SDK broker host boundary", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(root, controls, [], undefined, undefined, undefined, undefined, {
+			globalResult: operation =>
+				operation === "model.resolve" ? { ok: true, result: { ok: true, model: "cursor/default" } } : undefined,
+		});
+
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			model: "cursor/default",
+			idempotency_key: "broker-model-pin",
+			allow_mutation: true,
+		});
+
+		expect(started).toMatchObject({ ok: true, session: { model: "cursor/default" } });
+		expect(lifecycleControls(controls).map(control => control.operation)).toEqual([
+			"model.resolve",
+			"session.create",
+		]);
+		expect(controls.find(control => control.operation === "model.resolve")?.input).toMatchObject({ cwd: root });
+	});
+
+	it("passes the planned worktree target to model pin resolution", async () => {
+		const root = await tempRoot();
+		const controls: SdkControl[] = [];
+		const server = await createSdkControlServer(
+			root,
+			controls,
+			[],
+			undefined,
+			undefined,
+			"gjc --worktree",
+			undefined,
+			{
+				globalResult: (operation, input) => {
+					if (operation === "model.resolve") {
+						expect(input.target).toMatchObject({ path: root, worktree: { enabled: true } });
+						return { ok: true, result: { ok: true, model: "cursor/default" } };
+					}
+					return undefined;
+				},
+			},
+		);
+
+		const started = await server.callTool("gjc_coordinator_start_session", {
+			cwd: root,
+			model: "cursor/default",
+			idempotency_key: "broker-model-pin-worktree",
+			allow_mutation: true,
+		});
+
+		expect(started).toMatchObject({ ok: true, session: { model: "cursor/default" } });
+	});
+
 	it("keeps lifecycle endpoint credentials out of start_session results", async () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
