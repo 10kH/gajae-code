@@ -23,7 +23,13 @@ import {
 	prewarmSearchProviders,
 	resolveProviderChain,
 	type SearchProvider,
+	searchProviderSettings,
 } from "./provider";
+import {
+	SEARXNG_BASIC_CREDENTIAL_PREFIX,
+	SEARXNG_BEARER_CREDENTIAL_PREFIX,
+	type SearchProviderSettings,
+} from "./providers/base";
 import { getConfiguredSearchTimeoutMs, runWithSearchTimeout } from "./providers/utils";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
 import {
@@ -165,6 +171,36 @@ interface ExecuteSearchOptions {
 	settings?: Settings;
 }
 
+function createScopedSearchAuthStorage(authStorage: AuthStorage, settings?: Settings): AuthStorage {
+	if (!settings) return authStorage;
+
+	const basicUsername = settings.get("searxng.basicUsername");
+	const basicPassword = settings.get("searxng.basicPassword");
+	const token = settings.get("searxng.token");
+	if (basicUsername === undefined && basicPassword === undefined && !token) return authStorage;
+
+	const getApiKey: AuthStorage["getApiKey"] = async (provider, sessionId, options) => {
+		if (provider === "searxng") {
+			if (basicUsername !== undefined || basicPassword !== undefined) {
+				const payload = Buffer.from(JSON.stringify({ username: basicUsername, password: basicPassword })).toString(
+					"base64",
+				);
+				return `${SEARXNG_BASIC_CREDENTIAL_PREFIX}${payload}`;
+			}
+			if (token) return `${SEARXNG_BEARER_CREDENTIAL_PREFIX}${token}`;
+		}
+		return await authStorage.getApiKey(provider, sessionId, options);
+	};
+
+	return new Proxy(authStorage, {
+		get(target, property, receiver) {
+			if (property === "getApiKey") return getApiKey;
+			const value = Reflect.get(target, property, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
 function searchPolicyFromSettings(
 	settings: Settings | undefined,
 ): Pick<ExecuteSearchOptions, "preferredProvider" | "fallbackProviders" | "hardTimeoutMs" | "settings"> {
@@ -225,11 +261,13 @@ async function executeSearchUnscoped(
 		hardTimeoutMs,
 		settings,
 	} = options;
+	const providerAuthStorage = createScopedSearchAuthStorage(authStorage, settings);
+	const providerSettings: SearchProviderSettings | undefined = searchProviderSettings(settings);
 	// Pass `params.provider` straight through: when omitted (the normal model-facing
 	// path) it is `undefined`, so `resolveProviderChain` applies the settings-configured
 	// preferred provider. Coalescing to "auto" here would silently bypass that preference.
 	const providers = await resolveProviderChain({
-		authStorage,
+		authStorage: providerAuthStorage,
 		sessionId,
 		signal,
 		preferredProvider: params.provider,
@@ -258,13 +296,13 @@ async function executeSearchUnscoped(
 		enableImageSearch: params.enable_image_search,
 		enableVideoUnderstanding: params.enable_video_understanding,
 		noInlineCitations: params.no_inline_citations,
-		authStorage,
+		authStorage: providerAuthStorage,
 		sessionId,
 		activeModelContext,
 		hardTimeoutMs,
 		preferredProvider,
 		fallbackProviders,
-		settings,
+		settings: providerSettings,
 	};
 
 	// Hedged fallback: when DuckDuckGo (keyless, cheap) is a non-primary member

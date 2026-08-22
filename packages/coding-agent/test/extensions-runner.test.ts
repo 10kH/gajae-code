@@ -69,6 +69,7 @@ describe("ExtensionRunner", () => {
 	describe("safe tool resolver", () => {
 		it("exposes the authoritative session settings to extension contexts", () => {
 			const settings = {
+				get: (path: string) => (path === "modelRoles" ? { image: "openai/gpt-image-2" } : undefined),
 				getModelRole: (role: string) => (role === "image" ? "openai/gpt-image-2" : undefined),
 			} as Settings;
 			const runner = new ExtensionRunner(
@@ -83,8 +84,9 @@ describe("ExtensionRunner", () => {
 
 			const exposed = runner.createContext().settings;
 			expect(exposed).not.toBe(settings);
+			expect(exposed?.get("modelRoles")).toEqual({ image: "openai/gpt-image-2" });
 			expect(exposed?.getModelRole("image")).toBe("openai/gpt-image-2");
-			expect("get" in (exposed ?? {})).toBe(false);
+			expect(exposed?.get("searxng.token")).toBeUndefined();
 		});
 
 		it("exposes the live credential session identity to extension contexts", () => {

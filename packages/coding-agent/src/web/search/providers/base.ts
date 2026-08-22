@@ -1,6 +1,21 @@
 import type { AuthStorage } from "@gajae-code/ai/core";
-import type { Settings } from "../../../config/settings";
 import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "../types";
+
+/** Non-sensitive provider policy passed to search implementations. */
+export interface SearchProviderSettings {
+	exa?: {
+		enabled?: boolean;
+		enableSearch?: boolean;
+	};
+	searxng?: {
+		endpoint?: string;
+		categories?: string;
+		language?: string;
+	};
+}
+
+export const SEARXNG_BASIC_CREDENTIAL_PREFIX = "gjc-searxng-basic:";
+export const SEARXNG_BEARER_CREDENTIAL_PREFIX = "gjc-searxng-bearer:";
 
 /**
  * Shared web search parameters passed to providers.
@@ -76,8 +91,8 @@ export interface SearchParams {
 	activeModelContext?: ActiveSearchModelContext;
 	/** Session-scoped web-search timeout override in milliseconds. */
 	hardTimeoutMs?: number;
-	/** Owning session settings for provider-local policy. */
-	settings?: Settings;
+	/** Narrow provider-local policy; credentials remain available only through authStorage. */
+	settings?: SearchProviderSettings;
 }
 
 /** Base class for web search providers. */
@@ -90,7 +105,7 @@ export abstract class SearchProvider {
 	 * service a request right now. Implementations consult the passed
 	 * {@link AuthStorage} — never a sibling store.
 	 */
-	abstract isAvailable(authStorage: AuthStorage, settings?: Settings): Promise<boolean> | boolean;
+	abstract isAvailable(authStorage: AuthStorage, settings?: SearchProviderSettings): Promise<boolean> | boolean;
 
 	/**
 	 * Execute a search. Credentials MUST be resolved through `params.authStorage`.

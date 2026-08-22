@@ -7,13 +7,11 @@
  * them into a combined `answer` string on the SearchResponse.
  */
 import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai/core";
-import type { Settings } from "../../../config/settings";
-import { settings } from "../../../config/settings";
 
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import { dateToAgeSeconds } from "../utils";
-import type { SearchParams } from "./base";
+import type { SearchParams, SearchProviderSettings } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
@@ -32,7 +30,7 @@ export interface ExaSearchParams {
 	start_published_date?: string;
 	end_published_date?: string;
 	signal?: AbortSignal;
-	settings?: Settings;
+	settings?: SearchProviderSettings;
 }
 
 interface ExaSearchResult {
@@ -174,15 +172,8 @@ export class ExaProvider extends SearchProvider {
 	readonly id = "exa";
 	readonly label = "Exa";
 
-	isAvailable(_authStorage: AuthStorage, activeSettings?: Settings): boolean {
-		try {
-			const source = activeSettings ?? settings;
-			if (source.get("exa.enabled") === false || source.get("exa.enableSearch") === false) {
-				return false;
-			}
-		} catch {
-			// Settings not initialized; availability still requires explicit API credentials.
-		}
+	isAvailable(_authStorage: AuthStorage, activeSettings?: SearchProviderSettings): boolean {
+		if (activeSettings?.exa?.enabled === false || activeSettings?.exa?.enableSearch === false) return false;
 		return !!getEnvApiKey("exa");
 	}
 

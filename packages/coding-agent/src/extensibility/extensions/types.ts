@@ -38,6 +38,7 @@ import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { ModelSelectorValue } from "../../config/model-selector-value";
 import type { Settings } from "../../config/settings";
+import type { SettingPath, SettingValue } from "../../config/settings-schema";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
@@ -337,12 +338,35 @@ export interface ExtensionSessionMetadata {
 
 /** Non-sensitive session policy exposed to third-party extensions. */
 export interface ExtensionSettings {
+	/** Read an allowlisted non-sensitive setting; blocked secret paths return undefined. */
+	get<P extends SettingPath>(path: P): SettingValue<P> | undefined;
 	getModelRole(role: string): ModelSelectorValue | undefined;
 }
 
+const EXTENSION_BLOCKED_SETTING_PREFIXES = [
+	"auth.",
+	"notifications.",
+	"hindsight.apiToken",
+	"searxng.basic",
+	"searxng.token",
+	"crashReport.",
+] as const;
+
+function isExtensionSettingReadable(path: string): boolean {
+	return !EXTENSION_BLOCKED_SETTING_PREFIXES.some(prefix => path.startsWith(prefix));
+}
+
 /** Create an extension-safe settings facade without exposing credentials or mutation APIs. */
-export function createExtensionSettings(settings: Pick<Settings, "getModelRole">): ExtensionSettings {
-	return Object.freeze({ getModelRole: settings.getModelRole.bind(settings) });
+export function createExtensionSettings(
+	settings: Pick<Settings, "getModelRole"> & Pick<Settings, "get">,
+): ExtensionSettings {
+	return Object.freeze({
+		get: <P extends SettingPath>(path: P): SettingValue<P> | undefined => {
+			if (!isExtensionSettingReadable(path)) return undefined;
+			return settings.get(path);
+		},
+		getModelRole: settings.getModelRole.bind(settings),
+	});
 }
 
 /**

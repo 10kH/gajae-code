@@ -10,12 +10,27 @@
 
 import type { AuthStorage } from "@gajae-code/ai/core";
 import type { Settings } from "../../config/settings";
-import type { SearchProvider } from "./providers/base";
+import type { SearchProvider, SearchProviderSettings } from "./providers/base";
 import type { ActiveSearchModelContext, SearchProviderId } from "./types";
 import { isConfigurableSearchProviderId } from "./types";
 
-export type { SearchParams } from "./providers/base";
+export type { SearchParams, SearchProviderSettings } from "./providers/base";
 export { SearchProvider } from "./providers/base";
+
+export function searchProviderSettings(settings?: Settings): SearchProviderSettings | undefined {
+	if (!settings) return undefined;
+	return {
+		exa: {
+			enabled: settings.get("exa.enabled"),
+			enableSearch: settings.get("exa.enableSearch"),
+		},
+		searxng: {
+			endpoint: settings.get("searxng.endpoint"),
+			categories: settings.get("searxng.categories"),
+			language: settings.get("searxng.language"),
+		},
+	};
+}
 
 interface ProviderMeta {
 	id: SearchProviderId;
@@ -251,7 +266,7 @@ async function appendAvailable(
 ): Promise<void> {
 	if (chain.includes(id)) return;
 	const provider = await getSearchProvider(id);
-	if (await provider.isAvailable(authStorage, settings)) chain.push(id);
+	if (await provider.isAvailable(authStorage, searchProviderSettings(settings))) chain.push(id);
 }
 
 function appendDeduped(chain: SearchProviderId[], id: SearchProviderId): void {
