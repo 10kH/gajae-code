@@ -73,6 +73,8 @@ export interface SearchParams {
 	 */
 	sessionId?: string;
 	activeModelContext?: ActiveSearchModelContext;
+	/** Session-scoped web-search timeout override in milliseconds. */
+	hardTimeoutMs?: number;
 }
 
 /** Base class for web search providers. */

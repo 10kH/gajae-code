@@ -8,6 +8,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { AuthStorage } from "@gajae-code/ai/core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import type { Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext, RenderResultOptions } from "../../extensibility/custom-tools/types";
 import type { Theme } from "../../modes/theme/theme";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
@@ -16,10 +17,22 @@ import { discoverAuthStorage } from "../../sdk";
 import type { ToolSession } from "../../tools";
 import { formatAge } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
-import { getSearchProviderLabel, prewarmSearchProviders, resolveProviderChain, type SearchProvider } from "./provider";
+import {
+	getConfiguredSearchProviderPreference,
+	getSearchProviderLabel,
+	prewarmSearchProviders,
+	resolveProviderChain,
+	type SearchProvider,
+} from "./provider";
+import { getConfiguredSearchTimeoutMs, runWithSearchTimeout } from "./providers/utils";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
-import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "./types";
-import { SearchProviderError } from "./types";
+import {
+	type ActiveSearchModelContext,
+	isConfigurableSearchProviderId,
+	SearchProviderError,
+	type SearchProviderId,
+	type SearchResponse,
+} from "./types";
 
 /** Web search tool parameters schema */
 export const webSearchSchema = z.object({
@@ -146,6 +159,25 @@ interface ExecuteSearchOptions {
 	sessionId?: string;
 	signal?: AbortSignal;
 	activeModelContext?: ActiveSearchModelContext;
+	preferredProvider?: SearchProviderId | "auto";
+	fallbackProviders?: readonly SearchProviderId[];
+	hardTimeoutMs?: number;
+}
+
+function searchPolicyFromSettings(
+	settings: Settings | undefined,
+): Pick<ExecuteSearchOptions, "preferredProvider" | "fallbackProviders" | "hardTimeoutMs"> {
+	if (!settings) return {};
+	const fallback = settings.get("web_search.fallback");
+	return {
+		preferredProvider: getConfiguredSearchProviderPreference(settings),
+		fallbackProviders: Array.isArray(fallback)
+			? fallback.filter(
+					(value): value is SearchProviderId => typeof value === "string" && isConfigurableSearchProviderId(value),
+				)
+			: undefined,
+		hardTimeoutMs: getConfiguredSearchTimeoutMs(settings),
+	};
 }
 
 /**
@@ -170,7 +202,19 @@ async function executeSearch(
 	params: SearchQueryParams,
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	const { authStorage, sessionId, signal, activeModelContext } = options;
+	if (Object.hasOwn(options, "hardTimeoutMs")) {
+		return runWithSearchTimeout(options.hardTimeoutMs, () => executeSearchUnscoped(_toolCallId, params, options));
+	}
+	return executeSearchUnscoped(_toolCallId, params, options);
+}
+
+async function executeSearchUnscoped(
+	_toolCallId: string,
+	params: SearchQueryParams,
+	options: ExecuteSearchOptions,
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
+	const { authStorage, sessionId, signal, activeModelContext, preferredProvider, fallbackProviders, hardTimeoutMs } =
+		options;
 	// Pass `params.provider` straight through: when omitted (the normal model-facing
 	// path) it is `undefined`, so `resolveProviderChain` applies the settings-configured
 	// preferred provider. Coalescing to "auto" here would silently bypass that preference.
@@ -179,6 +223,8 @@ async function executeSearch(
 		sessionId,
 		signal,
 		preferredProvider: params.provider,
+		fallbackProviders,
+		...(preferredProvider !== undefined && params.provider === undefined ? { preferredProvider } : {}),
 		activeModelContext,
 	});
 
@@ -204,6 +250,9 @@ async function executeSearch(
 		authStorage,
 		sessionId,
 		activeModelContext,
+		hardTimeoutMs,
+		preferredProvider,
+		fallbackProviders,
 	};
 
 	// Hedged fallback: when DuckDuckGo (keyless, cheap) is a non-primary member
@@ -325,6 +374,10 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 
 	#session: ToolSession;
 
+	#searchPolicy(): Pick<ExecuteSearchOptions, "preferredProvider" | "fallbackProviders" | "hardTimeoutMs"> {
+		return searchPolicyFromSettings(this.#session.settings);
+	}
+
 	constructor(session: ToolSession) {
 		this.#session = session;
 		this.description = prompt.render(webSearchDescription);
@@ -341,6 +394,7 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 					authStorage,
 					sessionId: session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 					activeModelContext,
+					...this.#searchPolicy(),
 				});
 			} catch {
 				// Never let prewarming break tool construction.
@@ -360,7 +414,13 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		const activeModelContext = this.#session.model
 			? this.#session.modelRegistry?.getActiveSearchModelContext(this.#session.model)
 			: undefined;
-		return executeSearch(_toolCallId, params, { authStorage, sessionId, signal, activeModelContext });
+		return executeSearch(_toolCallId, params, {
+			authStorage,
+			sessionId,
+			signal,
+			activeModelContext,
+			...this.#searchPolicy(),
+		});
 	}
 }
 
@@ -385,6 +445,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRende
 			sessionId,
 			signal,
 			activeModelContext: ctx.model ? ctx.modelRegistry?.getActiveSearchModelContext(ctx.model) : undefined,
+			...searchPolicyFromSettings(ctx.settings),
 		});
 	},
 
