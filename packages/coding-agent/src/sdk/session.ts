@@ -65,7 +65,7 @@ import {
 	type ScopedModelSelection,
 } from "../config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "../config/prompt-templates";
-import { Settings, type SkillsSettings } from "../config/settings";
+import { isSettingsInitialized, Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
@@ -584,7 +584,7 @@ export interface CreateAgentSessionOptions {
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
 
-	/** Settings instance. Default: Settings.init({ cwd, agentDir }) */
+	/** Settings instance. Default: a scope-local Settings.loadForScope({ cwd, agentDir }). */
 	settings?: Settings;
 	/** Internal/advanced runtime-service injection. Omitted services use session defaults. */
 	runtimeServices?: OptionalRuntimeServicesOverrides;
@@ -1423,6 +1423,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
+		// Keep legacy singleton consumers (bash, edit guards, and older extension code)
+		// initialized for SDK child hosts without making the session's role resolution
+		// depend on that process-global instance. Session-aware tool contexts carry the
+		// scope-local `settings` object directly.
+		if (!isSettingsInitialized()) {
+			await logger.time("settings:legacy-global", Settings.init, { cwd, agentDir });
+		}
 		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
 		// so services resolve the LIVE session cwd per activation instead of
 		// capturing the launch root. Before the manager exists the launch cwd is the
