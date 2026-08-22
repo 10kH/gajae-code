@@ -68,11 +68,6 @@ import {
 	type WebhookDelivery,
 } from "./event-webhook";
 import {
-	type CoordinatorModelRegistryLoader,
-	loadCoordinatorModelRegistry,
-	resolveCoordinatorModel,
-} from "./model-pin";
-import {
 	type CoordinatorModelProfileLoader,
 	loadCoordinatorModelProfiles,
 	resolveCoordinatorMpreset,
@@ -210,11 +205,15 @@ interface CoordinatorServices {
 	readSdkBrokerDiscovery?: (agentDir: string) => Promise<BrokerDiscovery | null>;
 	getAgentDir?: () => string;
 	resolveModelProfiles?: CoordinatorModelProfileLoader;
-	resolveModelRegistry?: CoordinatorModelRegistryLoader;
+	resolveModelPin?: (raw: unknown, cwd?: string) => Promise<CoordinatorModelResolution>;
 	canonicalizePath?: (value: string) => Promise<string>;
 	codexTransportFactory?: CodexTransportFactory;
 	eventWebhookDelivery?: WebhookDelivery;
 }
+
+type CoordinatorModelResolution =
+	| { ok: true; model: string | null }
+	| { ok: false; reason: "unknown_model"; model: string; error: string };
 
 interface CoordinatorMcpServerOptions {
 	env?: NodeJS.ProcessEnv;
@@ -2536,7 +2535,6 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	}
 	const platform = options.platform ?? process.platform;
 	const loadModelProfiles = services.resolveModelProfiles ?? loadCoordinatorModelProfiles;
-	const loadModelRegistry = services.resolveModelRegistry ?? loadCoordinatorModelRegistry;
 	const namespaceDir = path.join(
 		config.stateRoot,
 		config.namespace.profile ?? "unscoped-profile",
@@ -3497,6 +3495,31 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		if (requestError) throw requestError;
 		return result;
 	}
+
+	const resolveModelPin =
+		services.resolveModelPin ??
+		(async (raw: unknown, cwd?: string): Promise<CoordinatorModelResolution> => {
+			if (raw === undefined || raw === null) return { ok: true, model: null };
+			const result = brokerResult(
+				await brokerSession("", "model.resolve", {
+					model: raw,
+					cwd,
+					target: coordinatorLifecycleTarget(config.sessionCommand, cwd ?? ""),
+				}),
+			);
+			if (result) {
+				if (result.ok === true && (result.model === null || typeof result.model === "string"))
+					return { ok: true, model: result.model };
+				if (
+					result.ok === false &&
+					result.reason === "unknown_model" &&
+					typeof result.model === "string" &&
+					typeof result.error === "string"
+				)
+					return { ok: false, reason: "unknown_model", model: result.model, error: result.error };
+			}
+			throw new SdkClientError("unavailable", "SDK host returned an invalid model resolution.");
+		});
 
 	async function withRemoteSessionCompensation<T>(
 		cwd: string,
@@ -4856,9 +4879,10 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						available_profiles: mpresetResolution.available_profiles,
 					};
 				}
-				// Explicit model pin (#4707): same CLI-grammar validation as
-				// start_session, applied to the fresh delegate session.
-				const modelResolution = await resolveCoordinatorModel(args.model, loadModelRegistry);
+				// Explicit model pin (#4707) is resolved by the SDK host. The
+				// coordinator remains a transport/controller boundary and never loads
+				// session, settings, discovery, or MCP-manager authority.
+				const modelResolution = await resolveModelPin(args.model, canonicalCwd);
 				if (!modelResolution.ok) {
 					return {
 						ok: false,
@@ -5182,10 +5206,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						available_profiles: mpresetResolution.available_profiles,
 					};
 				}
-				// Explicit model pin (#4707): resolve with CLI grammar before any
-				// broker mutation or idempotency record so an unknown id can never
-				// create a session on a different model.
-				const modelResolution = await resolveCoordinatorModel(args.model, loadModelRegistry);
+				// Explicit model pin (#4707): resolve with CLI grammar at the SDK host
+				// boundary before any coordinator mutation or lifecycle request.
+				const modelResolution = await resolveModelPin(args.model, cwd);
 				if (!modelResolution.ok) {
 					return {
 						ok: false,

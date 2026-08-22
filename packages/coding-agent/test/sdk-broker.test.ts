@@ -280,6 +280,53 @@ it("SDK lifecycle explicit model pins reach the session host parser and validate
 	}
 });
 
+it("SDK broker resolves explicit model pins at the host boundary", async () => {
+	const agentDir = await temp();
+	await fs.mkdir(agentDir, { recursive: true });
+	await fs.writeFile(
+		path.join(agentDir, "models.yml"),
+		"providers:\n  fixture:\n    baseUrl: http://127.0.0.1:1/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: broker-model\n        name: Broker Model\n        contextWindow: 32768\n        maxTokens: 4096\n",
+	);
+	const broker = new Broker({ agentDir });
+	try {
+		await expect(broker.handleRequest("model.resolve", { model: "fixture/broker-model" })).resolves.toMatchObject({
+			ok: true,
+			result: { ok: true, model: "fixture/broker-model" },
+		});
+		await expect(broker.handleRequest("model.resolve", { model: "cursor/default" })).resolves.toMatchObject({
+			ok: true,
+			result: { ok: true, model: "cursor/default" },
+		});
+		await expect(broker.handleRequest("model.resolve", { model: "cursor:not-a-model" })).resolves.toMatchObject({
+			ok: true,
+			result: { ok: false, reason: "unknown_model", model: "cursor:not-a-model" },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
+it("SDK broker scopes canonical alias ranking to its agent directory settings", async () => {
+	const agentDir = await temp();
+	await fs.mkdir(agentDir, { recursive: true });
+	await fs.writeFile(
+		path.join(agentDir, "models.yml"),
+		"providers:\n  fixture-a:\n    baseUrl: http://127.0.0.1:1/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: shared\n        name: shared\n        contextWindow: 32768\n        maxTokens: 4096\n  fixture-b:\n    baseUrl: http://127.0.0.1:1/v1\n    apiKey: fixture-key\n    api: openai-completions\n    models:\n      - id: shared\n        name: shared\n        contextWindow: 32768\n        maxTokens: 4096\n",
+	);
+	await fs.writeFile(path.join(agentDir, "config.yml"), "modelProviderOrder:\n  - fixture-b\n");
+	const broker = new Broker({ agentDir });
+	try {
+		await expect(broker.handleRequest("model.resolve", { model: "shared" })).resolves.toMatchObject({
+			ok: true,
+			result: { ok: true, model: "fixture-b/shared" },
+		});
+	} finally {
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});
+
 it("SDK lifecycle launch requests preserve validated ACP MCP transports", async () => {
 	const agentDir = await temp();
 	const cwd = path.join(agentDir, "repo");
