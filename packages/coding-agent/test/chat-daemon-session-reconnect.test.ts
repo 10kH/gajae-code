@@ -520,6 +520,7 @@ async function withAttachedDiscordRuntime(
 		runtime: ChatDaemonRuntime;
 		provider: FakeDiscordProvider;
 		reconcile: () => void;
+		awaitFrameSettlement: (generation: number, seq: number, count?: number) => Promise<void>;
 	}) => Promise<void>,
 ): Promise<void> {
 	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-chat-reconnect-discord-"));
@@ -549,6 +550,17 @@ async function withAttachedDiscordRuntime(
 
 		const provider = new FakeDiscordProvider();
 		let reconcileTick: (() => void) | undefined;
+		const settledSequences = new Map<string, number>();
+		const settlementWaiters = new Map<string, Array<{ count: number; waiter: PromiseWithResolvers<void> }>>();
+		const awaitFrameSettlement = async (generation: number, seq: number, count = 1): Promise<void> => {
+			const key = `${generation}:${seq}`;
+			if ((settledSequences.get(key) ?? 0) >= count) return;
+			const waiter = Promise.withResolvers<void>();
+			const waiters = settlementWaiters.get(key) ?? [];
+			waiters.push({ count, waiter });
+			settlementWaiters.set(key, waiters);
+			await waiter.promise;
+		};
 		runtime = new ChatDaemonRuntime(
 			{
 				kind: "discord",
@@ -568,6 +580,25 @@ async function withAttachedDiscordRuntime(
 			{
 				createDiscordProvider: () => provider,
 				routerDeps: {
+					onFrameSettled: (attachment, frame) => {
+						const seq = typeof frame.seq === "number" && Number.isSafeInteger(frame.seq) ? frame.seq : undefined;
+						if (seq === undefined) return;
+						const key = `${attachment.generation}:${seq}`;
+						const count = (settledSequences.get(key) ?? 0) + 1;
+						settledSequences.set(key, count);
+						const pending = settlementWaiters.get(key);
+						if (pending) {
+							const remaining = pending.filter(entry => {
+								if (entry.count <= count) {
+									entry.waiter.resolve();
+									return false;
+								}
+								return true;
+							});
+							if (remaining.length === 0) settlementWaiters.delete(key);
+							else settlementWaiters.set(key, remaining);
+						}
+					},
 					setInterval: ((callback: () => void) => {
 						reconcileTick = callback;
 						return 0;
@@ -578,7 +609,7 @@ async function withAttachedDiscordRuntime(
 				},
 			},
 		);
-		await run({ runtime, provider, reconcile: () => reconcileTick?.() });
+		await run({ runtime, provider, reconcile: () => reconcileTick?.(), awaitFrameSettlement });
 	} finally {
 		await runtime?.stop();
 		await fs.rm(agentDir, { recursive: true, force: true });
@@ -632,12 +663,6 @@ async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): 
 	expect(provider.posts).toHaveLength(count);
 	expect(provider.completedClientMsgIds.size).toBeGreaterThanOrEqual(count);
 	await Bun.sleep(100);
-}
-
-async function awaitDiscordPosts(provider: FakeDiscordProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 5_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
-	expect(provider.posts).toHaveLength(count);
-	await Bun.sleep(25);
 }
 
 /** A refusal is the only trace a failed publication leaves on this side of the runtime. */
@@ -714,6 +739,7 @@ test("chat daemon startup isolates an unreachable indexed endpoint from a health
 							request: async () => ({ events: [] }),
 							close: async () => {},
 							send: () => {},
+							sendMaintenance: () => {},
 						};
 					},
 					setInterval: (() => 0) as unknown as typeof setInterval,
@@ -1012,7 +1038,7 @@ test("a replay refused on a live socket loses no event and leaves the cursor bel
 }, 20_000);
 
 test("a replay refused past its retry budget rebuilds the attachment from its cursor", async () => {
-	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile }) => {
+	await withAttachedSessionRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement }) => {
 		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1020,7 +1046,8 @@ test("a replay refused past its retry budget rebuilds the attachment from its cu
 			await starting;
 
 			host.emit("one");
-			await awaitCompletedPosts(provider, 1);
+			await awaitFrameSettlement(GENERATION, 1);
+			expect(provider.posts).toHaveLength(1);
 
 			host.drop();
 			host.emit("two");
@@ -1550,7 +1577,7 @@ test("an ambiguously acknowledged Slack session-ready publication is not posted 
 	});
 }, 20_000);
 test("an ambiguously acknowledged Discord session-ready publication is not posted twice", async () => {
-	await withAttachedDiscordRuntime(async ({ runtime, provider, reconcile }) => {
+	await withAttachedDiscordRuntime(async ({ runtime, provider, reconcile, awaitFrameSettlement }) => {
 		await withSerializedFakeTransport(async () => {
 			const host = new FakeSessionHost();
 			const starting = runtime.start();
@@ -1559,7 +1586,8 @@ test("an ambiguously acknowledged Discord session-ready publication is not poste
 
 			provider.acceptThenThrowPosts = 1;
 			host.emitSessionReady();
-			await awaitDiscordPosts(provider, 1);
+			await awaitFrameSettlement(GENERATION, 1);
+			expect(provider.posts).toHaveLength(1);
 
 			host.drop();
 			reconcile();

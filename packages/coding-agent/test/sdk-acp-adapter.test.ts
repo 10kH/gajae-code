@@ -75,6 +75,8 @@ type RouterHarness = {
 	requests: Record<string, unknown>[];
 	requestOptions: ({ timeoutMs?: number } | undefined)[];
 	sent: Record<string, unknown>[];
+	/** Lease ids observed on the maintenance capability (#4689 heartbeat route). */
+	maintenance: string[];
 	setCurrent: (current: boolean) => void;
 };
 
@@ -84,6 +86,7 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 	const requests: Record<string, unknown>[] = [];
 	const requestOptions: ({ timeoutMs?: number } | undefined)[] = [];
 	const sent: Record<string, unknown>[] = [];
+	const maintenance: string[] = [];
 	const attachment: SessionAttachment = {
 		sessionId: "session-1",
 		connectionId: "router-connection-1",
@@ -92,6 +95,9 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 		send: async frame => {
 			sent.push(frame);
 			return await options.send?.(frame);
+		},
+		sendMaintenance: leaseId => {
+			maintenance.push(leaseId);
 		},
 	};
 	const router = {
@@ -114,7 +120,7 @@ function createRouterHarness(options: { send?: (frame: Record<string, unknown>) 
 			return { ok: true, result: { accepted: true } };
 		},
 	};
-	return { router, attachment, requests, requestOptions, sent, setCurrent: value => (current = value) };
+	return { router, attachment, requests, requestOptions, sent, maintenance, setCurrent: value => (current = value) };
 }
 
 const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
@@ -125,6 +131,143 @@ const waitFor = async (predicate: () => boolean, label: string): Promise<void> =
 	}
 	throw new Error(`Timed out waiting for ${label}`);
 };
+
+test("an attachment without sendMaintenance is rejected at setup, leaving no lease (#4730 review)", async () => {
+	// A custom attachment that predates the maintenance capability must fail with
+	// an explicit migration error at setup, not silently stop renewing leases
+	// later when the heartbeat fires.
+	const harness = createRouterHarness();
+	const legacy: SessionAttachment = {
+		sessionId: harness.attachment.sessionId,
+		connectionId: "router-connection-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async frame => {
+			harness.sent.push(frame);
+		},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: legacy,
+		sessionId: legacy.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	await expect(adapter.start()).rejects.toThrow(/sendMaintenance/);
+	try {
+		// No heartbeat may be emitted for an attachment that cannot renew.
+		const before = harness.maintenance.length;
+		await Bun.sleep(40);
+		expect(harness.maintenance.length).toBe(before);
+		expect(harness.maintenance).toHaveLength(0);
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("a capability-less attachment is rejected on the handoff paths too (#4730 review)", async () => {
+	// acceptAttachment/attachmentReady are the replacement and ready handoffs. A
+	// capability-less attachment arriving there must be refused as well, or a
+	// replacement could silently take over live leases and stop renewing them.
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	await adapter.start();
+	try {
+		const legacy: SessionAttachment = {
+			sessionId: harness.attachment.sessionId,
+			connectionId: "router-connection-2",
+			generation: 2,
+			isCurrent: () => true,
+			send: async () => {},
+		};
+		expect(() => adapter.acceptAttachment(legacy)).toThrow(/sendMaintenance/);
+		// The different-object path is guarded above. The SAME-object path must be
+		// guarded too, and asserting it needs an adapter whose CURRENT attachment
+		// is the capability-less one -- otherwise attachmentReady re-enters the
+		// different-object branch and just re-tests the first guard (#4730 review).
+		const sameObject = new AcpSdkAdapter({
+			router: harness.router as never,
+			attachment: legacy,
+			sessionId: legacy.sessionId,
+			// A provider MUST be configured, or a zero register_provider count is
+			// zero either way and proves nothing (#4730 review).
+			providers: [{ capability: "ui", definitions: [] }],
+		});
+		const registeredBefore = harness.requests.filter(frame => frame.type === "register_provider").length;
+		await expect(sameObject.attachmentReady(legacy)).rejects.toThrow(/sendMaintenance/);
+		// Rejected before provider registration: no lease may exist for an
+		// attachment that cannot renew one.
+		expect(harness.requests.filter(frame => frame.type === "register_provider").length).toBe(registeredBefore);
+		expect(sameObject.leaseIds.size).toBe(0);
+		await sameObject.close();
+		// The supported attachment keeps renewing; the refusal did not wedge it.
+		await waitFor(() => harness.maintenance.length >= 1, "heartbeat still renewing after refusal");
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP lease heartbeats take the maintenance route, never the reconciling send path (#4689)", async () => {
+	// The 5s lease heartbeat was one of the two timers that forced a locked
+	// authority reconcile per attached session. A regression back to send() (or
+	// to a full reconcile) must fail here, not just in the index-level tests.
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	await adapter.start();
+	try {
+		// A real registered provider lease must exist for a heartbeat to be sent.
+		const registered = harness.requests.filter(frame => frame.type === "register_provider");
+		expect(registered.length).toBeGreaterThan(0);
+
+		const sentBefore = harness.sent.length;
+		const requestsBefore = harness.requests.length;
+		await waitFor(() => harness.maintenance.length >= 2, "two lease heartbeats on the maintenance route");
+
+		// Every heartbeat carried a real lease id...
+		expect(harness.maintenance.every(leaseId => typeof leaseId === "string" && leaseId.length > 0)).toBe(true);
+		// ...and none of them went through the reconciling send() path or emitted
+		// any additional router request traffic.
+		expect(harness.sent.length).toBe(sentBefore);
+		expect(harness.requests.length).toBe(requestsBefore);
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP lease heartbeats stop once the attachment is no longer current (#4689)", async () => {
+	const harness = createRouterHarness();
+	const adapter = new AcpSdkAdapter({
+		router: harness.router as never,
+		attachment: harness.attachment,
+		sessionId: harness.attachment.sessionId,
+		providers: [{ capability: "ui", definitions: [] }],
+		heartbeatMs: 5,
+	});
+	await adapter.start();
+	try {
+		await waitFor(() => harness.maintenance.length >= 1, "a first lease heartbeat");
+		harness.setCurrent(false);
+		const afterStale = harness.maintenance.length;
+		await Bun.sleep(60);
+		// A stale attachment is a quiet no-op: no further heartbeats, and the
+		// adapter must not escalate it into reconnect/command traffic.
+		expect(harness.maintenance.length).toBe(afterStale);
+	} finally {
+		await adapter.close();
+	}
+});
 
 test("ACP abort keeps the one-shot reply deadline while other session commands take the session budget", async () => {
 	const harness = createRouterHarness();

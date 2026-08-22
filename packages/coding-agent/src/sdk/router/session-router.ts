@@ -60,6 +60,19 @@ export interface SessionAttachment {
 	readonly generation: number;
 	isCurrent(): boolean;
 	send(frame: Record<string, unknown>): unknown;
+	/**
+	 * Idempotent provider-lease heartbeat send that skips the pre-send authority
+	 * reconcile (#4689).
+	 *
+	 * Optional so existing exported-capability implementations (including
+	 * consumer-provided `resolveAttachment` callbacks on the Discord/Slack daemon
+	 * options) stay source- and runtime-compatible (#4730 review). It is NOT a
+	 * fail-open fallback: a caller that finds it absent must fail closed rather
+	 * than route the heartbeat through `send()`, which would restore the 5s
+	 * heartbeat-forced locked rescan this fix exists to remove. Router-owned
+	 * attachments always provide it.
+	 */
+	sendMaintenance?(leaseId: string): unknown;
 	/** Revoke this exact capability after provider admission or replay fails closed. */
 	retire?(): Promise<void>;
 }
@@ -158,6 +171,8 @@ export interface SessionRouterDeps {
 	clearInterval?: typeof clearInterval;
 	setTimeout?: typeof setTimeout;
 	clearTimeout?: typeof clearTimeout;
+	/** Test seam for the idle liveness-sweep cadence (#4689). */
+	idleSweepMs?: number;
 }
 
 export type SessionRouterProviderDeps = Pick<
@@ -251,6 +266,15 @@ const DELIVERY_ATTEMPT_LIMIT = 3;
 const ATTACH_CONCURRENCY = 4;
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
 const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
+/**
+ * Idle liveness-sweep cadence (#4689). When the session index is unchanged and
+ * no adoption is pending, the 2s reconcile tick is only a change-stamp check;
+ * the full attach/retire body runs on index changes and on this sweep, which
+ * bounds time-driven transitions (dead host pid, aged heartbeat, dropped
+ * transport revival) without re-projecting the whole index every tick. 30s
+ * stays well inside the index's own 2×60s heartbeat-freshness window.
+ */
+const SESSION_ROUTER_IDLE_SWEEP_MS = 30_000;
 const NOTIFICATION_WORK_TIMEOUT = Symbol("notification_work_timeout");
 /**
  * Client-message types the native session server authorizes with the
@@ -387,10 +411,25 @@ export class SessionRouter {
 		{ generation: number; frames: Array<{ seq: number; frame: Record<string, unknown> }> }
 	>();
 	readonly #reviving = new Set<string>();
+	/**
+	 * Endpoint-file inode captured when each attachment was published (#4730
+	 * review). Maintenance renewal compares against this so a rename-replace that
+	 * preserves size, mtime and body cannot keep a superseded endpoint authorized.
+	 */
+	readonly #endpointInodes = new Map<string, bigint>();
 	readonly #notificationReceipts = new Map<string, NotificationCleanupReceipt>();
 	#stopTimer: (() => void) | undefined;
 	#reconcileTail: Promise<void> = Promise.resolve();
-	#reconcilePending: { readonly runEpoch: number } | undefined;
+	#reconcilePending: { readonly runEpoch: number; force: boolean } | undefined;
+	/**
+	 * Set when a live indexed session failed to attach; keeps the idle gate
+	 * from parking retries until the 30s sweep (#4689 review).
+	 */
+	#retryPending = false;
+	/** Monotonic time of the last completed full reconcile body (#4689). */
+	#lastReconcileSweepAt = 0;
+	/** Index sequence the last completed full reconcile body processed (#4689). */
+	#lastReconciledIndexSeq = -1;
 	#ready = false;
 	#started = false;
 	#stopController = new AbortController();
@@ -422,9 +461,17 @@ export class SessionRouter {
 			this.#reconcileTail = Promise.resolve();
 			this.#reconcilePending = undefined;
 			this.#frameTails.clear();
+			// A restart must re-run the full body on the first tick: reset the
+			// idle-gate markers so stale state cannot carry across run epochs.
+			this.#lastReconcileSweepAt = 0;
+			this.#lastReconciledIndexSeq = -1;
 		}
 		try {
-			await this.#serialReconcile(runEpoch);
+			// Seed a cold reader from the snapshot before the forced authority refresh.
+			// Forced passes must not reopen the index repeatedly, but startup still
+			// needs the one-time open/replay boundary for compacted indexes.
+			await this.#index.open();
+			await this.#serialReconcile(runEpoch, false, true);
 			if (!this.#running(runEpoch)) return;
 			const timer = (this.#deps.setInterval ?? setInterval)(
 				() => this.#schedule(this.#serialReconcile(runEpoch, true)),
@@ -440,9 +487,11 @@ export class SessionRouter {
 	/** Exposed for deterministic callers and reconciliation tests. */
 	async reconcile(options: { waitForReplay?: boolean } = {}): Promise<void> {
 		const waitForReplay = options.waitForReplay ?? true;
-		await this.#serialReconcile(this.#runEpoch, !waitForReplay);
+		// Explicit callers always force the full body (#4689): the idle gate must
+		// never make an explicit reconcile a no-op.
+		await this.#serialReconcile(this.#runEpoch, !waitForReplay, true);
 		if (!waitForReplay) return;
-		// Periodic reconciliation may have published an attachment while its initial replay
+		// Periodic reconciliation may have published an attachment while its
 		// initial replay continues on that attachment's isolated ready tail.
 		// Explicit callers retain the historical synchronous contract without
 		// putting any ready tail back onto the fleet-wide reconcile tail.
@@ -512,7 +561,7 @@ export class SessionRouter {
 		const indexedCurrent =
 			listing.warnings.length === 0 ? listing.sessions.find(item => item.sessionId === sessionId) : undefined;
 		if (indexedCurrent && sameIndexedAuthority(indexed, indexedCurrent))
-			await this.#serialReconcile(this.#runEpoch, true);
+			await this.#serialReconcile(this.#runEpoch, true, true);
 		return capability;
 	}
 
@@ -592,7 +641,7 @@ export class SessionRouter {
 	): Promise<Record<string, unknown>> {
 		const publishing = this.#sessions.get(sessionId);
 		if (!expectedAttachment || publishing?.capability !== expectedAttachment || !publishing.initializingPublication)
-			await this.#serialReconcile(this.#runEpoch, true);
+			await this.#serialReconcile(this.#runEpoch, true, true);
 		const attached = this.#sessions.get(sessionId);
 		if (!attached || !this.#attachmentPublished(attached))
 			throw new SessionRouterError("pre_send", "SDK session attachment is unavailable: session not published.");
@@ -782,18 +831,25 @@ export class SessionRouter {
 		}
 	}
 
-	#serialReconcile(runEpoch: number, deferReplay = false): Promise<void> {
+	#serialReconcile(runEpoch: number, deferReplay = false, force = false): Promise<void> {
 		if (!this.#running(runEpoch)) return Promise.resolve();
 		const pending = this.#reconcilePending;
-		if (pending?.runEpoch === runEpoch) return this.#reconcileTail;
-		const queued = { runEpoch };
+		if (pending?.runEpoch === runEpoch) {
+			// A dispatch that needs the exact authority body must not inherit an
+			// already-queued idle-timer pass: escalate the queued pass (#4689
+			// review). If the pass already started, this call queues a forced
+			// follow-up on the tail instead.
+			if (force) pending.force = true;
+			return this.#reconcileTail;
+		}
+		const queued = { runEpoch, force };
 		this.#reconcilePending = queued;
 		const task = this.#reconcileTail
 			.catch(() => undefined)
 			.then(async () => {
 				if (this.#reconcilePending === queued) this.#reconcilePending = undefined;
 				try {
-					await this.#reconcile(runEpoch, deferReplay);
+					await this.#reconcile(runEpoch, deferReplay, queued.force);
 					if (!this.#running(runEpoch)) return;
 					this.#ready = true;
 					this.#deps.onReconciled?.();
@@ -806,12 +862,48 @@ export class SessionRouter {
 		return task;
 	}
 
-	async #reconcile(runEpoch: number, deferReplay = false): Promise<void> {
+	async #reconcile(runEpoch: number, deferReplay = false, force = false): Promise<void> {
 		if (!this.#running(runEpoch)) return;
-		await this.#index.open();
+		// Idle-poll fast path (#4689) is for TIMER TICKS ONLY. A forced pass backs
+		// a dispatch, adoption, explicit reconcile, or start, and must serialize
+		// against the index lock: the unlocked stamp cut cannot order itself
+		// against a writer that commits an unregister/re-registration between the
+		// stat and the listSessions()/request() below, which would let a forced
+		// request go out through a no-longer-authoritative attachment (#4730
+		// review). Forced passes therefore take the locked authority read.
+		// `refresh()` is the locked read; `open()` is deliberately NOT re-run per
+		// forced pass -- re-entering it disturbs the shared open-group state that
+		// live attachments and replay cursors depend on, which broke socket-loss
+		// resume.
+		let changed: boolean;
+		if (force) {
+			await this.#index.refresh();
+			changed = true;
+		} else changed = await this.#index.refreshIfChanged();
 		if (!this.#running(runEpoch)) return;
-		await this.#index.refresh();
-		if (!this.#running(runEpoch)) return;
+		// Idle gate (#4689), timer ticks ONLY: dispatch, adoption, explicit
+		// reconcile, and start pass force=true and keep the exact locked
+		// authority body. A gated tick must also never park local recovery: a
+		// failed replay barrier, a retired-but-listed attachment, or an
+		// unpublished attachment all force the body. `changed` covers durable
+		// index updates; a corrupt suffix never takes the stamp fast path.
+		const sweepDue =
+			performance.now() - this.#lastReconcileSweepAt >= (this.#deps.idleSweepMs ?? SESSION_ROUTER_IDLE_SWEEP_MS);
+		if (
+			!force &&
+			!changed &&
+			!sweepDue &&
+			this.#adopted.size === 0 &&
+			!this.#retryPending &&
+			!this.#hasUnhealthyAttachment() &&
+			this.#index.indexSeq === this.#lastReconciledIndexSeq
+		) {
+			// The 2s tick is also the session-transport revival mechanism:
+			// connect() is a cheap no-op on a healthy socket, so skipped ticks
+			// keep the reconnect latency without re-projecting the index.
+			for (const attached of this.#sessions.values()) this.#reviveTransport(attached);
+			return;
+		}
 		const indexed = this.#index.listSessions();
 		const live =
 			indexed.warnings.length === 0
@@ -860,6 +952,7 @@ export class SessionRouter {
 			}
 		}
 		let nextAttachment = 0;
+		let attachThrew = false;
 		const attachWorkers = Array.from({ length: Math.min(ATTACH_CONCURRENCY, live.length) }, async () => {
 			for (;;) {
 				if (!this.#running(runEpoch)) return;
@@ -869,6 +962,11 @@ export class SessionRouter {
 					if (await this.#attach(session, runEpoch, undefined, false, false, deferReplay))
 						attachedIds.add(session.sessionId);
 				} catch {
+					// A live row that failed to attach is local recovery state the
+					// durable index cannot see: keep ticks retrying it (#4689).
+					// A definitive no-endpoint #attach miss (returned false) does
+					// not latch — that row can never attach.
+					attachThrew = true;
 					const failed = this.#sessions.get(session.sessionId);
 					if (failed?.runEpoch === runEpoch)
 						await this.#retireAttachment(failed, liveIds.has(session.sessionId) ? "replaced" : "removed");
@@ -896,9 +994,83 @@ export class SessionRouter {
 			}
 		}
 		if (cleanupErrors.length > 0) throw new AggregateError(cleanupErrors, "SessionRouter stale cleanup failed.");
+		this.#lastReconcileSweepAt = performance.now();
+		// Record the snapshot the body actually enumerated: a nested exact
+		// refresh during endpoint validation may have already advanced the
+		// index past it, and those newer events were NOT processed here.
+		this.#lastReconciledIndexSeq = indexed.indexSeq;
+		// The retry latch is set only where a live row's attach throws (see the
+		// attach worker); a definitive no-endpoint miss can never attach.
+		this.#retryPending = attachThrew && live.some(session => !attachedIds.has(session.sessionId));
 	}
 
-	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
+	/**
+	 * Bounded, lock-free endpoint-authority read for maintenance heartbeats
+	 * (#4730 review). `#readEndpoint` finishes with a locked `#index.refresh()`,
+	 * which on the 5s lease heartbeat would restore exactly the locked full index
+	 * scan this work removes. The heartbeat does not need index re-projection: it
+	 * only needs to know that THIS endpoint record still carries the authority
+	 * the attachment was published with, which the endpoint file itself proves.
+	 * Returns true only when the durable record still matches.
+	 */
+	async #endpointAuthorityUnchanged(attached: AttachedSession): Promise<boolean> {
+		const indexed = attached.indexed;
+		if (!isSessionAuthorityEligible(indexed)) return false;
+		if (indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return false;
+		// mtime alone is not a replacement-safe identity (#4730 review): a rewrite or
+		// rename-replace inside one filesystem tick can preserve it. The inode the
+		// attachment was PUBLISHED against is therefore the identity, and the
+		// generation is compared so a re-registration reusing the same url/token/pid
+		// cannot keep the old attachment authorized.
+		const publishedIno = this.#endpointInodes.get(attached.id);
+		if (publishedIno === undefined) return false;
+		const statBefore = await fs.stat(attached.endpoint.path).catch(() => undefined);
+		const inoBefore = await fs
+			.stat(attached.endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		if (!statBefore || inoBefore === undefined || inoBefore !== publishedIno) return false;
+		if (statBefore.mtimeMs !== indexed.endpointMtimeMs) return false;
+		let raw: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(await Bun.file(attached.endpoint.path).text());
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
+			raw = parsed as Record<string, unknown>;
+		} catch {
+			return false;
+		}
+		if (
+			raw.sessionId !== indexed.sessionId ||
+			raw.pid !== attached.pid ||
+			raw.stale === true ||
+			raw.url !== attached.endpoint.url ||
+			raw.token !== attached.endpoint.token
+		)
+			return false;
+		// The endpoint record itself carries no generation, so generation identity
+		// comes from the indexed row this attachment was published against.
+		if (indexed.endpointGeneration !== attached.generation) return false;
+		if (raw.endpointGeneration !== undefined && raw.endpointGeneration !== attached.generation) return false;
+		const statAfter = await fs.stat(attached.endpoint.path).catch(() => undefined);
+		const inoAfter = await fs
+			.stat(attached.endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		return (
+			statAfter !== undefined &&
+			inoAfter !== undefined &&
+			statAfter.mtimeMs === indexed.endpointMtimeMs &&
+			inoAfter === publishedIno
+		);
+	}
+
+	/**
+	 * Returns the endpoint together with the inode this read PROVED (#4730
+	 * review). The identity travels with the value instead of living in a side
+	 * map, so every consumer decision compares the same proof and the two cannot
+	 * drift apart.
+	 */
+	async #readProvenEndpoint(indexed: IndexedSession): Promise<{ endpoint: SdkSessionEndpoint; ino: bigint } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
 		const repo = path.resolve(indexed.locator.repo);
 		const defaultStateRoot = path.join(repo, ".gjc", "state");
@@ -920,7 +1092,15 @@ export class SessionRouter {
 		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
 		const endpointStat = await fs.stat(endpoint.path).catch(() => undefined);
-		if (!endpointStat || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return null;
+		const endpointIno = await fs
+			.stat(endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		if (!endpointStat || endpointIno === undefined || endpointStat.mtimeMs !== indexed.endpointMtimeMs) return null;
+		// Identity is proven INSIDE this authority read (#4730 review): sampling it
+		// afterwards would let an identical rename between the read and the sample
+		// install the replacement's inode as the trusted baseline.
+		const provenIno = endpointIno;
 		let raw: Record<string, unknown>;
 		try {
 			const parsed = JSON.parse(await Bun.file(endpoint.path).text());
@@ -937,14 +1117,30 @@ export class SessionRouter {
 			raw.token !== endpoint.token
 		)
 			return null;
+		// Fail CLOSED on stat error and on any identity change across the body read.
 		const endpointStatAfterRead = await fs.stat(endpoint.path).catch(() => undefined);
-		if (!endpointStatAfterRead || endpointStatAfterRead.mtimeMs !== indexed.endpointMtimeMs) return null;
+		const inoAfterRead = await fs
+			.stat(endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		if (
+			!endpointStatAfterRead ||
+			inoAfterRead === undefined ||
+			endpointStatAfterRead.mtimeMs !== indexed.endpointMtimeMs ||
+			inoAfterRead !== provenIno
+		)
+			return null;
 		await this.#index.refresh();
 		const listing = this.#index.listSessions();
 		if (listing.warnings.length > 0) return null;
 		const current = listing.sessions.find(session => session.sessionId === indexed.sessionId);
 		if (!current || !sameIndexedAuthority(indexed, current)) return null;
-		return endpoint;
+		return { endpoint, ino: provenIno };
+	}
+
+	/** Endpoint-only view for callers that do not make an authority decision. */
+	async #readEndpoint(indexed: IndexedSession): Promise<SdkSessionEndpoint | null> {
+		return (await this.#readProvenEndpoint(indexed))?.endpoint ?? null;
 	}
 
 	async #createAttachedClient(
@@ -1007,7 +1203,17 @@ export class SessionRouter {
 		if (retirement) await retirement;
 		if (!this.#running(runEpoch)) return false;
 		if (indexed.endpointMtimeMs === undefined) return false;
-		const endpoint = resolvedEndpoint ?? (await this.#readEndpoint(indexed));
+		// The identity travels with the endpoint from its authority read (#4730
+		// review). A pre-resolved endpoint (adoption/lifecycle handoff) had no
+		// authority read of its own, so it samples once here.
+		const proven = resolvedEndpoint === undefined ? await this.#readProvenEndpoint(indexed) : null;
+		const endpoint = resolvedEndpoint ?? proven?.endpoint ?? null;
+		let provenIno = proven?.ino;
+		if (resolvedEndpoint !== undefined)
+			provenIno = await fs
+				.stat(resolvedEndpoint.path, { bigint: true })
+				.then(value => value.ino)
+				.catch(() => undefined);
 		const retirementAfterValidation = this.#retirements.get(indexed.sessionId);
 		if (retirementAfterValidation) await retirementAfterValidation;
 		if ((this.#retirementVersions.get(indexed.sessionId) ?? 0) !== retirementVersion)
@@ -1106,10 +1312,33 @@ export class SessionRouter {
 						await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
 						throw new SessionRouterError("pre_send", "SDK session attachment changed during publication.");
 					}
-				} else await this.#serialReconcile(runEpoch, true);
+				} else await this.#serialReconcile(runEpoch, true, true);
 				if (!attached || !this.#attachmentPublished(attached))
 					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 				attached.client.send(this.#prepareFrame(attached, frame));
+			},
+			/**
+			 * Provider-lease heartbeats skip the pre-send authority reconcile
+			 * (#4689): the frame is idempotent and advisory, the native server
+			 * drops wrong-token/stale-connection frames, and the 2s tick plus
+			 * 30s sweep revalidate authority on their own cadence. The frame
+			 * shape is fixed here so no command traffic can take this path;
+			 * dispatch keeps using send().
+			 */
+			sendMaintenance: async (leaseId: string) => {
+				if (!attached || !this.#attachmentPublished(attached))
+					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+				// Renewal must fail closed against durable authority (#4730 review):
+				// the idle path can defer full projection to the 30s sweep, so an
+				// endpoint replaced in that window would otherwise keep receiving lease
+				// renewals. This is the bounded LOCK-FREE check: it reads only this
+				// endpoint record and never re-enters the locked index rescan, which on
+				// a 5s heartbeat would restore the very cost #4689 removes.
+				if (!(await this.#endpointAuthorityUnchanged(attached)))
+					throw new SessionRouterError("pre_send", "SDK session endpoint authority changed before lease renewal.");
+				if (!attached || !this.#attachmentPublished(attached))
+					throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
+				attached.client.send(this.#prepareFrame(attached, { type: "provider_heartbeat", leaseId }));
 			},
 			retire: async () => {
 				if (attached) await this.#retireAttachment(attached);
@@ -1184,9 +1413,31 @@ export class SessionRouter {
 						new SessionRouterError("pre_send", "SDK session publication was detached before completion."),
 					);
 				barrier.held = undefined;
+				// Every teardown path (retirement, replacement, stop, failed
+				// publication) routes through dispose(), so the published-inode entry
+				// is dropped here rather than at one call site (#4730 review).
+				if (attached) this.#endpointInodes.delete(attached.id);
 			},
 		};
+		// Re-check at publication (#4730 review): the endpoint must STILL be the
+		// file authority validated. Fail closed on stat error or any identity
+		// change instead of publishing an attachment bound to a successor.
+		// Every rejection here must roll the connected client back fully (#4730
+		// review): the transport is already open at this point, so returning without
+		// closing it leaks an unowned connection.
+		const rollback = async (): Promise<false> => {
+			attached.dispose();
+			await client.close().catch(() => undefined);
+			return false;
+		};
+		if (provenIno === undefined) return await rollback();
+		const publishIno = await fs
+			.stat(endpoint.path, { bigint: true })
+			.then(value => value.ino)
+			.catch(() => undefined);
+		if (publishIno === undefined || publishIno !== provenIno) return await rollback();
 		this.#sessions.set(indexed.sessionId, attached);
+		this.#endpointInodes.set(attached.id, provenIno);
 		if (deferPublication)
 			this.#adopted.set(indexed.sessionId, {
 				generation: indexed.endpointGeneration,
@@ -1224,15 +1475,23 @@ export class SessionRouter {
 	async #publishAttachment(attached: AttachedSession, skipReplay: boolean, deferReplay = false): Promise<boolean> {
 		if (attached.published) return this.#attachmentPublished(attached);
 		if (!this.#attachmentLive(attached)) return false;
-		const endpoint = await this.#readEndpoint(attached.indexed).catch(() => null);
+		const proven = await this.#readProvenEndpoint(attached.indexed).catch(() => null);
 		if (!this.#attachmentLive(attached)) return false;
+		// The commit point compares the PROVEN inode alongside url/token/pid
+		// (#4730 review): an identical-byte rename during the pre-publication
+		// hooks matches every other field, so identity is what rejects it. The
+		// value compared here is the one the authority read proved, not a later
+		// observation, so the proof and its consumer cannot drift apart.
+		const publishedIno = this.#endpointInodes.get(attached.id);
 		if (
-			!endpoint ||
-			endpoint.url !== attached.endpoint.url ||
-			endpoint.token !== attached.endpoint.token ||
-			endpoint.pid !== attached.pid
+			!proven ||
+			proven.endpoint.url !== attached.endpoint.url ||
+			proven.endpoint.token !== attached.endpoint.token ||
+			proven.endpoint.pid !== attached.pid ||
+			publishedIno === undefined ||
+			proven.ino !== publishedIno
 		) {
-			await this.#retireAttachment(attached, endpoint ? "replaced_same_generation" : undefined);
+			await this.#retireAttachment(attached, proven ? "replaced_same_generation" : undefined);
 			return false;
 		}
 		if (!skipReplay) attached.barrier.held ??= [];
@@ -1336,6 +1595,17 @@ export class SessionRouter {
 		return this.#started && runEpoch === this.#runEpoch;
 	}
 
+	/**
+	 * Idle-gate guard (#4689): local recovery state the durable index cannot
+	 * see. A failed/detached replay barrier or an unpublished attachment must
+	 * force the next full body instead of waiting for the sweep.
+	 */
+	#hasUnhealthyAttachment(): boolean {
+		for (const attached of this.#sessions.values()) {
+			if (attached.barrier.failed || attached.barrier.detached || !attached.published) return true;
+		}
+		return false;
+	}
 	#attachmentLive(attached: AttachedSession): boolean {
 		return (
 			this.#running(attached.runEpoch) &&
