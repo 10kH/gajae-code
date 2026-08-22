@@ -7,6 +7,7 @@ export interface WindowsPowerShellInnerCommandOptions {
 	command: readonly string[];
 	args?: readonly string[];
 	environment?: Record<string, string>;
+	bootstrapSecret?: { path: string; urlEnv: string; keyIdEnv: string; keyId: string };
 	tmuxExitMarkerPath?: string;
 }
 
@@ -33,11 +34,18 @@ export function buildWindowsPowerShellInnerCommand({
 	command,
 	args = [],
 	environment,
+	bootstrapSecret,
 	tmuxExitMarkerPath,
 }: WindowsPowerShellInnerCommandOptions): string {
 	const envLines = Object.entries({ [GJC_TMUX_LAUNCHED_ENV]: "1", ...(environment ?? {}) }).map(
 		([key, value]) => `$env:${key} = ${powershellQuote(value)}`,
 	);
+	if (bootstrapSecret) {
+		envLines.push(
+			`$env:${bootstrapSecret.urlEnv} = ${powershellQuote(bootstrapSecret.path)}`,
+			`$env:${bootstrapSecret.keyIdEnv} = ${powershellQuote(bootstrapSecret.keyId)}`,
+		);
+	}
 	const resolvedCommand = command.map(powershellQuote).join(" ");
 	const innerArgs = args.map(powershellQuote).join(" ");
 	const invocation = `& ${resolvedCommand} ${innerArgs}`;

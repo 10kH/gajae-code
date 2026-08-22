@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { listCodexHandoffs, listCodexWakeEvents, registerCodexHandoff } from "../src/coordinator-mcp/codex-handoff";
+import { buildCoordinatorMcpConfig } from "../src/coordinator-mcp/policy";
 import {
 	appendCoordinatorEventForTest,
 	awaitCodexWakePublishesForTest,
@@ -35,8 +36,17 @@ async function tempRoot(): Promise<string> {
 	return root;
 }
 
+// The coordinator server registers wake transports and state under the
+// collision-resistant namespace identity; tests must target the same
+// directory the server itself resolves (the legacy local/repo layout is
+// migration input only).
 function namespaceDir(root: string): string {
-	return path.join(root, ".gjc", "coordinator-state", "local", "repo");
+	const config = buildCoordinatorMcpConfig({
+		GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+		GJC_COORDINATOR_MCP_PROFILE: "local",
+		GJC_COORDINATOR_MCP_REPO: "repo",
+	});
+	return path.join(config.stateRoot, "v1", config.namespace.identity, "projections");
 }
 
 function errnoError(code: string, message = code): NodeJS.ErrnoException {

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { $credentialEnv } from "@gajae-code/utils/env";
@@ -162,8 +163,11 @@ function eventWebhookScopeApplies(config: EventWebhookConfig, event: { session_i
 }
 
 function recordPath(namespaceDir: string, eventId: string): string {
-	if (!/^event-\d{12,}$/.test(eventId)) throw new Error("coordinator_event_webhook_event_id_invalid");
-	return path.join(namespaceDir, "webhook-outbox", `${eventId}.json`);
+	if (!/^[a-zA-Z0-9][a-zA-Z0-9_.:-]*$/.test(eventId)) throw new Error("coordinator_event_webhook_event_id_invalid");
+	// Stable IDs can exceed filesystem component limits. The complete identifier
+	// remains in the record and this fixed-size digest is only its outbox key.
+	const digest = createHash("sha256").update(eventId).digest("hex");
+	return path.join(namespaceDir, "webhook-outbox", `${digest}.json`);
 }
 
 async function readRecord(file: string, eventId: string): Promise<WebhookDeliveryRecord | null> {

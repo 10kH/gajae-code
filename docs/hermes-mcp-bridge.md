@@ -76,7 +76,7 @@ Mutating tools require both startup opt-in and per-call consent:
 export GJC_COORDINATOR_MCP_MUTATIONS="sessions,questions,reports"
 ```
 
-Every mutating MCP call that requires a caller key must include `allow_mutation: true` and the required caller-provided `idempotency_key`. The bridge durably binds the key to the tool and canonical arguments, serializes concurrent duplicates, replays the original bounded public response, and rejects reuse with different arguments as `idempotency_conflict`.
+Every mutating MCP call that requires a caller key must include `allow_mutation: true` and the required caller-provided `idempotency_key`. The bridge durably binds the key to the tool and canonical arguments, serializes concurrent duplicates, replays the original bounded public response, and rejects reuse with different arguments as `idempotency_conflict`. `gjc_coordinator_report_status` also records a canonical report operation in the session ledger before terminal projection; after a process crash, retrying the identical key repairs the canonical projections and retained event delivery before reconstructing the committed report/turn response instead of creating a second report. A replay consults the durable receipt/canonical report before revalidating mutable evidence paths, so deleting or renaming an evidence file cannot invalidate an already committed retry.
 
 `gjc_coordinator_start_session` uses SDK lifecycle control with the configured typed GJC selector. `gjc setup hermes` writes `gjc --worktree` by default:
 
@@ -88,7 +88,7 @@ The only supported values are `gjc` and `gjc --worktree [name]`; this variable i
 
 For resume safety, prefer the generated GJC-native worktree selector over creating a git worktree in Hermes itself. GJC's launch path records the original repo as the project identity while running in the worktree, so session listing/resume can still group the session under the source project. If Hermes creates and later deletes an unmanaged worktree, a saved session may still exist but its cwd can be gone.
 
-Artifact reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP`.
+Artifact reads are available only on Linux, where the bridge can enforce identity-bound handle authorization. On macOS and Windows, `gjc_coordinator_read_artifact` fails closed with the generic `artifact_unavailable` error; use `tools/list` to detect platform capability rather than branching on invocation errors; have the controller collect the bounded artifact through its own approved repository/worktree access and submit paths or summaries through coordinator reports instead. On Linux, reads are canonicalized, symlink escapes are rejected, and returned content is byte-capped by `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP`.
 
 `gjc setup hermes` renders `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` with the host platform path delimiter (`:` on POSIX, `;` on Windows). Manual configs should prefer the same encoding.
 
@@ -117,39 +117,39 @@ Read tools:
 - `gjc_coordinator_read_turn`
 - `gjc_coordinator_await_turn`
 - `gjc_coordinator_watch_events`
-- `gjc_coordinator_read_codex_handoff` — reads the Codex app-server resume bridge registration and durable wake state; endpoints are unix sockets or loopback TCP only, and token-file references only. Returned wake events expose lifecycle schema version 1 (`pending` → `requested`, `published` → `delivered`, `acked` → `acknowledged`, `failed` → `failed`); durable `attempts` and `last_error` are its failure/retry metadata. Heartbeats are unsupported (`automation_update_unavailable`), so delivery remains event-driven with startup drain.
+- `gjc_coordinator_read_codex_handoff` — reads the Codex app-server resume bridge registration and durable wake state; endpoints are unix sockets or loopback TCP only. Public handoffs report only whether a token is configured, never its path. Token files are independently authorized under `GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT` (default: the coordinator state root's managed `codex-tokens` directory), must be owner-only (`0600` or stricter), regular non-symlink files owned by the coordinator user, 1–4096 bytes, and contain neither CR nor LF. The coordinator binds the canonical no-follow file identity at registration and rejects replacement at delivery. Returned wake events expose lifecycle schema version 1 (`pending` → `requested`, `published` → `delivered`, `acked` → `acknowledged`, `failed` → `failed`); durable `attempts` and `last_error` are its failure/retry metadata. Heartbeats are unsupported (`automation_update_unavailable`), so delivery remains event-driven with startup drain.
 
 
 Mutating tools:
 
 - `gjc_coordinator_start_session`
 - `gjc_coordinator_activate_session`
+- `gjc_coordinator_stop_session` — closes and reaps coordinator delegate-created ephemeral sessions. A user-registered non-ephemeral session is refused unless the caller sets `force: true` and the bridge has the `GJC_COORDINATOR_MCP_FORCE_STOP` capability.
 - `gjc_coordinator_register_session`
 - `gjc_coordinator_send_prompt`
 - `gjc_coordinator_submit_question_answer`
 - `gjc_coordinator_report_status`
-- `gjc_coordinator_register_codex_handoff` — registers the Codex app-server resume bridge with a unix/loopback endpoint and token-file reference only.
+- `gjc_coordinator_register_codex_handoff` — registers the Codex app-server resume bridge with a unix/loopback endpoint and an independently authorized token-file reference only; raw token material and paths outside the configured token root are rejected.
 - `gjc_coordinator_ack_codex_handoff` — acknowledges a Codex resume wake by durable `wake_key`; wake prompts never include GJC final responses.
 - `gjc_delegate_plan`
 - `gjc_delegate_execute`
 
 The `gjc_delegate_*` tools are high-level, session-level delegation: each starts (or reuses) an SDK-discovered session and sends one workflow-tagged turn for `/skill:ralplan` or `/skill:ultragoal`, returning a durable `turn_id`, status, and artifact references. They use the same `sessions` mutation class and fail-closed workdir gating as `gjc_coordinator_start_session`, and emit a `delegation.started` event. Pass `await_completion: true` to use the durable bounded await/report path; `timeout_ms` and `poll_interval_ms` apply to that completion payload. Without it, the tool returns immediately after SDK acknowledgement. Pass `cwd` and `task`; set `allow_mutation: true` and a caller-provided `idempotency_key` only with startup mutation opt-in plus per-call consent. Optionally pass `mpreset` (same semantics as `gjc --mpreset <profile>`) to `gjc_coordinator_start_session` or a delegate tool to authoritatively activate a GJC model profile when starting a fresh session — it is resolved through the merged built-in/custom profile registry, applied from the first turn, and surfaced in status; unknown names are rejected with the available-profile listing, and reusing a session with a conflicting `mpreset` fails with `mpreset_conflict`. Pass `model` (`gjc --model <provider/model>` grammar, e.g. `cursor/claude-fable-5-xhigh`) instead of, or alongside, `mpreset` to pin one explicit model for the started session (#4707): it is resolved with the same CLI selector grammar, unknown ids are rejected before any session is created with the CLI's not-found error, and when both are given the explicit `model` wins exactly like `gjc --mpreset <p> --model <m>`. Prefer these over manual `start_session` + `send_prompt` when delegating a whole workflow.
 
-`gjc_coordinator_register_session` registers an existing SDK-discoverable GJC session for coordinator control. It validates the workdir allowlist and session id, then verifies the broker's exact canonical workspace and endpoint generation before writing a credential-free session record. Optional tmux identifiers are retained only as advisory process metadata and are never machine-read.
+`gjc_coordinator_register_session` re-registers an SDK-discoverable GJC session only when its matching coordinator record already establishes the sidecar authority used to authenticate runtime updates. A new running session cannot receive a newly minted private key; use `gjc_coordinator_start_session` to establish one. Optional tmux identifiers are retained only as advisory process metadata and are never machine-read.
 
 `gjc_coordinator_activate_session` publishes the readiness a prepared session withheld. Start the session with `prepare_existing_thread: true` when an existing chat thread must be adopted: the session stays live and endpoint-addressable at state `prepared`, claims no root, refuses an initial prompt, and refuses `gjc_coordinator_send_prompt` with `session_not_activated`. Bind the thread with the daemon-owned `gjc notify bind-thread --session-id <id> --thread-ts <root>` command — the Coordinator never writes a chat mapping — then activate. Activation proves the exact endpoint generation, delegates the decision to the session's own activation gate (`not_bound` while no binding exists), is idempotent on replay, and moves durable state to `ready_for_input` only after the session proves `activated` or `already`.
 ## Turn orchestration flow
 
-External coordinators should treat turns, not terminal scrollback, as the unit of work:
+External coordinators should treat turns, not terminal scrollback, as the unit of work. The durable event journal is the watch-first lifecycle surface:
 
 1. Call `gjc_coordinator_start_session` with `allow_mutation: true` and `idempotency_key`.
 2. Call `gjc_coordinator_send_prompt` with `allow_mutation: true` and `idempotency_key`.
-3. Store the returned `turn_id`.
-4. Poll `gjc_coordinator_read_turn`, or call bounded `gjc_coordinator_await_turn`, until the turn is terminal.
-5. Pull `gjc_coordinator_list_questions` with the required `session_id`; it reconciles pending `workflow.gates.list` rows and returns bounded questions, diagnostics, and reconciliation state. Submit each pending row with `gjc_coordinator_submit_question_answer`.
+3. Persist the returned `session_id` and `turn_id`.
+4. Call `gjc_coordinator_watch_events` with `after_seq` and persist **`next_after_seq` only**. A zero-time watch performs one bounded immediate reconcile/export pass; a positive timeout is a bounded long poll.
+5. Handle metadata-only `turn.waiting_for_answer`, `question.opened`, `turn.completed`, and `turn.failed` events. Read details through `gjc_coordinator_read_turn` or `gjc_coordinator_list_questions`, then submit pending rows with `gjc_coordinator_submit_question_answer`.
 
-6. Use `gjc_coordinator_report_status` with `session_id` and `turn_id` to write explicit completion/failure evidence.
-   Use `status: "cancelled"` for coordinator-policy cancellation, and `status: "failed"` plus `blocker` for provider/tool/task failures.
+`gjc_coordinator_report_status` is optional additive controller-authored evidence. Use it when the controller has an explicit summary/evidence record, needs to record policy cancellation (`status: "cancelled"`), or must provide a fallback failure report (`status: "failed"` plus `blocker`). Runtime-derived watch events do not require a preceding report.
 
 `gjc_coordinator_send_prompt` returns versioned top-level routing fields that exactly mirror its nested durable `turn`: `status`, `queued`, and `delivered` equal `turn.status`, `turn.delivery.queued`, and `turn.delivery.delivered`; `active_turn_id` is the new turn id unless this response queued a follow-up, in which case it is the existing active turn id.
 
@@ -165,7 +165,7 @@ External coordinators should treat turns, not terminal scrollback, as the unit o
 }
 ```
 
-A session may have only one active turn by default. A second prompt is rejected with `active_turn_exists` unless the caller explicitly passes `queue: true` or `force: true`. Queued turns are durable and the next queued turn is promoted when the active turn reaches a terminal `gjc_coordinator_report_status`. Force supersedes the previous active turn and audits that state in the turn journal.
+A session may have only one active turn by default. A second prompt is rejected with `active_turn_exists` unless the caller explicitly passes `queue: true` or `force: true`. Queued turns are durable and the next queued turn is promoted when the active turn reaches a terminal coordinator transition. Force supersedes the previous active turn and audits that state in the turn journal.
 Coordinator cancellation is recorded through `gjc_coordinator_report_status` with terminal `status: "cancelled"`; this updates durable turn state but does not control any process. If the correct policy is replacement work rather than cancellation, send the replacement prompt with `force: true` so the previous active turn is superseded and audited.
 
 `gjc_coordinator_read_turn` returns the authoritative durable turn and SDK-only advisory status. For the latest assistant output, use `gjc_coordinator_read_tail`; it queries `session.last_assistant` through the session SDK and returns only the requested bounded line suffix, never terminal output.
@@ -196,31 +196,33 @@ Coordinator cancellation is recorded through `gjc_coordinator_report_status` wit
 }
 ```
 
-The coordinator MCP bridge is currently a durable polling/await surface. It does not expose a push subscription stream; external coordinators should poll `gjc_coordinator_read_coordination_status`, `gjc_coordinator_read_turn`, or bounded `gjc_coordinator_await_turn` instead of waiting for server-sent push events.
+The coordinator MCP bridge is a durable watch/poll/await surface. `gjc_coordinator_watch_events` is the preferred bounded lifecycle feed and does not expose a push subscription stream; external coordinators should persist its `next_after_seq` cursor and use `gjc_coordinator_read_turn` or `gjc_coordinator_list_questions` for details. `gjc_coordinator_read_coordination_status` and bounded `gjc_coordinator_await_turn` remain available for snapshot and compatibility consumers.
 
 External `session_id`, `turn_id`, and `question_id` values are validated before path use, and loaded records must match the requested session/turn owner.
 
 ### Coordinator question pull loop
 
-`gjc_coordinator_list_questions` requires `session_id` and reconciles the session's pending `workflow.gates.list` rows on every call. Its bounded response contains public `questions`, `diagnostics`, and `reconciliation`; `status: "pending"` selects pending rows, while `status: "open"` remains a compatibility alias. More than one pending question may be returned. Public rows expose only the safe question shape, public option ids, and a fresh `answer_binding` for each pending row—never raw/private gate payloads or values.
+`gjc_coordinator_list_questions` requires `session_id` and reconciles the session's pending `workflow.gates.list` rows on every call. Its bounded response contains public `questions`, `diagnostics`, and `reconciliation`; `status: "pending"` selects pending rows, while `status: "open"` remains a compatibility alias. More than one pending question may be returned. Public rows expose only the safe question shape, public option ids, a versioned per-question `answer_schema`, and a fresh `answer_binding` for each pending row—never raw/private gate payloads or values. The schema describes the exact union: `{ "selected": ["opt_0"] }` (or multiple ids when `multi` is true), `{ "selected": [], "other": true, "custom": "..." }`, and `{ "action": "clarify", "question": "..." }`; an empty selected array is valid only when `allow_empty` is true.
 
-`gjc_coordinator_submit_question_answer` requires `session_id`, `turn_id`, `question_id`, `answer_binding`, `answer`, `idempotency_key`, and `allow_mutation: true`. Copy the identifiers and binding from the pending row and use the advertised answer shape. The bridge re-reconciles and revalidates ownership, pending state, and the binding before calling `workflow.gate_answer`; it never invokes generic `ask.answer`. An incomplete snapshot fails as `terminal_uncertain`; stale, terminal, missing, or ownership-mismatched rows are non-answerable. Restart can remint or quarantine gates, so re-list instead of reusing old rows. Identical idempotent replay returns the original accepted result; the same key with different arguments fails `idempotency_conflict`.
+`gjc_coordinator_submit_question_answer` requires `session_id`, `turn_id`, `question_id`, `answer_binding`, `answer`, `idempotency_key`, and `allow_mutation: true`. Copy the identifiers and binding from the pending row and validate against that row's versioned `answer_schema` (the generic tool schema is also discoverable through `tools/list`). The bridge re-reconciles and revalidates ownership, pending state, and the binding before calling `workflow.gate_answer`; it never invokes generic `ask.answer`. An incomplete snapshot fails as `terminal_uncertain`; stale, terminal, missing, or ownership-mismatched rows are non-answerable. Restart can remint or quarantine gates, so re-list instead of reusing old rows. Identical idempotent replay returns the original accepted result; the same key with different arguments fails `idempotency_conflict`. `custom` and clarification `question` strings must contain at least one non-whitespace character, at most 4096 Unicode code points (`maxLength`), and at most 4096 UTF-8 bytes (`x-maxUtf8Bytes`). Controllers must enforce both advertised bounds; this extension makes the multibyte byte limit explicit and matches runtime validation.
 
 This pull-loop contract is independent of #2549/#2551 and unattended plain-CLI handling.
 
 ## Coordinator event journal
 
-The bridge persists a restart-safe event journal under the configured coordinator state namespace, for example:
+The bridge persists a restart-safe event journal under the configured coordinator state namespace:
 
 ```text
-$GJC_COORDINATOR_MCP_STATE_ROOT/<profile>/<repo>/events/event-journal.jsonl
+$GJC_COORDINATOR_MCP_STATE_ROOT/v1/<namespace-identity>/projections/events/event-journal.jsonl
 ```
+
+`<namespace-identity>` is an opaque coordinator-owned projection identity; do not derive it from profile or repository names or consume this file as an integration API. Prefer `gjc_coordinator_watch_events` and persist its returned `next_after_seq` cursor.
 
 Each event is a bounded JSONL record with `schema_version`, monotonic namespace-local `seq`, stable `id`, `timestamp`, canonical `kind`, optional `session_id`/`turn_id`/`question_id`/`report_id`, short `summary`, optional `payload_ref`, and bounded scalar `metadata`. Full prompts, reports, final responses, and artifacts stay in their existing turn/report/artifact read paths; event records only point at them.
 
-`gjc_coordinator_watch_events` is a bounded long-poll MCP tool, not an unbounded stream. Inputs are `after_seq` (default `0`), optional `session_id`, optional `event_types`, `timeout_ms` capped at 30000, and `limit` capped at 100. If matching events already exist after `after_seq`, it returns immediately. Otherwise it waits for the event journal to change or for timeout. The response includes `events`, `latest_seq`, `timed_out`, and `transport: { "mcp": "long_poll", "push_subscriptions": false }`, so coordinators can persist `latest_seq` and resume safely after restart.
+`gjc_coordinator_watch_events` is a bounded long-poll MCP tool, not an unbounded stream. Inputs are `after_seq` (default `0`, a non-negative integer), optional `session_id`, optional `event_types`, `timeout_ms` capped at 30000, and `limit` capped at 100. If matching events already exist after `after_seq`, it returns immediately. Otherwise it waits for the event journal to change or for timeout. The response includes `events`, `latest_seq`, `next_after_seq`, `timed_out`, and `transport: { "mcp": "long_poll", "push_subscriptions": false }`. Persist **`next_after_seq` only** and send it as the next `after_seq`; `latest_seq` is only the snapshot watermark. This distinction matters for filtered or limited pages: `next_after_seq` may be lower than `latest_seq` until the page has been consumed. If a cursor is ahead of the snapshot, recover with the returned `snapshot_watermark` (typically restart from that watermark after deciding whether older events are still needed). Malformed cursors are rejected as `invalid_input`, not reported as coordinator unavailability.
 
-`gjc_coordinator_read_coordination_status` keeps its existing report fields and now also includes `latest_event_seq` plus recent event summaries for snapshot-style consumers.
+`gjc_coordinator_read_coordination_status` keeps its existing report fields and now also includes `latest_event_seq` plus recent event summaries for snapshot-style consumers. Question data includes `question_snapshots` with per-session `diagnostics` and `reconciliation`; `summary.questions_complete` is false when any contributing snapshot is incomplete or unavailable, and `summary.questions`/`summary.open_questions` are then `null` rather than an authoritative zero. Controllers must retry question reconciliation before concluding that no input is required.
 
 ### Opt-in webhook delivery of journal rows
 
@@ -269,7 +271,7 @@ Delivery contract:
 
 A delegated prompt accepted through `gjc_delegate_execute` (which routes to `turn.prompt`) is governed by the same progress-aware SDK prompt deadline as any direct SDK prompt. The SDK accepts the prompt with `sdk.promptDeadlineMs` (`1_800_000` ms) as an inactivity lease and renews it only from attributable tool-execution progress (`tool_execution_start` / `tool_execution_end`) for the exact accepted `commandId`/`turnId`. Renewals are bounded by the hard maximum `sdk.promptMaxRuntimeMs` (`21_600_000` ms). Healthy long-running Ultragoal work therefore does not hit `prompt_deadline_exceeded` while it is still making attributable progress, yet a wedged or stuck turn still terminates deterministically.
 
-Coordinator clients must persist the returned `session_id` and `turn_id`, observe terminal status through `gjc_coordinator_read_turn` / `gjc_coordinator_await_turn` / Q26 `turn.result` reconciliation (`accepted` / `in_flight` / `terminal_ok` / `failed`), and reconcile after disconnect/restart rather than blindly replaying the prompt. The bounded `await_turn` poll timeout (`timeout_ms`) is distinct from the SDK prompt terminal deadline; await time-outs do not kill the turn.
+Coordinator clients must persist the returned `session_id` and `turn_id`, observe lifecycle through `gjc_coordinator_watch_events` (`turn.waiting_for_answer`, `question.opened`, `turn.completed`, and `turn.failed`), and reconcile after disconnect/restart rather than blindly replaying the prompt. Read the authoritative turn or question details with the existing read tools; `gjc_coordinator_read_turn`, `gjc_coordinator_await_turn`, and Q26 `turn.result` reconciliation (`accepted` / `in_flight` / `terminal_ok` / `failed`) remain compatibility paths. The bounded `await_turn` poll timeout (`timeout_ms`) is distinct from the SDK prompt terminal deadline; await time-outs do not kill the turn.
 
 ## Smoke check
 
