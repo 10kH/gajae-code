@@ -39,6 +39,12 @@ class FakeTransport implements HarnessSessionTransport {
 let root: string;
 let owner: RuntimeOwner | null = null;
 let hungServer: net.Server | null = null;
+/**
+ * Server-side sockets of the degraded-owner fixture. `close()` only resolves
+ * once every accepted connection is gone, and a connection this fixture
+ * half-closed stays open after the peer goes away.
+ */
+const hungSockets = new Set<net.Socket>();
 let cliEnv: HarnessCliEnv;
 
 function seed(workspace: string): SessionState {
@@ -109,6 +115,8 @@ beforeEach(async () => {
 afterEach(async () => {
 	cliEnv.cleanup();
 	await owner?.stop();
+	for (const socket of hungSockets) socket.destroy();
+	hungSockets.clear();
 	await new Promise<void>(resolve => hungServer?.close(() => resolve()) ?? resolve());
 	hungServer = null;
 	await rm(root, { recursive: true, force: true });
@@ -171,6 +179,7 @@ describe("gjc harness CLI -> live owner routing", () => {
 		owner = null;
 		const socketPath = controlSocketPath(root, SID);
 		hungServer = net.createServer(socket => {
+			hungSockets.add(socket);
 			socket.on("data", () => {});
 		});
 		await new Promise<void>((resolve, reject) => {
@@ -204,6 +213,7 @@ describe("gjc harness CLI -> live owner routing", () => {
 		owner = null;
 		const socketPath = controlSocketPath(root, SID);
 		hungServer = net.createServer(socket => {
+			hungSockets.add(socket);
 			socket.end("not-json\n");
 		});
 		await new Promise<void>((resolve, reject) => {

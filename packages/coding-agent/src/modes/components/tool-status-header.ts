@@ -1048,9 +1048,10 @@ export class StatusLineComponent implements Component {
 	render(width: number): string[] {
 		const lines: string[] = [];
 		this.#refreshSkillHudInBackground();
-		const skillHud = this.#settings.showSkillHud === false ? null : renderSkillHudBar(this.#skillHudEntries, width);
-		if (skillHud) {
-			for (const skillHudRow of skillHud.split("\n")) {
+		const skillHudRows =
+			this.#settings.showSkillHud === false ? null : renderSkillHudBar(this.#skillHudEntries, width);
+		if (skillHudRows) {
+			for (const skillHudRow of skillHudRows) {
 				if (skillHudRow) lines.push(truncateToWidth(skillHudRow, width));
 			}
 		}

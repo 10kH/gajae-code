@@ -103,8 +103,12 @@ test("caps a valid 50,000-line result before wrapping while preserving source om
 		hasResult: true,
 	});
 	const lines = renderToolDisplayLines(descriptor, 1, theme);
-	expect(lines).toHaveLength(TOOL_RESULT_MAX_EXPANDED_LINES + 11);
+	// The cap applies BEFORE wrapping: 50,000 source lines collapse to the expanded
+	// cap plus one omission footer. Asserted against the content lines rather than a
+	// total, so header/status chrome width can change without masking the cap.
+	expect(lines.filter(line => line === "x")).toHaveLength(TOOL_RESULT_MAX_EXPANDED_LINES);
 	expect(lines.at(-1)).toBe("... 49900 more lines");
+	expect(lines.length).toBeLessThan(TOOL_RESULT_MAX_EXPANDED_LINES + 20);
 });
 
 test("keeps rich expanded-tool recompute below the frame budget without a cache", () => {

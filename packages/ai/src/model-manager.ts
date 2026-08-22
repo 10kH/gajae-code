@@ -331,9 +331,15 @@ async function resolveProviderModelsUncoalesced<TApi extends Api = Api, TModelsD
 			);
 			const latestCacheIsLegacy =
 				cache?.dynamicModelIds === undefined && latestCache !== null && latestCache.dynamicModelIds === undefined;
-			const fallbackCacheModels = latestCacheMatchesCurrentContext
-				? normalizeModelList<TApi>(latestCache.models)
-				: [];
+			// An unbound context (the provider supplies no dynamic provenance) has no
+			// foreign-context risk, so a legacy row keeps serving its models through a
+			// failed refetch instead of blanking the catalog and overwriting the row
+			// with an empty snapshot.
+			const latestCacheServesLegacyRow = latestCacheIsLegacy && options.cacheDynamicModelProvenance === undefined;
+			const fallbackCacheModels =
+				(latestCacheMatchesCurrentContext || latestCacheServesLegacyRow) && latestCache !== null
+					? normalizeModelList<TApi>(latestCache.models)
+					: [];
 			cacheModels = fallbackCacheModels;
 			if (options.canPublishCache?.() ?? true) {
 				const snapshotModels = applyFinalCodexGpt56ContextCap(
