@@ -113,6 +113,7 @@ async function seedPlan(root: string): Promise<void> {
 	});
 	await runGit(root, [
 		"add",
+		"-f",
 		path.relative(root, path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "goals.json")),
 		path.relative(root, path.join(sessionUltragoalDir(root, TEST_SESSION_ID), "ledger.jsonl")),
 	]);

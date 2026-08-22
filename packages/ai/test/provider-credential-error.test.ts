@@ -76,8 +76,10 @@ describe("streamSimple missing credentials", () => {
 			messages: [{ role: "user", content: "hi", timestamp: 0 }],
 		};
 
-		expect(() => streamSimple(model, context)).toThrow("OpenCode subscriptions authenticate with an API key");
-		expect(() => streamSimple(model, context)).toThrow("OPENCODE_API_KEY");
-		expect(() => streamSimple(model, context)).toThrow("not a separate session/OAuth token");
+		expect(() => streamSimple(model, context, { apiKey: "" })).toThrow(
+			"OpenCode subscriptions authenticate with an API key",
+		);
+		expect(() => streamSimple(model, context, { apiKey: "" })).toThrow("OPENCODE_API_KEY");
+		expect(() => streamSimple(model, context, { apiKey: "" })).toThrow("not a separate session/OAuth token");
 	});
 });
