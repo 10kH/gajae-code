@@ -5799,15 +5799,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					} catch (error) {
 						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 					}
-					// Idle eligibility is judged against the durable WAL session, not the
+					// Idle eligibility is judged against the durable WAL, not the
 					// projection state file: projection repair refreshes that stamp
 					// (writeSessionState stamps `now`), which would reset the idle clock
 					// after every failed close and defer the reaper's retry by a whole
-					// TTL. The WAL session's updated_at is the truthful last-activity
-					// authority; the projection state stays the fallback for sessions
-					// whose WAL cannot be read.
+					// TTL. The truthful WAL activity authority is the turn watermark
+					// (recovery.prompt_watermark_at, advanced on every canonical turn
+					// commit) — canonical.session.updated_at is creation-only and would
+					// degenerate the idle TTL into an age-since-creation check that reaps
+					// in-use sessions between turns. Turn-less sessions fall back to their
+					// creation stamp; the projection state remains the fallback only when
+					// the WAL itself cannot be read.
 					const walSession = await readSessionTransaction(questionPaths, sessionId);
-					const walStamp = optionalString(walSession?.canonical.session.updated_at);
+					const walStamp =
+						optionalString(walSession?.recovery.prompt_watermark_at) ??
+						optionalString(walSession?.canonical.session.updated_at);
 					const state = await readSessionState(namespaceDir, sessionId);
 					const stamp = walStamp ?? optionalString(state?.updated_at) ?? optionalString(session.created_at);
 					const lastActivityMs = stamp ? Date.parse(stamp) : Number.NaN;

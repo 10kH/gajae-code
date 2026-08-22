@@ -132,6 +132,7 @@ async function writeSession(
 	id: string,
 	overrides: Record<string, unknown> = {},
 	activeTurn?: { turnId: string; status: "active" | "delivering" | "waiting_for_answer" | "completing" },
+	ages?: { creationAgeMs?: number; activityAgeMs?: number },
 ): Promise<void> {
 	// Sessions live in the durable canonical layout: initialized registry, a
 	// canonical WAL transaction, and the projection row the reaper reads. The
@@ -149,6 +150,7 @@ async function writeSession(
 		},
 		overrides,
 		...(activeTurn ? { activeTurn } : {}),
+		...(ages ?? {}),
 	});
 }
 
@@ -273,6 +275,22 @@ describe("gjc_coordinator_stop_session SDK lifecycle", () => {
 		]);
 		expect(await Bun.file(sessionFile("idle")).exists()).toBe(false);
 		expect(await Bun.file(sessionFile("registered")).exists()).toBe(true);
+	});
+	it("does not sweep an old ephemeral session whose last turn activity is recent", async () => {
+		const root = await tempRoot();
+		const { server, controls, sessionFile } = await createServer(root);
+		// Created 31+ minutes ago (past the idle TTL) but its durable turn
+		// watermark is 2 minutes ago: the session is in use between turns and
+		// must survive the sweep. Reading the creation stamp instead of the
+		// activity watermark would reap it (#4835 review finding).
+		await writeSession(sessionFile("busy"), root, "busy", { ephemeral: true }, undefined, {
+			creationAgeMs: 31 * 60_000,
+			activityAgeMs: 2 * 60_000,
+		});
+
+		expect(await server.sessionReaper.sweepOnce()).toBe(0);
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([]);
+		expect(await Bun.file(sessionFile("busy")).exists()).toBe(true);
 	});
 
 	describe("DR-1 narrow reap proves exact terminal row after incarnation-bound close", () => {
