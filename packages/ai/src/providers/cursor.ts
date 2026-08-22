@@ -29,6 +29,7 @@ import { normalizeSystemPrompts } from "../utils";
 import { kCursorExecResolved } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { findUnnecessaryUnicodeEscape, parseStreamingJson } from "../utils/json-parse";
+import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import { CURSOR_COMPOSER_EDIT_DISCIPLINE_PROMPT, isComposerHarnessModel } from "./composer-discipline";
@@ -59,7 +60,7 @@ import {
 	piReadDisplayPath,
 	piTimeout,
 } from "./cursor/exec-modern";
-import type { McpToolDefinition } from "./cursor/gen/agent_pb";
+import type { CursorRule, McpToolDefinition, RequestedModel_ModelParameterbytes } from "./cursor/gen/agent_pb";
 import {
 	AgentClientMessageSchema,
 	AgentConversationTurnStructureSchema,
@@ -75,6 +76,10 @@ import {
 	ConversationStateStructureSchema,
 	ConversationStepSchema,
 	ConversationTurnStructureSchema,
+	CursorRuleSchema,
+	CursorRuleSource,
+	CursorRuleTypeGlobalSchema,
+	CursorRuleTypeSchema,
 	DeleteErrorSchema,
 	DeleteRejectedSchema,
 	DeleteResultSchema,
@@ -134,6 +139,8 @@ import {
 	RequestContextResultSchema,
 	RequestContextSchema,
 	RequestContextSuccessSchema,
+	RequestedModel_ModelParameterbytesSchema,
+	RequestedModelSchema,
 	ResumeActionSchema,
 	SelectedContextSchema,
 	SelectedImageSchema,
@@ -364,12 +371,82 @@ function omitTypeName(record: Record<string, unknown>): Record<string, unknown> 
 	return rest;
 }
 
+const CURSOR_MODEL_EFFORT_RE = /^(.*)-(minimal|low|medium|high|xhigh|max)(-fast)?$/;
+const CURSOR_GPT_MODEL_RE =
+	/^gpt-\d+(?:\.\d+){0,2}(?:-(?:codex-spark|codex-mini|codex-max|codex|luna|mini|max|nano|sol|terra))?$/;
+// `codex-max` is itself an intrinsic Cursor model, not an effort suffix. Keep
+// its canonical and canonical-fast forms intact before parsing effort aliases.
+const CURSOR_INTRINSIC_CODEX_MAX_RE = /^gpt-\d+(?:\.\d+){0,2}-codex-max(?:-fast)?$/;
+
+/** Build the ordered global USER rules Cursor expects for the current system prompt. */
+export function buildCursorRequestContextRules(systemPrompt: readonly string[] | undefined): CursorRule[] {
+	return normalizeSystemPrompts(systemPrompt).map((content, index) =>
+		create(CursorRuleSchema, {
+			fullPath: `/gjc/system-prompt/${index}.mdc`,
+			content,
+			type: create(CursorRuleTypeSchema, {
+				type: {
+					case: "global",
+					value: create(CursorRuleTypeGlobalSchema, {}),
+				},
+			}),
+			source: CursorRuleSource.USER,
+		}),
+	);
+}
+
+export interface CursorWireModelResolution {
+	modelId: string;
+	parameters: RequestedModel_ModelParameterbytes[];
+	translated: boolean;
+}
+
+/** Resolve a Cursor model's GPT effort suffix into its wire model and parameter. */
+export function resolveCursorWireModelForTest(
+	model: Pick<Model<"cursor-agent">, "id" | "wireModelId">,
+): CursorWireModelResolution {
+	const wireModelId = model.wireModelId ?? model.id;
+	if (CURSOR_INTRINSIC_CODEX_MAX_RE.test(wireModelId)) {
+		return { modelId: wireModelId, parameters: [], translated: false };
+	}
+	const match = CURSOR_MODEL_EFFORT_RE.exec(wireModelId);
+	if (!match || !CURSOR_GPT_MODEL_RE.test(match[1])) {
+		return { modelId: wireModelId, parameters: [], translated: false };
+	}
+
+	const [, baseModelId, effort, fastSuffix] = match;
+	const modelId = `${baseModelId}${fastSuffix ?? ""}`;
+	return {
+		modelId,
+		parameters: [
+			create(RequestedModel_ModelParameterbytesSchema, {
+				id: "reasoning",
+				value: effort,
+			}),
+		],
+		translated: true,
+	};
+}
+
+/** Turn Cursor's opaque HTTP/2 failure into a useful transport diagnosis. */
+export function mapH2TransportError(error: unknown, baseUrl: string): unknown {
+	if (!error || typeof error !== "object") return error;
+	const candidate = error as { code?: unknown; message?: unknown };
+	if (candidate.code !== "ERR_HTTP2_ERROR" || typeof candidate.message !== "string") return error;
+	if (!/h2 is not supported/i.test(candidate.message)) return error;
+	return new Error(
+		`Cursor HTTP/2 is not supported by ${baseUrl}. Use an HTTP/2-capable endpoint, configure a proxy tunnel that preserves ALPN h2, or set providers.cursor.baseUrl to an HTTP/2 endpoint.`,
+		{ cause: error },
+	);
+}
+
 export const streamCursor: StreamFunction<"cursor-agent"> = (
 	model: Model<"cursor-agent">,
 	context: Context,
 	options?: CursorOptions,
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
+	const requestContextRules = buildCursorRequestContextRules(context.systemPrompt);
 
 	(async () => {
 		const startTime = Date.now();
@@ -395,12 +472,50 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 
 		let h2Client: http2.ClientHttp2Session | null = null;
 		let h2Request: http2.ClientHttp2Stream | null = null;
+		let proxiedSocket: Awaited<ReturnType<typeof connectProxiedSocket>> | null = null;
 		let heartbeatTimer: NodeJS.Timeout | null = null;
+		let h2ClientErrorHandler: ((error: Error) => void) | undefined;
+		let h2RequestErrorHandler: ((error: Error) => void) | undefined;
+		let onAbort: (() => void) | undefined;
+		const baseUrl = model.baseUrl || CURSOR_API_URL;
+		const h2Completion = Promise.withResolvers<void>();
+		h2Completion.promise.catch(() => {});
+		let h2Settled = false;
+		let h2Failure: unknown;
+		let sawTurnEnded = false;
+		let responseEnded = false;
+		let queueDrained = false;
+		let endStreamError: Error | null = null;
+		const settleH2 = (error?: unknown): void => {
+			if (h2Settled) return;
+			h2Settled = true;
+			if (error !== undefined) {
+				h2Failure = mapH2TransportError(error, baseUrl);
+				h2Completion.reject(h2Failure);
+			} else {
+				h2Completion.resolve();
+			}
+		};
+		const settleH2WhenReady = (): void => {
+			if (!queueDrained) return;
+			if (endStreamError) {
+				settleH2(endStreamError);
+			} else if (sawTurnEnded) {
+				// A drained turnEnded is the successful terminal condition; Cursor
+				// may leave the HTTP/2 response open after sending it.
+				settleH2();
+			} else if (responseEnded) {
+				settleH2(new Error("Cursor HTTP/2 stream ended before turnEnded"));
+			}
+		};
 
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
 				throw new Error("Cursor API key (access token) is required");
+			}
+			if (options?.signal?.aborted) {
+				throw new Error("Request was aborted");
 			}
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
@@ -415,9 +530,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			conversationStateCache.set(conversationId, conversationState);
 			touchCursorConversation(conversationId);
 			const requestContextTools = buildMcpToolDefinitions(context.tools);
-
-			const baseUrl = model.baseUrl || CURSOR_API_URL;
-			h2Client = http2.connect(baseUrl);
+			const targetUrl = new URL(baseUrl);
+			const proxyUrl = getProxyForUrl(model.provider, targetUrl);
+			if (options?.signal?.aborted) {
+				throw new Error("Request was aborted");
+			}
+			if (proxyUrl) {
+				proxiedSocket = await connectProxiedSocket(proxyUrl, baseUrl, {
+					signal: options?.signal,
+					timeoutMs: 30_000,
+				});
+				h2Client = http2.connect(baseUrl, { createConnection: () => proxiedSocket! });
+			} else {
+				h2Client = http2.connect(baseUrl);
+			}
+			h2ClientErrorHandler = error => settleH2(error);
+			h2Client.on("error", h2ClientErrorHandler);
 
 			h2Request = h2Client.request({
 				":method": "POST",
@@ -431,11 +559,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				"x-cursor-client-type": "cli",
 				"x-request-id": crypto.randomUUID(),
 			});
+			h2RequestErrorHandler = error => settleH2(error);
+			h2Request.on("error", h2RequestErrorHandler);
 
 			stream.push({ type: "start", partial: output });
 
 			let pendingBuffer = Buffer.alloc(0);
-			let endStreamError: Error | null = null;
 			let currentTextBlock: (TextContent & { index: number }) | null = null;
 			let currentThinkingBlock: (ThinkingContent & { index: number }) | null = null;
 			let currentToolCall: ToolCallState | null = null;
@@ -473,11 +602,43 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				touchCursorConversation(conversationId);
 			};
 
-			let resolveH2: (() => void) | undefined;
-			let rejectH2: ((error: unknown) => void) | undefined;
 			const messageQueue = createCursorMessageQueueForTest(error => {
 				log("error", "handleServerMessage", { error: String(error) });
 			});
+			const drainMessageQueue = (): void => {
+				void messageQueue.drain().then(
+					() => {
+						queueDrained = true;
+						settleH2WhenReady();
+					},
+					error => {
+						queueDrained = true;
+						settleH2(error);
+					},
+				);
+			};
+
+			h2Request.on("trailers", trailers => {
+				const status = trailers["grpc-status"];
+				const msg = trailers["grpc-message"];
+				if (status && status !== "0") {
+					settleH2(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+				}
+			});
+			h2Request.on("end", () => {
+				responseEnded = true;
+				drainMessageQueue();
+			});
+			onAbort = () => {
+				h2Request?.close();
+				h2Client?.close();
+				proxiedSocket?.destroy();
+				settleH2(new Error("Request was aborted"));
+			};
+			if (options?.signal) {
+				options.signal.addEventListener("abort", onAbort, { once: true });
+				if (options.signal.aborted) onAbort();
+			}
 
 			h2Request.on("data", (chunk: Buffer) => {
 				pendingBuffer = Buffer.concat([pendingBuffer, chunk]);
@@ -491,10 +652,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					pendingBuffer = pendingBuffer.subarray(5 + msgLen);
 
 					if (flags & CONNECT_END_STREAM_FLAG) {
+						responseEnded = true;
 						const endError = parseConnectEndStream(messageBytes);
 						if (endError) {
 							endStreamError = endError;
+							settleH2(endError);
 							h2Request?.close();
+						} else {
+							drainMessageQueue();
 						}
 						continue;
 					}
@@ -519,20 +684,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 								usageState,
 								requestContextTools,
 								onConversationCheckpoint,
+								requestContextRules,
 							),
 						);
 
-						// Resolve only on explicit turnEnded. stopReason defaults to "stop"
-						// and is not a reliable signal for stream completion.
 						if (isTurnEnded) {
-							messageQueue.drain().then(() => {
-								if (resolveH2) {
-									const r = resolveH2;
-									resolveH2 = undefined;
-									rejectH2 = undefined;
-									r();
-								}
-							});
+							sawTurnEnded = true;
+							drainMessageQueue();
 						}
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
@@ -540,6 +698,9 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				}
 			});
 
+			if (h2Settled) {
+				await h2Completion.promise;
+			}
 			h2Request.write(frameConnectMessage(requestBytes));
 
 			const sendHeartbeat = () => {
@@ -554,39 +715,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
-
-			await new Promise<void>((resolve, reject) => {
-				resolveH2 = resolve;
-				rejectH2 = reject;
-
-				h2Request!.on("trailers", trailers => {
-					const status = trailers["grpc-status"];
-					const msg = trailers["grpc-message"];
-					if (status && status !== "0") {
-						reject(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
-					}
-				});
-
-				h2Request!.on("end", () => {
-					messageQueue.drain().then(() => {
-						resolveH2 = undefined;
-						rejectH2 = undefined;
-						if (endStreamError) reject(endStreamError);
-						else resolve();
-					});
-				});
-
-				h2Request!.on("error", error => {
-					if (rejectH2) rejectH2(error);
-				});
-
-				if (options?.signal) {
-					options.signal.addEventListener("abort", () => {
-						h2Request?.close();
-						reject(new Error("Request was aborted"));
-					});
-				}
-			});
+			await h2Completion.promise;
 
 			if (state.currentTextBlock) {
 				const idx = output.content.indexOf(state.currentTextBlock);
@@ -633,9 +762,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			});
 			stream.end();
 		} catch (error) {
+			// Keep the completion promise terminal even for synchronous setup/write
+			// failures that may not emit a separate HTTP/2 error event.
+			if (!h2Settled) settleH2(error);
+			const mappedError = h2Failure ?? error;
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorStatus = extractHttpStatusFromError(error);
-			output.errorMessage = formatErrorMessageWithRetryAfter(error);
+			output.errorStatus = extractHttpStatusFromError(mappedError);
+			output.errorMessage = formatErrorMessageWithRetryAfter(mappedError);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -645,8 +778,18 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				clearInterval(heartbeatTimer);
 				heartbeatTimer = null;
 			}
+			if (options?.signal && onAbort) {
+				options.signal.removeEventListener("abort", onAbort);
+			}
+			if (h2Request && h2RequestErrorHandler) {
+				h2Request.removeListener("error", h2RequestErrorHandler);
+			}
+			if (h2Client && h2ClientErrorHandler) {
+				h2Client.removeListener("error", h2ClientErrorHandler);
+			}
 			h2Request?.close();
 			h2Client?.close();
+			proxiedSocket?.destroy();
 		}
 	})();
 
@@ -687,6 +830,7 @@ async function handleServerMessage(
 	usageState: UsageState,
 	requestContextTools: McpToolDefinition[],
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
+	requestContextRules: CursorRule[] = [],
 ): Promise<void> {
 	const msgCase = msg.message.case;
 
@@ -705,6 +849,7 @@ async function handleServerMessage(
 			requestContextTools,
 			output,
 			stream,
+			requestContextRules,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
@@ -1063,12 +1208,13 @@ async function handleExecServerMessage(
 	requestContextTools: McpToolDefinition[],
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
+	requestContextRules: CursorRule[] = [],
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
 	if (execCase === "requestContextArgs") {
 		const requestContext = create(RequestContextSchema, {
-			rules: [],
+			rules: requestContextRules,
 			repositoryInfo: [],
 			tools: requestContextTools,
 			gitRepos: [],
@@ -3034,8 +3180,9 @@ function buildGrpcRequest(
 		turns,
 	});
 
+	const resolvedModel = resolveCursorWireModelForTest(model);
 	const modelDetails = create(ModelDetailsSchema, {
-		modelId: model.id,
+		modelId: resolvedModel.modelId,
 		displayModelId: model.id,
 		displayName: model.name,
 	});
@@ -3045,6 +3192,14 @@ function buildGrpcRequest(
 		action,
 		modelDetails,
 		conversationId: state.conversationId,
+		...(resolvedModel.translated
+			? {
+					requestedModel: create(RequestedModelSchema, {
+						modelId: resolvedModel.modelId,
+						parameters: resolvedModel.parameters,
+					}),
+				}
+			: {}),
 	});
 
 	options?.onPayload?.(runRequest, model, options?.attemptScope);
