@@ -98,6 +98,16 @@ describe("skill HUD bar renderer", () => {
 		expect(rows.every(row => Bun.stringWidth(Bun.stripANSI(row)) <= 10)).toBe(true);
 		expect(rows[0]).not.toBe("◆");
 		expect(text).toContain(theme?.status.error ?? "[!!]");
+		const longSkillRows = renderSkillHudBar(
+			[
+				{
+					skill: "averyverylongskillname",
+					hud: { version: 1, chips: [{ label: "blocked", value: "yes", severity: "blocked" }] },
+				},
+			],
+			10,
+		);
+		expect(longSkillRows?.join("\n")).toContain(theme?.status.error ?? "[!!]");
 	});
 
 	it("sanitizes dynamic text and truncates to width", () => {

@@ -11,7 +11,7 @@ const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 const MAX_HUD_ROWS = 2;
 
 type WidthTier = "wide" | "medium" | "tight";
-type HudToken = { text: string; mandatory: boolean; startsEntry?: boolean };
+type HudToken = { text: string; mandatory: boolean; startsEntry?: boolean; reserveAfter?: number };
 
 function color(role: "border" | "accent" | "dim" | "muted" | "warning" | "error", text: string): string {
 	return theme?.fg(role, text) ?? text;
@@ -90,11 +90,16 @@ function buildEntryTokens(entry: SkillActiveEntry, tier: WidthTier): HudToken[] 
 	const severity =
 		chips.find(chip => chip.severity === "error" || chip.severity === "blocked")?.severity ??
 		chips.find(chip => chip.severity === "warning")?.severity;
+	const glyph = severityGlyph(severity);
 	const tokens: HudToken[] = [
-		{ text: color("accent", tier === "tight" ? skill : base), mandatory: true, startsEntry: true },
+		{
+			text: color("accent", tier === "tight" ? skill : base),
+			mandatory: true,
+			startsEntry: true,
+			reserveAfter: glyph ? visibleWidth(` ${glyph}`) : 0,
+		},
 	];
 
-	const glyph = severityGlyph(severity);
 	if (glyph) tokens.push({ text: glyph, mandatory: true });
 
 	if (tier === "medium") {
@@ -113,8 +118,19 @@ function buildEntryTokens(entry: SkillActiveEntry, tier: WidthTier): HudToken[] 
 	return tokens;
 }
 
-function appendOverflowMarker(row: string, width: number): string {
+function appendOverflowMarker(row: string, width: number, protectedToken?: string): string {
 	if (!row || width <= 0) return row;
+	if (protectedToken) {
+		const tokenIndex = row.lastIndexOf(protectedToken);
+		if (tokenIndex >= 0) {
+			const prefix = row.slice(0, tokenIndex);
+			const tokenWidth = visibleWidth(protectedToken);
+			const plainPrefix = Bun.stripANSI(prefix).trimEnd();
+			const needsMarker = !plainPrefix.endsWith("…");
+			const prefixWidth = Math.max(0, width - tokenWidth - (needsMarker ? 1 : 0));
+			return `${truncateToWidth(prefix, prefixWidth)}${needsMarker ? "…" : ""}${protectedToken}`;
+		}
+	}
 	return truncateToWidth(`${row}…`, width);
 }
 
@@ -138,6 +154,7 @@ export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: n
 	let rowIndex = 0;
 	let hasToken = false;
 	let omitted = false;
+	let lastSeverityToken: string | undefined;
 
 	const tryAppend = (token: HudToken, allowTruncate: boolean): boolean => {
 		let joiner = hasToken ? (token.startsEntry ? separator : " ") : "";
@@ -148,11 +165,12 @@ export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: n
 			available = width;
 		}
 		if (available <= 0) return false;
+		const textAvailable = Math.max(0, available - (allowTruncate ? (token.reserveAfter ?? 0) : 0));
 		const text =
-			visibleWidth(token.text) <= available
+			visibleWidth(token.text) <= textAvailable
 				? token.text
 				: allowTruncate
-					? truncateToWidth(token.text, available)
+					? truncateToWidth(token.text, textAvailable)
 					: "";
 		if (!text || visibleWidth(text) <= 0) return false;
 		row = `${row}${joiner}${text}`;
@@ -171,10 +189,15 @@ export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: n
 
 	for (const entry of active) {
 		for (const token of buildEntryTokens(entry, tier)) {
-			if (tryAppend(token, false)) continue;
-			if (startNextRow() && tryAppend(token, false)) continue;
-			if (tryAppend(token, true)) continue;
-			if (token.mandatory && startNextRow() && tryAppend(token, true)) continue;
+			const append = (allowTruncate: boolean): boolean => {
+				const appended = tryAppend(token, allowTruncate);
+				if (appended && token.mandatory && !token.startsEntry) lastSeverityToken = token.text;
+				return appended;
+			};
+			if (append(false)) continue;
+			if (startNextRow() && append(false)) continue;
+			if (append(true)) continue;
+			if (token.mandatory && startNextRow() && append(true)) continue;
 			omitted = true;
 			break;
 		}
@@ -184,7 +207,7 @@ export function renderSkillHudBar(entries: readonly SkillActiveEntry[], width: n
 	if (hasToken) rows.push(truncateToWidth(row, width));
 	if (omitted && rows.length > 0) {
 		const last = rows.length - 1;
-		rows[last] = appendOverflowMarker(rows[last] ?? "", width);
+		rows[last] = appendOverflowMarker(rows[last] ?? "", width, lastSeverityToken);
 	}
 	return rows.length > 0 ? rows.slice(0, MAX_HUD_ROWS) : null;
 }
