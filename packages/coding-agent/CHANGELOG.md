@@ -16,6 +16,8 @@
 
 ### Fixed
 
+- Fixed long skill-HUD entries corrupting bottom-pinned TUI row accounting by emitting at most two independent width-bounded rows and preserving severity glyphs through narrow truncation.
+
 - SDK `goal.list/get` no longer reports `resource_gone` when an in-flight session's live goal projection is temporarily unavailable. It recovers the latest authoritative goal mode state from the current session branch after runtime recreation or session replacement, while goal-less sessions return an explicit `no_active_goal` diagnostic instead of being confused with snapshot-store loss (#4824).
 
 - `/logout` (and `gjc accounts logout`) now remove stored API-key credentials, not just OAuth rows. The interactive logout and the CLI only enumerated `oauth` inventory, so API-key logins (OpenCode Go/Zen, Cursor, Venice, DeepSeek, …) were rejected with `API-key credentials are not managed here`; both paths now remove stored credentials of either kind.
