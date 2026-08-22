@@ -60,7 +60,7 @@ describe("adaptive compaction threshold", () => {
 		expect(
 			resolveThresholdTokens(100_000, {
 				...adaptiveSettings,
-				adaptiveState: { turnsSinceCompact: 20, callsInWindow: 60 },
+				adaptiveState: { turnsSinceCompact: 20, callsInWindow: 60, lastContextTokens: 80_000 },
 			}),
 		).toBeLessThan(
 			resolveThresholdTokens(100_000, {
