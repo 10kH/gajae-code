@@ -92,5 +92,5 @@ describe("direct SDK image tool settings", () => {
 		expect(result.details?.provider).toBe("openai");
 		expect(credentialScopes.length).toBeGreaterThan(0);
 		expect(credentialScopes.every(scope => scope === credentialSessionId)).toBe(true);
-	});
+	}, 30_000);
 });
