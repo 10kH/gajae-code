@@ -18,6 +18,10 @@ const preregistrationPath = path.resolve(import.meta.dir, "../bench/perf-corpus-
 const templatePath = path.resolve(import.meta.dir, "../bench/perf-corpus-rlm-template.ipynb");
 const bundleDirectory = path.dirname(driverPath);
 const canonicalBenchmarkPath = path.resolve(import.meta.dir, "../bench/perf-corpus.bench.ts");
+// The driver admits exactly one Bun runtime pin, so fixtures must track that
+// constant rather than a duplicated literal that silently rots on every pin bump.
+const pinnedBunVersion = (await Bun.file(driverPath).text()).match(/^BUN_VERSION = "([^"]+)"$/mu)?.[1];
+if (pinnedBunVersion === undefined) throw new Error("perf-corpus RLM driver BUN_VERSION pin is unavailable");
 
 function runPerfCorpusBenchmark(): PerfCorpusReport {
 	const result = Bun.spawnSync([process.execPath, ...process.execArgv, canonicalBenchmarkPath], {
@@ -504,7 +508,7 @@ function reportFor(
 		environment,
 		platform: "darwin",
 		arch: "arm64",
-		bunVersion: "1.3.14",
+		bunVersion: pinnedBunVersion,
 		bunExecutable: "bun",
 		bunExecutableSha256: "b".repeat(64),
 		worktreeFingerprint: "c".repeat(64),
@@ -1090,7 +1094,7 @@ describe("trusted perf-corpus RLM analysis driver", () => {
 		});
 		expect(result.cohort?.sharedRunnerProvenance).toMatchObject({
 			runtimeCommand: "bun packages/coding-agent/bench/perf-corpus.bench.ts",
-			bunVersion: "1.3.14",
+			bunVersion: pinnedBunVersion,
 			bunExecutable: "bun",
 			bunExecutableSha256: "b".repeat(64),
 			worktreeFingerprint: "c".repeat(64),
