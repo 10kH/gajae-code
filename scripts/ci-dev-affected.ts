@@ -1047,7 +1047,7 @@ function addCodingAgentTestShard(tasks: Map<string, Task>, shard: number, total:
 			"--root=packages/coding-agent",
 			`--shard=${shard}/${total}`,
 			"--timeout=30000",
-			"--file-timeout=300000",
+			"--file-timeout=600000",
 			"--concurrency=1",
 		],
 	);

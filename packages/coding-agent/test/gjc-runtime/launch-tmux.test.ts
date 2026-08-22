@@ -22,7 +22,12 @@ import {
 	__setExecutableIdentityResolverForTests,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
 import { sessionRuntimeDir } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
-import { persistCoordinatorRuntimeStateFromPostmortem } from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
+import {
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
+	persistCoordinatorRuntimeStateFromPostmortem,
+} from "@gajae-code/coding-agent/gjc-runtime/session-state-sidecar";
 import {
 	captureOwnerGenerationBaselineSync,
 	isExactScopedBootstrapSuccessReceipt,
@@ -568,6 +573,214 @@ describe("default GJC tmux launch", () => {
 		expect(plan.innerCommand).toContain("tmux-exit.json");
 		expect(plan.innerCommand).toContain("trap __gjc_tmux_write_exit_marker EXIT");
 		expect(plan.innerCommand).not.toStartWith("exec ");
+	});
+
+	it("keeps the sidecar PKCS#8 private key out of tmux argv projections", () => {
+		const privateKey = "private-pkcs8-der-base64";
+		const plan = buildDefaultTmuxLaunchPlan({
+			parsed: args({ messages: ["hello world"], tmux: true }),
+			rawArgs: ["--tmux", "hello world"],
+			cwd: "/repo",
+			env: {
+				GJC_PSMUX_DETECTION: "off",
+				[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+				[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: privateKey,
+				[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: "a".repeat(64),
+			},
+			argv: ["bun", "packages/coding-agent/src/cli.ts"],
+			execPath: "/bin/bun",
+			platform: "darwin",
+			tty: interactiveTty,
+			tmuxAvailable: true,
+		});
+		expect(plan?.innerCommand).toBeDefined();
+		expect(plan?.innerCommand).not.toContain(privateKey);
+		expect(plan?.newSessionArgs.join(" ")).not.toContain(privateKey);
+	});
+	function coordinatorSidecarLaunchEnv(root: string, sessionId: string): Record<string, string> {
+		return {
+			GJC_TMUX_COMMAND: "tmux",
+			GJC_PSMUX_DETECTION: "off",
+			GJC_COORDINATOR_SESSION_ID: sessionId,
+			GJC_COORDINATOR_SESSION_STATE_FILE: path.join(root, "runtime-state.json"),
+			[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+			[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: "pkcs8-private-key-material",
+			[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: "a".repeat(64),
+		};
+	}
+
+	function leftoverCoordinatorSidecarKeys(root: string): string[] {
+		const scan = (dir: string): string[] =>
+			fs
+				.readdirSync(dir, { withFileTypes: true })
+				.flatMap(entry =>
+					entry.isDirectory()
+						? scan(path.join(dir, entry.name))
+						: entry.name.includes(".coordinator-sidecar-")
+							? [path.join(dir, entry.name)]
+							: [],
+				);
+		try {
+			return scan(root);
+		} catch {
+			return [];
+		}
+	}
+
+	it("never writes the coordinator sidecar bootstrap key when tmux is unavailable", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sidecar-unavailable-"));
+		try {
+			const diagnostics: string[] = [];
+			const writeSpy = spyOn(fs, "writeFileSync");
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd: root,
+				env: coordinatorSidecarLaunchEnv(root, "sidecar-unavailable"),
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "linux",
+				tty: interactiveTty,
+				tmuxAvailable: false,
+				existingBranchSessionName: null,
+				diagnosticWriter: message => diagnostics.push(message),
+			});
+			expect(handled).toBe(true);
+			expect(diagnostics).toEqual([
+				"gjc --tmux requested but no tmux executable was found; cannot continue without a tmux-backed session.\n",
+			]);
+			expect(writeSpy).not.toHaveBeenCalled();
+			expect(leftoverCoordinatorSidecarKeys(root)).toEqual([]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("never writes the coordinator sidecar bootstrap key when attaching an existing session", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sidecar-attach-"));
+		try {
+			const calls: string[][] = [];
+			__setMutationServerProofForTests(() => ({ pid: 101, startTime: "a" }));
+			spyOn(Bun, "spawnSync").mockImplementation(((options: string[] | { cmd: string[] }) => {
+				const command = "cmd" in options ? [...options.cmd] : [...options];
+				calls.push(command);
+				if (command.includes("list-sessions"))
+					return spawnResult(0, "managed\t1\t0\t1770000000\t1\troot\t0\t\t\t\t\t\t\t\t\n");
+				if (command.includes("show-options")) return spawnResult(0, "1\n");
+				if (command.includes("display-message")) return spawnResult(0, "$42\n");
+				return spawnResult(0, "");
+			}) as unknown as typeof Bun.spawnSync);
+			const writeSpy = spyOn(fs, "writeFileSync");
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true, continue: true }),
+				rawArgs: ["--tmux", "--continue", "hello"],
+				cwd: root,
+				env: coordinatorSidecarLaunchEnv(root, "sidecar-attach"),
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "linux",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				currentBranch: "feature/demo",
+				worktreeBranch: "feature/demo",
+				existingBranchSessionName: "managed",
+				diagnosticWriter: () => {},
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					return { exitCode: 0 };
+				},
+			});
+			expect(handled).toBe(true);
+			expect(calls.some(call => call[0] === "attach-session")).toBe(true);
+			expect(calls.some(call => call[0] === "new-session")).toBe(false);
+			expect(writeSpy).not.toHaveBeenCalled();
+			expect(leftoverCoordinatorSidecarKeys(root)).toEqual([]);
+		} finally {
+			__setMutationServerProofForTests(null);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("scrubs the coordinator sidecar bootstrap key when the second attach proof fails", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sidecar-second-proof-"));
+		try {
+			const calls: string[][] = [];
+			let proofCount = 0;
+			__setMutationServerProofForTests(() => {
+				proofCount++;
+				return proofCount <= 2 ? { pid: 101, startTime: "a" } : { pid: 202, startTime: "b" };
+			});
+			spyOn(Bun, "spawnSync").mockImplementation(((options: string[] | { cmd: string[] }) => {
+				const command = "cmd" in options ? [...options.cmd] : [...options];
+				calls.push(command);
+				if (command.includes("list-sessions"))
+					return spawnResult(0, "managed\t1\t0\t1770000000\t1\troot\t0\t\t\t\t\t\t\t\t\n");
+				if (command.includes("show-options")) return spawnResult(0, "1\n");
+				if (command.includes("display-message")) return spawnResult(0, "$42\n");
+				return spawnResult(0, "");
+			}) as unknown as typeof Bun.spawnSync);
+			const writeSpy = spyOn(fs, "writeFileSync");
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true, continue: true }),
+				rawArgs: ["--tmux", "--continue", "hello"],
+				cwd: root,
+				env: coordinatorSidecarLaunchEnv(root, "sidecar-second-proof"),
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "linux",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				currentBranch: "feature/demo",
+				worktreeBranch: "feature/demo",
+				existingBranchSessionName: "managed",
+				diagnosticWriter: () => {},
+				spawnSync: (_command, spawnArgs) => {
+					calls.push(spawnArgs);
+					return { exitCode: 0 };
+				},
+			});
+			expect(handled).toBe(true);
+			expect(proofCount).toBeGreaterThanOrEqual(3);
+			expect(calls.some(call => call[0] === "attach-session")).toBe(false);
+			expect(writeSpy).not.toHaveBeenCalled();
+			expect(leftoverCoordinatorSidecarKeys(root)).toEqual([]);
+		} finally {
+			__setMutationServerProofForTests(null);
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("uses a one-shot coordinator sidecar bootstrap endpoint only for the launching managed owner", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sidecar-launch-"));
+		try {
+			let commandBootstrapPath: string | undefined;
+			const handled = launchDefaultTmuxIfNeeded({
+				parsed: args({ messages: ["hello"], tmux: true }),
+				rawArgs: ["--tmux", "hello"],
+				cwd: root,
+				env: coordinatorSidecarLaunchEnv(root, "sidecar-launch"),
+				argv: ["bun", "cli.ts"],
+				execPath: "/bin/bun",
+				platform: "linux",
+				tty: interactiveTty,
+				tmuxAvailable: true,
+				existingBranchSessionName: null,
+				diagnosticWriter: () => {},
+				spawnSync: (_command, spawnArgs) => {
+					if (spawnArgs[0] === "new-session") {
+						const inner = spawnArgs.at(-1) ?? "";
+						commandBootstrapPath = /GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL='([^']+)'/.exec(inner)?.[1];
+					}
+					return { exitCode: 0, stdout: NATIVE_SESSION_ID };
+				},
+			});
+			expect(handled).toBe(true);
+			expect(commandBootstrapPath).toBeString();
+			expect(commandBootstrapPath).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/bootstrap\/[0-9a-f-]{36}$/i);
+			expect(leftoverCoordinatorSidecarKeys(root)).toEqual([]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
 	});
 
 	it("POSIX tmux inner wrapper writes a public-safe exit marker and preserves exit status", () => {
@@ -3502,6 +3715,9 @@ describe("tmux owner isolation launch gate", () => {
 				env: {
 					GJC_COORDINATOR_SESSION_ID: sessionId,
 					GJC_COORDINATOR_SESSION_STATE_FILE: stateFile,
+					[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+					[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: "managed-private-pkcs8-der-base64",
+					[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: "a".repeat(64),
 				},
 				argv: ["bun", "cli.ts"],
 				execPath: "/bin/bun",
@@ -3525,7 +3741,12 @@ describe("tmux owner isolation launch gate", () => {
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_GENERATION='${generation.generation}'`);
 			expect(innerCommand).toContain(`GJC_TMUX_OWNER_STATE_DIR='${root}'`);
 			expect(innerCommand).toContain("GJC_TMUX_OWNER_SERVER_KEY='tmux'");
+			expect(innerCommand).not.toContain("managed-private-pkcs8-der-base64");
 			expect(innerCommand).toStartWith("exec env GJC_TMUX_LAUNCHED=1");
+			expect(innerCommand).toMatch(
+				/GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL='http:\/\/127\.0\.0\.1:\d+\/bootstrap\/[0-9a-f-]{36}'/i,
+			);
+			expect(innerCommand).not.toContain("__gjc_sidecar_key");
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_RUN_ID='[0-9a-f-]{36}'/i);
 			expect(innerCommand).toMatch(/GJC_MANAGED_OWNER_INCARNATION='[0-9a-f-]{36}'/i);
 			expect(innerCommand).not.toContain("GJC_MANAGED_OWNER_PREDECESSOR_TOKEN");

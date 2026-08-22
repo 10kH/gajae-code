@@ -1610,6 +1610,11 @@ const machineWrapperEntrypoints = new Map<string, string>([
 	["packages/coding-agent/src/sdk/cli/session-cli.ts", "sdk session CLI"],
 ]);
 const rootAcpEntrypoint = "packages/coding-agent/src/main.ts";
+// Coordinator model-pin is a read-only preflight boundary. It reuses the full
+// model catalog for CLI-parity validation but never owns session lifecycle or
+// dispatches SDK operations, so its catalog dependencies are intentionally not
+// treated as machine-entrypoint session reachability.
+const sanctionedCoordinatorModelPin = "packages/coding-agent/src/coordinator-mcp/model-pin.ts";
 const directMachineWrapperRoutePattern =
 	/(?:\b(?:import|export)\s+(?:type\s+)?(?:[\s\S]*?\s+from\s+)?["'][^"']*(?:session\/agent-session|sdk\/session|sdk\/host\/(?:control|query)|session\/client-bridge|modes\/(?:rpc|bridge)|\/(?:rpc|bridge)(?=[-"'/.]|$)|unattended)(?:[-"'/.]|$)|\bimport\s*\(\s*["'][^"']*(?:session\/agent-session|sdk\/session|sdk\/host\/(?:control|query)|session\/client-bridge|modes\/(?:rpc|bridge)|\/(?:rpc|bridge)(?=[-"'/.]|$)|unattended)(?:[-"'/.]|$)|["'](?:rpc|bridge)(?:[-"'/.]|$)|--mode(?:\s+|=)["']?rpc(?:\b|["'])|["']--mode["']\s*,\s*["']rpc["']|\b(?:new\s+)?AgentSession\b|\b(?:agentSession|agent_session|session)\s*\.\s*(?:prompt|promptCustomMessage|abort|abortAndPrompt|followUp|answer)\s*\(|(?:Bun\.(?:spawn|spawnSync)|runner)\s*\(\s*\[[^\]]*?\b(?:tmux|tmux_command)\b)/g;
 
@@ -1782,6 +1787,7 @@ function scanMachineImportGraphs(contentsByFile: Map<string, string>): string[] 
 			const current = pending.shift();
 			if (!current || visited.has(current.file)) continue;
 			visited.add(current.file);
+			if (current.file === sanctionedCoordinatorModelPin) continue;
 			const forbidden = current.file === root ? undefined : forbiddenMachineModule(current.file);
 			if (forbidden) {
 				violations.push(

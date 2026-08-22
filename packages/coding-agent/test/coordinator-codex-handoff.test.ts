@@ -5,7 +5,9 @@ import * as path from "node:path";
 import {
 	ackCodexWakeEvent,
 	bindDelegateCodexHandoff,
+	listCodexHandoffs,
 	listCodexWakeEvents,
+	listPendingCodexWakeEvents,
 	readCodexHandoff,
 	recordCodexWakeEvent,
 	registerCodexHandoff,
@@ -117,6 +119,7 @@ describe("Codex handoff durable state", () => {
 			thread_id: "thread-3",
 			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
 			token_file: tokenFile,
+			token_root: tokenDir,
 		});
 
 		const state = await persistedText(root);
@@ -131,6 +134,77 @@ describe("Codex handoff durable state", () => {
 			}),
 		).rejects.toThrow("token_material_not_allowed");
 	});
+	it("lists valid handoffs when a legacy token registration requires migration", async () => {
+		const root = await tempRoot();
+		const tokenRoot = await tempRoot();
+		const tokenFile = path.join(tokenRoot, "token.txt");
+		await fs.writeFile(tokenFile, "token", { mode: 0o600 });
+		await registerCodexHandoff(root, {
+			work_unit: "valid-session",
+			thread_id: "valid-thread",
+			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+		});
+		const legacy = await registerCodexHandoff(root, {
+			work_unit: "legacy-session",
+			thread_id: "legacy-thread",
+			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+			token_file: tokenFile,
+			token_root: tokenRoot,
+		});
+		const { token_file_identity: _identity, ...legacyWithoutIdentity } = legacy;
+		await fs.writeFile(
+			path.join(root, "codex-handoffs", "legacy-session.json"),
+			JSON.stringify(legacyWithoutIdentity),
+		);
+		expect(await listCodexHandoffs(root)).toMatchObject([{ work_unit: "valid-session" }]);
+	});
+	it("isolates a legacy migration-required entry so valid handoffs and their wake drains survive", async () => {
+		const root = await tempRoot();
+		const tokenRoot = await tempRoot();
+		const tokenFile = path.join(tokenRoot, "token.txt");
+		await fs.writeFile(tokenFile, "token", { mode: 0o600 });
+		for (const index of [0, 1, 2]) {
+			const workUnit = `valid-session-${index}`;
+			await registerCodexHandoff(root, {
+				work_unit: workUnit,
+				thread_id: `valid-thread-${index}`,
+				endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+			});
+			await recordCodexWakeEvent(root, {
+				work_unit: workUnit,
+				event_seq: 1,
+				event_kind: "question.opened",
+				summary: `pending wake ${index}`,
+			});
+		}
+		const legacy = await registerCodexHandoff(root, {
+			work_unit: "legacy-session",
+			thread_id: "legacy-thread",
+			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
+			token_file: tokenFile,
+			token_root: tokenRoot,
+		});
+		const { token_file_identity: _identity, ...legacyWithoutIdentity } = legacy;
+		await fs.writeFile(
+			path.join(root, "codex-handoffs", "legacy-session.json"),
+			JSON.stringify(legacyWithoutIdentity),
+		);
+
+		const listed = await listCodexHandoffs(root);
+		expect(listed.map(handoff => handoff.work_unit)).toEqual([
+			"valid-session-0",
+			"valid-session-1",
+			"valid-session-2",
+		]);
+		await expect(readCodexHandoff(root, "legacy-session")).rejects.toThrow(
+			"codex_token_file_reregistration_required",
+		);
+		for (const [index, handoff] of listed.entries())
+			expect((await listPendingCodexWakeEvents(root, handoff.work_unit)).map(event => event.summary)).toEqual([
+				`pending wake ${index}`,
+			]);
+	});
+
 	it("creates exactly one wake across concurrent Bun processes", async () => {
 		const root = await tempRoot();
 		const marker = path.join(root, "start");
@@ -233,11 +307,17 @@ console.log(JSON.stringify(await recordCodexWakeEvent(${JSON.stringify(root)}, {
 	});
 	it("round-trips delegate origins and never overwrites an existing delegate binding", async () => {
 		const root = await tempRoot();
+		const tokenRoot = path.join(root, "managed-codex-tokens");
+		await fs.mkdir(tokenRoot, { mode: 0o700 });
+		const tokenFile = path.join(tokenRoot, "codex-token");
+		await fs.writeFile(tokenFile, "test-token", { mode: 0o600 });
+		await fs.chmod(tokenFile, 0o600);
 		const source = await registerCodexHandoff(root, {
 			work_unit: "host-session",
 			thread_id: "thread-source",
 			endpoint: { kind: "unix", path: "/tmp/codex.sock" },
-			token_file: "/tmp/codex-token",
+			token_file: tokenFile,
+			token_root: tokenRoot,
 		});
 		const origin = {
 			gjc_session_id: "delegate-session",
@@ -296,6 +376,7 @@ console.log(JSON.stringify(await recordCodexWakeEvent(${JSON.stringify(root)}, {
 				thread_id: "thread-legacy",
 				endpoint: { kind: "unix", path: "/tmp/codex.sock" },
 				token_file: null,
+				token_file_identity: null,
 				registered_at: "2026-07-19T00:00:00.000Z",
 				updated_at: "2026-07-19T00:00:00.000Z",
 			}),
@@ -309,6 +390,7 @@ console.log(JSON.stringify(await recordCodexWakeEvent(${JSON.stringify(root)}, {
 				thread_id: "thread-corrupt",
 				endpoint: { kind: "unix", path: "/tmp/codex.sock" },
 				token_file: null,
+				token_file_identity: null,
 				registered_at: "2026-07-19T00:00:00.000Z",
 				updated_at: "2026-07-19T00:00:00.000Z",
 				origin: { ...origin, delegation_id: 1 },
