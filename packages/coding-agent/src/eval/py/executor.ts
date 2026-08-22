@@ -133,6 +133,17 @@ function ensurePythonResourceCleanup(): void {
 }
 const sessions = new Map<string, PythonSession | InitializingPythonSession>();
 const retiringKernels = new Set<PythonKernel>();
+const settingsSessionIds = new WeakMap<Settings, number>();
+let nextSettingsSessionId = 1;
+
+function scopedSessionId(sessionId: string, activeSettings: Settings | undefined): string {
+	if (!activeSettings || !sessionId.startsWith("session:")) return sessionId;
+	const existing = settingsSessionIds.get(activeSettings);
+	if (existing !== undefined) return `${sessionId}:settings-${existing}`;
+	const id = nextSettingsSessionId++;
+	settingsSessionIds.set(activeSettings, id);
+	return `${sessionId}:settings-${id}`;
+}
 
 async function shutdownOrRetainKernel(kernel: PythonKernel): Promise<void> {
 	const result = await kernel.shutdown().catch(() => undefined);
@@ -718,7 +729,7 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 }
 
 async function executeOnSession(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
-	const sessionId = options.sessionId ?? `session:${cwd}`;
+	const sessionId = scopedSessionId(options.sessionId ?? `session:${cwd}`, options.settings);
 	if (options.bridge && !options.bridgeSessionId) {
 		options.bridgeSessionId = sessionId;
 	}
