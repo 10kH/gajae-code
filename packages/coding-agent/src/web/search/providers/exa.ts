@@ -8,6 +8,7 @@
  */
 import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai/core";
 import { settings } from "../../../config/settings";
+import type { Settings } from "../../../config/settings";
 
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
@@ -31,6 +32,7 @@ export interface ExaSearchParams {
 	start_published_date?: string;
 	end_published_date?: string;
 	signal?: AbortSignal;
+	settings?: Settings;
 }
 
 interface ExaSearchResult {
@@ -172,9 +174,10 @@ export class ExaProvider extends SearchProvider {
 	readonly id = "exa";
 	readonly label = "Exa";
 
-	isAvailable(_authStorage: AuthStorage): boolean {
+	isAvailable(_authStorage: AuthStorage, activeSettings?: Settings): boolean {
 		try {
-			if (settings.get("exa.enabled") === false || settings.get("exa.enableSearch") === false) {
+			const source = activeSettings ?? settings;
+			if (source.get("exa.enabled") === false || source.get("exa.enableSearch") === false) {
 				return false;
 			}
 		} catch {
@@ -188,6 +191,7 @@ export class ExaProvider extends SearchProvider {
 			query: params.query,
 			num_results: params.numSearchResults ?? params.limit,
 			signal: params.signal,
+			settings: params.settings,
 		});
 	}
 }

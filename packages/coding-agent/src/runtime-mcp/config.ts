@@ -14,9 +14,12 @@ import { readDisabledServers } from "./config-writer";
 import { canonicalizeMCPEndpoint } from "./pool-key";
 import { isMCPProtocolPreference } from "./protocol";
 import type { MCPServerConfig } from "./types";
+import type { Settings } from "../config/settings";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
+	/** Owning session settings for capability filtering. */
+	settings?: Settings;
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
@@ -147,6 +150,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		const result = await loadCapability<MCPServer>(mcpCapability.id, {
 			cwd,
 			agentDir: options?.agentDir,
+			settings: options?.settings,
 			providers: options?.nativeOnly === true ? ["native"] : undefined,
 		});
 		// Filter out project-level configs if disabled

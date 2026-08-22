@@ -162,14 +162,16 @@ interface ExecuteSearchOptions {
 	preferredProvider?: SearchProviderId | "auto";
 	fallbackProviders?: readonly SearchProviderId[];
 	hardTimeoutMs?: number;
+	settings?: Settings;
 }
 
 function searchPolicyFromSettings(
 	settings: Settings | undefined,
-): Pick<ExecuteSearchOptions, "preferredProvider" | "fallbackProviders" | "hardTimeoutMs"> {
+): Pick<ExecuteSearchOptions, "preferredProvider" | "fallbackProviders" | "hardTimeoutMs" | "settings"> {
 	if (!settings) return {};
 	const fallback = settings.get("web_search.fallback");
 	return {
+		settings,
 		preferredProvider: getConfiguredSearchProviderPreference(settings),
 		fallbackProviders: Array.isArray(fallback)
 			? fallback.filter(
@@ -213,8 +215,16 @@ async function executeSearchUnscoped(
 	params: SearchQueryParams,
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	const { authStorage, sessionId, signal, activeModelContext, preferredProvider, fallbackProviders, hardTimeoutMs } =
-		options;
+	const {
+		authStorage,
+		sessionId,
+		signal,
+		activeModelContext,
+		preferredProvider,
+		fallbackProviders,
+		hardTimeoutMs,
+		settings,
+	} = options;
 	// Pass `params.provider` straight through: when omitted (the normal model-facing
 	// path) it is `undefined`, so `resolveProviderChain` applies the settings-configured
 	// preferred provider. Coalescing to "auto" here would silently bypass that preference.
@@ -226,6 +236,7 @@ async function executeSearchUnscoped(
 		fallbackProviders,
 		...(preferredProvider !== undefined && params.provider === undefined ? { preferredProvider } : {}),
 		activeModelContext,
+		settings,
 	});
 
 	const baseSearchParams = {
@@ -253,6 +264,7 @@ async function executeSearchUnscoped(
 		hardTimeoutMs,
 		preferredProvider,
 		fallbackProviders,
+		settings,
 	};
 
 	// Hedged fallback: when DuckDuckGo (keyless, cheap) is a non-primary member
@@ -374,7 +386,10 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 
 	#session: ToolSession;
 
-	#searchPolicy(): Pick<ExecuteSearchOptions, "preferredProvider" | "fallbackProviders" | "hardTimeoutMs"> {
+	#searchPolicy(): Pick<
+		ExecuteSearchOptions,
+		"preferredProvider" | "fallbackProviders" | "hardTimeoutMs" | "settings"
+	> {
 		return searchPolicyFromSettings(this.#session.settings);
 	}
 

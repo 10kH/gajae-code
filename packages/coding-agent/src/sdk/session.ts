@@ -2122,6 +2122,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							: true,
 						autoloadOnly: true,
 						nativeOnly: true,
+						settings,
 					});
 					const { configs: pluginConfigs } = await buildPluginMcpConfigs({ cwd: to });
 					const pluginNames = new Set(Object.keys(pluginConfigs));
@@ -2823,6 +2824,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// Claude Code/Codex MCP files are explicit import sources into
 						// `.gjc`, not implicit competing runtime authorities.
 						nativeOnly: true,
+						settings,
 					});
 					conventionalConfigs = loaded.configs;
 					conventionalSources = loaded.sources;

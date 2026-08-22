@@ -1,4 +1,5 @@
 import type { AuthStorage } from "@gajae-code/ai/core";
+import type { Settings } from "../../../config/settings";
 import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "../types";
 
 /**
@@ -75,6 +76,8 @@ export interface SearchParams {
 	activeModelContext?: ActiveSearchModelContext;
 	/** Session-scoped web-search timeout override in milliseconds. */
 	hardTimeoutMs?: number;
+	/** Owning session settings for provider-local policy. */
+	settings?: Settings;
 }
 
 /** Base class for web search providers. */
@@ -87,7 +90,7 @@ export abstract class SearchProvider {
 	 * service a request right now. Implementations consult the passed
 	 * {@link AuthStorage} — never a sibling store.
 	 */
-	abstract isAvailable(authStorage: AuthStorage): Promise<boolean> | boolean;
+	abstract isAvailable(authStorage: AuthStorage, settings?: Settings): Promise<boolean> | boolean;
 
 	/**
 	 * Execute a search. Credentials MUST be resolved through `params.authStorage`.
