@@ -8729,7 +8729,10 @@ export class AgentSession {
 				? [...previousSshTool.hostNames]
 				: [];
 		const candidateHostNames = new Set(previousHostNames);
-		const capability = await loadCapability<{ name: string }>("ssh", { cwd: this.sessionManager.getCwd() });
+		const capability = await loadCapability<{ name: string }>("ssh", {
+			cwd: this.sessionManager.getCwd(),
+			settings: this.settings,
+		});
 		for (const host of capability.items) {
 			if (typeof host?.name === "string") {
 				candidateHostNames.add(host.name);

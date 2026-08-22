@@ -1889,7 +1889,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd });
+					: await loadCapability<Rule>(ruleCapability.id, { cwd, settings });
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
