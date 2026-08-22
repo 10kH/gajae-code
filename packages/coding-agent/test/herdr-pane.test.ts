@@ -867,11 +867,11 @@ describe("herdr server replacement", () => {
 		const events = eventSource();
 		const watcher = fakeWatch();
 		const options = { env: paneEnv(), which: () => "/usr/bin/herdr", spawn };
-		createHerdrReporter(SOCKET_PANE, events.subscribe, {
+		const reporter = createHerdrReporter(SOCKET_PANE, events.subscribe, {
 			...options,
 			watchServerReplacement: watcher.watch,
 		});
-		syncHerdrPaneTitle("Ship the release", options);
+		syncHerdrPaneTitle("Ship the release", options, reporter.titleScope);
 		const beforeReplacement = calls.length;
 
 		watcher.replace();
@@ -882,6 +882,28 @@ describe("herdr server replacement", () => {
 			"/usr/bin/herdr",
 			...buildHerdrTitleArgs("pane-7", "Ship the release", 0).slice(0, -1),
 		]);
+	});
+
+	it("never re-sends a released reporter's title to a later pane", () => {
+		const { calls, spawn } = recordingSpawn();
+		const options = { env: paneEnv(), which: () => "/usr/bin/herdr", spawn };
+		const first = createHerdrReporter(SOCKET_PANE, eventSource().subscribe, options);
+		syncHerdrPaneTitle("First Session", options, first.titleScope);
+		first.release();
+
+		const events = eventSource();
+		const watcher = fakeWatch();
+		createHerdrReporter(SOCKET_PANE, events.subscribe, {
+			...options,
+			watchServerReplacement: watcher.watch,
+		});
+		const beforeReplacement = calls.length;
+
+		watcher.replace();
+
+		const commands = calls.slice(beforeReplacement).map(call => call.command);
+		const titles = commands.filter(command => command.includes("report-metadata"));
+		expect(titles).toHaveLength(0);
 	});
 
 	it("stops watching once the pane authority is released", () => {
@@ -969,6 +991,47 @@ describe("herdr server replacement", () => {
 				),
 			]);
 			expect(calls.filter(call => call.command.includes("report-agent")).length).toBe(before + 1);
+		} finally {
+			reporter.release();
+			await close(server);
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
+	});
+	it("ignores unrelated file events through the production watcher", async () => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-noise-"));
+		const socketPath = path.join(directory, "herdr.sock");
+		const { calls, spawn } = recordingSpawn();
+		const listen = async (): Promise<net.Server> => {
+			const server = net.createServer();
+			const ready = Promise.withResolvers<void>();
+			server.once("error", ready.reject);
+			server.listen(socketPath, ready.resolve);
+			await ready.promise;
+			return server;
+		};
+		const close = async (server: net.Server): Promise<void> => {
+			const closed = Promise.withResolvers<void>();
+			server.close(error => (error ? closed.reject(error) : closed.resolve()));
+			await closed.promise;
+		};
+		const server = await listen();
+		const reporter = createHerdrReporter(
+			{ paneId: "pane-7", binPath: "/usr/bin/herdr", socketPath },
+			eventSource().subscribe,
+			{ env: paneEnv(), spawn },
+		);
+		await Bun.sleep(300);
+		const before = calls.filter(call => call.command.includes("report-agent")).length;
+
+		try {
+			// Heavy churn on sibling files in the watched directory must never
+			// trigger a re-assert: the watcher filters by socket basename.
+			for (let i = 0; i < 20; i++) {
+				fs.writeFileSync(path.join(directory, `noise-${i}.txt`), "x");
+				fs.rmSync(path.join(directory, `noise-${i}.txt`));
+			}
+			await Bun.sleep(600);
+			expect(calls.filter(call => call.command.includes("report-agent"))).toHaveLength(before);
 		} finally {
 			reporter.release();
 			await close(server);

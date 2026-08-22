@@ -136,11 +136,14 @@ function nextMetadataSeq(): number {
 }
 
 /**
- * Last title this process reported. A replaced Herdr server starts with an empty
- * metadata store, so the title has to be re-sent from here: the session name
- * lives in the session, not in Herdr, and nothing else would ever resend it.
+ * Last title reported for a pane, keyed by the reporter that reported it. A
+ * replaced Herdr server starts with an empty metadata store, so the title has
+ * to be re-sent from here: the session name lives in the session, not in
+ * Herdr, and nothing else would ever resend it. Keyed per reporter — not a
+ * module global — so one pane's re-assert can never send another pane's
+ * session name, and a released reporter's title dies with it.
  */
-let lastReportedTitle: string | undefined;
+const lastReportedTitles = new WeakMap<object, string>();
 
 export type HerdrAgentState = "idle" | "working" | "blocked";
 
@@ -197,7 +200,33 @@ export interface HerdrReporter {
 	release(): void;
 	/** Current reported state, for tests and diagnostics. */
 	readonly state: HerdrAgentState | null;
+	/** Scope object for `syncHerdrPaneTitle` so a pane's title re-asserts stay
+	 * bound to this reporter. Opaque by design; pass it straight through. */
+	readonly titleScope: object;
 }
+
+/**
+ * Identity for per-reporter title tracking. `syncHerdrPaneTitle` is callable
+ * without a reporter (standalone title reports), so the title memo needs a
+ * durable key that both paths share: a module-singleton object when no
+ * reporter exists, and the reporter's private handle once installed. The
+ * handle is unexported on purpose — only the WeakMap key semantics matter.
+/**
+ * Opaque per-reporter title-scope token. Only identity matters; the class is
+ * unexported so callers must obtain a scope from a reporter (or rely on the
+ * module's standalone default when no reporter exists).
+ */
+class HerdrTitleScope {}
+const standaloneTitleScope: HerdrTitleScope = new HerdrTitleScope();
+
+/**
+ * Scope of the process's installed reporter, when one exists. Production has
+ * at most one Herdr pane per gjc process (pane ownership is exclusive by the
+ * claim marker), so this is the binding between the reporter and standalone
+ * `syncHerdrPaneTitle` calls that have no reporter reference. Cleared on
+ * release so a released pane's title can never be re-sent.
+ */
+let activeTitleScope: object | undefined;
 
 function defaultSpawn(
 	command: string[],
@@ -640,14 +669,18 @@ function runHerdrCommand(binPath: string, args: string[], timeoutMs: number, opt
  * when the session has no usable name, so a pane keeps the last real title
  * instead of flickering to a placeholder during startup or a rename.
  */
-export function syncHerdrPaneTitle(sessionName: string | undefined, options: HerdrReporterOptions = {}): void {
+export function syncHerdrPaneTitle(
+	sessionName: string | undefined,
+	options: HerdrReporterOptions = {},
+	titleScope: object = activeTitleScope ?? standaloneTitleScope,
+): void {
 	const title = sanitizeHerdrPaneTitle(sessionName);
 	if (!title) return;
 
 	const paneEnv = resolveHerdrPaneEnvironment(options);
 	if (!paneEnv) return;
 
-	lastReportedTitle = title;
+	lastReportedTitles.set(titleScope, title);
 	runHerdrCommand(
 		paneEnv.binPath,
 		buildHerdrTitleArgs(paneEnv.paneId, title, nextMetadataSeq()),
@@ -673,6 +706,8 @@ function createHerdrReporterWithClaim(
 	const releaseAuthority = claimMarker !== undefined;
 	/** Nesting depth of blocking ask calls; a nested ask must not unblock early. */
 	let askDepth = 0;
+	/** Per-reporter title memo scope: re-asserts only this pane's last title. */
+	const titleScope = new HerdrTitleScope();
 
 	const run = (args: string[], timeoutMs: number): void => {
 		runHerdrCommand(paneEnv.binPath, args, timeoutMs, options);
@@ -721,8 +756,9 @@ function createHerdrReporterWithClaim(
 		const state = currentState ?? "idle";
 		currentState = null;
 		report(state);
-		if (lastReportedTitle) {
-			run(buildHerdrTitleArgs(paneEnv.paneId, lastReportedTitle, nextMetadataSeq()), HERDR_REPORT_TIMEOUT_MS);
+		const title = lastReportedTitles.get(titleScope);
+		if (title) {
+			run(buildHerdrTitleArgs(paneEnv.paneId, title, nextMetadataSeq()), HERDR_REPORT_TIMEOUT_MS);
 		}
 	};
 
@@ -736,6 +772,9 @@ function createHerdrReporterWithClaim(
 
 	return {
 		report,
+		get titleScope() {
+			return titleScope;
+		},
 		release() {
 			if (released) return;
 			released = true;
@@ -743,6 +782,10 @@ function createHerdrReporterWithClaim(
 			unsubscribe = null;
 			unwatch?.();
 			unwatch = null;
+			// The title memo dies with the reporter so a later pane's re-assert
+			// can never resurrect this session's title.
+			lastReportedTitles.delete(titleScope);
+			if (activeTitleScope === titleScope) activeTitleScope = undefined;
 			if (!releaseAuthority) return;
 			const env = options.env ?? process.env;
 			if (claimMarker !== undefined && env[HERDR_PANE_OWNER_ENV] === claimMarker) delete env[HERDR_PANE_OWNER_ENV];
@@ -788,8 +831,8 @@ export function installHerdrReporter(
 		ownerIncarnation(options.pid ?? process.pid, options),
 	);
 	env[HERDR_PANE_OWNER_ENV] = claimMarker;
-
 	const reporter = createHerdrReporterWithClaim(paneEnv, subscribe, options, claimMarker);
+	activeTitleScope = reporter.titleScope;
 	// `exit` handlers must be synchronous; release() only spawns and returns.
 	process.once("exit", reporter.release);
 	return reporter;
