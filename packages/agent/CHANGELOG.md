@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- `normalizeTools` now converts every Zod-authored tool schema to the wire JSON schema even when intent tracing is off. Previously the conversion ran only inside the `_i` intent-injection branch, so canonical sub-sessions (role agents spawned via `task`, where `resolveIntentTracingEnabled` forces `_i` off) sent a live `ZodObject` across the provider boundary. On append-only context providers (`anthropic`, `deepseek`; auto-enabled) the stable-prefix clone JSON-round-trips tools, and a `ZodObject` without `toJSON` reduces to a bare `{def, type}` object with no `properties`/`required` — the model is then advertised a tool with no parameters and omits required arguments. This is the root cause of issue #4837: every subagent `bash` call failing with `command: Invalid input: expected string, received undefined` while the parent session's identical call worked. Tool argument validation itself is unchanged: executors still validate against the original Zod schema.
 - Managed fallback now transfers safety-stop authority only to the adjudicated final assistant shell; intermediate partial snapshots and hostile accessor-backed final messages cannot retain or bypass the provenance boundary (#4777 review).
 
 - Managed assistant reconstruction now copies provider metadata through guarded property reads instead of an unguarded spread, so accessor-trapped metadata degrades without aborting the attempt or creating managed retry authority (#4777 review).

@@ -3005,13 +3005,22 @@ export function normalizeTools(tools: AgentContext["tools"], injectIntent: boole
 	return tools?.map(t => {
 		const intentMode = resolveIntentMode(t.intent);
 		let parameters: TSchema = t.parameters;
-		if (injectIntent && intentMode !== "omit") {
-			if (isZodSchema(parameters)) {
-				const wired = zodToWireSchema(parameters);
-				parameters = injectIntentIntoSchema(wired, intentMode) as TSchema;
-			} else {
-				parameters = injectIntentIntoSchema(parameters, intentMode) as TSchema;
-			}
+		if (isZodSchema(parameters)) {
+			// Zod instances must never cross the provider boundary as-is: any
+			// downstream JSON round-trip (append-only stable-prefix cloning, fork
+			// seed snapshots) reduces a live ZodObject to a bare `{def, type}`
+			// object with no `properties`/`required`, so providers advertise a
+			// tool with no parameters and the model omits required arguments
+			// (issue #4837: subagent-only bash "command: expected string,
+			// received undefined"). Intent injection forced the conversion on
+			// operator-facing sessions; canonical sub-sessions run it too.
+			const wired = zodToWireSchema(parameters);
+			parameters =
+				injectIntent && intentMode !== "omit"
+					? (injectIntentIntoSchema(wired, intentMode) as TSchema)
+					: (wired as TSchema);
+		} else if (injectIntent && intentMode !== "omit") {
+			parameters = injectIntentIntoSchema(parameters, intentMode) as TSchema;
 		}
 		const description = t.description ?? "";
 		return { ...t, parameters, description };
