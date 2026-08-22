@@ -301,6 +301,7 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 	requireRemainingTimeoutMs(options.deadlineMs);
 	return await PythonKernel.start({
 		cwd,
+		settings: options.settings,
 		env: buildKernelEnv(options),
 		runtimeOptions: options.runtimeOptions,
 		signal: options.signal,
@@ -678,10 +679,15 @@ async function executeWithKernel(
 }
 
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
-	const availability = await checkPythonKernelAvailability(cwd, options.runtimeOptions, {
-		signal: options.signal,
-		deadlineMs: options.deadlineMs,
-	});
+	const availability = await checkPythonKernelAvailability(
+		cwd,
+		options.runtimeOptions,
+		{
+			signal: options.signal,
+			deadlineMs: options.deadlineMs,
+		},
+		options.settings,
+	);
 	if (!availability.ok) {
 		throw new Error(availability.reason ?? "Python kernel unavailable");
 	}

@@ -112,6 +112,15 @@ describe("Settings", () => {
 		expect(Settings.instance.getModelRole("image")).toBeUndefined();
 	});
 
+	it("does not close the global storage when an SDK scope is disposed", async () => {
+		const global = await Settings.init({ cwd: projectDir, agentDir });
+		const scoped = await Settings.loadForScope({ cwd: projectDir, agentDir });
+
+		expect(scoped.getStorage()).not.toBe(global.getStorage());
+		scoped.close();
+		expect(() => global.getStorage()?.getSettings()).not.toThrow();
+	});
+
 	it("distinguishes an absent first-event retry timeout from an explicit zero", () => {
 		const absent = Settings.isolated();
 		expect(absent.get("retry.streamFirstEventTimeoutMs")).toBe(100_000);

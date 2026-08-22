@@ -495,6 +495,7 @@ export class Settings implements NotificationSettingsReader {
 	#cwd: string;
 	#agentDir: string;
 	#storage: AgentStorage | null = null;
+	#isolatedStorage = false;
 
 	/** Global settings from config.yml */
 	#global: RawSettings = {};
@@ -549,12 +550,13 @@ export class Settings implements NotificationSettingsReader {
 	/** Read-only inspection mode: config.yml is read but never written/migrated. */
 	#readonly: boolean;
 
-	private constructor(options: SettingsOptions = {}) {
+	private constructor(options: SettingsOptions = {}, isolatedStorage = false) {
 		this.#cwd = path.normalize(options.cwd ?? getProjectDir());
 		this.#agentDir = path.normalize(options.agentDir ?? getAgentDir());
 		this.#configPath = options.inMemory ? null : path.resolve(this.#agentDir, "config.yml");
 		this.#persist = !options.inMemory && !options.readonly;
 		this.#readonly = options.readonly === true;
+		this.#isolatedStorage = isolatedStorage;
 
 		if (options.overrides) {
 			for (const [key, value] of Object.entries(options.overrides)) {
@@ -607,7 +609,7 @@ export class Settings implements NotificationSettingsReader {
 	 * Managed-session policy resolution must be bound to the workspace being opened.
 	 */
 	static loadForScope(options: { cwd: string; agentDir?: string }): Promise<Settings> {
-		const instance = new Settings(options);
+		const instance = new Settings(options, true);
 		return instance.#load();
 	}
 	/**
@@ -1133,6 +1135,13 @@ export class Settings implements NotificationSettingsReader {
 		return this.#storage;
 	}
 
+	/** Close storage owned by an isolated settings scope. */
+	close(): void {
+		if (!this.#isolatedStorage) return;
+		this.#storage?.close();
+		this.#storage = null;
+	}
+
 	getCwd(): string {
 		return this.#cwd;
 	}
@@ -1373,10 +1382,14 @@ export class Settings implements NotificationSettingsReader {
 				// are never lost, then re-open and drain afterwards.
 				if (!this.#storage) {
 					try {
-						this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
+						this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir), {
+							isolated: this.#isolatedStorage,
+						});
 					} catch {
 						try {
-							this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
+							this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir), {
+								isolated: this.#isolatedStorage,
+							});
 						} catch {
 							// Continue without the database; the final retry below
 							// re-opens it for the rest of the load.
@@ -1397,7 +1410,9 @@ export class Settings implements NotificationSettingsReader {
 					// (an unavailable/corrupt database still fails the full load, as
 					// before) and drain the legacy settings into the already-created
 					// config.yml - the merge handles an existing file absent-only.
-					this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir));
+					this.#storage = await AgentStorage.open(getAgentDbPath(this.#agentDir), {
+						isolated: this.#isolatedStorage,
+					});
 					await this.#migrateAgentDirAndDatabaseLegacy();
 				}
 				this.#global = await this.#loadYaml(this.#configPath!);

@@ -1425,8 +1425,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 		closeOwnedSettings = (): void => {
-			if (ownsScopedSettings) settings.getStorage()?.close();
-		}
+		closeOwnedSettings = (): void => {
+			if (ownsScopedSettings) settings.close();
+		};
 		// Keep legacy singleton consumers (bash, edit guards, and older extension code)
 		// initialized for SDK child hosts without making the session's role resolution
 		// depend on that process-global instance. Session-aware tool contexts carry the

@@ -1640,6 +1640,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			? await runInteractiveBashPty(interactiveUi, {
 					command,
 					cwd: commandCwd,
+					settings: this.session.settings,
 					timeoutMs,
 					signal,
 					env: resolvedEnv,
