@@ -101,117 +101,122 @@ async function createWebSocketFixture(
 	const messages: Array<{ method: string; params: Record<string, unknown> }> = [];
 	const headers: string[] = [];
 	const pongs: Buffer[] = [];
-	const server = net.createServer(socket => {
-		let handshaken = false;
-		let initialized = false;
-		let buffer: Buffer = Buffer.alloc(0);
-		socket.on("data", chunk => {
-			buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
-			if (!handshaken) {
-				// Real app-server transports are WebSocket only; raw JSONL clients never upgrade.
-				if (!buffer.subarray(0, 4).toString("latin1").startsWith("GET")) {
-					socket.destroy();
-					return;
-				}
-				const end = buffer.indexOf("\r\n\r\n");
-				if (end < 0) return;
-				const request = buffer.subarray(0, end).toString("latin1");
-				headers.push(request);
-				const key = request.match(/^Sec-WebSocket-Key:\s*(.+)$/im)?.[1]?.trim();
-				if (key === undefined) throw new Error("missing websocket key");
-				const accept = crypto.createHash("sha1").update(`${key}${WEBSOCKET_GUID}`).digest("base64");
-				socket.write(
-					`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
-				);
-				buffer = buffer.subarray(end + 4);
-				handshaken = true;
-				if (behavior.ping) socket.write(serverFrame("ping-payload", 0x9));
-			}
-			const parsed = parseMaskedFrames(buffer);
-			buffer = parsed.remaining;
-			for (const pong of parsed.pongs ?? []) pongs.push(pong);
-			for (const message of parsed.messages) {
-				const request = JSON.parse(message) as { id?: number; method: string; params: Record<string, unknown> };
-				messages.push({ method: request.method, params: request.params });
-				if (request.id === undefined) {
-					if (request.method === "initialized") initialized = true;
-					continue;
-				}
-				// Per the generated protocol, every connection must initialize before other requests.
-				if (request.method !== "initialize" && !initialized) {
+	const server = trackFixtureServer(
+		net.createServer(socket => {
+			let handshaken = false;
+			let initialized = false;
+			let buffer: Buffer = Buffer.alloc(0);
+			socket.on("data", chunk => {
+				buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
+				if (!handshaken) {
+					// Real app-server transports are WebSocket only; raw JSONL clients never upgrade.
+					if (!buffer.subarray(0, 4).toString("latin1").startsWith("GET")) {
+						socket.destroy();
+						return;
+					}
+					const end = buffer.indexOf("\r\n\r\n");
+					if (end < 0) return;
+					const request = buffer.subarray(0, end).toString("latin1");
+					headers.push(request);
+					const key = request.match(/^Sec-WebSocket-Key:\s*(.+)$/im)?.[1]?.trim();
+					if (key === undefined) throw new Error("missing websocket key");
+					const accept = crypto.createHash("sha1").update(`${key}${WEBSOCKET_GUID}`).digest("base64");
 					socket.write(
-						serverFrame(
-							JSON.stringify({
-								jsonrpc: "2.0",
-								id: request.id,
-								error: { code: -32600, message: "not initialized" },
-							}),
-						),
+						`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
 					);
-					continue;
+					buffer = buffer.subarray(end + 4);
+					handshaken = true;
+					if (behavior.ping) socket.write(serverFrame("ping-payload", 0x9));
 				}
-				// Generated TurnStartParams accepts threadId/clientUserMessageId/input; legacy prompt is invalid.
-				if (
-					request.method === "turn/start" &&
-					("prompt" in request.params ||
-						!Array.isArray(request.params.input) ||
-						!(request.params.input as Array<Record<string, unknown>>).every(
-							item => item.type === "text" && typeof item.text === "string" && Array.isArray(item.text_elements),
-						))
-				) {
-					socket.write(
-						serverFrame(
-							JSON.stringify({
-								jsonrpc: "2.0",
-								id: request.id,
-								error: { code: -32602, message: "invalid turn/start params" },
-							}),
-						),
-					);
-					continue;
-				}
-				const result =
-					request.method === "initialize"
-						? { userAgent: "fixture" }
-						: request.method === "thread/resume"
-							? {
-									thread: {
-										id: request.params.threadId,
-										status: status === "idle" ? { type: "idle" } : { type: "active", activeFlags: [] },
-									},
-								}
-							: request.method === "turn/start"
-								? { turn: {} }
-								: {};
-				if (behavior.noiseBeforeResponse) {
-					socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", id: 999999, result: { wrong: true } })));
-					socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", method: "noise/notification", params: {} })));
-				}
-				if (behavior.fragmentResponses) {
-					// Legal wire behavior: a complete notification frame first, then the
-					// response as an RFC 6455 fragmented message (FIN=0 text frame plus a
-					// FIN=1 continuation frame), delivered in TCP chunks split mid-frame.
-					socket.write(
-						serverFrame(JSON.stringify({ jsonrpc: "2.0", method: "thread/statusChanged", params: {} })),
-					);
-					const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
-					const half = Math.floor(body.length / 2);
-					const firstFragment = Buffer.concat([Buffer.from([0x01, half]), body.subarray(0, half)]);
-					const continuation = Buffer.concat([Buffer.from([0x80, body.length - half]), body.subarray(half)]);
-					socket.write(firstFragment.subarray(0, 1));
-					setTimeout(() => {
-						socket.write(firstFragment.subarray(1));
+				const parsed = parseMaskedFrames(buffer);
+				buffer = parsed.remaining;
+				for (const pong of parsed.pongs ?? []) pongs.push(pong);
+				for (const message of parsed.messages) {
+					const request = JSON.parse(message) as { id?: number; method: string; params: Record<string, unknown> };
+					messages.push({ method: request.method, params: request.params });
+					if (request.id === undefined) {
+						if (request.method === "initialized") initialized = true;
+						continue;
+					}
+					// Per the generated protocol, every connection must initialize before other requests.
+					if (request.method !== "initialize" && !initialized) {
+						socket.write(
+							serverFrame(
+								JSON.stringify({
+									jsonrpc: "2.0",
+									id: request.id,
+									error: { code: -32600, message: "not initialized" },
+								}),
+							),
+						);
+						continue;
+					}
+					// Generated TurnStartParams accepts threadId/clientUserMessageId/input; legacy prompt is invalid.
+					if (
+						request.method === "turn/start" &&
+						("prompt" in request.params ||
+							!Array.isArray(request.params.input) ||
+							!(request.params.input as Array<Record<string, unknown>>).every(
+								item =>
+									item.type === "text" && typeof item.text === "string" && Array.isArray(item.text_elements),
+							))
+					) {
+						socket.write(
+							serverFrame(
+								JSON.stringify({
+									jsonrpc: "2.0",
+									id: request.id,
+									error: { code: -32602, message: "invalid turn/start params" },
+								}),
+							),
+						);
+						continue;
+					}
+					const result =
+						request.method === "initialize"
+							? { userAgent: "fixture" }
+							: request.method === "thread/resume"
+								? {
+										thread: {
+											id: request.params.threadId,
+											status: status === "idle" ? { type: "idle" } : { type: "active", activeFlags: [] },
+										},
+									}
+								: request.method === "turn/start"
+									? { turn: {} }
+									: {};
+					if (behavior.noiseBeforeResponse) {
+						socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", id: 999999, result: { wrong: true } })));
+						socket.write(
+							serverFrame(JSON.stringify({ jsonrpc: "2.0", method: "noise/notification", params: {} })),
+						);
+					}
+					if (behavior.fragmentResponses) {
+						// Legal wire behavior: a complete notification frame first, then the
+						// response as an RFC 6455 fragmented message (FIN=0 text frame plus a
+						// FIN=1 continuation frame), delivered in TCP chunks split mid-frame.
+						socket.write(
+							serverFrame(JSON.stringify({ jsonrpc: "2.0", method: "thread/statusChanged", params: {} })),
+						);
+						const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }));
+						const half = Math.floor(body.length / 2);
+						const firstFragment = Buffer.concat([Buffer.from([0x01, half]), body.subarray(0, half)]);
+						const continuation = Buffer.concat([Buffer.from([0x80, body.length - half]), body.subarray(half)]);
+						socket.write(firstFragment.subarray(0, 1));
 						setTimeout(() => {
-							socket.write(continuation.subarray(0, 1));
-							setTimeout(() => socket.write(continuation.subarray(1)), 3);
+							socket.write(firstFragment.subarray(1));
+							setTimeout(() => {
+								socket.write(continuation.subarray(0, 1));
+								setTimeout(() => socket.write(continuation.subarray(1)), 3);
+							}, 3);
 						}, 3);
-					}, 3);
-				} else {
-					socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", id: request.id, result })));
+					} else {
+						socket.write(serverFrame(JSON.stringify({ jsonrpc: "2.0", id: request.id, result })));
+					}
 				}
-			}
-		});
-	});
+			});
+		}),
+	);
 	const listening = Promise.withResolvers<void>();
 	server.once("error", listening.reject);
 	server.listen(socketPath, () => listening.resolve());
@@ -219,9 +224,28 @@ async function createWebSocketFixture(
 	return { messages, headers, pongs, server };
 }
 
+/**
+ * Accepted fixture sockets per server. `close()` only resolves once every
+ * accepted connection is gone, and a client that aborts mid-handshake (the
+ * establishment-deadline path) can leave its server side registered with
+ * unread inbound bytes, so the fixture destroys its own sockets.
+ */
+const fixtureSockets = new WeakMap<net.Server, Set<net.Socket>>();
+
+function trackFixtureServer(server: net.Server): net.Server {
+	const sockets = new Set<net.Socket>();
+	fixtureSockets.set(server, sockets);
+	server.on("connection", socket => {
+		sockets.add(socket);
+		socket.once("close", () => sockets.delete(socket));
+	});
+	return server;
+}
+
 async function closeServer(server: net.Server): Promise<void> {
 	const closed = Promise.withResolvers<void>();
 	server.close(() => closed.resolve());
+	for (const socket of fixtureSockets.get(server) ?? []) socket.destroy();
 	await closed.promise;
 }
 
@@ -478,7 +502,7 @@ describe("Codex wake publisher", () => {
 	it("fails fast with bounded unavailability when the server closes before upgrading", async () => {
 		const root = await tempRoot();
 		const socketPath = path.join(root, "codex-close.sock");
-		const server = net.createServer(socket => socket.destroy());
+		const server = trackFixtureServer(net.createServer(socket => socket.destroy()));
 		const listening = Promise.withResolvers<void>();
 		server.once("error", listening.reject);
 		server.listen(socketPath, () => listening.resolve());
@@ -556,7 +580,7 @@ describe("Codex wake publisher", () => {
 	it("bounds a stalled upgrade with the establishment deadline", async () => {
 		const root = await tempRoot();
 		const socketPath = path.join(root, "codex-stall.sock");
-		const server = net.createServer(() => {});
+		const server = trackFixtureServer(net.createServer(() => {}));
 		const listening = Promise.withResolvers<void>();
 		server.once("error", listening.reject);
 		server.listen(socketPath, () => listening.resolve());
