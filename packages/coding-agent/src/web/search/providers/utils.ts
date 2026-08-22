@@ -1,4 +1,4 @@
-import { AsyncLocalStorage } from "node:async_hooks";
+import * as asyncHooks from "node:async_hooks";
 import type { AgentStorage } from "../../../session/agent-storage";
 import { SearchProviderError, type SearchProviderId, type SearchSource } from "../../../web/search/types";
 import { dateToAgeSeconds } from "../utils";
@@ -82,7 +82,7 @@ const TIMEOUT_CLASS_MS: Record<SearchTimeoutClass, number> = {
  * class default so users keep a single knob. Unset means class defaults apply.
  */
 let configuredHardTimeoutMs: number | undefined;
-const searchTimeoutScope = new AsyncLocalStorage<{ hardTimeoutMs: number | undefined }>();
+const searchTimeoutScope = new asyncHooks.AsyncLocalStorage<{ hardTimeoutMs: number | undefined }>();
 
 /**
  * Override the hard timeout applied to every web-search round-trip.
