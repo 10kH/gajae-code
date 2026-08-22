@@ -250,20 +250,22 @@ export class SessionSdkHost {
 		return this.events.emit(frame);
 	}
 
+	emitAutoroutingInactiveNotice(): EventFrame {
+		return this.emitEvent({
+			kind: "notice",
+			payload: {
+				type: "notice",
+				level: "warning",
+				message: AUTOROUTING_INACTIVE_WARNING,
+				source: "autorouting",
+			},
+		});
+	}
+
 	async start(): Promise<"started" | "already"> {
 		if (this.#started) return "already";
 		this.events.restart();
-		if (isAutoroutingInactive(this)) {
-			this.emitEvent({
-				kind: "notice",
-				payload: {
-					type: "notice",
-					level: "warning",
-					message: AUTOROUTING_INACTIVE_WARNING,
-					source: "autorouting",
-				},
-			});
-		}
+		if (isAutoroutingInactive(this)) this.emitAutoroutingInactiveNotice();
 		if (this.#options.readiness !== "deferred") this.#publishReadiness();
 		else
 			this.emitEvent({

@@ -1266,6 +1266,7 @@ function createControlSurface(
 	settings?: Settings,
 	configOverrides?: Map<string, unknown>,
 	configRevision: { current: number } = { current: 0 },
+	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams,
 	terminalPublicationCapture?: { resolvers?: Array<(observed: boolean) => void> },
 	activePromptOwnerHolder?: { connectionIds?: ReadonlySet<string> },
@@ -2521,10 +2522,21 @@ function createControlSurface(
 			}
 			if (!settings) return unavailable("config.patch")();
 			const applyPatch = async () => {
+				const wasAutoroutingInactive =
+					settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
 				const entries = Object.entries(patch as Record<string, unknown>);
 				for (const [key, value] of entries) settings.set(key as never, value as never);
 				if (configOverrides) for (const [key, value] of entries) configOverrides.set(key, value);
 				configRevision.current += 1;
+				const isAutoroutingInactiveNow =
+					settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
+				if (isAutoroutingInactiveNow && !wasAutoroutingInactive) {
+					const host = getRuntimeHost();
+					if (host) {
+						markAutoroutingInactive(host);
+						if (host.started) host.emitAutoroutingInactiveNotice();
+					}
+				}
 				return { patched: entries.map(([key]) => key), revision: String(configRevision.current) };
 			};
 			// Serialize config mutations against synthetic profile activation and
@@ -2823,6 +2835,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			settings: options.settings,
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
+		let runtime: SessionSdkSessionRuntime;
 		const controlSurface = createControlSurface(
 			ctx,
 			api,
@@ -2847,6 +2860,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			options.settings,
 			options.configOverrides,
 			configRevision,
+			() => runtime?.host,
 			options.terminalAbortSeams,
 			terminalPublicationCapture,
 			activePromptOwnerHolder,
@@ -2862,7 +2876,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			() => acceptingGateResolutions,
 			trackGateResolution,
 		);
-		let runtime: SessionSdkSessionRuntime;
 		const installProviderDefinitions = (capability: string, definitions: unknown): void => {
 			if (capability === "permission") {
 				ctx.setSdkPermissionProvider?.(async (toolCall, permissionOptions, signal) => {

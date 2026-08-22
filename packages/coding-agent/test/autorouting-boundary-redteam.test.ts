@@ -3264,3 +3264,224 @@ describe("autorouting boundary red-team generation 8 delta re-attacks", () => {
 		expect(pass).toBe(true);
 	});
 });
+
+describe("autorouting boundary red-team generation 10 delta re-attacks", () => {
+	it("parentArtifactManager alone never claims durable staged publication without managedPersistence or a session file", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "autorouting-gen10-parent-only-"));
+		const parentArtifacts = new ArtifactManager(path.join(root, "parent"));
+		await parentArtifacts.save("sibling", "tool");
+		const models = [
+			model("test", "candidate", true, {
+				headers: {},
+				compat: {},
+				thinking: { mode: "effort", minLevel: "minimal", maxLevel: "high" },
+			}),
+		];
+		const authStorage = await AuthStorage.create(":memory:");
+		const modelRegistry = new ModelRegistry(authStorage);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue(models);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(models);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async () => "key");
+		const originalCreate = sdkModule.createAgentSession;
+		const durableSessionFiles: Array<string | undefined> = [];
+		const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			durableSessionFiles.push(options?.sessionManager?.getSessionFile());
+			const result = await originalCreate(options);
+			vi.spyOn(result.session, "prompt").mockImplementation(async (_message, promptOptions) => {
+				if (promptOptions?.onPreflightAcceptCommit) await promptOptions.onPreflightAcceptCommit();
+				else promptOptions?.onPreflightAccepted?.();
+				result.session.agent.emitExternalEvent({
+					type: "tool_execution_end",
+					toolCallId: "gen10-parent-only-yield",
+					toolName: "yield",
+					result: { content: [], details: { status: "success", data: {} } },
+					isError: false,
+				} as never);
+			});
+			vi.spyOn(result.session, "waitForIdle").mockResolvedValue(undefined);
+			return result;
+		});
+		let openStagedCalls = 0;
+		const openStagedSpy = vi.spyOn(SessionManager, "openStaged").mockImplementation(async () => {
+			openStagedCalls++;
+			throw new Error("durable staged session opened without managedPersistence or an explicit session file");
+		});
+		let commitStagedCalls = 0;
+		const commitStagedSpy = vi.spyOn(SessionManager.prototype, "commitStaged").mockImplementation(async function (
+			this: SessionManager,
+		) {
+			commitStagedCalls++;
+			throw new Error("durable staged publication committed without managedPersistence or an explicit session file");
+		});
+		let result: SingleResult | undefined;
+		try {
+			result = await runSubprocess({
+				cwd: root,
+				agent: taskAgent,
+				task: "gen10 parent-only durable authority",
+				assignment: "gen10 parent-only durable authority",
+				index: 0,
+				id: "gen10-parent-only",
+				modelOverride: ["test/candidate"],
+				settings: Settings.isolated(),
+				modelRegistry,
+				runMode: "initial",
+				autoroutingPreflight: true,
+				autoroutingCandidates: ["test/candidate"],
+				autoroutingSkips: [],
+				routing: {
+					tier: "fast",
+					requestedSelector: "test/candidate",
+					effectiveModel: "test/candidate",
+					substitutions: [],
+				},
+				// The ONLY durable-authority signal is the shared artifact manager. Without a
+				// managedPersistence store or an explicit sessionFile, this must not grant durable
+				// staged-publication authority: the accepted candidate uses the artifact-only path.
+				parentArtifactManager: parentArtifacts,
+				managedPersistence: undefined,
+				sessionFile: undefined,
+				artifactsDir: undefined,
+			});
+		} finally {
+			commitStagedSpy.mockRestore();
+			openStagedSpy.mockRestore();
+			createSpy.mockRestore();
+			authStorage.close();
+			await rm(root, { recursive: true, force: true });
+		}
+		const observed = {
+			openStagedCalls,
+			commitStagedCalls,
+			durableSessionFiles,
+			attempts: result?.routing?.attempts,
+			exitCode: result?.exitCode,
+			preflightFenceCrossed: result?.preflightFenceCrossed,
+		};
+		const pass =
+			openStagedCalls === 0 &&
+			commitStagedCalls === 0 &&
+			durableSessionFiles.length === 2 &&
+			durableSessionFiles.every(file => file === undefined) &&
+			JSON.stringify(result?.routing?.attempts) ===
+				JSON.stringify([
+					{ selector: "test/candidate", phase: "probe", code: "probe_passed" },
+					{ selector: "test/candidate", phase: "durable", code: "accepted" },
+				]) &&
+			result?.exitCode === 0 &&
+			result?.preflightFenceCrossed === true;
+		record(
+			"gen10-parent-only-no-durable-claim",
+			"AC13",
+			rootCommand,
+			observed,
+			pass,
+			"parentArtifactManager alone granted durable staged-publication authority: `openStaged`/`commitStaged` ran even though no managedPersistence or explicit sessionFile existed.",
+		);
+		expect(pass).toBe(true);
+	});
+
+	it("disposable preflight probes never run user/session extensions", async () => {
+		const root = await mkdtemp(path.join(tmpdir(), "autorouting-gen10-ext-probe-"));
+		const finalPath = path.join(root, "candidate.jsonl");
+		const models = [
+			model("test", "candidate", true, {
+				headers: {},
+				compat: {},
+				thinking: { mode: "effort", minLevel: "minimal", maxLevel: "high" },
+			}),
+		];
+		const authStorage = await AuthStorage.create(":memory:");
+		const modelRegistry = new ModelRegistry(authStorage);
+		vi.spyOn(modelRegistry, "getAll").mockReturnValue(models);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue(models);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async () => "key");
+		// The runner the executor's extension seam would drive on a live run; its methods only
+		// record, so a probe that (incorrectly) ran extensions would push the counts above zero.
+		const runner = {
+			initialize: vi.fn(),
+			onError: vi.fn(),
+			emit: vi.fn(),
+			hasHandlers: vi.fn(() => false),
+		};
+		const originalCreate = sdkModule.createAgentSession;
+		let createCalls = 0;
+		const createSpy = vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
+			createCalls++;
+			const result = await originalCreate(options);
+			// Shadow the public getter for the executor's extension seam only; session internals
+			// keep using their real #extensionRunner private field and are out of scope here.
+			Object.defineProperty(result.session, "extensionRunner", {
+				value: runner,
+				configurable: true,
+			});
+			vi.spyOn(result.session, "prompt").mockImplementation(async (_message, promptOptions) => {
+				if (promptOptions?.onPreflightAcceptCommit) await promptOptions.onPreflightAcceptCommit();
+				else promptOptions?.onPreflightAccepted?.();
+				result.session.agent.emitExternalEvent({
+					type: "tool_execution_end",
+					toolCallId: "gen10-ext-yield",
+					toolName: "yield",
+					result: { content: [], details: { status: "success", data: {} } },
+					isError: false,
+				} as never);
+			});
+			vi.spyOn(result.session, "waitForIdle").mockResolvedValue(undefined);
+			return result;
+		});
+		let result: SingleResult | undefined;
+		try {
+			result = await runSubprocess({
+				cwd: root,
+				agent: taskAgent,
+				task: "gen10 probe never runs extensions",
+				assignment: "gen10 probe never runs extensions",
+				index: 0,
+				id: "gen10-ext-probe",
+				modelOverride: ["test/candidate"],
+				settings: Settings.isolated(),
+				modelRegistry,
+				runMode: "initial",
+				autoroutingPreflight: true,
+				autoroutingCandidates: ["test/candidate"],
+				autoroutingSkips: [],
+				routing: {
+					tier: "fast",
+					requestedSelector: "test/candidate",
+					effectiveModel: "test/candidate",
+					substitutions: [],
+				},
+				sessionFile: finalPath,
+			});
+		} finally {
+			createSpy.mockRestore();
+			authStorage.close();
+			await rm(root, { recursive: true, force: true });
+		}
+		const sessionStartEmits = runner.emit.mock.calls.filter(
+			args => (args[0] as { type?: string } | undefined)?.type === "session_start",
+		).length;
+		const observed = {
+			createCalls,
+			runnerInitializeCalls: runner.initialize.mock.calls.length,
+			runnerSessionStartEmits: sessionStartEmits,
+			exitCode: result?.exitCode,
+			preflightFenceCrossed: result?.preflightFenceCrossed,
+		};
+		const pass =
+			createCalls === 2 &&
+			runner.initialize.mock.calls.length === 1 &&
+			sessionStartEmits === 1 &&
+			result?.exitCode === 0 &&
+			result?.preflightFenceCrossed === true;
+		record(
+			"gen10-probe-no-extensions",
+			"AC13",
+			rootCommand,
+			observed,
+			pass,
+			"A disposable preflight probe ran user/session extensions: the runner was initialize()d or received a session_start emit on the probe leg; only the accepted durable leg may.",
+		);
+		expect(pass).toBe(true);
+	});
+});

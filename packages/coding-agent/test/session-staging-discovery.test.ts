@@ -40,6 +40,9 @@ describe("staged session discovery exclusion", () => {
 		const stagedPath = path.join("/tmp", "agent-session", SESSION_STAGING_DIRNAME, "attempt.jsonl");
 		expect(isStagedSessionPath(stagedPath)).toBe(true);
 		expect(isStagedSessionPath(path.join("/tmp", "agent-session", "sibling.jsonl"))).toBe(false);
+		expect(isStagedSessionPath(path.join("/srv", SESSION_STAGING_DIRNAME, "gjc-sessions", "session.jsonl"))).toBe(
+			false,
+		);
 		const source = await readFile(new URL("../src/session/session-staging-paths.ts", import.meta.url), "utf8");
 		expect(source).not.toContain("session-manager");
 		expect(source).not.toContain("./artifacts");

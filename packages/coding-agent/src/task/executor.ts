@@ -875,7 +875,8 @@ export function finalizeRoutingEvidence(
 	},
 ): TaskRoutingEvidence | undefined {
 	if (!routing) return undefined;
-	const effectiveModel = state.lastAssistantModelString ?? state.resolvedModelString;
+	const terminalModel = state.lastAssistantModelString ?? state.resolvedModelString;
+	const effectiveModel = terminalModel === undefined ? undefined : boundedSelector(terminalModel);
 	const substitutions: TaskRoutingEvidence["substitutions"] = [];
 	if (state.authFallbackUsed) substitutions.push("auth_substituted");
 	if (state.assistantModelMismatch) substitutions.push("assistant_model_mismatch");
@@ -888,8 +889,8 @@ export function finalizeRoutingEvidence(
 	const evidence = {
 		...routing,
 		effectiveModel,
-		...(state.resolvedModelString && state.resolvedModelString !== effectiveModel
-			? { authResolvedModel: state.resolvedModelString }
+		...(state.resolvedModelString && state.resolvedModelString !== terminalModel
+			? { authResolvedModel: boundedSelector(state.resolvedModelString) }
 			: {}),
 		substitutions,
 	};
@@ -2095,7 +2096,10 @@ export async function runSubprocessOnce(options: ExecutorOptions): Promise<Singl
 
 			const extensionRunner = session.extensionRunner;
 			const pendingExtensionMessages: Promise<void>[] = [];
-			if (extensionRunner) {
+			// Disposable preflight probes execute an in-memory candidate session purely to observe a
+			// live model provider; they are discarded at the acceptance fence, so user/session
+			// extensions (session_start emits and tool wrappers) must never run against them.
+			if (extensionRunner && !options.preflightProbe) {
 				extensionRunner.initialize(
 					{
 						sendMessage: (message, options) => {
@@ -2864,20 +2868,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			parentActiveModelPattern: undefined,
 			autoroutingCandidates: undefined,
 			autoroutingSkips: undefined,
-			routing: undefined,
+			routing: routedOptions,
 		});
 		prior = durable;
 		if (durable.preflightCommitFailure) {
 			attempts.push({ selector, phase: "durable", code: "post_acceptance_failure" });
-			return { ...durable, routing: evidenceWithAttempts(routedOptions, attempts) };
+			return { ...durable, routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts) };
 		}
 		if (durable.preflightFenceCrossed) {
 			if (durable.exitCode === 0) {
 				attempts.push({ selector, phase: "durable", code: "accepted" });
-				return { ...durable, routing: evidenceWithAttempts(routedOptions, attempts) };
+				return { ...durable, routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts) };
 			}
 			attempts.push({ selector, phase: "durable", code: "post_acceptance_failure" });
-			return { ...durable, routing: evidenceWithAttempts(routedOptions, attempts) };
+			return { ...durable, routing: evidenceWithAttempts(durable.routing ?? routedOptions, attempts) };
 		}
 		const failure = durable.preflightFailure ?? { kind: "local", op: "preflight_validation", transient: false };
 		const { code, advance } = autoroutingAttemptDisposition(failure);

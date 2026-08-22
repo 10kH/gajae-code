@@ -36,7 +36,7 @@ import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from ".
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import { selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
-import { type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
+import { type RawSettings, type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
 import type { SettingValue } from "../../config/settings-schema";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
@@ -1196,6 +1196,22 @@ function sameCanonicalAutoroutingValue(left: unknown, right: unknown): boolean {
 	}
 	return true;
 }
+
+function rawAutoroutingState(current: RawSettings): {
+	provenance?: AutoroutingProvenance;
+	tiers?: unknown;
+} {
+	const task = current.task;
+	if (!task || typeof task !== "object" || Array.isArray(task)) return {};
+	const autorouting = (task as Record<string, unknown>).autorouting;
+	if (!autorouting || typeof autorouting !== "object" || Array.isArray(autorouting)) return {};
+	const record = autorouting as Record<string, unknown>;
+	return {
+		provenance: record.provenance as AutoroutingProvenance | undefined,
+		tiers: record.tiers,
+	};
+}
+
 export class SelectorController {
 	#smartRoutingInFlight?: Promise<unknown>;
 	#transcriptViewerOpen = false;
@@ -2329,10 +2345,14 @@ export class SelectorController {
 		}
 	}
 
-	#assertSmartRoutingNotHandEdited(preview: SmartRoutingPreview, allowHandEdit: boolean): void {
+	#assertSmartRoutingNotHandEdited(
+		preview: SmartRoutingPreview,
+		allowHandEdit: boolean,
+		current?: { provenance?: AutoroutingProvenance; tiers?: unknown },
+	): void {
 		if (allowHandEdit) return;
-		const provenance = this.ctx.settings.get("task.autorouting.provenance");
-		const currentTiers = this.ctx.settings.get("task.autorouting.tiers");
+		const provenance = current?.provenance ?? this.ctx.settings.get("task.autorouting.provenance");
+		const currentTiers = current?.tiers ?? this.ctx.settings.get("task.autorouting.tiers");
 		if (!provenance || currentTiers === undefined) return;
 		const state = evaluateAutoroutingProvenanceState(provenance, {
 			catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
@@ -2403,13 +2423,18 @@ export class SelectorController {
 			return this.#reportSmartRoutingValidationError(error);
 		}
 		return this.#runSmartRoutingIntent("Apply", async () => {
-			await this.ctx.settings.commitAtomicBatchWithCurrent(() =>
-				buildAutoroutingSettingsBatch({
+			await this.ctx.settings.commitAtomicBatchWithCurrent(current => {
+				this.#assertSmartRoutingNotHandEdited(
+					preview,
+					options?.confirmHandEdit === true,
+					rawAutoroutingState(current),
+				);
+				return buildAutoroutingSettingsBatch({
 					tiers: preview.tiers,
 					setup: preview.setup,
 					provenance: preview.provenance,
-				}),
-			);
+				});
+			});
 			return preview;
 		});
 	}
@@ -2449,13 +2474,18 @@ export class SelectorController {
 			return this.#reportSmartRoutingValidationError(error);
 		}
 		return this.#runSmartRoutingIntent("Refresh", async () => {
-			await this.ctx.settings.commitAtomicBatchWithCurrent(() =>
-				buildAutoroutingSettingsBatch({
+			await this.ctx.settings.commitAtomicBatchWithCurrent(current => {
+				this.#assertSmartRoutingNotHandEdited(
+					preview,
+					options?.confirmHandEdit === true,
+					rawAutoroutingState(current),
+				);
+				return buildAutoroutingSettingsBatch({
 					tiers: preview.tiers,
 					setup: preview.setup,
 					provenance: preview.provenance,
-				}),
-			);
+				});
+			});
 			return preview;
 		});
 	}

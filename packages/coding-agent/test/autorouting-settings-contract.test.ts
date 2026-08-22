@@ -173,7 +173,16 @@ describe("autorouting typed settings contract", () => {
 		expect(setupSchema.additionalProperties).toBe(false);
 		expect(setupSchema.required).toEqual(["schema", "providers"]);
 		expect(setupSchema.properties.providers).toMatchObject({ type: "array", minItems: 1, uniqueItems: true });
-		expect(setupSchema.properties.models.items.pattern).toBe(AUTOROUTING_SELECTOR_PATTERN);
+		expect(setupSchema.properties.providers.items).toMatchObject({
+			minLength: 1,
+			pattern: "^[^\\s](?:.*[^\\s])?$",
+		});
+		expect(setupSchema.properties.models.items).toMatchObject({
+			minLength: 1,
+			maxLength: AUTOROUTING_SELECTOR_MAX_LENGTH,
+			pattern: AUTOROUTING_SELECTOR_PATTERN,
+			not: { pattern: "^\\s*[pP][iI]/" },
+		});
 		expect(provenanceSchema.additionalProperties).toBe(false);
 		expect(provenanceSchema.properties.source.additionalProperties).toBe(false);
 		expect(provenanceSchema.properties.source.properties.generatorVersion).toMatchObject({

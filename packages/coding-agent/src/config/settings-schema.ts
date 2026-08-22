@@ -322,7 +322,11 @@ const AUTOROUTING_SETUP_JSON_SCHEMA: JsonSchemaObject = {
 			type: "array",
 			minItems: 1,
 			uniqueItems: true,
-			items: { type: "string", minLength: 1 },
+			items: {
+				type: "string",
+				minLength: 1,
+				pattern: "^[^\\s](?:.*[^\\s])?$",
+			},
 		},
 		models: {
 			type: "array",
