@@ -24,8 +24,8 @@ import {
 import { TempDir } from "@gajae-code/utils";
 import {
 	mintProviderSafetyStop,
-	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
 } from "../../ai/src/adapter-internals/provider-safety-stop";
 import { AgentSession, type AgentSessionEvent } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
