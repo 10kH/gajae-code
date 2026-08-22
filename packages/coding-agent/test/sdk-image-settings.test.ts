@@ -42,6 +42,7 @@ describe("direct SDK image tool settings", () => {
 		const cwd = tempDir.path();
 		authStorage = await AuthStorage.create(path.join(cwd, "auth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([imageModel]);
 		const credentialSessionId = "sdk-image-credential-scope";
 		const credentialScopes: Array<string | undefined> = [];
 		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (_model, sessionId) => {
