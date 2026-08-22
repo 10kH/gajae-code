@@ -1395,7 +1395,7 @@ export async function runRootCommand(
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		} finally {
-			await scopedSettings.close();
+			await scopedSettings.close?.();
 		}
 	}
 
