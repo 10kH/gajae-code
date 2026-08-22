@@ -157,7 +157,13 @@ describe("provider safety-stop provenance authority", () => {
 		for (const callerTransport of [() => undefined, {}]) {
 			const forged = message();
 			expect(
-				mintProviderSafetyStop(forged, "refusal", PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY, callerTransport),
+				mintProviderSafetyStop(
+					forged,
+					"refusal",
+					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+					callerTransport,
+					PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+				),
 			).toBe(false);
 			expect(forged.errorKind).toBeUndefined();
 			expect(isProviderSafetyStopAuthenticated(forged)).toBe(false);
@@ -174,7 +180,15 @@ describe("provider safety-stop provenance authority", () => {
 	test("a structurally forged capability cannot mint authority", () => {
 		const forged = message();
 		const forgedCapability = {} as Parameters<typeof mintProviderSafetyStop>[2];
-		expect(mintProviderSafetyStop(forged, "refusal", forgedCapability)).toBe(false);
+		expect(
+			mintProviderSafetyStop(
+				forged,
+				"refusal",
+				forgedCapability,
+				undefined,
+				PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+			),
+		).toBe(false);
 		expect(isProviderSafetyStopAuthenticated(forged)).toBe(false);
 		expect(forged.errorKind).toBeUndefined();
 	});
