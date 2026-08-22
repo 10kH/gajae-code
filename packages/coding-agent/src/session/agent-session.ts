@@ -19459,6 +19459,7 @@ export class AgentSession {
 		try {
 			const result = await executeBashCommand(command, {
 				onChunk,
+				settings: this.settings,
 				signal: abortController.signal,
 				sessionKey: this.sessionId,
 				cwd,
@@ -19596,6 +19597,7 @@ export class AgentSession {
 				sessionId,
 				kernelOwnerId: this.#evalKernelOwnerId,
 				kernelMode: this.settings.get("python.kernelMode"),
+				settings: this.settings,
 				onChunk,
 				signal: abortController.signal,
 			});

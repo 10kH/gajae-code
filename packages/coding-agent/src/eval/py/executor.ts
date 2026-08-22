@@ -21,6 +21,8 @@ export type PythonKernelMode = "session" | "per-call";
 export interface PythonExecutorOptions {
 	/** Working directory for command execution */
 	cwd?: string;
+	/** Session settings used for shell and runtime policy. */
+	settings?: Settings;
 	/** Timeout in milliseconds */
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline in milliseconds since epoch */
@@ -568,7 +570,7 @@ async function executeWithKernel(
 	code: string,
 	options: PythonExecutorOptions | undefined,
 ): Promise<PythonResult> {
-	const settings = await Settings.init();
+	const settings = options?.settings ?? (await Settings.init());
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,

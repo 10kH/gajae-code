@@ -1,6 +1,7 @@
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
 import { type Static, z } from "@gajae-code/ai/core";
 import { logger } from "@gajae-code/utils";
+import type { Settings } from "../config/settings";
 import { disposeKernelSessionsByOwner, executePython } from "../eval/py/executor";
 import type { ToolDefinition } from "../extensibility/extensions/types";
 import { applyToolProxy } from "../extensibility/tool-proxy";
@@ -21,6 +22,8 @@ export function pythonKernelOwnerId(sessionId: string): string {
 export interface SessionPythonToolInput {
 	/** Working directory for kernel execution (session cwd). */
 	cwd: string;
+	/** Session settings used for Python runtime policy. */
+	settings: Settings;
 	/** Resolve the GJC session id used for the kernel owner and transcript paths. */
 	getSessionId: () => string | null;
 	/** Register cleanup with the current logical session lifecycle. */
@@ -153,6 +156,7 @@ export function createSessionPythonTool(input: SessionPythonToolInput): AgentToo
 			try {
 				const result = await executePython(code, {
 					cwd: input.cwd,
+					settings: input.settings,
 					kernelMode: "session",
 					sessionId: ownerId,
 					kernelOwnerId: ownerId,

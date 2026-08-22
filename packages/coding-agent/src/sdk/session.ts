@@ -1385,6 +1385,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let authStorageClosed = false;
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
+	let closeOwnedSettings: () => void = () => {};
 	const closeOwnedAuthStorage = (): void => {
 		if (!hasSession && credentialScopeLeased && credentialScopeId) {
 			authStorage.releaseCredentialScope(credentialScopeId);
@@ -1423,6 +1424,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
+		closeOwnedSettings = (): void => {
+			if (ownsScopedSettings) settings.getStorage()?.close();
+		}
 		// Keep legacy singleton consumers (bash, edit guards, and older extension code)
 		// initialized for SDK child hosts without making the session's role resolution
 		// depend on that process-global instance. Session-aware tool contexts carry the
@@ -4221,6 +4225,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							AsyncJobManager.unregisterManager(asyncJobManager);
 						}
 						closeOwnedAuthStorage();
+						closeOwnedSettings();
 					}
 				}
 			};
@@ -4435,6 +4440,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				]);
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
 				await disposeVmContextsByOwner(evalKernelOwnerId);
+				closeOwnedSettings();
 			}
 		} catch (cleanupError) {
 			cleanupDiagnostic = cleanupError;
