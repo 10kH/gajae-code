@@ -9,6 +9,22 @@ import { SessionManager } from "../src/session/session-manager";
 
 const cliEntrypoint = path.resolve(import.meta.dir, "../src/cli.ts");
 
+// Live frames a fake host pushes only after it has answered a replay, so a tail
+// that exits on replayed history alone provably never observes them.
+const DEFERRED_LIVE_EVENT_DELAY_MS = 300;
+
+// The Router's attach-time replay calls the transport directly, while the CLI's
+// explicit tail replay goes through SessionRouter.request, which stamps
+// connectionId onto the wire frame. That difference is the fake host's only
+// deterministic discriminator between the two event_replay requests.
+function isExplicitTailReplay(frame: Record<string, unknown>): boolean {
+	return frame.type === "event_replay" && typeof frame.connectionId === "string";
+}
+
+// Delay applied to the explicit tail replay response so live frames pushed at
+// request time provably reach the client first.
+const EXPLICIT_REPLAY_DELAY_MS = 250;
+
 type CliResult = { exitCode: number; stdout: string; stderr: string };
 
 // Capture through files rather than pipes: a piped child that outlives the
@@ -72,12 +88,35 @@ describe("SDK session CLI", () => {
 	let endpointConnections = 0;
 	let promptStatuses = new Map<string, { status: string }>();
 	let replayEvents: Record<string, unknown>[] = [];
+	let deferredLiveEvents: Record<string, unknown>[] = [];
+	let deferredLiveDispatched = false;
+	let openSockets = new Set<Bun.ServerWebSocket<undefined>>();
+	// Out-of-band ordering script: events answered to the explicit tail replay
+	// only, live frames pushed the moment that request arrives, and a delay on
+	// the reply so the live frames provably land first.
+	let explicitReplayEvents: Record<string, unknown>[] | undefined;
+	let earlyLiveEvents: Record<string, unknown>[] = [];
+	let wireLog: string[] = [];
+	// Retained transcript rows served by `transcript.list`. Non-empty rows make
+	// the checkpoint advertise a cursor so the CLI actually drains the page.
+	let transcriptRows: Record<string, unknown>[] = [];
+	// Exact JSON the fake host put on the wire for the explicit tail replay, so a
+	// test can prove a raw coordinate claim really was transmitted.
+	let lastReplayPayload = "";
 
 	beforeEach(async () => {
 		endpointConnections = 0;
 		receivedControl = undefined;
 		promptStatuses = new Map();
 		replayEvents = [];
+		deferredLiveEvents = [];
+		deferredLiveDispatched = false;
+		openSockets = new Set();
+		explicitReplayEvents = undefined;
+		earlyLiveEvents = [];
+		wireLog = [];
+		transcriptRows = [];
+		lastReplayPayload = "";
 		root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-cli-"));
 		agentDir = path.join(root, "agent");
 		stateRoot = path.join(root, ".gjc", "state");
@@ -94,6 +133,7 @@ describe("SDK session CLI", () => {
 			},
 			websocket: {
 				open(socket) {
+					openSockets.add(socket);
 					// Defer hello one tick so the client open handler can enter the
 					// hello phase before the first frame is delivered (pairs with the
 					// SdkClient early-hello buffer under load).
@@ -110,9 +150,52 @@ describe("SDK session CLI", () => {
 				message(socket, message) {
 					const frame = JSON.parse(String(message)) as Record<string, unknown>;
 					if (frame.type === "event_replay") {
+						// Out-of-band script: answer the Router's attach replay empty so it
+						// cannot pre-order history, push live frames now, and delay the
+						// explicit tail replay so those live frames arrive first.
+						if (explicitReplayEvents !== undefined) {
+							const explicit = isExplicitTailReplay(frame);
+							wireLog.push(explicit ? "explicit_replay_request" : "attach_replay_request");
+							if (!explicit) {
+								socket.send(
+									JSON.stringify({ type: "event_replay_result", id: frame.id, ok: true, events: [] }),
+								);
+								return;
+							}
+							for (const event of earlyLiveEvents) {
+								socket.send(JSON.stringify(event));
+								wireLog.push(`live_sent:${event.kind}:${event.seq}`);
+							}
+							const events = explicitReplayEvents;
+							const id = frame.id;
+							void Bun.sleep(EXPLICIT_REPLAY_DELAY_MS).then(() => {
+								try {
+									lastReplayPayload = JSON.stringify({ type: "event_replay_result", id, ok: true, events });
+									socket.send(lastReplayPayload);
+									wireLog.push("explicit_replay_result");
+								} catch {
+									// connection already closed
+								}
+							});
+							return;
+						}
 						socket.send(
 							JSON.stringify({ type: "event_replay_result", id: frame.id, ok: true, events: replayEvents }),
 						);
+						if (deferredLiveEvents.length > 0 && !deferredLiveDispatched) {
+							deferredLiveDispatched = true;
+							const pending = deferredLiveEvents;
+							void Bun.sleep(DEFERRED_LIVE_EVENT_DELAY_MS).then(() => {
+								for (const event of pending)
+									for (const target of openSockets) {
+										try {
+											target.send(JSON.stringify(event));
+										} catch {
+											// connection already closed
+										}
+									}
+							});
+						}
 						return;
 					}
 					if (frame.type === "control_request") {
@@ -165,7 +248,21 @@ describe("SDK session CLI", () => {
 									type: "query_response",
 									id: frame.id,
 									ok: true,
-									result: { checkpoint: { revision: 1, generation: 1, seq: 0 } },
+									result: {
+										checkpoint: { revision: 1, generation: 1, seq: 0 },
+										...(transcriptRows.length > 0 ? { cursor: "transcript-page-1" } : {}),
+									},
+								}),
+							);
+							return;
+						}
+						if (frame.query === "transcript.list") {
+							socket.send(
+								JSON.stringify({
+									type: "query_response",
+									id: frame.id,
+									ok: true,
+									result: { page: { items: transcriptRows, complete: true } },
 								}),
 							);
 							return;
@@ -351,6 +448,634 @@ describe("SDK session CLI", () => {
 			ok: true,
 			result: { source: "session", terminal: true, items: [expect.objectContaining({ kind: "turn_end", seq: 1 })] },
 		});
+	}, 60_000);
+
+	it("keeps --until-idle attached when a replayed terminal turn precedes a newer active turn", async () => {
+		// Retained order: turn A already ended, then newer turn B started and is
+		// still running. Turn B's terminal event only arrives as a live frame.
+		replayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-a" },
+			},
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		deferredLiveEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 3,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const result = JSON.parse(tail.stdout).result as { terminal: boolean; items: Array<Record<string, unknown>> };
+		// Turn A's replayed terminal must not complete the tail; only turn B's own
+		// terminal event may, and prior replayed events stay visible in order.
+		expect(result.items.map(item => ({ kind: item.kind, seq: item.seq }))).toEqual([
+			{ kind: "turn_end", seq: 1 },
+			{ kind: "turn_start", seq: 2 },
+			{ kind: "turn_end", seq: 3 },
+		]);
+		expect(result.terminal).toBe(true);
+	}, 60_000);
+
+	// Out-of-band ordering: the Router delivers live frames as they arrive, while
+	// the explicit tail replay resolves later. Canonical (generation, seq) order
+	// must decide turn state, not the order frames happen to reach the client.
+	function assertLiveFramesPrecededReplay(): void {
+		const liveSent = wireLog.findIndex(entry => entry.startsWith("live_sent:"));
+		const replayResult = wireLog.indexOf("explicit_replay_result");
+		expect(wireLog).toContain("explicit_replay_request");
+		expect(liveSent).toBeGreaterThanOrEqual(0);
+		expect(replayResult).toBeGreaterThanOrEqual(0);
+		expect(liveSent).toBeLessThan(replayResult);
+	}
+
+	it("keeps session close priority when frame arrival order delivers close first", async () => {
+		// Doubles as the delivery control: this tail can only complete because the
+		// early live close frame really reached the CLI before the delayed replay.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 3,
+				kind: "session_closed",
+				payload: { type: "session_closed", sessionId: "live" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-a" },
+			},
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: true, result: { terminal: true } });
+	}, 60_000);
+
+	it("does not complete --until-idle when frame arrival order folds an older terminal last", async () => {
+		// Canonical order is turn_end(A, seq1) then turn_start(B, seq2): turn B is
+		// active, so the older terminal must not complete the tail even though it
+		// is the last event folded.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-a" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "tail_timeout" } });
+	}, 60_000);
+
+	it("does not complete --until-idle when a delayed unsequenced terminal follows a newer sequenced start", async () => {
+		// The host states no ring position for the replayed terminal, so it cannot
+		// be proven to be at or after turn_start(B, seq2). Turn B is the newest
+		// event with a canonical position and is still running, so an unsequenced
+		// terminal must not complete the tail.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		explicitReplayEvents = [{ type: "event", kind: "turn_end", payload: { type: "turn_end", sessionId: "live" } }];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "tail_timeout" } });
+	}, 60_000);
+
+	it("fails closed when conflicting lifecycle kinds claim the same canonical position", async () => {
+		// A host emitting two different lifecycle kinds at one (generation, seq)
+		// states no order between them, so neither arrival order may decide turn
+		// state. Both orders must fail closed identically.
+		const conflictingStart = {
+			type: "event",
+			generation: 1,
+			seq: 2,
+			kind: "turn_start",
+			payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+		};
+		const conflictingEnd = {
+			type: "event",
+			generation: 1,
+			seq: 2,
+			kind: "turn_end",
+			payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+		};
+		const runConflict = async (
+			early: Record<string, unknown>,
+			late: Record<string, unknown>,
+		): Promise<Record<string, unknown>> => {
+			wireLog = [];
+			earlyLiveEvents = [early];
+			explicitReplayEvents = [late];
+			const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+			assertLiveFramesPrecededReplay();
+			const parsed = JSON.parse(tail.stdout) as { ok?: boolean; error?: { code?: string } };
+			return { exitCode: tail.exitCode, ok: parsed.ok === true, code: parsed.error?.code };
+		};
+
+		const startFirst = await runConflict(conflictingStart, conflictingEnd);
+		const endFirst = await runConflict(conflictingEnd, conflictingStart);
+
+		expect({ startFirst, endFirst }).toEqual({
+			startFirst: { exitCode: 1, ok: false, code: "protocol_error" },
+			endFirst: { exitCode: 1, ok: false, code: "protocol_error" },
+		});
+	}, 60_000);
+
+	it("emits positioned event items canonically before the unpositioned event segment", async () => {
+		// An unpositioned lifecycle item must not anchor positioned items around
+		// it: positioned events stay canonical among themselves and precede the
+		// arrival-ordered unpositioned segment, which stays visible.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-unpositioned" },
+			},
+			{
+				type: "event",
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-a" },
+			},
+			{
+				type: "event",
+				generation: 1,
+				seq: 3,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const result = JSON.parse(tail.stdout).result as { terminal: boolean; items: Array<Record<string, unknown>> };
+		expect(result.items.map(item => ({ kind: item.kind, seq: item.seq }))).toEqual([
+			{ kind: "turn_end", seq: 1 },
+			{ kind: "turn_start", seq: 2 },
+			{ kind: "turn_end", seq: 3 },
+			{ kind: "turn_end", seq: undefined },
+		]);
+		expect(result.terminal).toBe(true);
+	}, 60_000);
+
+	it("keeps unpositioned live events visible after positioned lifecycle items", async () => {
+		// Router frames without a publication position are still evidence. They
+		// remain in the unpositioned segment and cannot reorder positioned state.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-unpositioned" },
+			},
+			{
+				type: "event",
+				generation: 1,
+				seq: 3,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const result = JSON.parse(tail.stdout).result as { terminal: boolean; items: Array<Record<string, unknown>> };
+		expect(result.items.map(item => ({ kind: item.kind, seq: item.seq }))).toEqual([
+			{ kind: "turn_start", seq: 2 },
+			{ kind: "turn_end", seq: 3 },
+			{ kind: "turn_end", seq: undefined },
+		]);
+		expect(result.terminal).toBe(true);
+	}, 60_000);
+
+	it("fails closed on a same-position conflict observed with close in one replay batch", async () => {
+		// A protocol conflict outranks a successful close completion, whichever
+		// order the two reach the fold within one batch.
+		const closeEvent = {
+			type: "event",
+			generation: 1,
+			seq: 9,
+			kind: "session_closed",
+			payload: { type: "session_closed", sessionId: "live" },
+		};
+		const conflictPair = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		const runBatch = async (events: Record<string, unknown>[]): Promise<Record<string, unknown>> => {
+			wireLog = [];
+			earlyLiveEvents = [];
+			explicitReplayEvents = events;
+			const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+			const parsed = JSON.parse(tail.stdout) as { ok?: boolean; error?: { code?: string } };
+			return { exitCode: tail.exitCode, ok: parsed.ok === true, code: parsed.error?.code };
+		};
+
+		const closeFirst = await runBatch([closeEvent, ...conflictPair]);
+		const conflictFirst = await runBatch([...conflictPair, closeEvent]);
+
+		expect({ closeFirst, conflictFirst }).toEqual({
+			closeFirst: { exitCode: 1, ok: false, code: "protocol_error" },
+			conflictFirst: { exitCode: 1, ok: false, code: "protocol_error" },
+		});
+	}, 60_000);
+
+	it("keeps transcript and event dedupe domains independent at one projected position", async () => {
+		// A transcript row may project the same kind/generation/seq as a real
+		// event-ring row. Sharing one dedupe domain lets the transcript claim the
+		// key first and suppress the event, erasing lifecycle and conflict
+		// evidence. Both source-domain items must survive.
+		const transcriptShapedAsEvent = {
+			kind: "turn_start",
+			generation: 1,
+			seq: 2,
+			payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+		};
+		const eventTurnStart = {
+			type: "event",
+			generation: 1,
+			seq: 2,
+			kind: "turn_start",
+			payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+		};
+
+		// Both items visible, and the event still drives turn state.
+		transcriptRows = [transcriptShapedAsEvent];
+		explicitReplayEvents = [
+			eventTurnStart,
+			{
+				type: "event",
+				generation: 1,
+				seq: 3,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		const visible = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
+		const visibleParsed = JSON.parse(visible.stdout) as {
+			result?: { items?: Array<Record<string, unknown>> };
+		};
+		const visibleSummary = {
+			exitCode: visible.exitCode,
+			turnStartCount: (visibleParsed.result?.items ?? []).filter(item => item.kind === "turn_start").length,
+			totalItems: (visibleParsed.result?.items ?? []).length,
+		};
+
+		// The event ring states a genuine same-position conflict; a transcript row
+		// occupying that key must not hide it.
+		wireLog = [];
+		transcriptRows = [transcriptShapedAsEvent];
+		explicitReplayEvents = [
+			eventTurnStart,
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		const conflict = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+		const conflictParsed = JSON.parse(conflict.stdout) as { error?: { code?: string } };
+
+		expect({
+			visibleSummary,
+			conflictCode: conflictParsed.error?.code,
+		}).toEqual({
+			visibleSummary: { exitCode: 0, turnStartCount: 2, totalItems: 3 },
+			conflictCode: "protocol_error",
+		});
+	}, 60_000);
+
+	it("fails closed on malformed event-ring position coordinates", async () => {
+		// Only a pair of non-negative safe integers is a canonical position. A
+		// partial or invalid claim is not silently downgraded to unpositioned.
+		const malformedClaims: Array<{ name: string; event: Record<string, unknown> }> = [
+			{ name: "generation only", event: { generation: 1 } },
+			{ name: "seq only", event: { seq: 2 } },
+			{ name: "negative seq", event: { generation: 1, seq: -1 } },
+			{ name: "negative generation", event: { generation: -1, seq: 2 } },
+			{ name: "fractional seq", event: { generation: 1, seq: 2.5 } },
+			{ name: "unsafe integer seq", event: { generation: 1, seq: 2 ** 53 } },
+			{ name: "non-finite seq serialized", event: { generation: 1, seq: Number.POSITIVE_INFINITY } },
+		];
+
+		const observed: Array<{ name: string; exitCode: number; code: string | undefined }> = [];
+		for (const claim of malformedClaims) {
+			wireLog = [];
+			transcriptRows = [];
+			explicitReplayEvents = [
+				{
+					type: "event",
+					kind: "turn_end",
+					...claim.event,
+					payload: { type: "turn_end", sessionId: "live", turnId: "turn-a" },
+				},
+			];
+			const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+			const parsed = JSON.parse(tail.stdout) as { error?: { code?: string } };
+			observed.push({ name: claim.name, exitCode: tail.exitCode, code: parsed.error?.code });
+		}
+
+		expect(observed).toEqual(
+			malformedClaims.map(claim => ({ name: claim.name, exitCode: 1, code: "protocol_error" })),
+		);
+	}, 120_000);
+
+	it("fails closed on raw null event-ring position claims that projection would drop", async () => {
+		// `toTailItemV1` keeps a coordinate only when it is already a number, so a
+		// raw null claim loses property presence and would otherwise be accepted as
+		// genuinely unpositioned. Validation must see the raw claim.
+		const rawClaims: Array<{ name: string; event: Record<string, unknown>; wire: string }> = [
+			{ name: "generation null, seq absent", event: { generation: null }, wire: '"generation":null' },
+			{ name: "seq null, generation absent", event: { seq: null }, wire: '"seq":null' },
+			{
+				name: "generation null and seq null",
+				event: { generation: null, seq: null },
+				wire: '"generation":null,"seq":null',
+			},
+			{
+				name: "both non-finite serialize to null",
+				event: { generation: Number.POSITIVE_INFINITY, seq: Number.NaN },
+				wire: '"generation":null,"seq":null',
+			},
+		];
+
+		const observed: Array<{ name: string; exitCode: number; code: string | undefined; wireCarriedClaim: boolean }> =
+			[];
+		for (const claim of rawClaims) {
+			wireLog = [];
+			transcriptRows = [];
+			lastReplayPayload = "";
+			explicitReplayEvents = [
+				{
+					type: "event",
+					kind: "turn_end",
+					...claim.event,
+					payload: { type: "turn_end", sessionId: "live", turnId: "turn-a" },
+				},
+			];
+			const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+			const parsed = JSON.parse(tail.stdout) as { error?: { code?: string } };
+			observed.push({
+				name: claim.name,
+				exitCode: tail.exitCode,
+				code: parsed.error?.code,
+				// Proves the failure is acceptance of a transmitted raw claim, not a
+				// fixture that never put the coordinate on the wire.
+				wireCarriedClaim: lastReplayPayload.includes(claim.wire),
+			});
+		}
+
+		expect(observed).toEqual(
+			rawClaims.map(claim => ({
+				name: claim.name,
+				exitCode: 1,
+				code: "protocol_error",
+				wireCarriedClaim: true,
+			})),
+		);
+	}, 120_000);
+
+	it("fails closed when a close kind conflicts with another lifecycle kind at one position", async () => {
+		// Close kinds are consumed by tail semantics, so they must claim their
+		// canonical position like any other lifecycle kind. Otherwise a close at a
+		// contested position silently wins instead of failing closed.
+		const at = (kind: string, seq: number): Record<string, unknown> => ({
+			type: "event",
+			generation: 1,
+			seq,
+			kind,
+			payload: { type: kind, sessionId: "live", turnId: "turn-b" },
+		});
+		const conflictPairs: Array<[string, string]> = [
+			["session_closed", "turn_start"],
+			["session_closed", "turn_end"],
+			["session_closed", "session_terminated"],
+		];
+
+		const runBatch = async (events: Record<string, unknown>[]): Promise<Record<string, unknown>> => {
+			wireLog = [];
+			transcriptRows = [];
+			earlyLiveEvents = [];
+			explicitReplayEvents = events;
+			const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+			const parsed = JSON.parse(tail.stdout) as { ok?: boolean; error?: { code?: string } };
+			return { exitCode: tail.exitCode, code: parsed.error?.code };
+		};
+
+		const observed: Array<Record<string, unknown>> = [];
+		for (const [closeKind, otherKind] of conflictPairs) {
+			observed.push({
+				case: `${closeKind} then ${otherKind}`,
+				...(await runBatch([at(closeKind, 2), at(otherKind, 2)])),
+			});
+			observed.push({
+				case: `${otherKind} then ${closeKind}`,
+				...(await runBatch([at(otherKind, 2), at(closeKind, 2)])),
+			});
+		}
+
+		// Control: the same two kinds at distinct positions are not a conflict, so
+		// both are delivered and visible — the conflict cases above therefore fail
+		// on the shared position, not on a fixture that dropped an event.
+		wireLog = [];
+		transcriptRows = [];
+		earlyLiveEvents = [];
+		explicitReplayEvents = [at("turn_start", 2), at("session_closed", 3)];
+		const control = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+		const controlItems = ((JSON.parse(control.stdout).result?.items ?? []) as Array<Record<string, unknown>>).map(
+			item => ({ kind: item.kind, seq: item.seq }),
+		);
+
+		// Control: a same-kind duplicate close at one position stays normal dedupe.
+		wireLog = [];
+		transcriptRows = [];
+		earlyLiveEvents = [];
+		explicitReplayEvents = [at("session_closed", 2), at("session_closed", 2)];
+		const duplicate = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "2000"]);
+		const duplicateParsed = JSON.parse(duplicate.stdout) as {
+			result?: { items?: Array<Record<string, unknown>> };
+		};
+
+		expect({
+			observed,
+			controlItems,
+			duplicate: {
+				exitCode: duplicate.exitCode,
+				closeItems: (duplicateParsed.result?.items ?? []).filter(item => item.kind === "session_closed").length,
+			},
+		}).toEqual({
+			observed: conflictPairs.flatMap(([closeKind, otherKind]) => [
+				{ case: `${closeKind} then ${otherKind}`, exitCode: 1, code: "protocol_error" },
+				{ case: `${otherKind} then ${closeKind}`, exitCode: 1, code: "protocol_error" },
+			]),
+			controlItems: [
+				{ kind: "turn_start", seq: 2 },
+				{ kind: "session_closed", seq: 3 },
+			],
+			duplicate: { exitCode: 0, closeItems: 1 },
+		});
+	}, 180_000);
+
+	it("fails closed when live lifecycle evidence conflicts with delayed replay", async () => {
+		// The Router delivers the live claim before the explicit replay response;
+		// the replayed claim must still fail closed rather than letting arrival
+		// order or an idle shortcut decide the lifecycle.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "5000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(1);
+		expect(JSON.parse(tail.stdout)).toMatchObject({ ok: false, error: { code: "protocol_error" } });
+	}, 60_000);
+
+	it("completes --until-idle in canonical order when frame arrival order delivers the newer terminal first", async () => {
+		// Canonical order is turn_end(A,1), turn_start(B,2), turn_end(B,3): turn B
+		// reached its own terminal, so the tail completes and reports canonical
+		// order rather than the [3,1,2] order the frames arrived in.
+		earlyLiveEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 3,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+		explicitReplayEvents = [
+			{
+				type: "event",
+				generation: 1,
+				seq: 1,
+				kind: "turn_end",
+				payload: { type: "turn_end", sessionId: "live", turnId: "turn-a" },
+			},
+			{
+				type: "event",
+				generation: 1,
+				seq: 2,
+				kind: "turn_start",
+				payload: { type: "turn_start", sessionId: "live", turnId: "turn-b" },
+			},
+		];
+
+		const tail = await runCli(root, agentDir, ["tail", "live", "--until-idle", "--timeout-ms", "4000"]);
+
+		assertLiveFramesPrecededReplay();
+		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
+		const result = JSON.parse(tail.stdout).result as { terminal: boolean; items: Array<Record<string, unknown>> };
+		expect(result.items.map(item => ({ kind: item.kind, seq: item.seq }))).toEqual([
+			{ kind: "turn_end", seq: 1 },
+			{ kind: "turn_start", seq: 2 },
+			{ kind: "turn_end", seq: 3 },
+		]);
+		expect(result.terminal).toBe(true);
 	}, 60_000);
 
 	it("bounds offline retained-transcript tail reads for a synthetic 300 MiB history", async () => {
