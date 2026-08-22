@@ -1,6 +1,8 @@
 import { logger } from "@gajae-code/utils";
+import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
 import { redactBrokerRuntimeCloseCapability } from "./control/runtime-gate";
 import { type EventFrame, SessionEventStream } from "./events";
+import { isAutoroutingInactive } from "./internal-autorouting-state";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
 import type { BrokerIndexWriter, HostEndpointAdapters, SdkFrame } from "./types";
 
@@ -77,6 +79,7 @@ export interface SessionSdkHostOptions extends HostEndpointAdapters {
 	connectionCapabilities?: (connectionId: string) => ReadonlySet<string> | undefined;
 	/** Readiness publication mode; defaults to the stock immediate contract. */
 	readiness?: SessionReadinessMode;
+
 	/**
 	 * Authorization for a deferred activation. It is consulted on every attempt
 	 * that would publish readiness and never on an idempotent replay, and a gate
@@ -247,9 +250,22 @@ export class SessionSdkHost {
 		return this.events.emit(frame);
 	}
 
+	emitAutoroutingInactiveNotice(): EventFrame {
+		return this.emitEvent({
+			kind: "notice",
+			payload: {
+				type: "notice",
+				level: "warning",
+				message: AUTOROUTING_INACTIVE_WARNING,
+				source: "autorouting",
+			},
+		});
+	}
+
 	async start(): Promise<"started" | "already"> {
 		if (this.#started) return "already";
 		this.events.restart();
+		if (isAutoroutingInactive(this)) this.emitAutoroutingInactiveNotice();
 		if (this.#options.readiness !== "deferred") this.#publishReadiness();
 		else
 			this.emitEvent({

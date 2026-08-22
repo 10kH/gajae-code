@@ -2,6 +2,7 @@
 
 import * as path from "node:path";
 import { zodToWireSchema } from "../packages/ai/src/utils/schema/wire";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../packages/coding-agent/src/config/autorouting-contract";
 import { SETTINGS_SCHEMA } from "../packages/coding-agent/src/config/settings-schema";
 import { ModelsConfigSchema } from "../packages/coding-agent/src/config/models-config-schema";
 
@@ -23,6 +24,7 @@ type JsonSchemaObject = {
 	minLength?: number;
 	pattern?: string;
 	anyOf?: JsonSchema[];
+	not?: JsonSchema;
 };
 
 type SettingsSchema = typeof SETTINGS_SCHEMA;
@@ -153,7 +155,33 @@ function settingTypeToJsonSchema(definition: SettingDefinition): JsonSchemaObjec
 				type: "object",
 				additionalProperties: recordValueSchema("valueSchema" in definition ? definition.valueSchema : undefined),
 			};
+		case "constrained-record": {
+			const selector = constrainedRecordSelectorSchema(definition.valueSchema);
+			const properties = Object.fromEntries(
+				definition.keys.map(key => [
+					key,
+					{ anyOf: [selector, { type: "array", minItems: 1, items: selector }] },
+				]),
+			);
+			return { type: "object", properties, additionalProperties: false };
+		}
+		case "optional-object":
+			return structuredClone(definition.jsonSchema);
 	}
+}
+
+function constrainedRecordSelectorSchema(valueSchema: {
+	readonly pattern: string;
+	readonly description: string;
+}): JsonSchemaObject {
+	return {
+		type: "string",
+		minLength: 1,
+		maxLength: AUTOROUTING_SELECTOR_MAX_LENGTH,
+		pattern: valueSchema.pattern,
+		not: { pattern: "^\\s*[pP][iI]/" },
+		description: valueSchema.description,
+	};
 }
 
 function recordValueSchema(

@@ -1,7 +1,10 @@
+import { AUTOROUTING_SELECTOR_MAX_LENGTH } from "../config/autorouting-contract";
 import {
+	assertRoutingEvidenceInvariant,
 	hasCompleteUsageCostBreakdown,
 	type ReviewFindingsArtifactRef,
 	type SingleResult,
+	type TaskRoutingEvidence,
 	type TaskToolDetails,
 } from "./types";
 export interface TaskRoi {
@@ -33,6 +36,7 @@ export interface TaskResultReceipt {
 	contextTokens?: number;
 	contextWindow?: number;
 	modelOverride?: string | string[];
+	routing?: TaskRoutingEvidence;
 	modelSubstitutionWarning?: SingleResult["modelSubstitutionWarning"];
 	fastMode?: boolean;
 	usage?: SingleResult["usage"];
@@ -247,6 +251,25 @@ export function buildTaskRoiSummary(receipts: readonly TaskResultReceipt[]): Tas
 		lowRoiChildIds: receipts.filter(receipt => receipt.roi?.lowRoi).map(receipt => receipt.id),
 	};
 }
+function validatedRoutingEvidence(value: TaskRoutingEvidence | undefined): TaskRoutingEvidence | undefined {
+	if (!value) return undefined;
+	try {
+		const bounded: TaskRoutingEvidence = {
+			...value,
+			requestedSelector: value.requestedSelector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH),
+			skips: value.skips
+				?.slice(0, 16)
+				.map(skip => ({ ...skip, selector: skip.selector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH) })),
+			attempts: value.attempts
+				?.slice(0, 6)
+				.map(attempt => ({ ...attempt, selector: attempt.selector.slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH) })),
+		};
+		assertRoutingEvidenceInvariant(bounded);
+		return bounded;
+	} catch {
+		return undefined;
+	}
+}
 
 export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 	// Receipts only include outputRef when production code kept outputMeta after a
@@ -288,6 +311,7 @@ export function buildTaskReceipt(raw: SingleResult): TaskResultReceipt {
 		contextWindow: raw.contextWindow,
 		modelOverride: raw.modelOverride,
 		modelSubstitutionWarning: raw.modelSubstitutionWarning,
+		routing: validatedRoutingEvidence(raw.routing),
 		usage: raw.usage,
 		cost: raw.usage?.cost.total,
 		usageCostBreakdownComplete:
