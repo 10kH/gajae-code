@@ -596,6 +596,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 	const blockIndex = () => blocks.length - 1;
 	let currentBlock: TextContent | ThinkingContent | null = null;
 	let firstTokenSeen = false;
+	let providerSafetyStop = false;
 
 	const flushCurrent = () => {
 		if (!currentBlock) return;
@@ -676,6 +677,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 
 		if (candidate?.finishReason) {
 			if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
+				providerSafetyStop = true;
 				// Terminal authority is minted by the adapter after parsing the
 				// structured candidate finish reason; a wire-assignable field
 				// alone never carries it (#4777).
@@ -687,7 +689,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 					adapterInvocation,
 				);
 				output.stopReason = "error";
-			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+			} else if (!providerSafetyStop) {
 				output.stopReason = mapStopReason(candidate.finishReason);
 				if (output.stopReason === "stop" && output.content.some(b => b.type === "toolCall")) {
 					output.stopReason = "toolUse";
@@ -698,6 +700,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 		const blockReason = getGooglePromptBlockReason(chunk.promptFeedback);
 		if (blockReason) {
 			if (isGooglePromptSafetyStopReason(blockReason)) {
+				providerSafetyStop = true;
 				// Prompt-level block reasons carry the same adapter-minted
 				// authority as candidate finish reasons (#4777).
 				mintProviderSafetyStop(
@@ -708,7 +711,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 					adapterInvocation,
 				);
 				output.stopReason = "error";
-			} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+			} else if (!providerSafetyStop) {
 				output.stopReason = "error";
 			}
 		}

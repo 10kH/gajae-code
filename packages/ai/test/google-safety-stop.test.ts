@@ -122,6 +122,38 @@ describe("Google safety stops", () => {
 		expect(result.errorKind).toBeUndefined();
 	});
 
+	it("keeps an unauthenticated safety refusal terminal across a later benign finish", async () => {
+		const model = createBaseModel("google-generative-ai");
+		const stream = streamGoogleGenAI({
+			model,
+			api: "google-generative-ai",
+			options: undefined,
+			prepare: () => ({
+				params: { model: model.id, contents: [] },
+				url: "https://google.example.test/stream",
+				headers: {},
+				fetch: async () =>
+					createSseResponse([
+						{
+							candidates: [
+								{
+									content: { parts: [{ functionCall: { name: "blocked", args: {} } }] },
+									finishReason: "SAFETY",
+								},
+							],
+						},
+						{ candidates: [{ finishReason: "STOP" }] },
+					]),
+			}),
+		});
+
+		await collectEvents(stream);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorKind).toBeUndefined();
+		expect(result.content.some(block => block.type === "toolCall")).toBe(true);
+	});
+
 	it("classifies the exhaustive candidate finish-reason partition", async () => {
 		for (const finishReason of candidateFinishReasonFixtures.commonSafety) {
 			const result = await streamGoogleResponse({ candidates: [{ finishReason }] });

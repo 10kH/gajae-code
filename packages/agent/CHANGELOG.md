@@ -4,6 +4,7 @@
 - Managed fallback now transfers safety-stop authority only to the adjudicated final assistant shell; intermediate partial snapshots and hostile accessor-backed final messages cannot retain or bypass the provenance boundary (#4777 review).
 
 - Managed assistant reconstruction now copies provider metadata through guarded property reads instead of an unguarded spread, so accessor-trapped metadata degrades without aborting the attempt or creating managed retry authority (#4777 review).
+- Hostile Proxy-wrapped final messages no longer reintroduce a forged `provider_safety_stop` label through the sanitizer fallback shell; discarded failure outcomes are now label-free before session policy can suppress provider fallback (#4777 review).
 
 
 ### Fixed

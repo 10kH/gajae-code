@@ -433,6 +433,7 @@ describe("managed attempt transaction", () => {
 		// (#4777 review follow-up).
 		const mock = createMockModel({ responses: [{ content: ["fallback accepted"] }] });
 		let calls = 0;
+		let discardedFailureKind: AssistantMessage["errorKind"] | undefined;
 		const agent = new Agent({
 			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
 			streamFn: (...args) => {
@@ -464,18 +465,21 @@ describe("managed attempt transaction", () => {
 		});
 		const options = {
 			fallbackManaged: true,
-			onManagedAttemptOutcome: () =>
-				({
+			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
+				if (outcome.type === "retryable_discarded") discardedFailureKind = outcome.failure.message.errorKind;
+				return {
 					type: "retry" as const,
 					continuation: async (ownership: { isCurrent(): boolean }) => {
 						if (ownership.isCurrent()) await agent.continue(options);
 					},
-				}) as const,
+				} as const;
+			},
 		};
 
 		await agent.prompt("run", options);
 
 		expect(calls).toBe(2);
+		expect(discardedFailureKind).toBeUndefined();
 		const terminal = agent.state.messages.at(-1);
 		expect(terminal).toMatchObject({ role: "assistant", content: [{ type: "text", text: "fallback accepted" }] });
 		expect((terminal as AssistantMessage).errorKind).toBeUndefined();

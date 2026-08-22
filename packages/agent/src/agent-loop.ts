@@ -452,7 +452,9 @@ function sanitizeProviderSafetyStopProvenance(
 		delete rebuilt.errorKind;
 		return rebuilt;
 	}
-	return managedAssistantShell(message, model);
+	const rebuilt = managedAssistantShell(message, model);
+	delete rebuilt.errorKind;
+	return rebuilt;
 }
 
 /**

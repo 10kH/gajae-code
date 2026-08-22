@@ -53,7 +53,6 @@ import {
 	mapStopReasonString,
 	mapToolChoice,
 	nextToolCallId,
-	PROVIDER_SAFETY_STOP,
 	pushBlockEndEvent,
 	pushToolCallEvents,
 	retainThoughtSignature,
@@ -481,6 +480,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 				}
 
 				let hasContent = false;
+				let providerSafetyStop = false;
 				let currentBlock: TextContent | ThinkingContent | null = null;
 				const blocks = output.content;
 				const blockIndex = () => blocks.length - 1;
@@ -570,6 +570,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 
 					if (candidate?.finishReason) {
 						if (isGoogleCandidateSafetyStopReason(candidate.finishReason)) {
+							providerSafetyStop = true;
 							hasContent = true;
 							// Adapter-minted terminal authority from the parsed
 							// structured finish reason (#4777).
@@ -581,7 +582,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 								isProviderSafetyStopAdapterInvocation(options),
 							);
 							output.stopReason = "error";
-						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+						} else if (!providerSafetyStop) {
 							output.stopReason = mapStopReasonString(candidate.finishReason);
 							if (output.stopReason === "stop" && output.content.some(b => b.type === "toolCall")) {
 								output.stopReason = "toolUse";
@@ -593,6 +594,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 					if (blockReason) {
 						hasContent = true;
 						if (isGooglePromptSafetyStopReason(blockReason)) {
+							providerSafetyStop = true;
 							// Prompt-level block reason: adapter-minted authority (#4777).
 							mintProviderSafetyStop(
 								output,
@@ -602,7 +604,7 @@ export const streamGoogleGeminiCli: StreamFunction<"google-gemini-cli"> = (
 								isProviderSafetyStopAdapterInvocation(options),
 							);
 							output.stopReason = "error";
-						} else if (output.errorKind !== PROVIDER_SAFETY_STOP) {
+						} else if (!providerSafetyStop) {
 							output.stopReason = "error";
 						}
 					}
