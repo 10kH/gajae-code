@@ -13,10 +13,13 @@ import {
 const TEST_SESSION_ID = "test-session";
 const tempRoots: string[] = [];
 let savedSessionId: string | undefined;
+let savedGithubWorkspace: string | undefined;
 
 beforeAll(() => {
 	savedSessionId = process.env.GJC_SESSION_ID;
+	savedGithubWorkspace = process.env.GITHUB_WORKSPACE;
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	delete process.env.GITHUB_WORKSPACE;
 });
 
 async function tempDir(): Promise<string> {
@@ -27,12 +30,16 @@ async function tempDir(): Promise<string> {
 
 afterEach(async () => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
+	if (savedGithubWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+	else process.env.GITHUB_WORKSPACE = savedGithubWorkspace;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
 afterAll(() => {
 	if (savedSessionId === undefined) delete process.env.GJC_SESSION_ID;
 	else process.env.GJC_SESSION_ID = savedSessionId;
+	if (savedGithubWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+	else process.env.GITHUB_WORKSPACE = savedGithubWorkspace;
 });
 
 async function runGit(cwd: string, args: string[]): Promise<void> {
