@@ -12,6 +12,16 @@ import type { OAuthProvider } from "@gajae-code/ai/utils/oauth/types";
 import type { Component, OverlayHandle, SlashCommand } from "@gajae-code/tui";
 import { Input, Loader, resolvePetMode, Spacer, Text } from "@gajae-code/tui";
 import { getAgentDbPath, getProjectDir, logger, VERSION } from "@gajae-code/utils";
+import {
+	type AutoroutingProvenance,
+	type AutoroutingSetup,
+	buildAutoroutingEnabledPatch,
+	buildAutoroutingSettingsBatch,
+	evaluateAutoroutingProvenanceState,
+	validateAutoroutingSetup,
+} from "../../config/autorouting-contract";
+import { canonicalJsonBytes, generateTierChains } from "../../config/autorouting-generator";
+import { CURATED_TIER_MAP } from "../../config/autorouting-tier-map";
 import type { AppKeybinding } from "../../config/keybindings";
 import {
 	activateModelProfile,
@@ -26,7 +36,7 @@ import { GJC_MODEL_ASSIGNMENT_TARGETS, type GjcModelAssignmentTargetId } from ".
 import { formatModelSelectorValue } from "../../config/model-resolver";
 import { selectorHead } from "../../config/model-selector-value";
 import type { ModelProfileConfig } from "../../config/models-config-schema";
-import { type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
+import { type RawSettings, type Settings, type SettingsAtomicReceipt, settings } from "../../config/settings";
 import type { SettingValue } from "../../config/settings-schema";
 import { DebugSelectorComponent } from "../../debug";
 import { disableProvider, enableProvider } from "../../discovery";
@@ -167,7 +177,6 @@ import {
 	PlanPreviewOverlay,
 	type PlanPreviewResult,
 } from "../components/plan-preview-overlay";
-
 import { PluginSelectorComponent } from "../components/plugin-selector";
 import {
 	type ProviderOnboardingAction,
@@ -179,6 +188,7 @@ import { SessionObserverOverlayComponent } from "../components/session-observer-
 import { SessionSelectorComponent } from "../components/session-selector";
 import { dashboardSessions, SessionsDashboardComponent } from "../components/sessions-dashboard";
 import { SettingsSelectorComponent } from "../components/settings-selector";
+import type { SmartRoutingPreview } from "../components/smart-routing-panel";
 import { TasksPaneComponent } from "../components/tasks-pane";
 import { ThemeSelectorComponent } from "../components/theme-selector";
 import { ThinkingSelectorComponent } from "../components/thinking-selector";
@@ -1176,7 +1186,36 @@ interface DefaultAssignmentRollbackSnapshot {
 	resumeDefaultSelector: string | undefined;
 	fallbackRuntimeState: DefaultFallbackRuntimeState;
 }
+
+function sameCanonicalAutoroutingValue(left: unknown, right: unknown): boolean {
+	const leftBytes = canonicalJsonBytes(left);
+	const rightBytes = canonicalJsonBytes(right);
+	if (leftBytes.length !== rightBytes.length) return false;
+	for (let index = 0; index < leftBytes.length; index++) {
+		if (leftBytes[index] !== rightBytes[index]) return false;
+	}
+	return true;
+}
+
+function rawAutoroutingState(current: RawSettings): {
+	provenance?: AutoroutingProvenance;
+	setup?: AutoroutingSetup;
+	tiers?: unknown;
+} {
+	const task = current.task;
+	if (!task || typeof task !== "object" || Array.isArray(task)) return {};
+	const autorouting = (task as Record<string, unknown>).autorouting;
+	if (!autorouting || typeof autorouting !== "object" || Array.isArray(autorouting)) return {};
+	const record = autorouting as Record<string, unknown>;
+	return {
+		provenance: record.provenance as AutoroutingProvenance | undefined,
+		setup: record.setup as AutoroutingSetup | undefined,
+		tiers: record.tiers,
+	};
+}
+
 export class SelectorController {
+	#smartRoutingInFlight?: Promise<unknown>;
 	#transcriptViewerOpen = false;
 	#transcriptViewer?: TranscriptViewerOverlay;
 	#sessionsDashboardOpen = false;
@@ -2278,7 +2317,208 @@ export class SelectorController {
 		this.ctx.showStatus(persistDefault ? `Default model profile: ${profileLabel}` : `Model profile: ${profileLabel}`);
 	}
 
-	showModelSelector(options?: { temporaryOnly?: boolean }): void {
+	/** Generate the immutable preview used by the smart-routing panel. */
+	previewSmartRouting(draft: AutoroutingSetup): SmartRoutingPreview {
+		const issues = validateAutoroutingSetup(draft);
+		if (issues.length > 0)
+			throw new Error(issues.map(issue => `${issue.path || "setup"}: ${issue.detail}`).join("; "));
+		const setup = structuredClone(draft);
+		const generated = generateTierChains(setup, CURATED_TIER_MAP, [...this.ctx.session.modelRegistry.getAll()]);
+		const provenance: AutoroutingProvenance = {
+			schema: 1,
+			source: structuredClone(generated.sourceIdentity),
+			declarationFingerprint: generated.declarationFingerprint,
+			tiersFingerprint: generated.tiersFingerprint,
+		};
+		return {
+			setup,
+			tiers: structuredClone(generated.tiers),
+			provenance,
+			sourceIdentity: structuredClone(generated.sourceIdentity),
+		};
+	}
+
+	#assertSmartRoutingWritable(): void {
+		if ((this.ctx.session.scopedModels?.length ?? 0) > 0) {
+			throw new Error("Smart-routing settings are read-only in a --models-scoped session.");
+		}
+		if (!this.ctx.settings.canWriteDurableConfig()) {
+			throw new Error("Cannot change smart-routing settings while durable config is unavailable.");
+		}
+	}
+
+	#assertSmartRoutingNotHandEdited(
+		preview: SmartRoutingPreview,
+		allowHandEdit: boolean,
+		current?: { provenance?: AutoroutingProvenance; tiers?: unknown },
+	): void {
+		if (allowHandEdit) return;
+		const provenance = current?.provenance ?? this.ctx.settings.get("task.autorouting.provenance");
+		const currentTiers = current?.tiers ?? this.ctx.settings.get("task.autorouting.tiers");
+		if (!provenance || currentTiers === undefined) return;
+		const state = evaluateAutoroutingProvenanceState(provenance, {
+			catalogFingerprint: preview.sourceIdentity.catalogFingerprint,
+			mapFingerprint: preview.sourceIdentity.mapFingerprint,
+			tiers: currentTiers,
+		});
+		if (!state.handEdited) return;
+		throw Object.assign(
+			new Error("Generated autorouting tiers were hand-edited; explicit confirmation is required."),
+			{ code: "autorouting-hand-edited" },
+		);
+	}
+
+	async #runSmartRoutingIntent<T>(label: string, operation: () => Promise<T>): Promise<T> {
+		if (this.#smartRoutingInFlight) throw new Error("Another smart-routing operation is already in progress.");
+		const task = (async () => {
+			this.ctx.showStatus(`${label} smart-routing settings…`);
+			try {
+				const result = await operation();
+				await this.ctx.notifyConfigChanged?.();
+				this.ctx.showStatus(`${label} smart-routing settings saved.`);
+				this.ctx.ui.requestRender();
+				return result;
+			} catch (error) {
+				this.ctx.showError(error instanceof Error ? error.message : String(error));
+				this.ctx.ui.requestRender();
+				throw error;
+			} finally {
+				this.#smartRoutingInFlight = undefined;
+			}
+		})();
+		this.#smartRoutingInFlight = task;
+		return task;
+	}
+	#reportSmartRoutingValidationError(error: unknown): never {
+		this.ctx.showError(error instanceof Error ? error.message : String(error));
+		this.ctx.ui.requestRender();
+		throw error;
+	}
+
+	async applySmartRouting(
+		draft: AutoroutingSetup,
+		options?: { preview?: SmartRoutingPreview; confirmHandEdit?: boolean },
+	): Promise<SmartRoutingPreview> {
+		let preview: SmartRoutingPreview;
+		try {
+			this.#assertSmartRoutingWritable();
+			const issues = validateAutoroutingSetup(draft);
+			if (issues.length > 0) {
+				throw new Error(issues.map(issue => `${issue.path || "setup"}: ${issue.detail}`).join("; "));
+			}
+			preview = options?.preview ?? this.previewSmartRouting(draft);
+			const regenerated = this.previewSmartRouting(draft);
+			if (!sameCanonicalAutoroutingValue(preview.setup, regenerated.setup)) {
+				throw new Error("Smart-routing preview does not match the draft being applied.");
+			}
+			if (
+				!sameCanonicalAutoroutingValue(preview.tiers, regenerated.tiers) ||
+				!sameCanonicalAutoroutingValue(preview.provenance, regenerated.provenance)
+			) {
+				// Never persist caller-supplied tier/provenance bytes that diverge from
+				// the declaration. Continue with the fresh canonical payload so Apply
+				// remains exactly the generated preview for legitimate callers.
+				preview = regenerated;
+			}
+			this.#assertSmartRoutingNotHandEdited(preview, options?.confirmHandEdit === true);
+		} catch (error) {
+			return this.#reportSmartRoutingValidationError(error);
+		}
+		return this.#runSmartRoutingIntent("Apply", async () => {
+			await this.ctx.settings.commitAtomicBatchWithCurrent(current => {
+				this.#assertSmartRoutingNotHandEdited(
+					preview,
+					options?.confirmHandEdit === true,
+					rawAutoroutingState(current),
+				);
+				return buildAutoroutingSettingsBatch({
+					tiers: preview.tiers,
+					setup: preview.setup,
+					provenance: preview.provenance,
+				});
+			});
+			return preview;
+		});
+	}
+
+	/**
+	 * Reorder a recorded declaration into current provider priority and drop entries
+	 * the catalog no longer offers. Comparison uses normalized ids while the result
+	 * keeps the catalog's spelling, because the generator matches provider prefixes
+	 * case-sensitively.
+	 */
+	#reseedProvidersFromPolicy(setup: AutoroutingSetup): AutoroutingSetup {
+		const order = this.ctx.session.modelRegistry.autoroutingProviderOrder();
+		const declared = new Set(setup.providers.map(provider => provider.trim().toLowerCase()));
+		const providers = order.filter(provider => declared.has(provider.trim().toLowerCase()));
+		return { ...structuredClone(setup), providers };
+	}
+
+	async refreshSmartRouting(options?: { confirmHandEdit?: boolean }): Promise<SmartRoutingPreview> {
+		let preview: SmartRoutingPreview;
+		let expectedSetup: AutoroutingSetup;
+		try {
+			this.#assertSmartRoutingWritable();
+			const setup = this.ctx.settings.get("task.autorouting.setup");
+			const issues = validateAutoroutingSetup(setup);
+			if (issues.length > 0 || setup === undefined) {
+				throw new Error("Cannot refresh smart routing without a valid recorded setup.");
+			}
+			expectedSetup = setup;
+			// Reseed the recorded declaration against the current provider priority:
+			// reorder to policy order and drop providers the catalog no longer offers.
+			// Refusing an empty result keeps a dead declaration from being persisted.
+			const reseeded = this.#reseedProvidersFromPolicy(setup);
+			if (reseeded.providers.length === 0) {
+				throw new Error("No declared providers remain in the catalog; smart routing was not updated.");
+			}
+			preview = this.previewSmartRouting(reseeded);
+			this.#assertSmartRoutingNotHandEdited(preview, options?.confirmHandEdit === true);
+		} catch (error) {
+			return this.#reportSmartRoutingValidationError(error);
+		}
+		return this.#runSmartRoutingIntent("Refresh", async () => {
+			await this.ctx.settings.commitAtomicBatchWithCurrent(current => {
+				const currentState = rawAutoroutingState(current);
+				if (!sameCanonicalAutoroutingValue(currentState.setup, expectedSetup)) {
+					throw new Error(
+						"Smart-routing setup changed while refresh was preparing; refresh again to use current settings.",
+					);
+				}
+				this.#assertSmartRoutingNotHandEdited(preview, options?.confirmHandEdit === true, currentState);
+				return buildAutoroutingSettingsBatch({
+					tiers: preview.tiers,
+					setup: preview.setup,
+					provenance: preview.provenance,
+				});
+			});
+			return preview;
+		});
+	}
+
+	async clearGeneratedSetup(): Promise<void> {
+		try {
+			this.#assertSmartRoutingWritable();
+		} catch (error) {
+			return this.#reportSmartRoutingValidationError(error);
+		}
+		return this.#runSmartRoutingIntent("Clear", async () => {
+			await this.ctx.settings.commitAtomicBatchWithCurrent(() => buildAutoroutingSettingsBatch({ clear: true }));
+		});
+	}
+
+	async setAutoroutingEnabled(enabled: boolean): Promise<void> {
+		try {
+			this.#assertSmartRoutingWritable();
+		} catch (error) {
+			return this.#reportSmartRoutingValidationError(error);
+		}
+		return this.#runSmartRoutingIntent("Toggle", async () => {
+			await this.ctx.settings.commitAtomicBatchWithCurrent(() => [buildAutoroutingEnabledPatch(enabled)]);
+		});
+	}
+
+	showModelSelector(options?: { temporaryOnly?: boolean; smartRoutingOnly?: boolean }): void {
 		this.showSelector(done => {
 			let modelSelector: ModelSelectorComponent;
 			const refreshRoleAssignments = () => {
@@ -2296,6 +2536,27 @@ export class SelectorController {
 				this.ctx.session.modelRegistry,
 				this.ctx.session.scopedModels,
 				async selection => {
+					if (selection.kind === "smartRouting") {
+						switch (selection.intent.kind) {
+							case "apply":
+								await this.applySmartRouting(selection.intent.draft, {
+									preview: selection.intent.preview,
+									confirmHandEdit: selection.intent.confirmHandEdit,
+								});
+								break;
+							case "refresh":
+								await this.refreshSmartRouting({ confirmHandEdit: selection.intent.confirmHandEdit });
+								break;
+							case "clear":
+								await this.clearGeneratedSetup();
+								break;
+							case "toggle":
+								await this.setAutoroutingEnabled(selection.intent.enabled);
+								break;
+						}
+						modelSelector.refreshSmartRoutingState();
+						return;
+					}
 					const isTrackedSingleAssignment =
 						selection.kind === "assignment" && selection.role !== null && selection.roles === undefined;
 					try {
@@ -2529,6 +2790,8 @@ export class SelectorController {
 					isFastForSubagentProvider: (provider, supportsServiceTier) =>
 						this.ctx.session.isFastForSubagentProvider(provider, supportsServiceTier),
 					isCurrentModelFastModeActive: () => this.ctx.session.isFastModeActive(),
+					smartRoutingPreview: draft => this.previewSmartRouting(draft),
+					smartRoutingOnly: options?.smartRoutingOnly,
 				},
 			);
 			return { component: modelSelector, focus: modelSelector };

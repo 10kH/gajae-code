@@ -26,6 +26,8 @@ import {
 } from "@gajae-code/coding-agent/async";
 import { $pickenv, prompt, Snowflake } from "@gajae-code/utils";
 import type { ToolSession } from "..";
+import { normalizeTierSelector, type RoutingOutcome, resolveTaskRouting } from "../config/autorouting";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import { resolveProfileBindings } from "../config/model-profiles";
 import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { Theme } from "../modes/theme/theme";
@@ -33,7 +35,9 @@ import planModeSubagentPrompt from "../prompts/system/plan-mode-subagent.md" wit
 import taskDescriptionTemplate from "../prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: "text" };
 import type { ForkContextSeed } from "../session/agent-session";
+import { splitSelectorThinkingSuffix } from "../thinking";
 import { formatBytes, formatDuration } from "../tools/render-utils";
+import { escapeXmlAttribute } from "../utils/xml-escape";
 import {
 	type AgentDefinition,
 	type AgentProgress,
@@ -44,6 +48,7 @@ import {
 	type SingleResult,
 	type TaskItem,
 	type TaskParams,
+	type TaskRoutingEvidence,
 	type TaskToolDetails,
 	type TaskToolSchemaInstance,
 } from "./types";
@@ -66,7 +71,13 @@ import { generateCommitMessage } from "../utils/commit-message-generator";
 import * as git from "../utils/git";
 import { loadBundledAgents } from "./agents";
 import { discoverAgents, filterVisibleAgents, getAgent } from "./discovery";
-import { createManagedTaskPersistence, renderSubagentUserPrompt, runSubprocess } from "./executor";
+import {
+	buildBoundedRoutingSkips,
+	createManagedTaskPersistence,
+	renderSubagentUserPrompt,
+	runSubprocess,
+} from "./executor";
+
 import { adviseForkContextMode } from "./fork-context-advisory";
 import { FORK_CONTEXT_TOKEN_BUDGET_BY_MODE } from "./fork-context-budget";
 import { getTaskIdValidationError, validateAllocatedTaskId } from "./id";
@@ -322,6 +333,7 @@ function renderDescription(
 	simpleMode: TaskSimpleMode,
 	ircEnabled: boolean,
 	parentSpawns: string,
+	autoroutingActive: boolean,
 ): string {
 	const spawningDisabled = parentSpawns === "";
 	let filteredAgents = filterVisibleAgents(agents);
@@ -339,7 +351,7 @@ function renderDescription(
 		filteredAgents = filteredAgents.filter(a => allowed.has(a.name));
 	}
 	const { contextEnabled, customSchemaEnabled } = getTaskSimpleModeCapabilities(simpleMode);
-	return prompt.render(taskDescriptionTemplate, {
+	const description = prompt.render(taskDescriptionTemplate, {
 		agents: filteredAgents,
 		spawningDisabled,
 		MAX_CONCURRENCY: maxConcurrency,
@@ -351,7 +363,9 @@ function renderDescription(
 		defaultMode: simpleMode === "default",
 		schemaFreeMode: simpleMode === "schema-free",
 		independentMode: simpleMode === "independent",
+		autoroutingActive,
 	});
+	return description;
 }
 
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
@@ -485,6 +499,47 @@ export function resolveForkContextMaxTokens(configured: number, model: Model | u
 	return normalizeForkContextCap(configured, fallback, Number.MAX_SAFE_INTEGER);
 }
 
+const ROUTING_SUMMARY_UNSAFE_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
+
+function sanitizeRoutingSummaryValue(value: string): string {
+	return value.normalize("NFKC").replace(ROUTING_SUMMARY_UNSAFE_RE, " ").slice(0, AUTOROUTING_SELECTOR_MAX_LENGTH);
+}
+
+export function findRoutingSnapshotModel(selector: string, routingSnapshot: readonly Model[]): Model | undefined {
+	const slash = selector.indexOf("/");
+	if (slash <= 0) return undefined;
+	const provider = selector.slice(0, slash).toLowerCase();
+	const modelId = selector.slice(slash + 1);
+	const providerMatches = routingSnapshot.filter(candidate => candidate.provider.toLowerCase() === provider);
+	return (
+		providerMatches.find(candidate => candidate.id === modelId) ??
+		providerMatches.find(candidate => {
+			const suffix = splitSelectorThinkingSuffix(modelId);
+			return (
+				suffix.invalidSuffix === undefined && suffix.thinkingLevel !== undefined && candidate.id === suffix.selector
+			);
+		})
+	);
+}
+
+/**
+ * Project routing evidence into the XML-attribute-safe display view consumed by
+ * the task-summary template. The template runtime uses noEscape, so every
+ * interpolated attribute value must be escaped here.
+ */
+export function projectRoutingForSummary(
+	routing: TaskRoutingEvidence | undefined,
+): { tier: string; effectiveModel: string; note: string } | undefined {
+	if (!routing) return undefined;
+	return {
+		tier: escapeXmlAttribute(sanitizeRoutingSummaryValue(routing.tier)),
+		effectiveModel: escapeXmlAttribute(
+			sanitizeRoutingSummaryValue(routing.effectiveModel ?? routing.requestedSelector),
+		),
+		note: escapeXmlAttribute(sanitizeRoutingSummaryValue(routing.note ?? "")),
+	};
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tool Class
 // ═══════════════════════════════════════════════════════════════════════════
@@ -565,9 +620,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			this.#getTaskSimpleMode(),
 			hasAvailableIrcTool(this.session),
 			this.session.getSessionSpawns() ?? "*",
+			this.session.settings.getEffectiveAutorouting().active,
 		);
 	}
 	readonly #sessionRepositoryBinding: RepositoryBinding;
+	#testRunSubprocess: typeof runSubprocess | undefined;
 
 	private constructor(
 		private readonly session: ToolSession,
@@ -577,6 +634,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		this.#blockedAgent = $pickenv("GJC_BLOCKED_AGENT", "PI_BLOCKED_AGENT");
 		this.#discoveredAgents = discoveredAgents;
 		this.#sessionRepositoryBinding = sessionRepositoryBinding;
+	}
+
+	#runSubprocess(options: Parameters<typeof runSubprocess>[0]): Promise<SingleResult> {
+		return (this.#testRunSubprocess ?? runSubprocess)(options);
 	}
 
 	#getTaskSimpleMode(): TaskSimpleMode {
@@ -800,12 +861,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	 * Repository authority is captured from session cwd *before* agent discovery so
 	 * multi-repo workspaces fail closed prior to context/discovery (#2901).
 	 */
-	static async create(session: ToolSession): Promise<TaskTool> {
+	static async create(session: ToolSession, options?: { runSubprocess?: typeof runSubprocess }): Promise<TaskTool> {
 		const sessionRepositoryBinding = await captureRepositoryBinding(session.cwd, { displayPath: session.cwd });
-		// Authority check before discovery: session cwd must resolve to a stable binding.
 		await assertExecutionRootMatchesRepositoryBinding(session.cwd, sessionRepositoryBinding);
 		const { agents } = await discoverAgents(session.cwd);
-		return new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
+		const tool = new TaskTool(session, agents, publicRepositoryBinding(sessionRepositoryBinding));
+		tool.#testRunSubprocess = options?.runSubprocess;
+		return tool;
 	}
 
 	/** Create catalog metadata from bundled agents only, without ambient filesystem discovery. */
@@ -1947,6 +2009,123 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			}
 			const tasksWithUniqueIds = tasks.map((t, i) => ({ ...t, id: validateAllocatedTaskId(uniqueIds[i] ?? "") }));
 
+			const effectiveAutorouting = this.session.settings.getEffectiveAutorouting();
+			const registry = this.session.modelRegistry as
+				| {
+						getAvailable?: () => Model[];
+						getAll?: () => Model[];
+						getApiKey?: (model: Model, credentialSessionId?: string) => Promise<string | undefined>;
+				  }
+				| undefined;
+			const routingSnapshot = registry?.getAll?.() ?? registry?.getAvailable?.();
+			const routingByIndex = new Map<number, RoutingOutcome>();
+			const routingCandidatesByIndex = new Map<number, string[]>();
+			const routingSkipsByIndex = new Map<number, Array<{ selector: string; code: AutoroutingReasonCode }>>();
+			for (let i = 0; i < tasksWithUniqueIds.length; i++) {
+				const task = tasksWithUniqueIds[i];
+				const outcome = routingSnapshot
+					? resolveTaskRouting({
+							effectiveAutorouting,
+							requestedTier: task.tier,
+							availableModels: routingSnapshot,
+						})
+					: effectiveAutorouting.active
+						? {
+								kind: "manual-fallback" as const,
+								tier: task.tier ?? "balanced",
+								requestedTier: task.tier,
+								...(task.tier === undefined ? { defaultTierApplied: true as const } : {}),
+								attemptedSelectorCount: 0,
+								reason: "tier_unmatched" as const,
+							}
+						: { kind: "disabled" as const };
+
+				routingByIndex.set(i, outcome);
+				if (outcome.kind === "disabled" || !routingSnapshot || !effectiveAutorouting.active) continue;
+
+				// Enumerate every configured selector before choosing a routed or manual
+				// outcome. This keeps AC12 evidence complete even when every selector is
+				// missing, malformed, or disabled.
+				const configured = effectiveAutorouting.map[outcome.tier] ?? [];
+				const candidates: string[] = [];
+				const skips: Array<{ selector: string; code: AutoroutingReasonCode }> = [];
+				const disabledProviders = new Set(
+					this.session.settings.get("disabledProviders").map(provider => provider.toLowerCase()),
+				);
+				for (const selector of configured) {
+					const slash = selector.indexOf("/");
+					const provider = slash > 0 ? selector.slice(0, slash).toLowerCase() : "";
+					// Disabled takes precedence over snapshot presence: a disabled provider
+					// that is also absent must remain truthfully classified as disabled.
+					if (disabledProviders.has(provider)) {
+						skips.push({ selector, code: "provider_disabled" });
+						continue;
+					}
+					const normalized = normalizeTierSelector(selector, routingSnapshot);
+					if (!("pinned" in normalized)) {
+						skips.push({
+							selector,
+							code: "rejected" in normalized ? "selector_not_provider_qualified" : "snapshot_missing",
+						});
+						continue;
+					}
+					candidates.push(normalized.pinned);
+				}
+				routingCandidatesByIndex.set(i, candidates);
+				routingSkipsByIndex.set(i, skips);
+			}
+			const resolveAutoroutingCandidates = async (
+				index: number,
+			): Promise<{
+				candidates: string[];
+				skips: Array<{ selector: string; code: AutoroutingReasonCode }>;
+				preflightErrors: Map<string, unknown>;
+			}> => {
+				const candidates = [...(routingCandidatesByIndex.get(index) ?? [])];
+				const skips = [...(routingSkipsByIndex.get(index) ?? [])];
+				const preflightErrors = new Map<string, unknown>();
+				if (!registry?.getApiKey || !routingSnapshot) return { candidates, skips, preflightErrors };
+				const authenticated: string[] = [];
+				for (const selector of candidates) {
+					const model = findRoutingSnapshotModel(selector, routingSnapshot);
+					if (!model) {
+						skips.push({ selector, code: "snapshot_missing" });
+						continue;
+					}
+					try {
+						const key = await registry.getApiKey(
+							model,
+							this.session.getCredentialSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
+						);
+						if (key) authenticated.push(selector);
+						else skips.push({ selector, code: "credential_unavailable" });
+					} catch (error) {
+						// Preserve the candidate for executor preflight, which records the
+						// terminal lookup failure in the routing ledger.
+						preflightErrors.set(selector, error);
+						authenticated.push(selector);
+					}
+				}
+				return { candidates: authenticated, skips, preflightErrors };
+			};
+			const effectivePatterns = (index: number): string | string[] => {
+				const outcome = routingByIndex.get(index);
+				return outcome?.kind === "routed" ? [outcome.pinnedSelector] : modelOverride;
+			};
+			const routeEvidenceForSynthetic = (outcome: RoutingOutcome | undefined): TaskRoutingEvidence | undefined => {
+				if (!outcome || outcome.kind === "disabled") return undefined;
+				return {
+					tier: outcome.tier,
+					requestedTier: outcome.requestedTier,
+					defaultTierApplied: outcome.defaultTierApplied,
+					requestedSelector: outcome.kind === "routed" ? outcome.pinnedSelector : "manual-model-chain",
+					notExecuted: true,
+					substitutions: [],
+					manualFallbackReason: outcome.kind === "manual-fallback" ? outcome.reason : undefined,
+					note: `${outcome.tier}; ${outcome.kind === "manual-fallback" ? outcome.reason : "not-executed"}`,
+				};
+			};
+
 			const availableSkills = [...(this.session.skills ?? [])];
 			// Resolve autoload skills from agent definition against available skills
 			const resolvedAutoloadSkills =
@@ -1981,7 +2160,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					tokens: 0,
 					cost: 0,
 					durationMs: 0,
-					modelOverride,
+					modelOverride: effectivePatterns(i),
 					description: taskItem.description,
 				});
 			}
@@ -2040,6 +2219,51 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				const managedPersistence = parentArtifactManager?.getManagedStore()
 					? createManagedTaskPersistence(parentArtifactManager, task.id)
 					: undefined;
+
+				const routingOutcome = routingByIndex.get(index);
+
+				const routeEvidence = (
+					outcome: RoutingOutcome | undefined,
+					freshOnResume = false,
+				): TaskRoutingEvidence | undefined => {
+					if (!outcome || outcome.kind === "disabled") return undefined;
+					const noteParts = [
+						`${outcome.tier}${outcome.defaultTierApplied ? " (default)" : ""}`,
+						outcome.kind === "manual-fallback" ? outcome.reason : undefined,
+						freshOnResume ? "freshOnResume" : undefined,
+					].filter((part): part is string => part !== undefined);
+					return {
+						tier: outcome.tier,
+						requestedTier: outcome.requestedTier,
+						defaultTierApplied: outcome.defaultTierApplied,
+						requestedSelector: outcome.kind === "routed" ? outcome.pinnedSelector : "manual-model-chain",
+						effectiveModel: outcome.kind === "routed" ? outcome.pinnedSelector : "manual-model-chain",
+						substitutions: [],
+						manualFallbackReason: outcome.kind === "manual-fallback" ? outcome.reason : undefined,
+						freshOnResume: freshOnResume ? true : undefined,
+						note: noteParts.join("; "),
+					};
+				};
+
+				const effectiveRunMode = overrides?.runMode ?? executionOverrides?.runMode;
+				const autoroutingInitial =
+					routingOutcome?.kind === "routed" && (effectiveRunMode ?? "initial") === "initial";
+				const autoroutingData =
+					(effectiveRunMode ?? "initial") === "initial" && routingOutcome && routingOutcome.kind !== "disabled"
+						? routingOutcome.kind === "routed"
+							? await resolveAutoroutingCandidates(index)
+							: {
+									candidates: undefined,
+									skips: [...(routingSkipsByIndex.get(index) ?? [])],
+									preflightErrors: new Map(),
+								}
+						: { candidates: undefined, skips: undefined, preflightErrors: new Map() };
+				const routingForRun = routeEvidence(
+					routingOutcome,
+					effectiveRunMode === "resume" || effectiveRunMode === "message",
+				);
+				if (routingForRun && autoroutingData.skips)
+					Object.assign(routingForRun, buildBoundedRoutingSkips(autoroutingData.skips));
 				const taskSessionFile = managedPersistence
 					? null
 					: (overrides?.sessionFile ?? executionOverrides?.sessionFiles?.get(task.id) ?? null);
@@ -2050,7 +2274,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 				if (!isIsolated) {
 					await assertExecutionRootMatchesRepositoryBinding(this.session.cwd, taskRepositoryBinding);
-					const result = await runSubprocess({
+					const result = await this.#runSubprocess({
 						cwd: this.session.cwd,
 						agent: effectiveAgent,
 						task: renderTaskAssignment(task.assignment, simpleMode),
@@ -2060,12 +2284,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						description: task.description,
 						index,
 						id: task.id,
-						runMode: overrides?.runMode ?? executionOverrides?.runMode,
+						runMode: effectiveRunMode,
+
 						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
 						subagentId: task.id,
 						asyncJobManager: manager,
 						taskDepth,
-						modelOverride,
+						modelOverride: effectivePatterns(index),
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
@@ -2082,6 +2307,12 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						enableLsp: subagentLspEnabled,
 						signal,
 						eventBus: this.session.eventBus,
+						routing: routingForRun,
+						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
+						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
+						autoroutingPreflightErrors: autoroutingInitial ? autoroutingData.preflightErrors : undefined,
+						autoroutingPreflight: autoroutingInitial,
+
 						onProgress: progress => {
 							progressMap.set(index, {
 								...structuredClone(progress),
@@ -2127,7 +2358,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					// Isolated worktrees must preserve the source repository identity (#2901).
 					await assertExecutionRootMatchesRepositoryBinding(isolationDir, taskRepositoryBinding);
 
-					const result = await runSubprocess({
+					const result = await this.#runSubprocess({
 						cwd: this.session.cwd,
 						worktree: isolationDir,
 						agent: effectiveAgent,
@@ -2138,12 +2369,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						description: task.description,
 						index,
 						id: task.id,
-						runMode: overrides?.runMode ?? executionOverrides?.runMode,
+						runMode: effectiveRunMode,
+
 						resumeMessage: overrides?.resumeMessage ?? executionOverrides?.resumeMessage,
 						subagentId: task.id,
 						asyncJobManager: manager,
 						taskDepth,
-						modelOverride,
+						modelOverride: effectivePatterns(index),
 						parentActiveModelPattern,
 						parentActiveModelProfile: parentOwnedModelProfile,
 						parentSessionId: this.session.getSessionId?.() ?? undefined,
@@ -2160,6 +2392,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						enableLsp: subagentLspEnabled,
 						signal,
 						eventBus: this.session.eventBus,
+						routing: routingForRun,
+						autoroutingCandidates: autoroutingInitial ? autoroutingData.candidates : undefined,
+						autoroutingSkips: autoroutingInitial ? autoroutingData.skips : undefined,
+						autoroutingPreflightErrors: autoroutingInitial ? autoroutingData.preflightErrors : undefined,
+						autoroutingPreflight: autoroutingInitial,
 						onProgress: progress => {
 							progressMap.set(index, {
 								...structuredClone(progress),
@@ -2291,7 +2528,9 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						truncated: false,
 						durationMs: Date.now() - taskStart,
 						tokens: 0,
-						modelOverride,
+						modelOverride: effectivePatterns(index),
+						routing: routeEvidenceForSynthetic(routingByIndex.get(index)),
+
 						forkContext,
 						error: message,
 					};
@@ -2331,7 +2570,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					truncated: false,
 					durationMs: 0,
 					tokens: 0,
-					modelOverride,
+					modelOverride: effectivePatterns(index),
+					routing: routeEvidenceForSynthetic(routingByIndex.get(index)),
 					error: "Cancelled before start",
 					aborted: true,
 					abortReason: "Cancelled before start",
@@ -2653,6 +2893,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 								charSize: formatBytes(r.outputRef.sizeBytes),
 							}
 						: undefined,
+					routing: projectRoutingForSummary(r.routing),
 				};
 			});
 

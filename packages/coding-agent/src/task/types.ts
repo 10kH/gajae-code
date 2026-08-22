@@ -1,7 +1,9 @@
 import type { ThinkingLevel } from "@gajae-code/agent-core";
 import type { Usage } from "@gajae-code/ai/core";
+import type { FallbackTriggerClass } from "@gajae-code/ai/utils/fallback-transport";
 import { $env } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import { AUTOROUTING_SELECTOR_MAX_LENGTH, type AutoroutingReasonCode } from "../config/autorouting-contract";
 import { isValidTaskId, TASK_ID_DESCRIPTION } from "./id";
 import type { TaskResultReceipt } from "./receipt";
 import type { SpawnRoiReconciliation } from "./roi-reconciliation";
@@ -97,6 +99,10 @@ const createTaskItemSchema = (_contextEnabled: boolean) =>
 		id: z.string().max(48).refine(isValidTaskId, TASK_ID_DESCRIPTION).describe("filesystem-safe task identifier"),
 		description: z.string().describe("ui label, not seen by subagent"),
 		assignment: z.string().describe(assignmentDescription),
+		tier: z
+			.enum(["fast", "balanced", "strong"])
+			.optional()
+			.describe("Advisory unless autorouting is enabled; omitted routes as balanced."),
 		executionMode: z
 			.enum(["default", "ultragoal-red-team"])
 			.optional()
@@ -595,6 +601,159 @@ export interface TaskPersistenceResult {
 	recoveryRef?: TaskRecoveryArtifactRef;
 }
 
+export type RoutingSubstitution = "auth_substituted" | "assistant_model_mismatch";
+
+/** A typed failure observed while an autorouting candidate is still before the real provider fence. */
+export type AutoroutingPreflightFailure =
+	| {
+			kind: "local";
+			op: "auth_resolve" | "session_open" | "tool_bootstrap" | "preflight_validation";
+			transient: boolean;
+	  }
+	| { kind: "transport"; class: FallbackTriggerClass };
+
+export type AutoroutingAttemptCode =
+	| "probe_passed"
+	| "accepted"
+	| "spawn_transient_retry"
+	| "credential_unavailable"
+	| "config_invalid_terminal"
+	| "post_acceptance_failure"
+	| "unclassified_terminal";
+
+export type AutoroutingAttempt = {
+	selector: string;
+	phase: "probe" | "durable";
+	code: AutoroutingAttemptCode;
+};
+
+export type AutoroutingSkip = {
+	selector: string;
+	code: AutoroutingReasonCode;
+};
+
+export interface TaskRoutingEvidence {
+	tier: "fast" | "balanced" | "strong";
+	requestedTier?: "fast" | "balanced" | "strong";
+	defaultTierApplied?: true;
+	requestedSelector: string;
+	authResolvedModel?: string;
+	effectiveModel?: string;
+	notExecuted?: true;
+	substitutions: RoutingSubstitution[];
+	manualFallbackReason?: "tier_unmatched" | "tier_missing_in_map";
+	freshOnResume?: true;
+	note?: string;
+	skips?: AutoroutingSkip[];
+	omittedSkipCount?: number;
+	omittedByCode?: Partial<Record<AutoroutingSkip["code"], number>>;
+	attempts?: AutoroutingAttempt[];
+	terminal?: "preflight_exhausted" | "all_candidates_skipped";
+}
+
+const AUTOROUTING_ATTEMPT_CODES = new Set<AutoroutingAttemptCode>([
+	"probe_passed",
+	"accepted",
+	"spawn_transient_retry",
+	"credential_unavailable",
+	"config_invalid_terminal",
+	"post_acceptance_failure",
+	"unclassified_terminal",
+]);
+
+const ROUTING_UNSAFE_TEXT_RE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u;
+
+function validBoundedSelector(value: unknown): value is string {
+	return (
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= AUTOROUTING_SELECTOR_MAX_LENGTH &&
+		!ROUTING_UNSAFE_TEXT_RE.test(value)
+	);
+}
+
+export function assertRoutingEvidenceInvariant(evidence: TaskRoutingEvidence): void {
+	const terminalWithoutModel = evidence.terminal !== undefined || evidence.notExecuted === true;
+	if (
+		!terminalWithoutModel &&
+		(!evidence.effectiveModel || evidence.effectiveModel.length > AUTOROUTING_SELECTOR_MAX_LENGTH)
+	)
+		throw new Error("Invalid effective routing model.");
+	if (!validBoundedSelector(evidence.requestedSelector)) throw new Error("Invalid requested routing selector.");
+	if (evidence.authResolvedModel && evidence.authResolvedModel === evidence.effectiveModel)
+		throw new Error("authResolvedModel must differ from effectiveModel when present.");
+	if (evidence.authResolvedModel !== undefined && !validBoundedSelector(evidence.authResolvedModel))
+		throw new Error("Invalid auth-resolved routing model.");
+
+	if (evidence.skips && evidence.skips.length > 16) throw new Error("Too many autorouting skips.");
+	if (evidence.attempts && evidence.attempts.length > 6) throw new Error("Too many autorouting attempts.");
+	if (
+		evidence.omittedSkipCount !== undefined &&
+		(!Number.isSafeInteger(evidence.omittedSkipCount) || evidence.omittedSkipCount < 0)
+	)
+		throw new Error("Invalid omitted autorouting skip count.");
+	for (const [code, count] of Object.entries(evidence.omittedByCode ?? {})) {
+		if (!Number.isSafeInteger(count) || count < 0) throw new Error("Invalid omitted autorouting skip aggregate.");
+		if (
+			!(
+				code in
+				{
+					tier_unmatched: true,
+					tier_missing_in_map: true,
+					config_invalid: true,
+					map_absent: true,
+					selector_not_provider_qualified: true,
+					auth_substituted: true,
+					assistant_model_mismatch: true,
+					provider_disabled: true,
+					snapshot_missing: true,
+					credential_unavailable: true,
+					preflight_spawn_failed: true,
+					preflight_exhausted: true,
+				}
+			)
+		)
+			throw new Error("Invalid omitted autorouting skip code.");
+	}
+	for (const skip of evidence.skips ?? []) {
+		if (!validBoundedSelector(skip.selector)) throw new Error("Invalid autorouting skip selector.");
+		if (
+			!(
+				skip.code in
+				{
+					tier_unmatched: true,
+					tier_missing_in_map: true,
+					config_invalid: true,
+					map_absent: true,
+					selector_not_provider_qualified: true,
+					auth_substituted: true,
+					assistant_model_mismatch: true,
+					provider_disabled: true,
+					snapshot_missing: true,
+					credential_unavailable: true,
+					preflight_spawn_failed: true,
+					preflight_exhausted: true,
+				}
+			)
+		)
+			throw new Error("Invalid autorouting skip code.");
+	}
+	for (const attempt of evidence.attempts ?? []) {
+		if (!validBoundedSelector(attempt.selector) || !AUTOROUTING_ATTEMPT_CODES.has(attempt.code))
+			throw new Error("Invalid autorouting attempt.");
+		if (attempt.code === "accepted" && attempt.phase !== "durable")
+			throw new Error("accepted requires durable phase.");
+		if (attempt.code === "probe_passed" && attempt.phase !== "probe")
+			throw new Error("probe_passed requires probe phase.");
+		if (attempt.phase === "probe" && attempt.code === "post_acceptance_failure")
+			throw new Error("post_acceptance_failure requires durable phase.");
+		if (attempt.phase === "durable" && attempt.code === "probe_passed")
+			throw new Error("probe_passed requires probe phase.");
+	}
+	if (evidence.terminal === undefined && evidence.omittedSkipCount && !evidence.skips)
+		throw new Error("Omitted skips require skip evidence.");
+}
+
 /** Result from a single agent execution */
 export interface SingleResult {
 	index: number;
@@ -616,6 +775,8 @@ export interface SingleResult {
 	contextTokens?: number;
 	/** Model's context window in tokens, when known. */
 	contextWindow?: number;
+	routing?: TaskRoutingEvidence;
+
 	modelOverride?: string | string[];
 	modelSubstitutionWarning?: ModelSubstitutionWarning;
 	/** Whether the resolved subagent model ran under the effective fast service tier. */
@@ -625,6 +786,11 @@ export interface SingleResult {
 	localErrorSummary?: LocalErrorSummary;
 	/** Safe diagnostic for a failure before the subagent sent its first LLM request. */
 	setupFailure?: SetupFailureSummary;
+	/** Internal typed autorouting preflight outcome; receipt sanitization omits this field. */
+	preflightFailure?: AutoroutingPreflightFailure;
+	preflightFenceCrossed?: boolean;
+	preflightProbeAccepted?: boolean;
+	preflightCommitFailure?: boolean;
 	aborted?: boolean;
 	abortReason?: string;
 
