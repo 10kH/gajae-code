@@ -271,7 +271,12 @@ import type {
 	TurnEndEvent,
 	TurnStartEvent,
 } from "../extensibility/extensions";
-import type { CompactOptions, ContextUsage, ExtensionTranscriptEntry } from "../extensibility/extensions/types";
+import {
+	type CompactOptions,
+	type ContextUsage,
+	createExtensionSettings,
+	type ExtensionTranscriptEntry,
+} from "../extensibility/extensions/types";
 import { ExtensionToolWrapper } from "../extensibility/extensions/wrapper";
 import {
 	type LoadedSubskillActivation,
@@ -8920,7 +8925,7 @@ export class AgentSession {
 		const getCustomToolContext = (): CustomToolContext => ({
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
-			settings: this.settings,
+			settings: createExtensionSettings(this.settings),
 			credentialSessionId: this.credentialSessionId,
 			model: this.model,
 			isIdle: () => !this.isStreaming,
@@ -8965,7 +8970,7 @@ export class AgentSession {
 		return {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			modelRegistry: this.#modelRegistry,
-			settings: this.settings,
+			settings: createExtensionSettings(this.settings),
 			credentialSessionId: this.credentialSessionId,
 			model: this.model,
 			isIdle: () => !this.isStreaming,
