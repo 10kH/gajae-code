@@ -8,6 +8,7 @@ import {
 	getTrustedHomeDir,
 } from "@gajae-code/utils";
 import {
+	copyProviderSafetyStopAdapterInvocation,
 	isProviderSafetyStopModelTrusted,
 	withProviderSafetyStopAdapterInvocation,
 } from "./adapter-internals/provider-safety-stop";
@@ -638,15 +639,22 @@ export function streamSimple<TApi extends Api>(
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
+	const adapterOptions = isProviderSafetyStopModelTrusted(model)
+		? withProviderSafetyStopAdapterInvocation(options ?? {})
+		: options;
 
 	// GitLab Duo - wraps Anthropic/OpenAI behind GitLab AI Gateway direct access tokens
 	if (model.provider === "gitlab-duo") {
 		return streamFromLazyImport(async () => {
 			const { streamGitLabDuo } = await import("./providers/gitlab-duo");
-			return streamGitLabDuo(model, context, {
-				...options,
-				apiKey,
-			});
+			return streamGitLabDuo(
+				model,
+				context,
+				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+					...adapterOptions,
+					apiKey,
+				}),
+			);
 		}, options?.signal);
 	}
 
@@ -655,11 +663,15 @@ export function streamSimple<TApi extends Api>(
 		return streamFromLazyImport(async () => {
 			const { streamKimi } = await import("./providers/kimi");
 			// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
-			return streamKimi(model as Model<"openai-completions">, context, {
-				...options,
-				apiKey,
-				format: options?.kimiApiFormat ?? "anthropic",
-			});
+			return streamKimi(
+				model as Model<"openai-completions">,
+				context,
+				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+					...adapterOptions,
+					apiKey,
+					format: options?.kimiApiFormat ?? "anthropic",
+				}),
+			);
 		}, options?.signal);
 	}
 
@@ -668,11 +680,15 @@ export function streamSimple<TApi extends Api>(
 		return streamFromLazyImport(async () => {
 			const { streamSynthetic } = await import("./providers/synthetic");
 			// Pass raw SimpleStreamOptions - streamSynthetic handles mapping internally
-			return streamSynthetic(model as Model<"openai-completions">, context, {
-				...options,
-				apiKey,
-				format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
-			});
+			return streamSynthetic(
+				model as Model<"openai-completions">,
+				context,
+				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+					...adapterOptions,
+					apiKey,
+					format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
+				}),
+			);
 		}, options?.signal);
 	}
 

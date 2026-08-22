@@ -7,7 +7,7 @@ import {
 import * as publicAi from "../src/index";
 import { getBundledModel } from "../src/models";
 import { streamOpenAICompletions } from "../src/providers/openai-completions";
-import { stream } from "../src/stream";
+import { stream, streamSimple } from "../src/stream";
 import type { AssistantMessage, Context, FetchImpl, Model } from "../src/types";
 import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 
@@ -80,6 +80,33 @@ describe("provider safety-stop provenance authority", () => {
 			expect(result.stopReason).toBe("error");
 			expect(result.errorKind).toBeUndefined();
 			expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+		} finally {
+			fetchSpy.mockRestore();
+		}
+	});
+
+	test("preserves authenticated safety stops through the Synthetic wrapper", async () => {
+		const model = getBundledModel("synthetic", "hf:deepseek-ai/DeepSeek-R1-0528");
+		if (!model) throw new Error("Expected bundled Synthetic model");
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					error: { message: "filtered", type: "invalid_request_error", code: "content_filter" },
+				}),
+				{ status: 429, headers: { "Content-Type": "application/json" } },
+			),
+		);
+		try {
+			const result = await streamSimple(
+				model,
+				{ messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+				{ apiKey: "synthetic-key", requestMaxRetries: 0, streamMaxRetries: 0 },
+			).result();
+
+			expect(fetchSpy).toHaveBeenCalled();
+			expect(result.stopReason).toBe("error");
+			expect(result.errorKind).toBe("provider_safety_stop");
+			expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
 		} finally {
 			fetchSpy.mockRestore();
 		}

@@ -75,6 +75,13 @@ export function isProviderSafetyStopAdapterInvocation(value: unknown): ProviderS
 	}
 }
 
+/** Copy an existing runtime invocation token across a first-party wrapper boundary. */
+export function copyProviderSafetyStopAdapterInvocation<T extends object>(source: unknown, destination: T): T {
+	return isProviderSafetyStopAdapterInvocation(source)
+		? ({ ...destination, [PROVIDER_SAFETY_STOP_INVOCATION_KEY]: PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION } as T)
+		: destination;
+}
+
 const authenticatedProviderSafetyStops = new WeakSet<object>();
 
 /**

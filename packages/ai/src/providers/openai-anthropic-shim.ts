@@ -8,6 +8,7 @@
  * here once.
  */
 
+import { copyProviderSafetyStopAdapterInvocation } from "../adapter-internals/provider-safety-stop";
 import { ANTHROPIC_THINKING } from "../stream";
 import type { Context, Model, SimpleStreamOptions } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
@@ -73,28 +74,33 @@ export function streamOpenAIAnthropicShim(
 					? (options?.thinkingBudgets?.[reasoningEffort] ?? ANTHROPIC_THINKING[reasoningEffort])
 					: undefined;
 
-				const innerStream = streamAnthropic(anthropicModel, context, {
-					apiKey: options?.apiKey,
-					temperature: options?.temperature,
-					topP: options?.topP,
-					topK: options?.topK,
-					minP: options?.minP,
-					presencePenalty: options?.presencePenalty,
-					repetitionPenalty: options?.repetitionPenalty,
-					maxTokens: options?.maxTokens ?? Math.min(model.maxTokens, 32000),
-					signal: options?.signal,
-					headers: mergedHeaders,
-					sessionId: options?.sessionId,
-					onPayload: options?.onPayload,
-					attemptScope: options?.attemptScope,
-					onResponse: options?.onResponse,
-					onSseEvent: options?.onSseEvent,
-					fetch: options?.fetch,
-					streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
-					streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
-					thinkingEnabled,
-					thinkingBudgetTokens: thinkingBudget,
-				});
+				const innerStream = streamAnthropic(
+					anthropicModel,
+					context,
+					copyProviderSafetyStopAdapterInvocation(options, {
+						...options,
+						apiKey: options?.apiKey,
+						temperature: options?.temperature,
+						topP: options?.topP,
+						topK: options?.topK,
+						minP: options?.minP,
+						presencePenalty: options?.presencePenalty,
+						repetitionPenalty: options?.repetitionPenalty,
+						maxTokens: options?.maxTokens ?? Math.min(model.maxTokens, 32000),
+						signal: options?.signal,
+						headers: mergedHeaders,
+						sessionId: options?.sessionId,
+						onPayload: options?.onPayload,
+						attemptScope: options?.attemptScope,
+						onResponse: options?.onResponse,
+						onSseEvent: options?.onSseEvent,
+						fetch: options?.fetch,
+						streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
+						streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
+						thinkingEnabled,
+						thinkingBudgetTokens: thinkingBudget,
+					}),
+				);
 
 				for await (const event of innerStream) {
 					stream.push(event);
@@ -105,27 +111,32 @@ export function streamOpenAIAnthropicShim(
 					: model;
 
 				const reasoningEffort = options?.reasoning;
-				const innerStream = streamOpenAICompletions(openaiModel, context, {
-					apiKey: options?.apiKey,
-					temperature: options?.temperature,
-					topP: options?.topP,
-					topK: options?.topK,
-					minP: options?.minP,
-					presencePenalty: options?.presencePenalty,
-					repetitionPenalty: options?.repetitionPenalty,
-					maxTokens: options?.maxTokens ?? model.maxTokens,
-					signal: options?.signal,
-					headers: mergedHeaders,
-					sessionId: options?.sessionId,
-					onPayload: options?.onPayload,
-					attemptScope: options?.attemptScope,
-					onResponse: options?.onResponse,
-					onSseEvent: options?.onSseEvent,
-					fetch: options?.fetch,
-					streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
-					streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
-					reasoning: reasoningEffort,
-				});
+				const innerStream = streamOpenAICompletions(
+					openaiModel,
+					context,
+					copyProviderSafetyStopAdapterInvocation(options, {
+						...options,
+						apiKey: options?.apiKey,
+						temperature: options?.temperature,
+						topP: options?.topP,
+						topK: options?.topK,
+						minP: options?.minP,
+						presencePenalty: options?.presencePenalty,
+						repetitionPenalty: options?.repetitionPenalty,
+						maxTokens: options?.maxTokens ?? model.maxTokens,
+						signal: options?.signal,
+						headers: mergedHeaders,
+						sessionId: options?.sessionId,
+						onPayload: options?.onPayload,
+						attemptScope: options?.attemptScope,
+						onResponse: options?.onResponse,
+						onSseEvent: options?.onSseEvent,
+						fetch: options?.fetch,
+						streamIdleTimeoutMs: options?.streamIdleTimeoutMs,
+						streamFirstEventTimeoutMs: options?.streamFirstEventTimeoutMs,
+						reasoning: reasoningEffort,
+					}),
+				);
 
 				for await (const event of innerStream) {
 					stream.push(event);
