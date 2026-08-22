@@ -681,7 +681,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 				// Terminal authority is minted by the adapter after parsing the
 				// structured candidate finish reason; a wire-assignable field
 				// alone never carries it (#4777).
-				mintProviderSafetyStop(
+				const authenticated = mintProviderSafetyStop(
 					output,
 					candidate.finishReason,
 					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
@@ -689,6 +689,13 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 					adapterInvocation,
 				);
 				output.stopReason = "error";
+				if (!authenticated) {
+					output.transportFailure = {
+						kind: "transport",
+						status: 500,
+						providerCode: "untrusted_safety_stop",
+					};
+				}
 			} else if (!providerSafetyStop) {
 				output.stopReason = mapStopReason(candidate.finishReason);
 				if (output.stopReason === "stop" && output.content.some(b => b.type === "toolCall")) {
@@ -703,7 +710,7 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 				providerSafetyStop = true;
 				// Prompt-level block reasons carry the same adapter-minted
 				// authority as candidate finish reasons (#4777).
-				mintProviderSafetyStop(
+				const authenticated = mintProviderSafetyStop(
 					output,
 					blockReason,
 					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
@@ -711,6 +718,13 @@ export async function consumeGoogleStream<T extends GoogleApiType>(args: {
 					adapterInvocation,
 				);
 				output.stopReason = "error";
+				if (!authenticated) {
+					output.transportFailure = {
+						kind: "transport",
+						status: 500,
+						providerCode: "untrusted_safety_stop",
+					};
+				}
 			} else if (!providerSafetyStop) {
 				output.stopReason = "error";
 			}
@@ -1022,7 +1036,7 @@ export function streamGoogleGenAI<T extends "google-generative-ai" | "google-ver
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(error);
-			output.transportFailure = transportFailureFacts(error);
+			output.transportFailure = transportFailureFacts(error) ?? output.transportFailure;
 			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;

@@ -22,6 +22,7 @@ import {
 } from "@gajae-code/utils";
 import {
 	isProviderSafetyStopAdapterInvocation,
+	isProviderSafetyStopModelTrusted,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 	withProviderSafetyStopAdapterInvocation,
@@ -1878,7 +1879,9 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 	context: Context,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
-	options = withProviderSafetyStopAdapterInvocation(options ?? {});
+	if (isProviderSafetyStopModelTrusted(model)) {
+		options = withProviderSafetyStopAdapterInvocation(options ?? {});
+	}
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {

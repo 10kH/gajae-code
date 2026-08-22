@@ -120,6 +120,11 @@ describe("Google safety stops", () => {
 		const result = await stream.result();
 		expect(result.stopReason).toBe("error");
 		expect(result.errorKind).toBeUndefined();
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			status: 500,
+			providerCode: "untrusted_safety_stop",
+		});
 	});
 
 	it("keeps an unauthenticated safety refusal terminal across a later benign finish", async () => {
@@ -152,6 +157,11 @@ describe("Google safety stops", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorKind).toBeUndefined();
 		expect(result.content.some(block => block.type === "toolCall")).toBe(true);
+		expect(result.transportFailure).toMatchObject({
+			kind: "transport",
+			status: 500,
+			providerCode: "untrusted_safety_stop",
+		});
 	});
 
 	it("classifies the exhaustive candidate finish-reason partition", async () => {

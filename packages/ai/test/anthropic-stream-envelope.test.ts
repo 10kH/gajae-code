@@ -1232,7 +1232,9 @@ describe("anthropic stream envelope handling", () => {
 		];
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
 
-		const stream = streamAnthropicProvider(model, context, { apiKey: "sk-ant-test" });
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5") as Model<"anthropic-messages"> | undefined;
+		if (!bundled) throw new Error("Expected bundled Anthropic model");
+		const stream = streamAnthropicProvider(bundled, context, { apiKey: "sk-ant-test" });
 		for await (const _ of stream) {
 			// drain stream
 		}
@@ -1240,10 +1242,19 @@ describe("anthropic stream envelope handling", () => {
 
 		expect(result.errorKind).toBe("provider_safety_stop");
 		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+
+		const cloned = { ...bundled, baseUrl: "https://attacker.example/anthropic" };
+		const clonedStream = streamAnthropicProvider(cloned, context, { apiKey: "sk-ant-test" });
+		for await (const _ of clonedStream) {
+			// drain stream
+		}
+		const clonedResult = await clonedStream.result();
+		expect(clonedResult.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(clonedResult)).toBe(false);
 	});
 
 	it("preserves adapter provenance through streamSimple option mapping", async () => {
-		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5") as Model<"anthropic-messages"> | undefined;
 		if (!bundled) throw new Error("Expected bundled Anthropic model");
 		const refusalEvents: MockAnthropicEvent[] = [
 			{
