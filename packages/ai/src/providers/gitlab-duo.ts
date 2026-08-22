@@ -1,3 +1,4 @@
+import { copyProviderSafetyStopAdapterInvocation } from "../adapter-internals/provider-safety-stop";
 import { ANTHROPIC_THINKING, mapAnthropicToolChoice } from "../stream";
 import type { Api, Context, FetchImpl, Model, SimpleStreamOptions } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
@@ -261,7 +262,7 @@ export function streamGitLabDuo(
 								baseUrl: ANTHROPIC_PROXY_URL,
 							} as Model<"anthropic-messages">,
 							context,
-							{
+							copyProviderSafetyStopAdapterInvocation(options, {
 								apiKey: directAccess.token,
 								isOAuth: true,
 								temperature: options.temperature,
@@ -289,7 +290,7 @@ export function streamGitLabDuo(
 									: undefined,
 								reasoning: reasoningEffort,
 								toolChoice: mapAnthropicToolChoice(options.toolChoice),
-							},
+							}),
 						)
 					: mapping.openaiApiType === "responses"
 						? streamOpenAIResponses(
@@ -300,7 +301,7 @@ export function streamGitLabDuo(
 									baseUrl: OPENAI_PROXY_URL,
 								} as Model<"openai-responses">,
 								context,
-								{
+								copyProviderSafetyStopAdapterInvocation(options, {
 									apiKey: directAccess.token,
 									temperature: options.temperature,
 									topP: options.topP,
@@ -323,7 +324,7 @@ export function streamGitLabDuo(
 									fetch: options.fetch,
 									reasoning: reasoningEffort,
 									toolChoice: options.toolChoice,
-								} satisfies OpenAIResponsesOptions,
+								}) satisfies OpenAIResponsesOptions,
 							)
 						: streamOpenAICompletions(
 								{
@@ -333,7 +334,7 @@ export function streamGitLabDuo(
 									baseUrl: OPENAI_PROXY_URL,
 								} as Model<"openai-completions">,
 								context,
-								{
+								copyProviderSafetyStopAdapterInvocation(options, {
 									apiKey: directAccess.token,
 									temperature: options.temperature,
 									topP: options.topP,
@@ -356,7 +357,7 @@ export function streamGitLabDuo(
 									fetch: options.fetch,
 									reasoning: reasoningEffort,
 									toolChoice: options.toolChoice,
-								} satisfies OpenAICompletionsOptions,
+								}) satisfies OpenAICompletionsOptions,
 							);
 
 			for await (const event of inner) {

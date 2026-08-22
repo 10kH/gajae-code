@@ -1,9 +1,23 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import { Messages } from "@anthropic-ai/sdk/resources/messages/messages";
+import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
 import { Effort } from "../src/model-thinking";
-import { applyClaudeToolPrefix, streamAnthropic, stripClaudeToolPrefix } from "../src/providers/anthropic";
+import { getBundledModel } from "../src/models";
+import {
+	applyClaudeToolPrefix,
+	streamAnthropic as streamAnthropicProvider,
+	stripClaudeToolPrefix,
+} from "../src/providers/anthropic";
+import { streamSimple } from "../src/stream";
 import type { AssistantMessageEvent, Context, Model, ProviderSessionState } from "../src/types";
+import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
+
+type AnthropicStreamOptions = NonNullable<Parameters<typeof streamAnthropicProvider>[2]>;
+
+function trustedStreamAnthropic(model: Model<"anthropic-messages">, context: Context, options: AnthropicStreamOptions) {
+	return streamAnthropicProvider(model, context, withProviderSafetyStopAdapterInvocation(options));
+}
 
 const model: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -248,7 +262,7 @@ describe("anthropic stream envelope handling", () => {
 			() => createMockRequest(createTextSuccessEvents("hello", { duplicateMessageStart: true })) as never,
 		);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -286,7 +300,7 @@ describe("anthropic stream envelope handling", () => {
 			]) as never;
 		});
 
-		const stream = streamAnthropic(summarizedModel, context, { apiKey: "sk-ant-test", thinkingEnabled: true });
+		const stream = trustedStreamAnthropic(summarizedModel, context, { apiKey: "sk-ant-test", thinkingEnabled: true });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) events.push(event);
 
@@ -322,7 +336,7 @@ describe("anthropic stream envelope handling", () => {
 			]) as never;
 		});
 
-		const stream = streamAnthropic(unsupportedAdaptiveModel, context, {
+		const stream = trustedStreamAnthropic(unsupportedAdaptiveModel, context, {
 			apiKey: "sk-ant-test",
 			thinkingEnabled: true,
 		});
@@ -382,7 +396,7 @@ describe("anthropic stream envelope handling", () => {
 				]) as never,
 		);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -433,7 +447,7 @@ describe("anthropic stream envelope handling", () => {
 				]) as never,
 		);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -497,7 +511,7 @@ describe("anthropic stream envelope handling", () => {
 				]) as never,
 		);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		for await (const _ of stream) {
 			// drain stream
 		}
@@ -548,7 +562,7 @@ describe("anthropic stream envelope handling", () => {
 				]) as never,
 		);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		for await (const _ of stream) {
 			// drain stream
 		}
@@ -601,7 +615,7 @@ describe("anthropic stream envelope handling", () => {
 				]) as never,
 		);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -633,7 +647,7 @@ describe("anthropic stream envelope handling", () => {
 			return createMockRequest(createTextSuccessEventsWithPreamble("hello", [{ type: "ping" }])) as never;
 		});
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -660,7 +674,7 @@ describe("anthropic stream envelope handling", () => {
 			) as never;
 		});
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -688,7 +702,7 @@ describe("anthropic stream envelope handling", () => {
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -728,7 +742,7 @@ describe("anthropic stream envelope handling", () => {
 			return createMockRequest(createTextSuccessEvents(attempt === 2 ? "recovered" : "later")) as never;
 		});
 
-		const stream = streamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
+		const stream = trustedStreamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -746,7 +760,7 @@ describe("anthropic stream envelope handling", () => {
 				?.strictToolsDisabled,
 		).toBe(true);
 
-		const nextStream = streamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
+		const nextStream = trustedStreamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
 		const nextEvents: AssistantMessageEvent[] = [];
 		for await (const event of nextStream) {
 			nextEvents.push(event);
@@ -781,7 +795,7 @@ describe("anthropic stream envelope handling", () => {
 			return createRejectedMockRequest(createOtherInvalidRequestError()) as never;
 		});
 
-		const stream = streamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
+		const stream = trustedStreamAnthropic(model, toolContext, { apiKey: "sk-ant-test", providerSessionState });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -845,7 +859,7 @@ describe("anthropic stream envelope handling", () => {
 			return createMockRequest(createTextSuccessEvents("recovered")) as never;
 		});
 
-		const stream = streamAnthropic(gatewayModel, toolLoopContext, {
+		const stream = trustedStreamAnthropic(gatewayModel, toolLoopContext, {
 			apiKey: "sk-ant-test",
 			providerSessionState,
 		});
@@ -870,7 +884,7 @@ describe("anthropic stream envelope handling", () => {
 
 		// A later turn in the same session starts from the reduced budget instead of
 		// re-triggering the rejection.
-		const nextStream = streamAnthropic(gatewayModel, toolLoopContext, {
+		const nextStream = trustedStreamAnthropic(gatewayModel, toolLoopContext, {
 			apiKey: "sk-ant-test",
 			providerSessionState,
 		});
@@ -900,7 +914,7 @@ describe("anthropic stream envelope handling", () => {
 			return createMockRequest(createTextSuccessEvents("recovered")) as never;
 		});
 
-		const stream = streamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test", providerSessionState });
+		const stream = trustedStreamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test", providerSessionState });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -936,7 +950,7 @@ describe("anthropic stream envelope handling", () => {
 			return createMockRequest(createTextSuccessEvents("recovered")) as never;
 		});
 
-		const stream = streamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test" });
 		for await (const _ of stream) {
 			// drain stream
 		}
@@ -963,7 +977,7 @@ describe("anthropic stream envelope handling", () => {
 			return createRejectedMockRequest(createOtherInvalidRequestError()) as never;
 		});
 
-		const stream = streamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test", providerSessionState });
+		const stream = trustedStreamAnthropic(gatewayModel, context, { apiKey: "sk-ant-test", providerSessionState });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -987,7 +1001,7 @@ describe("anthropic stream envelope handling", () => {
 			return createMockRequest(createMalformedToolUseEvents()) as never;
 		});
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -1020,7 +1034,7 @@ describe("anthropic stream envelope handling", () => {
 				) as never,
 		);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -1039,7 +1053,7 @@ describe("anthropic stream envelope handling", () => {
 		);
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createRawSseRequest(incompleteFrames) as never);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -1067,7 +1081,7 @@ describe("anthropic stream envelope handling", () => {
 		];
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createRawSseRequest(frames) as never);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		for await (const _ of stream) {
 			// drain stream
 		}
@@ -1099,7 +1113,7 @@ describe("anthropic stream envelope handling", () => {
 		];
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -1144,7 +1158,7 @@ describe("anthropic stream envelope handling", () => {
 		];
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			events.push(event);
@@ -1181,7 +1195,7 @@ describe("anthropic stream envelope handling", () => {
 		];
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(sensitiveEvents) as never);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		for await (const _ of stream) {
 			// drain stream
 		}
@@ -1190,7 +1204,108 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Content flagged by safety filters");
 		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
 	});
+
+	it("keeps direct provider calls unauthenticated without dispatcher provenance", async () => {
+		const refusalEvents: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_direct_refusal",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "message_delta",
+				delta: {
+					stop_reason: "end_turn",
+					stop_details: { type: "refusal", category: "safety", explanation: "Direct refusal" },
+				},
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+			{ type: "message_stop" },
+		];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
+
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5") as Model<"anthropic-messages"> | undefined;
+		if (!bundled) throw new Error("Expected bundled Anthropic model");
+		const stream = streamAnthropicProvider(bundled, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(result.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(false);
+
+		const cloned = { ...bundled, baseUrl: "https://attacker.example/anthropic" };
+		const clonedStream = streamAnthropicProvider(cloned, context, { apiKey: "sk-ant-test" });
+		for await (const _ of clonedStream) {
+			// drain stream
+		}
+		const clonedResult = await clonedStream.result();
+		expect(clonedResult.errorKind).toBeUndefined();
+		expect(isProviderSafetyStopAuthenticated(clonedResult)).toBe(false);
+
+		const callerTransportStream = streamAnthropicProvider(bundled, context, {
+			client: { messages: { create: () => createMockRequest(refusalEvents) } } as never,
+		});
+		for await (const _ of callerTransportStream) {
+			// drain stream
+		}
+		const callerTransportResult = await callerTransportStream.result();
+		expect(callerTransportResult.errorKind).toBeUndefined();
+		expect(callerTransportResult.transportFailure).toMatchObject({
+			kind: "transport",
+			status: 500,
+			providerCode: "untrusted_safety_stop",
+		});
+	});
+
+	it("preserves adapter provenance through streamSimple option mapping", async () => {
+		const bundled = getBundledModel("anthropic", "claude-sonnet-4-5") as Model<"anthropic-messages"> | undefined;
+		if (!bundled) throw new Error("Expected bundled Anthropic model");
+		const refusalEvents: MockAnthropicEvent[] = [
+			{
+				type: "message_start",
+				message: {
+					id: "msg_simple_refusal",
+					usage: {
+						input_tokens: 5,
+						output_tokens: 0,
+						cache_read_input_tokens: 0,
+						cache_creation_input_tokens: 0,
+					},
+				},
+			},
+			{
+				type: "message_delta",
+				delta: {
+					stop_reason: "end_turn",
+					stop_details: { type: "refusal", category: "safety", explanation: "Simple refusal" },
+				},
+				usage: { input_tokens: 5, output_tokens: 0 },
+			},
+			{ type: "message_stop" },
+		];
+		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(refusalEvents) as never);
+
+		const stream = streamSimple(bundled, context, { apiKey: "sk-ant-test" });
+		for await (const _ of stream) {
+			// drain stream
+		}
+		const result = await stream.result();
+
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+	});
+
 	it("keeps a safety stop terminal when later stop reasons and tool events arrive", async () => {
 		const eventsAfterSafety: MockAnthropicEvent[] = [
 			{
@@ -1227,7 +1342,7 @@ describe("anthropic stream envelope handling", () => {
 		];
 		vi.spyOn(Messages.prototype, "create").mockImplementation(() => createMockRequest(eventsAfterSafety) as never);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const observedEvents: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			observedEvents.push(event);
@@ -1279,7 +1394,7 @@ describe("anthropic stream envelope handling", () => {
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
-		const stream = streamAnthropic(model, context, { apiKey: "sk-ant-test" });
+		const stream = trustedStreamAnthropic(model, context, { apiKey: "sk-ant-test" });
 		const observedEvents: AssistantMessageEvent[] = [];
 		for await (const event of stream) {
 			observedEvents.push(event);
@@ -1310,13 +1425,13 @@ describe("anthropic stream envelope handling", () => {
 			return createMockRequest(createTextSuccessEvents("ok")) as never;
 		});
 
-		const eagerStream = streamAnthropic(model, toolContext, { apiKey: "sk-ant-test" });
+		const eagerStream = trustedStreamAnthropic(model, toolContext, { apiKey: "sk-ant-test" });
 		for await (const _ of eagerStream) {
 			// drain stream
 		}
 		await eagerStream.result();
 
-		const disabledStream = streamAnthropic(
+		const disabledStream = trustedStreamAnthropic(
 			{ ...model, compat: { supportsEagerToolInputStreaming: false } },
 			toolContext,
 			{ apiKey: "sk-ant-test" },
@@ -1350,7 +1465,7 @@ describe("anthropic stream envelope handling", () => {
 				baseUrl: "https://proxy.example.com/anthropic",
 			},
 		]) {
-			const stream = streamAnthropic(testModel, context, {
+			const stream = trustedStreamAnthropic(testModel, context, {
 				apiKey: "sk-ant-test",
 				cacheRetention: "long",
 			});
@@ -1403,7 +1518,7 @@ describe("anthropic stream envelope handling", () => {
 				},
 			]) {
 				// No cacheRetention passed: the provider default should drive the TTL.
-				const stream = streamAnthropic(testModel, context, { apiKey: "sk-ant-test" });
+				const stream = trustedStreamAnthropic(testModel, context, { apiKey: "sk-ant-test" });
 				for await (const _ of stream) {
 					// drain stream
 				}
@@ -1468,7 +1583,7 @@ describe("anthropic stream envelope handling", () => {
 				]) as never,
 		);
 
-		const stream = streamAnthropic(thinkingModel, context, { apiKey: "sk-ant-test", thinkingEnabled: true });
+		const stream = trustedStreamAnthropic(thinkingModel, context, { apiKey: "sk-ant-test", thinkingEnabled: true });
 		const events: AssistantMessageEvent[] = [];
 		for await (const event of stream) events.push(event);
 		const result = await stream.result();
