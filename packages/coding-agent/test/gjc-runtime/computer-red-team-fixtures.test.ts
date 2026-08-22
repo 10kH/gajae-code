@@ -30,8 +30,8 @@ async function tempDir(): Promise<string> {
 
 afterEach(async () => {
 	process.env.GJC_SESSION_ID = TEST_SESSION_ID;
-	if (savedGithubWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
-	else process.env.GITHUB_WORKSPACE = savedGithubWorkspace;
+	// Keep GITHUB_WORKSPACE deleted for hermetic change-set isolation; restore only in afterAll.
+	delete process.env.GITHUB_WORKSPACE;
 	await Promise.all(tempRoots.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
 });
 
