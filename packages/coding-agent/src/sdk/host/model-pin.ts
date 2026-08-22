@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { AuthStorage } from "@gajae-code/ai/core";
 import { ModelRegistry } from "../../config/model-registry";
 import { formatModelString, type ResolveCliModelResult, resolveCliModel } from "../../config/model-resolver";
+import { Settings } from "../../config/settings";
 import { discoverAuthStorage } from "../session";
 
 const MAX_ECHOED_MODEL_LENGTH = 256;
@@ -18,11 +19,14 @@ export type SdkHostModelRegistryLoader = () => ModelRegistry | Promise<ModelRegi
 export function createSdkHostModelRegistryLoader(
 	discoverStorage: () => Promise<AuthStorage>,
 	modelsPath?: string,
+	loadSettings?: () => Promise<Pick<Settings, "getGlobal">>,
 ): SdkHostModelRegistryLoader {
 	let cachedRegistry: Promise<ModelRegistry> | undefined;
 	return async () => {
 		if (cachedRegistry === undefined) {
-			const initializing = discoverStorage().then(storage => new ModelRegistry(storage, modelsPath));
+			const initializing = Promise.all([discoverStorage(), loadSettings?.()]).then(
+				([storage, registrySettings]) => new ModelRegistry(storage, modelsPath, registrySettings),
+			);
 			cachedRegistry = initializing;
 			try {
 				await initializing;
@@ -68,6 +72,7 @@ export function createDefaultSdkHostModelResolver(agentDir: string): SdkHostMode
 	const loadRegistry = createSdkHostModelRegistryLoader(
 		() => discoverAuthStorage(agentDir),
 		path.join(agentDir, "models.yml"),
+		() => Settings.loadReadonly({ agentDir }),
 	);
 	return (raw: unknown): Promise<SdkHostModelResolution> => resolveSdkHostModel(raw, loadRegistry);
 }

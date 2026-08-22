@@ -1295,9 +1295,9 @@ function getDisabledProviderIdsFromSettings(): Set<string> {
 	}
 }
 
-function getConfiguredProviderOrderFromSettings(): string[] {
+function getConfiguredProviderOrderFromSettings(settingsReader: Pick<Settings, "getGlobal"> = settings): string[] {
 	try {
-		const configured = settings.getGlobal("modelProviderOrder");
+		const configured = settingsReader.getGlobal("modelProviderOrder");
 		return Array.isArray(configured) ? configured.filter((value): value is string => typeof value === "string") : [];
 	} catch {
 		return [];
@@ -1387,6 +1387,7 @@ export class ModelRegistry {
 	#modelProfiles: Map<string, ModelProfileDefinition> = mergeModelProfiles();
 	#configError: ConfigError | undefined = undefined;
 	#modelsConfigFile: ConfigFile<ModelsConfig>;
+	readonly #settings: Pick<Settings, "getGlobal">;
 	#lastStaticLoadMtime: number | null = null;
 	#lastStaticLoadEnvironmentFingerprint: string | undefined;
 	#staticModelsLoaded = false;
@@ -1414,7 +1415,9 @@ export class ModelRegistry {
 	constructor(
 		readonly authStorage: AuthStorage,
 		modelsPath?: string,
+		registrySettings?: Pick<Settings, "getGlobal">,
 	) {
+		this.#settings = registrySettings ?? settings;
 		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
 		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
@@ -3739,7 +3742,7 @@ export class ModelRegistry {
 			effectiveAuth.set(providerKey, this.#effectiveProviderAuth(model.provider, sessionId));
 		}
 		return createProviderSelectionPolicy({
-			explicitProviderOrder: getConfiguredProviderOrderFromSettings(),
+			explicitProviderOrder: getConfiguredProviderOrderFromSettings(this.#settings),
 			effectiveAuth,
 			catalogProviders,
 			catalogModels,

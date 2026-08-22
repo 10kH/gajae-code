@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AuthStorage, type Model } from "@gajae-code/ai";
+import { Settings } from "../src/config/settings";
 import {
 	createSdkHostModelRegistryLoader,
 	resolveSdkHostModel,
@@ -136,6 +137,59 @@ describe("resolveSdkHostModel", () => {
 				model: "fixture/second-model",
 			});
 			expect((await resolveSdkHostModel("fixture/first-model", secondLoader)).ok).toBe(false);
+		} finally {
+			firstStorage.close();
+			secondStorage.close();
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("binds canonical alias ranking to each registry's provider order", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-host-provider-order-"));
+		const firstStorage = await AuthStorage.create(path.join(root, "first-auth.db"));
+		const secondStorage = await AuthStorage.create(path.join(root, "second-auth.db"));
+		const modelsPath = path.join(root, "models.yml");
+		const modelsFile = `providers:
+  fixture-a:
+    baseUrl: http://127.0.0.1:1/v1
+    apiKey: fixture-key
+    api: openai-completions
+    models:
+      - id: shared
+        name: shared
+        contextWindow: 32768
+        maxTokens: 4096
+  fixture-b:
+    baseUrl: http://127.0.0.1:1/v1
+    apiKey: fixture-key
+    api: openai-completions
+    models:
+      - id: shared
+        name: shared
+        contextWindow: 32768
+        maxTokens: 4096
+`;
+		try {
+			await fs.writeFile(modelsPath, modelsFile);
+			const firstLoader = createSdkHostModelRegistryLoader(
+				async () => firstStorage,
+				modelsPath,
+				async () => Settings.isolated({ modelProviderOrder: ["fixture-b"] }),
+			);
+			const secondLoader = createSdkHostModelRegistryLoader(
+				async () => secondStorage,
+				modelsPath,
+				async () => Settings.isolated({ modelProviderOrder: ["fixture-a"] }),
+			);
+
+			expect(await resolveSdkHostModel("shared", firstLoader)).toEqual({
+				ok: true,
+				model: "fixture-b/shared",
+			});
+			expect(await resolveSdkHostModel("shared", secondLoader)).toEqual({
+				ok: true,
+				model: "fixture-a/shared",
+			});
 		} finally {
 			firstStorage.close();
 			secondStorage.close();
