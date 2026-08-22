@@ -183,9 +183,13 @@ function chainCacheKey(
 	// key rotation) invalidate cached chains immediately instead of being
 	// masked for up to the TTL. Stubs without getGeneration() key as 0.
 	const generation = (authStorage as { getGeneration?: () => number }).getGeneration?.() ?? 0;
+	const providerSettings = settings
+		? [settings.get("exa.enabled"), settings.get("exa.enableSearch"), settings.get("searxng.endpoint")]
+		: null;
 	return JSON.stringify([
 		generation,
 		settingsCacheId(settings),
+		providerSettings,
 		preferred ?? null,
 		fallbacks,
 		ctx
@@ -428,8 +432,14 @@ export async function resolveProviderChain(options: ResolveProviderChainOptions)
 
 	const cacheKey = chainCacheKey(preferredProvider, fallbackProviders, activeModelContext, authStorage, settings);
 	const perStorage = chainCache.get(authStorage);
+	const now = Date.now();
+	if (perStorage) {
+		for (const [key, entry] of perStorage) {
+			if (entry.expires <= now) perStorage.delete(key);
+		}
+	}
 	const cached = perStorage?.get(cacheKey);
-	if (cached && cached.expires > Date.now()) {
+	if (cached && cached.expires > now) {
 		const cachedProviders: SearchProvider[] = [];
 		for (const id of cached.ids) cachedProviders.push(await getSearchProvider(id));
 		return cachedProviders;

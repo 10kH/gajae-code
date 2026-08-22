@@ -6140,8 +6140,16 @@ export async function ensureWorkflowSettingsMigrated(cwd: string): Promise<void>
 		logger.warn("Settings: workflow migration trigger could not load settings", {
 			error: error instanceof Error ? error.message : String(error),
 		});
-	} finally {
-		await loaded?.close();
+	}
+	if (loaded) {
+		try {
+			await loaded.close();
+		} catch (error) {
+			logger.warn("Settings: workflow migration cleanup could not flush settings", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			loaded.getStorage()?.close();
+		}
 	}
 }
 

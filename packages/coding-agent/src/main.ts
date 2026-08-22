@@ -1322,6 +1322,7 @@ export async function runRootCommand(
 	let autoChdirApplied = false;
 	let bareResumeSessionManager: SessionManager | undefined;
 	let bareResumeAction: "continue-tail" | "open-idle" | undefined;
+	let bareResumeCleanupFailed = false;
 
 	if (isBareResume(parsedArgs)) {
 		if (hasBareResumeConflict(parsedArgs)) {
@@ -1395,8 +1396,18 @@ export async function runRootCommand(
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		} finally {
-			await scopedSettings.close?.();
+			try {
+				await scopedSettings.close?.();
+			} catch (error) {
+				await bareResumeSessionManager?.close().catch(() => undefined);
+				bareResumeSessionManager = undefined;
+				bareResumeCleanupFailed = true;
+				logger.warn("Resume settings cleanup failed; discarded opened session manager", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
+		if (bareResumeCleanupFailed) return;
 	}
 
 	if (!initialThemeInitialized) {
