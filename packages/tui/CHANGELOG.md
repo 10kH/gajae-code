@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-22
+
 ### Fixed
 - OSC 8 hyperlinks now survive soft wrapping: a rendered URL longer than the terminal width keeps the identical clickable target on every visual row across narrow↔wide resize reflow, instead of rendering continuation rows as plain text; links no longer bleed over adjacent punctuation or hard-newline-adjacent text, and copy/select of a wrapped link returns the original URL with no injected control bytes (#4711).
 
