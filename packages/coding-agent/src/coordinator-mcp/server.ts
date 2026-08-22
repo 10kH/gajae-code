@@ -5799,8 +5799,17 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					} catch (error) {
 						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 					}
+					// Idle eligibility is judged against the durable WAL session, not the
+					// projection state file: projection repair refreshes that stamp
+					// (writeSessionState stamps `now`), which would reset the idle clock
+					// after every failed close and defer the reaper's retry by a whole
+					// TTL. The WAL session's updated_at is the truthful last-activity
+					// authority; the projection state stays the fallback for sessions
+					// whose WAL cannot be read.
+					const walSession = await readSessionTransaction(questionPaths, sessionId);
+					const walStamp = optionalString(walSession?.canonical.session.updated_at);
 					const state = await readSessionState(namespaceDir, sessionId);
-					const stamp = optionalString(state?.updated_at) ?? optionalString(session.created_at);
+					const stamp = walStamp ?? optionalString(state?.updated_at) ?? optionalString(session.created_at);
 					const lastActivityMs = stamp ? Date.parse(stamp) : Number.NaN;
 					out.push({
 						sessionId,
