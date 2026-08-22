@@ -1,0 +1,23 @@
+name: Env probe
+on:
+   workflow_dispatch:
+permissions:
+   contents: read
+jobs:
+   plain:
+      runs-on: ubuntu-22.04
+      steps:
+         - run: echo "plain job ran"
+   with_env:
+      runs-on: ubuntu-22.04
+      permissions:
+         deployments: write
+      environment: npm-release
+      steps:
+         - run: echo "environment job ran"
+   with_env_no_perms:
+      runs-on: ubuntu-22.04
+      permissions: {}
+      environment: npm-release
+      steps:
+         - run: echo "environment job without permissions ran"
