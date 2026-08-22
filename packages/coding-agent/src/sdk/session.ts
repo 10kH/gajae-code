@@ -3330,6 +3330,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...(options.currentAgentType ? { currentAgentType: options.currentAgentType } : {}),
 				},
 				settings,
+				() => session?.credentialSessionId ?? credentialSessionId,
 			);
 		}
 

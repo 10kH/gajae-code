@@ -356,6 +356,17 @@ function isExtensionSettingReadable(path: string): boolean {
 	return !EXTENSION_BLOCKED_SETTING_PREFIXES.some(prefix => path.startsWith(prefix));
 }
 
+function deepFreeze<T>(value: T): T {
+	if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+	return Object.freeze(value);
+}
+
+function cloneAndFreeze<T>(value: T): T {
+	if (value === null || typeof value !== "object") return value;
+	return deepFreeze(structuredClone(value));
+}
+
 /** Create an extension-safe settings facade without exposing credentials or mutation APIs. */
 export function createExtensionSettings(
 	settings: Pick<Settings, "getModelRole"> & Pick<Settings, "get">,
@@ -363,9 +374,9 @@ export function createExtensionSettings(
 	return Object.freeze({
 		get: <P extends SettingPath>(path: P): SettingValue<P> | undefined => {
 			if (!isExtensionSettingReadable(path)) return undefined;
-			return settings.get(path);
+			return cloneAndFreeze(settings.get(path));
 		},
-		getModelRole: settings.getModelRole.bind(settings),
+		getModelRole: (role: string): ModelSelectorValue | undefined => cloneAndFreeze(settings.getModelRole(role)),
 	});
 }
 
@@ -408,7 +419,8 @@ export function createCustomToolSettings(settings: Settings | ExtensionSettings)
 			const value = Reflect.get(target, property, receiver);
 			if (typeof value !== "function") return value;
 			if (!CUSTOM_TOOL_ALLOWED_SETTINGS_METHODS.has(property)) return blockedMethod;
-			return value.bind(target);
+			const bound = value.bind(target);
+			return (...args: unknown[]) => cloneAndFreeze(bound(...args));
 		},
 	});
 }

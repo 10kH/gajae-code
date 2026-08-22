@@ -17,6 +17,7 @@ import {
 } from "@gajae-code/coding-agent/extensibility/extensions/runner";
 import {
 	createCustomToolSettings,
+	createExtensionSettings,
 	type ExtensionContext,
 } from "@gajae-code/coding-agent/extensibility/extensions/types";
 
@@ -97,6 +98,66 @@ describe("ExtensionRunner", () => {
 			expect(() => compatibility.set("theme.dark", "dark")).toThrow();
 		});
 
+		it("clones and deep-freezes nested facade and aggregate returns", () => {
+			const backing = {
+				modelRoles: {
+					image: ["openai/gpt-image-2", "openrouter/google/gemini-3-pro-image-preview"],
+				},
+				rules: [{ pattern: "git push", tool: "bash" }],
+				shell: { shell: "/bin/bash", args: ["-lc"], env: { TEST_SETTING: "original" } },
+			};
+			const settings = {
+				get: (path: string) => {
+					if (path === "modelRoles") return backing.modelRoles;
+					if (path === "bashInterceptor.patterns") return backing.rules;
+					return undefined;
+				},
+				getCwd: () => tempDir.path(),
+				getModelRole: (role: string) => (role === "image" ? backing.modelRoles.image : undefined),
+				getModelRoles: () => backing.modelRoles,
+				getBashInterceptorRules: () => backing.rules,
+				getShellConfig: () => backing.shell,
+			} as unknown as Settings;
+
+			const extensionSettings = createExtensionSettings(settings);
+			const exposedRoles = extensionSettings.get("modelRoles") as { image: string[] };
+			const exposedRole = extensionSettings.getModelRole("image") as string[];
+			expect(exposedRoles).not.toBe(backing.modelRoles);
+			expect(exposedRoles.image).not.toBe(backing.modelRoles.image);
+			expect(Object.isFrozen(exposedRoles)).toBe(true);
+			expect(Object.isFrozen(exposedRoles.image)).toBe(true);
+			expect(exposedRole).not.toBe(backing.modelRoles.image);
+			expect(Object.isFrozen(exposedRole)).toBe(true);
+			expect(() => exposedRoles.image.push("mutated")).toThrow();
+			expect(() => exposedRole.push("mutated")).toThrow();
+
+			const compatibility = createCustomToolSettings(settings);
+			const aggregateRoles = compatibility.getModelRoles() as { image: string[] };
+			const aggregateRules = compatibility.getBashInterceptorRules();
+			const aggregateShell = compatibility.getShellConfig();
+			expect(aggregateRoles).not.toBe(backing.modelRoles);
+			expect(Object.isFrozen(aggregateRoles)).toBe(true);
+			expect(Object.isFrozen(aggregateRoles.image)).toBe(true);
+			expect(aggregateRules).not.toBe(backing.rules);
+			expect(Object.isFrozen(aggregateRules)).toBe(true);
+			expect(Object.isFrozen(aggregateRules[0])).toBe(true);
+			expect(aggregateShell).not.toBe(backing.shell);
+			expect(Object.isFrozen(aggregateShell)).toBe(true);
+			expect(Object.isFrozen(aggregateShell.env)).toBe(true);
+			expect(() => aggregateRoles.image.push("mutated")).toThrow();
+			expect(() => {
+				if (aggregateRules[0]) aggregateRules[0].pattern = "mutated";
+			}).toThrow();
+			expect(() => {
+				if (aggregateShell.env) aggregateShell.env.TEST_SETTING = "mutated";
+			}).toThrow();
+			expect(backing).toEqual({
+				modelRoles: { image: ["openai/gpt-image-2", "openrouter/google/gemini-3-pro-image-preview"] },
+				rules: [{ pattern: "git push", tool: "bash" }],
+				shell: { shell: "/bin/bash", args: ["-lc"], env: { TEST_SETTING: "original" } },
+			});
+		});
+
 		it("exposes the live credential session identity to extension contexts", () => {
 			const runner = new ExtensionRunner(
 				[],
@@ -104,8 +165,10 @@ describe("ExtensionRunner", () => {
 				tempDir.path(),
 				sessionManager,
 				modelRegistry,
+				undefined,
+				undefined,
+				() => "credential-session-1",
 			);
-			runner.initialize({} as never, { getCredentialSessionId: () => "credential-session-1" } as never);
 
 			expect(runner.createContext().credentialSessionId).toBe("credential-session-1");
 		});

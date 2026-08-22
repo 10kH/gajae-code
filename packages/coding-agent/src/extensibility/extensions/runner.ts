@@ -280,8 +280,10 @@ export class ExtensionRunner {
 		private readonly modelRegistry: ModelRegistry,
 		private readonly sessionMetadata?: ExtensionContext["sessionMetadata"],
 		private readonly settings?: Settings,
+		credentialSessionIdGetter?: () => string,
 	) {
 		this.#uiContext = noOpUIContext;
+		this.#getCredentialSessionId = credentialSessionIdGetter ?? (() => "");
 		this.#handlersByEvent = ExtensionRunner.#indexHandlers(extensions);
 	}
 
