@@ -19,7 +19,7 @@ export type SdkHostModelRegistryLoader = () => ModelRegistry | Promise<ModelRegi
 export function createSdkHostModelRegistryLoader(
 	discoverStorage: () => Promise<AuthStorage>,
 	modelsPath?: string,
-	loadSettings?: () => Promise<Pick<Settings, "getGlobal">>,
+	loadSettings?: () => Promise<Pick<Settings, "get" | "getGlobal">>,
 ): SdkHostModelRegistryLoader {
 	let cachedRegistry: Promise<ModelRegistry> | undefined;
 	return async () => {
