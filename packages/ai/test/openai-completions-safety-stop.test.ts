@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { streamOpenAICompletions } from "@gajae-code/ai/providers/openai-completions";
 import type { AssistantMessageEvent, Context, Model } from "@gajae-code/ai/types";
 import { withProviderSafetyStopAdapterInvocation } from "../src/adapter-internals/provider-safety-stop";
+import { getBundledModel } from "../src/models";
+import { isProviderSafetyStopAuthenticated } from "../src/utils/provider-safety-stop";
 
 function trustedOptions(): { apiKey: string } {
 	return withProviderSafetyStopAdapterInvocation({ apiKey: "test" });
@@ -79,6 +81,16 @@ function context(): Context {
 }
 
 describe("chat-completions: provider safety stops", () => {
+	it("authenticates direct calls for unchanged bundled models", async () => {
+		const bundled = getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions"> | undefined;
+		if (!bundled) throw new Error("Expected bundled OpenAI model");
+		global.fetch = mockFetch([chunk({}, "content_filter"), "[DONE]"]);
+
+		const result = await streamOpenAICompletions(bundled, context(), { apiKey: "test" }).result();
+		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
+	});
+
 	it("keeps a content-filter safety stop when a later tool block finishes", async () => {
 		global.fetch = mockFetch([
 			chunk({}, "content_filter"),

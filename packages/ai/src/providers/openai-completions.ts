@@ -12,8 +12,10 @@ import type {
 import packageJson from "../../package.json" with { type: "json" };
 import {
 	isProviderSafetyStopAdapterInvocation,
+	isProviderSafetyStopModelTrusted,
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+	withProviderSafetyStopAdapterInvocation,
 } from "../adapter-internals/provider-safety-stop";
 import { type Effort, getSupportedEfforts } from "../model-thinking";
 import { calculateCost } from "../models";
@@ -515,6 +517,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	context: Context,
 	options?: OpenAICompletionsOptions,
 ): AssistantMessageEventStream => {
+	if (isProviderSafetyStopModelTrusted(model)) {
+		options = withProviderSafetyStopAdapterInvocation(options ?? {});
+	}
 	const stream = new AssistantMessageEventStream();
 
 	(async () => {

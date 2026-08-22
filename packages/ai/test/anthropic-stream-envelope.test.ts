@@ -1204,6 +1204,7 @@ describe("anthropic stream envelope handling", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Content flagged by safety filters");
 		expect(result.errorKind).toBe("provider_safety_stop");
+		expect(isProviderSafetyStopAuthenticated(result)).toBe(true);
 	});
 
 	it("authenticates direct provider calls without caller transport seams", async () => {
@@ -1251,6 +1252,20 @@ describe("anthropic stream envelope handling", () => {
 		const clonedResult = await clonedStream.result();
 		expect(clonedResult.errorKind).toBeUndefined();
 		expect(isProviderSafetyStopAuthenticated(clonedResult)).toBe(false);
+
+		const callerTransportStream = streamAnthropicProvider(bundled, context, {
+			client: { messages: { create: () => createMockRequest(refusalEvents) } } as never,
+		});
+		for await (const _ of callerTransportStream) {
+			// drain stream
+		}
+		const callerTransportResult = await callerTransportStream.result();
+		expect(callerTransportResult.errorKind).toBeUndefined();
+		expect(callerTransportResult.transportFailure).toMatchObject({
+			kind: "transport",
+			status: 500,
+			providerCode: "untrusted_safety_stop",
+		});
 	});
 
 	it("preserves adapter provenance through streamSimple option mapping", async () => {
