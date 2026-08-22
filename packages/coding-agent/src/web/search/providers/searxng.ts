@@ -28,9 +28,8 @@
 import * as path from "node:path";
 import type { AuthStorage } from "@gajae-code/ai/core";
 import { $credentialEnv, parseEnvFile } from "@gajae-code/utils";
-
-import { settings } from "../../../config/settings";
 import type { Settings } from "../../../config/settings";
+import { settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import { clampNumResults, dateToAgeSeconds } from "../utils";

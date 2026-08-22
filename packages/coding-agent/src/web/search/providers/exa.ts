@@ -7,8 +7,8 @@
  * them into a combined `answer` string on the SearchResponse.
  */
 import { type AuthStorage, getEnvApiKey } from "@gajae-code/ai/core";
-import { settings } from "../../../config/settings";
 import type { Settings } from "../../../config/settings";
+import { settings } from "../../../config/settings";
 
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
