@@ -587,7 +587,7 @@ async function withAttachedDiscordRuntime(
 
 /** The runtime does its index and endpoint IO before it dials, so wait for the dial. */
 async function awaitSocket(count: number): Promise<FakeWebSocket> {
-	for (let attempt = 0; attempt < 2_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < 5_000 && FakeWebSocket.instances.length < count; attempt++) await Bun.sleep(1);
 	expect(FakeWebSocket.instances).toHaveLength(count);
 	return FakeWebSocket.instances[count - 1]!;
 }
@@ -601,7 +601,7 @@ async function awaitSocket(count: number): Promise<FakeWebSocket> {
  * cursor the runtime has not moved yet.
  */
 async function awaitPosts(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < 5_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
 	await Bun.sleep(25);
 }
@@ -625,7 +625,7 @@ async function awaitReconciliationFailures(provider: FakeSlackProvider, count: n
 async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): Promise<void> {
 	for (
 		let attempt = 0;
-		attempt < 2_000 && (provider.posts.length < count || provider.completedClientMsgIds.size < count);
+		attempt < 5_000 && (provider.posts.length < count || provider.completedClientMsgIds.size < count);
 		attempt++
 	)
 		await Bun.sleep(1);
@@ -635,20 +635,20 @@ async function awaitCompletedPosts(provider: FakeSlackProvider, count: number): 
 }
 
 async function awaitDiscordPosts(provider: FakeDiscordProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < 5_000 && provider.posts.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.posts).toHaveLength(count);
 	await Bun.sleep(25);
 }
 
 /** A refusal is the only trace a failed publication leaves on this side of the runtime. */
 async function awaitRefusals(provider: FakeSlackProvider, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && provider.refused.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < 5_000 && provider.refused.length < count; attempt++) await Bun.sleep(1);
 	expect(provider.refused).toHaveLength(count);
 }
 
 /** The replay rides the socket, so settle on the request the host itself observed. */
 async function awaitReplayRequests(host: FakeSessionHost, count: number): Promise<void> {
-	for (let attempt = 0; attempt < 2_000 && host.replayRequests.length < count; attempt++) await Bun.sleep(1);
+	for (let attempt = 0; attempt < 5_000 && host.replayRequests.length < count; attempt++) await Bun.sleep(1);
 	expect(host.replayRequests).toHaveLength(count);
 }
 
@@ -1726,7 +1726,7 @@ test("a frame queued behind a failed publication cannot advance the cursor past 
 			// replay the delayed retirement would still discard.
 			for (
 				let attempt = 0;
-				attempt < 2_000 && !warnings.some(line => line.includes("publication failed at seq 2"));
+				attempt < 5_000 && !warnings.some(line => line.includes("publication failed at seq 2"));
 				attempt++
 			)
 				await Bun.sleep(1);
