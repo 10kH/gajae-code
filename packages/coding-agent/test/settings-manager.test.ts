@@ -117,7 +117,7 @@ describe("Settings", () => {
 		const scoped = await Settings.loadForScope({ cwd: projectDir, agentDir });
 
 		expect(scoped.getStorage()).not.toBe(global.getStorage());
-		scoped.close();
+		await scoped.close();
 		expect(() => global.getStorage()?.getSettings()).not.toThrow();
 	});
 

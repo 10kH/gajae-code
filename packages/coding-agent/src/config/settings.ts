@@ -605,6 +605,17 @@ export class Settings implements NotificationSettingsReader {
 	}
 
 	/**
+	 * Make an explicitly supplied settings instance available to legacy ambient
+	 * consumers without loading a second, unrelated durable scope.
+	 */
+	static adoptForLegacy(instance: Settings): void {
+		if (globalInstancePromise) return;
+		globalInitOptions = {};
+		globalInstance = instance;
+		globalInstancePromise = Promise.resolve(instance);
+	}
+
+	/**
 	 * Load settings for an explicit workspace without changing the global singleton.
 	 * Managed-session policy resolution must be bound to the workspace being opened.
 	 */
@@ -1135,9 +1146,10 @@ export class Settings implements NotificationSettingsReader {
 		return this.#storage;
 	}
 
-	/** Close storage owned by an isolated settings scope. */
-	close(): void {
+	/** Flush and close storage owned by an isolated settings scope. */
+	async close(): Promise<void> {
 		if (!this.#isolatedStorage) return;
+		await this.flush();
 		this.#storage?.close();
 		this.#storage = null;
 	}
@@ -6121,12 +6133,15 @@ export function resetSettingsForTest(): void {
  */
 export async function ensureWorkflowSettingsMigrated(cwd: string): Promise<void> {
 	if (isSettingsInitialized()) return;
+	let loaded: Settings | undefined;
 	try {
-		await Settings.loadForScope({ cwd });
+		loaded = await Settings.loadForScope({ cwd });
 	} catch (error) {
 		logger.warn("Settings: workflow migration trigger could not load settings", {
 			error: error instanceof Error ? error.message : String(error),
 		});
+	} finally {
+		await loaded?.close();
 	}
 }
 

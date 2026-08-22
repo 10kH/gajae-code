@@ -1385,7 +1385,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let authStorageClosed = false;
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
-	let closeOwnedSettings: () => void = () => {};
+	let closeOwnedSettings: () => Promise<void> = async () => {};
 	const closeOwnedAuthStorage = (): void => {
 		if (!hasSession && credentialScopeLeased && credentialScopeId) {
 			authStorage.releaseCredentialScope(credentialScopeId);
@@ -1424,16 +1424,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
-		closeOwnedSettings = (): void => {
-		closeOwnedSettings = (): void => {
-			if (ownsScopedSettings) settings.close();
+		closeOwnedSettings = async (): Promise<void> => {
+			if (ownsScopedSettings) await settings.close();
+		};
 		};
 		// Keep legacy singleton consumers (bash, edit guards, and older extension code)
 		// initialized for SDK child hosts without making the session's role resolution
 		// depend on that process-global instance. Session-aware tool contexts carry the
 		// scope-local `settings` object directly.
 		if (!isSettingsInitialized()) {
-			await logger.time("settings:legacy-global", Settings.init, { cwd, agentDir });
+			if (options.settings) Settings.adoptForLegacy(settings);
+			else await logger.time("settings:legacy-global", Settings.init, { cwd, agentDir });
 		}
 		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
 		// so services resolve the LIVE session cwd per activation instead of
@@ -4226,7 +4227,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							AsyncJobManager.unregisterManager(asyncJobManager);
 						}
 						closeOwnedAuthStorage();
-						closeOwnedSettings();
+						await closeOwnedSettings();
 					}
 				}
 			};
@@ -4441,7 +4442,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				]);
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
 				await disposeVmContextsByOwner(evalKernelOwnerId);
-				closeOwnedSettings();
+				await closeOwnedSettings();
 			}
 		} catch (cleanupError) {
 			cleanupDiagnostic = cleanupError;
