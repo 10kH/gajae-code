@@ -45,11 +45,19 @@ describe("GJC native skill-state hooks", () => {
 	let tempDir: string | undefined;
 	let originalGjcSessionId: string | undefined;
 	let originalCiDevChangedPaths: string | undefined;
+	let originalGithubWorkspace: string | undefined;
 
 	beforeAll(() => {
 		originalGjcSessionId = process.env.GJC_SESSION_ID;
 		originalCiDevChangedPaths = process.env.CI_DEV_CHANGED_PATHS;
+		originalGithubWorkspace = process.env.GITHUB_WORKSPACE;
 		process.env.CI_DEV_CHANGED_PATHS = "packages/coding-agent/test/gjc-skill-state-hooks.test.ts";
+		// The checkpoint change-set capture discards the pinned CI paths whenever the
+		// cwd is not the declared workspace, and these cases run in a temp cwd. Left
+		// set, every checkpoint here captures as incomplete and escalates validation
+		// to the mandatory computer red-team suite — a different subject than the hook
+		// decisions under test.
+		delete process.env.GITHUB_WORKSPACE;
 		process.env.GJC_SESSION_ID = "test-session";
 	});
 
@@ -61,6 +69,8 @@ describe("GJC native skill-state hooks", () => {
 		}
 		if (originalCiDevChangedPaths === undefined) delete process.env.CI_DEV_CHANGED_PATHS;
 		else process.env.CI_DEV_CHANGED_PATHS = originalCiDevChangedPaths;
+		if (originalGithubWorkspace === undefined) delete process.env.GITHUB_WORKSPACE;
+		else process.env.GITHUB_WORKSPACE = originalGithubWorkspace;
 	});
 
 	const testEffectiveSkillConfig = {
