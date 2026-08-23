@@ -1429,7 +1429,7 @@ export class AcpAgent implements Agent {
 
 	async listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
 		if (params.cwd) this.#assertAbsoluteCwd(params.cwd);
-		const canonicalCwd = params.cwd === undefined ? undefined : await canonicalSessionCwd(params.cwd);
+		const canonicalCwd = params.cwd ? await canonicalSessionCwd(params.cwd) : undefined;
 		const adapter = await this.#brokerAdapter();
 		const listing = await collectAcpSessionList(input => adapter.global("session.list", input));
 		const listed = Array.isArray(listing.sessions) ? listing.sessions : [];

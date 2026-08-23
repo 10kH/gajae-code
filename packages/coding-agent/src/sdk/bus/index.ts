@@ -90,7 +90,7 @@ import { acpFinalTextFromMessage } from "../acp/final-text";
 import { ensureBroker } from "../broker/ensure";
 import { publishSessionHostRuntimeEvidence, type SessionHostRuntimePublication } from "../broker/lifecycle";
 import { processIncarnation } from "../broker/process-incarnation";
-import { SessionIndex } from "../broker/session-index";
+import { resolveSessionLocator, SessionIndex } from "../broker/session-index";
 import {
 	CAP_GATED_FRAME_KINDS,
 	createSdkSurfaceFactory,
@@ -7696,7 +7696,7 @@ export function createNotificationsExtension(
 					throwIfLifecycleStopped();
 					const index = await new SessionIndex(agentDir).open();
 					throwIfLifecycleStopped();
-					const locator = { repo: path.resolve(ctx.cwd), stateRoot: endpointStateRoot };
+					const locator = await resolveSessionLocator(ctx.cwd, endpointStateRoot);
 					const endpointMtimeMs = fs.statSync(path.join(endpointStateRoot, "sdk", `${id}.json`)).mtimeMs;
 					const hostProcessIncarnation = processIncarnation(process.pid);
 					await host.registerWithBroker({
