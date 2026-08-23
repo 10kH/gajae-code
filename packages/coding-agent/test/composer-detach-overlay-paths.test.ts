@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { Container, Input } from "@gajae-code/tui";
 import { getAgentDir, getDefaultTabWidth, getLogsDir, setAgentDir, setDefaultTabWidth } from "@gajae-code/utils";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
@@ -231,8 +232,8 @@ async function pinExclusiveDirState(): Promise<{ restore: () => Promise<void> }>
 			restoreEnvVar("GJC_CODING_AGENT_DIR", originalCodingAgentDir);
 			restoreEnvVar("HOME", originalHome);
 			homedirSpy.mockRestore();
-			await fs.rm(agentRoot, { recursive: true, force: true });
-			await fs.rm(homeRoot, { recursive: true, force: true });
+			await safeRm(agentRoot, { recursive: true, force: true });
+			await safeRm(homeRoot, { recursive: true, force: true });
 		},
 	};
 }
