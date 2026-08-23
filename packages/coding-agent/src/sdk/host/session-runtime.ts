@@ -4068,12 +4068,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							.listSessionIdentities()
 							.find(row => row.sessionId === input.sessionId && row.endpointGeneration === 0 && row.pid === process.pid)
 							?.masterRole;
+						const effectiveIncarnation = processIncarnation(process.pid);
 						const masterRole = masterAttestationForEffectiveHost({
 							masterCapability: options.masterCapability,
 							attestationEpoch: options.masterAttestationEpoch,
 							sessionId: input.sessionId,
 							pid: process.pid,
-							processIncarnation: processIncarnation(process.pid),
+							processIncarnation: effectiveIncarnation,
 							direct,
 						});
 						await index.append({
