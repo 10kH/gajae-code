@@ -43,6 +43,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.ownerAccessStrategy = undefined;
 	SessionStateLockTestHooks.probeProcessSignal = undefined;
 	SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
+	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
 	installExactIdentityNatives();
 	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -921,24 +922,9 @@ describe("coordinator session state lock", () => {
 		const lockFile = `${stateFile}.lock`;
 		const primary = new Error("primary state operation failure");
 		const release = new Error("owner release failure");
-		setSessionStateLockNativeBindings(() => ({
-			exactUnlink(target) {
-				if (target === lockFile) throw release;
-				try {
-					fsSync.unlinkSync(target);
-					return { ok: true };
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, code: "not_found" };
-					throw error;
-				}
-			},
-			snapshotDirectoryTree() {
-				throw new Error("unexpected directory snapshot");
-			},
-			exactRemoveDirectoryTree() {
-				throw new Error("unexpected directory removal");
-			},
-		}));
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = target => {
+			if (target === lockFile) throw release;
+		};
 
 		const observed = await withSessionStateFileLock(stateFile, () => {
 			throw primary;
@@ -948,6 +934,50 @@ describe("coordinator session state lock", () => {
 		expect(preservedPrimary).toBe(primary);
 		expect(preservedRelease).toBeInstanceOf(SessionStateLockUnavailableError);
 		expect((preservedRelease as Error & { cause?: unknown }).cause).toBe(release);
+	});
+
+	it("releases live owner records without the renameat2-based exact unlink primitive", async () => {
+		const { stateFile } = await seededRunningSession("lock-live-owner-portable-release");
+		const lockFile = `${stateFile}.lock`;
+		let exactUnlinkCalls = 0;
+		setSessionStateLockNativeBindings(() => ({
+			exactUnlink() {
+				exactUnlinkCalls++;
+				return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${lockFile}.quarantine` };
+			},
+			snapshotDirectoryTree() {
+				throw new Error("unexpected directory snapshot");
+			},
+			exactRemoveDirectoryTree() {
+				throw new Error("unexpected directory removal");
+			},
+		}));
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).resolves.toBe("entered");
+		expect(exactUnlinkCalls).toBe(0);
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+		expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+	});
+
+	it("refuses to unlink a successor that replaces a live owner record before release", async () => {
+		const { stateFile } = await seededRunningSession("lock-live-owner-successor");
+		const lockFile = `${stateFile}.lock`;
+		const successor = JSON.stringify({
+			pid: process.pid,
+			start_time: processStartTime(process.pid) ?? "unknown",
+			token: "live-owner-successor-token",
+		});
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = async target => {
+			if (target !== lockFile) return;
+			SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+			await fs.rm(target);
+			await fs.writeFile(target, successor);
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(await fs.readFile(lockFile, "utf8")).toBe(successor);
 	});
 
 	it("releases the owner record after a synchronous operation throw", async () => {

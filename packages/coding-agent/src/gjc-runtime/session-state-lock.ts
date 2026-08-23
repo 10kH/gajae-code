@@ -46,11 +46,11 @@ const LOCK_STALE_MS = 30_000;
  * filesystem, stopped in a debugger — is never broken by elapsed time. An ownerless claim
  * broken by age reintroduces exactly the concurrent create/unlink it exists to prevent.
  *
- * It needs no claim of its own because its every removal is identity-bound: `exactUnlink`
- * refuses unless the record is still byte-for-byte and inode-for-inode the one that was
- * judged, which is the atomic compare-and-delete `fs` does not offer. That is also why the
- * path is `<file>.lock.transition` and not the generic protocol's `.lock` directory — it
- * stays distinct from `<file>.lock` (whose regular-file owner format base writers read is
+ * It needs no claim of its own because contenders only create it exclusively or reclaim a
+ * dead owner. A live holder releases its own byte-and-inode-verified record; stale reclaim
+ * still uses `exactUnlink`'s atomic identity protocol. That is also why the path is
+ * `<file>.lock.transition` and not the generic protocol's `.lock` directory — it stays
+ * distinct from `<file>.lock` (whose regular-file owner format base writers read is
  * unchanged) and from the outer `locks/mutation.lock` (whose generic directory semantics
  * are likewise untouched).
  */
@@ -132,6 +132,12 @@ export const SessionStateLockTestHooks: {
 	 * configuration.
 	 */
 	ownerRecordWriteFault?: (file: string) => void | Promise<void>;
+	/**
+	 * @internal Runs after a live owner has been proven and immediately before its
+	 * final pathname capture for release. Tests use it to replace the pathname and
+	 * prove that live-owner cleanup refuses a successor.
+	 */
+	beforeCurrentOwnerRelease?: (file: string) => void | Promise<void>;
 	beforeLegacyDirectoryRemoval?: (lockDir: string) => void | Promise<void>;
 } = {};
 
@@ -661,15 +667,41 @@ async function createOwnerLock(file: string, owner: SessionStateLockOwner): Prom
 /**
  * Give up an owner record this process holds.
  *
- * A mismatch means something replaced our record while we held it. That successor is left
- * strictly alone and the caller is told the lock is no longer trustworthy, because the
- * alternative — deleting whatever is there now — is the exact bug this protocol exists to
- * remove.
+ * Live-owner release is already serialized by the transition claim: current writers cannot
+ * replace the pathname, and legacy writers observe this process incarnation as alive. Use a
+ * final no-follow identity capture followed by plain unlink so release also works on
+ * filesystems that reject Linux renameat2 exchange/no-replace (notably CephFS).
+ *
+ * Stale-owner reclaim still uses the native identity-bound detach protocol because no live
+ * owner or transition claim can vouch for that pathname. A mismatch here likewise leaves a
+ * successor strictly alone.
  */
-function releaseOwnerLock(file: string, held: LockOwnerSnapshot): void {
-	const outcome = exactUnlinkOwnerRecord(file, held);
-	if (outcome === "removed" || outcome === "absent") return;
-	throw new SessionStateLockUnavailableError(new Error(`Owner record could not be released: ${outcome}.`));
+async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<void> {
+	let owner: unknown;
+	try {
+		owner = JSON.parse(held.bytes);
+	} catch {
+		owner = null;
+	}
+	if (!validLockOwner(owner) || owner.pid !== process.pid || !sameOwnerIncarnation(owner)) {
+		throw new SessionStateLockUnavailableError(new Error("Owner record is not held by this process incarnation."));
+	}
+	try {
+		await SessionStateLockTestHooks.beforeCurrentOwnerRelease?.(file);
+	} catch (error) {
+		throw new SessionStateLockUnavailableError(error);
+	}
+	const current = await captureRegularLockOwner(file);
+	if (!current) return;
+	if (!sameLockOwnerSnapshot(current, held)) {
+		throw new SessionStateLockUnavailableError(new Error("Owner record changed before release."));
+	}
+	try {
+		await fs.unlink(file);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw new SessionStateLockUnavailableError(error);
+	}
 }
 
 /**
@@ -742,7 +774,7 @@ async function withLockPathTransition<T>(lockFile: string, transition: () => Pro
 			error => ({ ok: false as const, error }),
 		);
 		try {
-			releaseOwnerLock(transitionFile, held);
+			await releaseOwnerLock(transitionFile, held);
 		} catch (releaseError) {
 			// A claim that cannot be given up leaves the lock untrustworthy either way, so
 			// the typed refusal is what callers see; the transition's own fault rides along
