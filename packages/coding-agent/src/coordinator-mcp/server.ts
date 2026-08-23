@@ -5654,11 +5654,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			};
 			let admitted: CoordinatorSessionTransactionV1;
 			try {
-				admitted = await admitSessionClose(questionPaths, deletionEntry);
+				admitted = await admitSessionClose(questionPaths, deletionEntry, {
+					...(opts.reason === "idle_reaper" ? { idleBeforeMs: Date.now() - config.sessionIdleTtlMs } : {}),
+				});
 			} catch (error) {
 				if (error instanceof Error && error.message === "active_turn_exists") {
 					return { ok: false, reason: "active_turn", closed: false };
 				}
+				if (error instanceof Error && error.message === "session_not_idle")
+					return { ok: false, reason: "not_idle", closed: false };
 				throw error;
 			}
 			const projectionIds = {

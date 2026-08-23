@@ -1454,7 +1454,7 @@ async function pruneRetainedSessionIfEmpty(
 export async function admitSessionClose(
 	paths: CoordinatorStatePaths,
 	entry: NamespaceDeletionEntryV1,
-	options: { signal?: AbortSignal } = {},
+	options: { signal?: AbortSignal; idleBeforeMs?: number } = {},
 ): Promise<CoordinatorSessionTransactionV1> {
 	return await withNamespaceRegistry(
 		paths,
@@ -1483,6 +1483,13 @@ export async function admitSessionClose(
 					);
 					if (active || transaction.canonical.queue.active_turn_id !== null || reservedPrompt)
 						throw new Error("active_turn_exists");
+					if (options.idleBeforeMs !== undefined) {
+						const activityAt =
+							transaction.recovery.prompt_watermark_at ?? transaction.canonical.session.updated_at;
+						const activityMs = Date.parse(activityAt);
+						if (!Number.isFinite(activityMs) || activityMs > options.idleBeforeMs)
+							throw new Error("session_not_idle");
+					}
 					registry.deletions[entry.deletion_id] = existing ?? entry;
 					return transaction;
 				},
