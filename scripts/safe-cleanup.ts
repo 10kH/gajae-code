@@ -210,22 +210,42 @@ export function assessDeletionTarget(target: string, world: SafeCleanupWorld): D
 		}
 	})();
 	let canonical: string;
+	let present = exists;
 	if (exists) {
 		const real = tryRun(() => world.realpathSync(resolved));
 		if (real === undefined) {
-			return refuse(
-				"symlink-escape",
-				`refusing to delete ${resolved}: it exists but its real path could not be resolved`,
-			);
+			// Observed a moment ago, unresolvable now. A transient target -- a
+			// `<file>.lock` directory released by its owner between these two
+			// calls -- is simply gone, and a force removal of an absent path is a
+			// no-op, so aborting the whole process over that race is wrong.
+			// Re-observe before refusing: anything still present but unresolvable
+			// (symlink loop, unreadable parent) remains a genuine escape risk. An
+			// unreadable re-observation keeps the strict path, exactly as above.
+			const stillThere = (() => {
+				try {
+					return world.existsSync(resolved);
+				} catch {
+					return true;
+				}
+			})();
+			if (stillThere) {
+				return refuse(
+					"symlink-escape",
+					`refusing to delete ${resolved}: it exists but its real path could not be resolved`,
+				);
+			}
+			present = false;
+			canonical = resolved;
+		} else {
+			canonical = real;
 		}
-		canonical = real;
 	} else {
 		// Absent targets are a no-op for `force` removals; the lexical checks
 		// above have already run, which is all that can be checked offline.
 		canonical = resolved;
 	}
 
-	if (exists) {
+	if (present) {
 		for (const home of world.homeAliases) {
 			if (kit.equal(canonical, home)) {
 				return refuse(
@@ -255,7 +275,7 @@ export function assessDeletionTarget(target: string, world: SafeCleanupWorld): D
 	}
 
 	const lexicalRoot = world.allowedRoots.find((root) => kit.strictlyInside(resolved, root));
-	if (exists) {
+	if (present) {
 		const canonicalRoot = world.allowedRoots.find((root) => kit.strictlyInside(canonical, root));
 		// An explicitly registered, process-created fixture root outside the
 		// standard roots (see registerOwnedDeletionRoot) is the only additional
