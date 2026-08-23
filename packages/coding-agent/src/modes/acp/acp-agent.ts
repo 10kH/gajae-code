@@ -2739,7 +2739,7 @@ export class AcpAgent implements Agent {
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;
-		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
+		const isTerminal = event.type === "agent_end";
 		if (event.type === "notice" && event.source === "autorouting" && typeof event.message === "string") {
 			record.routingInactiveNotice = event.message;
 			return;
