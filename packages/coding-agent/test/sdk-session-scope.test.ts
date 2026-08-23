@@ -12,7 +12,9 @@ test("resolves canonical pwd, repo, global, and non-Git repo scope requests", as
 	const git = Bun.spawn(["git", "init", "-q", directory]);
 	await git.exited;
 	const locator = await resolveSessionLocator(directory, "/state");
-	const anchor = { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot };
+	const repoWorktree = locator.worktreeRoot;
+	if (repoWorktree === null) throw new Error("git worktree was not resolved");
+	const anchor = { cwd: locator.cwd, worktreeRoot: repoWorktree };
 
 	expect(await resolveScopeRequest({ version: 1, requested: "pwd", requestAnchor: anchor })).toEqual({
 		version: 1,
@@ -25,7 +27,7 @@ test("resolves canonical pwd, repo, global, and non-Git repo scope requests", as
 		version: 1,
 		requested: "repo",
 		requestAnchor: anchor,
-		resolved: { kind: "repo", worktreeRoot: locator.worktreeRoot },
+		resolved: { kind: "repo", worktreeRoot: repoWorktree },
 		resolution: "resolved",
 	});
 	expect(await resolveScopeRequest({ version: 1, requested: "global", requestAnchor: anchor })).toEqual({
@@ -60,10 +62,12 @@ test("canonicalizes symlinked anchors to one worktree identity", async () => {
 	const alias = `${directory}-alias`;
 	await fs.symlink(directory, alias);
 	const canonical = await resolveSessionLocator(directory, "/state");
+	const canonicalWorktree = canonical.worktreeRoot;
+	if (canonicalWorktree === null) throw new Error("git worktree was not resolved");
 	const aliased = await resolveScopeRequest({
 		version: 1,
 		requested: "repo",
-		requestAnchor: { cwd: alias, worktreeRoot: canonical.worktreeRoot },
+		requestAnchor: { cwd: alias, worktreeRoot: canonicalWorktree },
 	});
-	expect(aliased.requestAnchor).toEqual({ cwd: canonical.cwd, worktreeRoot: canonical.worktreeRoot });
+	expect(aliased.requestAnchor).toEqual({ cwd: canonical.cwd, worktreeRoot: canonicalWorktree });
 });
