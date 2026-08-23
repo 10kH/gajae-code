@@ -45,7 +45,7 @@ export interface RetentionPolicy {
 }
 export interface SessionIndexObservationDeps {
 	/** Test seam for the exact post-replay process-incarnation observation. */
-	processIncarnation?: (pid: number) => string | undefined;
+	processIncarnation?: (pid: number) => string | undefined | Promise<string | undefined>;
 }
 export interface SessionIndexEvent {
 	version: typeof SDK_STATE_VERSION;
@@ -1582,27 +1582,40 @@ export class SessionIndex {
 	 */
 	async generationStatus(sessionId: string, endpointGeneration: number): Promise<SessionGenerationIndexStatus> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
-		return await SessionIndex.#enqueue(indexPath, () =>
-			withSessionIndexLock("generation reconciliation", this.#agentDir, async () => {
-				await this.#replayUnderLock();
-				// Exact proof cannot reuse an incarnation observed before lock
-				// acquisition: the process can exit and its PID can be reused while
-				// replay awaits. Re-observe this session's registrations only after the
-				// locked replay, then classify against that same coherent index cut.
-				const probed = new Map<string, string | undefined>();
-				const observeIncarnation = this.#observationDeps.processIncarnation ?? processIncarnation;
-				for (const event of this.#events) {
-					if (event.type !== "host_registered" || event.sessionId !== sessionId) continue;
-					const recordedIncarnation = event.hostIncarnation ?? event.processIncarnation;
-					if (recordedIncarnation === undefined) continue;
-					probed.set(
-						`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}`,
-						observeIncarnation(event.pid),
-					);
-				}
-				return this.#generationStatusFromEvents(sessionId, endpointGeneration, probed);
-			}),
-		);
+		const observeIncarnation = this.#observationDeps.processIncarnation ?? processIncarnation;
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const plan = await SessionIndex.#enqueue(indexPath, () =>
+				withSessionIndexLock("generation reconciliation plan", this.#agentDir, async () => {
+					await this.#replayUnderLock();
+					return {
+						indexSeq: this.indexSeq,
+						registrations: this.#events
+							.filter(event => event.type === "host_registered" && event.sessionId === sessionId)
+							.map(event => ({
+								key: `${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}`,
+								pid: event.pid,
+							})),
+					};
+				}),
+			);
+			// OS incarnation probes may spawn platform helpers (PowerShell on Windows),
+			// so they must never run while the machine-global index lock is held.
+			// Probe after the planned replay, then accept the observations only if a
+			// second locked replay proves the index sequence did not change. A writer
+			// racing either cut causes a bounded retry rather than stale classification.
+			const probed = new Map<string, string | undefined>();
+			for (const registration of plan.registrations)
+				probed.set(registration.key, await observeIncarnation(registration.pid));
+			const result = await SessionIndex.#enqueue(indexPath, () =>
+				withSessionIndexLock("generation reconciliation commit", this.#agentDir, async () => {
+					await this.#replayUnderLock();
+					if (this.indexSeq !== plan.indexSeq) return undefined;
+					return this.#generationStatusFromEvents(sessionId, endpointGeneration, probed);
+				}),
+			);
+			if (result !== undefined) return result;
+		}
+		return { status: "unknown", observedIndexSeq: this.indexSeq, reason: "reconciliation_incomplete" };
 	}
 
 	#generationStatusFromEvents(

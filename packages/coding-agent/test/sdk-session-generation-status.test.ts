@@ -204,6 +204,41 @@ describe("SessionRouter exact generation status", () => {
 		});
 	});
 
+	test("retries when the index changes between the observation plan and commit", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-plan-race-"));
+		tempDirs.push(agentDir);
+		const locator = { repo: agentDir, stateRoot: path.join(agentDir, ".gjc", "state") };
+		let index: SessionIndex;
+		let raced = false;
+		index = await new SessionIndex(
+			agentDir,
+			{},
+			{
+				processIncarnation: async () => {
+					if (!raced) {
+						raced = true;
+						await index.append({
+							type: "host_unregistered",
+							sessionId: "plan-race-session",
+							locator,
+							endpointGeneration: 7,
+							pid: process.pid,
+							hostIncarnation: "linux:700",
+						});
+					}
+					return "linux:700";
+				},
+			},
+		).open();
+		await register(index, locator, "plan-race-session", 7, { hostIncarnation: "linux:700" });
+		const router = new SessionRouter({ agentDir, deps: { createIndex: () => index } });
+
+		const status = await router.generationStatus("plan-race-session", 7);
+		expect(raced).toBe(true);
+		expect(["current", "retired"]).toContain(status.status);
+		expect((await router.generationStatus("plan-race-session", 7)).status).toBe("retired");
+	});
+
 	test("fails generation reuse and wrap-like races closed instead of returning retired", async () => {
 		const { index, locator, router } = await fixture();
 		await register(index, locator, "reused-session", 11, { hostIncarnation: "linux:100" });
