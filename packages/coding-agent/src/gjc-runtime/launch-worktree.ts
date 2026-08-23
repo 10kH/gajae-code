@@ -466,11 +466,32 @@ export interface PreparedLaunchWorktree {
 	worktree: GjcLaunchWorktreeResult | { enabled: false };
 }
 
-export function prepareLaunchWorktree(cwd: string, args: string[]): PreparedLaunchWorktree {
+export interface StagedLaunchWorktree {
+	remainingArgs: string[];
+	plan: GjcLaunchWorktreePlan | { enabled: false };
+}
+
+/**
+ * Resolves where a launch would put its worktree without creating anything.
+ *
+ * Callers that must decide something about the target path first — such as
+ * refusing to enter a worktree another live session still holds — need the plan
+ * before the mutation, and re-planning afterwards would spend the same git
+ * queries twice.
+ */
+export function stageLaunchWorktree(cwd: string, args: string[]): StagedLaunchWorktree {
 	const parsed = parseLaunchWorktreeMode(args);
-	const planned = planLaunchWorktree(cwd, parsed.mode);
-	const ensured = ensureLaunchWorktree(planned);
-	if (!ensured.enabled) return { cwd, args: parsed.remainingArgs, worktree: ensured };
+	return { remainingArgs: parsed.remainingArgs, plan: planLaunchWorktree(cwd, parsed.mode) };
+}
+
+/** Creates or reuses the staged worktree and returns the launch's effective cwd. */
+export function completeLaunchWorktree(cwd: string, staged: StagedLaunchWorktree): PreparedLaunchWorktree {
+	const ensured = ensureLaunchWorktree(staged.plan);
+	if (!ensured.enabled) return { cwd, args: staged.remainingArgs, worktree: ensured };
 	ensureReusableNodeModules(ensured.repoRoot, ensured.worktreePath);
-	return { cwd: ensured.worktreePath, args: parsed.remainingArgs, worktree: ensured };
+	return { cwd: ensured.worktreePath, args: staged.remainingArgs, worktree: ensured };
+}
+
+export function prepareLaunchWorktree(cwd: string, args: string[]): PreparedLaunchWorktree {
+	return completeLaunchWorktree(cwd, stageLaunchWorktree(cwd, args));
 }
