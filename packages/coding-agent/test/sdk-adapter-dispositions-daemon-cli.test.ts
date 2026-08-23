@@ -10,13 +10,14 @@
  *
  * Coverage is byte-identical to the original monolithic file's daemonCli loop.
  */
-import { test } from "bun:test";
+import { expect, test } from "bun:test";
 import {
 	adapterPrefix,
 	assertDaemonCliRow,
 	expectedOutcome,
 	type MachineAdapter,
 	OPERATIONS,
+	runDaemonCli,
 } from "./helpers/sdk-adapter-dispositions-shared";
 
 const adapter: MachineAdapter = "daemonCli";
@@ -31,3 +32,22 @@ for (const operation of OPERATIONS) {
 		}, 60_000);
 	}
 }
+
+test("raw global session.spawn rejects capability-shaped input before dispatch", async () => {
+	const result = await runDaemonCli({
+		action: "raw",
+		rawAction: "global",
+		operation: "session.spawn",
+		jsonInput: JSON.stringify({
+			cwd: process.cwd(),
+			task: "adapter disposition probe",
+			masterCapability: "capability-shaped-probe",
+			model: "openai/gpt-4o-mini",
+			profile: "default",
+		}),
+	});
+	expect(result).toMatchObject({
+		exitCode: 1,
+		output: { ok: false, error: { code: "adapter_operation_prohibited" } },
+	});
+});

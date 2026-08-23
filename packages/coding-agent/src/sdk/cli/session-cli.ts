@@ -204,6 +204,10 @@ function isEndpointOperation(operation: string): boolean {
 	return operation === "session.get_endpoint";
 }
 
+function isRawSpawnOperation(kind: OperationKind, operation: string): boolean {
+	return kind === "global" && operation === "session.spawn";
+}
+
 function isLifecycleOperation(operation: string): operation is LifecycleMutationOperation {
 	return (
 		operation === "session.create" ||
@@ -1395,6 +1399,12 @@ export async function runSdkSessionCli(
 		const kind = rawKind(requireValue(action, "<verb>"), args);
 		if (!kind) throw new SdkSessionCliError("usage", "raw requires one of: control, query, global.", 2);
 		const operation = kind === "query" ? requireValue(args.query, "--query") : requireValue(args.operation, "--op");
+		if (isRawSpawnOperation(kind, operation))
+			throw new SdkSessionCliError(
+				"adapter_operation_prohibited",
+				"session.spawn is unavailable through the SDK session CLI.",
+				1,
+			);
 		const dispositionError = cliOperationError(kind, operation);
 		if (dispositionError) throw new SdkSessionCliError(dispositionError.code, dispositionError.message, 1);
 		if (isEndpointOperation(operation))

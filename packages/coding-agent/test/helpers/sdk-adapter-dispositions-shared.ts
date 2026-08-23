@@ -45,7 +45,7 @@ const parityRowsCache: ParityRow[] = (
 		rows: ParityRow[];
 	}
 ).rows;
-expect(parityRowsCache).toHaveLength(582);
+	expect(parityRowsCache).toHaveLength(588);
 
 export const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",
@@ -266,6 +266,14 @@ export function inputFor(operation: Operation, secret = false): Record<string, u
 			return { id: "missing-extension", on: true };
 		case "session.cwd.move":
 			return { path: process.cwd() };
+		case "session.spawn":
+			return {
+				cwd: process.cwd(),
+				task: "adapter disposition probe",
+				masterCapability: "capability-shaped-probe",
+				model: "openai/gpt-4o-mini",
+				profile: "default",
+			};
 		case "session.get_endpoint":
 			return { sessionId: "missing-session" };
 		case "transcript.body":

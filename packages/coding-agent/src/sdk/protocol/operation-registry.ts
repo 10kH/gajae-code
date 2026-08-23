@@ -135,6 +135,7 @@ const globals = [
 	["session.resume", "Resume a saved session."],
 	["session.close", "Close a saved session."],
 	["session.delete", "Delete a saved session."],
+	["session.spawn", "Spawn a task-seeded background child session (local interactive master only)."],
 ] as const;
 
 const queries = [
@@ -351,7 +352,16 @@ export const OPERATIONS: readonly Operation[] = [
 						})
 					: ["G03", "G04", "G05", "G06", "G07"].includes(id)
 						? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
-						: dispositions(),
+						: id === "G08"
+							? dispositions({
+									telegram: "prohibited",
+									discord: "prohibited",
+									slack: "prohibited",
+									mcp: "prohibited",
+									acp: "prohibited",
+									daemonCli: "prohibited",
+								})
+							: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};
 	}),
