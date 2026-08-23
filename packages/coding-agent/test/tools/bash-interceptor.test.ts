@@ -10,6 +10,7 @@ import { disposeAllShellSessions, getShellSessionCount } from "../../src/exec/ba
 import type { ToolSession } from "../../src/tools";
 import { BashTool, type BashToolInput } from "../../src/tools/bash";
 import * as shellSnapshot from "../../src/utils/shell-snapshot";
+import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
 afterEach(async () => {
 	vi.restoreAllMocks();
@@ -32,6 +33,7 @@ function createBashTool(rules: BashInterceptorRule[]): BashTool {
 			getBashInterceptorRules() {
 				return rules;
 			},
+			...stubBashExecutorSettings,
 		},
 	} as unknown as ToolSession;
 
@@ -109,6 +111,7 @@ describe("BashTool head/tail stripping", () => {
 				getBashInterceptorRules() {
 					return [];
 				},
+				...stubBashExecutorSettings,
 			},
 		} as unknown as ToolSession;
 		return new BashTool(session);
@@ -164,6 +167,7 @@ describe("BashTool restricted role-agent allowlist", () => {
 				getBashInterceptorRules() {
 					return [];
 				},
+				...stubBashExecutorSettings,
 			},
 		} as unknown as ToolSession;
 		return new BashTool(session);
