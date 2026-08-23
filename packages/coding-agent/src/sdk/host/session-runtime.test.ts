@@ -949,6 +949,10 @@ describe("SessionSdkSessionRuntime", () => {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
+			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
+				await options?.onPreflightAcceptCommit?.();
+				await new Promise<void>(() => {});
+			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
 		const reconciliationStore = createReconciliationStore({
@@ -1307,6 +1311,10 @@ describe("SessionSdkSessionRuntime", () => {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
+			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
+				await options?.onPreflightAcceptCommit?.();
+				await new Promise<void>(() => {});
+			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
 		const reconciliationStore = createReconciliationStore({
@@ -1372,6 +1380,8 @@ describe("SessionSdkSessionRuntime", () => {
 				ctx,
 			);
 			abortRelease.resolve();
+			await Bun.sleep(50);
+			expect(transport.sent.some(frame => frame.id === "successor-abort")).toBe(false);
 			await handlers.get("agent_end")?.({ type: "agent_end" }, ctx); // successor
 			const deadline = Date.now() + 5_000;
 			while (!transport.sent.some(frame => frame.id === "successor-abort")) {
