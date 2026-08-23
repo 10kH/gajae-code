@@ -10,18 +10,18 @@ import {
 interface GatedCall {
 	name: string;
 	release: () => void;
+	started: Promise<void>;
 }
 
 function gatedEffect(name: string): { effect: () => Promise<void>; call: GatedCall } {
-	let release!: () => void;
-	const settled = new Promise<void>(resolve => {
-		release = resolve;
-	});
+	const settled = Promise.withResolvers<void>();
+	const started = Promise.withResolvers<void>();
 	return {
 		effect: async () => {
-			await settled;
+			started.resolve();
+			await settled.promise;
 		},
-		call: { name, release },
+		call: { name, release: settled.resolve, started: started.promise },
 	};
 }
 
@@ -209,6 +209,7 @@ describe("inbound reaction transition ordering", () => {
 			},
 		});
 		await acceptedPromise;
+		await consumed.call.started;
 		// A replayed accepted ack arriving now must chain behind the in-flight
 		// consumed transition (and then be skipped by its terminal state), not
 		// start concurrently against it.
@@ -223,6 +224,45 @@ describe("inbound reaction transition ordering", () => {
 
 		expect(order).toEqual(["queued", "consumed"]);
 		expect(sequencer.isTerminal(802)).toBe(true);
+		await Bun.sleep(0);
+		expect(sequencer.debugChainCount()).toBe(0);
+	});
+
+	test("a rejected predecessor cannot drop an installed successor tail", async () => {
+		const sequencer = new InboundReactionSequencer();
+		const order: string[] = [];
+		const failed = Promise.withResolvers<void>();
+		const consumed = gatedEffect("consumed");
+
+		const failedPromise = sequencer.apply(803, {
+			terminal: false,
+			effect: async () => {
+				order.push("failing-queued");
+				await failed.promise;
+			},
+		});
+		const consumedPromise = sequencer.apply(803, {
+			terminal: true,
+			effect: async () => {
+				order.push("consumed");
+				await consumed.effect();
+			},
+		});
+
+		failed.reject(new Error("queued marker failed"));
+		await expect(failedPromise).rejects.toThrow("queued marker failed");
+		await consumed.call.started;
+		const replayedPromise = sequencer.apply(803, {
+			terminal: false,
+			effect: async () => {
+				order.push("replayed-queued");
+			},
+		});
+
+		consumed.call.release();
+		await Promise.all([consumedPromise, replayedPromise]);
+		expect(order).toEqual(["failing-queued", "consumed"]);
+		expect(sequencer.isTerminal(803)).toBe(true);
 		await Bun.sleep(0);
 		expect(sequencer.debugChainCount()).toBe(0);
 	});
