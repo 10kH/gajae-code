@@ -97,17 +97,25 @@ async function createFixture(
 		});
 	};
 	const sendFailed = (code: FailedCode): void => {
+		const outcome = {
+			kind: "failed" as const,
+			code,
+			message: `${code} from fixture`,
+			provenance: code === "prompt_failed" ? ("agent_failed" as const) : ("deadline" as const),
+		};
 		send({
 			type: "agent_failed",
 			sessionId,
 			commandId,
 			turnId,
-			outcome: {
-				kind: "failed",
-				code,
-				message: `${code} from fixture`,
-				provenance: code === "prompt_failed" ? "agent_failed" : "deadline",
-			},
+			outcome,
+		});
+		send({
+			type: "agent_end",
+			sessionId,
+			commandId,
+			turnId,
+			outcome,
 		});
 	};
 	const sendAssistantMessage = (text: string): void => {
@@ -492,7 +500,7 @@ test("ACP logs incomplete-correlation terminals dropped from an acknowledged pro
 	}
 });
 
-for (const terminalType of ["agent_end", "agent_failed"] as const) {
+for (const terminalType of ["agent_end"] as const) {
 	test(`ACP rejects a matching ${terminalType} without a normalized outcome before idle`, async () => {
 		const fixture = await createFixture();
 		try {
@@ -546,6 +554,16 @@ test("ACP preserves the fixed settlement-grace invalid-terminal rejection", asyn
 				message: "Prompt resources did not settle before the terminalization grace expired.",
 			},
 		});
+		fixture.sendTerminal({
+			type: "agent_end",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: {
+				code: "terminal_uncertain",
+				message: "Prompt resources did not settle before the terminalization grace expired.",
+			},
+		});
 		await expect(bounded(pending, "unsettled prompt rejection")).rejects.toMatchObject({
 			code: "connection_closed",
 			message:
@@ -565,6 +583,16 @@ test("ACP releases the running phase and accepts a new prompt after a settlement
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendTerminal({
 			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: {
+				code: "terminal_uncertain",
+				message: "Prompt resources did not settle before the terminalization grace expired.",
+			},
+		});
+		fixture.sendTerminal({
+			type: "agent_end",
 			sessionId: "prompt-terminal-session",
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",
