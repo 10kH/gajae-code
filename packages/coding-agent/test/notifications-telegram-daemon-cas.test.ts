@@ -53,6 +53,11 @@ test("machine-local identity parsing is strict and machine IDs are domain-hashed
 	});
 	expect(hostId).toMatch(/^[0-9a-f]{64}$/);
 	expect(hostId).not.toContain("00112233445566778899aabbccddeeff");
+	const fallbackHostId = await loadInstallationHostId({
+		platform: "linux",
+		readFile: async file => (file === "/etc/machine-id" ? "malformed" : "ffeeddccbbaa99887766554433221100\n"),
+	});
+	expect(fallbackHostId).toMatch(/^[0-9a-f]{64}$/);
 	await expect(
 		loadInstallationHostId({
 			platform: "linux",
