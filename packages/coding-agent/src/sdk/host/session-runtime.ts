@@ -421,6 +421,7 @@ interface InvocationRecord extends InvocationCorrelation {
 	clientRef?: string;
 	status: InvocationStatus;
 	acceptedAt: number;
+	deadlineRecoveryPending?: boolean;
 	startedAt?: number;
 	terminalAt?: number;
 	error?: { code: string; message: string };
@@ -438,6 +439,7 @@ export interface InvocationReconciliation {
 	): Promise<void>;
 	lookup(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
 	lookupResult(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
+	listDeadlineRecoveryPendingPrompts(): Array<{ correlation: InvocationCorrelation; acceptedAt: number }>;
 	hydrate(): Promise<void>;
 	claimPendingOutcome(
 		kind: InvocationKind,
@@ -790,6 +792,19 @@ export function createInvocationReconciliation(
 		lookupResult(kind, selector) {
 			const result = this.lookup(kind, selector) as Record<string, unknown>;
 			return result.status === "unknown" ? result : { kind, ...result };
+		},
+		listDeadlineRecoveryPendingPrompts() {
+			return [...records.values()]
+				.filter(
+					record =>
+						record.kind === "prompt" &&
+						record.deadlineRecoveryPending === true &&
+						record.terminalAt === undefined,
+				)
+				.map(record => ({
+					correlation: { commandId: record.commandId, turnId: record.turnId },
+					acceptedAt: record.acceptedAt,
+				}));
 		},
 		hydrate,
 		async claimPendingOutcome(kind, correlation, outcome) {
@@ -3331,6 +3346,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			correlation: InvocationCorrelation;
 			connectionId: string | undefined;
 		}> = [];
+		for (const { correlation, acceptedAt } of reconciliation.listDeadlineRecoveryPendingPrompts())
+			deadlineManager.recoverPending(correlation, acceptedAt);
 		const openLifecycleBatches: Array<{
 			invocations: Array<{
 				kind: InvocationKind;
