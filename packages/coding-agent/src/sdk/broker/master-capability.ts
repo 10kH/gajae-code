@@ -6,7 +6,7 @@ import type { MasterCapabilityVerifier } from "./spawn-authority";
 
 const MASTER_CAPABILITY_VERIFY_TIMEOUT_MS = 2_000;
 
-type SessionEndpoint = {
+export type SessionEndpoint = {
 	url: string;
 	token: string;
 };
@@ -80,7 +80,8 @@ function adoptedDirectAttestation(
 	});
 }
 
-async function readEndpoint(record: IndexedSession): Promise<SessionEndpoint | undefined> {
+/** Reads and validates a registered host's authenticated endpoint record. */
+export async function readEndpoint(record: IndexedSession): Promise<SessionEndpoint | undefined> {
 	if (record.endpointMtimeMs === undefined) return undefined;
 	try {
 		const endpointPath = path.join(record.locator.stateRoot, "sdk", `${record.sessionId}.json`);

@@ -942,6 +942,64 @@ function command(broker: Broker): LifecycleCommand {
 	return lifecycleCommandResolversForTest.get(broker)?.() ?? resolveSdkInternalSpawnCommand("session-host-internal");
 }
 
+/**
+ * Reuses the ordinary lifecycle host bootstrap without performing its direct
+ * process spawn. Broker-owned substrate providers receive this exact argv/env
+ * pair and remain the only launch authority for session.spawn.
+ */
+export type SpawnChildHostLaunch = {
+	childId: string;
+	cwd: string;
+	stateRoot: string;
+	argv: readonly string[];
+	env: Readonly<Record<string, string>>;
+	effectMarker: string;
+};
+
+export function prepareSpawnChildHostLaunch(
+	broker: Broker,
+	input: { cwd: string; modelId?: string; modelPreset?: string; childId?: string; receivedAt?: number },
+): SpawnChildHostLaunch {
+	const cwd = path.resolve(input.cwd);
+	const childId = input.childId ?? randomUUID();
+	const stateRoot = defaultStateRoot(cwd);
+	const effectMarker = randomUUID();
+	const deadlines = deriveLifecycleDeadlines(input.receivedAt ?? Date.now(), DEFAULT_READINESS_TIMEOUT_MS);
+	const request: SessionLifecycleLaunchRequest = {
+		operation: "session.create",
+		sessionId: childId,
+		cwd,
+		stateRoot,
+		effectMarker,
+		...deadlines,
+		...(input.modelId === undefined ? {} : { modelId: input.modelId }),
+		...(input.modelPreset === undefined ? {} : { modelPreset: input.modelPreset }),
+	};
+	const cmd = command(broker);
+	const inherited = "kind" in cmd ? cmd.env : process.env;
+	const env = Object.fromEntries(
+		Object.entries(inherited).filter(
+			(entry): entry is [string, string] => entry[0] !== "GJC_MASTER_CAPABILITY" && typeof entry[1] === "string",
+		),
+	);
+	return {
+		childId,
+		cwd,
+		stateRoot,
+		argv: [cmd.file, ...cmd.args],
+		env: {
+			...env,
+			GJC_AGENT_DIR: broker.settings.agentDir,
+			GJC_CODING_AGENT_DIR: broker.settings.agentDir,
+			GJC_SESSION_ID: childId,
+			GJC_STATE_ROOT: stateRoot,
+			GJC_LIFECYCLE_REQUEST_ID: effectMarker,
+			GJC_SDK_LIFECYCLE_REQUEST: JSON.stringify(request),
+		},
+		effectMarker,
+	};
+}
+
 const lifecycleMarkerPath = (root: string, id: string) => path.join(root, "sdk", `${id}.lifecycle.json`);
 const lifecycleReadyPath = (root: string, id: string) => path.join(root, "sdk", `${id}.lifecycle.ready.json`);
 const lifecycleFailurePath = (root: string, id: string, effectMarker: string) =>

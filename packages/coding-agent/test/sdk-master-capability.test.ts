@@ -78,6 +78,23 @@ async function spawn(broker: Broker, suppliedCapability = capability): Promise<u
 	);
 }
 
+const spawnSubstrateFake = {
+	launch: async () => ({
+		ok: true as const,
+		proof: { substrateKind: "headless" as const, providerIdentity: "test-provider", pid: 4242, processIncarnation: "inc-4242" },
+	}),
+	verify: async () => "verified" as const,
+	close: async () => ({ ok: true }),
+};
+const spawnPromptLayerFake = {
+	awaitRegistration: async (input: { childId: string }) => ({
+		ok: true as const,
+		registration: { sessionId: input.childId, endpointGeneration: 1, pid: 4242 },
+	}),
+	dispatch: async () => ({ kind: "accepted" as const, commandId: "cmd-1", turnId: "turn-1", acceptedAt: Date.now() }),
+	reconcile: async () => ({ status: "terminal_ok" as const, commandId: "cmd-1", turnId: "turn-1" }),
+};
+
 describe("master capability effective-host verification", () => {
 	it("requires an adopted live attachment, rejects stale replies and leaves no capability material on disk", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-master-capability-"));
@@ -95,7 +112,7 @@ describe("master capability effective-host verification", () => {
 			{ type: "host_registered", sessionId, locator, endpointGeneration: 0, pid: process.pid, hostIncarnation, masterRole: attestation },
 			1,
 		);
-		const broker = new Broker({ agentDir });
+		const broker = new Broker({ agentDir, spawnSubstrateProvider: spawnSubstrateFake, spawnPromptLayer: spawnPromptLayerFake });
 		await broker.start();
 		let host: { stop: () => void } | undefined;
 		try {
@@ -118,7 +135,7 @@ describe("master capability effective-host verification", () => {
 				2,
 			);
 			await writeIndex(agentDir, [direct, effective]);
-			expect(await spawn(broker)).toMatchObject({ ok: true, result: { code: "spawn_admitted" } });
+			expect(await spawn(broker)).toMatchObject({ ok: true, result: { code: "spawn_accepted", seed: { phase: "accepted" } } });
 			expect(await spawn(broker, "wrong-capability")).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
 
 			host.stop();

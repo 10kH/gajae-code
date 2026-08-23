@@ -31,10 +31,16 @@ import {
 import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
 import {
 	type MasterCapabilityVerifier,
+	isSpawnSubstrateProof,
+	type SeedDeliveryV2,
 	SpawnAuthorityStore,
+	type SpawnAuthorityV1,
 	type SpawnClaimV2,
+	type SpawnSubstrateProof,
+	type SpawnSubstrateProvider,
 } from "./spawn-authority";
-import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
+import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId, prepareSpawnChildHostLaunch } from "./lifecycle";
+import { createSpawnSubstrateProvider } from "./spawn-substrate";
 import {
 	type LifecycleDurableEffectsReceipt,
 	LifecycleLedger,
@@ -48,6 +54,7 @@ import {
 	SessionIndex,
 	type SessionList,
 } from "./session-index";
+import { SdkClient, SdkClientError } from "../client/client";
 import {
 	resolveScopeRequest,
 	scopeMatchesLocator,
@@ -56,7 +63,7 @@ import {
 	type ResolvedScopeV1,
 	type ScopeRequestV1,
 } from "./session-scope";
-import { createMasterCapabilityVerifier } from "./master-capability";
+import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -69,6 +76,10 @@ export interface BrokerSettings {
 	/** Broker-owned migration policy. Client lifecycle frames cannot select it. */
 	resolveDirectoryMigration?: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
 	/** Live-only, host-mediated capability verifier. It retains no request input. */
+	/** Exact managed-substrate authority. Tests inject an in-memory provider. */
+	spawnSubstrateProvider?: SpawnSubstrateProvider;
+	/** Ordered Q26 host control seam; production uses exact endpoint attachments. */
+	spawnPromptLayer?: SpawnPromptLayer;
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
 }
 
@@ -81,6 +92,8 @@ type ResolvedBrokerSettings = {
 	heartbeatTtlMs: number;
 	resolveDirectoryMigration: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
+	spawnSubstrateProvider?: SpawnSubstrateProvider;
+	spawnPromptLayer?: SpawnPromptLayer;
 };
 
 function modelResolutionCwd(input: Record<string, unknown>): string | undefined {
@@ -276,8 +289,39 @@ type SpawnInFlight = {
 	completion: Promise<BrokerResponse>;
 	resolve: (response: BrokerResponse) => void;
 	claimId?: string;
-	phase?: "prepared";
+	phase?: SpawnClaimV2["state"];
 };
+
+export type SpawnHostRegistration = {
+	sessionId: string;
+	endpointGeneration: number;
+	pid: number;
+	processIncarnation?: string;
+};
+
+export type SpawnPromptDispatch =
+	| { kind: "accepted"; commandId: string; turnId: string; acceptedAt: number }
+	| { kind: "pre_send_rejected" }
+	| { kind: "uncertain" };
+
+export type SpawnQ26Reconciliation = {
+	status: "accepted" | "in_flight" | "terminal_ok" | "failed" | "unknown";
+	clientRef?: string;
+	commandId?: string;
+	turnId?: string;
+	acceptedAt?: number;
+};
+
+/** Q26-only host control seam. It never receives or returns durable request material. */
+export interface SpawnPromptLayer {
+	awaitRegistration(input: {
+		childId: string;
+		cwd: string;
+		stateRoot: string;
+	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }>;
+	dispatch(input: { sessionId: string; task: string; clientRef: string }): Promise<SpawnPromptDispatch>;
+	reconcile(input: { sessionId: string; clientRef: string }): Promise<SpawnQ26Reconciliation>;
+}
 
 type SpawnAdmissionInput = {
 	task: string;
@@ -345,6 +389,66 @@ function sessionListLimit(input: Record<string, unknown>): number | BrokerRespon
 
 function isBrokerResponse(value: unknown): value is BrokerResponse {
 	return typeof value === "object" && value !== null && "ok" in value && typeof value.ok === "boolean";
+}
+
+const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
+const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
+const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
+
+/** Rebuilds the provider proof from durable authority facts only. */
+function spawnProofFromAuthority(authority: SpawnAuthorityV1): SpawnSubstrateProof {
+	return {
+		substrateKind: authority.substrateKind,
+		providerIdentity: authority.providerIdentity,
+		...(authority.nativeSessionId === undefined ? {} : { nativeSessionId: authority.nativeSessionId }),
+		...(authority.pid === undefined ? {} : { pid: authority.pid }),
+		...(authority.processIncarnation === undefined ? {} : { processIncarnation: authority.processIncarnation }),
+		...(authority.ownerGeneration === undefined ? {} : { ownerGeneration: authority.ownerGeneration }),
+		...(authority.stateFileProof === undefined ? {} : { stateFileProof: authority.stateFileProof }),
+	};
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function safeSpawnOpaque(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= 512;
+}
+
+function q26FromResponse(value: unknown): SpawnQ26Reconciliation {
+	const outer = recordValue(value);
+	const result = recordValue(outer?.result) ?? outer;
+	const rawStatus = result?.status;
+	const status =
+		rawStatus === "accepted" || rawStatus === "in_flight" || rawStatus === "terminal_ok" || rawStatus === "failed"
+			? rawStatus
+			: "unknown";
+	return {
+		status,
+		...(safeSpawnOpaque(result?.clientRef) ? { clientRef: result.clientRef } : {}),
+		...(safeSpawnOpaque(result?.commandId) ? { commandId: result.commandId } : {}),
+		...(safeSpawnOpaque(result?.turnId) ? { turnId: result.turnId } : {}),
+		...(typeof result?.acceptedAt === "number" && Number.isSafeInteger(result.acceptedAt) && result.acceptedAt >= 0
+			? { acceptedAt: result.acceptedAt }
+			: {}),
+	};
+}
+
+function promptAcceptanceFromResponse(
+	value: unknown,
+	clientRef: string,
+): { commandId: string; turnId: string } | undefined {
+	const outer = recordValue(value);
+	const result = recordValue(outer?.result) ?? outer;
+	if (
+		result?.accepted !== true ||
+		!safeSpawnOpaque(result.commandId) ||
+		!safeSpawnOpaque(result.turnId) ||
+		(result.clientRef !== undefined && result.clientRef !== clientRef)
+	)
+		return undefined;
+	return { commandId: result.commandId, turnId: result.turnId };
 }
 
 function normalizeAliasedString(
@@ -926,6 +1030,7 @@ export class Broker {
 	#spawnInFlight = new Map<string, SpawnInFlight>();
 	#spawnTasks = new WeakMap<SpawnInFlight, string>();
 	#spawnAuthority: SpawnAuthorityStore | null = null;
+	#spawnPromptLayer: SpawnPromptLayer;
 	#admitted = new Set<Promise<void>>();
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 	#publication: RetainedBrokerDiscovery | null = null;
@@ -958,12 +1063,19 @@ export class Broker {
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),
 			masterCapabilityVerifier: settings.masterCapabilityVerifier,
+			spawnSubstrateProvider: settings.spawnSubstrateProvider,
+			spawnPromptLayer: settings.spawnPromptLayer,
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
 		if (!this.settings.masterCapabilityVerifier)
 			this.settings.masterCapabilityVerifier = createMasterCapabilityVerifier(this.index);
+		this.#spawnPromptLayer = settings.spawnPromptLayer ?? {
+			awaitRegistration: async input => await this.#awaitSpawnHostRegistration(input),
+			dispatch: async input => await this.#dispatchSpawnPrompt(input),
+			reconcile: async input => await this.#reconcileSpawnPrompt(input),
+		};
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
 		const completion = Promise.withResolvers<void>();
 		this.#completion = completion.promise;
@@ -996,7 +1108,7 @@ export class Broker {
 		this.#spawnInFlight.set(lifecycleIdentity, inFlight);
 		this.#spawnTasks.set(inFlight, admission.task);
 		let response: BrokerResponse | undefined;
-		let retainedOwner = false;
+		let becameOwner = false;
 		try {
 			let verified: { allowed: boolean };
 			try {
@@ -1019,25 +1131,514 @@ export class Broker {
 			if (decision.kind === "idempotency_conflict") return (response = error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim"));
 			if (decision.kind === "in_progress") return (response = error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
 			if (decision.kind === "terminal_uncertain") return (response = error("terminal_uncertain", "session.spawn outcome is uncertain"));
-			if (decision.kind === "terminal" || decision.kind === "replay") return (response = error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
+			if (decision.kind === "terminal") return (response = this.#spawnTerminalResponse(decision.claim));
+			if (decision.kind === "replay") return (response = await this.#reconcileSpawnReplay(lifecycleIdentity, decision.claim));
+			becameOwner = true;
 			inFlight.claimId = decision.claim.claimId;
-			inFlight.phase = "prepared";
-			// Claim fsync precedes this audit mirror. Stage 3 may add substrate work
+			inFlight.phase = decision.claim.state;
+			// Claim fsync precedes this audit mirror. Substrate work may start
 			// only after the mirror succeeds; a startup reconciler rebuilds it claim-first.
 			await this.ledger.begin(lifecycleIdentity, bindingMac);
-			retainedOwner = true;
-			return (response = { ok: true, result: { code: "spawn_admitted", claimId: decision.claim.claimId, phase: "prepared" } });
+			return (response = await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight));
 		} catch {
 			return (response = error("spawn_failed", "session.spawn admission could not be durably established"));
 		} finally {
 			completion.resolve(response ?? error("spawn_failed", "session.spawn admission failed"));
-			if (!retainedOwner) {
-				this.#spawnTasks.delete(inFlight);
-				this.#spawnInFlight.delete(lifecycleIdentity);
-				await this.#spawnAuthority?.releaseOwner(lifecycleIdentity);
+			this.#spawnTasks.delete(inFlight);
+			this.#spawnInFlight.delete(lifecycleIdentity);
+			if (becameOwner) await this.#spawnAuthority?.releaseOwner(lifecycleIdentity);
+		}
+	}
+
+	/** Safe, allowlisted spawn result projection; never carries request material. */
+	#spawnResult(code: "spawn_accepted" | "spawn_replayed", claim: SpawnClaimV2): Record<string, unknown> {
+		const authorityRecord = this.#spawnAuthority?.authority(claim.lifecycleIdentity);
+		const seed = claim.seed;
+		return {
+			code,
+			claimId: claim.claimId,
+			...(claim.childId === undefined ? {} : { sessionId: claim.childId }),
+			...(authorityRecord === undefined ? {} : { substrateKind: authorityRecord.substrateKind }),
+			...(seed === undefined
+				? {}
+				: {
+						seed: {
+							phase: seed.phase,
+							clientRef: seed.clientRef,
+							...(seed.commandId === undefined ? {} : { commandId: seed.commandId }),
+							...(seed.turnId === undefined ? {} : { turnId: seed.turnId }),
+							...(seed.lastQ26Status === undefined ? {} : { status: seed.lastQ26Status }),
+						},
+					}),
+		};
+	}
+
+	#spawnTerminalResponse(claim: SpawnClaimV2): BrokerResponse {
+		if (claim.state === "accepted") return { ok: true, result: this.#spawnResult("spawn_replayed", claim) };
+		if (claim.state === "pre_send_rejected")
+			return error("spawn_failed", "session.spawn was rejected before seed handoff");
+		return error("resource_gone", "session.spawn claim is closed");
+	}
+
+	#spawnSubstrateProvider(): SpawnSubstrateProvider {
+		return this.settings.spawnSubstrateProvider ?? (this.settings.spawnSubstrateProvider = createSpawnSubstrateProvider());
+	}
+
+	/**
+	 * Drives one exclusively owned claim through the durable spawn state machine.
+	 * Every effect is fenced by a prior fsynced transition: substrate_starting
+	 * precedes launch, dispatching (lease consumption) precedes the prompt frame,
+	 * and accepted precedes the success response.
+	 */
+	async #driveSpawn(
+		lifecycleIdentity: string,
+		claim: SpawnClaimV2,
+		admission: SpawnAdmissionInput,
+		inFlight: SpawnInFlight,
+	): Promise<BrokerResponse> {
+		const store = this.#spawnAuthority;
+		if (!store) return error("unavailable", "spawn authority is unavailable");
+		const provider = this.#spawnSubstrateProvider();
+		let current = claim;
+		let handedOff = false;
+		try {
+			if (current.state === "prepared") {
+				const prep = prepareSpawnChildHostLaunch(this, {
+					cwd: admission.cwd,
+					...(admission.modelId === undefined ? {} : { modelId: admission.modelId }),
+					...(admission.modelPreset === undefined ? {} : { modelPreset: admission.modelPreset }),
+				});
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "prepared",
+						to: "substrate_starting",
+						childId: prep.childId,
+					})
+				).claim;
+				inFlight.phase = current.state;
+				const launched = await provider.launch({
+					childSessionId: prep.childId,
+					cwd: prep.cwd,
+					argv: prep.argv,
+					env: prep.env,
+				});
+				if (!launched.ok) {
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "pre_send_rejected",
+						})
+					).claim;
+					return error("spawn_failed", "session.spawn substrate could not be safely established");
+				}
+				const registration = await this.#spawnPromptLayer.awaitRegistration({
+					childId: prep.childId,
+					cwd: prep.cwd,
+					stateRoot: prep.stateRoot,
+				});
+				if (!registration.ok) {
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: "substrate_starting",
+							to: "uncertain",
+						})
+					).claim;
+					return error("terminal_uncertain", "session.spawn child registration is uncertain");
+				}
+				const now = Date.now();
+				const proof = launched.proof;
+				const authorityRecord: SpawnAuthorityV1 = {
+					version: 1,
+					authorityId: randomBytes(24).toString("base64url"),
+					claimId: current.claimId,
+					childId: prep.childId,
+					ownerSessionId: admission.ownerSessionId,
+					lifecycleIdentity,
+					substrateKind: proof.substrateKind,
+					providerIdentity: proof.providerIdentity,
+					...(proof.nativeSessionId === undefined ? {} : { nativeSessionId: proof.nativeSessionId }),
+					...(proof.pid === undefined ? {} : { pid: proof.pid }),
+					...(proof.processIncarnation === undefined ? {} : { processIncarnation: proof.processIncarnation }),
+					...(proof.ownerGeneration === undefined ? {} : { ownerGeneration: proof.ownerGeneration }),
+					...(proof.stateFileProof === undefined ? {} : { stateFileProof: proof.stateFileProof }),
+					closeState: "active",
+					createdAt: now,
+					updatedAt: now,
+				};
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "substrate_starting",
+						to: "authority_active",
+						childId: prep.childId,
+						authority: authorityRecord,
+					})
+				).claim;
+				inFlight.phase = current.state;
+			}
+			if (current.state === "authority_active") {
+				const seed: SeedDeliveryV2 = {
+					version: 2,
+					phase: "prepared",
+					clientRef: randomBytes(24).toString("base64url"),
+				};
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "authority_active",
+						to: "seed_prepared",
+						seed,
+					})
+				).claim;
+				inFlight.phase = current.state;
+			}
+			if (current.state !== "seed_prepared" || current.preSendLease?.status !== "owned" || !current.seed || !current.childId)
+				return error("terminal_uncertain", "session.spawn cannot proceed from its durable state");
+			const childId = current.childId;
+			const preparedSeed = current.seed;
+			current = (
+				await store.persistTransition(lifecycleIdentity, {
+					claimId: current.claimId,
+					from: "seed_prepared",
+					to: "dispatching",
+					leaseEpoch: current.preSendLease.epoch,
+					seed: { ...preparedSeed, phase: "dispatching" },
+				})
+			).claim;
+			inFlight.phase = current.state;
+			handedOff = true;
+			const dispatched = await this.#spawnPromptLayer.dispatch({
+				sessionId: childId,
+				task: admission.task,
+				clientRef: preparedSeed.clientRef,
+			});
+			if (dispatched.kind === "accepted") {
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "dispatching",
+						to: "accepted",
+						seed: {
+							...preparedSeed,
+							phase: "accepted",
+							commandId: dispatched.commandId,
+							turnId: dispatched.turnId,
+							acceptedAt: dispatched.acceptedAt,
+							lastQ26Status: "accepted",
+							observedAt: Date.now(),
+						},
+					})
+				).claim;
+				inFlight.phase = current.state;
+				return { ok: true, result: this.#spawnResult("spawn_accepted", current) };
+			}
+			if (dispatched.kind === "pre_send_rejected") {
+				current = (
+					await store.persistTransition(lifecycleIdentity, {
+						claimId: current.claimId,
+						from: "dispatching",
+						to: "pre_send_rejected",
+						provenNoHandoff: true,
+						seed: { ...preparedSeed, phase: "pre_send_rejected" },
+					})
+				).claim;
+				inFlight.phase = current.state;
+				await this.#closeSpawnSubstrate(lifecycleIdentity);
+				return error("spawn_failed", "session.spawn seed delivery was rejected before handoff");
+			}
+			current = (
+				await store.persistTransition(lifecycleIdentity, {
+					claimId: current.claimId,
+					from: "dispatching",
+					to: "uncertain",
+					seed: { ...preparedSeed, phase: "uncertain" },
+				})
+			).claim;
+			inFlight.phase = current.state;
+			return error("terminal_uncertain", "session.spawn seed delivery outcome is uncertain");
+		} catch {
+			return handedOff
+				? error("terminal_uncertain", "session.spawn state could not be advanced durably")
+				: error("spawn_failed", "session.spawn could not be advanced durably");
+		}
+	}
+
+	/** Best-effort exact-close of a rejected claim's substrate; never name/PID-only. */
+	async #closeSpawnSubstrate(lifecycleIdentity: string): Promise<void> {
+		try {
+			const authorityRecord = this.#spawnAuthority?.authority(lifecycleIdentity);
+			if (!authorityRecord || authorityRecord.closeState !== "active") return;
+			const provider = this.#spawnSubstrateProvider();
+			const proof = spawnProofFromAuthority(authorityRecord);
+			if ((await provider.verify(proof)) !== "verified") return;
+			await provider.close(proof);
+		} catch {
+			// Close is reconciled again by the reaper path; failure retains authority.
+		}
+	}
+
+	/**
+	 * Resolves a joined non-owner claim from stored facts only. dispatching+
+	 * replays exclusively through the stored opaque Q26 clientRef; unknown
+	 * outcomes stay retained-uncertain and never re-prompt.
+	 */
+	async #reconcileSpawnReplay(lifecycleIdentity: string, claim: SpawnClaimV2): Promise<BrokerResponse> {
+		const store = this.#spawnAuthority;
+		if (!store) return error("unavailable", "spawn authority is unavailable");
+		if (claim.state === "dispatching") {
+			const childId = claim.childId;
+			const seed = claim.seed;
+			if (!childId || !seed) return error("terminal_uncertain", "session.spawn dispatch facts are unavailable");
+			const q26 = await this.#spawnPromptLayer.reconcile({ sessionId: childId, clientRef: seed.clientRef });
+			if (
+				(q26.status === "accepted" || q26.status === "in_flight" || q26.status === "terminal_ok") &&
+				q26.commandId !== undefined &&
+				q26.turnId !== undefined
+			) {
+				try {
+					const advanced = await store.persistTransition(lifecycleIdentity, {
+						claimId: claim.claimId,
+						from: "dispatching",
+						to: "accepted",
+						seed: {
+							...seed,
+							phase: "accepted",
+							commandId: q26.commandId,
+							turnId: q26.turnId,
+							acceptedAt: q26.acceptedAt ?? Date.now(),
+							lastQ26Status: q26.status,
+							observedAt: Date.now(),
+						},
+					});
+					return { ok: true, result: this.#spawnResult("spawn_replayed", advanced.claim) };
+				} catch {
+					return error("terminal_uncertain", "session.spawn replay could not be advanced durably");
+				}
+			}
+			if (q26.status === "failed") {
+				try {
+					await store.persistSeedObservation(lifecycleIdentity, {
+						...seed,
+						lastQ26Status: "failed",
+						observedAt: Date.now(),
+					});
+				} catch {
+					// The observation is best effort; the durable claim already proves dispatch.
+				}
+				return error("spawn_failed", "session.spawn seed turn failed after handoff");
+			}
+			try {
+				await store.persistSeedObservation(lifecycleIdentity, {
+					...seed,
+					lastQ26Status: "unknown",
+					observedAt: Date.now(),
+				});
+			} catch {
+				// Retained uncertainty never blocks the typed response below.
+			}
+			return error("terminal_uncertain", "session.spawn outcome is unknown");
+		}
+		if (claim.state === "substrate_starting")
+			return error("terminal_uncertain", "session.spawn substrate state requires reconciliation");
+		return error("spawn_in_progress", `session.spawn is ${claim.state}`);
+	}
+
+	/**
+	 * Startup reconciliation of non-terminal spawn claims. It never creates a
+	 * replacement child or re-sends a prompt: substrate_starting without exact
+	 * authority proof retains uncertainty, authority_active durably allocates the
+	 * opaque clientRef so one recovery lease may retry, and dispatching resolves
+	 * through Q26 only.
+	 */
+	async #recoverSpawnClaims(): Promise<void> {
+		const store = this.#spawnAuthority;
+		if (!store) return;
+		for (const claim of store.claims()) {
+			try {
+				if (claim.state === "substrate_starting") {
+					await store.persistTransition(claim.lifecycleIdentity, {
+						claimId: claim.claimId,
+						from: "substrate_starting",
+						to: "uncertain",
+					});
+					continue;
+				}
+				if (claim.state === "authority_active") {
+					await store.persistTransition(claim.lifecycleIdentity, {
+						claimId: claim.claimId,
+						from: "authority_active",
+						to: "seed_prepared",
+						seed: { version: 2, phase: "prepared", clientRef: randomBytes(24).toString("base64url") },
+					});
+					continue;
+				}
+				if (claim.state === "dispatching") await this.#reconcileSpawnReplay(claim.lifecycleIdentity, claim);
+			} catch {
+				// Recovery is fail-closed: an unreconciled claim stays retained as-is.
 			}
 		}
 	}
+
+	async #awaitSpawnHostRegistration(input: {
+		childId: string;
+		cwd: string;
+		stateRoot: string;
+	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }> {
+		const deadline = Date.now() + SPAWN_HOST_REGISTRATION_TIMEOUT_MS;
+		for (;;) {
+			try {
+				await this.index.refresh();
+				const row = this.index
+					.listSessionIdentities()
+					.find(
+						candidate =>
+							candidate.sessionId === input.childId &&
+							candidate.endpointGeneration > 0 &&
+							candidate.live &&
+							!candidate.terminal &&
+							!candidate.terminalUncertain,
+					);
+				if (row) {
+					const incarnation = row.hostIncarnation ?? row.processIncarnation;
+					return {
+						ok: true,
+						registration: {
+							sessionId: row.sessionId,
+							endpointGeneration: row.endpointGeneration,
+							pid: row.pid,
+							...(incarnation === undefined ? {} : { processIncarnation: incarnation }),
+						},
+					};
+				}
+			} catch {
+				// A transient index read failure only delays the poll.
+			}
+			if (Date.now() > deadline) return { ok: false };
+			await Bun.sleep(SPAWN_HOST_REGISTRATION_POLL_MS);
+		}
+	}
+
+	/** One nonce-correlated frame exchange over a child host's authenticated endpoint. */
+	async #spawnChildExchange(input: {
+		sessionId: string;
+		frame: (id: string) => Record<string, unknown>;
+		responseType: string;
+		timeoutMs: number;
+	}): Promise<{ handedOff: boolean; frame?: Record<string, unknown> }> {
+		let row: IndexedSession | undefined;
+		try {
+			await this.index.refresh();
+			row = this.index
+				.listSessionIdentities()
+				.find(
+					candidate =>
+						candidate.sessionId === input.sessionId &&
+						candidate.endpointGeneration > 0 &&
+						candidate.live &&
+						!candidate.terminal &&
+						!candidate.terminalUncertain,
+				);
+		} catch {
+			row = undefined;
+		}
+		if (!row) return { handedOff: false };
+		const endpoint = await readEndpoint(row);
+		if (!endpoint) return { handedOff: false };
+		const id = randomBytes(16).toString("base64url");
+		const settled = Promise.withResolvers<Record<string, unknown> | undefined>();
+		let handedOff = false;
+		let complete = false;
+		const settle = (frame?: Record<string, unknown>): void => {
+			if (complete) return;
+			complete = true;
+			settled.resolve(frame);
+		};
+		let socket: WebSocket | undefined;
+		try {
+			const url = new URL(endpoint.url);
+			url.searchParams.set("token", endpoint.token);
+			socket = new WebSocket(url);
+			socket.addEventListener("error", () => settle(undefined));
+			socket.addEventListener("close", () => settle(undefined));
+			socket.addEventListener("message", event => {
+				let frame: Record<string, unknown>;
+				try {
+					const parsed = JSON.parse(String(event.data));
+					if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+					frame = parsed as Record<string, unknown>;
+				} catch {
+					return;
+				}
+				if (frame.type === "hello") {
+					try {
+						socket?.send(JSON.stringify(input.frame(id)));
+						handedOff = true;
+					} catch {
+						settle(undefined);
+					}
+					return;
+				}
+				if (frame.type !== input.responseType || frame.id !== id) return;
+				settle(frame);
+			});
+			const frame = await Promise.race([settled.promise, Bun.sleep(input.timeoutMs).then(() => undefined)]);
+			return { handedOff, frame };
+		} catch {
+			return { handedOff };
+		} finally {
+			try {
+				socket?.close();
+			} catch {
+				// Closing an already failed attachment is best effort.
+			}
+		}
+	}
+
+	async #dispatchSpawnPrompt(input: { sessionId: string; task: string; clientRef: string }): Promise<SpawnPromptDispatch> {
+		const exchange = await this.#spawnChildExchange({
+			sessionId: input.sessionId,
+			frame: id => ({
+				type: "control_request",
+				id,
+				operation: "turn.prompt",
+				input: { text: input.task, clientRef: input.clientRef },
+			}),
+			responseType: "control_response",
+			timeoutMs: SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS,
+		});
+		if (!exchange.handedOff) return { kind: "pre_send_rejected" };
+		const frame = exchange.frame;
+		if (!frame) return { kind: "uncertain" };
+		if (frame.ok === true) {
+			const acceptance = promptAcceptanceFromResponse(frame, input.clientRef);
+			return acceptance === undefined
+				? { kind: "uncertain" }
+				: { kind: "accepted", commandId: acceptance.commandId, turnId: acceptance.turnId, acceptedAt: Date.now() };
+		}
+		// An explicit rejection response proves the prompt never reached the turn loop.
+		return frame.ok === false ? { kind: "pre_send_rejected" } : { kind: "uncertain" };
+	}
+
+	async #reconcileSpawnPrompt(input: { sessionId: string; clientRef: string }): Promise<SpawnQ26Reconciliation> {
+		const exchange = await this.#spawnChildExchange({
+			sessionId: input.sessionId,
+			frame: id => ({
+				type: "query_request",
+				id,
+				query: "turn.result",
+				input: { kind: "prompt", clientRef: input.clientRef },
+			}),
+			responseType: "query_response",
+			timeoutMs: SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS,
+		});
+		const frame = exchange.frame;
+		if (!frame || frame.ok !== true) return { status: "unknown" };
+		return q26FromResponse(frame);
+	}
+
 	runStartup<T>(
 		queueWaitMs: number,
 		timing: StartupAdmissionTiming,
@@ -1246,6 +1847,7 @@ export class Broker {
 				else if (mirror.requestHash !== claim.bindingMac)
 					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
 			}
+			await this.#recoverSpawnClaims();
 			const now = Date.now();
 			const incarnation = brokerProcessIncarnation(process.pid);
 			if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
