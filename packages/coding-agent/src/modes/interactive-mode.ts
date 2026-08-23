@@ -646,11 +646,9 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#petTransportAvailabilityUnsubscribe = this.#itermPetTransport.subscribe(availability => {
 				if (!availability.available) void this.petWidget?.suspendItermCapability();
 				setVerifiedItermPetAvailability(availability);
-				if (availability.available) {
-					if (availability.mode === "managed") this.ui.refreshImageCellSize();
-					const saved = settings.get("pet.mode");
-					if (saved !== "off" && this.petWidget && this.petWidget.mode === "off") this.petWidget.setMode(saved);
-				}
+				if (availability.available && availability.mode === "managed") this.ui.refreshImageCellSize();
+				const saved = settings.get("pet.mode");
+				if (saved !== "off" && this.petWidget) this.petWidget.setMode(saved);
 			});
 		}
 		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
