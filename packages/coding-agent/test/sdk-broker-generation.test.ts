@@ -89,7 +89,13 @@ function ownedTestChild(): ChildProcess & { signals: NodeJS.Signals[] } {
 function olderPackageVersion(version: string): string {
 	const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
 	if (!match) throw new Error(`Test requires a stable package version, got ${version}`);
-	return `${match[1]}.${match[2]}.${Math.max(0, Number(match[3]) - 1)}`;
+	const major = Number(match[1]);
+	const minor = Number(match[2]);
+	const patch = Number(match[3]);
+	if (patch > 0) return `${major}.${minor}.${patch - 1}`;
+	if (minor > 0) return `${major}.${minor - 1}.0`;
+	if (major > 0) return `${major - 1}.0.0`;
+	throw new Error("Test cannot derive an older package version from 0.0.0");
 }
 
 function staleBroker(agentDir: string): Broker {
