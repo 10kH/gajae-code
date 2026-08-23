@@ -18,6 +18,7 @@ import { createAcpConnection } from "@gajae-code/coding-agent/modes/acp/acp-mode
 import { TempDir } from "@gajae-code/utils";
 import { AcpSdkAdapterError } from "../../src/sdk/acp";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { TEST_BROKER_PACKAGE_AUTHORITY } from "../helpers/sdk-broker-fixture";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -184,6 +185,8 @@ describe("ACP production cancellation completion", () => {
 			version: 1,
 			protocolVersion: 3,
 			packageGeneration: "test",
+			packageVersion: TEST_BROKER_PACKAGE_AUTHORITY.packageVersion,
+			installationIdentity: TEST_BROKER_PACKAGE_AUTHORITY.installationIdentity,
 			ownerId: "test-owner",
 			pid: process.pid,
 			host: "127.0.0.1",
@@ -201,7 +204,7 @@ describe("ACP production cancellation completion", () => {
 			signal: connectionAbort.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection;
-		const acp = new AcpAgent(connection, { agentDir });
+		const acp = new AcpAgent(connection, { agentDir, expectedPackageGeneration: "test" });
 		const created = await bounded(acp.newSession({ cwd, mcpServers: [] }), "new session");
 		expect(created.configOptions).toEqual(
 			expect.arrayContaining([
@@ -315,6 +318,7 @@ describe("ACP request failure codes", () => {
 	function agent(): AcpAgent {
 		return new AcpAgent({ signal: connectionAbort.signal } as unknown as AgentSideConnection, {
 			agentDir: "/tmp",
+			expectedPackageGeneration: "test",
 		});
 	}
 

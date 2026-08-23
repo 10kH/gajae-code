@@ -1,5 +1,6 @@
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
+
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client/client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
@@ -231,7 +232,8 @@ function textResult(
 /** Creates the model-facing MCP adapter with Router-owned live session authority. */
 export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 	const agentDir = options.agentDir ?? getAgentDir();
-	const router = options.router ?? new SessionRouter({ agentDir });
+	const injectedRouter = options.router;
+	const router = injectedRouter ?? new SessionRouter({ agentDir });
 	const lifecycleService = options.lifecycleService ?? createBrokerSessionLifecycleService(agentDir);
 	let startPromise: Promise<void> | undefined;
 	let closePromise: Promise<void> | undefined;
@@ -287,7 +289,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 	async function callTool(name: string, args: Arguments = {}): Promise<unknown> {
 		if (name === "gjc_session_list") {
 			try {
-				await ensureBroker({ agentDir });
+				if (!injectedRouter) await ensureBroker({ agentDir });
 				await start();
 				return await paginatedSessionList(router);
 			} catch (error) {
@@ -364,7 +366,7 @@ export function createSdkMcpServer(options: SdkMcpServerOptions = {}) {
 				};
 			try {
 				if (operation === "session.list") {
-					await ensureBroker({ agentDir });
+					if (!injectedRouter) await ensureBroker({ agentDir });
 					await start();
 					return await paginatedSessionList(router, input);
 				}
