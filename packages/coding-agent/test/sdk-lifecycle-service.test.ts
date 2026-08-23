@@ -174,7 +174,7 @@ describe("SessionLifecycleService", () => {
 				indexSeq: 7,
 				sessions: [
 					{ sessionId: "first", live: true },
-					{ sessionId: "second", repo: "/workspace" },
+					{ sessionId: "second", cwd: "/workspace" },
 				],
 				warnings: ["first-page-warning"],
 				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
