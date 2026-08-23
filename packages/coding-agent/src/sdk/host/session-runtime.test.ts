@@ -1388,9 +1388,12 @@ describe("SessionSdkSessionRuntime", () => {
 				if (Date.now() > deadline) throw new Error("Timed out waiting for successor abort response");
 				await Bun.sleep(10);
 			}
-			expect(reconciliationStore.snapshotTerminalScopes()).toEqual([
-				expect.objectContaining({ terminalPublished: true }),
-			]);
+			expect(reconciliationStore.snapshotTerminalScopes()).toContainEqual(
+				expect.objectContaining({
+					turnContinuationFence: expect.objectContaining({ abortedAttemptEpoch: 2 }),
+					terminalPublished: true,
+				}),
+			);
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
 			await rm(cwd, { recursive: true, force: true });
