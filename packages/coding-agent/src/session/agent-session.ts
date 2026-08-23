@@ -2708,6 +2708,15 @@ export class AgentSession {
 		nonEditDeterminations: 0,
 	};
 	#promptInFlightCount = 0;
+	// Identity of every in-flight prompt, so forced recovery can abandon the
+	// exact prompts that were in flight when it fired (a count cannot: prompts
+	// overlap and do not settle FIFO).
+	readonly #inFlightPromptTokens = new Set<symbol>();
+	// In-flight prompts abandoned by forced session recovery. Their
+	// `agent.prompt(...)` awaits a run loop wedged on a stream that ignored its
+	// abort signal and may never settle, so no abort drain or agent_end gate may
+	// keep waiting on them; their own finally still runs if the stream ever ends.
+	readonly #abandonedInFlightPrompts = new Set<symbol>();
 	#inFlightGenerations: number[] = [];
 	#agentEventHandlersInFlight = 0;
 	#queuedExtensionEventCount = 0;
@@ -3017,12 +3026,15 @@ export class AgentSession {
 		}
 	}
 
-	#beginInFlight(): void {
+	#beginInFlight(): symbol {
+		const token = Symbol("in-flight-prompt");
+		this.#inFlightPromptTokens.add(token);
 		this.#promptInFlightCount++;
 		this.#inFlightGenerations.push(this.#abortEpoch);
 		if (this.#promptInFlightCount === 1) {
 			this.#acquirePowerAssertion();
 		}
+		return token;
 	}
 
 	/** True while a live agent loop or a non-aborted in-flight prompt owns the session. */
@@ -3316,9 +3328,18 @@ export class AgentSession {
 	#wakeScopedSettlementWaiters(): void {
 		for (const check of [...this.#scopedSettlementWaiters]) check();
 	}
+	/** In-flight prompts that forced recovery has not abandoned. */
+	#livePromptsInFlight(): number {
+		let live = 0;
+		for (const token of this.#inFlightPromptTokens) {
+			if (!this.#abandonedInFlightPrompts.has(token)) live++;
+		}
+		return live;
+	}
+
 	#abortedTurnTerminalPending(): boolean {
 		return (
-			this.#promptInFlightCount > 0 ||
+			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#pendingAgentEndEmit !== undefined ||
 			this.#agentEndPublicationInFlight > 0
@@ -3391,7 +3412,9 @@ export class AgentSession {
 		}
 	}
 
-	#endInFlight(): unknown {
+	#endInFlight(token: symbol): unknown {
+		this.#inFlightPromptTokens.delete(token);
+		this.#abandonedInFlightPrompts.delete(token);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (this.#inFlightGenerations.length > 0) this.#inFlightGenerations.shift();
 		if (this.#promptInFlightCount !== 0) return undefined;
@@ -3411,8 +3434,8 @@ export class AgentSession {
 		this.#flushPendingAgentEnd();
 		return flushError;
 	}
-	async #settleEndedInFlight(promptWait?: "publication" | "full"): Promise<void> {
-		const flushError = this.#endInFlight();
+	async #settleEndedInFlight(token: symbol, promptWait?: "publication" | "full"): Promise<void> {
+		const flushError = this.#endInFlight(token);
 		const predecessorPromptStillInFlight = this.#promptInFlightCount > 0;
 		if (promptWait === "publication") {
 			await this.#agentEndPublicationPromise;
@@ -3456,7 +3479,7 @@ export class AgentSession {
 
 	#flushPendingAgentEnd(): void {
 		if (
-			this.#promptInFlightCount > 0 ||
+			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#pendingAgentEndContinuationHolds.size > 0
 		)
@@ -5024,7 +5047,7 @@ export class AgentSession {
 		// have unwound. Subscribers treat this event as the ready signal; flushing it
 		// from abort while either barrier is active permits a successor to race the
 		// prior prompt's cleanup.
-		if (event.type === "agent_end" && (this.#promptInFlightCount > 0 || this.#agentEventHandlersInFlight > 0)) {
+		if (event.type === "agent_end" && (this.#livePromptsInFlight() > 0 || this.#agentEventHandlersInFlight > 0)) {
 			this.#pendingAgentEndEmit = event;
 			return;
 		}
@@ -9186,7 +9209,7 @@ export class AgentSession {
 		}
 		await this.#awaitStartupTurnBarrier();
 		if (this.#sessionAdmissionClosed || this.#isDisposed) throw this.#sessionAdmissionBusyError();
-		this.#beginInFlight();
+		const inFlightPrompt = this.#beginInFlight();
 		let hindsightRecall: string | undefined;
 		try {
 			const volatileProjectContextMessage = await this.#buildVolatileProjectContextMessage();
@@ -9230,7 +9253,7 @@ export class AgentSession {
 			await this.#waitForPostPromptRecovery();
 		} finally {
 			this.#removeEphemeralCustomMessages();
-			await this.#settleEndedInFlight();
+			await this.#settleEndedInFlight(inFlightPrompt);
 		}
 	}
 
@@ -10566,7 +10589,7 @@ export class AgentSession {
 		// window, and #beginInFlight below would otherwise start a turn against the
 		// session being handed off.
 		this.#assertNoHandoffTransition();
-		this.#beginInFlight();
+		const inFlightPrompt = this.#beginInFlight();
 		// Discard hidden next-turn successors queued by a PREVIOUS turn that a
 		// terminal abort closed. This must run BEFORE the admission bump below:
 		// once the new root turn advances the epoch, the fence lookup can no
@@ -10950,7 +10973,7 @@ export class AgentSession {
 				this.#releaseIrcRosterClaim(rosterClaim.token, rosterClaim.epoch);
 			}
 			this.#releaseDeferredAgentEndContinuation(predecessorAgentEndHold);
-			await this.#settleEndedInFlight(options?.skipPostPromptRecoveryWait ? "publication" : "full");
+			await this.#settleEndedInFlight(inFlightPrompt, options?.skipPostPromptRecoveryWait ? "publication" : "full");
 		}
 	}
 
@@ -12477,6 +12500,35 @@ export class AgentSession {
 		this.abortEval();
 	}
 
+	/**
+	 * Forced recovery for an abort whose cooperative cleanup did not settle
+	 * within its budget. Abandons the post-prompt tasks and every in-flight
+	 * prompt BEFORE forcing the agent out of the busy state: the abandoned
+	 * prompts' `agent.prompt(...)` awaits a run loop wedged on a stream that
+	 * ignored its abort signal and may never settle, so the aborted-turn drain
+	 * and the agent_end defer/flush gates must stop waiting on them — and the
+	 * synthetic agent_end that forceAbort emits must publish instead of parking
+	 * in #pendingAgentEndEmit behind a prompt count that can never drop.
+	 */
+	#forceSessionRecovery(): void {
+		this.#abandonPostPromptTasks();
+		for (const token of this.#inFlightPromptTokens) this.#abandonedInFlightPrompts.add(token);
+		this.#wakeScopedSettlementWaiters();
+		const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
+		try {
+			if (forceAbortLogicalRunId !== undefined)
+				this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
+			else this.agent.forceAbort("Abort cleanup timed out");
+		} catch {
+			this.agent.forceAbort("Abort cleanup timed out");
+		}
+		this.emitNotice(
+			"warning",
+			"Abort cleanup timed out; forced session recovery. The previous provider stream or tool may still be unwinding in the background.",
+			"abort",
+		);
+	}
+
 	async #abortWithOutcome(options?: {
 		goalReason?: "interrupted" | "internal";
 		timeoutMs?: number;
@@ -12508,7 +12560,28 @@ export class AgentSession {
 			// Abort visibility is per-request: a later real abort must not inherit an
 			// earlier silent abort's suppression and swallow the user-visible notice.
 			if (options?.silent !== true) this.#silentAbortPending = false;
-			await this.#abortUnwind;
+			// Capture the unwind: the field clears once the first abort settles, and
+			// the awaits below must keep watching THIS unwind, not a successor's.
+			const sharedUnwind = this.#abortUnwind;
+			if (options?.timeoutMs !== undefined && options.timeoutMs > 0) {
+				// The first abort may be waiting on cooperative cleanup with no budget
+				// of its own; this abort's budget must still be able to force recovery,
+				// or a bounded user abort queued behind a wedged unbounded abort blocks
+				// forever — and with it every future prompt admission, which waits on
+				// the same unwind.
+				const shared = await Promise.race([
+					sharedUnwind.then(() => "settled" as const),
+					Bun.sleep(options.timeoutMs).then(() => "timeout" as const),
+				]);
+				if (shared === "settled") return { kind: "settled" };
+				this.#forceSessionRecovery();
+				const forced = await Promise.race([
+					sharedUnwind.then(() => "settled" as const),
+					Bun.sleep(options.timeoutMs).then(() => "timeout" as const),
+				]);
+				return { kind: forced === "settled" ? "settled" : "timeout" };
+			}
+			await sharedUnwind;
 			return { kind: "settled" };
 		}
 		const unwind = Promise.withResolvers<void>();
@@ -12531,20 +12604,7 @@ export class AgentSession {
 					Bun.sleep(options.timeoutMs).then(() => ({ kind: "timeout" as const })),
 				]);
 				if (outcome.kind === "timeout") {
-					this.#abandonPostPromptTasks();
-					const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
-					try {
-						if (forceAbortLogicalRunId !== undefined)
-							this.agent.forceAbort("Abort cleanup timed out", forceAbortLogicalRunId);
-						else this.agent.forceAbort("Abort cleanup timed out");
-					} catch {
-						this.agent.forceAbort("Abort cleanup timed out");
-					}
-					this.emitNotice(
-						"warning",
-						"Abort cleanup timed out; forced session recovery. The previous provider stream or tool may still be unwinding in the background.",
-						"abort",
-					);
+					this.#forceSessionRecovery();
 				}
 			} else {
 				outcome = await cleanup;

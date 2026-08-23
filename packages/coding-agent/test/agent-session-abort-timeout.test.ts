@@ -25,8 +25,25 @@ describe("AgentSession abort timeout", () => {
 		}
 		authStorage?.close();
 		authStorage = undefined;
-		tempDir?.removeSync();
+		// Clear the reference before removal so one failed cleanup cannot
+		// cascade into every later test's afterEach retrying the same stale dir.
+		const dir = tempDir;
 		tempDir = undefined;
+		if (dir) {
+			for (let attempt = 0; ; attempt++) {
+				try {
+					dir.removeSync();
+					break;
+				} catch (error) {
+					if (process.platform !== "win32") throw error;
+					// Windows reports EBUSY while the just-closed auth DB handle (or an
+					// AV scan of it) still holds the directory; retry briefly, then
+					// leave the disposable temp dir behind rather than failing the test.
+					if (attempt >= 10) break;
+					await Bun.sleep(50);
+				}
+			}
+		}
 		vi.restoreAllMocks();
 	});
 
@@ -158,6 +175,165 @@ describe("AgentSession abort timeout", () => {
 		await scheduler.flush();
 
 		expect(aborted).toBe(true);
+	});
+
+	function wedgedTurnHarness(): {
+		makeAgent: () => Agent;
+		releaseWedge: () => void;
+		hasWedgeStarted: () => boolean;
+	} {
+		const mock = createMockModel();
+		if (!authStorage) throw new Error("Expected auth storage");
+		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		const makeResponse = (text: string): AssistantMessage => ({
+			role: "assistant",
+			content: [{ type: "text", text }],
+			api: mock.model.api,
+			provider: mock.model.provider,
+			model: mock.model.id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const streamFn: StreamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const response = makeResponse("recovered");
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: response });
+				stream.push({ type: "done", reason: "stop", message: response });
+				stream.end(response);
+			});
+			return stream;
+		};
+		const wedgeGate = Promise.withResolvers<void>();
+		let transformCalls = 0;
+		return {
+			makeAgent: () =>
+				new Agent({
+					getApiKey: () => "test-key",
+					initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+					streamFn,
+					// The first turn's context transform models a hook that ignores
+					// its abort signal: the agent loop awaits transformContext bare
+					// (not raced against the signal), so cooperative abort cleanup
+					// cannot settle and only the timeout budget can recover the
+					// session. Every later turn passes straight through.
+					transformContext: async messages => {
+						transformCalls++;
+						if (transformCalls === 1) await wedgeGate.promise;
+						return messages;
+					},
+				}),
+			releaseWedge: () => wedgeGate.resolve(),
+			hasWedgeStarted: () => transformCalls >= 1,
+		};
+	}
+
+	it("returns from a timed-out abort and admits a successor when the stream ignores abort", async () => {
+		tempDir = TempDir.createSync("@gjc-abort-wedged-stream-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const harness = wedgedTurnHarness();
+		const agent = harness.makeAgent();
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		const activeSession = session;
+		const notices: string[] = [];
+		let agentEnds = 0;
+		activeSession.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "agent_end") agentEnds++;
+		});
+
+		const wedgedPrompt = activeSession.prompt("Start a turn that ignores abort.");
+		try {
+			const deadline = Date.now() + 1_000;
+			while (!(harness.hasWedgeStarted() && activeSession.isStreaming)) {
+				if (Date.now() >= deadline) throw new Error("Timed out waiting for the wedged turn to start");
+				await Bun.sleep(1);
+			}
+
+			// Before the abandoned-prompt tracking this await never returned: the
+			// aborted-turn drain kept waiting on the wedged prompt's in-flight
+			// count, which only drops when the wedged `agent.prompt(...)` settles.
+			await activeSession.abort({ timeoutMs: 25, cause: "user_interrupt" });
+			expect(notices.some(message => message.includes("forced session recovery"))).toBe(true);
+			// The forced terminal agent_end published instead of parking behind the
+			// abandoned prompt's in-flight count.
+			expect(agentEnds).toBeGreaterThanOrEqual(1);
+
+			// A later abort must not wedge on the abandoned prompt either.
+			await activeSession.abort({ timeoutMs: 25 });
+
+			// Prompt admission is unwedged: a successor prompt runs to completion.
+			await activeSession.prompt("Prompt after forced recovery.");
+			expect(agentEnds).toBeGreaterThanOrEqual(2);
+		} finally {
+			harness.releaseWedge();
+			await wedgedPrompt.catch(() => undefined);
+		}
+	});
+
+	it("lets a bounded abort force recovery for a wedged unbounded abort sharing the unwind", async () => {
+		tempDir = TempDir.createSync("@gjc-abort-shared-unwind-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const harness = wedgedTurnHarness();
+		const agent = harness.makeAgent();
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		const activeSession = session;
+		const notices: string[] = [];
+		activeSession.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+		});
+
+		const wedgedPrompt = activeSession.prompt("Start a turn that ignores abort.");
+		try {
+			const deadline = Date.now() + 1_000;
+			while (!(harness.hasWedgeStarted() && activeSession.isStreaming)) {
+				if (Date.now() >= deadline) throw new Error("Timed out waiting for the wedged turn to start");
+				await Bun.sleep(1);
+			}
+
+			// An unbounded abort wedges on cooperative cleanup (waitForIdle never
+			// settles) and owns the shared unwind.
+			const unboundedAbort = activeSession.abort({ cause: "tool_abort" });
+			let unboundedSettled = false;
+			void unboundedAbort.then(() => {
+				unboundedSettled = true;
+			});
+			await Bun.sleep(10);
+			expect(unboundedSettled).toBe(false);
+
+			// The bounded abort races the shared unwind with its own budget and
+			// forces recovery on the first abort's behalf; before that, it awaited
+			// the wedged unwind with its timeoutMs silently discarded.
+			await activeSession.abort({ timeoutMs: 25, cause: "user_interrupt" });
+			expect(notices.some(message => message.includes("forced session recovery"))).toBe(true);
+			await unboundedAbort;
+
+			// Prompt admission is unwedged for both aborts' waiters.
+			await activeSession.prompt("Prompt after forced recovery.");
+		} finally {
+			harness.releaseWedge();
+			await wedgedPrompt.catch(() => undefined);
+		}
 	});
 
 	it("bounds dispose, lets an abort-ignoring run settle cooperatively, and drops its late events", async () => {
