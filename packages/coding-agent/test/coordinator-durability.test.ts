@@ -92,6 +92,20 @@ describe("Coordinator durability", () => {
 		expect(calls).toEqual(["directory-sync", "directory-close"]);
 	});
 
+	it("preserves close failures after tolerating an unsupported Windows directory sync", async () => {
+		const handle = {
+			async sync(): Promise<void> {
+				throw errno("EPERM");
+			},
+			async close(): Promise<void> {
+				throw errno("EIO");
+			},
+		} as fs.FileHandle;
+		await expect(
+			syncCoordinatorDirectory("state", { platform: "win32", openDirectory: async () => handle }),
+		).rejects.toMatchObject({ code: "EIO" });
+	});
+
 	it("keeps unexpected and non-Windows directory failures fail-closed", async () => {
 		for (const [platform, code] of [
 			["win32", "EIO"],
