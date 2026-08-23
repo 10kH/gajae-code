@@ -421,6 +421,12 @@ export const SETTINGS_SCHEMA = {
 		description: "Hard maximum runtime for an SDK prompt from acceptance, bounding progress-aware renewals.",
 		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 86_400_000,
 	},
+	"sdk.masterOrphanGraceMs": {
+		type: "number",
+		default: 120_000,
+		description: "Grace period before a master-spawned child orphaned by confirmed master loss is closed.",
+		validate: (value: number) => Number.isSafeInteger(value) && value >= 60_000 && value <= 3_600_000,
+	},
 
 	// Notifications (shared daemon with Telegram/Discord/Slack presentation adapters)
 	"notifications.enabled": { type: "boolean", default: false },

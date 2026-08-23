@@ -1027,6 +1027,7 @@ export default class Sdk extends Command {
 			packageGeneration: authority.generation,
 			packageVersion: authority.packageVersion,
 			installationIdentity: authority.installationIdentity,
+			masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get("sdk.masterOrphanGraceMs"),
 			resolveDirectoryMigration: async cwd => {
 				const settings = await Settings.loadForScope({ cwd, agentDir });
 				try {

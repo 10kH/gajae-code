@@ -453,3 +453,152 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 });
+
+describe("Broker spawn close and orphan reaper", () => {
+	const verifier = { verifyMasterCapability: async () => ({ allowed: true }) };
+	const spawnInput = () => ({
+		task: "close-task",
+		masterCapability: "close-capability",
+		ownerSessionId: "master-close",
+		attestationEpoch: "epoch-close",
+		cwd: process.cwd(),
+	});
+	type ProviderProbe = { verdict: "verified" | "mismatch" | "gone"; closes: number };
+	function provider(probe: ProviderProbe) {
+		return {
+			launch: async () => ({
+				ok: true as const,
+				proof: { substrateKind: "headless" as const, providerIdentity: "close-provider", pid: 995, processIncarnation: "inc-995" },
+			}),
+			verify: async () => probe.verdict,
+			close: async () => {
+				probe.closes += 1;
+				return { ok: true };
+			},
+		};
+	}
+	const promptLayer = {
+		awaitRegistration: async (input: { childId: string }) => ({
+			ok: true as const,
+			registration: { sessionId: input.childId, endpointGeneration: 1, pid: 995 },
+		}),
+		dispatch: async () => ({ kind: "accepted" as const, commandId: "cmd-close", turnId: "turn-close", acceptedAt: 5 }),
+		reconcile: async () => ({ status: "unknown" as const }),
+	};
+
+	async function acceptedChild(broker: Broker, key: string): Promise<string> {
+		const response = (await broker.handleRequest("session.spawn", spawnInput(), key)) as {
+			ok: boolean;
+			result?: { sessionId?: string };
+		};
+		expect(response.ok).toBe(true);
+		const childId = response.result?.sessionId;
+		if (!childId) throw new Error("spawn success did not return a child id");
+		return childId;
+	}
+
+	it("closes only a re-proven substrate and replays repeated close safely", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: promptLayer,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "close-key");
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed", sessionId: childId } });
+			expect(probe.closes).toBe(1);
+			const again = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(again).toMatchObject({ ok: true, result: { code: "spawn_child_closed" } });
+			expect(probe.closes).toBe(1);
+			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await store.open();
+			const claim = store.claims().find(candidate => candidate.childId === childId);
+			expect(claim?.state).toBe("closed");
+			expect(store.authority(claim?.lifecycleIdentity ?? "")?.closeState).toBe("closed");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("retains uncertainty for a mismatched substrate identity and never closes it", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "mismatch", closes: 0 };
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: promptLayer,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "mismatch-key");
+			const closed = await broker.handleRequest("session.close", { sessionId: childId }, undefined);
+			expect(closed).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(probe.closes).toBe(0);
+			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await store.open();
+			const claim = store.claims().find(candidate => candidate.childId === childId);
+			expect(store.authority(claim?.lifecycleIdentity ?? "")?.closeState).toBe("uncertain");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("stores the orphan clock on master loss, clears it on recovery, and closes on expiry", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: promptLayer,
+			masterOrphanGraceMs: 3_600_000,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "orphan-key");
+			// The fixture master has no live effective host row, so the first pass orphans it.
+			await broker.reapSpawnOrphansOnce();
+			const identityKeyHex = await getBrokerIdentityKey(agentDir);
+			let store = new SpawnAuthorityStore(agentDir, identityKeyHex);
+			await store.open();
+			let claim = store.claims().find(candidate => candidate.childId === childId);
+			const identity = claim?.lifecycleIdentity ?? "";
+			const orphanedAt = store.authority(identity)?.orphanedAt;
+			expect(orphanedAt).toBeDefined();
+			// Within grace nothing closes.
+			await broker.reapSpawnOrphansOnce();
+			expect(probe.closes).toBe(0);
+			// Restart with a tiny grace honors the ORIGINAL orphanedAt and closes.
+			await broker.stop();
+			const restarted = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: provider(probe),
+				spawnPromptLayer: promptLayer,
+				masterOrphanGraceMs: 1,
+			});
+			await restarted.start();
+			try {
+				await restarted.reapSpawnOrphansOnce();
+				expect(probe.closes).toBe(1);
+				store = new SpawnAuthorityStore(agentDir, identityKeyHex);
+				await store.open();
+				claim = store.claims().find(candidate => candidate.childId === childId);
+				expect(claim?.state).toBe("closed");
+				const authority = store.authority(identity);
+				expect(authority?.closeState).toBe("closed");
+				expect(authority?.orphanedAt).toBe(orphanedAt);
+			} finally {
+				await restarted.stop();
+			}
+		} finally {
+			await broker.stop();
+		}
+	});
+});

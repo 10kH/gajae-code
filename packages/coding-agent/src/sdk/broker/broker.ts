@@ -81,6 +81,8 @@ export interface BrokerSettings {
 	/** Ordered Q26 host control seam; production uses exact endpoint attachments. */
 	spawnPromptLayer?: SpawnPromptLayer;
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
+	/** Grace before an orphaned spawn child closes; schema-bounded in production. */
+	masterOrphanGraceMs?: number;
 }
 
 type ResolvedBrokerSettings = {
@@ -94,6 +96,7 @@ type ResolvedBrokerSettings = {
 	masterCapabilityVerifier?: MasterCapabilityVerifier;
 	spawnSubstrateProvider?: SpawnSubstrateProvider;
 	spawnPromptLayer?: SpawnPromptLayer;
+	masterOrphanGraceMs: number;
 };
 
 function modelResolutionCwd(input: Record<string, unknown>): string | undefined {
@@ -394,6 +397,7 @@ function isBrokerResponse(value: unknown): value is BrokerResponse {
 const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
+const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
 
 /** Rebuilds the provider proof from durable authority facts only. */
 function spawnProofFromAuthority(authority: SpawnAuthorityV1): SpawnSubstrateProof {
@@ -1031,6 +1035,7 @@ export class Broker {
 	#spawnTasks = new WeakMap<SpawnInFlight, string>();
 	#spawnAuthority: SpawnAuthorityStore | null = null;
 	#spawnPromptLayer: SpawnPromptLayer;
+	#spawnReapInFlight = false;
 	#admitted = new Set<Promise<void>>();
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 	#publication: RetainedBrokerDiscovery | null = null;
@@ -1065,6 +1070,7 @@ export class Broker {
 			masterCapabilityVerifier: settings.masterCapabilityVerifier,
 			spawnSubstrateProvider: settings.spawnSubstrateProvider,
 			spawnPromptLayer: settings.spawnPromptLayer,
+			masterOrphanGraceMs: settings.masterOrphanGraceMs ?? MASTER_ORPHAN_GRACE_DEFAULT_MS,
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
@@ -1639,6 +1645,151 @@ export class Broker {
 		return q26FromResponse(frame);
 	}
 
+
+	/**
+	 * Routes session.close for a spawn-created child through its claim/authority
+	 * record. Non-spawn sessions fall through to the generic lifecycle path.
+	 */
+	async #maybeCloseSpawnChild(input: Record<string, unknown>): Promise<BrokerResponse | undefined> {
+		const store = this.#spawnAuthority;
+		const sessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
+		if (!store || !sessionId) return undefined;
+		const claim = store.claims().find(candidate => candidate.childId === sessionId);
+		if (!claim) return undefined;
+		const outcome = await this.#closeSpawnAuthority(claim.lifecycleIdentity);
+		if (outcome === "closed") return { ok: true, result: { code: "spawn_child_closed", sessionId } };
+		if (outcome === "uncertain")
+			return error("terminal_uncertain", "session.close substrate identity could not be re-proven");
+		return error("close_refused", "session.close could not complete for the spawned child");
+	}
+
+	/**
+	 * Ordinary exact close for one spawn authority. It mutates only a re-proven
+	 * substrate; identity mismatch retains durable uncertainty and never falls
+	 * back to name-only or PID-only cleanup. Repeated close replays safely.
+	 */
+	async #closeSpawnAuthority(lifecycleIdentity: string): Promise<"closed" | "uncertain" | "retained"> {
+		const store = this.#spawnAuthority;
+		if (!store) return "retained";
+		try {
+			const claim = store.claim(lifecycleIdentity);
+			let authority = store.authority(lifecycleIdentity);
+			if (!claim || !authority) return "retained";
+			if (claim.state === "closed" && authority.closeState === "closed") return "closed";
+			if (authority.closeState === "closed") return "closed";
+			const provider = this.#spawnSubstrateProvider();
+			const proof = spawnProofFromAuthority(authority);
+			const verdict = await provider.verify(proof);
+			if (verdict === "mismatch") {
+				if (authority.closeState !== "uncertain") {
+					const at = Math.max(Date.now(), authority.updatedAt + 1);
+					await store.persistAuthority(lifecycleIdentity, { ...authority, closeState: "uncertain", updatedAt: at });
+				}
+				return "uncertain";
+			}
+			if (authority.closeState === "active") {
+				const at = Math.max(Date.now(), authority.updatedAt + 1);
+				authority = (
+					await store.persistAuthority(lifecycleIdentity, {
+						...authority,
+						closeState: "close_requested",
+						closeRequestedAt: at,
+						updatedAt: at,
+					})
+				).authority!;
+			}
+			if (verdict === "verified") {
+				const closedSubstrate = await provider.close(proof);
+				if (!closedSubstrate.ok) return "retained";
+			}
+			const at = Math.max(Date.now(), authority.updatedAt + 1);
+			const closedAuthority: SpawnAuthorityV1 = { ...authority, closeState: "closed", closedAt: at, updatedAt: at };
+			const currentClaim = store.claim(lifecycleIdentity);
+			if (!currentClaim) return "retained";
+			if (currentClaim.state !== "closed")
+				await store.persistTransition(lifecycleIdentity, {
+					claimId: currentClaim.claimId,
+					from: currentClaim.state,
+					to: "closed",
+					authority: closedAuthority,
+				});
+			return "closed";
+		} catch {
+			return "retained";
+		}
+	}
+
+	/**
+	 * Broker-owned orphan reaping. First confirmed master loss stores a durable
+	 * orphan clock; recovery before expiry clears it; expiry converges through
+	 * the ordinary exact close for only the matching owned child.
+	 */
+	/** Deterministic single reap pass; used by maintenance paths and tests. */
+	async reapSpawnOrphansOnce(): Promise<void> {
+		await this.#reapSpawnOrphans();
+	}
+
+	async #reapSpawnOrphans(): Promise<void> {
+		if (this.#spawnReapInFlight || this.#stopping) return;
+		this.#spawnReapInFlight = true;
+		try {
+			const store = this.#spawnAuthority;
+			if (!store) return;
+			const grace = this.settings.masterOrphanGraceMs;
+			let rows: readonly IndexedSession[] | undefined;
+			for (const claim of store.claims()) {
+				const authority = store.authority(claim.lifecycleIdentity);
+				if (!authority || (authority.closeState !== "active" && authority.closeState !== "close_requested")) continue;
+				if (rows === undefined) {
+					try {
+						await this.index.refresh();
+					} catch {
+						return;
+					}
+					rows = this.index.listSessionIdentities();
+				}
+				const masterAlive = rows.some(
+					row =>
+						row.sessionId === authority.ownerSessionId &&
+						row.endpointGeneration > 0 &&
+						row.live &&
+						!row.terminal &&
+						!row.terminalUncertain &&
+						row.masterRole?.role === "master",
+				);
+				const orphanPending =
+					authority.orphanedAt !== undefined &&
+					(authority.orphanRecoveredAt === undefined || authority.orphanRecoveredAt < authority.orphanedAt);
+				const now = Date.now();
+				try {
+					if (masterAlive) {
+						if (orphanPending) {
+							const at = Math.max(now, authority.updatedAt + 1);
+							await store.persistAuthority(claim.lifecycleIdentity, {
+								...authority,
+								orphanRecoveredAt: at,
+								updatedAt: at,
+							});
+						}
+						continue;
+					}
+					if (!orphanPending) {
+						const at = Math.max(now, authority.updatedAt + 1);
+						const { orphanRecoveredAt: _cleared, ...rest } = authority;
+						await store.persistAuthority(claim.lifecycleIdentity, { ...rest, orphanedAt: at, updatedAt: at });
+						continue;
+					}
+					if (authority.orphanedAt !== undefined && now - authority.orphanedAt >= grace)
+						await this.#closeSpawnAuthority(claim.lifecycleIdentity);
+				} catch {
+					// One authority's reap failure never blocks the remaining scan.
+				}
+			}
+		} finally {
+			this.#spawnReapInFlight = false;
+		}
+	}
+
 	runStartup<T>(
 		queueWaitMs: number,
 		timing: StartupAdmissionTiming,
@@ -1877,7 +2028,10 @@ export class Broker {
 				10,
 				Math.min(BROKER_PUBLICATION_CADENCE_MS, Math.floor(this.settings.heartbeatTtlMs / 3)),
 			);
-			this.#heartbeatTimer = setInterval(() => void this.#watchPublication(), cadenceMs);
+			this.#heartbeatTimer = setInterval(() => {
+				void this.#watchPublication();
+				void this.#reapSpawnOrphans();
+			}, cadenceMs);
 			await this.#checkpointSessionHeartbeats();
 			return this.discovery;
 		} catch (error) {
@@ -2317,6 +2471,10 @@ export class Broker {
 		// Spawn bypasses generic raw-input transforms. They must never observe task
 		// or capability fields, even transiently.
 		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
+		if (operation === "session.close") {
+			const spawnClose = await this.#maybeCloseSpawnChild(input);
+			if (spawnClose) return spawnClose;
+		}
 		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
