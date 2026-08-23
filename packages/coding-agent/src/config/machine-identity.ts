@@ -39,6 +39,25 @@ async function loadInstallationSecret(deps: MachineIdentityDeps): Promise<string
 	const directory = deps.configRootDir ?? getConfigRootDir();
 	const file = path.join(directory, "machine-identity.secret");
 	const link = deps.link ?? fs.link;
+	const syncDirectory = async (): Promise<void> => {
+		if ((deps.platform ?? process.platform) === "win32") return;
+		const handle = await fs.open(directory, "r");
+		try {
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+	};
+	const writeSecretExclusive = async (target: string, secret: string): Promise<void> => {
+		const handle = await fs.open(target, "wx", 0o600);
+		try {
+			await handle.writeFile(`${secret}\n`, "utf8");
+			await handle.chmod(0o600);
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+	};
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	await fs.chmod(directory, 0o700);
 	let unsettledReads = 0;
@@ -71,17 +90,18 @@ async function loadInstallationSecret(deps: MachineIdentityDeps): Promise<string
 		const secret = crypto.randomBytes(32).toString("hex");
 		const temporary = path.join(directory, `.machine-identity.secret-${crypto.randomBytes(16).toString("hex")}`);
 		try {
-			await fs.writeFile(temporary, `${secret}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-			await fs.chmod(temporary, 0o600);
+			await writeSecretExclusive(temporary, secret);
 			try {
 				await link(temporary, file);
+				await syncDirectory();
 				return secret;
 			} catch (error) {
 				const code = (error as NodeJS.ErrnoException).code;
 				if (code === "EEXIST") continue;
 				if (!["EPERM", "EOPNOTSUPP", "ENOSYS", "EXDEV"].includes(code ?? "")) throw error;
 				try {
-					await fs.writeFile(file, `${secret}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+					await writeSecretExclusive(file, secret);
+					await syncDirectory();
 					return secret;
 				} catch (writeError) {
 					if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") throw writeError;
