@@ -3,13 +3,19 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 import * as native from "@gajae-code/natives";
 import { FileLockTestHooks } from "../src/config/file-lock";
-import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
+import {
+	canonicalSessionCwd,
+	SessionIndex,
+	type SessionIndexEvent,
+	sessionIndexChecksum,
+	sessionWorktreeRoot,
+} from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
 	sessionId,
-	locator: { repo: "r", stateRoot: "q" },
+	locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 	endpointGeneration: 1,
 	pid: process.pid,
 });
@@ -226,7 +232,7 @@ describe("SDK session index", () => {
 		expect(await index.repair()).toMatchObject({ status: "healthy", repaired: false });
 		await index.append({
 			...event("after"),
-			locator: { repo: "r".repeat(4 * 1024 * 1024), stateRoot: "q" },
+			locator: { cwd: "r".repeat(4 * 1024 * 1024), worktreeRoot: null, stateRoot: "q" },
 		});
 		const snapshot = JSON.parse(await fs.readFile(path.join(sessionsDir, "index.snapshot.json"), "utf8"));
 		expect(snapshot.indexSeq).toBe(3);
@@ -246,7 +252,7 @@ describe("SDK session index", () => {
 		await fs.writeFile(snapshotFile, JSON.stringify(invalidSnapshot));
 		const oversized = {
 			...event("oversized"),
-			locator: { repo: "r".repeat(4 * 1024 * 1024), stateRoot: "q" },
+			locator: { cwd: "r".repeat(4 * 1024 * 1024), worktreeRoot: null, stateRoot: "q" },
 			version: SDK_STATE_VERSION,
 			indexSeq: 2,
 			ts: Date.now(),
@@ -497,7 +503,7 @@ describe("SDK session index", () => {
 				await index.append({
 					type: "host_registered",
 					sessionId: process.env.WRITER_ID + "-" + i,
-					locator: { repo: "r", stateRoot: "q" },
+					locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 					endpointGeneration: 1,
 					pid: process.pid,
 				});
@@ -567,7 +573,7 @@ describe("SDK session index", () => {
 			ts: Date.now(),
 			type: "lifecycle_terminal",
 			sessionId: "stale-writer",
-			locator: { repo: "unknown", stateRoot: "q" },
+			locator: { cwd: "unknown", worktreeRoot: null, stateRoot: "q" },
 			endpointGeneration: 0,
 			pid: process.pid,
 			terminalUncertain: true,
@@ -596,7 +602,7 @@ describe("SDK session index", () => {
 		const writers = await Promise.all([new SessionIndex(dir).open(), new SessionIndex(dir).open()]);
 		const largeEvent = (sessionId: string) => ({
 			...event(sessionId),
-			locator: { repo: "r".repeat(300_000), stateRoot: "q" },
+			locator: { cwd: "r".repeat(300_000), worktreeRoot: null, stateRoot: "q" },
 		});
 		for (let round = 0; round < 3; round++) {
 			await Promise.all(
@@ -729,7 +735,7 @@ describe("SDK session index", () => {
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.mkdir(sessionsDir, { recursive: true });
 		const snapshotFile = path.join(sessionsDir, "index.snapshot.json");
-		await fs.writeFile(snapshotFile, JSON.stringify({ version: 4, indexSeq: 7, events: [] }));
+		await fs.writeFile(snapshotFile, JSON.stringify({ version: 5, indexSeq: 7, events: [] }));
 		const unsupported = new SessionIndex(dir);
 		expect(await unsupported.diagnose()).toMatchObject({ status: "unsupported", validPrefixSeq: 0, snapshotSeq: 7 });
 		expect(await unsupported.repair()).toMatchObject({ status: "unsupported", repaired: false });
@@ -1077,12 +1083,12 @@ describe("SDK session index", () => {
 			const sessionId = `ambiguous-${terminateHigherGeneration ? "higher" : "lower"}`;
 			const alternate = await index.append({
 				...event(sessionId),
-				locator: { repo: "alternate", stateRoot: "alternate-state" },
+				locator: { cwd: "alternate", worktreeRoot: null, stateRoot: "alternate-state" },
 				endpointGeneration: 1,
 			});
 			const current = await index.append({
 				...event(sessionId),
-				locator: { repo: "current", stateRoot: "current-state" },
+				locator: { cwd: "current", worktreeRoot: null, stateRoot: "current-state" },
 				endpointGeneration: 2,
 			});
 			const terminated = terminateHigherGeneration ? current : alternate;
@@ -1143,7 +1149,7 @@ describe("SDK session index", () => {
 			const bookkeeping = {
 				type: "host_registered" as const,
 				sessionId,
-				locator: { repo: "r", stateRoot: dir },
+				locator: { cwd: "r", worktreeRoot: null, stateRoot: dir },
 				endpointGeneration: 0,
 				pid: process.pid,
 			};
@@ -1177,7 +1183,7 @@ describe("SDK session index", () => {
 			await index.append({
 				type: conflicting.type,
 				sessionId,
-				locator: { repo: "other", stateRoot: "other-state" },
+				locator: { cwd: "other", worktreeRoot: null, stateRoot: "other-state" },
 				endpointGeneration: conflicting.endpointGeneration,
 				pid: process.pid,
 			});
@@ -1199,7 +1205,7 @@ describe("SDK session index", () => {
 		const bookkeeping = await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "r", stateRoot: dir },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot: dir },
 			endpointGeneration: 0,
 			pid: process.pid,
 		});
@@ -1234,7 +1240,7 @@ describe("SDK session index", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "elsewhere", stateRoot: "not-the-agent-dir" },
+			locator: { cwd: "elsewhere", worktreeRoot: null, stateRoot: "not-the-agent-dir" },
 			endpointGeneration: 0,
 			pid: process.pid,
 		});
@@ -1258,7 +1264,7 @@ describe("SDK session index", () => {
 		await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: "r", stateRoot: real },
+			locator: { cwd: "r", worktreeRoot: null, stateRoot: real },
 			endpointGeneration: 0,
 			pid: process.pid,
 		});
@@ -1284,18 +1290,18 @@ describe("SDK session index", () => {
 			await index.append({
 				type: "host_registered",
 				sessionId,
-				locator: { repo: "r", stateRoot: dir },
+				locator: { cwd: "r", worktreeRoot: null, stateRoot: dir },
 				endpointGeneration: 0,
 				pid: process.pid,
 			});
 			const survivor = await index.append({
 				...event(sessionId),
-				locator: { repo: "survivor", stateRoot: "survivor-root" },
+				locator: { cwd: "survivor", worktreeRoot: null, stateRoot: "survivor-root" },
 				endpointGeneration: terminatedIsHigher ? 1 : 2,
 			});
 			const terminated = await index.append({
 				...event(sessionId),
-				locator: { repo: "terminated", stateRoot: "terminated-root" },
+				locator: { cwd: "terminated", worktreeRoot: null, stateRoot: "terminated-root" },
 				endpointGeneration: terminatedIsHigher ? 2 : 1,
 			});
 			expect(index.listSessions().sessions).toEqual([
@@ -1764,5 +1770,35 @@ describe("SDK session index", () => {
 		// Without locked reclassification the tail read sees an empty log at
 		// offset 0 and keeps the stale projection; the locked path must replay.
 		expect(reader.listSessions().sessions.map(s => s.sessionId)).toEqual(["base", "late"]);
+	});
+	it("quarantines legacy repo-only rows with a re-register diagnostic", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-legacy-locator-"));
+		const legacy = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			type: "host_registered" as const,
+			sessionId: "legacy-session",
+			locator: { repo: dir, stateRoot: path.join(dir, ".gjc", "state") },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: Date.now(),
+		};
+		const line = { ...legacy, checksum: sessionIndexChecksum(legacy as unknown as Omit<SessionIndexEvent, "checksum">) };
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		await fs.writeFile(path.join(sessionsDir, "index.jsonl"), `${JSON.stringify(line)}\n`);
+		const index = await new SessionIndex(dir).open();
+		expect(index.listSessions().sessions).toEqual([]);
+		expect(index.listSessions().warnings).toContain("Session legacy-session has a legacy locator row and must re-register.");
+		const audit = await fs.readFile(path.join(sessionsDir, "index-audit.jsonl"), "utf8");
+		expect(audit).toContain('"code":"rejected_legacy_locator"');
+		expect(audit).toContain('"sessionId":"legacy-session"');
+	});
+	it("canonicalizes cwd and reports null worktree root outside Git", async () => {
+		const real = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-canonical-"));
+		const link = `${real}-link`;
+		await fs.symlink(real, link);
+		expect(await canonicalSessionCwd(link)).toBe(real);
+		expect(await sessionWorktreeRoot(real)).toBeNull();
 	});
 });

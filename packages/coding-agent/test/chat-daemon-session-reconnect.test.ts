@@ -417,7 +417,7 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 		await index.append({
 			type: "host_registered",
 			sessionId: SESSION_ID,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: GENERATION,
 			pid: process.pid,
 			processIncarnation: hostIncarnation,
@@ -498,7 +498,7 @@ async function withAttachedSessionRuntime(run: (harness: AttachedRuntimeHarness)
 				await index.append({
 					type: "host_registered",
 					sessionId: SESSION_ID,
-					locator: { repo: agentDir, stateRoot },
+					locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 					endpointGeneration: GENERATION + 1,
 					pid: process.pid,
 					processIncarnation: hostIncarnation,
@@ -539,7 +539,7 @@ async function withAttachedDiscordRuntime(
 		await index.append({
 			type: "host_registered",
 			sessionId: SESSION_ID,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: GENERATION,
 			pid: process.pid,
 			processIncarnation: hostIncarnation,
@@ -701,7 +701,7 @@ test("chat daemon startup isolates an unreachable indexed endpoint from a health
 			await index.append({
 				type: "host_registered",
 				sessionId: session.sessionId,
-				locator: { repo: agentDir, stateRoot },
+				locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 				processIncarnation: hostIncarnation,

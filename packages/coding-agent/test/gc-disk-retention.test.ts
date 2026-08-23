@@ -146,7 +146,7 @@ async function registerDirectCliSession(fixture: TestRoot, sessionId: string): P
 	await index.append({
 		type: "host_registered",
 		sessionId,
-		locator: { repo: fixture.root, stateRoot: fixture.agentDir },
+		locator: { cwd: fixture.root, worktreeRoot: null, stateRoot: fixture.agentDir },
 		endpointGeneration: 0,
 		pid: process.pid,
 	});
@@ -297,7 +297,7 @@ describe("gjc gc --disk --prune (sessions)", () => {
 			await index.append({
 				type: "host_registered",
 				sessionId: "hosted-session",
-				locator: { repo: fixture.root, stateRoot: fixture.root },
+				locator: { cwd: fixture.root, worktreeRoot: null, stateRoot: fixture.root },
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: Date.now(),

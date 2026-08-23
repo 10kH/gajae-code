@@ -24,8 +24,7 @@ import {
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
 import { ensureBroker } from "../broker/ensure";
-
-import { SessionIndex } from "../broker/session-index";
+import { resolveSessionLocator, SessionIndex } from "../broker/session-index";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
@@ -4012,7 +4011,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			try {
 				await ensureBroker({ agentDir: options.agentDir });
 				const index = await new SessionIndex(options.agentDir).open();
-				const locator = { repo: path.resolve(ctx.cwd), stateRoot };
+				const locator = await resolveSessionLocator(ctx.cwd, stateRoot);
 				await runtime.registerWithBroker({
 					register: async input => {
 						const endpointMtimeMs = (await fs.stat(path.join(input.stateRoot, "sdk", `${input.sessionId}.json`)))

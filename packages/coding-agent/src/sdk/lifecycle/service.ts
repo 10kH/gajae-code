@@ -492,12 +492,12 @@ function listResult(value: unknown): SessionLifecycleListResult | undefined {
 			live?: boolean;
 			endpointGeneration?: number;
 			terminalUncertain?: boolean;
-			repo?: string;
+			cwd?: string;
 		} = { sessionId: entry.sessionId };
 		if (typeof entry.live === "boolean") item.live = entry.live;
 		if (typeof entry.endpointGeneration === "number") item.endpointGeneration = entry.endpointGeneration;
 		if (typeof entry.terminalUncertain === "boolean") item.terminalUncertain = entry.terminalUncertain;
-		if (isRecord(entry.locator) && typeof entry.locator.repo === "string") item.repo = entry.locator.repo;
+		if (isRecord(entry.locator) && typeof entry.locator.cwd === "string") item.cwd = entry.locator.cwd;
 		sessions.push(item);
 	}
 	const warnings: string[] = [];

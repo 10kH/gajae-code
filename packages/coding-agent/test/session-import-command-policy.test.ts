@@ -46,7 +46,7 @@ async function publishBrokerSession(
 		indexSeq: 1,
 		type: "host_registered" as const,
 		sessionId,
-		locator: { repo: cwd, stateRoot },
+		locator: { cwd: cwd, worktreeRoot: null, stateRoot },
 		endpointGeneration,
 		pid,
 		...(incarnation !== undefined ? { hostIncarnation: incarnation } : {}),

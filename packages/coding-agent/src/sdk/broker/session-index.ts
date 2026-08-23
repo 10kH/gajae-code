@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
+import { repo } from "../../utils/git";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { withFileLock } from "../../config/file-lock";
 import { processIncarnation } from "./process-incarnation";
@@ -53,12 +54,63 @@ export interface SessionIndexProcessObservation {
 	readonly incarnation: string;
 	readonly isRunning: () => boolean;
 }
+/**
+ * Canonical location facts for one SDK session.
+ *
+ * `cwd` is always a realpath-canonicalized directory. `worktreeRoot` is the
+ * canonical Git worktree root when `cwd` is in a worktree, otherwise `null`.
+ * `stateRoot` retains its host-provided authority spelling and is never derived
+ * from either canonical path.
+ */
+export type SessionLocatorV2 = {
+	cwd: string;
+	worktreeRoot: string | null;
+	stateRoot: string;
+};
+
+/** Canonicalize a cwd without making an unavailable path a launch failure. */
+export async function canonicalSessionCwd(cwd: string): Promise<string> {
+	try {
+		return await fs.realpath(cwd);
+	} catch {
+		return path.resolve(cwd);
+	}
+}
+
+/** Resolve the canonical worktree root; non-Git and probe failures are `null`. */
+export async function sessionWorktreeRoot(cwd: string): Promise<string | null> {
+	try {
+		const repository = await repo.resolve(cwd);
+		return repository ? await canonicalSessionCwd(repository.repoRoot) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Build the only permitted locator shape for a newly registered session. */
+export async function resolveSessionLocator(cwd: string, stateRoot: string): Promise<SessionLocatorV2> {
+	const canonicalCwd = await canonicalSessionCwd(cwd);
+	return { cwd: canonicalCwd, worktreeRoot: await sessionWorktreeRoot(canonicalCwd), stateRoot };
+}
+
+function sessionLocatorV2(locator: unknown): locator is SessionLocatorV2 {
+	return (
+		typeof locator === "object" &&
+		locator !== null &&
+		typeof (locator as { cwd?: unknown }).cwd === "string" &&
+		(locator as { cwd: string }).cwd.length > 0 &&
+		(typeof (locator as { worktreeRoot?: unknown }).worktreeRoot === "string" ||
+			(locator as { worktreeRoot?: unknown }).worktreeRoot === null) &&
+		typeof (locator as { stateRoot?: unknown }).stateRoot === "string" &&
+		(locator as { stateRoot: string }).stateRoot.length > 0
+	);
+}
 export interface SessionIndexEvent {
 	version: typeof SDK_STATE_VERSION;
 	indexSeq: number;
 	type: SessionIndexEventType;
 	sessionId: string;
-	locator: { repo: string; stateRoot: string };
+	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	/**
@@ -80,7 +132,7 @@ export interface SessionIndexEvent {
 }
 export interface IndexedSession {
 	sessionId: string;
-	locator: { repo: string; stateRoot: string };
+	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	/** OS start incarnation of `pid` as published by its own host at registration. */
@@ -164,7 +216,10 @@ interface SessionIndexScan {
 }
 
 /** Admission-fence rejection codes recorded in the durable index audit (C5/C4). */
-export type SessionIndexAuditCode = "rejected_superseded_incarnation" | "rejected_after_tombstone";
+export type SessionIndexAuditCode =
+	| "rejected_superseded_incarnation"
+	| "rejected_after_tombstone"
+	| "rejected_legacy_locator";
 export interface SessionIndexAuditRecord {
 	version: typeof SDK_STATE_VERSION;
 	code: SessionIndexAuditCode;
@@ -268,6 +323,14 @@ const tupleKey = (event: SessionIndexEvent) =>
 const effectiveIncarnation = (event: SessionIndexEvent) => event.hostIncarnation ?? event.processIncarnation;
 const identityKey = (event: SessionIndexEvent) => `${tupleKey(event)}\u0000${effectiveIncarnation(event) ?? ""}`;
 
+function hasSessionLocatorV2(event: SessionIndexEvent): boolean {
+	return sessionLocatorV2(event.locator);
+}
+
+function legacyLocatorDiagnostic(event: SessionIndexEvent): string {
+	return `Session ${event.sessionId} has a legacy locator row and must re-register.`;
+}
+
 interface ResolvedRetentionPolicy {
 	clock: () => number;
 	maxAgeMs: number;
@@ -305,7 +368,17 @@ interface Admission {
  */
 function admitEvents(events: SessionIndexEvent[]): Admission {
 	const authoritative = new Map<string, { incarnation: string | undefined; indexSeq: number }>();
+	const rejected: RejectedEvent[] = [];
 	for (const event of events) {
+		if (!hasSessionLocatorV2(event)) {
+			rejected.push({
+				code: "rejected_legacy_locator",
+				event,
+				supersededByIncarnation: undefined,
+				supersededByIndexSeq: event.indexSeq,
+			});
+			continue;
+		}
 		if (event.type !== "host_registered") continue;
 		const key = tupleKey(event);
 		const current = authoritative.get(key);
@@ -314,8 +387,8 @@ function admitEvents(events: SessionIndexEvent[]): Admission {
 		}
 	}
 	const admitted: SessionIndexEvent[] = [];
-	const rejected: RejectedEvent[] = [];
 	for (const event of events) {
+		if (!hasSessionLocatorV2(event)) continue;
 		const authority = authoritative.get(tupleKey(event));
 		if (
 			authority !== undefined &&
@@ -378,7 +451,7 @@ function auditRecords(events: SessionIndexEvent[], ts: number): SessionIndexAudi
 		indexSeq: rejection.event.indexSeq,
 		sessionId: rejection.event.sessionId,
 		endpointGeneration: rejection.event.endpointGeneration,
-		stateRoot: rejection.event.locator.stateRoot,
+		stateRoot: hasSessionLocatorV2(rejection.event) ? rejection.event.locator.stateRoot : "unknown",
 		...(rejection.event.hostIncarnation !== undefined ? { hostIncarnation: rejection.event.hostIncarnation } : {}),
 		...(rejection.supersededByIncarnation !== undefined
 			? { supersededByIncarnation: rejection.supersededByIncarnation }
@@ -1055,6 +1128,9 @@ export class SessionIndex {
 		if (scan.diagnosis.status === "unsupported") throw scan.unsupportedError!;
 		this.#events = [...scan.snapshotEvents, ...scan.validLogEvents];
 		this.#warnings = [];
+		for (const event of this.#events) {
+			if (!hasSessionLocatorV2(event)) this.#warn(legacyLocatorDiagnostic(event));
+		}
 		this.#logOffset = scan.logContents?.length ?? 0;
 		this.#corruptSuffix = scan.diagnosis.status === "corrupt";
 		if (scan.diagnosis.reason === "invalid snapshot") this.#warnings.push("Invalid session index snapshot");
@@ -1450,7 +1526,7 @@ export class SessionIndex {
 						session.processIncarnation === expected.processIncarnation &&
 						(session.hostIncarnation ?? session.processIncarnation) ===
 							(expected.hostIncarnation ?? expected.processIncarnation) &&
-						resolveEquivalentPath(session.locator.repo) === resolveEquivalentPath(expected.locator.repo) &&
+						resolveEquivalentPath(session.locator.cwd) === resolveEquivalentPath(expected.locator.cwd) &&
 						path.resolve(session.locator.stateRoot) === path.resolve(expected.locator.stateRoot),
 				);
 				let currentRoot: IndexedSession | undefined;
@@ -1458,7 +1534,7 @@ export class SessionIndex {
 					if (
 						session.sessionId !== expected.sessionId ||
 						session.terminal ||
-						resolveEquivalentPath(session.locator.repo) !== resolveEquivalentPath(expected.locator.repo) ||
+						resolveEquivalentPath(session.locator.cwd) !== resolveEquivalentPath(expected.locator.cwd) ||
 						path.resolve(session.locator.stateRoot) !== path.resolve(expected.locator.stateRoot)
 					)
 						continue;
@@ -1899,7 +1975,7 @@ export class SessionIndex {
 				item.sessionId === registration.sessionId &&
 				item.endpointGeneration === registration.endpointGeneration &&
 				item.pid === registration.pid &&
-				resolveEquivalentPath(item.locator.repo) === resolveEquivalentPath(registration.locator.repo) &&
+				resolveEquivalentPath(item.locator.cwd) === resolveEquivalentPath(registration.locator.cwd) &&
 				path.resolve(item.locator.stateRoot) === path.resolve(registration.locator.stateRoot) &&
 				(lifecycleRequestId === undefined || item.lifecycleRequestId === lifecycleRequestId) &&
 				(incarnation === undefined || (item.hostIncarnation ?? item.processIncarnation) === incarnation),

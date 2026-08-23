@@ -309,7 +309,7 @@ test("the broker drops registrations whose host process is gone, keeps live ones
 	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 	try {
 		const index = await new SessionIndex(agentDir).open();
-		const locator = { repo: agentDir, stateRoot: agentDir };
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: agentDir };
 		await index.append({
 			type: "host_registered",
 			sessionId: "live",
@@ -369,7 +369,7 @@ test("a dead-registration sweep stays bounded so another client can still take t
 	const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
 	try {
 		const index = await new SessionIndex(agentDir).open();
-		const locator = { repo: agentDir, stateRoot: agentDir };
+		const locator = { cwd: agentDir, worktreeRoot: null, stateRoot: agentDir };
 		// The cap itself is the contract, not its production value: seed a small
 		// surplus over an injected limit so the bound is proven without paying for
 		// 192 fsynced index transactions on a shared CI runner.

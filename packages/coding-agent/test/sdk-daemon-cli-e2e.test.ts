@@ -291,7 +291,7 @@ describe("SDK session CLI", () => {
 		await broker.index.append({
 			type: "host_registered",
 			sessionId: "live",
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs,
@@ -315,7 +315,7 @@ describe("SDK session CLI", () => {
 		const registration = {
 			type: "host_registered" as const,
 			sessionId: id,
-			locator: { repo: root, stateRoot },
+			locator: { cwd: root, worktreeRoot: null, stateRoot },
 			endpointGeneration: 2,
 			pid: process.pid,
 			endpointMtimeMs: (await fs.stat(path.join(stateRoot, "sdk", "live.json"))).mtimeMs,
@@ -1307,7 +1307,7 @@ describe("SDK session CLI", () => {
 			await alternateBroker.index.append({
 				type: "host_registered",
 				sessionId: "alternate",
-				locator: { repo: root, stateRoot },
+				locator: { cwd: root, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: process.pid,
 				endpointMtimeMs: (await fs.stat(path.join(stateRoot, "sdk", "live.json"))).mtimeMs,

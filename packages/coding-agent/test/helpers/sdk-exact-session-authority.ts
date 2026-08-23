@@ -64,7 +64,7 @@ export async function publishExactSessionAuthority(
 	const unsigned = {
 		type: "host_registered" as const,
 		sessionId: authority.sessionId,
-		locator: { repo: options.cwd, stateRoot },
+		locator: { cwd: options.cwd, worktreeRoot: null, stateRoot },
 		endpointGeneration: authority.endpointGeneration,
 		pid: authority.pid,
 		// A real host publishes its own OS start incarnation; without it the

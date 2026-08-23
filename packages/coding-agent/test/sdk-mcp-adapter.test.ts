@@ -66,7 +66,7 @@ async function fixture() {
 	await broker.index.append({
 		type: "host_registered",
 		sessionId,
-		locator: { repo, stateRoot },
+		locator: { cwd: repo, worktreeRoot: null, stateRoot },
 		endpointGeneration: 1,
 		pid: process.pid,
 		endpointMtimeMs: fs.statSync(endpointPath).mtimeMs,

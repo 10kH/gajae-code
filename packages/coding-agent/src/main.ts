@@ -56,7 +56,7 @@ import {
 	discoverAuthStorage,
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
-import { SessionIndex } from "./sdk/broker/session-index";
+import { resolveSessionLocator, SessionIndex } from "./sdk/broker/session-index";
 import type { AgentSession } from "./session/agent-session";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
@@ -1788,7 +1788,7 @@ export async function runRootCommand(
 	const directSessionId = process.env.GJC_LIFECYCLE_REQUEST_ID ? undefined : sessionManager?.getSessionId();
 	if (directSessionId) {
 		const sessionIndex = new SessionIndex(settingsInstance.getAgentDir());
-		const locator = { repo: sessionManager?.getCwd() ?? cwd, stateRoot: settingsInstance.getAgentDir() };
+		const locator = await resolveSessionLocator(sessionManager?.getCwd() ?? cwd, settingsInstance.getAgentDir());
 		// A pid is reusable, so the broker's teardown fence needs this session's OS
 		// start incarnation recorded alongside the pid it publishes.
 		const directSessionIncarnation = processIncarnation(process.pid);

@@ -62,6 +62,7 @@ import {
 	type SdkStartupRollbackResult,
 	sanitizeSdkStartupMessage,
 } from "../startup-capability";
+import type { SessionLocatorV2 } from "./session-index";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
@@ -708,7 +709,7 @@ function lifecycleWorktreeTarget(input: Input): SessionLifecycleWorktreeTarget |
 }
 
 type LiveResumeRecord = {
-	locator: { repo: string; stateRoot: string };
+	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
@@ -730,7 +731,7 @@ type ResumeScope = {
 };
 function sameResumeLocator(record: LiveResumeRecord, cwd: string, root: string): boolean {
 	return (
-		resolveEquivalentPath(record.locator.repo) === resolveEquivalentPath(cwd) &&
+		resolveEquivalentPath(record.locator.cwd) === resolveEquivalentPath(cwd) &&
 		resolveEquivalentPath(record.locator.stateRoot) === resolveEquivalentPath(root)
 	);
 }
@@ -752,7 +753,7 @@ function sameLiveResumeRecord(expected: LiveResumeRecord, current: LiveResumeRec
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		sameResumeLocator(current, expected.locator.repo, expected.locator.stateRoot)
+		sameResumeLocator(current, expected.locator.cwd, expected.locator.stateRoot)
 	);
 }
 
@@ -891,14 +892,16 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 	if (!scope) return;
 	await broker.index.refresh();
 	const record = broker.index.listSessions().sessions.find(session => session.sessionId === id);
-	if (!record || record.locator.repo === scope) return;
-	// The host records its physical cwd, which Darwin canonicalizes from /var to
-	// /private/var. Preserve the lifecycle caller's lexical cwd for ACP's scoped
-	// listing while retaining the host-provided state root for endpoint binding.
+	if (!record) return;
+	const cwd = canonicalExistingPath(scope);
+	if (record.locator.cwd === cwd) return;
+	// Locator cwd is canonical everywhere. Reconcile only a pre-existing host row
+	// whose canonical registration race observed a different path; it never retains
+	// a caller's lexical spelling for ACP or any other scope consumer.
 	await broker.index.append({
 		type: "record_reconciled",
 		sessionId: id,
-		locator: { ...record.locator, repo: scope },
+		locator: { ...record.locator, cwd },
 		endpointGeneration: record.endpointGeneration,
 		pid: record.pid,
 		// Reconciliation only re-scopes the locator, so every identity fact the host
@@ -2639,7 +2642,7 @@ async function recordTerminalUncertain(broker: Broker, id: string, root: string,
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId: id,
-			locator: { repo: "unknown", stateRoot: root },
+			locator: { cwd: "unknown", worktreeRoot: null, stateRoot: root },
 			endpointGeneration: 0,
 			pid,
 			terminalUncertain: true,
@@ -3750,7 +3753,7 @@ async function validateDeletePath(
 	broker: Broker,
 	input: Input,
 	id: string,
-	record: { locator: { repo: string; stateRoot: string } } | undefined,
+	record: { locator: SessionLocatorV2 } | undefined,
 	cleanup?: CleanupEvidence,
 ): Promise<ValidatedDelete | BrokerResponse> {
 	const sessionPath = text(input.sessionPath);
@@ -3764,7 +3767,7 @@ async function validateDeletePath(
 	const canonicalRequestedRoot = canonicalExistingPath(requestedRoot);
 	if (
 		record &&
-		(canonicalExistingPath(record.locator.repo) !== cwd ||
+		(canonicalExistingPath(record.locator.cwd) !== cwd ||
 			canonicalExistingPath(record.locator.stateRoot) !== canonicalRequestedRoot)
 	)
 		return fail("invalid_input", "session.delete locator does not match the indexed session.");
@@ -3854,7 +3857,7 @@ async function validateDeletePath(
 }
 type CloseAuthority = { endpointGeneration: number; endpointIncarnation: string };
 type CloseRecord = {
-	locator: { repo: string; stateRoot: string };
+	locator: SessionLocatorV2;
 	endpointGeneration: number;
 	pid: number;
 	endpointMtimeMs?: number;
@@ -3918,7 +3921,7 @@ function sameCloseStoredProcessIdentity(expected: CloseRecord, current: CloseRec
 		typeof expected.lifecycleRequestId === "string" &&
 		expected.lifecycleRequestId.length > 0 &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
 }
@@ -3936,7 +3939,7 @@ function sameCloseEndpointIdentity(expected: CloseRecord, current: CloseRecord):
 		current.endpointMtimeMs !== undefined &&
 		expected.endpointMtimeMs !== undefined &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
 }
@@ -3953,7 +3956,7 @@ function sameCloseGeneration(expected: CloseRecord, current: CloseRecord & { liv
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
 		current.lifecycleRequestId === expected.lifecycleRequestId &&
 		current.processIncarnation === expected.processIncarnation &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
 }

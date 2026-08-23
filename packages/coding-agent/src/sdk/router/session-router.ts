@@ -3,9 +3,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import {
-	SessionIndex as DefaultSessionIndex,
-	type IndexedSession,
+	canonicalSessionCwd,
 	isSessionAuthorityEligible,
+	type IndexedSession,
+	resolveSessionLocator,
+	SessionIndex as DefaultSessionIndex,
 	type SessionIndex,
 } from "../broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
@@ -573,11 +575,11 @@ export class SessionRouter {
 				"pre_send",
 				"Broker lifecycle result omitted an exact session endpoint authority.",
 			);
-		const repo = path.resolve(fallback.cwd);
-		const stateRoot = path.join(repo, ".gjc", "state");
+		const cwd = await canonicalSessionCwd(fallback.cwd);
+		const stateRoot = path.join(cwd, ".gjc", "state");
 		const indexed: IndexedSession = {
 			sessionId,
-			locator: { repo, stateRoot },
+			locator: await resolveSessionLocator(cwd, stateRoot),
 			endpointGeneration,
 			pid,
 			endpointMtimeMs,
@@ -1152,15 +1154,11 @@ export class SessionRouter {
 	 */
 	async #readProvenEndpoint(indexed: IndexedSession): Promise<{ endpoint: SdkSessionEndpoint; ino: bigint } | null> {
 		if (!isSessionAuthorityEligible(indexed)) return null;
-		const repo = path.resolve(indexed.locator.repo);
-		const defaultStateRoot = path.join(repo, ".gjc", "state");
-		// The session index stores the lifecycle caller's lexical cwd in `locator.repo`
-		// (reconcileReadyScope re-scopes only that field) while `locator.stateRoot` is
-		// the host process's physical path, because process.cwd() resolves symlinks.
-		// The scope test therefore compares path identity, not spelling: a lexical
-		// match fails for every symlinked cwd (macOS /var -> /private/var,
-		// /home/jun/desk -> /data/Lina-Desk), the adopted attachment is retired on
-		// reconcile, and session/new surfaces "lost exact Router authority".
+		const cwd = indexed.locator.cwd;
+		const defaultStateRoot = path.join(cwd, ".gjc", "state");
+		// Locator cwd is already canonical. `stateRoot` remains the host-provided
+		// authority path, so this comparison resolves equivalent paths only for the
+		// state-root identity boundary; cwd never retains lexical symlink spellings.
 		const indexedStateRoot = resolveEquivalentPath(indexed.locator.stateRoot);
 		const scope =
 			indexedStateRoot === resolveEquivalentPath(defaultStateRoot)
@@ -1169,7 +1167,7 @@ export class SessionRouter {
 					? "chat"
 					: undefined;
 		if (!scope || indexed.endpointMtimeMs === undefined || !Number.isFinite(indexed.endpointMtimeMs)) return null;
-		const endpoint = await readSdkSessionEndpoint(repo, indexed.sessionId, scope);
+		const endpoint = await readSdkSessionEndpoint(cwd, indexed.sessionId, scope);
 		if (!endpoint || endpoint.stale || endpoint.pid !== indexed.pid) return null;
 		const endpointStat = await fs.stat(endpoint.path).catch(() => undefined);
 		const endpointIno = await fs

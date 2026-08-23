@@ -37,7 +37,12 @@ import {
 	type LifecycleState,
 } from "./lifecycle-ledger";
 import { resolveSdkPackageAuthority } from "./runtime";
-import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
+import {
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	SessionIndex,
+	type SessionList,
+} from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -444,7 +449,7 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
-		path.resolve(current.locator.repo) === path.resolve(expected.locator.repo) &&
+		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
 }

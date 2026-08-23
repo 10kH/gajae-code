@@ -10,7 +10,7 @@ import { SessionManager } from "../src/session/session-manager";
 const event = (sessionId: string) => ({
 	type: "host_registered" as const,
 	sessionId,
-	locator: { repo: "r", stateRoot: "q" },
+	locator: { cwd: "r", worktreeRoot: null, stateRoot: "q" },
 	endpointGeneration: 1,
 	pid: process.pid,
 });

@@ -36,7 +36,7 @@ async function routerHarness(
 	await index.append({
 		type: "host_registered",
 		sessionId,
-		locator: { repo: root, stateRoot },
+		locator: { cwd: root, worktreeRoot: null, stateRoot },
 		endpointGeneration: 7,
 		pid: process.pid,
 		endpointMtimeMs,
@@ -44,7 +44,7 @@ async function routerHarness(
 	await index.append({
 		type: "host_heartbeat",
 		sessionId,
-		locator: { repo: root, stateRoot },
+		locator: { cwd: root, worktreeRoot: null, stateRoot },
 		endpointGeneration: 7,
 		pid: process.pid,
 		endpointMtimeMs,

@@ -15,7 +15,7 @@ const event = (
 ) => ({
 	type,
 	sessionId,
-	locator: { repo: "repo", stateRoot },
+	locator: { cwd: "repo", worktreeRoot: null, stateRoot },
 	endpointGeneration: 1,
 	pid: process.pid,
 	...(endpointMtimeMs === undefined ? {} : { endpointMtimeMs }),

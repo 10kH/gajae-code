@@ -672,7 +672,7 @@ test("a blocked Telegram ownership race preserves the canonical endpoint and wit
 	expect(sessions).toContainEqual(
 		expect.objectContaining({
 			sessionId,
-			locator: { repo: path.resolve(cwd), stateRoot },
+			locator: { cwd: path.resolve(cwd), worktreeRoot: null, stateRoot },
 			endpointMtimeMs: fs.statSync(defaultEndpoint).mtimeMs,
 		}),
 	);

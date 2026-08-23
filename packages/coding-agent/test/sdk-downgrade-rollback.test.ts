@@ -177,7 +177,7 @@ test("v1 SDK state transforms to a rollback directory and is executable by the p
 	await index.append({
 		type: "host_registered",
 		sessionId: "rollback-session",
-		locator: { repo: source, stateRoot: path.join(source, "state") },
+		locator: { cwd: source, worktreeRoot: null, stateRoot: path.join(source, "state") },
 		endpointGeneration: 1,
 		pid: process.pid,
 	});

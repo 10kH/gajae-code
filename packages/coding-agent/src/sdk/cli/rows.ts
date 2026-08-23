@@ -19,7 +19,7 @@ export interface SdkSessionActivityV1 {
 
 export interface SdkSessionRowV1 {
 	sessionId: string;
-	locator: { repo: string; stateRoot: string };
+	locator: { cwd: string; worktreeRoot: string | null; stateRoot: string };
 	endpointGeneration: number;
 	/** Process-bound incarnation of the hosting process (C1); absent for legacy-provenance rows. */
 	hostIncarnation?: string;
@@ -98,12 +98,15 @@ function optionalFiniteNumber(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function locatorOf(row: Record<string, unknown>): { repo: string; stateRoot: string } {
+function locatorOf(row: Record<string, unknown>): { cwd: string; worktreeRoot: string | null; stateRoot: string } {
 	const locator = isRecord(row.locator) ? row.locator : {};
-	return {
-		repo: optionalString(locator.repo) ?? "unknown",
-		stateRoot: optionalString(locator.stateRoot) ?? "unknown",
-	};
+	const cwd = optionalString(locator.cwd);
+	const stateRoot = optionalString(locator.stateRoot);
+	const worktreeRoot = locator.worktreeRoot;
+	if (!cwd || !stateRoot || (worktreeRoot !== null && optionalString(worktreeRoot) === undefined)) {
+		throw new Error("session row has an invalid locator v2");
+	}
+	return { cwd, worktreeRoot: worktreeRoot === null ? null : optionalString(worktreeRoot)!, stateRoot };
 }
 
 function activityOf(row: Record<string, unknown>): SdkSessionActivityV1 | undefined {

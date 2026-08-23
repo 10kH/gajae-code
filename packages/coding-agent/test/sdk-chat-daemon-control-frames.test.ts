@@ -98,7 +98,7 @@ async function withRuntime(
 		await index.append({
 			type: "host_registered",
 			sessionId: SESSION_ID,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: GENERATION,
 			pid: process.pid,
 			endpointMtimeMs,
@@ -106,7 +106,7 @@ async function withRuntime(
 		await index.append({
 			type: "host_heartbeat",
 			sessionId: SESSION_ID,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: GENERATION,
 			pid: process.pid,
 			endpointMtimeMs,

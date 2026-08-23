@@ -107,7 +107,7 @@ async function routerFixture(
 				? [
 						{
 							sessionId,
-							locator: { repo: options.indexedRepo ?? repo, stateRoot },
+							locator: { cwd: options.indexedRepo ?? repo, worktreeRoot: null, stateRoot },
 							endpointGeneration: authority.generation,
 							pid: authority.pid,
 							endpointMtimeMs: authority.endpointMtimeMs,
@@ -274,7 +274,7 @@ function hungRouterFixture(): HungRouterFixture {
 			indexSeq: 1,
 			sessions: indexed.map(session => ({
 				sessionId: session.sessionId,
-				locator: { repo, stateRoot },
+				locator: { cwd: repo, worktreeRoot: null, stateRoot },
 				endpointGeneration: 1,
 				pid: 42,
 				endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
@@ -357,7 +357,7 @@ describe("SessionRouter dispatch authority", () => {
 		const alternate = await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo, stateRoot: alternateStateRoot },
+			locator: { cwd: repo, worktreeRoot: null, stateRoot: alternateStateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: 1,
@@ -365,7 +365,7 @@ describe("SessionRouter dispatch authority", () => {
 		const current = await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo, stateRoot },
+			locator: { cwd: repo, worktreeRoot: null, stateRoot },
 			endpointGeneration: 2,
 			pid: process.pid,
 			endpointMtimeMs,
@@ -444,7 +444,7 @@ describe("SessionRouter dispatch authority", () => {
 		const alternate = await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: alternateRepo, stateRoot: alternateStateRoot },
+			locator: { cwd: alternateRepo, worktreeRoot: null, stateRoot: alternateStateRoot },
 			endpointGeneration: 1,
 			pid: process.pid,
 			endpointMtimeMs: alternateEndpointMtimeMs,
@@ -452,7 +452,7 @@ describe("SessionRouter dispatch authority", () => {
 		const current = await index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo, stateRoot: currentStateRoot },
+			locator: { cwd: repo, worktreeRoot: null, stateRoot: currentStateRoot },
 			endpointGeneration: 2,
 			pid: process.pid,
 			endpointMtimeMs: 1,
@@ -542,7 +542,7 @@ describe("SessionRouter dispatch authority", () => {
 				indexSeq: 1,
 				sessions: indexed.map(session => ({
 					sessionId: session.sessionId,
-					locator: { repo, stateRoot },
+					locator: { cwd: repo, worktreeRoot: null, stateRoot },
 					endpointGeneration: 1,
 					pid: 42,
 					endpointMtimeMs: endpointMtimeMs.get(session.sessionId),
@@ -1429,12 +1429,10 @@ describe("SessionRouter dispatch authority", () => {
 		}
 	});
 
-	test("publishes an attachment whose indexed repo is a symlinked spelling of the state root", async () => {
-		// Production shape after reconcileReadyScope: locator.repo carries the
-		// lifecycle caller's lexical cwd while locator.stateRoot stays the host's
-		// physical path, because the host derives it from process.cwd(), which
-		// resolves symlinks. A lexical scope test rejects every symlinked cwd and
-		// the attachment can never be published.
+	test("publishes an attachment whose indexed canonical cwd is symlink-equivalent to the state root", async () => {
+		// Locator cwd is canonical before index registration. The state root remains
+		// host-provided, so Router resolves only its identity when determining the
+		// endpoint scope; canonical cwd preserves attachment authority.
 		const linkParent = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-router-symlink-"));
 		tempDirs.push(linkParent);
 		let readyCount = 0;
@@ -1750,7 +1748,7 @@ describe("SessionRouter dispatch authority", () => {
 				sessions: [
 					{
 						sessionId,
-						locator: { repo, stateRoot },
+						locator: { cwd: repo, worktreeRoot: null, stateRoot },
 						endpointGeneration: generation,
 						pid: 42,
 						endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
