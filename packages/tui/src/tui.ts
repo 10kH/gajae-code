@@ -1094,7 +1094,10 @@ export class TUI extends Container {
 	#mouseSelectionMode: MouseSelectionMode = "char";
 	/** The cell the current selection was opened from; word/line drags pivot around it. */
 	#mouseSelectionAnchor: MouseSelectionPoint | null = null;
-	#lastClickCell: { x: number; y: number } | null = null;
+	#mouseButtonDown = false;
+	#mouseGestureDragged = false;
+	#mousePressPoint: MouseSelectionPoint | null = null;
+	#lastClickPoint: MouseSelectionPoint | null = null;
 	#lastClickAt = 0;
 	#clickCount = 0;
 	#multiClickIntervalMs = DEFAULT_MULTI_CLICK_INTERVAL_MS;
@@ -2311,6 +2314,8 @@ export class TUI extends Container {
 	start(): void {
 		this.#stopped = false;
 		this.#terminalUnavailable = false;
+		this.#clearMouseSelection();
+		this.#resetClickCount();
 		// Seed the observed width so a spurious post-start resize event (iTerm2 tab
 		// activation, the self-sent SIGWINCH after resume) is not read as a reflow.
 		this.#lastObservedWidth = this.terminal.columns;
@@ -2677,6 +2682,8 @@ export class TUI extends Container {
 		const placementCleanup = this.#kittyPlacementDeletePlan(this.#kittyPlacementSpans, [], [], true).output;
 		if (placementCleanup.length > 0 && this.#writeTerminal(placementCleanup)) this.#kittyPlacementSpans = [];
 		this.#clearSixelProbeState();
+		this.#clearMouseSelection();
+		this.#resetClickCount();
 		this.#stopped = true;
 		this.#settleRenderCommitWaiters(false);
 		if (this.#renderTimer) {
@@ -3123,24 +3130,25 @@ export class TUI extends Container {
 	 * restarts at char. A fourth click stays on line rather than cycling back, which
 	 * matches how terminal emulators clamp their own native selection.
 	 */
-	#nextClickMode(mouse: MouseEvent): MouseSelectionMode {
-		const now = Date.now();
+	#nextClickMode(point: MouseSelectionPoint): MouseSelectionMode {
+		const now = performance.now();
 		const repeat =
 			this.#multiClickIntervalMs > 0 &&
-			this.#lastClickCell !== null &&
-			this.#lastClickCell.x === mouse.x &&
-			this.#lastClickCell.y === mouse.y &&
+			this.#lastClickPoint !== null &&
+			this.#lastClickPoint.line === point.line &&
+			this.#lastClickPoint.column === point.column &&
 			now - this.#lastClickAt <= this.#multiClickIntervalMs;
 		this.#clickCount = repeat ? Math.min(this.#clickCount + 1, 3) : 1;
-		this.#lastClickCell = { x: mouse.x, y: mouse.y };
-		this.#lastClickAt = now;
 		return this.#clickCount === 1 ? "char" : this.#clickCount === 2 ? "word" : "line";
 	}
 
 	#resetClickCount(): void {
 		this.#clickCount = 0;
-		this.#lastClickCell = null;
+		this.#lastClickPoint = null;
 		this.#lastClickAt = 0;
+		this.#mouseButtonDown = false;
+		this.#mouseGestureDragged = false;
+		this.#mousePressPoint = null;
 	}
 
 	/** Painted transcript rows the selection reads from; manual history keeps its own frame. */
@@ -3199,13 +3207,24 @@ export class TUI extends Container {
 
 	#beginMouseSelection(mouse: MouseEvent): void {
 		if (!this.options.copySelection) return;
-		const mode = this.#nextClickMode(mouse);
 		const point = this.#mouseSelectionPoint(mouse);
 		if (point === null) {
 			this.#clearMouseSelection();
 			this.#resetClickCount();
 			return;
 		}
+		if (this.#mouseButtonDown) {
+			if (this.#clickCount < 3) this.#resetClickCount();
+			else {
+				this.#mouseButtonDown = false;
+				this.#mouseGestureDragged = false;
+				this.#mousePressPoint = null;
+			}
+		}
+		const mode = this.#clickCount >= 3 ? "line" : this.#nextClickMode(point);
+		this.#mouseButtonDown = true;
+		this.#mouseGestureDragged = false;
+		this.#mousePressPoint = point;
 		this.#mouseSelectionMode = mode;
 		this.#mouseSelectionAnchor = point;
 		this.#mouseSelectionStart = this.#snapSelectionPoint(point, "start");
@@ -3216,9 +3235,14 @@ export class TUI extends Container {
 	}
 
 	#updateMouseSelection(mouse: MouseEvent): void {
+		if (!this.#mouseButtonDown) {
+			this.#resetClickCount();
+			return;
+		}
 		const anchor = this.#mouseSelectionAnchor;
 		if (this.#mouseSelectionStart === null || anchor === null) return;
 		const point = this.#mouseSelectionPoint(mouse);
+		this.#mouseGestureDragged = true;
 		if (point === null) return;
 		const forward = point.line > anchor.line || (point.line === anchor.line && point.column >= anchor.column);
 		// The anchor span stays whole while the far end grows, so dragging after a
@@ -3229,8 +3253,28 @@ export class TUI extends Container {
 	}
 
 	#finishMouseSelection(mouse: MouseEvent): void {
-		if (this.#mouseSelectionStart === null) return;
+		if (!this.#mouseButtonDown) {
+			this.#resetClickCount();
+			return;
+		}
+		this.#mouseButtonDown = false;
 		const point = this.#mouseSelectionPoint(mouse);
+		const pressPoint = this.#mousePressPoint;
+		const completedClick =
+			!this.#mouseGestureDragged &&
+			point !== null &&
+			pressPoint !== null &&
+			point.line === pressPoint.line &&
+			point.column === pressPoint.column;
+		this.#mousePressPoint = null;
+		this.#mouseGestureDragged = false;
+		if (completedClick) {
+			this.#lastClickPoint = point;
+			this.#lastClickAt = performance.now();
+		} else {
+			this.#resetClickCount();
+		}
+		if (this.#mouseSelectionStart === null) return;
 		if (point !== null && this.#mouseSelectionAnchor !== null) {
 			const anchor = this.#mouseSelectionAnchor;
 			const forward = point.line > anchor.line || (point.line === anchor.line && point.column >= anchor.column);

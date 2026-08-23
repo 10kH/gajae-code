@@ -208,6 +208,82 @@ describe("multi-click selection", () => {
 		tui.stop();
 	});
 
+	test("a drag between clicks cancels escalation", async () => {
+		const { terminal, tui, copied } = await mount(["alpha bravo"], { columns: 30, rows: 1 });
+
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(drag(4, 1));
+		terminal.sendInput(release(4, 1));
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		await terminal.waitForRender();
+
+		expect(copied).toEqual(["ph"]);
+		tui.stop();
+	});
+
+	test("a release without a matching press cancels escalation", async () => {
+		const { terminal, tui, copied } = await mount(["alpha bravo"], { columns: 30, rows: 1 });
+
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		terminal.sendInput(release(3, 1));
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		await terminal.waitForRender();
+
+		expect(copied).toEqual([]);
+		tui.stop();
+	});
+
+	test("a duplicate press without release cancels escalation", async () => {
+		const { terminal, tui, copied } = await mount(["alpha bravo"], { columns: 30, rows: 1 });
+
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		await terminal.waitForRender();
+
+		expect(copied).toEqual([]);
+		tui.stop();
+	});
+
+	test("stop and restart clear pending click escalation", async () => {
+		const { terminal, tui, copied } = await mount(["alpha bravo"], { columns: 30, rows: 1 });
+
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		tui.stop();
+		tui.start();
+		await terminal.waitForRender();
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		await terminal.waitForRender();
+
+		expect(copied).toEqual([]);
+		tui.stop();
+	});
+
+	test("repeat clicks compare transcript coordinates after scrolling", async () => {
+		const { terminal, tui, copied } = await mount(
+			Array.from({ length: 12 }, (_value, index) => `line-${index}`),
+			{ columns: 30, rows: 5 },
+		);
+
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		terminal.sendInput("\x1b[<64;10;2M");
+		await terminal.flush();
+		terminal.sendInput(press(3, 4));
+		terminal.sendInput(release(3, 4));
+		await terminal.waitForRender();
+
+		expect(copied).toEqual([]);
+		tui.stop();
+	});
+
 	test("multiClickIntervalMs: 0 disables escalation entirely", async () => {
 		const { terminal, tui, copied } = await mount(["alpha bravo"], { columns: 30, rows: 1 }, 0);
 
@@ -219,6 +295,22 @@ describe("multi-click selection", () => {
 
 		expect(copied).toEqual([]);
 		tui.stop();
+	});
+
+	test("double click never splits an emoji grapheme from either occupied cell", async () => {
+		for (const x of [2, 3]) {
+			const { terminal, tui, copied } = await mount(["A👩‍💻B"], { columns: 30, rows: 1 });
+
+			for (let click = 0; click < 2; click++) {
+				terminal.sendInput(press(x, 1));
+				terminal.sendInput(release(x, 1));
+			}
+			await terminal.waitForRender();
+
+			expect(copied).toEqual(["A👩‍💻B"]);
+			expect(copied[0]).toContain("👩‍💻");
+			tui.stop();
+		}
 	});
 
 	test("a word selection is painted before the button is released", async () => {
