@@ -697,6 +697,10 @@ describe("SessionSdkSessionRuntime", () => {
 			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
 				handlers.set(event, handler);
 			},
+			sendUserMessage: async (_content: string, options: { onPreflightAcceptCommit?: () => Promise<void> }) => {
+				await options?.onPreflightAcceptCommit?.();
+				await new Promise<void>(() => {});
+			},
 		} as unknown as ExtensionAPI;
 		const transport = memoryTransport();
 		const reconciliationStore = createReconciliationStore({
@@ -1290,6 +1294,93 @@ describe("SessionSdkSessionRuntime", () => {
 				// (review thread P2).
 				expect(scope.responseState).toBe("sent");
 			}
+		} finally {
+			await handlers.get("session_shutdown")?.({}, ctx);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("delayed predecessor and maintenance ends cannot resolve a successor publication waiter", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-sdk-terminal-epoch-isolation-"));
+		const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => Promise<void> | void>();
+		const api = {
+			on(event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void> | void) {
+				handlers.set(event, handler);
+			},
+		} as unknown as ExtensionAPI;
+		const transport = memoryTransport();
+		const reconciliationStore = createReconciliationStore({
+			sessionFile: path.join(cwd, "session.json"),
+			sessionId: transport.sessionId,
+		});
+		let activeEpoch = 1;
+		let activeHandle = "predecessor";
+		let abortCalls = 0;
+		const abortRelease = Promise.withResolvers<void>();
+		createSdkSessionRuntimeExtension(api, {
+			agentDir: cwd,
+			createTransport: async () => transport,
+			terminalAbortSeams: {
+				getReconciliationStore: () => reconciliationStore,
+				getTerminalTurnEpoch: () => activeEpoch,
+				getActivePromptHandle: () => activeHandle,
+				getActivePromptOwnerConnectionId: () => "client",
+				cancelPendingPreflightForTerminalAbort: () => {},
+				abortPromptAndWaitWithTerminal: async () => {
+					abortCalls += 1;
+					await abortRelease.promise;
+					return { status: "settled", terminalScope: {} };
+				},
+			},
+		});
+		const ctx = extensionContext(transport.sessionId, cwd);
+		try {
+			await handlers.get("session_start")?.({}, ctx);
+			transport.feed("client", {
+				type: "control_request",
+				id: "predecessor-prompt",
+				operation: "turn.prompt",
+				input: { text: "predecessor" },
+			} as SdkFrame);
+			while (!transport.sent.some(frame => frame.id === "predecessor-prompt")) await Bun.sleep(10);
+			await handlers.get("agent_start")?.({}, ctx); // lifecycle epoch 1
+			await handlers.get("agent_end")?.(
+				{ type: "agent_end", stopReason: "maintenance", maintenanceOutcome: "completed" },
+				ctx,
+			);
+			transport.feed("client", {
+				type: "control_request",
+				id: "successor-prompt",
+				operation: "turn.prompt",
+				input: { text: "successor" },
+			} as SdkFrame);
+			while (!transport.sent.some(frame => frame.id === "successor-prompt")) await Bun.sleep(10);
+			activeEpoch = 2;
+			activeHandle = "successor";
+			await handlers.get("agent_start")?.({}, ctx); // lifecycle epoch 2
+			transport.feed("client", {
+				type: "control_request",
+				id: "successor-abort",
+				operation: "turn.abort",
+				input: { mode: "terminal" },
+				idempotencyKey: "successor-abort-key",
+			} as SdkFrame);
+			while (abortCalls < 1) await Bun.sleep(10);
+			await handlers.get("agent_end")?.({ type: "agent_end" }, ctx); // delayed predecessor
+			await handlers.get("agent_end")?.(
+				{ type: "agent_end", stopReason: "maintenance", maintenanceOutcome: "completed" },
+				ctx,
+			);
+			abortRelease.resolve();
+			await handlers.get("agent_end")?.({ type: "agent_end" }, ctx); // successor
+			const deadline = Date.now() + 5_000;
+			while (!transport.sent.some(frame => frame.id === "successor-abort")) {
+				if (Date.now() > deadline) throw new Error("Timed out waiting for successor abort response");
+				await Bun.sleep(10);
+			}
+			expect(reconciliationStore.snapshotTerminalScopes()).toEqual([
+				expect.objectContaining({ terminalPublished: true }),
+			]);
 		} finally {
 			await handlers.get("session_shutdown")?.({}, ctx);
 			await rm(cwd, { recursive: true, force: true });
