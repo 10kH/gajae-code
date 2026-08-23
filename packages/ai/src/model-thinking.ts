@@ -495,6 +495,20 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			levels: [Effort.Low, Effort.High, Effort.Max],
 		};
 	}
+	// Ox Alpha (OpenRouter stealth preview) always thinks and exposes only
+	// low/high/max reasoning_effort. Measured against the live endpoint on
+	// 2026-08-23: every effort value returns 200, but only `max` (or omitting
+	// `reasoning`) emits reasoning content — the generated minimal..high range
+	// silently disabled thinking because `max` was unreachable.
+	if (model.id === "stealth/ox-alpha" && model.reasoning) {
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		};
+	}
 	if (model.provider === "alibaba-token-plan" && model.id === "deepseek-v4-flash-0731") {
 		model.contextWindow = 1_000_000;
 		model.maxTokens = 384_000;

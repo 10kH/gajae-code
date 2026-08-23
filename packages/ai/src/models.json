@@ -77939,8 +77939,14 @@
 			"maxTokens": 131072,
 			"thinking": {
 				"mode": "effort",
-				"minLevel": "minimal",
-				"maxLevel": "high"
+				"minLevel": "low",
+				"maxLevel": "max",
+				"defaultLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
 			}
 		},
 		"stepfun/step-3.5-flash": {
