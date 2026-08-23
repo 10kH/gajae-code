@@ -397,6 +397,43 @@ describe("main orchestration", () => {
 		}
 	});
 
+	test("rejects a wrong-kind creation lock instead of treating it as contention", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-lock-kind-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+			const lockPath = `${target}.create.lock`;
+			await fs.writeFile(lockPath, "not a lock directory", { mode: 0o600 });
+			await expect(withCreationLock(async () => "must not run")).rejects.toThrow(
+				"approval lock is not a private directory",
+			);
+			expect(await fs.readFile(lockPath, "utf8")).toBe("not a lock directory");
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform === "win32")("refuses a POSIX approval file that became group-readable", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-store-mode-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+			await fileApprovalStore.recordApprovals([manifest]);
+			await fs.chmod(target, 0o640);
+			expect(await fileApprovalStore.loadApprovals()).toEqual([]);
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
 	function mainDependencies(
 		approved: boolean,
 		overrides: Partial<MainDependencies> = {},
