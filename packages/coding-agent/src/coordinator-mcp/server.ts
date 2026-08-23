@@ -5588,7 +5588,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (session.ephemeral !== true && opts.force !== true)
 				return { ok: false, reason: "not_ephemeral", closed: false };
-			const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+			let canonicalTransaction = await readSessionTransaction(questionPaths, id);
 			const canonicalActiveTurn = (canonicalTransaction
 				? Object.values(canonicalTransaction.canonical.turns).find(turn =>
 						ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
@@ -5602,6 +5602,32 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					closed: false,
 					active_turn_id: activeTurn?.turn_id ?? canonicalActiveTurn?.turn_id,
 				};
+			// `listSessions` selects an idle candidate before this transition acquires
+			// its per-session lock. A turn may finish in that interval, leaving no
+			// active-turn marker but advancing the canonical activity watermark. Re-read
+			// the durable authority immediately before admitting the irreversible close.
+			if (opts.reason === "idle_reaper") {
+				canonicalTransaction = await readSessionTransaction(questionPaths, id);
+				const latestActiveTurn = canonicalTransaction
+					? Object.values(canonicalTransaction.canonical.turns).find(turn =>
+							ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+						)
+					: undefined;
+				if (latestActiveTurn)
+					return {
+						ok: false,
+						reason: "active_turn",
+						closed: false,
+						active_turn_id: latestActiveTurn.turn_id,
+					};
+				const latestStamp =
+					optionalString(canonicalTransaction?.recovery.prompt_watermark_at) ??
+					optionalString(canonicalTransaction?.canonical.session.updated_at) ??
+					optionalString(session.created_at);
+				const latestActivityMs = latestStamp ? Date.parse(latestStamp) : Number.NaN;
+				if (!Number.isFinite(latestActivityMs) || Date.now() - latestActivityMs < config.sessionIdleTtlMs)
+					return { ok: false, reason: "not_idle", closed: false };
+			}
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
 			const deletionEntry = {
