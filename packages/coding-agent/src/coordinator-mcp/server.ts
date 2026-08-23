@@ -894,8 +894,10 @@ function toolSchema(name: CoordinatorToolName): {
 			description:
 				"Enumerate GJC sessions discovered on the broker under the allowed roots. Each entry reports " +
 				"`registered`: only sessions with `registered: true` can be used with the other coordinator " +
-				"tools. Calling read_status, read_tail, send_prompt, or stop_session on an entry with " +
-				"`registered: false` returns not_found; register it with gjc_coordinator_register_session first.",
+				"tools. Calling read_status, read_tail, or send_prompt on an entry with `registered: false` " +
+				"returns not_found, and stop_session reports unknown_session; register it with " +
+				"gjc_coordinator_register_session first. The marker is a hint at listing time and can change " +
+				"between listing and use.",
 			inputSchema: common,
 		};
 	}
@@ -5353,19 +5355,34 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 		return path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`);
 	}
 	/**
-	 * True when the session has a durable coordinator projection, i.e. when tools
-	 * other than list_sessions can resolve it. A broker session that was never
-	 * registered answers false instead of throwing, so listing stays total.
+	 * Session ids that have a durable coordinator projection usable by the
+	 * session-scoped tools, i.e. that `gjc_coordinator_read_status` can resolve.
+	 * One directory scan answers every listed broker row, so a listing over
+	 * hundreds of sessions costs one readdir plus one read per projected row
+	 * instead of one read per broker row; unregistered broker sessions are free.
+	 * `registered: true` keeps predicting the other tools' outcome only when the
+	 * row is non-null — a projection row without a usable `cwd` string answers
+	 * false, mirroring `read_status`'s own gate, so a foreign or damaged row
+	 * cannot make the marker overpromise. A projection may also be created or
+	 * reaped after this snapshot; the session-scoped tools stay the authority.
 	 */
-	async function isRegisteredSession(sessionId: unknown): Promise<boolean> {
-		if (typeof sessionId !== "string" || sessionId.length === 0) return false;
-		let file: string;
-		try {
-			file = sessionFile(sessionId);
-		} catch {
-			return false;
-		}
-		return asRecord(await readJsonFile(file)) !== null;
+	async function registeredSessionIds(): Promise<Set<string>> {
+		const registered = new Set<string>();
+		const entries = await fs.readdir(path.join(namespaceDir, "sessions"), { withFileTypes: true }).catch(() => []);
+		await Promise.all(
+			entries.map(async entry => {
+				if (!entry.isFile() || !entry.name.endsWith(".json")) return;
+				const sessionId = entry.name.slice(0, -".json".length);
+				if (!COORDINATOR_SESSION_ID_PATTERN.test(sessionId)) return;
+				const session = asRecord(await readJsonFile(sessionFile(sessionId)).catch(() => null));
+				if (optionalString(session?.cwd) !== null) registered.add(sessionId);
+			}),
+		);
+		return registered;
+	}
+	function registeredSessionMarker(registered: ReadonlySet<string>, session: Record<string, unknown>): boolean {
+		const sessionId = brokerSessionId(session);
+		return sessionId !== null && registered.has(sessionId);
 	}
 	async function removeReapedProjection(
 		sessionId: string,
@@ -7120,12 +7137,14 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 				// an explicit marker a controller cannot tell the two apart and burns a
 				// not_found round-trip per unregistered session, which trips client-side
 				// consecutive-failure breakers. Publish registration as first-class state.
-				const sessions = await Promise.all(
-					(await listSessions()).map(async session => {
-						const view = publicBrokerSession(session);
-						return { ...view, registered: await isRegisteredSession(view.session_id) };
-					}),
-				);
+				// The marker is a point-in-time hint: a projection can be created or reaped
+				// between this listing and the caller's next tool call, and the session-scoped
+				// tools remain the authority for that moment.
+				const registered = await registeredSessionIds();
+				const sessions = (await listSessions()).map(session => ({
+					...publicBrokerSession(session),
+					registered: registeredSessionMarker(registered, session),
+				}));
 				return { ok: true, sessions };
 			}
 			if (name === "gjc_coordinator_register_session") {
