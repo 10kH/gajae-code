@@ -89,6 +89,14 @@ describe("reconciliation-store", () => {
 				acceptedAt: 1,
 				terminalAt: 3,
 			},
+			{
+				kind: "prompt",
+				commandId: "c4",
+				turnId: "t4",
+				status: "accepted",
+				acceptedAt: 1,
+				deadlineRecoveryPending: true,
+			},
 		];
 		const settled = settleProcessRestart(input, now);
 		// Prompts must always end with one normalized outcome; only skills keep the
@@ -99,6 +107,7 @@ describe("reconciliation-store", () => {
 		expect(settled[1]?.status).toBe("failed");
 		expect(settled[1]?.error?.code).toBe("process_restart");
 		expect(settled[2]?.status).toBe("terminal_ok");
+		expect(settled[3]).toEqual(input[3]);
 	});
 
 	test("transact persists and reload settles a non-terminal prompt with its normalized outcome", async () => {
@@ -135,6 +144,42 @@ describe("reconciliation-store", () => {
 		await again.delete();
 		await expect(fs.stat(store.path!)).rejects.toMatchObject({ code: "ENOENT" });
 		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("reload preserves a deadline recovery prompt for runtime hydration", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-deadline-recovery-"));
+		try {
+			const sessionFile = path.join(root, "sess.jsonl");
+			await fs.writeFile(sessionFile, "");
+			const store = createReconciliationStore({
+				sessionFile,
+				sessionId: "deadline-recovery",
+				now: () => 5_000,
+			});
+			await store.transact(() => [
+				{
+					kind: "prompt",
+					commandId: "deadline-command",
+					turnId: "deadline-turn",
+					status: "accepted",
+					acceptedAt: 1_000,
+					deadlineRecoveryPending: true,
+				},
+			]);
+			const reopened = createReconciliationStore({
+				sessionFile,
+				sessionId: "deadline-recovery",
+				now: () => 9_000,
+			});
+			expect(await reopened.load()).toEqual([
+				expect.objectContaining({
+					status: "accepted",
+					deadlineRecoveryPending: true,
+				}),
+			]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("reload preserves a skill pending claim without quarantining sibling records", async () => {

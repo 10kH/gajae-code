@@ -642,17 +642,27 @@ export function createInvocationReconciliation(
 			reservationCounts.set(kind, Math.max(0, (reservationCounts.get(kind) ?? 1) - 1));
 		},
 		async noteAccepted(kind, correlation, clientRef) {
-			records.set(key(kind, correlation), {
+			const recordKey = key(kind, correlation);
+			const acceptedRecord: InvocationRecord = {
 				...correlation,
 				kind,
 				revision: ++mutationRevision,
 				...(clientRef === undefined ? {} : { clientRef }),
 				status: "accepted",
 				acceptedAt: Date.now(),
-			});
+			};
+			records.set(recordKey, acceptedRecord);
+			try {
+				await persist();
+			} catch (error) {
+				// Admission is not accepted until its durable record publishes. Roll the
+				// provisional in-memory row back so the caller's release() can discharge
+				// the still-live reservation without leaving a conflicting clientRef.
+				if (records.get(recordKey) === acceptedRecord) records.delete(recordKey);
+				throw error;
+			}
 			if (clientRef !== undefined) reservations.delete(ref(kind, clientRef));
 			reservationCounts.set(kind, Math.max(0, (reservationCounts.get(kind) ?? 1) - 1));
-			await persist();
 		},
 		async noteTransition(kind, correlation, frame) {
 			if (!correlation) return;
@@ -1497,7 +1507,7 @@ function createControlSurface(
 	retirePendingOwner?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
-		leaseRelease?: "always" | "recover-failure",
+		leaseRelease?: "always" | "recover-failure" | "recover-terminal",
 		failureIntent?: { code: string; message: string },
 	) => void,
 	canResolveGate: () => boolean = () => true,
@@ -1710,12 +1720,46 @@ function createControlSurface(
 							// a turn it did not start. No-op when agent_start already
 							// drained the entry.
 							retirePendingOwner?.(kind, correlation);
-							void reconciliation.noteTransition(kind, correlation, {
-								type: "agent_end",
-								...(typeof result === "string"
-									? { content: { version: 1, type: "text", text: result, byteLength: 0, truncated: false } }
-									: {}),
-							});
+							const attemptTerminalization = async (remaining: number): Promise<void> => {
+								try {
+									await reconciliation.noteTransition(kind, correlation, {
+										type: "agent_end",
+										...(typeof result === "string"
+											? {
+													content: {
+														version: 1,
+														type: "text",
+														text: result,
+														byteLength: 0,
+														truncated: false,
+													},
+												}
+											: {}),
+									});
+									retirePendingOwner?.(kind, correlation, "always");
+								} catch (transitionError) {
+									if (kind === "prompt") {
+										retirePendingOwner?.(kind, correlation, "recover-terminal");
+										return;
+									}
+									if (remaining <= 1) {
+										logger.error(
+											"SDK skill completion exhausted terminal retries; continuing scheduled recovery",
+											{
+												kind,
+												commandId: correlation.commandId,
+												turnId: correlation.turnId,
+												error: sanitizePromptFailure(transitionError),
+											},
+										);
+										await Bun.sleep(1_000);
+										return attemptTerminalization(remaining);
+									}
+									await Bun.sleep(1_000);
+									return attemptTerminalization(remaining - 1);
+								}
+							};
+							void attemptTerminalization(3);
 						}
 						return;
 					}
@@ -1799,6 +1843,18 @@ function createControlSurface(
 									} else if (remaining > 1) {
 										await Bun.sleep(1_000);
 										return attemptRejectionTerminalization(remaining - 1);
+									} else {
+										logger.error(
+											"SDK skill rejection exhausted its terminal retries; continuing scheduled recovery",
+											{
+												kind,
+												commandId: correlation.commandId,
+												turnId: correlation.turnId,
+												error: sanitizePromptFailure(transitionError),
+											},
+										);
+										await Bun.sleep(1_000);
+										return attemptRejectionTerminalization(remaining);
 									}
 									logger.error("SDK accepted submission failed to terminalize after rejection", {
 										kind,
@@ -2996,6 +3052,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// turn it did not submit, and never set for agent-initiated turns (review
 	// thread P1).
 	const activePromptOwnerHolder: { connectionIds?: Set<string> } = {};
+	const skillTerminalRecoveryKeys = new Set<string>();
 	const emitLifecycle = async (
 		type: "agent_start" | "agent_end" | "agent_failed",
 		ctx: ExtensionContext,
@@ -3029,9 +3086,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		if (type === "agent_failed") {
-			const active = current.activeInvocation;
-			const candidates = current.openLifecycleBatches[0]?.invocations ?? current.pending;
-			const fallback = active ? [active] : candidates;
+			const activeInvocation = current.activeInvocation;
+			const activeBatch = activeInvocation
+				? current.openLifecycleBatches.find(batch =>
+						batch.invocations.some(
+							entry =>
+								entry.correlation.commandId === activeInvocation.correlation.commandId &&
+								entry.correlation.turnId === activeInvocation.correlation.turnId,
+						),
+					)
+				: undefined;
+			const fallback =
+				activeBatch?.invocations ??
+				current.drainedInvocations ??
+				(activeInvocation ? [activeInvocation] : current.pending);
 			// In-run ATTACHED correlations share the failing run: without their
 			// agent_failed diagnostic the later agent_end marks them terminal_ok
 			// after a failed shared run (exact-head review P1). Deduplicate by
@@ -3107,6 +3175,59 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				)
 			)
 				current.openLifecycleBatches.shift();
+		};
+		const scheduleSkillTerminalRecovery = (invocation: {
+			kind: InvocationKind;
+			correlation: InvocationCorrelation;
+		}): void => {
+			if (invocation.kind !== "skill") return;
+			const recoveryKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
+			if (skillTerminalRecoveryKeys.has(recoveryKey)) return;
+			skillTerminalRecoveryKeys.add(recoveryKey);
+			const attempt = async (): Promise<void> => {
+				try {
+					const unrecorded = current.unrecordedFailureReasons?.get(recoveryKey);
+					if (unrecorded !== undefined) {
+						await current.reconciliation.noteTransition("skill", invocation.correlation, {
+							type: "agent_failed",
+							error: Object.assign(new Error(unrecorded.message), { code: unrecorded.code }),
+						} as never);
+						current.unrecordedFailureReasons?.delete(recoveryKey);
+					}
+					await current.reconciliation.noteTransition("skill", invocation.correlation, { type: "agent_end" });
+					skillTerminalRecoveryKeys.delete(recoveryKey);
+					for (const batch of current.openLifecycleBatches) {
+						batch.invocations = batch.invocations.filter(
+							entry =>
+								entry.correlation.commandId !== invocation.correlation.commandId ||
+								entry.correlation.turnId !== invocation.correlation.turnId,
+						);
+					}
+					current.openLifecycleBatches = current.openLifecycleBatches.filter(
+						batch => batch.invocations.length > 0,
+					);
+					current.drainedInvocations = current.drainedInvocations?.filter(
+						entry =>
+							entry.correlation.commandId !== invocation.correlation.commandId ||
+							entry.correlation.turnId !== invocation.correlation.turnId,
+					);
+					if (
+						current.activeInvocation?.correlation.commandId === invocation.correlation.commandId &&
+						current.activeInvocation.correlation.turnId === invocation.correlation.turnId
+					)
+						adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
+					if (current.openLifecycleBatches.length === 0) current.lifecycleActive = false;
+				} catch (error) {
+					logger.error("SDK skill lifecycle terminal recovery retrying", {
+						commandId: invocation.correlation.commandId,
+						turnId: invocation.correlation.turnId,
+						error: sanitizePromptFailure(error),
+					});
+					await Bun.sleep(1_000);
+					return attempt();
+				}
+			};
+			void attempt();
 		};
 		if (type === "agent_end" && maintenanceOutcome !== undefined && maintenanceOutcome !== "aborted") {
 			try {
@@ -3230,6 +3351,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.lifecycleActive = false;
 				current.activeInvocation = failedTransitions[0];
 				current.drainedInvocations = failedTransitions;
+				for (const invocation of failedTransitions) scheduleSkillTerminalRecovery(invocation);
 				const resolvers = terminalPublicationCapture.resolvers;
 				terminalPublicationCapture.resolvers = undefined;
 				for (const resolve of resolvers ?? []) resolve(observed);
@@ -3593,7 +3715,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			(
 				kind: InvocationKind,
 				correlation: InvocationCorrelation,
-				leaseRelease?: "always" | "recover-failure",
+				leaseRelease?: "always" | "recover-failure" | "recover-terminal",
 				failureIntent?: { code: string; message: string },
 			) => {
 				// An accepted submission that settles WITHOUT starting (a rejection
@@ -3620,6 +3742,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// replay re-records the failure reason before agent_end (exact-head
 					// review HIGH: a bare terminal replay made rejections terminal_ok).
 					deadlineManager.noteTerminalTransition(correlation, failureIntent);
+					return;
+				}
+				if (leaseRelease === "recover-terminal") {
+					deadlineManager.noteTerminalTransition(correlation);
 					return;
 				}
 				const settledRow = reconciliation.lookup(kind, correlation) as { status?: string };

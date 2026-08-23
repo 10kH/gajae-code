@@ -554,6 +554,13 @@ export function settleProcessRestart(
 			};
 		}
 		if (record.terminalAt !== undefined) return record;
+		if (record.kind === "prompt" && record.deadlineRecoveryPending === true) {
+			// This row already has an explicit durable recovery owner. Preserve it for
+			// runtime hydration so PromptDeadlineManager can re-arm the original
+			// acceptance-anchored hard cap instead of replacing uncertainty with a
+			// synthetic process-restart failure.
+			return record;
+		}
 		if (record.pendingOutcome !== undefined || record.kind === "prompt") {
 			const outcome: SdkPromptTerminalOutcome = record.pendingOutcome ?? {
 				kind: "failed",

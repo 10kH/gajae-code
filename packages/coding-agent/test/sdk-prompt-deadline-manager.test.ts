@@ -10,6 +10,7 @@ import { PromptDeadlineManager } from "../src/sdk/prompt-deadline-manager";
 
 interface FakeReconciliation {
 	status: string;
+	error?: { code: string; message: string };
 	finalizeFailures: number;
 	finalizeCalls: number;
 	claimStarted?: () => void;
@@ -31,7 +32,7 @@ interface FakeReconciliation {
 
 function fakeReconciliation(): {
 	reconciliation: {
-		lookup: () => { status: string };
+		lookup: () => { status: string; error?: { code: string; message: string } };
 		claimPendingOutcome: () => Promise<void>;
 		noteTransition: (_kind: string, _correlation: unknown, frame?: { type?: string }) => Promise<void>;
 		markUncertain: (_kind: string, _correlation: unknown, isCurrent?: () => boolean) => Promise<void>;
@@ -58,12 +59,12 @@ function fakeReconciliation(): {
 	return {
 		state,
 		reconciliation: {
-			lookup: () => ({ status: state.status }),
+			lookup: () => ({ status: state.status, ...(state.error === undefined ? {} : { error: state.error }) }),
 			noteTransition: async (_kind: string, _correlation: unknown, frame?: { type?: string }) => {
 				state.noteTransitionCalls += 1;
 				state.noteTransitionFrames.push(frame?.type ?? "unknown");
 				if (state.noteTransitionCalls <= state.noteTransitionFailures) throw new Error("terminal replay failed");
-				state.status = "terminal_ok";
+				state.status = state.error === undefined ? "terminal_ok" : "failed";
 			},
 			markUncertain: async (_kind: string, _correlation: unknown, isCurrent?: () => boolean) => {
 				state.uncertainCalls += 1;
@@ -154,6 +155,39 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(expired).toBe(0);
 		expect(manager.has(correlation)).toBe(true);
 		manager.clearAll();
+	});
+
+	test("a recorded real failure wins over deadline expiry and remains failed", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		state.error = { code: "provider_unavailable", message: "Agent run failed." };
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-real-failure", turnId: "turn-real-failure" };
+		manager.onAccepted(correlation);
+		await Bun.sleep(80);
+		expect(state.noteTransitionFrames).toEqual(["agent_end"]);
+		expect(state.finalizeCodes).toEqual([]);
+		expect(state.status).toBe("failed");
+		expect(manager.has(correlation)).toBe(false);
+	});
+
+	test("a late terminal upgrade without a lease re-arms bounded replay ownership", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		state.noteTransitionFailures = 1;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-late-upgrade", turnId: "turn-late-upgrade" };
+		manager.noteTerminalTransition(correlation);
+		expect(manager.has(correlation)).toBe(true);
+		await Bun.sleep(2_300);
+		expect(state.noteTransitionCalls).toBeGreaterThanOrEqual(2);
+		expect(manager.has(correlation)).toBe(false);
 	});
 
 	test("fences late adoption while expiry persistence is suspended", async () => {
@@ -348,6 +382,27 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(state.uncertainCalls).toBeGreaterThanOrEqual(3);
 		expect(manager.has(correlation)).toBe(true);
 		expect(manager.hasRecoveryPending(correlation)).toBe(true);
+		manager.clearAll();
+	}, 15_000);
+
+	test("the exhausted uncertainty rejection cannot contaminate a renewed lease", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		state.finalizeFailures = Number.MAX_SAFE_INTEGER;
+		state.uncertainFailures = Number.MAX_SAFE_INTEGER;
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+		});
+		const correlation = { commandId: "cmd-exhausted-stale", turnId: "turn-exhausted-stale" };
+		state.uncertainStarted = () => {
+			if (state.uncertainCalls === 3) manager.onProgress(correlation);
+		};
+		manager.onAccepted(correlation);
+		await Bun.sleep(9_200);
+		expect(state.uncertainCalls).toBe(3);
+		expect(manager.has(correlation)).toBe(true);
+		expect(manager.hasRecoveryPending(correlation)).toBe(false);
 		manager.clearAll();
 	}, 15_000);
 

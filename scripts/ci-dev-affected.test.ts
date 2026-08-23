@@ -1411,10 +1411,15 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 	});
 	test("agent-session source changes select the promotion and concurrency suites", () => {
 		const tasks = targeted(["packages/coding-agent/src/session/agent-session.ts"]);
-		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/agent-session-concurrent.test.ts");
-		expect(tasks.map(task => task.key)).toContain(
-			"test:packages/coding-agent/test/agent-session-promotion-identity.test.ts",
-		);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/agent-session-concurrent.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/agent-session-promotion-identity.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts");
+	});
+	test("agent lifecycle source changes select force-abort and managed-attempt regressions", () => {
+		const keys = targeted(["packages/agent/src/agent.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/agent/test/agent-force-abort.test.ts");
+		expect(keys).toContain("test:packages/agent/test/managed-attempt-transaction.test.ts");
 	});
 	test("lifecycle coverage stays targeted instead of selecting unrelated coding-agent shards", () => {
 		const tasks = targeted([

@@ -305,6 +305,40 @@ test("a late agent failure never overwrites the reason an already terminal recor
 	expect(reconciliation.lookup("prompt", { clientRef: "first-reason-ref" })).toEqual(claimed);
 });
 
+test("a failed acceptance persist rolls back the provisional record and reservation", async () => {
+	let records: unknown[] = [];
+	let failNext = true;
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			const candidate = mutator(records as never);
+			if (failNext) {
+				failNext = false;
+				throw new Error("accept persist failed");
+			}
+			records = candidate;
+		},
+	} as never;
+	const reconciliation = createInvocationReconciliation({ store });
+	const first = { commandId: "accept-failed-command", turnId: "accept-failed-turn" };
+	reconciliation.admit("prompt", "accept-failed-ref");
+	await expect(reconciliation.noteAccepted("prompt", first, "accept-failed-ref")).rejects.toThrow(
+		"accept persist failed",
+	);
+	reconciliation.release("prompt", "accept-failed-ref");
+	expect(reconciliation.lookup("prompt", first)).toEqual({ status: "unknown" });
+
+	const retry = { commandId: "accept-retry-command", turnId: "accept-retry-turn" };
+	reconciliation.admit("prompt", "accept-failed-ref");
+	await reconciliation.noteAccepted("prompt", retry, "accept-failed-ref");
+	expect(reconciliation.lookup("prompt", { clientRef: "accept-failed-ref" })).toMatchObject({
+		status: "accepted",
+		commandId: retry.commandId,
+		turnId: retry.turnId,
+	});
+});
+
 test("durable reload keeps agent_end terminal across a paused successor transition", async () => {
 	let records: unknown[] = [];
 	let pauseWrites = 0;
@@ -2917,6 +2951,10 @@ function createInterceptorReconciliationStore(
 					interceptor({ type: "agent_failed" });
 					throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
 				}
+				const previous = backing.records.find(candidate => candidate.commandId === record.commandId);
+				if (record.terminalAt !== undefined && previous?.terminalAt === undefined) {
+					interceptor({ type: "agent_end" });
+				}
 			}
 			backing.records = records;
 		},
@@ -3431,6 +3469,48 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
+	test("agent_failed reaches every prompt in the active drained batch", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-failed-batch-"));
+		try {
+			const promoted: Array<((promotion: { startsOwnRun: boolean }) => void) | undefined> = [];
+			const harness = await invocationHarness("failed-batch", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					if ((options as { deliverAs?: string } | undefined)?.deliverAs === "followUp") {
+						promoted.push(
+							(options as { onQueuedPromoted?: (promotion: { startsOwnRun: boolean }) => void } | undefined)
+								?.onQueuedPromoted,
+						);
+					}
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_end");
+			const followUpB = await harness.control("turn.follow_up", { text: "b" });
+			const followUpC = await harness.control("turn.follow_up", { text: "c" });
+			promoted[0]?.({ startsOwnRun: true });
+			promoted[1]?.({ startsOwnRun: true });
+			await harness.emit("agent_start");
+			await harness.emit("agent_failed", {
+				error: Object.assign(new Error("provider failed"), { code: "provider_unavailable" }),
+			});
+			await harness.emit("agent_end");
+			for (const response of [followUpB, followUpC]) {
+				const ids = { commandId: response.result?.commandId, turnId: response.result?.turnId };
+				expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+					status: "failed",
+					error: { code: "provider_unavailable" },
+				});
+			}
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a non-empty agent_start re-entry preserves the replaced turn's lease and leases the replacement", async () => {
 		// Red-team finding (#4668): a second agent_start without a prior agent_end
 		// replaces the tracked invocation. The replaced turn's acceptance lease
@@ -3915,6 +3995,46 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 			expect(failedWrites).toBeGreaterThan(0);
 			expect(settled.status).toBe("failed");
 			expect(settled.error?.code).toBe("skill_runtime");
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("an active skill keeps retrying a failed terminal persistence boundary", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-skill-terminal-retry-"));
+		let failedWrites = 0;
+		try {
+			const harness = await invocationHarness("skill-terminal-retry", cwd, {
+				invokeSkill: async (_name, _args, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await new Promise<void>(() => {});
+				},
+				persistInterceptor: transition => {
+					if (transition.type === "agent_end" && failedWrites < 2) {
+						failedWrites += 1;
+						throw Object.assign(new Error("injected terminal persistence failure"), { code: "io_error" });
+					}
+				},
+			});
+			const submitted = await harness.control("skill.invoke", {
+				name: "hang",
+				args: "",
+				clientRef: "skill-terminal-retry-ref",
+			});
+			expect(submitted.ok).toBe(true);
+			await harness.emit("agent_start");
+			await harness.emit("agent_end");
+			let settled: { status?: string } | undefined;
+			for (let attempt = 0; attempt < 500 && settled === undefined; attempt += 1) {
+				const frame = await harness.query("skill.invoke_status", { clientRef: "skill-terminal-retry-ref" });
+				const result = frame.result as { status?: string } | undefined;
+				if (result?.status === "terminal_ok") settled = result;
+				else await Bun.sleep(10);
+			}
+			if (settled === undefined) throw new Error("active skill terminal recovery never converged");
+			expect(failedWrites).toBe(2);
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);

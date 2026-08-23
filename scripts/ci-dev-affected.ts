@@ -66,6 +66,10 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // replace, direct-basename test selection and owner fallback tasks.
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
+	"packages/agent/src/agent.ts": [
+		"packages/agent/test/agent-force-abort.test.ts",
+		"packages/agent/test/managed-attempt-transaction.test.ts",
+	],
 	"packages/coding-agent/src/tools/atomic-file-write.ts": ["packages/coding-agent/test/file-tools-atomicity.test.ts"],
 	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
@@ -83,6 +87,7 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/coding-agent/src/session/agent-session.ts": [
 		"packages/coding-agent/test/agent-session-concurrent.test.ts",
 		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
+		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
 	],
 	"packages/coding-agent/src/sdk/bus/reconciliation-store.ts": [
 		"packages/coding-agent/test/sdk-reconciliation-store.test.ts",

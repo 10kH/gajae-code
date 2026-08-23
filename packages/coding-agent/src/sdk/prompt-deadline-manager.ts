@@ -116,14 +116,35 @@ export class PromptDeadlineManager {
 			}
 			return;
 		}
-		let lookup: { status: string };
+		let lookup: { status: string; error?: { code: string; message: string } };
 		try {
-			lookup = this.#reconciliation.lookup("prompt", correlation) as { status: string };
+			lookup = this.#reconciliation.lookup("prompt", correlation) as {
+				status: string;
+				error?: { code: string; message: string };
+			};
 		} catch {
 			this.#retry(key);
 			return;
 		}
 		if (lookup.status === "terminal_ok" || lookup.status === "failed") {
+			this.clear(correlation);
+			return;
+		}
+		if (lookup.error !== undefined) {
+			// A real agent_failed diagnostic already won before the zero-activity
+			// deadline. Use the synthetic boundary only to close that failed run;
+			// never overwrite its authenticated classifier with
+			// prompt_deadline_exceeded, which a late real agent_end could otherwise
+			// upgrade to terminal_ok.
+			try {
+				await this.#reconciliation.noteTransition("prompt", correlation, { type: "agent_end" });
+			} catch {
+				this.#retry(key);
+				return;
+			}
+			if (this.#backOffIfSuperseded(key, lease, lease.generation)) return;
+			this.#expiryRetries.delete(key);
+			this.#onExpired?.(correlation);
 			this.clear(correlation);
 			return;
 		}
@@ -250,6 +271,16 @@ export class PromptDeadlineManager {
 				}
 			})
 			.catch(() => {
+				const current = this.#leases.get(key);
+				if (current !== lease || current.generation !== generation) {
+					// Validate authority before applying the exhaustion branch too. A stale
+					// third rejection must not mark or reschedule a renewed/replacement
+					// lease's recovery state.
+					this.#expiring.delete(key);
+					this.#expiryRetries.delete(key);
+					if (current) this.#schedule(key);
+					return;
+				}
 				if (attempts >= MAX_UNCERTAINTY_RETRIES) {
 					// Keep an explicit in-memory recovery state AND a live retry timer: a
 					// later real agent_end can still reconcile the retained lease, and the
@@ -267,18 +298,6 @@ export class PromptDeadlineManager {
 						(recoveryTimer as unknown as { unref?: () => void }).unref?.();
 						this.#timers.set(key, recoveryTimer);
 					}
-					return;
-				}
-				const current = this.#leases.get(key);
-				if (current !== lease || current.generation !== generation) {
-					// The timer map is keyed by correlation, so never clear or replace
-					// it after this failed attempt has become stale. The current owner
-					// already owns its own timer; reschedule only that live lease.
-					// This recovery attempt is over: release the adoption fence and
-					// the exhausted retry budget so the live lease restarts clean.
-					this.#expiring.delete(key);
-					this.#expiryRetries.delete(key);
-					if (current) this.#schedule(key);
 					return;
 				}
 				this.#clearTimer(key);
@@ -341,7 +360,13 @@ export class PromptDeadlineManager {
 		pendingFailure?: { code: string; message: string },
 	): void {
 		const key = leaseKey(correlation);
-		if (!this.#leases.has(key)) return;
+		if (!this.#leases.has(key)) {
+			// A real agent_end may arrive after a synthetic deadline already cleared
+			// its lease. Re-arm a bounded replay owner before the durable upgrade so a
+			// failed terminal_ok write is retried rather than leaving the synthetic
+			// deadline result permanently visible.
+			this.onAccepted(correlation);
+		}
 		this.#pendingTerminalTransitions.add(key);
 		// Compound failure-plus-terminal recovery intent (exact-head review HIGH):
 		// when expiry replays this real terminal transition after a failed write, it
