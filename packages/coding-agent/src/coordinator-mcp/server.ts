@@ -1015,9 +1015,17 @@ type CoordinatorWorktreeResolution = { ok: true; name?: string } | { ok: false; 
  * Refusals are typed rather than thrown: the bridge redacts error messages, so a
  * thrown error would reach the controller as an undiagnosable `invalid_input`.
  */
-function resolveCoordinatorWorktree(sessionCommand: string | null, requested: unknown): CoordinatorWorktreeResolution {
+function resolveCoordinatorWorktree(
+	sessionCommand: string | null,
+	requested: unknown,
+	required = false,
+): CoordinatorWorktreeResolution {
 	if (requested !== undefined && typeof requested !== "string") return { ok: false, reason: "invalid_worktree_name" };
 	const name = optionalString(requested);
+	if (required && !coordinatorWorktreeEnabled(sessionCommand)) {
+		return { ok: false, reason: "worktree_required_without_worktree_mode" };
+	}
+	if (required && name === null) return { ok: false, reason: "worktree_required" };
 	if (name === null) return { ok: true };
 	if (!coordinatorWorktreeEnabled(sessionCommand)) return { ok: false, reason: "worktree_not_enabled" };
 	// The selector is whitespace-split, so a name containing whitespace has no
@@ -7904,7 +7912,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								SAFE_EXTERNAL_ID_PATTERN.test(args.codex_host_session_id)
 							? args.codex_host_session_id
 							: "";
-				const delegateWorktree = resolveCoordinatorWorktree(config.sessionCommand, args.worktree);
+				const delegateWorktree = resolveCoordinatorWorktree(
+					config.sessionCommand,
+					args.worktree,
+					config.requireWorktree && !reusedSessionId,
+				);
 				if (!delegateWorktree.ok) return { ok: false, reason: delegateWorktree.reason };
 				const canonicalArgs = {
 					cwd: canonicalCwd,
@@ -8276,7 +8288,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						},
 					};
 				let creationRemoteStarted = false;
-				const worktreeResolution = resolveCoordinatorWorktree(config.sessionCommand, args.worktree);
+				const worktreeResolution = resolveCoordinatorWorktree(
+					config.sessionCommand,
+					args.worktree,
+					config.requireWorktree,
+				);
 				if (!worktreeResolution.ok) return { ok: false, reason: worktreeResolution.reason };
 				const canonicalArgs = {
 					cwd,

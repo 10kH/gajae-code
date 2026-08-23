@@ -66,6 +66,7 @@ export interface CoordinatorMcpConfig {
 	stateRoot: string;
 	codexTokenRoot: string;
 	sessionCommand: string | null;
+	requireWorktree: boolean;
 	sessionIdleTtlMs: number;
 	sessionSweepIntervalMs: number;
 	forceStopEnabled: boolean;
@@ -174,6 +175,7 @@ export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env):
 			env.GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT?.trim() || path.join(stateRoot, "codex-tokens"),
 		),
 		sessionCommand: env.GJC_COORDINATOR_MCP_SESSION_COMMAND?.trim() || null,
+		requireWorktree: parseBool(env.GJC_COORDINATOR_MCP_REQUIRE_WORKTREE),
 		sessionIdleTtlMs: parsePositiveIntMs(
 			env.GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS,
 			DEFAULT_SESSION_IDLE_TTL_MS,
