@@ -8,6 +8,8 @@ export interface MachineIdentityDeps {
 	readFile?: (file: string) => Promise<string>;
 	runCommand?: (command: string, args: readonly string[]) => { exitCode: number; stdout: Uint8Array };
 	installationSecret?: string;
+	configRootDir?: string;
+	link?: (existingPath: string, newPath: string) => Promise<void>;
 }
 
 function normalizedMachineIdentity(value: string, pattern: RegExp): string | undefined {
@@ -32,14 +34,20 @@ export function parseMacPlatformUuid(output: string): string | undefined {
 		: undefined;
 }
 
-async function loadInstallationSecret(): Promise<string> {
-	const directory = getConfigRootDir();
+async function loadInstallationSecret(deps: MachineIdentityDeps): Promise<string> {
+	const directory = deps.configRootDir ?? getConfigRootDir();
 	const file = path.join(directory, "machine-identity.secret");
+	const link = deps.link ?? fs.link;
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	let unsettledReads = 0;
 	for (;;) {
 		try {
 			const secret = (await fs.readFile(file, "utf8")).trim();
 			if (/^[0-9a-f]{64}$/.test(secret)) return secret;
+			if (unsettledReads++ < 4) {
+				await Bun.sleep(10);
+				continue;
+			}
 			throw new Error(`installation identity secret is malformed at ${file}`);
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -51,10 +59,18 @@ async function loadInstallationSecret(): Promise<string> {
 			await fs.writeFile(temporary, `${secret}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
 			await fs.chmod(temporary, 0o600);
 			try {
-				await fs.link(temporary, file);
+				await link(temporary, file);
 				return secret;
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+				const code = (error as NodeJS.ErrnoException).code;
+				if (code === "EEXIST") continue;
+				if (!["EPERM", "EOPNOTSUPP", "ENOSYS", "EXDEV"].includes(code ?? "")) throw error;
+				try {
+					await fs.writeFile(file, `${secret}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+					return secret;
+				} catch (writeError) {
+					if ((writeError as NodeJS.ErrnoException).code !== "EEXIST") throw writeError;
+				}
 			}
 		} finally {
 			await fs.rm(temporary, { force: true });
@@ -70,8 +86,15 @@ function hashMachineIdentity(rawId: string, installationSecret: string): string 
 		.digest("hex");
 }
 
-/** Loads a verified machine-local identity without persisting the underlying machine ID. */
-export async function loadInstallationHostId(deps: MachineIdentityDeps = {}): Promise<string> {
+function legacyMachineIdentity(rawId: string): string {
+	return crypto
+		.createHash("sha256")
+		.update("gajae-code:telegram-daemon:machine-identity:v1\0")
+		.update(rawId)
+		.digest("hex");
+}
+
+async function loadRawMachineIdentity(deps: MachineIdentityDeps): Promise<string> {
 	const platform = deps.platform ?? process.platform;
 	const readFile = deps.readFile ?? (async (file: string) => await fs.readFile(file, "utf8"));
 	const runCommand =
@@ -102,7 +125,18 @@ export async function loadInstallationHostId(deps: MachineIdentityDeps = {}): Pr
 	}
 
 	if (!rawId) throw new Error("machine-local identity is unavailable or malformed");
-	const installationSecret = deps.installationSecret ?? (await loadInstallationSecret());
+	return rawId;
+}
+
+/** Loads a verified machine-local identity without persisting the underlying machine ID. */
+export async function loadInstallationHostId(deps: MachineIdentityDeps = {}): Promise<string> {
+	const rawId = await loadRawMachineIdentity(deps);
+	const installationSecret = deps.installationSecret ?? (await loadInstallationSecret(deps));
 	if (!/^[0-9a-f]{64}$/.test(installationSecret)) throw new Error("installation identity secret is malformed");
 	return hashMachineIdentity(rawId, installationSecret);
+}
+
+/** @internal Recognizes owner records written before installation-keyed identities. */
+export async function loadLegacyInstallationHostId(deps: MachineIdentityDeps = {}): Promise<string> {
+	return legacyMachineIdentity(await loadRawMachineIdentity(deps));
 }

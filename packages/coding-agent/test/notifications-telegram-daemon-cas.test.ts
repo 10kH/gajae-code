@@ -82,6 +82,24 @@ test("machine-local identity parsing is strict and machine IDs are keyed per ins
 	).rejects.toThrow("unavailable or malformed");
 });
 
+test("machine identity secret creation falls back when hard links are unavailable", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-machine-identity-"));
+	temporaryDirectories.push(directory);
+	const hostId = await loadInstallationHostId({
+		platform: "linux",
+		configRootDir: directory,
+		link: async () => {
+			throw Object.assign(new Error("unsupported"), { code: "EOPNOTSUPP" });
+		},
+		readFile: async () => "00112233445566778899aabbccddeeff\n",
+	});
+
+	expect(hostId).toMatch(/^[0-9a-f]{64}$/);
+	expect(await fs.promises.readFile(path.join(directory, "machine-identity.secret"), "utf8")).toMatch(
+		/^[0-9a-f]{64}\n$/,
+	);
+});
+
 test("filesystem topic authority bootstraps, serializes competing hosts, and survives restart", async () => {
 	const { authority: first, file } = authority();
 	const second = new FilesystemTopicRegistryCasAuthority(file, {

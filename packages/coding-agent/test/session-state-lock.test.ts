@@ -34,6 +34,7 @@ installExactIdentityNatives();
 
 beforeEach(() => {
 	SessionStateLockTestHooks.ownerHostId = () => "local-host";
+	SessionStateLockTestHooks.legacyOwnerHostId = () => "legacy-local-host";
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = true;
 });
 
@@ -50,6 +51,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
 	SessionStateLockTestHooks.ownerHostId = undefined;
 	SessionStateLockTestHooks.loadInstallationHostId = undefined;
+	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
@@ -1187,6 +1189,29 @@ describe("coordinator session state lock", () => {
 		await reclaimStaleSessionStateLock(lockFile);
 
 		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+	});
+
+	it("reclaims a dead owner written with the previous same-host identity", async () => {
+		const { stateFile } = await seededRunningSession("lock-previous-host-owner");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(
+			lockFile,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "previous-owner-start",
+				token: "previous-owner-token",
+				owner_host_id: "previous-local-host",
+			}),
+		);
+		SessionStateLockTestHooks.ownerHostId = () => "local-host";
+		SessionStateLockTestHooks.legacyOwnerHostId = () => "previous-local-host";
+		SessionStateLockTestHooks.probeProcessSignal = () => {
+			throw Object.assign(new Error("missing"), { code: "ESRCH" });
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(fsSync.existsSync(lockFile)).toBe(false);
 	});
 
 	it("fails closed for an unqualified regular owner on a shared volume", async () => {
