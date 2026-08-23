@@ -82,7 +82,12 @@ export function resolvedScopeV1(value: unknown): ResolvedScopeV1 | undefined {
 		requested: scope.requested,
 		requestAnchor: scope.requestAnchor,
 	});
-	if (!request || (scope.resolution !== "resolved" && scope.resolution !== "not-in-git-worktree")) return undefined;
+	if (
+		!request ||
+		(scope.resolution !== "resolved" && scope.resolution !== "not-in-git-worktree") ||
+		Object.keys(scope).some(key => key !== "version" && key !== "requested" && key !== "requestAnchor" && key !== "resolved" && key !== "resolution")
+	)
+		return undefined;
 	const resolved = scope.resolved;
 	if (resolved === null)
 		return scope.resolution === "not-in-git-worktree" && request.requested === "repo"
@@ -126,6 +131,7 @@ export function sdkSearchRowV1(value: unknown): SdkSearchRowV1 | undefined {
 		typeof locator.cwd !== "string" ||
 		(locator.worktreeRoot !== null && typeof locator.worktreeRoot !== "string") ||
 		typeof locator.stateRoot !== "string" ||
+		Object.keys(locator).some(key => key !== "cwd" && key !== "worktreeRoot" && key !== "stateRoot") ||
 		Object.keys(row).some(key => key !== "id" && key !== "locator" && key !== "live")
 	)
 		return undefined;
@@ -148,11 +154,28 @@ export function sdkSearchResultV1(value: unknown): SdkSearchResultV1 | undefined
 		!Array.isArray(result.rows) ||
 		!Array.isArray(result.warnings) ||
 		result.rows.some(row => !sdkSearchRowV1(row)) ||
-		result.warnings.some(warning => typeof warning !== "string")
+		result.warnings.some(warning => typeof warning !== "string") ||
+		Object.keys(result).some(
+			key =>
+				key !== "version" &&
+				key !== "scope" &&
+				key !== "status" &&
+				key !== "observedAt" &&
+				key !== "indexSeq" &&
+				key !== "rows" &&
+				key !== "warnings" &&
+				key !== "error",
+		)
 	)
 		return undefined;
 	if (result.status === "not-in-git-worktree" && (scope.resolved !== null || result.rows.length !== 0)) return undefined;
-	if (result.status === "unavailable" && (!isRecord(result.error) || typeof result.error.code !== "string" || typeof result.error.message !== "string"))
+	if (
+		result.status === "unavailable" &&
+		(!isRecord(result.error) ||
+			typeof result.error.code !== "string" ||
+			typeof result.error.message !== "string" ||
+			Object.keys(result.error).some(key => key !== "code" && key !== "message"))
+	)
 		return undefined;
 	if (result.indexSeq !== undefined && (!Number.isSafeInteger(result.indexSeq) || result.indexSeq < 0)) return undefined;
 	return {
