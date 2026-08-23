@@ -357,12 +357,39 @@ describe("main orchestration", () => {
 			const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
 			await Promise.all([fileApprovalStore.recordApprovals([manifest]), fileApprovalStore.recordApprovals([manifest])]);
 			const stat = await fs.stat(target);
-			expect(stat.mode & 0o077).toBe(0);
+			// Windows reports synthetic 0o666-style modes, so the private-mode bits
+			// are only meaningful on POSIX.
+			if (process.platform !== "win32") expect(stat.mode & 0o077).toBe(0);
 			expect(await fileApprovalStore.loadApprovals()).toEqual([manifest]);
 			await fileApprovalStore.recordFiled(manifest, "https://github.com/Yeachan-Heo/gajae-code/issues/1");
 			expect(await fileApprovalStore.hasAnyFiled(manifest)).toBe(true);
 			await fileApprovalStore.consume(manifest);
 			expect(await fileApprovalStore.loadApprovals()).toEqual([]);
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("recovers a stale creation lock left behind by a dead process", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-lock-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+			const lockPath = `${target}.create.lock`;
+			await fs.mkdir(lockPath, { mode: 0o700 });
+			await fs.writeFile(
+				path.join(lockPath, "owner.json"),
+				`${JSON.stringify({ token: randomUUID(), pid: 999_999_999, startedAt: 0 })}\n`,
+				{ mode: 0o600 },
+			);
+			const past = new Date(Date.now() - 11 * 60 * 1000);
+			await fs.utimes(lockPath, past, past);
+			expect(await withCreationLock(async () => "ran")).toBe("ran");
+			await expect(fs.lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
 		} finally {
 			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
 			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;

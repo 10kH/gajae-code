@@ -49,6 +49,7 @@
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -607,17 +608,28 @@ function isPending(value: unknown): value is { manifest: ApprovalManifest; attem
 	return isManifest(record.manifest) && typeof record.attemptId === "string" && ATTEMPT_ID.test(record.attemptId);
 }
 
+/**
+ * POSIX mode bits and ownership are synthetic on Windows — a directory created
+ * with mode 0o700 reads back as 0o666 — so the group/other-permission and uid
+ * checks would reject every store there; NTFS privacy comes from the profile
+ * directory ACLs instead, and only the entry-kind checks carry over.
+ */
+function isPrivateOwnedEntry(stat: Stats, kind: "directory" | "file"): boolean {
+	if (kind === "directory" ? !stat.isDirectory() : !stat.isFile()) return false;
+	if (stat.isSymbolicLink()) return false;
+	if (process.platform === "win32") return true;
+	const uid = process.getuid?.();
+	return (stat.mode & 0o077) === 0 && (uid === undefined || stat.uid === uid);
+}
+
 async function loadStoredApprovals(): Promise<StoredApprovals> {
 	const target = approvalStorePath();
 	const directory = path.dirname(target);
 	try {
 		const directoryStat = await fs.lstat(directory);
-		const uid = process.getuid?.();
-		if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 || (uid !== undefined && directoryStat.uid !== uid))
-			return { approvals: [], filed: [], pending: [] };
+		if (!isPrivateOwnedEntry(directoryStat, "directory")) return { approvals: [], filed: [], pending: [] };
 		const fileStat = await fs.lstat(target);
-		if (!fileStat.isFile() || fileStat.isSymbolicLink() || (fileStat.mode & 0o077) !== 0 || (uid !== undefined && fileStat.uid !== uid))
-			return { approvals: [], filed: [], pending: [] };
+		if (!isPrivateOwnedEntry(fileStat, "file")) return { approvals: [], filed: [], pending: [] };
 		const parsed: unknown = await Bun.file(target).json();
 		if (typeof parsed !== "object" || parsed === null) return { approvals: [], filed: [], pending: [] };
 		const record = parsed as { approvals?: unknown; filed?: unknown; pending?: unknown };
@@ -688,8 +700,7 @@ async function ensureApprovalStoreDirectory(): Promise<void> {
 	const directory = path.dirname(approvalStorePath());
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
 	const directoryStat = await fs.lstat(directory);
-	const uid = process.getuid?.();
-	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 || (uid !== undefined && directoryStat.uid !== uid))
+	if (!isPrivateOwnedEntry(directoryStat, "directory"))
 		throw new Error("approval store directory is not a private directory owned by the current user");
 }
 
@@ -710,7 +721,14 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 		} catch (error) {
 			const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
 			await fs.rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
-			if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
+			// Windows reports EPERM, not EEXIST/ENOTEMPTY, when renaming a directory
+			// onto an existing one; without this the stale-lock takeover below is
+			// unreachable on win32. The lstat gate keeps a genuine ACL denial fatal.
+			const contended =
+				code === "EEXIST" ||
+				code === "ENOTEMPTY" ||
+				(process.platform === "win32" && code === "EPERM" && (await fs.lstat(lockPath).then(() => true, () => false)));
+			if (!contended) throw error;
 			const stale = await staleLock(lockPath);
 			if (stale.stale) await removeLockIfOwner(lockPath, stale.token);
 			await Bun.sleep(25);
