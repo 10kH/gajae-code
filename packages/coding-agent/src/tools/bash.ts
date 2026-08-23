@@ -1092,6 +1092,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}),
 			...(sessionAgentDir && !explicitAgentDirOverride ? { GJC_CODING_AGENT_DIR: sessionAgentDir } : {}),
 			...expandedEnv,
+			...(this.session.getMasterBashCapability?.() ? { GJC_MASTER_CAPABILITY: this.session.getMasterBashCapability() } : {}),
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};

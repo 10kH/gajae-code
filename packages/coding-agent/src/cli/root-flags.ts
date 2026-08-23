@@ -73,6 +73,8 @@ export const ROOT_LAUNCH_FLAGS = {
 		optionalValue: true,
 	}),
 	"no-title": Flags.boolean({ description: "Disable title auto-generation" }),
+	master: Flags.boolean({ description: "Launch an interactive master session" }),
+	scope: Flags.string({ description: "Master scope: repo (default), pwd, or global", options: ["repo", "pwd", "global"] }),
 };
 
 export type ConsumerLaunchFlagName = "hook" | "extension" | "no-extensions" | "no-skills" | "skills";

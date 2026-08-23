@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
@@ -68,6 +68,20 @@ export type SessionLocatorV2 = {
 	stateRoot: string;
 };
 
+/** Durable master-role facts. `attestationEpoch` is opaque random broker state. */
+export type MasterRoleAttestationV2 = {
+	version: 2;
+	ownerSessionId: string;
+	launchPid: number;
+	launchProcessIncarnation: string;
+	role: "master";
+	attestationEpoch: string;
+};
+
+export function newMasterAttestationEpoch(): string {
+	return randomBytes(32).toString("base64url");
+}
+
 /** Canonicalize a cwd without making an unavailable path a launch failure. */
 export async function canonicalSessionCwd(cwd: string): Promise<string> {
 	try {
@@ -127,6 +141,7 @@ export interface SessionIndexEvent {
 	hostIncarnation?: string;
 	/** Present on host_heartbeat checkpoints (C2). */
 	activity?: SessionActivity;
+	masterRole?: MasterRoleAttestationV2;
 	ts: number;
 	checksum: string;
 }
@@ -147,6 +162,7 @@ export interface IndexedSession {
 	activity?: SessionActivity;
 	/** Wall-clock timestamp of the latest admitted heartbeat, when one exists. */
 	lastHeartbeatAt?: number;
+	masterRole?: MasterRoleAttestationV2;
 	/** True when more than one unresolved authority-fencing state-root identity claims this session id. */
 	ambiguous: boolean;
 	/** True when the identity's latest event is terminal (DR-1 retains stopped rows for inspection/offline tail). */
@@ -576,6 +592,7 @@ function projectIdentity(
 		terminalUncertain,
 		indexSeq: latest.indexSeq,
 		hostIncarnation: latest.hostIncarnation,
+		masterRole: latest.masterRole,
 		identityProvenance: recordedIncarnation === undefined ? "legacy" : "composite",
 		activity: heartbeat?.activity,
 		lastHeartbeatAt: heartbeat?.ts,
@@ -1939,6 +1956,7 @@ export class SessionIndex {
 						pid: row.pid,
 						...(row.processIncarnation === undefined ? {} : { processIncarnation: row.processIncarnation }),
 						...(row.hostIncarnation === undefined ? {} : { hostIncarnation: row.hostIncarnation }),
+						...(row.masterRole === undefined ? {} : { masterRole: row.masterRole }),
 						activity: { state: "active", at: now },
 						ts: now,
 					};
@@ -2014,6 +2032,7 @@ export class SessionIndex {
 					terminalUncertain: false,
 					indexSeq: event.indexSeq,
 					hostIncarnation: event.hostIncarnation,
+					masterRole: event.masterRole,
 					identityProvenance: event.hostIncarnation === undefined ? "legacy" : "composite",
 					ambiguous: false,
 					live: alive(event.pid),

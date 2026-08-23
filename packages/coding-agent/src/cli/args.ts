@@ -84,6 +84,8 @@ export interface Args {
 	noRules?: boolean;
 	listModels?: string | true;
 	noTitle?: boolean;
+	master?: true;
+	masterScope?: "repo" | "pwd" | "global";
 	messages: string[];
 	fileArgs: string[];
 	/** Flags unknown to every launch parser; their consumer supplies the diagnostic. */
@@ -178,6 +180,17 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 			result.help = true;
 		} else if (arg === "--version" || arg === "-v") {
 			result.version = true;
+		} else if (arg === "--master") {
+			result.master = true;
+		} else if (arg === "--scope") {
+			const scope = takeFlagValue(args, i++, "--scope");
+			if (scope !== "repo" && scope !== "pwd" && scope !== "global") {
+				throw new CliParseError("invalid --scope value (expected repo, pwd, or global)");
+			}
+			if (result.masterScope !== undefined && result.masterScope !== scope) {
+				throw new CliParseError("--scope cannot be specified with conflicting values");
+			}
+			result.masterScope = scope;
 		} else if (arg === "--allow-home") {
 			result.allowHome = true;
 		} else if (arg === "--mode") {
@@ -371,6 +384,10 @@ export function parseArgs(args: string[], authority: ParseArgsAuthority = "local
 		}
 	}
 
+	if (result.masterScope !== undefined && result.master !== true) {
+		throw new CliParseError("--scope requires --master");
+	}
+	if (result.master === true && result.masterScope === undefined) result.masterScope = "repo";
 	if (result.default && !result.mpreset) {
 		throw new CliParseError("--default requires --mpreset <name>");
 	}

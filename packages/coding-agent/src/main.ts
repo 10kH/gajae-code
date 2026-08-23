@@ -56,7 +56,8 @@ import {
 	discoverAuthStorage,
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
-import { resolveSessionLocator, SessionIndex } from "./sdk/broker/session-index";
+import { newMasterAttestationEpoch, resolveSessionLocator, SessionIndex } from "./sdk/broker/session-index";
+import { assertMasterLaunchDisposition, assertMasterLaunchArgs, createMasterModeContext } from "./master-mode/context";
 import type { AgentSession } from "./session/agent-session";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
@@ -1335,6 +1336,7 @@ export async function runRootCommand(
 	deps: RunRootCommandDependencies = {},
 ): Promise<void> {
 	const parsedArgs = parsed;
+	assertMasterLaunchArgs(parsedArgs);
 	let initialThemeInitialized = false;
 	let autoChdirApplied = false;
 	let bareResumeSessionManager: SessionManager | undefined;
@@ -1523,6 +1525,18 @@ export async function runRootCommand(
 		mode: parsedArgs.mode,
 	});
 	if (disposition.nonInteractiveError) {
+	try {
+		assertMasterLaunchDisposition({
+			master: parsedArgs.master,
+			isInteractive: disposition.isInteractive,
+			autoPrint: disposition.autoPrint,
+			nonInteractiveError: disposition.nonInteractiveError,
+		});
+	} catch (error) {
+		process.stderr.write(`${chalk.red(error instanceof Error ? error.message : "Invalid master launch") }\n`);
+		if (!deps.suppressProcessExit) process.exitCode = 1;
+		return;
+	}
 		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
 		process.exit(1);
 	}
@@ -1645,6 +1659,10 @@ export async function runRootCommand(
 			}
 		}
 	}
+	const masterModeContext =
+		parsedArgs.master === true && sessionManager
+			? createMasterModeContext(parsedArgs.masterScope ?? "repo", sessionManager.getSessionId(), newMasterAttestationEpoch())
+			: undefined;
 
 	const { options: sessionOptions } = await logger.time(
 		"buildSessionOptions",
@@ -1704,6 +1722,7 @@ export async function runRootCommand(
 	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.sdkHostModeSupported = isInteractive;
 	sessionOptions.settings = settingsInstance;
+	sessionOptions.masterModeContext = masterModeContext;
 	if (isInteractive && sessionOptions.mcpConfigPath) {
 		sessionOptions.deferMcpConfigStartup = true;
 	}
@@ -1799,6 +1818,18 @@ export async function runRootCommand(
 			endpointGeneration: 0,
 			pid: process.pid,
 			...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
+			...(masterModeContext && directSessionIncarnation
+				? {
+					masterRole: {
+						version: 2,
+						ownerSessionId: masterModeContext.ownerSessionId,
+						launchPid: process.pid,
+						launchProcessIncarnation: directSessionIncarnation,
+						role: "master" as const,
+						attestationEpoch: masterModeContext.attestationEpoch,
+					},
+				}
+				: {}),
 		});
 		postmortem.register("direct-session-index", async () => {
 			await sessionIndex.append({

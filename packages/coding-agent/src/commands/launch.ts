@@ -3,6 +3,7 @@
  */
 
 import { APP_NAME, getAgentDir, setProjectDir } from "@gajae-code/utils";
+import { assertMasterLaunchArgs } from "../master-mode/context";
 import { Args, Command } from "@gajae-code/utils/cli";
 import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
@@ -130,6 +131,7 @@ export default class Index extends Command {
 		const { args } = prepareAcpTerminalAuthArgs(this.argv);
 		const parsed = parseArgs([...args], "deferred");
 		if (parsed.mode !== "acp") assertLocalLaunchArgs(parsed);
+		assertMasterLaunchArgs(parsed);
 		if (parsed.help || parsed.version) {
 			await runRootCommand(parsed, args);
 			return;
@@ -150,6 +152,7 @@ export default class Index extends Command {
 		}
 		const launchParsed = parseArgs(launch.args, "deferred");
 		if (launchParsed.mode !== "acp") assertLocalLaunchArgs(launchParsed);
+		assertMasterLaunchArgs(launchParsed);
 		if (
 			launchDefaultTmuxIfNeeded({
 				parsed: launchParsed,

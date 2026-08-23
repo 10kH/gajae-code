@@ -24,7 +24,8 @@ import {
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
 import { ensureBroker } from "../broker/ensure";
-import { resolveSessionLocator, SessionIndex } from "../broker/session-index";
+import { resolveSessionLocator, SessionIndex, type MasterRoleAttestationV2 } from "../broker/session-index";
+import { processIncarnation } from "../broker/process-incarnation";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
@@ -393,6 +394,10 @@ export interface CreateSdkSessionRuntimeOptions {
 	onSdkRequest?: SessionSdkHostOptions["onRequest"];
 	/** Mutable shadow of patched config values merged into query readback. */
 	configOverrides?: Map<string, unknown>;
+	/** In-memory master capability for private broker verification only. */
+	masterCapability?: string;
+	/** Opaque direct-role epoch this effective host may adopt. */
+	masterAttestationEpoch?: string;
 	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 	/** Callback when a frame is admitted to the runtime (test harness). */
@@ -3033,6 +3038,28 @@ export function registerSdkOnlyNotificationCommand(api: ExtensionAPI): void {
 	});
 }
 
+function masterAttestationForEffectiveHost(input: {
+	masterCapability: string | undefined;
+	attestationEpoch: string | undefined;
+	sessionId: string;
+	pid: number;
+	processIncarnation: string | undefined;
+	direct: MasterRoleAttestationV2 | undefined;
+}): MasterRoleAttestationV2 | undefined {
+	const direct = input.direct;
+	if (
+		input.masterCapability === undefined ||
+		input.attestationEpoch === undefined ||
+		direct === undefined ||
+		direct.ownerSessionId !== input.sessionId ||
+		direct.launchPid !== input.pid ||
+		direct.launchProcessIncarnation !== input.processIncarnation ||
+		direct.attestationEpoch !== input.attestationEpoch
+	)
+		return undefined;
+	return direct;
+}
+
 /** Install a complete SDK host for a session when notifications are inactive. */
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	let active:
@@ -3440,6 +3467,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await current.registerBroker();
 		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
 	});
+	const consumedMasterNonces = new Set<string>();
 	api.on("turn_end", (_event, ctx) =>
 		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
 	);
@@ -3892,6 +3920,26 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			masterCapabilityVerify: frame => {
+				const nonce = typeof frame.nonce === "string" ? frame.nonce : "";
+				const epoch = typeof frame.attestationEpoch === "string" ? frame.attestationEpoch : "";
+				const capability = typeof frame.capability === "string" ? frame.capability : "";
+				const expected = options.masterCapability;
+				const expectedBytes = Buffer.from(expected ?? "");
+				const capabilityBytes = Buffer.from(capability);
+				const reusable = nonce.length > 0 && !consumedMasterNonces.has(nonce);
+				if (reusable) consumedMasterNonces.add(nonce);
+				return {
+					ok:
+						reusable &&
+						expected !== undefined &&
+						epoch === options.masterAttestationEpoch &&
+						expectedBytes.length === capabilityBytes.length &&
+						crypto.timingSafeEqual(expectedBytes, capabilityBytes),
+					nonce,
+					attestationEpoch: epoch === options.masterAttestationEpoch ? epoch : "",
+				};
+			},
 			control: async (connectionId, frame) => {
 				options.onFrameAdmitted?.();
 				const request = controlRequestFromFrame(frame as Record<string, unknown>);
@@ -4016,7 +4064,26 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					register: async input => {
 						const endpointMtimeMs = (await fs.stat(path.join(input.stateRoot, "sdk", `${input.sessionId}.json`)))
 							.mtimeMs;
-						await index.append({ type: "host_registered", ...input, locator, pid: process.pid, endpointMtimeMs });
+						const direct = index
+							.listSessionIdentities()
+							.find(row => row.sessionId === input.sessionId && row.endpointGeneration === 0 && row.pid === process.pid)
+							?.masterRole;
+						const masterRole = masterAttestationForEffectiveHost({
+							masterCapability: options.masterCapability,
+							attestationEpoch: options.masterAttestationEpoch,
+							sessionId: input.sessionId,
+							pid: process.pid,
+							processIncarnation: processIncarnation(process.pid),
+							direct,
+						});
+						await index.append({
+							type: "host_registered",
+							...input,
+							locator,
+							pid: process.pid,
+							endpointMtimeMs,
+							...(masterRole ? { masterRole } : {}),
+						});
 					},
 					unregister: async input => {
 						await index.append({ type: "host_unregistered", ...input, locator, pid: process.pid });

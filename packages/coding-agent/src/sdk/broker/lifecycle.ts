@@ -4244,7 +4244,11 @@ async function executeLifecycleResponse(
 					// by the OS rather than captured (#4712 review).
 					stdio: "ignore",
 					env: {
-						...commandEnvironment,
+						// Master capability is process-local to direct Bash children and must
+						// never cross a broker lifecycle launch boundary.
+						...Object.fromEntries(
+							Object.entries(commandEnvironment).filter(([key]) => key !== "GJC_MASTER_CAPABILITY"),
+						),
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,

@@ -521,6 +521,8 @@ export interface CreateAgentSessionOptions {
 	 * @internal CLI-only startup optimization; SDK callers retain synchronous loading by default.
 	 */
 	deferMcpConfigStartup?: boolean;
+	/** Process-local master authority. Never persist or pass to lifecycle children. */
+	masterModeContext?: import("../master-mode/context").MasterModeContext;
 	/**
 	 * Defer memory backend startup until the caller has applied startup model profiles.
 	 * @internal CLI-only ordering guard; SDK callers retain immediate startup by default.
@@ -1303,6 +1305,7 @@ function validateAutomationTools(options: CreateAgentSessionOptions): Automation
 
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
 	const automationTools = validateAutomationTools(options);
+	const masterModeContext = options.masterModeContext;
 	const lifecycleStartupCapability = (
 		options as CreateAgentSessionOptions & { [lifecycleStartupCapabilityOption]?: SdkStartupCapability }
 	)[lifecycleStartupCapabilityOption];
@@ -2527,6 +2530,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			getToolForExecution: name => session?.getToolForExecution(name),
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
+			getMasterBashCapability: () => masterModeContext?.getCapability(),
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getPlanModeState: () => session?.getPlanModeState(),
@@ -3065,6 +3069,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					if (autoroutingInactive) markAutoroutingInactive(api);
 					if (lifecycleStartupCapability) attachLifecycleStartupCapability(api, lifecycleStartupCapability);
+					if (masterModeContext) {
+						createSdkSessionRuntimeExtension(api, {
+							agentDir,
+							createTransport: input => createSdkWebSocketTransport(input),
+							settings,
+							masterCapability: masterModeContext.getCapability(),
+							masterAttestationEpoch: masterModeContext.attestationEpoch,
+						});
+						return;
+					}
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");
 					if (notificationsExtensionEligible) {
