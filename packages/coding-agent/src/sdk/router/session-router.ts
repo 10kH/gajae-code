@@ -101,6 +101,48 @@ export interface NotificationCleanupReceipt {
 	readonly reason?: string;
 }
 
+export interface SessionGenerationEvidence {
+	readonly source: "session_index";
+	readonly observedIndexSeq: number;
+	readonly evidenceIndexSeq: number;
+}
+
+export interface SessionGenerationUnknownEvidence {
+	readonly source: "session_index";
+	readonly observedIndexSeq: number;
+}
+
+export type SessionGenerationStatus =
+	| {
+			readonly status: "current";
+			readonly evidence: SessionGenerationEvidence;
+	  }
+	| {
+			readonly status: "retired";
+			readonly evidence: SessionGenerationEvidence & {
+				readonly event: "host_unregistered" | "session_closed" | "session_deleted";
+			};
+	  }
+	| {
+			readonly status: "replaced";
+			readonly currentGeneration: number;
+			readonly evidence: SessionGenerationEvidence;
+	  }
+	| {
+			readonly status: "unknown";
+			readonly reason:
+				| "invalid_generation"
+				| "index_unavailable"
+				| "index_incomplete"
+				| "session_not_observed"
+				| "generation_not_observed"
+				| "generation_reused"
+				| "ambiguous_authority"
+				| "proof_expired"
+				| "reconciliation_incomplete";
+			readonly evidence?: SessionGenerationUnknownEvidence;
+	  };
+
 /** The transport surface Router keeps private behind its attachment capabilities. */
 export interface SessionRouterClient {
 	onFrame(handler: (frame: Record<string, unknown>) => void): () => void;
@@ -729,6 +771,44 @@ export class SessionRouter {
 		if (!endpoint || endpoint.stale === true || endpoint.pid !== indexed.pid || !endpoint.token) return undefined;
 		if (this.#sessions.get(sessionId) !== attached || !this.#attachmentPublished(attached)) return undefined;
 		return { sessionId, endpointGeneration: attached.generation };
+	}
+
+	/**
+	 * Reconciles one exact endpoint generation without exposing endpoint or process
+	 * credentials. Retirement is returned only from a retained positive terminal
+	 * index event; absence, corruption, incomplete reconciliation, and generation
+	 * reuse remain explicitly unknown.
+	 */
+	async generationStatus(sessionId: string, endpointGeneration: number): Promise<SessionGenerationStatus> {
+		if (!Number.isSafeInteger(endpointGeneration) || endpointGeneration <= 0)
+			return { status: "unknown", reason: "invalid_generation" };
+		try {
+			await this.#index.open();
+			const status = await this.#index.generationStatus(sessionId, endpointGeneration);
+			const evidence: SessionGenerationUnknownEvidence = {
+				source: "session_index",
+				observedIndexSeq: status.observedIndexSeq,
+			};
+			switch (status.status) {
+				case "current":
+					return { status: "current", evidence: { ...evidence, evidenceIndexSeq: status.evidenceIndexSeq } };
+				case "retired":
+					return {
+						status: "retired",
+						evidence: { ...evidence, evidenceIndexSeq: status.evidenceIndexSeq, event: status.event },
+					};
+				case "replaced":
+					return {
+						status: "replaced",
+						currentGeneration: status.currentGeneration,
+						evidence: { ...evidence, evidenceIndexSeq: status.evidenceIndexSeq },
+					};
+				case "unknown":
+					return { status: "unknown", reason: status.reason, evidence };
+			}
+		} catch {
+			return { status: "unknown", reason: "index_unavailable" };
+		}
 	}
 
 	/** Activates a prepared session through one Router-owned, one-shot SDK client. */

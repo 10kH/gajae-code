@@ -101,6 +101,37 @@ export interface SessionList {
 	warnings: string[];
 }
 
+export type SessionGenerationIndexStatus =
+	| {
+			status: "current";
+			observedIndexSeq: number;
+			evidenceIndexSeq: number;
+	  }
+	| {
+			status: "retired";
+			observedIndexSeq: number;
+			evidenceIndexSeq: number;
+			event: "host_unregistered" | "session_closed" | "session_deleted";
+	  }
+	| {
+			status: "replaced";
+			observedIndexSeq: number;
+			evidenceIndexSeq: number;
+			currentGeneration: number;
+	  }
+	| {
+			status: "unknown";
+			observedIndexSeq: number;
+			reason:
+				| "index_incomplete"
+				| "session_not_observed"
+				| "generation_not_observed"
+				| "generation_reused"
+				| "ambiguous_authority"
+				| "proof_expired"
+				| "reconciliation_incomplete";
+	  };
+
 export interface SessionIndexDiagnosis {
 	status: "healthy" | "corrupt" | "unsupported";
 	validPrefixSeq: number;
@@ -1533,6 +1564,138 @@ export class SessionIndex {
 			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).sessions,
 			warnings: this.#warnings,
 		};
+	}
+
+	/**
+	 * Credential-free proof for one exact public endpoint generation.
+	 *
+	 * A strictly newer live generation proves replacement only when this
+	 * generation was itself observed. Otherwise terminal evidence wins only when
+	 * the retained index history positively records it for the exact generation. Missing,
+	 * ambiguous, reused, corrupt, or merely non-live state remains unknown.
+	 */
+	async generationStatus(sessionId: string, endpointGeneration: number): Promise<SessionGenerationIndexStatus> {
+		const probed = new Map<string, string | undefined>();
+		for (const event of this.#events) {
+			if (event.type !== "host_registered") continue;
+			const recordedIncarnation = event.hostIncarnation ?? event.processIncarnation;
+			if (recordedIncarnation === undefined || !alive(event.pid)) continue;
+			probed.set(
+				`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}`,
+				processIncarnation(event.pid),
+			);
+		}
+		const probedAt = performance.now();
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		return await SessionIndex.#enqueue(indexPath, () =>
+			withSessionIndexLock("generation reconciliation", this.#agentDir, async () => {
+				const freshAtAcquisition = performance.now() - probedAt <= SESSION_INDEX_PROBE_FRESHNESS_MS;
+				await this.#replayUnderLock();
+				const freshAfterReplay = performance.now() - probedAt <= SESSION_INDEX_REPLAY_FRESHNESS_MS;
+				return this.#generationStatusFromEvents(
+					sessionId,
+					endpointGeneration,
+					freshAtAcquisition && freshAfterReplay ? probed : new Map(),
+				);
+			}),
+		);
+	}
+
+	#generationStatusFromEvents(
+		sessionId: string,
+		endpointGeneration: number,
+		probedIncarnations: ReadonlyMap<string, string | undefined>,
+	): SessionGenerationIndexStatus {
+		const observedIndexSeq = this.indexSeq;
+		if (this.#corruptSuffix || this.#warnings.length > 0)
+			return { status: "unknown", observedIndexSeq, reason: "index_incomplete" };
+
+		const rawSessionEvents = this.#events.filter(event => event.sessionId === sessionId);
+		if (rawSessionEvents.length === 0) return { status: "unknown", observedIndexSeq, reason: "session_not_observed" };
+		const rawGenerationEvents = rawSessionEvents.filter(event => event.endpointGeneration === endpointGeneration);
+		if (rawGenerationEvents.length === 0)
+			return { status: "unknown", observedIndexSeq, reason: "generation_not_observed" };
+
+		const registrations = rawGenerationEvents.filter(event => event.type === "host_registered");
+		const authorityKeys = new Set<string>();
+		for (const event of registrations) {
+			const incarnation = event.hostIncarnation ?? event.processIncarnation;
+			const authority =
+				incarnation === undefined
+					? `legacy:${event.pid}:${event.endpointMtimeMs ?? "unknown"}`
+					: `composite:${incarnation}`;
+			authorityKeys.add(`${resolveEquivalentPath(event.locator.stateRoot)}\u0000${authority}`);
+		}
+		if (authorityKeys.size > 1) return { status: "unknown", observedIndexSeq, reason: "generation_reused" };
+		const registration = registrations.at(-1);
+		const registrationIncarnation = registration?.hostIncarnation ?? registration?.processIncarnation;
+		if (!registration || registrationIncarnation === undefined)
+			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+		if (
+			rawSessionEvents.some(
+				event =>
+					event.type === "host_registered" &&
+					event.indexSeq > registration.indexSeq &&
+					event.endpointGeneration < endpointGeneration,
+			)
+		)
+			return { status: "unknown", observedIndexSeq, reason: "generation_reused" };
+
+		const admitted = admitEvents(this.#events).admitted;
+		const generationEvents = admitted.filter(
+			event => event.sessionId === sessionId && event.endpointGeneration === endpointGeneration,
+		);
+		if (generationEvents.length === 0)
+			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+
+		const current = reduceEvents(admitted, this.#policy.clock(), this.#agentDir, probedIncarnations).sessions.find(
+			session => session.sessionId === sessionId,
+		);
+		if (current?.terminalUncertain)
+			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+		if (current && !isSessionAuthorityEligible(current))
+			return { status: "unknown", observedIndexSeq, reason: "ambiguous_authority" };
+		if (current?.live) {
+			if (current.endpointGeneration === endpointGeneration)
+				return {
+					status: "current",
+					observedIndexSeq,
+					evidenceIndexSeq: current.indexSeq,
+				};
+			if (current.endpointGeneration > endpointGeneration)
+				return {
+					status: "replaced",
+					observedIndexSeq,
+					evidenceIndexSeq: current.indexSeq,
+					currentGeneration: current.endpointGeneration,
+				};
+			return { status: "unknown", observedIndexSeq, reason: "generation_reused" };
+		}
+		const latestExact = generationEvents.findLast(event => event.type !== "host_heartbeat");
+		if (
+			latestExact?.type === "host_unregistered" ||
+			latestExact?.type === "session_closed" ||
+			latestExact?.type === "session_deleted"
+		) {
+			const terminalIncarnation = latestExact.hostIncarnation ?? latestExact.processIncarnation;
+			if (latestExact.ts < this.#policy.clock() - this.#policy.maxAgeMs)
+				return { status: "unknown", observedIndexSeq, reason: "proof_expired" };
+			if (
+				terminalIncarnation !== registrationIncarnation ||
+				latestExact.pid !== registration.pid ||
+				resolveEquivalentPath(latestExact.locator.stateRoot) !==
+					resolveEquivalentPath(registration.locator.stateRoot)
+			)
+				return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+			return {
+				status: "retired",
+				observedIndexSeq,
+				evidenceIndexSeq: latestExact.indexSeq,
+				event: latestExact.type,
+			};
+		}
+
+		return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
 	}
 	/**
 	 * Broker-internal current composite-identity rows. Unlike {@link listSessions},
