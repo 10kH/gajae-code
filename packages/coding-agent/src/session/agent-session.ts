@@ -2648,6 +2648,7 @@ export class AgentSession {
 	#silentAbortPending = false;
 	/** In-flight `abort()` unwind. Fresh prompts wait so they cannot steer into the dying turn. */
 	#abortUnwind: Promise<void> | undefined;
+	#abortForceRecoveryStarted = false;
 	#abortEpoch = 0;
 	/**
 	 * Monotonic count of ADMITTED abort requests, advanced synchronously on every
@@ -12527,6 +12528,8 @@ export class AgentSession {
 	 * in #pendingAgentEndEmit behind a prompt count that can never drop.
 	 */
 	#forceSessionRecovery(): void {
+		if (this.#abortForceRecoveryStarted) return;
+		this.#abortForceRecoveryStarted = true;
 		this.#abandonPostPromptTasks();
 		const hadLivePrompt = this.#livePromptsInFlight() > 0;
 		for (const token of this.#inFlightPromptTokens.keys()) this.#abandonedInFlightPrompts.add(token);
@@ -12586,8 +12589,9 @@ export class AgentSession {
 			// Capture the unwind: the field clears once the first abort settles, and
 			// the awaits below must keep watching THIS unwind, not a successor's.
 			const sharedUnwind = this.#abortUnwind;
-			if (options?.timeoutMs !== undefined && options.timeoutMs > 0) {
-				const deadline = Date.now() + options.timeoutMs;
+			if (options?.timeoutMs !== undefined) {
+				const timeoutMs = Math.max(0, options.timeoutMs);
+				const deadline = Date.now() + timeoutMs;
 				// The first abort may be waiting on cooperative cleanup with no budget
 				// of its own; this abort's budget must still be able to force recovery,
 				// or a bounded user abort queued behind a wedged unbounded abort blocks
@@ -12595,7 +12599,7 @@ export class AgentSession {
 				// the same unwind.
 				const shared = await Promise.race([
 					sharedUnwind.then(() => "settled" as const),
-					Bun.sleep(options.timeoutMs).then(() => "timeout" as const),
+					Bun.sleep(timeoutMs).then(() => "timeout" as const),
 				]);
 				if (shared === "settled") return { kind: "settled" };
 				this.#forceSessionRecovery();
@@ -12611,6 +12615,7 @@ export class AgentSession {
 			return { kind: "settled" };
 		}
 		const unwind = Promise.withResolvers<void>();
+		this.#abortForceRecoveryStarted = false;
 		this.#abortUnwind = unwind.promise;
 		try {
 			this.#abortOptions(options);
@@ -12624,10 +12629,10 @@ export class AgentSession {
 			);
 			cleanup.catch(() => {});
 			let outcome: AbortOutcome;
-			if (options?.timeoutMs !== undefined && options.timeoutMs > 0) {
+			if (options?.timeoutMs !== undefined) {
 				outcome = await Promise.race([
 					cleanup,
-					Bun.sleep(options.timeoutMs).then(() => ({ kind: "timeout" as const })),
+					Bun.sleep(Math.max(0, options.timeoutMs)).then(() => ({ kind: "timeout" as const })),
 				]);
 				if (outcome.kind === "timeout") {
 					this.#forceSessionRecovery();
@@ -12663,6 +12668,7 @@ export class AgentSession {
 			}
 		} finally {
 			this.#abortUnwind = undefined;
+			this.#abortForceRecoveryStarted = false;
 			unwind.resolve();
 		}
 	}

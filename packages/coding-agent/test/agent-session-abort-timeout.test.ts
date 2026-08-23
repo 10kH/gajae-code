@@ -320,8 +320,10 @@ describe("AgentSession abort timeout", () => {
 		});
 		const activeSession = session;
 		const notices: string[] = [];
+		let agentEnds = 0;
 		activeSession.subscribe(event => {
 			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "agent_end") agentEnds++;
 		});
 
 		const wedgedPrompt = activeSession.prompt("Start a turn that ignores abort.");
@@ -346,9 +348,13 @@ describe("AgentSession abort timeout", () => {
 			// forces recovery on the first abort's behalf; before that, it awaited
 			// the wedged unwind with its timeoutMs silently discarded.
 			const boundedStarted = Date.now();
-			await activeSession.abort({ timeoutMs: 25, cause: "user_interrupt" });
+			await Promise.all([
+				activeSession.abort({ timeoutMs: 25, cause: "user_interrupt" }),
+				activeSession.abort({ timeoutMs: 0, cause: "user_interrupt" }),
+			]);
 			expect(Date.now() - boundedStarted).toBeLessThan(45);
-			expect(notices.some(message => message.includes("forced session recovery"))).toBe(true);
+			expect(notices.filter(message => message.includes("forced session recovery"))).toHaveLength(1);
+			expect(agentEnds).toBe(1);
 			await unboundedAbort;
 
 			// Prompt admission is unwedged for both aborts' waiters.
