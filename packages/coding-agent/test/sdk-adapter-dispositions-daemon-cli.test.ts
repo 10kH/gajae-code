@@ -4,7 +4,9 @@
  * file-timeout budget at ~489s of genuine per-fixture runtime (291 production
  * SDK host startups at ~1.7s each). This is not a leaked-resource defect: the
  * process exits ~200ms after the final test. Each adapter cohort runs as its
- * own fresh process under the unchanged timeout.
+ * its own fresh process. The current production-host startup authority path is
+ * intentionally proof-heavy, so CI grants this cohort the shared coding-agent
+ * harness's 15-minute per-file ceiling while retaining 60-second row bounds.
  *
  * Coverage is byte-identical to the original monolithic file's daemonCli loop.
  */

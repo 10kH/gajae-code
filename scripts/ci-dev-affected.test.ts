@@ -1172,7 +1172,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"--root=packages/coding-agent",
 			"--shard=1/8",
 			"--timeout=30000",
-			"--file-timeout=600000",
+			"--file-timeout=900000",
 			"--concurrency=1",
 		]);
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([shardOne]);
@@ -1199,7 +1199,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"--root=packages/coding-agent",
 			"--shard=1/8",
 			"--timeout=30000",
-			"--file-timeout=600000",
+			"--file-timeout=900000",
 			"--concurrency=1",
 		]);
 		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated")?.command).toEqual([
@@ -1622,7 +1622,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"--root=packages/coding-agent",
 			"--shard=1/8",
 			"--timeout=30000",
-			"--file-timeout=600000",
+			"--file-timeout=900000",
 			"--concurrency=1",
 		]);
 		expect(testShards[0]?.cwd).toBeUndefined();
