@@ -130,6 +130,7 @@ export interface LoadNativeOptions {
 	context?: LoaderContext;
 	extractEmbeddedAddons?: (ctx: LoaderContext) => string[];
 	stageNodeModulesAddon?: (ctx: LoaderContext, errors: string[]) => string[] | string | null;
+	acquireStagedCandidateLease?: (candidate: string) => () => void;
 	requireCandidate?: (candidate: string) => Record<string, unknown>;
 	validateCandidate?: (bindings: Record<string, unknown>, candidate: string) => void;
 }

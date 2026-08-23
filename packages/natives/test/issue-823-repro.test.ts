@@ -434,7 +434,7 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 		expect(attempted).toEqual([baseline]);
 	});
 
-	it("preserves Windows staging ahead of package candidates", () => {
+	it("defers Windows content staging until package bytes are snapshotted", () => {
 		const filename = "pi_natives.win32-x64-baseline.node";
 		const versionedDir = "C:\\Users\\u\\AppData\\Local\\gjc\\14.5.2";
 		const optionalDir = "C:\\repo\\node_modules\\@gajae-code\\natives-win32-x64\\native";
@@ -449,7 +449,7 @@ describe("issue 823: standalone-binary native loader path resolution", () => {
 			userDataDir: "C:\\Users\\u\\AppData\\Local\\gjc",
 		});
 
-		expect(candidates[0]).toBe(path.join(versionedDir, filename));
-		expect(candidates.indexOf(path.join(optionalDir, filename))).toBeGreaterThan(0);
+		expect(candidates).not.toContain(path.join(versionedDir, filename));
+		expect(candidates[0]).toBe(path.join(optionalDir, filename));
 	});
 });

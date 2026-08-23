@@ -40,10 +40,9 @@ function send(socket: ServerWebSocket<unknown>, frame: Record<string, unknown>):
 	return socket.send(JSON.stringify(frame));
 }
 
-export type BrokerShutdownSendAction = "dropped" | "wait_for_drain" | "close";
+export type BrokerShutdownSendAction = "wait_for_drain" | "close";
 
 export function brokerShutdownSendAction(status: number): BrokerShutdownSendAction {
-	if (status === 0) return "dropped";
 	return status < 0 ? "wait_for_drain" : "close";
 }
 function sendError(socket: ServerWebSocket<unknown>, id: string | undefined, code: string, message: string): void {
@@ -154,7 +153,6 @@ export class BrokerTransport {
 			const action = brokerShutdownSendAction(
 				send(socket, { type: "broker_response", id: frame.id, ok: true, result: { accepted: true } }),
 			);
-			if (action === "dropped") return;
 			this.#shutdownRequested = true;
 			if (action === "wait_for_drain") {
 				this.#shutdownBackpressured.add(socket);

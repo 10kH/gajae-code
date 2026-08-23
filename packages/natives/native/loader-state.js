@@ -1,3 +1,4 @@
+import { dlopen, ptr } from "bun:ffi";
 import * as childProcess from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -39,10 +40,15 @@ const OPTIONAL_PACKAGE_BY_PLATFORM_TAG = {
 	"linux-x64": "@gajae-code/natives-linux-x64",
 	"win32-x64": "@gajae-code/natives-win32-x64",
 };
+const WINDOWS_GENERIC_READ = 0x80000000;
+const WINDOWS_FILE_SHARE_READ = 0x00000001;
+const WINDOWS_OPEN_EXISTING = 3;
+const WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080;
+let windowsKernel32;
 
 class StagedCandidateChangedError extends Error {
-	constructor() {
-		super("staged addon changed before load");
+	constructor(message = "staged addon changed before load") {
+		super(message);
 		this.name = "StagedCandidateChangedError";
 	}
 }
@@ -140,6 +146,51 @@ function validateStagedCandidate(ctx, candidate) {
 		const currentSource = safeFileSnapshot(source.sourcePath);
 		if (currentSource.hash !== source.snapshot.hash) throw new StagedCandidateChangedError();
 	}
+}
+
+function windowsKernel32Bindings() {
+	if (windowsKernel32) return windowsKernel32;
+	windowsKernel32 = dlopen("kernel32.dll", {
+		CreateFileW: {
+			args: ["ptr", "u32", "u32", "ptr", "u32", "u32", "i64"],
+			returns: "i64",
+		},
+		CloseHandle: { args: ["i64"], returns: "u32" },
+		GetLastError: { args: [], returns: "u32" },
+	});
+	return windowsKernel32;
+}
+
+/**
+ * Hold a Windows read handle that denies write/delete sharing from validation
+ * through pathname-based native loading. CreateFile's sharing check is
+ * symmetric: acquisition also fails while any existing writer/deleter could
+ * mutate or replace the staged file.
+ */
+function acquireStagedCandidateLease(candidate) {
+	if (process.platform !== "win32") return () => {};
+	const widePath = new Uint16Array(candidate.length + 1);
+	for (let index = 0; index < candidate.length; index++) widePath[index] = candidate.charCodeAt(index);
+	const kernel32 = windowsKernel32Bindings();
+	const handle = kernel32.symbols.CreateFileW(
+		ptr(widePath),
+		WINDOWS_GENERIC_READ,
+		WINDOWS_FILE_SHARE_READ,
+		null,
+		WINDOWS_OPEN_EXISTING,
+		WINDOWS_FILE_ATTRIBUTE_NORMAL,
+		0n,
+	);
+	if (handle === -1n) {
+		throw new Error(`staged addon lease refused (win32=${kernel32.symbols.GetLastError()})`);
+	}
+	let released = false;
+	return () => {
+		if (released) return;
+		released = true;
+		if (kernel32.symbols.CloseHandle(handle) === 0)
+			throw new Error(`staged addon lease release failed (win32=${kernel32.symbols.GetLastError()})`);
+	};
 }
 
 // =========================================================================
@@ -833,8 +884,26 @@ export function loadNative(options = {}) {
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,
 		requireCandidate: candidate => {
-			validateStagedCandidate(ctx, candidate);
-			return options.requireCandidate ? options.requireCandidate(candidate) : require_(candidate);
+			let releaseLease;
+			if (ctx.stagedCandidateSnapshots?.has(candidate)) {
+				try {
+					releaseLease = (options.acquireStagedCandidateLease ?? acquireStagedCandidateLease)(candidate);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					throw new StagedCandidateChangedError(`staged addon lease unavailable: ${message}`);
+				}
+			}
+			try {
+				validateStagedCandidate(ctx, candidate);
+				return options.requireCandidate ? options.requireCandidate(candidate) : require_(candidate);
+			} finally {
+				try {
+					releaseLease?.();
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					throw new StagedCandidateChangedError(`staged addon lease release failed: ${message}`);
+				}
+			}
 		},
 		validateCandidate: options.validateCandidate ?? ((bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate)),
 		describeCandidate: candidate => candidate,

@@ -20,7 +20,7 @@ import {
 	resolveSdkPackageAuthority,
 	resolveSdkPackageGeneration,
 } from "../src/sdk/broker/runtime";
-import { BrokerTransport } from "../src/sdk/broker/transport";
+import { BrokerTransport, brokerShutdownSendAction } from "../src/sdk/broker/transport";
 import { SdkClient } from "../src/sdk/client/client";
 
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-generation-"));
@@ -545,6 +545,10 @@ describe("sdk broker package generation", () => {
 			ws.close();
 			await transport.stop();
 		}
+	});
+
+	it("stops after a dropped shutdown acknowledgement instead of retaining a stale broker", () => {
+		expect(brokerShutdownSendAction(0)).toBe("close");
 	});
 
 	it("does not reap a ready local owner when its publication is missing", async () => {

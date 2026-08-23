@@ -132,6 +132,57 @@ describe("windows native addon loading", () => {
 		}
 	});
 
+	it("holds the staged candidate lease through validation and native loading", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-lease-"));
+		const filename = "pi_natives.win32-x64.node";
+		try {
+			const context = await makeInstalledContext(root, [filename], "leased-addon");
+			const events: string[] = [];
+			const bindings = loadNative({
+				context,
+				acquireStagedCandidateLease: () => {
+					events.push("acquire");
+					return () => events.push("release");
+				},
+				requireCandidate: candidate => {
+					events.push("require");
+					expect(candidate).toBe(contentPath(context.versionedDir, filename, "leased-addon"));
+					return { selected: candidate };
+				},
+				validateCandidate: () => events.push("validate-bindings"),
+			});
+			expect(bindings.selected).toBe(contentPath(context.versionedDir, filename, "leased-addon"));
+			expect(events).toEqual(["acquire", "require", "release", "validate-bindings"]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when the staged candidate lease cannot be acquired", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-lease-fail-"));
+		const filename = "pi_natives.win32-x64.node";
+		try {
+			const context = await makeInstalledContext(root, [filename], "leased-addon");
+			let required = false;
+			expect(() =>
+				loadNative({
+					context,
+					acquireStagedCandidateLease: () => {
+						throw new Error("lease unavailable");
+					},
+					requireCandidate: () => {
+						required = true;
+						return {};
+					},
+					validateCandidate: () => undefined,
+				}),
+			).toThrow("lease unavailable");
+			expect(required).toBe(false);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	it("creates a new content path for same-version package drift without pruning the old winner", async () => {
 		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-drift-"));
 		const filename = "pi_natives.win32-x64.node";
