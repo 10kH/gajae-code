@@ -7,6 +7,7 @@
 import { getMCPConfigPath } from "@gajae-code/utils";
 import { mcpCapability } from "../capability/mcp";
 import type { SourceMeta } from "../capability/types";
+import type { Settings } from "../config/settings";
 import type { MCPServer } from "../discovery";
 import { loadCapability } from "../discovery";
 import { loadMCPJsonFile } from "../discovery/mcp-json";
@@ -17,6 +18,8 @@ import type { MCPServerConfig } from "./types";
 
 /** Options for loading MCP configs */
 export interface LoadMCPConfigsOptions {
+	/** Owning session settings for capability filtering. */
+	settings?: Settings;
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
 	/** Whether to filter out Exa MCP servers (default: true) */
@@ -147,6 +150,7 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 		const result = await loadCapability<MCPServer>(mcpCapability.id, {
 			cwd,
 			agentDir: options?.agentDir,
+			settings: options?.settings,
 			providers: options?.nativeOnly === true ? ["native"] : undefined,
 		});
 		// Filter out project-level configs if disabled

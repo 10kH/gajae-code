@@ -13,6 +13,7 @@ import type {
 import type { KeyId } from "@gajae-code/tui";
 import { logger } from "@gajae-code/utils";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { Settings } from "../../config/settings";
 import type { WorkflowGateEmitter } from "../../modes/shared/agent-wire/workflow-gate-broker";
 import { type Theme, theme } from "../../modes/theme/theme";
 import type { AttemptRecordStore } from "../../session/attempt-record-store";
@@ -60,6 +61,7 @@ import type {
 	UserPythonEvent,
 	UserPythonEventResult,
 } from "./types";
+import { createExtensionSettings } from "./types";
 
 /** Combined result from all before_agent_start handlers */
 interface BeforeAgentStartCombinedResult {
@@ -277,8 +279,11 @@ export class ExtensionRunner {
 		private readonly sessionManager: SessionManager,
 		private readonly modelRegistry: ModelRegistry,
 		private readonly sessionMetadata?: ExtensionContext["sessionMetadata"],
+		private readonly settings?: Settings,
+		credentialSessionIdGetter?: () => string,
 	) {
 		this.#uiContext = noOpUIContext;
+		this.#getCredentialSessionId = credentialSessionIdGetter ?? (() => "");
 		this.#handlersByEvent = ExtensionRunner.#indexHandlers(extensions);
 	}
 
@@ -615,6 +620,7 @@ export class ExtensionRunner {
 			sessionManager: createReadonlySessionManager(this.sessionManager),
 			sessionMetadata: this.sessionMetadata,
 			modelRegistry: this.modelRegistry,
+			settings: this.settings ? createExtensionSettings(this.settings) : undefined,
 			get credentialSessionId() {
 				return getCredentialSessionId();
 			},

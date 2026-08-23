@@ -1322,6 +1322,7 @@ export async function runRootCommand(
 	let autoChdirApplied = false;
 	let bareResumeSessionManager: SessionManager | undefined;
 	let bareResumeAction: "continue-tail" | "open-idle" | undefined;
+	let bareResumeCleanupFailed = false;
 
 	if (isBareResume(parsedArgs)) {
 		if (hasBareResumeConflict(parsedArgs)) {
@@ -1365,30 +1366,51 @@ export async function runRootCommand(
 			return;
 		}
 		const scopedSettings = await (deps.loadSettingsForScope ?? Settings.loadForScope)({ cwd: resumeCwd });
-		const resumeMigrationPolicy =
-			scopedSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
-		let opened: StrictSessionOpenResult;
 		try {
-			opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
-				selection.identity,
-				parsedArgs.sessionDir
-					? SessionManager.explicitDestination(parsedArgs.sessionDir)
-					: SessionManager.managedDestination(resumeCwd, scopedSettings.getAgentDir()),
-				undefined,
-				resumeMigrationPolicy,
-			);
+			const resumeMigrationPolicy =
+				scopedSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+			let opened: StrictSessionOpenResult;
+			try {
+				opened = await (deps.openExistingSessionStrict ?? SessionManager.openExistingStrict)(
+					selection.identity,
+					parsedArgs.sessionDir
+						? SessionManager.explicitDestination(parsedArgs.sessionDir)
+						: SessionManager.managedDestination(resumeCwd, scopedSettings.getAgentDir()),
+					undefined,
+					resumeMigrationPolicy,
+				);
+			} catch (error) {
+				process.stderr.write(`${operatorFacingSessionOpenMessage(error) ?? BARE_RESUME_OPEN_ERROR}\n`);
+				if (!deps.suppressProcessExit) process.exitCode = 1;
+				return;
+			}
+			if (opened.kind === "error") {
+				process.stderr.write(`${operatorFacingSessionOpenMessage(opened.reason) ?? BARE_RESUME_OPEN_ERROR}\n`);
+				if (!deps.suppressProcessExit) process.exitCode = 1;
+				return;
+			}
+			bareResumeSessionManager = opened.manager;
+			bareResumeAction = selection.action;
 		} catch (error) {
 			process.stderr.write(`${operatorFacingSessionOpenMessage(error) ?? BARE_RESUME_OPEN_ERROR}\n`);
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
+		} finally {
+			try {
+				await scopedSettings.close?.();
+			} catch (error) {
+				await bareResumeSessionManager?.close().catch(() => undefined);
+				bareResumeSessionManager = undefined;
+				bareResumeCleanupFailed = true;
+				logger.warn("Resume settings cleanup failed; discarded opened session manager", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
-		if (opened.kind === "error") {
-			process.stderr.write(`${operatorFacingSessionOpenMessage(opened.reason) ?? BARE_RESUME_OPEN_ERROR}\n`);
+		if (bareResumeCleanupFailed) {
 			if (!deps.suppressProcessExit) process.exitCode = 1;
 			return;
 		}
-		bareResumeSessionManager = opened.manager;
-		bareResumeAction = selection.action;
 	}
 
 	if (!initialThemeInitialized) {

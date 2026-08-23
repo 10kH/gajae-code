@@ -306,9 +306,10 @@ export async function runInteractiveBashPty(
 		artifactPublisher?: TerminalArtifactPublisher;
 		spillThreshold?: number;
 		headBytes?: number;
+		settings?: Settings;
 	},
 ): Promise<BashInteractiveResult> {
-	const settings = await Settings.init();
+	const settings = options.settings ?? (await Settings.init());
 	const { shell: resolvedShell } = settings.getShellConfig();
 	const sink = new OutputSink({
 		artifactPath: options.artifactPath,

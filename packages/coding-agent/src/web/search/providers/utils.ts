@@ -1,3 +1,4 @@
+import * as asyncHooks from "node:async_hooks";
 import type { AgentStorage } from "../../../session/agent-storage";
 import { SearchProviderError, type SearchProviderId, type SearchSource } from "../../../web/search/types";
 import { dateToAgeSeconds } from "../utils";
@@ -81,6 +82,7 @@ const TIMEOUT_CLASS_MS: Record<SearchTimeoutClass, number> = {
  * class default so users keep a single knob. Unset means class defaults apply.
  */
 let configuredHardTimeoutMs: number | undefined;
+const searchTimeoutScope = new asyncHooks.AsyncLocalStorage<{ hardTimeoutMs: number | undefined }>();
 
 /**
  * Override the hard timeout applied to every web-search round-trip.
@@ -107,12 +109,19 @@ export interface SearchTimeoutSettingSource {
  * schema defaults; unset clears any previous override so class defaults apply.
  */
 export function applyConfiguredSearchTimeout(settings: SearchTimeoutSettingSource): void {
-	if (!settings.has("web_search.timeout")) {
-		setSearchHardTimeoutMs(undefined);
-		return;
-	}
+	setSearchHardTimeoutMs(getConfiguredSearchTimeoutMs(settings));
+}
+
+/** Resolve the explicit timeout override without mutating process-global state. */
+export function getConfiguredSearchTimeoutMs(settings: SearchTimeoutSettingSource): number | undefined {
+	if (!settings.has("web_search.timeout")) return undefined;
 	const value = settings.get("web_search.timeout");
-	setSearchHardTimeoutMs(typeof value === "number" && Number.isFinite(value) && value > 0 ? value * 1000 : undefined);
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? value * 1000 : undefined;
+}
+
+/** Run one search with an immutable session-scoped timeout policy. */
+export function runWithSearchTimeout<T>(hardTimeoutMs: number | undefined, work: () => Promise<T>): Promise<T> {
+	return searchTimeoutScope.run({ hardTimeoutMs }, work);
 }
 
 /**
@@ -131,11 +140,20 @@ export function applyConfiguredSearchTimeout(settings: SearchTimeoutSettingSourc
  *   back to the legacy {@link SEARCH_HARD_TIMEOUT_MS} ceiling. A user-set
  *   `web_search.timeout` overrides class defaults (but not explicit ms).
  */
-export function withHardTimeout(signal: AbortSignal | undefined, msOrClass?: number | SearchTimeoutClass): AbortSignal {
+export function withHardTimeout(
+	signal: AbortSignal | undefined,
+	msOrClass?: number | SearchTimeoutClass,
+	hardTimeoutMs?: number,
+): AbortSignal {
+	const scopedTimeout = searchTimeoutScope.getStore();
 	const ms =
 		typeof msOrClass === "number"
 			? msOrClass
-			: (configuredHardTimeoutMs ?? (msOrClass ? TIMEOUT_CLASS_MS[msOrClass] : SEARCH_HARD_TIMEOUT_MS));
+			: scopedTimeout !== undefined
+				? (scopedTimeout.hardTimeoutMs ?? (msOrClass ? TIMEOUT_CLASS_MS[msOrClass] : SEARCH_HARD_TIMEOUT_MS))
+				: (hardTimeoutMs ??
+					configuredHardTimeoutMs ??
+					(msOrClass ? TIMEOUT_CLASS_MS[msOrClass] : SEARCH_HARD_TIMEOUT_MS));
 	const timeout = AbortSignal.timeout(ms);
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }

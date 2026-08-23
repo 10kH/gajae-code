@@ -148,6 +148,8 @@ export interface BashExecutorOptions {
 	 */
 	onRawChunk?: (chunk: string) => void;
 	signal?: AbortSignal;
+	/** Session settings used for shell policy and output limits. */
+	settings?: Settings;
 	/** Session key suffix to isolate shell sessions per agent */
 	sessionKey?: string;
 	/** Additional environment variables to inject */
@@ -244,7 +246,7 @@ export function buildMinimizerOptions(group: ShellMinimizerSettings): MinimizerO
 }
 
 export async function executeBash(command: string, options?: BashExecutorOptions): Promise<BashResult> {
-	const settings = await Settings.init();
+	const settings = options?.settings ?? (await Settings.init());
 	const { shell, env: shellEnv, prefix } = settings.getShellConfig();
 	const configuredPrefix = options?.ignoreShellPrefix ? undefined : prefix;
 	const snapshotPath =

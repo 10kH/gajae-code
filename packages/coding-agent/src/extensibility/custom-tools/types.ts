@@ -80,7 +80,7 @@ export interface CustomToolContext {
 	hasQueuedMessages(): boolean;
 	/** Abort the current agent operation (fire-and-forget, does not wait) */
 	abort(): void;
-	/** Settings instance for the current session. Prefer over the global singleton. */
+	/** Settings-compatible, read-only session facade. Mutating or secret accessors are blocked at runtime. */
 	settings?: Settings;
 }
 

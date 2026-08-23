@@ -807,6 +807,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				try {
 					const result = await executeBash(options.command, {
 						cwd: options.commandCwd,
+						settings: this.session.settings,
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
 						timeout: options.timeoutMs,
 						signal: runSignal,
@@ -1206,6 +1207,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				try {
 					const result = await executeBash(prepared.command, {
 						cwd: prepared.commandCwd,
+						settings: this.session.settings,
 						sessionKey: `${this.session.getSessionId?.() ?? ""}:monitor:${id}`,
 						timeout: monitorTimeoutMs,
 						signal,
@@ -1638,6 +1640,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			? await runInteractiveBashPty(interactiveUi, {
 					command,
 					cwd: commandCwd,
+					settings: this.session.settings,
 					timeoutMs,
 					signal,
 					env: resolvedEnv,
@@ -1649,6 +1652,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				})
 			: await executeBash(command, {
 					cwd: commandCwd,
+					settings: this.session.settings,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
 					oneShot: this.session.bashRestrictionProfile === "read-only",
 					timeout: timeoutMs,

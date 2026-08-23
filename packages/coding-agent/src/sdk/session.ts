@@ -75,13 +75,14 @@ import "../discovery";
 import { resolveConfigValue } from "../config/resolve-config-value";
 import { getEmbeddedDefaultGjcSkills } from "../defaults/gjc-defaults";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "../defaults/gjc-grok-cli";
-import { initializeWithSettings } from "../discovery";
+import { initializeWithSettings, releaseSettingsScope } from "../discovery";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../discovery/helpers";
 import { TtsrManager } from "../export/ttsr";
 import type { CustomCommandsLoadResult, LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool, CustomToolContext, CustomToolSessionEvent } from "../extensibility/custom-tools/types";
 import { CustomToolAdapter } from "../extensibility/custom-tools/wrapper";
 import {
+	createCustomToolSettings,
 	type ExtensionContext,
 	type ExtensionFactory,
 	ExtensionRunner,
@@ -584,7 +585,7 @@ export interface CreateAgentSessionOptions {
 	/** Override local:// protocol options for subagent local:// sharing. Default: uses the session's own artifacts dir and session ID. */
 	localProtocolOptions?: LocalProtocolOptions;
 
-	/** Settings instance. Default: Settings.init({ cwd, agentDir }) */
+	/** Settings instance. Default: a scope-local Settings.loadForScope({ cwd, agentDir }). */
 	settings?: Settings;
 	/** Internal/advanced runtime-service injection. Omitted services use session defaults. */
 	runtimeServices?: OptionalRuntimeServicesOverrides;
@@ -827,6 +828,10 @@ function createCustomToolContext(ctx: ExtensionContext): CustomToolContext {
 	return {
 		sessionManager: ctx.sessionManager,
 		modelRegistry: ctx.modelRegistry,
+		settings: ctx.settings ? createCustomToolSettings(ctx.settings) : undefined,
+		get credentialSessionId() {
+			return ctx.credentialSessionId;
+		},
 		model: ctx.model,
 		isIdle: ctx.isIdle,
 		hasQueuedMessages: ctx.hasPendingMessages,
@@ -1381,6 +1386,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	let authStorageClosed = false;
 	let credentialScopeId: string | undefined;
 	let credentialScopeLeased = false;
+	let closeOwnedSettings: () => Promise<void> = async () => {};
 	const closeOwnedAuthStorage = (): void => {
 		if (!hasSession && credentialScopeLeased && credentialScopeId) {
 			authStorage.releaseCredentialScope(credentialScopeId);
@@ -1415,9 +1421,18 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const applyCredentialSelector = (scopeId: string, provider: string, selector: AuthCredentialSelector): void => {
 			authStorage.setSessionCredentialSelector(scopeId, provider, selector);
 		};
-		const settings = options.settings ?? (await logger.time("settings", Settings.init, { cwd, agentDir }));
+		const ownsScopedSettings = options.settings === undefined;
+		const settings = options.settings ?? (await logger.time("settings", Settings.loadForScope, { cwd, agentDir }));
 		const autoroutingInactive =
 			settings.get("task.autorouting.enabled") === true && !settings.getEffectiveAutorouting().active;
+		closeOwnedSettings = async (): Promise<void> => {
+			if (!ownsScopedSettings) return;
+			try {
+				await settings.close();
+			} finally {
+				releaseSettingsScope(settings);
+			}
+		};
 		// Cwd-derived runtime state must follow a rescope (`move_session`, `/move`),
 		// so services resolve the LIVE session cwd per activation instead of
 		// capturing the launch root. Before the manager exists the launch cwd is the
@@ -1872,7 +1887,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd });
+					: await loadCapability<Rule>(ruleCapability.id, { cwd, settings });
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
@@ -2105,6 +2120,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							: true,
 						autoloadOnly: true,
 						nativeOnly: true,
+						settings,
 					});
 					const { configs: pluginConfigs } = await buildPluginMcpConfigs({ cwd: to });
 					const pluginNames = new Set(Object.keys(pluginConfigs));
@@ -2661,7 +2677,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Add web search tools
 		if (options.toolNames?.includes("web_search")) {
 			const { getSearchTools } = await import("../web/search");
-			customTools.push(...getSearchTools());
+			customTools.push(...getSearchTools(settings));
 		}
 
 		const getReservedSubskillToolNames = () => [
@@ -2806,6 +2822,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						// Claude Code/Codex MCP files are explicit import sources into
 						// `.gjc`, not implicit competing runtime authorities.
 						nativeOnly: true,
+						settings,
 					});
 					conventionalConfigs = loaded.configs;
 					conventionalSources = loaded.sources;
@@ -3312,6 +3329,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					...(options.parentTaskPrefix ? { parentTaskPrefix: options.parentTaskPrefix } : {}),
 					...(options.currentAgentType ? { currentAgentType: options.currentAgentType } : {}),
 				},
+				settings,
+				() => session?.credentialSessionId ?? credentialSessionId,
 			);
 		}
 
@@ -3368,7 +3387,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				isIdle: () => !session?.isStreaming,
 				hasQueuedMessages: () => (session?.queuedMessageCount ?? 0) > 0,
 				abort: () => session?.abort(),
-				settings,
+				settings: createCustomToolSettings(settings),
 			});
 			wrappedExtensionTools = (options.customTools ?? [])
 				.filter(isCustomTool)
@@ -4208,6 +4227,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							AsyncJobManager.unregisterManager(asyncJobManager);
 						}
 						closeOwnedAuthStorage();
+						await closeOwnedSettings();
 					}
 				}
 			};
@@ -4422,6 +4442,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				]);
 				await disposeKernelSessionsByOwner(evalKernelOwnerId);
 				await disposeVmContextsByOwner(evalKernelOwnerId);
+				await closeOwnedSettings();
 			}
 		} catch (cleanupError) {
 			cleanupDiagnostic = cleanupError;

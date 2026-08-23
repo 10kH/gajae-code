@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import type { Settings } from "@gajae-code/coding-agent/config/settings";
 import { discoverAndLoadExtensions } from "@gajae-code/coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
@@ -14,7 +15,11 @@ import {
 	testSetExtensionHandlerTimeoutMs,
 	testSetSessionShutdownHandlerTimeoutMs,
 } from "@gajae-code/coding-agent/extensibility/extensions/runner";
-import type { ExtensionContext } from "@gajae-code/coding-agent/extensibility/extensions/types";
+import {
+	createCustomToolSettings,
+	createExtensionSettings,
+	type ExtensionContext,
+} from "@gajae-code/coding-agent/extensibility/extensions/types";
 
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
@@ -66,6 +71,112 @@ describe("ExtensionRunner", () => {
 	};
 
 	describe("safe tool resolver", () => {
+		it("exposes the authoritative session settings to extension contexts", () => {
+			const settings = {
+				get: (path: string) => (path === "modelRoles" ? { image: "openai/gpt-image-2" } : undefined),
+				getCwd: () => tempDir.path(),
+				getModelRole: (role: string) => (role === "image" ? "openai/gpt-image-2" : undefined),
+			} as Settings;
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				settings,
+			);
+
+			const exposed = runner.createContext().settings;
+			expect(exposed).not.toBe(settings);
+			expect(exposed?.get("modelRoles")).toEqual({ image: "openai/gpt-image-2" });
+			expect(exposed?.getModelRole("image")).toBe("openai/gpt-image-2");
+			expect(exposed?.get("searxng.token")).toBeUndefined();
+			const compatibility = createCustomToolSettings(settings);
+			expect(compatibility.getCwd()).toBe(tempDir.path());
+			expect(compatibility.get("searxng.token")).toBeUndefined();
+			expect(() => compatibility.set("theme.dark", "dark")).toThrow();
+		});
+
+		it("clones and deep-freezes nested facade and aggregate returns", () => {
+			const backing = {
+				modelRoles: {
+					image: ["openai/gpt-image-2", "openrouter/google/gemini-3-pro-image-preview"],
+				},
+				rules: [{ pattern: "git push", tool: "bash" }],
+				shell: { shell: "/bin/bash", args: ["-lc"], env: { TEST_SETTING: "original" } },
+			};
+			const settings = {
+				get: (path: string) => {
+					if (path === "modelRoles") return backing.modelRoles;
+					if (path === "bashInterceptor.patterns") return backing.rules;
+					return undefined;
+				},
+				getCwd: () => tempDir.path(),
+				getModelRole: (role: string) => (role === "image" ? backing.modelRoles.image : undefined),
+				getModelRoles: () => backing.modelRoles,
+				getBashInterceptorRules: () => backing.rules,
+				getShellConfig: () => backing.shell,
+			} as unknown as Settings;
+
+			const extensionSettings = createExtensionSettings(settings);
+			const exposedRoles = extensionSettings.get("modelRoles") as { image: string[] };
+			const exposedRole = extensionSettings.getModelRole("image") as string[];
+			expect(exposedRoles).not.toBe(backing.modelRoles);
+			expect(exposedRoles.image).not.toBe(backing.modelRoles.image);
+			expect(Object.isFrozen(exposedRoles)).toBe(true);
+			expect(Object.isFrozen(exposedRoles.image)).toBe(true);
+			expect(exposedRole).not.toBe(backing.modelRoles.image);
+			expect(Object.isFrozen(exposedRole)).toBe(true);
+			expect(() => exposedRoles.image.push("mutated")).toThrow();
+			expect(() => exposedRole.push("mutated")).toThrow();
+
+			const compatibility = createCustomToolSettings(settings);
+			const aggregateRoles = compatibility.getModelRoles() as { image: string[] };
+			const aggregateRules = compatibility.getBashInterceptorRules();
+			const aggregateShell = compatibility.getShellConfig();
+			expect(aggregateRoles).not.toBe(backing.modelRoles);
+			expect(Object.isFrozen(aggregateRoles)).toBe(true);
+			expect(Object.isFrozen(aggregateRoles.image)).toBe(true);
+			expect(aggregateRules).not.toBe(backing.rules);
+			expect(Object.isFrozen(aggregateRules)).toBe(true);
+			expect(Object.isFrozen(aggregateRules[0])).toBe(true);
+			expect(aggregateShell).not.toBe(backing.shell);
+			expect(Object.isFrozen(aggregateShell)).toBe(true);
+			expect(Object.isFrozen(aggregateShell.env)).toBe(true);
+			expect(() => aggregateRoles.image.push("mutated")).toThrow();
+			expect(() => {
+				if (aggregateRules[0]) aggregateRules[0].pattern = "mutated";
+			}).toThrow();
+			expect(() => {
+				if (aggregateShell.env) aggregateShell.env.TEST_SETTING = "mutated";
+			}).toThrow();
+			expect(() => Reflect.set(compatibility, "mutated", true)).toThrow();
+			expect(() => Reflect.deleteProperty(compatibility, "mutated")).toThrow();
+			expect(() => Object.defineProperty(compatibility, "mutated", { value: true })).toThrow();
+			expect(() => Object.setPrototypeOf(compatibility, null)).toThrow();
+			expect(backing).toEqual({
+				modelRoles: { image: ["openai/gpt-image-2", "openrouter/google/gemini-3-pro-image-preview"] },
+				rules: [{ pattern: "git push", tool: "bash" }],
+				shell: { shell: "/bin/bash", args: ["-lc"], env: { TEST_SETTING: "original" } },
+			});
+		});
+
+		it("exposes the live credential session identity to extension contexts", () => {
+			const runner = new ExtensionRunner(
+				[],
+				{ flagValues: new Map(), pendingProviderRegistrations: [] } as never,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+				undefined,
+				undefined,
+				() => "credential-session-1",
+			);
+
+			expect(runner.createContext().credentialSessionId).toBe("credential-session-1");
+		});
+
 		it("exposes only tool safe-summary metadata through extension context", () => {
 			const safeSummary = (kind: "args" | "result", value: unknown) =>
 				kind === "args" ? `safe:${String(value)}` : undefined;

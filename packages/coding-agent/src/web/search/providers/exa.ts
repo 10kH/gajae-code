@@ -12,7 +12,7 @@ import { settings } from "../../../config/settings";
 import type { SearchResponse, SearchSource } from "../../../web/search/types";
 import { SearchProviderError } from "../../../web/search/types";
 import { dateToAgeSeconds } from "../utils";
-import type { SearchParams } from "./base";
+import type { SearchParams, SearchProviderSettings } from "./base";
 import { SearchProvider } from "./base";
 import { classifyProviderHttpError, withHardTimeout } from "./utils";
 
@@ -31,6 +31,7 @@ export interface ExaSearchParams {
 	start_published_date?: string;
 	end_published_date?: string;
 	signal?: AbortSignal;
+	settings?: SearchProviderSettings;
 }
 
 interface ExaSearchResult {
@@ -172,13 +173,13 @@ export class ExaProvider extends SearchProvider {
 	readonly id = "exa";
 	readonly label = "Exa";
 
-	isAvailable(_authStorage: AuthStorage): boolean {
+	isAvailable(_authStorage: AuthStorage, activeSettings?: SearchProviderSettings): boolean {
 		try {
-			if (settings.get("exa.enabled") === false || settings.get("exa.enableSearch") === false) {
-				return false;
-			}
+			const enabled = activeSettings?.exa?.enabled ?? settings.get("exa.enabled");
+			const enableSearch = activeSettings?.exa?.enableSearch ?? settings.get("exa.enableSearch");
+			if (enabled === false || enableSearch === false) return false;
 		} catch {
-			// Settings not initialized; availability still requires explicit API credentials.
+			// Settings may be uninitialized in standalone provider tests.
 		}
 		return !!getEnvApiKey("exa");
 	}
@@ -188,6 +189,7 @@ export class ExaProvider extends SearchProvider {
 			query: params.query,
 			num_results: params.numSearchResults ?? params.limit,
 			signal: params.signal,
+			settings: params.settings,
 		});
 	}
 }

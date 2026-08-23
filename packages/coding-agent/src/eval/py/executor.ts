@@ -21,6 +21,8 @@ export type PythonKernelMode = "session" | "per-call";
 export interface PythonExecutorOptions {
 	/** Working directory for command execution */
 	cwd?: string;
+	/** Session settings used for shell and runtime policy. */
+	settings?: Settings;
 	/** Timeout in milliseconds */
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline in milliseconds since epoch */
@@ -131,6 +133,25 @@ function ensurePythonResourceCleanup(): void {
 }
 const sessions = new Map<string, PythonSession | InitializingPythonSession>();
 const retiringKernels = new Set<PythonKernel>();
+const settingsSessionIds = new WeakMap<Settings, number>();
+let nextSettingsSessionId = 1;
+
+function scopedSessionId(sessionId: string, activeSettings: Settings | undefined): string {
+	if (!activeSettings) {
+		const prefix = `${sessionId}:settings-`;
+		for (const existingSessionId of sessions.keys()) {
+			if (existingSessionId.startsWith(prefix)) return existingSessionId;
+		}
+		return sessionId;
+	}
+	const existing = settingsSessionIds.get(activeSettings);
+	if (existing !== undefined) {
+		return `${sessionId}:settings-${existing}`;
+	}
+	const id = nextSettingsSessionId++;
+	settingsSessionIds.set(activeSettings, id);
+	return `${sessionId}:settings-${id}`;
+}
 
 async function shutdownOrRetainKernel(kernel: PythonKernel): Promise<void> {
 	const result = await kernel.shutdown().catch(() => undefined);
@@ -299,6 +320,7 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 	requireRemainingTimeoutMs(options.deadlineMs);
 	return await PythonKernel.start({
 		cwd,
+		settings: options.settings,
 		env: buildKernelEnv(options),
 		runtimeOptions: options.runtimeOptions,
 		signal: options.signal,
@@ -568,7 +590,7 @@ async function executeWithKernel(
 	code: string,
 	options: PythonExecutorOptions | undefined,
 ): Promise<PythonResult> {
-	const settings = await Settings.init();
+	const settings = options?.settings ?? (await Settings.init());
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,
@@ -676,10 +698,15 @@ async function executeWithKernel(
 }
 
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
-	const availability = await checkPythonKernelAvailability(cwd, options.runtimeOptions, {
-		signal: options.signal,
-		deadlineMs: options.deadlineMs,
-	});
+	const availability = await checkPythonKernelAvailability(
+		cwd,
+		options.runtimeOptions,
+		{
+			signal: options.signal,
+			deadlineMs: options.deadlineMs,
+		},
+		options.settings,
+	);
 	if (!availability.ok) {
 		throw new Error(availability.reason ?? "Python kernel unavailable");
 	}
@@ -710,7 +737,7 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 }
 
 async function executeOnSession(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
-	const sessionId = options.sessionId ?? `session:${cwd}`;
+	const sessionId = scopedSessionId(options.sessionId ?? `session:${cwd}`, options.settings);
 	if (options.bridge && !options.bridgeSessionId) {
 		options.bridgeSessionId = sessionId;
 	}

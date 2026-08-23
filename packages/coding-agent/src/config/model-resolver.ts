@@ -772,6 +772,8 @@ export function parseModelPattern(
 const PREFIX_MODEL_ROLE = "pi/";
 const DEFAULT_MODEL_ROLE = "default";
 
+export type ModelRoleSettings = Pick<Settings, "getModelRole">;
+
 function getModelRoleAlias(value: string): ModelRole | undefined {
 	const normalized = value.trim();
 	if (!normalized.startsWith(PREFIX_MODEL_ROLE)) return undefined;
@@ -791,7 +793,7 @@ function isSessionInheritedAgentPattern(value: string): boolean {
 	return value === DEFAULT_MODEL_ROLE || value === `${PREFIX_MODEL_ROLE}${DEFAULT_MODEL_ROLE}`;
 }
 
-function resolveConfiguredRolePattern(value: string, settings?: Settings): string[] | undefined {
+function resolveConfiguredRolePattern(value: string, settings?: ModelRoleSettings): string[] | undefined {
 	const normalized = value.trim();
 	if (!normalized) return undefined;
 
@@ -814,7 +816,7 @@ function resolveConfiguredRolePattern(value: string, settings?: Settings): strin
 /**
  * Expand a role alias like "pi/default" to the configured model string.
  */
-export function expandRoleAlias(value: string, settings?: Settings): string {
+export function expandRoleAlias(value: string, settings?: ModelRoleSettings): string {
 	const normalized = value.trim();
 	if (normalized === DEFAULT_MODEL_ROLE) {
 		return normalizeModelPatternList(settings?.getModelRole("default"))[0] ?? value;
@@ -824,7 +826,10 @@ export function expandRoleAlias(value: string, settings?: Settings): string {
 	return resolved ?? value;
 }
 
-export function resolveConfiguredModelPatterns(value: ModelSelectorValue | undefined, settings?: Settings): string[] {
+export function resolveConfiguredModelPatterns(
+	value: ModelSelectorValue | undefined,
+	settings?: ModelRoleSettings,
+): string[] {
 	const patterns = normalizeModelPatternList(value);
 	return patterns.flatMap(pattern => {
 		const resolved = resolveConfiguredRolePattern(pattern, settings);
@@ -875,7 +880,7 @@ export function resolveModelRoleValue(
 	roleValue: ModelSelectorValue | undefined,
 	availableModels: Model<Api>[],
 	options?: {
-		settings?: Settings;
+		settings?: ModelRoleSettings;
 		matchPreferences?: ModelMatchPreferences;
 		modelRegistry?: CanonicalModelRegistry;
 		sessionId?: string;
