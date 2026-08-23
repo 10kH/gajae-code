@@ -126,7 +126,7 @@ function renderedScope(scope: ResolvedScopeV1): ResolvedScopeV1 {
 				? { kind: "repo" as const, worktreeRoot: escapeMasterPeerSnapshotText(scope.resolved.worktreeRoot) }
 				: scope.resolved.kind === "pwd"
 					? { kind: "pwd" as const, cwd: escapeMasterPeerSnapshotText(scope.resolved.cwd) }
-					: { kind: "global" as const, visibility: escapeMasterPeerSnapshotText(scope.resolved.visibility) };
+					: { kind: "global" as const, visibility: scope.resolved.visibility };
 	return {
 		version: scope.version,
 		requested: escapeMasterPeerSnapshotText(scope.requested) as ScopeNameV1,

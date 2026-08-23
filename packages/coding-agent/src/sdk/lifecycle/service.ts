@@ -187,7 +187,7 @@ export interface SessionLifecycleListEntry {
 	readonly live?: boolean;
 	readonly endpointGeneration?: number;
 	readonly terminalUncertain?: boolean;
-	readonly repo?: string;
+	readonly cwd?: string;
 	readonly locator?: { readonly cwd: string; readonly worktreeRoot: string | null; readonly stateRoot: string };
 }
 
