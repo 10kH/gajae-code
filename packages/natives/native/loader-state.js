@@ -561,7 +561,7 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
  * `node_modules` copy that bun must overwrite on update. No-op on non-Windows,
  * in workspace dev, and for compiled binaries — see `shouldStageNodeModulesAddon`.
  */
-export function maybeStageNodeModulesAddon(ctx, errors) {
+function maybeStageNodeModulesAddon(ctx, errors) {
 	if (!ctx.stageFromNodeModules) return null;
 	const versionedDir = typeof ctx.versionedDir === "string" ? ctx.versionedDir : null;
 	const addonFilenames = Array.isArray(ctx.addonFilenames) ? ctx.addonFilenames : [];

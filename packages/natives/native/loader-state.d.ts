@@ -111,8 +111,6 @@ export interface LoaderContext {
 	selectedVariant?: "modern" | "baseline" | null;
 }
 
-export function maybeStageNodeModulesAddon(ctx: LoaderContext, errors: string[]): string | null;
-
 export function embeddedAddonIsAuthoritative(
 	ctx: LoaderContext,
 	addon?: EmbeddedAddon | null,
