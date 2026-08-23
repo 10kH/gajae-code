@@ -2782,18 +2782,15 @@ export class AgentSession {
 		const display = this.settings.get("power.preventDisplaySleep");
 		if (!idle && !system && !user && !display) return;
 		const generation = this.#powerAssertionGeneration;
+		let cancelledByGeneration = false;
 		this.#powerAssertionLoad = Promise.resolve()
 			.then(() => {
 				const { MacOSPowerAssertion } = require("@gajae-code/natives") as Pick<
 					typeof import("@gajae-code/natives"),
 					"MacOSPowerAssertion"
 				>;
-				if (
-					this.#powerAssertion ||
-					generation !== this.#powerAssertionGeneration ||
-					this.#livePromptsInFlight() === 0
-				)
-					return;
+				cancelledByGeneration = generation !== this.#powerAssertionGeneration;
+				if (this.#powerAssertion || cancelledByGeneration || this.#livePromptsInFlight() === 0) return;
 				this.#powerAssertion = MacOSPowerAssertion.start({
 					reason: "Gajae Code agent session",
 					idle,
@@ -2807,7 +2804,8 @@ export class AgentSession {
 			})
 			.finally(() => {
 				this.#powerAssertionLoad = undefined;
-				if (!this.#powerAssertion && this.#livePromptsInFlight() > 0) this.#acquirePowerAssertion();
+				if (cancelledByGeneration && !this.#powerAssertion && this.#livePromptsInFlight() > 0)
+					this.#acquirePowerAssertion();
 			});
 	}
 
@@ -3429,16 +3427,8 @@ export class AgentSession {
 		this.#abandonedInFlightPrompts.delete(token);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
 		if (wasAbandoned) {
-			let flushError: unknown;
-			if (this.#livePromptsInFlight() === 0) {
-				try {
-					this.#flushPendingPromptMessages();
-				} catch (error) {
-					flushError = error;
-				}
-			}
 			this.#resolveSessionSettlement();
-			return flushError;
+			return undefined;
 		}
 		if (this.#livePromptsInFlight() !== 0) {
 			this.#resolveSessionSettlement();
