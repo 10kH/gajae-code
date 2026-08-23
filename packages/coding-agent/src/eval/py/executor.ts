@@ -133,8 +133,29 @@ function ensurePythonResourceCleanup(): void {
 }
 const sessions = new Map<string, PythonSession | InitializingPythonSession>();
 const retiringKernels = new Set<PythonKernel>();
-const settingsSessionIds = new WeakMap<Settings, number>();
-let nextSettingsSessionId = 1;
+const settingsScopes = new WeakMap<Settings, string>();
+
+/**
+ * Fingerprint the settings values that actually shape a spawned kernel process.
+ * `PythonKernel.start` derives the kernel environment solely from
+ * `settings.getShellConfig()`, so two Settings instances resolving to the same
+ * shell configuration produce byte-identical kernels and MUST share one
+ * retained kernel. Keying on Settings object identity instead partitions every
+ * logical session into its own kernel, which breaks cross-session reuse and
+ * lets one session's dispose shut down a kernel another session still owns.
+ */
+function settingsScope(activeSettings: Settings): string {
+	const cached = settingsScopes.get(activeSettings);
+	if (cached !== undefined) return cached;
+	const { shell, args, env } = activeSettings.getShellConfig();
+	const canonicalEnv = Object.keys(env)
+		.sort()
+		.map(key => [key, env[key]]);
+	const canonical = JSON.stringify([shell, args, canonicalEnv]);
+	const scope = new Bun.CryptoHasher("sha256").update(canonical).digest("hex").slice(0, 16);
+	settingsScopes.set(activeSettings, scope);
+	return scope;
+}
 
 function scopedSessionId(sessionId: string, activeSettings: Settings | undefined): string {
 	if (!activeSettings) {
@@ -144,13 +165,7 @@ function scopedSessionId(sessionId: string, activeSettings: Settings | undefined
 		}
 		return sessionId;
 	}
-	const existing = settingsSessionIds.get(activeSettings);
-	if (existing !== undefined) {
-		return `${sessionId}:settings-${existing}`;
-	}
-	const id = nextSettingsSessionId++;
-	settingsSessionIds.set(activeSettings, id);
-	return `${sessionId}:settings-${id}`;
+	return `${sessionId}:settings-${settingsScope(activeSettings)}`;
 }
 
 async function shutdownOrRetainKernel(kernel: PythonKernel): Promise<void> {

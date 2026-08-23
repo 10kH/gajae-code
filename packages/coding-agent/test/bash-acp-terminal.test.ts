@@ -3,6 +3,7 @@ import type { ClientBridge, ClientBridgeTerminalHandle } from "../src/session/cl
 import { truncateHeadBytes, truncateTailBytes } from "../src/session/streaming-output";
 import type { ToolSession } from "../src/tools";
 import { BashTool } from "../src/tools/bash";
+import { stubBashExecutorSettings } from "./helpers/tool-session-settings";
 
 interface SessionOptions {
 	tailKiB?: number;
@@ -38,6 +39,7 @@ function makeSession(bridge: ClientBridge, options: SessionOptions = {}): ToolSe
 			getBashInterceptorRules() {
 				return [];
 			},
+			...stubBashExecutorSettings,
 		},
 		getClientBridge: () => bridge,
 		getArtifactManager: options.saveArtifact ? () => ({ save: options.saveArtifact }) : undefined,
@@ -574,6 +576,7 @@ describe("BashTool ACP terminal routing", () => {
 				get: () => undefined,
 				has: () => false,
 				getAgentDir: () => "default-profile",
+				...stubBashExecutorSettings,
 			},
 			getSessionId: () => "test-session",
 			getSessionAgentDir: () => "tenant-profile",
@@ -592,6 +595,7 @@ describe("BashTool ACP terminal routing", () => {
 				get: () => undefined,
 				has: () => false,
 				getAgentDir: () => "default-profile",
+				...stubBashExecutorSettings,
 			},
 			getSessionId: () => "test-session",
 			getSessionAgentDir: () => "tenant-profile",

@@ -496,7 +496,10 @@ it("aborts auto-generated file edits as soon as the path is available", async ()
 		waitBeforeFirstDelta.resolve();
 		await promptPromise;
 
-		expect(checkSpy).toHaveBeenCalledWith(generatedPath, "generated.ts");
+		// The guard receives the resolved path, its display name, and the owning
+		// session's settings — built-in executors read session settings, never
+		// ambient role state (#4826).
+		expect(checkSpy).toHaveBeenCalledWith(generatedPath, "generated.ts", session.settings);
 		expect(abortSpy).toHaveBeenCalled();
 		expect(abortSignalRef.current?.aborted ?? false).toBe(true);
 		const lastAssistant = lastAssistantMessage(session.state.messages);

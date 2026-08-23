@@ -7,6 +7,7 @@ import { BashTool } from "@gajae-code/coding-agent/tools/bash";
 import { ToolError } from "@gajae-code/coding-agent/tools/tool-errors";
 import * as shellSnapshot from "@gajae-code/coding-agent/utils/shell-snapshot";
 import { resetShellConfigCache } from "@gajae-code/utils/shell-config";
+import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
 /**
  * Observable BashTool integration for the sleep-advisory notice (#4465 review).
@@ -48,6 +49,7 @@ function createBashTool(cwd: string): BashTool {
 			getBashInterceptorRules() {
 				return [];
 			},
+			...stubBashExecutorSettings,
 		},
 	} as unknown as ToolSession;
 	return new BashTool(session);
