@@ -28,6 +28,7 @@ export type SdkSearchRowV1 = {
 	id: string;
 	locator: { cwd: string; worktreeRoot: string | null; stateRoot: string };
 	live: boolean;
+	probe?: "reachable" | "unreachable" | "stale";
 };
 
 export type SdkSearchResultV1 = {
@@ -77,7 +78,8 @@ export function scopeRequestV1(value: unknown): ScopeRequestV1 | undefined {
 /** Strictly validates a resolved descriptor returned by Broker pages. */
 export function resolvedScopeV1(value: unknown): ResolvedScopeV1 | undefined {
 	const scope = record(value);
-	const request = scope === undefined ? undefined : scopeRequestV1({
+	if (!scope) return undefined;
+	const request = scopeRequestV1({
 		version: scope.version,
 		requested: scope.requested,
 		requestAnchor: scope.requestAnchor,
@@ -127,18 +129,20 @@ export function sdkSearchRowV1(value: unknown): SdkSearchRowV1 | undefined {
 		typeof row?.id !== "string" ||
 		row.id.length === 0 ||
 		(row.live !== true && row.live !== false) ||
+		(row.probe !== undefined && row.probe !== "reachable" && row.probe !== "unreachable" && row.probe !== "stale") ||
 		!locator ||
 		typeof locator.cwd !== "string" ||
 		(locator.worktreeRoot !== null && typeof locator.worktreeRoot !== "string") ||
 		typeof locator.stateRoot !== "string" ||
 		Object.keys(locator).some(key => key !== "cwd" && key !== "worktreeRoot" && key !== "stateRoot") ||
-		Object.keys(row).some(key => key !== "id" && key !== "locator" && key !== "live")
+		Object.keys(row).some(key => key !== "id" && key !== "locator" && key !== "live" && key !== "probe")
 	)
 		return undefined;
 	return {
 		id: row.id,
 		locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
 		live: row.live,
+		...(row.probe === undefined ? {} : { probe: row.probe }),
 	};
 }
 
@@ -169,24 +173,27 @@ export function sdkSearchResultV1(value: unknown): SdkSearchResultV1 | undefined
 	)
 		return undefined;
 	if (result.status === "not-in-git-worktree" && (scope.resolved !== null || result.rows.length !== 0)) return undefined;
+	const error = record(result.error);
 	if (
 		result.status === "unavailable" &&
-		(!isRecord(result.error) ||
-			typeof result.error.code !== "string" ||
-			typeof result.error.message !== "string" ||
-			Object.keys(result.error).some(key => key !== "code" && key !== "message"))
+		(!error ||
+			typeof error.code !== "string" ||
+			typeof error.message !== "string" ||
+			Object.keys(error).some(key => key !== "code" && key !== "message"))
 	)
 		return undefined;
-	if (result.indexSeq !== undefined && (!Number.isSafeInteger(result.indexSeq) || result.indexSeq < 0)) return undefined;
+	const indexSeq = typeof result.indexSeq === "number" ? result.indexSeq : undefined;
+	if (result.indexSeq !== undefined && indexSeq === undefined) return undefined;
+	if (indexSeq !== undefined && (!Number.isSafeInteger(indexSeq) || indexSeq < 0)) return undefined;
 	return {
 		version: 1,
 		scope,
 		status: result.status,
 		observedAt: result.observedAt,
-		...(result.indexSeq === undefined ? {} : { indexSeq: result.indexSeq }),
+		...(indexSeq === undefined ? {} : { indexSeq }),
 		rows: result.rows.map(row => sdkSearchRowV1(row)!),
 		warnings: [...result.warnings],
-		...(result.error === undefined ? {} : { error: { code: result.error.code as string, message: result.error.message as string } }),
+		...(error === undefined ? {} : { error: { code: error.code as string, message: error.message as string } }),
 	};
 }
 

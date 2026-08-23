@@ -2,16 +2,26 @@ import { randomBytes } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { getAgentDir } from "@gajae-code/utils";
+import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
 import { ensureBroker } from "../broker/ensure";
 
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
+import { resolveSessionLocator } from "../broker/session-index";
+import {
+	resolveScopeRequest,
+	type ScopeNameV1,
+	type ScopeRequestV1,
+	type SdkSearchResultV1,
+	type SdkSearchRowV1,
+} from "../broker/session-scope";
 import type {
 	SessionLifecycleMutationRequest,
 	SessionLifecycleOperation,
 	SessionLifecycleSavedSession,
 	SessionLifecycleSavedSessionIdentity,
+	SessionLifecycleService,
 } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
@@ -33,6 +43,7 @@ import {
 
 export type SdkSessionCliAction =
 	| "list"
+	| "search"
 	| "inspect"
 	| "send"
 	| "status"
@@ -63,6 +74,10 @@ export interface SdkSessionCliArgs {
 	untilIdle?: boolean;
 	allEvents?: boolean;
 	repo?: string;
+	scope?: ScopeNameV1;
+	limit?: number;
+	json?: boolean;
+
 	agentDir?: string;
 }
 
@@ -85,6 +100,10 @@ const TAIL_OFFLINE_MAX_SCAN_BYTES = 4 * 1024 * 1024;
 const TAIL_OFFLINE_MAX_SCANNED_LINES = 4_096;
 const TAIL_OFFLINE_MAX_LINE_BYTES = 256 * 1024;
 const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
+const SEARCH_PROBE_TIMEOUT_MS = 2_000;
+const SEARCH_PROBE_MAX_ROWS = 100;
+const SEARCH_TEXT_WIDTH = 80;
+
 
 const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end"]);
 const START_TURN_KINDS = new Set(["turn_start", "agent_start"]);
@@ -360,7 +379,121 @@ async function sessionRows(agentDir: string): Promise<SessionRows> {
 	});
 }
 
+function searchScopeRequest(scope: ScopeNameV1, locator: { cwd: string; worktreeRoot: string | null }): ScopeRequestV1 {
+	return { version: 1, requested: scope, requestAnchor: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot } };
+}
+
+function searchProbe(row: SdkSearchRowV1, router: SessionRouter): Promise<SdkSearchRowV1> {
+	if (!row.live) return Promise.resolve({ ...row, probe: "stale" });
+	return (async () => {
+		try {
+			const attachment = router.attachment(row.id);
+			if (!attachment) return { ...row, probe: "stale" };
+			const response = await router.request(
+				row.id,
+				{ type: "query_request", query: "session.checkpoint", input: {} },
+				attachment.generation,
+				attachment,
+				{ timeoutMs: SEARCH_PROBE_TIMEOUT_MS },
+			);
+			return { ...row, probe: response.ok === true ? "reachable" : "unreachable" };
+		} catch {
+			return { ...row, probe: "unreachable" };
+		}
+	})();
+}
+
+async function probeSearchRows(agentDir: string, result: SdkSearchResultV1): Promise<SdkSearchResultV1> {
+	if (result.status === "unavailable" || result.status === "not-in-git-worktree" || result.rows.length === 0) return result;
+	const rows = result.rows.slice(0, SEARCH_PROBE_MAX_ROWS);
+	try {
+		const probes = await withRouter(
+			agentDir,
+			async router => await Promise.all(rows.map(row => searchProbe(row, router))),
+		);
+		return { ...result, rows: probes };
+	} catch {
+		return { ...result, rows: rows.map(row => ({ ...row, probe: row.live ? "unreachable" : "stale" })) };
+	}
+}
+
+/** Resolves, lists, and probes only the exact rows selected by the Broker-scoped search. */
+export async function runSdkSearch(
+	args: Pick<SdkSessionCliArgs, "agentDir" | "repo" | "scope" | "limit" | "cursor">,
+	createService: (agentDir: string) => SessionLifecycleService = createBrokerSessionLifecycleService,
+	probe: (agentDir: string, result: SdkSearchResultV1) => Promise<SdkSearchResultV1> = probeSearchRows,
+): Promise<{ result: SdkSearchResultV1; exitCode: 0 | 1 }> {
+	const agentDir = args.agentDir ?? getAgentDir();
+	const locator = await resolveSessionLocator(args.repo ?? process.cwd(), agentDir);
+	const scope = args.scope ?? "repo";
+	const request = searchScopeRequest(scope, locator);
+	const resolved = await resolveScopeRequest(request);
+	const outcome = await createService(agentDir).scopedList(request, args.limit, args.cursor);
+	if (outcome.ok) {
+		if ("rows" in outcome.result) {
+			if (outcome.result.status === "not-in-git-worktree") return { result: outcome.result, exitCode: 0 };
+			if (outcome.result.status === "unavailable") return { result: outcome.result, exitCode: 1 };
+			return { result: await probe(agentDir, outcome.result), exitCode: 0 };
+		}
+		return {
+			result: {
+				version: 1,
+				scope: resolved,
+				status: "unavailable",
+				observedAt: new Date().toISOString(),
+				rows: [],
+				warnings: [],
+				error: { code: "malformed_response", message: "broker search returned an unscoped result" },
+			},
+			exitCode: 1,
+		};
+	}
+	if (!outcome.ok && outcome.result?.status === "unavailable") return { result: outcome.result, exitCode: 1 };
+	return {
+		result: {
+			version: 1,
+			scope: resolved,
+			status: "unavailable",
+			observedAt: new Date().toISOString(),
+			rows: [],
+			warnings: [],
+			error: { code: outcome.error.code, message: outcome.error.message },
+		},
+		exitCode: 1,
+	};
+}
+
+function searchScopeLabel(result: SdkSearchResultV1): string {
+	const resolved = result.scope.resolved;
+	if (resolved === null) return "not-in-git-worktree";
+	if (resolved.kind === "repo") return resolved.worktreeRoot;
+	if (resolved.kind === "pwd") return resolved.cwd;
+	return resolved.visibility;
+}
+
+function safeSearchText(value: string): string {
+	return truncateToWidth(replaceTabs(value).replaceAll(/[\r\n]/g, " "), SEARCH_TEXT_WIDTH);
+}
+
+/** Renders a credential-free scope/status preamble and bounded search table. */
+export function renderSdkSearchTable(result: SdkSearchResultV1): string {
+	const lines = [
+		`Scope requested: ${result.scope.requested}`,
+		`Scope resolved: ${safeSearchText(searchScopeLabel(result))}`,
+		`Status: ${result.status}`,
+		`Observed at: ${result.observedAt}`,
+	];
+	if (result.rows.length === 0) return lines.join("\n");
+	lines.push("ID  PROBE        LIVE  CWD");
+	for (const row of result.rows)
+		lines.push(
+			`${safeSearchText(row.id).padEnd(20)}  ${(row.probe ?? "-").padEnd(11)}  ${String(row.live).padEnd(4)}  ${safeSearchText(row.locator.cwd)}`,
+		);
+	return lines.join("\n");
+}
+
 async function runList(agentDir: string): Promise<unknown> {
+
 	const listing = await sessionRows(agentDir);
 	return {
 		ok: true,
@@ -967,6 +1100,8 @@ async function offlineTailReplay(
 	});
 	if (!outcome.ok)
 		throw new SdkSessionCliError(outcome.error.code, outcome.error.message, 1, { certainty: outcome.certainty });
+	if ("rows" in outcome.result)
+		throw new SdkSessionCliError("malformed_response", "broker returned a scoped result for retained transcript replay", 1);
 	const savedSession = outcome.result.savedSession;
 	if (!savedSession)
 		throw new SdkSessionCliError(
@@ -1347,6 +1482,7 @@ export async function runSdkSessionCli(
 		const action = args.action;
 		if (
 			action !== "list" &&
+			action !== "search" &&
 			action !== "inspect" &&
 			action !== "send" &&
 			action !== "status" &&
@@ -1364,6 +1500,12 @@ export async function runSdkSessionCli(
 		const agentDir = args.agentDir ?? getAgentDir();
 		if (action === "list") {
 			writeOutput(stripSecretFields(await runList(agentDir)));
+			return;
+		}
+		if (action === "search") {
+			const search = await runSdkSearch(args);
+			writeOutput(args.json === true ? search.result : renderSdkSearchTable(search.result));
+			if (search.exitCode !== 0) setExitCode(search.exitCode);
 			return;
 		}
 		if (action === "inspect") {

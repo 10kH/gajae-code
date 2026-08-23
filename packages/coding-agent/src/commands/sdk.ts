@@ -28,7 +28,7 @@ import {
 import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { resolveSdkPackageAuthority } from "../sdk/broker/runtime";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
-import { runSdkSessionCli } from "../sdk/cli";
+import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
@@ -846,8 +846,11 @@ class SdkSessionHelp extends Command {
 		"idempotency-key": Flags.string({ description: "Caller idempotency key required for SDK lifecycle globals" }),
 		confirm: Flags.boolean({ description: "Confirm a destructive SDK control operation" }),
 		cursor: Flags.string({
-			description: "Raw query continuation cursor, or a saved checkpoint token to resume tail from",
+			description: "Raw query continuation cursor, saved checkpoint token, or search continuation cursor",
 		}),
+		scope: Flags.string({ description: "Search scope: repo, pwd, or global (default: repo)" }),
+		limit: Flags.integer({ description: "Search page size from 1 to 100" }),
+		json: Flags.boolean({ description: "Render search as the SdkSearchResultV1 JSON envelope" }),
 		text: Flags.string({ description: "Prompt text for send (alternative to --json-input)" }),
 		"op-ref": Flags.string({ description: "Operation reference for send (defaults to a generated ULID)" }),
 		wait: Flags.boolean({
@@ -859,6 +862,33 @@ class SdkSessionHelp extends Command {
 		"all-events": Flags.boolean({ description: "tail --all-events: include every event-ring kind" }),
 	};
 	async run(): Promise<void> {}
+}
+
+class SdkSearchCommand extends Command {
+	static description = "Search broker-visible SDK sessions within an exact repo, pwd, or global scope.";
+	static flags = {
+		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
+		repo: Flags.string({ description: "Workspace directory for scope resolution (default: current directory)" }),
+		scope: Flags.string({ description: "Search scope: repo, pwd, or global (default: repo)" }),
+		limit: Flags.integer({ description: "Search page size from 1 to 100" }),
+		cursor: Flags.string({ description: "Frozen scoped search continuation cursor" }),
+		json: Flags.boolean({ description: "Render exactly the SdkSearchResultV1 JSON envelope" }),
+	};
+	async run(): Promise<void> {
+		const { flags } = await this.parse(SdkSearchCommand);
+		const scope = flags.scope;
+		if (scope !== undefined && scope !== "repo" && scope !== "pwd" && scope !== "global")
+			throw new CliParseError("--scope must be repo, pwd, or global.");
+		const search = await runSdkSearch({
+			agentDir: flags["agent-dir"],
+			repo: flags.repo,
+			scope,
+			limit: flags.limit,
+			cursor: flags.cursor,
+		});
+		process.stdout.write(`${flags.json ? JSON.stringify(search.result) : renderSdkSearchTable(search.result)}\n`);
+		if (search.exitCode !== 0) process.exitCode = search.exitCode;
+	}
 }
 
 class SdkSessionCommand extends Command {
@@ -932,31 +962,39 @@ class SdkGuidesCommand extends Command {
 
 export default class Sdk extends Command {
 	static description =
-		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
+		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
 	static hidden = false;
 	static delegateHelp = true;
-	static args = { action: Args.string({ required: false, options: ["serve", "session", "guides"] }) };
+	static args = { action: Args.string({ required: false, options: ["serve", "search", "session", "guides"] }) };
 	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
 		const action = this.argv[0];
 		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-			const helpAction =
-				action === "serve"
-					? "sdk serve"
+		const helpAction =
+			action === "serve"
+				? "sdk serve"
+				: action === "search"
+					? "sdk search"
 					: action === "session"
 						? "sdk session"
 						: action === "guides"
 							? "sdk guides"
 							: "sdk";
-			const helpCommand =
-				action === "serve"
-					? SdkServeHelp
+		const helpCommand =
+			action === "serve"
+				? SdkServeHelp
+				: action === "search"
+					? SdkSearchCommand
 					: action === "session"
 						? SdkSessionCommand
 						: action === "guides"
 							? SdkGuidesCommand
 							: Sdk;
 			renderCommandHelp("gjc", helpAction, helpCommand);
+			return;
+		}
+		if (action === "search") {
+			await new SdkSearchCommand(this.argv.slice(1), this.config).run();
 			return;
 		}
 		if (action === "session") {
@@ -972,7 +1010,7 @@ export default class Sdk extends Command {
 			return;
 		}
 		if (action !== "broker-internal" && action !== "session-host-internal")
-			throw new CliParseError("Expected action to be serve, session, or guides.");
+			throw new CliParseError("Expected action to be serve, search, session, or guides.");
 		const internal = parseSdkInternalArgv(this.argv);
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();

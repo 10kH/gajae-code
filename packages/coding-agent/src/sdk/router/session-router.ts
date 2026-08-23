@@ -233,6 +233,8 @@ export type SessionRouterProviderDeps = Pick<
 
 export interface SessionRouterOptions {
 	agentDir: string;
+	/** Limits attachment to exact ids selected by a Broker-scoped operation. */
+	sessionIds?: readonly string[];
 	deps?: SessionRouterDeps;
 	/** Runtime-specific identity validation; Router supplies a conservative fallback. */
 	correlateFrame?: SessionRouterFrameCorrelator;
@@ -440,6 +442,7 @@ type AdoptedSession = {
  */
 export class SessionRouter {
 	readonly #agentDir: string;
+	readonly #sessionIds: ReadonlySet<string> | undefined;
 	readonly #deps: SessionRouterDeps;
 	readonly #correlateFrame: SessionRouterFrameCorrelator;
 	readonly #index: SessionIndex;
@@ -481,6 +484,7 @@ export class SessionRouter {
 
 	constructor(options: SessionRouterOptions) {
 		this.#agentDir = options.agentDir;
+		this.#sessionIds = options.sessionIds === undefined ? undefined : new Set(options.sessionIds);
 		this.#deps = options.deps ?? {};
 		this.#correlateFrame = options.correlateFrame ?? fallbackCorrelation;
 		this.#index = this.#deps.createIndex?.(options.agentDir) ?? new DefaultSessionIndex(options.agentDir);
@@ -990,7 +994,11 @@ export class SessionRouter {
 		const live =
 			indexed.warnings.length === 0
 				? indexed.sessions.filter(
-						session => session.live && isSessionAuthorityEligible(session) && !session.terminalUncertain,
+						session =>
+							session.live &&
+							isSessionAuthorityEligible(session) &&
+							!session.terminalUncertain &&
+							(this.#sessionIds === undefined || this.#sessionIds.has(session.sessionId)),
 					)
 				: [];
 		const liveIds = new Set(live.map(session => session.sessionId));

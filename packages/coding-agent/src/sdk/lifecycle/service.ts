@@ -639,6 +639,18 @@ export class SessionLifecycleService {
 		this.#client = client;
 	}
 
+	async scopedList(scope: ScopeRequestV1, limit?: number, cursor?: string): Promise<SessionListOutcome> {
+		return await this.list({
+			actor: { id: "gjc-sdk-search-cli", namespace: "sdk:search-cli" },
+			capability: "session.list",
+			target: {
+				scope,
+				...(limit === undefined ? {} : { limit }),
+				...(cursor === undefined ? {} : { cursor }),
+			},
+		});
+	}
+
 	async execute(
 		request: SessionLifecycleMutationRequest,
 	): Promise<
