@@ -45,6 +45,7 @@ const WINDOWS_FILE_SHARE_READ = 0x00000001;
 const WINDOWS_OPEN_EXISTING = 3;
 const WINDOWS_FILE_ATTRIBUTE_NORMAL = 0x00000080;
 let windowsKernel32;
+const STAGED_CANDIDATE_ATTEMPT = Symbol("stagedCandidateAttempt");
 
 class StagedCandidateChangedError extends Error {
 	constructor(message = "staged addon changed before load") {
@@ -110,20 +111,9 @@ function stagedAddonPath(versionedDir, filename, hash) {
 	return path.join(versionedDir, `.content-${hash}-${filename}`);
 }
 
-function packageAddonCandidates(ctx, filename) {
-	const dirs = [
-		...(Array.isArray(ctx.optionalPackageNativeDirs) ? ctx.optionalPackageNativeDirs : []),
-		...(typeof ctx.nativeDir === "string" ? [ctx.nativeDir] : []),
-	];
-	const candidates = dirs.filter(directory => typeof directory === "string").map(directory => path.join(directory, filename));
-	if (typeof ctx.versionedDir === "string") candidates.push(path.join(ctx.versionedDir, filename));
-	return candidates;
-}
-
-function rejectPackageAddonCandidates(ctx, filename) {
+function rejectInstalledAddonFallbacks(ctx) {
 	if (!Array.isArray(ctx.candidates)) return;
-	const rejected = new Set(packageAddonCandidates(ctx, filename));
-	ctx.candidates = ctx.candidates.filter(candidate => !rejected.has(candidate));
+	ctx.candidates = [];
 }
 
 function recordStagedSnapshot(ctx, candidate, snapshot) {
@@ -353,14 +343,23 @@ export function resolveLoaderCandidates({
 export function loadFromCandidates({ candidates, requireCandidate, validateCandidate, describeCandidate }) {
 	const errors = [];
 	for (const candidate of candidates) {
+		let attempt;
 		try {
-			const bindings = requireCandidate(candidate);
+			attempt = requireCandidate(candidate);
+			const bindings = attempt?.[STAGED_CANDIDATE_ATTEMPT] ? attempt.bindings : attempt;
 			validateCandidate(bindings, candidate);
 			return { bindings, errors };
 		} catch (err) {
 			if (err instanceof StagedCandidateChangedError) throw err;
 			const message = err instanceof Error ? err.message : String(err);
 			errors.push(`${describeCandidate(candidate)}: ${message}`);
+		} finally {
+			try {
+				if (attempt?.[STAGED_CANDIDATE_ATTEMPT]) attempt.release();
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				throw new StagedCandidateChangedError(`staged addon lease release failed: ${message}`);
+			}
 		}
 	}
 	return { bindings: null, errors };
@@ -714,7 +713,7 @@ export function maybeStageNodeModulesAddon(ctx, errors) {
 		// Once an installed artifact has been selected for staging, its direct
 		// pathname is no longer a fallback. This also covers drift and partial
 		// winners, which must fail closed rather than execute an unverified file.
-		rejectPackageAddonCandidates(ctx, filename);
+		rejectInstalledAddonFallbacks(ctx);
 		if (sourceError || !sourceSnapshot) {
 			const message = sourceError instanceof Error ? sourceError.message : String(sourceError ?? "unavailable");
 			errors.push(`staged addon source (${filename}): ${message}`);
@@ -895,14 +894,11 @@ export function loadNative(options = {}) {
 			}
 			try {
 				validateStagedCandidate(ctx, candidate);
-				return options.requireCandidate ? options.requireCandidate(candidate) : require_(candidate);
-			} finally {
-				try {
-					releaseLease?.();
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					throw new StagedCandidateChangedError(`staged addon lease release failed: ${message}`);
-				}
+				const bindings = options.requireCandidate ? options.requireCandidate(candidate) : require_(candidate);
+				return releaseLease ? { [STAGED_CANDIDATE_ATTEMPT]: true, bindings, release: releaseLease } : bindings;
+			} catch (error) {
+				releaseLease?.();
+				throw error;
 			}
 		},
 		validateCandidate: options.validateCandidate ?? ((bindings, candidate) => validateLoadedBindings(ctx, bindings, candidate)),

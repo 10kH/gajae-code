@@ -152,7 +152,7 @@ describe("windows native addon loading", () => {
 				validateCandidate: () => events.push("validate-bindings"),
 			});
 			expect(bindings.selected).toBe(contentPath(context.versionedDir, filename, "leased-addon"));
-			expect(events).toEqual(["acquire", "require", "release", "validate-bindings"]);
+			expect(events).toEqual(["acquire", "require", "validate-bindings", "release"]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
@@ -262,6 +262,31 @@ describe("windows native addon loading", () => {
 			expect(maybeStageNodeModulesAddon(context, errors)).toEqual([]);
 			expect(errors.join("\n")).toContain("different bytes");
 			expect(context.candidates).not.toContain(path.join(context.nativeDir, filename));
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not fall through to execDir when installed addon staging fails", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-fallback-"));
+		const filename = "pi_natives.win32-x64.node";
+		try {
+			const context = await makeInstalledContext(root, [filename], "complete-addon");
+			const target = contentPath(context.versionedDir, filename, "complete-addon");
+			await fs.mkdir(context.versionedDir, { recursive: true });
+			await fs.writeFile(target, "mismatched-winner");
+			const attempted: string[] = [];
+			expect(() =>
+				loadNative({
+					context,
+					requireCandidate: candidate => {
+						attempted.push(candidate);
+						return {};
+					},
+					validateCandidate: () => undefined,
+				}),
+			).toThrow("staged addon publish");
+			expect(attempted).toEqual([]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}
