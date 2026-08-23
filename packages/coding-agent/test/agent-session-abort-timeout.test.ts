@@ -354,8 +354,8 @@ describe("AgentSession abort timeout", () => {
 			]);
 			expect(Date.now() - boundedStarted).toBeLessThan(45);
 			expect(notices.filter(message => message.includes("forced session recovery"))).toHaveLength(1);
-			expect(agentEnds).toBe(1);
 			await unboundedAbort;
+			expect(agentEnds).toBe(1);
 
 			// Prompt admission is unwedged for both aborts' waiters.
 			await activeSession.prompt("Prompt after forced recovery.");
