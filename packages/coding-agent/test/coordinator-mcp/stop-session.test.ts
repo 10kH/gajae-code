@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { buildCoordinatorMcpConfig } from "../../src/coordinator-mcp/policy";
-import { coordinatorStatePaths } from "../../src/coordinator-mcp/question-state";
+import { coordinatorStatePaths, readSessionTransaction } from "../../src/coordinator-mcp/question-state";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
 import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SdkClient } from "../../src/sdk/client/client";
@@ -155,6 +155,45 @@ async function writeSession(
 }
 
 describe("gjc_coordinator_stop_session SDK lifecycle", () => {
+	it("persists one endpoint-incarnation authority across WAL, projection, and broker close", async () => {
+		const root = await tempRoot();
+		const { server, controls } = await createServer(root);
+		const sessionId = "authority";
+		const fixture = await writeDurableCoordinatorSession({
+			sessionId,
+			cwd: root,
+			env: {
+				GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+				GJC_COORDINATOR_MCP_STATE_ROOT: path.join(root, ".gjc", "coordinator-state"),
+				GJC_COORDINATOR_MCP_MUTATIONS: "sessions",
+				GJC_COORDINATOR_MCP_PROFILE: "local",
+				GJC_COORDINATOR_MCP_REPO: "repo",
+			},
+			overrides: { ephemeral: true },
+		});
+		const expectedIncarnation = fixtureEndpointIncarnation(sessionId);
+		const wal = await readSessionTransaction(fixture.paths, sessionId);
+		const projection = JSON.parse(await fs.readFile(fixture.sessionFile, "utf8")) as {
+			endpoint_incarnation?: unknown;
+		};
+
+		expect(wal?.canonical.session.broker.endpoint_incarnation).toBe(expectedIncarnation);
+		expect(projection.endpoint_incarnation).toBe(expectedIncarnation);
+		expect(
+			await server.callTool("gjc_coordinator_stop_session", { session_id: sessionId, allow_mutation: true }),
+		).toMatchObject({ ok: true, closed: true, session_id: sessionId });
+		expect(controls.filter(control => control.operation === "session.close")).toEqual([
+			expect.objectContaining({
+				input: expect.objectContaining({
+					sessionId,
+					endpointGeneration: ENDPOINT_GENERATION,
+					endpointIncarnation: expectedIncarnation,
+				}),
+				idempotencyKey: `coordinator-reap:${sessionId}:${expectedIncarnation}`,
+			}),
+		]);
+	});
+
 	it("refuses a non-ephemeral session without force and never invokes lifecycle close", async () => {
 		const root = await tempRoot();
 		const { server, controls, sessionFile } = await createServer(root);

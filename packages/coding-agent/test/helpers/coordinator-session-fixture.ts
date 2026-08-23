@@ -110,7 +110,7 @@ export async function writeDurableCoordinatorSession(
 	const createdAt = new Date(Date.now() - creationAgeMs).toISOString();
 	const activityAt = new Date(Date.now() - activityAgeMs).toISOString();
 
-	const endpointIncarnation = fixtureEndpointIncarnation(options.sessionId);
+	const endpointIncarnationHash = fixtureEndpointIncarnation(options.sessionId);
 	const intent: CanonicalCreateIntentV1 = {
 		kind: "register",
 		session: {
@@ -128,7 +128,7 @@ export async function writeDurableCoordinatorSession(
 				workspace: realRoot,
 				endpoint_url: "",
 				endpoint_generation: FIXTURE_ENDPOINT_GENERATION,
-				endpoint_incarnation: endpointIncarnation,
+				endpoint_incarnation: endpointIncarnationHash,
 				sidecar_verifier: fixtureVerifier(),
 			},
 			ephemeral: options.overrides?.ephemeral === true,
@@ -191,7 +191,7 @@ export async function writeDurableCoordinatorSession(
 			created_at: createdAt,
 			broker_workspace: realRoot,
 			endpoint_generation: FIXTURE_ENDPOINT_GENERATION,
-			endpoint_incarnation: endpointIncarnation,
+			endpoint_incarnation: endpointIncarnationHash,
 			...options.overrides,
 		})}\n`,
 	);
