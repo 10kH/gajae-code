@@ -349,8 +349,13 @@ export class GajaePetWidget {
 	#applyMode(mode: PetMode, mountComposer: boolean): void {
 		if (this.#disposed) return;
 		if (mode === this.#mode) {
-			if (mode !== "off" && this.#framedEditor.canFit(this.#ui.terminal.columns)) this.#mountEditor(true);
-			return;
+			if (mode === "off") return;
+			const nextProtocol = this.#forcedProtocol ?? GajaePetWidget.pixelProtocol();
+			const currentProtocol = this.#itermProtocol ? "iterm" : (this.#pixel?.protocol ?? "text");
+			if (nextProtocol === currentProtocol) {
+				if (this.#framedEditor.canFit(this.#ui.terminal.columns)) this.#mountEditor(true);
+				return;
+			}
 		}
 		if (mode === "off") {
 			if (!this.#canMutateSharedUi()) return;

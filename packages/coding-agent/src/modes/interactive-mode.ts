@@ -845,10 +845,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#petProtocolUnsubscribe = onImageProtocolChanged(protocol => {
 			if (!protocol) {
 				void this.petWidget?.suspendItermCapability();
-				return;
 			}
 			const saved = settings.get("pet.mode");
-			if (saved !== "off" && this.petWidget && this.petWidget.mode === "off") {
+			if (saved !== "off" && this.petWidget) {
 				this.petWidget.setMode(saved);
 			}
 		});

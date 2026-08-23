@@ -266,6 +266,35 @@ describe("GajaePetWidget", () => {
 		}
 	});
 
+	it("upgrades a text fallback to pixels when its protocol becomes available", () => {
+		const { widget, getEmitter } = makeWidget(80, 30, { protocol: null });
+		const protocol = vi.spyOn(GajaePetWidget, "pixelProtocol").mockReturnValue("text");
+		try {
+			widget.setMode("red");
+			protocol.mockReturnValue("sixel");
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+		} finally {
+			protocol.mockRestore();
+			widget.dispose();
+		}
+	});
+
+	it("replaces an active pixel pet with text cells when graphics disappear", () => {
+		const { widget, editorContainer, getEmitter } = makeWidget(80, 30, { protocol: null });
+		const protocol = vi.spyOn(GajaePetWidget, "pixelProtocol").mockReturnValue("sixel");
+		try {
+			widget.setMode("red");
+			protocol.mockReturnValue("text");
+			widget.setMode("red");
+			expect(getEmitter()?.()).toBeNull();
+			expect(editorContainer.render(80).join("\n")).toContain("▀");
+		} finally {
+			protocol.mockRestore();
+			widget.dispose();
+		}
+	});
+
 	it("owns and deletes a distinct Kitty image ID per widget", () => {
 		const first = makeWidget(80, 30, { protocol: "kitty" });
 		const second = makeWidget(80, 30, { protocol: "kitty" });
