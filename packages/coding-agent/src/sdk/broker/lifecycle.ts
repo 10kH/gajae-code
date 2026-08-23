@@ -4990,21 +4990,27 @@ async function executeLifecycleResponse(
 			const reconciled = await reconcileLifecycleCleanup(broker, identity, metadataCleanup, completion);
 			if (!reconciled.ok) return reconciled;
 		}
-		if (record)
-			await broker.index.append({
-				type: "session_deleted",
-				sessionId: id,
-				locator: record.locator,
-				endpointGeneration: record.endpointGeneration,
-				pid: record.pid,
-				...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
-				...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
-				...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
-				...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
-			});
+		// Persist exact retirement authority in the broker-owned index only. These
+		// identity fields are deliberately not added to `completion`, so the public
+		// lifecycle response remains the credential-free `{ sessionId }` contract.
+		if (record) await appendSessionDeletedEvidence(broker, record);
 		return completion;
 	}
 	return fail("invalid_input", "Unknown lifecycle operation.");
+}
+
+async function appendSessionDeletedEvidence(broker: Broker, record: IndexedSession): Promise<void> {
+	await broker.index.append({
+		type: "session_deleted",
+		sessionId: record.sessionId,
+		locator: record.locator,
+		endpointGeneration: record.endpointGeneration,
+		pid: record.pid,
+		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
+		...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
+		...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
+	});
 }
 
 async function exactCleanupProof(

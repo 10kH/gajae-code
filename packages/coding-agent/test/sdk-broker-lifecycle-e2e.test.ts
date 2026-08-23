@@ -1435,7 +1435,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				"canonical-cold-fork-delete",
 				await broker.handleRequest("session.delete", forkDeleteInput, "canonical-cold-fork-delete"),
 			),
-		).toMatchObject({ ok: true, result: { sessionId: forkId } });
+		).toEqual({ ok: true, result: { sessionId: forkId } });
 		expect(await proofRouter.generationStatus(forkId, forkGeneration)).toMatchObject({
 			status: "retired",
 			evidence: { source: "session_index", event: "session_deleted" },
@@ -1483,7 +1483,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				"canonical-cold-resume-delete",
 				await broker.handleRequest("session.delete", sourceDeleteInput, "canonical-cold-resume-delete"),
 			),
-		).toMatchObject({ ok: true, result: { sessionId: sourceId } });
+		).toEqual({ ok: true, result: { sessionId: sourceId } });
 		expect(await proofRouter.generationStatus(sourceId, resumedGeneration)).toMatchObject({
 			status: "retired",
 			evidence: { source: "session_index", event: "session_deleted" },
