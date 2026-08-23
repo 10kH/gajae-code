@@ -189,6 +189,44 @@ describe("inbound reaction transition ordering", () => {
 		expect(sequencer.debugChainCount()).toBe(0);
 	});
 
+	test("an earlier transition settling mid-chain never unserializes a later one", async () => {
+		const sequencer = new InboundReactionSequencer();
+		const order: string[] = [];
+		const consumed = gatedEffect("consumed");
+
+		// Fast accepted ack settles while the slow consumed ack is mid-flight.
+		const acceptedPromise = sequencer.apply(802, {
+			terminal: false,
+			effect: async () => {
+				order.push("queued");
+			},
+		});
+		const consumedPromise = sequencer.apply(802, {
+			terminal: true,
+			effect: async () => {
+				order.push("consumed");
+				await consumed.effect();
+			},
+		});
+		await acceptedPromise;
+		// A replayed accepted ack arriving now must chain behind the in-flight
+		// consumed transition (and then be skipped by its terminal state), not
+		// start concurrently against it.
+		const replayedPromise = sequencer.apply(802, {
+			terminal: false,
+			effect: async () => {
+				order.push("replayed-queued");
+			},
+		});
+		consumed.call.release();
+		await Promise.all([consumedPromise, replayedPromise]);
+
+		expect(order).toEqual(["queued", "consumed"]);
+		expect(sequencer.isTerminal(802)).toBe(true);
+		await Bun.sleep(0);
+		expect(sequencer.debugChainCount()).toBe(0);
+	});
+
 	test("set payload maps an emoji marker to the Bot API reaction array", () => {
 		expect(inboundReactionSetPayload("42", 5001, "👀")).toEqual({
 			chat_id: "42",

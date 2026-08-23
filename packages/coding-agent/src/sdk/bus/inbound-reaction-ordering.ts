@@ -57,16 +57,16 @@ export class InboundReactionSequencer {
 		const next = prior.then(run, run);
 		// The chain is retained only while unsettled work exists for the update;
 		// once settled it is deleted so the map cannot grow without bound. The
+		// delete is identity-guarded: an earlier transition settling must not
+		// drop a tail a later transition has already installed, or the next
+		// apply() would chain onto a fresh promise and run unserialized. The
 		// stored tail never rejects (both arms handle) so an unawaited chain can
 		// never surface an unhandled rejection.
-		const settled = next.then(
-			() => this.#chains.delete(updateId),
-			() => this.#chains.delete(updateId),
-		);
-		this.#chains.set(
-			updateId,
-			settled.then(() => undefined),
-		);
+		const release = (): void => {
+			if (this.#chains.get(updateId) === tail) this.#chains.delete(updateId);
+		};
+		const tail: Promise<void> = next.then(release, release);
+		this.#chains.set(updateId, tail);
 		return next;
 	}
 
