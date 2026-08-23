@@ -250,12 +250,14 @@ export function resolveOptionalPackageNativeDirs({ packageNames, requireResolve 
  * @returns {boolean}
  */
 export function shouldStageNodeModulesAddon({ platform, isCompiledBinary, nativeDir }) {
-	if (platform !== "win32") return false;
-	if (isCompiledBinary) return false;
-	// Check both separators independently of the host's `path.sep`: this helper
-	// is shared by the loader (running on Windows with `\`) and the test suite
-	// (typically running on POSIX hosts when CI executes the regression test).
-	return nativeDir.includes("\\node_modules\\") || nativeDir.includes("/node_modules/");
+	// Node and Bun only load N-API addons by pathname. The old cache-copy path
+	// validated one pathname then loaded it through another pathname resolution,
+	// which cannot bind the verified bytes to native execution. Do not stage until
+	// the runtime exposes descriptor/HANDLE-bound addon loading.
+	void platform;
+	void isCompiledBinary;
+	void nativeDir;
+	return false;
 }
 
 /**
@@ -299,12 +301,9 @@ export function resolveLoaderCandidates({
 		path.join(versionedDir, filename),
 		path.join(userDataDir, filename),
 	]);
-	const stagedCandidates = stageFromNodeModules ? addonFilenames.map(filename => path.join(versionedDir, filename)) : [];
 	let releaseCandidates;
 	if (isCompiledBinary) {
 		releaseCandidates = [...compiledCandidates, ...baseReleaseCandidates];
-	} else if (stageFromNodeModules) {
-		releaseCandidates = [...stagedCandidates, ...baseReleaseCandidates];
 	} else {
 		releaseCandidates = baseReleaseCandidates;
 	}
@@ -777,11 +776,7 @@ function initLoaderContext(require_) {
 		env: process.env,
 		importMetaUrl: import.meta.url,
 	});
-	const stageFromNodeModules = shouldStageNodeModulesAddon({
-		platform: process.platform,
-		isCompiledBinary,
-		nativeDir,
-	});
+	const stageFromNodeModules = false;
 	const isWorkspaceLoad =
 		!isCompiledBinary && !nativeDir.includes("\\node_modules\\") && !nativeDir.includes("/node_modules/");
 
@@ -845,10 +840,7 @@ export function loadNative(options = {}) {
 	const errors = [];
 	const embeddedCandidates = (options.extractEmbeddedAddons ?? maybeExtractEmbeddedAddons)(ctx, errors);
 	const embeddedIsAuthoritative = embeddedAddonIsAuthoritative(ctx);
-	const stagedCandidate =
-		embeddedCandidates.length > 0 || embeddedIsAuthoritative
-			? null
-			: (options.stageNodeModulesAddon ?? maybeStageNodeModulesAddon)(ctx, errors);
+	const stagedCandidate = null;
 	const prepended = [...embeddedCandidates, stagedCandidate].filter(c => typeof c === "string");
 	const runtimeCandidates = embeddedIsAuthoritative ? prepended : prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
 	const loaded = loadFromCandidates({
