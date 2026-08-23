@@ -58,6 +58,10 @@ export class BrokerTransport {
 	#port = 0;
 	readonly #shutdownBackpressured = new WeakSet<ServerWebSocket<unknown>>();
 	#shutdownRequested = false;
+	#shutdownResponseBackpressured = false;
+	#shutdownStopScheduled = false;
+	readonly #activeRequests = new Set<Promise<void>>();
+	readonly #responseDrainWaiters = new WeakMap<ServerWebSocket<unknown>, Set<() => void>>();
 	constructor(broker: Broker, token: string, port = 0) {
 		this.#broker = broker;
 		this.#token = token;
@@ -89,7 +93,16 @@ export class BrokerTransport {
 				},
 				message: (socket, message) => void this.#handleMessage(socket, message),
 				drain: socket => {
-					if (this.#shutdownBackpressured.delete(socket)) this.#scheduleStopAfterShutdownResponse();
+					this.#settleResponseDrain(socket);
+					if (this.#shutdownBackpressured.delete(socket)) {
+						this.#shutdownResponseBackpressured = false;
+						this.#scheduleStopAfterShutdownResponse();
+					}
+				},
+				close: socket => {
+					this.#settleResponseDrain(socket);
+					if (this.#shutdownBackpressured.delete(socket)) this.#shutdownResponseBackpressured = false;
+					this.#scheduleStopAfterShutdownResponse();
 				},
 			},
 		});
@@ -143,18 +156,55 @@ export class BrokerTransport {
 			);
 			if (action === "dropped") return;
 			this.#shutdownRequested = true;
-			if (action === "wait_for_drain") this.#shutdownBackpressured.add(socket);
-			else this.#scheduleStopAfterShutdownResponse();
+			if (action === "wait_for_drain") {
+				this.#shutdownBackpressured.add(socket);
+				this.#shutdownResponseBackpressured = true;
+			} else this.#scheduleStopAfterShutdownResponse();
 			return;
 		}
+		const activeRequest = (async (): Promise<void> => {
+			try {
+				const result = await this.#broker.handleRequest(frame.operation!, frame.input!, frame.idempotencyKey);
+				await this.#sendAndDrain(socket, { type: "broker_response", id: frame.id, ...result });
+			} catch {
+				await this.#sendAndDrain(socket, {
+					type: "broker_response",
+					id: frame.id,
+					ok: false,
+					error: { code: "unavailable", message: "broker request failed" },
+				}).catch(() => undefined);
+			}
+		})();
+		this.#activeRequests.add(activeRequest);
 		try {
-			const result = await this.#broker.handleRequest(frame.operation, frame.input, frame.idempotencyKey);
-			send(socket, { type: "broker_response", id: frame.id, ...result });
-		} catch {
-			sendError(socket, frame.id, "unavailable", "broker request failed");
+			await activeRequest;
+		} finally {
+			this.#activeRequests.delete(activeRequest);
+			this.#scheduleStopAfterShutdownResponse();
 		}
 	}
+	#sendAndDrain(socket: ServerWebSocket<unknown>, frame: Record<string, unknown>): Promise<void> {
+		const status = send(socket, frame);
+		if (status >= 0) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		let waiters = this.#responseDrainWaiters.get(socket);
+		if (!waiters) {
+			waiters = new Set();
+			this.#responseDrainWaiters.set(socket, waiters);
+		}
+		waiters.add(resolve);
+		return promise;
+	}
+	#settleResponseDrain(socket: ServerWebSocket<unknown>): void {
+		const waiters = this.#responseDrainWaiters.get(socket);
+		if (!waiters) return;
+		this.#responseDrainWaiters.delete(socket);
+		for (const resolve of waiters) resolve();
+	}
 	#scheduleStopAfterShutdownResponse(): void {
+		if (this.#shutdownStopScheduled || !this.#shutdownRequested || this.#shutdownResponseBackpressured) return;
+		if (this.#activeRequests.size > 0) return;
+		this.#shutdownStopScheduled = true;
 		setTimeout(() => void this.#broker.stop(), 25);
 	}
 }

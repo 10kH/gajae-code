@@ -91,6 +91,12 @@ export interface CachedEmbeddedExtractionIsFreshInput {
 
 export function cachedEmbeddedExtractionIsFresh(input: CachedEmbeddedExtractionIsFreshInput): boolean;
 
+export interface NativeAddonSnapshot {
+	bytes: Uint8Array;
+	hash: string;
+	identity: string;
+}
+
 export function validateLoadedBindings(
 	ctx: { versionSentinelExport: string; packageVersion: string },
 	bindings: Record<string, unknown>,
@@ -109,7 +115,11 @@ export interface LoaderContext {
 	nativeDir?: string;
 	optionalPackageNativeDirs?: string[];
 	selectedVariant?: "modern" | "baseline" | null;
+	stagedCandidateSnapshots?: Map<string, NativeAddonSnapshot>;
+	stagedSourceSnapshots?: Map<string, { sourcePath: string; snapshot: NativeAddonSnapshot }>;
 }
+
+export function maybeStageNodeModulesAddon(ctx: LoaderContext, errors: string[]): string[];
 
 export function embeddedAddonIsAuthoritative(
 	ctx: LoaderContext,
@@ -119,7 +129,7 @@ export function embeddedAddonIsAuthoritative(
 export interface LoadNativeOptions {
 	context?: LoaderContext;
 	extractEmbeddedAddons?: (ctx: LoaderContext) => string[];
-	stageNodeModulesAddon?: (ctx: LoaderContext, errors: string[]) => string | null;
+	stageNodeModulesAddon?: (ctx: LoaderContext, errors: string[]) => string[] | string | null;
 	requireCandidate?: (candidate: string) => Record<string, unknown>;
 	validateCandidate?: (bindings: Record<string, unknown>, candidate: string) => void;
 }

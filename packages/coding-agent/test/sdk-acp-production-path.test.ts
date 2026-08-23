@@ -1,12 +1,14 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import * as brokerEnsure from "../src/sdk/broker/ensure";
 import { resolveSdkPackageAuthority } from "../src/sdk/broker/runtime";
 import { SessionIndex } from "../src/sdk/broker/session-index";
+import { SdkClient } from "../src/sdk/client";
 
 type TestServer = {
 	port: number | undefined;
@@ -124,6 +126,80 @@ test("concurrent ACP broker requests share one canonical connection", async () =
 	expect(second).toEqual({ sessions: [] });
 	expect(fixture.connections()).toBe(1);
 });
+
+test("disposed ACP rejects queued production broker calls before broker startup", async () => {
+	const ensureSpy = spyOn(brokerEnsure, "ensureBroker");
+	const connectSpy = spyOn(SdkClient, "connect");
+	const abort = new AbortController();
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
+		agentDir: path.join(tmpdir(), "acp-disposed-before-broker"),
+		expectedPackageGeneration: "test",
+	});
+	try {
+		// Let the constructor install its abort listener before closing the ACP connection.
+		await Promise.resolve();
+		abort.abort();
+		await Promise.resolve();
+		const results = await Promise.all([
+			agent.extMethod("_gjc/sdk/global", { operation: "session.list" }),
+			agent.extMethod("_gjc/sdk/global", { operation: "session.list" }),
+		]);
+		expect(results).toEqual([
+			expect.objectContaining({ ok: false, error: expect.objectContaining({ code: "connection_closed" }) }),
+			expect.objectContaining({ ok: false, error: expect.objectContaining({ code: "connection_closed" }) }),
+		]);
+		expect(ensureSpy).not.toHaveBeenCalled();
+		expect(connectSpy).not.toHaveBeenCalled();
+	} finally {
+		connectSpy.mockRestore();
+		ensureSpy.mockRestore();
+	}
+});
+
+test("ACP closes a broker connection that finishes startup after disposal", async () => {
+	const ensureSpy = spyOn(brokerEnsure, "ensureBroker").mockResolvedValue({
+		url: "ws://broker.test",
+		token: "broker-token",
+		packageGeneration: "test",
+	} as never);
+	const startEntered = Promise.withResolvers<void>();
+	const releaseStart = Promise.withResolvers<void>();
+	let clientCloseCalls = 0;
+	const client = {
+		connectionId: "late-connection",
+		onFrame: () => () => {},
+		onReconnect: () => () => {},
+		onReconnectFailed: () => () => {},
+		connect: async () => {
+			startEntered.resolve();
+			await releaseStart.promise;
+		},
+		close: async () => {
+			clientCloseCalls += 1;
+		},
+	} as unknown as SdkClient;
+	const connectSpy = spyOn(SdkClient, "connect").mockResolvedValue(client);
+	const abort = new AbortController();
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
+		agentDir: path.join(tmpdir(), "acp-disposed-during-broker-startup"),
+		expectedPackageGeneration: "test",
+	});
+	try {
+		await Promise.resolve();
+		const pending = agent.listSessions({});
+		await startEntered.promise;
+		abort.abort();
+		await Promise.resolve();
+		releaseStart.resolve();
+		await expect(pending).rejects.toMatchObject({ code: "connection_closed" });
+		expect(connectSpy).toHaveBeenCalledTimes(1);
+		expect(clientCloseCalls).toBeGreaterThan(0);
+	} finally {
+		connectSpy.mockRestore();
+		ensureSpy.mockRestore();
+	}
+});
+
 test("production ACP routes zero-session SDK globals through the broker adapter", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-production-"));
 	directories.push(directory);

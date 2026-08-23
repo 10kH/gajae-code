@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "bun:test";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -10,6 +12,7 @@ import {
 	canRetireStaleBrokerForTest,
 	ensureBroker,
 	matchesExpectedBrokerAuthorityForTest,
+	registerBrokerOwnerForTest,
 	signalExactBrokerForTest,
 } from "../src/sdk/broker/ensure";
 import {
@@ -17,9 +20,71 @@ import {
 	resolveSdkPackageAuthority,
 	resolveSdkPackageGeneration,
 } from "../src/sdk/broker/runtime";
+import { BrokerTransport } from "../src/sdk/broker/transport";
 import { SdkClient } from "../src/sdk/client/client";
 
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-broker-generation-"));
+
+async function nextFrame(ws: WebSocket): Promise<Record<string, unknown>> {
+	return await new Promise((resolve, reject) => {
+		const timeout = setTimeout(() => reject(new Error("Timed out waiting for broker frame")), 2_000);
+		ws.addEventListener(
+			"message",
+			event => {
+				clearTimeout(timeout);
+				resolve(JSON.parse(String(event.data)) as Record<string, unknown>);
+			},
+			{ once: true },
+		);
+		ws.addEventListener(
+			"error",
+			() => {
+				clearTimeout(timeout);
+				reject(new Error("Broker WebSocket error"));
+			},
+			{ once: true },
+		);
+		ws.addEventListener(
+			"close",
+			event => {
+				clearTimeout(timeout);
+				reject(new Error(`Broker WebSocket closed (${event.code})`));
+			},
+			{ once: true },
+		);
+	});
+}
+
+async function connectTransport(url: string, token: string): Promise<WebSocket> {
+	const ws = new WebSocket(`${url}/?token=${token}`);
+	await new Promise<void>((resolve, reject) => {
+		ws.addEventListener("open", () => resolve(), { once: true });
+		ws.addEventListener("error", () => reject(new Error("Broker WebSocket error")), { once: true });
+	});
+	return ws;
+}
+
+async function waitForCondition(predicate: () => boolean, label: string): Promise<void> {
+	const deadline = Date.now() + 2_000;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${label}`);
+		await Bun.sleep(10);
+	}
+}
+
+function ownedTestChild(): ChildProcess & { signals: NodeJS.Signals[] } {
+	const signals: NodeJS.Signals[] = [];
+	return Object.assign(new EventEmitter(), {
+		pid: process.pid,
+		exitCode: null as number | null,
+		signalCode: null as NodeJS.Signals | null,
+		signals,
+		kill(signal: NodeJS.Signals): boolean {
+			signals.push(signal);
+			return true;
+		},
+	}) as unknown as ChildProcess & { signals: NodeJS.Signals[] };
+}
 
 function olderPackageVersion(version: string): string {
 	const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
@@ -248,6 +313,43 @@ describe("sdk broker package generation", () => {
 		}
 	}, 15_000);
 
+	it("fails closed without signalling a legacy discovery with opaque generation drift", async () => {
+		const dir = await temp();
+		const authority = resolveSdkPackageAuthority();
+		const pid = process.ppid;
+		const processRef = nativeProcessBindings().Process.fromPid(pid);
+		const incarnation = processRef?.incarnation ?? brokerProcessIncarnation(pid);
+		const signalRoot = vi.fn(() => true);
+		const fromPid = vi.spyOn(nativeProcessBindings().Process, "fromPid").mockReturnValue({
+			incarnation,
+			signalRoot,
+		} as never);
+		try {
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "legacy-opaque-generation",
+				ownerId: "legacy-discovery",
+				pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "legacy-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			await expect(ensureBroker({ agentDir: dir, expectedPackageGeneration: authority.generation })).rejects.toThrow(
+				"stale broker retirement was not verified",
+			);
+			expect(signalRoot).not.toHaveBeenCalled();
+		} finally {
+			fromPid.mockRestore();
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
 	it("fails closed when Darwin cannot signal an identity-bound stale broker", () => {
 		const originalPlatform = process.platform;
 		const processRef = {
@@ -394,6 +496,237 @@ describe("sdk broker package generation", () => {
 			fromPid.mockRestore();
 		}
 	});
+
+	it("waits for admitted broker work before completing authenticated shutdown", async () => {
+		const admitted = Promise.withResolvers<{ ok: true; result: { drained: true } }>();
+		const stopped = Promise.withResolvers<void>();
+		const handleRequest = vi.fn(() => admitted.promise);
+		const stop = vi.fn(async () => {
+			stopped.resolve();
+		});
+		const transport = new BrokerTransport({ handleRequest, stop } as unknown as Broker, "generation-transport-token");
+		const port = await transport.start();
+		const ws = await connectTransport(`ws://127.0.0.1:${port}`, "generation-transport-token");
+		try {
+			expect(await nextFrame(ws)).toEqual({ type: "broker_hello", protocolVersion: 3 });
+			ws.send(JSON.stringify({ type: "broker_request", id: "admitted", operation: "session.list", input: {} }));
+			await waitForCondition(() => handleRequest.mock.calls.length === 1, "admitted broker request");
+			expect(handleRequest).toHaveBeenCalledTimes(1);
+
+			const shutdownResponse = nextFrame(ws);
+			ws.send(JSON.stringify({ type: "broker_request", id: "shutdown", operation: "broker.shutdown", input: {} }));
+			expect(await shutdownResponse).toEqual({
+				type: "broker_response",
+				id: "shutdown",
+				ok: true,
+				result: { accepted: true },
+			});
+			const lateResponse = nextFrame(ws);
+			ws.send(JSON.stringify({ type: "broker_request", id: "late", operation: "session.list", input: {} }));
+			expect(await lateResponse).toEqual({
+				type: "broker_response",
+				ok: false,
+				error: { code: "unavailable", message: "broker is shutting down" },
+			});
+			await Bun.sleep(25);
+			expect(stop).not.toHaveBeenCalled();
+
+			const workResponse = nextFrame(ws);
+			admitted.resolve({ ok: true, result: { drained: true } });
+			expect(await workResponse).toEqual({
+				type: "broker_response",
+				id: "admitted",
+				ok: true,
+				result: { drained: true },
+			});
+			await stopped.promise;
+			expect(stop).toHaveBeenCalledTimes(1);
+		} finally {
+			ws.close();
+			await transport.stop();
+		}
+	});
+
+	it("does not reap a ready local owner when its publication is missing", async () => {
+		const dir = await temp();
+		const authority = resolveSdkPackageAuthority();
+		const child = ownedTestChild();
+		const owner = registerBrokerOwnerForTest(dir, child);
+		const incarnation = brokerProcessIncarnation(process.pid);
+		try {
+			expect(incarnation).toBeString();
+			const discovery = {
+				version: 1 as const,
+				protocolVersion: 3 as const,
+				packageGeneration: authority.generation,
+				packageVersion: authority.packageVersion,
+				installationIdentity: authority.installationIdentity,
+				ownerId: "ready-owner-missing-publication",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1" as const,
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "ready-owner-missing-publication-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			};
+			await writeBrokerDiscovery(dir, discovery);
+			expect(owner.markReady(discovery)).toBe(true);
+			await fs.rm(path.join(dir, "sdk", "broker.json"), { force: true });
+			await expect(
+				ensureBroker({
+					agentDir: dir,
+					expectedPackageGeneration: authority.generation,
+					expectedPackageVersion: authority.packageVersion,
+					expectedInstallationIdentity: authority.installationIdentity,
+				}),
+			).rejects.toThrow("refusing destructive cleanup of a ready broker");
+			expect(child.signals).toEqual([]);
+			expect(brokerOwnerForTest(dir)).toBe(owner);
+		} finally {
+			(child as unknown as { exitCode: number | null }).exitCode = 0;
+			child.emit("exit", 0, null);
+			await owner.stop().catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("does not force-kill an equal-version exact local owner while work is admitted", async () => {
+		const dir = await temp();
+		const authority = resolveSdkPackageAuthority();
+		const token = "owned-retirement-timeout-token";
+		const child = ownedTestChild();
+		const admitted = Promise.withResolvers<{ ok: true; result: { drained: true } }>();
+		const admittedStarted = Promise.withResolvers<void>();
+		const stopped = Promise.withResolvers<void>();
+		const handleRequest = vi.fn(() => {
+			admittedStarted.resolve();
+			return admitted.promise;
+		});
+		const transport = new BrokerTransport(
+			{
+				handleRequest,
+				stop: vi.fn(async () => {
+					await fs.rm(path.join(dir, "sdk", "broker.json"), { force: true });
+					(child as unknown as { exitCode: number | null }).exitCode = 0;
+					child.emit("exit", 0, null);
+					stopped.resolve();
+				}),
+			} as unknown as Broker,
+			token,
+		);
+		const port = await transport.start();
+		const owner = registerBrokerOwnerForTest(dir, child);
+		const incarnation = brokerProcessIncarnation(process.pid);
+		const client = await SdkClient.connect(`ws://127.0.0.1:${port}`, token, { reconnectAttempts: 0 });
+		try {
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "same-version-source-generation",
+				packageVersion: authority.packageVersion,
+				installationIdentity: authority.installationIdentity,
+				ownerId: "owned-retirement-timeout",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port,
+				url: `ws://127.0.0.1:${port}`,
+				token,
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const work = client.global("session.list", {});
+			await admittedStarted.promise;
+			await expect(
+				ensureBroker({
+					agentDir: dir,
+					expectedPackageGeneration: authority.generation,
+					expectedPackageVersion: authority.packageVersion,
+					expectedInstallationIdentity: authority.installationIdentity,
+				}),
+			).rejects.toThrow("stale broker retirement was not verified");
+			expect(child.signals).toEqual([]);
+			expect(brokerOwnerForTest(dir)).toBe(owner);
+
+			admitted.resolve({ ok: true, result: { drained: true } });
+			await expect(work).resolves.toMatchObject({ ok: true, result: { drained: true } });
+			await stopped.promise;
+		} finally {
+			await client.close().catch(() => {});
+			await transport.stop();
+			await brokerOwnerForTest(dir)
+				?.stop()
+				.catch(() => {});
+			await fs.rm(dir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("replaces a verified drained equal-version local owner exactly once", async () => {
+		const dir = await temp();
+		const authority = resolveSdkPackageAuthority();
+		const token = "owned-retirement-drained-token";
+		const child = ownedTestChild();
+		const stopped = Promise.withResolvers<void>();
+		const stop = vi.fn(async () => {
+			await fs.rm(path.join(dir, "sdk", "broker.json"), { force: true });
+			(child as unknown as { exitCode: number | null }).exitCode = 0;
+			child.emit("exit", 0, null);
+			stopped.resolve();
+		});
+		const transport = new BrokerTransport(
+			{
+				handleRequest: vi.fn(async () => ({ ok: true, result: { drained: true } })),
+				stop,
+			} as unknown as Broker,
+			token,
+		);
+		const port = await transport.start();
+		registerBrokerOwnerForTest(dir, child);
+		const incarnation = brokerProcessIncarnation(process.pid);
+		try {
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "same-version-source-generation",
+				packageVersion: authority.packageVersion,
+				installationIdentity: authority.installationIdentity,
+				ownerId: "owned-retirement-drained",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port,
+				url: `ws://127.0.0.1:${port}`,
+				token,
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const replacement = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+				expectedPackageVersion: authority.packageVersion,
+				expectedInstallationIdentity: authority.installationIdentity,
+			});
+			expect(await stopped.promise).toBeUndefined();
+			expect(stop).toHaveBeenCalledTimes(1);
+			expect(replacement.pid).not.toBe(process.pid);
+			const reused = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+				expectedPackageVersion: authority.packageVersion,
+				expectedInstallationIdentity: authority.installationIdentity,
+			});
+			expect(reused.pid).toBe(replacement.pid);
+			expect(reused.incarnation).toBe(replacement.incarnation);
+			expect(stop).toHaveBeenCalledTimes(1);
+		} finally {
+			await transport.stop();
+			await cleanup(dir);
+		}
+	}, 30_000);
 
 	it("serializes concurrent stale-broker retirements into one replacement", async () => {
 		const dir = await temp();

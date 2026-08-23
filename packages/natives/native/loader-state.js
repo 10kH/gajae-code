@@ -47,27 +47,12 @@ class StagedCandidateChangedError extends Error {
 	}
 }
 
-const REFRESH_ARTIFACT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-
-
 function getNativesDir() {
 	const xdgDataHome = process.env.XDG_DATA_HOME;
 	if (xdgDataHome && fs.existsSync(path.join(xdgDataHome, "gjc"))) {
 		return path.join(xdgDataHome, "gjc", "natives");
 	}
 	return path.join(os.homedir(), ".gjc", "natives");
-}
-
-function addonBytesMatch(left, right) {
-	try {
-		return safeFileSnapshot(left).hash === safeFileSnapshot(right).hash;
-	} catch {
-		return false;
-	}
-}
-
-function addonContentDigest(file) {
-	return safeFileSnapshot(file).hash.slice(0, 24);
 }
 
 function safeFileSnapshot(file) {
@@ -111,6 +96,30 @@ function safeDirectoryPath(directory) {
 	}
 }
 
+function isMissingPathError(error) {
+	return error?.code === "ENOENT" || error?.message === "ENOENT";
+}
+
+function stagedAddonPath(versionedDir, filename, hash) {
+	return path.join(versionedDir, `.content-${hash}-${filename}`);
+}
+
+function packageAddonCandidates(ctx, filename) {
+	const dirs = [
+		...(Array.isArray(ctx.optionalPackageNativeDirs) ? ctx.optionalPackageNativeDirs : []),
+		...(typeof ctx.nativeDir === "string" ? [ctx.nativeDir] : []),
+	];
+	const candidates = dirs.filter(directory => typeof directory === "string").map(directory => path.join(directory, filename));
+	if (typeof ctx.versionedDir === "string") candidates.push(path.join(ctx.versionedDir, filename));
+	return candidates;
+}
+
+function rejectPackageAddonCandidates(ctx, filename) {
+	if (!Array.isArray(ctx.candidates)) return;
+	const rejected = new Set(packageAddonCandidates(ctx, filename));
+	ctx.candidates = ctx.candidates.filter(candidate => !rejected.has(candidate));
+}
+
 function recordStagedSnapshot(ctx, candidate, snapshot) {
 	ctx.stagedCandidateSnapshots ??= new Map();
 	ctx.stagedCandidateSnapshots.set(candidate, snapshot);
@@ -125,43 +134,11 @@ function validateStagedCandidate(ctx, candidate) {
 	const expected = ctx.stagedCandidateSnapshots?.get(candidate);
 	if (!expected) return;
 	const current = safeFileSnapshot(candidate);
-	if (current.hash !== expected.hash || current.identity !== expected.identity)
-		throw new StagedCandidateChangedError();
+	if (current.hash !== expected.hash) throw new StagedCandidateChangedError();
 	const source = ctx.stagedSourceSnapshots?.get(candidate);
 	if (source) {
 		const currentSource = safeFileSnapshot(source.sourcePath);
-		if (currentSource.hash !== source.snapshot.hash || currentSource.identity !== source.snapshot.identity)
-			throw new StagedCandidateChangedError();
-	}
-}
-
-function pruneRefreshArtifacts(versionedDir, filename, keepPath) {
-	if (!safeDirectoryPath(versionedDir)) return;
-	const suffix = `-${filename}`;
-	try {
-		for (const entry of fs.readdirSync(versionedDir)) {
-			if (
-				!entry.startsWith(".refresh-") ||
-				!entry.endsWith(suffix) ||
-				entry === path.basename(keepPath) ||
-				!/^[a-f0-9]{24}$/.test(entry.slice(".refresh-".length, -suffix.length))
-			)
-				continue;
-			const candidate = path.join(versionedDir, entry);
-			try {
-				const stat = fs.lstatSync(candidate);
-				if (
-					stat.isFile() &&
-					!stat.isSymbolicLink() &&
-					Date.now() - stat.mtimeMs >= REFRESH_ARTIFACT_MAX_AGE_MS
-				)
-					fs.unlinkSync(candidate);
-			} catch {
-				// Another process may still hold the old refresh path on Windows.
-			}
-		}
-	} catch {
-		// Refresh cleanup is best effort; the verified current artifact remains authoritative.
+		if (currentSource.hash !== source.snapshot.hash) throw new StagedCandidateChangedError();
 	}
 }
 
@@ -230,18 +207,16 @@ export function resolveOptionalPackageNativeDirs({ packageNames, requireResolve 
 }
 
 /**
- * Decide whether the loader should mirror the package's `native/<filename>.node`
- * into the per-version cache directory (`~/.gjc/natives/<version>/`) before loading.
+ * Decide whether the loader should snapshot installed package addons into the
+ * per-version cache directory (`~/.gjc/natives/<version>/`) before loading.
  *
  * Windows-only safety net for `bun install -g` updates: when a previous `gjc`
  * process is running, bun cannot overwrite the locked `.node` inside
  * `node_modules/@gajae-code/natives/native/`, leaving an old binary next to a
  * newer `index.js` and producing `<sym> is not a function` crashes on the next
- * launch. Staging into the version-pinned cache:
- *   1. Gives every package version its own filesystem path, so concurrent gjc
- *      processes never collide on the same file.
- *   2. Makes the running process keep its handle on the cache copy, freeing bun
- *      to overwrite the `node_modules` copy on subsequent updates.
+ * launch. Content-addressed staging gives each byte set its own immutable path,
+ * so concurrent gjc processes never collide and bun can overwrite the
+ * `node_modules` copy on subsequent updates.
  * Disabled on non-Windows (no file-lock problem), in workspace dev (`nativeDir`
  * is not inside a `node_modules` segment), and for compiled binaries (handled
  * by `maybeExtractEmbeddedAddon`).
@@ -250,14 +225,12 @@ export function resolveOptionalPackageNativeDirs({ packageNames, requireResolve 
  * @returns {boolean}
  */
 export function shouldStageNodeModulesAddon({ platform, isCompiledBinary, nativeDir }) {
-	// Node and Bun only load N-API addons by pathname. The old cache-copy path
-	// validated one pathname then loaded it through another pathname resolution,
-	// which cannot bind the verified bytes to native execution. Do not stage until
-	// the runtime exposes descriptor/HANDLE-bound addon loading.
-	void platform;
-	void isCompiledBinary;
-	void nativeDir;
-	return false;
+	if (platform !== "win32") return false;
+	if (isCompiledBinary) return false;
+	// Check both separators independently of the host's `path.sep`: this helper
+	// is shared by the loader (running on Windows with `\`) and the test suite
+	// (typically running on POSIX hosts when CI executes the regression test).
+	return nativeDir.includes("\\node_modules\\") || nativeDir.includes("/node_modules/");
 }
 
 /**
@@ -304,9 +277,11 @@ export function resolveLoaderCandidates({
 	let releaseCandidates;
 	if (isCompiledBinary) {
 		releaseCandidates = [...compiledCandidates, ...baseReleaseCandidates];
-	} else {
-		releaseCandidates = baseReleaseCandidates;
-	}
+	} else releaseCandidates = baseReleaseCandidates;
+	// Staged paths are content-addressed and therefore cannot be resolved until
+	// the current package bytes have been snapshotted. `loadNative()` prepends
+	// those paths after staging; never synthesize the retired fixed cache path.
+	void stageFromNodeModules;
 	return [...new Set(releaseCandidates)];
 }
 
@@ -555,14 +530,102 @@ function maybeExtractEmbeddedAddons(ctx, errors) {
 }
 
 /**
- * Mirror the optional-package or legacy bundled `native/<filename>.node` into
- * `versionedDir/<filename>.node` on Windows installs so the running process
- * keeps its OS-level handle on a versioned cache path, never on the
- * `node_modules` copy that bun must overwrite on update. No-op on non-Windows,
- * in workspace dev, and for compiled binaries — see `shouldStageNodeModulesAddon`.
+ * Publish one verified package snapshot under a content-addressed name. The
+ * destination is created with a no-replace hard link, so concurrent creators
+ * either reuse the byte-identical winner or fail closed without overwriting it.
  */
-function maybeStageNodeModulesAddon(ctx, errors) {
-	if (!ctx.stageFromNodeModules) return null;
+function publishStagedAddon(ctx, filename, sourcePath, sourceSnapshot) {
+	const versionedDir = typeof ctx.versionedDir === "string" ? ctx.versionedDir : null;
+	if (!versionedDir) throw new Error("staged addon context is incomplete");
+	if (!safeDirectoryPath(versionedDir)) throw new Error("staged addon directory is not safe");
+	try {
+		fs.mkdirSync(versionedDir, { recursive: true });
+	} catch (error) {
+		throw new Error(`staged addon directory: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	if (!safeDirectoryPath(versionedDir)) throw new Error("staged addon directory is not safe");
+
+	const targetPath = stagedAddonPath(versionedDir, filename, sourceSnapshot.hash);
+	try {
+		const winner = safeFileSnapshot(targetPath);
+		if (winner.hash !== sourceSnapshot.hash) throw new Error("staged addon drift: winner contains different bytes");
+		recordStagedSnapshot(ctx, targetPath, winner);
+		recordStagedSourceSnapshot(ctx, targetPath, sourcePath, sourceSnapshot);
+		return targetPath;
+	} catch (error) {
+		if (!isMissingPathError(error)) throw error;
+	}
+
+	const temporaryPath = `${targetPath}.tmp-${process.pid}-${randomUUID()}`;
+	const noFollow = fs.constants.O_NOFOLLOW ?? 0;
+	let fd;
+	try {
+		fd = fs.openSync(
+			temporaryPath,
+			fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow,
+			0o600,
+		);
+		fs.writeFileSync(fd, sourceSnapshot.bytes);
+		fs.fsyncSync(fd);
+		fs.closeSync(fd);
+		fd = undefined;
+
+		try {
+			// A hard link publishes the complete temporary file atomically and
+			// fails with EEXIST rather than replacing a concurrent winner.
+			fs.linkSync(temporaryPath, targetPath);
+		} catch (publishError) {
+			const code = publishError && typeof publishError === "object" ? publishError.code : undefined;
+			if (code === "EPERM" || code === "ENOTSUP" || code === "EOPNOTSUPP") {
+				try {
+					fs.copyFileSync(temporaryPath, targetPath, fs.constants.COPYFILE_EXCL);
+				} catch (copyError) {
+					const copyCode = copyError && typeof copyError === "object" ? copyError.code : undefined;
+					if (copyCode !== "EEXIST") throw copyError;
+				}
+				if (fs.existsSync(targetPath)) {
+					const staged = safeFileSnapshot(targetPath);
+					if (staged.hash !== sourceSnapshot.hash)
+						throw new Error("staged addon drift: winner contains different bytes");
+					recordStagedSnapshot(ctx, targetPath, staged);
+					recordStagedSourceSnapshot(ctx, targetPath, sourcePath, sourceSnapshot);
+					return targetPath;
+				}
+				throw publishError;
+			}
+			try {
+				const winner = safeFileSnapshot(targetPath);
+				if (winner.hash !== sourceSnapshot.hash)
+					throw new Error("staged addon drift: winner contains different bytes");
+				recordStagedSnapshot(ctx, targetPath, winner);
+				recordStagedSourceSnapshot(ctx, targetPath, sourcePath, sourceSnapshot);
+				return targetPath;
+			} catch (winnerError) {
+				if (!isMissingPathError(winnerError)) throw winnerError;
+				throw publishError;
+			}
+		}
+
+		const staged = safeFileSnapshot(targetPath);
+		if (staged.hash !== sourceSnapshot.hash) throw new Error("staged addon drift: bytes do not match source snapshot");
+		recordStagedSnapshot(ctx, targetPath, staged);
+		recordStagedSourceSnapshot(ctx, targetPath, sourcePath, sourceSnapshot);
+		return targetPath;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+		try {
+			fs.unlinkSync(temporaryPath);
+		} catch {}
+	}
+}
+
+/**
+ * Stage every current installed-package addon in variant order. The source
+ * snapshot is captured once per package path and reused for publication;
+ * immutable winners are retained for other processes and launches.
+ */
+export function maybeStageNodeModulesAddon(ctx, errors) {
+	if (!ctx.stageFromNodeModules || ctx.isCompiledBinary || !ctx.platformTag?.startsWith("win32-")) return [];
 	const versionedDir = typeof ctx.versionedDir === "string" ? ctx.versionedDir : null;
 	const addonFilenames = Array.isArray(ctx.addonFilenames) ? ctx.addonFilenames : [];
 	const optionalPackageNativeDirs = Array.isArray(ctx.optionalPackageNativeDirs)
@@ -571,143 +634,50 @@ function maybeStageNodeModulesAddon(ctx, errors) {
 	const nativeDir = typeof ctx.nativeDir === "string" ? ctx.nativeDir : null;
 	if (!versionedDir || addonFilenames.length === 0 || (!nativeDir && optionalPackageNativeDirs.length === 0)) {
 		errors.push("staged addon context is incomplete");
-		return null;
+		return [];
 	}
 
-	let stagedPath = null;
-	const refreshedCandidates = [];
-	const rejectFilename = filename => {
-		if (!Array.isArray(ctx.candidates)) return;
-		ctx.candidates = ctx.candidates.filter(candidate => path.basename(candidate) !== filename);
-	};
-	const refreshAddon = (sourcePath, refreshPath) => {
-		if (!safeDirectoryPath(path.dirname(refreshPath))) throw new Error("refresh directory is not a safe directory");
-		const source = safeFileSnapshot(sourcePath);
-		try {
-			const existing = safeFileSnapshot(refreshPath);
-			if (existing.hash === source.hash) {
-				recordStagedSnapshot(ctx, refreshPath, existing);
-				recordStagedSourceSnapshot(ctx, refreshPath, sourcePath, source);
-				return refreshPath;
-			}
-			throw new Error("refresh destination contains different bytes");
-		} catch (error) {
-			if (error?.code !== "ENOENT" && error?.message !== "ENOENT") throw error;
-		}
-		const temporaryPath = `${refreshPath}.tmp-${process.pid}-${randomUUID()}`;
-		const noFollow = fs.constants.O_NOFOLLOW ?? 0;
-		let fd;
-		try {
-			fd = fs.openSync(temporaryPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow, 0o600);
-			fs.writeFileSync(fd, source.bytes);
-			fs.fsyncSync(fd);
-			fs.closeSync(fd);
-			fd = undefined;
-			const staged = safeFileSnapshot(temporaryPath);
-			if (staged.hash !== source.hash) throw new Error("temporary addon bytes do not match the source");
-			try {
-				fs.renameSync(temporaryPath, refreshPath);
-			} catch {
-				const winner = safeFileSnapshot(refreshPath);
-				if (winner.hash !== source.hash) throw new Error("refresh destination is unavailable");
-			}
-			const final = safeFileSnapshot(refreshPath);
-			if (final.hash !== source.hash) throw new Error("restaged addon bytes do not match the current package artifact");
-			recordStagedSnapshot(ctx, refreshPath, final);
-			recordStagedSourceSnapshot(ctx, refreshPath, sourcePath, source);
-			return refreshPath;
-		} finally {
-			if (fd !== undefined) fs.closeSync(fd);
-			fs.rmSync(temporaryPath, { force: true });
-		}
-	};
 	const sourceDirs = [...optionalPackageNativeDirs, ...(nativeDir ? [nativeDir] : [])];
+	const sourceSnapshots = new Map();
+	const stagedCandidates = [];
 	for (const filename of addonFilenames) {
-		const targetPath = path.join(versionedDir, filename);
-		const sourcePath = sourceDirs.map(sourceDir => path.join(sourceDir, filename)).find(candidate => fs.existsSync(candidate));
-
-		if (fs.existsSync(targetPath)) {
-			if (!sourcePath) {
-				errors.push(`staged addon orphan (${filename}): no current package artifact exists`);
-				rejectFilename(filename);
-				continue;
+		let sourcePath = null;
+		let sourceSnapshot = null;
+		let sourceError = null;
+		for (const sourceDir of sourceDirs) {
+			const candidate = path.join(sourceDir, filename);
+			try {
+				sourcePath = candidate;
+				sourceSnapshot = sourceSnapshots.get(candidate) ?? safeFileSnapshot(candidate);
+				sourceSnapshots.set(candidate, sourceSnapshot);
+				break;
+			} catch (error) {
+				if (isMissingPathError(error)) continue;
+				sourcePath = candidate;
+				sourceError = error;
+				break;
 			}
-			if (sourcePath && !addonBytesMatch(targetPath, sourcePath)) {
-				errors.push(`staged addon drift (${filename}): cached bytes differ from the current package artifact`);
-				rejectFilename(filename);
-				try {
-					const refreshPath = path.join(versionedDir, `.refresh-${addonContentDigest(sourcePath)}-${filename}`);
-					const refreshed = refreshAddon(sourcePath, refreshPath);
-					pruneRefreshArtifacts(versionedDir, filename, refreshed);
-					refreshedCandidates.push(refreshed);
-					stagedPath = stagedPath || refreshed;
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					errors.push(`staged addon refresh (${filename}): ${message}`);
-					rejectFilename(filename);
-				}
-				continue;
-			}
-			if (addonBytesMatch(targetPath, sourcePath)) {
-				try {
-					const sourceSnapshot = safeFileSnapshot(sourcePath);
-					const targetSnapshot = safeFileSnapshot(targetPath);
-					if (sourceSnapshot.hash !== targetSnapshot.hash)
-						throw new Error("staged addon source changed during snapshot");
-					recordStagedSnapshot(ctx, targetPath, targetSnapshot);
-					recordStagedSourceSnapshot(ctx, targetPath, sourcePath, sourceSnapshot);
-				} catch (err) {
-					const message = err instanceof Error ? err.message : String(err);
-					errors.push(`staged addon snapshot (${filename}): ${message}`);
-					rejectFilename(filename);
-					continue;
-				}
-			}
-			stagedPath = stagedPath || targetPath;
-			continue;
 		}
 		if (!sourcePath) continue;
 
-		try {
-			fs.mkdirSync(versionedDir, { recursive: true });
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			errors.push(`staged addon dir: ${message}`);
+		// Once an installed artifact has been selected for staging, its direct
+		// pathname is no longer a fallback. This also covers drift and partial
+		// winners, which must fail closed rather than execute an unverified file.
+		rejectPackageAddonCandidates(ctx, filename);
+		if (sourceError || !sourceSnapshot) {
+			const message = sourceError instanceof Error ? sourceError.message : String(sourceError ?? "unavailable");
+			errors.push(`staged addon source (${filename}): ${message}`);
 			continue;
 		}
 
 		try {
-			// `copyFileSync` is atomic on Windows (CopyFileW) and avoids holding
-			// two large buffers in JS for the read/write dance.
-			fs.copyFileSync(sourcePath, targetPath);
-			const sourceSnapshot = safeFileSnapshot(sourcePath);
-			const targetSnapshot = safeFileSnapshot(targetPath);
-			if (sourceSnapshot.hash !== targetSnapshot.hash) throw new Error("staged addon source changed during copy");
-			recordStagedSnapshot(ctx, targetPath, targetSnapshot);
-			recordStagedSourceSnapshot(ctx, targetPath, sourcePath, sourceSnapshot);
-			stagedPath = stagedPath || targetPath;
-		} catch (err) {
-			const message = err instanceof Error ? err.message : String(err);
-			errors.push(`staged addon copy (${filename}): ${message}`);
-			try {
-				const winner = safeFileSnapshot(targetPath);
-				const source = safeFileSnapshot(sourcePath);
-				if (winner.hash === source.hash) {
-					recordStagedSnapshot(ctx, targetPath, winner);
-					recordStagedSourceSnapshot(ctx, targetPath, sourcePath, source);
-					stagedPath = stagedPath || targetPath;
-					continue;
-				}
-			} catch {
-				// No verified race winner exists; remove the target from fallback selection.
-			}
-			rejectFilename(filename);
+			stagedCandidates.push(publishStagedAddon(ctx, filename, sourcePath, sourceSnapshot));
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			errors.push(`staged addon publish (${filename}): ${message}`);
 		}
 	}
-	ctx.candidates = [...refreshedCandidates, ...(ctx.candidates ?? [])].filter(
-		(candidate, index, all) => all.indexOf(candidate) === index,
-	);
-	return stagedPath;
+	return stagedCandidates;
 }
 
 export function validateLoadedBindings(ctx, bindings, candidate) {
@@ -776,7 +746,11 @@ function initLoaderContext(require_) {
 		env: process.env,
 		importMetaUrl: import.meta.url,
 	});
-	const stageFromNodeModules = false;
+	const stageFromNodeModules = shouldStageNodeModulesAddon({
+		platform: process.platform,
+		isCompiledBinary,
+		nativeDir,
+	});
 	const isWorkspaceLoad =
 		!isCompiledBinary && !nativeDir.includes("\\node_modules\\") && !nativeDir.includes("/node_modules/");
 
@@ -840,9 +814,22 @@ export function loadNative(options = {}) {
 	const errors = [];
 	const embeddedCandidates = (options.extractEmbeddedAddons ?? maybeExtractEmbeddedAddons)(ctx, errors);
 	const embeddedIsAuthoritative = embeddedAddonIsAuthoritative(ctx);
-	const stagedCandidate = null;
-	const prepended = [...embeddedCandidates, stagedCandidate].filter(c => typeof c === "string");
-	const runtimeCandidates = embeddedIsAuthoritative ? prepended : prepended.length > 0 ? [...prepended, ...ctx.candidates] : ctx.candidates;
+	const stagedResult =
+		embeddedCandidates.length > 0 || embeddedIsAuthoritative
+			? []
+			: (options.stageNodeModulesAddon ?? maybeStageNodeModulesAddon)(ctx, errors);
+	const stagedCandidates = Array.isArray(stagedResult)
+		? stagedResult.filter(candidate => typeof candidate === "string")
+		: typeof stagedResult === "string"
+			? [stagedResult]
+			: [];
+	const prepended = [...embeddedCandidates, ...stagedCandidates];
+	const baseCandidates = Array.isArray(ctx.candidates) ? ctx.candidates : [];
+	const runtimeCandidates = embeddedIsAuthoritative
+		? prepended
+		: prepended.length > 0
+			? [...prepended, ...baseCandidates]
+			: baseCandidates;
 	const loaded = loadFromCandidates({
 		candidates: runtimeCandidates,
 		requireCandidate: candidate => {

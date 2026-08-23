@@ -6,7 +6,7 @@ import * as os from "node:os";
 import path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { SdkClient } from "../client/client";
-import { type BrokerDiscovery, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
+import { type BrokerDiscovery, brokerDiscoveryPath, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
 import {
 	resolveSdkInternalSpawnCommand,
 	resolveSdkPackageAuthority,
@@ -124,6 +124,8 @@ export interface StartedFixtureBroker {
 
 interface BrokerOwner {
 	stop(): Promise<void>;
+	waitForExit(timeoutMs: number): Promise<boolean>;
+	isReady(): boolean;
 	canReuse(discovery: BrokerDiscovery | null): boolean;
 	owns(discovery: BrokerDiscovery | null): boolean;
 	markReady(discovery: BrokerDiscovery): boolean;
@@ -154,6 +156,33 @@ const DEFAULT_REAP_TIMING: ReapTiming = {
 	killVerifyMs: REAP_SIGKILL_CAP_MS,
 };
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+function childHasExited(child: ChildProcess): boolean {
+	return child.pid === undefined || child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForChildExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
+	if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0)
+		return Promise.reject(new Error("Invalid broker exit timeout."));
+	if (childHasExited(child)) return Promise.resolve(true);
+	return new Promise(resolve => {
+		let settled = false;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const finish = (exited: boolean): void => {
+			if (settled) return;
+			settled = true;
+			if (timer) clearTimeout(timer);
+			child.off("exit", onExit);
+			child.off("close", onExit);
+			resolve(exited && childHasExited(child));
+		};
+		const onExit = (): void => finish(true);
+		timer = setTimeout(() => finish(false), timeoutMs);
+		child.once("exit", onExit);
+		child.once("close", onExit);
+		if (childHasExited(child)) finish(true);
+	});
+}
 
 /**
  * Terminate and reap a detached broker this process spawned, targeting the exact
@@ -240,6 +269,12 @@ function registerBrokerOwner(
 			}
 			if (owners.get(agentDir) === owner) owners.delete(agentDir);
 		},
+		waitForExit(timeoutMs): Promise<boolean> {
+			return waitForChildExit(child, timeoutMs);
+		},
+		isReady(): boolean {
+			return state === "ready";
+		},
 		canReuse(discovery): boolean {
 			return state === "ready" && matches(discovery);
 		},
@@ -317,6 +352,12 @@ function createFixtureLease(owner: BrokerOwner, child: ChildProcess): ExactFixtu
  * not block the spawn path.
  */
 const STALE_BROKER_SHUTDOWN_TIMEOUT_MS = 2_000;
+/**
+ * An owned retirement may wait only a bounded time in the ensuring caller. The
+ * broker transport itself never applies this bound to admitted work: timing out
+ * here fails closed and leaves the exact owner live rather than escalating it.
+ */
+const OWNED_BROKER_RETIRE_TIMEOUT_MS = STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 
 /** Sends SIGTERM only through an OS process reference bound to the published incarnation. */
 function signalExactBroker(pid: number, incarnation: string): boolean {
@@ -379,6 +420,13 @@ function canRetireStaleBroker(stale: BrokerDiscovery, authority: SdkPackageAutho
 	return comparePackageVersions(stale.packageVersion, authority.packageVersion) === -1;
 }
 
+function canRetireOwnedBroker(stale: BrokerDiscovery, authority: SdkPackageAuthority): boolean {
+	if (!hasCompletePackageAuthority(stale)) return false;
+	if (stale.installationIdentity !== authority.installationIdentity) return false;
+	const order = comparePackageVersions(stale.packageVersion!, authority.packageVersion);
+	return order === -1 || order === 0;
+}
+
 function sameBrokerIdentity(left: BrokerDiscovery, right: BrokerDiscovery): boolean {
 	return (
 		left.pid === right.pid &&
@@ -389,8 +437,25 @@ function sameBrokerIdentity(left: BrokerDiscovery, right: BrokerDiscovery): bool
 	);
 }
 
+function sameBrokerAuthority(left: BrokerDiscovery, right: BrokerDiscovery): boolean {
+	return (
+		left.packageGeneration === right.packageGeneration &&
+		left.packageVersion === right.packageVersion &&
+		left.installationIdentity === right.installationIdentity
+	);
+}
+
 function hasCompletePackageAuthority(discovery: BrokerDiscovery): boolean {
 	return typeof discovery.packageVersion === "string" && typeof discovery.installationIdentity === "string";
+}
+
+async function brokerDiscoveryFileAbsent(agentDir: string): Promise<boolean> {
+	try {
+		await fs.access(brokerDiscoveryPath(agentDir));
+		return false;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+	}
 }
 
 function isAuthorizedBrokerEndpoint(discovery: BrokerDiscovery): boolean {
@@ -427,13 +492,16 @@ async function retireStaleBroker(
 ): Promise<boolean> {
 	const preflightAuthority = resolveSdkPackageAuthority({ force: true });
 	if (preflightAuthority.generation !== expectedPackageGeneration) return false;
-	const legacy = !hasCompletePackageAuthority(stale);
-	if (!legacy && !canRetireStaleBroker(stale, preflightAuthority)) return false;
+	if (!hasCompletePackageAuthority(stale) || !canRetireStaleBroker(stale, preflightAuthority)) return false;
 	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-	if (!currentBeforeConnect || !sameBrokerIdentity(currentBeforeConnect, stale)) return false;
+	if (
+		!currentBeforeConnect ||
+		!sameBrokerIdentity(currentBeforeConnect, stale) ||
+		!sameBrokerAuthority(currentBeforeConnect, stale)
+	)
+		return false;
 	if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
 	try {
-		if (legacy) throw new Error("legacy broker discovery requires signal fallback");
 		const client = await SdkClient.connect(stale.url, stale.token, {
 			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
 			reconnectAttempts: 0,
@@ -449,20 +517,88 @@ async function retireStaleBroker(
 		// before signaling. A replacement or package mutation must never be targeted.
 		const currentAuthority = resolveSdkPackageAuthority({ force: true });
 		if (currentAuthority.generation !== expectedPackageGeneration) return false;
-		if (!legacy && !canRetireStaleBroker(stale, currentAuthority)) return false;
+		if (!canRetireStaleBroker(stale, currentAuthority)) return false;
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 		if (!current) return true;
 		if (!sameBrokerIdentity(current, stale)) return true;
+		if (!sameBrokerAuthority(current, stale)) return false;
 		if (!isAuthorizedBrokerEndpoint(current)) return false;
 		if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 	while (Date.now() < deadline) {
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-		if (!current || current.pid !== stale.pid || current.incarnation !== stale.incarnation) return true;
+		if (!current) {
+			if (await brokerDiscoveryFileAbsent(agentDir)) return true;
+		} else if (current.pid !== stale.pid || current.incarnation !== stale.incarnation) return true;
 		await sleep(50);
 	}
 	return false;
+}
+
+/**
+ * Retire a broker spawned by this process without taking the destructive reap
+ * path. The authenticated shutdown fences new transport work; the transport
+ * then waits for admitted requests before asking the broker to stop. A caller
+ * timeout is only a proof failure: the exact child remains owned and no signal
+ * is sent as a consequence of the timeout.
+ */
+async function retireOwnedBroker(
+	settings: EnsureBrokerSettings,
+	stale: BrokerDiscovery,
+	owner: BrokerOwner,
+): Promise<boolean> {
+	const expectedPackageGeneration = settings.expectedPackageGeneration;
+	if (expectedPackageGeneration === undefined) return false;
+	const authority = resolveSdkPackageAuthority({ force: true });
+	if (
+		authority.generation !== expectedPackageGeneration ||
+		(settings.expectedPackageVersion !== undefined && settings.expectedPackageVersion !== authority.packageVersion) ||
+		(settings.expectedInstallationIdentity !== undefined &&
+			settings.expectedInstallationIdentity !== authority.installationIdentity)
+	)
+		return false;
+	if (!canRetireOwnedBroker(stale, authority)) return false;
+	const currentBeforeConnect = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+	if (
+		!currentBeforeConnect ||
+		!sameBrokerIdentity(currentBeforeConnect, stale) ||
+		!sameBrokerAuthority(currentBeforeConnect, stale) ||
+		!owner.owns(currentBeforeConnect) ||
+		!isAuthorizedBrokerEndpoint(currentBeforeConnect)
+	)
+		return false;
+	let client: SdkClient | undefined;
+	try {
+		client = await SdkClient.connect(stale.url, stale.token, {
+			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
+			reconnectAttempts: 0,
+		});
+		const currentBeforeShutdown = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		const currentAuthority = resolveSdkPackageAuthority({ force: true });
+		if (
+			currentAuthority.generation !== expectedPackageGeneration ||
+			currentAuthority.packageVersion !== authority.packageVersion ||
+			currentAuthority.installationIdentity !== authority.installationIdentity ||
+			!currentBeforeShutdown ||
+			!sameBrokerIdentity(currentBeforeShutdown, stale) ||
+			!sameBrokerAuthority(currentBeforeShutdown, stale) ||
+			currentBeforeShutdown.packageVersion !== stale.packageVersion ||
+			currentBeforeShutdown.installationIdentity !== stale.installationIdentity ||
+			!owner.owns(currentBeforeShutdown) ||
+			!isAuthorizedBrokerEndpoint(currentBeforeShutdown)
+		)
+			return false;
+		await client.global("broker.shutdown", {}, { timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS });
+	} catch {
+		return false;
+	} finally {
+		await client?.close().catch(() => {});
+	}
+	if (!(await owner.waitForExit(OWNED_BROKER_RETIRE_TIMEOUT_MS))) return false;
+	if (!(await brokerDiscoveryFileAbsent(settings.agentDir))) return false;
+	if (owners.get(settings.agentDir) === owner) owners.delete(settings.agentDir);
+	return true;
 }
 
 function matchesExpectedPackageGeneration(
@@ -507,12 +643,14 @@ async function retireAndReadReplacement(
 			settings.expectedInstallationIdentity !== authority.installationIdentity)
 	)
 		throw new Error("SDK broker package installation identity changed before retirement.");
-	if (hasCompletePackageAuthority(stale)) {
-		if (!canRetireStaleBroker(stale, authority))
-			throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
-	} else if (stale.packageGeneration === expectedPackageGeneration) {
+	if (!hasCompletePackageAuthority(stale)) {
+		// A legacy record has no ordered installation authority. Generation
+		// inequality alone cannot prove that it predates this package, so it is
+		// never signalled or retired destructively.
 		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
 	}
+	if (!canRetireStaleBroker(stale, authority))
+		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
 	const retired = await retireStaleBroker(
 		settings.agentDir,
 		stale,
@@ -581,8 +719,17 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 			if (!current || !sameBrokerIdentity(current, existing))
 				throw staleBrokerRetirementUnverified(settings.expectedPackageGeneration, existing.packageGeneration);
+			if (!canRetireOwnedBroker(current, authority))
+				throw staleBrokerRetirementUnverified(settings.expectedPackageGeneration, current.packageGeneration);
+			if (!(await retireOwnedBroker(settings, current, priorOwner)))
+				throw staleBrokerRetirementUnverified(settings.expectedPackageGeneration, current.packageGeneration);
+		} else if (!priorOwner.isReady()) {
+			await priorOwner.stop();
+		} else {
+			throw new Error(
+				"SDK broker owned publication is unavailable; refusing destructive cleanup of a ready broker.",
+			);
 		}
-		await priorOwner.stop();
 		const discoveredAfterCleanup = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 		if (discoveredAfterCleanup) {
 			if (
@@ -634,6 +781,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			spawnError = error;
 		});
 		const owner = registerBrokerOwner(settings.agentDir, child);
+		let gracefulRetirementUnverified = false;
 		const discoveryTimeoutMs = initiator === "fixture-lease" ? FIXTURE_DISCOVERY_TIMEOUT_MS : DISCOVERY_TIMEOUT_MS;
 		const deadline = Date.now() + discoveryTimeoutMs;
 		let discoveryError: unknown;
@@ -650,7 +798,14 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 							settings.expectedInstallationIdentity,
 						)
 					) {
-						await owner.stop();
+						if (owner.owns(discovered)) {
+							gracefulRetirementUnverified = !(await retireOwnedBroker(settings, discovered, owner));
+							if (gracefulRetirementUnverified)
+								throw staleBrokerRetirementUnverified(
+									settings.expectedPackageGeneration!,
+									discovered.packageGeneration,
+								);
+						} else await owner.stop();
 						throw staleBrokerRetirementUnverified(
 							settings.expectedPackageGeneration!,
 							discovered.packageGeneration,
@@ -667,6 +822,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 			} catch (error) {
 				discoveryError = error;
 			}
+			if (gracefulRetirementUnverified) break;
 			await sleep(50);
 		}
 		const exitedBeforeDiscovery = child.exitCode !== null || child.signalCode !== null;
@@ -724,7 +880,7 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 					? discoveryError
 					: new Error("Timed out waiting for detached SDK broker discovery.");
 		try {
-			await owner.stop();
+			if (!gracefulRetirementUnverified) await owner.stop();
 		} catch (cleanupError) {
 			throw new AggregateError(
 				[failure, cleanupError],

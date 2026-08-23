@@ -2434,7 +2434,12 @@ export class AcpAgent implements Agent {
 		return (await this.#brokerConnection()).adapter;
 	}
 
+	#assertBrokerOpen(): void {
+		if (this.#disposed) throw new AcpSdkAdapterError("connection_closed", "ACP connection is closed.");
+	}
+
 	async #brokerConnection(): Promise<BrokerConnection> {
+		this.#assertBrokerOpen();
 		if (this.#brokerResolution) return this.#brokerResolution;
 		let resolution!: Promise<BrokerConnection>;
 		resolution = this.#resolveBrokerConnection();
@@ -2447,6 +2452,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #resolveBrokerConnection(): Promise<BrokerConnection> {
+		this.#assertBrokerOpen();
 		if (this.#broker) {
 			const current = resolveSdkPackageAuthority();
 			const existing = this.#broker;
@@ -2457,6 +2463,7 @@ export class AcpAgent implements Agent {
 				if (this.#broker === existing) this.#broker = undefined;
 				throw error;
 			}
+			this.#assertBrokerOpen();
 			const generationMatches =
 				pending.packageGeneration === (this.#expectedPackageGeneration ?? current.generation) &&
 				(this.#expectedPackageGeneration !== undefined ||
@@ -2472,16 +2479,19 @@ export class AcpAgent implements Agent {
 						beforeClose.installationIdentity !== current.installationIdentity))
 			)
 				throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed during connection replacement.");
+			this.#assertBrokerOpen();
 			this.#broker = undefined;
 			await pending.adapter.close().catch(() => undefined);
 			await pending.client.close().catch(() => undefined);
 		}
+		this.#assertBrokerOpen();
 		const discovery = await ensureBroker({
 			agentDir: this.#agentDir,
 			...(this.#expectedPackageGeneration === undefined
 				? {}
 				: { expectedPackageGeneration: this.#expectedPackageGeneration }),
 		});
+		this.#assertBrokerOpen();
 		const authorityAfterEnsure =
 			this.#expectedPackageGeneration === undefined ? resolveSdkPackageAuthority({ force: true }) : undefined;
 		if (
@@ -2492,14 +2502,23 @@ export class AcpAgent implements Agent {
 				discovery.installationIdentity !== authorityAfterEnsure.installationIdentity)
 		)
 			throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed before connection publication.");
+		this.#assertBrokerOpen();
 		let pending!: Promise<BrokerConnection>;
 		pending = (async () => {
 			const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
+			if (this.#disposed) {
+				await client.close().catch(() => undefined);
+				throw new AcpSdkAdapterError("connection_closed", "ACP connection closed during broker startup.");
+			}
 			const adapter = new AcpSdkAdapter({ client });
 			adapter.onReconnectFailed(() => {
 				if (this.#broker === pending) this.#broker = undefined;
 				void adapter.close().catch(() => undefined);
 			});
+			if (this.#disposed) {
+				await adapter.close().catch(() => undefined);
+				throw new AcpSdkAdapterError("connection_closed", "ACP connection closed during broker startup.");
+			}
 			await adapter.start();
 			return {
 				adapter,
