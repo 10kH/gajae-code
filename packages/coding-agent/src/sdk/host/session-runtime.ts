@@ -504,7 +504,10 @@ export function createInvocationReconciliation(
 			// map has already converged.
 			const snapshot = [...records.values()].map(record => ({ ...record }));
 			if (store) {
-				await store.transact(() => snapshot.map(record => ({ ...record })));
+				await store.transact(current => [
+					...current.filter(record => record.kind !== "prompt" && record.kind !== "skill"),
+					...snapshot.map(record => ({ ...record })),
+				]);
 				return;
 			}
 			if (!reconciliationFile) return;
@@ -3027,6 +3030,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						correlation: InvocationCorrelation;
 						connectionId: string | undefined;
 					}>;
+					attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 				}>;
 				disposeGate?: () => void;
 				lifecycleActive: boolean;
@@ -3105,12 +3109,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// after a failed shared run (exact-head review P1). Deduplicate by
 			// correlation against the fallback set.
 			const seen = new Set(fallback.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`));
-			const attached = (current.attachedInvocations ?? []).filter(({ correlation }) => {
-				const id = `${correlation.commandId}:${correlation.turnId}`;
-				if (seen.has(id)) return false;
-				seen.add(id);
-				return true;
-			});
+			const attached = (activeBatch?.attachedInvocations ?? current.attachedInvocations ?? []).filter(
+				({ correlation }) => {
+					const id = `${correlation.commandId}:${correlation.turnId}`;
+					if (seen.has(id)) return false;
+					seen.add(id);
+					return true;
+				},
+			);
 			transitions = [...fallback, ...attached].map(({ kind, correlation }) => ({ kind, correlation }));
 		} else if (type === "agent_start") {
 			current.lifecycleEpoch += 1;
@@ -3131,7 +3137,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				.splice(0)
 				.filter(entry => entry.kind !== "prompt" || !current.deadlineManager.isExpiring(entry.correlation));
 			if (drained.length > 0) {
-				current.openLifecycleBatches.push({ invocations: drained });
+				current.openLifecycleBatches.push({ invocations: drained, attachedInvocations: [] });
 				adoptLifecycleBatch(drained);
 				if (current.activeInvocation?.kind === "prompt") {
 					current.deadlineManager.onAccepted(current.activeInvocation.correlation);
@@ -3148,7 +3154,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				: current.activeInvocation
 					? [current.activeInvocation]
 					: [];
-			const attached = current.attachedInvocations ?? [];
+			const attached = ended?.attachedInvocations ?? current.attachedInvocations ?? [];
 			const seen = new Set(
 				baseTransitions.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`),
 			);
@@ -3337,6 +3343,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// durable transitions were awaiting persistence. Retire the ended
 				// batch before returning; otherwise it remains ahead of the successor
 				// and the next agent_end is paired with stale ownership.
+				for (const invocation of failedTransitions) scheduleSkillTerminalRecovery(invocation);
 				retireEndedLifecycleBatch();
 				const resolvers = terminalPublicationCapture.resolvers;
 				terminalPublicationCapture.resolvers = undefined;
@@ -3462,14 +3469,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const transport = await options.createTransport({ sessionId, stateRoot, token });
 		const revisions = new RevisionStore(sessionId, Date.now, { storageDir: stateRoot });
 		const cursors = new CursorRegistry(token, revisions);
-		const reconciliationStore = options.terminalAbortSeams?.getReconciliationStore?.();
-		const reconciliation = createInvocationReconciliation({ store: reconciliationStore });
-		await reconciliation.hydrate();
 		const sessionFile =
 			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
 			resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
+		const reconciliationStore =
+			options.terminalAbortSeams?.getReconciliationStore?.() ??
+			createReconciliationStore({ sessionFile, sessionId });
+		const reconciliation = createInvocationReconciliation({ store: reconciliationStore });
+		await reconciliation.hydrate();
 		const steerReconciliation = createKindAwareReconciliation({
-			store: createReconciliationStore({ sessionFile, sessionId }),
+			store: reconciliationStore as never,
+			ownedKinds: ["steer"],
 		});
 		await steerReconciliation.hydrateFromStore();
 		const deadlineManager = new PromptDeadlineManager({
@@ -3504,6 +3514,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				correlation: InvocationCorrelation;
 				connectionId: string | undefined;
 			}>;
+			attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
 		}> = [];
 		const configRevision = { current: 0 };
 		let acceptingGateResolutions = true;
@@ -3674,6 +3685,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					if (current.drainedInvocations === undefined)
 						current.drainedInvocations = current.activeInvocation ? [current.activeInvocation] : [];
 					if (current.attachedInvocations === undefined) current.attachedInvocations = [];
+					const activeBatch = current.activeInvocation
+						? current.openLifecycleBatches.find(batch =>
+								batch.invocations.some(
+									entry =>
+										entry.correlation.commandId === current.activeInvocation?.correlation.commandId &&
+										entry.correlation.turnId === current.activeInvocation?.correlation.turnId,
+								),
+							)
+						: undefined;
 					const alreadyAttached = current.drainedInvocations.some(
 						entry =>
 							entry.correlation.commandId === correlation.commandId &&
@@ -3688,6 +3708,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						)
 					)
 						current.attachedInvocations.push({ kind, correlation });
+					if (
+						activeBatch &&
+						!activeBatch.attachedInvocations.some(
+							entry =>
+								entry.correlation.commandId === correlation.commandId &&
+								entry.correlation.turnId === correlation.turnId,
+						)
+					)
+						activeBatch.attachedInvocations.push({ kind, correlation });
 					return;
 				}
 				// No in-flight run visible and this is an in-run consumption

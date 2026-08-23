@@ -104,10 +104,15 @@ export interface KindAwareReconciliation {
 }
 
 export function createKindAwareReconciliation(
-	options: { now?: () => number; store?: ReconciliationStore | null } = {},
+	options: {
+		now?: () => number;
+		store?: ReconciliationStore | null;
+		ownedKinds?: readonly DurableReconciliationRecord["kind"][];
+	} = {},
 ): KindAwareReconciliation {
 	const now = options.now ?? Date.now;
 	const store = options.store ?? null;
+	const ownedKinds = new Set<DurableReconciliationRecord["kind"]>(options.ownedKinds ?? ["prompt", "skill", "steer"]);
 	let records = new Map<string, DurableReconciliationRecord>();
 	let clientRefIndex = new Map<string, string>();
 	const reservedClientRefs = new Map<ReconciliationKind, Set<string>>();
@@ -172,7 +177,11 @@ export function createKindAwareReconciliation(
 			const result = mutate(candidate);
 			if (!result.changed) return result.value;
 			const candidateIndex = indexRecords(candidate);
-			if (store) await store.transact(() => [...candidate.values()].map(record => ({ ...record })));
+			if (store)
+				await store.transact(current => [
+					...current.filter(record => !ownedKinds.has(record.kind)),
+					...[...candidate.values()].filter(record => ownedKinds.has(record.kind)).map(record => ({ ...record })),
+				]);
 			records = candidate;
 			clientRefIndex = candidateIndex;
 			return result.value;
@@ -546,7 +555,7 @@ export function createKindAwareReconciliation(
 	const hydrateFromStore = async () => {
 		if (!store) return;
 		const run = async () => {
-			const loaded = await store.load();
+			const loaded = (await store.load()).filter(record => ownedKinds.has(record.kind));
 			const candidate = new Map(
 				loaded.map(record => {
 					const hydrated =
@@ -574,7 +583,11 @@ export function createKindAwareReconciliation(
 			// prompt/skill admission — stalling reconciliationReady so a concurrent
 			// abort misses the not-yet-registered pending preflight entry (#4522).
 			const settledSteers = loaded.some(record => record.kind === "steer" && record.status === "accepted");
-			if (settledSteers) await store.transact(() => [...candidate.values()].map(record => ({ ...record })));
+			if (settledSteers)
+				await store.transact(current => [
+					...current.filter(record => !ownedKinds.has(record.kind)),
+					...[...candidate.values()].filter(record => ownedKinds.has(record.kind)).map(record => ({ ...record })),
+				]);
 			records = candidate;
 			clientRefIndex = candidateIndex;
 		};

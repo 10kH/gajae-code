@@ -13,6 +13,34 @@ describe("kind-aware reconciliation", () => {
 		expect(() => rec.admit("prompt", "same-ref")).toThrow(/clientRef/);
 	});
 
+	test("a steer-only writer preserves prompt records owned by another reconciler", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-owned-recon-"));
+		try {
+			const sessionFile = path.join(root, "s.jsonl");
+			await fs.writeFile(sessionFile, "");
+			const store = createReconciliationStore({ sessionFile, sessionId: "owned", now: () => 1_000 });
+			await store.transact(() => [
+				{
+					kind: "prompt",
+					commandId: "prompt-command",
+					turnId: "prompt-turn",
+					clientRef: "prompt-ref",
+					status: "accepted",
+					acceptedAt: 1,
+				},
+			]);
+			const reconciliation = createKindAwareReconciliation({ store, ownedKinds: ["steer"] });
+			await reconciliation.hydrateFromStore();
+			await reconciliation.reserveSteer("steer-ref", "body");
+			expect(store.snapshot()).toEqual([
+				expect.objectContaining({ kind: "prompt", clientRef: "prompt-ref" }),
+				expect.objectContaining({ kind: "steer", clientRef: "steer-ref" }),
+			]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("durable store survives process restart with process_restart settlement", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-recon-"));
 		const sessionFile = path.join(root, "s.jsonl");
