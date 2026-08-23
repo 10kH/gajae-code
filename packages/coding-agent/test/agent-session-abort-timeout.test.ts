@@ -36,6 +36,8 @@ describe("AgentSession abort timeout", () => {
 					break;
 				} catch (error) {
 					if (process.platform !== "win32") throw error;
+					const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
+					if (code !== "EBUSY" && code !== "EPERM") throw error;
 					// Windows reports EBUSY while the just-closed auth DB handle (or an
 					// AV scan of it) still holds the directory; retry briefly, then
 					// leave the disposable temp dir behind rather than failing the test.
@@ -340,7 +342,9 @@ describe("AgentSession abort timeout", () => {
 			// The bounded abort races the shared unwind with its own budget and
 			// forces recovery on the first abort's behalf; before that, it awaited
 			// the wedged unwind with its timeoutMs silently discarded.
+			const boundedStarted = Date.now();
 			await activeSession.abort({ timeoutMs: 25, cause: "user_interrupt" });
+			expect(Date.now() - boundedStarted).toBeLessThan(45);
 			expect(notices.some(message => message.includes("forced session recovery"))).toBe(true);
 			await unboundedAbort;
 

@@ -2807,6 +2807,7 @@ export class AgentSession {
 			})
 			.finally(() => {
 				this.#powerAssertionLoad = undefined;
+				if (!this.#powerAssertion && this.#livePromptsInFlight() > 0) this.#acquirePowerAssertion();
 			});
 	}
 
@@ -3427,7 +3428,19 @@ export class AgentSession {
 		this.#inFlightPromptTokens.delete(token);
 		this.#abandonedInFlightPrompts.delete(token);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
-		if (wasAbandoned || this.#livePromptsInFlight() !== 0) {
+		if (wasAbandoned) {
+			let flushError: unknown;
+			if (this.#livePromptsInFlight() === 0) {
+				try {
+					this.#flushPendingPromptMessages();
+				} catch (error) {
+					flushError = error;
+				}
+			}
+			this.#resolveSessionSettlement();
+			return flushError;
+		}
+		if (this.#livePromptsInFlight() !== 0) {
 			this.#resolveSessionSettlement();
 			return undefined;
 		}
@@ -12528,6 +12541,11 @@ export class AgentSession {
 		const hadLivePrompt = this.#livePromptsInFlight() > 0;
 		for (const token of this.#inFlightPromptTokens.keys()) this.#abandonedInFlightPrompts.add(token);
 		if (hadLivePrompt) this.#releasePowerAssertion();
+		try {
+			this.#flushPendingPromptMessages();
+		} catch (error) {
+			logger.warn("Failed to flush deferred prompt messages during forced recovery", { error: String(error) });
+		}
 		this.#resolveSessionSettlement();
 		const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
 		try {
@@ -12579,6 +12597,7 @@ export class AgentSession {
 			// the awaits below must keep watching THIS unwind, not a successor's.
 			const sharedUnwind = this.#abortUnwind;
 			if (options?.timeoutMs !== undefined && options.timeoutMs > 0) {
+				const deadline = Date.now() + options.timeoutMs;
 				// The first abort may be waiting on cooperative cleanup with no budget
 				// of its own; this abort's budget must still be able to force recovery,
 				// or a bounded user abort queued behind a wedged unbounded abort blocks
@@ -12590,9 +12609,11 @@ export class AgentSession {
 				]);
 				if (shared === "settled") return { kind: "settled" };
 				this.#forceSessionRecovery();
+				const remainingMs = Math.max(0, deadline - Date.now());
+				if (remainingMs === 0) return { kind: "timeout" };
 				const forced = await Promise.race([
 					sharedUnwind.then(() => "settled" as const),
-					Bun.sleep(options.timeoutMs).then(() => "timeout" as const),
+					Bun.sleep(remainingMs).then(() => "timeout" as const),
 				]);
 				return { kind: forced === "settled" ? "settled" : "timeout" };
 			}
