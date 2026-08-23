@@ -164,9 +164,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS - 1);
 			expect(showStatus).not.toHaveBeenCalled();
 			vi.advanceTimersByTime(1);
-			expect(showStatus).toHaveBeenCalledTimes(1);
-			expect(showStatus.mock.calls[0]?.[0]).toContain("Pets aren’t available");
-			expect(showStatus.mock.calls[0]?.[0]).not.toContain("(unknown)");
+			expect(showStatus).not.toHaveBeenCalled();
 		} finally {
 			mode.stop();
 			setVerifiedItermPetAvailability(undefined);
@@ -211,17 +209,11 @@ describe("InteractiveMode.setEditorComponent", () => {
 			await mode.init();
 			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS * 2);
 
-			expect(showStatus).toHaveBeenCalledTimes(1);
-			const startupWarning = showStatus.mock.calls[0]?.[0] ?? "";
-			expect(startupWarning).toContain("Pets aren’t available");
-			expect(startupWarning).not.toContain("(");
+			expect(showStatus).not.toHaveBeenCalled();
 
 			showStatus.mockClear();
-			expect(mode.setPetMode("red")).toBe(false);
-			expect(showStatus).toHaveBeenCalledTimes(1);
-			const refusal = showStatus.mock.calls[0]?.[0] ?? "";
-			expect(refusal).toContain("Pets aren’t available");
-			expect(refusal).not.toContain("(");
+			expect(mode.setPetMode("red")).toBe(true);
+			expect(showStatus).not.toHaveBeenCalled();
 		} finally {
 			mode.stop();
 			setVerifiedItermPetAvailability(undefined);
@@ -268,15 +260,11 @@ describe("InteractiveMode.setEditorComponent", () => {
 			setVerifiedItermPetAvailability({ available: false, mode: "direct", reason: "probe-timeout", epoch: 1 });
 			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS * 2);
 
-			expect(showStatus).toHaveBeenCalledTimes(1);
-			const startupWarning = showStatus.mock.calls[0]?.[0] ?? "";
-			expect(startupWarning).toContain("Pets aren’t available");
-			expect(startupWarning).toContain("(probe-timeout)");
+			expect(showStatus).not.toHaveBeenCalled();
 
 			showStatus.mockClear();
-			expect(mode.setPetMode("red")).toBe(false);
-			expect(showStatus).toHaveBeenCalledTimes(1);
-			expect(showStatus.mock.calls[0]?.[0] ?? "").toContain("(probe-timeout)");
+			expect(mode.setPetMode("red")).toBe(true);
+			expect(showStatus).not.toHaveBeenCalled();
 		} finally {
 			mode.stop();
 			setVerifiedItermPetAvailability(undefined);
@@ -943,10 +931,10 @@ describe("InteractiveMode.setEditorComponent", () => {
 			setTerminalImageProtocol(null);
 			settings.set("pet.mode", "red");
 			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
-			expect(mode.petWidget?.mode).toBe("off");
+			expect(mode.petWidget?.mode).toBe("red");
 
 			mode.setEditorComponent((_tui, editorTheme) => new TestModalEditor(editorTheme));
-			expect(mode.petWidget?.mode).toBe("off");
+			expect(mode.petWidget?.mode).toBe("red");
 
 			expect(settings.get("pet.mode")).toBe("red");
 			setTerminalImageProtocol(ImageProtocol.Sixel);
@@ -972,7 +960,7 @@ describe("InteractiveMode.setEditorComponent", () => {
 
 			expect(dispose).toHaveBeenCalledTimes(1);
 			expect(mode.petWidget).not.toBe(preInitWidget);
-			expect(mode.petWidget?.mode).toBe("off");
+			expect(mode.petWidget?.mode).toBe("red");
 
 			setTerminalImageProtocol(ImageProtocol.Sixel);
 			expect(mode.petWidget?.mode).toBe("red");
@@ -988,21 +976,16 @@ describe("InteractiveMode.setEditorComponent", () => {
 			settings.set("pet.mode", "off");
 			const showStatus = vi.spyOn(mode, "showStatus").mockImplementation(() => {});
 
-			// Capability is rechecked immediately before mutation: a rejected
-			// commit surfaces the warning and never persists.
+			// Text cells make the pet reachable even without an image protocol.
 			setTerminalImageProtocol(null);
-			expect(mode.setPetMode("red")).toBe(false);
-			expect(settings.get("pet.mode")).toBe("off");
+			expect(mode.setPetMode("red")).toBe(true);
+			expect(settings.get("pet.mode")).toBe("red");
 			expect(mode.petWidget?.mode ?? "off").toBe("off");
-			expect(showStatus).toHaveBeenCalledTimes(1);
+			expect(showStatus).not.toHaveBeenCalled();
 
-			expect(mode.commitPetPreviewMode("red")).toBe(false);
-			expect(settings.get("pet.mode")).toBe("off");
-			expect(showStatus).toHaveBeenCalledTimes(2);
-			for (const call of showStatus.mock.calls) {
-				expect(String(call[0])).toContain("Gajae Pet");
-				expect(String(call[0])).not.toContain("(unknown)");
-			}
+			expect(mode.commitPetPreviewMode("red")).toBe(true);
+			expect(settings.get("pet.mode")).toBe("red");
+			expect(showStatus).not.toHaveBeenCalled();
 
 			// An accepted commit persists only after the widget mutation applies.
 			setTerminalImageProtocol(ImageProtocol.Sixel);

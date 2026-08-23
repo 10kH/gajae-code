@@ -839,10 +839,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.petWidget = this.#createPetWidget(this.editor);
 		const configuredPetMode = settings.get("pet.mode");
 		this.petWidget.setMode(configuredPetMode);
-		// The async sixel capability probe can enable graphics after the saved
-		// pet mode was applied and dropped (no protocol yet at startup).
-		// Re-apply the configured mode when capability arrives so the pet
-		// appears without the user re-running /pet.
+		// The text-cell fallback renders immediately. Re-apply a saved mode if an
+		// asynchronous graphics probe later upgrades it to pixel rendering.
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = onImageProtocolChanged(protocol => {
 			if (!protocol) {

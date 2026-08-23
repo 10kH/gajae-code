@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Gajae Pet now stays reachable in tmux and image-protocol-free SSH clients through a bounded two-row text-cell rendering. The fallback derives conservative Block Elements from the active skin, uses truecolor when available and ANSI-256 otherwise, reserves no extra transcript rows, and retains the pixel renderer unchanged for supported Kitty, Sixel, and iTerm2 terminals (#4867).
+
 - Python kernel reuse is once again keyed on the settings values that shape a kernel, not on `Settings` object identity. Binding built-in executors to session settings (#4826) made `scopedSessionId` suffix each kernel key with a per-instance counter, so two logical sessions in one process — which resolve the same shell configuration and therefore spawn byte-identical kernels — each started their own kernel, and disposing one shut down a kernel the other still owned. The scope is now a fingerprint of the resolved shell config (shell, args, environment), so equivalent settings share one retained kernel while genuinely different shell environments stay isolated.
 
 ## [0.15.0] - 2026-08-22
