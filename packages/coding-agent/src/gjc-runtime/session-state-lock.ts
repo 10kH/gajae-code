@@ -8,6 +8,7 @@ import type {
 	NativeExactUnlinkResult,
 } from "@gajae-code/natives";
 import { genericFileLockDirIsStale, processStartTime as portableProcessStartTime } from "../config/file-lock";
+import { loadInstallationHostId } from "../config/machine-identity";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 
 /**
@@ -40,19 +41,17 @@ const LOCK_STALE_MS = 30_000;
  * write-failure cleanup, release — is made under this separate claim. Only pathname
  * bookkeeping happens inside it; the caller's state-file operation never does.
  *
- * The claim is itself a regular owner record at `<file>.lock.transition`, in the same
- * format and with the same liveness rules as the record it guards: pid and start time are
- * stamped into it, so a holder that is merely paused — descheduled, stalled on the
- * filesystem, stopped in a debugger — is never broken by elapsed time. An ownerless claim
- * broken by age reintroduces exactly the concurrent create/unlink it exists to prevent.
+ * The claim is an atomic empty directory at `<file>.lock.transition`; its machine-qualified
+ * owner record is the sibling `<file>.lock.transition.owner`. `mkdir` admits exactly one
+ * contender, while the held directory prevents a successor until release unlinks the
+ * validated sidecar and atomically `rmdir`s the claim. A crash before either step leaves a
+ * fail-closed directory for explicit recovery; concurrent automatic reclaim cannot prove
+ * that a directory + sibling sidecar still name the claim it inspected.
  *
- * It needs no claim of its own because its every removal is identity-bound: `exactUnlink`
- * refuses unless the record is still byte-for-byte and inode-for-inode the one that was
- * judged, which is the atomic compare-and-delete `fs` does not offer. That is also why the
- * path is `<file>.lock.transition` and not the generic protocol's `.lock` directory — it
- * stays distinct from `<file>.lock` (whose regular-file owner format base writers read is
- * unchanged) and from the outer `locks/mutation.lock` (whose generic directory semantics
- * are likewise untouched).
+ * The separate sidecar keeps the claim directory empty, which is what makes `rmdir` the
+ * identity-safe portable release primitive. The path stays distinct from `<file>.lock`
+ * (whose regular-file owner format base writers read) and from the outer
+ * `locks/mutation.lock` (whose generic directory semantics are unchanged).
  */
 const LOCK_TRANSITION_RESOURCE_SUFFIX = ".transition";
 
@@ -60,6 +59,8 @@ interface SessionStateLockOwner {
 	pid: number;
 	start_time: string;
 	token: string;
+	owner_host_id?: string;
+	released?: true;
 }
 
 /**
@@ -132,6 +133,18 @@ export const SessionStateLockTestHooks: {
 	 * configuration.
 	 */
 	ownerRecordWriteFault?: (file: string) => void | Promise<void>;
+	/** @internal Stable host identity seam for shared-volume ownership tests. */
+	ownerHostId?: () => string | Promise<string>;
+	/** @internal Lets legacy same-host fixtures exercise their pre-qualification paths. */
+	unqualifiedOwnerIsLocal?: boolean;
+	/** @internal Runs after final live-owner validation and before descriptor rewrite. */
+	afterCurrentOwnerValidation?: (file: string) => void | Promise<void>;
+	/**
+	 * @internal Runs after a live owner has been proven and immediately before its
+	 * final pathname capture for release. Tests use it to replace the pathname and
+	 * prove that live-owner cleanup refuses a successor.
+	 */
+	beforeCurrentOwnerRelease?: (file: string) => void | Promise<void>;
 	beforeLegacyDirectoryRemoval?: (lockDir: string) => void | Promise<void>;
 } = {};
 
@@ -221,8 +234,29 @@ function validLockOwner(value: unknown): value is SessionStateLockOwner {
 		owner.pid > 0 &&
 		typeof owner.start_time === "string" &&
 		typeof owner.token === "string" &&
-		owner.token.length > 0
+		owner.token.length > 0 &&
+		(owner.owner_host_id === undefined ||
+			(typeof owner.owner_host_id === "string" && owner.owner_host_id.length > 0)) &&
+		(owner.released === undefined || owner.released === true)
 	);
+}
+
+let ownerHostIdPromise: Promise<string> | undefined;
+
+async function currentOwnerHostId(): Promise<string> {
+	try {
+		let hostId: string;
+		if (SessionStateLockTestHooks.ownerHostId) {
+			hostId = await SessionStateLockTestHooks.ownerHostId();
+		} else {
+			ownerHostIdPromise ??= loadInstallationHostId();
+			hostId = await ownerHostIdPromise;
+		}
+		if (!hostId) throw new Error("Host identity is unavailable.");
+		return hostId;
+	} catch (error) {
+		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
+	}
 }
 
 /**
@@ -281,9 +315,16 @@ function probeOwnerProcess(pid: number): OwnerProcessLiveness {
  * record still is the record that was judged, so the compare-and-delete matches and a live
  * holder loses its lock.
  */
-function lockOwnerIsAlive(value: unknown): boolean {
+async function lockOwnerIsAlive(value: unknown): Promise<boolean> {
 	if (!validLockOwner(value)) return false;
 	const owner = value;
+	if (owner.owner_host_id === undefined) {
+		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return true;
+	} else if (owner.owner_host_id !== (await currentOwnerHostId())) {
+		return true;
+	}
+	// PID and process-start values are host-local. A current writer on a shared
+	// volume must never classify a foreign owner from a local ESRCH result.
 	const liveness = probeOwnerProcess(owner.pid);
 	if (liveness === "dead") return false;
 	if (liveness === "unknown") return true;
@@ -541,8 +582,26 @@ function ownerCreateFlags(): number | undefined {
 	return strategy === "posix-nofollow" ? POSIX_OWNER_CREATE_FLAGS : undefined;
 }
 
-function newLockOwner(): SessionStateLockOwner {
-	return { pid: process.pid, start_time: ownerStartTime(process.pid), token: randomUUID() };
+async function newLockOwner(): Promise<SessionStateLockOwner> {
+	return {
+		pid: process.pid,
+		start_time: ownerStartTime(process.pid),
+		token: randomUUID(),
+		owner_host_id: await currentOwnerHostId(),
+	};
+}
+
+async function releasedLockOwner(): Promise<SessionStateLockOwner> {
+	return {
+		// PID 1 exists in every supported process namespace. Legacy readers that do
+		// not understand `released` therefore keep this compatibility fence instead
+		// of deleting it and racing a current writer.
+		pid: 1,
+		start_time: "unknown",
+		token: randomUUID(),
+		owner_host_id: await currentOwnerHostId(),
+		released: true,
+	};
 }
 
 /**
@@ -658,18 +717,154 @@ async function createOwnerLock(file: string, owner: SessionStateLockOwner): Prom
 	}
 }
 
+const POSIX_OWNER_REWRITE_FLAGS = POSIX_NOFOLLOW_AVAILABLE
+	? fsSync.constants.O_RDWR | fsSync.constants.O_NONBLOCK | fsSync.constants.O_NOFOLLOW
+	: undefined;
+
+async function rewriteHeldOwnerRecord(
+	file: string,
+	held: LockOwnerSnapshot,
+	replacement: SessionStateLockOwner,
+	allowSuccessorAfterRewrite = false,
+): Promise<LockOwnerSnapshot> {
+	const strategy = ownerAccessStrategy();
+	let before: fsSync.BigIntStats | undefined;
+	if (strategy === "windows-validated") {
+		before = await fs.lstat(file, { bigint: true }).catch(error => {
+			throw new SessionStateLockUnavailableError(error);
+		});
+		if (before.isSymbolicLink() || !before.isFile())
+			throw new SessionStateLockUnavailableError(new Error("Owner record cannot be rewritten safely."));
+	}
+	const flags = strategy === "windows-validated" ? fsSync.constants.O_RDWR : POSIX_OWNER_REWRITE_FLAGS;
+	if (flags === undefined)
+		throw new SessionStateLockUnavailableError(new Error("No-follow owner rewrites are unsupported."));
+	let handle: fs.FileHandle;
+	try {
+		handle = await fs.open(file, flags);
+	} catch (error) {
+		throw new SessionStateLockUnavailableError(error);
+	}
+	try {
+		const opened = await handle.stat({ bigint: true });
+		if (!opened.isFile()) throw new SessionStateLockUnavailableError(new Error("Owner record is not regular."));
+		if (before && !sameRegularFileIdentity(before, opened))
+			throw new SessionStateLockUnavailableError(new Error("Owner record changed while opening for rewrite."));
+		if (before) {
+			const relinked = await fs.lstat(file, { bigint: true }).catch(() => null);
+			if (!relinked || !sameRegularFileIdentity(opened, relinked))
+				throw new SessionStateLockUnavailableError(new Error("Owner pathname changed while opening for rewrite."));
+		}
+		const currentBytes = await handle.readFile();
+		const settled = await handle.stat({ bigint: true });
+		if (!sameRegularFileIdentity(opened, settled) || settled.size !== BigInt(currentBytes.byteLength))
+			throw new SessionStateLockUnavailableError(new Error("Owner record changed before rewrite."));
+		if (!sameLockOwnerSnapshot(ownerSnapshotFrom(settled, currentBytes), held))
+			throw new SessionStateLockUnavailableError(new Error("Owner record identity changed before rewrite."));
+
+		const replacementBytes = Buffer.from(JSON.stringify(replacement), "utf8");
+		await handle.truncate(0);
+		let offset = 0;
+		while (offset < replacementBytes.byteLength) {
+			const { bytesWritten } = await handle.write(
+				replacementBytes,
+				offset,
+				replacementBytes.byteLength - offset,
+				offset,
+			);
+			if (bytesWritten <= 0) throw new Error("Owner record rewrite made no progress.");
+			offset += bytesWritten;
+		}
+		await handle.truncate(replacementBytes.byteLength);
+		await handle.sync();
+		const rewritten = await handle.stat({ bigint: true });
+		const canonical = await captureRegularLockOwner(file);
+		if (!canonical || canonical.dev !== rewritten.dev || canonical.ino !== rewritten.ino)
+			throw new SessionStateLockUnavailableError(new Error("Owner pathname changed after rewrite."));
+		if (canonical.bytes !== replacementBytes.toString("utf8")) {
+			let successor: unknown;
+			try {
+				successor = JSON.parse(canonical.bytes);
+			} catch {
+				successor = null;
+			}
+			if (!allowSuccessorAfterRewrite || !validLockOwner(successor) || successor.released === true)
+				throw new SessionStateLockUnavailableError(new Error("Owner record changed after rewrite."));
+		}
+		return canonical;
+	} catch (error) {
+		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
+	} finally {
+		await handle.close().catch(() => undefined);
+	}
+}
+
+async function acquireOwnerLock(file: string, owner: SessionStateLockOwner): Promise<LockOwnerSnapshot> {
+	nativeSessionStateLock();
+	try {
+		return await createOwnerLock(file, owner);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+		const stat = await fs.lstat(file).catch(() => null);
+		if (!stat?.isFile()) throw error;
+		const current = await captureRegularLockOwner(file).catch(() => null);
+		if (!current) throw error;
+		let observed: unknown;
+		try {
+			observed = JSON.parse(current.bytes);
+		} catch {
+			throw error;
+		}
+		if (!validLockOwner(observed) || observed.released !== true) throw error;
+		return await rewriteHeldOwnerRecord(file, current, owner);
+	}
+}
+
 /**
  * Give up an owner record this process holds.
  *
- * A mismatch means something replaced our record while we held it. That successor is left
- * strictly alone and the caller is told the lock is no longer trustworthy, because the
- * alternative — deleting whatever is there now — is the exact bug this protocol exists to
- * remove.
+ * Live-owner release rewrites the held inode into a durable released tombstone instead of
+ * unlinking its pathname. Current writers reuse that exact inode under the transition
+ * claim; legacy/base writers see PID 1 as live and remain fenced. Holding the descriptor
+ * across verification and rewrite means a successor that replaces the pathname is never
+ * modified or deleted. This stays portable on filesystems that reject Linux renameat2
+ * exchange/no-replace (notably CephFS).
+ *
+ * Stale-owner reclaim still uses the native identity-bound detach protocol because no live
+ * owner or transition claim can vouch for that pathname. A mismatch here likewise leaves a
+ * successor strictly alone.
  */
-function releaseOwnerLock(file: string, held: LockOwnerSnapshot): void {
-	const outcome = exactUnlinkOwnerRecord(file, held);
-	if (outcome === "removed" || outcome === "absent") return;
-	throw new SessionStateLockUnavailableError(new Error(`Owner record could not be released: ${outcome}.`));
+async function releaseOwnerLock(file: string, held: LockOwnerSnapshot): Promise<void> {
+	let owner: unknown;
+	try {
+		owner = JSON.parse(held.bytes);
+	} catch {
+		owner = null;
+	}
+	if (
+		!validLockOwner(owner) ||
+		owner.pid !== process.pid ||
+		owner.owner_host_id !== (await currentOwnerHostId()) ||
+		!sameOwnerIncarnation(owner)
+	) {
+		throw new SessionStateLockUnavailableError(new Error("Owner record is not held by this process incarnation."));
+	}
+	try {
+		await SessionStateLockTestHooks.beforeCurrentOwnerRelease?.(file);
+	} catch (error) {
+		throw new SessionStateLockUnavailableError(error);
+	}
+	const current = await captureRegularLockOwner(file);
+	if (!current) throw new SessionStateLockUnavailableError(new Error("Owner record disappeared before release."));
+	if (!sameLockOwnerSnapshot(current, held)) {
+		throw new SessionStateLockUnavailableError(new Error("Owner record changed before release."));
+	}
+	try {
+		await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(file);
+	} catch (error) {
+		throw new SessionStateLockUnavailableError(error);
+	}
+	await rewriteHeldOwnerRecord(file, held, await releasedLockOwner(), true);
 }
 
 /**
@@ -698,9 +893,10 @@ async function reclaimStaleOwnerRecord(
 		owner = null;
 	}
 	if (!validLockOwner(owner)) {
+		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return;
 		// The mtime of the very inode the bytes were read from, not a fresh path `stat`.
 		if (Date.now() - Number(snapshot.mtimeNs / 1_000_000n) < LOCK_STALE_MS) return;
-	} else if (lockOwnerIsAlive(owner)) return;
+	} else if (await lockOwnerIsAlive(owner)) return;
 	await hooks.afterInspection?.(file);
 	const current = await captureRegularLockOwner(file);
 	if (!current || !sameLockOwnerSnapshot(current, snapshot)) return;
@@ -711,42 +907,68 @@ async function reclaimStaleOwnerRecord(
 		throw new SessionStateLockUnavailableError(new Error("Stale owner record could not be reclaimed."));
 }
 
-/**
- * Run one pathname transition of `<file>.lock` with no other CURRENT contender able to
- * create or remove that path.
- *
- * The claim is always released, including when the transition throws, so a fault leaves
- * behind at most the lock file itself — which the normal stale protocol then handles.
- */
+async function releaseTransitionClaim(
+	transitionDir: string,
+	ownerFile: string,
+	held: LockOwnerSnapshot,
+): Promise<void> {
+	await SessionStateLockTestHooks.beforeCurrentOwnerRelease?.(ownerFile);
+	const current = await captureRegularLockOwner(ownerFile);
+	if (!current || !sameLockOwnerSnapshot(current, held))
+		throw new SessionStateLockUnavailableError(new Error("Transition owner changed before release."));
+	await SessionStateLockTestHooks.afterCurrentOwnerValidation?.(ownerFile);
+	await rewriteHeldOwnerRecord(ownerFile, held, await releasedLockOwner());
+	await fs.rmdir(transitionDir);
+}
+
+async function reclaimStaleTransitionClaim(transitionDir: string): Promise<void> {
+	const stat = await fs.lstat(transitionDir).catch(() => null);
+	if (!stat) return;
+	// Regular-file claims belong to the superseded protocol. They retain the old
+	// exact-identity stale path; released PID-1 tombstones deliberately require
+	// explicit cleanup before this atomic-directory protocol can take over.
+	if (stat.isFile()) {
+		await reclaimStaleOwnerRecord(transitionDir, {
+			afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
+			beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
+		});
+		return;
+	}
+	if (!stat.isDirectory()) throw new SessionStateLockUnavailableError();
+	// No portable operation can atomically prove that this directory + sibling
+	// sidecar are still the dead claim two concurrent reclaimers inspected. A
+	// crashed atomic claim therefore stays fail-closed for explicit recovery.
+}
+
+/** Run one pathname transition under an atomic `mkdir`/`rmdir` claim. */
 async function withLockPathTransition<T>(lockFile: string, transition: () => Promise<T>): Promise<T> {
-	const transitionFile = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
-	const owner = newLockOwner();
+	const transitionDir = `${lockFile}${LOCK_TRANSITION_RESOURCE_SUFFIX}`;
+	const ownerFile = `${transitionDir}.owner`;
+	const owner = await newLockOwner();
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
-		let held: LockOwnerSnapshot;
 		try {
-			held = await createOwnerLock(transitionFile, owner);
+			await fs.mkdir(transitionDir);
 		} catch (error) {
-			if (error instanceof SessionStateLockUnavailableError) throw error;
 			const code = (error as NodeJS.ErrnoException).code;
-			if (code !== "EEXIST" && code !== "EISDIR" && code !== "EPERM")
-				throw new SessionStateLockUnavailableError(error);
-			await reclaimStaleOwnerRecord(transitionFile, {
-				afterInspection: SessionStateLockTestHooks.afterTransitionStaleInspection,
-				beforeRemoval: SessionStateLockTestHooks.beforeTransitionStaleRemoval,
-			});
+			if (code !== "EEXIST" && code !== "EPERM") throw new SessionStateLockUnavailableError(error);
+			await reclaimStaleTransitionClaim(transitionDir);
 			await Bun.sleep(LOCK_ACQUIRE_RETRY_MS);
 			continue;
+		}
+		let held: LockOwnerSnapshot;
+		try {
+			held = await acquireOwnerLock(ownerFile, owner);
+		} catch (error) {
+			await fs.rmdir(transitionDir).catch(() => undefined);
+			throw error;
 		}
 		const outcome = await transition().then(
 			value => ({ ok: true as const, value }),
 			error => ({ ok: false as const, error }),
 		);
 		try {
-			releaseOwnerLock(transitionFile, held);
+			await releaseTransitionClaim(transitionDir, ownerFile, held);
 		} catch (releaseError) {
-			// A claim that cannot be given up leaves the lock untrustworthy either way, so
-			// the typed refusal is what callers see; the transition's own fault rides along
-			// as the cause rather than replacing it.
 			if (!outcome.ok)
 				throw new SessionStateLockUnavailableError(
 					new AggregateError([outcome.error, releaseError], "Lock path transition and release both failed."),
@@ -864,7 +1086,9 @@ async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
 		const native = nativeSessionStateLock();
 		const before = captureLegacyDirectoryTree(native, lockFile);
 		if (!before) return;
-		if (!(await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS))) return;
+		const ownerHostId =
+			SessionStateLockTestHooks.unqualifiedOwnerIsLocal === true ? undefined : await currentOwnerHostId();
+		if (!(await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId))) return;
 		await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
 		const authorized = captureLegacyDirectoryTree(native, lockFile);
 		// The verdict spoke for `before`; only an unchanged tree carries that authority.
@@ -940,7 +1164,7 @@ export async function reclaimStaleSessionStateLock(lockFile: string): Promise<vo
  */
 export async function withSessionStateFileLock<T>(stateFile: string, operation: () => Promise<T>): Promise<T> {
 	const lockFile = `${stateFile}.lock`;
-	const owner = newLockOwner();
+	const owner = await newLockOwner();
 	await fs.mkdir(path.dirname(stateFile), { recursive: true });
 	for (let attempt = 0; attempt < LOCK_ACQUIRE_ATTEMPTS; attempt++) {
 		let held: LockOwnerSnapshot | undefined;
@@ -948,7 +1172,7 @@ export async function withSessionStateFileLock<T>(stateFile: string, operation: 
 			// Contention (`EEXIST`, or `EISDIR`/`EPERM` for a legacy directory owner)
 			// propagates out of the claim to the evaluation below; the claim is released
 			// first, so the reclaim that follows can take it.
-			held = await withLockPathTransition(lockFile, () => createOwnerLock(lockFile, owner));
+			held = await withLockPathTransition(lockFile, () => acquireOwnerLock(lockFile, owner));
 			let outcome: { ok: true; value: T } | { ok: false; error: unknown };
 			try {
 				outcome = { ok: true, value: await operation() };
