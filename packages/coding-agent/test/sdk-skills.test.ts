@@ -122,6 +122,38 @@ Loaded via symbolic link.
 
 		expect(session.skills.some((s: Skill) => s.name === "test-skill")).toBe(true);
 	});
+	it("loads user skills from the session agent-directory profile", async () => {
+		const profileDir = path.join(tempDir, "profile-agent");
+		const profileSkillDir = path.join(profileDir, "skills", "profile-skill");
+		fs.mkdirSync(profileSkillDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(profileSkillDir, "SKILL.md"),
+			`---
+name: profile-skill
+description: Skill installed into an explicit agent-directory profile.
+---
+
+# Profile Skill
+`,
+		);
+
+		const { session } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: profileDir,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({
+				"skills.enabled": true,
+				"skills.trustUserSkills": true,
+			}),
+		});
+
+		try {
+			expect(session.skills.some(skill => skill.name === "profile-skill")).toBe(true);
+		} finally {
+			await session.dispose();
+		}
+	});
+
 	it("keeps bundled GJC workflow skills even when options.skills is empty", async () => {
 		const { session } = await createAgentSession({
 			cwd: tempDir,

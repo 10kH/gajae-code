@@ -1851,6 +1851,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		} else if (settings.get("skills.enabled")) {
 			const skillsResult = await logger.time("loadSkills", loadSkills, {
 				...settings.getGroup("skills"),
+				agentDir,
 				cwd,
 				disabledExtensions: settings.get("disabledExtensions"),
 			});
@@ -1872,7 +1873,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			const rulesResult =
 				options.rules !== undefined
 					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd });
+					: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir });
 			const rulebookRules: Rule[] = [];
 			const alwaysApplyRules: Rule[] = [];
 			for (const rule of rulesResult.items) {
@@ -2042,6 +2043,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		let mcpManager: MCPManager | undefined = options.mcpManager;
 		let ownsMcpManager = false;
 		const cwdCapturingToolNames: string[] = [];
+		const ownedConventionalMcpServerNames = new Set<string>();
+		let ownedConventionalMcpToolNames: string[] = [];
+		let publishOwnedConventionalMcpTools = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const wireMcpManagerCallbacks = (manager: MCPManager): void => {
 			manager.setOnPromptsChanged(serverName => {
@@ -2169,6 +2173,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				try {
 					const reloaded = await loadSkills({
 						...settings.getGroup("skills"),
+						agentDir,
 						cwd: to,
 						disabledExtensions: settings.get("disabledExtensions"),
 					});
@@ -2859,27 +2864,33 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								error: safeErrorForLog(err),
 							});
 						}
-						if (result.connectedServers.length > 0) {
+						const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
+						const pendingConventionalNames = Object.keys(conventionalConfigs).filter(
+							name => owned.getConnectionStatus(name) === "connecting",
+						);
+						const retainOwnedManager = result.connectedServers.length > 0 || pendingConventionalNames.length > 0;
+						if (retainOwnedManager) {
 							mcpManager = owned;
 							ownsMcpManager = true;
 							customTools.push(...(result.tools as CustomTool[]));
 							cwdCapturingToolNames.push(...result.tools.map(tool => tool.name));
-							const connectedPluginNames = new Set(
-								result.connectedServers.filter(name => pluginNames.has(name)),
-							);
+							for (const name of Object.keys(conventionalConfigs)) ownedConventionalMcpServerNames.add(name);
 							pluginMcpManagerServers.set(owned, connectedPluginNames);
-							conventionalMcpManagerServers.set(owned, new Set(result.connectedServers));
+							conventionalMcpManagerServers.set(owned, new Set(Object.keys(conventionalConfigs)));
 							for (const tool of result.tools) {
 								const serverName = tool.mcpServerName;
 								if (serverName === undefined) continue;
 								if (connectedPluginNames.has(serverName)) pluginMcpToolNames.push(tool.name);
-								else conventionalMcpToolNames.push(tool.name);
+								else {
+									conventionalMcpToolNames.push(tool.name);
+									ownedConventionalMcpToolNames.push(tool.name);
+								}
 							}
-							// Plugin-bundle connections are fixed for the session lifetime
-							// (existing plugin contract). Sessions without plugin MCPs keep
-							// a mutable connection set so `/mcp reload` can re-discover
-							// conventional registrations.
-							if (connectedPluginNames.size > 0) owned.sealConnectionSet();
+							publishOwnedConventionalMcpTools = ownedConventionalMcpServerNames.size > 0;
+							// Plugin-bundle connections are fixed for the session lifetime only
+							// when no conventional server is still connecting in the same manager.
+							if (connectedPluginNames.size > 0 && pendingConventionalNames.length === 0)
+								owned.sealConnectionSet();
 						} else {
 							try {
 								await owned.disconnectAll();
@@ -4297,16 +4308,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Exact-config managers do not receive reactive callbacks; their tools are
 		// registered once in the session-owned catalog.
 		if (mcpManager && !options.mcpManager && explicitMcpConfigPath === undefined) {
-			// The owned plugin-bundle manager surfaces its tools as always-on custom
-			// tools (registered above), so it must NOT drive refreshMCPTools — that
-			// path strips MCP bridge tools and re-gates them behind MCP selection,
-			// which would deactivate the always-on plugin tools. Reactive tool
-			// updates remain wired only for externally supplied managers.
-			// The owned manager is disconnected by AgentSession.dispose via
-			// ownedMcpManager; only externally supplied managers wire reactive
-			// refreshMCPTools (the owned always-on path must not, or it would
-			// deactivate the plugin tools).
-			if (!ownsMcpManager) {
+			if (publishOwnedConventionalMcpTools) {
+				const syncConventionalTools = async (tools: CustomTool[]): Promise<void> => {
+					if (session.isDisposed) return;
+					const nextTools = tools.filter(tool =>
+						tool.mcpServerName ? ownedConventionalMcpServerNames.has(tool.mcpServerName) : false,
+					);
+					const previousNames = ownedConventionalMcpToolNames;
+					ownedConventionalMcpToolNames = nextTools.map(tool => tool.name);
+					const previousSet = new Set(previousNames);
+					cwdCapturingToolNames.splice(
+						0,
+						cwdCapturingToolNames.length,
+						...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
+						...ownedConventionalMcpToolNames,
+					);
+					await session.replaceNamedCustomTools(previousNames, nextTools);
+				};
+				mcpManager.setOnToolsChanged(tools => {
+					void syncConventionalTools(tools as CustomTool[]);
+				});
+				void syncConventionalTools(mcpManager.getTools() as CustomTool[]);
+			} else if (!ownsMcpManager) {
 				mcpManager.setOnToolsChanged(tools => {
 					void session.refreshMCPTools(tools);
 				});

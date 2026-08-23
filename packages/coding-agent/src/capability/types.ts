@@ -23,10 +23,8 @@ export interface LoadContext {
 	 * consumers then fall back to the same process-wide `getAgentDir()`.
 	 *
 	 * A native surface whose write path targets the agent directory resolves its
-	 * user scope from here, or discovery reads a different file than the one the
-	 * writer produced: `gjc mcp add` (user scope) writes `getMCPConfigPath("user")`
-	 * under this directory. Surfaces whose writers are home-relative (skills) keep
-	 * resolving from `home`.
+	 * user scope from here, or discovery reads a different file than the writer
+	 * produced. This includes MCP registrations and user-installed skills.
 	 */
 	userAgentDir?: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */

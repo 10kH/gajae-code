@@ -10,6 +10,7 @@ import { AuthStorage, getBundledModel } from "@gajae-code/ai";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
 import { runMCPCommand } from "../src/cli/mcp-cli";
@@ -24,6 +25,24 @@ rl.on('line', line => {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'demo', version: '1' } } }) + '\\n');
   } else if (msg.method === 'tools/list') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'hello', description: 'Demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
+  } else if (msg.id !== undefined) {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
+  }
+});
+setInterval(() => {}, 1000);
+`;
+
+const DELAYED_MCP_SERVER_SCRIPT = `
+const readline = require('node:readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', line => {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') {
+    setTimeout(() => {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-demo', version: '1' } } }) + '\\n');
+    }, 2200);
+  } else if (msg.method === 'tools/list') {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'late_hello', description: 'Late demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
   } else if (msg.id !== undefined) {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: {} }) + '\\n');
   }
@@ -103,6 +122,43 @@ describe("conventional MCP autoload in standalone sessions", () => {
 			expect(session.getAllToolNames()).toContain("mcp__demo_hello");
 			// Ordinary sessions expose autoloaded MCP tools as active tools.
 			expect(session.getActiveToolNames()).toContain("mcp__demo_hello");
+		} finally {
+			await session.dispose();
+		}
+	}, 30_000);
+
+	it("retains a declared-timeout MCP manager and publishes tools after background connection", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow-demo",
+			commandArgs: [process.execPath, "-e", DELAYED_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 5_000 },
+			cwd: projectDir,
+		});
+
+		const published = Promise.withResolvers<void>();
+		const originalReplace = AgentSession.prototype.replaceNamedCustomTools;
+		vi.spyOn(AgentSession.prototype, "replaceNamedCustomTools").mockImplementation(async function (
+			this: AgentSession,
+			previousNames,
+			nextTools,
+		) {
+			await originalReplace.call(this, previousNames, nextTools);
+			if (nextTools.some(tool => tool.name === "mcp__slow_demo_late_hello")) published.resolve();
+		});
+
+		const startedAt = Date.now();
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(Date.now() - startedAt).toBeLessThan(2_200);
+			expect(mcpManager).toBeDefined();
+			expect(mcpManager?.getConnectionStatus("slow-demo")).toBe("connecting");
+			// This integration case deliberately crosses the real MCP startup ceiling;
+			// await the publication callback rather than sleeping for a guessed duration.
+			await published.promise;
+			expect(mcpManager?.getConnectedServers()).toContain("slow-demo");
+			expect(session.getAllToolNames()).toContain("mcp__slow_demo_late_hello");
+			expect(session.getActiveToolNames()).toContain("mcp__slow_demo_late_hello");
 		} finally {
 			await session.dispose();
 		}

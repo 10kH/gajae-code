@@ -4,7 +4,7 @@
  * Primary provider for GJC native configs. Supports all capabilities.
  */
 import * as path from "node:path";
-import { getAgentDir, logger, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
+import { logger, parseFrontmatter, tryParseJson } from "@gajae-code/utils";
 import { YAML } from "bun";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
@@ -56,7 +56,7 @@ function getUserAgentDirs(): string[] {
  * profile's servers into it.
  */
 function resolveUserAgentDir(ctx: LoadContext): string {
-	return ctx.userAgentDir ?? getAgentDir();
+	return ctx.userAgentDir ?? path.join(ctx.home, PATHS.userAgent);
 }
 
 function getProjectConfigDirs(): string[] {
@@ -84,11 +84,9 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 			result.push({ dir: projectDir, level: "project" });
 		}
 	}
-	for (const userAgentDir of getUserAgentDirs()) {
-		const userDir = await ifNonEmptyDir(ctx.home, userAgentDir);
-		if (userDir) {
-			result.push({ dir: userDir, level: "user" });
-		}
+	const userDir = await ifNonEmptyDir(resolveUserAgentDir(ctx));
+	if (userDir) {
+		result.push({ dir: userDir, level: "user" });
 	}
 
 	return result;
@@ -335,15 +333,15 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 		),
 	);
 
-	// User-level scan from ~/.gjc/agent/skills/
-	const userScans = getUserAgentDirs().map(userAgentDir =>
+	// User-level scan from the active agent-directory profile.
+	const userScans = [
 		scanSkillsFromDir(ctx, {
-			dir: path.join(ctx.home, userAgentDir, "skills"),
+			dir: path.join(resolveUserAgentDir(ctx), "skills"),
 			providerId: PROVIDER_ID,
 			level: "user",
 			requireDescription: true,
 		}),
-	);
+	];
 
 	const results = await Promise.all([...projectScans, ...userScans]);
 
@@ -414,11 +412,9 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// turn so they keep hold across long conversations".
 	// User scope:    ~/.gjc/agent/RULES.md
 	// Project scope: nearest .gjc/RULES.md walking up from cwd to repoRoot
-	for (const userAgentDir of getUserAgentDirs()) {
-		const userRulesFile = path.join(ctx.home, userAgentDir, "RULES.md");
-		const userRule = await loadStickyRulesFile(userRulesFile, "user");
-		if (userRule) items.push(userRule);
-	}
+	const userRulesFile = path.join(resolveUserAgentDir(ctx), "RULES.md");
+	const userRule = await loadStickyRulesFile(userRulesFile, "user");
+	if (userRule) items.push(userRule);
 
 	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
 	if (nearestProjectConfigDir) {

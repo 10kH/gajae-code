@@ -24,6 +24,9 @@
 
 ### Fixed
 
+- User skill discovery now follows the active `agentDir` profile, matching MCP and customization writers instead of silently reading the default home-relative profile. The bundled `deep-interview` trigger no longer claims explicit third-party Ouroboros commands.
+
+
 - Fixed long skill-HUD entries corrupting bottom-pinned TUI row accounting by emitting at most two independent width-bounded rows and preserving severity glyphs through narrow truncation.
 
 - SDK `goal.list/get` no longer reports `resource_gone` when an in-flight session's live goal projection is temporarily unavailable. It recovers the latest authoritative goal mode state from the current session branch after runtime recreation or session replacement, while goal-less sessions return an explicit `no_active_goal` diagnostic instead of being confused with snapshot-store loss (#4824).
