@@ -160,6 +160,42 @@ describe("safe-cleanup verdict: filesystem-aware refusals (posix)", () => {
 		expect(refusalFor("/tmp/escape-link", world)).toBe("symlink-escape");
 	});
 
+	test("still refuses a target that remains present but unresolvable", () => {
+		const fake = baseFake();
+		// Present on every observation, realpath never succeeds: a symlink loop or
+		// an unreadable parent, which is a genuine escape risk.
+		const world = {
+			...makeWorld(fake),
+			existsSync: (): boolean => true,
+			realpathSync: (target: string): string => {
+				throw new Error(`ELOOP: ${target}`);
+			},
+		};
+		expect(refusalFor("/tmp/loop-link", world)).toBe("symlink-escape");
+	});
+
+	test("treats a target that vanishes between observation and resolution as absent", () => {
+		// A `<file>.lock` directory released by its owner mid-check used to abort
+		// the whole test process. It is gone, and a force removal of an absent
+		// path is a no-op, so the lexical verdict must stand.
+		const fake = baseFake();
+		let observations = 0;
+		const world = {
+			...makeWorld(fake),
+			existsSync: (): boolean => {
+				observations += 1;
+				return observations === 1;
+			},
+			realpathSync: (target: string): string => {
+				throw new Error(`ENOENT: ${target}`);
+			},
+		};
+		expect(approvalFor("/tmp/owned/index.jsonl.lock", world)).toEqual({
+			canonicalTarget: "/tmp/owned/index.jsonl.lock",
+			containedRoot: "/tmp",
+		});
+	});
+
 	test("refuses unowned components below the allowed root", () => {
 		const world = makeWorld(baseFake());
 		expect(refusalFor("/tmp/root-owned/child", world)).toBe("unowned-path");
