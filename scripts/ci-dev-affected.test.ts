@@ -1416,6 +1416,20 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"test:packages/coding-agent/test/agent-session-promotion-identity.test.ts",
 		);
 	});
+	test("lifecycle coverage stays targeted instead of selecting unrelated coding-agent shards", () => {
+		const tasks = targeted([
+			"packages/agent/src/agent.ts",
+			"packages/coding-agent/src/session/agent-session.ts",
+			"packages/coding-agent/src/sdk/host/session-runtime.ts",
+			"scripts/ci-dev-affected.ts",
+		]);
+		const codingAgentShards = tasks.map(task => task.key).filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(codingAgentShards).toEqual(["test:@gajae-code/coding-agent:shard-1-of-8"]);
+		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/agent-session-concurrent.test.ts");
+		expect(tasks.map(task => task.key)).toContain(
+			"test:packages/coding-agent/test/agent-session-promotion-identity.test.ts",
+		);
+	});
 	test("sdk-prefixed bus suites stay selected for their owning sources", () => {
 		const store = targeted(["packages/coding-agent/src/sdk/bus/reconciliation-store.ts"]);
 		expect(store.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-reconciliation-store.test.ts");
