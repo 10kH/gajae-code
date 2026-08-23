@@ -80,6 +80,7 @@ export interface SetupCommandArgs {
 		mpreset?: string;
 		noWorktree?: boolean;
 		worktreeName?: string;
+		requireWorktree?: boolean;
 		stateRoot?: string;
 		mutation?: string[];
 		artifactByteCap?: string;
@@ -120,6 +121,7 @@ const HERMES_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = [
 	"sessionCommand",
 	"noWorktree",
 	"worktreeName",
+	"requireWorktree",
 	"stateRoot",
 	"mutation",
 	"artifactByteCap",
@@ -219,6 +221,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.noWorktree = true;
 		} else if (arg === "--worktree-name") {
 			flags.worktreeName = args[++i];
+		} else if (arg === "--require-worktree") {
+			flags.requireWorktree = true;
 		} else if (arg === "--state-root") {
 			flags.stateRoot = args[++i];
 		} else if (arg === "--mutation") {

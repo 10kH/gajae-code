@@ -26,6 +26,7 @@ export interface HermesSetupFlags {
 	sessionCommand?: string;
 	noWorktree?: boolean;
 	worktreeName?: string;
+	requireWorktree?: boolean;
 	stateRoot?: string;
 	mutation?: string[];
 	artifactByteCap?: string;
@@ -53,6 +54,8 @@ export interface CoordinatorSetupSpec {
 	worktree: {
 		enabled: boolean;
 		name?: string;
+		/** Refuse a session creation that did not name its own worktree. */
+		required: boolean;
 	};
 	stateRoot?: string;
 	mutationPolicy: {
@@ -181,8 +184,16 @@ function resolveHermesWorktree(flags: HermesSetupFlags): CoordinatorSetupSpec["w
 	if (flags.noWorktree && flags.worktreeName) {
 		throw new HermesSetupError("Use either --no-worktree or --worktree-name, not both.", 2);
 	}
+	// Requiring a per-session worktree from a coordinator configured to run in
+	// place would refuse every session it ever creates.
+	if (flags.requireWorktree && flags.noWorktree) {
+		throw new HermesSetupError("--require-worktree cannot be combined with --no-worktree.", 2);
+	}
 	const name = normalizeWorktreeName(flags.worktreeName);
-	return flags.noWorktree ? { enabled: false } : { enabled: true, ...(name ? { name } : {}) };
+	const required = flags.requireWorktree === true;
+	return flags.noWorktree
+		? { enabled: false, required: false }
+		: { enabled: true, required, ...(name ? { name } : {}) };
 }
 
 function validateHermesSessionCommand(command: string): void {
@@ -215,7 +226,7 @@ function resolveHermesSessionCommand(flags: HermesSetupFlags): string {
 				2,
 			);
 		}
-		if (flags.noWorktree || flags.worktreeName) {
+		if (flags.noWorktree || flags.worktreeName || flags.requireWorktree) {
 			throw new HermesSetupError(
 				"Use either --session-command or Hermes worktree flags; explicit session commands are preserved exactly.",
 				2,
@@ -312,6 +323,7 @@ function renderHermesServerBlockWithoutSignature(spec: CoordinatorSetupSpec): Re
 		env.GJC_COORDINATOR_MCP_MUTATIONS = spec.mutationPolicy.classes.join(",");
 	if (spec.artifactByteCap !== undefined) env.GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP = String(spec.artifactByteCap);
 	if (spec.sessionCommand) env.GJC_COORDINATOR_MCP_SESSION_COMMAND = spec.sessionCommand;
+	if (spec.worktree.required) env.GJC_COORDINATOR_MCP_REQUIRE_WORKTREE = "true";
 	return {
 		command: spec.gjcCommand,
 		args: spec.args,

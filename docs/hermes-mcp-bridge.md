@@ -84,7 +84,17 @@ Every mutating MCP call that requires a caller key must include `allow_mutation:
 export GJC_COORDINATOR_MCP_SESSION_COMMAND="gjc --worktree"
 ```
 
-The only supported values are `gjc` and `gjc --worktree [name]`; this variable is never evaluated as a shell command. The coordinator binds registration, reuse, and control to the broker's exact canonical workspace and endpoint generation, then discovers the generation-bound SDK endpoint internally. Endpoint credentials are never persisted in coordinator records or returned by coordinator tools. `gjc_coordinator_read_coordination_status` returns a canonical polling snapshot for public session, state, turn, question, report, and bounded event data. Tmux identifiers, when supplied while registering an existing session, are advisory process metadata only; they do not provide control authority, machine viewing, startup, prompt injection, or determine turn completion.
+The only supported values are `gjc` and `gjc --worktree [name]`; this variable is never evaluated as a shell command.
+
+The configured name is a default, not a per-task assignment. `gjc_coordinator_start_session`, `gjc_delegate_plan`, and `gjc_delegate_execute` accept a `worktree` argument that names this session's worktree and branch, which is what lets concurrent sessions in one repository get isolated checkouts. Omitting it falls back to the one worktree derived from the repository's current branch, and a second session that resolves to an occupied worktree is refused with `worktree_in_use` rather than silently sharing the checkout.
+
+To make that isolation policy instead of caller discipline, set:
+
+```bash
+export GJC_COORDINATOR_MCP_REQUIRE_WORKTREE=true
+```
+
+A creation that did not name a worktree then fails with `worktree_required`. Session reuse through `session_id` creates no worktree and is unaffected. `gjc setup hermes --require-worktree` renders this alongside the worktree selector. The coordinator binds registration, reuse, and control to the broker's exact canonical workspace and endpoint generation, then discovers the generation-bound SDK endpoint internally. Endpoint credentials are never persisted in coordinator records or returned by coordinator tools. `gjc_coordinator_read_coordination_status` returns a canonical polling snapshot for public session, state, turn, question, report, and bounded event data. Tmux identifiers, when supplied while registering an existing session, are advisory process metadata only; they do not provide control authority, machine viewing, startup, prompt injection, or determine turn completion.
 
 For resume safety, prefer the generated GJC-native worktree selector over creating a git worktree in Hermes itself. GJC's launch path records the original repo as the project identity while running in the worktree, so session listing/resume can still group the session under the source project. If Hermes creates and later deletes an unmanaged worktree, a saved session may still exist but its cwd can be gone.
 
