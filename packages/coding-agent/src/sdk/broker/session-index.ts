@@ -43,6 +43,10 @@ export interface RetentionPolicy {
 	maxRows?: number;
 	tombstoneRule?: SessionTombstoneRule;
 }
+export interface SessionIndexObservationDeps {
+	/** Test seam for the exact post-replay process-incarnation observation. */
+	processIncarnation?: (pid: number) => string | undefined;
+}
 export interface SessionIndexEvent {
 	version: typeof SDK_STATE_VERSION;
 	indexSeq: number;
@@ -908,6 +912,7 @@ export class SessionIndex {
 	static #openGroups = new Map<string, SessionIndexOpenGroup>();
 	#agentDir: string;
 	#policy: ResolvedRetentionPolicy;
+	#observationDeps: SessionIndexObservationDeps;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
 	#logOffset = 0;
@@ -919,9 +924,10 @@ export class SessionIndex {
 	#changeStamp: SessionIndexChangeStamp | undefined;
 	/** indexSeqs already recorded in the durable audit; null until lazily seeded. */
 	#auditedSeq: Set<number> | null = null;
-	constructor(agentDir: string, policy: RetentionPolicy = {}) {
+	constructor(agentDir: string, policy: RetentionPolicy = {}, observationDeps: SessionIndexObservationDeps = {}) {
 		this.#agentDir = agentDir;
 		this.#policy = resolvePolicy(policy);
+		this.#observationDeps = observationDeps;
 	}
 	static #enqueue<T>(indexPath: string, operation: () => Promise<T>): Promise<T> {
 		const previous = SessionIndex.#operations.get(indexPath) ?? Promise.resolve();
@@ -1575,28 +1581,26 @@ export class SessionIndex {
 	 * ambiguous, reused, corrupt, or merely non-live state remains unknown.
 	 */
 	async generationStatus(sessionId: string, endpointGeneration: number): Promise<SessionGenerationIndexStatus> {
-		const probed = new Map<string, string | undefined>();
-		for (const event of this.#events) {
-			if (event.type !== "host_registered") continue;
-			const recordedIncarnation = event.hostIncarnation ?? event.processIncarnation;
-			if (recordedIncarnation === undefined || !alive(event.pid)) continue;
-			probed.set(
-				`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}`,
-				processIncarnation(event.pid),
-			);
-		}
-		const probedAt = performance.now();
 		const indexPath = path.resolve(logFor(this.#agentDir));
 		return await SessionIndex.#enqueue(indexPath, () =>
 			withSessionIndexLock("generation reconciliation", this.#agentDir, async () => {
-				const freshAtAcquisition = performance.now() - probedAt <= SESSION_INDEX_PROBE_FRESHNESS_MS;
 				await this.#replayUnderLock();
-				const freshAfterReplay = performance.now() - probedAt <= SESSION_INDEX_REPLAY_FRESHNESS_MS;
-				return this.#generationStatusFromEvents(
-					sessionId,
-					endpointGeneration,
-					freshAtAcquisition && freshAfterReplay ? probed : new Map(),
-				);
+				// Exact proof cannot reuse an incarnation observed before lock
+				// acquisition: the process can exit and its PID can be reused while
+				// replay awaits. Re-observe this session's registrations only after the
+				// locked replay, then classify against that same coherent index cut.
+				const probed = new Map<string, string | undefined>();
+				const observeIncarnation = this.#observationDeps.processIncarnation ?? processIncarnation;
+				for (const event of this.#events) {
+					if (event.type !== "host_registered" || event.sessionId !== sessionId) continue;
+					const recordedIncarnation = event.hostIncarnation ?? event.processIncarnation;
+					if (recordedIncarnation === undefined) continue;
+					probed.set(
+						`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}`,
+						observeIncarnation(event.pid),
+					);
+				}
+				return this.#generationStatusFromEvents(sessionId, endpointGeneration, probed);
 			}),
 		);
 	}

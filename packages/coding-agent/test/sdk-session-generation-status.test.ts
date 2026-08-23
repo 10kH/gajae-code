@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SessionRouter } from "../src/sdk/router";
@@ -11,7 +12,7 @@ afterEach(async () => {
 });
 
 async function fixture(policy: ConstructorParameters<typeof SessionIndex>[1] = {}) {
-	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-generation-status-"));
+	const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-status-"));
 	tempDirs.push(agentDir);
 	const index = await new SessionIndex(agentDir, policy).open();
 	const router = new SessionRouter({ agentDir, deps: { createIndex: () => index } });
@@ -182,6 +183,24 @@ describe("SessionRouter exact generation status", () => {
 			status: "unknown",
 			reason: "ambiguous_authority",
 			evidence: { source: "session_index", observedIndexSeq: 2 },
+		});
+	});
+
+	test("revalidates process incarnation after replay before reporting current", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-pid-reuse-"));
+		tempDirs.push(agentDir);
+		const locator = { repo: agentDir, stateRoot: path.join(agentDir, ".gjc", "state") };
+		let observedIncarnation = "linux:100";
+		const index = await new SessionIndex(agentDir, {}, { processIncarnation: () => observedIncarnation }).open();
+		await register(index, locator, "pid-reuse-session", 6, { hostIncarnation: "linux:100" });
+		const router = new SessionRouter({ agentDir, deps: { createIndex: () => index } });
+
+		expect((await router.generationStatus("pid-reuse-session", 6)).status).toBe("current");
+		observedIncarnation = "linux:200";
+		expect(await router.generationStatus("pid-reuse-session", 6)).toEqual({
+			status: "unknown",
+			reason: "reconciliation_incomplete",
+			evidence: { source: "session_index", observedIndexSeq: 1 },
 		});
 	});
 
