@@ -1505,8 +1505,10 @@ function createControlSurface(
 	configRevision: { current: number } = { current: 0 },
 	getRuntimeHost: () => SessionSdkHost | undefined = () => undefined,
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams,
-	terminalPublicationCapture?: { resolvers?: Array<(observed: boolean) => void> },
-	activePromptOwnerHolder?: { connectionIds?: ReadonlySet<string> },
+	terminalPublicationCapture?: {
+		waiters?: Array<{ epoch: number; resolve: (observed: boolean) => void }>;
+	},
+	activePromptOwnerHolder?: { connectionIds?: ReadonlySet<string>; lifecycleEpoch?: number },
 	retirePendingOwner?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -1577,7 +1579,7 @@ function createControlSurface(
 	// runtime extension so agent_end clears it: a stale owner must not
 	// authorize its old client against a later turn it did not submit (review
 	// thread P1).
-	const activePromptOwner = activePromptOwnerHolder ?? { connectionIds: new Set<string>() };
+	const activePromptOwner = activePromptOwnerHolder ?? { connectionIds: new Set<string>(), lifecycleEpoch: 0 };
 	const currentRequesterPreflights = (): Set<() => void> => {
 		const key = sdkControlRequesterContext.getStore() ?? "";
 		let pending = pendingPreflights.get(key);
@@ -2572,14 +2574,17 @@ function createControlSurface(
 			// false negative (review thread P2).
 			const terminalPublication = Promise.withResolvers<boolean>();
 			const removeTerminalPublicationWaiter = () => {
-				const resolvers = terminalPublicationCapture?.resolvers;
-				if (!resolvers) return;
-				const index = resolvers.indexOf(terminalPublication.resolve);
-				if (index >= 0) resolvers.splice(index, 1);
+				const waiters = terminalPublicationCapture?.waiters;
+				if (!waiters) return;
+				const index = waiters.findIndex(waiter => waiter.resolve === terminalPublication.resolve);
+				if (index >= 0) waiters.splice(index, 1);
 			};
 			if (terminalPublicationCapture) {
-				if (!terminalPublicationCapture.resolvers) terminalPublicationCapture.resolvers = [];
-				terminalPublicationCapture.resolvers.push(terminalPublication.resolve);
+				if (!terminalPublicationCapture.waiters) terminalPublicationCapture.waiters = [];
+				terminalPublicationCapture.waiters.push({
+					epoch: activePromptOwner.lifecycleEpoch ?? 0,
+					resolve: terminalPublication.resolve,
+				});
 			}
 			let proof: { status: string; terminalScope?: unknown };
 			try {
@@ -3049,13 +3054,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// observing it (review thread P2). Single slot: only the abort that
 	// reaches the stopped path awaits it; a concurrent abort for the same turn
 	// is settled by the durable marker transaction instead.
-	const terminalPublicationCapture: { resolvers?: Array<(observed: boolean) => void> } = {};
+	const terminalPublicationCapture: {
+		waiters?: Array<{ epoch: number; resolve: (observed: boolean) => void }>;
+	} = {};
 	// Shared with the control surface: the SDK connection owning the currently
 	// active prompt/skill turn. Cleared at every agent_end (terminal lifecycle
 	// boundary) so a stale owner never authorizes an abort against a later
 	// turn it did not submit, and never set for agent-initiated turns (review
 	// thread P1).
-	const activePromptOwnerHolder: { connectionIds?: Set<string> } = {};
+	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
 	const skillTerminalRecoveryKeys = new Set<string>();
 	const emitLifecycle = async (
 		type: "agent_start" | "agent_end" | "agent_failed",
@@ -3120,6 +3127,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			transitions = [...fallback, ...attached].map(({ kind, correlation }) => ({ kind, correlation }));
 		} else if (type === "agent_start") {
 			current.lifecycleEpoch += 1;
+			activePromptOwnerHolder.lifecycleEpoch = current.lifecycleEpoch;
 			// Mark lifecycle active even when the drain is empty: a monitor/cron
 			// run started by the session has no SDK pending entry but is still a
 			// real active run that later in-run promotions must attach to instead
@@ -3169,6 +3177,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			];
 		}
 		const eventLifecycleEpoch = current.lifecycleEpoch;
+		const resolveTerminalPublicationWaiters = (observed: boolean): void => {
+			const waiters = terminalPublicationCapture.waiters;
+			if (!waiters) return;
+			const matched = waiters.filter(waiter => waiter.epoch === eventLifecycleEpoch);
+			const remaining = waiters.filter(waiter => waiter.epoch !== eventLifecycleEpoch);
+			terminalPublicationCapture.waiters = remaining.length === 0 ? undefined : remaining;
+			for (const waiter of matched) waiter.resolve(observed);
+		};
 		const retireEndedLifecycleBatch = (): void => {
 			const ended = current.openLifecycleBatches[0];
 			if (!ended) return;
@@ -3241,9 +3257,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			} catch {
 				// Maintenance checkpoints are non-terminal lifecycle observations.
 			}
-			const resolvers = terminalPublicationCapture.resolvers;
-			terminalPublicationCapture.resolvers = undefined;
-			for (const resolve of resolvers ?? []) resolve(true);
 			return;
 		}
 		// Observe whether the lifecycle publication actually landed: a terminal
@@ -3345,9 +3358,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// and the next agent_end is paired with stale ownership.
 				for (const invocation of failedTransitions) scheduleSkillTerminalRecovery(invocation);
 				retireEndedLifecycleBatch();
-				const resolvers = terminalPublicationCapture.resolvers;
-				terminalPublicationCapture.resolvers = undefined;
-				for (const resolve of resolvers ?? []) resolve(observed);
+				resolveTerminalPublicationWaiters(observed);
 				return;
 			}
 			if (failedTransitions.length > 0) {
@@ -3359,9 +3370,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.activeInvocation = failedTransitions[0];
 				current.drainedInvocations = failedTransitions;
 				for (const invocation of failedTransitions) scheduleSkillTerminalRecovery(invocation);
-				const resolvers = terminalPublicationCapture.resolvers;
-				terminalPublicationCapture.resolvers = undefined;
-				for (const resolve of resolvers ?? []) resolve(observed);
+				resolveTerminalPublicationWaiters(observed);
 				return;
 			}
 			if (current.openLifecycleBatches.length > 0) current.openLifecycleBatches.shift();
@@ -3373,9 +3382,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			// exactly one agent_end, and each admitted abort of it must observe the
 			// same publication result rather than a single latest-wins slot (review
 			// thread P2).
-			const resolvers = terminalPublicationCapture.resolvers;
-			terminalPublicationCapture.resolvers = undefined;
-			for (const resolve of resolvers ?? []) resolve(observed);
+			resolveTerminalPublicationWaiters(observed);
 		}
 	};
 	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
