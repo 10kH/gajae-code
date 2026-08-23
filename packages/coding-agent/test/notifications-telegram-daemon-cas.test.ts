@@ -100,6 +100,22 @@ test("machine identity secret creation falls back when hard links are unavailabl
 	);
 });
 
+test("machine identity refuses a symlinked installation secret", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-machine-identity-"));
+	temporaryDirectories.push(directory);
+	const target = path.join(directory, "target");
+	fs.writeFileSync(target, "11".repeat(32));
+	fs.symlinkSync(target, path.join(directory, "machine-identity.secret"));
+
+	await expect(
+		loadInstallationHostId({
+			platform: "linux",
+			configRootDir: directory,
+			readFile: async () => "00112233445566778899aabbccddeeff\n",
+		}),
+	).rejects.toThrow("not a regular file");
+});
+
 test("filesystem topic authority bootstraps, serializes competing hosts, and survives restart", async () => {
 	const { authority: first, file } = authority();
 	const second = new FilesystemTopicRegistryCasAuthority(file, {

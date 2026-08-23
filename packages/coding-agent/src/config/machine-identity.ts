@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getConfigRootDir } from "@gajae-code/utils";
@@ -39,10 +40,24 @@ async function loadInstallationSecret(deps: MachineIdentityDeps): Promise<string
 	const file = path.join(directory, "machine-identity.secret");
 	const link = deps.link ?? fs.link;
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	await fs.chmod(directory, 0o700);
 	let unsettledReads = 0;
 	for (;;) {
 		try {
-			const secret = (await fs.readFile(file, "utf8")).trim();
+			const before = await fs.lstat(file);
+			if (!before.isFile() || before.isSymbolicLink())
+				throw new Error(`installation identity secret is not a regular file at ${file}`);
+			const handle = await fs.open(file, fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0));
+			let secret: string;
+			try {
+				const stat = await handle.stat();
+				if (!stat.isFile() || stat.dev !== before.dev || stat.ino !== before.ino)
+					throw new Error(`installation identity secret changed while opening at ${file}`);
+				await handle.chmod(0o600);
+				secret = (await handle.readFile("utf8")).trim();
+			} finally {
+				await handle.close();
+			}
 			if (/^[0-9a-f]{64}$/.test(secret)) return secret;
 			if (unsettledReads++ < 4) {
 				await Bun.sleep(10);
