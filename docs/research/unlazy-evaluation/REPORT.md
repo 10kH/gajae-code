@@ -3,12 +3,12 @@
 - **Issue:** #4844
 - **Source request:** Discord playground-ko message 1540980632572788817
 - **Verdict receipt:** `f76e2db6-fbf3-4e74-a17e-a9b2f2fa95b8` (autoresearch ledger, this session)
-- **Scope:** research only. No product code, dependency, manifest, or benchmark binary was changed. Nothing from the external repository was executed or copied into product code; MIT-licensed upstream text is quoted under fair review with attribution, and verbatim snapshots are kept in `snapshots/` as evidence pins.
-- **External project state when inspected:** `Leonxlnx/unlazy`, branch `main`, `pushedAt 2026-08-23T04:51:20Z`, no release tags, ~1.1k stars, MIT. The v1 method also exists on the `v1` branch. Both were inspected read-only via the GitHub API.
+- **Scope:** research only. No product code, dependency, manifest, or benchmark binary was changed. Nothing from the external repository was executed or copied into product code. Verbatim upstream snapshots are retained for review with attribution under the upstream MIT license, and their local integrity is covered by `MANIFEST.sha256`.
+- **External project state when inspected:** `Leonxlnx/unlazy`, branch `main`, `pushedAt 2026-08-23T04:51:20Z`, no release tags, 1,135 stars at capture, MIT. The v1 method also exists on the `v1` branch. Both were inspected read-only via the GitHub API and pinned to main commit `754d9a68109e39b836cc72a39fb9a823f9d6b613`, v1 commit `baf39ef9b6e71077fa6056bcf8715e09fe6d7462`, and upstream `LICENSE` blob `48a2f6640b81ff8eca9ce7f6a96337692713ef5b`.
 
 ## Executive summary
 
-**Do not adopt the unlazy depth-tree method. Adopt two narrow ideas from it.**
+**Reject the unlazy depth-tree method. Propose two narrow ideas for separate product decisions.**
 
 The Discord request asks about "the depth-tree method" that "splits a task N layers deep and gives every leaf the full time budget of the whole task, so effort multiplies with depth." That claim is the **v1 (2026-08-09) version of unlazy**, and the project's own current documentation **explicitly retracts it**:
 
@@ -73,11 +73,11 @@ unlazy v2's enforcement stack:
 
 Research conclusions only — each item below names a *candidate*, not an approved change. Any actual adoption is a separate, explicitly proposed product decision (see "Proposal boundary").
 
-### R1 — Adopt: bounded no-progress release for the GJC skill stop-hook block
+### R1 — Candidate for separate decision: bounded no-progress release for the GJC skill stop-hook block
 
 Add an unlazy-style escape hatch to `buildSkillStopOutput` (`packages/coding-agent/src/hooks/skill-state.ts`): when the same active-workflow stop block fires N consecutive times with no durable-state progress (ledger append, checkpoint, state-write), release the block with an operator-visible message instead of blocking forever. Upstream evidence: `stop-hook.mjs` `MAX_BLOCKS = 6`, session-keyed, content-hash progress detection, release message that still names the outstanding items. This is small, mechanical, fail-open-at-the-edge, and addresses a real wedged-session mode GJC currently resolves only through operator intervention. Prerequisite: define "progress" against GJC's durable artifacts (`ledger.jsonl` appends, mode-state mtime/content) rather than unlazy's ledger text hash.
 
-### R2 — Adopt (as guidance, not machinery): gate-authoring rules
+### R2 — Candidate for separate decision (guidance, not machinery): gate-authoring rules
 
 Two authoring rules from `references/gates.md:95-100` are cheap to fold into existing GJC gate/verification guidance (ultragoal quality-gate docs, `docs/` verification guidance) without any runtime change:
 
@@ -110,7 +110,7 @@ Any change above requires a separate maintainer-approved product decision with i
 
 ## Method and evidence integrity
 
-- All external-repository evidence was captured read-only via the GitHub REST API on 2026-08-23 into `snapshots/` (17 files, including both `main` and `v1` variants of SKILL/README). No unlazy script was executed at any point.
-- Claim verification harness: `autoresearch.sh` (kept in `.gjc` retired mission state; reproduced in this PR's review evidence) — 10 claims (5 external, 5 GJC-side), exit 0, deterministic output across repeated runs.
+- All external-repository evidence was captured read-only via the GitHub REST API on 2026-08-23 into `snapshots/` (17 files, including both `main` and `v1` variants of SKILL/README plus the security policy cited in F2). No unlazy script was executed at any point. The bundle intentionally omits the upstream changelog because it is not evidence for a report claim; the remaining snapshots cover every quoted or behavior-critical source.
+- The prior autoresearch session receipt reports a claim-verification harness (`autoresearch.sh`) covering 10 claims (5 external, 5 GJC-side) with deterministic exit-0 output. That retired harness is not part of this PR or the current checkout, so this review treats the receipt as provenance rather than independently reproducible evidence.
 - GJC-side citations are to `packages/coding-agent/src/hooks/skill-state.ts`, `packages/coding-agent/src/hooks/events.ts`, `packages/coding-agent/src/gjc-runtime/autoresearch-runtime.ts`, `packages/coding-agent/src/defaults/gjc/skills/{ultragoal,ralplan,deep-interview,autoresearch}/SKILL.md`, and `AGENTS.md` at base `d06a42e53a9d6363d152a88c8168b5d6b2ab345e`.
-- **Limitations:** no live benchmark of the depth-tree method against GJC workloads was run — the multiplication claim is rejected on upstream's own retraction plus internal-consistency grounds, not new measurements, which matches the request's research-only boundary. unlazy has no tagged releases, so findings are pinned to the inspected commit state rather than a version.
+- **Limitations:** no live benchmark of the depth-tree method against GJC workloads was run — the multiplication claim is rejected on upstream's own retraction plus internal-consistency grounds, not new measurements, which matches the request's research-only boundary. unlazy has no tagged releases, so findings are pinned to the inspected commit SHAs rather than a version.

@@ -1,12 +1,12 @@
 # Evidence manifest — issue #4844 unlazy evaluation
-# External snapshots captured read-only via GitHub API on 2026-08-23 from Leonxlnx/unlazy (main, pushedAt 2026-08-23T04:51:20Z) and its v1 branch.
-e094fbb75c0644490da341dc10b4764c6c7ac85527d20ec9185b72c857c7c610  REPORT.md
-a7a326f3b3ad5a90273e4f9875fd8c0e29f082a8fcd440d7fbe24fb8f4ceee2f  snapshots/unlazy-CHANGELOG.md.snapshot
+# External snapshots captured read-only via GitHub API on 2026-08-23 from Leonxlnx/unlazy: main commit 754d9a68109e39b836cc72a39fb9a823f9d6b613 (pushedAt 2026-08-23T04:51:20Z), v1 commit baf39ef9b6e71077fa6056bcf8715e09fe6d7462, LICENSE blob 48a2f6640b81ff8eca9ce7f6a96337692713ef5b.
+e70e5c4c3d3bba93a1bd545b1032be7173b01d13ddb06d93acf677a777e4ad40  REPORT.md
 08bb848539aa94305357443f315b8e2e5288d12ed311019d3f1fb721c0ff81d9  snapshots/unlazy-PLAN.md.snapshot
 97998d95e2e775fcbe97fd82f26b5be85eeb4b0cbbe62d3864022b50d4bb8e5c  snapshots/unlazy-README-v1.md.snapshot
 2ae4b9865ff61585d7603fe2dd1f983836690957c93d91c6c15e48dbd2e4a32a  snapshots/unlazy-README-v2.md.snapshot
 38b67d3a90fc32307fcfdde1cef06e889a754493b49d29bc9d6dd0886e9842c0  snapshots/unlazy-SKILL-v1.md.snapshot
 1c3ebe9ef610d8c4ce56fc948f9e94b811e1d36b3dc243c66d4f59636e182005  snapshots/unlazy-SKILL.md.snapshot
+764d02f0e6aeb10bbc2391adb93d860b39ef26587d9eb7ee416d9227e532400d  snapshots/unlazy-SECURITY.md.snapshot
 b283dd60f0b4e03a8f7280539ca01ebf0d08fe416bfb2d76035de2ec73ef3358  snapshots/unlazy-gate-check.mjs.snapshot
 9dc8d77bc10846201c693bdc54236dae9b31640e1a4b877535477d1429617d5c  snapshots/unlazy-gates-leaf.md.snapshot
 fbc060f2187fdf74d2761186c53e20d9f5cbebebfa58745c86f6b4a61c39d4eb  snapshots/unlazy-gates-node.md.snapshot
