@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { postmortem } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
+import { loadInstallationHostId } from "../src/config/machine-identity";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
 import {
 	canonicalCoordinatorSidecarPayload,
@@ -1969,7 +1970,12 @@ describe("coordinator runtime state sidecar", () => {
 		await fs.mkdir(`${stateFile}.lock`);
 		await Bun.write(
 			`${stateFile}.lock/info`,
-			JSON.stringify({ pid: 999_999_999, start_time: "0", timestamp: Date.now() }),
+			JSON.stringify({
+				pid: 999_999_999,
+				start_time: "0",
+				timestamp: Date.now() - 60_000,
+				owner_host_id: await loadInstallationHostId(),
+			}),
 		);
 		await persistCoordinatorRuntimeStateFromEvent(assistantEnd("completed"), {
 			sessionId: "orphaned-runtime-lock",
@@ -1977,7 +1983,7 @@ describe("coordinator runtime state sidecar", () => {
 			sessionFile: null,
 		});
 		expect((await readPayload(stateFile)).state).toBe("completed");
-		expect(await Bun.file(`${stateFile}.lock`).exists()).toBe(false);
+		expect(await readJson(`${stateFile}.lock`)).toMatchObject({ pid: 1, released: true });
 	});
 
 	it("publishes one byte-stable immutable verdict when raw and sidecar observers race", async () => {
