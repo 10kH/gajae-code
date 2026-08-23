@@ -888,6 +888,17 @@ function toolSchema(name: CoordinatorToolName): {
 			},
 		};
 	}
+	if (name === "gjc_coordinator_list_sessions") {
+		return {
+			name,
+			description:
+				"Enumerate GJC sessions discovered on the broker under the allowed roots. Each entry reports " +
+				"`registered`: only sessions with `registered: true` can be used with the other coordinator " +
+				"tools. Calling read_status, read_tail, send_prompt, or stop_session on an entry with " +
+				"`registered: false` returns not_found; register it with gjc_coordinator_register_session first.",
+			inputSchema: common,
+		};
+	}
 	return { name, description: "List known scoped GJC coordinator bridge sessions.", inputSchema: common };
 }
 
@@ -5341,6 +5352,21 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 	function sessionFile(sessionId: unknown): string {
 		return path.join(namespaceDir, "sessions", `${safeExternalId("session", sessionId)}.json`);
 	}
+	/**
+	 * True when the session has a durable coordinator projection, i.e. when tools
+	 * other than list_sessions can resolve it. A broker session that was never
+	 * registered answers false instead of throwing, so listing stays total.
+	 */
+	async function isRegisteredSession(sessionId: unknown): Promise<boolean> {
+		if (typeof sessionId !== "string" || sessionId.length === 0) return false;
+		let file: string;
+		try {
+			file = sessionFile(sessionId);
+		} catch {
+			return false;
+		}
+		return asRecord(await readJsonFile(file)) !== null;
+	}
 	async function removeReapedProjection(
 		sessionId: string,
 		turnIds: readonly string[],
@@ -7088,8 +7114,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 
 	async function callTool(name: string, args: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
 		try {
-			if (name === "gjc_coordinator_list_sessions")
-				return { ok: true, sessions: (await listSessions()).map(publicBrokerSession) };
+			if (name === "gjc_coordinator_list_sessions") {
+				// listSessions() enumerates the broker across allowed roots, but every other
+				// coordinator tool resolves a session through its durable projection. Without
+				// an explicit marker a controller cannot tell the two apart and burns a
+				// not_found round-trip per unregistered session, which trips client-side
+				// consecutive-failure breakers. Publish registration as first-class state.
+				const sessions = await Promise.all(
+					(await listSessions()).map(async session => {
+						const view = publicBrokerSession(session);
+						return { ...view, registered: await isRegisteredSession(view.session_id) };
+					}),
+				);
+				return { ok: true, sessions };
+			}
 			if (name === "gjc_coordinator_register_session") {
 				requireCoordinatorMutation(config, "sessions", args);
 				const idempotencyKey = requiredIdempotencyKey(args);
