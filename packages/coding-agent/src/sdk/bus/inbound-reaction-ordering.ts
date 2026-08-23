@@ -32,6 +32,8 @@ export const INBOUND_REACTION_TOMBSTONE_WINDOW = 512;
 export class InboundReactionSequencer {
 	/** Update ids whose reaction reached a terminal (consumed/retracted) state. */
 	readonly #terminal = new Map<number, true>();
+	/** Highest terminal update id observed, independent of effect completion order. */
+	#newestTerminalId: number | undefined;
 	/** Per-update serialization chain, deleted once settled. */
 	readonly #chains = new Map<number, Promise<void>>();
 
@@ -50,7 +52,8 @@ export class InboundReactionSequencer {
 			await transition.effect();
 			if (transition.terminal) {
 				this.#terminal.set(updateId, true);
-				this.#evictStaleTombstones(updateId);
+				this.#newestTerminalId = Math.max(this.#newestTerminalId ?? updateId, updateId);
+				this.#evictStaleTombstones(this.#newestTerminalId);
 			}
 		};
 		const prior = this.#chains.get(updateId) ?? Promise.resolve();

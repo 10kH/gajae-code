@@ -189,6 +189,20 @@ describe("inbound reaction transition ordering", () => {
 		expect(sequencer.debugChainCount()).toBe(0);
 	});
 
+	test("terminal tombstones stay bounded when effects complete in descending update order", async () => {
+		const sequencer = new InboundReactionSequencer();
+		const newest = INBOUND_REACTION_TOMBSTONE_WINDOW * 3;
+		await sequencer.apply(newest, { terminal: true, effect: async () => undefined });
+		for (let updateId = newest - 1; updateId >= 1; updateId--) {
+			await sequencer.apply(updateId, { terminal: true, effect: async () => undefined });
+		}
+
+		expect(sequencer.isTerminal(newest)).toBe(true);
+		expect(sequencer.isTerminal(1)).toBe(false);
+		expect(sequencer.debugTombstoneCount()).toBeLessThanOrEqual(INBOUND_REACTION_TOMBSTONE_WINDOW);
+		expect(sequencer.debugChainCount()).toBe(0);
+	});
+
 	test("an earlier transition settling mid-chain never unserializes a later one", async () => {
 		const sequencer = new InboundReactionSequencer();
 		const order: string[] = [];
