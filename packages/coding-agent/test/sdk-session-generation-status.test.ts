@@ -82,25 +82,36 @@ describe("SessionRouter exact generation status", () => {
 		const { index, locator, router } = await fixture();
 		await register(index, locator, "closed-session", 3);
 		await retire(index, locator, "closed-session", 3, "host_unregistered");
-		await register(index, locator, "deleted-session", 4);
-		await retire(index, locator, "deleted-session", 4, "session_deleted");
+		await register(index, locator, "lifecycle-closed-session", 4);
+		await retire(index, locator, "lifecycle-closed-session", 4, "session_closed");
+		await register(index, locator, "deleted-session", 5);
+		await retire(index, locator, "deleted-session", 5, "session_deleted");
 		await router.stop();
 
 		expect(await router.generationStatus("closed-session", 3)).toEqual({
 			status: "retired",
 			evidence: {
 				source: "session_index",
-				observedIndexSeq: 4,
+				observedIndexSeq: 6,
 				evidenceIndexSeq: 2,
 				event: "host_unregistered",
 			},
 		});
-		expect(await router.generationStatus("deleted-session", 4)).toEqual({
+		expect(await router.generationStatus("lifecycle-closed-session", 4)).toEqual({
 			status: "retired",
 			evidence: {
 				source: "session_index",
-				observedIndexSeq: 4,
+				observedIndexSeq: 6,
 				evidenceIndexSeq: 4,
+				event: "session_closed",
+			},
+		});
+		expect(await router.generationStatus("deleted-session", 5)).toEqual({
+			status: "retired",
+			evidence: {
+				source: "session_index",
+				observedIndexSeq: 6,
+				evidenceIndexSeq: 6,
 				event: "session_deleted",
 			},
 		});
