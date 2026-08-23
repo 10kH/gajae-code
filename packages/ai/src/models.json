@@ -17174,7 +17174,7 @@
 			"api": "openai-completions",
 			"provider": "groq",
 			"baseUrl": "https://api.groq.com/openai/v1",
-			"reasoning": true,
+			"reasoning": false,
 			"input": [
 				"text"
 			],
@@ -17185,12 +17185,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192,
-			"thinking": {
-				"mode": "effort",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
-			}
+			"maxTokens": 8192
 		},
 		"groq/compound-mini": {
 			"id": "groq/compound-mini",
@@ -17198,7 +17193,7 @@
 			"api": "openai-completions",
 			"provider": "groq",
 			"baseUrl": "https://api.groq.com/openai/v1",
-			"reasoning": true,
+			"reasoning": false,
 			"input": [
 				"text"
 			],
@@ -17209,12 +17204,7 @@
 				"cacheWrite": 0
 			},
 			"contextWindow": 131072,
-			"maxTokens": 8192,
-			"thinking": {
-				"mode": "effort",
-				"minLevel": "minimal",
-				"maxLevel": "xhigh"
-			}
+			"maxTokens": 8192
 		},
 		"llama-3.1-8b-instant": {
 			"id": "llama-3.1-8b-instant",

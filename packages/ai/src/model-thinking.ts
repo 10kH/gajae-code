@@ -495,6 +495,14 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 			levels: [Effort.Low, Effort.High, Effort.Max],
 		};
 	}
+	// Groq's agentic `compound` systems reject `reasoning_effort` outright
+	// (400 "`reasoning_effort` is not supported with this model", verified
+	// 2026-08-23), yet models.dev advertises them as reasoning models. Drop the
+	// thinking config so GJC never sends the field.
+	if (model.provider === "groq" && (model.id === "groq/compound" || model.id === "groq/compound-mini")) {
+		model.reasoning = false;
+		delete model.thinking;
+	}
 	// Ox Alpha (OpenRouter stealth preview) always thinks and exposes only
 	// low/high/max reasoning_effort. Measured against the live endpoint on
 	// 2026-08-23: every effort value returns 200, but only `max` (or omitting
