@@ -979,7 +979,12 @@ export class Broker {
 		let response: BrokerResponse | undefined;
 		let retainedOwner = false;
 		try {
-			const verified = await this.verifyMasterCapability(admission.ownerSessionId, admission.masterCapability);
+			let verified: { allowed: boolean };
+			try {
+				verified = await this.verifyMasterCapability(admission.ownerSessionId, admission.masterCapability);
+			} finally {
+				admission.masterCapability = "";
+			}
 			if (!verified.allowed) return (response = error("spawn_failed", "master capability verification was denied"));
 			const key = await getBrokerIdentityKey(this.settings.agentDir);
 			const bindingMac = createHmac("sha256", Buffer.from(key, "hex"))
@@ -1003,9 +1008,11 @@ export class Broker {
 			return (response = error("spawn_failed", "session.spawn admission could not be durably established"));
 		} finally {
 			completion.resolve(response ?? error("spawn_failed", "session.spawn admission failed"));
-			this.#spawnTasks.delete(inFlight);
-			this.#spawnInFlight.delete(lifecycleIdentity);
-			if (!retainedOwner) await this.#spawnAuthority?.releaseOwner(lifecycleIdentity);
+			if (!retainedOwner) {
+				this.#spawnTasks.delete(inFlight);
+				this.#spawnInFlight.delete(lifecycleIdentity);
+				await this.#spawnAuthority?.releaseOwner(lifecycleIdentity);
+			}
 		}
 	}
 	runStartup<T>(
