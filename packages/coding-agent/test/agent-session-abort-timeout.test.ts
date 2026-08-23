@@ -393,6 +393,80 @@ describe("AgentSession abort timeout", () => {
 		}
 	});
 
+	it("recovers when the provider event stream itself never settles after abort", async () => {
+		tempDir = TempDir.createSync("@gjc-abort-wedged-provider-stream-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		const mock = createMockModel();
+		authStorage.setRuntimeApiKey(mock.model.provider, "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const heldStream = new AssistantMessageEventStream();
+		const response: AssistantMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "recovered" }],
+			api: mock.model.api,
+			provider: mock.model.provider,
+			model: mock.model.id,
+			usage: {
+				input: 1,
+				output: 1,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 2,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		let streamCalls = 0;
+		const streamFn: StreamFn = () => {
+			streamCalls++;
+			if (streamCalls === 1) return heldStream;
+			const stream = new AssistantMessageEventStream();
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: response });
+				stream.push({ type: "done", reason: "stop", message: response });
+				stream.end(response);
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model: mock.model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		const activeSession = session;
+		const agentEnds: string[] = [];
+		activeSession.subscribe(event => {
+			if (event.type === "agent_end") agentEnds.push(event.stopReason ?? "unknown");
+		});
+
+		const wedgedPrompt = activeSession.prompt("Start a provider stream that never settles.");
+		try {
+			const deadline = Date.now() + 1_000;
+			while (!(heldStream.hasActiveConsumer && activeSession.isStreaming)) {
+				if (Date.now() >= deadline) throw new Error("Timed out waiting for provider stream consumption");
+				await Bun.sleep(1);
+			}
+
+			await activeSession.abort({ timeoutMs: 25, cause: "user_interrupt" });
+			expect(agentEnds).toHaveLength(1);
+			expect(Boolean(activeSession.isStreaming)).toBe(false);
+
+			await activeSession.prompt("Successor after wedged provider stream.");
+			expect(streamCalls).toBe(2);
+			expect(agentEnds).toHaveLength(2);
+		} finally {
+			heldStream.end(response);
+			await wedgedPrompt.catch(() => undefined);
+		}
+	});
+
 	it("bounds dispose, lets an abort-ignoring run settle cooperatively, and drops its late events", async () => {
 		tempDir = TempDir.createSync("@gjc-dispose-timeout-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
