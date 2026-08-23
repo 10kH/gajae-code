@@ -37,7 +37,7 @@ function authority(): { authority: FilesystemTopicRegistryCasAuthority; file: st
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
-test("machine-local identity parsing is strict and machine IDs are domain-hashed", async () => {
+test("machine-local identity parsing is strict and machine IDs are keyed per installation", async () => {
 	expect(parseWindowsMachineGuid("MachineGuid    REG_SZ    00112233-4455-6677-8899-aabbccddeeff")).toBe(
 		"00112233-4455-6677-8899-aabbccddeeff",
 	);
@@ -46,6 +46,7 @@ test("machine-local identity parsing is strict and machine IDs are domain-hashed
 
 	const hostId = await loadInstallationHostId({
 		platform: "linux",
+		installationSecret: "11".repeat(32),
 		readFile: async file => {
 			if (file === "/etc/machine-id") return "00112233445566778899aabbccddeeff\n";
 			throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -55,18 +56,27 @@ test("machine-local identity parsing is strict and machine IDs are domain-hashed
 	expect(hostId).not.toContain("00112233445566778899aabbccddeeff");
 	const fallbackHostId = await loadInstallationHostId({
 		platform: "linux",
+		installationSecret: "11".repeat(32),
 		readFile: async file => (file === "/etc/machine-id" ? "malformed" : "ffeeddccbbaa99887766554433221100\n"),
 	});
 	expect(fallbackHostId).toMatch(/^[0-9a-f]{64}$/);
+	const otherInstallationHostId = await loadInstallationHostId({
+		platform: "linux",
+		installationSecret: "22".repeat(32),
+		readFile: async () => "00112233445566778899aabbccddeeff\n",
+	});
+	expect(otherInstallationHostId).not.toBe(hostId);
 	await expect(
 		loadInstallationHostId({
 			platform: "linux",
+			installationSecret: "11".repeat(32),
 			readFile: async () => "malformed",
 		}),
 	).rejects.toThrow("unavailable or malformed");
 	await expect(
 		loadInstallationHostId({
 			platform: "win32",
+			installationSecret: "11".repeat(32),
 			runCommand: () => ({ exitCode: 1, stdout: new Uint8Array() }),
 		}),
 	).rejects.toThrow("unavailable or malformed");

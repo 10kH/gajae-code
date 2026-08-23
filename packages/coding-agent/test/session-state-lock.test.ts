@@ -49,6 +49,7 @@ afterEach(async () => {
 	SessionStateLockTestHooks.probeProcessSignal = undefined;
 	SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
 	SessionStateLockTestHooks.ownerHostId = undefined;
+	SessionStateLockTestHooks.loadInstallationHostId = undefined;
 	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
 	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
@@ -1281,6 +1282,24 @@ describe("coordinator session state lock", () => {
 		);
 		expect(fsSync.existsSync(`${stateFile}.lock`)).toBe(false);
 		expect(fsSync.existsSync(`${stateFile}.lock.transition`)).toBe(false);
+	});
+
+	it("retries machine identity loading after a transient failure", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-host-identity-retry.json");
+		SessionStateLockTestHooks.ownerHostId = undefined;
+		let attempts = 0;
+		SessionStateLockTestHooks.loadInstallationHostId = async () => {
+			attempts++;
+			if (attempts === 1) throw new Error("transient identity read failure");
+			return "local-host";
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
+		expect(attempts).toBe(2);
 	});
 
 	it("refuses to unlink a successor that replaces a live owner record before release", async () => {
