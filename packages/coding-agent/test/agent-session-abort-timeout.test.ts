@@ -30,20 +30,21 @@ describe("AgentSession abort timeout", () => {
 		const dir = tempDir;
 		tempDir = undefined;
 		if (dir) {
-			let lastRemovalError: unknown;
 			for (let attempt = 0; ; attempt++) {
 				try {
 					dir.removeSync();
 					break;
 				} catch (error) {
-					lastRemovalError = error;
 					if (process.platform !== "win32") throw error;
 					const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
 					if (code !== "EBUSY" && code !== "EPERM") throw error;
 					// Windows reports EBUSY while the just-closed auth DB handle (or an
 					// AV scan of it) still holds the directory; retry briefly, then
 					// leave the disposable temp dir behind rather than failing the test.
-					if (attempt >= 10) throw lastRemovalError;
+					if (attempt >= 10) {
+						process.emitWarning(`Leaving locked test temp directory behind: ${dir.path()} (${String(error)})`);
+						break;
+					}
 					await Bun.sleep(50);
 				}
 			}
