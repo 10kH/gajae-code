@@ -1097,6 +1097,7 @@ export class TUI extends Container {
 	#mouseButtonDown = false;
 	#mouseGestureDragged = false;
 	#mousePressPoint: MouseSelectionPoint | null = null;
+	#mousePressAt = 0;
 	#lastClickPoint: MouseSelectionPoint | null = null;
 	#lastClickAt = 0;
 	#clickCount = 0;
@@ -3025,21 +3026,28 @@ export class TUI extends Container {
 		const mouse = parseSgrMouseEvent(data);
 		if (mouse) {
 			// Coordinates outside the current terminal cannot name a visible cell.
-			if (mouse.x > this.terminal.columns || mouse.y > this.terminal.rows) return;
+			if (mouse.x > this.terminal.columns || mouse.y > this.terminal.rows) {
+				this.#clearMouseSelection();
+				this.#resetClickCount();
+				return;
+			}
 			if (mouse.kind === "wheel") {
 				this.#clearMouseSelection();
 				this.#resetClickCount();
 				this.scrollViewportBy(mouse.direction! * DEFAULT_WHEEL_LINES, { pin: "stable" });
 			} else if (mouse.kind === "click") {
-				this.#beginMouseSelection(mouse);
 				const focusedOverlay = this.overlayStack.find(o => o.component === this.#focusedComponent);
 				if (focusedOverlay) {
 					if (!this.#isOverlayVisible(focusedOverlay)) {
 						focusedOverlay.mouseBounds = undefined;
+						this.#clearMouseSelection();
+						this.#resetClickCount();
 						return;
 					}
 					const bounds = focusedOverlay.mouseBounds;
 					if (bounds?.termWidth !== this.terminal.columns || bounds.termHeight !== this.terminal.rows) {
+						this.#clearMouseSelection();
+						this.#resetClickCount();
 						return;
 					}
 
@@ -3049,14 +3057,22 @@ export class TUI extends Container {
 						mouse.x > bounds.col + bounds.width ||
 						mouse.y < bounds.row + 1 ||
 						mouse.y > bounds.row + bounds.height
-					)
+					) {
+						this.#clearMouseSelection();
+						this.#resetClickCount();
 						return;
+					}
+					this.#clearMouseSelection();
+					this.#resetClickCount();
 					this.#focusedComponent?.handleMouse?.({
 						...mouse,
 						localX: mouse.x - bounds.col,
 						localY: mouse.y - bounds.row,
 					});
-				} else this.#focusedComponent?.handleMouse?.(mouse);
+				} else {
+					this.#beginMouseSelection(mouse);
+					this.#focusedComponent?.handleMouse?.(mouse);
+				}
 			} else if (mouse.kind === "drag") {
 				this.#updateMouseSelection(mouse);
 			} else {
@@ -3066,7 +3082,11 @@ export class TUI extends Container {
 			return;
 		}
 		// SGR-looking reports, including malformed reports, are terminal controls.
-		if (data.startsWith("\x1b[<")) return;
+		if (data.startsWith("\x1b[<")) {
+			this.#clearMouseSelection();
+			this.#resetClickCount();
+			return;
+		}
 
 		// Consume terminal cell size responses without blocking unrelated input.
 		if (this.#consumeCellSizeResponse(data)) {
@@ -3114,9 +3134,6 @@ export class TUI extends Container {
 	}
 
 	#mouseSelectionPoint(mouse: MouseEvent): MouseSelectionPoint | null {
-		if (this.#manualViewportTop === undefined) {
-			return { line: this.#viewportTopRow + mouse.y - 1, column: mouse.x - 1 };
-		}
 		const line = this.#committedTranscriptRows[mouse.y - 1];
 		return line === null || line === undefined || line < 0 || line >= this.#manualTranscriptLineCount
 			? null
@@ -3130,8 +3147,7 @@ export class TUI extends Container {
 	 * restarts at char. A fourth click stays on line rather than cycling back, which
 	 * matches how terminal emulators clamp their own native selection.
 	 */
-	#nextClickMode(point: MouseSelectionPoint): MouseSelectionMode {
-		const now = performance.now();
+	#nextClickMode(point: MouseSelectionPoint, now: number): MouseSelectionMode {
 		const repeat =
 			this.#multiClickIntervalMs > 0 &&
 			this.#lastClickPoint !== null &&
@@ -3149,6 +3165,7 @@ export class TUI extends Container {
 		this.#mouseButtonDown = false;
 		this.#mouseGestureDragged = false;
 		this.#mousePressPoint = null;
+		this.#mousePressAt = 0;
 	}
 
 	/** Painted transcript rows the selection reads from; manual history keeps its own frame. */
@@ -3213,18 +3230,13 @@ export class TUI extends Container {
 			this.#resetClickCount();
 			return;
 		}
-		if (this.#mouseButtonDown) {
-			if (this.#clickCount < 3) this.#resetClickCount();
-			else {
-				this.#mouseButtonDown = false;
-				this.#mouseGestureDragged = false;
-				this.#mousePressPoint = null;
-			}
-		}
-		const mode = this.#clickCount >= 3 ? "line" : this.#nextClickMode(point);
+		if (this.#mouseButtonDown) this.#resetClickCount();
+		const pressAt = performance.now();
+		const mode = this.#nextClickMode(point, pressAt);
 		this.#mouseButtonDown = true;
 		this.#mouseGestureDragged = false;
 		this.#mousePressPoint = point;
+		this.#mousePressAt = pressAt;
 		this.#mouseSelectionMode = mode;
 		this.#mouseSelectionAnchor = point;
 		this.#mouseSelectionStart = this.#snapSelectionPoint(point, "start");
@@ -3260,6 +3272,7 @@ export class TUI extends Container {
 		this.#mouseButtonDown = false;
 		const point = this.#mouseSelectionPoint(mouse);
 		const pressPoint = this.#mousePressPoint;
+		const pressAt = this.#mousePressAt;
 		const completedClick =
 			!this.#mouseGestureDragged &&
 			point !== null &&
@@ -3267,10 +3280,11 @@ export class TUI extends Container {
 			point.line === pressPoint.line &&
 			point.column === pressPoint.column;
 		this.#mousePressPoint = null;
+		this.#mousePressAt = 0;
 		this.#mouseGestureDragged = false;
 		if (completedClick) {
 			this.#lastClickPoint = point;
-			this.#lastClickAt = performance.now();
+			this.#lastClickAt = pressAt;
 		} else {
 			this.#resetClickCount();
 		}

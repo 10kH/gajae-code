@@ -154,7 +154,6 @@ describe("multi-click selection", () => {
 			terminal.sendInput(release(3, 1));
 		}
 		terminal.sendInput(press(3, 1));
-		terminal.sendInput(press(3, 1));
 		terminal.sendInput(drag(2, 2));
 		terminal.sendInput(release(2, 2));
 		await terminal.waitForRender();
@@ -242,6 +241,36 @@ describe("multi-click selection", () => {
 		terminal.sendInput(press(3, 1));
 		terminal.sendInput(release(3, 1));
 		terminal.sendInput(press(3, 1));
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		await terminal.waitForRender();
+
+		expect(copied).toEqual([]);
+		tui.stop();
+	});
+
+	test("a duplicate press after triple click cancels the clamped line chain", async () => {
+		const { terminal, tui, copied } = await mount(["alpha bravo"], { columns: 30, rows: 1 });
+
+		for (let click = 0; click < 3; click++) {
+			terminal.sendInput(press(3, 1));
+			terminal.sendInput(release(3, 1));
+		}
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(press(3, 1));
+		terminal.sendInput(release(3, 1));
+		await terminal.waitForRender();
+
+		expect(copied).toEqual(["alpha", "alpha bravo"]);
+		tui.stop();
+	});
+
+	test("a long-held first press does not start a repeat-click window on release", async () => {
+		const { terminal, tui, copied } = await mount(["alpha bravo"], { columns: 30, rows: 1 }, 5);
+
+		terminal.sendInput(press(3, 1));
+		await Bun.sleep(20);
+		terminal.sendInput(release(3, 1));
 		terminal.sendInput(press(3, 1));
 		terminal.sendInput(release(3, 1));
 		await terminal.waitForRender();
