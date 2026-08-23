@@ -48,6 +48,14 @@ import {
 	SessionIndex,
 	type SessionList,
 } from "./session-index";
+import {
+	resolveScopeRequest,
+	scopeMatchesLocator,
+	scopeRequestV1,
+	ScopeRequestValidationError,
+	type ResolvedScopeV1,
+	type ScopeRequestV1,
+} from "./session-scope";
 import { createMasterCapabilityVerifier } from "./master-capability";
 import { BrokerTransport } from "./transport";
 
@@ -256,6 +264,8 @@ type SessionListCursor = {
 	limit: number;
 	offset: number;
 	expiresAt: number;
+	scope?: ResolvedScopeV1;
+	observedAt?: string;
 };
 
 const SESSION_LIST_DEFAULT_LIMIT = 100;
@@ -381,6 +391,8 @@ function normalizeBrokerInput(operation: string, input: Record<string, unknown>)
 			return error("invalid_input", "cursor must be a non-empty opaque string");
 		const limit = sessionListLimit(input);
 		if (isBrokerResponse(limit)) return limit;
+		if (input.scope !== undefined && !scopeRequestV1(input.scope) && input.cursor === undefined)
+			return error("invalid_input", "scope must be a valid ScopeRequestV1");
 		return { input: normalized };
 	}
 	if (
@@ -1608,7 +1620,7 @@ export class Broker {
 		return token;
 	}
 
-	#sessionListPage(input: Record<string, unknown>, result: SessionList): BrokerResponse {
+	async #sessionListPage(input: Record<string, unknown>, result: SessionList): Promise<BrokerResponse> {
 		const requestedLimit = input.limit === undefined ? undefined : sessionListLimit(input);
 		if (isBrokerResponse(requestedLimit)) return requestedLimit;
 		const cursor = input.cursor;
@@ -1619,14 +1631,43 @@ export class Broker {
 		}
 		if (stored && requestedLimit !== undefined && stored.limit !== requestedLimit)
 			return error("invalid_input", "limit must match the cursor page shape");
+		let scope: ResolvedScopeV1 | undefined;
+		if (stored?.scope !== undefined) {
+			if (input.scope !== undefined) {
+				const supplied = scopeRequestV1(input.scope);
+				if (!supplied) return error("scope_cursor_mismatch", "scope must match the cursor snapshot");
+				try {
+					scope = await resolveScopeRequest(supplied);
+				} catch (cause) {
+					if (cause instanceof ScopeRequestValidationError)
+						return error("scope_cursor_mismatch", "scope must match the cursor snapshot");
+					throw cause;
+				}
+				if (JSON.stringify(scope) !== JSON.stringify(stored.scope))
+					return error("scope_cursor_mismatch", "scope must match the cursor snapshot");
+			}
+			scope = stored.scope;
+		} else if (input.scope !== undefined) {
+			if (stored !== undefined) return error("scope_cursor_mismatch", "scope must match the cursor snapshot");
+			const request = scopeRequestV1(input.scope);
+			if (!request) return error("invalid_input", "scope must be a valid ScopeRequestV1");
+			try {
+				scope = await resolveScopeRequest(request);
+			} catch (cause) {
+				if (cause instanceof ScopeRequestValidationError) return error("invalid_input", cause.message);
+				throw cause;
+			}
+		}
 		const limit = stored?.limit ?? requestedLimit ?? SESSION_LIST_DEFAULT_LIMIT;
+		const observedAt = stored?.observedAt ?? (scope === undefined ? undefined : new Date().toISOString());
 		const snapshot = stored ?? {
-			sessions: [...result.sessions],
+			sessions: scope === undefined ? [...result.sessions] : result.sessions.filter(session => scopeMatchesLocator(scope, session.locator)),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,
 			offset: 0,
 			expiresAt: Date.now() + SESSION_LIST_CURSOR_TTL_MS,
+			...(scope === undefined ? {} : { scope, observedAt: observedAt! }),
 		};
 		const sessions = snapshot.sessions.slice(snapshot.offset, snapshot.offset + snapshot.limit).map(session => {
 			const { lifecycleRequestId: _lifecycleRequestId, ...publicSession } = session;
@@ -1648,6 +1689,7 @@ export class Broker {
 				indexSeq: snapshot.indexSeq,
 				sessions,
 				warnings: snapshot.warnings,
+				...(snapshot.scope === undefined ? {} : { scope: snapshot.scope, observedAt: snapshot.observedAt }),
 				...(continuationCursor ? { continuationCursor } : {}),
 			},
 			indexSeq: snapshot.indexSeq,
@@ -1679,7 +1721,7 @@ export class Broker {
 		input = normalization.input;
 		if (operation === "session.list") {
 			if (input.cursor === undefined) await this.index.refresh();
-			const page = this.#sessionListPage(input, this.index.listSessions());
+			const page = await this.#sessionListPage(input, this.index.listSessions());
 			if (!page.ok) return page;
 			const pageResult = page.result as Record<string, unknown>;
 			const resolveSessionId = typeof input.resolveSessionId === "string" ? input.resolveSessionId : undefined;
