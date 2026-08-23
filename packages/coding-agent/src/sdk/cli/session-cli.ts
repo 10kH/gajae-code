@@ -269,9 +269,11 @@ async function withRouter<T>(
 	agentDir: string,
 	action: (router: SessionRouter) => Promise<T>,
 	onFrame?: (attachment: SessionAttachment, frame: SessionRouterFrame) => void,
+	sessionIds?: readonly string[],
 ): Promise<T> {
 	const router = new SessionRouter({
 		agentDir,
+		...(sessionIds === undefined ? {} : { sessionIds }),
 		...(onFrame === undefined ? {} : { deps: { onFrame } }),
 	});
 	let result!: T;
@@ -388,7 +390,7 @@ function searchProbe(row: SdkSearchRowV1, router: SessionRouter): Promise<SdkSea
 	return (async () => {
 		try {
 			const attachment = router.attachment(row.id);
-			if (!attachment) return { ...row, probe: "stale" };
+			if (!attachment) return { ...row, probe: "unreachable" };
 			const response = await router.request(
 				row.id,
 				{ type: "query_request", query: "session.checkpoint", input: {} },
@@ -410,6 +412,8 @@ async function probeSearchRows(agentDir: string, result: SdkSearchResultV1): Pro
 		const probes = await withRouter(
 			agentDir,
 			async router => await Promise.all(rows.map(row => searchProbe(row, router))),
+			undefined,
+			rows.map(row => row.id),
 		);
 		return { ...result, rows: probes };
 	} catch {
