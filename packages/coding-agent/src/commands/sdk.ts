@@ -29,6 +29,7 @@ import { processIncarnation } from "../sdk/broker/process-incarnation";
 import { resolveSdkPackageAuthority } from "../sdk/broker/runtime";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { renderSdkSearchTable, runSdkSearch, runSdkSessionCli } from "../sdk/cli";
+import { renderSpawnTable, runSdkSpawn, SdkMasterCliError } from "../sdk/cli/master-cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
 import { type CreateLifecycleAgentSessionResult, createLifecycleAgentSession } from "../sdk/lifecycle-session";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../sdk/session-directory";
@@ -864,6 +865,39 @@ class SdkSessionHelp extends Command {
 	async run(): Promise<void> {}
 }
 
+class SdkSpawnCommand extends Command {
+	static description = "Spawn a task-seeded background child session (local interactive master only).";
+	static flags = {
+		cwd: Flags.string({ description: "Working directory for the spawned child" }),
+		prompt: Flags.string({ description: "Seed task delivered once to the child" }),
+		model: Flags.string({ description: "Model selector for the child" }),
+		profile: Flags.string({ description: "Model profile name for the child" }),
+		"agent-dir": Flags.string({ description: "SDK broker state directory" }),
+		json: Flags.boolean({ description: "Render the safe spawn result as JSON" }),
+	};
+	async run(): Promise<void> {
+		const { flags } = await this.parse(SdkSpawnCommand);
+		try {
+			const spawn = await runSdkSpawn({
+				cwd: flags.cwd,
+				prompt: flags.prompt,
+				model: flags.model,
+				profile: flags.profile,
+				agentDir: flags["agent-dir"],
+			});
+			process.stdout.write(`${flags.json ? JSON.stringify(spawn.rendered) : renderSpawnTable(spawn.rendered)}\n`);
+			if (spawn.exitCode !== 0) process.exitCode = spawn.exitCode;
+		} catch (error) {
+			if (error instanceof SdkMasterCliError) {
+				process.stderr.write(`Error: ${error.code}: ${error.message}\n`);
+				process.exitCode = error.exitCode;
+				return;
+			}
+			throw error;
+		}
+	}
+}
+
 class SdkSearchCommand extends Command {
 	static description = "Search broker-visible SDK sessions within an exact repo, pwd, or global scope.";
 	static flags = {
@@ -962,10 +996,10 @@ class SdkGuidesCommand extends Command {
 
 export default class Sdk extends Command {
 	static description =
-		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
+		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk spawn --cwd <dir> --prompt <task> (master only); gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
 	static hidden = false;
 	static delegateHelp = true;
-	static args = { action: Args.string({ required: false, options: ["serve", "search", "session", "guides"] }) };
+	static args = { action: Args.string({ required: false, options: ["serve", "search", "spawn", "session", "guides"] }) };
 	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
 		const action = this.argv[0];
@@ -975,6 +1009,8 @@ export default class Sdk extends Command {
 				? "sdk serve"
 				: action === "search"
 					? "sdk search"
+					: action === "spawn"
+						? "sdk spawn"
 					: action === "session"
 						? "sdk session"
 						: action === "guides"
@@ -985,6 +1021,8 @@ export default class Sdk extends Command {
 				? SdkServeHelp
 				: action === "search"
 					? SdkSearchCommand
+					: action === "spawn"
+						? SdkSpawnCommand
 					: action === "session"
 						? SdkSessionCommand
 						: action === "guides"
@@ -995,6 +1033,10 @@ export default class Sdk extends Command {
 		}
 		if (action === "search") {
 			await new SdkSearchCommand(this.argv.slice(1), this.config).run();
+			return;
+		}
+		if (action === "spawn") {
+			await new SdkSpawnCommand(this.argv.slice(1), this.config).run();
 			return;
 		}
 		if (action === "session") {
@@ -1010,7 +1052,7 @@ export default class Sdk extends Command {
 			return;
 		}
 		if (action !== "broker-internal" && action !== "session-host-internal")
-			throw new CliParseError("Expected action to be serve, search, session, or guides.");
+			throw new CliParseError("Expected action to be serve, search, spawn, session, or guides.");
 		const internal = parseSdkInternalArgv(this.argv);
 		if (internal.action === "session-host-internal") {
 			await runSessionHost();

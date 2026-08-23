@@ -233,6 +233,30 @@ mechanism.
 \`tail\` reports a \`retention_gap\` with the missing sequence range and a
 \`resync\` checkpoint when retained history or the event ring dropped entries;
 \`--strict\` turns any gap into exit code 1.
+
+## Scoped search
+
+\`gjc sdk search [--scope repo|pwd|global] [--json]\` lists broker-visible
+sessions inside one exact scope (default \`repo\`: the identical canonical Git
+worktree, never a path prefix). Every result carries a scope/status envelope
+(requested and resolved scope, \`populated\`, \`empty\`, \`not-in-git-worktree\`,
+or \`unavailable\`); empty and non-Git results exit 0 and never fall back to a
+wider scope. Rows are probed after scoping (\`reachable\`, \`unreachable\`,
+\`stale\`) without printing endpoint credentials.
+
+## Local-only spawn
+
+\`gjc sdk spawn --cwd <dir> --prompt <task> [--model <selector>] [--profile <name>]\`
+creates one task-seeded background child through the broker and is legal only
+inside a live interactive \`gjc --master\` session. Each invocation uses a fresh
+idempotency identity: one identity yields at most one child and one seed
+prompt, replays return stored outcomes, and a semantically new task requires a
+new invocation. \`spawn_in_progress\` and \`terminal_uncertain\` are honest
+states, never retry triggers. The task and master capability never persist in
+broker state, logs, or output; spawn is prohibited on MCP, ACP, daemon CLI/raw,
+Telegram, Discord, and Slack surfaces. Clean up children through the standard
+\`session.close\` path; orphaned children are reaped after
+\`sdk.masterOrphanGraceMs\`.
 `;
 }
 

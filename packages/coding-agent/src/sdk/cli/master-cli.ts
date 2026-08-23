@@ -1,0 +1,170 @@
+/**
+ * Local interactive-master CLI surface.
+ *
+ * `gjc sdk spawn` is legal only inside a live master session: the master's Bash
+ * tool threads the transient capability through the child environment, and the
+ * Broker still verifies it against the live effective host before any effect.
+ * No output path may echo the task or capability.
+ */
+import { randomUUID } from "node:crypto";
+import { getAgentDir } from "@gajae-code/utils";
+import { SessionIndex } from "../broker/session-index";
+import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
+
+const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
+const MASTER_SESSION_ENV = "GJC_SESSION_ID";
+const SPAWN_TIMEOUT_MS = 120_000;
+
+export class SdkMasterCliError extends Error {
+	constructor(
+		readonly code: string,
+		message: string,
+		readonly exitCode: 1 | 2 = 1,
+	) {
+		super(message);
+		this.name = "SdkMasterCliError";
+	}
+}
+
+export interface SdkSpawnArgs {
+	cwd?: string;
+	prompt?: string;
+	model?: string;
+	profile?: string;
+	agentDir?: string;
+	json?: boolean;
+}
+
+/** The allowlisted spawn result projection rendered to the operator. */
+export interface SdkSpawnRendered {
+	code: string;
+	claimId?: string;
+	sessionId?: string;
+	substrateKind?: string;
+	seed?: { phase?: string; clientRef?: string; commandId?: string; turnId?: string; status?: string };
+	error?: { code: string; message: string };
+}
+
+export interface SdkSpawnDependencies {
+	env: Record<string, string | undefined>;
+	dispatch: (agentDir: string, input: Record<string, unknown>, idempotencyKey: string) => Promise<unknown>;
+	resolveAttestationEpoch: (agentDir: string, ownerSessionId: string) => Promise<string | undefined>;
+}
+
+async function brokerSpawnDispatch(
+	agentDir: string,
+	input: Record<string, unknown>,
+	idempotencyKey: string,
+): Promise<unknown> {
+	return await dispatchSpawnGlobal(agentDir, input, idempotencyKey, SPAWN_TIMEOUT_MS);
+}
+
+async function indexAttestationEpoch(agentDir: string, ownerSessionId: string): Promise<string | undefined> {
+	const index = await new SessionIndex(agentDir).open();
+	const rows = index.listSessionIdentities();
+	const attested = rows.find(
+		row => row.sessionId === ownerSessionId && row.masterRole?.role === "master" && row.masterRole.version === 2,
+	);
+	return attested?.masterRole?.attestationEpoch;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function opaque(value: unknown): string | undefined {
+	return typeof value === "string" && value.length > 0 && value.length <= 512 ? value : undefined;
+}
+
+/** Projects an arbitrary Broker response onto the allowlisted render shape. */
+export function safeSpawnRender(response: unknown): { rendered: SdkSpawnRendered; exitCode: 0 | 1 } {
+	const outer = record(response);
+	if (outer?.ok === true) {
+		const result = record(outer.result);
+		const seed = record(result?.seed);
+		return {
+			rendered: {
+				code: opaque(result?.code) ?? "spawn_accepted",
+				...(opaque(result?.claimId) === undefined ? {} : { claimId: opaque(result?.claimId) }),
+				...(opaque(result?.sessionId) === undefined ? {} : { sessionId: opaque(result?.sessionId) }),
+				...(opaque(result?.substrateKind) === undefined ? {} : { substrateKind: opaque(result?.substrateKind) }),
+				...(seed === undefined
+					? {}
+					: {
+							seed: {
+								...(opaque(seed.phase) === undefined ? {} : { phase: opaque(seed.phase) }),
+								...(opaque(seed.clientRef) === undefined ? {} : { clientRef: opaque(seed.clientRef) }),
+								...(opaque(seed.commandId) === undefined ? {} : { commandId: opaque(seed.commandId) }),
+								...(opaque(seed.turnId) === undefined ? {} : { turnId: opaque(seed.turnId) }),
+								...(opaque(seed.status) === undefined ? {} : { status: opaque(seed.status) }),
+							},
+						}),
+			},
+			exitCode: 0,
+		};
+	}
+	const error = record(outer?.error);
+	const code = opaque(error?.code) ?? "spawn_failed";
+	// Error messages are Broker-typed and never quote request input; render the
+	// code plus the typed message only.
+	const message = typeof error?.message === "string" && error.message.length <= 512 ? error.message : "session.spawn failed";
+	return { rendered: { code, error: { code, message } }, exitCode: 1 };
+}
+
+export function renderSpawnTable(rendered: SdkSpawnRendered): string {
+	const lines = [`Result: ${rendered.code}`];
+	if (rendered.claimId) lines.push(`Claim: ${rendered.claimId}`);
+	if (rendered.sessionId) lines.push(`Child session: ${rendered.sessionId}`);
+	if (rendered.substrateKind) lines.push(`Substrate: ${rendered.substrateKind}`);
+	if (rendered.seed?.phase) lines.push(`Seed phase: ${rendered.seed.phase}`);
+	if (rendered.seed?.status) lines.push(`Seed status: ${rendered.seed.status}`);
+	if (rendered.error) lines.push(`Error: ${rendered.error.code}: ${rendered.error.message}`);
+	return lines.join("\n");
+}
+
+/**
+ * Runs one local master spawn. Every invocation uses a fresh idempotency key:
+ * a semantically new task must never replay an older claim.
+ */
+export async function runSdkSpawn(
+	args: SdkSpawnArgs,
+	dependencies: Partial<SdkSpawnDependencies> = {},
+): Promise<{ rendered: SdkSpawnRendered; exitCode: 0 | 1 }> {
+	const deps: SdkSpawnDependencies = {
+		env: dependencies.env ?? process.env,
+		dispatch: dependencies.dispatch ?? brokerSpawnDispatch,
+		resolveAttestationEpoch: dependencies.resolveAttestationEpoch ?? indexAttestationEpoch,
+	};
+	if (!args.cwd) throw new SdkMasterCliError("invalid_input", "sdk spawn requires --cwd <dir>.", 2);
+	if (!args.prompt) throw new SdkMasterCliError("invalid_input", "sdk spawn requires --prompt <task>.", 2);
+	const capability = deps.env[MASTER_CAPABILITY_ENV];
+	const ownerSessionId = deps.env[MASTER_SESSION_ENV];
+	if (!capability || !ownerSessionId)
+		throw new SdkMasterCliError(
+			"master_context_required",
+			"sdk spawn is available only inside a live interactive master session.",
+			1,
+		);
+	const agentDir = args.agentDir ?? getAgentDir();
+	const attestationEpoch = await deps.resolveAttestationEpoch(agentDir, ownerSessionId);
+	if (!attestationEpoch)
+		throw new SdkMasterCliError(
+			"master_context_required",
+			"No master role attestation exists for this session; relaunch with gjc --master.",
+			1,
+		);
+	const response = await deps.dispatch(
+		agentDir,
+		{
+			task: args.prompt,
+			masterCapability: capability,
+			ownerSessionId,
+			attestationEpoch,
+			cwd: args.cwd,
+			...(args.model === undefined ? {} : { modelId: args.model }),
+			...(args.profile === undefined ? {} : { modelPreset: args.profile }),
+		},
+		randomUUID(),
+	);
+	return safeSpawnRender(response);
+}

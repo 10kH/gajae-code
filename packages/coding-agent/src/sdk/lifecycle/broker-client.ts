@@ -48,3 +48,31 @@ export class AgentDirSessionLifecycleClient implements SessionLifecycleClient {
 export function createBrokerSessionLifecycleService(agentDir: string): SessionLifecycleService {
 	return new SessionLifecycleService(new AgentDirSessionLifecycleClient(agentDir));
 }
+
+/**
+ * Dedicated dispatch for the local master `session.spawn` surface. It shares
+ * the lifecycle client's credential boundary but bypasses the generic mutation
+ * outcome types: spawn responses are validated by the caller's allowlist.
+ */
+export async function dispatchSpawnGlobal(
+	agentDir: string,
+	input: Record<string, unknown>,
+	idempotencyKey: string,
+	timeoutMs: number,
+): Promise<unknown> {
+	await ensureBroker({ agentDir });
+	const discovery = await readSdkBrokerDiscovery(agentDir);
+	if (!discovery) throw new Error("SDK broker discovery is unavailable.");
+	const client = await SdkClient.connect(discovery.url, discovery.token, { timeoutMs });
+	try {
+		return await client.global("session.spawn", input, { idempotencyKey, timeoutMs });
+	} finally {
+		try {
+			await client.close();
+		} catch (error) {
+			logger.warn("SDK spawn client cleanup failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+}
