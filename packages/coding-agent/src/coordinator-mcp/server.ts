@@ -535,6 +535,11 @@ function toolSchema(name: CoordinatorToolName): {
 			"Optional explicit model pin (`gjc --model <provider/model>`, e.g. cursor/claude-fable-5-xhigh). Unknown ids are rejected with the same not-found error as the CLI; when both model and mpreset are given, the explicit model wins exactly like `gjc --mpreset <p> --model <m>`.",
 	};
 
+	const worktree = {
+		type: "string",
+		description:
+			"Name this session's git worktree and branch instead of the configured default, so concurrent sessions in one repository get isolated checkouts. Requires GJC_COORDINATOR_MCP_SESSION_COMMAND to select worktree mode. Without it every session in a repository shares one worktree derived from the repository's current branch.",
+	};
 	const common = { type: "object", properties: {} as Record<string, unknown> };
 	const idempotencyKey = {
 		type: "string",
@@ -581,6 +586,7 @@ function toolSchema(name: CoordinatorToolName): {
 					},
 					mpreset,
 					model: modelPin,
+					worktree,
 					idempotency_key: idempotencyKey,
 					allow_mutation: allowMutation,
 				},
@@ -876,6 +882,7 @@ function toolSchema(name: CoordinatorToolName): {
 					},
 					mpreset,
 					model: modelPin,
+					worktree,
 					await_completion: { type: "boolean", description: "If true, poll the turn until terminal or timeout." },
 					timeout_ms: {
 						type: "number",
@@ -987,7 +994,49 @@ function normalizeSession(session: Record<string, unknown>): Record<string, unkn
 	return normalized;
 }
 
-function coordinatorLifecycleTarget(sessionCommand: string | null, cwd: string): Record<string, unknown> {
+/** Whether the configured selector puts sessions in a GJC-managed worktree. */
+function coordinatorWorktreeEnabled(sessionCommand: string | null): boolean {
+	if (!sessionCommand) return false;
+	const [executable, ...args] = sessionCommand.trim().split(/\s+/);
+	return executable === "gjc" && args[0] === "--worktree";
+}
+
+type CoordinatorWorktreeResolution = { ok: true; name?: string } | { ok: false; reason: string };
+
+/**
+ * Resolves the worktree name for one session creation.
+ *
+ * The configured selector stays the capability gate: it decides whether GJC manages
+ * a worktree at all, so a request cannot turn worktree mode on for a coordinator
+ * deliberately configured to run in place. Within worktree mode the request names
+ * this session's worktree, which is what lets concurrent sessions in one repository
+ * get isolated checkouts instead of sharing the slug derived from its current branch.
+ *
+ * Refusals are typed rather than thrown: the bridge redacts error messages, so a
+ * thrown error would reach the controller as an undiagnosable `invalid_input`.
+ */
+function resolveCoordinatorWorktree(sessionCommand: string | null, requested: unknown): CoordinatorWorktreeResolution {
+	const name = optionalString(requested);
+	if (name === null) return { ok: true };
+	if (!coordinatorWorktreeEnabled(sessionCommand)) return { ok: false, reason: "worktree_not_enabled" };
+	// The selector is whitespace-split, so a name containing whitespace has no
+	// representation, and a leading `-` would parse as another flag. Everything
+	// else is left to git, which checks the name with `git check-ref-format`
+	// because a named worktree also creates a branch of that name.
+	if (name.startsWith("-") || /\s/.test(name)) return { ok: false, reason: "invalid_worktree_name" };
+	return { ok: true, name };
+}
+
+/**
+ * Builds the SDK lifecycle target for one session creation. `requestedWorktree`
+ * comes from a resolved {@link resolveCoordinatorWorktree} and overrides the name
+ * carried by the configured selector.
+ */
+function coordinatorLifecycleTarget(
+	sessionCommand: string | null,
+	cwd: string,
+	requestedWorktree?: string,
+): Record<string, unknown> {
 	if (!sessionCommand) return { path: cwd };
 	const [executable, ...args] = sessionCommand.trim().split(/\s+/);
 	if (executable !== "gjc")
@@ -1005,9 +1054,10 @@ function coordinatorLifecycleTarget(sessionCommand: string | null, cwd: string):
 			"invalid_input",
 			"GJC_COORDINATOR_MCP_SESSION_COMMAND supports only gjc or gjc --worktree [name] under SDK lifecycle control.",
 		);
+	const name = requestedWorktree ?? args[1];
 	return {
 		path: cwd,
-		worktree: { enabled: true, ...(args[1] ? { name: args[1] } : {}) },
+		worktree: { enabled: true, ...(name ? { name } : {}) },
 	};
 }
 
@@ -7846,6 +7896,8 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 								SAFE_EXTERNAL_ID_PATTERN.test(args.codex_host_session_id)
 							? args.codex_host_session_id
 							: "";
+				const delegateWorktree = resolveCoordinatorWorktree(config.sessionCommand, args.worktree);
+				if (!delegateWorktree.ok) return { ok: false, reason: delegateWorktree.reason };
 				const canonicalArgs = {
 					cwd: canonicalCwd,
 					task,
@@ -7860,6 +7912,9 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						: {}),
 					prompt_alias_ignored: hasTask && hasPrompt,
 					...(explicitHostWorkUnit !== null ? { codex_host_session_id: explicitHostWorkUnit } : {}),
+					// Two delegations that differ only by worktree land in different checkouts,
+					// so the name has to bind the idempotency key like every other creation input.
+					...(delegateWorktree.name ? { worktree: delegateWorktree.name } : {}),
 					allow_mutation: true,
 				};
 				let creationRemoteStarted = false;
@@ -7955,7 +8010,11 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 											"session.create",
 											{
 												cwd: canonicalCwd,
-												target: coordinatorLifecycleTarget(config.sessionCommand, canonicalCwd),
+												target: coordinatorLifecycleTarget(
+													config.sessionCommand,
+													canonicalCwd,
+													delegateWorktree.name,
+												),
 												...(mpresetResolution.mpreset ? { modelPreset: mpresetResolution.mpreset } : {}),
 												...(modelResolution.model ? { modelId: modelResolution.model } : {}),
 												// Thread the coordinator state dir so the broker-spawned runtime
@@ -8209,15 +8268,20 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 						},
 					};
 				let creationRemoteStarted = false;
+				const worktreeResolution = resolveCoordinatorWorktree(config.sessionCommand, args.worktree);
+				if (!worktreeResolution.ok) return { ok: false, reason: worktreeResolution.reason };
 				const canonicalArgs = {
 					cwd,
 					mpreset: mpresetResolution.mpreset,
 					model: modelResolution.model,
 					...(prompt ? { prompt } : {}),
 					...(preparesExistingThread ? { prepare_existing_thread: true } : {}),
+					// Two sessions that differ only by worktree are different sessions, so the
+					// name has to bind the idempotency key like every other creation input.
+					...(worktreeResolution.name ? { worktree: worktreeResolution.name } : {}),
 					allow_mutation: true,
 				};
-				const lifecycleTarget = coordinatorLifecycleTarget(config.sessionCommand, cwd);
+				const lifecycleTarget = coordinatorLifecycleTarget(config.sessionCommand, cwd, worktreeResolution.name);
 				const remoteSession = { value: null as string | null };
 				return await withToolIdempotency(
 					name,
