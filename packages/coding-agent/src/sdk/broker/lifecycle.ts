@@ -3117,11 +3117,15 @@ function worktreeOccupant(
 	worktreePath: string,
 	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
 ): string | null {
-	const target = path.resolve(worktreePath);
+	// Session locators retain the lexical cwd supplied to the host, while a
+	// lifecycle worktree plan may arrive through a symlink. Compare physical
+	// identity where it exists, with resolveEquivalentPath's lexical fallback
+	// for paths that have not been created yet.
+	const target = resolveEquivalentPath(worktreePath);
 	for (const session of broker.index.listSessions().sessions) {
 		if (session.terminal || !session.live) continue;
-		if (path.resolve(session.locator.repo) !== target) continue;
-		if (observe(session.pid, session.processIncarnation) === "exited") continue;
+		if (resolveEquivalentPath(session.locator.repo) !== target) continue;
+		if (observe(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited") continue;
 		return session.sessionId;
 	}
 	return null;
