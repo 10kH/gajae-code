@@ -105,6 +105,14 @@ const LINE_TERMINATOR = "\x1b[0m\x1b]8;;\x07";
 const MOUSE_SELECTION_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 /** Discrete mouse-wheel notch size in terminal rows (xterm/less-style). */
 export const DEFAULT_WHEEL_LINES = 3;
+/**
+ * Repeat clicks on the same cell within this window escalate char -> word -> line
+ * selection. SGR mouse reports carry no click counter, so the escalation is timed
+ * here the way a terminal emulator would time its own native selection.
+ */
+export const DEFAULT_MULTI_CLICK_INTERVAL_MS = 400;
+/** Graphemes that bound a double-click word selection. Mirrors the xterm.js `wordSeparator` default. */
+const WORD_SEPARATORS = new Set([" ", "\t", "(", ")", "[", "]", "{", "}", "'", '"', "`", ","]);
 /** CSI 6 terminal-cell dimensions beyond this cannot produce a safe pet raster. */
 const MAX_CELL_DIMENSION_PX = 512;
 
@@ -206,6 +214,9 @@ export type MouseSelectionPoint = {
 	line: number;
 	column: number;
 };
+
+/** Granularity a manual selection extends by: single click, double click, triple click. */
+type MouseSelectionMode = "char" | "word" | "line";
 
 /** Parse xterm SGR mouse reports for wheel, left-click, drag, and release events. */
 export function parseSgrMouseEvent(data: string): MouseEvent | undefined {
@@ -1078,7 +1089,15 @@ export class TUI extends Container {
 	#pendingTerminalCleanup: Array<{ payload: string; onDelivered?: () => void }> = [];
 	#mouseSelectionStart: MouseSelectionPoint | null = null;
 	#mouseSelectionEnd: MouseSelectionPoint | null = null;
-	#mouseSelectionDragged = false;
+	/** True once a selection is painted and copyable — set by a drag or by a word/line click. */
+	#mouseSelectionActive = false;
+	#mouseSelectionMode: MouseSelectionMode = "char";
+	/** The cell the current selection was opened from; word/line drags pivot around it. */
+	#mouseSelectionAnchor: MouseSelectionPoint | null = null;
+	#lastClickCell: { x: number; y: number } | null = null;
+	#lastClickAt = 0;
+	#clickCount = 0;
+	#multiClickIntervalMs = DEFAULT_MULTI_CLICK_INTERVAL_MS;
 	#viewportOutputSource: ViewportOutputSource | null = null;
 	#manualOutputNotice = false;
 	#manualTranscriptLineCount = 0;
@@ -1186,6 +1205,12 @@ export class TUI extends Container {
 			 * `GJC_TUI_WIDTH_SETTLE_MS` / `PI_TUI_WIDTH_SETTLE_MS`, then 1000.
 			 */
 			widthSettleMs?: number;
+			/**
+			 * Window in ms for repeat clicks on one cell to escalate to word/line
+			 * selection. Defaults to `DEFAULT_MULTI_CLICK_INTERVAL_MS`; `0` disables
+			 * escalation so every click starts a fresh character selection.
+			 */
+			multiClickIntervalMs?: number;
 		} = {},
 	) {
 		super();
@@ -1200,6 +1225,13 @@ export class TUI extends Container {
 		}
 		if (options.widthSettleMs !== undefined && Number.isFinite(options.widthSettleMs) && options.widthSettleMs >= 0) {
 			this.#widthSettleMs = options.widthSettleMs;
+		}
+		if (
+			options.multiClickIntervalMs !== undefined &&
+			Number.isFinite(options.multiClickIntervalMs) &&
+			options.multiClickIntervalMs >= 0
+		) {
+			this.#multiClickIntervalMs = options.multiClickIntervalMs;
 		}
 		this.#imeCursorActive = !this.#showHardwareCursor && this.#useImeBlockCursor;
 		this.#unsubscribeTabWidthChange = onDefaultTabWidthChange(() => {
@@ -1314,7 +1346,7 @@ export class TUI extends Container {
 	setViewportSelection(start: MouseSelectionPoint, end: MouseSelectionPoint): void {
 		if (!this.options.copySelection) return;
 		// Non-finite coordinates would survive the clamp below as NaN, latch
-		// #mouseSelectionDragged, and force a repaint every frame while reporting a
+		// #mouseSelectionActive, and force a repaint every frame while reporting a
 		// NaN selection through getViewportObservation(). Reject them the same way
 		// scrollViewportBy does rather than storing an unpaintable selection.
 		if (![start.line, start.column, end.line, end.column].every(value => Number.isFinite(value))) return;
@@ -1332,7 +1364,9 @@ export class TUI extends Container {
 		}
 		this.#mouseSelectionStart = mappedStart;
 		this.#mouseSelectionEnd = mappedEnd;
-		this.#mouseSelectionDragged = true;
+		this.#mouseSelectionAnchor = mappedStart;
+		this.#mouseSelectionMode = "char";
+		this.#mouseSelectionActive = true;
 		this.requestRender(false, "selection");
 	}
 
@@ -2987,6 +3021,7 @@ export class TUI extends Container {
 			if (mouse.x > this.terminal.columns || mouse.y > this.terminal.rows) return;
 			if (mouse.kind === "wheel") {
 				this.#clearMouseSelection();
+				this.#resetClickCount();
 				this.scrollViewportBy(mouse.direction! * DEFAULT_WHEEL_LINES, { pin: "stable" });
 			} else if (mouse.kind === "click") {
 				this.#beginMouseSelection(mouse);
@@ -3081,31 +3116,128 @@ export class TUI extends Container {
 			: { line, column: mouse.x - 1 };
 	}
 
+	/**
+	 * Resolve the selection granularity for this press. SGR mouse reports carry no
+	 * click counter, so repeats are inferred from the previous press: same cell and
+	 * inside the multi-click window escalates char -> word -> line, anything else
+	 * restarts at char. A fourth click stays on line rather than cycling back, which
+	 * matches how terminal emulators clamp their own native selection.
+	 */
+	#nextClickMode(mouse: MouseEvent): MouseSelectionMode {
+		const now = Date.now();
+		const repeat =
+			this.#multiClickIntervalMs > 0 &&
+			this.#lastClickCell !== null &&
+			this.#lastClickCell.x === mouse.x &&
+			this.#lastClickCell.y === mouse.y &&
+			now - this.#lastClickAt <= this.#multiClickIntervalMs;
+		this.#clickCount = repeat ? Math.min(this.#clickCount + 1, 3) : 1;
+		this.#lastClickCell = { x: mouse.x, y: mouse.y };
+		this.#lastClickAt = now;
+		return this.#clickCount === 1 ? "char" : this.#clickCount === 2 ? "word" : "line";
+	}
+
+	#resetClickCount(): void {
+		this.#clickCount = 0;
+		this.#lastClickCell = null;
+		this.#lastClickAt = 0;
+	}
+
+	/** Painted transcript rows the selection reads from; manual history keeps its own frame. */
+	#selectionSourceLines(): string[] {
+		return this.#manualViewportTop === undefined ? this.#latestRenderedLines : this.#previousLines;
+	}
+
+	/** Control-stripped text of a painted row, or null when the row holds an image. */
+	#plainSelectionLine(line: number): string | null {
+		const rendered = this.#selectionSourceLines()[line];
+		if (rendered === undefined || TERMINAL.isImageLine(rendered)) return null;
+		return stripTerminalControls(rendered);
+	}
+
+	/**
+	 * Half-open column range `[start, end)` of the word covering `column`. Clicking a
+	 * separator selects the run of adjacent separators, so whitespace stays selectable
+	 * the way it is in a terminal emulator. Ranges are measured in columns, not string
+	 * indexes, so wide graphemes are never split.
+	 */
+	#wordColumnRange(text: string, column: number): { start: number; end: number } | null {
+		const cells: { separator: boolean; start: number; end: number }[] = [];
+		let cursor = 0;
+		for (const part of MOUSE_SELECTION_SEGMENTER.segment(text)) {
+			const next = cursor + Math.max(1, visibleWidth(part.segment));
+			cells.push({ separator: WORD_SEPARATORS.has(part.segment), start: cursor, end: next });
+			cursor = next;
+		}
+		const index = cells.findIndex(cell => column >= cell.start && column < cell.end);
+		if (index < 0) return null;
+		const separator = cells[index]!.separator;
+		let first = index;
+		let last = index;
+		while (first > 0 && cells[first - 1]!.separator === separator) first--;
+		while (last + 1 < cells.length && cells[last + 1]!.separator === separator) last++;
+		return { start: cells[first]!.start, end: cells[last]!.end };
+	}
+
+	/**
+	 * Snap a point to the selection granularity. `edge` picks which side of the
+	 * resolved span the point becomes, so a backward drag anchors on the far edge.
+	 * Columns returned here are inclusive, matching {@link MouseSelectionPoint}.
+	 */
+	#snapSelectionPoint(point: MouseSelectionPoint, edge: "start" | "end"): MouseSelectionPoint {
+		if (this.#mouseSelectionMode === "char") return point;
+		const text = this.#plainSelectionLine(point.line);
+		if (text === null) return point;
+		const width = visibleWidth(text);
+		if (this.#mouseSelectionMode === "line") {
+			return { line: point.line, column: edge === "start" ? 0 : Math.max(0, width - 1) };
+		}
+		const range = this.#wordColumnRange(text, point.column);
+		if (range === null) return point;
+		return { line: point.line, column: edge === "start" ? range.start : Math.max(range.start, range.end - 1) };
+	}
+
 	#beginMouseSelection(mouse: MouseEvent): void {
 		if (!this.options.copySelection) return;
+		const mode = this.#nextClickMode(mouse);
 		const point = this.#mouseSelectionPoint(mouse);
 		if (point === null) {
 			this.#clearMouseSelection();
+			this.#resetClickCount();
 			return;
 		}
-		this.#mouseSelectionStart = point;
-		this.#mouseSelectionEnd = point;
-		this.#mouseSelectionDragged = false;
+		this.#mouseSelectionMode = mode;
+		this.#mouseSelectionAnchor = point;
+		this.#mouseSelectionStart = this.#snapSelectionPoint(point, "start");
+		this.#mouseSelectionEnd = this.#snapSelectionPoint(point, "end");
+		// A word/line click is already a complete selection: paint and copy it without
+		// waiting for a drag. A plain click stays collapsed so it never copies.
+		this.#mouseSelectionActive = mode !== "char";
 	}
 
 	#updateMouseSelection(mouse: MouseEvent): void {
-		if (this.#mouseSelectionStart === null) return;
+		const anchor = this.#mouseSelectionAnchor;
+		if (this.#mouseSelectionStart === null || anchor === null) return;
 		const point = this.#mouseSelectionPoint(mouse);
 		if (point === null) return;
-		this.#mouseSelectionEnd = point;
-		this.#mouseSelectionDragged = true;
+		const forward = point.line > anchor.line || (point.line === anchor.line && point.column >= anchor.column);
+		// The anchor span stays whole while the far end grows, so dragging after a
+		// double click extends word by word instead of collapsing back to one cell.
+		this.#mouseSelectionStart = this.#snapSelectionPoint(anchor, forward ? "start" : "end");
+		this.#mouseSelectionEnd = this.#snapSelectionPoint(point, forward ? "end" : "start");
+		this.#mouseSelectionActive = true;
 	}
 
 	#finishMouseSelection(mouse: MouseEvent): void {
 		if (this.#mouseSelectionStart === null) return;
 		const point = this.#mouseSelectionPoint(mouse);
-		if (point !== null) this.#mouseSelectionEnd = point;
-		if (!this.#mouseSelectionDragged || !this.options.copySelection) {
+		if (point !== null && this.#mouseSelectionAnchor !== null) {
+			const anchor = this.#mouseSelectionAnchor;
+			const forward = point.line > anchor.line || (point.line === anchor.line && point.column >= anchor.column);
+			this.#mouseSelectionStart = this.#snapSelectionPoint(anchor, forward ? "start" : "end");
+			this.#mouseSelectionEnd = this.#snapSelectionPoint(point, forward ? "end" : "start");
+		}
+		if (!this.#mouseSelectionActive || !this.options.copySelection) {
 			this.#clearMouseSelection();
 			return;
 		}
@@ -3125,7 +3257,9 @@ export class TUI extends Container {
 	#clearMouseSelection(): void {
 		this.#mouseSelectionStart = null;
 		this.#mouseSelectionEnd = null;
-		this.#mouseSelectionDragged = false;
+		this.#mouseSelectionAnchor = null;
+		this.#mouseSelectionMode = "char";
+		this.#mouseSelectionActive = false;
 	}
 
 	#orderedMouseSelection(): { start: MouseSelectionPoint; end: MouseSelectionPoint } | null {
@@ -3159,7 +3293,7 @@ export class TUI extends Container {
 		const selection = this.#orderedMouseSelection();
 		if (selection === null) return "";
 		const selected: string[] = [];
-		const selectionLines = this.#manualViewportTop === undefined ? this.#latestRenderedLines : this.#previousLines;
+		const selectionLines = this.#selectionSourceLines();
 		for (let lineIndex = selection.start.line; lineIndex <= selection.end.line; lineIndex++) {
 			const line = selectionLines[lineIndex];
 			if (line === undefined || TERMINAL.isImageLine(line)) {
@@ -3178,7 +3312,7 @@ export class TUI extends Container {
 	}
 
 	#applyMouseSelection(lines: string[]): string[] {
-		if (!this.#mouseSelectionDragged) return lines;
+		if (!this.#mouseSelectionActive) return lines;
 		const selection = this.#orderedMouseSelection();
 		if (selection === null) return lines;
 		const highlighted = lines;
@@ -4076,7 +4210,7 @@ export class TUI extends Container {
 			}
 		}
 		const cursorVisible = cursorRow !== null && cursorRow >= 0 && cursorRow < height;
-		const selectedRange = this.#mouseSelectionDragged ? this.#orderedMouseSelection() : null;
+		const selectedRange = this.#mouseSelectionActive ? this.#orderedMouseSelection() : null;
 		const paintedSelection =
 			selectedRange === null
 				? null
@@ -4400,7 +4534,7 @@ export class TUI extends Container {
 			}
 			const nextViewportTop = resolvedAnchorTop ?? this.#manualViewportTop;
 			if (
-				!this.#mouseSelectionDragged &&
+				!this.#mouseSelectionActive &&
 				this.#previousWidth === width &&
 				this.#previousHeight === height &&
 				nextViewportTop === this.#manualViewportTop &&
