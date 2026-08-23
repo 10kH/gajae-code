@@ -248,16 +248,16 @@ describe("sdk broker package generation", () => {
 		}
 	}, 15_000);
 
-	it("uses the incarnation-bound native signal for Darwin unknown-operation fallback", () => {
+	it("fails closed when Darwin cannot signal an identity-bound stale broker", () => {
 		const originalPlatform = process.platform;
 		const processRef = {
 			incarnation: "darwin:1700000000:123456",
-			signalRoot: vi.fn(() => true),
+			signalRoot: vi.fn(() => false),
 		};
 		const fromPid = vi.spyOn(nativeProcessBindings().Process, "fromPid").mockReturnValue(processRef as never);
 		Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
 		try {
-			expect(signalExactBrokerForTest(4_242, processRef.incarnation)).toBe(true);
+			expect(signalExactBrokerForTest(4_242, processRef.incarnation)).toBe(false);
 			expect(processRef.signalRoot).toHaveBeenCalledWith(os.constants.signals.SIGTERM);
 		} finally {
 			Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });

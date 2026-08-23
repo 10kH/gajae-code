@@ -1428,10 +1428,9 @@ impl Process {
 	/// Send `signal` only to this pinned root process.
 	///
 	/// Linux delivers through the owned pidfd and Windows through the owned
-	/// process handle. Darwin has no pidfd, so its platform implementation
-	/// re-reads the kernel start-time identity immediately before the syscall
-	/// and refuses when the published incarnation is no longer present; callers
-	/// never fall back to a raw PID signal.
+	/// process handle. Darwin has no atomic identity-bound signal primitive, so
+	/// this operation fails closed there; callers must not fall back to a raw
+	/// PID signal after checking the published incarnation.
 	#[cfg_attr(
 		target_os = "macos",
 		allow(

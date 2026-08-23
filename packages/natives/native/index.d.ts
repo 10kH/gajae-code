@@ -320,9 +320,11 @@ export declare class Process {
    * Send `signal` only to this pinned process reference.
    *
    * On Linux this uses the owned pidfd; on Windows it uses the owned process
-   * handle. It deliberately never discovers descendants or signals a process
-   * group. Returns `false` when the pinned process has already exited or the
-   * operating system rejects delivery.
+   * handle. macOS has no atomic identity-bound signal primitive, so this
+   * operation deliberately fails closed there. It never discovers descendants
+   * or signals a process group. Returns `false` when the pinned process has
+   * already exited, the platform cannot bind delivery to the process
+   * identity, or the operating system rejects delivery.
    */
   signalRoot(signal: number): boolean
   /**
