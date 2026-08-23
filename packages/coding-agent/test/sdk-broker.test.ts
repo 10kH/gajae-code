@@ -1903,6 +1903,45 @@ describe("SDK broker identity and discovery", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	}, 20_000);
+	it("freezes a scoped session list descriptor and rejects conflicting continuation scope", async () => {
+		const dir = await temp();
+		const worktree = path.join(dir, "worktree");
+		const stateRoot = path.join(dir, "state");
+		await fs.mkdir(worktree, { recursive: true });
+		const git = Bun.spawn(["git", "init", "-q", worktree]);
+		await git.exited;
+		const broker = new Broker({ agentDir: dir });
+		await broker.index.open();
+		for (const sessionId of ["scope-a", "scope-b"]) {
+			await broker.index.append({
+				type: "host_registered",
+				sessionId,
+				locator: { cwd: worktree, worktreeRoot: worktree, stateRoot },
+				endpointGeneration: 1,
+				pid: process.pid,
+			});
+		}
+		const scope = { version: 1 as const, requested: "repo" as const, requestAnchor: { cwd: worktree, worktreeRoot: worktree } };
+		const first = await broker.handleRequest("session.list", { scope, limit: 1 });
+		expect(first.ok).toBe(true);
+		if (!first.ok) return;
+		const firstResult = first.result as { scope: unknown; observedAt: string; continuationCursor?: string; sessions: unknown[] };
+		expect(firstResult.sessions).toHaveLength(1);
+		expect(firstResult.continuationCursor).toBeString();
+		const mismatched = await broker.handleRequest("session.list", {
+			cursor: firstResult.continuationCursor,
+			scope: { ...scope, requested: "pwd" },
+		});
+		expect(mismatched).toEqual({
+			ok: false,
+			error: { code: "scope_cursor_mismatch", message: "scope must match the cursor snapshot" },
+		});
+		const second = await broker.handleRequest("session.list", { cursor: firstResult.continuationCursor });
+		expect(second.ok).toBe(true);
+		if (!second.ok) return;
+		expect((second.result as { scope: unknown; observedAt: string }).scope).toEqual(firstResult.scope);
+		expect((second.result as { observedAt: string }).observedAt).toBe(firstResult.observedAt);
+	});
 	it("returns only an endpoint bound to the indexed incarnation", async () => {
 		const dir = await temp();
 		const stateRoot = path.join(dir, "state");
