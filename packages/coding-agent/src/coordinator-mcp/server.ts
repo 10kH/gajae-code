@@ -1016,14 +1016,22 @@ type CoordinatorWorktreeResolution = { ok: true; name?: string } | { ok: false; 
  * thrown error would reach the controller as an undiagnosable `invalid_input`.
  */
 function resolveCoordinatorWorktree(sessionCommand: string | null, requested: unknown): CoordinatorWorktreeResolution {
+	if (requested !== undefined && typeof requested !== "string") return { ok: false, reason: "invalid_worktree_name" };
 	const name = optionalString(requested);
 	if (name === null) return { ok: true };
 	if (!coordinatorWorktreeEnabled(sessionCommand)) return { ok: false, reason: "worktree_not_enabled" };
 	// The selector is whitespace-split, so a name containing whitespace has no
-	// representation, and a leading `-` would parse as another flag. Everything
-	// else is left to git, which checks the name with `git check-ref-format`
-	// because a named worktree also creates a branch of that name.
+	// representation, and a leading `-` would parse as another flag.
 	if (name.startsWith("-") || /\s/.test(name)) return { ok: false, reason: "invalid_worktree_name" };
+	// Named worktrees create local branches. Validate the exact branch grammar at
+	// the coordinator boundary so malformed requests receive the typed refusal
+	// rather than a redacted lifecycle error. The argv array prevents the name
+	// from becoming shell syntax or another git option.
+	const validation = Bun.spawnSync(["git", "check-ref-format", "--branch", name], {
+		stdout: "ignore",
+		stderr: "ignore",
+	});
+	if (validation.exitCode !== 0) return { ok: false, reason: "invalid_worktree_name" };
 	return { ok: true, name };
 }
 

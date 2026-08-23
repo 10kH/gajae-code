@@ -128,7 +128,7 @@ describe("per-call worktree name", () => {
 		const root = await coordinatorFixtureRoot(tempDirs);
 		const { server, calls } = await createServer(root, "gjc --worktree");
 
-		for (const [index, worktree] of ["--force", "two words"].entries()) {
+		for (const [index, worktree] of ["--force", "two words", "bad..branch", "branch.lock", 1].entries()) {
 			expect(await startSession(server, root, { worktree }, `reject-${index}`)).toMatchObject({
 				ok: false,
 				reason: "invalid_worktree_name",
