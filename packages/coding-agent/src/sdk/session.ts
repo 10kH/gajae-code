@@ -158,7 +158,10 @@ import {
 	retireOwnedRegistrationsForEndpoint,
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
+import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
+import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
+import { createSessionLifecycleService } from "./lifecycle/client";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
@@ -3660,16 +3663,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				if (hasSession) session.configWarnings.push(warning);
 				logger.warn("Context file discovery warning", { warning });
 			}
+			// The master doctrine block is appended exactly once, AFTER any custom
+			// system-prompt transformation, and only for the master session itself.
+			const withMasterGuidance = (built: BuildSystemPromptResult): BuildSystemPromptResult =>
+				masterModeContext ? { ...built, systemPrompt: [...built.systemPrompt, masterModeTemplate.trim()] } : built;
 			if (options.systemPrompt === undefined) {
-				return defaultPrompt;
+				return withMasterGuidance(defaultPrompt);
 			}
 			if (Array.isArray(options.systemPrompt)) {
-				return { systemPrompt: options.systemPrompt, warnings: defaultPrompt.warnings };
+				return withMasterGuidance({ systemPrompt: options.systemPrompt, warnings: defaultPrompt.warnings });
 			}
-			return {
+			return withMasterGuidance({
 				systemPrompt: options.systemPrompt(defaultPrompt.systemPrompt),
 				warnings: defaultPrompt.warnings,
-			};
+			});
 		};
 
 		const toolNamesFromRegistry = Array.from(toolRegistry.keys());
@@ -4212,6 +4219,29 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// carried by the host replay ring through the internal runtime seam above.
 		if (autoroutingInactive) session.configWarnings.push(AUTOROUTING_INACTIVE_WARNING);
 		hasSession = true;
+		if (masterModeContext) {
+			// One scoped, no-probe peer snapshot immediately before the FIRST accepted
+			// provider request; see createMasterPeerSnapshotContributor for the
+			// discard/reuse/no-duplicate semantics.
+			const capturedSession = session;
+			session.registerBeforeAgentStartContributor(
+				createMasterPeerSnapshotContributor({
+					lifecycle: createSessionLifecycleService(agentDir),
+					ownerSessionId: masterModeContext.ownerSessionId,
+					scope: masterModeContext.scope,
+					getCwd: getLiveCwd,
+					hasPersistedInjection: () =>
+						capturedSession.sessionManager
+							.getBranch()
+							.some(
+								entry =>
+									entry.type === "message" &&
+									(entry.message as { customType?: string }).customType === MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
+							),
+					onError: error => logger.debug("master peer snapshot injection failed", { error: safeErrorForLog(error) }),
+				}),
+			);
+		}
 		const sessionAsyncJobManager = asyncJobManager;
 		if (sessionAsyncJobManager) {
 			session.yieldQueue.register<AsyncResultEntry>("async-result", {
