@@ -64,7 +64,8 @@ describe("SDK-owned session lifecycle authority", () => {
 		expect(router).toContain("readSdkSessionEndpoint");
 		expect(router).toContain("readSdkBrokerDiscovery");
 		expect(lifecycleClient).toContain('from "./broker-client"');
-		expect(brokerClient).toContain("readSdkBrokerDiscovery");
+		expect(brokerClient).toContain("ensureBroker");
+		expect(brokerClient).not.toContain("readSdkBrokerDiscovery");
 	});
 
 	test("providers consume opaque Router attachments", async () => {

@@ -5,6 +5,7 @@ import path from "node:path";
 import type { AgentSideConnection, SessionNotification } from "@agentclientprotocol/sdk";
 import { AcpAgent, acpSkillInvocation } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import { resolveSdkPackageAuthority } from "../src/sdk/broker/runtime";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 
 type TestServer = {
@@ -15,6 +16,7 @@ type TestServer = {
 
 const directories: string[] = [];
 const servers: Array<{ stop(closeActiveConnections?: boolean): void }> = [];
+const packageAuthority = resolveSdkPackageAuthority();
 
 afterEach(async () => {
 	for (const server of servers.splice(0)) server.stop(true);
@@ -40,14 +42,18 @@ async function bounded<T>(promise: Promise<T>, label: string, timeoutMs = 15_000
 
 type SessionListResponse = Record<string, unknown>;
 
-async function createSessionListBroker(
-	responder: (input: Record<string, unknown>) => SessionListResponse,
-): Promise<{ directory: string; agentDir: string; requests: Array<Record<string, unknown>> }> {
+async function createSessionListBroker(responder: (input: Record<string, unknown>) => SessionListResponse): Promise<{
+	directory: string;
+	agentDir: string;
+	requests: Array<Record<string, unknown>>;
+	connections: () => number;
+}> {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-session-list-"));
 	directories.push(directory);
 	const agentDir = path.join(directory, ".gjc", "agent");
 	const token = "acp-session-list-token";
 	const requests: Array<Record<string, unknown>> = [];
+	let connectionCount = 0;
 	let server!: TestServer;
 	server = Bun.serve({
 		hostname: "127.0.0.1",
@@ -59,6 +65,7 @@ async function createSessionListBroker(
 		},
 		websocket: {
 			open(socket) {
+				connectionCount += 1;
 				socket.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
 			},
 			message(socket, raw) {
@@ -74,6 +81,8 @@ async function createSessionListBroker(
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
+		packageVersion: packageAuthority.packageVersion,
+		installationIdentity: packageAuthority.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -83,7 +92,7 @@ async function createSessionListBroker(
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
 	});
-	return { directory, agentDir, requests };
+	return { directory, agentDir, requests, connections: () => connectionCount };
 }
 
 test("ACP advertised skill commands require one complete canonical text block", () => {
@@ -102,6 +111,18 @@ test("ACP advertised skill commands require one complete canonical text block", 
 		name: "not-advertised",
 		args: "",
 	});
+});
+
+test("concurrent ACP broker requests share one canonical connection", async () => {
+	const fixture = await createSessionListBroker(() => ({ sessions: [] }));
+	const agent = new AcpAgent({ signal: new AbortController().signal } as unknown as AgentSideConnection, {
+		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
+	});
+	const [first, second] = await Promise.all([agent.listSessions({}), agent.listSessions({})]);
+	expect(first).toEqual({ sessions: [] });
+	expect(second).toEqual({ sessions: [] });
+	expect(fixture.connections()).toBe(1);
 });
 test("production ACP routes zero-session SDK globals through the broker adapter", async () => {
 	const directory = await mkdtemp(path.join(tmpdir(), "gjc-sdk-acp-production-"));
@@ -134,6 +155,8 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
+		packageVersion: packageAuthority.packageVersion,
+		installationIdentity: packageAuthority.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -145,7 +168,10 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 	});
 
 	const abort = new AbortController();
-	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, { agentDir });
+	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
+		agentDir,
+		expectedPackageGeneration: "test",
+	});
 	const result = await agent.extMethod("_gjc/sdk/global", { operation: "session.list" });
 
 	expect(result).toMatchObject({ ok: true, result: { sessions: [] } });
@@ -175,6 +201,7 @@ test("production ACP drains session.list continuation pages before returning ses
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
 		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
 	});
 	try {
 		const listed = await agent.listSessions({});
@@ -195,6 +222,7 @@ test("production ACP rejects an ok:false session.list continuation instead of re
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
 		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
 	});
 	try {
 		await expect(agent.listSessions({})).rejects.toMatchObject({
@@ -215,6 +243,7 @@ test("production ACP rejects repeated session.list cursors without returning par
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
 		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
 	});
 	try {
 		await expect(agent.listSessions({})).rejects.toMatchObject({
@@ -236,6 +265,7 @@ test("production ACP rejects malformed session.list continuation pages without p
 	const abort = new AbortController();
 	const agent = new AcpAgent({ signal: abort.signal } as unknown as AgentSideConnection, {
 		agentDir: fixture.agentDir,
+		expectedPackageGeneration: "test",
 	});
 	try {
 		await expect(agent.listSessions({})).rejects.toMatchObject({
@@ -644,6 +674,8 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
+		packageVersion: packageAuthority.packageVersion,
+		installationIdentity: packageAuthority.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -663,7 +695,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 			signal: controller.signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection,
-		{ agentDir, startupOptions: { modelPreset: "codex-medium" } },
+		{ agentDir, startupOptions: { modelPreset: "codex-medium" }, expectedPackageGeneration: "test" },
 	);
 	const initialized = await bounded(agent.initialize({ protocolVersion: 1, clientCapabilities: {} }), "initialize");
 	// Legacy MCP HTTP+SSE is deprecated and unimplemented, so it must not be advertised.
@@ -1220,7 +1252,10 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	).rejects.toMatchObject({ code: "unsupported" });
 
 	const observerAbort = new AbortController();
-	const observer = new AcpAgent({ signal: observerAbort.signal } as unknown as AgentSideConnection, { agentDir });
+	const observer = new AcpAgent({ signal: observerAbort.signal } as unknown as AgentSideConnection, {
+		agentDir,
+		expectedPackageGeneration: "test",
+	});
 	await bounded(observer.listSessions({}), "observer list");
 	const brokerRequestCount = brokerRequests.length;
 	// Enumerating a session through `session/list` must not confer destructive

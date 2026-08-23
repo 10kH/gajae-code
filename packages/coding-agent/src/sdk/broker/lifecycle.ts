@@ -4048,6 +4048,7 @@ async function executeLifecycleResponse(
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
+				const commandEnvironment = "kind" in cmd ? cmd.env : process.env;
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
@@ -4058,7 +4059,7 @@ async function executeLifecycleResponse(
 					// by the OS rather than captured (#4712 review).
 					stdio: "ignore",
 					env: {
-						...("kind" in cmd ? cmd.env : process.env),
+						...commandEnvironment,
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,

@@ -20,8 +20,17 @@
  * build`) and on non-Windows so the regular path is unchanged.
  */
 import { describe, expect, it } from "bun:test";
+import { createHash } from "node:crypto";
+import * as fsSync from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAddonFilenames, resolveLoaderCandidates, shouldStageNodeModulesAddon } from "../native/loader-state.js";
+import {
+	getAddonFilenames,
+	loadNative,
+	maybeStageNodeModulesAddon,
+	resolveLoaderCandidates,
+	shouldStageNodeModulesAddon,
+} from "../native/loader-state.js";
 import packageJson from "../package.json" with { type: "json" };
 
 const winNodeModulesNativeDir = "C:\\Users\\Admin\\node_modules\\@gajae-code\\pi-natives\\native";
@@ -125,6 +134,266 @@ describe("windows native addon staging", () => {
 		const nodeModulesBaseline = path.join(posixNodeModulesNativeDir, "pi_natives.linux-x64-baseline.node");
 		expect(candidates).not.toContain(versionedBaseline);
 		expect(candidates).toContain(nodeModulesBaseline);
+	});
+
+	it("does not reuse a staged addon whose bytes drifted from the package artifact", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-drift-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(path.join(nativeDir, filename), "new-addon");
+		await fs.writeFile(path.join(versionedDir, filename), "old-addon");
+		try {
+			const errors: string[] = [];
+			const staged = maybeStageNodeModulesAddon(
+				{
+					isCompiledBinary: false,
+					platformTag: "win32-x64",
+					stageFromNodeModules: true,
+					versionedDir,
+					addonFilenames: [filename],
+					optionalPackageNativeDirs: [],
+					nativeDir,
+				},
+				errors,
+			);
+			expect(staged).toBeString();
+			expect(staged).not.toBe(path.join(versionedDir, filename));
+			expect(staged).not.toContain(nativeDir);
+			expect(await fs.readFile(staged as string, "utf8")).toBe("new-addon");
+			expect(errors).toEqual([expect.stringContaining("staged addon drift")]);
+			await fs.rm(path.join(nativeDir, filename));
+			const orphanErrors: string[] = [];
+			expect(
+				maybeStageNodeModulesAddon(
+					{
+						isCompiledBinary: false,
+						platformTag: "win32-x64",
+						stageFromNodeModules: true,
+						versionedDir,
+						addonFilenames: [filename],
+						optionalPackageNativeDirs: [],
+						nativeDir,
+					},
+					orphanErrors,
+				),
+			).toBeNull();
+			expect(orphanErrors).toEqual([expect.stringContaining("staged addon orphan")]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when staged loading receives an incomplete context", () => {
+		const errors: string[] = [];
+		expect(
+			maybeStageNodeModulesAddon(
+				{ isCompiledBinary: false, platformTag: "win32-x64", stageFromNodeModules: true },
+				errors,
+			),
+		).toBeNull();
+		expect(errors).toEqual(["staged addon context is incomplete"]);
+	});
+
+	it("rejects a symlinked content-addressed refresh entry", async () => {
+		if (process.platform === "win32") return;
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-symlink-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		const sourcePath = path.join(nativeDir, filename);
+		const refreshPath = path.join(
+			versionedDir,
+			`.refresh-${createHash("sha256").update("new-addon").digest("hex").slice(0, 24)}-${filename}`,
+		);
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(sourcePath, "new-addon");
+		await fs.writeFile(path.join(versionedDir, filename), "old-addon");
+		await fs.symlink(sourcePath, refreshPath);
+		try {
+			const errors: string[] = [];
+			expect(
+				maybeStageNodeModulesAddon(
+					{
+						isCompiledBinary: false,
+						platformTag: "win32-x64",
+						stageFromNodeModules: true,
+						versionedDir,
+						addonFilenames: [filename],
+						optionalPackageNativeDirs: [],
+						nativeDir,
+					},
+					errors,
+				),
+			).toBeNull();
+			expect(errors).toEqual([
+				expect.stringContaining("staged addon drift"),
+				expect.stringContaining("staged addon refresh"),
+			]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("removes drifted staged candidates before native loading", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-load-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		const stagedPath = path.join(versionedDir, filename);
+		const sourcePath = path.join(nativeDir, filename);
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(sourcePath, "new-addon");
+		await fs.writeFile(stagedPath, "old-addon");
+		try {
+			const loadSelected = () => {
+				const attempted: string[] = [];
+				const bindings = loadNative({
+					context: {
+						isCompiledBinary: false,
+						stageFromNodeModules: true,
+						platformTag: "win32-x64",
+						packageVersion: "test",
+						selectedVariant: "baseline",
+						versionedDir,
+						nativeDir,
+						optionalPackageNativeDirs: [],
+						addonFilenames: [filename],
+						candidates: [stagedPath, sourcePath],
+					},
+					extractEmbeddedAddons: () => [],
+					stageNodeModulesAddon: (ctx, stageErrors) => maybeStageNodeModulesAddon(ctx, stageErrors),
+					requireCandidate: candidate => {
+						attempted.push(candidate);
+						if (candidate === stagedPath || candidate === sourcePath) {
+							throw new Error("stale node_modules candidate should not be loaded");
+						}
+						return { selected: candidate };
+					},
+					validateCandidate: () => undefined,
+				});
+				return { bindings, attempted };
+			};
+
+			const first = loadSelected();
+			expect(first.attempted).toHaveLength(1);
+			expect(first.attempted[0]).not.toBe(sourcePath);
+			expect(first.attempted[0]).not.toBe(stagedPath);
+			expect(first.attempted[0]).not.toContain(nativeDir);
+			expect(await fs.readFile(first.attempted[0], "utf8")).toBe("new-addon");
+
+			await fs.utimes(first.attempted[0], new Date(0), new Date(Date.now() - 2 * 24 * 60 * 60 * 1000));
+			await fs.writeFile(sourcePath, "newer-addon");
+			const second = loadSelected();
+			expect(second.attempted).toHaveLength(1);
+			expect(second.attempted[0]).not.toBe(first.attempted[0]);
+			expect(second.attempted[0]).not.toBe(sourcePath);
+			expect(await fs.readFile(second.attempted[0], "utf8")).toBe("newer-addon");
+			await expect(fs.stat(first.attempted[0])).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a warm refresh replaced after staging and before require", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-warm-race-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		const sourcePath = path.join(nativeDir, filename);
+		const stagedPath = path.join(versionedDir, filename);
+		const refreshPath = path.join(
+			versionedDir,
+			`.refresh-${createHash("sha256").update("new-addon").digest("hex").slice(0, 24)}-${filename}`,
+		);
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(sourcePath, "new-addon");
+		await fs.writeFile(stagedPath, "old-addon");
+		await fs.writeFile(refreshPath, "new-addon");
+		try {
+			const attempted: string[] = [];
+			expect(() =>
+				loadNative({
+					context: {
+						isCompiledBinary: false,
+						stageFromNodeModules: true,
+						platformTag: "win32-x64",
+						packageVersion: "test",
+						selectedVariant: "baseline",
+						versionedDir,
+						nativeDir,
+						optionalPackageNativeDirs: [],
+						addonFilenames: [filename],
+						candidates: [refreshPath, stagedPath, sourcePath],
+					},
+					extractEmbeddedAddons: () => [],
+					stageNodeModulesAddon: (ctx, stageErrors) => {
+						const selected = maybeStageNodeModulesAddon(ctx, stageErrors);
+						if (selected) fsSync.writeFileSync(selected, "tampered-addon");
+						return selected;
+					},
+					requireCandidate: candidate => {
+						attempted.push(candidate);
+						return { selected: candidate };
+					},
+					validateCandidate: () => undefined,
+				}),
+			).toThrow("staged addon changed before load");
+			expect(attempted).toEqual([]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a matching staged addon replaced after staging and before require", async () => {
+		const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-native-stage-matching-race-"));
+		const nativeDir = path.join(root, "native");
+		const versionedDir = path.join(root, "versioned");
+		const filename = "pi_natives.win32-x64.node";
+		const sourcePath = path.join(nativeDir, filename);
+		const stagedPath = path.join(versionedDir, filename);
+		await fs.mkdir(nativeDir, { recursive: true });
+		await fs.mkdir(versionedDir, { recursive: true });
+		await fs.writeFile(sourcePath, "matching-addon");
+		await fs.writeFile(stagedPath, "matching-addon");
+		try {
+			const attempted: string[] = [];
+			expect(() =>
+				loadNative({
+					context: {
+						isCompiledBinary: false,
+						stageFromNodeModules: true,
+						platformTag: "win32-x64",
+						packageVersion: "test",
+						selectedVariant: "baseline",
+						versionedDir,
+						nativeDir,
+						optionalPackageNativeDirs: [],
+						addonFilenames: [filename],
+						candidates: [stagedPath, sourcePath],
+					},
+					extractEmbeddedAddons: () => [],
+					stageNodeModulesAddon: (ctx, stageErrors) => {
+						const selected = maybeStageNodeModulesAddon(ctx, stageErrors);
+						if (selected) fsSync.writeFileSync(selected, "tampered-addon");
+						return selected;
+					},
+					requireCandidate: candidate => {
+						attempted.push(candidate);
+						return { selected: candidate };
+					},
+					validateCandidate: () => undefined,
+				}),
+			).toThrow("staged addon changed before load");
+			expect(attempted).toEqual([]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 });
 

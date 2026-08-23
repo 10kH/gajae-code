@@ -791,6 +791,7 @@ test("publishes exact durable authority generation 173 at serving epoch 88", () 
 	// (#4689). The daemon builds a SessionRouter, so a pre-upgrade owner would
 	// retain the old per-tick locked index rescan. Generation alone does not
 	// force replacement, so the serving epoch advances with it.
+
 	expect(DAEMON_GENERATION).toBe(173);
 	expect(SERVING_EPOCH).toBe(88);
 });
