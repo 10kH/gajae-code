@@ -127,9 +127,9 @@ Autoresearch produces research findings and a verdict; it never implements. Down
 
 ## Ending a mission
 
-Two exits, both one step: These exits cover pre-verdict and inconclusive missions — a non-inconclusive verdict already finalizes itself, because the verdict-completion sequence runs `gjc autoresearch clear` automatically.
+Two exits, both one step: These exits cover pre-verdict and inconclusive missions — a conclusive verdict requests the same clear sequence from the agent after its matching goal pass completes.
 
-- **Hand off to planning/clarification**: invoke `/skill:ralplan`, `/skill:deep-interview`, or `/skill:ultragoal` directly — autoresearch is handoff-ready at any phase (`intake`/`research`/`verdict`), and the skill tool performs the atomic state handoff itself. No `gjc state` preparation is needed.
+- **Hand off to planning/clarification**: when the turn still permits tools, drop this mission's matching nonterminal goal first, then invoke `/skill:ralplan`, `/skill:deep-interview`, or `/skill:ultragoal` — autoresearch is handoff-ready at any phase (`intake`/`research`/`verdict`), and the skill tool performs the atomic workflow-state handoff itself, not an atomic goal-state cleanup. No `gjc state` preparation is needed.
 - **Finalize only**: `gjc autoresearch clear` retires the mission artifact and its working set, appends `mission_cleared` to the ledger, and marks the workflow complete — no handoff target required.
 
-Both exits drop the inline goal when one is still active; the post-verdict auto-clear never does, because its goal is already complete — see [Goal mode (nudge until verdict)](#goal-mode-nudge-until-verdict).
+Neither command or handoff automatically drops an inline goal: explicitly drop this mission's matching nonterminal goal before a manual exit when possible, and after cancellation or failed cleanup re-enter and reconcile it. The post-verdict auto-clear never drops its goal because that goal is already complete — see [Goal mode (nudge until verdict)](#goal-mode-nudge-until-verdict).
