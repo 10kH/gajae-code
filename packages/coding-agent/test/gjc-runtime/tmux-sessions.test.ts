@@ -690,6 +690,58 @@ describe("GJC tmux session management", () => {
 			}),
 		);
 	});
+	it("passes a structured Broker launch through managed tmux without inheriting the parent session identity", () => {
+		let plannedArgv: string[] | undefined;
+		__setCreateOwnerIsolationForTests({
+			execute: plan => {
+				if (!plan.ok) throw new Error("expected owner-isolation plan");
+				plannedArgv = plan.execution.argv;
+				return { ok: false, code: "scope_bootstrap_failed", diagnostic: "test-stop" };
+			},
+		});
+		const cwd = path.join(os.tmpdir(), `gjc-broker-launch-${crypto.randomUUID()}`);
+		expect(() =>
+			createGjcTmuxSession(
+				{
+					GJC_TMUX_COMMAND: "tmux",
+					GJC_COORDINATOR_SESSION_ID: "parent-session",
+					GJC_COORDINATOR_SESSION_STATE_FILE: path.join(os.tmpdir(), "parent-state.json"),
+				},
+				{
+					platform: "darwin",
+					launch: {
+						childSessionId: "broker-child",
+						cwd,
+						argv: ["child-command", "--safe"],
+						env: {
+							BROKER_CHILD_ENV: "enabled",
+							GJC_COORDINATOR_SESSION_ID: "untrusted-parent",
+							GJC_MANAGED_OWNER_REDACT_COMMAND: "0",
+						},
+					},
+				},
+			),
+		).toThrow("gjc_tmux_owner_isolation_scope_bootstrap_failed:test-stop");
+		expect(plannedArgv?.slice(0, -1)).toEqual([
+			"tmux",
+			"new-session",
+			"-d",
+			"-s",
+			"broker-child",
+			"-c",
+			cwd,
+			"-P",
+			"-F",
+			"#{session_id}",
+		]);
+		const innerCommand = plannedArgv?.at(-1);
+		expect(innerCommand).toContain("GJC_COORDINATOR_SESSION_ID='broker-child'");
+		expect(innerCommand).not.toContain("parent-session");
+		expect(innerCommand).not.toContain("untrusted-parent");
+		expect(innerCommand).toContain("BROKER_CHILD_ENV='enabled'");
+		expect(innerCommand).toContain("GJC_MANAGED_OWNER_COMMAND_JSON='[\"child-command\",\"--safe\"]'");
+		expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
+	});
 	it("refuses psmux before attach-session mutation", () => {
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
 		try {

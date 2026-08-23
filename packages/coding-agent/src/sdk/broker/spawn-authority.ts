@@ -42,6 +42,36 @@ export interface MasterCapabilityVerifier {
 	verifyMasterCapability(ownerSessionId: string, rawCapability: string, attestationEpoch: string): Promise<{ allowed: boolean }>;
 }
 
+/** Structured, shell-free child launch contract owned by the Broker. */
+export interface SpawnSubstrateLaunchSpec {
+	childSessionId: string;
+	cwd: string;
+	argv: readonly string[];
+	env?: Readonly<Record<string, string>>;
+}
+
+/** Durable facts required to re-prove one spawned substrate without task material. */
+export type SpawnSubstrateProof = {
+	substrateKind: "tmux" | "psmux" | "headless";
+	providerIdentity: string;
+	nativeSessionId?: string;
+	pid?: number;
+	processIncarnation?: string;
+	ownerGeneration?: number;
+	stateFileProof?: Readonly<Record<string, string | number>>;
+};
+
+export interface SpawnSubstrateProvider {
+	launch(
+		spec: SpawnSubstrateLaunchSpec,
+	): Promise<
+		| { ok: true; proof: SpawnSubstrateProof }
+		| { ok: false; code: "substrate_unavailable" | "substrate_proof_failed"; message: string }
+	>;
+	verify(proof: SpawnSubstrateProof): Promise<"verified" | "mismatch" | "gone">;
+	close(proof: SpawnSubstrateProof): Promise<{ ok: boolean; code?: string }>;
+}
+
 export type SpawnClaimDecision =
 	| { kind: "owner"; claim: SpawnClaimV2; recovery: boolean }
 	| { kind: "in_progress"; claim: SpawnClaimV2 }

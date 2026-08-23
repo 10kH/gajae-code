@@ -15,6 +15,8 @@ export const MANAGED_OWNER_GENERATION_ENV = "GJC_TMUX_OWNER_GENERATION";
 export const MANAGED_OWNER_STATE_DIR_ENV = "GJC_TMUX_OWNER_STATE_DIR";
 export const MANAGED_OWNER_RUN_ID_ENV = "GJC_MANAGED_OWNER_RUN_ID";
 export const MANAGED_OWNER_INCARNATION_ENV = "GJC_MANAGED_OWNER_INCARNATION";
+/** Suppresses command-derived durable artifacts for Broker-owned opaque spawn children. */
+export const MANAGED_OWNER_REDACT_COMMAND_ENV = "GJC_MANAGED_OWNER_REDACT_COMMAND";
 
 let bootstrapSigtermPending = false;
 const captureBootstrapSigterm = () => {
@@ -140,26 +142,32 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	if (!supervisorStartTime) throw new Error("managed_owner_supervisor_start_time_unavailable");
 	await fs.mkdir(root, { recursive: true, mode: 0o700 });
 	const childToken = crypto.randomUUID();
-	const binding: ManagedOwnerBinding = {
-		schema_version: 2,
-		generation,
-		session_id: sessionId,
-		run_id: runId,
-		endpoint_incarnation: incarnation,
-		child_token: childToken,
-		command,
-		command_sha256: commandDigest(command),
-		supervisor_pid: process.pid,
-		supervisor_start_time: supervisorStartTime,
-		created_at: new Date().toISOString(),
-	};
-	await writeDurableExclusive(path.join(root, `child-${childToken}.binding.json`), binding);
+	const redactCommand = process.env[MANAGED_OWNER_REDACT_COMMAND_ENV] === "1";
+	const binding: ManagedOwnerBinding | null = redactCommand
+		? null
+		: {
+				schema_version: 2,
+				generation,
+				session_id: sessionId,
+				run_id: runId,
+				endpoint_incarnation: incarnation,
+				child_token: childToken,
+				command,
+				command_sha256: commandDigest(command),
+				supervisor_pid: process.pid,
+				supervisor_start_time: supervisorStartTime,
+				created_at: new Date().toISOString(),
+			};
+	if (binding) await writeDurableExclusive(path.join(root, `child-${childToken}.binding.json`), binding);
+	const childEnvironment: NodeJS.ProcessEnv = { ...process.env, [MANAGED_OWNER_CHILD_TOKEN_ENV]: childToken };
+	delete childEnvironment[MANAGED_OWNER_COMMAND_ENV];
+	delete childEnvironment[MANAGED_OWNER_REDACT_COMMAND_ENV];
 	const child = Bun.spawn({
 		cmd: command,
 		stdin: "inherit",
 		stdout: "inherit",
 		stderr: "inherit",
-		env: { ...process.env, [MANAGED_OWNER_CHILD_TOKEN_ENV]: childToken },
+		env: childEnvironment,
 	});
 	const childStartTime = await managedOwnerProcessProvenance(child.pid);
 	if (!childStartTime) throw new Error("managed_owner_child_start_time_unavailable");
@@ -167,24 +175,26 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 	if (!childProcess) {
 		const exitCode = await child.exited;
 		if (child.signalCode === "SIGABRT") {
-			const receipt: ManagedOwnerSigabrtReceipt = {
-				schema_version: 2,
-				generation,
-				session_id: sessionId,
-				run_id: runId,
-				endpoint_incarnation: incarnation,
-				child_token: childToken,
-				command_sha256: binding.command_sha256,
-				supervisor_pid: process.pid,
-				supervisor_start_time: supervisorStartTime,
-				child_pid: child.pid,
-				child_start_time: childStartTime,
-				signal: "SIGABRT",
-				signal_number: 6,
-				exit_code: exitCode,
-				received_at: new Date().toISOString(),
-			};
-			await writeDurableExclusive(path.join(root, `sigabrt-${childToken}.receipt.json`), receipt);
+			if (binding) {
+				const receipt: ManagedOwnerSigabrtReceipt = {
+					schema_version: 2,
+					generation,
+					session_id: sessionId,
+					run_id: runId,
+					endpoint_incarnation: incarnation,
+					child_token: childToken,
+					command_sha256: binding.command_sha256,
+					supervisor_pid: process.pid,
+					supervisor_start_time: supervisorStartTime,
+					child_pid: child.pid,
+					child_start_time: childStartTime,
+					signal: "SIGABRT",
+					signal_number: 6,
+					exit_code: exitCode,
+					received_at: new Date().toISOString(),
+				};
+				await writeDurableExclusive(path.join(root, `sigabrt-${childToken}.receipt.json`), receipt);
+			}
 			process.exitCode = 134;
 			return;
 		}
@@ -246,24 +256,26 @@ export async function runManagedOwnerSupervisor(): Promise<void> {
 		});
 	}
 	if (child.signalCode === "SIGABRT") {
-		const receipt: ManagedOwnerSigabrtReceipt = {
-			schema_version: 2,
-			generation,
-			session_id: sessionId,
-			run_id: runId,
-			endpoint_incarnation: incarnation,
-			child_token: childToken,
-			command_sha256: binding.command_sha256,
-			supervisor_pid: process.pid,
-			supervisor_start_time: supervisorStartTime,
-			child_pid: child.pid,
-			child_start_time: childStartTime,
-			signal: "SIGABRT",
-			signal_number: 6,
-			exit_code: exitCode,
-			received_at: new Date().toISOString(),
-		};
-		await writeDurableExclusive(path.join(root, `sigabrt-${childToken}.receipt.json`), receipt);
+		if (binding) {
+			const receipt: ManagedOwnerSigabrtReceipt = {
+				schema_version: 2,
+				generation,
+				session_id: sessionId,
+				run_id: runId,
+				endpoint_incarnation: incarnation,
+				child_token: childToken,
+				command_sha256: binding.command_sha256,
+				supervisor_pid: process.pid,
+				supervisor_start_time: supervisorStartTime,
+				child_pid: child.pid,
+				child_start_time: childStartTime,
+				signal: "SIGABRT",
+				signal_number: 6,
+				exit_code: exitCode,
+				received_at: new Date().toISOString(),
+			};
+			await writeDurableExclusive(path.join(root, `sigabrt-${childToken}.receipt.json`), receipt);
+		}
 		process.exitCode = 134;
 		return;
 	}
