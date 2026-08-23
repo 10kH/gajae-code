@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -28,7 +28,12 @@ import {
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 } from "./discovery";
-import { deriveIdempotencyIdentity } from "./identity";
+import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
+import {
+	type MasterCapabilityVerifier,
+	SpawnAuthorityStore,
+	type SpawnClaimV2,
+} from "./spawn-authority";
 import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId } from "./lifecycle";
 import {
 	type LifecycleDurableEffectsReceipt,
@@ -54,6 +59,8 @@ export interface BrokerSettings {
 	heartbeatTtlMs?: number;
 	/** Broker-owned migration policy. Client lifecycle frames cannot select it. */
 	resolveDirectoryMigration?: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
+	/** Live-only, host-mediated capability verifier. It retains no request input. */
+	masterCapabilityVerifier?: MasterCapabilityVerifier;
 }
 
 type ResolvedBrokerSettings = {
@@ -64,6 +71,7 @@ type ResolvedBrokerSettings = {
 	port: number;
 	heartbeatTtlMs: number;
 	resolveDirectoryMigration: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
+	masterCapabilityVerifier?: MasterCapabilityVerifier;
 };
 
 function modelResolutionCwd(input: Record<string, unknown>): string | undefined {
@@ -253,6 +261,68 @@ const SESSION_LIST_DEFAULT_LIMIT = 100;
 const SESSION_LIST_MAX_LIMIT = 100;
 const SESSION_LIST_CURSOR_TTL_MS = 15 * 60 * 1_000;
 const SESSION_LIST_MAX_CURSORS = 32;
+type SpawnInFlight = {
+	completion: Promise<BrokerResponse>;
+	resolve: (response: BrokerResponse) => void;
+	claimId?: string;
+	phase?: "prepared";
+};
+
+type SpawnAdmissionInput = {
+	task: string;
+	masterCapability: string;
+	ownerSessionId: string;
+	attestationEpoch: string;
+	cwd: string;
+	modelId?: string;
+	modelPreset?: string;
+};
+
+function parseSpawnInput(input: Record<string, unknown>, idempotencyKey: string | undefined): SpawnAdmissionInput | BrokerResponse {
+	if (!idempotencyKey || idempotencyKey.length > 512) return error("invalid_input", "idempotencyKey is required for session.spawn");
+	const allowed = new Set([
+		"task",
+		"prompt",
+		"masterCapability",
+		"ownerSessionId",
+		"attestationEpoch",
+		"cwd",
+		"modelId",
+		"modelPreset",
+	]);
+	if (Object.keys(input).some(key => !allowed.has(key))) return error("invalid_input", "session.spawn input is invalid");
+	const task = input.task ?? input.prompt;
+	if (
+		typeof task !== "string" ||
+		task.length === 0 ||
+		task.length > 1_000_000 ||
+		(input.task !== undefined && input.prompt !== undefined && input.task !== input.prompt)
+	)
+		return error("invalid_input", "session.spawn task is invalid");
+	if (typeof input.masterCapability !== "string" || input.masterCapability.length === 0 || input.masterCapability.length > 16_384)
+		return error("invalid_input", "session.spawn capability is invalid");
+	if (
+		typeof input.ownerSessionId !== "string" ||
+		!isCanonicalSessionId(input.ownerSessionId) ||
+		typeof input.attestationEpoch !== "string" ||
+		input.attestationEpoch.length === 0 ||
+		input.attestationEpoch.length > 512 ||
+		typeof input.cwd !== "string" ||
+		input.cwd.length === 0 ||
+		(input.modelId !== undefined && (typeof input.modelId !== "string" || input.modelId.length === 0)) ||
+		(input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
+	)
+		return error("invalid_input", "session.spawn input is invalid");
+	return {
+		task,
+		masterCapability: input.masterCapability,
+		ownerSessionId: input.ownerSessionId,
+		attestationEpoch: input.attestationEpoch,
+		cwd: path.resolve(input.cwd),
+		...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
+		...(typeof input.modelPreset === "string" ? { modelPreset: input.modelPreset } : {}),
+	};
+}
 
 function sessionListLimit(input: Record<string, unknown>): number | BrokerResponse {
 	const limit = input.limit;
@@ -840,6 +910,9 @@ export class Broker {
 	#owner = randomBytes(12).toString("hex");
 	#sessionListCursors = new Map<string, SessionListCursor>();
 	#chains = new Map<string, Promise<void>>();
+	#spawnInFlight = new Map<string, SpawnInFlight>();
+	#spawnTasks = new WeakMap<SpawnInFlight, string>();
+	#spawnAuthority: SpawnAuthorityStore | null = null;
 	#admitted = new Set<Promise<void>>();
 	#startupAdmissions = new StartupAdmissionQueue(sdkHostStartupConcurrency());
 	#publication: RetainedBrokerDiscovery | null = null;
@@ -871,6 +944,7 @@ export class Broker {
 			port: settings.port ?? 0,
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),
+			masterCapabilityVerifier: settings.masterCapabilityVerifier,
 		};
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
@@ -880,6 +954,59 @@ export class Broker {
 		this.#completion = completion.promise;
 		this.#resolveCompletion = completion.resolve;
 		this.#rejectCompletion = completion.reject;
+	}
+	/** Host capability validation is live-only; no request material is retained. */
+	async verifyMasterCapability(ownerSessionId: string, rawCapability: string): Promise<{ allowed: boolean }> {
+		const verifier = this.settings.masterCapabilityVerifier;
+		return verifier ? await verifier.verifyMasterCapability(ownerSessionId, rawCapability) : { allowed: false };
+	}
+	async #handleSpawn(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
+		const admission = parseSpawnInput(input, idempotencyKey);
+		if (isBrokerResponse(admission)) return admission;
+		const lifecycleIdentity = await deriveIdempotencyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey!);
+		const active = this.#spawnInFlight.get(lifecycleIdentity);
+		if (active) {
+			if (this.#spawnTasks.get(active) !== admission.task)
+				return error("idempotency_conflict", "idempotency key conflicts with a live session.spawn request");
+			return error("spawn_in_progress", `session.spawn is ${active.phase ?? "prepared"}`);
+		}
+		const completion = Promise.withResolvers<BrokerResponse>();
+		const inFlight: SpawnInFlight = { completion: completion.promise, resolve: completion.resolve };
+		// Installed before verification or a durable mutation. Task ownership is a
+		// weak in-memory association and cannot reach durable generic code.
+		this.#spawnInFlight.set(lifecycleIdentity, inFlight);
+		this.#spawnTasks.set(inFlight, admission.task);
+		let response: BrokerResponse | undefined;
+		let retainedOwner = false;
+		try {
+			const verified = await this.verifyMasterCapability(admission.ownerSessionId, admission.masterCapability);
+			if (!verified.allowed) return (response = error("spawn_failed", "master capability verification was denied"));
+			const key = await getBrokerIdentityKey(this.settings.agentDir);
+			const bindingMac = createHmac("sha256", Buffer.from(key, "hex"))
+				.update(canonicalJson({ version: 1, operation: "session.spawn", ownerSessionId: admission.ownerSessionId, attestationEpoch: admission.attestationEpoch, cwd: admission.cwd, modelId: admission.modelId ?? null, modelPreset: admission.modelPreset ?? null }))
+				.digest("hex");
+			const authority = this.#spawnAuthority;
+			if (!authority) return (response = error("unavailable", "spawn authority is unavailable"));
+			const decision = await authority.claimOrJoin(lifecycleIdentity, bindingMac);
+			if (decision.kind === "idempotency_conflict") return (response = error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim"));
+			if (decision.kind === "in_progress") return (response = error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
+			if (decision.kind === "terminal_uncertain") return (response = error("terminal_uncertain", "session.spawn outcome is uncertain"));
+			if (decision.kind === "terminal" || decision.kind === "replay") return (response = error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
+			inFlight.claimId = decision.claim.claimId;
+			inFlight.phase = "prepared";
+			// Claim fsync precedes this audit mirror. Stage 3 may add substrate work
+			// only after the mirror succeeds; a startup reconciler rebuilds it claim-first.
+			await this.ledger.begin(lifecycleIdentity, bindingMac);
+			retainedOwner = true;
+			return (response = { ok: true, result: { code: "spawn_admitted", claimId: decision.claim.claimId, phase: "prepared" } });
+		} catch {
+			return (response = error("spawn_failed", "session.spawn admission could not be durably established"));
+		} finally {
+			completion.resolve(response ?? error("spawn_failed", "session.spawn admission failed"));
+			this.#spawnTasks.delete(inFlight);
+			this.#spawnInFlight.delete(lifecycleIdentity);
+			if (!retainedOwner) await this.#spawnAuthority?.releaseOwner(lifecycleIdentity);
+		}
 	}
 	runStartup<T>(
 		queueWaitMs: number,
@@ -1080,6 +1207,15 @@ export class Broker {
 		try {
 			await this.index.open();
 			await this.ledger.open();
+			const brokerIdentityKey = await getBrokerIdentityKey(this.settings.agentDir);
+			this.#spawnAuthority = new SpawnAuthorityStore(this.settings.agentDir, brokerIdentityKey);
+			await this.#spawnAuthority.open();
+			for (const claim of this.#spawnAuthority.claims()) {
+				const mirror = this.ledger.get(claim.lifecycleIdentity);
+				if (!mirror) await this.ledger.begin(claim.lifecycleIdentity, claim.bindingMac);
+				else if (mirror.requestHash !== claim.bindingMac)
+					throw new Error("Spawn claim lifecycle mirror binding differs from durable authority.");
+			}
 			const now = Date.now();
 			const incarnation = brokerProcessIncarnation(process.pid);
 			if (!incarnation) throw new Error("Broker process incarnation is unavailable.");
@@ -1516,6 +1652,9 @@ export class Broker {
 		idempotencyKey?: string,
 	): Promise<BrokerResponse> {
 		if (this.#stopping) return error("broker_restarting", "broker is stopping");
+		// Spawn bypasses generic raw-input transforms. They must never observe task
+		// or capability fields, even transiently.
+		if (operation === "session.spawn") return this.#handleSpawn(input, idempotencyKey);
 		const fingerprint = lifecycleFingerprint(operation, input);
 		const normalization = normalizeBrokerInput(operation, input);
 		if (isBrokerResponse(normalization)) return normalization;
@@ -1580,6 +1719,8 @@ export class Broker {
 			const requestedFingerprint = typeof input.fingerprint === "string" ? input.fingerprint : undefined;
 			if (!idempotencyKey || !requestedOperation || !requestedFingerprint)
 				return error("invalid_input", "operation, idempotencyKey, and fingerprint are required");
+			if (requestedOperation === "session.spawn")
+				return error("invalid_input", "session.spawn does not support lifecycle lookup");
 			if (!LIFECYCLE_OPERATIONS.has(requestedOperation))
 				return error("not_found", "lifecycle operation was not found");
 			const identity = await deriveIdempotencyIdentity(this.settings.agentDir, requestedOperation, idempotencyKey);

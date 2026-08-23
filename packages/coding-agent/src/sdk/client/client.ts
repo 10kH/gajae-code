@@ -473,8 +473,10 @@ export class SdkClient {
 		const sentOperation = typeof serializedFrame.operation === "string" ? serializedFrame.operation : undefined;
 		const sentIdempotencyKey =
 			typeof serializedFrame.idempotencyKey === "string" ? serializedFrame.idempotencyKey : undefined;
-		const sentFingerprint =
-			typeof serializedFrame.operation === "string"
+		const isSpawn = sentOperation === "session.spawn";
+		const sentFingerprint = isSpawn
+			? undefined
+			: typeof serializedFrame.operation === "string"
 				? lifecycleFingerprint(serializedFrame.operation, serializedFrame.input ?? {})
 				: inputFingerprint(serializedFrame.input ?? {});
 		const deferred = Promise.withResolvers<unknown>();
@@ -571,12 +573,16 @@ export class SdkClient {
 		// nothing reached the transport, so the request stays retryable and
 		// non-uncertain with no record retained.
 		pending.sent = true;
-		this.#rememberSentRecord({
-			id,
-			operation: sentOperation,
-			idempotencyKey: sentIdempotencyKey,
-			fingerprint: sentFingerprint,
-		});
+		// Spawn reconciliation is exclusively broker-owned and keyed by its opaque
+		// claim identity. Never compute or retain a raw sent-record fingerprint.
+		if (!isSpawn) {
+			this.#rememberSentRecord({
+				id,
+				operation: sentOperation,
+				idempotencyKey: sentIdempotencyKey,
+				fingerprint: sentFingerprint!,
+			});
+		}
 		try {
 			incarnation.socket.send(serializedRequest);
 		} catch (error) {

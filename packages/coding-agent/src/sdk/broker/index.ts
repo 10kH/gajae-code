@@ -4,6 +4,7 @@ export * from "./ensure";
 export * from "./identity";
 export * from "./lifecycle";
 export * from "./lifecycle-ledger";
+export * from "./spawn-authority";
 export * from "./session-index";
 export * from "./startup-budget";
 export * from "./transport";
