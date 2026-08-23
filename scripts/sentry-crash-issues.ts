@@ -52,6 +52,7 @@ import {
 	applyOwnerOnlyPathSecurity,
 	exactRemoveDirectoryTree,
 	type NativeDirectoryTreeSnapshot,
+	renameNoReplacePath,
 	snapshotDirectoryTree,
 	verifyOwnerOnlyFdSecurity,
 	verifyOwnerOnlyPathSecurityExpected,
@@ -755,13 +756,11 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 	const lockPath = `${approvalStorePath()}.create.lock`;
 	for (let attempt = 0; attempt < 200; attempt++) {
 		const ownerToken = randomUUID();
-		let acquired = false;
-		let ownerPublished = false;
+		const candidatePath = `${lockPath}.${process.pid}.${ownerToken}.tmp`;
 		try {
-			await fs.mkdir(lockPath, { mode: 0o700 });
-			acquired = true;
-			if (process.platform === "win32") assertOwnerOnlyApplied(lockPath, "directory");
-			const ownerPath = path.join(lockPath, "owner.json");
+			await fs.mkdir(candidatePath, { mode: 0o700 });
+			if (process.platform === "win32") assertOwnerOnlyApplied(candidatePath, "directory");
+			const ownerPath = path.join(candidatePath, "owner.json");
 			const ownerHandle = await fs.open(ownerPath, "wx", 0o600);
 			try {
 				if (process.platform === "win32") {
@@ -772,22 +771,30 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 					`${JSON.stringify({ token: ownerToken, pid: process.pid, startedAt: Date.now(), processStart: await processStartIdentity(process.pid) })}\n`,
 				);
 				await ownerHandle.sync();
-				ownerPublished = true;
 			} finally {
 				await ownerHandle.close();
 			}
-		} catch (error) {
-			const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
-			if (acquired) {
-				await removeLockIfOwner(lockPath, ownerPublished ? ownerToken : undefined);
-				throw error;
+			const published = renameNoReplacePath(candidatePath, lockPath);
+			if (published.ok) {
+				// The fully initialized candidate is now the canonical lock.
+			} else if (published.reason === "destination_exists") {
+				const stale = await staleLock(lockPath);
+				if (stale.stale) await removeLockIfOwner(lockPath, stale.token);
+				await Bun.sleep(25);
+				continue;
+			} else {
+				throw new Error(`approval lock publication failed: ${published.code ?? published.reason}`);
 			}
-			if (code !== "EEXIST") throw error;
-			const stale = await staleLock(lockPath);
-			if (stale.stale) await removeLockIfOwner(lockPath, stale.token);
-			await Bun.sleep(25);
-			continue;
+		} finally {
+			await fs.rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
 		}
+		if (!(await fs.lstat(lockPath).then(stat => isPrivateOwnedEntry(lockPath, stat, "directory"), () => false))) {
+			throw new Error("published approval lock is not the initialized private directory");
+		}
+		const publishedOwner = JSON.parse(await Bun.file(path.join(lockPath, "owner.json")).text()) as {
+			token?: unknown;
+		};
+		if (publishedOwner.token !== ownerToken) throw new Error("published approval lock owner identity changed");
 		try {
 			return await action();
 		} finally {
@@ -840,6 +847,10 @@ async function removeLockIfOwner(lockPath: string, token: string | undefined): P
 		try {
 			owner = JSON.parse(await Bun.file(ownerPath).text()) as { token?: unknown };
 		} catch (error) {
+			if (error instanceof SyntaxError && token === undefined) {
+				await removeApprovalLockSnapshot(lockPath, snapshot.snapshot);
+				return;
+			}
 			const code = error instanceof Error && "code" in error ? error.code : undefined;
 			if (code !== "ENOENT") throw error;
 			// A process can die after mkdir and before owner.json. Re-check the

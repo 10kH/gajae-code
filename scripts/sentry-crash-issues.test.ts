@@ -397,6 +397,27 @@ describe("main orchestration", () => {
 		}
 	});
 
+	test("recovers a stale creation lock with an incomplete owner record", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-lock-incomplete-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+			const lockPath = `${target}.create.lock`;
+			await fs.mkdir(lockPath, { mode: 0o700 });
+			await fs.writeFile(path.join(lockPath, "owner.json"), "{", { mode: 0o600 });
+			const past = new Date(Date.now() - 11 * 60 * 1000);
+			await fs.utimes(lockPath, past, past);
+			expect(await withCreationLock(async () => "ran")).toBe("ran");
+			await expect(fs.lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
 	test("rejects a wrong-kind creation lock instead of treating it as contention", async () => {
 		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-lock-kind-"));
 		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
