@@ -12,9 +12,13 @@ export interface FileLockOptions {
 	onAcquired?: () => void;
 	/** Stable host identity required to safely reclaim locks on a shared volume. */
 	ownerHostId?: string;
+	/** Previous local host identities accepted only when deciding stale-owner reclamation. */
+	previousOwnerHostIds?: readonly string[];
 }
 
-const DEFAULT_OPTIONS: Required<Omit<FileLockOptions, "ownerHostId" | "signal" | "onAcquired">> = {
+const DEFAULT_OPTIONS: Required<
+	Omit<FileLockOptions, "ownerHostId" | "previousOwnerHostIds" | "signal" | "onAcquired">
+> = {
 	staleMs: 10_000,
 	retries: 50,
 	retryDelayMs: 100,
@@ -203,6 +207,7 @@ async function staleLockSnapshot(
 	lockPath: string,
 	staleMs: number,
 	ownerHostId?: string,
+	previousOwnerHostIds: readonly string[] = [],
 	startTimeCache?: Map<string, string | null>,
 ): Promise<LockStaleSnapshot> {
 	let info: LockInfo | null;
@@ -230,7 +235,12 @@ async function staleLockSnapshot(
 	// A host-qualified lock may only be reclaimed after proving that its owner is
 	// local. Foreign and malformed host-qualified records fail closed: PID values
 	// and clocks are not meaningful across hosts.
-	if (ownerHostId !== undefined && info.owner_host_id !== ownerHostId) return { stale: false };
+	if (
+		ownerHostId !== undefined &&
+		info.owner_host_id !== ownerHostId &&
+		!previousOwnerHostIds.includes(info.owner_host_id ?? "")
+	)
+		return { stale: false };
 	// Never reap a live owner by elapsed time: a long legitimate critical section must
 	// not have its lock stolen (#652). Reclaim a dead owner immediately. Only when owner
 	// liveness is indeterminate do we fall back to the staleMs elapsed-time heuristic.
@@ -382,6 +392,8 @@ async function lockHolderDescription(lockPath: string): Promise<string> {
 
 async function acquireLock(filePath: string, options: FileLockOptions = {}): Promise<() => Promise<void>> {
 	if (options.ownerHostId !== undefined && !options.ownerHostId) throw new Error("ownerHostId must be non-empty");
+	if (options.previousOwnerHostIds?.some(hostId => !hostId))
+		throw new Error("previousOwnerHostIds must contain only non-empty identities");
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const lockPath = getLockPath(filePath);
 	const contentionStartTimes = new Map<string, string | null>();
@@ -389,7 +401,13 @@ async function acquireLock(filePath: string, options: FileLockOptions = {}): Pro
 		if (opts.signal?.aborted) throw opts.signal.reason ?? new Error("File lock acquisition aborted");
 		const owner = await tryAcquireLock(lockPath, opts.ownerHostId, opts.onAcquired);
 		if (owner) return () => releaseLock(lockPath, owner);
-		const stale = await staleLockSnapshot(lockPath, opts.staleMs, opts.ownerHostId, contentionStartTimes);
+		const stale = await staleLockSnapshot(
+			lockPath,
+			opts.staleMs,
+			opts.ownerHostId,
+			opts.previousOwnerHostIds,
+			contentionStartTimes,
+		);
 		if (await removeStaleLockForAcquire(lockPath, stale)) continue;
 		if (!opts.signal) {
 			await Bun.sleep(opts.retryDelayMs);

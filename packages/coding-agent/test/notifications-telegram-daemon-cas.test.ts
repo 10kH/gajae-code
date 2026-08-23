@@ -386,3 +386,29 @@ test("foreign-host locks with locally dead PIDs fail closed instead of permittin
 	expect(fs.existsSync(lockDir)).toBe(true);
 	expect(fs.existsSync(file)).toBe(false);
 }, 10_000);
+
+test("reclaims a dead topic lock written with the previous local host identity", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-topic-cas-legacy-lock-"));
+	temporaryDirectories.push(directory);
+	const file = path.join(directory, "telegram-topics.json");
+	const registry = new FilesystemTopicRegistryCasAuthority(file, {
+		installationHostId: "current-host",
+		previousInstallationHostIds: ["previous-local-host"],
+		fs: durableTestFs,
+		platform: "linux",
+	});
+	const lockDir = `${file}.lock`;
+	fs.mkdirSync(lockDir);
+	fs.writeFileSync(
+		path.join(lockDir, "info"),
+		JSON.stringify({
+			pid: 999_999_999,
+			start_time: "previous-start",
+			owner_host_id: "previous-local-host",
+			timestamp: 0,
+		}),
+	);
+
+	expect(await registry.compareAndSet(0, { version: 2, registryGeneration: 1, topics: {} })).toBe(true);
+	expect(fs.existsSync(lockDir)).toBe(false);
+});

@@ -55,6 +55,7 @@ import { type TelegramSetupPreflight, withTelegramSetupLease } from "./telegram-
 
 export {
 	loadInstallationHostId,
+	loadLegacyInstallationHostId,
 	type MachineIdentityDeps,
 	parseMacPlatformUuid,
 	parseWindowsMachineGuid,
@@ -888,11 +889,13 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 	private readonly platform: NodeJS.Platform;
 	private readonly exactReplace: TopicRegistryExactReplace;
 	private readonly installationHostId: string;
+	private readonly previousInstallationHostIds: readonly string[];
 
 	constructor(
 		private readonly file: string,
 		input: {
 			installationHostId: string;
+			previousInstallationHostIds?: readonly string[];
 			fs?: TelegramDaemonFs;
 			platform?: NodeJS.Platform;
 			exactReplace?: TopicRegistryExactReplace;
@@ -900,6 +903,7 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 	) {
 		if (!input.installationHostId) throw new Error("installationHostId must be non-empty");
 		this.installationHostId = input.installationHostId;
+		this.previousInstallationHostIds = input.previousInstallationHostIds ?? [];
 		this.fsImpl = input.fs ?? nodeFs;
 		this.platform = input.platform ?? process.platform;
 		this.exactReplace = input.exactReplace ?? exactReplacePath;
@@ -909,6 +913,7 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 		return await withFileLock(this.file, async () => await this.readLocked(), {
 			staleMs: 10_000,
 			ownerHostId: this.installationHostId,
+			previousOwnerHostIds: this.previousInstallationHostIds,
 		});
 	}
 
@@ -938,7 +943,11 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 				);
 				return true;
 			},
-			{ staleMs: 10_000, ownerHostId: this.installationHostId },
+			{
+				staleMs: 10_000,
+				ownerHostId: this.installationHostId,
+				previousOwnerHostIds: this.previousInstallationHostIds,
+			},
 		);
 	}
 
