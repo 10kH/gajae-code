@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { applyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -58,6 +59,10 @@ function options(overrides: Partial<Options> = {}): Options {
 		repo: "Yeachan-Heo/gajae-code",
 		...overrides,
 	};
+}
+
+function secureWindowsFixture(pathname: string, kind: "directory" | "file"): void {
+	if (process.platform === "win32") expect(applyOwnerOnlyPathSecurity(pathname, kind)).toEqual({ ok: true });
 }
 
 describe("parseArgs", () => {
@@ -381,11 +386,13 @@ describe("main orchestration", () => {
 			await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
 			const lockPath = `${target}.create.lock`;
 			await fs.mkdir(lockPath, { mode: 0o700 });
+			secureWindowsFixture(lockPath, "directory");
 			await fs.writeFile(
 				path.join(lockPath, "owner.json"),
 				`${JSON.stringify({ token: randomUUID(), pid: 999_999_999, startedAt: 0 })}\n`,
 				{ mode: 0o600 },
 			);
+			secureWindowsFixture(path.join(lockPath, "owner.json"), "file");
 			const past = new Date(Date.now() - 11 * 60 * 1000);
 			await fs.utimes(lockPath, past, past);
 			expect(await withCreationLock(async () => "ran")).toBe("ran");
@@ -406,7 +413,9 @@ describe("main orchestration", () => {
 			await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
 			const lockPath = `${target}.create.lock`;
 			await fs.mkdir(lockPath, { mode: 0o700 });
+			secureWindowsFixture(lockPath, "directory");
 			await fs.writeFile(path.join(lockPath, "owner.json"), "{", { mode: 0o600 });
+			secureWindowsFixture(path.join(lockPath, "owner.json"), "file");
 			const past = new Date(Date.now() - 11 * 60 * 1000);
 			await fs.utimes(lockPath, past, past);
 			expect(await withCreationLock(async () => "ran")).toBe("ran");
