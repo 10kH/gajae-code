@@ -8,7 +8,7 @@
  *
  * Coverage is byte-identical to the original monolithic file's MCP loop.
  */
-import { test } from "bun:test";
+import { expect, test } from "bun:test";
 import {
 	adapterPrefix,
 	assertMcpRow,
@@ -16,6 +16,7 @@ import {
 	type MachineAdapter,
 	OPERATIONS,
 } from "./helpers/sdk-adapter-dispositions-shared";
+import { createSdkMcpServer } from "../src/sdk/mcp";
 
 const adapter: MachineAdapter = "mcp";
 for (const operation of OPERATIONS) {
@@ -29,3 +30,23 @@ for (const operation of OPERATIONS) {
 		}, 60_000);
 	}
 }
+
+test("session.spawn rejects capability-shaped input before MCP Broker startup", async () => {
+	const mcp = createSdkMcpServer({ agentDir: process.cwd() });
+	try {
+		expect(
+			await mcp.callTool("gjc_session_global", {
+				operation: "session.spawn",
+				input: {
+					cwd: process.cwd(),
+					task: "adapter disposition probe",
+					masterCapability: "capability-shaped-probe",
+					model: "openai/gpt-4o-mini",
+					profile: "default",
+				},
+			}),
+		).toMatchObject({ ok: false, error: { code: "adapter_operation_prohibited" } });
+	} finally {
+		await mcp.close();
+	}
+});
