@@ -48,6 +48,7 @@ import {
 	SessionIndex,
 	type SessionList,
 } from "./session-index";
+import { createMasterCapabilityVerifier } from "./master-capability";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -949,6 +950,8 @@ export class Broker {
 		this.index = new SessionIndex(settings.agentDir);
 		this.ledger = new LifecycleLedger(settings.agentDir);
 		this.#resolveModelPin = createDefaultSdkHostModelResolver(this.settings.agentDir);
+		if (!this.settings.masterCapabilityVerifier)
+			this.settings.masterCapabilityVerifier = createMasterCapabilityVerifier(this.index);
 		this.#lock = path.join(settings.agentDir, "sdk", "broker.lock");
 		const completion = Promise.withResolvers<void>();
 		this.#completion = completion.promise;
@@ -956,9 +959,13 @@ export class Broker {
 		this.#rejectCompletion = completion.reject;
 	}
 	/** Host capability validation is live-only; no request material is retained. */
-	async verifyMasterCapability(ownerSessionId: string, rawCapability: string): Promise<{ allowed: boolean }> {
+	async verifyMasterCapability(
+		ownerSessionId: string,
+		rawCapability: string,
+		attestationEpoch: string,
+	): Promise<{ allowed: boolean }> {
 		const verifier = this.settings.masterCapabilityVerifier;
-		return verifier ? await verifier.verifyMasterCapability(ownerSessionId, rawCapability) : { allowed: false };
+		return verifier ? await verifier.verifyMasterCapability(ownerSessionId, rawCapability, attestationEpoch) : { allowed: false };
 	}
 	async #handleSpawn(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
 		const admission = parseSpawnInput(input, idempotencyKey);
@@ -981,7 +988,11 @@ export class Broker {
 		try {
 			let verified: { allowed: boolean };
 			try {
-				verified = await this.verifyMasterCapability(admission.ownerSessionId, admission.masterCapability);
+				verified = await this.verifyMasterCapability(
+					admission.ownerSessionId,
+					admission.masterCapability,
+					admission.attestationEpoch,
+				);
 			} finally {
 				admission.masterCapability = "";
 			}

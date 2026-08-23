@@ -122,7 +122,7 @@ describe("SpawnAuthorityStore", () => {
 			const broker = new Broker({
 				agentDir,
 				masterCapabilityVerifier: {
-					verifyMasterCapability: async (_ownerSessionId, rawCapability) => ({ allowed: rawCapability === capability }),
+					verifyMasterCapability: async (_ownerSessionId, rawCapability, _attestationEpoch) => ({ allowed: rawCapability === capability }),
 				},
 			});
 			await broker.start();

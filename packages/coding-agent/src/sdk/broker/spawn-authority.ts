@@ -39,7 +39,7 @@ export type SeedDeliveryV2 = {
 
 /** Live-only capability check. Implementations must not retain either argument. */
 export interface MasterCapabilityVerifier {
-	verifyMasterCapability(ownerSessionId: string, rawCapability: string): Promise<{ allowed: boolean }>;
+	verifyMasterCapability(ownerSessionId: string, rawCapability: string, attestationEpoch: string): Promise<{ allowed: boolean }>;
 }
 
 export type SpawnClaimDecision =
