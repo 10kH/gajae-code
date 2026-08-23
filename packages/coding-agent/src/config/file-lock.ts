@@ -277,8 +277,12 @@ async function removeStaleLockForAcquire(lockPath: string, snapshot: LockStaleSn
  * remove the directory has to do it under an identity-bound primitive that refuses when
  * the object is no longer the one that was judged.
  */
-export async function genericFileLockDirIsStale(lockDir: string, staleMs: number): Promise<boolean> {
-	return (await staleLockSnapshot(lockDir, staleMs)).stale;
+export async function genericFileLockDirIsStale(
+	lockDir: string,
+	staleMs: number,
+	ownerHostId?: string,
+): Promise<boolean> {
+	return (await staleLockSnapshot(lockDir, staleMs, ownerHostId)).stale;
 }
 
 async function tryAcquireLock(

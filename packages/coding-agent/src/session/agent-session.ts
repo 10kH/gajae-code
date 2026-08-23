@@ -2867,17 +2867,7 @@ export class AgentSession {
 	}
 
 	#captureScheduledContinuationAdmission(): ScheduledContinuationAdmission | undefined {
-		const contextualEntry = this.#sessionAdmissionContext.getStore();
-		// Deferred terminal publication runs after the prompt's in-flight counter
-		// reaches zero and can lose the originating AsyncLocalStorage context. The
-		// prompt admission itself remains active until publication and all scheduled
-		// continuation work settle. Join that active admission so a steer queued by
-		// an agent_end subscriber cannot park behind the prompt that is waiting for
-		// the steer to finish.
-		const entry =
-			contextualEntry?.kind === "prompt" && !contextualEntry.released
-				? contextualEntry
-				: this.#activeSessionAdmission;
+		const entry = this.#sessionAdmissionContext.getStore();
 		if (
 			entry?.kind !== "prompt" ||
 			entry.released ||
@@ -4995,11 +4985,8 @@ export class AgentSession {
 				},
 				observation,
 			);
-		} catch (error) {
-			logger.warn("Failed to persist coordinator runtime state", {
-				event: event.type,
-				error: error instanceof Error ? error.message : String(error),
-			});
+		} catch {
+			logger.warn("Failed to persist coordinator runtime state", { event: event.type });
 		}
 	}
 
