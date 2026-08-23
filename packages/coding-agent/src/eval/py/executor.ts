@@ -157,7 +157,8 @@ function settingsScope(activeSettings: Settings): string {
 	return scope;
 }
 
-function scopedSessionId(sessionId: string, activeSettings: Settings | undefined): string {
+function scopedSessionId(sessionId: string, activeSettings: Settings | undefined, explicitSessionId: boolean): string {
+	if (explicitSessionId) return sessionId;
 	if (!activeSettings) {
 		const prefix = `${sessionId}:settings-`;
 		for (const existingSessionId of sessions.keys()) {
@@ -752,7 +753,11 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 }
 
 async function executeOnSession(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
-	const sessionId = scopedSessionId(options.sessionId ?? `session:${cwd}`, options.settings);
+	const sessionId = scopedSessionId(
+		options.sessionId ?? `session:${cwd}`,
+		options.settings,
+		options.sessionId !== undefined,
+	);
 	if (options.bridge && !options.bridgeSessionId) {
 		options.bridgeSessionId = sessionId;
 	}
