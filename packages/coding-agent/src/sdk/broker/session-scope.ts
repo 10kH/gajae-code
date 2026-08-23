@@ -90,11 +90,26 @@ export function resolvedScopeV1(value: unknown): ResolvedScopeV1 | undefined {
 			: undefined;
 	const descriptor = record(resolved);
 	if (!descriptor || scope.resolution !== "resolved") return undefined;
-	if (request.requested === "repo" && descriptor.kind === "repo" && typeof descriptor.worktreeRoot === "string")
+	if (
+		request.requested === "repo" &&
+		descriptor.kind === "repo" &&
+		typeof descriptor.worktreeRoot === "string" &&
+		Object.keys(descriptor).every(key => key === "kind" || key === "worktreeRoot")
+	)
 		return { ...request, resolved: { kind: "repo", worktreeRoot: descriptor.worktreeRoot }, resolution: "resolved" };
-	if (request.requested === "pwd" && descriptor.kind === "pwd" && typeof descriptor.cwd === "string")
+	if (
+		request.requested === "pwd" &&
+		descriptor.kind === "pwd" &&
+		typeof descriptor.cwd === "string" &&
+		Object.keys(descriptor).every(key => key === "kind" || key === "cwd")
+	)
 		return { ...request, resolved: { kind: "pwd", cwd: descriptor.cwd }, resolution: "resolved" };
-	if (request.requested === "global" && descriptor.kind === "global" && descriptor.visibility === "current-broker")
+	if (
+		request.requested === "global" &&
+		descriptor.kind === "global" &&
+		descriptor.visibility === "current-broker" &&
+		Object.keys(descriptor).every(key => key === "kind" || key === "visibility")
+	)
 		return { ...request, resolved: { kind: "global", visibility: "current-broker" }, resolution: "resolved" };
 	return undefined;
 }
