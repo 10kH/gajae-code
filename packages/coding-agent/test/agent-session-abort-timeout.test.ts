@@ -181,6 +181,8 @@ describe("AgentSession abort timeout", () => {
 		makeAgent: () => Agent;
 		releaseWedge: () => void;
 		hasWedgeStarted: () => boolean;
+		blockSuccessors: () => void;
+		releaseSuccessors: () => void;
 	} {
 		const mock = createMockModel();
 		if (!authStorage) throw new Error("Expected auth storage");
@@ -213,7 +215,9 @@ describe("AgentSession abort timeout", () => {
 			return stream;
 		};
 		const wedgeGate = Promise.withResolvers<void>();
+		const successorGate = Promise.withResolvers<void>();
 		let transformCalls = 0;
+		let blockSuccessors = false;
 		return {
 			makeAgent: () =>
 				new Agent({
@@ -228,11 +232,16 @@ describe("AgentSession abort timeout", () => {
 					transformContext: async messages => {
 						transformCalls++;
 						if (transformCalls === 1) await wedgeGate.promise;
+						else if (blockSuccessors) await successorGate.promise;
 						return messages;
 					},
 				}),
 			releaseWedge: () => wedgeGate.resolve(),
 			hasWedgeStarted: () => transformCalls >= 1,
+			blockSuccessors: () => {
+				blockSuccessors = true;
+			},
+			releaseSuccessors: () => successorGate.resolve(),
 		};
 	}
 
@@ -271,14 +280,21 @@ describe("AgentSession abort timeout", () => {
 			expect(notices.some(message => message.includes("forced session recovery"))).toBe(true);
 			// The forced terminal agent_end published instead of parking behind the
 			// abandoned prompt's in-flight count.
-			expect(agentEnds).toBeGreaterThanOrEqual(1);
+			expect(agentEnds).toBe(1);
+			expect(Boolean(activeSession.isStreaming)).toBe(false);
+			await Promise.race([
+				activeSession.waitForIdle(),
+				Bun.sleep(250).then(() => {
+					throw new Error("Forced recovery left session settlement waiting on the abandoned prompt");
+				}),
+			]);
 
 			// A later abort must not wedge on the abandoned prompt either.
 			await activeSession.abort({ timeoutMs: 25 });
 
 			// Prompt admission is unwedged: a successor prompt runs to completion.
 			await activeSession.prompt("Prompt after forced recovery.");
-			expect(agentEnds).toBeGreaterThanOrEqual(2);
+			expect(agentEnds).toBe(2);
 		} finally {
 			harness.releaseWedge();
 			await wedgedPrompt.catch(() => undefined);
@@ -330,6 +346,47 @@ describe("AgentSession abort timeout", () => {
 
 			// Prompt admission is unwedged for both aborts' waiters.
 			await activeSession.prompt("Prompt after forced recovery.");
+		} finally {
+			harness.releaseWedge();
+			await wedgedPrompt.catch(() => undefined);
+		}
+	});
+
+	it("keeps a successor observable while an abandoned prompt settles later", async () => {
+		tempDir = TempDir.createSync("@gjc-abort-zombie-settlement-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const harness = wedgedTurnHarness();
+		const agent = harness.makeAgent();
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		const activeSession = session;
+		const wedgedPrompt = activeSession.prompt("Start a turn that ignores abort.");
+		try {
+			const deadline = Date.now() + 1_000;
+			while (!(harness.hasWedgeStarted() && activeSession.isStreaming)) {
+				if (Date.now() >= deadline) throw new Error("Timed out waiting for the wedged turn to start");
+				await Bun.sleep(1);
+			}
+
+			await activeSession.abort({ timeoutMs: 25, cause: "user_interrupt" });
+
+			harness.blockSuccessors();
+			const successorPrompt = activeSession.prompt("Successor stays active during zombie settlement.");
+			await Bun.sleep(10);
+			expect(Boolean(activeSession.isStreaming)).toBe(true);
+
+			harness.releaseWedge();
+			await Bun.sleep(10);
+			expect(Boolean(activeSession.isStreaming)).toBe(true);
+
+			harness.releaseSuccessors();
+			await Promise.all([successorPrompt, wedgedPrompt.catch(() => undefined)]);
+			expect(Boolean(activeSession.isStreaming)).toBe(false);
 		} finally {
 			harness.releaseWedge();
 			await wedgedPrompt.catch(() => undefined);

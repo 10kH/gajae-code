@@ -2711,13 +2711,12 @@ export class AgentSession {
 	// Identity of every in-flight prompt, so forced recovery can abandon the
 	// exact prompts that were in flight when it fired (a count cannot: prompts
 	// overlap and do not settle FIFO).
-	readonly #inFlightPromptTokens = new Set<symbol>();
+	readonly #inFlightPromptTokens = new Map<symbol, number>();
 	// In-flight prompts abandoned by forced session recovery. Their
 	// `agent.prompt(...)` awaits a run loop wedged on a stream that ignored its
 	// abort signal and may never settle, so no abort drain or agent_end gate may
 	// keep waiting on them; their own finally still runs if the stream ever ends.
 	readonly #abandonedInFlightPrompts = new Set<symbol>();
-	#inFlightGenerations: number[] = [];
 	#agentEventHandlersInFlight = 0;
 	#queuedExtensionEventCount = 0;
 	#extensionTurnGeneration = 0;
@@ -3028,10 +3027,10 @@ export class AgentSession {
 
 	#beginInFlight(): symbol {
 		const token = Symbol("in-flight-prompt");
-		this.#inFlightPromptTokens.add(token);
+		const hadLivePrompt = this.#livePromptsInFlight() > 0;
+		this.#inFlightPromptTokens.set(token, this.#abortEpoch);
 		this.#promptInFlightCount++;
-		this.#inFlightGenerations.push(this.#abortEpoch);
-		if (this.#promptInFlightCount === 1) {
+		if (!hadLivePrompt) {
 			this.#acquirePowerAssertion();
 		}
 		return token;
@@ -3041,7 +3040,10 @@ export class AgentSession {
 	#isLiveTurnBusy(): boolean {
 		if (this.agent.state.isStreaming) return true;
 		if (!this.isStreaming) return false;
-		return this.#inFlightGenerations.every(generation => generation === this.#abortEpoch);
+		for (const [token, generation] of this.#inFlightPromptTokens) {
+			if (!this.#abandonedInFlightPrompts.has(token) && generation !== this.#abortEpoch) return false;
+		}
+		return true;
 	}
 	/**
 	 * Allocate a FRESH prompt attempt/lineage for an allowed owned-completion
@@ -3304,7 +3306,7 @@ export class AgentSession {
 
 	#isSessionSettlementPending(ignoreSelectionFenceGeneration?: number): boolean {
 		return (
-			this.#promptInFlightCount > 0 ||
+			this.#livePromptsInFlight() > 0 ||
 			this.#agentEventHandlersInFlight > 0 ||
 			this.#agentEndPublicationInFlight > 0 ||
 			this.#pendingAgentEndContinuationHolds.size > 0 ||
@@ -3331,7 +3333,7 @@ export class AgentSession {
 	/** In-flight prompts that forced recovery has not abandoned. */
 	#livePromptsInFlight(): number {
 		let live = 0;
-		for (const token of this.#inFlightPromptTokens) {
+		for (const token of this.#inFlightPromptTokens.keys()) {
 			if (!this.#abandonedInFlightPrompts.has(token)) live++;
 		}
 		return live;
@@ -3413,11 +3415,14 @@ export class AgentSession {
 	}
 
 	#endInFlight(token: symbol): unknown {
+		const wasAbandoned = this.#abandonedInFlightPrompts.has(token);
 		this.#inFlightPromptTokens.delete(token);
 		this.#abandonedInFlightPrompts.delete(token);
 		this.#promptInFlightCount = Math.max(0, this.#promptInFlightCount - 1);
-		if (this.#inFlightGenerations.length > 0) this.#inFlightGenerations.shift();
-		if (this.#promptInFlightCount !== 0) return undefined;
+		if (wasAbandoned || this.#livePromptsInFlight() !== 0) {
+			this.#resolveSessionSettlement();
+			return undefined;
+		}
 
 		this.#releasePowerAssertion();
 		let flushError: unknown;
@@ -3436,7 +3441,7 @@ export class AgentSession {
 	}
 	async #settleEndedInFlight(token: symbol, promptWait?: "publication" | "full"): Promise<void> {
 		const flushError = this.#endInFlight(token);
-		const predecessorPromptStillInFlight = this.#promptInFlightCount > 0;
+		const predecessorPromptStillInFlight = this.#livePromptsInFlight() > 0;
 		if (promptWait === "publication") {
 			await this.#agentEndPublicationPromise;
 		} else if (promptWait === "full") {
@@ -7966,7 +7971,7 @@ export class AgentSession {
 
 	/** Whether agent is currently streaming a response */
 	get isStreaming(): boolean {
-		return this.agent.state.isStreaming || this.#promptInFlightCount > 0;
+		return this.agent.state.isStreaming || this.#livePromptsInFlight() > 0;
 	}
 
 	/** Wait until streaming and session settlement work are fully settled. */
@@ -12512,8 +12517,10 @@ export class AgentSession {
 	 */
 	#forceSessionRecovery(): void {
 		this.#abandonPostPromptTasks();
-		for (const token of this.#inFlightPromptTokens) this.#abandonedInFlightPrompts.add(token);
-		this.#wakeScopedSettlementWaiters();
+		const hadLivePrompt = this.#livePromptsInFlight() > 0;
+		for (const token of this.#inFlightPromptTokens.keys()) this.#abandonedInFlightPrompts.add(token);
+		if (hadLivePrompt) this.#releasePowerAssertion();
+		this.#resolveSessionSettlement();
 		const forceAbortLogicalRunId = this.agent.currentManagedLogicalRunId ?? this.#activeLogicalRunId;
 		try {
 			if (forceAbortLogicalRunId !== undefined)
