@@ -44,8 +44,14 @@ export interface RetentionPolicy {
 	tombstoneRule?: SessionTombstoneRule;
 }
 export interface SessionIndexObservationDeps {
-	/** Test seam for the exact post-replay process-incarnation observation. */
-	processIncarnation?: (pid: number) => string | undefined | Promise<string | undefined>;
+	/** Test seam for an exact retained process-identity observation. */
+	retainProcess?: (
+		pid: number,
+	) => SessionIndexProcessObservation | undefined | Promise<SessionIndexProcessObservation | undefined>;
+}
+export interface SessionIndexProcessObservation {
+	readonly incarnation: string;
+	readonly isRunning: () => boolean;
 }
 export interface SessionIndexEvent {
 	version: typeof SDK_STATE_VERSION;
@@ -1582,7 +1588,14 @@ export class SessionIndex {
 	 */
 	async generationStatus(sessionId: string, endpointGeneration: number): Promise<SessionGenerationIndexStatus> {
 		const indexPath = path.resolve(logFor(this.#agentDir));
-		const observeIncarnation = this.#observationDeps.processIncarnation ?? processIncarnation;
+		const retainProcess =
+			this.#observationDeps.retainProcess ??
+			((pid: number): SessionIndexProcessObservation | undefined => {
+				const reference = nativeProcessBindings().Process.fromPid(pid);
+				return reference
+					? { incarnation: reference.incarnation, isRunning: () => reference.status() === "running" }
+					: undefined;
+			});
 		for (let attempt = 0; attempt < 3; attempt++) {
 			const plan = await SessionIndex.#enqueue(indexPath, () =>
 				withSessionIndexLock("generation reconciliation plan", this.#agentDir, async () => {
@@ -1598,18 +1611,22 @@ export class SessionIndex {
 					};
 				}),
 			);
-			// OS incarnation probes may spawn platform helpers (PowerShell on Windows),
-			// so they must never run while the machine-global index lock is held.
-			// Probe after the planned replay, then accept the observations only if a
-			// second locked replay proves the index sequence did not change. A writer
-			// racing either cut causes a bounded retry rather than stale classification.
-			const probed = new Map<string, string | undefined>();
+			// Opening a retained process reference may perform platform work, so it
+			// must never run while the machine-global index lock is held. The retained
+			// handle binds the exact process incarnation and is checked for running
+			// status only after the second locked replay; PID reuse cannot make the old
+			// handle refer to the successor. A writer racing either cut causes a bounded
+			// retry rather than stale classification.
+			const retained = new Map<string, SessionIndexProcessObservation | undefined>();
 			for (const registration of plan.registrations)
-				probed.set(registration.key, await observeIncarnation(registration.pid));
+				retained.set(registration.key, await retainProcess(registration.pid));
 			const result = await SessionIndex.#enqueue(indexPath, () =>
 				withSessionIndexLock("generation reconciliation commit", this.#agentDir, async () => {
 					await this.#replayUnderLock();
 					if (this.indexSeq !== plan.indexSeq) return undefined;
+					const probed = new Map<string, string | undefined>();
+					for (const [key, observation] of retained)
+						probed.set(key, observation?.isRunning() === true ? observation.incarnation : undefined);
 					return this.#generationStatusFromEvents(sessionId, endpointGeneration, probed);
 				}),
 			);

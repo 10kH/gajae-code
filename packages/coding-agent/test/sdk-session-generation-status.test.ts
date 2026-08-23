@@ -201,12 +201,20 @@ describe("SessionRouter exact generation status", () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-pid-reuse-"));
 		tempDirs.push(agentDir);
 		const locator = { repo: agentDir, stateRoot: path.join(agentDir, ".gjc", "state") };
+		let running = true;
 		let observedIncarnation = "linux:100";
-		const index = await new SessionIndex(agentDir, {}, { processIncarnation: () => observedIncarnation }).open();
+		const index = await new SessionIndex(
+			agentDir,
+			{},
+			{
+				retainProcess: () => ({ incarnation: observedIncarnation, isRunning: () => running }),
+			},
+		).open();
 		await register(index, locator, "pid-reuse-session", 6, { hostIncarnation: "linux:100" });
 		const router = new SessionRouter({ agentDir, deps: { createIndex: () => index } });
 
 		expect((await router.generationStatus("pid-reuse-session", 6)).status).toBe("current");
+		running = false;
 		observedIncarnation = "linux:200";
 		expect(await router.generationStatus("pid-reuse-session", 6)).toEqual({
 			status: "unknown",
@@ -225,7 +233,7 @@ describe("SessionRouter exact generation status", () => {
 			agentDir,
 			{},
 			{
-				processIncarnation: async () => {
+				retainProcess: async () => {
 					if (!raced) {
 						raced = true;
 						await index.append({
@@ -237,7 +245,7 @@ describe("SessionRouter exact generation status", () => {
 							hostIncarnation: "linux:700",
 						});
 					}
-					return "linux:700";
+					return { incarnation: "linux:700", isRunning: () => true };
 				},
 			},
 		).open();
