@@ -7799,6 +7799,11 @@ describe("Coordinator MCP deep-audit regressions", () => {
 			idempotency_key: "close-admission-terminal",
 			allow_mutation: true,
 		});
+		// A turn that starts and completes after reaper preflight leaves no active
+		// turn, but its canonical watermark must still reject idle close admission.
+		await expect(
+			admitSessionClose(paths, entry, { idleBeforeMs: Date.now() - server.config.sessionIdleTtlMs }),
+		).rejects.toThrow("session_not_idle");
 		await expect(admitSessionClose(paths, entry)).resolves.toMatchObject({ session_id: "visible-session" });
 	});
 

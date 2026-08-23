@@ -5588,7 +5588,7 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			}
 			if (session.ephemeral !== true && opts.force !== true)
 				return { ok: false, reason: "not_ephemeral", closed: false };
-			const canonicalTransaction = await readSessionTransaction(questionPaths, id);
+			let canonicalTransaction = await readSessionTransaction(questionPaths, id);
 			const canonicalActiveTurn = (canonicalTransaction
 				? Object.values(canonicalTransaction.canonical.turns).find(turn =>
 						ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
@@ -5602,6 +5602,32 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					closed: false,
 					active_turn_id: activeTurn?.turn_id ?? canonicalActiveTurn?.turn_id,
 				};
+			// `listSessions` selects an idle candidate before this transition acquires
+			// its per-session lock. A turn may finish in that interval, leaving no
+			// active-turn marker but advancing the canonical activity watermark. Re-read
+			// the durable authority immediately before admitting the irreversible close.
+			if (opts.reason === "idle_reaper") {
+				canonicalTransaction = await readSessionTransaction(questionPaths, id);
+				const latestActiveTurn = canonicalTransaction
+					? Object.values(canonicalTransaction.canonical.turns).find(turn =>
+							ACTIVE_TURN_STATUSES.has(turn.status as TurnStatus),
+						)
+					: undefined;
+				if (latestActiveTurn)
+					return {
+						ok: false,
+						reason: "active_turn",
+						closed: false,
+						active_turn_id: latestActiveTurn.turn_id,
+					};
+				const latestStamp =
+					optionalString(canonicalTransaction?.recovery.prompt_watermark_at) ??
+					optionalString(canonicalTransaction?.canonical.session.updated_at) ??
+					optionalString(session.created_at);
+				const latestActivityMs = latestStamp ? Date.parse(latestStamp) : Number.NaN;
+				if (!Number.isFinite(latestActivityMs) || Date.now() - latestActivityMs < config.sessionIdleTtlMs)
+					return { ok: false, reason: "not_idle", closed: false };
+			}
 			const deletionId = `delete:${id}:${persistedIncarnation}`;
 			const deletionKey = createHash("sha256").update(deletionId).digest("hex");
 			const deletionEntry = {
@@ -5628,11 +5654,15 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 			};
 			let admitted: CoordinatorSessionTransactionV1;
 			try {
-				admitted = await admitSessionClose(questionPaths, deletionEntry);
+				admitted = await admitSessionClose(questionPaths, deletionEntry, {
+					...(opts.reason === "idle_reaper" ? { idleBeforeMs: Date.now() - config.sessionIdleTtlMs } : {}),
+				});
 			} catch (error) {
 				if (error instanceof Error && error.message === "active_turn_exists") {
 					return { ok: false, reason: "active_turn", closed: false };
 				}
+				if (error instanceof Error && error.message === "session_not_idle")
+					return { ok: false, reason: "not_idle", closed: false };
 				throw error;
 			}
 			const projectionIds = {
@@ -5799,8 +5829,23 @@ export function createCoordinatorMcpServer(options: CoordinatorMcpServerOptions 
 					} catch (error) {
 						if (!(error instanceof Error) || error.message !== "resource_gone") throw error;
 					}
+					// Idle eligibility is judged against the durable WAL, not the
+					// projection state file: projection repair refreshes that stamp
+					// (writeSessionState stamps `now`), which would reset the idle clock
+					// after every failed close and defer the reaper's retry by a whole
+					// TTL. The truthful WAL activity authority is the turn watermark
+					// (recovery.prompt_watermark_at, advanced on every canonical turn
+					// commit) — canonical.session.updated_at is creation-only and would
+					// degenerate the idle TTL into an age-since-creation check that reaps
+					// in-use sessions between turns. Turn-less sessions fall back to their
+					// creation stamp; the projection state remains the fallback only when
+					// the WAL itself cannot be read.
+					const walSession = await readSessionTransaction(questionPaths, sessionId);
+					const walStamp =
+						optionalString(walSession?.recovery.prompt_watermark_at) ??
+						optionalString(walSession?.canonical.session.updated_at);
 					const state = await readSessionState(namespaceDir, sessionId);
-					const stamp = optionalString(state?.updated_at) ?? optionalString(session.created_at);
+					const stamp = walStamp ?? optionalString(state?.updated_at) ?? optionalString(session.created_at);
 					const lastActivityMs = stamp ? Date.parse(stamp) : Number.NaN;
 					out.push({
 						sessionId,

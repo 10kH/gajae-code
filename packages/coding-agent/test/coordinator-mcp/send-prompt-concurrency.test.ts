@@ -74,7 +74,15 @@ describe("send_prompt same-session concurrency", () => {
 										pid: authority.pid,
 										endpointMtimeMs: authority.endpointMtimeMs,
 									});
-									return { ok: true, result: { sessionId } };
+									// The creation verifier reconciliation (#4731) requires the
+									// broker to prove which sidecar key became runtime authority.
+									return {
+										ok: true,
+										result: {
+											sessionId,
+											coordinatorSidecarKeyId: input.coordinatorSidecarKeyId,
+										},
+									};
 								}
 								if (operation === "session.list") return { ok: true, result: { sessions: brokerSessions } };
 								throw new Error(`unexpected broker operation: ${operation} ${JSON.stringify(input)}`);
