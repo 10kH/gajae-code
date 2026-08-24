@@ -744,6 +744,15 @@ export function decodePrintableKey(data: string): string | undefined {
  * @param keyId - Key identifier (e.g., "ctrl+c", "escape", Key.ctrl("c"))
  */
 export function matchesKey(data: string, keyId: KeyId): boolean {
+	if (data === "\x08" && isWindowsTerminalSession()) {
+		// Raw 0x08 is ambiguous and the native matcher resolves it as unmodified
+		// backspace only, so on Windows Terminal -- where the byte means
+		// ctrl+backspace -- every chord declaring ctrl+backspace silently never
+		// fired. Resolve it here so the declared chord works and plain backspace
+		// stops claiming the byte on that host.
+		if (keyId === "ctrl+backspace") return true;
+		if (keyId === "backspace") return false;
+	}
 	return (
 		nativeKeys().matchesKey(data, keyId, kittyProtocolActive) ||
 		(kittyProtocolActive && matchesKoreanDubeolsikKittySequence(data, keyId))

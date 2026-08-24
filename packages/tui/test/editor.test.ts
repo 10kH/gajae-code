@@ -2400,6 +2400,38 @@ describe("Editor component", () => {
 				expect(editor.getText()).toBe("abc ");
 			});
 
+			it("deletes the previous word for raw 0x08 inside Windows Terminal", () => {
+				// Windows Terminal sends 0x08 for ctrl+backspace. The native matcher
+				// resolves that byte as unmodified backspace only, so the declared
+				// ctrl+backspace chord never fired on that host until matchesKey began
+				// consulting the Windows Terminal heuristic.
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				process.env.WT_SESSION = "test-session";
+				delete process.env.SSH_CONNECTION;
+				delete process.env.SSH_CLIENT;
+				delete process.env.SSH_TTY;
+
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				editor.handleInput("\x08");
+
+				expect(editor.getText()).toBe("abc ");
+			});
+
+			it("keeps raw 0x08 as ctrl+backspace only when no SSH markers are present", () => {
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				process.env.WT_SESSION = "test-session";
+				process.env.SSH_CONNECTION = "1.2.3.4 5 6.7.8.9 22";
+
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				editor.handleInput("\x08");
+
+				// Forwarded over SSH the far end is not Windows Terminal, so the byte
+				// must fall back to plain backspace.
+				expect(editor.getText()).toBe("abc de");
+			});
+
 			it("leaves raw 0x08 as plain backspace on a non-Windows-Terminal host", () => {
 				// Raw 0x08 is ambiguous: Windows Terminal sends it for ctrl+backspace,
 				// other terminals for plain backspace. The WT branch is decided inside
