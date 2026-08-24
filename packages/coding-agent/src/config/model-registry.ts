@@ -1950,6 +1950,7 @@ export class ModelRegistry {
 			merged[existingIndex] = {
 				...existing,
 				...registryModel,
+				api: explicitTransport?.api ?? registryModel.api,
 				baseUrl: existing.baseUrl,
 				headers: existing.headers,
 				transport: existing.transport,
