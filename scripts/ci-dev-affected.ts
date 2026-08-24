@@ -477,6 +477,7 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		// Windows imports, so dependency-only changes must still run the live
 		// windows-latest regression (#4883).
 		changedPath === "Cargo.toml" ||
+		changedPath === "Cargo.lock" ||
 		changedPath === "crates/brush-core-vendored/Cargo.toml" ||
 		changedPath === "crates/pi-shell/Cargo.toml" ||
 		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts"

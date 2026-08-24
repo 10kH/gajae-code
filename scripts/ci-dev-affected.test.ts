@@ -1296,6 +1296,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"crates/pi-shell/src/lib.rs",
 			"crates/pi-shell/src/windows.rs",
 			"Cargo.toml",
+			"Cargo.lock",
 			"crates/brush-core-vendored/Cargo.toml",
 			"crates/pi-shell/Cargo.toml",
 			"packages/natives/test/windows-hidden-shell.windows.test.ts",

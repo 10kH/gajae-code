@@ -28,7 +28,7 @@
 import { dlopen } from "bun:ffi";
 import { describe, expect, it, setDefaultTimeout } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const isWindows = process.platform === "win32";
@@ -38,7 +38,7 @@ const isWindows = process.platform === "win32";
 const LIVE_TEST_TIMEOUT_MS = 60_000;
 setDefaultTimeout(LIVE_TEST_TIMEOUT_MS);
 
-const NATIVES_ENTRY_URL = pathToFileURL(resolve("packages/natives/native/index.js")).href;
+const NATIVES_ENTRY_URL = pathToFileURL(path.resolve("packages/natives/native/index.js")).href;
 
 // Three-way console-state probe, one P/Invoke per kernel call:
 //   - handle:      GetConsoleWindow() — non-null ⇒ a console WINDOW exists
@@ -75,9 +75,11 @@ function runHidden(command: string, args: string[], cwd?: string, hide = true) {
  */
 function runConsolelessBun(script: string) {
 	const wrapper = `
+import { dlopen as childDlopen } from "bun:ffi";
+import { executeShell } from ${JSON.stringify(NATIVES_ENTRY_URL)};
+
 (async () => {
-	const { dlopen } = await import("bun:ffi");
-	const kernel32 = dlopen("kernel32.dll", {
+	const kernel32 = childDlopen("kernel32.dll", {
 		FreeConsole: { args: [], returns: "bool" },
 		GetConsoleWindow: { args: [], returns: "ptr" },
 	});
@@ -88,7 +90,6 @@ function runConsolelessBun(script: string) {
 		process.exit(3);
 	}
 	console.log("host-consoleless=1");
-	const { executeShell } = await import(${JSON.stringify(NATIVES_ENTRY_URL)});
 	async function sh(command) {
 		let out = "";
 		const result = await executeShell({ command, timeoutMs: 45_000 }, (err, chunk) => {
