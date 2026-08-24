@@ -518,3 +518,144 @@ describe("ProcessTerminal raw-Buffer stdin (issue #454)", () => {
 		terminal.stop();
 	});
 });
+
+describe("ProcessTerminal probe writes and cooked-mode tty", () => {
+	const stdinIsRawDescriptor = Object.getOwnPropertyDescriptor(process.stdin, "isRaw");
+
+	beforeEach(() => {
+		Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+		restoreProperty(process.stdin, "isTTY", stdinIsTtyDescriptor);
+		restoreProperty(process.stdout, "isTTY", stdoutIsTtyDescriptor);
+		restoreProperty(process.stdin, "isRaw", stdinIsRawDescriptor);
+		restoreProperty(process.stdin, "setRawMode", stdinSetRawModeDescriptor);
+		restoreProperty(process, "platform", processPlatformDescriptor);
+		restoreEnv("WSL_INTEROP", originalWslInterop);
+		restoreEnv("WSL_DISTRO_NAME", originalWslDistroName);
+	});
+
+	/** Models a real tty whose kernel mode can diverge from the stream's cached isRaw flag. */
+	function setupTerminal() {
+		let cachedRaw = false;
+		let kernelRaw = false;
+		let runtimeRequestedRaw = false;
+		const rawModeCalls: boolean[] = [];
+		const writes: string[] = [];
+		Object.defineProperty(process.stdin, "isRaw", {
+			get: () => cachedRaw,
+			set: value => (cachedRaw = value),
+			configurable: true,
+		});
+		const setRawModeMock = vi.fn((value: boolean) => {
+			rawModeCalls.push(value);
+			// Match Node/Bun: the runtime no-ops repeated requests using internal
+			// state that does not observe direct termios changes or isRaw assignment.
+			if (runtimeRequestedRaw === value) return process.stdin;
+			runtimeRequestedRaw = value;
+			cachedRaw = value;
+			kernelRaw = value;
+			return process.stdin;
+		});
+		Object.defineProperty(process.stdin, "setRawMode", {
+			value: setRawModeMock,
+			configurable: true,
+		});
+		vi.spyOn(process, "kill").mockReturnValue(true);
+		vi.spyOn(process.stdin, "resume").mockImplementation(() => process.stdin);
+		vi.spyOn(process.stdin, "pause").mockImplementation(() => process.stdin);
+		vi.spyOn(process.stdin, "setEncoding").mockImplementation(() => process.stdin);
+		vi.spyOn(process.stdout, "write").mockImplementation(chunk => {
+			writes.push(typeof chunk === "string" ? chunk : chunk.toString());
+			return true;
+		});
+
+		const terminal = new ProcessTerminal();
+		terminal.start(
+			() => {},
+			() => {},
+		);
+
+		const queryCount = () => writes.filter(w => w === "\x1b]11;?\x07").length;
+		return {
+			terminal,
+			writes,
+			queryCount,
+			rawModeCalls,
+			setRawModeMock,
+			isKernelRaw: () => kernelRaw,
+			setKernelCooked: () => (kernelRaw = false),
+		};
+	}
+
+	it("re-asserts raw mode when child termios changes leave isRaw stale", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount, setKernelCooked, isKernelRaw } = setupTerminal();
+		const baseline = queryCount();
+		expect(isKernelRaw()).toBe(true);
+
+		// A foreground child changes the kernel termios directly. Node/Bun's
+		// process.stdin.isRaw cache remains true, so consulting it cannot detect this.
+		setKernelCooked();
+
+		vi.advanceTimersByTime(2000);
+
+		expect(queryCount()).toBe(baseline + 1);
+		expect(isKernelRaw()).toBe(true);
+
+		terminal.stop();
+	});
+
+	it("keeps re-asserting across repeated poll ticks", () => {
+		vi.useFakeTimers();
+		const { terminal, setKernelCooked, isKernelRaw } = setupTerminal();
+
+		for (let tick = 0; tick < 3; tick++) {
+			setKernelCooked();
+			vi.advanceTimersByTime(2000);
+			expect(isKernelRaw()).toBe(true);
+			// The DA1 sentinel completes the cycle so the next poll issues a query.
+			process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+			process.stdin.emit("data", "\x1b[?1;2c");
+		}
+
+		terminal.stop();
+	});
+
+	it("does not trust cached isRaw while the tty appears healthy", () => {
+		vi.useFakeTimers();
+		const { terminal, rawModeCalls } = setupTerminal();
+		const afterStart = rawModeCalls.length;
+
+		// Finish startup, then let the first poll issue another probe.
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		vi.advanceTimersByTime(2000);
+
+		expect(rawModeCalls.slice(afterStart)).toEqual([false, true]);
+
+		terminal.stop();
+	});
+
+	it("does not write a probe when raw-mode restoration fails", () => {
+		vi.useFakeTimers();
+		const { terminal, queryCount, setRawModeMock } = setupTerminal();
+		const baseline = queryCount();
+		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
+		process.stdin.emit("data", "\x1b[?1;2c");
+		setRawModeMock.mockImplementation(() => {
+			throw new Error("tty detached");
+		});
+
+		vi.advanceTimersByTime(2000);
+
+		expect(queryCount()).toBe(baseline);
+
+		setRawModeMock.mockImplementation(() => process.stdin);
+		terminal.stop();
+	});
+});
