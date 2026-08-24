@@ -6,7 +6,12 @@ import { APP_ACTION_METADATA } from "../src/modes/action-registry";
 import { AVAILABILITY_GATED_NAV_PALETTE_ACTIONS } from "../src/modes/controllers/input-controller";
 
 /** Chords shipped by the low-risk TUI/UX batch, with their sole intended owner. */
-const NEWLY_SHIPPED_CHORD_OWNERS: ReadonlyArray<readonly [KeyId, AppKeybinding]> = [["alt+shift+t", "app.todo.toggle"]];
+const NEWLY_SHIPPED_CHORD_OWNERS: ReadonlyArray<readonly [KeyId, AppKeybinding]> = [
+	["alt+shift+t", "app.todo.toggle"],
+	["alt+shift+s", "app.session.tree"],
+	["alt+shift+f", "app.session.fork"],
+	["alt+shift+r", "app.session.resume"],
+];
 
 const appBindings = Object.keys(KEYBINDINGS).filter((id): id is AppKeybinding => id.startsWith("app."));
 const metadataById = new Map(APP_ACTION_METADATA.map(action => [action.id, action]));

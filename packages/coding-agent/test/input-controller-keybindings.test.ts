@@ -79,6 +79,9 @@ async function createContext(options?: {
 		"tui.select.cancel": ["escape"],
 		"tui.editor.deleteCharBackward": ["backspace"],
 		"app.todo.toggle": ["alt+shift+t"],
+		"app.session.tree": ["alt+shift+s"],
+		"app.session.fork": ["alt+shift+f"],
+		"app.session.resume": ["alt+shift+r"],
 	};
 
 	const setActionKeys = vi.fn();
@@ -1686,6 +1689,45 @@ describe("InputController shell mode cues", () => {
 		// consumes a chord before custom handlers run, so a collision there would
 		// silently shadow the new bindings even with no KEYBINDINGS conflict.
 		const editor = new CustomEditor(defaultEditorTheme);
-		expect(editor.hasActionKey("alt+shift+t")).toBe(false);
+		for (const chord of ["alt+shift+t", "alt+shift+s", "alt+shift+f", "alt+shift+r"] as const) {
+			expect(editor.hasActionKey(chord)).toBe(false);
+		}
+	});
+
+	it("activates the session navigation chords, leaving tree and fork inert on an empty session", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		(ctx.session as { messages: unknown[] }).messages = [];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		const handlerFor = (key: string) =>
+			(editor.setCustomKeyHandler as Mock<(key: string, handler: () => boolean) => void>).mock.calls.find(
+				([registered]) => registered === key,
+			)?.[1];
+
+		const tree = handlerFor("alt+shift+s");
+		const fork = handlerFor("alt+shift+f");
+		const resume = handlerFor("alt+shift+r");
+		if (!tree || !fork || !resume) throw new Error("Expected the three session navigation chords to be bound");
+
+		// The loops consume the chord, but ActionRegistry refuses an unavailable
+		// action, so nothing opens against an empty session.
+		expect(tree()).toBe(true);
+		expect(fork()).toBe(true);
+		expect(ctx.showTreeSelector).not.toHaveBeenCalled();
+		expect(ctx.showUserMessageSelector).not.toHaveBeenCalled();
+
+		// `app.session.resume` has no message precondition.
+		expect(resume()).toBe(true);
+		await Bun.sleep(0);
+		expect(ctx.showSessionSelector).toHaveBeenCalledTimes(1);
+
+		(ctx.session as { messages: unknown[] }).messages = [{ role: "user", content: "hi" }];
+		await Bun.sleep(0);
+
+		expect(tree()).toBe(true);
+		await Bun.sleep(0);
+		expect(ctx.showTreeSelector).toHaveBeenCalledTimes(1);
 	});
 });

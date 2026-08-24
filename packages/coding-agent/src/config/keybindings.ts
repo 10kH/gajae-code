@@ -177,15 +177,15 @@ export const KEYBINDINGS = {
 		description: "Start a new session",
 	},
 	"app.session.tree": {
-		defaultKeys: [],
+		defaultKeys: "alt+shift+s",
 		description: "Show session tree",
 	},
 	"app.session.fork": {
-		defaultKeys: [],
+		defaultKeys: "alt+shift+f",
 		description: "Branch from message",
 	},
 	"app.session.resume": {
-		defaultKeys: [],
+		defaultKeys: "alt+shift+r",
 		description: "Resume session",
 	},
 	"app.session.observe": {
