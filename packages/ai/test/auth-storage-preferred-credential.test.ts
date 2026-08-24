@@ -83,7 +83,7 @@ describe("runtime preferred credential selector", () => {
 		expect(await storage.markUsageLimitReached("anthropic", "session-c", { retryAfterMs: 45_000 })).toBe(true);
 		expect(await storage.getApiKey("anthropic", "session-c")).toBe("token-test-fallback");
 		expect(await storage.markUsageLimitReached("anthropic", "session-c", { retryAfterMs: 90_000 })).toBe(false);
-		const retryableAt = storage.getEarliestUnblockAt("anthropic");
+		const retryableAt = storage.getEarliestUnblockAt("anthropic", "session-c");
 		expect(retryableAt).toBeDefined();
 		expect(retryableAt!).toBeGreaterThanOrEqual(before + 45_000 - 250);
 		expect(retryableAt!).toBeLessThan(before + 90_000);

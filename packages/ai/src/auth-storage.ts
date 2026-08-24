@@ -4172,12 +4172,16 @@ export class AuthStorage {
 	/**
 	 * Earliest instant at which any currently blocked stored credential for this
 	 * provider becomes usable again. Undefined when nothing is blocked.
+	 * When `sessionId` is provided, only the session's active credential type is
+	 * considered — API-key and OAuth backoff pools are independent.
 	 * Informational only: callers must not treat this as authorization to wait.
 	 */
-	getEarliestUnblockAt(provider: string): number | undefined {
+	getEarliestUnblockAt(provider: string, sessionId?: string): number | undefined {
 		provider = resolveOAuthStorageProvider(provider);
+		const sessionType = this.#getSessionCredential(provider, sessionId)?.type;
 		let earliest: number | undefined;
 		for (const [index, credential] of this.#getCredentialsForProvider(provider).entries()) {
+			if (sessionType !== undefined && credential.type !== sessionType) continue;
 			const blockedUntil = this.#getCredentialBlockedUntil(
 				this.#getProviderTypeKey(provider, credential.type),
 				index,

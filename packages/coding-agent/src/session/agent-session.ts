@@ -18893,7 +18893,10 @@ export class AgentSession {
 	/** Copy AuthStorage's already-computed unblock instant onto a terminal quota error. */
 	#quotaRetryableAtMs(): number | undefined {
 		if (!this.model) return undefined;
-		const retryableAt = this.#modelRegistry.authStorage.getEarliestUnblockAt(this.model.provider);
+		const retryableAt = this.#modelRegistry.authStorage.getEarliestUnblockAt(
+			this.model.provider,
+			this.credentialSessionId,
+		);
 		return retryableAt !== undefined && Number.isFinite(retryableAt) ? retryableAt : undefined;
 	}
 
@@ -19027,14 +19030,15 @@ export class AgentSession {
 		// observable state to corrupt, so it is replay-safe regardless of
 		// extension lifecycle participation. Mark the failed credential and
 		// retry with the next stored credential of the same provider.
-		let credentialRotated =
+		let credentialRotated = false;
+		if (
 			!managedFallback &&
 			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
-			(trigger.class === "quota" || trigger.class === "rate_limit") &&
-			(await this.#markFailedCredential(trigger));
-		if (!credentialRotated && (trigger.class === "quota" || trigger.class === "rate_limit")) {
-			this.#stampQuotaRetryableAt(message);
+			(trigger.class === "quota" || trigger.class === "rate_limit")
+		) {
+			credentialRotated = await this.#markFailedCredential(trigger);
+			if (!credentialRotated) this.#stampQuotaRetryableAt(message);
 		}
 
 		// A content-free credential rotation is inherently replay-safe: no partial
