@@ -334,9 +334,12 @@ describe("test manifest runner", () => {
 
 		expect(result.exitCode, output(result)).toBe(0);
 		expect(output(result)).toContain(`manifest command receipts complete: ${manifest.commands.length}`);
-		expect(output(result)).toContain(
-			"manifest row receipts complete: 582 (telegram=97, discord=97, slack=97, mcp=97, acp=97, daemonCli=97)",
-		);
+		// Derived from the manifest, not hardcoded: adding one operation adds one
+		// row per adapter, and a literal total silently goes stale.
+		const perAdapter = new Map<string, number>();
+		for (const row of manifest.rows) perAdapter.set(row.adapter, (perAdapter.get(row.adapter) ?? 0) + 1);
+		const breakdown = [...perAdapter.entries()].map(([adapter, count]) => `${adapter}=${count}`).join(", ");
+		expect(output(result)).toContain(`manifest row receipts complete: ${manifest.rows.length} (${breakdown})`);
 		// Receipts run concurrently inside a phase, so their relative order carries
 		// no evidence; what must hold is that every declared receipt ran exactly
 		// once as its own process, and that no parity row started before the
