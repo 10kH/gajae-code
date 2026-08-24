@@ -428,6 +428,8 @@ jobs:
         run: |
           cargo test -p pi-shell --lib windows
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p pi-shell --lib embedded_external_command_console_window_visibility
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 
   windows-native-build-toolchain:
