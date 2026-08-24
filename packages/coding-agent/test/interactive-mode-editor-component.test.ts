@@ -437,6 +437,36 @@ describe("InteractiveMode.setEditorComponent", () => {
 		forceTerminalSize(mode, 80, 24);
 		expect(mode.todoContainer.render(80).every(line => visibleWidth(line) <= 47)).toBe(true);
 	});
+	it("expands the todo HUD from the collapsed five-task view and back", async () => {
+		await mode.init();
+		const tasks = Array.from({ length: 7 }, (_, index) => ({
+			content: `task-${index + 1}`,
+			status: index === 0 ? ("in_progress" as const) : ("pending" as const),
+		}));
+		mode.setTodos(tasks);
+
+		const collapsed = mode.todoContainer.render(80).map(stripRenderControls).join("\n");
+		expect(mode.todoExpanded).toBe(false);
+		expect(collapsed).toContain("task-5");
+		// Tasks past the collapsed cap are hidden behind a summary row.
+		expect(collapsed).not.toContain("task-6");
+		expect(collapsed).not.toContain("task-7");
+		expect(collapsed).toMatch(/\+\s*2\s+more/);
+
+		mode.toggleTodoExpansion();
+
+		const expanded = mode.todoContainer.render(80).map(stripRenderControls).join("\n");
+		expect(mode.todoExpanded).toBe(true);
+		for (const task of tasks) expect(expanded).toContain(task.content);
+		expect(expanded).not.toMatch(/\+\s*\d+\s+more/);
+
+		mode.toggleTodoExpansion();
+
+		const recollapsed = mode.todoContainer.render(80).map(stripRenderControls).join("\n");
+		expect(mode.todoExpanded).toBe(false);
+		expect(recollapsed).not.toContain("task-7");
+		expect(recollapsed).toMatch(/\+\s*2\s+more/);
+	});
 
 	it("suppresses the toggle hint when the panel is requested-open but yielded at narrow width", () => {
 		mode.settings.set("irc.enabled", true);

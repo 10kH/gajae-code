@@ -1730,6 +1730,19 @@ describe("InputController availability-gated navigation palette entries", () => 
 		expect(ids).toContain("app.session.fork");
 	});
 
+	it("omits the todo toggle entry with an empty todo model and lists it once a phase has tasks", () => {
+		const { ctx } = createContext();
+		ctx.todoPhases = [];
+
+		expect(listPalette(ctx).map(action => action.id)).not.toContain("app.todo.toggle");
+
+		ctx.todoPhases = [
+			{ title: "Phase 1", tasks: [{ text: "do the thing", status: "pending" }] },
+		] as unknown as InteractiveModeContext["todoPhases"];
+
+		expect(listPalette(ctx).map(action => action.id)).toContain("app.todo.toggle");
+	});
+
 	it("labels gated entries from their keybinding description", () => {
 		const { ctx } = createContext();
 

@@ -187,6 +187,7 @@ Authoritative inventory of the keybinding registry, one row per action. Generate
 | `app.transcript.nextTurn` | _(none)_ | composer |
 | `app.mode.cycle` | _(none)_ | composer |
 | `app.tasks.toggle` | alt+t | composer |
+| `app.todo.toggle` | alt+shift+t | composer |
 | `app.queue.togglePane` | _(none)_ | composer |
 | `app.message.sendNow` | _(none)_ | composer |
 

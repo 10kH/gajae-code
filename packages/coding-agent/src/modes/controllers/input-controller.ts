@@ -159,6 +159,7 @@ export class InputController {
 			"app.transcript.prevTurn": () => this.#jumpTranscriptTurn(-1),
 			"app.transcript.nextTurn": () => this.#jumpTranscriptTurn(1),
 			"app.tasks.toggle": () => this.ctx.showTasksPane(),
+			"app.todo.toggle": () => this.ctx.toggleTodoExpansion(),
 			"app.queue.togglePane": () => this.toggleQueuePane(),
 			"app.message.sendNow": () => this.sendNow(),
 		};
@@ -234,6 +235,8 @@ export class InputController {
 					!this.ctx.goalModeController.enabled &&
 					!this.ctx.goalModeController.paused
 				);
+			case "app.todo.toggle":
+				return this.ctx.todoPhases.some(phase => phase.tasks.length > 0);
 			case "app.queue.togglePane":
 				return true;
 			case "app.message.sendNow":
@@ -863,6 +866,17 @@ export class InputController {
 		for (const key of this.ctx.keybindings.getKeys("app.tasks.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
 				this.#executeAction("app.tasks.toggle");
+				return true;
+			});
+		}
+		// The todo HUD renders a `+N more` row but had no way to expand it:
+		// `toggleTodoExpansion()` had no caller anywhere in src/. The palette entry
+		// opts into availability gating so it is not offered with an empty model.
+		this.#registerCommandPaletteAction("app.todo.toggle", () => this.#executeAction("app.todo.toggle"), true);
+		for (const key of this.ctx.keybindings.getKeys("app.todo.toggle")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				if (!this.actionRegistry.isAvailable("app.todo.toggle")) return false;
+				this.#executeAction("app.todo.toggle");
 				return true;
 			});
 		}

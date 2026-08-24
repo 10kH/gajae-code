@@ -78,6 +78,7 @@ async function createContext(options?: {
 		"tui.select.confirm": ["enter"],
 		"tui.select.cancel": ["escape"],
 		"tui.editor.deleteCharBackward": ["backspace"],
+		"app.todo.toggle": ["alt+shift+t"],
 	};
 
 	const setActionKeys = vi.fn();
@@ -1649,5 +1650,42 @@ describe("InputController shell mode cues", () => {
 
 		expect(editor.addToHistory).toHaveBeenCalledWith("!pwd");
 		expect(spies.handleBashCommand).toHaveBeenCalledWith("pwd", false);
+	});
+
+	it("dispatches the todo toggle chord only while a phase has tasks", async () => {
+		const { InputController, ctx, editor } = await createContext();
+		const toggleTodoExpansion = vi.fn();
+		ctx.toggleTodoExpansion = toggleTodoExpansion;
+		ctx.todoPhases = [];
+		const controller = new InputController(ctx);
+
+		controller.setupKeyHandlers();
+
+		const handler = (
+			editor.setCustomKeyHandler as Mock<(key: string, handler: () => boolean) => void>
+		).mock.calls.find(([key]) => key === "alt+shift+t")?.[1];
+		if (!handler) throw new Error("Expected an alt+shift+t handler for app.todo.toggle");
+
+		// Empty model: the chord must fall through rather than toggling an empty HUD.
+		expect(handler()).toBe(false);
+		expect(toggleTodoExpansion).not.toHaveBeenCalled();
+
+		ctx.todoPhases = [
+			{ title: "Phase 1", tasks: [{ text: "do the thing", status: "pending" }] },
+		] as unknown as InteractiveModeContext["todoPhases"];
+		// ActionRegistry memoizes availability for the current microtask and clears
+		// it on a queued microtask, so yield before re-probing.
+		await Bun.sleep(0);
+
+		expect(handler()).toBe(true);
+		expect(toggleTodoExpansion).toHaveBeenCalledTimes(1);
+	});
+
+	it("leaves the new alt+shift chords unclaimed by built-in editor actions", () => {
+		// `CustomEditor.#actionKeys` decides whether a built-in editor action
+		// consumes a chord before custom handlers run, so a collision there would
+		// silently shadow the new bindings even with no KEYBINDINGS conflict.
+		const editor = new CustomEditor(defaultEditorTheme);
+		expect(editor.hasActionKey("alt+shift+t")).toBe(false);
 	});
 });

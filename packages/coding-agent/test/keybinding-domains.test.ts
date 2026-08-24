@@ -1,8 +1,12 @@
 import { describe, expect, it } from "bun:test";
+import { type KeyId, parseKeyId } from "@gajae-code/tui";
 import { generateHotkeysDocsTable } from "../scripts/generate-hotkeys-docs";
 import { type AppKeybinding, KEYBINDINGS } from "../src/config/keybindings";
 import { APP_ACTION_METADATA } from "../src/modes/action-registry";
 import { AVAILABILITY_GATED_NAV_PALETTE_ACTIONS } from "../src/modes/controllers/input-controller";
+
+/** Chords shipped by the low-risk TUI/UX batch, with their sole intended owner. */
+const NEWLY_SHIPPED_CHORD_OWNERS: ReadonlyArray<readonly [KeyId, AppKeybinding]> = [["alt+shift+t", "app.todo.toggle"]];
 
 const appBindings = Object.keys(KEYBINDINGS).filter((id): id is AppKeybinding => id.startsWith("app."));
 const metadataById = new Map(APP_ACTION_METADATA.map(action => [action.id, action]));
@@ -69,5 +73,26 @@ describe("application keybinding domains", () => {
 		const gated = new Set<AppKeybinding>(AVAILABILITY_GATED_NAV_PALETTE_ACTIONS);
 		expect(gated.has("app.message.followUp")).toBe(false);
 		expect(gated.has("app.mode.cycle")).toBe(false);
+	});
+
+	it("claims each newly shipped alt+shift chord for exactly one owner across every keybinding layer", () => {
+		// KEYBINDINGS spreads TUI_KEYBINDINGS, so iterating it covers the app layer
+		// and the TUI editor/input/select layers in one pass. The pre-existing
+		// collision test only compares APP_ACTION_METADATA entries against each
+		// other, so a chord already claimed by a TUI editor binding would slip past.
+		const ownersByChord = new Map<string, string[]>();
+		for (const [id, binding] of Object.entries(KEYBINDINGS)) {
+			const keys = Array.isArray(binding.defaultKeys) ? binding.defaultKeys : [binding.defaultKeys];
+			for (const key of keys) {
+				if (!key) continue;
+				ownersByChord.set(key, [...(ownersByChord.get(key) ?? []), id]);
+			}
+		}
+
+		for (const [chord, expectedOwner] of NEWLY_SHIPPED_CHORD_OWNERS) {
+			expect(ownersByChord.get(chord)).toEqual([expectedOwner]);
+			// Canonical form: a non-canonical spelling would never match at runtime.
+			expect(parseKeyId(chord)?.keyId).toBe(chord);
+		}
 	});
 });

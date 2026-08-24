@@ -61,6 +61,7 @@ interface AppKeybindings {
 	"app.transcript.nextTurn": true;
 	"app.mode.cycle": true;
 	"app.tasks.toggle": true;
+	"app.todo.toggle": true;
 	"app.queue.togglePane": true;
 	"app.message.sendNow": true;
 }
@@ -263,6 +264,10 @@ export const KEYBINDINGS = {
 	"app.tasks.toggle": {
 		defaultKeys: "alt+t",
 		description: "Toggle tasks pane",
+	},
+	"app.todo.toggle": {
+		defaultKeys: "alt+shift+t",
+		description: "Toggle todo list expansion",
 	},
 	"app.queue.togglePane": {
 		defaultKeys: [],
