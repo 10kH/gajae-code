@@ -110,11 +110,18 @@ has_git_lfs() {
 }
 
 
+trusted_github_url() {
+    case "$1" in
+        https://api.github.com/* | https://github.com/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 curl_github() {
     url="$1"
     out="$2"
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    if [ -n "$token" ]; then
+    if [ -n "$token" ] && trusted_github_url "$url"; then
         curl -fsSL --retry 3 --retry-delay 1 \
             -A "gjc-install" \
             -H "Accept: application/vnd.github+json" \
@@ -134,7 +141,7 @@ curl_github_optional() {
     url="$1"
     out="$2"
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    if [ -n "$token" ]; then
+    if [ -n "$token" ] && trusted_github_url "$url"; then
         curl -sSL --retry 2 --retry-delay 1 \
             -A "gjc-install" \
             -H "Accept: application/octet-stream" \
@@ -171,7 +178,8 @@ extract_json_string() {
 
 pick_nightly_tag() {
     json_file="$1"
-    tr -d '\r' < "$json_file" | awk '
+    # Split compact GitHub arrays so each field can be inspected independently.
+    tr -d '\r' < "$json_file" | sed 's/[{,]/&\n/g' | awk '
         BEGIN { tag=""; draft=""; pre="" }
         {
             if (match($0, /"tag_name"[ \t]*:[ \t]*"[^"]+"/)) {
@@ -183,7 +191,7 @@ pick_nightly_tag() {
             if ($0 ~ /"draft"[ \t]*:[ \t]*true/) draft = "1"
             if ($0 ~ /"draft"[ \t]*:[ \t]*false/) draft = "0"
             if ($0 ~ /"prerelease"[ \t]*:[ \t]*true/) {
-                if (tag != "" && draft != "1" && tag ~ /-nightly\./) {
+                if (tag != "" && draft != "1" && tag ~ /-nightly\.[0-9]+\.[0-9]+\.g[0-9a-f]+$/) {
                     print tag
                     exit
                 }

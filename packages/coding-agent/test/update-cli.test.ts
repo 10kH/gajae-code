@@ -999,14 +999,12 @@ describe("update-cli binary update flow", () => {
 		const result = await runBinaryUpdateFlow(targetPath, "https://example.test/gjc", "1.2.3", flow);
 
 		expect(result.ok).toBe(true);
-		expect(calls).toEqual([
-			`download https://example.test/gjc -> ${targetPath}.new`,
-			`fsync ${targetPath}.new`,
-			"beforeReplace",
-			`replace ${targetPath}.new -> ${targetPath}`,
-			"verify 1.2.3",
-		]);
-		expect(calls).not.toContain(`removeTemp ${targetPath}.new`);
+		expect(calls[0]).toMatch(new RegExp(`^download https://example.test/gjc -> ${targetPath}\\.new\\.`));
+		expect(calls[1]).toMatch(new RegExp(`^fsync ${targetPath}\\.new\\.`));
+		expect(calls[2]).toBe("beforeReplace");
+		expect(calls[3]).toMatch(new RegExp(`^replace ${targetPath}\\.new\\..* -> ${targetPath}$`));
+		expect(calls[4]).toBe("verify 1.2.3");
+		expect(calls.some(call => call.startsWith("removeTemp "))).toBe(false);
 	});
 
 	it("aborts before replacement/verification when fsync fails", async () => {
@@ -1037,7 +1035,9 @@ describe("update-cli binary update flow", () => {
 			"fsync failed",
 		);
 
-		expect(calls).toEqual([`download ${targetPath}.new`, "fsync", `removeTemp ${targetPath}.new`]);
+		expect(calls[0]).toMatch(new RegExp(`^download ${targetPath}\\.new\\.`));
+		expect(calls[1]).toBe("fsync");
+		expect(calls[2]).toMatch(new RegExp(`^removeTemp ${targetPath}\\.new\\.`));
 		expect(calls).not.toContain("replace");
 		expect(calls).not.toContain("verify");
 	});

@@ -782,25 +782,51 @@ export async function runBinaryUpdateFlow(
 	expectedVersion: string,
 	flow: BinaryUpdateFlow,
 ): Promise<InstalledVersionVerification> {
-	const tempPath = `${targetPath}.new`;
-	const backupPath = `${targetPath}.bak`;
-
-	await flow.download(url, tempPath);
+	const stamp = `${process.pid}.${Date.now().toString(16)}`;
+	const tempPath = `${targetPath}.new.${stamp}`;
+	const backupPath = `${targetPath}.bak.${stamp}`;
+	const releaseLock = await acquireBinaryUpdateLock(targetPath);
 	try {
-		await flow.fsync(tempPath);
+		await flow.download(url, tempPath);
+		try {
+			await flow.fsync(tempPath);
+		} catch (err) {
+			if (flow.removeTemp) await flow.removeTemp(tempPath);
+			throw err;
+		}
+
+		flow.beforeReplace?.();
+		return await flow.replace({
+			targetPath,
+			tempPath,
+			backupPath,
+			expectedVersion,
+			verifyInstalledVersion: flow.verifyInstalledVersion,
+		});
+	} finally {
+		await releaseLock();
+	}
+}
+
+async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {
+	const lockDir = `${targetPath}.update-lock`;
+	try {
+		await fs.promises.mkdir(lockDir);
 	} catch (err) {
-		if (flow.removeTemp) await flow.removeTemp(tempPath);
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return async () => {};
+		if (code === "EEXIST") {
+			throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
+		}
 		throw err;
 	}
-
-	flow.beforeReplace?.();
-	return flow.replace({
-		targetPath,
-		tempPath,
-		backupPath,
-		expectedVersion,
-		verifyInstalledVersion: flow.verifyInstalledVersion,
-	});
+	return async () => {
+		try {
+			await fs.promises.rmdir(lockDir);
+		} catch {
+			// Best-effort lock release after a verified or failed update.
+		}
+	};
 }
 
 /**

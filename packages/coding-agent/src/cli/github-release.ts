@@ -15,7 +15,7 @@ export const BINARY_SHA256_ASSET = "gajae-release-binaries.sha256";
 export const BINARY_MANIFEST_ASSET = "gajae-release-binaries-v1.json";
 
 const STABLE_VERSION_RE = /^\d+\.\d+\.\d+$/;
-const NIGHTLY_VERSION_RE = /^\d+\.\d+\.\d+-nightly\.[0-9A-Za-z.-]+$/;
+const NIGHTLY_VERSION_RE = /^\d+\.\d+\.\d+-nightly\.[0-9]+\.[0-9]+\.g[0-9a-f]+$/;
 const TAG_RE = /^v[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 
@@ -229,5 +229,8 @@ export async function verifyDownloadedBinaryChecksum(options: {
 		}
 		return "verified";
 	}
+	// Releases published before checksum assets (e.g. v0.15.0) return 404 for
+	// both files. Only an explicit double-404 is the compatibility skip;
+	// fetchOptionalText already fails closed on any non-404 HTTP error.
 	return "absent";
 }

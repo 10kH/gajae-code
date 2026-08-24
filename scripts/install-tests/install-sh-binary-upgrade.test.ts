@@ -362,6 +362,25 @@ describe("install.sh binary-first contract", () => {
 		const installer = await Bun.file(installScript).text();
 		expect(installer).toContain("curl -sSL");
 		expect(installer).toContain('if [ "$http_code" != "404" ]');
-		expect(installer).toContain("tag ~ /-nightly\\./");
+		expect(installer).toContain("tag ~ /-nightly\\.[0-9]+\\.[0-9]+\\.g[0-9a-f]+$/");
+		expect(installer).toContain("trusted_github_url");
+	});
+
+	test("selects a compact JSON nightly list without a pretty-printed layout", async () => {
+		const nightly = "0.9.1-nightly.1.1.gabc";
+		const payload = fakeGjcScript({ version: nightly });
+		writeCurlShim(sandbox.shimDir, {
+			releasesJson: JSON.stringify([
+				{ tag_name: "v0.9.0-rc.1", draft: false, prerelease: true },
+				{ tag_name: `v${nightly}`, draft: false, prerelease: true },
+			]),
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const result = await runInstaller(["--channel", "nightly"]);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain(`Using version: v${nightly}`);
 	});
 });
