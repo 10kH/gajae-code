@@ -920,9 +920,12 @@ test("SDK broker registration records an absolute lifecycle scope", async () => 
 			return fs.existsSync(indexPath) && fs.readFileSync(indexPath, "utf8").includes(sessionId);
 		}, "SDK broker registration");
 		const sessions = (await new SessionIndex(agentDir).open()).listSessions().sessions;
-		expect(sessions).toContainEqual(
-			expect.objectContaining({ sessionId, locator: expect.objectContaining({ repo: path.resolve(cwd) }) }),
-		);
+		// Locator v2 records a canonical absolute cwd, so a relative launch path
+		// is resolved AND realpath-canonicalized (macOS maps /var to /private/var).
+		const registered = sessions.find(session => session.sessionId === sessionId);
+		expect(registered).toBeDefined();
+		expect(path.isAbsolute(registered!.locator.cwd)).toBe(true);
+		expect(fs.realpathSync(registered!.locator.cwd)).toBe(fs.realpathSync(path.resolve(cwd)));
 	} finally {
 		await brokerOwnerForTest(agentDir)?.stop();
 	}
