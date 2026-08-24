@@ -21,15 +21,28 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		const installer = await Bun.file(installPs1Path).text();
 
 		// .NET Framework-based PowerShell 5.1 can default to TLS 1.0, which
-		// GitHub and bun.sh reject; every download then fails with "Could not
-		// create SSL/TLS secure channel".
+		// GitHub rejects; every download then fails with "Could not create
+		// SSL/TLS secure channel".
 		const tlsIndex = installer.indexOf("[Net.SecurityProtocolType]::Tls12");
 		expect(tlsIndex).toBeGreaterThan(-1);
-		for (const networkCall of ["Invoke-RestMethod", "Invoke-WebRequest", "irm bun.sh"]) {
+		for (const networkCall of ["Invoke-RestMethod", "Invoke-WebRequest"]) {
 			const callIndex = installer.indexOf(networkCall);
 			expect(callIndex).toBeGreaterThan(-1);
 			expect(tlsIndex).toBeLessThan(callIndex);
 		}
+	});
+
+	test("default path is a GitHub binary install and never downloads Bun", async () => {
+		const installer = await Bun.file(installPs1Path).text();
+		expect(installer).not.toContain("irm bun.sh");
+		expect(installer).not.toContain("Install-Bun");
+		expect(installer).toContain("This installer never downloads Bun");
+		expect(installer).toContain("Install-Binary");
+		expect(installer).toContain("gajae-release-binaries.sha256");
+		expect(installer).toContain("--smoke-test");
+		expect(installer).toContain("Restored previous gjc binary");
+		expect(installer).toContain("nightly");
+		expect(installer).not.toContain("Default: use bun if available");
 	});
 
 	test.skipIf(!pwsh)("parses without syntax errors under PowerShell", async () => {

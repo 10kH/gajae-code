@@ -1,74 +1,223 @@
 #!/bin/sh
 set -e
 
-# GJC Coding Agent Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+# GJC Coding Agent Installer (standalone binary, no Bun required)
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly
+#   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --ref v0.15.0
 #
 # Options:
-#   --source       Install via bun (installs bun if needed)
-#   --binary       Always install prebuilt binary
-#   --ref <ref>    Install specific tag/commit/branch
-#   -r <ref>       Shorthand for --ref
+#   --channel <stable|nightly>  Release channel (default: stable)
+#   --ref <tag> / -r <tag>      Exact GitHub release tag (binary assets required)
+#   --binary                    Explicit binary install (default; no-op alias)
+#   --source                    Development/source install via an existing Bun
+#   -h, --help                  Show this help
+#
+# Bun is never detected, installed, or invoked on the default path.
+# --source requires a preinstalled Bun and never downloads one.
 
 REPO="Yeachan-Heo/gajae-code"
 PACKAGE="@gajae-code/coding-agent"
 INSTALL_DIR="${GJC_INSTALL_DIR:-$HOME/.local/bin}"
+GITHUB_API="${GJC_GITHUB_API:-https://api.github.com}"
+GITHUB_RELEASES="${GJC_GITHUB_RELEASES:-https://github.com/${REPO}/releases/download}"
 MIN_BUN_VERSION="1.3.14"
+BINARY_SHA256_ASSET="gajae-release-binaries.sha256"
+BINARY_MANIFEST_ASSET="gajae-release-binaries-v1.json"
 
-# Parse arguments
-MODE=""
+MODE="binary"
+CHANNEL="stable"
 REF=""
-while [ $# -gt 0 ]; do
+TMP_FILES=""
+LOCK_DIR=""
+BACKUP_PATH=""
+DEST_PATH=""
+
+usage() {
+    cat <<'EOF'
+GJC installer — standalone binary (Bun is not required)
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+  sh install.sh [--channel stable|nightly] [--ref <tag>]
+  sh install.sh --source [--ref <tag>]
+
+Options:
+  --channel <stable|nightly>  GitHub release channel (default: stable)
+  --ref <tag>, -r <tag>       Exact GitHub release tag
+  --binary                    Install the prebuilt binary (default)
+  --source                    Source/development install; requires existing Bun
+  -h, --help                  Show this help
+
+Environment:
+  GJC_INSTALL_DIR             Install directory (default: ~/.local/bin)
+  GITHUB_TOKEN / GH_TOKEN     Optional GitHub API token (rate limits)
+EOF
+}
+
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+cleanup() {
+    old_status=$?
+    if [ -n "$TMP_FILES" ]; then
+        # shellcheck disable=SC2086
+        rm -f $TMP_FILES
+    fi
+    if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+    return 0
+}
+
+trap cleanup EXIT INT HUP TERM
+
+remember_tmp() {
+    TMP_FILES="${TMP_FILES} $1"
+}
+
+is_safe_tag() {
     case "$1" in
-        --source)
-            MODE="source"
-            shift
-            ;;
-        --binary)
-            MODE="binary"
-            shift
-            ;;
-        --ref)
-            shift
-            if [ -z "$1" ]; then
-                echo "Missing value for --ref"
-                exit 1
-            fi
-            REF="$1"
-            shift
-            ;;
-        --ref=*)
-            REF="${1#*=}"
-            if [ -z "$REF" ]; then
-                echo "Missing value for --ref"
-                exit 1
-            fi
-            shift
-            ;;
-        -r)
-            shift
-            if [ -z "$1" ]; then
-                echo "Missing value for -r"
-                exit 1
-            fi
-            REF="$1"
-            shift
+        v[A-Za-z0-9]*)
+            rest="${1#v}"
+            stripped=$(printf '%s' "$rest" | tr -d 'A-Za-z0-9._-')
+            [ -z "$stripped" ]
+            return $?
             ;;
         *)
-            echo "Unknown option: $1"
-            exit 1
+            return 1
             ;;
     esac
-done
+}
 
-# If a ref is provided, default to source install
-if [ -n "$REF" ] && [ -z "$MODE" ]; then
-    MODE="source"
-fi
+is_safe_channel() {
+    [ "$1" = "stable" ] || [ "$1" = "nightly" ]
+}
 
-# Check if bun is available
 has_bun() {
     command -v bun >/dev/null 2>&1
+}
+
+has_git() {
+    command -v git >/dev/null 2>&1
+}
+
+has_git_lfs() {
+    command -v git-lfs >/dev/null 2>&1
+}
+
+
+curl_github() {
+    url="$1"
+    out="$2"
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [ -n "$token" ]; then
+        curl -fsSL --retry 3 --retry-delay 1 \
+            -A "gjc-install" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Authorization: Bearer ${token}" \
+            -o "$out" "$url"
+    else
+        curl -fsSL --retry 3 --retry-delay 1 \
+            -A "gjc-install" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o "$out" "$url"
+    fi
+}
+
+curl_github_optional() {
+    url="$1"
+    out="$2"
+    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [ -n "$token" ]; then
+        curl -sS --retry 2 --retry-delay 1 \
+            -A "gjc-install" \
+            -H "Accept: application/octet-stream" \
+            -H "Authorization: Bearer ${token}" \
+            -o "$out" -w "%{http_code}" "$url"
+    else
+        curl -sS --retry 2 --retry-delay 1 \
+            -A "gjc-install" \
+            -H "Accept: application/octet-stream" \
+            -o "$out" -w "%{http_code}" "$url"
+    fi
+}
+
+extract_json_string() {
+    json_file="$1"
+    key="$2"
+    # Constrained extractor: first "key": "value" whose value matches the
+    # allowed charset. Rejects path traversal and shell metacharacters.
+    tr -d '\r' < "$json_file" | awk -v key="$key" '
+        BEGIN { pat = "\"" key "\"[[:space:]]*:[[:space:]]*\"" }
+        {
+            line = $0
+            while (match(line, "\"" key "\"[ \t]*:[ \t]*\"[^\"]*\"")) {
+                s = substr(line, RSTART, RLENGTH)
+                sub(/^[^"]*\"[^\"]*\"[ \t]*:[ \t]*\"/, "", s)
+                sub(/\"$/, "", s)
+                print s
+                exit
+            }
+        }
+    '
+}
+
+
+pick_nightly_tag() {
+    json_file="$1"
+    tr -d '\r' < "$json_file" | awk '
+        BEGIN { tag=""; draft=""; pre="" }
+        {
+            if (match($0, /"tag_name"[ \t]*:[ \t]*"[^"]+"/)) {
+                s = substr($0, RSTART, RLENGTH)
+                sub(/^"tag_name"[ \t]*:[ \t]*"/, "", s)
+                sub(/"$/, "", s)
+                tag = s
+            }
+            if ($0 ~ /"draft"[ \t]*:[ \t]*true/) draft = "1"
+            if ($0 ~ /"draft"[ \t]*:[ \t]*false/) draft = "0"
+            if ($0 ~ /"prerelease"[ \t]*:[ \t]*true/) {
+                if (tag != "" && draft != "1") {
+                    print tag
+                    exit
+                }
+            }
+            if ($0 ~ /"prerelease"[ \t]*:[ \t]*false/) {
+                tag = ""
+                draft = ""
+            }
+        }
+    '
+}
+
+file_sha256() {
+    f="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$f" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$f" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$f" | awk '{print $NF}'
+    else
+        die "Need sha256sum, shasum, or openssl to verify the downloaded binary"
+    fi
+}
+
+lookup_checksum() {
+    sums_file="$1"
+    asset_name="$2"
+    awk -v name="$asset_name" '
+        $2 == name || $2 == ("*" name) || $2 == ("./" name) {
+            print $1
+            exit
+        }
+    ' "$sums_file"
 }
 
 version_ge() {
@@ -103,53 +252,177 @@ version_ge() {
 require_bun_version() {
     version_raw=$(bun --version 2>/dev/null || true)
     if [ -z "$version_raw" ]; then
-        echo "Failed to read bun version"
-        exit 1
+        die "Failed to read bun version"
     fi
 
     version_clean=${version_raw%%-*}
     if ! version_ge "$version_clean" "$MIN_BUN_VERSION"; then
-        echo "Bun ${MIN_BUN_VERSION} or newer is required. Current version: ${version_clean}"
-        echo "Upgrade Bun at https://bun.sh/docs/installation"
-        exit 1
+        die "Bun ${MIN_BUN_VERSION} or newer is required for --source. Current version: ${version_clean}
+Install or upgrade Bun yourself: https://bun.sh/docs/installation
+This installer never downloads Bun."
     fi
 }
 
-# Check if git is available
-has_git() {
-    command -v git >/dev/null 2>&1
+detect_platform() {
+    OS="$(uname -s)"
+    ARCH="$(uname -m)"
+
+    case "$OS" in
+        Linux)  PLATFORM="linux" ;;
+        Darwin) PLATFORM="darwin" ;;
+        *)      die "Unsupported OS: $OS. Prebuilt binaries exist for Linux and macOS. See docs/install.md." ;;
+    esac
+
+    case "$ARCH" in
+        x86_64|amd64)  ARCH="x64" ;;
+        arm64|aarch64) ARCH="arm64" ;;
+        *)             die "Unsupported architecture: $ARCH. Prebuilt binaries exist for x64 and arm64." ;;
+    esac
+
+    BINARY="gjc-${PLATFORM}-${ARCH}"
 }
 
-# Install bun
-install_bun() {
-    echo "Installing bun..."
-    if command -v bash >/dev/null 2>&1; then
-        curl -fsSL https://bun.sh/install | bash
+acquire_lock() {
+    LOCK_DIR="${INSTALL_DIR}/.gjc-install.lock"
+    mkdir -p "$INSTALL_DIR"
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${LOCK_DIR})."
+    fi
+}
+
+resolve_release_tag() {
+    json_tmp="${INSTALL_DIR}/.gjc-release.$$.json"
+    remember_tmp "$json_tmp"
+
+    if [ -n "$REF" ]; then
+        is_safe_tag "$REF" || die "Invalid --ref '$REF'. Expected a GitHub release tag like v0.15.0."
+        echo "Fetching release $REF..."
+        if ! curl_github "${GITHUB_API}/repos/${REPO}/releases/tags/${REF}" "$json_tmp"; then
+            die "Release tag not found: $REF
+For branch/commit source installs, re-run with --source --ref <git-ref> and an existing Bun."
+        fi
+        LATEST=$(extract_json_string "$json_tmp" "tag_name")
+    elif [ "$CHANNEL" = "nightly" ]; then
+        echo "Fetching latest nightly GitHub prerelease..."
+        if ! curl_github "${GITHUB_API}/repos/${REPO}/releases?per_page=40" "$json_tmp"; then
+            die "Failed to list GitHub releases for the nightly channel"
+        fi
+        LATEST=$(pick_nightly_tag "$json_tmp")
+        if [ -z "$LATEST" ]; then
+            die "The nightly channel has no published GitHub prerelease yet; it is populated by the scheduled nightly workflow."
+        fi
     else
-        echo "bash not found; attempting install with sh..."
-        curl -fsSL https://bun.sh/install | sh
+        echo "Fetching latest stable GitHub release..."
+        if ! curl_github "${GITHUB_API}/repos/${REPO}/releases/latest" "$json_tmp"; then
+            die "Failed to fetch the latest GitHub release"
+        fi
+        LATEST=$(extract_json_string "$json_tmp" "tag_name")
     fi
-    export BUN_INSTALL="$HOME/.bun"
-    export PATH="$BUN_INSTALL/bin:$PATH"
-    require_bun_version
+
+    is_safe_tag "$LATEST" || die "Refusing unsafe release tag: ${LATEST:-<empty>}"
+    EXPECTED_VERSION="${LATEST#v}"
+    echo "Using version: $LATEST"
 }
 
-# Check if git-lfs is available
-has_git_lfs() {
-    command -v git-lfs >/dev/null 2>&1
+verify_checksum() {
+    asset_name="$1"
+    downloaded="$2"
+    sums_tmp="${INSTALL_DIR}/.gjc.sha256.$$"
+    manifest_tmp="${INSTALL_DIR}/.gjc.manifest.$$"
+    remember_tmp "$sums_tmp"
+    remember_tmp "$manifest_tmp"
+
+    sums_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_SHA256_ASSET}"
+    http_code=$(curl_github_optional "$sums_url" "$sums_tmp" || true)
+    if [ "$http_code" = "200" ] && [ -s "$sums_tmp" ]; then
+        expected=$(lookup_checksum "$sums_tmp" "$asset_name")
+        case "$expected" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+                actual=$(file_sha256 "$downloaded")
+                if [ "$actual" != "$expected" ]; then
+                    die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
+                fi
+                echo "Verified SHA-256 for ${asset_name}"
+                return 0
+                ;;
+            *)
+                die "Release checksum file ${BINARY_SHA256_ASSET} did not list ${asset_name}"
+                ;;
+        esac
+    fi
+
+    manifest_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_MANIFEST_ASSET}"
+    http_code=$(curl_github_optional "$manifest_url" "$manifest_tmp" || true)
+    if [ "$http_code" = "200" ] && [ -s "$manifest_tmp" ]; then
+        expected=$(awk -v name="$asset_name" '
+            $0 ~ "\"name\"" && $0 ~ name { saw=1 }
+            saw && /"sha256"/ {
+                if (match($0, /"sha256"[ \t]*:[ \t]*"[0-9a-f]{64}"/)) {
+                    s = substr($0, RSTART, RLENGTH)
+                    sub(/^.*"sha256"[ \t]*:[ \t]*"/, "", s)
+                    sub(/"$/, "", s)
+                    print s
+                    exit
+                }
+            }
+        ' "$manifest_tmp")
+        case "$expected" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
+                actual=$(file_sha256 "$downloaded")
+                if [ "$actual" != "$expected" ]; then
+                    die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
+                fi
+                echo "Verified SHA-256 for ${asset_name} from ${BINARY_MANIFEST_ASSET}"
+                return 0
+                ;;
+        esac
+    fi
+
+    echo "No checksum asset on ${LATEST}; continuing with size, --version, and --smoke-test verification."
 }
 
-# Install via bun
+restore_backup() {
+    if [ -n "$BACKUP_PATH" ] && [ -f "$BACKUP_PATH" ] && [ -n "$DEST_PATH" ]; then
+        mv -f "$BACKUP_PATH" "$DEST_PATH"
+        echo "Restored previous gjc binary at ${DEST_PATH}"
+    elif [ -n "$DEST_PATH" ] && [ ! -f "$BACKUP_PATH" ]; then
+        rm -f "$DEST_PATH"
+    fi
+}
+
+verify_installed_binary() {
+    dest="$1"
+    expected="$2"
+    if [ ! -x "$dest" ]; then
+        echo "Installed file is not executable: $dest" >&2
+        return 1
+    fi
+    reported=$("$dest" --version 2>/dev/null || true)
+    case "$reported" in
+        *"/${expected}"*) ;;
+        *)
+            echo "Installed binary --version mismatch (expected gjc/${expected}, got: ${reported:-<empty>})" >&2
+            return 1
+            ;;
+    esac
+    if ! "$dest" --smoke-test >/dev/null 2>&1; then
+        echo "Installed binary --smoke-test failed" >&2
+        return 1
+    fi
+    return 0
+}
+
 install_via_bun() {
-    echo "Installing via bun..."
+    echo "Installing from source via existing bun..."
     if [ -n "$REF" ]; then
         if ! has_git; then
-            echo "git is required for --ref when installing from source"
-            exit 1
+            die "git is required for --source --ref"
         fi
 
         TMP_DIR="$(mktemp -d)"
-        trap 'rm -rf "$TMP_DIR"' EXIT
+        remember_tmp ""
+        # TMP_DIR is a directory; cleaned below.
+        SOURCE_TMP="$TMP_DIR"
 
         if git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$TMP_DIR" >/dev/null 2>&1; then
             :
@@ -158,106 +431,137 @@ install_via_bun() {
             (cd "$TMP_DIR" && git checkout "$REF")
         fi
 
-        # Pull LFS files
         if has_git_lfs; then
             (cd "$TMP_DIR" && git lfs pull)
         fi
 
         if [ ! -d "$TMP_DIR/packages/coding-agent" ]; then
-            echo "Expected package at ${TMP_DIR}/packages/coding-agent"
-            exit 1
+            rm -rf "$TMP_DIR"
+            die "Expected package at ${TMP_DIR}/packages/coding-agent"
         fi
 
         bun install -g "$TMP_DIR/packages/coding-agent" || {
-            echo "Failed to install from source"
-            exit 1
+            rm -rf "$TMP_DIR"
+            die "Failed to install from source"
         }
+        rm -rf "$TMP_DIR"
     else
-        bun install -g "$PACKAGE" || {
-            echo "Failed to install $PACKAGE"
-            exit 1
-        }
+        bun install -g "$PACKAGE" || die "Failed to install $PACKAGE"
     fi
     echo ""
-    echo "✓ Installed gjc via bun"
+    echo "Installed gjc via bun (development/source mode)"
     echo "Run 'gjc' to get started!"
 }
 
-# Install binary from GitHub releases
 install_binary() {
-    # Detect platform
-    OS="$(uname -s)"
-    ARCH="$(uname -m)"
+    detect_platform
+    acquire_lock
+    resolve_release_tag
 
-    case "$OS" in
-        Linux)  PLATFORM="linux" ;;
-        Darwin) PLATFORM="darwin" ;;
-        *)      echo "Unsupported OS: $OS"; exit 1 ;;
-    esac
-
-    case "$ARCH" in
-        x86_64|amd64)  ARCH="x64" ;;
-        arm64|aarch64) ARCH="arm64" ;;
-        *)             echo "Unsupported architecture: $ARCH"; exit 1 ;;
-    esac
-
-    BINARY="gjc-${PLATFORM}-${ARCH}"
-    # Get release tag
-    if [ -n "$REF" ]; then
-        echo "Fetching release $REF..."
-        if RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/tags/${REF}"); then
-            LATEST=$(echo "$RELEASE_JSON" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-        else
-            echo "Release tag not found: $REF"
-            echo "For branch/commit installs, use --source with --ref."
-            exit 1
-        fi
-    else
-        echo "Fetching latest release..."
-        RELEASE_JSON=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest")
-        LATEST=$(echo "$RELEASE_JSON" | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
-    fi
-
-    if [ -z "$LATEST" ]; then
-        echo "Failed to fetch release tag"
-        exit 1
-    fi
-    echo "Using version: $LATEST"
-
-    mkdir -p "$INSTALL_DIR"
-    # Download binary to a temp file first so a failed or partial download
-    # never clobbers an existing working install at ${INSTALL_DIR}/gjc.
-    BINARY_URL="https://github.com/${REPO}/releases/download/${LATEST}/${BINARY}"
+    DEST_PATH="${INSTALL_DIR}/gjc"
     DOWNLOAD_TMP="${INSTALL_DIR}/.gjc.download.$$"
+    BACKUP_PATH="${INSTALL_DIR}/.gjc.bak.$$"
+    remember_tmp "$DOWNLOAD_TMP"
+
+    BINARY_URL="${GITHUB_RELEASES}/${LATEST}/${BINARY}"
     echo "Downloading ${BINARY}..."
-    if ! curl -fsSL "$BINARY_URL" -o "$DOWNLOAD_TMP"; then
+    if ! curl_github "$BINARY_URL" "$DOWNLOAD_TMP"; then
         rm -f "$DOWNLOAD_TMP"
         echo ""
         echo "No prebuilt GJC binary was found for ${PLATFORM}-${ARCH} in ${LATEST}."
         echo "Fallback options:"
-        echo "  - Install via Bun/npm source package: bun install -g gajae-code"
-        echo "  - Re-run this installer with --source to build/use the npm package path"
         echo "  - Choose a release that publishes ${BINARY}"
+        echo "  - Re-run this installer with --source if you are developing GJC and already have Bun"
         echo "Expected asset URL: $BINARY_URL"
         exit 1
     fi
-    chmod +x "$DOWNLOAD_TMP"
-    mv -f "$DOWNLOAD_TMP" "${INSTALL_DIR}/gjc"
-    echo ""
-    echo "✓ Installed gjc to ${INSTALL_DIR}/gjc"
 
-    # Check if in PATH
+    if [ ! -s "$DOWNLOAD_TMP" ]; then
+        rm -f "$DOWNLOAD_TMP"
+        die "Downloaded file was empty: $BINARY_URL. Existing install was not changed."
+    fi
+
+    verify_checksum "$BINARY" "$DOWNLOAD_TMP"
+    chmod +x "$DOWNLOAD_TMP"
+
+    if [ -e "$DEST_PATH" ]; then
+        cp -f "$DEST_PATH" "$BACKUP_PATH"
+    fi
+
+    mv -f "$DOWNLOAD_TMP" "$DEST_PATH"
+
+    if ! verify_installed_binary "$DEST_PATH" "$EXPECTED_VERSION"; then
+        restore_backup
+        die "Verification failed; existing install was preserved if one existed."
+    fi
+
+    rm -f "$BACKUP_PATH"
+    BACKUP_PATH=""
+
+    echo ""
+    echo "Installed gjc ${EXPECTED_VERSION} to ${DEST_PATH}"
+
     case ":$PATH:" in
         *":$INSTALL_DIR:"*) echo "Run 'gjc' to get started!" ;;
         *) echo "Add ${INSTALL_DIR} to your PATH, then run 'gjc'" ;;
     esac
 }
 
-# Main logic
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --source)
+            MODE="source"
+            shift
+            ;;
+        --binary)
+            MODE="binary"
+            shift
+            ;;
+        --channel)
+            shift
+            [ -n "$1" ] || die "Missing value for --channel"
+            CHANNEL="$1"
+            is_safe_channel "$CHANNEL" || die "Invalid --channel '$CHANNEL'. Expected stable or nightly."
+            shift
+            ;;
+        --channel=*)
+            CHANNEL="${1#*=}"
+            is_safe_channel "$CHANNEL" || die "Invalid --channel '$CHANNEL'. Expected stable or nightly."
+            shift
+            ;;
+        --ref)
+            shift
+            [ -n "$1" ] || die "Missing value for --ref"
+            REF="$1"
+            shift
+            ;;
+        --ref=*)
+            REF="${1#*=}"
+            [ -n "$REF" ] || die "Missing value for --ref"
+            shift
+            ;;
+        -r)
+            shift
+            [ -n "$1" ] || die "Missing value for -r"
+            REF="$1"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            die "Unknown option: $1"
+            ;;
+    esac
+done
+
 case "$MODE" in
     source)
         if ! has_bun; then
-            install_bun
+            die " --source requires an existing Bun ${MIN_BUN_VERSION}+ on PATH.
+This installer never downloads Bun. Install it from https://bun.sh/docs/installation
+Ordinary installs should omit --source and use the prebuilt binary."
         fi
         require_bun_version
         install_via_bun
@@ -266,12 +570,6 @@ case "$MODE" in
         install_binary
         ;;
     *)
-        # Default: use bun if available, otherwise binary
-        if has_bun; then
-            require_bun_version
-            install_via_bun
-        else
-            install_binary
-        fi
+        die "Internal error: unknown mode $MODE"
         ;;
 esac

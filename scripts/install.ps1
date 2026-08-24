@@ -1,23 +1,25 @@
-# GJC Coding Agent Installer for Windows
+# GJC Coding Agent Installer for Windows (standalone binary, no Bun required)
 # Usage: irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex
 #
 # Or with options:
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1)))
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1))) -Channel nightly
+#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1))) -Ref v0.15.0
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1))) -Source
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1))) -Binary
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1))) -Source -Ref v3.20.1
 #   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1))) -Source -Ref main
-#   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1))) -Binary -Ref v3.20.1
 
 param(
     [switch]$Source,
     [switch]$Binary,
+    [ValidateSet("stable", "nightly")]
+    [string]$Channel = "stable",
     [string]$Ref
 )
 
 $ErrorActionPreference = "Stop"
 
 # Windows PowerShell 5.1 runs on .NET Framework, which may still default to
-# TLS 1.0; GitHub and bun.sh both require TLS 1.2+, so opt in explicitly.
+# TLS 1.0; GitHub requires TLS 1.2+, so opt in explicitly.
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 } catch {}
@@ -25,8 +27,44 @@ try {
 $Repo = "Yeachan-Heo/gajae-code"
 $Package = "@gajae-code/coding-agent"
 $InstallDir = if ($env:GJC_INSTALL_DIR) { $env:GJC_INSTALL_DIR } else { "$env:LOCALAPPDATA\gjc" }
-$BinaryName = "gjc-windows-x64.exe"
+$GithubApi = if ($env:GJC_GITHUB_API) { $env:GJC_GITHUB_API } else { "https://api.github.com" }
+$GithubReleases = if ($env:GJC_GITHUB_RELEASES) { $env:GJC_GITHUB_RELEASES } else { "https://github.com/$Repo/releases/download" }
 $MinimumBunVersion = "1.3.14"
+$BinarySha256Asset = "gajae-release-binaries.sha256"
+$BinaryManifestAsset = "gajae-release-binaries-v1.json"
+$UserAgent = "gjc-install"
+
+function Get-GithubHeaders {
+    $headers = @{
+        "User-Agent" = $UserAgent
+        "Accept" = "application/vnd.github+json"
+        "X-GitHub-Api-Version" = "2022-11-28"
+    }
+    $token = $env:GITHUB_TOKEN
+    if (-not $token) { $token = $env:GH_TOKEN }
+    if ($token) {
+        $headers["Authorization"] = "Bearer $token"
+    }
+    return $headers
+}
+
+function Test-SafeReleaseTag {
+    param([string]$Tag)
+    if (-not $Tag) { return $false }
+    if ($Tag -match '[/\\;|&`$]|(\.\.)') { return $false }
+    return $Tag -match '^v[A-Za-z0-9][A-Za-z0-9._-]*$'
+}
+
+function Get-WindowsBinaryName {
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($arch -eq "ARM64") {
+        throw "Unsupported architecture: ARM64. Prebuilt Windows binaries are published for x64 only."
+    }
+    if ($arch -and $arch -ne "AMD64" -and $arch -ne "x86") {
+        throw "Unsupported architecture: $arch. Prebuilt Windows binaries are published for x64 only."
+    }
+    return "gjc-windows-x64.exe"
+}
 
 function Test-BunInstalled {
     try {
@@ -68,7 +106,11 @@ function Assert-BunVersion {
     if (-not (Test-BunVersion $MinimumVersion)) {
         $current = Get-BunVersion
         $currentText = if ($current) { $current.ToString() } else { "unknown" }
-        throw "Bun $MinimumVersion or newer is required. Current version: $currentText. Upgrade Bun at https://bun.sh/docs/installation"
+        throw @"
+Bun $MinimumVersion or newer is required for -Source. Current version: $currentText.
+Install or upgrade Bun yourself: https://bun.sh/docs/installation
+This installer never downloads Bun.
+"@
     }
 }
 
@@ -91,13 +133,11 @@ function Test-GitLfsInstalled {
 }
 
 function Find-BashShell {
-    # Check Git Bash first (most common on Windows)
     $gitBash = "C:\Program Files\Git\bin\bash.exe"
     if (Test-Path $gitBash) {
         return $gitBash
     }
 
-    # Check bash.exe on PATH (Cygwin, MSYS2, WSL)
     try {
         $bashCmd = Get-Command bash.exe -ErrorAction Stop
         return $bashCmd.Source
@@ -111,7 +151,6 @@ function Configure-BashShell {
         $settingsDir = Join-Path $env:USERPROFILE ".gjc\agent"
         $settingsFile = Join-Path $settingsDir "settings.json"
 
-        # Check if settings.json already has a shellPath configured
         if (Test-Path $settingsFile) {
             try {
                 $existingSettings = Get-Content $settingsFile -Raw | ConvertFrom-Json
@@ -129,15 +168,10 @@ function Configure-BashShell {
         if ($bashPath) {
             Write-Host "Found bash shell: $bashPath" -ForegroundColor Cyan
 
-            # Create settings directory if needed
             if (-not (Test-Path $settingsDir)) {
                 New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null
             }
 
-            # Read existing settings or create new. ConvertFrom-Json's AsHashtable
-            # switch only exists on PowerShell 6+; the documented `irm | iex`
-            # install path runs under Windows PowerShell 5.1, where that parameter
-            # throws and the catch below used to wipe every existing settings key.
             $settings = @{}
             if (Test-Path $settingsFile) {
                 try {
@@ -152,15 +186,12 @@ function Configure-BashShell {
                 }
             }
 
-            # Set shellPath
             $settings["shellPath"] = $bashPath
-
-            # Write settings
             $settings | ConvertTo-Json -Depth 10 | Set-Content $settingsFile -Encoding UTF8
-            Write-Host "✓ Configured shell path in $settingsFile" -ForegroundColor Green
+            Write-Host "Configured shell path in $settingsFile" -ForegroundColor Green
         } else {
             Write-Host ""
-            Write-Host "⚠ No bash shell found!" -ForegroundColor Yellow
+            Write-Host "No bash shell found." -ForegroundColor Yellow
             Write-Host "  GJC requires a bash shell on Windows. Options:" -ForegroundColor Yellow
             Write-Host "    1. Install Git for Windows: https://git-scm.com/download/win" -ForegroundColor Yellow
             Write-Host "    2. Use WSL, Cygwin, or MSYS2" -ForegroundColor Yellow
@@ -170,23 +201,147 @@ function Configure-BashShell {
             Write-Host '    { "shellPath": "C:\\path\\to\\bash.exe" }' -ForegroundColor Yellow
         }
     } catch {
-        Write-Host "⚠ Could not configure bash shell: $_" -ForegroundColor Yellow
+        Write-Host "Could not configure bash shell: $_" -ForegroundColor Yellow
     }
 }
 
-function Install-Bun {
-    Write-Host "Installing bun..."
-    irm bun.sh/install.ps1 | iex
-    # Refresh PATH
-    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "User") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-    Assert-BunVersion $MinimumBunVersion
+function Get-FileSha256Lower {
+    param([string]$Path)
+    return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-ChecksumForAsset {
+    param(
+        [string]$SumsPath,
+        [string]$AssetName
+    )
+    foreach ($line in Get-Content -Path $SumsPath) {
+        $parts = $line.Trim() -split '\s+'
+        if ($parts.Count -ge 2) {
+            $name = $parts[1].TrimStart('*').TrimStart('.', '\', '/')
+            $name = Split-Path -Leaf $name
+            if ($name -eq $AssetName) {
+                return $parts[0].ToLowerInvariant()
+            }
+        }
+    }
+    return $null
+}
+
+function Resolve-ReleaseTag {
+    $headers = Get-GithubHeaders
+    if ($Ref) {
+        if (-not (Test-SafeReleaseTag $Ref)) {
+            throw "Invalid -Ref '$Ref'. Expected a GitHub release tag like v0.15.0."
+        }
+        Write-Host "Fetching release $Ref..."
+        try {
+            $Release = Invoke-RestMethod -Uri "$GithubApi/repos/$Repo/releases/tags/$Ref" -Headers $headers
+        } catch {
+            throw "Release tag not found: $Ref`nFor branch/commit source installs, use -Source with -Ref and an existing Bun."
+        }
+        return $Release.tag_name
+    }
+
+    if ($Channel -eq "nightly") {
+        Write-Host "Fetching latest nightly GitHub prerelease..."
+        $releases = Invoke-RestMethod -Uri "$GithubApi/repos/$Repo/releases?per_page=40" -Headers $headers
+        foreach ($candidate in $releases) {
+            if ($candidate.prerelease -eq $true -and $candidate.draft -eq $false -and (Test-SafeReleaseTag $candidate.tag_name)) {
+                return $candidate.tag_name
+            }
+        }
+        throw "The nightly channel has no published GitHub prerelease yet; it is populated by the scheduled nightly workflow."
+    }
+
+    Write-Host "Fetching latest stable GitHub release..."
+    $Release = Invoke-RestMethod -Uri "$GithubApi/repos/$Repo/releases/latest" -Headers $headers
+    return $Release.tag_name
+}
+
+function Assert-Checksum {
+    param(
+        [string]$Tag,
+        [string]$AssetName,
+        [string]$DownloadedPath
+    )
+
+    $sumsUrl = "$GithubReleases/$Tag/$BinarySha256Asset"
+    $sumsTmp = Join-Path $InstallDir (".gjc.sha256." + [System.Guid]::NewGuid().ToString("N"))
+    $manifestUrl = "$GithubReleases/$Tag/$BinaryManifestAsset"
+    $manifestTmp = Join-Path $InstallDir (".gjc.manifest." + [System.Guid]::NewGuid().ToString("N"))
+    try {
+        try {
+            Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsTmp -Headers @{ "User-Agent" = $UserAgent }
+            if ((Test-Path $sumsTmp) -and ((Get-Item $sumsTmp).Length -gt 0)) {
+                $expected = Get-ChecksumForAsset -SumsPath $sumsTmp -AssetName $AssetName
+                if (-not $expected -or $expected -notmatch '^[0-9a-f]{64}$') {
+                    throw "Release checksum file $BinarySha256Asset did not list $AssetName"
+                }
+                $actual = Get-FileSha256Lower $DownloadedPath
+                if ($actual -ne $expected) {
+                    throw "Checksum mismatch for ${AssetName}: expected $expected, got $actual. Existing install was not changed."
+                }
+                Write-Host "Verified SHA-256 for $AssetName"
+                return
+            }
+        } catch {
+            if ($_.Exception.Message -match "Checksum mismatch|did not list") { throw }
+        }
+
+        try {
+            Invoke-WebRequest -Uri $manifestUrl -OutFile $manifestTmp -Headers @{ "User-Agent" = $UserAgent }
+            if ((Test-Path $manifestTmp) -and ((Get-Item $manifestTmp).Length -gt 0)) {
+                $manifest = Get-Content $manifestTmp -Raw | ConvertFrom-Json
+                foreach ($entry in $manifest.binaries) {
+                    if ($entry.name -eq $AssetName) {
+                        $expected = [string]$entry.sha256
+                        if ($expected -notmatch '^[0-9a-f]{64}$') {
+                            throw "Release manifest listed an invalid checksum for $AssetName"
+                        }
+                        $actual = Get-FileSha256Lower $DownloadedPath
+                        if ($actual -ne $expected) {
+                            throw "Checksum mismatch for ${AssetName}: expected $expected, got $actual. Existing install was not changed."
+                        }
+                        Write-Host "Verified SHA-256 for $AssetName from $BinaryManifestAsset"
+                        return
+                    }
+                }
+            }
+        } catch {
+            if ($_.Exception.Message -match "Checksum mismatch|invalid checksum") { throw }
+        }
+
+        Write-Host "No checksum asset on $Tag; continuing with size, --version, and --smoke-test verification."
+    } finally {
+        Remove-Item -Force $sumsTmp -ErrorAction SilentlyContinue
+        Remove-Item -Force $manifestTmp -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-InstalledBinary {
+    param(
+        [string]$ExePath,
+        [string]$ExpectedVersion
+    )
+    if (-not (Test-Path $ExePath)) {
+        throw "Installed file is missing: $ExePath"
+    }
+    $versionOutput = & $ExePath --version 2>$null
+    if (-not $versionOutput -or ($versionOutput -notlike "*/$ExpectedVersion*")) {
+        throw "Installed binary --version mismatch (expected gjc/$ExpectedVersion, got: $versionOutput)"
+    }
+    & $ExePath --smoke-test | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed binary --smoke-test failed"
+    }
 }
 
 function Install-ViaBun {
-    Write-Host "Installing via bun..."
+    Write-Host "Installing from source via existing bun..."
     if ($Ref) {
         if (-not (Test-GitInstalled)) {
-            throw "git is required for -Ref when installing from source"
+            throw "git is required for -Source -Ref"
         }
 
         $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("gjc-install-" + [System.Guid]::NewGuid().ToString("N"))
@@ -212,7 +367,6 @@ function Install-ViaBun {
                 }
             }
 
-            # Pull LFS files
             if (Test-GitLfsInstalled) {
                 Push-Location $tmpRoot
                 try {
@@ -242,87 +396,105 @@ function Install-ViaBun {
     }
 
     Write-Host ""
-    Write-Host "✓ Installed gjc via bun" -ForegroundColor Green
-
+    Write-Host "Installed gjc via bun (development/source mode)" -ForegroundColor Green
     Configure-BashShell
-
     Write-Host "Run 'gjc' to get started!"
 }
 
 function Install-Binary {
-    if ($Ref) {
-        Write-Host "Fetching release $Ref..."
-        try {
-            $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/tags/$Ref"
-        } catch {
-            throw "Release tag not found: $Ref`nFor branch/commit installs, use -Source with -Ref."
-        }
-    } else {
-        Write-Host "Fetching latest release..."
-        $Release = Invoke-RestMethod -Uri "https://api.github.com/repos/$Repo/releases/latest"
+    $BinaryName = Get-WindowsBinaryName
+    $Latest = Resolve-ReleaseTag
+    if (-not (Test-SafeReleaseTag $Latest)) {
+        throw "Refusing unsafe release tag: $Latest"
     }
-
-    $Latest = $Release.tag_name
-    if (-not $Latest) {
-        throw "Failed to fetch release tag"
-    }
+    $ExpectedVersion = $Latest.TrimStart("v")
     Write-Host "Using version: $Latest"
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    $lockDir = Join-Path $InstallDir ".gjc-install.lock"
+    try {
+        New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
+    } catch {
+        throw "Another GJC installer is already running in $InstallDir (lock: $lockDir)."
+    }
 
-    # Download binary to a temp file first so a failed or partial download
-    # never clobbers an existing working install at $InstallDir\gjc.exe.
-    $BinaryUrl = "https://github.com/$Repo/releases/download/$Latest/$BinaryName"
-    Write-Host "Downloading $BinaryName..."
     $OutPath = Join-Path $InstallDir "gjc.exe"
     $DownloadTmp = Join-Path $InstallDir (".gjc.download." + [System.Guid]::NewGuid().ToString("N"))
+    $BackupPath = Join-Path $InstallDir (".gjc.bak." + [System.Guid]::NewGuid().ToString("N"))
+    $hadExisting = Test-Path $OutPath
     try {
-        Invoke-WebRequest -Uri $BinaryUrl -OutFile $DownloadTmp
-    } catch {
+        $BinaryUrl = "$GithubReleases/$Latest/$BinaryName"
+        Write-Host "Downloading $BinaryName..."
+        try {
+            Invoke-WebRequest -Uri $BinaryUrl -OutFile $DownloadTmp -Headers @{ "User-Agent" = $UserAgent }
+        } catch {
+            Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
+            throw "No prebuilt GJC binary was found for windows-x64 in $Latest.`nExpected asset URL: $BinaryUrl`nRe-run with -Source only if you are developing GJC and already have Bun."
+        }
+
+        if (-not (Test-Path $DownloadTmp) -or ((Get-Item $DownloadTmp).Length -le 0)) {
+            Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
+            throw "Downloaded file was empty: $BinaryUrl. Existing install was not changed."
+        }
+
+        Assert-Checksum -Tag $Latest -AssetName $BinaryName -DownloadedPath $DownloadTmp
+
+        if ($hadExisting) {
+            Move-Item -Force $OutPath $BackupPath
+        }
+        Move-Item -Force $DownloadTmp $OutPath
+
+        try {
+            Assert-InstalledBinary -ExePath $OutPath -ExpectedVersion $ExpectedVersion
+        } catch {
+            if (Test-Path $BackupPath) {
+                Move-Item -Force $BackupPath $OutPath
+                Write-Host "Restored previous gjc binary at $OutPath"
+            } elseif (-not $hadExisting) {
+                Remove-Item -Force $OutPath -ErrorAction SilentlyContinue
+            }
+            throw "Verification failed; existing install was preserved if one existed. $_"
+        }
+
+        Remove-Item -Force $BackupPath -ErrorAction SilentlyContinue
+
+        Write-Host ""
+        Write-Host "Installed gjc $ExpectedVersion to $OutPath" -ForegroundColor Green
+
+        $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        $needsRestart = $UserPath -notlike "*$InstallDir*"
+        if ($needsRestart) {
+            Write-Host "Adding $InstallDir to PATH..."
+            [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
+        }
+
+        Configure-BashShell
+
+        if ($needsRestart) {
+            Write-Host "Restart your terminal, then run 'gjc' to get started!"
+        } else {
+            Write-Host "Run 'gjc' to get started!"
+        }
+    } finally {
         Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
-        throw
-    }
-    Move-Item -Force $DownloadTmp $OutPath
-
-    Write-Host ""
-    Write-Host "✓ Installed gjc to $OutPath" -ForegroundColor Green
-
-    # Add to PATH if not already there
-    $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    $needsRestart = $UserPath -notlike "*$InstallDir*"
-    if ($needsRestart) {
-        Write-Host "Adding $InstallDir to PATH..."
-        [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
-    }
-
-    Configure-BashShell
-
-    if ($needsRestart) {
-        Write-Host "Restart your terminal, then run 'gjc' to get started!"
-    } else {
-        Write-Host "Run 'gjc' to get started!"
+        Remove-Item -Recurse -Force $lockDir -ErrorAction SilentlyContinue
     }
 }
 
-# Main logic
-if ($Ref -and -not $Source -and -not $Binary) {
-    $Source = $true
+if ($Source -and $Binary) {
+    throw "Specify only one of -Source or -Binary."
 }
 
 if ($Source) {
     if (-not (Test-BunInstalled)) {
-        Install-Bun
+        throw @"
+-Source requires an existing Bun $MinimumBunVersion+ on PATH.
+This installer never downloads Bun. Install it from https://bun.sh/docs/installation
+Ordinary installs should omit -Source and use the prebuilt binary.
+"@
     }
     Assert-BunVersion $MinimumBunVersion
     Install-ViaBun
-} elseif ($Binary) {
-    Install-Binary
 } else {
-    # Default: use bun if available, otherwise binary
-    if (Test-BunInstalled) {
-        Assert-BunVersion $MinimumBunVersion
-        Install-ViaBun
-    } else {
-        Install-Binary
-    }
+    Install-Binary
 }

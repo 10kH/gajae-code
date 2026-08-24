@@ -1,14 +1,39 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
 const repoRoot = path.join(import.meta.dir, "..", "..");
 const installScript = path.join(repoRoot, "scripts", "install.sh");
+const rootInstallScript = path.join(repoRoot, "install.sh");
 
 const EXISTING_BINARY = '#!/bin/sh\necho "gjc 0.8.1 (existing install)"\n';
-const RELEASE_JSON = '{"tag_name": "v0.9.0"}';
-const NEW_BINARY_CONTENT = "#!/bin/sh\necho new-binary\n";
+const VERSION = "0.9.0";
+const TAG = `v${VERSION}`;
+
+function hostBinaryName(): string {
+	const osName = process.platform === "darwin" ? "darwin" : "linux";
+	const arch = process.arch === "arm64" ? "arm64" : "x64";
+	return `gjc-${osName}-${arch}`;
+}
+
+function sha256(content: string | Buffer): string {
+	return crypto.createHash("sha256").update(content).digest("hex");
+}
+
+function fakeGjcScript(options: { version: string; smokeFails?: boolean; truncated?: boolean }): string {
+	if (options.truncated) return "truncated";
+	const smoke = options.smokeFails ? "exit 1" : "exit 0";
+	return [
+		"#!/bin/sh",
+		`if [ "$1" = "--version" ]; then echo "gjc/${options.version}"; exit 0; fi`,
+		`if [ "$1" = "--smoke-test" ]; then ${smoke}; fi`,
+		"echo new-binary",
+		"exit 0",
+		"",
+	].join("\n");
+}
 
 interface Sandbox {
 	root: string;
@@ -18,45 +43,112 @@ interface Sandbox {
 
 let sandbox: Sandbox;
 
-function writeCurlShim(dir: string, options: { downloadFails: boolean }): void {
-	// Emulates curl just enough for install.sh: the GitHub API call returns a
-	// release tag, and the asset download either succeeds (writing to the -o
-	// target) or fails like `curl -f` does on an HTTP 404 (exit 22).
-	const downloadBranch = options.downloadFails
-		? "exit 22"
-		: 'printf \'%s\' "$NEW_BINARY_CONTENT" > "$out"\nexit 0';
-	const shim = [
-		"#!/bin/sh",
-		'for arg in "$@"; do',
-		'  case "$arg" in',
-		"    https://api.github.com/*)",
-		`      printf '%s\\n' '${RELEASE_JSON}'`,
-		"      exit 0",
-		"      ;;",
-		"  esac",
-		"done",
-		'out=""',
-		'prev=""',
-		'for arg in "$@"; do',
-		'  if [ "$prev" = "-o" ]; then out="$arg"; fi',
-		'  prev="$arg"',
-		"done",
-		'if [ -z "$out" ]; then exit 22; fi',
-		downloadBranch,
-		"",
-	].join("\n");
+interface CurlFixture {
+	latestJson?: string;
+	tagJson?: Record<string, string>;
+	releasesJson?: string;
+	assets: Record<string, string | Buffer>;
+	missingAssets?: string[];
+	failDownload?: boolean;
+	emptyDownload?: boolean;
+}
+
+function writeCurlShim(dir: string, fixture: CurlFixture): void {
+	const fixturePath = path.join(dir, "fixture.json");
+	fs.writeFileSync(
+		fixturePath,
+		JSON.stringify({
+			latestJson: fixture.latestJson ?? JSON.stringify({ tag_name: TAG, draft: false, prerelease: false }),
+			tagJson: fixture.tagJson ?? {},
+			releasesJson:
+				fixture.releasesJson ??
+				JSON.stringify(
+					[
+						{ tag_name: "v0.9.1-nightly.1.1.gabc", draft: false, prerelease: true },
+						{ tag_name: TAG, draft: false, prerelease: false },
+					],
+					null,
+					2,
+				),
+			assets: Object.fromEntries(
+				Object.entries(fixture.assets).map(([name, body]) => [
+					name,
+					Buffer.isBuffer(body) ? body.toString("base64") : Buffer.from(body).toString("base64"),
+				]),
+			),
+			missingAssets: fixture.missingAssets ?? [],
+			failDownload: fixture.failDownload === true,
+			emptyDownload: fixture.emptyDownload === true,
+		}),
+	);
+	const shim = `#!/bin/sh
+FIXTURE="${fixturePath}"
+out=""
+url=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$arg"; fi
+  case "$arg" in
+    https://*|http://*) url="$arg" ;;
+  esac
+  prev="$arg"
+done
+python3 - "$FIXTURE" "$url" "$out" <<'PY'
+import json, os, sys
+fixture = json.load(open(sys.argv[1]))
+url = sys.argv[2]
+out = sys.argv[3] if len(sys.argv) > 3 else ""
+def write(data: bytes, code: int = 0):
+    if out:
+        open(out, "wb").write(data)
+    if code == 0:
+        sys.stdout.write("200")
+    sys.exit(code)
+if "api.github.com" in url and "/releases/latest" in url:
+    write(fixture["latestJson"].encode())
+if "api.github.com" in url and "/releases?per_page" in url:
+    write(fixture["releasesJson"].encode())
+if "api.github.com" in url and "/releases/tags/" in url:
+    tag = url.rsplit("/", 1)[-1]
+    payload = fixture.get("tagJson", {}).get(tag) or json.dumps({"tag_name": tag})
+    write(payload.encode())
+if fixture.get("failDownload"):
+    sys.exit(22)
+name = url.rsplit("/", 1)[-1]
+if name in fixture.get("missingAssets", []):
+    sys.exit(22)
+if fixture.get("emptyDownload") and not name.endswith(".sha256") and not name.endswith(".json"):
+    write(b"", 0)
+assets = fixture.get("assets", {})
+if name in assets:
+    write(__import__("base64").b64decode(assets[name]))
+sys.exit(22)
+PY
+`;
 	const shimPath = path.join(dir, "curl");
 	fs.writeFileSync(shimPath, shim);
 	fs.chmodSync(shimPath, 0o755);
 }
 
-async function runInstaller(): Promise<{ exitCode: number; stdout: string; stderr: string }> {
-	const proc = Bun.spawn(["sh", installScript, "--binary"], {
+function writeFailingBun(dir: string): void {
+	const bunPath = path.join(dir, "bun");
+	fs.writeFileSync(bunPath, "#!/bin/sh\necho 'bun should not run' >&2\nexit 99\n");
+	fs.chmodSync(bunPath, 0o755);
+}
+
+async function runInstaller(
+	args: string[],
+	env: Record<string, string> = {},
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+	const proc = Bun.spawn(["sh", installScript, ...args], {
 		env: {
 			...process.env,
 			PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
 			GJC_INSTALL_DIR: sandbox.installDir,
-			NEW_BINARY_CONTENT,
+			HOME: sandbox.root,
+			GITHUB_TOKEN: "",
+			GH_TOKEN: "",
+			...env,
 		},
 		stdout: "pipe",
 		stderr: "pipe",
@@ -76,39 +168,190 @@ beforeEach(() => {
 	fs.mkdirSync(shimDir, { recursive: true });
 	fs.mkdirSync(installDir, { recursive: true });
 	sandbox = { root, shimDir, installDir };
+	writeFailingBun(shimDir);
 });
 
 afterEach(() => {
 	fs.rmSync(sandbox.root, { recursive: true, force: true });
 });
 
-describe("install.sh binary upgrades", () => {
+describe("install.sh binary-first contract", () => {
+	test("never installs or invokes bun on the default path, even when bun is present", async () => {
+		const installer = await Bun.file(installScript).text();
+		expect(installer).not.toContain("bun.sh/install");
+		expect(installer).toContain("never downloads Bun");
+		expect(installer).toContain('MODE="binary"');
+		expect(installer).not.toContain("Default: use bun if available");
+
+		const binaryName = hostBinaryName();
+		const payload = fakeGjcScript({ version: VERSION });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[binaryName]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${binaryName}\n`,
+			},
+		});
+		const result = await runInstaller([]);
+		expect(result.stderr).not.toContain("bun should not run");
+		expect(result.exitCode).toBe(0);
+		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+	});
+
+	test("root install.sh execs the canonical scripts/install.sh from a clone", async () => {
+		const root = await Bun.file(rootInstallScript).text();
+		expect(root).toContain("scripts/install.sh");
+		expect(root).toContain("https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh");
+		const binaryName = hostBinaryName();
+		const payload = fakeGjcScript({ version: VERSION });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[binaryName]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${binaryName}\n`,
+			},
+		});
+		const proc = Bun.spawn(["sh", rootInstallScript], {
+			env: {
+				...process.env,
+				PATH: `${sandbox.shimDir}:/usr/bin:/bin`,
+				GJC_INSTALL_DIR: sandbox.installDir,
+				HOME: sandbox.root,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		const exitCode = await proc.exited;
+		expect(exitCode).toBe(0);
+		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+	});
+
 	test("a failed download leaves the existing gjc binary untouched", async () => {
 		const existingPath = path.join(sandbox.installDir, "gjc");
 		fs.writeFileSync(existingPath, EXISTING_BINARY);
 		fs.chmodSync(existingPath, 0o755);
-		writeCurlShim(sandbox.shimDir, { downloadFails: true });
+		writeCurlShim(sandbox.shimDir, { assets: {}, failDownload: true });
 
-		const result = await runInstaller();
+		const result = await runInstaller(["--binary"]);
 
 		expect(result.exitCode).not.toBe(0);
-		expect(fs.existsSync(existingPath)).toBe(true);
 		expect(fs.readFileSync(existingPath, "utf8")).toBe(EXISTING_BINARY);
 	});
 
-	test("a successful download replaces the binary and leaves no temp files", async () => {
+	test("an empty download leaves the existing gjc binary untouched", async () => {
 		const existingPath = path.join(sandbox.installDir, "gjc");
 		fs.writeFileSync(existingPath, EXISTING_BINARY);
 		fs.chmodSync(existingPath, 0o755);
-		writeCurlShim(sandbox.shimDir, { downloadFails: false });
+		writeCurlShim(sandbox.shimDir, { assets: { [hostBinaryName()]: "" }, emptyDownload: true });
 
-		const result = await runInstaller();
+		const result = await runInstaller([]);
+		expect(result.exitCode).not.toBe(0);
+		expect(fs.readFileSync(existingPath, "utf8")).toBe(EXISTING_BINARY);
+	});
 
+	test("checksum mismatch leaves the existing binary untouched", async () => {
+		const existingPath = path.join(sandbox.installDir, "gjc");
+		fs.writeFileSync(existingPath, EXISTING_BINARY);
+		fs.chmodSync(existingPath, 0o755);
+		const payload = fakeGjcScript({ version: VERSION });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${"a".repeat(64)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const result = await runInstaller([]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("Checksum mismatch");
+		expect(fs.readFileSync(existingPath, "utf8")).toBe(EXISTING_BINARY);
+	});
+
+	test("version/smoke failure restores the previous binary", async () => {
+		const existingPath = path.join(sandbox.installDir, "gjc");
+		fs.writeFileSync(existingPath, EXISTING_BINARY);
+		fs.chmodSync(existingPath, 0o755);
+		const payload = fakeGjcScript({ version: "9.9.9", smokeFails: true });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const result = await runInstaller([]);
+		expect(result.exitCode).not.toBe(0);
+		expect(fs.readFileSync(existingPath, "utf8")).toBe(EXISTING_BINARY);
+	});
+
+	test("a successful download replaces the binary, verifies, and leaves no temp files", async () => {
+		const existingPath = path.join(sandbox.installDir, "gjc");
+		fs.writeFileSync(existingPath, EXISTING_BINARY);
+		fs.chmodSync(existingPath, 0o755);
+		const payload = fakeGjcScript({ version: VERSION });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+
+		const result = await runInstaller(["--binary"]);
 		expect(result.exitCode).toBe(0);
-		expect(fs.readFileSync(existingPath, "utf8")).toBe(NEW_BINARY_CONTENT);
-		// The install must be executable and must not leave partial download
-		// artifacts next to the binary.
+		expect(fs.readFileSync(existingPath, "utf8")).toBe(payload);
 		expect(fs.statSync(existingPath).mode & 0o100).toBe(0o100);
-		expect(fs.readdirSync(sandbox.installDir)).toEqual(["gjc"]);
+		const leftover = fs.readdirSync(sandbox.installDir).filter(name => name !== "gjc");
+		expect(leftover).toEqual([]);
+	});
+
+	test("installs an explicit release tag as a binary without switching to source", async () => {
+		const payload = fakeGjcScript({ version: "0.15.0" });
+		writeCurlShim(sandbox.shimDir, {
+			tagJson: { "v0.15.0": JSON.stringify({ tag_name: "v0.15.0" }) },
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const result = await runInstaller(["--ref", "v0.15.0"]);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain("Using version: v0.15.0");
+		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+	});
+
+	test("rejects path-traversal tags", async () => {
+		writeCurlShim(sandbox.shimDir, { assets: {} });
+		const result = await runInstaller(["--ref", "v1.0.0/../../evil"]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("Invalid --ref");
+	});
+
+	test("selects a nightly GitHub prerelease", async () => {
+		const nightly = "0.9.1-nightly.1.1.gabc";
+		const payload = fakeGjcScript({ version: nightly });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const result = await runInstaller(["--channel", "nightly"]);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain(`Using version: v${nightly}`);
+	});
+
+	test("--source without bun fails and never downloads bun", async () => {
+		writeCurlShim(sandbox.shimDir, { assets: {} });
+		const result = await runInstaller(["--source"], {
+			PATH: "/usr/bin:/bin",
+		});
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).not.toContain("Installing bun");
+		expect(result.stderr + result.stdout).toMatch(/requires an existing Bun/i);
+	});
+
+	test("supported platform names are the published release assets", async () => {
+		const installer = await Bun.file(installScript).text();
+		expect(installer).toContain("gjc-${PLATFORM}-${ARCH}");
+		expect(installer).toContain('PLATFORM="linux"');
+		expect(installer).toContain('PLATFORM="darwin"');
+		expect(installer).toContain('ARCH="x64"');
+		expect(installer).toContain('ARCH="arm64"');
 	});
 });
