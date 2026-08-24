@@ -27,9 +27,9 @@
  */
 import { dlopen } from "bun:ffi";
 import { describe, expect, it, setDefaultTimeout } from "bun:test";
-import { spawnSync } from "node:child_process";
+import * as childProcess from "node:child_process";
 import * as path from "node:path";
-import { pathToFileURL } from "node:url";
+import * as url from "node:url";
 
 const isWindows = process.platform === "win32";
 
@@ -38,7 +38,7 @@ const isWindows = process.platform === "win32";
 const LIVE_TEST_TIMEOUT_MS = 60_000;
 setDefaultTimeout(LIVE_TEST_TIMEOUT_MS);
 
-const NATIVES_ENTRY_URL = pathToFileURL(path.resolve("packages/natives/native/index.js")).href;
+const NATIVES_ENTRY_URL = url.pathToFileURL(path.resolve("packages/natives/native/index.js")).href;
 
 // Three-way console-state probe, one P/Invoke per kernel call:
 //   - handle:      GetConsoleWindow() — non-null ⇒ a console WINDOW exists
@@ -59,7 +59,7 @@ const PROBE_PS = [
 ].join("\n");
 
 function runHidden(command: string, args: string[], cwd?: string, hide = true) {
-	return spawnSync(command, args, {
+	return childProcess.spawnSync(command, args, {
 		encoding: "utf-8",
 		windowsHide: hide,
 		timeout: 50_000,
