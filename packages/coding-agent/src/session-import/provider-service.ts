@@ -55,8 +55,19 @@ interface ParsedSource {
 	redactionKinds: string[];
 }
 
+export interface SessionImportSourceIdentity {
+	dev: bigint;
+	ino: bigint;
+	size: bigint;
+	mtimeNs: bigint;
+	ctimeNs: bigint;
+}
+
 /** Read the explicit source file with fixed bounds. The source is never written. */
-async function readImportSource(sourcePath: string): Promise<{ text: string; bytes: number; sha256: string }> {
+async function readImportSource(
+	sourcePath: string,
+	expectedIdentity?: SessionImportSourceIdentity,
+): Promise<{ text: string; bytes: number; sha256: string }> {
 	const resolved = path.resolve(sourcePath);
 	const displayPath = redactImportedText(sourcePath).value;
 	let handle: fsp.FileHandle;
@@ -76,6 +87,21 @@ async function readImportSource(sourcePath: string): Promise<{ text: string; byt
 	}
 	try {
 		const initial = await handle.stat({ bigint: true });
+		if (
+			expectedIdentity &&
+			(initial.dev !== expectedIdentity.dev ||
+				initial.ino !== expectedIdentity.ino ||
+				initial.size !== expectedIdentity.size ||
+				initial.mtimeNs !== expectedIdentity.mtimeNs ||
+				initial.ctimeNs !== expectedIdentity.ctimeNs)
+		) {
+			throw new SessionImportError(
+				"source_changed",
+				"read",
+				"The transcript path no longer identifies the disclosed source file.",
+				{ retryable: true },
+			);
+		}
 		if (!initial.isFile()) {
 			throw new SessionImportError(
 				"invalid_request",
@@ -266,7 +292,9 @@ function renderImportContext(conversation: ImportedConversation): {
  * session mutation; safe to run before any session transition.
  */
 export async function prepareExternalSessionImport(
-	request: Pick<ExternalSessionImportRequest, "sourcePath" | "provider">,
+	request: Pick<ExternalSessionImportRequest, "sourcePath" | "provider"> & {
+		expectedIdentity?: SessionImportSourceIdentity;
+	},
 ): Promise<PreparedSessionImport> {
 	if (typeof request.sourcePath !== "string" || request.sourcePath.trim().length === 0) {
 		throw new SessionImportError(
@@ -282,7 +310,7 @@ export async function prepareExternalSessionImport(
 			`Unsupported provider "${String(request.provider)}"; expected codex or claude.`,
 		);
 	}
-	const source = await readImportSource(request.sourcePath);
+	const source = await readImportSource(request.sourcePath, request.expectedIdentity);
 	const detection = detectSessionImportFormat(source.text, request.provider);
 	const parsed = parseDetectedFormat(detection, source.text);
 	assertValidTimestamps(parsed.conversation);

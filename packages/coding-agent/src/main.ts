@@ -71,6 +71,11 @@ import {
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
+import {
+	readOnboardingState,
+	shouldOfferAutomaticOnboarding,
+	shouldOfferOnboarding,
+} from "./setup/frictionless-onboarding";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
@@ -716,6 +721,21 @@ export async function runInteractiveMode(
 		throw error;
 	}
 
+	if (
+		shouldOfferAutomaticOnboarding({
+			normalInteractive: true,
+			initialMessage,
+			initialMessages,
+			initialImages,
+			resumeAction,
+		})
+	) {
+		const agentDir = session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.();
+		if (agentDir) {
+			const onboardingState = await readOnboardingState(agentDir);
+			if (shouldOfferOnboarding(onboardingState)) await mode.showFrictionlessOnboarding();
+		}
+	}
 	mode.renderInitialMessages(undefined, { preserveExistingChat: true });
 
 	for (const notify of notifs) {

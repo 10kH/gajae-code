@@ -1482,6 +1482,15 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		},
 	},
 	{
+		name: "tutorial",
+		priority: 99,
+		description: "Open frictionless onboarding",
+		handleTui: (_command, runtime) => {
+			void runtime.ctx.showFrictionlessOnboarding();
+			runtime.ctx.editor.setText("");
+		},
+	},
+	{
 		name: "help",
 		priority: 100,
 		description: "Learn commands and beginner workflows",

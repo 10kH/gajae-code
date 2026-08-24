@@ -421,6 +421,7 @@ export interface InteractiveModeContext {
 	setAutoroutingEnabled(enabled: boolean): Promise<void>;
 	showEffortSelector(): void;
 	showProviderOnboarding(): void;
+	showFrictionlessOnboarding(): Promise<void>;
 	showPluginSelector(mode?: "install" | "uninstall"): void;
 	showUserMessageSelector(): void;
 	showTreeSelector(): void;

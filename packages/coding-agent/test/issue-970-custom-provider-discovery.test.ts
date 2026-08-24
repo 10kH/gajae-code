@@ -200,6 +200,31 @@ describe("issue #970 custom provider discovery", () => {
 		}
 	});
 
+	test("does not discover a configured remote vLLM endpoint without credentials", async () => {
+		const previousApiKey = Bun.env.VLLM_API_KEY;
+		const previousBaseUrl = Bun.env.VLLM_BASE_URL;
+		delete Bun.env.VLLM_API_KEY;
+		Bun.env.VLLM_BASE_URL = "https://vllm.example.test/v1";
+		try {
+			using _hook = hookFetch(input => {
+				if (String(input) === "https://vllm.example.test/v1/models") {
+					throw new Error("credentialless discovery must not probe a remote vLLM endpoint");
+				}
+				return new Response(null, { status: 404 });
+			});
+
+			const registry = new ModelRegistryImpl(authStorage, modelsPath);
+			await registry.refresh();
+
+			expect(registry.find("vllm", "remote-vllm-model")).toBeUndefined();
+		} finally {
+			if (previousApiKey === undefined) delete Bun.env.VLLM_API_KEY;
+			else Bun.env.VLLM_API_KEY = previousApiKey;
+			if (previousBaseUrl === undefined) delete Bun.env.VLLM_BASE_URL;
+			else Bun.env.VLLM_BASE_URL = previousBaseUrl;
+		}
+	});
+
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {
 		installTestTheme();
 		const selector = await createSelector({
