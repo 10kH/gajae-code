@@ -164,19 +164,17 @@ describe("gjc setup hermes --coding-agent-dir", () => {
 			codingAgentDir: path.join(root, "agent-a"),
 		});
 		const configPath = path.join(profileDir, "config.yaml");
-		await Bun.write(
-			configPath,
-			(await Bun.file(configPath).text()).replace(
-				`GJC_CODING_AGENT_DIR: ${path.join(root, "agent-a")}`,
-				"GJC_CODING_AGENT_DIR: relative-injection",
-			),
+		const tamperedConfig = (await Bun.file(configPath).text()).replace(
+			`GJC_CODING_AGENT_DIR: ${path.join(root, "agent-a")}`,
+			"GJC_CODING_AGENT_DIR: relative-injection",
 		);
+		await Bun.write(configPath, tamperedConfig);
 
 		await expect(runHermesSetup({ install: true, root: [root], profileDir })).rejects.toThrow(
 			"has GJC managed markers but its setup signature does not match",
 		);
 		// Fail-closed: the refused install leaves the tampered bytes untouched.
-		expect(await Bun.file(configPath).text()).toContain("relative-injection");
+		expect(await Bun.file(configPath).text()).toBe(tamperedConfig);
 	});
 
 	it("normalizes the rendered value to an absolute resolved path", () => {
