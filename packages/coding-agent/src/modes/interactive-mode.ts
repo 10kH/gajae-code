@@ -646,11 +646,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#petTransportAvailabilityUnsubscribe = this.#itermPetTransport.subscribe(availability => {
 				if (!availability.available) void this.petWidget?.suspendItermCapability();
 				setVerifiedItermPetAvailability(availability);
-				if (availability.available) {
-					if (availability.mode === "managed") this.ui.refreshImageCellSize();
-					const saved = settings.get("pet.mode");
-					if (saved !== "off" && this.petWidget && this.petWidget.mode === "off") this.petWidget.setMode(saved);
-				}
+				if (availability.available && availability.mode === "managed") this.ui.refreshImageCellSize();
+				const petWidget = this.petWidget;
+				const active = petWidget?.mode;
+				if (active && active !== "off") petWidget.setMode(active);
 			});
 		}
 		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
@@ -839,18 +838,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.petWidget = this.#createPetWidget(this.editor);
 		const configuredPetMode = settings.get("pet.mode");
 		this.petWidget.setMode(configuredPetMode);
-		// The async sixel capability probe can enable graphics after the saved
-		// pet mode was applied and dropped (no protocol yet at startup).
-		// Re-apply the configured mode when capability arrives so the pet
-		// appears without the user re-running /pet.
+		// The text-cell fallback renders immediately. Re-apply a saved mode if an
+		// asynchronous graphics probe later upgrades it to pixel rendering.
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = onImageProtocolChanged(protocol => {
 			if (!protocol) {
 				void this.petWidget?.suspendItermCapability();
-				return;
 			}
 			const saved = settings.get("pet.mode");
-			if (saved !== "off" && this.petWidget && this.petWidget.mode === "off") {
+			if (saved !== "off" && this.petWidget) {
 				this.petWidget.setMode(saved);
 			}
 		});

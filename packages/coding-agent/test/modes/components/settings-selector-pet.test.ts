@@ -39,7 +39,7 @@ function makeComponent(
 function openPetSetting(component: SettingsSelectorComponent): void {
 	for (let attempt = 0; attempt < 100; attempt++) {
 		const rendered = stripVTControlCharacters(component.render(160).join("\n"));
-		if (rendered.includes("Real-pixel pet living beside the composer")) {
+		if (rendered.includes("Animated pet beside the composer")) {
 			component.handleInput("\n");
 			return;
 		}
@@ -49,7 +49,7 @@ function openPetSetting(component: SettingsSelectorComponent): void {
 }
 
 describe("SettingsSelectorComponent pet capability", () => {
-	it("shows a saved unavailable pet, permits only Off, and routes the commit through the shared policy", () => {
+	it("keeps saved pets reachable through the text fallback and routes the commit through the shared policy", () => {
 		settings.set("pet.mode", "red");
 		const onChange = vi.fn();
 		const onPetPreview = vi.fn();
@@ -58,52 +58,24 @@ describe("SettingsSelectorComponent pet capability", () => {
 			settings.set("pet.mode", mode as never);
 			return true;
 		});
-		const component = makeComponent(false, { onChange, onPetPreview, onPetCommit });
+		const component = makeComponent(true, { onChange, onPetPreview, onPetCommit });
 
 		openPetSetting(component);
 		const submenu = stripVTControlCharacters(component.render(80).join("\n"));
-		expect(submenu).toContain("RedGajae (saved)");
+		expect(submenu).toContain("RedGajae");
 		expect(submenu).toContain("BlueGajae");
 		expect(submenu).toContain("Ouroboros");
-		expect(submenu).toContain("Saved, unavailable");
-		expect(stripVTControlCharacters(component.render(40).join("\n"))).toContain("RedGajae (saved)");
+		expect(stripVTControlCharacters(component.render(40).join("\n"))).toContain("RedGajae");
 
 		component.handleInput("\x1b[B");
-		expect(onPetPreview).not.toHaveBeenCalled();
+		expect(onPetPreview).toHaveBeenCalledWith("blue");
 		component.handleInput("\n");
 
 		// The settings surface never persists pet.mode itself and never routes
 		// it through the generic onChange path; the shared policy owns both.
-		expect(onPetCommit).toHaveBeenCalledWith("off");
+		expect(onPetCommit).toHaveBeenCalledWith("blue");
 		expect(onChange).not.toHaveBeenCalled();
-		expect(settings.get("pet.mode")).toBe("off");
-	});
-
-	it("shows the actionable unavailable warning inside the pet submenu", () => {
-		settings.set("pet.mode", "red");
-		const component = makeComponent(false, {}, {});
-
-		openPetSetting(component);
-		const submenu = stripVTControlCharacters(component.render(200).join("\n"));
-
-		// Same guidance as startup and /pet (normal-terminal variant in tests);
-		// dimmed option descriptions alone are not sufficient.
-		expect(submenu).toContain("Ghostty");
-	});
-
-	it.each([
-		["TMUX", { TMUX: "/tmp/host,1,0" }],
-		["tmux TERM", { TERM: "tmux-256color" }],
-	])("shows multiplexer recovery guidance for %s without normal-terminal guidance", (_name, terminalEnv) => {
-		settings.set("pet.mode", "red");
-		const component = makeComponent(false, {}, terminalEnv);
-
-		openPetSetting(component);
-		const submenu = stripVTControlCharacters(component.render(200).join("\n"));
-
-		expect(submenu).toContain("outside the multiplexer");
-		expect(submenu).toContain("PI_FORCE_IMAGE_PROTOCOL=sixel");
-		expect(submenu).not.toContain("Ghostty");
+		expect(settings.get("pet.mode")).toBe("blue");
 	});
 
 	it("does not persist pet.mode when the commit policy rejects at select time", () => {
