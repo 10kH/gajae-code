@@ -476,16 +476,20 @@ function Install-Binary {
     Write-Host "Using version: $Latest"
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    $lockDir = Join-Path $InstallDir ".gjc-install.lock"
-    $lockClaim = Join-Path $lockDir "claim"
+    $lockFile = Join-Path $InstallDir ".gjc-install.lock"
     $lockNonce = [guid]::NewGuid().ToString("N")
     $lockLine = "$PID $lockNonce"
+    $lockOwned = $false
     try {
-        New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
+        $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockLine + "`n")
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Dispose()
+        $lockOwned = $true
     } catch {
         $ownerLine = $null
-        if (Test-Path $lockClaim) {
-            $ownerLine = (Get-Content $lockClaim -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (Test-Path $lockFile) {
+            $ownerLine = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
         }
         $ownerPid = $null
         if ($ownerLine) { $ownerPid = ($ownerLine -split '\s+')[0] }
@@ -496,20 +500,23 @@ function Install-Binary {
                 $alive = $true
             } catch {}
         }
-        if ($alive) {
-            throw "Another GJC installer is already running in $InstallDir (pid $ownerPid, lock: $lockDir)."
+        if ($alive -or -not $ownerLine) {
+            throw "Another GJC installer is already running in $InstallDir (lock: $lockFile)."
         }
         $still = $null
-        if (Test-Path $lockClaim) {
-            $still = (Get-Content $lockClaim -ErrorAction SilentlyContinue | Select-Object -First 1)
+        if (Test-Path $lockFile) {
+            $still = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
         }
-        if ($still -eq $ownerLine) {
-            Remove-Item -Force $lockClaim -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $lockDir -ErrorAction SilentlyContinue
+        if ($still -ne $ownerLine) {
+            throw "Another GJC installer is already running in $InstallDir (lock: $lockFile)."
         }
-        New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
+        Remove-Item -Force $lockFile -ErrorAction SilentlyContinue
+        $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockLine + "`n")
+        $fs.Write($bytes, 0, $bytes.Length)
+        $fs.Dispose()
+        $lockOwned = $true
     }
-    Set-Content -Path $lockClaim -Value $lockLine
 
     $OutPath = Join-Path $InstallDir "gjc.exe"
     $DownloadTmp = Join-Path $InstallDir (".gjc.download." + [System.Guid]::NewGuid().ToString("N"))
@@ -588,13 +595,11 @@ function Install-Binary {
         }
     } finally {
         Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
-        $still = $null
-        if (Test-Path $lockClaim) {
-            $still = (Get-Content $lockClaim -ErrorAction SilentlyContinue | Select-Object -First 1)
-        }
-        if ($still -eq $lockLine) {
-            Remove-Item -Force $lockClaim -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $lockDir -ErrorAction SilentlyContinue
+        if ($lockOwned -and (Test-Path $lockFile)) {
+            $still = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
+            if ($still -eq $lockLine) {
+                Remove-Item -Force $lockFile -ErrorAction SilentlyContinue
+            }
         }
     }
 }

@@ -636,27 +636,41 @@ async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
 	}
 	let target = "";
 	let backup = "";
+	let next = "";
 	try {
 		const parsed: unknown = JSON.parse(raw);
 		if (parsed && typeof parsed === "object") {
-			const record = parsed as { target?: unknown; backup?: unknown };
+			const record = parsed as { target?: unknown; backup?: unknown; next?: unknown };
 			if (typeof record.target === "string") target = record.target;
 			if (typeof record.backup === "string") backup = record.backup;
+			if (typeof record.next === "string") next = record.next;
 		}
 	} catch {
 		await unlinkIfExists(journalPath);
 		return;
 	}
-	if (target && backup) {
+	const exists = async (p: string): Promise<boolean> => {
 		try {
-			await fs.promises.lstat(target);
+			await fs.promises.lstat(p);
+			return true;
 		} catch (err) {
-			if (!isEnoent(err)) throw err;
-			try {
-				await fs.promises.rename(backup, target);
-			} catch (restoreErr) {
-				if (!isEnoent(restoreErr)) throw restoreErr;
-			}
+			if (isEnoent(err)) return false;
+			throw err;
+		}
+	};
+	if (target && next && (await exists(next))) {
+		if (!(await exists(target))) {
+			await fs.promises.rename(next, target);
+			await unlinkIfExists(journalPath);
+			return;
+		}
+		return;
+	}
+	if (target && backup && !(await exists(target))) {
+		try {
+			await fs.promises.rename(backup, target);
+		} catch (restoreErr) {
+			if (!isEnoent(restoreErr)) throw restoreErr;
 		}
 	}
 	await unlinkIfExists(journalPath);
@@ -685,12 +699,14 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		}
 		await unlinkIfExists(options.backupPath);
 		if (process.platform === "win32") {
+			const nextPath = `${options.targetPath}.next`;
 			await fs.promises.writeFile(
 				journalPath,
 				JSON.stringify({
 					target: options.targetPath,
 					backup: options.backupPath,
 					temp: options.tempPath,
+					next: nextPath,
 				}),
 				"utf8",
 			);
@@ -698,7 +714,14 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 				await fs.promises.rename(options.targetPath, options.backupPath);
 				backupReady = true;
 			} catch (err) {
-				if (!isEnoent(err)) throw err;
+				if (isEnoent(err)) {
+					backupReady = false;
+				} else {
+					await fs.promises.copyFile(options.tempPath, nextPath);
+					throw new Error(
+						`Running Windows image ${options.targetPath} could not be replaced in-process (${err}). Staged ${nextPath}. Close running gjc.exe and re-run gjc update.`,
+					);
+				}
 			}
 		} else {
 			try {
@@ -919,16 +942,20 @@ export async function runBinaryUpdateFlow(
 }
 
 async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {
-	const lockDir = `${targetPath}.update-lock`;
-	const ownerPath = path.join(lockDir, "claim");
+	const lockFile = `${targetPath}.update-lock`;
 	const nonce = `${process.pid}.${Date.now().toString(16)}.${Math.random().toString(16).slice(2)}`;
 	const claim = `${process.pid} ${nonce}\n`;
-	const writeOwner = async (): Promise<void> => {
-		await fs.promises.writeFile(ownerPath, claim, { encoding: "utf8" });
+	const publish = async (): Promise<void> => {
+		const handle = await fs.promises.open(lockFile, "wx");
+		try {
+			await handle.write(claim);
+		} finally {
+			await handle.close();
+		}
 	};
 	const ownsClaim = async (): Promise<boolean> => {
 		try {
-			return (await fs.promises.readFile(ownerPath, "utf8")) === claim;
+			return (await fs.promises.readFile(lockFile, "utf8")) === claim;
 		} catch {
 			return false;
 		}
@@ -936,15 +963,13 @@ async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promis
 	const release = async (): Promise<void> => {
 		try {
 			if (!(await ownsClaim())) return;
-			await unlinkIfExists(ownerPath);
-			await fs.promises.rmdir(lockDir);
+			await unlinkIfExists(lockFile);
 		} catch {
 			// Best-effort lock release after a verified or failed update.
 		}
 	};
 	try {
-		await fs.promises.mkdir(lockDir);
-		await writeOwner();
+		await publish();
 		return release;
 	} catch (err) {
 		const code = (err as NodeJS.ErrnoException).code;
@@ -952,27 +977,27 @@ async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promis
 		if (code === "EEXIST") {
 			let ownerLine = "";
 			try {
-				ownerLine = (await fs.promises.readFile(ownerPath, "utf8")).trim();
+				ownerLine = (await fs.promises.readFile(lockFile, "utf8")).trim();
 			} catch {
 				throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
 			}
-			const ownerPid = Number(ownerLine.split(/\s+/)[0]);
-			if (Number.isInteger(ownerPid) && ownerPid > 0) {
-				try {
-					process.kill(ownerPid, 0);
-				} catch {
-					const still = (await fs.promises.readFile(ownerPath, "utf8").catch(() => "")).trim();
-					if (still === ownerLine) {
-						await unlinkIfExists(ownerPath);
-						try {
-							await fs.promises.rmdir(lockDir);
-						} catch {
-							throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
-						}
-						await fs.promises.mkdir(lockDir);
-						await writeOwner();
-						return release;
-					}
+			const parts = ownerLine.split(/\s+/);
+			const ownerPid = Number(parts[0]);
+			if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !parts[1]) {
+				throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
+			}
+			try {
+				process.kill(ownerPid, 0);
+			} catch (killErr) {
+				const killCode = (killErr as NodeJS.ErrnoException).code;
+				if (killCode === "EPERM") {
+					throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
+				}
+				const still = (await fs.promises.readFile(lockFile, "utf8").catch(() => "")).trim();
+				if (still === ownerLine) {
+					await unlinkIfExists(lockFile);
+					await publish();
+					return release;
 				}
 			}
 			throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);

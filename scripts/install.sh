@@ -30,7 +30,7 @@ MODE="binary"
 CHANNEL="stable"
 REF=""
 TMP_FILES=""
-LOCK_DIR=""
+LOCK_FILE=""
 LOCK_NONCE=""
 AUTH_HDR=""
 BACKUP_PATH=""
@@ -72,15 +72,12 @@ cleanup() {
             rm -f "$tmp_file"
         done || true
     fi
-    if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
+    if [ -n "$LOCK_FILE" ] && [ -f "$LOCK_FILE" ]; then
         owner=""
         nonce=""
-        if [ -f "${LOCK_DIR}/claim" ]; then
-            read owner nonce < "${LOCK_DIR}/claim" || true
-        fi
+        read owner nonce < "$LOCK_FILE" || true
         if [ "$owner" = "$$" ] && [ -n "$LOCK_NONCE" ] && [ "$nonce" = "$LOCK_NONCE" ]; then
-            rm -f "${LOCK_DIR}/claim"
-            rmdir "$LOCK_DIR" 2>/dev/null || true
+            rm -f "$LOCK_FILE"
         fi
     fi
     if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
@@ -351,27 +348,26 @@ detect_platform() {
     BINARY="gjc-${PLATFORM}-${ARCH}"
 }
 
-write_lock_claim() {
-    dest="$1"
-    LOCK_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
-    [ -n "$LOCK_NONCE" ] || LOCK_NONCE="$$.$RANDOM"
-    printf '%s %s\n' "$$" "$LOCK_NONCE" > "${dest}/claim"
+try_publish_lock_file() {
+    lock="$1"
+    ( set -C; umask 077; printf '%s %s\n' "$$" "$LOCK_NONCE" > "$lock" )
 }
 
 acquire_lock() {
     lock="${INSTALL_DIR}/.gjc-install.lock"
     mkdir -p "$INSTALL_DIR"
-    if mkdir "$lock" 2>/dev/null; then
-        LOCK_DIR="$lock"
-        write_lock_claim "$lock"
+    LOCK_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$LOCK_NONCE" ] || LOCK_NONCE="$$.$RANDOM"
+    if try_publish_lock_file "$lock" 2>/dev/null; then
+        LOCK_FILE="$lock"
         return 0
     fi
     owner=""
     nonce=""
-    if [ ! -f "${lock}/claim" ]; then
+    if [ ! -f "$lock" ]; then
         die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
     fi
-    read owner nonce < "${lock}/claim" || true
+    read owner nonce < "$lock" || true
     if [ -z "$owner" ] || [ -z "$nonce" ]; then
         die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
     fi
@@ -380,15 +376,15 @@ acquire_lock() {
     fi
     current_owner=""
     current_nonce=""
-    read current_owner current_nonce < "${lock}/claim" || true
+    read current_owner current_nonce < "$lock" || true
     if [ "$current_owner" != "$owner" ] || [ "$current_nonce" != "$nonce" ]; then
         die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
     fi
-    rm -f "${lock}/claim"
-    rmdir "$lock" 2>/dev/null || die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
-    if mkdir "$lock" 2>/dev/null; then
-        LOCK_DIR="$lock"
-        write_lock_claim "$lock"
+    rm -f "$lock"
+    LOCK_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$LOCK_NONCE" ] || LOCK_NONCE="$$.$RANDOM"
+    if try_publish_lock_file "$lock" 2>/dev/null; then
+        LOCK_FILE="$lock"
         return 0
     fi
     die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
