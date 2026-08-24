@@ -562,15 +562,17 @@ function isAuthorizedBrokerEndpoint(discovery: BrokerDiscovery): boolean {
 
 /**
  * Stop a live broker whose published generation differs from the package this
- * process would spawn. The authenticated `broker.shutdown` op is tried first.
- * Ordered same-install discoveries that predate the op (or fail transport) take
- * an identity-fenced SIGTERM instead. Legacy records that lack version/identity
+ * process would spawn. The authenticated `broker.shutdown` op is tried first
+ * and is the Darwin retirement path: the owner process exits itself. Ordered
+ * same-install discoveries that predate the op (or fail transport) take an
+ * identity-fenced SIGTERM instead. Legacy records that lack version/identity
  * are shut down through the same authenticated path. They are signalled only
  * after a typed authenticated `unknown_operation` (pre-shutdown brokers) and
- * identity revalidation; generation inequality alone never authorizes SIGTERM.
- * A heartbeat TTL lapse with a still-live process is not retirement. A
- * mismatched discovery that remains published is never returned to a lifecycle
- * caller.
+ * identity revalidation, and only where `signalRoot` is incarnation-bound.
+ * Darwin `signalRoot` fail-closes; generation inequality never authorizes
+ * SIGTERM. A heartbeat TTL lapse with a still-live process is not retirement.
+ * A mismatched discovery that remains published is never returned to a
+ * lifecycle caller.
  */
 async function retireStaleBroker(
 	agentDir: string,

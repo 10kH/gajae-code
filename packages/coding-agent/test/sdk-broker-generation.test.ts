@@ -469,9 +469,9 @@ describe("sdk broker package generation", () => {
 		}
 	}, 30_000);
 
-	it("signals an unstamped pre-shutdown broker after authenticated unknown_operation", async () => {
+	it("retires a historical unstamped broker through authenticated owner-side shutdown", async () => {
 		const dir = await temp();
-		const token = "unstamped-unknown-operation-token";
+		const token = "unstamped-owner-side-shutdown-token";
 		const discoveryModule = path.resolve(import.meta.dir, "../src/sdk/broker/discovery.ts");
 		const script = path.join(dir, "historical-unstamped-broker.ts");
 		await Bun.write(
@@ -500,9 +500,10 @@ const server = Bun.serve({
 				ws.send(JSON.stringify({
 					type: "broker_response",
 					id: frame.id,
-					ok: false,
-					error: { code: "unknown_operation", message: "unknown broker operation" },
+					ok: true,
+					result: { accepted: true },
 				}));
+				setTimeout(() => process.exit(0), 0);
 			}
 		},
 	},
@@ -558,23 +559,31 @@ process.on("SIGTERM", () => process.exit(0));
 			const published = await readBrokerDiscovery(dir);
 			expect(published?.pid).toBe(child.pid);
 			const authority = resolveSdkPackageAuthority();
-			if (process.platform === "darwin") {
-				await expect(
-					ensureBroker({
-						agentDir: dir,
-						expectedPackageGeneration: authority.generation,
-					}),
-				).rejects.toThrow("stale broker retirement was not verified");
-				expect(isPidAlive(child.pid!)).toBe(true);
-			} else {
-				const replacement = await ensureBroker({
-					agentDir: dir,
-					expectedPackageGeneration: authority.generation,
-				});
-				expect(isPidAlive(child.pid!)).toBe(false);
-				expect(replacement.pid).not.toBe(child.pid);
-				expect(replacement.packageGeneration).toBe(authority.generation);
-			}
+			const replacement = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+			});
+			expect(child.pid).toBeDefined();
+			expect(isPidAlive(child.pid!)).toBe(false);
+			expect(replacement.pid).not.toBe(child.pid);
+			expect(replacement.packageGeneration).toBe(authority.generation);
+			expect(replacement.packageVersion).toBe(authority.packageVersion);
+			expect(replacement.installationIdentity).toBe(authority.installationIdentity);
+			const after = await readBrokerDiscovery(dir);
+			expect(after?.pid).toBe(replacement.pid);
+			expect(after?.incarnation).toBe(replacement.incarnation);
+			const lockOwner = JSON.parse(
+				await fs.readFile(path.join(dir, "sdk", "broker.lock", "owner.json"), "utf8"),
+			) as {
+				pid?: number;
+			};
+			expect(lockOwner.pid).toBe(replacement.pid);
+			const reused = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+			});
+			expect(reused.pid).toBe(replacement.pid);
+			expect(reused.incarnation).toBe(replacement.incarnation);
 		} finally {
 			if (child.pid !== undefined && isPidAlive(child.pid)) child.kill("SIGKILL");
 			await cleanup(dir);
