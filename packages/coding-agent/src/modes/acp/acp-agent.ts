@@ -2314,9 +2314,13 @@ export class AcpAgent implements Agent {
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
-		if (error instanceof SdkClientError && error.code !== "reconnect_exhausted") {
+		if (
+			error instanceof SdkClientError &&
+			error.code !== "reconnect_exhausted" &&
+			error.code !== "provider_rebind_failed"
+		) {
 			logger.warn(
-				`ACP session ${id} transport failure is not reconnect_exhausted (${error.code}); ignoring terminal recovery.`,
+				`ACP session ${id} transport failure is not recoverable (${error.code}); ignoring terminal recovery.`,
 			);
 			return;
 		}

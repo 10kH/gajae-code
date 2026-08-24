@@ -646,7 +646,7 @@ export class AcpSdkAdapter {
 			error instanceof SdkClientError
 				? error
 				: error instanceof AcpSdkAdapterError
-					? new SdkClientError(error.code, error.message, error)
+					? new SdkClientError("provider_rebind_failed", `${error.code}: ${error.message}`, error)
 					: new SdkClientError(
 							"reconnect_exhausted",
 							error instanceof Error ? error.message : "SDK reconnect failed.",

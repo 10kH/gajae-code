@@ -179,6 +179,50 @@ test("ACP provider readiness rebinds expired reverse leases on the live attachme
 	}
 });
 
+test("ACP provider rebind reports non-conflict adapter failures as provider_rebind_failed (#4909)", async () => {
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	let registrations = 0;
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, _frame: Record<string, unknown>) => {
+				registrations++;
+				if (registrations === 1) return { ok: true, result: { leaseId: "lease-1" } };
+				return { ok: true, result: {} };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		const failures: SdkClientError[] = [];
+		adapter.onReconnectFailed(error => failures.push(error));
+		await adapter.start();
+		adapter.acceptFrame({
+			type: "reverse_response",
+			id: "",
+			connectionId: "router-connection-1",
+			leaseId: "lease-1",
+			ok: false,
+			error: { code: "lease_expired", message: "Lease expired." },
+		});
+		await waitFor(
+			() => failures.some(error => error.code === "provider_rebind_failed"),
+			"provider_rebind_failed after omitted leaseId",
+		);
+		expect(failures.some(error => error.code === "reconnect_exhausted")).toBe(false);
+	} finally {
+		await adapter.close();
+	}
+});
+
 test("ACP provider rebind observes lease_expired through the Router event wrapper (#4909)", async () => {
 	const registrations: Record<string, unknown>[] = [];
 	const attachment: SessionAttachment = {
