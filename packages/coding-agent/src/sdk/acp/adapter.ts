@@ -838,7 +838,10 @@ export class AcpSdkAdapter {
 		capability: string,
 		leaseId: string,
 	): boolean {
-		const currentLeaseId = this.#leases.get(capability);
+		// Outstanding reverse RPCs are completed by captured identity: the host
+		// accepts respond() on the original connectionId/leaseId even after that
+		// capability's live lease has been replaced or quarantined. New reverse
+		// requests stay live-lease gated in #ownsReverseLease.
 		return (
 			this.#reverseRequests.get(id) === request &&
 			request.state === "pending" &&
@@ -846,8 +849,7 @@ export class AcpSdkAdapter {
 			this.#connectionId === request.connectionId &&
 			request.connectionId === connectionId &&
 			request.capability === capability &&
-			request.leaseId === leaseId &&
-			currentLeaseId !== undefined
+			request.leaseId === leaseId
 		);
 	}
 

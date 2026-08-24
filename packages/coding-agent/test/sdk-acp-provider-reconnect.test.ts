@@ -299,6 +299,74 @@ test("ACP lease rebind does not abort in-flight reverse permission requests (#49
 	}
 });
 
+test("ACP still answers an admitted reverse request after a later lease conflict (#4909)", async () => {
+	const registrations: Record<string, unknown>[] = [];
+	const sent: Record<string, unknown>[] = [];
+	const { promise: permissionStarted, resolve: resolvePermissionStarted } = Promise.withResolvers<
+		AbortSignal | undefined
+	>();
+	const { promise: permissionGate, resolve: resolvePermissionGate } = Promise.withResolvers<void>();
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		connectionId: "router-connection-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async frame => {
+			sent.push(frame);
+		},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations.push(frame);
+				if (registrations.length === 1) return { ok: true, result: { leaseId: "lease-1" } };
+				throw new SdkClientError("provider_lease_conflict", "provider_lease_conflict");
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		connection: {
+			request: async (
+				_method: string,
+				_params: Record<string, unknown>,
+				options?: { cancellationSignal?: AbortSignal },
+			) => {
+				resolvePermissionStarted(options?.cancellationSignal);
+				await permissionGate;
+				return { outcome: "selected", optionId: "allow_once" };
+			},
+		},
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await adapter.start();
+		adapter.acceptFrame({
+			type: "reverse_request",
+			id: "perm-1",
+			connectionId: "router-connection-1",
+			capability: "permission",
+			leaseId: "lease-1",
+			payload: { method: "request", payload: { toolCall: { toolName: "bash" } } },
+		});
+		await permissionStarted;
+		await adapter.ensureProviders();
+		expect(adapter.leaseIds.get("permission")).toBeUndefined();
+		resolvePermissionGate();
+		await waitFor(
+			() =>
+				sent.some(
+					frame => frame.type === "reverse_response" && frame.id === "perm-1" && frame.leaseId === "lease-1",
+				),
+			"admitted reverse response after conflict quarantine",
+		);
+	} finally {
+		resolvePermissionGate();
+		await adapter.close();
+	}
+});
+
 test("ACP provider rebind leaves a live foreign permission lease in place (#4909)", async () => {
 	const registrations: Record<string, unknown>[] = [];
 	const attachment: SessionAttachment = {
