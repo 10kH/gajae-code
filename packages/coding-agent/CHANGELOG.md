@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The five `macOS Local (oMLX)` presets are retuned from same-machine throughput measurements (#4871). All presets now use one role-effort ladder — critic and architect `high`, planner `medium`, executor and default `low` — and pick each preset's model by measured local throughput: `fast` keeps the 4-bit and `balanced` the 8-bit Qwen 3.6 35B A3B MoE quants (93.5 / 71.1 tok/s measured), `quality` keeps the 8-bit MoE for default/executor/planner/architect and routes only the critic to the official dense `Qwen3.8-27B-8bit` checkpoint (public SWE-bench/agent scores still favor dense for criticism), and both `abliterated` presets move to the faster `Qwen3.8-27B-Uncensored-MLX-4bit` (19.8 tok/s measured, ahead of the Abliterated 4-bit/6-bit quants on every measured axis). Preset display names now state the measured throughput instead of the memory-tier hints.
+
 ### Fixed
 
 - Gajae Pet now stays reachable in tmux and image-protocol-free SSH clients through a bounded two-row text-cell rendering. The fallback derives conservative Block Elements from the active skin, uses truecolor when available and ANSI-256 otherwise, reserves no extra transcript rows, and retains the pixel renderer unchanged for supported Kitty, Sixel, and iTerm2 terminals (#4867).
