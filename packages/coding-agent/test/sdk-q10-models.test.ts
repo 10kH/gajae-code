@@ -19,6 +19,7 @@ function model(overrides: Record<string, unknown> = {}): Model<Api> {
 		api: "openai-completions",
 		baseUrl: "https://example.invalid",
 		reasoning: true,
+		compat: { supportsReasoningEffort: true },
 		thinking,
 		input: ["text"],
 		output: ["text"],
@@ -34,6 +35,25 @@ function invalid(reason: string, descriptor: Record<string, unknown> | undefined
 }
 
 describe("Q10 model projection", () => {
+	it("projects unsupported custom reasoning transports as non-configurable", () => {
+		const unsupported = model({
+			id: "unsupported",
+			compat: { supportsReasoningEffort: false },
+		});
+
+		const row = projectQ10Models({
+			models: [unsupported],
+			currentModel: unsupported,
+			currentThinkingLevel: ThinkingLevel.High,
+		})[0];
+		expect(row).toMatchObject({
+			reasoning: false,
+			thinking: { validLevels: [ThinkingLevel.Off] },
+			current: true,
+			currentThinkingLevel: ThinkingLevel.Off,
+		});
+	});
+
 	it("projects the exact public rows without leaking model internals", () => {
 		const source = model({
 			thinking: { ...thinking, levels: [Effort.Low, Effort.Medium, Effort.High] },

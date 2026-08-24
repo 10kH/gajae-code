@@ -113,6 +113,27 @@ function createOpenAIModel(provider: "openai" | "openai-codex", id: string, reas
 	};
 }
 
+function createCustomOpenAIReasoningModel(id: string, supportsReasoningEffort: boolean): Model {
+	return {
+		id,
+		name: id,
+		api: "openai-completions",
+		provider: "custom-proxy",
+		baseUrl: "https://proxy.example.com/v1",
+		reasoning: true,
+		thinking: {
+			minLevel: Effort.Low,
+			maxLevel: Effort.High,
+			mode: "effort",
+		},
+		compat: { supportsReasoningEffort },
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 32_000,
+	};
+}
+
 function createAnthropicReasoningModel(id: string): Model {
 	return {
 		id,
@@ -562,6 +583,60 @@ describe("ModelSelector canonical model selection", () => {
 		expect(selectedAfterThinking.role).toBe("default");
 		expect(selectedAfterThinking.thinkingLevel).toBe(ThinkingLevel.High);
 		expect(selectedAfterThinking.selector).toBe(`${model.provider}/${model.id}`);
+	});
+
+	test("prompts and carries the selected effort for an explicitly eligible custom OpenAI-compatible model", async () => {
+		installTestTheme();
+		const model = createCustomOpenAIReasoningModel("eligible-reasoner", true);
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			Settings.isolated({}),
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		expect(selected).toBeUndefined();
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).toContain("Reasoning for Default: off");
+		for (let i = 0; i < 3; i++) selector.handleInput("\x1b[B");
+		selector.handleInput("\n");
+
+		const selection = selected;
+		if (!selection) throw new Error("Expected custom reasoning selection");
+		expect(selection.thinkingLevel).toBe(ThinkingLevel.High);
+		expect(selection.selector).toBe("custom-proxy/eligible-reasoner");
+	});
+
+	test("keeps custom OpenAI-compatible reasoning controls unavailable when transport support is disabled", async () => {
+		installTestTheme();
+		const model = createCustomOpenAIReasoningModel("unsupported-reasoner", false);
+		let selected: SelectionCapture | undefined;
+		const selector = createSelector(
+			model,
+			Settings.isolated({}),
+			selection => {
+				if (selection.kind === "assignment") selected = selection;
+			},
+			{ thinkingLevel: null },
+		);
+		await Bun.sleep(0);
+		installTestTheme();
+
+		selector.handleInput("\n");
+		selector.handleInput("\n");
+
+		const selection = selected;
+		if (!selection) throw new Error("Expected direct unsupported-model selection");
+		expect(selection.thinkingLevel).toBe(ThinkingLevel.Inherit);
+		expect(selection.selector).toBe("custom-proxy/unsupported-reasoner");
+		expect(normalizeRenderedText(selector.render(220).join("\n"))).not.toContain("Reasoning for Default");
 	});
 
 	test.each([

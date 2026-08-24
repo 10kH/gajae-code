@@ -173,6 +173,6 @@ describe("preset catalog model entries", () => {
 		expect(model.reasoning).toBe(true);
 		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.maxTokens).toBe(128_000);
-		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.High });
+		expect(model.thinking).toBeUndefined();
 	});
 });

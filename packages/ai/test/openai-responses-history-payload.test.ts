@@ -2,7 +2,10 @@ import { describe, expect, it } from "bun:test";
 import { getBundledModel } from "@gajae-code/ai/models";
 import { streamOpenAICodexResponses } from "@gajae-code/ai/providers/openai-codex-responses";
 import { type OpenAIResponsesOptions, streamOpenAIResponses } from "@gajae-code/ai/providers/openai-responses";
+import { applyResponsesReasoningParams } from "@gajae-code/ai/providers/openai-responses-shared";
 import type { AssistantMessage, Context, Model, ProviderSessionState } from "@gajae-code/ai/types";
+import type OpenAI from "openai";
+import type { ResponseInput } from "openai/resources/responses/responses";
 import { createOpenAIResponsesHistoryPayload, truncateResponseItemId } from "../src/utils";
 
 function createAbortedSignal(): AbortSignal {
@@ -18,6 +21,29 @@ function createCodexToken(accountId: string): string {
 	).toString("base64url");
 	return `${header}.${payload}.signature`;
 }
+
+it("requests encrypted reasoning replay without sending unsupported effort controls", () => {
+	const model: Model<"openai-responses"> = {
+		id: "fixed-reasoner",
+		name: "Fixed Reasoner",
+		api: "openai-responses",
+		provider: "custom-proxy",
+		baseUrl: "https://proxy.example.com/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 32_000,
+	};
+	const params = {} as OpenAI.Responses.ResponseCreateParamsStreaming;
+	const messages: ResponseInput = [];
+
+	applyResponsesReasoningParams(params, model, { reasoning: "high" }, messages);
+
+	expect(params.include).toEqual(["reasoning.encrypted_content"]);
+	expect(params.reasoning).toBeUndefined();
+	expect(messages).toEqual([]);
+});
 
 /**
  * Returns the bundled `gpt-5-mini` model with its `name` renamed so it doesn't

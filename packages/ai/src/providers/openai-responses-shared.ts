@@ -11,6 +11,7 @@ import type {
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 } from "openai/resources/responses/responses";
+import { modelSupportsReasoningControl } from "../model-thinking";
 import { calculateCost } from "../models";
 import {
 	type Api,
@@ -1170,6 +1171,7 @@ export function applyResponsesReasoningParams<P extends OpenAI.Responses.Respons
 	// multi-turn conversations when store is false (items aren't persisted server-side, so
 	// we must include the full content). See: https://github.com/can1357/gajae-code/issues/41
 	params.include = ["reasoning.encrypted_content"];
+	if (!modelSupportsReasoningControl(model)) return;
 
 	if (options?.reasoning || options?.reasoningSummary !== undefined) {
 		const requested = options?.reasoning || "medium";

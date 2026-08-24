@@ -186,6 +186,115 @@ describe("openai-completions compatibility", () => {
 		).toBe(true);
 	});
 
+	it("fails closed for arbitrary custom reasoning transports and honors explicit opt-in", async () => {
+		async function captureCustomPayload(
+			options: { compat?: OpenAICompat; id?: string; provider?: string; baseUrl?: string } = {},
+		) {
+			const model: Model<"openai-completions"> = {
+				id: options.id ?? "reasoning-model",
+				name: "Reasoning Model",
+				api: "openai-completions",
+				provider: options.provider ?? "my-proxy",
+				baseUrl: options.baseUrl ?? "https://proxy.example.com/v1",
+				reasoning: true,
+				thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 32_000,
+				compat: options.compat,
+			};
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			streamOpenAICompletions(model, baseContext(), {
+				apiKey: "test-key",
+				reasoning: "high",
+				signal: createAbortedSignal(),
+				onPayload: payload => resolve(payload as Record<string, unknown>),
+			});
+			return { model, payload: await promise };
+		}
+
+		const implicit = await captureCustomPayload();
+		expect(resolveOpenAICompat(implicit.model).supportsReasoningEffort).toBe(false);
+		expect(implicit.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabled = await captureCustomPayload({ compat: { supportsReasoningEffort: false } });
+		expect(disabled.payload).not.toHaveProperty("reasoning_effort");
+
+		const knownLabelOnUnknownEndpoint = await captureCustomPayload({
+			provider: "litellm",
+			baseUrl: "http://localhost:4000/v1",
+		});
+		expect(knownLabelOnUnknownEndpoint.payload).not.toHaveProperty("reasoning_effort");
+
+		const qwenByNameOnly = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: false },
+		});
+		expect(qwenByNameOnly.payload).not.toHaveProperty("enable_thinking");
+		expect(qwenByNameOnly.payload).not.toHaveProperty("reasoning_effort");
+
+		const optedIn = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: {
+				supportsReasoningEffort: true,
+				reasoningEffortMap: { high: "provider-high" },
+			},
+		});
+		expect(optedIn.payload.reasoning_effort).toBe("provider-high");
+		expect(optedIn.payload).not.toHaveProperty("enable_thinking");
+
+		const qwenOnOpenAI = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			provider: "custom",
+			baseUrl: "https://api.openai.com/dashscope/v1",
+		});
+		expect(qwenOnOpenAI.payload.reasoning_effort).toBe("high");
+		expect(qwenOnOpenAI.payload).not.toHaveProperty("enable_thinking");
+
+		const explicitQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: true, thinkingFormat: "qwen" },
+		});
+		expect(explicitQwenFormat.payload.enable_thinking).toBe(true);
+		expect(explicitQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledExplicitQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: false, thinkingFormat: "qwen" },
+		});
+		expect(disabledExplicitQwenFormat.payload).not.toHaveProperty("enable_thinking");
+		expect(disabledExplicitQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledAuditedQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			compat: { supportsReasoningEffort: false, thinkingFormat: "qwen" },
+		});
+		expect(disabledAuditedQwenFormat.payload).not.toHaveProperty("enable_thinking");
+		expect(disabledAuditedQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledInjectedThinking = await captureCustomPayload({
+			compat: {
+				supportsReasoningEffort: false,
+				extraBody: { thinking: { type: "enabled" } },
+			},
+		});
+		expect(disabledInjectedThinking.payload).not.toHaveProperty("thinking");
+
+		const zaiPathLookalike = await captureCustomPayload({
+			baseUrl: "https://api.openai.com/v1/api.z.ai",
+		});
+		expect(zaiPathLookalike.payload.reasoning_effort).toBe("high");
+		expect(zaiPathLookalike.payload).not.toHaveProperty("thinking");
+
+		const openRouterPathLookalike = await captureCustomPayload({
+			baseUrl: "https://api.openai.com/v1/openrouter.ai",
+		});
+		expect(openRouterPathLookalike.payload.reasoning_effort).toBe("high");
+		expect(openRouterPathLookalike.payload).not.toHaveProperty("reasoning");
+	});
+
 	it("serializes assistant text content as a plain string", () => {
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
@@ -617,6 +726,7 @@ describe("openai-completions compatibility", () => {
 			api: "openai-completions",
 			reasoning: true,
 			compat: {
+				supportsReasoningEffort: true,
 				thinkingFormat: "qwen-chat-template",
 			},
 		};
