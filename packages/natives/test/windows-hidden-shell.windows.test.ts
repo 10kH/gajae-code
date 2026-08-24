@@ -1,9 +1,9 @@
 /**
  * Live Windows execution of the #4883 hidden-console fix.
  *
- * These tests run only on the windows-latest CI job (`it.skipIf(!isWindows)`);
- * the cross-platform structural contract lives in
- * `windows-hidden-shell.test.ts`.
+ * These behavioral tests run only on the windows-latest CI job
+ * (`it.skipIf(!isWindows)`). They are the source of truth for the Windows
+ * creation-flag contract; a source-text mirror would not exercise it.
  *
  * Strategy: spawn a bun child (hidden, so the test itself never allocates a
  * window) that calls `kernel32!FreeConsole` to become console-less — the
