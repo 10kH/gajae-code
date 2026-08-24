@@ -339,6 +339,46 @@ test("a failed acceptance persist rolls back the provisional record and reservat
 	});
 });
 
+test("a failed uncertainty persist restores the durable deadline terminal until retry succeeds", async () => {
+	let records: unknown[] = [];
+	let failNext = false;
+	const store = {
+		path: null,
+		load: async () => records,
+		transact: async (mutator: (current: never[]) => never[]) => {
+			const candidate = mutator(records as never);
+			if (failNext) {
+				failNext = false;
+				throw new Error("uncertainty persist failed");
+			}
+			records = candidate;
+		},
+	} as never;
+	const reconciliation = createInvocationReconciliation({ store });
+	const correlation = { commandId: "uncertain-command", turnId: "uncertain-turn" };
+	await reconciliation.noteAccepted("prompt", correlation, "uncertain-ref");
+	await reconciliation.finalizeOutcome("prompt", correlation, {
+		kind: "failed",
+		code: "prompt_deadline_exceeded",
+		message: "deadline",
+	});
+	failNext = true;
+	await expect(reconciliation.markUncertain("prompt", correlation)).rejects.toThrow("uncertainty persist failed");
+	expect(reconciliation.lookup("prompt", { clientRef: "uncertain-ref" })).toMatchObject({
+		status: "failed",
+		error: { code: "prompt_deadline_exceeded" },
+	});
+	const reloadedBeforeRetry = createInvocationReconciliation({ store });
+	await reloadedBeforeRetry.hydrate();
+	expect(reloadedBeforeRetry.lookup("prompt", { clientRef: "uncertain-ref" })).toMatchObject({
+		status: "failed",
+		error: { code: "prompt_deadline_exceeded" },
+	});
+	await reconciliation.markUncertain("prompt", correlation);
+	expect(reconciliation.lookup("prompt", { clientRef: "uncertain-ref" })).toMatchObject({ status: "accepted" });
+	expect(records).toEqual([expect.objectContaining({ deadlineRecoveryPending: true })]);
+});
+
 test("durable reload keeps agent_end terminal across a paused successor transition", async () => {
 	let records: unknown[] = [];
 	let pauseWrites = 0;

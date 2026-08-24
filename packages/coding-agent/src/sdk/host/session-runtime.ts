@@ -927,7 +927,19 @@ export function createInvocationReconciliation(
 			delete (next as unknown as { outcome?: unknown }).outcome;
 			(next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending = true;
 			records.set(recordKey, next);
-			await persist();
+			try {
+				await persist();
+				if (isCurrent !== undefined && !isCurrent()) {
+					const current = records.get(recordKey);
+					if (current === next) {
+						records.set(recordKey, record);
+						await persist();
+					}
+				}
+			} catch (error) {
+				if (records.get(recordKey) === next) records.set(recordKey, record);
+				throw error;
+			}
 		},
 	};
 }

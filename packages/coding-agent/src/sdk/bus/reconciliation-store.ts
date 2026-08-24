@@ -703,8 +703,13 @@ export function createReconciliationStore(options: {
 			// Corrupt → quarantine
 			try {
 				await fileFs.rename(filePath, `${filePath}.corrupt.${now()}`);
-			} catch {
-				// ignore
+			} catch (error) {
+				// Quarantine is the proof that the invalid document is no longer the
+				// authoritative session record. If it cannot be published, fail closed
+				// instead of serving an empty store that could admit duplicate work.
+				throw Object.assign(error instanceof Error ? error : new Error("reconciliation quarantine failed"), {
+					code: "reconciliation_quarantine_failed",
+				});
 			}
 			memory = [];
 			terminalMemory = [];

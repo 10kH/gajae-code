@@ -249,6 +249,35 @@ describe("reconciliation-store", () => {
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
+	test("corrupt file fails closed when quarantine rename fails", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-corrupt-rename-"));
+		try {
+			const sessionFile = path.join(root, "s.jsonl");
+			await fs.writeFile(sessionFile, "");
+			const filePath = reconciliationStorePath(sessionFile, "s1");
+			await fs.mkdir(path.dirname(filePath), { recursive: true });
+			await fs.writeFile(filePath, "{ definitely not json");
+			const store = createReconciliationStore({
+				sessionFile,
+				sessionId: "s1",
+				fs: {
+					mkdir: fs.mkdir,
+					readFile: fs.readFile,
+					writeFile: fs.writeFile,
+					rename: async () => {
+						throw Object.assign(new Error("quarantine denied"), { code: "EACCES" });
+					},
+					unlink: fs.unlink,
+					open: fs.open as never,
+				},
+			});
+			await expect(store.load()).rejects.toMatchObject({ code: "reconciliation_quarantine_failed" });
+			expect(await fs.readFile(filePath, "utf8")).toBe("{ definitely not json");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("quarantines terminal_ok records with failed outcomes", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-terminal-mismatch-"));
 		const sessionFile = path.join(root, "s.jsonl");
