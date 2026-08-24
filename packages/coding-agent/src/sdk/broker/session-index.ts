@@ -1650,15 +1650,48 @@ export class SessionIndex {
 		if (rawGenerationEvents.length === 0)
 			return { status: "unknown", observedIndexSeq, reason: "generation_not_observed" };
 
+		const admitted = admitEvents(this.#events).admitted;
+		const generationEvents = admitted.filter(
+			event => event.sessionId === sessionId && event.endpointGeneration === endpointGeneration,
+		);
+		if (generationEvents.length === 0)
+			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+		const projection = reduceEvents(admitted, this.#policy.clock(), this.#agentDir, probedIncarnations);
+		const current = projection.sessions.find(session => session.sessionId === sessionId);
+		if (current?.terminalUncertain)
+			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+		if (current && !isSessionAuthorityEligible(current))
+			return { status: "unknown", observedIndexSeq, reason: "ambiguous_authority" };
+
 		const registrations = rawGenerationEvents.filter(event => event.type === "host_registered");
+		const latestByIdentity = new Map<string, SessionIndexEvent>();
+		for (const event of rawGenerationEvents) {
+			if (event.type === "host_heartbeat") continue;
+			const key = identityKey(event);
+			const previous = latestByIdentity.get(key);
+			if (previous === undefined || event.indexSeq > previous.indexSeq) latestByIdentity.set(key, event);
+		}
+		const unresolvedRoots = new Set<string>();
+		for (const event of registrations) {
+			const latest = latestByIdentity.get(identityKey(event));
+			if (latest && isUnresolvedEvent(latest)) unresolvedRoots.add(resolveEquivalentPath(event.locator.stateRoot));
+		}
 		const authorityKeys = new Set<string>();
 		for (const event of registrations) {
+			const latest = latestByIdentity.get(identityKey(event));
+			// A terminal identity from a historical root no longer claims authority.
+			// A terminal identity on the surviving root still participates: a new
+			// incarnation reusing the same numeric generation on that root must remain
+			// unknown. Cross-root ambiguity itself is classified by the projection
+			// above, which follows the same surviving-root rules as Router authority.
+			const root = resolveEquivalentPath(event.locator.stateRoot);
+			if (!latest || (!isUnresolvedEvent(latest) && !unresolvedRoots.has(root))) continue;
 			const incarnation = event.hostIncarnation ?? event.processIncarnation;
 			const authority =
 				incarnation === undefined
 					? `legacy:${event.pid}:${event.endpointMtimeMs ?? "unknown"}`
 					: `composite:${incarnation}`;
-			authorityKeys.add(`${resolveEquivalentPath(event.locator.stateRoot)}\u0000${authority}`);
+			authorityKeys.add(`${root}\u0000${authority}`);
 		}
 		if (authorityKeys.size > 1) return { status: "unknown", observedIndexSeq, reason: "generation_reused" };
 		const registration = registrations.at(-1);
@@ -1675,20 +1708,6 @@ export class SessionIndex {
 		)
 			return { status: "unknown", observedIndexSeq, reason: "generation_reused" };
 
-		const admitted = admitEvents(this.#events).admitted;
-		const generationEvents = admitted.filter(
-			event => event.sessionId === sessionId && event.endpointGeneration === endpointGeneration,
-		);
-		if (generationEvents.length === 0)
-			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
-
-		const current = reduceEvents(admitted, this.#policy.clock(), this.#agentDir, probedIncarnations).sessions.find(
-			session => session.sessionId === sessionId,
-		);
-		if (current?.terminalUncertain)
-			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
-		if (current && !isSessionAuthorityEligible(current))
-			return { status: "unknown", observedIndexSeq, reason: "ambiguous_authority" };
 		if (current?.live) {
 			if (current.endpointGeneration === endpointGeneration)
 				return {

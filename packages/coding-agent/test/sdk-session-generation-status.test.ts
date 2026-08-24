@@ -201,6 +201,22 @@ describe("SessionRouter exact generation status", () => {
 		});
 	});
 
+	test("ignores a terminal historical root when the same generation is live on a new root", async () => {
+		const { index, locator, router } = await fixture();
+		const replacementLocator = {
+			repo: locator.repo,
+			stateRoot: path.join(locator.repo, "replacement-state"),
+		};
+		await register(index, locator, "resolved-root-session", 2);
+		await retire(index, locator, "resolved-root-session", 2, "host_unregistered");
+		await register(index, replacementLocator, "resolved-root-session", 2);
+
+		expect(await router.generationStatus("resolved-root-session", 2)).toEqual({
+			status: "current",
+			evidence: { source: "session_index", observedIndexSeq: 3, evidenceIndexSeq: 3 },
+		});
+	});
+
 	test("revalidates process incarnation after replay before reporting current", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-pid-reuse-"));
 		tempDirs.push(agentDir);
