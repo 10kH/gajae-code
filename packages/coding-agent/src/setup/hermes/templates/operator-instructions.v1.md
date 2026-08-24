@@ -8,7 +8,7 @@ These instructions teach a Hermes-style coordinator how to operate GJC through t
 
 ## Core loop
 
-1. Use `{{TOOL_PREFIX}}_list_sessions` to find an existing session, or `{{TOOL_PREFIX}}_start_session` when a new session is required and mutation is enabled.
+1. Use `{{TOOL_PREFIX}}_list_sessions` to find an existing session, or `{{TOOL_PREFIX}}_start_session` when a new session is required and mutation is enabled. Pass `worktree` with a name derived from the task (a ticket id works well) so this session gets its own checkout; see Worktree policy below.
 2. Send exactly one bounded task prompt with `{{TOOL_PREFIX}}_send_prompt`.
 3. Store the returned `turn_id`.
 4. Prefer `{{TOOL_PREFIX}}_watch_events` with the stored `next_after_seq` for event-driven progress; fall back to `{{TOOL_PREFIX}}_read_turn` or `{{TOOL_PREFIX}}_await_turn` for a specific `turn_id` until terminal.
@@ -37,6 +37,17 @@ Coordinator MCP is a durable polling/await bridge, not a push subscription strea
 ## Worktree, model, and provider policy
 
 The Hermes bridge does not choose a model/provider. Generated setup configures `GJC_COORDINATOR_MCP_SESSION_COMMAND` to `gjc --worktree` by default, so GJC creates and tracks the worktree while still using normal local model/provider resolution. Keep worktree creation inside GJC rather than creating unmanaged Hermes-side git worktrees; this preserves the original project identity for session listing and resume. If the operator config supplies a different `GJC_COORDINATOR_MCP_SESSION_COMMAND`, preserve it as explicit user intent.
+
+Name the worktree per task. `{{TOOL_PREFIX}}_start_session`, `gjc_delegate_plan`, and `gjc_delegate_execute` accept `worktree`; the name becomes both the worktree directory and its branch. Omitting it does not mean "no worktree" — it means this session falls back to the one worktree derived from the repository's current branch, which every other unnamed session in that repository also resolves to. Two concurrent tasks in one repository must therefore pass different names, or the second is refused with `worktree_in_use`.
+
+Typical refusals, all recoverable without a config change unless noted:
+
+- `worktree_in_use` — another live session holds that worktree. Pick a different name, or stop the session named in the message.
+- `worktree_required` — the operator set `GJC_COORDINATOR_MCP_REQUIRE_WORKTREE`. Retry with a `worktree` name.
+- `invalid_worktree_name` — the name contains whitespace or starts with `-`. Choose a name git accepts as a branch.
+- `worktree_not_enabled` / `worktree_required_without_worktree_mode` — the configured session command does not select worktree mode. This is an operator configuration issue, not a request to retry.
+
+Reusing an existing session through `session_id` creates no worktree, so `worktree` does not apply to reuse.
 
 Provider-specific commands are examples only, never product defaults.
 

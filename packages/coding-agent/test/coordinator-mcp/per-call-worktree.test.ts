@@ -19,7 +19,7 @@ type BrokerCall = { operation: string; input: Record<string, unknown> };
  * broker. The target is what decides the worktree, so asserting on it is the
  * closest observable proof that a per-call name reached the launch path.
  */
-async function createServer(root: string, sessionCommand: string | null) {
+async function createServer(root: string, sessionCommand: string | null, requireWorktree = false) {
 	const agentDir = path.join(root, "agent-global");
 	await writeBrokerDiscovery(agentDir, {
 		version: 1,
@@ -43,6 +43,7 @@ async function createServer(root: string, sessionCommand: string | null) {
 			GJC_COORDINATOR_MCP_PROFILE: "local",
 			GJC_COORDINATOR_MCP_REPO: "repo",
 			...(sessionCommand === null ? {} : { GJC_COORDINATOR_MCP_SESSION_COMMAND: sessionCommand }),
+			...(requireWorktree ? { GJC_COORDINATOR_MCP_REQUIRE_WORKTREE: "true" } : {}),
 		},
 		services: {
 			getAgentDir: () => agentDir,
@@ -110,6 +111,28 @@ describe("per-call worktree name", () => {
 		await startSession(server, root);
 
 		expect(lifecycleTargets(calls)[0]?.worktree).toEqual({ enabled: true, name: "shared-default" });
+	});
+
+	it("requires an explicit per-task worktree when configured", async () => {
+		const root = await coordinatorFixtureRoot(tempDirs);
+		const { server, calls } = await createServer(root, "gjc --worktree", true);
+
+		expect(await startSession(server, root)).toMatchObject({ ok: false, reason: "worktree_required" });
+		expect(lifecycleTargets(calls)).toHaveLength(0);
+
+		await startSession(server, root, { worktree: "task-a" }, "required-task-a");
+		expect(lifecycleTargets(calls)[0]?.worktree).toEqual({ enabled: true, name: "task-a" });
+	});
+
+	it("refuses an unsatisfiable required-worktree configuration", async () => {
+		const root = await coordinatorFixtureRoot(tempDirs);
+		const { server, calls } = await createServer(root, "gjc", true);
+
+		expect(await startSession(server, root, { worktree: "task-a" })).toMatchObject({
+			ok: false,
+			reason: "worktree_required_without_worktree_mode",
+		});
+		expect(lifecycleTargets(calls)).toHaveLength(0);
 	});
 
 	it("refuses to enable worktree mode for an in-place coordinator", async () => {
