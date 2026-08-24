@@ -1661,6 +1661,11 @@ export class AcpAgent implements Agent {
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
 			throw error;
 		}
+		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
+
 		// Silence has to be bounded from the moment the prompt owns the session: a host that
 		// dies before it ever answers is exactly the failure that leaves the client running.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);
@@ -1870,6 +1875,11 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
+			if (waiter && !waiter.acknowledged) {
+				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+				waiter.cancelAttemptResolve?.(true);
+				return;
+			}
 			if (!waiter) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
