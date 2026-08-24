@@ -992,6 +992,8 @@ export class SettingsSelectorComponent extends Container {
 		done: (value?: string) => void,
 	): Container {
 		let options = def.options;
+		const language = this.#language();
+		const title = def.path === "ui.language" ? uiString(language, "settings.language.label") : def.label;
 
 		// Special case: inject runtime options for thinking level
 		if (def.path === "defaultThinkingLevel") {
@@ -1004,7 +1006,6 @@ export class SettingsSelectorComponent extends Container {
 		} else if (def.path === "modelProfile.default") {
 			options = this.context.availableModelProfiles.map(p => ({ value: p, label: p }));
 		} else if (def.path === "ui.language") {
-			const language = this.#language();
 			options = [
 				{ value: "en", label: uiString(language, "settings.language.english") },
 				{ value: "ko", label: uiString(language, "settings.language.korean") },
@@ -1013,7 +1014,8 @@ export class SettingsSelectorComponent extends Container {
 		if (def.path === "statusLine.preset") {
 			options = options.filter(option => option.value !== "custom");
 		}
-		let description = def.description;
+		let description =
+			def.path === "ui.language" ? uiString(language, "settings.language.description") : def.description;
 		if (def.path === "pet.mode") {
 			currentValue = resolvePetMode(currentValue);
 			const petAvailable = this.context.petAvailable ?? isPetAvailable();
@@ -1107,7 +1109,7 @@ export class SettingsSelectorComponent extends Container {
 		const getPreview = isThemeSetting ? this.callbacks.getStatusLinePreview : undefined;
 
 		return new SelectSubmenu(
-			def.label,
+			title,
 			description,
 			options,
 			currentValue,
