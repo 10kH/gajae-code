@@ -179,6 +179,55 @@ test("ACP provider readiness rebinds expired reverse leases on the live attachme
 	}
 });
 
+test("ACP provider rebind observes lease_expired through the Router event wrapper (#4909)", async () => {
+	const registrations: Record<string, unknown>[] = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations.push(frame);
+				return {
+					ok: true,
+					result: { leaseId: typeof frame.expectedLeaseId === "string" ? frame.expectedLeaseId : "lease-1" },
+				};
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await adapter.start();
+		expect(registrations).toHaveLength(1);
+		adapter.acceptFrame({
+			type: "event",
+			payload: {
+				type: "reverse_response",
+				id: "",
+				connectionId: "router-connection-1",
+				leaseId: "lease-1",
+				ok: false,
+				error: { code: "lease_expired", message: "Lease expired." },
+			},
+		});
+		await waitFor(() => registrations.length === 2, "permission rebind after wrapped lease_expired");
+		expect(registrations[1]).toMatchObject({
+			type: "register_provider",
+			capability: "permission",
+			expectedLeaseId: "lease-1",
+		});
+	} finally {
+		await adapter.close();
+	}
+});
+
 test("ACP lease rebind does not abort in-flight reverse permission requests (#4909)", async () => {
 	const registrations: Record<string, unknown>[] = [];
 	const { promise: permissionStarted, resolve: resolvePermissionStarted } = Promise.withResolvers<
@@ -273,11 +322,14 @@ test("ACP provider rebind leaves a live foreign permission lease in place (#4909
 		providers: [{ capability: "permission", definitions: [] }],
 	});
 	try {
+		const reconnectFailures: Error[] = [];
+		adapter.onReconnectFailed(error => reconnectFailures.push(error));
 		await adapter.start();
 		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
 		await expect(adapter.ensureProviders()).resolves.toBeUndefined();
 		expect(registrations.length).toBeGreaterThanOrEqual(2);
 		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
+		expect(reconnectFailures).toEqual([]);
 	} finally {
 		await adapter.close();
 	}

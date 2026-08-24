@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { type SdkClient, SdkClientError } from "../client";
+
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
@@ -625,6 +627,8 @@ export class AcpSdkAdapter {
 
 	#reportReconnectFailure(error: unknown): void {
 		if (error instanceof SessionRouterError) return;
+		if (providerErrorCode(error) === "provider_lease_conflict") return;
+		if (error instanceof AcpSdkAdapterError) return;
 		const typed =
 			error instanceof SdkClientError
 				? error
@@ -674,6 +678,11 @@ export class AcpSdkAdapter {
 			for (const leaseId of this.#leases.values()) await this.#sendLeaseHeartbeat(leaseId);
 		} catch (error) {
 			if (error instanceof SessionRouterError && error.phase === "pre_send") return;
+			logger.warn(
+				`ACP provider lease heartbeat failed; rebinding reverse providers: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			);
 			this.#rebindExpiredProviders();
 		}
 	}
@@ -698,8 +707,9 @@ export class AcpSdkAdapter {
 		}
 
 		if (this.#expiredOwnedLeaseFrame(frame)) {
-			if (object(frame.error)?.code === "not_lease_owner") {
-				const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : "";
+			const response = this.#leaseErrorFrame(frame);
+			if (object(response?.error)?.code === "not_lease_owner") {
+				const leaseId = typeof response?.leaseId === "string" ? response.leaseId : "";
 				for (const [capability, id] of this.#leases) if (id === leaseId) this.#leases.delete(capability);
 			}
 			this.#rebindExpiredProviders();
@@ -782,11 +792,21 @@ export class AcpSdkAdapter {
 		return false;
 	}
 
+	#leaseErrorFrame(frame: Record<string, unknown>): Record<string, unknown> | undefined {
+		if (frame.type === "reverse_response") return frame;
+		if (frame.type === "event") {
+			const payload = object(frame.payload);
+			if (payload?.type === "reverse_response") return payload;
+		}
+		return undefined;
+	}
+
 	#expiredOwnedLeaseFrame(frame: Record<string, unknown>): boolean {
-		if (frame.type !== "reverse_response" || frame.ok !== false) return false;
-		const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : "";
+		const response = this.#leaseErrorFrame(frame);
+		if (!response || response.ok !== false) return false;
+		const leaseId = typeof response.leaseId === "string" ? response.leaseId : "";
 		if (!leaseId || !this.#ownsLeaseId(leaseId)) return false;
-		const code = object(frame.error)?.code;
+		const code = object(response.error)?.code;
 		return code === "lease_expired" || code === "not_lease_owner";
 	}
 

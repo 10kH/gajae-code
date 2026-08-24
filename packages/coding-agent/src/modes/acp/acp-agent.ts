@@ -642,6 +642,7 @@ const ROUTER_PASSTHROUGH_FRAME_TYPES = new Set([
 	"hello",
 	"server_hello",
 	"reverse_request",
+	"reverse_response",
 	"reverse_cancel",
 	"reverse_request_cancel",
 	"reverse_request_cancelled",
