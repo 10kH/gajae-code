@@ -1689,6 +1689,21 @@ describe("InputController availability-gated navigation palette entries", () => 
 		(ctx.keybindings as unknown as { formatKeyHint(key: string): string }).formatKeyHint = key => key;
 	}
 
+	// Literal product contract, deliberately NOT derived from the production list:
+	// importing that list would make this test pass even if an id were dropped.
+	const EXPECTED_GATED_NAV_IDS = [
+		"app.session.dashboard",
+		"app.transcript.browse",
+		"app.transcript.prevTurn",
+		"app.transcript.nextTurn",
+		"app.queue.togglePane",
+		"app.message.sendNow",
+	] as const;
+
+	it("gates exactly the six documented navigation ids", () => {
+		expect([...AVAILABILITY_GATED_NAV_PALETTE_ACTIONS].sort()).toEqual([...EXPECTED_GATED_NAV_IDS].sort());
+	});
+
 	it("lists every gated navigation id once its predicate holds", () => {
 		const { ctx, editor } = createContext();
 		(ctx.session as { isStreaming: boolean }).isStreaming = true;
@@ -1697,7 +1712,7 @@ describe("InputController availability-gated navigation palette entries", () => 
 
 		const ids = listPalette(ctx).map(action => action.id);
 
-		for (const id of AVAILABILITY_GATED_NAV_PALETTE_ACTIONS) {
+		for (const id of EXPECTED_GATED_NAV_IDS) {
 			expect(ids).toContain(id);
 		}
 	});
@@ -1846,7 +1861,7 @@ describe("InputController availability-gated navigation palette entries", () => 
 	});
 
 	describe("sendNow draft semantics", () => {
-		function streamingContextWithDraft(): ReturnType<typeof createContext> {
+		function streamingContextWithDraft() {
 			const created = createContext();
 			(created.ctx.session as { isStreaming: boolean }).isStreaming = true;
 			created.editor.setText("  the draft  ");

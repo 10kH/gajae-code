@@ -640,11 +640,6 @@ describe("status line overflow cue geometry", () => {
 	});
 
 	it("keeps the count exact rather than approximating it as the rail widens", () => {
-		// A two-digit omitted count is not reachable through the public segment
-		// surface here: segments with no value are never collected, so this preset
-		// tops out below ten. The ladder's degrade-when-it-cannot-fit behavior is
-		// therefore pinned by the one- and two-column cases above; this asserts the
-		// count is a real exact figure and never a rounded or truncated one.
 		const rendered = buildWide(1).render(40);
 
 		const match = strip(rendered.join("")).match(/…\+(\d+)/);
@@ -652,6 +647,44 @@ describe("status line overflow cue geometry", () => {
 		expect(Number(match?.[1])).toBeGreaterThan(0);
 		expect(match?.[1]).not.toMatch(/^0/);
 		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(40);
+	});
+
+	// Repeating a visible segment is the reachable route to a two-digit count:
+	// segment arrays are unconstrained and collection preserves every occurrence.
+	function buildRepeated(maxRows: number, count: number): StatusLineComponent {
+		const component = new StatusLineComponent(createStatusLineSession("S"), { version: "9.9.9" });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae"],
+			rightSegments: Array.from({ length: count }, () => "session_name") as never,
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
+	it.each([
+		[1, 20, "…+12"],
+		[1, 30, "…+10"],
+		[2, 20, "…+7"],
+	] as const)("reports an exact known count (maxRows %i, width %i)", (maxRows, width, expected) => {
+		const rendered = buildRepeated(maxRows, 14).render(width);
+		const joined = strip(rendered.join(""));
+
+		// A known exact figure, including the two-digit cases, so an off-by-one or a
+		// stale count from the reservation passes cannot slip through.
+		expect(joined).toContain(expected);
+		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+	});
+
+	it("carries the two-digit count on the final row only in the multi-row path", () => {
+		const rendered = buildRepeated(2, 14).render(20);
+
+		expect(rendered.length).toBe(2);
+		expect(strip(rendered[0])).not.toContain("…+");
+		expect(strip(rendered[1])).toContain("…+7");
 	});
 
 	it("reports an exact count in the multi-row cutoff path", () => {

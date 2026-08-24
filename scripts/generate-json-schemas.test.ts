@@ -61,7 +61,9 @@ describe("generated JSON Schemas", () => {
 		expect(setting.ui?.tab).toBe("interaction");
 		expect(setting.ui?.label).toBe("Skip Startup Logo Animation");
 
-		const schema = configSchema() as any;
+		const schema = configSchema() as {
+			properties: { startup: { properties: Record<string, unknown> } };
+		};
 		expect(schema.properties.startup.properties.skipLogoAnimation).toMatchObject({
 			type: "boolean",
 			default: false,

@@ -2434,11 +2434,10 @@ describe("Editor component", () => {
 
 			it("leaves raw 0x08 as plain backspace on a non-Windows-Terminal host", () => {
 				// Raw 0x08 is ambiguous: Windows Terminal sends it for ctrl+backspace,
-				// other terminals for plain backspace. The WT branch is decided inside
-				// the native matcher, which snapshots the environment when the addon
-				// loads, so it cannot be simulated in-process; the explicit CSI-u case
-				// above is what proves the repair itself. This pins the safe default so
-				// the repair cannot start eating whole words on ordinary hosts.
+				// other terminals for plain backspace. `matchesKey` resolves it through
+				// the raw-backspace heuristic, which reads the environment on every
+				// call, so this pins the safe default: off Windows Terminal the byte
+				// must stay plain backspace and never start eating whole words.
 				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
 				delete process.env.WT_SESSION;
 

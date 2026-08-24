@@ -57,6 +57,23 @@ describe("application keybinding domains", () => {
 		for (const action of APP_ACTION_METADATA) expect(table).toContain(`\`${action.id}\``);
 	});
 
+	it("gates exactly the six documented navigation ids", () => {
+		// Literal contract: deriving this from the production list would let an
+		// accidentally removed id slip through unnoticed.
+		const expected: readonly AppKeybinding[] = [
+			"app.message.sendNow",
+			"app.queue.togglePane",
+			"app.session.dashboard",
+			"app.transcript.browse",
+			"app.transcript.nextTurn",
+			"app.transcript.prevTurn",
+		];
+		// Compare as plain strings: the production list's narrow union would
+		// otherwise drive inference and defeat the point of a literal expectation.
+		const asStrings = (ids: readonly AppKeybinding[]): string[] => [...ids].sort();
+		expect(asStrings(AVAILABILITY_GATED_NAV_PALETTE_ACTIONS)).toEqual(asStrings(expected));
+	});
+
 	it("keeps every availability-gated navigation palette id registered and default-free", () => {
 		for (const id of AVAILABILITY_GATED_NAV_PALETTE_ACTIONS) {
 			// A gated id must be a real registered action, or the palette would list
