@@ -60,11 +60,19 @@ Gajae-Code（`gjc`）は外付けのコーディングエージェントハー�
 **インストール** — Linux（x64/arm64）、macOS（arm64/x64）、Windows（x64）向けビルド済みバイナリ。Bun は不要です:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
 gjc
 ```
 
-Windows (PowerShell): `irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex`
+`main` をパイプすると可変のインストーラが実行されます。最新インストーラが必要なときだけ使ってください。
+
+Windows（PowerShell、タグ固定）:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
+```
 
 **初回利用** — プランを選んで出発:
 
@@ -84,7 +92,7 @@ gjc --tmux --worktree my-task      # リスクの高い作業向けの隔離ワ�
 gjc @screenshot.png "何を変えるべき？"   # 画像入力
 ```
 
-Nightly チャンネル: `curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly`。インストールマトリクス全体、Windows 設定、更新チャンネル、シェル補完: [docs/install.md](docs/install.md)。Bun が必要なのはソースからのビルドだけです。
+Nightly チャンネル: `sh gjc-install.sh --channel nightly`（上でダウンロードしたタグ付きインストーラ）。インストールマトリクス全体、Windows 設定、更新チャンネル、シェル補完: [docs/install.md](docs/install.md)。Bun が必要なのはソースからのビルドだけです。
 
 ---
 

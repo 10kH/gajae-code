@@ -60,11 +60,19 @@ Gajae-Code（`gjc`）是一个外置编码代理 harness：丢进任意仓库或
 **安装** — 提供 Linux（x64/arm64）、macOS（arm64/x64）、Windows（x64）预编译二进制。不需要 Bun：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
 gjc
 ```
 
-Windows (PowerShell): `irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex`
+从 `main` 管道执行会运行可变安装脚本。仅在需要最新安装器时使用。
+
+Windows（PowerShell，固定标签）：
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
+```
 
 **首次使用** — 选好订阅就出发：
 
@@ -84,7 +92,7 @@ gjc --tmux --worktree my-task      # 高风险工作用隔离 worktree
 gjc @screenshot.png "该改什么？"      # 图片输入
 ```
 
-Nightly 渠道：`curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly`。完整安装矩阵、Windows 设置、更新渠道与 shell 补全：[docs/install.md](docs/install.md)。Bun 仅用于从源码构建。
+Nightly 渠道：`sh gjc-install.sh --channel nightly`（使用上面下载的 tagged 安装器）。完整安装矩阵、Windows 设置、更新渠道与 shell 补全：[docs/install.md](docs/install.md)。Bun 仅用于从源码构建。
 
 ---
 

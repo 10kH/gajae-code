@@ -95,7 +95,7 @@ gjc --tmux --worktree my-task      # isolated worktree for risky work
 gjc @screenshot.png "What should I change?"   # image input
 ```
 
-Nightly channel: `curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly`. Full install matrix, Windows setup, update channels, and shell completion: [docs/install.md](docs/install.md). Bun is only needed to build from source.
+Nightly channel: `sh gjc-install.sh --channel nightly` (use the tagged installer downloaded above). Full install matrix, Windows setup, update channels, and shell completion: [docs/install.md](docs/install.md). Bun is only needed to build from source.
 
 ---
 

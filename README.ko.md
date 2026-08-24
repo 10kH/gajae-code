@@ -61,11 +61,19 @@ Gajae-Code(`gjc`)는 외부 코딩 에이전트 하네스입니다. 아무 저�
 **설치** — Linux(x64/arm64), macOS(arm64/x64), Windows(x64) 프리빌드 바이너리. Bun은 필요 없습니다:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
 gjc
 ```
 
-Windows (PowerShell): `irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex`
+`main`을 파이프하면 변경 가능한 설치 스크립트가 실행됩니다. 최신 설치기가 필요할 때만 사용하세요.
+
+Windows (PowerShell, 태그 고정):
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
+```
 
 **첫 실행** — 플랜 고르고 바로 시작:
 
@@ -85,7 +93,7 @@ gjc --tmux --worktree my-task      # 위험한 작업을 위한 격리 워크트
 gjc @screenshot.png "뭘 바꿔야 할까?"   # 이미지 입력
 ```
 
-나이틀리 채널: `curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly`. 전체 설치 매트릭스, Windows 설정, 업데이트 채널, 셸 자동완성: [docs/install.md](docs/install.md). Bun은 소스 빌드에만 필요합니다.
+나이틀리 채널: `sh gjc-install.sh --channel nightly` (위에서 받은 태그 설치기). 전체 설치 매트릭스, Windows 설정, 업데이트 채널, 셸 자동완성: [docs/install.md](docs/install.md). Bun은 소스 빌드에만 필요합니다.
 
 **한국어 실행 명령어** — `가재씨`는 패키지 매니저 설치에서 `gjc`와 함께 제공되는 별칭입니다. 독립 바이너리 설치는 `gjc`만 제공합니다:
 
