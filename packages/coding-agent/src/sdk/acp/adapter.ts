@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { logger } from "@gajae-code/utils";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { type SdkClient, SdkClientError } from "../client";
+
 import type { AbortScope } from "../host/control/operations";
 import { assertReverseResponseFrame, ReverseLeaseError } from "../host/reverse-leases";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";
@@ -12,6 +14,12 @@ import type { SessionLifecycleMcpServer } from "./mcp";
 type JsonObject = Record<string, unknown>;
 function object(value: unknown): JsonObject | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
+}
+
+function providerErrorCode(error: unknown): string | undefined {
+	if (error instanceof AcpSdkAdapterError || error instanceof SdkClientError || error instanceof ReverseLeaseError)
+		return error.code;
+	return undefined;
 }
 
 /** The small agent-side ACP surface used for reverse requests. */
@@ -102,6 +110,9 @@ type ReverseRequest = {
 	state: "pending" | "cancelled";
 	controller?: AbortController;
 	cancelTimer?: NodeJS.Timeout;
+	connectionId?: string;
+	capability?: string;
+	leaseId?: string;
 };
 
 export { ACP_SESSION_RECONNECT };
@@ -163,6 +174,8 @@ export class AcpSdkAdapter {
 	#leases = new Map<string, string>();
 	#reclaiming?: Promise<void>;
 	#providerActivation?: Promise<void>;
+	#ensuring?: Promise<void>;
+
 	#providersActivated = false;
 	#reverseRequests = new Map<string, ReverseRequest>();
 	#reconnectFailedHandlers = new Set<AcpReconnectFailedHandler>();
@@ -238,6 +251,26 @@ export class AcpSdkAdapter {
 		}
 		if (!attachment.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 		await this.#activateProviders();
+	}
+	/**
+	 * Re-register reverse providers on a live attachment without aborting in-flight
+	 * reverse RPCs. ACP session reuse and expired-lease recovery take this path
+	 * because `#providersActivated` otherwise leaves a dead permission lease in
+	 * place for the life of the session (#4909).
+	 */
+	async ensureProviders(): Promise<void> {
+		if (this.#closed || this.#providers.length === 0) return;
+		if (this.#ensuring) return await this.#ensuring;
+		const run = (async () => {
+			if (this.#closed) return;
+			await this.#activateProviders(true);
+		})();
+		this.#ensuring = run;
+		try {
+			await run;
+		} finally {
+			if (this.#ensuring === run) this.#ensuring = undefined;
+		}
 	}
 
 	acceptFrame(frame: Record<string, unknown>): void {
@@ -491,17 +524,48 @@ export class AcpSdkAdapter {
 		if (typeof result.leaseId !== "string")
 			throw new AcpSdkAdapterError("invalid_reverse_frame", "Provider registration omitted leaseId.");
 		this.#leases.set(provider.capability, result.leaseId);
+		if (previousLeaseId && previousLeaseId !== result.leaseId) this.#abortReverseForCapability(provider.capability);
 	}
 
-	async #activateProviders(): Promise<void> {
-		if (this.#providersActivated || this.#providers.length === 0) return;
-		if (this.#providerActivation) return await this.#providerActivation;
+	async #activateProviders(force = false): Promise<void> {
+		if (this.#providers.length === 0) return;
+		if (this.#providerActivation) {
+			await this.#providerActivation;
+			if (this.#closed) return;
+			if (!force && this.#providersActivated) return;
+		} else if (!force && this.#providersActivated) {
+			return;
+		}
+
 		const activation = (async () => {
 			for (;;) {
 				const attachment = this.#attachment;
 				const connectionId = attachment?.connectionId;
 				try {
-					for (const provider of this.#providers) await this.registerProvider(provider);
+					for (const provider of this.#providers) {
+						try {
+							await this.registerProvider(provider);
+						} catch (error) {
+							if (providerErrorCode(error) === "provider_lease_conflict") {
+								this.#leases.delete(provider.capability);
+								this.#abortReverseForCapability(provider.capability);
+								continue;
+							}
+
+							throw error;
+						}
+					}
+					const missing = this.#providers
+						.filter(provider => !this.#leases.has(provider.capability))
+						.map(provider => provider.capability);
+					if (missing.length > 0) {
+						this.#providersActivated = this.#leases.size > 0;
+						throw new AcpSdkAdapterError(
+							"provider_lease_conflict",
+							`Live foreign provider holds: ${missing.join(", ")}.`,
+						);
+					}
+
 					if (this.#router && (attachment !== this.#attachment || attachment?.connectionId !== connectionId)) {
 						this.#abortActiveReverseRequests();
 						this.#providersActivated = false;
@@ -583,14 +647,17 @@ export class AcpSdkAdapter {
 
 	#reportReconnectFailure(error: unknown): void {
 		if (error instanceof SessionRouterError) return;
+		if (providerErrorCode(error) === "provider_lease_conflict") return;
 		const typed =
 			error instanceof SdkClientError
 				? error
-				: new SdkClientError(
-						"reconnect_exhausted",
-						error instanceof Error ? error.message : "SDK reconnect failed.",
-						error,
-					);
+				: error instanceof AcpSdkAdapterError
+					? new SdkClientError("provider_rebind_failed", `${error.code}: ${error.message}`, error)
+					: new SdkClientError(
+							"reconnect_exhausted",
+							error instanceof Error ? error.message : "SDK reconnect failed.",
+							error,
+						);
 		for (const handler of this.#reconnectFailedHandlers) handler(typed);
 	}
 
@@ -632,7 +699,11 @@ export class AcpSdkAdapter {
 			for (const leaseId of this.#leases.values()) await this.#sendLeaseHeartbeat(leaseId);
 		} catch (error) {
 			if (error instanceof SessionRouterError && error.phase === "pre_send") return;
-			this.#reportReconnectFailure(error);
+			logger.warn(
+				`ACP provider lease heartbeat failed; rebinding reverse providers (${providerErrorCode(error) ?? "unknown"})`,
+			);
+
+			this.#rebindExpiredProviders();
 		}
 	}
 
@@ -655,6 +726,21 @@ export class AcpSdkAdapter {
 			return;
 		}
 
+		if (this.#expiredOwnedLeaseFrame(frame)) {
+			const response = this.#leaseErrorFrame(frame);
+			if (object(response?.error)?.code === "not_lease_owner") {
+				const leaseId = typeof response?.leaseId === "string" ? response.leaseId : "";
+				for (const [capability, id] of this.#leases) {
+					if (id === leaseId) {
+						this.#leases.delete(capability);
+						this.#abortReverseForCapability(capability);
+					}
+				}
+			}
+			this.#rebindExpiredProviders();
+			return;
+		}
+
 		if (frame.type !== "reverse_request" || !this.#router) return;
 		const id = typeof frame.id === "string" ? frame.id : "";
 		const connectionId = typeof frame.connectionId === "string" ? frame.connectionId : "";
@@ -674,7 +760,8 @@ export class AcpSdkAdapter {
 		}
 		if (!this.#ownsReverseLease(connectionId, capability, leaseId)) return;
 		const controller = new AbortController();
-		const active: ReverseRequest = { state: "pending", controller };
+		const active: ReverseRequest = { state: "pending", controller, connectionId, capability, leaseId };
+
 		this.#reverseRequests.set(id, active);
 		try {
 			const request = frame.payload as JsonObject | undefined;
@@ -725,6 +812,35 @@ export class AcpSdkAdapter {
 		);
 	}
 
+	#ownsLeaseId(leaseId: string): boolean {
+		for (const id of this.#leases.values()) if (id === leaseId) return true;
+		return false;
+	}
+
+	#leaseErrorFrame(frame: Record<string, unknown>): Record<string, unknown> | undefined {
+		if (frame.type === "reverse_response") return frame;
+		if (frame.type === "event") {
+			const payload = object(frame.payload);
+			if (payload?.type === "reverse_response") return payload;
+		}
+		return undefined;
+	}
+
+	#expiredOwnedLeaseFrame(frame: Record<string, unknown>): boolean {
+		const response = this.#leaseErrorFrame(frame);
+		if (!response || response.ok !== false) return false;
+		const leaseId = typeof response.leaseId === "string" ? response.leaseId : "";
+		const connectionId = typeof response.connectionId === "string" ? response.connectionId : "";
+		if (!leaseId || !this.#ownsLeaseId(leaseId)) return false;
+		if (!this.#connectionId || connectionId !== this.#connectionId) return false;
+		const code = object(response.error)?.code;
+		return code === "lease_expired" || code === "not_lease_owner";
+	}
+
+	#rebindExpiredProviders(): void {
+		void this.ensureProviders().catch(error => this.#reportReconnectFailure(error));
+	}
+
 	#canRespondToReverse(
 		id: string,
 		request: ReverseRequest,
@@ -732,11 +848,36 @@ export class AcpSdkAdapter {
 		capability: string,
 		leaseId: string,
 	): boolean {
+		// Respond only for the currently owned lease id. A same-owner rebind that
+		// rotates the id aborts captured requests in registerProvider.
 		return (
 			this.#reverseRequests.get(id) === request &&
 			request.state === "pending" &&
-			this.#ownsReverseLease(connectionId, capability, leaseId)
+			this.#router !== undefined &&
+			this.#connectionId === request.connectionId &&
+			request.connectionId === connectionId &&
+			request.capability === capability &&
+			request.leaseId === leaseId &&
+			this.#leases.get(capability) === leaseId
 		);
+	}
+
+	#abortReverseForCapability(capability: string): void {
+		for (const [id, request] of [...this.#reverseRequests]) {
+			if (request.capability !== capability) continue;
+			const connectionId = request.connectionId;
+			const leaseId = request.leaseId;
+			this.#cancelReverse(id);
+			if (typeof connectionId !== "string" || typeof leaseId !== "string") continue;
+			void this.#sendSession({
+				type: "reverse_response",
+				id,
+				connectionId,
+				leaseId,
+				ok: false,
+				error: { code: "provider_disconnected", message: "Reverse provider lease was replaced." },
+			}).catch(() => {});
+		}
 	}
 
 	#cancelReverse(id: string): void {

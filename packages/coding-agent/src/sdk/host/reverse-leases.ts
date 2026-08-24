@@ -148,6 +148,13 @@ export class ReverseLeaseRuntime {
 			existing?.active !== false && existing?.connectionId === connectionId && existing.expiresAt > now;
 		if (existing && !reclaiming && !refreshing && existing.connectionId !== connectionId && existing.expiresAt > now)
 			throw new ReverseLeaseError("provider_lease_conflict");
+		if (refreshing && canonicalJson(existing!.definitions) === canonicalJson(definitions)) {
+			existing!.expiresAt = now + this.#leaseTtlMs;
+			existing!.graceUntil = undefined;
+			existing!.active = true;
+			if (idempotencyKey) this.#idempotency.set(key, { fingerprint, lease: existing! });
+			return { ...existing! };
+		}
 		this.#installDefinitionsFor(capability, definitions);
 		const lease: ProviderLease = {
 			leaseId: reclaiming || refreshing ? existing!.leaseId : randomUUID(),

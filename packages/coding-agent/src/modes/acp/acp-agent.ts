@@ -104,6 +104,9 @@ const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
 	acknowledged: boolean;
+	/** True once turn.prompt / skill.invoke has been sent; cancel must not fake-settle after this. */
+	dispatched: boolean;
+
 	/** Highest inbound frame sequence already observed when the prompt was acknowledged. */
 	boundary: number;
 	correlation: PromptCorrelation;
@@ -642,6 +645,7 @@ const ROUTER_PASSTHROUGH_FRAME_TYPES = new Set([
 	"hello",
 	"server_hello",
 	"reverse_request",
+	"reverse_response",
 	"reverse_cancel",
 	"reverse_request_cancel",
 	"reverse_request_cancelled",
@@ -1632,28 +1636,42 @@ export class AcpAgent implements Agent {
 					MAX_PROMPT_FRAME_BYTES / 1024,
 				)} KiB transport limit. Attach a smaller or more compressed image.`,
 			);
-		let waiter!: PromptWaiter;
-		const response = new Promise<PromptResponse>((resolve, reject) => {
-			waiter = {
-				acknowledged: false,
-				boundary: record.inboundSequence,
-				correlation: {},
-				emittedAssistantText: "",
-				settled: false,
-				deferredFrames: [],
-				deferredActivityFrames: [],
-				lastFrameAt: this.#promptWatchdogClock.now(),
-				lastFrameType: "prompt_dispatch",
-				activity: new PromptActivity(),
-				resolve,
-				reject,
-			};
-			record.activePrompt = waiter;
-		});
+		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
+		const waiter: PromptWaiter = {
+			acknowledged: false,
+			dispatched: false,
+			boundary: record.inboundSequence,
+			correlation: {},
+			emittedAssistantText: "",
+			settled: false,
+			deferredFrames: [],
+			deferredActivityFrames: [],
+			lastFrameAt: this.#promptWatchdogClock.now(),
+			lastFrameType: "prompt_dispatch",
+			activity: new PromptActivity(),
+			resolve,
+			reject,
+		};
+		record.activePrompt = waiter;
 		// The watchdog may reject this waiter while the SDK acknowledgement request is still
 		// pending. Retain the original promise for the caller, but mark that delayed rejection
 		// as observed until prompt() can resume and await it.
 		void response.catch(() => undefined);
+		try {
+			await record.adapter.ensureProviders();
+		} catch (error) {
+			if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+				if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+				return await response;
+			}
+			if (record.activePrompt === waiter) record.activePrompt = undefined;
+			throw error;
+		}
+		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
+
 		// Silence has to be bounded from the moment the prompt owns the session: a host that
 		// dies before it ever answers is exactly the failure that leaves the client running.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);
@@ -1674,13 +1692,21 @@ export class AcpAgent implements Agent {
 				record.adapter,
 			);
 		}
+		waiter.dispatched = true;
+		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
+
 		const acknowledgementTask = (async (): Promise<PromptResponse> => {
+			if (waiter.settled || record.activePrompt !== waiter) return await response;
 			const acknowledgement = skillInvocation
 				? await record.adapter.control("skill.invoke", skillInvocation)
 				: await record.adapter.prompt({
 						text: payload.text,
 						...(payload.images.length ? { images: payload.images } : {}),
 					});
+
 			const acknowledgementCorrelation = promptAcknowledgement(acknowledgement);
 			if (!acknowledgementCorrelation)
 				throw new AcpSdkAdapterError(
@@ -1863,6 +1889,11 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
+			if (waiter && !waiter.dispatched) {
+				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+				waiter.cancelAttemptResolve?.(true);
+				return;
+			}
 			if (!waiter) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
@@ -2060,6 +2091,7 @@ export class AcpAgent implements Agent {
 			// session host remains authoritative for its immutable configuration, so
 			// attachment must not reinterpret the replay as a mutation request.
 			this.#pendingDeleteLocators.delete(id);
+			await attached.adapter.ensureProviders();
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -2143,6 +2175,7 @@ export class AcpAgent implements Agent {
 		if (existing) {
 			if (path.resolve(existing.cwd) !== path.resolve(cwd))
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			await existing.adapter.ensureProviders();
 			return;
 		}
 		const attaching = this.#attaching.get(id);
@@ -2279,9 +2312,13 @@ export class AcpAgent implements Agent {
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
-		if (error instanceof SdkClientError && error.code !== "reconnect_exhausted") {
+		if (
+			error instanceof SdkClientError &&
+			error.code !== "reconnect_exhausted" &&
+			error.code !== "provider_rebind_failed"
+		) {
 			logger.warn(
-				`ACP session ${id} transport failure is not reconnect_exhausted (${error.code}); ignoring terminal recovery.`,
+				`ACP session ${id} transport failure is not recoverable (${error.code}); ignoring terminal recovery.`,
 			);
 			return;
 		}
