@@ -4391,7 +4391,7 @@ describe("ModelRegistry", () => {
 			expect(gemma?.reasoning).toBe(false);
 		});
 
-		test("keeps the newest same-provider discovery result when overlapping refreshes complete out of order", async () => {
+		test("serializes same-provider discovery refresh publication", async () => {
 			writeRawModelsJson({
 				race: {
 					baseUrl: "https://race.example.com/v1",
@@ -4419,7 +4419,9 @@ describe("ModelRegistry", () => {
 			const registry = new ModelRegistry(authStorage, modelsJsonPath);
 			const firstRefresh = registry.refreshProvider("race", "online");
 			await firstRequest.promise;
-			await registry.refreshProvider("race", "online");
+			const secondRefresh = registry.refreshProvider("race", "online");
+			await Bun.sleep(0);
+			expect(requests).toBe(1);
 			firstResponse.resolve(
 				new Response(JSON.stringify({ data: [{ id: "old-model" }] }), {
 					status: 200,
@@ -4427,6 +4429,7 @@ describe("ModelRegistry", () => {
 				}),
 			);
 			await firstRefresh;
+			await secondRefresh;
 
 			expect(registry.getProviderDiscoveryState("race")?.models).toEqual(["new-model"]);
 			expect(registry.find("race", "new-model")).toBeDefined();
@@ -4974,7 +4977,7 @@ describe("ModelRegistry", () => {
 				restoreLlamaKey();
 			}
 		});
-		test("newer optional-auth preflight state wins when overlapping refreshes finish out of order", async () => {
+		test("serializes optional-auth preflight refresh publication", async () => {
 			const restoreLlamaKey = unsetEnvForTest("LLAMA_CPP_API_KEY");
 			const restoreLlamaBaseUrl = unsetEnvForTest("LLAMA_CPP_BASE_URL");
 			try {
@@ -5000,14 +5003,13 @@ describe("ModelRegistry", () => {
 					while (credentialCalls < 1) await Bun.sleep(0);
 
 					const newerRefresh = registry.refreshProvider("llama.cpp", "offline");
-					while (credentialCalls < 2) await Bun.sleep(0);
-
-					newerCredential.resolve(undefined);
-					await newerRefresh;
-					expect(await registry.getApiKeyForProvider("llama.cpp")).toBe(kNoAuth);
-
+					await Bun.sleep(0);
+					expect(credentialCalls).toBe(1);
 					olderCredential.resolve("older-preflight-key");
 					await olderRefresh;
+					while (credentialCalls < 2) await Bun.sleep(0);
+					newerCredential.resolve(undefined);
+					await newerRefresh;
 					expect(await registry.getApiKeyForProvider("llama.cpp")).toBe(kNoAuth);
 				} finally {
 					credentialSpy.mockRestore();
@@ -7340,7 +7342,7 @@ describe("ModelRegistry", () => {
 				restore();
 			}
 		});
-		test("does not let a stale configured refresh clear newer credential evidence", async () => {
+		test("serializes configured refresh credential evidence publication", async () => {
 			writeRawModelsJson({
 				"discovery-provider": {
 					baseUrl: "https://discovery.example.com/v1",
@@ -7360,13 +7362,7 @@ describe("ModelRegistry", () => {
 			authStorage.setRuntimeApiKey("discovery-provider", "credential-b");
 			const newerRefresh = registry.refreshProvider("discovery-provider", "online");
 			await Bun.sleep(0);
-			resolveNewer(
-				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
-					status: 200,
-					headers: { "Content-Type": "application/json" },
-				}),
-			);
-			await newerRefresh;
+			expect(calls).toBe(1);
 			resolveOlder(
 				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
 					status: 200,
@@ -7374,6 +7370,14 @@ describe("ModelRegistry", () => {
 				}),
 			);
 			await olderRefresh;
+			while (calls < 2) await Bun.sleep(0);
+			resolveNewer(
+				new Response(JSON.stringify({ data: [{ id: "discovered-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				}),
+			);
+			await newerRefresh;
 
 			expect(activeRowsFor(registry, ["discovery-provider"])).toEqual([
 				{ provider: "discovery-provider", connectionKind: "credential" },
@@ -8218,7 +8222,7 @@ describe("ModelRegistry", () => {
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
 		});
-		test("does not let an older descriptor refresh overwrite a newer failed probe", async () => {
+		test("serializes descriptor discovery publication before a newer failed probe", async () => {
 			authStorage.setRuntimeApiKey("vllm", "fresh-vllm-key");
 			let calls = 0;
 			const { promise: olderResponse, resolve: resolveOlder } = Promise.withResolvers<Response>();
@@ -8230,8 +8234,6 @@ describe("ModelRegistry", () => {
 			await Bun.sleep(0);
 			const newerRefresh = registry.refreshProvider("vllm", "online");
 			await Bun.sleep(0);
-			resolveNewer(new Response("unavailable", { status: 503 }));
-			await newerRefresh;
 			resolveOlder(
 				new Response(JSON.stringify({ data: [{ id: "older-model" }] }), {
 					status: 200,
@@ -8239,7 +8241,12 @@ describe("ModelRegistry", () => {
 				}),
 			);
 			await olderRefresh;
-			expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).toEqual([]);
+			while (calls < 2) await Bun.sleep(0);
+			resolveNewer(new Response("unavailable", { status: 503 }));
+			await newerRefresh;
+			expect(readModelCache("vllm", 24 * 60 * 60 * 1000, Date.now, cacheDbPath)?.models).toEqual(
+				expect.arrayContaining([expect.objectContaining({ id: "older-model" })]),
+			);
 
 			expect(activeRowsFor(registry, ["vllm"])).toEqual([]);
 		});
