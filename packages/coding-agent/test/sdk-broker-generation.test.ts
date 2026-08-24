@@ -95,7 +95,10 @@ function standInBrokerProcess(): { pid: number; incarnation: string; kill: () =>
 	const child = spawn(process.execPath, ["-e", "await Bun.sleep(3_600_000)"], { stdio: "ignore" });
 	if (child.pid === undefined) throw new Error("stand-in broker pid unavailable");
 	const incarnation = brokerProcessIncarnation(child.pid);
-	if (!incarnation) throw new Error("stand-in broker incarnation unavailable");
+	if (!incarnation) {
+		child.kill("SIGKILL");
+		throw new Error("stand-in broker incarnation unavailable");
+	}
 	return {
 		pid: child.pid,
 		incarnation,

@@ -572,7 +572,7 @@ async function retireStaleBroker(
 			!sameBrokerAuthority(peeked, stale) ||
 			!isAuthorizedBrokerEndpoint(peeked)
 		)
-			return false;
+			return unstampedProcessGone(stale);
 	} else {
 		return false;
 	}
