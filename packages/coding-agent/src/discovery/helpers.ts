@@ -1074,7 +1074,8 @@ export async function resolveActiveProjectRegistryPath(
 		}
 	};
 	homeDir = await canonicalize(homeDir);
-	let dir = await canonicalize(cwd);
+	const canonicalCwd = await canonicalize(cwd);
+	let dir = canonicalCwd;
 	while (dir !== homeDir) {
 		try {
 			const stat = await fs.promises.stat(path.join(dir, getConfigDirName()));
@@ -1090,7 +1091,7 @@ export async function resolveActiveProjectRegistryPath(
 	}
 
 	// Pass 2: walk up looking for .git as a fallback anchor.
-	dir = path.resolve(cwd);
+	dir = canonicalCwd;
 	while (dir !== homeDir) {
 		try {
 			await fs.promises.stat(path.join(dir, ".git"));
