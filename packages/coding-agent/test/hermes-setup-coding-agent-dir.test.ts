@@ -129,6 +129,55 @@ describe("gjc setup hermes --coding-agent-dir", () => {
 		await runHermesSetup({ install: true, root: [root], profileDir });
 		expect((await readServerEnv(profileDir)).GJC_CODING_AGENT_DIR).toBe(agentNew);
 	});
+	it("does not preserve a foreign GJC_CODING_AGENT_DIR from an unmanaged block under --force", async () => {
+		const root = await freshRoot();
+		const configPath = path.join(root, "config.yaml");
+		await Bun.write(
+			configPath,
+			YAML.stringify({
+				mcp_servers: {
+					gjc_coordinator: {
+						command: "custom",
+						env: { GJC_CODING_AGENT_DIR: path.join(root, "foreign-agent") },
+					},
+				},
+			}),
+		);
+
+		await runHermesSetup({ install: true, force: true, root: [root], target: configPath });
+
+		const parsed = YAML.parse(await Bun.file(configPath).text()) as {
+			mcp_servers: Record<string, { env?: Record<string, string> }>;
+		};
+		// Preserve is scoped to blocks GJC signed itself; --force re-renders from
+		// flags alone instead of adopting an untrusted env value.
+		expect(parsed.mcp_servers.gjc_coordinator?.env?.GJC_CODING_AGENT_DIR).toBeUndefined();
+	});
+
+	it("refuses a tampered managed block instead of preserving the edited value", async () => {
+		const root = await freshRoot();
+		const profileDir = path.join(root, "profile");
+		await runHermesSetup({
+			install: true,
+			root: [root],
+			profileDir,
+			codingAgentDir: path.join(root, "agent-a"),
+		});
+		const configPath = path.join(profileDir, "config.yaml");
+		await Bun.write(
+			configPath,
+			(await Bun.file(configPath).text()).replace(
+				`GJC_CODING_AGENT_DIR: ${path.join(root, "agent-a")}`,
+				"GJC_CODING_AGENT_DIR: relative-injection",
+			),
+		);
+
+		await expect(runHermesSetup({ install: true, root: [root], profileDir })).rejects.toThrow(
+			"already exists and is not managed by GJC",
+		);
+		// Fail-closed: the refused install leaves the tampered bytes untouched.
+		expect(await Bun.file(configPath).text()).toContain("relative-injection");
+	});
 
 	it("normalizes the rendered value to an absolute resolved path", () => {
 		const root = "/tmp/gjc-hermes-abs";

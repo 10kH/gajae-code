@@ -444,7 +444,12 @@ function mergeHermesConfig(
 	// An operator-set GJC_CODING_AGENT_DIR in a managed block survives re-install
 	// unless --coding-agent-dir explicitly overrides it (issue #4879). The value
 	// stays out of the spec so the rendered signature remains flags-derived.
-	const preservedCodingAgentDir = spec.codingAgentDir ? undefined : readManagedCodingAgentDir(existingBlock);
+	// Preserve is scoped to GJC-managed blocks: a value we signed ourselves. An
+	// unmanaged block (--force) or a tampered one re-renders from flags alone.
+	const preservedCodingAgentDir =
+		spec.codingAgentDir || !serverBlockIsManaged(existingBlock)
+			? undefined
+			: readManagedCodingAgentDir(existingBlock);
 	return {
 		...existing,
 		mcp_servers: {
@@ -457,9 +462,9 @@ function mergeHermesConfig(
 }
 
 /**
- * Read the GJC_CODING_AGENT_DIR an earlier managed install rendered. Only a
- * managed block can carry one: unmanaged blocks already fail above unless
- * --force, and --force re-renders from flags alone.
+ * Read the GJC_CODING_AGENT_DIR a managed block carries. Callers gate on
+ * serverBlockIsManaged first, so only values GJC itself signed can be
+ * preserved; unmanaged or tampered blocks re-render from flags alone.
  */
 function readManagedCodingAgentDir(existingBlock: unknown): string | undefined {
 	if (!isRecord(existingBlock) || !isRecord(existingBlock.env)) return undefined;
