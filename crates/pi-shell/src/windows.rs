@@ -1,12 +1,16 @@
 use std::{
 	collections::HashSet,
 	env,
+	os::windows::process::CommandExt as _,
 	path::{Path, PathBuf},
 	process::Command,
 };
 
 use anyhow::{Error, Result};
-use brush_core::{Shell as BrushShell, ShellValue, ShellVariable};
+use brush_core::{
+	Shell as BrushShell, ShellValue, ShellVariable, commands::CommandWindowControlExt as _,
+};
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
 
 pub fn configure_windows_path(shell: &mut BrushShell) -> Result<()> {
@@ -133,7 +137,15 @@ fn query_git_install_path_from_registry() -> Option<String> {
 }
 
 fn query_git_install_path_from_where() -> Option<String> {
-	let output = Command::new("where").arg("git").output().ok()?;
+	let mut command = Command::new("where");
+	// Shell-session setup runs even when the host is a console-less ACP/GUI
+	// embedder (#4883); without this flag each probe would flash a visible
+	// console window. Same host-console-aware contract as external command
+	// spawns in brush-core: a console-attached host inherits unchanged.
+	if Command::host_is_consoleless() {
+		command.creation_flags(CREATE_NO_WINDOW);
+	}
+	let output = command.arg("git").output().ok()?;
 	if !output.status.success() {
 		return None;
 	}

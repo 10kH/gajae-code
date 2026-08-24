@@ -69,6 +69,25 @@ impl CommandFgControlExt for std::process::Command {
 	}
 }
 
+/// Extension trait for keeping child processes of a console-less host from
+/// allocating visible console windows (#4883). Console windows are a Windows
+/// concept; on Unix this is a no-op.
+pub trait CommandWindowControlExt {
+	/// Whether this process currently has no attached console (never true on
+	/// Unix).
+	fn host_is_consoleless() -> bool;
+
+	/// Applies the host-console-aware no-window creation flag (no-op on Unix).
+	fn suppress_console_window_if_host_consoleless(&mut self);
+}
+
+impl CommandWindowControlExt for std::process::Command {
+	fn host_is_consoleless() -> bool {
+		false
+	}
+	fn suppress_console_window_if_host_consoleless(&mut self) {}
+}
+
 /// Extension trait for detaching commands from the parent's controlling terminal.
 pub trait CommandSessionExt {
 	/// Arranges for the command to run in a new POSIX session with no controlling terminal.

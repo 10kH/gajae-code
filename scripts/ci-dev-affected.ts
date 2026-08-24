@@ -461,7 +461,26 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/utils/src/env.ts" ||
 		changedPath === "packages/utils/test/env-provenance.windows.test.ts" ||
 		changedPath === "packages/natives/native/loader-state.js" ||
-		changedPath === "scripts/host-detect.ts"
+		changedPath === "scripts/host-detect.ts" ||
+		// Rust shell-spawn surfaces cannot be executed on an Ubuntu shard; the
+		// hidden-console creation-flag contract is Windows-only, so route these
+		// to the windows-latest job (#4883).
+		changedPath === "crates/brush-core-vendored/src/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/windows/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/unix/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/stubs/commands.rs" ||
+		changedPath === "crates/pi-shell/src/shell.rs" ||
+		changedPath === "crates/pi-shell/src/lib.rs" ||
+		changedPath === "crates/pi-shell/src/windows.rs" ||
+		// These manifests supply the Windows-only APIs and crate wiring used by
+		// the hidden-console spawn path. A Linux shard cannot compile the cfg
+		// Windows imports, so dependency-only changes must still run the live
+		// windows-latest regression (#4883).
+		changedPath === "Cargo.toml" ||
+		changedPath === "Cargo.lock" ||
+		changedPath === "crates/brush-core-vendored/Cargo.toml" ||
+		changedPath === "crates/pi-shell/Cargo.toml" ||
+		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts"
 	);
 }
 

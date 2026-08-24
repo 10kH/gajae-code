@@ -1285,6 +1285,21 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/sdk/broker/lifecycle.ts",
 			"packages/coding-agent/src/commands/sdk.ts",
 			"packages/coding-agent/test/sdk-lifecycle-ready-then-exit.test.ts",
+			// #4883: the hidden-console creation-flag contract is Windows-only
+			// (CREATE_NO_WINDOW), so the rust shell-spawn surfaces route to the
+			// windows-latest job instead of a Linux shard.
+			"crates/brush-core-vendored/src/commands.rs",
+			"crates/brush-core-vendored/src/sys/windows/commands.rs",
+			"crates/brush-core-vendored/src/sys/unix/commands.rs",
+			"crates/brush-core-vendored/src/sys/stubs/commands.rs",
+			"crates/pi-shell/src/shell.rs",
+			"crates/pi-shell/src/lib.rs",
+			"crates/pi-shell/src/windows.rs",
+			"Cargo.toml",
+			"Cargo.lock",
+			"crates/brush-core-vendored/Cargo.toml",
+			"crates/pi-shell/Cargo.toml",
+			"packages/natives/test/windows-hidden-shell.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
