@@ -166,6 +166,33 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		}
 	}, 30_000);
 
+	it("re-seals a mixed plugin + conventional manager once the late conventional server settles", async () => {
+		await runMCPCommand({
+			action: "add",
+			name: "slow-demo",
+			commandArgs: [process.execPath, "-e", DELAYED_MCP_SERVER_SCRIPT],
+			flags: { project: true, timeout: 5_000 },
+			cwd: projectDir,
+		});
+
+		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
+		try {
+			expect(mcpManager).toBeDefined();
+			// The conventional server is still inside its declared startup window,
+			// so publication is armed and the plugin contract cannot seal yet.
+			expect(mcpManager?.getConnectionStatus("slow-demo")).toBe("connecting");
+			// Drain publication via the session registry rather than a fixed sleep.
+			const deadline = Date.now() + 30_000;
+			while (!session.getAllToolNames().includes("mcp__slow_demo_late_hello")) {
+				if (Date.now() > deadline) throw new Error("late conventional tool was never published");
+				await Bun.sleep(100);
+			}
+			expect(mcpManager?.getConnectedServers()).toContain("slow-demo");
+		} finally {
+			await session.dispose();
+		}
+	}, 45_000);
+
 	it("opts out with enableMcpAutoload: false (CLI --no-mcp) without loading conventional registrations", async () => {
 		await runMCPCommand({
 			action: "add",

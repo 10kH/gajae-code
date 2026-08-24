@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Late conventional MCP connections publish into the active session registry through an ordered, failure-isolated chain: concurrent late snapshots can no longer interleave a stale tool list, one failed publication no longer kills every later one, and mixed plugin + conventional sessions re-seal the fixed connection set once the last conventional server settles instead of staying reloadable.
 - User skill discovery now follows the active `agentDir` profile, matching MCP and customization writers instead of silently reading the default home-relative profile. The bundled `deep-interview` trigger no longer claims explicit third-party Ouroboros commands.
 - Gajae Pet now stays reachable in tmux and image-protocol-free SSH clients through a bounded two-row text-cell rendering. The fallback derives conservative Block Elements from the active skin, uses truecolor when available and ANSI-256 otherwise, reserves no extra transcript rows, and retains the pixel renderer unchanged for supported Kitty, Sixel, and iTerm2 terminals (#4867).
 

@@ -2061,6 +2061,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const ownedConventionalMcpServerNames = new Set<string>();
 		let ownedConventionalMcpToolNames: string[] = [];
 		let publishOwnedConventionalMcpTools = false;
+		let ownedPluginServersConnected = false;
 		const notificationDebounceTimers = new Map<string, Timer>();
 		const wireMcpManagerCallbacks = (manager: MCPManager): void => {
 			manager.setOnPromptsChanged(serverName => {
@@ -2882,10 +2883,15 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							});
 						}
 						const connectedPluginNames = new Set(result.connectedServers.filter(name => pluginNames.has(name)));
-						const pendingConventionalNames = Object.keys(conventionalConfigs).filter(
-							name => owned.getConnectionStatus(name) === "connecting",
+						// Retain while any conventional server is still live: "connecting"
+						// covers the declared-timeout window, and a server that landed in
+						// "connected" inside the microtask between connectServers() resolving
+						// and this synchronous check must not be torn down either.
+						const unsettledConventionalNames = Object.keys(conventionalConfigs).filter(
+							name => owned.getConnectionStatus(name) !== "disconnected",
 						);
-						const retainOwnedManager = result.connectedServers.length > 0 || pendingConventionalNames.length > 0;
+						const retainOwnedManager =
+							result.connectedServers.length > 0 || unsettledConventionalNames.length > 0;
 						if (retainOwnedManager) {
 							mcpManager = owned;
 							ownsMcpManager = true;
@@ -2904,9 +2910,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								}
 							}
 							publishOwnedConventionalMcpTools = ownedConventionalMcpServerNames.size > 0;
+							ownedPluginServersConnected = connectedPluginNames.size > 0;
 							// Plugin-bundle connections are fixed for the session lifetime only
-							// when no conventional server is still connecting in the same manager.
-							if (connectedPluginNames.size > 0 && pendingConventionalNames.length === 0)
+							// when no conventional server is still connecting in the same manager;
+							// otherwise the seal is re-applied once they settle (below).
+							if (connectedPluginNames.size > 0 && unsettledConventionalNames.length === 0)
 								owned.sealConnectionSet();
 						} else {
 							try {
@@ -4332,24 +4340,44 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				// Late conventional connections can publish near-simultaneously.
 				// Serialize the swaps so an older snapshot cannot interleave with a
 				// newer one inside replaceNamedCustomTools and leave a stale list.
+				// Each link swallows (and logs) its own failure so one bad
+				// publication cannot kill the chain for every later one.
 				let conventionalToolsSync: Promise<void> = Promise.resolve();
 				const syncConventionalTools = (tools: CustomTool[]): Promise<void> => {
-					conventionalToolsSync = conventionalToolsSync.then(async () => {
-						if (session.isDisposed) return;
-						const nextTools = tools.filter(tool =>
-							tool.mcpServerName ? ownedConventionalMcpServerNames.has(tool.mcpServerName) : false,
-						);
-						const previousNames = ownedConventionalMcpToolNames;
-						ownedConventionalMcpToolNames = nextTools.map(tool => tool.name);
-						const previousSet = new Set(previousNames);
-						cwdCapturingToolNames.splice(
-							0,
-							cwdCapturingToolNames.length,
-							...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
-							...ownedConventionalMcpToolNames,
-						);
-						await session.replaceNamedCustomTools(previousNames, nextTools);
-					});
+					conventionalToolsSync = conventionalToolsSync
+						.then(async () => {
+							if (session.isDisposed) return;
+							const nextTools = tools.filter(tool =>
+								tool.mcpServerName ? ownedConventionalMcpServerNames.has(tool.mcpServerName) : false,
+							);
+							const previousNames = ownedConventionalMcpToolNames;
+							ownedConventionalMcpToolNames = nextTools.map(tool => tool.name);
+							const previousSet = new Set(previousNames);
+							cwdCapturingToolNames.splice(
+								0,
+								cwdCapturingToolNames.length,
+								...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
+								...ownedConventionalMcpToolNames,
+							);
+							await session.replaceNamedCustomTools(previousNames, nextTools);
+							// Mixed plugin + conventional sessions deferred the seal while
+							// a conventional server was still connecting; restore the
+							// fixed-connection plugin contract once every conventional
+							// server has reached a terminal state.
+							if (
+								ownedPluginServersConnected &&
+								mcpManager !== undefined &&
+								!mcpManager.isConnectionSetSealed() &&
+								![...ownedConventionalMcpServerNames].some(
+									name => mcpManager?.getConnectionStatus(name) === "connecting",
+								)
+							) {
+								mcpManager.sealConnectionSet();
+							}
+						})
+						.catch(error => {
+							logger.warn("Failed to publish conventional MCP tools", { error: safeErrorForLog(error) });
+						});
 					return conventionalToolsSync;
 				};
 				mcpManager.setOnToolsChanged(tools => {
