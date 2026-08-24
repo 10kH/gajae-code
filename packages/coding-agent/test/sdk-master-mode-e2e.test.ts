@@ -59,9 +59,16 @@ function substrateFake(counters: { launches: number; closes: number }) {
 
 function promptLayerFake(counters: { dispatches: number }) {
 	return {
-		awaitRegistration: async (input: { childId: string }) => ({
+		awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
 			ok: true as const,
-			registration: { sessionId: input.childId, endpointGeneration: 1, pid: 4321 },
+			registration: {
+				sessionId: input.childId,
+				endpointGeneration: 1,
+				pid: 4321,
+				processIncarnation: "inc-4321",
+				cwd: input.cwd,
+				stateRoot: input.stateRoot,
+			},
 		}),
 		dispatch: async () => {
 			counters.dispatches += 1;

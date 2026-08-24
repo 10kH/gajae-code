@@ -301,14 +301,15 @@ type SpawnInFlight = {
 	phase?: SpawnClaimV2["state"];
 };
 
+/** Complete five-leg child endpoint pin captured at registration. */
 export type SpawnHostRegistration = {
 	sessionId: string;
 	endpointGeneration: number;
 	pid: number;
-	processIncarnation?: string;
+	processIncarnation: string;
 	/** Workspace the child was launched into; bound so a colliding pid elsewhere cannot pass. */
-	cwd?: string;
-	stateRoot?: string;
+	cwd: string;
+	stateRoot: string;
 };
 
 export type SpawnPromptDispatch =
@@ -336,12 +337,12 @@ export interface SpawnPromptLayer {
 		task: string;
 		clientRef: string;
 		/** Endpoint identity proven at registration; implementations must not talk to another endpoint. */
-		pinned?: SpawnHostRegistration;
+		pinned: SpawnHostRegistration;
 	}): Promise<SpawnPromptDispatch>;
 	reconcile(input: {
 		sessionId: string;
 		clientRef: string;
-		pinned?: SpawnHostRegistration;
+		pinned: SpawnHostRegistration;
 	}): Promise<SpawnQ26Reconciliation>;
 }
 
@@ -469,11 +470,8 @@ function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistratio
 	return (
 		candidate.endpointGeneration === pinned.endpointGeneration &&
 		candidate.pid === pinned.pid &&
-		pinned.processIncarnation !== undefined &&
 		(candidate.hostIncarnation ?? candidate.processIncarnation) === pinned.processIncarnation &&
-		pinned.cwd !== undefined &&
 		resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(pinned.cwd) &&
-		pinned.stateRoot !== undefined &&
 		resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(pinned.stateRoot)
 	);
 }
@@ -1368,13 +1366,9 @@ export class Broker {
 					...(proof.stateFileProof === undefined ? {} : { stateFileProof: proof.stateFileProof }),
 					endpointGeneration: registration.registration.endpointGeneration,
 					endpointPid: registration.registration.pid,
-					...(registration.registration.processIncarnation === undefined
-						? {}
-						: { endpointIncarnation: registration.registration.processIncarnation }),
-					...(registration.registration.cwd === undefined ? {} : { endpointCwd: registration.registration.cwd }),
-					...(registration.registration.stateRoot === undefined
-						? {}
-						: { endpointStateRoot: registration.registration.stateRoot }),
+					endpointIncarnation: registration.registration.processIncarnation,
+					endpointCwd: registration.registration.cwd,
+					endpointStateRoot: registration.registration.stateRoot,
 					closeState: "active",
 					createdAt: now,
 					updatedAt: now,
@@ -1439,6 +1433,9 @@ export class Broker {
 			}
 			const childId = current.childId;
 			const preparedSeed = current.seed;
+			// Dispatch without a complete pin must never consume the pre-send lease.
+			if (pinnedRegistration === undefined)
+				return error("terminal_uncertain", "session.spawn endpoint pin is unavailable before dispatch");
 			current = (
 				await store.persistTransition(lifecycleIdentity, {
 					claimId: current.claimId,
@@ -1454,7 +1451,7 @@ export class Broker {
 				sessionId: childId,
 				task: admission.task,
 				clientRef: preparedSeed.clientRef,
-				...(pinnedRegistration === undefined ? {} : { pinned: pinnedRegistration }),
+				pinned: pinnedRegistration,
 			});
 			if (dispatched.kind === "accepted") {
 				current = (
@@ -1731,17 +1728,21 @@ export class Broker {
 					);
 				if (row) {
 					const incarnation = row.hostIncarnation ?? row.processIncarnation;
-					return {
-						ok: true,
-						registration: {
-							sessionId: row.sessionId,
-							endpointGeneration: row.endpointGeneration,
-							pid: row.pid,
-							...(incarnation === undefined ? {} : { processIncarnation: incarnation }),
-							cwd: row.locator.cwd,
-							stateRoot: row.locator.stateRoot,
-						},
-					};
+					// An incarnation-less row is incomplete endpoint evidence; a partial pin
+					// previously just failed later at dispatch, so failing at registration keeps one boundary.
+					if (incarnation !== undefined) {
+						return {
+							ok: true,
+							registration: {
+								sessionId: row.sessionId,
+								endpointGeneration: row.endpointGeneration,
+								pid: row.pid,
+								processIncarnation: incarnation,
+								cwd: row.locator.cwd,
+								stateRoot: row.locator.stateRoot,
+							},
+						};
+					}
 				}
 			} catch {
 				// A transient index read failure only delays the poll.
@@ -1755,7 +1756,7 @@ export class Broker {
 	async #spawnChildExchange(input: {
 		sessionId: string;
 		/** Endpoint identity captured at registration; the exchange refuses to talk to anything else. */
-		pinned?: SpawnHostRegistration;
+		pinned: SpawnHostRegistration;
 		frame: (id: string) => Record<string, unknown>;
 		responseType: string;
 		timeoutMs: number;
@@ -1776,10 +1777,8 @@ export class Broker {
 						// replaced host or an alternate endpoint for the same id could
 						// receive the seed prompt or answer a Q26 reconciliation.
 						// Every pin leg is required. Identity fields alone collide across
-						// workspaces (pids are reused), so an absent leg is missing evidence
-						// rather than an unconstrained match. spawnPinFromAuthority only
-						// yields complete pins, so a caller-supplied partial pin is refused.
-						(input.pinned === undefined || matchesSpawnPin(candidate, input.pinned)),
+						// workspaces (pids are reused), so a complete pin is required evidence.
+						matchesSpawnPin(candidate, input.pinned),
 				);
 		} catch {
 			row = undefined;
@@ -1841,11 +1840,11 @@ export class Broker {
 		sessionId: string;
 		task: string;
 		clientRef: string;
-		pinned?: SpawnHostRegistration;
+		pinned: SpawnHostRegistration;
 	}): Promise<SpawnPromptDispatch> {
 		const exchange = await this.#spawnChildExchange({
 			sessionId: input.sessionId,
-			...(input.pinned === undefined ? {} : { pinned: input.pinned }),
+			pinned: input.pinned,
 			frame: id => ({
 				type: "control_request",
 				id,
@@ -1871,11 +1870,11 @@ export class Broker {
 	async #reconcileSpawnPrompt(input: {
 		sessionId: string;
 		clientRef: string;
-		pinned?: SpawnHostRegistration;
+		pinned: SpawnHostRegistration;
 	}): Promise<SpawnQ26Reconciliation> {
 		const exchange = await this.#spawnChildExchange({
 			sessionId: input.sessionId,
-			...(input.pinned === undefined ? {} : { pinned: input.pinned }),
+			pinned: input.pinned,
 			frame: id => ({
 				type: "query_request",
 				id,

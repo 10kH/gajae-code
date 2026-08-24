@@ -87,9 +87,16 @@ const spawnSubstrateFake = {
 	close: async () => ({ ok: true }),
 };
 const spawnPromptLayerFake = {
-	awaitRegistration: async (input: { childId: string }) => ({
+	awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
 		ok: true as const,
-		registration: { sessionId: input.childId, endpointGeneration: 1, pid: 4242 },
+		registration: {
+			sessionId: input.childId,
+			endpointGeneration: 1,
+			pid: 4242,
+			processIncarnation: "inc-4242",
+			cwd: input.cwd,
+			stateRoot: input.stateRoot,
+		},
 	}),
 	dispatch: async () => ({ kind: "accepted" as const, commandId: "cmd-1", turnId: "turn-1", acceptedAt: Date.now() }),
 	reconcile: async () => ({ status: "terminal_ok" as const, commandId: "cmd-1", turnId: "turn-1" }),

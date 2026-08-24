@@ -25,9 +25,16 @@ const spawnSubstrateFake = {
 	close: async () => ({ ok: true }),
 };
 const spawnPromptLayerFake = {
-	awaitRegistration: async (input: { childId: string }) => ({
+	awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
 		ok: true as const,
-		registration: { sessionId: input.childId, endpointGeneration: 1, pid: 4242 },
+		registration: {
+			sessionId: input.childId,
+			endpointGeneration: 1,
+			pid: 4242,
+			processIncarnation: "inc-4242",
+			cwd: input.cwd,
+			stateRoot: input.stateRoot,
+		},
 	}),
 	dispatch: async () => ({ kind: "accepted" as const, commandId: "cmd-1", turnId: "turn-1", acceptedAt: Date.now() }),
 	reconcile: async () => ({ status: "terminal_ok" as const, commandId: "cmd-1", turnId: "turn-1" }),
@@ -263,9 +270,16 @@ describe("Broker spawn flow driver", () => {
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
-				awaitRegistration: async (input: { childId: string }) => ({
+				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
 					ok: true as const,
-					registration: { sessionId: input.childId, endpointGeneration: 1, pid: 999 },
+					registration: {
+						sessionId: input.childId,
+						endpointGeneration: 1,
+						pid: 999,
+						processIncarnation: "inc-999",
+						cwd: input.cwd,
+						stateRoot: input.stateRoot,
+					},
 				}),
 				dispatch: async () => {
 					observed.dispatches += 1;
@@ -324,9 +338,16 @@ describe("Broker spawn flow driver", () => {
 				close: async () => ({ ok: true }),
 			},
 			spawnPromptLayer: {
-				awaitRegistration: async (input: { childId: string }) => ({
+				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
 					ok: true as const,
-					registration: { sessionId: input.childId, endpointGeneration: 1, pid: 998 },
+					registration: {
+						sessionId: input.childId,
+						endpointGeneration: 1,
+						pid: 998,
+						processIncarnation: "inc-998",
+						cwd: input.cwd,
+						stateRoot: input.stateRoot,
+					},
 				}),
 				dispatch: async () => {
 					dispatches += 1;
@@ -372,9 +393,16 @@ describe("Broker spawn flow driver", () => {
 				},
 			},
 			spawnPromptLayer: {
-				awaitRegistration: async (input: { childId: string }) => ({
+				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
 					ok: true as const,
-					registration: { sessionId: input.childId, endpointGeneration: 1, pid: 997 },
+					registration: {
+						sessionId: input.childId,
+						endpointGeneration: 1,
+						pid: 997,
+						processIncarnation: "inc-997",
+						cwd: input.cwd,
+						stateRoot: input.stateRoot,
+					},
 				}),
 				dispatch: async () => ({ kind: "pre_send_rejected" as const }),
 				reconcile: async () => ({ status: "unknown" as const }),
@@ -941,9 +969,16 @@ describe("Broker spawn close and orphan reaper", () => {
 		};
 	}
 	const promptLayer = {
-		awaitRegistration: async (input: { childId: string }) => ({
+		awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
 			ok: true as const,
-			registration: { sessionId: input.childId, endpointGeneration: 1, pid: 995 },
+			registration: {
+				sessionId: input.childId,
+				endpointGeneration: 1,
+				pid: 995,
+				processIncarnation: "inc-995",
+				cwd: input.cwd,
+				stateRoot: input.stateRoot,
+			},
 		}),
 		dispatch: async () => ({ kind: "accepted" as const, commandId: "cmd-close", turnId: "turn-close", acceptedAt: 5 }),
 		reconcile: async () => ({ status: "unknown" as const }),
@@ -1066,18 +1101,23 @@ describe("Broker spawn close and orphan reaper", () => {
 				processIncarnation: "inc-982",
 				endpointGeneration: 1,
 				endpointPid: 982,
+				endpointIncarnation: "inc-982",
+				endpointCwd: "/pinned/workspace-982",
+				endpointStateRoot: "/pinned/workspace-982/.gjc/state",
 				closeState: "active",
 				createdAt: at,
 				updatedAt: at,
 			},
 		});
 		await store.releaseOwner("recover-throw");
+		let verifyCalls = 0;
 		const broker = new Broker({
 			agentDir,
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: {
 				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
 				verify: async () => {
+					verifyCalls += 1;
 					throw new Error("verify transport failed");
 				},
 				close: async () => ({ ok: true }),
@@ -1094,6 +1134,7 @@ describe("Broker spawn close and orphan reaper", () => {
 			const reopened = new SpawnAuthorityStore(agentDir, brokerKey);
 			await reopened.open();
 			expect(reopened.claim("recover-throw")?.state).toBe("uncertain");
+			expect(verifyCalls).toBeGreaterThanOrEqual(1);
 		} finally {
 			await broker.stop();
 		}
@@ -1147,11 +1188,21 @@ describe("Broker spawn close and orphan reaper", () => {
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: provider({ verdict: "verified", closes: 0 }),
 			spawnPromptLayer: {
-				awaitRegistration: async input => {
+				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => {
 					// The launch locator must reach the matcher; a same-id row from an
 					// unrelated workspace must not satisfy this spawn.
 					registrations.push(input);
-					return { ok: true as const, registration: { sessionId: input.childId, endpointGeneration: 7, pid: 4242 } };
+					return {
+						ok: true as const,
+						registration: {
+							sessionId: input.childId,
+							endpointGeneration: 7,
+							pid: 4242,
+							processIncarnation: "inc-4242",
+							cwd: input.cwd,
+							stateRoot: input.stateRoot,
+						},
+					};
 				},
 				dispatch: async input => {
 					seen.pinned = input.pinned;
