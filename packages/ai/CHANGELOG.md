@@ -9,6 +9,7 @@
 ### Fixed
 
 - Direct model selections now retry zero-token empty OpenAI-compatible responses.
+- OpenAI-compatible chat streams now replay an exact `finish_reason: "network_error"` only when no text, reasoning, refusal, or tool-call delta has been exposed. Retries honor `streamMaxRetries`, exponential backoff, caller cancellation, and managed-fallback ownership; failed-attempt usage, cost, response IDs, and partial chunks are discarded while terminal error wording remains compatible (#4918).
 
 - Cursor `requestContext` rules now forward normalized system prompts, Cursor HTTP/2 transport honors standard proxy environment variables, and GPT effort siblings are sent as their base model with the corresponding reasoning parameter.
 - `AuthStorage.getEarliestUnblockAt(provider)` now exposes the earliest stored credential `blockedUntil` instant so quota exhaustion can report when a row becomes usable again without waiting for it (#4908).

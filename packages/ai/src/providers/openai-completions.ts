@@ -1,3 +1,4 @@
+import { scheduler } from "node:timers/promises";
 import { $credentialEnv, $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
 import type {
@@ -515,6 +516,26 @@ function getTrailingPartialDeepseekToken(text: string): string {
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
 const OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE = "Provider returned an empty response with zero token usage";
+const OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_MAX_RETRIES = 3;
+const OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_BASE_DELAY_MS = 2000;
+
+function hasReplayUnsafeOpenAICompletionsDelta(chunk: ChatCompletionChunk): boolean {
+	const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+	const delta = choice?.delta;
+	if (!delta) return false;
+	if (typeof delta.refusal === "string" && delta.refusal.length > 0) return true;
+	if (normalizeStreamingContentText(delta.content).length > 0) return true;
+	if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) return true;
+	return ["reasoning_content", "reasoning", "reasoning_text"].some(field => {
+		const value = (delta as Record<string, unknown>)[field];
+		return typeof value === "string" && value.length > 0;
+	});
+}
+
+function hasNetworkErrorFinishReason(chunk: ChatCompletionChunk): boolean {
+	const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+	return (choice?.finish_reason as string | null | undefined) === "network_error";
+}
 
 function isEmptyOpenAICompletionsResponse(
 	output: AssistantMessage,
@@ -678,6 +699,63 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				output.usage.premiumRequests = premiumRequestsTotal;
 			}
 			stream.push({ type: "start", partial: output });
+			const iterateAttempt = (attemptStream: AsyncIterable<ChatCompletionChunk>) =>
+				iterateWithIdleTimeout(attemptStream, {
+					firstItemTimeoutMs: firstEventTimeoutMs,
+					firstItemErrorMessage: OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE,
+					idleTimeoutMs,
+					errorMessage: "OpenAI completions stream stalled while waiting for the next event",
+					onIdle: () => requestAbortController.abort(),
+					onFirstItemTimeout: () => requestAbortController.abort(),
+					abortSignal: options?.signal,
+					isProgressItem: isOpenAICompletionsProgressChunk,
+				});
+			const iterateWithNetworkErrorRetry = async function* (): AsyncGenerator<ChatCompletionChunk> {
+				let attemptStream = openaiStream;
+				let retryAttempt = 0;
+				while (true) {
+					const replaySafeChunks: ChatCompletionChunk[] = [];
+					let replayUnsafe = false;
+					let retryNetworkError = false;
+					for await (const chunk of iterateAttempt(attemptStream)) {
+						if (!replayUnsafe && hasReplayUnsafeOpenAICompletionsDelta(chunk)) {
+							replayUnsafe = true;
+							for (const bufferedChunk of replaySafeChunks) yield bufferedChunk;
+							replaySafeChunks.length = 0;
+						}
+						if (replayUnsafe) {
+							yield chunk;
+							continue;
+						}
+						replaySafeChunks.push(chunk);
+						if (hasNetworkErrorFinishReason(chunk) && !options?.fallbackManaged) {
+							retryNetworkError = true;
+							break;
+						}
+					}
+
+					if (
+						!retryNetworkError ||
+						abortTracker.wasCallerAbort() ||
+						retryAttempt >=
+							resolveRetryBudget(options?.streamMaxRetries, OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_MAX_RETRIES)
+					) {
+						for (const bufferedChunk of replaySafeChunks) yield bufferedChunk;
+						return;
+					}
+
+					retryAttempt += 1;
+					const delayMs = OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_BASE_DELAY_MS * 2 ** (retryAttempt - 1);
+					if (options?.providerRetryWait) {
+						await options.providerRetryWait(delayMs, options.signal);
+					} else {
+						await scheduler.wait(delayMs, { signal: options?.signal });
+					}
+					if (abortTracker.wasCallerAbort()) throw new Error("Request was aborted");
+					attemptStream = await createCompletionsStream();
+					streamConnected = true;
+				}
+			};
 
 			const parseMiniMaxThinkTags = model.provider === "minimax-code" || model.provider === "minimax-code-cn";
 			// Some OpenAI-compatible DeepSeek hosts (including NVIDIA NIM and DeepSeek's
@@ -886,16 +964,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (errorMessage) output.errorMessage = errorMessage;
 			};
 
-			for await (const chunk of iterateWithIdleTimeout(openaiStream, {
-				firstItemTimeoutMs: firstEventTimeoutMs,
-				firstItemErrorMessage: OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE,
-				idleTimeoutMs,
-				errorMessage: "OpenAI completions stream stalled while waiting for the next event",
-				onIdle: () => requestAbortController.abort(),
-				onFirstItemTimeout: () => requestAbortController.abort(),
-				abortSignal: options?.signal,
-				isProgressItem: isOpenAICompletionsProgressChunk,
-			})) {
+			for await (const chunk of iterateWithNetworkErrorRetry()) {
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -2152,7 +2221,6 @@ function shouldRetryWithoutStrictTools(
 		.join("\n");
 	return /wrong_api_format|mixed values for 'strict'|tool[s]?\b.*strict|\bstrict\b.*tool/i.test(messageParts);
 }
-
 function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | string): {
 	stopReason: StopReason;
 	errorMessage?: string;
