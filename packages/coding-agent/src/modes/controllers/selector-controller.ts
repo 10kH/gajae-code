@@ -131,6 +131,15 @@ import {
 	type ImportableCredential,
 } from "../../setup/credential-import";
 import {
+	analyzeOnboardingEvidence,
+	createManualOnboardingProfile,
+	deriveOnboardingProfile,
+	discoverOnboardingRootPresence,
+	type OnboardingProfile,
+	shouldPersistCompletion,
+	writeOnboardingState,
+} from "../../setup/frictionless-onboarding";
+import {
 	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
 	MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND,
 	MODEL_ONBOARDING_SETUP_COMMAND,
@@ -159,6 +168,11 @@ import {
 import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "../components/custom-provider-wizard";
 import { CustomizationDashboard } from "../components/customization";
 import { ExtensionDashboard } from "../components/extensions";
+import {
+	FrictionlessOnboardingSelectorComponent,
+	type FrictionlessOnboardingStage,
+	getFrictionlessOnboardingCopy,
+} from "../components/frictionless-onboarding-selector";
 import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
 import { HookSelectorComponent } from "../components/hook-selector";
@@ -1438,15 +1452,10 @@ export class SelectorController {
 			const selector = new ProviderOnboardingSelectorComponent(
 				(action: ProviderOnboardingAction) => {
 					done();
-					if (action === "custom-provider-wizard") {
-						this.showCustomProviderWizard();
-					} else if (action === "oauth-login") {
-						void this.showOAuthSelector("login");
-					} else if (action === "import-credentials") {
-						void this.#handleCredentialImport();
-					} else {
-						this.ctx.showStatus(formatProviderOnboardingCommandGuide());
-					}
+					if (action === "custom-provider-wizard") this.showCustomProviderWizard();
+					else if (action === "oauth-login") void this.showOAuthSelector("login");
+					else if (action === "import-credentials") void this.#handleCredentialImport();
+					else this.ctx.showStatus(formatProviderOnboardingCommandGuide());
 				},
 				() => {
 					done();
@@ -1455,6 +1464,81 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector };
 		});
+	}
+
+	async showFrictionlessOnboarding(): Promise<void> {
+		const agentDir = this.ctx.session.getSessionAgentDir();
+		const presence = await discoverOnboardingRootPresence();
+		const initialProfile = deriveOnboardingProfile([], {
+			osLocale: Intl.DateTimeFormat().resolvedOptions().locale,
+		});
+
+		const open = (profile: OnboardingProfile, stage: FrictionlessOnboardingStage): void => {
+			const text = getFrictionlessOnboardingCopy(profile.language);
+			this.showSelector(done => {
+				const selector = new FrictionlessOnboardingSelectorComponent(
+					profile,
+					async action => {
+						if (action === "analyze") {
+							const evidence = await analyzeOnboardingEvidence(presence);
+							const analyzed = deriveOnboardingProfile(evidence, {
+								osLocale: Intl.DateTimeFormat().resolvedOptions().locale,
+							});
+							done();
+							open(analyzed, analyzed.operations?.length ? "preview" : "manual");
+							return;
+						}
+						if (action === "manual") {
+							done();
+							open(profile, "manual");
+							return;
+						}
+						const manualIntent =
+							action === "manual-migration" ? "migration" : action === "manual-learn" ? "commands" : undefined;
+						if (manualIntent) {
+							done();
+							open(createManualOnboardingProfile(profile.language, manualIntent), "preview");
+							return;
+						}
+						if (action === "apply") {
+							const operation = profile.operations?.[0];
+							const confirmed = await this.ctx.showHookConfirm(
+								text.confirmTitle,
+								profile.migrationMap.join("\n") || text.noChanges,
+							);
+							done();
+							if (!shouldPersistCompletion(operation, confirmed)) {
+								open(profile, "preview");
+								return;
+							}
+							this.ctx.handleHelpCommand();
+							const saved = await writeOnboardingState({ version: 1, decision: "completed", profile }, agentDir);
+							if (!saved) {
+								this.ctx.showError(text.persistFailed);
+								return;
+							}
+							this.ctx.showStatus(text.completed);
+							return;
+						}
+						if (action === "skip") {
+							const saved = await writeOnboardingState({ version: 1, decision: "skipped" }, agentDir);
+							if (saved) {
+								done();
+								this.ctx.showStatus(text.skipped);
+							} else this.ctx.showError(text.persistFailed);
+							return;
+						}
+						done();
+					},
+					done,
+					profile.language,
+					stage,
+				);
+				return { component: selector, focus: selector };
+			});
+		};
+
+		open(initialProfile, "disclosure");
 	}
 
 	async #handleCredentialImport(): Promise<void> {
