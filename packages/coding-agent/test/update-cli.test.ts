@@ -18,6 +18,7 @@ import {
 	parseReportedVersionForTest,
 	parseUpdateArgs,
 	replaceBinaryForUpdate,
+	resolveGjcPathForTest,
 	resolveNpmManagedTargetForTest,
 	resolveUpdateDecision,
 	resolveUpdateMethodForTest,
@@ -1168,6 +1169,7 @@ describe("update-cli release channels", () => {
 						seenChannels.push(options?.channel ?? "stable");
 						return { tag: "v0.0.1", version: "0.0.1", registry: DEFAULT_NPM_REGISTRY, warnings: [] };
 					},
+					resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
 				},
 			);
 			expect(seenChannels).toEqual(["stable"]);
@@ -1195,12 +1197,69 @@ describe("update-cli release channels", () => {
 						registry: DEFAULT_NPM_REGISTRY,
 						warnings: [],
 					}),
+					resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
 				},
 			);
 			expect(output.join("\n")).toContain("Already up to date");
 			expect(output.join("\n")).not.toContain("Forcing reinstall");
 		} finally {
 			logSpy.mockRestore();
+		}
+	});
+
+	it("prefers the compiled executable over PATH lookup", () => {
+		expect(
+			resolveGjcPathForTest({
+				compiled: true,
+				execPath: "/opt/gjc/gjc",
+				whichPath: "/usr/bin/gjc",
+			}),
+		).toBe(path.resolve("/opt/gjc/gjc"));
+		expect(
+			resolveGjcPathForTest({
+				compiled: false,
+				execPath: "/opt/gjc/gjc",
+				whichPath: "/usr/bin/gjc",
+			}),
+		).toBe("/usr/bin/gjc");
+	});
+
+	it("fails closed when the install target cannot be resolved", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => {
+			output.push(String(message));
+		});
+		try {
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					getLatestRelease: async () => ({
+						tag: "v0.15.0",
+						version: "0.15.0",
+						registry: DEFAULT_NPM_REGISTRY,
+						warnings: [],
+					}),
+					resolveUpdateTarget: async () => {
+						throw new Error(
+							"Current install at /home/alice/.local/bin/gjc is a package-manager shim in the default binary directory",
+						);
+					},
+					exit: ((code?: number) => {
+						throw new Error(`exit ${code ?? 0}`);
+					}) as typeof process.exit,
+				},
+			);
+			throw new Error("expected exit");
+		} catch (err) {
+			expect(String(err)).toContain("exit 1");
+			expect(output.join("\n")).toContain("package-manager shim in the default binary directory");
+			expect(output.join("\n")).not.toContain("Already up to date");
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
 		}
 	});
 });

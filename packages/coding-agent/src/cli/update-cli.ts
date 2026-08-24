@@ -9,7 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { $which, APP_NAME, isEnoent, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, isCompiledBinary, isEnoent, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
@@ -424,7 +424,17 @@ function getBinaryName(platform: NodeJS.Platform = process.platform, arch: strin
  * Resolve the path that `gjc` maps to in the user's PATH.
  */
 function resolveGjcPath(): string | undefined {
+	if (isCompiledBinary()) return path.resolve(process.execPath);
 	return $which(APP_NAME) ?? undefined;
+}
+
+export function resolveGjcPathForTest(options: {
+	compiled: boolean;
+	execPath: string;
+	whichPath: string | undefined;
+}): string | undefined {
+	if (options.compiled) return path.resolve(options.execPath);
+	return options.whichPath;
 }
 
 /**
@@ -1158,8 +1168,9 @@ export async function runUpdateCommand(
 	let target: UpdateTarget | undefined;
 	try {
 		target = await resolveTarget();
-	} catch {
-		target = undefined;
+	} catch (err) {
+		console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+		return exit(1);
 	}
 
 	let release: ReleaseInfo;
