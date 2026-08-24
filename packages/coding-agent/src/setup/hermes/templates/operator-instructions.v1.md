@@ -9,6 +9,7 @@ These instructions teach a Hermes-style coordinator how to operate GJC through t
 ## Core loop
 
 1. Use `{{TOOL_PREFIX}}_list_sessions` to find an existing session, or `{{TOOL_PREFIX}}_start_session` when a new session is required and mutation is enabled. Pass `worktree` with a name derived from the task (a ticket id works well) so this session gets its own checkout; see Worktree policy below.
+   `{{TOOL_PREFIX}}_list_sessions` enumerates every GJC session the broker discovered under the allowed roots, which is a superset of the ones this bridge can drive. Reuse only entries with `registered: true`; the other tools resolve a session through its coordinator projection and answer `not_found` for the rest, so iterating the list unfiltered spends a failed call per unregistered entry and can trip a controller's consecutive-failure breaker. To adopt an unregistered session deliberately, call `{{TOOL_PREFIX}}_register_session` first.
 2. Send exactly one bounded task prompt with `{{TOOL_PREFIX}}_send_prompt`.
 3. Store the returned `turn_id`.
 4. Prefer `{{TOOL_PREFIX}}_watch_events` with the stored `next_after_seq` for event-driven progress; fall back to `{{TOOL_PREFIX}}_read_turn` or `{{TOOL_PREFIX}}_await_turn` for a specific `turn_id` until terminal.
