@@ -78,6 +78,13 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 	}
 }
 
+// Broker `session.list` rows always carry a v2 locator: legacy shapes are
+// quarantined at index admission, so the CLI row projection rejects a row
+// without one instead of inventing a placeholder. Stubbed pages must therefore
+// look like real broker rows.
+const stubLocator = { cwd: "/stub/cwd", worktreeRoot: null, stateRoot: "/stub/cwd/.gjc/state" };
+const stubRow = (sessionId: string) => ({ sessionId, locator: stubLocator });
+
 describe("SDK session CLI", () => {
 	let root: string;
 	let agentDir: string;
@@ -1212,8 +1219,8 @@ describe("SDK session CLI", () => {
 			if (operation === "session.list") {
 				requests.push(input);
 				return input.cursor === undefined
-					? { ok: true, result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-2" } }
-					: { ok: true, result: { sessions: [{ sessionId: "page-two" }] } };
+					? { ok: true, result: { sessions: [stubRow("page-one")], continuationCursor: "page-2" } }
+					: { ok: true, result: { sessions: [stubRow("page-two")] } };
 			}
 			return await originalHandleRequest(operation, input, idempotencyKey);
 		};
@@ -1234,7 +1241,7 @@ describe("SDK session CLI", () => {
 			if (operation === "session.list") {
 				requests.push(input);
 				return input.cursor === undefined
-					? { ok: true, result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-2" } }
+					? { ok: true, result: { sessions: [stubRow("page-one")], continuationCursor: "page-2" } }
 					: { ok: false, error: { code: "continuation_failed", message: "page two failed" } };
 			}
 			return await originalHandleRequest(operation, input, idempotencyKey);
@@ -1256,7 +1263,7 @@ describe("SDK session CLI", () => {
 				requests.push(input);
 				return {
 					ok: true,
-					result: { sessions: [{ sessionId: "page" }], continuationCursor: "repeat" },
+					result: { sessions: [stubRow("page")], continuationCursor: "repeat" },
 				};
 			}
 			return await originalHandleRequest(operation, input, idempotencyKey);
@@ -1281,7 +1288,7 @@ describe("SDK session CLI", () => {
 			if (operation === "session.list") {
 				requests.push(input);
 				return input.cursor === undefined
-					? { ok: true, result: { sessions: [{ sessionId: "page-one" }], continuationCursor: "page-2" } }
+					? { ok: true, result: { sessions: [stubRow("page-one")], continuationCursor: "page-2" } }
 					: { ok: true, result: { sessions: "not-an-array" } };
 			}
 			return await originalHandleRequest(operation, input, idempotencyKey);
