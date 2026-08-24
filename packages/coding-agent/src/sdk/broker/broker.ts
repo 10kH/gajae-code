@@ -306,6 +306,9 @@ export type SpawnHostRegistration = {
 	endpointGeneration: number;
 	pid: number;
 	processIncarnation?: string;
+	/** Workspace the child was launched into; bound so a colliding pid elsewhere cannot pass. */
+	cwd?: string;
+	stateRoot?: string;
 };
 
 export type SpawnPromptDispatch =
@@ -426,6 +429,8 @@ function spawnPinFromAuthority(authority: SpawnAuthorityV1): SpawnHostRegistrati
 		endpointGeneration: authority.endpointGeneration,
 		pid: authority.endpointPid,
 		...(authority.endpointIncarnation === undefined ? {} : { processIncarnation: authority.endpointIncarnation }),
+		...(authority.endpointCwd === undefined ? {} : { cwd: authority.endpointCwd }),
+		...(authority.endpointStateRoot === undefined ? {} : { stateRoot: authority.endpointStateRoot }),
 	};
 }
 
@@ -1322,6 +1327,10 @@ export class Broker {
 					...(registration.registration.processIncarnation === undefined
 						? {}
 						: { endpointIncarnation: registration.registration.processIncarnation }),
+					...(registration.registration.cwd === undefined ? {} : { endpointCwd: registration.registration.cwd }),
+					...(registration.registration.stateRoot === undefined
+						? {}
+						: { endpointStateRoot: registration.registration.stateRoot }),
 					closeState: "active",
 					createdAt: now,
 					updatedAt: now,
@@ -1685,6 +1694,8 @@ export class Broker {
 							endpointGeneration: row.endpointGeneration,
 							pid: row.pid,
 							...(incarnation === undefined ? {} : { processIncarnation: incarnation }),
+							cwd: row.locator.cwd,
+							stateRoot: row.locator.stateRoot,
 						},
 					};
 				}
@@ -1724,7 +1735,15 @@ export class Broker {
 							(candidate.endpointGeneration === input.pinned.endpointGeneration &&
 								candidate.pid === input.pinned.pid &&
 								(input.pinned.processIncarnation === undefined ||
-									(candidate.hostIncarnation ?? candidate.processIncarnation) === input.pinned.processIncarnation))),
+									(candidate.hostIncarnation ?? candidate.processIncarnation) === input.pinned.processIncarnation) &&
+								// Identity fields alone can collide across workspaces (pids are
+								// reused), so the workspace the child was launched into is part
+								// of the pin.
+								(input.pinned.cwd === undefined ||
+									resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.pinned.cwd)) &&
+								(input.pinned.stateRoot === undefined ||
+									resolveEquivalentPath(candidate.locator.stateRoot) ===
+										resolveEquivalentPath(input.pinned.stateRoot)))),
 				);
 		} catch {
 			row = undefined;

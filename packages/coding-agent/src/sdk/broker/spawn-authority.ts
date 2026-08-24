@@ -103,6 +103,9 @@ export type SpawnAuthorityV1 = {
 	endpointGeneration?: number;
 	endpointPid?: number;
 	endpointIncarnation?: string;
+	/** Launch locator, so a colliding generation/pid in another workspace cannot pass. */
+	endpointCwd?: string;
+	endpointStateRoot?: string;
 	closeState: SpawnAuthorityCloseState;
 	orphanedAt?: number;
 	orphanRecoveredAt?: number;
@@ -235,6 +238,8 @@ const AUTHORITY_KEYS = new Set([
 	"endpointGeneration",
 	"endpointPid",
 	"endpointIncarnation",
+	"endpointCwd",
+	"endpointStateRoot",
 	"closeState",
 	"orphanedAt",
 	"orphanRecoveredAt",
@@ -369,6 +374,8 @@ export function isSpawnAuthorityV1(value: unknown): value is SpawnAuthorityV1 {
 		(authority.endpointGeneration === undefined || isNonNegativeInteger(authority.endpointGeneration)) &&
 		(authority.endpointPid === undefined || isPositiveInteger(authority.endpointPid)) &&
 		(authority.endpointIncarnation === undefined || isOpaque(authority.endpointIncarnation)) &&
+		(authority.endpointCwd === undefined || isOpaque(authority.endpointCwd)) &&
+		(authority.endpointStateRoot === undefined || isOpaque(authority.endpointStateRoot)) &&
 		(authority.nativeSessionId === undefined || isOpaque(authority.nativeSessionId)) &&
 		(authority.pid === undefined || isPositiveInteger(authority.pid)) &&
 		(authority.processIncarnation === undefined || isOpaque(authority.processIncarnation)) &&

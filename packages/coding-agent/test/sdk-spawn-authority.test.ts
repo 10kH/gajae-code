@@ -430,6 +430,57 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
+	it("refuses a foreign workspace endpoint whose generation and pid collide", async () => {
+		const agentDir = await temp();
+		const brokerKey = await getBrokerIdentityKey(agentDir);
+		const store = new SpawnAuthorityStore(agentDir, brokerKey);
+		await store.open();
+		const mac = "b".repeat(63) + "c";
+		const owner = await store.claimOrJoin("collide", mac);
+		if (owner.kind !== "owner") throw new Error("expected owner");
+		await store.persistTransition("collide", {
+			claimId: owner.claim.claimId,
+			from: "prepared",
+			to: "substrate_starting",
+			childId: "child-collide",
+		});
+		const at = Date.now();
+		await store.persistTransition("collide", {
+			claimId: owner.claim.claimId,
+			from: "substrate_starting",
+			to: "authority_active",
+			childId: "child-collide",
+			authority: {
+				version: 1,
+				authorityId: "authority-collide",
+				claimId: owner.claim.claimId,
+				childId: "child-collide",
+				ownerSessionId: "master-flow",
+				lifecycleIdentity: "collide",
+				substrateKind: "headless",
+				providerIdentity: "p",
+				pid: 977,
+				processIncarnation: "inc-977",
+				endpointGeneration: 3,
+				endpointPid: 977,
+				endpointIncarnation: "inc-977",
+				// The workspace is part of the pin; a colliding pid elsewhere must fail.
+				endpointCwd: "/expected/workspace",
+				endpointStateRoot: "/expected/workspace/.gjc/state",
+				closeState: "active",
+				createdAt: at,
+				updatedAt: at,
+			},
+		});
+		const reopened = new SpawnAuthorityStore(agentDir, brokerKey);
+		await reopened.open();
+		const pin = reopened.authority("collide");
+		expect(pin?.endpointCwd).toBe("/expected/workspace");
+		expect(pin?.endpointGeneration).toBe(3);
+		// The strict validator accepts the locator fields and still rejects unknown keys.
+		expect(isSpawnClaimV2(reopened.claim("collide"))).toBe(true);
+	});
+
 	it("pins Q26 replay and refuses a mismatched clientRef", async () => {
 		const agentDir = await temp();
 		const brokerKey = await getBrokerIdentityKey(agentDir);

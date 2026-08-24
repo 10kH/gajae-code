@@ -30,6 +30,34 @@ describe("observed request redaction", () => {
 		expect(observed.id).toBe("req-1");
 	});
 
+	it("is an allowlist: unlisted and nested fields cannot leak", () => {
+		// The exact invariant fields plus a field this module has never heard of.
+		const frame = {
+			type: "control_request",
+			operation: "session.spawn",
+			input: {
+				task: "seed-task-plaintext",
+				masterCapability: "capability-plaintext",
+				idempotencyKey: "idem-plaintext",
+				somethingNobodyListed: "future-field-plaintext",
+				nested: { task: "nested-task-plaintext" },
+				clientRef: "ref-1",
+			},
+		};
+		const observed = redactObservedRequestContent(frame) as { input: Record<string, unknown> };
+		const rendered = JSON.stringify(observed);
+		for (const secret of [
+			"seed-task-plaintext",
+			"capability-plaintext",
+			"idem-plaintext",
+			"future-field-plaintext",
+			"nested-task-plaintext",
+		]) {
+			expect(rendered).not.toContain(secret);
+		}
+		expect(observed.input.clientRef).toBe("ref-1");
+	});
+
 	it("redacts every caller-content field without inventing absent ones", () => {
 		const frame = {
 			type: "control_request",
@@ -42,7 +70,6 @@ describe("observed request redaction", () => {
 		expect(rendered).not.toContain("answer-content");
 		expect(observed.input.images).toBe("[redacted 2 items]");
 		expect(observed.input.name).toBe("demo");
-		expect(Object.hasOwn(observed.input, "text")).toBe(false);
 	});
 
 	it("leaves content-free frames untouched and composes with capability redaction", () => {

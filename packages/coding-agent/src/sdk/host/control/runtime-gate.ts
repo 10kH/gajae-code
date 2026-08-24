@@ -28,35 +28,60 @@ export function redactBrokerRuntimeCloseCapability(frame: Record<string, unknown
 }
 
 /**
- * Free-text request fields that carry caller content (a prompt, a task, an
- * answer, skill arguments). Diagnostic observers get the request shape, never
- * the content: a spawned child's seed task travels through `turn.prompt`
- * `input.text`, and that text must not reach an observer.
+ * Request fields an observer may see. This is an ALLOWLIST on purpose: a
+ * denylist is fail-open, so every unlisted or newly added field would leak by
+ * default. Only structural routing/correlation values are preserved; all other
+ * values are caller content and are replaced with a shape marker.
  */
-const OBSERVED_CONTENT_FIELDS = ["text", "prompt", "answer", "response", "args", "items", "images"] as const;
+const OBSERVABLE_INPUT_FIELDS = new Set([
+	"clientRef",
+	"commandId",
+	"turnId",
+	"sessionId",
+	"expectedSessionId",
+	"cursor",
+	"mode",
+	"scope",
+	"kind",
+	"level",
+	"on",
+	"confirm",
+	"name",
+	"op",
+	"id",
+]);
 
 /** Replaces caller content with a shape-preserving marker for observers. */
 function redactedContentMarker(value: unknown): string {
 	if (typeof value === "string") return `[redacted ${value.length} chars]`;
 	if (Array.isArray(value)) return `[redacted ${value.length} items]`;
+	if (value !== null && typeof value === "object") return `[redacted ${Object.keys(value).length} fields]`;
 	return "[redacted]";
 }
 
 /**
  * Strips caller content from a request frame before it reaches a diagnostic
  * observer. Operation, ids, and correlation fields survive so instrumentation
- * stays useful; only the content itself is removed.
+ * stays useful; everything else is redacted, including nested objects, so a
+ * field this module has never heard of cannot leak.
  */
 export function redactObservedRequestContent(frame: Record<string, unknown>): Record<string, unknown> {
 	const input = record(frame.input);
 	if (!input) return frame;
-	let redacted: Record<string, unknown> | undefined;
-	for (const field of OBSERVED_CONTENT_FIELDS) {
-		if (!Object.hasOwn(input, field) || input[field] === undefined) continue;
-		redacted ??= { ...input };
-		redacted[field] = redactedContentMarker(input[field]);
+	let changed = false;
+	const redacted: Record<string, unknown> = {};
+	for (const [field, value] of Object.entries(input)) {
+		if (value === undefined) continue;
+		// A scalar routing field is safe; an object or array under an allowlisted
+		// name still gets redacted, because nesting is where content hides.
+		if (OBSERVABLE_INPUT_FIELDS.has(field) && (value === null || typeof value !== "object")) {
+			redacted[field] = value;
+			continue;
+		}
+		redacted[field] = redactedContentMarker(value);
+		changed = true;
 	}
-	return redacted === undefined ? frame : { ...frame, input: redacted };
+	return changed ? { ...frame, input: redacted } : frame;
 }
 
 /**
