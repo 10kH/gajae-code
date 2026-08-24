@@ -319,6 +319,13 @@ async function resolveUpdateTarget(): Promise<UpdateTarget> {
 		if (isProtectedSourcePath(userPath)) {
 			throw new Error(formatUnsupportedTargetMessage(`Refusing to install over a source checkout at ${userPath}`));
 		}
+		if (path.resolve(userPath) === path.resolve(ompPath)) {
+			throw new Error(
+				formatUnsupportedTargetMessage(
+					`Current install at ${ompPath} is a package-manager shim in the default binary directory. Set GJC_INSTALL_DIR to a different directory, or remove the shim and reinstall with the binary installer`,
+				),
+			);
+		}
 		return { method: "migrate", path: userPath, previousPath: ompPath };
 	}
 
@@ -1099,7 +1106,7 @@ async function performUpdate(
 /** How the update command should proceed after comparing versions. */
 export interface UpdateDecision {
 	install: boolean;
-	kind: "up-to-date" | "new-version" | "switch-back" | "force";
+	kind: "up-to-date" | "new-version" | "switch-back" | "force" | "migrate";
 }
 
 /**
@@ -1118,9 +1125,13 @@ export function resolveUpdateDecision(options: {
 	force: boolean;
 	channel: UpdateChannel;
 	currentVersion: string;
+	migrate?: boolean;
 }): UpdateDecision {
 	const isChannelSwitchBack =
 		options.channel === "stable" && options.currentVersion.includes("-nightly.") && options.comparison < 0;
+	if (options.migrate && !options.force && !isChannelSwitchBack && options.comparison <= 0) {
+		return { install: true, kind: "migrate" };
+	}
 	if (options.comparison <= 0 && !isChannelSwitchBack && !options.force) {
 		return { install: false, kind: "up-to-date" };
 	}
@@ -1177,7 +1188,13 @@ export async function runUpdateCommand(
 		return exit(1);
 	}
 
-	const decision = resolveUpdateDecision({ comparison, force: opts.force, channel, currentVersion: VERSION });
+	const decision = resolveUpdateDecision({
+		comparison,
+		force: opts.force,
+		channel,
+		currentVersion: VERSION,
+		migrate: target?.method === "migrate",
+	});
 
 	if (!decision.install) {
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
@@ -1188,6 +1205,8 @@ export async function runUpdateCommand(
 		console.log(chalk.cyan(`Switching to the stable channel: ${release.version}`));
 	} else if (decision.kind === "new-version") {
 		console.log(chalk.cyan(`New version available: ${release.version}`));
+	} else if (decision.kind === "migrate") {
+		console.log(chalk.cyan(`Migrating to a standalone GitHub binary: ${release.version}`));
 	} else {
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}

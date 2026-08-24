@@ -1302,6 +1302,15 @@ describe("update-cli channel robustness", () => {
 		expect(
 			resolveUpdateDecision({ comparison: 0, force: false, channel: "stable", currentVersion: "0.12.11" }),
 		).toEqual({ install: false, kind: "up-to-date" });
+		expect(
+			resolveUpdateDecision({
+				comparison: 0,
+				force: false,
+				channel: "stable",
+				currentVersion: "0.12.11",
+				migrate: true,
+			}),
+		).toEqual({ install: true, kind: "migrate" });
 	});
 });
 
