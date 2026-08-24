@@ -56,6 +56,7 @@ import type {
 	Usage,
 } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
+import { attachUnicodeEscapeEvidence, type UnicodeEscapeEvidence } from "../utils/json-parse";
 
 /** The API string this provider serves. */
 export const MOCK_API = "mock" as const;
@@ -79,6 +80,7 @@ export type MockContent =
 			incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 			/** Simulate a provider-flagged `\uXXXX`-escaped non-ASCII argument payload. */
 			escapedNonAsciiArguments?: boolean;
+			escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
 			thoughtSignature?: string;
 	  };
 /** One scripted response. */
@@ -426,7 +428,7 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 		return { type: "text", text: input };
 	}
 	if (input.type === "toolCall") {
-		return {
+		const toolCall = {
 			type: "toolCall",
 			id: input.id ?? generateToolCallId(state),
 			name: input.name,
@@ -437,6 +439,10 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 			...(input.escapedNonAsciiArguments ? { escapedNonAsciiArguments: true } : {}),
 			...(input.thoughtSignature ? { thoughtSignature: input.thoughtSignature } : {}),
 		} as ToolCall;
+		if (input.escapedUnicodeArgumentEvidence) {
+			attachUnicodeEscapeEvidence(toolCall, input.escapedUnicodeArgumentEvidence);
+		}
+		return toolCall;
 	}
 	return input;
 }

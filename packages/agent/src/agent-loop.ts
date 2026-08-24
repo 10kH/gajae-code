@@ -34,6 +34,13 @@ import {
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
+import {
+	attachUnicodeEscapeEvidence,
+	type UnicodeEscapeEvidence,
+	unicodeEscapePathTag,
+	unicodeEscapeScalarTag,
+	verifyUnicodeEscapeEvidence,
+} from "@gajae-code/ai/utils/json-parse";
 import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
 import * as logger from "@gajae-code/utils/logger";
 import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
@@ -397,7 +404,11 @@ const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
 
 /** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
 function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
-	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
+	return message.content.some(
+		block =>
+			block.type === "toolCall" &&
+			(block.escapedNonAsciiArguments === true || block.escapedUnicodeArgumentEvidence !== undefined),
+	);
 }
 
 const ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX = 8;
@@ -408,12 +419,21 @@ function escapedNonAsciiToolCallShape(message: AssistantMessage): {
 	escapedToolCallCountCapped: boolean;
 } {
 	const count = message.content.filter(
-		block => block.type === "toolCall" && block.escapedNonAsciiArguments === true,
+		block =>
+			block.type === "toolCall" &&
+			(block.escapedNonAsciiArguments === true || block.escapedUnicodeArgumentEvidence !== undefined),
 	).length;
 	return {
 		escapedToolCallCount: Math.min(count, ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX),
 		escapedToolCallCountCapped: count > ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX,
 	};
+}
+
+/** Remove transient raw-evidence metadata before any message can become durable. */
+function stripUnicodeEscapeEvidence(message: AssistantMessage): void {
+	for (const block of message.content) {
+		if (block.type === "toolCall") delete block.escapedUnicodeArgumentEvidence;
+	}
 }
 
 /**
@@ -460,10 +480,11 @@ function isDisplaySafeEscapedTool(tool: AgentTool<TSchema> | undefined): boolean
 function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, args: Record<string, unknown>): boolean {
 	const fields = (tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields;
 	if (!fields || fields.length === 0) return false;
-	const prefixes = [...fields];
-	const isDisplayPath = (path: string): boolean =>
-		prefixes.some(field => path === field || path.startsWith(`${field}.`));
-	const walk = (node: unknown, path: string): boolean => {
+	const prefixes = fields.map(field => field.split("."));
+	const isDisplayPath = (path: readonly string[]): boolean =>
+		prefixes.some(field => field.length <= path.length && field.every((segment, index) => path[index] === segment));
+	const path: string[] = [];
+	const walk = (node: unknown): boolean => {
 		if (typeof node === "string") {
 			for (const ch of node) {
 				const cp = ch.codePointAt(0);
@@ -474,7 +495,7 @@ function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, arg
 			}
 			return true;
 		}
-		if (Array.isArray(node)) return node.every(item => walk(item, path));
+		if (Array.isArray(node)) return node.every(item => walk(item));
 		if (typeof node === "object" && node !== null) {
 			for (const [key, value] of Object.entries(node)) {
 				// Field names are structural identifiers; the display fields have
@@ -483,12 +504,97 @@ function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, arg
 					const cp = ch.codePointAt(0);
 					if (cp !== undefined && cp >= 0x80) return false;
 				}
-				if (!walk(value, path === "" ? key : `${path}.${key}`)) return false;
+				path.push(key);
+				const valid = walk(value);
+				path.pop();
+				if (!valid) return false;
 			}
 		}
 		return true;
 	};
-	return walk(args, "");
+	return walk(args);
+}
+
+/**
+ * Validate the original raw escape positions, not just the decoded values.
+ * Missing, malformed, overflowed, key-position, non-U+2014, or path-mismatched
+ * evidence fails closed. Process-keyed scalar/path tags keep argument text out of the
+ * carried metadata while still binding every escape to a declared display field.
+ */
+function isDisplaySafeRawEscapeEvidence(
+	tool: AgentTool<TSchema> | undefined,
+	args: Record<string, unknown>,
+	evidence: UnicodeEscapeEvidence | undefined,
+): boolean {
+	const fields = (tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields;
+	if (
+		!fields ||
+		fields.length === 0 ||
+		!evidence ||
+		!verifyUnicodeEscapeEvidence(evidence) ||
+		evidence.malformed ||
+		evidence.truncated
+	)
+		return false;
+	if (evidence.positions.length === 0 || evidence.positions.length > 32) return false;
+
+	const allowedValues = new Map<string, { offsets: Set<number>; matched: Set<number> }>();
+	const valueOrdinals = new Map<string, number>();
+	const prefixes = fields.map(field => field.split("."));
+	const isDisplayPath = (path: readonly string[]): boolean =>
+		prefixes.some(field => field.length <= path.length && field.every((segment, index) => path[index] === segment));
+	const path: string[] = [];
+	const walk = (node: unknown): void => {
+		if (typeof node === "string") {
+			if (!isDisplayPath(path)) return;
+			const pathTag = unicodeEscapePathTag(path);
+			const valueOrdinal = valueOrdinals.get(pathTag) ?? 0;
+			valueOrdinals.set(pathTag, valueOrdinal + 1);
+			const offsets = new Set<number>();
+			for (let offset = 0; offset < node.length; ) {
+				const codePoint = node.codePointAt(offset);
+				if (codePoint === 0x2014) offsets.add(offset);
+				offset += codePoint !== undefined && codePoint > 0xffff ? 2 : 1;
+			}
+			allowedValues.set(`${pathTag}:${valueOrdinal}`, { offsets, matched: new Set() });
+			return;
+		}
+		if (Array.isArray(node)) {
+			for (const item of node) walk(item);
+			return;
+		}
+		if (typeof node === "object" && node !== null) {
+			for (const [key, value] of Object.entries(node)) {
+				path.push(key);
+				walk(value);
+				path.pop();
+			}
+		}
+	};
+	walk(args);
+
+	let previousOffset = -1;
+	const allowedScalarTag = unicodeEscapeScalarTag(0x2014);
+	for (const position of evidence.positions) {
+		if (
+			position.location !== "value" ||
+			position.scalarTag !== allowedScalarTag ||
+			!Number.isSafeInteger(position.offset) ||
+			position.offset <= previousOffset ||
+			!/^[0-9a-f]{64}$/.test(position.pathTag) ||
+			!Number.isSafeInteger(position.valueOrdinal) ||
+			position.valueOrdinal < 0 ||
+			!Number.isSafeInteger(position.valueOffset) ||
+			position.valueOffset < 0
+		) {
+			return false;
+		}
+		previousOffset = position.offset;
+		const value = allowedValues.get(`${position.pathTag}:${position.valueOrdinal}`);
+		if (!value?.offsets.has(position.valueOffset) || value.matched.has(position.valueOffset)) return false;
+		value.matched.add(position.valueOffset);
+	}
+	return [...allowedValues.values()].every(value => value.offsets.size === value.matched.size);
 }
 /** Remove only the exact assistant response committed by its streaming attempt. */
 function removeCommittedAssistantMessage(messages: AgentMessage[], message: AssistantMessage): boolean {
@@ -1843,6 +1949,7 @@ function managedAssistantShell(
 		}
 	}
 	const content = rawArray === undefined ? [] : rawArray.flatMap(managedContentBlock);
+	restoreTransientUnicodeEscapeEvidence(content, value);
 	const usage = managedAssistantUsage(managedAttemptSnapshot(managedProperty(source, "usage")));
 	const api = managedProperty(source, "api");
 	const provider = managedProperty(source, "provider");
@@ -1917,6 +2024,77 @@ function managedContentBlock(block: unknown): AssistantMessage["content"] {
 	return normalized ? [normalized] : [];
 }
 
+function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | undefined {
+	if (!isManagedPlainRecord(value)) return undefined;
+	const positionsValue = managedProperty(value, "positions");
+	const totalPositions = managedProperty(value, "totalPositions");
+	const truncated = managedProperty(value, "truncated");
+	const malformed = managedProperty(value, "malformed");
+	const integrity = managedProperty(value, "integrity");
+	if (!Array.isArray(positionsValue) || positionsValue.length > 32) return undefined;
+	if (
+		typeof totalPositions !== "number" ||
+		!Number.isSafeInteger(totalPositions) ||
+		totalPositions < positionsValue.length ||
+		typeof truncated !== "boolean" ||
+		typeof malformed !== "boolean" ||
+		typeof integrity !== "string" ||
+		!/^[0-9a-f]{64}$/.test(integrity)
+	)
+		return undefined;
+	const positions: UnicodeEscapeEvidence["positions"][number][] = [];
+	for (const positionValue of positionsValue) {
+		if (!isManagedPlainRecord(positionValue)) return undefined;
+		const offset = managedProperty(positionValue, "offset");
+		const scalarTag = managedProperty(positionValue, "scalarTag");
+		const pathTag = managedProperty(positionValue, "pathTag");
+		const location = managedProperty(positionValue, "location");
+		const valueOrdinal = managedProperty(positionValue, "valueOrdinal");
+		const valueOffset = managedProperty(positionValue, "valueOffset");
+		if (
+			typeof offset !== "number" ||
+			!Number.isSafeInteger(offset) ||
+			offset < 0 ||
+			typeof scalarTag !== "string" ||
+			!/^[0-9a-f]{64}$/.test(scalarTag) ||
+			typeof pathTag !== "string" ||
+			!/^[0-9a-f]{64}$/.test(pathTag) ||
+			(location !== "key" && location !== "value") ||
+			typeof valueOrdinal !== "number" ||
+			!Number.isSafeInteger(valueOrdinal) ||
+			valueOrdinal < 0 ||
+			typeof valueOffset !== "number" ||
+			!Number.isSafeInteger(valueOffset) ||
+			valueOffset < 0
+		) {
+			return undefined;
+		}
+		positions.push({ offset, scalarTag, pathTag, location, valueOrdinal, valueOffset });
+	}
+	return { positions, totalPositions, truncated, malformed, integrity };
+}
+
+function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["content"], liveMessage: unknown): void {
+	const liveContent = managedProperty(liveMessage, "content");
+	if (!Array.isArray(liveContent)) return;
+	for (const destination of content) {
+		if (destination.type !== "toolCall") continue;
+		const matches = liveContent.filter(
+			candidate =>
+				isManagedPlainRecord(candidate) &&
+				managedProperty(candidate, "type") === "toolCall" &&
+				managedProperty(candidate, "id") === destination.id &&
+				managedProperty(candidate, "name") === destination.name,
+		);
+		if (matches.length !== 1) continue;
+		const rawEvidence = managedProperty(matches[0], "escapedUnicodeArgumentEvidence");
+		if (rawEvidence === undefined) continue;
+		const evidence = managedUnicodeEscapeEvidence(rawEvidence);
+		if (evidence) attachUnicodeEscapeEvidence(destination, evidence);
+		else destination.escapedNonAsciiArguments = true;
+	}
+}
+
 function managedAssistantContent(value: unknown): AssistantMessage["content"][number] | undefined {
 	if (!isManagedPlainRecord(value)) return undefined;
 	const type = managedProperty(value, "type");
@@ -1943,6 +2121,9 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const incompleteArguments = managedProperty(value, "incompleteArguments");
 	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
 	const escapedNonAsciiArguments = managedProperty(value, "escapedNonAsciiArguments");
+	const rawEscapedUnicodeArgumentEvidence = managedProperty(value, "escapedUnicodeArgumentEvidence");
+	const escapedUnicodeArgumentEvidence = managedUnicodeEscapeEvidence(rawEscapedUnicodeArgumentEvidence);
+	const escapedArgumentsGuarded = escapedNonAsciiArguments === true || rawEscapedUnicodeArgumentEvidence !== undefined;
 	return {
 		type,
 		id,
@@ -1961,7 +2142,12 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 						| "ambiguous",
 				}
 			: {}),
-		...(typeof escapedNonAsciiArguments === "boolean" ? { escapedNonAsciiArguments } : {}),
+		...(escapedArgumentsGuarded
+			? { escapedNonAsciiArguments: true }
+			: typeof escapedNonAsciiArguments === "boolean"
+				? { escapedNonAsciiArguments }
+				: {}),
+		...(escapedUnicodeArgumentEvidence ? { escapedUnicodeArgumentEvidence } : {}),
 	};
 }
 
@@ -2674,7 +2860,18 @@ class ManagedAttemptTransaction {
 	}
 
 	#losslessSnapshot<T>(value: T): T {
-		return losslessDetachedClone(value);
+		const snapshot = losslessDetachedClone(value);
+		if (
+			isManagedPlainRecord(snapshot) &&
+			managedProperty(snapshot, "role") === "assistant" &&
+			Array.isArray(managedProperty(snapshot, "content"))
+		) {
+			restoreTransientUnicodeEscapeEvidence(
+				managedProperty(snapshot, "content") as AssistantMessage["content"],
+				value,
+			);
+		}
+		return snapshot;
 	}
 
 	#losslessAgentEventSnapshot(event: AgentEvent): AgentEvent {
@@ -3549,6 +3746,7 @@ async function runLoopBody(
 								...diagnosticShape,
 							},
 				);
+				stripUnicodeEscapeEvidence(message);
 				// The defective turn was already committed to the context by the
 				// streaming path. Remove that exact object rather than assuming it is
 				// still the tail: callbacks may append user/system history while the
@@ -3586,12 +3784,16 @@ async function runLoopBody(
 				}
 				continue;
 			}
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				stripUnicodeEscapeEvidence(message);
+			}
 			escapedNonAsciiResampleAttempt = 0;
 			escapedNonAsciiToolChoiceCaptured = false;
 			escapedNonAsciiToolChoice = undefined;
 
 			const overflow = managedContextOverflow(message, config);
 			if (config.fallbackManaged && overflow) {
+				stripUnicodeEscapeEvidence(message);
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
@@ -3660,6 +3862,9 @@ async function runLoopBody(
 					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
 					if (loopSignal.aborted) message.stopReason = "aborted";
 				}
+				if (message.stopReason === "error" || message.stopReason === "aborted") {
+					stripUnicodeEscapeEvidence(message);
+				}
 				escapedToolTransaction.replacePendingAssistantMessage(message);
 				escapedToolTransaction.flush();
 			} else {
@@ -3669,6 +3874,7 @@ async function runLoopBody(
 				await config.onManagedAttemptAccepted?.();
 			}
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				stripUnicodeEscapeEvidence(message);
 				// Create placeholder tool results for any tool calls in the aborted message
 				// This maintains the tool_use/tool_result pairing that the API requires
 				type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;
@@ -4707,6 +4913,10 @@ async function executeToolCalls(
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
+				const escapedUnicodeArgumentEvidence = toolCall.escapedUnicodeArgumentEvidence;
+				const escapedArgumentsGuarded =
+					toolCall.escapedNonAsciiArguments || escapedUnicodeArgumentEvidence !== undefined;
+				if (escapedArgumentsGuarded) delete toolCall.escapedUnicodeArgumentEvidence;
 				if (toolCall.incompleteArguments) {
 					record.argumentValidationFailed = true;
 					// The provider flagged this call's arguments as unsafe to execute.
@@ -4723,18 +4933,22 @@ async function executeToolCalls(
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
 					throw new Error(detail);
 				}
-				if (toolCall.escapedNonAsciiArguments && !isDisplaySafeEscapedArguments(tool, argsForExecution)) {
+				const displaySafeEscapedArguments =
+					escapedArgumentsGuarded &&
+					isDisplaySafeEscapedArguments(tool, argsForExecution) &&
+					isDisplaySafeRawEscapeEvidence(tool, argsForExecution, escapedUnicodeArgumentEvidence);
+				if (escapedArgumentsGuarded && !displaySafeEscapedArguments) {
 					record.argumentValidationFailed = true;
 					// The arguments decoded cleanly, but they were spelled as `\uXXXX`
-					// escapes rather than literal UTF-8. Hand-written hex is where models
+					// escapes rather than literal characters. Hand-written hex is where models
 					// mistype digits, and every mistyped nibble decodes to a different but
 					// equally valid character — the payload is unverifiable and cannot be
 					// repaired after parsing, so it is rejected rather than executed on
 					// silently corrupted text. The one bounded exception is a tool that
 					// declared its arguments display-only (see
 					// isDisplaySafeEscapedArguments): user-facing question text whose
-					// only non-ASCII characters are benign typographic punctuation is
-					// not the Hangul-mistype corruption this guard exists to stop.
+					// only escaped scalars are exact U+2014 positions, corroborated against
+					// the decoded display fields. Missing or ASCII-position evidence rejects.
 					//
 					// Terminal for this call: the resample budget is already spent, so
 					// log it (shape-only) to make the fire rate measurable without
@@ -4745,9 +4959,9 @@ async function executeToolCalls(
 						displaySafeFieldsDeclared: isDisplaySafeEscapedTool(tool),
 					});
 					throw new Error(
-						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
+						`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
 							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
-							`so the call was not executed. Re-issue it writing every non-ASCII character literally.`,
+							`so the call was not executed. Re-issue it writing every printable character literally.`,
 					);
 				}
 				if (!tool) {

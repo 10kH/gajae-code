@@ -28,7 +28,7 @@ import type {
 import { normalizeSystemPrompts } from "../utils";
 import { kCursorExecResolved } from "../utils/block-symbols";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { findUnnecessaryUnicodeEscape, parseStreamingJson } from "../utils/json-parse";
+import { captureUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
 import { connectProxiedSocket, getProxyForUrl } from "../utils/proxy";
 import { formatErrorMessageWithRetryAfter } from "../utils/retry-after";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
@@ -738,9 +738,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			if (state.currentToolCall) {
 				const idx = output.content.indexOf(state.currentToolCall);
 				state.currentToolCall.arguments = parseStreamingJson(state.currentToolCall.partialJson);
-				if (findUnnecessaryUnicodeEscape(state.currentToolCall.partialJson ?? "")) {
-					state.currentToolCall.escapedNonAsciiArguments = true;
-				}
+				captureUnicodeEscapeEvidence(state.currentToolCall, state.currentToolCall.partialJson ?? "");
 				delete (state.currentToolCall as any).partialJson;
 				delete (state.currentToolCall as any).index;
 				stream.push({
@@ -2667,6 +2665,7 @@ function processInteractionUpdate(
 		if (state.currentToolCall) {
 			const toolCall = update.message.value.toolCall;
 			if (state.currentToolCall.kind === "mcp") {
+				captureUnicodeEscapeEvidence(state.currentToolCall, state.currentToolCall.partialJson ?? "");
 				const decodedArgs = decodeMcpArgsMap(selectMcpToolCall(toolCall)?.args?.args);
 				if (decodedArgs) {
 					state.currentToolCall.arguments = decodedArgs;
