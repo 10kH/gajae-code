@@ -37,7 +37,7 @@ function authority(): { authority: FilesystemTopicRegistryCasAuthority; file: st
 afterEach(() => {
 	for (const directory of temporaryDirectories.splice(0)) fs.rmSync(directory, { recursive: true, force: true });
 });
-test("machine-local identity parsing is strict and machine IDs are domain-hashed", async () => {
+test("machine-local identity parsing is strict and machine IDs are keyed per installation", async () => {
 	expect(parseWindowsMachineGuid("MachineGuid    REG_SZ    00112233-4455-6677-8899-aabbccddeeff")).toBe(
 		"00112233-4455-6677-8899-aabbccddeeff",
 	);
@@ -46,6 +46,7 @@ test("machine-local identity parsing is strict and machine IDs are domain-hashed
 
 	const hostId = await loadInstallationHostId({
 		platform: "linux",
+		installationSecret: "11".repeat(32),
 		readFile: async file => {
 			if (file === "/etc/machine-id") return "00112233445566778899aabbccddeeff\n";
 			throw Object.assign(new Error("missing"), { code: "ENOENT" });
@@ -53,18 +54,66 @@ test("machine-local identity parsing is strict and machine IDs are domain-hashed
 	});
 	expect(hostId).toMatch(/^[0-9a-f]{64}$/);
 	expect(hostId).not.toContain("00112233445566778899aabbccddeeff");
+	const fallbackHostId = await loadInstallationHostId({
+		platform: "linux",
+		installationSecret: "11".repeat(32),
+		readFile: async file => (file === "/etc/machine-id" ? "malformed" : "ffeeddccbbaa99887766554433221100\n"),
+	});
+	expect(fallbackHostId).toMatch(/^[0-9a-f]{64}$/);
+	const otherInstallationHostId = await loadInstallationHostId({
+		platform: "linux",
+		installationSecret: "22".repeat(32),
+		readFile: async () => "00112233445566778899aabbccddeeff\n",
+	});
+	expect(otherInstallationHostId).not.toBe(hostId);
 	await expect(
 		loadInstallationHostId({
 			platform: "linux",
+			installationSecret: "11".repeat(32),
 			readFile: async () => "malformed",
 		}),
 	).rejects.toThrow("unavailable or malformed");
 	await expect(
 		loadInstallationHostId({
 			platform: "win32",
+			installationSecret: "11".repeat(32),
 			runCommand: () => ({ exitCode: 1, stdout: new Uint8Array() }),
 		}),
 	).rejects.toThrow("unavailable or malformed");
+});
+
+test("machine identity secret creation falls back when hard links are unavailable", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-machine-identity-"));
+	temporaryDirectories.push(directory);
+	const hostId = await loadInstallationHostId({
+		platform: "linux",
+		configRootDir: directory,
+		link: async () => {
+			throw Object.assign(new Error("unsupported"), { code: "EOPNOTSUPP" });
+		},
+		readFile: async () => "00112233445566778899aabbccddeeff\n",
+	});
+
+	expect(hostId).toMatch(/^[0-9a-f]{64}$/);
+	expect(await fs.promises.readFile(path.join(directory, "machine-identity.secret"), "utf8")).toMatch(
+		/^[0-9a-f]{64}\n$/,
+	);
+});
+
+test("machine identity refuses a symlinked installation secret", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-machine-identity-"));
+	temporaryDirectories.push(directory);
+	const target = path.join(directory, "target");
+	fs.writeFileSync(target, "11".repeat(32));
+	fs.symlinkSync(target, path.join(directory, "machine-identity.secret"));
+
+	await expect(
+		loadInstallationHostId({
+			platform: "linux",
+			configRootDir: directory,
+			readFile: async () => "00112233445566778899aabbccddeeff\n",
+		}),
+	).rejects.toThrow("not a regular file");
 });
 
 test("filesystem topic authority bootstraps, serializes competing hosts, and survives restart", async () => {
@@ -353,3 +402,29 @@ test("foreign-host locks with locally dead PIDs fail closed instead of permittin
 	expect(fs.existsSync(lockDir)).toBe(true);
 	expect(fs.existsSync(file)).toBe(false);
 }, 10_000);
+
+test("reclaims a dead topic lock written with the previous local host identity", async () => {
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-topic-cas-legacy-lock-"));
+	temporaryDirectories.push(directory);
+	const file = path.join(directory, "telegram-topics.json");
+	const registry = new FilesystemTopicRegistryCasAuthority(file, {
+		installationHostId: "current-host",
+		previousInstallationHostIds: ["previous-local-host"],
+		fs: durableTestFs,
+		platform: "linux",
+	});
+	const lockDir = `${file}.lock`;
+	fs.mkdirSync(lockDir);
+	fs.writeFileSync(
+		path.join(lockDir, "info"),
+		JSON.stringify({
+			pid: 999_999_999,
+			start_time: "previous-start",
+			owner_host_id: "previous-local-host",
+			timestamp: 0,
+		}),
+	);
+
+	expect(await registry.compareAndSet(0, { version: 2, registryGeneration: 1, topics: {} })).toBe(true);
+	expect(fs.existsSync(lockDir)).toBe(false);
+});

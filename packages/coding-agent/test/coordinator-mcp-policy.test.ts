@@ -76,6 +76,31 @@ describe("Hermes MCP safety policy", () => {
 		);
 	});
 
+	it("authorizes GJC-managed sibling worktrees under the repository bucket", async () => {
+		const root = await tempRoot();
+		const bucket = `${root}.gajae-code-worktrees`;
+		const worktree = path.join(bucket, "feature-session");
+		await fs.mkdir(worktree, { recursive: true });
+		const config = buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+		});
+
+		await expect(assertCoordinatorWorkdir(config, worktree)).resolves.toBe(worktree);
+	});
+
+	it("honors the configured managed worktree bucket", async () => {
+		const root = await tempRoot();
+		const bucket = await tempRoot();
+		const worktree = path.join(bucket, "configured-session");
+		await fs.mkdir(worktree);
+		const config = buildCoordinatorMcpConfig({
+			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
+			GJC_WORKTREE_DIR: bucket,
+		});
+
+		await expect(assertCoordinatorWorkdir(config, worktree)).resolves.toBe(worktree);
+	});
+
 	it("rejects artifact symlink escapes and enforces byte caps", async () => {
 		const root = await tempRoot();
 		const outside = await tempRoot();

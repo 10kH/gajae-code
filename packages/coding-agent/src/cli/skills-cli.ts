@@ -70,26 +70,30 @@ export async function runSkillsCommand(cmd: SkillsCommandArgs): Promise<void> {
 	if (cmd.action === "discover") {
 		const source = cmd.flags?.source ?? "all";
 		const settings = await Settings.loadForScope({ cwd: process.cwd() });
-		const result = await discoverRuntimeSkills({
-			cwd: process.cwd(),
-			source,
-			policy: {
-				...settings.getGroup("skills"),
-				disabledExtensions: settings.get("disabledExtensions"),
-			},
-		});
-		if (cmd.flags?.json) {
-			writeJson({ candidates: result.candidates, diagnostics: result.diagnostics.messages });
-			return;
-		}
-		for (const candidate of result.candidates) {
-			process.stdout.write(`${formatCandidate(candidate)}\n`);
-		}
-		if (result.diagnostics.messages.length > 0) {
-			process.stdout.write("\nDiagnostics:\n");
-			for (const message of result.diagnostics.messages) {
-				process.stdout.write(`- ${message}\n`);
+		try {
+			const result = await discoverRuntimeSkills({
+				cwd: process.cwd(),
+				source,
+				policy: {
+					...settings.getGroup("skills"),
+					disabledExtensions: settings.get("disabledExtensions"),
+				},
+			});
+			if (cmd.flags?.json) {
+				writeJson({ candidates: result.candidates, diagnostics: result.diagnostics.messages });
+				return;
 			}
+			for (const candidate of result.candidates) {
+				process.stdout.write(`${formatCandidate(candidate)}\n`);
+			}
+			if (result.diagnostics.messages.length > 0) {
+				process.stdout.write("\nDiagnostics:\n");
+				for (const message of result.diagnostics.messages) {
+					process.stdout.write(`- ${message}\n`);
+				}
+			}
+		} finally {
+			await settings.close();
 		}
 		return;
 	}

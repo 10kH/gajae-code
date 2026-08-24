@@ -452,6 +452,7 @@ export interface GjcReviewedUpdateToken {
 export type GjcLifecycleErrorCode =
 	| "already_installed_use_upgrade"
 	| "not_installed"
+	| "registry_unreadable"
 	| "identity_mismatch"
 	| "stale_candidate"
 	| "stale_baseline"
@@ -496,6 +497,13 @@ export interface GjcUpdateApplyResult {
 
 export interface GjcInstallResult {
 	status: "installed";
+	summary: GjcBundleSummary;
+}
+
+/** A resolved uninstall that was deliberately not performed. */
+export interface GjcUninstallPreview {
+	status: "would-uninstall";
+	identity: GjcBundleIdentity;
 	summary: GjcBundleSummary;
 }
 

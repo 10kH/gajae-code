@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import {
 	getPetPixelProtocol,
+	getPetRenderProtocol,
 	PET_CAPABILITY_SETTLE_MS,
 	warnWhenPetCapabilitySettled,
 } from "@gajae-code/coding-agent/modes/components/pet-capability";
@@ -45,16 +46,18 @@ afterEach(() => {
 
 describe("getPetPixelProtocol", () => {
 	for (const [name, multiplexerEnv] of multiplexerCases) {
-		it(`keeps forced Kitty unavailable inside ${name}`, () => {
+		it(`uses text cells for forced Kitty inside ${name}`, () => {
 			setForcedProtocol("kitty", multiplexerEnv);
 
 			expect(getPetPixelProtocol()).toBeNull();
+			expect(getPetRenderProtocol()).toBe("text");
 		});
 
 		it(`keeps forced Sixel available inside ${name}`, () => {
 			setForcedProtocol("sixel", multiplexerEnv);
 
 			expect(getPetPixelProtocol()).toBe("sixel");
+			expect(getPetRenderProtocol()).toBe("sixel");
 		});
 	}
 });
@@ -88,7 +91,7 @@ describe("warnWhenPetCapabilitySettled", () => {
 		}
 	});
 
-	it("warns exactly once when the settle deadline passes with the terminal still unavailable", () => {
+	it("does not warn when the settle deadline selects the text-cell fallback", () => {
 		vi.useFakeTimers();
 		setTerminalImageProtocol(null);
 		const onUnavailable = vi.fn();
@@ -99,7 +102,7 @@ describe("warnWhenPetCapabilitySettled", () => {
 
 			vi.advanceTimersByTime(PET_CAPABILITY_SETTLE_MS * 2);
 
-			expect(onUnavailable).toHaveBeenCalledTimes(1);
+			expect(onUnavailable).not.toHaveBeenCalled();
 		} finally {
 			dispose();
 		}

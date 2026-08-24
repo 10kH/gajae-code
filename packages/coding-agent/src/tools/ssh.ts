@@ -106,7 +106,7 @@ async function loadHosts(session: ToolSession): Promise<{
 	hostNames: string[];
 	hostsByName: Map<string, SSHHost>;
 }> {
-	const result = await loadCapability<SSHHost>(sshCapability.id, { cwd: session.cwd });
+	const result = await loadCapability<SSHHost>(sshCapability.id, { cwd: session.cwd, settings: session.settings });
 	const hostsByName = new Map<string, SSHHost>();
 	for (const host of result.items) {
 		if (!hostsByName.has(host.name)) {
@@ -166,6 +166,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("ssh")) ?? {};
 
 		const result = await executeSSH(hostConfig, remoteCommand, {
+			settings: this.session.settings,
 			timeout: timeoutMs,
 			signal,
 			compatEnabled: hostInfo.compatEnabled,

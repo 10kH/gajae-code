@@ -12,6 +12,7 @@ import {
 	classifyFallbackTrigger,
 	EMPTY_RESPONSE_PROVIDER_CODE,
 	EventStream,
+	isProviderSafetyStopAuthenticated,
 	isZodSchema,
 	streamSimple,
 	type ToolChoice,
@@ -34,6 +35,7 @@ import {
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
 import { $credentialEnv, logger, sanitizeText } from "@gajae-code/utils";
+import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
 import type { AttemptScope } from "./attempt-scope";
 import {
 	createHarmonyAuditEvent,
@@ -491,13 +493,17 @@ function managedContextOverflow(message: AssistantMessage, config: AgentLoopConf
 }
 
 /** Managed fallback owns retry policy; only attached typed transport facts may discard an attempt. */
-function managedProperty(value: unknown, key: string): unknown {
-	if (!value || typeof value !== "object") return undefined;
+function managedPropertyRead(value: unknown, key: string): { ok: boolean; value: unknown } {
+	if (!value || typeof value !== "object") return { ok: true, value: undefined };
 	try {
-		return Reflect.get(value, key);
+		return { ok: true, value: Reflect.get(value, key) };
 	} catch {
-		return undefined;
+		return { ok: false, value: undefined };
 	}
+}
+
+function managedProperty(value: unknown, key: string): unknown {
+	return managedPropertyRead(value, key).value;
 }
 
 function managedTransportFailure(failure: unknown) {
@@ -505,9 +511,35 @@ function managedTransportFailure(failure: unknown) {
 	return facts && typeof facts === "object" ? transportFailureFacts(facts) : undefined;
 }
 
+// AI owns provider-originated authority. The agent loop owns authority for
+// the rebuilt message objects it creates; this second WeakSet is deliberately
+// module-private so a public AI consumer cannot transfer authority to an
+// arbitrary destination. A destination is marked only while this managed
+// runtime is rebuilding a source that AI authenticated.
+const managedProviderSafetyStops = new WeakSet<object>();
+
+function isManagedProviderSafetyStopAuthenticated(value: unknown): boolean {
+	return (
+		isProviderSafetyStopAuthenticated(value) ||
+		(typeof value === "object" && value !== null && managedProviderSafetyStops.has(value))
+	);
+}
+
 function managedRetryableFailure(failure: unknown): boolean {
 	const facts = managedTransportFailure(failure);
 	if (!facts) return false;
+	// A typed provider safety stop is terminal evidence ahead of any transport
+	// class, but only with adapter-minted provenance: unauthenticated labels
+	// are stripped at the stream exit (`sanitizeProviderSafetyStopProvenance`)
+	// and must fall through to ordinary transport classification so the chain
+	// can still advance (#4777).
+	if (
+		managedProperty(failure, "stopReason") === "error" &&
+		managedProperty(failure, "errorKind") === "provider_safety_stop" &&
+		isManagedProviderSafetyStopAuthenticated(failure)
+	) {
+		return false;
+	}
 	const trigger = classifyFallbackTrigger(facts);
 	// A plain `forbidden` is terminal: retrying it just re-sends a request the
 	// caller is not authorized to make, and the credential-mutating consumers
@@ -531,6 +563,62 @@ function promoteTypedEmptyResponseStop(message: AssistantMessage): void {
 	}
 	message.stopReason = "error";
 	message.errorMessage = "Provider returned an empty response with zero token usage";
+}
+/**
+ * Terminal safety-stop authority is provenance-bound, not data-bound: a
+ * provider or custom stream payload that self-labels
+ * `errorKind: "provider_safety_stop"` without the adapter-minted mark must not
+ * terminalize the failure, because terminal treatment suppresses the user's
+ * configured fallback chain (#4777 review follow-up). Strip the unauthenticated
+ * field from the live final message at the single stream-exit point, before
+ * the managed snapshot shell clones it and before any retry/discard policy
+ * reads it, so a forged label degrades to an ordinary (fallback-eligible)
+ * error everywhere downstream — loop gates, session policy, and persistence.
+ *
+ * The label is stripped regardless of stopReason: the field is reserved for
+ * adapter-minted terminal stops, and downstream consumers (session compaction
+ * checks among them) read it without re-checking the error state, so a forged
+ * label on a nominally successful response must not survive either. A frozen
+ * or Proxy-trapped final message is rebuilt as a plain mutable copy instead of
+ * letting the strip abort the run.
+ */
+
+function sanitizeProviderSafetyStopProvenance(
+	message: AssistantMessage,
+	model: AgentLoopConfig["model"],
+): AssistantMessage {
+	const errorKindRead = managedPropertyRead(message, "errorKind");
+	if (
+		errorKindRead.ok &&
+		(errorKindRead.value !== "provider_safety_stop" || isManagedProviderSafetyStopAuthenticated(message))
+	) {
+		return message;
+	}
+	const detached = managedAttemptSnapshotDetailed(message).snapshot;
+	if (isManagedPlainRecord(detached)) {
+		const rebuilt = { ...detached } as AssistantMessage;
+		delete rebuilt.errorKind;
+		return rebuilt;
+	}
+	const rebuilt = managedAssistantShell(message, model);
+	delete rebuilt.errorKind;
+	return rebuilt;
+}
+
+/**
+ * Expire residual terminal safety-stop authority before a dispatch exposes
+ * committed history to a stream. Once a stop has been adjudicated, its
+ * committed assistant message may be handed unchanged to a later — possibly
+ * custom — stream through `convertToLlm`; a live mark would let that stream
+ * re-use the authenticated object (or a mutation of it) to forge a terminal
+ * failure and suppress the fallback chain (#4777 review follow-up).
+ */
+function expireProviderSafetyStopAuthority(messages: AgentMessage[]): void {
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		revokeProviderSafetyStop(message);
+		managedProviderSafetyStops.delete(message);
+	}
 }
 
 /**
@@ -1693,6 +1781,7 @@ function managedAssistantShell(
 	value: unknown,
 	model: AgentLoopConfig["model"],
 	degradedFieldDiagnostics: Set<string> = new Set<string>(),
+	transferSafetyStopAuthority = false,
 ): AssistantMessage {
 	const detailed = managedAttemptSnapshotDetailed(value);
 	const snapshotRecord = isManagedPlainRecord(detailed.snapshot) ? detailed.snapshot : undefined;
@@ -1758,9 +1847,13 @@ function managedAssistantShell(
 		stopReason === "error" && managedProperty(source, "errorKind") === "provider_safety_stop"
 			? ("provider_safety_stop" as const)
 			: undefined;
-	const safeMetadata: Record<string, unknown> = isManagedPlainRecord(detailed.snapshot)
-		? { ...detailed.snapshot }
-		: {};
+	const safeMetadata: Record<string, unknown> = {};
+	if (isManagedPlainRecord(detailed.snapshot)) {
+		for (const key of Object.keys(detailed.snapshot)) {
+			const metadata = managedProperty(detailed.snapshot, key);
+			if (metadata !== undefined) safeMetadata[key] = metadata;
+		}
+	}
 	delete safeMetadata.errorMessage;
 	delete safeMetadata.errorStatus;
 	delete safeMetadata.transportFailure;
@@ -1770,7 +1863,7 @@ function managedAssistantShell(
 	// runtime failure in the executor's parent-facing summary (#4618).
 	delete safeMetadata.errorKind;
 	delete safeMetadata.bufferOverflow;
-	return {
+	const rebuilt: AssistantMessage = {
 		...safeMetadata,
 		role: "assistant",
 		content,
@@ -1785,6 +1878,16 @@ function managedAssistantShell(
 		...(errorKind ? { errorKind } : {}),
 		...(typeof errorStatus === "number" && Number.isFinite(errorStatus) ? { errorStatus } : {}),
 	};
+	// The closed-literal copy above is fed by the stream-exit provenance
+	// sanitize, so an unauthenticated label never reaches here. Mark the
+	// runtime-owned destination only when this source is already authenticated;
+	// no public AI API can perform this transfer (#4777 review).
+	if (transferSafetyStopAuthority && errorKind && isManagedProviderSafetyStopAuthenticated(value)) {
+		managedProviderSafetyStops.add(rebuilt);
+		revokeProviderSafetyStop(value);
+		if (typeof value === "object" && value !== null) managedProviderSafetyStops.delete(value);
+	}
+	return rebuilt;
 }
 
 function managedContentBlock(block: unknown): AssistantMessage["content"] {
@@ -2902,13 +3005,22 @@ export function normalizeTools(tools: AgentContext["tools"], injectIntent: boole
 	return tools?.map(t => {
 		const intentMode = resolveIntentMode(t.intent);
 		let parameters: TSchema = t.parameters;
-		if (injectIntent && intentMode !== "omit") {
-			if (isZodSchema(parameters)) {
-				const wired = zodToWireSchema(parameters);
-				parameters = injectIntentIntoSchema(wired, intentMode) as TSchema;
-			} else {
-				parameters = injectIntentIntoSchema(parameters, intentMode) as TSchema;
-			}
+		if (isZodSchema(parameters)) {
+			// Zod instances must never cross the provider boundary as-is: any
+			// downstream JSON round-trip (append-only stable-prefix cloning, fork
+			// seed snapshots) reduces a live ZodObject to a bare `{def, type}`
+			// object with no `properties`/`required`, so providers advertise a
+			// tool with no parameters and the model omits required arguments
+			// (issue #4837: subagent-only bash "command: expected string,
+			// received undefined"). Intent injection forced the conversion on
+			// operator-facing sessions; canonical sub-sessions run it too.
+			const wired = zodToWireSchema(parameters);
+			parameters =
+				injectIntent && intentMode !== "omit"
+					? (injectIntentIntoSchema(wired, intentMode) as TSchema)
+					: (wired as TSchema);
+		} else if (injectIntent && intentMode !== "omit") {
+			parameters = injectIntentIntoSchema(parameters, intentMode) as TSchema;
 		}
 		const description = t.description ?? "";
 		return { ...t, parameters, description };
@@ -3479,7 +3591,7 @@ async function runLoopBody(
 				return;
 			}
 			if (attemptTransaction) {
-				message = managedAssistantShell(message, config.model);
+				message = managedAssistantShell(message, config.model, new Set<string>(), true);
 				const index = currentContext.messages.length - 1;
 				if (index >= 0 && currentContext.messages[index]?.role === "assistant") {
 					currentContext.messages[index] = message;
@@ -3785,9 +3897,21 @@ async function streamAssistantResponse(
 	const managedDegradedFieldDiagnostics = new Set<string>();
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
+	// Revoke before invoking any caller-controlled transform so it cannot retain
+	// a live authenticated object and restore its role for a later custom stream.
+	expireProviderSafetyStopAuthority(messages);
+	if (messages !== context.messages) expireProviderSafetyStopAuthority(context.messages);
 	if (config.transformContext) {
 		messages = await config.transformContext(messages, signal, scope);
 	}
+
+	// Expire residual terminal safety-stop authority again after the transform:
+	// committed history (including a previously adjudicated stop) is handed
+	// to the stream through convertToLlm below, and a live mark would let a
+	// custom stream re-use the authenticated object to forge a terminal
+	// failure (#4777 review follow-up).
+	expireProviderSafetyStopAuthority(messages);
+	if (messages !== context.messages) expireProviderSafetyStopAuthority(context.messages);
 
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[]) and normalize at the LLM boundary.
 	// Cache hits are keyed by provider-visible content hashes, never message object identity.
@@ -4176,9 +4300,10 @@ async function streamAssistantResponse(
 
 						case "done":
 						case "error": {
+							const finished = sanitizeProviderSafetyStopProvenance(await finishResponse(), config.model);
 							const finalMessage = config.fallbackManaged
-								? managedAssistantShell(await finishResponse(), config.model, managedDegradedFieldDiagnostics)
-								: await finishResponse();
+								? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
+								: finished;
 							promoteTypedEmptyResponseStop(finalMessage);
 							if (addedPartial) {
 								context.messages[context.messages.length - 1] = finalMessage;
@@ -4199,9 +4324,10 @@ async function streamAssistantResponse(
 				closeIterator();
 			}
 
+			const finished = sanitizeProviderSafetyStopProvenance(await finishResponse(), config.model);
 			const trailing = config.fallbackManaged
-				? managedAssistantShell(await finishResponse(), config.model, managedDegradedFieldDiagnostics)
-				: await finishResponse();
+				? managedAssistantShell(finished, config.model, managedDegradedFieldDiagnostics, true)
+				: finished;
 			await finishChat(trailing);
 			return trailing;
 		});

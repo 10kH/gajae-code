@@ -1,7 +1,9 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { VERSION } from "@gajae-code/utils/dirs";
+import { isCompiledBinary } from "@gajae-code/utils/env";
 import { safeStderrWrite } from "@gajae-code/utils/safe-stderr";
 import type { Args } from "../cli/args";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
@@ -19,8 +21,13 @@ import {
 } from "./managed-owner-supervisor";
 import { tmuxRuntimeSessionPath } from "./session-layout";
 import {
+	coordinatorSidecarSigningBootstrapEnv,
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL_ENV,
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 	GJC_TMUX_OWNER_GENERATION_ENV,
 	GJC_TMUX_OWNER_SERVER_KEY_ENV,
 	GJC_TMUX_OWNER_STATE_DIR_ENV,
@@ -194,6 +201,9 @@ export interface TmuxLaunchPlan {
 	ownerIncarnation?: string;
 	/** Generation state captured before owner-isolation planning; required for publication CAS. */
 	ownerGenerationBaseline?: OwnerGenerationBaseline;
+	/** One-shot coordinator signing bootstrap endpoint; key material never enters tmux argv or environment. */
+	coordinatorSidecarBootstrap?: { path: string; keyId: string };
+	coordinatorSidecarBootstrapClose?: () => void;
 	/** Native tmux session identity emitted atomically by `new-session -P -F`. */
 	createdSessionId?: string;
 	/** Safe server identity proven immediately after creation. */
@@ -272,6 +282,7 @@ interface CommandResolutionContext {
 	argv: string[];
 	execPath: string;
 	extraEnv?: Record<string, string>;
+	bootstrapSecret?: { path: string; urlEnv: string; keyIdEnv: string; keyId: string };
 	tmuxExitMarkerPath?: string;
 	platform?: NodeJS.Platform;
 	managedOwnerSupervisor?: boolean;
@@ -389,6 +400,28 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function coordinatorSidecarSigningEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+	const marker = env[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]?.trim();
+	const bootstrap = coordinatorSidecarSigningBootstrapEnv();
+	const key =
+		env[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]?.trim() ?? bootstrap[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	const keyId = env[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]?.trim() ?? bootstrap[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV];
+	if (marker === undefined && key === undefined && keyId === undefined) return {};
+	if (marker !== "true" || !key || !keyId || !/^[a-f0-9]{64}$/.test(keyId))
+		throw new Error("Coordinator sidecar signing key is required for this tmux launch.");
+	return {
+		[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+		[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: key,
+		[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: keyId,
+	};
+}
+
+function coordinatorSidecarControlEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+	const controlEnv = { ...env };
+	delete controlEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	return controlEnv;
+}
+
 function buildEnvAssignments(values: Record<string, string> | undefined): string {
 	const entries = Object.entries(values ?? {});
 	return entries.length === 0 ? "" : ` ${entries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")}`;
@@ -496,6 +529,7 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 			command: resolveCurrentGjcCommand(context),
 			args: stripRootTmuxFlag(rawArgs),
 			environment: context.extraEnv,
+			bootstrapSecret: context.bootstrapSecret,
 			tmuxExitMarkerPath: context.tmuxExitMarkerPath,
 		});
 	const command = resolveCurrentGjcCommand(context);
@@ -507,9 +541,94 @@ function buildInnerCommand(context: CommandResolutionContext, rawArgs: string[])
 		? [...command, MANAGED_OWNER_SUPERVISOR_ARG]
 		: [...command, ...childArgs];
 	const quoted = invocationArgs.map(shellQuote).join(" ");
-	const invocation = `env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv, ...supervisorEnv })} ${quoted}`;
-	if (!context.tmuxExitMarkerPath) return `exec ${invocation}`;
-	return `${buildPosixTmuxExitMarkerPrefix(context.tmuxExitMarkerPath)}; ${invocation}; exit $?`;
+	const invocation = `env ${GJC_TMUX_LAUNCHED_ENV}=1${buildEnvAssignments({ ...context.extraEnv, ...supervisorEnv })}${
+		context.bootstrapSecret
+			? ` ${context.bootstrapSecret.urlEnv}=${shellQuote(context.bootstrapSecret.path)} ${context.bootstrapSecret.keyIdEnv}=${shellQuote(context.bootstrapSecret.keyId)}`
+			: ""
+	} ${quoted}`;
+	const bootstrappedInvocation = invocation;
+	if (!context.tmuxExitMarkerPath) return `exec ${bootstrappedInvocation}`;
+	return `${buildPosixTmuxExitMarkerPrefix(context.tmuxExitMarkerPath)}; ${bootstrappedInvocation}; exit $?`;
+}
+
+function stageCoordinatorSidecarBootstrap(
+	stateDir: string,
+	signingEnv: Record<string, string>,
+): { path: string; keyId: string } | undefined {
+	const key = signingEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	const keyId = signingEnv[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV];
+	if (!key || !keyId) return undefined;
+	let bootstrapDir = stateDir;
+	try {
+		fs.mkdirSync(bootstrapDir, { recursive: true, mode: 0o700 });
+	} catch {
+		bootstrapDir = path.join(os.tmpdir(), "gjc-coordinator-bootstrap");
+		fs.mkdirSync(bootstrapDir, { recursive: true, mode: 0o700 });
+	}
+	return { path: path.join(bootstrapDir, `.coordinator-sidecar-${crypto.randomUUID()}.key`), keyId };
+}
+
+/**
+ * Materialize a one-shot loopback bootstrap endpoint immediately before the
+ * managed owner child launches. The key never enters a file, argv, or tmux
+ * server environment, and the endpoint closes after its first successful read.
+ */
+function writeCoordinatorSidecarBootstrapFile(plan: TmuxLaunchPlan, env: NodeJS.ProcessEnv): void {
+	const bootstrap = plan.coordinatorSidecarBootstrap;
+	if (!bootstrap) return;
+	const key = coordinatorSidecarSigningEnv(env)[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	if (!key) throw new Error("Coordinator sidecar signing key disappeared before the managed owner launch.");
+	plan.coordinatorSidecarBootstrapClose?.();
+	plan.coordinatorSidecarBootstrapClose = undefined;
+	const token = crypto.randomUUID();
+	const ready = new Int32Array(new SharedArrayBuffer(4));
+	const worker = isCompiledBinary()
+		? new Worker("./packages/coding-agent/src/gjc-runtime/coordinator-sidecar-bootstrap-worker.ts", {
+				type: "module",
+			})
+		: new Worker(new URL("./coordinator-sidecar-bootstrap-worker.ts", import.meta.url).href, { type: "module" });
+	worker.postMessage({ type: "start", key, token, ready: ready.buffer });
+	Atomics.wait(ready, 0, 0, 2_000);
+	const port = Atomics.load(ready, 0);
+	if (port <= 0) {
+		void worker.terminate();
+		throw new Error("Coordinator sidecar bootstrap responder failed to start.");
+	}
+	const endpoint = `http://127.0.0.1:${port}/bootstrap/${token}`;
+	const stagedPath = bootstrap.path;
+	plan.coordinatorSidecarBootstrap = { path: endpoint, keyId: bootstrap.keyId };
+	plan.coordinatorSidecarBootstrapClose = () => {
+		worker.postMessage({ type: "close" });
+		void worker.terminate();
+	};
+	plan.innerCommand = replaceCoordinatorBootstrapPath(plan.innerCommand, stagedPath, endpoint, plan.platform);
+	plan.newSessionArgs = [...plan.newSessionArgs.slice(0, -1), plan.innerCommand];
+}
+
+function replaceCoordinatorBootstrapPath(
+	innerCommand: string,
+	previousPath: string,
+	nextPath: string,
+	platform: NodeJS.Platform,
+): string {
+	if (platform !== "win32") return innerCommand.replace(previousPath, nextPath);
+	const marker = "-EncodedCommand ";
+	const markerIndex = innerCommand.indexOf(marker);
+	if (markerIndex < 0)
+		throw new Error("Coordinator sidecar bootstrap command is missing its encoded PowerShell payload.");
+	const prefix = innerCommand.slice(0, markerIndex + marker.length);
+	const encoded = innerCommand.slice(markerIndex + marker.length).trim();
+	const script = Buffer.from(encoded, "base64").toString("utf16le");
+	const replaced = script.replace(previousPath, nextPath);
+	if (replaced === script)
+		throw new Error("Coordinator sidecar bootstrap path was not present in the encoded PowerShell payload.");
+	return `${prefix}${Buffer.from(replaced, "utf16le").toString("base64")}`;
+}
+
+function cleanupCoordinatorSidecarBootstrap(plan: TmuxLaunchPlan): void {
+	plan.coordinatorSidecarBootstrapClose?.();
+	plan.coordinatorSidecarBootstrapClose = undefined;
+	plan.coordinatorSidecarBootstrap = undefined;
 }
 
 function visibleWidth(value: string): number {
@@ -915,7 +1034,7 @@ function readTmuxStatusLineCount(tmuxCommand: string, cwd: string, env: NodeJS.P
 	if (resolveGjcTmuxBinary({ env }).isPsmux) return 0;
 	const result = Bun.spawnSync([tmuxCommand, "show-options", "-gqv", "status"], {
 		cwd,
-		env,
+		env: coordinatorSidecarControlEnv(env),
 		stdin: "pipe",
 		stdout: "pipe",
 		stderr: "pipe",
@@ -1003,6 +1122,14 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 	const sessionStateFile =
 		env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]?.trim() ||
 		tmuxRuntimeSessionPath(cwd, gjcSessionId, buildGjcTmuxSessionSlug(sessionName));
+	const signingEnv = coordinatorSidecarSigningEnv(env);
+	// Stage only the one-shot channel descriptor (path + key id). The PKCS#8 key
+	// itself stays in memory until writeCoordinatorSidecarBootstrapFile runs
+	// immediately before the managed owner launches, so attach-only, tmux-less,
+	// and other non-launch paths never expose key material on disk.
+	const coordinatorSidecarBootstrap = stageCoordinatorSidecarBootstrap(path.dirname(sessionStateFile), signingEnv);
+	const childSigningEnv = { ...signingEnv };
+	delete childSigningEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
 	const tmuxAvailable = context.tmuxAvailable ?? Bun.which(tmuxCommand) !== null;
 	if (!tmuxAvailable) {
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxUnavailableDiagnostic(platform));
@@ -1025,6 +1152,7 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 			argv: context.argv ?? process.argv,
 			execPath: context.execPath ?? process.execPath,
 			extraEnv: {
+				...childSigningEnv,
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: sessionStateFile,
 				// Carry the GJC-managed session name into the child so tmux-backed
@@ -1065,6 +1193,7 @@ export function buildDefaultTmuxLaunchPlan(context: TmuxLaunchContext): TmuxLaun
 		project,
 		sessionId,
 		sessionStateFile,
+		coordinatorSidecarBootstrap,
 		attachSessionName: existingSessionName,
 	};
 }
@@ -1098,8 +1227,16 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 			argv: context.argv ?? process.argv,
 			execPath: context.execPath ?? process.execPath,
 			extraEnv: {
+				...(plan.coordinatorSidecarBootstrap
+					? {
+							[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+							[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: plan.coordinatorSidecarBootstrap.keyId,
+						}
+					: {}),
 				[GJC_COORDINATOR_SESSION_ID_ENV]: sessionId,
 				[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: plan.sessionStateFile ?? "",
+				// The tmux server inherits the bootstrap secret as child environment;
+				// never serialize it into the command argument passed to tmux.
 				[GJC_TMUX_ACTIVE_SESSION_ENV]: plan.sessionName,
 				[GJC_TMUX_OWNER_GENERATION_ENV]: generation,
 				[GJC_TMUX_OWNER_STATE_DIR_ENV]: stateDir,
@@ -1117,6 +1254,14 @@ function prepareManagedOwnerLifecycle(plan: TmuxLaunchPlan, context: TmuxLaunchC
 						}
 					: {}),
 			},
+			bootstrapSecret: plan.coordinatorSidecarBootstrap
+				? {
+						path: plan.coordinatorSidecarBootstrap.path,
+						urlEnv: GJC_COORDINATOR_SIDECAR_BOOTSTRAP_URL_ENV,
+						keyIdEnv: GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+						keyId: plan.coordinatorSidecarBootstrap.keyId,
+					}
+				: undefined,
 			// Linux managed owner close signals the pane PID. Do not place the exit-marker shell
 			// in front of it; `buildInnerCommand` therefore execs the GJC owner directly.
 			tmuxExitMarkerPath: plan.platform === "linux" ? undefined : tmuxExitMarkerPath(plan.sessionStateFile ?? ""),
@@ -1171,7 +1316,7 @@ function defaultOwnerIsolationProbe(
 		}
 		const probe = spawn(plan.tmuxCommand, ["display-message", "-p", "#{pid}"], {
 			cwd: plan.cwd,
-			env,
+			env: coordinatorSidecarControlEnv(env),
 			stdin: "pipe",
 			stdout: "pipe",
 			stderr: "pipe",
@@ -1426,6 +1571,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 				(context.providerAuthorityStagedAssert ?? assertGjcTmuxStagedMutationAuthoritySync)(plan.authority);
 			}
 		} catch (error) {
+			cleanupCoordinatorSidecarBootstrap(plan);
 			(context.diagnosticWriter ?? safeStderrWrite)(`tmux provider authority resolution failed: ${String(error)}`);
 			return true;
 		}
@@ -1445,9 +1591,14 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		}
 	};
 	const creationSpawn = plan.authority ? spawnSync : rawSpawnSync;
+	const spawnEnv = { ...env };
+	delete spawnEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
+	const signingEnv = coordinatorSidecarSigningEnv(env);
+	Object.assign(spawnEnv, signingEnv);
+	delete spawnEnv[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV];
 	const options: TmuxSpawnOptions = {
 		cwd: plan.cwd,
-		env,
+		env: spawnEnv,
 		stdin: "inherit",
 		stdout: "inherit",
 		stderr: "inherit",
@@ -1489,7 +1640,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 	const buildProfileInputs = (): GjcTmuxProfileContext => ({
 		tmuxCommand: plan.tmuxCommand,
 		cwd: plan.cwd,
-		env,
+		env: coordinatorSidecarControlEnv(env),
 		spawnSync,
 		branch: plan.branch,
 		project: plan.project,
@@ -1565,6 +1716,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 				existingProof = proveGjcTmuxSessionMutationTarget(plan.attachSessionName, env);
 				existingTarget = existingProof.nativeSessionId;
 			} catch {
+				cleanupCoordinatorSidecarBootstrap(plan);
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					"tmux existing session proof failed; preserving session without mutation.\n",
 				);
@@ -1598,6 +1750,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 				)
 					throw new Error("tmux_session_identity_changed");
 			} catch {
+				cleanupCoordinatorSidecarBootstrap(plan);
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					"tmux existing session proof failed; preserving session without mutation.\n",
 				);
@@ -1605,16 +1758,28 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			}
 		}
 		const attached = spawnSync(plan.tmuxCommand, ["attach-session", "-t", existingTarget], attachOptions);
-		if (attached.exitCode === 0) return true;
+		if (attached.exitCode === 0) {
+			cleanupCoordinatorSidecarBootstrap(plan);
+			return true;
+		}
 	}
 	try {
 		prepareManagedOwnerLifecycle(plan, context);
 	} catch (error) {
+		cleanupCoordinatorSidecarBootstrap(plan);
 		(context.diagnosticWriter ?? safeStderrWrite)(`tmux owner lifecycle publication failed: ${String(error)}`);
 		return true;
 	}
 	if (!plan.sessionId || !plan.sessionStateFile || !plan.ownerGeneration || !plan.tmuxCommand) {
+		cleanupCoordinatorSidecarBootstrap(plan);
 		(context.diagnosticWriter ?? safeStderrWrite)("tmux required ownership metadata was unavailable");
+		return true;
+	}
+	try {
+		writeCoordinatorSidecarBootstrapFile(plan, env);
+	} catch (error) {
+		cleanupCoordinatorSidecarBootstrap(plan);
+		(context.diagnosticWriter ?? safeStderrWrite)(`tmux coordinator sidecar bootstrap failed: ${String(error)}`);
 		return true;
 	}
 	const created = createIsolatedTmuxSession(
@@ -1630,6 +1795,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		(context.diagnosticWriter ?? safeStderrWrite)(
 			"gjc --tmux failed after creating tmux session: native session identity was unavailable; preserving session for recovery.\n",
 		);
+		cleanupCoordinatorSidecarBootstrap(plan);
 		return true;
 	}
 	if (created.exitCode === 0) {
@@ -1641,6 +1807,16 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			if (!isWindowsPsmuxMissingSessionRegistrationRace(plan, probeResult)) {
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic("session registration probe failed", probeResult.stderr),
+				);
+				cleanupCoordinatorSidecarBootstrap(plan);
+				return true;
+			}
+			try {
+				writeCoordinatorSidecarBootstrapFile(plan, env);
+			} catch (error) {
+				cleanupCoordinatorSidecarBootstrap(plan);
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					`tmux coordinator sidecar bootstrap retry failed: ${String(error)}`,
 				);
 				return true;
 			}
@@ -1660,7 +1836,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 					),
 				);
 				cleanupCreatedTmuxSessionAfterFailure(plan, spawnSync, options, ownerIsolationProbe);
-
+				cleanupCoordinatorSidecarBootstrap(plan);
 				return true;
 			}
 		}
@@ -1668,6 +1844,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			(context.diagnosticWriter ?? safeStderrWrite)(
 				"tmux created session proof failed; preserving session without mutation.\n",
 			);
+			cleanupCoordinatorSidecarBootstrap(plan);
 			return true;
 		}
 		renameTmuxWindow(plan.tmuxCommand, windowTitle, spawnSync, controlOptions, createdSessionExactTarget(plan, env));
@@ -1692,6 +1869,16 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 					formatTmuxLaunchDiagnostic("profile tagging failed", ownershipFailure.stderr),
 				);
 				cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);
+				cleanupCoordinatorSidecarBootstrap(plan);
+				return true;
+			}
+			try {
+				writeCoordinatorSidecarBootstrapFile(plan, env);
+			} catch (error) {
+				cleanupCoordinatorSidecarBootstrap(plan);
+				(context.diagnosticWriter ?? safeStderrWrite)(
+					`tmux coordinator sidecar bootstrap retry failed: ${String(error)}`,
+				);
 				return true;
 			}
 			const retry = createIsolatedTmuxSession(
@@ -1704,7 +1891,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			const retryProbe = probeHasSession();
 			if (retry.exitCode !== 0 || retryProbe.exitCode !== 0) {
 				cleanupCreatedTmuxSessionAfterFailure(plan, spawnSync, options, ownerIsolationProbe);
-
+				cleanupCoordinatorSidecarBootstrap(plan);
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic(
 						"new-session retry failed after ownership failure",
@@ -1718,7 +1905,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			emitOptionalProfileDiagnostics(retryProfile, context.diagnosticWriter ?? safeStderrWrite);
 			if (retryOwnershipFailure) {
 				cleanupCreatedTmuxSessionAfterFailure(plan, spawnSync, options, ownerIsolationProbe);
-
+				cleanupCoordinatorSidecarBootstrap(plan);
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic("profile tagging failed after retry", retryOwnershipFailure.stderr),
 				);
@@ -1729,6 +1916,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 					"tmux required ownership metadata readback failed; preserving session without publication.\n",
 				);
 				cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);
+				cleanupCoordinatorSidecarBootstrap(plan);
 				return true;
 			}
 			// Recovery succeeded via retry — fall through to attach-session below.
@@ -1755,6 +1943,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		const stderr = created.stderr;
 		const suffix = probeWarning ? ` Wrapper warning: ${probeWarning}` : "";
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("new-session failed", stderr) + suffix);
+		cleanupCoordinatorSidecarBootstrap(plan);
 		return true;
 	}
 	if (!hasExactRequiredPsmuxMetadata()) {
@@ -1762,12 +1951,14 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			"tmux required ownership metadata readback failed; preserving session without publication.\n",
 		);
 		cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);
+		cleanupCoordinatorSidecarBootstrap(plan);
 		return true;
 	}
 	if (!isCreatedTmuxSessionIdentityStable(plan, spawnSync, controlOptions, ownerIsolationProbe)) {
 		(context.diagnosticWriter ?? safeStderrWrite)(
 			"tmux created session proof failed; preserving session without attach.\n",
 		);
+		cleanupCoordinatorSidecarBootstrap(plan);
 		return true;
 	}
 	try {
@@ -1777,6 +1968,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 		providerAuthorityPublished = true;
 	} catch (error) {
 		cleanupCreatedTmuxSessionBeforePublicationFailure(plan, spawnSync, controlOptions, ownerIsolationProbe);
+		cleanupCoordinatorSidecarBootstrap(plan);
 		(context.diagnosticWriter ?? safeStderrWrite)(`tmux owner lifecycle publication failed: ${String(error)}`);
 		return true;
 	}
@@ -1785,21 +1977,27 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 			(context.diagnosticWriter ?? safeStderrWrite)(
 				"tmux created session proof failed after lifecycle publication; preserving session without attach.\n",
 			);
+			cleanupCoordinatorSidecarBootstrap(plan);
 			return true;
 		}
 		if (!hasExactRequiredPsmuxMetadata()) {
 			(context.diagnosticWriter ?? safeStderrWrite)(
 				"tmux required ownership metadata readback failed after lifecycle publication; preserving session without attach.\n",
 			);
+			cleanupCoordinatorSidecarBootstrap(plan);
 			return true;
 		}
 		// attach-session needs PTY inherit for the user-facing attach; keep it unchanged.
 		const attached = attachCreatedSession();
-		if (attached.exitCode === 0) return true;
+		if (attached.exitCode === 0) {
+			cleanupCoordinatorSidecarBootstrap(plan);
+			return true;
+		}
 		if (isTmuxAttachDisconnectError(attached)) {
 			(context.diagnosticWriter ?? safeStderrWrite)(
 				formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr),
 			);
+			cleanupCoordinatorSidecarBootstrap(plan);
 			return true;
 		}
 		if (isWindowsPsmuxAttachConnectionRefused(plan, attached)) {
@@ -1813,31 +2011,39 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 					(context.diagnosticWriter ?? safeStderrWrite)(
 						"tmux created session proof failed after attach recovery probe; preserving session without attach.\n",
 					);
+					cleanupCoordinatorSidecarBootstrap(plan);
 					return true;
 				}
 				const retryAttached = attachCreatedSession();
-				if (retryAttached.exitCode === 0) return true;
+				if (retryAttached.exitCode === 0) {
+					cleanupCoordinatorSidecarBootstrap(plan);
+					return true;
+				}
 				if (isTmuxAttachDisconnectError(retryAttached)) {
 					(context.diagnosticWriter ?? safeStderrWrite)(
 						formatTmuxLaunchDiagnostic("attach disconnected", retryAttached.stderr),
 					);
+					cleanupCoordinatorSidecarBootstrap(plan);
 					return true;
 				}
 
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic("attach retry failed", retryAttached.stderr),
 				);
+				cleanupCoordinatorSidecarBootstrap(plan);
 				return true;
 			}
 			if (!isWindowsPsmuxMissingSessionRegistrationRace(plan, probeAfterAttach)) {
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic("attach recovery probe failed", probeAfterAttach.stderr),
 				);
+				cleanupCoordinatorSidecarBootstrap(plan);
 				return true;
 			}
 			(context.diagnosticWriter ?? safeStderrWrite)(
 				"tmux attach recovery found the published session missing; preserving lifecycle state without recreation.\n",
 			);
+			cleanupCoordinatorSidecarBootstrap(plan);
 			return true;
 		}
 		// Closing an SSH/Windows Terminal tab can make `tmux attach-session`
@@ -1852,10 +2058,12 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 				(context.diagnosticWriter ?? safeStderrWrite)(
 					formatTmuxLaunchDiagnostic("attach disconnected", attached.stderr),
 				);
+				cleanupCoordinatorSidecarBootstrap(plan);
 				return true;
 			}
 		}
 		(context.diagnosticWriter ?? safeStderrWrite)(formatTmuxLaunchDiagnostic("attach failed", attached.stderr));
+		cleanupCoordinatorSidecarBootstrap(plan);
 		return true;
 	} catch (error) {
 		(context.diagnosticWriter ?? safeStderrWrite)(
@@ -1864,6 +2072,7 @@ export function launchDefaultTmuxIfNeeded(context: TmuxLaunchContext): boolean {
 				String(error),
 			),
 		);
+		cleanupCoordinatorSidecarBootstrap(plan);
 		return true;
 	}
 }

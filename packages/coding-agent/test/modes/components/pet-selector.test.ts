@@ -16,22 +16,21 @@ beforeAll(async () => {
 });
 
 describe("PetSelectorComponent", () => {
-	it("shows saved named pets but keeps unavailable ones unselectable", () => {
+	it("keeps named pets reachable through the text-cell fallback", () => {
 		const onSelect = vi.fn();
 		const onPreview = vi.fn();
-		const component = new PetSelectorComponent("red", onSelect, () => {}, onPreview, false);
+		const component = new PetSelectorComponent("red", onSelect, () => {}, onPreview, true);
 		const rendered = stripAnsi(component.render(80).join("\n"));
 
-		expect(rendered).toContain("RedGajae (saved)");
+		expect(rendered).toContain("RedGajae");
 		expect(rendered).toContain("BlueGajae");
 		expect(rendered).toContain("Ouroboros");
-		expect(rendered).toContain("Saved, unavailable");
-		expect(stripAnsi(component.render(40).join("\n"))).toContain("RedGajae (saved)");
-		expect(component.getSelectList().getSelectedItem()?.value).toBe("off");
+		expect(stripAnsi(component.render(40).join("\n"))).toContain("RedGajae");
+		expect(component.getSelectList().getSelectedItem()?.value).toBe("red");
 
 		component.getSelectList().handleInput("\x1b[B");
-		expect(component.getSelectList().getSelectedItem()?.value).toBe("off");
-		expect(onPreview).not.toHaveBeenCalled();
+		expect(component.getSelectList().getSelectedItem()?.value).toBe("blue");
+		expect(onPreview).toHaveBeenCalledWith("blue");
 	});
 
 	it("decorates settings options through the shared capability policy", () => {

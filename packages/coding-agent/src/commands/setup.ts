@@ -38,9 +38,12 @@ export default class Setup extends Command {
 		root: Flags.string({ description: "Allowed Hermes MCP workdir/artifact root (repeatable)", multiple: true }),
 		repo: Flags.string({ description: "Hermes MCP repo namespace" }),
 		profile: Flags.string({ description: "Hermes MCP profile namespace" }),
-		"session-command": Flags.string({ description: "Explicit GJC session command for Hermes to launch" }),
+		"session-command": Flags.string({ description: "Typed GJC lifecycle selector: gjc | gjc --worktree [name]" }),
 		"no-worktree": Flags.boolean({ description: "Disable default GJC --worktree isolation for Hermes sessions" }),
 		"worktree-name": Flags.string({ description: "Named GJC --worktree branch for Hermes sessions" }),
+		"require-worktree": Flags.boolean({
+			description: "Refuse Hermes session creation that did not name its own worktree",
+		}),
 		"state-root": Flags.string({ description: "Hermes MCP coordination state root" }),
 		mutation: Flags.string({
 			description: "Hermes MCP mutation classes: sessions,questions,reports,all",
@@ -89,6 +92,7 @@ export default class Setup extends Command {
 				sessionCommand: flags["session-command"],
 				noWorktree: flags["no-worktree"],
 				worktreeName: flags["worktree-name"],
+				requireWorktree: flags["require-worktree"],
 				stateRoot: flags["state-root"],
 				mutation: flags.mutation,
 				artifactByteCap: flags["artifact-byte-cap"],

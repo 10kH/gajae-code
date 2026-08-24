@@ -94,8 +94,8 @@ async function lookupLifecycle(
 	return await response;
 }
 describe("SDK broker WebSocket transport", () => {
-	it("fails closed for dropped shutdown acknowledgements and waits for backpressure drain", () => {
-		expect(brokerShutdownSendAction(0)).toBe("dropped");
+	it("stops for dropped shutdown acknowledgements and waits for backpressure drain", () => {
+		expect(brokerShutdownSendAction(0)).toBe("close");
 		expect(brokerShutdownSendAction(-1)).toBe("wait_for_drain");
 		expect(brokerShutdownSendAction(1)).toBe("close");
 	});

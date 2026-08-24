@@ -1150,7 +1150,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
 		expect(keys).not.toContain("test:packages/coding-agent/test/edit/bar.test.ts");
 		const testTask = tasks.find(task => task.key === "test:packages/coding-agent/test/edit/foo.test.ts");
-		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
+		expect(testTask?.command).toEqual(["bun", "test", "--timeout=30000", "packages/coding-agent/test/edit/foo.test.ts"]);
 	});
 
 	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
@@ -1172,7 +1172,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 			"--root=packages/coding-agent",
 			"--shard=1/8",
 			"--timeout=30000",
-			"--file-timeout=300000",
+			"--file-timeout=900000",
 			"--concurrency=1",
 		]);
 			expect(keys.filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"))).toEqual([shardOne]);
@@ -1187,14 +1187,19 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	test("prompt terminal diagnostics changes run directly and on the isolated SDK host", () => {
 		const testFile = "packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts";
 		const tasks = targeted([testFile]);
-		expect(tasks.find(task => task.key === `test:${testFile}`)?.command).toEqual(["bun", "test", testFile]);
+		expect(tasks.find(task => task.key === `test:${testFile}`)?.command).toEqual([
+			"bun",
+			"test",
+			"--timeout=30000",
+			testFile,
+		]);
 		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.command).toEqual([
 			"bun",
 			"scripts/run-bun-test-files.ts",
 			"--root=packages/coding-agent",
 			"--shard=1/8",
 			"--timeout=30000",
-			"--file-timeout=300000",
+			"--file-timeout=900000",
 			"--concurrency=1",
 		]);
 		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:sdk-production-host-isolated")?.command).toEqual([
@@ -1315,7 +1320,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			key: "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts",
 			identity: "legacy:dGVzdDpwYWNrYWdlcy9jb2RpbmctYWdlbnQvdGVzdC9ybG0tbGl2ZS1tb2RlbC1lMmUudGVzdC50cw:Lg",
 			description: "Test packages/coding-agent/test/rlm-live-model-e2e.test.ts",
-			command: ["bun", "test", "packages/coding-agent/test/rlm-live-model-e2e.test.ts"],
+			command: ["bun", "test", "--timeout=30000", "packages/coding-agent/test/rlm-live-model-e2e.test.ts"],
 			cwd: undefined,
 			native: true,
 			rust: false,
@@ -1350,7 +1355,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"cli-smoke",
 			"native-linux-x64",
 		]);
-		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/coding-agent/test/startup-update-contract.test.ts"]);
+		expect(tasks[0]?.command).toEqual([
+			"bun",
+			"test",
+			"--timeout=30000",
+			"packages/coding-agent/test/startup-update-contract.test.ts",
+		]);
 		expect(tasks[1]).toMatchObject({
 			command: ["bun", "run", "check"],
 			cwd: resolvePackageCwd("packages/coding-agent"),
@@ -1392,7 +1402,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"root-check",
 			"native-linux-x64",
 		]);
-		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/ai/test/anthropic-cache-eval.integration.test.ts"]);
+		expect(tasks[0]?.command).toEqual([
+			"bun",
+			"test",
+			"--timeout=30000",
+			"packages/ai/test/anthropic-cache-eval.integration.test.ts",
+		]);
 		expect(tasks[1]?.command).toEqual(["bun", "run", "ci:check:full"]);
 		expect(tasks[2]?.command).toEqual(["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
 	});
@@ -1477,7 +1492,12 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
-		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
+		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual([
+			"bun",
+			"test",
+			"--timeout=30000",
+			"scripts/release-evidence.test.ts",
+		]);
 	});
 
 	test("unscoped wrapper package changes keep wrapper-version smoke with release validation", () => {
@@ -1602,7 +1622,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 			"--root=packages/coding-agent",
 			"--shard=1/8",
 			"--timeout=30000",
-			"--file-timeout=300000",
+			"--file-timeout=900000",
 			"--concurrency=1",
 		]);
 		expect(testShards[0]?.cwd).toBeUndefined();
@@ -1637,7 +1657,12 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
-		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
+		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual([
+			"bun",
+			"test",
+			"--timeout=30000",
+			"scripts/release-evidence.test.ts",
+		]);
 	});
 
 	test("tooling-script root-check marks the bounded check as a native consumer", () => {

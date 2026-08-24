@@ -110,7 +110,12 @@ async function loadImpl<T>(
 	const contributingProviders: string[] = [];
 	const disabledExtensionIds = options.includeDisabled
 		? new Set<string>()
-		: new Set<string>(options.disabledExtensions ?? settings?.get("disabledExtensions") ?? []);
+		: new Set<string>(
+				options.disabledExtensions ??
+					options.settings?.get("disabledExtensions") ??
+					settings?.get("disabledExtensions") ??
+					[],
+			);
 
 	const results = await Promise.all(
 		providers.map(async provider => {
@@ -239,7 +244,7 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 	const home = getTrustedHomeDir();
 	const userAgentDir = options.agentDir ? path.resolve(options.agentDir) : getAgentDir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot };
+	const ctx: LoadContext = { cwd, home, userAgentDir, repoRoot, settings: options.settings };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);
@@ -259,6 +264,12 @@ export function initializeWithSettings(activeSettings: Settings): void {
 	const disabled = activeSettings.get("disabledProviders");
 	disabledProviders.clear();
 	for (const id of disabled) disabledProviders.add(id);
+}
+
+/** Remove a disposed session scope without disturbing a newer replacement. */
+export function releaseSettingsScope(activeSettings: Settings): void {
+	const cwd = path.normalize(activeSettings.getCwd());
+	if (settingsByCwd.get(cwd) === activeSettings) settingsByCwd.delete(cwd);
 }
 
 function assertDisabledProvidersWritable(activeSettings: Settings): void {

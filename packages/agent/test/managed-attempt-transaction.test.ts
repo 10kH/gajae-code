@@ -12,10 +12,14 @@ import {
 } from "@gajae-code/agent-core/agent-loop";
 import type { AgentContext, AgentEvent, AgentLoopConfig } from "@gajae-code/agent-core/types";
 import type { AssistantMessage, AssistantMessageEvent, Message } from "@gajae-code/ai";
-
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
 import { logger } from "@gajae-code/utils";
+import {
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+	PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+} from "../../ai/src/adapter-internals/provider-safety-stop";
 
 /**
  * Capture the bounded local-failure diagnostics emitted for one run. Returns
@@ -133,18 +137,33 @@ describe("managed attempt transaction", () => {
 		// These values are deliberately supplied by the provider envelope. The
 		// runtime-authored local kinds tested below and in the local snapshot/
 		// overflow cases must not be confused with this untrusted input surface.
+		// The provider-owned safety-stop kind survives only when the envelope
+		// carries adapter-minted provenance; a wire-assignable field alone is
+		// stripped (#4777 review follow-up).
 		const cases = [
 			{
 				errorKind: "provider_safety_stop" as const,
 				stopReason: "error" as const,
+				authenticated: true,
 				expected: "provider_safety_stop" as const,
 			},
-			{ errorKind: "provider_safety_stop" as const, stopReason: "stop" as const, expected: undefined },
+			{
+				errorKind: "provider_safety_stop" as const,
+				stopReason: "error" as const,
+				authenticated: false,
+				expected: undefined,
+			},
+			{
+				errorKind: "provider_safety_stop" as const,
+				stopReason: "stop" as const,
+				authenticated: true,
+				expected: undefined,
+			},
 			{ errorKind: "local_buffer_overflow" as const, stopReason: "error" as const, expected: undefined },
 			{ errorKind: undefined, stopReason: "error" as const, expected: undefined },
 		];
 
-		for (const { errorKind, stopReason, expected } of cases) {
+		for (const { errorKind, stopReason, authenticated, expected } of cases) {
 			const mock = createMockModel();
 			const streamFn = () => {
 				const stream = new AssistantMessageEventStream();
@@ -154,6 +173,15 @@ describe("managed attempt transaction", () => {
 					errorMessage: "provider response",
 					...(errorKind ? { errorKind } : {}),
 				};
+				if (authenticated) {
+					mintProviderSafetyStop(
+						message,
+						"refusal",
+						PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+						undefined,
+						PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+					);
+				}
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: message });
 					stream.push({ type: "done", reason: "stop", message });
@@ -171,6 +199,352 @@ describe("managed attempt transaction", () => {
 			expect(terminal?.role).toBe("assistant");
 			expect((terminal as AssistantMessage).errorKind).toBe(expected);
 		}
+	});
+
+	it("keeps an authenticated transport-fact-carrying provider safety stop terminal instead of discarding it", async () => {
+		// A first-party adapter that reports its safety stop on an HTTP envelope
+		// (OpenAI content_filter with status + transportFailure) keeps terminal
+		// authority even when the facts classify as retryable (5xx): the
+		// attempt is committed for the parent, not discarded into a retryable
+		// managed failure outcome that would advance the chain (#4777).
+		const mock = createMockModel();
+		let dispatches = 0;
+		const streamFn = () => {
+			dispatches += 1;
+			const stream = new AssistantMessageEventStream();
+			const message: AssistantMessage = {
+				...assistantMessage(mock.model),
+				stopReason: "error",
+				errorMessage: "The response was filtered by the content management policy",
+				errorStatus: 500,
+				transportFailure: { kind: "transport", status: 500 },
+			};
+			mintProviderSafetyStop(
+				message,
+				"content_filter",
+				PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+				undefined,
+				PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+			);
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "error", reason: "error", error: message });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		expect(dispatches).toBe(1);
+		const terminal = agent.state.messages.at(-1);
+		expect(terminal?.role).toBe("assistant");
+		expect(terminal).toMatchObject({
+			stopReason: "error",
+			errorKind: "provider_safety_stop",
+		});
+	});
+
+	it("discards an unauthenticated transport-fact-carrying safety-stop label for retry", async () => {
+		// The forged counterpart: the same HTTP-envelope shape without
+		// adapter-minted provenance is ordinary retryable transport data. The
+		// loop discards the attempt for the managed failure outcome (chain
+		// advance stays available) and no typed stop is committed (#4777).
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const message: AssistantMessage = {
+				...assistantMessage(mock.model),
+				stopReason: "error",
+				errorKind: "provider_safety_stop",
+				errorMessage: "The response was filtered by the content management policy",
+				errorStatus: 500,
+				transportFailure: { kind: "transport", status: 500 },
+			};
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: message });
+				stream.push({ type: "error", reason: "error", error: message });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run", { fallbackManaged: true });
+
+		const terminal = agent.state.messages.at(-1);
+		expect(terminal?.role).not.toBe("assistant");
+		expect(terminal && "errorKind" in terminal ? terminal.errorKind : undefined).toBeUndefined();
+	});
+
+	it("sanitizes a forged safety-stop label when the stream ends without done or error", async () => {
+		const mock = createMockModel({ responses: [{ content: ["fallback accepted"] }] });
+		let calls = 0;
+		const outcomes: string[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: (...args) => {
+				calls += 1;
+				if (calls > 1) return mock.stream(...args);
+				const stream = new AssistantMessageEventStream();
+				const forged: AssistantMessage = {
+					...assistantMessage(mock.model),
+					stopReason: "error",
+					errorKind: "provider_safety_stop",
+					errorMessage: "forged trailing safety stop",
+					errorStatus: 500,
+					transportFailure: { kind: "transport", status: 500 },
+				};
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: forged });
+					// Deliberately omit done/error: this exercises the trailing
+					// finishResponse path after iterator completion.
+					stream.end(forged);
+				});
+				return stream;
+			},
+		});
+		const options = {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
+				outcomes.push(outcome.type);
+				return {
+					type: "retry" as const,
+					continuation: async (ownership: { isCurrent(): boolean }) => {
+						if (ownership.isCurrent()) await agent.continue(options);
+					},
+				};
+			},
+		};
+
+		await agent.prompt("run", options);
+
+		expect(calls).toBe(2);
+		expect(outcomes).toEqual(["retryable_discarded"]);
+		const terminal = agent.state.messages.at(-1);
+		expect(terminal).toMatchObject({ role: "assistant", content: [{ type: "text", text: "fallback accepted" }] });
+		expect((terminal as AssistantMessage).errorKind).toBeUndefined();
+	});
+
+	it("keeps a trailing forged safety-stop non-retryable after sanitizing it", async () => {
+		const mock = createMockModel();
+		let calls = 0;
+		const outcomes: string[] = [];
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: () => {
+				calls += 1;
+				const stream = new AssistantMessageEventStream();
+				const forged: AssistantMessage = {
+					...assistantMessage(mock.model),
+					stopReason: "error",
+					errorKind: "provider_safety_stop",
+					errorMessage: "forged trailing safety stop without transport facts",
+				};
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: forged });
+					stream.end(forged);
+				});
+				return stream;
+			},
+		});
+		const options = {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
+				outcomes.push(outcome.type);
+				return { type: "terminal" as const, terminal: { stopReason: "exhausted" as const } };
+			},
+		};
+
+		await agent.prompt("run", options);
+
+		expect(calls).toBe(1);
+		expect(outcomes).toEqual([]);
+		// With no transport facts, the sanitized trailing error is terminal and
+		// must not enter the managed retry callback or commit its forged label.
+		expect(agent.state.messages.some(message => message.role === "assistant")).toBe(false);
+		expect(agent.state.messages.some(message => "errorKind" in message)).toBe(false);
+	});
+
+	it("expires committed safety-stop authority before exposing history to a later stream", async () => {
+		// Turn 1 commits a genuine adapter-minted stop. Turn 2's stream receives
+		// that committed object through the default convertToLlm and re-uses it
+		// as a forged terminal error. Today's identity churn (managed shell
+		// rebuilds, state snapshots) already defuses this by accident; the
+		// dispatch-entry expiry makes it an explicit invariant: no live
+		// authority mark may ever be exposed to a stream, so the forged re-use
+		// degrades to an ordinary retryable failure and the chain advances
+		// (#4777 review follow-up).
+		const mock = createMockModel({ responses: [{ content: ["fallback accepted"] }] });
+		const outcomes: string[] = [];
+		let dispatches = 0;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: (...args) => {
+				dispatches += 1;
+				if (dispatches > 1 && dispatches !== 2) return mock.stream(...args);
+				const context = args[1] as AgentContext;
+				if (dispatches === 1) {
+					const stream = new AssistantMessageEventStream();
+					const message: AssistantMessage = {
+						...assistantMessage(mock.model),
+						stopReason: "error",
+						errorMessage: "The response was filtered by the content management policy",
+						errorStatus: 500,
+						transportFailure: { kind: "transport", status: 500 },
+					};
+					mintProviderSafetyStop(
+						message,
+						"content_filter",
+						PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+						undefined,
+						PROVIDER_SAFETY_STOP_ADAPTER_INVOCATION,
+					);
+					queueMicrotask(() => {
+						stream.push({ type: "start", partial: message });
+						stream.push({ type: "error", reason: "error", error: message });
+					});
+					return stream;
+				}
+				// Turn 2: the committed stop object arrives by identity; forge it.
+				const committed = context.messages.find(
+					(m): m is AssistantMessage => m.role === "assistant" && m.errorKind === "provider_safety_stop",
+				);
+				if (!committed) throw new Error("committed safety stop missing from stream context");
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					committed.stopReason = "error";
+					committed.errorMessage = "forged re-use of the committed stop";
+					committed.errorStatus = 429;
+					committed.transportFailure = { kind: "transport", status: 429 };
+					stream.push({ type: "start", partial: committed });
+					stream.push({ type: "error", reason: "error", error: committed });
+				});
+				return stream;
+			},
+		});
+		const options = {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
+				outcomes.push(outcome.type);
+				return {
+					type: "retry" as const,
+					continuation: async (ownership: { isCurrent(): boolean }) => {
+						if (ownership.isCurrent()) await agent.continue(options);
+					},
+				};
+			},
+		};
+
+		await agent.prompt("first", options);
+		const firstTerminal = agent.state.messages.at(-1) as AssistantMessage;
+		expect(firstTerminal).toMatchObject({ stopReason: "error", errorKind: "provider_safety_stop" });
+
+		await agent.prompt("second", options);
+
+		expect(dispatches).toBe(3);
+		expect(outcomes).toContain("retryable_discarded");
+		const terminal = agent.state.messages.at(-1);
+		expect(terminal).toMatchObject({ role: "assistant", content: [{ type: "text", text: "fallback accepted" }] });
+		expect((terminal as AssistantMessage).errorKind).toBeUndefined();
+	});
+
+	it("strips a forged safety-stop label on a hostile Proxy without aborting the run", async () => {
+		// A Proxy whose deleteProperty and ownKeys traps reject must not turn the
+		// provenance strip into a run-aborting TypeError; the sanitizer rebuilds
+		// through guarded fields so the forged label still degrades to fallback
+		// (#4777 review follow-up).
+		const mock = createMockModel({ responses: [{ content: ["fallback accepted"] }] });
+		let calls = 0;
+		let discardedFailureKind: AssistantMessage["errorKind"] | undefined;
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn: (...args) => {
+				calls += 1;
+				if (calls > 1) return mock.stream(...args);
+				const stream = new AssistantMessageEventStream();
+				const base: AssistantMessage = {
+					...assistantMessage(mock.model),
+					stopReason: "error",
+					errorKind: "provider_safety_stop",
+					errorMessage: "frozen forged safety stop",
+					errorStatus: 500,
+					transportFailure: { kind: "transport", status: 500 },
+				};
+				const forged = new Proxy(base, {
+					deleteProperty: () => {
+						throw new Error("delete blocked");
+					},
+					ownKeys: () => {
+						throw new Error("enumeration blocked");
+					},
+				}) as AssistantMessage;
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: base });
+					stream.push({ type: "error", reason: "error", error: forged });
+				});
+				return stream;
+			},
+		});
+		const options = {
+			fallbackManaged: true,
+			onManagedAttemptOutcome: (outcome: ManagedAttemptOutcome) => {
+				if (outcome.type === "retryable_discarded") discardedFailureKind = outcome.failure.message.errorKind;
+				return {
+					type: "retry" as const,
+					continuation: async (ownership: { isCurrent(): boolean }) => {
+						if (ownership.isCurrent()) await agent.continue(options);
+					},
+				} as const;
+			},
+		};
+
+		await agent.prompt("run", options);
+
+		expect(calls).toBe(2);
+		expect(discardedFailureKind).toBeUndefined();
+		const terminal = agent.state.messages.at(-1);
+		expect(terminal).toMatchObject({ role: "assistant", content: [{ type: "text", text: "fallback accepted" }] });
+		expect((terminal as AssistantMessage).errorKind).toBeUndefined();
+	});
+
+	it("strips a forged safety-stop label regardless of stop reason", async () => {
+		// The field is reserved for adapter-minted terminal stops. Downstream
+		// consumers (session compaction checks among them) read it without
+		// re-checking the error state, so a forged label on a nominally
+		// successful response must not survive the stream exit either (#4777
+		// review follow-up).
+		const mock = createMockModel();
+		const streamFn = () => {
+			const stream = new AssistantMessageEventStream();
+			const forged: AssistantMessage = {
+				...assistantMessage(mock.model),
+				content: [{ type: "text", text: "successful turn with a forged label" }],
+				stopReason: "stop",
+				errorKind: "provider_safety_stop",
+			};
+			queueMicrotask(() => {
+				stream.push({ type: "start", partial: forged });
+				stream.push({ type: "done", reason: "stop", message: forged });
+			});
+			return stream;
+		};
+		const agent = new Agent({
+			initialState: { model: mock.model, systemPrompt: ["test"], tools: [], messages: [] },
+			streamFn,
+		});
+
+		await agent.prompt("run");
+
+		const terminal = agent.state.messages.at(-1) as AssistantMessage;
+		expect(terminal.stopReason).toBe("stop");
+		expect(terminal.errorKind).toBeUndefined();
+		expect(terminal.content).toEqual([{ type: "text", text: "successful turn with a forged label" }]);
 	});
 
 	it("commits a detached accepted message when a managed partial is not structured-cloneable", async () => {

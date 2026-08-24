@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { coordinatorMcpStateRoot, gjcRoot } from "../gjc-runtime/session-layout";
 import {
@@ -11,6 +12,16 @@ import {
 } from "./session-reaper";
 
 export type CoordinatorMutationClass = "sessions" | "questions" | "reports";
+
+/** Artifact reads require Linux's identity-bound `/proc/self/fd` authorization. */
+export function coordinatorArtifactCapability(platform: NodeJS.Platform = process.platform): {
+	available: boolean;
+	reason: "artifact_identity_unavailable" | null;
+} {
+	return platform === "linux"
+		? { available: true, reason: null }
+		: { available: false, reason: "artifact_identity_unavailable" };
+}
 
 export interface CoordinatorNamespace {
 	profile: string | null;
@@ -48,11 +59,14 @@ export function coordinatorNamespaceIdentity(env: NodeJS.ProcessEnv = process.en
 
 export interface CoordinatorMcpConfig {
 	allowedRoots: string[];
+	managedWorktreeRoots: string[];
 	mutationClasses: Set<CoordinatorMutationClass>;
 	artifactByteCap: number;
 	namespace: CoordinatorNamespace;
 	stateRoot: string;
+	codexTokenRoot: string;
 	sessionCommand: string | null;
+	requireWorktree: boolean;
 	sessionIdleTtlMs: number;
 	sessionSweepIntervalMs: number;
 	forceStopEnabled: boolean;
@@ -97,6 +111,12 @@ function parseRootList(value: string | undefined): string[] {
 		.filter(Boolean);
 }
 
+function resolveManagedWorktreeRoot(root: string, configured: string | undefined): string {
+	const template = (configured?.trim() || "{repo}.gajae-code-worktrees").replace(/^~(?=\/|$)/, os.homedir());
+	const resolved = template.replaceAll("{repo}", path.basename(root));
+	return path.resolve(path.isAbsolute(resolved) ? resolved : path.join(path.dirname(root), resolved));
+}
+
 function parseMutationClasses(value: string | undefined): Set<CoordinatorMutationClass> {
 	const classes = new Set<CoordinatorMutationClass>();
 	for (const raw of parseList(value)) {
@@ -136,6 +156,9 @@ export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env):
 	const stateRoot = stateRootOverride || defaultCoordinatorMcpStateRoot(process.cwd(), gjcSessionId);
 	return {
 		allowedRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root => path.resolve(root)),
+		managedWorktreeRoots: parseRootList(env.GJC_COORDINATOR_MCP_WORKDIR_ROOTS).map(root =>
+			resolveManagedWorktreeRoot(path.resolve(root), env.GJC_WORKTREE_DIR),
+		),
 		mutationClasses: parseMutationClasses(
 			env.GJC_COORDINATOR_MCP_MUTATIONS ?? env.GJC_COORDINATOR_MCP_ENABLE_MUTATION_CLASSES,
 		),
@@ -148,7 +171,11 @@ export function buildCoordinatorMcpConfig(env: NodeJS.ProcessEnv = process.env):
 			identity: coordinatorNamespaceIdentity(env),
 		},
 		stateRoot: path.resolve(stateRoot),
+		codexTokenRoot: path.resolve(
+			env.GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT?.trim() || path.join(stateRoot, "codex-tokens"),
+		),
 		sessionCommand: env.GJC_COORDINATOR_MCP_SESSION_COMMAND?.trim() || null,
+		requireWorktree: parseBool(env.GJC_COORDINATOR_MCP_REQUIRE_WORKTREE),
 		sessionIdleTtlMs: parsePositiveIntMs(
 			env.GJC_COORDINATOR_MCP_SESSION_IDLE_TTL_MS,
 			DEFAULT_SESSION_IDLE_TTL_MS,
@@ -190,16 +217,69 @@ async function canonicalAllowedRoots(config: CoordinatorMcpConfig): Promise<stri
 	return roots.map(root => path.resolve(root));
 }
 
+async function canonicalSessionRoots(config: CoordinatorMcpConfig): Promise<string[]> {
+	const roots = await canonicalAllowedRoots(config);
+	const managed = await Promise.all(config.managedWorktreeRoots.map(root => realpathIfExists(root)));
+	return [...roots, ...managed.map(root => path.resolve(root))];
+}
+
+async function canonicalPersistedAllowedRoots(
+	config: CoordinatorMcpConfig,
+	canonicalizePath?: (value: string) => Promise<string>,
+): Promise<string[]> {
+	const roots = canonicalizePath
+		? await Promise.all(config.allowedRoots.map(root => canonicalizePath(root)))
+		: await canonicalAllowedRoots(config);
+	const managed = config.managedWorktreeRoots.map(root =>
+		canonicalizePath ? canonicalizePath(root) : realpathIfExists(root),
+	);
+	return [...roots, ...(await Promise.all(managed)).map(root => path.resolve(root))];
+}
+
+function isInsideCanonicalRoot(candidate: string, root: string, platform: NodeJS.Platform): boolean {
+	if (platform !== "win32") return isInside(candidate, root);
+	const windows = (value: string) => value.replaceAll("/", "\\").toLowerCase();
+	const relative = path.win32.relative(windows(root), windows(candidate));
+	return relative === "" || (!!relative && !relative.startsWith("..") && !path.win32.isAbsolute(relative));
+}
+
 export async function assertCoordinatorWorkdir(config: CoordinatorMcpConfig, cwd: unknown): Promise<string> {
 	if (typeof cwd !== "string" || cwd.trim().length === 0) throw new Error("coordinator_workdir_required");
 	if (config.allowedRoots.length === 0) throw new Error("coordinator_workdir_roots_required");
 	const requested = path.resolve(cwd);
 	const canonicalRequested = await realpathIfExists(requested);
-	const roots = await canonicalAllowedRoots(config);
+	const roots = await canonicalSessionRoots(config);
 	if (!roots.some(root => isInside(canonicalRequested, root))) {
 		throw new Error(`coordinator_workdir_outside_allowed_roots:${requested}`);
 	}
 	return requested;
+}
+
+/** Revalidate persisted session locations against the current root policy. */
+export async function assertCoordinatorSessionLocations(
+	config: CoordinatorMcpConfig,
+	cwd: unknown,
+	brokerWorkspace: unknown,
+	options: { canonicalizePath?: (value: string) => Promise<string>; platform?: NodeJS.Platform } = {},
+): Promise<void> {
+	if (typeof cwd !== "string" || cwd.trim().length === 0) throw new Error("coordinator_workdir_required");
+	if (typeof brokerWorkspace !== "string" || brokerWorkspace.trim().length === 0)
+		throw new Error("coordinator_workspace_required");
+	if (config.allowedRoots.length === 0) throw new Error("coordinator_workdir_roots_required");
+	const platform = options.platform ?? process.platform;
+	const canonicalize = options.canonicalizePath ?? realpathIfExists;
+	const [canonicalCwd, canonicalWorkspace, roots] = await Promise.all([
+		canonicalize(cwd),
+		canonicalize(brokerWorkspace),
+		canonicalPersistedAllowedRoots(config, options.canonicalizePath),
+	]);
+	// Reauthorize both persisted locations independently. A managed worktree may
+	// differ from the requested cwd, but neither may escape the current roots.
+	if (
+		!roots.some(root => isInsideCanonicalRoot(canonicalCwd, root, platform)) ||
+		!roots.some(root => isInsideCanonicalRoot(canonicalWorkspace, root, platform))
+	)
+		throw new Error("coordinator_workdir_outside_allowed_roots");
 }
 
 export async function assertCoordinatorArtifactPath(
@@ -231,7 +311,7 @@ export function requireCoordinatorMutation(
 }
 
 export function coordinatorNamespacePath(config: CoordinatorMcpConfig): string {
-	return path.join(config.stateRoot, "v1", config.namespace.identity);
+	return path.join(config.stateRoot, "v1", config.namespace.identity, "projections");
 }
 
 /** Opens and authorizes an artifact by the opened handle identity, not a racy pathname. */
@@ -242,7 +322,7 @@ export async function safeOpenCoordinatorArtifact(
 	if (typeof artifactPath !== "string" || artifactPath.trim().length === 0)
 		throw new Error("coordinator_artifact_path_required");
 	if (config.allowedRoots.length === 0) throw new Error("coordinator_artifact_roots_required");
-	if (process.platform !== "linux") throw new Error("artifact_identity_unavailable");
+	if (!coordinatorArtifactCapability().available) throw new Error("artifact_identity_unavailable");
 	const requested = path.resolve(artifactPath);
 	await assertCoordinatorArtifactPath(config, requested);
 	const handle = await fs.open(requested, nodeFs.constants.O_RDONLY | nodeFs.constants.O_NOFOLLOW);

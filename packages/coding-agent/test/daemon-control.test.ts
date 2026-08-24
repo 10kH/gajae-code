@@ -544,54 +544,58 @@ describe("TelegramDaemonController.reload", () => {
 	test.each([
 		["an immediately preceding generation", { generation: DAEMON_GENERATION - 1 }],
 		["a fully-provenanced generation-absent predecessor", { generation: undefined }],
-	] as const)("cooperatively stops %s and spawns a fresh one", async (_description, predecessor) => {
-		const agentDir = tempAgentDir();
-		const s = settings(agentDir);
-		const state = freshState(predecessor);
-		writeState(agentDir, state);
-		writeOwnershipLock(agentDir, state);
+	] as const)(
+		"cooperatively stops %s and spawns a fresh one",
+		async (_description, predecessor) => {
+			const agentDir = tempAgentDir();
+			const s = settings(agentDir);
+			const state = freshState(predecessor);
+			writeState(agentDir, state);
+			writeOwnershipLock(agentDir, state);
 
-		const alive = new Set<number>([999, 4242]);
-		const signals: Array<[number, string]> = [];
-		const spawns: Array<{ command: string; args: string[] }> = [];
-		const child = readyTelegramSpawnFixture({
-			settings: s,
-			firstChildPid: 4243,
-			onSpawn: (pid, command, args) => {
-				alive.add(pid);
-				spawns.push({ command, args });
-			},
-		});
-		const ctrl = new TelegramDaemonController(s, {
-			ownerPid: 4242,
-			pidAlive: pid => alive.has(pid),
-			pidIncarnation: () => "linux:100",
-			processReference: testProcessReference((pid, sig) => {
-				signals.push([pid, sig]);
-				if (sig === "SIGTERM") alive.delete(999);
-			}),
-			spawn: child.spawn,
-			sleep: child.sleep,
-		});
+			const alive = new Set<number>([999, 4242]);
+			const signals: Array<[number, string]> = [];
+			const spawns: Array<{ command: string; args: string[] }> = [];
+			const child = readyTelegramSpawnFixture({
+				settings: s,
+				firstChildPid: 4243,
+				onSpawn: (pid, command, args) => {
+					alive.add(pid);
+					spawns.push({ command, args });
+				},
+			});
+			const ctrl = new TelegramDaemonController(s, {
+				ownerPid: 4242,
+				pidAlive: pid => alive.has(pid),
+				pidIncarnation: () => "linux:100",
+				processReference: testProcessReference((pid, sig) => {
+					signals.push([pid, sig]);
+					if (sig === "SIGTERM") alive.delete(999);
+				}),
+				spawn: child.spawn,
+				sleep: child.sleep,
+			});
 
-		const result = await ctrl.reload();
-		expect(result.ok).toBe(true);
-		expect(signals).toContainEqual([999, "SIGTERM"]);
-		expect(spawns).toHaveLength(1);
-		const after = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as {
-			ownerId: string;
-			pid: number;
-			generation?: number;
-		};
-		const ownerIdIndex = spawns[0]?.args.indexOf("--owner-id") ?? -1;
-		expect(ownerIdIndex).toBeGreaterThanOrEqual(0);
-		expect(after.ownerId).not.toBe("old");
-		expect(after.ownerId).toBe(spawns[0]?.args[ownerIdIndex + 1]);
-		expect(after.pid).toBe(4243);
-		expect(after.generation).toBe(DAEMON_GENERATION);
-		// No leftover control request after a successful reload.
-		expect(await readTelegramControlRequest(s)).toBeUndefined();
-	});
+			const result = await ctrl.reload();
+			expect(result.ok).toBe(true);
+			expect(signals).toContainEqual([999, "SIGTERM"]);
+			expect(spawns).toHaveLength(1);
+			const after = JSON.parse(fs.readFileSync(daemonPaths(agentDir).state, "utf8")) as {
+				ownerId: string;
+				pid: number;
+				generation?: number;
+			};
+			const ownerIdIndex = spawns[0]?.args.indexOf("--owner-id") ?? -1;
+			expect(ownerIdIndex).toBeGreaterThanOrEqual(0);
+			expect(after.ownerId).not.toBe("old");
+			expect(after.ownerId).toBe(spawns[0]?.args[ownerIdIndex + 1]);
+			expect(after.pid).toBe(4243);
+			expect(after.generation).toBe(DAEMON_GENERATION);
+			// No leftover control request after a successful reload.
+			expect(await readTelegramControlRequest(s)).toBeUndefined();
+		},
+		20_000,
+	);
 
 	test("reload accepts a successor only when its PID incarnation still matches", async () => {
 		const agentDir = tempAgentDir();

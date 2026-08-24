@@ -26,6 +26,7 @@ import {
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
+import { resolveSdkPackageAuthority } from "../sdk/broker/runtime";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkSessionCli } from "../sdk/cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
@@ -324,43 +325,61 @@ export async function openLifecycleSessionManager(
 ): Promise<{ parsed: ParsedArgs; sessionManager: SessionManager | undefined }> {
 	const parsed = await lifecycleArgs(request, cwd, agentDir);
 	const lifecycleSettings = await Settings.loadForScope({ cwd, agentDir });
-	const migrationPolicy =
-		lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
-	if (request.operation === "session.create") {
-		return { parsed, sessionManager: await createSessionManager(parsed, cwd, lifecycleSettings) };
-	}
-	const snapshot = await captureLifecycleTranscript(request, cwd, agentDir, migrationPolicy);
 	let sessionManager: SessionManager | undefined;
-	if (request.operation === "session.resume") {
-		const opened = await SessionManager.openExistingStrict(
-			snapshot.identity,
-			SessionManager.managedDestination(cwd, agentDir),
-			undefined,
-			migrationPolicy,
-			lifecycleSettings.get("sessionMemory.mode"),
-		);
-		if (opened.kind === "error")
-			throw new Error("Lifecycle saved session authority changed while the session host opened it.");
-		sessionManager = opened.manager;
-		try {
-			await revalidateLifecycleTranscript(snapshot.identity);
-		} catch (error) {
-			await sessionManager.close();
-			throw error;
+	let result: { parsed: ParsedArgs; sessionManager: SessionManager | undefined } | undefined;
+	let operationError: unknown;
+	try {
+		const migrationPolicy =
+			lifecycleSettings.get("session.directoryMigration") === "disabled" ? "disabled" : "copy-retain";
+		if (request.operation === "session.create") {
+			sessionManager = await createSessionManager(parsed, cwd, lifecycleSettings);
+		} else {
+			const snapshot = await captureLifecycleTranscript(request, cwd, agentDir, migrationPolicy);
+			if (request.operation === "session.resume") {
+				const opened = await SessionManager.openExistingStrict(
+					snapshot.identity,
+					SessionManager.managedDestination(cwd, agentDir),
+					undefined,
+					migrationPolicy,
+					lifecycleSettings.get("sessionMemory.mode"),
+				);
+				if (opened.kind === "error")
+					throw new Error("Lifecycle saved session authority changed while the session host opened it.");
+				sessionManager = opened.manager;
+				try {
+					await revalidateLifecycleTranscript(snapshot.identity);
+				} catch (error) {
+					await sessionManager.close();
+					throw error;
+				}
+			} else {
+				const forked = await SessionManager.forkFromCaptured(
+					snapshot,
+					cwd,
+					SessionManager.managedDestination(cwd, agentDir),
+					migrationPolicy,
+					lifecycleSettings.get("sessionMemory.mode"),
+				);
+				if (forked.kind === "error")
+					throw new Error("Lifecycle saved session authority changed while the session host forked it.");
+				sessionManager = forked.manager;
+			}
 		}
-	} else {
-		const forked = await SessionManager.forkFromCaptured(
-			snapshot,
-			cwd,
-			SessionManager.managedDestination(cwd, agentDir),
-			migrationPolicy,
-			lifecycleSettings.get("sessionMemory.mode"),
-		);
-		if (forked.kind === "error")
-			throw new Error("Lifecycle saved session authority changed while the session host forked it.");
-		sessionManager = forked.manager;
+		result = { parsed, sessionManager };
+	} catch (error) {
+		operationError = error;
 	}
-	return { parsed, sessionManager };
+	let cleanupError: unknown;
+	try {
+		await lifecycleSettings.close();
+	} catch (error) {
+		cleanupError = error;
+		await sessionManager?.close().catch(() => undefined);
+	}
+	if (cleanupError !== undefined) throw cleanupError;
+	if (operationError !== undefined) throw operationError;
+	if (!result) throw new Error("Lifecycle session manager result was not produced.");
+	return result;
 }
 
 /**
@@ -960,11 +979,24 @@ export default class Sdk extends Command {
 			return;
 		}
 		const agentDir = internal.agentDir;
+		const authority = resolveSdkPackageAuthority({ force: true });
 		const broker = new Broker({
 			agentDir,
+			// Published in broker discovery so ensurers can retire a broker that
+			// predates the current package install instead of reusing stale code.
+			// Resolve inside the child: the parent may have observed a different
+			// package between spawn resolution and child startup.
+			packageGeneration: authority.generation,
+			packageVersion: authority.packageVersion,
+			installationIdentity: authority.installationIdentity,
 			resolveDirectoryMigration: async cwd => {
-				const policy = (await Settings.loadForScope({ cwd, agentDir })).get("session.directoryMigration");
-				return policy === "disabled" ? "disabled" : "copy-retain";
+				const settings = await Settings.loadForScope({ cwd, agentDir });
+				try {
+					const policy = settings.get("session.directoryMigration");
+					return policy === "disabled" ? "disabled" : "copy-retain";
+				} finally {
+					await settings.close();
+				}
 			},
 		});
 		try {

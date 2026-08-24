@@ -1,10 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test, vi } from "bun:test";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Container, Input } from "@gajae-code/tui";
 import { getAgentDir, getDefaultTabWidth, getLogsDir, setAgentDir, setDefaultTabWidth } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { defaultEditorTheme } from "../../tui/test/test-themes";
 import { AsyncJobManager } from "../src/async";
 import { DebugSelectorComponent } from "../src/debug";
@@ -191,15 +192,27 @@ function restoreEnvVar(name: string, original: string | undefined): void {
  * agent directory gets its own mkdtemp root. The resolved config root is
  * asserted to sit inside the exclusive name before anything is seeded, so a
  * resolver that refuses the override (e.g. a project-env provenance clash)
- * fails the test loudly instead of touching the real `~/.gjc`. The returned
- * restore closure puts the exact prior environment and agent directory back
- * and removes both exclusive trees.
+ * fails the test loudly instead of touching the real `~/.gjc`.
+ *
+ * The config root is derived from the home directory, so the home is first
+ * redirected to an owned temp tree. Anchoring the exclusive name under the
+ * real home instead put the tree outside every allowed cleanup root, and the
+ * fail-closed test cleanup contract (#4794) aborted the whole test process
+ * rather than recursing there — taking every later file in the run with it and
+ * leaving the directory behind in the developer's home.
+ *
+ * The returned restore closure puts the exact prior environment, home, and
+ * agent directory back and removes both exclusive trees.
  */
 async function pinExclusiveDirState(): Promise<{ restore: () => Promise<void> }> {
 	const originalAgentDir = getAgentDir();
 	const originalConfigDir = process.env.PI_CONFIG_DIR;
 	const originalGjcConfigDir = process.env.GJC_CONFIG_DIR;
 	const originalCodingAgentDir = process.env.GJC_CODING_AGENT_DIR;
+	const originalHome = process.env.HOME;
+	const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-composer-detach-home-"));
+	const homedirSpy = vi.spyOn(os, "homedir").mockReturnValue(homeRoot);
+	process.env.HOME = homeRoot;
 	const agentRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-composer-detach-agent-"));
 	const configName = `gjc-composer-detach-${randomUUID()}`;
 	process.env.GJC_CONFIG_DIR = configName;
@@ -217,8 +230,10 @@ async function pinExclusiveDirState(): Promise<{ restore: () => Promise<void> }>
 			// setAgentDir re-exports GJC_CODING_AGENT_DIR, so restore it after.
 			setAgentDir(originalAgentDir);
 			restoreEnvVar("GJC_CODING_AGENT_DIR", originalCodingAgentDir);
-			await fs.rm(agentRoot, { recursive: true, force: true });
-			await fs.rm(configRoot, { recursive: true, force: true });
+			restoreEnvVar("HOME", originalHome);
+			homedirSpy.mockRestore();
+			await safeRm(agentRoot, { recursive: true, force: true });
+			await safeRm(homeRoot, { recursive: true, force: true });
 		},
 	};
 }

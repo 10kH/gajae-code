@@ -32,6 +32,8 @@ export const INBOUND_REACTION_TOMBSTONE_WINDOW = 512;
 export class InboundReactionSequencer {
 	/** Update ids whose reaction reached a terminal (consumed/retracted) state. */
 	readonly #terminal = new Map<number, true>();
+	/** Highest terminal update id observed, independent of effect completion order. */
+	#newestTerminalId: number | undefined;
 	/** Per-update serialization chain, deleted once settled. */
 	readonly #chains = new Map<number, Promise<void>>();
 
@@ -50,23 +52,24 @@ export class InboundReactionSequencer {
 			await transition.effect();
 			if (transition.terminal) {
 				this.#terminal.set(updateId, true);
-				this.#evictStaleTombstones(updateId);
+				this.#newestTerminalId = Math.max(this.#newestTerminalId ?? updateId, updateId);
+				this.#evictStaleTombstones(this.#newestTerminalId);
 			}
 		};
 		const prior = this.#chains.get(updateId) ?? Promise.resolve();
 		const next = prior.then(run, run);
 		// The chain is retained only while unsettled work exists for the update;
 		// once settled it is deleted so the map cannot grow without bound. The
+		// delete is identity-guarded: an earlier transition settling must not
+		// drop a tail a later transition has already installed, or the next
+		// apply() would chain onto a fresh promise and run unserialized. The
 		// stored tail never rejects (both arms handle) so an unawaited chain can
 		// never surface an unhandled rejection.
-		const settled = next.then(
-			() => this.#chains.delete(updateId),
-			() => this.#chains.delete(updateId),
-		);
-		this.#chains.set(
-			updateId,
-			settled.then(() => undefined),
-		);
+		const release = (): void => {
+			if (this.#chains.get(updateId) === tail) this.#chains.delete(updateId);
+		};
+		const tail: Promise<void> = next.then(release, release);
+		this.#chains.set(updateId, tail);
 		return next;
 	}
 

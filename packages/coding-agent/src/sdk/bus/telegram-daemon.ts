@@ -12,7 +12,13 @@ import type { DaemonRuntimeInfo } from "../../daemon/control-types";
 import { resolveGjcRuntimeSpawnInfo } from "../../daemon/runtime";
 import { resizeImageBuffer } from "../../utils/image-resize";
 import { isProcessIncarnation, processIncarnation } from "../broker/process-incarnation";
-import { getNotificationConfig, isProviderEffectivelyEnabled, isTelegramComplete, tokenFingerprint } from "./config";
+import {
+	getNotificationConfig,
+	isProviderEffectivelyEnabled,
+	isTelegramComplete,
+	sessionTag,
+	tokenFingerprint,
+} from "./config";
 import {
 	parseInThreadConfigCommand,
 	parseRichToggleCommand,
@@ -46,6 +52,14 @@ import {
 	TelegramDaemonController,
 } from "./telegram-daemon-control";
 import { type TelegramSetupPreflight, withTelegramSetupLease } from "./telegram-setup";
+
+export {
+	loadInstallationHostId,
+	loadLegacyInstallationHostId,
+	type MachineIdentityDeps,
+	parseMacPlatformUuid,
+	parseWindowsMachineGuid,
+} from "../../config/machine-identity";
 
 export {
 	DAEMON_GENERATION,
@@ -875,11 +889,13 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 	private readonly platform: NodeJS.Platform;
 	private readonly exactReplace: TopicRegistryExactReplace;
 	private readonly installationHostId: string;
+	private readonly previousInstallationHostIds: readonly string[];
 
 	constructor(
 		private readonly file: string,
 		input: {
 			installationHostId: string;
+			previousInstallationHostIds?: readonly string[];
 			fs?: TelegramDaemonFs;
 			platform?: NodeJS.Platform;
 			exactReplace?: TopicRegistryExactReplace;
@@ -887,6 +903,7 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 	) {
 		if (!input.installationHostId) throw new Error("installationHostId must be non-empty");
 		this.installationHostId = input.installationHostId;
+		this.previousInstallationHostIds = input.previousInstallationHostIds ?? [];
 		this.fsImpl = input.fs ?? nodeFs;
 		this.platform = input.platform ?? process.platform;
 		this.exactReplace = input.exactReplace ?? exactReplacePath;
@@ -896,6 +913,7 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 		return await withFileLock(this.file, async () => await this.readLocked(), {
 			staleMs: 10_000,
 			ownerHostId: this.installationHostId,
+			previousOwnerHostIds: this.previousInstallationHostIds,
 		});
 	}
 
@@ -925,7 +943,11 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 				);
 				return true;
 			},
-			{ staleMs: 10_000, ownerHostId: this.installationHostId },
+			{
+				staleMs: 10_000,
+				ownerHostId: this.installationHostId,
+				previousOwnerHostIds: this.previousInstallationHostIds,
+			},
 		);
 	}
 
@@ -980,77 +1002,6 @@ export class FilesystemTopicRegistryCasAuthority implements TopicRegistryCasAuth
 		}
 		await writeTopicRegistryAtomic(this.fsImpl, quarantinePath, raw, this.platform, this.exactReplace);
 	}
-}
-
-export interface MachineIdentityDeps {
-	platform?: NodeJS.Platform;
-	readFile?: (file: string) => Promise<string>;
-	runCommand?: (command: string, args: readonly string[]) => { exitCode: number; stdout: Uint8Array };
-}
-
-function normalizedMachineIdentity(value: string, pattern: RegExp): string | undefined {
-	const normalized = value.trim().toLowerCase();
-	if (!pattern.test(normalized) || /^0+$/.test(normalized.replace(/-/g, ""))) return undefined;
-	return normalized;
-}
-
-/** @internal */
-export function parseWindowsMachineGuid(output: string): string | undefined {
-	const match = /^\s*MachineGuid\s+REG_\w+\s+(\S+)\s*$/im.exec(output);
-	return match
-		? normalizedMachineIdentity(match[1], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
-		: undefined;
-}
-
-/** @internal */
-export function parseMacPlatformUuid(output: string): string | undefined {
-	const match = /"IOPlatformUUID"\s*=\s*"([^"]+)"/.exec(output);
-	return match
-		? normalizedMachineIdentity(match[1], /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
-		: undefined;
-}
-
-function hashMachineIdentity(rawId: string): string {
-	return crypto
-		.createHash("sha256")
-		.update("gajae-code:telegram-daemon:machine-identity:v1\0")
-		.update(rawId)
-		.digest("hex");
-}
-
-/** Loads a verified machine-local identity without persisting the underlying machine ID. */
-export async function loadInstallationHostId(deps: MachineIdentityDeps = {}): Promise<string> {
-	const platform = deps.platform ?? process.platform;
-	const readFile = deps.readFile ?? (async (file: string) => await fs.promises.readFile(file, "utf8"));
-	const runCommand =
-		deps.runCommand ??
-		((command: string, args: readonly string[]) =>
-			Bun.spawnSync([command, ...args], { stdout: "pipe", stderr: "ignore" }));
-
-	let rawId: string | undefined;
-	if (platform === "linux") {
-		for (const file of ["/etc/machine-id", "/var/lib/dbus/machine-id"]) {
-			try {
-				const value = normalizedMachineIdentity(await readFile(file), /^[0-9a-f]{32}$/);
-				if (!value) throw new Error("machine-local identity is unavailable or malformed");
-				rawId = value;
-				break;
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-			}
-		}
-	} else if (platform === "win32") {
-		const result = runCommand("reg", ["query", "HKLM\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"]);
-		if (result.exitCode === 0) rawId = parseWindowsMachineGuid(new TextDecoder().decode(result.stdout));
-	} else if (platform === "darwin") {
-		const result = runCommand("ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"]);
-		if (result.exitCode === 0) rawId = parseMacPlatformUuid(new TextDecoder().decode(result.stdout));
-	} else {
-		throw new Error(`machine-local identity is unsupported on ${platform}`);
-	}
-
-	if (!rawId) throw new Error("machine-local identity is unavailable or malformed");
-	return hashMachineIdentity(rawId);
 }
 
 function validDaemonPid(pid: unknown): pid is number {
@@ -10887,6 +10838,10 @@ export class TelegramNotificationDaemon {
 				recommendedIndex: msg.recommendedIndex,
 				controls,
 				summary: msg.summary,
+				// Flat private-chat fallback has no topic carrying the session
+				// identity, so the idle marker needs the short tag (#4855). Topic
+				// delivery keeps the bare marker per #981's identity-once contract.
+				sessionTag: topicId ? undefined : sessionTag(logicalSessionId),
 			});
 			const kind = msg.kind === "idle" ? "idle" : "ask";
 			const callbackDispatchAuthorityIsCurrent = (): boolean =>
@@ -10995,6 +10950,7 @@ export class TelegramNotificationDaemon {
 								options: displayOptions,
 								recommendedIndex: msg.recommendedIndex,
 								summary: msg.summary,
+								sessionTag: topicId ? undefined : sessionTag(logicalSessionId),
 							}),
 							replyMarkup: kind === "ask" && inline_keyboard.length ? { inline_keyboard } : undefined,
 						},

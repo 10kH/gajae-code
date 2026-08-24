@@ -2,6 +2,7 @@
  * Conventional MCP autoload: ordinary top-level standalone sessions consume
  * `gjc mcp add` registrations (issue #4284).
  */
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -13,6 +14,7 @@ import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { getAgentDir, setAgentDir } from "@gajae-code/utils";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import { runMCPCommand } from "../src/cli/mcp-cli";
 import { MCPManager } from "../src/runtime-mcp";
 
@@ -78,9 +80,9 @@ describe("conventional MCP autoload in standalone sessions", () => {
 	afterEach(async () => {
 		vi.restoreAllMocks();
 		setAgentDir(originalAgentDir);
-		await fs.promises.rm(projectDir, { recursive: true, force: true });
-		await fs.promises.rm(agentDir, { recursive: true, force: true });
-		await fs.promises.rm(tempHome, { recursive: true, force: true });
+		await safeRm(projectDir, { recursive: true, force: true });
+		await safeRm(agentDir, { recursive: true, force: true });
+		await safeRm(tempHome, { recursive: true, force: true });
 	});
 
 	function isolatedSessionOptions() {

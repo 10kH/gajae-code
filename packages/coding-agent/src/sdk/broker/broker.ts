@@ -36,12 +36,15 @@ import {
 	type LifecycleStartupFailureReceipt,
 	type LifecycleState,
 } from "./lifecycle-ledger";
+import { resolveSdkPackageAuthority } from "./runtime";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
 	agentDir: string;
 	packageGeneration?: string;
+	packageVersion?: string;
+	installationIdentity?: string;
 	port?: number;
 	heartbeatTtlMs?: number;
 	/** Broker-owned migration policy. Client lifecycle frames cannot select it. */
@@ -51,6 +54,8 @@ export interface BrokerSettings {
 type ResolvedBrokerSettings = {
 	agentDir: string;
 	packageGeneration: string;
+	packageVersion: string;
+	installationIdentity: string;
 	port: number;
 	heartbeatTtlMs: number;
 	resolveDirectoryMigration: (_cwd: string) => Promise<DirectoryMigrationPolicy>;
@@ -209,8 +214,18 @@ const LIFECYCLE_OPERATIONS = new Set([
 	"session.delete",
 ]);
 
-function lifecycleFingerprint(operation: string, input: unknown): string {
-	return createHash("sha256").update(JSON.stringify({ operation, input })).digest("hex");
+/** Bootstrap signing material and its public candidate id authorize a launch but are not lifecycle request identity. */
+function lifecycleRequestIdentity(input: Record<string, unknown>): Record<string, unknown> {
+	const identity = { ...input };
+	delete identity.coordinatorSidecarSigningKey;
+	delete identity.coordinatorSidecarKeyId;
+	return identity;
+}
+
+function lifecycleFingerprint(operation: string, input: Record<string, unknown>): string {
+	return createHash("sha256")
+		.update(JSON.stringify({ operation, input: lifecycleRequestIdentity(input) }))
+		.digest("hex");
 }
 function lifecycleResponseState(response: BrokerResponse): LifecycleState {
 	if (response.ok) return "terminal_ok";
@@ -448,10 +463,11 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 	const id = string(input.sessionId, input.id);
 	switch (operation) {
 		case "session.create":
-			return { root };
+			return { root, worktree: lifecycleWorktreeTarget(input) };
 		case "session.fork":
 			return {
 				root,
+				worktree: lifecycleWorktreeTarget(input),
 				sourceSessionId: string(input.sourceSessionId, input.sourceId),
 				sourceSessionPath: string(input.sourceSessionPath, input.sourcePath, input.sessionPath),
 			};
@@ -462,6 +478,26 @@ function lifecycleTarget(operation: string, input: Record<string, unknown>): unk
 		default:
 			return { operation, root, sessionId: id };
 	}
+}
+
+/**
+ * A lifecycle request without a worktree remains serialized by its state root.
+ * Worktree launches instead serialize on the source repository plus the
+ * deterministic worktree selector, so concurrent requests cannot both observe
+ * an empty session index and then prepare the same checkout.
+ */
+function lifecycleWorktreeTarget(input: Record<string, unknown>): { name: string | null } | undefined {
+	const worktree = input.worktree;
+	if (worktree === undefined || worktree === false) return undefined;
+	if (worktree === true) return { name: null };
+	if (typeof worktree !== "object" || worktree === null || Array.isArray(worktree)) return undefined;
+	const name = (worktree as Record<string, unknown>).name;
+	return typeof name === "string" && name.length > 0 ? { name } : { name: null };
+}
+
+/** Test seam for lifecycle serialization identity. */
+export function lifecycleTargetForTest(operation: string, input: Record<string, unknown>): unknown {
+	return lifecycleTarget(operation, input);
 }
 
 const BROKER_LOCK_RECORD = "owner.json";
@@ -816,9 +852,17 @@ export class Broker {
 	#rejectCompletion!: (error: unknown) => void;
 	readonly #resolveModelPin: SdkHostModelResolver;
 	constructor(settings: BrokerSettings) {
+		const authority =
+			settings.packageGeneration === undefined ||
+			settings.packageVersion === undefined ||
+			settings.installationIdentity === undefined
+				? resolveSdkPackageAuthority()
+				: undefined;
 		this.settings = {
 			agentDir: settings.agentDir,
-			packageGeneration: settings.packageGeneration ?? "unknown",
+			packageGeneration: settings.packageGeneration ?? authority!.generation,
+			packageVersion: settings.packageVersion ?? authority!.packageVersion,
+			installationIdentity: settings.installationIdentity ?? authority!.installationIdentity,
 			port: settings.port ?? 0,
 			heartbeatTtlMs: settings.heartbeatTtlMs ?? BROKER_HEARTBEAT_TTL_MS,
 			resolveDirectoryMigration: settings.resolveDirectoryMigration ?? (async () => "copy-retain"),
@@ -1041,6 +1085,8 @@ export class Broker {
 				version: 1,
 				protocolVersion: 3,
 				packageGeneration: this.settings.packageGeneration,
+				packageVersion: this.settings.packageVersion,
+				installationIdentity: this.settings.installationIdentity,
 				ownerId: this.#owner,
 				pid: process.pid,
 				incarnation,
@@ -1604,7 +1650,10 @@ export class Broker {
 		}
 		const storedRequestHash = reconstructedDeleteCleanup ? this.ledger.get(identity)?.requestHash : undefined;
 		const requestHash =
-			storedRequestHash ?? createHash("sha256").update(canonicalJson({ operation, input })).digest("hex");
+			storedRequestHash ??
+			createHash("sha256")
+				.update(canonicalJson({ operation, input: lifecycleRequestIdentity(input) }))
+				.digest("hex");
 		const prev = this.#chains.get(target) ?? Promise.resolve();
 		let release!: () => void;
 		const current = new Promise<void>(resolve => (release = resolve));

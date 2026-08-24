@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { hookFetch } from "@gajae-code/utils";
+import { resetSettingsForTest, Settings } from "../../src/config/settings";
+import type { AuthStorage } from "../../src/session/auth-storage";
 import { runSearchQuery } from "../../src/web/search";
 import {
 	buildExaRequestBody,
+	ExaProvider,
 	normalizeSearchType,
 	searchExa,
 	synthesizeAnswer,
@@ -207,6 +210,7 @@ describe("searchExa", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		delete process.env.EXA_API_KEY;
+		resetSettingsForTest();
 	});
 
 	function mockFetch(responseBody: unknown, status = 200): Disposable {
@@ -358,6 +362,17 @@ describe("searchExa", () => {
 
 		await expect(searchExa({ query: "no key" })).rejects.toThrow("EXA_API_KEY is required");
 		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	it("standalone provider availability honors the global Exa disable policy", async () => {
+		resetSettingsForTest();
+		await Settings.init({
+			inMemory: true,
+			cwd: process.cwd(),
+			overrides: { "exa.enabled": false },
+		});
+
+		expect(new ExaProvider().isAvailable({} as AuthStorage)).toBe(false);
 	});
 
 	it("runSearchQuery with provider=exa falls back to DuckDuckGo without EXA_API_KEY", async () => {

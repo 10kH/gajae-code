@@ -21,6 +21,11 @@ import {
 	readSseEvents,
 } from "@gajae-code/utils";
 import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
+import {
 	hasOpus47ApiRestrictions,
 	mapEffortToAnthropicAdaptiveEffort,
 	supportsAnthropicAdaptiveThinkingDisplay as supportsAdaptiveThinkingDisplay,
@@ -2455,7 +2460,10 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 							const rawStopReason = event.delta.stop_reason as string | null | undefined;
 							const stopDetails = event.delta.stop_details;
 							const isProviderSafetyStop =
-								rawStopReason === "refusal" || rawStopReason === "sensitive" || stopDetails?.type === "refusal";
+								rawStopReason === "refusal" ||
+								rawStopReason === "sensitive" ||
+								stopDetails?.type === "refusal" ||
+								stopDetails?.type === "sensitive";
 							if (rawStopReason) {
 								output.stopReason = isProviderSafetyStop ? "error" : mapStopReason(rawStopReason);
 								sawTerminalEnvelope = true;
@@ -2464,7 +2472,28 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 								sawProviderSafetyStop = true;
 								sawTerminalEnvelope = true;
 								output.stopReason = "error";
-								output.errorKind = "provider_safety_stop";
+								// Mint the terminal kind with adapter provenance: the
+								// structured refusal signal was parsed from the stream
+								// delta, so the mark (not the wire field) carries the
+								// authority (#4777).
+								const authenticated = mintProviderSafetyStop(
+									output,
+									stopDetails?.type === "refusal" || stopDetails?.type === "sensitive"
+										? stopDetails.type
+										: rawStopReason === "sensitive"
+											? "sensitive"
+											: "refusal",
+									PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+									options?.fetch ?? options?.client,
+									isProviderSafetyStopAdapterInvocation(options),
+								);
+								if (!authenticated) {
+									output.transportFailure = {
+										kind: "transport",
+										status: 500,
+										providerCode: "untrusted_safety_stop",
+									};
+								}
 								if (stopDetails?.type === "refusal") {
 									const explanation = stopDetails.explanation?.trim();
 									const category = stopDetails.category;
@@ -2977,7 +3006,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 			const localAbortReason = activeAbortTracker.getLocalAbortReason();
 			output.stopReason = activeAbortTracker.wasCallerAbort() ? "aborted" : "error";
 			output.errorStatus = extractHttpStatusFromError(localAbortReason ?? error);
-			output.transportFailure = transportFailureFacts(localAbortReason ?? error);
+			output.transportFailure = transportFailureFacts(localAbortReason ?? error) ?? output.transportFailure;
 			if (output.errorKind !== "provider_safety_stop" || !output.errorMessage) {
 				output.errorMessage =
 					localAbortReason?.message ?? (await finalizeAnthropicErrorMessage(error, rawRequestDump));

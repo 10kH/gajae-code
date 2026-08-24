@@ -5,6 +5,7 @@ import { Agent } from "@gajae-code/agent-core";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async/job-manager";
 import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
+import { EventController } from "@gajae-code/coding-agent/modes/controllers/event-controller";
 import { InteractiveMode, resolveActivityIndicatorMessage } from "@gajae-code/coding-agent/modes/interactive-mode";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { AgentSession } from "@gajae-code/coding-agent/session/agent-session";
@@ -80,6 +81,84 @@ describe("interactive background activity indicator", () => {
 		expect(resolveActivityIndicatorMessage(false, 2, "Working…")).toBe("Background: 2 tasks…");
 		expect(resolveActivityIndicatorMessage(true, 2, "Working…")).toBe("Working… · 2 background tasks");
 	});
+
+	it("retires the foreground indicator when agent_end races stale streaming state", async () => {
+		mode.ensureLoadingAnimation();
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const controller = new EventController(mode);
+
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		mode.syncActivityIndicator();
+
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(renderStatus(mode)).toBe("");
+	});
+
+	it("retires stale foreground activity across maintenance stop boundaries", async () => {
+		mode.ensureLoadingAnimation();
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const controller = new EventController(mode);
+
+		await controller.handleEvent({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+		mode.autoCompactionLoader?.stop();
+		mode.autoCompactionLoader = undefined;
+		mode.statusContainer.clear();
+		mode.syncActivityIndicator();
+
+		expect(mode.loadingAnimation).toBeUndefined();
+		expect(renderStatus(mode)).toBe("");
+	});
+
+	it("preserves background activity and re-arms after settled terminal cleanup", async () => {
+		const ownerId = session.getAgentId();
+		if (!ownerId) throw new Error("Expected an owner id");
+		const background = Promise.withResolvers<string>();
+		pendingJobs.push(background);
+		const jobId = manager.register("task", "terminal-boundary activity", () => background.promise, { ownerId });
+		manager.registerSubagentRecord({
+			subagentId: "terminal-boundary-subagent",
+			ownerId,
+			currentJobId: jobId,
+			historicalJobIds: [],
+			status: "running",
+			sessionFile: null,
+			resumable: false,
+		});
+		await waitFor(() => mode.loadingAnimation !== undefined);
+
+		mode.ensureLoadingAnimation();
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const controller = new EventController(mode);
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		mode.syncActivityIndicator();
+		const backgroundLoader = mode.loadingAnimation;
+		if (!backgroundLoader) throw new Error("Expected background loader after agent_end");
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		mode.syncActivityIndicator();
+		expect(mode.loadingAnimation).toBe(backgroundLoader);
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		const releaseSuspension = mode.suspendActivityIndicator();
+		expect(renderStatus(mode)).toBe("");
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		releaseSuspension();
+		expect(mode.loadingAnimation).toBe(backgroundLoader);
+		expect(renderStatus(mode)).toContain("Background: 1 task…");
+
+		await controller.handleEvent({ type: "agent_start" });
+		expect(renderStatus(mode)).toContain("Working…");
+		expect(renderStatus(mode)).toContain("1 background task");
+
+		background.resolve("done");
+		pendingJobs.pop();
+		await waitFor(() => manager.getAllJobs({ ownerId }).find(job => job.id === jobId)?.status === "completed");
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => false });
+		await controller.handleEvent({ type: "agent_end", messages: [] });
+		await waitFor(() => mode.loadingAnimation === undefined);
+	});
+
 	it("schedules the startup crash relay hook from trusted global settings", async () => {
 		const debug = vi.spyOn(logger, "debug");
 		Settings.instance.set("crashReport.upstream", "sentry");

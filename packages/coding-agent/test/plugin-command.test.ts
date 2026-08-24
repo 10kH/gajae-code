@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { CliConfig } from "@gajae-code/utils/cli";
+import { safeRm } from "../../../scripts/safe-cleanup";
 import Plugin from "../src/commands/plugin";
 
 const TEST_CONFIG: CliConfig = {
@@ -47,10 +48,10 @@ async function makeTempProject(): Promise<string> {
 describe("Plugin command scope parsing", () => {
 	afterEach(async () => {
 		if (tempRoot) {
-			await fs.rm(tempRoot, { recursive: true, force: true });
+			await safeRm(tempRoot, { recursive: true, force: true });
 			tempRoot = undefined;
 		}
-		for (const dir of agentDirs.splice(0)) await fs.rm(dir, { recursive: true, force: true });
+		for (const dir of agentDirs.splice(0)) await safeRm(dir, { recursive: true, force: true });
 	});
 	it("rejects invalid scope values", async () => {
 		const command = new Plugin(["install", "--scope", "porject"], TEST_CONFIG);
@@ -188,7 +189,7 @@ describe("Plugin command scope parsing", () => {
 			],
 		});
 	});
-	it("falls back to non-GJC uninstall when the GJC registry is corrupt", async () => {
+	it("fails closed on uninstall when the GJC registry is corrupt", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-plugin-command-agent-"));
 		agentDirs.push(agentDir);
 		const cwd = await makeTempProject();
@@ -198,8 +199,10 @@ describe("Plugin command scope parsing", () => {
 
 		const result = await runPluginCommand(["uninstall", "not-a-gjc-bundle"], cwd, agentDir);
 
-		expect(`${result.stdout}${result.stderr}`).toMatch(/Uninstalled|Failed to uninstall/);
-		expect(`${result.stdout}${result.stderr}`).not.toContain("Corrupt GJC plugin registry");
+		// Ownership is unknown while the registry is unreadable, so the command
+		// must refuse instead of falling through to a non-GJC uninstall.
+		expect(result.exitCode).toBe(3);
+		expect(`${result.stdout}${result.stderr}`).toContain("Could not read the GJC user plugin registry");
 	});
 
 	it("GJC install and upgrade failures never echo the source or its cause", async () => {
@@ -219,7 +222,7 @@ describe("Plugin command scope parsing", () => {
 		});
 		const seeded = await runPluginCommand(["install", stagedSource, "--project"], cwd);
 		expect(seeded.exitCode).toBe(0);
-		await fs.rm(stagedSource, { recursive: true, force: true });
+		await safeRm(stagedSource, { recursive: true, force: true });
 
 		const install = await runPluginCommand(["install", hostile, "--project"], cwd);
 		const installJson = await runPluginCommand(["install", hostile, "--project", "--json"], cwd);

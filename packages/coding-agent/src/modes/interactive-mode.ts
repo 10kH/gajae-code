@@ -114,6 +114,7 @@ import type { Theme } from "./theme/theme";
 import { getEditorTheme, getSymbolTheme, onTerminalAppearanceChange, onThemeChange, theme } from "./theme/theme";
 import { type RegisterTranscriptItem, TranscriptItemRegistry, transcriptItemId } from "./transcript-item-registry";
 import {
+	type ActivityIndicatorStopOptions,
 	type CompactionQueuedMessage,
 	type ComposerSubmissionOptions,
 	canApplyComposerSubmission,
@@ -496,6 +497,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#jobsObserver?: JobsObserver;
 	#tasksAggregator?: TasksAggregator;
 	#foregroundActivity = false;
+	#foregroundTurnSettled = false;
 	#activityIndicatorSuspensions = 0;
 	#suspendedActivityIndicator?: Loader;
 	#stopped = false;
@@ -644,11 +646,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#petTransportAvailabilityUnsubscribe = this.#itermPetTransport.subscribe(availability => {
 				if (!availability.available) void this.petWidget?.suspendItermCapability();
 				setVerifiedItermPetAvailability(availability);
-				if (availability.available) {
-					if (availability.mode === "managed") this.ui.refreshImageCellSize();
-					const saved = settings.get("pet.mode");
-					if (saved !== "off" && this.petWidget && this.petWidget.mode === "off") this.petWidget.setMode(saved);
-				}
+				if (availability.available && availability.mode === "managed") this.ui.refreshImageCellSize();
+				const petWidget = this.petWidget;
+				const active = petWidget?.mode;
+				if (active && active !== "off") petWidget.setMode(active);
 			});
 		}
 		this.ui.setClearOnShrink(settings.get("clearOnShrink"));
@@ -837,18 +838,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.petWidget = this.#createPetWidget(this.editor);
 		const configuredPetMode = settings.get("pet.mode");
 		this.petWidget.setMode(configuredPetMode);
-		// The async sixel capability probe can enable graphics after the saved
-		// pet mode was applied and dropped (no protocol yet at startup).
-		// Re-apply the configured mode when capability arrives so the pet
-		// appears without the user re-running /pet.
+		// The text-cell fallback renders immediately. Re-apply a saved mode if an
+		// asynchronous graphics probe later upgrades it to pixel rendering.
 		this.#petProtocolUnsubscribe?.();
 		this.#petProtocolUnsubscribe = onImageProtocolChanged(protocol => {
 			if (!protocol) {
 				void this.petWidget?.suspendItermCapability();
-				return;
 			}
 			const saved = settings.get("pet.mode");
-			if (saved !== "off" && this.petWidget && this.petWidget.mode === "off") {
+			if (saved !== "off" && this.petWidget) {
 				this.petWidget.setMode(saved);
 			}
 		});
@@ -1841,13 +1839,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	syncActivityIndicator(): void {
 		if (this.#stopped || this.#activityIndicatorSuspensions > 0 || this.autoCompactionLoader || this.retryLoader)
 			return;
-		const foregroundActive = this.#foregroundActivity || this.session.isStreaming;
+		const foregroundActive = this.#foregroundActivity || (!this.#foregroundTurnSettled && this.session.isStreaming);
 		if (!this.isInitialized && !foregroundActive) {
 			this.#stopLoadingAnimation();
 			return;
 		}
 		const message = resolveActivityIndicatorMessage(
-			this.#foregroundActivity || this.session.isStreaming,
+			foregroundActive,
 			this.#activeBackgroundTaskCount(),
 			this.#pendingWorkingMessage ?? this.#defaultWorkingMessage,
 		);
@@ -1874,12 +1872,14 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	ensureLoadingAnimation(): void {
+		this.#foregroundTurnSettled = false;
 		this.#foregroundActivity = true;
 		this.syncActivityIndicator();
 	}
 
-	stopLoadingAnimation(options?: { restoreBackground?: boolean }): void {
+	stopLoadingAnimation(options?: ActivityIndicatorStopOptions): void {
 		this.#foregroundActivity = false;
+		if (options?.foregroundSettled) this.#foregroundTurnSettled = true;
 		if (options?.restoreBackground === false) {
 			this.#stopLoadingAnimation();
 			return;

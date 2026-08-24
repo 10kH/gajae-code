@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentTool, AgentToolResult } from "@gajae-code/agent-core";
+import { Settings } from "../../src/config/settings";
 import * as pyExecutor from "../../src/eval/py/executor";
 import { sessionIpykernelsDir } from "../../src/gjc-runtime/session-layout";
 import { createSessionPythonTool, pythonKernelOwnerId } from "../../src/tools/python";
@@ -27,6 +28,7 @@ async function tempDir(): Promise<string> {
 function createTool(cwd: string, sessionId: string): AgentTool {
 	return createSessionPythonTool({
 		cwd,
+		settings: Settings.isolated(),
 		getSessionId: () => sessionId,
 		registerSessionCleanup: () => {},
 	});

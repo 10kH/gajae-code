@@ -47,6 +47,16 @@
  * `--apply`. The repository is pinned to the interactive report repository.
  */
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
+import {
+	applyOwnerOnlyFdSecurity,
+	applyOwnerOnlyPathSecurity,
+	exactRemoveDirectoryTree,
+	type NativeDirectoryTreeSnapshot,
+	renameNoReplacePath,
+	snapshotDirectoryTree,
+	verifyOwnerOnlyFdSecurity,
+	verifyOwnerOnlyPathSecurityExpected,
+} from "@gajae-code/natives";
 import { randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs/promises";
@@ -607,18 +617,59 @@ function isPending(value: unknown): value is { manifest: ApprovalManifest; attem
 	return isManifest(record.manifest) && typeof record.attemptId === "string" && ATTEMPT_ID.test(record.attemptId);
 }
 
+/**
+ * POSIX mode bits and ownership are synthetic on Windows. The native verifier
+ * enforces a protected owner-only DACL there and binds the verdict to the exact
+ * filesystem identity retained by lstat; POSIX keeps the existing mode/uid
+ * contract unchanged.
+ */
+function isPrivateOwnedEntry(
+	pathname: string,
+	stat: Awaited<ReturnType<typeof fs.lstat>>,
+	kind: "directory" | "file",
+): boolean {
+	if (kind === "directory" ? !stat.isDirectory() : !stat.isFile()) return false;
+	if (stat.isSymbolicLink()) return false;
+	if (process.platform === "win32") {
+		return verifyOwnerOnlyPathSecurityExpected(pathname, kind, BigInt(stat.dev), BigInt(stat.ino)).ok;
+	}
+	const uid = process.getuid?.();
+	return (Number(stat.mode) & 0o077) === 0 && (uid === undefined || Number(stat.uid) === uid);
+}
+
+function sameEntryIdentity(
+	left: Awaited<ReturnType<typeof fs.lstat>>,
+	right: Awaited<ReturnType<typeof fs.lstat>>,
+): boolean {
+	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertOwnerOnlyApplied(pathname: string, kind: "directory" | "file"): void {
+	const result = applyOwnerOnlyPathSecurity(pathname, kind);
+	if (!result.ok) throw new Error(`approval store ${kind} security could not be applied: ${result.code}`);
+}
+
 async function loadStoredApprovals(): Promise<StoredApprovals> {
 	const target = approvalStorePath();
 	const directory = path.dirname(target);
 	try {
 		const directoryStat = await fs.lstat(directory);
-		const uid = process.getuid?.();
-		if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 || (uid !== undefined && directoryStat.uid !== uid))
-			return { approvals: [], filed: [], pending: [] };
-		const fileStat = await fs.lstat(target);
-		if (!fileStat.isFile() || fileStat.isSymbolicLink() || (fileStat.mode & 0o077) !== 0 || (uid !== undefined && fileStat.uid !== uid))
-			return { approvals: [], filed: [], pending: [] };
-		const parsed: unknown = await Bun.file(target).json();
+		if (!isPrivateOwnedEntry(directory, directoryStat, "directory")) return { approvals: [], filed: [], pending: [] };
+		const before = await fs.lstat(target);
+		if (!isPrivateOwnedEntry(target, before, "file")) return { approvals: [], filed: [], pending: [] };
+		const handle = await fs.open(target, "r");
+		let parsed: unknown;
+		try {
+			const opened = await handle.stat();
+			const relinked = await fs.lstat(target);
+			if (!sameEntryIdentity(before, opened) || !sameEntryIdentity(opened, relinked))
+				return { approvals: [], filed: [], pending: [] };
+			if (process.platform === "win32" && !verifyOwnerOnlyFdSecurity(target, "file", handle.fd).ok)
+				return { approvals: [], filed: [], pending: [] };
+			parsed = JSON.parse(await handle.readFile("utf8"));
+		} finally {
+			await handle.close();
+		}
 		if (typeof parsed !== "object" || parsed === null) return { approvals: [], filed: [], pending: [] };
 		const record = parsed as { approvals?: unknown; filed?: unknown; pending?: unknown };
 		return {
@@ -653,12 +704,19 @@ async function writeStoredApprovals(stored: StoredApprovals): Promise<void> {
 	try {
 		const handle = await fs.open(temporary, "wx", 0o600);
 		try {
+			if (process.platform === "win32") {
+				const security = applyOwnerOnlyFdSecurity(temporary, "file", handle.fd);
+				if (!security.ok) throw new Error(`approval store temporary file security could not be applied: ${security.code}`);
+			}
 			await handle.writeFile(`${JSON.stringify(stored, null, "\t")}\n`);
 			await handle.sync();
 		} finally {
 			await handle.close();
 		}
 		await fs.rename(temporary, target);
+		const targetStat = await fs.lstat(target);
+		if (!isPrivateOwnedEntry(target, targetStat, "file"))
+			throw new Error("approval store file is not a private regular file owned by the current user");
 		try {
 			const directoryHandle = await fs.open(directory, "r");
 			try {
@@ -687,9 +745,9 @@ const approvalStoreLockContext = new AsyncLocalStorage<boolean>();
 async function ensureApprovalStoreDirectory(): Promise<void> {
 	const directory = path.dirname(approvalStorePath());
 	await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+	if (process.platform === "win32") assertOwnerOnlyApplied(directory, "directory");
 	const directoryStat = await fs.lstat(directory);
-	const uid = process.getuid?.();
-	if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink() || (directoryStat.mode & 0o077) !== 0 || (uid !== undefined && directoryStat.uid !== uid))
+	if (!isPrivateOwnedEntry(directory, directoryStat, "directory"))
 		throw new Error("approval store directory is not a private directory owned by the current user");
 }
 
@@ -701,23 +759,42 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 		const candidatePath = `${lockPath}.${process.pid}.${ownerToken}.tmp`;
 		try {
 			await fs.mkdir(candidatePath, { mode: 0o700 });
-			await fs.writeFile(
-				path.join(candidatePath, "owner.json"),
-				`${JSON.stringify({ token: ownerToken, pid: process.pid, startedAt: Date.now(), processStart: await processStartIdentity(process.pid) })}\n`,
-				{ mode: 0o600, flag: "wx" },
-			);
-			await fs.rename(candidatePath, lockPath);
-		} catch (error) {
-			const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
-			await fs.rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
-			if (code !== "EEXIST" && code !== "ENOTEMPTY") throw error;
-			const stale = await staleLock(lockPath);
-			if (stale.stale) await removeLockIfOwner(lockPath, stale.token);
-			await Bun.sleep(25);
-			continue;
+			if (process.platform === "win32") assertOwnerOnlyApplied(candidatePath, "directory");
+			const ownerPath = path.join(candidatePath, "owner.json");
+			const ownerHandle = await fs.open(ownerPath, "wx", 0o600);
+			try {
+				if (process.platform === "win32") {
+					const security = applyOwnerOnlyFdSecurity(ownerPath, "file", ownerHandle.fd);
+					if (!security.ok) throw new Error(`approval lock owner security could not be applied: ${security.code}`);
+				}
+				await ownerHandle.writeFile(
+					`${JSON.stringify({ token: ownerToken, pid: process.pid, startedAt: Date.now(), processStart: await processStartIdentity(process.pid) })}\n`,
+				);
+				await ownerHandle.sync();
+			} finally {
+				await ownerHandle.close();
+			}
+			const published = renameNoReplacePath(candidatePath, lockPath);
+			if (published.ok) {
+				// The fully initialized candidate is now the canonical lock.
+			} else if (published.reason === "destination_exists") {
+				const stale = await staleLock(lockPath);
+				if (stale.stale) await removeLockIfOwner(lockPath, stale.token);
+				await Bun.sleep(25);
+				continue;
+			} else {
+				throw new Error(`approval lock publication failed: ${published.code ?? published.reason}`);
+			}
 		} finally {
 			await fs.rm(candidatePath, { recursive: true, force: true }).catch(() => undefined);
 		}
+		if (!(await fs.lstat(lockPath).then(stat => isPrivateOwnedEntry(lockPath, stat, "directory"), () => false))) {
+			throw new Error("published approval lock is not the initialized private directory");
+		}
+		const publishedOwner = JSON.parse(await Bun.file(path.join(lockPath, "owner.json")).text()) as {
+			token?: unknown;
+		};
+		if (publishedOwner.token !== ownerToken) throw new Error("published approval lock owner identity changed");
 		try {
 			return await action();
 		} finally {
@@ -729,7 +806,8 @@ async function withApprovalStoreLock<T>(action: () => Promise<T>): Promise<T> {
 
 async function staleLock(lockPath: string): Promise<{ stale: boolean; token?: string }> {
 	try {
-		const stat = await fs.stat(lockPath);
+		const stat = await fs.lstat(lockPath);
+		if (!isPrivateOwnedEntry(lockPath, stat, "directory")) throw new Error("approval lock is not a private directory");
 		if (Date.now() - stat.mtimeMs < LOCK_STALE_MS) return { stale: false };
 		try {
 			const owner = JSON.parse(await Bun.file(path.join(lockPath, "owner.json")).text()) as {
@@ -746,24 +824,33 @@ async function staleLock(lockPath: string): Promise<{ stale: boolean; token?: st
 			try {
 				process.kill(owner.pid, 0);
 				return { stale: false };
-			} catch {
-				return { stale: true, token };
+			} catch (error) {
+				const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
+				return code === "ESRCH" ? { stale: true, token } : { stale: false };
 			}
 		} catch {
 			return { stale: true };
 		}
-	} catch {
-		return { stale: false };
+	} catch (error) {
+		const code = error instanceof Error && "code" in error ? String(error.code) : undefined;
+		if (code === "ENOENT") return { stale: false };
+		throw error;
 	}
 }
 
 async function removeLockIfOwner(lockPath: string, token: string | undefined): Promise<void> {
 	try {
+		const snapshot = snapshotDirectoryTree(lockPath);
+		if (!snapshot.ok || !snapshot.snapshot) return;
 		const ownerPath = path.join(lockPath, "owner.json");
 		let owner: { token?: unknown } | undefined;
 		try {
 			owner = JSON.parse(await Bun.file(ownerPath).text()) as { token?: unknown };
 		} catch (error) {
+			if (error instanceof SyntaxError && token === undefined) {
+				await removeApprovalLockSnapshot(lockPath, snapshot.snapshot);
+				return;
+			}
 			const code = error instanceof Error && "code" in error ? error.code : undefined;
 			if (code !== "ENOENT") throw error;
 			// A process can die after mkdir and before owner.json. Re-check the
@@ -775,16 +862,26 @@ async function removeLockIfOwner(lockPath: string, token: string | undefined): P
 			} catch (secondError) {
 				const secondCode = secondError instanceof Error && "code" in secondError ? secondError.code : undefined;
 				if (secondCode === "ENOENT" && token === undefined) {
-					await fs.rm(lockPath, { recursive: true, force: true });
+					await removeApprovalLockSnapshot(lockPath, snapshot.snapshot);
 				}
 				return;
 			}
 		}
 		if (token !== undefined && owner?.token !== token) return;
 		if (token === undefined && owner?.token !== undefined) return;
-		await fs.rm(lockPath, { recursive: true, force: true });
+		await removeApprovalLockSnapshot(lockPath, snapshot.snapshot);
 	} catch {
 		// Teardown is best effort; never mask the action's result.
+	}
+}
+
+async function removeApprovalLockSnapshot(lockPath: string, snapshot: NativeDirectoryTreeSnapshot): Promise<void> {
+	const removed = exactRemoveDirectoryTree(lockPath, snapshot);
+	if (!removed.ok && removed.code === "cleanup_pending" && removed.detachedPath) {
+		// The native operation already detached the exact authorized lock tree
+		// from the canonical pathname. Cleanup of that inert quarantine cannot
+		// consume a successor published at lockPath.
+		await fs.rm(removed.detachedPath, { recursive: true, force: true });
 	}
 }
 

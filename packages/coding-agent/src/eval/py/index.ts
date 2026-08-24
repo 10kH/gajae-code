@@ -20,7 +20,7 @@ export default {
 	highlightLang: "python",
 
 	async isAvailable(session: ToolSession): Promise<boolean> {
-		const availability = await checkPythonKernelAvailability(session.cwd);
+		const availability = await checkPythonKernelAvailability(session.cwd, undefined, undefined, session.settings);
 		return availability.ok;
 	},
 
@@ -28,6 +28,7 @@ export default {
 		const kernelMode = readSetting<PythonExecutorOptions["kernelMode"]>(opts.session, "python.kernelMode");
 		const executorOptions: PythonExecutorOptions = {
 			cwd: opts.cwd,
+			settings: opts.session.settings,
 			deadlineMs: opts.deadlineMs,
 			signal: opts.signal,
 			sessionId: namespaceSessionId(opts.sessionId),

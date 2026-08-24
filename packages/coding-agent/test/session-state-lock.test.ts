@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, setSystemTime } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, setSystemTime } from "bun:test";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -32,6 +32,12 @@ const tempDirs: string[] = [];
 
 installExactIdentityNatives();
 
+beforeEach(() => {
+	SessionStateLockTestHooks.ownerHostId = () => "local-host";
+	SessionStateLockTestHooks.legacyOwnerHostId = () => "legacy-local-host";
+	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = true;
+});
+
 afterEach(async () => {
 	SessionStateLockTestHooks.afterStaleInspection = undefined;
 	SessionStateLockTestHooks.beforeStaleRemoval = undefined;
@@ -43,6 +49,12 @@ afterEach(async () => {
 	SessionStateLockTestHooks.ownerAccessStrategy = undefined;
 	SessionStateLockTestHooks.probeProcessSignal = undefined;
 	SessionStateLockTestHooks.ownerRecordWriteFault = undefined;
+	SessionStateLockTestHooks.ownerHostId = undefined;
+	SessionStateLockTestHooks.loadInstallationHostId = undefined;
+	SessionStateLockTestHooks.legacyOwnerHostId = undefined;
+	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
+	SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+	SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
 	installExactIdentityNatives();
 	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
@@ -69,7 +81,31 @@ async function seededRunningSession(name: string): Promise<{ root: string; state
 		{ type: "turn_start" },
 		{ sessionId: SESSION_ID, cwd: root, sessionFile: null },
 	);
+	// Production keeps released compatibility tombstones. Most tests install a
+	// specific pre-existing lock shape, so start each fixture from an empty path.
+	await fs.rm(`${stateFile}.lock`, { force: true });
+	await fs.rm(`${stateFile}.lock.transition`, { recursive: true, force: true });
+	await fs.rm(`${stateFile}.lock.transition.owner`, { force: true });
 	return { root, stateFile };
+}
+
+async function expectReleasedOwner(file: string): Promise<void> {
+	expect(await readJson(file)).toMatchObject({
+		pid: 1,
+		start_time: "unknown",
+		owner_host_id: "local-host",
+		released: true,
+	});
+}
+
+function expectReleasedTransition(lockFile: string): void {
+	expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+	expect(JSON.parse(fsSync.readFileSync(`${lockFile}.transition.owner`, "utf8"))).toMatchObject({
+		pid: 1,
+		start_time: "unknown",
+		owner_host_id: "local-host",
+		released: true,
+	});
 }
 
 /** One activity write through the full acquire path, so the lock is actually contended. */
@@ -111,9 +147,11 @@ function installCleanupPendingNative(lockFile: string, result: NativeExactUnlink
  * long it has been sitting there.
  */
 function liveTransitionPath(lockFile: string): string {
-	const candidate = `${lockFile}.transition`;
-	if (!fsSync.existsSync(candidate)) throw new Error("no transition claim was held during the stale-removal window");
-	return candidate;
+	const transitionDir = `${lockFile}.transition`;
+	const ownerFile = `${transitionDir}.owner`;
+	if (!fsSync.statSync(transitionDir).isDirectory() || !fsSync.existsSync(ownerFile))
+		throw new Error("no transition claim was held during the stale-removal window");
+	return ownerFile;
 }
 
 /** Inode identity, so a break-and-recreate is not mistaken for survival. */
@@ -352,8 +390,8 @@ describe("coordinator session state lock", () => {
 		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
 
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-		// A regular file, never a directory: `<file>.lock/info` would strand base writers.
-		expect(fsSync.existsSync(`${stateFile}.lock`)).toBe(false);
+		await expectReleasedOwner(`${stateFile}.lock`);
+		expectReleasedTransition(`${stateFile}.lock`);
 	});
 
 	it("reclaims a malformed owner file only once it is stale", async () => {
@@ -368,7 +406,8 @@ describe("coordinator session state lock", () => {
 		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
 
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-		expect(fsSync.existsSync(lockFile)).toBe(false);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
 	});
 
 	it("leaves a successor owner that claimed the path after the stale verdict", async () => {
@@ -441,7 +480,8 @@ describe("coordinator session state lock", () => {
 		expect(enteredDuringWindow).toBe(false);
 		expect(entries).toBe(1);
 		expect(order).toEqual(["window-open", "window-closed", "stale-removed", "contender-entered"]);
-		expect(fsSync.existsSync(lockFile)).toBe(false);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
 	});
 
 	it("never breaks a transition claim whose holder is still inside it, however old it looks", async () => {
@@ -494,9 +534,8 @@ describe("coordinator session state lock", () => {
 
 		expect(entries).toBe(1);
 		expect(order).toEqual(["window-open", "window-closed", "stale-removed", "contender-entered"]);
-		expect(fsSync.existsSync(lockFile)).toBe(false);
-		// Released with its holder: a claim is never left behind for age-based cleanup.
-		expect(fsSync.existsSync(heldTransition)).toBe(false);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
 	});
 
 	it("never removes a live legacy directory owner, however old its timestamp", async () => {
@@ -522,7 +561,8 @@ describe("coordinator session state lock", () => {
 		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
 
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-		expect(fsSync.existsSync(lockFile)).toBe(false);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
 	});
 
 	it("continues after native cleanup durably detaches a stale legacy directory", async () => {
@@ -540,7 +580,8 @@ describe("coordinator session state lock", () => {
 		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
 
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-		expect(fsSync.existsSync(lockFile)).toBe(false);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
 		expect(fsSync.statSync(detachedLock).isDirectory()).toBe(true);
 	});
 
@@ -607,7 +648,8 @@ describe("coordinator session state lock", () => {
 		await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");
 
 		expect((await readJson(stateFile)).activity).toMatchObject({ seq: 1, tool: "bash" });
-		expect(fsSync.existsSync(lockFile)).toBe(false);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
 	});
 
 	it("refuses to delete a legacy directory whose owner token changed", async () => {
@@ -813,7 +855,7 @@ describe("coordinator session state lock", () => {
 		it(`leaves a successor that took the ${target} owner path while a failed writer was cleaning up`, async () => {
 			const { stateFile } = await seededRunningSession(`lock-write-failure-${target}`);
 			const lockFile = `${stateFile}.lock`;
-			const ownerFile = target === "state" ? lockFile : `${lockFile}.transition`;
+			const ownerFile = target === "state" ? lockFile : `${lockFile}.transition.owner`;
 			const successor = JSON.stringify({
 				pid: process.pid,
 				start_time: processStartTime(process.pid) ?? "unknown",
@@ -921,24 +963,9 @@ describe("coordinator session state lock", () => {
 		const lockFile = `${stateFile}.lock`;
 		const primary = new Error("primary state operation failure");
 		const release = new Error("owner release failure");
-		setSessionStateLockNativeBindings(() => ({
-			exactUnlink(target) {
-				if (target === lockFile) throw release;
-				try {
-					fsSync.unlinkSync(target);
-					return { ok: true };
-				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: false, code: "not_found" };
-					throw error;
-				}
-			},
-			snapshotDirectoryTree() {
-				throw new Error("unexpected directory snapshot");
-			},
-			exactRemoveDirectoryTree() {
-				throw new Error("unexpected directory removal");
-			},
-		}));
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = target => {
+			if (target === lockFile) throw release;
+		};
 
 		const observed = await withSessionStateFileLock(stateFile, () => {
 			throw primary;
@@ -948,6 +975,377 @@ describe("coordinator session state lock", () => {
 		expect(preservedPrimary).toBe(primary);
 		expect(preservedRelease).toBeInstanceOf(SessionStateLockUnavailableError);
 		expect((preservedRelease as Error & { cause?: unknown }).cause).toBe(release);
+	});
+
+	it("releases live owner records without the renameat2-based exact unlink primitive", async () => {
+		const { stateFile } = await seededRunningSession("lock-live-owner-portable-release");
+		const lockFile = `${stateFile}.lock`;
+		let exactUnlinkCalls = 0;
+		const releasedHostIds: string[] = [];
+		SessionStateLockTestHooks.ownerHostId = () => "local-host";
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = async target => {
+			const owner = JSON.parse(await fs.readFile(target, "utf8")) as { owner_host_id?: string };
+			if (owner.owner_host_id) releasedHostIds.push(owner.owner_host_id);
+		};
+		setSessionStateLockNativeBindings(() => ({
+			exactUnlink() {
+				exactUnlinkCalls++;
+				return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${lockFile}.quarantine` };
+			},
+			snapshotDirectoryTree() {
+				throw new Error("unexpected directory snapshot");
+			},
+			exactRemoveDirectoryTree() {
+				throw new Error("unexpected directory removal");
+			},
+		}));
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).resolves.toBe("entered");
+		expect(exactUnlinkCalls).toBe(0);
+		expect(releasedHostIds).toEqual(["local-host", "local-host", "local-host"]);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
+		await expect(fs.open(lockFile, "wx")).rejects.toMatchObject({ code: "EEXIST" });
+		await expect(withSessionStateFileLock(stateFile, async () => "reused")).resolves.toBe("reused");
+	});
+
+	it("serializes concurrent writers that reuse the same released state tombstone", async () => {
+		const { stateFile } = await seededRunningSession("lock-released-tombstone-contention");
+		await withSessionStateFileLock(stateFile, async () => undefined);
+		const firstEntered = Promise.withResolvers<void>();
+		const releaseFirst = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const first = withSessionStateFileLock(stateFile, async () => {
+			order.push("first-entered");
+			firstEntered.resolve();
+			await releaseFirst.promise;
+			order.push("first-released");
+		});
+		await firstEntered.promise;
+		const second = withSessionStateFileLock(stateFile, async () => {
+			order.push("second-entered");
+		});
+		await Bun.sleep(100);
+		expect(order).toEqual(["first-entered"]);
+		releaseFirst.resolve();
+		await Promise.all([first, second]);
+		expect(order).toEqual(["first-entered", "first-released", "second-entered"]);
+	});
+
+	it("serializes cross-process writers that reuse a released state tombstone", async () => {
+		const { root, stateFile } = await seededRunningSession("lock-cross-process-tombstone-contention");
+		await withSessionStateFileLock(stateFile, async () => undefined);
+		const readyFile = path.join(root, "holder-ready");
+		const releaseFile = path.join(root, "holder-release");
+		const enteredFile = path.join(root, "contender-entered");
+		const lockModule = path.resolve("packages/coding-agent/src/gjc-runtime/session-state-lock.ts");
+		const holderScript = `
+			import { withSessionStateFileLock } from ${JSON.stringify(lockModule)};
+			const [stateFile, readyFile, releaseFile] = Bun.argv.slice(-3);
+			await withSessionStateFileLock(stateFile, async () => {
+				await Bun.write(readyFile, "ready");
+				while (!(await Bun.file(releaseFile).exists())) await Bun.sleep(10);
+			});
+		`;
+		const contenderScript = `
+			import { withSessionStateFileLock } from ${JSON.stringify(lockModule)};
+			const [stateFile, enteredFile] = Bun.argv.slice(-2);
+			await withSessionStateFileLock(stateFile, async () => await Bun.write(enteredFile, "entered"));
+		`;
+		const holder = Bun.spawn([process.execPath, "-e", holderScript, stateFile, readyFile, releaseFile], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		while (!(await Bun.file(readyFile).exists())) await Bun.sleep(10);
+		const contender = Bun.spawn([process.execPath, "-e", contenderScript, stateFile, enteredFile], {
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+		await Bun.sleep(200);
+		expect(await Bun.file(enteredFile).exists()).toBe(false);
+		await Bun.write(releaseFile, "release");
+		const [holderExit, contenderExit] = await Promise.all([holder.exited, contender.exited]);
+		expect(holderExit).toBe(0);
+		expect(contenderExit).toBe(0);
+		expect(await Bun.file(enteredFile).text()).toBe("entered");
+	});
+
+	it("fails closed on a dead atomic transition directory without renameat2", async () => {
+		const { stateFile } = await seededRunningSession("lock-dead-atomic-transition");
+		const lockFile = `${stateFile}.lock`;
+		const transitionDir = `${lockFile}.transition`;
+		const ownerFile = `${transitionDir}.owner`;
+		await fs.mkdir(transitionDir);
+		await fs.writeFile(
+			ownerFile,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: "dead-atomic-transition",
+				owner_host_id: "local-host",
+			}),
+		);
+		let exactUnlinkCalls = 0;
+		setSessionStateLockNativeBindings(() => ({
+			exactUnlink() {
+				exactUnlinkCalls++;
+				return { ok: false, code: "cleanup_failed" };
+			},
+			snapshotDirectoryTree() {
+				throw new Error("unexpected directory snapshot");
+			},
+			exactRemoveDirectoryTree() {
+				throw new Error("unexpected directory removal");
+			},
+		}));
+
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Bun.sleep(300);
+		expect(entered).toEqual([]);
+		expect(exactUnlinkCalls).toBe(0);
+		expect(fsSync.statSync(transitionDir).isDirectory()).toBe(true);
+		expect(await fs.readFile(ownerFile, "utf8")).toContain("dead-atomic-transition");
+		await fs.rm(ownerFile);
+		await fs.rmdir(transitionDir);
+		await contender;
+		expect(entered).toEqual(["entered"]);
+	});
+
+	for (const target of ["state", "transition"] as const) {
+		it(`leaves a legacy successor that replaces the ${target} owner after final validation`, async () => {
+			const { stateFile } = await seededRunningSession(`lock-live-${target}-final-successor`);
+			const lockFile = `${stateFile}.lock`;
+			const ownerFile = target === "state" ? lockFile : `${lockFile}.transition.owner`;
+			const successor = JSON.stringify({
+				pid: process.pid,
+				start_time: processStartTime(process.pid) ?? "unknown",
+				token: `legacy-${target}-successor`,
+			});
+			SessionStateLockTestHooks.afterCurrentOwnerValidation = async file => {
+				if (file !== ownerFile) return;
+				SessionStateLockTestHooks.afterCurrentOwnerValidation = undefined;
+				await fs.rm(file);
+				await fs.writeFile(file, successor);
+			};
+
+			await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+				SessionStateLockUnavailableError,
+			);
+			expect(await fs.readFile(ownerFile, "utf8")).toBe(successor);
+		});
+	}
+
+	for (const target of ["state", "transition"] as const) {
+		it(`preserves a stale ${target} owner when Ceph rejects exact cleanup`, async () => {
+			const { stateFile } = await seededRunningSession(`lock-ceph-stale-${target}`);
+			const lockFile = `${stateFile}.lock`;
+			const ownerFile = target === "state" ? lockFile : `${lockFile}.transition`;
+			const record = JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "unknown",
+				token: `ceph-stale-${target}`,
+				owner_host_id: "local-host",
+			});
+			await fs.writeFile(ownerFile, record);
+			setSessionStateLockNativeBindings(() => ({
+				exactUnlink() {
+					return { ok: false, code: "cleanup_failed", retainedUnknownPath: `${ownerFile}.quarantine` };
+				},
+				snapshotDirectoryTree() {
+					throw new Error("unexpected directory snapshot");
+				},
+				exactRemoveDirectoryTree() {
+					throw new Error("unexpected directory removal");
+				},
+			}));
+
+			const attempt =
+				target === "state"
+					? reclaimStaleSessionStateLock(lockFile)
+					: withSessionStateFileLock(stateFile, async () => "entered");
+			await expect(attempt).rejects.toBeInstanceOf(SessionStateLockUnavailableError);
+			expect(await fs.readFile(ownerFile, "utf8")).toBe(record);
+		});
+	}
+
+	it("never reclaims a foreign-host owner from a host-local ESRCH verdict", async () => {
+		const { stateFile } = await seededRunningSession("lock-foreign-host-owner");
+		const lockFile = `${stateFile}.lock`;
+		const record = JSON.stringify({
+			pid: DEAD_PID,
+			start_time: "remote-start",
+			token: "foreign-owner-token",
+			owner_host_id: "remote-host",
+		});
+		await fs.writeFile(lockFile, record);
+		SessionStateLockTestHooks.ownerHostId = () => "local-host";
+		SessionStateLockTestHooks.probeProcessSignal = () => {
+			throw Object.assign(new Error("missing"), { code: "ESRCH" });
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+	});
+
+	it("reclaims a dead owner written with the previous same-host identity", async () => {
+		const { stateFile } = await seededRunningSession("lock-previous-host-owner");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(
+			lockFile,
+			JSON.stringify({
+				pid: DEAD_PID,
+				start_time: "previous-owner-start",
+				token: "previous-owner-token",
+				owner_host_id: "previous-local-host",
+			}),
+		);
+		SessionStateLockTestHooks.ownerHostId = () => "local-host";
+		SessionStateLockTestHooks.legacyOwnerHostId = () => "previous-local-host";
+		SessionStateLockTestHooks.probeProcessSignal = () => {
+			throw Object.assign(new Error("missing"), { code: "ESRCH" });
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(fsSync.existsSync(lockFile)).toBe(false);
+	});
+
+	it("fails closed for an unqualified regular owner on a shared volume", async () => {
+		const { stateFile } = await seededRunningSession("lock-unqualified-owner");
+		const lockFile = `${stateFile}.lock`;
+		const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "unqualified-owner" });
+		await fs.writeFile(lockFile, record);
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+		SessionStateLockTestHooks.probeProcessSignal = () => {
+			throw Object.assign(new Error("missing"), { code: "ESRCH" });
+		};
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(await fs.readFile(lockFile, "utf8")).toBe(record);
+	});
+
+	it("fails closed for a stale malformed regular owner on a shared volume", async () => {
+		const { stateFile } = await seededRunningSession("lock-malformed-shared-owner");
+		const lockFile = `${stateFile}.lock`;
+		await fs.writeFile(lockFile, `{"pid":${DEAD_PID},"owner_host_id":"remote-host"`);
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(lockFile, stale, stale);
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(await fs.readFile(lockFile, "utf8")).toBe(`{"pid":${DEAD_PID},"owner_host_id":"remote-host"`);
+	});
+
+	it("fails closed for an unqualified transition claim on a shared volume", async () => {
+		const { stateFile } = await seededRunningSession("lock-unqualified-transition");
+		const transitionFile = `${stateFile}.lock.transition`;
+		const record = JSON.stringify({ pid: DEAD_PID, start_time: "unknown", token: "unqualified-transition" });
+		await fs.writeFile(transitionFile, record);
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Promise.race([contender, Bun.sleep(300)]);
+
+		expect(await fs.readFile(transitionFile, "utf8")).toBe(record);
+		expect(entered).toEqual([]);
+		await fs.rm(transitionFile);
+		await contender;
+		expect(entered).toEqual(["entered"]);
+	});
+
+	it("fails closed for a stale malformed transition claim on a shared volume", async () => {
+		const { stateFile } = await seededRunningSession("lock-malformed-shared-transition");
+		const transitionFile = `${stateFile}.lock.transition`;
+		const record = `{"pid":${DEAD_PID},"owner_host_id":"remote-host"`;
+		await fs.writeFile(transitionFile, record);
+		const stale = new Date(Date.now() - 60_000);
+		await fs.utimes(transitionFile, stale, stale);
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		const entered: string[] = [];
+		const contender = withSessionStateFileLock(stateFile, async () => {
+			entered.push("entered");
+		});
+		await Promise.race([contender, Bun.sleep(300)]);
+
+		expect(await fs.readFile(transitionFile, "utf8")).toBe(record);
+		expect(entered).toEqual([]);
+		await fs.rm(transitionFile);
+		await contender;
+		expect(entered).toEqual(["entered"]);
+	});
+
+	it("fails closed for an unqualified legacy directory owner on a shared volume", async () => {
+		const { stateFile } = await seededRunningSession("lock-unqualified-directory");
+		const lockFile = `${stateFile}.lock`;
+		await writeGenericLockDir(lockFile, { pid: DEAD_PID, start_time: "unknown", timestamp: Date.now() - 60_000 });
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = false;
+
+		await reclaimStaleSessionStateLock(lockFile);
+
+		expect(fsSync.statSync(lockFile).isDirectory()).toBe(true);
+	});
+
+	it("creates no owner record when machine identity is unavailable", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-host-identity-unavailable.json");
+		SessionStateLockTestHooks.ownerHostId = async () => {
+			throw new Error("machine identity unavailable");
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(fsSync.existsSync(`${stateFile}.lock`)).toBe(false);
+		expect(fsSync.existsSync(`${stateFile}.lock.transition`)).toBe(false);
+	});
+
+	it("retries machine identity loading after a transient failure", async () => {
+		const root = await tempRoot();
+		const stateFile = path.join(root, "lock-host-identity-retry.json");
+		SessionStateLockTestHooks.ownerHostId = undefined;
+		let attempts = 0;
+		SessionStateLockTestHooks.loadInstallationHostId = async () => {
+			attempts++;
+			if (attempts === 1) throw new Error("transient identity read failure");
+			return "local-host";
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(await withSessionStateFileLock(stateFile, async () => "entered")).toBe("entered");
+		expect(attempts).toBe(2);
+	});
+
+	it("refuses to unlink a successor that replaces a live owner record before release", async () => {
+		const { stateFile } = await seededRunningSession("lock-live-owner-successor");
+		const lockFile = `${stateFile}.lock`;
+		const successor = JSON.stringify({
+			pid: process.pid,
+			start_time: processStartTime(process.pid) ?? "unknown",
+			token: "live-owner-successor-token",
+		});
+		SessionStateLockTestHooks.beforeCurrentOwnerRelease = async target => {
+			if (target !== lockFile) return;
+			SessionStateLockTestHooks.beforeCurrentOwnerRelease = undefined;
+			await fs.rm(target);
+			await fs.writeFile(target, successor);
+		};
+
+		await expect(withSessionStateFileLock(stateFile, async () => "entered")).rejects.toBeInstanceOf(
+			SessionStateLockUnavailableError,
+		);
+		expect(await fs.readFile(lockFile, "utf8")).toBe(successor);
 	});
 
 	it("releases the owner record after a synchronous operation throw", async () => {
@@ -960,7 +1358,8 @@ describe("coordinator session state lock", () => {
 		}).catch(error => error);
 
 		expect(observed).toBe(primary);
-		expect(fsSync.existsSync(lockFile)).toBe(false);
+		await expectReleasedOwner(lockFile);
+		expectReleasedTransition(lockFile);
 		expect(await withSessionStateFileLock(stateFile, async () => "reacquired")).toBe("reacquired");
 	});
 
@@ -1184,9 +1583,8 @@ describe("coordinator session state lock", () => {
 			});
 
 			expect(observed).toEqual(["file", "self-owned"]);
-			// Released against the identity captured from the writing handle.
-			expect(fsSync.existsSync(lockFile)).toBe(false);
-			expect(fsSync.existsSync(`${lockFile}.transition`)).toBe(false);
+			await expectReleasedOwner(lockFile);
+			expectReleasedTransition(lockFile);
 
 			// And the lock still serializes a real state write afterwards.
 			await writeToolActivity(root, "call-1", "2026-03-01T00:00:05.000Z");

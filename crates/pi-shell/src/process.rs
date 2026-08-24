@@ -1428,8 +1428,9 @@ impl Process {
 	/// Send `signal` only to this pinned root process.
 	///
 	/// Linux delivers through the owned pidfd and Windows through the owned
-	/// process handle, so PID reuse cannot redirect the signal. Darwin has no
-	/// equivalent stable kernel authority and deliberately fails closed.
+	/// process handle. Darwin has no atomic identity-bound signal primitive, so
+	/// this operation fails closed there; callers must not fall back to a raw
+	/// PID signal after checking the published incarnation.
 	#[cfg_attr(
 		target_os = "macos",
 		allow(
@@ -1440,7 +1441,11 @@ impl Process {
 	pub fn signal_root(&self, signal: i32) -> bool {
 		#[cfg(target_os = "macos")]
 		{
-			let _ = signal;
+			// macOS exposes no atomic signal-if-start-time-matches primitive. The
+			// identity recheck in `DarwinProcess::kill` cannot close the PID-reuse
+			// window between the check and `kill(2)`, so broker retirement must fail
+			// closed rather than claim that this path is incarnation-safe.
+			let _ = (self, signal);
 			false
 		}
 		#[cfg(not(target_os = "macos"))]
@@ -2052,5 +2057,24 @@ mod tests {
 			 cancellation cleanup can reach it; this regressed on macOS when the walk relied on the \
 			 broken `proc_listchildpids`",
 		);
+	}
+
+	/// Darwin's stable process reference must refuse the fallback signal because
+	/// macOS has no atomic identity-bound signal primitive.
+	#[cfg(target_os = "macos")]
+	#[test]
+	fn signal_root_terminates_the_pinned_child() {
+		use std::process::Command;
+
+		let mut child = Command::new("sleep")
+			.arg("10")
+			.spawn()
+			.expect("spawn sleep");
+		let pid = i32::try_from(child.id()).expect("child pid fits in i32");
+		let process = Process::from_pid(pid).expect("child process reference");
+		assert!(!process.signal_root(TERM_SIGNAL));
+		assert!(child.try_wait().expect("poll child").is_none());
+		child.kill().expect("cleanup child");
+		let _ = child.wait();
 	}
 }

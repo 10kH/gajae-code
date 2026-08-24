@@ -426,7 +426,10 @@ describe("createAgentSession credential_disabled subscription", () => {
 				unsubscribe();
 			};
 		});
-		vi.spyOn(Settings, "init").mockRejectedValue(new Error("settings initialization failed"));
+		// createAgentSession loads scope-bound settings through `loadForScope`;
+		// `Settings.init` is the ambient-singleton path it deliberately no longer
+		// takes, so mocking that would exercise nothing.
+		vi.spyOn(Settings, "loadForScope").mockRejectedValue(new Error("settings initialization failed"));
 		const { settings: _settings, ...startupOptions } = baseOptions(dirs, authStorage);
 
 		await expect(createAgentSession(startupOptions)).rejects.toThrow(/settings initialization failed/);
@@ -440,7 +443,7 @@ describe("createAgentSession credential_disabled subscription", () => {
 		const storage = await createTestAuthStorage(path.join(dirs.agentDir, "agent.db"));
 		const close = vi.spyOn(storage, "close");
 		vi.spyOn(AuthStorage, "create").mockResolvedValue(storage);
-		vi.spyOn(Settings, "init").mockRejectedValue(new Error("settings initialization failed"));
+		vi.spyOn(Settings, "loadForScope").mockRejectedValue(new Error("settings initialization failed"));
 
 		await expect(createAgentSession({ cwd: dirs.cwd, agentDir: dirs.agentDir })).rejects.toThrow(
 			/settings initialization failed/,

@@ -21,6 +21,8 @@ export type PythonKernelMode = "session" | "per-call";
 export interface PythonExecutorOptions {
 	/** Working directory for command execution */
 	cwd?: string;
+	/** Session settings used for shell and runtime policy. */
+	settings?: Settings;
 	/** Timeout in milliseconds */
 	timeoutMs?: number;
 	/** Absolute wall-clock deadline in milliseconds since epoch */
@@ -131,6 +133,41 @@ function ensurePythonResourceCleanup(): void {
 }
 const sessions = new Map<string, PythonSession | InitializingPythonSession>();
 const retiringKernels = new Set<PythonKernel>();
+const settingsScopes = new WeakMap<Settings, string>();
+
+/**
+ * Fingerprint the settings values that actually shape a spawned kernel process.
+ * `PythonKernel.start` derives the kernel environment solely from
+ * `settings.getShellConfig()`, so two Settings instances resolving to the same
+ * shell configuration produce byte-identical kernels and MUST share one
+ * retained kernel. Keying on Settings object identity instead partitions every
+ * logical session into its own kernel, which breaks cross-session reuse and
+ * lets one session's dispose shut down a kernel another session still owns.
+ */
+function settingsScope(activeSettings: Settings): string {
+	const cached = settingsScopes.get(activeSettings);
+	if (cached !== undefined) return cached;
+	const { shell, args, env } = activeSettings.getShellConfig();
+	const canonicalEnv = Object.keys(env)
+		.sort()
+		.map(key => [key, env[key]]);
+	const canonical = JSON.stringify([shell, args, canonicalEnv]);
+	const scope = new Bun.CryptoHasher("sha256").update(canonical).digest("hex").slice(0, 16);
+	settingsScopes.set(activeSettings, scope);
+	return scope;
+}
+
+function scopedSessionId(sessionId: string, activeSettings: Settings | undefined, explicitSessionId: boolean): string {
+	if (explicitSessionId) return sessionId;
+	if (!activeSettings) {
+		const prefix = `${sessionId}:settings-`;
+		for (const existingSessionId of sessions.keys()) {
+			if (existingSessionId.startsWith(prefix)) return existingSessionId;
+		}
+		return sessionId;
+	}
+	return `${sessionId}:settings-${settingsScope(activeSettings)}`;
+}
 
 async function shutdownOrRetainKernel(kernel: PythonKernel): Promise<void> {
 	const result = await kernel.shutdown().catch(() => undefined);
@@ -299,6 +336,7 @@ async function startKernel(cwd: string, options: PythonExecutorOptions): Promise
 	requireRemainingTimeoutMs(options.deadlineMs);
 	return await PythonKernel.start({
 		cwd,
+		settings: options.settings,
 		env: buildKernelEnv(options),
 		runtimeOptions: options.runtimeOptions,
 		signal: options.signal,
@@ -568,7 +606,7 @@ async function executeWithKernel(
 	code: string,
 	options: PythonExecutorOptions | undefined,
 ): Promise<PythonResult> {
-	const settings = await Settings.init();
+	const settings = options?.settings ?? (await Settings.init());
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,
@@ -676,10 +714,15 @@ async function executeWithKernel(
 }
 
 async function ensureKernelAvailable(cwd: string, options: PythonExecutorOptions): Promise<void> {
-	const availability = await checkPythonKernelAvailability(cwd, options.runtimeOptions, {
-		signal: options.signal,
-		deadlineMs: options.deadlineMs,
-	});
+	const availability = await checkPythonKernelAvailability(
+		cwd,
+		options.runtimeOptions,
+		{
+			signal: options.signal,
+			deadlineMs: options.deadlineMs,
+		},
+		options.settings,
+	);
 	if (!availability.ok) {
 		throw new Error(availability.reason ?? "Python kernel unavailable");
 	}
@@ -710,7 +753,11 @@ async function executePerCall(code: string, cwd: string, options: PythonExecutor
 }
 
 async function executeOnSession(code: string, cwd: string, options: PythonExecutorOptions): Promise<PythonResult> {
-	const sessionId = options.sessionId ?? `session:${cwd}`;
+	const sessionId = scopedSessionId(
+		options.sessionId ?? `session:${cwd}`,
+		options.settings,
+		options.sessionId !== undefined,
+	);
 	if (options.bridge && !options.bridgeSessionId) {
 		options.bridgeSessionId = sessionId;
 	}

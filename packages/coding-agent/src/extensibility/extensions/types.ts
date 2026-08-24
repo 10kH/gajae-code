@@ -36,6 +36,9 @@ import type * as piCodingAgent from "@gajae-code/coding-agent";
 import type { AutocompleteItem, Component, EditorTheme, KeyId, TUI } from "@gajae-code/tui";
 import type { KeybindingsManager } from "../../config/keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { ModelSelectorValue } from "../../config/model-selector-value";
+import type { Settings } from "../../config/settings";
+import type { SettingPath, SettingValue } from "../../config/settings-schema";
 import type { EditToolDetails } from "../../edit";
 import type { PythonResult } from "../../eval/py/executor";
 import type { BashResult } from "../../exec/bash-executor";
@@ -333,6 +336,103 @@ export interface ExtensionSessionMetadata {
 	currentAgentType?: string;
 }
 
+/** Non-sensitive session policy exposed to third-party extensions. */
+export interface ExtensionSettings {
+	/** Read an allowlisted non-sensitive setting; blocked secret paths return undefined. */
+	get<P extends SettingPath>(path: P): SettingValue<P> | undefined;
+	getModelRole(role: string): ModelSelectorValue | undefined;
+}
+
+const EXTENSION_BLOCKED_SETTING_PREFIXES = [
+	"auth.",
+	"notifications.",
+	"hindsight.apiToken",
+	"searxng.basic",
+	"searxng.token",
+	"crashReport.",
+] as const;
+
+function isExtensionSettingReadable(path: string): boolean {
+	return !EXTENSION_BLOCKED_SETTING_PREFIXES.some(prefix => path.startsWith(prefix));
+}
+
+function deepFreeze<T>(value: T): T {
+	if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+	for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+	return Object.freeze(value);
+}
+
+function cloneAndFreeze<T>(value: T): T {
+	if (value === null || typeof value !== "object") return value;
+	return deepFreeze(structuredClone(value));
+}
+
+/** Create an extension-safe settings facade without exposing credentials or mutation APIs. */
+export function createExtensionSettings(
+	settings: Pick<Settings, "getModelRole"> & Pick<Settings, "get">,
+): ExtensionSettings {
+	return Object.freeze({
+		get: <P extends SettingPath>(path: P): SettingValue<P> | undefined => {
+			if (!isExtensionSettingReadable(path)) return undefined;
+			return cloneAndFreeze(settings.get(path));
+		},
+		getModelRole: (role: string): ModelSelectorValue | undefined => cloneAndFreeze(settings.getModelRole(role)),
+	});
+}
+
+const CUSTOM_TOOL_ALLOWED_SETTINGS_METHODS = new Set<PropertyKey>([
+	"getAgentDir",
+	"getBashInterceptorRules",
+	"getCwd",
+	"getEditVariantForModel",
+	"getModelRoles",
+	"getPlansDirectory",
+	"getShellConfig",
+]);
+
+const CUSTOM_TOOL_SETTINGS_BLOCKED_MESSAGE = "Custom tool settings are read-only and secret paths are unavailable";
+
+/**
+ * Preserve the historical Settings-shaped custom-tool contract without exposing
+ * mutation APIs or unrestricted settings reads at runtime.
+ */
+
+export function createCustomToolSettings(settings: Settings | ExtensionSettings): Settings {
+	const blockedMethod = (): never => {
+		throw new Error(CUSTOM_TOOL_SETTINGS_BLOCKED_MESSAGE);
+	};
+	if (!("getCwd" in settings)) {
+		return new Proxy(Object.create(null) as Settings, {
+			get(_target, property) {
+				if (property === "get") return settings.get;
+				if (property === "getModelRole") return settings.getModelRole;
+				return blockedMethod;
+			},
+			set: () => blockedMethod(),
+			deleteProperty: () => blockedMethod(),
+			defineProperty: () => blockedMethod(),
+			setPrototypeOf: () => blockedMethod(),
+		});
+	}
+	const extensionSettings = createExtensionSettings(settings);
+
+	return new Proxy(settings, {
+		get(target, property, receiver) {
+			if (property === "get") return extensionSettings.get;
+			if (property === "getModelRole") return extensionSettings.getModelRole;
+			const value = Reflect.get(target, property, receiver);
+			if (typeof value !== "function") return value;
+			if (!CUSTOM_TOOL_ALLOWED_SETTINGS_METHODS.has(property)) return blockedMethod;
+			const bound = value.bind(target);
+			return (...args: unknown[]) => cloneAndFreeze(bound(...args));
+		},
+		set: () => blockedMethod(),
+		deleteProperty: () => blockedMethod(),
+		defineProperty: () => blockedMethod(),
+		setPrototypeOf: () => blockedMethod(),
+	});
+}
+
 /**
  * Context passed to extension event handlers.
  */
@@ -360,6 +460,8 @@ export interface ExtensionContext {
 	sessionMetadata?: ExtensionSessionMetadata;
 	/** Model registry for API key resolution */
 	modelRegistry: ModelRegistry;
+	/** Non-sensitive session settings for role resolution. */
+	settings?: ExtensionSettings;
 	/** Credential-selection identity, distinct from logical/provider cache identity. */
 	credentialSessionId?: string;
 	/** Current model (may be undefined) */

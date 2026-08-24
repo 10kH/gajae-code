@@ -7,6 +7,11 @@ import {
 	extractHttpStatusFromError,
 	getTrustedHomeDir,
 } from "@gajae-code/utils";
+import {
+	copyProviderSafetyStopAdapterInvocation,
+	isProviderSafetyStopModelTrusted,
+	withProviderSafetyStopAdapterInvocation,
+} from "./adapter-internals/provider-safety-stop";
 import { assertManagedAttempt, classifyFallbackTrigger, type TransportFailureFacts } from "./utils/fallback-transport";
 
 const managedAttemptValidated = Symbol("managedAttemptValidated");
@@ -325,13 +330,13 @@ export function stream<TApi extends Api>(
 		if (!apiKey) {
 			throw new Error(formatMissingApiKeyError(model.provider));
 		}
+		const adapterOptions = isProviderSafetyStopModelTrusted(model)
+			? withProviderSafetyStopAdapterInvocation({ ...(options as SimpleStreamOptions | undefined), apiKey })
+			: { ...(options as SimpleStreamOptions | undefined), apiKey };
 		return streamFromLazyImport(
 			async () => {
 				const { streamGitLabDuo } = await import("./providers/gitlab-duo");
-				return streamGitLabDuo(model, context, {
-					...(options as SimpleStreamOptions | undefined),
-					apiKey,
-				});
+				return streamGitLabDuo(model, context, adapterOptions);
 			},
 			(options as StreamOptions | undefined)?.signal,
 		);
@@ -339,7 +344,14 @@ export function stream<TApi extends Api>(
 
 	// Vertex AI uses Application Default Credentials, not API keys
 	if (model.api === "google-vertex") {
-		return streamGoogleVertex(model as Model<"google-vertex">, context, options as GoogleVertexOptions);
+		const vertexOptions = (options || {}) as GoogleVertexOptions;
+		return streamGoogleVertex(
+			model as Model<"google-vertex">,
+			context,
+			isProviderSafetyStopModelTrusted(model)
+				? withProviderSafetyStopAdapterInvocation(vertexOptions)
+				: vertexOptions,
+		);
 	} else if (model.api === "bedrock-converse-stream") {
 		// Bedrock doesn't have any API keys instead it sources credentials from standard AWS env variables or from given AWS profile.
 		return streamBedrock(model as Model<"bedrock-converse-stream">, context, (options || {}) as BedrockOptions);
@@ -356,11 +368,14 @@ export function stream<TApi extends Api>(
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
 	const providerOptions = { ...options, apiKey };
+	const adapterProviderOptions = isProviderSafetyStopModelTrusted(model)
+		? withProviderSafetyStopAdapterInvocation(providerOptions)
+		: providerOptions;
 
 	const api: Api = model.api;
 	switch (api) {
 		case "anthropic-messages": {
-			const anthropicOptions = providerOptions as AnthropicOptions;
+			const anthropicOptions = adapterProviderOptions as AnthropicOptions;
 			return streamAnthropic(model as Model<"anthropic-messages">, context, {
 				...anthropicOptions,
 				isOAuth: anthropicOptions.isOAuth ?? model.isOAuth,
@@ -368,32 +383,40 @@ export function stream<TApi extends Api>(
 		}
 
 		case "openai-completions":
-			return streamOpenAICompletions(model as Model<"openai-completions">, context, providerOptions as any);
+			return streamOpenAICompletions(model as Model<"openai-completions">, context, adapterProviderOptions as any);
 
 		case "openai-responses":
-			return streamOpenAIResponses(model as Model<"openai-responses">, context, providerOptions as any);
+			return streamOpenAIResponses(model as Model<"openai-responses">, context, adapterProviderOptions as any);
 
 		case "azure-openai-responses":
-			return streamAzureOpenAIResponses(model as Model<"azure-openai-responses">, context, providerOptions as any);
+			return streamAzureOpenAIResponses(
+				model as Model<"azure-openai-responses">,
+				context,
+				adapterProviderOptions as any,
+			);
 
 		case "openai-codex-responses":
-			return streamOpenAICodexResponses(model as Model<"openai-codex-responses">, context, providerOptions as any);
+			return streamOpenAICodexResponses(
+				model as Model<"openai-codex-responses">,
+				context,
+				adapterProviderOptions as any,
+			);
 
 		case "google-generative-ai":
-			return streamGoogle(model as Model<"google-generative-ai">, context, providerOptions);
+			return streamGoogle(model as Model<"google-generative-ai">, context, adapterProviderOptions);
 
 		case "google-gemini-cli":
 			return streamGoogleGeminiCli(
 				model as Model<"google-gemini-cli">,
 				context,
-				providerOptions as GoogleGeminiCliOptions,
+				adapterProviderOptions as GoogleGeminiCliOptions,
 			);
 
 		case "ollama-chat":
-			return streamOllama(model as Model<"ollama-chat">, context, providerOptions as OllamaChatOptions);
+			return streamOllama(model as Model<"ollama-chat">, context, adapterProviderOptions as OllamaChatOptions);
 
 		case "cursor-agent":
-			return streamCursor(model as Model<"cursor-agent">, context, providerOptions as CursorOptions);
+			return streamCursor(model as Model<"cursor-agent">, context, adapterProviderOptions as CursorOptions);
 
 		default:
 			throw new Error(`Unhandled API: ${api}`);
@@ -616,15 +639,22 @@ export function streamSimple<TApi extends Api>(
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}
+	const adapterOptions = isProviderSafetyStopModelTrusted(model)
+		? withProviderSafetyStopAdapterInvocation(options ?? {})
+		: options;
 
 	// GitLab Duo - wraps Anthropic/OpenAI behind GitLab AI Gateway direct access tokens
 	if (model.provider === "gitlab-duo") {
 		return streamFromLazyImport(async () => {
 			const { streamGitLabDuo } = await import("./providers/gitlab-duo");
-			return streamGitLabDuo(model, context, {
-				...options,
-				apiKey,
-			});
+			return streamGitLabDuo(
+				model,
+				context,
+				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+					...adapterOptions,
+					apiKey,
+				}),
+			);
 		}, options?.signal);
 	}
 
@@ -633,11 +663,15 @@ export function streamSimple<TApi extends Api>(
 		return streamFromLazyImport(async () => {
 			const { streamKimi } = await import("./providers/kimi");
 			// Pass raw SimpleStreamOptions - streamKimi handles mapping internally
-			return streamKimi(model as Model<"openai-completions">, context, {
-				...options,
-				apiKey,
-				format: options?.kimiApiFormat ?? "anthropic",
-			});
+			return streamKimi(
+				model as Model<"openai-completions">,
+				context,
+				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+					...adapterOptions,
+					apiKey,
+					format: options?.kimiApiFormat ?? "anthropic",
+				}),
+			);
 		}, options?.signal);
 	}
 
@@ -646,11 +680,15 @@ export function streamSimple<TApi extends Api>(
 		return streamFromLazyImport(async () => {
 			const { streamSynthetic } = await import("./providers/synthetic");
 			// Pass raw SimpleStreamOptions - streamSynthetic handles mapping internally
-			return streamSynthetic(model as Model<"openai-completions">, context, {
-				...options,
-				apiKey,
-				format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
-			});
+			return streamSynthetic(
+				model as Model<"openai-completions">,
+				context,
+				copyProviderSafetyStopAdapterInvocation(adapterOptions, {
+					...adapterOptions,
+					apiKey,
+					format: options?.syntheticApiFormat ?? "openai", // Default to OpenAI format
+				}),
+			);
 		}, options?.signal);
 	}
 
@@ -770,7 +808,7 @@ function mapOptionsForApi<TApi extends Api>(
 	options?: SimpleStreamOptions,
 	apiKey?: string,
 ): OptionsForApi<TApi> {
-	const base = {
+	const base = copyProviderSafetyStopAdapterInvocation(options, {
 		temperature: options?.temperature,
 		topP: options?.topP,
 		topK: options?.topK,
@@ -797,7 +835,7 @@ function mapOptionsForApi<TApi extends Api>(
 		attemptScope: options?.attemptScope,
 		execHandlers: options?.execHandlers,
 		[managedAttemptValidated]: hasValidatedManagedAttempt(options),
-	};
+	});
 
 	switch (model.api) {
 		case "anthropic-messages": {

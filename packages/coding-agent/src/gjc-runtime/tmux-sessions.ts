@@ -1240,21 +1240,13 @@ function exactManagedOwnerSupervisor(supervisorPid: number, supervisorStartTime:
  * Deliver SIGTERM to exactly one already-proved owner PID.
  *
  * `Process.signalRoot` routes through the owned pidfd on Linux and the owned
- * process handle on Windows, so PID reuse cannot redirect the signal. macOS has
- * no equivalent kernel authority and the native binding deliberately fails
- * closed there, which would leave every macOS force-close unable to signal its
- * owner at all. On that platform the caller has already re-proved the PID's
- * start-time incarnation immediately before this call — the same evidence the
- * native macOS signal path re-validates — so deliver to that exact PID.
+ * process handle on Windows, so PID reuse cannot redirect the signal. macOS
+ * has no equivalent kernel authority, so the native binding deliberately fails
+ * closed there rather than falling back to a raw PID signal.
  */
 function signalManagedOwnerTerm(supervisor: Process, pid: number): boolean {
-	if (process.platform !== "darwin") return supervisor.signalRoot(15);
-	try {
-		process.kill(pid, "SIGTERM");
-		return true;
-	} catch {
-		return false;
-	}
+	void pid;
+	return supervisor.signalRoot(15);
 }
 
 async function readCurrentGeneration(stateDir: string, sessionId: string): Promise<string | null> {

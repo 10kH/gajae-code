@@ -6,6 +6,8 @@ import { buildRemoteCommand, ensureConnection, ensureHostInfo, type SSHConnectio
 import { hasSshfs, mountRemote } from "./sshfs-mount";
 
 export interface SSHExecutorOptions {
+	/** Session settings used for output policy. */
+	settings?: Settings;
 	/** Timeout in milliseconds */
 	timeout?: number;
 	/** Callback for streaming output chunks (already sanitized) */
@@ -85,7 +87,7 @@ export async function executeSSH(
 		stderr: "full",
 	});
 
-	const settings = await Settings.init();
+	const settings = options?.settings ?? (await Settings.init());
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
 		artifactPath: options?.artifactPath,

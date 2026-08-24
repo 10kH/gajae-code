@@ -19,6 +19,7 @@ import {
 	FilesystemTopicRegistryCasAuthority,
 	hasSafeDaemonStateShape,
 	loadInstallationHostId,
+	loadLegacyInstallationHostId,
 	markDaemonOwnerStopped,
 	readDaemonState,
 	readOwnerFreshnessSnapshot,
@@ -54,6 +55,8 @@ export interface RunDaemonInternalDeps {
 	readDaemonState?: (settings: Settings) => Promise<DaemonState | undefined>;
 	/** Loads the verified machine-local identity; injectable so daemon tests do not touch the host. */
 	loadInstallationHostId?: () => Promise<string>;
+	/** Loads the previous machine-local identity used only for stale lock migration. */
+	loadLegacyInstallationHostId?: () => Promise<string>;
 	/**
 	 * Startup hygiene sweep over the notifications dir; injectable so tests can
 	 * prove it is fired, is never awaited by startup, and that a rejection is
@@ -308,9 +311,17 @@ export async function runDaemonInternal(argv: string[], deps: RunDaemonInternalD
 		})
 		.catch(error => logger.warn(`telegram-daemon: startup debris sweep failed: ${String(error)}`));
 	const installationHostId = await (deps.loadInstallationHostId ?? loadInstallationHostId)();
+	const legacyInstallationHostId = deps.loadLegacyInstallationHostId
+		? await deps.loadLegacyInstallationHostId()
+		: deps.loadInstallationHostId
+			? installationHostId
+			: await loadLegacyInstallationHostId();
 	const topicRegistryAuthority = new FilesystemTopicRegistryCasAuthority(
 		path.join(daemonPaths(resolvedAgentDir).dir, "telegram-topics.json"),
-		{ installationHostId },
+		{
+			installationHostId,
+			previousInstallationHostIds: legacyInstallationHostId === installationHostId ? [] : [legacyInstallationHostId],
+		},
 	);
 	const Daemon: TelegramDaemonConstructor = deps.DaemonImpl ?? TelegramNotificationDaemon;
 	const readState = deps.readDaemonState ?? readDaemonState;

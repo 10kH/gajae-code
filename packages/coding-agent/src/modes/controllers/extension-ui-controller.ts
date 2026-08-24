@@ -25,6 +25,7 @@ import type {
 	SendUserMessageHandler,
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
+import { createExtensionSettings } from "../../extensibility/extensions";
 import { runExtensionSetModel } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { HookEditorComponent } from "../../modes/components/hook-editor";
@@ -921,6 +922,7 @@ export class ExtensionUiController {
 						compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 						hasUI: !this.ctx.isBackgrounded,
 						cwd: this.ctx.sessionManager.getCwd(),
+						settings: this.ctx.session.settings ? createExtensionSettings(this.ctx.session.settings) : undefined,
 						sessionManager: createReadonlySessionManager(this.ctx.session.sessionManager),
 						modelRegistry: this.ctx.session.modelRegistry,
 						model: this.ctx.session.model,

@@ -9,8 +9,9 @@ import {
 import type { PetTransportAvailability } from "./iterm-pet-transport";
 
 export type PetPixelProtocol = "sixel" | "kitty" | "iterm";
+export type PetRenderProtocol = PetPixelProtocol | "text";
 
-export const PET_UNAVAILABLE_DESCRIPTION = "Unavailable: requires compatible Kitty or Sixel overlay rendering";
+export const PET_UNAVAILABLE_DESCRIPTION = "Unavailable";
 export const PET_SAVED_UNAVAILABLE_DESCRIPTION =
 	"Saved, unavailable — requires compatible Kitty or Sixel overlay rendering";
 export const PET_UNAVAILABLE_WARNING =
@@ -54,7 +55,12 @@ export function getPetPixelProtocol(): PetPixelProtocol | null {
 }
 
 export function isPetAvailable(): boolean {
-	return getPetPixelProtocol() !== null;
+	return true;
+}
+
+/** Every terminal can render the conservative text-cell pet; pixels are optional. */
+export function getPetRenderProtocol(): PetRenderProtocol {
+	return getPetPixelProtocol() ?? "text";
 }
 
 export function createPetSelectItems(

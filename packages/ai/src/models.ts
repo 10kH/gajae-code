@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { registerProviderSafetyStopModel } from "./adapter-internals/provider-safety-stop";
 import { getOpenAIModelCost } from "./model-pricing";
 import { isRetiredModelKey } from "./model-retirements";
 import { applyGeneratedModelPolicies, enrichModelThinking } from "./model-thinking";
@@ -42,7 +43,9 @@ function getProviderModels(provider: GeneratedProvider): Map<string, Model<Api>>
 		if (isRetiredModelKey(provider, id)) {
 			continue;
 		}
-		providerModels.set(id, applyBundledCompatDefaults(enrichModelThinking(model as Model<Api>)));
+		const bundledModel = applyBundledCompatDefaults(enrichModelThinking(model as Model<Api>));
+		registerProviderSafetyStopModel(bundledModel);
+		providerModels.set(id, bundledModel);
 	}
 	providerModelRegistry.set(provider, providerModels);
 	return providerModels;

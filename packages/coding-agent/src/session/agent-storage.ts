@@ -212,12 +212,16 @@ FROM model_usage_legacy
 	/**
 	 * Returns singleton instance for the given database path, creating if needed.
 	 * Retries on SQLITE_BUSY with exponential backoff.
-	 * @param dbPath - Path to the SQLite database file (defaults to config path)
+	 * @param dbPath - Path to the database file (defaults to config path)
+	 * @param options.isolated - Open an independent handle instead of the cached process-wide instance.
 	 * @returns AgentStorage instance for the given path
 	 */
-	static async open(dbPath: string = getAgentDbPath()): Promise<AgentStorage> {
-		const existing = instances.get(dbPath);
-		if (existing) return existing;
+	static async open(dbPath: string = getAgentDbPath(), options?: { isolated?: boolean }): Promise<AgentStorage> {
+		const isolated = options?.isolated === true;
+		if (!isolated) {
+			const existing = instances.get(dbPath);
+			if (existing) return existing;
+		}
 
 		const maxRetries = 3;
 		const baseDelayMs = 100;
@@ -226,7 +230,7 @@ FROM model_usage_legacy
 		for (let attempt = 0; attempt < maxRetries; attempt++) {
 			try {
 				const storage = new AgentStorage(dbPath);
-				instances.set(dbPath, storage);
+				if (!isolated) instances.set(dbPath, storage);
 				return storage;
 			} catch (err) {
 				const isSqliteBusy = err && typeof err === "object" && (err as { code?: string }).code === "SQLITE_BUSY";

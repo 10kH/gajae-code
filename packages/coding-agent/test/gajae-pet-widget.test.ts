@@ -234,6 +234,67 @@ describe("GajaePetWidget", () => {
 		}
 	});
 
+	it("renders a bounded text-cell fallback without terminal image escapes", () => {
+		const { widget, editorContainer, getEmitter } = makeWidget(80, 30, { protocol: null });
+		const protocol = vi.spyOn(GajaePetWidget, "pixelProtocol").mockReturnValue("text");
+		try {
+			widget.setMode("red");
+			const lines = editorContainer.render(80);
+			expect(lines).toHaveLength(2);
+			expect(lines.join("\n")).toContain("▀");
+			expect(getEmitter()?.()).toBeNull();
+			expect(lines.join("")).not.toContain("\x1bP");
+			expect(lines.join("")).not.toContain("\x1b_G");
+		} finally {
+			protocol.mockRestore();
+			widget.dispose();
+		}
+	});
+
+	it("drops text art rather than widening or adding rows on narrow terminals", () => {
+		const { widget, editorContainer } = makeWidget(17, 30, { protocol: null });
+		const protocol = vi.spyOn(GajaePetWidget, "pixelProtocol").mockReturnValue("text");
+		try {
+			widget.setMode("blue");
+			const lines = editorContainer.render(17);
+			expect(lines).toHaveLength(2);
+			expect(lines.every(line => tui.visibleWidth(line) <= 17)).toBe(true);
+			expect(lines.join("\n")).not.toContain("▀");
+		} finally {
+			protocol.mockRestore();
+			widget.dispose();
+		}
+	});
+
+	it("upgrades a text fallback to pixels when its protocol becomes available", () => {
+		const { widget, getEmitter } = makeWidget(80, 30, { protocol: null });
+		const protocol = vi.spyOn(GajaePetWidget, "pixelProtocol").mockReturnValue("text");
+		try {
+			widget.setMode("red");
+			protocol.mockReturnValue("sixel");
+			widget.setMode("red");
+			expect(getEmitter()?.()).toContain("\x1bP0;1;0q");
+		} finally {
+			protocol.mockRestore();
+			widget.dispose();
+		}
+	});
+
+	it("replaces an active pixel pet with text cells when graphics disappear", () => {
+		const { widget, editorContainer, getEmitter } = makeWidget(80, 30, { protocol: null });
+		const protocol = vi.spyOn(GajaePetWidget, "pixelProtocol").mockReturnValue("sixel");
+		try {
+			widget.setMode("red");
+			protocol.mockReturnValue("text");
+			widget.setMode("red");
+			expect(getEmitter()?.()).toBeNull();
+			expect(editorContainer.render(80).join("\n")).toContain("▀");
+		} finally {
+			protocol.mockRestore();
+			widget.dispose();
+		}
+	});
+
 	it("owns and deletes a distinct Kitty image ID per widget", () => {
 		const first = makeWidget(80, 30, { protocol: "kitty" });
 		const second = makeWidget(80, 30, { protocol: "kitty" });

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { applyOwnerOnlyPathSecurity } from "@gajae-code/natives";
 import { CRASH_ISSUE_MARKER_PREFIX } from "@gajae-code/utils";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
@@ -58,6 +59,10 @@ function options(overrides: Partial<Options> = {}): Options {
 		repo: "Yeachan-Heo/gajae-code",
 		...overrides,
 	};
+}
+
+function secureWindowsFixture(pathname: string, kind: "directory" | "file"): void {
+	if (process.platform === "win32") expect(applyOwnerOnlyPathSecurity(pathname, kind)).toEqual({ ok: true });
 }
 
 describe("parseArgs", () => {
@@ -357,11 +362,100 @@ describe("main orchestration", () => {
 			const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
 			await Promise.all([fileApprovalStore.recordApprovals([manifest]), fileApprovalStore.recordApprovals([manifest])]);
 			const stat = await fs.stat(target);
-			expect(stat.mode & 0o077).toBe(0);
+			// Windows reports synthetic 0o666-style modes, so the private-mode bits
+			// are only meaningful on POSIX.
+			if (process.platform !== "win32") expect(stat.mode & 0o077).toBe(0);
 			expect(await fileApprovalStore.loadApprovals()).toEqual([manifest]);
 			await fileApprovalStore.recordFiled(manifest, "https://github.com/Yeachan-Heo/gajae-code/issues/1");
 			expect(await fileApprovalStore.hasAnyFiled(manifest)).toBe(true);
 			await fileApprovalStore.consume(manifest);
+			expect(await fileApprovalStore.loadApprovals()).toEqual([]);
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("recovers a stale creation lock left behind by a dead process", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-lock-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+			const lockPath = `${target}.create.lock`;
+			await fs.mkdir(lockPath, { mode: 0o700 });
+			secureWindowsFixture(lockPath, "directory");
+			await fs.writeFile(
+				path.join(lockPath, "owner.json"),
+				`${JSON.stringify({ token: randomUUID(), pid: 999_999_999, startedAt: 0 })}\n`,
+				{ mode: 0o600 },
+			);
+			secureWindowsFixture(path.join(lockPath, "owner.json"), "file");
+			const past = new Date(Date.now() - 11 * 60 * 1000);
+			await fs.utimes(lockPath, past, past);
+			expect(await withCreationLock(async () => "ran")).toBe("ran");
+			await expect(fs.lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("recovers a stale creation lock with an incomplete owner record", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-lock-incomplete-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+			const lockPath = `${target}.create.lock`;
+			await fs.mkdir(lockPath, { mode: 0o700 });
+			secureWindowsFixture(lockPath, "directory");
+			await fs.writeFile(path.join(lockPath, "owner.json"), "{", { mode: 0o600 });
+			secureWindowsFixture(path.join(lockPath, "owner.json"), "file");
+			const past = new Date(Date.now() - 11 * 60 * 1000);
+			await fs.utimes(lockPath, past, past);
+			expect(await withCreationLock(async () => "ran")).toBe("ran");
+			await expect(fs.lstat(lockPath)).rejects.toMatchObject({ code: "ENOENT" });
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects a wrong-kind creation lock instead of treating it as contention", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-lock-kind-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+			const lockPath = `${target}.create.lock`;
+			await fs.writeFile(lockPath, "not a lock directory", { mode: 0o600 });
+			await expect(withCreationLock(async () => "must not run")).rejects.toThrow(
+				"approval lock is not a private directory",
+			);
+			expect(await fs.readFile(lockPath, "utf8")).toBe("not a lock directory");
+		} finally {
+			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;
+			else process.env.GJC_SENTRY_APPROVAL_STORE = previousStore;
+			await fs.rm(home, { recursive: true, force: true });
+		}
+	});
+
+	test.skipIf(process.platform === "win32")("refuses a POSIX approval file that became group-readable", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sentry-store-mode-"));
+		const previousStore = process.env.GJC_SENTRY_APPROVAL_STORE;
+		const target = path.join(home, ".gjc", "sentry-triage-approvals.json");
+		process.env.GJC_SENTRY_APPROVAL_STORE = target;
+		try {
+			const manifest = approvalManifest({ fingerprint: FINGERPRINT, sentry: sentryIssue() }, options());
+			await fileApprovalStore.recordApprovals([manifest]);
+			await fs.chmod(target, 0o640);
 			expect(await fileApprovalStore.loadApprovals()).toEqual([]);
 		} finally {
 			if (previousStore === undefined) delete process.env.GJC_SENTRY_APPROVAL_STORE;

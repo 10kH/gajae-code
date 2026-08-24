@@ -10,18 +10,18 @@ import {
 interface GatedCall {
 	name: string;
 	release: () => void;
+	started: Promise<void>;
 }
 
 function gatedEffect(name: string): { effect: () => Promise<void>; call: GatedCall } {
-	let release!: () => void;
-	const settled = new Promise<void>(resolve => {
-		release = resolve;
-	});
+	const settled = Promise.withResolvers<void>();
+	const started = Promise.withResolvers<void>();
 	return {
 		effect: async () => {
-			await settled;
+			started.resolve();
+			await settled.promise;
 		},
-		call: { name, release },
+		call: { name, release: settled.resolve, started: started.promise },
 	};
 }
 
@@ -186,6 +186,98 @@ describe("inbound reaction transition ordering", () => {
 			await sequencer.apply(updateId, { terminal: true, effect: async () => undefined });
 		}
 		expect(sequencer.debugTombstoneCount()).toBeLessThanOrEqual(INBOUND_REACTION_TOMBSTONE_WINDOW);
+		expect(sequencer.debugChainCount()).toBe(0);
+	});
+
+	test("terminal tombstones stay bounded when effects complete in descending update order", async () => {
+		const sequencer = new InboundReactionSequencer();
+		const newest = INBOUND_REACTION_TOMBSTONE_WINDOW * 3;
+		await sequencer.apply(newest, { terminal: true, effect: async () => undefined });
+		for (let updateId = newest - 1; updateId >= 1; updateId--) {
+			await sequencer.apply(updateId, { terminal: true, effect: async () => undefined });
+		}
+
+		expect(sequencer.isTerminal(newest)).toBe(true);
+		expect(sequencer.isTerminal(1)).toBe(false);
+		expect(sequencer.debugTombstoneCount()).toBeLessThanOrEqual(INBOUND_REACTION_TOMBSTONE_WINDOW);
+		expect(sequencer.debugChainCount()).toBe(0);
+	});
+
+	test("an earlier transition settling mid-chain never unserializes a later one", async () => {
+		const sequencer = new InboundReactionSequencer();
+		const order: string[] = [];
+		const consumed = gatedEffect("consumed");
+
+		// Fast accepted ack settles while the slow consumed ack is mid-flight.
+		const acceptedPromise = sequencer.apply(802, {
+			terminal: false,
+			effect: async () => {
+				order.push("queued");
+			},
+		});
+		const consumedPromise = sequencer.apply(802, {
+			terminal: true,
+			effect: async () => {
+				order.push("consumed");
+				await consumed.effect();
+			},
+		});
+		await acceptedPromise;
+		await consumed.call.started;
+		// A replayed accepted ack arriving now must chain behind the in-flight
+		// consumed transition (and then be skipped by its terminal state), not
+		// start concurrently against it.
+		const replayedPromise = sequencer.apply(802, {
+			terminal: false,
+			effect: async () => {
+				order.push("replayed-queued");
+			},
+		});
+		consumed.call.release();
+		await Promise.all([consumedPromise, replayedPromise]);
+
+		expect(order).toEqual(["queued", "consumed"]);
+		expect(sequencer.isTerminal(802)).toBe(true);
+		await Bun.sleep(0);
+		expect(sequencer.debugChainCount()).toBe(0);
+	});
+
+	test("a rejected predecessor cannot drop an installed successor tail", async () => {
+		const sequencer = new InboundReactionSequencer();
+		const order: string[] = [];
+		const failed = Promise.withResolvers<void>();
+		const consumed = gatedEffect("consumed");
+
+		const failedPromise = sequencer.apply(803, {
+			terminal: false,
+			effect: async () => {
+				order.push("failing-queued");
+				await failed.promise;
+			},
+		});
+		const consumedPromise = sequencer.apply(803, {
+			terminal: true,
+			effect: async () => {
+				order.push("consumed");
+				await consumed.effect();
+			},
+		});
+
+		failed.reject(new Error("queued marker failed"));
+		await expect(failedPromise).rejects.toThrow("queued marker failed");
+		await consumed.call.started;
+		const replayedPromise = sequencer.apply(803, {
+			terminal: false,
+			effect: async () => {
+				order.push("replayed-queued");
+			},
+		});
+
+		consumed.call.release();
+		await Promise.all([consumedPromise, replayedPromise]);
+		expect(order).toEqual(["failing-queued", "consumed"]);
+		expect(sequencer.isTerminal(803)).toBe(true);
+		await Bun.sleep(0);
 		expect(sequencer.debugChainCount()).toBe(0);
 	});
 

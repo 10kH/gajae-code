@@ -4,6 +4,7 @@ import {
 	type CellRect,
 	type Component,
 	type Container,
+	CURSOR_MARKER,
 	type GajaeGifFrame,
 	type GajaeGifTimeline,
 	type GajaePixelFrames,
@@ -14,15 +15,18 @@ import {
 	type PetFrameName,
 	type PetMode,
 	type PetSkinId,
+	padding,
 	petBurstDurationMs,
 	petBurstFrame,
 	type RasterLeaseToken,
 	registerAnimationCallback,
+	TERMINAL,
 	type TUI,
+	visibleWidth,
 	wrapITerm2RecordForTmux,
 } from "@gajae-code/tui";
 import type { CustomEditor } from "./custom-editor";
-import { getItermPetUnavailableReason, getPetPixelProtocol, getVerifiedItermPetAvailability } from "./pet-capability";
+import { getItermPetUnavailableReason, getPetRenderProtocol, getVerifiedItermPetAvailability } from "./pet-capability";
 
 /** Re-exported from the tui skin registry so widget-relative imports stay valid. */
 export type { PetMode, PetSkinId };
@@ -145,11 +149,62 @@ const OUROBOROS_WORK_BURST_MAX_GAP_MS = 30_000;
 
 /** Selector preview: fire the first burst this soon after a skin is previewed. */
 const PREVIEW_INTRO_MS = 2300;
+const TEXT_PET_COLUMNS = 8;
+
+function nearestAnsi256([red, green, blue]: readonly [number, number, number]): number {
+	if (red === green && green === blue)
+		return red < 8 ? 16 : red > 248 ? 231 : 232 + Math.round(((red - 8) / 247) * 23);
+	return 16 + 36 * Math.round((red / 255) * 5) + 6 * Math.round((green / 255) * 5) + Math.round((blue / 255) * 5);
+}
+
+function sgr(color: readonly [number, number, number], background: boolean): string {
+	const channel = background ? 48 : 38;
+	return TERMINAL.trueColor
+		? `\x1b[${channel};2;${color[0]};${color[1]};${color[2]}m`
+		: `\x1b[${channel};5;${nearestAnsi256(color)}m`;
+}
+
+function dominantColor(
+	grid: readonly string[],
+	palette: Readonly<Record<string, readonly [number, number, number] | null>>,
+	x: number,
+	y: number,
+): readonly [number, number, number] | null {
+	const counts = new Map<string, number>();
+	for (let row = y; row < y + 4; row++)
+		for (let column = x; column < x + 2; column++) {
+			const key = grid[row]?.[column] ?? ".";
+			if (palette[key]) counts.set(key, (counts.get(key) ?? 0) + 1);
+		}
+	let selected: string | undefined;
+	let count = 0;
+	for (const [key, nextCount] of counts) if (nextCount > count) [selected, count] = [key, nextCount];
+	return selected ? (palette[selected] ?? null) : null;
+}
+
+/** A two-row, eight-cell composition that never emits terminal graphics escapes. */
+function textPetFrame(mode: PetSkinId, frame: PetFrameName): string[] {
+	const skin = PET_SKINS[mode];
+	const grid = skin.frames[frame] ?? skin.frames[skin.baseFrame]!;
+	return [0, 8].map(y => {
+		let line = "";
+		for (let x = 0; x < 16; x += 2) {
+			const upper = dominantColor(grid, skin.palette, x, y);
+			const lower = dominantColor(grid, skin.palette, x, y + 4);
+			if (!upper && !lower) line += " ";
+			else if (upper && lower) line += `${sgr(upper, false)}${sgr(lower, true)}▀`;
+			else if (upper) line += `${sgr(upper, false)}▀`;
+			else if (lower) line += `${sgr(lower, false)}▄`;
+		}
+		return `${line}\x1b[0m`;
+	});
+}
 
 /** Reserve a right-side area beside the composer where the pixel pet is drawn. */
 export class PetFramedEditor implements Component {
 	#editor: CustomEditor;
 	#reserve = 0;
+	#textArt: (() => string[]) | undefined;
 
 	constructor(editor: CustomEditor) {
 		this.#editor = editor;
@@ -157,6 +212,10 @@ export class PetFramedEditor implements Component {
 
 	setReserve(columns: number): void {
 		this.#reserve = columns;
+	}
+
+	setTextArt(textArt: (() => string[]) | undefined): void {
+		this.#textArt = textArt;
 	}
 
 	canFit(width: number): boolean {
@@ -169,7 +228,17 @@ export class PetFramedEditor implements Component {
 
 	render(width: number): string[] {
 		if (!this.canFit(width)) return this.#editor.render(width);
-		return this.#editor.render(width - this.#reserve);
+		const lines = this.#editor.render(width - this.#reserve);
+		const art = this.#textArt?.();
+		if (!art) return lines;
+		const start = Math.max(0, lines.length - art.length);
+		return lines.map((line, index) => {
+			if (index < start) return line;
+			// The APC cursor marker is zero-width but native width calculation sees
+			// it before TUI strips it. Keep the reserved art from shifting the cursor.
+			const lineWidth = visibleWidth(line.replace(CURSOR_MARKER, ""));
+			return `${line}${padding(Math.max(0, width - this.#reserve - lineWidth))}${art[index - start]}`;
+		});
 	}
 }
 
@@ -240,8 +309,8 @@ export class GajaePetWidget {
 			options.autoFlexGapMs === undefined ? [AUTO_FLEX_MIN_GAP_MS, AUTO_FLEX_MAX_GAP_MS] : options.autoFlexGapMs;
 	}
 
-	static pixelProtocol(): "sixel" | "kitty" | "iterm" | null {
-		return getPetPixelProtocol();
+	static pixelProtocol(): "sixel" | "kitty" | "iterm" | "text" | null {
+		return getPetRenderProtocol();
 	}
 
 	get mode(): PetMode {
@@ -278,7 +347,16 @@ export class GajaePetWidget {
 	}
 
 	#applyMode(mode: PetMode, mountComposer: boolean): void {
-		if (this.#disposed || mode === this.#mode) return;
+		if (this.#disposed) return;
+		if (mode === this.#mode) {
+			if (mode === "off") return;
+			const nextProtocol = this.#forcedProtocol ?? GajaePetWidget.pixelProtocol();
+			const currentProtocol = this.#itermProtocol ? "iterm" : (this.#pixel?.protocol ?? "text");
+			if (nextProtocol === currentProtocol) {
+				if (this.#framedEditor.canFit(this.#ui.terminal.columns)) this.#mountEditor(true);
+				return;
+			}
+		}
 		if (mode === "off") {
 			if (!this.#canMutateSharedUi()) return;
 			this.#itermGeneration++;
@@ -299,6 +377,7 @@ export class GajaePetWidget {
 			this.#workTransition = undefined;
 			this.#nextWorkBurstAt = 0;
 			this.#framedEditor.setReserve(0);
+			this.#framedEditor.setTextArt(undefined);
 			if (mountComposer) this.#mountEditor(false);
 			this.#ui.requestRender(true);
 			return;
@@ -359,11 +438,19 @@ export class GajaePetWidget {
 		this.dispose();
 	}
 
-	#buildPixel(protocol: "sixel" | "kitty" | "iterm"): void {
+	#buildPixel(protocol: "sixel" | "kitty" | "iterm" | "text"): void {
 		const cell = getCellDimensions();
 		this.#builtCellW = cell.widthPx;
 		this.#builtCellH = cell.heightPx;
 		const skin: PetSkinId = this.#mode === "off" ? "red" : this.#mode;
+		if (protocol === "text") {
+			this.#itermProtocol = false;
+			this.#pixel = undefined;
+			this.#framedEditor.setReserve(TEXT_PET_COLUMNS + PET_SIDE_MARGIN);
+			this.#framedEditor.setTextArt(() => textPetFrame(skin, this.#frame));
+			return;
+		}
+		this.#framedEditor.setTextArt(undefined);
 		if (protocol === "kitty") {
 			this.#kittyImageId ??= allocatePetKittyImageId();
 			this.#kittyCleanupGeneration++;
@@ -781,7 +868,15 @@ export class GajaePetWidget {
 			this.#tickIterm(now);
 			return;
 		}
-		if (this.#mode === "off" || !this.#pixel) return;
+		if (this.#mode === "off") return;
+		if (!this.#pixel) {
+			const frame = this.#pickFrame(now);
+			if (frame !== this.#frame) {
+				this.#frame = frame;
+				this.#ui.requestRender();
+			}
+			return;
+		}
 		const cell = getCellDimensions();
 		if (cell.widthPx !== this.#builtCellW || cell.heightPx !== this.#builtCellH) {
 			const protocol = this.#forcedProtocol ?? GajaePetWidget.pixelProtocol();

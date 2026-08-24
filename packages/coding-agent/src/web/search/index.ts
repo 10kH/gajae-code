@@ -8,6 +8,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { AuthStorage } from "@gajae-code/ai/core";
 import { prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
+import type { Settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext, RenderResultOptions } from "../../extensibility/custom-tools/types";
 import type { Theme } from "../../modes/theme/theme";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
@@ -16,10 +17,28 @@ import { discoverAuthStorage } from "../../sdk";
 import type { ToolSession } from "../../tools";
 import { formatAge } from "../../tools/render-utils";
 import { throwIfAborted } from "../../tools/tool-errors";
-import { getSearchProviderLabel, prewarmSearchProviders, resolveProviderChain, type SearchProvider } from "./provider";
+import {
+	getConfiguredSearchProviderPreference,
+	getSearchProviderLabel,
+	prewarmSearchProviders,
+	resolveProviderChain,
+	type SearchProvider,
+	searchProviderSettings,
+} from "./provider";
+import {
+	SEARXNG_BASIC_CREDENTIAL_PREFIX,
+	SEARXNG_BEARER_CREDENTIAL_PREFIX,
+	type SearchProviderSettings,
+} from "./providers/base";
+import { getConfiguredSearchTimeoutMs, runWithSearchTimeout } from "./providers/utils";
 import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
-import type { ActiveSearchModelContext, SearchProviderId, SearchResponse } from "./types";
-import { SearchProviderError } from "./types";
+import {
+	type ActiveSearchModelContext,
+	isConfigurableSearchProviderId,
+	SearchProviderError,
+	type SearchProviderId,
+	type SearchResponse,
+} from "./types";
 
 /** Web search tool parameters schema */
 export const webSearchSchema = z.object({
@@ -146,6 +165,57 @@ interface ExecuteSearchOptions {
 	sessionId?: string;
 	signal?: AbortSignal;
 	activeModelContext?: ActiveSearchModelContext;
+	preferredProvider?: SearchProviderId | "auto";
+	fallbackProviders?: readonly SearchProviderId[];
+	hardTimeoutMs?: number;
+	settings?: Settings;
+}
+
+function createScopedSearchAuthStorage(authStorage: AuthStorage, settings?: Settings): AuthStorage {
+	if (!settings) return authStorage;
+
+	const basicUsername = settings.get("searxng.basicUsername");
+	const basicPassword = settings.get("searxng.basicPassword");
+	const token = settings.get("searxng.token");
+	if (basicUsername === undefined && basicPassword === undefined && !token) return authStorage;
+
+	const getApiKey: AuthStorage["getApiKey"] = async (provider, sessionId, options) => {
+		if (provider === "searxng") {
+			if (basicUsername !== undefined || basicPassword !== undefined) {
+				const payload = Buffer.from(JSON.stringify({ username: basicUsername, password: basicPassword })).toString(
+					"base64",
+				);
+				return `${SEARXNG_BASIC_CREDENTIAL_PREFIX}${payload}`;
+			}
+			if (token) return `${SEARXNG_BEARER_CREDENTIAL_PREFIX}${token}`;
+		}
+		return await authStorage.getApiKey(provider, sessionId, options);
+	};
+
+	return new Proxy(authStorage, {
+		get(target, property, receiver) {
+			if (property === "getApiKey") return getApiKey;
+			const value = Reflect.get(target, property, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+function searchPolicyFromSettings(
+	settings: Settings | undefined,
+): Pick<ExecuteSearchOptions, "preferredProvider" | "fallbackProviders" | "hardTimeoutMs" | "settings"> {
+	if (!settings) return {};
+	const fallback = settings.get("web_search.fallback");
+	return {
+		settings,
+		preferredProvider: getConfiguredSearchProviderPreference(settings),
+		fallbackProviders: Array.isArray(fallback)
+			? fallback.filter(
+					(value): value is SearchProviderId => typeof value === "string" && isConfigurableSearchProviderId(value),
+				)
+			: undefined,
+		hardTimeoutMs: getConfiguredSearchTimeoutMs(settings),
+	};
 }
 
 /**
@@ -170,16 +240,41 @@ async function executeSearch(
 	params: SearchQueryParams,
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	const { authStorage, sessionId, signal, activeModelContext } = options;
+	if (Object.hasOwn(options, "hardTimeoutMs")) {
+		return runWithSearchTimeout(options.hardTimeoutMs, () => executeSearchUnscoped(_toolCallId, params, options));
+	}
+	return executeSearchUnscoped(_toolCallId, params, options);
+}
+
+async function executeSearchUnscoped(
+	_toolCallId: string,
+	params: SearchQueryParams,
+	options: ExecuteSearchOptions,
+): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
+	const {
+		authStorage,
+		sessionId,
+		signal,
+		activeModelContext,
+		preferredProvider,
+		fallbackProviders,
+		hardTimeoutMs,
+		settings,
+	} = options;
+	const providerAuthStorage = createScopedSearchAuthStorage(authStorage, settings);
+	const providerSettings: SearchProviderSettings | undefined = searchProviderSettings(settings);
 	// Pass `params.provider` straight through: when omitted (the normal model-facing
 	// path) it is `undefined`, so `resolveProviderChain` applies the settings-configured
 	// preferred provider. Coalescing to "auto" here would silently bypass that preference.
 	const providers = await resolveProviderChain({
-		authStorage,
+		authStorage: providerAuthStorage,
 		sessionId,
 		signal,
 		preferredProvider: params.provider,
+		fallbackProviders,
+		...(preferredProvider !== undefined && params.provider === undefined ? { preferredProvider } : {}),
 		activeModelContext,
+		settings,
 	});
 
 	const baseSearchParams = {
@@ -201,9 +296,13 @@ async function executeSearch(
 		enableImageSearch: params.enable_image_search,
 		enableVideoUnderstanding: params.enable_video_understanding,
 		noInlineCitations: params.no_inline_citations,
-		authStorage,
+		authStorage: providerAuthStorage,
 		sessionId,
 		activeModelContext,
+		hardTimeoutMs,
+		preferredProvider,
+		fallbackProviders,
+		settings: providerSettings,
 	};
 
 	// Hedged fallback: when DuckDuckGo (keyless, cheap) is a non-primary member
@@ -325,6 +424,13 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 
 	#session: ToolSession;
 
+	#searchPolicy(): Pick<
+		ExecuteSearchOptions,
+		"preferredProvider" | "fallbackProviders" | "hardTimeoutMs" | "settings"
+	> {
+		return searchPolicyFromSettings(this.#session.settings);
+	}
+
 	constructor(session: ToolSession) {
 		this.#session = session;
 		this.description = prompt.render(webSearchDescription);
@@ -341,6 +447,7 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 					authStorage,
 					sessionId: session.getCredentialSessionId?.() ?? session.getSessionId?.() ?? undefined,
 					activeModelContext,
+					...this.#searchPolicy(),
 				});
 			} catch {
 				// Never let prewarming break tool construction.
@@ -360,45 +467,57 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 		const activeModelContext = this.#session.model
 			? this.#session.modelRegistry?.getActiveSearchModelContext(this.#session.model)
 			: undefined;
-		return executeSearch(_toolCallId, params, { authStorage, sessionId, signal, activeModelContext });
-	}
-}
-
-/** Web search tool as CustomTool (for TUI rendering support) */
-export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRenderDetails> = {
-	name: "web_search",
-	label: "Web Search",
-	description: prompt.render(webSearchDescription),
-	parameters: webSearchSchema,
-
-	async execute(
-		toolCallId: string,
-		params: SearchToolParams,
-		_onUpdate,
-		ctx: CustomToolContext,
-		signal?: AbortSignal,
-	) {
-		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
-		const sessionId = ctx.credentialSessionId ?? ctx.sessionManager.getSessionId();
-		return executeSearch(toolCallId, params, {
+		return executeSearch(_toolCallId, params, {
 			authStorage,
 			sessionId,
 			signal,
-			activeModelContext: ctx.model ? ctx.modelRegistry?.getActiveSearchModelContext(ctx.model) : undefined,
+			activeModelContext,
+			...this.#searchPolicy(),
 		});
-	},
+	}
+}
 
-	renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
-		return renderSearchCall(args, options, theme);
-	},
+/** Web search tool as CustomTool (for TUI rendering support). */
+function createWebSearchCustomTool(activeSettings?: Settings): CustomTool<typeof webSearchSchema, SearchRenderDetails> {
+	return {
+		name: "web_search",
+		label: "Web Search",
+		description: prompt.render(webSearchDescription),
+		parameters: webSearchSchema,
 
-	renderResult(result, options: RenderResultOptions, theme: Theme) {
-		return renderSearchResult(result, options, theme);
-	},
-};
+		async execute(
+			toolCallId: string,
+			params: SearchToolParams,
+			_onUpdate,
+			ctx: CustomToolContext,
+			signal?: AbortSignal,
+		) {
+			const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
+			const sessionId = ctx.credentialSessionId ?? ctx.sessionManager.getSessionId();
+			return executeSearch(toolCallId, params, {
+				authStorage,
+				sessionId,
+				signal,
+				activeModelContext: ctx.model ? ctx.modelRegistry?.getActiveSearchModelContext(ctx.model) : undefined,
+				...searchPolicyFromSettings(activeSettings),
+			});
+		},
 
-export function getSearchTools(): CustomTool<any, any>[] {
-	return [webSearchCustomTool];
+		renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
+			return renderSearchCall(args, options, theme);
+		},
+
+		renderResult(result, options: RenderResultOptions, theme: Theme) {
+			return renderSearchResult(result, options, theme);
+		},
+	};
+}
+
+/** Backward-compatible standalone tool; session construction uses getSearchTools(settings). */
+export const webSearchCustomTool = createWebSearchCustomTool();
+
+export function getSearchTools(settings?: Settings): CustomTool<any, any>[] {
+	return [createWebSearchCustomTool(settings)];
 }
 
 export {

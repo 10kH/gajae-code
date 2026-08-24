@@ -10,6 +10,11 @@ import type {
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions";
 import packageJson from "../../package.json" with { type: "json" };
+import {
+	isProviderSafetyStopAdapterInvocation,
+	mintProviderSafetyStop,
+	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+} from "../adapter-internals/provider-safety-stop";
 import { type Effort, getSupportedEfforts } from "../model-thinking";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
@@ -829,8 +834,17 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			let providerSafetyStop = false;
 			const markProviderSafetyStop = (errorMessage?: string): void => {
 				providerSafetyStop = true;
-				output.errorKind = "provider_safety_stop";
 				output.stopReason = "error";
+				// Terminal authority comes from the adapter mark, not the wire
+				// field: this call site parsed the structured content_filter
+				// finish reason from the provider's own response (#4777).
+				mintProviderSafetyStop(
+					output,
+					"content_filter",
+					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+					options?.fetch,
+					isProviderSafetyStopAdapterInvocation(options),
+				);
 				if (errorMessage) output.errorMessage = errorMessage;
 			};
 
@@ -1073,7 +1087,16 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
 			output.errorMessage = rewriteCopilotError(output.errorMessage, normalizedError, model.provider);
 			if (hasContentFilterSafetyCode(capturedErrorResponse)) {
-				output.errorKind = "provider_safety_stop";
+				// The structured content_filter code was parsed from the captured
+				// HTTP response body; mint adapter provenance for the terminal
+				// kind instead of trusting a wire-assignable field (#4777).
+				mintProviderSafetyStop(
+					output,
+					"content_filter",
+					PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
+					options?.fetch,
+					isProviderSafetyStopAdapterInvocation(options),
+				);
 			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;

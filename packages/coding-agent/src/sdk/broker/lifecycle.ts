@@ -33,6 +33,9 @@ import {
 	GJC_COORDINATOR_SESSION_BRANCH_ENV,
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
+	GJC_COORDINATOR_SIDECAR_KEY_ID_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV,
+	GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV,
 } from "../../gjc-runtime/session-state-sidecar";
 import { validateManagedArtifactTree } from "../../session/internal/managed-session-storage";
 import {
@@ -74,7 +77,7 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
-import { isSessionAuthorityEligible } from "./session-index";
+import { type IndexedSession, isSessionAuthorityEligible } from "./session-index";
 import {
 	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
@@ -262,7 +265,7 @@ export interface SessionLifecycleTranscriptIdentity {
  * be produced by an inherited process-global flag.
  */
 export type SessionLifecycleReadiness = "immediate" | "deferred";
-export interface SessionLifecycleLaunchRequest {
+export interface SessionLifecycleLaunchRequestBase {
 	operation: "session.create" | "session.fork" | "session.resume";
 	sessionId: string;
 	cwd: string;
@@ -293,10 +296,48 @@ export interface SessionLifecycleLaunchRequest {
 	semanticReadyDeadlineAt: number;
 	terminationStartDeadlineAt: number;
 	lifecycleCleanupDeadlineAt: number;
-	/** Coordinator namespace dir; broker computes the state file path from launch.id (#2549). */
-	coordinatorStateDir?: string;
 	coordinatorSessionId?: string;
 	coordinatorSessionBranch?: string;
+}
+
+export type SessionLifecycleLaunchRequest = SessionLifecycleLaunchRequestBase &
+	(
+		| {
+				coordinatorStateDir?: undefined;
+				coordinatorSidecarSigningKey?: undefined;
+				coordinatorSidecarKeyId?: undefined;
+		  }
+		| {
+				/** Coordinator namespace dir; broker computes the state file path from launch.id. */
+				coordinatorStateDir: string;
+				/** Public Coordinator signing authority metadata. */
+				coordinatorSidecarKeyId: string;
+				coordinatorSidecarSigningKey?: undefined;
+		  }
+	);
+
+function hasValidCoordinatorSidecarTarget(stateDir: unknown, keyId?: unknown): boolean {
+	if (stateDir === undefined && keyId === undefined) return true;
+	return (
+		typeof stateDir === "string" &&
+		stateDir.length > 0 &&
+		typeof keyId === "string" &&
+		/^[a-f0-9]{64}$/.test(keyId) &&
+		stateDir.length <= 4096
+	);
+}
+
+function hasValidCoordinatorSidecarLaunchTarget(stateDir: unknown, signingKey: unknown, keyId?: unknown): boolean {
+	if (stateDir === undefined && signingKey === undefined && keyId === undefined) return true;
+	return (
+		typeof stateDir === "string" &&
+		stateDir.length > 0 &&
+		typeof signingKey === "string" &&
+		signingKey.length > 0 &&
+		typeof keyId === "string" &&
+		/^[a-f0-9]{64}$/.test(keyId) &&
+		stateDir.length <= 4096
+	);
 }
 
 function isSessionLifecycleTranscriptIdentity(value: unknown): value is SessionLifecycleTranscriptIdentity {
@@ -445,8 +486,8 @@ export function readSessionLifecycleLaunchRequest(
 		(request.operation === "session.fork" &&
 			(!hasValidTranscriptAuthority(request.sourceSessionPath, request.sourceSessionIdentity) ||
 				request.sourceSessionId === undefined)) ||
-		(request.coordinatorStateDir !== undefined &&
-			(typeof request.coordinatorStateDir !== "string" || request.coordinatorStateDir.length > 4096)) ||
+		request.coordinatorSidecarSigningKey !== undefined ||
+		!hasValidCoordinatorSidecarTarget(request.coordinatorStateDir, request.coordinatorSidecarKeyId) ||
 		(request.coordinatorSessionId !== undefined &&
 			(typeof request.coordinatorSessionId !== "string" ||
 				!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(request.coordinatorSessionId))) ||
@@ -480,6 +521,8 @@ type SessionLaunch = {
 	coordinatorStateDir?: string;
 	coordinatorSessionId?: string;
 	coordinatorSessionBranch?: string;
+	coordinatorSidecarSigningKey?: string;
+	coordinatorSidecarKeyId?: string;
 	worktree?: SessionLifecycleWorktreeTarget;
 	readiness?: SessionLifecycleReadiness;
 	worktreePlan?: GjcLaunchWorktreePlan;
@@ -3057,6 +3100,46 @@ function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorkt
 	};
 }
 
+/**
+ * The id of a session still occupying `worktreePath`, or null when it is free.
+ *
+ * `ensureLaunchWorktree` reuses an existing worktree without asking whether anyone
+ * is in it, and an unnamed launch derives its directory deterministically from the
+ * repository's current branch. Two concurrent sessions in one repository therefore
+ * land in the same checkout and overwrite each other's files with no error.
+ *
+ * Only a process observed as definitively exited releases the worktree. `uncertain`
+ * counts as occupied: refusing a launch is recoverable by picking another worktree
+ * name, whereas two live sessions sharing a checkout corrupts work already done.
+ */
+function worktreeOccupant(
+	broker: { index: { listSessions(): { sessions: IndexedSession[] } } },
+	worktreePath: string,
+	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
+): string | null {
+	// Session locators retain the lexical cwd supplied to the host, while a
+	// lifecycle worktree plan may arrive through a symlink. Compare physical
+	// identity where it exists, with resolveEquivalentPath's lexical fallback
+	// for paths that have not been created yet.
+	const target = resolveEquivalentPath(worktreePath);
+	for (const session of broker.index.listSessions().sessions) {
+		if (session.terminal || !session.live) continue;
+		if (resolveEquivalentPath(session.locator.repo) !== target) continue;
+		if (observe(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited") continue;
+		return session.sessionId;
+	}
+	return null;
+}
+
+/** Test seam for the worktree occupancy boundary. */
+export function worktreeOccupantForTest(
+	sessions: IndexedSession[],
+	worktreePath: string,
+	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
+): string | null {
+	return worktreeOccupant({ index: { listSessions: () => ({ sessions }) } }, worktreePath, observe);
+}
+
 function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
 	const prepared = ensureLaunchWorktree(plan);
 	if (!prepared.enabled || path.resolve(prepared.worktreePath) !== path.resolve(plan.worktreePath))
@@ -3153,6 +3236,27 @@ async function launchInput(
 	const coordinatorStateDir = text(input.coordinatorStateDir);
 	const coordinatorSessionId = text(input.coordinatorSessionId);
 	const coordinatorSessionBranch = text(input.coordinatorSessionBranch);
+	const coordinatorSidecarSigningKey =
+		typeof input.coordinatorSidecarSigningKey === "string" ? input.coordinatorSidecarSigningKey : undefined;
+	const coordinatorSidecarKeyId =
+		typeof input.coordinatorSidecarKeyId === "string" ? input.coordinatorSidecarKeyId : undefined;
+	if (
+		(input.coordinatorStateDir !== undefined && !coordinatorStateDir) ||
+		(input.coordinatorSidecarSigningKey !== undefined && !coordinatorSidecarSigningKey) ||
+		!hasValidCoordinatorSidecarLaunchTarget(
+			coordinatorStateDir,
+			coordinatorSidecarSigningKey,
+			coordinatorSidecarKeyId,
+		)
+	)
+		return fail(
+			"invalid_input",
+			"Coordinator state directory, signing key, and verifier id must be supplied together as a valid target.",
+		);
+	const coordinatorAuthority =
+		coordinatorSidecarSigningKey && coordinatorSidecarKeyId
+			? { coordinatorSidecarSigningKey, coordinatorSidecarKeyId }
+			: {};
 
 	if (operation === "session.create")
 		return {
@@ -3168,6 +3272,7 @@ async function launchInput(
 			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
 			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
 			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
+			...coordinatorAuthority,
 		};
 	if (operation === "session.resume") {
 		if (!requested) return fail("invalid_input", "sessionId is required to resume a saved session.");
@@ -3189,6 +3294,7 @@ async function launchInput(
 			...(coordinatorStateDir ? { coordinatorStateDir } : {}),
 			...(coordinatorSessionId ? { coordinatorSessionId } : {}),
 			...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
+			...coordinatorAuthority,
 		};
 	}
 	const sourceSessionId = text(input.sourceSessionId) ?? text(input.sourceId);
@@ -3215,6 +3321,7 @@ async function launchInput(
 		...(coordinatorStateDir ? { coordinatorStateDir } : {}),
 		...(coordinatorSessionId ? { coordinatorSessionId } : {}),
 		...(coordinatorSessionBranch ? { coordinatorSessionBranch } : {}),
+		...coordinatorAuthority,
 	};
 }
 
@@ -3838,6 +3945,16 @@ async function executeLifecycleResponse(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
+		// Refuse before any durable effect is recorded: a launch that cannot own its
+		// worktree should leave no ledger transition or child process behind.
+		if (launch.worktreePlan) {
+			const occupant = worktreeOccupant(broker, launch.worktreePlan.worktreePath);
+			if (occupant && occupant !== launch.id)
+				return fail(
+					"worktree_in_use",
+					`The requested worktree is already held by session ${occupant}. Choose another worktree name or stop that session.`,
+				);
+		}
 		const effectMarker = randomUUID();
 		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
 		const effectIntent: LifecycleEffectIntent = {
@@ -3893,6 +4010,13 @@ async function executeLifecycleResponse(
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
 
+		const coordinatorSidecarTarget =
+			typeof launch.coordinatorStateDir === "string" && typeof launch.coordinatorSidecarKeyId === "string"
+				? {
+						coordinatorStateDir: launch.coordinatorStateDir,
+						coordinatorSidecarKeyId: launch.coordinatorSidecarKeyId,
+					}
+				: {};
 		const request: SessionLifecycleLaunchRequest = {
 			operation,
 			sessionId: launch.id,
@@ -3915,7 +4039,7 @@ async function executeLifecycleResponse(
 			...(launch.mcpServers ? { mcpServers: launch.mcpServers } : {}),
 			...(launch.worktree ? { worktree: launch.worktree } : {}),
 			...(launch.readiness ? { readiness: launch.readiness } : {}),
-			...(launch.coordinatorStateDir ? { coordinatorStateDir: launch.coordinatorStateDir } : {}),
+			...coordinatorSidecarTarget,
 			...(launch.coordinatorSessionId ? { coordinatorSessionId: launch.coordinatorSessionId } : {}),
 			...(launch.coordinatorSessionBranch ? { coordinatorSessionBranch: launch.coordinatorSessionBranch } : {}),
 		};
@@ -3924,6 +4048,7 @@ async function executeLifecycleResponse(
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
+				const commandEnvironment = "kind" in cmd ? cmd.env : process.env;
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
@@ -3934,7 +4059,7 @@ async function executeLifecycleResponse(
 					// by the OS rather than captured (#4712 review).
 					stdio: "ignore",
 					env: {
-						...("kind" in cmd ? cmd.env : process.env),
+						...commandEnvironment,
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,
@@ -3960,6 +4085,13 @@ async function executeLifecycleResponse(
 							: {}),
 						...(launch.coordinatorSessionBranch
 							? { [GJC_COORDINATOR_SESSION_BRANCH_ENV]: launch.coordinatorSessionBranch }
+							: {}),
+						...(launch.coordinatorSidecarSigningKey
+							? {
+									[GJC_COORDINATOR_SIDECAR_SIGNATURE_REQUIRED_ENV]: "true",
+									[GJC_COORDINATOR_SIDECAR_SIGNING_KEY_ENV]: launch.coordinatorSidecarSigningKey,
+									[GJC_COORDINATOR_SIDECAR_KEY_ID_ENV]: launch.coordinatorSidecarKeyId,
+								}
 							: {}),
 					},
 				});
@@ -4105,6 +4237,9 @@ async function executeLifecycleResponse(
 				pid: verified.endpoint.pid,
 				endpointMtimeMs: verified.endpointMtimeMs,
 				endpoint: verified.endpoint,
+				// Public, ledger-replayable evidence of the bootstrap authority that
+				// reached this runtime. The private key never enters the response.
+				...(launch.coordinatorSidecarKeyId ? { coordinatorSidecarKeyId: launch.coordinatorSidecarKeyId } : {}),
 				...(launch.readiness === "deferred" ? { readiness: "prepared" as const } : {}),
 				...(worktreeReceipt ? { worktree: worktreeReceipt } : {}),
 			},
