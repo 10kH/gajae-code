@@ -127,13 +127,14 @@ if (import.meta.main) {
 		throw new Error("usage: bun scripts/release-binaries-manifest.ts --bin-dir <dir> --tag <vX.Y.Z> [--channel stable|nightly]");
 	}
 	const channelArg = channelIndex >= 0 ? args[channelIndex + 1] : undefined;
-	if (channelArg && channelArg !== "stable" && channelArg !== "nightly") {
+	if (channelArg !== undefined && channelArg !== "stable" && channelArg !== "nightly") {
 		throw new Error(`Invalid --channel ${channelArg}`);
 	}
+	const channel: "stable" | "nightly" | undefined = channelArg;
 	const result = writeReleaseBinariesManifest({
 		binDir: args[binDirIndex + 1]!,
 		tag: args[tagIndex + 1]!,
-		...(channelArg ? { channel: channelArg } : {}),
+		...(channel ? { channel } : {}),
 	});
 	process.stdout.write(`wrote ${result.manifestPath}\nwrote ${result.sha256Path}\n`);
 }
