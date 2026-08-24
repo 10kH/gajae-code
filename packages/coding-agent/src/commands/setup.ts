@@ -57,6 +57,14 @@ export default class Setup extends Command {
 		"gjc-command": Flags.string({ description: "Command used to start `gjc mcp-serve coordinator`" }),
 		target: Flags.string({ description: "Hermes config file target for config-only install" }),
 		"profile-dir": Flags.string({ description: "Hermes profile directory for full setup install" }),
+		timeout: Flags.string({
+			description:
+				"Hermes MCP client call timeout in whole seconds 1-3600 (default 180); host client budget, not a GJC turn deadline",
+		}),
+		"connect-timeout": Flags.string({
+			description:
+				"Hermes MCP connect timeout in whole seconds 1-3600 (default 60); host client budget, not a GJC turn deadline",
+		}),
 		preset: Flags.string({ description: "Provider preset id (run setup provider --help to list available presets)" }),
 		compat: Flags.string({ description: "Provider compatibility: openai or anthropic" }),
 		provider: Flags.string({ description: "Provider id to add to models.yml" }),
@@ -104,6 +112,8 @@ export default class Setup extends Command {
 				gjcCommand: flags["gjc-command"],
 				target: flags.target,
 				profileDir: flags["profile-dir"],
+				timeout: flags.timeout,
+				connectTimeout: flags["connect-timeout"],
 				remove: flags.remove,
 				mpreset: flags.mpreset,
 				yes: flags.yes,

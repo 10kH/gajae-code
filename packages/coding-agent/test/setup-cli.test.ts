@@ -633,7 +633,7 @@ describe("setup CLI parsing", () => {
 			await Bun.write(configPath, tamperedConfig);
 
 			await expect(runHermesSetup({ install: true, root: [tempRoot], profileDir })).rejects.toThrow(
-				"already exists and is not managed by GJC",
+				"has GJC managed markers but its setup signature does not match",
 			);
 			expect(await Bun.file(configPath).text()).toBe(tamperedConfig);
 
