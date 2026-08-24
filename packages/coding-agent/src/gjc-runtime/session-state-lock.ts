@@ -8,7 +8,7 @@ import type {
 	NativeExactUnlinkResult,
 } from "@gajae-code/natives";
 import { genericFileLockDirIsStale, processStartTime as portableProcessStartTime } from "../config/file-lock";
-import { loadInstallationHostId } from "../config/machine-identity";
+import { loadInstallationHostId, loadLegacyInstallationHostId } from "../config/machine-identity";
 import { readLinuxProcStartTimeSync } from "./linux-proc";
 
 /**
@@ -135,6 +135,10 @@ export const SessionStateLockTestHooks: {
 	ownerRecordWriteFault?: (file: string) => void | Promise<void>;
 	/** @internal Stable host identity seam for shared-volume ownership tests. */
 	ownerHostId?: () => string | Promise<string>;
+	/** @internal Installation identity loader seam for cache retry tests. */
+	loadInstallationHostId?: () => Promise<string>;
+	/** @internal Previous identity seam for upgrade recovery tests. */
+	legacyOwnerHostId?: () => string | Promise<string>;
 	/** @internal Lets legacy same-host fixtures exercise their pre-qualification paths. */
 	unqualifiedOwnerIsLocal?: boolean;
 	/** @internal Runs after final live-owner validation and before descriptor rewrite. */
@@ -242,6 +246,7 @@ function validLockOwner(value: unknown): value is SessionStateLockOwner {
 }
 
 let ownerHostIdPromise: Promise<string> | undefined;
+let legacyOwnerHostIdPromise: Promise<string> | undefined;
 
 async function currentOwnerHostId(): Promise<string> {
 	try {
@@ -249,12 +254,31 @@ async function currentOwnerHostId(): Promise<string> {
 		if (SessionStateLockTestHooks.ownerHostId) {
 			hostId = await SessionStateLockTestHooks.ownerHostId();
 		} else {
-			ownerHostIdPromise ??= loadInstallationHostId();
-			hostId = await ownerHostIdPromise;
+			const promise =
+				ownerHostIdPromise ?? (SessionStateLockTestHooks.loadInstallationHostId ?? loadInstallationHostId)();
+			ownerHostIdPromise = promise;
+			try {
+				hostId = await promise;
+			} catch (error) {
+				if (ownerHostIdPromise === promise) ownerHostIdPromise = undefined;
+				throw error;
+			}
 		}
 		if (!hostId) throw new Error("Host identity is unavailable.");
 		return hostId;
 	} catch (error) {
+		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
+	}
+}
+
+async function currentLegacyOwnerHostId(): Promise<string> {
+	if (SessionStateLockTestHooks.legacyOwnerHostId) return await SessionStateLockTestHooks.legacyOwnerHostId();
+	const promise = legacyOwnerHostIdPromise ?? loadLegacyInstallationHostId();
+	legacyOwnerHostIdPromise = promise;
+	try {
+		return await promise;
+	} catch (error) {
+		if (legacyOwnerHostIdPromise === promise) legacyOwnerHostIdPromise = undefined;
 		throw error instanceof SessionStateLockUnavailableError ? error : new SessionStateLockUnavailableError(error);
 	}
 }
@@ -321,7 +345,7 @@ async function lockOwnerIsAlive(value: unknown): Promise<boolean> {
 	if (owner.owner_host_id === undefined) {
 		if (SessionStateLockTestHooks.unqualifiedOwnerIsLocal !== true) return true;
 	} else if (owner.owner_host_id !== (await currentOwnerHostId())) {
-		return true;
+		if (owner.owner_host_id !== (await currentLegacyOwnerHostId())) return true;
 	}
 	// PID and process-start values are host-local. A current writer on a shared
 	// volume must never classify a foreign owner from a local ESRCH result.
@@ -1088,7 +1112,10 @@ async function reclaimStaleDirectoryLock(lockFile: string): Promise<void> {
 		if (!before) return;
 		const ownerHostId =
 			SessionStateLockTestHooks.unqualifiedOwnerIsLocal === true ? undefined : await currentOwnerHostId();
-		if (!(await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId))) return;
+		let stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, ownerHostId);
+		if (!stale && ownerHostId !== undefined)
+			stale = await genericFileLockDirIsStale(lockFile, LOCK_STALE_MS, await currentLegacyOwnerHostId());
+		if (!stale) return;
 		await SessionStateLockTestHooks.afterLegacyDirectoryStaleVerdict?.(lockFile);
 		const authorized = captureLegacyDirectoryTree(native, lockFile);
 		// The verdict spoke for `before`; only an unchanged tree carries that authority.
