@@ -104,6 +104,9 @@ const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
 	acknowledged: boolean;
+	/** True once turn.prompt / skill.invoke has been sent; cancel must not fake-settle after this. */
+	dispatched: boolean;
+
 	/** Highest inbound frame sequence already observed when the prompt was acknowledged. */
 	boundary: number;
 	correlation: PromptCorrelation;
@@ -1637,6 +1640,8 @@ export class AcpAgent implements Agent {
 		const response = new Promise<PromptResponse>((resolve, reject) => {
 			waiter = {
 				acknowledged: false,
+				dispatched: false,
+
 				boundary: record.inboundSequence,
 				correlation: {},
 				emittedAssistantText: "",
@@ -1686,13 +1691,20 @@ export class AcpAgent implements Agent {
 				record.adapter,
 			);
 		}
+		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
+
 		const acknowledgementTask = (async (): Promise<PromptResponse> => {
+			waiter.dispatched = true;
 			const acknowledgement = skillInvocation
 				? await record.adapter.control("skill.invoke", skillInvocation)
 				: await record.adapter.prompt({
 						text: payload.text,
 						...(payload.images.length ? { images: payload.images } : {}),
 					});
+
 			const acknowledgementCorrelation = promptAcknowledgement(acknowledgement);
 			if (!acknowledgementCorrelation)
 				throw new AcpSdkAdapterError(
@@ -1875,7 +1887,7 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
-			if (waiter && !waiter.acknowledged) {
+			if (waiter && !waiter.dispatched) {
 				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 				waiter.cancelAttemptResolve?.(true);
 				return;
