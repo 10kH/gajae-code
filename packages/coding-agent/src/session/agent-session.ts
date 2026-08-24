@@ -18183,6 +18183,7 @@ export class AgentSession {
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
+		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return false;
 		const transportFailure = message.transportFailure;
 		// Transport facts normally bypass typed classification in managed fallback.
 		// A provider safety stop must still remain terminal on that path.
@@ -18314,6 +18315,7 @@ export class AgentSession {
 	 * except canonical idle-stream stalls bounded downstream) -> unknown (bounded retry).
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
+		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return "terminal";
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
@@ -18692,6 +18694,7 @@ export class AgentSession {
 		// result is returned verbatim below. Narrowing it away here would silently
 		// disable the terminal-403 guard in `#markFailedCredential`.
 	): { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition } | undefined {
+		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return undefined;
 		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop") return undefined;
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
