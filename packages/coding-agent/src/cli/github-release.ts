@@ -229,8 +229,10 @@ export async function verifyDownloadedBinaryChecksum(options: {
 		}
 		return "verified";
 	}
-	// Releases published before checksum assets (e.g. v0.15.0) return 404 for
-	// both files. Only an explicit double-404 is the compatibility skip;
-	// fetchOptionalText already fails closed on any non-404 HTTP error.
-	return "absent";
+	const version = versionFromTag(options.tag);
+	if (version === "0.15.0") {
+		// The last published release before checksum assets. Later tags must ship integrity files.
+		return "absent";
+	}
+	throw new Error(`Release ${options.tag} has no checksum assets; refusing to install an unsigned binary`);
 }

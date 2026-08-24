@@ -45,7 +45,8 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).not.toContain("Default: use bun if available");
 		expect(installer).toContain("Putting $InstallDir first on PATH");
 		expect(installer).toContain("Failed to publish the downloaded binary");
-		expect(installer).toContain("*-nightly.*");
+		expect(installer).toContain('^v\\d+\\.\\d+\\.\\d+-nightly\\.\\d+\\.\\d+\\.g[0-9a-f]+$');
+		expect(installer).toContain("Test-TrustedGithubUri");
 	});
 
 	test.skipIf(!pwsh)("parses without syntax errors under PowerShell", async () => {

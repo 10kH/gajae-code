@@ -64,8 +64,10 @@ die() {
 cleanup() {
     old_status=$?
     if [ -n "$TMP_FILES" ]; then
-        # shellcheck disable=SC2086
-        rm -f $TMP_FILES
+        printf '%s\n' "$TMP_FILES" | while IFS= read -r tmp_file; do
+            [ -n "$tmp_file" ] || continue
+            rm -f "$tmp_file"
+        done || true
     fi
     if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
         rmdir "$LOCK_DIR" 2>/dev/null || true
@@ -76,7 +78,8 @@ cleanup() {
 trap cleanup EXIT INT HUP TERM
 
 remember_tmp() {
-    TMP_FILES="${TMP_FILES} $1"
+    TMP_FILES="${TMP_FILES}$1
+"
 }
 
 is_safe_tag() {
@@ -386,7 +389,14 @@ verify_checksum() {
         die "Integrity asset ${BINARY_MANIFEST_ASSET} returned HTTP ${http_code}. Existing install was not changed."
     fi
 
-    echo "No checksum asset on ${LATEST}; continuing with size, --version, and --smoke-test verification."
+    case "$LATEST" in
+        v0.15.0)
+            echo "No checksum asset on ${LATEST}; continuing with size, --version, and --smoke-test verification."
+            ;;
+        *)
+            die "Release ${LATEST} has no checksum assets. Existing install was not changed."
+            ;;
+    esac
 }
 
 restore_backup() {
@@ -406,13 +416,11 @@ verify_installed_binary() {
         return 1
     fi
     reported=$("$dest" --version 2>/dev/null || true)
-    case "$reported" in
-        *"/${expected}"*) ;;
-        *)
-            echo "Installed binary --version mismatch (expected gjc/${expected}, got: ${reported:-<empty>})" >&2
-            return 1
-            ;;
-    esac
+    actual=$(printf '%s\n' "$reported" | sed -n 's|^gjc/\([^[:space:]]*\).*|\1|p')
+    if [ "$actual" != "$expected" ]; then
+        echo "Installed binary --version mismatch (expected gjc/${expected}, got: ${reported:-<empty>})" >&2
+        return 1
+    fi
     if ! "$dest" --smoke-test >/dev/null 2>&1; then
         echo "Installed binary --smoke-test failed" >&2
         return 1

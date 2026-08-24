@@ -34,7 +34,18 @@ $BinarySha256Asset = "gajae-release-binaries.sha256"
 $BinaryManifestAsset = "gajae-release-binaries-v1.json"
 $UserAgent = "gjc-install"
 
+function Test-TrustedGithubUri {
+    param([string]$Uri)
+    try {
+        $parsed = [Uri]$Uri
+        return $parsed.Scheme -eq "https" -and ($parsed.Host -eq "api.github.com" -or $parsed.Host -eq "github.com")
+    } catch {
+        return $false
+    }
+}
+
 function Get-GithubHeaders {
+    param([string]$Uri)
     $headers = @{
         "User-Agent" = $UserAgent
         "Accept" = "application/vnd.github+json"
@@ -42,7 +53,7 @@ function Get-GithubHeaders {
     }
     $token = $env:GITHUB_TOKEN
     if (-not $token) { $token = $env:GH_TOKEN }
-    if ($token) {
+    if ($token -and (Test-TrustedGithubUri $Uri)) {
         $headers["Authorization"] = "Bearer $token"
     }
     return $headers
@@ -229,7 +240,7 @@ function Get-ChecksumForAsset {
 }
 
 function Resolve-ReleaseTag {
-    $headers = Get-GithubHeaders
+    $headers = Get-GithubHeaders -Uri "$GithubApi/"
     if ($Ref) {
         if (-not (Test-SafeReleaseTag $Ref)) {
             throw "Invalid -Ref '$Ref'. Expected a GitHub release tag like v0.15.0."
@@ -247,7 +258,7 @@ function Resolve-ReleaseTag {
         Write-Host "Fetching latest nightly GitHub prerelease..."
         $releases = Invoke-RestMethod -Uri "$GithubApi/repos/$Repo/releases?per_page=40" -Headers $headers
         foreach ($candidate in $releases) {
-            if ($candidate.prerelease -eq $true -and $candidate.draft -eq $false -and (Test-SafeReleaseTag $candidate.tag_name) -and $candidate.tag_name -like "*-nightly.*") {
+            if ($candidate.prerelease -eq $true -and $candidate.draft -eq $false -and (Test-SafeReleaseTag $candidate.tag_name) -and $candidate.tag_name -match '^v\d+\.\d+\.\d+-nightly\.\d+\.\d+\.g[0-9a-f]+$') {
                 return $candidate.tag_name
             }
         }
@@ -322,6 +333,9 @@ function Assert-Checksum {
             if ($_.Exception.Message -match "Checksum mismatch|invalid checksum|did not list") { throw }
             $status = Get-WebExceptionStatus $_
             if ($status -eq 404 -and $sumsMissing) {
+                if ($Tag -ne "v0.15.0") {
+                    throw "Release $Tag has no checksum assets. Existing install was not changed."
+                }
                 Write-Host "No checksum asset on $Tag; continuing with size, --version, and --smoke-test verification."
                 return
             }
@@ -342,7 +356,8 @@ function Assert-InstalledBinary {
         throw "Installed file is missing: $ExePath"
     }
     $versionOutput = & $ExePath --version 2>$null
-    if (-not $versionOutput -or ($versionOutput -notlike "*/$ExpectedVersion*")) {
+    $escaped = [regex]::Escape($ExpectedVersion)
+    if (-not $versionOutput -or ($versionOutput -notmatch "(?m)^gjc/$escaped(\s|$)")) {
         throw "Installed binary --version mismatch (expected gjc/$ExpectedVersion, got: $versionOutput)"
     }
     & $ExePath --smoke-test | Out-Null

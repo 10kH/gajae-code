@@ -605,6 +605,9 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	try {
 		await unlinkIfExists(options.backupPath);
 		try {
+			// Windows allows renaming a mapped running image; it does not allow
+			// overwriting that image in place. Move the live file aside, then
+			// publish the staged replacement into the vacated name.
 			await fs.promises.rename(options.targetPath, options.backupPath);
 			backupReady = true;
 		} catch (err) {
@@ -744,13 +747,18 @@ async function downloadBinaryTo(
 	}
 	if (expectedVersion) {
 		const tag = expectedVersion.startsWith("v") ? expectedVersion : `v${expectedVersion}`;
-		const checksum = await verifyDownloadedBinaryChecksum({
-			tag,
-			assetName: binaryName,
-			filePath: tempPath,
-		});
-		if (checksum === "absent") {
-			console.log(chalk.dim(`No checksum asset on ${tag}; continuing with version and smoke verification.`));
+		try {
+			const checksum = await verifyDownloadedBinaryChecksum({
+				tag,
+				assetName: binaryName,
+				filePath: tempPath,
+			});
+			if (checksum === "absent") {
+				console.log(chalk.dim(`No checksum asset on ${tag}; continuing with version and smoke verification.`));
+			}
+		} catch (err) {
+			await unlinkIfExists(tempPath);
+			throw err;
 		}
 	}
 }
@@ -810,23 +818,47 @@ export async function runBinaryUpdateFlow(
 
 async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {
 	const lockDir = `${targetPath}.update-lock`;
-	try {
-		await fs.promises.mkdir(lockDir);
-	} catch (err) {
-		const code = (err as NodeJS.ErrnoException).code;
-		if (code === "ENOENT") return async () => {};
-		if (code === "EEXIST") {
-			throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
-		}
-		throw err;
-	}
-	return async () => {
+	const ownerPath = path.join(lockDir, "pid");
+	const writeOwner = async (): Promise<void> => {
+		await fs.promises.writeFile(ownerPath, `${process.pid}\n`, { encoding: "utf8" });
+	};
+	const release = async (): Promise<void> => {
 		try {
+			await unlinkIfExists(ownerPath);
 			await fs.promises.rmdir(lockDir);
 		} catch {
 			// Best-effort lock release after a verified or failed update.
 		}
 	};
+	try {
+		await fs.promises.mkdir(lockDir);
+		await writeOwner();
+		return release;
+	} catch (err) {
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return async () => {};
+		if (code === "EEXIST") {
+			let owner = "";
+			try {
+				owner = (await fs.promises.readFile(ownerPath, "utf8")).trim();
+			} catch {
+				throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
+			}
+			const ownerPid = Number(owner);
+			if (Number.isInteger(ownerPid) && ownerPid > 0) {
+				try {
+					process.kill(ownerPid, 0);
+				} catch {
+					await fs.promises.rm(lockDir, { recursive: true, force: true });
+					await fs.promises.mkdir(lockDir);
+					await writeOwner();
+					return release;
+				}
+			}
+			throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
+		}
+		throw err;
+	}
 }
 
 /**
