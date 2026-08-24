@@ -472,6 +472,13 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "crates/pi-shell/src/shell.rs" ||
 		changedPath === "crates/pi-shell/src/lib.rs" ||
 		changedPath === "crates/pi-shell/src/windows.rs" ||
+		// These manifests supply the Windows-only APIs and crate wiring used by
+		// the hidden-console spawn path. A Linux shard cannot compile the cfg
+		// Windows imports, so dependency-only changes must still run the live
+		// windows-latest regression (#4883).
+		changedPath === "Cargo.toml" ||
+		changedPath === "crates/brush-core-vendored/Cargo.toml" ||
+		changedPath === "crates/pi-shell/Cargo.toml" ||
 		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts"
 	);
 }
