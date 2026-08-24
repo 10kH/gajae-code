@@ -205,3 +205,4 @@ A few contexts still match chords directly instead of resolving through the regi
 
 - Tree selector (`tree-selector.ts`): up/down/left/right/enter, `ctrl+c`, filter cycling (`ctrl+o` / `ctrl+shift+o`), filter modes (`alt+d/t/u/l/a`), label edit (`shift+l`).
 - Parts of the model selector.
+- Composer editor (`editor.ts`): the kill-ring, word-delete and line-kill actions (`tui.editor.deleteToLineEnd`, `tui.editor.deleteToLineStart`, `tui.editor.deleteWordBackward`, `tui.editor.deleteWordForward`, `tui.editor.yank`, `tui.editor.yankPop`) now resolve through the registry and are fully remappable. Two exceptions remain: `tui.editor.cursorLineStart` and `tui.editor.cursorLineEnd` are matched by literal `ctrl+a` / `ctrl+e` branches placed ahead of their registry branches, so remapping those two actions elsewhere does **not** free `ctrl+a` / `ctrl+e` inside the composer. The `alt+enter` / `ctrl+j` / `ctrl+enter` submit and newline chords are likewise still literal.
