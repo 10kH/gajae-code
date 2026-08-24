@@ -442,6 +442,17 @@ test("ACP still answers an admitted reverse request after a later lease conflict
 		await expect(adapter.ensureProviders()).rejects.toMatchObject({ code: "provider_lease_conflict" });
 		expect(adapter.leaseIds.get("permission")).toBeUndefined();
 		expect(signal?.aborted).toBe(true);
+		await waitFor(
+			() =>
+				sent.some(
+					frame =>
+						frame.type === "reverse_response" &&
+						frame.id === "perm-1" &&
+						frame.ok === false &&
+						(frame.error as { code?: string } | undefined)?.code === "provider_disconnected",
+				),
+			"host reverse settlement after foreign quarantine",
+		);
 	} finally {
 		resolvePermissionGate();
 		await adapter.close();

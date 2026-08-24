@@ -863,8 +863,20 @@ export class AcpSdkAdapter {
 	}
 
 	#abortReverseForCapability(capability: string): void {
-		for (const [id, request] of this.#reverseRequests) {
-			if (request.capability === capability) this.#cancelReverse(id);
+		for (const [id, request] of [...this.#reverseRequests]) {
+			if (request.capability !== capability) continue;
+			const connectionId = request.connectionId;
+			const leaseId = request.leaseId;
+			this.#cancelReverse(id);
+			if (typeof connectionId !== "string" || typeof leaseId !== "string") continue;
+			void this.#sendSession({
+				type: "reverse_response",
+				id,
+				connectionId,
+				leaseId,
+				ok: false,
+				error: { code: "provider_disconnected", message: "Reverse provider lease was replaced." },
+			}).catch(() => {});
 		}
 	}
 
