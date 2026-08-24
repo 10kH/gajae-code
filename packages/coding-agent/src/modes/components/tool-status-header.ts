@@ -926,12 +926,17 @@ export class StatusLineComponent implements Component {
 		let placed = layout(topFillWidth);
 		let reserved = 0;
 		if (placed.dropped > 0 && topFillWidth > 0) {
-			reserved = Math.min(topFillWidth, visibleWidth(`…+${placed.dropped}`));
 			// Re-evict against the reduced budget so the cue never overflows the
-			// rail. The reservation can push out another segment; the recomputed
-			// count covers it, and the marker degrades to a bare `…` when the
-			// larger count no longer fits the cells we reserved.
-			placed = layout(Math.max(0, topFillWidth - reserved));
+			// rail. Reserving cells can push out another segment, which can in turn
+			// widen the count (9 -> 10 gains a digit), so converge instead of
+			// reserving once: otherwise the exact count would degrade to a bare
+			// marker even when the rail had room for it.
+			for (let pass = 0; pass < 4; pass += 1) {
+				const needed = Math.min(topFillWidth, visibleWidth(`…+${placed.dropped}`));
+				if (needed <= reserved) break;
+				reserved = needed;
+				placed = layout(Math.max(0, topFillWidth - reserved));
+			}
 		}
 		const marker = this.#renderOverflowMarker(placed.dropped, reserved);
 
@@ -1059,20 +1064,36 @@ export class StatusLineComponent implements Component {
 				else dropped += current.length;
 			}
 
-			// Reserve marker cells in the final admitted row, evicting from its tail
+			// Prune every row down to what actually fits. Without this, an oversized
+			// row survives here and the defensive truncation in `render()` trims it
+			// into a lone ellipsis, which reads exactly like the overflow cue on a row
+			// that is not supposed to carry one. Emptied rows are removed rather than
+			// emitted blank, so at tiny widths the marker ends up alone on one row.
+			for (let index = packedRows.length - 1; index >= 0; index -= 1) {
+				const row = packedRows[index];
+				while (row.length > 0 && this.#groupWidth(row, seg.leftCapWidth, seg.leftSepWidth) > topFillWidth) {
+					row.pop();
+					dropped += 1;
+				}
+				if (row.length === 0) packedRows.splice(index, 1);
+			}
+
+			// Reserve marker cells in the final surviving row, evicting from its tail
 			// until the cue fits. Never opens a new row: that would contradict maxRows.
-			const lastRow = packedRows[packedRows.length - 1];
 			let marker = "";
-			if (dropped > 0 && lastRow && topFillWidth > 0) {
+			if (dropped > 0 && topFillWidth > 0) {
+				const lastRow = packedRows[packedRows.length - 1];
 				let reserved = Math.min(topFillWidth, visibleWidth(`…+${dropped}`));
 				while (
-					lastRow.length > 1 &&
+					lastRow &&
+					lastRow.length > 0 &&
 					this.#groupWidth(lastRow, seg.leftCapWidth, seg.leftSepWidth) + reserved > topFillWidth
 				) {
 					lastRow.pop();
 					dropped += 1;
 					reserved = Math.min(topFillWidth, visibleWidth(`…+${dropped}`));
 				}
+				if (lastRow && lastRow.length === 0) packedRows.pop();
 				marker = this.#renderOverflowMarker(dropped, reserved);
 			}
 
@@ -1087,6 +1108,8 @@ export class StatusLineComponent implements Component {
 				);
 				return index === packedRows.length - 1 ? rendered + marker : rendered;
 			});
+			// Every content row was pruned away, so the cue is the only thing left.
+			if (packedRows.length === 0 && marker) rows = [marker];
 		}
 
 		this.#renderedRowsCache = { key: cacheKey, rows };
@@ -1138,7 +1161,11 @@ export class StatusLineComponent implements Component {
 
 		const statusRows = this.#buildStatusRows(width, this.#resolveMaxRows());
 		for (const statusRow of statusRows) {
-			if (statusRow) lines.push(truncateToWidth(statusRow, width));
+			if (!statusRow) continue;
+			// Guard on the truncated value: at width 0 the truncation collapses to an
+			// empty string, and emitting that would add a blank row rather than none.
+			const truncated = truncateToWidth(statusRow, width);
+			if (truncated) lines.push(truncated);
 		}
 
 		const showHooks = this.#settings.showHookStatus ?? true;

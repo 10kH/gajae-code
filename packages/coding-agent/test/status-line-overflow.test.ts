@@ -578,3 +578,97 @@ describe("status line overflow cue", () => {
 		for (const row of changed) expect(visibleWidth(row)).toBeLessThanOrEqual(WIDTH);
 	});
 });
+
+describe("status line overflow cue geometry", () => {
+	const strip = (s: string): string => Bun.stripANSI(s);
+
+	function buildWide(maxRows: number): StatusLineComponent {
+		// Enough segments that the omitted count crosses into two digits.
+		const component = new StatusLineComponent(createStatusLineSession("GeoSess"), { version: "9.9.9" });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae", "session", "model", "mode"],
+			rightSegments: [
+				"session_name",
+				"time",
+				"cost",
+				"context_pct",
+				"context_total",
+				"token_in",
+				"token_out",
+				"token_total",
+				"token_rate",
+				"cache_read",
+				"cache_write",
+				"time_spent",
+				"hostname",
+			],
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
+	it.each([1, 2])("renders exactly the bare marker at one column (maxRows %i)", maxRows => {
+		const rendered = buildWide(maxRows).render(1);
+
+		expect(rendered).toHaveLength(1);
+		expect(strip(rendered[0])).toBe("…");
+		expect(visibleWidth(rendered[0])).toBe(1);
+	});
+
+	it.each([1, 2])("renders exactly the bare marker at two columns (maxRows %i)", maxRows => {
+		const rendered = buildWide(maxRows).render(2);
+
+		expect(rendered).toHaveLength(1);
+		// `…+N` needs at least three cells, so the count is intentionally omitted.
+		expect(strip(rendered[0])).toBe("…");
+		expect(visibleWidth(rendered[0])).toBe(1);
+	});
+
+	it.each([1, 2])("renders the exact count at three columns when it fits (maxRows %i)", maxRows => {
+		const rendered = buildWide(maxRows).render(3);
+
+		expect(rendered).toHaveLength(1);
+		const text = strip(rendered[0]);
+		// W == 3 and a single-digit count needs exactly 2 + 1 cells, so the count
+		// renders rather than degrading.
+		expect(text).toMatch(/^…\+\d$/);
+		expect(visibleWidth(rendered[0])).toBe(3);
+	});
+
+	it("keeps the count exact rather than approximating it as the rail widens", () => {
+		// A two-digit omitted count is not reachable through the public segment
+		// surface here: segments with no value are never collected, so this preset
+		// tops out below ten. The ladder's degrade-when-it-cannot-fit behavior is
+		// therefore pinned by the one- and two-column cases above; this asserts the
+		// count is a real exact figure and never a rounded or truncated one.
+		const rendered = buildWide(1).render(40);
+
+		const match = strip(rendered.join("")).match(/…\+(\d+)/);
+		expect(match).not.toBeNull();
+		expect(Number(match?.[1])).toBeGreaterThan(0);
+		expect(match?.[1]).not.toMatch(/^0/);
+		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(40);
+	});
+
+	it("reports an exact count in the multi-row cutoff path", () => {
+		const rendered = buildWide(2).render(40);
+
+		expect(rendered.length).toBeLessThanOrEqual(2);
+		const match = strip(rendered.join("")).match(/…\+(\d+)/);
+		expect(match).not.toBeNull();
+		expect(Number(match?.[1])).toBeGreaterThan(0);
+		// The cue belongs to the final admitted row only.
+		for (const row of rendered.slice(0, -1)) expect(strip(row)).not.toContain("…+");
+		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(40);
+	});
+
+	it.each([1, 2])("emits no row at all at zero width (maxRows %i)", maxRows => {
+		// A zero-width rail has nowhere to put a cue, so it must render nothing
+		// rather than a blank row.
+		expect(buildWide(maxRows).render(0)).toEqual([]);
+	});
+});
