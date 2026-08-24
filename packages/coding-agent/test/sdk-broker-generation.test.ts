@@ -519,14 +519,23 @@ process.on("SIGTERM", () => process.exit(0));
 			const published = await readBrokerDiscovery(dir);
 			expect(published?.pid).toBe(child.pid);
 			const authority = resolveSdkPackageAuthority();
-			const replacement = await ensureBroker({
-				agentDir: dir,
-				expectedPackageGeneration: authority.generation,
-			});
-			expect(child.pid).toBeDefined();
-			expect(isPidAlive(child.pid!)).toBe(false);
-			expect(replacement.pid).not.toBe(child.pid);
-			expect(replacement.packageGeneration).toBe(authority.generation);
+			if (process.platform === "darwin") {
+				await expect(
+					ensureBroker({
+						agentDir: dir,
+						expectedPackageGeneration: authority.generation,
+					}),
+				).rejects.toThrow("stale broker retirement was not verified");
+				expect(isPidAlive(child.pid!)).toBe(true);
+			} else {
+				const replacement = await ensureBroker({
+					agentDir: dir,
+					expectedPackageGeneration: authority.generation,
+				});
+				expect(isPidAlive(child.pid!)).toBe(false);
+				expect(replacement.pid).not.toBe(child.pid);
+				expect(replacement.packageGeneration).toBe(authority.generation);
+			}
 		} finally {
 			if (child.pid !== undefined && isPidAlive(child.pid)) child.kill("SIGKILL");
 			await cleanup(dir);
