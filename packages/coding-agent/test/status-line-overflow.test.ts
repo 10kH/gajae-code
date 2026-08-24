@@ -652,10 +652,16 @@ describe("status line overflow cue geometry", () => {
 	});
 
 	it.each([1, 2])("renders the exact literal count at three columns when it fits (maxRows %i)", maxRows => {
-		const rendered = buildWide(maxRows).render(3);
+		const component = buildWide(maxRows);
+
+		// Raw pre-truncation rows first: render() applies a defensive truncateToWidth,
+		// so a literal read only from its output cannot prove the marker was reserved
+		// during layout rather than produced by that guard.
+		expect(component.getPreviewContent(3).split("\n").map(strip)).toEqual(["…+8"]);
 
 		// W == 3 with a single-digit count needs exactly 2 + 1 cells, so the count
 		// renders. Asserted as an exact literal, not a shape.
+		const rendered = component.render(3);
 		expect(rendered.map(strip)).toEqual(["…+8"]);
 		expect(visibleWidth(rendered[0])).toBe(3);
 	});
@@ -688,8 +694,13 @@ describe("status line overflow cue geometry", () => {
 		// This fixture drops well over ten segments, so `…+NN` needs four cells and
 		// cannot fit three. The plan requires the count be dropped, never truncated
 		// into a wrong or partial number.
-		const rendered = buildRepeated(maxRows, 14).render(3);
+		const component = buildRepeated(maxRows, 14);
 
+		// Raw rows prove the bare marker is the reserved cue, not a truncation
+		// lookalike that the defensive guard happened to emit.
+		expect(component.getPreviewContent(3).split("\n").map(strip)).toEqual(["…"]);
+
+		const rendered = component.render(3);
 		expect(rendered.map(strip)).toEqual(["…"]);
 		expect(visibleWidth(rendered[0])).toBe(1);
 		expect(strip(rendered[0])).not.toMatch(/\d/);
