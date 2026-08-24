@@ -28,6 +28,7 @@ export interface HermesSetupFlags {
 	worktreeName?: string;
 	requireWorktree?: boolean;
 	stateRoot?: string;
+	codingAgentDir?: string;
 	mutation?: string[];
 	artifactByteCap?: string;
 	serverKey?: string;
@@ -58,6 +59,8 @@ export interface CoordinatorSetupSpec {
 		required: boolean;
 	};
 	stateRoot?: string;
+	/** Agent-directory override (GJC_CODING_AGENT_DIR). Distinct from the coordinator state root. */
+	codingAgentDir?: string;
 	mutationPolicy: {
 		classes: HermesMutationClass[];
 		perCallConsentRequired: true;
@@ -138,6 +141,27 @@ function normalizeRoots(roots: string[] | undefined): string[] {
 		}
 	}
 	return normalized;
+}
+/**
+ * Validate --coding-agent-dir with the same guard normalizeRoots applies to
+ * --root: absolute (path.isAbsolute covers POSIX and Windows drive/UNC), never
+ * the filesystem root, /home, or the account home.
+ */
+function normalizeCodingAgentDir(value: string | undefined): string | undefined {
+	const trimmed = optionalTrim(value);
+	if (!trimmed) return undefined;
+	if (!path.isAbsolute(trimmed)) {
+		throw new HermesSetupError(`--coding-agent-dir must be an absolute path; got: ${trimmed}`, 2);
+	}
+	const resolved = path.resolve(trimmed);
+	if (
+		resolved === path.parse(resolved).root ||
+		resolved === path.resolve("/home") ||
+		resolved === path.resolve(os.homedir())
+	) {
+		throw new HermesSetupError(`Refusing broad Hermes coding agent dir: ${resolved}`, 2);
+	}
+	return resolved;
 }
 
 function parseMutationClasses(values: string[] | undefined): HermesMutationClass[] {
@@ -271,6 +295,11 @@ export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupS
 		sessionCommandSource: flags.sessionCommand !== undefined ? "explicit" : "default",
 		sessionCommand,
 		...(optionalTrim(flags.stateRoot) ? { stateRoot: path.resolve(flags.stateRoot!) } : {}),
+		// Preserved/overridden at install time from the managed block, so the
+		// spec field only reflects an explicit --coding-agent-dir.
+		...(normalizeCodingAgentDir(flags.codingAgentDir)
+			? { codingAgentDir: normalizeCodingAgentDir(flags.codingAgentDir) }
+			: {}),
 		mutationPolicy: {
 			classes: parseMutationClasses(flags.mutation),
 			perCallConsentRequired: true,
@@ -319,6 +348,7 @@ function renderHermesServerBlockWithoutSignature(spec: CoordinatorSetupSpec): Re
 	if (spec.namespace.profile) env.GJC_COORDINATOR_MCP_PROFILE = spec.namespace.profile;
 	if (spec.namespace.repo) env.GJC_COORDINATOR_MCP_REPO = spec.namespace.repo;
 	if (spec.stateRoot) env.GJC_COORDINATOR_MCP_STATE_ROOT = spec.stateRoot;
+	if (spec.codingAgentDir) env.GJC_CODING_AGENT_DIR = spec.codingAgentDir;
 	if (spec.mutationPolicy.classes.length > 0)
 		env.GJC_COORDINATOR_MCP_MUTATIONS = spec.mutationPolicy.classes.join(",");
 	if (spec.artifactByteCap !== undefined) env.GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP = String(spec.artifactByteCap);
@@ -411,13 +441,36 @@ function mergeHermesConfig(
 	if (existingBlock !== undefined && !serverBlockIsManaged(existingBlock) && !force) {
 		throw new HermesSetupError(`Hermes MCP server '${spec.serverKey}' already exists and is not managed by GJC.`, 3);
 	}
+	// An operator-set GJC_CODING_AGENT_DIR in a managed block survives re-install
+	// unless --coding-agent-dir explicitly overrides it (issue #4879). The value
+	// stays out of the spec so the rendered signature remains flags-derived.
+	// Preserve is scoped to GJC-managed blocks: a value we signed ourselves. An
+	// unmanaged block (--force) or a tampered one re-renders from flags alone.
+	const preservedCodingAgentDir =
+		spec.codingAgentDir || !serverBlockIsManaged(existingBlock)
+			? undefined
+			: readManagedCodingAgentDir(existingBlock);
 	return {
 		...existing,
 		mcp_servers: {
 			...currentServers,
-			[spec.serverKey]: renderHermesServerBlock(spec),
+			[spec.serverKey]: renderHermesServerBlock(
+				preservedCodingAgentDir ? { ...spec, codingAgentDir: preservedCodingAgentDir } : spec,
+			),
 		},
 	};
+}
+
+/**
+ * Read the GJC_CODING_AGENT_DIR a managed block carries. Callers gate on
+ * serverBlockIsManaged first, so only values GJC itself signed can be
+ * preserved; unmanaged or tampered blocks re-render from flags alone.
+ */
+function readManagedCodingAgentDir(existingBlock: unknown): string | undefined {
+	if (!isRecord(existingBlock) || !isRecord(existingBlock.env)) return undefined;
+	const value = existingBlock.env.GJC_CODING_AGENT_DIR;
+	if (typeof value !== "string" || !value.trim()) return undefined;
+	return value;
 }
 
 function configPathForTarget(spec: CoordinatorSetupSpec): string | null {

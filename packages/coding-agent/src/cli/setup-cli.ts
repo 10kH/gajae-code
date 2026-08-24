@@ -82,6 +82,7 @@ export interface SetupCommandArgs {
 		worktreeName?: string;
 		requireWorktree?: boolean;
 		stateRoot?: string;
+		codingAgentDir?: string;
 		mutation?: string[];
 		artifactByteCap?: string;
 		serverKey?: string;
@@ -123,6 +124,7 @@ const HERMES_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = [
 	"worktreeName",
 	"requireWorktree",
 	"stateRoot",
+	"codingAgentDir",
 	"mutation",
 	"artifactByteCap",
 	"serverKey",
@@ -225,6 +227,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.requireWorktree = true;
 		} else if (arg === "--state-root") {
 			flags.stateRoot = args[++i];
+		} else if (arg === "--coding-agent-dir") {
+			flags.codingAgentDir = args[++i];
 		} else if (arg === "--mutation") {
 			flags.mutation = [...(flags.mutation ?? []), args[++i] ?? ""];
 		} else if (arg === "--artifact-byte-cap") {
@@ -927,6 +931,7 @@ ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo --worktree-name hermes-gajae-code
   ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --worktree hermes-custom"
   ${APP_NAME} setup hermes --root /path/to/repo --session-command gjc
+  ${APP_NAME} setup hermes --root /path/to/repo --coding-agent-dir /var/lib/gjc/hermes-agent
 
 ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
@@ -948,6 +953,7 @@ ${chalk.bold("Options:")}
   --no-worktree     Disable default GJC --worktree isolation for Hermes sessions
   --worktree-name   Named GJC --worktree branch for Hermes sessions
   --mutation        Hermes MCP mutation classes: sessions,questions,reports,all
+  --coding-agent-dir GJC agent-directory override (GJC_CODING_AGENT_DIR, absolute path); distinct from --state-root
   --target          Hermes config file target for config-only install
   --profile-dir     Hermes profile directory for full setup install
   --dry-run         Preview discovered credentials without importing (credentials)
