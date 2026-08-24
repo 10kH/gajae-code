@@ -8,6 +8,34 @@ function gemini37SiblingId(modelId: string): string {
 }
 
 describe("preset catalog model entries", () => {
+	test("bundles Kilo Ox Alpha with its reviewed capability contract", () => {
+		const model = getBundledModel("kilo", "stealth/ox-alpha");
+
+		expect(model.id).toBe("stealth/ox-alpha");
+		expect(model.provider).toBe("kilo");
+		expect(model.name).toBe("Ox Alpha");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toEqual(["text", "image"]);
+		expect(model.contextWindow).toBe(1_048_576);
+		expect(model.maxTokens).toBe(131_072);
+		expect(model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		});
+	});
+
+	test("keeps Groq compound systems reasoning-control free", () => {
+		for (const id of ["groq/compound", "groq/compound-mini"] as const) {
+			const model = getBundledModel("groq", id);
+			expect(model.reasoning).toBe(false);
+			expect(model.thinking).toBeUndefined();
+		}
+	});
+
 	test("bundles kimi-code/kimi-k2.7-code", () => {
 		const model = getBundledModel("kimi-code", "kimi-k2.7-code");
 

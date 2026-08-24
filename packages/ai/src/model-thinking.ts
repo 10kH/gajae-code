@@ -153,6 +153,10 @@ export const CLOUDFLARE_FALLBACK_MODEL: ApiModel<"anthropic-messages"> = {
 const kEnrichedModel = Symbol("model-thinking.enrichedModel");
 type ModelWithEnriched = ApiModel<Api> & { [kEnrichedModel]?: ApiModel<Api> };
 
+export function isGroqCompoundReasoningUnsupported(model: Pick<ApiModel<Api>, "provider" | "id">): boolean {
+	return model.provider === "groq" && (model.id === "groq/compound" || model.id === "groq/compound-mini");
+}
+
 /**
  * Returns a copy of the model with canonical thinking metadata attached.
  *
@@ -167,7 +171,12 @@ export function enrichModelThinking<TApi extends Api>(model: ApiModel<TApi>): Ap
 	}
 	const normalizedThinking = normalizeThinkingConfig(model.thinking);
 	let result: ApiModel<TApi>;
-	if (!model.reasoning) {
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		result =
+			!model.reasoning && normalizedThinking === undefined
+				? model
+				: { ...model, reasoning: false, thinking: undefined };
+	} else if (!model.reasoning) {
 		result =
 			normalizedThinking === undefined && model.thinking === undefined ? model : { ...model, thinking: undefined };
 	} else {
@@ -193,6 +202,11 @@ export function enrichModelThinking<TApi extends Api>(model: ApiModel<TApi>): Ap
  * canonical rules, replacing any existing `thinking`.
  */
 export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): ApiModel<TApi> {
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		return !model.reasoning && model.thinking === undefined
+			? model
+			: { ...model, reasoning: false, thinking: undefined };
+	}
 	if (!model.reasoning) {
 		const normalizedThinking = normalizeThinkingConfig(model.thinking);
 		return normalizedThinking === undefined && model.thinking === undefined
@@ -487,6 +501,31 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	// GLM-5.3 always thinks and exposes only low/high/max reasoning_effort.
 	// https://z.ai/blog/glm-5.3#api-changes-in-glm-5-3
 	if (model.provider === "zai" && model.id === "glm-5.3") {
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		};
+	}
+	// Groq's agentic `compound` systems reject `reasoning_effort` outright
+	// (400 "`reasoning_effort` is not supported with this model", verified
+	// 2026-08-23), yet models.dev advertises them as reasoning models. Drop the
+	// thinking config so GJC never sends the field.
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		model.reasoning = false;
+		delete model.thinking;
+	}
+	// Kilo's Ox Alpha catalog row advertises reasoning, vision, a 1,048,576-token
+	// context, a 131,072-token output ceiling, and low/high/max variants. Its
+	// OpenAI-compatible `/models` shape exposes those fields outside the generic
+	// discovery parser, so pin the reviewed provider-specific contract here.
+	if (model.provider === "kilo" && model.id === "stealth/ox-alpha") {
+		model.reasoning = true;
+		model.input = ["text", "image"];
+		model.contextWindow = 1_048_576;
+		model.maxTokens = 131_072;
 		model.thinking = {
 			mode: "effort",
 			minLevel: Effort.Low,

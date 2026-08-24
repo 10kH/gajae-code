@@ -2,7 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Kilo's `stealth/ox-alpha` model with its reviewed 1,048,576-token context, 131,072-token output ceiling, text/image input, and low/high/max reasoning-effort contract.
+
 ### Fixed
+
+- Direct model selections now retry zero-token empty OpenAI-compatible responses.
 
 - Cursor `requestContext` rules now forward normalized system prompts, Cursor HTTP/2 transport honors standard proxy environment variables, and GPT effort siblings are sent as their base model with the corresponding reasoning parameter.
 - `AuthStorage.getEarliestUnblockAt(provider)` now exposes the earliest stored credential `blockedUntil` instant so quota exhaustion can report when a row becomes usable again without waiting for it (#4908).

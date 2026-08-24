@@ -15,7 +15,7 @@ import {
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 } from "../adapter-internals/provider-safety-stop";
-import { type Effort, getSupportedEfforts } from "../model-thinking";
+import { type Effort, getSupportedEfforts, isGroqCompoundReasoningUnsupported } from "../model-thinking";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
@@ -43,7 +43,7 @@ import {
 import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { transportFailureFacts } from "../utils/fallback-transport";
+import { EMPTY_RESPONSE_PROVIDER_CODE, transportFailureFacts } from "../utils/fallback-transport";
 import { toFirepassWireModelId, toFireworksWireModelId } from "../utils/fireworks-model-id";
 import {
 	type CapturedHttpErrorResponse,
@@ -509,6 +509,25 @@ function getTrailingPartialDeepseekToken(text: string): string {
 
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
+const OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE = "Provider returned an empty response with zero token usage";
+
+function isEmptyOpenAICompletionsResponse(
+	output: AssistantMessage,
+	hasExplicitUsageReport: boolean,
+	hasNonzeroUsageEvidence: boolean,
+): boolean {
+	return (
+		hasExplicitUsageReport &&
+		!hasNonzeroUsageEvidence &&
+		output.stopReason === "stop" &&
+		output.content.length === 0 &&
+		output.usage.input === 0 &&
+		output.usage.output === 0 &&
+		output.usage.cacheRead === 0 &&
+		output.usage.cacheWrite === 0 &&
+		output.usage.totalTokens === 0
+	);
+}
 
 export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	model: Model<"openai-completions">,
@@ -832,6 +851,20 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				for (const call of calls) emitHealedToolCall(call);
 			};
 			let providerSafetyStop = false;
+			let hasExplicitUsageReport = false;
+			let hasNonzeroUsageEvidence = false;
+			const applyUsage = (rawUsage: object): void => {
+				const usage = parseChunkUsage(rawUsage, model, premiumRequestsTotal);
+				const hasExplicitTotal = getOptionalNumberProperty(rawUsage, "total_tokens") !== undefined;
+				const hasExplicitComponents =
+					getOptionalNumberProperty(rawUsage, "prompt_tokens") !== undefined &&
+					getOptionalNumberProperty(rawUsage, "completion_tokens") !== undefined;
+				hasExplicitUsageReport ||= hasExplicitTotal || hasExplicitComponents;
+				hasNonzeroUsageEvidence ||= usage.totalTokens > 0;
+				if (usage.totalTokens >= output.usage.totalTokens) {
+					output.usage = usage;
+				}
+			};
 			const markProviderSafetyStop = (errorMessage?: string): void => {
 				providerSafetyStop = true;
 				output.stopReason = "error";
@@ -865,7 +898,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				output.responseId ||= chunk.id;
 
 				if (chunk.usage) {
-					output.usage = parseChunkUsage(chunk.usage, model, premiumRequestsTotal);
+					applyUsage(chunk.usage);
 				}
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
@@ -874,7 +907,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (!chunk.usage) {
 					const choiceUsage = getChoiceUsage(choice);
 					if (choiceUsage) {
-						output.usage = parseChunkUsage(choiceUsage, model, premiumRequestsTotal);
+						applyUsage(choiceUsage);
 					}
 				}
 
@@ -1060,9 +1093,21 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 
 			output.errorMessage = strictFallbackErrorMessage;
+			if (isEmptyOpenAICompletionsResponse(output, hasExplicitUsageReport, hasNonzeroUsageEvidence)) {
+				output.stopReason = "error";
+				output.errorMessage = OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE;
+				output.transportFailure = {
+					kind: "transport",
+					providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+				};
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			if (output.stopReason === "error") {
+				stream.push({ type: "error", reason: "error", error: output });
+			} else {
+				stream.push({ type: "done", reason: output.stopReason, message: output });
+			}
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;
@@ -1295,7 +1340,7 @@ function buildParams(
 	const compat = getCompat(model, resolvedBaseUrl);
 	const messages = convertMessages(model, context, compat);
 	maybeAddOpenRouterAnthropicCacheControl(model, messages);
-	const supportsReasoningParams = model.provider !== "github-copilot";
+	const supportsReasoningParams = model.provider !== "github-copilot" && !isGroqCompoundReasoningUnsupported(model);
 
 	// Kimi (including via OpenRouter and Fireworks router-form IDs such as
 	// `accounts/fireworks/routers/kimi-*`) calculates TPM rate limits based on
@@ -1555,12 +1600,14 @@ export function parseChunkUsage(
 	// `completion_tokens` (which is the total billed output). Adding them would
 	// double-count.
 	const outputTokens = getOptionalNumberProperty(rawUsage, "completion_tokens") ?? 0;
+	const reportedTotalTokens = getOptionalNumberProperty(rawUsage, "total_tokens") ?? 0;
+	const componentTotalTokens = input + outputTokens + cachedTokens + cacheWriteTokens;
 	const usage: AssistantMessage["usage"] = {
 		input,
 		output: outputTokens,
 		cacheRead: cachedTokens,
 		cacheWrite: cacheWriteTokens,
-		totalTokens: input + outputTokens + cachedTokens + cacheWriteTokens,
+		totalTokens: Math.max(componentTotalTokens, reportedTotalTokens),
 		...(reasoningTokens > 0 ? { reasoningTokens } : {}),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		...(premiumRequests !== undefined ? { premiumRequests } : {}),
