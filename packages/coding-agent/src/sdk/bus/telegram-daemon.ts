@@ -543,17 +543,27 @@ function splitTelegramPlainText(text: string, max = TELEGRAM_MESSAGE_LIMIT): str
 function topicRenameApplied(response: unknown): boolean {
 	return !!response && typeof response === "object" && (response as { ok?: unknown }).ok === true;
 }
+function isDefinitiveMissingTopicResponse(response: unknown): boolean {
+	if (!response || typeof response !== "object") return false;
+	const result = response as { ok?: unknown; error_code?: unknown; description?: unknown };
+	if (result.ok !== false || result.error_code !== 400 || typeof result.description !== "string") return false;
+	const description = result.description.trim().replace(/^Bad Request:\s*/i, "");
+	return /^(?:FORUM_TOPIC_NOT_FOUND|TOPIC_NOT_FOUND|THREAD_NOT_FOUND|TOPIC_ID_INVALID|message thread not found)$/i.test(
+		description,
+	);
+}
 function topicArchiveSettled(response: unknown): boolean {
 	if (!response || typeof response !== "object") return false;
 	const result = response as { ok?: unknown; result?: unknown; error_code?: unknown; description?: unknown };
 	if (result.ok === true && result.result === true) return true;
+	if (isDefinitiveMissingTopicResponse(response)) return true;
 	if (result.ok !== false || result.error_code !== 400 || typeof result.description !== "string") return false;
 	const description = result.description.trim();
 	// TOPIC_ID_INVALID is Telegram's definitive answer for a topic that was
 	// already deleted (observed from editForumTopic/deleteForumTopic against a
 	// user-deleted private-chat topic); retrying it can never succeed.
 	// FORUM_TOPIC_NOT_FOUND covers the equivalent 400 for supergroup topics.
-	return /^(?:Bad Request: )?(?:FORUM_TOPIC_NOT_FOUND|TOPIC_NOT_FOUND|THREAD_NOT_FOUND|TOPIC_ID_INVALID|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
+	return /^(?:Bad Request: )?(?:topic (?:already|is already) closed|message thread is not modified)$/i.test(
 		description,
 	);
 }
@@ -4197,6 +4207,13 @@ type BotApiCallOutcome =
 interface BotApiCallResult {
 	response: unknown;
 	outcome: BotApiCallOutcome;
+}
+type TopicAdoptionPickerOutcome = "sent" | "topic_missing" | "retry";
+
+function classifyTopicAdoptionPickerResult(result: BotApiCallResult): TopicAdoptionPickerOutcome {
+	if (result.outcome.kind === "accepted") return "sent";
+	if (result.outcome.kind === "rejected" && isDefinitiveMissingTopicResponse(result.response)) return "topic_missing";
+	return "retry";
 }
 function createBotApiAdapter(
 	call: (
@@ -11307,13 +11324,24 @@ export class TelegramNotificationDaemon {
 				return "retry";
 			}
 		}
-		if (!(await this.#renderAdoptionPicker(threadId, updateId))) return "retry";
+		const pickerOutcome = await this.#renderAdoptionPicker(threadId, updateId);
+		if (pickerOutcome === "retry") return "retry";
+		if (pickerOutcome === "topic_missing" && pendingTopic.chatId === String(this.opts.chatId)) {
+			try {
+				await this.#adoptionIntents.removePendingTopic(threadId);
+			} catch (error) {
+				logger.warn(
+					`notifications: failed to remove deleted pending user topic: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+				);
+				return "retry";
+			}
+		}
 		await this.rememberSeenUpdateId(updateId);
 		return "consumed";
 	}
 
 	/** Render the top-level folder source choices for a user-created topic. */
-	async #renderAdoptionPicker(threadId: number, updateId: number): Promise<boolean> {
+	async #renderAdoptionPicker(threadId: number, updateId: number): Promise<TopicAdoptionPickerOutcome> {
 		const providerRequestKey = this.#providerRequestKey(updateId, `topic:${threadId}`);
 		const chatId = String(this.opts.chatId);
 		const choices: Array<{ label: string; action: TopicPickerAction }> = [
@@ -11331,7 +11359,7 @@ export class TelegramNotificationDaemon {
 			}),
 		}));
 		try {
-			const response = await this.botApi.call(
+			const result = await this.callBotApiClassified(
 				"sendMessage",
 				{
 					chat_id: this.opts.chatId,
@@ -11343,15 +11371,15 @@ export class TelegramNotificationDaemon {
 				},
 				{ noRetry: true },
 			);
-			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
+			const outcome = classifyTopicAdoptionPickerResult(result);
+			if (outcome !== "sent") {
 				for (const choice of aliases) this.#adoptionPickerAliases.delete(choice.alias);
-				return false;
 			}
-			return true;
+			return outcome;
 		} catch {
 			for (const choice of aliases) this.#adoptionPickerAliases.delete(choice.alias);
 			logger.warn("notifications: failed to send topic-adoption picker keyboard");
-			return false;
+			return "retry";
 		}
 	}
 
