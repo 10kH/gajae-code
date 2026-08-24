@@ -15,6 +15,8 @@
 
 ### Fixed
 
+- Gajae Pet now treats forwarded `LC_TERMINAL=iTerm2` and `TERM_PROGRAM=iTerm.app` values as probe hints over SSH, enabling iTerm2 only after an active OSC 1337 File-capability reply. Generic SSH, spoofed/noninteractive/CI environments, and unmanaged tmux/screen/zellij nesting remain on the text fallback; verified Kitty and Sixel keep precedence. (#4911)
+
 - Telegram polling no longer wedges behind a deleted private-chat `forum_topic_created` update. Definitive missing-topic `400` responses from the adoption picker now consume the stale update, remove only its matching pending-topic sidecar, and let the ordered poll offset advance; rate limits, network/server failures, authentication failures, and ambiguous responses remain retryable. (#4904)
 
 - `gjc --worktree` now runs the declared Bun, npm, or pnpm frozen install in workspace launch worktrees instead of linking the origin checkout's `node_modules`. Workspace imports and install mutations are bound to the worktree's own lockfile and checkout, including reuse of worktrees carrying the legacy source-tree link (#4620).
