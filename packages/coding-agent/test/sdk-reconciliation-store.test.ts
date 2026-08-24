@@ -89,6 +89,14 @@ describe("reconciliation-store", () => {
 				acceptedAt: 1,
 				terminalAt: 3,
 			},
+			{
+				kind: "prompt",
+				commandId: "c4",
+				turnId: "t4",
+				status: "accepted",
+				acceptedAt: 1,
+				deadlineRecoveryPending: true,
+			},
 		];
 		const settled = settleProcessRestart(input, now);
 		// Prompts must always end with one normalized outcome; only skills keep the
@@ -99,6 +107,38 @@ describe("reconciliation-store", () => {
 		expect(settled[1]?.status).toBe("failed");
 		expect(settled[1]?.error?.code).toBe("process_restart");
 		expect(settled[2]?.status).toBe("terminal_ok");
+		expect(settled[3]).toEqual(input[3]);
+	});
+
+	test("process restart preserves agent_failed precedence over a pending stopped outcome", () => {
+		const [settled] = settleProcessRestart(
+			[
+				{
+					kind: "prompt",
+					commandId: "failed-command",
+					turnId: "failed-turn",
+					status: "in_flight",
+					acceptedAt: 1,
+					startedAt: 2,
+					pendingOutcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+					pendingReceiptState: "missing",
+					error: { code: "provider_unavailable", message: "Agent run failed." },
+				},
+			],
+			100,
+		);
+
+		expect(settled).toMatchObject({
+			status: "failed",
+			terminalAt: 100,
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				message: "Agent run failed.",
+				provenance: "agent_failed",
+			},
+			error: { code: "prompt_failed", message: "Agent run failed." },
+		});
 	});
 
 	test("transact persists and reload settles a non-terminal prompt with its normalized outcome", async () => {
@@ -135,6 +175,42 @@ describe("reconciliation-store", () => {
 		await again.delete();
 		await expect(fs.stat(store.path!)).rejects.toMatchObject({ code: "ENOENT" });
 		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("reload preserves a deadline recovery prompt for runtime hydration", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-deadline-recovery-"));
+		try {
+			const sessionFile = path.join(root, "sess.jsonl");
+			await fs.writeFile(sessionFile, "");
+			const store = createReconciliationStore({
+				sessionFile,
+				sessionId: "deadline-recovery",
+				now: () => 5_000,
+			});
+			await store.transact(() => [
+				{
+					kind: "prompt",
+					commandId: "deadline-command",
+					turnId: "deadline-turn",
+					status: "accepted",
+					acceptedAt: 1_000,
+					deadlineRecoveryPending: true,
+				},
+			]);
+			const reopened = createReconciliationStore({
+				sessionFile,
+				sessionId: "deadline-recovery",
+				now: () => 9_000,
+			});
+			expect(await reopened.load()).toEqual([
+				expect.objectContaining({
+					status: "accepted",
+					deadlineRecoveryPending: true,
+				}),
+			]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("reload preserves a skill pending claim without quarantining sibling records", async () => {
@@ -202,6 +278,35 @@ describe("reconciliation-store", () => {
 		const entries = await fs.readdir(path.dirname(storePath));
 		expect(entries.some(name => name.includes("corrupt"))).toBe(true);
 		await fs.rm(root, { recursive: true, force: true });
+	});
+
+	test("corrupt file fails closed when quarantine rename fails", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-corrupt-rename-"));
+		try {
+			const sessionFile = path.join(root, "s.jsonl");
+			await fs.writeFile(sessionFile, "");
+			const filePath = reconciliationStorePath(sessionFile, "s1");
+			await fs.mkdir(path.dirname(filePath), { recursive: true });
+			await fs.writeFile(filePath, "{ definitely not json");
+			const store = createReconciliationStore({
+				sessionFile,
+				sessionId: "s1",
+				fs: {
+					mkdir: fs.mkdir,
+					readFile: fs.readFile,
+					writeFile: fs.writeFile,
+					rename: async () => {
+						throw Object.assign(new Error("quarantine denied"), { code: "EACCES" });
+					},
+					unlink: fs.unlink,
+					open: fs.open as never,
+				},
+			});
+			await expect(store.load()).rejects.toMatchObject({ code: "reconciliation_quarantine_failed" });
+			expect(await fs.readFile(filePath, "utf8")).toBe("{ definitely not json");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("quarantines terminal_ok records with failed outcomes", async () => {

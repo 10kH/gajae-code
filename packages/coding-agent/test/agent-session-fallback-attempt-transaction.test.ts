@@ -822,7 +822,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			role: "assistant",
 			stopReason: "error",
 			errorKind: "local_snapshot_failure",
-			errorMessage: expect.stringContaining("local snapshot bug"),
+			errorMessage: "Agent run failed.",
 		});
 	});
 	it("honors retry.enabled=false for local snapshot failures on a managed chain", async () => {
@@ -848,7 +848,8 @@ describe("AgentSession managed fallback attempt transaction", () => {
 		expect(session!.messages.at(-1)).toMatchObject({
 			role: "assistant",
 			stopReason: "error",
-			errorMessage: expect.stringContaining("local snapshot bug"),
+			errorKind: "local_snapshot_failure",
+			errorMessage: "Agent run failed.",
 		});
 		// The local failure must not leave the provider fallback budget charged.
 		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
@@ -939,7 +940,7 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			role: "assistant",
 			stopReason: "error",
 			errorKind: "local_snapshot_failure",
-			errorMessage: expect.stringContaining("local snapshot bug"),
+			errorMessage: "Agent run failed.",
 		});
 		// The one local failure must discharge its provisional provider charge.
 		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({
@@ -974,7 +975,11 @@ describe("AgentSession managed fallback attempt transaction", () => {
 			role: "assistant",
 			stopReason: "error",
 			errorKind: "local_buffer_overflow",
-			errorMessage: expect.stringContaining("provisional event buffer limit"),
+			errorMessage: "Agent run failed.",
+			bufferOverflow: {
+				stage: "overflow.preMeasure",
+				exceeded: "bytes",
+			},
 		});
 		// A local staging failure must not leave the provider fallback budget charged.
 		expect(session!.getDefaultFallbackRuntimeState().controller).toMatchObject({

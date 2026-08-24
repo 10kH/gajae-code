@@ -67,6 +67,21 @@ export interface KindAwareReconciliation {
 		recordError?: { code: string; message: string },
 		content?: unknown,
 	): Promise<void>;
+	finalizeOutcome(
+		kind: ReconciliationKind,
+		correlation: PromptCorrelation,
+		outcome?: SdkPromptTerminalOutcome,
+		isCurrent?: () => boolean,
+		recordError?: { code: string; message: string },
+		content?: unknown,
+	): Promise<void>;
+	/** Replace an exhausted deadline failure with an active, non-definite record. */
+	markUncertain(
+		kind: ReconciliationKind,
+		correlation: PromptCorrelation,
+		isCurrent?: () => boolean,
+		deadlineMaxAt?: number,
+	): Promise<void>;
 	peekPendingOutcome(kind: ReconciliationKind, correlation: PromptCorrelation): SdkPromptTerminalOutcome | undefined;
 	lookup(
 		kind: ReconciliationKind,
@@ -94,10 +109,15 @@ export interface KindAwareReconciliation {
 }
 
 export function createKindAwareReconciliation(
-	options: { now?: () => number; store?: ReconciliationStore | null } = {},
+	options: {
+		now?: () => number;
+		store?: ReconciliationStore | null;
+		ownedKinds?: readonly DurableReconciliationRecord["kind"][];
+	} = {},
 ): KindAwareReconciliation {
 	const now = options.now ?? Date.now;
 	const store = options.store ?? null;
+	const ownedKinds = new Set<DurableReconciliationRecord["kind"]>(options.ownedKinds ?? ["prompt", "skill", "steer"]);
 	let records = new Map<string, DurableReconciliationRecord>();
 	let clientRefIndex = new Map<string, string>();
 	const reservedClientRefs = new Map<ReconciliationKind, Set<string>>();
@@ -162,7 +182,11 @@ export function createKindAwareReconciliation(
 			const result = mutate(candidate);
 			if (!result.changed) return result.value;
 			const candidateIndex = indexRecords(candidate);
-			if (store) await store.transact(() => [...candidate.values()].map(record => ({ ...record })));
+			if (store)
+				await store.transact(current => [
+					...current.filter(record => !ownedKinds.has(record.kind)),
+					...[...candidate.values()].filter(record => ownedKinds.has(record.kind)).map(record => ({ ...record })),
+				]);
 			records = candidate;
 			clientRefIndex = candidateIndex;
 			return result.value;
@@ -339,31 +363,48 @@ export function createKindAwareReconciliation(
 			}
 			if (frame.type === "agent_start") {
 				if (record.status !== "accepted") return { value: undefined, changed: false };
+				delete record.deadlineRecoveryPending;
+				delete record.deadlineMaxAt;
 				record.status = "in_flight";
 				record.startedAt = now();
 				if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
 				return { value: undefined, changed: true };
 			}
+			if (frame.type === "agent_failed") {
+				// agent_failed is additive diagnostics; agent_end remains the sole
+				// terminal lifecycle boundary for the correlated invocation.
+				record.error ??= sanitizePromptFailure(frame.error);
+				delete record.deadlineRecoveryPending;
+				delete record.deadlineMaxAt;
+				return { value: undefined, changed: true };
+			}
 			const pendingOutcome = record.pendingOutcome;
+			delete record.deadlineRecoveryPending;
+			delete record.deadlineMaxAt;
 			record.terminalAt = now();
 			if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
 			if (pendingOutcome !== undefined) {
-				record.outcome = pendingOutcome;
+				const terminalOutcome =
+					record.error !== undefined && pendingOutcome.kind !== "failed"
+						? {
+								kind: "failed" as const,
+								code: "prompt_failed" as const,
+								message: record.error.message,
+								provenance: "agent_failed" as const,
+							}
+						: pendingOutcome;
+				record.outcome = terminalOutcome;
 				record.pendingOutcome = undefined;
-				if (pendingOutcome.kind === "failed") {
+				if (terminalOutcome.kind === "failed") {
 					record.status = "failed";
-					record.error = { code: pendingOutcome.code, message: pendingOutcome.message };
+					record.error = { code: terminalOutcome.code, message: terminalOutcome.message };
 				} else {
 					record.status = "terminal_ok";
 				}
 				record.receiptState = record.pendingReceiptState ?? "missing";
 				record.pendingReceiptState = undefined;
-			} else if (frame.type === "agent_failed") {
-				record.status = "failed";
-				record.error = sanitizePromptFailure(frame.error);
-				record.receiptState = frame.content?.text?.trim() ? "present" : "missing";
 			} else {
-				record.status = "terminal_ok";
+				record.status = record.error === undefined ? "terminal_ok" : "failed";
 				record.receiptState = frame.content?.text?.trim() ? "present" : "missing";
 			}
 			cleanupRecords(candidate);
@@ -391,10 +432,21 @@ export function createKindAwareReconciliation(
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		outcome?: SdkPromptTerminalOutcome,
-		recordError?: { code: string; message: string },
-		content?: unknown,
+		arg4?: (() => boolean) | { code: string; message: string },
+		arg5?: { code: string; message: string } | unknown,
+		arg6?: unknown,
 	) => {
+		const isCurrent = typeof arg4 === "function" ? arg4 : typeof arg6 === "function" ? arg6 : undefined;
+		const recordError =
+			typeof arg4 === "object" && arg4 !== null && "code" in arg4
+				? arg4
+				: typeof arg5 === "object" && arg5 !== null && "code" in arg5
+					? (arg5 as { code: string; message: string })
+					: undefined;
+		const content =
+			typeof arg4 === "function" ? arg6 : typeof arg5 === "object" && arg5 !== null && "code" in arg5 ? arg6 : arg5;
 		await queueMutation(candidate => {
+			if (isCurrent !== undefined && !isCurrent()) return { value: undefined, changed: false };
 			const record = candidate.get(keyOf(kind, correlation));
 			if (!record || record.terminalAt !== undefined || record.kind !== kind)
 				return { value: undefined, changed: false };
@@ -410,6 +462,31 @@ export function createKindAwareReconciliation(
 			record.pendingOutcome = undefined;
 			record.pendingReceiptState = undefined;
 			cleanupRecords(candidate);
+			return { value: undefined, changed: true };
+		});
+	};
+
+	const markUncertain = async (
+		kind: ReconciliationKind,
+		correlation: PromptCorrelation,
+		isCurrent?: () => boolean,
+		deadlineMaxAt?: number,
+	) => {
+		await queueMutation(candidate => {
+			if (isCurrent !== undefined && !isCurrent()) return { value: undefined, changed: false };
+			const record = candidate.get(keyOf(kind, correlation));
+			if (!record || record.kind !== kind) return { value: undefined, changed: false };
+			const wasDeadlineFailure = record.status === "failed" && record.error?.code === "prompt_deadline_exceeded";
+			if (!wasDeadlineFailure && record.terminalAt !== undefined) return { value: undefined, changed: false };
+			record.status = record.startedAt === undefined ? "accepted" : "in_flight";
+			delete record.terminalAt;
+			delete record.outcome;
+			delete record.pendingOutcome;
+			delete record.pendingReceiptState;
+			delete record.receiptState;
+			delete record.error;
+			record.deadlineRecoveryPending = true;
+			if (deadlineMaxAt !== undefined) record.deadlineMaxAt = deadlineMaxAt;
 			return { value: undefined, changed: true };
 		});
 	};
@@ -497,7 +574,7 @@ export function createKindAwareReconciliation(
 	const hydrateFromStore = async () => {
 		if (!store) return;
 		const run = async () => {
-			const loaded = await store.load();
+			const loaded = (await store.load()).filter(record => ownedKinds.has(record.kind));
 			const candidate = new Map(
 				loaded.map(record => {
 					const hydrated =
@@ -525,7 +602,11 @@ export function createKindAwareReconciliation(
 			// prompt/skill admission — stalling reconciliationReady so a concurrent
 			// abort misses the not-yet-registered pending preflight entry (#4522).
 			const settledSteers = loaded.some(record => record.kind === "steer" && record.status === "accepted");
-			if (settledSteers) await store.transact(() => [...candidate.values()].map(record => ({ ...record })));
+			if (settledSteers)
+				await store.transact(current => [
+					...current.filter(record => !ownedKinds.has(record.kind)),
+					...[...candidate.values()].filter(record => ownedKinds.has(record.kind)).map(record => ({ ...record })),
+				]);
 			records = candidate;
 			clientRefIndex = candidateIndex;
 		};
@@ -557,6 +638,7 @@ export function createKindAwareReconciliation(
 		noteTransition,
 		claimPendingOutcome,
 		finalizeOutcome,
+		markUncertain,
 		peekPendingOutcome,
 		lookup,
 		lookupResult,

@@ -66,6 +66,10 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // replace, direct-basename test selection and owner fallback tasks.
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
+	"packages/agent/src/agent.ts": [
+		"packages/agent/test/agent-force-abort.test.ts",
+		"packages/agent/test/managed-attempt-transaction.test.ts",
+	],
 	"packages/coding-agent/src/tools/atomic-file-write.ts": ["packages/coding-agent/test/file-tools-atomicity.test.ts"],
 	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
@@ -78,6 +82,25 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
+	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
+	"packages/coding-agent/src/session/agent-session.ts": [
+		"packages/coding-agent/test/agent-session-concurrent.test.ts",
+		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
+		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
+	],
+	"packages/coding-agent/src/sdk/bus/reconciliation-store.ts": [
+		"packages/coding-agent/test/sdk-reconciliation-store.test.ts",
+	],
+	"packages/coding-agent/src/sdk/bus/kind-aware-reconciliation.ts": [
+		"packages/coding-agent/test/sdk-kind-aware-reconciliation.test.ts",
+	],
+	"packages/coding-agent/test/helpers/sdk-adapter-dispositions-shared.ts": [
+		"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
 	"packages/coding-agent/src/tools/tool-catalog.generated.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
 	"packages/coding-agent/scripts/generate-tool-catalog.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],

@@ -48,6 +48,10 @@ export interface DurableExecutionReconciliationRecord extends PromptCorrelation 
 	receiptState?: Exclude<ReceiptState, "absent">;
 	pendingOutcome?: SdkPromptTerminalOutcome;
 	pendingReceiptState?: Extract<ReceiptState, "present" | "missing">;
+	/** A deadline repair exhausted its bounded retry budget; outcome is non-definite. */
+	deadlineRecoveryPending?: boolean;
+	/** Absolute hard deadline retained across uncertainty recovery and process restart. */
+	deadlineMaxAt?: number;
 	/** Skill-only safe token; never skill args bodies. */
 	skillName?: string;
 	content?: TurnResultContent;
@@ -249,6 +253,12 @@ function isValidRecord(value: unknown): boolean {
 	if (value.startedAt !== undefined && (typeof value.startedAt !== "number" || !Number.isFinite(value.startedAt)))
 		return false;
 	if (value.clientRef !== undefined && typeof value.clientRef !== "string") return false;
+	if (value.deadlineRecoveryPending !== undefined && typeof value.deadlineRecoveryPending !== "boolean") return false;
+	if (
+		value.deadlineMaxAt !== undefined &&
+		(typeof value.deadlineMaxAt !== "number" || !Number.isFinite(value.deadlineMaxAt))
+	)
+		return false;
 	if (value.skillName !== undefined && typeof value.skillName !== "string") return false;
 	if (value.content !== undefined) {
 		if (
@@ -551,13 +561,28 @@ export function settleProcessRestart(
 			};
 		}
 		if (record.terminalAt !== undefined) return record;
+		if (record.kind === "prompt" && record.deadlineRecoveryPending === true) {
+			// This row already has an explicit durable recovery owner. Preserve it for
+			// runtime hydration so PromptDeadlineManager can re-arm the original
+			// acceptance-anchored hard cap instead of replacing uncertainty with a
+			// synthetic process-restart failure.
+			return record;
+		}
 		if (record.pendingOutcome !== undefined || record.kind === "prompt") {
-			const outcome: SdkPromptTerminalOutcome = record.pendingOutcome ?? {
-				kind: "failed",
-				code: "prompt_failed",
-				message: "Prompt did not complete before process restart.",
-				provenance: "agent_failed",
-			};
+			const outcome: SdkPromptTerminalOutcome =
+				record.error !== undefined && record.pendingOutcome?.kind !== "failed"
+					? {
+							kind: "failed",
+							code: "prompt_failed",
+							message: record.error.message,
+							provenance: "agent_failed",
+						}
+					: (record.pendingOutcome ?? {
+							kind: "failed",
+							code: "prompt_failed",
+							message: "Prompt did not complete before process restart.",
+							provenance: "agent_failed",
+						});
 			return {
 				...record,
 				status: outcome.kind === "stopped" ? "terminal_ok" : "failed",
@@ -693,8 +718,13 @@ export function createReconciliationStore(options: {
 			// Corrupt → quarantine
 			try {
 				await fileFs.rename(filePath, `${filePath}.corrupt.${now()}`);
-			} catch {
-				// ignore
+			} catch (error) {
+				// Quarantine is the proof that the invalid document is no longer the
+				// authoritative session record. If it cannot be published, fail closed
+				// instead of serving an empty store that could admit duplicate work.
+				throw Object.assign(error instanceof Error ? error : new Error("reconciliation quarantine failed"), {
+					code: "reconciliation_quarantine_failed",
+				});
 			}
 			memory = [];
 			terminalMemory = [];
