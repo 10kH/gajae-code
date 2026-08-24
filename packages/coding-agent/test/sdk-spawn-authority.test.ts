@@ -634,6 +634,32 @@ describe("Broker spawn close and orphan reaper", () => {
 		}
 	});
 
+	it("routes the session id alias through exact spawn close", async () => {
+		const agentDir = await temp();
+		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider(probe),
+			spawnPromptLayer: promptLayer,
+		});
+		await broker.start();
+		try {
+			const childId = await acceptedChild(broker, "alias-key");
+			// `id` is a supported alias normalized later by the generic path; if the
+			// spawn fast path misses it, generic close can signal the child PID
+			// without the provider's exact substrate proof.
+			const closed = await broker.handleRequest("session.close", { id: childId }, undefined);
+			expect(closed).toMatchObject({ ok: true, result: { code: "spawn_child_closed", sessionId: childId } });
+			expect(probe.closes).toBe(1);
+			const store = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await store.open();
+			expect(store.claims().find(row => row.childId === childId)?.state).toBe("closed");
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("retains uncertainty for a mismatched substrate identity and never closes it", async () => {
 		const agentDir = await temp();
 		const probe: ProviderProbe = { verdict: "mismatch", closes: 0 };

@@ -1704,7 +1704,12 @@ export class Broker {
 	 */
 	async #maybeCloseSpawnChild(input: Record<string, unknown>): Promise<BrokerResponse | undefined> {
 		const store = this.#spawnAuthority;
-		const sessionId = typeof input.sessionId === "string" ? input.sessionId : undefined;
+		// This runs BEFORE generic normalization, so it must resolve the same
+		// `id` alias that normalizeBrokerInput accepts. Reading only `sessionId`
+		// let `session.close {id}` fall through to the generic path, which can
+		// signal the child PID without the provider's exact substrate proof.
+		const alias = normalizeAliasedString(input, "sessionId", ["id"]);
+		const sessionId = alias.error ? undefined : alias.value;
 		if (!store || !sessionId) return undefined;
 		const claim = store.claims().find(candidate => candidate.childId === sessionId);
 		if (!claim) return undefined;
