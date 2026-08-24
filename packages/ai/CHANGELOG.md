@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Ollama Cloud discovery now keeps curated output limits authoritative and gives unknown models a bounded 32,000-token fallback capped by their discovered context window. This replaces the truncation-prone 8,192 fallback without treating the server context length as a verified 131,072-token output capability or sending unbounded `num_predict` requests (#4921).
+- Ollama Cloud discovery now keeps curated output limits authoritative and gives unknown models a bounded 32,000-token fallback capped by their discovered context window. This replaces the truncation-prone 8,192 fallback without treating the server context length as a verified 131,072-token output capability or sending unbounded `num_predict` requests. Hosted cold starts and long prefills also receive a 300-second first-event window while explicit timeout overrides keep precedence (#4921).
 - Direct model selections now retry zero-token empty OpenAI-compatible responses.
 - OpenAI-compatible chat streams now replay an exact `finish_reason: "network_error"` only when no text, reasoning, refusal, or tool-call delta has been exposed. Retries honor `streamMaxRetries`, exponential backoff, caller cancellation, and managed-fallback ownership; failed-attempt usage, cost, response IDs, and partial chunks are discarded while terminal error wording remains compatible (#4918).
 
