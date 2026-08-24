@@ -840,6 +840,7 @@ describe("update-cli install lock", () => {
 		const source = await Bun.file(path.resolve(import.meta.dir, "../src/cli/update-cli.ts")).text();
 		expect(source).toContain(".gjc-install.lock");
 		expect(source).not.toContain(".update-lock");
+		expect(source).toContain("Remove ${lockFile} only after confirming");
 	});
 });
 
@@ -857,6 +858,8 @@ describe("update-cli windows journal recovery", () => {
 		expect(await Bun.file(targetPath).text()).toBe("new");
 		expect(await Bun.file(nextPath).exists()).toBe(false);
 		expect(await Bun.file(journalPath).exists()).toBe(false);
+		const leftovers = (await fs.readdir(dir)).filter(name => name.includes(".bak.recover."));
+		expect(leftovers).toEqual([]);
 	});
 	it("promotes .next even when the journal backup path already exists", async () => {
 		const dir = await makeTempDir();
@@ -873,6 +876,8 @@ describe("update-cli windows journal recovery", () => {
 		expect(await Bun.file(backupPath).text()).toBe("stale-backup");
 		expect(await Bun.file(nextPath).exists()).toBe(false);
 		expect(await Bun.file(journalPath).exists()).toBe(false);
+		const leftovers = (await fs.readdir(dir)).filter(name => name.includes(".bak.recover."));
+		expect(leftovers).toEqual([]);
 	});
 });
 

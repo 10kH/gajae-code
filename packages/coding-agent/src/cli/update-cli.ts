@@ -677,6 +677,7 @@ export async function recoverWindowsUpdateJournal(journalPath: string): Promise<
 				}
 				throw promoteErr;
 			}
+			await unlinkIfExists(recoverBackup);
 			await unlinkIfExists(journalPath);
 			return;
 		} catch {
@@ -994,32 +995,9 @@ async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promis
 		const code = (err as NodeJS.ErrnoException).code;
 		if (code === "ENOENT") return async () => {};
 		if (code === "EEXIST") {
-			let ownerLine = "";
-			try {
-				ownerLine = (await fs.promises.readFile(lockFile, "utf8")).trim();
-			} catch {
-				throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
-			}
-			const parts = ownerLine.split(/\s+/);
-			const ownerPid = Number(parts[0]);
-			if (!Number.isInteger(ownerPid) || ownerPid <= 0 || !parts[1]) {
-				throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
-			}
-			try {
-				process.kill(ownerPid, 0);
-			} catch (killErr) {
-				const killCode = (killErr as NodeJS.ErrnoException).code;
-				if (killCode === "EPERM") {
-					throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
-				}
-				const still = (await fs.promises.readFile(lockFile, "utf8").catch(() => "")).trim();
-				if (still === ownerLine) {
-					await unlinkIfExists(lockFile);
-					await publish();
-					return release;
-				}
-			}
-			throw new Error(`Another ${APP_NAME} update is already running for ${targetPath}`);
+			throw new Error(
+				`Another ${APP_NAME} update is already running for ${targetPath}. Remove ${lockFile} only after confirming no installer or update is running.`,
+			);
 		}
 		throw err;
 	}
