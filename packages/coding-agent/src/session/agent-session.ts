@@ -1256,6 +1256,13 @@ function terminalProviderFirstEventTimeoutIdentity(errorMessage: string): string
 		? PROVIDER_FIRST_EVENT_TIMEOUT_ERROR
 		: errorMessage;
 }
+function attachRetryableAtHint(errorMessage: string | undefined, retryableAt: number): string {
+	const hint = `retryable at ${new Date(retryableAt).toISOString()}`;
+	const current = errorMessage?.trim();
+	if (current?.includes("retryable at ")) return current;
+	return current ? `${current}; ${hint}` : hint;
+}
+
 function isMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
 	if (hasBareDefaultRetryDisqualifyingFacts(message)) return false;
 	return (
@@ -18876,6 +18883,13 @@ export class AgentSession {
 		// (3) Distinct-row proof.
 		return (await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey;
 	}
+	/** Copy AuthStorage's already-computed unblock instant onto a terminal quota error. */
+	#stampQuotaRetryableAt(message: AssistantMessage): void {
+		if (!this.model) return;
+		const retryableAt = this.#modelRegistry.authStorage.getEarliestUnblockAt(this.model.provider);
+		if (retryableAt === undefined) return;
+		message.errorMessage = attachRetryableAtHint(message.errorMessage, retryableAt);
+	}
 
 	/** Handle retryable errors with exponential backoff. */
 	async #handleRetryableError(
@@ -19002,6 +19016,10 @@ export class AgentSession {
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit") &&
 			(await this.#markFailedCredential(trigger));
+		if (!credentialRotated && (trigger.class === "quota" || trigger.class === "rate_limit")) {
+			this.#stampQuotaRetryableAt(message);
+		}
+
 		// A content-free credential rotation is inherently replay-safe: no partial
 		// output, no tool calls, no extension-observable streaming state was produced
 		// before the failure. This bypasses #hasCleanRetryReplaySafety because the
