@@ -862,6 +862,37 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
 	});
+	it("does not delete the live binary when backup copy fails", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await Bun.write(targetPath, "old binary");
+		await Bun.write(tempPath, "new binary");
+		const originalCopy = fsNode.promises.copyFile;
+		const copy = vi.spyOn(fsNode.promises, "copyFile").mockImplementation(async (src, dest, flags) => {
+			if (String(src) === targetPath) {
+				const err = new Error("EPERM: copy") as NodeJS.ErrnoException;
+				err.code = "EPERM";
+				throw err;
+			}
+			return originalCopy(src, dest, flags as number | undefined);
+		});
+		try {
+			await expect(
+				replaceBinaryForUpdate({
+					targetPath,
+					tempPath,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("EPERM");
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+		} finally {
+			copy.mockRestore();
+		}
+	});
 
 	it("keeps a verified replacement when backup cleanup hits EPERM", async () => {
 		const dir = await makeTempDir();

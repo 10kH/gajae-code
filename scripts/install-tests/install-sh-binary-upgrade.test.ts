@@ -366,6 +366,8 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain("trusted_github_url");
 		expect(installer).toContain("require_official_github_origins");
 		expect(installer).toContain("${LOCK_DIR}/pid");
+		expect(installer).toContain("Failed to publish the downloaded binary");
+		expect(installer).toContain("exit 130");
 	});
 
 	test("rejects unofficial GitHub origin overrides", async () => {

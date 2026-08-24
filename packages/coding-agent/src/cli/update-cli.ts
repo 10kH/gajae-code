@@ -602,18 +602,29 @@ async function cleanupVerifiedBackup(backupPath: string): Promise<string | undef
  */
 export async function replaceBinaryForUpdate(options: BinaryReplacementOptions): Promise<InstalledVersionVerification> {
 	let backupReady = false;
+	let published = false;
 	try {
 		await unlinkIfExists(options.backupPath);
-		try {
-			// Windows allows renaming a mapped running image; it does not allow
-			// overwriting that image in place. Move the live file aside, then
-			// publish the staged replacement into the vacated name.
-			await fs.promises.rename(options.targetPath, options.backupPath);
-			backupReady = true;
-		} catch (err) {
-			if (!isEnoent(err)) throw err;
+		if (process.platform === "win32") {
+			try {
+				// Windows allows renaming a mapped running image; it does not allow
+				// overwriting that image in place. Move the live file aside, then
+				// publish the staged replacement into the vacated name.
+				await fs.promises.rename(options.targetPath, options.backupPath);
+				backupReady = true;
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
+		} else {
+			try {
+				await fs.promises.copyFile(options.targetPath, options.backupPath);
+				backupReady = true;
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
 		}
 		await fs.promises.rename(options.tempPath, options.targetPath);
+		published = true;
 
 		const verification = await options.verifyInstalledVersion(options.expectedVersion);
 		if (!verification.ok) {
@@ -629,7 +640,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		if (backupReady) {
 			await unlinkIfExists(options.targetPath);
 			await fs.promises.rename(options.backupPath, options.targetPath);
-		} else {
+		} else if (published) {
 			await unlinkIfExists(options.targetPath);
 		}
 		await unlinkIfExists(options.tempPath);

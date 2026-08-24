@@ -76,7 +76,10 @@ cleanup() {
     return 0
 }
 
-trap cleanup EXIT INT HUP TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
 
 remember_tmp() {
     TMP_FILES="${TMP_FILES}$1
@@ -531,7 +534,10 @@ install_binary() {
         cp -f "$DEST_PATH" "$BACKUP_PATH"
     fi
 
-    mv -f "$DOWNLOAD_TMP" "$DEST_PATH"
+    if ! mv -f "$DOWNLOAD_TMP" "$DEST_PATH"; then
+        restore_backup
+        die "Failed to publish the downloaded binary. Existing install was preserved if one existed."
+    fi
 
     if ! verify_installed_binary "$DEST_PATH" "$EXPECTED_VERSION"; then
         restore_backup

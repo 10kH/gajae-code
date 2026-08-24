@@ -83,7 +83,10 @@ function Get-WindowsBinaryName {
     if ($arch -eq "ARM64") {
         throw "Unsupported architecture: ARM64. Prebuilt Windows binaries are published for x64 only."
     }
-    if ($arch -and $arch -ne "AMD64" -and $arch -ne "x86") {
+    if ($arch -eq "x86") {
+        throw "Unsupported architecture: x86. Prebuilt Windows binaries are published for x64 only."
+    }
+    if ($arch -and $arch -ne "AMD64") {
         throw "Unsupported architecture: $arch. Prebuilt Windows binaries are published for x64 only."
     }
     return "gjc-windows-x64.exe"
