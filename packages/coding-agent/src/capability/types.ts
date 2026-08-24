@@ -20,13 +20,13 @@ export interface LoadContext {
 	 * (`getAgentDir()`), which `--agent-dir`, `GJC_CODING_AGENT_DIR` and
 	 * `setAgentDir()` redirect away from `<home>/.gjc/agent`. `loadCapability`
 	 * always sets it; ad-hoc contexts built for path scanning may omit it, and
-	 * consumers then fall back to the same process-wide `getAgentDir()`.
+	 * native providers then fall back to the home-relative default
+	 * `<home>/<configDirName>/agent` (see `resolveUserAgentDir` in
+	 * `discovery/builtin.ts`).
 	 *
 	 * A native surface whose write path targets the agent directory resolves its
-	 * user scope from here, or discovery reads a different file than the one the
-	 * writer produced: `gjc mcp add` (user scope) writes `getMCPConfigPath("user")`
-	 * under this directory. Surfaces whose writers are home-relative (skills) keep
-	 * resolving from `home`.
+	 * user scope from here, or discovery reads a different file than the writer
+	 * produced. This includes MCP registrations and user-installed skills.
 	 */
 	userAgentDir?: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */

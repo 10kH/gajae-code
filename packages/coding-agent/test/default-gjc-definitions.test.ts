@@ -108,6 +108,13 @@ describe("default GJC definitions", () => {
 		expect(autoresearch?.content).not.toContain("$autoresearch");
 	});
 
+	it("does not claim third-party Ouroboros commands as deep-interview triggers", () => {
+		const deepInterview = getDefaultGjcDefinitions().find(
+			definition => definition.kind === "skill" && definition.name === "deep-interview",
+		);
+		expect(deepInterview?.content).not.toContain('"ouroboros"');
+	});
+
 	it("exposes deep-interview fragments only through the parent-scoped fragment accessor", () => {
 		const fragments = getEmbeddedDefaultGjcSkillFragments("deep-interview");
 
