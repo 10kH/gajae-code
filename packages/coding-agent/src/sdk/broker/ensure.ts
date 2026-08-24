@@ -473,7 +473,10 @@ function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): 
 	const lockPath = path.join(path.dirname(discoveryPath), "broker.lock");
 	if (!isPidAlive(stale.pid)) return ` The published pid ${stale.pid} is gone; delete ${discoveryPath}.`;
 	const incarnation = brokerProcessIncarnation(stale.pid);
-	if (incarnation === undefined || incarnation === "" || incarnation !== stale.incarnation) {
+	if (incarnation === undefined || incarnation === "") {
+		return ` Published pid ${stale.pid} has no verifiable incarnation; do not signal it or delete ${lockPath}.`;
+	}
+	if (incarnation !== stale.incarnation) {
 		return ` Published pid ${stale.pid} is live but is not the published broker; do not signal it. After confirming it is not the SDK broker, delete ${discoveryPath} and ${lockPath}.`;
 	}
 	return ` Stop the broker at pid ${stale.pid} before deleting ${discoveryPath}.`;
