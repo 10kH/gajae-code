@@ -5,8 +5,14 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { SdkClient } from "../client/client";
-import { type BrokerDiscovery, brokerDiscoveryPath, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
+import { SdkClient, SdkClientError } from "../client/client";
+import {
+	type BrokerDiscovery,
+	brokerDiscoveryPath,
+	brokerProcessIncarnation,
+	isPidAlive,
+	readBrokerDiscovery,
+} from "./discovery";
 import {
 	resolveSdkInternalSpawnCommand,
 	resolveSdkPackageAuthority,
@@ -358,6 +364,21 @@ const STALE_BROKER_SHUTDOWN_TIMEOUT_MS = 2_000;
  * here fails closed and leaves the exact owner live rather than escalating it.
  */
 const OWNED_BROKER_RETIRE_TIMEOUT_MS = STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
+const PACKAGE_AUTHORITY_CHANGED_BEFORE_SHUTDOWN = "SDK broker package authority changed before shutdown dispatch";
+
+function assertUnchangedPackageAuthority(expectedPackageGeneration: string, preflight: SdkPackageAuthority): void {
+	const current = resolveSdkPackageAuthority({ force: true });
+	if (
+		current.generation !== expectedPackageGeneration ||
+		current.packageVersion !== preflight.packageVersion ||
+		current.installationIdentity !== preflight.installationIdentity
+	)
+		throw new Error(PACKAGE_AUTHORITY_CHANGED_BEFORE_SHUTDOWN);
+}
+
+function isPackageAuthorityChangedBeforeShutdown(error: unknown): boolean {
+	return error instanceof Error && error.message === PACKAGE_AUTHORITY_CHANGED_BEFORE_SHUTDOWN;
+}
 
 /** Sends SIGTERM only through an OS process reference bound to the published incarnation. */
 function signalExactBroker(pid: number, incarnation: string): boolean {
@@ -449,6 +470,68 @@ function hasCompletePackageAuthority(discovery: BrokerDiscovery): boolean {
 	return typeof discovery.packageVersion === "string" && typeof discovery.installationIdentity === "string";
 }
 
+function isAbsentPackageAuthorityField(value: string | undefined | null): boolean {
+	return value == null || value === "";
+}
+
+function isLegacyUnstampedDiscovery(discovery: BrokerDiscovery): boolean {
+	const generation = discovery.packageGeneration as string | undefined | null;
+	return (
+		(generation === "unknown" || isAbsentPackageAuthorityField(generation)) &&
+		isAbsentPackageAuthorityField(discovery.packageVersion) &&
+		isAbsentPackageAuthorityField(discovery.installationIdentity)
+	);
+}
+
+function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): string {
+	const discoveryPath = brokerDiscoveryPath(agentDir);
+	const lockPath = path.join(path.dirname(discoveryPath), "broker.lock");
+	if (!isPidAlive(stale.pid)) return ` The published pid ${stale.pid} is gone; delete ${discoveryPath}.`;
+	const incarnation = brokerProcessIncarnation(stale.pid);
+	if (incarnation === undefined || incarnation === "") {
+		return ` Published pid ${stale.pid} has no verifiable incarnation; do not signal it or delete ${lockPath}.`;
+	}
+	if (incarnation !== stale.incarnation) {
+		return ` Published pid ${stale.pid} is live but is not the published broker; do not signal it. After confirming it is not the SDK broker, delete ${discoveryPath} and ${lockPath}.`;
+	}
+	return ` Stop the broker at pid ${stale.pid} before deleting ${discoveryPath}.`;
+}
+function unstampedProcessGone(stale: BrokerDiscovery): boolean {
+	return !isPidAlive(stale.pid);
+}
+async function peekUnstampedLiveBroker(agentDir: string): Promise<BrokerDiscovery | null> {
+	try {
+		const raw: unknown = JSON.parse(await fs.readFile(brokerDiscoveryPath(agentDir), "utf8"));
+		if (!raw || typeof raw !== "object") return null;
+		const discovery = raw as BrokerDiscovery;
+		if (!isLegacyUnstampedDiscovery(discovery)) return null;
+		if (!Number.isSafeInteger(discovery.pid) || discovery.pid <= 0) return null;
+		if (typeof discovery.incarnation !== "string" || discovery.incarnation.length === 0) return null;
+		if (typeof discovery.url !== "string" || typeof discovery.token !== "string") return null;
+		if (!isPidAlive(discovery.pid)) return null;
+		return discovery;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" || error instanceof SyntaxError) return null;
+		throw error;
+	}
+}
+
+async function readUnstampedBrokerIgnoringTtl(agentDir: string): Promise<BrokerDiscovery | null> {
+	const discovery = await readBrokerDiscovery(agentDir, Number.MAX_SAFE_INTEGER);
+	if (!discovery || !isLegacyUnstampedDiscovery(discovery)) return null;
+	return discovery;
+}
+async function readPublishedBrokerIdentity(agentDir: string): Promise<BrokerDiscovery | null> {
+	try {
+		const raw: unknown = JSON.parse(await fs.readFile(brokerDiscoveryPath(agentDir), "utf8"));
+		if (!raw || typeof raw !== "object") return null;
+		return raw as BrokerDiscovery;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" || error instanceof SyntaxError) return null;
+		throw error;
+	}
+}
+
 async function brokerDiscoveryFileAbsent(agentDir: string): Promise<boolean> {
 	try {
 		await fs.access(brokerDiscoveryPath(agentDir));
@@ -479,10 +562,17 @@ function isAuthorizedBrokerEndpoint(discovery: BrokerDiscovery): boolean {
 
 /**
  * Stop a live broker whose published generation differs from the package this
- * process would spawn. The authenticated `broker.shutdown` op is tried first;
- * brokers that predate the op (or fail transport) take an identity-fenced
- * SIGTERM instead. Retirement is best-effort, but a mismatched discovery that
- * remains published is never returned to a lifecycle caller.
+ * process would spawn. The authenticated `broker.shutdown` op is tried first
+ * and is the Darwin retirement path: the owner process exits itself. Ordered
+ * same-install discoveries that predate the op (or fail transport) take an
+ * identity-fenced SIGTERM instead. Legacy records that lack version/identity
+ * are shut down through the same authenticated path. They are signalled only
+ * after a typed authenticated `unknown_operation` (pre-shutdown brokers) and
+ * identity revalidation, and only where `signalRoot` is incarnation-bound.
+ * Darwin `signalRoot` fail-closes; generation inequality never authorizes
+ * SIGTERM. A heartbeat TTL lapse with a still-live process is not retirement.
+ * A mismatched discovery that remains published is never returned to a
+ * lifecycle caller.
  */
 async function retireStaleBroker(
 	agentDir: string,
@@ -492,45 +582,121 @@ async function retireStaleBroker(
 ): Promise<boolean> {
 	const preflightAuthority = resolveSdkPackageAuthority({ force: true });
 	if (preflightAuthority.generation !== expectedPackageGeneration) return false;
-	if (!hasCompletePackageAuthority(stale) || !canRetireStaleBroker(stale, preflightAuthority)) return false;
-	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-	if (
-		!currentBeforeConnect ||
-		!sameBrokerIdentity(currentBeforeConnect, stale) ||
-		!sameBrokerAuthority(currentBeforeConnect, stale)
-	)
+	const unstamped = isLegacyUnstampedDiscovery(stale);
+	if (unstamped) {
+		if (!isAuthorizedBrokerEndpoint(stale)) return false;
+	} else if (!canRetireStaleBroker(stale, preflightAuthority)) {
 		return false;
-	if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
+	}
+	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+	if (currentBeforeConnect) {
+		if (!sameBrokerIdentity(currentBeforeConnect, stale) || !sameBrokerAuthority(currentBeforeConnect, stale))
+			return unstamped ? unstampedProcessGone(stale) : false;
+		if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
+	} else if (unstamped) {
+		// TTL-expired publications are invisible to readBrokerDiscovery, but a live
+		// pid still owns the lock. Re-read the raw publication and require the same
+		// identity before authenticated shutdown so a concurrent replacement is not
+		// disrupted.
+		if (unstampedProcessGone(stale)) return true;
+		const peeked = await readUnstampedBrokerIgnoringTtl(agentDir);
+		if (
+			!peeked ||
+			!sameBrokerIdentity(peeked, stale) ||
+			!sameBrokerAuthority(peeked, stale) ||
+			!isAuthorizedBrokerEndpoint(peeked)
+		)
+			return unstampedProcessGone(stale);
+	} else {
+		return false;
+	}
+	let unknownOperationAfterAuth = false;
 	try {
 		const client = await SdkClient.connect(stale.url, stale.token, {
 			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
 			reconnectAttempts: 0,
 		});
 		try {
-			await client.global("broker.shutdown", {});
+			const currentBeforeShutdown = unstamped
+				? await readUnstampedBrokerIgnoringTtl(agentDir)
+				: await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+			if (
+				!currentBeforeShutdown ||
+				!sameBrokerIdentity(currentBeforeShutdown, stale) ||
+				!sameBrokerAuthority(currentBeforeShutdown, stale) ||
+				!isAuthorizedBrokerEndpoint(currentBeforeShutdown)
+			)
+				return unstamped ? unstampedProcessGone(stale) : false;
+			await client.global(
+				"broker.shutdown",
+				{},
+				{
+					timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
+					beforeDispatch: () => {
+						assertUnchangedPackageAuthority(expectedPackageGeneration, preflightAuthority);
+					},
+				},
+			);
+		} catch (error) {
+			if (isPackageAuthorityChangedBeforeShutdown(error)) return false;
+			if (unstamped && error instanceof SdkClientError && error.code === "unknown_operation") {
+				unknownOperationAfterAuth = true;
+			} else {
+				throw error;
+			}
 		} finally {
 			await client.close().catch(() => {});
 		}
 	} catch {
-		// RPC unreachable or unknown_operation (broker predates the shutdown op):
-		// Re-read both installation authority and the publication identity immediately
-		// before signaling. A replacement or package mutation must never be targeted.
-		const currentAuthority = resolveSdkPackageAuthority({ force: true });
-		if (currentAuthority.generation !== expectedPackageGeneration) return false;
-		if (!canRetireStaleBroker(stale, currentAuthority)) return false;
-		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-		if (!current) return true;
-		if (!sameBrokerIdentity(current, stale)) return true;
-		if (!sameBrokerAuthority(current, stale)) return false;
-		if (!isAuthorizedBrokerEndpoint(current)) return false;
+		if (unstamped) {
+			// Connect/transport failure cannot authorize SIGTERM.
+			const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+			if (!current) return unstampedProcessGone(stale);
+			if (!sameBrokerIdentity(current, stale)) return unstampedProcessGone(stale);
+		} else {
+			// RPC unreachable or unknown_operation (broker predates the shutdown op):
+			// Re-read both installation authority and the publication identity immediately
+			// before signaling. A replacement or package mutation must never be targeted.
+			const currentAuthority = resolveSdkPackageAuthority({ force: true });
+			if (currentAuthority.generation !== expectedPackageGeneration) return false;
+			if (!canRetireStaleBroker(stale, currentAuthority)) return false;
+			const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+			if (!current) return true;
+			if (!sameBrokerIdentity(current, stale)) return true;
+			if (!sameBrokerAuthority(current, stale)) return false;
+			if (!isAuthorizedBrokerEndpoint(current)) return false;
+			if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
+		}
+	}
+	if (unknownOperationAfterAuth) {
+		const peeked = await readUnstampedBrokerIgnoringTtl(agentDir);
+		if (
+			!peeked ||
+			!sameBrokerIdentity(peeked, stale) ||
+			!sameBrokerAuthority(peeked, stale) ||
+			!isAuthorizedBrokerEndpoint(peeked)
+		)
+			return unstampedProcessGone(stale);
+		try {
+			assertUnchangedPackageAuthority(expectedPackageGeneration, preflightAuthority);
+		} catch (error) {
+			if (isPackageAuthorityChangedBeforeShutdown(error)) return false;
+			throw error;
+		}
 		if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 	while (Date.now() < deadline) {
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 		if (!current) {
-			if (await brokerDiscoveryFileAbsent(agentDir)) return true;
-		} else if (current.pid !== stale.pid || current.incarnation !== stale.incarnation) return true;
+			if (unstamped) {
+				if (unstampedProcessGone(stale)) return true;
+			} else if (await brokerDiscoveryFileAbsent(agentDir)) {
+				return true;
+			}
+		} else if (current.pid !== stale.pid || current.incarnation !== stale.incarnation) {
+			if (!unstamped || unstampedProcessGone(stale)) return true;
+		}
 		await sleep(50);
 	}
 	return false;
@@ -575,11 +741,7 @@ async function retireOwnedBroker(
 			reconnectAttempts: 0,
 		});
 		const currentBeforeShutdown = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		const currentAuthority = resolveSdkPackageAuthority({ force: true });
 		if (
-			currentAuthority.generation !== expectedPackageGeneration ||
-			currentAuthority.packageVersion !== authority.packageVersion ||
-			currentAuthority.installationIdentity !== authority.installationIdentity ||
 			!currentBeforeShutdown ||
 			!sameBrokerIdentity(currentBeforeShutdown, stale) ||
 			!sameBrokerAuthority(currentBeforeShutdown, stale) ||
@@ -589,7 +751,16 @@ async function retireOwnedBroker(
 			!isAuthorizedBrokerEndpoint(currentBeforeShutdown)
 		)
 			return false;
-		await client.global("broker.shutdown", {}, { timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS });
+		await client.global(
+			"broker.shutdown",
+			{},
+			{
+				timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
+				beforeDispatch: () => {
+					assertUnchangedPackageAuthority(expectedPackageGeneration, authority);
+				},
+			},
+		);
 	} catch {
 		return false;
 	} finally {
@@ -620,9 +791,11 @@ function matchesExpectedPackageGeneration(
 function staleBrokerRetirementUnverified(
 	expectedPackageGeneration: string,
 	actualPackageGeneration: string | undefined,
+	remedy?: { agentDir: string; stale: BrokerDiscovery },
 ): Error {
+	const detail = remedy ? staleBrokerRetirementRemedy(remedy.agentDir, remedy.stale) : "";
 	return new Error(
-		`SDK broker package generation ${actualPackageGeneration ?? "unknown"} does not match expected generation ${expectedPackageGeneration}, and stale broker retirement was not verified.`,
+		`SDK broker package generation ${actualPackageGeneration ?? "unknown"} does not match expected generation ${expectedPackageGeneration}, and stale broker retirement was not verified.${detail}`,
 	);
 }
 
@@ -643,21 +816,41 @@ async function retireAndReadReplacement(
 			settings.expectedInstallationIdentity !== authority.installationIdentity)
 	)
 		throw new Error("SDK broker package installation identity changed before retirement.");
-	if (!hasCompletePackageAuthority(stale)) {
-		// A legacy record has no ordered installation authority. Generation
-		// inequality alone cannot prove that it predates this package, so it is
-		// never signalled or retired destructively.
+	if (isLegacyUnstampedDiscovery(stale)) {
+		// A legacy record has no ordered installation authority, so generation
+		// inequality alone cannot authorize SIGTERM. Authenticated shutdown on a
+		// loopback endpoint is still attempted; unverified records keep the operator
+		// remedy instead of remaining an unexplained blocker.
+		if (!isAuthorizedBrokerEndpoint(stale))
+			throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration, {
+				agentDir: settings.agentDir,
+				stale,
+			});
+	} else if (!canRetireStaleBroker(stale, authority)) {
+		// Stamped but not an older same-install broker: do not tell the operator
+		// to stop that pid (it may be newer or a different installation).
 		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
 	}
-	if (!canRetireStaleBroker(stale, authority))
-		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
 	const retired = await retireStaleBroker(
 		settings.agentDir,
 		stale,
 		expectedPackageGeneration,
 		settings.heartbeatTtlMs,
 	);
-	if (!retired) throw staleBrokerRetirementUnverified(expectedPackageGeneration, stale.packageGeneration);
+	if (!retired) {
+		const current =
+			(await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs)) ??
+			(await readPublishedBrokerIdentity(settings.agentDir));
+		if (current && !sameBrokerIdentity(current, stale)) {
+			throw new Error(
+				`SDK broker package generation ${stale.packageGeneration ?? "unknown"} does not match expected generation ${expectedPackageGeneration}, and stale broker retirement was not verified. The current broker.json names a different publication; do not delete ${brokerDiscoveryPath(settings.agentDir)}.`,
+			);
+		}
+		throw staleBrokerRetirementUnverified(expectedPackageGeneration, stale.packageGeneration, {
+			agentDir: settings.agentDir,
+			stale,
+		});
+	}
 	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 	if (!replacement) return undefined;
 	const currentPackageGeneration = resolveSdkPackageAuthority({ force: true }).generation;
@@ -755,6 +948,18 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		if (!stale) return { kind: "external-discovery", discovery: existing };
 		const replacement = await retireAndReadReplacement(settings, existing);
 		if (replacement) return { kind: "external-discovery", discovery: replacement };
+	}
+	if (!existing && !priorOwner && settings.expectedPackageGeneration !== undefined) {
+		const leftover = await peekUnstampedLiveBroker(settings.agentDir);
+		if (leftover) {
+			const replacement = await retireAndReadReplacement(settings, leftover);
+			if (replacement) return { kind: "external-discovery", discovery: replacement };
+			if (isPidAlive(leftover.pid))
+				throw staleBrokerRetirementUnverified(settings.expectedPackageGeneration, leftover.packageGeneration, {
+					agentDir: settings.agentDir,
+					stale: leftover,
+				});
+		}
 	}
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");
@@ -1008,6 +1213,10 @@ export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 /** Test hook: exercise the identity-fenced stale-broker signal fallback. */
 export function signalExactBrokerForTest(pid: number, incarnation: string): boolean {
 	return signalExactBroker(pid, incarnation);
+}
+/** Test hook: legacy unstamped discoveries are shutdown-only, never signalled. */
+export function isLegacyUnstampedDiscoveryForTest(discovery: BrokerDiscovery): boolean {
+	return isLegacyUnstampedDiscovery(discovery);
 }
 /** Test hook: validates ordered same-install retirement authority. */
 export function canRetireStaleBrokerForTest(stale: BrokerDiscovery, authority: SdkPackageAuthority): boolean {
