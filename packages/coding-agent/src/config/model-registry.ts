@@ -2522,6 +2522,11 @@ export class ModelRegistry {
 		}
 		const effectiveProviderConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveProviderConfig.baseUrl ?? "");
+		const allowsKeylessVllmDiscovery =
+			provider !== "vllm" ||
+			isAuthenticated(preflightApiKey) ||
+			effectiveProviderConfig.baseUrl === undefined ||
+			resolveLoopbackOpenAIBaseUrl(effectiveProviderConfig.baseUrl, "") === effectiveProviderConfig.baseUrl;
 		if (!isCurrentPreflight() || preflightStale) {
 			return {
 				provider: effectiveProviderConfig.provider,
@@ -2537,6 +2542,17 @@ export class ModelRegistry {
 			return {
 				provider: effectiveProviderConfig.provider,
 				current: false,
+				models: [],
+				authGeneration: this.#getProviderEvidenceGeneration(provider, preflightApiKey),
+				configurationGeneration: preflightAuthConfigurationGeneration,
+				endpoint,
+				fetched: false,
+			};
+		}
+		if (!allowsKeylessVllmDiscovery) {
+			return {
+				provider: effectiveProviderConfig.provider,
+				current: true,
 				models: [],
 				authGeneration: this.#getProviderEvidenceGeneration(provider, preflightApiKey),
 				configurationGeneration: preflightAuthConfigurationGeneration,
