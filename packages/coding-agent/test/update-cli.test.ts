@@ -1223,6 +1223,20 @@ describe("update-cli release channels", () => {
 			}),
 		).toBe("/usr/bin/gjc");
 	});
+	it("resolves compiled execPath through a symlink", async () => {
+		const dir = await makeTempDir();
+		const realFile = path.join(dir, "gjc-real");
+		const link = path.join(dir, "gjc-link");
+		await Bun.write(realFile, "binary");
+		await fs.symlink(realFile, link);
+		expect(
+			resolveGjcPathForTest({
+				compiled: true,
+				execPath: link,
+				whichPath: "/usr/bin/gjc",
+			}),
+		).toBe(await fs.realpath(link));
+	});
 
 	it("fails closed when the install target cannot be resolved", async () => {
 		const output: string[] = [];

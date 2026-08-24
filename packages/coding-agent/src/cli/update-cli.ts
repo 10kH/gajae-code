@@ -421,10 +421,19 @@ function getBinaryName(platform: NodeJS.Platform = process.platform, arch: strin
 }
 
 /**
- * Resolve the path that `gjc` maps to in the user's PATH.
+ * Resolve the running GJC image. Compiled binaries update themselves via
+ * execPath (realpath when available), not whichever `gjc` is first on PATH.
  */
+function resolveRunningImagePath(execPath: string): string {
+	try {
+		return fs.realpathSync(execPath);
+	} catch {
+		return path.resolve(execPath);
+	}
+}
+
 function resolveGjcPath(): string | undefined {
-	if (isCompiledBinary()) return path.resolve(process.execPath);
+	if (isCompiledBinary()) return resolveRunningImagePath(process.execPath);
 	return $which(APP_NAME) ?? undefined;
 }
 
@@ -433,7 +442,7 @@ export function resolveGjcPathForTest(options: {
 	execPath: string;
 	whichPath: string | undefined;
 }): string | undefined {
-	if (options.compiled) return path.resolve(options.execPath);
+	if (options.compiled) return resolveRunningImagePath(options.execPath);
 	return options.whichPath;
 }
 
