@@ -35,6 +35,8 @@ export interface HermesSetupFlags {
 	gjcCommand?: string;
 	target?: string;
 	profileDir?: string;
+	timeout?: string;
+	connectTimeout?: string;
 }
 
 export interface CoordinatorSetupSpec {
@@ -66,6 +68,14 @@ export interface CoordinatorSetupSpec {
 		perCallConsentRequired: true;
 	};
 	artifactByteCap?: number;
+	/**
+	 * Explicit Hermes MCP client call timeout override in whole seconds.
+	 * Undefined means "no explicit flag": keep the default, or preserve the
+	 * installed value on `--install` (#4878).
+	 */
+	timeout?: number;
+	/** Explicit Hermes MCP connect timeout override in whole seconds. */
+	connectTimeout?: number;
 	installTarget?: {
 		kind: "profile-dir" | "config-file";
 		path: string;
@@ -109,6 +119,8 @@ const DEFAULT_SERVER_KEY = "gjc_coordinator";
 const DEFAULT_GJC_COMMAND = "gjc";
 const DEFAULT_TIMEOUT = 180;
 const DEFAULT_CONNECT_TIMEOUT = 60;
+const MIN_TIMEOUT_SECONDS = 1;
+const MAX_TIMEOUT_SECONDS = 3600;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -194,6 +206,89 @@ function parseByteCap(value: string | undefined): number | undefined {
 	}
 	return parsed;
 }
+const TIMEOUT_RANGE_ERROR = `must be whole seconds between ${MIN_TIMEOUT_SECONDS} and ${MAX_TIMEOUT_SECONDS}`;
+
+function parseTimeoutSeconds(flag: string, value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const trimmed = value.trim();
+	const parsed = Number(trimmed);
+	if (!/^[0-9]+$/.test(trimmed) || parsed < MIN_TIMEOUT_SECONDS || parsed > MAX_TIMEOUT_SECONDS) {
+		throw new HermesSetupError(`${flag} ${TIMEOUT_RANGE_ERROR}.`, 2);
+	}
+	return parsed;
+}
+
+/**
+ * Block fields carrying host MCP client timeout budgets. The managed setup
+ * signature deliberately leaves them unsigned (#4878): they are operator
+ * knobs, and pinning them made every hand-tune look like tampering.
+ */
+const UNSIGNED_TIMEOUT_FIELDS = ["timeout", "connect_timeout"] as const;
+
+type TimeoutBlockField = (typeof UNSIGNED_TIMEOUT_FIELDS)[number];
+
+interface HermesTimeouts {
+	timeout: number;
+	connectTimeout: number;
+}
+
+function blockHasManagedMarkers(block: unknown): block is Record<string, unknown> {
+	if (!isRecord(block) || !isRecord(block.env)) return false;
+	return (
+		block.env.GJC_COORDINATOR_MCP_SETUP_MANAGED_BY === MANAGED_BY &&
+		block.env.GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION === SETUP_SCHEMA_VERSION
+	);
+}
+
+/**
+ * Read one preserved operator timeout from an existing block. Only a
+ * GJC-marked block's values are preserved; anything unpreservable (absent,
+ * non-numeric, out of range) falls back with a warning instead of being
+ * silently propagated.
+ */
+function preservedTimeoutSeconds(
+	block: unknown,
+	field: TimeoutBlockField,
+	flag: string,
+	warnings: string[],
+): number | undefined {
+	if (!blockHasManagedMarkers(block)) return undefined;
+	const value = block[field];
+	if (value === undefined) return undefined;
+	const preservable =
+		typeof value === "number" &&
+		Number.isInteger(value) &&
+		value >= MIN_TIMEOUT_SECONDS &&
+		value <= MAX_TIMEOUT_SECONDS;
+	if (!preservable) {
+		warnings.push(
+			`Ignoring existing ${field} ${JSON.stringify(value)} in the GJC-managed block (not whole seconds between ${MIN_TIMEOUT_SECONDS} and ${MAX_TIMEOUT_SECONDS}); pass ${flag} to set it explicitly.`,
+		);
+		return undefined;
+	}
+	return value;
+}
+
+/**
+ * Resolve the timeout pair written into a rendered block: an explicit flag
+ * wins, then a preserved value from the installed GJC-managed block, then the
+ * 180/60 defaults. These are the host MCP client's call/connect budgets, not
+ * GJC turn deadlines and not the coordinator await_turn/watch_events per-call
+ * caps.
+ */
+function resolveHermesTimeouts(
+	spec: CoordinatorSetupSpec,
+	existingBlock: unknown,
+): HermesTimeouts & { warnings: string[] } {
+	const warnings: string[] = [];
+	const timeout =
+		spec.timeout ?? preservedTimeoutSeconds(existingBlock, "timeout", "--timeout", warnings) ?? DEFAULT_TIMEOUT;
+	const connectTimeout =
+		spec.connectTimeout ??
+		preservedTimeoutSeconds(existingBlock, "connect_timeout", "--connect-timeout", warnings) ??
+		DEFAULT_CONNECT_TIMEOUT;
+	return { timeout, connectTimeout, warnings };
+}
 
 function normalizeWorktreeName(value: string | undefined): string | undefined {
 	const trimmed = optionalTrim(value);
@@ -278,6 +373,8 @@ export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupS
 	const roots = normalizeRoots(flags.root);
 	const gjcCommand = optionalTrim(flags.gjcCommand) ?? DEFAULT_GJC_COMMAND;
 	const sessionCommand = resolveHermesSessionCommand(flags);
+	const timeout = parseTimeoutSeconds("--timeout", flags.timeout);
+	const connectTimeout = parseTimeoutSeconds("--connect-timeout", flags.connectTimeout);
 	return {
 		schemaVersion: 1,
 		coordinator: "hermes",
@@ -305,6 +402,8 @@ export function buildHermesSetupSpec(flags: HermesSetupFlags): CoordinatorSetupS
 			perCallConsentRequired: true,
 		},
 		...(parseByteCap(flags.artifactByteCap) ? { artifactByteCap: parseByteCap(flags.artifactByteCap) } : {}),
+		...(timeout !== undefined ? { timeout } : {}),
+		...(connectTimeout !== undefined ? { connectTimeout } : {}),
 		...(normalizeInstallTarget(flags) ? { installTarget: normalizeInstallTarget(flags) } : {}),
 		operatorTemplateVersion: 1,
 		contractDocVersion: 1,
@@ -329,17 +428,29 @@ function digest(value: unknown): string {
 		.digest("hex");
 }
 
-function serverBlockDigest(block: Record<string, unknown>): string {
+function serverBlockDigest(block: Record<string, unknown>, options?: { includeTimeoutFields?: boolean }): string {
 	const env = isRecord(block.env) ? { ...block.env } : {};
 	delete env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE;
-	return digest({ ...block, env });
+	const unsigned: Record<string, unknown> = { ...block, env };
+	// The timeout knobs stay out of the signature (#4878) so operators can
+	// hand-tune them without the block losing managed status. The
+	// includeTimeoutFields digest variant matches blocks written before that
+	// change and lets them upgrade in place instead of failing as tampered.
+	if (!options?.includeTimeoutFields) {
+		for (const field of UNSIGNED_TIMEOUT_FIELDS) delete unsigned[field];
+	}
+	return digest(unsigned);
 }
 
 export function computeHermesSetupSignature(spec: CoordinatorSetupSpec): string {
 	return serverBlockDigest(renderHermesServerBlockWithoutSignature(spec));
 }
 
-function renderHermesServerBlockWithoutSignature(spec: CoordinatorSetupSpec): Record<string, unknown> {
+function renderHermesServerBlockWithoutSignature(
+	spec: CoordinatorSetupSpec,
+	timeouts?: HermesTimeouts,
+): Record<string, unknown> {
+	const resolved = timeouts ?? resolveHermesTimeouts(spec, undefined);
 	const env: Record<string, string> = {
 		GJC_COORDINATOR_MCP_WORKDIR_ROOTS: spec.roots.join(path.delimiter),
 		GJC_COORDINATOR_MCP_SETUP_MANAGED_BY: MANAGED_BY,
@@ -358,14 +469,17 @@ function renderHermesServerBlockWithoutSignature(spec: CoordinatorSetupSpec): Re
 		command: spec.gjcCommand,
 		args: spec.args,
 		env,
-		timeout: DEFAULT_TIMEOUT,
-		connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+		timeout: resolved.timeout,
+		connect_timeout: resolved.connectTimeout,
 		enabled: true,
 	};
 }
 
-export function renderHermesServerBlock(spec: CoordinatorSetupSpec): Record<string, unknown> {
-	const block = renderHermesServerBlockWithoutSignature(spec);
+export function renderHermesServerBlock(
+	spec: CoordinatorSetupSpec,
+	timeouts?: HermesTimeouts,
+): Record<string, unknown> {
+	const block = renderHermesServerBlockWithoutSignature(spec, timeouts);
 	const env = block.env as Record<string, string>;
 	env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE = serverBlockDigest(block);
 	return block;
@@ -398,7 +512,8 @@ function serverBlockIsManaged(block: unknown): boolean {
 		env.GJC_COORDINATOR_MCP_SETUP_MANAGED_BY === MANAGED_BY &&
 		env.GJC_COORDINATOR_MCP_SETUP_SCHEMA_VERSION === SETUP_SCHEMA_VERSION &&
 		typeof env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE === "string" &&
-		env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE === serverBlockDigest(block)
+		(env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE === serverBlockDigest(block) ||
+			env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE === serverBlockDigest(block, { includeTimeoutFields: true }))
 	);
 }
 
@@ -435,10 +550,20 @@ function mergeHermesConfig(
 	existing: Record<string, unknown>,
 	spec: CoordinatorSetupSpec,
 	force: boolean,
-): Record<string, unknown> {
+): { config: Record<string, unknown>; warnings: string[] } {
 	const currentServers = isRecord(existing.mcp_servers) ? existing.mcp_servers : {};
 	const existingBlock = currentServers[spec.serverKey];
 	if (existingBlock !== undefined && !serverBlockIsManaged(existingBlock) && !force) {
+		if (blockHasManagedMarkers(existingBlock)) {
+			// Marked but signature-stale: hand-edited plumbing, or a pre-#4878
+			// block whose timeout hand-tune broke the old all-fields digest.
+			// Distinguish it from a foreign block so the operator knows --force
+			// is the adoption path and that the tuned timeouts survive it.
+			throw new HermesSetupError(
+				`Hermes MCP server '${spec.serverKey}' has GJC managed markers but its setup signature does not match (it was hand-edited or written by an older GJC). Re-run with --force to adopt the managed block; installed numeric timeout/connect_timeout values are preserved unless --timeout/--connect-timeout is passed.`,
+				3,
+			);
+		}
 		throw new HermesSetupError(`Hermes MCP server '${spec.serverKey}' already exists and is not managed by GJC.`, 3);
 	}
 	// An operator-set GJC_CODING_AGENT_DIR in a managed block survives re-install
@@ -450,14 +575,19 @@ function mergeHermesConfig(
 		spec.codingAgentDir || !serverBlockIsManaged(existingBlock)
 			? undefined
 			: readManagedCodingAgentDir(existingBlock);
+	const effectiveSpec = preservedCodingAgentDir ? { ...spec, codingAgentDir: preservedCodingAgentDir } : spec;
+	// Explicit flags win; otherwise keep the installed operator-tuned values
+	// from the existing GJC-marked block instead of resetting to 180/60.
+	const timeouts = resolveHermesTimeouts(effectiveSpec, existingBlock);
 	return {
-		...existing,
-		mcp_servers: {
-			...currentServers,
-			[spec.serverKey]: renderHermesServerBlock(
-				preservedCodingAgentDir ? { ...spec, codingAgentDir: preservedCodingAgentDir } : spec,
-			),
+		config: {
+			...existing,
+			mcp_servers: {
+				...currentServers,
+				[spec.serverKey]: renderHermesServerBlock(effectiveSpec, timeouts),
+			},
 		},
+		warnings: timeouts.warnings,
 	};
 }
 
@@ -512,11 +642,15 @@ async function restoreFile(snapshot: FileSnapshot): Promise<void> {
 	await fs.writeFile(snapshot.path, snapshot.content);
 }
 
-async function installConfig(spec: CoordinatorSetupSpec, force: boolean): Promise<string[]> {
+async function installConfig(
+	spec: CoordinatorSetupSpec,
+	force: boolean,
+): Promise<{ filesWritten: string[]; warnings: string[] }> {
 	const configPath = configPathForTarget(spec);
-	if (!configPath) return [];
+	if (!configPath) return { filesWritten: [], warnings: [] };
 	const existing = await readYamlConfig(configPath);
-	const configContent = YAML.stringify(mergeHermesConfig(existing, spec, force), null, 2);
+	const merged = mergeHermesConfig(existing, spec, force);
+	const configContent = YAML.stringify(merged.config, null, 2);
 	const operatorPath = operatorPathForTarget(spec);
 	const operatorContent = operatorPath ? renderOperatorTemplate(spec) : null;
 
@@ -551,7 +685,7 @@ async function installConfig(spec: CoordinatorSetupSpec, force: boolean): Promis
 	} finally {
 		for (const file of staged) await fs.rm(file.stagedPath, { force: true });
 	}
-	return staged.map(file => file.path);
+	return { filesWritten: staged.map(file => file.path), warnings: merged.warnings };
 }
 
 async function checkInstalledHermesSetup(spec: CoordinatorSetupSpec): Promise<NonNullable<HermesSetupResult["check"]>> {
@@ -628,27 +762,26 @@ export async function runHermesSetup(flags: HermesSetupFlags): Promise<HermesSet
 		{ path: configPath, content: renderConfigYaml(spec) },
 		{ path: operatorPathForTarget(spec) ?? "operator-instructions.v1.md", content: renderOperatorTemplate(spec) },
 	];
-	const files_written = flags.install ? await installConfig(spec, Boolean(flags.force)) : [];
+	const install = flags.install ? await installConfig(spec, Boolean(flags.force)) : { filesWritten: [], warnings: [] };
 	const check = flags.check ? await checkInstalledHermesSetup(spec) : null;
 	const smoke = flags.smoke ? await runSmoke(spec) : null;
 	if (smoke && !smoke.ok) {
 		throw new HermesSetupError(`Hermes MCP smoke failed; missing tools: ${smoke.missingTools.join(", ")}`, 4);
 	}
+	const warnings = [
+		spec.sessionCommandSource === "explicit"
+			? "Using explicit GJC_COORDINATOR_MCP_SESSION_COMMAND validated as a supported GJC lifecycle selector."
+			: spec.worktree.enabled
+				? `GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to '${spec.sessionCommand}' so GJC owns worktree creation and resume identity.`
+				: "GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to 'gjc' with worktree isolation disabled by user request.",
+		...install.warnings,
+	];
 	return {
 		ok: check?.ok ?? true,
 		mode,
-		files_written,
+		files_written: install.filesWritten,
 		previews,
-		warnings:
-			spec.sessionCommandSource === "explicit"
-				? ["Using explicit GJC_COORDINATOR_MCP_SESSION_COMMAND validated as a supported GJC lifecycle selector."]
-				: spec.worktree.enabled
-					? [
-							`GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to '${spec.sessionCommand}' so GJC owns worktree creation and resume identity.`,
-						]
-					: [
-							"GJC_COORDINATOR_MCP_SESSION_COMMAND defaults to 'gjc' with worktree isolation disabled by user request.",
-						],
+		warnings,
 		smoke,
 		check,
 	};

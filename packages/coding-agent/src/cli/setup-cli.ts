@@ -89,6 +89,8 @@ export interface SetupCommandArgs {
 		gjcCommand?: string;
 		target?: string;
 		profileDir?: string;
+		timeout?: string;
+		connectTimeout?: string;
 		yes?: boolean;
 		dryRun?: boolean;
 		keychain?: boolean;
@@ -132,6 +134,8 @@ const HERMES_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = [
 	"target",
 	"profile",
 	"profileDir",
+	"timeout",
+	"connectTimeout",
 ];
 
 function rejectHermesFlagsOutsideHermes(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
@@ -237,6 +241,10 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.serverKey = args[++i];
 		} else if (arg === "--gjc-command") {
 			flags.gjcCommand = args[++i];
+		} else if (arg === "--timeout") {
+			flags.timeout = args[++i] ?? "";
+		} else if (arg === "--connect-timeout") {
+			flags.connectTimeout = args[++i] ?? "";
 		} else if (arg === "--target") {
 			flags.target = args[++i];
 		} else if (arg === "--profile-dir") {
@@ -952,6 +960,8 @@ ${chalk.bold("Options:")}
   --session-command Typed GJC lifecycle selector: gjc | gjc --worktree [name]; disables generated worktree flags
   --no-worktree     Disable default GJC --worktree isolation for Hermes sessions
   --worktree-name   Named GJC --worktree branch for Hermes sessions
+  --timeout         Hermes MCP client call timeout in whole seconds 1-3600 (default 180); host client budget, not a GJC turn deadline
+  --connect-timeout Hermes MCP connect timeout in whole seconds 1-3600 (default 60); host client budget, not a GJC turn deadline
   --mutation        Hermes MCP mutation classes: sessions,questions,reports,all
   --coding-agent-dir GJC agent-directory override (GJC_CODING_AGENT_DIR, absolute path); distinct from --state-root
   --target          Hermes config file target for config-only install

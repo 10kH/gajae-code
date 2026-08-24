@@ -73,6 +73,24 @@ export GJC_CODING_AGENT_DIR="/var/lib/gjc/hermes-agent"
 
 `--coding-agent-dir` requires an absolute path (Windows accepts `C:\...` and UNC `\\server\share\...`) and refuses the home directory, the account home, and the filesystem root, the same way `--root` does. On `--install` of a GJC-managed block, an existing `GJC_CODING_AGENT_DIR` is preserved unless `--coding-agent-dir` is passed, which overrides it explicitly; the value participates in the managed setup signature, so `--check` detects drift.
 
+### MCP client timeouts (#4878)
+
+The generated block writes `timeout: 180` and `connect_timeout: 60` (whole seconds). These are the host MCP client's per-call budgets — how long the controller waits for one `gjc_coordinator_*` tool call to return. They are **not** a GJC turn deadline, and not the coordinator per-call caps (`gjc_coordinator_watch_events` `timeout_ms` up to 30000 ms; `gjc_coordinator_await_turn` bounded at 30 minutes). Poll again instead of raising the client timeout.
+
+Tune them explicitly:
+
+```bash
+gjc setup hermes --root /path/to/repo --timeout 900 --connect-timeout 30 --install
+```
+
+Both flags take whole seconds in the range 1–3600; anything else is rejected with exit code 2. Defaults stay 180/60 when the flags are omitted and no installed value exists.
+
+`--install` preserves existing numeric `timeout` / `connect_timeout` values from a block carrying the GJC managed markers when the corresponding flag is omitted, per field: a hand-set `timeout: 900` survives the next install instead of being reset to 180. An explicit flag overrides the installed value. Render-only previews always show flag-or-default values, since there is no installed target to preserve from. The managed setup signature covers the GJC-owned plumbing (command, args, env) and deliberately does not pin these two knobs, so hand-tuning them keeps the block managed and `gjc setup hermes --check` does not report timeout drift.
+
+Upgrading from a pre-#4878 install (whose signature included the timeout fields): a block whose stored content still matches its stored signature is still recognized as managed and is re-signed on the next `--install` (`--check` reports its signature as stale until then). A pre-#4878 block whose timeout was hand-tuned no longer matches either digest, so plain `--install` refuses with the stale-signature error pointing at `--force`; `--force` adopts the managed block and preserves the tuned values. `--force` never discards installed timeout values — pass `--timeout 180 --connect-timeout 60` to reset them explicitly.
+
+`--profile-dir` installs also write the operator instructions file, whose digest pins its exact content. A release that changes that template (as this one does) therefore requires one `--force` for profiles holding an older render; the installed numeric timeout values are preserved across that upgrade too.
+
 Run a non-mutating setup smoke check with:
 
 ```bash
