@@ -33,6 +33,10 @@ Each delegate starts (or reuses) a session, sends one workflow-tagged turn, and 
 
 Do not report completion to the user until the GJC turn is terminal. Do not infer completion from terminal scrollback alone.
 
+## Timeouts
+
+The generated `timeout` / `connect_timeout` values are the host MCP client's call and connect budgets for this server, in whole seconds — not a GJC turn deadline, and not the per-call `timeout_ms` caps of `{{TOOL_PREFIX}}_await_turn` / `{{TOOL_PREFIX}}_watch_events` (bounded at 30000 ms each; poll again instead of raising them). Operators may hand-tune them (1-3600); `gjc setup hermes --install` preserves installed numeric values unless `--timeout <seconds>` / `--connect-timeout <seconds>` is passed explicitly.
+
 Coordinator MCP is a durable polling/await bridge, not a push subscription stream. Use `{{TOOL_PREFIX}}_read_coordination_status`, `{{TOOL_PREFIX}}_read_turn`, and bounded `{{TOOL_PREFIX}}_await_turn` as the authoritative consumption surface.
 
 ## Worktree, model, and provider policy
