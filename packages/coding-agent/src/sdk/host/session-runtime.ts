@@ -3434,36 +3434,33 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// keep failing. In-run attachments are not in any batch yet (no
 		// agent_start follows for them), so they renew through
 		// attachedInvocations instead.
-		const liveRenewalSet = [
-			...(current.openLifecycleBatches[0]?.invocations ?? []),
-			...(current.attachedInvocations ?? []),
-		];
-		const inLiveRun = (entry: { kind: InvocationKind; correlation: InvocationCorrelation }): boolean =>
-			liveRenewalSet.some(
-				v =>
-					v.correlation.commandId === entry.correlation.commandId &&
-					v.correlation.turnId === entry.correlation.turnId,
-			);
-		// Derive EVERY renewal candidate from the live set only (exact-head review):
-		// activeInvocation may be a stale failedTransitions retention whose run
-		// already ended, so it must pass the same live filter — never renew from it
-		// alone.
-		const head = (current.activeInvocation ? [current.activeInvocation] : []).filter(inLiveRun);
-		const drained = (current.drainedInvocations ?? []).filter(inLiveRun);
-		const batch =
-			drained.length > 0
-				? head.length > 0 &&
-					!drained.some(
-						v =>
-							v.correlation.commandId === head[0]!.correlation.commandId &&
-							v.correlation.turnId === head[0]!.correlation.turnId,
-					)
-					? [...drained, ...head]
-					: drained
-				: head;
-		for (const invocation of batch)
+		const activeInvocation = current.activeInvocation;
+		const activeBatch = activeInvocation
+			? current.openLifecycleBatches.find(batch =>
+					batch.invocations.some(
+						entry =>
+							entry.correlation.commandId === activeInvocation.correlation.commandId &&
+							entry.correlation.turnId === activeInvocation.correlation.turnId,
+					),
+				)
+			: undefined;
+		// A delayed predecessor end may leave its batch at index zero after a
+		// successor start. Renew the batch containing the active invocation, never
+		// the oldest unmatched batch. An agent-initiated run has no SDK root batch;
+		// only its explicitly attached in-run correlations are attributable.
+		const liveRenewalSet = activeBatch
+			? [...activeBatch.invocations, ...activeBatch.attachedInvocations]
+			: current.lifecycleActive && activeInvocation === undefined
+				? (current.attachedInvocations ?? [])
+				: [];
+		const seen = new Set<string>();
+		for (const invocation of liveRenewalSet) {
+			const correlationKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
+			if (seen.has(correlationKey)) continue;
+			seen.add(correlationKey);
 			if (invocation.kind === "prompt")
 				current.deadlineManager.onAttributableEvent(invocation.correlation, eventType);
+		}
 	};
 	api.on("tool_execution_start", async (_event, ctx) => {
 		renewAttributableProgress("tool_execution_start");

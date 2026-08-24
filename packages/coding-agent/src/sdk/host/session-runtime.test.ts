@@ -3196,6 +3196,57 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("successor tool progress renews its deadline while a predecessor batch awaits agent_end", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-successor-progress-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const successorStarted = Promise.withResolvers<void>();
+			let prompts = 0;
+			const harness = await invocationHarness("successor-progress", cwd, {
+				settings: {
+					get: (key: string) =>
+						key === "sdk.promptDeadlineMs" ? 25 : key === "sdk.promptMaxRuntimeMs" ? 60_000 : undefined,
+				} as unknown as Settings,
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) {
+						await firstInflight.promise;
+						return;
+					}
+					successorStarted.resolve();
+					await Promise.withResolvers<void>().promise;
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			await harness.emit("agent_start");
+			expect(await harness.control("turn.abort", {})).toMatchObject({ ok: true });
+			firstInflight.reject(Object.assign(new Error("turn aborted"), { code: "aborted" }));
+			const successor = await harness.control("turn.prompt", { text: "successor" });
+			expect(successor.ok).toBe(true);
+			const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
+			await harness.emit("agent_start");
+			await successorStarted.promise;
+			for (let index = 0; index < 4; index += 1) {
+				await harness.emit("tool_execution_start");
+				await Bun.sleep(15);
+			}
+			expect(await harness.query("turn.prompt_status", successorIds)).toMatchObject({
+				result: { status: expect.stringMatching(/accepted|in_flight/) },
+			});
+			await harness.emit("agent_end");
+			await harness.emit("agent_end");
+			expect(await settledStatus(harness, "turn.prompt_status", successorIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("abort_and_prompt starts exactly one successor and is not duplicated by delayed abort teardown", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-abort-and-prompt-once-"));
 		try {
