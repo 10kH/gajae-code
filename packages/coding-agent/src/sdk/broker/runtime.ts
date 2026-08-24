@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { currentExecutablePath } from "@gajae-code/natives";
 import packageJson from "../../../package.json" with { type: "json" };
 import internalSourceMarker from "./internal-source-marker-2178.txt" with { type: "file" };
 
@@ -82,6 +83,42 @@ function regularReadablePath(file: string, label: string): string {
 		throw new Error(`SDK internal launch refused: ${label} is not a readable regular file.`);
 	}
 	return canonical;
+}
+
+function regularExecutablePath(file: string, label: string): string {
+	const canonical = regularReadablePath(file, label);
+	try {
+		fs.accessSync(canonical, fs.constants.X_OK);
+	} catch {
+		throw new Error(`SDK internal launch refused: ${label} is not an executable regular file.`);
+	}
+	return canonical;
+}
+
+function isBunVirtualExecutablePath(file: string): boolean {
+	const normalized = file.replaceAll("\\", "/").toLowerCase();
+	return (
+		normalized === "/$bunfs" || normalized.startsWith("/$bunfs/") || /^(?:[a-z]:)?\/~bun(?:\/|$)/.test(normalized)
+	);
+}
+
+/**
+ * Bun normally exposes the compiled application's on-disk path through
+ * `process.execPath`. Some single-file builds instead expose their virtual
+ * bundle entry there. Exact compiled-marker evidence proves this is the
+ * bundled GJC process; the fallback comes from the OS current-image query,
+ * never argv or PATH.
+ */
+function compiledExecutable(options: SdkInternalRuntimeDescriptorTestOptions): string {
+	const execPath = options.execPath ?? process.execPath;
+	try {
+		return regularExecutablePath(path.resolve(execPath), "compiled executable");
+	} catch (error) {
+		if (!isBunVirtualExecutablePath(execPath)) throw error;
+		const currentExecutable = currentExecutablePath();
+		if (!currentExecutable) throw error;
+		return regularExecutablePath(currentExecutable, "compiled executable");
+	}
 }
 
 function internalEnvironment(environment: NodeJS.ProcessEnv, source: boolean): NodeJS.ProcessEnv {
@@ -468,7 +505,7 @@ function resolveSdkInternalSpawnCommandWithEvidence(
 	const isSourceMarker = path.isAbsolute(markerPath) && !compiledMarkerPath;
 	if (embeddedFiles.length === 0 && isSourceMarker) return sourceDescriptor(action, options, markerPath);
 	if (exactCompiledArtifact && compiledMarkerPath) {
-		const executable = regularReadablePath(path.resolve(options.execPath ?? process.execPath), "compiled executable");
+		const executable = compiledExecutable(options);
 		const command: SdkInternalSpawnCommand = {
 			kind: "compiled",
 			file: executable,

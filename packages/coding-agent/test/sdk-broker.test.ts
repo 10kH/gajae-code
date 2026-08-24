@@ -33,6 +33,8 @@ import {
 	deriveLifecycleDeadlines,
 	readSessionLifecycleLaunchRequest,
 	type SessionLifecycleLaunchRequest,
+	terminalUncertainStartupMessage,
+	waitForChildSpawn,
 } from "../src/sdk/broker/lifecycle";
 import { LifecycleLedger } from "../src/sdk/broker/lifecycle-ledger";
 import { resolveSdkInternalSpawnCommand, resolveSdkInternalSpawnCommandForTest } from "../src/sdk/broker/runtime";
@@ -46,6 +48,31 @@ import {
 } from "../src/session/session-storage";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-"));
+
+it("does not disclose launch paths when cleanup remains uncertain", () => {
+	const executable = "/private/runtime/gjc-secret";
+	const message = terminalUncertainStartupMessage({
+		ok: false,
+		error: { code: "spawn_failed", message: `spawn ${executable} ENOENT` },
+	});
+	expect(message).toBe(
+		"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation. Original launch failure: SDK internal process could not be started.",
+	);
+	expect(message).not.toContain(executable);
+});
+
+it("retains an error handler after a child reports successful spawn", async () => {
+	const child = new EventEmitter();
+	const postSpawnErrors: string[] = [];
+	const spawned = waitForChildSpawn(child as unknown as Pick<ChildProcess, "off" | "on" | "once">, error =>
+		postSpawnErrors.push(error.message),
+	);
+	child.emit("spawn");
+	await spawned;
+	expect(child.listenerCount("error")).toBe(1);
+	child.emit("error", new Error("late child failure"));
+	expect(postSpawnErrors).toEqual(["late child failure"]);
+});
 async function managedSessionPath(agentDir: string, cwd: string, sessionId: string): Promise<string> {
 	await fs.mkdir(cwd, { recursive: true });
 	const sessionsRoot = getSessionsDir(agentDir);
@@ -178,6 +205,19 @@ it("isolates source SDK children and preserves compiled self-spawn", () => {
 		packageVersion: expect.any(String),
 		installationIdentity: process.execPath,
 	});
+});
+
+it("uses the native current executable for exact compiled-marker-authorized Bun virtual executable paths", () => {
+	const markerPath = "/$bunfs/root/internal-source-marker-2178-abcd.txt";
+	const executable = native.currentExecutablePath();
+	if (!executable) throw new Error("Expected native current executable identity.");
+	expect(
+		resolveSdkInternalSpawnCommandForTest("session-host-internal", {
+			execPath: "/$bunfs/root/gjc",
+			markerPath,
+			embeddedFiles: [{ name: path.basename(markerPath) }],
+		}),
+	).toMatchObject({ kind: "compiled", file: executable });
 });
 
 it("treats explicit broker env as a complete allowlist and still scrubs runtime options", () => {

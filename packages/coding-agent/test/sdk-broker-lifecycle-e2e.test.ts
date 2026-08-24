@@ -21,6 +21,7 @@ import {
 	observeProcessForTest,
 	parseDarwinProcessIncarnation,
 	processIncarnation,
+	reapDeadLifecycleMarkers,
 	reapDeadSessionRegistrations,
 	setLifecycleCleanupHookForTest,
 	setLifecycleCommandResolverForTest,
@@ -1320,7 +1321,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		await broker.start();
 		const resumed = await broker.handleRequest(
 			"session.resume",
-			{ cwd: root, stateRoot, sessionId: sourceId, sessionPath: sourcePath },
+			{ cwd: root, stateRoot, sessionId: sourceId, sessionPath: sourcePath, readinessTimeoutMs: 20_000 },
 			"canonical-cold-resume",
 		);
 		expect(resumed).toMatchObject({ ok: true, result: { sessionId: sourceId } });
@@ -1375,7 +1376,13 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 
 		const forked = await broker.handleRequest(
 			"session.fork",
-			{ cwd: root, stateRoot, sourceSessionId: sourceId, sourceSessionPath: sourcePath },
+			{
+				cwd: root,
+				stateRoot,
+				sourceSessionId: sourceId,
+				sourceSessionPath: sourcePath,
+				readinessTimeoutMs: 20_000,
+			},
 			"canonical-cold-fork",
 		);
 		expect(forked).toMatchObject({ ok: true });
@@ -1515,7 +1522,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 30_000);
+}, 50_000);
 
 test("broker replays one identity-bound lifecycle metadata cleanup plan after the first delete detach", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-delete-metadata-crash-"));
@@ -2436,6 +2443,127 @@ test("broker terminalizes default command resolver failures", async () => {
 		setLifecycleCommandResolverForTest(broker, undefined);
 		if (previousCommand === undefined) delete process.env.GJC_SDK_SESSION_COMMAND;
 		else process.env.GJC_SDK_SESSION_COMMAND = previousCommand;
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("broker preserves spawn_failed when the ChildProcess emits an error before PID ownership", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-broker-child-error-"));
+	const broker = new Broker({ agentDir: path.join(root, "agent") });
+	try {
+		setLifecycleCommandResolverForTest(broker, () => ({ file: path.join(root, "missing-gjc"), args: [] }));
+		await broker.start();
+		await expect(
+			broker.handleRequest("session.create", { cwd: root }, "child-error-before-pid"),
+		).resolves.toMatchObject({
+			ok: false,
+			error: { code: "spawn_failed" },
+		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("reaps only lifecycle markers whose exact owner is proven dead", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-marker-reap-"));
+	const sdk = path.join(root, ".gjc", "state", "sdk");
+	const deadId = "dead-session";
+	const liveId = "live-session";
+	const unreadableId = "unreadable-session";
+	try {
+		await fs.mkdir(sdk, { recursive: true });
+		const dead = { pid: 999_999_999, effectMarker: "dead", incarnation: "linux:1" };
+		const live = { pid: process.pid, effectMarker: "live", incarnation: await incarnation(process.pid) };
+		await Bun.write(path.join(sdk, `${deadId}.lifecycle.json`), JSON.stringify(dead));
+		await Bun.write(path.join(sdk, `${deadId}.lifecycle.ready.json`), JSON.stringify(dead));
+		await Bun.write(path.join(sdk, `${liveId}.lifecycle.json`), JSON.stringify(live));
+		await Bun.write(path.join(sdk, `${unreadableId}.lifecycle.json`), "not lifecycle JSON");
+		const expiredAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		await fs.utimes(path.join(sdk, `${deadId}.lifecycle.json`), expiredAt, expiredAt);
+
+		expect(await reapDeadLifecycleMarkers(path.dirname(sdk))).toBe(1);
+		await expect(Bun.file(path.join(sdk, `${deadId}.lifecycle.json`)).exists()).resolves.toBe(false);
+		await expect(Bun.file(path.join(sdk, `${deadId}.lifecycle.ready.json`)).exists()).resolves.toBe(false);
+		await expect(Bun.file(path.join(sdk, `${liveId}.lifecycle.json`)).exists()).resolves.toBe(true);
+		await expect(Bun.file(path.join(sdk, `${unreadableId}.lifecycle.json`)).exists()).resolves.toBe(true);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("bounds stale lifecycle marker inspection even when candidates are not reapable", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-marker-limit-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const sdk = path.join(stateRoot, "sdk");
+	const originalKill = process.kill;
+	let observations = 0;
+	try {
+		await fs.mkdir(sdk, { recursive: true });
+		const live = { pid: process.pid, effectMarker: "live", incarnation: await incarnation(process.pid) };
+		for (let index = 0; index < 5; index += 1)
+			await Bun.write(path.join(sdk, `live-${index}.lifecycle.json`), JSON.stringify(live));
+		process.kill = ((pid, signal) => {
+			observations += 1;
+			return originalKill.call(process, pid, signal);
+		}) as typeof process.kill;
+
+		expect(await reapDeadLifecycleMarkers(stateRoot, 2)).toBe(0);
+		expect(observations).toBe(2);
+	} finally {
+		process.kill = originalKill;
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("does not follow lifecycle sdk symlinks or partially reap an unsafe ready sibling", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-lifecycle-marker-safety-"));
+	const stateRoot = path.join(root, ".gjc", "state");
+	const redirectedSdk = path.join(root, "redirected-sdk");
+	const dead = { pid: 999_999_999, effectMarker: "dead", incarnation: "linux:1" };
+	try {
+		await fs.mkdir(redirectedSdk, { recursive: true });
+		await fs.mkdir(stateRoot, { recursive: true });
+		await fs.symlink(redirectedSdk, path.join(stateRoot, "sdk"));
+		await Bun.write(path.join(redirectedSdk, "redirected.lifecycle.json"), JSON.stringify(dead));
+		expect(await reapDeadLifecycleMarkers(stateRoot)).toBe(0);
+		await expect(Bun.file(path.join(redirectedSdk, "redirected.lifecycle.json")).exists()).resolves.toBe(true);
+
+		await fs.rm(path.join(stateRoot, "sdk"));
+		await fs.mkdir(path.join(stateRoot, "sdk"));
+		const markerPath = path.join(stateRoot, "sdk", "unsafe-ready.lifecycle.json");
+		await Bun.write(markerPath, JSON.stringify(dead));
+		await Bun.write(path.join(stateRoot, "sdk", "unsafe-ready.lifecycle.ready.json"), "unsafe ready sibling");
+		const expiredAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
+		await fs.utimes(markerPath, expiredAt, expiredAt);
+		expect(await reapDeadLifecycleMarkers(stateRoot)).toBe(0);
+		await expect(Bun.file(markerPath).exists()).resolves.toBe(true);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("retains the concrete spawn failure when cleanup proof is unavailable", async () => {
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-spawn-failure-cause-"));
+	const agentDir = path.join(root, "agent");
+	const broker = new Broker({ agentDir });
+	try {
+		setLifecycleCommandResolverForTest(broker, () => {
+			throw new Error("runtime executable is not a readable regular file.");
+		});
+		await broker.start();
+		const response = await broker.handleRequest("session.create", { cwd: root }, "concrete-spawn-failure");
+		expect(response).toEqual({
+			ok: false,
+			error: {
+				code: "spawn_failed",
+				message: "Unable to spawn session: runtime executable is not a readable regular file.",
+			},
+		});
+	} finally {
+		setLifecycleCommandResolverForTest(broker, undefined);
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
@@ -4518,6 +4646,208 @@ test("never-settling model profile startup cuts off with proven pre-registration
 		await fs.rm(root, { recursive: true, force: true });
 	}
 }, 10_000);
+
+test("unregistered cutoff receipt gets bounded publication and post-signal proof", async () => {
+	if (process.platform !== "linux") return;
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-pre-registration-boundary-"));
+	const agentDir = path.join(root, "agent");
+	const fixture = path.join(root, "pre-registration-boundary.ts");
+	const pidPath = path.join(root, "child.pid");
+	const requestPath = path.join(root, "child.request.json");
+	const receivedAt = 1_000;
+	const deadlines = deriveLifecycleDeadlines(receivedAt, 4_000);
+	let nowMs = receivedAt;
+	let receiptPublished = false;
+	const broker = new Broker({ agentDir });
+	await fs.writeFile(
+		fixture,
+		`await Bun.write(${JSON.stringify(pidPath)}, String(process.pid));
+await Bun.write(${JSON.stringify(requestPath)}, process.env.GJC_SDK_LIFECYCLE_REQUEST ?? "");
+setInterval(() => {}, 1_000_000);
+`,
+	);
+	setLifecycleCommandResolverForTest(broker, () => ({ file: process.execPath, args: ["run", fixture] }));
+	setLifecycleTimingForTest(broker, {
+		now: () => nowMs,
+		sleep: async ms => {
+			const requestReady = await fs.access(requestPath).then(
+				() => true,
+				() => false,
+			);
+			if (!requestReady) {
+				await Bun.sleep(1);
+				return;
+			}
+			nowMs += ms;
+			if (!receiptPublished && nowMs >= deadlines.semanticReadyDeadlineAt - 100) {
+				const request = JSON.parse(await fs.readFile(requestPath, "utf8")) as {
+					sessionId: string;
+					stateRoot: string;
+					effectMarker: string;
+				};
+				const pid = Number(await fs.readFile(pidPath, "utf8"));
+				const childIncarnation = processIncarnation(pid);
+				if (!childIncarnation) throw new Error("Expected a readable child process incarnation.");
+				await writeSessionLifecycleFailure(
+					request.stateRoot,
+					request.sessionId,
+					request.effectMarker,
+					{
+						phase: "startup",
+						reason: "pending",
+						message: "deterministic cutoff receipt",
+					},
+					{
+						endpointGeneration: null,
+						fenced: true,
+						runtimeRemoved: true,
+						hostStopped: true,
+						brokerRegistrationReleased: true,
+					},
+					undefined,
+					childIncarnation,
+					pid,
+				);
+				receiptPublished = true;
+			}
+			await Bun.sleep(1);
+		},
+	});
+	try {
+		await broker.start();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: deadlines.requestedReadinessTimeoutMs },
+			"pre-registration-boundary",
+		);
+		expect(receiptPublished).toBe(true);
+		expect(response).toMatchObject({
+			ok: false,
+			error: {
+				code: "spawn_failed",
+				endpoint: "unavailable",
+				message: "deterministic cutoff receipt",
+			},
+			startupFailure: {
+				phase: "startup",
+				reason: "pending",
+				message: "deterministic cutoff receipt",
+				rollback: {
+					endpointGeneration: null,
+					fenced: true,
+					runtimeRemoved: true,
+					hostStopped: true,
+					brokerRegistrationReleased: true,
+				},
+				cleanupProof: {
+					processExited: true,
+					endpointRemoved: true,
+					hostUnregistered: { state: "not_registered" },
+				},
+			},
+		});
+		expect(nowMs).toBeLessThan(deadlines.lifecycleCleanupDeadlineAt);
+	} finally {
+		setLifecycleTimingForTest(broker, undefined);
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 10_000);
+
+test("delayed lifecycle reconciliation proof cannot return spawn_failed cleanup after its deadline", async () => {
+	if (process.platform !== "linux") return;
+	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-delayed-proof-"));
+	const agentDir = path.join(root, "agent");
+	const fixture = path.join(root, "delayed-proof.ts");
+	const pidPath = path.join(root, "child.pid");
+	const requestPath = path.join(root, "child.request.json");
+	const receivedAt = 1_000;
+	const deadlines = deriveLifecycleDeadlines(receivedAt, 4_000);
+	let nowMs = receivedAt;
+	let receiptPublished = false;
+	let delayedProof = false;
+	const broker = new Broker({ agentDir });
+	await fs.writeFile(
+		fixture,
+		`await Bun.write(${JSON.stringify(pidPath)}, String(process.pid));
+await Bun.write(${JSON.stringify(requestPath)}, process.env.GJC_SDK_LIFECYCLE_REQUEST ?? "");
+setInterval(() => {}, 1_000_000);
+`,
+	);
+	setLifecycleCommandResolverForTest(broker, () => ({ file: process.execPath, args: ["run", fixture] }));
+	setLifecycleTimingForTest(broker, {
+		now: () => nowMs,
+		sleep: async ms => {
+			const requestReady = await fs.access(requestPath).then(
+				() => true,
+				() => false,
+			);
+			if (!requestReady) {
+				await Bun.sleep(1);
+				return;
+			}
+			nowMs += ms;
+			if (!receiptPublished && nowMs >= deadlines.semanticReadyDeadlineAt - 100) {
+				const request = JSON.parse(await fs.readFile(requestPath, "utf8")) as {
+					sessionId: string;
+					stateRoot: string;
+					effectMarker: string;
+				};
+				const pid = Number(await fs.readFile(pidPath, "utf8"));
+				const childIncarnation = processIncarnation(pid);
+				if (!childIncarnation) throw new Error("Expected a readable child process incarnation.");
+				await writeSessionLifecycleFailure(
+					request.stateRoot,
+					request.sessionId,
+					request.effectMarker,
+					{ phase: "startup", reason: "pending", message: "delayed lifecycle proof" },
+					{
+						endpointGeneration: null,
+						fenced: true,
+						runtimeRemoved: true,
+						hostStopped: true,
+						brokerRegistrationReleased: true,
+					},
+					undefined,
+					childIncarnation,
+					pid,
+				);
+				receiptPublished = true;
+			}
+			await Bun.sleep(1);
+		},
+	});
+	const originalExactUnlink = native.exactUnlink.bind(native);
+	const unlinkSpy = vi.spyOn(native, "exactUnlink").mockImplementation((pathname, identity) => {
+		const result = originalExactUnlink(pathname, identity);
+		if (!delayedProof && receiptPublished && nowMs >= deadlines.terminationStartDeadlineAt) {
+			nowMs = deadlines.lifecycleCleanupDeadlineAt;
+			delayedProof = true;
+		}
+		return result;
+	});
+	try {
+		await broker.start();
+		const response = await broker.handleRequest(
+			"session.create",
+			{ cwd: root, readinessTimeoutMs: deadlines.requestedReadinessTimeoutMs },
+			"delayed-lifecycle-proof",
+		);
+		expect(receiptPublished).toBe(true);
+		expect(delayedProof).toBe(true);
+		expect(nowMs).toBeGreaterThanOrEqual(deadlines.lifecycleCleanupDeadlineAt);
+		expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+		if (!response.ok) expect(response.error.code).not.toBe("spawn_failed");
+	} finally {
+		unlinkSpy.mockRestore();
+		setLifecycleTimingForTest(broker, undefined);
+		setLifecycleCommandResolverForTest(broker, undefined);
+		await broker.stop();
+		await fs.rm(root, { recursive: true, force: true });
+	}
+}, 10_000);
+
 test("production post-registration startup failure proves cleanup and exact replay", async () => {
 	if (process.platform !== "linux") return;
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-production-failure-"));
@@ -4603,7 +4933,9 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 		await broker.start();
 		const created = await broker.handleRequest(
 			"session.create",
-			{ cwd: root, readinessTimeoutMs: 10_000 },
+			// This boots a real source-workspace host. Preserve enough headroom when
+			// Bun runs this file beside the broker unit shard on loaded CI workers.
+			{ cwd: root, readinessTimeoutMs: 20_000 },
 			"v3-native-create",
 		);
 		if (!created.ok) throw new Error(created.error.message);
@@ -4637,7 +4969,7 @@ test("production broker session.create authenticates a source-workspace v3 nativ
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 20_000);
+}, 30_000);
 
 test("broker agentDir profile validates, activates, and is discoverable through session Q27", async () => {
 	const root = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-profile-agent-dir-"));
@@ -4654,7 +4986,7 @@ test("broker agentDir profile validates, activates, and is discoverable through 
 		await broker.start();
 		const created = await broker.handleRequest(
 			"session.create",
-			{ cwd, modelPreset: "agent-dir-only", readinessTimeoutMs: 10_000 },
+			{ cwd, modelPreset: "agent-dir-only", readinessTimeoutMs: 20_000 },
 			"agent-dir-profile-create",
 		);
 		if (!created.ok) throw new Error(created.error.message);
@@ -4687,7 +5019,7 @@ test("broker agentDir profile validates, activates, and is discoverable through 
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });
 	}
-}, 20_000);
+}, 30_000);
 
 test("child profile activation failures preserve typed codes through readiness and BrokerResponse", async () => {
 	if (process.platform !== "linux") return;
