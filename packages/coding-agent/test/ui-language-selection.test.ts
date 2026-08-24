@@ -89,5 +89,6 @@ describe("interactive UI language selection", () => {
 		expect(settings.get("ui.language")).toBe("ko");
 		expect(rendered).toContain("설정:");
 		expect(rendered).toContain("언어");
+		expect(rendered).toContain("미리보기:");
 	});
 });

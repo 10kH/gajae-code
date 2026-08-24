@@ -1230,7 +1230,7 @@ export class SettingsSelectorComponent extends Container {
 			this.#statusPreviewContainer = new Container();
 			this.#statusPreviewContainer.addChild(new Spacer(1));
 			this.#statusPreviewContainer.addChild(
-				new Text(theme.fg("muted", uiString(this.#language(), "settings.preview")), 0, 0),
+				new DynamicThemeText(() => theme.fg("muted", uiString(settings.get("ui.language"), "settings.preview"))),
 			);
 			this.#statusPreviewText = new Text(this.#getStatusPreviewString(), 0, 0);
 			this.#statusPreviewContainer.addChild(this.#statusPreviewText);
