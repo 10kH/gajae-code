@@ -14,6 +14,12 @@ function object(value: unknown): JsonObject | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as JsonObject) : undefined;
 }
 
+function providerErrorCode(error: unknown): string | undefined {
+	if (error instanceof AcpSdkAdapterError || error instanceof SdkClientError || error instanceof ReverseLeaseError)
+		return error.code;
+	return undefined;
+}
+
 /** The small agent-side ACP surface used for reverse requests. */
 export interface AcpReverseConnection {
 	request?(method: string, params: JsonObject, options?: { cancellationSignal?: AbortSignal }): Promise<unknown>;
@@ -250,7 +256,15 @@ export class AcpSdkAdapter {
 		if (this.#providerActivation) await this.#providerActivation;
 		if (this.#closed) return;
 		this.#providersActivated = false;
-		await this.#activateProviders();
+		try {
+			await this.#activateProviders();
+		} catch (error) {
+			// A live foreign owner must keep the lease. Rebind is best-effort recovery
+			// of *this* adapter's expired registration, not a steal, and must not fail
+			// an otherwise healthy ACP prompt (#4909).
+			if (providerErrorCode(error) === "provider_lease_conflict") return;
+			throw error;
+		}
 	}
 
 	acceptFrame(frame: Record<string, unknown>): void {
@@ -669,6 +683,10 @@ export class AcpSdkAdapter {
 		}
 
 		if (this.#expiredOwnedLeaseFrame(frame)) {
+			if (object(frame.error)?.code === "not_lease_owner") {
+				const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : "";
+				for (const [capability, id] of this.#leases) if (id === leaseId) this.#leases.delete(capability);
+			}
 			this.#rebindExpiredProviders();
 			return;
 		}
@@ -757,8 +775,7 @@ export class AcpSdkAdapter {
 	}
 
 	#rebindExpiredProviders(): void {
-		this.#providersActivated = false;
-		void this.#activateProviders().catch(error => this.#reportReconnectFailure(error));
+		void this.ensureProviders().catch(error => this.#reportReconnectFailure(error));
 	}
 
 	#canRespondToReverse(

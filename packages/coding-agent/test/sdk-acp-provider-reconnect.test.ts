@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import { AcpSdkAdapter } from "../src/sdk/acp";
+import { SdkClientError } from "../src/sdk/client";
+
 import type { SessionAttachment } from "../src/sdk/router";
 
 const waitFor = async (predicate: () => boolean, label: string): Promise<void> => {
@@ -232,6 +234,39 @@ test("ACP lease rebind does not abort in-flight reverse permission requests (#49
 		resolvePermissionGate();
 	} finally {
 		resolvePermissionGate();
+		await adapter.close();
+	}
+});
+
+test("ACP provider rebind leaves a live foreign permission lease in place (#4909)", async () => {
+	const registrations: Record<string, unknown>[] = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations.push(frame);
+				if (registrations.length === 1) return { ok: true, result: { leaseId: "lease-1" } };
+				throw new SdkClientError("provider_lease_conflict", "provider_lease_conflict");
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await adapter.start();
+		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
+		await expect(adapter.ensureProviders()).resolves.toBeUndefined();
+		expect(registrations.length).toBeGreaterThanOrEqual(2);
+		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
+	} finally {
 		await adapter.close();
 	}
 });
