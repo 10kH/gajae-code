@@ -1257,7 +1257,14 @@ function terminalProviderFirstEventTimeoutIdentity(errorMessage: string): string
 		: errorMessage;
 }
 function attachRetryableAtHint(errorMessage: string | undefined, retryableAt: number): string {
-	const hint = `retryable at ${new Date(retryableAt).toISOString()}`;
+	if (!Number.isFinite(retryableAt)) return errorMessage?.trim() || "";
+	let iso: string;
+	try {
+		iso = new Date(retryableAt).toISOString();
+	} catch {
+		return errorMessage?.trim() || "";
+	}
+	const hint = `retryable at ${iso}`;
 	const current = errorMessage?.trim();
 	if (current?.includes("retryable at ")) return current;
 	return current ? `${current}; ${hint}` : hint;
@@ -18887,7 +18894,7 @@ export class AgentSession {
 	#stampQuotaRetryableAt(message: AssistantMessage): void {
 		if (!this.model) return;
 		const retryableAt = this.#modelRegistry.authStorage.getEarliestUnblockAt(this.model.provider);
-		if (retryableAt === undefined) return;
+		if (retryableAt === undefined || !Number.isFinite(retryableAt)) return;
 		message.errorMessage = attachRetryableAtHint(message.errorMessage, retryableAt);
 	}
 
@@ -19088,6 +19095,7 @@ export class AgentSession {
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
 			credentialRotated = await this.#markFailedCredential(trigger);
+			if (!credentialRotated) this.#stampQuotaRetryableAt(message);
 		}
 		if (credentialRotated) {
 			// A rotation only becomes a same-model retry if the controller can
@@ -19105,7 +19113,11 @@ export class AgentSession {
 		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {
-				const errorMessage = this.#fallbackExhaustionError(controller);
+				this.#stampQuotaRetryableAt(message);
+				const errorMessage = attachRetryableAtHint(
+					this.#fallbackExhaustionError(controller),
+					this.#modelRegistry.authStorage.getEarliestUnblockAt(this.model?.provider ?? "") ?? Number.NaN,
+				);
 				this.emitNotice("error", errorMessage, "fallback");
 				this.#defaultFallbackExhaustedLastTurn = true;
 				controller.resetSticky();

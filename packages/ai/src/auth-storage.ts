@@ -4182,7 +4182,7 @@ export class AuthStorage {
 				this.#getProviderTypeKey(provider, credential.type),
 				index,
 			);
-			if (blockedUntil === undefined) continue;
+			if (blockedUntil === undefined || !Number.isFinite(blockedUntil)) continue;
 			if (earliest === undefined || blockedUntil < earliest) earliest = blockedUntil;
 		}
 		return earliest;
