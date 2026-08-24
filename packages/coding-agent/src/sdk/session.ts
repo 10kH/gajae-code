@@ -4329,21 +4329,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// registered once in the session-owned catalog.
 		if (mcpManager && !options.mcpManager && explicitMcpConfigPath === undefined) {
 			if (publishOwnedConventionalMcpTools) {
-				const syncConventionalTools = async (tools: CustomTool[]): Promise<void> => {
-					if (session.isDisposed) return;
-					const nextTools = tools.filter(tool =>
-						tool.mcpServerName ? ownedConventionalMcpServerNames.has(tool.mcpServerName) : false,
-					);
-					const previousNames = ownedConventionalMcpToolNames;
-					ownedConventionalMcpToolNames = nextTools.map(tool => tool.name);
-					const previousSet = new Set(previousNames);
-					cwdCapturingToolNames.splice(
-						0,
-						cwdCapturingToolNames.length,
-						...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
-						...ownedConventionalMcpToolNames,
-					);
-					await session.replaceNamedCustomTools(previousNames, nextTools);
+				// Late conventional connections can publish near-simultaneously.
+				// Serialize the swaps so an older snapshot cannot interleave with a
+				// newer one inside replaceNamedCustomTools and leave a stale list.
+				let conventionalToolsSync: Promise<void> = Promise.resolve();
+				const syncConventionalTools = (tools: CustomTool[]): Promise<void> => {
+					conventionalToolsSync = conventionalToolsSync.then(async () => {
+						if (session.isDisposed) return;
+						const nextTools = tools.filter(tool =>
+							tool.mcpServerName ? ownedConventionalMcpServerNames.has(tool.mcpServerName) : false,
+						);
+						const previousNames = ownedConventionalMcpToolNames;
+						ownedConventionalMcpToolNames = nextTools.map(tool => tool.name);
+						const previousSet = new Set(previousNames);
+						cwdCapturingToolNames.splice(
+							0,
+							cwdCapturingToolNames.length,
+							...cwdCapturingToolNames.filter(name => !previousSet.has(name)),
+							...ownedConventionalMcpToolNames,
+						);
+						await session.replaceNamedCustomTools(previousNames, nextTools);
+					});
+					return conventionalToolsSync;
 				};
 				mcpManager.setOnToolsChanged(tools => {
 					void syncConventionalTools(tools as CustomTool[]);
