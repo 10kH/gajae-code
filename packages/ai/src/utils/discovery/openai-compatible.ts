@@ -122,7 +122,7 @@ export function resolveLoopbackOpenAIBaseUrl(value: string | undefined, fallback
 	if (!candidate) return fallback;
 	try {
 		const parsed = new URL(candidate);
-		const host = parsed.hostname.toLowerCase();
+		const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
 		const isLoopback = host === "localhost" || host === "::1" || /^127(?:\.\d{1,3}){3}$/.test(host);
 		if ((parsed.protocol === "http:" || parsed.protocol === "https:") && isLoopback) {
 			return candidate;

@@ -225,6 +225,32 @@ describe("issue #970 custom provider discovery", () => {
 		}
 	});
 
+	test("does not discover a remote configured vLLM provider without credentials", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					vllm: {
+						baseUrl: "https://vllm.example.test/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		let requestedRemote = false;
+		using _hook = hookFetch(input => {
+			if (String(input) === "https://vllm.example.test/v1/models") requestedRemote = true;
+			return new Response(null, { status: 404 });
+		});
+
+		const registry = new ModelRegistryImpl(authStorage, modelsPath);
+		await registry.refresh();
+
+		expect(requestedRemote).toBe(false);
+	});
+
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {
 		installTestTheme();
 		const selector = await createSelector({
