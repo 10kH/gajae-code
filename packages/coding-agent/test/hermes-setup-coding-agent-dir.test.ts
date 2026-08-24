@@ -173,7 +173,7 @@ describe("gjc setup hermes --coding-agent-dir", () => {
 		);
 
 		await expect(runHermesSetup({ install: true, root: [root], profileDir })).rejects.toThrow(
-			"already exists and is not managed by GJC",
+			"has GJC managed markers but its setup signature does not match",
 		);
 		// Fail-closed: the refused install leaves the tampered bytes untouched.
 		expect(await Bun.file(configPath).text()).toContain("relative-injection");
