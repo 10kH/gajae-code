@@ -363,10 +363,10 @@ async function createSdkControlServer(
 			indexSeq: 1,
 			sessions: brokerSessions.map(session => {
 				const sessionId = String(session.sessionId ?? session.session_id ?? "");
-				const repo = root;
+				const workspace = root;
 				return {
 					sessionId,
-					locator: { repo, stateRoot: path.join(repo, ".gjc", "state") },
+					locator: { cwd: workspace, worktreeRoot: null, stateRoot: path.join(workspace, ".gjc", "state") },
 					live: session.live === true,
 					terminalUncertain: session.terminalUncertain === true,
 					endpointGeneration: session.endpointGeneration,
