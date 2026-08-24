@@ -31,7 +31,9 @@ directory).
 every indexed session into the versioned row DTO (`SESSION_ROWS_VERSION`). Each
 row is credential-free and carries:
 
-- `sessionId` and the `locator` (`repo`, `stateRoot`);
+- `sessionId` and the `locator` (`cwd`, `worktreeRoot`, `stateRoot`), where `cwd`
+  is the canonical workspace directory and `worktreeRoot` is the canonical Git
+  worktree root or `null` outside a worktree;
 - `endpointGeneration`, `pid`, `live`, `deleted` (tombstone), `indexSeq`;
 - `hostIncarnation` and `identityProvenance` (`composite` | `legacy`);
 - `activity` (`{state: active|idle, at}`) and `lastHeartbeatAt`;

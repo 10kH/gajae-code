@@ -196,9 +196,9 @@ never prints. \`--agent-dir\` selects the broker state directory.
 - \`gjc sdk session list\` — broker \`session.list\` projected to the versioned,
   credential-free row DTO (session id, locator, pid, liveness, tombstone,
   activity, heartbeat, identity provenance, ambiguity).
-- \`gjc sdk session inspect <sessionId>\` — one indexed row; when the broker is
-  absent, falls back to a credential-free offline projection from the local
-  endpoint discovery record.
+- \`gjc sdk session inspect <sessionId>\` — one indexed row from the broker. It
+  never reads endpoint discovery records directly: a missing or unavailable
+  broker fails closed rather than exposing endpoint authority outside SDK core.
 - \`gjc sdk session send <sessionId> --text <prompt>\` — ordered \`turn.prompt\`
   carrying a caller-chosen operation reference (ULID). \`--wait\` polls
   \`turn.result\` with \`kind: "prompt"\` until terminal or the wait window elapses;
