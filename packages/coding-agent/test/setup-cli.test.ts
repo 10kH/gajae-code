@@ -206,6 +206,43 @@ describe("setup CLI parsing", () => {
 				},
 			});
 		});
+		it("parses --coding-agent-dir as a Hermes-only flag", () => {
+			expect(
+				parseSetupArgs([
+					"setup",
+					"hermes",
+					"--root",
+					"/tmp/repo",
+					"--state-root",
+					"/tmp/state",
+					"--coding-agent-dir",
+					"/tmp/agent-home",
+				]),
+			).toEqual({
+				component: "hermes",
+				flags: {
+					root: ["/tmp/repo"],
+					stateRoot: "/tmp/state",
+					codingAgentDir: "/tmp/agent-home",
+				},
+			});
+		});
+
+		it("rejects --coding-agent-dir outside the Hermes component", async () => {
+			const proc = Bun.spawn({
+				cmd: [
+					process.execPath,
+					"-e",
+					`import { parseSetupArgs } from "./src/cli/setup-cli"; parseSetupArgs(["setup", "defaults", "--coding-agent-dir", "/tmp/agent"]);`,
+				],
+				cwd: path.join(import.meta.dir, ".."),
+				stdout: "pipe",
+				stderr: "pipe",
+			});
+			const [exitCode, stderr] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
+			expect(exitCode).toBe(1);
+			expect(stderr).toContain("--coding-agent-dir require the explicit `hermes` component");
+		});
 
 		it("renders Hermes setup with a model-agnostic usable GJC session command", async () => {
 			tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-coordinator-setup-"));
