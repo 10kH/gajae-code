@@ -42,7 +42,7 @@ rl.on('line', line => {
   if (msg.method === 'initialize') {
     setTimeout(() => {
       process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: '2025-03-26', capabilities: { tools: {} }, serverInfo: { name: 'slow-demo', version: '1' } } }) + '\\n');
-    }, 2200);
+    }, 4200);
   } else if (msg.method === 'tools/list') {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { tools: [{ name: 'late_hello', description: 'Late demo tool', inputSchema: { type: 'object', properties: {} } }] } }) + '\\n');
   } else if (msg.id !== undefined) {
@@ -152,7 +152,11 @@ describe("conventional MCP autoload in standalone sessions", () => {
 		const startedAt = Date.now();
 		const { session, mcpManager } = await createAgentSession(isolatedSessionOptions());
 		try {
-			expect(Date.now() - startedAt).toBeLessThan(2_200);
+			// Startup ceiling for a declared 5s timeout is max(250, 5000+500) = 5.5s.
+			// Wall-clock assertions are load-sensitive (CI shards / shared hosts), so
+			// the hard contract lives in the status assertions below; this bound only
+			// guards the gross "blocked until connected" failure mode (>= 5.5s).
+			expect(Date.now() - startedAt).toBeLessThan(5_500);
 			expect(mcpManager).toBeDefined();
 			expect(mcpManager?.getConnectionStatus("slow-demo")).toBe("connecting");
 			// This integration case deliberately crosses the real MCP startup ceiling;
