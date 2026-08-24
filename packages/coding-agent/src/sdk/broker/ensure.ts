@@ -506,6 +506,16 @@ async function readUnstampedBrokerIgnoringTtl(agentDir: string): Promise<BrokerD
 	if (!discovery || !isLegacyUnstampedDiscovery(discovery)) return null;
 	return discovery;
 }
+async function readPublishedBrokerIdentity(agentDir: string): Promise<BrokerDiscovery | null> {
+	try {
+		const raw: unknown = JSON.parse(await fs.readFile(brokerDiscoveryPath(agentDir), "utf8"));
+		if (!raw || typeof raw !== "object") return null;
+		return raw as BrokerDiscovery;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" || error instanceof SyntaxError) return null;
+		throw error;
+	}
+}
 
 async function brokerDiscoveryFileAbsent(agentDir: string): Promise<boolean> {
 	try {
@@ -780,7 +790,9 @@ async function retireAndReadReplacement(
 		settings.heartbeatTtlMs,
 	);
 	if (!retired) {
-		const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		const current =
+			(await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs)) ??
+			(await readPublishedBrokerIdentity(settings.agentDir));
 		if (current && !sameBrokerIdentity(current, stale)) {
 			throw new Error(
 				`SDK broker package generation ${stale.packageGeneration ?? "unknown"} does not match expected generation ${expectedPackageGeneration}, and stale broker retirement was not verified. The current broker.json names a different publication; do not delete ${brokerDiscoveryPath(settings.agentDir)}.`,
