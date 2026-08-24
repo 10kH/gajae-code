@@ -69,6 +69,10 @@ describe("getProviderFirstEventTimeoutFallbackMs(provider)", () => {
 		expect(getProviderFirstEventTimeoutFallbackMs("kimi-code")).toBe(300_000);
 	});
 
+	it("gives Ollama Cloud a 300-second first-event window for hosted cold starts", () => {
+		expect(getProviderFirstEventTimeoutFallbackMs("ollama-cloud")).toBe(300_000);
+	});
+
 	it("does not widen unrelated providers", () => {
 		expect(getProviderFirstEventTimeoutFallbackMs("anthropic")).toBeUndefined();
 	});
