@@ -1589,8 +1589,6 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
-		await record.adapter.ensureProviders();
-
 		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
 		record.cancelRequested = false;
 		const payload = acpPromptPayload(params.prompt);
@@ -1656,6 +1654,12 @@ export class AcpAgent implements Agent {
 		// pending. Retain the original promise for the caller, but mark that delayed rejection
 		// as observed until prompt() can resume and await it.
 		void response.catch(() => undefined);
+		try {
+			await record.adapter.ensureProviders();
+		} catch (error) {
+			if (record.activePrompt === waiter) record.activePrompt = undefined;
+			throw error;
+		}
 		// Silence has to be bounded from the moment the prompt owns the session: a host that
 		// dies before it ever answers is exactly the failure that leaves the client running.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);

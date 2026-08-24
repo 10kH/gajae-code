@@ -108,6 +108,9 @@ type ReverseRequest = {
 	state: "pending" | "cancelled";
 	controller?: AbortController;
 	cancelTimer?: NodeJS.Timeout;
+	connectionId?: string;
+	capability?: string;
+	leaseId?: string;
 };
 
 export { ACP_SESSION_RECONNECT };
@@ -262,7 +265,11 @@ export class AcpSdkAdapter {
 			// A live foreign owner must keep the lease. Rebind is best-effort recovery
 			// of *this* adapter's expired registration, not a steal, and must not fail
 			// an otherwise healthy ACP prompt (#4909).
-			if (providerErrorCode(error) === "provider_lease_conflict") return;
+			if (providerErrorCode(error) === "provider_lease_conflict") {
+				if (this.#leases.size > 0) this.#providersActivated = true;
+				return;
+			}
+
 			throw error;
 		}
 	}
@@ -528,7 +535,15 @@ export class AcpSdkAdapter {
 				const attachment = this.#attachment;
 				const connectionId = attachment?.connectionId;
 				try {
-					for (const provider of this.#providers) await this.registerProvider(provider);
+					for (const provider of this.#providers) {
+						try {
+							await this.registerProvider(provider);
+						} catch (error) {
+							if (providerErrorCode(error) === "provider_lease_conflict") continue;
+							throw error;
+						}
+					}
+
 					if (this.#router && (attachment !== this.#attachment || attachment?.connectionId !== connectionId)) {
 						this.#abortActiveReverseRequests();
 						this.#providersActivated = false;
@@ -710,7 +725,8 @@ export class AcpSdkAdapter {
 		}
 		if (!this.#ownsReverseLease(connectionId, capability, leaseId)) return;
 		const controller = new AbortController();
-		const active: ReverseRequest = { state: "pending", controller };
+		const active: ReverseRequest = { state: "pending", controller, connectionId, capability, leaseId };
+
 		this.#reverseRequests.set(id, active);
 		try {
 			const request = frame.payload as JsonObject | undefined;
@@ -788,7 +804,9 @@ export class AcpSdkAdapter {
 		return (
 			this.#reverseRequests.get(id) === request &&
 			request.state === "pending" &&
-			this.#ownsReverseLease(connectionId, capability, leaseId)
+			request.connectionId === connectionId &&
+			request.capability === capability &&
+			request.leaseId === leaseId
 		);
 	}
 

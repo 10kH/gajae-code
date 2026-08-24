@@ -185,13 +185,18 @@ test("ACP lease rebind does not abort in-flight reverse permission requests (#49
 		AbortSignal | undefined
 	>();
 	const { promise: permissionGate, resolve: resolvePermissionGate } = Promise.withResolvers<void>();
+	const sent: Record<string, unknown>[] = [];
+
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
 		sessionId: "session-1",
 		connectionId: "router-connection-1",
 		generation: 1,
 		isCurrent: () => true,
-		send: async () => {},
+		send: async frame => {
+			sent.push(frame);
+		},
+
 		sendMaintenance: () => {},
 	};
 	const adapter = new AcpSdkAdapter({
@@ -232,6 +237,13 @@ test("ACP lease rebind does not abort in-flight reverse permission requests (#49
 		expect(registrations.length).toBeGreaterThanOrEqual(2);
 		expect(signal?.aborted).toBe(false);
 		resolvePermissionGate();
+		await waitFor(
+			() =>
+				sent.some(
+					frame => frame.type === "reverse_response" && frame.id === "perm-1" && frame.leaseId === "lease-1",
+				),
+			"admitted reverse response on original lease",
+		);
 	} finally {
 		resolvePermissionGate();
 		await adapter.close();
@@ -266,6 +278,55 @@ test("ACP provider rebind leaves a live foreign permission lease in place (#4909
 		await expect(adapter.ensureProviders()).resolves.toBeUndefined();
 		expect(registrations.length).toBeGreaterThanOrEqual(2);
 		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP provider rebind keeps successfully registered capabilities after a later conflict (#4909)", async () => {
+	const sent: Record<string, unknown>[] = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		connectionId: "router-connection-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async frame => {
+			sent.push(frame);
+		},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				if (frame.capability === "permission")
+					throw new SdkClientError("provider_lease_conflict", "provider_lease_conflict");
+				return { ok: true, result: { leaseId: "lease-fs" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [
+			{ capability: "fs", definitions: [] },
+			{ capability: "permission", definitions: [] },
+		],
+	});
+	try {
+		await adapter.start();
+		expect(adapter.leaseIds.get("fs")).toBe("lease-fs");
+		expect(adapter.leaseIds.get("permission")).toBeUndefined();
+		adapter.acceptFrame({
+			type: "reverse_request",
+			id: "fs-1",
+			connectionId: "router-connection-1",
+			capability: "fs",
+			leaseId: "lease-fs",
+			payload: { method: "fs.readTextFile", payload: { path: "/tmp/x" } },
+		});
+		await waitFor(
+			() => sent.some(frame => frame.type === "reverse_response" && frame.id === "fs-1"),
+			"fs reverse still owned after permission conflict",
+		);
 	} finally {
 		await adapter.close();
 	}
