@@ -182,6 +182,7 @@ export const KNOWN_PROVIDERS = [
 	"ollama-cloud",
 	"qianfan",
 	"qwen-portal",
+	"sglang",
 	"together",
 	"venice",
 	"vllm",
