@@ -374,25 +374,18 @@ acquire_lock() {
         LOCK_FILE="$lock"
         return 0
     fi
+    stolen="${lock}.stolen.$$"
+    if ! mv "$lock" "$stolen" 2>/dev/null; then
+        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
+    fi
     owner=""
     nonce=""
-    if [ ! -f "$lock" ]; then
+    read owner nonce < "$stolen" || true
+    if [ -z "$owner" ] || [ -z "$nonce" ] || kill -0 "$owner" 2>/dev/null; then
+        mv "$stolen" "$lock" 2>/dev/null || true
         die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
     fi
-    read owner nonce < "$lock" || true
-    if [ -z "$owner" ] || [ -z "$nonce" ]; then
-        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
-    fi
-    if kill -0 "$owner" 2>/dev/null; then
-        die "Another GJC installer is already running in ${INSTALL_DIR} (pid ${owner}, lock: ${lock})."
-    fi
-    current_owner=""
-    current_nonce=""
-    read current_owner current_nonce < "$lock" || true
-    if [ "$current_owner" != "$owner" ] || [ "$current_nonce" != "$nonce" ]; then
-        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
-    fi
-    rm -f "$lock"
+    rm -f "$stolen"
     LOCK_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
     [ -n "$LOCK_NONCE" ] || LOCK_NONCE="$$.$RANDOM"
     if try_publish_lock_file "$lock" 2>/dev/null; then

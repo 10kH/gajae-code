@@ -324,7 +324,7 @@ function Assert-Checksum {
     try {
         $sumsMissing = $false
         try {
-            Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsTmp -Headers @{ "User-Agent" = $UserAgent }
+            Invoke-WebRequest -UseBasicParsing -Uri $sumsUrl -OutFile $sumsTmp -Headers @{ "User-Agent" = $UserAgent }
             $expected = Get-ChecksumForAsset -SumsPath $sumsTmp -AssetName $AssetName
             if (-not $expected -or $expected -notmatch '^[0-9a-f]{64}$') {
                 throw "Release checksum file $BinarySha256Asset did not list $AssetName"
@@ -343,7 +343,7 @@ function Assert-Checksum {
         }
 
         try {
-            Invoke-WebRequest -Uri $manifestUrl -OutFile $manifestTmp -Headers @{ "User-Agent" = $UserAgent }
+            Invoke-WebRequest -UseBasicParsing -Uri $manifestUrl -OutFile $manifestTmp -Headers @{ "User-Agent" = $UserAgent }
             $manifest = Get-Content $manifestTmp -Raw | ConvertFrom-Json
             foreach ($entry in $manifest.binaries) {
                 if ($entry.name -eq $AssetName) {
@@ -535,7 +535,7 @@ function Install-Binary {
         $BinaryUrl = "$GithubReleases/$Latest/$BinaryName"
         Write-Host "Downloading $BinaryName..."
         try {
-            Invoke-WebRequest -Uri $BinaryUrl -OutFile $DownloadTmp -Headers @{ "User-Agent" = $UserAgent }
+            Invoke-WebRequest -UseBasicParsing -Uri $BinaryUrl -OutFile $DownloadTmp -Headers @{ "User-Agent" = $UserAgent }
         } catch {
             Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
             throw "No prebuilt GJC binary was found for windows-x64 in $Latest.`nExpected asset URL: $BinaryUrl`nRe-run with -Source only if you are developing GJC and already have Bun."
@@ -588,8 +588,9 @@ function Install-Binary {
         if ($newUserPath -ne $UserPath) {
             Write-Host "Putting $InstallDir first on PATH..."
             [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+            $env:Path = "$InstallDir;" + $env:Path
+            $needsRestart = $true
         }
-        $needsRestart = $true
 
         Configure-BashShell
 
