@@ -51,6 +51,8 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).toContain("Join-Path $lockDir \"pid\"");
 		expect(installer).toContain('throw "Unsupported architecture: x86');
 		expect(installer).toContain("PROCESSOR_ARCHITEW6432");
+		expect(installer).toContain("Test-StableReleaseTag");
+		expect(installer).toContain("Refusing non-stable release tag");
 	});
 
 	test.skipIf(!pwsh)("parses without syntax errors under PowerShell", async () => {

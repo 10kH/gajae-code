@@ -71,8 +71,14 @@ cleanup() {
         done || true
     fi
     if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
-        rm -f "${LOCK_DIR}/pid"
-        rmdir "$LOCK_DIR" 2>/dev/null || true
+        owner=""
+        if [ -f "${LOCK_DIR}/pid" ]; then
+            owner=$(tr -d ' \t\r\n' < "${LOCK_DIR}/pid")
+        fi
+        if [ "$owner" = "$$" ]; then
+            rm -f "${LOCK_DIR}/pid"
+            rmdir "$LOCK_DIR" 2>/dev/null || true
+        fi
     fi
     if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
         rm -rf "$SOURCE_CLONE_DIR"
@@ -102,6 +108,18 @@ is_safe_tag() {
             return 1
             ;;
     esac
+}
+
+is_stable_release_tag() {
+    printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+is_nightly_release_tag() {
+    printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-nightly\.[0-9]+\.[0-9]+\.g[0-9a-f]+$'
+}
+
+is_release_tag() {
+    is_stable_release_tag "$1" || is_nightly_release_tag "$1"
 }
 
 is_safe_channel() {
@@ -319,23 +337,25 @@ detect_platform() {
 }
 
 acquire_lock() {
-    LOCK_DIR="${INSTALL_DIR}/.gjc-install.lock"
+    lock="${INSTALL_DIR}/.gjc-install.lock"
     mkdir -p "$INSTALL_DIR"
-    if mkdir "$LOCK_DIR" 2>/dev/null; then
+    if mkdir "$lock" 2>/dev/null; then
+        LOCK_DIR="$lock"
         printf '%s\n' "$$" > "${LOCK_DIR}/pid"
         return 0
     fi
     owner=""
-    if [ -f "${LOCK_DIR}/pid" ]; then
-        owner=$(tr -d ' \t\r\n' < "${LOCK_DIR}/pid")
+    if [ -f "${lock}/pid" ]; then
+        owner=$(tr -d ' \t\r\n' < "${lock}/pid")
     fi
     if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
-        die "Another GJC installer is already running in ${INSTALL_DIR} (pid ${owner}, lock: ${LOCK_DIR})."
+        die "Another GJC installer is already running in ${INSTALL_DIR} (pid ${owner}, lock: ${lock})."
     fi
-    rm -rf "$LOCK_DIR"
-    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${LOCK_DIR})."
+    rm -rf "$lock"
+    if ! mkdir "$lock" 2>/dev/null; then
+        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
     fi
+    LOCK_DIR="$lock"
     printf '%s\n' "$$" > "${LOCK_DIR}/pid"
 }
 
@@ -344,7 +364,7 @@ resolve_release_tag() {
     remember_tmp "$json_tmp"
 
     if [ -n "$REF" ]; then
-        is_safe_tag "$REF" || die "Invalid --ref '$REF'. Expected a GitHub release tag like v0.15.0."
+        is_release_tag "$REF" || die "Invalid --ref '$REF'. Expected a GitHub release tag like v0.15.0 or v0.15.0-nightly.1.1.gabc."
         echo "Fetching release $REF..."
         if ! curl_github "${GITHUB_API}/repos/${REPO}/releases/tags/${REF}" "$json_tmp"; then
             die "Release tag not found: $REF
@@ -368,7 +388,13 @@ For branch/commit source installs, re-run with --source --ref <git-ref> and an e
         LATEST=$(extract_json_string "$json_tmp" "tag_name")
     fi
 
-    is_safe_tag "$LATEST" || die "Refusing unsafe release tag: ${LATEST:-<empty>}"
+    if [ -n "$REF" ]; then
+        is_release_tag "$LATEST" || die "Refusing unsafe release tag: ${LATEST:-<empty>}"
+    elif [ "$CHANNEL" = "nightly" ]; then
+        is_nightly_release_tag "$LATEST" || die "Refusing non-nightly release tag: ${LATEST:-<empty>}"
+    else
+        is_stable_release_tag "$LATEST" || die "Refusing non-stable release tag: ${LATEST:-<empty>}"
+    fi
     EXPECTED_VERSION="${LATEST#v}"
     echo "Using version: $LATEST"
 }

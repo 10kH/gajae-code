@@ -399,4 +399,39 @@ describe("install.sh binary-first contract", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.stdout).toContain(`Using version: v${nightly}`);
 	});
+
+	test("rejects a non-semver stable tag such as vpreview", async () => {
+		writeCurlShim(sandbox.shimDir, {
+			latestJson: JSON.stringify({ tag_name: "vpreview", draft: false, prerelease: false }),
+			assets: {},
+		});
+		const result = await runInstaller([]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("Refusing non-stable release tag");
+	});
+
+	test("rejects --ref vpreview before downloading", async () => {
+		writeCurlShim(sandbox.shimDir, { assets: {} });
+		const result = await runInstaller(["--ref", "vpreview"]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("Invalid --ref");
+	});
+
+	test("does not delete a live foreign installer lock", async () => {
+		writeCurlShim(sandbox.shimDir, { assets: {} });
+		const lockDir = path.join(sandbox.installDir, ".gjc-install.lock");
+		fs.mkdirSync(lockDir, { recursive: true });
+		const sleeper = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
+		fs.writeFileSync(path.join(lockDir, "pid"), `${sleeper.pid}\n`);
+		try {
+			const result = await runInstaller([]);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.stderr + result.stdout).toContain("Another GJC installer is already running");
+			expect(fs.existsSync(lockDir)).toBe(true);
+			expect(fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim()).toBe(String(sleeper.pid));
+		} finally {
+			sleeper.kill();
+			await sleeper.exited;
+		}
+	});
 });

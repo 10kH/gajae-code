@@ -78,6 +78,21 @@ function Test-SafeReleaseTag {
     return $Tag -match '^v[A-Za-z0-9][A-Za-z0-9._-]*$'
 }
 
+function Test-StableReleaseTag {
+    param([string]$Tag)
+    return $Tag -match '^v\d+\.\d+\.\d+$'
+}
+
+function Test-NightlyReleaseTag {
+    param([string]$Tag)
+    return $Tag -match '^v\d+\.\d+\.\d+-nightly\.\d+\.\d+\.g[0-9a-f]+$'
+}
+
+function Test-ReleaseTag {
+    param([string]$Tag)
+    return (Test-StableReleaseTag $Tag) -or (Test-NightlyReleaseTag $Tag)
+}
+
 function Get-WindowsBinaryName {
     $arch = $env:PROCESSOR_ARCHITEW6432
     if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
@@ -258,8 +273,8 @@ function Get-ChecksumForAsset {
 function Resolve-ReleaseTag {
     $headers = Get-GithubHeaders -Uri "$GithubApi/"
     if ($Ref) {
-        if (-not (Test-SafeReleaseTag $Ref)) {
-            throw "Invalid -Ref '$Ref'. Expected a GitHub release tag like v0.15.0."
+        if (-not (Test-ReleaseTag $Ref)) {
+            throw "Invalid -Ref '$Ref'. Expected a GitHub release tag like v0.15.0 or v0.15.0-nightly.1.1.gabc."
         }
         Write-Host "Fetching release $Ref..."
         try {
@@ -450,8 +465,12 @@ function Install-Binary {
     Assert-OfficialGithubOrigins
     $BinaryName = Get-WindowsBinaryName
     $Latest = Resolve-ReleaseTag
-    if (-not (Test-SafeReleaseTag $Latest)) {
-        throw "Refusing unsafe release tag: $Latest"
+    if ($Ref) {
+        if (-not (Test-ReleaseTag $Latest)) { throw "Refusing unsafe release tag: $Latest" }
+    } elseif ($Channel -eq "nightly") {
+        if (-not (Test-NightlyReleaseTag $Latest)) { throw "Refusing non-nightly release tag: $Latest" }
+    } else {
+        if (-not (Test-StableReleaseTag $Latest)) { throw "Refusing non-stable release tag: $Latest" }
     }
     $ExpectedVersion = $Latest.TrimStart("v")
     Write-Host "Using version: $Latest"
