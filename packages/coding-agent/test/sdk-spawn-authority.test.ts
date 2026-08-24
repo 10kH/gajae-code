@@ -113,6 +113,28 @@ describe("SpawnAuthorityStore", () => {
 		expect(store.claims()).toHaveLength(0);
 	});
 
+	it("leaves no journal trace when the durability barrier fails, so a retry still reopens", async () => {
+		const agentDir = await temp();
+		let failNextSync = true;
+		const store = new SpawnAuthorityStore(agentDir, identityKey, {
+			beforeSyncForTest: () => {
+				if (!failNextSync) return;
+				failNextSync = false;
+				throw new Error("injected sync failure");
+			},
+		});
+		await store.open();
+		await expect(store.claimOrJoin("identity", bindingMac)).rejects.toThrow("injected sync failure");
+		// The failed append must not survive physically: otherwise the retry below
+		// appends a second row for the same claim and reopen rejects the history.
+		const retried = await store.claimOrJoin("identity", bindingMac);
+		expect(retried.kind).toBe("owner");
+		const reopened = new SpawnAuthorityStore(agentDir, identityKey);
+		await reopened.open();
+		expect(reopened.claims()).toHaveLength(1);
+		expect(reopened.claim("identity")?.state).toBe("prepared");
+	});
+
 	it("strictly rejects sensitive or generic-hash claim fields", () => {
 		const base = {
 			version: 2,

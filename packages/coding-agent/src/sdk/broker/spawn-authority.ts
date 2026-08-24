@@ -837,11 +837,32 @@ export class SpawnAuthorityStore {
 			throw new Error("Refusing to persist invalid spawn authority evidence.");
 		const write: SpawnAuthorityDurableWrite = { claim, ...(authority === undefined ? {} : { authority }) };
 		const row: StoredClaim = { version: 1, ...write, integrity: this.#integrity(claim, authority) };
+		// The row is appended before the durability barrier, so a barrier failure
+		// can leave a physically written line that in-memory state never accepted.
+		// A retry would then append a second row for the same claim and reopen
+		// would reject the whole journal as invalid history. Roll back to the
+		// pre-write length instead, so a failed append leaves no trace at all.
+		let priorSize = 0;
+		try {
+			priorSize = (await fs.stat(this.#file)).size;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
 		const handle = await fs.open(this.#file, fsSync.constants.O_WRONLY | fsSync.constants.O_APPEND | fsSync.constants.O_CREAT, 0o600);
 		try {
-			await handle.writeFile(`${canonicalJson(row)}\n`);
-			await this.#options.beforeSyncForTest?.(write);
-			await handle.sync();
+			try {
+				await handle.writeFile(`${canonicalJson(row)}\n`);
+				await this.#options.beforeSyncForTest?.(write);
+				await handle.sync();
+			} catch (error) {
+				try {
+					await handle.truncate(priorSize);
+					await handle.sync();
+				} catch {
+					// Rollback is best effort; the original fault is the reportable one.
+				}
+				throw error;
+			}
 		} finally {
 			await handle.close();
 		}
