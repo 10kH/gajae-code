@@ -108,47 +108,6 @@ function standInBrokerProcess(): { pid: number; incarnation: string; kill: () =>
 		},
 	};
 }
-function startPreShutdownUnknownOperationBroker(token: string): { url: string; port: number; stop: () => void } {
-	const server = Bun.serve({
-		port: 0,
-		fetch(req, srv) {
-			const url = new URL(req.url);
-			if (url.searchParams.get("token") !== token) return new Response("forbidden", { status: 403 });
-			if (srv.upgrade(req)) return undefined;
-			return new Response("ok");
-		},
-		websocket: {
-			open(ws) {
-				ws.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
-			},
-			message(ws, data) {
-				const frame = JSON.parse(String(data)) as { id?: string; operation?: string };
-				if (frame.operation === "broker.shutdown") {
-					ws.send(
-						JSON.stringify({
-							type: "broker_response",
-							id: frame.id,
-							ok: false,
-							error: { code: "unknown_operation", message: "unknown broker operation" },
-						}),
-					);
-				}
-			},
-		},
-	});
-	const port = server.port;
-	if (port === undefined) {
-		server.stop(true);
-		throw new Error("pre-shutdown fixture port is unavailable");
-	}
-	return {
-		port,
-		url: `ws://127.0.0.1:${port}`,
-		stop() {
-			server.stop(true);
-		},
-	};
-}
 
 function olderPackageVersion(version: string): string {
 	const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
@@ -474,34 +433,102 @@ describe("sdk broker package generation", () => {
 	it("signals an unstamped pre-shutdown broker after authenticated unknown_operation", async () => {
 		const dir = await temp();
 		const token = "unstamped-unknown-operation-token";
-		const standIn = standInBrokerProcess();
-		const fixture = startPreShutdownUnknownOperationBroker(token);
+		const discoveryModule = path.resolve(import.meta.dir, "../src/sdk/broker/discovery.ts");
+		const script = path.join(dir, "historical-unstamped-broker.ts");
+		await Bun.write(
+			script,
+			`
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { brokerProcessIncarnation, writeBrokerDiscovery } from ${JSON.stringify(discoveryModule)};
+const agentDir = process.argv[2]!;
+const token = process.argv[3]!;
+const server = Bun.serve({
+	port: 0,
+	fetch(req, srv) {
+		const url = new URL(req.url);
+		if (url.searchParams.get("token") !== token) return new Response("forbidden", { status: 403 });
+		if (srv.upgrade(req)) return undefined;
+		return new Response("ok");
+	},
+	websocket: {
+		open(ws) {
+			ws.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+		},
+		message(ws, data) {
+			const frame = JSON.parse(String(data)) as { id?: string; operation?: string };
+			if (frame.operation === "broker.shutdown") {
+				ws.send(JSON.stringify({
+					type: "broker_response",
+					id: frame.id,
+					ok: false,
+					error: { code: "unknown_operation", message: "unknown broker operation" },
+				}));
+			}
+		},
+	},
+});
+const port = server.port;
+if (port === undefined) process.exit(2);
+const incarnation = brokerProcessIncarnation(process.pid);
+if (!incarnation) process.exit(3);
+const lockDir = path.join(agentDir, "sdk", "broker.lock");
+await fs.mkdir(lockDir, { recursive: true, mode: 0o700 });
+await Bun.write(path.join(lockDir, "owner.json"), JSON.stringify({
+	version: 1,
+	ownerId: "legacy-pre-shutdown",
+	pid: process.pid,
+	acquiredAt: Date.now(),
+}) + "\\n");
+await writeBrokerDiscovery(agentDir, {
+	version: 1,
+	protocolVersion: 3,
+	packageGeneration: "unknown",
+	ownerId: "legacy-pre-shutdown",
+	pid: process.pid,
+	incarnation,
+	host: "127.0.0.1",
+	port,
+	url: \`ws://127.0.0.1:\${port}\`,
+	token,
+	startedAt: Date.now(),
+	heartbeatAt: Date.now(),
+});
+setInterval(async () => {
+	try {
+		const file = path.join(agentDir, "sdk", "broker.json");
+		const discovery = JSON.parse(await Bun.file(file).text()) as { heartbeatAt: number };
+		discovery.heartbeatAt = Date.now();
+		await Bun.write(file, \`\${JSON.stringify(discovery)}\\n\`);
+	} catch {}
+}, 200);
+process.on("SIGTERM", () => process.exit(0));
+`,
+		);
+		const child = spawn(process.execPath, [script, dir, token], { stdio: "ignore" });
 		try {
-			await writeBrokerDiscovery(dir, {
-				version: 1,
-				protocolVersion: 3,
-				packageGeneration: "unknown",
-				ownerId: "legacy-pre-shutdown",
-				pid: standIn.pid,
-				incarnation: standIn.incarnation,
-				host: "127.0.0.1",
-				port: fixture.port,
-				url: fixture.url,
-				token,
-				startedAt: Date.now(),
-				heartbeatAt: Date.now(),
-			});
+			const deadline = Date.now() + 5_000;
+			while (Date.now() < deadline) {
+				try {
+					await fs.access(brokerDiscoveryPath(dir));
+					break;
+				} catch {
+					await Bun.sleep(20);
+				}
+			}
+			const published = await readBrokerDiscovery(dir);
+			expect(published?.pid).toBe(child.pid);
 			const authority = resolveSdkPackageAuthority();
 			const replacement = await ensureBroker({
 				agentDir: dir,
 				expectedPackageGeneration: authority.generation,
 			});
-			expect(isPidAlive(standIn.pid)).toBe(false);
-			expect(replacement.pid).not.toBe(standIn.pid);
+			expect(child.pid).toBeDefined();
+			expect(isPidAlive(child.pid!)).toBe(false);
+			expect(replacement.pid).not.toBe(child.pid);
 			expect(replacement.packageGeneration).toBe(authority.generation);
 		} finally {
-			standIn.kill();
-			fixture.stop();
+			if (child.pid !== undefined && isPidAlive(child.pid)) child.kill("SIGKILL");
 			await cleanup(dir);
 		}
 	}, 30_000);

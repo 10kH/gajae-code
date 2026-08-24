@@ -380,6 +380,27 @@ function signalExactBroker(pid: number, incarnation: string): boolean {
 		return false;
 	}
 }
+function signalExactUnstampedBroker(pid: number, incarnation: string): boolean {
+	try {
+		if (pid === process.pid) return false;
+		const processRef = nativeProcessBindings().Process.fromPid(pid);
+		if (!processRef || processRef.incarnation !== incarnation) return false;
+		const signal = os.constants.signals.SIGTERM;
+		if (signal === undefined) return false;
+		if (process.platform === "darwin") {
+			const current = nativeProcessBindings().Process.fromPid(pid);
+			if (!current || current.incarnation !== incarnation) return false;
+			process.kill(pid, "SIGTERM");
+			return true;
+		}
+		return processRef.signalRoot(signal);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException | undefined)?.code;
+		if (code === "ESRCH") return false;
+		if (code === "EACCES" || code === "EIO") throw error;
+		return false;
+	}
+}
 
 function comparePackageVersions(left: string, right: string): number | undefined {
 	const parse = (value: string): { numbers: [number, number, number]; prerelease: string[] } | undefined => {
@@ -630,7 +651,7 @@ async function retireStaleBroker(
 			!isAuthorizedBrokerEndpoint(peeked)
 		)
 			return unstampedProcessGone(stale);
-		if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
+		if (!signalExactUnstampedBroker(stale.pid, stale.incarnation)) return false;
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 	while (Date.now() < deadline) {
