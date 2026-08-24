@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- `ask` question wording and option labels no longer use the post-resample U+2014 display-text exemption because accepted calls enter durable session history and deep-interview rounds; genuinely display-only tool fields retain the existing exemption (#4926).
 - Gajae Pet now treats forwarded `LC_TERMINAL=iTerm2` and `TERM_PROGRAM=iTerm.app` values as probe hints over SSH, enabling iTerm2 only after an active OSC 1337 File-capability reply. Generic SSH, spoofed/noninteractive/CI environments, and unmanaged tmux/screen/zellij nesting remain on the text fallback; verified Kitty and Sixel keep precedence. (#4911)
 - Interactive terminal completion now publishes the local `agent_end` boundary before waiting for the ordered coordinator sidecar write, so slow or lock-hostile WSL drvfs mounts cannot leave the foreground activity indicator and composer busy after a turn has completed. Coordinator persistence ordering and extension delivery remain unchanged. (#4741)
 
