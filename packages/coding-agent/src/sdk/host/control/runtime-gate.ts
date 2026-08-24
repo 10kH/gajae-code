@@ -28,7 +28,18 @@ export function redactBrokerRuntimeCloseCapability(frame: Record<string, unknown
 }
 
 /**
- * Request fields an observer may see. This is an ALLOWLIST on purpose: a
+ * Frame-level keys an observer may see. `SdkFrame` is an open
+ * `Record<string, unknown>` and `#observeRequest` runs BEFORE dispatch
+ * validation, so an adversarial or malformed frame can carry content under any
+ * top-level key. Only structural routing values survive. `idempotencyKey` is a
+ * caller-chosen value and is deliberately absent; so are `cursor` (a signed
+ * pagination token that can carry session/revision data) and `expectedRevision`
+ * (no diagnostic consumer reads it).
+ */
+const OBSERVABLE_FRAME_FIELDS = new Set(["type", "id", "operation", "query", "confirm"]);
+
+/**
+ * Input fields an observer may see. This is an ALLOWLIST on purpose: a
  * denylist is fail-open, so every unlisted or newly added field would leak by
  * default. Only structural routing/correlation values are preserved; all other
  * values are caller content and are replaced with a shape marker.
@@ -39,7 +50,6 @@ const OBSERVABLE_INPUT_FIELDS = new Set([
 	"turnId",
 	"sessionId",
 	"expectedSessionId",
-	"cursor",
 	"mode",
 	"scope",
 	"kind",
@@ -66,22 +76,39 @@ function redactedContentMarker(value: unknown): string {
  * field this module has never heard of cannot leak.
  */
 export function redactObservedRequestContent(frame: Record<string, unknown>): Record<string, unknown> {
-	const input = record(frame.input);
-	if (!input) return frame;
-	let changed = false;
+	const observed: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(frame)) {
+		if (value === undefined) continue;
+		if (key === "input") {
+			const input = record(value);
+			// A non-record payload is content, not "nothing to redact". Returning
+			// early here would hand a string or array `input` through verbatim.
+			observed.input = input === undefined ? redactedContentMarker(value) : redactObservedInput(input);
+			continue;
+		}
+		// Structural routing scalars survive; every other top-level key, including
+		// one this module has never heard of, is redacted.
+		observed[key] =
+			OBSERVABLE_FRAME_FIELDS.has(key) && (value === null || typeof value !== "object")
+				? value
+				: redactedContentMarker(value);
+	}
+	return observed;
+}
+
+/** Redacts one input payload, preserving only structural scalar routing fields. */
+function redactObservedInput(input: Record<string, unknown>): Record<string, unknown> {
 	const redacted: Record<string, unknown> = {};
 	for (const [field, value] of Object.entries(input)) {
 		if (value === undefined) continue;
 		// A scalar routing field is safe; an object or array under an allowlisted
 		// name still gets redacted, because nesting is where content hides.
-		if (OBSERVABLE_INPUT_FIELDS.has(field) && (value === null || typeof value !== "object")) {
-			redacted[field] = value;
-			continue;
-		}
-		redacted[field] = redactedContentMarker(value);
-		changed = true;
+		redacted[field] =
+			OBSERVABLE_INPUT_FIELDS.has(field) && (value === null || typeof value !== "object")
+				? value
+				: redactedContentMarker(value);
 	}
-	return changed ? { ...frame, input: redacted } : frame;
+	return redacted;
 }
 
 /**

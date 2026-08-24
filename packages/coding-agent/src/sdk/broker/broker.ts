@@ -423,14 +423,25 @@ const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
  * undefined for a pre-pin row, which recovery must treat as missing authority.
  */
 function spawnPinFromAuthority(authority: SpawnAuthorityV1): SpawnHostRegistration | undefined {
-	if (authority.endpointGeneration === undefined || authority.endpointPid === undefined) return undefined;
+	// A pin is COMPLETE or it is missing authority. The fields are optional in the
+	// schema so older rows still reopen, but a partially populated pin carries
+	// strictly weaker evidence than the exchange assumes: generation plus pid is
+	// collidable across workspaces, so a partial pin must never be usable.
+	if (
+		authority.endpointGeneration === undefined ||
+		authority.endpointPid === undefined ||
+		authority.endpointIncarnation === undefined ||
+		authority.endpointCwd === undefined ||
+		authority.endpointStateRoot === undefined
+	)
+		return undefined;
 	return {
 		sessionId: authority.childId,
 		endpointGeneration: authority.endpointGeneration,
 		pid: authority.endpointPid,
-		...(authority.endpointIncarnation === undefined ? {} : { processIncarnation: authority.endpointIncarnation }),
-		...(authority.endpointCwd === undefined ? {} : { cwd: authority.endpointCwd }),
-		...(authority.endpointStateRoot === undefined ? {} : { stateRoot: authority.endpointStateRoot }),
+		processIncarnation: authority.endpointIncarnation,
+		cwd: authority.endpointCwd,
+		stateRoot: authority.endpointStateRoot,
 	};
 }
 
@@ -1731,19 +1742,19 @@ export class Broker {
 						// Bind to the exact endpoint proven at registration. Without this a
 						// replaced host or an alternate endpoint for the same id could
 						// receive the seed prompt or answer a Q26 reconciliation.
+						// Every pin leg is required. Identity fields alone collide across
+						// workspaces (pids are reused), so an absent leg is missing evidence
+						// rather than an unconstrained match.
 						(input.pinned === undefined ||
 							(candidate.endpointGeneration === input.pinned.endpointGeneration &&
 								candidate.pid === input.pinned.pid &&
-								(input.pinned.processIncarnation === undefined ||
-									(candidate.hostIncarnation ?? candidate.processIncarnation) === input.pinned.processIncarnation) &&
-								// Identity fields alone can collide across workspaces (pids are
-								// reused), so the workspace the child was launched into is part
-								// of the pin.
-								(input.pinned.cwd === undefined ||
-									resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.pinned.cwd)) &&
-								(input.pinned.stateRoot === undefined ||
-									resolveEquivalentPath(candidate.locator.stateRoot) ===
-										resolveEquivalentPath(input.pinned.stateRoot)))),
+								input.pinned.processIncarnation !== undefined &&
+								(candidate.hostIncarnation ?? candidate.processIncarnation) === input.pinned.processIncarnation &&
+								input.pinned.cwd !== undefined &&
+								resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.pinned.cwd) &&
+								input.pinned.stateRoot !== undefined &&
+								resolveEquivalentPath(candidate.locator.stateRoot) ===
+									resolveEquivalentPath(input.pinned.stateRoot))),
 				);
 		} catch {
 			row = undefined;

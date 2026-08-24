@@ -430,6 +430,84 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
+	it("treats a partially populated endpoint pin as missing authority", async () => {
+		const agentDir = await temp();
+		const brokerKey = await getBrokerIdentityKey(agentDir);
+		const store = new SpawnAuthorityStore(agentDir, brokerKey);
+		await store.open();
+		const mac = "c".repeat(63) + "d";
+		const owner = await store.claimOrJoin("partial", mac);
+		if (owner.kind !== "owner") throw new Error("expected owner");
+		await store.persistTransition("partial", {
+			claimId: owner.claim.claimId,
+			from: "prepared",
+			to: "substrate_starting",
+			childId: "child-partial",
+		});
+		const at = Date.now();
+		// Identity fields present, locator legs absent: exactly the shape an earlier
+		// generation wrote. Generation plus pid is collidable across workspaces, so
+		// this must NOT be usable as a pin.
+		await store.persistTransition("partial", {
+			claimId: owner.claim.claimId,
+			from: "substrate_starting",
+			to: "authority_active",
+			childId: "child-partial",
+			authority: {
+				version: 1,
+				authorityId: "authority-partial",
+				claimId: owner.claim.claimId,
+				childId: "child-partial",
+				ownerSessionId: "master-flow",
+				lifecycleIdentity: "partial",
+				substrateKind: "headless",
+				providerIdentity: "p",
+				pid: 976,
+				processIncarnation: "inc-976",
+				endpointGeneration: 5,
+				endpointPid: 976,
+				endpointIncarnation: "inc-976",
+				closeState: "active",
+				createdAt: at,
+				updatedAt: at,
+			},
+		});
+		await store.releaseOwner("partial");
+		let dispatches = 0;
+		let reconciles = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				verify: async () => "verified" as const,
+				close: async () => ({ ok: true }),
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async () => ({ ok: false as const }),
+				dispatch: async () => {
+					dispatches += 1;
+					return { kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 };
+				},
+				reconcile: async () => {
+					reconciles += 1;
+					return { status: "terminal_ok" as const, commandId: "c", turnId: "t" };
+				},
+			},
+		});
+		await broker.start();
+		try {
+			const after = new SpawnAuthorityStore(agentDir, brokerKey);
+			await after.open();
+			// The row still reopens; it just never recovers into a seed handoff.
+			expect(after.claim("partial")?.state).toBe("uncertain");
+			expect(dispatches).toBe(0);
+			expect(reconciles).toBe(0);
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("refuses a foreign workspace endpoint whose generation and pid collide", async () => {
 		const agentDir = await temp();
 		const brokerKey = await getBrokerIdentityKey(agentDir);
@@ -515,6 +593,8 @@ describe("Broker spawn flow driver", () => {
 				endpointGeneration: 4,
 				endpointPid: 978,
 				endpointIncarnation: "inc-978",
+				endpointCwd: "/pinned/workspace-978",
+				endpointStateRoot: "/pinned/workspace-978/.gjc/state",
 				closeState: "active",
 				createdAt: at,
 				updatedAt: at,
@@ -683,6 +763,8 @@ describe("Broker spawn flow driver", () => {
 				endpointGeneration: 1,
 				endpointPid: 994,
 				endpointIncarnation: "inc-994",
+				endpointCwd: "/pinned/workspace-994",
+				endpointStateRoot: "/pinned/workspace-994/.gjc/state",
 				closeState: "active",
 				createdAt: at,
 				updatedAt: at,
@@ -770,6 +852,8 @@ describe("Broker spawn flow driver", () => {
 				endpointGeneration: 1,
 				endpointPid: 996,
 				endpointIncarnation: "inc-996",
+				endpointCwd: "/pinned/workspace-996",
+				endpointStateRoot: "/pinned/workspace-996/.gjc/state",
 				closeState: "active",
 				createdAt: authorityNow,
 				updatedAt: authorityNow,

@@ -72,9 +72,56 @@ describe("observed request redaction", () => {
 		expect(observed.input.name).toBe("demo");
 	});
 
+	it("redacts caller content at FRAME level, in the production frame shape", () => {
+		// SdkClient puts idempotencyKey at the TOP level, not inside input. An
+		// input-only redactor left the real production shape untouched.
+		const frame = {
+			type: "control_request",
+			id: "req-9",
+			operation: "session.spawn",
+			idempotencyKey: "idem-plaintext-secret",
+			expectedRevision: "rev-plaintext",
+			text: "top-level-task-secret",
+			args: { nested: "top-level-nested-secret" },
+			input: { task: "input-task-secret", clientRef: "ref-9" },
+		};
+		const observed = redactObservedRequestContent(frame);
+		const rendered = JSON.stringify(observed);
+		for (const secret of [
+			"idem-plaintext-secret",
+			"rev-plaintext",
+			"top-level-task-secret",
+			"top-level-nested-secret",
+			"input-task-secret",
+		]) {
+			expect(rendered).not.toContain(secret);
+		}
+		// Structural routing survives so instrumentation stays useful.
+		expect(observed.type).toBe("control_request");
+		expect(observed.id).toBe("req-9");
+		expect(observed.operation).toBe("session.spawn");
+		expect((observed.input as Record<string, unknown>).clientRef).toBe("ref-9");
+	});
+
+	it("treats a non-record input as content rather than nothing to redact", () => {
+		for (const payload of ["RAW_INPUT_SECRET", ["ARRAY_SECRET"], 42]) {
+			const observed = redactObservedRequestContent({
+				type: "query_request",
+				id: "q-1",
+				query: "turn.result",
+				input: payload,
+			});
+			const rendered = JSON.stringify(observed);
+			expect(rendered).not.toContain("RAW_INPUT_SECRET");
+			expect(rendered).not.toContain("ARRAY_SECRET");
+			expect(observed.query).toBe("turn.result");
+		}
+	});
+
 	it("leaves content-free frames untouched and composes with capability redaction", () => {
 		const plain = { type: "control_request", operation: "turn.abort", input: { mode: "turn" } };
-		expect(redactObservedRequestContent(plain)).toBe(plain);
+		// Structural-only frames survive by value (the frame is rebuilt, not aliased).
+		expect(redactObservedRequestContent(plain)).toEqual(plain);
 		const closeFrame = {
 			type: "control_request",
 			operation: "session.close",
