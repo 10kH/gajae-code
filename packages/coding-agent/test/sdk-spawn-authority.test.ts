@@ -135,6 +135,28 @@ describe("SpawnAuthorityStore", () => {
 		expect(reopened.claim("identity")?.state).toBe("prepared");
 	});
 
+	it("rolls back when the parent-directory barrier fails, not just the file barrier", async () => {
+		const agentDir = await temp();
+		let failNextDirectorySync = true;
+		const store = new SpawnAuthorityStore(agentDir, identityKey, {
+			beforeDirectorySyncForTest: () => {
+				if (!failNextDirectorySync) return;
+				failNextDirectorySync = false;
+				throw new Error("injected directory barrier failure");
+			},
+		});
+		await store.open();
+		await expect(store.claimOrJoin("identity", bindingMac)).rejects.toThrow("injected directory barrier failure");
+		// The row was file-synced before the directory barrier threw; without a
+		// rollback spanning that barrier it would survive and the retry below would
+		// append a duplicate that makes reopen reject the whole journal.
+		const retried = await store.claimOrJoin("identity", bindingMac);
+		expect(retried.kind).toBe("owner");
+		const reopened = new SpawnAuthorityStore(agentDir, identityKey);
+		await reopened.open();
+		expect(reopened.claims()).toHaveLength(1);
+	});
+
 	it("strictly rejects sensitive or generic-hash claim fields", () => {
 		const base = {
 			version: 2,
@@ -408,6 +430,174 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
+	it("pins Q26 replay and refuses a mismatched clientRef", async () => {
+		const agentDir = await temp();
+		const brokerKey = await getBrokerIdentityKey(agentDir);
+		const store = new SpawnAuthorityStore(agentDir, brokerKey);
+		await store.open();
+		const mac = "a".repeat(63) + "b";
+		const owner = await store.claimOrJoin("q26-pin", mac);
+		if (owner.kind !== "owner") throw new Error("expected owner");
+		await store.persistTransition("q26-pin", {
+			claimId: owner.claim.claimId,
+			from: "prepared",
+			to: "substrate_starting",
+			childId: "child-q26",
+		});
+		const at = Date.now();
+		await store.persistTransition("q26-pin", {
+			claimId: owner.claim.claimId,
+			from: "substrate_starting",
+			to: "authority_active",
+			childId: "child-q26",
+			authority: {
+				version: 1,
+				authorityId: "authority-q26",
+				claimId: owner.claim.claimId,
+				childId: "child-q26",
+				ownerSessionId: "master-flow",
+				lifecycleIdentity: "q26-pin",
+				substrateKind: "headless",
+				providerIdentity: "p",
+				pid: 978,
+				processIncarnation: "inc-978",
+				endpointGeneration: 4,
+				endpointPid: 978,
+				endpointIncarnation: "inc-978",
+				closeState: "active",
+				createdAt: at,
+				updatedAt: at,
+			},
+		});
+		const seed: SeedDeliveryV2 = { version: 2, phase: "prepared", clientRef: "stored-client-ref" };
+		await store.persistTransition("q26-pin", {
+			claimId: owner.claim.claimId,
+			from: "authority_active",
+			to: "seed_prepared",
+			seed,
+		});
+		const lease = (await store.claimOrJoin("q26-pin", mac)) as { claim: SpawnClaimV2 };
+		await store.persistTransition("q26-pin", {
+			claimId: owner.claim.claimId,
+			from: "seed_prepared",
+			to: "dispatching",
+			leaseEpoch: lease.claim.preSendLease?.epoch ?? "",
+			seed: { ...seed, phase: "dispatching" },
+		});
+		await store.releaseOwner("q26-pin");
+		const seenPins: (undefined | { endpointGeneration: number; pid: number })[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				verify: async () => "verified" as const,
+				close: async () => ({ ok: true }),
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async () => ({ ok: false as const }),
+				dispatch: async () => ({ kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 }),
+				reconcile: async input => {
+					seenPins.push(input.pinned);
+					// Answer for a DIFFERENT correlation than the stored ref.
+					return {
+						status: "terminal_ok" as const,
+						clientRef: "wrong-client-ref",
+						commandId: "foreign-command",
+						turnId: "foreign-turn",
+					};
+				},
+			},
+		});
+		await broker.start();
+		try {
+			// The replay must carry the durable endpoint pin.
+			expect(seenPins.length).toBeGreaterThan(0);
+			expect(seenPins[0]).toMatchObject({ endpointGeneration: 4, pid: 978 });
+			// A mismatched echoed clientRef must not bind foreign facts.
+			const after = new SpawnAuthorityStore(agentDir, brokerKey);
+			await after.open();
+			const claim = after.claim("q26-pin");
+			expect(claim?.state).not.toBe("accepted");
+			expect(JSON.stringify(claim)).not.toContain("foreign-command");
+			expect(JSON.stringify(claim)).not.toContain("foreign-turn");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("fails a pre-pin legacy authority row closed instead of matching by session id", async () => {
+		const agentDir = await temp();
+		const brokerKey = await getBrokerIdentityKey(agentDir);
+		const store = new SpawnAuthorityStore(agentDir, brokerKey);
+		await store.open();
+		const mac = "f".repeat(64);
+		const owner = await store.claimOrJoin("legacy-pin", mac);
+		if (owner.kind !== "owner") throw new Error("expected owner");
+		await store.persistTransition("legacy-pin", {
+			claimId: owner.claim.claimId,
+			from: "prepared",
+			to: "substrate_starting",
+			childId: "child-legacy",
+		});
+		const at = Date.now();
+		// A row written before the endpoint pin existed: it must still REOPEN
+		// (no whole-journal rejection) but must never recover by id alone.
+		await store.persistTransition("legacy-pin", {
+			claimId: owner.claim.claimId,
+			from: "substrate_starting",
+			to: "authority_active",
+			childId: "child-legacy",
+			authority: {
+				version: 1,
+				authorityId: "authority-legacy",
+				claimId: owner.claim.claimId,
+				childId: "child-legacy",
+				ownerSessionId: "master-flow",
+				lifecycleIdentity: "legacy-pin",
+				substrateKind: "headless",
+				providerIdentity: "p",
+				pid: 979,
+				processIncarnation: "inc-979",
+				closeState: "active",
+				createdAt: at,
+				updatedAt: at,
+			},
+		});
+		const reopened = new SpawnAuthorityStore(agentDir, brokerKey);
+		await reopened.open();
+		expect(reopened.claim("legacy-pin")?.state).toBe("authority_active");
+		expect(reopened.authority("legacy-pin")?.endpointGeneration).toBeUndefined();
+		await store.releaseOwner("legacy-pin");
+		let dispatches = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				verify: async () => "verified" as const,
+				close: async () => ({ ok: true }),
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async () => ({ ok: false as const }),
+				dispatch: async () => {
+					dispatches += 1;
+					return { kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 };
+				},
+				reconcile: async () => ({ status: "terminal_ok" as const, commandId: "c", turnId: "t" }),
+			},
+		});
+		await broker.start();
+		try {
+			const after = new SpawnAuthorityStore(agentDir, brokerKey);
+			await after.open();
+			expect(after.claim("legacy-pin")?.state).toBe("uncertain");
+			expect(dispatches).toBe(0);
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("refuses to seed a substrate that cannot be re-proven after restart", async () => {
 		const agentDir = await temp();
 		const brokerKey = await getBrokerIdentityKey(agentDir);
@@ -439,6 +629,9 @@ describe("Broker spawn flow driver", () => {
 				providerIdentity: "flow-provider",
 				pid: 994,
 				processIncarnation: "inc-994",
+				endpointGeneration: 1,
+				endpointPid: 994,
+				endpointIncarnation: "inc-994",
 				closeState: "active",
 				createdAt: at,
 				updatedAt: at,
@@ -522,6 +715,10 @@ describe("Broker spawn flow driver", () => {
 				providerIdentity: "flow-provider",
 				pid: 996,
 				processIncarnation: "inc-996",
+				// Endpoint identity proven at registration; recovery re-pins from it.
+				endpointGeneration: 1,
+				endpointPid: 996,
+				endpointIncarnation: "inc-996",
 				closeState: "active",
 				createdAt: authorityNow,
 				updatedAt: authorityNow,
@@ -651,6 +848,117 @@ describe("Broker spawn close and orphan reaper", () => {
 			const claim = store.claims().find(candidate => candidate.childId === childId);
 			expect(claim?.state).toBe("closed");
 			expect(store.authority(claim?.lifecycleIdentity ?? "")?.closeState).toBe("closed");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("closes the launched substrate on every post-launch failure exit", async () => {
+		// The registration-failure BRANCH is not the only post-launch exit: a throw
+		// from awaitRegistration, verify, or a durable transition all leak the same
+		// substrate, and none of them persists an authority row for the reaper.
+		const exits = [
+			{ name: "awaitRegistration throws", registration: "throw" as const },
+			{ name: "awaitRegistration returns false", registration: "false" as const },
+		];
+		for (const exit of exits) {
+			const agentDir = await temp();
+			let closes = 0;
+			const broker = new Broker({
+				agentDir,
+				masterCapabilityVerifier: verifier,
+				spawnSubstrateProvider: {
+					launch: async () => ({
+						ok: true as const,
+						proof: { substrateKind: "headless" as const, providerIdentity: "leak-p", pid: 981, processIncarnation: "inc-981" },
+					}),
+					verify: async () => "verified" as const,
+					close: async () => {
+						closes += 1;
+						return { ok: true };
+					},
+				},
+				spawnPromptLayer: {
+					awaitRegistration: async () => {
+						if (exit.registration === "throw") throw new Error("registration transport failed");
+						return { ok: false as const };
+					},
+					dispatch: async () => ({ kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 }),
+					reconcile: async () => ({ status: "unknown" as const }),
+				},
+			});
+			await broker.start();
+			try {
+				const response = await broker.handleRequest("session.spawn", spawnInput(), `exit-${exit.registration}`);
+				expect(response, exit.name).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+				expect(closes, exit.name).toBe(1);
+			} finally {
+				await broker.stop();
+			}
+		}
+	});
+
+	it("retains uncertainty when a recovery verify throws instead of answering", async () => {
+		const agentDir = await temp();
+		const brokerKey = await getBrokerIdentityKey(agentDir);
+		const store = new SpawnAuthorityStore(agentDir, brokerKey);
+		await store.open();
+		const mac = "e".repeat(64);
+		const owner = await store.claimOrJoin("recover-throw", mac);
+		if (owner.kind !== "owner") throw new Error("expected owner");
+		await store.persistTransition("recover-throw", {
+			claimId: owner.claim.claimId,
+			from: "prepared",
+			to: "substrate_starting",
+			childId: "child-throw",
+		});
+		const at = Date.now();
+		await store.persistTransition("recover-throw", {
+			claimId: owner.claim.claimId,
+			from: "substrate_starting",
+			to: "authority_active",
+			childId: "child-throw",
+			authority: {
+				version: 1,
+				authorityId: "authority-throw",
+				claimId: owner.claim.claimId,
+				childId: "child-throw",
+				ownerSessionId: "master-flow",
+				lifecycleIdentity: "recover-throw",
+				substrateKind: "headless",
+				providerIdentity: "p",
+				pid: 982,
+				processIncarnation: "inc-982",
+				endpointGeneration: 1,
+				endpointPid: 982,
+				closeState: "active",
+				createdAt: at,
+				updatedAt: at,
+			},
+		});
+		await store.releaseOwner("recover-throw");
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				verify: async () => {
+					throw new Error("verify transport failed");
+				},
+				close: async () => ({ ok: true }),
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async () => ({ ok: false as const }),
+				dispatch: async () => ({ kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 }),
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		await broker.start();
+		try {
+			// A thrown verify is not evidence of a healthy substrate.
+			const reopened = new SpawnAuthorityStore(agentDir, brokerKey);
+			await reopened.open();
+			expect(reopened.claim("recover-throw")?.state).toBe("uncertain");
 		} finally {
 			await broker.stop();
 		}

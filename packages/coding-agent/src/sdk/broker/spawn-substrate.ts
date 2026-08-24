@@ -73,6 +73,11 @@ function isNonEmptyString(value: unknown): value is string {
 	return typeof value === "string" && value.length > 0 && value.length <= 4096;
 }
 
+/** An environment VALUE may be empty but is still length-bounded. */
+function isBoundedString(value: unknown): value is string {
+	return typeof value === "string" && value.length <= 4096;
+}
+
 function isPositiveInteger(value: unknown): value is number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
 }
@@ -98,8 +103,7 @@ function validLaunchSpec(spec: SpawnSubstrateLaunchSpec, platform: NodeJS.Platfo
 			// Requiring a non-empty value rejected ordinary inherited environments
 			// and failed every spawn before launch.
 			Object.entries(spec.env).every(
-				([name, value]) =>
-					/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && typeof value === "string" && !value.includes("\0"),
+				([name, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && isBoundedString(value) && !value.includes("\0"),
 			))
 	);
 }

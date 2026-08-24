@@ -93,6 +93,16 @@ export type SpawnAuthorityV1 = {
 	processIncarnation?: string;
 	ownerGeneration?: number;
 	stateFileProof?: Readonly<Record<string, string | number>>;
+	/**
+	 * Identity of the child HOST endpoint proven at registration. Distinct from
+	 * the substrate `pid`/`processIncarnation` above: proving the multiplexer
+	 * substrate is intact says nothing about which host answers on that session
+	 * id. Optional so pre-pin v1 rows still reopen; recovery treats an absent
+	 * pin as missing authority and fails closed rather than matching by id.
+	 */
+	endpointGeneration?: number;
+	endpointPid?: number;
+	endpointIncarnation?: string;
 	closeState: SpawnAuthorityCloseState;
 	orphanedAt?: number;
 	orphanRecoveredAt?: number;
@@ -155,6 +165,8 @@ export interface SpawnAuthorityStoreOptions {
 	beforeSyncForTest?: (write: SpawnAuthorityDurableWrite) => Promise<void> | void;
 	/** Test-only hook after both file and parent-directory fsync complete. */
 	afterSyncForTest?: (write: SpawnAuthorityDurableWrite) => Promise<void> | void;
+	/** Test-only hook between the file barrier and the parent-directory barrier. */
+	beforeDirectorySyncForTest?: (write: SpawnAuthorityDurableWrite) => Promise<void> | void;
 }
 
 const CLAIM_STATES = new Set<SpawnClaimV2["state"]>([
@@ -220,6 +232,9 @@ const AUTHORITY_KEYS = new Set([
 	"processIncarnation",
 	"ownerGeneration",
 	"stateFileProof",
+	"endpointGeneration",
+	"endpointPid",
+	"endpointIncarnation",
 	"closeState",
 	"orphanedAt",
 	"orphanRecoveredAt",
@@ -351,6 +366,9 @@ export function isSpawnAuthorityV1(value: unknown): value is SpawnAuthorityV1 {
 		typeof authority.substrateKind === "string" &&
 		SUBSTRATE_KINDS.has(authority.substrateKind as SpawnSubstrateProof["substrateKind"]) &&
 		isOpaque(authority.providerIdentity) &&
+		(authority.endpointGeneration === undefined || isNonNegativeInteger(authority.endpointGeneration)) &&
+		(authority.endpointPid === undefined || isPositiveInteger(authority.endpointPid)) &&
+		(authority.endpointIncarnation === undefined || isOpaque(authority.endpointIncarnation)) &&
 		(authority.nativeSessionId === undefined || isOpaque(authority.nativeSessionId)) &&
 		(authority.pid === undefined || isPositiveInteger(authority.pid)) &&
 		(authority.processIncarnation === undefined || isOpaque(authority.processIncarnation)) &&
@@ -849,28 +867,39 @@ export class SpawnAuthorityStore {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
 		const handle = await fs.open(this.#file, fsSync.constants.O_WRONLY | fsSync.constants.O_APPEND | fsSync.constants.O_CREAT, 0o600);
+		let rollbackFailed = false;
 		try {
 			try {
 				await handle.writeFile(`${canonicalJson(row)}\n`);
 				await this.#options.beforeSyncForTest?.(write);
 				await handle.sync();
+				// The parent-directory barrier belongs INSIDE the rolled-back region:
+				// a throw here would otherwise leave a durable row that in-memory
+				// state never accepted, and the retry would append a duplicate that
+				// makes the journal unreopenable.
+				await this.#options.beforeDirectorySyncForTest?.(write);
+				const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
+				try {
+					await directory.sync();
+				} finally {
+					await directory.close();
+				}
 			} catch (error) {
 				try {
 					await handle.truncate(priorSize);
 					await handle.sync();
 				} catch {
-					// Rollback is best effort; the original fault is the reportable one.
+					// A failed rollback may leave a partial row behind. Surface that
+					// instead of reporting only the original fault, because the journal
+					// can no longer be assumed clean.
+					rollbackFailed = true;
 				}
+				if (rollbackFailed)
+					throw new Error("Spawn authority journal append failed and its rollback could not be completed.");
 				throw error;
 			}
 		} finally {
 			await handle.close();
-		}
-		const directory = await fs.open(path.dirname(this.#file), fsSync.constants.O_RDONLY);
-		try {
-			await directory.sync();
-		} finally {
-			await directory.close();
 		}
 		this.#latest.set(claim.lifecycleIdentity, claim);
 		if (authority) this.#authorities.set(claim.lifecycleIdentity, authority);

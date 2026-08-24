@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import type { NativeDirectoryTreeSnapshot } from "@gajae-code/natives";
-import { logger } from "@gajae-code/utils";
+import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import type { ModelProfileErrorDetails } from "../../config/model-profile-contract";
 import { planLaunchWorktree } from "../../gjc-runtime/launch-worktree";
 import { createDefaultSdkHostModelResolver, type SdkHostModelResolver } from "../host/model-pin";
@@ -414,6 +414,20 @@ const SPAWN_HOST_REGISTRATION_TIMEOUT_MS = 10_000;
 const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
+
+/**
+ * Rebuilds the proven child-endpoint pin from durable authority. Returns
+ * undefined for a pre-pin row, which recovery must treat as missing authority.
+ */
+function spawnPinFromAuthority(authority: SpawnAuthorityV1): SpawnHostRegistration | undefined {
+	if (authority.endpointGeneration === undefined || authority.endpointPid === undefined) return undefined;
+	return {
+		sessionId: authority.childId,
+		endpointGeneration: authority.endpointGeneration,
+		pid: authority.endpointPid,
+		...(authority.endpointIncarnation === undefined ? {} : { processIncarnation: authority.endpointIncarnation }),
+	};
+}
 
 /** Rebuilds the provider proof from durable authority facts only. */
 function spawnProofFromAuthority(authority: SpawnAuthorityV1): SpawnSubstrateProof {
@@ -1275,16 +1289,8 @@ export class Broker {
 					stateRoot: prep.stateRoot,
 				});
 				if (!registration.ok) {
-					// No authority row is ever persisted on this path, so the reaper can
-					// never see this substrate. Close it here against its exact proof
-					// instead of leaking a live child forever.
-					if (launchedProof && (await provider.verify(launchedProof)) === "verified") {
-						try {
-							await provider.close(launchedProof);
-						} catch {
-							// Close is best effort; the claim still records uncertainty below.
-						}
-					}
+					await this.#releaseUnownedSubstrate(provider, launchedProof);
+					launchedProof = undefined;
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
@@ -1311,6 +1317,11 @@ export class Broker {
 					...(proof.processIncarnation === undefined ? {} : { processIncarnation: proof.processIncarnation }),
 					...(proof.ownerGeneration === undefined ? {} : { ownerGeneration: proof.ownerGeneration }),
 					...(proof.stateFileProof === undefined ? {} : { stateFileProof: proof.stateFileProof }),
+					endpointGeneration: registration.registration.endpointGeneration,
+					endpointPid: registration.registration.pid,
+					...(registration.registration.processIncarnation === undefined
+						? {}
+						: { endpointIncarnation: registration.registration.processIncarnation }),
 					closeState: "active",
 					createdAt: now,
 					updatedAt: now,
@@ -1350,7 +1361,16 @@ export class Broker {
 			if (recovered) {
 				const recoveredAuthority = store.authority(lifecycleIdentity);
 				if (!recoveredAuthority) return error("terminal_uncertain", "session.spawn authority is unavailable after restart");
-				const verdict = await provider.verify(spawnProofFromAuthority(recoveredAuthority));
+				// A recovery owner has no in-process pin, so it must come from durable
+				// authority. An absent pin is missing evidence, not permission to
+				// match on session id alone.
+				pinnedRegistration = spawnPinFromAuthority(recoveredAuthority);
+				let verdict: "verified" | "mismatch" | "gone";
+				try {
+					verdict = pinnedRegistration === undefined ? "gone" : await provider.verify(spawnProofFromAuthority(recoveredAuthority));
+				} catch {
+					verdict = "gone";
+				}
 				if (verdict !== "verified") {
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
@@ -1430,9 +1450,44 @@ export class Broker {
 		} catch {
 			// Once a substrate exists the outcome is ambiguous even before handoff:
 			// reporting an ordinary failure would downgrade retained uncertainty.
-			return handedOff || launchedProof
+			const ambiguous = handedOff || launchedProof !== undefined;
+			// A launched substrate with no persisted authority is invisible to the
+			// reaper, so in-process cleanup is its only chance. This must run on
+			// EVERY post-launch failure exit, not just a returned registration
+			// failure: a throw from awaitRegistration, verify, close, or a durable
+			// transition all land here.
+			if (!handedOff) await this.#releaseUnownedSubstrate(provider, launchedProof);
+			return ambiguous
 				? error("terminal_uncertain", "session.spawn state could not be advanced durably")
 				: error("spawn_failed", "session.spawn could not be advanced durably");
+		}
+	}
+
+	/**
+	 * Closes a substrate that was launched but never got a durable authority row.
+	 * The orphan reaper iterates authorities, so such a substrate has no durable
+	 * owner and would leak forever. `verify` and `close` are each contained: a
+	 * throw or a falsy close result must not skip the remaining work or escape.
+	 */
+	async #releaseUnownedSubstrate(
+		provider: SpawnSubstrateProvider,
+		proof: SpawnSubstrateProof | undefined,
+	): Promise<void> {
+		if (!proof) return;
+		let verdict: "verified" | "mismatch" | "gone";
+		try {
+			verdict = await provider.verify(proof);
+		} catch {
+			// An unprovable substrate is never mutated; uncertainty is retained by
+			// the caller's durable transition instead.
+			return;
+		}
+		if (verdict !== "verified") return;
+		try {
+			await provider.close(proof);
+		} catch {
+			// The substrate may survive. The caller still records uncertainty, which
+			// is the honest durable outcome for an unclosed unowned substrate.
 		}
 	}
 
@@ -1462,8 +1517,22 @@ export class Broker {
 			const childId = claim.childId;
 			const seed = claim.seed;
 			if (!childId || !seed) return error("terminal_uncertain", "session.spawn dispatch facts are unavailable");
-			const q26 = await this.#spawnPromptLayer.reconcile({ sessionId: childId, clientRef: seed.clientRef });
+			// Q26 replay must talk to the proven endpoint, not any live row with this
+			// session id: a foreign same-id host could otherwise answer and have its
+			// command/turn facts persisted as this claim's acceptance.
+			const replayAuthority = store.authority(lifecycleIdentity);
+			const replayPin = replayAuthority ? spawnPinFromAuthority(replayAuthority) : undefined;
+			if (!replayPin) return error("terminal_uncertain", "session.spawn endpoint authority is unavailable for replay");
+			const q26 = await this.#spawnPromptLayer.reconcile({
+				sessionId: childId,
+				clientRef: seed.clientRef,
+				pinned: replayPin,
+			});
+			// A present-but-unequal clientRef means the responder answered for another
+			// correlation; binding its facts would falsify this claim's acceptance.
+			const refMismatch = q26.clientRef !== undefined && q26.clientRef !== seed.clientRef;
 			if (
+				!refMismatch &&
 				(q26.status === "accepted" || q26.status === "in_flight" || q26.status === "terminal_ok") &&
 				q26.commandId !== undefined &&
 				q26.turnId !== undefined
@@ -1488,7 +1557,7 @@ export class Broker {
 					return error("terminal_uncertain", "session.spawn replay could not be advanced durably");
 				}
 			}
-			if (q26.status === "failed") {
+			if (!refMismatch && q26.status === "failed") {
 				try {
 					await store.persistSeedObservation(lifecycleIdentity, {
 						...seed,
@@ -1541,9 +1610,21 @@ export class Broker {
 					// advance this claim; otherwise it retains uncertainty rather than
 					// letting a later recovery owner prompt a replaced substrate.
 					const authorityRecord = store.authority(claim.lifecycleIdentity);
-					const verdict = authorityRecord
-						? await this.#spawnSubstrateProvider().verify(spawnProofFromAuthority(authorityRecord))
-						: "gone";
+					// A thrown verify is not evidence of a healthy substrate. Treat it
+					// exactly like `gone`, so the claim retains uncertainty instead of
+					// staying authority_active and later answering spawn_in_progress.
+					let verdict: "verified" | "mismatch" | "gone" = "gone";
+					// A row written before the endpoint pin existed carries no proof of
+					// WHICH host answers on this session id. That is missing authority,
+					// so the claim fails closed here rather than becoming eligible for a
+					// recovery lease that would match by session id alone.
+					if (authorityRecord && spawnPinFromAuthority(authorityRecord)) {
+						try {
+							verdict = await this.#spawnSubstrateProvider().verify(spawnProofFromAuthority(authorityRecord));
+						} catch {
+							verdict = "gone";
+						}
+					}
 					if (verdict !== "verified") {
 						await store.persistTransition(claim.lifecycleIdentity, {
 							claimId: claim.claimId,
@@ -1587,8 +1668,13 @@ export class Broker {
 							candidate.live &&
 							!candidate.terminal &&
 							!candidate.terminalUncertain &&
-							path.resolve(candidate.locator.cwd) === path.resolve(input.cwd) &&
-							path.resolve(candidate.locator.stateRoot) === path.resolve(input.stateRoot),
+							// Path IDENTITY, not spelling. The child publishes a
+							// realpath-canonicalized locator while the launch spec carries the
+							// caller's lexical path, so `path.resolve` never reconciles a
+							// symlinked workspace (macOS /var vs /private/var) and a
+							// legitimate child would never match.
+							resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.cwd) &&
+							resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(input.stateRoot),
 					);
 				if (row) {
 					const incarnation = row.hostIncarnation ?? row.processIncarnation;

@@ -18,7 +18,11 @@ describe("observed request redaction", () => {
 			operation: "turn.prompt",
 			input: { text: "seed-task-plaintext", clientRef: "ref-1" },
 		};
-		const observed = redactObservedRequestContent(frame) as { input: Record<string, unknown> };
+		const observed = redactObservedRequestContent(frame) as {
+			input: Record<string, unknown>;
+			operation: string;
+			id: string;
+		};
 		expect(JSON.stringify(observed)).not.toContain("seed-task-plaintext");
 		expect(observed.input.text).toBe("[redacted 19 chars]");
 		expect(observed.input.clientRef).toBe("ref-1");

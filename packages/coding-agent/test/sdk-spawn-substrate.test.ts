@@ -88,6 +88,11 @@ describe("Broker spawn substrate provider", () => {
 		expect(badName).toMatchObject({ ok: false, code: "substrate_proof_failed" });
 		const nulValue = await provider.launch({ ...launchSpec(), env: { OK_NAME: "a\u0000b" } });
 		expect(nulValue).toMatchObject({ ok: false, code: "substrate_proof_failed" });
+		// Allowing an empty value must not drop the length bound.
+		const atBound = await provider.launch({ ...launchSpec(), env: { OK_NAME: "x".repeat(4096) } });
+		expect(atBound).toMatchObject({ ok: true });
+		const oversized = await provider.launch({ ...launchSpec(), env: { OK_NAME: "x".repeat(4097) } });
+		expect(oversized).toMatchObject({ ok: false, code: "substrate_proof_failed" });
 	});
 
 	it("uses the psmux substrate kind only for the Windows multiplexer selection", async () => {
