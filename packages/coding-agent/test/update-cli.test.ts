@@ -172,6 +172,9 @@ describe("update-cli binary release assets", () => {
 			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-windows-x64.exe",
 		);
 	});
+	it("rejects Windows ARM64 because no release asset exists", () => {
+		expect(() => buildReleaseBinaryUrlForTest("0.2.3", "win32", "arm64")).toThrow("Unsupported architecture: arm64");
+	});
 
 	it("reports actionable Unix manual update commands for unsupported fallback paths", () => {
 		const instructions = formatManualUpdateInstructionsForTest("linux");

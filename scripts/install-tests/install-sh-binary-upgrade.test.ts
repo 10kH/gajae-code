@@ -204,6 +204,7 @@ describe("install.sh binary-first contract", () => {
 		const root = await Bun.file(rootInstallScript).text();
 		expect(root).toContain("scripts/install.sh");
 		expect(root).toContain("https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh");
+		expect(root).not.toContain("exec sh \"$TMP\"");
 		const binaryName = hostBinaryName();
 		const payload = fakeGjcScript({ version: VERSION });
 		writeCurlShim(sandbox.shimDir, {
@@ -368,6 +369,8 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain("${LOCK_DIR}/pid");
 		expect(installer).toContain("Failed to publish the downloaded binary");
 		expect(installer).toContain("exit 130");
+		expect(installer).toContain("Unsupported libc: musl");
+		expect(installer).toContain("SOURCE_CLONE_DIR");
 	});
 
 	test("rejects unofficial GitHub origin overrides", async () => {

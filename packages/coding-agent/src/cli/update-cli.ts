@@ -405,6 +405,9 @@ function getBinaryName(platform: NodeJS.Platform = process.platform, arch: strin
 	}
 
 	if (os === "windows") {
+		if (archName !== "x64") {
+			throw new Error(formatUnsupportedTargetMessage(`Unsupported architecture: ${arch}`));
+		}
 		return `${APP_NAME}-${os}-${archName}.exe`;
 	}
 	return `${APP_NAME}-${os}-${archName}`;
@@ -749,12 +752,16 @@ async function downloadBinaryTo(
 			),
 		);
 	}
-	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
-	await pipeline(response.body, fileStream);
-	const stat = await fs.promises.stat(tempPath);
-	if (stat.size <= 0) {
+	try {
+		const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
+		await pipeline(response.body, fileStream);
+		const stat = await fs.promises.stat(tempPath);
+		if (stat.size <= 0) {
+			throw new Error(`Downloaded file was empty: ${url}`);
+		}
+	} catch (err) {
 		await unlinkIfExists(tempPath);
-		throw new Error(`Downloaded file was empty: ${url}`);
+		throw err;
 	}
 	if (expectedVersion) {
 		const tag = expectedVersion.startsWith("v") ? expectedVersion : `v${expectedVersion}`;

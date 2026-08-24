@@ -25,4 +25,8 @@ case "$first_line" in
         exit 1
         ;;
 esac
-exec sh "$TMP" "$@"
+sh "$TMP" "$@"
+status=$?
+rm -f "$TMP"
+trap - EXIT
+exit "$status"

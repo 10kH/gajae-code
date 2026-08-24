@@ -33,6 +33,7 @@ TMP_FILES=""
 LOCK_DIR=""
 BACKUP_PATH=""
 DEST_PATH=""
+SOURCE_CLONE_DIR=""
 
 usage() {
     cat <<'EOF'
@@ -72,6 +73,9 @@ cleanup() {
     if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
         rm -f "${LOCK_DIR}/pid"
         rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+    if [ -n "$SOURCE_CLONE_DIR" ] && [ -d "$SOURCE_CLONE_DIR" ]; then
+        rm -rf "$SOURCE_CLONE_DIR"
     fi
     return 0
 }
@@ -295,7 +299,12 @@ detect_platform() {
     ARCH="$(uname -m)"
 
     case "$OS" in
-        Linux)  PLATFORM="linux" ;;
+        Linux)
+            PLATFORM="linux"
+            if ldd /bin/sh 2>/dev/null | grep -q musl; then
+                die "Unsupported libc: musl. Prebuilt Linux binaries are glibc-only. See docs/install.md."
+            fi
+            ;;
         Darwin) PLATFORM="darwin" ;;
         *)      die "Unsupported OS: $OS. Prebuilt binaries exist for Linux and macOS. See docs/install.md." ;;
     esac
@@ -465,8 +474,7 @@ install_via_bun() {
         fi
 
         TMP_DIR="$(mktemp -d)"
-        remember_tmp ""
-        # TMP_DIR is a directory; cleaned below.
+        SOURCE_CLONE_DIR="$TMP_DIR"
         SOURCE_TMP="$TMP_DIR"
 
         if git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$TMP_DIR" >/dev/null 2>&1; then
