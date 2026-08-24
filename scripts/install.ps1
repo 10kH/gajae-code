@@ -522,7 +522,12 @@ function Install-Binary {
     $DownloadTmp = Join-Path $InstallDir (".gjc.download." + [System.Guid]::NewGuid().ToString("N"))
     $BackupPath = Join-Path $InstallDir (".gjc.bak." + [System.Guid]::NewGuid().ToString("N"))
     $existing = Get-Item -LiteralPath $OutPath -Force -ErrorAction SilentlyContinue
-    if ($existing -and $existing.LinkType) {
+    $isReparse = $false
+    if ($existing) {
+        $isReparse = [bool]($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+        if (-not $isReparse -and $existing.LinkType) { $isReparse = $true }
+    }
+    if ($isReparse) {
         throw "Refusing to replace symlink $OutPath with a regular binary. Remove the symlink or set GJC_INSTALL_DIR."
     }
     $hadExisting = [bool]$existing

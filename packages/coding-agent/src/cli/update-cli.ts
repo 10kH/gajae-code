@@ -682,6 +682,7 @@ async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
 export async function replaceBinaryForUpdate(options: BinaryReplacementOptions): Promise<InstalledVersionVerification> {
 	let backupReady = false;
 	let published = false;
+	let stagedNext = false;
 	const journalPath = `${options.targetPath}.update-journal`;
 	try {
 		if (process.platform === "win32") {
@@ -718,6 +719,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 					backupReady = false;
 				} else {
 					await fs.promises.copyFile(options.tempPath, nextPath);
+					stagedNext = true;
 					throw new Error(
 						`Running Windows image ${options.targetPath} could not be replaced in-process (${err}). Staged ${nextPath}. Close running gjc.exe and re-run gjc update.`,
 					);
@@ -753,7 +755,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 			await unlinkIfExists(options.targetPath);
 		}
 		await unlinkIfExists(options.tempPath);
-		if (process.platform === "win32") await unlinkIfExists(journalPath);
+		if (process.platform === "win32" && !stagedNext) await unlinkIfExists(journalPath);
 		throw err;
 	}
 }

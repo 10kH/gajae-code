@@ -50,6 +50,7 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).toContain("Assert-OfficialGithubOrigins");
 		expect(installer).toContain("FileMode]::CreateNew");
 		expect(installer).toContain("Refusing to replace symlink");
+		expect(installer).toContain("FileAttributes]::ReparsePoint");
 		expect(installer).toContain("Copy-Item -Force -LiteralPath $OutPath");
 		expect(installer).toContain('throw "Unsupported architecture: x86');
 		expect(installer).toContain("PROCESSOR_ARCHITEW6432");

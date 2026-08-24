@@ -368,6 +368,8 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain("require_official_github_origins");
 		expect(installer).toContain("try_publish_lock_file");
 		expect(installer).toContain("set -C");
+		expect(installer).toContain("exclusive_tmp");
+		expect(installer).toContain("mktemp");
 		expect(installer).not.toContain('Authorization: Bearer ${token}');
 		expect(installer).toContain('-H "@${AUTH_HDR}"');
 		expect(installer).toContain("prepare_github_auth_header");

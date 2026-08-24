@@ -95,6 +95,18 @@ remember_tmp() {
     TMP_FILES="${TMP_FILES}$1
 "
 }
+exclusive_tmp() {
+    prefix="$1"
+    dir="${2:-$INSTALL_DIR}"
+    mkdir -p "$dir"
+    LAST_EXCLUSIVE_TMP=$(mktemp "${dir}/${prefix}.XXXXXX")
+    if [ -h "$LAST_EXCLUSIVE_TMP" ]; then
+        rm -f "$LAST_EXCLUSIVE_TMP"
+        die "Refusing to write through a symlink at $LAST_EXCLUSIVE_TMP"
+    fi
+    remember_tmp "$LAST_EXCLUSIVE_TMP"
+}
+
 
 is_safe_tag() {
     case "$1" in
@@ -160,8 +172,8 @@ require_official_github_origins() {
 
 prepare_github_auth_header() {
     token="$1"
-    AUTH_HDR="${TMPDIR:-/tmp}/.gjc.curlhdr.$$"
-    remember_tmp "$AUTH_HDR"
+    exclusive_tmp "gjc.curlhdr" "${TMPDIR:-/tmp}"
+    AUTH_HDR="$LAST_EXCLUSIVE_TMP"
     old_umask=$(umask)
     umask 077
     printf 'Authorization: Bearer %s\n' "$token" > "$AUTH_HDR"
@@ -391,8 +403,8 @@ acquire_lock() {
 }
 
 resolve_release_tag() {
-    json_tmp="${INSTALL_DIR}/.gjc-release.$$.json"
-    remember_tmp "$json_tmp"
+    exclusive_tmp "gjc-release"
+    json_tmp="$LAST_EXCLUSIVE_TMP"
 
     if [ -n "$REF" ]; then
         is_release_tag "$REF" || die "Invalid --ref '$REF'. Expected a GitHub release tag like v0.15.0 or v0.15.0-nightly.1.1.gabc."
@@ -433,10 +445,10 @@ For branch/commit source installs, re-run with --source --ref <git-ref> and an e
 verify_checksum() {
     asset_name="$1"
     downloaded="$2"
-    sums_tmp="${INSTALL_DIR}/.gjc.sha256.$$"
-    manifest_tmp="${INSTALL_DIR}/.gjc.manifest.$$"
-    remember_tmp "$sums_tmp"
-    remember_tmp "$manifest_tmp"
+    exclusive_tmp "gjc.sha256"
+    sums_tmp="$LAST_EXCLUSIVE_TMP"
+    exclusive_tmp "gjc.manifest"
+    manifest_tmp="$LAST_EXCLUSIVE_TMP"
     sums_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_SHA256_ASSET}"
     http_code=$(curl_github_optional "$sums_url" "$sums_tmp") || die "Failed to fetch integrity asset $sums_url. Existing install was not changed."
     if [ "$http_code" = "200" ]; then
@@ -570,9 +582,10 @@ install_binary() {
     resolve_release_tag
 
     DEST_PATH="${INSTALL_DIR}/gjc"
-    DOWNLOAD_TMP="${INSTALL_DIR}/.gjc.download.$$"
-    BACKUP_PATH="${INSTALL_DIR}/.gjc.bak.$$"
-    remember_tmp "$DOWNLOAD_TMP"
+    exclusive_tmp "gjc.download"
+    DOWNLOAD_TMP="$LAST_EXCLUSIVE_TMP"
+    exclusive_tmp "gjc.bak"
+    BACKUP_PATH="$LAST_EXCLUSIVE_TMP"
 
     BINARY_URL="${GITHUB_RELEASES}/${LATEST}/${BINARY}"
     echo "Downloading ${BINARY}..."
