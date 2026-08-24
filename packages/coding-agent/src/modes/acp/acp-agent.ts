@@ -1663,6 +1663,10 @@ export class AcpAgent implements Agent {
 		try {
 			await record.adapter.ensureProviders();
 		} catch (error) {
+			if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+				if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+				return await response;
+			}
 			if (record.activePrompt === waiter) record.activePrompt = undefined;
 			throw error;
 		}
