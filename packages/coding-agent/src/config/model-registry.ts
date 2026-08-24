@@ -1486,6 +1486,7 @@ export class ModelRegistry {
 				void this.#enqueueCatalogMutation(() => {
 					if (this.#disposed) return;
 					this.#reloadStaticModels();
+					this.#modelBindingsApplier.apply();
 					this.#notifyCatalogChanged();
 				}).catch(() => undefined);
 			},
