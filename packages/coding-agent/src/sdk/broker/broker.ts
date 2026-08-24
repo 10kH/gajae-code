@@ -322,8 +322,18 @@ export interface SpawnPromptLayer {
 		cwd: string;
 		stateRoot: string;
 	}): Promise<{ ok: true; registration: SpawnHostRegistration } | { ok: false }>;
-	dispatch(input: { sessionId: string; task: string; clientRef: string }): Promise<SpawnPromptDispatch>;
-	reconcile(input: { sessionId: string; clientRef: string }): Promise<SpawnQ26Reconciliation>;
+	dispatch(input: {
+		sessionId: string;
+		task: string;
+		clientRef: string;
+		/** Endpoint identity proven at registration; implementations must not talk to another endpoint. */
+		pinned?: SpawnHostRegistration;
+	}): Promise<SpawnPromptDispatch>;
+	reconcile(input: {
+		sessionId: string;
+		clientRef: string;
+		pinned?: SpawnHostRegistration;
+	}): Promise<SpawnQ26Reconciliation>;
 }
 
 type SpawnAdmissionInput = {
@@ -1211,6 +1221,7 @@ export class Broker {
 		// Set the moment a substrate exists. After this point a failure is
 		// ambiguous, never an ordinary pre-effect failure.
 		let launchedProof: SpawnSubstrateProof | undefined;
+		let pinnedRegistration: SpawnHostRegistration | undefined;
 		try {
 			if (current.state === "prepared") {
 				const prep = prepareSpawnChildHostLaunch(this, {
@@ -1269,6 +1280,7 @@ export class Broker {
 					).claim;
 					return error("terminal_uncertain", "session.spawn child registration is uncertain");
 				}
+				pinnedRegistration = registration.registration;
 				const now = Date.now();
 				const proof = launched.proof;
 				const authorityRecord: SpawnAuthorityV1 = {
@@ -1355,6 +1367,7 @@ export class Broker {
 				sessionId: childId,
 				task: admission.task,
 				clientRef: preparedSeed.clientRef,
+				...(pinnedRegistration === undefined ? {} : { pinned: pinnedRegistration }),
 			});
 			if (dispatched.kind === "accepted") {
 				current = (
@@ -1549,6 +1562,8 @@ export class Broker {
 		for (;;) {
 			try {
 				await this.index.refresh();
+				// The launch locator is authority: a same-id row registered by an
+				// unrelated workspace must never be adopted as this spawn's child.
 				const row = this.index
 					.listSessionIdentities()
 					.find(
@@ -1557,7 +1572,9 @@ export class Broker {
 							candidate.endpointGeneration > 0 &&
 							candidate.live &&
 							!candidate.terminal &&
-							!candidate.terminalUncertain,
+							!candidate.terminalUncertain &&
+							path.resolve(candidate.locator.cwd) === path.resolve(input.cwd) &&
+							path.resolve(candidate.locator.stateRoot) === path.resolve(input.stateRoot),
 					);
 				if (row) {
 					const incarnation = row.hostIncarnation ?? row.processIncarnation;
@@ -1582,6 +1599,8 @@ export class Broker {
 	/** One nonce-correlated frame exchange over a child host's authenticated endpoint. */
 	async #spawnChildExchange(input: {
 		sessionId: string;
+		/** Endpoint identity captured at registration; the exchange refuses to talk to anything else. */
+		pinned?: SpawnHostRegistration;
 		frame: (id: string) => Record<string, unknown>;
 		responseType: string;
 		timeoutMs: number;
@@ -1597,7 +1616,15 @@ export class Broker {
 						candidate.endpointGeneration > 0 &&
 						candidate.live &&
 						!candidate.terminal &&
-						!candidate.terminalUncertain,
+						!candidate.terminalUncertain &&
+						// Bind to the exact endpoint proven at registration. Without this a
+						// replaced host or an alternate endpoint for the same id could
+						// receive the seed prompt or answer a Q26 reconciliation.
+						(input.pinned === undefined ||
+							(candidate.endpointGeneration === input.pinned.endpointGeneration &&
+								candidate.pid === input.pinned.pid &&
+								(input.pinned.processIncarnation === undefined ||
+									(candidate.hostIncarnation ?? candidate.processIncarnation) === input.pinned.processIncarnation))),
 				);
 		} catch {
 			row = undefined;
@@ -1655,9 +1682,15 @@ export class Broker {
 		}
 	}
 
-	async #dispatchSpawnPrompt(input: { sessionId: string; task: string; clientRef: string }): Promise<SpawnPromptDispatch> {
+	async #dispatchSpawnPrompt(input: {
+		sessionId: string;
+		task: string;
+		clientRef: string;
+		pinned?: SpawnHostRegistration;
+	}): Promise<SpawnPromptDispatch> {
 		const exchange = await this.#spawnChildExchange({
 			sessionId: input.sessionId,
+			...(input.pinned === undefined ? {} : { pinned: input.pinned }),
 			frame: id => ({
 				type: "control_request",
 				id,
@@ -1680,9 +1713,14 @@ export class Broker {
 		return frame.ok === false ? { kind: "pre_send_rejected" } : { kind: "uncertain" };
 	}
 
-	async #reconcileSpawnPrompt(input: { sessionId: string; clientRef: string }): Promise<SpawnQ26Reconciliation> {
+	async #reconcileSpawnPrompt(input: {
+		sessionId: string;
+		clientRef: string;
+		pinned?: SpawnHostRegistration;
+	}): Promise<SpawnQ26Reconciliation> {
 		const exchange = await this.#spawnChildExchange({
 			sessionId: input.sessionId,
+			...(input.pinned === undefined ? {} : { pinned: input.pinned }),
 			frame: id => ({
 				type: "query_request",
 				id,

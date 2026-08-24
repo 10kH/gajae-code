@@ -634,6 +634,42 @@ describe("Broker spawn close and orphan reaper", () => {
 		}
 	});
 
+	it("pins child registration to the launch locator and the dispatch endpoint", async () => {
+		const agentDir = await temp();
+		const seen: { pinned?: { endpointGeneration: number; pid: number } } = {};
+		const registrations: { childId: string; cwd: string; stateRoot: string }[] = [];
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: provider({ verdict: "verified", closes: 0 }),
+			spawnPromptLayer: {
+				awaitRegistration: async input => {
+					// The launch locator must reach the matcher; a same-id row from an
+					// unrelated workspace must not satisfy this spawn.
+					registrations.push(input);
+					return { ok: true as const, registration: { sessionId: input.childId, endpointGeneration: 7, pid: 4242 } };
+				},
+				dispatch: async input => {
+					seen.pinned = input.pinned;
+					return { kind: "accepted" as const, commandId: "cmd-pin", turnId: "turn-pin", acceptedAt: 3 };
+				},
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		await broker.start();
+		try {
+			const response = (await broker.handleRequest("session.spawn", spawnInput(), "pin-key")) as { ok: boolean };
+			expect(response.ok).toBe(true);
+			expect(registrations).toHaveLength(1);
+			expect(path.isAbsolute(registrations[0]!.cwd)).toBe(true);
+			expect(registrations[0]!.stateRoot.length).toBeGreaterThan(0);
+			// The proven endpoint identity is carried into the seed dispatch.
+			expect(seen.pinned).toMatchObject({ endpointGeneration: 7, pid: 4242 });
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("routes the session id alias through exact spawn close", async () => {
 		const agentDir = await temp();
 		const probe: ProviderProbe = { verdict: "verified", closes: 0 };
