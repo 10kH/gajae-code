@@ -368,8 +368,10 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain("require_official_github_origins");
 		expect(installer).toContain("${LOCK_DIR}/claim");
 		expect(installer).not.toContain('Authorization: Bearer ${token}');
-		expect(installer).toContain('-H "@${hdr}"');
+		expect(installer).toContain('-H "@${AUTH_HDR}"');
+		expect(installer).toContain("prepare_github_auth_header");
 		expect(installer).toContain("Refusing to replace symlink");
+		expect(installer).toContain("write_lock_claim");
 		expect(installer).not.toContain('rm -rf "$lock"');
 		expect(installer).toContain("is_stable_release_tag");
 		expect(installer).toContain("Failed to publish the downloaded binary");

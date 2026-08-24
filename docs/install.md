@@ -31,7 +31,7 @@ Windows default location: `%LOCALAPPDATA%\gjc\gjc.exe`.
 
 Prebuilt standalone release binaries are published for:
 
-- **Linux** — x64 and arm64
+- **Linux** — x64 and arm64, **glibc only** (musl/Alpine is not supported; use `--source` with existing Bun)
 - **Windows** — x64
 - **macOS** — Apple Silicon (arm64) and Intel (x64)
 

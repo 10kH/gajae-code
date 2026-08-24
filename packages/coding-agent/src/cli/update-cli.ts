@@ -670,6 +670,9 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	let published = false;
 	const journalPath = `${options.targetPath}.update-journal`;
 	try {
+		if (process.platform === "win32") {
+			await recoverWindowsUpdateJournal(journalPath);
+		}
 		try {
 			const dest = await fs.promises.lstat(options.targetPath);
 			if (dest.isSymbolicLink()) {
@@ -679,9 +682,6 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 			}
 		} catch (err) {
 			if (!isEnoent(err)) throw err;
-		}
-		if (process.platform === "win32") {
-			await recoverWindowsUpdateJournal(journalPath);
 		}
 		await unlinkIfExists(options.backupPath);
 		if (process.platform === "win32") {
@@ -710,7 +710,6 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		}
 		await fs.promises.rename(options.tempPath, options.targetPath);
 		published = true;
-		if (process.platform === "win32") await unlinkIfExists(journalPath);
 
 		const verification = await options.verifyInstalledVersion(options.expectedVersion);
 		if (!verification.ok) {
@@ -720,6 +719,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		}
 
 		backupReady = false;
+		if (process.platform === "win32") await unlinkIfExists(journalPath);
 		const cleanupWarning = await cleanupVerifiedBackup(options.backupPath);
 		return cleanupWarning ? { ...verification, cleanupWarning } : verification;
 	} catch (err) {

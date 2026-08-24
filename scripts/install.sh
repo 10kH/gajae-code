@@ -32,6 +32,7 @@ REF=""
 TMP_FILES=""
 LOCK_DIR=""
 LOCK_NONCE=""
+AUTH_HDR=""
 BACKUP_PATH=""
 DEST_PATH=""
 SOURCE_CLONE_DIR=""
@@ -160,15 +161,14 @@ require_official_github_origins() {
     fi
 }
 
-github_auth_header_file() {
+prepare_github_auth_header() {
     token="$1"
-    hdr="${TMPDIR:-/tmp}/.gjc.curlhdr.$$"
-    remember_tmp "$hdr"
+    AUTH_HDR="${TMPDIR:-/tmp}/.gjc.curlhdr.$$"
+    remember_tmp "$AUTH_HDR"
     old_umask=$(umask)
     umask 077
-    printf 'Authorization: Bearer %s\n' "$token" > "$hdr"
+    printf 'Authorization: Bearer %s\n' "$token" > "$AUTH_HDR"
     umask "$old_umask"
-    printf '%s' "$hdr"
 }
 
 curl_github() {
@@ -176,12 +176,12 @@ curl_github() {
     out="$2"
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
     if [ -n "$token" ] && trusted_github_url "$url"; then
-        hdr=$(github_auth_header_file "$token")
+        prepare_github_auth_header "$token"
         curl -fsSL --retry 3 --retry-delay 1 \
             -A "gjc-install" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "@${hdr}" \
+            -H "@${AUTH_HDR}" \
             -o "$out" "$url"
     else
         curl -fsSL --retry 3 --retry-delay 1 \
@@ -197,11 +197,11 @@ curl_github_optional() {
     out="$2"
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
     if [ -n "$token" ] && trusted_github_url "$url"; then
-        hdr=$(github_auth_header_file "$token")
+        prepare_github_auth_header "$token"
         curl -sSL --retry 2 --retry-delay 1 \
             -A "gjc-install" \
             -H "Accept: application/octet-stream" \
-            -H "@${hdr}" \
+            -H "@${AUTH_HDR}" \
             -o "$out" -w "%{http_code}" "$url"
     else
         curl -sSL --retry 2 --retry-delay 1 \
@@ -352,9 +352,10 @@ detect_platform() {
 }
 
 write_lock_claim() {
+    dest="$1"
     LOCK_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
     [ -n "$LOCK_NONCE" ] || LOCK_NONCE="$$.$RANDOM"
-    printf '%s %s\n' "$$" "$LOCK_NONCE" > "${LOCK_DIR}/claim"
+    printf '%s %s\n' "$$" "$LOCK_NONCE" > "${dest}/claim"
 }
 
 acquire_lock() {
@@ -362,31 +363,32 @@ acquire_lock() {
     mkdir -p "$INSTALL_DIR"
     if mkdir "$lock" 2>/dev/null; then
         LOCK_DIR="$lock"
-        write_lock_claim
+        write_lock_claim "$lock"
         return 0
     fi
     owner=""
     nonce=""
-    if [ -f "${lock}/claim" ]; then
-        read owner nonce < "${lock}/claim" || true
+    if [ ! -f "${lock}/claim" ]; then
+        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
     fi
-    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+    read owner nonce < "${lock}/claim" || true
+    if [ -z "$owner" ] || [ -z "$nonce" ]; then
+        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
+    fi
+    if kill -0 "$owner" 2>/dev/null; then
         die "Another GJC installer is already running in ${INSTALL_DIR} (pid ${owner}, lock: ${lock})."
     fi
-    if [ -n "$owner" ] && [ -f "${lock}/claim" ]; then
-        current_owner=""
-        current_nonce=""
-        read current_owner current_nonce < "${lock}/claim" || true
-        if [ "$current_owner" = "$owner" ] && [ "$current_nonce" = "$nonce" ]; then
-            rm -f "${lock}/claim"
-            rmdir "$lock" 2>/dev/null || true
-        fi
-    elif [ ! -f "${lock}/claim" ]; then
-        rmdir "$lock" 2>/dev/null || true
+    current_owner=""
+    current_nonce=""
+    read current_owner current_nonce < "${lock}/claim" || true
+    if [ "$current_owner" != "$owner" ] || [ "$current_nonce" != "$nonce" ]; then
+        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
     fi
+    rm -f "${lock}/claim"
+    rmdir "$lock" 2>/dev/null || die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
     if mkdir "$lock" 2>/dev/null; then
         LOCK_DIR="$lock"
-        write_lock_claim
+        write_lock_claim "$lock"
         return 0
     fi
     die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
