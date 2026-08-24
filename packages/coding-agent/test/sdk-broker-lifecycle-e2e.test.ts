@@ -1325,8 +1325,10 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		);
 		expect(resumed).toMatchObject({ ok: true, result: { sessionId: sourceId } });
 		if (!resumed.ok) throw new Error(resumed.error.message);
-		const resumedGeneration = (resumed.result as { endpointGeneration?: unknown }).endpointGeneration;
-		if (typeof resumedGeneration !== "number") throw new Error("Expected resumed endpoint generation.");
+		const resumedGeneration = broker.index
+			.listSessions()
+			.sessions.find(session => session.sessionId === sourceId)?.endpointGeneration;
+		if (resumedGeneration === undefined) throw new Error("Expected indexed resumed endpoint generation.");
 		const proofRouter = new SessionRouter({ agentDir });
 		const resumedSourceCandidate = await assertCanonicalSource();
 		expect(resumedSourceCandidate.identity).toMatchObject({ canonicalPath: sourcePath, sessionId: sourceId });
@@ -1380,8 +1382,10 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		if (!forked.ok) throw new Error(forked.error.message);
 		const forkResult = forked.result as { sessionId?: unknown };
 		const forkId = String(forkResult.sessionId);
-		const forkGeneration = (forked.result as { endpointGeneration?: unknown }).endpointGeneration;
-		if (typeof forkGeneration !== "number") throw new Error("Expected forked endpoint generation.");
+		const forkGeneration = broker.index
+			.listSessions()
+			.sessions.find(session => session.sessionId === forkId)?.endpointGeneration;
+		if (forkGeneration === undefined) throw new Error("Expected indexed forked endpoint generation.");
 		expect(forkId).not.toBe(sourceId);
 		const inventory = await listManagedSessionCandidates({ scope: scopeResult.scope });
 		expect(inventory.kind).toBe("complete");

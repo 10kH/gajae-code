@@ -677,6 +677,8 @@ const SESSION_INDEX_PROBE_FRESHNESS_MS = 50;
  * and the next pass re-probes from scratch.
  */
 const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
+/** Maximum distinct live identity probes admitted by one public status query. */
+const SESSION_GENERATION_PROBE_LIMIT = 32;
 
 /**
  * One locked session-index transaction (#4544): every critical section over the
@@ -1600,17 +1602,31 @@ export class SessionIndex {
 			const plan = await SessionIndex.#enqueue(indexPath, () =>
 				withSessionIndexLock("generation reconciliation plan", this.#agentDir, async () => {
 					await this.#replayUnderLock();
+					const latestByIdentity = new Map<string, SessionIndexEvent>();
+					for (const event of admitEvents(this.#events).admitted) {
+						if (event.sessionId !== sessionId || event.type === "host_heartbeat") continue;
+						const key = identityKey(event);
+						const previous = latestByIdentity.get(key);
+						if (previous === undefined || event.indexSeq > previous.indexSeq) latestByIdentity.set(key, event);
+					}
+					const registrations = new Map<string, number>();
+					for (const event of latestByIdentity.values()) {
+						if (!isUnresolvedEvent(event) || effectiveIncarnation(event) === undefined) continue;
+						registrations.set(`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}`, event.pid);
+					}
 					return {
 						indexSeq: this.indexSeq,
-						registrations: this.#events
-							.filter(event => event.type === "host_registered" && event.sessionId === sessionId)
-							.map(event => ({
-								key: `${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}`,
-								pid: event.pid,
-							})),
+						registrations:
+							registrations.size <= SESSION_GENERATION_PROBE_LIMIT ? [...registrations.entries()] : undefined,
 					};
 				}),
 			);
+			if (plan.registrations === undefined)
+				return {
+					status: "unknown",
+					observedIndexSeq: plan.indexSeq,
+					reason: "reconciliation_incomplete",
+				};
 			// Opening a retained process reference may perform platform work, so it
 			// must never run while the machine-global index lock is held. The retained
 			// handle binds the exact process incarnation and is checked for running
@@ -1618,8 +1634,7 @@ export class SessionIndex {
 			// handle refer to the successor. A writer racing either cut causes a bounded
 			// retry rather than stale classification.
 			const retained = new Map<string, SessionIndexProcessObservation | undefined>();
-			for (const registration of plan.registrations)
-				retained.set(registration.key, await retainProcess(registration.pid));
+			for (const [key, pid] of plan.registrations) retained.set(key, await retainProcess(pid));
 			const result = await SessionIndex.#enqueue(indexPath, () =>
 				withSessionIndexLock("generation reconciliation commit", this.#agentDir, async () => {
 					await this.#replayUnderLock();

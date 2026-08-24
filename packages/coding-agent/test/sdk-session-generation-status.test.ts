@@ -278,6 +278,37 @@ describe("SessionRouter exact generation status", () => {
 		expect((await router.generationStatus("plan-race-session", 7)).status).toBe("retired");
 	});
 
+	test("fails closed without probing when unresolved identity history exceeds the budget", async () => {
+		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-generation-probe-budget-"));
+		tempDirs.push(agentDir);
+		let probes = 0;
+		const index = await new SessionIndex(
+			agentDir,
+			{},
+			{
+				retainProcess: () => {
+					probes += 1;
+					return { incarnation: fixtureProcessIncarnation, isRunning: () => true };
+				},
+			},
+		).open();
+		for (let generation = 1; generation <= 33; generation++)
+			await register(
+				index,
+				{ repo: agentDir, stateRoot: path.join(agentDir, `state-${generation}`) },
+				"probe-budget-session",
+				generation,
+			);
+		const router = new SessionRouter({ agentDir, deps: { createIndex: () => index } });
+
+		expect(await router.generationStatus("probe-budget-session", 1)).toEqual({
+			status: "unknown",
+			reason: "reconciliation_incomplete",
+			evidence: { source: "session_index", observedIndexSeq: 33 },
+		});
+		expect(probes).toBe(0);
+	});
+
 	test("fails generation reuse and wrap-like races closed instead of returning retired", async () => {
 		const { index, locator, router } = await fixture();
 		await register(index, locator, "reused-session", 11, { hostIncarnation: "linux:100" });
