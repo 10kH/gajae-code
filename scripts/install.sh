@@ -343,8 +343,12 @@ detect_platform() {
     case "$OS" in
         Linux)
             PLATFORM="linux"
-            if ldd /bin/sh 2>/dev/null | grep -q musl; then
+            ldd_out=$(ldd /bin/sh 2>/dev/null || true)
+            if printf '%s' "$ldd_out" | grep -q musl; then
                 die "Unsupported libc: musl. Prebuilt Linux binaries are glibc-only. See docs/install.md."
+            fi
+            if [ -z "$ldd_out" ] || ! printf '%s' "$ldd_out" | grep -q 'libc.so.6'; then
+                die "Unsupported libc: could not identify glibc. Prebuilt Linux binaries are glibc-only. See docs/install.md."
             fi
             ;;
         Darwin) PLATFORM="darwin" ;;
@@ -374,25 +378,7 @@ acquire_lock() {
         LOCK_FILE="$lock"
         return 0
     fi
-    stolen="${lock}.stolen.$$"
-    if ! mv "$lock" "$stolen" 2>/dev/null; then
-        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
-    fi
-    owner=""
-    nonce=""
-    read owner nonce < "$stolen" || true
-    if [ -z "$owner" ] || [ -z "$nonce" ] || kill -0 "$owner" 2>/dev/null; then
-        mv "$stolen" "$lock" 2>/dev/null || true
-        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
-    fi
-    rm -f "$stolen"
-    LOCK_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
-    [ -n "$LOCK_NONCE" ] || LOCK_NONCE="$$.$RANDOM"
-    if try_publish_lock_file "$lock" 2>/dev/null; then
-        LOCK_FILE="$lock"
-        return 0
-    fi
-    die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
+    die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock}). Remove a leftover lock file only after confirming no installer is running."
 }
 
 resolve_release_tag() {

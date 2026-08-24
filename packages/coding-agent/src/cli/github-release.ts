@@ -35,6 +35,7 @@ export interface GithubReleaseLookupOptions {
 	lookupEnv?: (name: string) => string | undefined;
 	apiOrigin?: string;
 	timeoutMs?: number;
+	useAmbientToken?: boolean;
 }
 
 interface GithubReleaseJson {
@@ -71,8 +72,9 @@ function readToken(lookupEnv?: (name: string) => string | undefined): string | u
 async function readGithubJson(url: string, options: GithubReleaseLookupOptions): Promise<unknown> {
 	const fetchImpl = options.fetchImpl ?? fetch;
 	const timeoutMs = options.timeoutMs ?? 20_000;
+	const token = options.useAmbientToken ? readToken(options.lookupEnv) : undefined;
 	const response = await fetchImpl(url, {
-		headers: githubReleaseHeaders(readToken(options.lookupEnv)),
+		headers: githubReleaseHeaders(token),
 		signal: AbortSignal.timeout(timeoutMs),
 		redirect: "follow",
 	});
@@ -182,7 +184,7 @@ export async function fetchOptionalText(
 ): Promise<string | undefined> {
 	const fetchImpl = options.fetchImpl ?? fetch;
 	const response = await fetchImpl(url, {
-		headers: githubReleaseHeaders(readToken(options.lookupEnv)),
+		headers: githubReleaseHeaders(undefined),
 		signal: AbortSignal.timeout(options.timeoutMs ?? 20_000),
 		redirect: "follow",
 	});

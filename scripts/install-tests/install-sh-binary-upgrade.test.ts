@@ -369,7 +369,8 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain("try_publish_lock_file");
 		expect(installer).toContain("set -C");
 		expect(installer).toContain("exclusive_tmp");
-		expect(installer).toContain('.stolen.$$');
+		expect(installer).toContain("could not identify glibc");
+		expect(installer).toContain("leftover lock file");
 		expect(installer).toContain("mktemp");
 		expect(installer).not.toContain('Authorization: Bearer ${token}');
 		expect(installer).toContain('-H "@${AUTH_HDR}"');
@@ -444,20 +445,14 @@ describe("install.sh binary-first contract", () => {
 		}
 	});
 
-	test("reclaims a stale installer lock whose pid is dead", async () => {
-		const payload = fakeGjcScript({ version: VERSION });
-		writeCurlShim(sandbox.shimDir, {
-			assets: {
-				[hostBinaryName()]: payload,
-				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
-			},
-		});
+	test("fails closed when an installer lock already exists", async () => {
+		writeCurlShim(sandbox.shimDir, { assets: {} });
 		const lockFile = path.join(sandbox.installDir, ".gjc-install.lock");
 		fs.writeFileSync(lockFile, "999999 stale-nonce\n");
 		const result = await runInstaller([]);
-		expect(result.exitCode).toBe(0);
-		expect(fs.existsSync(lockFile)).toBe(false);
-		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("Another GJC installer is already running");
+		expect(fs.readFileSync(lockFile, "utf8")).toBe("999999 stale-nonce\n");
 	});
 
 	test("refuses to replace a destination symlink", async () => {

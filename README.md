@@ -59,11 +59,13 @@ Most coding agents fail on three fronts: they bill you twice, they mutate before
 **Install** — prebuilt binaries for Linux (x64/arm64), macOS (arm64/x64), and Windows (x64). Bun is not required:
 
 ```sh
+# Convenience one-liner from main (mutable). Prefer a tagged copy:
+#   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.sh -o gjc-install.sh && sh gjc-install.sh
 curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
 gjc
 ```
 
-Windows (PowerShell): `irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex`
+Windows (PowerShell): `irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex` (mutable `main`; pin a tag URL the same way when you need a fixed installer).
 
 **First use** — pick your plan and go:
 

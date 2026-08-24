@@ -521,17 +521,18 @@ function Install-Binary {
     $OutPath = Join-Path $InstallDir "gjc.exe"
     $DownloadTmp = Join-Path $InstallDir (".gjc.download." + [System.Guid]::NewGuid().ToString("N"))
     $BackupPath = Join-Path $InstallDir (".gjc.bak." + [System.Guid]::NewGuid().ToString("N"))
-    $existing = Get-Item -LiteralPath $OutPath -Force -ErrorAction SilentlyContinue
-    $isReparse = $false
-    if ($existing) {
-        $isReparse = [bool]($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
-        if (-not $isReparse -and $existing.LinkType) { $isReparse = $true }
-    }
-    if ($isReparse) {
-        throw "Refusing to replace symlink $OutPath with a regular binary. Remove the symlink or set GJC_INSTALL_DIR."
-    }
-    $hadExisting = [bool]$existing
+    $hadExisting = $false
     try {
+        $existing = Get-Item -LiteralPath $OutPath -Force -ErrorAction SilentlyContinue
+        $isReparse = $false
+        if ($existing) {
+            $isReparse = [bool]($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+            if (-not $isReparse -and $existing.LinkType) { $isReparse = $true }
+        }
+        if ($isReparse) {
+            throw "Refusing to replace symlink $OutPath with a regular binary. Remove the symlink or set GJC_INSTALL_DIR."
+        }
+        $hadExisting = [bool]$existing
         $BinaryUrl = "$GithubReleases/$Latest/$BinaryName"
         Write-Host "Downloading $BinaryName..."
         try {

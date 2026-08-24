@@ -350,7 +350,7 @@ export interface LatestReleaseLookupOptions extends GithubReleaseLookupOptions {
  */
 async function getLatestRelease(options?: LatestReleaseLookupOptions): Promise<ReleaseInfo> {
 	const channel = options?.channel ?? "stable";
-	const release = await fetchGithubChannelRelease({ ...options, channel });
+	const release = await fetchGithubChannelRelease({ ...options, channel, useAmbientToken: true });
 	if (!isSafeReleaseTag(release.tag)) {
 		throw new Error(`Refusing unsafe GitHub release tag: ${release.tag}`);
 	}
@@ -664,7 +664,16 @@ async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
 			await unlinkIfExists(journalPath);
 			return;
 		}
-		return;
+		try {
+			await fs.promises.rename(target, backup || `${target}.bak.recover`);
+			await fs.promises.rename(next, target);
+			await unlinkIfExists(journalPath);
+			return;
+		} catch {
+			await unlinkIfExists(next);
+			await unlinkIfExists(journalPath);
+			return;
+		}
 	}
 	if (target && backup && !(await exists(target))) {
 		try {

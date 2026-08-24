@@ -5,17 +5,24 @@
 Prebuilt standalone binaries are the supported end-user install. Bun is not required.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+# Tagged installer (recommended): pin the ref, then run locally.
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
 gjc --version
 gjc --smoke-test
 ```
 
-Windows (PowerShell):
+Piping the `main` branch script executes mutable content:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell), tagged:
 
 ```powershell
-irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex
-gjc --version
-gjc --smoke-test
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
 ```
 
 The installer downloads the current platform's GitHub release asset, verifies HTTP success, non-empty bytes, checksums when the release publishes them, then runs `--version` and `--smoke-test`. A failed download or verification never replaces a working existing `gjc`.
