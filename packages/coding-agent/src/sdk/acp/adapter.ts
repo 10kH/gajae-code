@@ -547,6 +547,7 @@ export class AcpSdkAdapter {
 						} catch (error) {
 							if (providerErrorCode(error) === "provider_lease_conflict") {
 								this.#leases.delete(provider.capability);
+								this.#abortReverseForCapability(provider.capability);
 								continue;
 							}
 
@@ -698,10 +699,9 @@ export class AcpSdkAdapter {
 		} catch (error) {
 			if (error instanceof SessionRouterError && error.phase === "pre_send") return;
 			logger.warn(
-				`ACP provider lease heartbeat failed; rebinding reverse providers: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
+				`ACP provider lease heartbeat failed; rebinding reverse providers (${providerErrorCode(error) ?? "unknown"})`,
 			);
+
 			this.#rebindExpiredProviders();
 		}
 	}
@@ -729,7 +729,12 @@ export class AcpSdkAdapter {
 			const response = this.#leaseErrorFrame(frame);
 			if (object(response?.error)?.code === "not_lease_owner") {
 				const leaseId = typeof response?.leaseId === "string" ? response.leaseId : "";
-				for (const [capability, id] of this.#leases) if (id === leaseId) this.#leases.delete(capability);
+				for (const [capability, id] of this.#leases) {
+					if (id === leaseId) {
+						this.#leases.delete(capability);
+						this.#abortReverseForCapability(capability);
+					}
+				}
 			}
 			this.#rebindExpiredProviders();
 			return;
@@ -842,10 +847,9 @@ export class AcpSdkAdapter {
 		capability: string,
 		leaseId: string,
 	): boolean {
-		// Outstanding reverse RPCs are completed by captured identity: the host
-		// accepts respond() on the original connectionId/leaseId even after that
-		// capability's live lease has been replaced or quarantined. New reverse
-		// requests stay live-lease gated in #ownsReverseLease.
+		// Same-owner rebind keeps a capability lease, so captured-identity completion
+		// remains valid. Foreign quarantine deletes the capability and aborts these
+		// requests in #abortReverseForCapability.
 		return (
 			this.#reverseRequests.get(id) === request &&
 			request.state === "pending" &&
@@ -853,8 +857,15 @@ export class AcpSdkAdapter {
 			this.#connectionId === request.connectionId &&
 			request.connectionId === connectionId &&
 			request.capability === capability &&
-			request.leaseId === leaseId
+			request.leaseId === leaseId &&
+			this.#leases.has(capability)
 		);
+	}
+
+	#abortReverseForCapability(capability: string): void {
+		for (const [id, request] of this.#reverseRequests) {
+			if (request.capability === capability) this.#cancelReverse(id);
+		}
 	}
 
 	#cancelReverse(id: string): void {

@@ -438,18 +438,10 @@ test("ACP still answers an admitted reverse request after a later lease conflict
 			leaseId: "lease-1",
 			payload: { method: "request", payload: { toolCall: { toolName: "bash" } } },
 		});
-		await permissionStarted;
+		const signal = await permissionStarted;
 		await expect(adapter.ensureProviders()).rejects.toMatchObject({ code: "provider_lease_conflict" });
-
 		expect(adapter.leaseIds.get("permission")).toBeUndefined();
-		resolvePermissionGate();
-		await waitFor(
-			() =>
-				sent.some(
-					frame => frame.type === "reverse_response" && frame.id === "perm-1" && frame.leaseId === "lease-1",
-				),
-			"admitted reverse response after conflict quarantine",
-		);
+		expect(signal?.aborted).toBe(true);
 	} finally {
 		resolvePermissionGate();
 		await adapter.close();
