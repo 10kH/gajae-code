@@ -1208,6 +1208,9 @@ export class Broker {
 		const provider = this.#spawnSubstrateProvider();
 		let current = claim;
 		let handedOff = false;
+		// Set the moment a substrate exists. After this point a failure is
+		// ambiguous, never an ordinary pre-effect failure.
+		let launchedProof: SpawnSubstrateProof | undefined;
 		try {
 			if (current.state === "prepared") {
 				const prep = prepareSpawnChildHostLaunch(this, {
@@ -1230,6 +1233,7 @@ export class Broker {
 					argv: prep.argv,
 					env: prep.env,
 				});
+				if (launched.ok) launchedProof = launched.proof;
 				if (!launched.ok) {
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
@@ -1246,6 +1250,16 @@ export class Broker {
 					stateRoot: prep.stateRoot,
 				});
 				if (!registration.ok) {
+					// No authority row is ever persisted on this path, so the reaper can
+					// never see this substrate. Close it here against its exact proof
+					// instead of leaking a live child forever.
+					if (launchedProof && (await provider.verify(launchedProof)) === "verified") {
+						try {
+							await provider.close(launchedProof);
+						} catch {
+							// Close is best effort; the claim still records uncertainty below.
+						}
+					}
 					current = (
 						await store.persistTransition(lifecycleIdentity, {
 							claimId: current.claimId,
@@ -1387,7 +1401,9 @@ export class Broker {
 			inFlight.phase = current.state;
 			return error("terminal_uncertain", "session.spawn seed delivery outcome is uncertain");
 		} catch {
-			return handedOff
+			// Once a substrate exists the outcome is ambiguous even before handoff:
+			// reporting an ordinary failure would downgrade retained uncertainty.
+			return handedOff || launchedProof
 				? error("terminal_uncertain", "session.spawn state could not be advanced durably")
 				: error("spawn_failed", "session.spawn could not be advanced durably");
 		}

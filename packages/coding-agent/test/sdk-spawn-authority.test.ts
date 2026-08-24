@@ -350,6 +350,42 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
+	it("closes the launched substrate when child registration never arrives", async () => {
+		const agentDir = await temp();
+		let closes = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({
+					ok: true as const,
+					proof: { substrateKind: "headless" as const, providerIdentity: "leak-provider", pid: 993, processIncarnation: "inc-993" },
+				}),
+				verify: async () => "verified" as const,
+				close: async () => {
+					closes += 1;
+					return { ok: true };
+				},
+			},
+			spawnPromptLayer: {
+				// Registration never arrives: no authority row is written, so nothing
+				// else would ever reap this substrate.
+				awaitRegistration: async () => ({ ok: false as const }),
+				dispatch: async () => ({ kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 }),
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		await broker.start();
+		try {
+			const response = await broker.handleRequest("session.spawn", spawnInput(), "leak-key");
+			expect(response).toMatchObject({ ok: false, error: { code: "terminal_uncertain" } });
+			expect(closes).toBe(1);
+			expect((await latestClaim(agentDir))?.state).toBe("uncertain");
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("refuses to seed a substrate that cannot be re-proven after restart", async () => {
 		const agentDir = await temp();
 		const brokerKey = await getBrokerIdentityKey(agentDir);
