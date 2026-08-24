@@ -71,6 +71,31 @@ describe("SGR mouse input", () => {
 		expect(inputs).toEqual([]);
 		expect(clicks).toEqual([]);
 	});
+	test("malformed and out-of-bounds SGR reports cancel click escalation", async () => {
+		for (const interruption of ["\x1b[<-1;3;1M", "\x1b[<0;999;1M"]) {
+			const terminal = new VirtualTerminal(20, 1);
+			const copied: string[] = [];
+			const tui = new TUI(terminal, undefined, {
+				enableMouse: true,
+				copySelection: text => {
+					copied.push(text);
+				},
+			});
+			tui.addChild({ render: () => ["alpha bravo"], invalidate: () => {} });
+			tui.start();
+			await terminal.waitForRender();
+
+			terminal.sendInput("\x1b[<0;3;1M");
+			terminal.sendInput("\x1b[<0;3;1m");
+			terminal.sendInput(interruption);
+			terminal.sendInput("\x1b[<0;3;1M");
+			terminal.sendInput("\x1b[<0;3;1m");
+			await terminal.waitForRender();
+
+			expect(copied).toEqual([]);
+			tui.stop();
+		}
+	});
 
 	test("dispatches only inside a bottom-centered overlay using last-painted local coordinates", async () => {
 		let input: ((data: string) => void) | undefined;
@@ -153,6 +178,30 @@ describe("SGR mouse input", () => {
 		input!("\x1b[<0;31;24M");
 		expect(clicks).toEqual([{ kind: "click", button: 0, x: 31, y: 24, localX: 1, localY: 1 }]);
 		expect(renders).toBe(rendersBeforeClick);
+	});
+	test("does not start transcript selection from clicks owned by an overlay", async () => {
+		const terminal = new VirtualTerminal(30, 5);
+		const copied: string[] = [];
+		const tui = new TUI(terminal, undefined, {
+			enableMouse: true,
+			copySelection: text => {
+				copied.push(text);
+			},
+		});
+		tui.addChild({ render: () => ["transcript row"], invalidate: () => {} });
+		const overlay: Component = { render: () => ["overlay row"], invalidate: () => {}, handleMouse: () => {} };
+		tui.showOverlay(overlay, { anchor: "bottom-center", width: 20 });
+		tui.start();
+		await terminal.waitForRender();
+
+		for (let click = 0; click < 3; click++) {
+			terminal.sendInput("\x1b[<0;7;5M");
+			terminal.sendInput("\x1b[<0;7;5m");
+		}
+		await terminal.waitForRender();
+
+		expect(copied).toEqual([]);
+		tui.stop();
 	});
 	test("dispatches clicks to the focused component without forwarding mouse text", () => {
 		let input: ((data: string) => void) | undefined;
@@ -328,6 +377,35 @@ describe("SGR mouse input", () => {
 		expect(copied).toHaveLength(1);
 		expect(copied[0]).not.toContain("status");
 		expect(copied[0]).not.toContain("editor");
+		tui.stop();
+	});
+	test("does not multi-click-select live pinned chrome", async () => {
+		const terminal = new VirtualTerminal(30, 5);
+		const copied: string[] = [];
+		const tui = new TUI(terminal, undefined, {
+			enableMouse: true,
+			copySelection: text => {
+				copied.push(text);
+			},
+		});
+		tui.addChild({ render: () => ["one", "two", "three"], invalidate: () => {} });
+		const status: Component = { render: () => ["status"], invalidate: () => {} };
+		const editor: Component = { render: () => ["editor"], invalidate: () => {} };
+		tui.addChild(status);
+		tui.addChild(editor);
+		tui.setBottomPinnedComponent(status);
+		tui.start();
+		await terminal.waitForRender();
+
+		for (const y of [4, 5]) {
+			for (let click = 0; click < 3; click++) {
+				terminal.sendInput(`\x1b[<0;2;${y}M`);
+				terminal.sendInput(`\x1b[<0;2;${y}m`);
+			}
+		}
+		await terminal.waitForRender();
+
+		expect(copied).toEqual([]);
 		tui.stop();
 	});
 	test("wheel notches scroll a few lines instead of a full page", async () => {

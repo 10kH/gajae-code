@@ -51,6 +51,28 @@ gjc setup hermes \
 
 The runtime accepts only the literal selectors `gjc` and `gjc --worktree [name]`. It rejects local wrappers, shell syntax, tmux flags, and model/provider flags before creating a session. Existing setup configs that contain a legacy explicit `--session-command` must be changed to one of those selectors; provider and model resolution remains normal GJC configuration, not coordinator command injection.
 
+## Agent directory override
+
+`GJC_COORDINATOR_MCP_STATE_ROOT` selects coordinator durable state (session/turn/question journals, projections). It is **not** the broker selector: sessions started by the bridge use the GJC agent directory (`GJC_CODING_AGENT_DIR`; broker, lifecycle ledger, session index, `config.yml` / `models.yml`), and the spawned `gjc` process inherits it from the MCP server env. Pointing only `STATE_ROOT` at a separate directory leaves sessions on the default `~/.gjc/agent` broker.
+
+Render the agent-directory override next to the state root with an absolute path:
+
+```bash
+gjc setup hermes \
+  --root /path/to/repo \
+  --state-root /var/lib/gjc/hermes-state \
+  --coding-agent-dir /var/lib/gjc/hermes-agent
+```
+
+The rendered block then carries both keys as independent values:
+
+```bash
+export GJC_COORDINATOR_MCP_STATE_ROOT="/var/lib/gjc/hermes-state"
+export GJC_CODING_AGENT_DIR="/var/lib/gjc/hermes-agent"
+```
+
+`--coding-agent-dir` requires an absolute path (Windows accepts `C:\...` and UNC `\\server\share\...`) and refuses the home directory, the account home, and the filesystem root, the same way `--root` does. On `--install` of a GJC-managed block, an existing `GJC_CODING_AGENT_DIR` is preserved unless `--coding-agent-dir` is passed, which overrides it explicitly; the value participates in the managed setup signature, so `--check` detects drift.
+
 Run a non-mutating setup smoke check with:
 
 ```bash
@@ -117,7 +139,7 @@ Missing namespace never widens into global session enumeration.
 
 Read tools:
 
-- `gjc_coordinator_list_sessions`
+- `gjc_coordinator_list_sessions` — enumerates GJC sessions the broker discovered under the allowed roots, which is a superset of the sessions this bridge can drive. Each entry reports `registered`; the other session-scoped tools resolve through the coordinator projection and refuse `registered: false` entries — `read_status`, `read_tail`, and `send_prompt` answer `not_found`, and `stop_session` reports `unknown_session`. Filter on it rather than discovering the difference through failed calls, and use `gjc_coordinator_register_session` to adopt one deliberately.
 - `gjc_coordinator_read_status`
 - `gjc_coordinator_read_tail`
 - `gjc_coordinator_list_questions`

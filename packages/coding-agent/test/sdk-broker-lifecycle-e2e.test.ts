@@ -35,6 +35,7 @@ import { runSdkSessionCli } from "../src/sdk/cli";
 import { SdkClient } from "../src/sdk/client";
 import { readSdkBrokerDiscovery } from "../src/sdk/client/discovery";
 import { createSdkMcpServer } from "../src/sdk/mcp";
+import { SessionRouter } from "../src/sdk/router";
 import { listManagedSessionCandidates, resolveManagedSessionScope } from "../src/sdk/session-directory";
 import { sanitizeSdkStartupMessage } from "../src/sdk/startup-capability";
 import { SessionManager } from "../src/session/session-manager";
@@ -1323,6 +1324,12 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 			"canonical-cold-resume",
 		);
 		expect(resumed).toMatchObject({ ok: true, result: { sessionId: sourceId } });
+		if (!resumed.ok) throw new Error(resumed.error.message);
+		const resumedGeneration = broker.index
+			.listSessions()
+			.sessions.find(session => session.sessionId === sourceId)?.endpointGeneration;
+		if (resumedGeneration === undefined) throw new Error("Expected indexed resumed endpoint generation.");
+		const proofRouter = new SessionRouter({ agentDir });
 		const resumedSourceCandidate = await assertCanonicalSource();
 		expect(resumedSourceCandidate.identity).toMatchObject({ canonicalPath: sourcePath, sessionId: sourceId });
 		expect(resumedSourceCandidate.identity).not.toEqual(sourceCandidate.identity);
@@ -1331,6 +1338,10 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		).toMatchObject({
 			ok: true,
 			result: { sessionId: sourceId },
+		});
+		expect(await proofRouter.generationStatus(sourceId, resumedGeneration)).toMatchObject({
+			status: "retired",
+			evidence: { source: "session_index", event: "host_unregistered" },
 		});
 		await waitFor(
 			async () =>
@@ -1371,6 +1382,10 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		if (!forked.ok) throw new Error(forked.error.message);
 		const forkResult = forked.result as { sessionId?: unknown };
 		const forkId = String(forkResult.sessionId);
+		const forkGeneration = broker.index
+			.listSessions()
+			.sessions.find(session => session.sessionId === forkId)?.endpointGeneration;
+		if (forkGeneration === undefined) throw new Error("Expected indexed forked endpoint generation.");
 		expect(forkId).not.toBe(sourceId);
 		const inventory = await listManagedSessionCandidates({ scope: scopeResult.scope });
 		expect(inventory.kind).toBe("complete");
@@ -1385,6 +1400,10 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 		).toMatchObject({
 			ok: true,
 			result: { sessionId: forkId },
+		});
+		expect(await proofRouter.generationStatus(forkId, forkGeneration)).toMatchObject({
+			status: "retired",
+			evidence: { source: "session_index", event: "host_unregistered" },
 		});
 		await waitFor(
 			async () =>
@@ -1420,7 +1439,11 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				"canonical-cold-fork-delete",
 				await broker.handleRequest("session.delete", forkDeleteInput, "canonical-cold-fork-delete"),
 			),
-		).toMatchObject({ ok: true, result: { sessionId: forkId } });
+		).toEqual({ ok: true, result: { sessionId: forkId } });
+		expect(await proofRouter.generationStatus(forkId, forkGeneration)).toMatchObject({
+			status: "retired",
+			evidence: { source: "session_index", event: "session_deleted" },
+		});
 		expect(await broker.handleRequest("session.list", {})).toMatchObject({
 			ok: true,
 			result: { sessions: expect.not.arrayContaining([expect.objectContaining({ sessionId: forkId })]) },
@@ -1464,7 +1487,11 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				"canonical-cold-resume-delete",
 				await broker.handleRequest("session.delete", sourceDeleteInput, "canonical-cold-resume-delete"),
 			),
-		).toMatchObject({ ok: true, result: { sessionId: sourceId } });
+		).toEqual({ ok: true, result: { sessionId: sourceId } });
+		expect(await proofRouter.generationStatus(sourceId, resumedGeneration)).toMatchObject({
+			status: "retired",
+			evidence: { source: "session_index", event: "session_deleted" },
+		});
 		expect(
 			await fs.access(sourcePath).then(
 				() => true,
@@ -1483,6 +1510,7 @@ test("broker directly resumes and forks a canonical cold saved session with scop
 				() => false,
 			),
 		).toBe(false);
+		await proofRouter.stop();
 	} finally {
 		await broker.stop();
 		await fs.rm(root, { recursive: true, force: true });

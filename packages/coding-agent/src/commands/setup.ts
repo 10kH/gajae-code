@@ -45,6 +45,9 @@ export default class Setup extends Command {
 			description: "Refuse Hermes session creation that did not name its own worktree",
 		}),
 		"state-root": Flags.string({ description: "Hermes MCP coordination state root" }),
+		"coding-agent-dir": Flags.string({
+			description: "GJC agent-directory override rendered as GJC_CODING_AGENT_DIR (distinct from --state-root)",
+		}),
 		mutation: Flags.string({
 			description: "Hermes MCP mutation classes: sessions,questions,reports,all",
 			multiple: true,
@@ -94,6 +97,7 @@ export default class Setup extends Command {
 				worktreeName: flags["worktree-name"],
 				requireWorktree: flags["require-worktree"],
 				stateRoot: flags["state-root"],
+				codingAgentDir: flags["coding-agent-dir"],
 				mutation: flags.mutation,
 				artifactByteCap: flags["artifact-byte-cap"],
 				serverKey: flags["server-key"],

@@ -1531,7 +1531,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Mouse Support",
 			description:
-				"Enable GJC session scrolling, drag-to-copy text selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection.",
+				"Enable GJC session scrolling, drag-to-copy text selection, double-click word and triple-click line selection, and overlay row selection with the mouse. Disabled by default to preserve native terminal or tmux scrollback and selection; while enabled, most terminals still reach their own selection with a modifier held (Option on macOS, Shift elsewhere), though that path copies only if the host terminal has its own copy-on-select enabled.",
 		},
 	},
 	// Conversation flow

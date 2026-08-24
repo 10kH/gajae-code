@@ -526,6 +526,65 @@ await attachment.send({ type: "reply", id: actionId, answer });
 
 Telegram, Discord, Slack, and third-party adapters own only their provider transport and presentation state. `SessionRouter` performs exact endpoint resolution, credential custody, replay, reconnect, rotation, and dispatch-time stale-lease rejection.
 
+### Exact generation reconciliation
+
+Managed consumers that close or delete a session can reconcile one previously
+persisted attachment generation without retaining endpoint credentials:
+
+```ts
+const proof = await sessionRouter.generationStatus(sessionId, endpointGeneration);
+
+switch (proof.status) {
+  case "current":
+    // This exact generation is the current live indexed authority.
+    break;
+  case "retired":
+    // A retained host-unregister, close, or delete event positively retired it.
+    break;
+  case "replaced":
+    // A different live generation is current; use proof.currentGeneration.
+    break;
+  case "unknown":
+    // Do not infer retirement or retry a possibly-applied lifecycle mutation.
+    break;
+}
+```
+
+`generationStatus(sessionId, endpointGeneration)` is credential-free and may be
+called after `SessionLifecycleService` returns from `session.close` or
+`session.delete`, and after `SessionRouter.stop()`. Its evidence contains only
+`source: "session_index"`, a coherent `observedIndexSeq`, the successful
+state's `evidenceIndexSeq`, and, for positive retirement, the safe terminal
+event kind. It never exposes endpoint URL/token data, process IDs, locators,
+private Broker responses, or lifecycle cleanup payloads.
+
+The result is an observation of one locked index reconciliation cut:
+
+- `current` requires the queried generation to be the current live, unambiguous
+  indexed authority.
+- `retired` requires a retained exact-generation `host_unregistered`,
+  `session_closed`, or `session_deleted` event. Missing attachment, missing
+  endpoint publication, Router shutdown, or a dead/unreachable host never imply
+  retirement.
+- `replaced` requires both prior observation of the queried generation and a
+  strictly greater current live generation. Same-generation reconnect remains
+  current; reuse, regression, or safe-integer wrap is classified as unknown
+  rather than manufacturing a successor relationship.
+- `unknown` is fail-closed. Reasons distinguish invalid input, unavailable or
+  incomplete index reconciliation, an unobserved session/generation, ambiguous
+  authority, and detected generation reuse. Consumers must preserve uncertain
+  lifecycle state rather than treating `unknown` as retired. Expired positive
+  evidence is reported specifically as `proof_expired`.
+
+Proof survives Broker, Router, and consumer process restart because it is read
+from the durable session index, not Router attachment memory. Positive terminal
+proof has the session-index `maxAgeMs` lifetime (30 days by default), even when a
+delete tombstone is retained longer for audit. Row-bound compaction may evict a
+whole session sooner. After proof expiry, compaction eviction, or loss of a
+complete index, `generationStatus` returns `unknown`, never a synthetic
+retirement proof. This bounds the public proof surface independently of durable
+Broker audit retention.
+
 ## Fallback chains
 
 Model-role selectors may be ordered fallback chains; see [Fallback chains](./models.md#fallback-chains) for configuration and retry-budget details. Resolution-time skips do not consume attempts. When a request-time retry advances to another eligible entry, the selected default fallback remains sticky for later prompts in that session until an explicit model selection or a chain reset changes it.

@@ -270,7 +270,7 @@ providers:
 
 This profile is applied on macOS, Linux, WSL (Linux), and native Windows when a compatible tmux provider is available. It is applied **only to sessions GJC itself creates**. If you start tmux yourself and then run `gjc` inside it, GJC leaves your tmux configuration untouched. GJC's own mouse support is disabled by default, so the host terminal or tmux retains wheel and selection behavior. Add `set -g mouse on` to your own `~/.tmux.conf` when you want tmux copy-mode scrolling.
 
-Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling (three rows per notch, not a full page). When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release.
+Set `mouse.enabled: true` to let GJC capture the wheel for virtual session scrolling (three rows per notch, not a full page). When GJC owns mouse input, dragging across rendered text highlights the selection and copies it to the system clipboard on release. Double-click selects the word under the cursor and triple-click selects the row; both copy on release, and dragging afterwards extends by whole words or rows. Because GJC owns the mouse while this is on, the terminal's own selection is reached with a modifier held — Option on macOS, Shift on most other terminals. That modifier makes the host terminal keep the click instead of forwarding it, so GJC never sees it and does not copy: whether the resulting selection reaches the clipboard is entirely the host terminal's own copy-on-select behavior, which is off by default in most terminals. GJC's own selection is the one that copies automatically.
 
 | Variable | Behavior |
 | --- | --- |
@@ -316,7 +316,7 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
 | `GJC_COORDINATOR_MCP_MUTATIONS` | Enables mutating tool classes as a comma-separated list (`sessions`, `questions`, `reports`) or `all`. `sessions` covers session startup, prompt delivery, durable turn journal updates, queue, and force operations. Per-call `allow_mutation: true` is still required. |
 | `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by Linux-only artifact reads (default `65536`, capped at `1048576`). On macOS and Windows, artifact reads fail closed with generic `artifact_unavailable`; detect support through MCP `tools/list`; use the controller's approved repository/worktree reader and report bounded results instead. |
-| `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). |
+| `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). Coordinator durable state only — it does **not** select the broker agent directory; that is `GJC_CODING_AGENT_DIR`, rendered by `gjc setup hermes --coding-agent-dir <abs-path>` (absolute path required; home/filesystem-root refused; preserved across managed re-installs unless the flag overrides it). |
 | `GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT` | Root for managed Codex handoff token files (default `<state-root>/codex-tokens`). Registered files must be owner-only regular non-symlink files beneath this root. Authenticated token-file handoff is unavailable on native Windows unless an equivalent secure ACL proof is provided; registration fails closed with `codex_authenticated_handoff_unavailable_windows`. |
 | `GJC_COORDINATOR_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
 | `GJC_COORDINATOR_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
@@ -499,7 +499,7 @@ LSP project configuration may control declarative matching, activation, and capa
 | Variable              | Default / behavior                                                            |
 | --------------------- | ----------------------------------------------------------------------------- |
 | `GJC_CONFIG_DIR`       | Config root dirname under home (default `.gjc`)                               |
-| `GJC_CODING_AGENT_DIR` | Full override for agent directory (default `~/<GJC_CONFIG_DIR or .gjc>/agent`) |
+| `GJC_CODING_AGENT_DIR` | Full override for agent directory (default `~/<GJC_CONFIG_DIR or .gjc>/agent`). `gjc setup hermes --coding-agent-dir <abs-path>` renders it into the coordinator server env so bridge-spawned sessions share that broker; it is distinct from `GJC_COORDINATOR_MCP_STATE_ROOT`, which never selects the agent directory. |
 | `PWD`                 | Used when matching canonical current working directory in path helpers        |
 | `GJC_WORKTREE_DIR`     | Directory holding `--worktree` launch worktrees (default `{repo}.gajae-code-worktrees`) |
 
