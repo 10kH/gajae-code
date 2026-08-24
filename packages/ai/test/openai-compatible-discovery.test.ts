@@ -240,23 +240,34 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 	});
 
 	it("accepts only loopback endpoints for implicit local-provider overrides", () => {
-		expect(resolveLoopbackOpenAIBaseUrl("http://localhost:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
+		const fallback = "http://127.0.0.1:8080/v1";
+		const accepted = [
 			"http://localhost:8080/v1",
-		);
-		expect(resolveLoopbackOpenAIBaseUrl("http://[::1]:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
-			"http://[::1]:8080/v1",
-		);
-		expect(resolveLoopbackOpenAIBaseUrl("http://[0:0:0:0:0:0:0:1]:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
-			"http://[0:0:0:0:0:0:0:1]:8080/v1",
-		);
-		expect(resolveLoopbackOpenAIBaseUrl("http://[::ffff:127.0.0.1]:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
-			"http://[::ffff:127.0.0.1]:8080/v1",
-		);
-		expect(resolveLoopbackOpenAIBaseUrl("http://[0:0:0:0:0:ffff:7f00:1]:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
-			"http://[0:0:0:0:0:ffff:7f00:1]:8080/v1",
-		);
-		expect(resolveLoopbackOpenAIBaseUrl("https://provider.example/v1", "http://127.0.0.1:8080/v1")).toBe(
 			"http://127.0.0.1:8080/v1",
-		);
+			"http://127.255.255.254:8080/v1",
+			"http://[::1]:8080/v1",
+			"http://[0:0:0:0:0:0:0:1]:8080/v1",
+			"http://[::ffff:127.0.0.1]:8080/v1",
+			"http://[::ffff:7f00:1]:8080/v1",
+			"http://[0:0:0:0:0:ffff:7f00:1]:8080/v1",
+			"http://[0:0:0:0:0:ffff:7fff:fffe]:8080/v1",
+		];
+		for (const endpoint of accepted) {
+			expect(resolveLoopbackOpenAIBaseUrl(endpoint, fallback)).toBe(endpoint);
+		}
+
+		const rejected = [
+			"https://provider.example/v1",
+			"http://127.0.0.1.example:8080/v1",
+			"http://10.0.0.1:8080/v1",
+			"http://[::2]:8080/v1",
+			"http://[::ffff:126.255.255.255]:8080/v1",
+			"http://[::ffff:128.0.0.1]:8080/v1",
+			"http://[0:0:0:0:0:ffff:7e00:1]:8080/v1",
+			"file:///tmp/models",
+		];
+		for (const endpoint of rejected) {
+			expect(resolveLoopbackOpenAIBaseUrl(endpoint, fallback)).toBe(fallback);
+		}
 	});
 });
