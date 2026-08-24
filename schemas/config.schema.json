@@ -664,7 +664,7 @@
 						"blue",
 						"ouroboros"
 					],
-					"description": "Real-pixel pet living beside the composer (sixel/kitty terminals)",
+					"description": "Animated pet beside the composer (pixel graphics where supported; text cells elsewhere)",
 					"default": "off"
 				}
 			},
