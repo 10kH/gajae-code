@@ -34,7 +34,8 @@ import {
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
-import { $credentialEnv, logger, sanitizeText } from "@gajae-code/utils";
+import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
+import * as logger from "@gajae-code/utils/logger";
 import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
 import type { AttemptScope } from "./attempt-scope";
 import {
@@ -399,11 +400,20 @@ function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
 	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
 }
 
-/** Names of the turn's `\uXXXX`-escaped tool calls, for shape-only diagnostics. */
-function escapedNonAsciiToolNames(message: AssistantMessage): string[] {
-	return message.content
-		.filter(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true)
-		.map(block => (block.type === "toolCall" ? block.name : ""));
+const ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX = 8;
+
+/** Bounded count of the turn's escaped tool calls; tool names are never logged. */
+function escapedNonAsciiToolCallShape(message: AssistantMessage): {
+	escapedToolCallCount: number;
+	escapedToolCallCountCapped: boolean;
+} {
+	const count = message.content.filter(
+		block => block.type === "toolCall" && block.escapedNonAsciiArguments === true,
+	).length;
+	return {
+		escapedToolCallCount: Math.min(count, ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX),
+		escapedToolCallCountCapped: count > ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX,
+	};
 }
 
 /**
@@ -3521,14 +3531,24 @@ async function runLoopBody(
 				// The discard is invisible everywhere else: the defective turn never
 				// reaches durable history, so nothing downstream can count how often
 				// the defect fires or whether steering ever changes the spelling.
-				// Shape-only (tool names + attempt), never the escaped payload.
-				logger.debug("agent: discarded a tool-call turn whose arguments were \\uXXXX-escaped", {
-					attempt: escapedNonAsciiResampleAttempt,
-					budget: MAX_ESCAPED_NONASCII_RESAMPLES,
-					steered: recoveryAttempt?.kind === "escaped-nonascii",
-					managed: config.fallbackManaged === true,
-					tools: escapedNonAsciiToolNames(message),
-				});
+				// Shape-only (bounded count + retry state), never names or payload.
+				const diagnosticShape = escapedNonAsciiToolCallShape(message);
+				logger.debug(
+					"agent: discarded a tool-call turn whose arguments were \\uXXXX-escaped",
+					config.fallbackManaged
+						? {
+								mode: "managed",
+								steeringAttached: recoveryAttempt?.kind === "escaped-nonascii",
+								...diagnosticShape,
+							}
+						: {
+								mode: "in_loop",
+								resampleAttempt: escapedNonAsciiResampleAttempt,
+								resampleBudget: MAX_ESCAPED_NONASCII_RESAMPLES,
+								steeringAttached: recoveryAttempt?.kind === "escaped-nonascii",
+								...diagnosticShape,
+							},
+				);
 				// The defective turn was already committed to the context by the
 				// streaming path. Remove that exact object rather than assuming it is
 				// still the tail: callbacks may append user/system history while the
@@ -4719,9 +4739,10 @@ async function executeToolCalls(
 					// Terminal for this call: the resample budget is already spent, so
 					// log it (shape-only) to make the fire rate measurable without
 					// scraping session transcripts.
-					logger.warn("agent: rejected a tool call whose arguments were \\uXXXX-escaped", {
-						tool: toolCall.name,
-						displaySafeTool: isDisplaySafeEscapedTool(tool),
+					logger.debug("agent: rejected a tool call whose arguments were \\uXXXX-escaped", {
+						mode: "in_loop",
+						toolRegistered: tool !== undefined,
+						displaySafeFieldsDeclared: isDisplaySafeEscapedTool(tool),
 					});
 					throw new Error(
 						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
