@@ -136,9 +136,14 @@ function startPreShutdownUnknownOperationBroker(token: string): { url: string; p
 			},
 		},
 	});
+	const port = server.port;
+	if (port === undefined) {
+		server.stop(true);
+		throw new Error("pre-shutdown fixture port is unavailable");
+	}
 	return {
-		port: server.port,
-		url: `ws://127.0.0.1:${server.port}`,
+		port,
+		url: `ws://127.0.0.1:${port}`,
 		stop() {
 			server.stop(true);
 		},
