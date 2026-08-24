@@ -243,6 +243,12 @@ describe("fetchOpenAICompatibleModels contextWindow & maxTokens discovery", () =
 		expect(resolveLoopbackOpenAIBaseUrl("http://localhost:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
 			"http://localhost:8080/v1",
 		);
+		expect(resolveLoopbackOpenAIBaseUrl("http://[::1]:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
+			"http://[::1]:8080/v1",
+		);
+		expect(resolveLoopbackOpenAIBaseUrl("http://[0:0:0:0:0:0:0:1]:8080/v1", "http://127.0.0.1:8080/v1")).toBe(
+			"http://[0:0:0:0:0:0:0:1]:8080/v1",
+		);
 		expect(resolveLoopbackOpenAIBaseUrl("https://provider.example/v1", "http://127.0.0.1:8080/v1")).toBe(
 			"http://127.0.0.1:8080/v1",
 		);

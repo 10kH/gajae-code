@@ -6,7 +6,7 @@ import { UNK_CONTEXT_WINDOW, UNK_MAX_TOKENS } from "@gajae-code/ai";
 import { hookFetch, Snowflake } from "@gajae-code/utils";
 import { kNoAuth } from "../src/config/model-auth";
 import { ModelRegistry } from "../src/config/model-registry";
-import { resetSettingsForTest, Settings, settings } from "../src/config/settings";
+import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { AuthStorage } from "../src/session/auth-storage";
 
 describe("ModelRegistry vLLM Discovery", () => {
@@ -110,6 +110,7 @@ describe("ModelRegistry vLLM Discovery", () => {
 		using _hook = hookFetch((input, init) => {
 			const url = String(input);
 			if (url.includes(":8000/v1/models")) {
+				expect(init?.redirect).toBe("error");
 				const headers = init?.headers as Headers | Record<string, string> | undefined;
 				const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
 				expect(authHeader).toBe("Bearer test-vllm-key");
@@ -135,28 +136,62 @@ describe("ModelRegistry vLLM Discovery", () => {
 		expect(await registry.getApiKey(model!)).toBe("test-vllm-key");
 	});
 
-	test("rejects a remote implicit endpoint so its provider credential cannot be exfiltrated", async () => {
-		Bun.env.VLLM_BASE_URL = "https://untrusted.example/v1";
+	test("honors a trusted remote VLLM_BASE_URL when a credential is present", async () => {
+		Bun.env.VLLM_BASE_URL = "https://trusted-vllm.example/v1";
 		authStorage.setRuntimeApiKey("vllm", "test-vllm-key");
-		const requestedUrls: string[] = [];
 
 		using _hook = hookFetch((input, init) => {
-			const url = String(input);
-			requestedUrls.push(url);
-			if (url.includes(":8000/v1/models")) {
-				const headers = init?.headers as Headers | Record<string, string> | undefined;
-				const authorization = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
-				expect(authorization).toBe("Bearer test-vllm-key");
-				return new Response(JSON.stringify({ data: [{ id: "loopback-vllm-model" }] }), { status: 200 });
-			}
+			expect(String(input)).toBe("https://trusted-vllm.example/v1/models");
+			expect(init?.redirect).toBe("error");
+			const headers = init?.headers as Headers | Record<string, string> | undefined;
+			const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
+			expect(authHeader).toBe("Bearer test-vllm-key");
+			return new Response(JSON.stringify({ data: [{ id: "remote-vllm-model" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refreshProvider("vllm", "online");
+
+		expect(registry.find("vllm", "remote-vllm-model")?.baseUrl).toBe("https://trusted-vllm.example/v1");
+	});
+
+	test("treats the empty-login vLLM sentinel as keyless", async () => {
+		authStorage.setRuntimeApiKey("vllm", "vllm-local");
+
+		using _hook = hookFetch((input, init) => {
+			if (!String(input).includes(":8000/v1/models")) return new Response(null, { status: 404 });
+			const headers = init?.headers as Headers | Record<string, string> | undefined;
+			const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
+			expect(authHeader).toBeUndefined();
+			return new Response(JSON.stringify({ data: [{ id: "sentinel-keyless-vllm-model" }] }), {
+				status: 200,
+				headers: { "Content-Type": "application/json" },
+			});
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		await registry.refresh();
+
+		expect(registry.find("vllm", "sentinel-keyless-vllm-model")).toBeDefined();
+	});
+
+	test("does not let the empty-login sentinel authorize remote discovery", async () => {
+		Bun.env.VLLM_BASE_URL = "https://vllm.example.test/v1";
+		authStorage.setRuntimeApiKey("vllm", "vllm-local");
+		let requestedRemote = false;
+
+		using _hook = hookFetch(input => {
+			if (String(input) === "https://vllm.example.test/v1/models") requestedRemote = true;
 			return new Response(null, { status: 404 });
 		});
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		await registry.refresh();
 
-		expect(registry.find("vllm", "loopback-vllm-model")).toBeDefined();
-		expect(requestedUrls.some(url => url.includes("untrusted.example"))).toBe(false);
+		expect(requestedRemote).toBe(false);
 	});
 
 	test("accepts a loopback VLLM_BASE_URL override for the implicit endpoint", async () => {
@@ -183,7 +218,7 @@ describe("ModelRegistry vLLM Discovery", () => {
 		using _hook = hookFetch(input => {
 			if (!String(input).includes(":8000/v1/models")) return new Response(null, { status: 404 });
 			return new Response(
-				'{"data":[{"id":"invalid-limits","max_model_len":1e400,"context_length":-1,"max_tokens":0},{"id":42},{"id":"valid-model","max_model_len":"131072","max_tokens":"8192"}]}',
+				'{"data":[{"id":"invalid-limits","max_model_len":1e400,"context_length":-1,"max_tokens":0},{"id":"fractional-limits","max_model_len":1.5,"max_tokens":2.5},{"id":"unsafe-limits","max_model_len":9007199254740992,"max_tokens":9007199254740992},{"id":42},{"id":"valid-model","max_model_len":"131072","max_tokens":"8192"}]}',
 				{ status: 200, headers: { "Content-Type": "application/json" } },
 			);
 		});
@@ -193,12 +228,38 @@ describe("ModelRegistry vLLM Discovery", () => {
 
 		expect(registry.find("vllm", "invalid-limits")?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
 		expect(registry.find("vllm", "invalid-limits")?.maxTokens).toBe(UNK_MAX_TOKENS);
+		expect(registry.find("vllm", "fractional-limits")?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+		expect(registry.find("vllm", "fractional-limits")?.maxTokens).toBe(UNK_MAX_TOKENS);
+		expect(registry.find("vllm", "unsafe-limits")?.contextWindow).toBe(UNK_CONTEXT_WINDOW);
+		expect(registry.find("vllm", "unsafe-limits")?.maxTokens).toBe(UNK_MAX_TOKENS);
 		expect(registry.find("vllm", "42")).toBeUndefined();
 		expect(registry.find("vllm", "valid-model")?.contextWindow).toBe(131072);
 		expect(registry.find("vllm", "valid-model")?.maxTokens).toBe(8192);
 	});
 
-	test("suppresses the implicit vLLM entry when the provider is disabled", async () => {
+	test("treats an unreachable implicit vLLM server as optional", async () => {
+		using _hook = hookFetch((input, init) => {
+			if (String(input).includes(":8000/v1/models")) {
+				const response = Promise.withResolvers<Response>();
+				init?.signal?.addEventListener(
+					"abort",
+					() => response.reject(new DOMException("The operation was aborted", "AbortError")),
+					{ once: true },
+				);
+				return response.promise;
+			}
+			return new Response(null, { status: 404 });
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const startedAt = performance.now();
+		await registry.refresh();
+
+		expect(performance.now() - startedAt).toBeLessThan(2_000);
+		expect(registry.getAll().some(model => model.provider === "vllm" && model.id === "unreachable")).toBe(false);
+	});
+
+	test("suppresses implicit vLLM descriptor discovery when the provider is disabled", async () => {
 		await Settings.init({
 			inMemory: true,
 			overrides: {
@@ -213,19 +274,13 @@ describe("ModelRegistry vLLM Discovery", () => {
 		});
 
 		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		expect(registry.getDiscoverableProviders()).not.toContain("vllm");
 
 		await registry.refresh("online");
 
 		expect(requestedUrls.some(url => url.includes("127.0.0.1:8000"))).toBe(false);
-
-		settings.override("disabledProviders", []);
-		await registry.refresh("offline");
-
-		expect(registry.getDiscoverableProviders()).toContain("vllm");
 	});
 
-	test("suppresses the implicit vLLM entry when vllm is explicitly configured in models.yml", async () => {
+	test("suppresses implicit vLLM discovery when vllm is explicitly configured in models.yml", async () => {
 		fs.writeFileSync(
 			modelsJsonPath,
 			JSON.stringify({
@@ -243,6 +298,7 @@ describe("ModelRegistry vLLM Discovery", () => {
 		using _hook = hookFetch(input => {
 			const url = String(input);
 			requestedUrls.push(url);
+			if (url === "http://127.0.0.1:8000/v1/models") throw new Error(`Unexpected vLLM discovery request: ${url}`);
 			return new Response(null, { status: 404 });
 		});
 
@@ -252,6 +308,7 @@ describe("ModelRegistry vLLM Discovery", () => {
 		await registry.refresh();
 
 		expect(registry.find("vllm", "configured-vllm-model")).toBeDefined();
+		expect(requestedUrls).not.toContain("http://127.0.0.1:8000/v1/models");
 	});
 
 	test("does not apply oMLX-only reasoning metadata to discovered vLLM models", async () => {
@@ -275,13 +332,6 @@ describe("ModelRegistry vLLM Discovery", () => {
 		const model = registry.find("vllm", "Qwen3.6-35B-A3B-8bit");
 		expect(model?.reasoning).toBeFalsy();
 		expect(model?.thinking).toBeUndefined();
-		// supportsReasoningEffort and thinkingFormat are set together only on the
-		// `providerConfig.provider === "omlx"` branch, so pinning this one value
-		// (matching the toMatchObject style omlx-discovery.test.ts uses for the
-		// same union-typed `compat` field) is sufficient to prove that branch
-		// wasn't taken for vLLM.
-		expect(model?.compat).toMatchObject({
-			supportsReasoningEffort: false,
-		});
+		expect(model?.compat).toBeUndefined();
 	});
 });

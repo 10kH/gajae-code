@@ -651,14 +651,14 @@ Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entrie
 
 ### Implicit vLLM discovery
 
-If `vllm` is not explicitly configured, registry adds an implicit discoverable provider:
+If `vllm` is not explicitly configured, its bundled provider descriptor discovers the local server implicitly:
 
 - provider: `vllm`
 - api: `openai-completions`
-- base URL: `VLLM_BASE_URL` or `http://127.0.0.1:8000/v1` (loopback-only — a project `.env` cannot redirect this to a remote host)
+- base URL: trusted `VLLM_BASE_URL` or `http://127.0.0.1:8000/v1` (a project `.env` cannot redirect authenticated traffic)
 - auth mode: keyless (`auth: none` behavior), `VLLM_API_KEY` attaches when present
 
-Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `max_model_len` support. A remote vLLM server (e.g. a LAN GPU box) isn't picked up by this loopback-only default — point at it via a trusted shell/user-env `VLLM_BASE_URL`, or configure it explicitly under `providers` as shown below.
+Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `max_model_len` support. Credentialless implicit discovery is limited to loopback. For a remote vLLM server (for example, a LAN GPU box), set `VLLM_BASE_URL` and `VLLM_API_KEY` in the launching shell or a user-owned GJC environment file, or configure it explicitly under `providers` as shown below.
 
 ### Explicit provider discovery
 
