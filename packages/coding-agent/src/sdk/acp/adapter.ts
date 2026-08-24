@@ -524,6 +524,7 @@ export class AcpSdkAdapter {
 		if (typeof result.leaseId !== "string")
 			throw new AcpSdkAdapterError("invalid_reverse_frame", "Provider registration omitted leaseId.");
 		this.#leases.set(provider.capability, result.leaseId);
+		if (previousLeaseId && previousLeaseId !== result.leaseId) this.#abortReverseForCapability(provider.capability);
 	}
 
 	async #activateProviders(force = false): Promise<void> {
@@ -847,9 +848,8 @@ export class AcpSdkAdapter {
 		capability: string,
 		leaseId: string,
 	): boolean {
-		// Same-owner rebind keeps a capability lease, so captured-identity completion
-		// remains valid. Foreign quarantine deletes the capability and aborts these
-		// requests in #abortReverseForCapability.
+		// Respond only for the currently owned lease id. A same-owner rebind that
+		// rotates the id aborts captured requests in registerProvider.
 		return (
 			this.#reverseRequests.get(id) === request &&
 			request.state === "pending" &&
@@ -858,7 +858,7 @@ export class AcpSdkAdapter {
 			request.connectionId === connectionId &&
 			request.capability === capability &&
 			request.leaseId === leaseId &&
-			this.#leases.has(capability)
+			this.#leases.get(capability) === leaseId
 		);
 	}
 
