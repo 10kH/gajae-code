@@ -728,14 +728,31 @@ describe("status line overflow cue never relies on defensive truncation", () => 
 	// would be replaced by whatever the final width truncation happened to emit.
 	it.each([1, 2, 3])("keeps every row within width across a width sweep (maxRows %i)", maxRows => {
 		for (let width = 0; width <= 60; width += 1) {
-			const rendered = build(maxRows, ["session_name", "time", "cost", "context_pct", "hostname"]).render(width);
+			const component = build(maxRows, ["session_name", "time", "cost", "context_pct", "hostname"]);
+
+			// Inspect the RAW rows first. `render()` applies a defensive
+			// truncateToWidth afterwards, so asserting only on rendered output cannot
+			// distinguish a reserved marker from an ellipsis that truncation
+			// manufactured. Raw rows already fitting the width is what proves the
+			// reservation did the work.
+			const rawRows =
+				width > 0
+					? component
+							.getPreviewContent(width)
+							.split("\n")
+							.filter(row => row !== "")
+					: [];
+			for (const rawRow of rawRows) {
+				expect(visibleWidth(rawRow)).toBeLessThanOrEqual(width);
+			}
+
+			const rendered = component.render(width);
 			for (const row of rendered) {
 				expect(visibleWidth(row)).toBeLessThanOrEqual(width);
 			}
 			// A cue, when present, must carry an exact count or no count at all --
 			// never a partial number left behind by truncation.
-			const text = strip(rendered.join("\n"));
-			const partial = text.match(/…\+(\d*)$/);
+			const partial = strip(rawRows.join("\n")).match(/…\+(\d*)$/);
 			if (partial) expect(partial[1]).not.toBe("");
 		}
 	});
