@@ -709,6 +709,27 @@ export class StatusLineComponent implements Component {
 		return partsWidth + sepTotal + 2 + capWidth;
 	}
 
+	/**
+	 * Render the overflow cue for evicted status segments.
+	 *
+	 * Deliberately bypasses `#renderStatusGroup`: that primitive spends two
+	 * padding cells plus any end cap before content (see `#groupWidth`), so it
+	 * cannot produce marker-only output at one or two columns. Emits the bare
+	 * marker with no padding and no caps so the final `truncateToWidth` in
+	 * `render()` stays a defensive guard rather than the thing that decides
+	 * whether the cue survives.
+	 *
+	 * `…+N` needs `2 + digits(N)` cells. When that does not fit, the count is
+	 * intentionally omitted rather than truncated into a wrong number, so the
+	 * cue is either exact or countless — never misleading.
+	 */
+	#renderOverflowMarker(count: number, available: number): string {
+		if (available <= 0 || count <= 0) return "";
+		const withCount = `…+${count}`;
+		const text = visibleWidth(withCount) <= available ? withCount : "…";
+		return theme.fg("dim", text);
+	}
+
 	#renderStatusGroup(
 		parts: string[],
 		direction: "left" | "right",
@@ -855,54 +876,79 @@ export class StatusLineComponent implements Component {
 		const seg = precollected ?? this.#collectStatusSegments(width, this.#resolveSettings());
 		const { ctx, separatorDef, bgAnsi, fgAnsi, sepAnsi, previewHighlightSegment } = seg;
 		const { leftSepWidth, rightSepWidth, leftCapWidth, rightCapWidth } = seg;
-		const left = [...seg.left];
-		const leftIds = [...seg.leftSegIds];
-		const right = [...seg.right];
 		const topFillWidth = Math.max(0, width);
 
-		let leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
-		let rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
-		const totalWidth = () => leftWidth + rightWidth + (left.length > 0 && right.length > 0 ? 1 : 0);
+		/**
+		 * Evict against `budget` using the existing configured-order semantics
+		 * (shrink path, then pop right, then pop left) and report how many
+		 * segments were dropped. Runs from the original segment lists each time so
+		 * the marker reservation can be recomputed without compounding evictions.
+		 */
+		const layout = (budget: number) => {
+			const left = [...seg.left];
+			const leftIds = [...seg.leftSegIds];
+			const right = [...seg.right];
+			let leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
+			let rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
+			const totalWidth = () => leftWidth + rightWidth + (left.length > 0 && right.length > 0 ? 1 : 0);
+			let dropped = 0;
 
-		if (topFillWidth > 0) {
-			// Shrink path before dropping right-side telemetry — path is the only elastic segment,
-			// and presets such as default-usage should not hide usage just because cwd is long.
-			const pathIdx = leftIds.indexOf("path");
-			if (pathIdx >= 0 && totalWidth() > topFillWidth) {
-				const overflow = totalWidth() - topFillWidth;
-				const shrunk = this.#shrinkPathToWidth(left[pathIdx], ctx, overflow);
-				if (shrunk !== null) {
-					left[pathIdx] = previewHighlightSegment === "path" ? `\x1b[7m${shrunk}\x1b[27m` : shrunk;
+			if (topFillWidth > 0) {
+				// Shrink path before dropping right-side telemetry — path is the only elastic segment,
+				// and presets such as default-usage should not hide usage just because cwd is long.
+				const pathIdx = leftIds.indexOf("path");
+				if (pathIdx >= 0 && totalWidth() > budget) {
+					const overflow = totalWidth() - budget;
+					const shrunk = this.#shrinkPathToWidth(left[pathIdx], ctx, overflow);
+					if (shrunk !== null) {
+						left[pathIdx] = previewHighlightSegment === "path" ? `\x1b[7m${shrunk}\x1b[27m` : shrunk;
+						leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
+					}
+				}
+				while (totalWidth() > budget && right.length > 0) {
+					right.pop();
+					dropped += 1;
+					rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
+				}
+				while (totalWidth() > budget && left.length > 0) {
+					left.pop();
+					leftIds.pop();
+					dropped += 1;
 					leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
 				}
 			}
-			while (totalWidth() > topFillWidth && right.length > 0) {
-				right.pop();
-				rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
-			}
-			while (totalWidth() > topFillWidth && left.length > 0) {
-				left.pop();
-				leftIds.pop();
-				leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
-			}
+			return { left, right, leftWidth, rightWidth, dropped };
+		};
+
+		// First pass with the full budget establishes whether anything is lost at
+		// all. Only after loss is detected do we reserve marker cells, so a rail
+		// that already fits is byte-identical to before.
+		let placed = layout(topFillWidth);
+		let reserved = 0;
+		if (placed.dropped > 0 && topFillWidth > 0) {
+			reserved = Math.min(topFillWidth, visibleWidth(`…+${placed.dropped}`));
+			// Re-evict against the reduced budget so the cue never overflows the
+			// rail. The reservation can push out another segment; the recomputed
+			// count covers it, and the marker degrades to a bare `…` when the
+			// larger count no longer fits the cells we reserved.
+			placed = layout(Math.max(0, topFillWidth - reserved));
+		}
+		const marker = this.#renderOverflowMarker(placed.dropped, reserved);
+
+		const leftGroup = this.#renderStatusGroup(placed.left, "left", separatorDef, bgAnsi, fgAnsi, sepAnsi);
+		const rightGroup = this.#renderStatusGroup(placed.right, "right", separatorDef, bgAnsi, fgAnsi, sepAnsi);
+		if (!leftGroup && !rightGroup) return marker;
+
+		if (topFillWidth === 0 || placed.left.length === 0 || placed.right.length === 0) {
+			return leftGroup + (leftGroup && rightGroup ? " " : "") + rightGroup + marker;
 		}
 
-		const leftGroup = this.#renderStatusGroup(left, "left", separatorDef, bgAnsi, fgAnsi, sepAnsi);
-		const rightGroup = this.#renderStatusGroup(right, "right", separatorDef, bgAnsi, fgAnsi, sepAnsi);
-		if (!leftGroup && !rightGroup) return "";
-
-		if (topFillWidth === 0 || left.length === 0 || right.length === 0) {
-			return leftGroup + (leftGroup && rightGroup ? " " : "") + rightGroup;
-		}
-
-		leftWidth = this.#groupWidth(left, leftCapWidth, leftSepWidth);
-		rightWidth = this.#groupWidth(right, rightCapWidth, rightSepWidth);
-		const gapWidth = Math.max(1, topFillWidth - leftWidth - rightWidth);
+		const gapWidth = Math.max(1, topFillWidth - placed.leftWidth - placed.rightWidth - visibleWidth(marker));
 		const sessionName = seg.sessionAccent !== false ? this.session.sessionManager?.getSessionName() : undefined;
 		const accentHex = sessionName ? getSessionAccentHex(sessionName) : undefined;
 		const gapColor = getSessionAccentAnsi(accentHex) ?? theme.getFgAnsi("border");
 		const gapFill = `${gapColor}${theme.boxRound.horizontal.repeat(gapWidth)}\x1b[39m`;
-		return leftGroup + gapFill + rightGroup;
+		return leftGroup + gapFill + rightGroup + marker;
 	}
 
 	/**
@@ -986,7 +1032,9 @@ export class StatusLineComponent implements Component {
 
 			const packedRows: string[][] = [];
 			let current: string[] = [];
-			for (const item of items) {
+			let dropped = 0;
+			for (let index = 0; index < items.length; index += 1) {
+				const item = items[index];
 				if (current.length === 0) {
 					current.push(item.content);
 					continue;
@@ -997,16 +1045,48 @@ export class StatusLineComponent implements Component {
 				} else {
 					packedRows.push(current);
 					current = [item.content];
-					if (packedRows.length >= maxRows) break;
+					if (packedRows.length >= maxRows) {
+						// `current` holds the item that opened the row we cannot admit,
+						// and everything after it is never visited: all of it is lost.
+						dropped = items.length - index;
+						current = [];
+						break;
+					}
 				}
 			}
-			if (packedRows.length < maxRows && current.length > 0) {
-				packedRows.push(current);
+			if (current.length > 0) {
+				if (packedRows.length < maxRows) packedRows.push(current);
+				else dropped += current.length;
 			}
 
-			rows = packedRows.map(row =>
-				this.#renderStatusGroup(row, "left", seg.separatorDef, seg.bgAnsi, seg.fgAnsi, seg.sepAnsi),
-			);
+			// Reserve marker cells in the final admitted row, evicting from its tail
+			// until the cue fits. Never opens a new row: that would contradict maxRows.
+			const lastRow = packedRows[packedRows.length - 1];
+			let marker = "";
+			if (dropped > 0 && lastRow && topFillWidth > 0) {
+				let reserved = Math.min(topFillWidth, visibleWidth(`…+${dropped}`));
+				while (
+					lastRow.length > 1 &&
+					this.#groupWidth(lastRow, seg.leftCapWidth, seg.leftSepWidth) + reserved > topFillWidth
+				) {
+					lastRow.pop();
+					dropped += 1;
+					reserved = Math.min(topFillWidth, visibleWidth(`…+${dropped}`));
+				}
+				marker = this.#renderOverflowMarker(dropped, reserved);
+			}
+
+			rows = packedRows.map((row, index) => {
+				const rendered = this.#renderStatusGroup(
+					row,
+					"left",
+					seg.separatorDef,
+					seg.bgAnsi,
+					seg.fgAnsi,
+					seg.sepAnsi,
+				);
+				return index === packedRows.length - 1 ? rendered + marker : rendered;
+			});
 		}
 
 		this.#renderedRowsCache = { key: cacheKey, rows };
