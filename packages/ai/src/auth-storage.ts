@@ -3119,6 +3119,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "sglang": {
+				const { loginSglang } = await import("./utils/oauth/sglang");
+				const apiKey = await loginSglang(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "parallel": {
 				const { loginParallel } = await import("./utils/oauth/parallel");
 				const apiKey = await loginParallel(ctrl);

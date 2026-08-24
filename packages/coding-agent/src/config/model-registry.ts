@@ -1844,7 +1844,8 @@ export class ModelRegistry {
 			providerConfig.discovery.type === "openai-models-list" ||
 			providerConfig.discovery.type === "lm-studio" ||
 			providerConfig.discovery.type === "omlx" ||
-			providerConfig.discovery.type === "vllm"
+			providerConfig.discovery.type === "vllm" ||
+			providerConfig.discovery.type === "sglang"
 				? this.#normalizeOpenAIModelsListBaseUrl(
 						this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
 					)
@@ -2531,8 +2532,8 @@ export class ModelRegistry {
 		}
 		const effectiveProviderConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveProviderConfig.baseUrl ?? "");
-		const allowsKeylessVllmDiscovery =
-			provider !== "vllm" ||
+		const allowsKeylessLocalDiscovery =
+			(provider !== "vllm" && provider !== "sglang") ||
 			(isAuthenticated(preflightApiKey) && !isVllmNoAuthToken(provider, preflightApiKey)) ||
 			effectiveProviderConfig.baseUrl === undefined ||
 			resolveLoopbackOpenAIBaseUrl(effectiveProviderConfig.baseUrl, "") === effectiveProviderConfig.baseUrl;
@@ -2558,7 +2559,7 @@ export class ModelRegistry {
 				fetched: false,
 			};
 		}
-		if (!allowsKeylessVllmDiscovery) {
+		if (!allowsKeylessLocalDiscovery) {
 			return {
 				provider: effectiveProviderConfig.provider,
 				current: true,
@@ -2696,6 +2697,7 @@ export class ModelRegistry {
 			case "lm-studio":
 			case "omlx":
 			case "vllm":
+			case "sglang":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 			case "models-dev":
@@ -2709,11 +2711,13 @@ export class ModelRegistry {
 	): Promise<Model<Api>[]> {
 		// Skip providers already handled by configured discovery (e.g. user-configured ollama with discovery.type)
 		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(p => p.provider));
-		// An explicit static vLLM provider owns its catalog. Unlike other standard
-		// descriptors, vLLM also supports credentialless implicit discovery, so
-		// leaving it eligible here would probe and merge models the user did not
-		// request. Explicit discovery remains available through discovery.type.
+		// An explicit static vLLM/SGLang provider owns its catalog. Unlike other
+		// standard descriptors, vLLM and SGLang also support credentialless
+		// implicit discovery, so leaving them eligible here would probe and merge
+		// models the user did not request. Explicit discovery remains available
+		// through discovery.type.
 		if (this.#configuredProviderIds.has("vllm")) configuredDiscoveryProviders.add("vllm");
+		if (this.#configuredProviderIds.has("sglang")) configuredDiscoveryProviders.add("sglang");
 		const managerOptions = (await this.#collectBuiltInModelManagerOptions(configuredDiscoveryProviders)).filter(
 			entry => (providerFilter ? providerFilter.has(entry.options.providerId) : true),
 		);
@@ -2802,7 +2806,7 @@ export class ModelRegistry {
 			const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId);
 			const allowsKeylessDiscovery =
 				descriptor.allowUnauthenticated &&
-				(descriptor.providerId !== "vllm" ||
+				((descriptor.providerId !== "vllm" && descriptor.providerId !== "sglang") ||
 					baseUrl === undefined ||
 					resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl);
 			if (
@@ -3253,9 +3257,15 @@ export class ModelRegistry {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
+		const hardenedLocalDiscovery =
+			(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang") &&
+			resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
 		const response = await fetch(modelsUrl, {
 			headers: requestHeaders,
-			signal: AbortSignal.timeout(5_000),
+			...(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang"
+				? { redirect: "error" as const }
+				: {}),
+			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : 5_000),
 		});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {
@@ -4249,7 +4259,8 @@ export class ModelRegistry {
 							: discoveryType === "openai-models-list" ||
 									discoveryType === "lm-studio" ||
 									discoveryType === "omlx" ||
-									discoveryType === "vllm"
+									discoveryType === "vllm" ||
+									discoveryType === "sglang"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
 								: (baseUrl ?? ""),
 					);

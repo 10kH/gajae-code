@@ -49,6 +49,7 @@ export type OAuthProvider =
 	| "perplexity"
 	| "qianfan"
 	| "qwen-portal"
+	| "sglang"
 	| "synthetic"
 	| "tavily"
 	| "together"

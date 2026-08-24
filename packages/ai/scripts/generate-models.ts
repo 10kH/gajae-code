@@ -711,7 +711,7 @@ async function generateModels() {
 	// credentials are unavailable, and ad-hoc model additions all persist
 	// through the existing models.json seed.
 	// Discovery-only providers (local inference servers) — never bundle static models.
-	const discoveryOnlyProviders = new Set(["ollama", "vllm"]);
+	const discoveryOnlyProviders = new Set(["ollama", "sglang", "vllm"]);
 	const fetchedKeys = new Set(allModels.map(model => `${model.provider}/${model.id}`));
 
 	for (const models of Object.values(prevModelsJson as Record<string, Record<string, Model>>)) {
