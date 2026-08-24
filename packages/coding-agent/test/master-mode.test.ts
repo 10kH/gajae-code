@@ -10,6 +10,7 @@ import {
 	MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
 } from "@gajae-code/coding-agent/master-mode/first-request";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
+import type { SessionListOutcome } from "@gajae-code/coding-agent/sdk/lifecycle/service";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Snowflake } from "@gajae-code/utils";
@@ -83,7 +84,8 @@ describe("master mode prompt integration", () => {
 });
 
 describe("master peer snapshot contributor", () => {
-	const resultFor = (cwd: string, worktreeRoot: string | null) => ({
+	const resultFor = (cwd: string, worktreeRoot: string | null): SessionListOutcome =>
+		({
 		ok: true as const,
 		operation: "session.list",
 		result: {
@@ -108,7 +110,7 @@ describe("master peer snapshot contributor", () => {
 						],
 			warnings: [],
 		},
-	});
+	}) as unknown as SessionListOutcome;
 
 	it("collects once, excludes self, and skips after a persisted injection", async () => {
 		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-master-contrib-")));

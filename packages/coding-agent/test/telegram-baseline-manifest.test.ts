@@ -337,7 +337,8 @@ describe("test manifest runner", () => {
 		// Derived from the manifest, not hardcoded: adding one operation adds one
 		// row per adapter, and a literal total silently goes stale.
 		const perAdapter = new Map<string, number>();
-		for (const row of manifest.rows) perAdapter.set(row.adapter, (perAdapter.get(row.adapter) ?? 0) + 1);
+		for (const row of manifest.rows as unknown as readonly { adapter: string }[])
+			perAdapter.set(row.adapter, (perAdapter.get(row.adapter) ?? 0) + 1);
 		const breakdown = [...perAdapter.entries()].map(([adapter, count]) => `${adapter}=${count}`).join(", ");
 		expect(output(result)).toContain(`manifest row receipts complete: ${manifest.rows.length} (${breakdown})`);
 		// Receipts run concurrently inside a phase, so their relative order carries
