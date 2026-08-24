@@ -510,6 +510,10 @@ describe("native release binary coverage", () => {
 		expect(finalize).toContain("softprops/action-gh-release");
 		expect(finalize).toContain("draft: false");
 		expect(finalize).toContain("release-binaries/gjc-*");
+		expect(finalize).toContain("gajae-release-binaries-v1.json");
+		expect(finalize).toContain("gajae-release-binaries.sha256");
+		expect(finalize).toContain("Publish binary checksum manifest");
+		expect(finalize.indexOf("Publish binary checksum manifest")).toBeLessThan(finalize.indexOf("Create GitHub Release"));
 		expect(finalize).toContain("gajae-release-packages-v1.json");
 		expect(finalize).toContain("gajae-release-channel-v1.json");
 		expect(finalize).toContain("fail_on_unmatched_files: true");
@@ -549,7 +553,7 @@ describe("native release binary coverage", () => {
 		const installer = await Bun.file(path.join(repoRoot, "scripts/install.sh")).text();
 
 		expect(installer).toContain("No prebuilt GJC binary was found for ${PLATFORM}-${ARCH} in ${LATEST}.");
-		expect(installer).toContain("Re-run this installer with --source");
+		expect(installer).toContain("Re-run this installer with --source if you are developing GJC and already have Bun");
 		expect(installer).toContain("Expected asset URL: $BINARY_URL");
 	});
 

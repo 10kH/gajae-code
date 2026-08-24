@@ -82,8 +82,10 @@ describe("startup update contract", () => {
 		expect(setting.default).toBe(true);
 		expect(setting.ui.description).toContain("At interactive startup, notify");
 		expect(setting.ui.description).toContain("never install");
-		expect(setting.ui.description).toContain("Use `gjc update` only");
-		expect(setting.ui.description).toContain("source, linked, and unrecognized installs use their original method");
+		expect(setting.ui.description).toContain("`gjc update` installs the matching GitHub release binary");
+		expect(setting.ui.description).toContain(
+			"Source, linked, and unrecognized installs stay on their original method",
+		);
 	});
 	it("displays the changelog without rewriting malformed global YAML", async () => {
 		using tempDir = TempDir.createSync("@gjc-malformed-changelog-");

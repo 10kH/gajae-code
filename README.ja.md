@@ -57,11 +57,21 @@ Gajae-Code（`gjc`）は外付けのコーディングエージェントハー�
 
 ## クイックスタート
 
-**インストール** — Linux（x64/arm64）、macOS（arm64/x64）、Windows（x64）向けビルド済みバイナリを提供。npm/Bun 経由はどこでも動作:
+**インストール** — Linux（x64/arm64）、macOS（arm64/x64）、Windows（x64）向けビルド済みバイナリ。Bun は不要です:
 
 ```sh
-bun install -g gajae-code
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
 gjc
+```
+
+`main` をパイプすると可変のインストーラが実行されます。最新インストーラが必要なときだけ使ってください。
+
+Windows（PowerShell、タグ固定）:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
 ```
 
 **初回利用** — プランを選んで出発:
@@ -82,7 +92,7 @@ gjc --tmux --worktree my-task      # リスクの高い作業向けの隔離ワ�
 gjc @screenshot.png "何を変えるべき？"   # 画像入力
 ```
 
-Nightly チャンネル: `bun install -g gajae-code@nightly`。インストールマトリクス全体、Windows 設定、更新チャンネル、シェル補完: [docs/install.md](docs/install.md)。
+Nightly チャンネル: `sh gjc-install.sh --channel nightly`（上でダウンロードしたタグ付きインストーラ）。インストールマトリクス全体、Windows 設定、更新チャンネル、シェル補完: [docs/install.md](docs/install.md)。Bun が必要なのはソースからのビルドだけです。
 
 ---
 

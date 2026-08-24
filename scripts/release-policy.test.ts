@@ -379,6 +379,9 @@ describe("stable release policy", () => {
 		expect(finalize).toContain("gajae-release-packages-expected-v1.json");
 		expect(finalize).toContain("gajae-release-packages-v1.json");
 		expect(finalize).toContain("gajae-release-channel-v1.json");
+		expect(finalize).toContain("gajae-release-binaries-v1.json");
+		expect(finalize).toContain("gajae-release-binaries.sha256");
+		expect(finalize).toContain("Publish binary checksum manifest");
 	});
 	test("updates owned Bun lock versions without re-resolving third-party packages", () => {
 		const lock = `{

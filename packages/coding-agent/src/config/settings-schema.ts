@@ -1675,7 +1675,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "interaction",
 			label: "Check for Updates",
 			description:
-				"At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
+				"At interactive startup, notify of newer versions; never install. `gjc update` installs the matching GitHub release binary. Source, linked, and unrecognized installs stay on their original method.",
 		},
 	},
 
@@ -1688,8 +1688,8 @@ export const SETTINGS_SCHEMA = {
 			label: "Update Channel",
 			description: "Release channel used by `gjc update` and the startup update check",
 			options: [
-				{ value: "stable", label: "Stable", description: "Track stable releases (npm `latest` dist-tag)" },
-				{ value: "nightly", label: "Nightly", description: "Track nightly prereleases (npm `nightly` dist-tag)" },
+				{ value: "stable", label: "Stable", description: "Track stable GitHub releases" },
+				{ value: "nightly", label: "Nightly", description: "Track nightly GitHub prereleases" },
 			],
 		},
 	},
