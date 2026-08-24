@@ -656,6 +656,45 @@ describe("Broker spawn close and orphan reaper", () => {
 		}
 	});
 
+	it("rejects an unknown model profile before any substrate effect", async () => {
+		const agentDir = await temp();
+		let launches = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => {
+					launches += 1;
+					return {
+						ok: true as const,
+						proof: { substrateKind: "headless" as const, providerIdentity: "p", pid: 991, processIncarnation: "inc-991" },
+					};
+				},
+				verify: async () => "verified" as const,
+				close: async () => ({ ok: true }),
+			},
+			spawnPromptLayer: promptLayer,
+		});
+		await broker.start();
+		try {
+			const response = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), modelPreset: "definitely-not-a-profile" },
+				"bad-profile-key",
+			);
+			expect(response).toMatchObject({ ok: false });
+			// The failure must be typed and pre-effect, not uncertainty after launch.
+			expect((response as { error: { code: string } }).error.code).not.toBe("terminal_uncertain");
+			expect(launches).toBe(0);
+			// No durable claim is committed either: the rejection precedes claimOrJoin.
+			const journal = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
+			await journal.open();
+			expect(journal.claims()).toHaveLength(0);
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("pins child registration to the launch locator and the dispatch endpoint", async () => {
 		const agentDir = await temp();
 		const seen: { pinned?: { endpointGeneration: number; pid: number } } = {};

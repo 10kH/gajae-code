@@ -39,7 +39,13 @@ import {
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
 } from "./spawn-authority";
-import { canonicalDeleteLocatorPath, executeLifecycle, isCanonicalSessionId, prepareSpawnChildHostLaunch } from "./lifecycle";
+import {
+	canonicalDeleteLocatorPath,
+	executeLifecycle,
+	isCanonicalSessionId,
+	prepareSpawnChildHostLaunch,
+	validateBrokerModelPreset,
+} from "./lifecycle";
 import { createSpawnSubstrateProvider } from "./spawn-substrate";
 import {
 	type LifecycleDurableEffectsReceipt,
@@ -1137,6 +1143,14 @@ export class Broker {
 				admission.masterCapability = "";
 			}
 			if (!verified.allowed) return (response = error("spawn_failed", "master capability verification was denied"));
+			// Validate the optional profile BEFORE any durable claim or substrate
+			// effect. Generic lifecycle create validates it; spawn branched earlier
+			// and skipped it, so an unknown profile launched a substrate and only
+			// failed later as uncertainty instead of a typed pre-effect error.
+			if (admission.modelPreset !== undefined) {
+				const validated = validateBrokerModelPreset(this.settings.agentDir, admission.modelPreset);
+				if (isBrokerResponse(validated)) return (response = validated);
+			}
 			const key = await getBrokerIdentityKey(this.settings.agentDir);
 			const bindingMac = createHmac("sha256", Buffer.from(key, "hex"))
 				.update(canonicalJson({ version: 1, operation: "session.spawn", ownerSessionId: admission.ownerSessionId, attestationEpoch: admission.attestationEpoch, cwd: admission.cwd, modelId: admission.modelId ?? null, modelPreset: admission.modelPreset ?? null }))

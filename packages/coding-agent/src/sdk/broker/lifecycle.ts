@@ -611,7 +611,7 @@ function text(value: unknown): string | undefined {
 	return typeof value === "string" && value ? value : undefined;
 }
 
-function validateBrokerModelPreset(agentDir: string, requestedProfile: string): string | BrokerResponse {
+export function validateBrokerModelPreset(agentDir: string, requestedProfile: string): string | BrokerResponse {
 	const modelsConfigFile = ModelsConfigFile.relocate(path.join(agentDir, "models.yml"));
 	modelsConfigFile.invalidate();
 	const loaded = modelsConfigFile.tryLoad();
