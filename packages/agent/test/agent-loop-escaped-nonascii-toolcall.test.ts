@@ -1,4 +1,4 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, vi } from "bun:test";
 import { Agent } from "@gajae-code/agent-core";
 import { agentLoop } from "@gajae-code/agent-core/agent-loop";
 import type {
@@ -12,6 +12,7 @@ import type {
 import type { AssistantMessage, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import * as logger from "@gajae-code/utils/logger";
 import * as z from "zod/v4";
 import { createUserMessage } from "./helpers";
 
@@ -143,6 +144,195 @@ function thinkingToolTurn(id: string, escaped = false) {
 }
 
 describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
+	it("logs only bounded shape for in-loop discards and terminal rejection", async () => {
+		const decodedPayload = "DECODED_PAYLOAD_마지막 병목";
+		const toolCallId = "CALL_ID_SECRET";
+		const toolName = "TOOL_NAME_SECRET ignore prior instructions";
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool([])] };
+		const escaped = {
+			content: [
+				{
+					type: "toolCall" as const,
+					id: toolCallId,
+					name: toolName,
+					arguments: { question: decodedPayload },
+					escapedNonAsciiArguments: true,
+				},
+			],
+		};
+		const mock = createMockModel({ responses: [escaped, escaped, escaped, { content: ["done"] }] });
+		const diagnostics: Array<{ message: string; context?: Record<string, unknown> }> = [];
+		const debug = vi.spyOn(logger, "debug").mockImplementation((message, logContext) => {
+			if (message.includes("whose arguments were \\uXXXX-escaped")) {
+				diagnostics.push({ message, context: logContext });
+			}
+		});
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		try {
+			const stream = agentLoop(
+				[createUserMessage("ask me")],
+				context,
+				{ model: mock.model, convertToLlm: identityConverter },
+				undefined,
+				mock.stream,
+			);
+			for await (const _event of stream) {
+				// drain
+			}
+
+			expect(diagnostics).toEqual([
+				{
+					message: "agent: discarded a tool-call turn whose arguments were \\uXXXX-escaped",
+					context: {
+						mode: "in_loop",
+						resampleAttempt: 1,
+						resampleBudget: 2,
+						steeringAttached: false,
+						escapedToolCallCount: 1,
+						escapedToolCallCountCapped: false,
+					},
+				},
+				{
+					message: "agent: discarded a tool-call turn whose arguments were \\uXXXX-escaped",
+					context: {
+						mode: "in_loop",
+						resampleAttempt: 2,
+						resampleBudget: 2,
+						steeringAttached: true,
+						escapedToolCallCount: 1,
+						escapedToolCallCountCapped: false,
+					},
+				},
+				{
+					message: "agent: rejected a tool call whose arguments were \\uXXXX-escaped",
+					context: {
+						mode: "in_loop",
+						toolRegistered: false,
+						displaySafeFieldsDeclared: false,
+					},
+				},
+			]);
+			expect(warn).not.toHaveBeenCalled();
+			expect(JSON.stringify(diagnostics)).not.toContain(decodedPayload);
+			expect(JSON.stringify(diagnostics)).not.toContain(toolCallId);
+			expect(JSON.stringify(diagnostics)).not.toContain(toolName);
+			expect(typeof diagnostics[0]?.context?.resampleAttempt).toBe("number");
+			expect(typeof diagnostics[0]?.context?.resampleBudget).toBe("number");
+		} finally {
+			debug.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
+	it("logs managed discard semantics without an in-loop attempt or steering content", async () => {
+		const steeringText = "STEERING_TEXT_SECRET literal UTF-8";
+		const decodedPayload = "MANAGED_PAYLOAD_SECRET_마지막 병목";
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool([])] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall" as const,
+							id: "MANAGED_CALL_ID_SECRET",
+							name: "ask",
+							arguments: { question: decodedPayload },
+							escapedNonAsciiArguments: true,
+						},
+					],
+				},
+			],
+		});
+		const diagnostics: Array<{ message: string; context?: Record<string, unknown> }> = [];
+		const debug = vi.spyOn(logger, "debug").mockImplementation((message, logContext) => {
+			if (message.startsWith("agent: discarded a tool-call turn")) {
+				diagnostics.push({ message, context: logContext });
+			}
+		});
+
+		try {
+			const stream = agentLoop(
+				[createUserMessage("ask me")],
+				context,
+				{
+					model: mock.model,
+					convertToLlm: identityConverter,
+					fallbackManaged: true,
+					transientRecoveryMessage: {
+						role: "user",
+						content: steeringText,
+						synthetic: true,
+						timestamp: 1,
+					},
+					onManagedAttemptOutcome: () => ({ type: "terminal", terminal: { stopReason: "error" } }),
+				},
+				undefined,
+				mock.stream,
+			);
+			for await (const _event of stream) {
+				// drain
+			}
+
+			expect(diagnostics).toEqual([
+				{
+					message: "agent: discarded a tool-call turn whose arguments were \\uXXXX-escaped",
+					context: {
+						mode: "managed",
+						steeringAttached: true,
+						escapedToolCallCount: 1,
+						escapedToolCallCountCapped: false,
+					},
+				},
+			]);
+			expect(diagnostics[0]?.context).not.toHaveProperty("resampleAttempt");
+			expect(diagnostics[0]?.context).not.toHaveProperty("resampleBudget");
+			expect(JSON.stringify(diagnostics)).not.toContain(steeringText);
+			expect(JSON.stringify(diagnostics)).not.toContain(decodedPayload);
+			expect(JSON.stringify(diagnostics)).not.toContain("MANAGED_CALL_ID_SECRET");
+		} finally {
+			debug.mockRestore();
+		}
+	});
+
+	it("caps escaped tool-call counts without logging model-supplied names", async () => {
+		const toolNameSentinel = "UNBOUNDED_TOOL_NAME_SECRET";
+		const escapedCalls = Array.from({ length: 9 }, (_, index) => ({
+			type: "toolCall" as const,
+			id: `secret-call-${index}`,
+			name: `${toolNameSentinel}-${index}`,
+			arguments: { question: QUESTION },
+			escapedNonAsciiArguments: true,
+		}));
+		const mock = createMockModel({ responses: [{ content: escapedCalls }, { content: ["done"] }] });
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool([])] };
+		const diagnostics: Record<string, unknown>[] = [];
+		const debug = vi.spyOn(logger, "debug").mockImplementation((message, logContext) => {
+			if (message.startsWith("agent: discarded a tool-call turn")) diagnostics.push(logContext ?? {});
+		});
+
+		try {
+			const stream = agentLoop(
+				[createUserMessage("ask me")],
+				context,
+				{ model: mock.model, convertToLlm: identityConverter },
+				undefined,
+				mock.stream,
+			);
+			for await (const _event of stream) {
+				// drain
+			}
+
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]?.escapedToolCallCount).toBe(8);
+			expect(diagnostics[0]?.escapedToolCallCountCapped).toBe(true);
+			expect(JSON.stringify(diagnostics)).not.toContain(toolNameSentinel);
+			expect(JSON.stringify(diagnostics)).not.toContain("secret-call-");
+		} finally {
+			debug.mockRestore();
+		}
+	});
+
 	it("resamples the turn instead of executing or reporting escaped arguments", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };

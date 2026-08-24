@@ -34,7 +34,8 @@ import {
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
-import { $credentialEnv, logger, sanitizeText } from "@gajae-code/utils";
+import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
+import * as logger from "@gajae-code/utils/logger";
 import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
 import type { AttemptScope } from "./attempt-scope";
 import {
@@ -399,6 +400,22 @@ function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
 	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
 }
 
+const ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX = 8;
+
+/** Bounded count of the turn's escaped tool calls; tool names are never logged. */
+function escapedNonAsciiToolCallShape(message: AssistantMessage): {
+	escapedToolCallCount: number;
+	escapedToolCallCountCapped: boolean;
+} {
+	const count = message.content.filter(
+		block => block.type === "toolCall" && block.escapedNonAsciiArguments === true,
+	).length;
+	return {
+		escapedToolCallCount: Math.min(count, ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX),
+		escapedToolCallCountCapped: count > ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX,
+	};
+}
+
 /**
  * The complete set of non-ASCII characters an escaped payload may decode to and
  * still execute on a display-safe tool after the resample budget: U+2014 EM DASH
@@ -424,6 +441,11 @@ type DisplaySafeEscapedTool = AgentTool<TSchema> & {
  */
 function isDisplaySafeEscapedCodepoint(cp: number): boolean {
 	return DISPLAY_SAFE_ESCAPED_CODEPOINTS.has(cp);
+}
+
+/** Whether the tool declared any display-only argument fields at all. */
+function isDisplaySafeEscapedTool(tool: AgentTool<TSchema> | undefined): boolean {
+	return ((tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields?.length ?? 0) > 0;
 }
 
 /**
@@ -3506,6 +3528,27 @@ async function runLoopBody(
 			) {
 				escapedNonAsciiResampleAttempt++;
 				escapedToolTransaction?.discard();
+				// The discard is invisible everywhere else: the defective turn never
+				// reaches durable history, so nothing downstream can count how often
+				// the defect fires or whether steering ever changes the spelling.
+				// Shape-only (bounded count + retry state), never names or payload.
+				const diagnosticShape = escapedNonAsciiToolCallShape(message);
+				logger.debug(
+					"agent: discarded a tool-call turn whose arguments were \\uXXXX-escaped",
+					config.fallbackManaged
+						? {
+								mode: "managed",
+								steeringAttached: recoveryAttempt?.kind === "escaped-nonascii",
+								...diagnosticShape,
+							}
+						: {
+								mode: "in_loop",
+								resampleAttempt: escapedNonAsciiResampleAttempt,
+								resampleBudget: MAX_ESCAPED_NONASCII_RESAMPLES,
+								steeringAttached: recoveryAttempt?.kind === "escaped-nonascii",
+								...diagnosticShape,
+							},
+				);
 				// The defective turn was already committed to the context by the
 				// streaming path. Remove that exact object rather than assuming it is
 				// still the tail: callbacks may append user/system history while the
@@ -4692,6 +4735,15 @@ async function executeToolCalls(
 					// isDisplaySafeEscapedArguments): user-facing question text whose
 					// only non-ASCII characters are benign typographic punctuation is
 					// not the Hangul-mistype corruption this guard exists to stop.
+					//
+					// Terminal for this call: the resample budget is already spent, so
+					// log it (shape-only) to make the fire rate measurable without
+					// scraping session transcripts.
+					logger.debug("agent: rejected a tool call whose arguments were \\uXXXX-escaped", {
+						mode: "in_loop",
+						toolRegistered: tool !== undefined,
+						displaySafeFieldsDeclared: isDisplaySafeEscapedTool(tool),
+					});
 					throw new Error(
 						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
 							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
