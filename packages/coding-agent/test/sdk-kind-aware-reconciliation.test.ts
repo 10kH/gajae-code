@@ -96,10 +96,16 @@ describe("kind-aware reconciliation", () => {
 	test("terminal transitions preserve claimed skill outcomes across reload", async () => {
 		const cases = [
 			{
-				name: "stopped claim beats a later failure frame",
+				name: "agent failure beats an earlier stopped claim at the terminal boundary",
 				outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
 				frame: { type: "agent_failed", error: new Error("late failure") },
-				expectedStatus: "terminal_ok",
+				expectedStatus: "failed",
+				expectedOutcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Prompt submission failed.",
+					provenance: "agent_failed",
+				},
 			},
 			{
 				name: "failed claim beats a later completion frame",
@@ -111,6 +117,12 @@ describe("kind-aware reconciliation", () => {
 				},
 				frame: { type: "agent_end" },
 				expectedStatus: "failed",
+				expectedOutcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "claimed failure",
+					provenance: "agent_failed",
+				},
 			},
 		] as const;
 
@@ -132,7 +144,7 @@ describe("kind-aware reconciliation", () => {
 
 				expect(rec.lookup("skill", { clientRef }), testCase.name).toMatchObject({
 					status: testCase.expectedStatus,
-					outcome: testCase.outcome,
+					outcome: testCase.expectedOutcome,
 				});
 
 				const reopenedStore = createReconciliationStore({ sessionFile, sessionId: "s1", now: () => 2000 });
@@ -140,7 +152,7 @@ describe("kind-aware reconciliation", () => {
 				await reopened.hydrateFromStore();
 				expect(reopened.lookup("skill", { clientRef }), `${testCase.name} after reload`).toMatchObject({
 					status: testCase.expectedStatus,
-					outcome: testCase.outcome,
+					outcome: testCase.expectedOutcome,
 				});
 			} finally {
 				await fs.rm(root, { recursive: true, force: true });

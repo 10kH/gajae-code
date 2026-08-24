@@ -391,33 +391,26 @@ test("ACP prompt rejects prompt_deadline_exceeded terminal outcomes with their c
 	}
 });
 
-test("ACP lets agent_end settle after a diagnostic agent_failed blocks advisory updates", async () => {
-	const fixture = await createFixture({ blockedAdvisoryQuery: "context.get" });
+test("ACP defers end-of-turn advisory updates until agent_end after diagnostic agent_failed", async () => {
+	const fixture = await createFixture();
 	try {
 		const contextQueriesBefore = fixture.queryCalls.filter(query => query === "context.get").length;
+		const metadataQueriesBefore = fixture.queryCalls.filter(query => query === "session.metadata").length;
+		const idleUpdatesBefore = idlePhaseUpdates(fixture.updates);
 		const pending = prompt(fixture, "diagnostic before terminal");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendDiagnostic();
-		await waitFor(
-			() => fixture.queryCalls.filter(query => query === "context.get").length === contextQueriesBefore + 1,
-			"diagnostic advisory query",
-		);
-		expect(fixture.blockedAdvisoryQueryCount()).toBe(1);
+		await Bun.sleep(20);
+		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore);
+		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore);
+		expect(idlePhaseUpdates(fixture.updates)).toBe(idleUpdatesBefore);
 
 		fixture.sendStopped("end_turn");
-		expect(
-			await Promise.race([
-				pending,
-				Bun.sleep(5_000).then(() => {
-					throw new Error("agent_end settlement was blocked by diagnostic advisory work");
-				}),
-			]),
-		).toEqual({ stopReason: "end_turn" });
-		// The diagnostic's context query is intentionally still unresolved when the
-		// correlated terminal settles; it must not own the frame queue.
-		expect(fixture.blockedAdvisoryQueryCount()).toBe(1);
+		expect(await bounded(pending, "agent_end settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(() => idlePhaseUpdates(fixture.updates) === idleUpdatesBefore + 1, "agent_end idle update");
+		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore + 1);
+		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore + 1);
 	} finally {
-		fixture.releaseBlockedAdvisoryQueries();
 		fixture.dispose();
 	}
 });

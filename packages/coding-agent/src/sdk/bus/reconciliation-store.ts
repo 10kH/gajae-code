@@ -50,6 +50,8 @@ export interface DurableExecutionReconciliationRecord extends PromptCorrelation 
 	pendingReceiptState?: Extract<ReceiptState, "present" | "missing">;
 	/** A deadline repair exhausted its bounded retry budget; outcome is non-definite. */
 	deadlineRecoveryPending?: boolean;
+	/** Absolute hard deadline retained across uncertainty recovery and process restart. */
+	deadlineMaxAt?: number;
 	/** Skill-only safe token; never skill args bodies. */
 	skillName?: string;
 	content?: TurnResultContent;
@@ -252,6 +254,11 @@ function isValidRecord(value: unknown): boolean {
 		return false;
 	if (value.clientRef !== undefined && typeof value.clientRef !== "string") return false;
 	if (value.deadlineRecoveryPending !== undefined && typeof value.deadlineRecoveryPending !== "boolean") return false;
+	if (
+		value.deadlineMaxAt !== undefined &&
+		(typeof value.deadlineMaxAt !== "number" || !Number.isFinite(value.deadlineMaxAt))
+	)
+		return false;
 	if (value.skillName !== undefined && typeof value.skillName !== "string") return false;
 	if (value.content !== undefined) {
 		if (

@@ -244,10 +244,15 @@ export class PromptDeadlineManager {
 		const attempts = (this.#uncertaintyRetries.get(key) ?? 0) + 1;
 		this.#uncertaintyRetries.set(key, attempts);
 		void this.#reconciliation
-			.markUncertain("prompt", correlation, () => {
-				const current = this.#leases.get(key);
-				return current === lease && current.generation === generation;
-			})
+			.markUncertain(
+				"prompt",
+				correlation,
+				() => {
+					const current = this.#leases.get(key);
+					return current === lease && current.generation === generation;
+				},
+				lease.acceptedAt + lease.maxMs,
+			)
 			.then(() => {
 				const current = this.#leases.get(key);
 				if (current === lease && current.generation === generation) {
@@ -324,11 +329,15 @@ export class PromptDeadlineManager {
 
 	/** Re-arm a durable uncertainty-recovery record after process startup without
 	 * resetting its acceptance-anchored hard maximum runtime. */
-	recoverPending(correlation: InvocationCorrelation, acceptedAt: number): void {
+	recoverPending(correlation: InvocationCorrelation, acceptedAt: number, deadlineMaxAt?: number): void {
 		const key = leaseKey(correlation);
 		if (this.#leases.has(key)) return;
 		const now = this.#now();
-		const lease = createPromptDeadlineLease({ now, leaseMs: this.#getLeaseMs(), maxMs: this.#getMaxMs() });
+		const lease = createPromptDeadlineLease({
+			now,
+			leaseMs: this.#getLeaseMs(),
+			maxMs: deadlineMaxAt === undefined ? this.#getMaxMs() : Math.max(1, deadlineMaxAt - acceptedAt),
+		});
 		this.#leases.set(key, { ...lease, acceptedAt });
 		this.#correlations.set(key, correlation);
 		this.#uncertaintyRecoveryPending.add(key);

@@ -573,4 +573,23 @@ describe("PromptDeadlineManager expiry reconciliation (#4668)", () => {
 		expect(manager.has(correlation)).toBe(false);
 		manager.clearAll();
 	});
+
+	test("restart recovery preserves the persisted hard deadline when configuration increases", async () => {
+		const { reconciliation, state } = fakeReconciliation();
+		const correlation = { commandId: "cmd-restart-config", turnId: "turn-restart-config" };
+		const manager = new PromptDeadlineManager({
+			reconciliation: reconciliation as never,
+			getLeaseMs: () => 20,
+			getMaxMs: () => 60_000,
+			now: () => 100,
+		});
+
+		manager.recoverPending(correlation, 0, 50);
+		await Bun.sleep(20);
+
+		expect(state.finalizeCodes).toEqual(["prompt_deadline_exceeded"]);
+		expect(state.status).toBe("failed");
+		expect(manager.has(correlation)).toBe(false);
+		manager.clearAll();
+	});
 });

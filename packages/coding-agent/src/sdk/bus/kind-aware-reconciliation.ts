@@ -76,7 +76,12 @@ export interface KindAwareReconciliation {
 		content?: unknown,
 	): Promise<void>;
 	/** Replace an exhausted deadline failure with an active, non-definite record. */
-	markUncertain(kind: ReconciliationKind, correlation: PromptCorrelation, isCurrent?: () => boolean): Promise<void>;
+	markUncertain(
+		kind: ReconciliationKind,
+		correlation: PromptCorrelation,
+		isCurrent?: () => boolean,
+		deadlineMaxAt?: number,
+	): Promise<void>;
 	peekPendingOutcome(kind: ReconciliationKind, correlation: PromptCorrelation): SdkPromptTerminalOutcome | undefined;
 	lookup(
 		kind: ReconciliationKind,
@@ -359,6 +364,7 @@ export function createKindAwareReconciliation(
 			if (frame.type === "agent_start") {
 				if (record.status !== "accepted") return { value: undefined, changed: false };
 				delete record.deadlineRecoveryPending;
+				delete record.deadlineMaxAt;
 				record.status = "in_flight";
 				record.startedAt = now();
 				if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
@@ -369,18 +375,29 @@ export function createKindAwareReconciliation(
 				// terminal lifecycle boundary for the correlated invocation.
 				record.error ??= sanitizePromptFailure(frame.error);
 				delete record.deadlineRecoveryPending;
+				delete record.deadlineMaxAt;
 				return { value: undefined, changed: true };
 			}
 			const pendingOutcome = record.pendingOutcome;
 			delete record.deadlineRecoveryPending;
+			delete record.deadlineMaxAt;
 			record.terminalAt = now();
 			if (frame.content) record.content = sanitizeTurnResultContent(frame.content.text);
 			if (pendingOutcome !== undefined) {
-				record.outcome = pendingOutcome;
+				const terminalOutcome =
+					record.error !== undefined && pendingOutcome.kind !== "failed"
+						? {
+								kind: "failed" as const,
+								code: "prompt_failed" as const,
+								message: record.error.message,
+								provenance: "agent_failed" as const,
+							}
+						: pendingOutcome;
+				record.outcome = terminalOutcome;
 				record.pendingOutcome = undefined;
-				if (pendingOutcome.kind === "failed") {
+				if (terminalOutcome.kind === "failed") {
 					record.status = "failed";
-					record.error = { code: pendingOutcome.code, message: pendingOutcome.message };
+					record.error = { code: terminalOutcome.code, message: terminalOutcome.message };
 				} else {
 					record.status = "terminal_ok";
 				}
@@ -453,6 +470,7 @@ export function createKindAwareReconciliation(
 		kind: ReconciliationKind,
 		correlation: PromptCorrelation,
 		isCurrent?: () => boolean,
+		deadlineMaxAt?: number,
 	) => {
 		await queueMutation(candidate => {
 			if (isCurrent !== undefined && !isCurrent()) return { value: undefined, changed: false };
@@ -468,6 +486,7 @@ export function createKindAwareReconciliation(
 			delete record.receiptState;
 			delete record.error;
 			record.deadlineRecoveryPending = true;
+			if (deadlineMaxAt !== undefined) record.deadlineMaxAt = deadlineMaxAt;
 			return { value: undefined, changed: true };
 		});
 	};

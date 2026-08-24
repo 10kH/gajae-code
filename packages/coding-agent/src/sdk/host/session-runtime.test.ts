@@ -374,9 +374,12 @@ test("a failed uncertainty persist restores the durable deadline terminal until 
 		status: "failed",
 		error: { code: "prompt_deadline_exceeded" },
 	});
-	await reconciliation.markUncertain("prompt", correlation);
+	await reconciliation.markUncertain("prompt", correlation, undefined, 50);
 	expect(reconciliation.lookup("prompt", { clientRef: "uncertain-ref" })).toMatchObject({ status: "accepted" });
-	expect(records).toEqual([expect.objectContaining({ deadlineRecoveryPending: true })]);
+	expect(records).toEqual([expect.objectContaining({ deadlineRecoveryPending: true, deadlineMaxAt: 50 })]);
+	expect(reconciliation.listDeadlineRecoveryPendingPrompts()).toEqual([
+		{ correlation, acceptedAt: expect.any(Number), deadlineMaxAt: 50 },
+	]);
 });
 
 test("durable reload keeps agent_end terminal across a paused successor transition", async () => {

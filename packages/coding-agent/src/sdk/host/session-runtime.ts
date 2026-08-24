@@ -439,7 +439,11 @@ export interface InvocationReconciliation {
 	): Promise<void>;
 	lookup(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
 	lookupResult(kind: InvocationKind, selector: { commandId?: string; turnId?: string; clientRef?: string }): unknown;
-	listDeadlineRecoveryPendingPrompts(): Array<{ correlation: InvocationCorrelation; acceptedAt: number }>;
+	listDeadlineRecoveryPendingPrompts(): Array<{
+		correlation: InvocationCorrelation;
+		acceptedAt: number;
+		deadlineMaxAt?: number;
+	}>;
 	hydrate(): Promise<void>;
 	claimPendingOutcome(
 		kind: InvocationKind,
@@ -457,7 +461,12 @@ export interface InvocationReconciliation {
 		arg4?: (() => boolean) | { code: string; message: string },
 		arg5?: unknown,
 	): Promise<void>;
-	markUncertain(kind: InvocationKind, correlation: InvocationCorrelation, isCurrent?: () => boolean): Promise<void>;
+	markUncertain(
+		kind: InvocationKind,
+		correlation: InvocationCorrelation,
+		isCurrent?: () => boolean,
+		deadlineMaxAt?: number,
+	): Promise<void>;
 }
 
 export function createInvocationReconciliation(
@@ -759,6 +768,7 @@ export function createInvocationReconciliation(
 			}
 			const next = { ...record, revision: ++mutationRevision };
 			delete (next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending;
+			delete (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt;
 			if (frame.type === "agent_start") {
 				next.status = "in_flight";
 				next.startedAt = Date.now();
@@ -817,6 +827,9 @@ export function createInvocationReconciliation(
 				.map(record => ({
 					correlation: { commandId: record.commandId, turnId: record.turnId },
 					acceptedAt: record.acceptedAt,
+					...((record as unknown as { deadlineMaxAt?: number }).deadlineMaxAt === undefined
+						? {}
+						: { deadlineMaxAt: (record as unknown as { deadlineMaxAt: number }).deadlineMaxAt }),
 				}));
 		},
 		hydrate,
@@ -910,7 +923,7 @@ export function createInvocationReconciliation(
 				if (pendingFinalizations.get(recordKey) === pending) pendingFinalizations.delete(recordKey);
 			}
 		},
-		async markUncertain(kind, correlation, isCurrent) {
+		async markUncertain(kind, correlation, isCurrent, deadlineMaxAt) {
 			if (isCurrent !== undefined && !isCurrent()) return;
 			const recordKey = key(kind, correlation);
 			const record = records.get(recordKey);
@@ -926,6 +939,7 @@ export function createInvocationReconciliation(
 			delete next.error;
 			delete (next as unknown as { outcome?: unknown }).outcome;
 			(next as unknown as { deadlineRecoveryPending?: boolean }).deadlineRecoveryPending = true;
+			if (deadlineMaxAt !== undefined) (next as unknown as { deadlineMaxAt?: number }).deadlineMaxAt = deadlineMaxAt;
 			records.set(recordKey, next);
 			try {
 				await persist();
@@ -3534,8 +3548,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			correlation: InvocationCorrelation;
 			connectionId: string | undefined;
 		}> = [];
-		for (const { correlation, acceptedAt } of reconciliation.listDeadlineRecoveryPendingPrompts())
-			deadlineManager.recoverPending(correlation, acceptedAt);
+		for (const { correlation, acceptedAt, deadlineMaxAt } of reconciliation.listDeadlineRecoveryPendingPrompts())
+			deadlineManager.recoverPending(correlation, acceptedAt, deadlineMaxAt);
 		const openLifecycleBatches: Array<{
 			epoch: number;
 			invocations: Array<{
