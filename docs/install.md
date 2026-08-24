@@ -2,23 +2,30 @@
 
 ## Standard install
 
+Prebuilt standalone binaries are the supported end-user install. Bun is not required.
+
 ```sh
-bun install -g gajae-code
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
 gjc --version
 gjc --smoke-test
 ```
 
-The scoped package is also available as `@gajae-code/coding-agent`.
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex
+gjc --version
+gjc --smoke-test
+```
+
+The installer downloads the current platform's GitHub release asset, verifies HTTP success, non-empty bytes, checksums when the release publishes them, then runs `--version` and `--smoke-test`. A failed download or verification never replaces a working existing `gjc`.
+
+Unix default location: `~/.local/bin/gjc` (`GJC_INSTALL_DIR` overrides).
+Windows default location: `%LOCALAPPDATA%\gjc\gjc.exe`.
 
 ## Korean launcher alias
 
-`가재씨` is installed alongside `gjc` as a launcher alias, so typing `가재씨` runs Gajae-Code exactly like `gjc`:
-
-```sh
-가재씨 --version
-```
-
-The alias is a package-owned bin entry created by npm/Bun during install — no shell alias or dotfile edit is required. It is supported on Linux and macOS (UTF-8 locales). On Windows the shim is created by the package manager, but invoking `가재씨` from `cmd.exe` depends on the console's active code page; use `gjc` or run from Windows Terminal / PowerShell with a UTF-8 code page (`chcp 65001`) if the Hangul alias is needed.
+`가재씨` is installed alongside `gjc` as a launcher alias on package-manager installs. Standalone binaries expose `gjc`. On Windows, use `gjc` (or run from Windows Terminal / PowerShell with UTF-8 `chcp 65001` if a Hangul alias is needed).
 
 ## Supported platforms
 
@@ -28,50 +35,45 @@ Prebuilt standalone release binaries are published for:
 - **Windows** — x64
 - **macOS** — Apple Silicon (arm64) and Intel (x64)
 
-The npm/Bun package path and build-from-source remain available on every platform:
-
-```sh
-bun install -g gajae-code
-# or
-curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --source
-```
-
 ## Nightly channel
 
-A verified nightly prerelease is published from `main` at 04:23 UTC and can also be started manually with the **nightly-release** CI dispatch. Nightly runs execute the complete main verification graph, build every supported native addon and standalone binary, publish the exact package set under the npm `nightly` dist-tag, and create a matching GitHub prerelease with package evidence. They do not move npm `latest`, rewrite `main`, or consume the `[Unreleased]` changelog sections.
+A verified nightly prerelease is published from `main` at 04:23 UTC and can also be started manually with the **nightly-release** CI dispatch. Nightly runs execute the complete main verification graph, build every supported native addon and standalone binary, and create a matching GitHub prerelease. They do not rewrite `main` or consume the `[Unreleased]` changelog sections.
 
 ```sh
-bun install -g gajae-code@nightly
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly
 gjc --version
 gjc --smoke-test
 ```
+
+Windows: pass `-Channel nightly` to `install.ps1`.
 
 Already on GJC? Switch channels without reinstalling: `gjc update --channel nightly` moves to the latest nightly, and `gjc update --channel stable` switches a nightly install back to the latest stable (the command detects the channel switch and installs even though stable is semver-lower than the nightly). To make a channel the default for both `gjc update` and the startup update check, set **Settings → Interaction → Update Channel** (the `startup.updateChannel` setting). In the brief window where a nightly shares the stable core version, add `--force` to move onto it.
 
-## Windows (native install)
+Pin an exact release tag (binary assets required):
 
-On a clean Windows 11 machine, install Bun first, then install `gjc` with Bun's global installer:
-
-```powershell
-# 1. Install Bun
-powershell -c "irm bun.sh/install.ps1|iex"
-
-# 2. Restart the terminal so PATH and the Bun runtime refresh, then confirm Bun
-bun --version
-
-# 3. Install and verify gjc
-bun install -g gajae-code
-gjc --version
-gjc --smoke-test
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --ref v0.15.0
 ```
 
-`bun install -g` places the `gjc` launcher in `%USERPROFILE%\.bun\bin`. That directory must be on `PATH` for `gjc` to resolve as a command. Bun's installer adds it automatically, but the change only applies to terminals started after installation — restart PowerShell (or sign out/in) if `gjc` is "not recognized".
+## Development / source install
 
-Troubleshooting:
+Bun is required only to build GJC from source. The installer never downloads Bun.
 
-- **`gjc` reports an old Bun runtime.** Re-run the Bun installer above, restart the terminal, and confirm `bun --version` matches what `gjc --version` expects. If an older Bun still wins, make sure `%USERPROFILE%\.bun\bin` is first on `PATH` and remove any stale Bun installs shadowing it.
-- **`gjc.exe` exists but `gjc` is "not recognized".** The launcher is installed but not on `PATH`. Confirm `%USERPROFILE%\.bun\bin` is listed in `echo $env:Path`, then restart the terminal.
-- **`gjc --tmux` starts without a tmux-backed session.** Native Windows needs a tmux-compatible executable on `PATH`. For GJC-managed session guarantees, use WSL with real tmux, or another provider that round-trips tmux user options such as `@gjc-profile`. Native psmux can provide `tmux`/`pmux`/`psmux` commands, but that path is not fully supported for GJC ownership tags and session guarantees yet; see [`environment-variables.md`](./environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile).
+```sh
+# Requires an existing Bun 1.3.14+ on PATH
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --source
+```
+
+From a checkout: `bun run install:dev`, then `bun run dev` / `bun run dev:link`. See the repository `AGENTS.md` for the development workflow.
+
+## Windows notes
+
+GJC's shell tool requires a bash-compatible shell on Windows. After a binary install, the PowerShell installer records Git Bash if it finds it. Options:
+
+1. Install Git for Windows: https://git-scm.com/download/win
+2. Use WSL, Cygwin, or MSYS2
+
+Native Windows `gjc --tmux` needs a tmux-compatible executable on `PATH`. For GJC-managed session guarantees, use WSL with real tmux. See [`environment-variables.md`](./environment-variables.md#interactive---tmux-startup-and-scrollmouse-profile).
 
 ## Shell completion
 
@@ -85,17 +87,15 @@ The installer writes `gjc.js` plus a minimal `index.js` into inshellisense's def
 
 ## Launch-time updates
 
-Interactive startup checks the npm registry for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch.
+Interactive startup checks GitHub releases for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch.
 
-- Recognized Bun global install → `gjc update` or `bun install -g @gajae-code/coding-agent@latest`.
-- Recognized Windows npm install → `gjc update` or the original npm package workflow.
-- Supported standalone binary installed by the bundled installer → `gjc update` or rerun the documented platform installer.
-- Source checkout or `dev:link` executable → update, pull, build, and link through that checkout's original workflow.
-- Unrecognized npm/pnpm/other package-manager installs or unknown PATH targets → use the original package manager or install method.
+- Standalone binary or former Bun/npm install on a supported platform → `gjc update` downloads and atomically replaces the matching GitHub release binary (package-manager shims are not overwritten; a user binary path is used and PATH migration is printed).
+- Source checkout or `dev:link` executable → update, pull, build, and link through that checkout's original workflow. `gjc update` refuses to self-overwrite it.
+- Unsupported platform or unknown target → rerun the documented platform installer.
 
-Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Registry or network failures are ignored so they do not block startup.
+Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.
 
-Both the launch-time check and `gjc update` resolve the registry the way npm does — `BUN_CONFIG_REGISTRY` or `npm_config_registry` from the environment, a scoped `@gajae-code:registry` key, then your user and machine-wide `.npmrc`, including the credentials registered for that registry. A mirrored or firewalled network is therefore checked at the same place the update would install from. A `.npmrc` in the current working directory is deliberately ignored, so a repository you have cloned cannot redirect the check or choose the credential it carries. `bunfig.toml` is not read, so a mirror declared only there is still checked against the public registry.
+`gjc update` resolves `stable` from GitHub `/releases/latest` and `nightly` from the newest published GitHub prerelease. Optional `GITHUB_TOKEN` / `GH_TOKEN` raises API rate limits. `--check`, `--force`, and channel switch-back semantics are unchanged.
 
 ## Retry configuration
 

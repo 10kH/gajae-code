@@ -7,12 +7,14 @@ import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	buildReleaseBinaryUrlForTest,
 	compareVersionsForTest,
+	defaultUserBinaryPathForTest,
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
 	hasManagedNotifySetup,
+	isProtectedSourcePathForTest,
 	parseReportedVersionForTest,
 	parseUpdateArgs,
 	replaceBinaryForUpdate,
@@ -57,46 +59,40 @@ describe("update-cli recovery command surface", () => {
 
 describe("update-cli release lookup", () => {
 	const isolated = {
-		homeDir: "/nonexistent-home",
-		platform: "darwin" as const,
-		readFile: async () => undefined,
+		lookupEnv: () => undefined,
 	};
 
-	it("asks the registry configured through npm config instead of the public one", async () => {
+	it("asks GitHub releases/latest for the stable channel", async () => {
 		const requested: string[] = [];
 
 		const release = await getLatestReleaseForTest({
 			...isolated,
-			lookupEnv: name =>
-				name === "npm_config_registry" ? "https://nexus.example.com/repository/npm-all/" : undefined,
 			fetchImpl: async url => {
-				requested.push(url);
-				return { ok: true, status: 200, statusText: "OK", json: async () => ({ version: "9.9.9" }) };
+				requested.push(String(url));
+				return new Response(JSON.stringify({ tag_name: "v9.9.9", draft: false, prerelease: false }), {
+					status: 200,
+				});
 			},
 		});
 
-		expect(requested).toEqual(["https://nexus.example.com/repository/npm-all/@gajae-code/coding-agent/latest"]);
+		expect(requested).toEqual(["https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest"]);
 		expect(release).toEqual({
 			tag: "v9.9.9",
 			version: "9.9.9",
-			registry: "https://nexus.example.com/repository/npm-all",
+			registry: "https://github.com/Yeachan-Heo/gajae-code",
 			warnings: [],
 		});
 	});
 
-	it("surfaces the failing url and status so blocked registries are diagnosable", async () => {
+	it("surfaces the failing url and status so blocked GitHub APIs are diagnosable", async () => {
 		const failing = getLatestReleaseForTest({
 			...isolated,
-			lookupEnv: () => undefined,
-			fetchImpl: async () => ({
-				ok: false,
-				status: 503,
-				statusText: "",
-				json: async () => ({}),
-			}),
+			fetchImpl: async () => new Response("nope", { status: 503, statusText: "Service Unavailable" }),
 		});
 
-		await expect(failing).rejects.toThrow("https://registry.npmjs.org/@gajae-code/coding-agent/latest responded 503");
+		await expect(failing).rejects.toThrow(
+			"https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest responded 503",
+		);
 	});
 });
 
@@ -180,21 +176,21 @@ describe("update-cli binary release assets", () => {
 	it("reports actionable Unix manual update commands for unsupported fallback paths", () => {
 		const instructions = formatManualUpdateInstructionsForTest("linux");
 
-		expect(instructions).toContain("bun install -g @gajae-code/coding-agent@latest");
-		expect(instructions).toContain("npm, pnpm, or another package manager");
 		expect(instructions).toContain(
-			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --binary",
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh",
 		);
+		expect(instructions).toContain("Bun is only required for source development/build");
+		expect(instructions).not.toContain("bun install -g");
 	});
 
 	it("reports actionable Windows manual update commands for unsupported fallback paths", () => {
 		const instructions = formatManualUpdateInstructionsForTest("win32");
 
-		expect(instructions).toContain("bun install -g @gajae-code/coding-agent@latest");
-		expect(instructions).toContain("npm, pnpm, or another package manager");
 		expect(instructions).toContain(
 			"irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex",
 		);
+		expect(instructions).toContain("Bun is only required for source development/build");
+		expect(instructions).not.toContain("bun install -g");
 	});
 
 	it("keeps manual reinstall guidance aligned with bundled installer repositories", async () => {
@@ -237,7 +233,9 @@ describe("update-cli binary release assets", () => {
 
 		expect(message).toContain("Download failed for gjc-linux-x64");
 		expect(message).toContain("Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-linux-x64");
-		expect(message).toContain("bun install -g @gajae-code/coding-agent@latest");
+		expect(message).toContain(
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh",
+		);
 	});
 
 	it("points at the mirror that named the version when the GitHub asset is missing", () => {
@@ -251,7 +249,9 @@ describe("update-cli binary release assets", () => {
 
 		expect(message).toContain("Download failed for gjc-linux-x64");
 		expect(message).toContain("was resolved from https://nexus.example.com/npm");
-		expect(message).toContain("bun install -g @gajae-code/coding-agent@latest");
+		expect(message).toContain(
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh",
+		);
 	});
 
 	it("says nothing about provenance when the public registry named the version", () => {
@@ -267,7 +267,7 @@ describe("update-cli binary release assets", () => {
 
 	it("includes actionable guidance when the platform has no release asset", () => {
 		expect(() => buildReleaseBinaryUrlForTest("0.2.3", "freebsd", "x64")).toThrow(
-			"bun install -g @gajae-code/coding-agent@latest",
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh",
 		);
 	});
 });
@@ -1093,7 +1093,7 @@ describe("update-cli release channels", () => {
 				},
 			);
 			expect(seenChannels).toEqual(["nightly"]);
-			expect(output.join("\n")).toContain("Update channel: nightly (npm dist-tag nightly)");
+			expect(output.join("\n")).toContain("Update channel: nightly (GitHub prerelease)");
 			expect(output.join("\n")).toContain("New version available: 999.0.0-nightly.1.1.gabc");
 		} finally {
 			logSpy.mockRestore();
@@ -1156,71 +1156,35 @@ describe("update-cli channel robustness", () => {
 		expect(() => parseUpdateArgs(["update", "--channel"])).toThrow("Missing value for --channel");
 	});
 
-	it("requests the nightly dist-tag route for nightly lookups", async () => {
+	it("requests the GitHub prerelease list for nightly lookups", async () => {
 		const requested: string[] = [];
 		const release = await getLatestReleaseForTest({
-			homeDir: "/nonexistent-home",
-			platform: "darwin",
-			readFile: async () => undefined,
 			lookupEnv: () => undefined,
 			channel: "nightly",
 			fetchImpl: async url => {
-				requested.push(url);
-				return {
-					ok: true,
-					status: 200,
-					statusText: "OK",
-					json: async () => ({ version: "1.2.3-nightly.1.1.gabc" }),
-				};
+				requested.push(String(url));
+				return new Response(
+					JSON.stringify([
+						{ tag_name: "v1.2.3", draft: false, prerelease: false },
+						{ tag_name: "v1.2.3-nightly.1.1.gabc", draft: false, prerelease: true },
+					]),
+					{ status: 200 },
+				);
 			},
 		});
 
-		expect(requested).toEqual(["https://registry.npmjs.org/@gajae-code/coding-agent/nightly"]);
+		expect(requested).toEqual(["https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=40"]);
 		expect(release.version).toBe("1.2.3-nightly.1.1.gabc");
-	});
-
-	it("falls back to the packument dist-tags entry for the requested channel", async () => {
-		const requested: string[] = [];
-		const release = await getLatestReleaseForTest({
-			homeDir: "/nonexistent-home",
-			platform: "darwin",
-			readFile: async () => undefined,
-			lookupEnv: () => undefined,
-			channel: "nightly",
-			fetchImpl: async url => {
-				requested.push(url);
-				if (url.endsWith("/nightly")) {
-					return { ok: false, status: 404, statusText: "Not Found", json: async () => ({}) };
-				}
-				return {
-					ok: true,
-					status: 200,
-					statusText: "OK",
-					json: async () => ({
-						"dist-tags": { latest: "1.2.3", nightly: "1.2.4-nightly.1.1.gabc" },
-					}),
-				};
-			},
-		});
-
-		expect(requested).toEqual([
-			"https://registry.npmjs.org/@gajae-code/coding-agent/nightly",
-			"https://registry.npmjs.org/@gajae-code/coding-agent",
-		]);
-		expect(release.version).toBe("1.2.4-nightly.1.1.gabc");
 	});
 
 	it("fails closed with workflow guidance when no nightly has ever been published", async () => {
 		const failing = getLatestReleaseForTest({
-			homeDir: "/nonexistent-home",
-			platform: "darwin",
-			readFile: async () => undefined,
 			lookupEnv: () => undefined,
 			channel: "nightly",
-			fetchImpl: async () => ({ ok: false, status: 404, statusText: "Not Found", json: async () => ({}) }),
+			fetchImpl: async () => new Response("[]", { status: 200 }),
 		});
 
-		await expect(failing).rejects.toThrow("nightly channel has no published release yet");
+		await expect(failing).rejects.toThrow("nightly channel has no published GitHub prerelease yet");
 	});
 
 	it("exits cleanly instead of crashing when the channel reports an unparseable version", async () => {
@@ -1294,5 +1258,26 @@ describe("update-cli reported version parsing", () => {
 			"0.12.12-nightly.20260805044024.123456789.g6dd873fd26b8",
 		);
 		expect(parseReportedVersionForTest("gjc: no version")).toBeUndefined();
+	});
+});
+describe("update-cli binary-first target policy", () => {
+	it("installs standalone binaries under the user install dir, not Bun's global bin", () => {
+		expect(defaultUserBinaryPathForTest("linux", { GJC_INSTALL_DIR: "/tmp/gjc-bin", HOME: "/home/alice" })).toBe(
+			"/tmp/gjc-bin/gjc",
+		);
+		expect(
+			defaultUserBinaryPathForTest("win32", { GJC_INSTALL_DIR: "D:\\tools", USERPROFILE: "C:\\Users\\alice" }),
+		).toBe("D:\\tools\\gjc.exe");
+		expect(defaultUserBinaryPathForTest("linux", { HOME: "/home/alice" })).toBe("/home/alice/.local/bin/gjc");
+	});
+
+	it("protects this repository checkout from self-overwrite", () => {
+		expect(isProtectedSourcePathForTest(path.join(repoRoot, "packages/coding-agent/src/cli.ts"))).toBe(true);
+		expect(isProtectedSourcePathForTest("/tmp/unrelated/gjc")).toBe(false);
+	});
+
+	it("keeps bun-global path detection as a shim classifier, not an install method", () => {
+		expect(resolveUpdateMethodForTest("/Users/test/.bun/bin/gjc", "/Users/test/.bun/bin")).toBe("bun");
+		expect(resolveUpdateMethodForTest("/Users/test/.local/bin/gjc", "/Users/test/.bun/bin")).toBe("binary");
 	});
 });

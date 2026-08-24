@@ -23,6 +23,7 @@ import {
 import chalk from "chalk";
 import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
+import { fetchGithubChannelRelease } from "./cli/github-release";
 import { buildInitialMessage } from "./cli/initial-message";
 import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
@@ -33,7 +34,7 @@ import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
-import { distTagForChannel, resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/update-channel";
+import { resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/update-channel";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
@@ -84,7 +85,6 @@ import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
 import { installHerdrReporter } from "./utils/herdr-pane";
-import { fetchLatestPackageVersion } from "./utils/npm-registry";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
@@ -95,10 +95,7 @@ async function checkForNewVersion(
 	channel: UpdateChannel = "stable",
 ): Promise<string | undefined> {
 	try {
-		// Resolved from npm config so mirrored/firewalled networks are checked too.
-		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent", {
-			distTag: distTagForChannel(channel),
-		});
+		const { version } = await fetchGithubChannelRelease({ channel });
 		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
 	} catch {
 		return undefined;

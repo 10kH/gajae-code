@@ -57,12 +57,14 @@ Gajae-Code（`gjc`）是一个外置编码代理 harness：丢进任意仓库或
 
 ## 快速开始
 
-**安装** — 提供 Linux（x64/arm64）、macOS（arm64/x64）、Windows（x64）预编译二进制；npm/Bun 路径全平台可用：
+**安装** — 提供 Linux（x64/arm64）、macOS（arm64/x64）、Windows（x64）预编译二进制。不需要 Bun：
 
 ```sh
-bun install -g gajae-code
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
 gjc
 ```
+
+Windows (PowerShell): `irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex`
 
 **首次使用** — 选好订阅就出发：
 
@@ -82,7 +84,7 @@ gjc --tmux --worktree my-task      # 高风险工作用隔离 worktree
 gjc @screenshot.png "该改什么？"      # 图片输入
 ```
 
-Nightly 渠道：`bun install -g gajae-code@nightly`。完整安装矩阵、Windows 设置、更新渠道与 shell 补全：[docs/install.md](docs/install.md)。
+Nightly 渠道：`curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly`。完整安装矩阵、Windows 设置、更新渠道与 shell 补全：[docs/install.md](docs/install.md)。Bun 仅用于从源码构建。
 
 ---
 

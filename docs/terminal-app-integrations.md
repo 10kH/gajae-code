@@ -120,7 +120,7 @@ agent below.
 1. Install and authenticate GJC on the machine Orca runs agents on:
 
    ```sh
-   bun install -g @gajae-code/coding-agent
+   curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
    gjc auth
    ```
 
