@@ -98,11 +98,10 @@ import json, os, sys
 fixture = json.load(open(sys.argv[1]))
 url = sys.argv[2]
 out = sys.argv[3] if len(sys.argv) > 3 else ""
-def write(data: bytes, code: int = 0):
+def write(data: bytes, code: int = 0, http: str = "200"):
     if out:
         open(out, "wb").write(data)
-    if code == 0:
-        sys.stdout.write("200")
+    sys.stdout.write(http)
     sys.exit(code)
 if "api.github.com" in url and "/releases/latest" in url:
     write(fixture["latestJson"].encode())
@@ -116,12 +115,16 @@ if fixture.get("failDownload"):
     sys.exit(22)
 name = url.rsplit("/", 1)[-1]
 if name in fixture.get("missingAssets", []):
+    if name.endswith(".sha256") or name.endswith(".json"):
+        write(b"", 0, "404")
     sys.exit(22)
 if fixture.get("emptyDownload") and not name.endswith(".sha256") and not name.endswith(".json"):
     write(b"", 0)
 assets = fixture.get("assets", {})
 if name in assets:
     write(__import__("base64").b64decode(assets[name]))
+if name.endswith(".sha256") or name.endswith("gajae-release-binaries-v1.json"):
+    write(b"", 0, "404")
 sys.exit(22)
 PY
 `;
@@ -353,5 +356,12 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain('PLATFORM="darwin"');
 		expect(installer).toContain('ARCH="x64"');
 		expect(installer).toContain('ARCH="arm64"');
+	});
+
+	test("follows redirects and fail-closes checksum fetch except HTTP 404", async () => {
+		const installer = await Bun.file(installScript).text();
+		expect(installer).toContain("curl -sSL");
+		expect(installer).toContain('if [ "$http_code" != "404" ]');
+		expect(installer).toContain("tag ~ /-nightly\\./");
 	});
 });

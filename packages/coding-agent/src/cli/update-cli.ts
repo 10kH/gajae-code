@@ -604,8 +604,12 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 	let backupReady = false;
 	try {
 		await unlinkIfExists(options.backupPath);
-		await fs.promises.rename(options.targetPath, options.backupPath);
-		backupReady = true;
+		try {
+			await fs.promises.rename(options.targetPath, options.backupPath);
+			backupReady = true;
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+		}
 		await fs.promises.rename(options.tempPath, options.targetPath);
 
 		const verification = await options.verifyInstalledVersion(options.expectedVersion);
@@ -622,6 +626,8 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		if (backupReady) {
 			await unlinkIfExists(options.targetPath);
 			await fs.promises.rename(options.backupPath, options.targetPath);
+		} else {
+			await unlinkIfExists(options.targetPath);
 		}
 		await unlinkIfExists(options.tempPath);
 		throw err;

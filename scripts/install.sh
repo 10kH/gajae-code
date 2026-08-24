@@ -135,13 +135,13 @@ curl_github_optional() {
     out="$2"
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
     if [ -n "$token" ]; then
-        curl -sS --retry 2 --retry-delay 1 \
+        curl -sSL --retry 2 --retry-delay 1 \
             -A "gjc-install" \
             -H "Accept: application/octet-stream" \
             -H "Authorization: Bearer ${token}" \
             -o "$out" -w "%{http_code}" "$url"
     else
-        curl -sS --retry 2 --retry-delay 1 \
+        curl -sSL --retry 2 --retry-delay 1 \
             -A "gjc-install" \
             -H "Accept: application/octet-stream" \
             -o "$out" -w "%{http_code}" "$url"
@@ -183,7 +183,7 @@ pick_nightly_tag() {
             if ($0 ~ /"draft"[ \t]*:[ \t]*true/) draft = "1"
             if ($0 ~ /"draft"[ \t]*:[ \t]*false/) draft = "0"
             if ($0 ~ /"prerelease"[ \t]*:[ \t]*true/) {
-                if (tag != "" && draft != "1") {
+                if (tag != "" && draft != "1" && tag ~ /-nightly\./) {
                     print tag
                     exit
                 }
@@ -331,29 +331,27 @@ verify_checksum() {
     manifest_tmp="${INSTALL_DIR}/.gjc.manifest.$$"
     remember_tmp "$sums_tmp"
     remember_tmp "$manifest_tmp"
-
     sums_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_SHA256_ASSET}"
-    http_code=$(curl_github_optional "$sums_url" "$sums_tmp" || true)
-    if [ "$http_code" = "200" ] && [ -s "$sums_tmp" ]; then
+    http_code=$(curl_github_optional "$sums_url" "$sums_tmp") || die "Failed to fetch integrity asset $sums_url. Existing install was not changed."
+    if [ "$http_code" = "200" ]; then
         expected=$(lookup_checksum "$sums_tmp" "$asset_name")
-        case "$expected" in
-            [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
-                actual=$(file_sha256 "$downloaded")
-                if [ "$actual" != "$expected" ]; then
-                    die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
-                fi
-                echo "Verified SHA-256 for ${asset_name}"
-                return 0
-                ;;
-            *)
-                die "Release checksum file ${BINARY_SHA256_ASSET} did not list ${asset_name}"
-                ;;
-        esac
+        if [ ${#expected} -ne 64 ]; then
+            die "Release checksum file ${BINARY_SHA256_ASSET} did not list ${asset_name}"
+        fi
+        actual=$(file_sha256 "$downloaded")
+        if [ "$actual" != "$expected" ]; then
+            die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
+        fi
+        echo "Verified SHA-256 for ${asset_name}"
+        return 0
+    fi
+    if [ "$http_code" != "404" ]; then
+        die "Integrity asset ${BINARY_SHA256_ASSET} returned HTTP ${http_code}. Existing install was not changed."
     fi
 
     manifest_url="${GITHUB_RELEASES}/${LATEST}/${BINARY_MANIFEST_ASSET}"
-    http_code=$(curl_github_optional "$manifest_url" "$manifest_tmp" || true)
-    if [ "$http_code" = "200" ] && [ -s "$manifest_tmp" ]; then
+    http_code=$(curl_github_optional "$manifest_url" "$manifest_tmp") || die "Failed to fetch integrity asset $manifest_url. Existing install was not changed."
+    if [ "$http_code" = "200" ]; then
         expected=$(awk -v name="$asset_name" '
             $0 ~ "\"name\"" && $0 ~ name { saw=1 }
             saw && /"sha256"/ {
@@ -366,16 +364,18 @@ verify_checksum() {
                 }
             }
         ' "$manifest_tmp")
-        case "$expected" in
-            [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*)
-                actual=$(file_sha256 "$downloaded")
-                if [ "$actual" != "$expected" ]; then
-                    die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
-                fi
-                echo "Verified SHA-256 for ${asset_name} from ${BINARY_MANIFEST_ASSET}"
-                return 0
-                ;;
-        esac
+        if [ ${#expected} -ne 64 ]; then
+            die "Release manifest ${BINARY_MANIFEST_ASSET} did not list a SHA-256 for ${asset_name}"
+        fi
+        actual=$(file_sha256 "$downloaded")
+        if [ "$actual" != "$expected" ]; then
+            die "Checksum mismatch for ${asset_name}: expected ${expected}, got ${actual}. Existing install was not changed."
+        fi
+        echo "Verified SHA-256 for ${asset_name} from ${BINARY_MANIFEST_ASSET}"
+        return 0
+    fi
+    if [ "$http_code" != "404" ]; then
+        die "Integrity asset ${BINARY_MANIFEST_ASSET} returned HTTP ${http_code}. Existing install was not changed."
     fi
 
     echo "No checksum asset on ${LATEST}; continuing with size, --version, and --smoke-test verification."

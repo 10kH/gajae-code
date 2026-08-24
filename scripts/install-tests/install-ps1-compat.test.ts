@@ -43,6 +43,9 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).toContain("Restored previous gjc binary");
 		expect(installer).toContain("nightly");
 		expect(installer).not.toContain("Default: use bun if available");
+		expect(installer).toContain("Putting $InstallDir first on PATH");
+		expect(installer).toContain("Failed to publish the downloaded binary");
+		expect(installer).toContain("*-nightly.*");
 	});
 
 	test.skipIf(!pwsh)("parses without syntax errors under PowerShell", async () => {

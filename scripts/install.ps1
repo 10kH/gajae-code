@@ -247,7 +247,7 @@ function Resolve-ReleaseTag {
         Write-Host "Fetching latest nightly GitHub prerelease..."
         $releases = Invoke-RestMethod -Uri "$GithubApi/repos/$Repo/releases?per_page=40" -Headers $headers
         foreach ($candidate in $releases) {
-            if ($candidate.prerelease -eq $true -and $candidate.draft -eq $false -and (Test-SafeReleaseTag $candidate.tag_name)) {
+            if ($candidate.prerelease -eq $true -and $candidate.draft -eq $false -and (Test-SafeReleaseTag $candidate.tag_name) -and $candidate.tag_name -like "*-nightly.*") {
                 return $candidate.tag_name
             }
         }
@@ -257,6 +257,15 @@ function Resolve-ReleaseTag {
     Write-Host "Fetching latest stable GitHub release..."
     $Release = Invoke-RestMethod -Uri "$GithubApi/repos/$Repo/releases/latest" -Headers $headers
     return $Release.tag_name
+}
+
+function Get-WebExceptionStatus {
+    param($ErrorRecord)
+    try {
+        return [int]$ErrorRecord.Exception.Response.StatusCode
+    } catch {
+        return 0
+    }
 }
 
 function Assert-Checksum {
@@ -271,48 +280,53 @@ function Assert-Checksum {
     $manifestUrl = "$GithubReleases/$Tag/$BinaryManifestAsset"
     $manifestTmp = Join-Path $InstallDir (".gjc.manifest." + [System.Guid]::NewGuid().ToString("N"))
     try {
+        $sumsMissing = $false
         try {
             Invoke-WebRequest -Uri $sumsUrl -OutFile $sumsTmp -Headers @{ "User-Agent" = $UserAgent }
-            if ((Test-Path $sumsTmp) -and ((Get-Item $sumsTmp).Length -gt 0)) {
-                $expected = Get-ChecksumForAsset -SumsPath $sumsTmp -AssetName $AssetName
-                if (-not $expected -or $expected -notmatch '^[0-9a-f]{64}$') {
-                    throw "Release checksum file $BinarySha256Asset did not list $AssetName"
-                }
-                $actual = Get-FileSha256Lower $DownloadedPath
-                if ($actual -ne $expected) {
-                    throw "Checksum mismatch for ${AssetName}: expected $expected, got $actual. Existing install was not changed."
-                }
-                Write-Host "Verified SHA-256 for $AssetName"
-                return
+            $expected = Get-ChecksumForAsset -SumsPath $sumsTmp -AssetName $AssetName
+            if (-not $expected -or $expected -notmatch '^[0-9a-f]{64}$') {
+                throw "Release checksum file $BinarySha256Asset did not list $AssetName"
             }
+            $actual = Get-FileSha256Lower $DownloadedPath
+            if ($actual -ne $expected) {
+                throw "Checksum mismatch for ${AssetName}: expected $expected, got $actual. Existing install was not changed."
+            }
+            Write-Host "Verified SHA-256 for $AssetName"
+            return
         } catch {
             if ($_.Exception.Message -match "Checksum mismatch|did not list") { throw }
+            $status = Get-WebExceptionStatus $_
+            if ($status -eq 404) { $sumsMissing = $true }
+            else { throw "Integrity asset $BinarySha256Asset could not be fetched (HTTP $status): $_. Existing install was not changed." }
         }
 
         try {
             Invoke-WebRequest -Uri $manifestUrl -OutFile $manifestTmp -Headers @{ "User-Agent" = $UserAgent }
-            if ((Test-Path $manifestTmp) -and ((Get-Item $manifestTmp).Length -gt 0)) {
-                $manifest = Get-Content $manifestTmp -Raw | ConvertFrom-Json
-                foreach ($entry in $manifest.binaries) {
-                    if ($entry.name -eq $AssetName) {
-                        $expected = [string]$entry.sha256
-                        if ($expected -notmatch '^[0-9a-f]{64}$') {
-                            throw "Release manifest listed an invalid checksum for $AssetName"
-                        }
-                        $actual = Get-FileSha256Lower $DownloadedPath
-                        if ($actual -ne $expected) {
-                            throw "Checksum mismatch for ${AssetName}: expected $expected, got $actual. Existing install was not changed."
-                        }
-                        Write-Host "Verified SHA-256 for $AssetName from $BinaryManifestAsset"
-                        return
+            $manifest = Get-Content $manifestTmp -Raw | ConvertFrom-Json
+            foreach ($entry in $manifest.binaries) {
+                if ($entry.name -eq $AssetName) {
+                    $expected = [string]$entry.sha256
+                    if ($expected -notmatch '^[0-9a-f]{64}$') {
+                        throw "Release manifest listed an invalid checksum for $AssetName"
                     }
+                    $actual = Get-FileSha256Lower $DownloadedPath
+                    if ($actual -ne $expected) {
+                        throw "Checksum mismatch for ${AssetName}: expected $expected, got $actual. Existing install was not changed."
+                    }
+                    Write-Host "Verified SHA-256 for $AssetName from $BinaryManifestAsset"
+                    return
                 }
             }
+            throw "Release manifest $BinaryManifestAsset did not list $AssetName"
         } catch {
-            if ($_.Exception.Message -match "Checksum mismatch|invalid checksum") { throw }
+            if ($_.Exception.Message -match "Checksum mismatch|invalid checksum|did not list") { throw }
+            $status = Get-WebExceptionStatus $_
+            if ($status -eq 404 -and $sumsMissing) {
+                Write-Host "No checksum asset on $Tag; continuing with size, --version, and --smoke-test verification."
+                return
+            }
+            throw "Integrity asset $BinaryManifestAsset could not be fetched (HTTP $status): $_. Existing install was not changed."
         }
-
-        Write-Host "No checksum asset on $Tag; continuing with size, --version, and --smoke-test verification."
     } finally {
         Remove-Item -Force $sumsTmp -ErrorAction SilentlyContinue
         Remove-Item -Force $manifestTmp -ErrorAction SilentlyContinue
@@ -442,7 +456,15 @@ function Install-Binary {
         if ($hadExisting) {
             Move-Item -Force $OutPath $BackupPath
         }
-        Move-Item -Force $DownloadTmp $OutPath
+        try {
+            Move-Item -Force $DownloadTmp $OutPath
+        } catch {
+            if (Test-Path $BackupPath) {
+                Move-Item -Force $BackupPath $OutPath
+                Write-Host "Restored previous gjc binary at $OutPath"
+            }
+            throw "Failed to publish the downloaded binary. Existing install was preserved if one existed. $_"
+        }
 
         try {
             Assert-InstalledBinary -ExePath $OutPath -ExpectedVersion $ExpectedVersion
@@ -462,11 +484,17 @@ function Install-Binary {
         Write-Host "Installed gjc $ExpectedVersion to $OutPath" -ForegroundColor Green
 
         $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
-        $needsRestart = $UserPath -notlike "*$InstallDir*"
-        if ($needsRestart) {
-            Write-Host "Adding $InstallDir to PATH..."
-            [Environment]::SetEnvironmentVariable("Path", "$UserPath;$InstallDir", "User")
+        if (-not $UserPath) { $UserPath = "" }
+        $pathParts = @()
+        foreach ($part in $UserPath.Split(";")) {
+            if ($part -and $part -ne $InstallDir) { $pathParts += $part }
         }
+        $newUserPath = (@($InstallDir) + $pathParts) -join ";"
+        if ($newUserPath -ne $UserPath) {
+            Write-Host "Putting $InstallDir first on PATH..."
+            [Environment]::SetEnvironmentVariable("Path", $newUserPath, "User")
+        }
+        $needsRestart = $true
 
         Configure-BashShell
 
