@@ -3,6 +3,7 @@ import {
 	getPetPixelProtocol,
 	getPetRenderProtocol,
 	PET_CAPABILITY_SETTLE_MS,
+	setVerifiedItermPetAvailability,
 	warnWhenPetCapabilitySettled,
 } from "@gajae-code/coding-agent/modes/components/pet-capability";
 import { ImageProtocol, setTerminalImageProtocol, TERMINAL } from "@gajae-code/tui";
@@ -34,6 +35,7 @@ function setForcedProtocol(protocol: "kitty" | "sixel", multiplexerEnv: Readonly
 }
 
 afterEach(() => {
+	setVerifiedItermPetAvailability(undefined);
 	setTerminalImageProtocol(originalProtocol);
 	for (const key of multiplexerEnvKeys) {
 		const value = originalMultiplexerEnv.get(key);
@@ -45,6 +47,31 @@ afterEach(() => {
 });
 
 describe("getPetPixelProtocol", () => {
+	it("requires an active iTerm capability reply instead of trusting direct or forwarded markers", () => {
+		setTerminalImageProtocol(ImageProtocol.Iterm2);
+
+		expect(getPetPixelProtocol()).toBeNull();
+		expect(getPetRenderProtocol()).toBe("text");
+
+		setVerifiedItermPetAvailability({ available: false, mode: "direct", reason: "probe-timeout", epoch: 1 });
+		expect(getPetPixelProtocol()).toBeNull();
+
+		setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 2 });
+		expect(getPetPixelProtocol()).toBe("iterm");
+		expect(getPetRenderProtocol()).toBe("iterm");
+	});
+
+	it.each([
+		[ImageProtocol.Kitty, "kitty"],
+		[ImageProtocol.Sixel, "sixel"],
+	] as const)("keeps %s precedence over verified iTerm", (imageProtocol, expected) => {
+		for (const key of multiplexerEnvKeys) delete Bun.env[key];
+		setVerifiedItermPetAvailability({ available: true, mode: "direct", epoch: 1 });
+		setTerminalImageProtocol(imageProtocol);
+
+		expect(getPetPixelProtocol()).toBe(expected);
+	});
+
 	for (const [name, multiplexerEnv] of multiplexerCases) {
 		it(`uses text cells for forced Kitty inside ${name}`, () => {
 			setForcedProtocol("kitty", multiplexerEnv);
