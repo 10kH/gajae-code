@@ -43,6 +43,16 @@ export interface RetentionPolicy {
 	maxRows?: number;
 	tombstoneRule?: SessionTombstoneRule;
 }
+export interface SessionIndexObservationDeps {
+	/** Test seam for an exact retained process-identity observation. */
+	retainProcess?: (
+		pid: number,
+	) => SessionIndexProcessObservation | undefined | Promise<SessionIndexProcessObservation | undefined>;
+}
+export interface SessionIndexProcessObservation {
+	readonly incarnation: string;
+	readonly isRunning: () => boolean;
+}
 export interface SessionIndexEvent {
 	version: typeof SDK_STATE_VERSION;
 	indexSeq: number;
@@ -100,6 +110,37 @@ export interface SessionList {
 	sessions: IndexedSession[];
 	warnings: string[];
 }
+
+export type SessionGenerationIndexStatus =
+	| {
+			status: "current";
+			observedIndexSeq: number;
+			evidenceIndexSeq: number;
+	  }
+	| {
+			status: "retired";
+			observedIndexSeq: number;
+			evidenceIndexSeq: number;
+			event: "host_unregistered" | "session_closed" | "session_deleted";
+	  }
+	| {
+			status: "replaced";
+			observedIndexSeq: number;
+			evidenceIndexSeq: number;
+			currentGeneration: number;
+	  }
+	| {
+			status: "unknown";
+			observedIndexSeq: number;
+			reason:
+				| "index_incomplete"
+				| "session_not_observed"
+				| "generation_not_observed"
+				| "generation_reused"
+				| "ambiguous_authority"
+				| "proof_expired"
+				| "reconciliation_incomplete";
+	  };
 
 export interface SessionIndexDiagnosis {
 	status: "healthy" | "corrupt" | "unsupported";
@@ -636,6 +677,8 @@ const SESSION_INDEX_PROBE_FRESHNESS_MS = 50;
  * and the next pass re-probes from scratch.
  */
 const SESSION_INDEX_REPLAY_FRESHNESS_MS = 2_000;
+/** Maximum distinct live identity probes admitted by one public status query. */
+const SESSION_GENERATION_PROBE_LIMIT = 32;
 
 /**
  * One locked session-index transaction (#4544): every critical section over the
@@ -877,6 +920,7 @@ export class SessionIndex {
 	static #openGroups = new Map<string, SessionIndexOpenGroup>();
 	#agentDir: string;
 	#policy: ResolvedRetentionPolicy;
+	#observationDeps: SessionIndexObservationDeps;
 	#events: SessionIndexEvent[] = [];
 	#warnings: string[] = [];
 	#logOffset = 0;
@@ -888,9 +932,10 @@ export class SessionIndex {
 	#changeStamp: SessionIndexChangeStamp | undefined;
 	/** indexSeqs already recorded in the durable audit; null until lazily seeded. */
 	#auditedSeq: Set<number> | null = null;
-	constructor(agentDir: string, policy: RetentionPolicy = {}) {
+	constructor(agentDir: string, policy: RetentionPolicy = {}, observationDeps: SessionIndexObservationDeps = {}) {
 		this.#agentDir = agentDir;
 		this.#policy = resolvePolicy(policy);
+		this.#observationDeps = observationDeps;
 	}
 	static #enqueue<T>(indexPath: string, operation: () => Promise<T>): Promise<T> {
 		const previous = SessionIndex.#operations.get(indexPath) ?? Promise.resolve();
@@ -1533,6 +1578,192 @@ export class SessionIndex {
 			sessions: reduceEvents(this.#events, this.#policy.clock(), this.#agentDir).sessions,
 			warnings: this.#warnings,
 		};
+	}
+
+	/**
+	 * Credential-free proof for one exact public endpoint generation.
+	 *
+	 * A strictly newer live generation proves replacement only when this
+	 * generation was itself observed. Otherwise terminal evidence wins only when
+	 * the retained index history positively records it for the exact generation. Missing,
+	 * ambiguous, reused, corrupt, or merely non-live state remains unknown.
+	 */
+	async generationStatus(sessionId: string, endpointGeneration: number): Promise<SessionGenerationIndexStatus> {
+		const indexPath = path.resolve(logFor(this.#agentDir));
+		const retainProcess =
+			this.#observationDeps.retainProcess ??
+			((pid: number): SessionIndexProcessObservation | undefined => {
+				const reference = nativeProcessBindings().Process.fromPid(pid);
+				return reference
+					? { incarnation: reference.incarnation, isRunning: () => reference.status() === "running" }
+					: undefined;
+			});
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const plan = await SessionIndex.#enqueue(indexPath, () =>
+				withSessionIndexLock("generation reconciliation plan", this.#agentDir, async () => {
+					await this.#replayUnderLock();
+					const latestByIdentity = new Map<string, SessionIndexEvent>();
+					for (const event of admitEvents(this.#events).admitted) {
+						if (event.sessionId !== sessionId || event.type === "host_heartbeat") continue;
+						const key = identityKey(event);
+						const previous = latestByIdentity.get(key);
+						if (previous === undefined || event.indexSeq > previous.indexSeq) latestByIdentity.set(key, event);
+					}
+					const registrations = new Map<string, number>();
+					for (const event of latestByIdentity.values()) {
+						if (!isUnresolvedEvent(event) || effectiveIncarnation(event) === undefined) continue;
+						registrations.set(`${event.sessionId}\u0000${event.endpointGeneration}\u0000${event.pid}`, event.pid);
+					}
+					return {
+						indexSeq: this.indexSeq,
+						registrations:
+							registrations.size <= SESSION_GENERATION_PROBE_LIMIT ? [...registrations.entries()] : undefined,
+					};
+				}),
+			);
+			if (plan.registrations === undefined)
+				return {
+					status: "unknown",
+					observedIndexSeq: plan.indexSeq,
+					reason: "reconciliation_incomplete",
+				};
+			// Opening a retained process reference may perform platform work, so it
+			// must never run while the machine-global index lock is held. The retained
+			// handle binds the exact process incarnation and is checked for running
+			// status only after the second locked replay; PID reuse cannot make the old
+			// handle refer to the successor. A writer racing either cut causes a bounded
+			// retry rather than stale classification.
+			const retained = new Map<string, SessionIndexProcessObservation | undefined>();
+			for (const [key, pid] of plan.registrations) retained.set(key, await retainProcess(pid));
+			const result = await SessionIndex.#enqueue(indexPath, () =>
+				withSessionIndexLock("generation reconciliation commit", this.#agentDir, async () => {
+					await this.#replayUnderLock();
+					if (this.indexSeq !== plan.indexSeq) return undefined;
+					const probed = new Map<string, string | undefined>();
+					for (const [key, observation] of retained)
+						probed.set(key, observation?.isRunning() === true ? observation.incarnation : undefined);
+					return this.#generationStatusFromEvents(sessionId, endpointGeneration, probed);
+				}),
+			);
+			if (result !== undefined) return result;
+		}
+		return { status: "unknown", observedIndexSeq: this.indexSeq, reason: "reconciliation_incomplete" };
+	}
+
+	#generationStatusFromEvents(
+		sessionId: string,
+		endpointGeneration: number,
+		probedIncarnations: ReadonlyMap<string, string | undefined>,
+	): SessionGenerationIndexStatus {
+		const observedIndexSeq = this.indexSeq;
+		if (this.#corruptSuffix || this.#warnings.length > 0)
+			return { status: "unknown", observedIndexSeq, reason: "index_incomplete" };
+
+		const rawSessionEvents = this.#events.filter(event => event.sessionId === sessionId);
+		if (rawSessionEvents.length === 0) return { status: "unknown", observedIndexSeq, reason: "session_not_observed" };
+		const rawGenerationEvents = rawSessionEvents.filter(event => event.endpointGeneration === endpointGeneration);
+		if (rawGenerationEvents.length === 0)
+			return { status: "unknown", observedIndexSeq, reason: "generation_not_observed" };
+
+		const admitted = admitEvents(this.#events).admitted;
+		const generationEvents = admitted.filter(
+			event => event.sessionId === sessionId && event.endpointGeneration === endpointGeneration,
+		);
+		if (generationEvents.length === 0)
+			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+		const projection = reduceEvents(admitted, this.#policy.clock(), this.#agentDir, probedIncarnations);
+		const current = projection.sessions.find(session => session.sessionId === sessionId);
+		if (current?.terminalUncertain)
+			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+		if (current && !isSessionAuthorityEligible(current))
+			return { status: "unknown", observedIndexSeq, reason: "ambiguous_authority" };
+
+		const registrations = rawGenerationEvents.filter(event => event.type === "host_registered");
+		const latestByIdentity = new Map<string, SessionIndexEvent>();
+		for (const event of rawGenerationEvents) {
+			if (event.type === "host_heartbeat") continue;
+			const key = identityKey(event);
+			const previous = latestByIdentity.get(key);
+			if (previous === undefined || event.indexSeq > previous.indexSeq) latestByIdentity.set(key, event);
+		}
+		const unresolvedRoots = new Set<string>();
+		for (const event of registrations) {
+			const latest = latestByIdentity.get(identityKey(event));
+			if (latest && isUnresolvedEvent(latest)) unresolvedRoots.add(resolveEquivalentPath(event.locator.stateRoot));
+		}
+		const authorityKeys = new Set<string>();
+		for (const event of registrations) {
+			const latest = latestByIdentity.get(identityKey(event));
+			// A terminal identity from a historical root no longer claims authority.
+			// A terminal identity on the surviving root still participates: a new
+			// incarnation reusing the same numeric generation on that root must remain
+			// unknown. Cross-root ambiguity itself is classified by the projection
+			// above, which follows the same surviving-root rules as Router authority.
+			const root = resolveEquivalentPath(event.locator.stateRoot);
+			if (!latest || (!isUnresolvedEvent(latest) && !unresolvedRoots.has(root))) continue;
+			const incarnation = event.hostIncarnation ?? event.processIncarnation;
+			const authority =
+				incarnation === undefined
+					? `legacy:${event.pid}:${event.endpointMtimeMs ?? "unknown"}`
+					: `composite:${incarnation}`;
+			authorityKeys.add(`${root}\u0000${authority}`);
+		}
+		if (authorityKeys.size > 1) return { status: "unknown", observedIndexSeq, reason: "generation_reused" };
+		const registration = registrations.at(-1);
+		const registrationIncarnation = registration?.hostIncarnation ?? registration?.processIncarnation;
+		if (!registration || registrationIncarnation === undefined)
+			return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+		if (
+			rawSessionEvents.some(
+				event =>
+					event.type === "host_registered" &&
+					event.indexSeq > registration.indexSeq &&
+					event.endpointGeneration < endpointGeneration,
+			)
+		)
+			return { status: "unknown", observedIndexSeq, reason: "generation_reused" };
+
+		if (current?.live) {
+			if (current.endpointGeneration === endpointGeneration)
+				return {
+					status: "current",
+					observedIndexSeq,
+					evidenceIndexSeq: current.indexSeq,
+				};
+			if (current.endpointGeneration > endpointGeneration)
+				return {
+					status: "replaced",
+					observedIndexSeq,
+					evidenceIndexSeq: current.indexSeq,
+					currentGeneration: current.endpointGeneration,
+				};
+			return { status: "unknown", observedIndexSeq, reason: "generation_reused" };
+		}
+		const latestExact = generationEvents.findLast(event => event.type !== "host_heartbeat");
+		if (
+			latestExact?.type === "host_unregistered" ||
+			latestExact?.type === "session_closed" ||
+			latestExact?.type === "session_deleted"
+		) {
+			const terminalIncarnation = latestExact.hostIncarnation ?? latestExact.processIncarnation;
+			if (latestExact.ts < this.#policy.clock() - this.#policy.maxAgeMs)
+				return { status: "unknown", observedIndexSeq, reason: "proof_expired" };
+			if (
+				terminalIncarnation !== registrationIncarnation ||
+				latestExact.pid !== registration.pid ||
+				resolveEquivalentPath(latestExact.locator.stateRoot) !==
+					resolveEquivalentPath(registration.locator.stateRoot)
+			)
+				return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
+			return {
+				status: "retired",
+				observedIndexSeq,
+				evidenceIndexSeq: latestExact.indexSeq,
+				event: latestExact.type,
+			};
+		}
+
+		return { status: "unknown", observedIndexSeq, reason: "reconciliation_incomplete" };
 	}
 	/**
 	 * Broker-internal current composite-identity rows. Unlike {@link listSessions},
