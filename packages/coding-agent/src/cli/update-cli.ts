@@ -665,7 +665,7 @@ export async function recoverWindowsUpdateJournal(journalPath: string): Promise<
 			return;
 		}
 		try {
-			const recoverBackup = backup || `${target}.bak.recover`;
+			const recoverBackup = `${target}.bak.recover.${process.pid}.${Date.now().toString(16)}`;
 			await fs.promises.rename(target, recoverBackup);
 			try {
 				await fs.promises.rename(next, target);

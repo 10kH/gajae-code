@@ -855,7 +855,22 @@ describe("update-cli windows journal recovery", () => {
 		await Bun.write(journalPath, JSON.stringify({ target: targetPath, backup: backupPath, next: nextPath }));
 		await recoverWindowsUpdateJournal(journalPath);
 		expect(await Bun.file(targetPath).text()).toBe("new");
-		expect(await Bun.file(backupPath).text()).toBe("old");
+		expect(await Bun.file(nextPath).exists()).toBe(false);
+		expect(await Bun.file(journalPath).exists()).toBe(false);
+	});
+	it("promotes .next even when the journal backup path already exists", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const backupPath = `${targetPath}.bak`;
+		const nextPath = `${targetPath}.next`;
+		const journalPath = `${targetPath}.update-journal`;
+		await Bun.write(targetPath, "old");
+		await Bun.write(nextPath, "new");
+		await Bun.write(backupPath, "stale-backup");
+		await Bun.write(journalPath, JSON.stringify({ target: targetPath, backup: backupPath, next: nextPath }));
+		await recoverWindowsUpdateJournal(journalPath);
+		expect(await Bun.file(targetPath).text()).toBe("new");
+		expect(await Bun.file(backupPath).text()).toBe("stale-backup");
 		expect(await Bun.file(nextPath).exists()).toBe(false);
 		expect(await Bun.file(journalPath).exists()).toBe(false);
 	});
