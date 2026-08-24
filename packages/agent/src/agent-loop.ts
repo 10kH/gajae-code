@@ -399,6 +399,13 @@ function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
 	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
 }
 
+/** Names of the turn's `\uXXXX`-escaped tool calls, for shape-only diagnostics. */
+function escapedNonAsciiToolNames(message: AssistantMessage): string[] {
+	return message.content
+		.filter(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true)
+		.map(block => (block.type === "toolCall" ? block.name : ""));
+}
+
 /**
  * The complete set of non-ASCII characters an escaped payload may decode to and
  * still execute on a display-safe tool after the resample budget: U+2014 EM DASH
@@ -424,6 +431,11 @@ type DisplaySafeEscapedTool = AgentTool<TSchema> & {
  */
 function isDisplaySafeEscapedCodepoint(cp: number): boolean {
 	return DISPLAY_SAFE_ESCAPED_CODEPOINTS.has(cp);
+}
+
+/** Whether the tool declared any display-only argument fields at all. */
+function isDisplaySafeEscapedTool(tool: AgentTool<TSchema> | undefined): boolean {
+	return ((tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields?.length ?? 0) > 0;
 }
 
 /**
@@ -3506,6 +3518,17 @@ async function runLoopBody(
 			) {
 				escapedNonAsciiResampleAttempt++;
 				escapedToolTransaction?.discard();
+				// The discard is invisible everywhere else: the defective turn never
+				// reaches durable history, so nothing downstream can count how often
+				// the defect fires or whether steering ever changes the spelling.
+				// Shape-only (tool names + attempt), never the escaped payload.
+				logger.debug("agent: discarded a tool-call turn whose arguments were \\uXXXX-escaped", {
+					attempt: escapedNonAsciiResampleAttempt,
+					budget: MAX_ESCAPED_NONASCII_RESAMPLES,
+					steered: recoveryAttempt?.kind === "escaped-nonascii",
+					managed: config.fallbackManaged === true,
+					tools: escapedNonAsciiToolNames(message),
+				});
 				// The defective turn was already committed to the context by the
 				// streaming path. Remove that exact object rather than assuming it is
 				// still the tail: callbacks may append user/system history while the
@@ -4692,6 +4715,14 @@ async function executeToolCalls(
 					// isDisplaySafeEscapedArguments): user-facing question text whose
 					// only non-ASCII characters are benign typographic punctuation is
 					// not the Hangul-mistype corruption this guard exists to stop.
+					//
+					// Terminal for this call: the resample budget is already spent, so
+					// log it (shape-only) to make the fire rate measurable without
+					// scraping session transcripts.
+					logger.warn("agent: rejected a tool call whose arguments were \\uXXXX-escaped", {
+						tool: toolCall.name,
+						displaySafeTool: isDisplaySafeEscapedTool(tool),
+					});
 					throw new Error(
 						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
 							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
