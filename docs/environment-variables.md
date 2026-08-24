@@ -478,6 +478,7 @@ Extra conditional behavior:
 | `PUPPETEER_EXECUTABLE_PATH`  | Browser tool Chromium executable override                                                          |
 | `LM_STUDIO_BASE_URL`         | Default implicit LM Studio discovery base URL override (`http://127.0.0.1:1234/v1` if unset)       |
 | `OMLX_BASE_URL`              | Default implicit oMLX discovery base URL override (`http://127.0.0.1:8080/v1` if unset); only HTTP(S) loopback URLs are accepted to prevent credential forwarding to remote hosts |
+| `VLLM_BASE_URL`              | Default implicit vLLM discovery base URL override (`http://127.0.0.1:8000/v1` if unset); only HTTP(S) loopback URLs are accepted to prevent credential forwarding to remote hosts |
 | `OLLAMA_BASE_URL`            | Default implicit Ollama discovery base URL override (`http://127.0.0.1:11434` if unset)            |
 | `LLAMA_CPP_BASE_URL`         | Default implicit Llama.cpp discovery base URL override (`http://127.0.0.1:8080` if unset)          |
 | `GJC_EDIT_VARIANT`            | Forces edit tool variant (`patch`, `replace`, `hashline`, `vim`, `apply_patch`). The force beats `edit.modelVariants`, `edit.mode`, and automatic model-family routing; invalid values fail fast at startup. `PI_EDIT_VARIANT` is the legacy alias. |

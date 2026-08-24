@@ -1831,7 +1831,8 @@ export class ModelRegistry {
 		const liveBaseUrl =
 			providerConfig.discovery.type === "openai-models-list" ||
 			providerConfig.discovery.type === "lm-studio" ||
-			providerConfig.discovery.type === "omlx"
+			providerConfig.discovery.type === "omlx" ||
+			providerConfig.discovery.type === "vllm"
 				? this.#normalizeOpenAIModelsListBaseUrl(
 						this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
 					)
@@ -1947,6 +1948,18 @@ export class ModelRegistry {
 			// Implicit oMLX auth is optional and may be added after startup.
 			this.#optionalAuthProviders.add("omlx");
 			this.#keylessProviders.add("omlx");
+		}
+		if (!configuredProviders.has("vllm") && !disabledProviders.has("vllm")) {
+			this.#discoveryManager.addProvider({
+				provider: "vllm",
+				api: "openai-completions",
+				baseUrl: resolveLoopbackOpenAIBaseUrl(Bun.env.VLLM_BASE_URL, "http://127.0.0.1:8000/v1"),
+				discovery: { type: "vllm" },
+				optional: true,
+			});
+			// Implicit vLLM auth is optional and may be added after startup.
+			this.#optionalAuthProviders.add("vllm");
+			this.#keylessProviders.add("vllm");
 		}
 	}
 
@@ -2686,6 +2699,7 @@ export class ModelRegistry {
 				return this.#discoverLlamaCppModels(providerConfig, apiKey);
 			case "lm-studio":
 			case "omlx":
+			case "vllm":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 			case "models-dev":
@@ -4201,7 +4215,8 @@ export class ModelRegistry {
 							? `${this.#normalizeOllamaBaseUrl(baseUrl)}/v1`
 							: discoveryType === "openai-models-list" ||
 									discoveryType === "lm-studio" ||
-									discoveryType === "omlx"
+									discoveryType === "omlx" ||
+									discoveryType === "vllm"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
 								: (baseUrl ?? ""),
 					);

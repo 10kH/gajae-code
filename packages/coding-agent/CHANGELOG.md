@@ -5,6 +5,7 @@
 ### Added
 
 - Added frictionless interactive onboarding for unresolved users and `/tutorial`. GJC now performs bounded, local metadata discovery across known coding-agent roots, requires corroborating activity within 90 days before inferring a workflow, falls back to manual guidance when evidence is insufficient, persists only a derived profile and completion decision, discloses unavailable sources, and previews the guided migration result before a single explicit apply or experienced-user skip.
+- vLLM servers are now discovered implicitly at `http://127.0.0.1:8000/v1`, the same zero-config UX as Ollama, LM Studio, and oMLX. `VLLM_BASE_URL` overrides the default and is loopback-only (project `.env` cannot redirect it to a remote host); a remote vLLM server is still reachable via a trusted shell/user-env `VLLM_BASE_URL` or an explicit `models.yml` provider entry. Adds `discovery.type: "vllm"`.
 
 ### Changed
 
