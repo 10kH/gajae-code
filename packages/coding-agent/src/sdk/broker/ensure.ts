@@ -364,6 +364,21 @@ const STALE_BROKER_SHUTDOWN_TIMEOUT_MS = 2_000;
  * here fails closed and leaves the exact owner live rather than escalating it.
  */
 const OWNED_BROKER_RETIRE_TIMEOUT_MS = STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
+const PACKAGE_AUTHORITY_CHANGED_BEFORE_SHUTDOWN = "SDK broker package authority changed before shutdown dispatch";
+
+function assertUnchangedPackageAuthority(expectedPackageGeneration: string, preflight: SdkPackageAuthority): void {
+	const current = resolveSdkPackageAuthority({ force: true });
+	if (
+		current.generation !== expectedPackageGeneration ||
+		current.packageVersion !== preflight.packageVersion ||
+		current.installationIdentity !== preflight.installationIdentity
+	)
+		throw new Error(PACKAGE_AUTHORITY_CHANGED_BEFORE_SHUTDOWN);
+}
+
+function isPackageAuthorityChangedBeforeShutdown(error: unknown): boolean {
+	return error instanceof Error && error.message === PACKAGE_AUTHORITY_CHANGED_BEFORE_SHUTDOWN;
+}
 
 /** Sends SIGTERM only through an OS process reference bound to the published incarnation. */
 function signalExactBroker(pid: number, incarnation: string): boolean {
@@ -600,13 +615,6 @@ async function retireStaleBroker(
 			reconnectAttempts: 0,
 		});
 		try {
-			const currentAuthority = resolveSdkPackageAuthority({ force: true });
-			if (
-				currentAuthority.generation !== expectedPackageGeneration ||
-				currentAuthority.packageVersion !== preflightAuthority.packageVersion ||
-				currentAuthority.installationIdentity !== preflightAuthority.installationIdentity
-			)
-				return false;
 			const currentBeforeShutdown = unstamped
 				? await readUnstampedBrokerIgnoringTtl(agentDir)
 				: await readBrokerDiscovery(agentDir, heartbeatTtlMs);
@@ -617,8 +625,18 @@ async function retireStaleBroker(
 				!isAuthorizedBrokerEndpoint(currentBeforeShutdown)
 			)
 				return unstamped ? unstampedProcessGone(stale) : false;
-			await client.global("broker.shutdown", {});
+			await client.global(
+				"broker.shutdown",
+				{},
+				{
+					timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
+					beforeDispatch: () => {
+						assertUnchangedPackageAuthority(expectedPackageGeneration, preflightAuthority);
+					},
+				},
+			);
 		} catch (error) {
+			if (isPackageAuthorityChangedBeforeShutdown(error)) return false;
 			if (unstamped && error instanceof SdkClientError && error.code === "unknown_operation") {
 				unknownOperationAfterAuth = true;
 			} else {
@@ -649,13 +667,6 @@ async function retireStaleBroker(
 		}
 	}
 	if (unknownOperationAfterAuth) {
-		const currentAuthority = resolveSdkPackageAuthority({ force: true });
-		if (
-			currentAuthority.generation !== expectedPackageGeneration ||
-			currentAuthority.packageVersion !== preflightAuthority.packageVersion ||
-			currentAuthority.installationIdentity !== preflightAuthority.installationIdentity
-		)
-			return false;
 		const peeked = await readUnstampedBrokerIgnoringTtl(agentDir);
 		if (
 			!peeked ||
@@ -664,6 +675,12 @@ async function retireStaleBroker(
 			!isAuthorizedBrokerEndpoint(peeked)
 		)
 			return unstampedProcessGone(stale);
+		try {
+			assertUnchangedPackageAuthority(expectedPackageGeneration, preflightAuthority);
+		} catch (error) {
+			if (isPackageAuthorityChangedBeforeShutdown(error)) return false;
+			throw error;
+		}
 		if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
@@ -722,11 +739,7 @@ async function retireOwnedBroker(
 			reconnectAttempts: 0,
 		});
 		const currentBeforeShutdown = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
-		const currentAuthority = resolveSdkPackageAuthority({ force: true });
 		if (
-			currentAuthority.generation !== expectedPackageGeneration ||
-			currentAuthority.packageVersion !== authority.packageVersion ||
-			currentAuthority.installationIdentity !== authority.installationIdentity ||
 			!currentBeforeShutdown ||
 			!sameBrokerIdentity(currentBeforeShutdown, stale) ||
 			!sameBrokerAuthority(currentBeforeShutdown, stale) ||
@@ -736,7 +749,16 @@ async function retireOwnedBroker(
 			!isAuthorizedBrokerEndpoint(currentBeforeShutdown)
 		)
 			return false;
-		await client.global("broker.shutdown", {}, { timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS });
+		await client.global(
+			"broker.shutdown",
+			{},
+			{
+				timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
+				beforeDispatch: () => {
+					assertUnchangedPackageAuthority(expectedPackageGeneration, authority);
+				},
+			},
+		);
 	} catch {
 		return false;
 	} finally {

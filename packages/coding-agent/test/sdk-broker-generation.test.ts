@@ -267,7 +267,7 @@ describe("sdk broker package generation", () => {
 		}
 	}, 30_000);
 
-	it("aborts stale shutdown when package authority changes after connect", async () => {
+	it("aborts stale shutdown when package authority changes at dispatch", async () => {
 		const dir = await temp();
 		const stale = staleBroker(dir);
 		const stop = vi.spyOn(stale, "stop");
@@ -281,7 +281,11 @@ describe("sdk broker package generation", () => {
 		const originalConnect = SdkClient.connect.bind(SdkClient);
 		const connect = vi.spyOn(SdkClient, "connect").mockImplementation(async (url, token, options) => {
 			const client = await originalConnect(url, token, options);
-			mutate = true;
+			const originalGlobal = client.global.bind(client);
+			client.global = ((operation, input, requestOptions) => {
+				if (operation === "broker.shutdown") mutate = true;
+				return originalGlobal(operation, input, requestOptions);
+			}) as typeof client.global;
 			return client;
 		});
 		try {
