@@ -2591,7 +2591,7 @@ export class AcpAgent implements Agent {
 		}
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") record.busy = true;
-		else if (event?.type === "agent_end" || event?.type === "agent_failed") record.busy = false;
+		else if (event?.type === "agent_end") record.busy = false;
 	}
 
 	#frameProcessingFailure(error: unknown): AcpSdkAdapterError {
