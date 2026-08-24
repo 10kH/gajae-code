@@ -58,4 +58,14 @@ describe("gjc setup hermes --require-worktree", () => {
 		expect(instructions).toContain("worktree_in_use");
 		expect(instructions).toContain("worktree_required");
 	});
+
+	it("teaches controllers to filter list_sessions on registered", async () => {
+		const instructions = operatorInstructions(await render());
+
+		// A controller that reuses an unregistered entry gets not_found from every
+		// session-scoped tool, so the marker has to reach the generated guidance.
+		expect(instructions).toContain("registered: true");
+		expect(instructions).toContain("not_found");
+		expect(instructions).toContain("register_session");
+	});
 });

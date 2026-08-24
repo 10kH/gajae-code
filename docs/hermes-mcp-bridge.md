@@ -117,7 +117,7 @@ Missing namespace never widens into global session enumeration.
 
 Read tools:
 
-- `gjc_coordinator_list_sessions`
+- `gjc_coordinator_list_sessions` — enumerates GJC sessions the broker discovered under the allowed roots, which is a superset of the sessions this bridge can drive. Each entry reports `registered`; the other session-scoped tools resolve through the coordinator projection and refuse `registered: false` entries — `read_status`, `read_tail`, and `send_prompt` answer `not_found`, and `stop_session` reports `unknown_session`. Filter on it rather than discovering the difference through failed calls, and use `gjc_coordinator_register_session` to adopt one deliberately.
 - `gjc_coordinator_read_status`
 - `gjc_coordinator_read_tail`
 - `gjc_coordinator_list_questions`
