@@ -37,9 +37,14 @@ import {
 } from "@gajae-code/ai/core";
 import { resolveLoopbackOpenAIBaseUrl } from "@gajae-code/ai/utils/discovery/openai-compatible";
 
-// Sentinel for local-only OAuth token (LM Studio, vLLM) — declared inline to avoid loading
-// any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts.
+// Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
+// modules at startup. Must match the provider OAuth modules.
 const DEFAULT_LOCAL_TOKEN = "lm-studio-local";
+const VLLM_DEFAULT_LOCAL_TOKEN = "vllm-local";
+
+function isVllmNoAuthToken(provider: string, apiKey: string | undefined): boolean {
+	return provider === "vllm" && apiKey === VLLM_DEFAULT_LOCAL_TOKEN;
+}
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
@@ -103,7 +108,7 @@ function firstPositiveDiscoveryNumber(...values: readonly unknown[]): number | u
 	for (const value of values) {
 		const number =
 			typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
-		if (Number.isFinite(number) && number > 0) return number;
+		if (Number.isSafeInteger(number) && number > 0) return number;
 	}
 	return undefined;
 }
@@ -1831,7 +1836,8 @@ export class ModelRegistry {
 		const liveBaseUrl =
 			providerConfig.discovery.type === "openai-models-list" ||
 			providerConfig.discovery.type === "lm-studio" ||
-			providerConfig.discovery.type === "omlx"
+			providerConfig.discovery.type === "omlx" ||
+			providerConfig.discovery.type === "vllm"
 				? this.#normalizeOpenAIModelsListBaseUrl(
 						this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
 					)
@@ -2524,7 +2530,7 @@ export class ModelRegistry {
 		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveProviderConfig.baseUrl ?? "");
 		const allowsKeylessVllmDiscovery =
 			provider !== "vllm" ||
-			isAuthenticated(preflightApiKey) ||
+			(isAuthenticated(preflightApiKey) && !isVllmNoAuthToken(provider, preflightApiKey)) ||
 			effectiveProviderConfig.baseUrl === undefined ||
 			resolveLoopbackOpenAIBaseUrl(effectiveProviderConfig.baseUrl, "") === effectiveProviderConfig.baseUrl;
 		if (!isCurrentPreflight() || preflightStale) {
@@ -2686,6 +2692,7 @@ export class ModelRegistry {
 				return this.#discoverLlamaCppModels(providerConfig, apiKey);
 			case "lm-studio":
 			case "omlx":
+			case "vllm":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 			case "models-dev":
@@ -2699,6 +2706,11 @@ export class ModelRegistry {
 	): Promise<Model<Api>[]> {
 		// Skip providers already handled by configured discovery (e.g. user-configured ollama with discovery.type)
 		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(p => p.provider));
+		// An explicit static vLLM provider owns its catalog. Unlike other standard
+		// descriptors, vLLM also supports credentialless implicit discovery, so
+		// leaving it eligible here would probe and merge models the user did not
+		// request. Explicit discovery remains available through discovery.type.
+		if (this.#configuredProviderIds.has("vllm")) configuredDiscoveryProviders.add("vllm");
 		const managerOptions = (await this.#collectBuiltInModelManagerOptions(configuredDiscoveryProviders)).filter(
 			entry => (providerFilter ? providerFilter.has(entry.options.providerId) : true),
 		);
@@ -2783,6 +2795,7 @@ export class ModelRegistry {
 		for (let i = 0; i < standardProviderDescriptors.length; i++) {
 			const descriptor = standardProviderDescriptors[i];
 			const { apiKey, authGeneration } = standardProviderCredentials[i];
+			const requestApiKey = isVllmNoAuthToken(descriptor.providerId, apiKey) ? undefined : apiKey;
 			const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId);
 			const allowsKeylessDiscovery =
 				descriptor.allowUnauthenticated &&
@@ -2792,11 +2805,11 @@ export class ModelRegistry {
 			if (
 				authGeneration !== undefined &&
 				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId, apiKey) &&
-				(isAuthenticated(apiKey) || allowsKeylessDiscovery)
+				(isAuthenticated(requestApiKey) || allowsKeylessDiscovery)
 			) {
 				options.push({
 					options: descriptor.createModelManagerOptions({
-						apiKey: isAuthenticated(apiKey) ? apiKey : undefined,
+						apiKey: isAuthenticated(requestApiKey) ? requestApiKey : undefined,
 						baseUrl,
 					}),
 					authGeneration,
@@ -3227,7 +3240,12 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl }));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (
+			apiKey &&
+			apiKey !== DEFAULT_LOCAL_TOKEN &&
+			!isVllmNoAuthToken(providerConfig.provider, apiKey) &&
+			apiKey !== kNoAuth
+		) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
@@ -4201,7 +4219,8 @@ export class ModelRegistry {
 							? `${this.#normalizeOllamaBaseUrl(baseUrl)}/v1`
 							: discoveryType === "openai-models-list" ||
 									discoveryType === "lm-studio" ||
-									discoveryType === "omlx"
+									discoveryType === "omlx" ||
+									discoveryType === "vllm"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
 								: (baseUrl ?? ""),
 					);
