@@ -14,7 +14,7 @@
  */
 import * as crypto from "node:crypto";
 import * as path from "node:path";
-import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
+import { cleanReason } from "@gajae-code/ai/auth-broker";
 import { startAuthGateway } from "@gajae-code/ai/auth-gateway/server";
 import {
 	type Api,

@@ -17,7 +17,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { cleanReason } from "@gajae-code/ai/auth-broker/redact";
+import { cleanReason } from "@gajae-code/ai/auth-broker";
 import {
 	AuthBrokerClient,
 	type AuthCredential,

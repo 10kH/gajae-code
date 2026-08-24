@@ -1,6 +1,6 @@
 import { logger } from "@gajae-code/utils";
 import { AUTOROUTING_INACTIVE_WARNING } from "../../config/autorouting-contract";
-import { redactBrokerRuntimeCloseCapability } from "./control/runtime-gate";
+import { redactBrokerRuntimeCloseCapability, redactObservedRequestContent } from "./control/runtime-gate";
 import { type EventFrame, SessionEventStream } from "./events";
 import { isAutoroutingInactive } from "./internal-autorouting-state";
 import { type ProviderLease, ReverseLeaseError, ReverseLeaseRuntime } from "./reverse-leases";
@@ -630,7 +630,11 @@ export class SessionSdkHost {
 	}
 	#observeRequest(kind: "control" | "query", connectionId: string, frame: SdkFrame): void {
 		try {
-			this.#options.onRequest?.(kind, connectionId, redactBrokerRuntimeCloseCapability(frame));
+			this.#options.onRequest?.(
+				kind,
+				connectionId,
+				redactObservedRequestContent(redactBrokerRuntimeCloseCapability(frame)),
+			);
 		} catch {
 			// Diagnostic observers must not change request handling.
 		}

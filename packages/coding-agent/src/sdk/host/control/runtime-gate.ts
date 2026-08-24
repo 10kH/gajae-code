@@ -28,6 +28,38 @@ export function redactBrokerRuntimeCloseCapability(frame: Record<string, unknown
 }
 
 /**
+ * Free-text request fields that carry caller content (a prompt, a task, an
+ * answer, skill arguments). Diagnostic observers get the request shape, never
+ * the content: a spawned child's seed task travels through `turn.prompt`
+ * `input.text`, and that text must not reach an observer.
+ */
+const OBSERVED_CONTENT_FIELDS = ["text", "prompt", "answer", "response", "args", "items", "images"] as const;
+
+/** Replaces caller content with a shape-preserving marker for observers. */
+function redactedContentMarker(value: unknown): string {
+	if (typeof value === "string") return `[redacted ${value.length} chars]`;
+	if (Array.isArray(value)) return `[redacted ${value.length} items]`;
+	return "[redacted]";
+}
+
+/**
+ * Strips caller content from a request frame before it reaches a diagnostic
+ * observer. Operation, ids, and correlation fields survive so instrumentation
+ * stays useful; only the content itself is removed.
+ */
+export function redactObservedRequestContent(frame: Record<string, unknown>): Record<string, unknown> {
+	const input = record(frame.input);
+	if (!input) return frame;
+	let redacted: Record<string, unknown> | undefined;
+	for (const field of OBSERVED_CONTENT_FIELDS) {
+		if (!Object.hasOwn(input, field) || input[field] === undefined) continue;
+		redacted ??= { ...input };
+		redacted[field] = redactedContentMarker(input[field]);
+	}
+	return redacted === undefined ? frame : { ...frame, input: redacted };
+}
+
+/**
  * Runtime-local authority check for the Broker-only graceful close executor.
  *
  * A lifecycle child receives GJC_LIFECYCLE_REQUEST_ID from the Broker launch
