@@ -558,8 +558,18 @@ async function retireStaleBroker(
 		if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
 	} else if (unstamped) {
 		// TTL-expired publications are invisible to readBrokerDiscovery, but a live
-		// pid still owns the lock. Attempt authenticated shutdown on the peeked record.
+		// pid still owns the lock. Re-read the raw publication and require the same
+		// identity before authenticated shutdown so a concurrent replacement is not
+		// disrupted.
 		if (unstampedProcessGone(stale)) return true;
+		const peeked = await peekUnstampedLiveBroker(agentDir);
+		if (
+			!peeked ||
+			!sameBrokerIdentity(peeked, stale) ||
+			!sameBrokerAuthority(peeked, stale) ||
+			!isAuthorizedBrokerEndpoint(peeked)
+		)
+			return false;
 	} else {
 		return false;
 	}
