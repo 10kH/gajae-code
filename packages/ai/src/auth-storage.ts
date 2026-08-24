@@ -4169,6 +4169,29 @@ export class AuthStorage {
 		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));
 	}
 
+	/**
+	 * Earliest instant at which any currently blocked stored credential for this
+	 * provider becomes usable again. Undefined when nothing is blocked.
+	 * When `sessionId` is provided, only the session's active credential type is
+	 * considered — API-key and OAuth backoff pools are independent.
+	 * Informational only: callers must not treat this as authorization to wait.
+	 */
+	getEarliestUnblockAt(provider: string, sessionId?: string): number | undefined {
+		provider = resolveOAuthStorageProvider(provider);
+		const sessionType = this.#getSessionCredential(provider, sessionId)?.type;
+		let earliest: number | undefined;
+		for (const [index, credential] of this.#getCredentialsForProvider(provider).entries()) {
+			if (sessionType !== undefined && credential.type !== sessionType) continue;
+			const blockedUntil = this.#getCredentialBlockedUntil(
+				this.#getProviderTypeKey(provider, credential.type),
+				index,
+			);
+			if (blockedUntil === undefined || !Number.isFinite(blockedUntil)) continue;
+			if (earliest === undefined || blockedUntil < earliest) earliest = blockedUntil;
+		}
+		return earliest;
+	}
+
 	#resolveWindowResetAt(window: UsageLimit["window"]): number | undefined {
 		if (!window) return undefined;
 		if (typeof window.resetsAt === "number" && Number.isFinite(window.resetsAt)) {
