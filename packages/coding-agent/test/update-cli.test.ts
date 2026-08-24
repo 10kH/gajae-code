@@ -839,6 +839,7 @@ describe("update-cli install lock", () => {
 	it("locks the same file the POSIX installer uses", async () => {
 		const source = await Bun.file(path.resolve(import.meta.dir, "../src/cli/update-cli.ts")).text();
 		expect(source).toContain(".gjc-install.lock");
+		expect(source).not.toContain("No checksum asset on");
 		expect(source).not.toContain(".update-lock");
 		expect(source).toContain("Remove ${lockFile} only after confirming");
 	});

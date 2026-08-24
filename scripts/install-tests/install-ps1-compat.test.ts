@@ -49,6 +49,8 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).toContain("Test-TrustedGithubUri");
 		expect(installer).toContain("Assert-OfficialGithubOrigins");
 		expect(installer).toContain("FileMode]::CreateNew");
+		expect(installer).toContain("leftover lock file");
+		expect(installer).not.toContain("Get-Process -Id");
 		expect(installer).toContain("Refusing to replace symlink");
 		expect(installer).toContain("FileAttributes]::ReparsePoint");
 		expect(installer).toContain("-UseBasicParsing");

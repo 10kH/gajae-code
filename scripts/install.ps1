@@ -483,35 +483,7 @@ function Install-Binary {
         $fs.Dispose()
         $lockOwned = $true
     } catch {
-        $ownerLine = $null
-        if (Test-Path $lockFile) {
-            $ownerLine = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-        }
-        $ownerPid = $null
-        if ($ownerLine) { $ownerPid = ($ownerLine -split '\s+')[0] }
-        $alive = $false
-        if ($ownerPid) {
-            try {
-                Get-Process -Id ([int]$ownerPid) -ErrorAction Stop | Out-Null
-                $alive = $true
-            } catch {}
-        }
-        if ($alive -or -not $ownerLine) {
-            throw "Another GJC installer is already running in $InstallDir (lock: $lockFile)."
-        }
-        $still = $null
-        if (Test-Path $lockFile) {
-            $still = (Get-Content $lockFile -ErrorAction SilentlyContinue | Select-Object -First 1)
-        }
-        if ($still -ne $ownerLine) {
-            throw "Another GJC installer is already running in $InstallDir (lock: $lockFile)."
-        }
-        Remove-Item -Force $lockFile -ErrorAction SilentlyContinue
-        $fs = [System.IO.File]::Open($lockFile, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockLine + "`n")
-        $fs.Write($bytes, 0, $bytes.Length)
-        $fs.Dispose()
-        $lockOwned = $true
+        throw "Another GJC installer is already running in $InstallDir (lock: $lockFile). Remove a leftover lock file only after confirming no installer is running."
     }
 
     $OutPath = Join-Path $InstallDir "gjc.exe"

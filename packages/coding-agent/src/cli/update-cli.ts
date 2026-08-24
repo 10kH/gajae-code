@@ -893,14 +893,11 @@ async function downloadBinaryTo(
 	if (expectedVersion) {
 		const tag = expectedVersion.startsWith("v") ? expectedVersion : `v${expectedVersion}`;
 		try {
-			const checksum = await verifyDownloadedBinaryChecksum({
+			await verifyDownloadedBinaryChecksum({
 				tag,
 				assetName: binaryName,
 				filePath: tempPath,
 			});
-			if (checksum === "absent") {
-				console.log(chalk.dim(`No checksum asset on ${tag}; continuing with version and smoke verification.`));
-			}
 		} catch (err) {
 			await unlinkIfExists(tempPath);
 			throw err;

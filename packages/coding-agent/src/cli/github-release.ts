@@ -200,7 +200,7 @@ export async function verifyDownloadedBinaryChecksum(options: {
 	fetchImpl?: GithubFetch;
 	lookupEnv?: (name: string) => string | undefined;
 	downloadOrigin?: string;
-}): Promise<"verified" | "absent"> {
+}): Promise<"verified"> {
 	const origin = options.downloadOrigin ?? GITHUB_RELEASE_DOWNLOAD_ORIGIN;
 	const sumsUrl = `${origin}/${options.tag}/${BINARY_SHA256_ASSET}`;
 	const manifestUrl = `${origin}/${options.tag}/${BINARY_MANIFEST_ASSET}`;

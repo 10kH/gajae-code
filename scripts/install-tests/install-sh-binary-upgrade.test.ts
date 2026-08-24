@@ -413,6 +413,20 @@ describe("install.sh binary-first contract", () => {
 		expect(result.exitCode).toBe(0);
 		expect(result.stdout).toContain(`Using version: v${nightly}`);
 	});
+	test("selects a nightly tag when prerelease appears before tag_name", async () => {
+		const nightly = "0.9.2-nightly.1.1.gdef";
+		const payload = fakeGjcScript({ version: nightly });
+		writeCurlShim(sandbox.shimDir, {
+			releasesJson: `[{"prerelease":true,"draft":false,"tag_name":"v${nightly}"}]`,
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const result = await runInstaller(["--channel", "nightly"]);
+		expect(result.exitCode).toBe(0);
+		expect(result.stdout).toContain(`Using version: v${nightly}`);
+	});
 
 	test("rejects a non-semver stable tag such as vpreview", async () => {
 		writeCurlShim(sandbox.shimDir, {

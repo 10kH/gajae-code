@@ -247,6 +247,7 @@ pick_nightly_tag() {
     tr -d '\r' < "$json_file" | sed 's/[{,]/&\n/g' | awk '
         BEGIN { tag=""; draft=""; pre="" }
         {
+            if ($0 ~ /\{/) { tag=""; draft=""; pre="" }
             if (match($0, /"tag_name"[ \t]*:[ \t]*"[^"]+"/)) {
                 s = substr($0, RSTART, RLENGTH)
                 sub(/^"tag_name"[ \t]*:[ \t]*"/, "", s)
@@ -255,15 +256,14 @@ pick_nightly_tag() {
             }
             if ($0 ~ /"draft"[ \t]*:[ \t]*true/) draft = "1"
             if ($0 ~ /"draft"[ \t]*:[ \t]*false/) draft = "0"
-            if ($0 ~ /"prerelease"[ \t]*:[ \t]*true/) {
-                if (tag != "" && draft != "1" && tag ~ /-nightly\.[0-9]+\.[0-9]+\.g[0-9a-f]+$/) {
+            if ($0 ~ /"prerelease"[ \t]*:[ \t]*true/) pre = "1"
+            if ($0 ~ /"prerelease"[ \t]*:[ \t]*false/) pre = "0"
+            if ($0 ~ /\}/) {
+                if (pre == "1" && draft != "1" && tag ~ /-nightly\.[0-9]+\.[0-9]+\.g[0-9a-f]+$/) {
                     print tag
                     exit
                 }
-            }
-            if ($0 ~ /"prerelease"[ \t]*:[ \t]*false/) {
-                tag = ""
-                draft = ""
+                tag=""; draft=""; pre=""
             }
         }
     '
