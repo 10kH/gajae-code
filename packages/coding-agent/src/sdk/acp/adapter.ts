@@ -642,15 +642,16 @@ export class AcpSdkAdapter {
 	#reportReconnectFailure(error: unknown): void {
 		if (error instanceof SessionRouterError) return;
 		if (providerErrorCode(error) === "provider_lease_conflict") return;
-		if (error instanceof AcpSdkAdapterError) return;
 		const typed =
 			error instanceof SdkClientError
 				? error
-				: new SdkClientError(
-						"reconnect_exhausted",
-						error instanceof Error ? error.message : "SDK reconnect failed.",
-						error,
-					);
+				: error instanceof AcpSdkAdapterError
+					? new SdkClientError(error.code, error.message, error)
+					: new SdkClientError(
+							"reconnect_exhausted",
+							error instanceof Error ? error.message : "SDK reconnect failed.",
+							error,
+						);
 		for (const handler of this.#reconnectFailedHandlers) handler(typed);
 	}
 
@@ -819,7 +820,9 @@ export class AcpSdkAdapter {
 		const response = this.#leaseErrorFrame(frame);
 		if (!response || response.ok !== false) return false;
 		const leaseId = typeof response.leaseId === "string" ? response.leaseId : "";
+		const connectionId = typeof response.connectionId === "string" ? response.connectionId : "";
 		if (!leaseId || !this.#ownsLeaseId(leaseId)) return false;
+		if (this.#connectionId !== undefined && connectionId !== this.#connectionId) return false;
 		const code = object(response.error)?.code;
 		return code === "lease_expired" || code === "not_lease_owner";
 	}
@@ -835,6 +838,7 @@ export class AcpSdkAdapter {
 		capability: string,
 		leaseId: string,
 	): boolean {
+		const currentLeaseId = this.#leases.get(capability);
 		return (
 			this.#reverseRequests.get(id) === request &&
 			request.state === "pending" &&
@@ -842,7 +846,8 @@ export class AcpSdkAdapter {
 			this.#connectionId === request.connectionId &&
 			request.connectionId === connectionId &&
 			request.capability === capability &&
-			request.leaseId === leaseId
+			request.leaseId === leaseId &&
+			currentLeaseId !== undefined
 		);
 	}
 
