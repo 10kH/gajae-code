@@ -743,6 +743,20 @@ export const SETTINGS_SCHEMA = {
 	// ────────────────────────────────────────────────────────────────────────
 	// Appearance
 	// ────────────────────────────────────────────────────────────────────────
+	"ui.language": {
+		type: "enum",
+		values: ["en", "ko"] as const,
+		default: "en",
+		ui: {
+			tab: "appearance",
+			label: "Language",
+			description: "Language for human-facing interactive UI text",
+			options: [
+				{ value: "en", label: "English" },
+				{ value: "ko", label: "Korean (한국어)" },
+			],
+		},
+	},
 
 	// Theme
 	"theme.dark": {

@@ -528,6 +528,21 @@
 			},
 			"additionalProperties": false
 		},
+		"ui": {
+			"type": "object",
+			"properties": {
+				"language": {
+					"type": "string",
+					"enum": [
+						"en",
+						"ko"
+					],
+					"description": "Language for human-facing interactive UI text",
+					"default": "en"
+				}
+			},
+			"additionalProperties": false
+		},
 		"theme": {
 			"type": "object",
 			"properties": {

@@ -27,6 +27,7 @@ import type { GjcRuntimeSnapshotProvider } from "../../extensibility/gjc-plugins
 import { getCurrentThemeName, getSelectListTheme, getSettingsListTheme, theme } from "../../modes/theme/theme";
 import { matchesAppInterrupt } from "../../modes/utils/keybinding-matchers";
 import { getTabBarTheme } from "../shared";
+import { resolveUiLanguage, type UiLanguage, uiString } from "../ui-language";
 import { DynamicBorder } from "./dynamic-border";
 import { DynamicThemeText } from "./dynamic-theme-text";
 import { GjcBundleSettingsComponent } from "./gjc-bundle-settings";
@@ -114,7 +115,9 @@ class SelectSubmenu extends Container {
 		// Preview (if provided)
 		if (getPreview) {
 			this.addChild(new Spacer(1));
-			this.addChild(new DynamicThemeText(() => theme.fg("muted", "Preview:")));
+			this.addChild(
+				new DynamicThemeText(() => theme.fg("muted", uiString(settings.get("ui.language"), "settings.preview"))),
+			);
 			this.#previewText = new Text(getPreview(), 0, 0);
 			this.addChild(this.#previewText);
 		}
@@ -159,7 +162,9 @@ class SelectSubmenu extends Container {
 
 		// Hint
 		this.addChild(new Spacer(1));
-		this.addChild(new DynamicThemeText(() => theme.fg("dim", "  Enter to select · Esc to go back")));
+		this.addChild(
+			new DynamicThemeText(() => theme.fg("dim", uiString(settings.get("ui.language"), "settings.selectHint"))),
+		);
 	}
 
 	#updatePreview(): void {
@@ -650,15 +655,15 @@ class StatusLineCustomEditor extends Container {
 	}
 }
 
-function getSettingsTabs(): Tab[] {
+function getSettingsTabs(language: UiLanguage): Tab[] {
 	return [
 		...SETTING_TABS.map(id => {
 			const meta = TAB_METADATA[id];
 			const icon = theme.symbol(meta.icon as Parameters<typeof theme.symbol>[0]);
-			return { id, label: `${icon} ${meta.label}` };
+			return { id, label: `${icon} ${uiString(language, `settings.tab.${id}`)}` };
 		}),
-		{ id: "plugins", label: `${theme.icon.package} Plugins` },
-		{ id: "gjc-bundles", label: `${theme.icon.package} GJC Bundles` },
+		{ id: "plugins", label: `${theme.icon.package} ${uiString(language, "settings.tab.plugins")}` },
+		{ id: "gjc-bundles", label: `${theme.icon.package} ${uiString(language, "settings.tab.gjcBundles")}` },
 	];
 }
 
@@ -785,10 +790,7 @@ export class SettingsSelectorComponent extends Container {
 		this.addChild(new DynamicBorder());
 
 		// Tab bar
-		this.#tabBar = new TabBar("Settings", getSettingsTabs(), getTabBarTheme());
-		this.#tabBar.onTabChange = () => {
-			this.#switchToTab(this.#tabBar.getActiveTab().id as SettingTab | "plugins" | "gjc-bundles");
-		};
+		this.#tabBar = this.#createTabBar();
 
 		this.addChild(this.#tabBar);
 
@@ -800,6 +802,31 @@ export class SettingsSelectorComponent extends Container {
 
 		// Add bottom border
 		this.addChild(new DynamicBorder());
+	}
+
+	#language(): UiLanguage {
+		return resolveUiLanguage(settings.get("ui.language"));
+	}
+
+	#createTabBar(initialIndex = 0): TabBar {
+		const language = this.#language();
+		const tabBar = new TabBar(
+			uiString(language, "settings.title"),
+			getSettingsTabs(language),
+			getTabBarTheme(),
+			initialIndex,
+			uiString(language, "settings.navigationHint"),
+		);
+		tabBar.onTabChange = () => {
+			this.#switchToTab(tabBar.getActiveTab().id as SettingTab | "plugins" | "gjc-bundles");
+		};
+		return tabBar;
+	}
+
+	#refreshTabBarLanguage(): void {
+		const previous = this.#tabBar;
+		this.#tabBar = this.#createTabBar(previous.getActiveIndex());
+		this.replaceChildren(this.children.map(child => (child === previous ? this.#tabBar : child)));
 	}
 
 	#switchToTab(tabId: SettingTab | "plugins" | "gjc-bundles"): void {
@@ -871,13 +898,17 @@ export class SettingsSelectorComponent extends Container {
 		}
 
 		const currentValue = this.#getCurrentValue(def);
+		const language = this.#language();
+		const label = def.path === "ui.language" ? uiString(language, "settings.language.label") : def.label;
+		const description =
+			def.path === "ui.language" ? uiString(language, "settings.language.description") : def.description;
 
 		switch (def.type) {
 			case "boolean":
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: currentValue ? "true" : "false",
 					values: ["true", "false"],
 				};
@@ -885,8 +916,8 @@ export class SettingsSelectorComponent extends Container {
 			case "enum":
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: currentValue as string,
 					values: [...def.values],
 				};
@@ -894,8 +925,8 @@ export class SettingsSelectorComponent extends Container {
 			case "submenu":
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: this.#getSubmenuCurrentValue(def.path, currentValue),
 					submenu: (cv, done) => this.#createSubmenu(def, cv, done),
 				};
@@ -905,8 +936,8 @@ export class SettingsSelectorComponent extends Container {
 				if (!createEditor) return null;
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: `${normalizeProviderOrder(settings.getGlobal("modelProviderOrder") ?? []).length} configured`,
 					submenu: (_currentValue, done) => {
 						const editor = createEditor(() => {
@@ -926,8 +957,8 @@ export class SettingsSelectorComponent extends Container {
 			case "text":
 				return {
 					id: def.path,
-					label: def.label,
-					description: def.description,
+					label,
+					description,
 					currentValue: (currentValue as string) ?? "",
 					submenu: (cv, done) => this.#createTextInput(def, cv, done),
 				};
@@ -972,6 +1003,12 @@ export class SettingsSelectorComponent extends Container {
 			options = this.context.availableThemes.map(t => ({ value: t, label: t }));
 		} else if (def.path === "modelProfile.default") {
 			options = this.context.availableModelProfiles.map(p => ({ value: p, label: p }));
+		} else if (def.path === "ui.language") {
+			const language = this.#language();
+			options = [
+				{ value: "en", label: uiString(language, "settings.language.english") },
+				{ value: "ko", label: uiString(language, "settings.language.korean") },
+			];
 		}
 		if (def.path === "statusLine.preset") {
 			options = options.filter(option => option.value !== "custom");
@@ -1113,6 +1150,7 @@ export class SettingsSelectorComponent extends Container {
 				}
 				if (!commitInteractiveSettings(this.callbacks, () => this.#setSettingValue(def.path, value))) return;
 				this.callbacks.onChange(def.path, value);
+				if (def.path === "ui.language") this.#refreshTabBarLanguage();
 				done(value);
 			},
 			() => {
@@ -1189,7 +1227,9 @@ export class SettingsSelectorComponent extends Container {
 		if (tabId === "appearance") {
 			this.#statusPreviewContainer = new Container();
 			this.#statusPreviewContainer.addChild(new Spacer(1));
-			this.#statusPreviewContainer.addChild(new Text(theme.fg("muted", "Preview:"), 0, 0));
+			this.#statusPreviewContainer.addChild(
+				new Text(theme.fg("muted", uiString(this.#language(), "settings.preview")), 0, 0),
+			);
 			this.#statusPreviewText = new Text(this.#getStatusPreviewString(), 0, 0);
 			this.#statusPreviewContainer.addChild(this.#statusPreviewText);
 			this.#statusPreviewContainer.addChild(new Spacer(1));
@@ -1275,6 +1315,7 @@ export class SettingsSelectorComponent extends Container {
 			const appearanceAnchorIds = [
 				"theme.dark",
 				"theme.light",
+				"ui.language",
 				"symbolPreset",
 				"colorBlindMode",
 				"statusLine.preset",
