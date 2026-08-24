@@ -501,6 +501,12 @@ async function peekUnstampedLiveBroker(agentDir: string): Promise<BrokerDiscover
 	}
 }
 
+async function readUnstampedBrokerIgnoringTtl(agentDir: string): Promise<BrokerDiscovery | null> {
+	const discovery = await readBrokerDiscovery(agentDir, Number.MAX_SAFE_INTEGER);
+	if (!discovery || !isLegacyUnstampedDiscovery(discovery)) return null;
+	return discovery;
+}
+
 async function brokerDiscoveryFileAbsent(agentDir: string): Promise<boolean> {
 	try {
 		await fs.access(brokerDiscoveryPath(agentDir));
@@ -558,7 +564,7 @@ async function retireStaleBroker(
 	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 	if (currentBeforeConnect) {
 		if (!sameBrokerIdentity(currentBeforeConnect, stale) || !sameBrokerAuthority(currentBeforeConnect, stale))
-			return false;
+			return unstamped ? unstampedProcessGone(stale) : false;
 		if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
 	} else if (unstamped) {
 		// TTL-expired publications are invisible to readBrokerDiscovery, but a live
@@ -566,7 +572,7 @@ async function retireStaleBroker(
 		// identity before authenticated shutdown so a concurrent replacement is not
 		// disrupted.
 		if (unstampedProcessGone(stale)) return true;
-		const peeked = await peekUnstampedLiveBroker(agentDir);
+		const peeked = await readUnstampedBrokerIgnoringTtl(agentDir);
 		if (
 			!peeked ||
 			!sameBrokerIdentity(peeked, stale) ||
@@ -616,7 +622,7 @@ async function retireStaleBroker(
 		}
 	}
 	if (unknownOperationAfterAuth) {
-		const peeked = await peekUnstampedLiveBroker(agentDir);
+		const peeked = await readUnstampedBrokerIgnoringTtl(agentDir);
 		if (
 			!peeked ||
 			!sameBrokerIdentity(peeked, stale) ||
