@@ -278,6 +278,7 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"gpt-oss-20b",
 		config => vllmModelManagerOptions(config),
 		catalog("vLLM", ["VLLM_API_KEY"], { allowUnauthenticated: true }),
+		{ allowUnauthenticated: true },
 	),
 	catalogDescriptor(
 		"moonshot",
