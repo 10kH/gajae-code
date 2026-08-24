@@ -4,7 +4,7 @@
 
 ### Added
 
-- Added an `sglang` provider mirroring vLLM's local OpenAI-compatible surface: its bundled provider descriptor discovers a running SGLang server at `http://127.0.0.1:30000/v1` implicitly, with the same hardened discovery request (`redirect: "error"`, a 500ms loopback probe timeout, and `max_model_len` accepted only as a safe positive integer). `SGLANG_API_KEY` / `SGLANG_BASE_URL` follow the same env conventions as `VLLM_API_KEY` / `VLLM_BASE_URL`, and `/login sglang` stores the `sglang-local` no-auth sentinel for credentialless local servers.
+- Added an `sglang` provider for local OpenAI-compatible servers: its bundled provider descriptor discovers a running SGLang server at `http://127.0.0.1:30000/v1` implicitly, with hardened discovery (`redirect: "error"`, a 500ms loopback probe timeout, and `max_model_len` accepted only as a safe positive integer). `SGLANG_API_KEY` / `SGLANG_BASE_URL` follow the trusted env conventions used by vLLM. Local no-auth discovery needs no stored credential; `/login sglang` stores only a supplied API key, and discovery-only SGLang catalogs are never bundled into release defaults.
 - Added Kilo's `stealth/ox-alpha` model with its reviewed 1,048,576-token context, 131,072-token output ceiling, text/image input, and low/high/max reasoning-effort contract.
 
 ### Fixed

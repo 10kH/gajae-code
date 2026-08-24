@@ -42,15 +42,9 @@ import { resolveLoopbackOpenAIBaseUrl } from "@gajae-code/ai/utils/discovery/ope
 // modules at startup. Must match the provider OAuth modules.
 const DEFAULT_LOCAL_TOKEN = "lm-studio-local";
 const VLLM_DEFAULT_LOCAL_TOKEN = "vllm-local";
-const SGLANG_DEFAULT_LOCAL_TOKEN = "sglang-local";
 
-const LOCAL_NO_AUTH_TOKENS_BY_PROVIDER: Record<string, string> = {
-	vllm: VLLM_DEFAULT_LOCAL_TOKEN,
-	sglang: SGLANG_DEFAULT_LOCAL_TOKEN,
-};
-
-function isLocalNoAuthToken(provider: string, apiKey: string | undefined): boolean {
-	return LOCAL_NO_AUTH_TOKENS_BY_PROVIDER[provider] === apiKey;
+function isVllmNoAuthToken(provider: string, apiKey: string | undefined): boolean {
+	return provider === "vllm" && apiKey === VLLM_DEFAULT_LOCAL_TOKEN;
 }
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
@@ -2538,9 +2532,9 @@ export class ModelRegistry {
 		}
 		const effectiveProviderConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveProviderConfig.baseUrl ?? "");
-		const allowsKeylessVllmDiscovery =
+		const allowsKeylessLocalDiscovery =
 			(provider !== "vllm" && provider !== "sglang") ||
-			(isAuthenticated(preflightApiKey) && !isLocalNoAuthToken(provider, preflightApiKey)) ||
+			(isAuthenticated(preflightApiKey) && !isVllmNoAuthToken(provider, preflightApiKey)) ||
 			effectiveProviderConfig.baseUrl === undefined ||
 			resolveLoopbackOpenAIBaseUrl(effectiveProviderConfig.baseUrl, "") === effectiveProviderConfig.baseUrl;
 		if (!isCurrentPreflight() || preflightStale) {
@@ -2565,7 +2559,7 @@ export class ModelRegistry {
 				fetched: false,
 			};
 		}
-		if (!allowsKeylessVllmDiscovery) {
+		if (!allowsKeylessLocalDiscovery) {
 			return {
 				provider: effectiveProviderConfig.provider,
 				current: true,
@@ -2808,7 +2802,7 @@ export class ModelRegistry {
 		for (let i = 0; i < standardProviderDescriptors.length; i++) {
 			const descriptor = standardProviderDescriptors[i];
 			const { apiKey, authGeneration } = standardProviderCredentials[i];
-			const requestApiKey = isLocalNoAuthToken(descriptor.providerId, apiKey) ? undefined : apiKey;
+			const requestApiKey = isVllmNoAuthToken(descriptor.providerId, apiKey) ? undefined : apiKey;
 			const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId);
 			const allowsKeylessDiscovery =
 				descriptor.allowUnauthenticated &&
@@ -3257,15 +3251,21 @@ export class ModelRegistry {
 		if (
 			apiKey &&
 			apiKey !== DEFAULT_LOCAL_TOKEN &&
-			!isLocalNoAuthToken(providerConfig.provider, apiKey) &&
+			!isVllmNoAuthToken(providerConfig.provider, apiKey) &&
 			apiKey !== kNoAuth
 		) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
+		const hardenedLocalDiscovery =
+			(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang") &&
+			resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
 		const response = await fetch(modelsUrl, {
 			headers: requestHeaders,
-			signal: AbortSignal.timeout(5_000),
+			...(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang"
+				? { redirect: "error" as const }
+				: {}),
+			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : 5_000),
 		});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {

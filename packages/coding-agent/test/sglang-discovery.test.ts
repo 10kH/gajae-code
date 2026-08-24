@@ -158,29 +158,8 @@ describe("ModelRegistry SGLang Discovery", () => {
 		expect(registry.find("sglang", "remote-sglang-model")?.baseUrl).toBe("https://trusted-sglang.example/v1");
 	});
 
-	test("treats the empty-login SGLang sentinel as keyless", async () => {
-		authStorage.setRuntimeApiKey("sglang", "sglang-local");
-
-		using _hook = hookFetch((input, init) => {
-			if (!String(input).includes(":30000/v1/models")) return new Response(null, { status: 404 });
-			const headers = init?.headers as Headers | Record<string, string> | undefined;
-			const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
-			expect(authHeader).toBeUndefined();
-			return new Response(JSON.stringify({ data: [{ id: "sentinel-keyless-sglang-model" }] }), {
-				status: 200,
-				headers: { "Content-Type": "application/json" },
-			});
-		});
-
-		const registry = new ModelRegistry(authStorage, modelsJsonPath);
-		await registry.refresh();
-
-		expect(registry.find("sglang", "sentinel-keyless-sglang-model")).toBeDefined();
-	});
-
-	test("does not let the empty-login sentinel authorize remote discovery", async () => {
+	test("does not probe a remote SGLANG_BASE_URL without a credential", async () => {
 		Bun.env.SGLANG_BASE_URL = "https://sglang.example.test/v1";
-		authStorage.setRuntimeApiKey("sglang", "sglang-local");
 		let requestedRemote = false;
 
 		using _hook = hookFetch(input => {
@@ -192,6 +171,40 @@ describe("ModelRegistry SGLang Discovery", () => {
 		await registry.refresh();
 
 		expect(requestedRemote).toBe(false);
+	});
+
+	test("hardens explicitly configured loopback SGLang discovery", async () => {
+		fs.writeFileSync(
+			modelsJsonPath,
+			JSON.stringify({
+				providers: {
+					sglang: {
+						baseUrl: "http://127.0.0.1:19001/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "sglang" },
+					},
+				},
+			}),
+		);
+
+		using _hook = hookFetch((input, init) => {
+			if (String(input) !== "http://127.0.0.1:19001/v1/models") return new Response(null, { status: 404 });
+			expect(init?.redirect).toBe("error");
+			const signal = init?.signal;
+			expect(signal).toBeDefined();
+			const response = Promise.withResolvers<Response>();
+			signal?.addEventListener("abort", () => response.reject(new DOMException("Aborted", "AbortError")), {
+				once: true,
+			});
+			return response.promise;
+		});
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+		const startedAt = performance.now();
+		await registry.refreshProvider("sglang", "online");
+
+		expect(performance.now() - startedAt).toBeLessThan(2_000);
 	});
 
 	test("accepts a loopback SGLANG_BASE_URL override for the implicit endpoint", async () => {

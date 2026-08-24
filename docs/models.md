@@ -368,7 +368,7 @@ translation protocol that GJC does not implement, so they are deliberately not b
 
 - `auth`: `apiKey` (default), `none`, or `oauth`; for `models.yml` custom models, `oauth` is accepted by schema but does not waive the `apiKey` requirement
 - `models.yml` is strict: unknown provider/model keys fail validation before provider dispatch, so stale keys such as `requestTransform` or `wireModelId` only work where this document lists them.
-- `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `omlx`, `vllm`, `sglang`, or `openai-models-list`
+- `discovery.type`: `ollama`, `llama.cpp`, `lm-studio`, `omlx`, `vllm`, `sglang`, `openai-models-list`, or `models-dev`; `models-dev` may select a different catalog entry with `modelsDevProvider`
 - `cacheRetention`: `none`, `short`, or `long`; request-time options win over model/modelOverride values, then provider values, then `GJC_CACHE_RETENTION`, then the runtime default. The runtime default is `short` for most providers, but the Anthropic provider defaults to `long` because the ~5m cache is fragile for long-running subagent workflows. Canonical Anthropic models use top-level automatic caching and emit `ttl: "1h"` when long retention is supported. Claude-family models on non-canonical Anthropic-compatible endpoints default to explicit block markers because compatible proxies commonly inject, rewrite, or reject top-level cache controls; they omit `ttl` unless `compat.supportsLongCacheRetention: true` opts the endpoint into 1-hour retention. For OpenAI Responses, this controls `prompt_cache_retention` only; it does not disable `prompt_cache_key` when a stable session id exists.
 
 ## OpenAI-compatible proxy configuration
@@ -679,7 +679,7 @@ If `sglang` is not explicitly configured, its bundled provider descriptor discov
 - base URL: trusted `SGLANG_BASE_URL` or `http://127.0.0.1:30000/v1` (a project `.env` cannot redirect authenticated traffic)
 - auth mode: keyless (`auth: none` behavior), `SGLANG_API_KEY` attaches when present
 
-Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `max_model_len` support. Credentialless implicit discovery is limited to loopback. For a remote SGLang server (for example, a LAN GPU box), set `SGLANG_BASE_URL` and `SGLANG_API_KEY` in the launching shell or a user-owned GJC environment file, or configure it explicitly under `providers` as shown below.
+Runtime discovery fetches models (`GET /v1/models`) and synthesizes model entries with local defaults and `max_model_len` support. Credentialless implicit discovery is limited to loopback and needs no `/login`; `/login sglang` stores only an actual API key. For a remote SGLang server (for example, a LAN GPU box), set `SGLANG_BASE_URL` and `SGLANG_API_KEY` in the launching shell or a user-owned GJC environment file, or configure it explicitly under `providers` as shown below. Standard proxy environment variables remain explicit transport configuration, so include local SGLang hosts in `NO_PROXY` when local traffic must connect directly.
 
 ### Explicit provider discovery
 
