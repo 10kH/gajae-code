@@ -672,3 +672,47 @@ describe("status line overflow cue geometry", () => {
 		expect(buildWide(maxRows).render(0)).toEqual([]);
 	});
 });
+
+describe("status line overflow cue never relies on defensive truncation", () => {
+	const strip = (s: string): string => Bun.stripANSI(s);
+
+	function build(maxRows: number, rightSegments: string[]): StatusLineComponent {
+		const component = new StatusLineComponent(createStatusLineSession("TruncSess"), { version: "9.9.9" });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae", "session", "model", "mode"],
+			rightSegments: rightSegments as never,
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
+	// Sweeping widths catches the case where a row is emptied to make marker room
+	// and the marker then lands on a different, unreserved row: the reserved cue
+	// would be replaced by whatever the final width truncation happened to emit.
+	it.each([1, 2, 3])("keeps every row within width across a width sweep (maxRows %i)", maxRows => {
+		for (let width = 0; width <= 60; width += 1) {
+			const rendered = build(maxRows, ["session_name", "time", "cost", "context_pct", "hostname"]).render(width);
+			for (const row of rendered) {
+				expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+			}
+			// A cue, when present, must carry an exact count or no count at all --
+			// never a partial number left behind by truncation.
+			const text = strip(rendered.join("\n"));
+			const partial = text.match(/…\+(\d*)$/);
+			if (partial) expect(partial[1]).not.toBe("");
+		}
+	});
+
+	it("never emits the cue on an interior row", () => {
+		for (let width = 1; width <= 60; width += 1) {
+			const rendered = build(3, ["session_name", "time", "cost", "context_pct", "hostname"]).render(width);
+			for (const row of rendered.slice(0, -1)) {
+				expect(strip(row)).not.toContain("…+");
+			}
+		}
+	});
+});

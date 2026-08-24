@@ -1078,22 +1078,23 @@ export class StatusLineComponent implements Component {
 				if (row.length === 0) packedRows.splice(index, 1);
 			}
 
-			// Reserve marker cells in the final surviving row, evicting from its tail
-			// until the cue fits. Never opens a new row: that would contradict maxRows.
+			// Reserve marker cells on whichever row ends up last, evicting from its
+			// tail until the cue fits. Never opens a new row: that would contradict
+			// maxRows. Emptying that row is fine -- the marker then occupies it alone.
+			// Popping it instead would move the marker onto a row that carries no
+			// reservation, and the defensive truncation in `render()` would recreate
+			// the lookalike-ellipsis failure one row further up.
 			let marker = "";
 			if (dropped > 0 && topFillWidth > 0) {
-				const lastRow = packedRows[packedRows.length - 1];
 				let reserved = Math.min(topFillWidth, visibleWidth(`…+${dropped}`));
-				while (
-					lastRow &&
-					lastRow.length > 0 &&
-					this.#groupWidth(lastRow, seg.leftCapWidth, seg.leftSepWidth) + reserved > topFillWidth
-				) {
+				while (packedRows.length > 0) {
+					const lastRow = packedRows[packedRows.length - 1];
+					if (this.#groupWidth(lastRow, seg.leftCapWidth, seg.leftSepWidth) + reserved <= topFillWidth) break;
+					if (lastRow.length === 0) break;
 					lastRow.pop();
 					dropped += 1;
 					reserved = Math.min(topFillWidth, visibleWidth(`…+${dropped}`));
 				}
-				if (lastRow && lastRow.length === 0) packedRows.pop();
 				marker = this.#renderOverflowMarker(dropped, reserved);
 			}
 
