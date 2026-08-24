@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { buildCoordinatorMcpConfig } from "../../src/coordinator-mcp/policy";
 import { coordinatorStatePaths, readSessionTransaction } from "../../src/coordinator-mcp/question-state";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
-import { writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SdkClient } from "../../src/sdk/client/client";
 import {
 	coordinatorFixtureRoot,
@@ -71,23 +71,30 @@ async function createServer(
 			)
 		).filter(session => !closedSessionIds.has(session.sessionId as string));
 	}
-	await writeBrokerDiscovery(agentDir, {
+	const discovery: BrokerDiscovery = {
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
 		ownerId: "test",
 		pid: process.pid,
+		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
 		host: "127.0.0.1",
 		port: 1,
 		url: "ws://sdk.example.test",
 		token: "test-token",
 		startedAt: Date.now(),
 		heartbeatAt: Date.now(),
-	});
+	};
+	await writeBrokerDiscovery(agentDir, discovery);
 	const server = createCoordinatorMcpServer({
 		env,
 		services: {
 			getAgentDir: () => agentDir,
+			// This suite exercises coordinator stop/reap semantics, not broker
+			// bootstrap or package-generation replacement. Pin both discovery seams
+			// to the fixture so ambient/local broker authority cannot change results.
+			ensureBroker: async () => discovery,
+			readSdkBrokerDiscovery: async () => discovery,
 			connectBroker: async () =>
 				({
 					global: async (
