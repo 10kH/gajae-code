@@ -7,6 +7,7 @@ import {
 	type Api,
 	type Context,
 	Effort,
+	getSupportedEfforts,
 	type Model,
 	type OpenAICompat,
 	readModelCache,
@@ -449,6 +450,51 @@ describe("ModelRegistry", () => {
 				expect(registry.getProviderBaseUrl("my-proxy")).toBe("https://custom-provider.example.com/v1");
 			} finally {
 				restore();
+			}
+		});
+	});
+
+	describe("custom reasoning capability metadata", () => {
+		test("persists explicit opt-in and keeps unsupported OpenAI-compatible models unavailable after reload", () => {
+			writeRawModelsJson({
+				"reasoning-proxy": {
+					baseUrl: "https://proxy.example.com/v1",
+					apiKey: "TEST_KEY",
+					api: "openai-completions",
+					models: [
+						{
+							id: "eligible-reasoner",
+							reasoning: true,
+							thinking: { mode: "effort", minLevel: "low", maxLevel: "high" },
+							compat: { supportsReasoningEffort: true },
+						},
+						{
+							id: "explicitly-disabled-reasoner",
+							reasoning: true,
+							thinking: { mode: "effort", minLevel: "low", maxLevel: "high" },
+							compat: { supportsReasoningEffort: false },
+						},
+						{
+							id: "implicit-reasoner",
+							reasoning: true,
+							thinking: { mode: "effort", minLevel: "low", maxLevel: "high" },
+						},
+					],
+				},
+			});
+
+			for (let load = 0; load < 2; load++) {
+				const registry = new ModelRegistry(authStorage, modelsJsonPath);
+				const eligible = registry.find("reasoning-proxy", "eligible-reasoner");
+				const disabled = registry.find("reasoning-proxy", "explicitly-disabled-reasoner");
+				const implicit = registry.find("reasoning-proxy", "implicit-reasoner");
+
+				expect(eligible?.thinking).toEqual({ mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High });
+				expect(eligible ? getSupportedEfforts(eligible) : []).toEqual([Effort.Low, Effort.Medium, Effort.High]);
+				expect(disabled?.thinking).toBeUndefined();
+				expect(disabled ? getSupportedEfforts(disabled) : []).toEqual([]);
+				expect(implicit?.thinking).toBeUndefined();
+				expect(implicit ? getSupportedEfforts(implicit) : []).toEqual([]);
 			}
 		});
 	});
@@ -4067,7 +4113,7 @@ describe("ModelRegistry", () => {
 			expect(registry.getProviderDiscoveryState("ollama")?.status).toBe("idle");
 		});
 
-		test("discovers ollama thinking capabilities from show metadata", async () => {
+		test("records Ollama model reasoning without inventing OpenAI effort controls", async () => {
 			writeRawModelsJson({
 				ollama: {
 					baseUrl: "http://127.0.0.1:11434/v1",
@@ -4110,14 +4156,179 @@ describe("ModelRegistry", () => {
 
 			const qwen = registry.find("ollama", "qwen3.5:397b-cloud");
 			expect(qwen?.reasoning).toBe(true);
-			expect(qwen?.thinking).toEqual({
-				mode: "effort",
-				minLevel: Effort.Minimal,
-				maxLevel: Effort.High,
-			});
+			expect(qwen?.thinking).toBeUndefined();
 
 			const llama = registry.find("ollama", "llama3.2:3b");
 			expect(llama?.reasoning).toBe(false);
+		});
+
+		test("preserves explicit reasoning effort opt-in through OpenAI models-list discovery", async () => {
+			writeRawModelsJson({
+				"reasoning-discovery": {
+					baseUrl: "https://proxy.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					compat: { supportsReasoningEffort: true },
+					discovery: { type: "openai-models-list" },
+				},
+			});
+
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://proxy.example.com/v1/models");
+				return new Response(JSON.stringify({ data: [{ id: "gpt-5.4" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+			const model = registry.find("reasoning-discovery", "gpt-5.4");
+
+			expect(getOpenAICompat(model)?.supportsReasoningEffort).toBe(true);
+			expect(model?.thinking).toBeDefined();
+			expect(model ? getSupportedEfforts(model) : []).toContain(Effort.High);
+		});
+
+		test("preserves explicit reasoning effort opt-in through models.dev discovery", async () => {
+			writeRawModelsJson({
+				"models-dev-reasoning": {
+					baseUrl: "https://proxy.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					compat: { supportsReasoningEffort: true },
+					discovery: { type: "models-dev", modelsDevProvider: "openai" },
+				},
+			});
+
+			using _hook = hookFetch(input => {
+				expect(String(input)).toBe("https://models.dev/api.json");
+				return new Response(
+					JSON.stringify({
+						openai: {
+							models: {
+								"gpt-5.4": {
+									id: "gpt-5.4",
+									name: "GPT-5.4",
+									tool_call: true,
+									reasoning: true,
+									modalities: { input: ["text"], output: ["text"] },
+									limit: { context: 128_000, output: 32_000 },
+								},
+							},
+						},
+					}),
+					{ status: 200, headers: { "Content-Type": "application/json" } },
+				);
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			await registry.refresh();
+			const model = registry.find("models-dev-reasoning", "gpt-5.4");
+
+			expect(getOpenAICompat(model)?.supportsReasoningEffort).toBe(true);
+			expect(model ? getSupportedEfforts(model) : []).toContain(Effort.High);
+		});
+
+		test("re-enriches reasoning metadata after a runtime provider capability override", () => {
+			writeRawModelsJson({
+				"runtime-reasoning": {
+					baseUrl: "https://proxy.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					models: [
+						{
+							id: "gpt-5.4",
+							reasoning: true,
+							thinking: {
+								mode: "effort",
+								minLevel: Effort.Low,
+								maxLevel: Effort.High,
+								levels: [Effort.Low, Effort.High],
+								defaultLevel: Effort.High,
+							},
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			expect(registry.find("runtime-reasoning", "gpt-5.4")?.thinking).toBeUndefined();
+
+			registry.registerProvider("runtime-reasoning", {
+				compat: { supportsReasoningEffort: true },
+			});
+
+			const model = registry.find("runtime-reasoning", "gpt-5.4");
+			expect(getOpenAICompat(model)?.supportsReasoningEffort).toBe(true);
+			expect(model?.thinking).toEqual({
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.High,
+				levels: [Effort.Low, Effort.High],
+				defaultLevel: Effort.High,
+			});
+			expect(model ? getSupportedEfforts(model) : []).toEqual([Effort.Low, Effort.High]);
+		});
+
+		test("preserves explicit thinking metadata when a model override enables capability", () => {
+			writeRawModelsJson({
+				"configured-reasoning": {
+					baseUrl: "https://proxy.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					models: [
+						{
+							id: "custom-reasoner",
+							reasoning: true,
+							thinking: {
+								mode: "effort",
+								minLevel: Effort.Low,
+								maxLevel: Effort.High,
+								levels: [Effort.Low, Effort.High],
+								defaultLevel: Effort.High,
+							},
+						},
+					],
+					modelOverrides: {
+						"custom-reasoner": { compat: { supportsReasoningEffort: true } },
+					},
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			const model = registry.find("configured-reasoning", "custom-reasoner");
+
+			expect(getOpenAICompat(model)?.supportsReasoningEffort).toBe(true);
+			expect(model ? getSupportedEfforts(model) : []).toEqual([Effort.Low, Effort.High]);
+			expect(model?.thinking?.defaultLevel).toBe(Effort.High);
+		});
+
+		test("keeps a model-level reasoning effort opt-out over runtime provider opt-in", () => {
+			writeRawModelsJson({
+				"runtime-disabled-reasoning": {
+					baseUrl: "https://proxy.example.com/v1",
+					api: "openai-completions",
+					auth: "none",
+					models: [
+						{
+							id: "disabled-reasoner",
+							reasoning: true,
+							thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+							compat: { supportsReasoningEffort: false },
+						},
+					],
+				},
+			});
+
+			const registry = new ModelRegistry(authStorage, modelsJsonPath);
+			registry.registerProvider("runtime-disabled-reasoning", {
+				compat: { supportsReasoningEffort: true },
+			});
+			const model = registry.find("runtime-disabled-reasoning", "disabled-reasoner");
+
+			expect(getOpenAICompat(model)?.supportsReasoningEffort).toBe(false);
+			expect(model ? getSupportedEfforts(model) : []).toEqual([]);
 		});
 
 		test("discovers ollama context window from show model_info", async () => {
@@ -5326,6 +5537,7 @@ describe("ModelRegistry", () => {
 								defaultLevel: "high",
 								levels: ["low", "high", "xhigh"],
 							},
+							compat: { supportsReasoningEffort: true },
 							input: ["text"],
 							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 							contextWindow: 128000,

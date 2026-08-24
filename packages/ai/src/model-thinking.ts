@@ -5,7 +5,7 @@ import {
 	isCodexProductTransport,
 } from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
-import { resolveOpenAICompat } from "./openai-completions-compat";
+import { isAuditedOpenAIReasoningTransport, resolveOpenAICompat } from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
@@ -176,7 +176,7 @@ export function enrichModelThinking<TApi extends Api>(model: ApiModel<TApi>): Ap
 			!model.reasoning && normalizedThinking === undefined
 				? model
 				: { ...model, reasoning: false, thinking: undefined };
-	} else if (!model.reasoning) {
+	} else if (!model.reasoning || !modelSupportsReasoningControl(model)) {
 		result =
 			normalizedThinking === undefined && model.thinking === undefined ? model : { ...model, thinking: undefined };
 	} else {
@@ -207,13 +207,53 @@ export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): A
 			? model
 			: { ...model, reasoning: false, thinking: undefined };
 	}
-	if (!model.reasoning) {
+	if (!model.reasoning || !modelSupportsReasoningControl(model)) {
 		const normalizedThinking = normalizeThinkingConfig(model.thinking);
 		return normalizedThinking === undefined && model.thinking === undefined
 			? model
 			: { ...model, thinking: undefined };
 	}
 	return { ...model, thinking: inferModelThinking(model) };
+}
+
+/**
+ * Returns whether the configured transport has an audited user-facing reasoning control.
+ *
+ * Custom OpenAI-compatible endpoints fail closed: declaring a model as reasoning-capable
+ * is not enough to prove that the proxy accepts OpenAI reasoning parameters. Unknown
+ * endpoints must opt in with `compat.supportsReasoningEffort: true`; providers using a
+ * non-OpenAI request shape must also declare `compat.thinkingFormat`. Bundled providers
+ * remain governed by their catalog and compatibility metadata.
+ */
+export function modelSupportsReasoningControl<TApi extends Api>(
+	model: ApiModel<TApi>,
+	resolvedBaseUrl?: string,
+): boolean {
+	if (!model.reasoning) return false;
+
+	if (model.api === "openai-completions") {
+		const completionsModel = model as ApiModel<"openai-completions">;
+		const explicitSupport = completionsModel.compat?.supportsReasoningEffort;
+		if (explicitSupport === false) return false;
+		if (explicitSupport !== true && !isAuditedOpenAIReasoningTransport(completionsModel, resolvedBaseUrl))
+			return false;
+		const compat = resolveOpenAICompat(completionsModel, resolvedBaseUrl);
+		return compat.thinkingFormat !== "openai" || compat.supportsReasoningEffort;
+	}
+
+	if (
+		model.api === "openai-responses" ||
+		model.api === "openai-codex-responses" ||
+		model.api === "azure-openai-responses"
+	) {
+		const explicitSupport =
+			model.compat !== undefined && "supportsReasoningEffort" in model.compat
+				? model.compat.supportsReasoningEffort
+				: undefined;
+		return explicitSupport ?? isAuditedOpenAIReasoningTransport(model);
+	}
+
+	return true;
 }
 
 /**
@@ -282,7 +322,7 @@ export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
  * @throws Error when a reasoning-capable model is missing thinking metadata
  */
 export function getSupportedEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
-	if (!model.reasoning) {
+	if (!modelSupportsReasoningControl(model)) {
 		return [];
 	}
 	if (!model.thinking) {
@@ -303,7 +343,7 @@ export function clampThinkingLevelForModel<TApi extends Api>(
 	if (!model) {
 		return requested;
 	}
-	if (!model.reasoning || requested === undefined) {
+	if (!modelSupportsReasoningControl(model) || requested === undefined) {
 		return undefined;
 	}
 
@@ -329,7 +369,7 @@ export function clampThinkingLevelForModel<TApi extends Api>(
 }
 
 export function requireSupportedEffort<TApi extends Api>(model: ApiModel<TApi>, effort: Effort): Effort {
-	if (!model.reasoning) {
+	if (!modelSupportsReasoningControl(model)) {
 		throw new Error(`Model ${model.provider}/${model.id} does not support thinking`);
 	}
 	const levels = getSupportedEfforts(model);

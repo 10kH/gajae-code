@@ -389,6 +389,12 @@ providers:
       - id: local-gpt
         name: Local GPT
         reasoning: true
+        thinking:
+          minLevel: low
+          maxLevel: high
+          mode: effort
+        compat:
+          supportsReasoningEffort: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 400000
@@ -396,6 +402,8 @@ providers:
 ```
 
 Use provider-level `headers` for proxy-required headers. Keep the provider `api` set to `openai-completions` when the proxy exposes Chat Completions-compatible `/v1/chat/completions` semantics. `auth: apiKey` sends the resolved token as bearer auth; use `auth: none` only for trusted local/no-auth endpoints.
+
+For an unknown custom endpoint, `reasoning: true` declares model capability but does not prove the proxy accepts a control parameter. A familiar provider id or model-family name is not transport evidence: configurable LiteLLM/vLLM/local endpoints still fail closed. Add `thinking` and `compat.supportsReasoningEffort: true` only when the endpoint documents OpenAI-style `reasoning_effort`; set `compat.thinkingFormat` as well when it uses a different documented request shape. Otherwise GJC keeps reasoning-level controls unavailable and omits the parameter.
 
 `auth` selects the transport scheme only; it never supplies a credential. A provider that declares `models:` must therefore also declare where its key comes from, and `models.yml` validation rejects the config before model discovery otherwise:
 
@@ -458,6 +466,8 @@ providers:
           mode: effort
           defaultLevel: high
           levels: [low, medium, high, xhigh]
+        compat:
+          supportsReasoningEffort: true
         input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 400000
@@ -892,7 +902,7 @@ Request shaping:
 
 Reasoning / thinking:
 
-- `supportsReasoningEffort` — accept `reasoning_effort`. Default: auto (off for Grok and zAI).
+- `supportsReasoningEffort` — accept OpenAI-style `reasoning_effort`. Default: auto for bundled/audited providers and recognized first-party endpoints; `false` for unknown custom endpoints. Set `true` only from provider documentation or probe evidence, and pair it with explicit `reasoning: true` plus `thinking` metadata.
 - `reasoningEffortMap` — partial map from internal effort levels (`minimal|low|medium|high|xhigh`) to provider-specific strings (e.g. DeepSeek maps `xhigh -> "max"`).
 - `thinkingFormat` — request shape for thinking: `"openai"` (`reasoning_effort`), `"openrouter"` (`reasoning: { effort }`), `"zai"` (`thinking: { type: "enabled" }`), `"qwen"` (top-level `enable_thinking`), or `"qwen-chat-template"` (`chat_template_kwargs.enable_thinking`). Default: `"openai"`.
 - `reasoningContentField` — assistant field carrying chain-of-thought: `"reasoning_content"`, `"reasoning"`, or `"reasoning_text"`. Default: auto.

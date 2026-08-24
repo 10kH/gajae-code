@@ -29,6 +29,7 @@ function createReasoningEffortModel(): Model<"openai-completions"> {
 		provider: "custom",
 		baseUrl: "https://proxy.example.com/v1",
 		reasoning: true,
+		compat: { supportsReasoningEffort: true },
 		thinking: {
 			mode: "effort",
 			minLevel: Effort.Minimal,

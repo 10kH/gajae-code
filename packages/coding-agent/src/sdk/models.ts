@@ -4,6 +4,7 @@ import {
 	type Effort,
 	getSupportedEfforts,
 	type Model,
+	modelSupportsReasoningControl,
 	THINKING_CONTROL_MODES,
 	THINKING_EFFORTS,
 	type ThinkingControlMode,
@@ -97,6 +98,7 @@ export interface Q10ModelProjectionInput {
 export function projectQ10Models(input: Q10ModelProjectionInput): Q10Model[] {
 	const profileActive = input.activeProfile !== undefined;
 	const concrete = input.models.map(model => {
+		const reasoning = modelSupportsReasoningControl(model);
 		const current =
 			!profileActive && input.currentModel?.provider === model.provider && input.currentModel.id === model.id;
 		const base: Q10Model = {
@@ -105,14 +107,14 @@ export function projectQ10Models(input: Q10ModelProjectionInput): Q10Model[] {
 			name: model.name,
 			contextWindow: model.contextWindow,
 			maxTokens: model.maxTokens,
-			reasoning: model.reasoning,
+			reasoning,
 			thinking: { validLevels: [ThinkingLevel.Off] },
 			current,
 			...(current && input.currentThinkingLevel !== undefined
-				? { currentThinkingLevel: input.currentThinkingLevel }
+				? { currentThinkingLevel: reasoning ? input.currentThinkingLevel : ThinkingLevel.Off }
 				: {}),
 		};
-		if (!model.reasoning) return base;
+		if (!reasoning) return base;
 
 		return {
 			...base,

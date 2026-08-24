@@ -24,6 +24,7 @@ import {
 	type ModelManagerOptions,
 	type ModelRefreshStrategy,
 	type ModelRequestTransform,
+	modelSupportsReasoningControl,
 	openaiCodexModelManagerOptions,
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
@@ -191,7 +192,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 };
 
 export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
-	if (model.reasoning !== true) return false;
+	if (!modelSupportsReasoningControl(model)) return false;
 	if (
 		model.provider === "openai" ||
 		model.provider === "openai-codex" ||
@@ -941,10 +942,20 @@ function mergeProviderCompat(
 		overrideCompat && "supportsResponsesSessionAffinity" in overrideCompat
 			? overrideCompat.supportsResponsesSessionAffinity
 			: undefined;
+	let protectedMerged = merged;
 	if (baseAffinity === false && overrideAffinity !== undefined) {
-		return { ...merged, supportsResponsesSessionAffinity: false };
+		protectedMerged = { ...protectedMerged, supportsResponsesSessionAffinity: false };
 	}
-	return merged;
+	const baseReasoningEffort =
+		baseCompat && "supportsReasoningEffort" in baseCompat ? baseCompat.supportsReasoningEffort : undefined;
+	const overrideReasoningEffort =
+		overrideCompat && "supportsReasoningEffort" in overrideCompat
+			? overrideCompat.supportsReasoningEffort
+			: undefined;
+	if (baseReasoningEffort === false && overrideReasoningEffort !== undefined) {
+		protectedMerged = { ...protectedMerged, supportsReasoningEffort: false };
+	}
+	return protectedMerged;
 }
 
 function mergeRequestTransform(
@@ -1606,11 +1617,7 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive refresh() cycles
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(
-			this.#applyRuntimeProviderOverrides(withModelOverrides),
-			undefined,
-			this.#codexContextWindowOverrides,
-		);
+		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
 		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
@@ -2458,11 +2465,7 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive online discovery completion
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(
-			this.#applyRuntimeProviderOverrides(withModelOverrides),
-			undefined,
-			this.#codexContextWindowOverrides,
-		);
+		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
 		this.#rebuildCanonicalIndex();
 	}
 
@@ -3216,6 +3219,7 @@ export class ModelRegistry {
 					contextWindow: toPositiveNumberOrUndefined(limit.context) ?? UNK_CONTEXT_WINDOW,
 					maxTokens: toPositiveNumberOrUndefined(limit.output) ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
+					compat: providerConfig.compat,
 				}),
 			);
 		}
@@ -3304,18 +3308,20 @@ export class ModelRegistry {
 							UNK_MAX_TOKENS,
 						) ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
-					compat: {
-						...referenceModel?.compat,
-						supportsStore: false,
-						supportsDeveloperRole: false,
-						supportsReasoningEffort: providerConfig.provider === "omlx",
-						...(providerConfig.provider === "omlx"
-							? {
-									thinkingFormat: "qwen-chat-template" as const,
-									reasoningContentField: "reasoning_content" as const,
-								}
-							: {}),
-					},
+					compat: mergeCompat(
+						{
+							supportsStore: false,
+							supportsDeveloperRole: false,
+							supportsReasoningEffort: providerConfig.provider === "omlx",
+							...(providerConfig.provider === "omlx"
+								? {
+										thinkingFormat: "qwen-chat-template" as const,
+										reasoningContentField: "reasoning_content" as const,
+									}
+								: {}),
+						},
+						mergeProviderCompat(providerConfig.compat, referenceModel?.compat),
+					),
 					...(providerConfig.provider === "omlx"
 						? {
 								reasoning: true,
@@ -3514,16 +3520,21 @@ export class ModelRegistry {
 		};
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
-		const withTransportOverride = this.#applyProviderTransportOverride(model, override);
+		const withTransportOverride = this.#applyProviderTransportOverride(
+			this.#restoreDeclaredThinking(model),
+			override,
+		);
 		const sanitizedBaseUrl = this.#stripUrlUserinfo(withTransportOverride.baseUrl);
 		const sanitizedTransport: Model<Api> =
 			sanitizedBaseUrl === withTransportOverride.baseUrl
 				? withTransportOverride
 				: { ...withTransportOverride, ...(sanitizedBaseUrl === undefined ? {} : { baseUrl: sanitizedBaseUrl }) };
 		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
-		return modelCompat
-			? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
-			: sanitizedTransport;
+		return enrichModelThinking(
+			modelCompat
+				? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
+				: sanitizedTransport,
+		);
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
 		if (this.#runtimeProviderOverrides.size === 0) return models;
@@ -3532,6 +3543,24 @@ export class ModelRegistry {
 			if (!override) return model;
 			return this.#applyRuntimeProviderOverride(model, override);
 		});
+	}
+	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
+		return applyFinalCodexGpt56ContextCap(
+			models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) })),
+			undefined,
+			this.#codexContextWindowOverrides,
+		);
+	}
+	#restoreDeclaredThinking(model: Model<Api>): Model<Api> {
+		const overrideThinking = this.#modelOverrides
+			.get(model.provider.toLowerCase())
+			?.get(model.id.toLowerCase())?.thinking;
+		if (overrideThinking !== undefined) return { ...model, thinking: overrideThinking as ThinkingConfig };
+		const overlay = [...this.#runtimeModelOverlays, ...this.#customModelOverlays].find(
+			candidate =>
+				candidate.provider === model.provider && candidate.id === model.id && candidate.thinking !== undefined,
+		);
+		return overlay?.thinking === undefined ? model : { ...model, thinking: overlay.thinking };
 	}
 	/**
 	 * Collects explicit user `contextWindow` overrides keyed by provider + model
@@ -4611,22 +4640,14 @@ export class ModelRegistry {
 			if (config.oauth?.modifyModels) {
 				const credential = this.authStorage.getOAuthCredential(providerName);
 				if (credential) {
-					this.#models = applyFinalCodexGpt56ContextCap(
-						config.oauth.modifyModels(withModelOverrides, credential),
-						undefined,
-						this.#codexContextWindowOverrides,
-					);
+					this.#models = this.#finalizeModels(config.oauth.modifyModels(withModelOverrides, credential));
 					this.#rebuildCanonicalIndex();
 					this.#rebuildProviderActivity();
 					return;
 				}
 			}
 
-			this.#models = applyFinalCodexGpt56ContextCap(
-				withModelOverrides,
-				undefined,
-				this.#codexContextWindowOverrides,
-			);
+			this.#models = this.#finalizeModels(withModelOverrides);
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 			return;

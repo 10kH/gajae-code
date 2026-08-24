@@ -15,7 +15,12 @@ import {
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 } from "../adapter-internals/provider-safety-stop";
-import { type Effort, getSupportedEfforts, isGroqCompoundReasoningUnsupported } from "../model-thinking";
+import {
+	type Effort,
+	getSupportedEfforts,
+	isGroqCompoundReasoningUnsupported,
+	modelSupportsReasoningControl,
+} from "../model-thinking";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
@@ -1340,7 +1345,10 @@ function buildParams(
 	const compat = getCompat(model, resolvedBaseUrl);
 	const messages = convertMessages(model, context, compat);
 	maybeAddOpenRouterAnthropicCacheControl(model, messages);
-	const supportsReasoningParams = model.provider !== "github-copilot" && !isGroqCompoundReasoningUnsupported(model);
+	const supportsReasoningParams =
+		model.provider !== "github-copilot" &&
+		!isGroqCompoundReasoningUnsupported(model) &&
+		modelSupportsReasoningControl(model, resolvedBaseUrl);
 
 	// Kimi (including via OpenRouter and Fireworks router-form IDs such as
 	// `accounts/fireworks/routers/kimi-*`) calculates TPM rate limits based on
@@ -1553,6 +1561,13 @@ function buildParams(
 		Object.assign(params, compat.extraBody);
 	}
 	applyOpenAIRequestTransformBody(params, model.requestTransform);
+	if (!supportsReasoningParams) {
+		delete params.reasoning;
+		delete params.reasoning_effort;
+		delete params.thinking;
+		delete params.enable_thinking;
+		delete params.chat_template_kwargs;
+	}
 
 	return { params, toolStrictMode };
 }
