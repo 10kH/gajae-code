@@ -43,7 +43,7 @@ import {
 import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { transportFailureFacts } from "../utils/fallback-transport";
+import { EMPTY_RESPONSE_PROVIDER_CODE, transportFailureFacts } from "../utils/fallback-transport";
 import { toFirepassWireModelId, toFireworksWireModelId } from "../utils/fireworks-model-id";
 import {
 	type CapturedHttpErrorResponse,
@@ -509,6 +509,19 @@ function getTrailingPartialDeepseekToken(text: string): string {
 
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
+const OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE = "Provider returned an empty response with zero token usage";
+
+function isEmptyOpenAICompletionsResponse(output: AssistantMessage): boolean {
+	return (
+		output.stopReason === "stop" &&
+		output.content.length === 0 &&
+		output.usage.input === 0 &&
+		output.usage.output === 0 &&
+		output.usage.cacheRead === 0 &&
+		output.usage.cacheWrite === 0 &&
+		output.usage.totalTokens === 0
+	);
+}
 
 export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	model: Model<"openai-completions">,
@@ -1060,9 +1073,21 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 
 			output.errorMessage = strictFallbackErrorMessage;
+			if (isEmptyOpenAICompletionsResponse(output)) {
+				output.stopReason = "error";
+				output.errorMessage = OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE;
+				output.transportFailure = {
+					kind: "transport",
+					providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+				};
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			if (output.stopReason === "error") {
+				stream.push({ type: "error", reason: "error", error: output });
+			} else {
+				stream.push({ type: "done", reason: output.stopReason, message: output });
+			}
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;

@@ -3,7 +3,8 @@ import * as z from "zod/v4";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
 import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
-import type { AssistantMessage, Context, Model, OpenAICompat, Tool } from "../src/types";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model, OpenAICompat, Tool } from "../src/types";
+import { EMPTY_RESPONSE_PROVIDER_CODE } from "../src/utils/fallback-transport";
 
 const originalFetch = global.fetch;
 
@@ -54,6 +55,19 @@ function createMockFetch(events: unknown[]): typeof fetch {
 	}
 
 	return Object.assign(mockFetch, { preconnect: originalFetch.preconnect });
+}
+
+function createSuccessfulCompletionResponse(): Response {
+	return createSseResponse([
+		{
+			id: "chatcmpl-success",
+			object: "chat.completion.chunk",
+			created: 0,
+			model: "gpt-4o-mini",
+			choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }],
+		},
+		"[DONE]",
+	]);
 }
 
 function baseContext(): Context {
@@ -416,6 +430,62 @@ describe("openai-completions compatibility", () => {
 		expect(result.usage.totalTokens).toBe(15);
 	});
 
+	it("types an empty zero-usage completion as a retryable transport failure", async () => {
+		const model = getBundledModel("kilo", "stealth/ox-alpha") as Model<"openai-completions">;
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-empty",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 0, completion_tokens: 0 },
+			},
+			"[DONE]",
+		]);
+
+		const stream = streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Provider returned an empty response with zero token usage");
+		expect(result.transportFailure).toEqual({
+			kind: "transport",
+			providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+		});
+		expect(events.filter(event => event.type === "error")).toHaveLength(1);
+		expect(events.filter(event => event.type === "done")).toHaveLength(0);
+	});
+
+	it("leaves low nonzero empty completion usage untyped for overflow recovery", async () => {
+		const model = getBundledModel("kilo", "stealth/ox-alpha") as Model<"openai-completions">;
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-low-usage-empty",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 1, completion_tokens: 1 },
+			},
+			"[DONE]",
+		]);
+
+		const stream = streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([]);
+		expect(result.usage).toMatchObject({ input: 1, output: 1 });
+		expect(result.transportFailure).toBeUndefined();
+		expect(events.filter(event => event.type === "error")).toHaveLength(0);
+		expect(events.filter(event => event.type === "done")).toHaveLength(1);
+	});
+
 	it("maps qwen chat template reasoning into chat_template_kwargs", async () => {
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
@@ -578,7 +648,7 @@ describe("openai-completions compatibility", () => {
 				if (attempt === 1) {
 					return new Response("retry", { status: 500, headers: { "retry-after-ms": "0" } });
 				}
-				return createSseResponse(["[DONE]"]);
+				return createSuccessfulCompletionResponse();
 			},
 			{ preconnect: originalFetch.preconnect },
 		);
@@ -607,7 +677,7 @@ describe("openai-completions compatibility", () => {
 		const fetch = Object.assign(
 			async (input: string | URL | Request): Promise<Response> => {
 				requests.push(input instanceof Request ? input.url : String(input));
-				return createSseResponse(["[DONE]"]);
+				return createSuccessfulCompletionResponse();
 			},
 			{ preconnect: originalFetch.preconnect },
 		);
@@ -630,7 +700,7 @@ describe("openai-completions compatibility", () => {
 		const fetch = Object.assign(
 			async (input: string | URL | Request): Promise<Response> => {
 				requests.push(input instanceof Request ? input.url : String(input));
-				return createSseResponse(["[DONE]"]);
+				return createSuccessfulCompletionResponse();
 			},
 			{ preconnect: originalFetch.preconnect },
 		);
