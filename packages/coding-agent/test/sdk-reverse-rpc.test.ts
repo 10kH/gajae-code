@@ -354,4 +354,24 @@ describe("directed reverse RPC leases", () => {
 		expect(() => runtime.registerProvider("intruder", "permission", [])).toThrow("provider_lease_conflict");
 		runtime.dispose();
 	});
+
+	test("same-owner permission refresh renews expiry without reinstalling definitions (#4909)", () => {
+		let now = 0;
+		const installed: string[] = [];
+		const runtime = new ReverseLeaseRuntime({
+			now: () => now,
+			leaseTtlMs: 1_000,
+			sendFrame: () => {},
+			installDefinitions: capability => installed.push(capability),
+		});
+		const first = runtime.registerProvider("acp", "permission", []);
+		expect(installed).toEqual(["permission"]);
+		now = 100;
+		const refreshed = runtime.registerProvider("acp", "permission", []);
+		expect(refreshed.leaseId).toBe(first.leaseId);
+		expect(refreshed.expiresAt).toBe(now + 1_000);
+		expect(installed).toEqual(["permission"]);
+		expect(runtime.getInstalledDefinitions("permission")).toEqual([]);
+		runtime.dispose();
+	});
 });

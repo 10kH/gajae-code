@@ -263,15 +263,7 @@ export class AcpSdkAdapter {
 		if (this.#ensuring) return await this.#ensuring;
 		const run = (async () => {
 			if (this.#closed) return;
-			try {
-				await this.#activateProviders(true);
-			} catch (error) {
-				// A live foreign owner must keep the lease. Rebind is best-effort recovery
-				// of *this* adapter's expired registration, not a steal, and must not fail
-				// an otherwise healthy ACP prompt (#4909).
-				if (providerErrorCode(error) === "provider_lease_conflict") return;
-				throw error;
-			}
+			await this.#activateProviders(true);
 		})();
 		this.#ensuring = run;
 		try {
@@ -558,6 +550,16 @@ export class AcpSdkAdapter {
 
 							throw error;
 						}
+					}
+					const missing = this.#providers
+						.filter(provider => !this.#leases.has(provider.capability))
+						.map(provider => provider.capability);
+					if (missing.length > 0) {
+						this.#providersActivated = this.#leases.size > 0;
+						throw new AcpSdkAdapterError(
+							"provider_lease_conflict",
+							`Live foreign provider holds: ${missing.join(", ")}.`,
+						);
 					}
 
 					if (this.#router && (attachment !== this.#attachment || attachment?.connectionId !== connectionId)) {

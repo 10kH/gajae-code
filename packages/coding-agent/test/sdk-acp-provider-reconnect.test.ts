@@ -395,7 +395,8 @@ test("ACP still answers an admitted reverse request after a later lease conflict
 			payload: { method: "request", payload: { toolCall: { toolName: "bash" } } },
 		});
 		await permissionStarted;
-		await adapter.ensureProviders();
+		await expect(adapter.ensureProviders()).rejects.toMatchObject({ code: "provider_lease_conflict" });
+
 		expect(adapter.leaseIds.get("permission")).toBeUndefined();
 		resolvePermissionGate();
 		await waitFor(
@@ -438,7 +439,8 @@ test("ACP provider rebind leaves a live foreign permission lease in place (#4909
 		adapter.onReconnectFailed(error => reconnectFailures.push(error));
 		await adapter.start();
 		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
-		await expect(adapter.ensureProviders()).resolves.toBeUndefined();
+		await expect(adapter.ensureProviders()).rejects.toMatchObject({ code: "provider_lease_conflict" });
+
 		expect(registrations.length).toBeGreaterThanOrEqual(2);
 		expect(adapter.leaseIds.get("permission")).toBeUndefined();
 
@@ -515,7 +517,7 @@ test("ACP provider rebind keeps successfully registered capabilities after a lat
 		],
 	});
 	try {
-		await adapter.start();
+		await expect(adapter.start()).rejects.toMatchObject({ code: "provider_lease_conflict" });
 		expect(adapter.leaseIds.get("fs")).toBe("lease-fs");
 		expect(adapter.leaseIds.get("permission")).toBeUndefined();
 		adapter.acceptFrame({
