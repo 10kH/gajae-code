@@ -563,8 +563,7 @@ install_binary() {
     DEST_PATH="${INSTALL_DIR}/gjc"
     exclusive_tmp "gjc.download"
     DOWNLOAD_TMP="$LAST_EXCLUSIVE_TMP"
-    exclusive_tmp "gjc.bak"
-    BACKUP_PATH="$LAST_EXCLUSIVE_TMP"
+    BACKUP_PATH=""
 
     BINARY_URL="${GITHUB_RELEASES}/${LATEST}/${BINARY}"
     echo "Downloading ${BINARY}..."
@@ -592,7 +591,10 @@ install_binary() {
     fi
 
     if [ -e "$DEST_PATH" ]; then
-        cp -f "$DEST_PATH" "$BACKUP_PATH"
+        exclusive_tmp "gjc.bak"
+        BACKUP_PATH="$LAST_EXCLUSIVE_TMP"
+        rm -f "$BACKUP_PATH"
+        cp -p "$DEST_PATH" "$BACKUP_PATH"
     fi
 
     if ! mv -f "$DOWNLOAD_TMP" "$DEST_PATH"; then
