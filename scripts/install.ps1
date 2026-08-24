@@ -79,7 +79,8 @@ function Test-SafeReleaseTag {
 }
 
 function Get-WindowsBinaryName {
-    $arch = $env:PROCESSOR_ARCHITECTURE
+    $arch = $env:PROCESSOR_ARCHITEW6432
+    if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
     if ($arch -eq "ARM64") {
         throw "Unsupported architecture: ARM64. Prebuilt Windows binaries are published for x64 only."
     }
