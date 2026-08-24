@@ -350,6 +350,79 @@ describe("Broker spawn flow driver", () => {
 		}
 	});
 
+	it("refuses to seed a substrate that cannot be re-proven after restart", async () => {
+		const agentDir = await temp();
+		const brokerKey = await getBrokerIdentityKey(agentDir);
+		const store = new SpawnAuthorityStore(agentDir, brokerKey);
+		await store.open();
+		const mac = "d".repeat(64);
+		const owner = await store.claimOrJoin("recover-mismatch", mac);
+		if (owner.kind !== "owner") throw new Error("expected owner");
+		await store.persistTransition("recover-mismatch", {
+			claimId: owner.claim.claimId,
+			from: "prepared",
+			to: "substrate_starting",
+			childId: "child-mismatch",
+		});
+		const at = Date.now();
+		await store.persistTransition("recover-mismatch", {
+			claimId: owner.claim.claimId,
+			from: "substrate_starting",
+			to: "authority_active",
+			childId: "child-mismatch",
+			authority: {
+				version: 1,
+				authorityId: "authority-mismatch",
+				claimId: owner.claim.claimId,
+				childId: "child-mismatch",
+				ownerSessionId: "master-flow",
+				lifecycleIdentity: "recover-mismatch",
+				substrateKind: "headless",
+				providerIdentity: "flow-provider",
+				pid: 994,
+				processIncarnation: "inc-994",
+				closeState: "active",
+				createdAt: at,
+				updatedAt: at,
+			},
+		});
+		await store.releaseOwner("recover-mismatch");
+		let verifyCalls = 0;
+		let dispatches = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				verify: async () => {
+					verifyCalls += 1;
+					return "mismatch" as const;
+				},
+				close: async () => ({ ok: true }),
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async () => ({ ok: false as const }),
+				dispatch: async () => {
+					dispatches += 1;
+					return { kind: "accepted" as const, commandId: "c", turnId: "t", acceptedAt: 1 };
+				},
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		await broker.start();
+		try {
+			// Startup recovery must re-prove the durable substrate; a mismatch retains
+			// uncertainty instead of letting a recovery owner prompt a foreign child.
+			expect(verifyCalls).toBeGreaterThan(0);
+			const recovered = new SpawnAuthorityStore(agentDir, brokerKey);
+			await recovered.open();
+			expect(recovered.claim("recover-mismatch")?.state).toBe("uncertain");
+			expect(dispatches).toBe(0);
+		} finally {
+			await broker.stop();
+		}
+	});
+
 	it("recovers restart windows without a replacement child or second prompt", async () => {
 		const agentDir = await temp();
 		const brokerKey = await getBrokerIdentityKey(agentDir);

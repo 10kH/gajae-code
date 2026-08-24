@@ -1145,7 +1145,7 @@ export class Broker {
 			// Claim fsync precedes this audit mirror. Substrate work may start
 			// only after the mirror succeeds; a startup reconciler rebuilds it claim-first.
 			await this.ledger.begin(lifecycleIdentity, bindingMac);
-			return (response = await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight));
+			return (response = await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery));
 		} catch {
 			return (response = error("spawn_failed", "session.spawn admission could not be durably established"));
 		} finally {
@@ -1201,6 +1201,7 @@ export class Broker {
 		claim: SpawnClaimV2,
 		admission: SpawnAdmissionInput,
 		inFlight: SpawnInFlight,
+		recovered = false,
 	): Promise<BrokerResponse> {
 		const store = this.#spawnAuthority;
 		if (!store) return error("unavailable", "spawn authority is unavailable");
@@ -1303,6 +1304,26 @@ export class Broker {
 			}
 			if (current.state !== "seed_prepared" || current.preSendLease?.status !== "owned" || !current.seed || !current.childId)
 				return error("terminal_uncertain", "session.spawn cannot proceed from its durable state");
+			// A recovery owner resumes a claim whose substrate was launched by an
+			// earlier process. Re-prove that exact substrate before handing off the
+			// seed: a replaced or vanished substrate must never receive the prompt.
+			if (recovered) {
+				const recoveredAuthority = store.authority(lifecycleIdentity);
+				if (!recoveredAuthority) return error("terminal_uncertain", "session.spawn authority is unavailable after restart");
+				const verdict = await provider.verify(spawnProofFromAuthority(recoveredAuthority));
+				if (verdict !== "verified") {
+					current = (
+						await store.persistTransition(lifecycleIdentity, {
+							claimId: current.claimId,
+							from: current.state,
+							to: "uncertain",
+							seed: { ...current.seed, phase: "uncertain" },
+						})
+					).claim;
+					inFlight.phase = current.state;
+					return error("terminal_uncertain", "session.spawn substrate could not be re-proven after restart");
+				}
+			}
 			const childId = current.childId;
 			const preparedSeed = current.seed;
 			current = (
@@ -1473,6 +1494,21 @@ export class Broker {
 					continue;
 				}
 				if (claim.state === "authority_active") {
+					// Only exact evidence that the original substrate is still active may
+					// advance this claim; otherwise it retains uncertainty rather than
+					// letting a later recovery owner prompt a replaced substrate.
+					const authorityRecord = store.authority(claim.lifecycleIdentity);
+					const verdict = authorityRecord
+						? await this.#spawnSubstrateProvider().verify(spawnProofFromAuthority(authorityRecord))
+						: "gone";
+					if (verdict !== "verified") {
+						await store.persistTransition(claim.lifecycleIdentity, {
+							claimId: claim.claimId,
+							from: "authority_active",
+							to: "uncertain",
+						});
+						continue;
+					}
 					await store.persistTransition(claim.lifecycleIdentity, {
 						claimId: claim.claimId,
 						from: "authority_active",
