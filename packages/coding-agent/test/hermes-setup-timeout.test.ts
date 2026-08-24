@@ -172,6 +172,15 @@ describe("gjc setup hermes --timeout / --connect-timeout", () => {
 		const tuned = await installedServerBlock(configPath);
 		await writeConfig(configPath, { ...tuned, timeout: 1800 });
 		expect((await runHermesSetup({ check: true, root: [dir], target: configPath })).check?.ok).toBe(true);
+
+		// Render-only previews always show flag-or-default values even when the
+		// installed block preserves tuned values (no target exists to preserve
+		// from), so the divergence between preview and install is intentional.
+		const preview = renderedServerBlock(
+			await runHermesSetup({ json: true, root: [dir], profile: "test", repo: "repo" }),
+		);
+		expect(preview.timeout).toBe(180);
+		expect((await installedServerBlock(configPath)).timeout).toBe(1800);
 	});
 
 	it("upgrades a legacy signed block in place, preserving its numeric timeouts", async () => {
@@ -183,6 +192,11 @@ describe("gjc setup hermes --timeout / --connect-timeout", () => {
 		if (legacy.env) legacy.env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE = legacySignature(legacy);
 		await writeConfig(configPath, legacy);
 
+		// Before the upgrade, --check reports the legacy signature as stale.
+		const stale = await runHermesSetup({ check: true, root: [dir], target: configPath });
+		expect(stale.check?.ok).toBe(false);
+		expect(stale.check?.mismatches).toContainEqual({ path: configPath, kind: "signature" });
+
 		// A block written before #4878 must not be refused as unmanaged.
 		await runHermesSetup({ install: true, root: [dir], target: configPath });
 		expect(await installedServerBlock(configPath)).toMatchObject({ timeout: 900, connect_timeout: 45 });
@@ -193,6 +207,56 @@ describe("gjc setup hermes --timeout / --connect-timeout", () => {
 			legacy.env?.GJC_COORDINATOR_MCP_SETUP_SIGNATURE,
 		);
 		expect((await runHermesSetup({ check: true, root: [dir], target: configPath })).check?.ok).toBe(true);
+	});
+	it("refuses a hand-tuned legacy block with the stale-signature error and preserves it via --force", async () => {
+		const dir = await tempDir();
+		const configPath = path.join(dir, "config.yaml");
+
+		// The reporter's exact scenario: a pre-#4878 install whose timeout was
+		// hand-set to 900 after the block was signed over 180.
+		const rendered = renderedServerBlock(await render({ root: [dir], timeout: "180" }));
+		const legacy = { ...rendered };
+		if (legacy.env) legacy.env.GJC_COORDINATOR_MCP_SETUP_SIGNATURE = legacySignature(legacy);
+		await writeConfig(configPath, { ...legacy, timeout: 900 });
+
+		await expect(runHermesSetup({ install: true, root: [dir], target: configPath })).rejects.toThrow(
+			"has GJC managed markers but its setup signature does not match",
+		);
+		const checked = await runHermesSetup({ check: true, root: [dir], target: configPath });
+		expect(checked.check?.ok).toBe(false);
+		expect(checked.check?.mismatches).toContainEqual({ path: configPath, kind: "invalid" });
+
+		await runHermesSetup({ install: true, force: true, root: [dir], target: configPath });
+		expect(await installedServerBlock(configPath)).toMatchObject({ timeout: 900, connect_timeout: 60 });
+		expect((await runHermesSetup({ check: true, root: [dir], target: configPath })).check?.ok).toBe(true);
+	});
+
+	it("requires one --force for a stale operator template while preserving timeouts", async () => {
+		const dir = await tempDir();
+		const profileDir = path.join(dir, "profile");
+		const configPath = path.join(profileDir, "config.yaml");
+		const operatorPath = path.join(profileDir, "skills", "autonomous-ai-agents", "gajae-code", "SKILL.md");
+
+		await runHermesSetup({ install: true, root: [dir], profileDir, timeout: "900" });
+
+		// Simulate a pre-template-change operator file: no longer equal to the
+		// current render, so its digest gate refuses a plain install.
+		const staleOperator = (await Bun.file(operatorPath).text())
+			.replaceAll("## Timeouts", "## Timeouts (older render)")
+			.replace(
+				/<!-- GJC Hermes operator instructions digest v1: [a-f0-9]{64} -->/,
+				"<!-- GJC Hermes operator instructions digest v1: 0000000000000000000000000000000000000000000000000000000000000000 -->",
+			);
+		await Bun.write(operatorPath, staleOperator);
+
+		await expect(runHermesSetup({ install: true, root: [dir], profileDir })).rejects.toThrow(
+			"Operator instruction target already exists and is not managed by GJC",
+		);
+
+		await runHermesSetup({ install: true, force: true, root: [dir], profileDir });
+		expect((await installedServerBlock(configPath)).timeout).toBe(900);
+		expect(await Bun.file(operatorPath).text()).not.toBe(staleOperator);
+		expect((await runHermesSetup({ check: true, root: [dir], profileDir })).check?.ok).toBe(true);
 	});
 
 	it("still refuses unmarked blocks and does not preserve foreign timeouts with --force", async () => {

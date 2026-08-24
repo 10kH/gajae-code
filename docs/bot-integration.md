@@ -48,9 +48,8 @@ gjc setup hermes \
   --profile-dir /path/to/hermes/profile \
   --install
 ```
-```
 
-The generated `mcp_servers` block carries `timeout` / `connect_timeout` (default 180/60 whole seconds), the host MCP client's per-call budgets — not a GJC turn deadline, and not the coordinator `await_turn` / `watch_events` per-call `timeout_ms` caps (30000 ms each). Tune them with `gjc setup hermes --timeout <seconds>` / `--connect-timeout <seconds>` (1–3600); `--install` preserves installed numeric values when a flag is omitted, and an explicit flag overrides them.
+The generated `mcp_servers` block carries `timeout` / `connect_timeout` (default 180/60 whole seconds), the host MCP client's per-call budgets — not a GJC turn deadline, and not the coordinator per-call caps (`watch_events` `timeout_ms` up to 30000 ms; `await_turn` bounded at 30 minutes). Tune them with `gjc setup hermes --timeout <seconds>` / `--connect-timeout <seconds>` (1–3600); `--install` preserves installed numeric values when a flag is omitted, and an explicit flag overrides them.
 
 Run provider-independent contract smokes before trying a live model:
 

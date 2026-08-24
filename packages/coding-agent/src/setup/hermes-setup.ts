@@ -554,6 +554,16 @@ function mergeHermesConfig(
 	const currentServers = isRecord(existing.mcp_servers) ? existing.mcp_servers : {};
 	const existingBlock = currentServers[spec.serverKey];
 	if (existingBlock !== undefined && !serverBlockIsManaged(existingBlock) && !force) {
+		if (blockHasManagedMarkers(existingBlock)) {
+			// Marked but signature-stale: hand-edited plumbing, or a pre-#4878
+			// block whose timeout hand-tune broke the old all-fields digest.
+			// Distinguish it from a foreign block so the operator knows --force
+			// is the adoption path and that the tuned timeouts survive it.
+			throw new HermesSetupError(
+				`Hermes MCP server '${spec.serverKey}' has GJC managed markers but its setup signature does not match (it was hand-edited or written by an older GJC). Re-run with --force to adopt the managed block; installed numeric timeout/connect_timeout values are preserved unless --timeout/--connect-timeout is passed.`,
+				3,
+			);
+		}
 		throw new HermesSetupError(`Hermes MCP server '${spec.serverKey}' already exists and is not managed by GJC.`, 3);
 	}
 	// An operator-set GJC_CODING_AGENT_DIR in a managed block survives re-install
@@ -576,9 +586,6 @@ function mergeHermesConfig(
 				...currentServers,
 				[spec.serverKey]: renderHermesServerBlock(effectiveSpec, timeouts),
 			},
-		},
-		warnings: timeouts.warnings,
-	};
 		},
 		warnings: timeouts.warnings,
 	};

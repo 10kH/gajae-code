@@ -87,6 +87,10 @@ Both flags take whole seconds in the range 1–3600; anything else is rejected w
 
 `--install` preserves existing numeric `timeout` / `connect_timeout` values from a block carrying the GJC managed markers when the corresponding flag is omitted, per field: a hand-set `timeout: 900` survives the next install instead of being reset to 180. An explicit flag overrides the installed value. Render-only previews always show flag-or-default values, since there is no installed target to preserve from. The managed setup signature covers the GJC-owned plumbing (command, args, env) and deliberately does not pin these two knobs, so hand-tuning them keeps the block managed and `gjc setup hermes --check` does not report timeout drift.
 
+Upgrading from a pre-#4878 install (whose signature included the timeout fields): a block whose stored content still matches its stored signature is still recognized as managed and is re-signed on the next `--install` (`--check` reports its signature as stale until then). A pre-#4878 block whose timeout was hand-tuned no longer matches either digest, so plain `--install` refuses with the stale-signature error pointing at `--force`; `--force` adopts the managed block and preserves the tuned values. `--force` never discards installed timeout values — pass `--timeout 180 --connect-timeout 60` to reset them explicitly.
+
+`--profile-dir` installs also write the operator instructions file, whose digest pins its exact content. A release that changes that template (as this one does) therefore requires one `--force` for profiles holding an older render; the installed numeric timeout values are preserved across that upgrade too.
+
 Run a non-mutating setup smoke check with:
 
 ```bash
