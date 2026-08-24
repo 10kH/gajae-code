@@ -1442,6 +1442,7 @@ export class ModelRegistry {
 	#catalogPublicationTail: Promise<void> = Promise.resolve();
 	#pendingCatalogPublications = 0;
 	#activeCatalogRefreshes = 0;
+	#catalogRefreshGeneration = 0;
 	#catalogRefreshIdle: Promise<void> = Promise.resolve();
 	#resolveCatalogRefreshIdle: (() => void) | undefined;
 	#disposed = false;
@@ -1557,13 +1558,14 @@ export class ModelRegistry {
 	 * Reload models from disk (embedded + accepted registry + custom from models.yml).
 	 */
 	async refresh(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
+		const refreshGeneration = ++this.#catalogRefreshGeneration;
 		await this.#runCatalogRefresh(async () => {
 			this.#suspendRebuild();
 			try {
 				this.#reloadStaticModels();
 				this.#suppressedSelectors.clear();
 				await this.#refreshRuntimeDiscoveries(strategy);
-				this.#modelBindingsApplier.apply();
+				if (refreshGeneration === this.#catalogRefreshGeneration) this.#modelBindingsApplier.apply();
 			} finally {
 				this.#resumeRebuild();
 			}
@@ -1589,6 +1591,7 @@ export class ModelRegistry {
 	}
 
 	async refreshProvider(providerId: string, strategy: ModelRefreshStrategy = "online"): Promise<void> {
+		const refreshGeneration = ++this.#catalogRefreshGeneration;
 		await this.#runCatalogRefresh(async () => {
 			this.#suspendRebuild();
 			try {
@@ -1599,7 +1602,7 @@ export class ModelRegistry {
 					}
 				}
 				await this.#refreshRuntimeDiscoveries(strategy, new Set([providerId]));
-				this.#modelBindingsApplier.apply();
+				if (refreshGeneration === this.#catalogRefreshGeneration) this.#modelBindingsApplier.apply();
 			} finally {
 				this.#resumeRebuild();
 			}
