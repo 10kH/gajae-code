@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod/v4";
+import { Effort } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
 import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
@@ -70,6 +71,20 @@ function createSuccessfulCompletionResponse(): Response {
 	]);
 }
 
+function createEmptyResponseModel(
+	cost: Model<"openai-completions">["cost"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+): Model<"openai-completions"> {
+	return {
+		...getBundledModel("openai", "gpt-4o-mini"),
+		api: "openai-completions",
+		provider: "kilo",
+		id: "stealth/ox-alpha",
+		name: "Ox Alpha",
+		baseUrl: "https://api.kilo.ai/api/gateway",
+		cost,
+	};
+}
+
 function baseContext(): Context {
 	return {
 		messages: [
@@ -83,6 +98,38 @@ function baseContext(): Context {
 }
 
 describe("openai-completions compatibility", () => {
+	it("never sends reasoning controls to Groq compound systems after late metadata overrides", async () => {
+		for (const id of ["groq/compound", "groq/compound-mini"] as const) {
+			const model: Model<"openai-completions"> = {
+				id,
+				name: id,
+				api: "openai-completions",
+				provider: "groq",
+				baseUrl: "https://api.groq.com/openai/v1",
+				reasoning: true,
+				thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 131_072,
+				maxTokens: 8_192,
+				compat: { supportsReasoningEffort: true },
+			};
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			streamOpenAICompletions(model, baseContext(), {
+				apiKey: "test-key",
+				reasoning: "high",
+				signal: createAbortedSignal(),
+				onPayload: payload => resolve(payload as Record<string, unknown>),
+			});
+
+			const payload = await promise;
+			expect(payload.reasoning_effort).toBeUndefined();
+			expect(payload.reasoning).toBeUndefined();
+			expect(payload.enable_thinking).toBeUndefined();
+			expect(payload.chat_template_kwargs).toBeUndefined();
+		}
+	});
+
 	it("serializes direct xAI Grok 4.5 and 4.6 reasoning efforts without changing other Grok routes", async () => {
 		async function captureXaiPayload(modelId: "grok-4.5" | "grok-4.6", reasoning: "low" | "xhigh") {
 			const model: Model<"openai-completions"> = {
@@ -431,7 +478,7 @@ describe("openai-completions compatibility", () => {
 	});
 
 	it("types an empty zero-usage completion as a retryable transport failure", async () => {
-		const model = getBundledModel("kilo", "stealth/ox-alpha") as Model<"openai-completions">;
+		const model = createEmptyResponseModel();
 		global.fetch = createMockFetch([
 			{
 				id: "chatcmpl-empty",
@@ -460,7 +507,7 @@ describe("openai-completions compatibility", () => {
 	});
 
 	it("leaves low nonzero empty completion usage untyped for overflow recovery", async () => {
-		const model = getBundledModel("kilo", "stealth/ox-alpha") as Model<"openai-completions">;
+		const model = createEmptyResponseModel({ input: 2, output: 4, cacheRead: 1, cacheWrite: 3 });
 		global.fetch = createMockFetch([
 			{
 				id: "chatcmpl-low-usage-empty",
@@ -481,9 +528,87 @@ describe("openai-completions compatibility", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([]);
 		expect(result.usage).toMatchObject({ input: 1, output: 1 });
+		expect(result.usage.cost).toEqual({
+			input: 0.000002,
+			output: 0.000004,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0.000006,
+		});
 		expect(result.transportFailure).toBeUndefined();
 		expect(events.filter(event => event.type === "error")).toHaveLength(0);
 		expect(events.filter(event => event.type === "done")).toHaveLength(1);
+	});
+
+	it("leaves empty completions without explicit usage on overflow recovery", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-usage-absent",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([]);
+		expect(result.usage.totalTokens).toBe(0);
+		expect(result.transportFailure).toBeUndefined();
+	});
+
+	it("preserves total-token-only evidence on empty completions", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-total-only",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { total_tokens: 2 },
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage.totalTokens).toBe(2);
+		expect(result.transportFailure).toBeUndefined();
+	});
+
+	it("does not let duplicate zero usage erase earlier nonzero evidence", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-nonzero-first",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [],
+				usage: { prompt_tokens: 1, completion_tokens: 1 },
+			},
+			{
+				id: "chatcmpl-zero-last",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 0, completion_tokens: 0 },
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toMatchObject({ input: 1, output: 1, totalTokens: 2 });
+		expect(result.transportFailure).toBeUndefined();
 	});
 
 	it("maps qwen chat template reasoning into chat_template_kwargs", async () => {

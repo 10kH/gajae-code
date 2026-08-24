@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Kilo's `stealth/ox-alpha` model with its reviewed 1,048,576-token context, 131,072-token output ceiling, text/image input, and low/high/max reasoning-effort contract.
+
 ### Fixed
 
 - Direct model selections now retry zero-token empty OpenAI-compatible responses.

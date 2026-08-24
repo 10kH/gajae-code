@@ -329,6 +329,53 @@ describe("generated model policies", () => {
 		});
 	});
 
+	it("pins Kilo Ox Alpha capabilities when generic discovery omits them", () => {
+		const models: Model<Api>[] = [
+			createModel({
+				id: "stealth/ox-alpha",
+				api: "openai-completions",
+				provider: "kilo",
+				reasoning: false,
+			}),
+		];
+		models[0]!.input = ["text"];
+		models[0]!.contextWindow = 222_222;
+		models[0]!.maxTokens = 8_888;
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]).toMatchObject({
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+			thinking: {
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.Max,
+				defaultLevel: Effort.Max,
+				levels: [Effort.Low, Effort.High, Effort.Max],
+			},
+		});
+	});
+
+	it("removes unsupported reasoning controls only from Groq compound systems", () => {
+		const models = [
+			createModel({ id: "groq/compound", api: "openai-completions", provider: "groq" }),
+			createModel({ id: "groq/compound-mini", api: "openai-completions", provider: "groq" }),
+			createModel({ id: "groq/compound", api: "openai-completions", provider: "openrouter" }),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.reasoning).toBe(false);
+		expect(models[0]?.thinking).toBeUndefined();
+		expect(models[1]?.reasoning).toBe(false);
+		expect(models[1]?.thinking).toBeUndefined();
+		expect(models[2]?.reasoning).toBe(true);
+		expect(models[2]?.thinking).toBeDefined();
+	});
+
 	it("maps only first-class MiniMax M3 routes to the official 1M context (issue #3896)", () => {
 		const models = [
 			createModel({ id: "MiniMax-M3", api: "anthropic-messages", provider: "minimax" }),
