@@ -10,7 +10,10 @@ use std::{
 
 use brush_parser::ast;
 use itertools::Itertools;
-use sys::commands::{CommandExt, CommandFdInjectionExt, CommandFgControlExt, CommandSessionExt};
+pub use sys::commands::CommandWindowControlExt;
+use sys::commands::{
+	CommandExt, CommandFdInjectionExt, CommandFgControlExt, CommandSessionExt,
+};
 
 use crate::{
 	ErrorKind, ExecutionControlFlow, ExecutionExitCode, ExecutionParameters, ExecutionResult, Shell,
@@ -615,6 +618,12 @@ pub(crate) fn execute_external_command(
 	)?;
 	let mut marker_output = prepare_output_markers(&context, executable_path, cmd_args.as_slice());
 
+	// A console-less host (detached ACP/GUI embedder, #4883) must not let every
+	// external child allocate a visible console window. On Windows this adds
+	// CREATE_NO_WINDOW; on other platforms it is a no-op. It must run before
+	// the process-group/session setup below, which re-derives the complete
+	// Windows creation-flag set (std's creation_flags replaces the value).
+	cmd.suppress_console_window_if_host_consoleless();
 
 	// Set up process group/session state.
 	let command_leads_session = new_pg

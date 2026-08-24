@@ -461,7 +461,18 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/utils/src/env.ts" ||
 		changedPath === "packages/utils/test/env-provenance.windows.test.ts" ||
 		changedPath === "packages/natives/native/loader-state.js" ||
-		changedPath === "scripts/host-detect.ts"
+		changedPath === "scripts/host-detect.ts" ||
+		// Rust shell-spawn surfaces cannot be executed on an Ubuntu shard; the
+		// hidden-console creation-flag contract is Windows-only, so route these
+		// to the windows-latest job (#4883).
+		changedPath === "crates/brush-core-vendored/src/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/windows/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/unix/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/stubs/commands.rs" ||
+		changedPath === "crates/pi-shell/src/shell.rs" ||
+		changedPath === "crates/pi-shell/src/lib.rs" ||
+		changedPath === "crates/pi-shell/src/windows.rs" ||
+		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts"
 	);
 }
 

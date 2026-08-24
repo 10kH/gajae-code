@@ -2101,6 +2101,221 @@ mod tests {
 		);
 	}
 
+	/// Standard base64 (RFC 4648, with padding) for the Windows e2e probe below:
+	/// `-EncodedCommand` delivers the PowerShell script without exposing it to
+	/// any shell quoting/expansion layer. Kept local because pi-shell has no
+	/// base64 dependency and the vendored crate cannot be touched for tests.
+	#[cfg(windows)]
+	fn test_base64(input: &[u8]) -> String {
+		const ALPHABET: &[u8; 64] =
+			b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+		let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+		for chunk in input.chunks(3) {
+			let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+			let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+			out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+			out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+			out.push(if chunk.len() > 1 {
+				ALPHABET[(n >> 6) as usize & 63] as char
+			} else {
+				'='
+			});
+			out.push(if chunk.len() > 2 {
+				ALPHABET[n as usize & 63] as char
+			} else {
+				'='
+			});
+		}
+		out
+	}
+
+	/// Windows hidden-console creation-flag contract (#4883). The brush-core
+	/// crate is excluded from the workspace and cannot be tested standalone
+	/// (same reason `child_session_action` truth-table tests live here), so the
+	/// composition surface is re-tested through the public brush API.
+	#[cfg(windows)]
+	mod windows_hidden_console_flags {
+		use std::process::Command;
+
+		use brush_core::commands::CommandWindowControlExt as _;
+
+		#[test]
+		fn consoleless_host_probe_matches_kernel() {
+			// On an ordinary console-attached test runner this is false; what is
+			// pinned is that the trait probe is exactly the GetConsoleWindow
+			// sentinel, not a cached or guessed value.
+			assert_eq!(
+				Command::host_is_consoleless(),
+				unsafe { windows_sys::Win32::System::Console::GetConsoleWindow() }.is_null(),
+			);
+		}
+
+		/// Truth table for the real brush-core composition. std's
+		/// `creation_flags` replaces the whole value, so every Windows flags
+		/// write must flow through this function; these cases pin both halves
+		/// of the contract.
+		#[test]
+		fn spawn_creation_flags_truth_table() {
+			use brush_core::sys::commands::spawn_creation_flags;
+			use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+
+			// Base spawn from a console-less host: hidden console (#4883).
+			assert_eq!(spawn_creation_flags(0, true), CREATE_NO_WINDOW);
+			// Base spawn from a console-attached host: std default (inherit).
+			assert_eq!(spawn_creation_flags(0, false), 0);
+			// Process-group spawns compose, never overwrite, the no-window bit.
+			assert_eq!(
+				spawn_creation_flags(CREATE_NEW_PROCESS_GROUP, true),
+				CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+			);
+			assert_eq!(
+				spawn_creation_flags(CREATE_NEW_PROCESS_GROUP, false),
+				CREATE_NEW_PROCESS_GROUP,
+			);
+			// CREATE_NO_WINDOW is 0x08000000; a wrong constant silently changes
+			// which console behavior every external child gets.
+			assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
+			assert_eq!(CREATE_NEW_PROCESS_GROUP, 0x0200);
+		}
+
+		/// The issue explicitly forbids `DETACHED_PROCESS` (0x00000008): a
+		/// detached child has no console, so its own children would allocate
+		/// fresh *visible* consoles. The composed flags must never carry it.
+		#[test]
+		fn no_window_flag_never_implies_detached_process() {
+			use brush_core::sys::commands::spawn_creation_flags;
+			const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+			assert_eq!(spawn_creation_flags(0, true) & DETACHED_PROCESS, 0);
+		}
+	}
+
+	/// Windows counterpart of
+	/// `embedded_external_command_runs_in_its_own_session`: verifies the #4883
+	/// hidden-console wiring end-to-end through a real embedded brush session.
+	///
+	/// The host-console probe itself is pinned by
+	/// `windows_hidden_console_flags::consoleless_host_probe_matches_kernel`;
+	/// this test covers the *wiring* — that a real brush session spawned
+	/// exactly the way `create_session` builds it passes `CREATE_NO_WINDOW`
+	/// to its external children when the host is console-less, and plain
+	/// default flags (inherit parent console) when the host has a console.
+	///
+	/// The child reports its own console state via `GetConsoleWindow`/
+	/// `IsWindowVisible` P/Invoked from PowerShell, so the assertion reads the
+	/// kernel's view of the spawned child, not a mock:
+	///   - console-less host  → child HAS a console whose window is NOT visible
+	///     (CREATE_NO_WINDOW; `DETACHED_PROCESS` would print `has-console=0` and
+	///     fail the first assert);
+	///   - console-attached host → child inherits this console, and
+	///     `CREATE_NO_WINDOW` must NOT be set (a hidden, different console would
+	///     decouple the child from the interactive terminal).
+	#[cfg(windows)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn embedded_external_command_console_window_visibility_follows_host_console_state() {
+		use std::process::Command;
+
+		use brush_core::sys::commands::CommandWindowControlExt as _;
+
+		let host_consoleless = Command::host_is_consoleless();
+
+		// Three-way console-state probe: handle (GetConsoleWindow — non-null
+		// means a console WINDOW exists), has-console (GetConsoleCP — non-zero
+		// means a console is attached at all; CREATE_NO_WINDOW keeps a headless
+		// one, DETACHED_PROCESS would not), visible (window shown).
+		let script = concat!(
+			"$w = Add-Type -Namespace GjcProbe -Name Win -PassThru -MemberDefinition @'",
+			"\n",
+			"[DllImport(\"kernel32\")] public static extern IntPtr GetConsoleWindow();\n",
+			"[DllImport(\"kernel32\")] public static extern uint GetConsoleCP();\n",
+			"[DllImport(\"user32\")] public static extern bool IsWindowVisible(IntPtr h);\n",
+			"'@\n",
+			"$h = $w::GetConsoleWindow()\n",
+			"Write-Output (\"handle={0} has-console={1} visible={2}\" -f $h, ",
+			"[int]($w::GetConsoleCP() -ne 0), [int]($h -ne [IntPtr]::Zero -and \
+			 $w::IsWindowVisible($h)))"
+		);
+
+		// Build the same kind of session pi-natives uses in production.
+		let config = ShellConfig { session_env: None, snapshot_path: None, minimizer: None };
+		let mut session = create_session(&config).await.expect("create_session");
+
+		let (mut reader, writer) = pipe_to_files("win-console").expect("pipe");
+		let stdout_file = OpenFile::from(writer.try_clone().expect("clone"));
+		let stderr_file = OpenFile::from(writer);
+
+		let mut params = session.shell.default_exec_params();
+		params.set_fd(OpenFiles::STDIN_FD, null_file().expect("null stdin"));
+		params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
+		params.set_fd(OpenFiles::STDERR_FD, stderr_file);
+
+		let source_info = SourceInfo::from("pi-natives:test");
+		// The probe script is delivered base64-encoded (`-EncodedCommand`): no
+		// quoting, variable expansion, or backslash semantics of the brush shell
+		// can mangle it, and powershell.exe itself decodes the payload.
+		// `-EncodedCommand` decodes UTF-16LE, so encode the script's UTF-16
+		// code units rather than its UTF-8 bytes.
+		let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+		let encoded = test_base64(&utf16);
+		let quoted = format!("powershell -NoProfile -NonInteractive -EncodedCommand {encoded}");
+		let exec = session
+			.shell
+			.run_string(&quoted, &source_info, &params)
+			.await
+			.expect("run_string");
+		drop(params);
+
+		assert!(
+			matches!(exec.exit_code, ExecutionExitCode::Success),
+			"powershell console probe failed: {}",
+			exit_code(&exec),
+		);
+
+		// Drain the probe's stdout.
+		let mut output = String::new();
+		use std::io::Read as _;
+		reader
+			.read_to_string(&mut output)
+			.expect("read probe output");
+
+		let has_window = !output.contains("handle=0");
+		let has_console = output.contains("has-console=1");
+		let visible = output.contains("visible=1");
+		assert!(
+			output.contains("handle=")
+				&& output.contains("has-console=")
+				&& output.contains("visible="),
+			"probe produced no parseable result: {output:?}",
+		);
+
+		if host_consoleless {
+			// CREATE_NO_WINDOW contract, three-way discriminated:
+			//   no console window allocated (a flags-0 child of a console-less
+			//   host would allocate a visible one), but a headless console is
+			//   still attached (DETACHED_PROCESS would report none).
+			assert!(
+				!has_window,
+				"console-less host child allocated a console window (#4883 regression); output: \
+				 {output:?}"
+			);
+			assert!(
+				has_console,
+				"console-less host child got no console (DETACHED-like); output: {output:?}"
+			);
+			assert!(
+				!visible,
+				"console-less host child console window is visible (#4883 regression); output: \
+				 {output:?}"
+			);
+		} else {
+			// Console-attached host: child inherits this console untouched.
+			assert!(
+				has_window && has_console,
+				"console-attached host child lost the inherited console; output: {output:?}"
+			);
+		}
+	}
+
 	#[tokio::test]
 	async fn abort_state_signals_cancel_token() {
 		let abort_state = ShellAbortState::default();
