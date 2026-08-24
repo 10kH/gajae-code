@@ -367,6 +367,8 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain("trusted_github_url");
 		expect(installer).toContain("require_official_github_origins");
 		expect(installer).toContain("${LOCK_DIR}/pid");
+		expect(installer).not.toContain('rm -rf "$lock"');
+		expect(installer).toContain("is_stable_release_tag");
 		expect(installer).toContain("Failed to publish the downloaded binary");
 		expect(installer).toContain("exit 130");
 		expect(installer).toContain("Unsupported libc: musl");
@@ -433,5 +435,21 @@ describe("install.sh binary-first contract", () => {
 			sleeper.kill();
 			await sleeper.exited;
 		}
+	});
+	test("reclaims a stale installer lock whose pid is dead", async () => {
+		const payload = fakeGjcScript({ version: VERSION });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const lockDir = path.join(sandbox.installDir, ".gjc-install.lock");
+		fs.mkdirSync(lockDir, { recursive: true });
+		fs.writeFileSync(path.join(lockDir, "pid"), "999999\n");
+		const result = await runInstaller([]);
+		expect(result.exitCode).toBe(0);
+		expect(fs.existsSync(lockDir)).toBe(false);
+		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
 	});
 });

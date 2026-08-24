@@ -351,12 +351,23 @@ acquire_lock() {
     if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
         die "Another GJC installer is already running in ${INSTALL_DIR} (pid ${owner}, lock: ${lock})."
     fi
-    rm -rf "$lock"
-    if ! mkdir "$lock" 2>/dev/null; then
-        die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
+    # Stale takeover: remove only the observed dead pid, then mkdir exclusively.
+    # Never rm -rf a lock directory that another process may have just acquired.
+    if [ -n "$owner" ] && [ -f "${lock}/pid" ]; then
+        current=$(tr -d ' \t\r\n' < "${lock}/pid")
+        if [ "$current" = "$owner" ]; then
+            rm -f "${lock}/pid"
+            rmdir "$lock" 2>/dev/null || true
+        fi
+    elif [ ! -f "${lock}/pid" ]; then
+        rmdir "$lock" 2>/dev/null || true
     fi
-    LOCK_DIR="$lock"
-    printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+    if mkdir "$lock" 2>/dev/null; then
+        LOCK_DIR="$lock"
+        printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+        return 0
+    fi
+    die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
 }
 
 resolve_release_tag() {
