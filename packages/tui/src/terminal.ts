@@ -697,7 +697,43 @@ export class ProcessTerminal implements Terminal {
 		this.#startOsc11Query();
 	}
 
+	/**
+	 * Re-assert raw mode before writing a capability probe.
+	 *
+	 * `start()` enables raw mode once and never re-checks it. A foreground child
+	 * that inherits the real tty (ssh, sudo, a pager, anything that dies before
+	 * restoring termios) can leave it in cooked mode while the OSC 11 poll keeps
+	 * firing every 2s. The kernel then echoes the terminal's replies to the
+	 * screen and line-buffers them, so they never reach the stdin parser at all -
+	 * the probe-reply reassembly in #handleSequence cannot help - and each tick
+	 * appends another `\x1b]11;rgb:...\x07\x1b[?62;22;52c` pair to the display
+	 * while keystrokes stall in the line buffer.
+	 */
+	#ensureRawModeForProbe(): boolean {
+		if (!this.#started || this.#dead) return false;
+		if (!process.stdin.isTTY) return true;
+		if (typeof process.stdin.setRawMode !== "function") return false;
+		try {
+			// `isRaw` and setRawMode() both trust the runtime's last requested mode.
+			// A child can change the shared tty's termios directly without updating
+			// that cache, so a repeated setRawMode(true) is a no-op in Node and Bun.
+			// Cycle through cooked mode synchronously to force a real raw-mode apply;
+			// no JavaScript or input callback can run between these two operations.
+			process.stdin.setRawMode(false);
+			process.stdin.setRawMode(true);
+			// On Windows setRawMode() resets console input flags. Restore VT input so
+			// modified keys keep arriving as escape sequences after self-healing.
+			this.#enableWindowsVTInput();
+			return true;
+		} catch {
+			// Do not write a probe into a tty whose input mode is unknown. A later
+			// poll can retry if the terminal becomes usable again.
+			return false;
+		}
+	}
+
 	#startOsc11Query(): void {
+		if (!this.#ensureRawModeForProbe()) return;
 		this.#osc11Pending = true;
 		this.#osc11ResponseBuffer = "";
 		this.#pendingDa1Sentinels++;
