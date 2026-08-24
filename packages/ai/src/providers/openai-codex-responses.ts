@@ -59,7 +59,7 @@ import {
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { findUnnecessaryUnicodeEscape, parseStreamingJson } from "../utils/json-parse";
+import { captureUnicodeEscapeEvidence, collectUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import {
 	adaptSchemaForStrict,
@@ -1433,7 +1433,7 @@ function handleToolCallArgumentsDone(
 	if (typeof args === "string") {
 		currentBlock.partialJson = args;
 		currentBlock.arguments = parseStreamingJson(currentBlock.partialJson);
-		if (findUnnecessaryUnicodeEscape(args)) currentBlock.escapedNonAsciiArguments = true;
+		captureUnicodeEscapeEvidence(currentBlock, args);
 	}
 }
 
@@ -1564,12 +1564,13 @@ function handleOutputItemDone(
 			throw new Error("Codex function_call terminal item did not match the active tool call");
 		}
 		runtime.finalizedToolCallIds.add(id);
+		const escapedUnicodeArgumentEvidence = collectUnicodeEscapeEvidence(item.arguments);
 		const toolCall: ToolCall = {
 			type: "toolCall",
 			id,
 			name: codexToolCanonicalName(item.name),
 			arguments: terminalArguments as Record<string, unknown>,
-			...(findUnnecessaryUnicodeEscape(item.arguments || "") ? { escapedNonAsciiArguments: true } : {}),
+			...(escapedUnicodeArgumentEvidence ? { escapedNonAsciiArguments: true, escapedUnicodeArgumentEvidence } : {}),
 		};
 		Object.assign(runtime.currentBlock, toolCall);
 		delete (runtime.currentBlock as { partialJson?: string }).partialJson;

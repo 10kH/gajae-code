@@ -12,6 +12,7 @@ import type {
 import type { AssistantMessage, Message } from "@gajae-code/ai";
 import { createMockModel } from "@gajae-code/ai/providers/mock";
 import { AssistantMessageEventStream } from "@gajae-code/ai/utils/event-stream";
+import { collectUnicodeEscapeEvidence } from "@gajae-code/ai/utils/json-parse";
 import * as logger from "@gajae-code/utils/logger";
 import * as z from "zod/v4";
 import { createUserMessage } from "./helpers";
@@ -25,6 +26,12 @@ const askSchema = z.object({ question: z.string() });
 // Decodes cleanly, but a mistyped nibble anywhere in it would be
 // indistinguishable from the correct text.
 const QUESTION = "마지막 병목";
+
+function escapeEvidence(rawArguments: string) {
+	const evidence = collectUnicodeEscapeEvidence(rawArguments);
+	if (!evidence) throw new Error("test fixture must contain a qualifying Unicode escape");
+	return evidence;
+}
 
 function askTool(executed: Array<Record<string, unknown>>): AgentTool<typeof askSchema, Record<string, never>> {
 	return {
@@ -67,6 +74,9 @@ function emDashEscapedTurn(id: string, name = "ask") {
 				name,
 				arguments: { question: "How should the daemon drive sessions — in-process?" },
 				escapedNonAsciiArguments: true,
+				escapedUnicodeArgumentEvidence: escapeEvidence(
+					String.raw`{"question":"How should the daemon drive sessions \u2014 in-process?"}`,
+				),
 			},
 		],
 	};
@@ -1079,6 +1089,54 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(replayRequest?.some(message => message.role === "assistant")).toBe(false);
 	});
 
+	it("keeps managed fallback guarded when carried evidence cannot be reconstructed", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tc-managed-invalid-evidence",
+							name: "ask",
+							arguments: { question: "w" },
+							escapedUnicodeArgumentEvidence: {
+								positions: [],
+								totalPositions: 0,
+								truncated: false,
+								malformed: false,
+								integrity: "invalid",
+							} as never,
+						},
+					],
+				},
+			],
+		});
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				fallbackManaged: true,
+				onManagedAttemptOutcome: outcome => {
+					outcomes.push(outcome);
+					return { type: "terminal", terminal: { stopReason: "error" } };
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(outcomes.map(outcome => outcome.type)).toEqual(["escaped_arguments_discarded"]);
+		expect(executed).toHaveLength(0);
+	});
+
 	it("continues a managed run after the session policy retries the discarded outcome", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [askTool(executed)] };
@@ -1223,6 +1281,216 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(executed).toEqual([{ question: "How should the daemon drive sessions — in-process?" }]);
 		expect(toolResults).toHaveLength(1);
 		expect(toolResults[0].isError).toBeFalsy();
+	});
+
+	it.each([
+		["U+00B7 one-nibble ASCII landing", String.raw`{"question":"\u0077"}`, "w"],
+		["U+2026 one-nibble ASCII landing", String.raw`{"question":"\u0026"}`, "&"],
+	])("rejects %s after the full resample budget", async (_label, rawArguments, decodedQuestion) => {
+		const executed: Array<Record<string, unknown>> = [];
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+		const turn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: { question: decodedQuestion },
+					escapedNonAsciiArguments: true,
+					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
+				},
+			],
+		});
+		const mock = createMockModel({
+			responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
+		});
+		const toolResults: Array<{ isError?: boolean; text: string }> = [];
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			context,
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
+			}
+		}
+
+		expect(mock.calls).toHaveLength(4);
+		expect(executed).toHaveLength(0);
+		expect(toolResults).toHaveLength(1);
+		expect(toolResults[0]).toMatchObject({ isError: true });
+		expect(toolResults[0].text).toContain("\\uXXXX");
+	});
+
+	it("allows exact U+2014 evidence at duplicate nested array/object display positions", async () => {
+		const nestedSchema = z.object({
+			questions: z.array(
+				z.object({
+					question: z.string(),
+					options: z.array(z.object({ label: z.string() })),
+				}),
+			),
+		});
+		const executed: Array<Record<string, unknown>> = [];
+		const tool: AgentTool<typeof nestedSchema, Record<string, never>> = {
+			name: "ask",
+			label: "Ask",
+			description: "Ask nested questions",
+			parameters: nestedSchema,
+			displaySafeEscapedArgFields: ["questions.question", "questions.options.label"],
+			async execute(_id, params) {
+				executed.push(params as Record<string, unknown>);
+				return { content: [{ type: "text", text: "answered" }], details: {} };
+			},
+		};
+		const rawArguments = String.raw`{"questions":[{"question":"left \u2014 right \u2014 done","options":[{"label":"keep \u2014 exact"}]},{"question":"second \u2014 item","options":[]}]}`;
+		const argumentsValue = JSON.parse(rawArguments) as Record<string, unknown>;
+		const turn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: argumentsValue,
+					escapedNonAsciiArguments: true,
+					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
+				},
+			],
+		});
+		const mock = createMockModel({
+			responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
+		});
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			{ systemPrompt: [""], messages: [], tools: [tool] },
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(mock.calls).toHaveLength(4);
+		expect(executed).toEqual([argumentsValue]);
+	});
+
+	it("fails closed when raw escape evidence is malformed, missing, or overflowed", async () => {
+		const complete = escapeEvidence(String.raw`{"question":"\u2014\u2014"}`);
+		const cases = [
+			undefined,
+			escapeEvidence(String.raw`{"question":"\u2014"`),
+			{ ...escapeEvidence(String.raw`{"question":"\u2014"}`), truncated: true },
+			{ ...complete, positions: complete.positions.slice(0, 1) },
+		];
+		for (const evidence of cases) {
+			const executed: Array<Record<string, unknown>> = [];
+			const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
+			const turn = (id: string) => ({
+				content: [
+					{
+						type: "toolCall" as const,
+						id,
+						name: "ask",
+						arguments: { question: "—" },
+						escapedNonAsciiArguments: true,
+						...(evidence ? { escapedUnicodeArgumentEvidence: evidence } : {}),
+					},
+				],
+			});
+			const mock = createMockModel({
+				responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
+			});
+			const stream = agentLoop(
+				[createUserMessage("ask me")],
+				context,
+				{ model: mock.model, convertToLlm: identityConverter },
+				undefined,
+				mock.stream,
+			);
+			for await (const _event of stream) {
+				// drain
+			}
+			expect(executed).toHaveLength(0);
+		}
+	});
+
+	it("treats carried evidence as guarded even when the legacy boolean is absent", async () => {
+		const executed: Array<Record<string, unknown>> = [];
+		const evidence = escapeEvidence(String.raw`{"question":"\u0077"}`);
+		const turn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: { question: "w" },
+					escapedUnicodeArgumentEvidence: evidence,
+				},
+			],
+		});
+		const mock = createMockModel({
+			responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
+		});
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] },
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+		expect(mock.calls).toHaveLength(4);
+		expect(executed).toHaveLength(0);
+	});
+
+	it("does not confuse a dotted literal key with a nested display path", async () => {
+		const dottedSchema = z.object({ "questions.question": z.string() });
+		const executed: Array<Record<string, unknown>> = [];
+		const tool: AgentTool<typeof dottedSchema, Record<string, never>> = {
+			name: "ask",
+			label: "Ask",
+			description: "Adversarial dotted key",
+			parameters: dottedSchema,
+			displaySafeEscapedArgFields: ["questions.question"],
+			async execute(_id, params) {
+				executed.push(params as Record<string, unknown>);
+				return { content: [{ type: "text", text: "answered" }], details: {} };
+			},
+		};
+		const rawArguments = String.raw`{"questions.question":"\u2014"}`;
+		const turn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: { "questions.question": "—" },
+					escapedNonAsciiArguments: true,
+					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
+				},
+			],
+		});
+		const mock = createMockModel({
+			responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
+		});
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			{ systemPrompt: [""], messages: [], tools: [tool] },
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+		expect(executed).toHaveLength(0);
 	});
 
 	it("never exempts escaped non-ASCII outside the declared display fields", async () => {

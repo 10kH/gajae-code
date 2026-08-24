@@ -34,6 +34,11 @@ import {
 	stripUnusableReasoningItems,
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
+import {
+	type UnicodeEscapeEvidence,
+	unicodeEscapePathHash,
+	verifyUnicodeEscapeEvidence,
+} from "@gajae-code/ai/utils/json-parse";
 import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
 import * as logger from "@gajae-code/utils/logger";
 import { revokeProviderSafetyStop } from "../../ai/src/adapter-internals/provider-safety-stop";
@@ -397,7 +402,11 @@ const MAX_ESCAPED_NONASCII_RESAMPLES = 2;
 
 /** Whether any tool call in the turn carried `\uXXXX`-escaped arguments. */
 function hasEscapedNonAsciiToolCall(message: AssistantMessage): boolean {
-	return message.content.some(block => block.type === "toolCall" && block.escapedNonAsciiArguments === true);
+	return message.content.some(
+		block =>
+			block.type === "toolCall" &&
+			(block.escapedNonAsciiArguments === true || block.escapedUnicodeArgumentEvidence !== undefined),
+	);
 }
 
 const ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX = 8;
@@ -408,7 +417,9 @@ function escapedNonAsciiToolCallShape(message: AssistantMessage): {
 	escapedToolCallCountCapped: boolean;
 } {
 	const count = message.content.filter(
-		block => block.type === "toolCall" && block.escapedNonAsciiArguments === true,
+		block =>
+			block.type === "toolCall" &&
+			(block.escapedNonAsciiArguments === true || block.escapedUnicodeArgumentEvidence !== undefined),
 	).length;
 	return {
 		escapedToolCallCount: Math.min(count, ESCAPED_NONASCII_DIAGNOSTIC_TOOL_CALL_COUNT_MAX),
@@ -460,10 +471,11 @@ function isDisplaySafeEscapedTool(tool: AgentTool<TSchema> | undefined): boolean
 function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, args: Record<string, unknown>): boolean {
 	const fields = (tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields;
 	if (!fields || fields.length === 0) return false;
-	const prefixes = [...fields];
-	const isDisplayPath = (path: string): boolean =>
-		prefixes.some(field => path === field || path.startsWith(`${field}.`));
-	const walk = (node: unknown, path: string): boolean => {
+	const prefixes = fields.map(field => field.split("."));
+	const isDisplayPath = (path: readonly string[]): boolean =>
+		prefixes.some(field => field.length <= path.length && field.every((segment, index) => path[index] === segment));
+	const path: string[] = [];
+	const walk = (node: unknown): boolean => {
 		if (typeof node === "string") {
 			for (const ch of node) {
 				const cp = ch.codePointAt(0);
@@ -474,7 +486,7 @@ function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, arg
 			}
 			return true;
 		}
-		if (Array.isArray(node)) return node.every(item => walk(item, path));
+		if (Array.isArray(node)) return node.every(item => walk(item));
 		if (typeof node === "object" && node !== null) {
 			for (const [key, value] of Object.entries(node)) {
 				// Field names are structural identifiers; the display fields have
@@ -483,12 +495,87 @@ function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, arg
 					const cp = ch.codePointAt(0);
 					if (cp !== undefined && cp >= 0x80) return false;
 				}
-				if (!walk(value, path === "" ? key : `${path}.${key}`)) return false;
+				path.push(key);
+				const valid = walk(value);
+				path.pop();
+				if (!valid) return false;
 			}
 		}
 		return true;
 	};
-	return walk(args, "");
+	return walk(args);
+}
+
+/**
+ * Validate the original raw escape positions, not just the decoded values.
+ * Missing, malformed, overflowed, key-position, non-U+2014, or path-mismatched
+ * evidence fails closed. Path hashes keep argument keys and values out of the
+ * carried metadata while still binding every escape to a declared display field.
+ */
+function isDisplaySafeRawEscapeEvidence(
+	tool: AgentTool<TSchema> | undefined,
+	args: Record<string, unknown>,
+	evidence: UnicodeEscapeEvidence | undefined,
+): boolean {
+	const fields = (tool as DisplaySafeEscapedTool | undefined)?.displaySafeEscapedArgFields;
+	if (
+		!fields ||
+		fields.length === 0 ||
+		!evidence ||
+		!verifyUnicodeEscapeEvidence(evidence) ||
+		evidence.malformed ||
+		evidence.truncated
+	)
+		return false;
+	if (evidence.positions.length === 0 || evidence.positions.length > 32) return false;
+
+	const allowedCounts = new Map<string, number>();
+	const prefixes = fields.map(field => field.split("."));
+	const isDisplayPath = (path: readonly string[]): boolean =>
+		prefixes.some(field => field.length <= path.length && field.every((segment, index) => path[index] === segment));
+	const path: string[] = [];
+	const walk = (node: unknown): void => {
+		if (typeof node === "string") {
+			if (!isDisplayPath(path)) return;
+			let count = 0;
+			for (const character of node) if (character.codePointAt(0) === 0x2014) count++;
+			if (count > 0) {
+				const pathHash = unicodeEscapePathHash(path);
+				allowedCounts.set(pathHash, (allowedCounts.get(pathHash) ?? 0) + count);
+			}
+			return;
+		}
+		if (Array.isArray(node)) {
+			for (const item of node) walk(item);
+			return;
+		}
+		if (typeof node === "object" && node !== null) {
+			for (const [key, value] of Object.entries(node)) {
+				path.push(key);
+				walk(value);
+				path.pop();
+			}
+		}
+	};
+	walk(args);
+
+	let previousOffset = -1;
+	for (const position of evidence.positions) {
+		if (
+			position.location !== "value" ||
+			position.codePoint !== 0x2014 ||
+			!Number.isSafeInteger(position.offset) ||
+			position.offset <= previousOffset ||
+			!/^[0-9a-f]{64}$/.test(position.pathHash)
+		) {
+			return false;
+		}
+		previousOffset = position.offset;
+		const remaining = allowedCounts.get(position.pathHash) ?? 0;
+		if (remaining === 0) return false;
+		allowedCounts.set(position.pathHash, remaining - 1);
+	}
+	return true;
 }
 /** Remove only the exact assistant response committed by its streaming attempt. */
 function removeCommittedAssistantMessage(messages: AgentMessage[], message: AssistantMessage): boolean {
@@ -1917,6 +2004,50 @@ function managedContentBlock(block: unknown): AssistantMessage["content"] {
 	return normalized ? [normalized] : [];
 }
 
+function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | undefined {
+	if (!isManagedPlainRecord(value)) return undefined;
+	const positionsValue = managedProperty(value, "positions");
+	const totalPositions = managedProperty(value, "totalPositions");
+	const truncated = managedProperty(value, "truncated");
+	const malformed = managedProperty(value, "malformed");
+	const integrity = managedProperty(value, "integrity");
+	if (!Array.isArray(positionsValue) || positionsValue.length > 32) return undefined;
+	if (
+		typeof totalPositions !== "number" ||
+		!Number.isSafeInteger(totalPositions) ||
+		totalPositions < positionsValue.length ||
+		typeof truncated !== "boolean" ||
+		typeof malformed !== "boolean" ||
+		typeof integrity !== "string" ||
+		!/^[0-9a-f]{64}$/.test(integrity)
+	)
+		return undefined;
+	const positions: UnicodeEscapeEvidence["positions"][number][] = [];
+	for (const positionValue of positionsValue) {
+		if (!isManagedPlainRecord(positionValue)) return undefined;
+		const offset = managedProperty(positionValue, "offset");
+		const codePoint = managedProperty(positionValue, "codePoint");
+		const pathHash = managedProperty(positionValue, "pathHash");
+		const location = managedProperty(positionValue, "location");
+		if (
+			typeof offset !== "number" ||
+			!Number.isSafeInteger(offset) ||
+			offset < 0 ||
+			typeof codePoint !== "number" ||
+			!Number.isSafeInteger(codePoint) ||
+			codePoint < 0 ||
+			codePoint > 0x10ffff ||
+			typeof pathHash !== "string" ||
+			!/^[0-9a-f]{64}$/.test(pathHash) ||
+			(location !== "key" && location !== "value")
+		) {
+			return undefined;
+		}
+		positions.push({ offset, codePoint, pathHash, location });
+	}
+	return { positions, totalPositions, truncated, malformed, integrity };
+}
+
 function managedAssistantContent(value: unknown): AssistantMessage["content"][number] | undefined {
 	if (!isManagedPlainRecord(value)) return undefined;
 	const type = managedProperty(value, "type");
@@ -1943,6 +2074,9 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 	const incompleteArguments = managedProperty(value, "incompleteArguments");
 	const incompleteArgumentsReason = managedProperty(value, "incompleteArgumentsReason");
 	const escapedNonAsciiArguments = managedProperty(value, "escapedNonAsciiArguments");
+	const rawEscapedUnicodeArgumentEvidence = managedProperty(value, "escapedUnicodeArgumentEvidence");
+	const escapedUnicodeArgumentEvidence = managedUnicodeEscapeEvidence(rawEscapedUnicodeArgumentEvidence);
+	const escapedArgumentsGuarded = escapedNonAsciiArguments === true || rawEscapedUnicodeArgumentEvidence !== undefined;
 	return {
 		type,
 		id,
@@ -1961,7 +2095,12 @@ function managedAssistantContent(value: unknown): AssistantMessage["content"][nu
 						| "ambiguous",
 				}
 			: {}),
-		...(typeof escapedNonAsciiArguments === "boolean" ? { escapedNonAsciiArguments } : {}),
+		...(escapedArgumentsGuarded
+			? { escapedNonAsciiArguments: true }
+			: typeof escapedNonAsciiArguments === "boolean"
+				? { escapedNonAsciiArguments }
+				: {}),
+		...(escapedUnicodeArgumentEvidence ? { escapedUnicodeArgumentEvidence } : {}),
 	};
 }
 
@@ -4723,18 +4862,22 @@ async function executeToolCalls(
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
 					throw new Error(detail);
 				}
-				if (toolCall.escapedNonAsciiArguments && !isDisplaySafeEscapedArguments(tool, argsForExecution)) {
+				if (
+					(toolCall.escapedNonAsciiArguments || toolCall.escapedUnicodeArgumentEvidence !== undefined) &&
+					(!isDisplaySafeEscapedArguments(tool, argsForExecution) ||
+						!isDisplaySafeRawEscapeEvidence(tool, argsForExecution, toolCall.escapedUnicodeArgumentEvidence))
+				) {
 					record.argumentValidationFailed = true;
 					// The arguments decoded cleanly, but they were spelled as `\uXXXX`
-					// escapes rather than literal UTF-8. Hand-written hex is where models
+					// escapes rather than literal characters. Hand-written hex is where models
 					// mistype digits, and every mistyped nibble decodes to a different but
 					// equally valid character — the payload is unverifiable and cannot be
 					// repaired after parsing, so it is rejected rather than executed on
 					// silently corrupted text. The one bounded exception is a tool that
 					// declared its arguments display-only (see
 					// isDisplaySafeEscapedArguments): user-facing question text whose
-					// only non-ASCII characters are benign typographic punctuation is
-					// not the Hangul-mistype corruption this guard exists to stop.
+					// only escaped scalars are exact U+2014 positions, corroborated against
+					// the decoded display fields. Missing or ASCII-position evidence rejects.
 					//
 					// Terminal for this call: the resample budget is already spent, so
 					// log it (shape-only) to make the fire rate measurable without
@@ -4745,9 +4888,9 @@ async function executeToolCalls(
 						displaySafeFieldsDeclared: isDisplaySafeEscapedTool(tool),
 					});
 					throw new Error(
-						`Tool call "${toolCall.name}" spelled non-ASCII text as \\uXXXX escapes instead of literal UTF-8. ` +
+						`Tool call "${toolCall.name}" spelled printable text as \\uXXXX escapes instead of literal UTF-8 characters. ` +
 							`Escaped text cannot be verified — a single wrong hex digit silently becomes a different character — ` +
-							`so the call was not executed. Re-issue it writing every non-ASCII character literally.`,
+							`so the call was not executed. Re-issue it writing every printable character literally.`,
 					);
 				}
 				if (!tool) {

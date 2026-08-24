@@ -26,6 +26,7 @@ import type {
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { withHttpStatus } from "../utils/http-inspector";
+import { captureUnicodeEscapeEvidence } from "../utils/json-parse";
 import { decodeEventStream } from "./aws-eventstream";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -510,6 +511,7 @@ function handleToolUseEvent(
 			name,
 			arguments: safeParseJson(inputStr) as Record<string, any>,
 		};
+		if (typeof toolEvent.input === "string") captureUnicodeEscapeEvidence(toolCall, inputStr);
 
 		const newBlock: Block = { ...toolCall, index: blocks.length };
 		blocks.push(newBlock);

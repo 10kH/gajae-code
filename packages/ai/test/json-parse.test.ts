@@ -1,10 +1,13 @@
 import { describe, expect, it } from "bun:test";
 import {
+	collectUnicodeEscapeEvidence,
 	findUnnecessaryUnicodeEscape,
 	isCompleteJson,
 	parseJsonWithRepair,
 	parseStreamingJson,
 	repairJson,
+	unicodeEscapePathHash,
+	verifyUnicodeEscapeEvidence,
 } from "@gajae-code/ai/utils/json-parse";
 
 describe("JSON repair", () => {
@@ -66,10 +69,15 @@ describe("findUnnecessaryUnicodeEscape", () => {
 		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"\ude00 tail"}`)).toBeUndefined();
 	});
 
-	it("ignores literal UTF-8, required control escapes, and ASCII escapes", () => {
+	it("ignores literal UTF-8, required control escapes, and DEL", () => {
 		expect(findUnnecessaryUnicodeEscape('{"q":"병목 café 😀"}')).toBeUndefined();
 		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"a\u0000b\u001fc"}`)).toBeUndefined();
-		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"a\nb\"c\u0041"}`)).toBeUndefined();
+		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"a\nb\"c\u007f"}`)).toBeUndefined();
+	});
+
+	it("flags printable ASCII escapes because they can be one-nibble mutations of non-ASCII", () => {
+		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"\u0077"}`)).toBe(String.raw`\u0077`);
+		expect(findUnnecessaryUnicodeEscape(String.raw`{"q":"\u0026"}`)).toBe(String.raw`\u0026`);
 	});
 
 	it("ignores an escaped backslash followed by u — the source syntax of code being written", () => {
@@ -118,20 +126,108 @@ describe("findUnnecessaryUnicodeEscape", () => {
 		["stream cut mid `\\u`", '{"a":"x\\u', false],
 		["stream cut after a high surrogate", '{"a":"\\ud83d', false],
 		["high surrogate followed by a literal char", '{"a":"\\ud83d\uac00"}', false],
-		["high surrogate followed by a non-low escape", String.raw`{"a":"\ud83d\u0041"}`, false],
+		["high surrogate followed by a printable ASCII escape", String.raw`{"a":"\ud83d\u0041"}`, true],
 		["surrogates in the wrong order", String.raw`{"a":"\ude00\ud83d"}`, false],
 		["C1 control is still non-ASCII", String.raw`{"a":"\u0085"}`, true],
-		["DEL stays ASCII", String.raw`{"a":"\u007f"}`, false],
+		["DEL stays non-printing ASCII", String.raw`{"a":"\u007f"}`, false],
 		["U+0080 is the first flagged codepoint", String.raw`{"a":"\u0080"}`, true],
 		["uppercase hex digits", String.raw`{"a":"\uBCD1"}`, true],
 		["mixed-case hex digits", String.raw`{"a":"\uBcD1"}`, true],
-		["only ASCII escapes", String.raw`{"a":"\u0041\u007a\u0020"}`, false],
+		["printable ASCII escapes retain mutation evidence", String.raw`{"a":"\u0041\u007a\u0020"}`, true],
 		["no strings at all", "{}", false],
 		["bare numeric value", '{"a":123}', false],
 	];
 
 	it.each(redteam)("red team: %s", (_label, json, shouldFlag) => {
 		expect(findUnnecessaryUnicodeEscape(json) !== undefined).toBe(shouldFlag);
+	});
+
+	it("carries bounded payload-free positions and scalars through nested arrays and objects", () => {
+		const evidence = collectUnicodeEscapeEvidence(
+			String.raw`{"questions":[{"question":"a\u2014b\u0077"},{"question":"\u2014"}],"meta":{"note":"\u0026"}}`,
+		);
+		expect(evidence).toMatchObject({
+			positions: [
+				{
+					offset: 28,
+					codePoint: 0x2014,
+					pathHash: unicodeEscapePathHash(["questions", "question"]),
+					location: "value",
+				},
+				{
+					offset: 35,
+					codePoint: 0x77,
+					pathHash: unicodeEscapePathHash(["questions", "question"]),
+					location: "value",
+				},
+				{
+					offset: 57,
+					codePoint: 0x2014,
+					pathHash: unicodeEscapePathHash(["questions", "question"]),
+					location: "value",
+				},
+				{ offset: 83, codePoint: 0x26, pathHash: unicodeEscapePathHash(["meta", "note"]), location: "value" },
+			],
+			totalPositions: 4,
+			truncated: false,
+			malformed: false,
+		});
+		expect(evidence?.integrity).toMatch(/^[0-9a-f]{64}$/);
+		expect(evidence && verifyUnicodeEscapeEvidence(evidence)).toBe(true);
+		expect(JSON.stringify(evidence)).not.toContain("questions");
+		expect(JSON.stringify(evidence)).not.toContain("note");
+	});
+
+	it("retains duplicate escapes and marks escaped keys as structural", () => {
+		const evidence = collectUnicodeEscapeEvidence(String.raw`{"\u006b":"\u2014\u2014"}`);
+		expect(evidence?.positions.map(position => [position.codePoint, position.location])).toEqual([
+			[0x6b, "key"],
+			[0x2014, "value"],
+			[0x2014, "value"],
+		]);
+	});
+
+	it("fails closed without carrying partial positions when the raw JSON is malformed", () => {
+		expect(collectUnicodeEscapeEvidence(String.raw`{"q":"\u2014"`)).toMatchObject({
+			positions: [],
+			totalPositions: 0,
+			truncated: false,
+			malformed: true,
+		});
+	});
+
+	it("keeps dotted keys distinct from nested display paths", () => {
+		expect(unicodeEscapePathHash(["questions.question"])).not.toBe(unicodeEscapePathHash(["questions", "question"]));
+		const evidence = collectUnicodeEscapeEvidence(String.raw`{"questions.question":"\u2014"}`);
+		expect(evidence?.positions[0]?.pathHash).toBe(unicodeEscapePathHash(["questions.question"]));
+	});
+
+	it("fails closed on duplicate object members", () => {
+		const evidence = collectUnicodeEscapeEvidence(String.raw`{"question":"\u2014","question":"—"}`);
+		expect(evidence).toMatchObject({ positions: [], totalPositions: 0, truncated: false, malformed: true });
+	});
+
+	it("fails closed before recursive evidence traversal exceeds its depth bound", () => {
+		let raw = String.raw`"\u2014"`;
+		for (let depth = 0; depth < 66; depth++) raw = `{"nested":${raw}}`;
+		expect(collectUnicodeEscapeEvidence(raw)).toMatchObject({ malformed: true });
+	});
+
+	it("rejects partial or altered evidence envelopes", () => {
+		const evidence = collectUnicodeEscapeEvidence(String.raw`{"question":"\u2014\u2014"}`);
+		expect(evidence).toBeDefined();
+		if (!evidence) return;
+		expect(verifyUnicodeEscapeEvidence({ ...evidence, positions: evidence.positions.slice(0, 1) })).toBe(false);
+		expect(verifyUnicodeEscapeEvidence({ ...evidence, totalPositions: 1 })).toBe(false);
+	});
+
+	it("bounds retained positions and reports overflow", () => {
+		const evidence = collectUnicodeEscapeEvidence(
+			JSON.stringify({ q: "—" }).replace("—", String.raw`\u2014`.repeat(40)),
+		);
+		expect(evidence?.positions).toHaveLength(32);
+		expect(evidence?.totalPositions).toBe(40);
+		expect(evidence?.truncated).toBe(true);
 	});
 
 	it("scans a megabyte of literal UTF-8 without a per-character walk", () => {

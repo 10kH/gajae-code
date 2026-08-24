@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Tool-call parsing now preserves bounded, payload-free raw `\uXXXX` position/scalar evidence across provider adapters. Printable ASCII escapes are included because a one-nibble mutation can move an intended non-ASCII scalar into ASCII before decoded-value validation. Unambiguous path hashes, duplicate-key/depth rejection, total-position accounting, and a process-local integrity tag make partial, altered, malformed, or overflowed evidence explicitly fail-closed for the agent terminal guard (#4927).
 - Direct model selections now retry zero-token empty OpenAI-compatible responses.
 - OpenAI-compatible chat streams now replay an exact `finish_reason: "network_error"` only when no text, reasoning, refusal, or tool-call delta has been exposed. Retries honor `streamMaxRetries`, exponential backoff, caller cancellation, and managed-fallback ownership; failed-attempt usage, cost, response IDs, and partial chunks are discarded while terminal error wording remains compatible (#4918).
 

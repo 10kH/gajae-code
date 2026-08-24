@@ -31,7 +31,7 @@ import {
 } from "../types";
 import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
-import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import { collectUnicodeEscapeEvidence, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { areJsonValuesEqual } from "../utils/schema";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
@@ -915,14 +915,15 @@ export async function processResponsesStream<TApi extends Api>(
 							? "conflicting"
 							: "malformed"
 					: undefined;
-				const escapedNonAscii = findUnnecessaryUnicodeEscape(rawArguments) !== undefined;
+				const escapedUnicodeArgumentEvidence = collectUnicodeEscapeEvidence(rawArguments);
+				const escapedNonAscii = escapedUnicodeArgumentEvidence !== undefined;
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: args,
 					...(incompleteArguments ? { incompleteArguments: true, incompleteArgumentsReason } : {}),
-					...(escapedNonAscii ? { escapedNonAsciiArguments: true } : {}),
+					...(escapedNonAscii ? { escapedNonAsciiArguments: true, escapedUnicodeArgumentEvidence } : {}),
 				};
 				if (entry?.block.type === "toolCall") {
 					entry.block.id = toolCall.id;
@@ -930,6 +931,11 @@ export async function processResponsesStream<TApi extends Api>(
 					entry.block.arguments = args;
 					if (escapedNonAscii) entry.block.escapedNonAsciiArguments = true;
 					else delete entry.block.escapedNonAsciiArguments;
+					if (escapedUnicodeArgumentEvidence) {
+						entry.block.escapedUnicodeArgumentEvidence = escapedUnicodeArgumentEvidence;
+					} else {
+						delete entry.block.escapedUnicodeArgumentEvidence;
+					}
 					if (incompleteArguments) {
 						entry.block.incompleteArguments = true;
 						entry.block.incompleteArgumentsReason = incompleteArgumentsReason;

@@ -86,7 +86,20 @@ describe("Anthropic ASCII-escaped non-ASCII tool arguments", () => {
 
 		expect(tool?.arguments).toEqual({ question: "마지막 병목" });
 		expect(tool?.escapedNonAsciiArguments).toBe(true);
+		expect(tool?.escapedUnicodeArgumentEvidence).toMatchObject({ malformed: false, truncated: false });
+		expect(tool?.escapedUnicodeArgumentEvidence?.positions.map(position => position.codePoint)).toEqual([
+			0xb9c8, 0xc9c0, 0xb9c9, 0xbcd1, 0xbaa9,
+		]);
 		expect(tool && "partialJson" in tool).toBe(false);
+	});
+
+	it("retains printable ASCII escape evidence from a one-nibble landing", async () => {
+		const result = await run(script(String.raw`{"question":"\u0077 \u0026"}`));
+		const [tool] = toolCalls(result);
+
+		expect(tool?.arguments).toEqual({ question: "w &" });
+		expect(tool?.escapedNonAsciiArguments).toBe(true);
+		expect(tool?.escapedUnicodeArgumentEvidence?.positions.map(position => position.codePoint)).toEqual([0x77, 0x26]);
 	});
 
 	it("does not flag literal UTF-8 arguments", async () => {

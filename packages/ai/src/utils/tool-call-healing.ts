@@ -17,7 +17,7 @@
  * the end of a chunk is held back until the next chunk arrives.
  */
 
-import { findUnnecessaryUnicodeEscape, parseJsonWithRepair } from "./json-parse";
+import { collectUnicodeEscapeEvidence, parseJsonWithRepair, type UnicodeEscapeEvidence } from "./json-parse";
 
 const TOK_SECTION_BEGIN = "<|tool_calls_section_begin|>";
 const TOK_SECTION_END = "<|tool_calls_section_end|>";
@@ -41,6 +41,7 @@ export interface HealedToolCall {
 	 * evidence that the text is unverifiable.
 	 */
 	readonly escapedNonAsciiArguments: boolean;
+	readonly escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
 }
 
 /**
@@ -239,7 +240,8 @@ export class ToolCallHealer {
 
 		// Sample the raw payload first: the round-trip below decodes `\uXXXX` into
 		// literal characters, so checking `argsJson` afterwards always reports clean.
-		const escapedNonAsciiArguments = findUnnecessaryUnicodeEscape(rawArgs) !== undefined;
+		const escapedUnicodeArgumentEvidence = collectUnicodeEscapeEvidence(rawArgs);
+		const escapedNonAsciiArguments = escapedUnicodeArgumentEvidence !== undefined;
 
 		let argsJson = rawArgs;
 		if (rawArgs.length > 0) {
@@ -253,7 +255,13 @@ export class ToolCallHealer {
 			argsJson = "{}";
 		}
 
-		this.#completed.push({ id, name, arguments: argsJson, escapedNonAsciiArguments });
+		this.#completed.push({
+			id,
+			name,
+			arguments: argsJson,
+			escapedNonAsciiArguments,
+			...(escapedUnicodeArgumentEvidence ? { escapedUnicodeArgumentEvidence } : {}),
+		});
 		this.#inCall = false;
 		this.#inArgs = false;
 		this.#pendingId = "";

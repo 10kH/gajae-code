@@ -18,7 +18,12 @@ import { normalizeSystemPrompts } from "../utils";
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
-import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import {
+	captureUnicodeEscapeEvidence,
+	collectUnicodeEscapeEvidence,
+	isCompleteJson,
+	parseStreamingJson,
+} from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import {
@@ -361,9 +366,7 @@ function endToolCallBlock(stream: AssistantMessageEventStream, output: Assistant
 	if (toolCall.partialJson !== undefined) {
 		if (toolCall.partialJson.trim()) {
 			toolCall.arguments = parseStreamingJson<Record<string, unknown>>(toolCall.partialJson);
-			if (findUnnecessaryUnicodeEscape(toolCall.partialJson)) {
-				toolCall.escapedNonAsciiArguments = true;
-			}
+			captureUnicodeEscapeEvidence(toolCall, toolCall.partialJson);
 		}
 		delete toolCall.partialJson;
 	}
@@ -547,13 +550,16 @@ export const streamOllama: StreamFunction<"ollama-chat"> = (
 						const rawArgs = call.function?.arguments;
 						const unverifiableArguments = typeof rawArgs !== "string";
 						const partialJson = typeof rawArgs === "string" ? rawArgs : JSON.stringify(rawArgs ?? {});
+						const escapedUnicodeArgumentEvidence = collectUnicodeEscapeEvidence(partialJson);
 						const toolCall: InternalToolCallBlock = {
 							type: "toolCall",
 							id: `ollama:${output.content.length}:${name}`,
 							name,
 							arguments: parseStreamingJson<Record<string, unknown>>(partialJson),
 							partialJson,
-							...(findUnnecessaryUnicodeEscape(partialJson) ? { escapedNonAsciiArguments: true } : {}),
+							...(escapedUnicodeArgumentEvidence
+								? { escapedNonAsciiArguments: true, escapedUnicodeArgumentEvidence }
+								: {}),
 						};
 						if (unverifiableArguments) unverifiableArgumentToolCallIds.add(toolCall.id);
 						output.content.push(toolCall);
