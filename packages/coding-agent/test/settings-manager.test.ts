@@ -112,6 +112,32 @@ describe("Settings", () => {
 		expect(Settings.instance.getModelRole("image")).toBeUndefined();
 	});
 
+	it("keeps UI language operator-owned instead of workspace-controlled", async () => {
+		await writeSettings({ ui: { language: "ko" } });
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			YAML.stringify({ ui: { language: "en" } }, null, 2),
+		);
+		const globalWins = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(globalWins.get("ui.language")).toBe("ko");
+		} finally {
+			await globalWins.close();
+		}
+
+		await Bun.write(getConfigPath(), "{}\n");
+		await Bun.write(
+			path.join(getProjectAgentDir(projectDir), "config.yml"),
+			YAML.stringify({ ui: { language: "ko" } }, null, 2),
+		);
+		const projectIgnored = await Settings.loadForScope({ cwd: projectDir, agentDir });
+		try {
+			expect(projectIgnored.get("ui.language")).toBe("en");
+		} finally {
+			await projectIgnored.close();
+		}
+	});
+
 	it("does not close the global storage when an SDK scope is disposed", async () => {
 		const global = await Settings.init({ cwd: projectDir, agentDir });
 		const scoped = await Settings.loadForScope({ cwd: projectDir, agentDir });

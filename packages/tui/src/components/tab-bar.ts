@@ -50,15 +50,23 @@ export class TabBar implements Component {
 	#activeIndex: number = 0;
 	#theme: TabBarTheme;
 	#label: string;
+	#navigationHint: string;
 
 	/** Callback fired when the active tab changes */
 	onTabChange?: (tab: Tab, index: number) => void;
 
-	constructor(label: string, tabs: Tab[], theme: TabBarTheme, initialIndex: number = 0) {
+	constructor(
+		label: string,
+		tabs: Tab[],
+		theme: TabBarTheme,
+		initialIndex: number = 0,
+		navigationHint = "(tab to cycle)",
+	) {
 		this.#label = label;
 		this.#tabs = tabs;
 		this.#theme = theme;
 		this.#activeIndex = initialIndex;
+		this.#navigationHint = navigationHint;
 	}
 
 	/** Get the currently active tab */
@@ -134,7 +142,7 @@ export class TabBar implements Component {
 
 		// Navigation hint
 		chunks.push("  ");
-		chunks.push(this.#theme.hint("(tab to cycle)"));
+		chunks.push(this.#theme.hint(this.#navigationHint));
 
 		const lines: string[] = [];
 		let currentLine = "";

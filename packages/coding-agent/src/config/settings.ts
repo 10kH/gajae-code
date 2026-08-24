@@ -328,8 +328,8 @@ function getByPath(obj: RawSettings, segments: string[]): unknown {
 }
 
 const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
-/** Settings which authorize automatic network egress and must never be workspace-controlled. */
-const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>(["crashReport.upstream", "crashReport.upstreamDsn"]);
+/** Operator-owned settings which must never be workspace-controlled or runtime-overridden. */
+const GLOBAL_ONLY_SETTINGS = new Set<SettingPath>(["crashReport.upstream", "crashReport.upstreamDsn", "ui.language"]);
 const LEGACY_THEME_NAME_REPLACEMENTS = {
 	dark: "red-claw",
 	light: "blue-crab",
