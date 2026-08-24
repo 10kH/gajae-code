@@ -2985,6 +2985,7 @@ async function invocationHarness(
 		settings?: Settings;
 		/** Throw to inject a durable-write failure for matching transitions. */
 		persistInterceptor?: (transition: { type: string }) => void;
+		agentFailedWriteFailures?: number;
 	},
 ): Promise<InvocationHarness> {
 	const waiters = new Map<string, (frame: ResponseFrame) => void>();
@@ -2999,7 +3000,7 @@ async function invocationHarness(
 		sendUserMessage: hooks.sendUserMessage ?? (async () => {}),
 	} as unknown as ExtensionAPI;
 	const interceptorStore = hooks.persistInterceptor
-		? createInterceptorReconciliationStore(hooks.persistInterceptor)
+		? createInterceptorReconciliationStore(hooks.persistInterceptor, hooks.agentFailedWriteFailures)
 		: undefined;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
@@ -3076,8 +3077,9 @@ async function invocationHarness(
  * the intermediate failed-without-terminal state an agent_failed transition persists. */
 function createInterceptorReconciliationStore(
 	interceptor: (transition: { type: string }) => void,
+	agentFailedWriteFailures = 1,
 ): SdkOnlyReconciliationStore {
-	const failedOnce = new Set<string>();
+	const failureCounts = new Map<string, number>();
 	const backing = createInterceptorBackingStore();
 	return {
 		path: null,
@@ -3086,15 +3088,16 @@ function createInterceptorReconciliationStore(
 			const records = mutator(backing.records.map(record => ({ ...record })));
 			for (const record of records as Array<{ status?: string; terminalAt?: number; commandId?: string }>) {
 				// The intermediate durable state an agent_failed write produces:
-				// the reason is set but the row is not terminal yet. Fail only the
-				// FIRST such write per correlation so retries can succeed.
+				// the reason is set but the row is not terminal yet. Tests choose how
+				// many consecutive writes fail before the recovery replay succeeds.
 				const identity = String(record?.commandId ?? "unknown");
+				const failureCount = failureCounts.get(identity) ?? 0;
 				if (
 					record?.terminalAt === undefined &&
 					(record as { error?: unknown }).error !== undefined &&
-					!failedOnce.has(identity)
+					failureCount < agentFailedWriteFailures
 				) {
-					failedOnce.add(identity);
+					failureCounts.set(identity, failureCount + 1);
 					interceptor({ type: "agent_failed" });
 					throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
 				}
@@ -4111,7 +4114,7 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 		}
 	});
 
-	test("agent_end re-records a failed run's reason when the agent_failed write failed", async () => {
+	test("deadline recovery preserves a failed run reason when agent_failed and agent_end re-record writes fail", async () => {
 		// Exact-head review P1: a failed agent_failed write followed by a
 		// successful agent_end used to classify the run terminal_ok. The
 		// boundary now replays the sanitized reason first.
@@ -4133,12 +4136,14 @@ describe("accepted-control zero-execution bound (#4668)", () => {
 						throw Object.assign(new Error("injected persistence failure"), { code: "io_error" });
 					}
 				},
+				agentFailedWriteFailures: 2,
 			});
 			const submitted = await harness.control("turn.prompt", { text: "run", clientRef: "end-reason-ref" });
 			expect(submitted.ok).toBe(true);
 			await harness.emit("agent_start");
-			// First agent_failed write fails (interceptor); the deadline lease
-			// stays armed. Emit agent_end: the boundary re-records the reason.
+			// The first agent_failed write and the agent_end re-record both fail.
+			// The deadline owner must retain the sanitized reason and replay the
+			// compound reason+boundary transition after persistence recovers.
 			await harness.emit("agent_failed", {
 				error: Object.assign(new Error("provider exploded"), { code: "provider_unavailable" }),
 			});

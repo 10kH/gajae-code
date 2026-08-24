@@ -3307,16 +3307,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		try {
 			for (const invocation of transitions) {
 				try {
+					const reasonKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
+					const unrecorded = type === "agent_end" ? current.unrecordedFailureReasons?.get(reasonKey) : undefined;
 					if (type === "agent_end" && invocation.kind === "prompt")
-						current.deadlineManager.noteTerminalTransition(invocation.correlation);
+						current.deadlineManager.noteTerminalTransition(invocation.correlation, unrecorded);
 					if (type === "agent_end") {
 						// Compound recovery (exact-head review P1): if this run's
 						// agent_failed write failed, re-record the sanitized reason
 						// durably BEFORE the boundary so the terminal classification is
 						// failed, never terminal_ok. A failed re-record throws into the
 						// catch below and retains recovery ownership.
-						const reasonKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
-						const unrecorded = current.unrecordedFailureReasons?.get(reasonKey);
 						if (unrecorded !== undefined) {
 							await current.reconciliation.noteTransition(invocation.kind, invocation.correlation, {
 								type: "agent_failed",
