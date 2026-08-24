@@ -1636,26 +1636,23 @@ export class AcpAgent implements Agent {
 					MAX_PROMPT_FRAME_BYTES / 1024,
 				)} KiB transport limit. Attach a smaller or more compressed image.`,
 			);
-		let waiter!: PromptWaiter;
-		const response = new Promise<PromptResponse>((resolve, reject) => {
-			waiter = {
-				acknowledged: false,
-				dispatched: false,
-
-				boundary: record.inboundSequence,
-				correlation: {},
-				emittedAssistantText: "",
-				settled: false,
-				deferredFrames: [],
-				deferredActivityFrames: [],
-				lastFrameAt: this.#promptWatchdogClock.now(),
-				lastFrameType: "prompt_dispatch",
-				activity: new PromptActivity(),
-				resolve,
-				reject,
-			};
-			record.activePrompt = waiter;
-		});
+		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
+		const waiter: PromptWaiter = {
+			acknowledged: false,
+			dispatched: false,
+			boundary: record.inboundSequence,
+			correlation: {},
+			emittedAssistantText: "",
+			settled: false,
+			deferredFrames: [],
+			deferredActivityFrames: [],
+			lastFrameAt: this.#promptWatchdogClock.now(),
+			lastFrameType: "prompt_dispatch",
+			activity: new PromptActivity(),
+			resolve,
+			reject,
+		};
+		record.activePrompt = waiter;
 		// The watchdog may reject this waiter while the SDK acknowledgement request is still
 		// pending. Retain the original promise for the caller, but mark that delayed rejection
 		// as observed until prompt() can resume and await it.
