@@ -48,7 +48,9 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).toContain('^v\\d+\\.\\d+\\.\\d+-nightly\\.\\d+\\.\\d+\\.g[0-9a-f]+$');
 		expect(installer).toContain("Test-TrustedGithubUri");
 		expect(installer).toContain("Assert-OfficialGithubOrigins");
-		expect(installer).toContain("Join-Path $lockDir \"pid\"");
+		expect(installer).toContain('Join-Path $lockDir "claim"');
+		expect(installer).toContain("Refusing to replace symlink");
+		expect(installer).toContain("Copy-Item -Force -LiteralPath $OutPath");
 		expect(installer).toContain('throw "Unsupported architecture: x86');
 		expect(installer).toContain("PROCESSOR_ARCHITEW6432");
 		expect(installer).toContain("Test-StableReleaseTag");

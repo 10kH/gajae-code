@@ -477,33 +477,48 @@ function Install-Binary {
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $lockDir = Join-Path $InstallDir ".gjc-install.lock"
-    $lockPid = Join-Path $lockDir "pid"
+    $lockClaim = Join-Path $lockDir "claim"
+    $lockNonce = [guid]::NewGuid().ToString("N")
+    $lockLine = "$PID $lockNonce"
     try {
         New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
     } catch {
-        $owner = $null
-        if (Test-Path $lockPid) {
-            $owner = (Get-Content $lockPid -ErrorAction SilentlyContinue | Select-Object -First 1)
+        $ownerLine = $null
+        if (Test-Path $lockClaim) {
+            $ownerLine = (Get-Content $lockClaim -ErrorAction SilentlyContinue | Select-Object -First 1)
         }
+        $ownerPid = $null
+        if ($ownerLine) { $ownerPid = ($ownerLine -split '\s+')[0] }
         $alive = $false
-        if ($owner) {
+        if ($ownerPid) {
             try {
-                Get-Process -Id ([int]$owner) -ErrorAction Stop | Out-Null
+                Get-Process -Id ([int]$ownerPid) -ErrorAction Stop | Out-Null
                 $alive = $true
             } catch {}
         }
         if ($alive) {
-            throw "Another GJC installer is already running in $InstallDir (pid $owner, lock: $lockDir)."
+            throw "Another GJC installer is already running in $InstallDir (pid $ownerPid, lock: $lockDir)."
         }
-        Remove-Item -Recurse -Force $lockDir -ErrorAction SilentlyContinue
+        $still = $null
+        if (Test-Path $lockClaim) {
+            $still = (Get-Content $lockClaim -ErrorAction SilentlyContinue | Select-Object -First 1)
+        }
+        if ($still -eq $ownerLine) {
+            Remove-Item -Force $lockClaim -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $lockDir -ErrorAction SilentlyContinue
+        }
         New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
     }
-    Set-Content -Path $lockPid -Value $PID
+    Set-Content -Path $lockClaim -Value $lockLine
 
     $OutPath = Join-Path $InstallDir "gjc.exe"
     $DownloadTmp = Join-Path $InstallDir (".gjc.download." + [System.Guid]::NewGuid().ToString("N"))
     $BackupPath = Join-Path $InstallDir (".gjc.bak." + [System.Guid]::NewGuid().ToString("N"))
-    $hadExisting = Test-Path $OutPath
+    $existing = Get-Item -LiteralPath $OutPath -Force -ErrorAction SilentlyContinue
+    if ($existing -and $existing.LinkType) {
+        throw "Refusing to replace symlink $OutPath with a regular binary. Remove the symlink or set GJC_INSTALL_DIR."
+    }
+    $hadExisting = [bool]$existing
     try {
         $BinaryUrl = "$GithubReleases/$Latest/$BinaryName"
         Write-Host "Downloading $BinaryName..."
@@ -522,13 +537,13 @@ function Install-Binary {
         Assert-Checksum -Tag $Latest -AssetName $BinaryName -DownloadedPath $DownloadTmp
 
         if ($hadExisting) {
-            Move-Item -Force $OutPath $BackupPath
+            Copy-Item -Force -LiteralPath $OutPath -Destination $BackupPath
         }
         try {
             Move-Item -Force $DownloadTmp $OutPath
         } catch {
             if (Test-Path $BackupPath) {
-                Move-Item -Force $BackupPath $OutPath
+                Copy-Item -Force -LiteralPath $BackupPath -Destination $OutPath
                 Write-Host "Restored previous gjc binary at $OutPath"
             }
             throw "Failed to publish the downloaded binary. Existing install was preserved if one existed. $_"
@@ -538,7 +553,7 @@ function Install-Binary {
             Assert-InstalledBinary -ExePath $OutPath -ExpectedVersion $ExpectedVersion
         } catch {
             if (Test-Path $BackupPath) {
-                Move-Item -Force $BackupPath $OutPath
+                Copy-Item -Force -LiteralPath $BackupPath -Destination $OutPath
                 Write-Host "Restored previous gjc binary at $OutPath"
             } elseif (-not $hadExisting) {
                 Remove-Item -Force $OutPath -ErrorAction SilentlyContinue
@@ -573,7 +588,14 @@ function Install-Binary {
         }
     } finally {
         Remove-Item -Force $DownloadTmp -ErrorAction SilentlyContinue
-        Remove-Item -Recurse -Force $lockDir -ErrorAction SilentlyContinue
+        $still = $null
+        if (Test-Path $lockClaim) {
+            $still = (Get-Content $lockClaim -ErrorAction SilentlyContinue | Select-Object -First 1)
+        }
+        if ($still -eq $lockLine) {
+            Remove-Item -Force $lockClaim -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $lockDir -ErrorAction SilentlyContinue
+        }
     }
 }
 

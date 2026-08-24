@@ -366,7 +366,10 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain("tag ~ /-nightly\\.[0-9]+\\.[0-9]+\\.g[0-9a-f]+$/");
 		expect(installer).toContain("trusted_github_url");
 		expect(installer).toContain("require_official_github_origins");
-		expect(installer).toContain("${LOCK_DIR}/pid");
+		expect(installer).toContain("${LOCK_DIR}/claim");
+		expect(installer).not.toContain('Authorization: Bearer ${token}');
+		expect(installer).toContain('-H "@${hdr}"');
+		expect(installer).toContain("Refusing to replace symlink");
 		expect(installer).not.toContain('rm -rf "$lock"');
 		expect(installer).toContain("is_stable_release_tag");
 		expect(installer).toContain("Failed to publish the downloaded binary");
@@ -424,18 +427,20 @@ describe("install.sh binary-first contract", () => {
 		const lockDir = path.join(sandbox.installDir, ".gjc-install.lock");
 		fs.mkdirSync(lockDir, { recursive: true });
 		const sleeper = Bun.spawn(["sleep", "30"], { stdout: "ignore", stderr: "ignore" });
-		fs.writeFileSync(path.join(lockDir, "pid"), `${sleeper.pid}\n`);
+		const claim = `${sleeper.pid} foreign-nonce\n`;
+		fs.writeFileSync(path.join(lockDir, "claim"), claim);
 		try {
 			const result = await runInstaller([]);
 			expect(result.exitCode).not.toBe(0);
 			expect(result.stderr + result.stdout).toContain("Another GJC installer is already running");
 			expect(fs.existsSync(lockDir)).toBe(true);
-			expect(fs.readFileSync(path.join(lockDir, "pid"), "utf8").trim()).toBe(String(sleeper.pid));
+			expect(fs.readFileSync(path.join(lockDir, "claim"), "utf8")).toBe(claim);
 		} finally {
 			sleeper.kill();
 			await sleeper.exited;
 		}
 	});
+
 	test("reclaims a stale installer lock whose pid is dead", async () => {
 		const payload = fakeGjcScript({ version: VERSION });
 		writeCurlShim(sandbox.shimDir, {
@@ -446,10 +451,29 @@ describe("install.sh binary-first contract", () => {
 		});
 		const lockDir = path.join(sandbox.installDir, ".gjc-install.lock");
 		fs.mkdirSync(lockDir, { recursive: true });
-		fs.writeFileSync(path.join(lockDir, "pid"), "999999\n");
+		fs.writeFileSync(path.join(lockDir, "claim"), "999999 stale-nonce\n");
 		const result = await runInstaller([]);
 		expect(result.exitCode).toBe(0);
 		expect(fs.existsSync(lockDir)).toBe(false);
 		expect(fs.readFileSync(path.join(sandbox.installDir, "gjc"), "utf8")).toBe(payload);
+	});
+
+	test("refuses to replace a destination symlink", async () => {
+		const payload = fakeGjcScript({ version: VERSION });
+		writeCurlShim(sandbox.shimDir, {
+			assets: {
+				[hostBinaryName()]: payload,
+				"gajae-release-binaries.sha256": `${sha256(payload)}  ${hostBinaryName()}\n`,
+			},
+		});
+		const dest = path.join(sandbox.installDir, "gjc");
+		const real = path.join(sandbox.installDir, "real-gjc");
+		fs.writeFileSync(real, "managed\n");
+		fs.symlinkSync(real, dest);
+		const result = await runInstaller([]);
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("Refusing to replace symlink");
+		expect(fs.readFileSync(real, "utf8")).toBe("managed\n");
+		expect(fs.lstatSync(dest).isSymbolicLink()).toBe(true);
 	});
 });

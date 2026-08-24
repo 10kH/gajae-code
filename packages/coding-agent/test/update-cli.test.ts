@@ -877,6 +877,27 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
 	});
+	it("refuses to replace a destination symlink", async () => {
+		const dir = await makeTempDir();
+		const realPath = path.join(dir, "real");
+		const targetPath = path.join(dir, "gjc");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await Bun.write(realPath, "managed");
+		await fs.symlink(realPath, targetPath);
+		await Bun.write(tempPath, "new binary");
+		await expect(
+			replaceBinaryForUpdate({
+				targetPath,
+				tempPath,
+				backupPath,
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("Refusing to replace symlink");
+		expect(fsNode.lstatSync(targetPath).isSymbolicLink()).toBe(true);
+		expect(await Bun.file(realPath).text()).toBe("managed");
+	});
 	it("does not delete the live binary when backup copy fails", async () => {
 		const dir = await makeTempDir();
 		const targetPath = path.join(dir, "gjc");

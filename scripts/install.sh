@@ -31,6 +31,7 @@ CHANNEL="stable"
 REF=""
 TMP_FILES=""
 LOCK_DIR=""
+LOCK_NONCE=""
 BACKUP_PATH=""
 DEST_PATH=""
 SOURCE_CLONE_DIR=""
@@ -72,11 +73,12 @@ cleanup() {
     fi
     if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
         owner=""
-        if [ -f "${LOCK_DIR}/pid" ]; then
-            owner=$(tr -d ' \t\r\n' < "${LOCK_DIR}/pid")
+        nonce=""
+        if [ -f "${LOCK_DIR}/claim" ]; then
+            read owner nonce < "${LOCK_DIR}/claim" || true
         fi
-        if [ "$owner" = "$$" ]; then
-            rm -f "${LOCK_DIR}/pid"
+        if [ "$owner" = "$$" ] && [ -n "$LOCK_NONCE" ] && [ "$nonce" = "$LOCK_NONCE" ]; then
+            rm -f "${LOCK_DIR}/claim"
             rmdir "$LOCK_DIR" 2>/dev/null || true
         fi
     fi
@@ -158,16 +160,28 @@ require_official_github_origins() {
     fi
 }
 
+github_auth_header_file() {
+    token="$1"
+    hdr="${TMPDIR:-/tmp}/.gjc.curlhdr.$$"
+    remember_tmp "$hdr"
+    old_umask=$(umask)
+    umask 077
+    printf 'Authorization: Bearer %s\n' "$token" > "$hdr"
+    umask "$old_umask"
+    printf '%s' "$hdr"
+}
+
 curl_github() {
     url="$1"
     out="$2"
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
     if [ -n "$token" ] && trusted_github_url "$url"; then
+        hdr=$(github_auth_header_file "$token")
         curl -fsSL --retry 3 --retry-delay 1 \
             -A "gjc-install" \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            -H "Authorization: Bearer ${token}" \
+            -H "@${hdr}" \
             -o "$out" "$url"
     else
         curl -fsSL --retry 3 --retry-delay 1 \
@@ -183,10 +197,11 @@ curl_github_optional() {
     out="$2"
     token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
     if [ -n "$token" ] && trusted_github_url "$url"; then
+        hdr=$(github_auth_header_file "$token")
         curl -sSL --retry 2 --retry-delay 1 \
             -A "gjc-install" \
             -H "Accept: application/octet-stream" \
-            -H "Authorization: Bearer ${token}" \
+            -H "@${hdr}" \
             -o "$out" -w "%{http_code}" "$url"
     else
         curl -sSL --retry 2 --retry-delay 1 \
@@ -336,35 +351,42 @@ detect_platform() {
     BINARY="gjc-${PLATFORM}-${ARCH}"
 }
 
+write_lock_claim() {
+    LOCK_NONCE=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [ -n "$LOCK_NONCE" ] || LOCK_NONCE="$$.$RANDOM"
+    printf '%s %s\n' "$$" "$LOCK_NONCE" > "${LOCK_DIR}/claim"
+}
+
 acquire_lock() {
     lock="${INSTALL_DIR}/.gjc-install.lock"
     mkdir -p "$INSTALL_DIR"
     if mkdir "$lock" 2>/dev/null; then
         LOCK_DIR="$lock"
-        printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+        write_lock_claim
         return 0
     fi
     owner=""
-    if [ -f "${lock}/pid" ]; then
-        owner=$(tr -d ' \t\r\n' < "${lock}/pid")
+    nonce=""
+    if [ -f "${lock}/claim" ]; then
+        read owner nonce < "${lock}/claim" || true
     fi
     if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
         die "Another GJC installer is already running in ${INSTALL_DIR} (pid ${owner}, lock: ${lock})."
     fi
-    # Stale takeover: remove only the observed dead pid, then mkdir exclusively.
-    # Never rm -rf a lock directory that another process may have just acquired.
-    if [ -n "$owner" ] && [ -f "${lock}/pid" ]; then
-        current=$(tr -d ' \t\r\n' < "${lock}/pid")
-        if [ "$current" = "$owner" ]; then
-            rm -f "${lock}/pid"
+    if [ -n "$owner" ] && [ -f "${lock}/claim" ]; then
+        current_owner=""
+        current_nonce=""
+        read current_owner current_nonce < "${lock}/claim" || true
+        if [ "$current_owner" = "$owner" ] && [ "$current_nonce" = "$nonce" ]; then
+            rm -f "${lock}/claim"
             rmdir "$lock" 2>/dev/null || true
         fi
-    elif [ ! -f "${lock}/pid" ]; then
+    elif [ ! -f "${lock}/claim" ]; then
         rmdir "$lock" 2>/dev/null || true
     fi
     if mkdir "$lock" 2>/dev/null; then
         LOCK_DIR="$lock"
-        printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+        write_lock_claim
         return 0
     fi
     die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${lock})."
@@ -574,6 +596,10 @@ install_binary() {
 
     verify_checksum "$BINARY" "$DOWNLOAD_TMP"
     chmod +x "$DOWNLOAD_TMP"
+
+    if [ -h "$DEST_PATH" ]; then
+        die "Refusing to replace symlink ${DEST_PATH} with a regular binary. Remove the symlink or set GJC_INSTALL_DIR."
+    fi
 
     if [ -e "$DEST_PATH" ]; then
         cp -f "$DEST_PATH" "$BACKUP_PATH"
