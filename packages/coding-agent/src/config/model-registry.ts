@@ -2767,12 +2767,17 @@ export class ModelRegistry {
 		for (let i = 0; i < standardProviderDescriptors.length; i++) {
 			const descriptor = standardProviderDescriptors[i];
 			const { apiKey, authGeneration } = standardProviderCredentials[i];
+			const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId);
+			const allowsKeylessDiscovery =
+				descriptor.allowUnauthenticated &&
+				(descriptor.providerId !== "vllm" ||
+					baseUrl === undefined ||
+					resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl);
 			if (
 				authGeneration !== undefined &&
 				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId, apiKey) &&
-				(isAuthenticated(apiKey) || descriptor.allowUnauthenticated)
+				(isAuthenticated(apiKey) || allowsKeylessDiscovery)
 			) {
-				const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId);
 				options.push({
 					options: descriptor.createModelManagerOptions({
 						apiKey: isAuthenticated(apiKey) ? apiKey : undefined,
