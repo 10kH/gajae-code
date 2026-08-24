@@ -953,7 +953,7 @@ export async function runBinaryUpdateFlow(
 }
 
 async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {
-	const lockFile = `${targetPath}.update-lock`;
+	const lockFile = path.join(path.dirname(targetPath), ".gjc-install.lock");
 	const nonce = `${process.pid}.${Date.now().toString(16)}.${Math.random().toString(16).slice(2)}`;
 	const claim = `${process.pid} ${nonce}\n`;
 	const publish = async (): Promise<void> => {

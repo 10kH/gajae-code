@@ -475,14 +475,7 @@ verify_checksum() {
         die "Integrity asset ${BINARY_MANIFEST_ASSET} returned HTTP ${http_code}. Existing install was not changed."
     fi
 
-    case "$LATEST" in
-        v0.15.0)
-            echo "No checksum asset on ${LATEST}; continuing with size, --version, and --smoke-test verification."
-            ;;
-        *)
-            die "Release ${LATEST} has no checksum assets. Existing install was not changed."
-            ;;
-    esac
+    die "Release ${LATEST} has no checksum assets. Existing install was not changed."
 }
 
 restore_backup() {

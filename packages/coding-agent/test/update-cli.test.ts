@@ -834,6 +834,14 @@ describe("update-cli managed notification recovery", () => {
 	});
 });
 
+describe("update-cli install lock", () => {
+	it("locks the same file the POSIX installer uses", async () => {
+		const source = await Bun.file(path.resolve(import.meta.dir, "../src/cli/update-cli.ts")).text();
+		expect(source).toContain(".gjc-install.lock");
+		expect(source).not.toContain(".update-lock");
+	});
+});
+
 describe("update-cli binary replacement", () => {
 	it("restores the previous binary when the replacement fails verification", async () => {
 		const dir = await makeTempDir();

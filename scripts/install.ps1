@@ -364,11 +364,7 @@ function Assert-Checksum {
             if ($_.Exception.Message -match "Checksum mismatch|invalid checksum|did not list") { throw }
             $status = Get-WebExceptionStatus $_
             if ($status -eq 404 -and $sumsMissing) {
-                if ($Tag -ne "v0.15.0") {
-                    throw "Release $Tag has no checksum assets. Existing install was not changed."
-                }
-                Write-Host "No checksum asset on $Tag; continuing with size, --version, and --smoke-test verification."
-                return
+                throw "Release $Tag has no checksum assets. Existing install was not changed."
             }
             throw "Integrity asset $BinaryManifestAsset could not be fetched (HTTP $status): $_. Existing install was not changed."
         }

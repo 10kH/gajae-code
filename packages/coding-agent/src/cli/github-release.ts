@@ -231,10 +231,5 @@ export async function verifyDownloadedBinaryChecksum(options: {
 		}
 		return "verified";
 	}
-	const version = versionFromTag(options.tag);
-	if (version === "0.15.0") {
-		// The last published release before checksum assets. Later tags must ship integrity files.
-		return "absent";
-	}
 	throw new Error(`Release ${options.tag} has no checksum assets; refusing to install an unsigned binary`);
 }

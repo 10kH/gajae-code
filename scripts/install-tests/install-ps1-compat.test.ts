@@ -52,6 +52,7 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).toContain("Refusing to replace symlink");
 		expect(installer).toContain("FileAttributes]::ReparsePoint");
 		expect(installer).toContain("-UseBasicParsing");
+		expect(installer).not.toContain('No checksum asset on $Tag');
 		expect(installer).toContain('$env:Path = "$InstallDir;"');
 		expect(installer).toContain("Copy-Item -Force -LiteralPath $OutPath");
 		expect(installer).toContain('throw "Unsupported architecture: x86');

@@ -372,6 +372,8 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain("could not identify glibc");
 		expect(installer).toContain("leftover lock file");
 		expect(installer).toContain('cp -p "$DEST_PATH" "$BACKUP_PATH"');
+		expect(installer).not.toContain("No checksum asset on");
+		expect(installer).toContain("has no checksum assets");
 		expect(installer).toContain("mktemp");
 		expect(installer).not.toContain('Authorization: Bearer ${token}');
 		expect(installer).toContain('-H "@${AUTH_HDR}"');

@@ -25,7 +25,7 @@ Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo
 powershell -File gjc-install.ps1
 ```
 
-The installer downloads the current platform's GitHub release asset, verifies HTTP success, non-empty bytes, checksums when the release publishes them, then runs `--version` and `--smoke-test`. A failed download or verification never replaces a working existing `gjc`.
+The installer downloads the current platform's GitHub release asset, verifies HTTP success, non-empty bytes, and published SHA-256 checksums, then runs `--version` and `--smoke-test`. A failed download or verification never replaces a working existing `gjc`. Version discovery uses GitHub only (`https://api.github.com` and `https://github.com/<repo>/releases/download`); firewalled or mirrored registries are not used. Offline/source workflows use `--source` with an existing Bun.
 
 Unix default location: `~/.local/bin/gjc` (`GJC_INSTALL_DIR` overrides).
 Windows default location: `%LOCALAPPDATA%\gjc\gjc.exe`.
