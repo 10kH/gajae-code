@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added frictionless interactive onboarding for unresolved users and `/tutorial`. GJC now performs bounded, local metadata discovery across known coding-agent roots, requires corroborating activity within 90 days before inferring a workflow, falls back to manual guidance when evidence is insufficient, persists only a derived profile and completion decision, discloses unavailable sources, and previews the guided migration result before a single explicit apply or experienced-user skip.
+
 ### Changed
 
 - The five `macOS Local (oMLX)` presets are retuned from same-machine throughput measurements (#4871). All presets now use one role-effort ladder — critic and architect `high`, planner `medium`, executor and default `low` — and pick each preset's model by measured local throughput: `fast` keeps the 4-bit and `balanced` the 8-bit Qwen 3.6 35B A3B MoE quants (93.5 / 71.1 tok/s measured), `quality` keeps the 8-bit MoE for default/executor/planner/architect and routes only the critic to the official dense `Qwen3.8-27B-8bit` checkpoint (public SWE-bench/agent scores still favor dense for criticism), and both `abliterated` presets move to the faster `Qwen3.8-27B-Uncensored-MLX-4bit` (19.8 tok/s measured, ahead of the Abliterated 4-bit/6-bit quants on every measured axis). Preset display names now state the measured throughput instead of the memory-tier hints.
