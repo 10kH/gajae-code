@@ -514,6 +514,7 @@ function handleToolUseEvent(
 		if (typeof toolEvent.input === "string") captureUnicodeEscapeEvidence(toolCall, inputStr);
 
 		const newBlock: Block = { ...toolCall, index: blocks.length };
+		if (typeof toolEvent.input === "string") captureUnicodeEscapeEvidence(newBlock, inputStr);
 		blocks.push(newBlock);
 		stream.push({ type: "toolcall_end", contentIndex: newBlock.index!, toolCall, partial: output });
 		return;

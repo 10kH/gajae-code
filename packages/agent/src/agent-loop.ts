@@ -3784,12 +3784,16 @@ async function runLoopBody(
 				}
 				continue;
 			}
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				stripUnicodeEscapeEvidence(message);
+			}
 			escapedNonAsciiResampleAttempt = 0;
 			escapedNonAsciiToolChoiceCaptured = false;
 			escapedNonAsciiToolChoice = undefined;
 
 			const overflow = managedContextOverflow(message, config);
 			if (config.fallbackManaged && overflow) {
+				stripUnicodeEscapeEvidence(message);
 				transaction?.discard();
 				currentContext.messages.splice(contextMessageCount);
 				newMessages.splice(newMessageCount);
@@ -3867,6 +3871,7 @@ async function runLoopBody(
 				await config.onManagedAttemptAccepted?.();
 			}
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				stripUnicodeEscapeEvidence(message);
 				// Create placeholder tool results for any tool calls in the aborted message
 				// This maintains the tool_use/tool_result pairing that the API requires
 				type ToolCallContent = Extract<AssistantMessage["content"][number], { type: "toolCall" }>;

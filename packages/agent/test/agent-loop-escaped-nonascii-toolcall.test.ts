@@ -1092,6 +1092,53 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(replayRequest?.some(message => message.role === "assistant")).toBe(false);
 	});
 
+	it("strips transient evidence from managed retryable terminal failures", async () => {
+		const evidence = escapeEvidence(String.raw`{"question":"\u0077"}`);
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tc-managed-terminal",
+							name: "ask",
+							arguments: { question: "w" },
+							escapedUnicodeArgumentEvidence: evidence,
+						},
+					],
+					stopReason: "error",
+					transportFailure: { kind: "transport", status: 503 },
+				},
+			],
+		});
+		const outcomes: ManagedAttemptOutcome[] = [];
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool([])] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				fallbackManaged: true,
+				onManagedAttemptOutcome: outcome => {
+					outcomes.push(outcome);
+					return { type: "terminal", terminal: { stopReason: "error" } };
+				},
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+
+		expect(outcomes).toHaveLength(1);
+		expect(outcomes[0]?.type).toBe("retryable_discarded");
+		if (outcomes[0]?.type === "retryable_discarded") {
+			const call = outcomes[0].failure.message.content.find(block => block.type === "toolCall");
+			expect(call?.type === "toolCall" ? call.escapedUnicodeArgumentEvidence : undefined).toBeUndefined();
+		}
+	});
+
 	it("keeps managed fallback guarded when carried evidence cannot be reconstructed", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
