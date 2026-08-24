@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Mouse selection now supports double-click word select and triple-click line select. Enabling GJC's own mouse capture previously removed the terminal's native word/line selection without replacing it: SGR mouse reports carry no click counter, so the TUI only ever saw single presses and drags. Repeat presses on the same cell within `DEFAULT_MULTI_CLICK_INTERVAL_MS` (400ms) now escalate char -> word -> line, a fourth press stays on line rather than cycling back, and any wheel notch, different cell, or expired window restarts at char. A word/line press is a complete selection, so it paints and copies on release without needing a drag; a plain single click still copies nothing. Dragging after a double or triple click extends by whole words or rows in either direction, pivoting on the anchor span instead of collapsing it. Word bounds use the xterm `wordSeparator` set, so a path stays intact and a click on whitespace selects the whitespace run, and all ranges are measured in grapheme-aligned columns so wide CJK and emoji cells are never split. `TUI`'s new `multiClickIntervalMs` option overrides the window; `0` disables escalation entirely.
+
 ## [0.15.0] - 2026-08-22
 
 ### Fixed
