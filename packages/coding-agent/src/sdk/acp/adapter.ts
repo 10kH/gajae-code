@@ -239,6 +239,19 @@ export class AcpSdkAdapter {
 		if (!attachment.isCurrent()) throw new SessionRouterError("pre_send", "SDK session attachment is stale.");
 		await this.#activateProviders();
 	}
+	/**
+	 * Re-register reverse providers on a live attachment without aborting in-flight
+	 * reverse RPCs. ACP session reuse and expired-lease recovery take this path
+	 * because `#providersActivated` otherwise leaves a dead permission lease in
+	 * place for the life of the session (#4909).
+	 */
+	async ensureProviders(): Promise<void> {
+		if (this.#closed || this.#providers.length === 0) return;
+		if (this.#providerActivation) await this.#providerActivation;
+		if (this.#closed) return;
+		this.#providersActivated = false;
+		await this.#activateProviders();
+	}
 
 	acceptFrame(frame: Record<string, unknown>): void {
 		void this.#onFrame(frame);
@@ -632,7 +645,7 @@ export class AcpSdkAdapter {
 			for (const leaseId of this.#leases.values()) await this.#sendLeaseHeartbeat(leaseId);
 		} catch (error) {
 			if (error instanceof SessionRouterError && error.phase === "pre_send") return;
-			this.#reportReconnectFailure(error);
+			this.#rebindExpiredProviders();
 		}
 	}
 
@@ -652,6 +665,11 @@ export class AcpSdkAdapter {
 			typeof frame.id === "string"
 		) {
 			this.#cancelReverse(frame.id);
+			return;
+		}
+
+		if (this.#expiredOwnedLeaseFrame(frame)) {
+			this.#rebindExpiredProviders();
 			return;
 		}
 
@@ -723,6 +741,24 @@ export class AcpSdkAdapter {
 			this.#connectionId === connectionId &&
 			this.#leases.get(capability) === leaseId
 		);
+	}
+
+	#ownsLeaseId(leaseId: string): boolean {
+		for (const id of this.#leases.values()) if (id === leaseId) return true;
+		return false;
+	}
+
+	#expiredOwnedLeaseFrame(frame: Record<string, unknown>): boolean {
+		if (frame.type !== "reverse_response" || frame.ok !== false) return false;
+		const leaseId = typeof frame.leaseId === "string" ? frame.leaseId : "";
+		if (!leaseId || !this.#ownsLeaseId(leaseId)) return false;
+		const code = object(frame.error)?.code;
+		return code === "lease_expired" || code === "not_lease_owner";
+	}
+
+	#rebindExpiredProviders(): void {
+		this.#providersActivated = false;
+		void this.#activateProviders().catch(error => this.#reportReconnectFailure(error));
 	}
 
 	#canRespondToReverse(

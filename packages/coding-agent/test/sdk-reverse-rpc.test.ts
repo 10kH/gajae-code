@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { MAX_REVERSE_PAYLOAD_BYTES, ReverseLeaseError, ReverseLeaseRuntime } from "../src/sdk/host";
+import {
+	MAX_REVERSE_PAYLOAD_BYTES,
+	REVERSE_RECLAIM_GRACE_MS,
+	ReverseLeaseError,
+	ReverseLeaseRuntime,
+} from "../src/sdk/host";
 
 describe("directed reverse RPC leases", () => {
 	test("bootstraps atomically, conflicts, reclaims, and hands off", () => {
@@ -314,6 +319,39 @@ describe("directed reverse RPC leases", () => {
 		const replacement = runtime.registerProvider("next", "ui", [{ name: "confirm" }]);
 		expect(replacement.connectionId).toBe("next");
 		expect(runtime.getInstalledDefinitions("ui")).toEqual([{ name: "confirm" }]);
+		runtime.dispose();
+	});
+
+	test("same connection rebinds permission after disconnect and after reclaim grace (#4909)", () => {
+		let now = 0;
+		const removed: string[] = [];
+		const runtime = new ReverseLeaseRuntime({
+			now: () => now,
+			sendFrame: () => {},
+			onDefinitionsRemoved: capability => removed.push(capability),
+		});
+		const lease = runtime.registerProvider("acp", "permission", []);
+		expect(runtime.getInstalledDefinitions("permission")).toEqual([]);
+		expect(() => runtime.registerProvider("intruder", "permission", [])).toThrow("provider_lease_conflict");
+		runtime.disconnect("acp");
+		expect(runtime.getLease("permission")).toBeUndefined();
+		expect(removed).toEqual(["permission"]);
+		const rebound = runtime.registerProvider("acp", "permission", [], lease.leaseId);
+		expect(rebound).toMatchObject({
+			leaseId: lease.leaseId,
+			connectionId: "acp",
+			active: true,
+		});
+		expect(runtime.getInstalledDefinitions("permission")).toEqual([]);
+		expect(() => runtime.registerProvider("intruder", "permission", [])).toThrow("provider_lease_conflict");
+		runtime.disconnect("acp");
+		now += REVERSE_RECLAIM_GRACE_MS + 1;
+		expect(() => runtime.heartbeat("acp", lease.leaseId)).toThrow("lease_expired");
+		const afterGrace = runtime.registerProvider("acp", "permission", [], lease.leaseId);
+		expect(afterGrace.connectionId).toBe("acp");
+		expect(afterGrace.active).toBe(true);
+		expect(runtime.getInstalledDefinitions("permission")).toEqual([]);
+		expect(() => runtime.registerProvider("intruder", "permission", [])).toThrow("provider_lease_conflict");
 		runtime.dispose();
 	});
 });

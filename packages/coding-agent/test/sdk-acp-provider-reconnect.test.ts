@@ -122,3 +122,116 @@ test("Broker lifecycle client cannot activate per-session providers", async () =
 	await expect(adapter.start()).rejects.toMatchObject({ code: "operation_prohibited" });
 	await adapter.close();
 });
+
+test("ACP provider readiness rebinds expired reverse leases on the live attachment (#4909)", async () => {
+	const registrations: Record<string, unknown>[] = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations.push(frame);
+				return {
+					ok: true,
+					result: { leaseId: typeof frame.expectedLeaseId === "string" ? frame.expectedLeaseId : "lease-1" },
+				};
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await adapter.start();
+		expect(registrations).toHaveLength(1);
+		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
+		await adapter.ensureProviders();
+		expect(registrations).toHaveLength(2);
+		expect(registrations[1]).toMatchObject({
+			type: "register_provider",
+			capability: "permission",
+			expectedLeaseId: "lease-1",
+		});
+		adapter.acceptFrame({
+			type: "reverse_response",
+			id: "",
+			connectionId: "router-connection-1",
+			leaseId: "lease-1",
+			ok: false,
+			error: { code: "lease_expired", message: "Lease expired." },
+		});
+		await waitFor(() => registrations.length === 3, "permission rebind after lease_expired");
+		expect(registrations[2]).toMatchObject({
+			type: "register_provider",
+			capability: "permission",
+			expectedLeaseId: "lease-1",
+		});
+	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP lease rebind does not abort in-flight reverse permission requests (#4909)", async () => {
+	const registrations: Record<string, unknown>[] = [];
+	const { promise: permissionStarted, resolve: resolvePermissionStarted } = Promise.withResolvers<
+		AbortSignal | undefined
+	>();
+	const { promise: permissionGate, resolve: resolvePermissionGate } = Promise.withResolvers<void>();
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		connectionId: "router-connection-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations.push(frame);
+				return { ok: true, result: { leaseId: "lease-1" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		connection: {
+			request: async (
+				_method: string,
+				_params: Record<string, unknown>,
+				options?: { cancellationSignal?: AbortSignal },
+			) => {
+				resolvePermissionStarted(options?.cancellationSignal);
+				await permissionGate;
+				return { outcome: "selected", optionId: "allow_once" };
+			},
+		},
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await adapter.start();
+		adapter.acceptFrame({
+			type: "reverse_request",
+			id: "perm-1",
+			connectionId: "router-connection-1",
+			capability: "permission",
+			leaseId: "lease-1",
+			payload: { method: "request", payload: { toolCall: { toolName: "bash" } } },
+		});
+		const signal = await permissionStarted;
+		expect(signal?.aborted).toBe(false);
+		await adapter.ensureProviders();
+		expect(registrations.length).toBeGreaterThanOrEqual(2);
+		expect(signal?.aborted).toBe(false);
+		resolvePermissionGate();
+	} finally {
+		resolvePermissionGate();
+		await adapter.close();
+	}
+});

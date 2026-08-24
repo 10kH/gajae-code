@@ -1589,6 +1589,8 @@ export class AcpAgent implements Agent {
 		if (!record) throw new AcpSdkAdapterError("not_found", `Unknown session, not found: ${params.sessionId}`);
 		if (record.activePrompt) throw new AcpSdkAdapterError("conflict", "ACP session already has an active prompt.");
 		if (record.authFailure) throw new AcpSdkAdapterError("authentication_failed", record.authFailure);
+		await record.adapter.ensureProviders();
+
 		// A new turn starts uncancelled; a stale flag must never settle it as `cancelled`.
 		record.cancelRequested = false;
 		const payload = acpPromptPayload(params.prompt);
@@ -2060,6 +2062,7 @@ export class AcpAgent implements Agent {
 			// session host remains authoritative for its immutable configuration, so
 			// attachment must not reinterpret the replay as a mutation request.
 			this.#pendingDeleteLocators.delete(id);
+			await attached.adapter.ensureProviders();
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -2143,6 +2146,7 @@ export class AcpAgent implements Agent {
 		if (existing) {
 			if (path.resolve(existing.cwd) !== path.resolve(cwd))
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			await existing.adapter.ensureProviders();
 			return;
 		}
 		const attaching = this.#attaching.get(id);
