@@ -569,12 +569,20 @@ export function settleProcessRestart(
 			return record;
 		}
 		if (record.pendingOutcome !== undefined || record.kind === "prompt") {
-			const outcome: SdkPromptTerminalOutcome = record.pendingOutcome ?? {
-				kind: "failed",
-				code: "prompt_failed",
-				message: "Prompt did not complete before process restart.",
-				provenance: "agent_failed",
-			};
+			const outcome: SdkPromptTerminalOutcome =
+				record.error !== undefined && record.pendingOutcome?.kind !== "failed"
+					? {
+							kind: "failed",
+							code: "prompt_failed",
+							message: record.error.message,
+							provenance: "agent_failed",
+						}
+					: (record.pendingOutcome ?? {
+							kind: "failed",
+							code: "prompt_failed",
+							message: "Prompt did not complete before process restart.",
+							provenance: "agent_failed",
+						});
 			return {
 				...record,
 				status: outcome.kind === "stopped" ? "terminal_ok" : "failed",

@@ -57,6 +57,7 @@ import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
+import type { AgentSessionEvent } from "../../session/agent-session";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
 	buildToolCallStartUpdate,
@@ -2819,28 +2820,32 @@ export class AcpAgent implements Agent {
 		) {
 			record.toolArgs.set(toolCallId, event.args);
 		}
-		if (wirePayload) {
-			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, {
-				cwd: record.cwd,
-				getToolArgs: id => record.toolArgs.get(id),
-				getMessageProgress: message => {
-					if (!object(message)) return undefined;
-					if (promptOwner) {
-						promptOwner.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
-						return promptOwner.messageProgress;
-					}
-					record.sessionMessageProgress ??= { textEmitted: false, thoughtEmitted: false };
-					return record.sessionMessageProgress;
-				},
-			})) {
-				if (
-					promptOwner &&
-					notification.update.sessionUpdate === "agent_message_chunk" &&
-					notification.update.content.type === "text"
-				)
-					promptOwner.emittedAssistantText += notification.update.content.text;
-				await this.#publishSessionUpdate(id, notification, adapter);
-			}
+		const mapperOptions = {
+			cwd: record.cwd,
+			getToolArgs: (id: string) => record.toolArgs.get(id),
+			getMessageProgress: (message: unknown) => {
+				if (!object(message)) return undefined;
+				if (promptOwner) {
+					promptOwner.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
+					return promptOwner.messageProgress;
+				}
+				record.sessionMessageProgress ??= { textEmitted: false, thoughtEmitted: false };
+				return record.sessionMessageProgress;
+			},
+		};
+		const notifications = wirePayload
+			? mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, mapperOptions)
+			: event.type === "agent_failed" && object(event.error)
+				? mapAgentSessionEventToAcpSessionUpdates(event as unknown as AgentSessionEvent, id, mapperOptions)
+				: [];
+		for (const notification of notifications) {
+			if (
+				promptOwner &&
+				notification.update.sessionUpdate === "agent_message_chunk" &&
+				notification.update.content.type === "text"
+			)
+				promptOwner.emittedAssistantText += notification.update.content.text;
+			await this.#publishSessionUpdate(id, notification, adapter);
 		}
 		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
 		if (event.type === "agent_start") {

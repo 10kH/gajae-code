@@ -110,6 +110,37 @@ describe("reconciliation-store", () => {
 		expect(settled[3]).toEqual(input[3]);
 	});
 
+	test("process restart preserves agent_failed precedence over a pending stopped outcome", () => {
+		const [settled] = settleProcessRestart(
+			[
+				{
+					kind: "prompt",
+					commandId: "failed-command",
+					turnId: "failed-turn",
+					status: "in_flight",
+					acceptedAt: 1,
+					startedAt: 2,
+					pendingOutcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
+					pendingReceiptState: "missing",
+					error: { code: "provider_unavailable", message: "Agent run failed." },
+				},
+			],
+			100,
+		);
+
+		expect(settled).toMatchObject({
+			status: "failed",
+			terminalAt: 100,
+			outcome: {
+				kind: "failed",
+				code: "prompt_failed",
+				message: "Agent run failed.",
+				provenance: "agent_failed",
+			},
+			error: { code: "prompt_failed", message: "Agent run failed." },
+		});
+	});
+
 	test("transact persists and reload settles a non-terminal prompt with its normalized outcome", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "recon-store-"));
 		const sessionFile = path.join(root, "sess.jsonl");

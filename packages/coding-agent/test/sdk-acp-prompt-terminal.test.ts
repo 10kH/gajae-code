@@ -400,7 +400,22 @@ test("ACP defers end-of-turn advisory updates until agent_end after diagnostic a
 		const pending = prompt(fixture, "diagnostic before terminal");
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendDiagnostic();
-		await Bun.sleep(20);
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "session_info_update" &&
+						(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true,
+				),
+			"diagnostic failure metadata",
+		);
+		expect(
+			fixture.updates.filter(
+				update =>
+					update.update.sessionUpdate === "session_info_update" &&
+					(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true,
+			),
+		).toHaveLength(1);
 		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore);
 		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore);
 		expect(idlePhaseUpdates(fixture.updates)).toBe(idleUpdatesBefore);
