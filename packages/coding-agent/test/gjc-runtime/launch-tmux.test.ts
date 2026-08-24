@@ -41,6 +41,7 @@ import {
 	removeGjcTmuxSession,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-sessions";
 import { postmortem } from "@gajae-code/utils";
+import { SessionStateLockTestHooks } from "../../src/gjc-runtime/session-state-lock";
 
 function args(overrides: Partial<Args> = {}): Args {
 	return {
@@ -3889,7 +3890,13 @@ describe("tmux owner isolation launch gate", () => {
 		const runtimeRoot = path.join(root, "runtime");
 		const ownerRoot = path.join(root, "owner-lifecycle");
 		const previousPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+		const previousOwnerHostId = SessionStateLockTestHooks.ownerHostId;
 		try {
+			// This test changes process.platform only to exercise the portable Darwin
+			// owner-verdict branch. Keep the unrelated state-lock host identity stable;
+			// otherwise Linux CI tries to resolve a Darwin installation identity and
+			// fails before the behavior under test can persist its fail-closed verdict.
+			SessionStateLockTestHooks.ownerHostId = () => "darwin-owner-finalization-test-host";
 			Object.defineProperty(process, "platform", { configurable: true, value: "darwin" });
 			await persistCoordinatorRuntimeStateFromPostmortem(postmortem.Reason.EXIT, {
 				sessionId: "portable-owner",
@@ -3906,6 +3913,7 @@ describe("tmux owner isolation launch gate", () => {
 			expect(payload.event).toBe("owner_terminal");
 			expect(payload.reason).toBe("owner_verdict_unavailable");
 		} finally {
+			SessionStateLockTestHooks.ownerHostId = previousOwnerHostId;
 			if (previousPlatform) Object.defineProperty(process, "platform", previousPlatform);
 			fs.rmSync(root, { recursive: true, force: true });
 		}
