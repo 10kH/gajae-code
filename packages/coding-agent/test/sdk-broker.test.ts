@@ -235,6 +235,20 @@ it("treats explicit broker env as a complete allowlist and still scrubs runtime 
 	expect(environment.AMBIENT_SENTINEL).toBeUndefined();
 });
 
+it("never lets the master capability cross into a cold-started broker", () => {
+	const command = resolveSdkInternalSpawnCommandForTest("broker-internal", {});
+	// A broker cold-started from the master's own Bash environment would otherwise
+	// inherit the transient capability and hand it to every substrate child.
+	const environment = brokerSpawnEnvironmentForTest(command, {
+		PATH: process.env.PATH,
+		GJC_MASTER_CAPABILITY: "must-not-cross-the-lifecycle-boundary",
+		OWNED_SENTINEL: "kept",
+	});
+	expect(environment.GJC_MASTER_CAPABILITY).toBeUndefined();
+	expect(JSON.stringify(environment)).not.toContain("must-not-cross-the-lifecycle-boundary");
+	expect(environment.OWNED_SENTINEL).toBe("kept");
+});
+
 it("fails closed when compiled marker evidence disagrees", () => {
 	expect(() =>
 		resolveSdkInternalSpawnCommandForTest("broker-internal", {

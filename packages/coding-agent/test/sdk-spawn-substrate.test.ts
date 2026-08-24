@@ -75,6 +75,21 @@ describe("Broker spawn substrate provider", () => {
 		});
 	});
 
+	it("accepts inherited empty environment values and still rejects invalid names or NUL", async () => {
+		const provider = createSpawnSubstrateProvider(managedDependencies());
+		// An empty value is legitimate (AWS_PAGER="" disables a pager) and appears
+		// in ordinary inherited environments; rejecting it failed every spawn.
+		const accepted = await provider.launch({
+			...launchSpec(),
+			env: { CHILD_SETTING: "enabled", AWS_PAGER: "", EMPTY_TOO: "" },
+		});
+		expect(accepted).toEqual({ ok: true, proof: substrateProof() });
+		const badName = await provider.launch({ ...launchSpec(), env: { "BAD-NAME": "x" } });
+		expect(badName).toMatchObject({ ok: false, code: "substrate_proof_failed" });
+		const nulValue = await provider.launch({ ...launchSpec(), env: { OK_NAME: "a\u0000b" } });
+		expect(nulValue).toMatchObject({ ok: false, code: "substrate_proof_failed" });
+	});
+
 	it("uses the psmux substrate kind only for the Windows multiplexer selection", async () => {
 		const psmux = managedProof({
 			providerIdentity: '["windows-psmux","C:\\\\psmux.exe","namespace","volume:42"]',

@@ -165,10 +165,10 @@
   },
   "devDependencies": {
     "@biomejs/biome": "catalog:",
-    "prettier": "catalog:",
-    "@types/bun": "catalog:",
+    "prettier": "3.9.6",
+    "@types/bun": "1.4.0",
     "typescript": "catalog:",
-    "lint-staged": "catalog:"
+    "lint-staged": "16.4.0"
   },
   "lint-staged": {
     "*.{js,ts,jsx,tsx,json,jsonc,css}": "biome check --write --no-errors-on-unmatched"

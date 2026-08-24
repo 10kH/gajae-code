@@ -93,8 +93,13 @@ function validLaunchSpec(spec: SpawnSubstrateLaunchSpec, platform: NodeJS.Platfo
 		spec.argv.length > 0 &&
 		spec.argv.every(value => isNonEmptyString(value) && !value.includes("\0")) &&
 		(spec.env === undefined ||
+			// An empty environment value is legitimate and meaningful (for example
+			// AWS_PAGER="" disables a pager), so only the NAME must be non-empty.
+			// Requiring a non-empty value rejected ordinary inherited environments
+			// and failed every spawn before launch.
 			Object.entries(spec.env).every(
-				([name, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && isNonEmptyString(value) && !value.includes("\0"),
+				([name, value]) =>
+					/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && typeof value === "string" && !value.includes("\0"),
 			))
 	);
 }
