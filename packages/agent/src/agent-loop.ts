@@ -3862,6 +3862,9 @@ async function runLoopBody(
 					if (stream.hasActiveConsumer) await stream.waitForConsumerDrain(new AbortController().signal);
 					if (loopSignal.aborted) message.stopReason = "aborted";
 				}
+				if (message.stopReason === "error" || message.stopReason === "aborted") {
+					stripUnicodeEscapeEvidence(message);
+				}
 				escapedToolTransaction.replacePendingAssistantMessage(message);
 				escapedToolTransaction.flush();
 			} else {

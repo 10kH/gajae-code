@@ -1139,6 +1139,58 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		}
 	});
 
+	it("strips transient evidence before managed non-retryable terminal snapshots flush", async () => {
+		const evidence = escapeEvidence(String.raw`{"question":"\u0077"}`);
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{
+							type: "toolCall",
+							id: "tc-managed-nonretryable",
+							name: "ask",
+							arguments: { question: "w" },
+							escapedUnicodeArgumentEvidence: evidence,
+						},
+					],
+					stopReason: "error",
+				},
+			],
+		});
+		const exposedMessages: AssistantMessage[] = [];
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool([])] },
+			{
+				model: mock.model,
+				convertToLlm: identityConverter,
+				fallbackManaged: true,
+			},
+			undefined,
+			mock.stream,
+		);
+		for await (const event of stream) {
+			if (
+				(event.type === "message_start" ||
+					event.type === "message_update" ||
+					event.type === "message_end" ||
+					event.type === "turn_end") &&
+				event.message.role === "assistant"
+			) {
+				exposedMessages.push(event.message);
+			}
+		}
+
+		expect(exposedMessages.length).toBeGreaterThan(0);
+		expect(
+			exposedMessages.some(message =>
+				message.content.some(
+					block => block.type === "toolCall" && block.escapedUnicodeArgumentEvidence !== undefined,
+				),
+			),
+		).toBe(false);
+	});
+
 	it("keeps managed fallback guarded when carried evidence cannot be reconstructed", async () => {
 		const executed: Array<Record<string, unknown>> = [];
 		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] };
