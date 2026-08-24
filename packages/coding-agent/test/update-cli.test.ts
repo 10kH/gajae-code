@@ -765,10 +765,21 @@ describe("update-cli managed notification recovery", () => {
 				settingsCalls += 1;
 			},
 		};
-		await runUpdateCommand({ force: false, check: true }, { getLatestRelease: async () => release, ...lifecycle });
+		await runUpdateCommand(
+			{ force: false, check: true },
+			{
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
+				...lifecycle,
+			},
+		);
 		await runUpdateCommand(
 			{ force: false, check: false },
-			{ getLatestRelease: async () => ({ ...release, version: "0.0.1" }), ...lifecycle },
+			{
+				getLatestRelease: async () => ({ ...release, version: "0.0.1" }),
+				resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
+				...lifecycle,
+			},
 		);
 		await runUpdateCommand(
 			{ force: false, check: false },
@@ -1145,6 +1156,7 @@ describe("update-cli release channels", () => {
 							warnings: [],
 						};
 					},
+					resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
 				},
 			);
 			expect(seenChannels).toEqual(["nightly"]);
@@ -1332,6 +1344,7 @@ describe("update-cli channel robustness", () => {
 							registry: DEFAULT_NPM_REGISTRY,
 							warnings: [],
 						}),
+						resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
 						exit: code => {
 							exitCodes.push(code);
 							throw sentinel;
