@@ -626,21 +626,37 @@ async function cleanupVerifiedBackup(backupPath: string): Promise<string | undef
 	}
 }
 
-async function recoverWindowsUpdateJournal(journalPath: string, targetPath: string, backupPath: string): Promise<void> {
+async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
+	let raw: string;
 	try {
-		await fs.promises.stat(journalPath);
+		raw = await fs.promises.readFile(journalPath, "utf8");
 	} catch (err) {
 		if (isEnoent(err)) return;
 		throw err;
 	}
+	let target = "";
+	let backup = "";
 	try {
-		await fs.promises.lstat(targetPath);
-	} catch (err) {
-		if (!isEnoent(err)) throw err;
+		const parsed: unknown = JSON.parse(raw);
+		if (parsed && typeof parsed === "object") {
+			const record = parsed as { target?: unknown; backup?: unknown };
+			if (typeof record.target === "string") target = record.target;
+			if (typeof record.backup === "string") backup = record.backup;
+		}
+	} catch {
+		await unlinkIfExists(journalPath);
+		return;
+	}
+	if (target && backup) {
 		try {
-			await fs.promises.rename(backupPath, targetPath);
-		} catch (restoreErr) {
-			if (!isEnoent(restoreErr)) throw restoreErr;
+			await fs.promises.lstat(target);
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+			try {
+				await fs.promises.rename(backup, target);
+			} catch (restoreErr) {
+				if (!isEnoent(restoreErr)) throw restoreErr;
+			}
 		}
 	}
 	await unlinkIfExists(journalPath);
@@ -665,7 +681,7 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 			if (!isEnoent(err)) throw err;
 		}
 		if (process.platform === "win32") {
-			await recoverWindowsUpdateJournal(journalPath, options.targetPath, options.backupPath);
+			await recoverWindowsUpdateJournal(journalPath);
 		}
 		await unlinkIfExists(options.backupPath);
 		if (process.platform === "win32") {
@@ -987,6 +1003,18 @@ async function updateViaBinaryAt(
 	expectedVersion: string,
 	registry?: string,
 ): Promise<InstalledVersionVerification> {
+	if (
+		process.platform === "linux" &&
+		(fs.existsSync("/lib/ld-musl-x86_64.so.1") ||
+			fs.existsSync("/lib/ld-musl-aarch64.so.1") ||
+			fs.existsSync("/lib/ld-musl-armhf.so.1"))
+	) {
+		throw new Error(
+			formatUnsupportedTargetMessage(
+				"Unsupported libc: musl. Prebuilt Linux binaries are glibc-only. See docs/install.md",
+			),
+		);
+	}
 	const binaryName = getBinaryName();
 	const url = buildReleaseBinaryUrl(expectedVersion);
 	const registryNote = formatRegistryProvenance(expectedVersion, registry);
@@ -1208,7 +1236,7 @@ export function resolveUpdateDecision(options: {
 }): UpdateDecision {
 	const isChannelSwitchBack =
 		options.channel === "stable" && options.currentVersion.includes("-nightly.") && options.comparison < 0;
-	if (options.migrate && !options.force && !isChannelSwitchBack && options.comparison <= 0) {
+	if (options.migrate && !options.force && !isChannelSwitchBack && options.comparison === 0) {
 		return { install: true, kind: "migrate" };
 	}
 	if (options.comparison <= 0 && !isChannelSwitchBack && !options.force) {

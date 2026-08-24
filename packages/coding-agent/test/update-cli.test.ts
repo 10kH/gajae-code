@@ -1418,6 +1418,15 @@ describe("update-cli channel robustness", () => {
 				migrate: true,
 			}),
 		).toEqual({ install: true, kind: "migrate" });
+		expect(
+			resolveUpdateDecision({
+				comparison: -1,
+				force: false,
+				channel: "stable",
+				currentVersion: "0.12.11",
+				migrate: true,
+			}),
+		).toEqual({ install: false, kind: "up-to-date" });
 	});
 });
 
