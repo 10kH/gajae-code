@@ -18891,11 +18891,21 @@ export class AgentSession {
 		return (await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey;
 	}
 	/** Copy AuthStorage's already-computed unblock instant onto a terminal quota error. */
-	#stampQuotaRetryableAt(message: AssistantMessage): void {
-		if (!this.model) return;
+	#quotaRetryableAtMs(): number | undefined {
+		if (!this.model) return undefined;
 		const retryableAt = this.#modelRegistry.authStorage.getEarliestUnblockAt(this.model.provider);
-		if (retryableAt === undefined || !Number.isFinite(retryableAt)) return;
+		return retryableAt !== undefined && Number.isFinite(retryableAt) ? retryableAt : undefined;
+	}
+
+	#stampQuotaRetryableAt(message: AssistantMessage): void {
+		const retryableAt = this.#quotaRetryableAtMs();
+		if (retryableAt === undefined) return;
 		message.errorMessage = attachRetryableAtHint(message.errorMessage, retryableAt);
+	}
+
+	#annotateQuotaRetryableAt(errorMessage: string): string {
+		const retryableAt = this.#quotaRetryableAtMs();
+		return retryableAt === undefined ? errorMessage : attachRetryableAtHint(errorMessage, retryableAt);
 	}
 
 	/** Handle retryable errors with exponential backoff. */
@@ -19113,11 +19123,14 @@ export class AgentSession {
 		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {
-				this.#stampQuotaRetryableAt(message);
-				const errorMessage = attachRetryableAtHint(
-					this.#fallbackExhaustionError(controller),
-					this.#modelRegistry.authStorage.getEarliestUnblockAt(this.model?.provider ?? "") ?? Number.NaN,
-				);
+				let errorMessage = this.#fallbackExhaustionError(controller);
+				if (trigger.class === "quota" || trigger.class === "rate_limit") {
+					if (!assistantMessageHasVisibleOrToolContent(message)) {
+						await this.#markFailedCredential(trigger);
+					}
+					this.#stampQuotaRetryableAt(message);
+					errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
+				}
 				this.emitNotice("error", errorMessage, "fallback");
 				this.#defaultFallbackExhaustedLastTurn = true;
 				controller.resetSticky();
@@ -19165,9 +19178,13 @@ export class AgentSession {
 				}
 			}
 			if (!advanced) {
-				const errorMessage = resolutionError
+				let errorMessage = resolutionError
 					? `${this.#fallbackExhaustionError(controller)}; resolution failed: ${resolutionError instanceof Error ? resolutionError.message : String(resolutionError)}`
 					: this.#fallbackExhaustionError(controller);
+				if (trigger.class === "quota" || trigger.class === "rate_limit") {
+					this.#stampQuotaRetryableAt(message);
+					errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
+				}
 				this.emitNotice("error", errorMessage, "fallback");
 				if (managedOutcome && ownership) {
 					this.agent.requestRunTerminal(ownership.handle.logicalRunId, {
