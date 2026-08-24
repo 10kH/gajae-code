@@ -103,6 +103,24 @@ describe("observed request redaction", () => {
 		expect((observed.input as Record<string, unknown>).clientRef).toBe("ref-9");
 	});
 
+	it("keeps confirm only when it is the structural boolean", () => {
+		const real = redactObservedRequestContent({
+			type: "control_request",
+			operation: "context.clear",
+			confirm: true,
+			input: {},
+		});
+		expect(real.confirm).toBe(true);
+		// A caller-authored string under a structural key is content, not routing.
+		const forged = redactObservedRequestContent({
+			type: "control_request",
+			operation: "context.clear",
+			confirm: "CONFIRM_STRING_SECRET",
+			input: {},
+		});
+		expect(JSON.stringify(forged)).not.toContain("CONFIRM_STRING_SECRET");
+	});
+
 	it("treats a non-record input as content rather than nothing to redact", () => {
 		for (const payload of ["RAW_INPUT_SECRET", ["ARRAY_SECRET"], 42]) {
 			const observed = redactObservedRequestContent({

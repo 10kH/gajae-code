@@ -36,7 +36,14 @@ export function redactBrokerRuntimeCloseCapability(frame: Record<string, unknown
  * pagination token that can carry session/revision data) and `expectedRevision`
  * (no diagnostic consumer reads it).
  */
-const OBSERVABLE_FRAME_FIELDS = new Set(["type", "id", "operation", "query", "confirm"]);
+const OBSERVABLE_FRAME_FIELDS = new Set(["type", "id", "operation", "query"]);
+
+/**
+ * Frame keys whose value must match an exact expected type to survive.
+ * `confirm` is a structural destructive-op gate, so only the boolean form is
+ * routing information; a caller-authored string under that name is content.
+ */
+const OBSERVABLE_TYPED_FRAME_FIELDS: Readonly<Record<string, "boolean">> = { confirm: "boolean" };
 
 /**
  * Input fields an observer may see. This is an ALLOWLIST on purpose: a
@@ -88,6 +95,11 @@ export function redactObservedRequestContent(frame: Record<string, unknown>): Re
 		}
 		// Structural routing scalars survive; every other top-level key, including
 		// one this module has never heard of, is redacted.
+		const requiredType = OBSERVABLE_TYPED_FRAME_FIELDS[key];
+		if (requiredType !== undefined) {
+			observed[key] = typeof value === requiredType ? value : redactedContentMarker(value);
+			continue;
+		}
 		observed[key] =
 			OBSERVABLE_FRAME_FIELDS.has(key) && (value === null || typeof value !== "object")
 				? value

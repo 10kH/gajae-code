@@ -418,23 +418,42 @@ const SPAWN_HOST_REGISTRATION_POLL_MS = 50;
 const SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS = 10_000;
 const MASTER_ORPHAN_GRACE_DEFAULT_MS = 120_000;
 
+/** The five legs every usable pin must carry; a partial pin is missing authority. */
+type CompleteSpawnPinAuthority = SpawnAuthorityV1 & {
+	endpointGeneration: number;
+	endpointPid: number;
+	endpointIncarnation: string;
+	endpointCwd: string;
+	endpointStateRoot: string;
+};
+
+/**
+ * A pin is COMPLETE or it is missing authority. The fields are optional in the
+ * schema so older rows still reopen, but a partially populated pin carries
+ * strictly weaker evidence than the exchange assumes: generation plus pid is
+ * collidable across workspaces, so a partial pin must never be usable.
+ */
+function isCompleteSpawnPin(authority: SpawnAuthorityV1): authority is CompleteSpawnPinAuthority {
+	return (
+		authority.endpointGeneration !== undefined &&
+		authority.endpointPid !== undefined &&
+		authority.endpointIncarnation !== undefined &&
+		authority.endpointCwd !== undefined &&
+		authority.endpointStateRoot !== undefined
+	);
+}
+
 /**
  * Rebuilds the proven child-endpoint pin from durable authority. Returns
- * undefined for a pre-pin row, which recovery must treat as missing authority.
+ * undefined for a pre-pin or partially pinned row, which recovery must treat as
+ * missing authority.
  */
 function spawnPinFromAuthority(authority: SpawnAuthorityV1): SpawnHostRegistration | undefined {
 	// A pin is COMPLETE or it is missing authority. The fields are optional in the
 	// schema so older rows still reopen, but a partially populated pin carries
 	// strictly weaker evidence than the exchange assumes: generation plus pid is
 	// collidable across workspaces, so a partial pin must never be usable.
-	if (
-		authority.endpointGeneration === undefined ||
-		authority.endpointPid === undefined ||
-		authority.endpointIncarnation === undefined ||
-		authority.endpointCwd === undefined ||
-		authority.endpointStateRoot === undefined
-	)
-		return undefined;
+	if (!isCompleteSpawnPin(authority)) return undefined;
 	return {
 		sessionId: authority.childId,
 		endpointGeneration: authority.endpointGeneration,
@@ -443,6 +462,20 @@ function spawnPinFromAuthority(authority: SpawnAuthorityV1): SpawnHostRegistrati
 		cwd: authority.endpointCwd,
 		stateRoot: authority.endpointStateRoot,
 	};
+}
+
+/** Exact match of a live index row against a complete endpoint pin. */
+function matchesSpawnPin(candidate: IndexedSession, pinned: SpawnHostRegistration): boolean {
+	return (
+		candidate.endpointGeneration === pinned.endpointGeneration &&
+		candidate.pid === pinned.pid &&
+		pinned.processIncarnation !== undefined &&
+		(candidate.hostIncarnation ?? candidate.processIncarnation) === pinned.processIncarnation &&
+		pinned.cwd !== undefined &&
+		resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(pinned.cwd) &&
+		pinned.stateRoot !== undefined &&
+		resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(pinned.stateRoot)
+	);
 }
 
 /** Rebuilds the provider proof from durable authority facts only. */
@@ -1744,17 +1777,9 @@ export class Broker {
 						// receive the seed prompt or answer a Q26 reconciliation.
 						// Every pin leg is required. Identity fields alone collide across
 						// workspaces (pids are reused), so an absent leg is missing evidence
-						// rather than an unconstrained match.
-						(input.pinned === undefined ||
-							(candidate.endpointGeneration === input.pinned.endpointGeneration &&
-								candidate.pid === input.pinned.pid &&
-								input.pinned.processIncarnation !== undefined &&
-								(candidate.hostIncarnation ?? candidate.processIncarnation) === input.pinned.processIncarnation &&
-								input.pinned.cwd !== undefined &&
-								resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.pinned.cwd) &&
-								input.pinned.stateRoot !== undefined &&
-								resolveEquivalentPath(candidate.locator.stateRoot) ===
-									resolveEquivalentPath(input.pinned.stateRoot))),
+						// rather than an unconstrained match. spawnPinFromAuthority only
+						// yields complete pins, so a caller-supplied partial pin is refused.
+						(input.pinned === undefined || matchesSpawnPin(candidate, input.pinned)),
 				);
 		} catch {
 			row = undefined;
