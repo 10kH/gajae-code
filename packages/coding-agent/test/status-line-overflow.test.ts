@@ -576,6 +576,13 @@ describe("status line overflow cue", () => {
 		expect(changed).not.toEqual(before);
 		expect(Number(countOf(changed))).toBeGreaterThan(Number(countOf(before)));
 		for (const row of changed) expect(visibleWidth(row)).toBeLessThanOrEqual(WIDTH);
+
+		// Post-change identical re-render must hit and return byte-identical rows.
+		const repeatAfterChange = component.render(WIDTH);
+		const afterSecondHit = component.getCacheStatsForTest();
+		expect(repeatAfterChange).toEqual(changed);
+		expect(afterSecondHit.rowHits).toBe(afterMiss.rowHits + 1);
+		expect(afterSecondHit.rowMisses).toBe(afterMiss.rowMisses);
 	});
 });
 
@@ -611,6 +618,22 @@ describe("status line overflow cue geometry", () => {
 		return component;
 	}
 
+	// Repeating a visible segment is the reachable route to a two-digit count:
+	// segment arrays are unconstrained and collection preserves every occurrence.
+	function buildRepeated(maxRows: number, count: number): StatusLineComponent {
+		const component = new StatusLineComponent(createStatusLineSession("S"), { version: "9.9.9" });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae"],
+			rightSegments: Array.from({ length: count }, () => "session_name") as never,
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
 	it.each([1, 2])("renders exactly the bare marker at one column (maxRows %i)", maxRows => {
 		const rendered = buildWide(maxRows).render(1);
 
@@ -628,14 +651,12 @@ describe("status line overflow cue geometry", () => {
 		expect(visibleWidth(rendered[0])).toBe(1);
 	});
 
-	it.each([1, 2])("renders the exact count at three columns when it fits (maxRows %i)", maxRows => {
+	it.each([1, 2])("renders the exact literal count at three columns when it fits (maxRows %i)", maxRows => {
 		const rendered = buildWide(maxRows).render(3);
 
-		expect(rendered).toHaveLength(1);
-		const text = strip(rendered[0]);
-		// W == 3 and a single-digit count needs exactly 2 + 1 cells, so the count
-		// renders rather than degrading.
-		expect(text).toMatch(/^…\+\d$/);
+		// W == 3 with a single-digit count needs exactly 2 + 1 cells, so the count
+		// renders. Asserted as an exact literal, not a shape.
+		expect(rendered.map(strip)).toEqual(["…+8"]);
 		expect(visibleWidth(rendered[0])).toBe(3);
 	});
 
@@ -649,22 +670,6 @@ describe("status line overflow cue geometry", () => {
 		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(40);
 	});
 
-	// Repeating a visible segment is the reachable route to a two-digit count:
-	// segment arrays are unconstrained and collection preserves every occurrence.
-	function buildRepeated(maxRows: number, count: number): StatusLineComponent {
-		const component = new StatusLineComponent(createStatusLineSession("S"), { version: "9.9.9" });
-		component.updateSettings({
-			preset: "custom",
-			leftSegments: ["gajae"],
-			rightSegments: Array.from({ length: count }, () => "session_name") as never,
-			separator: "pipe",
-			showSkillHud: false,
-			sessionAccent: false,
-			maxRows,
-		});
-		return component;
-	}
-
 	it.each([
 		[1, 20, "…+12"],
 		[1, 30, "…+10"],
@@ -677,6 +682,17 @@ describe("status line overflow cue geometry", () => {
 		// stale count from the reservation passes cannot slip through.
 		expect(joined).toContain(expected);
 		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+	});
+
+	it.each([1, 2])("omits a two-digit count at three columns rather than truncating it (maxRows %i)", maxRows => {
+		// This fixture drops well over ten segments, so `…+NN` needs four cells and
+		// cannot fit three. The plan requires the count be dropped, never truncated
+		// into a wrong or partial number.
+		const rendered = buildRepeated(maxRows, 14).render(3);
+
+		expect(rendered.map(strip)).toEqual(["…"]);
+		expect(visibleWidth(rendered[0])).toBe(1);
+		expect(strip(rendered[0])).not.toMatch(/\d/);
 	});
 
 	it("carries the two-digit count on the final row only in the multi-row path", () => {
