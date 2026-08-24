@@ -450,8 +450,140 @@ export function ensureLaunchWorktree(
 	};
 }
 
+interface WorkspacePackageManifest {
+	packageManager?: unknown;
+	workspaces?: unknown;
+}
+
+type WorkspacePackageManager = "bun" | "npm" | "pnpm";
+
+interface ResolvedWorkspacePackageManager {
+	name: WorkspacePackageManager;
+	version: string | null;
+}
+
+function readWorkspacePackageManifest(worktreePath: string): WorkspacePackageManifest | null {
+	const manifestPath = path.join(worktreePath, "package.json");
+	try {
+		return JSON.parse(fs.readFileSync(manifestPath, "utf8")) as WorkspacePackageManifest;
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") return null;
+		throw error;
+	}
+}
+
+function isWorkspaceRoot(worktreePath: string, manifest: WorkspacePackageManifest | null): boolean {
+	return manifest?.workspaces !== undefined || fs.existsSync(path.join(worktreePath, "pnpm-workspace.yaml"));
+}
+
+function declaredPackageManager(
+	manifest: WorkspacePackageManifest | null,
+): { name: string; version: string | null } | null {
+	if (typeof manifest?.packageManager !== "string") return null;
+	const separator = manifest.packageManager.indexOf("@");
+	const name = (separator < 0 ? manifest.packageManager : manifest.packageManager.slice(0, separator)).trim();
+	if (!name) return null;
+	const version = separator < 0 ? null : manifest.packageManager.slice(separator + 1).trim() || null;
+	return { name, version };
+}
+
+function resolveWorkspacePackageManager(
+	worktreePath: string,
+	manifest: WorkspacePackageManifest | null,
+): ResolvedWorkspacePackageManager {
+	const declared = declaredPackageManager(manifest);
+	if (declared !== null) {
+		if (declared.name === "bun" || declared.name === "npm" || declared.name === "pnpm") {
+			return { name: declared.name, version: declared.version };
+		}
+		throw new Error(`worktree_dependency_manager_unsupported:${declared.name}`);
+	}
+
+	const lockfileManagers: WorkspacePackageManager[] = [];
+	if (fs.existsSync(path.join(worktreePath, "bun.lock")) || fs.existsSync(path.join(worktreePath, "bun.lockb"))) {
+		lockfileManagers.push("bun");
+	}
+	if (fs.existsSync(path.join(worktreePath, "pnpm-lock.yaml"))) lockfileManagers.push("pnpm");
+	if (
+		fs.existsSync(path.join(worktreePath, "package-lock.json")) ||
+		fs.existsSync(path.join(worktreePath, "npm-shrinkwrap.json"))
+	) {
+		lockfileManagers.push("npm");
+	}
+	if (lockfileManagers.length === 1) return { name: lockfileManagers[0] as WorkspacePackageManager, version: null };
+	if (lockfileManagers.length === 0) throw new Error("worktree_dependency_lockfile_missing");
+	throw new Error(`worktree_dependency_manager_ambiguous:${lockfileManagers.join(",")}`);
+}
+
+function removeLegacySourceNodeModulesLink(sourceRoot: string, worktreePath: string): void {
+	const target = path.join(worktreePath, "node_modules");
+	let targetStat: fs.Stats;
+	try {
+		targetStat = fs.lstatSync(target);
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") return;
+		throw error;
+	}
+	if (!targetStat.isSymbolicLink()) return;
+
+	const sourceModules = path.join(sourceRoot, "node_modules");
+	const linkTarget = path.resolve(path.dirname(target), fs.readlinkSync(target));
+	let linksToSource = linkTarget === path.resolve(sourceModules);
+	try {
+		linksToSource = linksToSource || fs.realpathSync(target) === fs.realpathSync(sourceModules);
+	} catch (error) {
+		if (fileSystemErrorCode(error) !== "ENOENT") throw error;
+	}
+	if (!linksToSource) throw new Error(`worktree_node_modules_not_local:${target}`);
+	fs.unlinkSync(target);
+}
+
+function workspaceInstallCommand(manager: ResolvedWorkspacePackageManager): string[] {
+	const args = manager.name === "npm" ? ["ci"] : ["install", "--frozen-lockfile"];
+	if (manager.name === "bun" || Bun.which(manager.name) !== null) return [manager.name, ...args];
+	if (manager.version === null) throw new Error(`worktree_dependency_manager_unavailable:${manager.name}`);
+	return ["bun", "x", `${manager.name}@${manager.version}`, ...args];
+}
+
+function installWorkspaceDependencies(
+	sourceRoot: string,
+	worktreePath: string,
+	manifest: WorkspacePackageManifest | null,
+): void {
+	removeLegacySourceNodeModulesLink(sourceRoot, worktreePath);
+	const manager = resolveWorkspacePackageManager(worktreePath, manifest);
+	const command = workspaceInstallCommand(manager);
+	let result: Bun.ReadableSyncSubprocess;
+	try {
+		result = Bun.spawnSync(command, {
+			cwd: worktreePath,
+			stdout: "pipe",
+			stderr: "pipe",
+		});
+	} catch (error) {
+		throw new Error(`worktree_dependency_install_failed:${manager.name}:${String(error)}`);
+	}
+	if (result.exitCode !== 0) {
+		throw new Error(`worktree_dependency_install_failed:${manager.name}:${result.stderr.toString().trim()}`);
+	}
+	let installed: fs.Stats;
+	try {
+		installed = fs.lstatSync(path.join(worktreePath, "node_modules"));
+	} catch (error) {
+		if (fileSystemErrorCode(error) === "ENOENT") return;
+		throw error;
+	}
+	if (!installed.isDirectory() || installed.isSymbolicLink()) throw new Error("worktree_dependency_install_not_local");
+}
+
+/** Workspace worktrees must own their complete lockfile-resolved dependency graph (#4620). */
 export function ensureReusableNodeModules(sourceRoot: string, worktreePath: string): "symlink" | "present" | "missing" {
 	const target = path.join(worktreePath, "node_modules");
+	const manifest = readWorkspacePackageManifest(worktreePath);
+	if (isWorkspaceRoot(worktreePath, manifest)) {
+		installWorkspaceDependencies(sourceRoot, worktreePath, manifest);
+		return "present";
+	}
 	if (fs.existsSync(target)) return "present";
 	const source = path.join(sourceRoot, "node_modules");
 	if (!fs.existsSync(source)) return "missing";
