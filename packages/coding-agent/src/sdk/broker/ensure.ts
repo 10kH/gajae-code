@@ -5,7 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
-import { SdkClient } from "../client/client";
+import { SdkClient, SdkClientError } from "../client/client";
 import {
 	type BrokerDiscovery,
 	brokerDiscoveryPath,
@@ -534,11 +534,12 @@ function isAuthorizedBrokerEndpoint(discovery: BrokerDiscovery): boolean {
  * process would spawn. The authenticated `broker.shutdown` op is tried first.
  * Ordered same-install discoveries that predate the op (or fail transport) take
  * an identity-fenced SIGTERM instead. Legacy records that lack version/identity
- * are shut down through the same authenticated path, or treated as evicted once
- * the publication is absent or the published pid/incarnation is gone; they are
- * never signalled. A heartbeat TTL lapse with a still-live process is not
- * retirement. A mismatched discovery that remains published is never returned
- * to a lifecycle caller.
+ * are shut down through the same authenticated path. They are signalled only
+ * after a typed authenticated `unknown_operation` (pre-shutdown brokers) and
+ * identity revalidation; generation inequality alone never authorizes SIGTERM.
+ * A heartbeat TTL lapse with a still-live process is not retirement. A
+ * mismatched discovery that remains published is never returned to a lifecycle
+ * caller.
  */
 async function retireStaleBroker(
 	agentDir: string,
@@ -576,6 +577,7 @@ async function retireStaleBroker(
 	} else {
 		return false;
 	}
+	let unknownOperationAfterAuth = false;
 	try {
 		const client = await SdkClient.connect(stale.url, stale.token, {
 			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
@@ -583,15 +585,18 @@ async function retireStaleBroker(
 		});
 		try {
 			await client.global("broker.shutdown", {});
+		} catch (error) {
+			if (unstamped && error instanceof SdkClientError && error.code === "unknown_operation") {
+				unknownOperationAfterAuth = true;
+			} else {
+				throw error;
+			}
 		} finally {
 			await client.close().catch(() => {});
 		}
 	} catch {
 		if (unstamped) {
-			// Generation inequality without version/identity cannot authorize SIGTERM.
-			// Authenticated shutdown was attempted; treat the publication as gone only
-			// when the published pid is dead. A different discovery while that pid is
-			// still live is not eviction — spawning would collide with the lock.
+			// Connect/transport failure cannot authorize SIGTERM.
 			const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 			if (!current) return unstampedProcessGone(stale);
 			if (!sameBrokerIdentity(current, stale)) return unstampedProcessGone(stale);
@@ -609,6 +614,17 @@ async function retireStaleBroker(
 			if (!isAuthorizedBrokerEndpoint(current)) return false;
 			if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
 		}
+	}
+	if (unknownOperationAfterAuth) {
+		const peeked = await peekUnstampedLiveBroker(agentDir);
+		if (
+			!peeked ||
+			!sameBrokerIdentity(peeked, stale) ||
+			!sameBrokerAuthority(peeked, stale) ||
+			!isAuthorizedBrokerEndpoint(peeked)
+		)
+			return unstampedProcessGone(stale);
+		if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 	while (Date.now() < deadline) {

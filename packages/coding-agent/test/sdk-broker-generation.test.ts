@@ -9,6 +9,7 @@ import { Broker } from "../src/sdk/broker/broker";
 import {
 	brokerDiscoveryPath,
 	brokerProcessIncarnation,
+	isPidAlive,
 	readBrokerDiscovery,
 	writeBrokerDiscovery,
 } from "../src/sdk/broker/discovery";
@@ -104,6 +105,42 @@ function standInBrokerProcess(): { pid: number; incarnation: string; kill: () =>
 		incarnation,
 		kill() {
 			child.kill("SIGKILL");
+		},
+	};
+}
+function startPreShutdownUnknownOperationBroker(token: string): { url: string; port: number; stop: () => void } {
+	const server = Bun.serve({
+		port: 0,
+		fetch(req, srv) {
+			const url = new URL(req.url);
+			if (url.searchParams.get("token") !== token) return new Response("forbidden", { status: 403 });
+			if (srv.upgrade(req)) return undefined;
+			return new Response("ok");
+		},
+		websocket: {
+			open(ws) {
+				ws.send(JSON.stringify({ type: "broker_hello", protocolVersion: 3 }));
+			},
+			message(ws, data) {
+				const frame = JSON.parse(String(data)) as { id?: string; operation?: string };
+				if (frame.operation === "broker.shutdown") {
+					ws.send(
+						JSON.stringify({
+							type: "broker_response",
+							id: frame.id,
+							ok: false,
+							error: { code: "unknown_operation", message: "unknown broker operation" },
+						}),
+					);
+				}
+			},
+		},
+	});
+	return {
+		port: server.port,
+		url: `ws://127.0.0.1:${server.port}`,
+		stop() {
+			server.stop(true);
 		},
 	};
 }
@@ -425,6 +462,41 @@ describe("sdk broker package generation", () => {
 		} finally {
 			standIn.kill();
 			await transport.stop();
+			await cleanup(dir);
+		}
+	}, 30_000);
+
+	it("signals an unstamped pre-shutdown broker after authenticated unknown_operation", async () => {
+		const dir = await temp();
+		const token = "unstamped-unknown-operation-token";
+		const standIn = standInBrokerProcess();
+		const fixture = startPreShutdownUnknownOperationBroker(token);
+		try {
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "unknown",
+				ownerId: "legacy-pre-shutdown",
+				pid: standIn.pid,
+				incarnation: standIn.incarnation,
+				host: "127.0.0.1",
+				port: fixture.port,
+				url: fixture.url,
+				token,
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const authority = resolveSdkPackageAuthority();
+			const replacement = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+			});
+			expect(isPidAlive(standIn.pid)).toBe(false);
+			expect(replacement.pid).not.toBe(standIn.pid);
+			expect(replacement.packageGeneration).toBe(authority.generation);
+		} finally {
+			standIn.kill();
+			fixture.stop();
 			await cleanup(dir);
 		}
 	}, 30_000);
