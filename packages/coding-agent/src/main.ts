@@ -1524,7 +1524,10 @@ export async function runRootCommand(
 		print: Boolean(parsedArgs.print),
 		mode: parsedArgs.mode,
 	});
-	if (disposition.nonInteractiveError) {
+	// Master admission runs unconditionally and BEFORE any session state is
+	// opened or created. Nesting it under nonInteractiveError skipped it for a
+	// non-TTY launch carrying prepared input, which resolves to autoPrint with no
+	// error, so `--master <prompt>` proceeded as an ordinary auto-print run.
 	try {
 		assertMasterLaunchDisposition({
 			master: parsedArgs.master,
@@ -1533,10 +1536,11 @@ export async function runRootCommand(
 			nonInteractiveError: disposition.nonInteractiveError,
 		});
 	} catch (error) {
-		process.stderr.write(`${chalk.red(error instanceof Error ? error.message : "Invalid master launch") }\n`);
+		process.stderr.write(`${chalk.red(error instanceof Error ? error.message : "Invalid master launch")}\n`);
 		if (!deps.suppressProcessExit) process.exitCode = 1;
 		return;
 	}
+	if (disposition.nonInteractiveError) {
 		process.stderr.write(`${chalk.red(disposition.nonInteractiveError)}\n`);
 		process.exit(1);
 	}

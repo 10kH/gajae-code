@@ -4,7 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import { createMasterModeContext } from "@gajae-code/coding-agent/master-mode/context";
+import {
+	assertMasterLaunchDisposition,
+	createMasterModeContext,
+} from "@gajae-code/coding-agent/master-mode/context";
 import {
 	createMasterPeerSnapshotContributor,
 	MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
@@ -55,6 +58,38 @@ afterEach(() => {
 function countOccurrences(haystack: string, needle: string): number {
 	return haystack.split(needle).length - 1;
 }
+
+describe("master launch admission", () => {
+	// Every noninteractive master route must fail admission. The prepared-input
+	// non-TTY case is the dangerous one: it resolves to autoPrint with NO
+	// nonInteractiveError, so a guard nested under that error is skipped.
+	const routes = [
+		{ name: "non-TTY with prepared input (autoPrint, no error)", isInteractive: false, autoPrint: true },
+		{ name: "non-TTY with no input", isInteractive: false, autoPrint: false, nonInteractiveError: "no input" },
+		{ name: "auto-print while a TTY is attached", isInteractive: true, autoPrint: true },
+	];
+	for (const route of routes) {
+		it(`refuses --master on a ${route.name}`, () => {
+			expect(() =>
+				assertMasterLaunchDisposition({
+					master: true,
+					isInteractive: route.isInteractive,
+					autoPrint: route.autoPrint,
+					...(route.nonInteractiveError === undefined ? {} : { nonInteractiveError: route.nonInteractiveError }),
+				}),
+			).toThrow("--master requires an interactive TTY launch");
+		});
+	}
+
+	it("admits an interactive master launch and ignores non-master routes", () => {
+		expect(() =>
+			assertMasterLaunchDisposition({ master: true, isInteractive: true, autoPrint: false }),
+		).not.toThrow();
+		expect(() =>
+			assertMasterLaunchDisposition({ master: undefined, isInteractive: false, autoPrint: true }),
+		).not.toThrow();
+	});
+});
 
 describe("master mode prompt integration", () => {
 	it("appends the master guidance block exactly once for master sessions", async () => {
