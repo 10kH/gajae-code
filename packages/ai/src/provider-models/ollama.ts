@@ -21,6 +21,13 @@ type OllamaShowResponse = {
 
 const OLLAMA_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
 
+// Ollama Cloud serves large hosted frontier models and its API exposes no per-model
+// output cap (/api/show reports context_length only). The previous 8192 fallback made
+// discovery report a tiny num_predict, so long generations were truncated server-side
+// (stop reason "length"), stalling agent loops mid-task. 128K matches the largest
+// max_output values already used by bundled reference catalogs.
+const OLLAMA_CLOUD_DEFAULT_MAX_TOKENS = 131_072;
+
 function trimTrailingSlash(value: string): string {
 	return value.endsWith("/") ? value.slice(0, -1) : value;
 }
@@ -141,7 +148,7 @@ export function ollamaCloudModelManagerOptions(
 						input,
 						cost: reference?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 						contextWindow,
-						maxTokens: reference?.maxTokens ?? Math.min(contextWindow, 8192),
+						maxTokens: reference?.maxTokens ?? Math.min(contextWindow, OLLAMA_CLOUD_DEFAULT_MAX_TOKENS),
 					};
 				}),
 			);
