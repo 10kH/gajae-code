@@ -779,11 +779,18 @@ async function retireAndReadReplacement(
 		expectedPackageGeneration,
 		settings.heartbeatTtlMs,
 	);
-	if (!retired)
+	if (!retired) {
+		const current = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
+		if (current && !sameBrokerIdentity(current, stale) && isPidAlive(stale.pid)) {
+			throw new Error(
+				`SDK broker package generation ${stale.packageGeneration ?? "unknown"} does not match expected generation ${expectedPackageGeneration}, and stale broker retirement was not verified. Original pid ${stale.pid} is still live; do not delete ${brokerDiscoveryPath(settings.agentDir)}.`,
+			);
+		}
 		throw staleBrokerRetirementUnverified(expectedPackageGeneration, stale.packageGeneration, {
 			agentDir: settings.agentDir,
 			stale,
 		});
+	}
 	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 	if (!replacement) return undefined;
 	const currentPackageGeneration = resolveSdkPackageAuthority({ force: true }).generation;
