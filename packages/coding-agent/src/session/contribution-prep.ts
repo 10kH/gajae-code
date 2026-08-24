@@ -87,7 +87,7 @@ export function redactContributionPrepText(
 	);
 	redacted = replaceRegex(
 		redacted,
-		/\b(?:ghp_[A-Za-z0-9_]{12,}|gho_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g,
+		/\b(?:gh[opsur]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,})\b/g,
 		"[REDACTED_TOKEN]",
 		state,
 		"tokens",
@@ -273,7 +273,7 @@ export async function prepareContributionPrep(
 		created_at: createdAt,
 		cwd: redact(context.cwd),
 		git_head: gitHead,
-		changed_files: files,
+		changed_files: files.map(redact),
 		artifacts,
 		redactions: [...redactions.labels].sort(),
 		recommended_output: [
