@@ -18859,36 +18859,41 @@ export class AgentSession {
 		class: FallbackTriggerClass;
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
-	}): Promise<boolean> {
+	}): Promise<"rotated" | "exhausted" | "unchanged"> {
 		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit")) {
-			return false;
+			return "unchanged";
 		}
 		// (2) Terminal forbidden: no credential state may change.
-		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return false;
+		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return "unchanged";
 
 		const authStorage = this.#modelRegistry.authStorage;
 		const provider = this.model.provider;
 		// (1) Pin guard, before any mutation and for every branch.
-		if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasRuntimeCredentialSelector(provider)) return false;
+		if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasRuntimeCredentialSelector(provider)) {
+			return "unchanged";
+		}
 
 		const credentialSessionId = this.credentialSessionId;
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
-		let mutated: boolean;
+		let remaining: boolean;
 		if (trigger.class === "auth") {
-			if (!isAuthenticated(activeApiKey)) return false;
-			mutated = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
+			if (!isAuthenticated(activeApiKey)) return "unchanged";
+			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
 				sessionId: credentialSessionId,
 			});
+			if (!remaining) return "unchanged";
 		} else {
-			mutated = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				retryAfterMs: trigger.retryAfterMs,
 			});
 		}
-		if (!mutated) return false;
 
 		// (3) Distinct-row proof.
-		return (await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey;
+		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {
+			return "rotated";
+		}
+		return remaining ? "unchanged" : "exhausted";
 	}
 	/** Copy AuthStorage's already-computed unblock instant onto a terminal quota error. */
 	#quotaRetryableAtMs(): number | undefined {
@@ -19037,8 +19042,9 @@ export class AgentSession {
 			!assistantMessageHasVisibleOrToolContent(message) &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
-			credentialRotated = await this.#markFailedCredential(trigger);
-			if (!credentialRotated) this.#stampQuotaRetryableAt(message);
+			const mark = await this.#markFailedCredential(trigger);
+			credentialRotated = mark === "rotated";
+			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
 		}
 
 		// A content-free credential rotation is inherently replay-safe: no partial
@@ -19108,8 +19114,9 @@ export class AgentSession {
 			outcome === "advance" &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
-			credentialRotated = await this.#markFailedCredential(trigger);
-			if (!credentialRotated) this.#stampQuotaRetryableAt(message);
+			const mark = await this.#markFailedCredential(trigger);
+			credentialRotated = mark === "rotated";
+			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
 		}
 		if (credentialRotated) {
 			// A rotation only becomes a same-model retry if the controller can
@@ -19130,10 +19137,12 @@ export class AgentSession {
 				let errorMessage = this.#fallbackExhaustionError(controller);
 				if (trigger.class === "quota" || trigger.class === "rate_limit") {
 					if (!assistantMessageHasVisibleOrToolContent(message)) {
-						await this.#markFailedCredential(trigger);
+						const mark = await this.#markFailedCredential(trigger);
+						if (mark === "exhausted") {
+							this.#stampQuotaRetryableAt(message);
+							errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
+						}
 					}
-					this.#stampQuotaRetryableAt(message);
-					errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
 				}
 				this.emitNotice("error", errorMessage, "fallback");
 				this.#defaultFallbackExhaustedLastTurn = true;
@@ -19169,8 +19178,11 @@ export class AgentSession {
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
+			let quotaPoolExhausted = false;
 			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
-				await this.#markFailedCredential(trigger);
+				const mark = await this.#markFailedCredential(trigger);
+				if (mark === "rotated") credentialRotated = true;
+				quotaPoolExhausted = mark === "exhausted";
 			}
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
@@ -19185,7 +19197,7 @@ export class AgentSession {
 				let errorMessage = resolutionError
 					? `${this.#fallbackExhaustionError(controller)}; resolution failed: ${resolutionError instanceof Error ? resolutionError.message : String(resolutionError)}`
 					: this.#fallbackExhaustionError(controller);
-				if (trigger.class === "quota" || trigger.class === "rate_limit") {
+				if ((trigger.class === "quota" || trigger.class === "rate_limit") && quotaPoolExhausted) {
 					this.#stampQuotaRetryableAt(message);
 					errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
 				}
