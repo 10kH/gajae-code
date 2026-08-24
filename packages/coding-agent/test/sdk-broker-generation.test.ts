@@ -22,6 +22,7 @@ import {
 	registerBrokerOwnerForTest,
 	signalExactBrokerForTest,
 } from "../src/sdk/broker/ensure";
+import * as brokerRuntime from "../src/sdk/broker/runtime";
 import {
 	resolveSdkInternalSpawnCommandForTest,
 	resolveSdkPackageAuthority,
@@ -265,6 +266,40 @@ describe("sdk broker package generation", () => {
 			await cleanup(dir, stale);
 		}
 	}, 30_000);
+
+	it("aborts stale shutdown when package authority changes after connect", async () => {
+		const dir = await temp();
+		const stale = staleBroker(dir);
+		const stop = vi.spyOn(stale, "stop");
+		const realResolve = brokerRuntime.resolveSdkPackageAuthority;
+		let mutate = false;
+		const authoritySpy = vi.spyOn(brokerRuntime, "resolveSdkPackageAuthority").mockImplementation(options => {
+			const auth = realResolve(options);
+			if (mutate) return { ...auth, generation: `${auth.generation}-changed` };
+			return auth;
+		});
+		const originalConnect = SdkClient.connect.bind(SdkClient);
+		const connect = vi.spyOn(SdkClient, "connect").mockImplementation(async (url, token, options) => {
+			const client = await originalConnect(url, token, options);
+			mutate = true;
+			return client;
+		});
+		try {
+			const published = await stale.start();
+			const expected = realResolve().generation;
+			await expect(ensureBroker({ agentDir: dir, expectedPackageGeneration: expected })).rejects.toThrow(
+				"stale broker retirement was not verified",
+			);
+			expect(stop).not.toHaveBeenCalled();
+			const current = await readBrokerDiscovery(dir);
+			expect(current?.pid).toBe(published.pid);
+			expect(current?.incarnation).toBe(published.incarnation);
+		} finally {
+			authoritySpy.mockRestore();
+			connect.mockRestore();
+			await cleanup(dir, stale);
+		}
+	}, 15_000);
 
 	it("does not reuse a stale broker when retirement cannot be proven", async () => {
 		const dir = await temp();

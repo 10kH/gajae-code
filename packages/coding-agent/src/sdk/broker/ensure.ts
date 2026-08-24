@@ -600,6 +600,23 @@ async function retireStaleBroker(
 			reconnectAttempts: 0,
 		});
 		try {
+			const currentAuthority = resolveSdkPackageAuthority({ force: true });
+			if (
+				currentAuthority.generation !== expectedPackageGeneration ||
+				currentAuthority.packageVersion !== preflightAuthority.packageVersion ||
+				currentAuthority.installationIdentity !== preflightAuthority.installationIdentity
+			)
+				return false;
+			const currentBeforeShutdown = unstamped
+				? await readUnstampedBrokerIgnoringTtl(agentDir)
+				: await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+			if (
+				!currentBeforeShutdown ||
+				!sameBrokerIdentity(currentBeforeShutdown, stale) ||
+				!sameBrokerAuthority(currentBeforeShutdown, stale) ||
+				!isAuthorizedBrokerEndpoint(currentBeforeShutdown)
+			)
+				return unstamped ? unstampedProcessGone(stale) : false;
 			await client.global("broker.shutdown", {});
 		} catch (error) {
 			if (unstamped && error instanceof SdkClientError && error.code === "unknown_operation") {
@@ -632,6 +649,13 @@ async function retireStaleBroker(
 		}
 	}
 	if (unknownOperationAfterAuth) {
+		const currentAuthority = resolveSdkPackageAuthority({ force: true });
+		if (
+			currentAuthority.generation !== expectedPackageGeneration ||
+			currentAuthority.packageVersion !== preflightAuthority.packageVersion ||
+			currentAuthority.installationIdentity !== preflightAuthority.installationIdentity
+		)
+			return false;
 		const peeked = await readUnstampedBrokerIgnoringTtl(agentDir);
 		if (
 			!peeked ||
