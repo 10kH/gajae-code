@@ -87,13 +87,11 @@ gjc @screenshot.png "뭘 바꿔야 할까?"   # 이미지 입력
 
 나이틀리 채널: `curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --channel nightly`. 전체 설치 매트릭스, Windows 설정, 업데이트 채널, 셸 자동완성: [docs/install.md](docs/install.md). Bun은 소스 빌드에만 필요합니다.
 
-**한국어 실행 명령어** — `가재씨`를 `gjc` 대신 사용할 수 있습니다:
+**한국어 실행 명령어** — `가재씨`는 패키지 매니저 설치에서 `gjc`와 함께 제공되는 별칭입니다. 독립 바이너리 설치는 `gjc`만 제공합니다:
 
 ```sh
 가재씨 --version
 ```
-
-`가재씨`는 설치 시 패키지 bin 항목으로 함께 생성되며, `gjc`와 완전히 동일하게 동작합니다. Linux·macOS(UTF-8 로케일)에서 지원됩니다.
 
 ---
 
