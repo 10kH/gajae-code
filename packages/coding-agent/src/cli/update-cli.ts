@@ -626,7 +626,7 @@ async function cleanupVerifiedBackup(backupPath: string): Promise<string | undef
 	}
 }
 
-async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
+export async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
 	let raw: string;
 	try {
 		raw = await fs.promises.readFile(journalPath, "utf8");
@@ -665,13 +665,21 @@ async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
 			return;
 		}
 		try {
-			await fs.promises.rename(target, backup || `${target}.bak.recover`);
-			await fs.promises.rename(next, target);
+			const recoverBackup = backup || `${target}.bak.recover`;
+			await fs.promises.rename(target, recoverBackup);
+			try {
+				await fs.promises.rename(next, target);
+			} catch (promoteErr) {
+				try {
+					await fs.promises.rename(recoverBackup, target);
+				} catch {
+					throw promoteErr;
+				}
+				throw promoteErr;
+			}
 			await unlinkIfExists(journalPath);
 			return;
 		} catch {
-			await unlinkIfExists(next);
-			await unlinkIfExists(journalPath);
 			return;
 		}
 	}

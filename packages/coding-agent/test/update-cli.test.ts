@@ -17,6 +17,7 @@ import {
 	isProtectedSourcePathForTest,
 	parseReportedVersionForTest,
 	parseUpdateArgs,
+	recoverWindowsUpdateJournal,
 	replaceBinaryForUpdate,
 	resolveGjcPathForTest,
 	resolveNpmManagedTargetForTest,
@@ -839,6 +840,24 @@ describe("update-cli install lock", () => {
 		const source = await Bun.file(path.resolve(import.meta.dir, "../src/cli/update-cli.ts")).text();
 		expect(source).toContain(".gjc-install.lock");
 		expect(source).not.toContain(".update-lock");
+	});
+});
+
+describe("update-cli windows journal recovery", () => {
+	it("promotes .next over the live target and does not strand the prior binary", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const backupPath = `${targetPath}.bak`;
+		const nextPath = `${targetPath}.next`;
+		const journalPath = `${targetPath}.update-journal`;
+		await Bun.write(targetPath, "old");
+		await Bun.write(nextPath, "new");
+		await Bun.write(journalPath, JSON.stringify({ target: targetPath, backup: backupPath, next: nextPath }));
+		await recoverWindowsUpdateJournal(journalPath);
+		expect(await Bun.file(targetPath).text()).toBe("new");
+		expect(await Bun.file(backupPath).text()).toBe("old");
+		expect(await Bun.file(nextPath).exists()).toBe(false);
+		expect(await Bun.file(journalPath).exists()).toBe(false);
 	});
 });
 
