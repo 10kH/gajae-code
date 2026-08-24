@@ -364,6 +364,17 @@ describe("install.sh binary-first contract", () => {
 		expect(installer).toContain('if [ "$http_code" != "404" ]');
 		expect(installer).toContain("tag ~ /-nightly\\.[0-9]+\\.[0-9]+\\.g[0-9a-f]+$/");
 		expect(installer).toContain("trusted_github_url");
+		expect(installer).toContain("require_official_github_origins");
+		expect(installer).toContain("${LOCK_DIR}/pid");
+	});
+
+	test("rejects unofficial GitHub origin overrides", async () => {
+		writeCurlShim(sandbox.shimDir, { assets: {} });
+		const result = await runInstaller([], {
+			GJC_GITHUB_API: "https://evil.example/api",
+		});
+		expect(result.exitCode).not.toBe(0);
+		expect(result.stderr + result.stdout).toContain("GJC_GITHUB_API must be https://api.github.com");
 	});
 
 	test("selects a compact JSON nightly list without a pretty-printed layout", async () => {

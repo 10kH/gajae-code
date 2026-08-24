@@ -47,6 +47,8 @@ describe("install.ps1 Windows PowerShell 5.1 compatibility", () => {
 		expect(installer).toContain("Failed to publish the downloaded binary");
 		expect(installer).toContain('^v\\d+\\.\\d+\\.\\d+-nightly\\.\\d+\\.\\d+\\.g[0-9a-f]+$');
 		expect(installer).toContain("Test-TrustedGithubUri");
+		expect(installer).toContain("Assert-OfficialGithubOrigins");
+		expect(installer).toContain("Join-Path $lockDir \"pid\"");
 	});
 
 	test.skipIf(!pwsh)("parses without syntax errors under PowerShell", async () => {

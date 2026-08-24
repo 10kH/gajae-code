@@ -70,6 +70,7 @@ cleanup() {
         done || true
     fi
     if [ -n "$LOCK_DIR" ] && [ -d "$LOCK_DIR" ]; then
+        rm -f "${LOCK_DIR}/pid"
         rmdir "$LOCK_DIR" 2>/dev/null || true
     fi
     return 0
@@ -118,6 +119,18 @@ trusted_github_url() {
         https://api.github.com/* | https://github.com/*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+require_official_github_origins() {
+    api=$(printf '%s' "$GITHUB_API" | sed 's:/*$::')
+    releases=$(printf '%s' "$GITHUB_RELEASES" | sed 's:/*$::')
+    expected_releases="https://github.com/${REPO}/releases/download"
+    if [ "$api" != "https://api.github.com" ]; then
+        die "GJC_GITHUB_API must be https://api.github.com (got ${GITHUB_API})."
+    fi
+    if [ "$releases" != "$expected_releases" ]; then
+        die "GJC_GITHUB_RELEASES must be ${expected_releases} (got ${GITHUB_RELEASES})."
+    fi
 }
 
 curl_github() {
@@ -296,9 +309,22 @@ detect_platform() {
 acquire_lock() {
     LOCK_DIR="${INSTALL_DIR}/.gjc-install.lock"
     mkdir -p "$INSTALL_DIR"
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+        return 0
+    fi
+    owner=""
+    if [ -f "${LOCK_DIR}/pid" ]; then
+        owner=$(tr -d ' \t\r\n' < "${LOCK_DIR}/pid")
+    fi
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+        die "Another GJC installer is already running in ${INSTALL_DIR} (pid ${owner}, lock: ${LOCK_DIR})."
+    fi
+    rm -rf "$LOCK_DIR"
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         die "Another GJC installer is already running in ${INSTALL_DIR} (lock: ${LOCK_DIR})."
     fi
+    printf '%s\n' "$$" > "${LOCK_DIR}/pid"
 }
 
 resolve_release_tag() {
@@ -471,6 +497,7 @@ install_via_bun() {
 
 install_binary() {
     detect_platform
+    require_official_github_origins
     acquire_lock
     resolve_release_tag
 

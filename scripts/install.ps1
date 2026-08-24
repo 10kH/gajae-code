@@ -44,6 +44,18 @@ function Test-TrustedGithubUri {
     }
 }
 
+function Assert-OfficialGithubOrigins {
+    $api = $GithubApi.TrimEnd("/")
+    $releases = $GithubReleases.TrimEnd("/")
+    $expectedReleases = "https://github.com/$Repo/releases/download"
+    if ($api -ne "https://api.github.com") {
+        throw "GJC_GITHUB_API must be https://api.github.com (got $GithubApi)."
+    }
+    if ($releases -ne $expectedReleases) {
+        throw "GJC_GITHUB_RELEASES must be $expectedReleases (got $GithubReleases)."
+    }
+}
+
 function Get-GithubHeaders {
     param([string]$Uri)
     $headers = @{
@@ -431,6 +443,7 @@ function Install-ViaBun {
 }
 
 function Install-Binary {
+    Assert-OfficialGithubOrigins
     $BinaryName = Get-WindowsBinaryName
     $Latest = Resolve-ReleaseTag
     if (-not (Test-SafeReleaseTag $Latest)) {
@@ -441,11 +454,28 @@ function Install-Binary {
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     $lockDir = Join-Path $InstallDir ".gjc-install.lock"
+    $lockPid = Join-Path $lockDir "pid"
     try {
         New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
     } catch {
-        throw "Another GJC installer is already running in $InstallDir (lock: $lockDir)."
+        $owner = $null
+        if (Test-Path $lockPid) {
+            $owner = (Get-Content $lockPid -ErrorAction SilentlyContinue | Select-Object -First 1)
+        }
+        $alive = $false
+        if ($owner) {
+            try {
+                Get-Process -Id ([int]$owner) -ErrorAction Stop | Out-Null
+                $alive = $true
+            } catch {}
+        }
+        if ($alive) {
+            throw "Another GJC installer is already running in $InstallDir (pid $owner, lock: $lockDir)."
+        }
+        Remove-Item -Recurse -Force $lockDir -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $lockDir -ErrorAction Stop | Out-Null
     }
+    Set-Content -Path $lockPid -Value $PID
 
     $OutPath = Join-Path $InstallDir "gjc.exe"
     $DownloadTmp = Join-Path $InstallDir (".gjc.download." + [System.Guid]::NewGuid().ToString("N"))
