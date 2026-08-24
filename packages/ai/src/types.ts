@@ -637,11 +637,12 @@ export interface ToolCall {
 	escapedNonAsciiArguments?: boolean;
 	/**
 	 * Bounded, payload-free evidence for the original raw escape positions and
-	 * scalars. Required for the display-safe terminal exemption: decoded values
+	 * process-keyed scalar/path identities. Required for the display-safe terminal exemption: decoded values
 	 * alone cannot prove that an ASCII landing such as `\u0077` was not a
 	 * one-nibble mutation of a non-ASCII escape. Presence of this evidence implies
 	 * the guarded state even if a legacy producer omitted
-	 * `escapedNonAsciiArguments`.
+	 * `escapedNonAsciiArguments`. The agent consumes and removes this transient
+	 * field before the tool-call message can become durable.
 	 */
 	escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
 }

@@ -65,7 +65,12 @@ import {
 	iterateWithIdleTimeout,
 	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
-import { captureUnicodeEscapeEvidence, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import {
+	attachUnicodeEscapeEvidence,
+	captureUnicodeEscapeEvidence,
+	isCompleteJson,
+	parseStreamingJson,
+} from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -916,7 +921,9 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				// so the signal has to come from its pre-round-trip sample of the raw payload.
 				if (call.escapedNonAsciiArguments) {
 					block.escapedNonAsciiArguments = true;
-					block.escapedUnicodeArgumentEvidence = call.escapedUnicodeArgumentEvidence;
+					if (call.escapedUnicodeArgumentEvidence) {
+						attachUnicodeEscapeEvidence(block, call.escapedUnicodeArgumentEvidence);
+					}
 				}
 				currentBlock = block;
 				output.content.push(block);

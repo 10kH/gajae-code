@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { streamOllama } from "../src/providers/ollama";
 import type { AssistantMessage, Context, Model, ToolCall } from "../src/types";
+import { unicodeEscapeScalarTag } from "../src/utils/json-parse";
 
 const originalFetch = global.fetch;
 
@@ -77,7 +78,9 @@ describe("Ollama ASCII-escaped non-ASCII tool arguments", () => {
 
 		expect(tool?.arguments).toEqual({ question: "w &" });
 		expect(tool?.escapedNonAsciiArguments).toBe(true);
-		expect(tool?.escapedUnicodeArgumentEvidence?.positions.map(position => position.codePoint)).toEqual([0x77, 0x26]);
+		expect(tool?.escapedUnicodeArgumentEvidence?.positions.map(position => position.scalarTag)).toEqual(
+			[0x77, 0x26].map(unicodeEscapeScalarTag),
+		);
 	});
 
 	it("does not flag literal UTF-8 arguments", async () => {

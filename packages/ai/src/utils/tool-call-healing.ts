@@ -17,7 +17,12 @@
  * the end of a chunk is held back until the next chunk arrives.
  */
 
-import { collectUnicodeEscapeEvidence, parseJsonWithRepair, type UnicodeEscapeEvidence } from "./json-parse";
+import {
+	attachUnicodeEscapeEvidence,
+	collectUnicodeEscapeEvidence,
+	parseJsonWithRepair,
+	type UnicodeEscapeEvidence,
+} from "./json-parse";
 
 const TOK_SECTION_BEGIN = "<|tool_calls_section_begin|>";
 const TOK_SECTION_END = "<|tool_calls_section_end|>";
@@ -255,13 +260,14 @@ export class ToolCallHealer {
 			argsJson = "{}";
 		}
 
-		this.#completed.push({
+		const completed: HealedToolCall = {
 			id,
 			name,
 			arguments: argsJson,
 			escapedNonAsciiArguments,
-			...(escapedUnicodeArgumentEvidence ? { escapedUnicodeArgumentEvidence } : {}),
-		});
+		};
+		if (escapedUnicodeArgumentEvidence) attachUnicodeEscapeEvidence(completed, escapedUnicodeArgumentEvidence);
+		this.#completed.push(completed);
 		this.#inCall = false;
 		this.#inArgs = false;
 		this.#pendingId = "";

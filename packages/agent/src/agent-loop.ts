@@ -35,8 +35,10 @@ import {
 } from "@gajae-code/ai/utils";
 import { isCursorExecResolved } from "@gajae-code/ai/utils/block-symbols";
 import {
+	attachUnicodeEscapeEvidence,
 	type UnicodeEscapeEvidence,
-	unicodeEscapePathHash,
+	unicodeEscapePathTag,
+	unicodeEscapeScalarTag,
 	verifyUnicodeEscapeEvidence,
 } from "@gajae-code/ai/utils/json-parse";
 import { $credentialEnv, sanitizeText } from "@gajae-code/utils";
@@ -427,6 +429,13 @@ function escapedNonAsciiToolCallShape(message: AssistantMessage): {
 	};
 }
 
+/** Remove transient raw-evidence metadata before any message can become durable. */
+function stripUnicodeEscapeEvidence(message: AssistantMessage): void {
+	for (const block of message.content) {
+		if (block.type === "toolCall") delete block.escapedUnicodeArgumentEvidence;
+	}
+}
+
 /**
  * The complete set of non-ASCII characters an escaped payload may decode to and
  * still execute on a display-safe tool after the resample budget: U+2014 EM DASH
@@ -509,7 +518,7 @@ function isDisplaySafeEscapedArguments(tool: AgentTool<TSchema> | undefined, arg
 /**
  * Validate the original raw escape positions, not just the decoded values.
  * Missing, malformed, overflowed, key-position, non-U+2014, or path-mismatched
- * evidence fails closed. Path hashes keep argument keys and values out of the
+ * evidence fails closed. Process-keyed scalar/path tags keep argument text out of the
  * carried metadata while still binding every escape to a declared display field.
  */
 function isDisplaySafeRawEscapeEvidence(
@@ -529,7 +538,8 @@ function isDisplaySafeRawEscapeEvidence(
 		return false;
 	if (evidence.positions.length === 0 || evidence.positions.length > 32) return false;
 
-	const allowedCounts = new Map<string, number>();
+	const allowedValues = new Map<string, { offsets: Set<number>; matched: Set<number> }>();
+	const valueOrdinals = new Map<string, number>();
 	const prefixes = fields.map(field => field.split("."));
 	const isDisplayPath = (path: readonly string[]): boolean =>
 		prefixes.some(field => field.length <= path.length && field.every((segment, index) => path[index] === segment));
@@ -537,12 +547,16 @@ function isDisplaySafeRawEscapeEvidence(
 	const walk = (node: unknown): void => {
 		if (typeof node === "string") {
 			if (!isDisplayPath(path)) return;
-			let count = 0;
-			for (const character of node) if (character.codePointAt(0) === 0x2014) count++;
-			if (count > 0) {
-				const pathHash = unicodeEscapePathHash(path);
-				allowedCounts.set(pathHash, (allowedCounts.get(pathHash) ?? 0) + count);
+			const pathTag = unicodeEscapePathTag(path);
+			const valueOrdinal = valueOrdinals.get(pathTag) ?? 0;
+			valueOrdinals.set(pathTag, valueOrdinal + 1);
+			const offsets = new Set<number>();
+			for (let offset = 0; offset < node.length; ) {
+				const codePoint = node.codePointAt(offset);
+				if (codePoint === 0x2014) offsets.add(offset);
+				offset += codePoint !== undefined && codePoint > 0xffff ? 2 : 1;
 			}
+			allowedValues.set(`${pathTag}:${valueOrdinal}`, { offsets, matched: new Set() });
 			return;
 		}
 		if (Array.isArray(node)) {
@@ -560,22 +574,27 @@ function isDisplaySafeRawEscapeEvidence(
 	walk(args);
 
 	let previousOffset = -1;
+	const allowedScalarTag = unicodeEscapeScalarTag(0x2014);
 	for (const position of evidence.positions) {
 		if (
 			position.location !== "value" ||
-			position.codePoint !== 0x2014 ||
+			position.scalarTag !== allowedScalarTag ||
 			!Number.isSafeInteger(position.offset) ||
 			position.offset <= previousOffset ||
-			!/^[0-9a-f]{64}$/.test(position.pathHash)
+			!/^[0-9a-f]{64}$/.test(position.pathTag) ||
+			!Number.isSafeInteger(position.valueOrdinal) ||
+			position.valueOrdinal < 0 ||
+			!Number.isSafeInteger(position.valueOffset) ||
+			position.valueOffset < 0
 		) {
 			return false;
 		}
 		previousOffset = position.offset;
-		const remaining = allowedCounts.get(position.pathHash) ?? 0;
-		if (remaining === 0) return false;
-		allowedCounts.set(position.pathHash, remaining - 1);
+		const value = allowedValues.get(`${position.pathTag}:${position.valueOrdinal}`);
+		if (!value?.offsets.has(position.valueOffset) || value.matched.has(position.valueOffset)) return false;
+		value.matched.add(position.valueOffset);
 	}
-	return true;
+	return [...allowedValues.values()].every(value => value.offsets.size === value.matched.size);
 }
 /** Remove only the exact assistant response committed by its streaming attempt. */
 function removeCommittedAssistantMessage(messages: AgentMessage[], message: AssistantMessage): boolean {
@@ -1930,6 +1949,7 @@ function managedAssistantShell(
 		}
 	}
 	const content = rawArray === undefined ? [] : rawArray.flatMap(managedContentBlock);
+	restoreTransientUnicodeEscapeEvidence(content, value);
 	const usage = managedAssistantUsage(managedAttemptSnapshot(managedProperty(source, "usage")));
 	const api = managedProperty(source, "api");
 	const provider = managedProperty(source, "provider");
@@ -2026,26 +2046,53 @@ function managedUnicodeEscapeEvidence(value: unknown): UnicodeEscapeEvidence | u
 	for (const positionValue of positionsValue) {
 		if (!isManagedPlainRecord(positionValue)) return undefined;
 		const offset = managedProperty(positionValue, "offset");
-		const codePoint = managedProperty(positionValue, "codePoint");
-		const pathHash = managedProperty(positionValue, "pathHash");
+		const scalarTag = managedProperty(positionValue, "scalarTag");
+		const pathTag = managedProperty(positionValue, "pathTag");
 		const location = managedProperty(positionValue, "location");
+		const valueOrdinal = managedProperty(positionValue, "valueOrdinal");
+		const valueOffset = managedProperty(positionValue, "valueOffset");
 		if (
 			typeof offset !== "number" ||
 			!Number.isSafeInteger(offset) ||
 			offset < 0 ||
-			typeof codePoint !== "number" ||
-			!Number.isSafeInteger(codePoint) ||
-			codePoint < 0 ||
-			codePoint > 0x10ffff ||
-			typeof pathHash !== "string" ||
-			!/^[0-9a-f]{64}$/.test(pathHash) ||
-			(location !== "key" && location !== "value")
+			typeof scalarTag !== "string" ||
+			!/^[0-9a-f]{64}$/.test(scalarTag) ||
+			typeof pathTag !== "string" ||
+			!/^[0-9a-f]{64}$/.test(pathTag) ||
+			(location !== "key" && location !== "value") ||
+			typeof valueOrdinal !== "number" ||
+			!Number.isSafeInteger(valueOrdinal) ||
+			valueOrdinal < 0 ||
+			typeof valueOffset !== "number" ||
+			!Number.isSafeInteger(valueOffset) ||
+			valueOffset < 0
 		) {
 			return undefined;
 		}
-		positions.push({ offset, codePoint, pathHash, location });
+		positions.push({ offset, scalarTag, pathTag, location, valueOrdinal, valueOffset });
 	}
 	return { positions, totalPositions, truncated, malformed, integrity };
+}
+
+function restoreTransientUnicodeEscapeEvidence(content: AssistantMessage["content"], liveMessage: unknown): void {
+	const liveContent = managedProperty(liveMessage, "content");
+	if (!Array.isArray(liveContent)) return;
+	for (const destination of content) {
+		if (destination.type !== "toolCall") continue;
+		const matches = liveContent.filter(
+			candidate =>
+				isManagedPlainRecord(candidate) &&
+				managedProperty(candidate, "type") === "toolCall" &&
+				managedProperty(candidate, "id") === destination.id &&
+				managedProperty(candidate, "name") === destination.name,
+		);
+		if (matches.length !== 1) continue;
+		const rawEvidence = managedProperty(matches[0], "escapedUnicodeArgumentEvidence");
+		if (rawEvidence === undefined) continue;
+		const evidence = managedUnicodeEscapeEvidence(rawEvidence);
+		if (evidence) attachUnicodeEscapeEvidence(destination, evidence);
+		else destination.escapedNonAsciiArguments = true;
+	}
 }
 
 function managedAssistantContent(value: unknown): AssistantMessage["content"][number] | undefined {
@@ -2813,7 +2860,18 @@ class ManagedAttemptTransaction {
 	}
 
 	#losslessSnapshot<T>(value: T): T {
-		return losslessDetachedClone(value);
+		const snapshot = losslessDetachedClone(value);
+		if (
+			isManagedPlainRecord(snapshot) &&
+			managedProperty(snapshot, "role") === "assistant" &&
+			Array.isArray(managedProperty(snapshot, "content"))
+		) {
+			restoreTransientUnicodeEscapeEvidence(
+				managedProperty(snapshot, "content") as AssistantMessage["content"],
+				value,
+			);
+		}
+		return snapshot;
 	}
 
 	#losslessAgentEventSnapshot(event: AgentEvent): AgentEvent {
@@ -3688,6 +3746,7 @@ async function runLoopBody(
 								...diagnosticShape,
 							},
 				);
+				stripUnicodeEscapeEvidence(message);
 				// The defective turn was already committed to the context by the
 				// streaming path. Remove that exact object rather than assuming it is
 				// still the tail: callbacks may append user/system history while the
@@ -4846,6 +4905,10 @@ async function executeToolCalls(
 
 		await runInActiveSpan(toolSpan, async () => {
 			try {
+				const escapedUnicodeArgumentEvidence = toolCall.escapedUnicodeArgumentEvidence;
+				const escapedArgumentsGuarded =
+					toolCall.escapedNonAsciiArguments || escapedUnicodeArgumentEvidence !== undefined;
+				if (escapedArgumentsGuarded) delete toolCall.escapedUnicodeArgumentEvidence;
 				if (toolCall.incompleteArguments) {
 					record.argumentValidationFailed = true;
 					// The provider flagged this call's arguments as unsafe to execute.
@@ -4862,11 +4925,11 @@ async function executeToolCalls(
 									: `Tool call "${toolCall.name}" was cut off before its arguments finished streaming (the response hit its output token limit). The partial arguments cannot be executed. Re-issue the call with complete arguments, splitting the work into smaller steps if needed.`;
 					throw new Error(detail);
 				}
-				if (
-					(toolCall.escapedNonAsciiArguments || toolCall.escapedUnicodeArgumentEvidence !== undefined) &&
-					(!isDisplaySafeEscapedArguments(tool, argsForExecution) ||
-						!isDisplaySafeRawEscapeEvidence(tool, argsForExecution, toolCall.escapedUnicodeArgumentEvidence))
-				) {
+				const displaySafeEscapedArguments =
+					escapedArgumentsGuarded &&
+					isDisplaySafeEscapedArguments(tool, argsForExecution) &&
+					isDisplaySafeRawEscapeEvidence(tool, argsForExecution, escapedUnicodeArgumentEvidence);
+				if (escapedArgumentsGuarded && !displaySafeEscapedArguments) {
 					record.argumentValidationFailed = true;
 					// The arguments decoded cleanly, but they were spelled as `\uXXXX`
 					// escapes rather than literal characters. Hand-written hex is where models

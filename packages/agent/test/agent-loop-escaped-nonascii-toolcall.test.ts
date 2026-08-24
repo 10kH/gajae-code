@@ -359,7 +359,6 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
 			}
 		}
-
 		// The resampled call ran; the defective one neither ran nor produced an error.
 		expect(executed).toEqual([{ question: QUESTION }]);
 		expect(toolResults).toHaveLength(1);
@@ -1079,9 +1078,13 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(outcomes).toHaveLength(1);
 		expect(outcomes[0].type).toBe("escaped_arguments_discarded");
 		if (outcomes[0].type === "escaped_arguments_discarded") {
-			expect(outcomes[0].message.content.some(block => block.type === "toolCall" && block.id === "tc-managed")).toBe(
-				true,
+			const managedCall = outcomes[0].message.content.find(
+				block => block.type === "toolCall" && block.id === "tc-managed",
 			);
+			expect(managedCall).toBeDefined();
+			expect(
+				managedCall?.type === "toolCall" ? managedCall.escapedUnicodeArgumentEvidence : undefined,
+			).toBeUndefined();
 		}
 		expect(executed).toHaveLength(0);
 		expect(toolResults).toHaveLength(0);
@@ -1274,6 +1277,7 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 				toolResults.push({ isError: event.isError, text: first?.type === "text" ? first.text : "" });
 			}
 		}
+		const produced = await stream.result();
 
 		// The full budget ran before execution: 1 original + 2 resamples + the
 		// follow-up elicited by the executed tool result.
@@ -1281,6 +1285,15 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 		expect(executed).toEqual([{ question: "How should the daemon drive sessions — in-process?" }]);
 		expect(toolResults).toHaveLength(1);
 		expect(toolResults[0].isError).toBeFalsy();
+		expect(
+			produced.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(
+						block => block.type === "toolCall" && block.escapedUnicodeArgumentEvidence !== undefined,
+					),
+			),
+		).toBe(false);
 	});
 
 	it.each([
@@ -1377,6 +1390,49 @@ describe("agentLoop: ASCII-escaped non-ASCII argument guard", () => {
 
 		expect(mock.calls).toHaveLength(4);
 		expect(executed).toEqual([argumentsValue]);
+	});
+
+	it.each([
+		["shifted decoded position", String.raw`{"question":"x\u2014"}`, "—x"],
+		["unrepresented decoded U+2014", `${String.raw`{"question":"\u2014 `}—"}`, "— —"],
+	])("rejects %s despite an otherwise valid evidence envelope", async (_label, rawArguments, decodedQuestion) => {
+		const executed: Array<Record<string, unknown>> = [];
+		const turn = (id: string) => ({
+			content: [
+				{
+					type: "toolCall" as const,
+					id,
+					name: "ask",
+					arguments: { question: decodedQuestion },
+					escapedNonAsciiArguments: true,
+					escapedUnicodeArgumentEvidence: escapeEvidence(rawArguments),
+				},
+			],
+		});
+		const mock = createMockModel({
+			responses: [turn("tc-1"), turn("tc-2"), turn("tc-3"), { content: ["done"] }],
+		});
+		const stream = agentLoop(
+			[createUserMessage("ask me")],
+			{ systemPrompt: [""], messages: [], tools: [displaySafeAskTool(executed)] },
+			{ model: mock.model, convertToLlm: identityConverter },
+			undefined,
+			mock.stream,
+		);
+		for await (const _event of stream) {
+			// drain
+		}
+		const produced = await stream.result();
+		expect(executed).toHaveLength(0);
+		expect(
+			produced.some(
+				message =>
+					message.role === "assistant" &&
+					message.content.some(
+						block => block.type === "toolCall" && block.escapedUnicodeArgumentEvidence !== undefined,
+					),
+			),
+		).toBe(false);
 	});
 
 	it("fails closed when raw escape evidence is malformed, missing, or overflowed", async () => {

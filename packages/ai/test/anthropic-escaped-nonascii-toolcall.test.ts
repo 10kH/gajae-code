@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Messages } from "@anthropic-ai/sdk/resources/messages/messages";
 import { streamAnthropic } from "../src/providers/anthropic";
 import type { AssistantMessage, Context, Model, ToolCall } from "../src/types";
+import { unicodeEscapeScalarTag } from "../src/utils/json-parse";
 
 const model: Model<"anthropic-messages"> = {
 	id: "claude-sonnet-4-5",
@@ -87,9 +88,11 @@ describe("Anthropic ASCII-escaped non-ASCII tool arguments", () => {
 		expect(tool?.arguments).toEqual({ question: "마지막 병목" });
 		expect(tool?.escapedNonAsciiArguments).toBe(true);
 		expect(tool?.escapedUnicodeArgumentEvidence).toMatchObject({ malformed: false, truncated: false });
-		expect(tool?.escapedUnicodeArgumentEvidence?.positions.map(position => position.codePoint)).toEqual([
-			0xb9c8, 0xc9c0, 0xb9c9, 0xbcd1, 0xbaa9,
-		]);
+		expect(tool?.escapedUnicodeArgumentEvidence?.positions.map(position => position.scalarTag)).toEqual(
+			[0xb9c8, 0xc9c0, 0xb9c9, 0xbcd1, 0xbaa9].map(unicodeEscapeScalarTag),
+		);
+		expect(JSON.stringify(tool)).not.toContain("escapedUnicodeArgumentEvidence");
+		expect(tool ? Object.keys(tool) : []).not.toContain("escapedUnicodeArgumentEvidence");
 		expect(tool && "partialJson" in tool).toBe(false);
 	});
 
@@ -99,7 +102,9 @@ describe("Anthropic ASCII-escaped non-ASCII tool arguments", () => {
 
 		expect(tool?.arguments).toEqual({ question: "w &" });
 		expect(tool?.escapedNonAsciiArguments).toBe(true);
-		expect(tool?.escapedUnicodeArgumentEvidence?.positions.map(position => position.codePoint)).toEqual([0x77, 0x26]);
+		expect(tool?.escapedUnicodeArgumentEvidence?.positions.map(position => position.scalarTag)).toEqual(
+			[0x77, 0x26].map(unicodeEscapeScalarTag),
+		);
 	});
 
 	it("does not flag literal UTF-8 arguments", async () => {

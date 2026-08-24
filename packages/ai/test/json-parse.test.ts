@@ -6,7 +6,8 @@ import {
 	parseJsonWithRepair,
 	parseStreamingJson,
 	repairJson,
-	unicodeEscapePathHash,
+	unicodeEscapePathTag,
+	unicodeEscapeScalarTag,
 	verifyUnicodeEscapeEvidence,
 } from "@gajae-code/ai/utils/json-parse";
 
@@ -150,23 +151,36 @@ describe("findUnnecessaryUnicodeEscape", () => {
 			positions: [
 				{
 					offset: 28,
-					codePoint: 0x2014,
-					pathHash: unicodeEscapePathHash(["questions", "question"]),
+					scalarTag: unicodeEscapeScalarTag(0x2014),
+					pathTag: unicodeEscapePathTag(["questions", "question"]),
 					location: "value",
+					valueOrdinal: 0,
+					valueOffset: 1,
 				},
 				{
 					offset: 35,
-					codePoint: 0x77,
-					pathHash: unicodeEscapePathHash(["questions", "question"]),
+					scalarTag: unicodeEscapeScalarTag(0x77),
+					pathTag: unicodeEscapePathTag(["questions", "question"]),
 					location: "value",
+					valueOrdinal: 0,
+					valueOffset: 3,
 				},
 				{
 					offset: 57,
-					codePoint: 0x2014,
-					pathHash: unicodeEscapePathHash(["questions", "question"]),
+					scalarTag: unicodeEscapeScalarTag(0x2014),
+					pathTag: unicodeEscapePathTag(["questions", "question"]),
 					location: "value",
+					valueOrdinal: 1,
+					valueOffset: 0,
 				},
-				{ offset: 83, codePoint: 0x26, pathHash: unicodeEscapePathHash(["meta", "note"]), location: "value" },
+				{
+					offset: 83,
+					scalarTag: unicodeEscapeScalarTag(0x26),
+					pathTag: unicodeEscapePathTag(["meta", "note"]),
+					location: "value",
+					valueOrdinal: 0,
+					valueOffset: 0,
+				},
 			],
 			totalPositions: 4,
 			truncated: false,
@@ -176,14 +190,17 @@ describe("findUnnecessaryUnicodeEscape", () => {
 		expect(evidence && verifyUnicodeEscapeEvidence(evidence)).toBe(true);
 		expect(JSON.stringify(evidence)).not.toContain("questions");
 		expect(JSON.stringify(evidence)).not.toContain("note");
+		expect(JSON.stringify(evidence)).not.toContain("codePoint");
 	});
 
 	it("retains duplicate escapes and marks escaped keys as structural", () => {
 		const evidence = collectUnicodeEscapeEvidence(String.raw`{"\u006b":"\u2014\u2014"}`);
-		expect(evidence?.positions.map(position => [position.codePoint, position.location])).toEqual([
-			[0x6b, "key"],
-			[0x2014, "value"],
-			[0x2014, "value"],
+		expect(
+			evidence?.positions.map(position => [position.scalarTag, position.location, position.valueOffset]),
+		).toEqual([
+			[unicodeEscapeScalarTag(0x6b), "key", 0],
+			[unicodeEscapeScalarTag(0x2014), "value", 0],
+			[unicodeEscapeScalarTag(0x2014), "value", 1],
 		]);
 	});
 
@@ -197,9 +214,9 @@ describe("findUnnecessaryUnicodeEscape", () => {
 	});
 
 	it("keeps dotted keys distinct from nested display paths", () => {
-		expect(unicodeEscapePathHash(["questions.question"])).not.toBe(unicodeEscapePathHash(["questions", "question"]));
+		expect(unicodeEscapePathTag(["questions.question"])).not.toBe(unicodeEscapePathTag(["questions", "question"]));
 		const evidence = collectUnicodeEscapeEvidence(String.raw`{"questions.question":"\u2014"}`);
-		expect(evidence?.positions[0]?.pathHash).toBe(unicodeEscapePathHash(["questions.question"]));
+		expect(evidence?.positions[0]?.pathTag).toBe(unicodeEscapePathTag(["questions.question"]));
 	});
 
 	it("fails closed on duplicate object members", () => {

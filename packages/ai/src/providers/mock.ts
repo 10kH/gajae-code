@@ -56,7 +56,7 @@ import type {
 	Usage,
 } from "../types";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import type { UnicodeEscapeEvidence } from "../utils/json-parse";
+import { attachUnicodeEscapeEvidence, type UnicodeEscapeEvidence } from "../utils/json-parse";
 
 /** The API string this provider serves. */
 export const MOCK_API = "mock" as const;
@@ -428,7 +428,7 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 		return { type: "text", text: input };
 	}
 	if (input.type === "toolCall") {
-		return {
+		const toolCall = {
 			type: "toolCall",
 			id: input.id ?? generateToolCallId(state),
 			name: input.name,
@@ -437,11 +437,12 @@ function normalizeContent(input: MockContent, state: MockModel): TextContent | T
 				? { incompleteArguments: true, incompleteArgumentsReason: input.incompleteArgumentsReason ?? "truncated" }
 				: {}),
 			...(input.escapedNonAsciiArguments ? { escapedNonAsciiArguments: true } : {}),
-			...(input.escapedUnicodeArgumentEvidence
-				? { escapedUnicodeArgumentEvidence: input.escapedUnicodeArgumentEvidence }
-				: {}),
 			...(input.thoughtSignature ? { thoughtSignature: input.thoughtSignature } : {}),
 		} as ToolCall;
+		if (input.escapedUnicodeArgumentEvidence) {
+			attachUnicodeEscapeEvidence(toolCall, input.escapedUnicodeArgumentEvidence);
+		}
+		return toolCall;
 	}
 	return input;
 }

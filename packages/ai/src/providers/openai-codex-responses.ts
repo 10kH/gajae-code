@@ -59,7 +59,7 @@ import {
 	getStreamFirstEventTimeoutMs,
 	iterateWithIdleTimeout,
 } from "../utils/idle-iterator";
-import { captureUnicodeEscapeEvidence, collectUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
+import { captureUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import {
 	adaptSchemaForStrict,
@@ -1564,15 +1564,15 @@ function handleOutputItemDone(
 			throw new Error("Codex function_call terminal item did not match the active tool call");
 		}
 		runtime.finalizedToolCallIds.add(id);
-		const escapedUnicodeArgumentEvidence = collectUnicodeEscapeEvidence(item.arguments);
 		const toolCall: ToolCall = {
 			type: "toolCall",
 			id,
 			name: codexToolCanonicalName(item.name),
 			arguments: terminalArguments as Record<string, unknown>,
-			...(escapedUnicodeArgumentEvidence ? { escapedNonAsciiArguments: true, escapedUnicodeArgumentEvidence } : {}),
 		};
+		captureUnicodeEscapeEvidence(toolCall, item.arguments);
 		Object.assign(runtime.currentBlock, toolCall);
+		captureUnicodeEscapeEvidence(runtime.currentBlock, item.arguments);
 		delete (runtime.currentBlock as { partialJson?: string }).partialJson;
 		delete (runtime.currentBlock as { doneInput?: string }).doneInput;
 		runtime.canSafelyReplayWebsocketOverSse = false;
