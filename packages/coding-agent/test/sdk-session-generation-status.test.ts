@@ -2,10 +2,14 @@ import { afterEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SessionRouter } from "../src/sdk/router";
 
 const tempDirs: string[] = [];
+
+const fixtureProcessIncarnation = processIncarnation(process.pid);
+if (!fixtureProcessIncarnation) throw new Error("Current process incarnation is unavailable.");
 
 afterEach(async () => {
 	await Promise.all(tempDirs.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
@@ -34,7 +38,7 @@ async function register(
 		endpointGeneration,
 		pid: process.pid,
 		endpointMtimeMs: endpointGeneration * 1_000,
-		...(options.hostIncarnation ? { hostIncarnation: options.hostIncarnation } : {}),
+		hostIncarnation: options.hostIncarnation ?? fixtureProcessIncarnation,
 		...(options.ts === undefined ? {} : { ts: options.ts }),
 	});
 }
@@ -54,7 +58,7 @@ async function retire(
 		endpointGeneration,
 		pid: process.pid,
 		endpointMtimeMs: endpointGeneration * 1_000,
-		...(options.hostIncarnation ? { hostIncarnation: options.hostIncarnation } : {}),
+		hostIncarnation: options.hostIncarnation ?? fixtureProcessIncarnation,
 		...(options.ts === undefined ? {} : { ts: options.ts }),
 	});
 }
