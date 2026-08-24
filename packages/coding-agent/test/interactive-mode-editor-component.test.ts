@@ -20,6 +20,7 @@ import type {
 } from "../src/extensibility/extensions";
 import { CustomEditor } from "../src/modes/components/custom-editor";
 import { computeIrcWorkLaneWidths, IrcSplitViewComponent } from "../src/modes/components/irc-sidebar";
+import { resolveWelcomeIntroTickMs, WelcomeComponent } from "../src/modes/components/welcome";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { InteractiveMode } from "../src/modes/interactive-mode";
@@ -466,6 +467,75 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(mode.todoExpanded).toBe(false);
 		expect(recollapsed).not.toContain("task-7");
 		expect(recollapsed).toMatch(/\+\s*2\s+more/);
+	});
+
+	it("forwards startup.skipLogoAnimation through the real settings path", async () => {
+		// `init()` schedules unrelated timers (pet capability settle, etc.), so a
+		// global timer count proves nothing. Record interval delays instead and
+		// A/B the two settings values in one test so the intro tick is the only
+		// difference between them.
+		const introTick = resolveWelcomeIntroTickMs(process.platform, Bun.env.TERM_PROGRAM_VERSION ?? "");
+		const originalSetInterval = globalThis.setInterval;
+		const delays: number[] = [];
+		globalThis.setInterval = ((handler: () => void, delay?: number, ...args: unknown[]) => {
+			delays.push(Number(delay));
+			return Reflect.apply(originalSetInterval, globalThis, [handler, delay, ...args]);
+		}) as typeof globalThis.setInterval;
+
+		const makeMode = () =>
+			new InteractiveMode(
+				session,
+				"test",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				injectedKeyDisplayContext,
+			);
+		const skipped = makeMode();
+		const animated = makeMode();
+		try {
+			settings.set("startup.quiet", false);
+			settings.set("startup.skipLogoAnimation", true);
+			vi.spyOn(skipped.ui, "start").mockImplementation(() => {});
+			await skipped.init();
+
+			const welcome = skipped.ui.children.find(child => child instanceof WelcomeComponent);
+			expect(welcome).toBeInstanceOf(WelcomeComponent);
+			// Resting content still renders: this is not startup.quiet.
+			expect(welcome?.render(120).length).toBeGreaterThan(0);
+			expect(delays).not.toContain(introTick);
+
+			// Mutating the setting after init() is inert: it is read once at startup.
+			settings.set("startup.skipLogoAnimation", false);
+			expect(delays).not.toContain(introTick);
+
+			// Positive control on the same instrument: the default value animates.
+			delays.length = 0;
+			vi.spyOn(animated.ui, "start").mockImplementation(() => {});
+			await animated.init();
+
+			expect(animated.ui.children.some(child => child instanceof WelcomeComponent)).toBe(true);
+			expect(delays).toContain(introTick);
+		} finally {
+			globalThis.setInterval = originalSetInterval;
+			skipped.stop();
+			animated.stop();
+		}
+	});
+
+	it("still renders no welcome surface at all under startup.quiet regardless of the motion flag", async () => {
+		settings.set("startup.quiet", true);
+		settings.set("startup.skipLogoAnimation", false);
+		try {
+			vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+			await mode.init();
+
+			expect(mode.ui.children.some(child => child instanceof WelcomeComponent)).toBe(false);
+		} finally {
+			mode.stop();
+		}
 	});
 
 	it("suppresses the toggle hint when the panel is requested-open but yielded at narrow width", () => {

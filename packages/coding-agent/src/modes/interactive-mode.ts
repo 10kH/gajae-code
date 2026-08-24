@@ -808,6 +808,7 @@ export class InteractiveMode implements InteractiveModeContext {
 					rightGutterWidth: COMPOSER_RIGHT_GUTTER_WIDTH,
 					collapseChangelog: settings.get("collapseChangelog"),
 					keyDisplayContext: this.#keyDisplayContext,
+					reducedMotion: settings.get("startup.skipLogoAnimation") === true,
 				},
 			);
 

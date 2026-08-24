@@ -24,6 +24,8 @@ export interface WelcomeComponentOptions {
 	collapseChangelog?: boolean;
 	buildLabel?: string;
 	keyDisplayContext?: KeyDisplayContext;
+	/** Render the resting logo frame instead of playing the startup gradient sweep. */
+	reducedMotion?: boolean;
 }
 
 const WELCOME_STATIC_RIGHT_ROWS_EXCLUDING_DYNAMIC_SECTIONS = 9;
@@ -73,6 +75,12 @@ export class WelcomeComponent implements Component {
 	 */
 	playIntro(requestRender: () => void): void {
 		this.#stopAnimation();
+		if (this.options.reducedMotion) {
+			// `#animStart` stays null, which `#currentLogoFrame` already resolves to
+			// the resting frame, so one render settles the surface with no timer.
+			requestRender();
+			return;
+		}
 		this.#animStart = performance.now();
 		requestRender();
 		this.#animTimer = setInterval(() => {
