@@ -130,11 +130,13 @@ test("ACP provider readiness rebinds expired reverse leases on the live attachme
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
 		sessionId: "session-1",
+		connectionId: "router-connection-1",
 		generation: 1,
 		isCurrent: () => true,
 		send: async () => {},
 		sendMaintenance: () => {},
 	};
+
 	const adapter = new AcpSdkAdapter({
 		router: {
 			request: async (_sessionId: string, frame: Record<string, unknown>) => {
@@ -179,10 +181,51 @@ test("ACP provider readiness rebinds expired reverse leases on the live attachme
 	}
 });
 
+test("ACP provider rebind ignores lease errors from a foreign connection (#4909)", async () => {
+	const registrations: Record<string, unknown>[] = [];
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		connectionId: "router-connection-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations.push(frame);
+				return { ok: true, result: { leaseId: "lease-1" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await adapter.start();
+		expect(registrations).toHaveLength(1);
+		adapter.acceptFrame({
+			type: "reverse_response",
+			id: "",
+			connectionId: "other-connection",
+			leaseId: "lease-1",
+			ok: false,
+			error: { code: "lease_expired", message: "Lease expired." },
+		});
+		await Bun.sleep(30);
+		expect(registrations).toHaveLength(1);
+	} finally {
+		await adapter.close();
+	}
+});
+
 test("ACP provider rebind reports non-conflict adapter failures as provider_rebind_failed (#4909)", async () => {
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
 		sessionId: "session-1",
+		connectionId: "router-connection-1",
 		generation: 1,
 		isCurrent: () => true,
 		send: async () => {},
@@ -228,6 +271,7 @@ test("ACP provider rebind observes lease_expired through the Router event wrappe
 	const attachment: SessionAttachment = {
 		authorityId: "session-1:stable",
 		sessionId: "session-1",
+		connectionId: "router-connection-1",
 		generation: 1,
 		isCurrent: () => true,
 		send: async () => {},

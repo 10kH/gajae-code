@@ -1692,13 +1692,14 @@ export class AcpAgent implements Agent {
 				record.adapter,
 			);
 		}
+		waiter.dispatched = true;
 		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
 			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
 			return await response;
 		}
 
 		const acknowledgementTask = (async (): Promise<PromptResponse> => {
-			waiter.dispatched = true;
+			if (waiter.settled || record.activePrompt !== waiter) return await response;
 			const acknowledgement = skillInvocation
 				? await record.adapter.control("skill.invoke", skillInvocation)
 				: await record.adapter.prompt({

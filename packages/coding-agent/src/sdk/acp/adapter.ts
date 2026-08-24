@@ -528,10 +528,12 @@ export class AcpSdkAdapter {
 
 	async #activateProviders(force = false): Promise<void> {
 		if (this.#providers.length === 0) return;
-		if (!force && this.#providersActivated) return;
 		if (this.#providerActivation) {
 			await this.#providerActivation;
-			if (!force || this.#closed || this.#providersActivated) return;
+			if (this.#closed) return;
+			if (!force && this.#providersActivated) return;
+		} else if (!force && this.#providersActivated) {
+			return;
 		}
 
 		const activation = (async () => {
@@ -824,7 +826,7 @@ export class AcpSdkAdapter {
 		const leaseId = typeof response.leaseId === "string" ? response.leaseId : "";
 		const connectionId = typeof response.connectionId === "string" ? response.connectionId : "";
 		if (!leaseId || !this.#ownsLeaseId(leaseId)) return false;
-		if (this.#connectionId !== undefined && connectionId !== this.#connectionId) return false;
+		if (!this.#connectionId || connectionId !== this.#connectionId) return false;
 		const code = object(response.error)?.code;
 		return code === "lease_expired" || code === "not_lease_owner";
 	}
