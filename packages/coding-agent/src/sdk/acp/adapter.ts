@@ -174,6 +174,8 @@ export class AcpSdkAdapter {
 	#leases = new Map<string, string>();
 	#reclaiming?: Promise<void>;
 	#providerActivation?: Promise<void>;
+	#ensuring?: Promise<void>;
+
 	#providersActivated = false;
 	#reverseRequests = new Map<string, ReverseRequest>();
 	#reconnectFailedHandlers = new Set<AcpReconnectFailedHandler>();
@@ -258,21 +260,24 @@ export class AcpSdkAdapter {
 	 */
 	async ensureProviders(): Promise<void> {
 		if (this.#closed || this.#providers.length === 0) return;
-		if (this.#providerActivation) await this.#providerActivation;
-		if (this.#closed) return;
-		this.#providersActivated = false;
-		try {
-			await this.#activateProviders();
-		} catch (error) {
-			// A live foreign owner must keep the lease. Rebind is best-effort recovery
-			// of *this* adapter's expired registration, not a steal, and must not fail
-			// an otherwise healthy ACP prompt (#4909).
-			if (providerErrorCode(error) === "provider_lease_conflict") {
-				if (this.#leases.size > 0) this.#providersActivated = true;
-				return;
+		if (this.#ensuring) return await this.#ensuring;
+		const run = (async () => {
+			if (this.#closed) return;
+			try {
+				await this.#activateProviders(true);
+			} catch (error) {
+				// A live foreign owner must keep the lease. Rebind is best-effort recovery
+				// of *this* adapter's expired registration, not a steal, and must not fail
+				// an otherwise healthy ACP prompt (#4909).
+				if (providerErrorCode(error) === "provider_lease_conflict") return;
+				throw error;
 			}
-
-			throw error;
+		})();
+		this.#ensuring = run;
+		try {
+			await run;
+		} finally {
+			if (this.#ensuring === run) this.#ensuring = undefined;
 		}
 	}
 
@@ -529,9 +534,14 @@ export class AcpSdkAdapter {
 		this.#leases.set(provider.capability, result.leaseId);
 	}
 
-	async #activateProviders(): Promise<void> {
-		if (this.#providersActivated || this.#providers.length === 0) return;
-		if (this.#providerActivation) return await this.#providerActivation;
+	async #activateProviders(force = false): Promise<void> {
+		if (this.#providers.length === 0) return;
+		if (!force && this.#providersActivated) return;
+		if (this.#providerActivation) {
+			await this.#providerActivation;
+			if (!force || this.#closed || this.#providersActivated) return;
+		}
+
 		const activation = (async () => {
 			for (;;) {
 				const attachment = this.#attachment;
@@ -541,7 +551,11 @@ export class AcpSdkAdapter {
 						try {
 							await this.registerProvider(provider);
 						} catch (error) {
-							if (providerErrorCode(error) === "provider_lease_conflict") continue;
+							if (providerErrorCode(error) === "provider_lease_conflict") {
+								this.#leases.delete(provider.capability);
+								continue;
+							}
+
 							throw error;
 						}
 					}
@@ -824,6 +838,8 @@ export class AcpSdkAdapter {
 		return (
 			this.#reverseRequests.get(id) === request &&
 			request.state === "pending" &&
+			this.#router !== undefined &&
+			this.#connectionId === request.connectionId &&
 			request.connectionId === connectionId &&
 			request.capability === capability &&
 			request.leaseId === leaseId

@@ -328,9 +328,48 @@ test("ACP provider rebind leaves a live foreign permission lease in place (#4909
 		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
 		await expect(adapter.ensureProviders()).resolves.toBeUndefined();
 		expect(registrations.length).toBeGreaterThanOrEqual(2);
-		expect(adapter.leaseIds.get("permission")).toBe("lease-1");
+		expect(adapter.leaseIds.get("permission")).toBeUndefined();
+
 		expect(reconnectFailures).toEqual([]);
 	} finally {
+		await adapter.close();
+	}
+});
+
+test("ACP provider refresh coalesces concurrent ensureProviders calls (#4909)", async () => {
+	const registrations: Record<string, unknown>[] = [];
+	const { promise: secondRegistration, resolve: resolveSecondRegistration } = Promise.withResolvers<void>();
+	const attachment: SessionAttachment = {
+		authorityId: "session-1:stable",
+		sessionId: "session-1",
+		generation: 1,
+		isCurrent: () => true,
+		send: async () => {},
+		sendMaintenance: () => {},
+	};
+	const adapter = new AcpSdkAdapter({
+		router: {
+			request: async (_sessionId: string, frame: Record<string, unknown>) => {
+				registrations.push(frame);
+				if (registrations.length === 2) await secondRegistration;
+				return { ok: true, result: { leaseId: "lease-1" } };
+			},
+		} as never,
+		attachment,
+		sessionId: attachment.sessionId,
+		providers: [{ capability: "permission", definitions: [] }],
+	});
+	try {
+		await adapter.start();
+		expect(registrations).toHaveLength(1);
+		const first = adapter.ensureProviders();
+		await waitFor(() => registrations.length === 2, "forced refresh registration");
+		const second = adapter.ensureProviders();
+		resolveSecondRegistration();
+		await Promise.all([first, second]);
+		expect(registrations).toHaveLength(2);
+	} finally {
+		resolveSecondRegistration();
 		await adapter.close();
 	}
 });
