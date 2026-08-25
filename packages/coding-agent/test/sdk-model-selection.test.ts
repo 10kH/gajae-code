@@ -130,10 +130,13 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		selectedRowId: number;
 		commandRowId: number;
 		commandMarker: string;
+		preloadedRegistry?: ModelRegistry;
 		cleanup(): Promise<void>;
 	}
 
-	async function seedOwnedDiscoveryFixture(): Promise<OwnedDiscoveryFixture> {
+	async function seedOwnedDiscoveryFixture(
+		cacheCredential: "wrong" | "selected" = "selected",
+	): Promise<OwnedDiscoveryFixture> {
 		const root = path.join(tempDir, `owned-${Snowflake.next()}`);
 		const agentDir = path.join(root, "agent");
 		const modelsPath = path.join(agentDir, "models.yml");
@@ -201,12 +204,15 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			}
 
 			const seedRegistry = new ModelRegistry(seedAuth, modelsPath);
-			expect(await seedAuth.getApiKey(provider)).toBe(wrongKey);
+			if (cacheCredential === "selected") {
+				expect(await seedAuth.getApiKey(provider)).toBe(wrongKey);
+			}
+			const cacheKey = cacheCredential === "selected" ? selectedKey : wrongKey;
 			let seedRequests = 0;
 			using _seedFetch = hookFetch((input, init) => {
 				seedRequests += 1;
 				expect(String(input)).toBe(`${baseUrl}/models`);
-				expect(new Headers(init?.headers).get("Authorization")).toBe(`Bearer ${selectedKey}`);
+				expect(new Headers(init?.headers).get("Authorization")).toBe(`Bearer ${cacheKey}`);
 				return new Response(JSON.stringify({ data: [{ id: modelId }] }), {
 					status: 200,
 					headers: { "Content-Type": "application/json" },
@@ -215,8 +221,11 @@ describe("createAgentSession deferred model pattern resolution", () => {
 			await seedRegistry.refreshProvider(provider, "online");
 			expect(seedRequests).toBe(1);
 			expect(seedRegistry.find(provider, modelId)).toBeDefined();
-			seedAuth.close();
-			seedAuth = undefined;
+			const preloadedRegistry = cacheCredential === "wrong" ? seedRegistry : undefined;
+			if (!preloadedRegistry) {
+				seedAuth.close();
+				seedAuth = undefined;
+			}
 			closeModelCache(cacheDbPath);
 
 			setAgentDir(agentDir);
@@ -239,6 +248,7 @@ describe("createAgentSession deferred model pattern resolution", () => {
 				selectedRowId: selectedRow.id,
 				commandRowId: commandRow.id,
 				commandMarker,
+				preloadedRegistry,
 				cleanup,
 			};
 		} catch (error) {
@@ -623,6 +633,241 @@ describe("createAgentSession deferred model pattern resolution", () => {
 	test("owned registry matching cache keeps unknown model unresolved", async () => {
 		const fixture = await seedOwnedDiscoveryFixture();
 		await assertOwnedCachedModelNotFound(fixture, fixture.selectedRowId, "genuinely-unknown-model", true);
+	});
+
+	test("explicit selector rejects an existing dynamic model cached for another literal credential", async () => {
+		const fixture = await seedOwnedDiscoveryFixture("wrong");
+		const admissions: boolean[] = [];
+		const sharedRegistry = fixture.preloadedRegistry;
+		if (!sharedRegistry) throw new Error("Expected preloaded foreign-credential registry");
+		let providerRequests = 0;
+		let session: { dispose(): Promise<void> } | undefined;
+		try {
+			expect(sharedRegistry.find(fixture.provider, fixture.modelId)).toBeDefined();
+			const discoveryStateBefore = sharedRegistry.getProviderDiscoveryState(fixture.provider);
+			using _admissions = spyOnCacheAdmissions(admissions);
+			using _blockedFetch = hookFetch(() => {
+				providerRequests += 1;
+				return Promise.reject(new Error("provider request"));
+			});
+			const result = await createAgentSession({
+				...ownedDiscoverySessionOptions(fixture, fixture.selectedRowId, fixture.modelId),
+				modelRegistry: sharedRegistry,
+			});
+			session = result.session;
+			expect(admissions).toEqual([]);
+			expect(sharedRegistry.find(fixture.provider, fixture.modelId)).toBeDefined();
+			expect(sharedRegistry.getProviderDiscoveryState(fixture.provider)).toEqual(discoveryStateBefore);
+			expect(result.session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toBe(`Model "${fixture.provider}/${fixture.modelId}" not found`);
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session?.dispose();
+			await fixture.cleanup();
+		}
+	});
+
+	test("CLI root authority revalidates a pre-resolved dynamic model against the selected literal", async () => {
+		const fixture = await seedOwnedDiscoveryFixture("wrong");
+		const admissions: boolean[] = [];
+		const rootRegistry = fixture.preloadedRegistry;
+		if (!rootRegistry) throw new Error("Expected preloaded CLI-root registry");
+		const preResolvedModel = rootRegistry.find(fixture.provider, fixture.modelId);
+		if (!preResolvedModel) throw new Error("Expected pre-resolved foreign-credential model");
+		let admissionAttempts = 0;
+		let providerRequests = 0;
+		let session: { dispose(): Promise<void> } | undefined;
+		try {
+			using _admissions = spyOnCacheAdmissions(admissions);
+			using _blockedFetch = hookFetch(() => {
+				providerRequests += 1;
+				return Promise.reject(new Error("provider request"));
+			});
+			const result = await createAgentSession({
+				...ownedDiscoverySessionOptions(fixture, fixture.selectedRowId, fixture.modelId),
+				model: preResolvedModel,
+				modelPattern: undefined,
+				modelRegistry: rootRegistry,
+				modelRegistryStartupMutation: {
+					owner: "cli-root",
+					onAttempt: () => {
+						admissionAttempts += 1;
+					},
+				},
+			});
+			session = result.session;
+			expect(admissionAttempts).toBe(1);
+			expect(admissions).toEqual([false]);
+			expect(rootRegistry.find(fixture.provider, fixture.modelId)).toBeDefined();
+			expect(result.session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toBe(`Model "${fixture.provider}/${fixture.modelId}" not found`);
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session?.dispose();
+			await fixture.cleanup();
+		}
+	});
+
+	test("provider-mismatched selector rejects a preloaded dynamic target without mutating the registry", async () => {
+		const fixture = await seedOwnedDiscoveryFixture("wrong");
+		const admissions: boolean[] = [];
+		const sharedRegistry = fixture.preloadedRegistry;
+		if (!sharedRegistry) throw new Error("Expected preloaded provider-mismatch registry");
+		const discoveryStateBefore = sharedRegistry.getProviderDiscoveryState(fixture.provider);
+		let providerRequests = 0;
+		let session: { dispose(): Promise<void> } | undefined;
+		try {
+			using _admissions = spyOnCacheAdmissions(admissions);
+			using _blockedFetch = hookFetch(() => {
+				providerRequests += 1;
+				return Promise.reject(new Error("provider request"));
+			});
+			const result = await createAgentSession({
+				...ownedDiscoverySessionOptions(fixture, fixture.selectedRowId, fixture.modelId),
+				credentialSelector: {
+					provider: fixture.foreignProvider,
+					selector: { kind: "id", value: String(fixture.foreignRowId) },
+					raw: `${fixture.foreignProvider}/id:${fixture.foreignRowId}`,
+				},
+				modelRegistry: sharedRegistry,
+			});
+			session = result.session;
+			expect(admissions).toEqual([]);
+			expect(sharedRegistry.find(fixture.provider, fixture.modelId)).toBeDefined();
+			expect(sharedRegistry.getProviderDiscoveryState(fixture.provider)).toEqual(discoveryStateBefore);
+			expect(result.session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toBe(`Model "${fixture.provider}/${fixture.modelId}" not found`);
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session?.dispose();
+			await fixture.cleanup();
+		}
+	});
+
+	test("rejects an admitted dynamic target after an extension changes its request context", async () => {
+		const fixture = await seedOwnedDiscoveryFixture();
+		const admissions: boolean[] = [];
+		let providerRequests = 0;
+		let session: { dispose(): Promise<void> } | undefined;
+		try {
+			using _admissions = spyOnCacheAdmissions(admissions);
+			using _blockedFetch = hookFetch(() => {
+				providerRequests += 1;
+				return Promise.reject(new Error("provider request"));
+			});
+			const result = await createAgentSession({
+				...ownedDiscoverySessionOptions(fixture, fixture.selectedRowId, fixture.modelId),
+				extensions: [
+					api => {
+						api.registerProvider(fixture.provider, {
+							baseUrl: "https://changed-discovery.example.test/v1",
+							headers: { "X-Fixture-Tenant": "changed" },
+						});
+					},
+				],
+			});
+			session = result.session;
+			expect(admissions).toEqual([true]);
+			expect(result.session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toBe(`Model "${fixture.provider}/${fixture.modelId}" not found`);
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session?.dispose();
+			await fixture.cleanup();
+		}
+	});
+
+	test("keeps case-insensitive bundled model resolution outside dynamic cache validation", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected bundled Anthropic model");
+		const storedKey = ["fixture", "static", "anthropic"].join("-");
+		await authStorage.set(model.provider, [{ type: "api_key", key: storedKey }]);
+		const row = authStorage.listCredentialInventory(model.provider)[0];
+		if (row?.credentialKind !== "api_key") throw new Error("Expected bundled-model API-key row");
+		let providerRequests = 0;
+		using _blockedFetch = hookFetch(() => {
+			providerRequests += 1;
+			return Promise.reject(new Error("provider request"));
+		});
+		const { session } = await createAgentSession({
+			modelRegistry,
+			modelPattern: `${model.provider.toUpperCase()}/${model.id.toUpperCase()}`,
+			credentialSelector: {
+				selector: { kind: "id", value: String(row.id) },
+				raw: `id:${row.id}`,
+			},
+			disableExtensionDiscovery: true,
+			settings: Settings.isolated(),
+		});
+		try {
+			expect(session.model).toMatchObject({ provider: model.provider, id: model.id });
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("keeps derived OpenRouter static routes outside dynamic cache validation", async () => {
+		const baseModel = getBundledModel("openrouter", "z-ai/glm-4.7");
+		if (!baseModel) throw new Error("Expected bundled OpenRouter model");
+		const routedId = "z-ai/glm-4.7-20251222:nitro";
+		const storedKey = ["fixture", "static", "openrouter"].join("-");
+		await authStorage.set(baseModel.provider, [{ type: "api_key", key: storedKey }]);
+		const row = authStorage.listCredentialInventory(baseModel.provider)[0];
+		if (row?.credentialKind !== "api_key") throw new Error("Expected OpenRouter API-key row");
+		let providerRequests = 0;
+		using _blockedFetch = hookFetch(() => {
+			providerRequests += 1;
+			return Promise.reject(new Error("provider request"));
+		});
+		const { session } = await createAgentSession({
+			modelRegistry,
+			modelPattern: `${baseModel.provider}/${routedId}`,
+			credentialSelector: {
+				selector: { kind: "id", value: String(row.id) },
+				raw: `id:${row.id}`,
+			},
+			disableExtensionDiscovery: true,
+			settings: Settings.isolated(),
+		});
+		try {
+			expect(session.model).toMatchObject({ provider: baseModel.provider, id: routedId });
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("exact stored literal selector outranks provider environment fallback", async () => {
+		const authPath = path.join(tempDir, `env-precedence-${Snowflake.next()}.db`);
+		const auth = await AuthStorage.create(authPath);
+		const originalOpenAiKey = process.env.OPENAI_API_KEY;
+		const siblingEnvName = `GJC_SIBLING_ENV_${Snowflake.next()}`;
+		const originalSiblingEnv = process.env[siblingEnvName];
+		const storedKey = ["fixture", "stored", "selected"].join("-");
+		try {
+			await auth.set("openai", [
+				{ type: "api_key", key: siblingEnvName },
+				{ type: "api_key", key: storedKey },
+			]);
+			const row = auth.listCredentialInventory("openai")[1];
+			if (row?.credentialKind !== "api_key") throw new Error("Expected stored API-key fixture row");
+			const selector = { kind: "id" as const, value: String(row.id) };
+			process.env.OPENAI_API_KEY = ["fixture", "environment", "fallback"].join("-");
+			process.env[siblingEnvName] = ["fixture", "sibling", "one"].join("-");
+
+			expect(await auth.getApiKey("openai", undefined, { credentialSelector: selector })).toBe(storedKey);
+			const firstEvidence = auth.getStoredLiteralApiKeyEvidenceGeneration("openai", selector);
+			expect(firstEvidence).toBeDefined();
+			process.env[siblingEnvName] = ["fixture", "sibling", "two"].join("-");
+			expect(auth.getStoredLiteralApiKeyEvidenceGeneration("openai", selector)).toBe(firstEvidence);
+		} finally {
+			if (originalOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+			else process.env.OPENAI_API_KEY = originalOpenAiKey;
+			if (originalSiblingEnv === undefined) delete process.env[siblingEnvName];
+			else process.env[siblingEnvName] = originalSiblingEnv;
+			auth.close();
+		}
 	});
 
 	test("does not apply default role thinking override when modelPattern is explicit", async () => {

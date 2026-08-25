@@ -1359,6 +1359,24 @@ export class AuthStorage {
 	getProviderEvidenceGeneration(provider: string, resolvedApiKey?: string): string {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const evidenceApiKey = resolvedApiKey;
+		const storedLiteral =
+			evidenceApiKey === undefined ||
+			this.#runtimeOverrides.has(storageProvider) ||
+			this.#configOverrides.has(storageProvider)
+				? undefined
+				: this.#getCredentialsForProvider(storageProvider).find(
+						(credential): credential is Extract<AuthCredential, { type: "api_key" }> =>
+							credential.type === "api_key" &&
+							credential.key === evidenceApiKey &&
+							!credential.key.startsWith("!") &&
+							process.env[credential.key] === undefined,
+					);
+		if (storedLiteral) {
+			return crypto
+				.createHash("sha256")
+				.update(`stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}`)
+				.digest("hex");
+		}
 		let selectedCredential: ({ index: number } & StoredCredential) | undefined;
 		try {
 			selectedCredential = this.#resolveSelectedStoredCredential(provider, undefined, undefined);

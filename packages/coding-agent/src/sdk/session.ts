@@ -431,6 +431,8 @@ export interface CreateAgentSessionOptions {
 	authStorage?: AuthStorage;
 	/** Model registry. Default: discoverModels(authStorage, agentDir) */
 	modelRegistry?: ModelRegistry;
+	/** @internal Allows the first-party CLI root to mutate its own registry and observe an admission attempt. */
+	modelRegistryStartupMutation?: { owner: "cli-root"; onAttempt(): void };
 
 	/** Model to use. Default: from settings, else first available */
 	model?: Model;
@@ -1444,25 +1446,42 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
 		const startupModelReference =
-			options.model === undefined && options.modelPattern ? parseModelString(options.modelPattern) : undefined;
-		const attemptedStartupCacheAdmission =
-			startupModelReference !== undefined &&
-			options.modelRegistry === undefined &&
-			options.credentialSelector !== undefined &&
-			!modelRegistry.find(startupModelReference.provider, startupModelReference.id);
+			options.model === undefined
+				? options.modelPattern
+					? parseModelString(options.modelPattern)
+					: undefined
+				: options.modelRegistryStartupMutation?.owner === "cli-root"
+					? { provider: options.model.provider, id: options.model.id }
+					: undefined;
+		const startupRegistryMutationAuthorized =
+			options.modelRegistry === undefined || options.modelRegistryStartupMutation?.owner === "cli-root";
 		const startupCredentialSelector =
-			attemptedStartupCacheAdmission &&
 			startupModelReference &&
 			options.credentialSelector &&
 			(!options.credentialSelector.provider ||
-				options.credentialSelector.provider === startupModelReference.provider)
+				options.credentialSelector.provider.toLowerCase() === startupModelReference.provider.toLowerCase())
 				? options.credentialSelector.selector
 				: undefined;
-		if (startupModelReference && startupCredentialSelector) {
-			modelRegistry.admitCachedProviderForStoredLiteralCredential(
+		const startupCredentialProviderMismatch =
+			startupModelReference !== undefined &&
+			options.credentialSelector?.provider !== undefined &&
+			options.credentialSelector.provider.toLowerCase() !== startupModelReference.provider.toLowerCase();
+		const attemptedStartupCacheAdmission =
+			startupModelReference !== undefined &&
+			startupRegistryMutationAuthorized &&
+			options.credentialSelector !== undefined &&
+			modelRegistry.requiresStoredLiteralCredentialCacheAdmission(
 				startupModelReference.provider,
-				startupCredentialSelector,
+				startupModelReference.id,
 			);
+		if (attemptedStartupCacheAdmission) options.modelRegistryStartupMutation?.onAttempt();
+		if (startupModelReference && startupCredentialSelector) {
+			if (attemptedStartupCacheAdmission) {
+				modelRegistry.admitCachedProviderForStoredLiteralCredential(
+					startupModelReference.provider,
+					startupCredentialSelector,
+				);
+			}
 		}
 		if (!options.modelRegistry && !attemptedStartupCacheAdmission) {
 			modelRegistry.refreshInBackground();
@@ -3276,8 +3295,41 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			extensionsResult.runtime.pendingProviderRegistrations = [];
 		}
 
+		let startupCredentialModelRejected = false;
+		if (startupModelReference && (startupCredentialSelector || startupCredentialProviderMismatch)) {
+			const validated =
+				!startupCredentialProviderMismatch &&
+				startupCredentialSelector !== undefined &&
+				modelRegistry.validateModelForStoredLiteralCredential(
+					startupModelReference.provider,
+					startupModelReference.id,
+					startupCredentialSelector,
+				);
+			const currentStartupModel = modelRegistry.find(startupModelReference.provider, startupModelReference.id);
+			const providerMismatchRejectsTarget =
+				startupCredentialProviderMismatch &&
+				modelRegistry.requiresStoredLiteralCredentialCacheAdmission(
+					startupModelReference.provider,
+					startupModelReference.id,
+				);
+			if (
+				(!validated && (startupCredentialSelector !== undefined || providerMismatchRejectsTarget)) ||
+				!currentStartupModel
+			) {
+				startupCredentialModelRejected = true;
+				if (model?.provider === startupModelReference.provider && model.id === startupModelReference.id) {
+					model = undefined;
+				}
+				modelFallbackMessage = `Model "${
+					options.modelPattern ?? `${startupModelReference.provider}/${startupModelReference.id}`
+				}" not found`;
+			} else if (model?.provider === startupModelReference.provider && model.id === startupModelReference.id) {
+				model = currentStartupModel;
+			}
+		}
+
 		// Resolve deferred --model pattern now that extension models are registered.
-		if (!model && options.modelPattern) {
+		if (!model && options.modelPattern && !startupCredentialModelRejected) {
 			const availableModels = modelRegistry.getAll();
 			const matchPreferences = {
 				usageOrder: settings.getStorage()?.getModelUsageOrder(),
@@ -3312,7 +3364,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Fall back to first available model with a valid API key, honoring the
 		// path-scoped `enabledModels` allow-list when configured. Skip when the
 		// user explicitly requested a model via --model that wasn't found.
-		if (!model && !options.modelPattern) {
+		if (!model && !options.modelPattern && !startupCredentialModelRejected) {
 			// Re-resolve the allowed set: extension factories above may have
 			// registered providers/models that weren't visible at startup.
 			const fallbackCandidates = await resolveAllowedModels(modelRegistry, settings, modelMatchPreferences);

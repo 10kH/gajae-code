@@ -1508,20 +1508,11 @@ export class ModelRegistry {
 	}
 
 	admitCachedProviderForStoredLiteralCredential(providerId: string, selector: AuthCredentialSelector): boolean {
-		const supportsDiscovery =
-			this.#discoveryManager.providerIds().has(providerId) ||
-			PROVIDER_DESCRIPTORS.some(descriptor => descriptor.providerId === providerId);
-		if (!supportsDiscovery) return false;
-		const authEvidence = this.authStorage.getStoredLiteralApiKeyEvidenceGeneration(providerId, selector);
-		if (!authEvidence) return false;
+		const cachedModels = this.#loadCachedProviderModelsForStoredLiteralCredential(providerId, selector);
+		if (!cachedModels || cachedModels.length === 0) return false;
 
 		this.#suspendRebuild();
 		try {
-			const cachedModels = [
-				...this.#loadCachedStandardProviderModels(providerId, authEvidence),
-				...this.#loadCachedDiscoverableModels(providerId, authEvidence),
-			];
-			if (cachedModels.length === 0) return false;
 			this.#mergeDiscoveredModels(cachedModels);
 			this.#rebuildProviderActivity();
 			this.#modelBindingsApplier.apply();
@@ -1529,6 +1520,53 @@ export class ModelRegistry {
 		} finally {
 			this.#resumeRebuild();
 		}
+	}
+
+	/** @internal Validate an existing startup model without mutating a caller-supplied registry. */
+	validateModelForStoredLiteralCredential(
+		providerId: string,
+		modelId: string,
+		selector: AuthCredentialSelector,
+	): boolean {
+		if (!this.find(providerId, modelId)) return false;
+		if (this.#resolveStaticModelReference(providerId, modelId)) return true;
+		const cachedModels = this.#loadCachedProviderModelsForStoredLiteralCredential(providerId, selector, false);
+		return cachedModels ? resolveProviderModelReference(providerId, modelId, cachedModels) !== undefined : false;
+	}
+
+	/** @internal Whether startup must establish credential-scoped cache provenance for this exact target. */
+	requiresStoredLiteralCredentialCacheAdmission(providerId: string, modelId: string): boolean {
+		return !this.find(providerId, modelId) || !this.#resolveStaticModelReference(providerId, modelId);
+	}
+
+	#loadCachedProviderModelsForStoredLiteralCredential(
+		providerId: string,
+		selector: AuthCredentialSelector,
+		publishDiscoveryState = true,
+	): Model<Api>[] | undefined {
+		const supportsDiscovery =
+			this.#discoveryManager.providerIds().has(providerId) ||
+			PROVIDER_DESCRIPTORS.some(descriptor => descriptor.providerId === providerId);
+		if (!supportsDiscovery) return undefined;
+		const authEvidence = this.authStorage.getStoredLiteralApiKeyEvidenceGeneration(providerId, selector);
+		if (!authEvidence) return undefined;
+		return [
+			...this.#loadCachedStandardProviderModels(providerId, authEvidence),
+			...this.#loadCachedDiscoverableModels(providerId, authEvidence, publishDiscoveryState),
+		];
+	}
+
+	#resolveStaticModelReference(providerId: string, modelId: string): Model<Api> | undefined {
+		const normalizedProvider = providerId.toLowerCase();
+		const matchingActivity = [...this.#providerActivity.entries()].filter(
+			([candidateProvider]) => candidateProvider.toLowerCase() === normalizedProvider,
+		);
+		if (matchingActivity.length !== 1) return undefined;
+		const [canonicalProvider, activity] = matchingActivity[0];
+		const staticModels = this.#models.filter(
+			model => model.provider === canonicalProvider && activity.staticModelIds.has(model.id),
+		);
+		return resolveProviderModelReference(providerId, modelId, staticModels);
 	}
 
 	#getStaticLoadEnvironmentFingerprint(): string {
@@ -1821,7 +1859,11 @@ export class ModelRegistry {
 		return cachedModels;
 	}
 
-	#loadCachedDiscoverableModels(providerId?: string, authEvidence?: string): Model<Api>[] {
+	#loadCachedDiscoverableModels(
+		providerId?: string,
+		authEvidence?: string,
+		publishDiscoveryState = true,
+	): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
 		for (const providerConfig of this.#discoveryManager.providers) {
 			if (providerId && providerConfig.provider !== providerId) continue;
@@ -1837,7 +1879,9 @@ export class ModelRegistry {
 				// A context that cannot be fully derived cannot vouch for a cache row.
 				expectedProvenance = undefined;
 			}
-			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance);
+			const models = publishDiscoveryState
+				? this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance)
+				: this.#readCachedDiscoverableModels(providerConfig, expectedProvenance);
 			// Cache rows persist sanitized transport metadata (no headers), so a
 			// rebooted registry re-derives the provider transport override from the
 			// same source the live publish path uses — mirroring the cached
@@ -1858,6 +1902,22 @@ export class ModelRegistry {
 			cachedModels.push(...normalized);
 		}
 		return cachedModels;
+	}
+
+	#readCachedDiscoverableModels(
+		providerConfig: DiscoveryProviderConfig,
+		expectedProvenance: string | undefined,
+	): Model<Api>[] {
+		const cache = readModelCache<Api>(providerConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
+		if (
+			cache === null ||
+			cache.dynamicModelIds === undefined ||
+			expectedProvenance === undefined ||
+			cache.dynamicModelProvenance !== expectedProvenance
+		) {
+			return [];
+		}
+		return applyFinalCodexGpt56ContextCap(cache.models);
 	}
 
 	#applyProviderCompat(compat: Model<Api>["compat"] | undefined, models: Model<Api>[]): Model<Api>[] {
