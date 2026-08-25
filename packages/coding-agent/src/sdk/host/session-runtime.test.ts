@@ -2959,6 +2959,7 @@ interface PreflightHooks {
 interface ResponseFrame {
 	id?: string;
 	ok?: boolean;
+	error?: { code: string; message: string };
 	result?: { status?: string; commandId?: string; turnId?: string; error?: { code: string; message: string } };
 }
 
@@ -2968,6 +2969,9 @@ interface InvocationHarness {
 	emit(event: string, payload?: unknown): Promise<void>;
 	switchSession(sessionId: string): Promise<void>;
 	branch(sessionId: string): Promise<void>;
+	requestOnSession(sessionId: string, frame: Record<string, unknown>): Promise<ResponseFrame>;
+	sendToSession(sessionId: string, frame: Record<string, unknown>): void;
+	sent(sessionId: string): SdkFrame[];
 	readonly broadcasts: SdkFrame[];
 	stop(): Promise<void>;
 }
@@ -2996,6 +3000,8 @@ async function invocationHarness(
 	const handlers = new Map<string, (event: unknown, ctx: unknown) => Promise<void> | void>();
 	const broadcasts: SdkFrame[] = [];
 	let deliver: ((connectionId: string, frame: SdkFrame) => void) | undefined;
+	const deliveries = new Map<string, (connectionId: string, frame: SdkFrame) => void>();
+	const sentFrames = new Map<string, SdkFrame[]>();
 	let nextId = 0;
 	const api = {
 		on(event: string, handler: (event: unknown, ctx: unknown) => Promise<void> | void) {
@@ -3030,12 +3036,17 @@ async function invocationHarness(
 			token,
 			onFrame(handler) {
 				deliver = handler;
+				deliveries.set(id, handler);
 				return () => {
 					if (deliver === handler) deliver = undefined;
+					if (deliveries.get(id) === handler) deliveries.delete(id);
 				};
 			},
 			sendFrame(_connectionId, frame) {
 				const response = frame as ResponseFrame;
+				const frames = sentFrames.get(id) ?? [];
+				frames.push(frame);
+				sentFrames.set(id, frames);
 				if (typeof response.id === "string") waiters.get(response.id)?.(response);
 			},
 			broadcastFrame(frame) {
@@ -3089,6 +3100,18 @@ async function invocationHarness(
 				{ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionId } },
 			);
 		},
+		requestOnSession: (sessionId, frame) => {
+			const id = `frame-${nextId}`;
+			nextId += 1;
+			const { promise, resolve } = Promise.withResolvers<ResponseFrame>();
+			waiters.set(id, resolve);
+			deliveries.get(sessionId)?.("client", { ...frame, id } as SdkFrame);
+			return promise;
+		},
+		sendToSession: (sessionId, frame) => {
+			deliveries.get(sessionId)?.("client", frame as SdkFrame);
+		},
+		sent: sessionId => sentFrames.get(sessionId) ?? [],
 	};
 }
 
@@ -3318,6 +3341,39 @@ describe("post-acceptance invocation terminalization", () => {
 				await entered.promise;
 				const lifecycleChange = harness[operation](`${operation}-successor`);
 				await Bun.sleep(10);
+				const [oldControl, oldQuery, oldReplay, oldProvider] = await Promise.all([
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "control_request",
+						operation: "turn.prompt",
+						input: {},
+					}),
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "query_request",
+						query: "turn.prompt_status",
+						input: {},
+					}),
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "event_replay",
+						sinceGeneration: 0,
+						sinceSeq: 0,
+					}),
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "register_provider",
+						capability: "fs",
+						definitions: {},
+					}),
+				]);
+				harness.sendToSession(`${operation}-provider-race`, { type: "provider_heartbeat", leaseId: "old-lease" });
+				harness.sendToSession(`${operation}-provider-race`, { type: "lease_release", leaseId: "old-lease" });
+				expect([oldControl, oldQuery, oldReplay, oldProvider].map(response => response.error?.code)).toEqual([
+					"session_quiescing",
+					"session_quiescing",
+					"session_quiescing",
+					"session_quiescing",
+				]);
+				expect(
+					harness.sent(`${operation}-provider-race`).filter(frame => frame.type === "transport_error"),
+				).toHaveLength(2);
 				release.resolve();
 				await Promise.all([end, lifecycleChange]);
 				const failure = harness.broadcasts.find(frame => {
@@ -3344,6 +3400,47 @@ describe("post-acceptance invocation terminalization", () => {
 				});
 				firstInflight.resolve();
 				expect(prompts).toBe(2);
+				await harness.stop();
+			} finally {
+				await Bun.sleep(50);
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+
+	test.each([
+		{ operation: "switchSession" as const, label: "session switch" },
+		{ operation: "branch" as const, label: "session branch" },
+	])("bounds a stalled 402/429 lifecycle drain during $label", async ({ operation }) => {
+		for (const status of [402, 429]) {
+			const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-${operation}-provider-stall-`));
+			try {
+				const entered = Promise.withResolvers<void>();
+				const release = Promise.withResolvers<void>();
+				const firstInflight = Promise.withResolvers<void>();
+				const harness = await invocationHarness(`${operation}-provider-stall`, cwd, {
+					persistInterceptor: () => {},
+					persistHold: { type: "agent_failed", onEntered: entered.resolve, release: release.promise },
+					agentFailedWriteFailures: 0,
+					sendUserMessage: async (_content, options) => {
+						await options?.onPreflightAcceptCommit?.();
+						await firstInflight.promise;
+					},
+				});
+				const first = await harness.control("turn.prompt", { text: "first" });
+				expect(first.ok).toBe(true);
+				await harness.emit("agent_start");
+				const end = harness.emit("agent_end", {
+					messages: [{ role: "assistant", stopReason: "error", errorStatus: status }],
+				});
+				await entered.promise;
+				const startedAt = Date.now();
+				const lifecycleChange = harness[operation](`${operation}-stall-successor`);
+				await lifecycleChange;
+				expect(Date.now() - startedAt).toBeLessThan(1_500);
+				release.resolve();
+				firstInflight.resolve();
+				await end;
 				await harness.stop();
 			} finally {
 				await Bun.sleep(50);

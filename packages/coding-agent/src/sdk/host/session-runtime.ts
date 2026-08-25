@@ -87,6 +87,8 @@ const SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS = 1_000;
  *  after this bound are abandoned — their durable broker state is the recovery
  *  authority, and outcomes are inherently uncertain. */
 const GATE_RESOLUTION_QUIESCENCE_MS = 5_000;
+/** Maximum time a replaced runtime may retain a lifecycle persistence task. */
+const LIFECYCLE_QUIESCENCE_MS = 1_000;
 
 class DiffQueryError extends Error {
 	constructor(
@@ -3066,6 +3068,20 @@ export function registerSdkOnlyNotificationCommand(api: ExtensionAPI): void {
 	});
 }
 
+function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown> | undefined {
+	const error = { code: "session_quiescing", message: "The session endpoint is being replaced." };
+	const id = typeof frame.id === "string" ? frame.id : "";
+	if (frame.type === "control_request") return { type: "control_response", id, ok: false, error };
+	if (frame.type === "query_request") return { type: "query_response", id, ok: false, error };
+	if (frame.type === "event_replay") return { type: "event_replay_result", id, ok: false, error };
+	if (frame.type === "session_activate")
+		return { type: "session_activate_result", id, ok: false, status: "authority_unavailable", error };
+	if (frame.type === "register_provider") return { type: "register_provider_result", id, ok: false, error };
+	if (frame.type === "provider_heartbeat" || frame.type === "lease_release")
+		return { type: "transport_error", code: "session_quiescing", message: error.message };
+	return undefined;
+}
+
 /** Install a complete SDK host for a session when notifications are inactive. */
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	let active:
@@ -3082,6 +3098,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					connectionId: string | undefined;
 				}>;
 				registerBroker: () => Promise<void>;
+				quiesceInput: () => void;
 				fenceGateResolutions: () => void;
 				waitForGateResolutionQuiescence: () => Promise<void>;
 				activeInvocation?: { kind: InvocationKind; correlation: InvocationCorrelation };
@@ -3668,6 +3685,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			settings: options.settings,
 		});
 		const queryHandlers = new QueryHandlers(surfaceFactory.query, sessionId, revisions, cursors);
+		const inputGate = { quiescing: false };
 		let runtime: SessionSdkSessionRuntime;
 		// Durable-first bounded terminalization for accepted submissions that leave
 		// their queue or race a run WITHOUT consumption (exact-head review: clearing
@@ -3976,6 +3994,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
+			onFrameAdmission: (_connectionId, frame) =>
+				inputGate.quiescing ? quiescingFrame(frame as Record<string, unknown>) : undefined,
 			control: async (connectionId, frame) => {
 				options.onFrameAdmitted?.();
 				const request = controlRequestFromFrame(frame as Record<string, unknown>);
@@ -4122,6 +4142,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			pending,
 			openLifecycleBatches,
 			registerBroker,
+			quiesceInput: () => {
+				inputGate.quiescing = true;
+			},
 			fenceGateResolutions: () => {
 				acceptingGateResolutions = false;
 			},
@@ -4155,6 +4178,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					pending,
 					openLifecycleBatches,
 					registerBroker,
+					quiesceInput: () => {
+						inputGate.quiescing = true;
+					},
 					fenceGateResolutions: () => {
 						acceptingGateResolutions = false;
 					},
@@ -4175,11 +4201,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const stopActive = async (): Promise<void> => {
 		const current = active;
 		if (!current) return;
+		current.quiesceInput();
 		current.deadlineManager.clearAll();
 		current.fenceGateResolutions();
 		try {
 			await current.waitForGateResolutionQuiescence();
-			while (current.lifecycleTasks.size > 0) await Promise.all([...current.lifecycleTasks]);
+			if (current.lifecycleTasks.size > 0) {
+				const lifecycleDrain = Promise.all([...current.lifecycleTasks]);
+				const timeout = Bun.sleep(LIFECYCLE_QUIESCENCE_MS).then(() => {
+					logger.warn("SDK runtime lifecycle drain timed out; durable lifecycle recovery remains authoritative.");
+				});
+				await Promise.race([lifecycleDrain, timeout]);
+			}
 			active = undefined;
 			current.disposeGate?.();
 			await current.runtime.stop();
