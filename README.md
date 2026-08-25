@@ -187,17 +187,17 @@ Also included, opt-in: **`computer-use`** (experimental desktop control). See [P
 
 ## Custom skills
 
-GJC follows the Claude Code / Codex file convention for custom skills — drop a `SKILL.md` into a documented location and it is discoverable in a normal session with **no configuration**:
+GJC uses the Claude Code / Codex `SKILL.md` file convention, but loads runtime skills directly only from canonical GJC locations — no configuration required:
 
 ```sh
-# project-local (any of these):
-cp -r my-skill .gjc/skills/          # or .claude/skills/ or .codex/skills/
+# project-local, per repository:
+cp -r my-skill .gjc/skills/
 
 # user-wide, available in every project:
 mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/
 ```
 
-Then invoke it with `/skill:my-skill` in a session. Scope trust is explicit via `skills.trustProjectSkills` / `skills.trustUserSkills` (both default on), with `skills.enabled` as the master switch; inspect what is discoverable with `gjc skills discover`. The four bundled workflow skills above can never be replaced by disk skills. See [docs/skills.md](docs/skills.md) for locations, precedence, and diagnostics.
+Claude Code and Codex skill directories are import sources only. `gjc skills discover` reports them with the exact copy command; copy a skill into a canonical `.gjc` location before invoking it with `/skill:my-skill`. Scope trust is explicit via `skills.trustProjectSkills` / `skills.trustUserSkills` (both default on), with `skills.enabled` as the master switch. The four bundled workflow skills above can never be replaced by disk skills. See [docs/skills.md](docs/skills.md) for locations, precedence, and diagnostics.
 ## Theme defaults
 
 The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. Explicit theme settings still take precedence.

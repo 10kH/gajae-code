@@ -195,17 +195,17 @@ deep-interview -> ralplan -> ultragoal
 
 ## 사용자 스킬
 
-GJC는 사용자 스킬에 Claude Code / Codex 파일 규약을 따릅니다. 문서화된 경로에 `SKILL.md`를 넣기만 하면 **별도 설정 없이** 일반 세션에서 발견됩니다:
+GJC는 Claude Code / Codex의 `SKILL.md` 파일 규약을 사용하지만, 런타임 스킬은 정식 GJC 경로에서만 직접 로드합니다. 별도 설정은 필요 없습니다:
 
 ```sh
-# 프로젝트 로컬(아래 중 아무 곳):
-cp -r my-skill .gjc/skills/          # 또는 .claude/skills/ 또는 .codex/skills/
+# 프로젝트 로컬, 저장소별:
+cp -r my-skill .gjc/skills/
 
 # 모든 프로젝트에서 쓸 사용자 전역 경로:
 mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/
 ```
 
-세션에서 `/skill:my-skill`로 실행합니다. 범위 신뢰는 `skills.trustProjectSkills` / `skills.trustUserSkills`로 명시하며(둘 다 기본 활성화), `skills.enabled`가 전체 스위치입니다. `gjc skills discover`로 발견 가능한 항목을 확인할 수 있습니다. 위의 번들 워크플로 스킬 4개는 디스크 스킬로 교체할 수 없습니다. 위치, 우선순위, 진단은 [docs/skills.md](docs/skills.md)를 참고하세요.
+Claude Code와 Codex 스킬 디렉터리는 가져오기 소스일 뿐입니다. `gjc skills discover`가 정확한 복사 명령과 함께 이를 알려 주므로, 스킬을 정식 `.gjc` 경로로 복사한 뒤 세션에서 `/skill:my-skill`로 실행하세요. 범위 신뢰는 `skills.trustProjectSkills` / `skills.trustUserSkills`로 명시하며(둘 다 기본 활성화), `skills.enabled`가 전체 스위치입니다. 위의 번들 워크플로 스킬 4개는 디스크 스킬로 교체할 수 없습니다. 위치, 우선순위, 진단은 [docs/skills.md](docs/skills.md)를 참고하세요.
 
 ## 기본 테마
 

@@ -189,17 +189,17 @@ deep-interview -> ralplan -> ultragoal
 
 ## カスタムスキル
 
-GJC はカスタムスキルに Claude Code / Codex のファイル規約を採用しています。文書化された場所に `SKILL.md` を置くだけで、**設定なしに**通常のセッションから検出できます:
+GJC は Claude Code / Codex の `SKILL.md` ファイル規約を使いますが、ランタイムスキルを直接読み込むのは正規の GJC 場所だけです。設定は不要です:
 
 ```sh
-# プロジェクトローカル（以下のどれでも可）:
-cp -r my-skill .gjc/skills/          # または .claude/skills/ または .codex/skills/
+# プロジェクトローカル、リポジトリごと:
+cp -r my-skill .gjc/skills/
 
 # すべてのプロジェクトで使えるユーザー全体の場所:
 mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/
 ```
 
-セッションで `/skill:my-skill` として呼び出します。スコープの信頼は `skills.trustProjectSkills` / `skills.trustUserSkills` で明示され（どちらもデフォルトで有効）、`skills.enabled` がマスタースイッチです。検出可能な項目は `gjc skills discover` で確認できます。上記の同梱ワークフロースキル 4 つはディスク上のスキルで置き換えられません。場所、優先順位、診断については [docs/skills.md](docs/skills.md) を参照してください。
+Claude Code と Codex のスキルディレクトリはインポートソースに過ぎません。`gjc skills discover` が正確なコピーコマンドとともに表示するため、スキルを正規の `.gjc` 場所へコピーしてから、セッションで `/skill:my-skill` として呼び出してください。スコープの信頼は `skills.trustProjectSkills` / `skills.trustUserSkills` で明示され（どちらもデフォルトで有効）、`skills.enabled` がマスタースイッチです。上記の同梱ワークフロースキル 4 つはディスク上のスキルで置き換えられません。場所、優先順位、診断については [docs/skills.md](docs/skills.md) を参照してください。
 
 ## デフォルトテーマ
 
