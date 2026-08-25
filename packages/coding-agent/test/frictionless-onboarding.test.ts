@@ -132,6 +132,17 @@ describe("frictionless onboarding", () => {
 		expect(detectOnboardingLanguage(["the 한글"], "fr-FR")).toBe("ko");
 		expect(detectOnboardingLanguage(["the and 한글"], "fr-FR")).toBe("fr");
 	});
+	test("a stray Hangul or Kana glyph does not erase dominant Han evidence", () => {
+		// One sub-threshold Hangul glyph is noise, not a Korean claim on the text.
+		expect(detectOnboardingLanguage(["한文件文件文件 please change"], "en-US")).toBe("zh");
+		expect(detectOnboardingLanguage(["한文件文件文件"], "en-US")).toBe("zh");
+		expect(detectOnboardingLanguage(["한か漢漢漢漢"], "en-US")).toBe("zh");
+		// Kana still claims mixed kanji once it itself reaches the evidence minimum.
+		expect(detectOnboardingLanguage(["漢字か"], "zh-CN")).toBe("ja");
+		expect(detectOnboardingLanguage(["かか漢漢漢漢"], "en-US")).toBe("ja");
+		// And a Hangul count that reaches the minimum claims the mixed text.
+		expect(detectOnboardingLanguage(["한한文件文件文件"], "en-US")).toBe("ko");
+	});
 
 	test("an explicit language preference outranks messages and locale", () => {
 		expect(detectOnboardingLanguage(["le fichier merci"], "fr-FR", "ko")).toBe("ko");

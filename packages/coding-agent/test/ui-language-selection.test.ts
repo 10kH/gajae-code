@@ -142,7 +142,19 @@ describe("/language slash command", () => {
 		expect(parseUiLanguage("en-US")).toBe("en");
 		expect(parseUiLanguage("fr")).toBeUndefined();
 		expect(parseUiLanguage("fr-FR")).toBeUndefined();
+	});
 
+	it("never returns inherited object properties for hostile inputs", () => {
+		expect(parseUiLanguage("__proto__")).toBeUndefined();
+		expect(parseUiLanguage("constructor")).toBeUndefined();
+		expect(parseUiLanguage("constructor-anything")).toBeUndefined();
+		expect(parseUiLanguage("toString")).toBeUndefined();
+		expect(parseUiLanguage("valueOf")).toBeUndefined();
+		expect(parseUiLanguage("hasOwnProperty")).toBeUndefined();
+		expect(parseUiLanguage("__proto__-ko")).toBeUndefined();
+	});
+
+	it("persists endonym, English-name, and locale-tag spellings through the command", async () => {
 		const korean = harness();
 		await executeBuiltinSlashCommand("/language 한국어", korean.runtime as never);
 		expect(settings.get("ui.language")).toBe("ko");
