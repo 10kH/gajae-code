@@ -149,6 +149,26 @@ test("collectMasterPeerSnapshot preserves explicit empty and not-in-git-worktree
 	expect(renderMasterPeerSnapshot(noGit)).toContain("status: not-in-git-worktree");
 });
 
+test("bounds large master snapshots and reports truncation", async () => {
+	const { anchor } = await gitAnchor();
+	const peers = Array.from({ length: 300 }, (_, index) => ({
+		id: `peer-${String(index).padStart(3, "0")}`,
+		locator: { cwd: `/repo/${index}`, worktreeRoot: "/repo", stateRoot: `/state/${index}` },
+		live: true,
+	}));
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle: new FakeLifecycle({ ok: true, operation: "session.list", result: result(anchor, peers) }),
+		actor,
+		ownerSessionId: "master",
+		scope: "repo",
+		requestAnchor: anchor,
+	});
+
+	expect(snapshot.truncated).toBe(true);
+	expect(snapshot.rows.length).toBe(256);
+	expect(renderMasterPeerSnapshot(snapshot)).toContain('"truncated":true');
+});
+
 test("collectMasterPeerSnapshot renders unavailable when Broker does not return a scoped envelope", async () => {
 	const { anchor } = await gitAnchor();
 	const lifecycle = new FakeLifecycle({

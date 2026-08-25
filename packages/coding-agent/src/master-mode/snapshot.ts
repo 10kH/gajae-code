@@ -15,7 +15,11 @@ export type MasterPeerSnapshot = {
 	readonly observedAt: string;
 	readonly indexSeq?: number;
 	readonly rows: readonly SdkSearchRowV1[];
+	readonly truncated?: boolean;
 };
+
+const MASTER_PEER_SNAPSHOT_MAX_ROWS = 256;
+const MASTER_PEER_SNAPSHOT_MAX_BYTES = 64 * 1024;
 
 /** The scoped Broker surface needed for the one-time master peer snapshot. */
 export interface MasterPeerSnapshotLifecycle {
@@ -62,6 +66,22 @@ function matchesResolvedScope(left: ResolvedScopeV1, right: ResolvedScopeV1): bo
 	return JSON.stringify(left) === JSON.stringify(right);
 }
 
+function boundSnapshotRows(rows: readonly SdkSearchRowV1[]): {
+	rows: readonly SdkSearchRowV1[];
+	truncated: boolean;
+} {
+	const retained: SdkSearchRowV1[] = [];
+	let bytes = 0;
+	for (const row of rows) {
+		const rowBytes = Buffer.byteLength(JSON.stringify(row), "utf8");
+		if (retained.length >= MASTER_PEER_SNAPSHOT_MAX_ROWS || bytes + rowBytes > MASTER_PEER_SNAPSHOT_MAX_BYTES)
+			return { rows: retained, truncated: true };
+		retained.push(row);
+		bytes += rowBytes;
+	}
+	return { rows: retained, truncated: false };
+}
+
 /**
  * Collects the first-request peer snapshot through scoped Broker session.list.
  * It deliberately has no Router or endpoint-probe dependency.
@@ -81,12 +101,14 @@ export async function collectMasterPeerSnapshot(input: CollectMasterPeerSnapshot
 	});
 	const result = sdkSearchResultV1(outcome.result);
 	if (!result || !matchesResolvedScope(result.scope, resolvedScope)) return unavailableSnapshot(resolvedScope);
+	const bounded = boundSnapshotRows(result.rows.filter(row => row.id !== input.ownerSessionId).sort(compareRows));
 	return {
 		status: result.status,
 		scope: result.scope,
 		observedAt: result.observedAt,
 		...(result.indexSeq === undefined ? {} : { indexSeq: result.indexSeq }),
-		rows: result.rows.filter(row => row.id !== input.ownerSessionId).sort(compareRows),
+		rows: bounded.rows,
+		...(bounded.truncated ? { truncated: true } : {}),
 	};
 }
 
@@ -157,6 +179,7 @@ export function renderMasterPeerSnapshot(snapshot: MasterPeerSnapshot): string {
 		scope: renderedScope(snapshot.scope),
 		observedAt: escapeMasterPeerSnapshotText(snapshot.observedAt),
 		...(snapshot.indexSeq === undefined ? {} : { indexSeq: snapshot.indexSeq }),
+		...(snapshot.truncated === undefined ? {} : { truncated: snapshot.truncated }),
 		rows: renderedRows(snapshot.rows),
 	};
 	return `<gjc-master-peer-snapshot>\nstatus: ${escapeMasterPeerSnapshotText(snapshot.status)}\n${JSON.stringify(content)}\n</gjc-master-peer-snapshot>`;
