@@ -30,6 +30,11 @@ async function waitForProcessExit(pid: number): Promise<void> {
 	for (let attempt = 0; attempt < 50; attempt += 1) {
 		try {
 			process.kill(pid, 0);
+			if (isLinux) {
+				const stat = fsSync.readFileSync(`/proc/${pid}/stat`, "utf8");
+				const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+				if (state === "Z") return;
+			}
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
 			throw error;
