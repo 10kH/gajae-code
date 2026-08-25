@@ -90,9 +90,18 @@ describe("iTerm Pet candidate detection", () => {
 		["generic SSH", { SSH_CONNECTION: "client server", TERM: "xterm-256color" }, true],
 		["spoofed noninteractive marker", { SSH_CONNECTION: "client server", LC_TERMINAL: "iTerm2" }, false],
 		["CI with a forwarded marker", { CI: "true", SSH_CONNECTION: "client server", LC_TERMINAL: "iTerm2" }, true],
+		["whitespace-only CI", { CI: "   ", TERM_PROGRAM: "iTerm.app" }, true],
+		["control-only CI", { CI: "\n\t", TERM_PROGRAM: "iTerm.app" }, true],
 	] as const)("does not probe %s", (_label, env, tty) => {
 		expect(isItermCandidate(env, tty)).toBe(false);
 		expect(createNativePetTransport({ ui: nativeUi, env, tty })).toBeUndefined();
+	});
+
+	it.each([
+		["explicit false CI", { CI: " false ", TERM_PROGRAM: "iTerm.app" }],
+		["explicit zero CI", { CI: " 0 ", TERM_PROGRAM: "iTerm.app" }],
+	] as const)("allows explicitly inactive CI marker %s", (_label, env) => {
+		expect(isItermCandidate(env, true)).toBe(true);
 	});
 
 	it.each([

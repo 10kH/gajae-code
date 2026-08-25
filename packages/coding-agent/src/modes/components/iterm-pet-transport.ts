@@ -122,7 +122,7 @@ export function isItermCandidate(
 ): boolean {
 	if (!tty) return false;
 	const ci = env.CI?.trim().toLowerCase();
-	if (ci && ci !== "0" && ci !== "false") return false;
+	if (env.CI !== undefined && ci !== "0" && ci !== "false") return false;
 	// These variables are untrusted hints, especially when forwarded over SSH.
 	// They may start the capability probe, but only an OSC 1337 reply containing
 	// the File capability can make the transport available.
