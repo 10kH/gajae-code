@@ -1062,13 +1062,6 @@ export default class Sdk extends Command {
 		const agentDir = internal.agentDir;
 		const broker = new Broker({
 			agentDir,
-			// Published in broker discovery so ensurers can retire a broker that
-			// predates the current package install instead of reusing stale code.
-			// Resolve inside the child: the parent may have observed a different
-			// package between spawn resolution and child startup.
-			packageGeneration: authority.generation,
-			packageVersion: authority.packageVersion,
-			installationIdentity: authority.installationIdentity,
 			masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
 				"sdk.masterOrphanGraceMs",
 			),

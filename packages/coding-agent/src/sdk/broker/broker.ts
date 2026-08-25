@@ -43,7 +43,6 @@ import {
 	type LifecycleState,
 } from "./lifecycle-ledger";
 import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
-import { resolveSdkPackageAuthority } from "./runtime";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
 import {
 	type ResolvedScopeV1,
