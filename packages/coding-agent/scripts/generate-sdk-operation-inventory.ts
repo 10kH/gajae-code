@@ -21,6 +21,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:settings": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:theme": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:language":
+		"visual/local-only interactive UI language selector persisted through settings, not a user-facing SDK control seam",
 	"slash_command:copy": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:changelog": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:help": "visual/local-only command, not a user-facing SDK control seam",

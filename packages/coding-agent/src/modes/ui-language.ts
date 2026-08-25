@@ -23,6 +23,9 @@ const ENGLISH_STRINGS = {
 	"settings.language.description": "Language for human-facing interactive UI text",
 	"settings.language.english": "English",
 	"settings.language.korean": "Korean (한국어)",
+	"language.current": "Current UI language:",
+	"language.changed": "UI language changed to",
+	"language.unknown": "Unknown language",
 } as const;
 
 export type UiStringKey = keyof typeof ENGLISH_STRINGS;
@@ -48,6 +51,9 @@ const KOREAN_STRINGS: Record<UiStringKey, string> = {
 	"settings.language.description": "사람이 읽는 대화형 UI 텍스트의 언어",
 	"settings.language.english": "English",
 	"settings.language.korean": "한국어",
+	"language.current": "현재 UI 언어:",
+	"language.changed": "UI 언어를 다음으로 변경했습니다:",
+	"language.unknown": "알 수 없는 언어",
 };
 
 /** User selection is authoritative; invalid or unavailable values deterministically fall back to English. */
@@ -57,4 +63,26 @@ export function resolveUiLanguage(value: unknown): UiLanguage {
 
 export function uiString(language: unknown, key: UiStringKey): string {
 	return resolveUiLanguage(language) === "ko" ? KOREAN_STRINGS[key] : ENGLISH_STRINGS[key];
+}
+
+/** Endonym shown by `/language` and the language submenu. */
+export const UI_LANGUAGE_LABELS: Record<UiLanguage, string> = {
+	en: "English",
+	ko: "한국어",
+};
+
+/** Spellings accepted by `/language`; the canonical codes stay authoritative. */
+const UI_LANGUAGE_ALIASES: Readonly<Record<string, UiLanguage>> = {
+	en: "en",
+	eng: "en",
+	english: "en",
+	ko: "ko",
+	kr: "ko",
+	kor: "ko",
+	korean: "ko",
+	한국어: "ko",
+};
+
+export function parseUiLanguage(value: string): UiLanguage | undefined {
+	return UI_LANGUAGE_ALIASES[value.trim().toLowerCase()];
 }

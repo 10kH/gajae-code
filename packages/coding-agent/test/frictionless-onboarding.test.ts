@@ -97,6 +97,49 @@ describe("frictionless onboarding", () => {
 		expect(detectOnboardingLanguage([], "fr-FR")).toBe("fr");
 	});
 
+	test("English messages are not misread as a Latin language sharing short function words", () => {
+		const englishMessages = [
+			"please handle the class in this file",
+			"change the parser and help me later",
+			"display the table, then modify the module",
+		];
+		expect(detectOnboardingLanguage(englishMessages, "ko-KR")).toBe("en");
+		// A single weak match is not evidence; the locale still decides.
+		expect(detectOnboardingLanguage(["fix the crash"], "ko-KR")).toBe("ko");
+	});
+
+	test("word evidence needs a clear leader, otherwise the OS locale decides", () => {
+		// `la` belongs to both es and fr word lists: a tie must not pick a winner.
+		expect(detectOnboardingLanguage(["la la"], "de-DE")).toBe("de");
+		expect(detectOnboardingLanguage(["le fichier"], "en-US")).toBe("fr");
+	});
+
+	test("CJK scripts are detected by script, not by particle substrings", () => {
+		expect(detectOnboardingLanguage(["ファイルを変更してください"], "en-US")).toBe("ja");
+		expect(detectOnboardingLanguage(["请修改文件"], "en-US")).toBe("zh");
+		expect(detectOnboardingLanguage(["파일 변경해줘"], "en-US")).toBe("ko");
+	});
+
+	test("an explicit language preference outranks messages and locale", () => {
+		expect(detectOnboardingLanguage(["le fichier merci"], "fr-FR", "ko")).toBe("ko");
+		expect(
+			deriveOnboardingProfile(
+				[
+					{
+						provider: "codex",
+						activityAt: 1000,
+						signals: ["supported-session"],
+						sessionCount: 1,
+						userMessages: ["le fichier merci modifier"],
+					},
+				],
+				{ now: 1000, osLocale: "fr-FR", preferredLanguage: "ko" },
+			).language,
+		).toBe("ko");
+		// An unsupported preference is ignored rather than silently accepted.
+		expect(detectOnboardingLanguage([], "fr-FR", "xx")).toBe("fr");
+	});
+
 	test("profile derivation accepts injected time", () => {
 		const profile = deriveOnboardingProfile(
 			[

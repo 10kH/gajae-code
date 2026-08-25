@@ -9,6 +9,7 @@ import {
 import { SettingsSelectorComponent } from "@gajae-code/coding-agent/modes/components/settings-selector";
 import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import { resolveUiLanguage, uiString } from "@gajae-code/coding-agent/modes/ui-language";
+import { executeBuiltinSlashCommand } from "@gajae-code/coding-agent/slash-commands/builtin-registry";
 
 beforeAll(async () => {
 	await initTheme(false, undefined, undefined, "red-claw", "blue-crab");
@@ -90,5 +91,60 @@ describe("interactive UI language selection", () => {
 		expect(rendered).toContain("설정:");
 		expect(rendered).toContain("언어");
 		expect(rendered).toContain("미리보기:");
+	});
+});
+
+describe("/language slash command", () => {
+	function harness() {
+		const status: string[] = [];
+		const errors: string[] = [];
+		const ctx = {
+			settings,
+			editor: { setText: () => {} },
+			statusLine: { invalidate: () => {} },
+			ui: { invalidate: () => {} },
+			showStatus: (text: string) => status.push(text),
+			showError: (text: string) => errors.push(text),
+		};
+		return { status, errors, runtime: { ctx, handleBackgroundCommand: () => {} } };
+	}
+
+	it("reports the current language without arguments", async () => {
+		const { status, runtime } = harness();
+
+		expect(await executeBuiltinSlashCommand("/language", runtime as never)).toBe(true);
+
+		expect(status[0]).toContain("Current UI language: English");
+		expect(settings.has("ui.language")).toBe(false);
+	});
+
+	it("persists a canonical code and confirms in the selected language", async () => {
+		const { status, runtime } = harness();
+
+		expect(await executeBuiltinSlashCommand("/language ko", runtime as never)).toBe(true);
+
+		expect(settings.get("ui.language")).toBe("ko");
+		expect(status[0]).toContain("한국어");
+	});
+
+	it("accepts endonym and English-name spellings", async () => {
+		const korean = harness();
+		await executeBuiltinSlashCommand("/language 한국어", korean.runtime as never);
+		expect(settings.get("ui.language")).toBe("ko");
+
+		const english = harness();
+		await executeBuiltinSlashCommand("/language English", english.runtime as never);
+		expect(settings.get("ui.language")).toBe("en");
+	});
+
+	it("rejects an unsupported language and changes nothing", async () => {
+		settings.set("ui.language", "ko");
+		const { errors, runtime } = harness();
+
+		expect(await executeBuiltinSlashCommand("/language fr", runtime as never)).toBe(true);
+
+		expect(errors[0]).toContain("알 수 없는 언어");
+		expect(errors[0]).toContain("ko (한국어)");
+		expect(settings.get("ui.language")).toBe("ko");
 	});
 });
