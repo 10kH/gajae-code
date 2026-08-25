@@ -3122,6 +3122,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							masterCapability: masterModeContext.getCapability(),
 							masterAttestationEpoch: masterModeContext.attestationEpoch,
 						});
+						return;
 					}
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");

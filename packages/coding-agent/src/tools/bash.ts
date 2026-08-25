@@ -1013,6 +1013,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		command: string;
 		commandCwd: string;
 		resolvedEnv: Record<string, string>;
+		directMasterSpawn: boolean;
 		requestedTimeoutSec: number;
 		timeoutSec: number;
 		timeoutMs: number;
@@ -1192,7 +1193,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const sleepAdvisory = longSleepAdvisory(command, timeoutSec);
 		if (sleepAdvisory) notices.push(sleepAdvisory);
 
-		return { command, commandCwd, resolvedEnv, requestedTimeoutSec, timeoutSec, timeoutMs, notices };
+		return {
+			command,
+			commandCwd,
+			resolvedEnv,
+			directMasterSpawn,
+			requestedTimeoutSec,
+			timeoutSec,
+			timeoutMs,
+			notices,
+		};
 	}
 
 	/**
@@ -1353,6 +1363,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			command,
 			commandCwd,
 			resolvedEnv,
+			directMasterSpawn,
 			requestedTimeoutSec,
 			timeoutSec,
 			timeoutMs,
@@ -1390,7 +1401,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Skip when pty=true (PTY needs the local terminal UI).
 		const clientBridge =
 			this.session.bashRestrictionProfile === "read-only" ? undefined : this.session.getClientBridge?.();
-		const clientTerminalActive = Boolean(clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty);
+		const clientTerminalActive = Boolean(
+			!directMasterSpawn && clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty,
+		);
 
 		// Run non-PTY bash through the managed job path so Ctrl+B-twice fold-on-demand works
 		// even when auto-background is disabled. When a client terminal will handle the
@@ -1700,7 +1713,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const artifactPublisher = createBashArtifactPublisher(this.session);
 
 		const interactiveUi =
-			this.session.bashRestrictionProfile === "read-only"
+			this.session.bashRestrictionProfile === "read-only" || directMasterSpawn
 				? undefined
 				: canUseInteractiveBashPty(pty, ctx)
 					? ctx?.ui
@@ -1723,7 +1736,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					cwd: commandCwd,
 					settings: this.session.settings,
 					sessionKey: this.session.getSessionId?.() ?? undefined,
-					oneShot: this.session.bashRestrictionProfile === "read-only",
+					oneShot: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
 					timeout: timeoutMs,
 					signal,
 					env: resolvedEnv,
