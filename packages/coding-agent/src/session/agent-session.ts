@@ -12098,6 +12098,7 @@ export class AgentSession {
 			await this.prompt(text, {
 				expandPromptTemplates: false,
 				images,
+				sdkRunToken: options?.sdkRunToken,
 				onPreflightAccepted: () => {
 					options?.onPreflightAccepted?.();
 					fireQueuedPromotion();
