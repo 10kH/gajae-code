@@ -1354,6 +1354,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			options.authStorage ??
 				(await logger.time("discoverModels", () => discoverAuthStorage(agentDir, startupAuthConfig))),
 			path.join(agentDir, "models.yml"),
+			undefined,
+			{ agentDir },
 		);
 	const authStorage = modelRegistry.authStorage;
 	if (options.authStorage && options.authStorage !== authStorage) {

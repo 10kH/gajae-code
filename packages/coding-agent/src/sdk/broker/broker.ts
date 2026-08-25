@@ -1303,6 +1303,7 @@ export class Broker {
 				}
 				await this.#releaseOwnedLock();
 			}
+			await this.#resolveModelPin.dispose?.();
 			this.discovery = null;
 		})();
 		void this.#completionTask.then(this.#resolveCompletion, this.#rejectCompletion);
