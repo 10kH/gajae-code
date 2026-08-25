@@ -1,9 +1,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { sanitizeText } from "@gajae-code/utils";
+import { sanitizeDisplayLine, sanitizeText } from "@gajae-code/utils";
 import { type ExecOptions, type ExecResult, execCommand } from "../../exec/exec";
-import { parseCommandArgs } from "../../utils/command-args";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./parse";
 
@@ -112,8 +111,59 @@ export function windowsPowerShellQuote(value: string): string {
 	return `'${value.replace(/'/g, "''")}'`;
 }
 
-function quoteAsidePath(value: string): string {
-	return process.platform === "win32" ? windowsPowerShellQuote(value) : posixQuote(value);
+function quoteAsidePath(value: string, platform = process.platform): string {
+	return platform === "win32" ? windowsPowerShellQuote(value) : posixQuote(value);
+}
+
+type AsideArgvResult = { ok: true; args: string[] } | { ok: false; error: string };
+
+/** Parse user-provided Aside argv without silently accepting malformed quoting. */
+export function parseAsideArgv(input: string): AsideArgvResult {
+	const args: string[] = [];
+	let current = "";
+	let tokenStarted = false;
+	let quote: "'" | '"' | null = null;
+	let escaped = false;
+
+	for (const char of input) {
+		if (escaped) {
+			current += char;
+			tokenStarted = true;
+			escaped = false;
+			continue;
+		}
+		if (quote) {
+			if (char === quote) {
+				quote = null;
+			} else if (char === "\\" && quote === '"') {
+				escaped = true;
+			} else {
+				current += char;
+			}
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			quote = char;
+			tokenStarted = true;
+		} else if (char === "\\") {
+			escaped = true;
+			tokenStarted = true;
+		} else if (char === " " || char === "\t") {
+			if (tokenStarted) {
+				args.push(current);
+				current = "";
+				tokenStarted = false;
+			}
+		} else {
+			current += char;
+			tokenStarted = true;
+		}
+	}
+
+	if (escaped) return { ok: false, error: "unfinished escape" };
+	if (quote) return { ok: false, error: "unterminated quote" };
+	if (tokenStarted) args.push(current);
+	return { ok: true, args };
 }
 
 export function formatAsideMissingCli(probe: Extract<AsideCliProbe, { ok: false }>): string {
@@ -129,9 +179,9 @@ export function formatAsideMissingCli(probe: Extract<AsideCliProbe, { ok: false 
 	].join("\n");
 }
 
-export function formatAsideMcpRegistration(cliPath: string): string {
+export function formatAsideMcpRegistration(cliPath: string, platform = process.platform): string {
 	const safeCliPath = sanitizeText(cliPath).replace(/[\r\n]/gu, " ");
-	const quotedCliPath = quoteAsidePath(safeCliPath);
+	const quotedCliPath = quoteAsidePath(safeCliPath, platform);
 	return [
 		`Aside CLI: ${safeCliPath}`,
 		"`/aside mcp` does not start a stdio server inside GJC.",
@@ -208,7 +258,7 @@ export function createAsideHandler(options: AsideHandlerOptions = {}) {
 			const lines = [`Aside CLI: ${probe.path}`];
 			try {
 				const version = await exec(probe.path, ["--version"], runtime.cwd, { timeout: ASIDE_STATUS_TIMEOUT_MS });
-				const label = version.stdout.trim() || version.stderr.trim();
+				const label = sanitizeDisplayLine(version.stdout).trim() || sanitizeDisplayLine(version.stderr).trim();
 				if (version.code === 0 && label) lines.push(`Version: ${label.split("\n")[0]}`);
 			} catch {
 				// Status should still print when `--version` is unavailable.
@@ -221,17 +271,23 @@ export function createAsideHandler(options: AsideHandlerOptions = {}) {
 		if (!probe.ok) return usage(formatAsideMissingCli(probe), runtime);
 
 		if (verb === "account") {
-			return runCli(runtime, probe.path, ["account", ...parseCommandArgs(rest)], ASIDE_STATUS_TIMEOUT_MS);
+			const parsed = parseAsideArgv(rest);
+			if (!parsed.ok) return usage(`Invalid Aside arguments: ${parsed.error}.`, runtime);
+			return runCli(runtime, probe.path, ["account", ...parsed.args], ASIDE_STATUS_TIMEOUT_MS);
 		}
 
 		if (verb === "exec") {
-			const argv = parseCommandArgs(rest);
+			const parsed = parseAsideArgv(rest);
+			if (!parsed.ok) return usage(`Invalid Aside arguments: ${parsed.error}.`, runtime);
+			const argv = parsed.args;
 			if (argv.length === 0) return usage("Usage: /aside exec [args] <prompt>", runtime);
 			return runCli(runtime, probe.path, ["exec", ...argv], ASIDE_EXEC_TIMEOUT_MS);
 		}
 
 		if (verb.startsWith("-")) {
-			return runCli(runtime, probe.path, ["exec", ...parseCommandArgs(command.args)], ASIDE_EXEC_TIMEOUT_MS);
+			const parsed = parseAsideArgv(command.args);
+			if (!parsed.ok) return usage(`Invalid Aside arguments: ${parsed.error}.`, runtime);
+			return runCli(runtime, probe.path, ["exec", ...parsed.args], ASIDE_EXEC_TIMEOUT_MS);
 		}
 
 		return runCli(runtime, probe.path, ["exec", command.args.trim()], ASIDE_EXEC_TIMEOUT_MS);

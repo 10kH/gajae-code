@@ -5,6 +5,7 @@ import {
 	asideCliCandidates,
 	createAsideHandler,
 	formatAsideMcpRegistration,
+	parseAsideArgv,
 	posixQuote,
 	probeAsideCli,
 	resolveAsideCliPath,
@@ -80,6 +81,31 @@ describe("posixQuote", () => {
 		);
 		expect(windowsPowerShellQuote("C:\\Users\\O'Brien\\aside.exe")).toBe("'C:\\Users\\O''Brien\\aside.exe'");
 	});
+
+	test("selects PowerShell quoting for native Windows MCP commands", () => {
+		const cliPath = "C:\\Users\\demo\\Aside CLI\\aside.exe";
+		expect(formatAsideMcpRegistration(cliPath, "win32")).toContain(
+			`gjc mcp add aside ${windowsPowerShellQuote(cliPath)} mcp --project`,
+		);
+	});
+});
+
+describe("parseAsideArgv", () => {
+	test("preserves empty quoted arguments and escaped quotes", () => {
+		expect(parseAsideArgv('exec --message "" it\\\'s')).toEqual({
+			ok: true,
+			args: ["exec", "--message", "", "it's"],
+		});
+		expect(parseAsideArgv('exec "say \\"hello\\""')).toEqual({
+			ok: true,
+			args: ["exec", 'say "hello"'],
+		});
+	});
+
+	test("rejects unterminated quotes and escapes", () => {
+		expect(parseAsideArgv('exec "unterminated')).toEqual({ ok: false, error: "unterminated quote" });
+		expect(parseAsideArgv("exec trailing\\")).toEqual({ ok: false, error: "unfinished escape" });
+	});
 });
 
 describe("/aside slash command", () => {
@@ -130,6 +156,19 @@ describe("/aside slash command", () => {
 		expect(output[0]).toContain("Aside CLI: /Users/demo/.local/bin/aside");
 		expect(output[0]).toContain("Version: 1.26.810");
 		expect(output[0]).toContain(ASIDE_USAGE);
+	});
+
+	test("sanitizes version output before rendering status", async () => {
+		const handle = createAsideHandler({
+			homedir: () => "/Users/demo",
+			isExecutable: filePath => filePath === "/Users/demo/.local/bin/aside",
+			which: () => null,
+			exec: async () => ({ stdout: "\x1b]0;pwned\x071.26.810\n", stderr: "", code: 0, killed: false }),
+		});
+		const { runtime, output } = runtimeHarness();
+		await handle({ name: "aside", args: "", text: "/aside" }, runtime);
+		expect(output[0]).toContain("Version: 1.26.810");
+		expect(output[0]).not.toContain("pwned");
 	});
 
 	test("freeform prompts run aside exec with a single prompt argument", async () => {
@@ -262,6 +301,21 @@ describe("/aside slash command", () => {
 			exitCode: 1,
 		});
 		expect(output).toEqual(["no daemon\n(exit 1)"]);
+	});
+
+	test("timeout results are consumed with a non-zero status", async () => {
+		const handle = createAsideHandler({
+			homedir: () => "/Users/demo",
+			isExecutable: filePath => filePath === "/Users/demo/.local/bin/aside",
+			which: () => null,
+			exec: async () => ({ stdout: "partial", stderr: "", code: 0, killed: true }),
+		});
+		const { runtime, output } = runtimeHarness();
+		expect(await handle({ name: "aside", args: "exec Continue", text: "/aside exec Continue" }, runtime)).toEqual({
+			consumed: true,
+			exitCode: 1,
+		});
+		expect(output).toEqual(["partial\nAside CLI timed out or was cancelled."]);
 	});
 
 	test("sanitizes CLI control sequences before rendering output", async () => {
