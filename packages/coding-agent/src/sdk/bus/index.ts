@@ -8546,7 +8546,6 @@ export function createNotificationsExtension(
 	const flushPendingSettled = (rt: SessionRuntime, id: string): void => {
 		const settled = rt.pendingSettled;
 		if (!settled?.receipts.length || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
-		rt.pendingSettled = undefined;
 		const text = composeSettlementText(settled.receipts);
 		// A composition represents multiple finalized turns. It must be a fresh
 		// terminal message rather than editing either constituent turn's stream.
@@ -8554,7 +8553,7 @@ export function createNotificationsExtension(
 		const previousLiveRef = rt.liveRef;
 		if (messageRef) rt.liveRef = messageRef;
 		try {
-			flushTurnText(rt, id, text, true);
+			if (flushTurnText(rt, id, text, true)) rt.pendingSettled = undefined;
 		} finally {
 			if (!messageRef) rt.liveRef = previousLiveRef;
 		}
@@ -8822,8 +8821,8 @@ export function createNotificationsExtension(
 	// The daemon coalesces/throttles these via its shared rate-limit pool.
 	// Push the in-flight turn's assistant text as a finalized turn_stream, deduped
 	// against what was already flushed for this turn (the pre-ask lead-in).
-	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): void => {
-		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive || rt.policySuspended) return;
+	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): boolean => {
+		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive || rt.policySuspended) return false;
 		const hadUserSettlementReceipt = hasUserSettlementReceipt(rt);
 		const settlementWindow = rt.currentTurnSettlementWindow ?? rt.settlementWindow;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
@@ -8843,7 +8842,7 @@ export function createNotificationsExtension(
 				text,
 				...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
 			});
-			if (!published) return;
+			if (!published) return false;
 			rt.preAskFlushedText = text;
 			if (!finalAnswer) {
 				// A successfully published ask lead-in settles only exact matching
@@ -8857,8 +8856,10 @@ export function createNotificationsExtension(
 				if (rt.currentTurnSettlementOrigin !== "autonomous" && !hadUserSettlementReceipt)
 					rt.pendingSettled = undefined;
 			}
+			return true;
 		} catch (e) {
 			logger.warn(`notifications: pushFrame (turn) failed: ${String(e)}`);
+			return false;
 		}
 	};
 
