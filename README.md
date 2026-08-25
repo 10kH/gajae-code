@@ -191,7 +191,7 @@ GJC uses the Claude Code / Codex `SKILL.md` file convention, but loads runtime s
 
 ```sh
 # project-local, per repository:
-cp -r my-skill .gjc/skills/
+mkdir -p .gjc/skills && cp -r my-skill .gjc/skills/
 
 # user-wide, available in every project:
 mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/

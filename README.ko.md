@@ -199,7 +199,7 @@ GJC는 Claude Code / Codex의 `SKILL.md` 파일 규약을 사용하지만, 런�
 
 ```sh
 # 프로젝트 로컬, 저장소별:
-cp -r my-skill .gjc/skills/
+mkdir -p .gjc/skills && cp -r my-skill .gjc/skills/
 
 # 모든 프로젝트에서 쓸 사용자 전역 경로:
 mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/

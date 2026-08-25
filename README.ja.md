@@ -193,7 +193,7 @@ GJC は Claude Code / Codex の `SKILL.md` ファイル規約を使いますが�
 
 ```sh
 # プロジェクトローカル、リポジトリごと:
-cp -r my-skill .gjc/skills/
+mkdir -p .gjc/skills && cp -r my-skill .gjc/skills/
 
 # すべてのプロジェクトで使えるユーザー全体の場所:
 mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/
