@@ -7459,6 +7459,9 @@ export class AgentSession {
 						type: "agent_failed",
 						error: sanitizePromptFailure(event.error),
 						scope: event.scope,
+						...(deliveryScope
+							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
+							: {}),
 					},
 					undefined,
 					deliveryScope,
@@ -7470,6 +7473,9 @@ export class AgentSession {
 						messages: event.messages,
 						stopReason: event.stopReason,
 						maintenanceOutcome: event.maintenanceOutcome,
+						...(deliveryScope
+							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
+							: {}),
 					},
 					undefined,
 					deliveryScope,

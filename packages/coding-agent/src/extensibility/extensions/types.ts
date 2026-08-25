@@ -752,6 +752,8 @@ export interface AgentStartEvent extends SharedAgentStartEvent {
 export interface AgentFailedEvent {
 	type: "agent_failed";
 	error: AgentFailureDiagnostic;
+	/** Internal SDK queue-owner binding for exact lifecycle attribution. */
+	sdkRunToken?: string;
 	/** Attempt correlation for the failing run, when scoped (matches the
 	 * agent_start/agent_end scope contract). */
 	scope?: AttemptScope;
