@@ -3100,12 +3100,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				lifecycleActive: boolean;
 				lifecycleEpoch: number;
 				failureDiagnosticKeys: Set<string>;
+				lifecycleTasks: Set<Promise<void>>;
 				/** Failure reasons whose durable agent_failed write failed; the
 				 * subsequent agent_end must re-record them before terminalizing or
 				 * the record classifies terminal_ok (exact-head review P1). */
 				unrecordedFailureReasons?: Map<string, { code: string; message: string }>;
 		  }
 		| undefined;
+	type RuntimeState = NonNullable<typeof active>;
+	type LifecycleBatch = RuntimeState["openLifecycleBatches"][number];
+	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
 	// Shared with the control surface's terminal abort: the correlated
 	// agent_end publication capture (AC 19). terminalAbort installs a fresh
 	// resolver before settling the abort; emitLifecycle resolves it with the
@@ -3124,23 +3128,24 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// thread P1).
 	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
 	const skillTerminalRecoveryKeys = new Set<string>();
+	const trackLifecycle = (handler: () => Promise<void>): Promise<void> => {
+		const owner = active;
+		if (!owner) return handler();
+		let task: Promise<void>;
+		task = handler().finally(() => owner.lifecycleTasks.delete(task));
+		owner.lifecycleTasks.add(task);
+		return task;
+	};
 	const emitLifecycle = async (
 		type: "agent_start" | "agent_end" | "agent_failed",
 		ctx: ExtensionContext,
 		failureCause?: unknown,
 		maintenanceOutcome?: string,
-		failureBatch?: {
-			epoch: number;
-			invocations: Array<{
-				kind: InvocationKind;
-				correlation: InvocationCorrelation;
-				connectionId: string | undefined;
-			}>;
-			attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
-		},
+		lifecycleOwner?: LifecycleOwner,
 	): Promise<void> => {
-		const current = active;
+		const current = lifecycleOwner?.state ?? active;
 		if (!current) return;
+		const failureBatch = lifecycleOwner?.batch;
 		const adoptLifecycleBatch = (
 			batch:
 				| Array<{
@@ -3255,11 +3260,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// may already have advanced to. Publication proof and race retirement must
 		// use the same batch identity as reconciliation.
 		const eventLifecycleEpoch =
-			type === "agent_failed" && failureBatch
+			(type === "agent_failed" || type === "agent_end") && failureBatch
 				? failureBatch.epoch
-				: type === "agent_end"
-					? (current.openLifecycleBatches[0]?.epoch ?? current.lifecycleEpoch)
-					: current.lifecycleEpoch;
+				: current.lifecycleEpoch;
 		const resolveTerminalPublicationWaiters = (observed: boolean): void => {
 			const waiters = terminalPublicationCapture.waiters;
 			if (!waiters) return;
@@ -3269,17 +3272,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			for (const waiter of matched) waiter.resolve(observed);
 		};
 		const retireEndedLifecycleBatch = (): void => {
-			const ended = current.openLifecycleBatches[0];
+			const ended = failureBatch ?? current.openLifecycleBatches[0];
 			if (!ended) return;
 			const transitionKeys = new Set(
 				transitions.map(({ correlation }) => `${correlation.commandId}:${correlation.turnId}`),
 			);
 			if (
-				ended.invocations.some(({ correlation }) =>
+				!ended.invocations.some(({ correlation }) =>
 					transitionKeys.has(`${correlation.commandId}:${correlation.turnId}`),
 				)
 			)
-				current.openLifecycleBatches.shift();
+				return;
+			const index = current.openLifecycleBatches.indexOf(ended);
+			if (index >= 0) current.openLifecycleBatches.splice(index, 1);
 		};
 		const scheduleSkillTerminalRecovery = (invocation: {
 			kind: InvocationKind;
@@ -3407,7 +3412,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					}
 				}
 			}
-			const sessionId = ctx.sessionManager.getSessionId();
+			const sessionId = lifecycleOwner?.sessionId ?? ctx.sessionManager.getSessionId();
 			if (type === "agent_failed") {
 				// Failure is a correlated diagnostic, not the terminal lifecycle boundary.
 				// Publish one safe frame per invocation so clients can attribute a shared
@@ -3461,7 +3466,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				resolveTerminalPublicationWaiters(observed);
 				return;
 			}
-			if (current.openLifecycleBatches.length > 0) current.openLifecycleBatches.shift();
+			const ended = failureBatch ?? current.openLifecycleBatches[0];
+			if (ended) {
+				const index = current.openLifecycleBatches.indexOf(ended);
+				if (index >= 0) current.openLifecycleBatches.splice(index, 1);
+			}
 			for (const invocation of transitions)
 				current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
 			for (const invocation of transitions)
@@ -3475,29 +3484,40 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			resolveTerminalPublicationWaiters(observed);
 		}
 	};
-	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
-	api.on("agent_end", async (event, ctx) => {
-		const failure = providerFailureFromAgentEnd(event);
-		const current = active;
-		// Capture the oldest unmatched batch synchronously. A successor may start
-		// while the failed diagnostic persists; that must not retarget the
-		// predecessor's reason or terminal boundary to the successor invocation.
-		const endedBatch = current?.openLifecycleBatches[0];
-		const currentInvocation = endedBatch?.invocations[0] ?? current?.activeInvocation;
-		const failureAlreadyPublished = currentInvocation
-			? current?.failureDiagnosticKeys.has(
-					`${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`,
-				)
-			: false;
-		if (failure && !failureAlreadyPublished) await emitLifecycle("agent_failed", ctx, failure, undefined, endedBatch);
-		await emitLifecycle(
-			"agent_end",
-			ctx,
-			undefined,
-			event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-		);
-	});
-	api.on("agent_failed", async (event, ctx) => emitLifecycle("agent_failed", ctx, event.error));
+	api.on("agent_start", (_event, ctx) => trackLifecycle(async () => await emitLifecycle("agent_start", ctx)));
+	api.on("agent_end", (event, ctx) =>
+		trackLifecycle(async () => {
+			const failure = providerFailureFromAgentEnd(event);
+			const current = active;
+			// Capture the oldest unmatched batch synchronously. A successor may start
+			// while the failed diagnostic persists; that must not retarget the
+			// predecessor's reason or terminal boundary to the successor invocation.
+			const endedBatch = current?.openLifecycleBatches[0];
+			const lifecycleOwner = current
+				? {
+						state: current,
+						sessionId: ctx.sessionManager.getSessionId(),
+						...(endedBatch ? { batch: endedBatch } : {}),
+					}
+				: undefined;
+			const currentInvocation = endedBatch?.invocations[0] ?? current?.activeInvocation;
+			const failureAlreadyPublished = currentInvocation
+				? current?.failureDiagnosticKeys.has(
+						`${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`,
+					)
+				: false;
+			if (failure && !failureAlreadyPublished)
+				await emitLifecycle("agent_failed", ctx, failure, undefined, lifecycleOwner);
+			await emitLifecycle(
+				"agent_end",
+				ctx,
+				undefined,
+				event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+				lifecycleOwner,
+			);
+		}),
+	);
+	api.on("agent_failed", (event, ctx) => trackLifecycle(async () => emitLifecycle("agent_failed", ctx, event.error)));
 	api.on("turn_start", async (_event, ctx) => {
 		const current = active;
 		if (!current) return;
@@ -4110,6 +4130,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			lifecycleActive: false,
 			lifecycleEpoch: 0,
 			failureDiagnosticKeys: new Set(),
+			lifecycleTasks: new Set(),
 		};
 		try {
 			await runtime.start();
@@ -4142,6 +4163,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					lifecycleActive: false,
 					lifecycleEpoch: 0,
 					failureDiagnosticKeys: new Set(),
+					lifecycleTasks: new Set(),
 				};
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}
@@ -4157,6 +4179,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		current.fenceGateResolutions();
 		try {
 			await current.waitForGateResolutionQuiescence();
+			while (current.lifecycleTasks.size > 0) await Promise.all([...current.lifecycleTasks]);
 			active = undefined;
 			current.disposeGate?.();
 			await current.runtime.stop();
