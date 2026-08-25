@@ -1285,6 +1285,7 @@ export class Broker {
 		if (this.#heartbeatTimer) clearInterval(this.#heartbeatTimer);
 		this.#heartbeatTimer = null;
 		this.#completionTask = (async () => {
+			await this.#resolveModelPin.dispose?.();
 			await this.#transport?.stop();
 			this.#transport = null;
 			if (mode === "lost-root")
@@ -1303,7 +1304,6 @@ export class Broker {
 				}
 				await this.#releaseOwnedLock();
 			}
-			await this.#resolveModelPin.dispose?.();
 			this.discovery = null;
 		})();
 		void this.#completionTask.then(this.#resolveCompletion, this.#rejectCompletion);
