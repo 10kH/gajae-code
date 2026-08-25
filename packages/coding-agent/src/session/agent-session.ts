@@ -2561,6 +2561,7 @@ export class AgentSession {
 	/** SDK follow-up ownership by queued message and the attempt that dequeues it. */
 	#sdkRunTokensByQueuedMessage = new WeakMap<AgentMessage, string>();
 	#sdkRunTokensByAttemptScope = new WeakMap<AttemptScope, string>();
+	#activeSdkRunToken: string | undefined;
 	#attemptAuthority!: AttemptScopeAuthority;
 	#attemptRecordStore!: AttemptRecordStore;
 	#activeLogicalRunId: AttemptRunHandle["logicalRunId"] | undefined;
@@ -6366,6 +6367,7 @@ export class AgentSession {
 													const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
 													if (sdkRunToken) {
 														this.#sdkRunTokensByAttemptScope.set(handle.scope, sdkRunToken);
+														this.#activeSdkRunToken = sdkRunToken;
 														break;
 													}
 												}
@@ -7430,11 +7432,19 @@ export class AgentSession {
 			await this.#flushWorkerIntegrationForAgentEnd();
 		}
 		const deliveryScope = scope ?? (event as AgentSessionEvent & { scope?: AttemptScopeRef }).scope;
+		const eventToken = (event as AgentSessionEvent & { sdkRunToken?: unknown }).sdkRunToken;
+		const sdkRunToken =
+			typeof eventToken === "string"
+				? eventToken
+				: deliveryScope
+					? this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope)
+					: this.#activeSdkRunToken;
 		const isTerminalAgentEnd =
 			event.type === "agent_end" && !(event.stopReason === "maintenance" && event.maintenanceOutcome !== "aborted");
 		const finishAttempt = () => {
 			if (!isTerminalAgentEnd) return;
 			if (deliveryScope) this.#attemptRecordStore.retire(deliveryScope as AttemptScope);
+			if (sdkRunToken === this.#activeSdkRunToken) this.#activeSdkRunToken = undefined;
 			this.#activeLogicalRunId = undefined;
 		};
 		if (!this.#extensionRunner) {
@@ -7448,9 +7458,7 @@ export class AgentSession {
 				await this.#extensionRunner.emit(
 					{
 						type: "agent_start",
-						...(deliveryScope
-							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
-							: {}),
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -7461,9 +7469,7 @@ export class AgentSession {
 						type: "agent_failed",
 						error: sanitizePromptFailure(event.error),
 						scope: event.scope,
-						...(deliveryScope
-							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
-							: {}),
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -7475,9 +7481,7 @@ export class AgentSession {
 						messages: event.messages,
 						stopReason: event.stopReason,
 						maintenanceOutcome: event.maintenanceOutcome,
-						...(deliveryScope
-							? { sdkRunToken: this.#sdkRunTokensByAttemptScope.get(deliveryScope as AttemptScope) }
-							: {}),
+						...(sdkRunToken ? { sdkRunToken } : {}),
 					},
 					undefined,
 					deliveryScope,
@@ -11006,7 +11010,10 @@ export class AgentSession {
 				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
 					this.#acceptRunHandle(handle);
-					if (options?.sdkRunToken) this.#sdkRunTokensByAttemptScope.set(handle.scope, options.sdkRunToken);
+					if (options?.sdkRunToken) {
+						this.#sdkRunTokensByAttemptScope.set(handle.scope, options.sdkRunToken);
+						this.#activeSdkRunToken = options.sdkRunToken;
+					}
 					options?.onRunAccepted?.(handle);
 					options?.admissionLease?.release();
 					// R3.3: the accepted-run wrapper is the exact acceptance boundary —

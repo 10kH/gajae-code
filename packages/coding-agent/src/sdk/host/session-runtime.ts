@@ -3144,9 +3144,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
 	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
-	const fallbackSessionManagerIdentities = new WeakMap<object, string>();
+	const fallbackSessionManagerIdentities = new WeakMap<object, string | null>();
 	const ambiguousLifecycleIdentities = new Set<string>();
-	const lifecycleRunOwners = new Map<string, RuntimeState>();
+	const lifecycleRunOwners = new Map<string, { state: RuntimeState; batch?: LifecycleBatch }>();
 	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		if (ctx.sessionManager.getSessionFile !== undefined) {
@@ -3154,7 +3154,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			if (!sessionFile) return undefined;
 			return `${sessionId}\u0000${sessionFile}`;
 		}
-		return fallbackSessionManagerIdentities.get(ctx.sessionManager);
+		const fallbackIdentity = fallbackSessionManagerIdentities.get(ctx.sessionManager);
+		return fallbackIdentity === null ? undefined : fallbackIdentity;
 	};
 	const lifecycleStateForContext = (
 		ctx: ExtensionContext,
@@ -3186,7 +3187,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		sdkRunToken: unknown,
 	): RuntimeState | undefined =>
 		type !== "agent_start" && typeof sdkRunToken === "string" && sdkRunToken.length > 0
-			? lifecycleRunOwners.get(sdkRunToken)
+			? lifecycleRunOwners.get(sdkRunToken)?.state
 			: lifecycleStateForContext(ctx, type);
 	const removeRetiredLifecycleOwner = (owner: RuntimeState): void => {
 		const timer = retiredLifecycleOwnerTimers.get(owner);
@@ -3199,6 +3200,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const remaining = owners.filter(candidate => candidate !== owner);
 		if (remaining.length === 0) retiredLifecycleOwners.delete(owner.sessionId);
 		else retiredLifecycleOwners.set(owner.sessionId, remaining);
+		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
 	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
 		if (owner.openLifecycleBatches.length > 0 || owner.lifecycleTasks.size > 0) return;
@@ -3595,30 +3597,33 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	api.on("agent_start", (event, ctx) => {
 		const owner = lifecycleStateForEvent(ctx, "agent_start", event.sdkRunToken);
-		if (owner && typeof event.sdkRunToken === "string" && event.sdkRunToken.length > 0)
-			lifecycleRunOwners.set(event.sdkRunToken, owner);
-		return trackLifecycle(
-			async () =>
-				await emitLifecycle(
-					"agent_start",
-					ctx,
-					undefined,
-					undefined,
-					owner ? { state: owner, sessionId: owner.sessionId } : undefined,
-				),
-			owner,
-		);
+		return trackLifecycle(async () => {
+			await emitLifecycle(
+				"agent_start",
+				ctx,
+				undefined,
+				undefined,
+				owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+			);
+			if (owner && typeof event.sdkRunToken === "string" && event.sdkRunToken.length > 0)
+				lifecycleRunOwners.set(event.sdkRunToken, {
+					state: owner,
+					batch: owner.openLifecycleBatches.at(-1),
+				});
+		}, owner);
 	});
 	api.on("agent_end", (event, ctx) => {
-		const owner = lifecycleStateForEvent(ctx, "agent_end", event.sdkRunToken);
+		const tokenBinding =
+			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
+		const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_end", event.sdkRunToken);
 		// Capture the oldest unmatched batch synchronously. A successor may start
 		// while the failed diagnostic persists; that must not retarget the
 		// predecessor's reason or terminal boundary to the successor invocation.
-		const endedBatch = owner?.openLifecycleBatches[0];
+		const endedBatch = tokenBinding?.batch ?? owner?.openLifecycleBatches[0];
 		const lifecycleOwner = owner
 			? {
 					state: owner,
-					sessionId: ctx.sessionManager.getSessionId(),
+					sessionId: owner.sessionId,
 					...(endedBatch ? { batch: endedBatch } : {}),
 				}
 			: undefined;
@@ -3640,13 +3645,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				lifecycleOwner,
 			);
 		}, owner).finally(() => {
-			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken) === owner)
+			if (typeof event.sdkRunToken === "string" && lifecycleRunOwners.get(event.sdkRunToken)?.state === owner)
 				lifecycleRunOwners.delete(event.sdkRunToken);
 		});
 	});
 	api.on("agent_failed", (event, ctx) => {
-		const owner = lifecycleStateForEvent(ctx, "agent_failed", event.sdkRunToken);
-		const failedBatch = owner?.openLifecycleBatches[0];
+		const tokenBinding =
+			typeof event.sdkRunToken === "string" ? lifecycleRunOwners.get(event.sdkRunToken) : undefined;
+		const owner = tokenBinding?.state ?? lifecycleStateForEvent(ctx, "agent_failed", event.sdkRunToken);
+		const failedBatch = tokenBinding?.batch ?? owner?.openLifecycleBatches[0];
 		return trackLifecycle(
 			async () =>
 				emitLifecycle(
@@ -3747,7 +3754,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
 		const sessionIdentity = `${sessionId}\u0000${sessionFile}`;
 		if (ctx.sessionManager.getSessionFile === undefined)
-			fallbackSessionManagerIdentities.set(ctx.sessionManager, sessionIdentity);
+			if (fallbackSessionManagerIdentities.has(ctx.sessionManager)) {
+				const previousIdentity = fallbackSessionManagerIdentities.get(ctx.sessionManager);
+				if (previousIdentity !== sessionIdentity) fallbackSessionManagerIdentities.set(ctx.sessionManager, null);
+			} else fallbackSessionManagerIdentities.set(ctx.sessionManager, sessionIdentity);
 		const reconciliationStore =
 			options.terminalAbortSeams?.getReconciliationStore?.() ??
 			createReconciliationStore({ sessionFile, sessionId });
