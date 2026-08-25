@@ -118,6 +118,9 @@ enum DirectCommand {
 		connection_generation:  String,
 		requires_tool_activity: bool,
 	},
+	/// Acknowledged only after every directed frame queued before it has
+	/// finished on this connection's writer path.
+	DirectedDeliveryBarrier(oneshot::Sender<()>),
 	ReevaluateAsk,
 }
 
@@ -828,6 +831,45 @@ impl ServerHandle {
 		})
 	}
 
+	/// Wait until every currently authenticated connection has processed all
+	/// directed frames accepted before this call. The barrier is serialized on
+	/// each connection's writer queue, so a later broadcast cannot overtake an
+	/// earlier positioned or excluded-recipient delivery.
+	///
+	/// Returns `false` when a connection closes before acknowledging its barrier
+	/// or the bounded wait expires. With no connected clients there is nothing
+	/// to order and the barrier succeeds immediately.
+	pub async fn wait_for_directed_delivery(&self, wait: Duration) -> bool {
+		let senders = self
+			.state
+			.connections
+			.lock()
+			.values()
+			.map(|connection| connection.tx.clone())
+			.collect::<Vec<_>>();
+		let mut receipts = Vec::with_capacity(senders.len());
+		for sender in senders {
+			let (settled_tx, settled_rx) = oneshot::channel();
+			if sender
+				.send(DirectCommand::DirectedDeliveryBarrier(settled_tx))
+				.is_err()
+			{
+				return false;
+			}
+			receipts.push(settled_rx);
+		}
+		timeout(wait, async move {
+			for receipt in receipts {
+				if receipt.await.is_err() {
+					return false;
+				}
+			}
+			true
+		})
+		.await
+		.unwrap_or(false)
+	}
+
 	/// Resolve an unclaimed legacy action. Claimed forward-mode replies require
 	/// [`Self::resolve_claim`] with the exact receipt.
 	pub fn resolve_client(
@@ -1443,6 +1485,10 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 								requires_tool_activity,
 							) && write.send(Message::Text(json)).await.is_ok()
 						},
+						DirectCommand::DirectedDeliveryBarrier(settled) => {
+							let _ = settled.send(());
+							true
+						},
 						DirectCommand::ReevaluateAsk => true,
 					};
 					if !sent {
@@ -1528,6 +1574,9 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 						) && write.send(Message::Text(json)).await.is_err() {
 							break;
 						}
+					},
+					DirectCommand::DirectedDeliveryBarrier(settled) => {
+						let _ = settled.send(());
 					},
 					DirectCommand::ReevaluateAsk => {
 						if !reevaluate_ask(&state, &mut write, &connection_id).await {
@@ -2002,6 +2051,119 @@ mod tests {
 		assert!(
 			handle.send_to("slow", r#"{"type":"query_response","id":"recovered","ok":true}"#.into(),)
 		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn directed_delivery_barrier_waits_behind_preceding_frames() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let (tx, mut rx) = mpsc::unbounded_channel::<DirectCommand>();
+		let queued = Arc::new(AtomicUsize::new(0));
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("slow".into(), Connection {
+				generation: "generation".into(),
+				capabilities: Vec::new(),
+				negotiation: Negotiation::Negotiated,
+				delivered: None,
+				queued_directed_frames: Arc::clone(&queued),
+				tx,
+			});
+
+		assert!(handle.send_to(
+			"slow",
+			r#"{"type":"identity_header","sessionId":"s","repo":"repo","branch":"dev","machine":"host"}"#
+				.into(),
+		));
+		let barrier = {
+			let handle = handle.clone();
+			tokio::spawn(async move {
+				handle
+					.wait_for_directed_delivery(Duration::from_secs(1))
+					.await
+			})
+		};
+
+		let DirectCommand::DirectedFrame { .. } = rx.recv().await.expect("preceding frame") else {
+			panic!("expected directed frame before its barrier");
+		};
+		release_directed_frame(&queued);
+		let DirectCommand::DirectedDeliveryBarrier(settled) =
+			rx.recv().await.expect("directed delivery barrier")
+		else {
+			panic!("expected directed delivery barrier after the frame");
+		};
+		assert!(!barrier.is_finished());
+		settled.send(()).expect("barrier waiter remains live");
+		assert!(barrier.await.expect("barrier task"));
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn directed_delivery_barrier_fails_when_a_writer_disappears() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let (tx, rx) = mpsc::unbounded_channel::<DirectCommand>();
+		handle
+			.state
+			.connections
+			.lock()
+			.insert("closed".into(), Connection {
+				generation: "generation".into(),
+				capabilities: Vec::new(),
+				negotiation: Negotiation::Negotiated,
+				delivered: None,
+				queued_directed_frames: Arc::new(AtomicUsize::new(0)),
+				tx,
+			});
+		drop(rx);
+
+		assert!(
+			!handle
+				.wait_for_directed_delivery(Duration::from_millis(100))
+				.await
+		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn directed_delivery_barrier_orders_a_later_idle_broadcast() {
+		use crate::protocol::IdentityHeader;
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut ws = connect(&handle, "secret").await;
+		let connection_id = next_server_hello(&mut ws)
+			.await
+			.connection_id
+			.expect("connection id");
+		wait_for_clients(&handle, 1).await;
+		let identity = ServerMessage::IdentityHeader(IdentityHeader {
+			session_id: "s".into(),
+			repo:       "gajae-code".into(),
+			branch:     "dev".into(),
+			machine:    "test".into(),
+			title:      None,
+		});
+		assert!(handle.send_to(
+			&connection_id,
+			serde_json::to_string(&identity).expect("identity serialization"),
+		));
+		assert!(
+			handle
+				.wait_for_directed_delivery(Duration::from_secs(1))
+				.await
+		);
+		handle.note_idle(idle("ordered-idle"));
+
+		assert!(matches!(
+			next_server_msg(&mut ws).await,
+			ServerMessage::IdentityHeader(IdentityHeader { session_id, .. }) if session_id == "s"
+		));
+		assert!(matches!(
+			next_server_msg(&mut ws).await,
+			ServerMessage::ActionNeeded(needed)
+				if needed.kind == ActionKind::Idle && needed.id == "ordered-idle"
+		));
 		handle.stop();
 	}
 

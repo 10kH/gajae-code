@@ -7139,6 +7139,11 @@ export function createNotificationsExtension(
 					"@gajae-code/natives is out of date: missing positioned raw-fan-out exclusion. Rebuild the native addon (bun --cwd=packages/natives run build).",
 				);
 			}
+			if (typeof server.waitForDirectedDelivery !== "function") {
+				throw new Error(
+					"@gajae-code/natives is out of date: missing directed-delivery barrier. Rebuild the native addon (bun --cwd=packages/natives run build).",
+				);
+			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
 				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
 			});
@@ -8747,30 +8752,43 @@ export function createNotificationsExtension(
 		const seq = rt.idleSeq++;
 		// Re-assert the identity header so the daemon renames the topic once the
 		// session title has been auto-generated ("{repo}/{branch} - {title}"). The
-		// daemon only renames when the title actually changed.
+		// daemon only renames when the title actually changed. A positioned event
+		// uses the per-connection directed queue while noteIdle uses the independent
+		// broadcast queue, so wait for the directed writer barrier before publishing
+		// the dependent idle action. Without it Tokio may select the idle first and
+		// route the notification with stale topic identity.
+		let idleOrderingReady = true;
 		try {
-			pushSessionFrame(rt, {
+			const positioned = pushSessionFrame(rt, {
 				type: "identity_header",
 				sessionId: id,
 				...buildIdentity(ctx.cwd, ctx.sessionManager.getSessionName(), telegramTopicsEnabled()),
 			});
-		} catch {}
-		try {
-			rt.server.noteIdle(
-				JSON.stringify(
-					notificationActionPayload(
-						{
-							id: `idle:${id}#${seq}`,
-							kind: "idle",
-							sessionId: id,
-							summary: undefined,
-						},
-						{ redact: rt.redact },
+			if (positioned) idleOrderingReady = await rt.server.waitForDirectedDelivery(1_000);
+		} catch (error) {
+			idleOrderingReady = false;
+			logger.warn(`notifications: identity delivery barrier failed: ${String(error)}`);
+		}
+		if (idleOrderingReady) {
+			try {
+				rt.server.noteIdle(
+					JSON.stringify(
+						notificationActionPayload(
+							{
+								id: `idle:${id}#${seq}`,
+								kind: "idle",
+								sessionId: id,
+								summary: undefined,
+							},
+							{ redact: rt.redact },
+						),
 					),
-				),
-			);
-		} catch (e) {
-			logger.warn(`notifications: noteIdle failed: ${String(e)}`);
+				);
+			} catch (e) {
+				logger.warn(`notifications: noteIdle failed: ${String(e)}`);
+			}
+		} else {
+			logger.warn("notifications: idle suppressed because positioned identity delivery did not settle");
 		}
 
 		// Lean: emit the latest deferred assistant answer exactly once at idle.

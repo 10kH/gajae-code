@@ -34,6 +34,8 @@ declare module "@gajae-code/natives" {
 		): void;
 		/** Directed delivery of a validated, bounded JSON v3 envelope to one connection. */
 		sendTo(connectionId: string, json: string): void;
+		/** Wait for every directed writer queue to cross the current delivery barrier. */
+		waitForDirectedDelivery(timeoutMs: number): Promise<boolean>;
 		/** Register a correlated workflow-gate action_needed frame. */
 		registerWorkflowGateAsk(workflowJson: string, repliable: boolean): void;
 		/** Atomically register the single active arbitrated action and return its private lease. */

@@ -41,6 +41,54 @@ test("napi turn streams report whether a connection accepted the raw frame", asy
 	}
 });
 
+test("napi directed delivery barrier settles before a dependent idle broadcast", async () => {
+	const sessionId = `directed-barrier-${process.pid}-${Date.now()}`;
+	const token = "directed-barrier-token";
+	const server = new NotificationServer(sessionId, token, `/tmp/${sessionId}`, true);
+	const endpoint = await server.start();
+	const frames: Array<{ type?: string; connectionId?: string; kind?: string }> = [];
+	const ws = new WebSocket(`${endpoint.url}/?token=${token}`);
+	ws.addEventListener("message", event => {
+		frames.push(JSON.parse(String(event.data)) as { type?: string; connectionId?: string; kind?: string });
+	});
+	const opened = Promise.withResolvers<void>();
+	ws.addEventListener("open", () => opened.resolve(), { once: true });
+	ws.addEventListener("error", () => opened.reject(new Error("websocket connection failed")), { once: true });
+	await opened.promise;
+	try {
+		await waitFor(() => frames.some(frame => frame.type === "hello" && frame.connectionId), "server hello");
+		const connectionId = frames.find(frame => frame.type === "hello")?.connectionId;
+		expect(connectionId).toBeString();
+		frames.splice(0);
+
+		server.sendTo(
+			connectionId!,
+			JSON.stringify({
+				type: "identity_header",
+				sessionId,
+				repo: "gajae-code",
+				branch: "dev",
+				machine: "test",
+			}),
+		);
+		expect(await server.waitForDirectedDelivery(1_000)).toBe(true);
+		server.noteIdle(JSON.stringify({ id: `idle:${sessionId}`, kind: "idle", sessionId }));
+
+		await waitFor(
+			() =>
+				frames.some(frame => frame.type === "identity_header") &&
+				frames.some(frame => frame.type === "action_needed" && frame.kind === "idle"),
+			"identity and idle frames",
+		);
+		const identityIndex = frames.findIndex(frame => frame.type === "identity_header");
+		const idleIndex = frames.findIndex(frame => frame.type === "action_needed" && frame.kind === "idle");
+		expect(identityIndex).toBeLessThan(idleIndex);
+	} finally {
+		ws.close();
+		await server.stopAndWait();
+	}
+});
+
 test("napi NotificationServer permits synchronous reentrant host calls during inbound and reply callbacks", async () => {
 	const sessionId = `reentrant-${process.pid}-${Date.now()}`;
 	const token = "reentrant-token";
