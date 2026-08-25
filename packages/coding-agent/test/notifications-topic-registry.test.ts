@@ -756,7 +756,7 @@ test("preserves a no-provenance endpoint claim before a held create can stage it
 	await creating;
 	expect(reg.endpointAuthority(binding)).toEqual({ state: "unique", sessionId: "B" });
 });
-test("publishes exact durable authority generation 176 at serving epoch 88", () => {
+test("publishes exact durable authority generation 177 at serving epoch 88", () => {
 	// Generation 58: parser-valid durable-fence promotion and rollback.
 	// Generation 152: a thrown steady heartbeat renewal in the run loop is
 	// contained instead of terminating the daemon (#4200).
@@ -794,7 +794,9 @@ test("publishes exact durable authority generation 176 at serving epoch 88", () 
 
 	// Generation 174: stale-package broker retirement changes protected daemon
 	// launch and discovery authority after dev's generation-173 notification fix.
-	expect(DAEMON_GENERATION).toBe(176);
+	// Generation 177: successful autonomous ask lead-ins consume only their exact
+	// same-window lean settlement receipts; serving protocol remains epoch 88.
+	expect(DAEMON_GENERATION).toBe(177);
 	expect(SERVING_EPOCH).toBe(88);
 });
 test("archives pending topics into retained inactive records", async () => {

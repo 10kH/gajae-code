@@ -8463,6 +8463,20 @@ export function createNotificationsExtension(
 	};
 
 	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => rt.pendingSettled?.receipts[0]?.origin === "user";
+	const composeSettlementText = (receipts: ReadonlyArray<{ text: string }>): string =>
+		receipts.map(receipt => receipt.text).join("\n\n");
+
+	const consumePublishedSettlement = (rt: SessionRuntime, text: string, window: number): void => {
+		const pending = rt.pendingSettled;
+		if (!pending || pending.window !== window) return;
+		if (composeSettlementText(pending.receipts) === text) {
+			rt.pendingSettled = undefined;
+			return;
+		}
+		const receipts = pending.receipts.filter(receipt => receipt.text !== text);
+		if (receipts.length === pending.receipts.length) return;
+		rt.pendingSettled = receipts.length ? { ...pending, receipts } : undefined;
+	};
 
 	const flushPendingFinal = (rt: SessionRuntime, id: string): void => {
 		const pending = rt.pendingFinal;
@@ -8479,7 +8493,7 @@ export function createNotificationsExtension(
 				for (const receipt of pending.receipts)
 					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window, receipt.origin);
 			} else {
-				const text = pending.receipts.map(receipt => receipt.text).join("\n\n");
+				const text = composeSettlementText(pending.receipts);
 				const messageRef = pending.receipts.length === 1 ? pending.receipts[0]?.messageRef : undefined;
 				try {
 					pushSessionFrame(rt, {
@@ -8503,7 +8517,7 @@ export function createNotificationsExtension(
 		const settled = rt.pendingSettled;
 		if (!settled?.receipts.length || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
 		rt.pendingSettled = undefined;
-		const text = settled.receipts.map(receipt => receipt.text).join("\n\n");
+		const text = composeSettlementText(settled.receipts);
 		// A composition represents multiple finalized turns. It must be a fresh
 		// terminal message rather than editing either constituent turn's stream.
 		const messageRef = settled.receipts.length === 1 ? settled.receipts[0]?.messageRef : undefined;
@@ -8780,11 +8794,8 @@ export function createNotificationsExtension(
 	// against what was already flushed for this turn (the pre-ask lead-in).
 	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): void => {
 		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive || rt.policySuspended) return;
-		rt.preAskFlushedText = text;
-		// Ask lead-ins supersede any deferred lean settled answer from earlier turns
-		// so agent_end does not re-emit stale intermediate narration (#2863 review).
-		if (!finalAnswer && rt.currentTurnSettlementOrigin !== "autonomous" && !hasUserSettlementReceipt(rt))
-			rt.pendingSettled = undefined;
+		const hadUserSettlementReceipt = hasUserSettlementReceipt(rt);
+		const settlementWindow = rt.currentTurnSettlementWindow ?? rt.settlementWindow;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
 		// async-queued and none landed before this flush, reuse the per-turn ref
@@ -8802,6 +8813,19 @@ export function createNotificationsExtension(
 				text,
 				...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
 			});
+			rt.preAskFlushedText = text;
+			if (!finalAnswer) {
+				// A successfully published ask lead-in settles only exact matching
+				// receipts from the same user-request window. Distinct retained user
+				// receipts remain eligible for the idle summary (#4458).
+				consumePublishedSettlement(rt, text, settlementWindow);
+				// Ask lead-ins supersede deferred lean narration from earlier turns so
+				// agent_end does not re-emit stale intermediate text (#2863 review).
+				// Preserve the pre-publish user-receipt decision even when the exact
+				// match above consumed that receipt.
+				if (rt.currentTurnSettlementOrigin !== "autonomous" && !hadUserSettlementReceipt)
+					rt.pendingSettled = undefined;
+			}
 		} catch (e) {
 			logger.warn(`notifications: pushFrame (turn) failed: ${String(e)}`);
 		}

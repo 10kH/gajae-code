@@ -731,6 +731,118 @@ test("an autonomous ask lead-in does not erase the prior user-request receipt", 
 	}
 }, 30000);
 
+test("lean does not replay a retained receipt when the same text is published as an autonomous ask lead-in", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const receipt = "Completed the work. Choose the next action.";
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Complete the request." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-duplicate", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "autonomous ask lead-in");
+		expect(turnStreams()[0]!.text).toContain(receipt);
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(false);
+
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(250);
+
+		expect(turnStreams()).toHaveLength(1);
+		expect(turnStreams().some(frame => finalAnswerOf(frame) === true)).toBe(false);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("an autonomous ask consumes only its matching receipt from a composed lean settlement", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const userReceipt = "Completed the requested migration.";
+		const autonomousReceipt = "Background verification finished.";
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Migrate the records." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: userReceipt } },
+			ctx,
+		);
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: autonomousReceipt } },
+			ctx,
+		);
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 2 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "follow-up ready" } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: autonomousReceipt } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-composed", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "composed settlement ask lead-in");
+		expect(turnStreams()[0]!.text).toContain(autonomousReceipt);
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(false);
+
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 2, message: { role: "assistant", content: autonomousReceipt } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(() => turnStreams().length === 2, 3000, "retained distinct user receipt");
+
+		expect(turnStreams()[1]!.text).toContain(userReceipt);
+		expect(turnStreams()[1]!.text).not.toContain(autonomousReceipt);
+		expect(finalAnswerOf(turnStreams()[1]!)).toBe(true);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 test("an autonomous tool continuation retains its provenance through a message-less turn", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";
