@@ -152,6 +152,14 @@ describe("stable release policy", () => {
 		// pipelines that pipefail would turn into an abort (grep -vFx exits 1).
 		expect(notes).not.toContain("grep -vFx");
 		expect(notes).toContain(': > "$notes"');
+		// A tagged-but-unpublished version cannot anchor the range: v0.15.1 was
+		// tagged, failed in this step before npm received anything, and would
+		// otherwise have hidden every change 0.15.2 actually shipped.
+		expect(notes).toContain('gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag"');
+		expect(notes).toContain('[ "$release_draft" = "false" ]');
+		// Only a definitive "no such release" skips; auth/transport/5xx fails closed.
+		expect(notes).toContain("HTTP 404|Not Found");
+		expect(notes).toContain('echo "Release lookup for $tag failed:');
 	});
 
 	test("gates stable tag releases on protected-main provenance with a ref-scoped OIDC subject", async () => {
