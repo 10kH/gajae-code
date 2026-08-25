@@ -24,9 +24,25 @@ describe("gjc sdk spawn CLI", () => {
 			role: "master" as const,
 			attestationEpoch,
 		});
-		const rows: Pick<IndexedSession, "sessionId" | "indexSeq" | "masterRole">[] = [
-			{ sessionId: "master-cli-owner", indexSeq: 20, masterRole: attestation("old-epoch") },
-			{ sessionId: "master-cli-owner", indexSeq: 21, masterRole: attestation("new-epoch") },
+		const row = (indexSeq: number, epoch: string, endpointGeneration: number, live = true): IndexedSession => ({
+			sessionId: "master-cli-owner",
+			locator: { cwd: "/repo", worktreeRoot: "/repo", stateRoot: "/state" },
+			endpointGeneration,
+			pid: 42,
+			processIncarnation: "process-42",
+			live,
+			indexSeq,
+			identityProvenance: "composite",
+			ambiguous: false,
+			terminal: false,
+			masterRole: attestation(epoch),
+		});
+		const rows: IndexedSession[] = [
+			row(1, "old-epoch", 0),
+			row(20, "old-epoch", 1),
+			row(19, "new-epoch", 0),
+			row(21, "new-epoch", 1),
+			row(22, "stale-epoch", 1, false),
 		];
 
 		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("new-epoch");

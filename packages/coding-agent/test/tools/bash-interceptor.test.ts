@@ -8,7 +8,12 @@ import { Settings } from "../../src/config/settings";
 import type { BashInterceptorRule } from "../../src/config/settings-schema";
 import { disposeAllShellSessions, getShellSessionCount } from "../../src/exec/bash-executor";
 import type { ToolSession } from "../../src/tools";
-import { BashTool, type BashToolInput, isStrictDirectSdkSpawnCommand } from "../../src/tools/bash";
+import {
+	BashTool,
+	type BashToolInput,
+	isStrictDirectSdkSpawnCommand,
+	masterCommandEnvOverrides,
+} from "../../src/tools/bash";
 import * as shellSnapshot from "../../src/utils/shell-snapshot";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
@@ -50,6 +55,11 @@ describe("Bash master capability command boundary", () => {
 		expect(
 			isStrictDirectSdkSpawnCommand("env GJC_MASTER_CAPABILITY=forged gjc sdk spawn --cwd /tmp --prompt task"),
 		).toBe(false);
+		expect(
+			masterCommandEnvOverrides({ PATH: "/tmp/fake", FOO: "bar", GJC_MASTER_CAPABILITY: "forged" }, true),
+		).toEqual({
+			FOO: "bar",
+		});
 	});
 });
 

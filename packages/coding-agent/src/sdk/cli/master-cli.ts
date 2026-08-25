@@ -9,7 +9,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
-import { type IndexedSession, SessionIndex } from "../broker/session-index";
+import { type IndexedSession, isSessionAuthorityEligible, SessionIndex } from "../broker/session-index";
 import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
 
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
@@ -70,9 +70,31 @@ async function brokerSpawnDispatch(
  * `indexSeq` is the authoritative retained ordering.
  */
 export function selectNewestMasterAttestationEpoch(
-	rows: readonly Pick<IndexedSession, "sessionId" | "indexSeq" | "masterRole">[],
+	rows: readonly IndexedSession[],
 	ownerSessionId: string,
 ): string | undefined {
+	const processIdentity = (row: IndexedSession): string | undefined => row.hostIncarnation ?? row.processIncarnation;
+	const matchesAttestation = (
+		left: NonNullable<IndexedSession["masterRole"]>,
+		right: NonNullable<IndexedSession["masterRole"]>,
+	) =>
+		left.version === right.version &&
+		left.ownerSessionId === right.ownerSessionId &&
+		left.launchPid === right.launchPid &&
+		left.launchProcessIncarnation === right.launchProcessIncarnation &&
+		left.role === right.role &&
+		left.attestationEpoch === right.attestationEpoch;
+	const hasDirectAttestation = (effective: IndexedSession): boolean =>
+		rows.some(
+			row =>
+				row.sessionId === effective.sessionId &&
+				row.endpointGeneration === 0 &&
+				row.pid === effective.masterRole?.launchPid &&
+				processIdentity(row) === effective.masterRole?.launchProcessIncarnation &&
+				row.masterRole !== undefined &&
+				effective.masterRole !== undefined &&
+				matchesAttestation(row.masterRole, effective.masterRole),
+		);
 	let newest: { indexSeq: number; epoch: string } | undefined;
 	for (const row of rows) {
 		const attestation = row.masterRole;
@@ -83,6 +105,14 @@ export function selectNewestMasterAttestationEpoch(
 			attestation.version !== 2 ||
 			attestation.role !== "master" ||
 			attestation.ownerSessionId !== ownerSessionId ||
+			row.endpointGeneration <= 0 ||
+			row.live !== true ||
+			row.terminal ||
+			row.terminalUncertain ||
+			!isSessionAuthorityEligible(row) ||
+			attestation.launchPid !== row.pid ||
+			attestation.launchProcessIncarnation !== processIdentity(row) ||
+			!hasDirectAttestation(row) ||
 			typeof attestation.attestationEpoch !== "string" ||
 			attestation.attestationEpoch.length === 0 ||
 			attestation.attestationEpoch.length > 512 ||

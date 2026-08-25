@@ -69,6 +69,7 @@ const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
+const MASTER_COMMAND_RESOLUTION_ENV = new Set([MASTER_CAPABILITY_ENV, "PATH", "PATHEXT", "BASH_ENV", "ENV"]);
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
 	GREP_OPTIONS: "",
@@ -550,6 +551,17 @@ export function isStrictDirectSdkSpawnCommand(command: string): boolean {
 	if (quote !== undefined) return false;
 	if (tokenStarted) tokens.push(token);
 	return tokens.length >= 3 && tokens[0] === "gjc" && tokens[1] === "sdk" && tokens[2] === "spawn";
+}
+
+export function masterCommandEnvOverrides(
+	env: Record<string, string> | undefined,
+	directMasterSpawn: boolean,
+): Record<string, string> {
+	return Object.fromEntries(
+		Object.entries(env ?? {}).filter(([key]) =>
+			directMasterSpawn ? MASTER_COMMAND_RESOLUTION_ENV.has(key) === false : key !== MASTER_CAPABILITY_ENV,
+		),
+	);
 }
 
 function escapeBashEnvValueForDisplay(value: string): string {
@@ -1139,9 +1151,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// command that contained shell syntax into a privileged one.
 		const directMasterSpawn = isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
 		const masterCapability = directMasterSpawn ? this.session.getMasterBashCapability?.() : undefined;
-		const commandEnvOverrides = Object.fromEntries(
-			Object.entries(expandedEnv ?? {}).filter(([key]) => key !== MASTER_CAPABILITY_ENV),
-		);
+		const commandEnvOverrides = masterCommandEnvOverrides(expandedEnv, directMasterSpawn);
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
 				sessionFile: null,

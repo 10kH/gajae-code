@@ -70,6 +70,7 @@ import { Settings, type SkillsSettings } from "../config/settings";
 import { resolveEagerTaskDelegation } from "../config/task-delegation";
 import { CursorExecHandlers } from "../cursor";
 import { EditTool } from "../edit";
+import type { MasterModeContext } from "../master-mode/context";
 import type { BashRestrictionProfile } from "../tools/bash-allowed-prefixes";
 import { SearchTool } from "../tools/search";
 import "../discovery";
@@ -528,7 +529,7 @@ export interface CreateAgentSessionOptions {
 	 */
 	deferMcpConfigStartup?: boolean;
 	/** Process-local master authority. Never persist or pass to lifecycle children. */
-	masterModeContext?: import("../master-mode/context").MasterModeContext;
+	masterModeContext?: MasterModeContext;
 	/**
 	 * Defer memory backend startup until the caller has applied startup model profiles.
 	 * @internal CLI-only ordering guard; SDK callers retain immediate startup by default.
@@ -3121,7 +3122,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							masterCapability: masterModeContext.getCapability(),
 							masterAttestationEpoch: masterModeContext.attestationEpoch,
 						});
-						return;
 					}
 					if (lifecycleStartupCapability && process.env.GJC_SDK_TEST_FACTORY_FAILURE === cwd)
 						throw new Error(process.env.GJC_SDK_TEST_FACTORY_SECRET ?? "Lifecycle factory test failure.");

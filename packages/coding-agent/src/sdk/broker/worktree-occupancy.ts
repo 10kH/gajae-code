@@ -7,13 +7,15 @@
  * and one definition of "still running" — here prevents the two from drifting
  * into different notions of liveness.
  */
+
+import type * as NativeBindings from "@gajae-code/natives";
 import { resolveEquivalentPath } from "@gajae-code/utils";
 import { probeLinuxProcPidSync } from "../../gjc-runtime/linux-proc";
 import { processIncarnation } from "./process-incarnation";
 import type { IndexedSession } from "./session-index";
 
-function nativeLifecycle(): typeof import("@gajae-code/natives") {
-	return require("@gajae-code/natives");
+function nativeLifecycle(): typeof NativeBindings {
+	return require("@gajae-code/natives") as typeof NativeBindings;
 }
 
 export type ProcessObservation = "alive" | "exited" | "uncertain";

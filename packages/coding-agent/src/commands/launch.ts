@@ -8,7 +8,13 @@ import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
 import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
-import { type PreparedLaunchWorktree, prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
+import {
+	type GjcLaunchWorktreePlan,
+	type PreparedLaunchWorktree,
+	parseLaunchWorktreeMode,
+	planLaunchWorktree,
+	prepareLaunchWorktree,
+} from "../gjc-runtime/launch-worktree";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
@@ -59,7 +65,7 @@ export async function persistCoordinatorLaunchFailure(
 	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
 }
 
-async function assertLaunchWorktreeUnoccupied(worktree: PreparedLaunchWorktree["worktree"]): Promise<void> {
+async function assertLaunchWorktreeUnoccupied(worktree: GjcLaunchWorktreePlan | { enabled: false }): Promise<void> {
 	if (!worktree.enabled) return;
 	let sessions: readonly IndexedSession[];
 	try {
@@ -120,8 +126,9 @@ export default class Index extends Command {
 
 		let launch: PreparedLaunchWorktree;
 		try {
+			const plannedWorktree = planLaunchWorktree(process.cwd(), parseLaunchWorktreeMode(args).mode);
+			await assertLaunchWorktreeUnoccupied(plannedWorktree);
 			launch = prepareLaunchWorktree(process.cwd(), args);
-			await assertLaunchWorktreeUnoccupied(launch.worktree);
 		} catch (error) {
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;

@@ -1,5 +1,5 @@
 /**
- * Versioned DTO rows for `gjc sdk session` semantic verbs (row DTO v1, DR-12).
+ * Versioned DTO rows for `gjc sdk session` semantic verbs (row DTO v2, DR-12).
  *
  * Every semantic verb renders its output through these rows so machine
  * consumers get one deterministic, versioned envelope per verb. Credentials
@@ -8,7 +8,7 @@
  * rendering.
  */
 
-export const SESSION_ROWS_VERSION = 1;
+export const SESSION_ROWS_VERSION = 2;
 
 export type SdkSessionActivityState = "active" | "idle";
 
