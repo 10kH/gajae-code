@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
+import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
 import {
 	cleanupFixtureRoots,
 	createNotificationFixtureRoot,
@@ -32,6 +33,10 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = {
 	type: string;
+	kind?: string;
+	payload?: Frame;
+	seq?: number;
+	generation?: number;
 	text?: string;
 	verbosity?: "lean" | "verbose";
 	redact?: boolean;
@@ -175,6 +180,75 @@ test("assistant text preceding an ask is flushed before the ask and not duplicat
 		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
 		await waitFor(() => turnStreams().length === 2, 3000, "settled turn_stream at idle");
 		expect(turnStreams()[1]!.text).toContain("All done.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("a replay-attached subscriber receives one live representation of a turn frame", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws } = await setup();
+		const legacyFrames: Frame[] = [];
+		const legacy = new WebSocket(ws.url);
+		openSockets.push(legacy);
+		legacy.addEventListener("message", event => legacyFrames.push(JSON.parse(String((event as MessageEvent).data))));
+		const opened = Promise.withResolvers<void>();
+		legacy.addEventListener("open", () => opened.resolve(), { once: true });
+		legacy.addEventListener("error", () => opened.reject(new Error("legacy ws error")), { once: true });
+		await opened.promise;
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				protocolVersion: 3,
+				capabilities: [POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY],
+			}),
+		);
+		ws.send(
+			JSON.stringify({
+				type: "event_replay",
+				id: "positioned-live-regression",
+				sinceGeneration: 0,
+				sinceSeq: 0,
+				capabilities: [],
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.type === "event_replay_result"), 3000, "event replay result");
+		frames.splice(0);
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "One visible result." } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "one-copy", args: {} },
+			ctx,
+		);
+
+		const turnRepresentations = () =>
+			frames.filter(
+				frame => frame.type === "turn_stream" || (frame.type === "event" && frame.kind === "turn_stream"),
+			);
+		await waitFor(() => turnRepresentations().length >= 1, 3000, "live turn representation");
+		await waitFor(
+			() => legacyFrames.filter(frame => frame.type === "turn_stream").length >= 1,
+			3000,
+			"legacy raw turn representation",
+		);
+		await sleep(150);
+		expect(turnRepresentations()).toEqual([
+			expect.objectContaining({
+				type: "event",
+				kind: "turn_stream",
+				seq: expect.any(Number),
+				payload: expect.objectContaining({ type: "turn_stream", text: "One visible result." }),
+			}),
+		]);
+		expect(legacyFrames.filter(frame => frame.type === "turn_stream")).toEqual([
+			expect.objectContaining({ type: "turn_stream", text: "One visible result." }),
+		]);
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;

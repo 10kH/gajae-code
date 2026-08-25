@@ -212,7 +212,7 @@ export declare class NotificationServer {
    * # Errors
    * Fails if not started or `frame_json` is not a valid `ServerMessage`.
    */
-  pushFrame(frameJson: string): void
+  pushFrame(frameJson: string, excludedConnectionIds?: Array<string> | undefined | null): void
   /**
    * Deliver a frame through every authenticated connection and wait for each
    * socket writer to settle within `timeout_ms`.
@@ -223,17 +223,24 @@ export declare class NotificationServer {
    * External frames must continue through [`Self::push_frame`] for serde
    * validation.
    */
-  pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null): void
+  pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null, excludedConnectionIds?: Array<string> | undefined | null): void
   /**
    * Broadcast a file attachment from raw N-API bytes, encoding the unchanged
    * base64 wire field only in Rust.
    */
-  pushFileAttachmentUnchecked(sessionId: string, name: string, mime: string | undefined | null, data: Buffer, caption?: string | undefined | null): void
+  pushFileAttachmentUnchecked(sessionId: string, name: string, mime: string | undefined | null, data: Buffer, caption?: string | undefined | null, excludedConnectionIds?: Array<string> | undefined | null): void
   /**
    * Return counters guarding the known-good frame crossing against
    * regressions.
    */
   knownGoodFrameStats(): KnownGoodFrameStats
+  /**
+   * Proves that the loaded addon honors positioned-recipient exclusions on
+   * raw notification fan-out. Kept as an explicit executable capability so a
+   * stale linked addon cannot silently accept and ignore the optional N-API
+   * arguments.
+   */
+  supportsPositionedRawExclusion(): boolean
   /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
   sendTo(connectionId: string, json: string): void
   /**

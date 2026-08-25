@@ -12,7 +12,7 @@
 //!   per-connection tasks and may be called any number of times.
 
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	net::{IpAddr, Ipv4Addr, SocketAddr},
 	path::PathBuf,
 	sync::{
@@ -642,6 +642,42 @@ impl ServerHandle {
 			return Err(PushFrameError::ActionNeededProhibited);
 		}
 		let _ = self.state.tx.send(msg);
+		Ok(())
+	}
+
+	/// Deliver one frame to every authenticated connection except the supplied
+	/// connection ids. The excluded connections already received the same event
+	/// through the positioned directed leg; targeting only the remainder keeps
+	/// legacy raw subscribers compatible without presenting one semantic event
+	/// twice to replay-attached clients.
+	pub fn push_frame_excluding(
+		&self,
+		msg: ServerMessage,
+		excluded_connection_ids: &[String],
+	) -> Result<(), PushFrameError> {
+		if matches!(msg, ServerMessage::ActionNeeded(_)) {
+			return Err(PushFrameError::ActionNeededProhibited);
+		}
+		if excluded_connection_ids.is_empty() {
+			let _ = self.state.tx.send(msg);
+			return Ok(());
+		}
+		let excluded = excluded_connection_ids
+			.iter()
+			.map(String::as_str)
+			.collect::<HashSet<_>>();
+		let recipients = self
+			.state
+			.connections
+			.lock()
+			.keys()
+			.filter(|connection_id| !excluded.contains(connection_id.as_str()))
+			.cloned()
+			.collect::<Vec<_>>();
+		let json = serde_json::to_string(&msg).expect("ServerMessage serialization cannot fail");
+		for connection_id in recipients {
+			let _ = self.send_to(&connection_id, json.clone());
+		}
 		Ok(())
 	}
 
@@ -2688,6 +2724,42 @@ mod tests {
 			next_server_msg(&mut ws).await,
 			ServerMessage::IdentityHeader(IdentityHeader { session_id, .. }) if session_id == "s"
 		));
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn push_frame_excluding_preserves_raw_delivery_only_for_legacy_recipients() {
+		use crate::protocol::IdentityHeader;
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let mut positioned = connect(&handle, "secret").await;
+		let positioned_id = next_server_hello(&mut positioned)
+			.await
+			.connection_id
+			.expect("positioned connection id");
+		let mut legacy = connect(&handle, "secret").await;
+		next_server_hello(&mut legacy).await;
+		wait_for_clients(&handle, 2).await;
+
+		let frame = ServerMessage::IdentityHeader(IdentityHeader {
+			session_id: "s".into(),
+			repo:       "gajae-code".into(),
+			branch:     "test".into(),
+			machine:    "m1".into(),
+			title:      None,
+		});
+		handle
+			.push_frame_excluding(frame, &[positioned_id])
+			.expect("legacy-only delivery");
+
+		assert!(matches!(
+			tokio::time::timeout(Duration::from_secs(2), legacy.next()).await,
+			Ok(Some(Ok(Message::Text(text)))) if text.contains("identity_header")
+		));
+		assert!(
+			tokio::time::timeout(Duration::from_millis(300), positioned.next())
+				.await
+				.is_err()
+		);
 		handle.stop();
 	}
 	#[tokio::test]

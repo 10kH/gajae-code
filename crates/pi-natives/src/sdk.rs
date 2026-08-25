@@ -588,7 +588,11 @@ impl NotificationServer {
 	/// # Errors
 	/// Fails if not started or `frame_json` is not a valid `ServerMessage`.
 	#[napi]
-	pub fn push_frame(&self, frame_json: String) -> Result<()> {
+	pub fn push_frame(
+		&self,
+		frame_json: String,
+		excluded_connection_ids: Option<Vec<String>>,
+	) -> Result<()> {
 		// `ActionNeeded` is rejected at runtime here (see `ServerHandle::push_frame`);
 		// action delivery must go through `register_ask`/`note_idle` so it stays
 		// capability-gated per connection. Kept as an in-body note so the generated
@@ -599,7 +603,9 @@ impl NotificationServer {
 			saturating_increment(&self.turn_stream_serde_validation_parses);
 		}
 		self
-			.with_handle(|h| h.push_frame(msg))?
+			.with_handle(|h| {
+				h.push_frame_excluding(msg, excluded_connection_ids.as_deref().unwrap_or_default())
+			})?
 			.map_err(|error| Error::from_reason(error.to_string()))
 	}
 
@@ -630,6 +636,7 @@ impl NotificationServer {
 		text: String,
 		final_answer: Option<bool>,
 		message_ref: Option<String>,
+		excluded_connection_ids: Option<Vec<String>>,
 	) -> Result<()> {
 		let phase = match phase.as_str() {
 			"live" => TurnPhase::Live,
@@ -639,13 +646,16 @@ impl NotificationServer {
 		saturating_increment(&self.known_good_turn_stream_frames);
 		self
 			.with_handle(|h| {
-				h.push_frame(ServerMessage::TurnStream(TurnStream {
-					session_id,
-					phase,
-					text,
-					final_answer,
-					message_ref,
-				}))
+				h.push_frame_excluding(
+					ServerMessage::TurnStream(TurnStream {
+						session_id,
+						phase,
+						text,
+						final_answer,
+						message_ref,
+					}),
+					excluded_connection_ids.as_deref().unwrap_or_default(),
+				)
 			})?
 			.map_err(|error| Error::from_reason(error.to_string()))
 	}
@@ -660,16 +670,20 @@ impl NotificationServer {
 		mime: Option<String>,
 		data: Buffer,
 		caption: Option<String>,
+		excluded_connection_ids: Option<Vec<String>>,
 	) -> Result<()> {
 		self
 			.with_handle(|h| {
-				h.push_frame(ServerMessage::FileAttachment(FileAttachment {
-					session_id,
-					name,
-					mime,
-					data: encode_base64(&data, &self.file_attachment_base64_chars),
-					caption,
-				}))
+				h.push_frame_excluding(
+					ServerMessage::FileAttachment(FileAttachment {
+						session_id,
+						name,
+						mime,
+						data: encode_base64(&data, &self.file_attachment_base64_chars),
+						caption,
+					}),
+					excluded_connection_ids.as_deref().unwrap_or_default(),
+				)
 			})?
 			.map_err(|error| Error::from_reason(error.to_string()))
 	}
@@ -691,6 +705,16 @@ impl NotificationServer {
 			turn_stream_serde_validation_parses: turn_stream_serde_validation_parses as f64,
 			file_attachment_rust_base64_chars:   file_attachment_rust_base64_chars as f64,
 		}
+	}
+
+	/// Proves that the loaded addon honors positioned-recipient exclusions on
+	/// raw notification fan-out. Kept as an explicit executable capability so a
+	/// stale linked addon cannot silently accept and ignore the optional N-API
+	/// arguments.
+	#[napi]
+	#[must_use]
+	pub const fn supports_positioned_raw_exclusion(&self) -> bool {
+		true
 	}
 
 	/// Send a validated, bounded JSON envelope to one connected v3 SDK client.

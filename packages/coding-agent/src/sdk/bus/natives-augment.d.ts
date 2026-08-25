@@ -22,6 +22,8 @@ declare module "@gajae-code/natives" {
 		status: "retired" | "already_terminal" | "claimed" | "stale";
 	}
 	interface NotificationServer {
+		/** Broadcast a validated frame, omitting subscribers that received its positioned event envelope. */
+		pushFrame(json: string, excludedConnectionIds?: string[]): void;
 		/** Register the raw v3 SDK frame callback. Must be called before start. */
 		onSdkFrame(callback: (err: null | Error, frame: SdkFrameEvent) => void): void;
 		/** Register the connection-close callback. Must be called before start. */
@@ -45,6 +47,7 @@ declare module "@gajae-code/natives" {
 			text: string,
 			finalAnswer?: boolean,
 			messageRef?: string,
+			excludedConnectionIds?: string[],
 		): void;
 		/** Broadcast raw file bytes; Rust encodes the unchanged base64 wire field. */
 		pushFileAttachmentUnchecked(
@@ -53,11 +56,14 @@ declare module "@gajae-code/natives" {
 			mime: string | undefined,
 			data: Buffer,
 			caption: string | undefined,
+			excludedConnectionIds?: string[],
 		): void;
 		/** Counters for known-good N-API frame crossings. */
 		knownGoodFrameStats(): {
 			knownGoodTurnStreamFrames: number;
 			turnStreamSerdeValidationParses: number;
 		};
+		/** Proves that optional raw fan-out exclusions are enforced by the loaded addon. */
+		supportsPositionedRawExclusion(): boolean;
 	}
 }

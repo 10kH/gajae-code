@@ -166,6 +166,7 @@ import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
 	ensureTelegramDaemonRunningDetailed,
+	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 } from "./telegram-daemon";
 
 export type {
@@ -1176,7 +1177,7 @@ interface SessionRuntime {
 	host: SessionSdkHost;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
-	broadcastEventFrame: (event: SdkFrame) => void;
+	broadcastEventFrame: (event: SdkFrame) => string[];
 	/** Owns stateRoot-backed revisions and removes their spills on terminal shutdown. */
 	revisions: RevisionStore;
 	/** Releases all snapshot pins before the revision store is closed. */
@@ -1403,15 +1404,15 @@ function emitSessionEvent(
 	runtime: Pick<SessionRuntime, "host" | "broadcastEventFrame">,
 	frame: { type: string; [key: string]: unknown },
 	payload: Record<string, unknown> = frame,
-): void {
-	runtime.broadcastEventFrame(runtime.host.emitEvent({ kind: frame.type, payload }));
+): string[] {
+	return runtime.broadcastEventFrame(runtime.host.emitEvent({ kind: frame.type, payload }));
 }
 
 function pushSessionFrame(
 	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: string; [key: string]: unknown },
 ): void {
-	emitSessionEvent(runtime, frame);
+	const positionedRecipients = emitSessionEvent(runtime, frame);
 	if (frame.type === "turn_stream") {
 		runtime.server.pushTurnStreamUnchecked(
 			String(frame.sessionId),
@@ -1419,10 +1420,11 @@ function pushSessionFrame(
 			String(frame.text),
 			typeof frame.finalAnswer === "boolean" ? frame.finalAnswer : undefined,
 			typeof frame.messageRef === "string" ? frame.messageRef : undefined,
+			positionedRecipients,
 		);
 		return;
 	}
-	runtime.server.pushFrame(JSON.stringify(frame));
+	runtime.server.pushFrame(JSON.stringify(frame), positionedRecipients);
 }
 
 async function pushTerminalSessionFrame(
@@ -1430,6 +1432,9 @@ async function pushTerminalSessionFrame(
 	frame: { type: "session_closed"; sessionId: string },
 ): Promise<boolean> {
 	emitSessionEvent(runtime, frame);
+	// Terminal shutdown still uses the acknowledged native leg: the positioned
+	// send is best-effort and the server must not stop before a socket writer has
+	// settled this final frame.
 	return await runtime.server.pushFrameAndWait(JSON.stringify(frame), 1_000);
 }
 
@@ -1438,8 +1443,15 @@ function pushFileAttachment(
 	frame: { type: "file_attachment"; sessionId: string; name: string; mime?: string; caption?: string },
 	data: Buffer,
 ): void {
-	emitSessionEvent(runtime, frame, { ...frame, data: data.toString("base64") });
-	runtime.server.pushFileAttachmentUnchecked(frame.sessionId, frame.name, frame.mime, data, frame.caption);
+	const positionedRecipients = emitSessionEvent(runtime, frame, { ...frame, data: data.toString("base64") });
+	runtime.server.pushFileAttachmentUnchecked(
+		frame.sessionId,
+		frame.name,
+		frame.mime,
+		data,
+		frame.caption,
+		positionedRecipients,
+	);
 }
 
 /** Agent lifecycle is SDK session truth, independent of optional chat delivery. */
@@ -1449,8 +1461,8 @@ function emitAgentLifecycle(
 ): void {
 	try {
 		const json = JSON.stringify(frame);
-		emitSessionEvent(runtime, frame);
-		runtime.server.pushFrame(json);
+		const positionedRecipients = emitSessionEvent(runtime, frame);
+		runtime.server.pushFrame(json, positionedRecipients);
 	} catch (error) {
 		logger.warn(`sdk: lifecycle delivery failed: ${String(error)}`);
 	}
@@ -4743,20 +4755,25 @@ export function createNotificationsExtension(
 		 * or an event replay, which is exactly the attached-subscriber set. Fenced
 		 * connections are excluded like their inbound frames, and capability-gated
 		 * kinds follow the same gate replay applies, so live and replay delivery
-		 * stay one truth per connection.
+		 * stay one truth per connection. Only notification adapters that explicitly
+		 * negotiate positioned-only effects are returned for matching raw exclusion;
+		 * ordinary direct SDK subscribers retain both public surfaces from #4570.
 		 */
-		const broadcastEventFrame = (event: SdkFrame): void => {
+		const broadcastEventFrame = (event: SdkFrame): string[] => {
 			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
+			const recipients: string[] = [];
 			for (const [connectionId, capabilities] of hostCapCache) {
 				if (fencedConnections.has(connectionId)) continue;
 				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
 				try {
 					server.sendTo(connectionId, json);
+					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) recipients.push(connectionId);
 				} catch {
 					// Broadcasts are best effort; directed responses surface send failures.
 				}
 			}
+			return recipients;
 		};
 		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
@@ -7109,6 +7126,14 @@ export function createNotificationsExtension(
 					"@gajae-code/natives is out of date: missing onNegotiatedCapabilities. Rebuild the native addon (bun --cwd=packages/natives run build).",
 				);
 			}
+			if (
+				typeof server.supportsPositionedRawExclusion !== "function" ||
+				server.supportsPositionedRawExclusion() !== true
+			) {
+				throw new Error(
+					"@gajae-code/natives is out of date: missing positioned raw-fan-out exclusion. Rebuild the native addon (bun --cwd=packages/natives run build).",
+				);
+			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
 				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
 			});
@@ -7670,8 +7695,8 @@ export function createNotificationsExtension(
 					sessionId: id,
 					...buildIdentity(ctx.cwd, sessionName, telegramTopicsEnabled()),
 				};
-				emitSessionEvent(initializedRuntime, identity);
-				server.pushFrame(JSON.stringify(identity));
+				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
+				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}, 250);
 			sessionNameObserver.unref?.();
 			runtime.stopSessionNameObserver = () => clearInterval(sessionNameObserver);
@@ -7684,8 +7709,8 @@ export function createNotificationsExtension(
 					sessionId: id,
 					...buildIdentity(ctx.cwd, sessionNameAfterStartup, telegramTopicsEnabled()),
 				};
-				emitSessionEvent(initializedRuntime, identity);
-				server.pushFrame(JSON.stringify(identity));
+				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
+				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}
 			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
