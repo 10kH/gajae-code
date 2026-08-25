@@ -378,20 +378,6 @@ async function createSdkControlServer(
 			warnings: [],
 		}),
 	} as unknown as SessionIndex;
-	const fakeBrokerDiscovery = {
-		version: 1,
-		protocolVersion: 3,
-		packageGeneration: "test",
-		ownerId: "test",
-		pid: process.pid,
-		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
-		host: "127.0.0.1",
-		port: 1,
-		url: "ws://sdk.example.test",
-		token: "broker-discovery-secret",
-		startedAt: Date.now(),
-		heartbeatAt: Date.now(),
-	} satisfies BrokerDiscovery;
 	const server = createCoordinatorMcpServer({
 		env: {
 			GJC_COORDINATOR_MCP_WORKDIR_ROOTS: root,
@@ -408,7 +394,6 @@ async function createSdkControlServer(
 		platform: serverOptions.platform,
 		services: {
 			getAgentDir: () => agentDir,
-			ensureBroker: async () => fakeBrokerDiscovery,
 			resolveModelProfiles: () => new Map([["codex-eco", { name: "codex-eco" }]]),
 			...(serverOptions.modelResolver ? { resolveModelPin: serverOptions.modelResolver } : {}),
 			canonicalizePath: serverOptions.canonicalizePath,
@@ -545,7 +530,20 @@ async function createSdkControlServer(
 		},
 	});
 	await fs.mkdir(path.join(root, ".gjc", "state", "sdk"), { recursive: true });
-	await writeBrokerDiscovery(agentDir, fakeBrokerDiscovery);
+	await writeBrokerDiscovery(agentDir, {
+		version: 1,
+		protocolVersion: 3,
+		packageGeneration: "test",
+		ownerId: "test",
+		pid: process.pid,
+		incarnation: brokerProcessIncarnation(process.pid) ?? "test-incarnation",
+		host: "127.0.0.1",
+		port: 1,
+		url: "ws://sdk.example.test",
+		token: "broker-discovery-secret",
+		startedAt: Date.now(),
+		heartbeatAt: Date.now(),
+	});
 	if (serverOptions.establishedSidecarAuthority !== false) await seedEstablishedSidecarAuthority();
 	return server;
 }
@@ -4229,7 +4227,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 				allow_mutation: true,
 			}),
 		).toMatchObject({ ok: false, error: { code: "not_found" } });
-	}, 20_000);
+	});
 
 	it("keeps coordinator metadata reports and event journals available without turning them into control authority", async () => {
 		const root = await tempRoot();

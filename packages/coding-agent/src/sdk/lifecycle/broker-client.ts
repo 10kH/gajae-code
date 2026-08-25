@@ -22,7 +22,9 @@ export class AgentDirSessionLifecycleClient implements SessionLifecycleClient {
 		input: Record<string, unknown>,
 		options: SessionLifecycleClientRequestOptions,
 	): Promise<unknown> {
-		const discovery = await ensureBroker({ agentDir: this.#agentDir });
+		await ensureBroker({ agentDir: this.#agentDir });
+		const discovery = await readSdkBrokerDiscovery(this.#agentDir);
+		if (!discovery) throw new Error("SDK broker discovery is unavailable.");
 		const client = await SdkClient.connect(discovery.url, discovery.token, {
 			...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
 		});

@@ -4310,7 +4310,7 @@ for (const eventType of ["session_switch", "session_branch"] as const) {
 		} finally {
 			stop.mockRestore();
 		}
-	}, 20_000);
+	});
 }
 
 test("SDK host binds session query and control seams and excludes uninstalled resources", async () => {
@@ -5014,7 +5014,7 @@ test("SDK ACP form elicitation remains preferred after /notify on and falls back
 	} finally {
 		await host.stop();
 	}
-}, 20_000);
+});
 test("rejects malformed provider definitions without replacing a valid tools registry", async () => {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "gjc-sdk-provider-validation-"));
 	dirs.push(cwd);

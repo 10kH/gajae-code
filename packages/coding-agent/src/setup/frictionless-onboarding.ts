@@ -53,15 +53,33 @@ const MAX_STATE_BYTES = 64 * 1024;
 const MAX_DISCOVERY_ENTRIES = 512;
 const MAX_SESSION_CANDIDATES = 4;
 const MAX_STRING_LENGTH = 500;
-const LANGUAGES: Record<string, string[]> = {
+/**
+ * Function words matched on token boundaries for space-delimited languages.
+ * Substring matching is prohibited here: two-letter articles such as `le`, `la`
+ * and `el` occur inside ordinary English words (`file`, `please`, `class`,
+ * `help`), which used to hand French or Spanish a majority on plain English.
+ */
+const WORD_LANGUAGES: Record<string, readonly string[]> = {
 	en: ["the", "and", "please", "file", "change", "help"],
-	ko: ["을", "를", "그리고", "파일", "변경", "도와"],
-	ja: ["を", "そして", "ファイル", "変更", "お願い"],
-	zh: ["请", "文件", "修改", "帮助"],
 	es: ["el", "la", "por", "favor", "archivo", "cambio"],
 	fr: ["le", "la", "fichier", "merci", "modifier"],
 	de: ["der", "die", "datei", "bitte", "ändern"],
 };
+
+/** Languages identified by script: their text is unspaced or agglutinative, so word lists never match. */
+const SCRIPT_LANGUAGES: ReadonlyArray<{ language: string; pattern: RegExp }> = [
+	{ language: "ko", pattern: /[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]/g },
+	{ language: "ja", pattern: /[\u3040-\u30ff]/g },
+	{ language: "zh", pattern: /[\u3400-\u4dbf\u4e00-\u9fff]/g },
+];
+
+const SUPPORTED_LANGUAGES: ReadonlySet<string> = new Set([
+	...Object.keys(WORD_LANGUAGES),
+	...SCRIPT_LANGUAGES.map(entry => entry.language),
+]);
+
+/** Minimum matches before message evidence outranks the OS locale. */
+const LANGUAGE_EVIDENCE_MINIMUM = 2;
 
 export function onboardingStatePath(agentDir = getAgentDir()): string {
 	return path.join(agentDir, "onboarding", "frictionless.json");
@@ -163,20 +181,69 @@ export async function writeOnboardingState(value: unknown, agentDir = getAgentDi
 
 function localeLanguage(locale = Intl.DateTimeFormat().resolvedOptions().locale): string {
 	const code = locale.split(/[-_]/)[0]?.toLowerCase();
-	return code && Object.hasOwn(LANGUAGES, code) ? code : "en";
+	return code && SUPPORTED_LANGUAGES.has(code) ? code : "en";
 }
 
-export function detectOnboardingLanguage(messages: readonly string[], osLocale?: string): string {
+function addLanguageScore(scores: Map<string, number>, language: string, amount: number): void {
+	if (amount <= 0) return;
+	scores.set(language, (scores.get(language) ?? 0) + amount);
+}
+
+function scriptScores(text: string): Map<string, number> {
 	const counts = new Map<string, number>();
-	for (const message of messages.slice(-MAX_ARRAY_ITEMS)) {
-		const normalized = message.toLowerCase();
-		for (const [language, words] of Object.entries(LANGUAGES)) {
-			const score = words.reduce((sum, word) => sum + (normalized.includes(word) ? 1 : 0), 0);
-			if (score) counts.set(language, (counts.get(language) ?? 0) + score);
+	for (const entry of SCRIPT_LANGUAGES) counts.set(entry.language, text.match(entry.pattern)?.length ?? 0);
+	const hangul = counts.get("ko") ?? 0;
+	const kana = counts.get("ja") ?? 0;
+	const han = counts.get("zh") ?? 0;
+	const scores = new Map<string, number>();
+	// Korean Hangul is decisive only once it reaches the evidence minimum and is
+	// at least as strong as kana; an equal sub-threshold Hangul/kana pair leaves
+	// dominant Han evidence intact. Japanese kana claims mixed Han whenever it
+	// exceeds Hangul, including the lone-kana boundary below that minimum.
+	const koreanClaims = hangul >= kana && hangul >= LANGUAGE_EVIDENCE_MINIMUM;
+	const japaneseClaims = kana > hangul && kana >= LANGUAGE_EVIDENCE_MINIMUM;
+	if (hangul > 0 && hangul >= kana) addLanguageScore(scores, "ko", hangul);
+	if (kana > hangul) addLanguageScore(scores, "ja", kana + han);
+	else if (hangul === 0 && kana === 0) addLanguageScore(scores, "zh", han);
+	else if (!koreanClaims && !japaneseClaims) addLanguageScore(scores, "zh", han);
+	return scores;
+}
+
+function wordScores(text: string): Map<string, number> {
+	const scores = new Map<string, number>();
+	for (const token of text.split(/[^\p{L}\p{N}]+/u)) {
+		if (!token) continue;
+		for (const [language, words] of Object.entries(WORD_LANGUAGES)) {
+			if (words.includes(token)) addLanguageScore(scores, language, 1);
 		}
 	}
-	const winner = [...counts.entries()].sort((left, right) => right[1] - left[1])[0];
-	return winner && winner[1] >= 2 ? winner[0] : localeLanguage(osLocale);
+	return scores;
+}
+
+function leadingLanguage(scores: Map<string, number>): string | undefined {
+	const ranked = [...scores.entries()].sort((left, right) => right[1] - left[1]);
+	const winner = ranked[0];
+	// Shared words (`la` in both fr and es) and a tied script/word mix must not win a coin flip.
+	if (!winner || winner[1] < LANGUAGE_EVIDENCE_MINIMUM || winner[1] === ranked[1]?.[1]) return undefined;
+	return winner[0];
+}
+
+/**
+ * Onboarding copy language. An explicit user preference always wins; script
+ * counts and Latin function-word hits share one ranking so two Hangul or Han
+ * characters cannot override a clearly English transcript. Evidence is trusted
+ * only when one language leads outright; everything else falls back to the OS locale.
+ */
+export function detectOnboardingLanguage(
+	messages: readonly string[],
+	osLocale?: string,
+	preferredLanguage?: string,
+): string {
+	if (preferredLanguage && SUPPORTED_LANGUAGES.has(preferredLanguage)) return preferredLanguage;
+	const sample = messages.slice(-MAX_ARRAY_ITEMS).join("\n").toLowerCase();
+	const scores = wordScores(sample);
+	for (const [language, amount] of scriptScores(sample)) addLanguageScore(scores, language, amount);
+	return leadingLanguage(scores) ?? localeLanguage(osLocale);
 }
 
 function sourceIdentity(stat: nodeFs.BigIntStats): SessionImportSourceIdentity {
@@ -449,6 +516,8 @@ export async function analyzeOnboardingEvidence(
 export interface DeriveOnboardingProfileOptions {
 	now?: number;
 	osLocale?: string;
+	/** Explicit `ui.language` selection; authoritative over locale and message evidence. */
+	preferredLanguage?: string;
 }
 
 interface OnboardingProfileText {
@@ -618,6 +687,7 @@ export function deriveOnboardingProfile(
 	const language = detectOnboardingLanguage(
 		sessionEvidence.flatMap(item => item.userMessages ?? []),
 		options.osLocale,
+		options.preferredLanguage,
 	);
 	const text = PROFILE_TEXT[language] ?? PROFILE_TEXT.en!;
 	const omissions = evidence

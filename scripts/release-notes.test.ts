@@ -8,6 +8,7 @@ import {
 	earliestMergedPullRequest,
 	isExplicitEmptyGhResult,
 	isRateLimitedGhResult,
+	isUnknownCommitGhResult,
 	rateLimitWaitMs,
 	normalizeSubject,
 	parseReleaseNotesCli,
@@ -322,6 +323,19 @@ describe("fail-closed gh result classification", () => {
 		// A bare/unknown failure must never be mistaken for an explicit empty.
 		expect(isExplicitEmptyGhResult(1, "")).toBe(false);
 		expect(isExplicitEmptyGhResult(128, "fatal: something else")).toBe(false);
+	});
+
+	test("classifies only a 422 unknown-commit answer as an absent commit", () => {
+		// v0.15.1 failed here: three shipped commits carried `(cherry picked from
+		// commit …)` trailers naming OIDs GitHub had garbage collected, and the
+		// strict commit lookup turned that answer into a release failure.
+		expect(isUnknownCommitGhResult(1, "gh: No commit found for SHA: 741dce2324ef7d47fce4707e5a69a435ea13fc03 (HTTP 422)")).toBe(true);
+		// Success is not an "unknown commit" answer; every other failure fails closed.
+		expect(isUnknownCommitGhResult(0, "")).toBe(false);
+		expect(isUnknownCommitGhResult(1, "HTTP 403: Resource not accessible by integration")).toBe(false);
+		expect(isUnknownCommitGhResult(1, "HTTP 500: Internal Server Error")).toBe(false);
+		expect(isUnknownCommitGhResult(1, "API rate limit exceeded")).toBe(false);
+		expect(isUnknownCommitGhResult(1, "")).toBe(false);
 	});
 });
 

@@ -51,16 +51,16 @@ import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "..
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { resolveSdkPackageAuthority } from "../../sdk/broker/runtime";
 import { canonicalSessionCwd } from "../../sdk/broker/session-index";
-import { SdkClient, SdkClientError } from "../../sdk/client";
+import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
-import type { AgentSessionEvent } from "../../session/agent-session";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
+	type AgentSessionEvent,
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
 	mapAgentWireEventPayloadToAcpSessionUpdates,
@@ -146,13 +146,7 @@ interface PromptWaiter {
 
 type PromptCorrelation = { commandId?: string; turnId?: string };
 
-type BrokerConnection = {
-	adapter: AcpSdkAdapter;
-	client: SdkClient;
-	packageGeneration: string;
-	packageVersion?: string;
-	installationIdentity?: string;
-};
+type BrokerConnection = { adapter: AcpSdkAdapter; client: SdkClient };
 type PendingAttachment = { epoch: number; task: Promise<void> };
 
 type SessionRecord = {
@@ -1187,7 +1181,6 @@ export async function applyAcpStartupOptions(
 export class AcpAgent implements Agent {
 	readonly #connection: AgentSideConnection;
 	readonly #agentDir: string;
-	readonly #expectedPackageGeneration: string | undefined;
 	readonly #router: SessionRouter;
 	readonly #pendingRouterAdapters = new Map<string, AcpSdkAdapter>();
 	readonly #pendingRouterFrames = new Map<string, Record<string, unknown>[]>();
@@ -1215,7 +1208,6 @@ export class AcpAgent implements Agent {
 	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
-	#brokerResolution: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
@@ -1230,20 +1222,12 @@ export class AcpAgent implements Agent {
 					startupOptions?: AcpStartupOptions;
 					cancelSettlementGraceMs?: number;
 					promptWatchdogClock?: PromptWatchdogClock;
-					/**
-					 * Broker generation this agent retires on sight (see ensure.ts). Tests
-					 * pin the fixture broker's generation so their in-process broker is
-					 * never recycled; production resolves the live package generation.
-					 */
-					expectedPackageGeneration?: string;
 			  }
 			| unknown,
 	) {
 		this.#connection = connection;
 		const candidate = object(options);
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
-		this.#expectedPackageGeneration =
-			typeof candidate?.expectedPackageGeneration === "string" ? candidate.expectedPackageGeneration : undefined;
 		this.#router = new SessionRouter({
 			agentDir: this.#agentDir,
 			deps: {
@@ -2471,122 +2455,27 @@ export class AcpAgent implements Agent {
 		return (await this.#brokerConnection()).adapter;
 	}
 
-	#assertBrokerOpen(): void {
-		if (this.#disposed) throw new AcpSdkAdapterError("connection_closed", "ACP connection is closed.");
-	}
-
 	async #brokerConnection(): Promise<BrokerConnection> {
-		this.#assertBrokerOpen();
-		if (this.#brokerResolution) return this.#brokerResolution;
-		let resolution!: Promise<BrokerConnection>;
-		resolution = this.#resolveBrokerConnection();
-		this.#brokerResolution = resolution;
-		try {
-			return await resolution;
-		} finally {
-			if (this.#brokerResolution === resolution) this.#brokerResolution = undefined;
-		}
-	}
-
-	async #resolveBrokerConnection(): Promise<BrokerConnection> {
-		this.#assertBrokerOpen();
-		if (this.#broker) {
-			const current = resolveSdkPackageAuthority();
-			const existing = this.#broker;
-			let pending: BrokerConnection;
-			try {
-				pending = await existing;
-			} catch (error) {
-				if (this.#broker === existing) this.#broker = undefined;
-				throw error;
-			}
-			this.#assertBrokerOpen();
-			const generationMatches =
-				pending.packageGeneration === (this.#expectedPackageGeneration ?? current.generation) &&
-				(this.#expectedPackageGeneration !== undefined ||
-					(pending.packageVersion === current.packageVersion &&
-						pending.installationIdentity === current.installationIdentity));
-			if (generationMatches) return pending;
-			const beforeClose = resolveSdkPackageAuthority({ force: true });
-			if (
-				this.#broker !== existing ||
-				(this.#expectedPackageGeneration === undefined &&
-					(beforeClose.generation !== current.generation ||
-						beforeClose.packageVersion !== current.packageVersion ||
-						beforeClose.installationIdentity !== current.installationIdentity))
-			)
-				throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed during connection replacement.");
-			this.#assertBrokerOpen();
-			this.#broker = undefined;
-			await pending.adapter.close().catch(() => undefined);
-			await pending.client.close().catch(() => undefined);
-		}
-		this.#assertBrokerOpen();
-		const discovery = await ensureBroker({
-			agentDir: this.#agentDir,
-			...(this.#expectedPackageGeneration === undefined
-				? {}
-				: { expectedPackageGeneration: this.#expectedPackageGeneration }),
-		});
-		this.#assertBrokerOpen();
-		const authorityAfterEnsure =
-			this.#expectedPackageGeneration === undefined ? resolveSdkPackageAuthority({ force: true }) : undefined;
-		if (
-			this.#expectedPackageGeneration === undefined &&
-			authorityAfterEnsure !== undefined &&
-			(discovery.packageGeneration !== authorityAfterEnsure.generation ||
-				discovery.packageVersion !== authorityAfterEnsure.packageVersion ||
-				discovery.installationIdentity !== authorityAfterEnsure.installationIdentity)
-		)
-			throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed before connection publication.");
-		this.#assertBrokerOpen();
-		let pending!: Promise<BrokerConnection>;
-		pending = (async () => {
-			const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
-			if (this.#disposed) {
-				await client.close().catch(() => undefined);
-				throw new AcpSdkAdapterError("connection_closed", "ACP connection closed during broker startup.");
-			}
-			const adapter = new AcpSdkAdapter({ client });
-			adapter.onReconnectFailed(() => {
-				if (this.#broker === pending) this.#broker = undefined;
-				void adapter.close().catch(() => undefined);
-			});
-			if (this.#disposed) {
-				await adapter.close().catch(() => undefined);
-				throw new AcpSdkAdapterError("connection_closed", "ACP connection closed during broker startup.");
-			}
-			await adapter.start();
-			return {
-				adapter,
-				client,
-				packageGeneration: discovery.packageGeneration,
-				packageVersion: discovery.packageVersion,
-				installationIdentity: discovery.installationIdentity,
-			};
-		})();
-		try {
-			const connection = await pending;
-			if (this.#disposed) {
-				await connection.adapter.close().catch(() => undefined);
-				await connection.client.close().catch(() => undefined);
-				throw new AcpSdkAdapterError("connection_closed", "ACP connection closed during broker startup.");
-			}
-			const authorityBeforePublish =
-				this.#expectedPackageGeneration === undefined ? resolveSdkPackageAuthority({ force: true }) : undefined;
-			if (
-				this.#expectedPackageGeneration === undefined &&
-				authorityBeforePublish !== undefined &&
-				(connection.packageGeneration !== authorityBeforePublish.generation ||
-					connection.packageVersion !== authorityBeforePublish.packageVersion ||
-					connection.installationIdentity !== authorityBeforePublish.installationIdentity)
-			) {
-				await connection.adapter.close().catch(() => undefined);
-				await connection.client.close().catch(() => undefined);
-				throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed before connection publication.");
-			}
+		if (!this.#broker) {
+			let pending!: Promise<BrokerConnection>;
+			pending = (async () => {
+				await ensureBroker({ agentDir: this.#agentDir });
+				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
+				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
+				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
+				const adapter = new AcpSdkAdapter({ client });
+				adapter.onReconnectFailed(() => {
+					if (this.#broker === pending) this.#broker = undefined;
+					void adapter.close().catch(() => undefined);
+				});
+				await adapter.start();
+				return { adapter, client };
+			})();
 			this.#broker = pending;
-			return connection;
+		}
+		const pending = this.#broker;
+		try {
+			return await pending;
 		} catch (error) {
 			if (this.#broker === pending) this.#broker = undefined;
 			throw error;
@@ -3794,13 +3683,6 @@ export class AcpAgent implements Agent {
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();
 		this.#tearingDown.clear();
-		if (this.#brokerResolution) {
-			try {
-				await this.#brokerResolution;
-			} catch (error) {
-				failures.push(error);
-			}
-		}
 		if (this.#broker) {
 			const broker = this.#broker;
 			this.#broker = undefined;

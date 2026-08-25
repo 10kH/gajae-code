@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createNotificationsExtension } from "../src/sdk/bus/index";
+import { POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY } from "../src/sdk/bus/telegram-daemon";
 import {
 	cleanupFixtureRoots,
 	createNotificationFixtureRoot,
@@ -32,6 +33,10 @@ async function waitFor(pred: () => boolean, ms = 4000, label = "condition"): Pro
 type Handler = (event: unknown, ctx: unknown) => unknown;
 type Frame = {
 	type: string;
+	kind?: string;
+	payload?: Frame;
+	seq?: number;
+	generation?: number;
 	text?: string;
 	verbosity?: "lean" | "verbose";
 	redact?: boolean;
@@ -175,6 +180,75 @@ test("assistant text preceding an ask is flushed before the ask and not duplicat
 		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
 		await waitFor(() => turnStreams().length === 2, 3000, "settled turn_stream at idle");
 		expect(turnStreams()[1]!.text).toContain("All done.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("a replay-attached subscriber receives one live representation of a turn frame", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames, ws } = await setup();
+		const legacyFrames: Frame[] = [];
+		const legacy = new WebSocket(ws.url);
+		openSockets.push(legacy);
+		legacy.addEventListener("message", event => legacyFrames.push(JSON.parse(String((event as MessageEvent).data))));
+		const opened = Promise.withResolvers<void>();
+		legacy.addEventListener("open", () => opened.resolve(), { once: true });
+		legacy.addEventListener("error", () => opened.reject(new Error("legacy ws error")), { once: true });
+		await opened.promise;
+		ws.send(
+			JSON.stringify({
+				type: "hello",
+				protocolVersion: 3,
+				capabilities: [POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY],
+			}),
+		);
+		ws.send(
+			JSON.stringify({
+				type: "event_replay",
+				id: "positioned-live-regression",
+				sinceGeneration: 0,
+				sinceSeq: 0,
+				capabilities: [],
+			}),
+		);
+		await waitFor(() => frames.some(frame => frame.type === "event_replay_result"), 3000, "event replay result");
+		frames.splice(0);
+
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: "One visible result." } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "one-copy", args: {} },
+			ctx,
+		);
+
+		const turnRepresentations = () =>
+			frames.filter(
+				frame => frame.type === "turn_stream" || (frame.type === "event" && frame.kind === "turn_stream"),
+			);
+		await waitFor(() => turnRepresentations().length >= 1, 3000, "live turn representation");
+		await waitFor(
+			() => legacyFrames.filter(frame => frame.type === "turn_stream").length >= 1,
+			3000,
+			"legacy raw turn representation",
+		);
+		await sleep(150);
+		expect(turnRepresentations()).toEqual([
+			expect.objectContaining({
+				type: "event",
+				kind: "turn_stream",
+				seq: expect.any(Number),
+				payload: expect.objectContaining({ type: "turn_stream", text: "One visible result." }),
+			}),
+		]);
+		expect(legacyFrames.filter(frame => frame.type === "turn_stream")).toEqual([
+			expect.objectContaining({ type: "turn_stream", text: "One visible result." }),
+		]);
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;
@@ -725,6 +799,185 @@ test("an autonomous ask lead-in does not erase the prior user-request receipt", 
 
 		await waitFor(() => turnStreams().length === 2, 3000, "retained receipt after ask");
 		expect(turnStreams()[1]!.text).toContain("Completion receipt.");
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean does not replay a retained receipt when the same text is published as an autonomous ask lead-in", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const receipt = "Completed the work. Choose the next action.";
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Complete the request." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-duplicate", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "autonomous ask lead-in");
+		expect(turnStreams()[0]!.text).toContain(receipt);
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(false);
+
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await sleep(250);
+
+		expect(turnStreams()).toHaveLength(1);
+		expect(turnStreams().some(frame => finalAnswerOf(frame) === true)).toBe(false);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("lean retains an ask lead-in receipt when no subscriber accepts the publication", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, ws } = await setup();
+		const url = ws.url;
+		const receipt = "Completed the work while the remote was disconnected.";
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Complete the disconnected task." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+
+		const closed = Promise.withResolvers<void>();
+		ws.addEventListener("close", () => closed.resolve(), { once: true });
+		ws.close();
+		await closed.promise;
+		// Let the server retire the authenticated connection and its broadcast
+		// receiver before the autonomous lead-in attempts publication.
+		await sleep(250);
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-disconnected", args: {} },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+
+		const replacementFrames: Frame[] = [];
+		const replacement = new WebSocket(url);
+		openSockets.push(replacement);
+		replacement.addEventListener("message", event =>
+			replacementFrames.push(JSON.parse(String((event as MessageEvent).data))),
+		);
+		const opened = Promise.withResolvers<void>();
+		replacement.addEventListener("open", () => opened.resolve(), { once: true });
+		replacement.addEventListener("error", () => opened.reject(new Error("replacement ws error")), { once: true });
+		await opened.promise;
+		await sleep(250);
+
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		const turnStreams = () => replacementFrames.filter(frame => frame.type === "turn_stream");
+		await waitFor(() => turnStreams().length === 1, 3000, "retained receipt after reconnect");
+		expect(turnStreams()[0]!.text).toContain(receipt);
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(true);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
+test("an autonomous ask consumes only its matching receipt from a composed lean settlement", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, frames } = await setup();
+		const turnStreams = () => frames.filter(f => f.type === "turn_stream");
+		const userReceipt = "Completed the requested migration.";
+		const autonomousReceipt = "Background verification finished.";
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Migrate the records." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: userReceipt } },
+			ctx,
+		);
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: autonomousReceipt } },
+			ctx,
+		);
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 2 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "follow-up ready" } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: autonomousReceipt } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-composed", args: {} },
+			ctx,
+		);
+		await waitFor(() => turnStreams().length === 1, 3000, "composed settlement ask lead-in");
+		expect(turnStreams()[0]!.text).toContain(autonomousReceipt);
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(false);
+
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 2, message: { role: "assistant", content: autonomousReceipt } },
+			ctx,
+		);
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		await waitFor(() => turnStreams().length === 2, 3000, "retained distinct user receipt");
+
+		expect(turnStreams()[1]!.text).toContain(userReceipt);
+		expect(turnStreams()[1]!.text).not.toContain(autonomousReceipt);
+		expect(finalAnswerOf(turnStreams()[1]!)).toBe(true);
 	} finally {
 		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
 		else process.env.GJC_NOTIFICATIONS = prevEnv;

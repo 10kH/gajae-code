@@ -87,7 +87,6 @@ import {
 	READINESS_TIMEOUT_INVALID_MESSAGE,
 	startupQueueWaitMs,
 } from "./startup-budget";
-import { observeProcess, type ProcessObservation, worktreeOccupant } from "./worktree-occupancy";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -1035,6 +1034,42 @@ function processIncarnationForBroker(broker: BrokerIndex, pid: number): string |
 }
 function hasProcessIncarnationAuthority(): boolean {
 	return processIncarnation(process.pid) !== undefined;
+}
+
+type ProcessObservation = "alive" | "exited" | "uncertain";
+
+/** Only ESRCH or a changed, readable incarnation proves the owned process exited. */
+function observeProcess(
+	pid: number,
+	expectedIncarnation: string | undefined,
+	readIncarnation: (pid: number) => string | undefined = processIncarnation,
+): ProcessObservation {
+	if (process.platform === "win32") {
+		try {
+			const reference = nativeLifecycle().Process.fromPid(pid);
+			if (reference?.status() !== "running") return "exited";
+		} catch {
+			return "uncertain";
+		}
+		if (!expectedIncarnation) return "uncertain";
+		const actualIncarnation = readIncarnation(pid);
+		if (!actualIncarnation) return "uncertain";
+		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
+	}
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
+	}
+	if (process.platform === "linux") {
+		const probe = probeLinuxProcPidSync(pid);
+		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
+			return "exited";
+	}
+	if (!expectedIncarnation) return "uncertain";
+	const actualIncarnation = readIncarnation(pid);
+	if (!actualIncarnation) return "uncertain";
+	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
 }
 
 /** Test seam for the lifecycle-owned process observation boundary. */
@@ -3371,15 +3406,6 @@ function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorkt
 	};
 }
 
-/** Test seam for the worktree occupancy boundary. */
-export function worktreeOccupantForTest(
-	sessions: IndexedSession[],
-	worktreePath: string,
-	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
-): string | null {
-	return worktreeOccupant(sessions, worktreePath, observe);
-}
-
 function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
 	const prepared = ensureLaunchWorktree(plan);
 	if (!prepared.enabled || path.resolve(prepared.worktreePath) !== path.resolve(plan.worktreePath))
@@ -4185,16 +4211,6 @@ async function executeLifecycleResponse(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
-		// Refuse before any durable effect is recorded: a launch that cannot own its
-		// worktree should leave no ledger transition or child process behind.
-		if (launch.worktreePlan) {
-			const occupant = worktreeOccupant(broker.index.listSessions().sessions, launch.worktreePlan.worktreePath);
-			if (occupant && occupant !== launch.id)
-				return fail(
-					"worktree_in_use",
-					`The requested worktree is already held by session ${occupant}. Choose another worktree name or stop that session.`,
-				);
-		}
 		const effectMarker = randomUUID();
 		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
 		const effectIntent: LifecycleEffectIntentWithDeadline = {
@@ -4291,7 +4307,6 @@ async function executeLifecycleResponse(
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
-				const commandEnvironment = "kind" in cmd ? cmd.env : process.env;
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
@@ -4305,7 +4320,9 @@ async function executeLifecycleResponse(
 						// Master capability is process-local to direct Bash children and must
 						// never cross a broker lifecycle launch boundary.
 						...Object.fromEntries(
-							Object.entries(commandEnvironment).filter(([key]) => key !== "GJC_MASTER_CAPABILITY"),
+							Object.entries("kind" in cmd ? cmd.env : process.env).filter(
+								([key]) => key !== "GJC_MASTER_CAPABILITY",
+							),
 						),
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,

@@ -4,6 +4,18 @@
 
 ### Fixed
 
+- Loader instances can opt into layout-only repaint requests so transient status animation does not force unchanged transcript subtree reconstruction.
+
+## [0.15.2] - 2026-08-25
+
+### Changed
+
+- Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
+
+## [0.15.1] - 2026-08-25
+
+### Fixed
+
 - Capability-probe replies no longer echo endlessly across the screen after a foreground child leaves the tty in cooked mode (`^[]11;rgb:0000/0000/0000^G^[[?62;22;52c` repeating every two seconds while the prompt stops accepting keys). `ProcessTerminal.start()` enabled raw mode exactly once, while Node/Bun cache only the last `setRawMode()` request and keep reporting raw mode when a child changes the shared tty's termios directly; even another `setRawMode(true)` is then a runtime no-op. The 2s OSC 11 poll could therefore keep writing `\x1b]11;?\x07` plus its DA1 sentinel into a cooked tty, where the kernel echoes and line-buffers the replies before the input parser can see them. Each OSC 11 query now synchronously cycles the runtime's raw-mode setter before writing, restores Windows VT-input flags that `setRawMode()` resets, and skips the probe when restoration fails. Non-TTY and stopped or dead terminals retain their existing behavior; probe-reply parsing, the Mode 2031 push path, and the poll interval are unchanged.
 
 ### Added
