@@ -3136,11 +3136,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	type LifecycleBatch = RuntimeState["openLifecycleBatches"][number];
 	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
-	const sessionIdentityForContext = (ctx: ExtensionContext): string => {
+	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
-		const sessionFile =
-			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
-			resolveReconciliationSessionFile(undefined, path.join(ctx.cwd, ".gjc", "state"), sessionId);
+		const sessionFile = ctx.sessionManager.getSessionFile?.();
+		if (!sessionFile) return undefined;
 		return `${sessionId}\u0000${sessionFile}`;
 	};
 	const lifecycleStateForContext = (
@@ -3149,6 +3148,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	): RuntimeState | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const sessionIdentity = sessionIdentityForContext(ctx);
+		if (!sessionIdentity) return undefined;
 		const retired = (retiredLifecycleOwners.get(sessionId) ?? []).filter(
 			owner => owner.sessionIdentity === sessionIdentity,
 		);
@@ -3184,6 +3184,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// turn it did not submit, and never set for agent-initiated turns (review
 	// thread P1).
 	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
+	let nextLifecycleEpoch = 0;
 	const skillTerminalRecoveryKeys = new Set<string>();
 	const trackLifecycle = (handler: () => Promise<void>, owner: RuntimeState | undefined): Promise<void> => {
 		if (!owner) return Promise.resolve();
@@ -3218,7 +3219,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				current.activeInvocation = undefined;
 				current.drainedInvocations = undefined;
 				current.attachedInvocations = undefined;
-				activePromptOwnerHolder.connectionIds = undefined;
+				if (current === active) activePromptOwnerHolder.connectionIds = undefined;
 				return;
 			}
 			current.activeInvocation = batch[0];
@@ -3226,7 +3227,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			current.attachedInvocations = undefined;
 			const owners = new Set<string>();
 			for (const entry of batch) if (entry.connectionId !== undefined) owners.add(entry.connectionId);
-			activePromptOwnerHolder.connectionIds = owners;
+			if (current === active) activePromptOwnerHolder.connectionIds = owners;
 		};
 		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		if (type === "agent_failed") {
@@ -3260,8 +3261,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			);
 			transitions = [...fallback, ...attached].map(({ kind, correlation }) => ({ kind, correlation }));
 		} else if (type === "agent_start") {
-			current.lifecycleEpoch += 1;
-			activePromptOwnerHolder.lifecycleEpoch = current.lifecycleEpoch;
+			current.lifecycleEpoch = ++nextLifecycleEpoch;
+			if (current === active) activePromptOwnerHolder.lifecycleEpoch = current.lifecycleEpoch;
 			// Mark lifecycle active even when the drain is empty: a monitor/cron
 			// run started by the session has no SDK pending entry but is still a
 			// real active run that later in-run promotions must attach to instead
@@ -3408,9 +3409,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 		const correlationKey = (correlation: InvocationCorrelation): string =>
 			`${correlation.commandId}:${correlation.turnId}`;
-		if (type === "agent_failed")
+		if (type === "agent_failed") {
+			transitions = transitions.filter(
+				invocation => !current.failureDiagnosticKeys.has(correlationKey(invocation.correlation)),
+			);
 			for (const invocation of transitions)
 				current.failureDiagnosticKeys.add(correlationKey(invocation.correlation));
+		}
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
 		// terminalPublished when the correlated agent_end event reached the
@@ -3460,6 +3465,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					observed = false;
 					failedTransitions.push(invocation);
 					if (type === "agent_failed") {
+						current.failureDiagnosticKeys.delete(
+							`${invocation.correlation.commandId}:${invocation.correlation.turnId}`,
+						);
 						// Keep the sanitized reason: the later agent_end must re-record
 						// it before terminalizing, or a successful boundary write
 						// classifies the failed run terminal_ok (exact-head review P1).

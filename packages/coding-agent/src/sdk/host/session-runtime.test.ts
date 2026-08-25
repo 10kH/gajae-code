@@ -3072,6 +3072,7 @@ async function invocationHarness(
 		...(hooks.invokeSkill ? { invokeSkill: hooks.invokeSkill } : {}),
 		sessionManager: {
 			getSessionId: () => sessionId,
+			getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
 			getSessionName: () => undefined,
 			getBranch: () => [],
 		},
@@ -3098,13 +3099,27 @@ async function invocationHarness(
 		switchSession: async sessionId => {
 			await handlers.get("session_switch")?.(
 				{},
-				{ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionId } },
+				{
+					...ctx,
+					sessionManager: {
+						...ctx.sessionManager,
+						getSessionId: () => sessionId,
+						getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
+					},
+				},
 			);
 		},
 		branch: async sessionId => {
 			await handlers.get("session_branch")?.(
 				{},
-				{ ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => sessionId } },
+				{
+					...ctx,
+					sessionManager: {
+						...ctx.sessionManager,
+						getSessionId: () => sessionId,
+						getSessionFile: () => path.join(cwd, ".gjc", "state", `${sessionId}.jsonl`),
+					},
+				},
 			);
 		},
 		requestOnSession: (sessionId, frame) => {
@@ -3479,6 +3494,40 @@ describe("post-acceptance invocation terminalization", () => {
 				await Bun.sleep(50);
 				await rm(cwd, { recursive: true, force: true });
 			}
+		}
+	});
+
+	test("deduplicates repeated agent_failed diagnostics for one invocation", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-agent-failed-dedupe-"));
+		try {
+			const inflight = Promise.withResolvers<void>();
+			const harness = await invocationHarness("agent-failed-dedupe", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await inflight.promise;
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "hello" });
+			expect(accepted.ok).toBe(true);
+			const correlation = accepted.result;
+			await harness.emit("agent_start");
+			const failure = { error: Object.assign(new Error("provider failed"), { code: "provider_rejected" }) };
+			await harness.emit("agent_failed", failure);
+			await harness.emit("agent_failed", failure);
+			expect(
+				harness.broadcasts.filter(
+					frame =>
+						frame.kind === "agent_failed" &&
+						(frame.payload as { commandId?: string }).commandId === correlation?.commandId &&
+						(frame.payload as { turnId?: string }).turnId === correlation?.turnId,
+				),
+			).toHaveLength(1);
+			await harness.emit("agent_end");
+			inflight.resolve();
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
 		}
 	});
 
