@@ -338,6 +338,8 @@ const ATTACH_CONCURRENCY = 4;
  * that answered are already published and usable when this lapses.
  */
 const STARTUP_ATTACH_BUDGET_MS = 5_000;
+/** Bound on the straggler list in one startup diagnostic line. */
+const STARTUP_STRAGGLER_LOG_LIMIT = 8;
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
 const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
 /**
@@ -554,10 +556,31 @@ export class SessionRouter {
 				initialPass.then(() => true),
 				Bun.sleep(this.#deps.startupAttachBudgetMs ?? STARTUP_ATTACH_BUDGET_MS).then(() => false),
 			]);
-			if (!settled)
+			if (!settled) {
+				// Name the sessions the budget was spent on. Without this the lapse is
+				// silent and the only symptom is a slow startup somewhere else, which
+				// is what made the original 40s stall cost an instrumented bisect to
+				// attribute. Session id and pid identify the process an operator has
+				// to look at; endpoint url and token are never logged.
+				const stragglers = this.#index
+					.listSessions()
+					.sessions.filter(session => {
+						if (!session.live) return false;
+						const attached = this.#sessions.get(session.sessionId);
+						// No attachment yet, or one whose replay barrier is still open:
+						// publication precedes replay, so `published` alone cannot tell
+						// an attachment that finished replaying from one still waiting.
+						return attached?.published !== true || attached.barrier.held !== undefined;
+					})
+					.map(session => `${session.sessionId}@pid ${session.pid}`);
+				if (stragglers.length > 0)
+					logger.warn(
+						`SDK session Router startup returned before ${stragglers.length} attachment(s) settled: ${stragglers.slice(0, STARTUP_STRAGGLER_LOG_LIMIT).join(", ")}${stragglers.length > STARTUP_STRAGGLER_LOG_LIMIT ? ", …" : ""}. Those hosts have not answered their initial replay; reconciliation keeps retrying them, and a host that never answers needs that process stopped.`,
+					);
 				void initialPass.catch(error =>
 					logger.warn(`SDK session Router initial reconciliation failed after startup returned: ${String(error)}`),
 				);
+			}
 			if (!this.#running(runEpoch)) return;
 			const timer = (this.#deps.setInterval ?? setInterval)(
 				() => this.#schedule(this.#serialReconcile(runEpoch, true)),

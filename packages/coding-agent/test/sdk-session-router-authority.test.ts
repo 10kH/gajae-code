@@ -1918,6 +1918,10 @@ describe("SessionRouter dispatch authority", () => {
 			},
 		});
 
+		const warnings: string[] = [];
+		const warn = spyOn(logger, "warn").mockImplementation(message => {
+			warnings.push(String(message));
+		});
 		try {
 			const startedAt = performance.now();
 			await router.start();
@@ -1928,7 +1932,14 @@ describe("SessionRouter dispatch authority", () => {
 			expect(router.attachment(healthy)?.isCurrent()).toBe(true);
 			// The wedged replay was attempted, and its pass is still parked on it.
 			expect(replayRequests).toContain(wedged);
+			// The lapse names the session and pid to look at, and no endpoint secret.
+			const lapse = warnings.find(message => message.includes("startup returned before"));
+			expect(lapse).toContain(wedged);
+			expect(lapse).toContain("pid 42");
+			expect(lapse).not.toContain(healthy);
+			expect(warnings.join("\n")).not.toContain("v1");
 		} finally {
+			warn.mockRestore();
 			wedgedGate.resolve();
 			await router.stop();
 		}
