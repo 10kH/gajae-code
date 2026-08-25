@@ -1507,6 +1507,40 @@ function rejectionRecoveryIntent(error: unknown): { code: string; message: strin
 	return sanitizePromptFailure(error);
 }
 
+/**
+ * A provider can finish a stream with an assistant error message rather than
+ * rejecting the prompt promise. The SDK extension receives the final agent_end
+ * after retry/fallback policy has settled, so this is the safe boundary at which
+ * to publish the additive failure diagnostic before terminal reconciliation.
+ */
+function providerFailureFromAgentEnd(event: unknown): { code: string; message: string } | undefined {
+	if (!event || typeof event !== "object") return undefined;
+	const messages = (event as { messages?: unknown }).messages;
+	if (!Array.isArray(messages)) return undefined;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		const message = messages[index];
+		if (!message || typeof message !== "object") continue;
+		const assistant = message as {
+			role?: unknown;
+			stopReason?: unknown;
+			errorStatus?: unknown;
+			transportFailure?: { status?: unknown };
+		};
+		if (assistant.role !== "assistant" || assistant.stopReason !== "error") continue;
+		const status =
+			typeof assistant.errorStatus === "number" && Number.isSafeInteger(assistant.errorStatus)
+				? assistant.errorStatus
+				: typeof assistant.transportFailure?.status === "number" &&
+						Number.isSafeInteger(assistant.transportFailure.status)
+					? assistant.transportFailure.status
+					: undefined;
+		if (status === 402 || status === 429)
+			return { code: `provider_http_${status}`, message: "Prompt submission failed." };
+		if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
+	}
+	return undefined;
+}
+
 function createControlSurface(
 	ctx: ExtensionContext,
 	api: ExtensionAPI,
@@ -3066,6 +3100,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				disposeGate?: () => void;
 				lifecycleActive: boolean;
 				lifecycleEpoch: number;
+				failureDiagnosticKeys: Set<string>;
 				/** Failure reasons whose durable agent_failed write failed; the
 				 * subsequent agent_end must re-record them before terminalizing or
 				 * the record classifies terminal_ok (exact-head review P1). */
@@ -3296,6 +3331,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 			return;
 		}
+		const correlationKey = (correlation: InvocationCorrelation): string =>
+			`${correlation.commandId}:${correlation.turnId}`;
+		if (type === "agent_failed")
+			for (const invocation of transitions)
+				current.failureDiagnosticKeys.add(correlationKey(invocation.correlation));
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
 		// terminalPublished when the correlated agent_end event reached the
@@ -3412,6 +3452,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 			if (current.openLifecycleBatches.length > 0) current.openLifecycleBatches.shift();
 			for (const invocation of transitions)
+				current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
+			for (const invocation of transitions)
 				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
 			adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
 			if (current.openLifecycleBatches.length === 0) current.lifecycleActive = false;
@@ -3423,16 +3465,23 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 	};
 	api.on("agent_start", async (_event, ctx) => await emitLifecycle("agent_start", ctx));
-	api.on(
-		"agent_end",
-		async (event, ctx) =>
-			await emitLifecycle(
-				"agent_end",
-				ctx,
-				undefined,
-				event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
-			),
-	);
+	api.on("agent_end", async (event, ctx) => {
+		const failure = providerFailureFromAgentEnd(event);
+		const current = active;
+		const currentInvocation = current?.activeInvocation ?? current?.openLifecycleBatches[0]?.invocations[0];
+		const failureAlreadyPublished = currentInvocation
+			? current?.failureDiagnosticKeys.has(
+					`${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`,
+				)
+			: false;
+		if (failure && !failureAlreadyPublished) await emitLifecycle("agent_failed", ctx, failure);
+		await emitLifecycle(
+			"agent_end",
+			ctx,
+			undefined,
+			event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
+		);
+	});
 	api.on("agent_failed", async (event, ctx) => emitLifecycle("agent_failed", ctx, event.error));
 	api.on("turn_start", async (_event, ctx) => {
 		const current = active;
@@ -4045,6 +4094,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			disposeGate,
 			lifecycleActive: false,
 			lifecycleEpoch: 0,
+			failureDiagnosticKeys: new Set(),
 		};
 		try {
 			await runtime.start();
@@ -4076,6 +4126,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					disposeGate,
 					lifecycleActive: false,
 					lifecycleEpoch: 0,
+					failureDiagnosticKeys: new Set(),
 				};
 				throw new AggregateError([error, cleanupError], "SDK runtime startup failed and cleanup failed.");
 			}

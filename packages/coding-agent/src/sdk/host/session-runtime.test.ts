@@ -3135,6 +3135,62 @@ async function settledStatus(
 }
 
 describe("post-acceptance invocation terminalization", () => {
+	test.each([
+		402, 429,
+	])("terminalizes a streamed provider HTTP %i rejection and permits a healthy abort_and_prompt replacement", async status => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-provider-http-${status}-`));
+		try {
+			let prompts = 0;
+			const harness = await invocationHarness(`provider-http-${status}`, cwd, {
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) await new Promise<void>(() => {});
+				},
+			});
+			const failed = await harness.control("turn.prompt", { text: "provider rejects", clientRef: `http-${status}` });
+			expect(failed.ok).toBe(true);
+			const failedIds = { commandId: failed.result?.commandId, turnId: failed.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorStatus: status,
+						transportFailure: { kind: "transport", status },
+					},
+				],
+			});
+
+			const terminal = await settledStatus(harness, "turn.result", {
+				kind: "prompt",
+				clientRef: `http-${status}`,
+			});
+			expect(terminal).toMatchObject({
+				status: "failed",
+				error: { code: `provider_http_${status}`, message: "Prompt submission failed." },
+				terminalAt: expect.any(Number),
+			});
+			const stable = await harness.query("turn.result", { kind: "prompt", ...failedIds });
+			expect(stable.result).toEqual(terminal);
+
+			const replacement = await harness.control("turn.abort_and_prompt", { text: "replacement" });
+			expect(replacement).toMatchObject({ ok: true, result: { accepted: true } });
+			const replacementIds = { commandId: replacement.result?.commandId, turnId: replacement.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end");
+			expect(await settledStatus(harness, "turn.prompt_status", replacementIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a prompt killed by a provider stream interrupt reports a terminal failed status", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-prompt-"));
 		try {

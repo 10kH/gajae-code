@@ -30,6 +30,9 @@
 - Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
 
 ## [0.15.1] - 2026-08-25
+### Fixed
+
+- SDK prompts now publish a bounded structured terminal failure when a provider immediately returns HTTP 402 or 429. The accepted receipt remains non-terminal until the correlated `agent_end`, while `turn.result`/`turn.prompt_status` no longer strand the prompt as `in_flight`; replacement turns remain independently abortable and recoverable. (#4941)
 
 ### Added
 
