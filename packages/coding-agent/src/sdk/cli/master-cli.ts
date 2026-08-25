@@ -9,7 +9,7 @@
  */
 import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
-import { SessionIndex, type IndexedSession } from "../broker/session-index";
+import { type IndexedSession, SessionIndex } from "../broker/session-index";
 import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
 
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";

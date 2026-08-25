@@ -2,9 +2,9 @@ import { describe, expect, it } from "bun:test";
 import {
 	renderSpawnTable,
 	runSdkSpawn,
-	selectNewestMasterAttestationEpoch,
 	SdkMasterCliError,
 	safeSpawnRender,
+	selectNewestMasterAttestationEpoch,
 } from "@gajae-code/coding-agent/sdk/cli/master-cli";
 import type { IndexedSession } from "../src/sdk/broker/session-index";
 

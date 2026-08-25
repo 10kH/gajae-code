@@ -1137,8 +1137,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// never ambient state for ordinary Bash or a chained/pipelined descendant.
 		// Check both spellings so cwd normalization or URL expansion cannot turn a
 		// command that contained shell syntax into a privileged one.
-		const directMasterSpawn =
-			isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
+		const directMasterSpawn = isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
 		const masterCapability = directMasterSpawn ? this.session.getMasterBashCapability?.() : undefined;
 		const commandEnvOverrides = Object.fromEntries(
 			Object.entries(expandedEnv ?? {}).filter(([key]) => key !== MASTER_CAPABILITY_ENV),
