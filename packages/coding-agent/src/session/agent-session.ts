@@ -1044,6 +1044,8 @@ export interface PromptOptions {
 	onSkillPrepared?: (meta: { name: string; path: string; lineCount?: number; cleanedArgs?: string }) => void;
 	/** Optional invocation-scoped cancellation fence used before an accepted skill starts execution. */
 	preflightSignal?: AbortSignal;
+	/** Internal SDK lifecycle owner token. */
+	sdkRunToken?: string;
 }
 
 function promptPreflightCancelledError(): Error {
@@ -10565,6 +10567,7 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
+			| "sdkRunToken"
 		>,
 	): Promise<void> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
@@ -10666,6 +10669,7 @@ export class AgentSession {
 			| "onPreflightAccepted"
 			| "onPreflightAcceptCommit"
 			| "preflightSignal"
+			| "sdkRunToken"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
@@ -10999,8 +11003,10 @@ export class AgentSession {
 			const agentPromptOptions = {
 				...(options?.toolChoice ? { toolChoice: options.toolChoice } : undefined),
 				...this.#managedFallbackPromptOptions(),
+				...(options?.sdkRunToken ? { sdkRunToken: options.sdkRunToken } : {}),
 				onRunAccepted: (handle: AttemptRunHandle) => {
 					this.#acceptRunHandle(handle);
+					if (options?.sdkRunToken) this.#sdkRunTokensByAttemptScope.set(handle.scope, options.sdkRunToken);
 					options?.onRunAccepted?.(handle);
 					options?.admissionLease?.release();
 					// R3.3: the accepted-run wrapper is the exact acceptance boundary —
@@ -19533,6 +19539,7 @@ export class AgentSession {
 		preSubmit: PreSubmitBuilder,
 		options?: {
 			toolChoice?: ToolChoice;
+			sdkRunToken?: string;
 			fallbackManaged?: boolean;
 			onRunAccepted?: (handle: AttemptRunHandle) => void;
 		},

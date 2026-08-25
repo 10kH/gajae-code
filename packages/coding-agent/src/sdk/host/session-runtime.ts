@@ -1666,6 +1666,7 @@ function createControlSurface(
 		kind: InvocationKind,
 		clientRef: string | undefined,
 		run: (options: {
+			sdkRunToken: string;
 			onPreflightAccepted: () => void;
 			onPreflightAcceptCommit: () => Promise<void>;
 			/** Internal disposition before a queued submission is actually consumed. */
@@ -1685,6 +1686,7 @@ function createControlSurface(
 		const retainedClientRef = normalizeClientRef(clientRef);
 		reconciliation.admit(kind, retainedClientRef);
 		const correlation = newCorrelation();
+		const sdkRunToken = `${correlation.commandId}:${correlation.turnId}`;
 		const preflight = Promise.withResolvers<void>();
 		let accepted = false;
 		let settled = false;
@@ -1743,6 +1745,7 @@ function createControlSurface(
 			const submission = Promise.resolve(
 				run({
 					onPreflightAccepted: () => void accept().catch(() => undefined),
+					sdkRunToken,
 					onPreflightAcceptCommit: accept,
 					onDispatchDisposition: promotion => {
 						promotionStartsOwnRun = promotion.startsOwnRun;
@@ -2823,10 +2826,14 @@ function createControlSurface(
 	};
 	return {
 		prompt: async (text, images, clientRef) =>
-			submit("prompt", clientRef, ({ queuedAtDispatch, ...options }) =>
+			submit("prompt", clientRef, ({ queuedAtDispatch, sdkRunToken, ...options }) =>
 				api.sendUserMessage(
 					typeof images === "undefined" ? text : ([{ type: "text", text }, ...(images as never[])] as never),
-					queuedAtDispatch ? { ...options, queuedAtDispatch: true } : options,
+					{
+						...options,
+						sdkRunToken,
+						...(queuedAtDispatch ? { queuedAtDispatch: true } : {}),
+					},
 				),
 			),
 		steer: async (text, clientRef) => {
