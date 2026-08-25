@@ -12055,6 +12055,7 @@ export class AgentSession {
 				return;
 			}
 			if (deliverAs === "steer") {
+				if (options?.sdkRunToken) this.#activeSdkRunToken = options.sdkRunToken;
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
 				await this.#queueSteer(text, images, {
@@ -12074,6 +12075,7 @@ export class AgentSession {
 			// Abort unwind is awaited before classification so a successor is not
 			// parked in the dying turn's steer queue.
 			if (this.#isLiveTurnBusy() && !waitedForAbortUnwind) {
+				if (options?.sdkRunToken) this.#activeSdkRunToken = options.sdkRunToken;
 				if (options?.onPreflightAcceptCommit) await options.onPreflightAcceptCommit();
 				assertPreflightStillOpen();
 				await this.#queueSteer(text, images, {

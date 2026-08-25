@@ -4371,7 +4371,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			}
 			active = undefined;
-			if (current.openLifecycleBatches.length > 0 || current.lifecycleTasks.size > 0) {
+			if (current.pending.length > 0 || current.openLifecycleBatches.length > 0 || current.lifecycleTasks.size > 0) {
 				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
 				owners.push(current);
 				retiredLifecycleOwners.set(current.sessionId, owners);
