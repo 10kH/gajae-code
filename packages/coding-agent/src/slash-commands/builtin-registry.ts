@@ -45,6 +45,7 @@ import {
 } from "../setup/provider-onboarding";
 import { parseThinkingLevel } from "../thinking";
 import { getDisplayChangelogEntries } from "../utils/changelog";
+import { handleAsideAcp } from "./helpers/aside";
 import { buildAutoroutingStatusReport } from "./helpers/autorouting-status";
 import { buildContextReportText } from "./helpers/context-report";
 import { switchSessionCredentialCommand } from "./helpers/credential-switch";
@@ -609,6 +610,24 @@ const shutdownHandlerTui = (_command: ParsedSlashCommand, runtime: TuiSlashComma
 const IMPORT_SESSION_RETAINED_DESCRIPTOR_AUTHORITY_AVAILABLE = process.platform === "linux";
 
 const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
+	{
+		name: "aside",
+		priority: 32,
+		description: "Run the Aside CLI from the composer",
+		acpDescription: "Run the Aside CLI",
+		subcommands: [
+			{ name: "exec", description: "Run Aside with a prompt", usage: "[args] <prompt>" },
+			{ name: "repl", description: "Aside REPL is terminal-only; prints the outside command" },
+			{ name: "mcp", description: "Print MCP registration using the resolved CLI path" },
+			{ name: "account", description: "Inspect or select Aside CLI accounts", usage: "[list|status|use]" },
+			{ name: "help", description: "Show /aside usage" },
+		],
+		inlineHint: "[exec|repl|mcp|account|help|<prompt>]",
+		acpInputHint: "[exec|repl|mcp|account|help|<prompt>]",
+		allowArgs: true,
+		localHeadless: true,
+		handle: handleAsideAcp,
+	},
 	{
 		name: "import-session",
 		priority: 29,

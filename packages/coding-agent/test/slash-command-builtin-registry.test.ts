@@ -6,6 +6,7 @@ import { Settings } from "@gajae-code/coding-agent/config/settings";
 import { BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/extensibility/slash-commands";
 import { getCurrentThemeName, initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
+import { ACP_BUILTIN_SLASH_COMMANDS } from "@gajae-code/coding-agent/slash-commands/acp-builtins";
 import {
 	BUILTIN_SLASH_COMMAND_DEFS,
 	BUILTIN_SLASH_COMMANDS_INTERNAL,
@@ -613,5 +614,24 @@ describe("builtin /routing slash command", () => {
 
 		expect(fastLine).toBeDefined();
 		expect(fastLine?.length).toBeLessThanOrEqual(220);
+	});
+});
+
+describe("builtin /aside slash command", () => {
+	it("is discoverable with Aside CLI completion metadata", () => {
+		const asideCommand = BUILTIN_SLASH_COMMAND_DEFS.find(command => command.name === "aside");
+
+		expect(asideCommand).toBeDefined();
+		expect(asideCommand?.description).toContain("Aside CLI");
+		expect(asideCommand?.inlineHint).toBe("[exec|repl|mcp|account|help|<prompt>]");
+		expect(asideCommand?.subcommands?.map(command => command.name)).toEqual([
+			"exec",
+			"repl",
+			"mcp",
+			"account",
+			"help",
+		]);
+		expect(lookupBuiltinSlashCommand("aside")?.allowArgs).toBe(true);
+		expect(ACP_BUILTIN_SLASH_COMMANDS.some(command => command.name === "aside")).toBe(true);
 	});
 });

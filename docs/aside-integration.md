@@ -1,6 +1,8 @@
 # Aside sidecar evaluation
 
-This note records the safe first-step boundary for evaluating [Aside](https://aside.com/) with Gajae-Code (`gjc`). It is intentionally docs-only: GJC does not ship an Aside adapter, does not auto-discover Aside, and does not enable browser-control behavior by default.
+This note records the safe first-step boundary for evaluating [Aside](https://aside.com/) with Gajae-Code (`gjc`). The search/context sidecar path is intentionally docs-only: GJC does not ship an Aside adapter, does not auto-discover Aside, and does not enable browser-control behavior by default.
+
+The one in-tree CLI ergonomics surface is the explicit `/aside` composer slash command. It probes a user-installed Aside CLI and can run `aside exec` / `aside account` when the operator types it. That command does not restore a GJC browser-tool backend and does not turn Aside on for ordinary browser or search tools.
 
 ## Current public surface
 
@@ -58,7 +60,31 @@ Recommended prompt boundary for evaluation:
 Use the Aside sidecar only for read-only search/context retrieval. Do not click, submit, sign in, autofill credentials, use payment or billing flows, post messages, write files, or operate internal tools. Return a short answer with source titles/URLs only.
 ```
 
-## Option B: future HTTP/SSE MCP endpoint
+## Option B: `/aside` composer command
+
+Type `/aside` in the GJC composer to probe and use a locally installed Aside CLI. This is operator-initiated and does not enable GJC browser-control by default.
+
+```text
+/aside
+/aside Summarize the current page
+/aside exec --session <id> Continue
+/aside mcp
+/aside account list
+```
+
+Behavior:
+
+- Bare `/aside` prints the resolved CLI path, `aside --version` when available, and usage.
+- `/aside <prompt>` and `/aside exec …` spawn `aside exec` with argv (no shell).
+- `/aside mcp` prints `gjc mcp add aside <resolved-cli> mcp --project`. It does not start `aside mcp` inside GJC, because that command is a stdio server.
+- `/aside repl` is refused inside GJC. Run `aside repl` in a real terminal TTY.
+- If the CLI is missing, GJC prints the searched paths and `curl -fsSL https://releases.aside.com/install.sh | bash`. It never runs the installer.
+
+Probe order: `~/.local/bin/aside`, then `~/.aside/cli/Aside CLI.app/Contents/MacOS/aside`, then `PATH`.
+
+Keep the same payload boundary as the MCP path: do not paste cookies, screenshots, task transcripts, or private Aside profile paths into issues or PRs.
+
+## Option C: future HTTP/SSE MCP endpoint
 
 If Aside or a wrapper later exposes a narrow search/context MCP endpoint, keep endpoint and credentials user-owned:
 
@@ -101,7 +127,9 @@ gjc mcp remove aside-search --project
 
 | Symptom | Check |
 | --- | --- |
-| `aside` command not found | Install the Aside CLI from Aside developer settings, then use the concrete CLI path as the MCP `command` if needed. |
+| `aside` command not found | Run `/aside` in the GJC composer, or install the Aside CLI from Aside developer settings, then use the concrete CLI path as the MCP `command` if needed. |
+| `/aside` says the CLI was not found | Confirm the installer symlink (`~/.local/bin/aside`) or the `Aside CLI.app` bundle exists and is executable. `/aside` never runs the installer. |
+| `/aside repl` is refused | Expected. GJC cannot attach a TTY to `aside repl`; run that command in a terminal. |
 | MCP server does not appear in `gjc mcp list` | Re-run `gjc mcp list --json`; confirm whether the registration was user-scoped or project-scoped. |
 | Aside tools do not appear in a normal GJC session | Check `gjc mcp list --json`: the server must be `autoload` status (not `enabled: false`, not in `disabledServers`, not `autoload: false`), project scope must not be disabled by an explicit `mcp.enableProjectConfig: false` setting, and the session must not have passed `--no-mcp`. |
 | Auth failure | Rotate or re-enter the Aside-side token/API key. Do not paste it into GJC prompts or issue comments. |
@@ -111,4 +139,4 @@ gjc mcp remove aside-search --project
 
 ## Decision
 
-Docs-only is the smallest safe outcome for issue #1097. Existing GJC MCP registration can store a user-provided Aside MCP server definition for redacted inspection, and Aside already documents `aside mcp`; no GJC adapter glue is required. The future-safe boundary is to keep Aside external and opt-in, document read/search/context-only use, and require a separate design before GJC claims runtime support for browser actions, login, payment, internal-tool, or private browser-session workflows.
+Docs-only remains the smallest safe outcome for the search/context sidecar in issue #1097: existing GJC MCP registration can store a user-provided Aside MCP server definition for redacted inspection, and Aside already documents `aside mcp`. `/aside` is the separate CLI-ergonomics path: an explicit composer command that probes and optionally execs the user-installed binary, without adapter glue and without restoring the reverted Aside browser-tool backend. The future-safe boundary is to keep Aside external and opt-in, document read/search/context-only use, and require a separate design before GJC claims runtime support for browser actions, login, payment, internal-tool, or private browser-session workflows.

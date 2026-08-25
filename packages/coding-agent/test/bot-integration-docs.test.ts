@@ -87,6 +87,8 @@ describe("external controller integration docs", () => {
 		expect(guide).toContain("docs-only");
 		expect(guide).toContain("aside mcp");
 		expect(guide).toContain("gjc mcp add aside aside mcp --project");
+		expect(guide).toContain("/aside");
+		expect(guide).toContain("composer slash command");
 		expect(guide).toContain("browser actions and form submissions");
 		expect(guide).toContain("login flows, credential autofill, MFA");
 		expect(guide).toContain("payments, purchases, subscriptions, billing changes");
