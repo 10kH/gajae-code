@@ -254,6 +254,22 @@ describe("/aside slash command", () => {
 		expect(output[0]).not.toContain("aside mcp\n");
 	});
 
+	test("rejects unexpected MCP arguments without probing or spawning", async () => {
+		const handle = createAsideHandler({
+			homedir: () => "/missing",
+			isExecutable: () => false,
+			which: () => null,
+			exec: async () => {
+				throw new Error("mcp must not spawn");
+			},
+		});
+		const { runtime, output } = runtimeHarness();
+		expect(await handle({ name: "aside", args: "mcp unexpected", text: "/aside mcp unexpected" }, runtime)).toEqual({
+			consumed: true,
+		});
+		expect(output).toEqual(["Usage: /aside mcp"]);
+	});
+
 	test("repl refuses to run inside GJC", async () => {
 		const handle = createAsideHandler({
 			homedir: () => "/Users/demo",
@@ -267,6 +283,24 @@ describe("/aside slash command", () => {
 		expect(await handle({ name: "aside", args: "repl", text: "/aside repl" }, runtime)).toEqual({ consumed: true });
 		expect(output[0]).toContain("needs a real terminal TTY");
 		expect(output[0]).toContain("/Users/demo/.local/bin/aside repl");
+	});
+
+	test("rejects unexpected REPL arguments without probing or spawning", async () => {
+		const handle = createAsideHandler({
+			homedir: () => "/missing",
+			isExecutable: () => false,
+			which: () => null,
+			exec: async () => {
+				throw new Error("repl must not spawn");
+			},
+		});
+		const { runtime, output } = runtimeHarness();
+		expect(await handle({ name: "aside", args: "repl unexpected", text: "/aside repl unexpected" }, runtime)).toEqual(
+			{
+				consumed: true,
+			},
+		);
+		expect(output).toEqual(["Usage: /aside repl"]);
 	});
 
 	test("account forwards subcommands", async () => {

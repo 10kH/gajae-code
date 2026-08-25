@@ -238,11 +238,13 @@ export function createAsideHandler(options: AsideHandlerOptions = {}) {
 		const probe = probeAsideCli(homedir(), probeOptions);
 
 		if (verb === "mcp") {
+			if (rest) return usage("Usage: /aside mcp", runtime);
 			if (!probe.ok) return usage(formatAsideMissingCli(probe), runtime);
 			return usage(formatAsideMcpRegistration(probe.path), runtime);
 		}
 
 		if (verb === "repl") {
+			if (rest) return usage("Usage: /aside repl", runtime);
 			if (!probe.ok) return usage(formatAsideMissingCli(probe), runtime);
 			return usage(
 				[
