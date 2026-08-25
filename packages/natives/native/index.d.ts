@@ -220,10 +220,11 @@ export declare class NotificationServer {
   pushFrameAndWait(frameJson: string, timeoutMs: number): Promise<boolean>
   /**
    * Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
-   * External frames must continue through [`Self::push_frame`] for serde
-   * validation.
+   * Returns whether at least one non-excluded transport accepted the raw
+   * frame. External frames must continue through [`Self::push_frame`] for
+   * serde validation.
    */
-  pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null, excludedConnectionIds?: Array<string> | undefined | null): void
+  pushTurnStreamUnchecked(sessionId: string, phase: string, text: string, finalAnswer?: boolean | undefined | null, messageRef?: string | undefined | null, excludedConnectionIds?: Array<string> | undefined | null): boolean
   /**
    * Broadcast a file attachment from raw N-API bytes, encoding the unchanged
    * base64 wire field only in Rust.

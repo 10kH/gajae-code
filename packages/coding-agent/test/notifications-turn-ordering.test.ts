@@ -855,6 +855,73 @@ test("lean does not replay a retained receipt when the same text is published as
 	}
 }, 30000);
 
+test("lean retains an ask lead-in receipt when no subscriber accepts the publication", async () => {
+	const prevEnv = process.env.GJC_NOTIFICATIONS;
+	process.env.GJC_NOTIFICATIONS = "1";
+	try {
+		const { handlers, ctx, ws } = await setup();
+		const url = ws.url;
+		const receipt = "Completed the work while the remote was disconnected.";
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "user", content: "Complete the disconnected task." } },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 0, message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+
+		const closed = Promise.withResolvers<void>();
+		ws.addEventListener("close", () => closed.resolve(), { once: true });
+		ws.close();
+		await closed.promise;
+		// Let the server retire the authenticated connection and its broadcast
+		// receiver before the autonomous lead-in attempts publication.
+		await sleep(250);
+
+		await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "custom", customType: "subagent", content: "worker complete" } },
+			ctx,
+		);
+		await handlers.get("message_end")!(
+			{ type: "message_end", message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+		await handlers.get("tool_execution_start")!(
+			{ type: "tool_execution_start", toolName: "ask", toolCallId: "ask-disconnected", args: {} },
+			ctx,
+		);
+		await handlers.get("turn_end")!(
+			{ type: "turn_end", turnIndex: 1, message: { role: "assistant", content: receipt } },
+			ctx,
+		);
+
+		const replacementFrames: Frame[] = [];
+		const replacement = new WebSocket(url);
+		openSockets.push(replacement);
+		replacement.addEventListener("message", event =>
+			replacementFrames.push(JSON.parse(String((event as MessageEvent).data))),
+		);
+		const opened = Promise.withResolvers<void>();
+		replacement.addEventListener("open", () => opened.resolve(), { once: true });
+		replacement.addEventListener("error", () => opened.reject(new Error("replacement ws error")), { once: true });
+		await opened.promise;
+		await sleep(250);
+
+		await handlers.get("agent_end")!({ type: "agent_end" }, ctx);
+		const turnStreams = () => replacementFrames.filter(frame => frame.type === "turn_stream");
+		await waitFor(() => turnStreams().length === 1, 3000, "retained receipt after reconnect");
+		expect(turnStreams()[0]!.text).toContain(receipt);
+		expect(finalAnswerOf(turnStreams()[0]!)).toBe(true);
+	} finally {
+		if (prevEnv === undefined) delete process.env.GJC_NOTIFICATIONS;
+		else process.env.GJC_NOTIFICATIONS = prevEnv;
+	}
+}, 30000);
+
 test("an autonomous ask consumes only its matching receipt from a composed lean settlement", async () => {
 	const prevEnv = process.env.GJC_NOTIFICATIONS;
 	process.env.GJC_NOTIFICATIONS = "1";

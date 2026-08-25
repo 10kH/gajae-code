@@ -606,6 +606,7 @@ impl NotificationServer {
 			.with_handle(|h| {
 				h.push_frame_excluding(msg, excluded_connection_ids.as_deref().unwrap_or_default())
 			})?
+			.map(|_| ())
 			.map_err(|error| Error::from_reason(error.to_string()))
 	}
 
@@ -626,8 +627,9 @@ impl NotificationServer {
 	}
 
 	/// Broadcast a TypeScript-constructed turn frame without re-parsing JSON.
-	/// External frames must continue through [`Self::push_frame`] for serde
-	/// validation.
+	/// Returns whether at least one non-excluded transport accepted the raw
+	/// frame. External frames must continue through [`Self::push_frame`] for
+	/// serde validation.
 	#[napi]
 	pub fn push_turn_stream_unchecked(
 		&self,
@@ -637,7 +639,7 @@ impl NotificationServer {
 		final_answer: Option<bool>,
 		message_ref: Option<String>,
 		excluded_connection_ids: Option<Vec<String>>,
-	) -> Result<()> {
+	) -> Result<bool> {
 		let phase = match phase.as_str() {
 			"live" => TurnPhase::Live,
 			"finalized" => TurnPhase::Finalized,
@@ -685,6 +687,7 @@ impl NotificationServer {
 					excluded_connection_ids.as_deref().unwrap_or_default(),
 				)
 			})?
+			.map(|_| ())
 			.map_err(|error| Error::from_reason(error.to_string()))
 	}
 

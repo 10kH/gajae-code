@@ -48,7 +48,7 @@ declare module "@gajae-code/natives" {
 			finalAnswer?: boolean,
 			messageRef?: string,
 			excludedConnectionIds?: string[],
-		): void;
+		): boolean;
 		/** Broadcast raw file bytes; Rust encodes the unchanged base64 wire field. */
 		pushFileAttachmentUnchecked(
 			sessionId: string,

@@ -1411,10 +1411,10 @@ function emitSessionEvent(
 function pushSessionFrame(
 	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: string; [key: string]: unknown },
-): void {
+): boolean {
 	const positionedRecipients = emitSessionEvent(runtime, frame);
 	if (frame.type === "turn_stream") {
-		runtime.server.pushTurnStreamUnchecked(
+		const rawAccepted = runtime.server.pushTurnStreamUnchecked(
 			String(frame.sessionId),
 			frame.phase === "live" ? "live" : "finalized",
 			String(frame.text),
@@ -1422,9 +1422,14 @@ function pushSessionFrame(
 			typeof frame.messageRef === "string" ? frame.messageRef : undefined,
 			positionedRecipients,
 		);
-		return;
+		// A retained lean settlement may be consumed only after either the
+		// positioned or legacy raw transport accepts the lead-in. Older native addons
+		// return undefined here, which deliberately fails closed unless the
+		// positioned leg has already proved acceptance.
+		return positionedRecipients.length > 0 || rawAccepted === true;
 	}
 	runtime.server.pushFrame(JSON.stringify(frame), positionedRecipients);
+	return positionedRecipients.length > 0;
 }
 
 async function pushTerminalSessionFrame(
@@ -8830,7 +8835,7 @@ export function createNotificationsExtension(
 			rt.liveRef = String(rt.turnSeq);
 		}
 		try {
-			pushSessionFrame(rt, {
+			const published = pushSessionFrame(rt, {
 				type: "turn_stream",
 				sessionId: id,
 				phase: "finalized",
@@ -8838,6 +8843,7 @@ export function createNotificationsExtension(
 				text,
 				...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
 			});
+			if (!published) return;
 			rt.preAskFlushedText = text;
 			if (!finalAnswer) {
 				// A successfully published ask lead-in settles only exact matching

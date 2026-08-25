@@ -649,18 +649,18 @@ impl ServerHandle {
 	/// connection ids. The excluded connections already received the same event
 	/// through the positioned directed leg; targeting only the remainder keeps
 	/// legacy raw subscribers compatible without presenting one semantic event
-	/// twice to replay-attached clients.
+	/// twice to replay-attached clients. Returns whether at least one eligible
+	/// connection transport accepted the frame.
 	pub fn push_frame_excluding(
 		&self,
 		msg: ServerMessage,
 		excluded_connection_ids: &[String],
-	) -> Result<(), PushFrameError> {
+	) -> Result<bool, PushFrameError> {
 		if matches!(msg, ServerMessage::ActionNeeded(_)) {
 			return Err(PushFrameError::ActionNeededProhibited);
 		}
 		if excluded_connection_ids.is_empty() {
-			let _ = self.state.tx.send(msg);
-			return Ok(());
+			return Ok(self.state.tx.send(msg).is_ok());
 		}
 		let excluded = excluded_connection_ids
 			.iter()
@@ -675,10 +675,11 @@ impl ServerHandle {
 			.cloned()
 			.collect::<Vec<_>>();
 		let json = serde_json::to_string(&msg).expect("ServerMessage serialization cannot fail");
+		let mut accepted = false;
 		for connection_id in recipients {
-			let _ = self.send_to(&connection_id, json.clone());
+			accepted |= self.send_to(&connection_id, json.clone());
 		}
-		Ok(())
+		Ok(accepted)
 	}
 
 	/// Deliver one frame through every currently authenticated connection writer
@@ -2747,9 +2748,11 @@ mod tests {
 			machine:    "m1".into(),
 			title:      None,
 		});
-		handle
-			.push_frame_excluding(frame, &[positioned_id])
-			.expect("legacy-only delivery");
+		assert!(
+			handle
+				.push_frame_excluding(frame, &[positioned_id])
+				.expect("legacy-only delivery")
+		);
 
 		assert!(matches!(
 			tokio::time::timeout(Duration::from_secs(2), legacy.next()).await,
@@ -2760,6 +2763,22 @@ mod tests {
 				.await
 				.is_err()
 		);
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn push_frame_excluding_reports_when_no_connection_accepts_the_frame() {
+		use crate::protocol::IdentityHeader;
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let frame = ServerMessage::IdentityHeader(IdentityHeader {
+			session_id: "s".into(),
+			repo:       "gajae-code".into(),
+			branch:     "test".into(),
+			machine:    "m1".into(),
+			title:      None,
+		});
+
+		assert!(!handle.push_frame_excluding(frame, &[]).unwrap());
 		handle.stop();
 	}
 	#[tokio::test]
