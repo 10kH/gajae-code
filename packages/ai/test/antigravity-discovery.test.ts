@@ -51,6 +51,26 @@ describe("Antigravity model discovery", () => {
 							maxTokens: 1_048_576,
 							maxOutputTokens: 65_535,
 						},
+						"gemini-3.7-flash-high": {
+							displayName: "Gemini 3.7 Flash (High)",
+							supportsImages: true,
+							supportsThinking: true,
+						},
+						"gemini-3.7-flash-low": {
+							displayName: "Gemini 3.7 Flash (Low)",
+							supportsImages: true,
+							supportsThinking: true,
+						},
+						"gemini-3.7-flash-medium": {
+							displayName: "Gemini 3.7 Flash (Medium)",
+							supportsImages: true,
+							supportsThinking: true,
+						},
+						"gemini-3.7-flash-tiered": {
+							displayName: "Gemini 3.7 Flash (Tiered)",
+							supportsImages: true,
+							supportsThinking: true,
+						},
 					},
 				}),
 				{ headers: { "content-type": "application/json" } },
@@ -64,7 +84,7 @@ describe("Antigravity model discovery", () => {
 			fetcher: createDiscoveryFetcher(),
 		});
 
-		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low"]);
+		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-low", "gemini-3.7-flash-tiered"]);
 	});
 
 	it("keeps gemini-3.1-pro-high when discovery targets google-gemini-cli", async () => {
@@ -75,12 +95,23 @@ describe("Antigravity model discovery", () => {
 			targetProvider: "google-gemini-cli",
 		});
 
-		expect(models?.map(model => model.id)).toEqual(["gemini-3.1-pro-high", "gemini-3.1-pro-low"]);
+		expect(models?.map(model => model.id)).toEqual([
+			"gemini-3.1-pro-high",
+			"gemini-3.1-pro-low",
+			"gemini-3.7-flash-high",
+			"gemini-3.7-flash-low",
+			"gemini-3.7-flash-medium",
+			"gemini-3.7-flash-tiered",
+		]);
 	});
 
 	it("does not expose retired selectors from the bundled registry", () => {
 		expect(getBundledModel("google-antigravity", "gemini-3.1-pro-high")).toBeUndefined();
 		expect(getBundledModels("google-antigravity").map(model => model.id)).not.toContain("gemini-3.1-pro-high");
+		expect(getBundledModel("google-antigravity", "gemini-3.7-flash-high")).toBeUndefined();
+		expect(getBundledModel("google-antigravity", "gemini-3.7-flash-low")).toBeUndefined();
+		expect(getBundledModel("google-antigravity", "gemini-3.7-flash-medium")).toBeUndefined();
+		expect(getBundledModel("google-antigravity", "gemini-3.7-flash-tiered")?.id).toBe("gemini-3.7-flash-tiered");
 		expect(getBundledModel("google-antigravity", "gemini-3.1-pro-low")?.id).toBe("gemini-3.1-pro-low");
 	});
 
@@ -90,8 +121,12 @@ describe("Antigravity model discovery", () => {
 		const cacheDbPath = join(cacheDir, "models.db");
 		const low = createAntigravityModel("gemini-3.1-pro-low", "Gemini 3.1 Pro (Low)");
 		const high = createAntigravityModel("gemini-3.1-pro-high", "Gemini 3.1 Pro (High)");
-		const staticModels: Model<Api>[] = [low];
-		const cachedModels: Model<Api>[] = [low, high];
+		const flashHigh = createAntigravityModel("gemini-3.7-flash-high", "Gemini 3.7 Flash (High)");
+		const flashLow = createAntigravityModel("gemini-3.7-flash-low", "Gemini 3.7 Flash (Low)");
+		const flashMedium = createAntigravityModel("gemini-3.7-flash-medium", "Gemini 3.7 Flash (Medium)");
+		const flashTiered = createAntigravityModel("gemini-3.7-flash-tiered", "Gemini 3.7 Flash (Tiered)");
+		const staticModels: Model<Api>[] = [low, flashTiered];
+		const cachedModels: Model<Api>[] = [low, high, flashHigh, flashLow, flashMedium, flashTiered];
 		const now = () => 1_800_000_000_000;
 		const staticFingerprint = Bun.hash(JSON.stringify(staticModels)).toString(36);
 		writeModelCache("google-antigravity", now(), cachedModels, true, staticFingerprint, cacheDbPath);
@@ -110,6 +145,6 @@ describe("Antigravity model discovery", () => {
 		);
 
 		expect(stale).toBe(false);
-		expect(models.map(model => model.id)).toEqual(["gemini-3.1-pro-low"]);
+		expect(models.map(model => model.id)).toEqual(["gemini-3.1-pro-low", "gemini-3.7-flash-tiered"]);
 	});
 });
