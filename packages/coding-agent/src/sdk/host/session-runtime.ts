@@ -1517,27 +1517,26 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 	if (!event || typeof event !== "object") return undefined;
 	const messages = (event as { messages?: unknown }).messages;
 	if (!Array.isArray(messages)) return undefined;
-	for (let index = messages.length - 1; index >= 0; index -= 1) {
-		const message = messages[index];
-		if (!message || typeof message !== "object") continue;
-		const assistant = message as {
-			role?: unknown;
-			stopReason?: unknown;
-			errorStatus?: unknown;
-			transportFailure?: { status?: unknown };
-		};
-		if (assistant.role !== "assistant" || assistant.stopReason !== "error") continue;
-		const status =
-			typeof assistant.errorStatus === "number" && Number.isSafeInteger(assistant.errorStatus)
-				? assistant.errorStatus
-				: typeof assistant.transportFailure?.status === "number" &&
-						Number.isSafeInteger(assistant.transportFailure.status)
-					? assistant.transportFailure.status
-					: undefined;
-		if (status === 402 || status === 429)
-			return { code: `provider_http_${status}`, message: "Prompt submission failed." };
-		if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
-	}
+	const lastAssistant = [...messages]
+		.reverse()
+		.find(message => message && typeof message === "object" && (message as { role?: unknown }).role === "assistant");
+	if (!lastAssistant || typeof lastAssistant !== "object") return undefined;
+	const assistant = lastAssistant as {
+		stopReason?: unknown;
+		errorStatus?: unknown;
+		transportFailure?: { status?: unknown };
+	};
+	if (assistant.stopReason !== "error") return undefined;
+	const status =
+		typeof assistant.errorStatus === "number" && Number.isSafeInteger(assistant.errorStatus)
+			? assistant.errorStatus
+			: typeof assistant.transportFailure?.status === "number" &&
+					Number.isSafeInteger(assistant.transportFailure.status)
+				? assistant.transportFailure.status
+				: undefined;
+	if (status === 402 || status === 429)
+		return { code: `provider_http_${status}`, message: "Prompt submission failed." };
+	if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
 	return undefined;
 }
 

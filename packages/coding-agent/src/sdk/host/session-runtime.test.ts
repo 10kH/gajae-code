@@ -3184,7 +3184,12 @@ describe("post-acceptance invocation terminalization", () => {
 			expect(replacement).toMatchObject({ ok: true, result: { accepted: true } });
 			const replacementIds = { commandId: replacement.result?.commandId, turnId: replacement.result?.turnId };
 			await harness.emit("agent_start");
-			await harness.emit("agent_end");
+			await harness.emit("agent_end", {
+				messages: [
+					{ role: "assistant", stopReason: "error", errorStatus: 429 },
+					{ role: "assistant", stopReason: "stop" },
+				],
+			});
 			expect(await settledStatus(harness, "turn.prompt_status", replacementIds)).toMatchObject({
 				status: "terminal_ok",
 			});
