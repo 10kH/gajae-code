@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Loader instances can opt into layout-only repaint requests so transient status animation does not force unchanged transcript subtree reconstruction.
+
 ## [0.15.2] - 2026-08-25
 
 ### Changed
