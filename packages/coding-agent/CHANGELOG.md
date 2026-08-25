@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-08-25
+
 ### Added
 
 - Added `/language [en|ko]`, the interactive slash command for the persisted `ui.language` selection. Without arguments it reports the current language; with a canonical code, endonym (`한국어`), or English name it persists the choice through settings and confirms in the selected language. An unsupported value is rejected with the available list and changes nothing.
