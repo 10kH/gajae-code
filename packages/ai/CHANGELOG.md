@@ -2,8 +2,6 @@
 
 ## [Unreleased]
 
-## [0.16.0] - 2026-08-25
-
 ### Added
 
 - Added an `sglang` provider for local OpenAI-compatible servers: its bundled provider descriptor discovers a running SGLang server at `http://127.0.0.1:30000/v1` implicitly, with hardened discovery (`redirect: "error"`, a 500ms loopback probe timeout, and `max_model_len` accepted only as a safe positive integer). `SGLANG_API_KEY` / `SGLANG_BASE_URL` follow the trusted env conventions used by vLLM. Local no-auth discovery needs no stored credential; `/login sglang` stores only a supplied API key, and discovery-only SGLang catalogs are never bundled into release defaults.
