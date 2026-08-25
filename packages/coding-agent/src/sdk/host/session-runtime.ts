@@ -3137,11 +3137,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
 	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
+	const fallbackSessionManagerIdentities = new WeakMap<object, string>();
+	const ambiguousLifecycleIdentities = new Set<string>();
 	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
-		const sessionFile = ctx.sessionManager.getSessionFile?.();
-		if (!sessionFile) return undefined;
-		return `${sessionId}\u0000${sessionFile}`;
+		if (ctx.sessionManager.getSessionFile !== undefined) {
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			if (!sessionFile) return undefined;
+			return `${sessionId}\u0000${sessionFile}`;
+		}
+		return fallbackSessionManagerIdentities.get(ctx.sessionManager);
 	};
 	const lifecycleStateForContext = (
 		ctx: ExtensionContext,
@@ -3154,9 +3159,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			owner => owner.sessionIdentity === sessionIdentity,
 		);
 		if (type !== "agent_start") {
+			if (ambiguousLifecycleIdentities.has(sessionIdentity)) return undefined;
 			const delayedOwner = retired.find(owner => owner.openLifecycleBatches.length > 0);
 			if (delayedOwner) {
-				if (active?.sessionIdentity === sessionIdentity && active.openLifecycleBatches.length > 0) return undefined;
+				if (active?.sessionIdentity === sessionIdentity && active.openLifecycleBatches.length > 0) {
+					ambiguousLifecycleIdentities.add(sessionIdentity);
+					return undefined;
+				}
 				return delayedOwner;
 			}
 		}
@@ -3715,6 +3724,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
 			resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
 		const sessionIdentity = `${sessionId}\u0000${sessionFile}`;
+		if (ctx.sessionManager.getSessionFile === undefined)
+			fallbackSessionManagerIdentities.set(ctx.sessionManager, sessionIdentity);
 		const reconciliationStore =
 			options.terminalAbortSeams?.getReconciliationStore?.() ??
 			createReconciliationStore({ sessionFile, sessionId });
