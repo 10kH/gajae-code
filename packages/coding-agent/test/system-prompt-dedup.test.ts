@@ -11,7 +11,7 @@ import {
 	loadProjectContextFiles,
 	loadSystemPromptFiles,
 } from "@gajae-code/coding-agent/system-prompt";
-import { getAgentDir } from "@gajae-code/utils";
+import { getAgentDir, resetAgentDirFromEnvironment } from "@gajae-code/utils";
 import { cleanupTempHome } from "./helpers/temp-home-cleanup";
 
 function escapeRegExp(text: string): string {
@@ -23,6 +23,8 @@ describe("SYSTEM.md prompt assembly", () => {
 	let tempHomeDir = "";
 	let agentDir = "";
 	let originalHome: string | undefined;
+	let originalAgentDir: string | undefined;
+	let originalPiAgentDir: string | undefined;
 
 	beforeEach(() => {
 		// Keep project-context fixtures outside the real user HOME even when
@@ -33,11 +35,30 @@ describe("SYSTEM.md prompt assembly", () => {
 		// Native user scope follows the selected profile, not a later HOME mutation.
 		agentDir = path.join(tempHomeDir, ".gjc", "agent");
 		originalHome = process.env.HOME;
+		originalAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		originalPiAgentDir = process.env.PI_CODING_AGENT_DIR;
 		process.env.HOME = tempHomeDir;
 		vi.spyOn(os, "homedir").mockReturnValue(tempHomeDir);
+		// Native user-scope follows GJC_CODING_AGENT_DIR / PI_CODING_AGENT_DIR,
+		// not mocked HOME. Redirect the process profile into this test's temp
+		// home so AGENTS.md fixtures cannot mutate a live developer profile.
+		const isolatedAgentDir = path.join(tempHomeDir, ".gjc", "agent");
+		fs.mkdirSync(isolatedAgentDir, { recursive: true });
+		process.env.GJC_CODING_AGENT_DIR = isolatedAgentDir;
+		delete process.env.PI_CODING_AGENT_DIR;
+		resetAgentDirFromEnvironment();
 	});
 
-	afterEach(cleanupTempHome(() => ({ tempDir, tempHomeDir, originalHome })));
+	afterEach(() => {
+		cleanupTempHome(() => ({
+			tempDir,
+			tempHomeDir,
+			originalHome,
+			originalAgentDir,
+			originalPiAgentDir,
+		}))();
+		vi.restoreAllMocks();
+	});
 
 	it("renders SYSTEM.md exactly once when it is used as the custom base prompt", async () => {
 		const projectDir = path.join(tempDir, "project");
