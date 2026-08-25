@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
+
 ## [0.15.1] - 2026-08-25
 - Display-safe escaped tool calls now require bounded raw escape-position/scalar evidence before the post-resample U+2014 exemption can execute. Printable ASCII escapes are retained too, so one-nibble mutations such as `\u00b7` → `\u0077` and `\u2026` → `\u0026` fail closed instead of disappearing after JSON decoding. Evidence carries only raw/decoded offsets, ordinals, location kinds, process-keyed scalar/path tags, a bounded total, and a process-local integrity tag; it is stripped before discarded, rejected, or executed calls can become durable. Exact decoded U+2014 positions/counts must correspond to the complete envelope. Overflow, malformed or duplicate-key JSON, missing/altered evidence, escaped keys, dotted-key ambiguity, excessive nesting, and every other scalar reject terminally. Existing resample/terminal debug records remain shape-only and never include argument payloads.
 - Escaped-non-ASCII turn discards and terminal per-call rejections are now logged at debug severity with bounded shape-only fields. Diagnostics distinguish managed policy handoff from in-loop resampling, type in-loop attempt/budget values as numbers, cap tool-call counts, and report only fixed booleans for registration/display-field contracts; tool names, call ids, arguments, steering text, and payload content never enter the log. The discarded turn never reaches durable history, so the defect previously left no trace anywhere except the surfaced tool error, and its fire rate could only be recovered by scraping session transcripts.

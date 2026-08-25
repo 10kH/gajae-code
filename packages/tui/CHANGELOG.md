@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
+
 ## [0.15.1] - 2026-08-25
 
 ### Fixed
