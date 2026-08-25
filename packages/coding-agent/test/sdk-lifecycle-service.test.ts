@@ -3,11 +3,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as brokerEnsure from "../src/sdk/broker/ensure";
+import { resolveSessionLocator } from "../src/sdk/broker/session-index";
+import { resolveScopeRequest } from "../src/sdk/broker/session-scope";
 import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClient } from "../src/sdk/client/client";
 import * as sdkDiscovery from "../src/sdk/client/discovery";
-import { resolveScopeRequest } from "../src/sdk/broker/session-scope";
-import { resolveSessionLocator } from "../src/sdk/broker/session-index";
 import {
 	AgentDirSessionLifecycleService,
 	deriveSessionLifecycleIdempotencyKey,

@@ -87,6 +87,7 @@ import {
 	READINESS_TIMEOUT_INVALID_MESSAGE,
 	startupQueueWaitMs,
 } from "./startup-budget";
+import { worktreeOccupant } from "./worktree-occupancy";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -3406,6 +3407,15 @@ function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorkt
 	};
 }
 
+/** Test seam for the worktree occupancy boundary. */
+export function worktreeOccupantForTest(
+	sessions: IndexedSession[],
+	worktreePath: string,
+	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
+): string | null {
+	return worktreeOccupant(sessions, worktreePath, observe);
+}
+
 function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
 	const prepared = ensureLaunchWorktree(plan);
 	if (!prepared.enabled || path.resolve(prepared.worktreePath) !== path.resolve(plan.worktreePath))
@@ -4211,6 +4221,14 @@ async function executeLifecycleResponse(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
+		if (launch.worktreePlan) {
+			const occupant = worktreeOccupant(broker.index.listSessions().sessions, launch.worktreePlan.worktreePath);
+			if (occupant && occupant !== launch.id)
+				return fail(
+					"worktree_in_use",
+					`The requested worktree is already held by session ${occupant}. Choose another worktree name or stop that session.`,
+				);
+		}
 		const effectMarker = randomUUID();
 		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
 		const effectIntent: LifecycleEffectIntentWithDeadline = {

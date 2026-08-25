@@ -2,7 +2,7 @@
  * Root command for the coding agent CLI.
  */
 
-import { APP_NAME, setProjectDir } from "@gajae-code/utils";
+import { APP_NAME, getAgentDir, setProjectDir } from "@gajae-code/utils";
 import { Args, Command } from "@gajae-code/utils/cli";
 import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
@@ -17,6 +17,8 @@ import {
 import { runRootCommand } from "../main";
 import { assertMasterLaunchArgs } from "../master-mode/context";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
+import { type IndexedSession, SessionIndex } from "../sdk/broker/session-index";
+import { worktreeOccupant } from "../sdk/broker/worktree-occupancy";
 
 export async function persistCoordinatorLaunchFailure(
 	error: unknown,
@@ -55,6 +57,22 @@ export async function persistCoordinatorLaunchFailure(
 			: {}),
 	};
 	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
+}
+
+async function assertLaunchWorktreeUnoccupied(worktree: PreparedLaunchWorktree["worktree"]): Promise<void> {
+	if (!worktree.enabled) return;
+	let sessions: readonly IndexedSession[];
+	try {
+		sessions = (await new SessionIndex(getAgentDir()).open()).listSessions().sessions;
+	} catch {
+		return;
+	}
+	const occupant = worktreeOccupant(sessions, worktree.worktreePath);
+	if (occupant)
+		throw new Error(
+			`worktree_in_use:${worktree.worktreePath} is already held by session ${occupant}. ` +
+				"Use gjc --worktree <name> for a separate checkout, or stop that session.",
+		);
 }
 
 export default class Index extends Command {
@@ -103,6 +121,7 @@ export default class Index extends Command {
 		let launch: PreparedLaunchWorktree;
 		try {
 			launch = prepareLaunchWorktree(process.cwd(), args);
+			await assertLaunchWorktreeUnoccupied(launch.worktree);
 		} catch (error) {
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;

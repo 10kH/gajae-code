@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
-import { brokerProcessIncarnation, type BrokerDiscovery, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SdkClient } from "../../src/sdk/client/client";
 import {
 	coordinatorFixtureRoot,

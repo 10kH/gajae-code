@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { createCoordinatorMcpServer } from "../../src/coordinator-mcp/server";
-import { brokerProcessIncarnation, type BrokerDiscovery, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
+import { type BrokerDiscovery, brokerProcessIncarnation, writeBrokerDiscovery } from "../../src/sdk/broker/discovery";
 import type { SessionIndex } from "../../src/sdk/broker/session-index";
 import type { SessionRouterClient } from "../../src/sdk/router";
 import { prepareExactSessionAuthority } from "../helpers/sdk-exact-session-authority";
