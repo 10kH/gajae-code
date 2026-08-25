@@ -273,6 +273,8 @@ export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 /** Receive-only compatibility capability for pre-v2 hosts. */
 export const LEGACY_TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
+/** Opts notification adapters into positioned-only delivery for matching live effects. */
+export const POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY = "positioned_notification_effects_v1";
 type ToolActivityCapability = "v1" | "v2";
 
 function negotiateToolActivityCapability(
@@ -5261,6 +5263,7 @@ export class TelegramNotificationDaemon {
 					ASK_SELECTED_ACK_CAPABILITY,
 					TOOL_ACTIVITY_CAPABILITY,
 					LEGACY_TOOL_ACTIVITY_CAPABILITY,
+					POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 					"ephemeral_turn_v1",
 				],
 			});

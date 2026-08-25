@@ -5,6 +5,8 @@
 ### Fixed
 
 - Foreground activity animation now uses layout-only TUI repaints, avoiding repeated reconstruction of unchanged transcript content during long sessions.
+- Notification adapters can now opt into one live representation per native effect: adapters that accept a positioned event are excluded from its matching raw fan-out, while ordinary direct SDK and raw-only legacy subscribers retain their existing delivery. Telegram opts in, preventing turn output, tool activity, and reasoning summaries from rendering twice after #4570; acknowledged terminal shutdown delivery is unchanged.
+- Lean notifications no longer replay a retained completion receipt at idle when identical text was already delivered immediately before an autonomous `ask`; distinct receipts and other settlement windows remain preserved.
 
 ## [0.15.2] - 2026-08-25
 

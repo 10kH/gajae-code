@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Notification frame fan-out can now exclude explicitly opted-in adapter connections that already accepted the matching positioned SDK event, preserving existing delivery for ordinary direct SDK and raw-only legacy subscribers.
+
 ## [0.15.2] - 2026-08-25
 
 ### Changed
