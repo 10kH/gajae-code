@@ -155,15 +155,6 @@ export const TIER_MAP_SKIP_LIST = {
 	"cursor/gemini-3.7-flash-medium": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
 	},
-	"google-antigravity/gemini-3.7-flash-high": {
-		rationale: "post-rebase catalog addition from dev; not yet curated",
-	},
-	"google-antigravity/gemini-3.7-flash-low": {
-		rationale: "post-rebase catalog addition from dev; not yet curated",
-	},
-	"google-antigravity/gemini-3.7-flash-medium": {
-		rationale: "post-rebase catalog addition from dev; not yet curated",
-	},
 	"google-antigravity/gemini-3.7-flash-tiered": {
 		rationale: "post-rebase catalog addition from dev; not yet curated",
 	},

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isRetiredModelKey } from "../src/model-retirements";
 import { Effort } from "../src/model-thinking";
 import type { GeneratedProvider } from "../src/models";
 import { getBundledModel, getBundledModels, getBundledProviders } from "../src/models";
@@ -122,6 +123,7 @@ describe("preset catalog model entries", () => {
 				if (!/gemini-3[.-]6-flash/.test(source.id)) continue;
 				if (source.id.endsWith("-minimal")) continue;
 				const siblingId = gemini37SiblingId(source.id);
+				if (isRetiredModelKey(provider, siblingId)) continue;
 				const sibling = getBundledModel(provider as GeneratedProvider, siblingId);
 				if (!sibling) {
 					missing.push(`${provider}/${siblingId}`);
@@ -146,9 +148,6 @@ describe("preset catalog model entries", () => {
 		const selectors = [
 			["google", "gemini-3.7-flash"],
 			["google-gemini-cli", "gemini-3.7-flash"],
-			["google-antigravity", "gemini-3.7-flash-high"],
-			["google-antigravity", "gemini-3.7-flash-low"],
-			["google-antigravity", "gemini-3.7-flash-medium"],
 			["google-antigravity", "gemini-3.7-flash-tiered"],
 			["opencode-zen", "gemini-3.7-flash"],
 		] as const;
