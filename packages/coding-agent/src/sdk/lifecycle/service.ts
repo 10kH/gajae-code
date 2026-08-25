@@ -817,6 +817,31 @@ export class SessionLifecycleService {
 					"malformed_response",
 					"lifecycle broker returned a malformed scoped list result",
 				);
+			const frozenScope = JSON.stringify(scope);
+			const frozenIndexSeq = result.indexSeq;
+			for (const page of pages) {
+				const pageScope = page.page.scope;
+				const pageObservedAt = page.page.observedAt;
+				if (
+					pageScope === undefined ||
+					pageObservedAt !== observedAt ||
+					page.page.result.indexSeq !== frozenIndexSeq ||
+					JSON.stringify(pageScope) !== frozenScope
+				)
+					return failure(
+						"session.list",
+						"uncertain",
+						"scope_observation_drift",
+						"lifecycle broker changed the frozen scope observation across list pages",
+					);
+			}
+			if (locallyResolvedScope && JSON.stringify(locallyResolvedScope) !== frozenScope)
+				return failure(
+					"session.list",
+					"uncertain",
+					"scope_observation_drift",
+					"lifecycle broker scope does not match the locally resolved request scope",
+				);
 			const rows = pages
 				.flatMap(page => page.page.result.sessions)
 				.map(entry => {

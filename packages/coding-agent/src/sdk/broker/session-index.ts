@@ -108,9 +108,11 @@ export async function resolveSessionLocator(cwd: string, stateRoot: string): Pro
 }
 
 function sessionLocatorV2(locator: unknown): locator is SessionLocatorV2 {
+	if (typeof locator !== "object" || locator === null || Array.isArray(locator)) return false;
+	const keys = Object.keys(locator);
+	if (keys.length !== 3 || !keys.every(key => key === "cwd" || key === "worktreeRoot" || key === "stateRoot"))
+		return false;
 	return (
-		typeof locator === "object" &&
-		locator !== null &&
 		typeof (locator as { cwd?: unknown }).cwd === "string" &&
 		(locator as { cwd: string }).cwd.length > 0 &&
 		(typeof (locator as { worktreeRoot?: unknown }).worktreeRoot === "string" ||

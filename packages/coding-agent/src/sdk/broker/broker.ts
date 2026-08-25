@@ -388,7 +388,7 @@ function parseSpawnInput(
 		input.attestationEpoch.length > 512 ||
 		typeof input.cwd !== "string" ||
 		input.cwd.length === 0 ||
-		(input.modelId !== undefined && (typeof input.modelId !== "string" || input.modelId.length === 0)) ||
+		(input.modelId !== undefined && (typeof input.modelId !== "string" || input.modelId.trim().length === 0)) ||
 		(input.modelPreset !== undefined && (typeof input.modelPreset !== "string" || input.modelPreset.length === 0))
 	)
 		return error("invalid_input", "session.spawn input is invalid");
@@ -398,7 +398,7 @@ function parseSpawnInput(
 		ownerSessionId: input.ownerSessionId,
 		attestationEpoch: input.attestationEpoch,
 		cwd: path.resolve(input.cwd),
-		...(typeof input.modelId === "string" ? { modelId: input.modelId } : {}),
+		...(typeof input.modelId === "string" ? { modelId: input.modelId.trim() } : {}),
 		...(typeof input.modelPreset === "string" ? { modelPreset: input.modelPreset } : {}),
 	};
 }
@@ -1224,6 +1224,18 @@ export class Broker {
 			if (admission.modelPreset !== undefined) {
 				const validated = validateBrokerModelPreset(this.settings.agentDir, admission.modelPreset);
 				if (isBrokerResponse(validated)) return finish(validated);
+				admission.modelPreset = validated;
+			}
+			// Resolve the explicit model pin at the broker host boundary before the
+			// durable claim. Raw selectors must never reach a launched child: a
+			// child can otherwise reject them only after substrate and lifecycle
+			// effects have already happened.
+			if (admission.modelId !== undefined) {
+				const resolved = await this.#resolveModelPin(admission.modelId, { cwd: admission.cwd });
+				if (!resolved.ok) return finish(error("unknown_model", resolved.error));
+				if (resolved.model === null)
+					return finish(error("unknown_model", "session.spawn modelId could not be resolved."));
+				admission.modelId = resolved.model;
 			}
 			const key = await getBrokerIdentityKey(this.settings.agentDir);
 			const bindingMac = createHmac("sha256", Buffer.from(key, "hex"))

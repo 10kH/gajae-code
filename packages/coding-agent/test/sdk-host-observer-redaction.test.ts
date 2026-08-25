@@ -25,9 +25,9 @@ describe("observed request redaction", () => {
 		};
 		expect(JSON.stringify(observed)).not.toContain("seed-task-plaintext");
 		expect(observed.input.text).toBe("[redacted 19 chars]");
-		expect(observed.input.clientRef).toBe("ref-1");
+		expect(observed.input.clientRef).toBe("[redacted 5 chars]");
 		expect(observed.operation).toBe("turn.prompt");
-		expect(observed.id).toBe("req-1");
+		expect(observed.id).toBe("[redacted 5 chars]");
 	});
 
 	it("is an allowlist: unlisted and nested fields cannot leak", () => {
@@ -55,7 +55,7 @@ describe("observed request redaction", () => {
 		]) {
 			expect(rendered).not.toContain(secret);
 		}
-		expect(observed.input.clientRef).toBe("ref-1");
+		expect(observed.input.clientRef).toBe("[redacted 5 chars]");
 	});
 
 	it("redacts every caller-content field without inventing absent ones", () => {
@@ -69,7 +69,7 @@ describe("observed request redaction", () => {
 		expect(rendered).not.toContain("arg-content");
 		expect(rendered).not.toContain("answer-content");
 		expect(observed.input.images).toBe("[redacted 2 items]");
-		expect(observed.input.name).toBe("demo");
+		expect(observed.input.name).toBe("[redacted 4 chars]");
 	});
 
 	it("redacts caller content at FRAME level, in the production frame shape", () => {
@@ -98,9 +98,9 @@ describe("observed request redaction", () => {
 		}
 		// Structural routing survives so instrumentation stays useful.
 		expect(observed.type).toBe("control_request");
-		expect(observed.id).toBe("req-9");
+		expect(observed.id).toBe("[redacted 5 chars]");
 		expect(observed.operation).toBe("session.spawn");
-		expect((observed.input as Record<string, unknown>).clientRef).toBe("ref-9");
+		expect((observed.input as Record<string, unknown>).clientRef).toBe("[redacted 5 chars]");
 	});
 
 	it("keeps confirm only when it is the structural boolean", () => {
@@ -149,6 +149,80 @@ describe("observed request redaction", () => {
 			input: Record<string, unknown>;
 		};
 		expect(JSON.stringify(observed)).not.toContain("broker-only");
-		expect(observed.input.sessionId).toBe("child");
+		expect(observed.input.sessionId).toBe("[redacted 5 chars]");
+	});
+
+	it("does not trust allowlisted scalar names or preserve caller-chosen values", () => {
+		const frame = {
+			type: "control_request",
+			id: "id-secret",
+			operation: "operation-secret",
+			query: "query-secret",
+			confirm: "confirm-secret",
+			input: {
+				clientRef: "client-ref-secret",
+				commandId: "command-secret",
+				turnId: "turn-secret",
+				sessionId: "session-secret",
+				expectedSessionId: "expected-session-secret",
+				mode: "mode-secret",
+				scope: "scope-secret",
+				kind: "kind-secret",
+				level: "level-secret",
+				on: "on-secret",
+				confirm: "input-confirm-secret",
+				name: "name-secret",
+				op: "op-secret",
+				id: "input-id-secret",
+			},
+		};
+		const rendered = JSON.stringify(redactObservedRequestContent(frame));
+		for (const secret of [
+			"id-secret",
+			"operation-secret",
+			"query-secret",
+			"confirm-secret",
+			"client-ref-secret",
+			"command-secret",
+			"turn-secret",
+			"session-secret",
+			"expected-session-secret",
+			"mode-secret",
+			"scope-secret",
+			"kind-secret",
+			"level-secret",
+			"on-secret",
+			"input-confirm-secret",
+			"name-secret",
+			"op-secret",
+			"input-id-secret",
+		]) {
+			expect(rendered).not.toContain(secret);
+		}
+	});
+
+	it("keeps only bounded protocol literals in scalar telemetry", () => {
+		const observed = redactObservedRequestContent({
+			type: "control_request",
+			operation: "turn.abort",
+			confirm: true,
+			input: { mode: "terminal", scope: "owned", kind: "prompt", level: "high", on: false },
+		});
+		expect(observed).toMatchObject({
+			type: "control_request",
+			operation: "turn.abort",
+			confirm: true,
+			input: { mode: "terminal", scope: "owned", kind: "prompt", level: "high", on: false },
+		});
+	});
+
+	it("bounds marker diagnostics for oversized caller values", () => {
+		const observed = redactObservedRequestContent({
+			type: "control_request",
+			operation: "turn.prompt",
+			input: { text: "x".repeat(100_000) },
+		});
+		expect((observed.input as Record<string, unknown>).text).toBe("[redacted 4096+ chars]");
+		expect(JSON.stringify(observed).length).toBeLessThan(256);
 	});
 });

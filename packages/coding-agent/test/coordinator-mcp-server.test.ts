@@ -330,7 +330,7 @@ async function createSdkControlServer(
 			if (session.live !== true) continue;
 			const sessionId = String(session.sessionId ?? session.session_id ?? "");
 			if (!sessionId) continue;
-			const declaredWorkspace = String((session.locator as Record<string, unknown> | undefined)?.repo ?? root);
+			const declaredWorkspace = String((session.locator as Record<string, unknown> | undefined)?.cwd ?? root);
 			const brokerWorkspace = (await serverOptions.canonicalizePath?.(declaredWorkspace)) ?? declaredWorkspace;
 			const recordFile = Bun.file(path.join(sessionsDirectory, `${sessionId}.json`));
 			const existing = (
@@ -2053,7 +2053,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 					);
 					brokerSessions.push({
 						sessionId: "created-session-1",
-						locator: { repo: root },
+						locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 						live: true,
 						endpointGeneration: 1,
 						pid: process.pid,
@@ -4494,7 +4494,7 @@ console.log(JSON.stringify(await appendCoordinatorEventForTest(${JSON.stringify(
 			[
 				{
 					sessionId: "visible-session",
-					locator: { repo: root },
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 					live: true,
 					endpointGeneration: 1,
 					pid: 101,
@@ -5551,9 +5551,24 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, [
-			{ sessionId: "alpha-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
-			{ sessionId: "beta-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
-			{ sessionId: "gamma-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{
+				sessionId: "alpha-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
+			{
+				sessionId: "beta-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
+			{
+				sessionId: "gamma-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
 		]);
 		for (const [sessionId, key] of [
 			["alpha-session", "register-empty-alpha"],
@@ -5589,8 +5604,18 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, [
-			{ sessionId: "alpha-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
-			{ sessionId: "zeta-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{
+				sessionId: "alpha-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
+			{
+				sessionId: "zeta-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
 		]);
 		for (const [sessionId, key] of [
 			["alpha-session", "register-alpha-ordering"],
@@ -5647,8 +5672,18 @@ describe("Coordinator MCP retained-delivery ordering", () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, [
-			{ sessionId: "alpha-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
-			{ sessionId: "beta-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{
+				sessionId: "alpha-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
+			{
+				sessionId: "beta-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
 		]);
 		for (const [sessionId, key] of [
 			["alpha-session", "register-aggregate-alpha"],
@@ -6673,9 +6708,24 @@ describe("Coordinator MCP deep-audit regressions", () => {
 				return { ok: true, page: { items: [], complete: false, revision: `fair-incomplete-${q12Calls}` } };
 			},
 			[
-				{ sessionId: "alpha-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
-				{ sessionId: "beta-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
-				{ sessionId: "gamma-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+				{
+					sessionId: "alpha-session",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+					endpointGeneration: 1,
+				},
+				{
+					sessionId: "beta-session",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+					endpointGeneration: 1,
+				},
+				{
+					sessionId: "gamma-session",
+					locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+					live: true,
+					endpointGeneration: 1,
+				},
 			],
 		);
 		for (const [sessionId, key] of [
@@ -7035,8 +7085,18 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		const root = await tempRoot();
 		const controls: SdkControl[] = [];
 		const server = await createSdkControlServer(root, controls, [], undefined, [
-			{ sessionId: "visible-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
-			{ sessionId: "other-session", locator: { repo: root }, live: true, endpointGeneration: 1 },
+			{
+				sessionId: "visible-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
+			{
+				sessionId: "other-session",
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
+				live: true,
+				endpointGeneration: 1,
+			},
 		]);
 		await registerSdkSession(server, root);
 		await server.callTool("gjc_coordinator_register_session", {
@@ -7159,7 +7219,7 @@ describe("Coordinator MCP deep-audit regressions", () => {
 		const brokerSessions = [
 			{
 				sessionId: "visible-session",
-				locator: { repo: root },
+				locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 				live: true,
 				endpointGeneration: 1,
 				pid: 101,

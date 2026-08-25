@@ -1799,6 +1799,31 @@ describe("SDK session index", () => {
 		expect(audit).toContain('"code":"rejected_legacy_locator"');
 		expect(audit).toContain('"sessionId":"legacy-session"');
 	});
+	it("quarantines mixed locator rows that retain a legacy repo key", async () => {
+		const dir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-mixed-locator-"));
+		const mixed = {
+			version: SDK_STATE_VERSION,
+			indexSeq: 1,
+			type: "host_registered" as const,
+			sessionId: "mixed-session",
+			locator: { cwd: dir, worktreeRoot: null, stateRoot: path.join(dir, ".gjc", "state"), repo: dir },
+			endpointGeneration: 1,
+			pid: process.pid,
+			ts: Date.now(),
+		};
+		const line = {
+			...mixed,
+			checksum: sessionIndexChecksum(mixed as unknown as Omit<SessionIndexEvent, "checksum">),
+		};
+		const sessionsDir = path.join(dir, "sdk", "sessions");
+		await fs.mkdir(sessionsDir, { recursive: true });
+		await fs.writeFile(path.join(sessionsDir, "index.jsonl"), `${JSON.stringify(line)}\n`);
+		const index = await new SessionIndex(dir).open();
+		expect(index.listSessions().sessions).toEqual([]);
+		expect(index.listSessions().warnings).toContain(
+			"Session mixed-session has a legacy locator row and must re-register.",
+		);
+	});
 	it("canonicalizes cwd and reports null worktree root outside Git", async () => {
 		const real = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-index-canonical-"));
 		const link = `${real}-link`;

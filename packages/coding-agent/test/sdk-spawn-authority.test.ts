@@ -15,6 +15,31 @@ import {
 const identityKey = "a".repeat(64);
 const bindingMac = "b".repeat(64);
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-authority-"));
+async function writeSpawnModelFixtures(agentDir: string): Promise<void> {
+	await fs.writeFile(
+		path.join(agentDir, "models.yml"),
+		"providers:\n" +
+			"  fixture-a:\n" +
+			"    baseUrl: http://127.0.0.1:1/v1\n" +
+			"    apiKey: fixture-key\n" +
+			"    api: openai-completions\n" +
+			"    models:\n" +
+			"      - id: shared\n" +
+			"        name: shared\n" +
+			"        contextWindow: 32768\n" +
+			"        maxTokens: 4096\n" +
+			"  fixture-b:\n" +
+			"    baseUrl: http://127.0.0.1:1/v1\n" +
+			"    apiKey: fixture-key\n" +
+			"    api: openai-completions\n" +
+			"    models:\n" +
+			"      - id: shared\n" +
+			"        name: shared\n" +
+			"        contextWindow: 32768\n" +
+			"        maxTokens: 4096\n",
+	);
+	await fs.writeFile(path.join(agentDir, "config.yml"), "modelProviderOrder:\n  - fixture-b\n");
+}
 
 const spawnSubstrateFake = {
 	launch: async () => ({
@@ -1284,6 +1309,133 @@ describe("Broker spawn close and orphan reaper", () => {
 			const journal = new SpawnAuthorityStore(agentDir, await getBrokerIdentityKey(agentDir));
 			await journal.open();
 			expect(journal.claims()).toHaveLength(0);
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("rejects an unknown model id before any claim, ledger, substrate, or seed effect", async () => {
+		const agentDir = await temp();
+		await writeSpawnModelFixtures(agentDir);
+		let launches = 0;
+		let dispatches = 0;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async () => {
+					launches += 1;
+					return {
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "unknown-model-provider",
+							pid: 990,
+							processIncarnation: "inc-990",
+						},
+					};
+				},
+				verify: async () => "verified" as const,
+				close: async () => ({ ok: true }),
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async () => ({ ok: false as const }),
+				dispatch: async () => {
+					dispatches += 1;
+					return { kind: "accepted" as const, commandId: "unused", turnId: "unused", acceptedAt: 1 };
+				},
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		await broker.start();
+		try {
+			const invalid = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), modelId: "   " },
+				"invalid-model-key",
+			);
+			expect(invalid).toMatchObject({ ok: false, error: { code: "invalid_input" } });
+			const response = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), modelId: "fixture/missing-model" },
+				"bad-model-key",
+			);
+			expect(response).toMatchObject({ ok: false, error: { code: "unknown_model" } });
+			expect(launches).toBe(0);
+			expect(dispatches).toBe(0);
+			const authorityJournal = Bun.file(path.join(agentDir, "sdk", "spawn-authority.jsonl"));
+			expect((await authorityJournal.exists()) ? (await authorityJournal.text()).trim() : "").toBe("");
+			const lifecycleLedger = Bun.file(path.join(agentDir, "sdk", "lifecycle-ledger.jsonl"));
+			expect((await lifecycleLedger.exists()) ? (await lifecycleLedger.text()).trim() : "").toBe("");
+		} finally {
+			await broker.stop();
+		}
+	});
+
+	it("canonicalizes an accepted model id before launch and preserves canonical replay identity", async () => {
+		const agentDir = await temp();
+		await writeSpawnModelFixtures(agentDir);
+		let launches = 0;
+		let launchModelId: string | undefined;
+		const broker = new Broker({
+			agentDir,
+			masterCapabilityVerifier: verifier,
+			spawnSubstrateProvider: {
+				launch: async spec => {
+					launches += 1;
+					const request = JSON.parse(spec.env?.GJC_SDK_LIFECYCLE_REQUEST ?? "{}") as { modelId?: string };
+					launchModelId = request.modelId;
+					return {
+						ok: true as const,
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "canonical-model-provider",
+							pid: 989,
+							processIncarnation: "inc-989",
+						},
+					};
+				},
+				verify: async () => "verified" as const,
+				close: async () => ({ ok: true }),
+			},
+			spawnPromptLayer: {
+				awaitRegistration: async (input: { childId: string; cwd: string; stateRoot: string }) => ({
+					ok: true as const,
+					registration: {
+						sessionId: input.childId,
+						endpointGeneration: 1,
+						pid: 989,
+						processIncarnation: "inc-989",
+						cwd: input.cwd,
+						stateRoot: input.stateRoot,
+					},
+				}),
+				dispatch: async () => ({
+					kind: "accepted" as const,
+					commandId: "cmd-canonical",
+					turnId: "turn-canonical",
+					acceptedAt: 1,
+				}),
+				reconcile: async () => ({ status: "unknown" as const }),
+			},
+		});
+		await broker.start();
+		try {
+			const first = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), modelId: "shared" },
+				"canonical-model-key",
+			);
+			expect(first).toMatchObject({ ok: true, result: { code: "spawn_accepted" } });
+			expect(launches).toBe(1);
+			expect(launchModelId).toBe("fixture-b/shared");
+			const replay = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), modelId: "fixture-b/shared" },
+				"canonical-model-key",
+			);
+			expect(replay).toMatchObject({ ok: true, result: { code: "spawn_replayed" } });
+			expect(launches).toBe(1);
 		} finally {
 			await broker.stop();
 		}

@@ -1,3 +1,5 @@
+import { findOperation } from "../../protocol/operation-registry";
+
 /**
  * Private field carried only on the Broker's endpoint close request.
  *
@@ -31,12 +33,14 @@ export function redactBrokerRuntimeCloseCapability(frame: Record<string, unknown
  * Frame-level keys an observer may see. `SdkFrame` is an open
  * `Record<string, unknown>` and `#observeRequest` runs BEFORE dispatch
  * validation, so an adversarial or malformed frame can carry content under any
- * top-level key. Only structural routing values survive. `idempotencyKey` is a
- * caller-chosen value and is deliberately absent; so are `cursor` (a signed
- * pagination token that can carry session/revision data) and `expectedRevision`
- * (no diagnostic consumer reads it).
+ * top-level key. Only structural routing values survive. `idempotencyKey`,
+ * `id`, and other correlation values are caller-chosen and are deliberately
+ * absent; so are `cursor` (a signed pagination token that can carry
+ * session/revision data) and `expectedRevision` (no diagnostic consumer reads
+ * it). Even allowlisted routing names are checked against their protocol
+ * values below: a field-name allowlist alone is fail-open for scalar secrets.
  */
-const OBSERVABLE_FRAME_FIELDS = new Set(["type", "id", "operation", "query"]);
+const OBSERVABLE_FRAME_FIELDS = new Set(["type", "operation", "query"]);
 
 /**
  * Frame keys whose value must match an exact expected type to survive.
@@ -45,42 +49,95 @@ const OBSERVABLE_FRAME_FIELDS = new Set(["type", "id", "operation", "query"]);
  */
 const OBSERVABLE_TYPED_FRAME_FIELDS: Readonly<Record<string, "boolean">> = { confirm: "boolean" };
 
+const OBSERVABLE_FRAME_LITERAL_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+	type: new Set(["control_request", "query_request"]),
+};
+
+const OBSERVER_MARKER_MAX_COUNT = 4096;
+
 /**
  * Input fields an observer may see. This is an ALLOWLIST on purpose: a
  * denylist is fail-open, so every unlisted or newly added field would leak by
  * default. Only structural routing/correlation values are preserved; all other
  * values are caller content and are replaced with a shape marker.
  */
-const OBSERVABLE_INPUT_FIELDS = new Set([
-	"clientRef",
-	"commandId",
-	"turnId",
-	"sessionId",
-	"expectedSessionId",
-	"mode",
-	"scope",
-	"kind",
-	"level",
-	"on",
-	"confirm",
-	"name",
-	"op",
-	"id",
-]);
+const OBSERVABLE_INPUT_FIELDS = new Set(["mode", "scope", "kind", "level", "on", "confirm"]);
+
+/**
+ * Input fields that carry a finite protocol value. Correlation identifiers,
+ * names, and operation arguments remain redacted even when they look like
+ * ordinary identifiers: callers are free to put arbitrary content in them.
+ */
+const OBSERVABLE_INPUT_LITERAL_FIELDS: Readonly<Record<string, ReadonlySet<string>>> = {
+	mode: new Set([
+		"turn",
+		"terminal",
+		"owned",
+		"allow",
+		"always-allow",
+		"deny",
+		"always-deny",
+		"prompt",
+		"all",
+		"one-at-a-time",
+		"immediate",
+		"wait",
+	]),
+	scope: new Set(["turn", "owned"]),
+	kind: new Set(["prompt", "skill"]),
+	level: new Set(["inherit", "off", "minimal", "low", "medium", "high", "xhigh", "max"]),
+};
+
+const OBSERVABLE_INPUT_TYPED_FIELDS: Readonly<Record<string, "boolean">> = {
+	on: "boolean",
+	confirm: "boolean",
+};
 
 /** Replaces caller content with a shape-preserving marker for observers. */
 function redactedContentMarker(value: unknown): string {
-	if (typeof value === "string") return `[redacted ${value.length} chars]`;
-	if (Array.isArray(value)) return `[redacted ${value.length} items]`;
-	if (value !== null && typeof value === "object") return `[redacted ${Object.keys(value).length} fields]`;
+	if (typeof value === "string") {
+		const count = Math.min(value.length, OBSERVER_MARKER_MAX_COUNT);
+		return `[redacted ${count}${value.length > count ? "+" : ""} chars]`;
+	}
+	if (Array.isArray(value)) {
+		const count = Math.min(value.length, OBSERVER_MARKER_MAX_COUNT);
+		return `[redacted ${count}${value.length > count ? "+" : ""} items]`;
+	}
+	if (value !== null && typeof value === "object") {
+		const fields = Object.keys(value).length;
+		const count = Math.min(fields, OBSERVER_MARKER_MAX_COUNT);
+		return `[redacted ${count}${fields > count ? "+" : ""} fields]`;
+	}
 	return "[redacted]";
+}
+
+function setObservedField(target: Record<string, unknown>, key: string, value: unknown): void {
+	Object.defineProperty(target, key, { configurable: true, enumerable: true, writable: true, value });
+}
+
+function observableFrameValue(key: string, value: unknown): unknown {
+	const requiredType = OBSERVABLE_TYPED_FRAME_FIELDS[key];
+	if (requiredType !== undefined) return typeof value === requiredType ? value : redactedContentMarker(value);
+	if (key === "operation" || key === "query") {
+		const known =
+			findOperation("control", String(value)) ??
+			findOperation("global", String(value)) ??
+			findOperation("query", String(value)) ??
+			findOperation("reverse", String(value));
+		return typeof value === "string" && value.length <= 128 && known !== undefined
+			? value
+			: redactedContentMarker(value);
+	}
+	const allowed = OBSERVABLE_FRAME_LITERAL_FIELDS[key];
+	return allowed?.has(typeof value === "string" ? value : "") ? value : redactedContentMarker(value);
 }
 
 /**
  * Strips caller content from a request frame before it reaches a diagnostic
- * observer. Operation, ids, and correlation fields survive so instrumentation
- * stays useful; everything else is redacted, including nested objects, so a
- * field this module has never heard of cannot leak.
+ * observer. Known protocol operation names and finite enum values survive so
+ * instrumentation stays useful; caller-chosen ids and all other values are
+ * redacted, including nested objects, so a field this module has never heard
+ * of cannot leak.
  */
 export function redactObservedRequestContent(frame: Record<string, unknown>): Record<string, unknown> {
 	const observed: Record<string, unknown> = {};
@@ -90,20 +147,22 @@ export function redactObservedRequestContent(frame: Record<string, unknown>): Re
 			const input = record(value);
 			// A non-record payload is content, not "nothing to redact". Returning
 			// early here would hand a string or array `input` through verbatim.
-			observed.input = input === undefined ? redactedContentMarker(value) : redactObservedInput(input);
+			setObservedField(
+				observed,
+				key,
+				input === undefined ? redactedContentMarker(value) : redactObservedInput(input),
+			);
 			continue;
 		}
 		// Structural routing scalars survive; every other top-level key, including
 		// one this module has never heard of, is redacted.
-		const requiredType = OBSERVABLE_TYPED_FRAME_FIELDS[key];
-		if (requiredType !== undefined) {
-			observed[key] = typeof value === requiredType ? value : redactedContentMarker(value);
-			continue;
-		}
-		observed[key] =
-			OBSERVABLE_FRAME_FIELDS.has(key) && (value === null || typeof value !== "object")
-				? value
-				: redactedContentMarker(value);
+		setObservedField(
+			observed,
+			key,
+			OBSERVABLE_FRAME_FIELDS.has(key) || Object.hasOwn(OBSERVABLE_TYPED_FRAME_FIELDS, key)
+				? observableFrameValue(key, value)
+				: redactedContentMarker(value),
+		);
 	}
 	return observed;
 }
@@ -113,12 +172,21 @@ function redactObservedInput(input: Record<string, unknown>): Record<string, unk
 	const redacted: Record<string, unknown> = {};
 	for (const [field, value] of Object.entries(input)) {
 		if (value === undefined) continue;
-		// A scalar routing field is safe; an object or array under an allowlisted
-		// name still gets redacted, because nesting is where content hides.
-		redacted[field] =
-			OBSERVABLE_INPUT_FIELDS.has(field) && (value === null || typeof value !== "object")
+		const requiredType = OBSERVABLE_INPUT_TYPED_FIELDS[field];
+		if (requiredType !== undefined) {
+			setObservedField(redacted, field, typeof value === requiredType ? value : redactedContentMarker(value));
+			continue;
+		}
+		const allowed = OBSERVABLE_INPUT_LITERAL_FIELDS[field];
+		// A finite protocol value is safe; every caller-chosen scalar, including
+		// an allowlisted field with a forged string, is content and is redacted.
+		setObservedField(
+			redacted,
+			field,
+			OBSERVABLE_INPUT_FIELDS.has(field) && allowed?.has(typeof value === "string" ? value : "")
 				? value
-				: redactedContentMarker(value);
+				: redactedContentMarker(value),
+		);
 	}
 	return redacted;
 }
