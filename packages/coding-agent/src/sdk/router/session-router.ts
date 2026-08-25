@@ -9,7 +9,7 @@ import {
 	type SessionIndex,
 } from "../broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClient, type SdkDispatchContext, type SdkDispatchHandler } from "../client/client";
+import { SdkClient, SdkClientError, type SdkDispatchContext, type SdkDispatchHandler } from "../client/client";
 import { readSdkBrokerDiscovery, readSdkSessionEndpoint, type SdkSessionEndpoint } from "../client/discovery";
 import {
 	type ActivatedPreparedSession,
@@ -215,6 +215,8 @@ export interface SessionRouterDeps {
 	clearTimeout?: typeof clearTimeout;
 	/** Test seam for the idle liveness-sweep cadence (#4689). */
 	idleSweepMs?: number;
+	/** Test seam for the bounded initial attach pass. */
+	startupAttachBudgetMs?: number;
 }
 
 export type SessionRouterProviderDeps = Pick<
@@ -301,11 +303,41 @@ type AttachedSession = {
 	dispose: () => void;
 };
 
+/**
+ * True when the transport dispatched the frame and the peer never answered it.
+ *
+ * `SdkClient` mints `uncertain_after_send` exactly for a request whose frame
+ * reached the socket before its budget lapsed or the connection dropped, which
+ * is the signature of a live listener with a stalled event loop. The attach-path
+ * replay treats it as definitive for that pass instead of retrying, because an
+ * identical retry has nothing new to observe.
+ */
+function isUnansweredAfterDispatch(error: unknown): boolean {
+	return error instanceof SdkClientError && error.code === "uncertain_after_send";
+}
+
 const REPLAY_BARRIER_LIMIT = 1_024;
 const REPLAY_RETRY_ATTEMPTS = 3;
 const REPLAY_RETRY_BACKOFF_MS = 100;
 const DELIVERY_ATTEMPT_LIMIT = 3;
 const ATTACH_CONCURRENCY = 4;
+/**
+ * How long `start()` waits for the initial attach pass before returning.
+ *
+ * A session host whose listener accepts while its loop never serves answers
+ * nothing, and the initial pass is what `start()` awaits, so startup used to
+ * cost the sum of every such session's request budget: 40.7s of a 40.9s
+ * measured startup for ONE wedged host, against callers that allow 10s.
+ *
+ * A per-request cap is the wrong instrument — a host settling a cancellation
+ * grace is legitimately slow to answer a replay, and cutting it there fails a
+ * barrier that flow depends on. So the budget is on the pass, not the frame:
+ * the pass keeps running to completion in the background (it is serialized on
+ * the reconcile tail like every other pass, and the 2s tick converges after
+ * it), while `start()` stops blocking the caller on stragglers. Attachments
+ * that answered are already published and usable when this lapses.
+ */
+const STARTUP_ATTACH_BUDGET_MS = 5_000;
 const ATTACH_CONNECT_TIMEOUT_MS = 10_000;
 const NOTIFICATION_WORK_TIMEOUT_MS = 5_000;
 /**
@@ -513,7 +545,19 @@ export class SessionRouter {
 			// Forced passes must not reopen the index repeatedly, but startup still
 			// needs the one-time open/replay boundary for compacted indexes.
 			await this.#index.open();
-			await this.#serialReconcile(runEpoch, false, true);
+			// Startup keeps its settled contract for every host that answers within
+			// STARTUP_ATTACH_BUDGET_MS: those attachments are published with their
+			// initial replay delivered. Past that budget the pass continues in the
+			// background instead of owning the caller's deadline.
+			const initialPass = this.#serialReconcile(runEpoch, false, true);
+			const settled = await Promise.race([
+				initialPass.then(() => true),
+				Bun.sleep(this.#deps.startupAttachBudgetMs ?? STARTUP_ATTACH_BUDGET_MS).then(() => false),
+			]);
+			if (!settled)
+				void initialPass.catch(error =>
+					logger.warn(`SDK session Router initial reconciliation failed after startup returned: ${String(error)}`),
+				);
 			if (!this.#running(runEpoch)) return;
 			const timer = (this.#deps.setInterval ?? setInterval)(
 				() => this.#schedule(this.#serialReconcile(runEpoch, true)),
@@ -2007,7 +2051,20 @@ export class SessionRouter {
 					if (outcome.kind === "stopped") return;
 					replay = outcome.value;
 					break;
-				} catch {
+				} catch (error) {
+					// A host that took the frame and never answered will not answer an
+					// identical retry: the socket is up and its loop is not serving.
+					// Retrying here multiplies one request budget by the whole ladder
+					// INSIDE the attach pass that `start()` awaits, so a single wedged
+					// session stalls Router startup past every caller's budget (a real
+					// 4-attempt × 10s stall measured against a spinning session host).
+					// Fail the barrier on the first such outcome and let the 2s tick
+					// re-attach: a failed barrier already forces the full reconcile body
+					// (#4689). Pre-dispatch failures stay on the retry ladder.
+					if (isUnansweredAfterDispatch(error)) {
+						this.#failBarrier(attached, "replay went unanswered by a live transport");
+						return;
+					}
 					if (attempt >= REPLAY_RETRY_ATTEMPTS) {
 						this.#failBarrier(attached, "replay went unanswered");
 						return;
