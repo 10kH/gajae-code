@@ -6,6 +6,8 @@ import * as brokerEnsure from "../src/sdk/broker/ensure";
 import { lifecycleRequestTimeoutMs } from "../src/sdk/broker/startup-budget";
 import { SdkClient } from "../src/sdk/client/client";
 import * as sdkDiscovery from "../src/sdk/client/discovery";
+import { resolveScopeRequest } from "../src/sdk/broker/session-scope";
+import { resolveSessionLocator } from "../src/sdk/broker/session-index";
 import {
 	AgentDirSessionLifecycleService,
 	deriveSessionLifecycleIdempotencyKey,
@@ -184,6 +186,35 @@ describe("SessionLifecycleService", () => {
 			{ operation: "session.list", input: {}, options: {} },
 			{ operation: "session.list", input: { cursor: "page-2" }, options: {} },
 		]);
+	});
+	it("rejects scoped pagination when a later page drifts from the frozen observation", async () => {
+		const { service, client } = serviceWith();
+		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
+		const scopeRequest = {
+			version: 1 as const,
+			requested: "global" as const,
+			requestAnchor: { cwd: anchor.cwd, worktreeRoot: anchor.worktreeRoot },
+		};
+		const scope = await resolveScopeRequest(scopeRequest);
+		client.responses.push(
+			{
+				ok: true,
+				result: {
+					indexSeq: 7,
+					sessions: [],
+					warnings: [],
+					scope,
+					observedAt: "2026-08-25T03:00:00.000Z",
+					continuationCursor: "next",
+				},
+			},
+			{
+				ok: true,
+				result: { indexSeq: 8, sessions: [], warnings: [], scope, observedAt: "2026-08-25T03:00:01.000Z" },
+			},
+		);
+		const result = await service.list({ actor, capability: "session.list", target: { scope: scopeRequest } });
+		expect(result).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "scope_observation_drift" } });
 	});
 	it("fails safely when a Broker list cursor repeats", async () => {
 		const { service, client } = serviceWith();
