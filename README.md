@@ -294,7 +294,7 @@ Need event-driven fan-out across many worktrees instead of one session at a time
 [Coordinator MCP bridge](docs/hermes-mcp-bridge.md) (`gjc mcp-serve coordinator`, installed by
 `gjc setup hermes`) exposes the delegation tools for that shape.
 
-- [External controller / bot integration guide](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar
+- [External controller / bot integration guide](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar and the `/aside` composer command
 - [SDK session CLI](docs/sdk-session-cli.md) · [SDK & wire protocol](docs/sdk.md) · [SDK app guide](docs/sdk-app-guide.md) · [External-control readiness](docs/external-control-readiness.md)
 
 ---

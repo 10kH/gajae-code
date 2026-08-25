@@ -293,7 +293,7 @@ endpoint records or credentials under .gjc/state/sdk, never open a raw session W
 1 セッションずつではなく多くのワークツリーへイベント駆動で展開する必要がある場合、ネイティブの
 [Coordinator MCP ブリッジ](docs/hermes-mcp-bridge.md)（`gjc mcp-serve coordinator`、`gjc setup hermes` でインストール）が、その形の委任ツールを提供します。
 
-- [外部コントローラ / bot 統合ガイド](docs/bot-integration.md) — プロバイダ非依存のスモーク。[`docs/aside-integration.md`](docs/aside-integration.md) はオプトインの検索/コンテキストサイドカーを扱います
+- [外部コントローラ / bot 統合ガイド](docs/bot-integration.md) — プロバイダ非依存のスモーク。[`docs/aside-integration.md`](docs/aside-integration.md) はオプトインの検索/コンテキストサイドカーと `/aside` コンポーザーコマンドを扱います
 - [SDK session CLI](docs/sdk-session-cli.md) · [SDK とワイヤプロトコル](docs/sdk.md) · [SDK アプリガイド](docs/sdk-app-guide.md) · [外部制御レディネス](docs/external-control-readiness.md)
 
 ---
