@@ -540,7 +540,8 @@
 					"type": "string",
 					"enum": [
 						"en",
-						"ko"
+						"ko",
+						"ja"
 					],
 					"description": "Language for human-facing interactive UI text",
 					"default": "en"
