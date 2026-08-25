@@ -86,7 +86,6 @@ import {
 	READINESS_TIMEOUT_INVALID_MESSAGE,
 	startupQueueWaitMs,
 } from "./startup-budget";
-import { observeProcess, type ProcessObservation, worktreeOccupant } from "./worktree-occupancy";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -974,6 +973,42 @@ function processIncarnationForBroker(broker: BrokerIndex, pid: number): string |
 }
 function hasProcessIncarnationAuthority(): boolean {
 	return processIncarnation(process.pid) !== undefined;
+}
+
+type ProcessObservation = "alive" | "exited" | "uncertain";
+
+/** Only ESRCH or a changed, readable incarnation proves the owned process exited. */
+function observeProcess(
+	pid: number,
+	expectedIncarnation: string | undefined,
+	readIncarnation: (pid: number) => string | undefined = processIncarnation,
+): ProcessObservation {
+	if (process.platform === "win32") {
+		try {
+			const reference = nativeLifecycle().Process.fromPid(pid);
+			if (reference?.status() !== "running") return "exited";
+		} catch {
+			return "uncertain";
+		}
+		if (!expectedIncarnation) return "uncertain";
+		const actualIncarnation = readIncarnation(pid);
+		if (!actualIncarnation) return "uncertain";
+		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
+	}
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
+	}
+	if (process.platform === "linux") {
+		const probe = probeLinuxProcPidSync(pid);
+		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
+			return "exited";
+	}
+	if (!expectedIncarnation) return "uncertain";
+	const actualIncarnation = readIncarnation(pid);
+	if (!actualIncarnation) return "uncertain";
+	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
 }
 
 /** Test seam for the lifecycle-owned process observation boundary. */
@@ -3310,13 +3345,44 @@ function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorkt
 	};
 }
 
+/**
+ * The id of a session still occupying `worktreePath`, or null when it is free.
+ *
+ * `ensureLaunchWorktree` reuses an existing worktree without asking whether anyone
+ * is in it, and an unnamed launch derives its directory deterministically from the
+ * repository's current branch. Two concurrent sessions in one repository therefore
+ * land in the same checkout and overwrite each other's files with no error.
+ *
+ * Only a process observed as definitively exited releases the worktree. `uncertain`
+ * counts as occupied: refusing a launch is recoverable by picking another worktree
+ * name, whereas two live sessions sharing a checkout corrupts work already done.
+ */
+function worktreeOccupant(
+	broker: { index: { listSessions(): { sessions: IndexedSession[] } } },
+	worktreePath: string,
+	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
+): string | null {
+	// Session locators retain the lexical cwd supplied to the host, while a
+	// lifecycle worktree plan may arrive through a symlink. Compare physical
+	// identity where it exists, with resolveEquivalentPath's lexical fallback
+	// for paths that have not been created yet.
+	const target = resolveEquivalentPath(worktreePath);
+	for (const session of broker.index.listSessions().sessions) {
+		if (session.terminal || !session.live) continue;
+		if (resolveEquivalentPath(session.locator.repo) !== target) continue;
+		if (observe(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited") continue;
+		return session.sessionId;
+	}
+	return null;
+}
+
 /** Test seam for the worktree occupancy boundary. */
 export function worktreeOccupantForTest(
 	sessions: IndexedSession[],
 	worktreePath: string,
 	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
 ): string | null {
-	return worktreeOccupant(sessions, worktreePath, observe);
+	return worktreeOccupant({ index: { listSessions: () => ({ sessions }) } }, worktreePath, observe);
 }
 
 function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
@@ -4127,7 +4193,7 @@ async function executeLifecycleResponse(
 		// Refuse before any durable effect is recorded: a launch that cannot own its
 		// worktree should leave no ledger transition or child process behind.
 		if (launch.worktreePlan) {
-			const occupant = worktreeOccupant(broker.index.listSessions().sessions, launch.worktreePlan.worktreePath);
+			const occupant = worktreeOccupant(broker, launch.worktreePlan.worktreePath);
 			if (occupant && occupant !== launch.id)
 				return fail(
 					"worktree_in_use",

@@ -2,18 +2,13 @@
  * Root command for the coding agent CLI.
  */
 
-import { APP_NAME, getAgentDir, setProjectDir } from "@gajae-code/utils";
+import { APP_NAME, setProjectDir } from "@gajae-code/utils";
 import { Args, Command } from "@gajae-code/utils/cli";
 import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
 import { writeCoordinatorAtomic } from "../coordinator-mcp/durability";
 import { launchDefaultTmuxIfNeeded } from "../gjc-runtime/launch-tmux";
-import {
-	completeLaunchWorktree,
-	type GjcLaunchWorktreePlan,
-	type PreparedLaunchWorktree,
-	stageLaunchWorktree,
-} from "../gjc-runtime/launch-worktree";
+import { type PreparedLaunchWorktree, prepareLaunchWorktree } from "../gjc-runtime/launch-worktree";
 import {
 	GJC_COORDINATOR_SESSION_ID_ENV,
 	GJC_COORDINATOR_SESSION_STATE_FILE_ENV,
@@ -21,8 +16,6 @@ import {
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
-import { type IndexedSession, SessionIndex } from "../sdk/broker/session-index";
-import { worktreeOccupant } from "../sdk/broker/worktree-occupancy";
 
 export async function persistCoordinatorLaunchFailure(
 	error: unknown,
@@ -61,36 +54,6 @@ export async function persistCoordinatorLaunchFailure(
 			: {}),
 	};
 	await writeCoordinatorAtomic(stateFile, `${JSON.stringify(payload, null, 2)}\n`);
-}
-
-/**
- * Refuses to enter a worktree another live session still holds.
- *
- * The broker refuses its own lifecycle launches for this reason, but an
- * interactive `gjc --worktree` reaches the launch path directly. Without this,
- * a second terminal on the same repository silently joins the first session's
- * checkout, because an unnamed launch derives its directory deterministically
- * from the repository's current branch.
- *
- * Reading the session index costs a comparable amount to the git queries this
- * path already runs, and only on launches that are about to create or reuse a
- * worktree. An unreadable index is not evidence of an occupant, so it never
- * blocks a launch.
- */
-async function assertLaunchWorktreeUnoccupied(plan: GjcLaunchWorktreePlan | { enabled: false }): Promise<void> {
-	if (!plan.enabled) return;
-	let sessions: readonly IndexedSession[];
-	try {
-		sessions = (await new SessionIndex(getAgentDir()).open()).listSessions().sessions;
-	} catch {
-		return;
-	}
-	const occupant = worktreeOccupant(sessions, plan.worktreePath);
-	if (occupant)
-		throw new Error(
-			`worktree_in_use:${plan.worktreePath} is already held by session ${occupant}. ` +
-				"Use gjc --worktree <name> for a separate checkout, or stop that session.",
-		);
 }
 
 export default class Index extends Command {
@@ -137,9 +100,7 @@ export default class Index extends Command {
 
 		let launch: PreparedLaunchWorktree;
 		try {
-			const staged = stageLaunchWorktree(process.cwd(), args);
-			await assertLaunchWorktreeUnoccupied(staged.plan);
-			launch = completeLaunchWorktree(process.cwd(), staged);
+			launch = prepareLaunchWorktree(process.cwd(), args);
 		} catch (error) {
 			await persistCoordinatorLaunchFailure(error, process.cwd());
 			throw error;
