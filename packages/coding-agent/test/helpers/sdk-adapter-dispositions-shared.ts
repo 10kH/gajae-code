@@ -45,7 +45,7 @@ const parityRowsCache: ParityRow[] = (
 		rows: ParityRow[];
 	}
 ).rows;
-	expect(parityRowsCache).toHaveLength(588);
+expect(parityRowsCache).toHaveLength(588);
 
 export const parityPrefix: Record<Adapter, string> = {
 	telegram: "T",

@@ -739,7 +739,7 @@ describe("GJC tmux session management", () => {
 		expect(innerCommand).not.toContain("parent-session");
 		expect(innerCommand).not.toContain("untrusted-parent");
 		expect(innerCommand).toContain("BROKER_CHILD_ENV='enabled'");
-		expect(innerCommand).toContain("GJC_MANAGED_OWNER_COMMAND_JSON='[\"child-command\",\"--safe\"]'");
+		expect(innerCommand).toContain('GJC_MANAGED_OWNER_COMMAND_JSON=\'["child-command","--safe"]\'');
 		expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
 	});
 	it("refuses psmux before attach-session mutation", () => {

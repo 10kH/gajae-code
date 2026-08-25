@@ -1935,11 +1935,20 @@ describe("SDK broker identity and discovery", () => {
 				pid: process.pid,
 			});
 		}
-		const scope = { version: 1 as const, requested: "repo" as const, requestAnchor: { cwd: worktree, worktreeRoot: worktree } };
+		const scope = {
+			version: 1 as const,
+			requested: "repo" as const,
+			requestAnchor: { cwd: worktree, worktreeRoot: worktree },
+		};
 		const first = await broker.handleRequest("session.list", { scope, limit: 1 });
 		expect(first.ok).toBe(true);
 		if (!first.ok) return;
-		const firstResult = first.result as { scope: unknown; observedAt: string; continuationCursor?: string; sessions: unknown[] };
+		const firstResult = first.result as {
+			scope: unknown;
+			observedAt: string;
+			continuationCursor?: string;
+			sessions: unknown[];
+		};
 		expect(firstResult.sessions).toHaveLength(1);
 		expect(firstResult.continuationCursor).toBeString();
 		const mismatched = await broker.handleRequest("session.list", {

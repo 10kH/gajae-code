@@ -62,7 +62,6 @@ import {
 	type SdkStartupRollbackResult,
 	sanitizeSdkStartupMessage,
 } from "../startup-capability";
-import type { SessionLocatorV2 } from "./session-index";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
@@ -79,6 +78,7 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
+import type { SessionLocatorV2 } from "./session-index";
 import { type IndexedSession, isSessionAuthorityEligible } from "./session-index";
 import {
 	cancellableSleep,

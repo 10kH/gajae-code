@@ -12,7 +12,7 @@ const OTHER_WORKTREE = "/repos/app.gajae-code-worktrees/task-b-1a2b3c4d";
 function session(overrides: Partial<IndexedSession> & { sessionId: string; repo: string }): IndexedSession {
 	const { repo, ...rest } = overrides;
 	return {
-		locator: { repo, stateRoot: `${repo}/.gjc/state` },
+		locator: { cwd: repo, worktreeRoot: null, stateRoot: `${repo}/.gjc/state` },
 		endpointGeneration: 1,
 		pid: 4242,
 		live: true,

@@ -4,10 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getBundledModel } from "@gajae-code/ai";
 import { Settings } from "@gajae-code/coding-agent/config/settings";
-import {
-	assertMasterLaunchDisposition,
-	createMasterModeContext,
-} from "@gajae-code/coding-agent/master-mode/context";
+import { assertMasterLaunchDisposition, createMasterModeContext } from "@gajae-code/coding-agent/master-mode/context";
 import {
 	createMasterPeerSnapshotContributor,
 	MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
@@ -121,31 +118,35 @@ describe("master mode prompt integration", () => {
 describe("master peer snapshot contributor", () => {
 	const resultFor = (cwd: string, worktreeRoot: string | null): SessionListOutcome =>
 		({
-		ok: true as const,
-		operation: "session.list",
-		result: {
-			version: 1,
-			scope: {
+			ok: true as const,
+			operation: "session.list",
+			result: {
 				version: 1,
-				requested: "repo",
-				requestAnchor: { cwd, worktreeRoot },
-				resolved: worktreeRoot === null ? null : { kind: "repo", worktreeRoot },
-				resolution: worktreeRoot === null ? "not-in-git-worktree" : "resolved",
+				scope: {
+					version: 1,
+					requested: "repo",
+					requestAnchor: { cwd, worktreeRoot },
+					resolved: worktreeRoot === null ? null : { kind: "repo", worktreeRoot },
+					resolution: worktreeRoot === null ? "not-in-git-worktree" : "resolved",
+				},
+				status: worktreeRoot === null ? "not-in-git-worktree" : "populated",
+				observedAt: "2026-08-23T00:00:00.000Z",
+				indexSeq: 3,
+				rows:
+					worktreeRoot === null
+						? []
+						: [
+								{ id: "peer-b", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: true },
+								{
+									id: "master-owner",
+									locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` },
+									live: true,
+								},
+								{ id: "peer-a", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: false },
+							],
+				warnings: [],
 			},
-			status: worktreeRoot === null ? "not-in-git-worktree" : "populated",
-			observedAt: "2026-08-23T00:00:00.000Z",
-			indexSeq: 3,
-			rows:
-				worktreeRoot === null
-					? []
-					: [
-							{ id: "peer-b", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: true },
-							{ id: "master-owner", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: true },
-							{ id: "peer-a", locator: { cwd, worktreeRoot, stateRoot: `${cwd}/.gjc/state` }, live: false },
-						],
-			warnings: [],
-		},
-	}) as unknown as SessionListOutcome;
+		}) as unknown as SessionListOutcome;
 
 	it("collects once, excludes self, and skips after a persisted injection", async () => {
 		const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "gjc-master-contrib-")));
@@ -156,8 +157,9 @@ describe("master peer snapshot contributor", () => {
 			lifecycle: {
 				list: async request => {
 					listCalls += 1;
-					const scope = (request.target as { scope?: { requestAnchor?: { cwd: string; worktreeRoot: string | null } } })
-						.scope;
+					const scope = (
+						request.target as { scope?: { requestAnchor?: { cwd: string; worktreeRoot: string | null } } }
+					).scope;
 					return resultFor(scope?.requestAnchor?.cwd ?? cwd, scope?.requestAnchor?.worktreeRoot ?? null);
 				},
 			},

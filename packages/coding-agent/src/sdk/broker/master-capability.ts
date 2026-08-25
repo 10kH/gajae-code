@@ -1,7 +1,12 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { isSessionAuthorityEligible, type IndexedSession, type MasterRoleAttestationV2, type SessionIndex } from "./session-index";
+import {
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	type MasterRoleAttestationV2,
+	type SessionIndex,
+} from "./session-index";
 import type { MasterCapabilityVerifier } from "./spawn-authority";
 
 const MASTER_CAPABILITY_VERIFY_TIMEOUT_MS = 2_000;
@@ -176,7 +181,11 @@ async function verifyOverAttachment(input: {
 /** Creates the ephemeral effective-host verifier used by broker spawn admission. */
 export function createMasterCapabilityVerifier(index: SessionIndex): MasterCapabilityVerifier {
 	return {
-		async verifyMasterCapability(ownerSessionId: string, rawCapability: string, attestationEpoch: string): Promise<{ allowed: boolean }> {
+		async verifyMasterCapability(
+			ownerSessionId: string,
+			rawCapability: string,
+			attestationEpoch: string,
+		): Promise<{ allowed: boolean }> {
 			try {
 				await index.refresh();
 				const rows = index.listSessionIdentities();
@@ -188,7 +197,8 @@ export function createMasterCapabilityVerifier(index: SessionIndex): MasterCapab
 				if (!endpoint) return { allowed: false };
 				await index.refresh();
 				const current = index.listSessionIdentities().find(row => sameAttachment(attachment, row));
-				if (!current || !isEffectiveMasterHost(current, ownerSessionId, attestationEpoch)) return { allowed: false };
+				if (!current || !isEffectiveMasterHost(current, ownerSessionId, attestationEpoch))
+					return { allowed: false };
 				const nonce = randomBytes(32).toString("base64url");
 				const allowed = await verifyOverAttachment({
 					endpoint,
@@ -198,7 +208,10 @@ export function createMasterCapabilityVerifier(index: SessionIndex): MasterCapab
 				});
 				await index.refresh();
 				const after = index.listSessionIdentities().find(row => sameAttachment(attachment, row));
-				return { allowed: allowed && after !== undefined && isEffectiveMasterHost(after, ownerSessionId, attestationEpoch) };
+				return {
+					allowed:
+						allowed && after !== undefined && isEffectiveMasterHost(after, ownerSessionId, attestationEpoch),
+				};
 			} catch {
 				return { allowed: false };
 			}

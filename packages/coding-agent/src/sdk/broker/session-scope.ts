@@ -1,8 +1,4 @@
-import {
-	canonicalSessionCwd,
-	sessionWorktreeRoot,
-	type SessionLocatorV2,
-} from "./session-index";
+import { canonicalSessionCwd, type SessionLocatorV2, sessionWorktreeRoot } from "./session-index";
 
 export type ScopeNameV1 = "repo" | "pwd" | "global";
 
@@ -50,7 +46,9 @@ export class ScopeRequestValidationError extends Error {
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
-	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
 }
 
 /** Strictly validates the versioned request shape before canonical resolution. */
@@ -87,7 +85,14 @@ export function resolvedScopeV1(value: unknown): ResolvedScopeV1 | undefined {
 	if (
 		!request ||
 		(scope.resolution !== "resolved" && scope.resolution !== "not-in-git-worktree") ||
-		Object.keys(scope).some(key => key !== "version" && key !== "requested" && key !== "requestAnchor" && key !== "resolved" && key !== "resolution")
+		Object.keys(scope).some(
+			key =>
+				key !== "version" &&
+				key !== "requested" &&
+				key !== "requestAnchor" &&
+				key !== "resolved" &&
+				key !== "resolution",
+		)
 	)
 		return undefined;
 	const resolved = scope.resolved;
@@ -153,7 +158,10 @@ export function sdkSearchResultV1(value: unknown): SdkSearchResultV1 | undefined
 	if (
 		result?.version !== 1 ||
 		!scope ||
-		(result.status !== "populated" && result.status !== "empty" && result.status !== "not-in-git-worktree" && result.status !== "unavailable") ||
+		(result.status !== "populated" &&
+			result.status !== "empty" &&
+			result.status !== "not-in-git-worktree" &&
+			result.status !== "unavailable") ||
 		typeof result.observedAt !== "string" ||
 		!Array.isArray(result.rows) ||
 		!Array.isArray(result.warnings) ||
@@ -172,7 +180,8 @@ export function sdkSearchResultV1(value: unknown): SdkSearchResultV1 | undefined
 		)
 	)
 		return undefined;
-	if (result.status === "not-in-git-worktree" && (scope.resolved !== null || result.rows.length !== 0)) return undefined;
+	if (result.status === "not-in-git-worktree" && (scope.resolved !== null || result.rows.length !== 0))
+		return undefined;
 	const error = record(result.error);
 	if (
 		result.status === "unavailable" &&
@@ -202,7 +211,9 @@ export async function resolveScopeRequest(request: ScopeRequestV1): Promise<Reso
 	const cwd = await canonicalSessionCwd(request.requestAnchor.cwd);
 	const worktreeRoot = await sessionWorktreeRoot(cwd);
 	const suppliedWorktree =
-		request.requestAnchor.worktreeRoot === null ? null : await canonicalSessionCwd(request.requestAnchor.worktreeRoot);
+		request.requestAnchor.worktreeRoot === null
+			? null
+			: await canonicalSessionCwd(request.requestAnchor.worktreeRoot);
 	if (suppliedWorktree !== worktreeRoot)
 		throw new ScopeRequestValidationError("scope request anchor does not match its canonical worktree identity");
 	const requestAnchor = { cwd, worktreeRoot };
@@ -233,7 +244,10 @@ export async function resolveScopeRequest(request: ScopeRequestV1): Promise<Reso
 			};
 }
 
-export function scopeMatchesLocator(scope: ResolvedScopeV1, locator: Pick<SessionLocatorV2, "cwd" | "worktreeRoot">): boolean {
+export function scopeMatchesLocator(
+	scope: ResolvedScopeV1,
+	locator: Pick<SessionLocatorV2, "cwd" | "worktreeRoot">,
+): boolean {
 	if (scope.resolved === null) return false;
 	if (scope.resolved.kind === "global") return true;
 	if (scope.resolved.kind === "pwd") return locator.cwd === scope.resolved.cwd;

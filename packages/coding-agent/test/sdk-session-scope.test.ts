@@ -1,9 +1,8 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import path from "node:path";
-
-import { resolveScopeRequest } from "../src/sdk/broker/session-scope";
 import { resolveSessionLocator } from "../src/sdk/broker/session-index";
+import { resolveScopeRequest } from "../src/sdk/broker/session-scope";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-session-scope-"));
 

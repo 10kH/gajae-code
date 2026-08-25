@@ -48,9 +48,9 @@ import {
 } from "../../sdk/acp";
 import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
-import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { ensureBroker } from "../../sdk/broker/ensure";
 import { resolveSdkPackageAuthority } from "../../sdk/broker/runtime";
+import { canonicalSessionCwd } from "../../sdk/broker/session-index";
 import { SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";

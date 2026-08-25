@@ -2,12 +2,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ManagedTmuxLaunchProof } from "../src/gjc-runtime/tmux-sessions";
+import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
 import {
 	createSpawnSubstrateProvider,
 	type SpawnSubstrateProviderDependencies,
 } from "../src/sdk/broker/spawn-substrate";
-import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof } from "../src/sdk/broker/spawn-authority";
-import type { ManagedTmuxLaunchProof } from "../src/gjc-runtime/tmux-sessions";
 
 const temporaryDirectories: string[] = [];
 
@@ -62,7 +62,9 @@ function managedDependencies(
 }
 
 afterEach(async () => {
-	await Promise.all(temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
+	await Promise.all(
+		temporaryDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })),
+	);
 });
 
 describe("Broker spawn substrate provider", () => {
@@ -227,7 +229,8 @@ describe("Broker spawn substrate provider", () => {
 		const provider = createSpawnSubstrateProvider(
 			managedDependencies({
 				launchManaged: () => first,
-				verifyManaged: proof => (proof.name === first.name || proof.name === sibling.name ? "verified" : "mismatch"),
+				verifyManaged: proof =>
+					proof.name === first.name || proof.name === sibling.name ? "verified" : "mismatch",
 				closeManaged: async proof => {
 					closed.push(proof.name);
 				},

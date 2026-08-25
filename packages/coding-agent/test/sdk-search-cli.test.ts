@@ -1,14 +1,17 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-
-import { renderSdkSearchTable, runSdkSearch } from "../src/sdk/cli/session-cli";
 import type { SdkSearchResultV1 } from "../src/sdk/broker/session-scope";
-import { SessionLifecycleService, type SessionLifecycleClient } from "../src/sdk/lifecycle/service";
+import { renderSdkSearchTable, runSdkSearch } from "../src/sdk/cli/session-cli";
+import { type SessionLifecycleClient, SessionLifecycleService } from "../src/sdk/lifecycle/service";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-search-"));
 
-function envelope(root: string, status: SdkSearchResultV1["status"], rows: SdkSearchResultV1["rows"] = []): SdkSearchResultV1 {
+function envelope(
+	root: string,
+	status: SdkSearchResultV1["status"],
+	rows: SdkSearchResultV1["rows"] = [],
+): SdkSearchResultV1 {
 	return {
 		version: 1,
 		scope: {
@@ -64,7 +67,9 @@ test("search returns exactly the scoped envelope and probes only populated filte
 			{ repo: root },
 			() => {
 				const service = new SessionLifecycleService(new Client({ ok: true, result: {} }));
-				return Object.assign(service, { scopedList: async () => ({ ok: true as const, operation: "session.list" as const, result }) });
+				return Object.assign(service, {
+					scopedList: async () => ({ ok: true as const, operation: "session.list" as const, result }),
+				});
 			},
 			async (_agentDir, value) => {
 				probes++;
@@ -88,14 +93,22 @@ test("non-Git repo is successful and makes zero probes", async () => {
 			() => {
 				const result: SdkSearchResultV1 = {
 					version: 1,
-					scope: { version: 1, requested: "repo", requestAnchor: { cwd: root, worktreeRoot: null }, resolved: null, resolution: "not-in-git-worktree" },
+					scope: {
+						version: 1,
+						requested: "repo",
+						requestAnchor: { cwd: root, worktreeRoot: null },
+						resolved: null,
+						resolution: "not-in-git-worktree",
+					},
 					status: "not-in-git-worktree",
 					observedAt: "2026-08-23T12:00:00.000Z",
 					rows: [],
 					warnings: [],
 				};
 				const service = new SessionLifecycleService(new Client({ ok: true, result: {} }));
-				return Object.assign(service, { scopedList: async () => ({ ok: true as const, operation: "session.list" as const, result }) });
+				return Object.assign(service, {
+					scopedList: async () => ({ ok: true as const, operation: "session.list" as const, result }),
+				});
 			},
 			async (_agentDir, value) => {
 				probes++;
@@ -120,14 +133,22 @@ test("unavailable search prints a scoped redacted envelope and exits nonzero wit
 		let probes = 0;
 		const search = await runSdkSearch(
 			{ repo: root },
-			() => new SessionLifecycleService(new Client({ ok: false, error: { code: "unavailable", message: "fixture-endpoint-token" } })),
+			() =>
+				new SessionLifecycleService(
+					new Client({ ok: false, error: { code: "unavailable", message: "fixture-endpoint-token" } }),
+				),
 			async (_agentDir, value) => {
 				probes++;
 				return value;
 			},
 		);
 		expect(search.exitCode).toBe(1);
-		expect(search.result).toMatchObject({ version: 1, status: "unavailable", rows: [], error: { code: "unavailable" } });
+		expect(search.result).toMatchObject({
+			version: 1,
+			status: "unavailable",
+			rows: [],
+			error: { code: "unavailable" },
+		});
 		expect(probes).toBe(0);
 		expect(JSON.stringify(search.result)).not.toContain("fixture-endpoint-token");
 		expect(renderSdkSearchTable(search.result)).toContain("Status: unavailable");

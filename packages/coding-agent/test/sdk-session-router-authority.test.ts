@@ -1878,7 +1878,7 @@ describe("SessionRouter dispatch authority", () => {
 					sessions: [
 						{
 							sessionId,
-							locator: { repo, stateRoot },
+							locator: { cwd: repo, worktreeRoot: null, stateRoot },
 							endpointGeneration: 1,
 							pid: 42,
 							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
@@ -1986,7 +1986,7 @@ describe("SessionRouter dispatch authority", () => {
 					sessions: [
 						{
 							sessionId,
-							locator: { repo, stateRoot },
+							locator: { cwd: repo, worktreeRoot: null, stateRoot },
 							endpointGeneration: 1,
 							pid: 42,
 							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
@@ -2071,7 +2071,7 @@ describe("SessionRouter dispatch authority", () => {
 				sessions: [
 					{
 						sessionId,
-						locator: { repo, stateRoot },
+						locator: { cwd: repo, worktreeRoot: null, stateRoot },
 						endpointGeneration: 1,
 						pid: 42,
 						endpointMtimeMs: indexedMtimeMs,
@@ -2165,7 +2165,7 @@ describe("SessionRouter dispatch authority", () => {
 				sessions: [
 					{
 						sessionId,
-						locator: { repo, stateRoot },
+						locator: { cwd: repo, worktreeRoot: null, stateRoot },
 						endpointGeneration: 1,
 						pid: 42,
 						endpointMtimeMs: indexedMtimeMs,
@@ -2259,7 +2259,7 @@ describe("SessionRouter dispatch authority", () => {
 					sessions: [
 						{
 							sessionId,
-							locator: { repo, stateRoot },
+							locator: { cwd: repo, worktreeRoot: null, stateRoot },
 							endpointGeneration: 1,
 							// A pid that cannot be alive stands in for a dead host.
 							pid: degraded && transition === "dead-pid" ? 0x7ffffffe : 42,
@@ -2341,7 +2341,7 @@ describe("SessionRouter dispatch authority", () => {
 					sessions: [
 						{
 							sessionId,
-							locator: { repo, stateRoot },
+							locator: { cwd: repo, worktreeRoot: null, stateRoot },
 							endpointGeneration: 1,
 							pid: 42,
 							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
@@ -2420,7 +2420,7 @@ describe("SessionRouter dispatch authority", () => {
 					sessions: [
 						{
 							sessionId,
-							locator: { repo, stateRoot },
+							locator: { cwd: repo, worktreeRoot: null, stateRoot },
 							endpointGeneration: 1,
 							pid: 42,
 							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
@@ -2508,7 +2508,7 @@ describe("SessionRouter dispatch authority", () => {
 					sessions: [
 						{
 							sessionId,
-							locator: { repo, stateRoot },
+							locator: { cwd: repo, worktreeRoot: null, stateRoot },
 							endpointGeneration: 1,
 							pid: 42,
 							endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,

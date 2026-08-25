@@ -267,8 +267,8 @@ test("production ACP routes zero-session SDK globals through the broker adapter"
 });
 
 test("production ACP drains session.list continuation pages before returning sessions", async () => {
-	const pageOne = { sessionId: "page-one", locator: { cwd: "/workspace" , worktreeRoot: null}, live: true };
-	const pageTwo = { sessionId: "page-two", locator: { cwd: "/workspace" , worktreeRoot: null}, live: false };
+	const pageOne = { sessionId: "page-one", locator: { cwd: "/workspace", worktreeRoot: null }, live: true };
+	const pageTwo = { sessionId: "page-two", locator: { cwd: "/workspace", worktreeRoot: null }, live: false };
 	const fixture = await createSessionListBroker(input =>
 		input.cursor === undefined
 			? { ok: true, result: { sessions: [pageOne], continuationCursor: "page-2" } }
@@ -289,7 +289,7 @@ test("production ACP drains session.list continuation pages before returning ses
 });
 
 test("production ACP rejects an ok:false session.list continuation instead of returning page one", async () => {
-	const pageOne = { sessionId: "page-one", locator: { cwd: "/workspace" , worktreeRoot: null}, live: true };
+	const pageOne = { sessionId: "page-one", locator: { cwd: "/workspace", worktreeRoot: null }, live: true };
 	const fixture = await createSessionListBroker(input =>
 		input.cursor === undefined
 			? { ok: true, result: { sessions: [pageOne], continuationCursor: "page-2" } }
@@ -360,7 +360,7 @@ test("production ACP preserves lifecycle, turn, replay, and connection ownership
 	const cwd = path.join(directory, "workspace");
 	const token = "acp-contract-token";
 	const brokerSessions: Record<string, unknown>[] = [
-		{ sessionId: "owned-session", locator: { cwd: cwd , worktreeRoot: null}, live: true, endpointGeneration: 1 },
+		{ sessionId: "owned-session", locator: { cwd: cwd, worktreeRoot: null }, live: true, endpointGeneration: 1 },
 	];
 	const lifecycleInputs: Record<string, unknown>[] = [];
 	const brokerRequests: Record<string, unknown>[] = [];

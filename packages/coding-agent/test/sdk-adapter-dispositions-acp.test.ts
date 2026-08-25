@@ -9,6 +9,8 @@
  * Coverage is byte-identical to the original monolithic file's ACP loop.
  */
 import { expect, test } from "bun:test";
+import { AcpSdkAdapter } from "../src/sdk/acp";
+import type { SdkClient } from "../src/sdk/client";
 import {
 	adapterPrefix,
 	assertAcpRow,
@@ -16,8 +18,6 @@ import {
 	type MachineAdapter,
 	OPERATIONS,
 } from "./helpers/sdk-adapter-dispositions-shared";
-import { AcpSdkAdapter } from "../src/sdk/acp";
-import type { SdkClient } from "../src/sdk/client";
 
 const adapter: MachineAdapter = "acp";
 for (const operation of OPERATIONS) {

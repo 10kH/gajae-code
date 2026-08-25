@@ -2,9 +2,9 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
-import { repo } from "../../utils/git";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { withFileLock } from "../../config/file-lock";
+import { repo } from "../../utils/git";
 import { processIncarnation } from "./process-incarnation";
 import {
 	assertSupportedSnapshotVersion,

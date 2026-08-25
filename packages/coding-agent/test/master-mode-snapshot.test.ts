@@ -5,8 +5,8 @@ import * as path from "node:path";
 import {
 	collectMasterPeerSnapshot,
 	escapeMasterPeerSnapshotText,
-	renderMasterPeerSnapshot,
 	type MasterPeerSnapshotLifecycle,
+	renderMasterPeerSnapshot,
 } from "../src/master-mode/snapshot";
 import { resolveSessionLocator } from "../src/sdk/broker/session-index";
 import type { ResolvedScopeV1, SdkSearchResultV1 } from "../src/sdk/broker/session-scope";
@@ -157,7 +157,13 @@ test("collectMasterPeerSnapshot renders unavailable when Broker does not return 
 		certainty: "retryable",
 		error: { code: "unavailable", message: "broker search is unavailable" },
 	});
-	const snapshot = await collectMasterPeerSnapshot({ lifecycle, actor, ownerSessionId: "master", scope: "repo", requestAnchor: anchor });
+	const snapshot = await collectMasterPeerSnapshot({
+		lifecycle,
+		actor,
+		ownerSessionId: "master",
+		scope: "repo",
+		requestAnchor: anchor,
+	});
 	expect(snapshot).toMatchObject({ status: "unavailable", scope: scope(anchor), rows: [] });
 	expect(renderMasterPeerSnapshot(snapshot)).toContain("status: unavailable");
 });

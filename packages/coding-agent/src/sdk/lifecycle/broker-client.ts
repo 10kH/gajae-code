@@ -1,6 +1,7 @@
 import { logger } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
 import { SdkClient } from "../client/client";
+import { readSdkBrokerDiscovery } from "../client/discovery";
 import {
 	type SessionLifecycleClient,
 	type SessionLifecycleClientRequestOptions,

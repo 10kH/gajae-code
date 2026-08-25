@@ -999,35 +999,37 @@ export default class Sdk extends Command {
 		"gjc sdk serve --stdio | --socket <path> [--session <id>]; gjc sdk search [--scope repo|pwd|global] [--json] [--limit N] [--cursor ...]; gjc sdk spawn --cwd <dir> --prompt <task> (master only); gjc sdk session list|inspect|send|status|tail; gjc sdk guides refresh|list|show|status|trust";
 	static hidden = false;
 	static delegateHelp = true;
-	static args = { action: Args.string({ required: false, options: ["serve", "search", "spawn", "session", "guides"] }) };
+	static args = {
+		action: Args.string({ required: false, options: ["serve", "search", "spawn", "session", "guides"] }),
+	};
 	static flags = SdkServeHelp.flags;
 	async run(): Promise<void> {
 		const action = this.argv[0];
 		if (this.argv.includes("--help") || this.argv.includes("-h")) {
-		const helpAction =
-			action === "serve"
-				? "sdk serve"
-				: action === "search"
-					? "sdk search"
-					: action === "spawn"
-						? "sdk spawn"
-					: action === "session"
-						? "sdk session"
-						: action === "guides"
-							? "sdk guides"
-							: "sdk";
-		const helpCommand =
-			action === "serve"
-				? SdkServeHelp
-				: action === "search"
-					? SdkSearchCommand
-					: action === "spawn"
-						? SdkSpawnCommand
-					: action === "session"
-						? SdkSessionCommand
-						: action === "guides"
-							? SdkGuidesCommand
-							: Sdk;
+			const helpAction =
+				action === "serve"
+					? "sdk serve"
+					: action === "search"
+						? "sdk search"
+						: action === "spawn"
+							? "sdk spawn"
+							: action === "session"
+								? "sdk session"
+								: action === "guides"
+									? "sdk guides"
+									: "sdk";
+			const helpCommand =
+				action === "serve"
+					? SdkServeHelp
+					: action === "search"
+						? SdkSearchCommand
+						: action === "spawn"
+							? SdkSpawnCommand
+							: action === "session"
+								? SdkSessionCommand
+								: action === "guides"
+									? SdkGuidesCommand
+									: Sdk;
 			renderCommandHelp("gjc", helpAction, helpCommand);
 			return;
 		}
@@ -1069,7 +1071,9 @@ export default class Sdk extends Command {
 			packageGeneration: authority.generation,
 			packageVersion: authority.packageVersion,
 			installationIdentity: authority.installationIdentity,
-			masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get("sdk.masterOrphanGraceMs"),
+			masterOrphanGraceMs: (await Settings.loadForScope({ cwd: process.cwd(), agentDir })).get(
+				"sdk.masterOrphanGraceMs",
+			),
 			resolveDirectoryMigration: async cwd => {
 				const settings = await Settings.loadForScope({ cwd, agentDir });
 				try {

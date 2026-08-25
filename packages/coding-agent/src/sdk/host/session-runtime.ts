@@ -24,8 +24,8 @@ import {
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
 import { ensureBroker } from "../broker/ensure";
-import { resolveSessionLocator, SessionIndex, type MasterRoleAttestationV2 } from "../broker/session-index";
 import { processIncarnation } from "../broker/process-incarnation";
+import { type MasterRoleAttestationV2, resolveSessionLocator, SessionIndex } from "../broker/session-index";
 import {
 	collectAuthenticatedProfileProviders,
 	parseSyntheticModelId,
@@ -4066,8 +4066,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							.mtimeMs;
 						const direct = index
 							.listSessionIdentities()
-							.find(row => row.sessionId === input.sessionId && row.endpointGeneration === 0 && row.pid === process.pid)
-							?.masterRole;
+							.find(
+								row =>
+									row.sessionId === input.sessionId && row.endpointGeneration === 0 && row.pid === process.pid,
+							)?.masterRole;
 						const effectiveIncarnation = processIncarnation(process.pid);
 						const masterRole = masterAttestationForEffectiveHost({
 							masterCapability: options.masterCapability,

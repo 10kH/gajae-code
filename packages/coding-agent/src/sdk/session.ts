@@ -118,7 +118,9 @@ import { normalizePluginHook } from "../hooks/normalize";
 import { initializeLocalRoot, LocalProtocolHandler, type LocalProtocolOptions } from "../internal-urls";
 import type { LspStartupServerInfo } from "../lsp";
 import { shutdownAll as shutdownAllLspClients } from "../lsp/client";
+import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
 import btwUserPrompt from "../prompts/system/btw-user.md" with { type: "text" };
+import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import asyncResultTemplate from "../prompts/tools/async-result.md" with { type: "text" };
 import { AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { createLazyService } from "../runtime/lazy-service";
@@ -158,10 +160,7 @@ import {
 	retireOwnedRegistrationsForEndpoint,
 	unregisterOwnedRegistration,
 } from "../session/terminal-abort";
-import { createMasterPeerSnapshotContributor, MASTER_PEER_SNAPSHOT_CUSTOM_TYPE } from "../master-mode/first-request";
-import masterModeTemplate from "../prompts/system/master-mode.md" with { type: "text" };
 import { formatNoModelsAvailableFallback } from "../setup/model-onboarding-guidance";
-import { createSessionLifecycleService } from "./lifecycle/client";
 import {
 	type BuildSystemPromptResult,
 	buildSystemPrompt as buildSystemPromptInternal,
@@ -190,6 +189,7 @@ import { guardToolForUltragoalAsk } from "../tools/ultragoal-ask-guard";
 import { EventBus } from "../utils/event-bus";
 import { buildNamedToolChoice, buildNamedToolChoiceResult } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
+import { createSessionLifecycleService } from "./lifecycle/client";
 import {
 	attachLifecycleStartupCapability,
 	lifecycleMcpStartupTimeoutOption,
@@ -4238,7 +4238,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									entry.type === "message" &&
 									(entry.message as { customType?: string }).customType === MASTER_PEER_SNAPSHOT_CUSTOM_TYPE,
 							),
-					onError: error => logger.debug("master peer snapshot injection failed", { error: safeErrorForLog(error) }),
+					onError: error =>
+						logger.debug("master peer snapshot injection failed", { error: safeErrorForLog(error) }),
 				}),
 			);
 		}

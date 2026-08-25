@@ -7,6 +7,13 @@ import type { Process } from "@gajae-code/natives";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { managedSecurityFailureClassification } from "../session/internal/managed-session-storage";
 import { readLinuxProcStartTime, readLinuxProcStartTimeSync } from "./linux-proc";
+import {
+	MANAGED_OWNER_COMMAND_ENV,
+	MANAGED_OWNER_INCARNATION_ENV,
+	MANAGED_OWNER_REDACT_COMMAND_ENV,
+	MANAGED_OWNER_RUN_ID_ENV,
+	MANAGED_OWNER_SUPERVISOR_ARG,
+} from "./managed-owner-supervisor";
 import { resolveGjcTmuxBinary } from "./psmux-detect";
 import { GJC_DIR, GJC_SESSION_PREFIX, tmuxRuntimeSessionPath } from "./session-layout";
 import {
@@ -69,13 +76,6 @@ import {
 	listGjcTmuxProviderAuthoritiesSync,
 } from "./tmux-provider-context";
 import { buildWindowsPowerShellInnerCommand } from "./windows-powershell-command";
-import {
-	MANAGED_OWNER_COMMAND_ENV,
-	MANAGED_OWNER_INCARNATION_ENV,
-	MANAGED_OWNER_REDACT_COMMAND_ENV,
-	MANAGED_OWNER_RUN_ID_ENV,
-	MANAGED_OWNER_SUPERVISOR_ARG,
-} from "./managed-owner-supervisor";
 
 export interface ManagedTmuxLaunchSpec {
 	childSessionId: string;
@@ -97,7 +97,9 @@ export interface ManagedTmuxLaunchProof {
 	psmuxIncarnation?: string;
 }
 
-function providerIdentity(provider: Pick<ProviderAuthority, "kind" | "command" | "namespace" | "executableIdentity">): string {
+function providerIdentity(
+	provider: Pick<ProviderAuthority, "kind" | "command" | "namespace" | "executableIdentity">,
+): string {
 	return JSON.stringify([provider.kind, provider.command, provider.namespace, provider.executableIdentity]);
 }
 
@@ -123,7 +125,8 @@ function validManagedLaunchSpec(spec: ManagedTmuxLaunchSpec, platform: NodeJS.Pl
 		spec.argv.every(value => typeof value === "string" && value.length > 0 && !value.includes("\0")) &&
 		(spec.env === undefined ||
 			Object.entries(spec.env).every(
-				([name, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && typeof value === "string" && !value.includes("\0"),
+				([name, value]) =>
+					/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && typeof value === "string" && !value.includes("\0"),
 			))
 	);
 }
@@ -601,10 +604,10 @@ export function createGjcTmuxSession(
 		[GJC_COORDINATOR_SESSION_STATE_FILE_ENV]: stateFile,
 		...(launch
 			? {
-				[MANAGED_OWNER_RUN_ID_ENV]: crypto.randomUUID(),
-				[MANAGED_OWNER_INCARNATION_ENV]: crypto.randomUUID(),
-				[MANAGED_OWNER_REDACT_COMMAND_ENV]: "1",
-			}
+					[MANAGED_OWNER_RUN_ID_ENV]: crypto.randomUUID(),
+					[MANAGED_OWNER_INCARNATION_ENV]: crypto.randomUUID(),
+					[MANAGED_OWNER_REDACT_COMMAND_ENV]: "1",
+				}
 			: {}),
 	};
 	const childEnvironment: Record<string, string> = { ...(launch?.env ?? {}), ...managedEnvironment };
@@ -620,12 +623,12 @@ export function createGjcTmuxSession(
 					},
 				})
 			: (() => {
-				const supervisorEnvironment = launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {};
-				const invocation = launch ? managedOwnerSupervisorArgv() : ["gjc"];
-				return `exec env ${Object.entries({ ...childEnvironment, ...supervisorEnvironment })
-					.map(([name, value]) => `${name}=${shellQuote(value)}`)
-					.join(" ")} ${invocation.map(shellQuote).join(" ")}`;
-			})();
+					const supervisorEnvironment = launch ? { [MANAGED_OWNER_COMMAND_ENV]: JSON.stringify(launch.argv) } : {};
+					const invocation = launch ? managedOwnerSupervisorArgv() : ["gjc"];
+					return `exec env ${Object.entries({ ...childEnvironment, ...supervisorEnvironment })
+						.map(([name, value]) => `${name}=${shellQuote(value)}`)
+						.join(" ")} ${invocation.map(shellQuote).join(" ")}`;
+				})();
 	const tmuxArgv = [
 		tmuxCommand,
 		...buildTmuxProviderCommand(provider, "new-session", [

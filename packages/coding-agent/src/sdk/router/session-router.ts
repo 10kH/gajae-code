@@ -4,10 +4,10 @@ import * as path from "node:path";
 import { logger, resolveEquivalentPath } from "@gajae-code/utils";
 import {
 	canonicalSessionCwd,
-	isSessionAuthorityEligible,
-	type IndexedSession,
-	resolveSessionLocator,
 	SessionIndex as DefaultSessionIndex,
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	resolveSessionLocator,
 	type SessionIndex,
 } from "../broker/session-index";
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";

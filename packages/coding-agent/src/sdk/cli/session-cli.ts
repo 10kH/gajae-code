@@ -1,13 +1,9 @@
 import { randomBytes } from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
-import { getAgentDir } from "@gajae-code/utils";
 import { replaceTabs, truncateToWidth } from "@gajae-code/tui";
+import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
-
-import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
-import { SdkClientError } from "../client";
-import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import { resolveSessionLocator } from "../broker/session-index";
 import {
 	resolveScopeRequest,
@@ -16,6 +12,9 @@ import {
 	type SdkSearchResultV1,
 	type SdkSearchRowV1,
 } from "../broker/session-scope";
+import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
+import { SdkClientError } from "../client";
+import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
 import type {
 	SessionLifecycleMutationRequest,
 	SessionLifecycleOperation,
@@ -103,7 +102,6 @@ const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
 const SEARCH_PROBE_TIMEOUT_MS = 2_000;
 const SEARCH_PROBE_MAX_ROWS = 100;
 const SEARCH_TEXT_WIDTH = 80;
-
 
 const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end"]);
 const START_TURN_KINDS = new Set(["turn_start", "agent_start"]);
@@ -406,7 +404,8 @@ function searchProbe(row: SdkSearchRowV1, router: SessionRouter): Promise<SdkSea
 }
 
 async function probeSearchRows(agentDir: string, result: SdkSearchResultV1): Promise<SdkSearchResultV1> {
-	if (result.status === "unavailable" || result.status === "not-in-git-worktree" || result.rows.length === 0) return result;
+	if (result.status === "unavailable" || result.status === "not-in-git-worktree" || result.rows.length === 0)
+		return result;
 	const rows = result.rows.slice(0, SEARCH_PROBE_MAX_ROWS);
 	try {
 		const probes = await withRouter(
@@ -497,7 +496,6 @@ export function renderSdkSearchTable(result: SdkSearchResultV1): string {
 }
 
 async function runList(agentDir: string): Promise<unknown> {
-
 	const listing = await sessionRows(agentDir);
 	return {
 		ok: true,
@@ -1105,7 +1103,11 @@ async function offlineTailReplay(
 	if (!outcome.ok)
 		throw new SdkSessionCliError(outcome.error.code, outcome.error.message, 1, { certainty: outcome.certainty });
 	if ("rows" in outcome.result)
-		throw new SdkSessionCliError("malformed_response", "broker returned a scoped result for retained transcript replay", 1);
+		throw new SdkSessionCliError(
+			"malformed_response",
+			"broker returned a scoped result for retained transcript replay",
+			1,
+		);
 	const savedSession = outcome.result.savedSession;
 	if (!savedSession)
 		throw new SdkSessionCliError(

@@ -1,11 +1,11 @@
 import {
-	resolveScopeRequest,
-	sdkSearchResultV1,
 	type ResolvedScopeV1,
+	resolveScopeRequest,
 	type ScopeNameV1,
 	type ScopeRequestV1,
 	type SdkSearchResultV1,
 	type SdkSearchRowV1,
+	sdkSearchResultV1,
 } from "../sdk/broker/session-scope";
 import type { SessionLifecycleActor, SessionListOutcome, SessionListRequest } from "../sdk/lifecycle/service";
 

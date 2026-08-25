@@ -9,6 +9,7 @@
  * Coverage is byte-identical to the original monolithic file's MCP loop.
  */
 import { expect, test } from "bun:test";
+import { createSdkMcpServer } from "../src/sdk/mcp";
 import {
 	adapterPrefix,
 	assertMcpRow,
@@ -16,7 +17,6 @@ import {
 	type MachineAdapter,
 	OPERATIONS,
 } from "./helpers/sdk-adapter-dispositions-shared";
-import { createSdkMcpServer } from "../src/sdk/mcp";
 
 const adapter: MachineAdapter = "mcp";
 for (const operation of OPERATIONS) {

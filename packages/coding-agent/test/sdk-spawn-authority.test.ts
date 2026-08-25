@@ -3,14 +3,14 @@ import { createHash, createHmac } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Broker } from "../src/sdk/broker/broker";
+import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import {
 	isSpawnClaimV2,
 	type SeedDeliveryV2,
 	SpawnAuthorityStore,
 	type SpawnClaimV2,
 } from "../src/sdk/broker/spawn-authority";
-import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
-import { Broker } from "../src/sdk/broker/broker";
 
 const identityKey = "a".repeat(64);
 const bindingMac = "b".repeat(64);
@@ -19,7 +19,12 @@ const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-authority-"));
 const spawnSubstrateFake = {
 	launch: async () => ({
 		ok: true as const,
-		proof: { substrateKind: "headless" as const, providerIdentity: "test-provider", pid: 4242, processIncarnation: "inc-4242" },
+		proof: {
+			substrateKind: "headless" as const,
+			providerIdentity: "test-provider",
+			pid: 4242,
+			processIncarnation: "inc-4242",
+		},
 	}),
 	verify: async () => "verified" as const,
 	close: async () => ({ ok: true }),
@@ -175,7 +180,17 @@ describe("SpawnAuthorityStore", () => {
 			updatedAt: 1,
 		};
 		expect(isSpawnClaimV2(base)).toBe(true);
-		for (const field of ["task", "prompt", "rawCapability", "taskDigest", "idempotencyKey", "fingerprint", "requestHash", "endpointCredential", "childStderr"])
+		for (const field of [
+			"task",
+			"prompt",
+			"rawCapability",
+			"taskDigest",
+			"idempotencyKey",
+			"fingerprint",
+			"requestHash",
+			"endpointCredential",
+			"childStderr",
+		])
 			expect(isSpawnClaimV2({ ...base, [field]: "forbidden" })).toBe(false);
 	});
 
@@ -189,17 +204,28 @@ describe("SpawnAuthorityStore", () => {
 				spawnSubstrateProvider: spawnSubstrateFake,
 				spawnPromptLayer: spawnPromptLayerFake,
 				masterCapabilityVerifier: {
-					verifyMasterCapability: async (_ownerSessionId, rawCapability, _attestationEpoch) => ({ allowed: rawCapability === capability }),
+					verifyMasterCapability: async (_ownerSessionId, rawCapability, _attestationEpoch) => ({
+						allowed: rawCapability === capability,
+					}),
 				},
 			});
 			await broker.start();
 			try {
 				const response = await broker.handleRequest(
 					"session.spawn",
-					{ task, masterCapability: capability, ownerSessionId: "master-1", attestationEpoch: "epoch-1", cwd: agentDir },
+					{
+						task,
+						masterCapability: capability,
+						ownerSessionId: "master-1",
+						attestationEpoch: "epoch-1",
+						cwd: agentDir,
+					},
 					"raw-idempotency-key",
 				);
-				expect(response).toMatchObject({ ok: true, result: { code: "spawn_accepted", seed: { phase: "accepted", status: "accepted" } } });
+				expect(response).toMatchObject({
+					ok: true,
+					result: { code: "spawn_accepted", seed: { phase: "accepted", status: "accepted" } },
+				});
 				const lookup = await broker.handleRequest(
 					"broker.lookup_lifecycle",
 					{ operation: "session.spawn", fingerprint: "not-a-spawn-fingerprint" },
@@ -250,7 +276,13 @@ describe("Broker spawn flow driver", () => {
 
 	it("fences every effect behind a durable transition and dispatches exactly once", async () => {
 		const agentDir = await temp();
-		const observed: { atLaunch?: string; atDispatch?: string; leaseAtDispatch?: string; launches: number; dispatches: number } = {
+		const observed: {
+			atLaunch?: string;
+			atDispatch?: string;
+			leaseAtDispatch?: string;
+			launches: number;
+			dispatches: number;
+		} = {
 			launches: 0,
 			dispatches: 0,
 		};
@@ -263,7 +295,12 @@ describe("Broker spawn flow driver", () => {
 					observed.atLaunch = (await latestClaim(agentDir))?.state;
 					return {
 						ok: true as const,
-						proof: { substrateKind: "headless" as const, providerIdentity: "flow-provider", pid: 999, processIncarnation: "inc-999" },
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "flow-provider",
+							pid: 999,
+							processIncarnation: "inc-999",
+						},
 					};
 				},
 				verify: async () => "verified" as const,
@@ -302,7 +339,11 @@ describe("Broker spawn flow driver", () => {
 			expect(success).toHaveLength(1);
 			expect(success[0]).toMatchObject({
 				ok: true,
-				result: { code: "spawn_accepted", substrateKind: "headless", seed: { phase: "accepted", commandId: "cmd-flow", turnId: "turn-flow" } },
+				result: {
+					code: "spawn_accepted",
+					substrateKind: "headless",
+					seed: { phase: "accepted", commandId: "cmd-flow", turnId: "turn-flow" },
+				},
 			});
 			expect(responses.find(response => !response.ok)).toMatchObject({
 				ok: false,
@@ -332,7 +373,12 @@ describe("Broker spawn flow driver", () => {
 			spawnSubstrateProvider: {
 				launch: async () => ({
 					ok: true as const,
-					proof: { substrateKind: "headless" as const, providerIdentity: "flow-provider", pid: 998, processIncarnation: "inc-998" },
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "flow-provider",
+						pid: 998,
+						processIncarnation: "inc-998",
+					},
 				}),
 				verify: async () => "verified" as const,
 				close: async () => ({ ok: true }),
@@ -384,7 +430,12 @@ describe("Broker spawn flow driver", () => {
 			spawnSubstrateProvider: {
 				launch: async () => ({
 					ok: true as const,
-					proof: { substrateKind: "headless" as const, providerIdentity: "flow-provider", pid: 997, processIncarnation: "inc-997" },
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "flow-provider",
+						pid: 997,
+						processIncarnation: "inc-997",
+					},
 				}),
 				verify: async () => "verified" as const,
 				close: async () => {
@@ -431,7 +482,12 @@ describe("Broker spawn flow driver", () => {
 			spawnSubstrateProvider: {
 				launch: async () => ({
 					ok: true as const,
-					proof: { substrateKind: "headless" as const, providerIdentity: "leak-provider", pid: 993, processIncarnation: "inc-993" },
+					proof: {
+						substrateKind: "headless" as const,
+						providerIdentity: "leak-provider",
+						pid: 993,
+						processIncarnation: "inc-993",
+					},
 				}),
 				verify: async () => "verified" as const,
 				close: async () => {
@@ -463,7 +519,7 @@ describe("Broker spawn flow driver", () => {
 		const brokerKey = await getBrokerIdentityKey(agentDir);
 		const store = new SpawnAuthorityStore(agentDir, brokerKey);
 		await store.open();
-		const mac = "c".repeat(63) + "d";
+		const mac = `${"c".repeat(63)}d`;
 		const owner = await store.claimOrJoin("partial", mac);
 		if (owner.kind !== "owner") throw new Error("expected owner");
 		await store.persistTransition("partial", {
@@ -507,7 +563,11 @@ describe("Broker spawn flow driver", () => {
 			agentDir,
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: {
-				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				launch: async () => ({
+					ok: false as const,
+					code: "substrate_unavailable" as const,
+					message: "no relaunch",
+				}),
 				verify: async () => "verified" as const,
 				close: async () => ({ ok: true }),
 			},
@@ -541,7 +601,7 @@ describe("Broker spawn flow driver", () => {
 		const brokerKey = await getBrokerIdentityKey(agentDir);
 		const store = new SpawnAuthorityStore(agentDir, brokerKey);
 		await store.open();
-		const mac = "b".repeat(63) + "c";
+		const mac = `${"b".repeat(63)}c`;
 		const owner = await store.claimOrJoin("collide", mac);
 		if (owner.kind !== "owner") throw new Error("expected owner");
 		await store.persistTransition("collide", {
@@ -592,7 +652,7 @@ describe("Broker spawn flow driver", () => {
 		const brokerKey = await getBrokerIdentityKey(agentDir);
 		const store = new SpawnAuthorityStore(agentDir, brokerKey);
 		await store.open();
-		const mac = "a".repeat(63) + "b";
+		const mac = `${"a".repeat(63)}b`;
 		const owner = await store.claimOrJoin("q26-pin", mac);
 		if (owner.kind !== "owner") throw new Error("expected owner");
 		await store.persistTransition("q26-pin", {
@@ -649,7 +709,11 @@ describe("Broker spawn flow driver", () => {
 			agentDir,
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: {
-				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				launch: async () => ({
+					ok: false as const,
+					code: "substrate_unavailable" as const,
+					message: "no relaunch",
+				}),
 				verify: async () => "verified" as const,
 				close: async () => ({ ok: true }),
 			},
@@ -733,7 +797,11 @@ describe("Broker spawn flow driver", () => {
 			agentDir,
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: {
-				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				launch: async () => ({
+					ok: false as const,
+					code: "substrate_unavailable" as const,
+					message: "no relaunch",
+				}),
 				verify: async () => "verified" as const,
 				close: async () => ({ ok: true }),
 			},
@@ -805,7 +873,11 @@ describe("Broker spawn flow driver", () => {
 			agentDir,
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: {
-				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				launch: async () => ({
+					ok: false as const,
+					code: "substrate_unavailable" as const,
+					message: "no relaunch",
+				}),
 				verify: async () => {
 					verifyCalls += 1;
 					return "mismatch" as const;
@@ -911,7 +983,11 @@ describe("Broker spawn flow driver", () => {
 			spawnSubstrateProvider: {
 				launch: async () => {
 					launches += 1;
-					return { ok: false as const, code: "substrate_unavailable" as const, message: "no launches during recovery" };
+					return {
+						ok: false as const,
+						code: "substrate_unavailable" as const,
+						message: "no launches during recovery",
+					};
 				},
 				verify: async () => "verified" as const,
 				close: async () => ({ ok: true }),
@@ -924,7 +1000,12 @@ describe("Broker spawn flow driver", () => {
 				},
 				reconcile: async (input: { clientRef: string }) => {
 					reconciled.push(input.clientRef);
-					return { status: "terminal_ok" as const, commandId: "cmd-recovered", turnId: "turn-recovered", acceptedAt: 42 };
+					return {
+						status: "terminal_ok" as const,
+						commandId: "cmd-recovered",
+						turnId: "turn-recovered",
+						acceptedAt: 42,
+					};
 				},
 			},
 		});
@@ -935,7 +1016,12 @@ describe("Broker spawn flow driver", () => {
 			expect(recovered.claim("recover-starting")?.state).toBe("uncertain");
 			const advanced = recovered.claim("recover-dispatching");
 			expect(advanced?.state).toBe("accepted");
-			expect(advanced?.seed).toMatchObject({ phase: "accepted", clientRef: "client-ref-q26", commandId: "cmd-recovered", turnId: "turn-recovered" });
+			expect(advanced?.seed).toMatchObject({
+				phase: "accepted",
+				clientRef: "client-ref-q26",
+				commandId: "cmd-recovered",
+				turnId: "turn-recovered",
+			});
 			expect(reconciled).toEqual(["client-ref-q26"]);
 			expect(launches).toBe(0);
 			expect(dispatchesAfterRestart).toBe(0);
@@ -959,7 +1045,12 @@ describe("Broker spawn close and orphan reaper", () => {
 		return {
 			launch: async () => ({
 				ok: true as const,
-				proof: { substrateKind: "headless" as const, providerIdentity: "close-provider", pid: 995, processIncarnation: "inc-995" },
+				proof: {
+					substrateKind: "headless" as const,
+					providerIdentity: "close-provider",
+					pid: 995,
+					processIncarnation: "inc-995",
+				},
 			}),
 			verify: async () => probe.verdict,
 			close: async () => {
@@ -980,7 +1071,12 @@ describe("Broker spawn close and orphan reaper", () => {
 				stateRoot: input.stateRoot,
 			},
 		}),
-		dispatch: async () => ({ kind: "accepted" as const, commandId: "cmd-close", turnId: "turn-close", acceptedAt: 5 }),
+		dispatch: async () => ({
+			kind: "accepted" as const,
+			commandId: "cmd-close",
+			turnId: "turn-close",
+			acceptedAt: 5,
+		}),
 		reconcile: async () => ({ status: "unknown" as const }),
 	};
 
@@ -1040,7 +1136,12 @@ describe("Broker spawn close and orphan reaper", () => {
 				spawnSubstrateProvider: {
 					launch: async () => ({
 						ok: true as const,
-						proof: { substrateKind: "headless" as const, providerIdentity: "leak-p", pid: 981, processIncarnation: "inc-981" },
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "leak-p",
+							pid: 981,
+							processIncarnation: "inc-981",
+						},
 					}),
 					verify: async () => "verified" as const,
 					close: async () => {
@@ -1115,7 +1216,11 @@ describe("Broker spawn close and orphan reaper", () => {
 			agentDir,
 			masterCapabilityVerifier: verifier,
 			spawnSubstrateProvider: {
-				launch: async () => ({ ok: false as const, code: "substrate_unavailable" as const, message: "no relaunch" }),
+				launch: async () => ({
+					ok: false as const,
+					code: "substrate_unavailable" as const,
+					message: "no relaunch",
+				}),
 				verify: async () => {
 					verifyCalls += 1;
 					throw new Error("verify transport failed");
@@ -1151,7 +1256,12 @@ describe("Broker spawn close and orphan reaper", () => {
 					launches += 1;
 					return {
 						ok: true as const,
-						proof: { substrateKind: "headless" as const, providerIdentity: "p", pid: 991, processIncarnation: "inc-991" },
+						proof: {
+							substrateKind: "headless" as const,
+							providerIdentity: "p",
+							pid: 991,
+							processIncarnation: "inc-991",
+						},
 					};
 				},
 				verify: async () => "verified" as const,

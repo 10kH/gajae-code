@@ -1783,13 +1783,18 @@ describe("SDK session index", () => {
 			pid: process.pid,
 			ts: Date.now(),
 		};
-		const line = { ...legacy, checksum: sessionIndexChecksum(legacy as unknown as Omit<SessionIndexEvent, "checksum">) };
+		const line = {
+			...legacy,
+			checksum: sessionIndexChecksum(legacy as unknown as Omit<SessionIndexEvent, "checksum">),
+		};
 		const sessionsDir = path.join(dir, "sdk", "sessions");
 		await fs.mkdir(sessionsDir, { recursive: true });
 		await fs.writeFile(path.join(sessionsDir, "index.jsonl"), `${JSON.stringify(line)}\n`);
 		const index = await new SessionIndex(dir).open();
 		expect(index.listSessions().sessions).toEqual([]);
-		expect(index.listSessions().warnings).toContain("Session legacy-session has a legacy locator row and must re-register.");
+		expect(index.listSessions().warnings).toContain(
+			"Session legacy-session has a legacy locator row and must re-register.",
+		);
 		const audit = await fs.readFile(path.join(sessionsDir, "index-audit.jsonl"), "utf8");
 		expect(audit).toContain('"code":"rejected_legacy_locator"');
 		expect(audit).toContain('"sessionId":"legacy-session"');

@@ -14,8 +14,16 @@ const sessionId = "master-e2e";
 const attestationEpoch = "master-attestation-epoch-e2e";
 const hostIncarnation = processIncarnation(process.pid);
 
-function event(input: Omit<SessionIndexEvent, "version" | "indexSeq" | "checksum" | "ts">, indexSeq: number): SessionIndexEvent {
-	const unsigned: Omit<SessionIndexEvent, "checksum"> = { ...input, version: SDK_STATE_VERSION as 1, indexSeq, ts: Date.now() };
+function event(
+	input: Omit<SessionIndexEvent, "version" | "indexSeq" | "checksum" | "ts">,
+	indexSeq: number,
+): SessionIndexEvent {
+	const unsigned: Omit<SessionIndexEvent, "checksum"> = {
+		...input,
+		version: SDK_STATE_VERSION as 1,
+		indexSeq,
+		ts: Date.now(),
+	};
 	return { ...unsigned, checksum: sessionIndexChecksum(unsigned) };
 }
 
@@ -25,7 +33,10 @@ async function writeIndex(agentDir: string, events: readonly SessionIndexEvent[]
 	await Bun.write(path.join(directory, "index.jsonl"), `${events.map(row => JSON.stringify(row)).join("\n")}\n`);
 }
 
-async function startHost(stateRoot: string, answer: "correct" | "wrong" | "replay"): Promise<{ url: string; token: string; stop: () => void }> {
+async function startHost(
+	stateRoot: string,
+	answer: "correct" | "wrong" | "replay",
+): Promise<{ url: string; token: string; stop: () => void }> {
 	const token = "host-token-e2e";
 	const server = Bun.serve<{ connectionId: string }>({
 		hostname: "127.0.0.1",
@@ -81,7 +92,12 @@ async function spawn(broker: Broker, suppliedCapability = capability): Promise<u
 const spawnSubstrateFake = {
 	launch: async () => ({
 		ok: true as const,
-		proof: { substrateKind: "headless" as const, providerIdentity: "test-provider", pid: 4242, processIncarnation: "inc-4242" },
+		proof: {
+			substrateKind: "headless" as const,
+			providerIdentity: "test-provider",
+			pid: 4242,
+			processIncarnation: "inc-4242",
+		},
 	}),
 	verify: async () => "verified" as const,
 	close: async () => ({ ok: true }),
@@ -116,10 +132,22 @@ describe("master capability effective-host verification", () => {
 			attestationEpoch,
 		};
 		const direct = event(
-			{ type: "host_registered", sessionId, locator, endpointGeneration: 0, pid: process.pid, hostIncarnation, masterRole: attestation },
+			{
+				type: "host_registered",
+				sessionId,
+				locator,
+				endpointGeneration: 0,
+				pid: process.pid,
+				hostIncarnation,
+				masterRole: attestation,
+			},
 			1,
 		);
-		const broker = new Broker({ agentDir, spawnSubstrateProvider: spawnSubstrateFake, spawnPromptLayer: spawnPromptLayerFake });
+		const broker = new Broker({
+			agentDir,
+			spawnSubstrateProvider: spawnSubstrateFake,
+			spawnPromptLayer: spawnPromptLayerFake,
+		});
 		await broker.start();
 		let host: { stop: () => void } | undefined;
 		try {
@@ -142,7 +170,10 @@ describe("master capability effective-host verification", () => {
 				2,
 			);
 			await writeIndex(agentDir, [direct, effective]);
-			expect(await spawn(broker)).toMatchObject({ ok: true, result: { code: "spawn_accepted", seed: { phase: "accepted" } } });
+			expect(await spawn(broker)).toMatchObject({
+				ok: true,
+				result: { code: "spawn_accepted", seed: { phase: "accepted" } },
+			});
 			expect(await spawn(broker, "wrong-capability")).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
 
 			host.stop();

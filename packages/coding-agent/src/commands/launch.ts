@@ -3,7 +3,6 @@
  */
 
 import { APP_NAME, getAgentDir, setProjectDir } from "@gajae-code/utils";
-import { assertMasterLaunchArgs } from "../master-mode/context";
 import { Args, Command } from "@gajae-code/utils/cli";
 import { assertLocalLaunchArgs, parseArgs } from "../cli/args";
 import { ROOT_LAUNCH_FLAGS } from "../cli/root-flags";
@@ -21,6 +20,7 @@ import {
 	GJC_TMUX_OWNER_GENERATION_ENV,
 } from "../gjc-runtime/session-state-sidecar";
 import { runRootCommand } from "../main";
+import { assertMasterLaunchArgs } from "../master-mode/context";
 import { prepareAcpTerminalAuthArgs } from "../modes/acp/terminal-auth";
 import { type IndexedSession, SessionIndex } from "../sdk/broker/session-index";
 import { worktreeOccupant } from "../sdk/broker/worktree-occupancy";

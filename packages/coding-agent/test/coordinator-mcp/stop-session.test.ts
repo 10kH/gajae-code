@@ -70,7 +70,6 @@ async function createServer(
 					}),
 			)
 		).filter(session => !closedSessionIds.has(session.sessionId as string));
-
 	}
 	const discovery: BrokerDiscovery = {
 		version: 1,

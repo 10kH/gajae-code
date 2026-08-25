@@ -40,6 +40,7 @@ import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { persistCoordinatorRuntimeInputReady } from "./gjc-runtime/session-state-sidecar";
+import { assertMasterLaunchArgs, assertMasterLaunchDisposition, createMasterModeContext } from "./master-mode/context";
 import type { AcpStartupOptions } from "./modes/acp/startup-options";
 import type { SessionSelectionResult } from "./modes/components/session-selector";
 import type { InteractiveMode } from "./modes/interactive-mode";
@@ -57,7 +58,6 @@ import {
 } from "./sdk";
 import { processIncarnation } from "./sdk/broker/process-incarnation";
 import { newMasterAttestationEpoch, resolveSessionLocator, SessionIndex } from "./sdk/broker/session-index";
-import { assertMasterLaunchDisposition, assertMasterLaunchArgs, createMasterModeContext } from "./master-mode/context";
 import type { AgentSession } from "./session/agent-session";
 import { SessionMigrationBusyError } from "./session/internal/session-open-errors";
 import {
@@ -1665,7 +1665,11 @@ export async function runRootCommand(
 	}
 	const masterModeContext =
 		parsedArgs.master === true && sessionManager
-			? createMasterModeContext(parsedArgs.masterScope ?? "repo", sessionManager.getSessionId(), newMasterAttestationEpoch())
+			? createMasterModeContext(
+					parsedArgs.masterScope ?? "repo",
+					sessionManager.getSessionId(),
+					newMasterAttestationEpoch(),
+				)
 			: undefined;
 
 	const { options: sessionOptions } = await logger.time(
@@ -1824,15 +1828,15 @@ export async function runRootCommand(
 			...(directSessionIncarnation ? { processIncarnation: directSessionIncarnation } : {}),
 			...(masterModeContext && directSessionIncarnation
 				? {
-					masterRole: {
-						version: 2,
-						ownerSessionId: masterModeContext.ownerSessionId,
-						launchPid: process.pid,
-						launchProcessIncarnation: directSessionIncarnation,
-						role: "master" as const,
-						attestationEpoch: masterModeContext.attestationEpoch,
-					},
-				}
+						masterRole: {
+							version: 2,
+							ownerSessionId: masterModeContext.ownerSessionId,
+							launchPid: process.pid,
+							launchProcessIncarnation: directSessionIncarnation,
+							role: "master" as const,
+							attestationEpoch: masterModeContext.attestationEpoch,
+						},
+					}
 				: {}),
 		});
 		postmortem.register("direct-session-index", async () => {

@@ -2,8 +2,8 @@ import { describe, expect, it } from "bun:test";
 import {
 	renderSpawnTable,
 	runSdkSpawn,
-	safeSpawnRender,
 	SdkMasterCliError,
+	safeSpawnRender,
 } from "@gajae-code/coding-agent/sdk/cli/master-cli";
 
 const task = "secret-task-fixture";
@@ -14,11 +14,15 @@ const epoch = async () => "epoch-cli";
 
 describe("gjc sdk spawn CLI", () => {
 	it("requires --cwd and --prompt", async () => {
-		await expect(runSdkSpawn({ prompt: task }, { env: masterEnv, resolveAttestationEpoch: epoch })).rejects.toMatchObject({
+		await expect(
+			runSdkSpawn({ prompt: task }, { env: masterEnv, resolveAttestationEpoch: epoch }),
+		).rejects.toMatchObject({
 			code: "invalid_input",
 			exitCode: 2,
 		});
-		await expect(runSdkSpawn({ cwd: "/tmp" }, { env: masterEnv, resolveAttestationEpoch: epoch })).rejects.toMatchObject({
+		await expect(
+			runSdkSpawn({ cwd: "/tmp" }, { env: masterEnv, resolveAttestationEpoch: epoch }),
+		).rejects.toMatchObject({
 			code: "invalid_input",
 			exitCode: 2,
 		});
@@ -29,10 +33,7 @@ describe("gjc sdk spawn CLI", () => {
 			runSdkSpawn({ cwd: "/tmp", prompt: task }, { env: {}, resolveAttestationEpoch: epoch }),
 		).rejects.toMatchObject({ code: "master_context_required" });
 		await expect(
-			runSdkSpawn(
-				{ cwd: "/tmp", prompt: task },
-				{ env: masterEnv, resolveAttestationEpoch: async () => undefined },
-			),
+			runSdkSpawn({ cwd: "/tmp", prompt: task }, { env: masterEnv, resolveAttestationEpoch: async () => undefined }),
 		).rejects.toMatchObject({ code: "master_context_required" });
 	});
 
@@ -49,7 +50,13 @@ describe("gjc sdk spawn CLI", () => {
 					claimId: "claim-1",
 					sessionId: "child-1",
 					substrateKind: "tmux",
-					seed: { phase: "accepted", clientRef: "ref-1", commandId: "cmd-1", turnId: "turn-1", status: "accepted" },
+					seed: {
+						phase: "accepted",
+						clientRef: "ref-1",
+						commandId: "cmd-1",
+						turnId: "turn-1",
+						status: "accepted",
+					},
 				},
 			};
 		};

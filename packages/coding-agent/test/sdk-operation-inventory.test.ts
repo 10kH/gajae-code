@@ -56,7 +56,9 @@ describe("SDK operation inventory", () => {
 			acp: "machine_only",
 			daemonCli: "machine_only",
 		});
-		expect(OPERATIONS.find(operation => operation.kind === "global" && operation.sdkId === "session.spawn")).toMatchObject({
+		expect(
+			OPERATIONS.find(operation => operation.kind === "global" && operation.sdkId === "session.spawn"),
+		).toMatchObject({
 			id: "G08",
 			description: "Spawn a task-seeded background child session (local interactive master only).",
 			adapterDispositions: {

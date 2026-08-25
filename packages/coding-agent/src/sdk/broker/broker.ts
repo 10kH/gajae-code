@@ -30,8 +30,30 @@ import {
 } from "./discovery";
 import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
 import {
+	canonicalDeleteLocatorPath,
+	executeLifecycle,
+	isCanonicalSessionId,
+	prepareSpawnChildHostLaunch,
+	validateBrokerModelPreset,
+} from "./lifecycle";
+import {
+	type LifecycleDurableEffectsReceipt,
+	LifecycleLedger,
+	type LifecycleStartupFailureReceipt,
+	type LifecycleState,
+} from "./lifecycle-ledger";
+import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
+import { resolveSdkPackageAuthority } from "./runtime";
+import { type IndexedSession, isSessionAuthorityEligible, SessionIndex, type SessionList } from "./session-index";
+import {
+	type ResolvedScopeV1,
+	resolveScopeRequest,
+	ScopeRequestValidationError,
+	scopeMatchesLocator,
+	scopeRequestV1,
+} from "./session-scope";
+import {
 	type MasterCapabilityVerifier,
-	isSpawnSubstrateProof,
 	type SeedDeliveryV2,
 	SpawnAuthorityStore,
 	type SpawnAuthorityV1,
@@ -39,37 +61,7 @@ import {
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
 } from "./spawn-authority";
-import {
-	canonicalDeleteLocatorPath,
-	executeLifecycle,
-	isCanonicalSessionId,
-	prepareSpawnChildHostLaunch,
-	validateBrokerModelPreset,
-} from "./lifecycle";
 import { createSpawnSubstrateProvider } from "./spawn-substrate";
-import {
-	type LifecycleDurableEffectsReceipt,
-	LifecycleLedger,
-	type LifecycleStartupFailureReceipt,
-	type LifecycleState,
-} from "./lifecycle-ledger";
-import { resolveSdkPackageAuthority } from "./runtime";
-import {
-	type IndexedSession,
-	isSessionAuthorityEligible,
-	SessionIndex,
-	type SessionList,
-} from "./session-index";
-import { SdkClient, SdkClientError } from "../client/client";
-import {
-	resolveScopeRequest,
-	scopeMatchesLocator,
-	scopeRequestV1,
-	ScopeRequestValidationError,
-	type ResolvedScopeV1,
-	type ScopeRequestV1,
-} from "./session-scope";
-import { createMasterCapabilityVerifier, readEndpoint } from "./master-capability";
 import { BrokerTransport } from "./transport";
 
 export interface BrokerSettings {
@@ -356,8 +348,12 @@ type SpawnAdmissionInput = {
 	modelPreset?: string;
 };
 
-function parseSpawnInput(input: Record<string, unknown>, idempotencyKey: string | undefined): SpawnAdmissionInput | BrokerResponse {
-	if (!idempotencyKey || idempotencyKey.length > 512) return error("invalid_input", "idempotencyKey is required for session.spawn");
+function parseSpawnInput(
+	input: Record<string, unknown>,
+	idempotencyKey: string | undefined,
+): SpawnAdmissionInput | BrokerResponse {
+	if (!idempotencyKey || idempotencyKey.length > 512)
+		return error("invalid_input", "idempotencyKey is required for session.spawn");
 	const allowed = new Set([
 		"task",
 		"prompt",
@@ -368,7 +364,8 @@ function parseSpawnInput(input: Record<string, unknown>, idempotencyKey: string 
 		"modelId",
 		"modelPreset",
 	]);
-	if (Object.keys(input).some(key => !allowed.has(key))) return error("invalid_input", "session.spawn input is invalid");
+	if (Object.keys(input).some(key => !allowed.has(key)))
+		return error("invalid_input", "session.spawn input is invalid");
 	const task = input.task ?? input.prompt;
 	if (
 		typeof task !== "string" ||
@@ -377,7 +374,11 @@ function parseSpawnInput(input: Record<string, unknown>, idempotencyKey: string 
 		(input.task !== undefined && input.prompt !== undefined && input.task !== input.prompt)
 	)
 		return error("invalid_input", "session.spawn task is invalid");
-	if (typeof input.masterCapability !== "string" || input.masterCapability.length === 0 || input.masterCapability.length > 16_384)
+	if (
+		typeof input.masterCapability !== "string" ||
+		input.masterCapability.length === 0 ||
+		input.masterCapability.length > 16_384
+	)
 		return error("invalid_input", "session.spawn capability is invalid");
 	if (
 		typeof input.ownerSessionId !== "string" ||
@@ -490,7 +491,9 @@ function spawnProofFromAuthority(authority: SpawnAuthorityV1): SpawnSubstratePro
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
-	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
 }
 
 function safeSpawnOpaque(value: unknown): value is string {
@@ -1172,12 +1175,18 @@ export class Broker {
 		attestationEpoch: string,
 	): Promise<{ allowed: boolean }> {
 		const verifier = this.settings.masterCapabilityVerifier;
-		return verifier ? await verifier.verifyMasterCapability(ownerSessionId, rawCapability, attestationEpoch) : { allowed: false };
+		return verifier
+			? await verifier.verifyMasterCapability(ownerSessionId, rawCapability, attestationEpoch)
+			: { allowed: false };
 	}
 	async #handleSpawn(input: Record<string, unknown>, idempotencyKey: string | undefined): Promise<BrokerResponse> {
 		const admission = parseSpawnInput(input, idempotencyKey);
 		if (isBrokerResponse(admission)) return admission;
-		const lifecycleIdentity = await deriveIdempotencyIdentity(this.settings.agentDir, "session.spawn", idempotencyKey!);
+		const lifecycleIdentity = await deriveIdempotencyIdentity(
+			this.settings.agentDir,
+			"session.spawn",
+			idempotencyKey!,
+		);
 		const active = this.#spawnInFlight.get(lifecycleIdentity);
 		if (active) {
 			if (this.#spawnTasks.get(active) !== admission.task)
@@ -1192,6 +1201,10 @@ export class Broker {
 		this.#spawnTasks.set(inFlight, admission.task);
 		let response: BrokerResponse | undefined;
 		let becameOwner = false;
+		const finish = (result: BrokerResponse): BrokerResponse => {
+			response = result;
+			return result;
+		};
 		try {
 			let verified: { allowed: boolean };
 			try {
@@ -1203,36 +1216,54 @@ export class Broker {
 			} finally {
 				admission.masterCapability = "";
 			}
-			if (!verified.allowed) return (response = error("spawn_failed", "master capability verification was denied"));
+			if (!verified.allowed) return finish(error("spawn_failed", "master capability verification was denied"));
 			// Validate the optional profile BEFORE any durable claim or substrate
 			// effect. Generic lifecycle create validates it; spawn branched earlier
 			// and skipped it, so an unknown profile launched a substrate and only
 			// failed later as uncertainty instead of a typed pre-effect error.
 			if (admission.modelPreset !== undefined) {
 				const validated = validateBrokerModelPreset(this.settings.agentDir, admission.modelPreset);
-				if (isBrokerResponse(validated)) return (response = validated);
+				if (isBrokerResponse(validated)) return finish(validated);
 			}
 			const key = await getBrokerIdentityKey(this.settings.agentDir);
 			const bindingMac = createHmac("sha256", Buffer.from(key, "hex"))
-				.update(canonicalJson({ version: 1, operation: "session.spawn", ownerSessionId: admission.ownerSessionId, attestationEpoch: admission.attestationEpoch, cwd: admission.cwd, modelId: admission.modelId ?? null, modelPreset: admission.modelPreset ?? null }))
+				.update(
+					canonicalJson({
+						version: 1,
+						operation: "session.spawn",
+						ownerSessionId: admission.ownerSessionId,
+						attestationEpoch: admission.attestationEpoch,
+						cwd: admission.cwd,
+						modelId: admission.modelId ?? null,
+						modelPreset: admission.modelPreset ?? null,
+					}),
+				)
 				.digest("hex");
 			const authority = this.#spawnAuthority;
-			if (!authority) return (response = error("unavailable", "spawn authority is unavailable"));
+			if (!authority) return finish(error("unavailable", "spawn authority is unavailable"));
 			const decision = await authority.claimOrJoin(lifecycleIdentity, bindingMac);
-			if (decision.kind === "idempotency_conflict") return (response = error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim"));
-			if (decision.kind === "in_progress") return (response = error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
-			if (decision.kind === "terminal_uncertain") return (response = error("terminal_uncertain", "session.spawn outcome is uncertain"));
-			if (decision.kind === "terminal") return (response = this.#spawnTerminalResponse(decision.claim));
-			if (decision.kind === "replay") return (response = await this.#reconcileSpawnReplay(lifecycleIdentity, decision.claim));
+			if (decision.kind === "idempotency_conflict")
+				return finish(
+					error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim"),
+				);
+			if (decision.kind === "in_progress")
+				return finish(error("spawn_in_progress", `session.spawn is ${decision.claim.state}`));
+			if (decision.kind === "terminal_uncertain")
+				return finish(error("terminal_uncertain", "session.spawn outcome is uncertain"));
+			if (decision.kind === "terminal") return finish(this.#spawnTerminalResponse(decision.claim));
+			if (decision.kind === "replay")
+				return finish(await this.#reconcileSpawnReplay(lifecycleIdentity, decision.claim));
 			becameOwner = true;
 			inFlight.claimId = decision.claim.claimId;
 			inFlight.phase = decision.claim.state;
 			// Claim fsync precedes this audit mirror. Substrate work may start
 			// only after the mirror succeeds; a startup reconciler rebuilds it claim-first.
 			await this.ledger.begin(lifecycleIdentity, bindingMac);
-			return (response = await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery));
+			return finish(
+				await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery),
+			);
 		} catch {
-			return (response = error("spawn_failed", "session.spawn admission could not be durably established"));
+			return finish(error("spawn_failed", "session.spawn admission could not be durably established"));
 		} finally {
 			completion.resolve(response ?? error("spawn_failed", "session.spawn admission failed"));
 			this.#spawnTasks.delete(inFlight);
@@ -1272,7 +1303,9 @@ export class Broker {
 	}
 
 	#spawnSubstrateProvider(): SpawnSubstrateProvider {
-		return this.settings.spawnSubstrateProvider ?? (this.settings.spawnSubstrateProvider = createSpawnSubstrateProvider());
+		if (this.settings.spawnSubstrateProvider) return this.settings.spawnSubstrateProvider;
+		this.settings.spawnSubstrateProvider = createSpawnSubstrateProvider();
+		return this.settings.spawnSubstrateProvider;
 	}
 
 	/**
@@ -1400,21 +1433,30 @@ export class Broker {
 				).claim;
 				inFlight.phase = current.state;
 			}
-			if (current.state !== "seed_prepared" || current.preSendLease?.status !== "owned" || !current.seed || !current.childId)
+			if (
+				current.state !== "seed_prepared" ||
+				current.preSendLease?.status !== "owned" ||
+				!current.seed ||
+				!current.childId
+			)
 				return error("terminal_uncertain", "session.spawn cannot proceed from its durable state");
 			// A recovery owner resumes a claim whose substrate was launched by an
 			// earlier process. Re-prove that exact substrate before handing off the
 			// seed: a replaced or vanished substrate must never receive the prompt.
 			if (recovered) {
 				const recoveredAuthority = store.authority(lifecycleIdentity);
-				if (!recoveredAuthority) return error("terminal_uncertain", "session.spawn authority is unavailable after restart");
+				if (!recoveredAuthority)
+					return error("terminal_uncertain", "session.spawn authority is unavailable after restart");
 				// A recovery owner has no in-process pin, so it must come from durable
 				// authority. An absent pin is missing evidence, not permission to
 				// match on session id alone.
 				pinnedRegistration = spawnPinFromAuthority(recoveredAuthority);
 				let verdict: "verified" | "mismatch" | "gone";
 				try {
-					verdict = pinnedRegistration === undefined ? "gone" : await provider.verify(spawnProofFromAuthority(recoveredAuthority));
+					verdict =
+						pinnedRegistration === undefined
+							? "gone"
+							: await provider.verify(spawnProofFromAuthority(recoveredAuthority));
 				} catch {
 					verdict = "gone";
 				}
@@ -1545,7 +1587,7 @@ export class Broker {
 	async #closeSpawnSubstrate(lifecycleIdentity: string): Promise<void> {
 		try {
 			const authorityRecord = this.#spawnAuthority?.authority(lifecycleIdentity);
-			if (!authorityRecord || authorityRecord.closeState !== "active") return;
+			if (authorityRecord?.closeState !== "active") return;
 			const provider = this.#spawnSubstrateProvider();
 			const proof = spawnProofFromAuthority(authorityRecord);
 			if ((await provider.verify(proof)) !== "verified") return;
@@ -1572,7 +1614,8 @@ export class Broker {
 			// command/turn facts persisted as this claim's acceptance.
 			const replayAuthority = store.authority(lifecycleIdentity);
 			const replayPin = replayAuthority ? spawnPinFromAuthority(replayAuthority) : undefined;
-			if (!replayPin) return error("terminal_uncertain", "session.spawn endpoint authority is unavailable for replay");
+			if (!replayPin)
+				return error("terminal_uncertain", "session.spawn endpoint authority is unavailable for replay");
 			const q26 = await this.#spawnPromptLayer.reconcile({
 				sessionId: childId,
 				clientRef: seed.clientRef,
@@ -1709,23 +1752,21 @@ export class Broker {
 				await this.index.refresh();
 				// The launch locator is authority: a same-id row registered by an
 				// unrelated workspace must never be adopted as this spawn's child.
-				const row = this.index
-					.listSessionIdentities()
-					.find(
-						candidate =>
-							candidate.sessionId === input.childId &&
-							candidate.endpointGeneration > 0 &&
-							candidate.live &&
-							!candidate.terminal &&
-							!candidate.terminalUncertain &&
-							// Path IDENTITY, not spelling. The child publishes a
-							// realpath-canonicalized locator while the launch spec carries the
-							// caller's lexical path, so `path.resolve` never reconciles a
-							// symlinked workspace (macOS /var vs /private/var) and a
-							// legitimate child would never match.
-							resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.cwd) &&
-							resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(input.stateRoot),
-					);
+				const row = this.index.listSessionIdentities().find(
+					candidate =>
+						candidate.sessionId === input.childId &&
+						candidate.endpointGeneration > 0 &&
+						candidate.live &&
+						!candidate.terminal &&
+						!candidate.terminalUncertain &&
+						// Path IDENTITY, not spelling. The child publishes a
+						// realpath-canonicalized locator while the launch spec carries the
+						// caller's lexical path, so `path.resolve` never reconciles a
+						// symlinked workspace (macOS /var vs /private/var) and a
+						// legitimate child would never match.
+						resolveEquivalentPath(candidate.locator.cwd) === resolveEquivalentPath(input.cwd) &&
+						resolveEquivalentPath(candidate.locator.stateRoot) === resolveEquivalentPath(input.stateRoot),
+				);
 				if (row) {
 					const incarnation = row.hostIncarnation ?? row.processIncarnation;
 					// An incarnation-less row is incomplete endpoint evidence; a partial pin
@@ -1764,22 +1805,20 @@ export class Broker {
 		let row: IndexedSession | undefined;
 		try {
 			await this.index.refresh();
-			row = this.index
-				.listSessionIdentities()
-				.find(
-					candidate =>
-						candidate.sessionId === input.sessionId &&
-						candidate.endpointGeneration > 0 &&
-						candidate.live &&
-						!candidate.terminal &&
-						!candidate.terminalUncertain &&
-						// Bind to the exact endpoint proven at registration. Without this a
-						// replaced host or an alternate endpoint for the same id could
-						// receive the seed prompt or answer a Q26 reconciliation.
-						// Every pin leg is required. Identity fields alone collide across
-						// workspaces (pids are reused), so a complete pin is required evidence.
-						matchesSpawnPin(candidate, input.pinned),
-				);
+			row = this.index.listSessionIdentities().find(
+				candidate =>
+					candidate.sessionId === input.sessionId &&
+					candidate.endpointGeneration > 0 &&
+					candidate.live &&
+					!candidate.terminal &&
+					!candidate.terminalUncertain &&
+					// Bind to the exact endpoint proven at registration. Without this a
+					// replaced host or an alternate endpoint for the same id could
+					// receive the seed prompt or answer a Q26 reconciliation.
+					// Every pin leg is required. Identity fields alone collide across
+					// workspaces (pids are reused), so a complete pin is required evidence.
+					matchesSpawnPin(candidate, input.pinned),
+			);
 		} catch {
 			row = undefined;
 		}
@@ -1885,10 +1924,9 @@ export class Broker {
 			timeoutMs: SPAWN_PROMPT_EXCHANGE_TIMEOUT_MS,
 		});
 		const frame = exchange.frame;
-		if (!frame || frame.ok !== true) return { status: "unknown" };
+		if (frame?.ok !== true) return { status: "unknown" };
 		return q26FromResponse(frame);
 	}
-
 
 	/**
 	 * Routes session.close for a spawn-created child through its claim/authority
@@ -1932,7 +1970,11 @@ export class Broker {
 			if (verdict === "mismatch") {
 				if (authority.closeState !== "uncertain") {
 					const at = Math.max(Date.now(), authority.updatedAt + 1);
-					await store.persistAuthority(lifecycleIdentity, { ...authority, closeState: "uncertain", updatedAt: at });
+					await store.persistAuthority(lifecycleIdentity, {
+						...authority,
+						closeState: "uncertain",
+						updatedAt: at,
+					});
 				}
 				return "uncertain";
 			}
@@ -1988,7 +2030,8 @@ export class Broker {
 			let rows: readonly IndexedSession[] | undefined;
 			for (const claim of store.claims()) {
 				const authority = store.authority(claim.lifecycleIdentity);
-				if (!authority || (authority.closeState !== "active" && authority.closeState !== "close_requested")) continue;
+				if (!authority || (authority.closeState !== "active" && authority.closeState !== "close_requested"))
+					continue;
 				if (rows === undefined) {
 					try {
 						await this.index.refresh();
@@ -2666,7 +2709,10 @@ export class Broker {
 		const limit = stored?.limit ?? requestedLimit ?? SESSION_LIST_DEFAULT_LIMIT;
 		const observedAt = stored?.observedAt ?? (scope === undefined ? undefined : new Date().toISOString());
 		const snapshot = stored ?? {
-			sessions: scope === undefined ? [...result.sessions] : result.sessions.filter(session => scopeMatchesLocator(scope, session.locator)),
+			sessions:
+				scope === undefined
+					? [...result.sessions]
+					: result.sessions.filter(session => scopeMatchesLocator(scope, session.locator)),
 			indexSeq: result.indexSeq,
 			warnings: [...result.warnings],
 			limit,

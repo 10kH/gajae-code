@@ -78,7 +78,7 @@ export function worktreeOccupant(
 	const target = resolveEquivalentPath(worktreePath);
 	for (const session of sessions) {
 		if (session.terminal || !session.live) continue;
-		if (resolveEquivalentPath(session.locator.repo) !== target) continue;
+		if (resolveEquivalentPath(session.locator.cwd) !== target) continue;
 		if (observe(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited") continue;
 		return session.sessionId;
 	}

@@ -39,7 +39,11 @@ export type SeedDeliveryV2 = {
 
 /** Live-only capability check. Implementations must not retain either argument. */
 export interface MasterCapabilityVerifier {
-	verifyMasterCapability(ownerSessionId: string, rawCapability: string, attestationEpoch: string): Promise<{ allowed: boolean }>;
+	verifyMasterCapability(
+		ownerSessionId: string,
+		rawCapability: string,
+		attestationEpoch: string,
+	): Promise<{ allowed: boolean }>;
 }
 
 /** Structured, shell-free child launch contract owned by the Broker. */
@@ -249,7 +253,8 @@ const AUTHORITY_KEYS = new Set([
 	"updatedAt",
 ]);
 const SUBSTRATE_KINDS = new Set<SpawnSubstrateProof["substrateKind"]>(["tmux", "psmux", "headless"]);
-const FORBIDDEN_FIELD = /(?:task|prompt|capability|idempotency|fingerprint|requesthash|digest|credential|token|secret|password|stderr)/i;
+const FORBIDDEN_FIELD =
+	/(?:task|prompt|capability|idempotency|fingerprint|requesthash|digest|credential|token|secret|password|stderr)/i;
 const TRANSITION_EDGES: Readonly<Record<SpawnClaimV2["state"], readonly SpawnClaimV2["state"][]>> = {
 	prepared: ["substrate_starting", "pre_send_rejected", "uncertain", "closed"],
 	substrate_starting: ["authority_active", "pre_send_rejected", "uncertain", "closed"],
@@ -351,7 +356,8 @@ function isSeed(value: unknown): value is SeedDeliveryV2 {
 		(seed.observedAt !== undefined && !isTimestamp(seed.observedAt))
 	)
 		return false;
-	if (seed.phase === "accepted") return isOpaque(seed.commandId) && isOpaque(seed.turnId) && isTimestamp(seed.acceptedAt);
+	if (seed.phase === "accepted")
+		return isOpaque(seed.commandId) && isOpaque(seed.turnId) && isTimestamp(seed.acceptedAt);
 	if (seed.phase === "prepared" || seed.phase === "dispatching" || seed.phase === "pre_send_rejected")
 		return seed.commandId === undefined && seed.turnId === undefined && seed.acceptedAt === undefined;
 	return true;
@@ -438,7 +444,8 @@ export function isSpawnClaimV2(value: unknown): value is SpawnClaimV2 {
 				!Array.isArray(lease) &&
 				Object.keys(lease).every(key => key === "epoch" || key === "status") &&
 				isOpaque((lease as { epoch?: unknown }).epoch) &&
-				((lease as { status?: unknown }).status === "owned" || (lease as { status?: unknown }).status === "consumed"))) &&
+				((lease as { status?: unknown }).status === "owned" ||
+					(lease as { status?: unknown }).status === "consumed"))) &&
 		(claim.childId === undefined || isOpaque(claim.childId)) &&
 		(claim.seed === undefined || isSeed(claim.seed)) &&
 		(claim.authorityRef === undefined || isOpaque(claim.authorityRef)) &&
@@ -493,9 +500,9 @@ function cloneAuthority(authority: SpawnAuthorityV1 | undefined): SpawnAuthority
 	return authority === undefined
 		? undefined
 		: {
-			...authority,
-			...(authority.stateFileProof === undefined ? {} : { stateFileProof: { ...authority.stateFileProof } }),
-		};
+				...authority,
+				...(authority.stateFileProof === undefined ? {} : { stateFileProof: { ...authority.stateFileProof } }),
+			};
 }
 
 function cloneClaim(claim: SpawnClaimV2): SpawnClaimV2 {
@@ -562,7 +569,8 @@ export class SpawnAuthorityStore {
 				} catch {
 					throw new Error("Spawn authority journal contains malformed durable evidence.");
 				}
-				if (!this.#isStoredClaim(row)) throw new Error("Spawn authority journal contains invalid durable evidence.");
+				if (!this.#isStoredClaim(row))
+					throw new Error("Spawn authority journal contains invalid durable evidence.");
 				const stored = row as StoredClaim;
 				const prior = this.#latest.get(stored.claim.lifecycleIdentity);
 				if (prior && (prior.claimId !== stored.claim.claimId || stored.claim.updatedAt <= prior.updatedAt))
@@ -575,7 +583,8 @@ export class SpawnAuthorityStore {
 	}
 
 	async claimOrJoin(lifecycleIdentity: string, bindingMac: string): Promise<SpawnClaimDecision> {
-		if (!isOpaque(lifecycleIdentity) || !/^[0-9a-f]{64}$/i.test(bindingMac)) throw new Error("Invalid opaque spawn claim key.");
+		if (!isOpaque(lifecycleIdentity) || !/^[0-9a-f]{64}$/i.test(bindingMac))
+			throw new Error("Invalid opaque spawn claim key.");
 		return await this.#serial(async () => {
 			const current = this.#latest.get(lifecycleIdentity);
 			if (!current) {
@@ -618,7 +627,10 @@ export class SpawnAuthorityStore {
 	 * Fsyncs one allowlisted state edge. Callers cannot patch claims in place,
 	 * which prevents a retry from downgrading a handoff-capable state.
 	 */
-	async persistTransition(lifecycleIdentity: string, transition: SpawnClaimTransition): Promise<SpawnAuthorityTransitionResult> {
+	async persistTransition(
+		lifecycleIdentity: string,
+		transition: SpawnClaimTransition,
+	): Promise<SpawnAuthorityTransitionResult> {
 		return await this.#serial(async () => {
 			const current = this.#latest.get(lifecycleIdentity);
 			if (!current) throw new SpawnAuthorityTransitionError("claim_not_found");
@@ -746,7 +758,8 @@ export class SpawnAuthorityStore {
 					break;
 				}
 				case "closed": {
-					if (transition.childId !== undefined || transition.seed !== undefined) throw new SpawnAuthorityTransitionError("invalid_transition");
+					if (transition.childId !== undefined || transition.seed !== undefined)
+						throw new SpawnAuthorityTransitionError("invalid_transition");
 					if (currentAuthority) {
 						const authority = transition.authority;
 						if (
@@ -757,7 +770,8 @@ export class SpawnAuthorityStore {
 						)
 							throw new SpawnAuthorityTransitionError("invalid_transition");
 						nextAuthority = authority;
-					} else if (transition.authority !== undefined) throw new SpawnAuthorityTransitionError("invalid_transition");
+					} else if (transition.authority !== undefined)
+						throw new SpawnAuthorityTransitionError("invalid_transition");
 					next = { ...current, state: "closed" };
 					break;
 				}
@@ -768,12 +782,18 @@ export class SpawnAuthorityStore {
 			if (!isSpawnClaimV2(next) || (nextAuthority !== undefined && !matchingAuthority(next, nextAuthority)))
 				throw new SpawnAuthorityTransitionError("invalid_transition");
 			await this.#append(next, nextAuthority);
-			return { claim: cloneClaim(next), ...(nextAuthority === undefined ? {} : { authority: cloneAuthority(nextAuthority)! }) };
+			return {
+				claim: cloneClaim(next),
+				...(nextAuthority === undefined ? {} : { authority: cloneAuthority(nextAuthority)! }),
+			};
 		});
 	}
 
 	/** Persists only an exact authority lifecycle update, never a proof replacement. */
-	async persistAuthority(lifecycleIdentity: string, authority: SpawnAuthorityV1): Promise<SpawnAuthorityTransitionResult> {
+	async persistAuthority(
+		lifecycleIdentity: string,
+		authority: SpawnAuthorityV1,
+	): Promise<SpawnAuthorityTransitionResult> {
 		return await this.#serial(async () => {
 			const current = this.#latest.get(lifecycleIdentity);
 			const prior = this.#authorities.get(lifecycleIdentity);
@@ -793,17 +813,22 @@ export class SpawnAuthorityStore {
 	}
 
 	/** Records an observed Q26 status without reopening or changing a state edge. */
-	async persistSeedObservation(lifecycleIdentity: string, seed: SeedDeliveryV2): Promise<SpawnAuthorityTransitionResult> {
+	async persistSeedObservation(
+		lifecycleIdentity: string,
+		seed: SeedDeliveryV2,
+	): Promise<SpawnAuthorityTransitionResult> {
 		return await this.#serial(async () => {
 			const current = this.#latest.get(lifecycleIdentity);
 			const authority = this.#authorities.get(lifecycleIdentity);
-			if (!current || !current.seed || !matchingAuthority(current, authority))
+			if (!current?.seed || !matchingAuthority(current, authority))
 				throw new SpawnAuthorityTransitionError("claim_not_found");
 			if (
 				!isSeed(seed) ||
 				seed.phase !== current.seed.phase ||
 				!sameSeedIdentity(current.seed, seed) ||
-				(seed.observedAt !== undefined && current.seed.observedAt !== undefined && seed.observedAt < current.seed.observedAt)
+				(seed.observedAt !== undefined &&
+					current.seed.observedAt !== undefined &&
+					seed.observedAt < current.seed.observedAt)
 			)
 				throw new SpawnAuthorityTransitionError("invalid_transition");
 			const next = { ...current, seed, updatedAt: claimTimestampAfter(current.updatedAt) };
@@ -818,14 +843,23 @@ export class SpawnAuthorityStore {
 	}
 
 	#allowedAuthorityUpdate(prior: SpawnAuthorityV1, next: SpawnAuthorityV1): boolean {
-		if (next.orphanedAt !== undefined && prior.orphanedAt !== undefined && next.orphanedAt < prior.orphanedAt) return false;
-		if (next.orphanRecoveredAt !== undefined && next.orphanedAt !== undefined && next.orphanRecoveredAt < next.orphanedAt)
+		if (next.orphanedAt !== undefined && prior.orphanedAt !== undefined && next.orphanedAt < prior.orphanedAt)
+			return false;
+		if (
+			next.orphanRecoveredAt !== undefined &&
+			next.orphanedAt !== undefined &&
+			next.orphanRecoveredAt < next.orphanedAt
+		)
 			return false;
 		switch (prior.closeState) {
 			case "active":
-				return next.closeState === "active" || next.closeState === "close_requested" || next.closeState === "uncertain";
+				return (
+					next.closeState === "active" || next.closeState === "close_requested" || next.closeState === "uncertain"
+				);
 			case "close_requested":
-				return next.closeState === "close_requested" || next.closeState === "closed" || next.closeState === "uncertain";
+				return (
+					next.closeState === "close_requested" || next.closeState === "closed" || next.closeState === "uncertain"
+				);
 			case "uncertain":
 				return next.closeState === "uncertain" || next.closeState === "closed";
 			case "closed":
@@ -843,7 +877,9 @@ export class SpawnAuthorityStore {
 		if (!value || typeof value !== "object" || Array.isArray(value)) return false;
 		const row = value as Partial<StoredClaim>;
 		return (
-			Object.keys(row).every(key => key === "version" || key === "claim" || key === "authority" || key === "integrity") &&
+			Object.keys(row).every(
+				key => key === "version" || key === "claim" || key === "authority" || key === "integrity",
+			) &&
 			row.version === 1 &&
 			isSpawnClaimV2(row.claim) &&
 			(row.authority === undefined || isSpawnAuthorityV1(row.authority)) &&
@@ -873,7 +909,11 @@ export class SpawnAuthorityStore {
 		} catch (error) {
 			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		}
-		const handle = await fs.open(this.#file, fsSync.constants.O_WRONLY | fsSync.constants.O_APPEND | fsSync.constants.O_CREAT, 0o600);
+		const handle = await fs.open(
+			this.#file,
+			fsSync.constants.O_WRONLY | fsSync.constants.O_APPEND | fsSync.constants.O_CREAT,
+			0o600,
+		);
 		let rollbackFailed = false;
 		try {
 			try {

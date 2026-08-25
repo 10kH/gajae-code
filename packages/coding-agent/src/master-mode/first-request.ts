@@ -1,10 +1,6 @@
 import { canonicalSessionCwd, sessionWorktreeRoot } from "../sdk/broker/session-index";
-import {
-	collectMasterPeerSnapshot,
-	type MasterPeerSnapshotLifecycle,
-	renderMasterPeerSnapshot,
-} from "./snapshot";
 import type { MasterScope } from "./context";
+import { collectMasterPeerSnapshot, type MasterPeerSnapshotLifecycle, renderMasterPeerSnapshot } from "./snapshot";
 
 export const MASTER_PEER_SNAPSHOT_CUSTOM_TYPE = "master-peer-snapshot";
 

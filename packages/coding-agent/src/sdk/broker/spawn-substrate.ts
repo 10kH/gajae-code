@@ -3,21 +3,17 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
+import { resolveGjcTmuxBinary } from "../../gjc-runtime/psmux-detect";
+import { sessionRuntimeDir } from "../../gjc-runtime/session-layout";
+import { resolveGjcTmuxProviderContext } from "../../gjc-runtime/tmux-provider-context";
 import {
 	createManagedGjcTmuxSession,
 	forceCloseManagedGjcTmuxSession,
 	type ManagedTmuxLaunchProof,
 	verifyManagedGjcTmuxSession,
 } from "../../gjc-runtime/tmux-sessions";
-import { resolveGjcTmuxBinary } from "../../gjc-runtime/psmux-detect";
-import { resolveGjcTmuxProviderContext } from "../../gjc-runtime/tmux-provider-context";
-import { sessionRuntimeDir } from "../../gjc-runtime/session-layout";
 import { processIncarnation } from "./process-incarnation";
-import type {
-	SpawnSubstrateLaunchSpec,
-	SpawnSubstrateProof,
-	SpawnSubstrateProvider,
-} from "./spawn-authority";
+import type { SpawnSubstrateLaunchSpec, SpawnSubstrateProof, SpawnSubstrateProvider } from "./spawn-authority";
 
 export type SpawnMultiplexerSelection = "none" | "tmux" | "psmux" | "proof_failed";
 
@@ -32,7 +28,11 @@ export interface SpawnSubstrateProviderDependencies {
 	/** @internal Test seam for deterministic provider selection. */
 	selectMultiplexer?: () => SpawnMultiplexerSelection;
 	/** @internal Test seam for the managed multiplexer command layer. */
-	launchManaged?: (spec: SpawnSubstrateLaunchSpec, env: NodeJS.ProcessEnv, platform: NodeJS.Platform) => ManagedTmuxLaunchProof;
+	launchManaged?: (
+		spec: SpawnSubstrateLaunchSpec,
+		env: NodeJS.ProcessEnv,
+		platform: NodeJS.Platform,
+	) => ManagedTmuxLaunchProof;
 	verifyManaged?: (proof: ManagedTmuxLaunchProof, env: NodeJS.ProcessEnv) => "verified" | "mismatch" | "gone";
 	closeManaged?: (proof: ManagedTmuxLaunchProof, env: NodeJS.ProcessEnv) => Promise<void>;
 	processIncarnation?: (pid: number) => string | undefined;

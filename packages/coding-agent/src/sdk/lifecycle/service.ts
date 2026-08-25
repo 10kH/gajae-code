@@ -1,18 +1,18 @@
 import { createHash } from "node:crypto";
 import {
+	resolvedScopeV1,
+	resolveScopeRequest,
+	type ScopeRequestV1,
+	type SdkSearchResultV1,
+	scopeRequestV1,
+	searchRowV1,
+} from "../broker/session-scope";
+import {
 	SessionListTraversalError,
 	type SessionListTraversalPage,
 	sessionListPageFromResponse,
 	traverseSessionList,
 } from "../session-list";
-import {
-	resolveScopeRequest,
-	searchRowV1,
-	resolvedScopeV1,
-	scopeRequestV1,
-	type ScopeRequestV1,
-	type SdkSearchResultV1,
-} from "../broker/session-scope";
 
 export type SessionLifecycleOperation =
 	| "session.create"
@@ -792,7 +792,8 @@ export class SessionLifecycleService {
 							: "session.list exceeded the page budget",
 				);
 			const error = brokerError(thrown) ?? brokerErrorFromThrown(thrown);
-			if (locallyResolvedScope && (!error || error.code === "unavailable")) return unavailableScopedList(locallyResolvedScope);
+			if (locallyResolvedScope && (!error || error.code === "unavailable"))
+				return unavailableScopedList(locallyResolvedScope);
 			return error
 				? failure("session.list", certaintyForThrownError(error), error.code, error.message)
 				: failure("session.list", "retryable", "unavailable", "lifecycle broker request was unavailable");
@@ -810,30 +811,42 @@ export class SessionLifecycleService {
 			const scope = firstPage.page.scope;
 			const observedAt = firstPage.page.observedAt;
 			if (!scope || !observedAt)
-				return failure("session.list", "uncertain", "malformed_response", "lifecycle broker returned a malformed scoped list result");
-			const rows = pages.flatMap(page => page.page.result.sessions).map(entry => {
-				const source = entry as SessionLifecycleListEntry & { locator?: unknown };
-				if (!isRecord(source.locator)) throw new SessionListTraversalError("malformed_page");
-				const locator = source.locator;
-				if (
-					typeof locator.cwd !== "string" ||
-					(locator.worktreeRoot !== null && typeof locator.worktreeRoot !== "string") ||
-					typeof locator.stateRoot !== "string"
-				)
-					throw new SessionListTraversalError("malformed_page");
-				return searchRowV1({
-					sessionId: entry.sessionId,
-					locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
-					live: entry.live === true,
+				return failure(
+					"session.list",
+					"uncertain",
+					"malformed_response",
+					"lifecycle broker returned a malformed scoped list result",
+				);
+			const rows = pages
+				.flatMap(page => page.page.result.sessions)
+				.map(entry => {
+					const source = entry as SessionLifecycleListEntry & { locator?: unknown };
+					if (!isRecord(source.locator)) throw new SessionListTraversalError("malformed_page");
+					const locator = source.locator;
+					if (
+						typeof locator.cwd !== "string" ||
+						(locator.worktreeRoot !== null && typeof locator.worktreeRoot !== "string") ||
+						typeof locator.stateRoot !== "string"
+					)
+						throw new SessionListTraversalError("malformed_page");
+					return searchRowV1({
+						sessionId: entry.sessionId,
+						locator: { cwd: locator.cwd, worktreeRoot: locator.worktreeRoot, stateRoot: locator.stateRoot },
+						live: entry.live === true,
+					});
 				});
-			});
 			return {
 				ok: true,
 				operation: "session.list",
 				result: {
 					version: 1,
 					scope,
-					status: scope.resolution === "not-in-git-worktree" ? "not-in-git-worktree" : rows.length === 0 ? "empty" : "populated",
+					status:
+						scope.resolution === "not-in-git-worktree"
+							? "not-in-git-worktree"
+							: rows.length === 0
+								? "empty"
+								: "populated",
 					observedAt,
 					indexSeq: result.indexSeq,
 					rows,

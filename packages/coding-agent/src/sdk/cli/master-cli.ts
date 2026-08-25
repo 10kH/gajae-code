@@ -69,7 +69,9 @@ async function indexAttestationEpoch(agentDir: string, ownerSessionId: string): 
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
-	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+	return value !== null && typeof value === "object" && !Array.isArray(value)
+		? (value as Record<string, unknown>)
+		: undefined;
 }
 
 function opaque(value: unknown): string | undefined {
@@ -107,7 +109,8 @@ export function safeSpawnRender(response: unknown): { rendered: SdkSpawnRendered
 	const code = opaque(error?.code) ?? "spawn_failed";
 	// Error messages are Broker-typed and never quote request input; render the
 	// code plus the typed message only.
-	const message = typeof error?.message === "string" && error.message.length <= 512 ? error.message : "session.spawn failed";
+	const message =
+		typeof error?.message === "string" && error.message.length <= 512 ? error.message : "session.spawn failed";
 	return { rendered: { code, error: { code, message } }, exitCode: 1 };
 }
 
