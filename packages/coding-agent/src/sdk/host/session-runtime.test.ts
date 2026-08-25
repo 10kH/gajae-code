@@ -3470,6 +3470,58 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("routes a delayed predecessor agent_end after replacement completion to the retired owner", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-delayed-retired-owner-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const secondInflight = Promise.withResolvers<void>();
+			let prompts = 0;
+			const harness = await invocationHarness("retired-owner-a", cwd, {
+				persistInterceptor: () => {},
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) await firstInflight.promise;
+					if (prompts === 2) await secondInflight.promise;
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.switchSession("retired-owner-b");
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
+			});
+			const failure = harness.broadcasts.find(frame => {
+				const payload = frame.payload;
+				return (
+					frame.kind === "agent_failed" &&
+					typeof payload === "object" &&
+					payload !== null &&
+					(payload as { commandId?: unknown }).commandId === firstIds.commandId &&
+					(payload as { turnId?: unknown }).turnId === firstIds.turnId
+				);
+			});
+			expect(failure).toMatchObject({ kind: "agent_failed", payload: { error: { code: "provider_http_402" } } });
+			const successor = await harness.control("turn.prompt", { text: "successor" });
+			expect(successor.ok).toBe(true);
+			const successorIds = { commandId: successor.result?.commandId, turnId: successor.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+			secondInflight.resolve();
+			expect(await settledStatus(harness, "turn.prompt_status", successorIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			firstInflight.resolve();
+			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a prompt killed by a provider stream interrupt reports a terminal failed status", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-prompt-"));
 		try {

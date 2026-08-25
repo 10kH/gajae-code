@@ -3090,6 +3090,7 @@ function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown>
 export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: CreateSdkSessionRuntimeOptions): void {
 	let active:
 		| {
+				sessionId: string;
 				runtime: SessionSdkSessionRuntime;
 				revisions: RevisionStore;
 				cursors: CursorRegistry;
@@ -3131,6 +3132,20 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	type RuntimeState = NonNullable<typeof active>;
 	type LifecycleBatch = RuntimeState["openLifecycleBatches"][number];
 	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
+	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
+	const lifecycleStateForContext = (ctx: ExtensionContext): RuntimeState | undefined => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (active?.sessionId === sessionId) return active;
+		return retiredLifecycleOwners.get(sessionId)?.[0];
+	};
+	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
+		if (owner.openLifecycleBatches.length > 0 || owner.lifecycleTasks.size > 0) return;
+		const owners = retiredLifecycleOwners.get(owner.sessionId);
+		if (!owners) return;
+		const remaining = owners.filter(candidate => candidate !== owner);
+		if (remaining.length === 0) retiredLifecycleOwners.delete(owner.sessionId);
+		else retiredLifecycleOwners.set(owner.sessionId, remaining);
+	};
 	// Shared with the control surface's terminal abort: the correlated
 	// agent_end publication capture (AC 19). terminalAbort installs a fresh
 	// resolver before settling the abort; emitLifecycle resolves it with the
@@ -3149,11 +3164,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// thread P1).
 	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
 	const skillTerminalRecoveryKeys = new Set<string>();
-	const trackLifecycle = (handler: () => Promise<void>): Promise<void> => {
-		const owner = active;
+	const trackLifecycle = (handler: () => Promise<void>, owner = active): Promise<void> => {
 		if (!owner) return handler();
 		let task: Promise<void>;
-		task = handler().finally(() => owner.lifecycleTasks.delete(task));
+		task = handler().finally(() => {
+			owner.lifecycleTasks.delete(task);
+			maybeRetireLifecycleOwner(owner);
+		});
 		owner.lifecycleTasks.add(task);
 		return task;
 	};
@@ -3512,28 +3529,31 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			resolveTerminalPublicationWaiters(observed);
 		}
 	};
-	api.on("agent_start", (_event, ctx) => trackLifecycle(async () => await emitLifecycle("agent_start", ctx)));
-	api.on("agent_end", (event, ctx) =>
-		trackLifecycle(async () => {
-			const failure = providerFailureFromAgentEnd(event);
-			const current = active;
-			// Capture the oldest unmatched batch synchronously. A successor may start
-			// while the failed diagnostic persists; that must not retarget the
-			// predecessor's reason or terminal boundary to the successor invocation.
-			const endedBatch = current?.openLifecycleBatches[0];
-			const lifecycleOwner = current
-				? {
-						state: current,
-						sessionId: ctx.sessionManager.getSessionId(),
-						...(endedBatch ? { batch: endedBatch } : {}),
-					}
-				: undefined;
-			const currentInvocation = endedBatch?.invocations[0] ?? current?.activeInvocation;
-			const failureAlreadyPublished = currentInvocation
-				? current?.failureDiagnosticKeys.has(
-						`${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`,
-					)
-				: false;
+	api.on("agent_start", (_event, ctx) => {
+		const owner = lifecycleStateForContext(ctx);
+		return trackLifecycle(async () => await emitLifecycle("agent_start", ctx), owner);
+	});
+	api.on("agent_end", (event, ctx) => {
+		const owner = lifecycleStateForContext(ctx);
+		// Capture the oldest unmatched batch synchronously. A successor may start
+		// while the failed diagnostic persists; that must not retarget the
+		// predecessor's reason or terminal boundary to the successor invocation.
+		const endedBatch = owner?.openLifecycleBatches[0];
+		const lifecycleOwner = owner
+			? {
+					state: owner,
+					sessionId: ctx.sessionManager.getSessionId(),
+					...(endedBatch ? { batch: endedBatch } : {}),
+				}
+			: undefined;
+		const currentInvocation = endedBatch?.invocations[0] ?? owner?.activeInvocation;
+		const failureAlreadyPublished = currentInvocation
+			? owner?.failureDiagnosticKeys.has(
+					`${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`,
+				)
+			: false;
+		const failure = providerFailureFromAgentEnd(event);
+		return trackLifecycle(async () => {
 			if (failure && !failureAlreadyPublished)
 				await emitLifecycle("agent_failed", ctx, failure, undefined, lifecycleOwner);
 			await emitLifecycle(
@@ -3543,9 +3563,22 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				event.stopReason === "maintenance" ? event.maintenanceOutcome : undefined,
 				lifecycleOwner,
 			);
-		}),
-	);
-	api.on("agent_failed", (event, ctx) => trackLifecycle(async () => emitLifecycle("agent_failed", ctx, event.error)));
+		}, owner);
+	});
+	api.on("agent_failed", (event, ctx) => {
+		const owner = lifecycleStateForContext(ctx);
+		return trackLifecycle(
+			async () =>
+				emitLifecycle(
+					"agent_failed",
+					ctx,
+					event.error,
+					undefined,
+					owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+				),
+			owner,
+		);
+	});
 	api.on("turn_start", async (_event, ctx) => {
 		const current = active;
 		if (!current) return;
@@ -4144,6 +4177,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 		};
 		active = {
+			sessionId,
 			runtime,
 			revisions,
 			cursors,
@@ -4180,6 +4214,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					error: String(cleanupError),
 				});
 				active = {
+					sessionId,
 					runtime,
 					revisions,
 					cursors,
@@ -4232,6 +4267,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			}
 			active = undefined;
+			if (current.openLifecycleBatches.length > 0 || current.lifecycleTasks.size > 0) {
+				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
+				owners.push(current);
+				retiredLifecycleOwners.set(current.sessionId, owners);
+			}
 			current.disposeGate?.();
 			await current.runtime.stop();
 		} catch (error) {
