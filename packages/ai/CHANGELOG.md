@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Exact ID-selected stored literal API keys can now authorize existing model-cache provenance without resolving or exposing secret bytes; command-backed rows, stored environment references, OAuth, runtime overrides, and config overrides remain ineligible, while an explicitly selected stored row keeps precedence over provider environment fallback.
 - Tool-call parsing now preserves bounded, payload-free raw `\uXXXX` position/scalar evidence across provider adapters. Printable ASCII escapes are included because a one-nibble mutation can move an intended non-ASCII scalar into ASCII before decoded-value validation. Process-keyed scalar/path tags, raw and decoded offsets, value ordinals, duplicate-key/depth rejection, total-position accounting, and a process-local integrity tag make partial, altered, malformed, or overflowed evidence explicitly fail-closed without retaining recoverable argument characters or field names (#4927).
 - Ollama Cloud discovery now keeps curated output limits authoritative and gives unknown models a bounded 32,000-token fallback capped by their discovered context window. This replaces the truncation-prone 8,192 fallback without treating the server context length as a verified 131,072-token output capability or sending unbounded `num_predict` requests. Hosted cold starts and long prefills also receive a 300-second first-event window while explicit timeout overrides keep precedence (#4921).
 - Direct model selections now retry zero-token empty OpenAI-compatible responses.

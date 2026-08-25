@@ -1724,8 +1724,15 @@ export async function runRootCommand(
 			);
 		},
 	};
+	let rootStartupCacheAdmissionAttempted = false;
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
+	sessionOptions.modelRegistryStartupMutation = {
+		owner: "cli-root",
+		onAttempt: () => {
+			rootStartupCacheAdmissionAttempted = true;
+		},
+	};
 	sessionOptions.hasUI = isInteractive;
 	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.sdkHostModeSupported = isInteractive;
@@ -1857,7 +1864,7 @@ export async function runRootCommand(
 		// discovery arms; running these concurrently contends for the event loop and stretches
 		// every parallel arm by ~30ms. Startup model profiles do their own foreground refresh
 		// before activation so project-scoped defaults can resolve freshly discovered models.
-		if (!context?.skipPostCreateModelRefresh) {
+		if (!context?.skipPostCreateModelRefresh && !rootStartupCacheAdmissionAttempted) {
 			modelRegistry.refreshInBackground();
 		}
 		return result;
