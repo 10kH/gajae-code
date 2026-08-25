@@ -1287,7 +1287,11 @@ export class Broker {
 						admission.modelPreset ?? null,
 					);
 				}
-				decision = await authority.claimOrJoin(lifecycleIdentity, existingBindingMac, requestBindingMac);
+				decision = await authority.claimOrJoin(
+					lifecycleIdentity,
+					existingBindingMac,
+					existingBindingMac ?? requestBindingMac,
+				);
 				if (decision.kind === "owner") {
 					becameOwner = true;
 					// A recovered pre-send claim may still need to launch. Preserve the
