@@ -399,6 +399,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 	/** Callback when a frame is admitted to the runtime (test harness). */
 	onFrameAdmitted?: () => void;
+	/** Test-only observation of a genuinely timed-out lifecycle drain. */
+	onLifecycleDrainTimeoutForTests?: () => void;
 }
 
 function unavailable(operation: string): () => never {
@@ -4208,10 +4210,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			await current.waitForGateResolutionQuiescence();
 			if (current.lifecycleTasks.size > 0) {
 				const lifecycleDrain = Promise.all([...current.lifecycleTasks]);
-				const timeout = Bun.sleep(LIFECYCLE_QUIESCENCE_MS).then(() => {
-					logger.warn("SDK runtime lifecycle drain timed out; durable lifecycle recovery remains authoritative.");
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const timeout = new Promise<void>(resolve => {
+					timer = setTimeout(resolve, LIFECYCLE_QUIESCENCE_MS);
 				});
-				await Promise.race([lifecycleDrain, timeout]);
+				const drained = Promise.race([lifecycleDrain, timeout]);
+				await drained;
+				if (timer !== undefined) clearTimeout(timer);
+				if (current.lifecycleTasks.size > 0) {
+					logger.warn("SDK runtime lifecycle drain timed out; durable lifecycle recovery remains authoritative.");
+					options.onLifecycleDrainTimeoutForTests?.();
+				}
 			}
 			active = undefined;
 			current.disposeGate?.();

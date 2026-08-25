@@ -2993,6 +2993,7 @@ async function invocationHarness(
 		persistInterceptor?: (transition: { type: string }) => void;
 		/** Hold one matching durable transition until the test releases it. */
 		persistHold?: { type: string; onEntered: () => void; release: Promise<void> };
+		onLifecycleDrainTimeout?: () => void;
 		agentFailedWriteFailures?: number;
 	},
 ): Promise<InvocationHarness> {
@@ -3018,6 +3019,7 @@ async function invocationHarness(
 		: undefined;
 	createSdkSessionRuntimeExtension(api, {
 		agentDir: cwd,
+		...(hooks.onLifecycleDrainTimeout ? { onLifecycleDrainTimeoutForTests: hooks.onLifecycleDrainTimeout } : {}),
 		...(interceptorStore
 			? {
 					terminalAbortSeams: {
@@ -3316,9 +3318,13 @@ describe("post-acceptance invocation terminalization", () => {
 				const release = Promise.withResolvers<void>();
 				const firstInflight = Promise.withResolvers<void>();
 				const secondInflight = Promise.withResolvers<void>();
+				let timeoutWarnings = 0;
 				let prompts = 0;
 				const harness = await invocationHarness(`${operation}-provider-race`, cwd, {
 					persistInterceptor: () => {},
+					onLifecycleDrainTimeout: () => {
+						timeoutWarnings += 1;
+					},
 					persistHold: { type: "agent_failed", onEntered: entered.resolve, release: release.promise },
 					agentFailedWriteFailures: 0,
 					sendUserMessage: async (_content, options) => {
@@ -3376,6 +3382,7 @@ describe("post-acceptance invocation terminalization", () => {
 				).toHaveLength(2);
 				release.resolve();
 				await Promise.all([end, lifecycleChange]);
+				expect(timeoutWarnings).toBe(0);
 				const failure = harness.broadcasts.find(frame => {
 					const payload = frame.payload;
 					return (
@@ -3418,8 +3425,12 @@ describe("post-acceptance invocation terminalization", () => {
 				const entered = Promise.withResolvers<void>();
 				const release = Promise.withResolvers<void>();
 				const firstInflight = Promise.withResolvers<void>();
+				let timeoutWarnings = 0;
 				const harness = await invocationHarness(`${operation}-provider-stall`, cwd, {
 					persistInterceptor: () => {},
+					onLifecycleDrainTimeout: () => {
+						timeoutWarnings += 1;
+					},
 					persistHold: { type: "agent_failed", onEntered: entered.resolve, release: release.promise },
 					agentFailedWriteFailures: 0,
 					sendUserMessage: async (_content, options) => {
@@ -3438,6 +3449,7 @@ describe("post-acceptance invocation terminalization", () => {
 				const lifecycleChange = harness[operation](`${operation}-stall-successor`);
 				await lifecycleChange;
 				expect(Date.now() - startedAt).toBeLessThan(1_500);
+				expect(timeoutWarnings).toBe(1);
 				release.resolve();
 				firstInflight.resolve();
 				await end;
