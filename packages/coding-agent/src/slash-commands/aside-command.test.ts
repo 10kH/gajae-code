@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { ACP_BUILTIN_SLASH_COMMANDS } from "./acp-builtins";
-import { lookupBuiltinSlashCommand } from "./builtin-registry";
 import {
 	ASIDE_INSTALL_COMMAND,
 	ASIDE_USAGE,
@@ -10,6 +8,7 @@ import {
 	posixQuote,
 	probeAsideCli,
 	resolveAsideCliPath,
+	windowsPowerShellQuote,
 } from "./helpers/aside";
 
 function runtimeHarness() {
@@ -73,6 +72,13 @@ describe("posixQuote", () => {
 
 	test("leaves simple paths unquoted", () => {
 		expect(posixQuote("/Users/demo/.local/bin/aside")).toBe("/Users/demo/.local/bin/aside");
+	});
+
+	test("quotes native Windows paths for PowerShell", () => {
+		expect(windowsPowerShellQuote("C:\\Users\\demo\\Aside CLI\\aside.exe")).toBe(
+			"'C:\\Users\\demo\\Aside CLI\\aside.exe'",
+		);
+		expect(windowsPowerShellQuote("C:\\Users\\O'Brien\\aside.exe")).toBe("'C:\\Users\\O''Brien\\aside.exe'");
 	});
 });
 
@@ -164,7 +170,11 @@ describe("/aside slash command", () => {
 		const { runtime, output } = runtimeHarness();
 		expect(
 			await handle(
-				{ name: "aside", args: 'exec --session abc "Continue later"', text: '/aside exec --session abc "Continue later"' },
+				{
+					name: "aside",
+					args: 'exec --session abc "Continue later"',
+					text: '/aside exec --session abc "Continue later"',
+				},
 				runtime,
 			),
 		).toEqual({ consumed: true });
@@ -252,5 +262,17 @@ describe("/aside slash command", () => {
 			exitCode: 1,
 		});
 		expect(output).toEqual(["no daemon\n(exit 1)"]);
+	});
+
+	test("sanitizes CLI control sequences before rendering output", async () => {
+		const handle = createAsideHandler({
+			homedir: () => "/Users/demo",
+			isExecutable: filePath => filePath === "/Users/demo/.local/bin/aside",
+			which: () => null,
+			exec: async () => ({ stdout: "\x1b]0;pwned\x07safe", stderr: "", code: 0, killed: false }),
+		});
+		const { runtime, output } = runtimeHarness();
+		await handle({ name: "aside", args: "account status", text: "/aside account status" }, runtime);
+		expect(output).toEqual(["safe"]);
 	});
 });

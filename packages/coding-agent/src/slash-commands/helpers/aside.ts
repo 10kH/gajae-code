@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { sanitizeText } from "@gajae-code/utils";
 import { type ExecOptions, type ExecResult, execCommand } from "../../exec/exec";
 import { parseCommandArgs } from "../../utils/command-args";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
@@ -38,12 +39,7 @@ export type AsideCliProbe =
 
 export type AsideWhich = (command: string) => string | null | undefined;
 export type AsideIsExecutable = (filePath: string) => boolean;
-export type AsideExec = (
-	command: string,
-	args: string[],
-	cwd: string,
-	options?: ExecOptions,
-) => Promise<ExecResult>;
+export type AsideExec = (command: string, args: string[], cwd: string, options?: ExecOptions) => Promise<ExecResult>;
 
 export interface AsideHandlerOptions {
 	homedir?: () => string;
@@ -75,6 +71,10 @@ function defaultWhich(command: string): string | null {
 	return Bun.which(command) ?? null;
 }
 
+function isSafeAsideCliPath(value: string): boolean {
+	return sanitizeText(value) === value && !/[\r\n]/u.test(value);
+}
+
 /** Resolve the first executable Aside CLI path, or null when none is found. */
 export function resolveAsideCliPath(
 	home = os.homedir(),
@@ -83,10 +83,10 @@ export function resolveAsideCliPath(
 	const isExecutable = options.isExecutable ?? defaultIsExecutable;
 	const which = options.which ?? defaultWhich;
 	for (const candidate of asideCliCandidates(home)) {
-		if (isExecutable(candidate)) return candidate;
+		if (isExecutable(candidate) && isSafeAsideCliPath(candidate)) return candidate;
 	}
 	const fromPath = which("aside");
-	if (fromPath && isExecutable(fromPath)) return fromPath;
+	if (fromPath && isExecutable(fromPath) && isSafeAsideCliPath(fromPath)) return fromPath;
 	return null;
 }
 
@@ -107,12 +107,22 @@ export function posixQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/** Quote a path for the PowerShell command shown on native Windows. */
+export function windowsPowerShellQuote(value: string): string {
+	return `'${value.replace(/'/g, "''")}'`;
+}
+
+function quoteAsidePath(value: string): string {
+	return process.platform === "win32" ? windowsPowerShellQuote(value) : posixQuote(value);
+}
+
 export function formatAsideMissingCli(probe: Extract<AsideCliProbe, { ok: false }>): string {
+	const installLabel = process.platform === "win32" ? "Install with in WSL or Git Bash:" : "Install with:";
 	return [
 		"Aside CLI was not found.",
 		"Looked in:",
 		...probe.searched.map(entry => `  - ${entry}`),
-		"Install with:",
+		installLabel,
 		`  ${probe.manualInstallCommand}`,
 		`Docs: ${probe.url}`,
 		"Then retry /aside, or register MCP with the concrete binary path.",
@@ -120,23 +130,27 @@ export function formatAsideMissingCli(probe: Extract<AsideCliProbe, { ok: false 
 }
 
 export function formatAsideMcpRegistration(cliPath: string): string {
+	const safeCliPath = sanitizeText(cliPath).replace(/[\r\n]/gu, " ");
+	const quotedCliPath = quoteAsidePath(safeCliPath);
 	return [
-		`Aside CLI: ${cliPath}`,
+		`Aside CLI: ${safeCliPath}`,
 		"`/aside mcp` does not start a stdio server inside GJC.",
 		"Register the user-owned MCP definition with the resolved binary:",
-		`  gjc mcp add aside ${posixQuote(cliPath)} mcp --project`,
+		`  gjc mcp add aside ${quotedCliPath} mcp --project`,
 		"Inspect the redacted record with `gjc mcp list --json`.",
 		"Do not paste cookies, screenshots, or private Aside profile paths into issues or PRs.",
 	].join("\n");
 }
 
 function formatExecOutput(result: ExecResult): string {
-	const body = [result.stdout.trim(), result.stderr.trim()].filter(Boolean).join("\n");
+	const body = [sanitizeText(result.stdout).trim(), sanitizeText(result.stderr).trim()].filter(Boolean).join("\n");
 	if (result.killed) {
 		return body ? `${body}\nAside CLI timed out or was cancelled.` : "Aside CLI timed out or was cancelled.";
 	}
 	if (!body) {
-		return result.code === 0 ? "Aside CLI exited 0 with no output." : `Aside CLI exited ${result.code} with no output.`;
+		return result.code === 0
+			? "Aside CLI exited 0 with no output."
+			: `Aside CLI exited ${result.code} with no output.`;
 	}
 	if (result.code !== 0) return `${body}\n(exit ${result.code})`;
 	return body;
@@ -156,7 +170,9 @@ export function createAsideHandler(options: AsideHandlerOptions = {}) {
 		try {
 			const result = await exec(cliPath, args, runtime.cwd, { timeout });
 			await runtime.output(formatExecOutput(result));
-			return result.code === 0 && !result.killed ? commandConsumed() : { consumed: true, exitCode: result.code || 1 };
+			return result.code === 0 && !result.killed
+				? commandConsumed()
+				: { consumed: true, exitCode: result.code || 1 };
 		} catch (error) {
 			return usage(`Aside CLI failed: ${errorMessage(error)}`, runtime);
 		}
@@ -181,7 +197,7 @@ export function createAsideHandler(options: AsideHandlerOptions = {}) {
 			return usage(
 				[
 					"`/aside repl` needs a real terminal TTY.",
-					`Run this outside GJC: ${posixQuote(probe.path)} repl`,
+					`Run this outside GJC: ${quoteAsidePath(probe.path)} repl`,
 				].join("\n"),
 				runtime,
 			);

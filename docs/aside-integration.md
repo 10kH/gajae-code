@@ -79,6 +79,7 @@ Behavior:
 - `/aside mcp` prints `gjc mcp add aside <resolved-cli> mcp --project`. It does not start `aside mcp` inside GJC, because that command is a stdio server.
 - `/aside repl` is refused inside GJC. Run `aside repl` in a real terminal TTY.
 - If the CLI is missing, GJC prints the searched paths and `curl -fsSL https://releases.aside.com/install.sh | bash`. It never runs the installer.
+- On native Windows, the printed MCP and REPL commands use PowerShell quoting; the documented installer command is for WSL or Git Bash, not PowerShell itself.
 
 Probe order: `~/.local/bin/aside`, then `~/.aside/cli/Aside CLI.app/Contents/MacOS/aside`, then `PATH`.
 
