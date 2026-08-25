@@ -8,6 +8,7 @@
  * No output path may echo the task or capability.
  */
 import { randomUUID } from "node:crypto";
+import * as path from "node:path";
 import { getAgentDir } from "@gajae-code/utils";
 import { type IndexedSession, isSessionAuthorityEligible, SessionIndex } from "../broker/session-index";
 import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
@@ -225,7 +226,7 @@ export async function runSdkSpawn(
 			masterCapability: capability,
 			ownerSessionId,
 			attestationEpoch,
-			cwd: args.cwd,
+			cwd: args.cwd === undefined ? undefined : path.resolve(args.cwd),
 			...(args.model === undefined ? {} : { modelId: args.model }),
 			...(args.profile === undefined ? {} : { modelPreset: args.profile }),
 		},

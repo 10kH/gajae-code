@@ -150,4 +150,20 @@ describe("gjc sdk spawn CLI", () => {
 		expect(error.code).toBe("master_context_required");
 		expect(error.exitCode).toBe(1);
 	});
+
+	it("resolves relative cwd before broker dispatch", async () => {
+		let dispatchedCwd: unknown;
+		await runSdkSpawn(
+			{ cwd: ".", prompt: task },
+			{
+				env: masterEnv,
+				resolveAttestationEpoch: epoch,
+				dispatch: async (_agentDir, input) => {
+					dispatchedCwd = input.cwd;
+					return { ok: true, result: { code: "spawn_accepted" } };
+				},
+			},
+		);
+		expect(dispatchedCwd).toBe(process.cwd());
+	});
 });

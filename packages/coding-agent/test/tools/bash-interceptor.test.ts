@@ -56,10 +56,11 @@ describe("Bash master capability command boundary", () => {
 			isStrictDirectSdkSpawnCommand("env GJC_MASTER_CAPABILITY=forged gjc sdk spawn --cwd /tmp --prompt task"),
 		).toBe(false);
 		expect(
-			masterCommandEnvOverrides({ PATH: "/tmp/fake", FOO: "bar", GJC_MASTER_CAPABILITY: "forged" }, true),
-		).toEqual({
-			FOO: "bar",
-		});
+			masterCommandEnvOverrides(
+				{ PATH: "/tmp/fake", LD_PRELOAD: "/tmp/steal.so", FOO: "bar", GJC_MASTER_CAPABILITY: "forged" },
+				true,
+			),
+		).toEqual({});
 	});
 });
 

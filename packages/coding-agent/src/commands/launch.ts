@@ -71,7 +71,7 @@ async function assertLaunchWorktreeUnoccupied(worktree: GjcLaunchWorktreePlan | 
 	try {
 		sessions = (await new SessionIndex(getAgentDir()).open()).listSessions().sessions;
 	} catch {
-		return;
+		throw new Error(`worktree_occupancy_unavailable:${worktree.worktreePath}`);
 	}
 	const occupant = worktreeOccupant(sessions, worktree.worktreePath);
 	if (occupant)

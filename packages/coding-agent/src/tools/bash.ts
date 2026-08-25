@@ -69,7 +69,6 @@ const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
-const MASTER_COMMAND_RESOLUTION_ENV = new Set([MASTER_CAPABILITY_ENV, "PATH", "PATHEXT", "BASH_ENV", "ENV"]);
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
 	GREP_OPTIONS: "",
@@ -557,11 +556,8 @@ export function masterCommandEnvOverrides(
 	env: Record<string, string> | undefined,
 	directMasterSpawn: boolean,
 ): Record<string, string> {
-	return Object.fromEntries(
-		Object.entries(env ?? {}).filter(([key]) =>
-			directMasterSpawn ? MASTER_COMMAND_RESOLUTION_ENV.has(key) === false : key !== MASTER_CAPABILITY_ENV,
-		),
-	);
+	if (directMasterSpawn) return {};
+	return Object.fromEntries(Object.entries(env ?? {}).filter(([key]) => key !== MASTER_CAPABILITY_ENV));
 }
 
 function escapeBashEnvValueForDisplay(value: string): string {
