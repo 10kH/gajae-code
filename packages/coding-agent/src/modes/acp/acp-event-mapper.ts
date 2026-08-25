@@ -7,6 +7,9 @@ import type {
 	ToolKind,
 } from "@agentclientprotocol/sdk";
 import type { AgentSessionEvent } from "../../session/agent-session";
+
+export type { AgentSessionEvent };
+
 import { resolveToCwd } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo-write";
 import type { AgentWireEventPayload } from "../shared/agent-wire/event-contract";
