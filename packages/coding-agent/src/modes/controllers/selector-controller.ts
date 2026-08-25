@@ -1469,9 +1469,12 @@ export class SelectorController {
 	async showFrictionlessOnboarding(): Promise<void> {
 		const agentDir = this.ctx.session.getSessionAgentDir();
 		const presence = await discoverOnboardingRootPresence();
-		const initialProfile = deriveOnboardingProfile([], {
+		// An explicit `/language` (or settings) selection outranks locale and transcript evidence.
+		const profileOptions = {
 			osLocale: Intl.DateTimeFormat().resolvedOptions().locale,
-		});
+			...(this.ctx.settings.has("ui.language") ? { preferredLanguage: this.ctx.settings.get("ui.language") } : {}),
+		};
+		const initialProfile = deriveOnboardingProfile([], profileOptions);
 
 		const open = (profile: OnboardingProfile, stage: FrictionlessOnboardingStage): void => {
 			const text = getFrictionlessOnboardingCopy(profile.language);
@@ -1481,9 +1484,7 @@ export class SelectorController {
 					async action => {
 						if (action === "analyze") {
 							const evidence = await analyzeOnboardingEvidence(presence);
-							const analyzed = deriveOnboardingProfile(evidence, {
-								osLocale: Intl.DateTimeFormat().resolvedOptions().locale,
-							});
+							const analyzed = deriveOnboardingProfile(evidence, profileOptions);
 							done();
 							open(analyzed, analyzed.operations?.length ? "preview" : "manual");
 							return;

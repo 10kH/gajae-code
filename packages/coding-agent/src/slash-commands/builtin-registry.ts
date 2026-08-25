@@ -30,6 +30,7 @@ import {
 	canApplyComposerSubmission,
 	type InteractiveModeContext,
 } from "../modes/types";
+import { parseUiLanguage, resolveUiLanguage, UI_LANGUAGE_LABELS, UI_LANGUAGES, uiString } from "../modes/ui-language";
 // W1b/W5b: notification-service and daemon controllers stay off the static
 // import graph; the /notify handlers import them lazily at first use.
 import type { NotificationProvider } from "../sdk/bus/config";
@@ -738,6 +739,51 @@ const BUILTIN_SLASH_COMMAND_REGISTRY: ReadonlyArray<SlashCommandSpec> = [
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showSettingsSelector();
 			runtime.ctx.editor.setText("");
+		},
+	},
+	{
+		name: "language",
+		priority: 41,
+		description: "Change the interactive UI language, or show the current one",
+		subcommands: UI_LANGUAGES.map(code => ({ name: code, description: UI_LANGUAGE_LABELS[code] })),
+		inlineHint: `[${UI_LANGUAGES.join("|")}]`,
+		allowArgs: true,
+		handleTui: (command, runtime) => {
+			const ctx = runtime.ctx;
+			const requested = command.args?.trim() ?? "";
+			const current = resolveUiLanguage(ctx.settings.get("ui.language"));
+			if (!requested) {
+				ctx.showStatus(
+					`${uiString(current, "language.current")} ${UI_LANGUAGE_LABELS[current]} · /language [${UI_LANGUAGES.join("|")}]`,
+				);
+				ctx.editor.setText("");
+				return;
+			}
+			const selected = parseUiLanguage(requested);
+			if (!selected) {
+				const available = UI_LANGUAGES.map(code => `${code} (${UI_LANGUAGE_LABELS[code]})`).join(", ");
+				ctx.showError(`${uiString(current, "language.unknown")}: "${requested}". ${available}`);
+				ctx.editor.setText("");
+				return;
+			}
+			if (!ctx.settings.canWriteDurableConfig()) {
+				ctx.showError(
+					"Cannot change settings while config.yml has invalid YAML syntax. Repair config.yml and reload settings.",
+				);
+				ctx.editor.setText("");
+				return;
+			}
+			try {
+				ctx.settings.set("ui.language", selected);
+			} catch (error) {
+				ctx.showError(error instanceof Error ? error.message : String(error));
+				ctx.editor.setText("");
+				return;
+			}
+			ctx.statusLine.invalidate();
+			ctx.ui.invalidate();
+			ctx.showStatus(`${uiString(selected, "language.changed")} ${UI_LANGUAGE_LABELS[selected]}`);
+			ctx.editor.setText("");
 		},
 	},
 	{
