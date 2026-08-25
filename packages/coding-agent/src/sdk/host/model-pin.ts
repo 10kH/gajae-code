@@ -91,7 +91,6 @@ export async function resolveSdkHostModel(
 
 /** Default resolver used by the SDK broker host. */
 export function createDefaultSdkHostModelResolver(agentDir: string): SdkHostModelResolver {
-<<<<<<< HEAD
 	const loadRegistry = createSdkHostModelRegistryLoader(
 		() => discoverAuthStorage(agentDir),
 		path.join(agentDir, "models.yml"),
@@ -99,8 +98,4 @@ export function createDefaultSdkHostModelResolver(agentDir: string): SdkHostMode
 	);
 	return (raw: unknown, context?: SdkHostModelResolveContext): Promise<SdkHostModelResolution> =>
 		resolveSdkHostModel(raw, loadRegistry, context);
-=======
-	const loadRegistry = createSdkHostModelRegistryLoader(() => discoverAuthStorage(agentDir));
-	return (raw: unknown): Promise<SdkHostModelResolution> => resolveSdkHostModel(raw, loadRegistry);
->>>>>>> 05b9c8696 (fix(sdk): route coordinator model pins through host boundary)
 }
