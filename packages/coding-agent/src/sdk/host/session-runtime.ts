@@ -3136,6 +3136,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	type LifecycleBatch = RuntimeState["openLifecycleBatches"][number];
 	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
+	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
 	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const sessionFile = ctx.sessionManager.getSessionFile?.();
@@ -3154,18 +3155,29 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		);
 		if (type !== "agent_start") {
 			const delayedOwner = retired.find(owner => owner.openLifecycleBatches.length > 0);
-			if (delayedOwner) return delayedOwner;
+			if (delayedOwner) {
+				if (active?.sessionIdentity === sessionIdentity && active.openLifecycleBatches.length > 0) return undefined;
+				return delayedOwner;
+			}
 		}
 		if (active?.sessionIdentity === sessionIdentity) return active;
 		return retired[0];
 	};
-	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
-		if (owner.openLifecycleBatches.length > 0 || owner.lifecycleTasks.size > 0) return;
+	const removeRetiredLifecycleOwner = (owner: RuntimeState): void => {
+		const timer = retiredLifecycleOwnerTimers.get(owner);
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			retiredLifecycleOwnerTimers.delete(owner);
+		}
 		const owners = retiredLifecycleOwners.get(owner.sessionId);
 		if (!owners) return;
 		const remaining = owners.filter(candidate => candidate !== owner);
 		if (remaining.length === 0) retiredLifecycleOwners.delete(owner.sessionId);
 		else retiredLifecycleOwners.set(owner.sessionId, remaining);
+	};
+	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
+		if (owner.openLifecycleBatches.length > 0 || owner.lifecycleTasks.size > 0) return;
+		removeRetiredLifecycleOwner(owner);
 	};
 	// Shared with the control surface's terminal abort: the correlated
 	// agent_end publication capture (AC 19). terminalAbort installs a fresh
@@ -3465,9 +3477,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					observed = false;
 					failedTransitions.push(invocation);
 					if (type === "agent_failed") {
-						current.failureDiagnosticKeys.delete(
-							`${invocation.correlation.commandId}:${invocation.correlation.turnId}`,
-						);
 						// Keep the sanitized reason: the later agent_end must re-record
 						// it before terminalizing, or a successful boundary write
 						// classifies the failed run terminal_ok (exact-head review P1).
@@ -3606,6 +3615,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	});
 	api.on("agent_failed", (event, ctx) => {
 		const owner = lifecycleStateForContext(ctx, "agent_failed");
+		const failedBatch = owner?.openLifecycleBatches[0];
 		return trackLifecycle(
 			async () =>
 				emitLifecycle(
@@ -3613,7 +3623,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					ctx,
 					event.error,
 					undefined,
-					owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+					owner
+						? {
+								state: owner,
+								sessionId: owner.sessionId,
+								...(failedBatch ? { batch: failedBatch } : {}),
+							}
+						: undefined,
 				),
 			owner,
 		);
@@ -4290,6 +4306,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const stopActive = async (): Promise<void> => {
 		const current = active;
 		if (!current) return;
+		activePromptOwnerHolder.connectionIds = undefined;
+		activePromptOwnerHolder.lifecycleEpoch = undefined;
 		current.quiesceInput();
 		current.deadlineManager.clearAll();
 		current.fenceGateResolutions();
@@ -4314,6 +4332,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
 				owners.push(current);
 				retiredLifecycleOwners.set(current.sessionId, owners);
+				const timer = setTimeout(() => {
+					retiredLifecycleOwnerTimers.delete(current);
+					removeRetiredLifecycleOwner(current);
+				}, LIFECYCLE_QUIESCENCE_MS);
+				retiredLifecycleOwnerTimers.set(current, timer);
 			}
 			current.disposeGate?.();
 			await current.runtime.stop();
