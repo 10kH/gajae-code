@@ -1,4 +1,4 @@
-export const UI_LANGUAGES = ["en", "ko"] as const;
+export const UI_LANGUAGES = ["en", "ko", "ja"] as const;
 
 export type UiLanguage = (typeof UI_LANGUAGES)[number];
 
@@ -23,6 +23,7 @@ const ENGLISH_STRINGS = {
 	"settings.language.description": "Language for human-facing interactive UI text",
 	"settings.language.english": "English",
 	"settings.language.korean": "Korean (한국어)",
+	"settings.language.japanese": "Japanese (日本語)",
 	"language.current": "Current UI language:",
 	"language.changed": "UI language changed to",
 	"language.unknown": "Unknown language",
@@ -51,24 +52,59 @@ const KOREAN_STRINGS: Record<UiStringKey, string> = {
 	"settings.language.description": "사람이 읽는 대화형 UI 텍스트의 언어",
 	"settings.language.english": "English",
 	"settings.language.korean": "한국어",
+	"settings.language.japanese": "日本語",
 	"language.current": "현재 UI 언어:",
 	"language.changed": "UI 언어를 다음으로 변경했습니다:",
 	"language.unknown": "알 수 없는 언어",
 };
 
+const JAPANESE_STRINGS: Record<UiStringKey, string> = {
+	"settings.title": "設定",
+	"settings.navigationHint": "(Tab キーで切り替え)",
+	"settings.selectHint": "  Enter: 選択 · Esc: 戻る",
+	"settings.preview": "プレビュー:",
+	"settings.tab.appearance": "外観",
+	"settings.tab.model": "モデル",
+	"settings.tab.interaction": "操作",
+	"settings.tab.context": "コンテキスト",
+	"settings.tab.memory": "メモリ",
+	"settings.tab.editing": "編集",
+	"settings.tab.tools": "ツール",
+	"settings.tab.tasks": "タスク",
+	"settings.tab.providers": "プロバイダー",
+	"settings.tab.notifications": "通知",
+	"settings.tab.plugins": "プラグイン",
+	"settings.tab.gjcBundles": "GJC バンドル",
+	"settings.language.label": "言語",
+	"settings.language.description": "対話型 UI テキストに使う言語",
+	"settings.language.english": "English",
+	"settings.language.korean": "한국어",
+	"settings.language.japanese": "日本語",
+	"language.current": "現在の UI 言語:",
+	"language.changed": "UI 言語を次に変更しました:",
+	"language.unknown": "不明な言語",
+};
+
+const STRINGS: Record<UiLanguage, Record<UiStringKey, string>> = {
+	en: ENGLISH_STRINGS,
+	ko: KOREAN_STRINGS,
+	ja: JAPANESE_STRINGS,
+};
+
 /** User selection is authoritative; invalid or unavailable values deterministically fall back to English. */
 export function resolveUiLanguage(value: unknown): UiLanguage {
-	return value === "ko" ? "ko" : "en";
+	return value === "ko" || value === "ja" ? value : "en";
 }
 
 export function uiString(language: unknown, key: UiStringKey): string {
-	return resolveUiLanguage(language) === "ko" ? KOREAN_STRINGS[key] : ENGLISH_STRINGS[key];
+	return STRINGS[resolveUiLanguage(language)][key];
 }
 
 /** Endonym shown by `/language` and the language submenu. */
 export const UI_LANGUAGE_LABELS: Record<UiLanguage, string> = {
 	en: "English",
 	ko: "한국어",
+	ja: "日本語",
 };
 
 /** Spellings accepted by `/language`; the canonical codes stay authoritative. */
@@ -81,6 +117,11 @@ const UI_LANGUAGE_ALIASES: Readonly<Record<string, UiLanguage>> = {
 	kor: "ko",
 	korean: "ko",
 	한국어: "ko",
+	ja: "ja",
+	jp: "ja",
+	jpn: "ja",
+	japanese: "ja",
+	日本語: "ja",
 };
 
 export function parseUiLanguage(value: string): UiLanguage | undefined {

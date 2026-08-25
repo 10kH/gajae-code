@@ -43,6 +43,16 @@ describe("config CLI schema coverage", () => {
 			type: "enum",
 			description: "Language for human-facing interactive UI text",
 		});
+
+		await runConfigCommand({ action: "set", key: "ui.language", value: "ja", flags: { json: true } });
+		await runConfigCommand({ action: "get", key: "ui.language", flags: { json: true } });
+
+		expect(JSON.parse(String(logSpy.mock.calls.at(-1)?.[0]))).toEqual({
+			key: "ui.language",
+			value: "ja",
+			type: "enum",
+			description: "Language for human-facing interactive UI text",
+		});
 	});
 
 	it("renders record settings as JSON and with record type in text output", async () => {
