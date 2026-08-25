@@ -3145,15 +3145,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
 	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
-	const fallbackSessionManagerIdentities = new WeakMap<object, string | null>();
 	const ambiguousLifecycleIdentities = new Set<string>();
 	const lifecycleRunOwners = new Map<string, { state: RuntimeState; batch?: LifecycleBatch }>();
 	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
 		const sessionFile = ctx.sessionManager.getSessionFile?.();
 		if (sessionFile) return `${sessionId}\u0000${sessionFile}`;
-		const fallbackIdentity = fallbackSessionManagerIdentities.get(ctx.sessionManager);
-		return fallbackIdentity === null ? undefined : fallbackIdentity;
+		const stateRoot = path.join(ctx.cwd, ".gjc", "state");
+		return `${sessionId}\u0000${resolveReconciliationSessionFile(undefined, stateRoot, sessionId)}`;
 	};
 	const lifecycleStateForContext = (
 		ctx: ExtensionContext,
@@ -3755,11 +3754,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
 			resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
 		const sessionIdentity = `${sessionId}\u0000${sessionFile}`;
-		if (!ctx.sessionManager.getSessionFile?.())
-			if (fallbackSessionManagerIdentities.has(ctx.sessionManager)) {
-				const previousIdentity = fallbackSessionManagerIdentities.get(ctx.sessionManager);
-				if (previousIdentity !== sessionIdentity) fallbackSessionManagerIdentities.set(ctx.sessionManager, null);
-			} else fallbackSessionManagerIdentities.set(ctx.sessionManager, sessionIdentity);
 		const reconciliationStore =
 			options.terminalAbortSeams?.getReconciliationStore?.() ??
 			createReconciliationStore({ sessionFile, sessionId });
