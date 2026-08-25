@@ -26,7 +26,6 @@ import {
 	writeSessionLifecycleReady,
 } from "../sdk/broker/lifecycle";
 import { processIncarnation } from "../sdk/broker/process-incarnation";
-import { resolveSdkPackageAuthority } from "../sdk/broker/runtime";
 import { writeBrokerStartupFailureMarker } from "../sdk/broker/startup-failure";
 import { runSdkSessionCli } from "../sdk/cli";
 import { runSdkGuidesCli } from "../sdk/guides/cli";
@@ -979,16 +978,8 @@ export default class Sdk extends Command {
 			return;
 		}
 		const agentDir = internal.agentDir;
-		const authority = resolveSdkPackageAuthority({ force: true });
 		const broker = new Broker({
 			agentDir,
-			// Published in broker discovery so ensurers can retire a broker that
-			// predates the current package install instead of reusing stale code.
-			// Resolve inside the child: the parent may have observed a different
-			// package between spawn resolution and child startup.
-			packageGeneration: authority.generation,
-			packageVersion: authority.packageVersion,
-			installationIdentity: authority.installationIdentity,
 			resolveDirectoryMigration: async cwd => {
 				const settings = await Settings.loadForScope({ cwd, agentDir });
 				try {

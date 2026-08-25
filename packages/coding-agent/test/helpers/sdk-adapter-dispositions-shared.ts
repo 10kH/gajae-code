@@ -15,7 +15,6 @@ import { AcpSdkAdapter } from "../../src/sdk/acp";
 import { Broker } from "../../src/sdk/broker";
 import { brokerOwnerForTest } from "../../src/sdk/broker/ensure";
 import { processIncarnation } from "../../src/sdk/broker/process-incarnation";
-import { resolveSdkPackageAuthority } from "../../src/sdk/broker/runtime";
 import { runSdkSessionCli } from "../../src/sdk/cli/session-cli";
 import { SdkClient } from "../../src/sdk/client";
 import { createSdkMcpServer } from "../../src/sdk/mcp";
@@ -90,7 +89,6 @@ export type AdapterFixture = {
 
 export const machineAdapters: readonly MachineAdapter[] = ["mcp", "acp", "daemonCli"];
 export const adapterPrefix: Record<MachineAdapter, string> = { mcp: "M", acp: "A", daemonCli: "L" };
-const adapterFixtureAuthority = resolveSdkPackageAuthority();
 
 export function expectedOutcome(adapter: MachineAdapter, operation: Operation, secret = false): Expected {
 	if (secret) return "rejected_before_send";
@@ -305,7 +303,7 @@ export async function fixture(): Promise<AdapterFixture> {
 	const productionHost = await startProductionSdkHost(repo, { acceptPromptPreflightWithoutExecution: true });
 	const sessionId = productionHost.sessionId;
 	const observed: ObservedRequest[] = productionHost.observed;
-	const broker = new Broker({ agentDir, ...adapterFixtureAuthority });
+	const broker = new Broker({ agentDir, packageGeneration: "adapter-dispositions" });
 	const brokerEndpoint = await broker.start();
 	const handleRequest = broker.handleRequest.bind(broker);
 	broker.handleRequest = async (operation, input, idempotencyKey) => {

@@ -3,7 +3,6 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
-
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";

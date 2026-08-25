@@ -183,9 +183,6 @@ it("isolates source SDK children and preserves compiled self-spawn", () => {
 		file: process.execPath,
 		args: ["sdk", "session-host-internal"],
 		env: { PATH: process.env.PATH, PI_COMPILED: "spoofed" },
-		generation: expect.any(String),
-		packageVersion: expect.any(String),
-		installationIdentity: process.execPath,
 	});
 	expect(compiled.env.BUN_OPTIONS).toBeUndefined();
 	const windowsMarkerPath = "C:/~BUN/root/internal-source-marker-2178-abcd.txt";
@@ -201,9 +198,6 @@ it("isolates source SDK children and preserves compiled self-spawn", () => {
 		file: process.execPath,
 		args: ["sdk", "broker-internal"],
 		env: { PATH: process.env.PATH, PI_COMPILED: "spoofed" },
-		generation: expect.any(String),
-		packageVersion: expect.any(String),
-		installationIdentity: process.execPath,
 	});
 });
 
@@ -866,7 +860,7 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message).toContain("Retained broker publication authority is unavailable.");
+			expect(refusal?.message).toMatch(/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/);
 			// The native refusal stays authoritative and is retained verbatim as cause.
 			expect((refusal?.cause as Error | undefined)?.message).toContain(
 				"Retained broker publication authority is unavailable.",
@@ -1128,12 +1122,13 @@ describe("SDK broker identity and discovery", () => {
 			heartbeatAt: Date.now(),
 		};
 		try {
+			// The unmocked native accepts this layout, which is what makes a kind
+			// complaint about it an invented condition.
 			const refusal = await publishBrokerDiscovery(dir, discovery).then(
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message).toContain("Retained broker publication authority is unavailable.");
-			expect((refusal?.cause as Error | undefined)?.message).toContain("owner.json");
+			expect(refusal?.message).toMatch(/owner\.json is not a regular file/);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
@@ -1161,7 +1156,7 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message).toContain("Retained broker publication authority is unavailable.");
+			expect(refusal?.message).toMatch(/sdk\/broker\.lock could not be opened \(ENOTDIR\)/);
 			expect((refusal?.cause as Error | undefined)?.message).toContain(nativeRefusal.message);
 		} finally {
 			await fs.rm(dir, { recursive: true, force: true });
@@ -1320,7 +1315,7 @@ describe("SDK broker identity and discovery", () => {
 				() => undefined,
 				(error: unknown) => error as Error,
 			);
-			expect(refusal?.message.slice(0, 512)).toContain("Retained broker publication authority is unavailable.");
+			expect(refusal?.message.slice(0, 512)).toMatch(/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/);
 			// The bound only matters because this message is what the durable startup
 			// marker persists, so assert through the marker rather than the throw.
 			await writeBrokerStartupFailureMarker(root, {
@@ -1329,8 +1324,8 @@ describe("SDK broker identity and discovery", () => {
 				signal: null,
 				pid: process.pid,
 			});
-			expect((await readBrokerStartupFailureMarker(root))?.reason).toContain(
-				"Retained broker publication authority is unavailable.",
+			expect((await readBrokerStartupFailureMarker(root))?.reason).toMatch(
+				/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/,
 			);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
@@ -1378,8 +1373,8 @@ describe("SDK broker identity and discovery", () => {
 				signal: null,
 				pid: process.pid,
 			});
-			expect((await readBrokerStartupFailureMarker(dir))?.reason).toContain(
-				"Retained broker publication authority is unavailable.",
+			expect((await readBrokerStartupFailureMarker(dir))?.reason).toMatch(
+				/sdk could not be opened \((?:ELOOP|ENOTDIR)\)/,
 			);
 		} finally {
 			spy.mockRestore();
@@ -1874,7 +1869,7 @@ describe("SDK broker identity and discovery", () => {
 		await owner?.stop();
 		expect(brokerOwnerForTest(dir)).toBeUndefined();
 		await fs.rm(dir, { recursive: true, force: true });
-	}, 20_000);
+	});
 	it("leaves exactly one live detached broker after concurrent process startup", async () => {
 		const dir = await temp();
 		const children = [0, 1].map(() =>

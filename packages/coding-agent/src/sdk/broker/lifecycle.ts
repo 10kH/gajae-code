@@ -78,7 +78,7 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
-import { isSessionAuthorityEligible } from "./session-index";
+import { type IndexedSession, isSessionAuthorityEligible } from "./session-index";
 import {
 	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
@@ -3345,7 +3345,6 @@ function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorkt
 	};
 }
 
-
 function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
 	const prepared = ensureLaunchWorktree(plan);
 	if (!prepared.enabled || path.resolve(prepared.worktreePath) !== path.resolve(plan.worktreePath))
@@ -4247,7 +4246,6 @@ async function executeLifecycleResponse(
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
-				const commandEnvironment = "kind" in cmd ? cmd.env : process.env;
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
@@ -4258,7 +4256,7 @@ async function executeLifecycleResponse(
 					// by the OS rather than captured (#4712 review).
 					stdio: "ignore",
 					env: {
-						...commandEnvironment,
+						...("kind" in cmd ? cmd.env : process.env),
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,

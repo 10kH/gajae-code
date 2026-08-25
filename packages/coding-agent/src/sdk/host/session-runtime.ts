@@ -24,7 +24,6 @@ import {
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
 import { ensureBroker } from "../broker/ensure";
-
 import { SessionIndex } from "../broker/session-index";
 import {
 	collectAuthenticatedProfileProviders,
