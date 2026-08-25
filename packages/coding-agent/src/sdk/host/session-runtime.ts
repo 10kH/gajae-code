@@ -3129,6 +3129,15 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		ctx: ExtensionContext,
 		failureCause?: unknown,
 		maintenanceOutcome?: string,
+		failureBatch?: {
+			epoch: number;
+			invocations: Array<{
+				kind: InvocationKind;
+				correlation: InvocationCorrelation;
+				connectionId: string | undefined;
+			}>;
+			attachedInvocations: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }>;
+		},
 	): Promise<void> => {
 		const current = active;
 		if (!current) return;
@@ -3157,15 +3166,16 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		let transitions: Array<{ kind: InvocationKind; correlation: InvocationCorrelation }> = [];
 		if (type === "agent_failed") {
-			const activeInvocation = current.activeInvocation;
+			const activeInvocation = failureBatch?.invocations[0] ?? current.activeInvocation;
 			const activeBatch = activeInvocation
-				? current.openLifecycleBatches.find(batch =>
+				? (failureBatch ??
+					current.openLifecycleBatches.find(batch =>
 						batch.invocations.some(
 							entry =>
 								entry.correlation.commandId === activeInvocation.correlation.commandId &&
 								entry.correlation.turnId === activeInvocation.correlation.turnId,
 						),
-					)
+					))
 				: undefined;
 			const fallback =
 				activeBatch?.invocations ??
@@ -3245,9 +3255,11 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// may already have advanced to. Publication proof and race retirement must
 		// use the same batch identity as reconciliation.
 		const eventLifecycleEpoch =
-			type === "agent_end"
-				? (current.openLifecycleBatches[0]?.epoch ?? current.lifecycleEpoch)
-				: current.lifecycleEpoch;
+			type === "agent_failed" && failureBatch
+				? failureBatch.epoch
+				: type === "agent_end"
+					? (current.openLifecycleBatches[0]?.epoch ?? current.lifecycleEpoch)
+					: current.lifecycleEpoch;
 		const resolveTerminalPublicationWaiters = (observed: boolean): void => {
 			const waiters = terminalPublicationCapture.waiters;
 			if (!waiters) return;
@@ -3467,13 +3479,17 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	api.on("agent_end", async (event, ctx) => {
 		const failure = providerFailureFromAgentEnd(event);
 		const current = active;
-		const currentInvocation = current?.activeInvocation ?? current?.openLifecycleBatches[0]?.invocations[0];
+		// Capture the oldest unmatched batch synchronously. A successor may start
+		// while the failed diagnostic persists; that must not retarget the
+		// predecessor's reason or terminal boundary to the successor invocation.
+		const endedBatch = current?.openLifecycleBatches[0];
+		const currentInvocation = endedBatch?.invocations[0] ?? current?.activeInvocation;
 		const failureAlreadyPublished = currentInvocation
 			? current?.failureDiagnosticKeys.has(
 					`${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`,
 				)
 			: false;
-		if (failure && !failureAlreadyPublished) await emitLifecycle("agent_failed", ctx, failure);
+		if (failure && !failureAlreadyPublished) await emitLifecycle("agent_failed", ctx, failure, undefined, endedBatch);
 		await emitLifecycle(
 			"agent_end",
 			ctx,

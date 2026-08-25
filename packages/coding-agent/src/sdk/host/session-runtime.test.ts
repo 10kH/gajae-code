@@ -3201,6 +3201,52 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("binds a delayed predecessor provider failure to its own batch after a replacement starts", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-delayed-provider-batch-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const secondInflight = Promise.withResolvers<void>();
+			let prompts = 0;
+			const harness = await invocationHarness("delayed-provider-batch", cwd, {
+				sendUserMessage: async (_content, options) => {
+					prompts += 1;
+					await options?.onPreflightAcceptCommit?.();
+					if (prompts === 1) await firstInflight.promise;
+					if (prompts === 2) await secondInflight.promise;
+				},
+				persistInterceptor: () => {},
+			});
+			const first = await harness.control("turn.prompt", { text: "first", clientRef: "delayed-first" });
+			expect(first.ok).toBe(true);
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			await harness.emit("agent_start");
+			const replacement = await harness.control("turn.abort_and_prompt", { text: "replacement" });
+			expect(replacement).toMatchObject({ ok: true, result: { accepted: true } });
+			const replacementIds = { commandId: replacement.result?.commandId, turnId: replacement.result?.turnId };
+			await harness.emit("agent_start");
+			expect((await harness.query("turn.prompt_status", replacementIds)).result?.status).toBe("in_flight");
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
+			});
+			expect(await settledStatus(harness, "turn.prompt_status", firstIds)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_http_402" },
+			});
+			expect((await harness.query("turn.prompt_status", replacementIds)).result?.status).toBe("in_flight");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", replacementIds)).toMatchObject({
+				status: "terminal_ok",
+			});
+			firstInflight.resolve();
+			secondInflight.resolve();
+			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("a prompt killed by a provider stream interrupt reports a terminal failed status", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-prompt-"));
 		try {
