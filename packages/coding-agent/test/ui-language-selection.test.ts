@@ -71,6 +71,29 @@ describe("interactive UI language selection", () => {
 		expect(submenu).toContain("한국어");
 	});
 
+	it("renders persisted Japanese settings chrome and offers it as a select option", () => {
+		settings.set("ui.language", "ja");
+		const selector = createSelector();
+		const rendered = selector.render(160).map(Bun.stripANSI).join("\n");
+
+		expect(rendered).toContain("設定:");
+		expect(rendered).toContain("外観");
+		expect(rendered).toContain("言語");
+		expect(settings.get("ui.language")).toBe("ja");
+
+		selector.handleInput("\x1b[B"); // Light Theme
+		selector.handleInput("\x1b[B"); // Language
+		selector.handleInput("\n");
+		const submenu = selector.render(160).map(Bun.stripANSI).join("\n");
+		expect(submenu).toContain("言語");
+		expect(submenu).toContain("対話型 UI テキストに使う言語");
+		expect(submenu).toContain("日本語");
+	});
+
+	it("validates Japanese in the settings enum patch surface", () => {
+		expect(validateSettingPatch({ "ui.language": "ja" })).toEqual([]);
+	});
+
 	it("keeps the operator language authoritative over runtime overrides", () => {
 		expect(
 			Settings.isolated({ "ui.language": "ko" }, { overrides: { "ui.language": "en" } }).get("ui.language"),
@@ -102,7 +125,7 @@ describe("/language slash command", () => {
 			settings: {
 				get: (path: "ui.language") => settings.get(path),
 				has: (path: "ui.language") => settings.has(path),
-				set: (path: "ui.language", value: "en" | "ko") => settings.set(path, value),
+				set: (path: "ui.language", value: "en" | "ko" | "ja") => settings.set(path, value),
 				canWriteDurableConfig: () => options.canWriteDurableConfig ?? settings.canWriteDurableConfig(),
 			},
 			editor: { setText: () => {} },
@@ -132,7 +155,22 @@ describe("/language slash command", () => {
 		expect(status[0]).toContain("한국어");
 	});
 
-	it("accepts endonym, English-name, ISO, and locale-tag spellings", async () => {
+	it("persists the Japanese canonical code and confirms in Japanese", async () => {
+		const { status, runtime } = harness();
+
+		expect(await executeBuiltinSlashCommand("/language ja", runtime as never)).toBe(true);
+
+		expect(settings.get("ui.language")).toBe("ja");
+		expect(status[0]).toContain("UI 言語を次に変更しました:");
+		expect(status[0]).toContain("日本語");
+	});
+
+	it("accepts Japanese endonym, English-name, ISO, and locale-tag spellings", async () => {
+		expect(parseUiLanguage("日本語")).toBe("ja");
+		expect(parseUiLanguage("Japanese")).toBe("ja");
+		expect(parseUiLanguage("jp")).toBe("ja");
+		expect(parseUiLanguage("jpn")).toBe("ja");
+		expect(parseUiLanguage("ja-JP")).toBe("ja");
 		expect(parseUiLanguage("한국어")).toBe("ko");
 		expect(parseUiLanguage("Korean")).toBe("ko");
 		expect(parseUiLanguage("kr")).toBe("ko");
@@ -170,6 +208,18 @@ describe("/language slash command", () => {
 		const english = harness();
 		await executeBuiltinSlashCommand("/language English", english.runtime as never);
 		expect(settings.get("ui.language")).toBe("en");
+	});
+
+	it("persists Japanese endonym and locale-tag spellings through the command", async () => {
+		const endonym = harness();
+		await executeBuiltinSlashCommand("/language 日本語", endonym.runtime as never);
+		expect(settings.get("ui.language")).toBe("ja");
+
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true });
+		const locale = harness();
+		await executeBuiltinSlashCommand("/language ja-JP", locale.runtime as never);
+		expect(settings.get("ui.language")).toBe("ja");
 	});
 
 	it("rejects an unsupported language and changes nothing", async () => {

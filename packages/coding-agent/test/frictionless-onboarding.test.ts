@@ -149,6 +149,7 @@ describe("frictionless onboarding", () => {
 
 	test("an explicit language preference outranks messages and locale", () => {
 		expect(detectOnboardingLanguage(["le fichier merci"], "fr-FR", "ko")).toBe("ko");
+		expect(detectOnboardingLanguage(["파일 변경해줘"], "ko-KR", "ja")).toBe("ja");
 		expect(
 			deriveOnboardingProfile(
 				[

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added Japanese (`ja`) to the persisted `ui.language` response-language surface: the `/language` command and the Settings → Appearance selector. Accepted input spellings include `ja`, `ja-JP`, `japanese`, `jp`, `jpn`, and `日本語`. English and Korean behavior, defaults, and onboarding language ranking are unchanged. (#4947)
+
 ### Fixed
 
 - Foreground activity animation now uses layout-only TUI repaints, avoiding repeated reconstruction of unchanged transcript content during long sessions.

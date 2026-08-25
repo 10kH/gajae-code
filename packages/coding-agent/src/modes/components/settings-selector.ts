@@ -1009,6 +1009,7 @@ export class SettingsSelectorComponent extends Container {
 			options = [
 				{ value: "en", label: uiString(language, "settings.language.english") },
 				{ value: "ko", label: uiString(language, "settings.language.korean") },
+				{ value: "ja", label: uiString(language, "settings.language.japanese") },
 			];
 		}
 		if (def.path === "statusLine.preset") {
