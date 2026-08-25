@@ -280,8 +280,11 @@ export const SDK_LIFECYCLE_ROUTER_PROTOCOL_VERSION = 1;
  * still running the pre-#4689 router keeps the old hot polling loop and its
  * lock contention, so an already-running owner must be replaced rather than
  * retained across this upgrade.
+ * Generation 177 consumes an exact same-window lean settlement receipt only
+ * after its autonomous ask lead-in publishes successfully, preventing idle
+ * replay without changing the serving protocol.
  */
-export const DAEMON_GENERATION = 175;
+export const DAEMON_GENERATION = 177;
 
 /**
  * Serving-compatibility boundary for daemon lifecycle requests. Epoch 7

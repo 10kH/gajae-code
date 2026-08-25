@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { isRetiredModelKey } from "../src/model-retirements";
 import { Effort } from "../src/model-thinking";
 import type { GeneratedProvider } from "../src/models";
 import { getBundledModel, getBundledModels, getBundledProviders } from "../src/models";
@@ -8,6 +9,34 @@ function gemini37SiblingId(modelId: string): string {
 }
 
 describe("preset catalog model entries", () => {
+	test("bundles Kilo Ox Alpha with its reviewed capability contract", () => {
+		const model = getBundledModel("kilo", "stealth/ox-alpha");
+
+		expect(model.id).toBe("stealth/ox-alpha");
+		expect(model.provider).toBe("kilo");
+		expect(model.name).toBe("Ox Alpha");
+		expect(model.reasoning).toBe(true);
+		expect(model.input).toEqual(["text", "image"]);
+		expect(model.contextWindow).toBe(1_048_576);
+		expect(model.maxTokens).toBe(131_072);
+		expect(model.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+		expect(model.thinking).toEqual({
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		});
+	});
+
+	test("keeps Groq compound systems reasoning-control free", () => {
+		for (const id of ["groq/compound", "groq/compound-mini"] as const) {
+			const model = getBundledModel("groq", id);
+			expect(model.reasoning).toBe(false);
+			expect(model.thinking).toBeUndefined();
+		}
+	});
+
 	test("bundles kimi-code/kimi-k2.7-code", () => {
 		const model = getBundledModel("kimi-code", "kimi-k2.7-code");
 
@@ -94,6 +123,7 @@ describe("preset catalog model entries", () => {
 				if (!/gemini-3[.-]6-flash/.test(source.id)) continue;
 				if (source.id.endsWith("-minimal")) continue;
 				const siblingId = gemini37SiblingId(source.id);
+				if (isRetiredModelKey(provider, siblingId)) continue;
 				const sibling = getBundledModel(provider as GeneratedProvider, siblingId);
 				if (!sibling) {
 					missing.push(`${provider}/${siblingId}`);
@@ -118,9 +148,6 @@ describe("preset catalog model entries", () => {
 		const selectors = [
 			["google", "gemini-3.7-flash"],
 			["google-gemini-cli", "gemini-3.7-flash"],
-			["google-antigravity", "gemini-3.7-flash-high"],
-			["google-antigravity", "gemini-3.7-flash-low"],
-			["google-antigravity", "gemini-3.7-flash-medium"],
 			["google-antigravity", "gemini-3.7-flash-tiered"],
 			["opencode-zen", "gemini-3.7-flash"],
 		] as const;
@@ -145,6 +172,6 @@ describe("preset catalog model entries", () => {
 		expect(model.reasoning).toBe(true);
 		expect(model.contextWindow).toBe(1_000_000);
 		expect(model.maxTokens).toBe(128_000);
-		expect(model.thinking).toEqual({ mode: "effort", minLevel: Effort.Minimal, maxLevel: Effort.High });
+		expect(model.thinking).toBeUndefined();
 	});
 });

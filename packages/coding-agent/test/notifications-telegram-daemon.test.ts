@@ -9,6 +9,7 @@ import { tokenFingerprint } from "../src/sdk/bus/config";
 import { daemonPaths } from "../src/sdk/bus/daemon-paths";
 import { exactUnlinkNotificationFile, readNotificationEndpointFile } from "../src/sdk/bus/notification-service";
 import type { NotificationOperatorRuntime } from "../src/sdk/bus/operator-runtime";
+import { pendingTopicFilePath, TELEGRAM_ADOPTION_INTENT_VERSION } from "../src/sdk/bus/telegram-adoption-intent";
 import {
 	acquireDaemonOwnership,
 	type BotApi,
@@ -875,7 +876,10 @@ describe("Telegram daemon retained owner lifecycle", () => {
 		}
 	});
 
-	test("reload handoff signals an incompatible live owner before spawning its replacement", async () => {
+	test.each([
+		["an older serving epoch", 1],
+		["the same serving epoch", SERVING_EPOCH],
+	] as const)("reload handoff replaces a fresh stale-generation owner with %s", async (_description, servingEpoch) => {
 		const agentDir = tempAgentDir();
 		try {
 			const daemonSettings = settings(agentDir);
@@ -897,7 +901,7 @@ describe("Telegram daemon retained owner lifecycle", () => {
 				heartbeatAt: 5_000,
 				version: DAEMON_VERSION,
 				generation: DAEMON_GENERATION - 1,
-				servingEpoch: 1,
+				servingEpoch,
 			});
 
 			expect(
@@ -1014,6 +1018,213 @@ test("advances past a malformed-only getUpdates batch", async () => {
 	expect((await poller.pollOnceResult()).kind).toBe("api_failure");
 	expect((await poller.pollOnceResult()).kind).toBe("success");
 	expect(offsets).toEqual([0, 1]);
+});
+
+describe("deleted forum-topic adoption updates", () => {
+	const missingDescriptions = [
+		"Bad Request: FORUM_TOPIC_NOT_FOUND",
+		"topic_not_found",
+		"Bad Request: THREAD_NOT_FOUND",
+		"Topic_Id_Invalid",
+		"bAd ReQuEsT: MeSsAgE ThReAd NoT FoUnD",
+	] as const;
+
+	for (const description of missingDescriptions) {
+		test(`consumes ordered update 7 and preserves later topic 8 for ${description}`, async () => {
+			const agentDir = tempAgentDir();
+			const expiresAt = Date.now() + 60_000;
+			await Bun.write(
+				pendingTopicFilePath(agentDir, 701),
+				`${JSON.stringify({
+					version: TELEGRAM_ADOPTION_INTENT_VERSION,
+					pendingTopic: { topicId: 701, chatId: "42", createdAt: 1, expiresAt },
+				})}\n`,
+			);
+			await Bun.write(
+				pendingTopicFilePath(agentDir, 999),
+				`${JSON.stringify({
+					version: TELEGRAM_ADOPTION_INTENT_VERSION,
+					pendingTopic: { topicId: 999, chatId: "42", createdAt: 1, expiresAt },
+				})}\n`,
+			);
+			const calls: Array<{ method: string; body: unknown }> = [];
+			const updates = [
+				{
+					update_id: 7,
+					message: {
+						chat: { id: 42, type: "private" },
+						from: { id: 42, is_bot: false },
+						message_thread_id: 701,
+						forum_topic_created: { name: "deleted" },
+					},
+				},
+				{
+					update_id: 8,
+					message: {
+						chat: { id: 42, type: "private" },
+						from: { id: 42, is_bot: false },
+						message_thread_id: 802,
+						forum_topic_created: { name: "survivor" },
+					},
+				},
+			];
+			const botApi: BotApi = {
+				call: async (method, body) => {
+					calls.push({ method, body });
+					if (method === "getUpdates") {
+						const offset = (body as { offset: number }).offset;
+						return { ok: true, result: updates.filter(update => update.update_id >= offset) };
+					}
+					if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+					if (method === "sendMessage" && (body as { message_thread_id?: unknown }).message_thread_id === 701)
+						return { ok: false, error_code: 400, description };
+					if (method === "sendMessage") return { ok: true, result: { message_id: 1 } };
+					return { ok: true, result: true };
+				},
+			};
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+				botApi,
+			});
+			try {
+				await daemon.loadTopics();
+				await daemon.loadAdoptionIntents();
+				expect(await daemon.pollOnce()).toBe(2);
+				expect(fs.existsSync(pendingTopicFilePath(agentDir, 701))).toBe(false);
+				expect(fs.existsSync(pendingTopicFilePath(agentDir, 802))).toBe(true);
+				expect(fs.existsSync(pendingTopicFilePath(agentDir, 999))).toBe(true);
+				expect(await daemon.pollOnce()).toBe(0);
+				expect(
+					calls.filter(call => call.method === "getUpdates").map(call => (call.body as { offset: number }).offset),
+				).toEqual([0, 9]);
+			} finally {
+				daemon.requestStop();
+				fs.rmSync(agentDir, { recursive: true, force: true });
+			}
+		});
+	}
+
+	test("consumes a missing current-chat topic without deleting a rehydrated same-id foreign-chat sidecar", async () => {
+		const agentDir = tempAgentDir();
+		const foreignSidecar = pendingTopicFilePath(agentDir, 701);
+		await Bun.write(
+			foreignSidecar,
+			`${JSON.stringify({
+				version: TELEGRAM_ADOPTION_INTENT_VERSION,
+				pendingTopic: { topicId: 701, chatId: "99", createdAt: 1, expiresAt: Date.now() + 60_000 },
+			})}\n`,
+		);
+		const offsets: number[] = [];
+		const botApi: BotApi = {
+			call: async (method, body) => {
+				if (method === "getUpdates") {
+					const offset = (body as { offset: number }).offset;
+					offsets.push(offset);
+					return {
+						ok: true,
+						result:
+							offset <= 7
+								? [
+										{
+											update_id: 7,
+											message: {
+												chat: { id: 42, type: "private" },
+												from: { id: 42, is_bot: false },
+												message_thread_id: 701,
+												forum_topic_created: { name: "deleted" },
+											},
+										},
+									]
+								: [],
+					};
+				}
+				if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+				if (method === "sendMessage")
+					return { ok: false, error_code: 400, description: "Bad Request: message thread not found" };
+				return { ok: true, result: true };
+			},
+		};
+		const daemon = new TelegramNotificationDaemon({
+			settings: settings(agentDir),
+			ownerId: "provider-owner",
+			botToken: BOT_TOKEN,
+			chatId: "42",
+			botApi,
+		});
+		try {
+			await daemon.loadTopics();
+			await daemon.loadAdoptionIntents();
+			expect(await daemon.pollOnce()).toBe(1);
+			expect(await daemon.pollOnce()).toBe(0);
+			expect(offsets).toEqual([0, 8]);
+			expect(fs.existsSync(foreignSidecar)).toBe(true);
+		} finally {
+			daemon.requestStop();
+			fs.rmSync(agentDir, { recursive: true, force: true });
+		}
+	});
+
+	const retryableFailures = [
+		{ name: "rate limit", response: { ok: false, error_code: 429, description: "Too Many Requests" } },
+		{ name: "server failure", response: { ok: false, error_code: 500, description: "Internal Server Error" } },
+		{ name: "ambiguous 400", response: { ok: false, error_code: 400, description: "Bad Request: chat not found" } },
+		{ name: "auth failure", response: { ok: false, error_code: 401, description: "Unauthorized" } },
+		{ name: "network failure", error: Object.assign(new Error("connection reset"), { code: "ECONNRESET" }) },
+	] as const;
+
+	for (const scenario of retryableFailures) {
+		test(`does not advance the ordered offset on ${scenario.name}`, async () => {
+			const agentDir = tempAgentDir();
+			const offsets: number[] = [];
+			const update = {
+				update_id: 7,
+				message: {
+					chat: { id: 42, type: "private" },
+					from: { id: 42, is_bot: false },
+					message_thread_id: 701,
+					forum_topic_created: { name: "retry" },
+				},
+			};
+			const botApi: BotApi = {
+				call: async (method, body) => {
+					if (method === "getUpdates") {
+						offsets.push((body as { offset: number }).offset);
+						return { ok: true, result: [update] };
+					}
+					if (method === "getChat") return { ok: true, result: { id: 42, type: "private" } };
+					if (method === "sendMessage") {
+						if ("error" in scenario) throw scenario.error;
+						return scenario.response;
+					}
+					return { ok: true, result: true };
+				},
+			};
+			const daemon = new TelegramNotificationDaemon({
+				settings: settings(agentDir),
+				ownerId: "provider-owner",
+				botToken: BOT_TOKEN,
+				chatId: "42",
+				botApi,
+				setTimeoutImpl: ((callback: () => void) => {
+					callback();
+					return 0 as unknown as NodeJS.Timeout;
+				}) as unknown as typeof setTimeout,
+			});
+			try {
+				await daemon.loadTopics();
+				expect(await daemon.pollOnce()).toBe(1);
+				expect(await daemon.pollOnce()).toBe(1);
+				expect(offsets).toEqual([0, 0]);
+				expect(fs.existsSync(pendingTopicFilePath(agentDir, 701))).toBe(true);
+			} finally {
+				daemon.requestStop();
+				fs.rmSync(agentDir, { recursive: true, force: true });
+			}
+		});
+	}
 });
 test("a throwing run-loop heartbeat renewal is contained and the daemon keeps serving (#4200)", async () => {
 	const runScenario = async (throwPath: "state" | "lock"): Promise<void> => {

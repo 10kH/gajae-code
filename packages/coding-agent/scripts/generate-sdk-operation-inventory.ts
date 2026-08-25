@@ -21,6 +21,8 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 		"visual/local-only autorouting settings toggle and smart-routing panel entry, not a user-facing SDK control seam",
 	"slash_command:settings": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:theme": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:language":
+		"visual/local-only interactive UI language selector persisted through settings, not a user-facing SDK control seam",
 	"slash_command:copy": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:changelog": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:help": "visual/local-only command, not a user-facing SDK control seam",
@@ -41,11 +43,13 @@ const LOCKED_EXCLUSIONS: Readonly<Record<string, string>> = {
 	"slash_command:exit": "visual/local-only command, not a user-facing SDK control seam",
 	"slash_command:notify":
 		"interactive diagnostics command; session on/off delegate to the notifications extension, not an SDK ingress seam",
+	"slash_command:aside": "explicit user-owned external CLI process launcher; not a credential-free SDK control seam",
 	"slash_command:extensions":
 		"interactive local customization dashboard mutates trusted local skill, hook, and MCP configuration (including filesystem import/removal); ACP and local headless cannot dispatch it, while SDK extension list/enable operations do not expose this dashboard authority",
 	"slash_command:credential":
 		"interactive session credential selector; not a credential-free public SDK operation or independent control seam",
 	"slash_command:pet": "visual/local-only command, not a user-facing SDK control seam",
+	"slash_command:tutorial": "visual/local-only onboarding selector, not a user-facing SDK control seam",
 	"slash_command:transcript": "visual/local-only transcript viewer, not a user-facing SDK control seam",
 	"slash_command:sessions": "visual/local-only sessions dashboard, not a user-facing SDK control seam",
 	"agent_session:constructor": "internal accessor/plumbing, not a user-facing control seam",

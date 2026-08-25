@@ -7,6 +7,9 @@ import type {
 	ToolKind,
 } from "@agentclientprotocol/sdk";
 import type { AgentSessionEvent } from "../../session/agent-session";
+
+export type { AgentSessionEvent };
+
 import { resolveToCwd } from "../../tools/path-utils";
 import type { TodoStatus } from "../../tools/todo-write";
 import type { AgentWireEventPayload } from "../shared/agent-wire/event-contract";
@@ -266,6 +269,25 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		case "turn_end":
 		case "message_start":
 			return [];
+		case "agent_failed":
+			return [
+				toSessionNotification(sessionId, {
+					sessionUpdate: "session_info_update",
+					_meta: {
+						gjcPhase: "error",
+						running: true,
+						gjcRunning: true,
+						gjcAgentFailed: true,
+						// Bounded sanitized diagnostic so ACP consumers can identify
+						// the documented failure cause (exact-head review P2). The
+						// payload is the runtime's {code,message} classifier — never
+						// raw provider detail.
+						gjcAgentFailedCode: event.error.code,
+						gjcAgentFailedMessage: event.error.message,
+						gjcAgentFailedScope: event.scope,
+					},
+				}),
+			];
 		case "auto_compaction_start":
 			return [
 				toSessionNotification(sessionId, {

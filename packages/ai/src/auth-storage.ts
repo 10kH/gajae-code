@@ -1359,6 +1359,24 @@ export class AuthStorage {
 	getProviderEvidenceGeneration(provider: string, resolvedApiKey?: string): string {
 		const storageProvider = resolveOAuthStorageProvider(provider);
 		const evidenceApiKey = resolvedApiKey;
+		const storedLiteral =
+			evidenceApiKey === undefined ||
+			this.#runtimeOverrides.has(storageProvider) ||
+			this.#configOverrides.has(storageProvider)
+				? undefined
+				: this.#getCredentialsForProvider(storageProvider).find(
+						(credential): credential is Extract<AuthCredential, { type: "api_key" }> =>
+							credential.type === "api_key" &&
+							credential.key === evidenceApiKey &&
+							!credential.key.startsWith("!") &&
+							process.env[credential.key] === undefined,
+					);
+		if (storedLiteral) {
+			return crypto
+				.createHash("sha256")
+				.update(`stored-literal\u0000${storageProvider}\u0000${storedLiteral.key}`)
+				.digest("hex");
+		}
 		let selectedCredential: ({ index: number } & StoredCredential) | undefined;
 		try {
 			selectedCredential = this.#resolveSelectedStoredCredential(provider, undefined, undefined);
@@ -1586,6 +1604,18 @@ export class AuthStorage {
 			explicitSelector ? { credentialSelector: explicitSelector } : undefined,
 			scopeId,
 		);
+	}
+
+	/** @internal Return cache provenance for an exact stored literal API-key row without resolving its value. */
+	getStoredLiteralApiKeyEvidenceGeneration(provider: string, selector: AuthCredentialSelector): string | undefined {
+		if (selector.kind !== "id") return undefined;
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeOverrides.has(storageProvider) || this.#configOverrides.has(storageProvider)) return undefined;
+		const selected = this.#findCredentialBySelector(storageProvider, selector);
+		if (selected?.credential.type !== "api_key") return undefined;
+		const key = selected.credential.key;
+		if (!key || key.startsWith("!") || process.env[key] !== undefined) return undefined;
+		return this.getProviderEvidenceGeneration(storageProvider, key);
 	}
 
 	/** Validate and canonicalize an OAuth-only selector for account pinning. */
@@ -3119,6 +3149,12 @@ export class AuthStorage {
 				await saveApiKeyCredential(apiKey);
 				return;
 			}
+			case "sglang": {
+				const { loginSglang } = await import("./utils/oauth/sglang");
+				const apiKey = await loginSglang(ctrl);
+				await saveApiKeyCredential(apiKey);
+				return;
+			}
 			case "parallel": {
 				const { loginParallel } = await import("./utils/oauth/parallel");
 				const apiKey = await loginParallel(ctrl);
@@ -4167,6 +4203,29 @@ export class AuthStorage {
 			);
 
 		return remainingCredentials.some(candidate => !this.#isCredentialBlocked(providerKey, candidate.index));
+	}
+
+	/**
+	 * Earliest instant at which any currently blocked stored credential for this
+	 * provider becomes usable again. Undefined when nothing is blocked.
+	 * When `sessionId` is provided, only the session's active credential type is
+	 * considered — API-key and OAuth backoff pools are independent.
+	 * Informational only: callers must not treat this as authorization to wait.
+	 */
+	getEarliestUnblockAt(provider: string, sessionId?: string): number | undefined {
+		provider = resolveOAuthStorageProvider(provider);
+		const sessionType = this.#getSessionCredential(provider, sessionId)?.type;
+		let earliest: number | undefined;
+		for (const [index, credential] of this.#getCredentialsForProvider(provider).entries()) {
+			if (sessionType !== undefined && credential.type !== sessionType) continue;
+			const blockedUntil = this.#getCredentialBlockedUntil(
+				this.#getProviderTypeKey(provider, credential.type),
+				index,
+			);
+			if (blockedUntil === undefined || !Number.isFinite(blockedUntil)) continue;
+			if (earliest === undefined || blockedUntil < earliest) earliest = blockedUntil;
+		}
+		return earliest;
 	}
 
 	#resolveWindowResetAt(window: UsageLimit["window"]): number | undefined {

@@ -3,6 +3,66 @@ import type { Model, OpenAICompat } from "./types";
 type OpenAIReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 type ResolvedToolStrictMode = NonNullable<OpenAICompat["toolStrictMode"]> | "mixed";
 
+const AUDITED_REASONING_EFFORT_HOST_SUFFIXES = [
+	"api.openai.com",
+	"chatgpt.com",
+	"openai.azure.com",
+	"models.inference.ai.azure.com",
+	"api.githubcopilot.com",
+	"openrouter.ai",
+	"api.cerebras.ai",
+	"api.together.xyz",
+	"fireworks.ai",
+	"api.groq.com",
+	"deepseek.com",
+	"deepinfra.com",
+	"mistral.ai",
+	"api.x.ai",
+	"api.z.ai",
+	"api.kilo.ai",
+	"opencode.ai",
+	"api.moonshot.ai",
+	"api.kimi.com",
+	"maas.aliyuncs.com",
+	"dashscope.aliyuncs.com",
+	"dashscope-intl.aliyuncs.com",
+	"bizrouter.ai",
+	"cloud.gitlab.com",
+	"huggingface.co",
+	"labs.jb.gg",
+	"mara.com",
+	"nano-gpt.com",
+	"nvidia.com",
+	"opengateway.ai",
+	"baidubce.com",
+	"venice.ai",
+	"xiaomimimo.com",
+	"zenmux.ai",
+] as const;
+
+function parseHostname(baseUrl: string): string | undefined {
+	try {
+		return new URL(baseUrl).hostname.toLowerCase();
+	} catch {
+		return undefined;
+	}
+}
+
+function hostnameMatches(hostname: string | undefined, suffix: string): boolean {
+	return hostname !== undefined && (hostname === suffix || hostname.endsWith(`.${suffix}`));
+}
+
+/** Returns whether the request endpoint is an audited reasoning-control transport. */
+export function isAuditedOpenAIReasoningTransport(
+	model: { provider: string; baseUrl?: string },
+	resolvedBaseUrl?: string,
+): boolean {
+	const baseUrl = resolvedBaseUrl ?? model.baseUrl ?? "";
+	if (!baseUrl && (model.provider === "openai" || model.provider === "azure-openai")) return true;
+	const hostname = parseHostname(baseUrl);
+	return AUDITED_REASONING_EFFORT_HOST_SUFFIXES.some(suffix => hostnameMatches(hostname, suffix));
+}
+
 export type ResolvedOpenAICompat = Required<
 	Omit<
 		OpenAICompat,
@@ -62,23 +122,23 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 	const provider = model.provider;
 	// Use resolvedBaseUrl if provided (e.g., after GitHub Copilot proxy-ep resolution)
 	const baseUrl = resolvedBaseUrl ?? model.baseUrl;
+	const hostname = parseHostname(baseUrl);
 
-	const isCerebras = provider === "cerebras" || baseUrl.includes("cerebras.ai");
-	const isZai = provider === "zai" || baseUrl.includes("api.z.ai");
-	const isKilo = provider === "kilo" || baseUrl.includes("api.kilo.ai");
+	const isCerebras = provider === "cerebras" || hostnameMatches(hostname, "cerebras.ai");
+	const isZai = hostnameMatches(hostname, "api.z.ai");
+	const isKilo = hostnameMatches(hostname, "api.kilo.ai");
 	const isKimiModel = model.id.includes("moonshotai/kimi") || /(^|\/)kimi[-.]/i.test(model.id);
 	const isMoonshotKimi =
-		isKimiModel &&
-		(provider === "moonshot" ||
-			provider === "kimi-code" ||
-			baseUrl.includes("api.moonshot.ai") ||
-			baseUrl.includes("api.kimi.com"));
+		isKimiModel && (hostnameMatches(hostname, "api.moonshot.ai") || hostnameMatches(hostname, "api.kimi.com"));
 	const isAnthropicModel =
 		provider === "anthropic" ||
 		baseUrl.includes("api.anthropic.com") ||
 		/(^|\/)claude[-.]/i.test(model.id) ||
 		/(^|\/)anthropic\//i.test(model.id);
-	const isAlibaba = baseUrl.includes("dashscope");
+	const isAlibaba =
+		hostnameMatches(hostname, "maas.aliyuncs.com") ||
+		hostnameMatches(hostname, "dashscope.aliyuncs.com") ||
+		hostnameMatches(hostname, "dashscope-intl.aliyuncs.com");
 	const isQwen = model.id.toLowerCase().includes("qwen");
 	// DeepSeek V4 (and other reasoning-capable DeepSeek models) reject follow-up requests in
 	// thinking mode unless prior assistant tool-call turns include `reasoning_content`. The
@@ -139,12 +199,13 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		baseUrl.includes(".openai.azure.com") ||
 		baseUrl.includes("models.inference.ai.azure.com") ||
 		baseUrl.includes("azure.com/openai");
-	const isOpenRouter = provider === "openrouter" || baseUrl.includes("openrouter.ai");
+	const isOpenRouter = hostnameMatches(hostname, "openrouter.ai");
 	const isTogether = provider === "together" || baseUrl.includes("api.together.xyz");
 	const isFireworks = baseUrl.includes("fireworks.ai");
 	const isGroqHost = provider === "groq" || baseUrl.includes("api.groq.com");
 	const isCopilotHost = provider === "github-copilot";
 	const isZenmuxHost = provider === "zenmux";
+	const hasAuditedReasoningEffortTransport = isAuditedOpenAIReasoningTransport(model, resolvedBaseUrl);
 	// Endpoints that MUST receive a single system block. MiniMax's OpenAI
 	// endpoint returns error 2013 on multiple system messages; Alibaba's
 	// Dashscope and Qwen Portal serve Qwen models whose chat template
@@ -216,7 +277,8 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		sendSessionHeaders: false,
 		supportsResponsesSessionAffinity: false,
 		supportsMultipleSystemMessages: supportsMultipleSystemMessagesDefault,
-		supportsReasoningEffort: (!isGrok && !isZai) || isDirectXaiReasoningEffortModel,
+		supportsReasoningEffort:
+			hasAuditedReasoningEffortTransport && ((!isGrok && !isZai) || isDirectXaiReasoningEffortModel),
 		reasoningEffortMap,
 		supportsUsageInStreaming: !isCerebras,
 		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel || isOpenCodeGoReasoning,
@@ -229,11 +291,11 @@ export function detectOpenAICompat(model: Model<"openai-completions">, resolvedB
 		requiresThinkingAsText: isMistral,
 		requiresMistralToolIds: isMistral,
 		thinkingFormat:
-			isZai || isMoonshotKimi
+			hasAuditedReasoningEffortTransport && (isZai || isMoonshotKimi)
 				? "zai"
-				: provider === "openrouter" || baseUrl.includes("openrouter.ai")
+				: hasAuditedReasoningEffortTransport && isOpenRouter
 					? "openrouter"
-					: isAlibaba || isQwen
+					: hasAuditedReasoningEffortTransport && isAlibaba && isQwen
 						? "qwen"
 						: "openai",
 		reasoningContentField: "reasoning_content",

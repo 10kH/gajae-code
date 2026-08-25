@@ -13,6 +13,7 @@ import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
 import { Container, Loader } from "@gajae-code/tui";
 import { logger, TempDir } from "@gajae-code/utils";
+import { FileLockTestHooks } from "../src/config/file-lock";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 
@@ -82,6 +83,21 @@ describe("interactive background activity indicator", () => {
 		expect(resolveActivityIndicatorMessage(true, 2, "Working…")).toBe("Working… · 2 background tasks");
 	});
 
+	it("uses layout-only repaints for the foreground activity indicator", () => {
+		const layoutRender = vi.spyOn(mode.ui, "requestLayoutRender");
+		const fullRender = vi.spyOn(mode.ui, "requestRender");
+		try {
+			mode.ensureLoadingAnimation();
+
+			expect(layoutRender).toHaveBeenCalledWith("loader");
+			expect(fullRender.mock.calls.some(([, source]) => source === "loader")).toBe(false);
+		} finally {
+			mode.stopLoadingAnimation({ foregroundSettled: true });
+			layoutRender.mockRestore();
+			fullRender.mockRestore();
+		}
+	});
+
 	it("retires the foreground indicator when agent_end races stale streaming state", async () => {
 		mode.ensureLoadingAnimation();
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
@@ -92,6 +108,29 @@ describe("interactive background activity indicator", () => {
 
 		expect(mode.loadingAnimation).toBeUndefined();
 		expect(renderStatus(mode)).toBe("");
+	});
+
+	it("publishes terminal activity cleanup before a slow coordinator sidecar write", async () => {
+		mode.ensureLoadingAnimation();
+		const lockEntered = Promise.withResolvers<void>();
+		const releaseLock = Promise.withResolvers<void>();
+		let gated = true;
+		const previousHook = FileLockTestHooks.afterParentMkdir;
+		FileLockTestHooks.afterParentMkdir = async lockPath => {
+			if (!gated || !lockPath.endsWith("mutation.lock.lock")) return;
+			gated = false;
+			lockEntered.resolve();
+			await releaseLock.promise;
+		};
+
+		try {
+			session.agent.emitExternalEvent({ type: "agent_end", messages: [] });
+			await lockEntered.promise;
+			await waitFor(() => mode.loadingAnimation === undefined);
+		} finally {
+			releaseLock.resolve();
+			FileLockTestHooks.afterParentMkdir = previousHook;
+		}
 	});
 
 	it("retires stale foreground activity across maintenance stop boundaries", async () => {

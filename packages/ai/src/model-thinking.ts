@@ -5,7 +5,7 @@ import {
 	isCodexProductTransport,
 } from "./context-cap-policy";
 import { applyOpenAIModelPricing } from "./model-pricing";
-import { resolveOpenAICompat } from "./openai-completions-compat";
+import { isAuditedOpenAIReasoningTransport, resolveOpenAICompat } from "./openai-completions-compat";
 import type { Api, Model as ApiModel, ThinkingConfig } from "./types";
 import { isClaudeForcedToolChoiceIncapableModelId } from "./utils/tool-choice-capability";
 
@@ -153,6 +153,10 @@ export const CLOUDFLARE_FALLBACK_MODEL: ApiModel<"anthropic-messages"> = {
 const kEnrichedModel = Symbol("model-thinking.enrichedModel");
 type ModelWithEnriched = ApiModel<Api> & { [kEnrichedModel]?: ApiModel<Api> };
 
+export function isGroqCompoundReasoningUnsupported(model: Pick<ApiModel<Api>, "provider" | "id">): boolean {
+	return model.provider === "groq" && (model.id === "groq/compound" || model.id === "groq/compound-mini");
+}
+
 /**
  * Returns a copy of the model with canonical thinking metadata attached.
  *
@@ -167,7 +171,12 @@ export function enrichModelThinking<TApi extends Api>(model: ApiModel<TApi>): Ap
 	}
 	const normalizedThinking = normalizeThinkingConfig(model.thinking);
 	let result: ApiModel<TApi>;
-	if (!model.reasoning) {
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		result =
+			!model.reasoning && normalizedThinking === undefined
+				? model
+				: { ...model, reasoning: false, thinking: undefined };
+	} else if (!model.reasoning || !modelSupportsReasoningControl(model)) {
 		result =
 			normalizedThinking === undefined && model.thinking === undefined ? model : { ...model, thinking: undefined };
 	} else {
@@ -193,13 +202,58 @@ export function enrichModelThinking<TApi extends Api>(model: ApiModel<TApi>): Ap
  * canonical rules, replacing any existing `thinking`.
  */
 export function refreshModelThinking<TApi extends Api>(model: ApiModel<TApi>): ApiModel<TApi> {
-	if (!model.reasoning) {
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		return !model.reasoning && model.thinking === undefined
+			? model
+			: { ...model, reasoning: false, thinking: undefined };
+	}
+	if (!model.reasoning || !modelSupportsReasoningControl(model)) {
 		const normalizedThinking = normalizeThinkingConfig(model.thinking);
 		return normalizedThinking === undefined && model.thinking === undefined
 			? model
 			: { ...model, thinking: undefined };
 	}
 	return { ...model, thinking: inferModelThinking(model) };
+}
+
+/**
+ * Returns whether the configured transport has an audited user-facing reasoning control.
+ *
+ * Custom OpenAI-compatible endpoints fail closed: declaring a model as reasoning-capable
+ * is not enough to prove that the proxy accepts OpenAI reasoning parameters. Unknown
+ * endpoints must opt in with `compat.supportsReasoningEffort: true`; providers using a
+ * non-OpenAI request shape must also declare `compat.thinkingFormat`. Bundled providers
+ * remain governed by their catalog and compatibility metadata.
+ */
+export function modelSupportsReasoningControl<TApi extends Api>(
+	model: ApiModel<TApi>,
+	resolvedBaseUrl?: string,
+): boolean {
+	if (!model.reasoning) return false;
+
+	if (model.api === "openai-completions") {
+		const completionsModel = model as ApiModel<"openai-completions">;
+		const explicitSupport = completionsModel.compat?.supportsReasoningEffort;
+		if (explicitSupport === false) return false;
+		if (explicitSupport !== true && !isAuditedOpenAIReasoningTransport(completionsModel, resolvedBaseUrl))
+			return false;
+		const compat = resolveOpenAICompat(completionsModel, resolvedBaseUrl);
+		return compat.thinkingFormat !== "openai" || compat.supportsReasoningEffort;
+	}
+
+	if (
+		model.api === "openai-responses" ||
+		model.api === "openai-codex-responses" ||
+		model.api === "azure-openai-responses"
+	) {
+		const explicitSupport =
+			model.compat !== undefined && "supportsReasoningEffort" in model.compat
+				? model.compat.supportsReasoningEffort
+				: undefined;
+		return explicitSupport ?? isAuditedOpenAIReasoningTransport(model);
+	}
+
+	return true;
 }
 
 /**
@@ -268,7 +322,7 @@ export function linkOpenAIPromotionTargets(models: ApiModel<Api>[]): void {
  * @throws Error when a reasoning-capable model is missing thinking metadata
  */
 export function getSupportedEfforts<TApi extends Api>(model: ApiModel<TApi>): readonly Effort[] {
-	if (!model.reasoning) {
+	if (!modelSupportsReasoningControl(model)) {
 		return [];
 	}
 	if (!model.thinking) {
@@ -289,7 +343,7 @@ export function clampThinkingLevelForModel<TApi extends Api>(
 	if (!model) {
 		return requested;
 	}
-	if (!model.reasoning || requested === undefined) {
+	if (!modelSupportsReasoningControl(model) || requested === undefined) {
 		return undefined;
 	}
 
@@ -315,7 +369,7 @@ export function clampThinkingLevelForModel<TApi extends Api>(
 }
 
 export function requireSupportedEffort<TApi extends Api>(model: ApiModel<TApi>, effort: Effort): Effort {
-	if (!model.reasoning) {
+	if (!modelSupportsReasoningControl(model)) {
 		throw new Error(`Model ${model.provider}/${model.id} does not support thinking`);
 	}
 	const levels = getSupportedEfforts(model);
@@ -487,6 +541,31 @@ function applyGeneratedModelPolicy(model: ApiModel<Api>): void {
 	// GLM-5.3 always thinks and exposes only low/high/max reasoning_effort.
 	// https://z.ai/blog/glm-5.3#api-changes-in-glm-5-3
 	if (model.provider === "zai" && model.id === "glm-5.3") {
+		model.thinking = {
+			mode: "effort",
+			minLevel: Effort.Low,
+			maxLevel: Effort.Max,
+			defaultLevel: Effort.Max,
+			levels: [Effort.Low, Effort.High, Effort.Max],
+		};
+	}
+	// Groq's agentic `compound` systems reject `reasoning_effort` outright
+	// (400 "`reasoning_effort` is not supported with this model", verified
+	// 2026-08-23), yet models.dev advertises them as reasoning models. Drop the
+	// thinking config so GJC never sends the field.
+	if (isGroqCompoundReasoningUnsupported(model)) {
+		model.reasoning = false;
+		delete model.thinking;
+	}
+	// Kilo's Ox Alpha catalog row advertises reasoning, vision, a 1,048,576-token
+	// context, a 131,072-token output ceiling, and low/high/max variants. Its
+	// OpenAI-compatible `/models` shape exposes those fields outside the generic
+	// discovery parser, so pin the reviewed provider-specific contract here.
+	if (model.provider === "kilo" && model.id === "stealth/ox-alpha") {
+		model.reasoning = true;
+		model.input = ["text", "image"];
+		model.contextWindow = 1_048_576;
+		model.maxTokens = 131_072;
 		model.thinking = {
 			mode: "effort",
 			minLevel: Effort.Low,

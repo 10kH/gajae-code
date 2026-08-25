@@ -443,7 +443,14 @@ async function emitTypeDeclarations(pkg: PublishPackage, temporaryRoot?: string)
 		const outputName = path.basename(config, path.extname(config));
 		const outputDir = path.join(temporaryRoot, pkg.dir.replaceAll(/[\\/]/g, "__"), outputName);
 		await fs.mkdir(outputDir, { recursive: true });
-		await $`bun x tsc -p ${config} --outDir ${outputDir}`.cwd(pkgDir);
+		// `--rootDir` is widened to the repository for the check emit. Workspace
+		// source that a package imports across the package boundary (agent-loop
+		// reaches into `packages/ai/src/adapter-internals`, which ai deliberately
+		// keeps out of its export map) lies outside the package `rootDir`, and tsc
+		// writes any such declaration NEXT TO ITS SOURCE rather than under
+		// `--outDir`. That left an untracked `.d.ts` in the working tree on every
+		// `ci:check:full`, which is exactly what a release pre-flight refuses.
+		await $`bun x tsc -p ${config} --rootDir ${repoRoot} --outDir ${outputDir}`.cwd(pkgDir);
 	}
 }
 

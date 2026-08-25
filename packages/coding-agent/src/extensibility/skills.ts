@@ -111,6 +111,8 @@ export interface LoadSkillsOptions extends SkillsSettings {
 	cwd?: string;
 	/** Explicit user home for skill discovery. Default: getTrustedHomeDir(). */
 	home?: string;
+	/** Explicit user agent directory for native user-scope skill discovery. */
+	agentDir?: string;
 }
 
 /**
@@ -164,7 +166,12 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		provider => provider.id === "native",
 	);
 	if (!nativeProvider) throw new Error("Native skill provider is unavailable");
-	const result = await nativeProvider.load({ cwd, home, repoRoot: await findRepoRoot(cwd) });
+	const result = await nativeProvider.load({
+		cwd,
+		home,
+		userAgentDir: options.agentDir,
+		repoRoot: await findRepoRoot(cwd),
+	});
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();

@@ -4,7 +4,6 @@ import type { AgentSideConnection, PromptRequest, SessionNotification } from "@a
 import { logger, TempDir } from "@gajae-code/utils";
 import { AcpAgent } from "../src/modes/acp/acp-agent";
 import { writeBrokerDiscovery } from "../src/sdk/broker/discovery";
-import { TEST_BROKER_PACKAGE_AUTHORITY } from "./helpers/sdk-broker-fixture";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -17,6 +16,7 @@ setDefaultTimeout(75_000);
 type TestSocket = { send(message: string): void };
 type StoppedReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
 type FailedCode = "prompt_failed" | "prompt_deadline_exceeded";
+type AdvisoryQuery = "context.get" | "session.metadata";
 
 type Fixture = {
 	agent: AcpAgent;
@@ -25,10 +25,13 @@ type Fixture = {
 	promptDelivered: Promise<void>;
 	sendStopped(reason: StoppedReason): void;
 	sendFailed(code: FailedCode): void;
+	sendDiagnostic(): void;
 	sendAssistantMessage(text: string): void;
 	sendIdle(): void;
 	dispose(): void;
 	queryCalls: string[];
+	blockedAdvisoryQueryCount(): number;
+	releaseBlockedAdvisoryQueries(): void;
 	sendTerminal(frame: Record<string, unknown>): void;
 };
 
@@ -66,6 +69,7 @@ async function createFixture(
 		promptAcknowledgement?: Record<string, unknown>;
 		cancelSettlementGraceMs?: number;
 		abortAcknowledgement?: Record<string, unknown>;
+		blockedAdvisoryQuery?: AdvisoryQuery;
 	} = {},
 ): Promise<Fixture> {
 	const tempDir = TempDir.createSync("@sdk-acp-prompt-terminal-");
@@ -77,9 +81,11 @@ async function createFixture(
 	const turnId = "prompt-terminal-turn";
 	const updates: SessionNotification[] = [];
 	const queryCalls: string[] = [];
+	const blockedAdvisoryQueries: Array<{ socket: TestSocket; id: string; result: unknown }> = [];
 	const delivered = Promise.withResolvers<void>();
 	const abort = new AbortController();
 	let promptSocket: TestSocket | undefined;
+	let blockAdvisoryQuery = false;
 	let server!: ReturnType<typeof Bun.serve>;
 
 	const send = (frame: Record<string, unknown>): void => {
@@ -96,18 +102,35 @@ async function createFixture(
 			outcome: { kind: "stopped", reason, provenance: reason === "cancelled" ? "client_cancel" : "agent" },
 		});
 	};
-	const sendFailed = (code: FailedCode): void => {
+	const sendDiagnostic = (): void => {
 		send({
 			type: "agent_failed",
 			sessionId,
 			commandId,
 			turnId,
-			outcome: {
-				kind: "failed",
-				code,
-				message: `${code} from fixture`,
-				provenance: code === "prompt_failed" ? "agent_failed" : "deadline",
-			},
+			error: { code: "provider_unavailable", message: "diagnostic from fixture" },
+		});
+	};
+	const sendFailed = (code: FailedCode): void => {
+		const outcome = {
+			kind: "failed" as const,
+			code,
+			message: `${code} from fixture`,
+			provenance: code === "prompt_failed" ? ("agent_failed" as const) : ("deadline" as const),
+		};
+		send({
+			type: "agent_failed",
+			sessionId,
+			commandId,
+			turnId,
+			outcome,
+		});
+		send({
+			type: "agent_end",
+			sessionId,
+			commandId,
+			turnId,
+			outcome,
 		});
 	};
 	const sendAssistantMessage = (text: string): void => {
@@ -168,6 +191,14 @@ async function createFixture(
 							: frame.query === "context.get"
 								? { usage: { tokens: 0, contextWindow: 200_000, percent: 0, source: "test" } }
 								: { page: { items, complete: true } };
+					if (
+						blockAdvisoryQuery &&
+						frame.query === options.blockedAdvisoryQuery &&
+						blockedAdvisoryQueries.length === 0
+					) {
+						blockedAdvisoryQueries.push({ socket, id: String(frame.id), result });
+						return;
+					}
 					socket.send(JSON.stringify({ type: "query_response", id: frame.id, ok: true, result }));
 					return;
 				}
@@ -228,8 +259,6 @@ async function createFixture(
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
-		packageVersion: TEST_BROKER_PACKAGE_AUTHORITY.packageVersion,
-		installationIdentity: TEST_BROKER_PACKAGE_AUTHORITY.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -250,7 +279,6 @@ async function createFixture(
 			...(options.cancelSettlementGraceMs === undefined
 				? {}
 				: { cancelSettlementGraceMs: options.cancelSettlementGraceMs }),
-			expectedPackageGeneration: "test",
 		},
 	);
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");
@@ -263,6 +291,7 @@ async function createFixture(
 			),
 		"bootstrap update",
 	);
+	blockAdvisoryQuery = true;
 
 	return {
 		agent,
@@ -271,9 +300,17 @@ async function createFixture(
 		promptDelivered: delivered.promise,
 		sendStopped,
 		sendFailed,
+		sendDiagnostic,
 		sendAssistantMessage,
 		sendIdle,
 		queryCalls,
+		blockedAdvisoryQueryCount: () => blockedAdvisoryQueries.length,
+		releaseBlockedAdvisoryQueries: () => {
+			for (const blocked of blockedAdvisoryQueries.splice(0))
+				blocked.socket.send(
+					JSON.stringify({ type: "query_response", id: blocked.id, ok: true, result: blocked.result }),
+				);
+		},
 		sendTerminal,
 		dispose: () => {
 			abort.abort();
@@ -345,6 +382,45 @@ test("ACP prompt rejects prompt_deadline_exceeded terminal outcomes with their c
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendFailed("prompt_deadline_exceeded");
 		await expect(bounded(pending, "deadline failure")).rejects.toMatchObject({ code: "prompt_deadline_exceeded" });
+	} finally {
+		fixture.dispose();
+	}
+});
+
+test("ACP defers end-of-turn advisory updates until agent_end after diagnostic agent_failed", async () => {
+	const fixture = await createFixture();
+	try {
+		const contextQueriesBefore = fixture.queryCalls.filter(query => query === "context.get").length;
+		const metadataQueriesBefore = fixture.queryCalls.filter(query => query === "session.metadata").length;
+		const idleUpdatesBefore = idlePhaseUpdates(fixture.updates);
+		const pending = prompt(fixture, "diagnostic before terminal");
+		await bounded(fixture.promptDelivered, "prompt delivery");
+		fixture.sendDiagnostic();
+		await waitFor(
+			() =>
+				fixture.updates.some(
+					update =>
+						update.update.sessionUpdate === "session_info_update" &&
+						(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true,
+				),
+			"diagnostic failure metadata",
+		);
+		expect(
+			fixture.updates.filter(
+				update =>
+					update.update.sessionUpdate === "session_info_update" &&
+					(update.update as { _meta?: { gjcAgentFailed?: boolean } })._meta?.gjcAgentFailed === true,
+			),
+		).toHaveLength(1);
+		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore);
+		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore);
+		expect(idlePhaseUpdates(fixture.updates)).toBe(idleUpdatesBefore);
+
+		fixture.sendStopped("end_turn");
+		expect(await bounded(pending, "agent_end settlement")).toEqual({ stopReason: "end_turn" });
+		await waitFor(() => idlePhaseUpdates(fixture.updates) === idleUpdatesBefore + 1, "agent_end idle update");
+		expect(fixture.queryCalls.filter(query => query === "context.get")).toHaveLength(contextQueriesBefore + 1);
+		expect(fixture.queryCalls.filter(query => query === "session.metadata")).toHaveLength(metadataQueriesBefore + 1);
 	} finally {
 		fixture.dispose();
 	}
@@ -492,7 +568,7 @@ test("ACP logs incomplete-correlation terminals dropped from an acknowledged pro
 	}
 });
 
-for (const terminalType of ["agent_end", "agent_failed"] as const) {
+for (const terminalType of ["agent_end"] as const) {
 	test(`ACP rejects a matching ${terminalType} without a normalized outcome before idle`, async () => {
 		const fixture = await createFixture();
 		try {
@@ -546,6 +622,16 @@ test("ACP preserves the fixed settlement-grace invalid-terminal rejection", asyn
 				message: "Prompt resources did not settle before the terminalization grace expired.",
 			},
 		});
+		fixture.sendTerminal({
+			type: "agent_end",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: {
+				code: "terminal_uncertain",
+				message: "Prompt resources did not settle before the terminalization grace expired.",
+			},
+		});
 		await expect(bounded(pending, "unsettled prompt rejection")).rejects.toMatchObject({
 			code: "connection_closed",
 			message:
@@ -565,6 +651,16 @@ test("ACP releases the running phase and accepts a new prompt after a settlement
 		await bounded(fixture.promptDelivered, "prompt delivery");
 		fixture.sendTerminal({
 			type: "agent_failed",
+			sessionId: "prompt-terminal-session",
+			commandId: "prompt-terminal-command",
+			turnId: "prompt-terminal-turn",
+			error: {
+				code: "terminal_uncertain",
+				message: "Prompt resources did not settle before the terminalization grace expired.",
+			},
+		});
+		fixture.sendTerminal({
+			type: "agent_end",
 			sessionId: "prompt-terminal-session",
 			commandId: "prompt-terminal-command",
 			turnId: "prompt-terminal-turn",

@@ -1,7 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
 	consumeCapabilityInput,
+	createNativePetTransport,
 	ItermPetTransport,
+	isItermCandidate,
+	type NativePetUi,
 	type PetTransportClock,
 } from "@gajae-code/coding-agent/modes/components/iterm-pet-transport";
 
@@ -54,6 +57,62 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 	}
 	throw new Error("condition did not become true within 200 microtasks");
 }
+
+const nativeUi = {
+	drainInput: async () => {},
+	addInputListener: () => () => {},
+	submitTerminalOutput: async () => ({ status: "written" }),
+	notifyTerminalLifecycle: async () => {},
+	terminalGeneration: 1,
+} satisfies NativePetUi;
+
+describe("iTerm Pet candidate detection", () => {
+	it.each([
+		["forwarded LC_TERMINAL", { SSH_CONNECTION: "client server", LC_TERMINAL: "iTerm2" }],
+		["normalized LC_TERMINAL", { SSH_CONNECTION: "client server", LC_TERMINAL: " iterm2 " }],
+		["forwarded TERM_PROGRAM", { SSH_TTY: "/dev/pts/1", TERM_PROGRAM: "iTerm.app" }],
+		["normalized TERM_PROGRAM", { SSH_CLIENT: "10.0.0.1 12345 22", TERM_PROGRAM: " iTerm2 " }],
+		["local iTerm2", { TERM_PROGRAM: "iTerm.app", TERM_PROGRAM_VERSION: "3.6.11" }],
+	] as const)("probes %s without treating the environment marker as proof", (_label, env) => {
+		expect(isItermCandidate(env, true)).toBe(true);
+		const transport = createNativePetTransport({ ui: nativeUi, env, tty: true });
+		expect(transport).toBeDefined();
+		expect(transport?.availability.available).toBe(false);
+		transport?.dispose();
+	});
+
+	it("does not treat whitespace-only markers as iTerm2 hints", () => {
+		expect(isItermCandidate({ SSH_CONNECTION: "   ", LC_TERMINAL: "\t" }, true)).toBe(false);
+		expect(isItermCandidate({ SSH_CLIENT: "\t", TERM_PROGRAM: "  " }, true)).toBe(false);
+	});
+
+	it.each([
+		["generic SSH", { SSH_CONNECTION: "client server", TERM: "xterm-256color" }, true],
+		["spoofed noninteractive marker", { SSH_CONNECTION: "client server", LC_TERMINAL: "iTerm2" }, false],
+		["CI with a forwarded marker", { CI: "true", SSH_CONNECTION: "client server", LC_TERMINAL: "iTerm2" }, true],
+		["whitespace-only CI", { CI: "   ", TERM_PROGRAM: "iTerm.app" }, true],
+		["control-only CI", { CI: "\n\t", TERM_PROGRAM: "iTerm.app" }, true],
+	] as const)("does not probe %s", (_label, env, tty) => {
+		expect(isItermCandidate(env, tty)).toBe(false);
+		expect(createNativePetTransport({ ui: nativeUi, env, tty })).toBeUndefined();
+	});
+
+	it.each([
+		["explicit false CI", { CI: " false ", TERM_PROGRAM: "iTerm.app" }],
+		["explicit zero CI", { CI: " 0 ", TERM_PROGRAM: "iTerm.app" }],
+	] as const)("allows explicitly inactive CI marker %s", (_label, env) => {
+		expect(isItermCandidate(env, true)).toBe(true);
+	});
+
+	it.each([
+		["tmux", { TMUX: "/tmp/tmux-1/default,1,0" }],
+		["screen", { STY: "screen.1" }],
+		["zellij", { ZELLIJ: "1" }],
+	] as const)("blocks unverified iTerm graphics inside %s", (_label, nesting) => {
+		const env = { SSH_CONNECTION: "client server", LC_TERMINAL: "iTerm2", ...nesting };
+		expect(createNativePetTransport({ ui: nativeUi, env, tty: true })).toBeUndefined();
+	});
+});
 
 describe("managed iTerm Pet topology revocation", () => {
 	it.each([

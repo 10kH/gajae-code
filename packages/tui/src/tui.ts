@@ -1172,6 +1172,7 @@ export class TUI extends Container {
 	}
 
 	#visibleWidthForDifferentialGuard(line: string): number {
+		if (line.length === 0) return 0;
 		const cached = this.#lineEmitWidthCache.get(line);
 		if (cached !== undefined) return cached;
 		TUI.#renderCounters.differentialGuardVisibleWidthCalls += 1;

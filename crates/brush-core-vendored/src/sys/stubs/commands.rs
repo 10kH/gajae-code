@@ -105,3 +105,22 @@ impl CommandSessionExt for std::process::Command {
 		// NOTE: This is a no-op on platforms without setsid support.
 	}
 }
+
+/// Extension trait for keeping child processes of a console-less host from
+/// allocating visible console windows (#4883). Console windows are a Windows
+/// concept; on stub platforms this is a no-op.
+pub trait CommandWindowControlExt {
+	/// Whether this process currently has no attached console (never true on
+	/// stub platforms).
+	fn host_is_consoleless() -> bool;
+
+	/// Applies the host-console-aware no-window creation flag (no-op here).
+	fn suppress_console_window_if_host_consoleless(&mut self);
+}
+
+impl CommandWindowControlExt for std::process::Command {
+	fn host_is_consoleless() -> bool {
+		false
+	}
+	fn suppress_console_window_if_host_consoleless(&mut self) {}
+}

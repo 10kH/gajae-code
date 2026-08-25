@@ -9,6 +9,7 @@ These instructions teach a Hermes-style coordinator how to operate GJC through t
 ## Core loop
 
 1. Use `{{TOOL_PREFIX}}_list_sessions` to find an existing session, or `{{TOOL_PREFIX}}_start_session` when a new session is required and mutation is enabled. Pass `worktree` with a name derived from the task (a ticket id works well) so this session gets its own checkout; see Worktree policy below.
+   `{{TOOL_PREFIX}}_list_sessions` enumerates every GJC session the broker discovered under the allowed roots, which is a superset of the ones this bridge can drive. Reuse only entries with `registered: true`; the other tools resolve a session through its coordinator projection — `read_status`, `read_tail`, and `send_prompt` answer `not_found`, and `stop_session` reports `unknown_session` — so iterating the list unfiltered spends a failed call per unregistered entry and can trip a controller's consecutive-failure breaker. To adopt an unregistered session deliberately, call `{{TOOL_PREFIX}}_register_session` first.
 2. Send exactly one bounded task prompt with `{{TOOL_PREFIX}}_send_prompt`.
 3. Store the returned `turn_id`.
 4. Prefer `{{TOOL_PREFIX}}_watch_events` with the stored `next_after_seq` for event-driven progress; fall back to `{{TOOL_PREFIX}}_read_turn` or `{{TOOL_PREFIX}}_await_turn` for a specific `turn_id` until terminal.
@@ -31,6 +32,10 @@ Each delegate starts (or reuses) a session, sends one workflow-tagged turn, and 
 `{{TOOL_PREFIX}}_watch_events` is a bounded long-poll read tool. Call it with `after_seq` set to the last stored sequence number, optional `session_id` or `event_types`, `timeout_ms` up to 30000, and `limit` up to 100. Store the returned `next_after_seq` before the next wait. A timeout with no events is not failure; call again or use the turn/status read tools for a snapshot.
 
 Do not report completion to the user until the GJC turn is terminal. Do not infer completion from terminal scrollback alone.
+
+## Timeouts
+
+The generated `timeout` / `connect_timeout` values are the host MCP client's call and connect budgets for this server, in whole seconds — not a GJC turn deadline, and not the coordinator per-call caps (`{{TOOL_PREFIX}}_watch_events` `timeout_ms` up to 30000 ms; `{{TOOL_PREFIX}}_await_turn` bounded at 30 minutes). Operators may hand-tune them (1-3600); `gjc setup hermes --install` preserves installed numeric values unless `--timeout <seconds>` / `--connect-timeout <seconds>` is passed explicitly.
 
 Coordinator MCP is a durable polling/await bridge, not a push subscription stream. Use `{{TOOL_PREFIX}}_read_coordination_status`, `{{TOOL_PREFIX}}_read_turn`, and bounded `{{TOOL_PREFIX}}_await_turn` as the authoritative consumption surface.
 

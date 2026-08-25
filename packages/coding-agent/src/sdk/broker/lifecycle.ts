@@ -60,6 +60,7 @@ import {
 	normalizeSdkStartupFailure,
 	type SdkStartupFailure,
 	type SdkStartupRollbackResult,
+	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
@@ -85,7 +86,6 @@ import {
 	READINESS_TIMEOUT_INVALID_MESSAGE,
 	startupQueueWaitMs,
 } from "./startup-budget";
-import { observeProcess, type ProcessObservation, worktreeOccupant } from "./worktree-occupancy";
 
 export {
 	type ProcessIncarnationCommandRunner,
@@ -100,6 +100,7 @@ const MAX_RECEIVED_AT_SKEW_MS = 5_000;
 const MAX_LIFECYCLE_METADATA_BYTES = 4096;
 const MAX_EFFECT_MARKER_LENGTH = 128;
 const MAX_PROCESS_INCARNATION_LENGTH = 256;
+const DEAD_LIFECYCLE_MARKER_EXPIRY_MS = 60 * 60 * 1000;
 const READY_THEN_EXIT_MESSAGE = "became ready then exited before live admission";
 
 function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerResponse {
@@ -111,6 +112,39 @@ function readyThenExitedResponse(id: string, child?: ChildProcess): BrokerRespon
 	// prove arbitrary child output free of that material; its stderr is discarded
 	// by the OS and never captured (#4712 review).
 	return fail("ready_then_exited", parts.join(" "));
+}
+
+const STARTUP_CLEANUP_UNCERTAIN_MESSAGE =
+	"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.";
+
+export function terminalUncertainStartupMessage(response: BrokerResponse): string {
+	if (response.ok || response.error.code !== "spawn_failed") return STARTUP_CLEANUP_UNCERTAIN_MESSAGE;
+	logger.warn("sdk broker retained a sanitized launch failure after uncertain startup cleanup", {
+		message: sanitizeSdkStartupMessage(response.error.message),
+	});
+	return `${STARTUP_CLEANUP_UNCERTAIN_MESSAGE} Original launch failure: SDK internal process could not be started.`;
+}
+
+export async function waitForChildSpawn(
+	spawned: Pick<ChildProcess, "off" | "on" | "once">,
+	onPostSpawnError: (error: Error) => void = error =>
+		logger.warn("sdk session child emitted an error after successful spawn", {
+			message: sanitizeSdkStartupMessage(error),
+		}),
+): Promise<void> {
+	const spawnOutcome = Promise.withResolvers<void>();
+	const onSpawn = () => {
+		spawned.off("error", onError);
+		spawned.on("error", onPostSpawnError);
+		spawnOutcome.resolve();
+	};
+	const onError = (error: Error) => {
+		spawned.off("spawn", onSpawn);
+		spawnOutcome.reject(error);
+	};
+	spawned.once("spawn", onSpawn);
+	spawned.once("error", onError);
+	await spawnOutcome.promise;
 }
 
 export interface LifecycleDeadlines {
@@ -200,6 +234,15 @@ function lifecycleTiming(broker: Broker): LifecycleTiming {
 	return lifecycleTimingsForTest.get(broker) ?? defaultLifecycleTiming;
 }
 
+type LifecycleProofBudget = {
+	timing: LifecycleTiming;
+	deadlineAt: number;
+};
+
+function lifecycleProofWithinDeadline(budget: LifecycleProofBudget | undefined): boolean {
+	return budget === undefined || budget.timing.now() < budget.deadlineAt;
+}
+
 export function hasValidLifecycleDeadlines(value: LifecycleDeadlines, now = Date.now()): boolean {
 	const {
 		receivedAt,
@@ -230,6 +273,9 @@ export function hasValidLifecycleDeadlines(value: LifecycleDeadlines, now = Date
 	}
 }
 type Input = Record<string, unknown>;
+// The admitted launch deadline must survive the response phase: executeLifecycle
+// receives the caller's original input after startup admission has expanded it.
+type LifecycleEffectIntentWithDeadline = LifecycleEffectIntent & { lifecycleCleanupDeadlineAt?: number };
 export const isCanonicalSessionId = (value: string): boolean => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value);
 const defaultStateRoot = (cwd: string) => path.join(path.resolve(cwd), ".gjc", "state");
 const hasDefaultStateRoot = (cwd: string, root: string) => path.resolve(root) === defaultStateRoot(cwd);
@@ -612,6 +658,23 @@ function lifecycleDeadlines(input: Input, now: number): LifecycleDeadlines | Bro
 	const timeout = readinessTimeout(input);
 	return typeof timeout === "number" ? deriveLifecycleDeadlines(now, timeout) : timeout;
 }
+
+function lifecycleProofBudgetFromInput(broker: Broker, input: Input): LifecycleProofBudget | undefined {
+	return typeof input.lifecycleCleanupDeadlineAt === "number" && Number.isSafeInteger(input.lifecycleCleanupDeadlineAt)
+		? { timing: lifecycleTiming(broker), deadlineAt: input.lifecycleCleanupDeadlineAt }
+		: undefined;
+}
+
+function lifecycleProofBudgetFromEffectIntent(
+	broker: Broker,
+	effectIntent: LifecycleEffectIntent | undefined,
+): LifecycleProofBudget | undefined {
+	const deadlineAt = (effectIntent as LifecycleEffectIntentWithDeadline | undefined)?.lifecycleCleanupDeadlineAt;
+	return typeof deadlineAt === "number" && Number.isSafeInteger(deadlineAt)
+		? { timing: lifecycleTiming(broker), deadlineAt }
+		: undefined;
+}
+
 function sessionId(input: Input): string | undefined {
 	return text(input.sessionId) ?? text(input.id);
 }
@@ -912,6 +975,42 @@ function hasProcessIncarnationAuthority(): boolean {
 	return processIncarnation(process.pid) !== undefined;
 }
 
+type ProcessObservation = "alive" | "exited" | "uncertain";
+
+/** Only ESRCH or a changed, readable incarnation proves the owned process exited. */
+function observeProcess(
+	pid: number,
+	expectedIncarnation: string | undefined,
+	readIncarnation: (pid: number) => string | undefined = processIncarnation,
+): ProcessObservation {
+	if (process.platform === "win32") {
+		try {
+			const reference = nativeLifecycle().Process.fromPid(pid);
+			if (reference?.status() !== "running") return "exited";
+		} catch {
+			return "uncertain";
+		}
+		if (!expectedIncarnation) return "uncertain";
+		const actualIncarnation = readIncarnation(pid);
+		if (!actualIncarnation) return "uncertain";
+		return actualIncarnation === expectedIncarnation ? "alive" : "exited";
+	}
+	try {
+		process.kill(pid, 0);
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain";
+	}
+	if (process.platform === "linux") {
+		const probe = probeLinuxProcPidSync(pid);
+		if (probe.kind === "live" && probe.state === "Z" && expectedIncarnation === `linux:${probe.startTime}`)
+			return "exited";
+	}
+	if (!expectedIncarnation) return "uncertain";
+	const actualIncarnation = readIncarnation(pid);
+	if (!actualIncarnation) return "uncertain";
+	return actualIncarnation === expectedIncarnation ? "alive" : "exited";
+}
+
 /** Test seam for the lifecycle-owned process observation boundary. */
 export function observeProcessForTest(
 	pid: number,
@@ -1002,6 +1101,115 @@ async function readEffectMarker(file: string): Promise<EffectMarker | undefined>
 	} catch {
 		return undefined;
 	}
+}
+
+/**
+ * Retires stale lifecycle markers only when their exact owner is proven gone. These
+ * files are launch bookkeeping, not authority for a future process: retaining
+ * an abandoned marker indefinitely turns unrelated launch failures into
+ * cleanup uncertainty. Unreadable, malformed, linked, and live markers are
+ * deliberately left untouched.
+ */
+export async function reapDeadLifecycleMarkers(
+	root: string,
+	limit = BROKER_DEAD_REGISTRATION_SWEEP_LIMIT,
+): Promise<number> {
+	let directory: string;
+	let directoryIdentity: { dev: bigint; ino: bigint };
+	try {
+		const canonicalRoot = fsSync.realpathSync(root);
+		directory = path.join(canonicalRoot, "sdk");
+		const directoryStat = fsSync.lstatSync(directory, { bigint: true });
+		if (!directoryStat.isDirectory() || directoryStat.isSymbolicLink()) return 0;
+		directoryIdentity = { dev: directoryStat.dev, ino: directoryStat.ino };
+	} catch {
+		return 0;
+	}
+	const inspectionLimit = Math.max(0, limit);
+	if (inspectionLimit === 0) return 0;
+	let directoryHandle: fsSync.Dir;
+	try {
+		directoryHandle = await fs.opendir(directory);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+		return 0;
+	}
+	let reaped = 0;
+	let inspected = 0;
+	for await (const entry of directoryHandle) {
+		if (inspected >= inspectionLimit) break;
+		inspected += 1;
+		const name = entry.name;
+		if (!entry.isFile() || !name.endsWith(".lifecycle.json")) continue;
+		const id = name.slice(0, -".lifecycle.json".length);
+		if (!isCanonicalSessionId(id)) continue;
+		const markerPath = path.join(directory, name);
+		const marker = await readEffectMarker(markerPath);
+		if (!marker || observeProcess(marker.pid, marker.incarnation) !== "exited") continue;
+		const primary = captureLifecycleFile(markerPath, true, true);
+		if (!primary || Date.now() - Number(primary.identity.mtimeNs / 1_000_000n) < DEAD_LIFECYCLE_MARKER_EXPIRY_MS)
+			continue;
+		const readyPath = lifecycleReadyPath(path.dirname(directory), id);
+		const ready = captureLifecycleFile(readyPath, true, true);
+		if (ready) {
+			try {
+				const readyMarker = parseLifecycleJson(ready.bytes);
+				if (!isExactEffectMarker(readyMarker) || !sameEffectMarker(readyMarker, marker)) continue;
+			} catch {
+				continue;
+			}
+		}
+		try {
+			const currentParent = lifecycleParentIdentity(directory);
+			if (
+				!currentParent ||
+				BigInt(currentParent.dev) !== directoryIdentity.dev ||
+				BigInt(currentParent.ino) !== directoryIdentity.ino
+			)
+				continue;
+			const currentPrimary = captureLifecycleFile(markerPath, true, true);
+			const currentReady = ready ? captureLifecycleFile(readyPath, true, true)?.identity : undefined;
+			if (
+				!currentPrimary ||
+				!sameLifecycleCleanupIdentity(
+					currentPrimary.identity,
+					serializeCleanupIdentity({ ...primary.identity, size: Number(primary.identity.size) }),
+				) ||
+				(ready &&
+					(!currentReady ||
+						!sameLifecycleCleanupIdentity(
+							currentReady,
+							serializeCleanupIdentity({ ...ready.identity, size: Number(ready.identity.size) }),
+						)))
+			)
+				continue;
+			const currentMarker = parseLifecycleJson(currentPrimary.bytes);
+			if (!isExactEffectMarker(currentMarker) || !sameEffectMarker(currentMarker, marker)) continue;
+			if (
+				ready &&
+				!nativeLifecycle().exactUnlinkDirect(readyPath, {
+					...ready.identity,
+					parentDev: directoryIdentity.dev,
+					parentIno: directoryIdentity.ino,
+					quarantineName: `.gjc-reap-${randomUUID()}-${path.basename(readyPath)}`,
+				}).ok
+			)
+				continue;
+			if (
+				!nativeLifecycle().exactUnlinkDirect(markerPath, {
+					...primary.identity,
+					parentDev: directoryIdentity.dev,
+					parentIno: directoryIdentity.ino,
+					quarantineName: `.gjc-reap-${randomUUID()}-${name}`,
+				}).ok
+			)
+				continue;
+		} catch {
+			continue;
+		}
+		reaped += 1;
+	}
+	return reaped;
 }
 
 async function writeEffectMarker(root: string, id: string, marker: EffectMarker): Promise<void> {
@@ -1925,7 +2133,10 @@ async function reconcileLifecycleCleanup(
 	identity: string,
 	cleanup: CleanupEvidence,
 	completion: BrokerResponse = fail("spawn_failed", "No ready SDK endpoint remains available."),
+	proofBudget?: LifecycleProofBudget,
 ): Promise<BrokerResponse> {
+	if (!lifecycleProofWithinDeadline(proofBudget))
+		return fail("terminal_uncertain", "Lifecycle cleanup proof exceeded its cleanup deadline.", cleanup);
 	const shapeValidation = validateLifecycleCleanupShape(cleanup);
 	if (shapeValidation) return shapeValidation;
 	let activeCleanup =
@@ -1934,10 +2145,14 @@ async function reconcileLifecycleCleanup(
 			: cleanup;
 	const metadataReplayValidation = validateLifecycleMetadataReplay(activeCleanup);
 	if (metadataReplayValidation) return metadataReplayValidation;
+	const deadlineFailure = (): BrokerResponse =>
+		fail("terminal_uncertain", "Lifecycle cleanup proof exceeded its cleanup deadline.", activeCleanup);
 	for (let index = 0; index < activeCleanup.lifecycleFiles!.length; index++) {
+		if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 		const file = activeCleanup.lifecycleFiles![index];
 		if (!validateLifecycleCleanupFile(activeCleanup.metadataRoot!, activeCleanup.sessionId!, file))
 			return fail("terminal_uncertain", "Lifecycle cleanup replay contains an invalid path authority.");
+		if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 		const candidates = lifecycleCleanupCandidates(file);
 		if (file.completed) {
 			for (const candidate of candidates) {
@@ -1964,12 +2179,14 @@ async function reconcileLifecycleCleanup(
 					"Lifecycle cleanup receipt marks a target complete while an authorized candidate remains.",
 				);
 			}
+			if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 			continue;
 		}
 		let activePath: string | undefined;
 		let captured: LifecycleFileCapture | undefined;
 		let foundUnauthorized = false;
 		for (const candidate of candidates) {
+			if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 			try {
 				const stat = fsSync.lstatSync(candidate);
 				if (stat.isSymbolicLink() || !stat.isFile()) {
@@ -1982,6 +2199,7 @@ async function reconcileLifecycleCleanup(
 				continue;
 			}
 			const current = captureLifecycleFile(candidate, true, true);
+			if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 
 			if (!current) {
 				foundUnauthorized = true;
@@ -2004,6 +2222,7 @@ async function reconcileLifecycleCleanup(
 			await broker.ledger.transition(identity, "effect_started", {
 				response: fail("cleanup_pending", "Lifecycle cleanup completion was durably reconciled.", activeCleanup),
 			});
+			if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 			continue;
 		}
 
@@ -2025,14 +2244,17 @@ async function reconcileLifecycleCleanup(
 					activeCleanup,
 				),
 			});
+			if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 		}
 		const currentFile = activeCleanup.lifecycleFiles![index];
+		if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 		const result = nativeLifecycle().exactUnlink(activePath, {
 			...captured.identity,
 			parentDev: BigInt(activeCleanup.lifecycleParentIdentity!.dev),
 			parentIno: BigInt(activeCleanup.lifecycleParentIdentity!.ino),
 			quarantineName: path.basename(currentFile.plannedPath),
 		});
+		if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 		if (!result.ok) {
 			if (result.code === "cleanup_pending" && result.detachedPath === currentFile.plannedPath) {
 				// Typed retained authority: the native verified the exact identity-bound
@@ -2048,6 +2270,7 @@ async function reconcileLifecycleCleanup(
 					response: fail("cleanup_pending", "Lifecycle cleanup completion was durably reconciled.", activeCleanup),
 				});
 				lifecycleCleanupHooksForTest.get(broker)?.();
+				if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 				continue;
 			}
 			const lifecycleFiles = activeCleanup.lifecycleFiles!.map((candidate, candidateIndex) =>
@@ -2068,8 +2291,10 @@ async function reconcileLifecycleCleanup(
 			response: fail("cleanup_pending", "Lifecycle cleanup completion was durably reconciled.", activeCleanup),
 		});
 		lifecycleCleanupHooksForTest.get(broker)?.();
+		if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 	}
 	await syncDirectory(path.join(activeCleanup.metadataRoot!, "sdk"));
+	if (!lifecycleProofWithinDeadline(proofBudget)) return deadlineFailure();
 	return completion;
 }
 
@@ -2303,8 +2528,11 @@ async function removeOwnedLifecycleArtifacts(
 	expected: EffectMarker,
 	onRetainedUnknown?: () => void,
 	onDurablePlaceholder?: (file: string) => void,
+	proofBudget?: LifecycleProofBudget,
 ): Promise<boolean> {
+	if (!lifecycleProofWithinDeadline(proofBudget)) return false;
 	const marker = await readEffectMarker(lifecycleMarkerPath(root, id));
+	if (!lifecycleProofWithinDeadline(proofBudget)) return false;
 	if (!marker || !sameEffectMarker(marker, expected)) return false;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
 	const plannedEndpointPath = path.join(
@@ -2327,6 +2555,7 @@ async function removeOwnedLifecycleArtifacts(
 		}
 	});
 	const endpoint = endpointSource ? captureLifecycleFile(endpointSource) : undefined;
+	if (!lifecycleProofWithinDeadline(proofBudget)) return false;
 	const endpointParent = endpointSource ? lifecycleParentIdentity(path.dirname(endpointSource)) : undefined;
 	if (endpoint && endpointSource && endpointParent) {
 		let parsed: { pid?: unknown };
@@ -2345,6 +2574,7 @@ async function removeOwnedLifecycleArtifacts(
 		// belong to a PID-reusing successor and must not be unlinked (#4712
 		// review: PID-reuse race must not delete a successor endpoint).
 		const preUnlinkMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
+		if (!lifecycleProofWithinDeadline(proofBudget)) return false;
 		if (!preUnlinkMarker || !sameEffectMarker(preUnlinkMarker, expected)) return false;
 		const endpointRemoval = exactUnlinkLifecycleFile(
 			endpointSource,
@@ -2356,6 +2586,7 @@ async function removeOwnedLifecycleArtifacts(
 					: finalEndpointPath,
 			{ dev: BigInt(endpointParent.dev), ino: BigInt(endpointParent.ino) },
 		);
+		if (!lifecycleProofWithinDeadline(proofBudget)) return false;
 		if (!endpointRemoval.ok) {
 			if (endpointRemoval.retainedUnknownPath) {
 				onRetainedUnknown?.();
@@ -2396,17 +2627,20 @@ async function removeOwnedLifecycleArtifacts(
 				} catch {
 					return false;
 				}
+				if (!lifecycleProofWithinDeadline(proofBudget)) return false;
 				if (!detachedRemoval.ok && detachedRemoval.code !== "not_found") return false;
 			}
 		}
 	}
 	const currentMarker = await readEffectMarker(lifecycleMarkerPath(root, id));
+	if (!lifecycleProofWithinDeadline(proofBudget)) return false;
 	if (!currentMarker || !sameEffectMarker(currentMarker, expected)) return false;
 	const readyPath = lifecycleReadyPath(root, id);
 	const ready = captureLifecycleFile(readyPath, true, true);
+	if (!lifecycleProofWithinDeadline(proofBudget)) return false;
 	if (ready && createHash("sha256").update(ready.bytes).digest("hex") !== ready.digest) return false;
 	// Readiness mutation is deferred to the same ledger-backed cleanup transaction.
-	return true;
+	return lifecycleProofWithinDeadline(proofBudget);
 }
 
 /**
@@ -2464,7 +2698,21 @@ async function terminateSpawnedChild(
 	const pid = child.pid;
 	if (!pid || (expected && pid !== expected.pid)) return false;
 	const incarnation = expected?.incarnation ?? processIncarnationForBroker(broker, pid);
+	const proofBudget: LifecycleProofBudget = { timing, deadlineAt: deadline };
+	const failClosed = async (): Promise<boolean> => {
+		await recordTerminalUncertain(broker, id, root, pid);
+		return false;
+	};
+	if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 	await broker.index.refresh();
+	if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+	const registered = expected ? broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker) : false;
+	// Keep one poll interval inside the lifecycle deadline for the final exact
+	// cleanup proof. Registered sessions retain the original deadline partition;
+	// only an unregistered child needs this extra bounded margin.
+	const processExitDeadlineAt = expected && !registered ? deadline - POLL_MS : deadline;
+	const unregisteredTerminationDeadlineAt =
+		processExitDeadlineAt - Math.max(POLL_MS, Math.floor((processExitDeadlineAt - terminationStartDeadlineAt) / 2));
 	const observe = (): ProcessObservation =>
 		child.exitCode !== null
 			? "exited"
@@ -2484,10 +2732,22 @@ async function terminateSpawnedChild(
 		if (observation !== "uncertain") return;
 		// This direct ChildProcess is owned by this broker invocation. A process-incarnation
 		// read can briefly lag its exit event, so recheck only this owned child before failing.
-		observation = await waitForExit(deadline);
+		observation = await waitForExit(processExitDeadlineAt);
 	};
 	if (observation === "alive") {
-		await waitUntil(timing, terminationStartDeadlineAt);
+		if (expected && !registered) {
+			// A child that has not registered yet owns the cutoff receipt. Give it
+			// the bounded pre-registration window to publish that proof, but reserve
+			// the final proof interval for post-signal observation inside the request
+			// deadline. A valid receipt does not interrupt the child's own rollback.
+			while (timing.now() < unregisteredTerminationDeadlineAt) {
+				if (await readLifecycleFailureArtifact(lifecycleFailurePath(root, id, expected.effectMarker), expected))
+					await waitUntil(timing, unregisteredTerminationDeadlineAt);
+				else await timing.sleep(Math.max(0, Math.min(POLL_MS, unregisteredTerminationDeadlineAt - timing.now())));
+			}
+		} else {
+			await waitUntil(timing, terminationStartDeadlineAt);
+		}
 		observation = observe();
 	}
 	if (observation === "alive") {
@@ -2499,7 +2759,7 @@ async function terminateSpawnedChild(
 				return false;
 			}
 		} else {
-			const remaining = Math.max(0, deadline - timing.now());
+			const remaining = Math.max(0, processExitDeadlineAt - timing.now());
 			const gracefulDeadline = timing.now() + Math.min(CLOSE_TIMEOUT_MS, Math.floor(remaining / 2));
 			observation = await waitForExit(gracefulDeadline);
 		}
@@ -2513,20 +2773,18 @@ async function terminateSpawnedChild(
 				return false;
 			}
 		} else {
-			observation = await waitForExit(deadline);
+			observation = await waitForExit(processExitDeadlineAt);
 		}
 	}
 	await recheckOwnedExitObservation();
-	if (observation !== "exited") {
-		await recordTerminalUncertain(broker, id, root, pid);
-		return false;
-	}
+	if (observation !== "exited" || !lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 	let rollbackGeneration: number | null | undefined;
 	if (expected) {
 		const failure = await readLifecycleFailureArtifact(
 			lifecycleFailurePath(root, id, expected.effectMarker),
 			expected,
 		);
+		if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 		const rollbackComplete =
 			failure?.artifact.rollback.fenced === true &&
 			failure.artifact.rollback.runtimeRemoved &&
@@ -2534,12 +2792,22 @@ async function terminateSpawnedChild(
 			failure.artifact.rollback.brokerRegistrationReleased;
 		if (!rollbackComplete) {
 			if (!readyThenExitToleranceEnabled()) {
-				await recordTerminalUncertain(broker, id, root, pid);
-				return false;
+				return failClosed();
 			}
+			if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 			const publishedReady = (await probePublishedReadyAuthority(root, id, expected)).kind === "matched";
-			const artifactsRemoved = await removeOwnedLifecycleArtifacts(root, id, expected);
+			if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+			const artifactsRemoved = await removeOwnedLifecycleArtifacts(
+				root,
+				id,
+				expected,
+				undefined,
+				undefined,
+				proofBudget,
+			);
+			if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 			await broker.index.refresh();
+			if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 			const registered = broker.index
 				.listSessions()
 				.sessions.find(session => session.sessionId === id && session.pid === pid);
@@ -2547,14 +2815,19 @@ async function terminateSpawnedChild(
 			let registrationReleased =
 				!broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker) || registeredRowTerminal;
 			if (registered && !registrationReleased) {
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 				registrationReleased = await broker.index.unregisterIfCurrent(registered);
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 				await broker.index.refresh();
+				if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 				registrationReleased =
 					registrationReleased || !broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker);
 			}
 			const stillExited =
 				observeProcess(pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) === "exited";
+			if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 			const endpointGone = await endpointRemoved(root, id);
+			if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 			try {
 				if (publishedReady && !failure) {
 					await writeSessionLifecycleFailure(
@@ -2581,23 +2854,29 @@ async function terminateSpawnedChild(
 			} catch {
 				// A missing broker-authored receipt must not hide a proven dead child.
 			}
-			if (stillExited && artifactsRemoved && endpointGone && registrationReleased) return true;
-			await recordTerminalUncertain(broker, id, root, pid);
-			return false;
+			if (
+				stillExited &&
+				artifactsRemoved &&
+				endpointGone &&
+				registrationReleased &&
+				lifecycleProofWithinDeadline(proofBudget)
+			)
+				return true;
+			return failClosed();
 		}
 		rollbackGeneration = failure.artifact.rollback.endpointGeneration;
 	}
-	if (expected && !(await removeOwnedLifecycleArtifacts(root, id, expected))) {
-		await recordTerminalUncertain(broker, id, root, pid);
-		return false;
-	}
+	if (expected && !(await removeOwnedLifecycleArtifacts(root, id, expected, undefined, undefined, proofBudget)))
+		return failClosed();
+	if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 	await broker.index.refresh();
+	if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
 	if (
 		rollbackGeneration === null &&
 		expected &&
 		!broker.index.hasHostRegistrationForLifecycle(id, pid, expected.effectMarker)
 	)
-		return true;
+		return lifecycleProofWithinDeadline(proofBudget) ? true : failClosed();
 	const registeredBeforeTermination =
 		rollbackGeneration === undefined || rollbackGeneration === null
 			? undefined
@@ -2606,10 +2885,11 @@ async function terminateSpawnedChild(
 		? broker.index.hostUnregisteredAfter(registeredBeforeTermination)
 		: undefined;
 	if (!registeredBeforeTermination || !unregistered) {
-		await recordTerminalUncertain(broker, id, root, pid);
-		return false;
+		return failClosed();
 	}
-	return endpointRemoved(root, id);
+	if (!lifecycleProofWithinDeadline(proofBudget)) return failClosed();
+	const endpointGone = await endpointRemoved(root, id);
+	return endpointGone && lifecycleProofWithinDeadline(proofBudget) ? true : failClosed();
 }
 
 async function signalVerifiedSession(
@@ -3063,15 +3343,6 @@ function worktreeIntent(plan: GjcLaunchWorktreePlan | undefined): LifecycleWorkt
 		baseRef: plan.baseRef,
 		...(plan.branchName ? { branchName: plan.branchName } : {}),
 	};
-}
-
-/** Test seam for the worktree occupancy boundary. */
-export function worktreeOccupantForTest(
-	sessions: IndexedSession[],
-	worktreePath: string,
-	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
-): string | null {
-	return worktreeOccupant(sessions, worktreePath, observe);
 }
 
 function preparePlannedWorktree(plan: GjcLaunchWorktreePlan): SessionLifecycleWorktreeReceipt {
@@ -3879,22 +4150,13 @@ async function executeLifecycleResponse(
 				"incarnation_unavailable",
 				"OS process incarnation authority is unavailable; refusing to spawn a lifecycle session.",
 			);
-		// Refuse before any durable effect is recorded: a launch that cannot own its
-		// worktree should leave no ledger transition or child process behind.
-		if (launch.worktreePlan) {
-			const occupant = worktreeOccupant(broker.index.listSessions().sessions, launch.worktreePlan.worktreePath);
-			if (occupant && occupant !== launch.id)
-				return fail(
-					"worktree_in_use",
-					`The requested worktree is already held by session ${occupant}. Choose another worktree name or stop that session.`,
-				);
-		}
 		const effectMarker = randomUUID();
 		const plannedWorktreeIntent = worktreeIntent(launch.worktreePlan);
-		const effectIntent: LifecycleEffectIntent = {
+		const effectIntent: LifecycleEffectIntentWithDeadline = {
 			sessionId: launch.id,
 			stateRoot: launch.root,
 			childOwnershipEstablished: false,
+			lifecycleCleanupDeadlineAt: deadlines.lifecycleCleanupDeadlineAt,
 			...(plannedWorktreeIntent ? { worktree: plannedWorktreeIntent } : {}),
 		};
 
@@ -3927,6 +4189,7 @@ async function executeLifecycleResponse(
 				await broker.ledger.transition(identity, "effect_started", { durableEffects });
 				ensureReusableNodeModules(launch.worktreePlan.repoRoot, launch.worktreePlan.worktreePath);
 			}
+			await reapDeadLifecycleMarkers(launch.root);
 		} catch (error) {
 			return fail(
 				"spawn_failed",
@@ -3979,10 +4242,10 @@ async function executeLifecycleResponse(
 		};
 		let child: ChildProcess | undefined;
 		let spawnedAuthority: EffectMarker | undefined;
+		let childSpawned = false;
 		try {
 			const authorizedSpawn = broker.runSynchronousEffectWithFreshPublicationAuthority(() => {
 				const cmd = command(broker);
-				const commandEnvironment = "kind" in cmd ? cmd.env : process.env;
 				return spawn(cmd.file, cmd.args, {
 					cwd: launch.cwd,
 					detached: true,
@@ -3993,7 +4256,7 @@ async function executeLifecycleResponse(
 					// by the OS rather than captured (#4712 review).
 					stdio: "ignore",
 					env: {
-						...commandEnvironment,
+						...("kind" in cmd ? cmd.env : process.env),
 						GJC_AGENT_DIR: broker.settings.agentDir,
 						GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 						GJC_SESSION_ID: launch.id,
@@ -4038,6 +4301,8 @@ async function executeLifecycleResponse(
 			}
 			const spawned = authorizedSpawn.value;
 			child = spawned;
+			await waitForChildSpawn(spawned);
+			childSpawned = true;
 			const pid = spawned.pid;
 			if (!pid) throw new Error("spawned session has no pid");
 			const incarnation = processIncarnationForBroker(broker, pid);
@@ -4049,18 +4314,19 @@ async function executeLifecycleResponse(
 			await writeEffectMarker(launch.root, launch.id, spawnedAuthority);
 			spawned.unref();
 		} catch (error) {
-			const terminated = child
-				? await terminateSpawnedChild(
-						child,
-						broker,
-						launch.id,
-						launch.root,
-						lifecycleDeadline,
-						terminationStartDeadline,
-						spawnedAuthority,
-						timing,
-					)
-				: true;
+			const terminated =
+				child && childSpawned
+					? await terminateSpawnedChild(
+							child,
+							broker,
+							launch.id,
+							launch.root,
+							lifecycleDeadline,
+							terminationStartDeadline,
+							spawnedAuthority,
+							timing,
+						)
+					: true;
 
 			return terminated
 				? fail("spawn_failed", `Unable to spawn session: ${error instanceof Error ? error.message : String(error)}`)
@@ -4990,17 +5256,27 @@ async function executeLifecycleResponse(
 			const reconciled = await reconcileLifecycleCleanup(broker, identity, metadataCleanup, completion);
 			if (!reconciled.ok) return reconciled;
 		}
-		if (record)
-			await broker.index.append({
-				type: "session_deleted",
-				sessionId: id,
-				locator: record.locator,
-				endpointGeneration: record.endpointGeneration,
-				pid: record.pid,
-			});
+		// Persist exact retirement authority in the broker-owned index only. These
+		// identity fields are deliberately not added to `completion`, so the public
+		// lifecycle response remains the credential-free `{ sessionId }` contract.
+		if (record) await appendSessionDeletedEvidence(broker, record);
 		return completion;
 	}
 	return fail("invalid_input", "Unknown lifecycle operation.");
+}
+
+async function appendSessionDeletedEvidence(broker: Broker, record: IndexedSession): Promise<void> {
+	await broker.index.append({
+		type: "session_deleted",
+		sessionId: record.sessionId,
+		locator: record.locator,
+		endpointGeneration: record.endpointGeneration,
+		pid: record.pid,
+		...(record.processIncarnation === undefined ? {} : { processIncarnation: record.processIncarnation }),
+		...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
+		...(record.endpointMtimeMs === undefined ? {} : { endpointMtimeMs: record.endpointMtimeMs }),
+		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
+	});
 }
 
 async function exactCleanupProof(
@@ -5009,8 +5285,10 @@ async function exactCleanupProof(
 	id: string | undefined,
 	expected: EffectMarker | undefined,
 	evidence: { artifact: LifecycleFailureArtifact } | undefined,
+	proofBudget?: LifecycleProofBudget,
 ): Promise<LifecycleCleanupProof | undefined> {
 	const rollback = evidence?.artifact.rollback;
+	if (!lifecycleProofWithinDeadline(proofBudget)) return undefined;
 	if (
 		!root ||
 		!id ||
@@ -5020,13 +5298,17 @@ async function exactCleanupProof(
 		!rollback.hostStopped ||
 		!rollback.brokerRegistrationReleased ||
 		observeProcess(expected.pid, expected.incarnation, value => processIncarnationForBroker(broker, value)) !==
-			"exited" ||
-		!(await endpointRemoved(root, id))
+			"exited"
 	)
 		return undefined;
+	if (!lifecycleProofWithinDeadline(proofBudget)) return undefined;
+	if (!(await endpointRemoved(root, id))) return undefined;
+	if (!lifecycleProofWithinDeadline(proofBudget)) return undefined;
 	await broker.index.refresh();
+	if (!lifecycleProofWithinDeadline(proofBudget)) return undefined;
 	if (rollback.endpointGeneration === null) {
 		if (broker.index.hasHostRegistrationForLifecycle(id, expected.pid, expected.effectMarker)) return undefined;
+		if (!lifecycleProofWithinDeadline(proofBudget)) return undefined;
 		return {
 			processExited: true,
 			endpointRemoved: true,
@@ -5047,7 +5329,7 @@ async function exactCleanupProof(
 		expected.effectMarker,
 	);
 	const hostUnregistered = registration ? broker.index.hostUnregisteredAfter(registration) : undefined;
-	return hostUnregistered
+	return hostUnregistered && lifecycleProofWithinDeadline(proofBudget)
 		? {
 				processExited: true,
 				endpointRemoved: true,
@@ -5109,6 +5391,9 @@ export async function executeLifecycle(
 	identity: string,
 	cleanup?: CleanupEvidence,
 ): Promise<LifecycleExecutionOutcome> {
+	let proofBudget = lifecycleProofBudgetFromInput(broker, input);
+	if (!proofBudget)
+		proofBudget = lifecycleProofBudgetFromEffectIntent(broker, broker.ledger.get(identity)?.effectIntent);
 	if (cleanup?.phase === "metadata") {
 		if (operation !== "session.delete")
 			return {
@@ -5135,10 +5420,16 @@ export async function executeLifecycle(
 			),
 		});
 		return {
-			response: await reconcileLifecycleCleanup(broker, identity, migrated, {
-				ok: true,
-				result: { sessionId: migrated.sessionId },
-			}),
+			response: await reconcileLifecycleCleanup(
+				broker,
+				identity,
+				migrated,
+				{
+					ok: true,
+					result: { sessionId: migrated.sessionId },
+				},
+				proofBudget,
+			),
 		};
 	}
 	if (cleanup?.phase === "lifecycle") {
@@ -5156,11 +5447,13 @@ export async function executeLifecycle(
 				operation === "session.delete"
 					? { ok: true, result: { sessionId: cleanup.sessionId } }
 					: fail("spawn_failed", "No ready SDK endpoint remains available."),
+				proofBudget,
 			),
 		};
 	}
 	const response = await executeLifecycleResponse(broker, operation, input, identity, cleanup);
 	const entry = broker.ledger.get(identity);
+	if (!proofBudget) proofBudget = lifecycleProofBudgetFromEffectIntent(broker, entry?.effectIntent);
 	const priorDurableEffects = entry?.durableEffects;
 	const evidenceCwd = entry?.effectIntent?.worktree?.worktreePath ?? lifecycleCwd(input);
 	const root = entry?.effectIntent?.stateRoot ?? stateRoot(input, evidenceCwd);
@@ -5176,7 +5469,14 @@ export async function executeLifecycle(
 					expected,
 				)
 			: undefined;
-	const cleanupProof = await exactCleanupProof(broker, root, entry?.intendedSessionId, expected, evidence);
+	const cleanupProof = await exactCleanupProof(
+		broker,
+		root,
+		entry?.intendedSessionId,
+		expected,
+		evidence,
+		proofBudget,
+	);
 	const startupFailure: LifecycleStartupFailureReceipt | undefined = evidence
 		? {
 				artifactDigest: evidence.digest,
@@ -5221,6 +5521,12 @@ export async function executeLifecycle(
 		evidence && root && entry?.intendedSessionId && expected && cleanupProof
 			? await (async () => {
 					const cleanupIntent = lifecycleCleanupPlan(root, entry.intendedSessionId!, expected, evidence);
+					if (!lifecycleProofWithinDeadline(proofBudget))
+						return fail(
+							"terminal_uncertain",
+							"Lifecycle cleanup proof exceeded its cleanup deadline.",
+							cleanupIntent,
+						);
 					await broker.ledger.transition(identity, "effect_started", {
 						response: fail(
 							"cleanup_pending",
@@ -5228,7 +5534,13 @@ export async function executeLifecycle(
 							cleanupIntent,
 						),
 					});
-					return reconcileLifecycleCleanup(broker, identity, cleanupIntent);
+					if (!lifecycleProofWithinDeadline(proofBudget))
+						return fail(
+							"terminal_uncertain",
+							"Lifecycle cleanup proof exceeded its cleanup deadline.",
+							cleanupIntent,
+						);
+					return reconcileLifecycleCleanup(broker, identity, cleanupIntent, undefined, proofBudget);
 				})()
 			: undefined;
 	if (
@@ -5244,14 +5556,17 @@ export async function executeLifecycle(
 	const provenExpected = expected;
 	const provenRoot = root;
 	const provenId = entry?.intendedSessionId;
-	const provenDeadCleanup =
-		Boolean(provenExpected) &&
-		Boolean(provenRoot) &&
-		Boolean(provenId) &&
-		observeProcess(provenExpected!.pid, provenExpected!.incarnation, value =>
-			processIncarnationForBroker(broker, value),
-		) === "exited" &&
-		(await endpointRemoved(provenRoot!, provenId!));
+	let provenDeadCleanup = false;
+	if (provenExpected && provenRoot && provenId && lifecycleProofWithinDeadline(proofBudget)) {
+		const processExited =
+			observeProcess(provenExpected!.pid, provenExpected!.incarnation, value =>
+				processIncarnationForBroker(broker, value),
+			) === "exited";
+		if (processExited && lifecycleProofWithinDeadline(proofBudget)) {
+			const endpointGone = await endpointRemoved(provenRoot!, provenId!);
+			provenDeadCleanup = endpointGone && lifecycleProofWithinDeadline(proofBudget);
+		}
+	}
 	const terminalResponse: BrokerResponse =
 		!response.ok &&
 		entry?.effectMarker &&
@@ -5293,8 +5608,7 @@ export async function executeLifecycle(
 										ok: false,
 										error: {
 											code: "terminal_uncertain",
-											message:
-												"Lifecycle startup cleanup could not be proven; retained artifacts require reconciliation.",
+											message: terminalUncertainStartupMessage(response),
 										},
 										...(durableEffects ? { durableEffects } : {}),
 										...(startupFailure ? { startupFailure } : {}),

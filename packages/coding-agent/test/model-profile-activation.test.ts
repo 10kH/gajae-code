@@ -34,6 +34,7 @@ const model = (provider: string, id: string, thinking?: Model["thinking"]): Mode
 		input: ["text"],
 		thinking,
 		reasoning: thinking !== undefined,
+		compat: thinking ? { supportsReasoningEffort: true } : undefined,
 	}) as Model;
 
 function fakeRegistry(options?: { missingProviders?: string[]; profiles?: ModelProfileDefinition[] }) {

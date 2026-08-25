@@ -1,30 +1,45 @@
 import { describe, expect, it } from "bun:test";
-import { THINKING_CONTROL_MODES } from "@gajae-code/ai";
+import { getBundledModel, THINKING_CONTROL_MODES } from "@gajae-code/ai";
 import {
 	applyGeneratedModelPolicies,
 	clampThinkingLevelForModel,
 	Effort,
 	enrichModelThinking,
+	getSupportedEfforts,
 	linkOpenAIPromotionTargets,
 	mapEffortToAnthropicAdaptiveEffort,
 	mapEffortToGoogleThinkingLevel,
+	modelSupportsReasoningControl,
 	requireSupportedEffort,
 } from "@gajae-code/ai/model-thinking";
 import type { Api, Model, Provider, ThinkingControlMode } from "@gajae-code/ai/types";
+
+const TEST_PROVIDER_BASE_URLS: Partial<Record<Provider, string>> = {
+	"alibaba-token-plan": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+	"kimi-code": "https://api.kimi.com/coding/v1",
+	"opencode-go": "https://opencode.ai/zen/go/v1",
+	"opencode-zen": "https://opencode.ai/zen/v1",
+	"openai-codex": "https://chatgpt.com/backend-api",
+	openrouter: "https://openrouter.ai/api/v1",
+	xai: "https://api.x.ai/v1",
+	zai: "https://api.z.ai/v1",
+};
 
 function createModel<TApi extends Api>(overrides: {
 	id: string;
 	api: TApi;
 	provider: Provider;
 	reasoning?: boolean;
+	compat?: Model<TApi>["compat"];
 }): Model<TApi> {
 	return enrichModelThinking({
 		id: overrides.id,
 		name: overrides.id,
 		api: overrides.api,
 		provider: overrides.provider,
-		baseUrl: "",
+		baseUrl: TEST_PROVIDER_BASE_URLS[overrides.provider] ?? "",
 		reasoning: overrides.reasoning ?? true,
+		compat: overrides.compat,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 200000,
@@ -327,6 +342,53 @@ describe("generated model policies", () => {
 				levels: [Effort.Low, Effort.High, Effort.Max],
 			},
 		});
+	});
+
+	it("pins Kilo Ox Alpha capabilities when generic discovery omits them", () => {
+		const models: Model<Api>[] = [
+			createModel({
+				id: "stealth/ox-alpha",
+				api: "openai-completions",
+				provider: "kilo",
+				reasoning: false,
+			}),
+		];
+		models[0]!.input = ["text"];
+		models[0]!.contextWindow = 222_222;
+		models[0]!.maxTokens = 8_888;
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]).toMatchObject({
+			reasoning: true,
+			input: ["text", "image"],
+			contextWindow: 1_048_576,
+			maxTokens: 131_072,
+			thinking: {
+				mode: "effort",
+				minLevel: Effort.Low,
+				maxLevel: Effort.Max,
+				defaultLevel: Effort.Max,
+				levels: [Effort.Low, Effort.High, Effort.Max],
+			},
+		});
+	});
+
+	it("removes unsupported reasoning controls only from Groq compound systems", () => {
+		const models = [
+			createModel({ id: "groq/compound", api: "openai-completions", provider: "groq" }),
+			createModel({ id: "groq/compound-mini", api: "openai-completions", provider: "groq" }),
+			createModel({ id: "groq/compound", api: "openai-completions", provider: "openrouter" }),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.reasoning).toBe(false);
+		expect(models[0]?.thinking).toBeUndefined();
+		expect(models[1]?.reasoning).toBe(false);
+		expect(models[1]?.thinking).toBeUndefined();
+		expect(models[2]?.reasoning).toBe(true);
+		expect(models[2]?.thinking).toBeDefined();
 	});
 
 	it("maps only first-class MiniMax M3 routes to the official 1M context (issue #3896)", () => {
@@ -667,8 +729,8 @@ describe("model thinking runtime helpers", () => {
 			id: "custom-reasoner",
 			name: "Custom Reasoner",
 			api: "openai-codex-responses",
-			provider: "custom",
-			baseUrl: "https://example.com",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
 			reasoning: true,
 			thinking: {
 				mode: "effort",
@@ -713,9 +775,10 @@ describe("model thinking runtime helpers", () => {
 			id: "custom-model",
 			api: "openai-completions",
 			provider: "custom",
+			compat: { supportsReasoningEffort: true },
 		});
 
-		// openai-completions should support xhigh by default
+		// Explicitly opted-in custom openai-completions models support xhigh.
 		expect(model.thinking?.maxLevel).toBe(Effort.XHigh);
 		expect(requireSupportedEffort(model, Effort.XHigh)).toBe(Effort.XHigh);
 	});
@@ -849,24 +912,72 @@ describe("model thinking runtime helpers", () => {
 		});
 	});
 
-	it("enables xhigh for openai-responses and openai-codex-responses APIs", () => {
+	it("requires explicit transport capability for custom OpenAI-compatible reasoning controls", () => {
+		const completionsModel = createModel({
+			id: "custom-completions",
+			api: "openai-completions",
+			provider: "custom",
+		});
 		const responsesModel = createModel({
 			id: "custom-responses",
 			api: "openai-responses",
 			provider: "custom",
 		});
-
-		const codexModel = createModel({
-			id: "custom-codex",
-			api: "openai-codex-responses",
+		const optedInResponsesModel = createModel({
+			id: "custom-responses-opted-in",
+			api: "openai-responses",
 			provider: "custom",
+			compat: { supportsReasoningEffort: true },
+		});
+		const configurableKnownLabel = enrichModelThinking({
+			...createModel({ id: "litellm-responses", api: "openai-responses", provider: "litellm" }),
+			baseUrl: "http://localhost:4000/v1",
+		});
+		const hostileLookalike = enrichModelThinking({
+			...createModel({ id: "hostile-responses", api: "openai-responses", provider: "custom" }),
+			baseUrl: "https://api.openai.com.evil.example/v1",
+		});
+		const officialCustomRoute = enrichModelThinking({
+			...createModel({ id: "official-custom", api: "openai-responses", provider: "custom" }),
+			baseUrl: "https://api.openai.com/v1",
+		});
+		const officialCustomCompletionsRoute = enrichModelThinking({
+			...createModel({ id: "official-custom-completions", api: "openai-completions", provider: "custom" }),
+			baseUrl: "https://api.openai.com/v1",
 		});
 
-		// Both should support xhigh
-		expect(responsesModel.thinking?.maxLevel).toBe(Effort.XHigh);
+		const codexModel = createModel({
+			id: "bundled-codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+		});
+
+		expect(completionsModel.thinking).toBeUndefined();
+		expect(responsesModel.thinking).toBeUndefined();
+		expect(configurableKnownLabel.thinking).toBeUndefined();
+		expect(hostileLookalike.thinking).toBeUndefined();
+		expect(officialCustomRoute.thinking?.maxLevel).toBe(Effort.XHigh);
+		expect(officialCustomCompletionsRoute.thinking?.maxLevel).toBe(Effort.XHigh);
+		expect(modelSupportsReasoningControl(officialCustomCompletionsRoute, "https://proxy.example.com/v1")).toBe(false);
+		expect(optedInResponsesModel.thinking?.maxLevel).toBe(Effort.XHigh);
 		expect(codexModel.thinking?.maxLevel).toBe(Effort.XHigh);
-		expect(requireSupportedEffort(responsesModel, Effort.XHigh)).toBe(Effort.XHigh);
+		expect(requireSupportedEffort(optedInResponsesModel, Effort.XHigh)).toBe(Effort.XHigh);
 		expect(requireSupportedEffort(codexModel, Effort.XHigh)).toBe(Effort.XHigh);
+	});
+
+	it("preserves reasoning controls for audited OpenRouter, OpenCode, and Kilo models", () => {
+		const models = [
+			getBundledModel("openrouter", "openai/gpt-5.4"),
+			getBundledModel("opencode-go", "deepseek-v4-flash"),
+			getBundledModel("opencode-zen", "claude-fable-5"),
+			getBundledModel("kilo", "anthropic/claude-sonnet-4.5"),
+		];
+
+		for (const model of models) {
+			expect(model.reasoning).toBe(true);
+			expect(model.thinking).toBeDefined();
+			expect(getSupportedEfforts(model).length).toBeGreaterThan(0);
+		}
 	});
 
 	it("rejects reasoning models that are missing thinking metadata at runtime", () => {
@@ -874,8 +985,8 @@ describe("model thinking runtime helpers", () => {
 			id: "broken-reasoner",
 			name: "Broken Reasoner",
 			api: "openai-responses",
-			provider: "custom",
-			baseUrl: "https://example.com",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
 			reasoning: true,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },

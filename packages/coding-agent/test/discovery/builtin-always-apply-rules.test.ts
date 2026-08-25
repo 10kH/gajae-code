@@ -114,6 +114,34 @@ USERMAGIC9K2 is the user passphrase.
 	expect(probe?._source.level).toBe("user");
 });
 
+test("user rules follow the explicit agent-directory profile", async () => {
+	const profileDir = path.join(tempDir, "profile-agent");
+	writeFile(
+		path.join(profileDir, "rules", "profile-route.md"),
+		`---
+alwaysApply: true
+description: profile route
+---
+PROFILE_ROUTE_7K2 must be visible.
+`,
+	);
+	writeFile(
+		path.join(home, ".gjc", "agent", "rules", "wrong-profile.md"),
+		`---
+alwaysApply: true
+---
+WRONG_PROFILE must stay hidden.
+`,
+	);
+
+	const rules = await loadNativeRules({ cwd: project, home, userAgentDir: profileDir, repoRoot: project });
+	const profileRule = rules.find(rule => rule.name === "profile-route");
+
+	expect(profileRule?.alwaysApply).toBe(true);
+	expect(profileRule?.content).toContain("PROFILE_ROUTE_7K2");
+	expect(rules.some(rule => rule.content.includes("WRONG_PROFILE"))).toBe(false);
+});
+
 test("project RULES.md sticky alwaysApply is discovered alongside rules dir", async () => {
 	writeFile(path.join(project, ".gjc", "RULES.md"), "STICKYRULE body.\n");
 	writeFile(

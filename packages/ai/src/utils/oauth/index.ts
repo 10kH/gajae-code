@@ -271,6 +271,11 @@ const builtInOAuthProviders: OAuthProviderInfo[] = [
 		available: true,
 	},
 	{
+		id: "sglang",
+		name: "SGLang (Local OpenAI-compatible)",
+		available: true,
+	},
+	{
 		id: "cloudflare-ai-gateway",
 		name: "Cloudflare AI Gateway",
 		available: true,
@@ -426,6 +431,7 @@ export async function refreshOAuthToken(
 		case "bizrouter":
 		case "opengateway":
 		case "vllm":
+		case "sglang":
 			// API keys / static bearer tokens don't expire, return as-is
 			newCredentials = credentials;
 			break;

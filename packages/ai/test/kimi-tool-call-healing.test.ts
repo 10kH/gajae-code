@@ -350,6 +350,7 @@ describe("Kimi K2 leaked tool-call healing", () => {
 		expect(toolCalls).toHaveLength(1);
 		expect(toolCalls[0].arguments).toEqual({ question: "마지막 병목" });
 		expect(toolCalls[0].escapedNonAsciiArguments).toBe(true);
+		expect(toolCalls[0].escapedUnicodeArgumentEvidence).toMatchObject({ malformed: false, truncated: false });
 	});
 
 	it("does not flag healed arguments that were written as literal UTF-8", async () => {

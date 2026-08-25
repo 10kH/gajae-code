@@ -46,7 +46,11 @@ export interface ReleaseCommit {
 	author: string;
 	/** Resolved GitHub login for the author, when the API provides one. */
 	githubLogin?: string;
-	/** Cherry-pick origin OID when this commit was cherry-picked; else undefined. */
+	/**
+	 * Cherry-pick origin OID when this commit was cherry-picked AND GitHub still
+	 * has that commit; else undefined. An origin GitHub never saw is not an
+	 * attribution key (see `isKnownCommit`).
+	 */
 	originSha?: string;
 }
 
@@ -202,6 +206,22 @@ export function isExplicitEmptyGhResult(exitCode: number, stderr: string): boole
 	if (exitCode === 0) return true;
 	return EXPLICIT_EMPTY_PATTERNS.some(pattern => pattern.test(stderr));
 }
+
+/** stderr patterns that mean "this repository has no such commit", not "lookup failed". */
+const UNKNOWN_COMMIT_PATTERNS: readonly RegExp[] = [
+	/no commit found for sha/iu,
+];
+
+/**
+ * True only when GitHub positively answers that a commit OID is unknown to the
+ * repository (HTTP 422 on a commit endpoint). Like `isExplicitEmptyGhResult`
+ * this is an answer, not a failure; every other non-zero exit still fails
+ * closed.
+ */
+export function isUnknownCommitGhResult(exitCode: number, stderr: string): boolean {
+	if (exitCode === 0) return false;
+	return UNKNOWN_COMMIT_PATTERNS.some(pattern => pattern.test(stderr));
+}
 /**
  * True for a GitHub rate-limit refusal, the one failure that is worth waiting
  * out instead of failing the release: the request was well-formed and the quota
@@ -276,7 +296,7 @@ async function ghAllowExplicitEmpty(args: readonly string[]): Promise<string | u
 	return result.stdout.toString();
 }
 
-async function collectCommits(baseTag: string, head: string): Promise<ReleaseCommit[]> {
+async function collectCommits(repo: string, baseTag: string, head: string): Promise<ReleaseCommit[]> {
 	const raw = await git(["log", "--no-merges", "--reverse", "--format=%H%x1f%s%x1f%an", `${baseTag}..${head}`]);
 	const commits: ReleaseCommit[] = [];
 	for (const line of raw.split("\n")) {
@@ -286,7 +306,8 @@ async function collectCommits(baseTag: string, head: string): Promise<ReleaseCom
 		// The release script's own version bump is machinery, not a change.
 		if (BUMP_SUBJECT.test(subject)) continue;
 		const originSha = await cherryPickOrigin(sha);
-		commits.push({ sha, subject, author, ...(originSha === sha ? {} : { originSha }) });
+		const attributable = originSha !== sha && (await isKnownCommit(repo, originSha));
+		commits.push({ sha, subject, author, ...(attributable ? { originSha } : {}) });
 	}
 	return commits;
 }
@@ -294,6 +315,25 @@ async function collectCommits(baseTag: string, head: string): Promise<ReleaseCom
 async function cherryPickOrigin(sha: string): Promise<string> {
 	const body = await git(["show", "-s", "--format=%b", sha]);
 	return body.match(/cherry picked from commit ([0-9a-f]{40})/u)?.[1] ?? sha;
+}
+
+/**
+ * Whether GitHub can still resolve a commit OID in this repository.
+ *
+ * A `(cherry picked from commit …)` trailer routinely names a commit GitHub
+ * never saw: the source was a local worktree branch, or a branch that was
+ * force-pushed away and garbage collected. Using such an OID as the attribution
+ * key made every commit lookup fail with HTTP 422 "No commit found for SHA",
+ * which failed the whole release-notes derivation (v0.15.1 died on exactly
+ * that, after its tag was already immutable). An unknown origin carries no
+ * attribution, so the shipped OID is used instead.
+ */
+async function isKnownCommit(repo: string, sha: string): Promise<boolean> {
+	const result = await $`gh api ${`repos/${repo}/commits/${sha}`} --jq .sha`.quiet().nothrow();
+	if (result.exitCode === 0) return true;
+	const stderr = result.stderr.toString().trim();
+	if (isUnknownCommitGhResult(result.exitCode, stderr)) return false;
+	throw new Error(`gh api repos/${repo}/commits/${sha} failed (exit ${result.exitCode}): ${stderr}`);
 }
 
 async function loadPullRequest(repo: string, number: number): Promise<CandidatePullRequest | undefined> {
@@ -369,7 +409,7 @@ async function resolveCommitLogin(repo: string, sha: string): Promise<string | u
 }
 
 export async function deriveReleaseNotes(repo: string, baseTag: string, head: string, headTag: string): Promise<string> {
-	const commits = await collectCommits(baseTag, head);
+	const commits = await collectCommits(repo, baseTag, head);
 	const pullRequestsByNumber = new Map<number, CandidatePullRequest>();
 	const candidatesBySha = new Map<string, readonly CandidatePullRequest[]>();
 

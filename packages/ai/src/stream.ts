@@ -186,6 +186,7 @@ const serviceProviderMap: Record<string, KeyResolver> = {
 	mara: "MARA_API_KEY",
 	venice: "VENICE_API_KEY",
 	vllm: "VLLM_API_KEY",
+	sglang: "SGLANG_API_KEY",
 	xiaomi: "XIAOMI_API_KEY",
 };
 

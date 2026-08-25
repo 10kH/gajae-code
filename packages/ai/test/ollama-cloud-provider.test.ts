@@ -105,6 +105,7 @@ describe("ollama-cloud provider support", () => {
 		expect(gpt?.baseUrl).toBe("https://ollama.com");
 		expect(gpt?.reasoning).toBe(true);
 		expect(gpt?.contextWindow).toBe(262144);
+		expect(gpt?.maxTokens).toBe(16384);
 		expect(gpt?.input).toEqual(["text", "image"]);
 		expect(qwen?.name).toBe("Qwen 3 32B");
 		expect(qwen?.input).toEqual(["text", "image"]);
@@ -112,6 +113,78 @@ describe("ollama-cloud provider support", () => {
 			"https://ollama.com/api/tags",
 			expect.objectContaining({ method: "GET" }),
 		);
+	});
+
+	test("bounds unknown model output limits by the discovered context window", async () => {
+		global.fetch = vi.fn(async (input, init) => {
+			const url = String(input);
+			if (url === "https://ollama.com/api/tags") {
+				return new Response(JSON.stringify({ models: [{ name: "unknown-large" }, { name: "unknown-small" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://ollama.com/api/show") {
+				const body = JSON.parse(String(init?.body ?? "{}")) as { model?: string };
+				const contextLength = body.model === "unknown-small" ? 4096 : 1_048_576;
+				return new Response(JSON.stringify({ model_info: { "test.context_length": contextLength } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		}) as unknown as typeof fetch;
+
+		const options = ollamaCloudModelManagerOptions({ apiKey: "cloud-test-key" });
+		const models = await options.fetchDynamicModels?.();
+
+		expect(models?.find(model => model.id === "unknown-large")).toMatchObject({
+			contextWindow: 1_048_576,
+			maxTokens: 32_000,
+		});
+		expect(models?.find(model => model.id === "unknown-small")).toMatchObject({
+			contextWindow: 4096,
+			maxTokens: 4096,
+		});
+	});
+
+	test("uses the bounded discovered limit for default requests and preserves explicit maxTokens", async () => {
+		const requestBodies: Array<Record<string, unknown>> = [];
+		global.fetch = vi.fn(async (input, init) => {
+			const url = String(input);
+			if (url === "https://ollama.com/api/tags") {
+				return new Response(JSON.stringify({ models: [{ name: "unknown-large" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://ollama.com/api/show") {
+				return new Response(JSON.stringify({ model_info: { "test.context_length": 1_048_576 } }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			if (url === "https://ollama.com/api/chat") {
+				requestBodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+				return createNdjsonResponse([
+					{ model: "unknown-large", message: { role: "assistant", content: "ok" }, done: false },
+					{ model: "unknown-large", done: true, done_reason: "stop", prompt_eval_count: 1, eval_count: 1 },
+				]);
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		}) as unknown as typeof fetch;
+
+		const options = ollamaCloudModelManagerOptions({ apiKey: "cloud-test-key" });
+		const models = await options.fetchDynamicModels?.();
+		const model = models?.find(candidate => candidate.id === "unknown-large");
+		expect(model).toBeDefined();
+		if (!model) throw new Error("unknown-large was not discovered");
+
+		const context = { messages: [{ role: "user" as const, content: "hi", timestamp: Date.now() }] };
+		await streamSimple(model, context, { apiKey: "cloud-test-key" }).result();
+		await streamSimple(model, context, { apiKey: "cloud-test-key", maxTokens: 12_345 }).result();
+
+		expect(requestBodies.map(body => body.options)).toEqual([{ num_predict: 32_000 }, { num_predict: 12_345 }]);
 	});
 
 	test("tolerates individual /api/show failures during model discovery", async () => {

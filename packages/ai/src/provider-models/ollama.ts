@@ -21,6 +21,12 @@ type OllamaShowResponse = {
 
 const OLLAMA_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
 
+// /api/show exposes the context window, not a verified output ceiling. Keep curated
+// output limits authoritative; unknown cloud models use the same bounded default that
+// streamSimple would request for a model with a larger known limit. This avoids the old
+// 8192-token truncation without advertising or requesting an unverified 131K output.
+const OLLAMA_CLOUD_UNKNOWN_MAX_TOKENS = 32_000;
+
 function trimTrailingSlash(value: string): string {
 	return value.endsWith("/") ? value.slice(0, -1) : value;
 }
@@ -141,7 +147,7 @@ export function ollamaCloudModelManagerOptions(
 						input,
 						cost: reference?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 						contextWindow,
-						maxTokens: reference?.maxTokens ?? Math.min(contextWindow, 8192),
+						maxTokens: reference?.maxTokens ?? Math.min(contextWindow, OLLAMA_CLOUD_UNKNOWN_MAX_TOKENS),
 					};
 				}),
 			);

@@ -80,7 +80,7 @@ import {
 	resolveAnthropicSdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
 import {
-	findUnnecessaryUnicodeEscape,
+	captureUnicodeEscapeEvidence,
 	isCompleteJson,
 	parseJsonWithRepair,
 	parseStreamingJson,
@@ -2443,9 +2443,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 											throw new Error("Anthropic tool_use completed with non-object arguments");
 										}
 										block.arguments = parsedArguments as Record<string, unknown>;
-										if (findUnnecessaryUnicodeEscape(block.partialJson)) {
-											block.escapedNonAsciiArguments = true;
-										}
+										captureUnicodeEscapeEvidence(block, block.partialJson);
 									}
 									delete (block as { partialJson?: string }).partialJson;
 									stream.push({
@@ -2960,9 +2958,7 @@ export const streamAnthropic: StreamFunction<"anthropic-messages"> = (
 					block.incompleteArgumentsReason = "truncated";
 					if (block.partialJson.trim()) {
 						block.arguments = parseStreamingJson(block.partialJson);
-						if (findUnnecessaryUnicodeEscape(block.partialJson)) {
-							block.escapedNonAsciiArguments = true;
-						}
+						captureUnicodeEscapeEvidence(block, block.partialJson);
 					}
 					delete (block as { partialJson?: string }).partialJson;
 				}

@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import * as z from "zod/v4";
+import { Effort } from "../src/model-thinking";
 import { getBundledModel } from "../src/models";
 import { convertMessages, detectCompat, streamOpenAICompletions } from "../src/providers/openai-completions";
 import { resolveOpenAICompat } from "../src/providers/openai-completions-compat";
-import type { AssistantMessage, Context, Model, OpenAICompat, Tool } from "../src/types";
+import type { AssistantMessage, AssistantMessageEvent, Context, Model, OpenAICompat, Tool } from "../src/types";
+import { EMPTY_RESPONSE_PROVIDER_CODE } from "../src/utils/fallback-transport";
 
 const originalFetch = global.fetch;
 
@@ -56,6 +58,33 @@ function createMockFetch(events: unknown[]): typeof fetch {
 	return Object.assign(mockFetch, { preconnect: originalFetch.preconnect });
 }
 
+function createSuccessfulCompletionResponse(): Response {
+	return createSseResponse([
+		{
+			id: "chatcmpl-success",
+			object: "chat.completion.chunk",
+			created: 0,
+			model: "gpt-4o-mini",
+			choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }],
+		},
+		"[DONE]",
+	]);
+}
+
+function createEmptyResponseModel(
+	cost: Model<"openai-completions">["cost"] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+): Model<"openai-completions"> {
+	return {
+		...getBundledModel("openai", "gpt-4o-mini"),
+		api: "openai-completions",
+		provider: "kilo",
+		id: "stealth/ox-alpha",
+		name: "Ox Alpha",
+		baseUrl: "https://api.kilo.ai/api/gateway",
+		cost,
+	};
+}
+
 function baseContext(): Context {
 	return {
 		messages: [
@@ -69,6 +98,38 @@ function baseContext(): Context {
 }
 
 describe("openai-completions compatibility", () => {
+	it("never sends reasoning controls to Groq compound systems after late metadata overrides", async () => {
+		for (const id of ["groq/compound", "groq/compound-mini"] as const) {
+			const model: Model<"openai-completions"> = {
+				id,
+				name: id,
+				api: "openai-completions",
+				provider: "groq",
+				baseUrl: "https://api.groq.com/openai/v1",
+				reasoning: true,
+				thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 131_072,
+				maxTokens: 8_192,
+				compat: { supportsReasoningEffort: true },
+			};
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			streamOpenAICompletions(model, baseContext(), {
+				apiKey: "test-key",
+				reasoning: "high",
+				signal: createAbortedSignal(),
+				onPayload: payload => resolve(payload as Record<string, unknown>),
+			});
+
+			const payload = await promise;
+			expect(payload.reasoning_effort).toBeUndefined();
+			expect(payload.reasoning).toBeUndefined();
+			expect(payload.enable_thinking).toBeUndefined();
+			expect(payload.chat_template_kwargs).toBeUndefined();
+		}
+	});
+
 	it("serializes direct xAI Grok 4.5 and 4.6 reasoning efforts without changing other Grok routes", async () => {
 		async function captureXaiPayload(modelId: "grok-4.5" | "grok-4.6", reasoning: "low" | "xhigh") {
 			const model: Model<"openai-completions"> = {
@@ -123,6 +184,115 @@ describe("openai-completions compatibility", () => {
 				maxTokens: 64_000,
 			}).supportsReasoningEffort,
 		).toBe(true);
+	});
+
+	it("fails closed for arbitrary custom reasoning transports and honors explicit opt-in", async () => {
+		async function captureCustomPayload(
+			options: { compat?: OpenAICompat; id?: string; provider?: string; baseUrl?: string } = {},
+		) {
+			const model: Model<"openai-completions"> = {
+				id: options.id ?? "reasoning-model",
+				name: "Reasoning Model",
+				api: "openai-completions",
+				provider: options.provider ?? "my-proxy",
+				baseUrl: options.baseUrl ?? "https://proxy.example.com/v1",
+				reasoning: true,
+				thinking: { mode: "effort", minLevel: Effort.Low, maxLevel: Effort.High },
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 128_000,
+				maxTokens: 32_000,
+				compat: options.compat,
+			};
+			const { promise, resolve } = Promise.withResolvers<Record<string, unknown>>();
+			streamOpenAICompletions(model, baseContext(), {
+				apiKey: "test-key",
+				reasoning: "high",
+				signal: createAbortedSignal(),
+				onPayload: payload => resolve(payload as Record<string, unknown>),
+			});
+			return { model, payload: await promise };
+		}
+
+		const implicit = await captureCustomPayload();
+		expect(resolveOpenAICompat(implicit.model).supportsReasoningEffort).toBe(false);
+		expect(implicit.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabled = await captureCustomPayload({ compat: { supportsReasoningEffort: false } });
+		expect(disabled.payload).not.toHaveProperty("reasoning_effort");
+
+		const knownLabelOnUnknownEndpoint = await captureCustomPayload({
+			provider: "litellm",
+			baseUrl: "http://localhost:4000/v1",
+		});
+		expect(knownLabelOnUnknownEndpoint.payload).not.toHaveProperty("reasoning_effort");
+
+		const qwenByNameOnly = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: false },
+		});
+		expect(qwenByNameOnly.payload).not.toHaveProperty("enable_thinking");
+		expect(qwenByNameOnly.payload).not.toHaveProperty("reasoning_effort");
+
+		const optedIn = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: {
+				supportsReasoningEffort: true,
+				reasoningEffortMap: { high: "provider-high" },
+			},
+		});
+		expect(optedIn.payload.reasoning_effort).toBe("provider-high");
+		expect(optedIn.payload).not.toHaveProperty("enable_thinking");
+
+		const qwenOnOpenAI = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			provider: "custom",
+			baseUrl: "https://api.openai.com/dashscope/v1",
+		});
+		expect(qwenOnOpenAI.payload.reasoning_effort).toBe("high");
+		expect(qwenOnOpenAI.payload).not.toHaveProperty("enable_thinking");
+
+		const explicitQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: true, thinkingFormat: "qwen" },
+		});
+		expect(explicitQwenFormat.payload.enable_thinking).toBe(true);
+		expect(explicitQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledExplicitQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			compat: { supportsReasoningEffort: false, thinkingFormat: "qwen" },
+		});
+		expect(disabledExplicitQwenFormat.payload).not.toHaveProperty("enable_thinking");
+		expect(disabledExplicitQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledAuditedQwenFormat = await captureCustomPayload({
+			id: "qwen-custom-reasoner",
+			baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+			compat: { supportsReasoningEffort: false, thinkingFormat: "qwen" },
+		});
+		expect(disabledAuditedQwenFormat.payload).not.toHaveProperty("enable_thinking");
+		expect(disabledAuditedQwenFormat.payload).not.toHaveProperty("reasoning_effort");
+
+		const disabledInjectedThinking = await captureCustomPayload({
+			compat: {
+				supportsReasoningEffort: false,
+				extraBody: { thinking: { type: "enabled" } },
+			},
+		});
+		expect(disabledInjectedThinking.payload).not.toHaveProperty("thinking");
+
+		const zaiPathLookalike = await captureCustomPayload({
+			baseUrl: "https://api.openai.com/v1/api.z.ai",
+		});
+		expect(zaiPathLookalike.payload.reasoning_effort).toBe("high");
+		expect(zaiPathLookalike.payload).not.toHaveProperty("thinking");
+
+		const openRouterPathLookalike = await captureCustomPayload({
+			baseUrl: "https://api.openai.com/v1/openrouter.ai",
+		});
+		expect(openRouterPathLookalike.payload.reasoning_effort).toBe("high");
+		expect(openRouterPathLookalike.payload).not.toHaveProperty("reasoning");
 	});
 
 	it("serializes assistant text content as a plain string", () => {
@@ -416,12 +586,147 @@ describe("openai-completions compatibility", () => {
 		expect(result.usage.totalTokens).toBe(15);
 	});
 
+	it("types an empty zero-usage completion as a retryable transport failure", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-empty",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 0, completion_tokens: 0 },
+			},
+			"[DONE]",
+		]);
+
+		const stream = streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Provider returned an empty response with zero token usage");
+		expect(result.transportFailure).toEqual({
+			kind: "transport",
+			providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+		});
+		expect(events.filter(event => event.type === "error")).toHaveLength(1);
+		expect(events.filter(event => event.type === "done")).toHaveLength(0);
+	});
+
+	it("leaves low nonzero empty completion usage untyped for overflow recovery", async () => {
+		const model = createEmptyResponseModel({ input: 2, output: 4, cacheRead: 1, cacheWrite: 3 });
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-low-usage-empty",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 1, completion_tokens: 1 },
+			},
+			"[DONE]",
+		]);
+
+		const stream = streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([]);
+		expect(result.usage).toMatchObject({ input: 1, output: 1 });
+		expect(result.usage.cost).toEqual({
+			input: 0.000002,
+			output: 0.000004,
+			cacheRead: 0,
+			cacheWrite: 0,
+			total: 0.000006,
+		});
+		expect(result.transportFailure).toBeUndefined();
+		expect(events.filter(event => event.type === "error")).toHaveLength(0);
+		expect(events.filter(event => event.type === "done")).toHaveLength(1);
+	});
+
+	it("leaves empty completions without explicit usage on overflow recovery", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-usage-absent",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([]);
+		expect(result.usage.totalTokens).toBe(0);
+		expect(result.transportFailure).toBeUndefined();
+	});
+
+	it("preserves total-token-only evidence on empty completions", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-total-only",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { total_tokens: 2 },
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage.totalTokens).toBe(2);
+		expect(result.transportFailure).toBeUndefined();
+	});
+
+	it("does not let duplicate zero usage erase earlier nonzero evidence", async () => {
+		const model = createEmptyResponseModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-nonzero-first",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [],
+				usage: { prompt_tokens: 1, completion_tokens: 1 },
+			},
+			{
+				id: "chatcmpl-zero-last",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+				usage: { prompt_tokens: 0, completion_tokens: 0 },
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.usage).toMatchObject({ input: 1, output: 1, totalTokens: 2 });
+		expect(result.transportFailure).toBeUndefined();
+	});
+
 	it("maps qwen chat template reasoning into chat_template_kwargs", async () => {
 		const model: Model<"openai-completions"> = {
 			...getBundledModel("openai", "gpt-4o-mini"),
 			api: "openai-completions",
 			reasoning: true,
 			compat: {
+				supportsReasoningEffort: true,
 				thinkingFormat: "qwen-chat-template",
 			},
 		};
@@ -578,7 +883,7 @@ describe("openai-completions compatibility", () => {
 				if (attempt === 1) {
 					return new Response("retry", { status: 500, headers: { "retry-after-ms": "0" } });
 				}
-				return createSseResponse(["[DONE]"]);
+				return createSuccessfulCompletionResponse();
 			},
 			{ preconnect: originalFetch.preconnect },
 		);
@@ -607,7 +912,7 @@ describe("openai-completions compatibility", () => {
 		const fetch = Object.assign(
 			async (input: string | URL | Request): Promise<Response> => {
 				requests.push(input instanceof Request ? input.url : String(input));
-				return createSseResponse(["[DONE]"]);
+				return createSuccessfulCompletionResponse();
 			},
 			{ preconnect: originalFetch.preconnect },
 		);
@@ -630,7 +935,7 @@ describe("openai-completions compatibility", () => {
 		const fetch = Object.assign(
 			async (input: string | URL | Request): Promise<Response> => {
 				requests.push(input instanceof Request ? input.url : String(input));
-				return createSseResponse(["[DONE]"]);
+				return createSuccessfulCompletionResponse();
 			},
 			{ preconnect: originalFetch.preconnect },
 		);

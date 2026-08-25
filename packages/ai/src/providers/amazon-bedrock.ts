@@ -36,7 +36,7 @@ import { normalizeToolCallId, resolveCacheRetention, sanitizeJsonStrings } from 
 import { AssistantMessageEventStream } from "../utils/event-stream";
 import { transportFailureFacts } from "../utils/fallback-transport";
 import { appendRawHttpRequestDumpFor400, type RawHttpRequestDump, withHttpStatus } from "../utils/http-inspector";
-import { findUnnecessaryUnicodeEscape, parseStreamingJson } from "../utils/json-parse";
+import { captureUnicodeEscapeEvidence, parseStreamingJson } from "../utils/json-parse";
 import { resolveRetryBudget } from "../utils/retry-budget";
 import { flattenToolRootCombinators, toolWireSchema } from "../utils/schema";
 import {
@@ -597,7 +597,7 @@ function handleContentBlockStop(
 			break;
 		case "toolCall":
 			block.arguments = parseStreamingJson(block.partialJson);
-			if (findUnnecessaryUnicodeEscape(block.partialJson ?? "")) block.escapedNonAsciiArguments = true;
+			captureUnicodeEscapeEvidence(block, block.partialJson ?? "");
 			delete (block as Block).partialJson;
 			stream.push({ type: "toolcall_end", contentIndex: index, toolCall: block, partial: output });
 			break;

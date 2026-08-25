@@ -36,6 +36,29 @@ describe("contribution prep", () => {
 		expect(redacted).not.toContain(process.env.HOME ?? "__missing_home__");
 	});
 
+	it("redacts every supported GitHub token prefix without changing near-misses", () => {
+		const tokens = [
+			"ghp_abcdefghijklmnopqrstuvwxyz123456",
+			"gho_abcdefghijklmnopqrstuvwxyz123456",
+			"ghs_abcdefghijklmnopqrstuvwxyz123456",
+			"ghu_abcdefghijklmnopqrstuvwxyz123456",
+			"ghr_abcdefghijklmnopqrstuvwxyz123456",
+			"github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890",
+		];
+		const nearMisses = [
+			"ghx_abcdefghijklmnopqrstuvwxyz123456",
+			"ghs_abcdefghijk",
+			"prefixghu_abcdefghijklmnopqrstuvwxyz123456",
+			"ordinary prose remains visible",
+		];
+		const redacted = redactContributionPrepText([...tokens, ...nearMisses].join("\n"), process.cwd());
+
+		expect(redacted).toBe([...tokens.map(() => "[REDACTED_TOKEN]"), ...nearMisses].join("\n"));
+		expect(redactContributionPrepText("before (ghs_abcdefghijkl), after", process.cwd())).toBe(
+			"before ([REDACTED_TOKEN]), after",
+		);
+	});
+
 	it("writes a manifest with redacted file-pointer artifacts", async () => {
 		const tempDir = TempDir.createSync("@gjc-contribution-prep-");
 		try {
@@ -43,10 +66,14 @@ describe("contribution prep", () => {
 			await $`git init`.cwd(tempDir.path()).quiet();
 			await $`git add tracked.txt`.cwd(tempDir.path()).quiet();
 			await $`git -c user.email=test@example.com -c user.name=Test commit -m initial`.cwd(tempDir.path()).quiet();
+			const tokenFilename = "ghs_abcdefghijklmnopqrstuvwxyz123456.txt";
+			const transcriptToken = "ghu_abcdefghijklmnopqrstuvwxyz123456";
+			const instructionsToken = "ghr_abcdefghijklmnopqrstuvwxyz123456";
 			await Bun.write(
 				path.join(tempDir.path(), "tracked.txt"),
-				"changed ghp_abcdefghijklmnopqrstuvwxyz123456 github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890\n",
+				"changed ghs_abcdefghijklmnopqrstuvwxyz123456 github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890\n",
 			);
+			await Bun.write(path.join(tempDir.path(), tokenFilename), "untracked");
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "Failure uses Authorization: Bearer ghp_secretsecretsecret", timestamp: 1 },
 				{
@@ -55,7 +82,7 @@ describe("contribution prep", () => {
 					provider: "anthropic",
 					model: "claude-sonnet-test",
 					timestamp: 2,
-					content: [{ type: "text", text: "Check http://192.168.0.10:3000/private" }],
+					content: [{ type: "text", text: `Check http://192.168.0.10:3000/private with ${transcriptToken}` }],
 					usage: {
 						input: 1,
 						output: 1,
@@ -75,7 +102,11 @@ describe("contribution prep", () => {
 					messages,
 					sessionFile: path.join(tempDir.path(), "session.jsonl"),
 				},
-				{ artifactRoot: path.join(tempDir.path(), "artifacts"), now: new Date("2026-05-31T00:00:00.000Z") },
+				{
+					artifactRoot: path.join(tempDir.path(), "artifacts"),
+					customInstructions: `Include ${instructionsToken}`,
+					now: new Date("2026-05-31T00:00:00.000Z"),
+				},
 			);
 
 			const manifest = JSON.parse(await Bun.file(result.manifestPath).text()) as {
@@ -85,6 +116,7 @@ describe("contribution prep", () => {
 				redactions: string[];
 				recommended_output: string[];
 				worker_prompt_path: string;
+				changed_files: string[];
 			};
 			const transcriptPath = manifest.artifacts.find(artifact => artifact.path.endsWith("transcript.md"))?.path;
 			expect(manifest.schema_version).toBe(1);
@@ -93,15 +125,22 @@ describe("contribution prep", () => {
 			expect(manifest.recommended_output).toContain("uncertainty / remaining risks");
 			expect(manifest.redactions).toContain("auth_headers");
 			expect(manifest.redactions).toContain("private_endpoints");
+			expect(manifest.changed_files).toContain("[REDACTED_TOKEN].txt");
+			expect(manifest.changed_files).not.toContain(tokenFilename);
 			expect(transcriptPath).toBeTruthy();
 			const transcript = await Bun.file(transcriptPath ?? "").text();
 			expect(transcript).toContain("[REDACTED_AUTH_HEADER]");
 			expect(transcript).toContain("[REDACTED_PRIVATE_ENDPOINT]");
+			expect(transcript).not.toContain(transcriptToken);
+			const summaryPath = manifest.artifacts.find(artifact => artifact.path.endsWith("summary.md"))?.path;
+			expect(summaryPath).toBeTruthy();
+			const summary = await Bun.file(summaryPath ?? "").text();
+			expect(summary).not.toContain(instructionsToken);
 			const diffPath = manifest.artifacts.find(artifact => artifact.path.endsWith("git-diff.patch"))?.path;
 			expect(diffPath).toBeTruthy();
 			const gitDiff = await Bun.file(diffPath ?? "").text();
 			expect(gitDiff).toContain("[REDACTED_TOKEN]");
-			expect(gitDiff).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz123456");
+			expect(gitDiff).not.toContain("ghs_abcdefghijklmnopqrstuvwxyz123456");
 			expect(gitDiff).not.toContain("github_pat_11ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz1234567890");
 		} finally {
 			tempDir.remove();

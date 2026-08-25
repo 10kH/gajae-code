@@ -56,6 +56,27 @@ describe("parseChangelogContent", () => {
 
 		expect(parseChangelogContent(fixture)).toEqual([]);
 	});
+
+	it("keeps inline backticked heading references inside the owning entry", () => {
+		const fixture = [
+			"# Changelog",
+			"",
+			"## [0.15.2] - 2026-08-25",
+			"",
+			"- Everything listed under `## [0.15.1]` below ships in this release.",
+			"",
+			"## [0.15.1] - 2026-08-25",
+			"",
+			"- older entry",
+			"",
+		].join("\n");
+
+		const entries = parseChangelogContent(fixture);
+
+		expect(entries).toHaveLength(2);
+		expect(entries[0]?.content).toContain("`## [0.15.1]`");
+		expect(entries[0]?.content.split("\n")).not.toContain("## [0.15.1]");
+	});
 });
 
 describe("getDisplayChangelogEntries", () => {
@@ -118,8 +139,7 @@ describe("first-run changelog display", () => {
 		expect(olderVersion).toBeDefined();
 
 		expect(firstRunEntry!.content).toContain(`## [${VERSION}]`);
-		expect(firstRunEntry!.content).not.toContain(
-			`## [${olderVersion!.major}.${olderVersion!.minor}.${olderVersion!.patch}]`,
-		);
+		const olderHeading = `## [${olderVersion!.major}.${olderVersion!.minor}.${olderVersion!.patch}]`;
+		expect(firstRunEntry!.content.split("\n")).not.toContain(olderHeading);
 	});
 });

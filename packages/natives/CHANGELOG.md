@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Notification frame fan-out can now exclude explicitly opted-in adapter connections that already accepted the matching positioned SDK event, preserving existing delivery for ordinary direct SDK and raw-only legacy subscribers.
+
+## [0.15.2] - 2026-08-25
+
+### Changed
+
+- Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
+
+## [0.15.1] - 2026-08-25
+### Fixed
+
+- Windows bash-tool children no longer open visible console windows when GJC runs as a console-less ACP/GUI host (#4883). The native brush shell spawned every external command with default creation flags, so from a console-less parent each child (python/cmd/powershell) made Windows allocate its own visible top-level console — a flashing, focus-stealing window per bash call. External spawns now add `CREATE_NO_WINDOW` when the host process has no console (`GetConsoleWindow() == null`), composed with `CREATE_NEW_PROCESS_GROUP` so cancellation still works; a hidden console is inherited by grandchildren instead of letting them allocate fresh visible ones (`DETACHED_PROCESS` is deliberately not used). Console-attached interactive sessions are unchanged: they keep inheriting the parent console. The shell-session `where git` probe gets the same treatment, and the contract is covered by Windows-gated Rust tests plus a live windows-latest regression (`windows-hidden-shell.windows.test.ts`) that detaches the host console and asserts child console-window state via P/Invoke.
+
 ## [0.15.0] - 2026-08-22
 ### Fixed
 

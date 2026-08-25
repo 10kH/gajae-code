@@ -76,7 +76,7 @@ use napi_derive::napi;
 /// MUST stay in sync with `VERSION_SENTINEL_EXPORT` in
 /// `packages/natives/native/index.js` (which derives the name from
 /// `package.json#version`).
-#[napi(js_name = "__piNativesV0_15_0")]
+#[napi(js_name = "__piNativesV0_15_2")]
 pub const fn pi_natives_version_sentinel() {}
 
 /// Publish-result wire-contract sentinel.
@@ -86,3 +86,13 @@ pub const fn pi_natives_version_sentinel() {}
 /// cannot be selected over a compatible baseline.
 #[napi(js_name = "__piNativesPublishOutcomeV1")]
 pub const fn pi_natives_publish_outcome_sentinel() {}
+
+/// Returns the operating system's canonical path for the running executable.
+/// Unlike argv, this is not supplied by the process caller.
+#[napi]
+pub fn current_executable_path() -> Option<String> {
+	std::env::current_exe()
+		.ok()
+		.and_then(|path| path.canonicalize().ok())
+		.map(|path| path.to_string_lossy().into_owned())
+}

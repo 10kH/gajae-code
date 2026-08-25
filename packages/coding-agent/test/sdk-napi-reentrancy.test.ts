@@ -24,6 +24,23 @@ async function open(endpoint: string, token: string): Promise<WebSocket> {
 	return ws;
 }
 
+test("napi turn streams report whether a connection accepted the raw frame", async () => {
+	const sessionId = `acceptance-${process.pid}-${Date.now()}`;
+	const token = "acceptance-token";
+	const server = new NotificationServer(sessionId, token, `/tmp/${sessionId}`, true);
+	const endpoint = await server.start();
+	let ws: WebSocket | undefined;
+	try {
+		expect(server.pushTurnStreamUnchecked(sessionId, "finalized", "offline")).toBe(false);
+		ws = await open(endpoint.url, token);
+		await waitFor(() => server.clientCount() === 1, "client connection");
+		expect(server.pushTurnStreamUnchecked(sessionId, "finalized", "online")).toBe(true);
+	} finally {
+		ws?.close();
+		server.stop();
+	}
+});
+
 test("napi NotificationServer permits synchronous reentrant host calls during inbound and reply callbacks", async () => {
 	const sessionId = `reentrant-${process.pid}-${Date.now()}`;
 	const token = "reentrant-token";

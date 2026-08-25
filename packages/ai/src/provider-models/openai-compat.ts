@@ -1774,6 +1774,7 @@ export interface VllmModelManagerConfig {
 export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelManagerOptions<"openai-completions"> {
 	const apiKey = config?.apiKey;
 	const baseUrl = config?.baseUrl ?? "http://127.0.0.1:8000/v1";
+	const isLoopback = resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
 	const references = createBundledReferenceMap<"openai-completions">("vllm" as Parameters<typeof getBundledModels>[0]);
 	return {
 		providerId: "vllm",
@@ -1783,11 +1784,74 @@ export function vllmModelManagerOptions(config?: VllmModelManagerConfig): ModelM
 				provider: "vllm",
 				baseUrl,
 				apiKey,
+				fetch: (input, init) =>
+					fetch(input, {
+						...init,
+						redirect: "error",
+						signal:
+							isLoopback && init?.signal
+								? AbortSignal.any([init.signal, AbortSignal.timeout(500)])
+								: init?.signal,
+					}),
 				mapModel: (entry, defaults) => {
 					const model = mapWithBundledReference(entry, defaults, references.get(defaults.id));
+					const contextWindow = toNumber(entry.max_model_len);
 					return {
 						...model,
-						contextWindow: toPositiveNumber(entry.max_model_len, model.contextWindow),
+						contextWindow:
+							contextWindow !== undefined && Number.isSafeInteger(contextWindow) && contextWindow > 0
+								? contextWindow
+								: model.contextWindow,
+					};
+				},
+			}),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// 22.5. SGLang
+// ---------------------------------------------------------------------------
+
+export interface SglangModelManagerConfig {
+	apiKey?: string;
+	baseUrl?: string;
+}
+
+export function sglangModelManagerOptions(
+	config?: SglangModelManagerConfig,
+): ModelManagerOptions<"openai-completions"> {
+	const apiKey = config?.apiKey;
+	const baseUrl = config?.baseUrl ?? "http://127.0.0.1:30000/v1";
+	const isLoopback = resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
+	const references = createBundledReferenceMap<"openai-completions">(
+		"sglang" as Parameters<typeof getBundledModels>[0],
+	);
+	return {
+		providerId: "sglang",
+		fetchDynamicModels: () =>
+			fetchOpenAICompatibleModels({
+				api: "openai-completions",
+				provider: "sglang",
+				baseUrl,
+				apiKey,
+				fetch: (input, init) =>
+					fetch(input, {
+						...init,
+						redirect: "error",
+						signal:
+							isLoopback && init?.signal
+								? AbortSignal.any([init.signal, AbortSignal.timeout(500)])
+								: init?.signal,
+					}),
+				mapModel: (entry, defaults) => {
+					const model = mapWithBundledReference(entry, defaults, references.get(defaults.id));
+					const contextWindow = toNumber(entry.max_model_len);
+					return {
+						...model,
+						contextWindow:
+							contextWindow !== undefined && Number.isSafeInteger(contextWindow) && contextWindow > 0
+								? contextWindow
+								: model.contextWindow,
 					};
 				},
 			}),

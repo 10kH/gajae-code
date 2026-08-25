@@ -9,6 +9,7 @@ import { brokerProcessIncarnation, writeBrokerDiscovery } from "../src/sdk/broke
 import { SessionIndex } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
 import { HEARTBEAT_TTL_MS } from "../src/sdk/bus/daemon-paths";
+import { SdkClientError } from "../src/sdk/client/client";
 import {
 	type NotificationSubscription,
 	type SessionAttachment,
@@ -18,6 +19,9 @@ import {
 	type SessionRouterFrame,
 } from "../src/sdk/router";
 import { SESSION_REQUEST_TIMEOUT_MS } from "../src/sdk/session-reconnect";
+
+/** Longer than the 100/200/400ms replay retry ladder the attach pass must not run. */
+const REPLAY_LADDER_WINDOW_MS = 900;
 
 const tempDirs: string[] = [];
 
@@ -1838,6 +1842,208 @@ describe("SessionRouter dispatch authority", () => {
 			expect(explicitSettled).toBe(true);
 		} finally {
 			wedgedGate.resolve();
+			await router.stop();
+		}
+	});
+	test("startup replay carries a bounded budget a wedged host cannot outlast", async () => {
+		// A session host whose listener accepts while its loop never serves answers
+		// nothing. On the transport's 10s default this attach-path replay made
+		// start() the sum of every such session's budget -- four 10s timeouts plus
+		// backoff, measured at 40.7s of a 40.9s startup for ONE host -- so
+		// `gjc sdk session list` died on its own 10s startup budget while the other
+		// attachments were already live. `start()` must bound the initial pass and
+		// leave the stragglers to the periodic tick.
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-start-wedge-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const wedged = "start-wedged";
+		const healthy = "start-healthy";
+		const endpointFiles = new Map<string, string>();
+		for (const sessionId of [wedged, healthy]) {
+			const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+			await Bun.write(
+				endpointFile,
+				JSON.stringify({ sessionId, url: `ws://${sessionId}.test`, token: "v1", pid: 42 }),
+			);
+			endpointFiles.set(sessionId, endpointFile);
+		}
+		const replayRequests: string[] = [];
+		const wedgedGate = Promise.withResolvers<void>();
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => true,
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => ({
+				indexSeq: 1,
+				sessions: [wedged, healthy].map(sessionId => ({
+					sessionId,
+					locator: { repo, stateRoot },
+					endpointGeneration: 1,
+					pid: 42,
+					endpointMtimeMs: fs.statSync(endpointFiles.get(sessionId)!).mtimeMs,
+					live: true,
+					indexSeq: 1,
+					ambiguous: false,
+					terminal: false,
+				})),
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async authority => ({
+					onFrame: () => () => {},
+					request: async (frame: Record<string, unknown>) => {
+						if (frame.type !== "event_replay") return { events: [] };
+						replayRequests.push(authority.sessionId);
+						// The wedged host took the frame and answers nothing at all.
+						if (authority.sessionId === wedged) await wedgedGate.promise;
+						return { events: [] };
+					},
+					close: async () => {},
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				startupAttachBudgetMs: 250,
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+
+		const warnings: string[] = [];
+		const warn = spyOn(logger, "warn").mockImplementation(message => {
+			warnings.push(String(message));
+		});
+		try {
+			const startedAt = performance.now();
+			await router.start();
+			const startMs = performance.now() - startedAt;
+			// Bounded by the startup budget, not by the wedged host's request budget.
+			expect(startMs).toBeLessThan(2_000);
+			// The host that answered is attached and usable.
+			expect(router.attachment(healthy)?.isCurrent()).toBe(true);
+			// The wedged replay was attempted, and its pass is still parked on it.
+			expect(replayRequests).toContain(wedged);
+			// The lapse names the session and pid to look at, and no endpoint secret.
+			const lapse = warnings.find(message => message.includes("startup returned before"));
+			expect(lapse).toContain(wedged);
+			expect(lapse).toContain("pid 42");
+			expect(lapse).not.toContain(healthy);
+			expect(warnings.join("\n")).not.toContain("v1");
+		} finally {
+			warn.mockRestore();
+			wedgedGate.resolve();
+			await router.stop();
+		}
+	});
+	test("attach replay does not retry a frame the host took and never answered", async () => {
+		// `uncertain_after_send` means the frame reached the socket and the peer
+		// never answered within its budget. The retry ladder used to multiply that
+		// one budget by four against a host that cannot answer any of them. One
+		// attempt fails the barrier; the periodic tick owns the retry.
+		const repo = await fsPromises.mkdtemp(path.join(os.tmpdir(), "gjc-router-replay-nodup-"));
+		tempDirs.push(repo);
+		const agentDir = path.join(repo, ".gjc", "agent");
+		const stateRoot = path.join(repo, ".gjc", "state");
+		const endpointDir = path.join(stateRoot, "sdk");
+		await fsPromises.mkdir(endpointDir, { recursive: true });
+		const sessionId = "replay-unanswered";
+		const endpointFile = path.join(endpointDir, `${sessionId}.json`);
+		await Bun.write(endpointFile, JSON.stringify({ sessionId, url: "ws://unanswered.test", token: "v1", pid: 42 }));
+		let replayAttempts = 0;
+		let transientAttempts = 0;
+		const transient = "replay-transient";
+		const transientEndpoint = path.join(endpointDir, `${transient}.json`);
+		await Bun.write(
+			transientEndpoint,
+			JSON.stringify({ sessionId: transient, url: "ws://transient.test", token: "v1", pid: 43 }),
+		);
+		const index = {
+			open: async () => {},
+			refresh: async () => {},
+			refreshIfChanged: async () => true,
+			get indexSeq() {
+				return 1;
+			},
+			listSessions: () => ({
+				indexSeq: 1,
+				sessions: [
+					{
+						sessionId,
+						locator: { repo, stateRoot },
+						endpointGeneration: 1,
+						pid: 42,
+						endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
+						live: true,
+						indexSeq: 1,
+						ambiguous: false,
+						terminal: false,
+					},
+					{
+						sessionId: transient,
+						locator: { repo, stateRoot },
+						endpointGeneration: 1,
+						pid: 43,
+						endpointMtimeMs: fs.statSync(transientEndpoint).mtimeMs,
+						live: true,
+						indexSeq: 1,
+						ambiguous: false,
+						terminal: false,
+					},
+				],
+				warnings: [],
+			}),
+		} as unknown as SessionIndex;
+		const router = new SessionRouter({
+			agentDir,
+			deps: {
+				createIndex: () => index,
+				createClient: async authority => ({
+					onFrame: () => () => {},
+					request: async (frame: Record<string, unknown>) => {
+						if (frame.type !== "event_replay") return { events: [] };
+						if (authority.sessionId === sessionId) {
+							replayAttempts++;
+							throw new SdkClientError(
+								"uncertain_after_send",
+								"SDK request outcome is uncertain after the frame was sent.",
+							);
+						}
+						transientAttempts++;
+						if (transientAttempts === 1) throw new SdkClientError("connection_closed", "closed before dispatch");
+						return { events: [] };
+					},
+					close: async () => {},
+					send: () => {},
+					sendMaintenance: () => {},
+				}),
+				setInterval: (() => 0) as unknown as typeof setInterval,
+				clearInterval: (() => {}) as unknown as typeof clearInterval,
+			},
+		});
+
+		try {
+			await router.start();
+			// Startup replay runs on the ready tail; wait for it to be attempted.
+			for (let i = 0; i < 500 && replayAttempts === 0; i++) await Bun.sleep(1);
+			// One dispatched-and-unanswered replay for that pass: no ladder, and no
+			// further attempts even after the backoff window the ladder would use.
+			await Bun.sleep(REPLAY_LADDER_WINDOW_MS);
+			expect(replayAttempts).toBe(1);
+			// A pre-dispatch failure keeps the retry ladder and converges in one pass.
+			expect(transientAttempts).toBe(2);
+			// The retry belongs to the next reconcile pass, not to the failed one.
+			await router.reconcile();
+			expect(replayAttempts).toBe(2);
+		} finally {
 			await router.stop();
 		}
 	});

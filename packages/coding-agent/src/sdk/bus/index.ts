@@ -166,6 +166,7 @@ import {
 	ASK_SELECTED_ACK_CAPABILITY,
 	type EnsureDaemonResult,
 	ensureTelegramDaemonRunningDetailed,
+	POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 } from "./telegram-daemon";
 
 export type {
@@ -1176,7 +1177,7 @@ interface SessionRuntime {
 	host: SessionSdkHost;
 	/** Delivers one ring-positioned event envelope to every attached subscriber
 	 *  connection, applying the same capability gate as event replay. */
-	broadcastEventFrame: (event: SdkFrame) => void;
+	broadcastEventFrame: (event: SdkFrame) => string[];
 	/** Owns stateRoot-backed revisions and removes their spills on terminal shutdown. */
 	revisions: RevisionStore;
 	/** Releases all snapshot pins before the revision store is closed. */
@@ -1403,26 +1404,32 @@ function emitSessionEvent(
 	runtime: Pick<SessionRuntime, "host" | "broadcastEventFrame">,
 	frame: { type: string; [key: string]: unknown },
 	payload: Record<string, unknown> = frame,
-): void {
-	runtime.broadcastEventFrame(runtime.host.emitEvent({ kind: frame.type, payload }));
+): string[] {
+	return runtime.broadcastEventFrame(runtime.host.emitEvent({ kind: frame.type, payload }));
 }
 
 function pushSessionFrame(
 	runtime: Pick<SessionRuntime, "server" | "host" | "broadcastEventFrame">,
 	frame: { type: string; [key: string]: unknown },
-): void {
-	emitSessionEvent(runtime, frame);
+): boolean {
+	const positionedRecipients = emitSessionEvent(runtime, frame);
 	if (frame.type === "turn_stream") {
-		runtime.server.pushTurnStreamUnchecked(
+		const rawAccepted = runtime.server.pushTurnStreamUnchecked(
 			String(frame.sessionId),
 			frame.phase === "live" ? "live" : "finalized",
 			String(frame.text),
 			typeof frame.finalAnswer === "boolean" ? frame.finalAnswer : undefined,
 			typeof frame.messageRef === "string" ? frame.messageRef : undefined,
+			positionedRecipients,
 		);
-		return;
+		// A retained lean settlement may be consumed only after either the
+		// positioned or legacy raw transport accepts the lead-in. Older native addons
+		// return undefined here, which deliberately fails closed unless the
+		// positioned leg has already proved acceptance.
+		return positionedRecipients.length > 0 || rawAccepted === true;
 	}
-	runtime.server.pushFrame(JSON.stringify(frame));
+	runtime.server.pushFrame(JSON.stringify(frame), positionedRecipients);
+	return positionedRecipients.length > 0;
 }
 
 async function pushTerminalSessionFrame(
@@ -1430,6 +1437,9 @@ async function pushTerminalSessionFrame(
 	frame: { type: "session_closed"; sessionId: string },
 ): Promise<boolean> {
 	emitSessionEvent(runtime, frame);
+	// Terminal shutdown still uses the acknowledged native leg: the positioned
+	// send is best-effort and the server must not stop before a socket writer has
+	// settled this final frame.
 	return await runtime.server.pushFrameAndWait(JSON.stringify(frame), 1_000);
 }
 
@@ -1438,8 +1448,15 @@ function pushFileAttachment(
 	frame: { type: "file_attachment"; sessionId: string; name: string; mime?: string; caption?: string },
 	data: Buffer,
 ): void {
-	emitSessionEvent(runtime, frame, { ...frame, data: data.toString("base64") });
-	runtime.server.pushFileAttachmentUnchecked(frame.sessionId, frame.name, frame.mime, data, frame.caption);
+	const positionedRecipients = emitSessionEvent(runtime, frame, { ...frame, data: data.toString("base64") });
+	runtime.server.pushFileAttachmentUnchecked(
+		frame.sessionId,
+		frame.name,
+		frame.mime,
+		data,
+		frame.caption,
+		positionedRecipients,
+	);
 }
 
 /** Agent lifecycle is SDK session truth, independent of optional chat delivery. */
@@ -1449,8 +1466,8 @@ function emitAgentLifecycle(
 ): void {
 	try {
 		const json = JSON.stringify(frame);
-		emitSessionEvent(runtime, frame);
-		runtime.server.pushFrame(json);
+		const positionedRecipients = emitSessionEvent(runtime, frame);
+		runtime.server.pushFrame(json, positionedRecipients);
 	} catch (error) {
 		logger.warn(`sdk: lifecycle delivery failed: ${String(error)}`);
 	}
@@ -4743,20 +4760,25 @@ export function createNotificationsExtension(
 		 * or an event replay, which is exactly the attached-subscriber set. Fenced
 		 * connections are excluded like their inbound frames, and capability-gated
 		 * kinds follow the same gate replay applies, so live and replay delivery
-		 * stay one truth per connection.
+		 * stay one truth per connection. Only notification adapters that explicitly
+		 * negotiate positioned-only effects are returned for matching raw exclusion;
+		 * ordinary direct SDK subscribers retain both public surfaces from #4570.
 		 */
-		const broadcastEventFrame = (event: SdkFrame): void => {
+		const broadcastEventFrame = (event: SdkFrame): string[] => {
 			const gated = CAP_GATED_FRAME_KINDS.has(String(event.kind));
 			const json = JSON.stringify(event);
+			const recipients: string[] = [];
 			for (const [connectionId, capabilities] of hostCapCache) {
 				if (fencedConnections.has(connectionId)) continue;
 				if (gated && !capabilities.has(TOOL_ACTIVITY_CAPABILITY)) continue;
 				try {
 					server.sendTo(connectionId, json);
+					if (capabilities.has(POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY)) recipients.push(connectionId);
 				} catch {
 					// Broadcasts are best effort; directed responses surface send failures.
 				}
 			}
+			return recipients;
 		};
 		let cancelPreflightsForConnection: ((connectionId: string) => Promise<void>) | undefined;
 		const promptTerminalTombstones = new Map<string, { connectionId: string; expiresAt: number }>();
@@ -5222,6 +5244,7 @@ export function createNotificationsExtension(
 					submission.reconciliationKind,
 					correlation,
 					winner,
+					undefined,
 					extra?.error,
 					extra?.finalText,
 				);
@@ -7108,6 +7131,14 @@ export function createNotificationsExtension(
 					"@gajae-code/natives is out of date: missing onNegotiatedCapabilities. Rebuild the native addon (bun --cwd=packages/natives run build).",
 				);
 			}
+			if (
+				typeof server.supportsPositionedRawExclusion !== "function" ||
+				server.supportsPositionedRawExclusion() !== true
+			) {
+				throw new Error(
+					"@gajae-code/natives is out of date: missing positioned raw-fan-out exclusion. Rebuild the native addon (bun --cwd=packages/natives run build).",
+				);
+			}
 			server.onNegotiatedCapabilities((_err, connectionId, capabilities) => {
 				if (connectionId) hostCapCache.set(connectionId, new Set(capabilities));
 			});
@@ -7669,8 +7700,8 @@ export function createNotificationsExtension(
 					sessionId: id,
 					...buildIdentity(ctx.cwd, sessionName, telegramTopicsEnabled()),
 				};
-				emitSessionEvent(initializedRuntime, identity);
-				server.pushFrame(JSON.stringify(identity));
+				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
+				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}, 250);
 			sessionNameObserver.unref?.();
 			runtime.stopSessionNameObserver = () => clearInterval(sessionNameObserver);
@@ -7683,8 +7714,8 @@ export function createNotificationsExtension(
 					sessionId: id,
 					...buildIdentity(ctx.cwd, sessionNameAfterStartup, telegramTopicsEnabled()),
 				};
-				emitSessionEvent(initializedRuntime, identity);
-				server.pushFrame(JSON.stringify(identity));
+				const positionedRecipients = emitSessionEvent(initializedRuntime, identity);
+				server.pushFrame(JSON.stringify(identity), positionedRecipients);
 			}
 			const agentDir = lifecycleAgentDir ?? settings?.getAgentDir?.();
 			if (lifecycleRequired && !agentDir) throw new Error("Lifecycle SDK host requires an agent directory.");
@@ -8462,6 +8493,20 @@ export function createNotificationsExtension(
 	};
 
 	const hasUserSettlementReceipt = (rt: SessionRuntime): boolean => rt.pendingSettled?.receipts[0]?.origin === "user";
+	const composeSettlementText = (receipts: ReadonlyArray<{ text: string }>): string =>
+		receipts.map(receipt => receipt.text).join("\n\n");
+
+	const consumePublishedSettlement = (rt: SessionRuntime, text: string, window: number): void => {
+		const pending = rt.pendingSettled;
+		if (!pending || pending.window !== window) return;
+		if (composeSettlementText(pending.receipts) === text) {
+			rt.pendingSettled = undefined;
+			return;
+		}
+		const receipts = pending.receipts.filter(receipt => receipt.text !== text);
+		if (receipts.length === pending.receipts.length) return;
+		rt.pendingSettled = receipts.length ? { ...pending, receipts } : undefined;
+	};
 
 	const flushPendingFinal = (rt: SessionRuntime, id: string): void => {
 		const pending = rt.pendingFinal;
@@ -8478,7 +8523,7 @@ export function createNotificationsExtension(
 				for (const receipt of pending.receipts)
 					deferLeanReceipt(rt, receipt.text, receipt.messageRef, pending.window, receipt.origin);
 			} else {
-				const text = pending.receipts.map(receipt => receipt.text).join("\n\n");
+				const text = composeSettlementText(pending.receipts);
 				const messageRef = pending.receipts.length === 1 ? pending.receipts[0]?.messageRef : undefined;
 				try {
 					pushSessionFrame(rt, {
@@ -8501,15 +8546,14 @@ export function createNotificationsExtension(
 	const flushPendingSettled = (rt: SessionRuntime, id: string): void => {
 		const settled = rt.pendingSettled;
 		if (!settled?.receipts.length || !rt.notificationsActive || rt.redact || rt.policySuspended) return;
-		rt.pendingSettled = undefined;
-		const text = settled.receipts.map(receipt => receipt.text).join("\n\n");
+		const text = composeSettlementText(settled.receipts);
 		// A composition represents multiple finalized turns. It must be a fresh
 		// terminal message rather than editing either constituent turn's stream.
 		const messageRef = settled.receipts.length === 1 ? settled.receipts[0]?.messageRef : undefined;
 		const previousLiveRef = rt.liveRef;
 		if (messageRef) rt.liveRef = messageRef;
 		try {
-			flushTurnText(rt, id, text, true);
+			if (flushTurnText(rt, id, text, true)) rt.pendingSettled = undefined;
 		} finally {
 			if (!messageRef) rt.liveRef = previousLiveRef;
 		}
@@ -8580,6 +8624,25 @@ export function createNotificationsExtension(
 			}
 		}
 		rt.pendingInbound.clear();
+	});
+
+	// `agent_failed` is an additive correlated diagnostic. The terminal
+	// `agent_end` handler below remains the sole owner of prompt terminalization;
+	// publishing this frame here lets clients surface the real failure while they
+	// continue waiting for the durable terminal boundary.
+	api.on("agent_failed", async (event, ctx) => {
+		const id = sessionId(ctx);
+		const rt = runtimes.get(id);
+		if (!rt) return;
+		const correlation = rt.activePromptCorrelation;
+		if (!correlation) return;
+		const error = sanitizePromptFailure(event.error);
+		rt.emitPromptLifecycle(correlation, {
+			type: "agent_failed",
+			sessionId: id,
+			...correlation,
+			error,
+		});
 	});
 
 	// Idle fires on `agent_end` (the agent loop settling to await the user), NOT
@@ -8758,13 +8821,10 @@ export function createNotificationsExtension(
 	// The daemon coalesces/throttles these via its shared rate-limit pool.
 	// Push the in-flight turn's assistant text as a finalized turn_stream, deduped
 	// against what was already flushed for this turn (the pre-ask lead-in).
-	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): void => {
-		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive || rt.policySuspended) return;
-		rt.preAskFlushedText = text;
-		// Ask lead-ins supersede any deferred lean settled answer from earlier turns
-		// so agent_end does not re-emit stale intermediate narration (#2863 review).
-		if (!finalAnswer && rt.currentTurnSettlementOrigin !== "autonomous" && !hasUserSettlementReceipt(rt))
-			rt.pendingSettled = undefined;
+	const flushTurnText = (rt: SessionRuntime, id: string, text: string | undefined, finalAnswer: boolean): boolean => {
+		if (!text || text === rt.preAskFlushedText || !rt.notificationsActive || rt.policySuspended) return false;
+		const hadUserSettlementReceipt = hasUserSettlementReceipt(rt);
+		const settlementWindow = rt.currentTurnSettlementWindow ?? rt.settlementWindow;
 		// Decision A: a stream-enabled turn must finalize as an in-place edit of ONE
 		// live message, never a fresh (rich-promotable) send. If live frames were
 		// async-queued and none landed before this flush, reuse the per-turn ref
@@ -8774,7 +8834,7 @@ export function createNotificationsExtension(
 			rt.liveRef = String(rt.turnSeq);
 		}
 		try {
-			pushSessionFrame(rt, {
+			const published = pushSessionFrame(rt, {
 				type: "turn_stream",
 				sessionId: id,
 				phase: "finalized",
@@ -8782,8 +8842,24 @@ export function createNotificationsExtension(
 				text,
 				...(rt.liveRef ? { messageRef: rt.liveRef } : {}),
 			});
+			if (!published) return false;
+			rt.preAskFlushedText = text;
+			if (!finalAnswer) {
+				// A successfully published ask lead-in settles only exact matching
+				// receipts from the same user-request window. Distinct retained user
+				// receipts remain eligible for the idle summary (#4458).
+				consumePublishedSettlement(rt, text, settlementWindow);
+				// Ask lead-ins supersede deferred lean narration from earlier turns so
+				// agent_end does not re-emit stale intermediate text (#2863 review).
+				// Preserve the pre-publish user-receipt decision even when the exact
+				// match above consumed that receipt.
+				if (rt.currentTurnSettlementOrigin !== "autonomous" && !hadUserSettlementReceipt)
+					rt.pendingSettled = undefined;
+			}
+			return true;
 		} catch (e) {
 			logger.warn(`notifications: pushFrame (turn) failed: ${String(e)}`);
+			return false;
 		}
 	};
 

@@ -17,6 +17,8 @@ const SPINNER_ADVANCE_MS = 80;
  */
 export interface LoaderOptions {
 	timeDependentColor?: boolean;
+	/** Request a layout-only repaint when the loader is outside the transcript anchor. */
+	renderScope?: "full" | "layout";
 }
 
 const SMOOTH_ANIMATION_MS = 16;
@@ -115,6 +117,7 @@ export class Loader extends Text {
 		this.#lastDisplayed = next;
 		this.setText(next);
 		__loaderPerfCounters.renderRequests += 1;
-		this.#ui?.requestRender(false, "loader");
+		if (this.options.renderScope === "layout") this.#ui?.requestLayoutRender("loader");
+		else this.#ui?.requestRender(false, "loader");
 	}
 }

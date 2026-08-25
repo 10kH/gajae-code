@@ -7,15 +7,19 @@ import type { BinaryUpdateFlow } from "../src/cli/update-cli";
 import {
 	buildReleaseBinaryUrlForTest,
 	compareVersionsForTest,
+	defaultUserBinaryPathForTest,
 	formatBinaryDownloadFailureMessageForTest,
 	formatManualUpdateInstructionsForTest,
 	formatVerificationFailureForTest,
 	fsyncFileForTest,
 	getLatestReleaseForTest,
 	hasManagedNotifySetup,
+	isProtectedSourcePathForTest,
 	parseReportedVersionForTest,
 	parseUpdateArgs,
+	recoverWindowsUpdateJournal,
 	replaceBinaryForUpdate,
+	resolveGjcPathForTest,
 	resolveNpmManagedTargetForTest,
 	resolveUpdateDecision,
 	resolveUpdateMethodForTest,
@@ -57,46 +61,40 @@ describe("update-cli recovery command surface", () => {
 
 describe("update-cli release lookup", () => {
 	const isolated = {
-		homeDir: "/nonexistent-home",
-		platform: "darwin" as const,
-		readFile: async () => undefined,
+		lookupEnv: () => undefined,
 	};
 
-	it("asks the registry configured through npm config instead of the public one", async () => {
+	it("asks GitHub releases/latest for the stable channel", async () => {
 		const requested: string[] = [];
 
 		const release = await getLatestReleaseForTest({
 			...isolated,
-			lookupEnv: name =>
-				name === "npm_config_registry" ? "https://nexus.example.com/repository/npm-all/" : undefined,
 			fetchImpl: async url => {
-				requested.push(url);
-				return { ok: true, status: 200, statusText: "OK", json: async () => ({ version: "9.9.9" }) };
+				requested.push(String(url));
+				return new Response(JSON.stringify({ tag_name: "v9.9.9", draft: false, prerelease: false }), {
+					status: 200,
+				});
 			},
 		});
 
-		expect(requested).toEqual(["https://nexus.example.com/repository/npm-all/@gajae-code/coding-agent/latest"]);
+		expect(requested).toEqual(["https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest"]);
 		expect(release).toEqual({
 			tag: "v9.9.9",
 			version: "9.9.9",
-			registry: "https://nexus.example.com/repository/npm-all",
+			registry: "https://github.com/Yeachan-Heo/gajae-code",
 			warnings: [],
 		});
 	});
 
-	it("surfaces the failing url and status so blocked registries are diagnosable", async () => {
+	it("surfaces the failing url and status so blocked GitHub APIs are diagnosable", async () => {
 		const failing = getLatestReleaseForTest({
 			...isolated,
-			lookupEnv: () => undefined,
-			fetchImpl: async () => ({
-				ok: false,
-				status: 503,
-				statusText: "",
-				json: async () => ({}),
-			}),
+			fetchImpl: async () => new Response("nope", { status: 503, statusText: "Service Unavailable" }),
 		});
 
-		await expect(failing).rejects.toThrow("https://registry.npmjs.org/@gajae-code/coding-agent/latest responded 503");
+		await expect(failing).rejects.toThrow(
+			"https://api.github.com/repos/Yeachan-Heo/gajae-code/releases/latest responded 503",
+		);
 	});
 });
 
@@ -176,25 +174,28 @@ describe("update-cli binary release assets", () => {
 			"https://github.com/Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-windows-x64.exe",
 		);
 	});
+	it("rejects Windows ARM64 because no release asset exists", () => {
+		expect(() => buildReleaseBinaryUrlForTest("0.2.3", "win32", "arm64")).toThrow("Unsupported architecture: arm64");
+	});
 
 	it("reports actionable Unix manual update commands for unsupported fallback paths", () => {
 		const instructions = formatManualUpdateInstructionsForTest("linux");
 
-		expect(instructions).toContain("bun install -g @gajae-code/coding-agent@latest");
-		expect(instructions).toContain("npm, pnpm, or another package manager");
 		expect(instructions).toContain(
-			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh -s -- --binary",
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh",
 		);
+		expect(instructions).toContain("Bun is only required for source development/build");
+		expect(instructions).not.toContain("bun install -g");
 	});
 
 	it("reports actionable Windows manual update commands for unsupported fallback paths", () => {
 		const instructions = formatManualUpdateInstructionsForTest("win32");
 
-		expect(instructions).toContain("bun install -g @gajae-code/coding-agent@latest");
-		expect(instructions).toContain("npm, pnpm, or another package manager");
 		expect(instructions).toContain(
 			"irm https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.ps1 | iex",
 		);
+		expect(instructions).toContain("Bun is only required for source development/build");
+		expect(instructions).not.toContain("bun install -g");
 	});
 
 	it("keeps manual reinstall guidance aligned with bundled installer repositories", async () => {
@@ -237,7 +238,9 @@ describe("update-cli binary release assets", () => {
 
 		expect(message).toContain("Download failed for gjc-linux-x64");
 		expect(message).toContain("Yeachan-Heo/gajae-code/releases/download/v0.2.3/gjc-linux-x64");
-		expect(message).toContain("bun install -g @gajae-code/coding-agent@latest");
+		expect(message).toContain(
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh",
+		);
 	});
 
 	it("points at the mirror that named the version when the GitHub asset is missing", () => {
@@ -251,7 +254,9 @@ describe("update-cli binary release assets", () => {
 
 		expect(message).toContain("Download failed for gjc-linux-x64");
 		expect(message).toContain("was resolved from https://nexus.example.com/npm");
-		expect(message).toContain("bun install -g @gajae-code/coding-agent@latest");
+		expect(message).toContain(
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh",
+		);
 	});
 
 	it("says nothing about provenance when the public registry named the version", () => {
@@ -267,7 +272,7 @@ describe("update-cli binary release assets", () => {
 
 	it("includes actionable guidance when the platform has no release asset", () => {
 		expect(() => buildReleaseBinaryUrlForTest("0.2.3", "freebsd", "x64")).toThrow(
-			"bun install -g @gajae-code/coding-agent@latest",
+			"curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh",
 		);
 	});
 });
@@ -761,10 +766,21 @@ describe("update-cli managed notification recovery", () => {
 				settingsCalls += 1;
 			},
 		};
-		await runUpdateCommand({ force: false, check: true }, { getLatestRelease: async () => release, ...lifecycle });
+		await runUpdateCommand(
+			{ force: false, check: true },
+			{
+				getLatestRelease: async () => release,
+				resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
+				...lifecycle,
+			},
+		);
 		await runUpdateCommand(
 			{ force: false, check: false },
-			{ getLatestRelease: async () => ({ ...release, version: "0.0.1" }), ...lifecycle },
+			{
+				getLatestRelease: async () => ({ ...release, version: "0.0.1" }),
+				resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
+				...lifecycle,
+			},
 		);
 		await runUpdateCommand(
 			{ force: false, check: false },
@@ -819,6 +835,53 @@ describe("update-cli managed notification recovery", () => {
 	});
 });
 
+describe("update-cli install lock", () => {
+	it("locks the same file the POSIX installer uses", async () => {
+		const source = await Bun.file(path.resolve(import.meta.dir, "../src/cli/update-cli.ts")).text();
+		expect(source).toContain(".gjc-install.lock");
+		expect(source).not.toContain("No checksum asset on");
+		expect(source).not.toContain(".update-lock");
+		expect(source).toContain("Remove ${lockFile} only after confirming");
+	});
+});
+
+describe("update-cli windows journal recovery", () => {
+	it("promotes .next over the live target and does not strand the prior binary", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const backupPath = `${targetPath}.bak`;
+		const nextPath = `${targetPath}.next`;
+		const journalPath = `${targetPath}.update-journal`;
+		await Bun.write(targetPath, "old");
+		await Bun.write(nextPath, "new");
+		await Bun.write(journalPath, JSON.stringify({ target: targetPath, backup: backupPath, next: nextPath }));
+		await recoverWindowsUpdateJournal(journalPath);
+		expect(await Bun.file(targetPath).text()).toBe("new");
+		expect(await Bun.file(nextPath).exists()).toBe(false);
+		expect(await Bun.file(journalPath).exists()).toBe(false);
+		const leftovers = (await fs.readdir(dir)).filter(name => name.includes(".bak.recover."));
+		expect(leftovers).toEqual([]);
+	});
+	it("promotes .next even when the journal backup path already exists", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const backupPath = `${targetPath}.bak`;
+		const nextPath = `${targetPath}.next`;
+		const journalPath = `${targetPath}.update-journal`;
+		await Bun.write(targetPath, "old");
+		await Bun.write(nextPath, "new");
+		await Bun.write(backupPath, "stale-backup");
+		await Bun.write(journalPath, JSON.stringify({ target: targetPath, backup: backupPath, next: nextPath }));
+		await recoverWindowsUpdateJournal(journalPath);
+		expect(await Bun.file(targetPath).text()).toBe("new");
+		expect(await Bun.file(backupPath).text()).toBe("stale-backup");
+		expect(await Bun.file(nextPath).exists()).toBe(false);
+		expect(await Bun.file(journalPath).exists()).toBe(false);
+		const leftovers = (await fs.readdir(dir)).filter(name => name.includes(".bak.recover."));
+		expect(leftovers).toEqual([]);
+	});
+});
+
 describe("update-cli binary replacement", () => {
 	it("restores the previous binary when the replacement fails verification", async () => {
 		const dir = await makeTempDir();
@@ -841,6 +904,78 @@ describe("update-cli binary replacement", () => {
 		expect(await Bun.file(targetPath).text()).toBe("old binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
 		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+	it("installs a fresh binary when the migration target does not exist yet", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await Bun.write(tempPath, "new binary");
+
+		const result = await replaceBinaryForUpdate({
+			targetPath,
+			tempPath,
+			backupPath,
+			expectedVersion: "15.1.8",
+			verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+		});
+
+		expect(result.ok).toBe(true);
+		expect(await Bun.file(targetPath).text()).toBe("new binary");
+		expect(await Bun.file(tempPath).exists()).toBe(false);
+		expect(await Bun.file(backupPath).exists()).toBe(false);
+	});
+	it("refuses to replace a destination symlink", async () => {
+		const dir = await makeTempDir();
+		const realPath = path.join(dir, "real");
+		const targetPath = path.join(dir, "gjc");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await Bun.write(realPath, "managed");
+		await fs.symlink(realPath, targetPath);
+		await Bun.write(tempPath, "new binary");
+		await expect(
+			replaceBinaryForUpdate({
+				targetPath,
+				tempPath,
+				backupPath,
+				expectedVersion: "15.1.8",
+				verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+			}),
+		).rejects.toThrow("Refusing to replace symlink");
+		expect(fsNode.lstatSync(targetPath).isSymbolicLink()).toBe(true);
+		expect(await Bun.file(realPath).text()).toBe("managed");
+	});
+	it("does not delete the live binary when backup copy fails", async () => {
+		const dir = await makeTempDir();
+		const targetPath = path.join(dir, "gjc");
+		const tempPath = `${targetPath}.new`;
+		const backupPath = `${targetPath}.bak`;
+		await Bun.write(targetPath, "old binary");
+		await Bun.write(tempPath, "new binary");
+		const originalCopy = fsNode.promises.copyFile;
+		const copy = vi.spyOn(fsNode.promises, "copyFile").mockImplementation(async (src, dest, flags) => {
+			if (String(src) === targetPath) {
+				const err = new Error("EPERM: copy") as NodeJS.ErrnoException;
+				err.code = "EPERM";
+				throw err;
+			}
+			return originalCopy(src, dest, flags as number | undefined);
+		});
+		try {
+			await expect(
+				replaceBinaryForUpdate({
+					targetPath,
+					tempPath,
+					backupPath,
+					expectedVersion: "15.1.8",
+					verifyInstalledVersion: async () => ({ ok: true, actual: "15.1.8", path: targetPath }),
+				}),
+			).rejects.toThrow("EPERM");
+			expect(await Bun.file(targetPath).text()).toBe("old binary");
+		} finally {
+			copy.mockRestore();
+		}
 	});
 
 	it("keeps a verified replacement when backup cleanup hits EPERM", async () => {
@@ -979,14 +1114,12 @@ describe("update-cli binary update flow", () => {
 		const result = await runBinaryUpdateFlow(targetPath, "https://example.test/gjc", "1.2.3", flow);
 
 		expect(result.ok).toBe(true);
-		expect(calls).toEqual([
-			`download https://example.test/gjc -> ${targetPath}.new`,
-			`fsync ${targetPath}.new`,
-			"beforeReplace",
-			`replace ${targetPath}.new -> ${targetPath}`,
-			"verify 1.2.3",
-		]);
-		expect(calls).not.toContain(`removeTemp ${targetPath}.new`);
+		expect(calls[0]).toMatch(new RegExp(`^download https://example.test/gjc -> ${targetPath}\\.new\\.`));
+		expect(calls[1]).toMatch(new RegExp(`^fsync ${targetPath}\\.new\\.`));
+		expect(calls[2]).toBe("beforeReplace");
+		expect(calls[3]).toMatch(new RegExp(`^replace ${targetPath}\\.new\\..* -> ${targetPath}$`));
+		expect(calls[4]).toBe("verify 1.2.3");
+		expect(calls.some(call => call.startsWith("removeTemp "))).toBe(false);
 	});
 
 	it("aborts before replacement/verification when fsync fails", async () => {
@@ -1017,7 +1150,9 @@ describe("update-cli binary update flow", () => {
 			"fsync failed",
 		);
 
-		expect(calls).toEqual([`download ${targetPath}.new`, "fsync", `removeTemp ${targetPath}.new`]);
+		expect(calls[0]).toMatch(new RegExp(`^download ${targetPath}\\.new\\.`));
+		expect(calls[1]).toBe("fsync");
+		expect(calls[2]).toMatch(new RegExp(`^removeTemp ${targetPath}\\.new\\.`));
 		expect(calls).not.toContain("replace");
 		expect(calls).not.toContain("verify");
 	});
@@ -1090,10 +1225,11 @@ describe("update-cli release channels", () => {
 							warnings: [],
 						};
 					},
+					resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
 				},
 			);
 			expect(seenChannels).toEqual(["nightly"]);
-			expect(output.join("\n")).toContain("Update channel: nightly (npm dist-tag nightly)");
+			expect(output.join("\n")).toContain("Update channel: nightly (GitHub prerelease)");
 			expect(output.join("\n")).toContain("New version available: 999.0.0-nightly.1.1.gabc");
 		} finally {
 			logSpy.mockRestore();
@@ -1114,6 +1250,7 @@ describe("update-cli release channels", () => {
 						seenChannels.push(options?.channel ?? "stable");
 						return { tag: "v0.0.1", version: "0.0.1", registry: DEFAULT_NPM_REGISTRY, warnings: [] };
 					},
+					resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
 				},
 			);
 			expect(seenChannels).toEqual(["stable"]);
@@ -1141,12 +1278,83 @@ describe("update-cli release channels", () => {
 						registry: DEFAULT_NPM_REGISTRY,
 						warnings: [],
 					}),
+					resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
 				},
 			);
 			expect(output.join("\n")).toContain("Already up to date");
 			expect(output.join("\n")).not.toContain("Forcing reinstall");
 		} finally {
 			logSpy.mockRestore();
+		}
+	});
+
+	it("prefers the compiled executable over PATH lookup", () => {
+		expect(
+			resolveGjcPathForTest({
+				compiled: true,
+				execPath: "/opt/gjc/gjc",
+				whichPath: "/usr/bin/gjc",
+			}),
+		).toBe(path.resolve("/opt/gjc/gjc"));
+		expect(
+			resolveGjcPathForTest({
+				compiled: false,
+				execPath: "/opt/gjc/gjc",
+				whichPath: "/usr/bin/gjc",
+			}),
+		).toBe("/usr/bin/gjc");
+	});
+	it("resolves compiled execPath through a symlink", async () => {
+		const dir = await makeTempDir();
+		const realFile = path.join(dir, "gjc-real");
+		const link = path.join(dir, "gjc-link");
+		await Bun.write(realFile, "binary");
+		await fs.symlink(realFile, link);
+		expect(
+			resolveGjcPathForTest({
+				compiled: true,
+				execPath: link,
+				whichPath: "/usr/bin/gjc",
+			}),
+		).toBe(await fs.realpath(link));
+	});
+
+	it("fails closed when the install target cannot be resolved", async () => {
+		const output: string[] = [];
+		const logSpy = vi.spyOn(console, "log").mockImplementation(message => {
+			output.push(String(message));
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(message => {
+			output.push(String(message));
+		});
+		try {
+			await runUpdateCommand(
+				{ force: false, check: false },
+				{
+					getLatestRelease: async () => ({
+						tag: "v0.15.0",
+						version: "0.15.0",
+						registry: DEFAULT_NPM_REGISTRY,
+						warnings: [],
+					}),
+					resolveUpdateTarget: async () => {
+						throw new Error(
+							"Current install at /home/alice/.local/bin/gjc is a package-manager shim in the default binary directory",
+						);
+					},
+					exit: ((code?: number) => {
+						throw new Error(`exit ${code ?? 0}`);
+					}) as typeof process.exit,
+				},
+			);
+			throw new Error("expected exit");
+		} catch (err) {
+			expect(String(err)).toContain("exit 1");
+			expect(output.join("\n")).toContain("package-manager shim in the default binary directory");
+			expect(output.join("\n")).not.toContain("Already up to date");
+		} finally {
+			logSpy.mockRestore();
+			errorSpy.mockRestore();
 		}
 	});
 });
@@ -1156,71 +1364,35 @@ describe("update-cli channel robustness", () => {
 		expect(() => parseUpdateArgs(["update", "--channel"])).toThrow("Missing value for --channel");
 	});
 
-	it("requests the nightly dist-tag route for nightly lookups", async () => {
+	it("requests the GitHub prerelease list for nightly lookups", async () => {
 		const requested: string[] = [];
 		const release = await getLatestReleaseForTest({
-			homeDir: "/nonexistent-home",
-			platform: "darwin",
-			readFile: async () => undefined,
 			lookupEnv: () => undefined,
 			channel: "nightly",
 			fetchImpl: async url => {
-				requested.push(url);
-				return {
-					ok: true,
-					status: 200,
-					statusText: "OK",
-					json: async () => ({ version: "1.2.3-nightly.1.1.gabc" }),
-				};
+				requested.push(String(url));
+				return new Response(
+					JSON.stringify([
+						{ tag_name: "v1.2.3", draft: false, prerelease: false },
+						{ tag_name: "v1.2.3-nightly.1.1.gabc", draft: false, prerelease: true },
+					]),
+					{ status: 200 },
+				);
 			},
 		});
 
-		expect(requested).toEqual(["https://registry.npmjs.org/@gajae-code/coding-agent/nightly"]);
+		expect(requested).toEqual(["https://api.github.com/repos/Yeachan-Heo/gajae-code/releases?per_page=40"]);
 		expect(release.version).toBe("1.2.3-nightly.1.1.gabc");
-	});
-
-	it("falls back to the packument dist-tags entry for the requested channel", async () => {
-		const requested: string[] = [];
-		const release = await getLatestReleaseForTest({
-			homeDir: "/nonexistent-home",
-			platform: "darwin",
-			readFile: async () => undefined,
-			lookupEnv: () => undefined,
-			channel: "nightly",
-			fetchImpl: async url => {
-				requested.push(url);
-				if (url.endsWith("/nightly")) {
-					return { ok: false, status: 404, statusText: "Not Found", json: async () => ({}) };
-				}
-				return {
-					ok: true,
-					status: 200,
-					statusText: "OK",
-					json: async () => ({
-						"dist-tags": { latest: "1.2.3", nightly: "1.2.4-nightly.1.1.gabc" },
-					}),
-				};
-			},
-		});
-
-		expect(requested).toEqual([
-			"https://registry.npmjs.org/@gajae-code/coding-agent/nightly",
-			"https://registry.npmjs.org/@gajae-code/coding-agent",
-		]);
-		expect(release.version).toBe("1.2.4-nightly.1.1.gabc");
 	});
 
 	it("fails closed with workflow guidance when no nightly has ever been published", async () => {
 		const failing = getLatestReleaseForTest({
-			homeDir: "/nonexistent-home",
-			platform: "darwin",
-			readFile: async () => undefined,
 			lookupEnv: () => undefined,
 			channel: "nightly",
-			fetchImpl: async () => ({ ok: false, status: 404, statusText: "Not Found", json: async () => ({}) }),
+			fetchImpl: async () => new Response("[]", { status: 200 }),
 		});
 
-		await expect(failing).rejects.toThrow("nightly channel has no published release yet");
+		await expect(failing).rejects.toThrow("nightly channel has no published GitHub prerelease yet");
 	});
 
 	it("exits cleanly instead of crashing when the channel reports an unparseable version", async () => {
@@ -1241,6 +1413,7 @@ describe("update-cli channel robustness", () => {
 							registry: DEFAULT_NPM_REGISTRY,
 							warnings: [],
 						}),
+						resolveUpdateTarget: async () => ({ method: "binary", path: "/tmp/gjc" }),
 						exit: code => {
 							exitCodes.push(code);
 							throw sentinel;
@@ -1284,6 +1457,24 @@ describe("update-cli channel robustness", () => {
 		expect(
 			resolveUpdateDecision({ comparison: 0, force: false, channel: "stable", currentVersion: "0.12.11" }),
 		).toEqual({ install: false, kind: "up-to-date" });
+		expect(
+			resolveUpdateDecision({
+				comparison: 0,
+				force: false,
+				channel: "stable",
+				currentVersion: "0.12.11",
+				migrate: true,
+			}),
+		).toEqual({ install: true, kind: "migrate" });
+		expect(
+			resolveUpdateDecision({
+				comparison: -1,
+				force: false,
+				channel: "stable",
+				currentVersion: "0.12.11",
+				migrate: true,
+			}),
+		).toEqual({ install: false, kind: "up-to-date" });
 	});
 });
 
@@ -1294,5 +1485,26 @@ describe("update-cli reported version parsing", () => {
 			"0.12.12-nightly.20260805044024.123456789.g6dd873fd26b8",
 		);
 		expect(parseReportedVersionForTest("gjc: no version")).toBeUndefined();
+	});
+});
+describe("update-cli binary-first target policy", () => {
+	it("installs standalone binaries under the user install dir, not Bun's global bin", () => {
+		expect(defaultUserBinaryPathForTest("linux", { GJC_INSTALL_DIR: "/tmp/gjc-bin", HOME: "/home/alice" })).toBe(
+			"/tmp/gjc-bin/gjc",
+		);
+		expect(
+			defaultUserBinaryPathForTest("win32", { GJC_INSTALL_DIR: "D:\\tools", USERPROFILE: "C:\\Users\\alice" }),
+		).toBe("D:\\tools\\gjc.exe");
+		expect(defaultUserBinaryPathForTest("linux", { HOME: "/home/alice" })).toBe("/home/alice/.local/bin/gjc");
+	});
+
+	it("protects this repository checkout from self-overwrite", () => {
+		expect(isProtectedSourcePathForTest(path.join(repoRoot, "packages/coding-agent/src/cli.ts"))).toBe(true);
+		expect(isProtectedSourcePathForTest("/tmp/unrelated/gjc")).toBe(false);
+	});
+
+	it("keeps bun-global path detection as a shim classifier, not an install method", () => {
+		expect(resolveUpdateMethodForTest("/Users/test/.bun/bin/gjc", "/Users/test/.bun/bin")).toBe("bun");
+		expect(resolveUpdateMethodForTest("/Users/test/.local/bin/gjc", "/Users/test/.bun/bin")).toBe("binary");
 	});
 });

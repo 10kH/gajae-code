@@ -44,6 +44,7 @@ import type { OpenAICompletionsOptions } from "./providers/openai-completions";
 import type { OpenAIResponsesOptions } from "./providers/openai-responses";
 import type { AssistantMessageEventStream } from "./utils/event-stream";
 import type { FallbackAttemptToken, TransportFailureFacts } from "./utils/fallback-transport";
+import type { UnicodeEscapeEvidence } from "./utils/json-parse";
 
 export type { AssistantMessageEventStream } from "./utils/event-stream";
 
@@ -181,6 +182,7 @@ export const KNOWN_PROVIDERS = [
 	"ollama-cloud",
 	"qianfan",
 	"qwen-portal",
+	"sglang",
 	"together",
 	"venice",
 	"vllm",
@@ -618,8 +620,10 @@ export interface ToolCall {
 	 */
 	incompleteArgumentsReason?: "truncated" | "malformed" | "conflicting" | "ambiguous";
 	/**
-	 * Set when the raw argument JSON spelled a printable non-ASCII character as a
-	 * `\uXXXX` escape instead of literal UTF-8. Such a payload parses cleanly but
+	 * Set when the raw argument JSON spelled a printable character as a `\uXXXX`
+	 * escape instead of a literal character. This includes ASCII landings because
+	 * a one-nibble mutation can move an intended non-ASCII scalar below U+0080.
+	 * Such a payload parses cleanly but
 	 * is unverifiable: one mistyped hex digit decodes to a different, equally
 	 * valid character, so the text can be silently wrong with no in-band evidence.
 	 * The agent loop resamples the turn unconditionally a bounded number of
@@ -632,6 +636,16 @@ export interface ToolCall {
 	 * surrogates) never set this.
 	 */
 	escapedNonAsciiArguments?: boolean;
+	/**
+	 * Bounded, payload-free evidence for the original raw escape positions and
+	 * process-keyed scalar/path identities. Required for the display-safe terminal exemption: decoded values
+	 * alone cannot prove that an ASCII landing such as `\u0077` was not a
+	 * one-nibble mutation of a non-ASCII escape. Presence of this evidence implies
+	 * the guarded state even if a legacy producer omitted
+	 * `escapedNonAsciiArguments`. The agent consumes and removes this transient
+	 * field before the tool-call message can become durable.
+	 */
+	escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
 }
 
 export interface Usage {

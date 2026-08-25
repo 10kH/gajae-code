@@ -3,7 +3,6 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { getAgentDir } from "@gajae-code/utils";
 import { ensureBroker } from "../broker/ensure";
-
 import { lifecycleRequestTimeoutMs } from "../broker/startup-budget";
 import { SdkClientError } from "../client";
 import { createBrokerSessionLifecycleService } from "../lifecycle/broker-client";
@@ -86,7 +85,7 @@ const TAIL_OFFLINE_MAX_SCANNED_LINES = 4_096;
 const TAIL_OFFLINE_MAX_LINE_BYTES = 256 * 1024;
 const transcriptDecoder = new TextDecoder("utf-8", { fatal: true });
 
-const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end", "agent_failed"]);
+const TERMINAL_TURN_KINDS = new Set(["turn_end", "agent_end"]);
 const START_TURN_KINDS = new Set(["turn_start", "agent_start"]);
 const CLOSE_EVENT_KINDS = new Set(["session_closed", "session_terminated"]);
 const DEFAULT_TAIL_KINDS = new Set([

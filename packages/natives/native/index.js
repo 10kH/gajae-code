@@ -30,7 +30,7 @@ export const Shell = nativeBindings.Shell;
 
 // functions
 export const __piNativesPublishOutcomeV1 = nativeBindings.__piNativesPublishOutcomeV1;
-export const __piNativesV0_15_0 = nativeBindings.__piNativesV0_15_0;
+export const __piNativesV0_15_2 = nativeBindings.__piNativesV0_15_2;
 export const applyBashFixups = nativeBindings.applyBashFixups;
 export const applyOwnerOnlyFdSecurity = nativeBindings.applyOwnerOnlyFdSecurity;
 export const applyOwnerOnlyPathSecurity = nativeBindings.applyOwnerOnlyPathSecurity;
@@ -39,6 +39,7 @@ export const astGrep = nativeBindings.astGrep;
 export const canonicalExistingDirectoryIdentity = nativeBindings.canonicalExistingDirectoryIdentity;
 export const computerScreenshot = nativeBindings.computerScreenshot;
 export const copyToClipboard = nativeBindings.copyToClipboard;
+export const currentExecutablePath = nativeBindings.currentExecutablePath;
 export const detectMacOSAppearance = nativeBindings.detectMacOSAppearance;
 export const diffLines = nativeBindings.diffLines;
 export const encodeSixel = nativeBindings.encodeSixel;

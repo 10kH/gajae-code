@@ -82,12 +82,15 @@ export interface SetupCommandArgs {
 		worktreeName?: string;
 		requireWorktree?: boolean;
 		stateRoot?: string;
+		codingAgentDir?: string;
 		mutation?: string[];
 		artifactByteCap?: string;
 		serverKey?: string;
 		gjcCommand?: string;
 		target?: string;
 		profileDir?: string;
+		timeout?: string;
+		connectTimeout?: string;
 		yes?: boolean;
 		dryRun?: boolean;
 		keychain?: boolean;
@@ -123,6 +126,7 @@ const HERMES_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = [
 	"worktreeName",
 	"requireWorktree",
 	"stateRoot",
+	"codingAgentDir",
 	"mutation",
 	"artifactByteCap",
 	"serverKey",
@@ -130,6 +134,8 @@ const HERMES_ONLY_FLAGS: readonly (keyof SetupCommandArgs["flags"])[] = [
 	"target",
 	"profile",
 	"profileDir",
+	"timeout",
+	"connectTimeout",
 ];
 
 function rejectHermesFlagsOutsideHermes(component: SetupComponent, flags: SetupCommandArgs["flags"]): void {
@@ -225,6 +231,8 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.requireWorktree = true;
 		} else if (arg === "--state-root") {
 			flags.stateRoot = args[++i];
+		} else if (arg === "--coding-agent-dir") {
+			flags.codingAgentDir = args[++i];
 		} else if (arg === "--mutation") {
 			flags.mutation = [...(flags.mutation ?? []), args[++i] ?? ""];
 		} else if (arg === "--artifact-byte-cap") {
@@ -233,6 +241,10 @@ export function parseSetupArgs(args: string[]): SetupCommandArgs | undefined {
 			flags.serverKey = args[++i];
 		} else if (arg === "--gjc-command") {
 			flags.gjcCommand = args[++i];
+		} else if (arg === "--timeout") {
+			flags.timeout = args[++i] ?? "";
+		} else if (arg === "--connect-timeout") {
+			flags.connectTimeout = args[++i] ?? "";
 		} else if (arg === "--target") {
 			flags.target = args[++i];
 		} else if (arg === "--profile-dir") {
@@ -927,6 +939,9 @@ ${chalk.bold("Hermes example:")}
   ${APP_NAME} setup hermes --root /path/to/repo --worktree-name hermes-gajae-code
   ${APP_NAME} setup hermes --root /path/to/repo --session-command "gjc --worktree hermes-custom"
   ${APP_NAME} setup hermes --root /path/to/repo --session-command gjc
+  ${APP_NAME} setup hermes --root /path/to/repo --coding-agent-dir /var/lib/gjc/hermes-agent
+  ${APP_NAME} setup hermes --root /path/to/repo --gjc-command "python3 /tmp/gjc-wrapper.py"
+  ${APP_NAME} setup hermes --root /path/to/repo --gjc-command /opt/gjc
 
 ${chalk.bold("Options:")}
   -c, --check       Check if dependencies are installed without installing
@@ -944,10 +959,14 @@ ${chalk.bold("Options:")}
   --root            Allowed Hermes MCP workdir/artifact root (repeatable)
   --profile         Hermes MCP profile namespace
   --repo            Hermes MCP repo namespace
+  --gjc-command     Full command the controller execs: one token = executable (mcp-serve coordinator still appended); multiple tokens = complete server command verbatim, nothing appended; quote-aware, never shell-evaluated
   --session-command Typed GJC lifecycle selector: gjc | gjc --worktree [name]; disables generated worktree flags
   --no-worktree     Disable default GJC --worktree isolation for Hermes sessions
   --worktree-name   Named GJC --worktree branch for Hermes sessions
+  --timeout         Hermes MCP client call timeout in whole seconds 1-3600 (default 180); host client budget, not a GJC turn deadline
+  --connect-timeout Hermes MCP connect timeout in whole seconds 1-3600 (default 60); host client budget, not a GJC turn deadline
   --mutation        Hermes MCP mutation classes: sessions,questions,reports,all
+  --coding-agent-dir GJC agent-directory override (GJC_CODING_AGENT_DIR, absolute path); distinct from --state-root
   --target          Hermes config file target for config-only install
   --profile-dir     Hermes profile directory for full setup install
   --dry-run         Preview discovered credentials without importing (credentials)

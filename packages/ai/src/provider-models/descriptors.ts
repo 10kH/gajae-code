@@ -40,6 +40,7 @@ import {
 	openrouterModelManagerOptions,
 	qianfanModelManagerOptions,
 	qwenPortalModelManagerOptions,
+	sglangModelManagerOptions,
 	syntheticModelManagerOptions,
 	togetherModelManagerOptions,
 	veniceModelManagerOptions,
@@ -278,6 +279,14 @@ export const PROVIDER_DESCRIPTORS: readonly ProviderDescriptor[] = [
 		"gpt-oss-20b",
 		config => vllmModelManagerOptions(config),
 		catalog("vLLM", ["VLLM_API_KEY"], { allowUnauthenticated: true }),
+		{ allowUnauthenticated: true },
+	),
+	catalogDescriptor(
+		"sglang",
+		"gpt-oss-20b",
+		config => sglangModelManagerOptions(config),
+		catalog("SGLang", ["SGLANG_API_KEY"], { allowUnauthenticated: true }),
+		{ allowUnauthenticated: true },
 	),
 	catalogDescriptor(
 		"moonshot",

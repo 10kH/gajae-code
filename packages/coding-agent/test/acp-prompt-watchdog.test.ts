@@ -10,7 +10,6 @@ import {
 	ACP_PROMPT_INFERENCE_TIMEOUT_MS,
 	ACP_PROMPT_TOOL_ACTIVITY_TIMEOUT_MS,
 } from "../src/sdk/prompt-watchdog";
-import { TEST_BROKER_PACKAGE_AUTHORITY } from "./helpers/sdk-broker-fixture";
 import {
 	type ExactSessionAuthorityFixture,
 	type ExactSessionAuthorityOptions,
@@ -354,8 +353,6 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 		version: 1,
 		protocolVersion: 3,
 		packageGeneration: "test",
-		packageVersion: TEST_BROKER_PACKAGE_AUTHORITY.packageVersion,
-		installationIdentity: TEST_BROKER_PACKAGE_AUTHORITY.installationIdentity,
 		ownerId: "test-owner",
 		pid: process.pid,
 		host: "127.0.0.1",
@@ -377,7 +374,6 @@ async function createFixture(options: FixtureOptions = {}): Promise<Fixture> {
 			...(options.cancelSettlementGraceMs === undefined
 				? {}
 				: { cancelSettlementGraceMs: options.cancelSettlementGraceMs }),
-			expectedPackageGeneration: "test",
 		},
 	);
 	const created = await bounded(agent.newSession({ cwd, mcpServers: [] }), "new session");

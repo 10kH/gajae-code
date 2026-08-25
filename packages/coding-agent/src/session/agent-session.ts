@@ -363,6 +363,7 @@ import type { WorkspaceTreeRuntime } from "../runtime/workspace-tree-service";
 import { MCPManager } from "../runtime-mcp/manager";
 import type { NotificationSessionController } from "../sdk/bus/session-control";
 import { buildSyntheticModelId, syntheticNamespaceCollision } from "../sdk/model-profile-model";
+import { sanitizePromptFailure } from "../sdk/prompt-failure";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import { formatNoCredentialOnboardingError, formatNoModelOnboardingError } from "../setup/model-onboarding-guidance";
 import {
@@ -1256,6 +1257,20 @@ function terminalProviderFirstEventTimeoutIdentity(errorMessage: string): string
 		? PROVIDER_FIRST_EVENT_TIMEOUT_ERROR
 		: errorMessage;
 }
+function attachRetryableAtHint(errorMessage: string | undefined, retryableAt: number): string {
+	if (!Number.isFinite(retryableAt)) return errorMessage?.trim() || "";
+	let iso: string;
+	try {
+		iso = new Date(retryableAt).toISOString();
+	} catch {
+		return errorMessage?.trim() || "";
+	}
+	const hint = `retryable at ${iso}`;
+	const current = errorMessage?.trim();
+	if (current?.includes("retryable at ")) return current;
+	return current ? `${current}; ${hint}` : hint;
+}
+
 function isMessageOnlyFirstEventTimeout(message: AssistantMessage): boolean {
 	if (hasBareDefaultRetryDisqualifyingFacts(message)) return false;
 	return (
@@ -1798,7 +1813,7 @@ function extractPermissionLocations(
  *  `message_start` dequeue branch; user-message pushes leave it undefined and
  *  rely on the existing text-equality match. `sequence` gives each queued chip a
  *  stable edit id while the display arrays preserve delivery order. */
-type QueuedDisplayEntry = { text: string; tag?: string; sequence: number };
+type QueuedDisplayEntry = { text: string; tag?: string; sequence: number; message?: AgentMessage };
 type IrcRosterClaim = { token: symbol; signature: string; epoch: number; message: CustomMessage };
 type QueuedFollowUpOwner = { cancel(): boolean };
 export type QueuedMessageEditMode = "steer" | "followUp";
@@ -2290,7 +2305,10 @@ export class AgentSession {
 	// not when an independently scheduled continuation is accepted — a skipped
 	// continuation must never discard the correlation of work that is still
 	// consumed (review thread P2).
-	readonly #followUpPromotionHooks = new Map<AgentMessage, () => void>();
+	readonly #followUpPromotionHooks = new Map<
+		AgentMessage,
+		(promotion: { startsOwnRun?: boolean; removed?: boolean }) => void
+	>();
 	/** SDK-owned follow-ups held outside Agent's live queue until the active run ends. */
 	#deferredSdkFollowUps: AgentMessage[] = [];
 	// Client/SDK steering (turn.prompt diverted to steer while streaming, or an
@@ -2305,7 +2323,10 @@ export class AgentSession {
 	/** Per-message SDK requester-ownership correlation for queued client steers:
 	 *  fired exactly once when the steer's run accepts it — via the idle
 	 *  auto-continue or the terminal-abort rearm (review thread P1). */
-	readonly #steerPromotionHooks = new WeakMap<AgentMessage, () => void>();
+	readonly #steerPromotionHooks = new WeakMap<
+		AgentMessage,
+		(promotion: { startsOwnRun?: boolean; removed?: boolean }) => void
+	>();
 	/** Monotonic steering admission sequence; the terminal abort snapshots it. */
 	#steeringAdmissionSeq = 0;
 	readonly #externalSteerAdmissionSeq = new WeakMap<AgentMessage, number>();
@@ -2323,17 +2344,39 @@ export class AgentSession {
 	readonly #terminalAbortSteeringSnapshotKeys = new Map<number, string>();
 	#terminalAbortAdmissionSeq = 0;
 	#queuedDisplaySequence = 0;
-	#fireQueuedPromotionHooks(messages: readonly AgentMessage[]): void {
+	/** Fire the stored promotion hook with a REMOVAL disposition for messages
+	 * leaving their queue without consumption (queue.message.remove, positional
+	 * editing, clearQueue, or the terminal-abort purge). The SDK terminalizes
+	 * those accepted submissions boundedly instead of leaving them accepted
+	 * forever (#4668 review P1). */
+	#fireQueuedRemovalHooks(messages: readonly AgentMessage[]): void {
 		for (const message of messages) {
 			const steerHook = this.#steerPromotionHooks.get(message);
 			if (steerHook) {
 				this.#steerPromotionHooks.delete(message);
-				steerHook();
+				steerHook({ startsOwnRun: false, removed: true });
 			}
 			const followUpHook = this.#followUpPromotionHooks.get(message);
 			if (followUpHook) {
 				this.#followUpPromotionHooks.delete(message);
-				followUpHook();
+				followUpHook({ startsOwnRun: true, removed: true });
+			}
+		}
+	}
+	#fireQueuedPromotionHooks(messages: readonly AgentMessage[], promotion?: { startsOwnRun?: boolean }): void {
+		for (const message of messages) {
+			const steerHook = this.#steerPromotionHooks.get(message);
+			if (steerHook) {
+				this.#steerPromotionHooks.delete(message);
+				// A steer is consumed INSIDE the currently running turn: no new
+				// agent_start follows for it (#4668 review).
+				steerHook({ startsOwnRun: promotion?.startsOwnRun ?? false });
+			}
+			const followUpHook = this.#followUpPromotionHooks.get(message);
+			if (followUpHook) {
+				this.#followUpPromotionHooks.delete(message);
+				// A follow-up is promoted to its own run, whose agent_start follows.
+				followUpHook({ startsOwnRun: promotion?.startsOwnRun ?? true });
 			}
 		}
 	}
@@ -3528,21 +3571,21 @@ export class AgentSession {
 		};
 		const publish = async () => {
 			// Worker integration is first-party lifecycle persistence, not an extension
-			// hook. Make it durable before publishing the terminal boundary while user
-			// extension delivery remains asynchronous.
+			// hook. Settle it before publishing the terminal boundary while user extension
+			// delivery and coordinator sidecar persistence remain asynchronous.
 			await this.#flushWorkerIntegrationForAgentEnd();
-			// Persist before notifying synchronous subscribers: a subscriber may start a
-			// successor prompt from agent_end, whose running state must serialize after
-			// this terminal boundary rather than be overwritten by it.
+			// Reserve persistence before notifying synchronous subscribers: a subscriber
+			// may start a successor prompt from agent_end, whose running state must
+			// serialize after this terminal boundary rather than be overwritten by it.
 			//
-			// Awaited, not fire-and-forget: this is the terminal boundary, and the write
-			// runs under the native identity-bound state-file lock. A detached write
-			// outlives the session that owns it — under `bun test --isolate` the pending
-			// unlink lands after the runtime has torn down the context it was scheduled in
-			// and segfaults the process, and in production it lets a settled session's
-			// last write race whatever reclaims its lock next.
-			await this.#queueCoordinatorRuntimeStatePersist(pending);
+			// Reserve the write before notifying subscribers so a successor still queues
+			// behind this terminal transition, but do not make the interactive terminal
+			// wait for the filesystem-backed lock/write to settle. On slow or lock-hostile
+			// mounts such as WSL drvfs, waiting here leaves the foreground activity loader
+			// and busy input state visible after the model has already finished.
+			const terminalPersistence = this.#queueCoordinatorRuntimeStatePersist(pending);
 			this.#emit(pending);
+			await terminalPersistence;
 			extensionDelivery = this.#queueExtensionEvent(
 				pending,
 				undefined,
@@ -3887,7 +3930,7 @@ export class AgentSession {
 		// actual resume admission — when the loop dequeues the follow-up for the
 		// next turn, the previously streaming turn has ended, so mutating the
 		// session-wide epoch/lineage is safe and its tools bind the fresh lineage.
-		this.agent.onFollowUpConsumed = messages => {
+		this.agent.onFollowUpConsumed = (messages, promotion = { startsOwnRun: false }) => {
 			// A follow-up whose owned-completion origin is DENIED — an owned
 			// scope landed after the result was queued, or the tuple is
 			// forged/vanished-disabled — must NOT resume the agent: remove it
@@ -3921,7 +3964,14 @@ export class AgentSession {
 			// when the batch is drained by a continuation the message did not
 			// schedule (a skipped continuation must never discard the correlation
 			// of work that is still consumed; review thread P2).
-			this.#fireQueuedPromotionHooks(messages);
+			this.#fireQueuedPromotionHooks(messages, promotion);
+		};
+		// Steering consumed mid-run never starts its own run: fire the stored
+		// promotion hook at the REAL dequeue boundary so the SDK attaches the
+		// submitter to the in-flight run instead of parking the correlation for
+		// an unrelated later agent_start (#4668).
+		this.agent.onSteeringConsumed = (messages, promotion = { startsOwnRun: false }) => {
+			this.#fireQueuedPromotionHooks(messages, promotion);
 		};
 		this.agent.providerSessionState = this.#providerSessionState;
 		this.#syncAgentSessionId();
@@ -4555,8 +4605,12 @@ export class AgentSession {
 		this.#planCompactAbortPending = false;
 	}
 
-	#createQueuedDisplayEntry(text: string, tag?: string): QueuedDisplayEntry {
-		const entry: QueuedDisplayEntry = { text, sequence: ++this.#queuedDisplaySequence };
+	#createQueuedDisplayEntry(text: string, tag?: string, message?: AgentMessage): QueuedDisplayEntry {
+		const entry: QueuedDisplayEntry = {
+			text,
+			sequence: ++this.#queuedDisplaySequence,
+			...(message === undefined ? {} : { message }),
+		};
 		if (tag !== undefined) {
 			entry.tag = tag;
 		}
@@ -6299,7 +6353,13 @@ export class AgentSession {
 											// continuations retain predecessor accounting, and resetAttemptBudget keeps
 											// the sticky fallback cursor unchanged.
 											onRunAccepted: (handle: AttemptRunHandle, acceptance) => {
-												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages);
+												// Maintenance continuations continue the logical run without a new
+												// agent_start (review P1); their queued messages are in-run
+												// consumptions, not own-run promotions.
+												const startsOwn = options?.maintenanceContinuation !== true;
+												this.#fireQueuedPromotionHooks(acceptance.consumedQueuedMessages, {
+													startsOwnRun: startsOwn,
+												});
 												for (const message of acceptance.consumedQueuedMessages) {
 													const sdkRunToken = this.#sdkRunTokensByQueuedMessage.get(message);
 													if (sdkRunToken) {
@@ -7393,12 +7453,23 @@ export class AgentSession {
 					undefined,
 					deliveryScope,
 				);
+			} else if (event.type === "agent_failed") {
+				await this.#extensionRunner.emit(
+					{
+						type: "agent_failed",
+						error: sanitizePromptFailure(event.error),
+						scope: event.scope,
+					},
+					undefined,
+					deliveryScope,
+				);
 			} else if (event.type === "agent_end") {
 				await this.#extensionRunner.emit(
 					{
 						type: "agent_end",
 						messages: event.messages,
 						stopReason: event.stopReason,
+						maintenanceOutcome: event.maintenanceOutcome,
 					},
 					undefined,
 					deliveryScope,
@@ -11231,16 +11302,19 @@ export class AgentSession {
 	async #queueSteer(
 		text: string,
 		images?: ImageContent[],
-		options?: { claimsGenuineUserIntent?: boolean; onPromoted?: () => void; external?: boolean },
+		options?: {
+			claimsGenuineUserIntent?: boolean;
+			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			external?: boolean;
+		},
 	): Promise<void> {
 		this.#assertNoHandoffTransition();
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
-		const displayEntry = this.#createQueuedDisplayEntry(displayText);
-		this.#steeringMessages.push(displayEntry);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		this.#steeringMessages.push(this.#createQueuedDisplayEntry(displayText, undefined, message));
 		if (options?.external) {
 			this.#externalSteerMessages.add(message);
 			this.#externalSteerAdmissionSeq.set(message, ++this.#steeringAdmissionSeq);
@@ -11277,7 +11351,7 @@ export class AgentSession {
 		options?: {
 			forceOneAtATime?: boolean;
 			claimsGenuineUserIntent?: boolean;
-			onPromoted?: () => void;
+			onPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
 			sdkRunToken?: string;
 		},
 	): Promise<QueuedFollowUpOwner> {
@@ -11285,11 +11359,13 @@ export class AgentSession {
 		assertImagePlaceholdersHavePayload(text, images);
 		const displayText = text || (images && images.length > 0 ? "[Image]" : "");
 		const queueWasEmpty = !this.agent.hasQueuedMessages();
-		const displayEntry = this.#createQueuedDisplayEntry(displayText);
-		this.#followUpMessages.push(displayEntry);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images && images.length > 0) content.push(...images);
 		const message = { role: "user" as const, content, attribution: "user" as const, timestamp: Date.now() };
+		// Display entry carries the message identity so positional editing can never
+		// misaddress a deferred SDK follow-up held outside the Agent live queue.
+		const displayEntry = this.#createQueuedDisplayEntry(displayText, undefined, message);
+		this.#followUpMessages.push(displayEntry);
 		this.#externalFollowUps.add(message);
 		if (options?.onPromoted) this.#followUpPromotionHooks.set(message, options.onPromoted);
 		if (options?.claimsGenuineUserIntent) {
@@ -11330,9 +11406,9 @@ export class AgentSession {
 					this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== displayEntry);
 					this.#deepInterviewGenuineUserMessageEpochs.delete(message);
 					this.#sdkRunTokensByQueuedMessage.delete(message);
-					// A canceled follow-up is never promoted: release its
-					// promotion hook so the callback is not retained for the
-					// session lifetime (review thread P2).
+					// A canceled follow-up never reaches the normal promotion boundary,
+					// so terminalize its SDK owner through the same removal disposition.
+					this.#followUpPromotionHooks.get(message)?.({ removed: true });
 					this.#followUpPromotionHooks.delete(message);
 				}
 				return removed;
@@ -11822,7 +11898,9 @@ export class AgentSession {
 			onPreflightAccepted?: () => void;
 			onPreflightAcceptCommit?: () => void | Promise<void>;
 			/** Fired when a queued submission (steering or follow-up) is promoted to its own run (SDK ownership correlation). */
-			onQueuedPromoted?: () => void;
+			onQueuedPromoted?: (promotion: { startsOwnRun?: boolean; removed?: boolean }) => void;
+			/** Internal dispatch disposition used before actual queue consumption. */
+			onDispatchDisposition?: (promotion: { startsOwnRun: boolean }) => void;
 			preflightSignal?: AbortSignal;
 			sdkRunToken?: string;
 		},
@@ -11895,8 +11973,7 @@ export class AgentSession {
 		const freshAtReservation =
 			queuedPlainPrompt &&
 			!followUpAheadAtReservation &&
-			!this.agent.state.isStreaming &&
-			!this.#canAutoContinueForSteer();
+			(waitedForAbortUnwind || (!this.agent.state.isStreaming && !this.#canAutoContinueForSteer()));
 		const promoteAfterAbortUnwind = waitedForAbortUnwind && dispatchedWhileBusy && !followUpAheadAtReservation;
 		const deliverAs =
 			options?.deliverAs ??
@@ -11985,6 +12062,16 @@ export class AgentSession {
 					onPromoted: options?.onQueuedPromoted,
 					external: true,
 				});
+				// Dispatch-race disposition (#4668 review P1): the SDK snapshot-decided
+				// this submission starts its own turn (idle at dispatch), but the
+				// session began streaming before sendUserMessage ran, so the message
+				// was actually diverted into the in-flight run's steering queue. The
+				// submission promise resolves NOW, before any consumption or promotion
+				// hook fires; without a synchronous disposition the SDK settlement
+				// would terminalize the accepted request as an own-run completion
+				// before it is consumed. Report the internal in-run disposition so the
+				// runtime attaches the correlation to the in-flight run instead.
+				options?.onDispatchDisposition?.({ startsOwnRun: false });
 				options?.onPreflightAccepted?.();
 				return;
 			}
@@ -11994,7 +12081,7 @@ export class AgentSession {
 			const fireQueuedPromotion = () => {
 				if ((!freshAtReservation && !promoteAfterAbortUnwind) || queuedPromotionFired) return;
 				queuedPromotionFired = true;
-				options?.onQueuedPromoted?.();
+				options?.onQueuedPromoted?.({ startsOwnRun: true });
 			};
 			await this.prompt(text, {
 				expandPromptTemplates: false,
@@ -12026,10 +12113,19 @@ export class AgentSession {
 	clearQueue(): { steering: string[]; followUp: string[] } {
 		const steering = this.#steeringMessages.map(e => e.text);
 		const followUp = this.#followUpMessages.map(e => e.text);
+		const steeringQueued = this.agent.snapshotSteering();
+		const followUpQueued = this.agent.snapshotFollowUp();
+		// Deferred SDK follow-ups are held OUTSIDE the Agent live queue: snapshot
+		// them too or their accepted submissions stay non-terminal forever when the
+		// queue is cleared (exact-head review HIGH).
+		const deferredQueued = [...this.#deferredSdkFollowUps];
 		this.#steeringMessages = [];
 		this.#followUpMessages = [];
 		this.#deferredSdkFollowUps = [];
 		this.agent.clearAllQueues();
+		// Every dropped message leaves without consumption: terminalize its
+		// accepted SDK submission boundedly (#4668 review P1).
+		this.#fireQueuedRemovalHooks([...steeringQueued, ...followUpQueued, ...deferredQueued]);
 		return { steering, followUp };
 	}
 
@@ -12117,11 +12213,29 @@ export class AgentSession {
 		if (index === -1) return undefined;
 
 		const [entry] = queue.splice(index, 1);
-		if (resolvedMode === "steer") {
-			this.agent.removeSteerAt(index);
-		} else {
-			this.agent.removeFollowUpAt(index);
+		// Identity-based removal across BOTH storage sites (exact-head review): a
+		// deferred SDK follow-up lives in #deferredSdkFollowUps OUTSIDE the Agent
+		// live queue, so a display index cannot address the live queue — positional
+		// removal deleted a DIFFERENT live message while the selected deferred
+		// entry's executable message survived and later ran.
+		let removedMessage = entry?.message;
+		if (removedMessage !== undefined) {
+			const deferredIndex = this.#deferredSdkFollowUps.indexOf(removedMessage);
+			if (deferredIndex !== -1) {
+				this.#deferredSdkFollowUps.splice(deferredIndex, 1);
+			} else {
+				this.agent.removeQueuedMessages(candidate => candidate === removedMessage);
+			}
+		} else if (index >= 0) {
+			// Legacy entries without an identity link keep positional removal.
+			const positional =
+				resolvedMode === "steer" ? this.agent.removeSteerAt(index) : this.agent.removeFollowUpAt(index);
+			if (positional !== undefined) removedMessage = positional;
 		}
+		// The removed message left its queue WITHOUT consumption: its accepted SDK
+		// submission must terminalize boundedly, not strand accepted forever
+		// (#4668 review P1).
+		if (removedMessage !== undefined) this.#fireQueuedRemovalHooks([removedMessage]);
 		return entry?.text;
 	}
 
@@ -12887,10 +13001,16 @@ export class AgentSession {
 				// would also wipe the follow-up queue, which owned-completion
 				// resumes must still deliver (review thread P1).
 				const steeringBeforePurge = this.agent.snapshotSteering();
+				const purgedSteering = steeringBeforePurge.filter(
+					message => !(this.#externalSteerMessages.has(message) && admittedAfterSnapshot(message)),
+				);
 				this.agent.removeQueuedMessages(
 					message => !(this.#externalSteerMessages.has(message) && admittedAfterSnapshot(message)),
 					"steering",
 				);
+				// Purged steering leaves without consumption: terminalize its accepted
+				// SDK submissions boundedly (#4668 review P1).
+				this.#fireQueuedRemovalHooks(purgedSteering);
 				// Keep the display list aligned with the ACTUAL purge decisions:
 				// preserved post-snapshot external steers stay visible and
 				// purged internal steers disappear — a stale entry would let the
@@ -12911,19 +13031,27 @@ export class AgentSession {
 				// command. Only authorized owned-completion envelopes survive
 				// (review thread P1).
 				const followUpBeforePurge = this.agent.snapshotFollowUp();
-				this.agent.removeQueuedMessages(message => {
+				// One predicate drives BOTH the agent-queue purge and the removal
+				// disposition hooks: the hooks must fire for exactly the messages that
+				// were removed, never for preserved ones (exact-head review: firing for a
+				// preserved external SDK follow-up cancelled its reconciliation row while
+				// it later executed without the promotion hook).
+				const purgedByAbort = (message: AgentMessage): boolean =>
 					// An SDK/client follow-up independently requested the next
 					// root turn; it is not a continuation caused by the
 					// aborted turn.
-					if (this.#externalFollowUps.has(message)) return false;
+					!this.#externalFollowUps.has(message) &&
 					// Preserve only envelopes that are CURRENTLY AUTHORIZED as
 					// owned completions (fresh or drop). The public
 					// sendMessage() accepts arbitrary details, so the mere
 					// presence of the ownedCompletions field is not authority —
 					// an envelope with no matching terminal scope classifies
 					// ordinary and must NOT survive the abort (review thread P2).
-					return ownedCompletionResumeAction(message as never) === "ordinary";
-				}, "followUp");
+					ownedCompletionResumeAction(message as never) === "ordinary";
+				this.agent.removeQueuedMessages(purgedByAbort, "followUp");
+				// Purged ordinary follow-ups leave without consumption: terminalize
+				// their accepted SDK submissions boundedly (#4668 review P1).
+				this.#fireQueuedRemovalHooks(followUpBeforePurge.filter(purgedByAbort));
 				// Mirror the follow-up purge in the display list so stale entries
 				// cannot misalign the positional editing APIs (review thread P2).
 				const followUpAfterPurge = new Set(this.agent.snapshotFollowUp());
@@ -13202,7 +13330,7 @@ export class AgentSession {
 							resetRetryReplaySafety: true,
 							onRunAccepted: () => {
 								runAccepted = true;
-								if (selected) this.#fireQueuedPromotionHooks([message]);
+								if (selected) this.#fireQueuedPromotionHooks([message], { startsOwnRun: true });
 								if (selected) {
 									this.#steeringMessages = this.#steeringMessages.filter(entry => entry !== selected.display);
 									this.#followUpMessages = this.#followUpMessages.filter(entry => entry !== selected.display);
@@ -18183,6 +18311,7 @@ export class AgentSession {
 	#isRetryableError(message: AssistantMessage): boolean {
 		if (this.#isTerminalProviderFirstEventTimeout(message)) return false;
 		if (message.errorMessage?.startsWith("Model fallback chain exhausted;")) return false;
+		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return false;
 		const transportFailure = message.transportFailure;
 		// Transport facts normally bypass typed classification in managed fallback.
 		// A provider safety stop must still remain terminal on that path.
@@ -18314,6 +18443,7 @@ export class AgentSession {
 	 * except canonical idle-stream stalls bounded downstream) -> unknown (bounded retry).
 	 */
 	#classifyErrorForRetry(message: AssistantMessage): RetryErrorClassification {
+		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return "terminal";
 		if (message.stopReason !== "error") return "none";
 		if (message.errorKind === "provider_safety_stop") return "terminal";
 		if (message.errorKind === "local_snapshot_failure") return "local_snapshot";
@@ -18692,6 +18822,7 @@ export class AgentSession {
 		// result is returned verbatim below. Narrowing it away here would silently
 		// disable the terminal-403 guard in `#markFailedCredential`.
 	): { class: FallbackTriggerClass; retryAfterMs?: number; authDisposition?: AuthDisposition } | undefined {
+		if (message.errorMessage?.startsWith("Managed fallback retried the escaped non-ASCII")) return undefined;
 		if (message.stopReason === "error" && message.errorKind === "provider_safety_stop") return undefined;
 		if (classifyContextOverflow(message, transportFailure, this.model?.contextWindow ?? 0)) return undefined;
 		const transport = classifyFallbackTrigger(transportFailure ?? { status: message.errorStatus });
@@ -18842,36 +18973,61 @@ export class AgentSession {
 		class: FallbackTriggerClass;
 		retryAfterMs?: number;
 		authDisposition?: AuthDisposition;
-	}): Promise<boolean> {
+	}): Promise<"rotated" | "exhausted" | "unchanged"> {
 		if (!this.model || (trigger.class !== "auth" && trigger.class !== "quota" && trigger.class !== "rate_limit")) {
-			return false;
+			return "unchanged";
 		}
 		// (2) Terminal forbidden: no credential state may change.
-		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return false;
+		if (trigger.class === "auth" && trigger.authDisposition === "forbidden") return "unchanged";
 
 		const authStorage = this.#modelRegistry.authStorage;
 		const provider = this.model.provider;
 		// (1) Pin guard, before any mutation and for every branch.
-		if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasRuntimeCredentialSelector(provider)) return false;
+		if (authStorage.hasRuntimeApiKey(provider) || authStorage.hasRuntimeCredentialSelector(provider)) {
+			return "unchanged";
+		}
 
 		const credentialSessionId = this.credentialSessionId;
 		const activeApiKey = await this.#modelRegistry.getApiKey(this.model, credentialSessionId);
 
-		let mutated: boolean;
+		let remaining: boolean;
 		if (trigger.class === "auth") {
-			if (!isAuthenticated(activeApiKey)) return false;
-			mutated = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
+			if (!isAuthenticated(activeApiKey)) return "unchanged";
+			remaining = await authStorage.invalidateCredentialMatching(provider, activeApiKey, {
 				sessionId: credentialSessionId,
 			});
+			if (!remaining) return "unchanged";
 		} else {
-			mutated = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
+			remaining = await authStorage.markUsageLimitReached(provider, credentialSessionId, {
 				retryAfterMs: trigger.retryAfterMs,
 			});
 		}
-		if (!mutated) return false;
 
 		// (3) Distinct-row proof.
-		return (await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey;
+		if ((await this.#modelRegistry.getApiKey(this.model, credentialSessionId)) !== activeApiKey) {
+			return "rotated";
+		}
+		return remaining ? "unchanged" : "exhausted";
+	}
+	/** Copy AuthStorage's already-computed unblock instant onto a terminal quota error. */
+	#quotaRetryableAtMs(): number | undefined {
+		if (!this.model) return undefined;
+		const retryableAt = this.#modelRegistry.authStorage.getEarliestUnblockAt(
+			this.model.provider,
+			this.credentialSessionId,
+		);
+		return retryableAt !== undefined && Number.isFinite(retryableAt) ? retryableAt : undefined;
+	}
+
+	#stampQuotaRetryableAt(message: AssistantMessage): void {
+		const retryableAt = this.#quotaRetryableAtMs();
+		if (retryableAt === undefined) return;
+		message.errorMessage = attachRetryableAtHint(message.errorMessage, retryableAt);
+	}
+
+	#annotateQuotaRetryableAt(errorMessage: string): string {
+		const retryableAt = this.#quotaRetryableAtMs();
+		return retryableAt === undefined ? errorMessage : attachRetryableAtHint(errorMessage, retryableAt);
 	}
 
 	/** Handle retryable errors with exponential backoff. */
@@ -18993,12 +19149,18 @@ export class AgentSession {
 		// observable state to corrupt, so it is replay-safe regardless of
 		// extension lifecycle participation. Mark the failed credential and
 		// retry with the next stored credential of the same provider.
-		let credentialRotated =
+		let credentialRotated = false;
+		if (
 			!managedFallback &&
 			!providerRetryCeilingReached &&
 			!assistantMessageHasVisibleOrToolContent(message) &&
-			(trigger.class === "quota" || trigger.class === "rate_limit") &&
-			(await this.#markFailedCredential(trigger));
+			(trigger.class === "quota" || trigger.class === "rate_limit")
+		) {
+			const mark = await this.#markFailedCredential(trigger);
+			credentialRotated = mark === "rotated";
+			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
+		}
+
 		// A content-free credential rotation is inherently replay-safe: no partial
 		// output, no tool calls, no extension-observable streaming state was produced
 		// before the failure. This bypasses #hasCleanRetryReplaySafety because the
@@ -19066,7 +19228,9 @@ export class AgentSession {
 			outcome === "advance" &&
 			(trigger.class === "quota" || trigger.class === "rate_limit")
 		) {
-			credentialRotated = await this.#markFailedCredential(trigger);
+			const mark = await this.#markFailedCredential(trigger);
+			credentialRotated = mark === "rotated";
+			if (mark === "exhausted") this.#stampQuotaRetryableAt(message);
 		}
 		if (credentialRotated) {
 			// A rotation only becomes a same-model retry if the controller can
@@ -19084,7 +19248,16 @@ export class AgentSession {
 		}
 		if (outcome === "exhausted") {
 			if (managedFallback) {
-				const errorMessage = this.#fallbackExhaustionError(controller);
+				let errorMessage = this.#fallbackExhaustionError(controller);
+				if (trigger.class === "quota" || trigger.class === "rate_limit") {
+					if (!assistantMessageHasVisibleOrToolContent(message)) {
+						const mark = await this.#markFailedCredential(trigger);
+						if (mark === "exhausted") {
+							this.#stampQuotaRetryableAt(message);
+							errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
+						}
+					}
+				}
 				this.emitNotice("error", errorMessage, "fallback");
 				this.#defaultFallbackExhaustedLastTurn = true;
 				controller.resetSticky();
@@ -19119,8 +19292,11 @@ export class AgentSession {
 		}
 
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
+			let quotaPoolExhausted = false;
 			if (managedFallback && !credentialRotated && !providerRetryCeilingReached) {
-				await this.#markFailedCredential(trigger);
+				const mark = await this.#markFailedCredential(trigger);
+				if (mark === "rotated") credentialRotated = true;
+				quotaPoolExhausted = mark === "exhausted";
 			}
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
@@ -19132,9 +19308,13 @@ export class AgentSession {
 				}
 			}
 			if (!advanced) {
-				const errorMessage = resolutionError
+				let errorMessage = resolutionError
 					? `${this.#fallbackExhaustionError(controller)}; resolution failed: ${resolutionError instanceof Error ? resolutionError.message : String(resolutionError)}`
 					: this.#fallbackExhaustionError(controller);
+				if ((trigger.class === "quota" || trigger.class === "rate_limit") && quotaPoolExhausted) {
+					this.#stampQuotaRetryableAt(message);
+					errorMessage = this.#annotateQuotaRetryableAt(errorMessage);
+				}
 				this.emitNotice("error", errorMessage, "fallback");
 				if (managedOutcome && ownership) {
 					this.agent.requestRunTerminal(ownership.handle.logicalRunId, {

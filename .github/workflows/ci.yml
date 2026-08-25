@@ -567,14 +567,41 @@ jobs:
               # would derive notes from the wrong base. The loop is pipe-free so
               # a no-candidate outcome reaches the documented empty-notes
               # fallback instead of aborting under pipefail.
+              #
+              # A tag whose GitHub Release was never published is skipped too. A
+              # stable cut that fails after tagging (v0.15.1 died in this very
+              # step, before any package reached npm) leaves an immutable tag
+              # that shipped nothing, and anchoring on it would hide every
+              # change users never received from the release that finally
+              # carries them. Only a published, non-draft release counts as
+              # "already shipped".
               previous=""
               while IFS= read -r tag; do
                  [ "$tag" = "$TAG_NAME" ] && continue
                  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-                 if git merge-base --is-ancestor "$tag" "$SOURCE_SHA"; then
-                    previous="$tag"
-                    break
+                 if ! git merge-base --is-ancestor "$tag" "$SOURCE_SHA"; then
+                    continue
                  fi
+                 # Fail closed on anything but a definitive "no such release":
+                 # an auth/transport/5xx failure must not silently widen the
+                 # range to an older base.
+                 lookup_error="$notes_dir/release-lookup.err"
+                 release_status=0
+                 release_draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" --jq '.draft' 2>"$lookup_error")" || release_status=$?
+                 if [ "$release_status" -eq 0 ]; then
+                    if [ "$release_draft" = "false" ]; then
+                       previous="$tag"
+                       break
+                    fi
+                    echo "Skipping $tag: its GitHub Release is still a draft" >&2
+                    continue
+                 fi
+                 if grep -qiE 'HTTP 404|Not Found' "$lookup_error"; then
+                    echo "Skipping $tag: tagged but never published as a GitHub Release" >&2
+                    continue
+                 fi
+                 echo "Release lookup for $tag failed: $(cat "$lookup_error")" >&2
+                 exit 1
               done < <(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname)
               if [ -z "$previous" ]; then
                  echo "No previous stable tag to compare against; leaving notes empty" >&2
@@ -845,6 +872,14 @@ jobs:
               pattern: gjc-binary-*
               path: release-binaries
               merge-multiple: true
+         - name: Publish binary checksum manifest
+           env:
+              TAG_NAME: ${{ needs.release_metadata.outputs.tag_name }}
+              RELEASE_CHANNEL: ${{ needs.release_metadata.outputs.channel }}
+           shell: bash
+           run: |
+              set -euo pipefail
+              bun scripts/release-binaries-manifest.ts --bin-dir release-binaries --tag "$TAG_NAME" --channel "$RELEASE_CHANNEL"
          - name: Create GitHub Release
            uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
            with:
@@ -859,6 +894,8 @@ jobs:
               fail_on_unmatched_files: true
               files: |
                  release-binaries/gjc-*
+                 release-binaries/gajae-release-binaries-v1.json
+                 release-binaries/gajae-release-binaries.sha256
                  ${{ runner.temp }}/release-evidence/gajae-release-packages-expected-v1.json
                  ${{ runner.temp }}/release-evidence/gajae-release-packages-v1.json
                  ${{ runner.temp }}/release-evidence/gajae-release-channel-v1.json
@@ -884,6 +921,7 @@ jobs:
                  }
                  const expectedAssets = [
                     "gjc-linux-x64", "gjc-linux-arm64", "gjc-darwin-arm64", "gjc-darwin-x64", "gjc-windows-x64.exe",
+                    "gajae-release-binaries-v1.json", "gajae-release-binaries.sha256",
                     "gajae-release-packages-expected-v1.json", "gajae-release-packages-v1.json", "gajae-release-channel-v1.json",
                  ];
                  const assets = new Set(release.assets.map(asset => asset.name));

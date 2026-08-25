@@ -23,6 +23,7 @@ import {
 import chalk from "chalk";
 import type { Args } from "./cli/args";
 import { processFileArguments } from "./cli/file-processor";
+import { fetchGithubChannelRelease } from "./cli/github-release";
 import { buildInitialMessage } from "./cli/initial-message";
 import { resolveLaunchDisposition } from "./cli/launch-disposition";
 import { runListModelsCommand } from "./cli/list-models";
@@ -33,7 +34,7 @@ import { ModelRegistry, ModelsConfigFile } from "./config/model-registry";
 import { resolveCliModel, resolveModelRoleValue, resolveModelScope, type ScopedModel } from "./config/model-resolver";
 import { selectorHead } from "./config/model-selector-value";
 import { getDefault, type SettingPath, Settings, settings } from "./config/settings";
-import { distTagForChannel, resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/update-channel";
+import { resolveMachineLocalUpdateChannel, type UpdateChannel } from "./config/update-channel";
 import { BUNDLED_GROK_BUILD_EXTENSION_ID, getBundledGrokBuildExtensionFactory } from "./defaults/gjc-grok-cli";
 import { initializeWithSettings } from "./discovery";
 import { exportFromFile } from "./export/html";
@@ -71,6 +72,11 @@ import {
 	type StrictSessionOpenResult,
 } from "./session/session-manager";
 import { runStartupCredentialAutoImportIfNeeded } from "./setup/credential-auto-import";
+import {
+	readOnboardingState,
+	shouldOfferAutomaticOnboarding,
+	shouldOfferOnboarding,
+} from "./setup/frictionless-onboarding";
 import { formatModelOnboardingGuidance } from "./setup/model-onboarding-guidance";
 import { executeBuiltinSlashCommand } from "./slash-commands/builtin-registry";
 import { resolvePromptInput } from "./system-prompt";
@@ -79,7 +85,6 @@ import type { LspStartupServerInfo } from "./tools";
 import { getDisplayChangelogEntries, getInstalledVersionChangelogEntry, getNewEntries } from "./utils/changelog";
 import type { EventBus } from "./utils/event-bus";
 import { installHerdrReporter } from "./utils/herdr-pane";
-import { fetchLatestPackageVersion } from "./utils/npm-registry";
 
 const MANAGED_OWNER_SUPERVISOR_ARG = "--internal-managed-owner-supervisor";
 const MANAGED_OWNER_CHILD_TOKEN_ENV = "GJC_MANAGED_OWNER_CHILD_TOKEN";
@@ -90,10 +95,7 @@ async function checkForNewVersion(
 	channel: UpdateChannel = "stable",
 ): Promise<string | undefined> {
 	try {
-		// Resolved from npm config so mirrored/firewalled networks are checked too.
-		const { version } = await fetchLatestPackageVersion("@gajae-code/coding-agent", {
-			distTag: distTagForChannel(channel),
-		});
+		const { version } = await fetchGithubChannelRelease({ channel });
 		return Bun.semver.order(version, currentVersion) > 0 ? version : undefined;
 	} catch {
 		return undefined;
@@ -716,6 +718,21 @@ export async function runInteractiveMode(
 		throw error;
 	}
 
+	if (
+		shouldOfferAutomaticOnboarding({
+			normalInteractive: true,
+			initialMessage,
+			initialMessages,
+			initialImages,
+			resumeAction,
+		})
+	) {
+		const agentDir = session.getSessionAgentDir?.() ?? session.settings?.getAgentDir?.();
+		if (agentDir) {
+			const onboardingState = await readOnboardingState(agentDir);
+			if (shouldOfferOnboarding(onboardingState)) await mode.showFrictionlessOnboarding();
+		}
+	}
 	mode.renderInitialMessages(undefined, { preserveExistingChat: true });
 
 	for (const notify of notifs) {
@@ -1681,8 +1698,15 @@ export async function runRootCommand(
 			);
 		},
 	};
+	let rootStartupCacheAdmissionAttempted = false;
 	sessionOptions.authStorage = authStorage;
 	sessionOptions.modelRegistry = modelRegistry;
+	sessionOptions.modelRegistryStartupMutation = {
+		owner: "cli-root",
+		onAttempt: () => {
+			rootStartupCacheAdmissionAttempted = true;
+		},
+	};
 	sessionOptions.hasUI = isInteractive;
 	sessionOptions.notificationHostModeSupported = isInteractive;
 	sessionOptions.sdkHostModeSupported = isInteractive;
@@ -1801,7 +1825,7 @@ export async function runRootCommand(
 		// discovery arms; running these concurrently contends for the event loop and stretches
 		// every parallel arm by ~30ms. Startup model profiles do their own foreground refresh
 		// before activation so project-scoped defaults can resolve freshly discovered models.
-		if (!context?.skipPostCreateModelRefresh) {
+		if (!context?.skipPostCreateModelRefresh && !rootStartupCacheAdmissionAttempted) {
 			modelRegistry.refreshInBackground();
 		}
 		return result;

@@ -2,9 +2,31 @@
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-08-25
+
+### Changed
+
+- Version 0.15.1 was tagged but never published: release automation failed while deriving release notes, before any package reached npm. Everything listed under `## [0.15.1]` below ships in this release.
+
+## [0.15.1] - 2026-08-25
+
+### Added
+
+- Added an `sglang` provider for local OpenAI-compatible servers: its bundled provider descriptor discovers a running SGLang server at `http://127.0.0.1:30000/v1` implicitly, with hardened discovery (`redirect: "error"`, a 500ms loopback probe timeout, and `max_model_len` accepted only as a safe positive integer). `SGLANG_API_KEY` / `SGLANG_BASE_URL` follow the trusted env conventions used by vLLM. Local no-auth discovery needs no stored credential; `/login sglang` stores only a supplied API key, and discovery-only SGLang catalogs are never bundled into release defaults.
+- Added Kilo's `stealth/ox-alpha` model with its reviewed 1,048,576-token context, 131,072-token output ceiling, text/image input, and low/high/max reasoning-effort contract.
+
 ### Fixed
 
+- Exact ID-selected stored literal API keys can now authorize existing model-cache provenance without resolving or exposing secret bytes; command-backed rows, stored environment references, OAuth, runtime overrides, and config overrides remain ineligible, while an explicitly selected stored row keeps precedence over provider environment fallback.
+- Tool-call parsing now preserves bounded, payload-free raw `\uXXXX` position/scalar evidence across provider adapters. Printable ASCII escapes are included because a one-nibble mutation can move an intended non-ASCII scalar into ASCII before decoded-value validation. Process-keyed scalar/path tags, raw and decoded offsets, value ordinals, duplicate-key/depth rejection, total-position accounting, and a process-local integrity tag make partial, altered, malformed, or overflowed evidence explicitly fail-closed without retaining recoverable argument characters or field names (#4927).
+- Hid the non-callable `google-antigravity/gemini-3.7-flash-{low,medium,high}` selectors from bundled, dynamic, and cached catalogs after live Cloud Code Assist calls returned HTTP 404; `google-antigravity/gemini-3.7-flash-tiered` remains available and callable.
+- Ollama Cloud discovery now keeps curated output limits authoritative and gives unknown models a bounded 32,000-token fallback capped by their discovered context window. This replaces the truncation-prone 8,192 fallback without treating the server context length as a verified 131,072-token output capability or sending unbounded `num_predict` requests. Hosted cold starts and long prefills also receive a 300-second first-event window while explicit timeout overrides keep precedence (#4921).
+- Direct model selections now retry zero-token empty OpenAI-compatible responses.
+- OpenAI-compatible chat streams now replay an exact `finish_reason: "network_error"` only when no text, reasoning, refusal, or tool-call delta has been exposed. Retries honor `streamMaxRetries`, exponential backoff, caller cancellation, and managed-fallback ownership; failed-attempt usage, cost, response IDs, and partial chunks are discarded while terminal error wording remains compatible (#4918).
+
 - Cursor `requestContext` rules now forward normalized system prompts, Cursor HTTP/2 transport honors standard proxy environment variables, and GPT effort siblings are sent as their base model with the corresponding reasoning parameter.
+- `AuthStorage.getEarliestUnblockAt(provider)` now exposes the earliest stored credential `blockedUntil` instant so quota exhaustion can report when a row becomes usable again without waiting for it (#4908).
+- vLLM's `allowUnauthenticated: true` now lives on the descriptor itself, not only inside its `catalogDiscovery` config. The runtime discovery gate in `packages/coding-agent/src/config/model-registry.ts` checks `isAuthenticated(apiKey) || descriptor.allowUnauthenticated`, so a local no-auth vLLM server previously needed a credential (`VLLM_API_KEY` or `/login vllm`) before its models would be discovered — unlike lm-studio/omlx, which already carry the descriptor-level flag. Catalog-generation behavior is unchanged.
 
 ## [0.15.0] - 2026-08-22
 - A failed dynamic-model refresh no longer blanks a legacy cache row in an unbound provider context. `resolveProviderModels` only reused the last-known rows when the latest cache row was provenance-bound to the current discovery context, so a provider that supplies no `cacheDynamicModelProvenance` (e.g. the Codex family) lost every cached model on a refresh failure AND had its row overwritten with an empty snapshot — the stale-while-error fallback the surrounding code documents never applied to it. Legacy rows now serve through a failed refresh whenever the request context is unbound; bound contexts still fail closed on foreign rows.

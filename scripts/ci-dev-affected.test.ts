@@ -1150,7 +1150,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 		expect(keys).not.toContain("test:@gajae-code/coding-agent");
 		expect(keys).not.toContain("test:packages/coding-agent/test/edit/bar.test.ts");
 		const testTask = tasks.find(task => task.key === "test:packages/coding-agent/test/edit/foo.test.ts");
-		expect(testTask?.command).toEqual(["bun", "test", "--timeout=30000", "packages/coding-agent/test/edit/foo.test.ts"]);
+		expect(testTask?.command).toEqual(["bun", "test", "packages/coding-agent/test/edit/foo.test.ts"]);
 	});
 
 	test("SDK host and coordinator prompt-control changes include shard 1 and the isolated production host", () => {
@@ -1187,12 +1187,7 @@ describe("planTargetedTasks PR-mode targeting", () => {
 	test("prompt terminal diagnostics changes run directly and on the isolated SDK host", () => {
 		const testFile = "packages/coding-agent/test/sdk-prompt-terminal-diagnostics.test.ts";
 		const tasks = targeted([testFile]);
-		expect(tasks.find(task => task.key === `test:${testFile}`)?.command).toEqual([
-			"bun",
-			"test",
-			"--timeout=30000",
-			testFile,
-		]);
+		expect(tasks.find(task => task.key === `test:${testFile}`)?.command).toEqual(["bun", "test", testFile]);
 		expect(tasks.find(task => task.key === "test:@gajae-code/coding-agent:shard-1-of-8")?.command).toEqual([
 			"bun",
 			"scripts/run-bun-test-files.ts",
@@ -1285,6 +1280,21 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"packages/coding-agent/src/sdk/broker/lifecycle.ts",
 			"packages/coding-agent/src/commands/sdk.ts",
 			"packages/coding-agent/test/sdk-lifecycle-ready-then-exit.test.ts",
+			// #4883: the hidden-console creation-flag contract is Windows-only
+			// (CREATE_NO_WINDOW), so the rust shell-spawn surfaces route to the
+			// windows-latest job instead of a Linux shard.
+			"crates/brush-core-vendored/src/commands.rs",
+			"crates/brush-core-vendored/src/sys/windows/commands.rs",
+			"crates/brush-core-vendored/src/sys/unix/commands.rs",
+			"crates/brush-core-vendored/src/sys/stubs/commands.rs",
+			"crates/pi-shell/src/shell.rs",
+			"crates/pi-shell/src/lib.rs",
+			"crates/pi-shell/src/windows.rs",
+			"Cargo.toml",
+			"Cargo.lock",
+			"crates/brush-core-vendored/Cargo.toml",
+			"crates/pi-shell/Cargo.toml",
+			"packages/natives/test/windows-hidden-shell.windows.test.ts",
 		]) {
 			expect(isWindowsSessionPathRegressionPath(changedPath)).toBe(true);
 			expect(needsWindowsSessionPathRegression([changedPath])).toBe(true);
@@ -1320,7 +1330,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			key: "test:packages/coding-agent/test/rlm-live-model-e2e.test.ts",
 			identity: "legacy:dGVzdDpwYWNrYWdlcy9jb2RpbmctYWdlbnQvdGVzdC9ybG0tbGl2ZS1tb2RlbC1lMmUudGVzdC50cw:Lg",
 			description: "Test packages/coding-agent/test/rlm-live-model-e2e.test.ts",
-			command: ["bun", "test", "--timeout=30000", "packages/coding-agent/test/rlm-live-model-e2e.test.ts"],
+			command: ["bun", "test", "packages/coding-agent/test/rlm-live-model-e2e.test.ts"],
 			cwd: undefined,
 			native: true,
 			rust: false,
@@ -1355,12 +1365,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"cli-smoke",
 			"native-linux-x64",
 		]);
-		expect(tasks[0]?.command).toEqual([
-			"bun",
-			"test",
-			"--timeout=30000",
-			"packages/coding-agent/test/startup-update-contract.test.ts",
-		]);
+		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/coding-agent/test/startup-update-contract.test.ts"]);
 		expect(tasks[1]).toMatchObject({
 			command: ["bun", "run", "check"],
 			cwd: resolvePackageCwd("packages/coding-agent"),
@@ -1390,6 +1395,52 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		const tasks = targeted(["crates/pi-natives/src/path_identity.rs"]);
 		expect(tasks.map(task => task.key)).toContain("test:packages/natives/test/path-identity-posix.test.ts");
 	});
+	test("prompt-deadline-lease changes select the production deadline manager suite", () => {
+		const tasks = targeted(["packages/coding-agent/src/sdk/prompt-deadline-lease.ts"]);
+		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts");
+	});
+	test("agent-session source changes select the promotion and concurrency suites", () => {
+		const tasks = targeted(["packages/coding-agent/src/session/agent-session.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/agent-session-concurrent.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/agent-session-promotion-identity.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts");
+	});
+	test("agent lifecycle source changes select force-abort and managed-attempt regressions", () => {
+		const keys = targeted(["packages/agent/src/agent.ts"]).map(task => task.key);
+		expect(keys).toContain("test:packages/agent/test/agent-force-abort.test.ts");
+		expect(keys).toContain("test:packages/agent/test/managed-attempt-transaction.test.ts");
+	});
+	test("lifecycle coverage stays targeted instead of selecting unrelated coding-agent shards", () => {
+		const tasks = targeted([
+			"packages/agent/src/agent.ts",
+			"packages/coding-agent/src/session/agent-session.ts",
+			"packages/coding-agent/src/sdk/host/session-runtime.ts",
+			"scripts/ci-dev-affected.ts",
+		]);
+		const codingAgentShards = tasks.map(task => task.key).filter(key => key.startsWith("test:@gajae-code/coding-agent:shard-"));
+		expect(codingAgentShards).toEqual(["test:@gajae-code/coding-agent:shard-1-of-8"]);
+		expect(tasks.map(task => task.key)).toContain("test:packages/coding-agent/test/agent-session-concurrent.test.ts");
+		expect(tasks.map(task => task.key)).toContain(
+			"test:packages/coding-agent/test/agent-session-promotion-identity.test.ts",
+		);
+	});
+	test("sdk-prefixed bus suites stay selected for their owning sources", () => {
+		const store = targeted(["packages/coding-agent/src/sdk/bus/reconciliation-store.ts"]);
+		expect(store.map(task => task.key)).toContain("test:packages/coding-agent/test/sdk-reconciliation-store.test.ts");
+		const kindAware = targeted(["packages/coding-agent/src/sdk/bus/kind-aware-reconciliation.ts"]);
+		expect(kindAware.map(task => task.key)).toContain(
+			"test:packages/coding-agent/test/sdk-kind-aware-reconciliation.test.ts",
+		);
+	});
+	test("adapter disposition helper changes select every disposition consumer suite", () => {
+		const tasks = targeted(["packages/coding-agent/test/helpers/sdk-adapter-dispositions-shared.ts"]);
+		const keys = tasks.map(task => task.key);
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts");
+		expect(keys).toContain("test:packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts");
+	});
 	test("clean core changes select the clean script test alongside root tooling fallback", () => {
 		const keys = targeted(["scripts/clean-core.ts"]).map(task => task.key);
 		expect(keys).toContain("test:scripts/clean.test.ts");
@@ -1402,12 +1453,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 			"root-check",
 			"native-linux-x64",
 		]);
-		expect(tasks[0]?.command).toEqual([
-			"bun",
-			"test",
-			"--timeout=30000",
-			"packages/ai/test/anthropic-cache-eval.integration.test.ts",
-		]);
+		expect(tasks[0]?.command).toEqual(["bun", "test", "packages/ai/test/anthropic-cache-eval.integration.test.ts"]);
 		expect(tasks[1]?.command).toEqual(["bun", "run", "ci:check:full"]);
 		expect(tasks[2]?.command).toEqual(["bash", "-lc", 'TARGET_VARIANTS="baseline modern" bun scripts/ci-build-native.ts']);
 	});
@@ -1492,12 +1538,7 @@ test("tab-worker graph changes always include install-methods and are Darwin rel
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
-		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual([
-			"bun",
-			"test",
-			"--timeout=30000",
-			"scripts/release-evidence.test.ts",
-		]);
+		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
 	});
 
 	test("unscoped wrapper package changes keep wrapper-version smoke with release validation", () => {
@@ -1657,12 +1698,7 @@ describe("push-mode broad planning still runs the fuller suite", () => {
 		expect(keys.filter(key => key === "release-publish-contract")).toHaveLength(1);
 		expect(keys.filter(key => key === "release-publish-dry-run")).toHaveLength(1);
 		expect(keys.filter(key => key === "test:scripts/release-evidence.test.ts")).toHaveLength(1);
-		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual([
-			"bun",
-			"test",
-			"--timeout=30000",
-			"scripts/release-evidence.test.ts",
-		]);
+		expect(tasks.find(task => task.key === "test:scripts/release-evidence.test.ts")?.command).toEqual(["bun", "test", "scripts/release-evidence.test.ts"]);
 	});
 
 	test("tooling-script root-check marks the bounded check as a native consumer", () => {

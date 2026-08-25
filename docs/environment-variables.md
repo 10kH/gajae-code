@@ -84,7 +84,8 @@ These are consumed via `getEnvApiKey()` (`packages/ai/src/stream.ts`) unless not
 | `OPENGATEWAY_API_KEY`           | OpenGateway (by Sionic AI) auth                  | Using `opengateway` provider                                  | OpenAI-compatible gateway; models discovered via `/v1/models`                                       |
 | `BIZROUTER_API_KEY`             | BizRouter auth                                    | Using `bizrouter` provider                                    | Korean enterprise LLM gateway; OpenAI-compatible, models discovered via `/v1/models`                |
 | `MARA_API_KEY`                  | Mara Cloud auth                                 | Using `mara` provider                                          | OpenAI-compatible enterprise inference platform; models discovered via `/v1/models`                 |
-| `VLLM_API_KEY`                  | vLLM auth/discovery opt-in                       | Using `vllm` provider (local OpenAI-compatible servers)        | Any non-empty value works for no-auth local servers                                                 |
+| `VLLM_API_KEY`                  | Optional vLLM bearer-token auth                  | Using `vllm` provider                                          | Not required for credentialless loopback discovery                                                  |
+| `SGLANG_API_KEY`                | Optional SGLang bearer-token auth                | Using `sglang` provider                                        | Not required for credentialless loopback discovery                                                  |
 | `CURSOR_ACCESS_TOKEN`           | Cursor provider auth                             | Using Cursor provider                                          |                                                                                                     |
 | `AI_GATEWAY_API_KEY`            | Vercel AI Gateway auth                           | Using `vercel-ai-gateway` provider                             |                                                                                                     |
 | `CLOUDFLARE_AI_GATEWAY_API_KEY` | Cloudflare AI Gateway auth                       | Using `cloudflare-ai-gateway` provider                         | Base URL must be configured as `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic` |
@@ -316,7 +317,7 @@ Coordinator MCP currently exposes durable polling/await tools, not push subscrip
 | `GJC_COORDINATOR_MCP_WORKDIR_ROOTS` | Required allowlist for workdir and artifact paths. `gjc setup hermes` renders absolute normalized paths joined with the platform path delimiter (`:` on POSIX, `;` on Windows). The bridge parser also accepts commas, semicolons, and newlines for legacy manual configs. |
 | `GJC_COORDINATOR_MCP_MUTATIONS` | Enables mutating tool classes as a comma-separated list (`sessions`, `questions`, `reports`) or `all`. `sessions` covers session startup, prompt delivery, durable turn journal updates, queue, and force operations. Per-call `allow_mutation: true` is still required. |
 | `GJC_COORDINATOR_MCP_ARTIFACT_BYTE_CAP` | Max bytes returned by Linux-only artifact reads (default `65536`, capped at `1048576`). On macOS and Windows, artifact reads fail closed with generic `artifact_unavailable`; detect support through MCP `tools/list`; use the controller's approved repository/worktree reader and report bounded results instead. |
-| `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). |
+| `GJC_COORDINATOR_MCP_STATE_ROOT` | Bridge coordination state root (default `<cwd>/.gjc/state/coordinator-mcp`). Coordinator durable state only — it does **not** select the broker agent directory; that is `GJC_CODING_AGENT_DIR`, rendered by `gjc setup hermes --coding-agent-dir <abs-path>` (absolute path required; home/filesystem-root refused; preserved across managed re-installs unless the flag overrides it). |
 | `GJC_COORDINATOR_MCP_CODEX_TOKEN_ROOT` | Root for managed Codex handoff token files (default `<state-root>/codex-tokens`). Registered files must be owner-only regular non-symlink files beneath this root. Authenticated token-file handoff is unavailable on native Windows unless an equivalent secure ACL proof is provided; registration fails closed with `codex_authenticated_handoff_unavailable_windows`. |
 | `GJC_COORDINATOR_MCP_PROFILE` | Optional profile namespace for session/question/report state. Missing scope never widens to global session enumeration. |
 | `GJC_COORDINATOR_MCP_REPO` | Optional repo namespace for session/question/report state. Missing scope never widens to global session enumeration. |
@@ -478,6 +479,8 @@ Extra conditional behavior:
 | `PUPPETEER_EXECUTABLE_PATH`  | Browser tool Chromium executable override                                                          |
 | `LM_STUDIO_BASE_URL`         | Default implicit LM Studio discovery base URL override (`http://127.0.0.1:1234/v1` if unset)       |
 | `OMLX_BASE_URL`              | Default implicit oMLX discovery base URL override (`http://127.0.0.1:8080/v1` if unset); only HTTP(S) loopback URLs are accepted to prevent credential forwarding to remote hosts |
+| `VLLM_BASE_URL`              | Trusted vLLM discovery base URL override (`http://127.0.0.1:8000/v1` if unset); project `.env` values are ignored, and credentialless remote discovery is rejected |
+| `SGLANG_BASE_URL`            | Trusted SGLang discovery base URL override (`http://127.0.0.1:30000/v1` if unset); project `.env` values are ignored, and credentialless remote discovery is rejected |
 | `OLLAMA_BASE_URL`            | Default implicit Ollama discovery base URL override (`http://127.0.0.1:11434` if unset)            |
 | `LLAMA_CPP_BASE_URL`         | Default implicit Llama.cpp discovery base URL override (`http://127.0.0.1:8080` if unset)          |
 | `GJC_EDIT_VARIANT`            | Forces edit tool variant (`patch`, `replace`, `hashline`, `vim`, `apply_patch`). The force beats `edit.modelVariants`, `edit.mode`, and automatic model-family routing; invalid values fail fast at startup. `PI_EDIT_VARIANT` is the legacy alias. |
@@ -499,7 +502,7 @@ LSP project configuration may control declarative matching, activation, and capa
 | Variable              | Default / behavior                                                            |
 | --------------------- | ----------------------------------------------------------------------------- |
 | `GJC_CONFIG_DIR`       | Config root dirname under home (default `.gjc`)                               |
-| `GJC_CODING_AGENT_DIR` | Full override for agent directory (default `~/<GJC_CONFIG_DIR or .gjc>/agent`) |
+| `GJC_CODING_AGENT_DIR` | Full override for agent directory (default `~/<GJC_CONFIG_DIR or .gjc>/agent`). `gjc setup hermes --coding-agent-dir <abs-path>` renders it into the coordinator server env so bridge-spawned sessions share that broker; it is distinct from `GJC_COORDINATOR_MCP_STATE_ROOT`, which never selects the agent directory. |
 | `PWD`                 | Used when matching canonical current working directory in path helpers        |
 | `GJC_WORKTREE_DIR`     | Directory holding `--worktree` launch worktrees (default `{repo}.gajae-code-worktrees`) |
 

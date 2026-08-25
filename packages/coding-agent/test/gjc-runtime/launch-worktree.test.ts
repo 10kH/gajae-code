@@ -9,6 +9,7 @@ import type { Args } from "@gajae-code/coding-agent/cli/args";
 import { buildDefaultTmuxLaunchPlan } from "@gajae-code/coding-agent/gjc-runtime/launch-tmux";
 import {
 	ensureLaunchWorktree,
+	ensureReusableNodeModules,
 	parseLaunchWorktreeMode,
 	planLaunchWorktree,
 	prepareLaunchWorktree,
@@ -134,6 +135,95 @@ describe("default launch worktrees", () => {
 		const second = prepareLaunchWorktree(repo, ["--worktree", "--slow", "opus"]);
 		expect(await fs.realpath(second.cwd)).toBe(await fs.realpath(expectedPath));
 		expect(second.worktree.enabled && second.worktree.reused).toBe(true);
+	});
+
+	for (const manager of ["bun", "npm", "pnpm"] as const) {
+		it(`installs ${manager} workspace dependencies locally instead of linking the source tree`, async () => {
+			const repo = await createRepo(`gjc-launch-worktree-${manager}-workspace-`);
+			const managerAvailable = manager === "bun" || Bun.which(manager) !== null;
+			const packageManagerVersion =
+				manager === "bun"
+					? Bun.version
+					: managerAvailable
+						? run(manager, ["--version"], os.tmpdir())
+						: manager === "pnpm"
+							? "10.14.0"
+							: "11.5.2";
+			const rootManifest = {
+				name: "workspace-root",
+				private: true,
+				packageManager: `${manager}@${packageManagerVersion}`,
+				...(manager === "pnpm" ? {} : { workspaces: ["packages/*"] }),
+				devDependencies: { "@scope/app": manager === "npm" ? "1.0.0" : "workspace:*" },
+			};
+			await Bun.write(path.join(repo, "package.json"), JSON.stringify(rootManifest));
+			if (manager === "pnpm") await Bun.write(path.join(repo, "pnpm-workspace.yaml"), "packages:\n  - packages/*\n");
+			await fs.mkdir(path.join(repo, "packages", "app"), { recursive: true });
+			await Bun.write(
+				path.join(repo, "packages", "app", "package.json"),
+				JSON.stringify({ name: "@scope/app", version: "1.0.0", exports: "./index.js" }),
+			);
+			await Bun.write(path.join(repo, "packages", "app", "index.js"), 'export const source = "worktree";\n');
+			const installCommand = managerAvailable
+				? { command: manager, args: ["install"] }
+				: { command: "bun", args: ["x", `${manager}@${packageManagerVersion}`, "install"] };
+			run(installCommand.command, installCommand.args, repo);
+			const lockfile = manager === "bun" ? "bun.lock" : manager === "pnpm" ? "pnpm-lock.yaml" : "package-lock.json";
+			run(
+				"git",
+				["add", "package.json", lockfile, "packages", ...(manager === "pnpm" ? ["pnpm-workspace.yaml"] : [])],
+				repo,
+			);
+			run("git", ["commit", "-m", "workspace"], repo);
+
+			const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: `${manager}-workspace` });
+			if (!plan.enabled) throw new Error("expected enabled worktree plan");
+			const worktree = ensureLaunchWorktree(plan);
+			if (!worktree.enabled) throw new Error("expected enabled worktree");
+			fsSync.symlinkSync(
+				path.join(repo, "node_modules"),
+				path.join(worktree.worktreePath, "node_modules"),
+				"junction",
+			);
+			expect(ensureReusableNodeModules(repo, worktree.worktreePath)).toBe("present");
+
+			const launched = prepareLaunchWorktree(repo, ["--worktree", `${manager}-workspace`]);
+			const worktreeModules = path.join(launched.cwd, "node_modules");
+			expect((await fs.lstat(worktreeModules)).isSymbolicLink()).toBe(false);
+			expect(await fs.realpath(path.join(worktreeModules, "@scope", "app"))).toBe(
+				path.join(launched.cwd, "packages", "app"),
+			);
+			expect(await fs.realpath(path.join(repo, "node_modules", "@scope", "app"))).toBe(
+				path.join(repo, "packages", "app"),
+			);
+		}, 30_000);
+	}
+
+	it("refuses an unowned external node_modules link instead of installing through it", async () => {
+		const repo = await createRepo("gjc-launch-worktree-external-modules-");
+		await Bun.write(
+			path.join(repo, "package.json"),
+			JSON.stringify({
+				name: "workspace-root",
+				private: true,
+				packageManager: `bun@${Bun.version}`,
+				workspaces: [],
+			}),
+		);
+		run("git", ["add", "package.json"], repo);
+		run("git", ["commit", "-m", "workspace"], repo);
+
+		const plan = planLaunchWorktree(repo, { enabled: true, detached: false, name: "external-modules" });
+		if (!plan.enabled) throw new Error("expected enabled worktree plan");
+		const worktree = ensureLaunchWorktree(plan);
+		if (!worktree.enabled) throw new Error("expected enabled worktree");
+		const externalModules = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-external-node-modules-"));
+		cleanupPaths.push(externalModules);
+		const target = path.join(worktree.worktreePath, "node_modules");
+		fsSync.symlinkSync(externalModules, target, "junction");
+
+		expect(() => ensureReusableNodeModules(repo, worktree.worktreePath)).toThrow(/worktree_node_modules_not_local:/);
+		expect(await fs.realpath(target)).toBe(externalModules);
 	});
 
 	it("creates launch worktrees beside the canonical source repo when launched from an existing worktree", async () => {

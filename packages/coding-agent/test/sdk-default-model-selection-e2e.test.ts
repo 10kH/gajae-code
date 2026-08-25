@@ -180,7 +180,7 @@ test("model.set executes every Q10-advertised selection and persists the public 
 	try {
 		const catalog = (await client.query("Q10")) as { page?: { items: Q10Model[] } };
 		const rows = catalog.page?.items ?? [];
-		expect(rows).toHaveLength(4);
+		expect(rows.filter(row => row.provider === "runtime-provider")).toHaveLength(4);
 
 		// Invalid `inherit` rejection is covered by sdk-host-wiring; this process-heavy
 		// fixture exercises only Q10-advertised selections and exact owner teardown.
@@ -188,13 +188,15 @@ test("model.set executes every Q10-advertised selection and persists the public 
 		const nonReasoningRow = rows.find(row => !row.reasoning);
 		if (!nonReasoningRow) throw new Error("Expected a non-reasoning model in the public Q10 response");
 		expect(nonReasoningRow.thinking.validLevels).toEqual(["off"]);
-		const advertisedSelections = rows.flatMap(row =>
-			row.thinking.validLevels.map(thinkingLevel => ({
-				provider: row.provider,
-				modelId: row.id,
-				thinkingLevel,
-			})),
-		);
+		const advertisedSelections = rows
+			.filter(row => row.provider === "runtime-provider")
+			.flatMap(row =>
+				row.thinking.validLevels.map(thinkingLevel => ({
+					provider: row.provider,
+					modelId: row.id,
+					thinkingLevel,
+				})),
+			);
 		expect(advertisedSelections).not.toHaveLength(0);
 		for (const selection of advertisedSelections) {
 			await expect(

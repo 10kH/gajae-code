@@ -66,6 +66,10 @@ const NATIVE_BUILD_KEYS: ReadonlySet<string> = new Set(["native-build", "native-
 // replace, direct-basename test selection and owner fallback tasks.
 const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/agent/src/agent-loop.ts": ["packages/coding-agent/test/provider-safety-stop-hint.e2e.test.ts"],
+	"packages/agent/src/agent.ts": [
+		"packages/agent/test/agent-force-abort.test.ts",
+		"packages/agent/test/managed-attempt-transaction.test.ts",
+	],
 	"packages/coding-agent/src/tools/atomic-file-write.ts": ["packages/coding-agent/test/file-tools-atomicity.test.ts"],
 	"packages/coding-agent/src/tools/read.ts": ["packages/coding-agent/test/read-acp-fs.test.ts"],
 	"packages/coding-agent/src/tools/write.ts": ["packages/coding-agent/test/write-acp-fs.test.ts"],
@@ -78,6 +82,25 @@ const BEHAVIORAL_OWNER_TESTS: Readonly<Record<string, readonly string[]>> = {
 	"packages/ai/test/fixtures/issue-3670-anthropic-cache-eval.json": ["packages/ai/test/anthropic-cache-eval.integration.test.ts"],
 	"crates/pi-natives/src/path_identity.rs": ["packages/natives/test/path-identity-posix.test.ts"],
 	"packages/coding-agent/src/main.ts": ["packages/coding-agent/test/startup-update-contract.test.ts"],
+	"packages/coding-agent/src/sdk/prompt-deadline-lease.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
+	"packages/coding-agent/src/sdk/prompt-deadline-manager.ts": ["packages/coding-agent/test/sdk-prompt-deadline-manager.test.ts"],
+	"packages/coding-agent/src/session/agent-session.ts": [
+		"packages/coding-agent/test/agent-session-concurrent.test.ts",
+		"packages/coding-agent/test/agent-session-promotion-identity.test.ts",
+		"packages/coding-agent/test/agent-session-terminal-abort-chain.test.ts",
+	],
+	"packages/coding-agent/src/sdk/bus/reconciliation-store.ts": [
+		"packages/coding-agent/test/sdk-reconciliation-store.test.ts",
+	],
+	"packages/coding-agent/src/sdk/bus/kind-aware-reconciliation.ts": [
+		"packages/coding-agent/test/sdk-kind-aware-reconciliation.test.ts",
+	],
+	"packages/coding-agent/test/helpers/sdk-adapter-dispositions-shared.ts": [
+		"packages/coding-agent/test/sdk-adapter-dispositions.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-acp.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-mcp.test.ts",
+		"packages/coding-agent/test/sdk-adapter-dispositions-daemon-cli.test.ts",
+	],
 	"scripts/clean-core.ts": ["scripts/clean.test.ts"],
 	"packages/coding-agent/src/tools/tool-catalog.generated.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
 	"packages/coding-agent/scripts/generate-tool-catalog.ts": ["packages/coding-agent/test/tools/tool-catalog.test.ts"],
@@ -461,7 +484,26 @@ export function isWindowsSessionPathRegressionPath(changedPath: string): boolean
 		changedPath === "packages/utils/src/env.ts" ||
 		changedPath === "packages/utils/test/env-provenance.windows.test.ts" ||
 		changedPath === "packages/natives/native/loader-state.js" ||
-		changedPath === "scripts/host-detect.ts"
+		changedPath === "scripts/host-detect.ts" ||
+		// Rust shell-spawn surfaces cannot be executed on an Ubuntu shard; the
+		// hidden-console creation-flag contract is Windows-only, so route these
+		// to the windows-latest job (#4883).
+		changedPath === "crates/brush-core-vendored/src/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/windows/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/unix/commands.rs" ||
+		changedPath === "crates/brush-core-vendored/src/sys/stubs/commands.rs" ||
+		changedPath === "crates/pi-shell/src/shell.rs" ||
+		changedPath === "crates/pi-shell/src/lib.rs" ||
+		changedPath === "crates/pi-shell/src/windows.rs" ||
+		// These manifests supply the Windows-only APIs and crate wiring used by
+		// the hidden-console spawn path. A Linux shard cannot compile the cfg
+		// Windows imports, so dependency-only changes must still run the live
+		// windows-latest regression (#4883).
+		changedPath === "Cargo.toml" ||
+		changedPath === "Cargo.lock" ||
+		changedPath === "crates/brush-core-vendored/Cargo.toml" ||
+		changedPath === "crates/pi-shell/Cargo.toml" ||
+		changedPath === "packages/natives/test/windows-hidden-shell.windows.test.ts"
 	);
 }
 
@@ -995,7 +1037,7 @@ export function planTargetedTasks(
 // so the matrix shard name stays small and directly traceable to the file.
 function addTestFileTask(tasks: Map<string, Task>, testFile: string, requireExisting = false): void {
 	if (requireExisting && !fsSync.existsSync(path.join(repoRoot, testFile))) return;
-	add(tasks, `test:${testFile}`, `Test ${testFile}`, ["bun", "test", "--timeout=30000", testFile]);
+	add(tasks, `test:${testFile}`, `Test ${testFile}`, ["bun", "test", testFile]);
 }
 
 function addWorkspaceTestTasks(tasks: Map<string, Task>, packages: readonly WorkspacePackage[]): void {

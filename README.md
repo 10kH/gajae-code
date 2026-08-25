@@ -56,11 +56,25 @@ Most coding agents fail on three fronts: they bill you twice, they mutate before
 
 ## Quick Start
 
-**Install** — prebuilt binaries for Linux (x64/arm64), macOS (arm64/x64), and Windows (x64); the npm/Bun path works everywhere:
+**Install** — prebuilt binaries for Linux (x64/arm64), macOS (arm64/x64), and Windows (x64). Bun is not required:
 
 ```sh
-bun install -g gajae-code
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
 gjc
+```
+
+Piping `main` executes mutable content; use it only if you explicitly want the latest installer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/main/scripts/install.sh | sh
+```
+
+Windows (PowerShell), tagged:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
 ```
 
 **First use** — pick your plan and go:
@@ -81,7 +95,7 @@ gjc --tmux --worktree my-task      # isolated worktree for risky work
 gjc @screenshot.png "What should I change?"   # image input
 ```
 
-Nightly channel: `bun install -g gajae-code@nightly`. Full install matrix, Windows setup, update channels, and shell completion: [docs/install.md](docs/install.md).
+Nightly channel: `sh gjc-install.sh --channel nightly` (use the tagged installer downloaded above). Full install matrix, Windows setup, update channels, and shell completion: [docs/install.md](docs/install.md). Bun is only needed to build from source.
 
 ---
 
@@ -173,17 +187,17 @@ Also included, opt-in: **`computer-use`** (experimental desktop control). See [P
 
 ## Custom skills
 
-GJC follows the Claude Code / Codex file convention for custom skills — drop a `SKILL.md` into a documented location and it is discoverable in a normal session with **no configuration**:
+GJC uses the Claude Code / Codex `SKILL.md` file convention, but loads runtime skills directly only from canonical GJC locations — no configuration required:
 
 ```sh
-# project-local (any of these):
-cp -r my-skill .gjc/skills/          # or .claude/skills/ or .codex/skills/
+# project-local, per repository:
+mkdir -p .gjc/skills && cp -r my-skill .gjc/skills/
 
 # user-wide, available in every project:
 mkdir -p ~/.gjc/agent/skills && cp -r my-skill ~/.gjc/agent/skills/
 ```
 
-Then invoke it with `/skill:my-skill` in a session. Scope trust is explicit via `skills.trustProjectSkills` / `skills.trustUserSkills` (both default on), with `skills.enabled` as the master switch; inspect what is discoverable with `gjc skills discover`. The four bundled workflow skills above can never be replaced by disk skills. See [docs/skills.md](docs/skills.md) for locations, precedence, and diagnostics.
+Claude Code and Codex skill directories are import sources only. `gjc skills discover` reports them with the exact copy command; copy a skill into a canonical `.gjc` location before invoking it with `/skill:my-skill`. Scope trust is explicit via `skills.trustProjectSkills` / `skills.trustUserSkills` (both default on), with `skills.enabled` as the master switch. The four bundled workflow skills above can never be replaced by disk skills. See [docs/skills.md](docs/skills.md) for locations, precedence, and diagnostics.
 ## Theme defaults
 
 The default dark TUI identity is the GJC red-claw theme; light-appearance terminals default to the bundled blue-crab theme. Explicit theme settings still take precedence.
@@ -280,7 +294,7 @@ Need event-driven fan-out across many worktrees instead of one session at a time
 [Coordinator MCP bridge](docs/hermes-mcp-bridge.md) (`gjc mcp-serve coordinator`, installed by
 `gjc setup hermes`) exposes the delegation tools for that shape.
 
-- [External controller / bot integration guide](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar
+- [External controller / bot integration guide](docs/bot-integration.md) — provider-independent smokes; [`docs/aside-integration.md`](docs/aside-integration.md) covers the opt-in search/context sidecar and the `/aside` composer command
 - [SDK session CLI](docs/sdk-session-cli.md) · [SDK & wire protocol](docs/sdk.md) · [SDK app guide](docs/sdk-app-guide.md) · [External-control readiness](docs/external-control-readiness.md)
 
 ---
@@ -335,7 +349,7 @@ gjc setup paseo --check    # pass / stale / drift, with a machine-readable --jso
 gjc setup paseo --remove   # rolls back only the keys GJC itself created
 ```
 
-Orca, in one field: install GJC (`bun install -g @gajae-code/coding-agent`), then add a custom agent
+Orca, in one field: install GJC (see [docs/install.md](docs/install.md)), then add a custom agent
 with command `gjc` and no arguments. Orca pre-fills a permission-bypass flag for agents that expose
 one — GJC has none by design, so leave the arguments empty and keep GJC's own approval gates.
 
@@ -348,7 +362,7 @@ per-host setup, verification, cancel semantics, troubleshooting tables, and what
 
 Start at **[gajae-code.com](https://gajae-code.com)** or `docs/`:
 
-- [Install & updates](docs/install.md) · [Environment variables](docs/environment-variables.md) · [Keybindings](docs/keybindings.md) · [Themes](docs/theme.md)
+- [Install & updates](docs/install.md) · [Environment variables](docs/environment-variables.md) · [Keybindings](docs/keybindings.md) · [Themes](docs/theme.md) · [UI language](docs/ui-language.md)
 - [Models & providers](docs/models.md) · [Custom providers & multi-account routing](docs/custom-providers-and-multi-account.md) · [Multi-vendor profiles](docs/multi-vendor-profiles.md) · [Auth broker](docs/auth-broker-gateway.md)
 - [Customization authority, import, and trust](docs/customization.md) · [Skills](docs/skills.md) · [Hooks](docs/hooks.md) · [Standalone MCP](docs/standalone-mcp.md) · [Plugin bundles](docs/gjc-plugins.md)
 - [Terminal app integrations: Paseo · Orca · T3 Code](docs/terminal-app-integrations.md)
@@ -415,11 +429,9 @@ retry:
 
 ### Launch-time updates
 
-Interactive startup checks the npm registry for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch. For a recognized Bun global install, use `gjc update` or `bun install -g @gajae-code/coding-agent@latest`. For a recognized Windows npm install, use `gjc update` or the original npm package workflow. For a supported standalone binary installed by the bundled installer, use `gjc update` or rerun the documented platform installer. For a source checkout or `dev:link` executable, update, pull, build, and link through that checkout's original workflow. For unrecognized npm, pnpm, other package-manager installs, or unknown PATH targets, use the original package manager or install method.
+Interactive startup checks GitHub releases for a newer GJC version in the background by default. This check is notify-only and non-mutating: GJC never installs or replaces itself during launch. On a supported platform, `gjc update` downloads and atomically replaces the matching GitHub release binary (package-manager shims are not overwritten). Source checkouts and `dev:link` executables must be updated through that checkout; `gjc update` refuses to self-overwrite them. Unsupported platforms should rerun the documented installer.
 
-Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Registry or network failures are ignored so they do not block startup.
-
-Both the launch-time check and `gjc update` resolve the registry the way npm does — `BUN_CONFIG_REGISTRY` or `npm_config_registry` from the environment, a scoped `@gajae-code:registry` key, then your user and machine-wide `.npmrc`, including the credentials registered for that registry. A mirrored or firewalled network is therefore checked at the same place the update would install from. A `.npmrc` in the current working directory is deliberately ignored, so a repository you have cloned cannot redirect the check or choose the credential it carries. `bunfig.toml` is not read, so a mirror declared only there is still checked against the public registry.
+Run `gjc config set startup.checkUpdate false` to disable the launch-time check. Network failures are ignored so they do not block startup.
 
 ### Good to read together
 

@@ -1,9 +1,18 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { TUI } from "@gajae-code/tui";
+import { Container, Text, TUI } from "@gajae-code/tui";
 import { __loaderPerfCounters, Loader } from "@gajae-code/tui/components/loader";
 import { visibleWidth } from "@gajae-code/tui/utils";
 import { __animationSchedulerTestHooks } from "../src/animation-scheduler";
 import { VirtualTerminal } from "./virtual-terminal";
+
+class CountingTranscript extends Container {
+	renderCount = 0;
+
+	override renderWithViewportAnchors(width: number) {
+		this.renderCount += 1;
+		return super.renderWithViewportAnchors(width);
+	}
+}
 
 const TERMINAL_TRANSPORT_ENV_KEYS = [
 	"SSH_CONNECTION",
@@ -125,6 +134,79 @@ describe("Loader component", () => {
 
 		loader.stop();
 		tui.stop();
+	});
+
+	it("routes layout-scoped updates through requestLayoutRender", () => {
+		const term = new VirtualTerminal(40, 4);
+		const tui = new TUI(term);
+		let fullRequests = 0;
+		let layoutRequests = 0;
+		const realRequestRender = tui.requestRender.bind(tui);
+		const realRequestLayoutRender = tui.requestLayoutRender.bind(tui);
+		tui.requestRender = ((force?: boolean, source?: string) => {
+			if (source === "loader") fullRequests += 1;
+			return realRequestRender(force, source);
+		}) as typeof tui.requestRender;
+		tui.requestLayoutRender = ((source?: string) => {
+			if (source === "loader") layoutRequests += 1;
+			return realRequestLayoutRender(source);
+		}) as typeof tui.requestLayoutRender;
+
+		const loader = new Loader(
+			tui,
+			text => text,
+			text => text,
+			"Working",
+			["|"],
+			{
+				renderScope: "layout",
+			},
+		);
+		expect(fullRequests).toBe(0);
+		expect(layoutRequests).toBe(1);
+
+		loader.setMessage("Still working");
+		expect(fullRequests).toBe(0);
+		expect(layoutRequests).toBe(2);
+
+		loader.stop();
+		tui.stop();
+	});
+
+	it("reuses an unchanged anchored transcript for a layout-scoped Loader update", async () => {
+		const term = new VirtualTerminal(80, 12);
+		const tui = new TUI(term, undefined, { widthSettleMs: 0 });
+		const transcript = new CountingTranscript();
+		for (let index = 0; index < 2_000; index++) transcript.addChild(new Text(`transcript-${index}`, 0, 0));
+		const status = new Container();
+		const loader = new Loader(
+			tui,
+			text => text,
+			text => text,
+			"Working",
+			["|"],
+			{ renderScope: "layout" },
+		);
+		status.addChild(loader);
+		tui.addChild(transcript);
+		tui.addChild(status);
+		tui.setViewportAnchorComponent(transcript);
+		tui.setViewportOutputSource({ identity: "session:test", revision: 0n });
+
+		try {
+			tui.start();
+			await term.waitForRender();
+			expect(transcript.renderCount).toBe(1);
+
+			loader.setMessage("Still working");
+			await term.waitForRender();
+
+			expect(transcript.renderCount).toBe(1);
+			expect(term.getViewport().join("\n")).toContain("Still working");
+		} finally {
+			loader.stop();
+			tui.stop();
+		}
 	});
 
 	it("still requests a render when a time-dependent colorizer changes the composed text", () => {

@@ -24,6 +24,7 @@ import {
 	type ModelManagerOptions,
 	type ModelRefreshStrategy,
 	type ModelRequestTransform,
+	modelSupportsReasoningControl,
 	openaiCodexModelManagerOptions,
 	PROVIDER_DESCRIPTORS,
 	readModelCache,
@@ -37,9 +38,14 @@ import {
 } from "@gajae-code/ai/core";
 import { resolveLoopbackOpenAIBaseUrl } from "@gajae-code/ai/utils/discovery/openai-compatible";
 
-// Sentinel for local-only OAuth token (LM Studio, vLLM) — declared inline to avoid loading
-// any provider module at startup. Must match `DEFAULT_LOCAL_TOKEN` in oauth/lm-studio.ts.
+// Sentinels for local-only OAuth tokens — declared inline to avoid loading provider
+// modules at startup. Must match the provider OAuth modules.
 const DEFAULT_LOCAL_TOKEN = "lm-studio-local";
+const VLLM_DEFAULT_LOCAL_TOKEN = "vllm-local";
+
+function isVllmNoAuthToken(provider: string, apiKey: string | undefined): boolean {
+	return provider === "vllm" && apiKey === VLLM_DEFAULT_LOCAL_TOKEN;
+}
 
 import { registerOAuthProvider, unregisterOAuthProviders } from "@gajae-code/ai/utils/oauth";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@gajae-code/ai/utils/oauth/types";
@@ -103,7 +109,7 @@ function firstPositiveDiscoveryNumber(...values: readonly unknown[]): number | u
 	for (const value of values) {
 		const number =
 			typeof value === "number" ? value : typeof value === "string" && value.trim() ? Number(value) : NaN;
-		if (Number.isFinite(number) && number > 0) return number;
+		if (Number.isSafeInteger(number) && number > 0) return number;
 	}
 	return undefined;
 }
@@ -186,7 +192,7 @@ export const GJC_MODEL_ASSIGNMENT_TARGETS: Record<GjcModelAssignmentTargetId, Gj
 };
 
 export function requiresExplicitThinkingChoice(model: Model, role: GjcModelAssignmentTargetId | null): boolean {
-	if (model.reasoning !== true) return false;
+	if (!modelSupportsReasoningControl(model)) return false;
 	if (
 		model.provider === "openai" ||
 		model.provider === "openai-codex" ||
@@ -936,10 +942,20 @@ function mergeProviderCompat(
 		overrideCompat && "supportsResponsesSessionAffinity" in overrideCompat
 			? overrideCompat.supportsResponsesSessionAffinity
 			: undefined;
+	let protectedMerged = merged;
 	if (baseAffinity === false && overrideAffinity !== undefined) {
-		return { ...merged, supportsResponsesSessionAffinity: false };
+		protectedMerged = { ...protectedMerged, supportsResponsesSessionAffinity: false };
 	}
-	return merged;
+	const baseReasoningEffort =
+		baseCompat && "supportsReasoningEffort" in baseCompat ? baseCompat.supportsReasoningEffort : undefined;
+	const overrideReasoningEffort =
+		overrideCompat && "supportsReasoningEffort" in overrideCompat
+			? overrideCompat.supportsReasoningEffort
+			: undefined;
+	if (baseReasoningEffort === false && overrideReasoningEffort !== undefined) {
+		protectedMerged = { ...protectedMerged, supportsReasoningEffort: false };
+	}
+	return protectedMerged;
 }
 
 function mergeRequestTransform(
@@ -1491,6 +1507,68 @@ export class ModelRegistry {
 		}
 	}
 
+	admitCachedProviderForStoredLiteralCredential(providerId: string, selector: AuthCredentialSelector): boolean {
+		const cachedModels = this.#loadCachedProviderModelsForStoredLiteralCredential(providerId, selector);
+		if (!cachedModels || cachedModels.length === 0) return false;
+
+		this.#suspendRebuild();
+		try {
+			this.#mergeDiscoveredModels(cachedModels);
+			this.#rebuildProviderActivity();
+			this.#modelBindingsApplier.apply();
+			return true;
+		} finally {
+			this.#resumeRebuild();
+		}
+	}
+
+	/** @internal Validate an existing startup model without mutating a caller-supplied registry. */
+	validateModelForStoredLiteralCredential(
+		providerId: string,
+		modelId: string,
+		selector: AuthCredentialSelector,
+	): boolean {
+		if (!this.find(providerId, modelId)) return false;
+		if (this.#resolveStaticModelReference(providerId, modelId)) return true;
+		const cachedModels = this.#loadCachedProviderModelsForStoredLiteralCredential(providerId, selector, false);
+		return cachedModels ? resolveProviderModelReference(providerId, modelId, cachedModels) !== undefined : false;
+	}
+
+	/** @internal Whether startup must establish credential-scoped cache provenance for this exact target. */
+	requiresStoredLiteralCredentialCacheAdmission(providerId: string, modelId: string): boolean {
+		return !this.find(providerId, modelId) || !this.#resolveStaticModelReference(providerId, modelId);
+	}
+
+	#loadCachedProviderModelsForStoredLiteralCredential(
+		providerId: string,
+		selector: AuthCredentialSelector,
+		publishDiscoveryState = true,
+	): Model<Api>[] | undefined {
+		const supportsDiscovery =
+			this.#discoveryManager.providerIds().has(providerId) ||
+			PROVIDER_DESCRIPTORS.some(descriptor => descriptor.providerId === providerId);
+		if (!supportsDiscovery) return undefined;
+		const authEvidence = this.authStorage.getStoredLiteralApiKeyEvidenceGeneration(providerId, selector);
+		if (!authEvidence) return undefined;
+		return [
+			...this.#loadCachedStandardProviderModels(providerId, authEvidence),
+			...this.#loadCachedDiscoverableModels(providerId, authEvidence, publishDiscoveryState),
+		];
+	}
+
+	#resolveStaticModelReference(providerId: string, modelId: string): Model<Api> | undefined {
+		const normalizedProvider = providerId.toLowerCase();
+		const matchingActivity = [...this.#providerActivity.entries()].filter(
+			([candidateProvider]) => candidateProvider.toLowerCase() === normalizedProvider,
+		);
+		if (matchingActivity.length !== 1) return undefined;
+		const [canonicalProvider, activity] = matchingActivity[0];
+		const staticModels = this.#models.filter(
+			model => model.provider === canonicalProvider && activity.staticModelIds.has(model.id),
+		);
+		return resolveProviderModelReference(providerId, modelId, staticModels);
+	}
+
 	#getStaticLoadEnvironmentFingerprint(): string {
 		const providerBaseUrlEnvKeys = new Set(
 			[
@@ -1601,11 +1679,7 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive refresh() cycles
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(
-			this.#applyRuntimeProviderOverrides(withModelOverrides),
-			undefined,
-			this.#codexContextWindowOverrides,
-		);
+		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
 		this.#rebuildProviderActivity();
 		this.#rebuildCanonicalIndex();
 		this.#lastStaticLoadMtime = this.#modelsConfigFile.getMtimeMs();
@@ -1750,16 +1824,17 @@ export class ModelRegistry {
 		return merged;
 	}
 
-	#loadCachedStandardProviderModels(): Model<Api>[] {
+	#loadCachedStandardProviderModels(providerId?: string, authEvidence?: string): Model<Api>[] {
 		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(provider => provider.provider));
 		const cachedModels: Model<Api>[] = [];
 		for (const descriptor of PROVIDER_DESCRIPTORS) {
+			if (providerId && descriptor.providerId !== providerId) continue;
 			if (configuredDiscoveryProviders.has(descriptor.providerId)) {
 				continue;
 			}
 			const cache = readModelCache<Api>(descriptor.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 			const expectedProvenance = fingerprintDescriptorDiscoveryProvenance(
-				this.#getProviderEvidenceGeneration(descriptor.providerId),
+				authEvidence ?? this.#getProviderEvidenceGeneration(descriptor.providerId),
 				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? ""),
 			);
 			if (
@@ -1784,22 +1859,29 @@ export class ModelRegistry {
 		return cachedModels;
 	}
 
-	#loadCachedDiscoverableModels(): Model<Api>[] {
+	#loadCachedDiscoverableModels(
+		providerId?: string,
+		authEvidence?: string,
+		publishDiscoveryState = true,
+	): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
 		for (const providerConfig of this.#discoveryManager.providers) {
+			if (providerId && providerConfig.provider !== providerId) continue;
 			let expectedProvenance: string | undefined;
 			try {
 				const effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 				expectedProvenance = fingerprintConfiguredDiscoveryRequestShape(
 					effectiveConfig,
-					this.#getProviderEvidenceGeneration(effectiveConfig.provider),
+					authEvidence ?? this.#getProviderEvidenceGeneration(effectiveConfig.provider),
 					this.#normalizeDiscoveryEvidenceEndpoint(effectiveConfig.baseUrl ?? ""),
 				);
 			} catch {
 				// A context that cannot be fully derived cannot vouch for a cache row.
 				expectedProvenance = undefined;
 			}
-			const models = this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance);
+			const models = publishDiscoveryState
+				? this.#discoveryManager.loadCached(providerConfig, this.#cacheDbPath, expectedProvenance)
+				: this.#readCachedDiscoverableModels(providerConfig, expectedProvenance);
 			// Cache rows persist sanitized transport metadata (no headers), so a
 			// rebooted registry re-derives the provider transport override from the
 			// same source the live publish path uses — mirroring the cached
@@ -1822,6 +1904,22 @@ export class ModelRegistry {
 		return cachedModels;
 	}
 
+	#readCachedDiscoverableModels(
+		providerConfig: DiscoveryProviderConfig,
+		expectedProvenance: string | undefined,
+	): Model<Api>[] {
+		const cache = readModelCache<Api>(providerConfig.provider, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
+		if (
+			cache === null ||
+			cache.dynamicModelIds === undefined ||
+			expectedProvenance === undefined ||
+			cache.dynamicModelProvenance !== expectedProvenance
+		) {
+			return [];
+		}
+		return applyFinalCodexGpt56ContextCap(cache.models);
+	}
+
 	#applyProviderCompat(compat: Model<Api>["compat"] | undefined, models: Model<Api>[]): Model<Api>[] {
 		if (!compat) return models;
 		return models.map(model => ({ ...model, compat: mergeCompat(model.compat, compat) }));
@@ -1831,7 +1929,9 @@ export class ModelRegistry {
 		const liveBaseUrl =
 			providerConfig.discovery.type === "openai-models-list" ||
 			providerConfig.discovery.type === "lm-studio" ||
-			providerConfig.discovery.type === "omlx"
+			providerConfig.discovery.type === "omlx" ||
+			providerConfig.discovery.type === "vllm" ||
+			providerConfig.discovery.type === "sglang"
 				? this.#normalizeOpenAIModelsListBaseUrl(
 						this.#getProviderBaseUrlForDiscovery(providerConfig.provider) ?? providerConfig.baseUrl,
 					)
@@ -2438,6 +2538,10 @@ export class ModelRegistry {
 			}
 			return;
 		}
+		this.#mergeDiscoveredModels(discovered);
+	}
+
+	#mergeDiscoveredModels(discovered: readonly Model<Api>[]): void {
 		const discoveredModels = this.#applyHardcodedModelPolicies(
 			discovered.map(model =>
 				mergeDiscoveredModel(
@@ -2452,11 +2556,7 @@ export class ModelRegistry {
 		// Merge runtime extension models so they survive online discovery completion
 		const combined = this.#mergeCustomModels(withConfigModels, this.#runtimeModelOverlays);
 		const withModelOverrides = this.#applyModelOverrides(combined, this.#modelOverrides);
-		this.#models = applyFinalCodexGpt56ContextCap(
-			this.#applyRuntimeProviderOverrides(withModelOverrides),
-			undefined,
-			this.#codexContextWindowOverrides,
-		);
+		this.#models = this.#finalizeModels(this.#applyRuntimeProviderOverrides(withModelOverrides));
 		this.#rebuildCanonicalIndex();
 	}
 
@@ -2522,6 +2622,11 @@ export class ModelRegistry {
 		}
 		const effectiveProviderConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 		const endpoint = this.#normalizeDiscoveryEvidenceEndpoint(effectiveProviderConfig.baseUrl ?? "");
+		const allowsKeylessLocalDiscovery =
+			(provider !== "vllm" && provider !== "sglang") ||
+			(isAuthenticated(preflightApiKey) && !isVllmNoAuthToken(provider, preflightApiKey)) ||
+			effectiveProviderConfig.baseUrl === undefined ||
+			resolveLoopbackOpenAIBaseUrl(effectiveProviderConfig.baseUrl, "") === effectiveProviderConfig.baseUrl;
 		if (!isCurrentPreflight() || preflightStale) {
 			return {
 				provider: effectiveProviderConfig.provider,
@@ -2537,6 +2642,17 @@ export class ModelRegistry {
 			return {
 				provider: effectiveProviderConfig.provider,
 				current: false,
+				models: [],
+				authGeneration: this.#getProviderEvidenceGeneration(provider, preflightApiKey),
+				configurationGeneration: preflightAuthConfigurationGeneration,
+				endpoint,
+				fetched: false,
+			};
+		}
+		if (!allowsKeylessLocalDiscovery) {
+			return {
+				provider: effectiveProviderConfig.provider,
+				current: true,
 				models: [],
 				authGeneration: this.#getProviderEvidenceGeneration(provider, preflightApiKey),
 				configurationGeneration: preflightAuthConfigurationGeneration,
@@ -2670,6 +2786,8 @@ export class ModelRegistry {
 				return this.#discoverLlamaCppModels(providerConfig, apiKey);
 			case "lm-studio":
 			case "omlx":
+			case "vllm":
+			case "sglang":
 			case "openai-models-list":
 				return this.#discoverOpenAIModelsList(providerConfig, apiKey);
 			case "models-dev":
@@ -2683,6 +2801,13 @@ export class ModelRegistry {
 	): Promise<Model<Api>[]> {
 		// Skip providers already handled by configured discovery (e.g. user-configured ollama with discovery.type)
 		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(p => p.provider));
+		// An explicit static vLLM/SGLang provider owns its catalog. Unlike other
+		// standard descriptors, vLLM and SGLang also support credentialless
+		// implicit discovery, so leaving them eligible here would probe and merge
+		// models the user did not request. Explicit discovery remains available
+		// through discovery.type.
+		if (this.#configuredProviderIds.has("vllm")) configuredDiscoveryProviders.add("vllm");
+		if (this.#configuredProviderIds.has("sglang")) configuredDiscoveryProviders.add("sglang");
 		const managerOptions = (await this.#collectBuiltInModelManagerOptions(configuredDiscoveryProviders)).filter(
 			entry => (providerFilter ? providerFilter.has(entry.options.providerId) : true),
 		);
@@ -2767,15 +2892,21 @@ export class ModelRegistry {
 		for (let i = 0; i < standardProviderDescriptors.length; i++) {
 			const descriptor = standardProviderDescriptors[i];
 			const { apiKey, authGeneration } = standardProviderCredentials[i];
+			const requestApiKey = isVllmNoAuthToken(descriptor.providerId, apiKey) ? undefined : apiKey;
+			const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId);
+			const allowsKeylessDiscovery =
+				descriptor.allowUnauthenticated &&
+				((descriptor.providerId !== "vllm" && descriptor.providerId !== "sglang") ||
+					baseUrl === undefined ||
+					resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl);
 			if (
 				authGeneration !== undefined &&
 				authGeneration === this.#getProviderEvidenceGeneration(descriptor.providerId, apiKey) &&
-				(isAuthenticated(apiKey) || descriptor.allowUnauthenticated)
+				(isAuthenticated(requestApiKey) || allowsKeylessDiscovery)
 			) {
-				const baseUrl = this.#getProviderBaseUrlForDiscovery(descriptor.providerId);
 				options.push({
 					options: descriptor.createModelManagerOptions({
-						apiKey: isAuthenticated(apiKey) ? apiKey : undefined,
+						apiKey: isAuthenticated(requestApiKey) ? requestApiKey : undefined,
 						baseUrl,
 					}),
 					authGeneration,
@@ -3182,6 +3313,7 @@ export class ModelRegistry {
 					contextWindow: toPositiveNumberOrUndefined(limit.context) ?? UNK_CONTEXT_WINDOW,
 					maxTokens: toPositiveNumberOrUndefined(limit.output) ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
+					compat: providerConfig.compat,
 				}),
 			);
 		}
@@ -3206,13 +3338,24 @@ export class ModelRegistry {
 			(this.#isCredentiallessProvider(providerConfig.provider)
 				? kNoAuth
 				: await this.authStorage.getApiKey(providerConfig.provider, undefined, { baseUrl }));
-		if (apiKey && apiKey !== DEFAULT_LOCAL_TOKEN && apiKey !== kNoAuth) {
+		if (
+			apiKey &&
+			apiKey !== DEFAULT_LOCAL_TOKEN &&
+			!isVllmNoAuthToken(providerConfig.provider, apiKey) &&
+			apiKey !== kNoAuth
+		) {
 			requestHeaders.Authorization = `Bearer ${apiKey}`;
 		}
 
+		const hardenedLocalDiscovery =
+			(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang") &&
+			resolveLoopbackOpenAIBaseUrl(baseUrl, "") === baseUrl;
 		const response = await fetch(modelsUrl, {
 			headers: requestHeaders,
-			signal: AbortSignal.timeout(5_000),
+			...(providerConfig.discovery.type === "vllm" || providerConfig.discovery.type === "sglang"
+				? { redirect: "error" as const }
+				: {}),
+			signal: AbortSignal.timeout(hardenedLocalDiscovery ? 500 : 5_000),
 		});
 		if (!response.ok) {
 			if (response.status === 401 || response.status === 403) {
@@ -3265,18 +3408,20 @@ export class ModelRegistry {
 							UNK_MAX_TOKENS,
 						) ?? UNK_MAX_TOKENS,
 					headers: providerConfig.headers,
-					compat: {
-						...referenceModel?.compat,
-						supportsStore: false,
-						supportsDeveloperRole: false,
-						supportsReasoningEffort: providerConfig.provider === "omlx",
-						...(providerConfig.provider === "omlx"
-							? {
-									thinkingFormat: "qwen-chat-template" as const,
-									reasoningContentField: "reasoning_content" as const,
-								}
-							: {}),
-					},
+					compat: mergeCompat(
+						{
+							supportsStore: false,
+							supportsDeveloperRole: false,
+							supportsReasoningEffort: providerConfig.provider === "omlx",
+							...(providerConfig.provider === "omlx"
+								? {
+										thinkingFormat: "qwen-chat-template" as const,
+										reasoningContentField: "reasoning_content" as const,
+									}
+								: {}),
+						},
+						mergeProviderCompat(providerConfig.compat, referenceModel?.compat),
+					),
 					...(providerConfig.provider === "omlx"
 						? {
 								reasoning: true,
@@ -3475,16 +3620,21 @@ export class ModelRegistry {
 		};
 	}
 	#applyRuntimeProviderOverride(model: Model<Api>, override: ProviderOverride): Model<Api> {
-		const withTransportOverride = this.#applyProviderTransportOverride(model, override);
+		const withTransportOverride = this.#applyProviderTransportOverride(
+			this.#restoreDeclaredThinking(model),
+			override,
+		);
 		const sanitizedBaseUrl = this.#stripUrlUserinfo(withTransportOverride.baseUrl);
 		const sanitizedTransport: Model<Api> =
 			sanitizedBaseUrl === withTransportOverride.baseUrl
 				? withTransportOverride
 				: { ...withTransportOverride, ...(sanitizedBaseUrl === undefined ? {} : { baseUrl: sanitizedBaseUrl }) };
 		const modelCompat = this.#modelOverrides.get(model.provider.toLowerCase())?.get(model.id.toLowerCase())?.compat;
-		return modelCompat
-			? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
-			: sanitizedTransport;
+		return enrichModelThinking(
+			modelCompat
+				? { ...sanitizedTransport, compat: mergeCompat(sanitizedTransport.compat, modelCompat) }
+				: sanitizedTransport,
+		);
 	}
 	#applyRuntimeProviderOverrides(models: Model<Api>[]): Model<Api>[] {
 		if (this.#runtimeProviderOverrides.size === 0) return models;
@@ -3493,6 +3643,24 @@ export class ModelRegistry {
 			if (!override) return model;
 			return this.#applyRuntimeProviderOverride(model, override);
 		});
+	}
+	#finalizeModels(models: Model<Api>[]): Model<Api>[] {
+		return applyFinalCodexGpt56ContextCap(
+			models.map(model => enrichModelThinking({ ...this.#restoreDeclaredThinking(model) })),
+			undefined,
+			this.#codexContextWindowOverrides,
+		);
+	}
+	#restoreDeclaredThinking(model: Model<Api>): Model<Api> {
+		const overrideThinking = this.#modelOverrides
+			.get(model.provider.toLowerCase())
+			?.get(model.id.toLowerCase())?.thinking;
+		if (overrideThinking !== undefined) return { ...model, thinking: overrideThinking as ThinkingConfig };
+		const overlay = [...this.#runtimeModelOverlays, ...this.#customModelOverlays].find(
+			candidate =>
+				candidate.provider === model.provider && candidate.id === model.id && candidate.thinking !== undefined,
+		);
+		return overlay?.thinking === undefined ? model : { ...model, thinking: overlay.thinking };
 	}
 	/**
 	 * Collects explicit user `contextWindow` overrides keyed by provider + model
@@ -4180,7 +4348,9 @@ export class ModelRegistry {
 							? `${this.#normalizeOllamaBaseUrl(baseUrl)}/v1`
 							: discoveryType === "openai-models-list" ||
 									discoveryType === "lm-studio" ||
-									discoveryType === "omlx"
+									discoveryType === "omlx" ||
+									discoveryType === "vllm" ||
+									discoveryType === "sglang"
 								? this.#normalizeOpenAIModelsListBaseUrl(baseUrl)
 								: (baseUrl ?? ""),
 					);
@@ -4571,22 +4741,14 @@ export class ModelRegistry {
 			if (config.oauth?.modifyModels) {
 				const credential = this.authStorage.getOAuthCredential(providerName);
 				if (credential) {
-					this.#models = applyFinalCodexGpt56ContextCap(
-						config.oauth.modifyModels(withModelOverrides, credential),
-						undefined,
-						this.#codexContextWindowOverrides,
-					);
+					this.#models = this.#finalizeModels(config.oauth.modifyModels(withModelOverrides, credential));
 					this.#rebuildCanonicalIndex();
 					this.#rebuildProviderActivity();
 					return;
 				}
 			}
 
-			this.#models = applyFinalCodexGpt56ContextCap(
-				withModelOverrides,
-				undefined,
-				this.#codexContextWindowOverrides,
-			);
+			this.#models = this.#finalizeModels(withModelOverrides);
 			this.#rebuildCanonicalIndex();
 			this.#rebuildProviderActivity();
 			return;

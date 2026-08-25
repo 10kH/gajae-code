@@ -76,6 +76,20 @@ describe("runtime preferred credential selector", () => {
 		expect(await storage.markUsageLimitReached("anthropic", "session-b", { retryAfterMs: 60_000 })).toBe(false);
 	});
 
+	test("all-row quota exhaustion exposes the earliest unblock instant", async () => {
+		const { storage } = await createStorage();
+		await storage.getApiKey("anthropic", "session-c");
+		const before = Date.now();
+		expect(await storage.markUsageLimitReached("anthropic", "session-c", { retryAfterMs: 45_000 })).toBe(true);
+		expect(await storage.getApiKey("anthropic", "session-c")).toBe("token-test-fallback");
+		expect(await storage.markUsageLimitReached("anthropic", "session-c", { retryAfterMs: 90_000 })).toBe(false);
+		const retryableAt = storage.getEarliestUnblockAt("anthropic", "session-c");
+		expect(retryableAt).toBeDefined();
+		expect(retryableAt!).toBeGreaterThanOrEqual(before + 45_000 - 250);
+		expect(retryableAt!).toBeLessThan(before + 90_000);
+		expect(storage.getEarliestUnblockAt("openai-codex")).toBeUndefined();
+	});
+
 	test("hard selector remains pinned and invalid preferred selectors fail closed", async () => {
 		const { storage, rows } = await createStorage();
 		storage.setRuntimeCredentialSelector("anthropic", { kind: "id", value: String(rows[0]!.id) });

@@ -50,6 +50,60 @@ gjc setup hermes \
 ```
 
 The runtime accepts only the literal selectors `gjc` and `gjc --worktree [name]`. It rejects local wrappers, shell syntax, tmux flags, and model/provider flags before creating a session. Existing setup configs that contain a legacy explicit `--session-command` must be changed to one of those selectors; provider and model resolution remains normal GJC configuration, not coordinator command injection.
+### Custom or wrapper launch command
+
+`--gjc-command` accepts the full command the controller execs (#4877). It is tokenized, never evaluated by a shell:
+
+- Omitted, or a single token, names the executable only: `--gjc-command gjc` (the default) or `--gjc-command /opt/gjc` renders `command: gjc` / `command: /opt/gjc` with GJC-owned `args: [mcp-serve, coordinator]`.
+- Multiple tokens are the full server command, split quote-aware (single/double quotes, backslash escapes) into controller argv and rendered verbatim with nothing appended: `--gjc-command "python3 /tmp/gjc-wrapper.py"` renders `command: python3`, `args: [/tmp/gjc-wrapper.py]`. A wrapper that already execs `gjc mcp-serve coordinator` — the historical workaround target — is emitted exactly as given, so it never receives a doubled argv tail. Spell the whole invocation to keep the tail: `--gjc-command "env WRAPPER=1 gjc mcp-serve coordinator"`.
+- Unbalanced quotes are rejected with an explicit error.
+
+```
+mcp_servers:
+  gjc_coordinator:
+    command: python3
+    args: [/tmp/gjc-wrapper.py]
+```
+
+## Agent directory override
+
+`GJC_COORDINATOR_MCP_STATE_ROOT` selects coordinator durable state (session/turn/question journals, projections). It is **not** the broker selector: sessions started by the bridge use the GJC agent directory (`GJC_CODING_AGENT_DIR`; broker, lifecycle ledger, session index, `config.yml` / `models.yml`), and the spawned `gjc` process inherits it from the MCP server env. Pointing only `STATE_ROOT` at a separate directory leaves sessions on the default `~/.gjc/agent` broker.
+
+Render the agent-directory override next to the state root with an absolute path:
+
+```bash
+gjc setup hermes \
+  --root /path/to/repo \
+  --state-root /var/lib/gjc/hermes-state \
+  --coding-agent-dir /var/lib/gjc/hermes-agent
+```
+
+The rendered block then carries both keys as independent values:
+
+```bash
+export GJC_COORDINATOR_MCP_STATE_ROOT="/var/lib/gjc/hermes-state"
+export GJC_CODING_AGENT_DIR="/var/lib/gjc/hermes-agent"
+```
+
+`--coding-agent-dir` requires an absolute path (Windows accepts `C:\...` and UNC `\\server\share\...`) and refuses the home directory, the account home, and the filesystem root, the same way `--root` does. On `--install` of a GJC-managed block, an existing `GJC_CODING_AGENT_DIR` is preserved unless `--coding-agent-dir` is passed, which overrides it explicitly; the value participates in the managed setup signature, so `--check` detects drift.
+
+### MCP client timeouts (#4878)
+
+The generated block writes `timeout: 180` and `connect_timeout: 60` (whole seconds). These are the host MCP client's per-call budgets — how long the controller waits for one `gjc_coordinator_*` tool call to return. They are **not** a GJC turn deadline, and not the coordinator per-call caps (`gjc_coordinator_watch_events` `timeout_ms` up to 30000 ms; `gjc_coordinator_await_turn` bounded at 30 minutes). Poll again instead of raising the client timeout.
+
+Tune them explicitly:
+
+```bash
+gjc setup hermes --root /path/to/repo --timeout 900 --connect-timeout 30 --install
+```
+
+Both flags take whole seconds in the range 1–3600; anything else is rejected with exit code 2. Defaults stay 180/60 when the flags are omitted and no installed value exists.
+
+`--install` preserves existing numeric `timeout` / `connect_timeout` values from a block carrying the GJC managed markers when the corresponding flag is omitted, per field: a hand-set `timeout: 900` survives the next install instead of being reset to 180. An explicit flag overrides the installed value. Render-only previews always show flag-or-default values, since there is no installed target to preserve from. The managed setup signature covers the GJC-owned plumbing (command, args, env) and deliberately does not pin these two knobs, so hand-tuning them keeps the block managed and `gjc setup hermes --check` does not report timeout drift.
+
+Upgrading from a pre-#4878 install (whose signature included the timeout fields): a block whose stored content still matches its stored signature is still recognized as managed and is re-signed on the next `--install` (`--check` reports its signature as stale until then). A pre-#4878 block whose timeout was hand-tuned no longer matches either digest, so plain `--install` refuses with the stale-signature error pointing at `--force`; `--force` adopts the managed block and preserves the tuned values. `--force` never discards installed timeout values — pass `--timeout 180 --connect-timeout 60` to reset them explicitly.
+
+`--profile-dir` installs also write the operator instructions file, whose digest pins its exact content. A release that changes that template (as this one does) therefore requires one `--force` for profiles holding an older render; the installed numeric timeout values are preserved across that upgrade too.
 
 Run a non-mutating setup smoke check with:
 
@@ -117,7 +171,7 @@ Missing namespace never widens into global session enumeration.
 
 Read tools:
 
-- `gjc_coordinator_list_sessions`
+- `gjc_coordinator_list_sessions` — enumerates GJC sessions the broker discovered under the allowed roots, which is a superset of the sessions this bridge can drive. Each entry reports `registered`; the other session-scoped tools resolve through the coordinator projection and refuse `registered: false` entries — `read_status`, `read_tail`, and `send_prompt` answer `not_found`, and `stop_session` reports `unknown_session`. Filter on it rather than discovering the difference through failed calls, and use `gjc_coordinator_register_session` to adopt one deliberately.
 - `gjc_coordinator_read_status`
 - `gjc_coordinator_read_tail`
 - `gjc_coordinator_list_questions`

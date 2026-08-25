@@ -294,6 +294,11 @@ describe("SessionLifecycleService", () => {
 				cwd: "/repo",
 				endpoint: { url: "ws://127.0.0.1:9999", token: "secret" },
 				token: "top-level-secret",
+				pid: 1234,
+				processIncarnation: "linux:1234",
+				hostIncarnation: "linux:1234",
+				endpointMtimeMs: 1234,
+				lifecycleRequestId: "internal-request-id",
 			},
 		});
 		const created = await service.create({ actor, capability: "session.create", requestKey: "create", target });
@@ -309,6 +314,11 @@ describe("SessionLifecycleService", () => {
 				cwd: "/repo",
 				endpoint: { url: "ws://127.0.0.1:9999", token: "secret" },
 				token: "top-level-secret",
+				pid: 1234,
+				processIncarnation: "linux:1234",
+				hostIncarnation: "linux:1234",
+				endpointMtimeMs: 1234,
+				lifecycleRequestId: "internal-request-id",
 			},
 		};
 		const resumed = await service.resume({

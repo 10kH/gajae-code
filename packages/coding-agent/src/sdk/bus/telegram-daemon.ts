@@ -273,6 +273,8 @@ export const ASK_CONTROLS_CAPABILITY = "ask_controls_v1";
 export const TOOL_ACTIVITY_CAPABILITY = "tool_activity_v2";
 /** Receive-only compatibility capability for pre-v2 hosts. */
 export const LEGACY_TOOL_ACTIVITY_CAPABILITY = "tool_activity_v1";
+/** Opts notification adapters into positioned-only delivery for matching live effects. */
+export const POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY = "positioned_notification_effects_v1";
 type ToolActivityCapability = "v1" | "v2";
 
 function negotiateToolActivityCapability(
@@ -543,17 +545,27 @@ function splitTelegramPlainText(text: string, max = TELEGRAM_MESSAGE_LIMIT): str
 function topicRenameApplied(response: unknown): boolean {
 	return !!response && typeof response === "object" && (response as { ok?: unknown }).ok === true;
 }
+function isDefinitiveMissingTopicResponse(response: unknown): boolean {
+	if (!response || typeof response !== "object") return false;
+	const result = response as { ok?: unknown; error_code?: unknown; description?: unknown };
+	if (result.ok !== false || result.error_code !== 400 || typeof result.description !== "string") return false;
+	const description = result.description.trim().replace(/^Bad Request:\s*/i, "");
+	return /^(?:FORUM_TOPIC_NOT_FOUND|TOPIC_NOT_FOUND|THREAD_NOT_FOUND|TOPIC_ID_INVALID|message thread not found)$/i.test(
+		description,
+	);
+}
 function topicArchiveSettled(response: unknown): boolean {
 	if (!response || typeof response !== "object") return false;
 	const result = response as { ok?: unknown; result?: unknown; error_code?: unknown; description?: unknown };
 	if (result.ok === true && result.result === true) return true;
+	if (isDefinitiveMissingTopicResponse(response)) return true;
 	if (result.ok !== false || result.error_code !== 400 || typeof result.description !== "string") return false;
 	const description = result.description.trim();
 	// TOPIC_ID_INVALID is Telegram's definitive answer for a topic that was
 	// already deleted (observed from editForumTopic/deleteForumTopic against a
 	// user-deleted private-chat topic); retrying it can never succeed.
 	// FORUM_TOPIC_NOT_FOUND covers the equivalent 400 for supergroup topics.
-	return /^(?:Bad Request: )?(?:FORUM_TOPIC_NOT_FOUND|TOPIC_NOT_FOUND|THREAD_NOT_FOUND|TOPIC_ID_INVALID|topic (?:already|is already) closed|message thread (?:not found|is not modified))$/i.test(
+	return /^(?:Bad Request: )?(?:topic (?:already|is already) closed|message thread is not modified)$/i.test(
 		description,
 	);
 }
@@ -2089,8 +2101,8 @@ export async function acquireDaemonOwnership(input: {
 	const ownerId =
 		input.ownerId ?? input.randomId?.() ?? `${pid}-${now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
-	// Generation is inventory-only: a lower servingEpoch triggers convergence,
-	// while same-epoch cross-generation owners attach.
+	// Exact current-generation owners attach (isCurrentCompatibleOwner); lower
+	// serving epochs and older operational generations converge through reload.
 	const attachDecision = (
 		snapshot: OwnerFreshnessSnapshot,
 	):
@@ -2136,6 +2148,9 @@ export async function acquireDaemonOwnership(input: {
 		// A physical owner that cannot prove current compatibility is never safe to
 		// attach. A reload handoff additionally requires a fresh heartbeat: a stale
 		// record must remain blocked rather than authorizing a signal to its PID.
+		// Older operational generations are not attach-compatible even when their
+		// serving epoch is unchanged, but a fully-provenanced owner may still be
+		// replaced through the controlled reload path.
 		if (
 			isFreshLiveOwner({
 				state,
@@ -2147,7 +2162,8 @@ export async function acquireDaemonOwnership(input: {
 				effectiveHeartbeatAt: snapshot.effectiveHeartbeatAt,
 			}) &&
 			(state.version !== DAEMON_VERSION ||
-				((state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH &&
+				(((state.servingEpoch === undefined ? 1 : state.servingEpoch) < SERVING_EPOCH ||
+					(state.generation !== undefined && state.generation < DAEMON_GENERATION)) &&
 					isSignalableMatchingOwner({
 						state,
 						tokenFingerprint: input.tokenFingerprint,
@@ -2688,7 +2704,7 @@ async function bindProvisionalDaemonPid(input: {
 	}
 }
 
-/** Wait for a matching compatible owner to publish a ready state. Readiness is serving-epoch gated (same-epoch cross-generation owners attach, per isCurrentCompatibleOwner); generation is inventory-only here. Mutation paths still require exact current-generation equality. */
+/** Wait for a matching compatible owner to publish a ready state. Attach requires exact current-generation and serving-epoch equality (per isCurrentCompatibleOwner); a stale-generation owner is refused for attachment but may be replaced through the controlled reload path when it is fresh and signalable. Mutation paths require the same exact-generation equality. */
 export async function waitForTelegramDaemonReady(input: {
 	settings: Settings;
 	ownerId?: string;
@@ -4198,6 +4214,13 @@ interface BotApiCallResult {
 	response: unknown;
 	outcome: BotApiCallOutcome;
 }
+type TopicAdoptionPickerOutcome = "sent" | "topic_missing" | "retry";
+
+function classifyTopicAdoptionPickerResult(result: BotApiCallResult): TopicAdoptionPickerOutcome {
+	if (result.outcome.kind === "accepted") return "sent";
+	if (result.outcome.kind === "rejected" && isDefinitiveMissingTopicResponse(result.response)) return "topic_missing";
+	return "retry";
+}
 function createBotApiAdapter(
 	call: (
 		method: string,
@@ -5240,6 +5263,7 @@ export class TelegramNotificationDaemon {
 					ASK_SELECTED_ACK_CAPABILITY,
 					TOOL_ACTIVITY_CAPABILITY,
 					LEGACY_TOOL_ACTIVITY_CAPABILITY,
+					POSITIONED_NOTIFICATION_EFFECTS_CAPABILITY,
 					"ephemeral_turn_v1",
 				],
 			});
@@ -11307,13 +11331,24 @@ export class TelegramNotificationDaemon {
 				return "retry";
 			}
 		}
-		if (!(await this.#renderAdoptionPicker(threadId, updateId))) return "retry";
+		const pickerOutcome = await this.#renderAdoptionPicker(threadId, updateId);
+		if (pickerOutcome === "retry") return "retry";
+		if (pickerOutcome === "topic_missing" && pendingTopic.chatId === String(this.opts.chatId)) {
+			try {
+				await this.#adoptionIntents.removePendingTopic(threadId);
+			} catch (error) {
+				logger.warn(
+					`notifications: failed to remove deleted pending user topic: ${sanitizeDiagnostic(String(error), this.opts.botToken)}`,
+				);
+				return "retry";
+			}
+		}
 		await this.rememberSeenUpdateId(updateId);
 		return "consumed";
 	}
 
 	/** Render the top-level folder source choices for a user-created topic. */
-	async #renderAdoptionPicker(threadId: number, updateId: number): Promise<boolean> {
+	async #renderAdoptionPicker(threadId: number, updateId: number): Promise<TopicAdoptionPickerOutcome> {
 		const providerRequestKey = this.#providerRequestKey(updateId, `topic:${threadId}`);
 		const chatId = String(this.opts.chatId);
 		const choices: Array<{ label: string; action: TopicPickerAction }> = [
@@ -11331,7 +11366,7 @@ export class TelegramNotificationDaemon {
 			}),
 		}));
 		try {
-			const response = await this.botApi.call(
+			const result = await this.callBotApiClassified(
 				"sendMessage",
 				{
 					chat_id: this.opts.chatId,
@@ -11343,15 +11378,15 @@ export class TelegramNotificationDaemon {
 				},
 				{ noRetry: true },
 			);
-			if (!response || typeof response !== "object" || (response as { ok?: unknown }).ok !== true) {
+			const outcome = classifyTopicAdoptionPickerResult(result);
+			if (outcome !== "sent") {
 				for (const choice of aliases) this.#adoptionPickerAliases.delete(choice.alias);
-				return false;
 			}
-			return true;
+			return outcome;
 		} catch {
 			for (const choice of aliases) this.#adoptionPickerAliases.delete(choice.alias);
 			logger.warn("notifications: failed to send topic-adoption picker keyboard");
-			return false;
+			return "retry";
 		}
 	}
 

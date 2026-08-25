@@ -1,30 +1,34 @@
 /**
  * Update CLI command handler.
  *
- * Handles `gjc update` to check for and install updates.
- * Uses bun if available, otherwise downloads binary from GitHub releases.
+ * Handles `gjc update` to check for and install standalone GitHub release
+ * binaries. Package-manager installs are migrated to a user binary path
+ * rather than overwritten. Source checkouts and dev-links are never replaced.
  */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { pipeline } from "node:stream/promises";
-import { $which, APP_NAME, isEnoent, VERSION } from "@gajae-code/utils";
+import { $which, APP_NAME, isCompiledBinary, isEnoent, VERSION } from "@gajae-code/utils";
 import { $ } from "bun";
 import chalk from "chalk";
 import { Settings } from "../config/settings";
-import { distTagForChannel, isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
+import { isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
 import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
 import { theme } from "../modes/theme/theme";
 import { getNotificationConfig, type NotificationProvider, resolveNotificationProvider } from "../sdk/bus/config";
-import {
-	DEFAULT_NPM_REGISTRY,
-	fetchLatestPackageVersion,
-	type Installer,
-	type NpmRegistryLookupOptions,
-} from "../utils/npm-registry";
 import { runDaemonCommand } from "./daemon-cli";
+import {
+	fetchGithubChannelRelease,
+	GITHUB_RELEASE_DOWNLOAD_ORIGIN,
+	type GithubReleaseLookupOptions,
+	isSafeReleaseTag,
+	RELEASE_REPO,
+	verifyDownloadedBinaryChecksum,
+	versionFromTag,
+} from "./github-release";
 import { runNotifyCommand } from "./notify-cli";
 
-const RELEASE_REPO = "Yeachan-Heo/gajae-code";
 const PACKAGE = "@gajae-code/coding-agent";
 const NPM_WRAPPER_PACKAGE = "gajae-code";
 const NPM_MANAGED_PACKAGES = [NPM_WRAPPER_PACKAGE, PACKAGE] as const;
@@ -162,7 +166,8 @@ export type PackageManagerTarget = { manager: "npm"; packageName: string };
 export type UpdateTarget =
 	| { method: "bun" }
 	| { method: "npm"; packageName: string }
-	| { method: "binary"; path: string };
+	| { method: "binary"; path: string }
+	| { method: "migrate"; path: string; previousPath?: string };
 
 type PathPlatform = NodeJS.Platform;
 type PackageExists = (packageName: string, packageRoot: string) => boolean;
@@ -217,67 +222,143 @@ export function resolveNpmManagedTargetForTest(
 ): PackageManagerTarget | undefined {
 	return resolveNpmManagedTarget(ompPath, platform, packageExists);
 }
+function readPackageName(packageJsonPath: string): string | undefined {
+	try {
+		const parsed: unknown = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
+		if (typeof parsed !== "object" || parsed === null || !("name" in parsed)) return undefined;
+		const name = (parsed as { name?: unknown }).name;
+		return typeof name === "string" ? name : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function findGajaeCodeRepoRoot(startDir: string): string | undefined {
+	let current = path.resolve(startDir);
+	while (true) {
+		if (
+			fs.existsSync(path.join(current, ".git")) &&
+			readPackageName(path.join(current, "package.json")) === "gajae-code"
+		) {
+			return current;
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return undefined;
+		current = parent;
+	}
+}
+
+function isProtectedSourcePath(filePath: string): boolean {
+	const real = tryRealpath(filePath) ?? path.resolve(filePath);
+	return findGajaeCodeRepoRoot(path.dirname(real)) !== undefined;
+}
+
+function fileStartsWithShebang(filePath: string): boolean {
+	try {
+		const fd = fs.openSync(filePath, "r");
+		try {
+			const buf = Buffer.alloc(2);
+			const read = fs.readSync(fd, buf, 0, 2, 0);
+			return read >= 2 && buf[0] === 0x23 && buf[1] === 0x21;
+		} finally {
+			fs.closeSync(fd);
+		}
+	} catch {
+		return false;
+	}
+}
+
+function isShimPath(filePath: string, bunBinDir: string | undefined): boolean {
+	const extension = path.extname(filePath).toLowerCase();
+	if (extension === ".cmd" || extension === ".ps1" || extension === ".bat" || extension === ".sh") return true;
+	if (resolveNpmManagedTarget(filePath)) return true;
+	if (bunBinDir && isPathInDirectory(filePath, bunBinDir)) return true;
+	return fileStartsWithShebang(filePath);
+}
+
+export function defaultUserBinaryPath(
+	platform: NodeJS.Platform = process.platform,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const pathApi = pathApiForPlatform(platform);
+	if (env.GJC_INSTALL_DIR && env.GJC_INSTALL_DIR.length > 0) {
+		return pathApi.join(env.GJC_INSTALL_DIR, platform === "win32" ? "gjc.exe" : "gjc");
+	}
+	if (platform === "win32") {
+		const base = env.LOCALAPPDATA || pathApi.join(env.USERPROFILE || os.homedir(), "AppData", "Local");
+		return pathApi.join(base, "gjc", "gjc.exe");
+	}
+	return pathApi.join(env.HOME || os.homedir(), ".local", "bin", "gjc");
+}
+
+export function isProtectedSourcePathForTest(filePath: string): boolean {
+	return isProtectedSourcePath(filePath);
+}
+
+export function defaultUserBinaryPathForTest(
+	platform: NodeJS.Platform = process.platform,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	return defaultUserBinaryPath(platform, env);
+}
+
 async function resolveUpdateTarget(): Promise<UpdateTarget> {
 	const bunBinDir = await getBunGlobalBinDir();
 	const ompPath = resolveGjcPath();
+	const userPath = defaultUserBinaryPath();
 
-	if (ompPath) {
-		const npmTarget = resolveNpmManagedTarget(ompPath);
-		if (npmTarget) return { method: "npm", packageName: npmTarget.packageName };
-		const method = resolveUpdateMethod(ompPath, bunBinDir);
-		if (method === "bun") return { method };
-		if (method === "npm") {
-			throw new Error(
-				formatUnsupportedTargetMessage(`Could not resolve npm package root for ${APP_NAME} shim ${ompPath}`),
-			);
-		}
-		return { method, path: ompPath };
+	if (ompPath && isProtectedSourcePath(ompPath)) {
+		throw new Error(
+			formatUnsupportedTargetMessage(
+				`Refusing to overwrite source checkout or dev-link at ${ompPath}. Update that checkout's original workflow instead`,
+			),
+		);
 	}
 
-	if (bunBinDir) return { method: "bun" };
+	if (ompPath && isShimPath(ompPath, bunBinDir)) {
+		if (isProtectedSourcePath(userPath)) {
+			throw new Error(formatUnsupportedTargetMessage(`Refusing to install over a source checkout at ${userPath}`));
+		}
+		if (path.resolve(userPath) === path.resolve(ompPath)) {
+			throw new Error(
+				formatUnsupportedTargetMessage(
+					`Current install at ${ompPath} is a package-manager shim in the default binary directory. Set GJC_INSTALL_DIR to a different directory, or remove the shim and reinstall with the binary installer`,
+				),
+			);
+		}
+		return { method: "migrate", path: userPath, previousPath: ompPath };
+	}
 
-	throw new Error(formatUnsupportedTargetMessage(`Could not resolve ${APP_NAME} binary path in PATH`));
+	if (ompPath) {
+		return { method: "binary", path: ompPath };
+	}
+
+	if (isProtectedSourcePath(userPath)) {
+		throw new Error(formatUnsupportedTargetMessage(`Refusing to install over a source checkout at ${userPath}`));
+	}
+	return { method: "migrate", path: userPath };
 }
 
-/** Lookup options for the release check: registry resolution plus the release channel. */
-export interface LatestReleaseLookupOptions extends NpmRegistryLookupOptions {
+/** Lookup options for the GitHub release check. */
+export interface LatestReleaseLookupOptions extends GithubReleaseLookupOptions {
 	channel?: UpdateChannel;
 }
 
 /**
- * Get the latest release info for a channel from the npm registry.
- * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
- *
- * The registry comes from npm config (`npm_config_registry`, `.npmrc`,
- * `BUN_CONFIG_REGISTRY`) so the check reaches the same place the install does.
- * Hardcoding the public registry broke every mirrored or firewalled network.
+ * Get the latest release info for a channel from GitHub releases.
+ * Stable uses `/releases/latest`. Nightly uses the newest published prerelease.
  */
 async function getLatestRelease(options?: LatestReleaseLookupOptions): Promise<ReleaseInfo> {
-	const { channel = "stable", ...lookupOptions } = options ?? {};
-	// The user is deliberately waiting on this command, unlike the startup check.
-	let version: string;
-	let registry: string;
-	let warnings: string[];
-	try {
-		({ version, registry, warnings } = await fetchLatestPackageVersion(PACKAGE, {
-			timeoutMs: 20_000,
-			...lookupOptions,
-			distTag: distTagForChannel(channel),
-		}));
-	} catch (err) {
-		if (channel === "nightly") {
-			throw new Error(
-				`${err instanceof Error ? err.message : String(err)} The nightly channel has no published release yet; it is populated by the scheduled nightly workflow.`,
-			);
-		}
-		throw err;
+	const channel = options?.channel ?? "stable";
+	const release = await fetchGithubChannelRelease({ ...options, channel, useAmbientToken: true });
+	if (!isSafeReleaseTag(release.tag)) {
+		throw new Error(`Refusing unsafe GitHub release tag: ${release.tag}`);
 	}
-
 	return {
-		tag: `v${version}`,
-		version,
-		registry,
-		warnings,
+		tag: release.tag,
+		version: release.version || versionFromTag(release.tag),
+		registry: `https://github.com/${RELEASE_REPO}`,
+		warnings: release.warnings,
 	};
 }
 
@@ -331,16 +412,38 @@ function getBinaryName(platform: NodeJS.Platform = process.platform, arch: strin
 	}
 
 	if (os === "windows") {
+		if (archName !== "x64") {
+			throw new Error(formatUnsupportedTargetMessage(`Unsupported architecture: ${arch}`));
+		}
 		return `${APP_NAME}-${os}-${archName}.exe`;
 	}
 	return `${APP_NAME}-${os}-${archName}`;
 }
 
 /**
- * Resolve the path that `gjc` maps to in the user's PATH.
+ * Resolve the running GJC image. Compiled binaries update themselves via
+ * execPath (realpath when available), not whichever `gjc` is first on PATH.
  */
+function resolveRunningImagePath(execPath: string): string {
+	try {
+		return fs.realpathSync(execPath);
+	} catch {
+		return path.resolve(execPath);
+	}
+}
+
 function resolveGjcPath(): string | undefined {
+	if (isCompiledBinary()) return resolveRunningImagePath(process.execPath);
 	return $which(APP_NAME) ?? undefined;
+}
+
+export function resolveGjcPathForTest(options: {
+	compiled: boolean;
+	execPath: string;
+	whichPath: string | undefined;
+}): string | undefined {
+	if (options.compiled) return resolveRunningImagePath(options.execPath);
+	return options.whichPath;
 }
 
 /**
@@ -359,21 +462,26 @@ export function parseReportedVersionForTest(output: string): string | undefined 
 /**
  * Run the resolved gjc binary and check if it reports the expected version.
  */
-async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
-	const ompPath = resolveGjcPath();
-	if (!ompPath) return { ok: false };
+async function verifyInstalledVersion(
+	expectedVersion: string,
+	runtimePath: string | undefined = resolveGjcPath(),
+): Promise<InstalledVersionVerification> {
+	if (!runtimePath) return { ok: false };
 	try {
-		const result = await $`${ompPath} --version`.quiet().nothrow();
-		if (result.exitCode !== 0) return { ok: false, path: ompPath };
+		const result = await $`${runtimePath} --version`.quiet().nothrow();
+		if (result.exitCode !== 0) return { ok: false, path: runtimePath };
 		const actual = parseReportedVersion(result.text());
-		return { ok: actual === expectedVersion, actual, path: ompPath };
+		return { ok: actual === expectedVersion, actual, path: runtimePath };
 	} catch {
-		return { ok: false, path: ompPath };
+		return { ok: false, path: runtimePath };
 	}
 }
 
-async function verifyInstalledRuntime(expectedVersion: string): Promise<InstalledVersionVerification> {
-	const versionResult = await verifyInstalledVersion(expectedVersion);
+async function verifyInstalledRuntime(
+	expectedVersion: string,
+	runtimePath?: string,
+): Promise<InstalledVersionVerification> {
+	const versionResult = await verifyInstalledVersion(expectedVersion, runtimePath ?? resolveGjcPath());
 	if (!versionResult.ok || !versionResult.path) {
 		return versionResult;
 	}
@@ -415,14 +523,14 @@ function formatBinaryInstallInstruction(platform: NodeJS.Platform = process.plat
 	if (platform === "win32") {
 		return `For a supported binary install, reinstall with PowerShell: irm https://raw.githubusercontent.com/${RELEASE_REPO}/main/scripts/install.ps1 | iex`;
 	}
-	return `For a supported binary install, reinstall with: curl -fsSL https://raw.githubusercontent.com/${RELEASE_REPO}/main/scripts/install.sh | sh -s -- --binary`;
+	return `For a supported binary install, reinstall with: curl -fsSL https://raw.githubusercontent.com/${RELEASE_REPO}/main/scripts/install.sh | sh`;
 }
 
 function formatManualUpdateInstructions(platform: NodeJS.Platform = process.platform): string {
 	return [
-		`If ${APP_NAME} was installed with Bun, run: bun install -g ${PACKAGE}@latest`,
-		`If ${APP_NAME} was installed with npm, pnpm, or another package manager, update it with that same manager.`,
 		formatBinaryInstallInstruction(platform),
+		`Source checkouts and dev-links must be updated through that checkout; they are never overwritten by ${APP_NAME} update.`,
+		`Bun is only required for source development/build. Ordinary installs and updates do not use Bun or npm.`,
 	].join("\n");
 }
 
@@ -518,16 +626,133 @@ async function cleanupVerifiedBackup(backupPath: string): Promise<string | undef
 	}
 }
 
+export async function recoverWindowsUpdateJournal(journalPath: string): Promise<void> {
+	let raw: string;
+	try {
+		raw = await fs.promises.readFile(journalPath, "utf8");
+	} catch (err) {
+		if (isEnoent(err)) return;
+		throw err;
+	}
+	let target = "";
+	let backup = "";
+	let next = "";
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (parsed && typeof parsed === "object") {
+			const record = parsed as { target?: unknown; backup?: unknown; next?: unknown };
+			if (typeof record.target === "string") target = record.target;
+			if (typeof record.backup === "string") backup = record.backup;
+			if (typeof record.next === "string") next = record.next;
+		}
+	} catch {
+		await unlinkIfExists(journalPath);
+		return;
+	}
+	const exists = async (p: string): Promise<boolean> => {
+		try {
+			await fs.promises.lstat(p);
+			return true;
+		} catch (err) {
+			if (isEnoent(err)) return false;
+			throw err;
+		}
+	};
+	if (target && next && (await exists(next))) {
+		if (!(await exists(target))) {
+			await fs.promises.rename(next, target);
+			await unlinkIfExists(journalPath);
+			return;
+		}
+		try {
+			const recoverBackup = `${target}.bak.recover.${process.pid}.${Date.now().toString(16)}`;
+			await fs.promises.rename(target, recoverBackup);
+			try {
+				await fs.promises.rename(next, target);
+			} catch (promoteErr) {
+				try {
+					await fs.promises.rename(recoverBackup, target);
+				} catch {
+					throw promoteErr;
+				}
+				throw promoteErr;
+			}
+			await unlinkIfExists(recoverBackup);
+			await unlinkIfExists(journalPath);
+			return;
+		} catch {
+			return;
+		}
+	}
+	if (target && backup && !(await exists(target))) {
+		try {
+			await fs.promises.rename(backup, target);
+		} catch (restoreErr) {
+			if (!isEnoent(restoreErr)) throw restoreErr;
+		}
+	}
+	await unlinkIfExists(journalPath);
+}
+
 /**
  * Atomically replace the installed binary and roll back if version verification fails.
  */
 export async function replaceBinaryForUpdate(options: BinaryReplacementOptions): Promise<InstalledVersionVerification> {
 	let backupReady = false;
+	let published = false;
+	let stagedNext = false;
+	const journalPath = `${options.targetPath}.update-journal`;
 	try {
+		if (process.platform === "win32") {
+			await recoverWindowsUpdateJournal(journalPath);
+		}
+		try {
+			const dest = await fs.promises.lstat(options.targetPath);
+			if (dest.isSymbolicLink()) {
+				throw new Error(
+					`Refusing to replace symlink ${options.targetPath} with a regular binary. Set GJC_INSTALL_DIR to a real directory.`,
+				);
+			}
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+		}
 		await unlinkIfExists(options.backupPath);
-		await fs.promises.rename(options.targetPath, options.backupPath);
-		backupReady = true;
+		if (process.platform === "win32") {
+			const nextPath = `${options.targetPath}.next`;
+			await fs.promises.writeFile(
+				journalPath,
+				JSON.stringify({
+					target: options.targetPath,
+					backup: options.backupPath,
+					temp: options.tempPath,
+					next: nextPath,
+				}),
+				"utf8",
+			);
+			try {
+				await fs.promises.rename(options.targetPath, options.backupPath);
+				backupReady = true;
+			} catch (err) {
+				if (isEnoent(err)) {
+					backupReady = false;
+				} else {
+					await fs.promises.copyFile(options.tempPath, nextPath);
+					stagedNext = true;
+					throw new Error(
+						`Running Windows image ${options.targetPath} could not be replaced in-process (${err}). Staged ${nextPath}. Close running gjc.exe and re-run gjc update.`,
+					);
+				}
+			}
+		} else {
+			try {
+				await fs.promises.copyFile(options.targetPath, options.backupPath);
+				backupReady = true;
+			} catch (err) {
+				if (!isEnoent(err)) throw err;
+			}
+		}
 		await fs.promises.rename(options.tempPath, options.targetPath);
+		published = true;
 
 		const verification = await options.verifyInstalledVersion(options.expectedVersion);
 		if (!verification.ok) {
@@ -537,14 +762,18 @@ export async function replaceBinaryForUpdate(options: BinaryReplacementOptions):
 		}
 
 		backupReady = false;
+		if (process.platform === "win32") await unlinkIfExists(journalPath);
 		const cleanupWarning = await cleanupVerifiedBackup(options.backupPath);
 		return cleanupWarning ? { ...verification, cleanupWarning } : verification;
 	} catch (err) {
 		if (backupReady) {
 			await unlinkIfExists(options.targetPath);
 			await fs.promises.rename(options.backupPath, options.targetPath);
+		} else if (published) {
+			await unlinkIfExists(options.targetPath);
 		}
 		await unlinkIfExists(options.tempPath);
+		if (process.platform === "win32" && !stagedNext) await unlinkIfExists(journalPath);
 		throw err;
 	}
 }
@@ -604,29 +833,6 @@ async function updateViaPackageManager(options: PackageManagerUpdateOptions): Pr
 }
 
 /**
- * Update via bun package manager.
- */
-async function updateViaBun(expectedVersion: string): Promise<InstalledVersionVerification> {
-	console.log(chalk.dim("Updating via bun..."));
-	return await updateViaPackageManager({
-		managerName: "bun",
-		expectedVersion,
-		runInstall: async version => await $`bun install -g ${PACKAGE}@${version}`.nothrow(),
-		verifyInstalledRuntime,
-	});
-}
-
-async function updateViaNpm(packageName: string, expectedVersion: string): Promise<InstalledVersionVerification> {
-	console.log(chalk.dim(`Updating npm-managed install via npm (${packageName})...`));
-	return await updateViaPackageManager({
-		managerName: "npm",
-		expectedVersion,
-		runInstall: async version => await $`npm install -g ${packageName}@${version}`.nothrow(),
-		verifyInstalledRuntime,
-	});
-}
-
-/**
  * Flush a freshly written file's data to stable storage.
  *
  * Critical on network filesystems (e.g. NFS home directories): `pipeline`
@@ -659,6 +865,7 @@ async function downloadBinaryTo(
 	tempPath: string,
 	binaryName: string,
 	registryNote?: string,
+	expectedVersion?: string,
 ): Promise<void> {
 	const response = await fetch(url, { redirect: "follow" });
 	if (!response.ok || !response.body) {
@@ -672,8 +879,30 @@ async function downloadBinaryTo(
 			),
 		);
 	}
-	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
-	await pipeline(response.body, fileStream);
+	try {
+		const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
+		await pipeline(response.body, fileStream);
+		const stat = await fs.promises.stat(tempPath);
+		if (stat.size <= 0) {
+			throw new Error(`Downloaded file was empty: ${url}`);
+		}
+	} catch (err) {
+		await unlinkIfExists(tempPath);
+		throw err;
+	}
+	if (expectedVersion) {
+		const tag = expectedVersion.startsWith("v") ? expectedVersion : `v${expectedVersion}`;
+		try {
+			await verifyDownloadedBinaryChecksum({
+				tag,
+				assetName: binaryName,
+				filePath: tempPath,
+			});
+		} catch (err) {
+			await unlinkIfExists(tempPath);
+			throw err;
+		}
+	}
 }
 
 /** Injectable steps of the binary update flow (seams for testing ordering). */
@@ -703,25 +932,72 @@ export async function runBinaryUpdateFlow(
 	expectedVersion: string,
 	flow: BinaryUpdateFlow,
 ): Promise<InstalledVersionVerification> {
-	const tempPath = `${targetPath}.new`;
-	const backupPath = `${targetPath}.bak`;
-
-	await flow.download(url, tempPath);
+	const stamp = `${process.pid}.${Date.now().toString(16)}`;
+	const tempPath = `${targetPath}.new.${stamp}`;
+	const backupPath = `${targetPath}.bak.${stamp}`;
+	const releaseLock = await acquireBinaryUpdateLock(targetPath);
 	try {
-		await flow.fsync(tempPath);
+		await flow.download(url, tempPath);
+		try {
+			await flow.fsync(tempPath);
+		} catch (err) {
+			if (flow.removeTemp) await flow.removeTemp(tempPath);
+			throw err;
+		}
+
+		flow.beforeReplace?.();
+		return await flow.replace({
+			targetPath,
+			tempPath,
+			backupPath,
+			expectedVersion,
+			verifyInstalledVersion: flow.verifyInstalledVersion,
+		});
+	} finally {
+		await releaseLock();
+	}
+}
+
+async function acquireBinaryUpdateLock(targetPath: string): Promise<() => Promise<void>> {
+	const lockFile = path.join(path.dirname(targetPath), ".gjc-install.lock");
+	const nonce = `${process.pid}.${Date.now().toString(16)}.${Math.random().toString(16).slice(2)}`;
+	const claim = `${process.pid} ${nonce}\n`;
+	const publish = async (): Promise<void> => {
+		const handle = await fs.promises.open(lockFile, "wx");
+		try {
+			await handle.write(claim);
+		} finally {
+			await handle.close();
+		}
+	};
+	const ownsClaim = async (): Promise<boolean> => {
+		try {
+			return (await fs.promises.readFile(lockFile, "utf8")) === claim;
+		} catch {
+			return false;
+		}
+	};
+	const release = async (): Promise<void> => {
+		try {
+			if (!(await ownsClaim())) return;
+			await unlinkIfExists(lockFile);
+		} catch {
+			// Best-effort lock release after a verified or failed update.
+		}
+	};
+	try {
+		await publish();
+		return release;
 	} catch (err) {
-		if (flow.removeTemp) await flow.removeTemp(tempPath);
+		const code = (err as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return async () => {};
+		if (code === "EEXIST") {
+			throw new Error(
+				`Another ${APP_NAME} update is already running for ${targetPath}. Remove ${lockFile} only after confirming no installer or update is running.`,
+			);
+		}
 		throw err;
 	}
-
-	flow.beforeReplace?.();
-	return flow.replace({
-		targetPath,
-		tempPath,
-		backupPath,
-		expectedVersion,
-		verifyInstalledVersion: flow.verifyInstalledVersion,
-	});
 }
 
 /**
@@ -732,8 +1008,10 @@ export async function runBinaryUpdateFlow(
  * back to the registry that named it.
  */
 function formatRegistryProvenance(version: string, registry: string | undefined): string | undefined {
-	if (!registry || registry === DEFAULT_NPM_REGISTRY) return undefined;
-	return `Version ${version} was resolved from ${registry}, not ${DEFAULT_NPM_REGISTRY}; a version published only to that registry has no matching GitHub release asset.`;
+	if (!registry || registry === `https://github.com/${RELEASE_REPO}` || registry === GITHUB_RELEASE_DOWNLOAD_ORIGIN) {
+		return undefined;
+	}
+	return `Version ${version} was resolved from ${registry}; GitHub release assets may not exist for a version that was never published there.`;
 }
 
 /**
@@ -744,16 +1022,30 @@ async function updateViaBinaryAt(
 	expectedVersion: string,
 	registry?: string,
 ): Promise<InstalledVersionVerification> {
+	if (
+		process.platform === "linux" &&
+		(fs.existsSync("/lib/ld-musl-x86_64.so.1") ||
+			fs.existsSync("/lib/ld-musl-aarch64.so.1") ||
+			fs.existsSync("/lib/ld-musl-armhf.so.1"))
+	) {
+		throw new Error(
+			formatUnsupportedTargetMessage(
+				"Unsupported libc: musl. Prebuilt Linux binaries are glibc-only. See docs/install.md",
+			),
+		);
+	}
 	const binaryName = getBinaryName();
 	const url = buildReleaseBinaryUrl(expectedVersion);
 	const registryNote = formatRegistryProvenance(expectedVersion, registry);
 	console.log(chalk.dim(`Downloading ${binaryName}…`));
+	await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
 
 	const verification = await runBinaryUpdateFlow(targetPath, url, expectedVersion, {
-		download: (downloadUrl, tempPath) => downloadBinaryTo(downloadUrl, tempPath, binaryName, registryNote),
+		download: (downloadUrl, tempPath) =>
+			downloadBinaryTo(downloadUrl, tempPath, binaryName, registryNote, expectedVersion),
 		fsync: fsyncFile,
 		replace: replaceBinaryForUpdate,
-		verifyInstalledVersion: verifyInstalledRuntime,
+		verifyInstalledVersion: version => verifyInstalledRuntime(version, targetPath),
 		removeTemp: unlinkIfExists,
 		beforeReplace: () => console.log(chalk.dim("Installing update...")),
 	});
@@ -909,19 +1201,38 @@ async function performUpdate(
 	expectedVersion: string,
 	registry?: string,
 ): Promise<InstalledVersionVerification> {
-	if (target.method === "bun") {
-		return await updateViaBun(expectedVersion);
-	} else if (target.method === "npm") {
-		return await updateViaNpm(target.packageName, expectedVersion);
-	} else {
+	if (target.method === "migrate") {
+		if (target.previousPath) {
+			console.log(
+				chalk.yellow(
+					`Current ${APP_NAME} at ${target.previousPath} is a package-manager shim or wrapper; installing a standalone binary at ${target.path} without overwriting the shim.`,
+				),
+			);
+		}
+		const verification = await updateViaBinaryAt(target.path, expectedVersion, registry);
+		console.log(
+			chalk.cyan(
+				`Put ${path.dirname(target.path)} first on PATH so the standalone binary wins over any leftover Bun/npm shim.`,
+			),
+		);
+		return verification;
+	}
+	if (target.method === "binary") {
 		return await updateViaBinaryAt(target.path, expectedVersion, registry);
 	}
+	const fallbackPath = defaultUserBinaryPath();
+	console.log(
+		chalk.yellow(
+			`Package-manager updates are no longer the default. Installing a standalone binary at ${fallbackPath}.`,
+		),
+	);
+	return await updateViaBinaryAt(fallbackPath, expectedVersion, registry);
 }
 
 /** How the update command should proceed after comparing versions. */
 export interface UpdateDecision {
 	install: boolean;
-	kind: "up-to-date" | "new-version" | "switch-back" | "force";
+	kind: "up-to-date" | "new-version" | "switch-back" | "force" | "migrate";
 }
 
 /**
@@ -940,9 +1251,13 @@ export function resolveUpdateDecision(options: {
 	force: boolean;
 	channel: UpdateChannel;
 	currentVersion: string;
+	migrate?: boolean;
 }): UpdateDecision {
 	const isChannelSwitchBack =
 		options.channel === "stable" && options.currentVersion.includes("-nightly.") && options.comparison < 0;
+	if (options.migrate && !options.force && !isChannelSwitchBack && options.comparison === 0) {
+		return { install: true, kind: "migrate" };
+	}
 	if (options.comparison <= 0 && !isChannelSwitchBack && !options.force) {
 		return { install: false, kind: "up-to-date" };
 	}
@@ -963,26 +1278,20 @@ export async function runUpdateCommand(
 
 	console.log(chalk.dim(`Current version: ${VERSION}`));
 	if (channel !== "stable") {
-		console.log(chalk.dim(`Update channel: ${channel} (npm dist-tag ${distTagForChannel(channel)})`));
+		console.log(chalk.dim(`Update channel: ${channel} (GitHub ${channel === "nightly" ? "prerelease" : "release"})`));
 	}
 
-	// Resolve the install target first so the registry lookup can match the
-	// manager that will actually run: the npm-managed path ignores
-	// BUN_CONFIG_REGISTRY, so preferring it there would make the version check
-	// disagree with the install this command is gating. Failure is not fatal
-	// here — the later resolveTarget() call reports it.
-	let installer: Installer | undefined;
 	let target: UpdateTarget | undefined;
 	try {
 		target = await resolveTarget();
-		installer = target.method === "bun" ? "bun" : target.method === "npm" ? "npm" : undefined;
-	} catch {
-		installer = undefined;
+	} catch (err) {
+		console.error(chalk.red(err instanceof Error ? err.message : String(err)));
+		return exit(1);
 	}
 
 	let release: ReleaseInfo;
 	try {
-		release = await lookupRelease({ ...(installer ? { installer } : {}), channel });
+		release = await lookupRelease({ channel });
 	} catch (err) {
 		console.error(chalk.red(`Failed to check for updates: ${err}`));
 		return exit(1);
@@ -1000,13 +1309,19 @@ export async function runUpdateCommand(
 	} catch (err) {
 		console.error(
 			chalk.red(
-				`Failed to check for updates: the ${distTagForChannel(channel)} channel reported an unparseable version "${release.version}": ${err instanceof Error ? err.message : String(err)}`,
+				`Failed to check for updates: the ${channel} channel reported an unparseable version "${release.version}": ${err instanceof Error ? err.message : String(err)}`,
 			),
 		);
 		return exit(1);
 	}
 
-	const decision = resolveUpdateDecision({ comparison, force: opts.force, channel, currentVersion: VERSION });
+	const decision = resolveUpdateDecision({
+		comparison,
+		force: opts.force,
+		channel,
+		currentVersion: VERSION,
+		migrate: target?.method === "migrate",
+	});
 
 	if (!decision.install) {
 		console.log(chalk.green(`${theme.status.success} Already up to date`));
@@ -1017,6 +1332,8 @@ export async function runUpdateCommand(
 		console.log(chalk.cyan(`Switching to the stable channel: ${release.version}`));
 	} else if (decision.kind === "new-version") {
 		console.log(chalk.cyan(`New version available: ${release.version}`));
+	} else if (decision.kind === "migrate") {
+		console.log(chalk.cyan(`Migrating to a standalone GitHub binary: ${release.version}`));
 	} else {
 		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
 	}

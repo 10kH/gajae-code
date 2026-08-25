@@ -49,8 +49,7 @@ import {
 import { resolveAcpFinalText } from "../../sdk/acp/final-text";
 import { ACP_MCP_LIFECYCLE_TIMEOUT_MS, type SessionLifecycleMcpServer } from "../../sdk/acp/mcp";
 import { ensureBroker } from "../../sdk/broker/ensure";
-import { resolveSdkPackageAuthority } from "../../sdk/broker/runtime";
-import { SdkClient, SdkClientError } from "../../sdk/client";
+import { readSdkBrokerDiscovery, SdkClient, SdkClientError } from "../../sdk/client";
 import type { AbortScope } from "../../sdk/host/control/operations";
 import { SYNTHETIC_PROVIDER_ID } from "../../sdk/model-profile-namespace";
 import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
@@ -59,6 +58,7 @@ import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
+	type AgentSessionEvent,
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
 	mapAgentWireEventPayloadToAcpSessionUpdates,
@@ -103,6 +103,9 @@ const PROMPT_FRAME_ID_PLACEHOLDER = "00000000-0000-4000-8000-000000000000";
 type JsonObject = Record<string, unknown>;
 interface PromptWaiter {
 	acknowledged: boolean;
+	/** True once turn.prompt / skill.invoke has been sent; cancel must not fake-settle after this. */
+	dispatched: boolean;
+
 	/** Highest inbound frame sequence already observed when the prompt was acknowledged. */
 	boundary: number;
 	correlation: PromptCorrelation;
@@ -141,13 +144,7 @@ interface PromptWaiter {
 
 type PromptCorrelation = { commandId?: string; turnId?: string };
 
-type BrokerConnection = {
-	adapter: AcpSdkAdapter;
-	client: SdkClient;
-	packageGeneration: string;
-	packageVersion?: string;
-	installationIdentity?: string;
-};
+type BrokerConnection = { adapter: AcpSdkAdapter; client: SdkClient };
 type PendingAttachment = { epoch: number; task: Promise<void> };
 
 type SessionRecord = {
@@ -641,6 +638,7 @@ const ROUTER_PASSTHROUGH_FRAME_TYPES = new Set([
 	"hello",
 	"server_hello",
 	"reverse_request",
+	"reverse_response",
 	"reverse_cancel",
 	"reverse_request_cancel",
 	"reverse_request_cancelled",
@@ -1180,7 +1178,6 @@ export async function applyAcpStartupOptions(
 export class AcpAgent implements Agent {
 	readonly #connection: AgentSideConnection;
 	readonly #agentDir: string;
-	readonly #expectedPackageGeneration: string | undefined;
 	readonly #router: SessionRouter;
 	readonly #pendingRouterAdapters = new Map<string, AcpSdkAdapter>();
 	readonly #pendingRouterFrames = new Map<string, Record<string, unknown>[]>();
@@ -1208,7 +1205,6 @@ export class AcpAgent implements Agent {
 	readonly #lifecycleOperations = new Map<string, Promise<void>>();
 	#clientCapabilities: ClientCapabilities | undefined;
 	#broker: Promise<BrokerConnection> | undefined;
-	#brokerResolution: Promise<BrokerConnection> | undefined;
 	readonly #startupOptions: AcpStartupOptions | undefined;
 	readonly #cancelSettlementGraceMs: number;
 	readonly #promptWatchdogClock: PromptWatchdogClock;
@@ -1223,20 +1219,12 @@ export class AcpAgent implements Agent {
 					startupOptions?: AcpStartupOptions;
 					cancelSettlementGraceMs?: number;
 					promptWatchdogClock?: PromptWatchdogClock;
-					/**
-					 * Broker generation this agent retires on sight (see ensure.ts). Tests
-					 * pin the fixture broker's generation so their in-process broker is
-					 * never recycled; production resolves the live package generation.
-					 */
-					expectedPackageGeneration?: string;
 			  }
 			| unknown,
 	) {
 		this.#connection = connection;
 		const candidate = object(options);
 		this.#agentDir = typeof candidate?.agentDir === "string" ? candidate.agentDir : getAgentDir();
-		this.#expectedPackageGeneration =
-			typeof candidate?.expectedPackageGeneration === "string" ? candidate.expectedPackageGeneration : undefined;
 		this.#router = new SessionRouter({
 			agentDir: this.#agentDir,
 			deps: {
@@ -1631,28 +1619,42 @@ export class AcpAgent implements Agent {
 					MAX_PROMPT_FRAME_BYTES / 1024,
 				)} KiB transport limit. Attach a smaller or more compressed image.`,
 			);
-		let waiter!: PromptWaiter;
-		const response = new Promise<PromptResponse>((resolve, reject) => {
-			waiter = {
-				acknowledged: false,
-				boundary: record.inboundSequence,
-				correlation: {},
-				emittedAssistantText: "",
-				settled: false,
-				deferredFrames: [],
-				deferredActivityFrames: [],
-				lastFrameAt: this.#promptWatchdogClock.now(),
-				lastFrameType: "prompt_dispatch",
-				activity: new PromptActivity(),
-				resolve,
-				reject,
-			};
-			record.activePrompt = waiter;
-		});
+		const { promise: response, resolve, reject } = Promise.withResolvers<PromptResponse>();
+		const waiter: PromptWaiter = {
+			acknowledged: false,
+			dispatched: false,
+			boundary: record.inboundSequence,
+			correlation: {},
+			emittedAssistantText: "",
+			settled: false,
+			deferredFrames: [],
+			deferredActivityFrames: [],
+			lastFrameAt: this.#promptWatchdogClock.now(),
+			lastFrameType: "prompt_dispatch",
+			activity: new PromptActivity(),
+			resolve,
+			reject,
+		};
+		record.activePrompt = waiter;
 		// The watchdog may reject this waiter while the SDK acknowledgement request is still
 		// pending. Retain the original promise for the caller, but mark that delayed rejection
 		// as observed until prompt() can resume and await it.
 		void response.catch(() => undefined);
+		try {
+			await record.adapter.ensureProviders();
+		} catch (error) {
+			if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+				if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+				return await response;
+			}
+			if (record.activePrompt === waiter) record.activePrompt = undefined;
+			throw error;
+		}
+		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
+
 		// Silence has to be bounded from the moment the prompt owns the session: a host that
 		// dies before it ever answers is exactly the failure that leaves the client running.
 		this.#armPromptWatchdog(params.sessionId, record, waiter);
@@ -1673,13 +1675,21 @@ export class AcpAgent implements Agent {
 				record.adapter,
 			);
 		}
+		waiter.dispatched = true;
+		if (waiter.settled || record.cancelRequested || record.activePrompt !== waiter) {
+			if (!waiter.settled) await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+			return await response;
+		}
+
 		const acknowledgementTask = (async (): Promise<PromptResponse> => {
+			if (waiter.settled || record.activePrompt !== waiter) return await response;
 			const acknowledgement = skillInvocation
 				? await record.adapter.control("skill.invoke", skillInvocation)
 				: await record.adapter.prompt({
 						text: payload.text,
 						...(payload.images.length ? { images: payload.images } : {}),
 					});
+
 			const acknowledgementCorrelation = promptAcknowledgement(acknowledgement);
 			if (!acknowledgementCorrelation)
 				throw new AcpSdkAdapterError(
@@ -1862,6 +1872,11 @@ export class AcpAgent implements Agent {
 			}
 			waiter?.cancelAttemptResolve?.(true);
 		} catch (error) {
+			if (waiter && !waiter.dispatched) {
+				await this.#settleCancelledPrompt(params.sessionId, record, waiter);
+				waiter.cancelAttemptResolve?.(true);
+				return;
+			}
 			if (!waiter) record.cancelRequested = false;
 			// Only the LAST in-flight attempt resolves the shared promise false;
 			// an earlier attempt may still acknowledge (review thread P2). After
@@ -2059,6 +2074,7 @@ export class AcpAgent implements Agent {
 			// session host remains authoritative for its immutable configuration, so
 			// attachment must not reinterpret the replay as a mutation request.
 			this.#pendingDeleteLocators.delete(id);
+			await attached.adapter.ensureProviders();
 			return;
 		}
 		const knownCwd = this.#knownSessionCwds.get(id);
@@ -2142,6 +2158,7 @@ export class AcpAgent implements Agent {
 		if (existing) {
 			if (path.resolve(existing.cwd) !== path.resolve(cwd))
 				throw new AcpSdkAdapterError("conflict", `ACP session ${id} has conflicting cwd authority.`);
+			await existing.adapter.ensureProviders();
 			return;
 		}
 		const attaching = this.#attaching.get(id);
@@ -2278,9 +2295,13 @@ export class AcpAgent implements Agent {
 	#recoverSessionAfterTransportFailure(id: string, adapter: AcpSdkAdapter, error: Error): void {
 		const record = this.#sessions.get(id);
 		if (!record || record.adapter !== adapter) return;
-		if (error instanceof SdkClientError && error.code !== "reconnect_exhausted") {
+		if (
+			error instanceof SdkClientError &&
+			error.code !== "reconnect_exhausted" &&
+			error.code !== "provider_rebind_failed"
+		) {
 			logger.warn(
-				`ACP session ${id} transport failure is not reconnect_exhausted (${error.code}); ignoring terminal recovery.`,
+				`ACP session ${id} transport failure is not recoverable (${error.code}); ignoring terminal recovery.`,
 			);
 			return;
 		}
@@ -2434,122 +2455,27 @@ export class AcpAgent implements Agent {
 		return (await this.#brokerConnection()).adapter;
 	}
 
-	#assertBrokerOpen(): void {
-		if (this.#disposed) throw new AcpSdkAdapterError("connection_closed", "ACP connection is closed.");
-	}
-
 	async #brokerConnection(): Promise<BrokerConnection> {
-		this.#assertBrokerOpen();
-		if (this.#brokerResolution) return this.#brokerResolution;
-		let resolution!: Promise<BrokerConnection>;
-		resolution = this.#resolveBrokerConnection();
-		this.#brokerResolution = resolution;
-		try {
-			return await resolution;
-		} finally {
-			if (this.#brokerResolution === resolution) this.#brokerResolution = undefined;
-		}
-	}
-
-	async #resolveBrokerConnection(): Promise<BrokerConnection> {
-		this.#assertBrokerOpen();
-		if (this.#broker) {
-			const current = resolveSdkPackageAuthority();
-			const existing = this.#broker;
-			let pending: BrokerConnection;
-			try {
-				pending = await existing;
-			} catch (error) {
-				if (this.#broker === existing) this.#broker = undefined;
-				throw error;
-			}
-			this.#assertBrokerOpen();
-			const generationMatches =
-				pending.packageGeneration === (this.#expectedPackageGeneration ?? current.generation) &&
-				(this.#expectedPackageGeneration !== undefined ||
-					(pending.packageVersion === current.packageVersion &&
-						pending.installationIdentity === current.installationIdentity));
-			if (generationMatches) return pending;
-			const beforeClose = resolveSdkPackageAuthority({ force: true });
-			if (
-				this.#broker !== existing ||
-				(this.#expectedPackageGeneration === undefined &&
-					(beforeClose.generation !== current.generation ||
-						beforeClose.packageVersion !== current.packageVersion ||
-						beforeClose.installationIdentity !== current.installationIdentity))
-			)
-				throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed during connection replacement.");
-			this.#assertBrokerOpen();
-			this.#broker = undefined;
-			await pending.adapter.close().catch(() => undefined);
-			await pending.client.close().catch(() => undefined);
-		}
-		this.#assertBrokerOpen();
-		const discovery = await ensureBroker({
-			agentDir: this.#agentDir,
-			...(this.#expectedPackageGeneration === undefined
-				? {}
-				: { expectedPackageGeneration: this.#expectedPackageGeneration }),
-		});
-		this.#assertBrokerOpen();
-		const authorityAfterEnsure =
-			this.#expectedPackageGeneration === undefined ? resolveSdkPackageAuthority({ force: true }) : undefined;
-		if (
-			this.#expectedPackageGeneration === undefined &&
-			authorityAfterEnsure !== undefined &&
-			(discovery.packageGeneration !== authorityAfterEnsure.generation ||
-				discovery.packageVersion !== authorityAfterEnsure.packageVersion ||
-				discovery.installationIdentity !== authorityAfterEnsure.installationIdentity)
-		)
-			throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed before connection publication.");
-		this.#assertBrokerOpen();
-		let pending!: Promise<BrokerConnection>;
-		pending = (async () => {
-			const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
-			if (this.#disposed) {
-				await client.close().catch(() => undefined);
-				throw new AcpSdkAdapterError("connection_closed", "ACP connection closed during broker startup.");
-			}
-			const adapter = new AcpSdkAdapter({ client });
-			adapter.onReconnectFailed(() => {
-				if (this.#broker === pending) this.#broker = undefined;
-				void adapter.close().catch(() => undefined);
-			});
-			if (this.#disposed) {
-				await adapter.close().catch(() => undefined);
-				throw new AcpSdkAdapterError("connection_closed", "ACP connection closed during broker startup.");
-			}
-			await adapter.start();
-			return {
-				adapter,
-				client,
-				packageGeneration: discovery.packageGeneration,
-				packageVersion: discovery.packageVersion,
-				installationIdentity: discovery.installationIdentity,
-			};
-		})();
-		try {
-			const connection = await pending;
-			if (this.#disposed) {
-				await connection.adapter.close().catch(() => undefined);
-				await connection.client.close().catch(() => undefined);
-				throw new AcpSdkAdapterError("connection_closed", "ACP connection closed during broker startup.");
-			}
-			const authorityBeforePublish =
-				this.#expectedPackageGeneration === undefined ? resolveSdkPackageAuthority({ force: true }) : undefined;
-			if (
-				this.#expectedPackageGeneration === undefined &&
-				authorityBeforePublish !== undefined &&
-				(connection.packageGeneration !== authorityBeforePublish.generation ||
-					connection.packageVersion !== authorityBeforePublish.packageVersion ||
-					connection.installationIdentity !== authorityBeforePublish.installationIdentity)
-			) {
-				await connection.adapter.close().catch(() => undefined);
-				await connection.client.close().catch(() => undefined);
-				throw new AcpSdkAdapterError("unavailable", "SDK broker authority changed before connection publication.");
-			}
+		if (!this.#broker) {
+			let pending!: Promise<BrokerConnection>;
+			pending = (async () => {
+				await ensureBroker({ agentDir: this.#agentDir });
+				const discovery = await readSdkBrokerDiscovery(this.#agentDir);
+				if (!discovery) throw new AcpSdkAdapterError("unavailable", "SDK broker discovery is unavailable.");
+				const client = await SdkClient.connect(discovery.url, discovery.token, { ...ACP_SESSION_RECONNECT });
+				const adapter = new AcpSdkAdapter({ client });
+				adapter.onReconnectFailed(() => {
+					if (this.#broker === pending) this.#broker = undefined;
+					void adapter.close().catch(() => undefined);
+				});
+				await adapter.start();
+				return { adapter, client };
+			})();
 			this.#broker = pending;
-			return connection;
+		}
+		const pending = this.#broker;
+		try {
+			return await pending;
 		} catch (error) {
 			if (this.#broker === pending) this.#broker = undefined;
 			throw error;
@@ -2590,7 +2516,7 @@ export class AcpAgent implements Agent {
 		}
 		const event = receivedSdkEvent(frame)?.event;
 		if (event?.type === "agent_start") record.busy = true;
-		else if (event?.type === "agent_end" || event?.type === "agent_failed") record.busy = false;
+		else if (event?.type === "agent_end") record.busy = false;
 	}
 
 	#frameProcessingFailure(error: unknown): AcpSdkAdapterError {
@@ -2739,7 +2665,7 @@ export class AcpAgent implements Agent {
 		const received = receivedSdkEvent(frame);
 		if (!received) return;
 		const { event, wirePayload } = received;
-		const isTerminal = event.type === "agent_end" || event.type === "agent_failed";
+		const isTerminal = event.type === "agent_end";
 		if (event.type === "notice" && event.source === "autorouting" && typeof event.message === "string") {
 			record.routingInactiveNotice = event.message;
 			return;
@@ -2819,28 +2745,32 @@ export class AcpAgent implements Agent {
 		) {
 			record.toolArgs.set(toolCallId, event.args);
 		}
-		if (wirePayload) {
-			for (const notification of mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, {
-				cwd: record.cwd,
-				getToolArgs: id => record.toolArgs.get(id),
-				getMessageProgress: message => {
-					if (!object(message)) return undefined;
-					if (promptOwner) {
-						promptOwner.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
-						return promptOwner.messageProgress;
-					}
-					record.sessionMessageProgress ??= { textEmitted: false, thoughtEmitted: false };
-					return record.sessionMessageProgress;
-				},
-			})) {
-				if (
-					promptOwner &&
-					notification.update.sessionUpdate === "agent_message_chunk" &&
-					notification.update.content.type === "text"
-				)
-					promptOwner.emittedAssistantText += notification.update.content.text;
-				await this.#publishSessionUpdate(id, notification, adapter);
-			}
+		const mapperOptions = {
+			cwd: record.cwd,
+			getToolArgs: (id: string) => record.toolArgs.get(id),
+			getMessageProgress: (message: unknown) => {
+				if (!object(message)) return undefined;
+				if (promptOwner) {
+					promptOwner.messageProgress ??= { textEmitted: false, thoughtEmitted: false };
+					return promptOwner.messageProgress;
+				}
+				record.sessionMessageProgress ??= { textEmitted: false, thoughtEmitted: false };
+				return record.sessionMessageProgress;
+			},
+		};
+		const notifications = wirePayload
+			? mapAgentWireEventPayloadToAcpSessionUpdates(wirePayload as never, id, mapperOptions)
+			: event.type === "agent_failed" && object(event.error)
+				? mapAgentSessionEventToAcpSessionUpdates(event as unknown as AgentSessionEvent, id, mapperOptions)
+				: [];
+		for (const notification of notifications) {
+			if (
+				promptOwner &&
+				notification.update.sessionUpdate === "agent_message_chunk" &&
+				notification.update.content.type === "text"
+			)
+				promptOwner.emittedAssistantText += notification.update.content.text;
+			await this.#publishSessionUpdate(id, notification, adapter);
 		}
 		if (toolCallId && event.type === "tool_execution_end") record.toolArgs.delete(toolCallId);
 		if (event.type === "agent_start") {
@@ -2897,7 +2827,10 @@ export class AcpAgent implements Agent {
 		// queries is what left a finished turn reported as running until the inactivity
 		// watchdog rescued it.
 		if (activePrompt) this.#settlePrompt(record, activePrompt);
-		if (event.type === "agent_end" || event.type === "agent_failed") await this.#emitEndOfTurnUpdates(id, adapter);
+		// agent_failed is correlated diagnostic state while the run is still live.
+		// Only the authoritative agent_end boundary may publish end-of-turn usage,
+		// title, and idle integration updates.
+		if (event.type === "agent_end") await this.#emitEndOfTurnUpdates(id, adapter);
 	}
 
 	async #rejectPrompt(
@@ -3750,13 +3683,6 @@ export class AcpAgent implements Agent {
 		this.#pendingCloseIdempotencyKeys.clear();
 		if (this.#lifecycleOperations.size === 0) this.#lifecycleOperations.clear();
 		this.#tearingDown.clear();
-		if (this.#brokerResolution) {
-			try {
-				await this.#brokerResolution;
-			} catch (error) {
-				failures.push(error);
-			}
-		}
 		if (this.#broker) {
 			const broker = this.#broker;
 			this.#broker = undefined;

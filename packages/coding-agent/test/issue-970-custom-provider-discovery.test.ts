@@ -167,6 +167,90 @@ describe("issue #970 custom provider discovery", () => {
 		expect(uncatalogued?.maxTokens).toBe(UNK_MAX_TOKENS);
 	});
 
+	test("discovers a default vLLM endpoint without credentials", async () => {
+		const previousApiKey = Bun.env.VLLM_API_KEY;
+		const previousBaseUrl = Bun.env.VLLM_BASE_URL;
+		delete Bun.env.VLLM_API_KEY;
+		delete Bun.env.VLLM_BASE_URL;
+		try {
+			const requestedUrls: string[] = [];
+			using _hook = hookFetch((input, init) => {
+				const url = String(input);
+				requestedUrls.push(url);
+				if (url !== "http://127.0.0.1:8000/v1/models") return new Response(null, { status: 404 });
+				const headers = init?.headers as Headers | Record<string, string> | undefined;
+				const authHeader = headers instanceof Headers ? headers.get("Authorization") : headers?.Authorization;
+				expect(authHeader).toBeUndefined();
+				return new Response(JSON.stringify({ data: [{ id: "credentialless-vllm-model" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+
+			const registry = new ModelRegistryImpl(authStorage, modelsPath);
+			await registry.refresh();
+
+			expect(requestedUrls).toContain("http://127.0.0.1:8000/v1/models");
+			expect(registry.find("vllm", "credentialless-vllm-model")?.provider).toBe("vllm");
+		} finally {
+			if (previousApiKey === undefined) delete Bun.env.VLLM_API_KEY;
+			else Bun.env.VLLM_API_KEY = previousApiKey;
+			if (previousBaseUrl === undefined) delete Bun.env.VLLM_BASE_URL;
+			else Bun.env.VLLM_BASE_URL = previousBaseUrl;
+		}
+	});
+
+	test("does not discover a configured remote vLLM endpoint without credentials", async () => {
+		const previousApiKey = Bun.env.VLLM_API_KEY;
+		const previousBaseUrl = Bun.env.VLLM_BASE_URL;
+		delete Bun.env.VLLM_API_KEY;
+		Bun.env.VLLM_BASE_URL = "https://vllm.example.test/v1";
+		try {
+			using _hook = hookFetch(input => {
+				if (String(input) === "https://vllm.example.test/v1/models") {
+					throw new Error("credentialless discovery must not probe a remote vLLM endpoint");
+				}
+				return new Response(null, { status: 404 });
+			});
+
+			const registry = new ModelRegistryImpl(authStorage, modelsPath);
+			await registry.refresh();
+
+			expect(registry.find("vllm", "remote-vllm-model")).toBeUndefined();
+		} finally {
+			if (previousApiKey === undefined) delete Bun.env.VLLM_API_KEY;
+			else Bun.env.VLLM_API_KEY = previousApiKey;
+			if (previousBaseUrl === undefined) delete Bun.env.VLLM_BASE_URL;
+			else Bun.env.VLLM_BASE_URL = previousBaseUrl;
+		}
+	});
+
+	test("does not discover a remote configured vLLM provider without credentials", async () => {
+		fs.writeFileSync(
+			modelsPath,
+			JSON.stringify({
+				providers: {
+					vllm: {
+						baseUrl: "https://vllm.example.test/v1",
+						api: "openai-completions",
+						auth: "none",
+						discovery: { type: "openai-models-list" },
+					},
+				},
+			}),
+		);
+		let requestedRemote = false;
+		using _hook = hookFetch(input => {
+			if (String(input) === "https://vllm.example.test/v1/models") requestedRemote = true;
+			return new Response(null, { status: 404 });
+		});
+
+		const registry = new ModelRegistryImpl(authStorage, modelsPath);
+		await registry.refresh();
+
+		expect(requestedRemote).toBe(false);
+	});
+
 	test("shows a provider-tab hint when discovery succeeds but returns zero models", async () => {
 		installTestTheme();
 		const selector = await createSelector({

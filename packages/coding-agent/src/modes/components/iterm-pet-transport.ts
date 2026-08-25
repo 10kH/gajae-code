@@ -120,12 +120,20 @@ export function isItermCandidate(
 	env: NodeJS.ProcessEnv = Bun.env,
 	tty = Boolean(process.stdin.isTTY && process.stdout.isTTY),
 ): boolean {
-	const v = env.TERM_PROGRAM_VERSION?.split(".").map(Number);
-	return env.TERM_PROGRAM === "iTerm.app" && tty && !!v && v[0] >= 3 && (v[0] > 3 || (v[1] ?? 0) >= 5);
+	if (!tty) return false;
+	const ci = env.CI?.trim().toLowerCase();
+	if (env.CI !== undefined && ci !== "0" && ci !== "false") return false;
+	// These variables are untrusted hints, especially when forwarded over SSH.
+	// They may start the capability probe, but only an OSC 1337 reply containing
+	// the File capability can make the transport available.
+	const lcTerminal = env.LC_TERMINAL?.trim().toLowerCase();
+	const termProgram = env.TERM_PROGRAM?.trim().toLowerCase();
+	return lcTerminal === "iterm2" || termProgram === "iterm.app" || termProgram === "iterm2";
 }
 export function createNativePetTransport(o: {
 	ui: NativePetUi;
 	env?: NodeJS.ProcessEnv;
+	tty?: boolean;
 	topology?: () => Promise<PetTmuxTopology>;
 }): ItermPetTransport | undefined {
 	const env = o.env ?? Bun.env;
@@ -133,7 +141,7 @@ export function createNativePetTransport(o: {
 		env.GJC_TMUX_ACTIVE_SESSION?.trim() && env.TMUX_PANE?.trim() && env.GJC_MANAGED_OWNER_RUN_ID?.trim(),
 	);
 	if (isUnderTerminalMultiplexer(env) && !managed) return undefined;
-	if (!isItermCandidate(env, true)) return undefined;
+	if (!isItermCandidate(env, o.tty)) return undefined;
 	const clock: PetTransportClock = { now: Date.now, setTimeout, clearTimeout };
 	const input: PetTransportInput = {
 		drain: (a, b) => o.ui.drainPetProbeInput?.(a, b) ?? o.ui.drainInput(a, b),

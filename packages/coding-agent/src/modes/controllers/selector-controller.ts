@@ -131,6 +131,15 @@ import {
 	type ImportableCredential,
 } from "../../setup/credential-import";
 import {
+	analyzeOnboardingEvidence,
+	createManualOnboardingProfile,
+	deriveOnboardingProfile,
+	discoverOnboardingRootPresence,
+	type OnboardingProfile,
+	shouldPersistCompletion,
+	writeOnboardingState,
+} from "../../setup/frictionless-onboarding";
+import {
 	MODEL_ONBOARDING_API_PROVIDER_COMMAND,
 	MODEL_ONBOARDING_PROVIDER_PRESET_COMMAND,
 	MODEL_ONBOARDING_SETUP_COMMAND,
@@ -143,6 +152,7 @@ import {
 	setSearchFallbackProviders,
 	setSearchHardTimeoutMs,
 } from "../../tools/implementations";
+import { isHyperlinkEnabled } from "../../tui/hyperlink";
 import { copyToClipboard } from "../../utils/clipboard";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
 import { AgentDashboard } from "../components/agent-dashboard";
@@ -159,6 +169,11 @@ import {
 import { CustomProviderWizardComponent, type CustomProviderWizardSubmit } from "../components/custom-provider-wizard";
 import { CustomizationDashboard } from "../components/customization";
 import { ExtensionDashboard } from "../components/extensions";
+import {
+	FrictionlessOnboardingSelectorComponent,
+	type FrictionlessOnboardingStage,
+	getFrictionlessOnboardingCopy,
+} from "../components/frictionless-onboarding-selector";
 import type { PetMode } from "../components/gajae-pet-widget";
 import { HistorySearchComponent } from "../components/history-search";
 import { HookSelectorComponent } from "../components/hook-selector";
@@ -240,6 +255,19 @@ export function buildStatusLineSettings(settingsInstance: Settings): StatusLineS
 		maxRows: settingsInstance.get("statusLine.maxRows"),
 		segmentOptions: settingsInstance.get("statusLine.segmentOptions"),
 	};
+}
+
+/**
+ * Build the OSC 8 anchor emitted for an OAuth login URL row.
+ *
+ * The URL row is itself an anchor, not bare text: a login URL is a single
+ * unbreakable token, so any pane narrower than the URL splits it across rows.
+ * The wrap layer re-opens the identical link on every fragment (#4711), but
+ * only for text that carries an anchor to begin with — a bare URL wrapped into
+ * fragments leaves every fragment as dead, unclickable text.
+ */
+export function buildOAuthLoginAnchor(url: string, label: string = url, hyperlinks = isHyperlinkEnabled()): string {
+	return hyperlinks ? `\x1b]8;;${url}\x07${label}\x1b]8;;\x07` : label;
 }
 
 function formatProviderOnboardingCommandGuide(): string {
@@ -1438,15 +1466,10 @@ export class SelectorController {
 			const selector = new ProviderOnboardingSelectorComponent(
 				(action: ProviderOnboardingAction) => {
 					done();
-					if (action === "custom-provider-wizard") {
-						this.showCustomProviderWizard();
-					} else if (action === "oauth-login") {
-						void this.showOAuthSelector("login");
-					} else if (action === "import-credentials") {
-						void this.#handleCredentialImport();
-					} else {
-						this.ctx.showStatus(formatProviderOnboardingCommandGuide());
-					}
+					if (action === "custom-provider-wizard") this.showCustomProviderWizard();
+					else if (action === "oauth-login") void this.showOAuthSelector("login");
+					else if (action === "import-credentials") void this.#handleCredentialImport();
+					else this.ctx.showStatus(formatProviderOnboardingCommandGuide());
 				},
 				() => {
 					done();
@@ -1455,6 +1478,82 @@ export class SelectorController {
 			);
 			return { component: selector, focus: selector };
 		});
+	}
+
+	async showFrictionlessOnboarding(): Promise<void> {
+		const agentDir = this.ctx.session.getSessionAgentDir();
+		const presence = await discoverOnboardingRootPresence();
+		// An explicit `/language` (or settings) selection outranks locale and transcript evidence.
+		const profileOptions = {
+			osLocale: Intl.DateTimeFormat().resolvedOptions().locale,
+			...(this.ctx.settings.has("ui.language") ? { preferredLanguage: this.ctx.settings.get("ui.language") } : {}),
+		};
+		const initialProfile = deriveOnboardingProfile([], profileOptions);
+
+		const open = (profile: OnboardingProfile, stage: FrictionlessOnboardingStage): void => {
+			const text = getFrictionlessOnboardingCopy(profile.language);
+			this.showSelector(done => {
+				const selector = new FrictionlessOnboardingSelectorComponent(
+					profile,
+					async action => {
+						if (action === "analyze") {
+							const evidence = await analyzeOnboardingEvidence(presence);
+							const analyzed = deriveOnboardingProfile(evidence, profileOptions);
+							done();
+							open(analyzed, analyzed.operations?.length ? "preview" : "manual");
+							return;
+						}
+						if (action === "manual") {
+							done();
+							open(profile, "manual");
+							return;
+						}
+						const manualIntent =
+							action === "manual-migration" ? "migration" : action === "manual-learn" ? "commands" : undefined;
+						if (manualIntent) {
+							done();
+							open(createManualOnboardingProfile(profile.language, manualIntent), "preview");
+							return;
+						}
+						if (action === "apply") {
+							const operation = profile.operations?.[0];
+							const confirmed = await this.ctx.showHookConfirm(
+								text.confirmTitle,
+								profile.migrationMap.join("\n") || text.noChanges,
+							);
+							done();
+							if (!shouldPersistCompletion(operation, confirmed)) {
+								open(profile, "preview");
+								return;
+							}
+							this.ctx.handleHelpCommand();
+							const saved = await writeOnboardingState({ version: 1, decision: "completed", profile }, agentDir);
+							if (!saved) {
+								this.ctx.showError(text.persistFailed);
+								return;
+							}
+							this.ctx.showStatus(text.completed);
+							return;
+						}
+						if (action === "skip") {
+							const saved = await writeOnboardingState({ version: 1, decision: "skipped" }, agentDir);
+							if (saved) {
+								done();
+								this.ctx.showStatus(text.skipped);
+							} else this.ctx.showError(text.persistFailed);
+							return;
+						}
+						done();
+					},
+					done,
+					profile.language,
+					stage,
+				);
+				return { component: selector, focus: selector };
+			});
+		};
+
+		open(initialProfile, "disclosure");
 	}
 
 	async #handleCredentialImport(): Promise<void> {
@@ -3399,8 +3498,8 @@ export class SelectorController {
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
 						this.ctx.chatContainer.addChild(new Spacer(1));
-						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", info.url), 1, 0));
-						const hyperlink = `\x1b]8;;${info.url}\x07Click here to login\x1b]8;;\x07`;
+						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", buildOAuthLoginAnchor(info.url)), 1, 0));
+						const hyperlink = buildOAuthLoginAnchor(info.url, "Click here to login");
 						this.ctx.chatContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
 						if (info.instructions) {
 							this.ctx.chatContainer.addChild(new Spacer(1));

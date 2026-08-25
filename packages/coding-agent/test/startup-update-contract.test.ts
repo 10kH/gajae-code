@@ -1,8 +1,9 @@
 import { describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import { getBundledModel } from "@gajae-code/ai";
-import { postmortem, TempDir } from "@gajae-code/utils";
+import { closeModelCache, getBundledModel, type Model } from "@gajae-code/ai";
+import { getAgentDir, hookFetch, postmortem, setAgentDir, TempDir } from "@gajae-code/utils";
 import { type Args, parseArgs } from "../src/cli/args";
+import { ModelRegistry, ModelsConfigFile } from "../src/config/model-registry";
 import { resetSettingsForTest, Settings } from "../src/config/settings";
 import { SETTINGS_SCHEMA } from "../src/config/settings-schema";
 import { resolveMachineLocalUpdateChannel } from "../src/config/update-channel";
@@ -16,7 +17,7 @@ import {
 } from "../src/main";
 import { getSettingsForTab } from "../src/modes/components/settings-defs";
 import type { InteractiveMode } from "../src/modes/interactive-mode";
-import type { CreateAgentSessionOptions, CreateAgentSessionResult } from "../src/sdk";
+import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "../src/sdk";
 import type { AgentSession } from "../src/session/agent-session";
 import { AuthStorage } from "../src/session/auth-storage";
 import { EventBus } from "../src/utils/event-bus";
@@ -62,6 +63,7 @@ function fakeSessionResult(): CreateAgentSessionResult {
 		extensionRunner: undefined,
 		getConfiguredModelChain: () => undefined,
 		setConfiguredModelChain: () => {},
+		seedDefaultFallbackResolution: () => {},
 		setModelTemporary: async (model: typeof testModel) => {
 			activeModel = model;
 		},
@@ -82,8 +84,10 @@ describe("startup update contract", () => {
 		expect(setting.default).toBe(true);
 		expect(setting.ui.description).toContain("At interactive startup, notify");
 		expect(setting.ui.description).toContain("never install");
-		expect(setting.ui.description).toContain("Use `gjc update` only");
-		expect(setting.ui.description).toContain("source, linked, and unrecognized installs use their original method");
+		expect(setting.ui.description).toContain("`gjc update` installs the matching GitHub release binary");
+		expect(setting.ui.description).toContain(
+			"Source, linked, and unrecognized installs stay on their original method",
+		);
 	});
 	it("displays the changelog without rewriting malformed global YAML", async () => {
 		using tempDir = TempDir.createSync("@gjc-malformed-changelog-");
@@ -375,6 +379,138 @@ describe("startup update contract", () => {
 			authStorage.close();
 			if (originalNoTitle === undefined) delete Bun.env.PI_NO_TITLE;
 			else Bun.env.PI_NO_TITLE = originalNoTitle;
+		}
+	});
+
+	it("admits a selected literal cache through the normal print root registry", async () => {
+		using tempDir = TempDir.createSync("@gjc-print-cache-startup-");
+		const agentDir = path.join(tempDir.path(), "agent");
+		const modelsPath = path.join(agentDir, "models.yml");
+		const authPath = path.join(agentDir, "auth.db");
+		const cacheDbPath = path.join(agentDir, "models.db");
+		const provider = "fixture-main-discovery";
+		const modelId = "discovered-only-model";
+		const baseUrl = "https://main-discovery.example.test/v1";
+		const wrongKey = ["fixture", "literal", "wrong"].join("-");
+		const selectedKey = ["fixture", "literal", "selected"].join("-");
+		const originalAgentDir = getAgentDir();
+		const originalRelocate = ModelsConfigFile.relocate.bind(ModelsConfigFile);
+		let restoreRelocate: (() => void) | undefined;
+		let restorePostRefresh: (() => void) | undefined;
+		let observedModel: Model | undefined;
+		let observedFallback: string | undefined;
+		let printedModel: Model | undefined;
+		let startupRequests = 0;
+		let postCreateRefreshes = 0;
+		const admissions: boolean[] = [];
+
+		try {
+			await Bun.write(
+				modelsPath,
+				JSON.stringify({
+					providers: {
+						[provider]: {
+							baseUrl,
+							api: "openai-responses",
+							discovery: { type: "openai-models-list" },
+						},
+					},
+				}),
+			);
+			const seedAuth = await AuthStorage.create(authPath);
+			await seedAuth.set(provider, [
+				{ type: "api_key", key: wrongKey },
+				{ type: "api_key", key: selectedKey },
+			]);
+			const selectedRow = seedAuth.listCredentialInventory(provider)[1];
+			if (selectedRow?.credentialKind !== "api_key") throw new Error("Expected selected API-key fixture row");
+			const seedRegistry = new ModelRegistry(seedAuth, modelsPath);
+			expect(await seedAuth.getApiKey(provider)).toBe(wrongKey);
+			using _seedFetch = hookFetch((input, init) => {
+				expect(String(input)).toBe(`${baseUrl}/models`);
+				expect(new Headers(init?.headers).get("Authorization")).toBe(`Bearer ${selectedKey}`);
+				return new Response(JSON.stringify({ data: [{ id: modelId }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			await seedRegistry.refreshProvider(provider, "online");
+			seedAuth.close();
+			closeModelCache(cacheDbPath);
+
+			setAgentDir(agentDir);
+			const isolatedModelsConfig = originalRelocate(modelsPath);
+			const relocateSpy = vi
+				.spyOn(ModelsConfigFile, "relocate")
+				.mockImplementation(requestedPath =>
+					requestedPath === undefined ? isolatedModelsConfig : originalRelocate(requestedPath),
+				);
+			restoreRelocate = () => relocateSpy.mockRestore();
+			const rootAuth = await AuthStorage.create(authPath);
+			const originalAdmission = ModelRegistry.prototype.admitCachedProviderForStoredLiteralCredential;
+			using _admissionSpy = vi
+				.spyOn(ModelRegistry.prototype, "admitCachedProviderForStoredLiteralCredential")
+				.mockImplementation(function (this: ModelRegistry, providerId, selector) {
+					const admitted = originalAdmission.call(this, providerId, selector);
+					admissions.push(admitted);
+					return admitted;
+				});
+			using _blockedStartupFetch = hookFetch(() => {
+				startupRequests += 1;
+				return Promise.reject(new Error("print startup provider request"));
+			});
+
+			await runRootCommand(
+				rootArgs({
+					mode: "text",
+					model: `${provider}/${modelId}`,
+					credential: `${provider}/id:${selectedRow.id}`,
+				}),
+				[],
+				{
+					createAgentSession: async (options = {}) => {
+						const rootRegistry = options.modelRegistry;
+						if (!rootRegistry) throw new Error("Expected main-owned root registry");
+						const refreshSpy = vi.spyOn(rootRegistry, "refreshInBackground").mockImplementation(() => {
+							postCreateRefreshes += 1;
+						});
+						restorePostRefresh = () => refreshSpy.mockRestore();
+						const result = await createAgentSession(options);
+						observedModel = result.session.model;
+						observedFallback = result.modelFallbackMessage;
+						if (!observedModel) {
+							await result.session.dispose();
+							return fakeSessionResult();
+						}
+						return result;
+					},
+					discoverAuthStorage: async () => rootAuth,
+					settings: Settings.isolated({ "marketplace.autoUpdate": "off", "startup.checkUpdate": false }),
+					suppressProcessExit: true,
+					initTheme: async () => {},
+					readPipedInput: async () => undefined,
+					runStartupCredentialAutoImportIfNeeded: async () => undefined,
+					runPrintMode: async session => {
+						printedModel = session.model;
+						await session.dispose();
+					},
+					quit: async () => {},
+				},
+			);
+
+			expect(admissions).toEqual([true]);
+			expect(observedModel).toMatchObject({ provider, id: modelId });
+			expect(observedFallback).toBeUndefined();
+			expect(printedModel).toMatchObject({ provider, id: modelId });
+			expect(startupRequests).toBe(0);
+			expect(postCreateRefreshes).toBe(0);
+		} finally {
+			restorePostRefresh?.();
+			restoreRelocate?.();
+			closeModelCache(cacheDbPath);
+			closeModelCache();
+			setAgentDir(originalAgentDir);
+			resetSettingsForTest();
 		}
 	});
 	it("forwards CLI --mcp-config as mcpConfigPath to local SDK session startup", async () => {

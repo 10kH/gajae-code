@@ -11,6 +11,7 @@ import type {
 	ResponseOutputMessage,
 	ResponseReasoningItem,
 } from "openai/resources/responses/responses";
+import { modelSupportsReasoningControl } from "../model-thinking";
 import { calculateCost } from "../models";
 import {
 	type Api,
@@ -30,7 +31,7 @@ import {
 } from "../types";
 import { normalizeResponsesToolCallId, sanitizeJsonStrings } from "../utils";
 import type { AssistantMessageEventStream } from "../utils/event-stream";
-import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import { captureUnicodeEscapeEvidence, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
 import { areJsonValuesEqual } from "../utils/schema";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
@@ -914,21 +915,21 @@ export async function processResponsesStream<TApi extends Api>(
 							? "conflicting"
 							: "malformed"
 					: undefined;
-				const escapedNonAscii = findUnnecessaryUnicodeEscape(rawArguments) !== undefined;
 				const toolCall: ToolCall = {
 					type: "toolCall",
 					id: encodeResponsesToolCallId(item.call_id, item.id),
 					name: item.name,
 					arguments: args,
 					...(incompleteArguments ? { incompleteArguments: true, incompleteArgumentsReason } : {}),
-					...(escapedNonAscii ? { escapedNonAsciiArguments: true } : {}),
 				};
+				captureUnicodeEscapeEvidence(toolCall, rawArguments);
 				if (entry?.block.type === "toolCall") {
 					entry.block.id = toolCall.id;
 					entry.block.name = toolCall.name;
 					entry.block.arguments = args;
-					if (escapedNonAscii) entry.block.escapedNonAsciiArguments = true;
-					else delete entry.block.escapedNonAsciiArguments;
+					delete entry.block.escapedNonAsciiArguments;
+					delete entry.block.escapedUnicodeArgumentEvidence;
+					captureUnicodeEscapeEvidence(entry.block, rawArguments);
 					if (incompleteArguments) {
 						entry.block.incompleteArguments = true;
 						entry.block.incompleteArgumentsReason = incompleteArgumentsReason;
@@ -1170,6 +1171,7 @@ export function applyResponsesReasoningParams<P extends OpenAI.Responses.Respons
 	// multi-turn conversations when store is false (items aren't persisted server-side, so
 	// we must include the full content). See: https://github.com/can1357/gajae-code/issues/41
 	params.include = ["reasoning.encrypted_content"];
+	if (!modelSupportsReasoningControl(model)) return;
 
 	if (options?.reasoning || options?.reasoningSummary !== undefined) {
 		const requested = options?.reasoning || "medium";

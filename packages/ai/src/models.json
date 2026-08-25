@@ -15785,31 +15785,6 @@
 				"maxLevel": "high"
 			}
 		},
-		"gemini-3.7-flash-high": {
-			"id": "gemini-3.7-flash-high",
-			"name": "Gemini 3.7 Flash (High) (Antigravity)",
-			"api": "google-gemini-cli",
-			"provider": "google-antigravity",
-			"baseUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com",
-			"reasoning": true,
-			"input": [
-				"text",
-				"image"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 1048576,
-			"maxTokens": 65536,
-			"thinking": {
-				"mode": "google-level",
-				"minLevel": "low",
-				"maxLevel": "high"
-			}
-		},
 		"gemini-3.6-flash-low": {
 			"id": "gemini-3.6-flash-low",
 			"name": "Gemini 3.6 Flash (Low) (Antigravity)",
@@ -15835,31 +15810,6 @@
 				"maxLevel": "high"
 			}
 		},
-		"gemini-3.7-flash-low": {
-			"id": "gemini-3.7-flash-low",
-			"name": "Gemini 3.7 Flash (Low) (Antigravity)",
-			"api": "google-gemini-cli",
-			"provider": "google-antigravity",
-			"baseUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com",
-			"reasoning": true,
-			"input": [
-				"text",
-				"image"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 1048576,
-			"maxTokens": 65536,
-			"thinking": {
-				"mode": "google-level",
-				"minLevel": "low",
-				"maxLevel": "high"
-			}
-		},
 		"gemini-3.6-flash-medium": {
 			"id": "gemini-3.6-flash-medium",
 			"name": "Gemini 3.6 Flash (Medium) (Antigravity)",
@@ -15882,31 +15832,6 @@
 			"thinking": {
 				"mode": "google-level",
 				"minLevel": "minimal",
-				"maxLevel": "high"
-			}
-		},
-		"gemini-3.7-flash-medium": {
-			"id": "gemini-3.7-flash-medium",
-			"name": "Gemini 3.7 Flash (Medium) (Antigravity)",
-			"api": "google-gemini-cli",
-			"provider": "google-antigravity",
-			"baseUrl": "https://daily-cloudcode-pa.sandbox.googleapis.com",
-			"reasoning": true,
-			"input": [
-				"text",
-				"image"
-			],
-			"cost": {
-				"input": 0,
-				"output": 0,
-				"cacheRead": 0,
-				"cacheWrite": 0
-			},
-			"contextWindow": 1048576,
-			"maxTokens": 65536,
-			"thinking": {
-				"mode": "google-level",
-				"minLevel": "low",
 				"maxLevel": "high"
 			}
 		},
@@ -26705,6 +26630,37 @@
 			},
 			"contextWindow": 222222,
 			"maxTokens": 8888
+		},
+		"stealth/ox-alpha": {
+			"id": "stealth/ox-alpha",
+			"name": "Ox Alpha",
+			"api": "openai-completions",
+			"provider": "kilo",
+			"baseUrl": "https://api.kilo.ai/api/gateway",
+			"reasoning": true,
+			"input": [
+				"text",
+				"image"
+			],
+			"cost": {
+				"input": 0,
+				"output": 0,
+				"cacheRead": 0,
+				"cacheWrite": 0
+			},
+			"contextWindow": 1048576,
+			"maxTokens": 131072,
+			"thinking": {
+				"mode": "effort",
+				"minLevel": "low",
+				"maxLevel": "max",
+				"defaultLevel": "max",
+				"levels": [
+					"low",
+					"high",
+					"max"
+				]
+			}
 		},
 		"stealth/qwen3.6-plus": {
 			"id": "stealth/qwen3.6-plus",

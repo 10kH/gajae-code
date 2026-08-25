@@ -57,11 +57,21 @@ Gajae-Code（`gjc`）是一个外置编码代理 harness：丢进任意仓库或
 
 ## 快速开始
 
-**安装** — 提供 Linux（x64/arm64）、macOS（arm64/x64）、Windows（x64）预编译二进制；npm/Bun 路径全平台可用：
+**安装** — 提供 Linux（x64/arm64）、macOS（arm64/x64）、Windows（x64）预编译二进制。不需要 Bun：
 
 ```sh
-bun install -g gajae-code
+curl -fsSL https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.sh -o gjc-install.sh
+sh gjc-install.sh
 gjc
+```
+
+从 `main` 管道执行会运行可变安装脚本。仅在需要最新安装器时使用。
+
+Windows（PowerShell，固定标签）：
+
+```powershell
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/Yeachan-Heo/gajae-code/v0.15.0/scripts/install.ps1 -OutFile gjc-install.ps1
+powershell -File gjc-install.ps1
 ```
 
 **首次使用** — 选好订阅就出发：
@@ -82,7 +92,7 @@ gjc --tmux --worktree my-task      # 高风险工作用隔离 worktree
 gjc @screenshot.png "该改什么？"      # 图片输入
 ```
 
-Nightly 渠道：`bun install -g gajae-code@nightly`。完整安装矩阵、Windows 设置、更新渠道与 shell 补全：[docs/install.md](docs/install.md)。
+Nightly 渠道：`sh gjc-install.sh --channel nightly`（使用上面下载的 tagged 安装器）。完整安装矩阵、Windows 设置、更新渠道与 shell 补全：[docs/install.md](docs/install.md)。Bun 仅用于从源码构建。
 
 ---
 
@@ -234,7 +244,7 @@ The session command selector accepts only "gjc" or "gjc --worktree [name]".
 若控制器要直接驱动单个在线会话，每个会话还暴露回环 **SDK WebSocket** 端点、`gjc sdk session` CLI（`list|inspect|send|status|tail`）以及内置 `sdk-skills/`（`gjc-sdk-discover` · `gjc-sdk-operate` · `gjc-sdk-author`）— 任何控制器托管的代理都能遵循的、经过审阅且带审批门的流程。
 
 - [外部控制器集成指南](docs/bot-integration.md) · [Coordinator MCP 桥](docs/hermes-mcp-bridge.md)
-- [外部控制器 / 机器人](docs/bot-integration.md) — 提供商无关冒烟测试；[`docs/aside-integration.md`](docs/aside-integration.md) 涵盖可选的搜索/上下文边车
+- [外部控制器 / 机器人](docs/bot-integration.md) — 提供商无关冒烟测试；[`docs/aside-integration.md`](docs/aside-integration.md) 涵盖可选的搜索/上下文边车和 `/aside` 编辑器命令
 - [SDK 与线协议](docs/sdk.md) · [SDK 会话 CLI](docs/sdk-session-cli.md) · [外部控制就绪度](docs/external-control-readiness.md)
 
 ---

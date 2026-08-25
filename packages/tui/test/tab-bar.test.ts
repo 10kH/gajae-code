@@ -10,6 +10,12 @@ const ansiTheme: TabBarTheme = {
 };
 
 describe("TabBar", () => {
+	it("renders a caller-provided navigation hint", () => {
+		const tabBar = new TabBar("설정", [{ id: "appearance", label: "화면" }], ansiTheme, 0, "(Tab 키로 전환)");
+
+		expect(tabBar.render(80).join("\n")).toContain("(Tab 키로 전환)");
+	});
+
 	it("wraps without producing style-only lines or duplicate active highlights", () => {
 		const tabs = [
 			{ id: "display", label: "Display" },

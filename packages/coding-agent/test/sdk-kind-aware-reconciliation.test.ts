@@ -13,6 +13,34 @@ describe("kind-aware reconciliation", () => {
 		expect(() => rec.admit("prompt", "same-ref")).toThrow(/clientRef/);
 	});
 
+	test("a steer-only writer preserves prompt records owned by another reconciler", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-owned-recon-"));
+		try {
+			const sessionFile = path.join(root, "s.jsonl");
+			await fs.writeFile(sessionFile, "");
+			const store = createReconciliationStore({ sessionFile, sessionId: "owned", now: () => 1_000 });
+			await store.transact(() => [
+				{
+					kind: "prompt",
+					commandId: "prompt-command",
+					turnId: "prompt-turn",
+					clientRef: "prompt-ref",
+					status: "accepted",
+					acceptedAt: 1,
+				},
+			]);
+			const reconciliation = createKindAwareReconciliation({ store, ownedKinds: ["steer"] });
+			await reconciliation.hydrateFromStore();
+			await reconciliation.reserveSteer("steer-ref", "body");
+			expect(store.snapshot()).toEqual([
+				expect.objectContaining({ kind: "prompt", clientRef: "prompt-ref" }),
+				expect.objectContaining({ kind: "steer", clientRef: "steer-ref" }),
+			]);
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
 	test("durable store survives process restart with process_restart settlement", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "kind-recon-"));
 		const sessionFile = path.join(root, "s.jsonl");
@@ -68,10 +96,16 @@ describe("kind-aware reconciliation", () => {
 	test("terminal transitions preserve claimed skill outcomes across reload", async () => {
 		const cases = [
 			{
-				name: "stopped claim beats a later failure frame",
+				name: "agent failure beats an earlier stopped claim at the terminal boundary",
 				outcome: { kind: "stopped", reason: "cancelled", provenance: "client_cancel" },
 				frame: { type: "agent_failed", error: new Error("late failure") },
-				expectedStatus: "terminal_ok",
+				expectedStatus: "failed",
+				expectedOutcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "Prompt submission failed.",
+					provenance: "agent_failed",
+				},
 			},
 			{
 				name: "failed claim beats a later completion frame",
@@ -83,6 +117,12 @@ describe("kind-aware reconciliation", () => {
 				},
 				frame: { type: "agent_end" },
 				expectedStatus: "failed",
+				expectedOutcome: {
+					kind: "failed",
+					code: "prompt_failed",
+					message: "claimed failure",
+					provenance: "agent_failed",
+				},
 			},
 		] as const;
 
@@ -99,10 +139,12 @@ describe("kind-aware reconciliation", () => {
 				await rec.noteAccepted("skill", correlation, clientRef, { skillName: "deep-interview" });
 				await rec.claimPendingOutcome("skill", correlation, testCase.outcome);
 				await rec.noteTransition("skill", correlation, testCase.frame);
+				if (testCase.frame.type === "agent_failed")
+					await rec.noteTransition("skill", correlation, { type: "agent_end" });
 
 				expect(rec.lookup("skill", { clientRef }), testCase.name).toMatchObject({
 					status: testCase.expectedStatus,
-					outcome: testCase.outcome,
+					outcome: testCase.expectedOutcome,
 				});
 
 				const reopenedStore = createReconciliationStore({ sessionFile, sessionId: "s1", now: () => 2000 });
@@ -110,7 +152,7 @@ describe("kind-aware reconciliation", () => {
 				await reopened.hydrateFromStore();
 				expect(reopened.lookup("skill", { clientRef }), `${testCase.name} after reload`).toMatchObject({
 					status: testCase.expectedStatus,
-					outcome: testCase.outcome,
+					outcome: testCase.expectedOutcome,
 				});
 			} finally {
 				await fs.rm(root, { recursive: true, force: true });

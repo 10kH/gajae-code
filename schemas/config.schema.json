@@ -116,7 +116,7 @@
 				},
 				"checkUpdate": {
 					"type": "boolean",
-					"description": "At interactive startup, notify of newer versions; never install. Use `gjc update` only for recognized Bun global, Windows npm, or bundled-installer binaries; source, linked, and unrecognized installs use their original method.",
+					"description": "At interactive startup, notify of newer versions; never install. `gjc update` installs the matching GitHub release binary. Source, linked, and unrecognized installs stay on their original method.",
 					"default": true
 				},
 				"updateChannel": {
@@ -529,6 +529,22 @@
 						}
 					},
 					"additionalProperties": false
+				}
+			},
+			"additionalProperties": false
+		},
+		"ui": {
+			"type": "object",
+			"properties": {
+				"language": {
+					"type": "string",
+					"enum": [
+						"en",
+						"ko",
+						"ja"
+					],
+					"description": "Language for human-facing interactive UI text",
+					"default": "en"
 				}
 			},
 			"additionalProperties": false

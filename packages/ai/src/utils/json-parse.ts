@@ -1,3 +1,4 @@
+import * as crypto from "node:crypto";
 import { parse as partialParse } from "partial-json";
 
 const QUOTE = 0x22;
@@ -23,6 +24,121 @@ const CONTROL_ESCAPES: readonly string[] = (() => {
 
 function isHexDigit(cp: number): boolean {
 	return (cp >= 0x30 && cp <= 0x39) || ((cp | 0x20) >= 0x61 && (cp | 0x20) <= 0x66);
+}
+
+const MAX_UNICODE_ESCAPE_POSITIONS = 32;
+const MAX_UNICODE_ESCAPE_DEPTH = 64;
+const UNICODE_ESCAPE_EVIDENCE_KEY_SLOT = Symbol.for("@gajae-code/ai.unicode-escape-evidence-key.v1");
+const unicodeEscapeEvidenceGlobal = globalThis as unknown as Record<PropertyKey, unknown>;
+const existingUnicodeEscapeEvidenceKey = unicodeEscapeEvidenceGlobal[UNICODE_ESCAPE_EVIDENCE_KEY_SLOT];
+const UNICODE_ESCAPE_EVIDENCE_KEY = Buffer.isBuffer(existingUnicodeEscapeEvidenceKey)
+	? existingUnicodeEscapeEvidenceKey
+	: crypto.randomBytes(32);
+if (!Buffer.isBuffer(existingUnicodeEscapeEvidenceKey)) {
+	Object.defineProperty(unicodeEscapeEvidenceGlobal, UNICODE_ESCAPE_EVIDENCE_KEY_SLOT, {
+		value: UNICODE_ESCAPE_EVIDENCE_KEY,
+		writable: false,
+		configurable: false,
+		enumerable: false,
+	});
+}
+
+export interface UnicodeEscapePositionEvidence {
+	/** UTF-16 offset of the escape's leading backslash in the raw JSON. */
+	readonly offset: number;
+	/** Process-keyed tag of the encoded scalar; never the recoverable character. */
+	readonly scalarTag: string;
+	/** Process-keyed tag of the unambiguous array-index-free path; never raw field names. */
+	readonly pathTag: string;
+	/** Escapes in object keys are structural and can never be display-safe. */
+	readonly location: "key" | "value";
+	/** Ordinal of this string among values sharing the array-index-free path. */
+	readonly valueOrdinal: number;
+	/** UTF-16 offset of the decoded scalar inside that string value. */
+	readonly valueOffset: number;
+}
+
+export interface UnicodeEscapeEvidence {
+	readonly positions: readonly UnicodeEscapePositionEvidence[];
+	/** Total qualifying escapes observed, including positions omitted by the cap. */
+	readonly totalPositions: number;
+	/** More qualifying escapes existed than the bounded evidence can carry. */
+	readonly truncated: boolean;
+	/** The raw JSON could not be mapped exactly and unambiguously; validation must fail closed. */
+	readonly malformed: boolean;
+	/** Process-local HMAC binding the complete collector-produced envelope. */
+	readonly integrity: string;
+}
+
+interface UnicodeEscapeEvidenceTarget {
+	escapedNonAsciiArguments?: boolean;
+	escapedUnicodeArgumentEvidence?: UnicodeEscapeEvidence;
+}
+
+/** Stable, payload-free identity for an unambiguous array-index-free argument path. */
+export function unicodeEscapePathTag(path: readonly string[]): string {
+	const hash = crypto.createHmac("sha256", UNICODE_ESCAPE_EVIDENCE_KEY);
+	const length = Buffer.allocUnsafe(4);
+	length.writeUInt32BE(path.length);
+	hash.update(length);
+	for (const segment of path) {
+		length.writeUInt32BE(Buffer.byteLength(segment));
+		hash.update(length);
+		hash.update(segment);
+	}
+	return hash.digest("hex");
+}
+
+/** Process-keyed scalar identity used without retaining recoverable argument text. */
+export function unicodeEscapeScalarTag(codePoint: number): string {
+	return crypto.createHmac("sha256", UNICODE_ESCAPE_EVIDENCE_KEY).update(`scalar:v1:${codePoint}`).digest("hex");
+}
+
+function unicodeEscapeEvidenceIntegrity(evidence: Omit<UnicodeEscapeEvidence, "integrity">): string {
+	const hmac = crypto.createHmac("sha256", UNICODE_ESCAPE_EVIDENCE_KEY);
+	hmac.update(`v1:${evidence.totalPositions}:${evidence.truncated ? 1 : 0}:${evidence.malformed ? 1 : 0}`);
+	for (const position of evidence.positions) {
+		hmac.update(
+			`|${position.offset}:${position.location}:${position.valueOrdinal}:${position.valueOffset}:${position.scalarTag}:`,
+		);
+		hmac.update(position.pathTag);
+	}
+	return hmac.digest("hex");
+}
+
+function createUnicodeEscapeEvidence(
+	positions: readonly UnicodeEscapePositionEvidence[],
+	totalPositions: number,
+	truncated: boolean,
+	malformed: boolean,
+): UnicodeEscapeEvidence {
+	const evidence = { positions, totalPositions, truncated, malformed };
+	return { ...evidence, integrity: unicodeEscapeEvidenceIntegrity(evidence) };
+}
+
+/** Verify that an evidence envelope is complete and was produced in this process. */
+export function verifyUnicodeEscapeEvidence(evidence: UnicodeEscapeEvidence): boolean {
+	if (
+		!Array.isArray(evidence.positions) ||
+		evidence.positions.length > MAX_UNICODE_ESCAPE_POSITIONS ||
+		!Number.isSafeInteger(evidence.totalPositions) ||
+		evidence.totalPositions < evidence.positions.length ||
+		(!evidence.truncated && evidence.totalPositions !== evidence.positions.length) ||
+		typeof evidence.integrity !== "string" ||
+		!/^[0-9a-f]{64}$/.test(evidence.integrity)
+	) {
+		return false;
+	}
+	try {
+		const expected = unicodeEscapeEvidenceIntegrity(evidence);
+		return crypto.timingSafeEqual(Buffer.from(evidence.integrity, "hex"), Buffer.from(expected, "hex"));
+	} catch {
+		return false;
+	}
+}
+
+function isSuspiciousEscapedScalar(codePoint: number): boolean {
+	return (codePoint >= 0x20 && codePoint < 0x7f) || codePoint >= 0x80;
 }
 
 export function repairJson(json: string): string {
@@ -114,15 +230,16 @@ export function repairJson(json: string): string {
  * First unnecessary `\uXXXX` escape in a JSON document, or `undefined` when the
  * document contains none.
  *
- * "Unnecessary" means the escape encodes a character JSON can carry literally:
- * any non-ASCII printable character. Control characters (< U+0020) MUST be
- * escaped, and an unpaired surrogate CANNOT be written literally, so neither
- * counts. A `\\uXXXX` sequence is a literal backslash followed by `u` — the
+ * "Unnecessary" means the escape encodes a printable character JSON can carry
+ * literally, including ASCII. ASCII must remain observable because one mistyped
+ * nibble can move a non-ASCII escape into ASCII (`\u00b7` → `\u0077`). Control
+ * characters (< U+0020), DEL, and unpaired surrogates are excluded. A `\\uXXXX`
+ * sequence is a literal backslash followed by `u` — the
  * intended source syntax when the model is writing code or a nested JSON
  * document — and is skipped, which is why this scans the raw text with the same
  * string/escape state machine as {@link repairJson} instead of using a regex.
  *
- * Models that spell non-ASCII text as hand-written hex instead of literal UTF-8
+ * Models that spell text as hand-written hex instead of literal characters
  * mistype the digits, and every mistyped nibble silently decodes to a different
  * but perfectly valid character (`\uc7a5` vs `\uc7a4`). The resulting arguments
  * parse cleanly and cannot be repaired after the fact, so the escape itself is
@@ -182,12 +299,211 @@ export function findUnnecessaryUnicodeEscape(json: string): string | undefined {
 			i += 6;
 			continue;
 		}
-		if (first >= 0x80 && !(first >= 0xdc00 && first <= 0xdfff)) {
+		if (isSuspiciousEscapedScalar(first) && !(first >= 0xdc00 && first <= 0xdfff)) {
 			return json.slice(i, i + 6);
 		}
 		i += 6;
 	}
 	return undefined;
+}
+
+/**
+ * Bounded raw-position/scalar evidence for every suspicious `\uXXXX` escape.
+ *
+ * Scalars and paths are carried only as process-keyed HMAC tags, so terminal
+ * validation can match them against decoded arguments without retaining
+ * recoverable characters, keys, or values in messages, diagnostics, or durable
+ * session artifacts. Array indices are
+ * intentionally omitted to preserve `questions.question`-style field matching.
+ */
+export function collectUnicodeEscapeEvidence(json: string): UnicodeEscapeEvidence | undefined {
+	const firstEscape = findUnnecessaryUnicodeEscape(json);
+	if (firstEscape === undefined) return undefined;
+
+	try {
+		JSON.parse(json);
+	} catch {
+		return createUnicodeEscapeEvidence([], 0, false, true);
+	}
+
+	const positions: UnicodeEscapePositionEvidence[] = [];
+	let totalPositions = 0;
+	let truncated = false;
+	let i = 0;
+	const path: string[] = [];
+	const valueOrdinals = new Map<string, number>();
+
+	const push = (
+		offset: number,
+		codePoint: number,
+		pathTag: string,
+		location: "key" | "value",
+		valueOrdinal: number,
+		valueOffset: number,
+	): void => {
+		if (!isSuspiciousEscapedScalar(codePoint)) return;
+		totalPositions++;
+		if (positions.length >= MAX_UNICODE_ESCAPE_POSITIONS) {
+			truncated = true;
+			return;
+		}
+		positions.push({
+			offset,
+			scalarTag: unicodeEscapeScalarTag(codePoint),
+			pathTag,
+			location,
+			valueOrdinal,
+			valueOffset,
+		});
+	};
+	const whitespace = (): void => {
+		while (i < json.length) {
+			const cp = json.charCodeAt(i);
+			if (cp !== 0x20 && cp !== 0x09 && cp !== 0x0a && cp !== 0x0d) break;
+			i++;
+		}
+	};
+	const string = (location: "key" | "value"): string => {
+		const start = i;
+		const pathTag = unicodeEscapePathTag(path);
+		const valueOrdinal = location === "value" ? (valueOrdinals.get(pathTag) ?? 0) : 0;
+		if (location === "value") valueOrdinals.set(pathTag, valueOrdinal + 1);
+		let decodedOffset = 0;
+		i++;
+		while (i < json.length) {
+			const cp = json.charCodeAt(i);
+			if (cp === QUOTE) {
+				i++;
+				return JSON.parse(json.slice(start, i)) as string;
+			}
+			if (cp !== BACKSLASH) {
+				i++;
+				decodedOffset++;
+				continue;
+			}
+			if (json.charCodeAt(i + 1) !== U) {
+				i += 2;
+				decodedOffset++;
+				continue;
+			}
+			const offset = i;
+			const first = Number.parseInt(json.slice(i + 2, i + 6), 16);
+			if (first >= 0xd800 && first <= 0xdbff) {
+				const low = Number.parseInt(json.slice(i + 8, i + 12), 16);
+				if (
+					json.charCodeAt(i + 6) === BACKSLASH &&
+					json.charCodeAt(i + 7) === U &&
+					low >= 0xdc00 &&
+					low <= 0xdfff
+				) {
+					push(
+						offset,
+						0x10000 + ((first - 0xd800) << 10) + (low - 0xdc00),
+						pathTag,
+						location,
+						valueOrdinal,
+						decodedOffset,
+					);
+					i += 12;
+					decodedOffset += 2;
+					continue;
+				}
+			} else if (!(first >= 0xdc00 && first <= 0xdfff)) {
+				push(offset, first, pathTag, location, valueOrdinal, decodedOffset);
+			}
+			i += 6;
+			decodedOffset++;
+		}
+		throw new Error("validated JSON string ended unexpectedly");
+	};
+	const value = (depth: number): void => {
+		if (depth > MAX_UNICODE_ESCAPE_DEPTH) throw new Error("Unicode escape evidence nesting exceeded");
+		whitespace();
+		const cp = json.charCodeAt(i);
+		if (cp === QUOTE) {
+			string("value");
+			return;
+		}
+		if (cp === 0x7b) {
+			i++;
+			const keys = new Set<string>();
+			whitespace();
+			if (json.charCodeAt(i) === 0x7d) {
+				i++;
+				return;
+			}
+			while (i < json.length) {
+				whitespace();
+				const key = string("key");
+				if (keys.has(key)) throw new Error("Duplicate JSON object key");
+				keys.add(key);
+				whitespace();
+				i++;
+				path.push(key);
+				value(depth + 1);
+				path.pop();
+				whitespace();
+				if (json.charCodeAt(i) === 0x7d) {
+					i++;
+					return;
+				}
+				i++;
+			}
+			return;
+		}
+		if (cp === 0x5b) {
+			i++;
+			whitespace();
+			if (json.charCodeAt(i) === 0x5d) {
+				i++;
+				return;
+			}
+			while (i < json.length) {
+				value(depth + 1);
+				whitespace();
+				if (json.charCodeAt(i) === 0x5d) {
+					i++;
+					return;
+				}
+				i++;
+			}
+			return;
+		}
+		while (i < json.length) {
+			const delimiter = json.charCodeAt(i);
+			if (delimiter === 0x2c || delimiter === 0x5d || delimiter === 0x7d) return;
+			i++;
+		}
+	};
+
+	try {
+		value(0);
+	} catch {
+		return createUnicodeEscapeEvidence([], 0, false, true);
+	}
+	return createUnicodeEscapeEvidence(positions, totalPositions, truncated, false);
+}
+
+/** Attach bounded raw evidence while preserving the existing call-level guard flag. */
+export function captureUnicodeEscapeEvidence(target: UnicodeEscapeEvidenceTarget, json: string): boolean {
+	const evidence = collectUnicodeEscapeEvidence(json);
+	if (!evidence) return false;
+	attachUnicodeEscapeEvidence(target, evidence);
+	return true;
+}
+
+/** Attach evidence as transient, non-enumerable metadata excluded from serialization. */
+export function attachUnicodeEscapeEvidence(
+	target: UnicodeEscapeEvidenceTarget,
+	evidence: UnicodeEscapeEvidence,
+): void {
+	target.escapedNonAsciiArguments = true;
+	Object.defineProperty(target, "escapedUnicodeArgumentEvidence", {
+		value: evidence,
+		writable: true,
+		configurable: true,
+		enumerable: false,
+	});
 }
 
 export function parseJsonWithRepair<T>(json: string): T {

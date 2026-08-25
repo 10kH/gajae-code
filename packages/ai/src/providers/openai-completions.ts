@@ -1,3 +1,4 @@
+import { scheduler } from "node:timers/promises";
 import { $credentialEnv, $env, extractHttpStatusFromError, logger } from "@gajae-code/utils";
 import OpenAI, { APIConnectionTimeoutError } from "openai";
 import type {
@@ -15,7 +16,12 @@ import {
 	mintProviderSafetyStop,
 	PROVIDER_SAFETY_STOP_ADAPTER_CAPABILITY,
 } from "../adapter-internals/provider-safety-stop";
-import { type Effort, getSupportedEfforts } from "../model-thinking";
+import {
+	type Effort,
+	getSupportedEfforts,
+	isGroqCompoundReasoningUnsupported,
+	modelSupportsReasoningControl,
+} from "../model-thinking";
 import { calculateCost } from "../models";
 import { getEnvApiKey } from "../stream";
 import {
@@ -43,7 +49,7 @@ import {
 import { normalizeSystemPrompts, sanitizeJsonStrings } from "../utils";
 import { createAbortSourceTracker } from "../utils/abort";
 import { AssistantMessageEventStream } from "../utils/event-stream";
-import { transportFailureFacts } from "../utils/fallback-transport";
+import { EMPTY_RESPONSE_PROVIDER_CODE, transportFailureFacts } from "../utils/fallback-transport";
 import { toFirepassWireModelId, toFireworksWireModelId } from "../utils/fireworks-model-id";
 import {
 	type CapturedHttpErrorResponse,
@@ -59,7 +65,12 @@ import {
 	iterateWithIdleTimeout,
 	resolveOpenAISdkRequestTimeoutMs,
 } from "../utils/idle-iterator";
-import { findUnnecessaryUnicodeEscape, isCompleteJson, parseStreamingJson } from "../utils/json-parse";
+import {
+	attachUnicodeEscapeEvidence,
+	captureUnicodeEscapeEvidence,
+	isCompleteJson,
+	parseStreamingJson,
+} from "../utils/json-parse";
 import { parseGitHubCopilotApiKey } from "../utils/oauth/github-copilot";
 import { getKimiCommonHeaders } from "../utils/oauth/kimi";
 import { notifyProviderResponse } from "../utils/provider-response";
@@ -509,6 +520,45 @@ function getTrailingPartialDeepseekToken(text: string): string {
 
 const OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE =
 	"OpenAI completions stream timed out while waiting for the first event";
+const OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE = "Provider returned an empty response with zero token usage";
+const OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_MAX_RETRIES = 3;
+const OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_BASE_DELAY_MS = 2000;
+
+function hasReplayUnsafeOpenAICompletionsDelta(chunk: ChatCompletionChunk): boolean {
+	const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+	const delta = choice?.delta;
+	if (!delta) return false;
+	if (typeof delta.refusal === "string" && delta.refusal.length > 0) return true;
+	if (normalizeStreamingContentText(delta.content).length > 0) return true;
+	if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) return true;
+	return ["reasoning_content", "reasoning", "reasoning_text"].some(field => {
+		const value = (delta as Record<string, unknown>)[field];
+		return typeof value === "string" && value.length > 0;
+	});
+}
+
+function hasNetworkErrorFinishReason(chunk: ChatCompletionChunk): boolean {
+	const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
+	return (choice?.finish_reason as string | null | undefined) === "network_error";
+}
+
+function isEmptyOpenAICompletionsResponse(
+	output: AssistantMessage,
+	hasExplicitUsageReport: boolean,
+	hasNonzeroUsageEvidence: boolean,
+): boolean {
+	return (
+		hasExplicitUsageReport &&
+		!hasNonzeroUsageEvidence &&
+		output.stopReason === "stop" &&
+		output.content.length === 0 &&
+		output.usage.input === 0 &&
+		output.usage.output === 0 &&
+		output.usage.cacheRead === 0 &&
+		output.usage.cacheWrite === 0 &&
+		output.usage.totalTokens === 0
+	);
+}
 
 export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 	model: Model<"openai-completions">,
@@ -654,6 +704,63 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				output.usage.premiumRequests = premiumRequestsTotal;
 			}
 			stream.push({ type: "start", partial: output });
+			const iterateAttempt = (attemptStream: AsyncIterable<ChatCompletionChunk>) =>
+				iterateWithIdleTimeout(attemptStream, {
+					firstItemTimeoutMs: firstEventTimeoutMs,
+					firstItemErrorMessage: OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE,
+					idleTimeoutMs,
+					errorMessage: "OpenAI completions stream stalled while waiting for the next event",
+					onIdle: () => requestAbortController.abort(),
+					onFirstItemTimeout: () => requestAbortController.abort(),
+					abortSignal: options?.signal,
+					isProgressItem: isOpenAICompletionsProgressChunk,
+				});
+			const iterateWithNetworkErrorRetry = async function* (): AsyncGenerator<ChatCompletionChunk> {
+				let attemptStream = openaiStream;
+				let retryAttempt = 0;
+				while (true) {
+					const replaySafeChunks: ChatCompletionChunk[] = [];
+					let replayUnsafe = false;
+					let retryNetworkError = false;
+					for await (const chunk of iterateAttempt(attemptStream)) {
+						if (!replayUnsafe && hasReplayUnsafeOpenAICompletionsDelta(chunk)) {
+							replayUnsafe = true;
+							for (const bufferedChunk of replaySafeChunks) yield bufferedChunk;
+							replaySafeChunks.length = 0;
+						}
+						if (replayUnsafe) {
+							yield chunk;
+							continue;
+						}
+						replaySafeChunks.push(chunk);
+						if (hasNetworkErrorFinishReason(chunk) && !options?.fallbackManaged) {
+							retryNetworkError = true;
+							break;
+						}
+					}
+
+					if (
+						!retryNetworkError ||
+						abortTracker.wasCallerAbort() ||
+						retryAttempt >=
+							resolveRetryBudget(options?.streamMaxRetries, OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_MAX_RETRIES)
+					) {
+						for (const bufferedChunk of replaySafeChunks) yield bufferedChunk;
+						return;
+					}
+
+					retryAttempt += 1;
+					const delayMs = OPENAI_COMPLETIONS_NETWORK_ERROR_RETRY_BASE_DELAY_MS * 2 ** (retryAttempt - 1);
+					if (options?.providerRetryWait) {
+						await options.providerRetryWait(delayMs, options.signal);
+					} else {
+						await scheduler.wait(delayMs, { signal: options?.signal });
+					}
+					if (abortTracker.wasCallerAbort()) throw new Error("Request was aborted");
+					attemptStream = await createCompletionsStream();
+					streamConnected = true;
+				}
+			};
 
 			const parseMiniMaxThinkTags = model.provider === "minimax-code" || model.provider === "minimax-code-cn";
 			// Some OpenAI-compatible DeepSeek hosts (including NVIDIA NIM and DeepSeek's
@@ -681,7 +788,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 					return;
 				}
 				block.arguments = parseStreamingJson(block.partialArgs);
-				if (findUnnecessaryUnicodeEscape(block.partialArgs ?? "")) block.escapedNonAsciiArguments = true;
+				captureUnicodeEscapeEvidence(block, block.partialArgs ?? "");
 				delete (block as { partialArgs?: string }).partialArgs;
 				stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: output });
 			};
@@ -812,7 +919,12 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				block.arguments = parseStreamingJson(call.arguments);
 				// The healer already normalized `call.arguments`, decoding any escapes away,
 				// so the signal has to come from its pre-round-trip sample of the raw payload.
-				if (call.escapedNonAsciiArguments) block.escapedNonAsciiArguments = true;
+				if (call.escapedNonAsciiArguments) {
+					block.escapedNonAsciiArguments = true;
+					if (call.escapedUnicodeArgumentEvidence) {
+						attachUnicodeEscapeEvidence(block, call.escapedUnicodeArgumentEvidence);
+					}
+				}
 				currentBlock = block;
 				output.content.push(block);
 				stream.push({ type: "toolcall_start", contentIndex: blockIndex(block), partial: output });
@@ -832,6 +944,20 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				for (const call of calls) emitHealedToolCall(call);
 			};
 			let providerSafetyStop = false;
+			let hasExplicitUsageReport = false;
+			let hasNonzeroUsageEvidence = false;
+			const applyUsage = (rawUsage: object): void => {
+				const usage = parseChunkUsage(rawUsage, model, premiumRequestsTotal);
+				const hasExplicitTotal = getOptionalNumberProperty(rawUsage, "total_tokens") !== undefined;
+				const hasExplicitComponents =
+					getOptionalNumberProperty(rawUsage, "prompt_tokens") !== undefined &&
+					getOptionalNumberProperty(rawUsage, "completion_tokens") !== undefined;
+				hasExplicitUsageReport ||= hasExplicitTotal || hasExplicitComponents;
+				hasNonzeroUsageEvidence ||= usage.totalTokens > 0;
+				if (usage.totalTokens >= output.usage.totalTokens) {
+					output.usage = usage;
+				}
+			};
 			const markProviderSafetyStop = (errorMessage?: string): void => {
 				providerSafetyStop = true;
 				output.stopReason = "error";
@@ -848,16 +974,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (errorMessage) output.errorMessage = errorMessage;
 			};
 
-			for await (const chunk of iterateWithIdleTimeout(openaiStream, {
-				firstItemTimeoutMs: firstEventTimeoutMs,
-				firstItemErrorMessage: OPENAI_COMPLETIONS_FIRST_EVENT_TIMEOUT_MESSAGE,
-				idleTimeoutMs,
-				errorMessage: "OpenAI completions stream stalled while waiting for the next event",
-				onIdle: () => requestAbortController.abort(),
-				onFirstItemTimeout: () => requestAbortController.abort(),
-				abortSignal: options?.signal,
-				isProgressItem: isOpenAICompletionsProgressChunk,
-			})) {
+			for await (const chunk of iterateWithNetworkErrorRetry()) {
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -865,7 +982,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				output.responseId ||= chunk.id;
 
 				if (chunk.usage) {
-					output.usage = parseChunkUsage(chunk.usage, model, premiumRequestsTotal);
+					applyUsage(chunk.usage);
 				}
 
 				const choice = Array.isArray(chunk.choices) ? chunk.choices[0] : undefined;
@@ -874,7 +991,7 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 				if (!chunk.usage) {
 					const choiceUsage = getChoiceUsage(choice);
 					if (choiceUsage) {
-						output.usage = parseChunkUsage(choiceUsage, model, premiumRequestsTotal);
+						applyUsage(choiceUsage);
 					}
 				}
 
@@ -1060,9 +1177,21 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions"> = (
 			}
 
 			output.errorMessage = strictFallbackErrorMessage;
+			if (isEmptyOpenAICompletionsResponse(output, hasExplicitUsageReport, hasNonzeroUsageEvidence)) {
+				output.stopReason = "error";
+				output.errorMessage = OPENAI_COMPLETIONS_EMPTY_RESPONSE_MESSAGE;
+				output.transportFailure = {
+					kind: "transport",
+					providerCode: EMPTY_RESPONSE_PROVIDER_CODE,
+				};
+			}
 			output.duration = Date.now() - startTime;
 			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "done", reason: output.stopReason, message: output });
+			if (output.stopReason === "error") {
+				stream.push({ type: "error", reason: "error", error: output });
+			} else {
+				stream.push({ type: "done", reason: output.stopReason, message: output });
+			}
 			stream.end();
 		} catch (error) {
 			for (const block of output.content) delete (block as any).index;
@@ -1295,7 +1424,10 @@ function buildParams(
 	const compat = getCompat(model, resolvedBaseUrl);
 	const messages = convertMessages(model, context, compat);
 	maybeAddOpenRouterAnthropicCacheControl(model, messages);
-	const supportsReasoningParams = model.provider !== "github-copilot";
+	const supportsReasoningParams =
+		model.provider !== "github-copilot" &&
+		!isGroqCompoundReasoningUnsupported(model) &&
+		modelSupportsReasoningControl(model, resolvedBaseUrl);
 
 	// Kimi (including via OpenRouter and Fireworks router-form IDs such as
 	// `accounts/fireworks/routers/kimi-*`) calculates TPM rate limits based on
@@ -1508,6 +1640,13 @@ function buildParams(
 		Object.assign(params, compat.extraBody);
 	}
 	applyOpenAIRequestTransformBody(params, model.requestTransform);
+	if (!supportsReasoningParams) {
+		delete params.reasoning;
+		delete params.reasoning_effort;
+		delete params.thinking;
+		delete params.enable_thinking;
+		delete params.chat_template_kwargs;
+	}
 
 	return { params, toolStrictMode };
 }
@@ -1555,12 +1694,14 @@ export function parseChunkUsage(
 	// `completion_tokens` (which is the total billed output). Adding them would
 	// double-count.
 	const outputTokens = getOptionalNumberProperty(rawUsage, "completion_tokens") ?? 0;
+	const reportedTotalTokens = getOptionalNumberProperty(rawUsage, "total_tokens") ?? 0;
+	const componentTotalTokens = input + outputTokens + cachedTokens + cacheWriteTokens;
 	const usage: AssistantMessage["usage"] = {
 		input,
 		output: outputTokens,
 		cacheRead: cachedTokens,
 		cacheWrite: cacheWriteTokens,
-		totalTokens: input + outputTokens + cachedTokens + cacheWriteTokens,
+		totalTokens: Math.max(componentTotalTokens, reportedTotalTokens),
 		...(reasoningTokens > 0 ? { reasoningTokens } : {}),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		...(premiumRequests !== undefined ? { premiumRequests } : {}),
@@ -2090,7 +2231,6 @@ function shouldRetryWithoutStrictTools(
 		.join("\n");
 	return /wrong_api_format|mixed values for 'strict'|tool[s]?\b.*strict|\bstrict\b.*tool/i.test(messageParts);
 }
-
 function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | string): {
 	stopReason: StopReason;
 	errorMessage?: string;

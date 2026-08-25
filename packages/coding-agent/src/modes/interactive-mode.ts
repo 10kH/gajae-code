@@ -1865,7 +1865,7 @@ export class InteractiveMode implements InteractiveModeContext {
 				workingMessage => renderWorkingMessage(workingMessage, this.#getWorkingMessageAccent()),
 				message,
 				getSymbolTheme().spinnerFrames,
-				{ timeDependentColor: true },
+				{ timeDependentColor: true, renderScope: "layout" },
 			);
 			this.statusContainer.addChild(this.loadingAnimation);
 		}
@@ -2366,6 +2366,9 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	showProviderOnboarding(): void {
 		this.#selectorController.showProviderOnboarding();
+	}
+	showFrictionlessOnboarding(): Promise<void> {
+		return this.#selectorController.showFrictionlessOnboarding();
 	}
 
 	showPluginSelector(mode?: "install" | "uninstall"): void {
