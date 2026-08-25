@@ -68,7 +68,7 @@ describe("send_prompt same-session concurrency", () => {
 								if (operation === "session.create") {
 									brokerSessions.push({
 										sessionId,
-										locator: { cwd: root, worktreeRoot: null },
+										locator: { cwd: root, worktreeRoot: null, stateRoot: path.join(root, ".gjc", "state") },
 										live: true,
 										endpointGeneration: 1,
 										pid: authority.pid,

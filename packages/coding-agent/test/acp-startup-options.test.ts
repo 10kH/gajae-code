@@ -162,13 +162,13 @@ test("ACP maps non-prompt permission handling to the SDK allow policy", async ()
 test("ACP paginates after cwd filtering and terminates the filtered cursor", () => {
 	const foreign = Array.from({ length: 50 }, (_, index) => ({
 		sessionId: `foreign-${index}`,
-		locator: { cwd: "/other", worktreeRoot: null },
+		locator: { cwd: "/other", worktreeRoot: null, stateRoot: "/other/.gjc/state" },
 	}));
 	const sessions = [
 		...foreign,
 		{
 			sessionId: "workspace",
-			locator: { cwd: "/workspace", worktreeRoot: null },
+			locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
 			title: "MCP inspection",
 			endpointMtimeMs: 1_784_998_000_000,
 		},

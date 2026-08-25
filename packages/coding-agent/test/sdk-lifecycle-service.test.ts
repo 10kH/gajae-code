@@ -161,7 +161,12 @@ describe("SessionLifecycleService", () => {
 				ok: true,
 				result: {
 					indexSeq: 7,
-					sessions: [{ sessionId: "second", locator: { cwd: "/workspace", worktreeRoot: null } }],
+					sessions: [
+						{
+							sessionId: "second",
+							locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+						},
+					],
 					warnings: ["second-page-warning"],
 				},
 			},

@@ -15,6 +15,16 @@ import {
 const identityKey = "a".repeat(64);
 const bindingMac = "b".repeat(64);
 const temp = () => fs.mkdtemp(path.join(os.tmpdir(), "gjc-spawn-authority-"));
+function canonicalJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	return `{${Object.keys(record)
+		.filter(key => record[key] !== undefined)
+		.sort()
+		.map(key => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+		.join(",")}}`;
+}
 async function writeSpawnModelFixtures(agentDir: string): Promise<void> {
 	await fs.writeFile(
 		path.join(agentDir, "models.yml"),
@@ -71,6 +81,30 @@ const spawnPromptLayerFake = {
 };
 
 describe("SpawnAuthorityStore", () => {
+	it("reopens a canonical-only legacy claim and preserves canonical replay", async () => {
+		const agentDir = await temp();
+		const store = new SpawnAuthorityStore(agentDir, identityKey);
+		await store.open();
+		const owner = await store.claimOrJoin("legacy-canonical-replay", bindingMac, bindingMac);
+		if (owner.kind !== "owner") throw new Error("expected owner");
+		const file = path.join(agentDir, "sdk", "spawn-authority.jsonl");
+		const row = JSON.parse((await fs.readFile(file, "utf8")).trim()) as {
+			version: number;
+			claim: SpawnClaimV2 & { requestBindingMac?: string };
+			integrity: string;
+		};
+		delete row.claim.requestBindingMac;
+		row.claim.state = "closed";
+		row.claim.updatedAt += 1;
+		row.integrity = createHmac("sha256", Buffer.from(identityKey, "hex"))
+			.update(canonicalJson({ claim: row.claim }))
+			.digest("hex");
+		await fs.writeFile(file, `${canonicalJson(row)}\n`);
+		const reopened = new SpawnAuthorityStore(agentDir, identityKey);
+		await reopened.open();
+		const replay = await reopened.claimOrJoin("legacy-canonical-replay", bindingMac, bindingMac);
+		expect(replay.kind).toBe("terminal");
+	});
 	it("creates one durable prepared claim for concurrent same-identity callers", async () => {
 		const agentDir = await temp();
 		const gate = Promise.withResolvers<void>();
