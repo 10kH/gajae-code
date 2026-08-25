@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Foreground activity animation now uses layout-only TUI repaints, avoiding repeated reconstruction of unchanged transcript content during long sessions.
+
 ## [0.15.2] - 2026-08-25
 
 ### Changed

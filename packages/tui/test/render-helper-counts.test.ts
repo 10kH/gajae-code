@@ -105,4 +105,25 @@ describe("TUI render helper counters", () => {
 			tui.stop();
 		}
 	});
+
+	it("treats empty differential rows as zero-width without measuring them", async () => {
+		const term = new VirtualTerminal(12, 8);
+		const component = new MutableLinesComponent(["before", "", ""]);
+		const tui = new TUI(term);
+		tui.addChild(component);
+
+		try {
+			tui.start();
+			await settle(term);
+			TUI.resetRenderCountersForTest();
+
+			component.setLines(["after", "", ""]);
+			tui.requestRender(true, "empty-row-width-test");
+			await settle(term);
+
+			expect(TUI.getRenderCountersForTest().differentialGuardVisibleWidthCalls).toBe(0);
+		} finally {
+			tui.stop();
+		}
+	});
 });

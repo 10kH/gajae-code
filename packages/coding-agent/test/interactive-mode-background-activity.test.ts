@@ -83,6 +83,21 @@ describe("interactive background activity indicator", () => {
 		expect(resolveActivityIndicatorMessage(true, 2, "Working…")).toBe("Working… · 2 background tasks");
 	});
 
+	it("uses layout-only repaints for the foreground activity indicator", () => {
+		const layoutRender = vi.spyOn(mode.ui, "requestLayoutRender");
+		const fullRender = vi.spyOn(mode.ui, "requestRender");
+		try {
+			mode.ensureLoadingAnimation();
+
+			expect(layoutRender).toHaveBeenCalledWith("loader");
+			expect(fullRender.mock.calls.some(([, source]) => source === "loader")).toBe(false);
+		} finally {
+			mode.stopLoadingAnimation({ foregroundSettled: true });
+			layoutRender.mockRestore();
+			fullRender.mockRestore();
+		}
+	});
+
 	it("retires the foreground indicator when agent_end races stale streaming state", async () => {
 		mode.ensureLoadingAnimation();
 		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
