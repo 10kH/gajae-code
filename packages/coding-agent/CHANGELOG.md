@@ -6,6 +6,7 @@
 
 - Added scoped SDK session discovery and broker-authoritative master-mode task spawning through `gjc sdk search` and `gjc sdk spawn`, with exact worktree scope, authenticated master authority, and paginated result handling.
 - Added Japanese (`ja`) to the persisted `ui.language` response-language surface: the `/language` command and the Settings → Appearance selector. Accepted input spellings include `ja`, `ja-JP`, `japanese`, `jp`, `jpn`, and `日本語`. English and Korean behavior, defaults, and onboarding language ranking are unchanged. (#4947)
+- Added `/aside`, a composer slash command that probes a user-installed Aside CLI (`~/.local/bin/aside`, the macOS `Aside CLI.app` bundle, then `PATH`) and runs explicit `exec` / `account` invocations from GJC. Bare `/aside` prints the resolved path and version; `/aside mcp` prints `gjc mcp add aside <cli> mcp --project` with a quoted concrete binary instead of starting a stdio server; `/aside repl` stays terminal-only because the GJC host cannot attach a TTY. Missing-binary output includes the official install command. This does not restore the reverted Aside browser-tool backend and does not enable browser-control by default.
 
 ### Fixed
 
