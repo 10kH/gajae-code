@@ -2994,6 +2994,7 @@ async function invocationHarness(
 		/** Hold one matching durable transition until the test releases it. */
 		persistHold?: { type: string; onEntered: () => void; release: Promise<void> };
 		onLifecycleDrainTimeout?: () => void;
+		onFailureDiagnosticKeyCount?: (count: number) => void;
 		agentFailedWriteFailures?: number;
 	},
 ): Promise<InvocationHarness> {
@@ -3030,6 +3031,9 @@ async function invocationHarness(
 						abortPromptAndWaitWithTerminal: async () => ({ status: "settled", terminalScope: {} }),
 					},
 				}
+			: {}),
+		...(hooks.onFailureDiagnosticKeyCount
+			? { onFailureDiagnosticKeyCountForTests: hooks.onFailureDiagnosticKeyCount }
 			: {}),
 		...(hooks.settings ? { settings: hooks.settings } : {}),
 		createTransport: async ({ sessionId: id, stateRoot, token }) => ({
@@ -3319,11 +3323,15 @@ describe("post-acceptance invocation terminalization", () => {
 				const firstInflight = Promise.withResolvers<void>();
 				const secondInflight = Promise.withResolvers<void>();
 				let timeoutWarnings = 0;
+				const diagnosticKeyCounts: number[] = [];
 				let prompts = 0;
 				const harness = await invocationHarness(`${operation}-provider-race`, cwd, {
 					persistInterceptor: () => {},
 					onLifecycleDrainTimeout: () => {
 						timeoutWarnings += 1;
+					},
+					onFailureDiagnosticKeyCount: count => {
+						diagnosticKeyCounts.push(count);
 					},
 					persistHold: { type: "agent_failed", onEntered: entered.resolve, release: release.promise },
 					agentFailedWriteFailures: 0,
@@ -3383,6 +3391,7 @@ describe("post-acceptance invocation terminalization", () => {
 				release.resolve();
 				await Promise.all([end, lifecycleChange]);
 				expect(timeoutWarnings).toBe(0);
+				expect(diagnosticKeyCounts.at(-1)).toBe(0);
 				const failure = harness.broadcasts.find(frame => {
 					const payload = frame.payload;
 					return (

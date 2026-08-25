@@ -401,6 +401,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	onFrameAdmitted?: () => void;
 	/** Test-only observation of a genuinely timed-out lifecycle drain. */
 	onLifecycleDrainTimeoutForTests?: () => void;
+	/** Test-only observation of bounded failure-diagnostic deduplication state. */
+	onFailureDiagnosticKeyCountForTests?: (count: number) => void;
 }
 
 function unavailable(operation: string): () => never {
@@ -3470,6 +3472,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				// and the next agent_end is paired with stale ownership.
 				for (const invocation of failedTransitions) scheduleSkillTerminalRecovery(invocation);
 				retireEndedLifecycleBatch();
+				const failedKeys = new Set(failedTransitions.map(({ correlation }) => correlationKey(correlation)));
+				for (const invocation of transitions) {
+					if (!failedKeys.has(correlationKey(invocation.correlation)))
+						current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
+				}
+				options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 				resolveTerminalPublicationWaiters(observed);
 				return;
 			}
@@ -3492,6 +3500,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			}
 			for (const invocation of transitions)
 				current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
+			options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 			for (const invocation of transitions)
 				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
 			adoptLifecycleBatch(current.openLifecycleBatches[0]?.invocations);
