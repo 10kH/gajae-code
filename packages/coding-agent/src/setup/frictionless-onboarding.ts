@@ -196,10 +196,10 @@ function scriptScores(text: string): Map<string, number> {
 	const kana = counts.get("ja") ?? 0;
 	const han = counts.get("zh") ?? 0;
 	const scores = new Map<string, number>();
-	// Korean hangul is decisive when it is at least as strong as kana; Japanese
-	// kana claims mixed han so Chinese does not win on kanji alone. A claimant
-	// below the evidence minimum is stray-glyph noise and must not erase
-	// dominant han evidence.
+	// Korean Hangul is decisive only once it reaches the evidence minimum and is
+	// at least as strong as kana; an equal sub-threshold Hangul/kana pair leaves
+	// dominant Han evidence intact. Japanese kana claims mixed Han whenever it
+	// exceeds Hangul, including the lone-kana boundary below that minimum.
 	const koreanClaims = hangul >= kana && hangul >= LANGUAGE_EVIDENCE_MINIMUM;
 	const japaneseClaims = kana > hangul && kana >= LANGUAGE_EVIDENCE_MINIMUM;
 	if (hangul > 0 && hangul >= kana) addLanguageScore(scores, "ko", hangul);
