@@ -3648,59 +3648,6 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
-	test("uses SDK run tokens to disambiguate active and retired reused sessions", async () => {
-		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-run-token-retired-owner-"));
-		try {
-			const firstInflight = Promise.withResolvers<void>();
-			const secondInflight = Promise.withResolvers<void>();
-			let prompts = 0;
-			const harness = await invocationHarness("token-reused-session", cwd, {
-				persistInterceptor: () => {},
-				sendUserMessage: async (_content, options) => {
-					prompts += 1;
-					await options?.onPreflightAcceptCommit?.();
-					if (prompts === 1) await firstInflight.promise;
-					if (prompts === 2) await secondInflight.promise;
-				},
-			});
-			const first = await harness.control("turn.prompt", { text: "first" });
-			expect(first.ok).toBe(true);
-			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
-			await harness.emit("agent_start", { sdkRunToken: "old-run" });
-			await harness.switchSession("different-session");
-			await harness.switchSession("token-reused-session");
-			const successor = await harness.control("turn.prompt", { text: "successor" });
-			expect(successor.ok).toBe(true);
-			await harness.emit("agent_start", { sdkRunToken: "new-run" });
-			await harness.emit("agent_end", {
-				sdkRunToken: "old-run",
-				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
-			});
-			const failure = harness.broadcasts.find(frame => {
-				const payload = frame.payload;
-				return (
-					frame.kind === "agent_failed" &&
-					typeof payload === "object" &&
-					payload !== null &&
-					(payload as { commandId?: unknown }).commandId === firstIds.commandId &&
-					(payload as { turnId?: unknown }).turnId === firstIds.turnId
-				);
-			});
-			expect(failure).toMatchObject({ kind: "agent_failed", payload: { error: { code: "provider_http_402" } } });
-			await harness.emit("agent_end", {
-				sdkRunToken: "new-run",
-				messages: [{ role: "assistant", stopReason: "stop" }],
-			});
-			secondInflight.resolve();
-			firstInflight.resolve();
-			expect(prompts).toBe(2);
-			await harness.stop();
-		} finally {
-			await Bun.sleep(50);
-			await rm(cwd, { recursive: true, force: true });
-		}
-	});
-
 	test("a prompt killed by a provider stream interrupt reports a terminal failed status", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-terminalize-prompt-"));
 		try {

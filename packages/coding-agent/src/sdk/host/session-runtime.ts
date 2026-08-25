@@ -1555,6 +1555,7 @@ function createControlSurface(
 		correlation: InvocationCorrelation,
 		connectionId: string | undefined,
 		startsOwnTurn: boolean,
+		sdkRunToken: string,
 	) => void,
 	steerReconciliation: KindAwareReconciliation,
 	onPromotedTurn?: (
@@ -1714,7 +1715,7 @@ function createControlSurface(
 				// The accepted submission does NOT own the active turn until its run
 				// actually STARTS: the connection is carried on the pending entry and
 				// associated at agent_start instead (review thread P1).
-				onAccepted(kind, correlation, requesterConnectionId, startsOwnTurn);
+				onAccepted(kind, correlation, requesterConnectionId, startsOwnTurn, sdkRunToken);
 				preflight.resolve();
 			} catch (error) {
 				settled = true;
@@ -3187,7 +3188,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		type: "agent_start" | "agent_end" | "agent_failed",
 		sdkRunToken: unknown,
 	): RuntimeState | undefined =>
-		type !== "agent_start" && typeof sdkRunToken === "string" && sdkRunToken.length > 0
+		typeof sdkRunToken === "string" && sdkRunToken.length > 0
 			? lifecycleRunOwners.get(sdkRunToken)?.state
 			: lifecycleStateForContext(ctx, type);
 	const removeRetiredLifecycleOwner = (owner: RuntimeState): void => {
@@ -3197,10 +3198,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			retiredLifecycleOwnerTimers.delete(owner);
 		}
 		const owners = retiredLifecycleOwners.get(owner.sessionId);
-		if (!owners) return;
+		if (!owners) {
+			ambiguousLifecycleIdentities.delete(owner.sessionIdentity);
+			return;
+		}
 		const remaining = owners.filter(candidate => candidate !== owner);
 		if (remaining.length === 0) retiredLifecycleOwners.delete(owner.sessionId);
 		else retiredLifecycleOwners.set(owner.sessionId, remaining);
+		if (remaining.length < 2) ambiguousLifecycleIdentities.delete(owner.sessionIdentity);
 		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
 	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
@@ -3787,6 +3792,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			kind: InvocationKind;
 			correlation: InvocationCorrelation;
 			connectionId: string | undefined;
+			sdkRunToken: string;
 		}> = [];
 		for (const { correlation, acceptedAt, deadlineMaxAt } of reconciliation.listDeadlineRecoveryPendingPrompts())
 			deadlineManager.recoverPending(correlation, acceptedAt, deadlineMaxAt);
@@ -3889,13 +3895,14 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			ctx,
 			api,
 			reconciliation,
-			(kind, correlation, connectionId, startsOwnTurn) => {
+			(kind, correlation, connectionId, startsOwnTurn, sdkRunToken) => {
+				if (sdkRunToken) lifecycleRunOwners.set(sdkRunToken, { state: active! });
 				// Only submissions that start their OWN turn get a pending entry: a
 				// steering-queued submission consumed inside the current run never
 				// emits the agent_start that would consume the entry, so leaving it
 				// queued would assign its stale connection as owner of a later
 				// agent-initiated turn (review thread P1).
-				if (startsOwnTurn) pending.push({ kind, correlation, connectionId });
+				if (startsOwnTurn) pending.push({ kind, correlation, connectionId, sdkRunToken });
 				// Anchor the zero-progress deadline at durable acceptance, not at
 				// agent_start (#4668): an accepted own-turn prompt that wedges
 				// between acceptance and run start (provider/credential/compaction
@@ -3941,7 +3948,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// starts with an empty pending queue at its agent_start; create the
 					// entry at promotion so the submitting connection owns that turn
 					// (review thread P2).
-					pending.push({ kind, correlation, connectionId });
+					pending.push({ kind, correlation, connectionId, sdkRunToken });
 					return;
 				}
 				// Consumed INSIDE the currently running turn: no new agent_start
@@ -4371,7 +4378,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			}
 			active = undefined;
-			if (current.pending.length > 0 || current.openLifecycleBatches.length > 0 || current.lifecycleTasks.size > 0) {
+			if (
+				current.pending.length > 0 ||
+				current.openLifecycleBatches.length > 0 ||
+				(current.attachedInvocations?.length ?? 0) > 0 ||
+				(current.drainedInvocations?.length ?? 0) > 0 ||
+				current.lifecycleTasks.size > 0
+			) {
 				const owners = retiredLifecycleOwners.get(current.sessionId) ?? [];
 				owners.push(current);
 				retiredLifecycleOwners.set(current.sessionId, owners);
