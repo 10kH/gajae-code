@@ -3136,8 +3136,13 @@ async function settledStatus(
 
 describe("post-acceptance invocation terminalization", () => {
 	test.each([
-		402, 429,
-	])("terminalizes a streamed provider HTTP %i rejection and permits a healthy abort_and_prompt replacement", async status => {
+		{ status: 402, code: "provider_http_402" },
+		{ status: 429, code: "provider_http_429" },
+		{ status: 500, code: "provider_rejected" },
+	])("terminalizes a streamed provider HTTP $status rejection and permits a healthy abort_and_prompt replacement", async ({
+		status,
+		code,
+	}) => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), `gjc-provider-http-${status}-`));
 		try {
 			let prompts = 0;
@@ -3169,7 +3174,7 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			expect(terminal).toMatchObject({
 				status: "failed",
-				error: { code: `provider_http_${status}`, message: "Prompt submission failed." },
+				error: { code, message: "Prompt submission failed." },
 				terminalAt: expect.any(Number),
 			});
 			const stable = await harness.query("turn.result", { kind: "prompt", ...failedIds });
