@@ -126,7 +126,9 @@ export function isItermCandidate(
 	// These variables are untrusted hints, especially when forwarded over SSH.
 	// They may start the capability probe, but only an OSC 1337 reply containing
 	// the File capability can make the transport available.
-	return env.LC_TERMINAL === "iTerm2" || env.TERM_PROGRAM === "iTerm.app";
+	const lcTerminal = env.LC_TERMINAL?.trim().toLowerCase();
+	const termProgram = env.TERM_PROGRAM?.trim().toLowerCase();
+	return lcTerminal === "iterm2" || termProgram === "iterm.app" || termProgram === "iterm2";
 }
 export function createNativePetTransport(o: {
 	ui: NativePetUi;

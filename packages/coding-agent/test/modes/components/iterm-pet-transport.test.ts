@@ -69,7 +69,9 @@ const nativeUi = {
 describe("iTerm Pet candidate detection", () => {
 	it.each([
 		["forwarded LC_TERMINAL", { SSH_CONNECTION: "client server", LC_TERMINAL: "iTerm2" }],
+		["normalized LC_TERMINAL", { SSH_CONNECTION: "client server", LC_TERMINAL: " iterm2 " }],
 		["forwarded TERM_PROGRAM", { SSH_TTY: "/dev/pts/1", TERM_PROGRAM: "iTerm.app" }],
+		["normalized TERM_PROGRAM", { SSH_CLIENT: "10.0.0.1 12345 22", TERM_PROGRAM: " iTerm2 " }],
 		["local iTerm2", { TERM_PROGRAM: "iTerm.app", TERM_PROGRAM_VERSION: "3.6.11" }],
 	] as const)("probes %s without treating the environment marker as proof", (_label, env) => {
 		expect(isItermCandidate(env, true)).toBe(true);
@@ -77,6 +79,11 @@ describe("iTerm Pet candidate detection", () => {
 		expect(transport).toBeDefined();
 		expect(transport?.availability.available).toBe(false);
 		transport?.dispose();
+	});
+
+	it("does not treat whitespace-only markers as iTerm2 hints", () => {
+		expect(isItermCandidate({ SSH_CONNECTION: "   ", LC_TERMINAL: "\t" }, true)).toBe(false);
+		expect(isItermCandidate({ SSH_CLIENT: "\t", TERM_PROGRAM: "  " }, true)).toBe(false);
 	});
 
 	it.each([
