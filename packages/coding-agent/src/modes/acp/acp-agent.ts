@@ -56,9 +56,9 @@ import type { SdkPromptTerminalOutcome } from "../../sdk/prompt-status";
 import { PromptActivity, type PromptWatchdogClock, systemPromptWatchdogClock } from "../../sdk/prompt-watchdog";
 import { type SessionAttachment, SessionRouter, type SessionRouterFrame } from "../../sdk/router";
 import { SessionListTraversalError, sessionListPageFromResponse, traverseSessionList } from "../../sdk/session-list";
-import type { AgentSessionEvent } from "../../session/agent-session";
 import { resolveAcpAbortScope } from "./abort-scope";
 import {
+	type AgentSessionEvent,
 	buildToolCallStartUpdate,
 	mapAgentSessionEventToAcpSessionUpdates,
 	mapAgentWireEventPayloadToAcpSessionUpdates,
