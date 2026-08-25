@@ -1,8 +1,9 @@
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { getKeybindings, ImageProtocol, TERMINAL, Text, visibleWidth } from "@gajae-code/tui";
-import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
+import { getProjectDir, isCompiledBinary, isEnoent, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager } from "../async";
 import { type BashArtifactSaveResult, type BashResult, executeBash } from "../exec/bash-executor";
@@ -513,14 +514,14 @@ function normalizeBashEnv(env: Record<string, string> | undefined): Record<strin
  * expansions, escapes, globbing, and line breaks all refuse the privileged
  * environment injection path.
  */
-export function isStrictDirectSdkSpawnCommand(command: string): boolean {
-	if (command.length === 0) return false;
+function strictDirectSdkSpawnTokens(command: string): string[] | undefined {
+	if (command.length === 0) return undefined;
 	const tokens: string[] = [];
 	let token = "";
 	let tokenStarted = false;
 	let quote: "'" | '"' | undefined;
 	for (const character of command) {
-		if (";&|<>()$`\\*?[]{}#!\n\r".includes(character)) return false;
+		if (";&|<>()$`\\*?[]{}#!\n\r".includes(character)) return undefined;
 		if (quote !== undefined) {
 			if (character === quote) {
 				quote = undefined;
@@ -547,9 +548,31 @@ export function isStrictDirectSdkSpawnCommand(command: string): boolean {
 		token += character;
 		tokenStarted = true;
 	}
-	if (quote !== undefined) return false;
+	if (quote !== undefined) return undefined;
 	if (tokenStarted) tokens.push(token);
-	return tokens.length >= 3 && tokens[0] === "gjc" && tokens[1] === "sdk" && tokens[2] === "spawn";
+	return tokens.length >= 3 && tokens[0] === "gjc" && tokens[1] === "sdk" && tokens[2] === "spawn"
+		? tokens
+		: undefined;
+}
+
+export function isStrictDirectSdkSpawnCommand(command: string): boolean {
+	return strictDirectSdkSpawnTokens(command) !== undefined;
+}
+
+function shellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function trustedDirectSdkSpawnCommand(command: string): string | undefined {
+	const tokens = strictDirectSdkSpawnTokens(command);
+	if (tokens === undefined) return undefined;
+	const executable = isCompiledBinary()
+		? [process.execPath]
+		: process.argv[1] === undefined
+			? undefined
+			: [process.execPath, path.resolve(process.argv[1])];
+	if (executable === undefined) return undefined;
+	return [...executable, ...tokens.slice(1)].map(shellQuote).join(" ");
 }
 
 export function masterCommandEnvOverrides(
@@ -829,6 +852,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		notices?: readonly string[];
 
 		resolvedEnv?: Record<string, string>;
+		directMasterSpawn: boolean;
 		onUpdate?: AgentToolUpdateCallback<BashToolDetails>;
 		startBackgrounded: boolean;
 		/** Immutable attempt-scoped tool call id, when executed via a tool call. */
@@ -875,8 +899,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						spillThreshold,
 						headBytes,
 						oneShot: true,
-						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || options.directMasterSpawn,
+						disableShellSnapshot:
+							this.session.bashRestrictionProfile === "read-only" || options.directMasterSpawn,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							latestText = tailBuffer.text();
@@ -1147,6 +1172,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Check both spellings so cwd normalization or URL expansion cannot turn a
 		// command that contained shell syntax into a privileged one.
 		const directMasterSpawn = isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
+		if (directMasterSpawn) {
+			const trustedCommand = trustedDirectSdkSpawnCommand(command);
+			if (trustedCommand === undefined) throw new ToolError("Trusted gjc sdk spawn entrypoint is unavailable.");
+			command = trustedCommand;
+		}
 		const masterCapability = directMasterSpawn ? this.session.getMasterBashCapability?.() : undefined;
 		const commandEnvOverrides = masterCommandEnvOverrides(expandedEnv, directMasterSpawn);
 		const resolvedEnv = {
@@ -1155,7 +1185,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				sessionId: this.session.getSessionId?.(),
 				cwd: this.session.cwd,
 			}),
-			...(sessionAgentDir && !explicitAgentDirOverride ? { GJC_CODING_AGENT_DIR: sessionAgentDir } : {}),
+			...(sessionAgentDir && (!explicitAgentDirOverride || directMasterSpawn)
+				? { GJC_CODING_AGENT_DIR: sessionAgentDir }
+				: {}),
 			...commandEnvOverrides,
 			...(masterCapability ? { [MASTER_CAPABILITY_ENV]: masterCapability } : {}),
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
@@ -1293,8 +1325,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						spillThreshold,
 						headBytes,
 						oneShot: true,
-						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-						disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || prepared.directMasterSpawn,
+						disableShellSnapshot:
+							this.session.bashRestrictionProfile === "read-only" || prepared.directMasterSpawn,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
 							void reportProgress(tailBuffer.text(), {
@@ -1383,6 +1416,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				directMasterSpawn,
 				onUpdate,
 				startBackgrounded: true,
 				toolCallId,
@@ -1425,6 +1459,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				notices: pendingNotices,
 
 				resolvedEnv,
+				directMasterSpawn,
 				onUpdate,
 				startBackgrounded,
 				toolCallId,
@@ -1743,8 +1778,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					headBytes,
 					onChunk: streamTailUpdates(tailBuffer, onUpdate),
 					onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
-					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
-					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+					ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
+					disableShellSnapshot: this.session.bashRestrictionProfile === "read-only" || directMasterSpawn,
 				});
 		if (result.cancelled) {
 			const noticeSuffix = pendingNotices.length > 0 ? `\n\n${pendingNotices.join("\n")}` : "";
