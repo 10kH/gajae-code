@@ -1272,7 +1272,22 @@ export class Broker {
 			if (existing !== undefined) {
 				// An existing claim carries the raw-selector binding, so terminal and
 				// replay responses do not depend on today's model/profile catalog.
-				decision = await authority.claimOrJoin(lifecycleIdentity, undefined, requestBindingMac);
+				let existingBindingMac: string | undefined;
+				if (existing.requestBindingMac === undefined) {
+					// Claims written before raw-selector evidence was introduced only have
+					// the canonical binding. Re-resolve that historical selector before
+					// comparison; if the catalog no longer proves it, fail closed rather
+					// than guessing or weakening idempotency conflict protection.
+					const modelError = await resolveModels();
+					if (modelError) return finish(modelError);
+					existingBindingMac = spawnBindingMac(
+						key,
+						admission,
+						admission.modelId ?? null,
+						admission.modelPreset ?? null,
+					);
+				}
+				decision = await authority.claimOrJoin(lifecycleIdentity, existingBindingMac, requestBindingMac);
 				if (decision.kind === "owner") {
 					becameOwner = true;
 					// A recovered pre-send claim may still need to launch. Preserve the
