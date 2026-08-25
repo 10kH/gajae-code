@@ -3081,6 +3081,8 @@ function quiescingFrame(frame: Record<string, unknown>): Record<string, unknown>
 	if (frame.type === "session_activate")
 		return { type: "session_activate_result", id, ok: false, status: "authority_unavailable", error };
 	if (frame.type === "register_provider") return { type: "register_provider_result", id, ok: false, error };
+	if (frame.type === "reverse_response")
+		return { type: "transport_error", id, code: error.code, message: error.message };
 	if (frame.type === "provider_heartbeat" || frame.type === "lease_release")
 		return { type: "transport_error", code: "session_quiescing", message: error.message };
 	return undefined;
@@ -3091,6 +3093,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	let active:
 		| {
 				sessionId: string;
+				sessionIdentity: string;
 				runtime: SessionSdkSessionRuntime;
 				revisions: RevisionStore;
 				cursors: CursorRegistry;
@@ -3133,10 +3136,28 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	type LifecycleBatch = RuntimeState["openLifecycleBatches"][number];
 	type LifecycleOwner = { state: RuntimeState; sessionId: string; batch?: LifecycleBatch };
 	const retiredLifecycleOwners = new Map<string, RuntimeState[]>();
-	const lifecycleStateForContext = (ctx: ExtensionContext): RuntimeState | undefined => {
+	const sessionIdentityForContext = (ctx: ExtensionContext): string => {
 		const sessionId = ctx.sessionManager.getSessionId();
-		if (active?.sessionId === sessionId) return active;
-		return retiredLifecycleOwners.get(sessionId)?.[0];
+		const sessionFile =
+			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
+			resolveReconciliationSessionFile(undefined, path.join(ctx.cwd, ".gjc", "state"), sessionId);
+		return `${sessionId}\u0000${sessionFile}`;
+	};
+	const lifecycleStateForContext = (
+		ctx: ExtensionContext,
+		type: "agent_start" | "agent_end" | "agent_failed" = "agent_start",
+	): RuntimeState | undefined => {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const sessionIdentity = sessionIdentityForContext(ctx);
+		const retired = (retiredLifecycleOwners.get(sessionId) ?? []).filter(
+			owner => owner.sessionIdentity === sessionIdentity,
+		);
+		if (type !== "agent_start") {
+			const delayedOwner = retired.find(owner => owner.openLifecycleBatches.length > 0);
+			if (delayedOwner) return delayedOwner;
+		}
+		if (active?.sessionIdentity === sessionIdentity) return active;
+		return retired[0];
 	};
 	const maybeRetireLifecycleOwner = (owner: RuntimeState): void => {
 		if (owner.openLifecycleBatches.length > 0 || owner.lifecycleTasks.size > 0) return;
@@ -3164,8 +3185,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	// thread P1).
 	const activePromptOwnerHolder: { connectionIds?: Set<string>; lifecycleEpoch?: number } = {};
 	const skillTerminalRecoveryKeys = new Set<string>();
-	const trackLifecycle = (handler: () => Promise<void>, owner = active): Promise<void> => {
-		if (!owner) return handler();
+	const trackLifecycle = (handler: () => Promise<void>, owner: RuntimeState | undefined): Promise<void> => {
+		if (!owner) return Promise.resolve();
 		let task: Promise<void>;
 		task = handler().finally(() => {
 			owner.lifecycleTasks.delete(task);
@@ -3530,11 +3551,21 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 	};
 	api.on("agent_start", (_event, ctx) => {
-		const owner = lifecycleStateForContext(ctx);
-		return trackLifecycle(async () => await emitLifecycle("agent_start", ctx), owner);
+		const owner = lifecycleStateForContext(ctx, "agent_start");
+		return trackLifecycle(
+			async () =>
+				await emitLifecycle(
+					"agent_start",
+					ctx,
+					undefined,
+					undefined,
+					owner ? { state: owner, sessionId: owner.sessionId } : undefined,
+				),
+			owner,
+		);
 	});
 	api.on("agent_end", (event, ctx) => {
-		const owner = lifecycleStateForContext(ctx);
+		const owner = lifecycleStateForContext(ctx, "agent_end");
 		// Capture the oldest unmatched batch synchronously. A successor may start
 		// while the failed diagnostic persists; that must not retarget the
 		// predecessor's reason or terminal boundary to the successor invocation.
@@ -3566,7 +3597,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}, owner);
 	});
 	api.on("agent_failed", (event, ctx) => {
-		const owner = lifecycleStateForContext(ctx);
+		const owner = lifecycleStateForContext(ctx, "agent_failed");
 		return trackLifecycle(
 			async () =>
 				emitLifecycle(
@@ -3580,20 +3611,23 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		);
 	});
 	api.on("turn_start", async (_event, ctx) => {
-		const current = active;
+		const current = lifecycleStateForContext(ctx, "agent_start");
 		if (!current) return;
 		await current.registerBroker();
 		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
 	});
 	api.on("turn_end", (_event, ctx) =>
-		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
+		lifecycleStateForContext(ctx, "agent_end")?.runtime.emitEvent({
+			type: "turn_end",
+			sessionId: ctx.sessionManager.getSessionId(),
+		}),
 	);
 	// Tool activity renews the deadline of EVERY prompt correlation attached to
 	// the active run — the root invocation plus any in-run consumed follow-ups
 	// sharing it — not only the head, or an attached correlation would
 	// false-fire prompt_deadline_exceeded during a long shared run (#4668).
-	const renewAttributableProgress = (eventType: string): void => {
-		const current = active;
+	const renewAttributableProgress = (eventType: string, ctx: ExtensionContext): void => {
+		const current = lifecycleStateForContext(ctx, "agent_end");
 		if (!current) return;
 		// Renew only invocations adopted by the CURRENT run: the live lifecycle
 		// batch plus in-run attachments. drainedInvocations may still hold
@@ -3633,12 +3667,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		}
 	};
 	api.on("tool_execution_start", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_start");
-		void ctx;
+		renewAttributableProgress("tool_execution_start", ctx);
 	});
 	api.on("tool_execution_end", async (_event, ctx) => {
-		renewAttributableProgress("tool_execution_end");
-		void ctx;
+		renewAttributableProgress("tool_execution_end", ctx);
 	});
 	const errorCode = (error: unknown): string | undefined =>
 		typeof error === "object" &&
@@ -3658,6 +3690,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const sessionFile =
 			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
 			resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
+		const sessionIdentity = `${sessionId}\u0000${sessionFile}`;
 		const reconciliationStore =
 			options.terminalAbortSeams?.getReconciliationStore?.() ??
 			createReconciliationStore({ sessionFile, sessionId });
@@ -4178,6 +4211,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		active = {
 			sessionId,
+			sessionIdentity,
 			runtime,
 			revisions,
 			cursors,
@@ -4215,6 +4249,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 				active = {
 					sessionId,
+					sessionIdentity,
 					runtime,
 					revisions,
 					cursors,

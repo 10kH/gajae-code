@@ -2959,6 +2959,7 @@ interface PreflightHooks {
 interface ResponseFrame {
 	id?: string;
 	ok?: boolean;
+	code?: string;
 	error?: { code: string; message: string };
 	result?: { status?: string; commandId?: string; turnId?: string; error?: { code: string; message: string } };
 }
@@ -3355,7 +3356,7 @@ describe("post-acceptance invocation terminalization", () => {
 				await entered.promise;
 				const lifecycleChange = harness[operation](`${operation}-successor`);
 				await Bun.sleep(10);
-				const [oldControl, oldQuery, oldReplay, oldProvider] = await Promise.all([
+				const [oldControl, oldQuery, oldReplay, oldProvider, oldReverse] = await Promise.all([
 					harness.requestOnSession(`${operation}-provider-race`, {
 						type: "control_request",
 						operation: "turn.prompt",
@@ -3376,10 +3377,21 @@ describe("post-acceptance invocation terminalization", () => {
 						capability: "fs",
 						definitions: {},
 					}),
+					harness.requestOnSession(`${operation}-provider-race`, {
+						type: "reverse_response",
+						leaseId: "old-lease",
+						ok: true,
+						result: {},
+					}),
 				]);
 				harness.sendToSession(`${operation}-provider-race`, { type: "provider_heartbeat", leaseId: "old-lease" });
 				harness.sendToSession(`${operation}-provider-race`, { type: "lease_release", leaseId: "old-lease" });
-				expect([oldControl, oldQuery, oldReplay, oldProvider].map(response => response.error?.code)).toEqual([
+				expect(
+					[oldControl, oldQuery, oldReplay, oldProvider, oldReverse].map(
+						response => response.error?.code ?? response.code,
+					),
+				).toEqual([
+					"session_quiescing",
 					"session_quiescing",
 					"session_quiescing",
 					"session_quiescing",
@@ -3387,7 +3399,7 @@ describe("post-acceptance invocation terminalization", () => {
 				]);
 				expect(
 					harness.sent(`${operation}-provider-race`).filter(frame => frame.type === "transport_error"),
-				).toHaveLength(2);
+				).toHaveLength(3);
 				release.resolve();
 				await Promise.all([end, lifecycleChange]);
 				expect(timeoutWarnings).toBe(0);
@@ -3515,6 +3527,46 @@ describe("post-acceptance invocation terminalization", () => {
 			});
 			firstInflight.resolve();
 			expect(prompts).toBe(2);
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("routes delayed predecessor events to the retired owner when a session id is reused", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-reused-session-retired-owner-"));
+		try {
+			const firstInflight = Promise.withResolvers<void>();
+			const harness = await invocationHarness("reused-session", cwd, {
+				persistInterceptor: () => {},
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await firstInflight.promise;
+				},
+			});
+			const first = await harness.control("turn.prompt", { text: "first" });
+			expect(first.ok).toBe(true);
+			const firstIds = { commandId: first.result?.commandId, turnId: first.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.switchSession("different-session");
+			await harness.switchSession("reused-session");
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", {
+				messages: [{ role: "assistant", stopReason: "error", errorStatus: 402 }],
+			});
+			const failure = harness.broadcasts.find(frame => {
+				const payload = frame.payload;
+				return (
+					frame.kind === "agent_failed" &&
+					typeof payload === "object" &&
+					payload !== null &&
+					(payload as { commandId?: unknown }).commandId === firstIds.commandId &&
+					(payload as { turnId?: unknown }).turnId === firstIds.turnId
+				);
+			});
+			expect(failure).toMatchObject({ kind: "agent_failed", payload: { error: { code: "provider_http_402" } } });
+			firstInflight.resolve();
 			await harness.stop();
 		} finally {
 			await Bun.sleep(50);
