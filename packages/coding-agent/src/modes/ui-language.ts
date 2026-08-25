@@ -84,5 +84,11 @@ const UI_LANGUAGE_ALIASES: Readonly<Record<string, UiLanguage>> = {
 };
 
 export function parseUiLanguage(value: string): UiLanguage | undefined {
-	return UI_LANGUAGE_ALIASES[value.trim().toLowerCase()];
+	const normalized = value.trim().toLowerCase();
+	if (!normalized) return undefined;
+	const prefix = normalized.split(/[-_]/)[0] ?? "";
+	// Own-property lookups only: untrusted slash-command input must not reach
+	// inherited keys (`__proto__`, `constructor`) through either path.
+	if (Object.hasOwn(UI_LANGUAGE_ALIASES, normalized)) return UI_LANGUAGE_ALIASES[normalized];
+	return Object.hasOwn(UI_LANGUAGE_ALIASES, prefix) ? UI_LANGUAGE_ALIASES[prefix] : undefined;
 }
