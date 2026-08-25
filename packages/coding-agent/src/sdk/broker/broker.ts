@@ -57,6 +57,7 @@ import {
 	type SeedDeliveryV2,
 	SpawnAuthorityStore,
 	type SpawnAuthorityV1,
+	type SpawnClaimDecision,
 	type SpawnClaimV2,
 	type SpawnSubstrateProof,
 	type SpawnSubstrateProvider,
@@ -401,6 +402,27 @@ function parseSpawnInput(
 		...(typeof input.modelId === "string" ? { modelId: input.modelId.trim() } : {}),
 		...(typeof input.modelPreset === "string" ? { modelPreset: input.modelPreset } : {}),
 	};
+}
+
+function spawnBindingMac(
+	key: string,
+	admission: Pick<SpawnAdmissionInput, "ownerSessionId" | "attestationEpoch" | "cwd">,
+	modelId: string | null,
+	modelPreset: string | null,
+): string {
+	return createHmac("sha256", Buffer.from(key, "hex"))
+		.update(
+			canonicalJson({
+				version: 1,
+				operation: "session.spawn",
+				ownerSessionId: admission.ownerSessionId,
+				attestationEpoch: admission.attestationEpoch,
+				cwd: admission.cwd,
+				modelId,
+				modelPreset,
+			}),
+		)
+		.digest("hex");
 }
 
 function sessionListLimit(input: Record<string, unknown>): number | BrokerResponse {
@@ -1217,43 +1239,81 @@ export class Broker {
 				admission.masterCapability = "";
 			}
 			if (!verified.allowed) return finish(error("spawn_failed", "master capability verification was denied"));
-			// Validate the optional profile BEFORE any durable claim or substrate
-			// effect. Generic lifecycle create validates it; spawn branched earlier
-			// and skipped it, so an unknown profile launched a substrate and only
-			// failed later as uncertainty instead of a typed pre-effect error.
-			if (admission.modelPreset !== undefined) {
-				const validated = validateBrokerModelPreset(this.settings.agentDir, admission.modelPreset);
-				if (isBrokerResponse(validated)) return finish(validated);
-				admission.modelPreset = validated;
-			}
-			// Resolve the explicit model pin at the broker host boundary before the
-			// durable claim. Raw selectors must never reach a launched child: a
-			// child can otherwise reject them only after substrate and lifecycle
-			// effects have already happened.
-			if (admission.modelId !== undefined) {
-				const resolved = await this.#resolveModelPin(admission.modelId, { cwd: admission.cwd });
-				if (!resolved.ok) return finish(error("unknown_model", resolved.error));
-				if (resolved.model === null)
-					return finish(error("unknown_model", "session.spawn modelId could not be resolved."));
-				admission.modelId = resolved.model;
-			}
 			const key = await getBrokerIdentityKey(this.settings.agentDir);
-			const bindingMac = createHmac("sha256", Buffer.from(key, "hex"))
-				.update(
-					canonicalJson({
-						version: 1,
-						operation: "session.spawn",
-						ownerSessionId: admission.ownerSessionId,
-						attestationEpoch: admission.attestationEpoch,
-						cwd: admission.cwd,
-						modelId: admission.modelId ?? null,
-						modelPreset: admission.modelPreset ?? null,
-					}),
-				)
-				.digest("hex");
 			const authority = this.#spawnAuthority;
 			if (!authority) return finish(error("unavailable", "spawn authority is unavailable"));
-			const decision = await authority.claimOrJoin(lifecycleIdentity, bindingMac);
+			const requestBindingMac = spawnBindingMac(
+				key,
+				admission,
+				admission.modelId ?? null,
+				admission.modelPreset ?? null,
+			);
+			const existing = authority.claim(lifecycleIdentity);
+			const resolveModels = async (): Promise<BrokerResponse | undefined> => {
+				// Validate the optional profile BEFORE any new durable claim or substrate
+				// effect. Generic lifecycle create validates it; spawn must do the same.
+				if (admission.modelPreset !== undefined) {
+					const validated = validateBrokerModelPreset(this.settings.agentDir, admission.modelPreset);
+					if (isBrokerResponse(validated)) return validated;
+					admission.modelPreset = validated;
+				}
+				// Resolve the explicit model pin before a new durable claim. Raw
+				// selectors must never reach a newly launched child.
+				if (admission.modelId !== undefined) {
+					const resolved = await this.#resolveModelPin(admission.modelId, { cwd: admission.cwd });
+					if (!resolved.ok) return error("unknown_model", resolved.error);
+					if (resolved.model === null)
+						return error("unknown_model", "session.spawn modelId could not be resolved.");
+					admission.modelId = resolved.model;
+				}
+				return undefined;
+			};
+			let decision: SpawnClaimDecision;
+			if (existing !== undefined) {
+				// An existing claim carries the raw-selector binding, so terminal and
+				// replay responses do not depend on today's model/profile catalog.
+				decision = await authority.claimOrJoin(lifecycleIdentity, undefined, requestBindingMac);
+				if (decision.kind === "owner") {
+					becameOwner = true;
+					// A recovered pre-send claim may still need to launch. Preserve the
+					// fail-closed model validation for that effectful path and reject a
+					// catalog remap rather than launching a different model.
+					const modelError = await resolveModels();
+					if (modelError) return finish(modelError);
+					const recoveredBindingMac = spawnBindingMac(
+						key,
+						admission,
+						admission.modelId ?? null,
+						admission.modelPreset ?? null,
+					);
+					if (recoveredBindingMac !== decision.claim.bindingMac)
+						return finish(
+							error("idempotency_conflict", "session.spawn model selection differs from its durable claim"),
+						);
+				}
+			} else {
+				const modelError = await resolveModels();
+				if (modelError) {
+					// A concurrent claimant may have durably established this exact raw
+					// request while catalog loading was in flight. Re-check its opaque
+					// binding before returning the validation failure.
+					const raced = authority.claim(lifecycleIdentity);
+					if (raced === undefined) return finish(modelError);
+					decision = await authority.claimOrJoin(lifecycleIdentity, undefined, requestBindingMac);
+					if (decision.kind === "owner") {
+						becameOwner = true;
+						return finish(modelError);
+					}
+				} else {
+					const bindingMac = spawnBindingMac(
+						key,
+						admission,
+						admission.modelId ?? null,
+						admission.modelPreset ?? null,
+					);
+					decision = await authority.claimOrJoin(lifecycleIdentity, bindingMac, requestBindingMac);
+				}
+			}
 			if (decision.kind === "idempotency_conflict")
 				return finish(
 					error("idempotency_conflict", "idempotency key conflicts with an existing session.spawn claim"),
@@ -1270,7 +1330,7 @@ export class Broker {
 			inFlight.phase = decision.claim.state;
 			// Claim fsync precedes this audit mirror. Substrate work may start
 			// only after the mirror succeeds; a startup reconciler rebuilds it claim-first.
-			await this.ledger.begin(lifecycleIdentity, bindingMac);
+			await this.ledger.begin(lifecycleIdentity, decision.claim.bindingMac);
 			return finish(
 				await this.#driveSpawn(lifecycleIdentity, decision.claim, admission, inFlight, decision.recovery),
 			);

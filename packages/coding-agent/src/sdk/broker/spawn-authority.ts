@@ -7,6 +7,8 @@ export type SpawnClaimV2 = {
 	version: 2;
 	claimId: string;
 	lifecycleIdentity: string;
+	/** Opaque binding of the raw selector request, retained for catalog-independent replay. */
+	requestBindingMac?: string;
 	bindingMac: string;
 	state:
 		| "prepared"
@@ -206,6 +208,7 @@ const CLAIM_KEYS = new Set([
 	"version",
 	"claimId",
 	"lifecycleIdentity",
+	"requestBindingMac",
 	"bindingMac",
 	"state",
 	"preSendLease",
@@ -435,6 +438,8 @@ export function isSpawnClaimV2(value: unknown): value is SpawnClaimV2 {
 		claim.version === 2 &&
 		isOpaque(claim.claimId) &&
 		isOpaque(claim.lifecycleIdentity) &&
+		(claim.requestBindingMac === undefined ||
+			(typeof claim.requestBindingMac === "string" && /^[0-9a-f]{64}$/i.test(claim.requestBindingMac))) &&
 		/^[0-9a-f]{64}$/i.test(String(claim.bindingMac)) &&
 		typeof claim.state === "string" &&
 		CLAIM_STATES.has(claim.state as SpawnClaimV2["state"]) &&
@@ -515,7 +520,8 @@ function cloneClaim(claim: SpawnClaimV2): SpawnClaimV2 {
 
 /**
  * Append-only source of spawn-effect authority. It deliberately records no request
- * input: the opaque identity and structural binding MAC are its only correlators.
+ * input: the opaque identity and raw/canonical structural binding MACs are its
+ * only correlators.
  */
 export class SpawnAuthorityStore {
 	readonly #file: string;
@@ -582,17 +588,28 @@ export class SpawnAuthorityStore {
 		});
 	}
 
-	async claimOrJoin(lifecycleIdentity: string, bindingMac: string): Promise<SpawnClaimDecision> {
-		if (!isOpaque(lifecycleIdentity) || !/^[0-9a-f]{64}$/i.test(bindingMac))
+	async claimOrJoin(
+		lifecycleIdentity: string,
+		bindingMac: string | undefined,
+		requestBindingMac = bindingMac,
+	): Promise<SpawnClaimDecision> {
+		if (
+			!isOpaque(lifecycleIdentity) ||
+			(bindingMac !== undefined && !/^[0-9a-f]{64}$/i.test(bindingMac)) ||
+			requestBindingMac === undefined ||
+			!/^[0-9a-f]{64}$/i.test(requestBindingMac)
+		)
 			throw new Error("Invalid opaque spawn claim key.");
 		return await this.#serial(async () => {
 			const current = this.#latest.get(lifecycleIdentity);
 			if (!current) {
+				if (bindingMac === undefined) throw new Error("A canonical spawn binding is required for a new claim.");
 				const now = Date.now();
 				const claim: SpawnClaimV2 = {
 					version: 2,
 					claimId: randomBytes(24).toString("base64url"),
 					lifecycleIdentity,
+					requestBindingMac,
 					bindingMac,
 					state: "prepared",
 					preSendLease: { epoch: randomBytes(24).toString("base64url"), status: "owned" },
@@ -603,7 +620,15 @@ export class SpawnAuthorityStore {
 				this.#active.add(lifecycleIdentity);
 				return { kind: "owner", claim: cloneClaim(claim), recovery: false };
 			}
-			if (!timingSafeEqual(Buffer.from(current.bindingMac, "hex"), Buffer.from(bindingMac, "hex")))
+			const requestMatches =
+				current.requestBindingMac === undefined
+					? timingSafeEqual(Buffer.from(current.bindingMac, "hex"), Buffer.from(requestBindingMac, "hex"))
+					: timingSafeEqual(Buffer.from(current.requestBindingMac, "hex"), Buffer.from(requestBindingMac, "hex"));
+			if (
+				!requestMatches ||
+				(bindingMac !== undefined &&
+					!timingSafeEqual(Buffer.from(current.bindingMac, "hex"), Buffer.from(bindingMac, "hex")))
+			)
 				return { kind: "idempotency_conflict", claim: cloneClaim(current) };
 			if (this.#active.has(lifecycleIdentity)) return { kind: "in_progress", claim: cloneClaim(current) };
 			if (isRecoverablePreSend(current)) {

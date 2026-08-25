@@ -199,6 +199,7 @@ describe("SpawnAuthorityStore", () => {
 			version: 2,
 			claimId: "claim",
 			lifecycleIdentity: "identity",
+			requestBindingMac: "c".repeat(64),
 			bindingMac,
 			state: "prepared",
 			createdAt: 1,
@@ -1429,13 +1430,20 @@ describe("Broker spawn close and orphan reaper", () => {
 			expect(first).toMatchObject({ ok: true, result: { code: "spawn_accepted" } });
 			expect(launches).toBe(1);
 			expect(launchModelId).toBe("fixture-b/shared");
+			await fs.rm(path.join(agentDir, "models.yml"));
 			const replay = await broker.handleRequest(
 				"session.spawn",
-				{ ...spawnInput(), modelId: "fixture-b/shared" },
+				{ ...spawnInput(), modelId: "shared" },
 				"canonical-model-key",
 			);
 			expect(replay).toMatchObject({ ok: true, result: { code: "spawn_replayed" } });
 			expect(launches).toBe(1);
+			const conflict = await broker.handleRequest(
+				"session.spawn",
+				{ ...spawnInput(), modelId: "fixture-b/shared" },
+				"canonical-model-key",
+			);
+			expect(conflict).toMatchObject({ ok: false, error: { code: "idempotency_conflict" } });
 		} finally {
 			await broker.stop();
 		}
