@@ -1543,7 +1543,7 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 	if (status === 402 || status === 429)
 		return { code: `provider_http_${status}`, message: "Prompt submission failed." };
 	if (status !== undefined) return { code: "provider_rejected", message: "Prompt submission failed." };
-	return undefined;
+	return { code: "provider_rejected", message: "Prompt submission failed." };
 }
 
 function createControlSurface(
@@ -1561,6 +1561,7 @@ function createControlSurface(
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
 		connectionId: string | undefined,
+		sdkRunToken: string,
 		promotion?: { startsOwnRun?: boolean; removed?: boolean },
 	) => void,
 	policy?: SdkSurfacePolicy,
@@ -1766,7 +1767,7 @@ function createControlSurface(
 					// terminal-abort that turn (review threads P1/P2).
 					onQueuedPromoted: (promotion?: { startsOwnRun?: boolean; removed?: boolean }) => {
 						promotionStartsOwnRun = promotion?.startsOwnRun;
-						onPromotedTurn?.(kind, correlation, requesterConnectionId, promotion);
+						onPromotedTurn?.(kind, correlation, requesterConnectionId, sdkRunToken, promotion);
 					},
 					queuedAtDispatch,
 				}),
@@ -3149,11 +3150,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const lifecycleRunOwners = new Map<string, { state: RuntimeState; batch?: LifecycleBatch }>();
 	const sessionIdentityForContext = (ctx: ExtensionContext): string | undefined => {
 		const sessionId = ctx.sessionManager.getSessionId();
-		if (ctx.sessionManager.getSessionFile !== undefined) {
-			const sessionFile = ctx.sessionManager.getSessionFile();
-			if (!sessionFile) return undefined;
-			return `${sessionId}\u0000${sessionFile}`;
-		}
+		const sessionFile = ctx.sessionManager.getSessionFile?.();
+		if (sessionFile) return `${sessionId}\u0000${sessionFile}`;
 		const fallbackIdentity = fallbackSessionManagerIdentities.get(ctx.sessionManager);
 		return fallbackIdentity === null ? undefined : fallbackIdentity;
 	};
@@ -3169,6 +3167,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		);
 		if (type !== "agent_start") {
 			if (ambiguousLifecycleIdentities.has(sessionIdentity)) return undefined;
+			if (retired.length > 1) {
+				ambiguousLifecycleIdentities.add(sessionIdentity);
+				return undefined;
+			}
 			const delayedOwner = retired.find(owner => owner.openLifecycleBatches.length > 0);
 			if (delayedOwner) {
 				if (active?.sessionIdentity === sessionIdentity && active.openLifecycleBatches.length > 0) {
@@ -3753,7 +3755,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			(typeof ctx.sessionManager.getSessionFile === "function" ? ctx.sessionManager.getSessionFile() : undefined) ??
 			resolveReconciliationSessionFile(undefined, stateRoot, sessionId);
 		const sessionIdentity = `${sessionId}\u0000${sessionFile}`;
-		if (ctx.sessionManager.getSessionFile === undefined)
+		if (!ctx.sessionManager.getSessionFile?.())
 			if (fallbackSessionManagerIdentities.has(ctx.sessionManager)) {
 				const previousIdentity = fallbackSessionManagerIdentities.get(ctx.sessionManager);
 				if (previousIdentity !== sessionIdentity) fallbackSessionManagerIdentities.set(ctx.sessionManager, null);
@@ -3912,7 +3914,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				if (startsOwnTurn && kind === "prompt") deadlineManager.onAccepted(correlation);
 			},
 			steerReconciliation,
-			(kind, correlation, connectionId, promotion) => {
+			(kind, correlation, connectionId, sdkRunToken, promotion) => {
+				const bindPromotedToken = (batch?: LifecycleBatch): void => {
+					if (sdkRunToken) lifecycleRunOwners.set(sdkRunToken, { state: active!, batch });
+				};
 				// Lease at the ACTUAL promotion boundary (#4668 review): a promoted
 				// submission that wedges before its run's agent_start must still
 				// terminalize boundedly instead of remaining accepted forever.
@@ -4005,6 +4010,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						)
 					)
 						activeBatch.attachedInvocations.push({ kind, correlation });
+					bindPromotedToken(activeBatch);
 					return;
 				}
 				// No in-flight run visible and this is an in-run consumption

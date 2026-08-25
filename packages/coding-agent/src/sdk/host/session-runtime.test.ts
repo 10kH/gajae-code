@@ -3278,6 +3278,31 @@ describe("post-acceptance invocation terminalization", () => {
 		}
 	});
 
+	test("classifies a statusless provider error completion as rejected", async () => {
+		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-provider-statusless-"));
+		try {
+			const harness = await invocationHarness("provider-statusless", cwd, {
+				sendUserMessage: async (_content, options) => {
+					await options?.onPreflightAcceptCommit?.();
+					await new Promise<void>(() => {});
+				},
+			});
+			const accepted = await harness.control("turn.prompt", { text: "provider rejects" });
+			expect(accepted.ok).toBe(true);
+			const ids = { commandId: accepted.result?.commandId, turnId: accepted.result?.turnId };
+			await harness.emit("agent_start");
+			await harness.emit("agent_end", { messages: [{ role: "assistant", stopReason: "error" }] });
+			expect(await settledStatus(harness, "turn.prompt_status", ids)).toMatchObject({
+				status: "failed",
+				error: { code: "provider_rejected" },
+			});
+			await harness.stop();
+		} finally {
+			await Bun.sleep(50);
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
 	test("binds a delayed predecessor provider failure to its own batch after a replacement starts", async () => {
 		const cwd = await mkdtemp(path.join(os.tmpdir(), "gjc-delayed-provider-batch-"));
 		try {

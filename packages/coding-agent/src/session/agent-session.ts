@@ -9562,7 +9562,7 @@ export class AgentSession {
 		args = "",
 		options?: Pick<
 			PromptOptions,
-			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal"
+			"onPreflightAccepted" | "onPreflightAcceptCommit" | "onSkillPrepared" | "preflightSignal" | "sdkRunToken"
 		>,
 	): Promise<{ name: string; path: string; args?: string; lineCount?: number }> {
 		if (options?.preflightSignal?.aborted) throw promptPreflightCancelledError();
