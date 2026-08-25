@@ -1588,6 +1588,18 @@ export class AuthStorage {
 		);
 	}
 
+	/** @internal Return cache provenance for an exact stored literal API-key row without resolving its value. */
+	getStoredLiteralApiKeyEvidenceGeneration(provider: string, selector: AuthCredentialSelector): string | undefined {
+		if (selector.kind !== "id") return undefined;
+		const storageProvider = resolveOAuthStorageProvider(provider);
+		if (this.#runtimeOverrides.has(storageProvider) || this.#configOverrides.has(storageProvider)) return undefined;
+		const selected = this.#findCredentialBySelector(storageProvider, selector);
+		if (selected?.credential.type !== "api_key") return undefined;
+		const key = selected.credential.key;
+		if (!key || key.startsWith("!") || process.env[key] !== undefined) return undefined;
+		return this.getProviderEvidenceGeneration(storageProvider, key);
+	}
+
 	/** Validate and canonicalize an OAuth-only selector for account pinning. */
 	resolveOAuthPinTarget(provider: string, selector: AuthCredentialSelector): OAuthPinTarget {
 		const storageProvider = resolveOAuthStorageProvider(provider);

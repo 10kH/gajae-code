@@ -59,6 +59,7 @@ import { kNoAuth, ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	parseModelPattern,
+	parseModelString,
 	resolveAllowedModels,
 	resolveModelChainWithAuth,
 	resolveModelRoleValue,
@@ -1442,7 +1443,28 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		const runtimeServices = createOptionalRuntimeServices(settings, options.runtimeServices, { cwd: getLiveCwd });
 		modelRegistry.applyConfiguredModelBindings(settings);
 		logger.time("initializeWithSettings", initializeWithSettings, settings);
-		if (!options.modelRegistry) {
+		const startupModelReference =
+			options.model === undefined && options.modelPattern ? parseModelString(options.modelPattern) : undefined;
+		const attemptedStartupCacheAdmission =
+			startupModelReference !== undefined &&
+			options.modelRegistry === undefined &&
+			options.credentialSelector !== undefined &&
+			!modelRegistry.find(startupModelReference.provider, startupModelReference.id);
+		const startupCredentialSelector =
+			attemptedStartupCacheAdmission &&
+			startupModelReference &&
+			options.credentialSelector &&
+			(!options.credentialSelector.provider ||
+				options.credentialSelector.provider === startupModelReference.provider)
+				? options.credentialSelector.selector
+				: undefined;
+		if (startupModelReference && startupCredentialSelector) {
+			modelRegistry.admitCachedProviderForStoredLiteralCredential(
+				startupModelReference.provider,
+				startupCredentialSelector,
+			);
+		}
+		if (!options.modelRegistry && !attemptedStartupCacheAdmission) {
 			modelRegistry.refreshInBackground();
 		}
 		// Resolve the workspace tree through its runtime service. The compatibility

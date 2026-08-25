@@ -2,13 +2,13 @@ import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test, vi } 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Effort, getBundledModel, type Model } from "@gajae-code/ai";
-import { ModelRegistry } from "@gajae-code/coding-agent/config/model-registry";
+import { closeModelCache, Effort, getBundledModel, type Model } from "@gajae-code/ai";
+import { ModelRegistry, ModelsConfigFile } from "@gajae-code/coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@gajae-code/coding-agent/config/settings";
 import { createAgentSession } from "@gajae-code/coding-agent/sdk";
 import { AuthStorage } from "@gajae-code/coding-agent/session/auth-storage";
 import { SessionManager } from "@gajae-code/coding-agent/session/session-manager";
-import { Snowflake } from "@gajae-code/utils";
+import { getAgentDbPath, getAgentDir, hookFetch, Snowflake, setAgentDir } from "@gajae-code/utils";
 
 setDefaultTimeout(20_000);
 
@@ -119,6 +119,188 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		};
 	}
 
+	interface OwnedDiscoveryFixture {
+		root: string;
+		agentDir: string;
+		provider: string;
+		modelId: string;
+		foreignProvider: string;
+		foreignRowId: number;
+		wrongRowId: number;
+		selectedRowId: number;
+		commandRowId: number;
+		commandMarker: string;
+		cleanup(): Promise<void>;
+	}
+
+	async function seedOwnedDiscoveryFixture(): Promise<OwnedDiscoveryFixture> {
+		const root = path.join(tempDir, `owned-${Snowflake.next()}`);
+		const agentDir = path.join(root, "agent");
+		const modelsPath = path.join(agentDir, "models.yml");
+		const cacheDbPath = path.join(agentDir, "models.db");
+		const provider = "fixture-owned-discovery";
+		const foreignProvider = "fixture-foreign-discovery";
+		const modelId = "discovered-only-model";
+		const baseUrl = "https://owned-discovery.example.test/v1";
+		const commandMarker = path.join(root, "command-ran");
+		const originalAgentDir = getAgentDir();
+		const originalGjcAgentDir = process.env.GJC_CODING_AGENT_DIR;
+		const originalPiAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const originalRelocate = ModelsConfigFile.relocate.bind(ModelsConfigFile);
+		let restoreModelsConfigRelocate: (() => void) | undefined;
+		let seedAuth: AuthStorage | undefined;
+
+		const restoreEnvironment = () => {
+			setAgentDir(originalAgentDir);
+			if (originalGjcAgentDir === undefined) delete process.env.GJC_CODING_AGENT_DIR;
+			else process.env.GJC_CODING_AGENT_DIR = originalGjcAgentDir;
+			if (originalPiAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = originalPiAgentDir;
+		};
+		const cleanup = async () => {
+			restoreModelsConfigRelocate?.();
+			closeModelCache(cacheDbPath);
+			closeModelCache();
+			seedAuth?.close();
+			restoreEnvironment();
+			await fs.promises.rm(root, { recursive: true, force: true });
+			expect(fs.existsSync(root)).toBe(false);
+		};
+
+		try {
+			await Bun.write(
+				modelsPath,
+				JSON.stringify({
+					providers: {
+						[provider]: {
+							baseUrl,
+							api: "openai-responses",
+							discovery: { type: "openai-models-list" },
+						},
+					},
+				}),
+			);
+			const wrongKey = ["fixture", "literal", "wrong"].join("-");
+			const selectedKey = ["fixture", "literal", "selected"].join("-");
+			const foreignKey = ["fixture", "literal", "foreign"].join("-");
+			const commandReference = `!printf command-ran > ${JSON.stringify(commandMarker)}`;
+			seedAuth = await AuthStorage.create(getAgentDbPath(agentDir));
+			await seedAuth.set(provider, [
+				{ type: "api_key", key: wrongKey },
+				{ type: "api_key", key: selectedKey },
+				{ type: "api_key", key: commandReference },
+			]);
+			await seedAuth.set(foreignProvider, [{ type: "api_key", key: foreignKey }]);
+			const rows = seedAuth.listCredentialInventory(provider);
+			const foreignRow = seedAuth.listCredentialInventory(foreignProvider)[0];
+			const wrongRow = rows[0];
+			const selectedRow = rows[1];
+			const commandRow = rows[2];
+			if ([foreignRow, wrongRow, selectedRow, commandRow].some(row => row?.credentialKind !== "api_key")) {
+				throw new Error("Expected literal and command API-key fixture rows");
+			}
+
+			const seedRegistry = new ModelRegistry(seedAuth, modelsPath);
+			expect(await seedAuth.getApiKey(provider)).toBe(wrongKey);
+			let seedRequests = 0;
+			using _seedFetch = hookFetch((input, init) => {
+				seedRequests += 1;
+				expect(String(input)).toBe(`${baseUrl}/models`);
+				expect(new Headers(init?.headers).get("Authorization")).toBe(`Bearer ${selectedKey}`);
+				return new Response(JSON.stringify({ data: [{ id: modelId }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			});
+			await seedRegistry.refreshProvider(provider, "online");
+			expect(seedRequests).toBe(1);
+			expect(seedRegistry.find(provider, modelId)).toBeDefined();
+			seedAuth.close();
+			seedAuth = undefined;
+			closeModelCache(cacheDbPath);
+
+			setAgentDir(agentDir);
+			const isolatedModelsConfig = originalRelocate(modelsPath);
+			const relocateSpy = vi
+				.spyOn(ModelsConfigFile, "relocate")
+				.mockImplementation(requestedPath =>
+					requestedPath === undefined ? isolatedModelsConfig : originalRelocate(requestedPath),
+				);
+			restoreModelsConfigRelocate = () => relocateSpy.mockRestore();
+
+			return {
+				root,
+				agentDir,
+				provider,
+				modelId,
+				foreignProvider,
+				foreignRowId: foreignRow.id,
+				wrongRowId: wrongRow.id,
+				selectedRowId: selectedRow.id,
+				commandRowId: commandRow.id,
+				commandMarker,
+				cleanup,
+			};
+		} catch (error) {
+			await cleanup();
+			throw error;
+		}
+	}
+
+	function ownedDiscoverySessionOptions(fixture: OwnedDiscoveryFixture, rowId: number, modelId = fixture.modelId) {
+		return {
+			cwd: fixture.root,
+			agentDir: fixture.agentDir,
+			enableMCP: false,
+			enableLsp: false,
+			workspaceTree: { rootPath: fixture.root, rendered: "", truncated: false, totalLines: 0, agentsMdFiles: [] },
+			modelPattern: `${fixture.provider}/${modelId}`,
+			credentialSelector: {
+				provider: fixture.provider,
+				selector: { kind: "id" as const, value: String(rowId) },
+				raw: `${fixture.provider}/id:${rowId}`,
+			},
+		};
+	}
+
+	function spyOnCacheAdmissions(results: boolean[]) {
+		const admit = ModelRegistry.prototype.admitCachedProviderForStoredLiteralCredential;
+		return vi
+			.spyOn(ModelRegistry.prototype, "admitCachedProviderForStoredLiteralCredential")
+			.mockImplementation(function (this: ModelRegistry, provider, selector) {
+				const admitted = admit.call(this, provider, selector);
+				results.push(admitted);
+				return admitted;
+			});
+	}
+
+	async function assertOwnedCachedModelNotFound(
+		fixture: OwnedDiscoveryFixture,
+		rowId: number,
+		modelId: string,
+		expectedAdmission: boolean,
+	): Promise<void> {
+		const admissions: boolean[] = [];
+		let providerRequests = 0;
+		let session: { dispose(): Promise<void> } | undefined;
+		try {
+			using _admissions = spyOnCacheAdmissions(admissions);
+			using _blockedFetch = hookFetch(() => {
+				providerRequests += 1;
+				return Promise.reject(new Error("provider request"));
+			});
+			const result = await createAgentSession(ownedDiscoverySessionOptions(fixture, rowId, modelId));
+			session = result.session;
+			expect(admissions).toEqual([expectedAdmission]);
+			expect(result.session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toBe(`Model "${fixture.provider}/${modelId}" not found`);
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session?.dispose();
+			await fixture.cleanup();
+		}
+	}
+
 	test("uses the machine-global default selector and its effective suffix for a fresh session", async () => {
 		// Given a durable machine-global B selector
 		await Bun.write(
@@ -207,6 +389,240 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		expect(session.model).toBeUndefined();
 		expect(modelFallbackMessage).toBe('Model "missing-provider/missing-model" not found');
 		await session.dispose();
+	});
+
+	test("owned registry credential-scoped cache startup selects before background fetch", async () => {
+		const fixture = await seedOwnedDiscoveryFixture();
+		const events: string[] = [];
+		const backgroundCatalogSnapshots: boolean[] = [];
+		let startupFetches = 0;
+		let session: { model: Model | undefined; dispose(): Promise<void> } | undefined;
+		let assertionFailure: unknown;
+		const originalGetAll = ModelRegistry.prototype.getAll;
+		const originalRefreshInBackground = ModelRegistry.prototype.refreshInBackground;
+
+		try {
+			using _catalogEvents = vi.spyOn(ModelRegistry.prototype, "getAll").mockImplementation(function (
+				this: ModelRegistry,
+			) {
+				const models = originalGetAll.call(this);
+				if (
+					models.some(model => model.provider === fixture.provider && model.id === fixture.modelId) &&
+					!events.includes("catalog:target-visible")
+				) {
+					events.push("catalog:target-visible");
+				}
+				return models;
+			});
+			using _backgroundEvents = vi
+				.spyOn(ModelRegistry.prototype, "refreshInBackground")
+				.mockImplementation(function (this: ModelRegistry, strategy) {
+					events.push("background:start");
+					backgroundCatalogSnapshots.push(this.find(fixture.provider, fixture.modelId) !== undefined);
+					return originalRefreshInBackground.call(this, strategy);
+				});
+			using _blockedStartupFetch = hookFetch(() => {
+				startupFetches += 1;
+				events.push("provider:fetch");
+				throw new Error("owned startup must not contact the provider before model resolution");
+			});
+
+			const result = await createAgentSession({
+				cwd: fixture.root,
+				agentDir: fixture.agentDir,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				workspaceTree: {
+					rootPath: fixture.root,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				},
+				toolNames: [],
+				rules: [],
+				modelPattern: `${fixture.provider}/${fixture.modelId}`,
+				credentialSelector: {
+					provider: fixture.provider,
+					selector: { kind: "id", value: String(fixture.selectedRowId) },
+					raw: `${fixture.provider}/id:${fixture.selectedRowId}`,
+				},
+			});
+			session = result.session;
+			await Bun.sleep(0);
+			events.push(session.model ? "model:selected" : "model:not-found");
+
+			expect(session.model).toMatchObject({ provider: fixture.provider, id: fixture.modelId });
+			expect(result.modelFallbackMessage).toBeUndefined();
+			expect(backgroundCatalogSnapshots).toEqual([]);
+			expect(startupFetches).toBe(0);
+			const catalogVisible = events.indexOf("catalog:target-visible");
+			const modelSelected = events.indexOf("model:selected");
+			expect(catalogVisible).toBeGreaterThanOrEqual(0);
+			expect(modelSelected).toBeGreaterThan(catalogVisible);
+		} catch (error) {
+			assertionFailure = error;
+		} finally {
+			await session?.dispose();
+			await fixture.cleanup();
+		}
+
+		expect(fs.existsSync(fixture.root)).toBe(false);
+		if (assertionFailure !== undefined) throw assertionFailure;
+	});
+
+	test("owned registry credential-scoped cache startup does not execute a command selector", async () => {
+		const fixture = await seedOwnedDiscoveryFixture();
+		let session: { model: Model | undefined; dispose(): Promise<void> } | undefined;
+		let assertionFailure: unknown;
+
+		try {
+			const commandAuth = await AuthStorage.create(getAgentDbPath(fixture.agentDir));
+			try {
+				expect(
+					commandAuth.getStoredLiteralApiKeyEvidenceGeneration(fixture.provider, {
+						kind: "id",
+						value: String(fixture.commandRowId),
+					}),
+				).toBeUndefined();
+			} finally {
+				commandAuth.close();
+			}
+			using _blockedStartupFetch = hookFetch(() => {
+				throw new Error("command credential guard must remain offline");
+			});
+			const result = await createAgentSession({
+				cwd: fixture.root,
+				agentDir: fixture.agentDir,
+				disableExtensionDiscovery: true,
+				extensions: [],
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				enableMCP: false,
+				enableLsp: false,
+				workspaceTree: {
+					rootPath: fixture.root,
+					rendered: "",
+					truncated: false,
+					totalLines: 0,
+					agentsMdFiles: [],
+				},
+				toolNames: [],
+				rules: [],
+				modelPattern: `${fixture.provider}/${fixture.modelId}`,
+				credentialSelector: {
+					provider: fixture.provider,
+					selector: { kind: "id", value: String(fixture.commandRowId) },
+					raw: `${fixture.provider}/id:${fixture.commandRowId}`,
+				},
+			});
+			session = result.session;
+			await Bun.sleep(0);
+
+			expect(fs.existsSync(fixture.commandMarker)).toBe(false);
+			expect(session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toBe(`Model "${fixture.provider}/${fixture.modelId}" not found`);
+		} catch (error) {
+			assertionFailure = error;
+		} finally {
+			await session?.dispose();
+			await fixture.cleanup();
+		}
+
+		expect(fs.existsSync(fixture.root)).toBe(false);
+		if (assertionFailure !== undefined) throw assertionFailure;
+	});
+
+	test("owned registry provider-mismatched selector suppresses background refresh", async () => {
+		const fixture = await seedOwnedDiscoveryFixture();
+		const admissions: boolean[] = [];
+		let backgroundRefreshes = 0;
+		let providerRequests = 0;
+		let session: { dispose(): Promise<void> } | undefined;
+		try {
+			const foreignAuth = await AuthStorage.create(getAgentDbPath(fixture.agentDir));
+			try {
+				expect(
+					foreignAuth.getStoredLiteralApiKeyEvidenceGeneration(fixture.foreignProvider, {
+						kind: "id",
+						value: String(fixture.foreignRowId),
+					}),
+				).toBeDefined();
+			} finally {
+				foreignAuth.close();
+			}
+			using _admissions = spyOnCacheAdmissions(admissions);
+			using _backgroundRefresh = vi.spyOn(ModelRegistry.prototype, "refreshInBackground").mockImplementation(() => {
+				backgroundRefreshes += 1;
+			});
+			using _blockedFetch = hookFetch(() => {
+				providerRequests += 1;
+				return Promise.reject(new Error("provider request"));
+			});
+			const result = await createAgentSession({
+				...ownedDiscoverySessionOptions(fixture, fixture.foreignRowId),
+				credentialSelector: {
+					provider: fixture.foreignProvider,
+					selector: { kind: "id", value: String(fixture.foreignRowId) },
+					raw: `${fixture.foreignProvider}/id:${fixture.foreignRowId}`,
+				},
+			});
+			session = result.session;
+			expect(admissions).toEqual([]);
+			expect(backgroundRefreshes).toBe(0);
+			expect(result.session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toBe(`Model "${fixture.provider}/${fixture.modelId}" not found`);
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session?.dispose();
+			await fixture.cleanup();
+		}
+	});
+
+	test("injected registry credential cache does not mutate shared catalog", async () => {
+		const fixture = await seedOwnedDiscoveryFixture();
+		const sharedAuth = await AuthStorage.create(getAgentDbPath(fixture.agentDir));
+		const sharedRegistry = new ModelRegistry(sharedAuth, path.join(fixture.agentDir, "models.yml"));
+		let providerRequests = 0;
+		let session: { dispose(): Promise<void> } | undefined;
+		try {
+			expect(sharedRegistry.find(fixture.provider, fixture.modelId)).toBeUndefined();
+			using _blockedFetch = hookFetch(() => {
+				providerRequests += 1;
+				return Promise.reject(new Error("provider request"));
+			});
+			const result = await createAgentSession({
+				...ownedDiscoverySessionOptions(fixture, fixture.selectedRowId),
+				modelRegistry: sharedRegistry,
+			});
+			session = result.session;
+			expect(sharedRegistry.find(fixture.provider, fixture.modelId)).toBeUndefined();
+			expect(result.session.model).toBeUndefined();
+			expect(result.modelFallbackMessage).toBe(`Model "${fixture.provider}/${fixture.modelId}" not found`);
+			expect(providerRequests).toBe(0);
+		} finally {
+			await session?.dispose();
+			sharedAuth.close();
+			await fixture.cleanup();
+		}
+	});
+
+	test("owned registry wrong literal credential does not admit cached model", async () => {
+		const fixture = await seedOwnedDiscoveryFixture();
+		await assertOwnedCachedModelNotFound(fixture, fixture.wrongRowId, fixture.modelId, false);
+	});
+
+	test("owned registry matching cache keeps unknown model unresolved", async () => {
+		const fixture = await seedOwnedDiscoveryFixture();
+		await assertOwnedCachedModelNotFound(fixture, fixture.selectedRowId, "genuinely-unknown-model", true);
 	});
 
 	test("does not apply default role thinking override when modelPattern is explicit", async () => {

@@ -1507,6 +1507,30 @@ export class ModelRegistry {
 		}
 	}
 
+	admitCachedProviderForStoredLiteralCredential(providerId: string, selector: AuthCredentialSelector): boolean {
+		const supportsDiscovery =
+			this.#discoveryManager.providerIds().has(providerId) ||
+			PROVIDER_DESCRIPTORS.some(descriptor => descriptor.providerId === providerId);
+		if (!supportsDiscovery) return false;
+		const authEvidence = this.authStorage.getStoredLiteralApiKeyEvidenceGeneration(providerId, selector);
+		if (!authEvidence) return false;
+
+		this.#suspendRebuild();
+		try {
+			const cachedModels = [
+				...this.#loadCachedStandardProviderModels(providerId, authEvidence),
+				...this.#loadCachedDiscoverableModels(providerId, authEvidence),
+			];
+			if (cachedModels.length === 0) return false;
+			this.#mergeDiscoveredModels(cachedModels);
+			this.#rebuildProviderActivity();
+			this.#modelBindingsApplier.apply();
+			return true;
+		} finally {
+			this.#resumeRebuild();
+		}
+	}
+
 	#getStaticLoadEnvironmentFingerprint(): string {
 		const providerBaseUrlEnvKeys = new Set(
 			[
@@ -1762,16 +1786,17 @@ export class ModelRegistry {
 		return merged;
 	}
 
-	#loadCachedStandardProviderModels(): Model<Api>[] {
+	#loadCachedStandardProviderModels(providerId?: string, authEvidence?: string): Model<Api>[] {
 		const configuredDiscoveryProviders = new Set(this.#discoveryManager.providers.map(provider => provider.provider));
 		const cachedModels: Model<Api>[] = [];
 		for (const descriptor of PROVIDER_DESCRIPTORS) {
+			if (providerId && descriptor.providerId !== providerId) continue;
 			if (configuredDiscoveryProviders.has(descriptor.providerId)) {
 				continue;
 			}
 			const cache = readModelCache<Api>(descriptor.providerId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 			const expectedProvenance = fingerprintDescriptorDiscoveryProvenance(
-				this.#getProviderEvidenceGeneration(descriptor.providerId),
+				authEvidence ?? this.#getProviderEvidenceGeneration(descriptor.providerId),
 				this.#normalizeDiscoveryEvidenceEndpoint(this.#getProviderBaseUrlForDiscovery(descriptor.providerId) ?? ""),
 			);
 			if (
@@ -1796,15 +1821,16 @@ export class ModelRegistry {
 		return cachedModels;
 	}
 
-	#loadCachedDiscoverableModels(): Model<Api>[] {
+	#loadCachedDiscoverableModels(providerId?: string, authEvidence?: string): Model<Api>[] {
 		const cachedModels: Model<Api>[] = [];
 		for (const providerConfig of this.#discoveryManager.providers) {
+			if (providerId && providerConfig.provider !== providerId) continue;
 			let expectedProvenance: string | undefined;
 			try {
 				const effectiveConfig = this.#effectiveDiscoveryProviderConfig(providerConfig);
 				expectedProvenance = fingerprintConfiguredDiscoveryRequestShape(
 					effectiveConfig,
-					this.#getProviderEvidenceGeneration(effectiveConfig.provider),
+					authEvidence ?? this.#getProviderEvidenceGeneration(effectiveConfig.provider),
 					this.#normalizeDiscoveryEvidenceEndpoint(effectiveConfig.baseUrl ?? ""),
 				);
 			} catch {
@@ -2452,6 +2478,10 @@ export class ModelRegistry {
 			}
 			return;
 		}
+		this.#mergeDiscoveredModels(discovered);
+	}
+
+	#mergeDiscoveredModels(discovered: readonly Model<Api>[]): void {
 		const discoveredModels = this.#applyHardcodedModelPolicies(
 			discovered.map(model =>
 				mergeDiscoveredModel(
