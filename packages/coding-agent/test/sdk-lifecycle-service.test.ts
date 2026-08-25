@@ -181,7 +181,11 @@ describe("SessionLifecycleService", () => {
 				indexSeq: 7,
 				sessions: [
 					{ sessionId: "first", live: true },
-					{ sessionId: "second", cwd: "/workspace" },
+					{
+						sessionId: "second",
+						cwd: "/workspace",
+						locator: { cwd: "/workspace", worktreeRoot: null, stateRoot: "/workspace/.gjc/state" },
+					},
 				],
 				warnings: ["first-page-warning"],
 				savedSession: { id: "saved", path: "/saved.jsonl", identity: savedTranscriptIdentity },
