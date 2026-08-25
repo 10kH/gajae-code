@@ -2,9 +2,11 @@ import { describe, expect, it } from "bun:test";
 import {
 	renderSpawnTable,
 	runSdkSpawn,
+	selectNewestMasterAttestationEpoch,
 	SdkMasterCliError,
 	safeSpawnRender,
 } from "@gajae-code/coding-agent/sdk/cli/master-cli";
+import type { IndexedSession } from "../src/sdk/broker/session-index";
 
 const task = "secret-task-fixture";
 const capability = "secret-capability-fixture";
@@ -13,6 +15,23 @@ const masterEnv = { GJC_MASTER_CAPABILITY: capability, GJC_SESSION_ID: "master-c
 const epoch = async () => "epoch-cli";
 
 describe("gjc sdk spawn CLI", () => {
+	it("selects the newest retained master epoch instead of the first row", () => {
+		const attestation = (attestationEpoch: string) => ({
+			version: 2 as const,
+			ownerSessionId: "master-cli-owner",
+			launchPid: 42,
+			launchProcessIncarnation: "process-42",
+			role: "master" as const,
+			attestationEpoch,
+		});
+		const rows: Pick<IndexedSession, "sessionId" | "indexSeq" | "masterRole">[] = [
+			{ sessionId: "master-cli-owner", indexSeq: 20, masterRole: attestation("old-epoch") },
+			{ sessionId: "master-cli-owner", indexSeq: 21, masterRole: attestation("new-epoch") },
+		];
+
+		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("new-epoch");
+	});
+
 	it("requires --cwd and --prompt", async () => {
 		await expect(
 			runSdkSpawn({ prompt: task }, { env: masterEnv, resolveAttestationEpoch: epoch }),

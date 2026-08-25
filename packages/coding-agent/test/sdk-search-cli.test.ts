@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { SdkSearchResultV1 } from "../src/sdk/broker/session-scope";
-import { renderSdkSearchTable, runSdkSearch } from "../src/sdk/cli/session-cli";
+import { mergeProbedSearchRows, renderSdkSearchTable, runSdkSearch } from "../src/sdk/cli/session-cli";
 import { type SessionLifecycleClient, SessionLifecycleService } from "../src/sdk/lifecycle/service";
 
 const temp = () => fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-search-"));
@@ -79,6 +79,61 @@ test("search returns exactly the scoped envelope and probes only populated filte
 		expect(search.exitCode).toBe(0);
 		expect(search.result).toEqual({ ...result, rows: [{ ...row, probe: "reachable" }] });
 		expect(probes).toBe(1);
+	} finally {
+		await fs.rm(root, { recursive: true, force: true });
+	}
+});
+
+test("preserves scoped rows beyond the bounded probe budget", () => {
+	const rows = Array.from({ length: 125 }, (_, index) => ({
+		id: `session-${index}`,
+		locator: { cwd: "/repo", worktreeRoot: "/repo", stateRoot: "/state" },
+		live: index < 100,
+	}));
+	const probed = rows.slice(0, 100).map(row => ({ ...row, probe: "reachable" as const }));
+
+	const merged = mergeProbedSearchRows(rows, probed);
+
+	expect(merged).toHaveLength(125);
+	expect(merged.slice(0, 100).every(row => row.probe === "reachable")).toBe(true);
+	expect(merged.slice(100)).toEqual(rows.slice(100));
+});
+
+test("drains all broker continuation pages for scoped search", async () => {
+	const root = await temp();
+	const git = Bun.spawn(["git", "init", "-q", root]);
+	await git.exited;
+	try {
+		const rows = Array.from({ length: 125 }, (_, index) => ({
+			sessionId: `session-${index}`,
+			live: false,
+			locator: { cwd: root, worktreeRoot: root, stateRoot: "/state" },
+		}));
+		const scope = envelope(root, "empty").scope;
+		class PagedClient implements SessionLifecycleClient {
+			async global(_operation: string, input: Record<string, unknown>): Promise<unknown> {
+				const page = input.cursor === "cursor-1" ? rows.slice(100) : rows.slice(0, 100);
+				return {
+					ok: true,
+					result: {
+						indexSeq: 7,
+						sessions: page,
+						warnings: [],
+						scope,
+						observedAt: "2026-08-23T12:00:00.000Z",
+						...(input.cursor === undefined ? { continuationCursor: "cursor-1" } : {}),
+					},
+				};
+			}
+		}
+		const search = await runSdkSearch(
+			{ repo: root },
+			() => new SessionLifecycleService(new PagedClient()),
+			async (_agentDir, value) => value,
+		);
+
+		expect(search.exitCode).toBe(0);
+		expect(search.result.rows).toHaveLength(125);
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}

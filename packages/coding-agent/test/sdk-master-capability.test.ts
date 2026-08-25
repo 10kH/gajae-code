@@ -7,6 +7,7 @@ import { Broker } from "../src/sdk/broker/broker";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
+import { verifyMasterCapabilityFrame } from "../src/sdk/host/session-runtime";
 
 const capability = "master-capability-fixed-e2e";
 const capabilityDigest = createHash("sha256").update(capability).digest("hex");
@@ -119,6 +120,42 @@ const spawnPromptLayerFake = {
 };
 
 describe("master capability effective-host verification", () => {
+	it("authenticates before storing nonces and bounds replay memory under flood", () => {
+		const replay = new Map<string, number>();
+		for (let index = 0; index < 4_096; index++) {
+			const result = verifyMasterCapabilityFrame({
+				frame: { nonce: `invalid-${index}!`, attestationEpoch, capability: "wrong" },
+				expectedCapability: capability,
+				expectedEpoch: attestationEpoch,
+				replay,
+				now: 1_000,
+			});
+			expect(result.ok).toBe(false);
+		}
+		expect(replay.size).toBe(0);
+
+		for (let index = 0; index < 2_048; index++) {
+			const result = verifyMasterCapabilityFrame({
+				frame: { nonce: `nonce-${index}`, attestationEpoch, capability },
+				expectedCapability: capability,
+				expectedEpoch: attestationEpoch,
+				replay,
+				now: 1_000,
+			});
+			expect(result.ok).toBe(true);
+		}
+		expect(replay.size).toBeLessThanOrEqual(1_024);
+		expect(
+			verifyMasterCapabilityFrame({
+				frame: { nonce: "nonce-2047", attestationEpoch, capability },
+				expectedCapability: capability,
+				expectedEpoch: attestationEpoch,
+				replay,
+				now: 1_000,
+			}).ok,
+		).toBe(false);
+	});
+
 	it("requires an adopted live attachment, rejects stale replies and leaves no capability material on disk", async () => {
 		const agentDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-master-capability-"));
 		const stateRoot = path.join(agentDir, "host-state");

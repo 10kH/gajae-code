@@ -71,14 +71,16 @@ export function worktreeOccupant(
 	worktreePath: string,
 	observe: (pid: number, expectedIncarnation: string | undefined) => ProcessObservation = observeProcess,
 ): string | null {
-	// Session locators retain the lexical cwd supplied to the host, while a launch
-	// plan may arrive through a symlink. Compare physical identity where it
-	// exists, with resolveEquivalentPath's lexical fallback for paths that have
-	// not been created yet.
+	// Session locators retain the canonical Git worktree root separately from the
+	// session cwd. A host may start below that root, and a launch plan may arrive
+	// through a symlink, so compare the root identity rather than the cwd spelling.
 	const target = resolveEquivalentPath(worktreePath);
 	for (const session of sessions) {
-		if (session.terminal || !session.live) continue;
-		if (resolveEquivalentPath(session.locator.cwd) !== target) continue;
+		const sessionWorktreeRoot = session.locator.worktreeRoot;
+		if (session.terminal || typeof sessionWorktreeRoot !== "string" || sessionWorktreeRoot.length === 0) continue;
+		if (resolveEquivalentPath(sessionWorktreeRoot) !== target) continue;
+		// `live` is heartbeat-derived and can be stale. Only positive process-exit
+		// evidence releases a matching retained session's worktree.
 		if (observe(session.pid, session.hostIncarnation ?? session.processIncarnation) === "exited") continue;
 		return session.sessionId;
 	}

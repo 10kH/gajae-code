@@ -68,6 +68,7 @@ export const BASH_DEFAULT_PREVIEW_LINES = 10;
 const BASH_ERROR_MAX_BYTES = 4096;
 const ARTIFACT_SAVE_DIAGNOSTIC_MAX_BYTES = 256;
 const BASH_ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
 const DEFAULT_AUTO_BACKGROUND_THRESHOLD_MS = 60_000;
 const READ_ONLY_BASH_ENV: Record<string, string> = {
 	GREP_OPTIONS: "",
@@ -501,6 +502,54 @@ function normalizeBashEnv(env: Record<string, string> | undefined): Record<strin
 		normalized[key] = value;
 	}
 	return normalized;
+}
+
+/**
+ * Return true only for a direct, shell-syntax-free `gjc sdk spawn` command.
+ *
+ * Master authority is process-local and must not become ambient state for an
+ * arbitrary shell pipeline. Keep a tiny lexer here instead of a prefix check:
+ * shell quoting is allowed for ordinary argument values, while operators,
+ * expansions, escapes, globbing, and line breaks all refuse the privileged
+ * environment injection path.
+ */
+export function isStrictDirectSdkSpawnCommand(command: string): boolean {
+	if (command.length === 0) return false;
+	const tokens: string[] = [];
+	let token = "";
+	let tokenStarted = false;
+	let quote: "'" | '"' | undefined;
+	for (const character of command) {
+		if (";&|<>()$`\\*?[]{}#!\n\r".includes(character)) return false;
+		if (quote !== undefined) {
+			if (character === quote) {
+				quote = undefined;
+				tokenStarted = true;
+			} else {
+				token += character;
+				tokenStarted = true;
+			}
+			continue;
+		}
+		if (character === "'" || character === '"') {
+			quote = character;
+			tokenStarted = true;
+			continue;
+		}
+		if (/\s/u.test(character)) {
+			if (tokenStarted) {
+				tokens.push(token);
+				token = "";
+				tokenStarted = false;
+			}
+			continue;
+		}
+		token += character;
+		tokenStarted = true;
+	}
+	if (quote !== undefined) return false;
+	if (tokenStarted) tokens.push(token);
+	return tokens.length >= 3 && tokens[0] === "gjc" && tokens[1] === "sdk" && tokens[2] === "spawn";
 }
 
 function escapeBashEnvValueForDisplay(value: string): string {
@@ -1084,7 +1133,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// silently ignore the caller's override.
 		const explicitAgentDirOverride =
 			expandedEnv?.GJC_CODING_AGENT_DIR !== undefined || expandedEnv?.PI_CODING_AGENT_DIR !== undefined;
-		const masterCapability = this.session.getMasterBashCapability?.();
+		// The master capability is a one-shot authority for the direct spawn CLI,
+		// never ambient state for ordinary Bash or a chained/pipelined descendant.
+		// Check both spellings so cwd normalization or URL expansion cannot turn a
+		// command that contained shell syntax into a privileged one.
+		const directMasterSpawn =
+			isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
+		const masterCapability = directMasterSpawn ? this.session.getMasterBashCapability?.() : undefined;
+		const commandEnvOverrides = Object.fromEntries(
+			Object.entries(expandedEnv ?? {}).filter(([key]) => key !== MASTER_CAPABILITY_ENV),
+		);
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
 				sessionFile: null,
@@ -1092,8 +1150,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				cwd: this.session.cwd,
 			}),
 			...(sessionAgentDir && !explicitAgentDirOverride ? { GJC_CODING_AGENT_DIR: sessionAgentDir } : {}),
-			...expandedEnv,
-			...(masterCapability ? { GJC_MASTER_CAPABILITY: masterCapability } : {}),
+			...commandEnvOverrides,
+			...(masterCapability ? { [MASTER_CAPABILITY_ENV]: masterCapability } : {}),
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};

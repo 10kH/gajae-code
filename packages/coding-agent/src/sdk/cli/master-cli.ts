@@ -2,13 +2,14 @@
  * Local interactive-master CLI surface.
  *
  * `gjc sdk spawn` is legal only inside a live master session: the master's Bash
- * tool threads the transient capability through the child environment, and the
- * Broker still verifies it against the live effective host before any effect.
+ * tool threads the transient capability only through a strict direct spawn
+ * command, and the Broker still verifies it against the live effective host
+ * before any effect.
  * No output path may echo the task or capability.
  */
 import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@gajae-code/utils";
-import { SessionIndex } from "../broker/session-index";
+import { SessionIndex, type IndexedSession } from "../broker/session-index";
 import { dispatchSpawnGlobal } from "../lifecycle/broker-client";
 
 const MASTER_CAPABILITY_ENV = "GJC_MASTER_CAPABILITY";
@@ -59,13 +60,44 @@ async function brokerSpawnDispatch(
 	return await dispatchSpawnGlobal(agentDir, input, idempotencyKey, SPAWN_TIMEOUT_MS);
 }
 
+/**
+ * Select the newest retained master attestation for an owner session.
+ *
+ * `listSessionIdentities()` can retain both the direct-role row and one or
+ * more endpoint generations. Its iteration order is a projection detail, not
+ * authority ordering, so selecting the first matching row can resurrect an
+ * older epoch after a master relaunch. The broker's monotonically increasing
+ * `indexSeq` is the authoritative retained ordering.
+ */
+export function selectNewestMasterAttestationEpoch(
+	rows: readonly Pick<IndexedSession, "sessionId" | "indexSeq" | "masterRole">[],
+	ownerSessionId: string,
+): string | undefined {
+	let newest: { indexSeq: number; epoch: string } | undefined;
+	for (const row of rows) {
+		const attestation = row.masterRole;
+		if (
+			row.sessionId !== ownerSessionId ||
+			!Number.isSafeInteger(row.indexSeq) ||
+			attestation === undefined ||
+			attestation.version !== 2 ||
+			attestation.role !== "master" ||
+			attestation.ownerSessionId !== ownerSessionId ||
+			typeof attestation.attestationEpoch !== "string" ||
+			attestation.attestationEpoch.length === 0 ||
+			attestation.attestationEpoch.length > 512 ||
+			!/^[A-Za-z0-9_-]+$/u.test(attestation.attestationEpoch)
+		)
+			continue;
+		if (newest === undefined || row.indexSeq > newest.indexSeq)
+			newest = { indexSeq: row.indexSeq, epoch: attestation.attestationEpoch };
+	}
+	return newest?.epoch;
+}
+
 async function indexAttestationEpoch(agentDir: string, ownerSessionId: string): Promise<string | undefined> {
 	const index = await new SessionIndex(agentDir).open();
-	const rows = index.listSessionIdentities();
-	const attested = rows.find(
-		row => row.sessionId === ownerSessionId && row.masterRole?.role === "master" && row.masterRole.version === 2,
-	);
-	return attested?.masterRole?.attestationEpoch;
+	return selectNewestMasterAttestationEpoch(index.listSessionIdentities(), ownerSessionId);
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

@@ -403,6 +403,13 @@ function searchProbe(row: SdkSearchRowV1, router: SessionRouter): Promise<SdkSea
 	})();
 }
 
+export function mergeProbedSearchRows(
+	rows: readonly SdkSearchRowV1[],
+	probedRows: readonly SdkSearchRowV1[],
+): readonly SdkSearchRowV1[] {
+	return [...probedRows, ...rows.slice(probedRows.length)];
+}
+
 async function probeSearchRows(agentDir: string, result: SdkSearchResultV1): Promise<SdkSearchResultV1> {
 	if (result.status === "unavailable" || result.status === "not-in-git-worktree" || result.rows.length === 0)
 		return result;
@@ -414,9 +421,15 @@ async function probeSearchRows(agentDir: string, result: SdkSearchResultV1): Pro
 			undefined,
 			rows.map(row => row.id),
 		);
-		return { ...result, rows: probes };
+		return { ...result, rows: mergeProbedSearchRows(result.rows, probes) };
 	} catch {
-		return { ...result, rows: rows.map(row => ({ ...row, probe: row.live ? "unreachable" : "stale" })) };
+		return {
+			...result,
+			rows: mergeProbedSearchRows(
+				result.rows,
+				rows.map(row => ({ ...row, probe: row.live ? "unreachable" : "stale" })),
+			),
+		};
 	}
 }
 

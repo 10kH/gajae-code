@@ -88,6 +88,64 @@ const SDK_ONLY_TERMINAL_PUBLICATION_WAIT_MS = 1_000;
  *  after this bound are abandoned — their durable broker state is the recovery
  *  authority, and outcomes are inherently uncertain. */
 const GATE_RESOLUTION_QUIESCENCE_MS = 5_000;
+/** Master verification fields are ephemeral protocol values, not unbounded input. */
+const MASTER_AUTH_VALUE_MAX_LENGTH = 512;
+const MASTER_AUTH_VALUE_PATTERN = /^[A-Za-z0-9_-]+$/u;
+/** Keep replay protection finite even when an authenticated client floods nonces. */
+const MASTER_NONCE_REPLAY_MAX_ENTRIES = 1_024;
+/** Verification exchanges complete in seconds; retain replay evidence for a bounded window. */
+const MASTER_NONCE_REPLAY_TTL_MS = 5 * 60_000;
+
+export type MasterCapabilityReplayState = Map<string, number>;
+
+export function verifyMasterCapabilityFrame(input: {
+	frame: { nonce: unknown; attestationEpoch: unknown; capability: unknown };
+	expectedCapability: string | undefined;
+	expectedEpoch: string | undefined;
+	replay: MasterCapabilityReplayState;
+	now?: number;
+}): { ok: boolean; nonce: string; attestationEpoch: string } {
+	const now = input.now ?? Date.now();
+	for (const [consumedNonce, expiresAt] of input.replay) {
+		if (expiresAt <= now) input.replay.delete(consumedNonce);
+	}
+	const bounded = (value: unknown): value is string =>
+		typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= MASTER_AUTH_VALUE_MAX_LENGTH &&
+		MASTER_AUTH_VALUE_PATTERN.test(value);
+	const nonce = bounded(input.frame.nonce) ? input.frame.nonce : "";
+	const epoch = bounded(input.frame.attestationEpoch) ? input.frame.attestationEpoch : "";
+	const capability = bounded(input.frame.capability) ? input.frame.capability : "";
+	const expectedCapability = bounded(input.expectedCapability) ? input.expectedCapability : "";
+	const expectedEpoch = bounded(input.expectedEpoch) ? input.expectedEpoch : "";
+	const authenticatedFields =
+		bounded(input.frame.nonce) &&
+		bounded(input.frame.attestationEpoch) &&
+		bounded(input.frame.capability) &&
+		bounded(input.expectedCapability) &&
+		bounded(input.expectedEpoch) &&
+		epoch === expectedEpoch;
+	const expectedBytes = Buffer.from(expectedCapability);
+	const capabilityBytes = Buffer.from(capability);
+	const capabilityMatches =
+		authenticatedFields &&
+		expectedBytes.length === capabilityBytes.length &&
+		crypto.timingSafeEqual(expectedBytes, capabilityBytes);
+	const reusable = capabilityMatches && !input.replay.has(nonce);
+	if (reusable) {
+		if (input.replay.size >= MASTER_NONCE_REPLAY_MAX_ENTRIES) {
+			const oldest = input.replay.keys().next().value;
+			if (typeof oldest === "string") input.replay.delete(oldest);
+		}
+		input.replay.set(nonce, now + MASTER_NONCE_REPLAY_TTL_MS);
+	}
+	return {
+		ok: reusable,
+		nonce,
+		attestationEpoch: authenticatedFields ? epoch : "",
+	};
+}
 
 class DiffQueryError extends Error {
 	constructor(
@@ -3467,7 +3525,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		await current.registerBroker();
 		current.runtime.emitEvent({ type: "turn_start", sessionId: ctx.sessionManager.getSessionId() });
 	});
-	const consumedMasterNonces = new Set<string>();
+	const consumedMasterNonces = new Map<string, number>();
 	api.on("turn_end", (_event, ctx) =>
 		active?.runtime.emitEvent({ type: "turn_end", sessionId: ctx.sessionManager.getSessionId() }),
 	);
@@ -3920,26 +3978,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		};
 		runtime = new SessionSdkSessionRuntime({
 			transport,
-			masterCapabilityVerify: frame => {
-				const nonce = typeof frame.nonce === "string" ? frame.nonce : "";
-				const epoch = typeof frame.attestationEpoch === "string" ? frame.attestationEpoch : "";
-				const capability = typeof frame.capability === "string" ? frame.capability : "";
-				const expected = options.masterCapability;
-				const expectedBytes = Buffer.from(expected ?? "");
-				const capabilityBytes = Buffer.from(capability);
-				const reusable = nonce.length > 0 && !consumedMasterNonces.has(nonce);
-				if (reusable) consumedMasterNonces.add(nonce);
-				return {
-					ok:
-						reusable &&
-						expected !== undefined &&
-						epoch === options.masterAttestationEpoch &&
-						expectedBytes.length === capabilityBytes.length &&
-						crypto.timingSafeEqual(expectedBytes, capabilityBytes),
-					nonce,
-					attestationEpoch: epoch === options.masterAttestationEpoch ? epoch : "",
-				};
-			},
+			masterCapabilityVerify: frame =>
+				verifyMasterCapabilityFrame({
+					frame,
+					expectedCapability: options.masterCapability,
+					expectedEpoch: options.masterAttestationEpoch,
+					replay: consumedMasterNonces,
+				}),
 			control: async (connectionId, frame) => {
 				options.onFrameAdmitted?.();
 				const request = controlRequestFromFrame(frame as Record<string, unknown>);
