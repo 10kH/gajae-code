@@ -853,6 +853,7 @@ describe("AgentSession MCP discovery", () => {
 		const reasoningModel: Model<"openai-responses"> = {
 			...createModel(),
 			reasoning: true,
+			compat: { supportsReasoningEffort: true },
 			thinking: { mode: "effort", minLevel: Effort.Medium, maxLevel: Effort.Medium },
 		};
 
