@@ -3505,7 +3505,11 @@ export class SelectorController {
 						const hyperlink = buildOAuthLoginAnchor(info.url, "Click here to login");
 						this.ctx.chatContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
 						this.ctx.chatContainer.addChild(
-							new Text(theme.fg("muted", "Command palette → Copy OAuth URL copies the URL exactly."), 1, 0),
+							new Text(
+								theme.fg("muted", "Alt+Shift+U or command palette → Copy OAuth URL copies the URL exactly."),
+								1,
+								0,
+							),
 						);
 						if (info.instructions) {
 							this.ctx.chatContainer.addChild(new Spacer(1));

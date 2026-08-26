@@ -431,7 +431,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	hookEditor: HookEditorComponent | undefined = undefined;
 	lastStatusSpacer: Spacer | undefined = undefined;
 	lastStatusText: Text | undefined = undefined;
-	#oauthUrlForCopy?: { token: symbol; url: string };
+	#oauthUrlForCopyLeases: Array<{ token: symbol; url: string }> = [];
 	fileSlashCommands: Set<string> = new Set();
 	skillCommands: Map<string, Skill> = new Map();
 	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
@@ -1841,18 +1841,20 @@ export class InteractiveMode implements InteractiveModeContext {
 
 	beginOAuthUrlForCopy(url: string): () => void {
 		const token = Symbol("oauth-url-copy");
-		this.#oauthUrlForCopy = { token, url };
+		this.#oauthUrlForCopyLeases.push({ token, url });
 		return () => {
-			if (this.#oauthUrlForCopy?.token === token) this.#oauthUrlForCopy = undefined;
+			const index = this.#oauthUrlForCopyLeases.findIndex(lease => lease.token === token);
+			if (index === -1) return;
+			this.#oauthUrlForCopyLeases.splice(index, 1);
 		};
 	}
 
 	hasOAuthUrlForCopy(): boolean {
-		return this.#oauthUrlForCopy !== undefined;
+		return this.#oauthUrlForCopyLeases.length > 0;
 	}
 
 	async copyOAuthUrl(): Promise<void> {
-		const pending = this.#oauthUrlForCopy;
+		const pending = this.#oauthUrlForCopyLeases.at(-1);
 		if (pending === undefined) {
 			this.showStatus("No OAuth URL is available to copy.");
 			return;

@@ -113,6 +113,16 @@ export class InputController {
 			context: undefined,
 			showError: actionId => this.ctx.showError(actionId),
 		});
+		this.ctx.ui.addInputListener?.(data => {
+			if (
+				!this.ctx.hasOAuthUrlForCopy() ||
+				!this.ctx.keybindings.getKeys("app.clipboard.copyOAuthUrl").some(key => matchesKey(data, key))
+			) {
+				return;
+			}
+			this.#executeAction("app.clipboard.copyOAuthUrl");
+			return { consume: true };
+		});
 		this.#registerActions();
 	}
 

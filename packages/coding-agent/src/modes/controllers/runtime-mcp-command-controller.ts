@@ -609,7 +609,10 @@ export class MCPCommandController {
 							);
 							this.ctx.chatContainer.addChild(
 								new Text(
-									theme.fg("success", "Use command palette → Copy OAuth URL to copy this exact URL:"),
+									theme.fg(
+										"success",
+										"Use Alt+Shift+U or command palette → Copy OAuth URL to copy this exact URL:",
+									),
 									1,
 									0,
 								),
@@ -624,7 +627,10 @@ export class MCPCommandController {
 							);
 							this.ctx.chatContainer.addChild(
 								new Text(
-									theme.fg("success", "Use command palette → Copy OAuth URL to copy this exact URL:"),
+									theme.fg(
+										"success",
+										"Use Alt+Shift+U or command palette → Copy OAuth URL to copy this exact URL:",
+									),
 									1,
 									0,
 								),

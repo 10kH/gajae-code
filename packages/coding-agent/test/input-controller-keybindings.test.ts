@@ -79,6 +79,7 @@ async function createContext(options?: {
 		"tui.select.cancel": ["escape"],
 		"tui.editor.deleteCharBackward": ["backspace"],
 		"app.todo.toggle": ["alt+shift+t"],
+		"app.clipboard.copyOAuthUrl": ["alt+shift+u"],
 		"app.session.tree": ["alt+shift+s"],
 		"app.session.fork": ["alt+shift+f"],
 		"app.session.resume": ["alt+shift+r"],
@@ -219,6 +220,7 @@ async function createContext(options?: {
 		ui: {
 			requestRender: vi.fn(),
 			setFocus: vi.fn(),
+			addInputListener: vi.fn(() => () => {}),
 			followLiveViewport: vi.fn(),
 			scrollViewportPages: vi.fn(),
 		} as unknown as InteractiveModeContext["ui"],
@@ -412,6 +414,19 @@ describe("InputController keybinding setup", () => {
 
 		expect(await controller.actionRegistry.execute("app.clipboard.copyOAuthUrl")).toBe(true);
 		expect(spies.copyOAuthUrl).toHaveBeenCalledTimes(1);
+	});
+
+	it("copies a pending OAuth URL from the global shortcut without changing focus", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		new InputController(ctx);
+		spies.hasOAuthUrlForCopy.mockReturnValue(true);
+		const addInputListener = ctx.ui.addInputListener as ReturnType<typeof vi.fn>;
+		const listener = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume: boolean } | undefined;
+
+		expect(listener("\x1bU")).toEqual({ consume: true });
+		await Promise.resolve();
+		expect(spies.copyOAuthUrl).toHaveBeenCalledTimes(1);
+		expect(ctx.ui.setFocus as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
 	});
 
 	it("enables model cycling from configured role candidates without a model scope", async () => {

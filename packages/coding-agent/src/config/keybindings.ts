@@ -174,7 +174,7 @@ export const KEYBINDINGS = {
 		description: "Copy prompt",
 	},
 	"app.clipboard.copyOAuthUrl": {
-		defaultKeys: [],
+		defaultKeys: "alt+shift+u",
 		description: "Copy OAuth URL",
 	},
 	"app.session.new": {
