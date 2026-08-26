@@ -18815,7 +18815,11 @@ export class AgentSession {
 								transitionGeneration,
 							);
 							if (!switched) {
-								if (this.#abortAdmissionEpoch !== abortEpoch || cancellationSignal?.aborted) {
+								if (
+									this.#abortAdmissionEpoch !== abortEpoch ||
+									cancellationSignal?.aborted ||
+									this.#fallbackTransitionGeneration !== transitionGeneration
+								) {
 									await restoreOwnedTransition();
 									return;
 								}
