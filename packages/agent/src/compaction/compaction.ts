@@ -175,9 +175,10 @@ export function computeAdaptiveThresholdPercent(
 	state: AdaptiveCompactionDecisionState | undefined,
 	options: AdaptiveCompactionOptions | undefined,
 ): number {
-	if (!options?.enabled || !state || !Number.isFinite(contextWindow) || contextWindow <= 0) return basePercent;
-
 	const clampedBasePercent = Number.isFinite(basePercent) ? Math.min(99, Math.max(1, basePercent)) : 85;
+	if (!options?.enabled) return basePercent;
+	if (!state || !Number.isFinite(contextWindow) || contextWindow <= 0) return clampedBasePercent;
+
 	if (state.turnsSinceCompact < 3) return clampedBasePercent;
 
 	const safeContextTokens = Number.isFinite(contextTokens) ? Math.max(0, contextTokens) : 0;

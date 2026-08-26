@@ -113,4 +113,13 @@ describe("adaptive compaction threshold", () => {
 		expect(invalid).toBe(85);
 		expect(zeroContext).toBe(85_000);
 	});
+
+	it("clamps an enabled adaptive base before state is available", () => {
+		expect(
+			computeAdaptiveThresholdPercent(200, 0, 100_000, undefined, {
+				...adaptiveOptions,
+				baseThresholdPercent: 200,
+			}),
+		).toBe(99);
+	});
 });

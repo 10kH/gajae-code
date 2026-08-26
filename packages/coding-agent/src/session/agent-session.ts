@@ -16467,11 +16467,12 @@ export class AgentSession {
 			}
 			if (isAborted()) return result("aborted");
 
-			// In-place context-full maintenance only. "off" defers entirely; "handoff"
+			// context-full maintenance. "off" defers entirely; "handoff"
 			// keeps its existing agent_end / pre-prompt boundaries (a mid-tool-loop
 			// session swap would be far more disruptive than the overflow it avoids).
 			const compactionSettings = this.settings.getGroup("compaction");
-			if (!compactionSettings.enabled || compactionSettings.strategy !== "context-full") return result("not-needed");
+			const adaptiveCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
+			if (!compactionSettings.enabled || compactionSettings.strategy === "context-full") return result("not-needed");
 			const contextWindow = this.model?.contextWindow ?? 0;
 			if (contextWindow <= 0) return result("not-needed");
 			// A compaction already in flight (overflow recovery, manual, idle) owns the
@@ -16483,7 +16484,9 @@ export class AgentSession {
 			const autoCompactionOutputReserveTokens = 0;
 			const anchor = this.#findMidRunUsageAnchor(context.messages);
 			let contextTokens = this.#estimateMidRunContextTokens(context.messages);
-			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+			if (
+				!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens)
+			) {
 				return result("not-needed");
 			}
 			// Anti-loop (#1662): a given provider response anchors at most one
@@ -16517,7 +16520,7 @@ export class AgentSession {
 				!shouldCompact(
 					Math.max(0, contextTokens - pruneEstimate.tokensSaved),
 					contextWindow,
-					compactionSettings,
+					adaptiveCompactionSettings,
 					autoCompactionOutputReserveTokens,
 				)
 			) {
@@ -16526,7 +16529,9 @@ export class AgentSession {
 				if (pruneResult?.failure === "artifact_persistence") return result("failed");
 				if (pruneResult) contextTokens = Math.max(0, contextTokens - pruneResult.tokensSaved);
 			}
-			if (!shouldCompact(contextTokens, contextWindow, compactionSettings, autoCompactionOutputReserveTokens)) {
+			if (
+				!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens)
+			) {
 				return pruneResult?.committed ? result("pruned", true) : result("not-needed");
 			}
 

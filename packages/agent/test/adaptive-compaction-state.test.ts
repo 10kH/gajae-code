@@ -62,6 +62,14 @@ describe("AdaptiveCompactionTracker", () => {
 		expect(tracker.windowMs).toBe(60_000);
 	});
 
+	it("normalizes non-finite window durations", () => {
+		const tracker = new AdaptiveCompactionTracker(Number.NaN, 0);
+
+		expect(tracker.windowMs).toBe(60_000);
+		tracker.recordCall(80_000, 60_000);
+		expect(tracker.snapshot().callsInWindow).toBe(1);
+	});
+
 	it("exposes the latest context size for adaptive decisions", () => {
 		const tracker = new AdaptiveCompactionTracker(60_000, 0);
 

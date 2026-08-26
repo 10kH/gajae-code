@@ -35,6 +35,6 @@ compaction:
     minThresholdPercent: 50
 ```
 
-The adaptive threshold uses both context fill and call rate. When context is in the high band and recent calls are dense, `aggression` lowers the threshold toward `minThresholdPercent`. The call window is a bounded tumbling window, and successful automatic or manual compaction resets it. Immediately after a compaction, the threshold returns to the base level for three turns to avoid repeated re-compaction.
+The adaptive threshold uses both context fill and call rate. When context is in the high band and recent calls are dense, `aggression` lowers the threshold toward `minThresholdPercent`. The policy is applied at post-turn, pre-prompt, and cooperative mid-run maintenance boundaries. The call window is a bounded tumbling window, and successful automatic or manual compaction resets it. Immediately after a compaction, the threshold returns to the base level for three turns to avoid repeated re-compaction.
 
 Leave `compaction.adaptive.enabled` as `false` for exact legacy behavior. The shipped default remains off for backward compatibility.

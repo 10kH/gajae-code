@@ -23,11 +23,10 @@ export interface AdaptiveCompactionOptions {
 
 export class AdaptiveCompactionTracker {
 	#state: AdaptiveCompactionState;
+	windowMs: number;
 
-	constructor(
-		public windowMs = 60_000,
-		now = Date.now(),
-	) {
+	constructor(windowMs = 60_000, now = Date.now()) {
+		this.windowMs = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 60_000;
 		this.#state = {
 			turnsSinceCompact: 0,
 			callsInWindow: 0,
@@ -39,6 +38,7 @@ export class AdaptiveCompactionTracker {
 	}
 
 	setWindowMs(windowMs: number, now = Date.now()): void {
+		if (!Number.isFinite(windowMs)) return;
 		const nextWindowMs = Math.max(1, windowMs);
 		if (nextWindowMs === this.windowMs) return;
 		this.windowMs = nextWindowMs;
