@@ -15860,6 +15860,9 @@ export class AgentSession {
 					preserveData,
 				);
 				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+				if (compactionSettings.adaptive?.enabled) {
+					this.#adaptiveCompactionTracker.recordCompact(tokensBefore);
+				}
 
 				const compactionResult: CompactionResult = {
 					summary,
@@ -16679,7 +16682,7 @@ export class AgentSession {
 		// Model maxTokens is a capability ceiling, not a per-turn reservation.
 		// Auto maintenance should track actual context fullness.
 		const autoCompactionOutputReserveTokens = 0;
-		const adaptiveCompactionSettings = this.#recordAdaptiveCompactionCall(contextTokens, compactionSettings);
+		const adaptiveCompactionSettings = this.#compactionSettingsWithAdaptiveState(compactionSettings);
 		if (!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens)) {
 			// Below the compaction threshold: optionally run evidence-gated maintenance
 			// pruning (opt-in, high savings + cache-epoch payback required).

@@ -645,7 +645,7 @@ export function streamSimple<TApi extends Api>(
 		return stream(model, context, providerOptions);
 	}
 
-	const apiKey = options?.apiKey ?? getEnvApiKey(model.provider);
+	const apiKey = options?.apiKey || getEnvApiKey(model.provider);
 	if (!apiKey) {
 		throw new Error(formatMissingApiKeyError(model.provider));
 	}

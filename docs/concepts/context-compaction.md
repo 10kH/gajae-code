@@ -17,7 +17,7 @@ compaction:
   thresholdPercent: 70
 ```
 
-`compaction.thresholdTokens` takes priority over `compaction.thresholdPercent` when it is greater than zero. The default percentage sentinel is `-1`, which uses the legacy reserve-based threshold: roughly `contextWindow - reserve`, commonly near 85% of the model context window.
+`compaction.thresholdTokens` takes priority over percentage settings when it is greater than zero. With adaptive mode disabled, the default percentage sentinel `-1` uses the legacy reserve-based threshold: roughly `contextWindow - reserve`, commonly near 85% of the model context window. With adaptive mode enabled, `compaction.adaptive.baseThresholdPercent` is the adaptive base, including when `thresholdPercent` remains at its `-1` sentinel; the adaptive base is then lowered only when its context and call-rate conditions are met.
 
 ## Adaptive Compaction
 
@@ -35,6 +35,6 @@ compaction:
     minThresholdPercent: 50
 ```
 
-The adaptive threshold uses both context fill and call rate. When context is in the high band and recent calls are dense, `aggression` lowers the threshold toward `minThresholdPercent`. Immediately after a compaction, the threshold returns to the base level for three turns to avoid repeated re-compaction.
+The adaptive threshold uses both context fill and call rate. When context is in the high band and recent calls are dense, `aggression` lowers the threshold toward `minThresholdPercent`. The call window is a bounded tumbling window, and successful automatic or manual compaction resets it. Immediately after a compaction, the threshold returns to the base level for three turns to avoid repeated re-compaction.
 
 Leave `compaction.adaptive.enabled` as `false` for exact legacy behavior. The shipped default remains off for backward compatibility.
