@@ -421,13 +421,13 @@ describe("InputController keybinding setup", () => {
 		const { InputController, ctx, spies } = await createContext({ oauthCopyKeys: ["alt+shift+k"] });
 		new InputController(ctx);
 		spies.hasOAuthUrlForCopy.mockReturnValue(true);
-		const addInputListener = ctx.ui.addInputListener as ReturnType<typeof vi.fn>;
+		const addInputListener = ctx.ui.addInputListener as Mock<InteractiveModeContext["ui"]["addInputListener"]>;
 		const listener = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume: boolean } | undefined;
 
 		expect(listener("\x1bK")).toEqual({ consume: true });
 		await Promise.resolve();
 		expect(spies.copyOAuthUrl).toHaveBeenCalledTimes(1);
-		expect(ctx.ui.setFocus as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+		expect(ctx.ui.setFocus as Mock<InteractiveModeContext["ui"]["setFocus"]>).not.toHaveBeenCalled();
 	});
 
 	it("does not let a remapped OAuth copy chord steal Ctrl+C cancellation", async () => {
@@ -438,7 +438,7 @@ describe("InputController keybinding setup", () => {
 			const { InputController, ctx, spies } = await createContext({ oauthCopyKeys: [copyKey] });
 			new InputController(ctx);
 			spies.hasOAuthUrlForCopy.mockReturnValue(true);
-			const addInputListener = ctx.ui.addInputListener as ReturnType<typeof vi.fn>;
+			const addInputListener = ctx.ui.addInputListener as Mock<InteractiveModeContext["ui"]["addInputListener"]>;
 			const listener = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume: boolean } | undefined;
 
 			expect(listener(input)).toBeUndefined();
@@ -523,7 +523,7 @@ describe("InputController keybinding setup", () => {
 
 		controller.setupKeyHandlers();
 
-		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+		const registration = (editor.setCustomKeyHandler as Mock<FakeEditor["setCustomKeyHandler"]>).mock.calls.find(
 			([key]) => key === "alt+i",
 		);
 		expect(registration).toBeDefined();
@@ -539,7 +539,7 @@ describe("InputController keybinding setup", () => {
 
 		controller.setupKeyHandlers();
 
-		const registration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
+		const registration = (editor.setCustomKeyHandler as Mock<FakeEditor["setCustomKeyHandler"]>).mock.calls.find(
 			([key]) => key === "ctrl+alt+i",
 		);
 		expect(registration).toBeDefined();
@@ -590,9 +590,9 @@ describe("InputController keybinding setup", () => {
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
-		const followUpRegistration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
-			([key]) => key === "ctrl+enter",
-		);
+		const followUpRegistration = (
+			editor.setCustomKeyHandler as Mock<FakeEditor["setCustomKeyHandler"]>
+		).mock.calls.find(([key]) => key === "ctrl+enter");
 		expect(followUpRegistration).toBeDefined();
 		const handler = followUpRegistration?.[1] as () => boolean | undefined;
 
@@ -608,9 +608,9 @@ describe("InputController keybinding setup", () => {
 		const controller = new InputController(ctx);
 
 		controller.setupKeyHandlers();
-		const followUpRegistration = (editor.setCustomKeyHandler as ReturnType<typeof vi.fn>).mock.calls.find(
-			([key]) => key === "ctrl+enter",
-		);
+		const followUpRegistration = (
+			editor.setCustomKeyHandler as Mock<FakeEditor["setCustomKeyHandler"]>
+		).mock.calls.find(([key]) => key === "ctrl+enter");
 		const handler = followUpRegistration?.[1] as () => boolean | undefined;
 
 		expect(handler()).toBe(true);

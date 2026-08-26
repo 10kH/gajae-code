@@ -567,9 +567,9 @@ describe("MCP 2026-07-28 authorization conformance", () => {
 		using _hook = hookFetch(async (input, init) => {
 			if (String(input) !== "https://provider.example/token") return new Response("not found", { status: 404 });
 			tokenStarted.resolve();
-			await new Promise<never>((_resolve, reject) => {
-				init?.signal?.addEventListener("abort", () => reject(new Error("token exchange aborted")), { once: true });
-			});
+			const { promise: aborted, reject } = Promise.withResolvers<never>();
+			init?.signal?.addEventListener("abort", () => reject(new Error("token exchange aborted")), { once: true });
+			await aborted;
 			throw new Error("unreachable");
 		});
 		const flow = new MCPOAuthFlow(

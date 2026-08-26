@@ -136,6 +136,7 @@ export class MCPAddWizard extends Container {
 	#onRenderCallback: (() => void) | null = null;
 	#onCommandPaletteCallback: ((keyData: string) => boolean) | null = null;
 	#onOAuthCredentialCleanupCallback: ((credentialId: string) => Promise<void> | void) | null = null;
+	#onOAuthCredentialCleanupErrorCallback: ((credentialId: string, error: unknown) => void) | null = null;
 	#oauthAbortController: AbortController | undefined;
 	#oauthCredentialCleanupStarted = false;
 	#completed = false;
@@ -162,6 +163,7 @@ export class MCPAddWizard extends Container {
 		onCommandPalette?: (keyData: string) => boolean,
 		initialName?: string,
 		onOAuthCredentialCleanup?: (credentialId: string) => Promise<void> | void,
+		onOAuthCredentialCleanupError?: (credentialId: string, error: unknown) => void,
 	) {
 		super();
 		this.#onCompleteCallback = onComplete;
@@ -171,6 +173,7 @@ export class MCPAddWizard extends Container {
 		this.#onRenderCallback = onRender ?? null;
 		this.#onCommandPaletteCallback = onCommandPalette ?? null;
 		this.#onOAuthCredentialCleanupCallback = onOAuthCredentialCleanup ?? null;
+		this.#onOAuthCredentialCleanupErrorCallback = onOAuthCredentialCleanupError ?? null;
 		if (initialName && initialName.trim().length > 0) {
 			this.#state.name = initialName.trim();
 			this.#currentStep = "transport";
@@ -205,7 +208,10 @@ export class MCPAddWizard extends Container {
 		this.#oauthAbortController = undefined;
 		if (!this.#completed && !this.#oauthCredentialCleanupStarted && this.#state.oauthCredentialId) {
 			this.#oauthCredentialCleanupStarted = true;
-			void this.#onOAuthCredentialCleanupCallback?.(this.#state.oauthCredentialId);
+			const credentialId = this.#state.oauthCredentialId;
+			void Promise.resolve(this.#onOAuthCredentialCleanupCallback?.(credentialId)).catch(error => {
+				this.#onOAuthCredentialCleanupErrorCallback?.(credentialId, error);
+			});
 		}
 		for (const timer of this.#transitionTimers) {
 			clearTimeout(timer);

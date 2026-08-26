@@ -574,6 +574,12 @@ export class MCPCommandController {
 			keyData => this.#openWizardOAuthCommandPalette(wizard, keyData),
 			parsed.initialName,
 			credentialId => this.#removeManagedOAuthCredential(credentialId),
+			(credentialId, error) =>
+				this.ctx.showError(
+					`Cancelled OAuth cleanup failed for ${credentialId}; the credential may remain stored. ${
+						error instanceof Error ? error.message : String(error)
+					}`,
+				),
 		);
 
 		// Replace editor with wizard

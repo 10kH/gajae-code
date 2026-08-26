@@ -326,9 +326,9 @@ describe("OAuth URL copy lease wiring", () => {
 				login: async () => {
 					callbacks.onAuth({ url: authUrl });
 					entered.resolve();
-					await new Promise<never>((_resolve, reject) => {
-						callbacks.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-					});
+					const { promise: aborted, reject } = Promise.withResolvers<never>();
+					callbacks.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+					await aborted;
 					throw new Error("unreachable");
 				},
 			}),
@@ -427,9 +427,9 @@ describe("OAuth URL copy lease wiring", () => {
 					callbacks.onAuth({ url: authUrl });
 					const signal = callbacks.signal;
 					if (!signal) throw new Error("missing cancellation signal");
-					return await new Promise<never>((_resolve, reject) => {
-						signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-					});
+					const { promise: aborted, reject } = Promise.withResolvers<never>();
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+					return await aborted;
 				},
 			}),
 			() => {},
