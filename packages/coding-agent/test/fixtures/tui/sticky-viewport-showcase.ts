@@ -175,9 +175,9 @@ export const STICKY_VIEWPORT_FRAME_TEXT_WITNESS: Readonly<Record<StickyViewportS
 	"selection-boundary/80x24/unicode-color": "8a6b28cff37576e3e11d5d8a549aa33efde56b4dd6d6704da91e506d79a0ca44",
 	"selection-boundary/120x36/unicode-color": "9e45f3a188c836870c708290e5d094842f75d142de1a072465866ef1425fa027",
 	"manual-new-output/80x24/ascii-no-color": "dce169b90e5a7f6557c1db829cda47716fc250d71698892637ba00b199c4a706",
-	"capacity-zero/48x10/ascii-no-color": "d39aeb89abc4aaaa5523668f63cfe918dae6751a8dac1025178c9dbcfb68c8f9",
-	"multiline-editor-hooks-pet/48x10/unicode-color": "c54fbe3d52e8e3625cd90e746b0c4be25f5563a0c950be615d372e7295afde59",
-	"narrow-cjk/48x10/unicode-color": "dcdc88cc87b4693ef0f1500fe304de994da6f2c6916faf5165bacda77c66c161",
+	"capacity-zero/48x10/ascii-no-color": "72c2cf0b8a3e25281cdb5d875e3331a1983bf58205867abd96da9f95761cc639",
+	"multiline-editor-hooks-pet/48x10/unicode-color": "9baef9786b980e99541ab38a5a2c9076cfd86ba1c67b73e6f911cccb3fe33ab7",
+	"narrow-cjk/48x10/unicode-color": "c881eeb839c9eeaefa0d867f8fd69fe44b351262113e4db4a570aeead22ee846",
 });
 // Every persisted frame must be canonical for its render mode, not just the
 // top-level payload. `metadata.json` is a required manifest artifact, so raw

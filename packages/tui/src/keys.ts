@@ -47,12 +47,23 @@ function isWindowsTerminalSession(): boolean {
  * Prefer explicit Kitty / CSI-u / modifyOtherKeys sequences whenever they are
  * available. Fall back to a Windows Terminal heuristic only for raw BS bytes.
  */
-function matchesRawBackspace(data: string, expectedModifier: number): boolean {
+/**
+ * Resolve the ambiguous raw backspace bytes against a chord's expected modifier.
+ *
+ * `\x7f` is always plain backspace. `\x08` is the ambiguous one: Windows
+ * Terminal sends it for Ctrl+Backspace, while legacy terminals and some tmux
+ * setups send it for plain Backspace. Returns undefined when the byte is neither,
+ * meaning the caller should fall through to normal matching.
+ */
+function matchesRawBackspace(data: string, expectedModifier: number): boolean | undefined {
 	if (data === "\x7f") return expectedModifier === 0;
-	if (data !== "\x08") return false;
+	if (data !== "\x08") return undefined;
 	// On Windows Terminal, 0x08 = Ctrl+Backspace. On others, it's plain Backspace.
-	return isWindowsTerminalSession() ? expectedModifier === 4 : expectedModifier === 0;
+	return isWindowsTerminalSession() ? expectedModifier === RAW_BACKSPACE_CTRL_MODIFIER : expectedModifier === 0;
 }
+
+/** Modifier code the raw-backspace heuristic treats as Ctrl. */
+const RAW_BACKSPACE_CTRL_MODIFIER = 4;
 
 export { isWindowsTerminalSession, matchesRawBackspace };
 
@@ -744,6 +755,15 @@ export function decodePrintableKey(data: string): string | undefined {
  * @param keyId - Key identifier (e.g., "ctrl+c", "escape", Key.ctrl("c"))
  */
 export function matchesKey(data: string, keyId: KeyId): boolean {
+	if (data === "\x08") {
+		// Raw 0x08 is ambiguous and the native matcher resolves it as unmodified
+		// backspace only, so on Windows Terminal -- where the byte means
+		// ctrl+backspace -- every chord declaring ctrl+backspace silently never
+		// fired. One helper owns that decision for both chords so the two cannot
+		// drift apart.
+		if (keyId === "ctrl+backspace") return matchesRawBackspace(data, RAW_BACKSPACE_CTRL_MODIFIER) === true;
+		if (keyId === "backspace") return matchesRawBackspace(data, 0) === true;
+	}
 	return (
 		nativeKeys().matchesKey(data, keyId, kittyProtocolActive) ||
 		(kittyProtocolActive && matchesKoreanDubeolsikKittySequence(data, keyId))

@@ -20,6 +20,7 @@ import type {
 } from "../src/extensibility/extensions";
 import { CustomEditor } from "../src/modes/components/custom-editor";
 import { computeIrcWorkLaneWidths, IrcSplitViewComponent } from "../src/modes/components/irc-sidebar";
+import { resolveWelcomeIntroTickMs, WelcomeComponent } from "../src/modes/components/welcome";
 import { ExtensionUiController } from "../src/modes/controllers/extension-ui-controller";
 import { SelectorController } from "../src/modes/controllers/selector-controller";
 import { InteractiveMode } from "../src/modes/interactive-mode";
@@ -436,6 +437,105 @@ describe("InteractiveMode.setEditorComponent", () => {
 		expect(mode.todoContainer.render(64).some(line => visibleWidth(line) > 32)).toBe(true);
 		forceTerminalSize(mode, 80, 24);
 		expect(mode.todoContainer.render(80).every(line => visibleWidth(line) <= 47)).toBe(true);
+	});
+	it("expands the todo HUD from the collapsed five-task view and back", async () => {
+		await mode.init();
+		const tasks = Array.from({ length: 7 }, (_, index) => ({
+			content: `task-${index + 1}`,
+			status: index === 0 ? ("in_progress" as const) : ("pending" as const),
+		}));
+		mode.setTodos(tasks);
+
+		const collapsed = mode.todoContainer.render(80).map(stripRenderControls).join("\n");
+		expect(mode.todoExpanded).toBe(false);
+		expect(collapsed).toContain("task-5");
+		// Tasks past the collapsed cap are hidden behind a summary row.
+		expect(collapsed).not.toContain("task-6");
+		expect(collapsed).not.toContain("task-7");
+		expect(collapsed).toMatch(/\+\s*2\s+more/);
+
+		mode.toggleTodoExpansion();
+
+		const expanded = mode.todoContainer.render(80).map(stripRenderControls).join("\n");
+		expect(mode.todoExpanded).toBe(true);
+		for (const task of tasks) expect(expanded).toContain(task.content);
+		expect(expanded).not.toMatch(/\+\s*\d+\s+more/);
+
+		mode.toggleTodoExpansion();
+
+		const recollapsed = mode.todoContainer.render(80).map(stripRenderControls).join("\n");
+		expect(mode.todoExpanded).toBe(false);
+		expect(recollapsed).not.toContain("task-7");
+		expect(recollapsed).toMatch(/\+\s*2\s+more/);
+	});
+
+	it("forwards startup.skipLogoAnimation through the real settings path", async () => {
+		// `init()` schedules unrelated timers (pet capability settle, etc.), so a
+		// global timer count proves nothing. Record interval delays instead and
+		// A/B the two settings values in one test so the intro tick is the only
+		// difference between them.
+		const introTick = resolveWelcomeIntroTickMs(process.platform, Bun.env.TERM_PROGRAM_VERSION ?? "");
+		const originalSetInterval = globalThis.setInterval;
+		const delays: number[] = [];
+		globalThis.setInterval = ((handler: () => void, delay?: number, ...args: unknown[]) => {
+			delays.push(Number(delay));
+			return Reflect.apply(originalSetInterval, globalThis, [handler, delay, ...args]);
+		}) as typeof globalThis.setInterval;
+
+		const makeMode = () =>
+			new InteractiveMode(
+				session,
+				"test",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				injectedKeyDisplayContext,
+			);
+		const skipped = makeMode();
+		const animated = makeMode();
+		try {
+			settings.set("startup.quiet", false);
+			settings.set("startup.skipLogoAnimation", true);
+			vi.spyOn(skipped.ui, "start").mockImplementation(() => {});
+			await skipped.init();
+
+			const welcome = skipped.ui.children.find(child => child instanceof WelcomeComponent);
+			expect(welcome).toBeInstanceOf(WelcomeComponent);
+			// Resting content still renders: this is not startup.quiet.
+			expect(welcome?.render(120).length).toBeGreaterThan(0);
+			expect(delays).not.toContain(introTick);
+
+			// Mutating the setting after init() is inert: it is read once at startup.
+			settings.set("startup.skipLogoAnimation", false);
+			expect(delays).not.toContain(introTick);
+
+			// Positive control on the same instrument: the default value animates.
+			delays.length = 0;
+			vi.spyOn(animated.ui, "start").mockImplementation(() => {});
+			await animated.init();
+
+			expect(animated.ui.children.some(child => child instanceof WelcomeComponent)).toBe(true);
+			expect(delays).toContain(introTick);
+		} finally {
+			globalThis.setInterval = originalSetInterval;
+			skipped.stop();
+			animated.stop();
+		}
+	});
+
+	it("still renders no welcome surface at all under startup.quiet regardless of the motion flag", async () => {
+		settings.set("startup.quiet", true);
+		settings.set("startup.skipLogoAnimation", false);
+		try {
+			vi.spyOn(mode.ui, "start").mockImplementation(() => {});
+			await mode.init();
+
+			expect(mode.ui.children.some(child => child instanceof WelcomeComponent)).toBe(false);
+		} finally {
+			mode.stop();
+		}
 	});
 
 	it("suppresses the toggle hint when the panel is requested-open but yielded at narrow width", () => {

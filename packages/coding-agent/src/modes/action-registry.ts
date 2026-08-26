@@ -71,6 +71,7 @@ export const APP_ACTION_METADATA: readonly ActionMetadata[] = [
 	action("app.transcript.nextTurn", "Next transcript turn", "Transcript", ["composer"]),
 	action("app.mode.cycle", "Cycle mode", "Mode", ["composer"]),
 	action("app.tasks.toggle", "Toggle tasks pane", "Jobs", ["composer"]),
+	action("app.todo.toggle", "Toggle todo expansion", "Tasks", ["composer"]),
 	action("app.queue.togglePane", "Toggle queue pane", "Messages", ["composer"]),
 	action("app.message.sendNow", "Send message now", "Messages", ["composer"]),
 ];

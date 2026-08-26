@@ -52,6 +52,24 @@ describe("generated JSON Schemas", () => {
 		expect(ralplan.additionalProperties).toBe(false);
 	});
 
+	it("exposes startup.skipLogoAnimation as a startup boolean on the interaction tab", () => {
+		const setting = SETTINGS_SCHEMA["startup.skipLogoAnimation"];
+		expect(setting.type).toBe("boolean");
+		expect(setting.default).toBe(false);
+		// Startup-sweep-only scope is carried by the label and placement: a generic
+		// "Reduced Motion" name would imply pet and loader motion also honor it.
+		expect(setting.ui?.tab).toBe("interaction");
+		expect(setting.ui?.label).toBe("Skip Startup Logo Animation");
+
+		const schema = configSchema() as {
+			properties: { startup: { properties: Record<string, unknown> } };
+		};
+		expect(schema.properties.startup.properties.skipLogoAnimation).toMatchObject({
+			type: "boolean",
+			default: false,
+		});
+	});
+
 	it("accepts documented Discord and Slack config while rejecting unknown chat properties", () => {
 		const schema = configSchema();
 		const completeConfig = {

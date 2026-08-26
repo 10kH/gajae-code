@@ -46,6 +46,23 @@ const QUEUE_SELECTOR_NAVIGATION_ACTIONS = [
 	"tui.select.pageDown",
 ] as const;
 
+/**
+ * Navigation actions that already carry a registry callback and an availability
+ * predicate but shipped with no curated command-palette entry and no key
+ * dispatch, leaving them unreachable from the palette. They opt into
+ * availability gating so an unavailable id is not listed, and each gets a remap
+ * dispatch loop while keeping `defaultKeys: []` -- inert at defaults, but a user
+ * binding now dispatches instead of only being rendered by the selector.
+ */
+export const AVAILABILITY_GATED_NAV_PALETTE_ACTIONS = [
+	"app.session.dashboard",
+	"app.transcript.browse",
+	"app.transcript.prevTurn",
+	"app.transcript.nextTurn",
+	"app.queue.togglePane",
+	"app.message.sendNow",
+] as const satisfies readonly AppKeybinding[];
+
 interface Expandable {
 	setExpanded(expanded: boolean): void;
 	setManuallyExpanded?(expanded: boolean): void;
@@ -142,6 +159,7 @@ export class InputController {
 			"app.transcript.prevTurn": () => this.#jumpTranscriptTurn(-1),
 			"app.transcript.nextTurn": () => this.#jumpTranscriptTurn(1),
 			"app.tasks.toggle": () => this.ctx.showTasksPane(),
+			"app.todo.toggle": () => this.ctx.toggleTodoExpansion(),
 			"app.queue.togglePane": () => this.toggleQueuePane(),
 			"app.message.sendNow": () => this.sendNow(),
 		};
@@ -217,6 +235,8 @@ export class InputController {
 					!this.ctx.goalModeController.enabled &&
 					!this.ctx.goalModeController.paused
 				);
+			case "app.todo.toggle":
+				return this.ctx.todoPhases.some(phase => phase.tasks.length > 0);
 			case "app.queue.togglePane":
 				return true;
 			case "app.message.sendNow":
@@ -281,14 +301,26 @@ export class InputController {
 	 *  so abort cleanup going idle cannot turn the second Esc into an idle action. */
 	#steerConsumePending = false;
 	#commandPaletteActions = new Map<AppKeybinding, CommandPaletteAction>();
+	/** Opt-in subset of `#commandPaletteActions` whose listing is filtered by the
+	 *  action registry's availability predicate. Deliberately a sibling set rather
+	 *  than a blanket filter over every curated entry: filtering all of them would
+	 *  change visible palette contents for pre-existing thinking, model-cycle,
+	 *  editor, copy, queue, and session actions, which is a separate reviewed
+	 *  migration and not this change. */
+	readonly #availabilityGatedPaletteActions = new Set<AppKeybinding>();
 	#paletteCommandInFlight = false;
 
-	#registerCommandPaletteAction(action: AppKeybinding, handler: () => void | Promise<void>): void {
+	#registerCommandPaletteAction(
+		action: AppKeybinding,
+		handler: () => void | Promise<void>,
+		availabilityGated = false,
+	): void {
 		this.#commandPaletteActions.set(action, {
 			id: action,
 			label: KEYBINDINGS[action].description,
 			handler,
 		});
+		if (availabilityGated) this.#availabilityGatedPaletteActions.add(action);
 	}
 
 	#globalInterruptUnsubscribe: (() => void) | undefined;
@@ -788,6 +820,21 @@ export class InputController {
 				return true;
 			});
 		}
+		// Six navigation actions that shipped with a registry callback and an
+		// availability predicate but no curated palette entry and no key dispatch.
+		// The palette handler routes through `#executeAction` so the registry's
+		// availability check is enforced on selection as well as on listing, and
+		// `defaultKeys` stays `[]` per the settled no-new-defaults boundary.
+		for (const id of AVAILABILITY_GATED_NAV_PALETTE_ACTIONS) {
+			this.#registerCommandPaletteAction(id, () => this.#executeAction(id), true);
+			for (const key of this.ctx.keybindings.getKeys(id)) {
+				this.ctx.editor.setCustomKeyHandler(key, () => {
+					if (!this.actionRegistry.isAvailable(id)) return false;
+					this.#executeAction(id);
+					return true;
+				});
+			}
+		}
 		for (const key of this.ctx.keybindings.getKeys("app.message.followUp")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
 				if (!this.actionRegistry.isAvailable("app.message.followUp")) return false;
@@ -819,6 +866,17 @@ export class InputController {
 		for (const key of this.ctx.keybindings.getKeys("app.tasks.toggle")) {
 			this.ctx.editor.setCustomKeyHandler(key, () => {
 				this.#executeAction("app.tasks.toggle");
+				return true;
+			});
+		}
+		// The todo HUD renders a `+N more` row but had no way to expand it:
+		// `toggleTodoExpansion()` had no caller anywhere in src/. The palette entry
+		// opts into availability gating so it is not offered with an empty model.
+		this.#registerCommandPaletteAction("app.todo.toggle", () => this.#executeAction("app.todo.toggle"), true);
+		for (const key of this.ctx.keybindings.getKeys("app.todo.toggle")) {
+			this.ctx.editor.setCustomKeyHandler(key, () => {
+				if (!this.actionRegistry.isAvailable("app.todo.toggle")) return false;
+				this.#executeAction("app.todo.toggle");
 				return true;
 			});
 		}
@@ -2109,7 +2167,9 @@ export class InputController {
 			return;
 		}
 
-		const actions = [...this.#commandPaletteActions.values()];
+		const actions = [...this.#commandPaletteActions.entries()]
+			.filter(([id]) => !this.#availabilityGatedPaletteActions.has(id) || this.actionRegistry.isAvailable(id))
+			.map(([, action]) => action);
 		const slashCommands = [...(this.ctx.getSlashCommands?.() ?? this.#slashCommands)];
 		if (!this.ctx.showCommandPalette) {
 			let overlayHandle: ReturnType<typeof this.ctx.ui.showOverlay> | undefined;

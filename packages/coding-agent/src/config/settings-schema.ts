@@ -1683,6 +1683,17 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"startup.skipLogoAnimation": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "interaction",
+			label: "Skip Startup Logo Animation",
+			description:
+				"Skip the animated startup logo sweep; the welcome surface, its resting logo, and all information rows still render. Applies at the next interactive start.",
+		},
+	},
+
 	"startup.checkUpdate": {
 		type: "boolean",
 		default: true,

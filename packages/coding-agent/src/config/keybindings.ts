@@ -61,6 +61,7 @@ interface AppKeybindings {
 	"app.transcript.nextTurn": true;
 	"app.mode.cycle": true;
 	"app.tasks.toggle": true;
+	"app.todo.toggle": true;
 	"app.queue.togglePane": true;
 	"app.message.sendNow": true;
 }
@@ -176,15 +177,15 @@ export const KEYBINDINGS = {
 		description: "Start a new session",
 	},
 	"app.session.tree": {
-		defaultKeys: [],
+		defaultKeys: "alt+shift+s",
 		description: "Show session tree",
 	},
 	"app.session.fork": {
-		defaultKeys: [],
+		defaultKeys: "alt+shift+f",
 		description: "Branch from message",
 	},
 	"app.session.resume": {
-		defaultKeys: [],
+		defaultKeys: "alt+shift+r",
 		description: "Resume session",
 	},
 	"app.session.observe": {
@@ -263,6 +264,10 @@ export const KEYBINDINGS = {
 	"app.tasks.toggle": {
 		defaultKeys: "alt+t",
 		description: "Toggle tasks pane",
+	},
+	"app.todo.toggle": {
+		defaultKeys: "alt+shift+t",
+		description: "Toggle todo list expansion",
 	},
 	"app.queue.togglePane": {
 		defaultKeys: [],

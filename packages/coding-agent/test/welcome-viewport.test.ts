@@ -25,6 +25,49 @@ describe("welcome intro cadence", () => {
 		expect(resolveWelcomeIntroTickMs("win32", "")).toBe(33);
 		expect(resolveWelcomeIntroTickMs("linux", "tmux,1,0")).toBe(33);
 	});
+
+	it("skips the animated sweep and settles on the resting frame under reduced motion", () => {
+		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii", {
+			reducedMotion: true,
+		});
+		let renders = 0;
+
+		welcome.playIntro(() => {
+			renders += 1;
+		});
+
+		// One settling render, and no interval left behind to drive more.
+		expect(renders).toBe(1);
+		const duringIntro = welcome.render(120).map(stripRenderControls);
+		welcome.dispose();
+		expect(duringIntro).toEqual(welcome.render(120).map(stripRenderControls));
+	});
+
+	it("animates by default, driving repeated renders from a live timer", () => {
+		const welcome = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii");
+		let renders = 0;
+
+		welcome.playIntro(() => {
+			renders += 1;
+		});
+
+		try {
+			expect(renders).toBe(1);
+			// The default path leaves a running interval, which the reduced-motion
+			// path must not: the resting render only matches after dispose().
+			expect(welcome.render(120).map(stripRenderControls)).not.toEqual(
+				(() => {
+					const resting = new WelcomeComponent("1.2.3", "test-model", "test-provider", [], [], "ascii", {
+						reducedMotion: true,
+					});
+					resting.playIntro(() => {});
+					return resting.render(120).map(stripRenderControls);
+				})(),
+			);
+		} finally {
+			welcome.dispose();
+		}
+	});
 });
 
 function stripRenderControls(line: string): string {

@@ -469,3 +469,327 @@ describe("status line multi-row wrapping (statusLine.maxRows)", () => {
 		expect(buildComponent(1).getPreviewContent(24).split("\n")).toHaveLength(1);
 	});
 });
+
+describe("status line overflow cue", () => {
+	const strip = (s: string): string => Bun.stripANSI(s);
+
+	function buildComponent(maxRows: number, sessionName = "OverflowSess"): StatusLineComponent {
+		const component = new StatusLineComponent(createStatusLineSession(sessionName), { version: "9.9.9" });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae", "session"],
+			rightSegments: ["session_name", "time"],
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
+	/** Marker text without the count, i.e. the countless fallback. */
+	const BARE = "…";
+
+	it("emits no marker when every segment fits", () => {
+		const rendered = buildComponent(1).render(200);
+
+		expect(rendered).toHaveLength(1);
+		expect(strip(rendered[0])).not.toContain(BARE);
+	});
+
+	it("cues the exact omitted count in the single-row eviction path", () => {
+		const rendered = buildComponent(1).render(30);
+
+		expect(rendered).toHaveLength(1);
+		const text = strip(rendered[0]);
+		// Loss happened, so the cue must be present and carry an exact count.
+		expect(text).toMatch(/…\+\d+/);
+		expect(visibleWidth(rendered[0])).toBeLessThanOrEqual(30);
+	});
+
+	it("cues the omitted count in the multi-row cutoff path", () => {
+		const rendered = buildComponent(2).render(14);
+
+		expect(rendered.length).toBeLessThanOrEqual(2);
+		const joined = rendered.map(strip).join("\n");
+		expect(joined).toContain(BARE);
+		// The cue belongs to the final admitted row only, never an interior one.
+		for (const row of rendered.slice(0, -1)) expect(strip(row)).not.toContain(BARE);
+		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(14);
+	});
+
+	it.each([1, 2, 3])("keeps the rail within %i column(s) and still cues the loss", width => {
+		for (const maxRows of [1, 2]) {
+			const rendered = buildComponent(maxRows).render(width);
+			const joined = rendered.map(strip).join("");
+
+			// Every emitted row respects the terminal width, marker included.
+			for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+			// Content cannot survive at these widths, so the cue is all that is left.
+			expect(joined).toContain(BARE);
+		}
+	});
+
+	it("renders the marker alone with no padding cell or end cap at one column", () => {
+		const rendered = buildComponent(1).render(1);
+
+		expect(rendered).toHaveLength(1);
+		expect(strip(rendered[0])).toBe(BARE);
+		expect(visibleWidth(rendered[0])).toBe(1);
+	});
+
+	it("omits the count rather than truncating it when the count cannot fit", () => {
+		// Two columns can never hold `…+N`, which needs at least three.
+		const rendered = buildComponent(1).render(2);
+
+		expect(strip(rendered[0])).toBe(BARE);
+		expect(visibleWidth(rendered[0])).toBe(1);
+		expect(strip(rendered[0])).not.toMatch(/\d/);
+	});
+
+	it("busts the row cache on a same-width state change and rehits on an identical render", () => {
+		// Width 30 is wide enough that the cue renders its exact count, which is
+		// what makes a count change observable at a fixed width.
+		const WIDTH = 30;
+		const component = buildComponent(1);
+		const before = component.render(WIDTH);
+		const baseline = component.getCacheStatsForTest();
+		const countOf = (rows: string[]): string | undefined =>
+			rows
+				.map(strip)
+				.join("")
+				.match(/…\+(\d+)/)?.[1];
+		expect(countOf(before)).toBeDefined();
+
+		// Same width, identical inputs: this must be a pure cache hit.
+		const repeat = component.render(WIDTH);
+		const afterHit = component.getCacheStatsForTest();
+		expect(repeat).toEqual(before);
+		expect(afterHit.rowHits).toBe(baseline.rowHits + 1);
+		expect(afterHit.rowMisses).toBe(baseline.rowMisses);
+
+		// Same width, more droppable segments: must miss and report a larger count.
+		component.updateSettings({ rightSegments: ["session_name", "time", "cost", "context_pct", "token_rate"] });
+		const changed = component.render(WIDTH);
+		const afterMiss = component.getCacheStatsForTest();
+		expect(afterMiss.rowMisses).toBeGreaterThan(baseline.rowMisses);
+		expect(changed).not.toEqual(before);
+		expect(Number(countOf(changed))).toBeGreaterThan(Number(countOf(before)));
+		for (const row of changed) expect(visibleWidth(row)).toBeLessThanOrEqual(WIDTH);
+
+		// Post-change identical re-render must hit and return byte-identical rows.
+		const repeatAfterChange = component.render(WIDTH);
+		const afterSecondHit = component.getCacheStatsForTest();
+		expect(repeatAfterChange).toEqual(changed);
+		expect(afterSecondHit.rowHits).toBe(afterMiss.rowHits + 1);
+		expect(afterSecondHit.rowMisses).toBe(afterMiss.rowMisses);
+	});
+});
+
+describe("status line overflow cue geometry", () => {
+	const strip = (s: string): string => Bun.stripANSI(s);
+
+	function buildWide(maxRows: number): StatusLineComponent {
+		// Enough segments that the omitted count crosses into two digits.
+		const component = new StatusLineComponent(createStatusLineSession("GeoSess"), { version: "9.9.9" });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae", "session", "model", "mode"],
+			rightSegments: [
+				"session_name",
+				"time",
+				"cost",
+				"context_pct",
+				"context_total",
+				"token_in",
+				"token_out",
+				"token_total",
+				"token_rate",
+				"cache_read",
+				"cache_write",
+				"time_spent",
+				"hostname",
+			],
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
+	// Repeating a visible segment is the reachable route to a two-digit count:
+	// segment arrays are unconstrained and collection preserves every occurrence.
+	function buildRepeated(maxRows: number, count: number): StatusLineComponent {
+		const component = new StatusLineComponent(createStatusLineSession("S"), { version: "9.9.9" });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae"],
+			rightSegments: Array.from({ length: count }, () => "session_name") as never,
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
+	it.each([1, 2])("renders exactly the bare marker at one column (maxRows %i)", maxRows => {
+		const rendered = buildWide(maxRows).render(1);
+
+		expect(rendered).toHaveLength(1);
+		expect(strip(rendered[0])).toBe("…");
+		expect(visibleWidth(rendered[0])).toBe(1);
+	});
+
+	it.each([1, 2])("renders exactly the bare marker at two columns (maxRows %i)", maxRows => {
+		const rendered = buildWide(maxRows).render(2);
+
+		expect(rendered).toHaveLength(1);
+		// `…+N` needs at least three cells, so the count is intentionally omitted.
+		expect(strip(rendered[0])).toBe("…");
+		expect(visibleWidth(rendered[0])).toBe(1);
+	});
+
+	it.each([1, 2])("renders the exact literal count at three columns when it fits (maxRows %i)", maxRows => {
+		const component = buildWide(maxRows);
+
+		// Raw pre-truncation rows first: render() applies a defensive truncateToWidth,
+		// so a literal read only from its output cannot prove the marker was reserved
+		// during layout rather than produced by that guard.
+		expect(component.getPreviewContent(3).split("\n").map(strip)).toEqual(["…+8"]);
+
+		// W == 3 with a single-digit count needs exactly 2 + 1 cells, so the count
+		// renders. Asserted as an exact literal, not a shape.
+		const rendered = component.render(3);
+		expect(rendered.map(strip)).toEqual(["…+8"]);
+		expect(visibleWidth(rendered[0])).toBe(3);
+	});
+
+	it("keeps the count exact rather than approximating it as the rail widens", () => {
+		const rendered = buildWide(1).render(40);
+
+		const match = strip(rendered.join("")).match(/…\+(\d+)/);
+		expect(match).not.toBeNull();
+		expect(Number(match?.[1])).toBeGreaterThan(0);
+		expect(match?.[1]).not.toMatch(/^0/);
+		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(40);
+	});
+
+	it.each([
+		[1, 20, "…+12"],
+		[1, 30, "…+10"],
+		[2, 20, "…+7"],
+	] as const)("reports an exact known count (maxRows %i, width %i)", (maxRows, width, expected) => {
+		const rendered = buildRepeated(maxRows, 14).render(width);
+		const joined = strip(rendered.join(""));
+
+		// A known exact figure, including the two-digit cases, so an off-by-one or a
+		// stale count from the reservation passes cannot slip through.
+		expect(joined).toContain(expected);
+		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+	});
+
+	it.each([1, 2])("omits a two-digit count at three columns rather than truncating it (maxRows %i)", maxRows => {
+		// This fixture drops well over ten segments, so `…+NN` needs four cells and
+		// cannot fit three. The plan requires the count be dropped, never truncated
+		// into a wrong or partial number.
+		const component = buildRepeated(maxRows, 14);
+
+		// Raw rows prove the bare marker is the reserved cue, not a truncation
+		// lookalike that the defensive guard happened to emit.
+		expect(component.getPreviewContent(3).split("\n").map(strip)).toEqual(["…"]);
+
+		const rendered = component.render(3);
+		expect(rendered.map(strip)).toEqual(["…"]);
+		expect(visibleWidth(rendered[0])).toBe(1);
+		expect(strip(rendered[0])).not.toMatch(/\d/);
+	});
+
+	it("carries the two-digit count on the final row only in the multi-row path", () => {
+		const rendered = buildRepeated(2, 14).render(20);
+
+		expect(rendered.length).toBe(2);
+		expect(strip(rendered[0])).not.toContain("…+");
+		expect(strip(rendered[1])).toContain("…+7");
+	});
+
+	it("reports an exact count in the multi-row cutoff path", () => {
+		const rendered = buildWide(2).render(40);
+
+		expect(rendered.length).toBeLessThanOrEqual(2);
+		const match = strip(rendered.join("")).match(/…\+(\d+)/);
+		expect(match).not.toBeNull();
+		expect(Number(match?.[1])).toBeGreaterThan(0);
+		// The cue belongs to the final admitted row only.
+		for (const row of rendered.slice(0, -1)) expect(strip(row)).not.toContain("…+");
+		for (const row of rendered) expect(visibleWidth(row)).toBeLessThanOrEqual(40);
+	});
+
+	it.each([1, 2])("emits no row at all at zero width (maxRows %i)", maxRows => {
+		// A zero-width rail has nowhere to put a cue, so it must render nothing
+		// rather than a blank row.
+		expect(buildWide(maxRows).render(0)).toEqual([]);
+	});
+});
+
+describe("status line overflow cue never relies on defensive truncation", () => {
+	const strip = (s: string): string => Bun.stripANSI(s);
+
+	function build(maxRows: number, rightSegments: string[]): StatusLineComponent {
+		const component = new StatusLineComponent(createStatusLineSession("TruncSess"), { version: "9.9.9" });
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["gajae", "session", "model", "mode"],
+			rightSegments: rightSegments as never,
+			separator: "pipe",
+			showSkillHud: false,
+			sessionAccent: false,
+			maxRows,
+		});
+		return component;
+	}
+
+	// Sweeping widths catches the case where a row is emptied to make marker room
+	// and the marker then lands on a different, unreserved row: the reserved cue
+	// would be replaced by whatever the final width truncation happened to emit.
+	it.each([1, 2, 3])("keeps every row within width across a width sweep (maxRows %i)", maxRows => {
+		for (let width = 0; width <= 60; width += 1) {
+			const component = build(maxRows, ["session_name", "time", "cost", "context_pct", "hostname"]);
+
+			// Inspect the RAW rows first. `render()` applies a defensive
+			// truncateToWidth afterwards, so asserting only on rendered output cannot
+			// distinguish a reserved marker from an ellipsis that truncation
+			// manufactured. Raw rows already fitting the width is what proves the
+			// reservation did the work.
+			const rawRows =
+				width > 0
+					? component
+							.getPreviewContent(width)
+							.split("\n")
+							.filter(row => row !== "")
+					: [];
+			for (const rawRow of rawRows) {
+				expect(visibleWidth(rawRow)).toBeLessThanOrEqual(width);
+			}
+
+			const rendered = component.render(width);
+			for (const row of rendered) {
+				expect(visibleWidth(row)).toBeLessThanOrEqual(width);
+			}
+			// A cue, when present, must carry an exact count or no count at all --
+			// never a partial number left behind by truncation.
+			const partial = strip(rawRows.join("\n")).match(/…\+(\d*)$/);
+			if (partial) expect(partial[1]).not.toBe("");
+		}
+	});
+
+	it("never emits the cue on an interior row", () => {
+		for (let width = 1; width <= 60; width += 1) {
+			const rendered = build(3, ["session_name", "time", "cost", "context_pct", "hostname"]).render(width);
+			for (const row of rendered.slice(0, -1)) {
+				expect(strip(row)).not.toContain("…+");
+			}
+		}
+	});
+});

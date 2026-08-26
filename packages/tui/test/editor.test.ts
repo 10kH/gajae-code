@@ -2291,6 +2291,183 @@ describe("Editor component", () => {
 			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
 		});
 
+		// `setText` leaves the cursor at end-of-text; ctrl+a moves it to line start.
+		// Both are used instead of a setter because Editor exposes no public one.
+		const LITERALS_BY_ACTION = {
+			"tui.editor.deleteToLineStart": ["\x15"],
+			"tui.editor.deleteWordBackward": ["\x17", "\x1b\x7f"],
+		} as const;
+
+		it.each([
+			"tui.editor.deleteToLineStart",
+			"tui.editor.deleteWordBackward",
+		] as const)("routes %s through the registry so a remap moves it", action => {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { [action]: "f8" }));
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abc def");
+			const before = editor.getText();
+
+			// The action's own former literals are inert once it is remapped away.
+			for (const literal of LITERALS_BY_ACTION[action]) editor.handleInput(literal);
+			expect(editor.getText()).toBe(before);
+
+			editor.handleInput("\x1b[19~"); // F8 now performs the edit
+			expect(editor.getText()).not.toBe(before);
+		});
+
+		it("routes the kill-ring yank ids through the registry", () => {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, { "tui.editor.yank": "f8" }));
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abc def");
+			editor.handleInput("\x15"); // ctrl+u kills to line start, filling the ring
+			expect(editor.getText()).toBe("");
+
+			// ctrl+y is no longer bound to yank, so it must not restore.
+			editor.handleInput("\x19");
+			expect(editor.getText()).toBe("");
+
+			editor.handleInput("\x1b[19~"); // F8 yanks
+			expect(editor.getText()).toBe("abc def");
+		});
+
+		it("keeps every declared default chord working for the migrated ids", () => {
+			setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+
+			// deleteToLineStart: cursor at end kills the whole line.
+			const killToStart = new Editor(defaultEditorTheme);
+			killToStart.setText("abc def");
+			killToStart.handleInput("\x15");
+			expect(killToStart.getText()).toBe("");
+
+			// deleteToLineEnd: ctrl+a to line start, then kill forward.
+			const killToEnd = new Editor(defaultEditorTheme);
+			killToEnd.setText("abc def");
+			killToEnd.handleInput("\x01");
+			killToEnd.handleInput("\x0b");
+			expect(killToEnd.getText()).toBe("");
+
+			// deleteWordBackward declares ctrl+w and alt+backspace; both must work.
+			for (const chord of ["\x17", "\x1b\x7f"]) {
+				const wordBack = new Editor(defaultEditorTheme);
+				wordBack.setText("abc def");
+				wordBack.handleInput(chord);
+				expect(wordBack.getText()).toBe("abc ");
+			}
+
+			// deleteWordForward from line start removes the leading word.
+			const wordForward = new Editor(defaultEditorTheme);
+			wordForward.setText("abc def");
+			wordForward.handleInput("\x01");
+			wordForward.handleInput("\x1bd");
+			expect(wordForward.getText()).toBe(" def");
+
+			// yank restores what the kill ring captured.
+			const yank = new Editor(defaultEditorTheme);
+			yank.setText("abc def");
+			yank.handleInput("\x15");
+			yank.handleInput("\x19");
+			expect(yank.getText()).toBe("abc def");
+		});
+
+		describe("ctrl+backspace repair", () => {
+			const originalWt = process.env.WT_SESSION;
+			const originalSsh = {
+				connection: process.env.SSH_CONNECTION,
+				client: process.env.SSH_CLIENT,
+				tty: process.env.SSH_TTY,
+			};
+
+			const restore = (key: string, value: string | undefined) => {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			};
+
+			afterEach(() => {
+				restore("WT_SESSION", originalWt);
+				restore("SSH_CONNECTION", originalSsh.connection);
+				restore("SSH_CLIENT", originalSsh.client);
+				restore("SSH_TTY", originalSsh.tty);
+			});
+
+			it("deletes the previous word on the explicit CSI-u encoding", () => {
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+
+				// ctrl+backspace, explicitly encoded (Kitty / CSI-u / modifyOtherKeys).
+				editor.handleInput("\x1b[127;5u");
+
+				expect(editor.getText()).toBe("abc ");
+			});
+
+			it("deletes the previous word for raw 0x08 inside Windows Terminal", () => {
+				// Windows Terminal sends 0x08 for ctrl+backspace. The native matcher
+				// resolves that byte as unmodified backspace only, so the declared
+				// ctrl+backspace chord never fired on that host until matchesKey began
+				// consulting the Windows Terminal heuristic.
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				process.env.WT_SESSION = "test-session";
+				delete process.env.SSH_CONNECTION;
+				delete process.env.SSH_CLIENT;
+				delete process.env.SSH_TTY;
+
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				editor.handleInput("\x08");
+
+				expect(editor.getText()).toBe("abc ");
+			});
+
+			it("keeps raw 0x08 as ctrl+backspace only when no SSH markers are present", () => {
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				process.env.WT_SESSION = "test-session";
+				process.env.SSH_CONNECTION = "1.2.3.4 5 6.7.8.9 22";
+
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				editor.handleInput("\x08");
+
+				// Forwarded over SSH the far end is not Windows Terminal, so the byte
+				// must fall back to plain backspace.
+				expect(editor.getText()).toBe("abc de");
+			});
+
+			it("leaves raw 0x08 as plain backspace on a non-Windows-Terminal host", () => {
+				// Raw 0x08 is ambiguous: Windows Terminal sends it for ctrl+backspace,
+				// other terminals for plain backspace. `matchesKey` resolves it through
+				// the raw-backspace heuristic, which reads the environment on every
+				// call, so this pins the safe default: off Windows Terminal the byte
+				// must stay plain backspace and never start eating whole words.
+				setKeybindings(new KeybindingsManager(TUI_KEYBINDINGS, {}));
+				delete process.env.WT_SESSION;
+
+				const editor = new Editor(defaultEditorTheme);
+				editor.setText("abc def");
+				editor.handleInput("\x08");
+
+				expect(editor.getText()).toBe("abc de");
+			});
+		});
+
+		it("keeps ctrl+a and ctrl+e on their literal branches (documented exception)", () => {
+			// Non-goal 9: these literals still precede the registry-driven
+			// cursorLineStart/cursorLineEnd branches, which docs/keybindings.md names
+			// as the remaining Editor exceptions.
+			setKeybindings(
+				new KeybindingsManager(TUI_KEYBINDINGS, {
+					"tui.editor.cursorLineStart": "f8",
+					"tui.editor.cursorLineEnd": "f9",
+				}),
+			);
+			const editor = new Editor(defaultEditorTheme);
+			editor.setText("abc def");
+
+			editor.handleInput("\x01"); // ctrl+a still goes to line start
+			expect(editor.getCursor()).toEqual({ line: 0, col: 0 });
+			editor.handleInput("\x05"); // ctrl+e still goes to line end
+			expect(editor.getCursor()).toEqual({ line: 0, col: 7 });
+		});
+
 		it("does not swallow keys rebound to copy", () => {
 			setKeybindings(
 				new KeybindingsManager(TUI_KEYBINDINGS, {

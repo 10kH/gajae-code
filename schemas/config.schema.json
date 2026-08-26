@@ -109,6 +109,11 @@
 					"description": "Logo style for the startup welcome screen",
 					"default": "auto"
 				},
+				"skipLogoAnimation": {
+					"type": "boolean",
+					"description": "Skip the animated startup logo sweep; the welcome surface, its resting logo, and all information rows still render. Applies at the next interactive start.",
+					"default": false
+				},
 				"checkUpdate": {
 					"type": "boolean",
 					"description": "At interactive startup, notify of newer versions; never install. `gjc update` installs the matching GitHub release binary. Source, linked, and unrecognized installs stay on their original method.",

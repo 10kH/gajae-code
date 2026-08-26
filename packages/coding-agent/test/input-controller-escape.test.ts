@@ -1,12 +1,19 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, type Mock, vi } from "bun:test";
+import type { AgentMessage } from "@gajae-code/agent-core";
 import { AsyncJobManager } from "@gajae-code/coding-agent/async";
+import { KEYBINDINGS } from "@gajae-code/coding-agent/config/keybindings";
 import { resetSettingsForTest, Settings, settings } from "@gajae-code/coding-agent/config/settings";
-import { InputController } from "@gajae-code/coding-agent/modes/controllers/input-controller";
+import {
+	AVAILABILITY_GATED_NAV_PALETTE_ACTIONS,
+	InputController,
+} from "@gajae-code/coding-agent/modes/controllers/input-controller";
+import { initTheme } from "@gajae-code/coding-agent/modes/theme/theme";
 import type {
 	ComposerSubmissionOptions,
 	InteractiveModeContext,
 	SubmittedUserInput,
 } from "@gajae-code/coding-agent/modes/types";
+import { associateSessionMessageViewportAnchorId } from "@gajae-code/coding-agent/session/session-manager";
 import type { ToolSession } from "@gajae-code/coding-agent/tools";
 import { SubagentTool } from "@gajae-code/coding-agent/tools/implementations";
 import type { SlashCommand } from "@gajae-code/tui";
@@ -14,6 +21,9 @@ import type { SlashCommand } from "@gajae-code/tui";
 beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true, cwd: process.cwd() });
+	// Palette entries that open themed overlays (queue pane) construct real
+	// components, which read the theme.
+	await initTheme(false);
 });
 
 afterAll(() => {
@@ -1652,5 +1662,269 @@ describe("InputController command palette", () => {
 
 		resolveChangelog();
 		await first;
+	});
+});
+
+describe("InputController availability-gated navigation palette entries", () => {
+	type PaletteAction = { id: string; label: string; handler: () => void | Promise<void> };
+
+	function listPalette(ctx: InteractiveModeContext): PaletteAction[] {
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+		controller.openCommandPalette();
+		return (showCommandPalette.mock.calls[0]?.[1] ?? []) as PaletteAction[];
+	}
+
+	function anchoredUserMessage(anchorId: string): AgentMessage {
+		const message = { role: "user", content: "hello" } as unknown as AgentMessage;
+		associateSessionMessageViewportAnchorId(message, anchorId);
+		return message;
+	}
+
+	function stubQueueKeyFormatting(ctx: InteractiveModeContext): void {
+		// `#showQueuePane` formats key hints through the keybinding manager; the
+		// shared fake only implements getKeys/getDisplayString.
+		(ctx.keybindings as unknown as { formatKeyHint(key: string): string }).formatKeyHint = key => key;
+	}
+
+	// Literal product contract, deliberately NOT derived from the production list:
+	// importing that list would make this test pass even if an id were dropped.
+	const EXPECTED_GATED_NAV_IDS = [
+		"app.session.dashboard",
+		"app.transcript.browse",
+		"app.transcript.prevTurn",
+		"app.transcript.nextTurn",
+		"app.queue.togglePane",
+		"app.message.sendNow",
+	] as const;
+
+	it("gates exactly the six documented navigation ids", () => {
+		expect([...AVAILABILITY_GATED_NAV_PALETTE_ACTIONS].sort()).toEqual([...EXPECTED_GATED_NAV_IDS].sort());
+	});
+
+	it("lists every gated navigation id once its predicate holds", () => {
+		const { ctx, editor } = createContext();
+		(ctx.session as { isStreaming: boolean }).isStreaming = true;
+		(ctx.session as { messages: AgentMessage[] }).messages = [anchoredUserMessage("anchor-1")];
+		editor.setText("draft");
+
+		const ids = listPalette(ctx).map(action => action.id);
+
+		for (const id of EXPECTED_GATED_NAV_IDS) {
+			expect(ids).toContain(id);
+		}
+	});
+
+	it("omits gated ids whose predicate is false and keeps the always-available ones", () => {
+		const { ctx } = createContext();
+
+		const ids = listPalette(ctx).map(action => action.id);
+
+		// messages: [] and not streaming -> these four predicates are false.
+		expect(ids).not.toContain("app.transcript.browse");
+		expect(ids).not.toContain("app.transcript.prevTurn");
+		expect(ids).not.toContain("app.transcript.nextTurn");
+		expect(ids).not.toContain("app.message.sendNow");
+		// `queue.togglePane` returns true and `session.dashboard` falls to default.
+		expect(ids).toContain("app.queue.togglePane");
+		expect(ids).toContain("app.session.dashboard");
+	});
+
+	it("leaves pre-existing ungated entries listed even when their predicate is false", () => {
+		const { ctx } = createContext();
+
+		const ids = listPalette(ctx).map(action => action.id);
+
+		// `app.session.tree`/`fork` require messages.length > 0 but are NOT gated,
+		// so the opt-in filter must not touch them. A blanket filter over the whole
+		// curated map would drop both here.
+		expect(ctx.session.messages).toHaveLength(0);
+		expect(ids).toContain("app.session.tree");
+		expect(ids).toContain("app.session.fork");
+	});
+
+	it("omits the todo toggle entry with an empty todo model and lists it once a phase has tasks", () => {
+		const { ctx } = createContext();
+		ctx.todoPhases = [];
+
+		expect(listPalette(ctx).map(action => action.id)).not.toContain("app.todo.toggle");
+
+		ctx.todoPhases = [
+			{ title: "Phase 1", tasks: [{ text: "do the thing", status: "pending" }] },
+		] as unknown as InteractiveModeContext["todoPhases"];
+
+		expect(listPalette(ctx).map(action => action.id)).toContain("app.todo.toggle");
+	});
+
+	it("labels gated entries from their keybinding description", () => {
+		const { ctx } = createContext();
+
+		const dashboard = listPalette(ctx).find(action => action.id === "app.session.dashboard");
+
+		expect(dashboard?.label).toBe(KEYBINDINGS["app.session.dashboard"].description);
+	});
+
+	it("dispatches a user remap of a gated id while its default stays empty", () => {
+		const { ctx, editor } = createContext();
+		(ctx.keybindings as unknown as { getKeys(action: string): string[] }).getKeys = action =>
+			action === "app.queue.togglePane" ? ["ctrl+alt+q"] : [];
+		const showSessionsDashboard = vi.fn();
+		ctx.showSessionsDashboard = showSessionsDashboard;
+		const getQueuedMessageEntries = vi.fn(() => [{ id: "q1", text: "queued", mode: "steer", label: "Steering" }]);
+		(ctx.session as unknown as { getQueuedMessageEntries: unknown }).getQueuedMessageEntries =
+			getQueuedMessageEntries;
+		(ctx.ui as unknown as { showOverlay: unknown; setFocus: unknown }).showOverlay = vi.fn(() => ({
+			hide: vi.fn(),
+		}));
+		(ctx.ui as unknown as { setFocus: unknown }).setFocus = vi.fn();
+		stubQueueKeyFormatting(ctx);
+
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		const registered = (editor.setCustomKeyHandler as Mock<(key: string, handler: () => boolean) => void>).mock.calls
+			.filter(([key]) => key === "ctrl+alt+q")
+			.map(([, handler]) => handler);
+		expect(registered).toHaveLength(1);
+		expect(KEYBINDINGS["app.queue.togglePane"].defaultKeys).toEqual([]);
+		expect(registered[0]?.()).toBe(true);
+		expect(getQueuedMessageEntries).toHaveBeenCalled();
+	});
+
+	it("refuses a remapped chord for a gated id whose predicate is false", () => {
+		const { ctx, editor } = createContext();
+		(ctx.keybindings as unknown as { getKeys(action: string): string[] }).getKeys = action =>
+			action === "app.transcript.browse" ? ["ctrl+alt+t"] : [];
+		const showTranscriptViewer = vi.fn();
+		ctx.showTranscriptViewer = showTranscriptViewer;
+
+		const controller = new InputController(ctx);
+		controller.setupKeyHandlers();
+
+		const handler = (
+			editor.setCustomKeyHandler as Mock<(key: string, handler: () => boolean) => void>
+		).mock.calls.find(([key]) => key === "ctrl+alt+t")?.[1];
+		// messages: [] -> unavailable, so the chord falls through instead of firing.
+		expect(handler?.()).toBe(false);
+		expect(showTranscriptViewer).not.toHaveBeenCalled();
+	});
+
+	it("jumps transcript turns through the expected viewport anchor", () => {
+		const { ctx } = createContext();
+		(ctx.session as { messages: AgentMessage[] }).messages = [
+			anchoredUserMessage("anchor-1"),
+			anchoredUserMessage("anchor-2"),
+		];
+		const revealViewportAnchor = vi.fn(() => true);
+		(ctx.ui as unknown as { revealViewportAnchor: unknown }).revealViewportAnchor = revealViewportAnchor;
+
+		const actions = listPalette(ctx);
+		actions.find(action => action.id === "app.transcript.prevTurn")?.handler();
+
+		expect(revealViewportAnchor).toHaveBeenCalledWith("anchor-2", "top");
+	});
+
+	it("opens the queue overlay from the palette with a queued entry present", () => {
+		const { ctx } = createContext();
+		const overlay = { hide: vi.fn() };
+		const showOverlay = vi.fn(() => overlay);
+		const setFocus = vi.fn();
+		(ctx.session as unknown as { getQueuedMessageEntries: unknown }).getQueuedMessageEntries = vi.fn(() => [
+			{ id: "q1", text: "queued", mode: "steer", label: "Steering" },
+		]);
+		(ctx.ui as unknown as { showOverlay: unknown }).showOverlay = showOverlay;
+		(ctx.ui as unknown as { setFocus: unknown }).setFocus = setFocus;
+		stubQueueKeyFormatting(ctx);
+
+		const actions = listPalette(ctx);
+		actions.find(action => action.id === "app.queue.togglePane")?.handler();
+
+		expect(showOverlay).toHaveBeenCalledTimes(1);
+		expect(setFocus).toHaveBeenCalled();
+	});
+
+	it("does not open an overlay for the queue pane when nothing is queued", () => {
+		const { ctx, spies } = createContext();
+		const showOverlay = vi.fn();
+		(ctx.session as unknown as { getQueuedMessageEntries: unknown }).getQueuedMessageEntries = vi.fn(() => []);
+		(ctx.ui as unknown as { showOverlay: unknown }).showOverlay = showOverlay;
+		(ctx.ui as unknown as { setFocus: unknown }).setFocus = vi.fn();
+		stubQueueKeyFormatting(ctx);
+
+		const actions = listPalette(ctx);
+		actions.find(action => action.id === "app.queue.togglePane")?.handler();
+
+		expect(showOverlay).not.toHaveBeenCalled();
+		expect(spies.showStatus).toHaveBeenCalledWith("No queued messages");
+	});
+
+	describe("sendNow draft semantics", () => {
+		function streamingContextWithDraft() {
+			const created = createContext();
+			(created.ctx.session as { isStreaming: boolean }).isStreaming = true;
+			created.editor.setText("  the draft  ");
+			created.ctx.updatePendingMessagesDisplay = vi.fn();
+			return created;
+		}
+
+		it("passes the trimmed draft to cancelAndSubmit exactly once and clears on submitted", async () => {
+			const { ctx, editor, spies } = streamingContextWithDraft();
+			const cancelAndSubmit = vi.fn(async () => ({ kind: "submitted" }) as const);
+			(ctx.session as unknown as { cancelAndSubmit: unknown }).cancelAndSubmit = cancelAndSubmit;
+
+			const actions = listPalette(ctx);
+			await actions.find(action => action.id === "app.message.sendNow")?.handler();
+
+			expect(cancelAndSubmit).toHaveBeenCalledTimes(1);
+			expect(cancelAndSubmit).toHaveBeenCalledWith("the draft", { queuedEntryId: undefined });
+			expect(spies.clearEditor).toHaveBeenCalledTimes(1);
+			expect(editor.getText()).toBe("");
+		});
+
+		it("preserves the draft and warns when the send rolls back", async () => {
+			const { ctx, editor, spies } = streamingContextWithDraft();
+			const showWarning = vi.fn();
+			ctx.showWarning = showWarning;
+			(ctx.session as unknown as { cancelAndSubmit: unknown }).cancelAndSubmit = vi.fn(
+				async () => ({ kind: "rolled_back", outcome: { kind: "timeout" } }) as const,
+			);
+
+			const actions = listPalette(ctx);
+			await actions.find(action => action.id === "app.message.sendNow")?.handler();
+
+			expect(spies.clearEditor).not.toHaveBeenCalled();
+			expect(editor.getText()).toBe("  the draft  ");
+			expect(showWarning).toHaveBeenCalledWith(
+				"Send was cancelled after forced recovery; queued messages were restored",
+			);
+		});
+
+		it("preserves the draft and reports a busy send", async () => {
+			const { ctx, editor, spies } = streamingContextWithDraft();
+			(ctx.session as unknown as { cancelAndSubmit: unknown }).cancelAndSubmit = vi.fn(
+				async () => ({ kind: "rejected", reason: "in_progress" }) as const,
+			);
+
+			const actions = listPalette(ctx);
+			await actions.find(action => action.id === "app.message.sendNow")?.handler();
+
+			expect(spies.clearEditor).not.toHaveBeenCalled();
+			expect(editor.getText()).toBe("  the draft  ");
+			expect(spies.showStatus).toHaveBeenCalledWith("Send already in progress");
+		});
+
+		it("leaves the draft untouched when a navigation entry is selected", () => {
+			const { ctx, editor, spies } = streamingContextWithDraft();
+			ctx.showSessionsDashboard = vi.fn();
+
+			const actions = listPalette(ctx);
+			actions.find(action => action.id === "app.session.dashboard")?.handler();
+
+			expect(spies.clearEditor).not.toHaveBeenCalled();
+			expect(editor.getText()).toBe("  the draft  ");
+			expect(ctx.showSessionsDashboard).toHaveBeenCalledTimes(1);
+		});
 	});
 });
