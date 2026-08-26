@@ -18768,6 +18768,8 @@ export class AgentSession {
 						},
 					};
 				}
+				if (this.#abortAdmissionEpoch !== abortEpoch || cancellationSignal?.aborted)
+					return { type: "terminal", terminal: { stopReason: "cancelled" } };
 				this.#defaultFallbackExhaustedLastTurn = true;
 				return this.#managedFallbackExhaustionDecision(
 					outcome.message,
@@ -18955,13 +18957,18 @@ export class AgentSession {
 				controller.tried.at(-1)?.selector ?? controller.chain.entries[controller.activeIndex - 1] ?? selector;
 			const to = selector;
 			const previousEditMode = this.#resolveActiveEditMode();
+			const previousModel = this.model;
 			this.#escapedNonAsciiManagedRetries = 0;
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
 			this.setThinkingLevel(
 				this.#thinkingLevelForResolvedFallback(resolved.explicitThinkingLevel, resolved.thinkingLevel),
 			);
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
-			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) return false;
+			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) {
+				if (previousModel && this.model !== previousModel)
+					this.#setModelAuthoritatively(previousModel, "fallback-switch");
+				return false;
+			}
 			if (from !== to) {
 				this.#emit({
 					type: "model_fallback_switched",
