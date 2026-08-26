@@ -35,6 +35,7 @@ function createControllerContext(overrides: Partial<InteractiveModeContext> = {}
 		chatContainer: { children: [] },
 		goalModeController: { enabled: false, paused: false, handleCommand: () => {} },
 		planModeController: { enabled: true, paused: false, handleCommand: () => {} },
+		todoPhases: [],
 		showError: () => {},
 		showStatus: () => {},
 		historyStorage: { getRecent: () => [] },
@@ -140,7 +141,9 @@ describe("G003 WS2 red-team: command palette", () => {
 			editor: { getText: () => "draft", setText: () => {}, onSubmit: async () => {} } as never,
 			showStatus: status => statuses.push(status),
 		});
-		new InputController(nonempty).openCommandPalette();
+		const nonemptyController = new InputController(nonempty);
+		expect(nonemptyController.actionRegistry.isAvailable("app.commandPalette.open")).toBe(true);
+		nonemptyController.openCommandPalette();
 		expect(statuses).toEqual([]);
 
 		const order: string[] = [];
@@ -171,6 +174,82 @@ describe("G003 WS2 red-team: command palette", () => {
 		palette?.handleInput("\n");
 		await Promise.resolve();
 		expect(order).toEqual(["hide", "focus", "execute", "error"]);
+	});
+
+	it("does not expose idle queue submission through the draft palette", () => {
+		let idlePalette: CommandPalette | undefined;
+		const idle = new InputController(
+			createControllerContext({
+				editor: { getText: () => "draft", setText: () => {}, onSubmit: async () => {} } as never,
+				ui: {
+					showOverlay(component: CommandPalette) {
+						idlePalette = component;
+						return { hide: () => {} };
+					},
+					setFocus: () => {},
+					requestRender: () => {},
+				} as never,
+			}) as never,
+		);
+		expect(idle.actionRegistry.isAvailable("app.message.queue")).toBe(false);
+		idle.openCommandPalette();
+		expect(idlePalette?.getEntries().some(entry => entry.id === "action:app.message.queue")).toBe(false);
+
+		const busy = new InputController(
+			createControllerContext({
+				editor: { getText: () => "draft", setText: () => {}, onSubmit: async () => {} } as never,
+				session: { isStreaming: true } as never,
+			}) as never,
+		);
+		expect(busy.actionRegistry.isAvailable("app.message.queue")).toBe(true);
+	});
+
+	it("rechecks queue availability when streaming ends after palette open", async () => {
+		let text = "draft";
+		let submitted = 0;
+		let palette: CommandPalette | undefined;
+		const session = {
+			messages: [],
+			isStreaming: true,
+			getQueuedMessageEntries: () => [],
+			getRoleModelCycleCandidateCount: () => 0,
+			hasForegroundBashBackgroundRequestHandler: () => false,
+			prompt: async () => {
+				submitted += 1;
+			},
+		};
+		const controller = new InputController(
+			createControllerContext({
+				editor: {
+					getText: () => text,
+					setText: (value: string) => {
+						text = value;
+					},
+					addToHistory: () => {},
+					onSubmit: async () => {},
+				} as never,
+				session: session as never,
+				hasActiveBtw: () => false,
+				withLocalSubmission: async <T>(_value: string, action: () => Promise<T>) => action(),
+				updatePendingMessagesDisplay: () => {},
+				ui: {
+					showOverlay(component: CommandPalette) {
+						palette = component;
+						return { hide: () => {} };
+					},
+					setFocus: () => {},
+					requestRender: () => {},
+				} as never,
+			}) as never,
+		);
+		controller.openCommandPalette();
+		const queueEntry = palette?.getEntries().find(entry => entry.id === "action:app.message.queue");
+		expect(queueEntry?.handler).toBeDefined();
+		session.isStreaming = false;
+		await queueEntry?.handler?.();
+		await Promise.resolve();
+		expect(submitted).toBe(0);
+		expect(text).toBe("draft");
 	});
 
 	it("does not open a palette over an active transcript overlay", () => {

@@ -184,7 +184,7 @@ export class InputController {
 			case "app.thinking.toggle":
 				return Boolean(this.ctx.session.model?.reasoning);
 			case "app.commandPalette.open":
-				return this.ctx.editor.getText().trim().length === 0;
+				return true;
 			case "app.model.cycleForward":
 			case "app.model.cycleBackward":
 				return this.ctx.session.getRoleModelCycleCandidateCount() > 1;
@@ -254,7 +254,7 @@ export class InputController {
 	}
 
 	#executeAction(id: (typeof APP_ACTION_METADATA)[number]["id"]): void {
-		void this.actionRegistry.execute(id);
+		void this.actionRegistry.executeFresh(id);
 	}
 
 	#transcriptTurnAnchorIds: readonly string[] = [];
@@ -742,10 +742,10 @@ export class InputController {
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
 		this.ctx.editor.onDequeue = () => this.#executeAction("app.message.dequeue");
 		this.#registerCommandPaletteAction("app.message.dequeue", dequeue);
-		const queue = () => this.handleQueueSubmit();
+		const queue = () => this.#executeAction("app.message.queue");
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
 		this.ctx.editor.onQueue = () => this.#executeAction("app.message.queue");
-		this.#registerCommandPaletteAction("app.message.queue", queue);
+		this.#registerCommandPaletteAction("app.message.queue", queue, true);
 
 		this.ctx.editor.onViewportPageScroll = direction => this.ctx.ui.scrollViewportPages(direction);
 		this.ctx.editor.onViewportFollowLive = () => {
@@ -2189,7 +2189,7 @@ export class InputController {
 						keybinding: action.bindingId
 							? this.ctx.keybindings.getKeys(action.bindingId).join(", ") || undefined
 							: undefined,
-						handler: () => this.actionRegistry.execute(action.id),
+						handler: () => this.actionRegistry.executeFresh(action.id),
 					})),
 				...slashCommands.map(command => ({
 					id: `slash:/${command.name}`,

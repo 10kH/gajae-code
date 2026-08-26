@@ -54,6 +54,27 @@ describe("ActionRegistry", () => {
 		expect(await registry.execute("app.suspend")).toBe(false);
 		expect(errors).toEqual(["Action app.suspend execution failed: failure"]);
 	});
+	it("rechecks availability for explicit fresh execution", async () => {
+		let available = true;
+		let calls = 0;
+		const registry = new ActionRegistry({ context: undefined, showError: () => {} });
+		registry.register({
+			id: "app.clear",
+			title: "Clear",
+			category: "Test",
+			bindingId: "app.clear",
+			domains: ["global"],
+			availability: () => available,
+			execute: () => {
+				calls += 1;
+			},
+		});
+
+		expect(registry.isAvailable("app.clear")).toBe(true);
+		available = false;
+		expect(await registry.executeFresh("app.clear")).toBe(false);
+		expect(calls).toBe(0);
+	});
 	it("contains reporter failures when availability or execution fails", async () => {
 		const registry = new ActionRegistry({
 			context: undefined,
