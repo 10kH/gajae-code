@@ -15,37 +15,56 @@ const masterEnv = { GJC_MASTER_CAPABILITY: capability, GJC_SESSION_ID: "master-c
 const epoch = async () => "epoch-cli";
 
 describe("gjc sdk spawn CLI", () => {
-	it("selects the newest retained master epoch instead of the first row", () => {
-		const attestation = (attestationEpoch: string) => ({
-			version: 2 as const,
-			ownerSessionId: "master-cli-owner",
-			launchPid: 42,
-			launchProcessIncarnation: "process-42",
-			role: "master" as const,
-			attestationEpoch,
-		});
-		const row = (indexSeq: number, epoch: string, endpointGeneration: number, live = true): IndexedSession => ({
-			sessionId: "master-cli-owner",
-			locator: { cwd: "/repo", worktreeRoot: "/repo", stateRoot: "/state" },
-			endpointGeneration,
-			pid: 42,
-			processIncarnation: "process-42",
-			live,
-			indexSeq,
-			identityProvenance: "composite",
-			ambiguous: false,
-			terminal: false,
-			masterRole: attestation(epoch),
-		});
+	const attestation = (attestationEpoch: string, launchProcessIncarnation: string) => ({
+		version: 2 as const,
+		ownerSessionId: "master-cli-owner",
+		launchPid: 42,
+		launchProcessIncarnation,
+		role: "master" as const,
+		attestationEpoch,
+	});
+	const row = (
+		indexSeq: number,
+		epoch: string,
+		endpointGeneration: number,
+		live = true,
+		processIncarnation = "process-42",
+	): IndexedSession => ({
+		sessionId: "master-cli-owner",
+		locator: { cwd: "/repo", worktreeRoot: "/repo", stateRoot: "/state" },
+		endpointGeneration,
+		pid: 42,
+		processIncarnation,
+		live,
+		indexSeq,
+		identityProvenance: "composite",
+		ambiguous: false,
+		terminal: false,
+		masterRole: attestation(epoch, processIncarnation),
+	});
+
+	it("selects the older live epoch when a newer crashed master registration remains", () => {
 		const rows: IndexedSession[] = [
-			row(1, "old-epoch", 0),
-			row(20, "old-epoch", 1),
-			row(19, "new-epoch", 0),
-			row(21, "new-epoch", 1),
-			row(22, "stale-epoch", 1, false),
+			row(1, "older-live-epoch", 0),
+			row(20, "older-live-epoch", 1),
+			row(21, "crashed-newer-epoch", 0, false),
+			row(22, "crashed-newer-epoch", 1, false),
 		];
 
-		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("new-epoch");
+		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("older-live-epoch");
+	});
+
+	it("selects the live resumed master incarnation when a stale identity is returned first", () => {
+		const priorProcess = "process-prior";
+		const resumedProcess = "process-resumed";
+		const rows: IndexedSession[] = [
+			row(30, "prior-epoch", 1, false, priorProcess),
+			row(29, "prior-epoch", 0, false, priorProcess),
+			row(31, "resumed-epoch", 0, true, resumedProcess),
+			row(32, "resumed-epoch", 1, true, resumedProcess),
+		];
+
+		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("resumed-epoch");
 	});
 
 	it("requires --cwd and --prompt", async () => {
