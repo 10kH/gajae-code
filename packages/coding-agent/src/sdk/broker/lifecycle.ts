@@ -63,6 +63,7 @@ import {
 	sanitizeSdkStartupMessage,
 } from "../startup-capability";
 import type { Broker, BrokerCleanupEvidence, BrokerCleanupIdentity, BrokerResponse } from "./broker";
+import { readEndpointFile } from "./endpoint-authority";
 import { decodeLifecycleUtf8, parseLifecycleJson } from "./lifecycle-codec";
 import type {
 	LifecycleCleanupProof,
@@ -78,8 +79,12 @@ import {
 	processIncarnation,
 } from "./process-incarnation";
 import { resolveSdkInternalSpawnCommand, type SdkInternalSpawnCommand } from "./runtime";
-import type { SessionLocatorV2 } from "./session-index";
-import { type IndexedSession, isSessionAuthorityEligible } from "./session-index";
+import {
+	type IndexedSession,
+	isSessionAuthorityEligible,
+	resolveSessionLocator,
+	type SessionLocatorV2,
+} from "./session-index";
 import {
 	cancellableSleep,
 	DEFAULT_READINESS_TIMEOUT_MS,
@@ -898,10 +903,11 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 	// Locator cwd is canonical everywhere. Reconcile only a pre-existing host row
 	// whose canonical registration race observed a different path; it never retains
 	// a caller's lexical spelling for ACP or any other scope consumer.
+	const locator = await resolveSessionLocator(scope, record.locator.stateRoot);
 	await broker.index.append({
 		type: "record_reconciled",
 		sessionId: id,
-		locator: { ...record.locator, cwd },
+		locator,
 		endpointGeneration: record.endpointGeneration,
 		pid: record.pid,
 		// Reconciliation only re-scopes the locator, so every identity fact the host
@@ -911,6 +917,8 @@ async function reconcileReadyScope(broker: Broker, id: string, scope: string | u
 		...(record.hostIncarnation === undefined ? {} : { hostIncarnation: record.hostIncarnation }),
 		...(record.lifecycleRequestId === undefined ? {} : { lifecycleRequestId: record.lifecycleRequestId }),
 		endpointMtimeMs: record.endpointMtimeMs,
+		...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
+		...(record.masterRole === undefined ? {} : { masterRole: record.masterRole }),
 	});
 }
 
@@ -1011,6 +1019,7 @@ type ReadyAuthority = {
 	endpoint: Record<string, unknown>;
 	endpointSource: string;
 	endpointMtimeMs: number;
+	endpointFileId?: string;
 	endpointGeneration: number;
 };
 type ReadinessResult =
@@ -3705,7 +3714,10 @@ async function removeExactDeadSessionEndpoint(
 				: finalEndpointPath;
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(endpointSource, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW);
+		handle = await fs.open(
+			endpointSource,
+			fsSync.constants.O_RDONLY | (fsSync.constants.O_NOFOLLOW ?? 0) | (fsSync.constants.O_NONBLOCK ?? 0),
+		);
 		const metadata = await handle.stat({ bigint: true });
 		if (!metadata.isFile() || metadata.nlink !== 1n || metadata.size > 4096n) return false;
 		const bytes = Buffer.alloc(Number(metadata.size) + 1);
@@ -3885,10 +3897,9 @@ async function currentReadyAuthority(
 	if (!(await hasOwnedReadinessEvidence(broker, root, id, expected))) return undefined;
 	const endpointPath = path.join(root, "sdk", `${id}.json`);
 	try {
-		const [endpointSource, endpointMetadata] = await Promise.all([
-			fs.readFile(endpointPath, "utf8"),
-			fs.stat(endpointPath),
-		]);
+		const endpointFile = await readEndpointFile(endpointPath);
+		if (!endpointFile) return undefined;
+		const endpointSource = endpointFile.source;
 		const endpoint = JSON.parse(endpointSource) as {
 			sessionId?: unknown;
 			url?: unknown;
@@ -3908,7 +3919,9 @@ async function currentReadyAuthority(
 			record.terminalUncertain ||
 			record.pid !== expected.pid ||
 			resolveEquivalentPath(record.locator.stateRoot) !== resolveEquivalentPath(root) ||
-			record.endpointMtimeMs !== endpointMetadata.mtimeMs ||
+			(record.endpointFileId !== undefined && record.endpointFileId !== `${endpointFile.dev}:${endpointFile.ino}`) ||
+			(record.processIncarnation !== undefined && record.processIncarnation !== expected.incarnation) ||
+			record.endpointMtimeMs !== endpointFile.mtimeMs ||
 			endpoint.pid !== expected.pid ||
 			endpoint.sessionId !== id ||
 			typeof endpoint.url !== "string" ||
@@ -3923,7 +3936,8 @@ async function currentReadyAuthority(
 		return {
 			endpoint: endpoint as Record<string, unknown>,
 			endpointSource,
-			endpointMtimeMs: endpointMetadata.mtimeMs,
+			endpointMtimeMs: endpointFile.mtimeMs,
+			...(record.endpointFileId === undefined ? {} : { endpointFileId: record.endpointFileId }),
 			endpointGeneration: record.endpointGeneration,
 		};
 	} catch {
@@ -3935,6 +3949,7 @@ function sameReadyAuthority(left: ReadyAuthority, right: ReadyAuthority): boolea
 	return (
 		left.endpointSource === right.endpointSource &&
 		left.endpointMtimeMs === right.endpointMtimeMs &&
+		left.endpointFileId === right.endpointFileId &&
 		left.endpointGeneration === right.endpointGeneration
 	);
 }

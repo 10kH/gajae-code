@@ -20,7 +20,6 @@ const BROKER_OPERATIONS = new Set([
 	"broker.lookup_lifecycle",
 	"model.resolve",
 	"session.spawn",
-	"model.resolve",
 ]);
 type RequestInput = Record<string, unknown>;
 type BrokerRequest = {

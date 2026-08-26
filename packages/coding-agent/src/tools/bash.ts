@@ -887,7 +887,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			throw new ToolError("Background job manager unavailable for this session.");
 		}
 
-		const label = options.command.length > 120 ? `${options.command.slice(0, 117)}...` : options.command;
+		const label = options.directMasterSpawn
+			? "gjc sdk spawn"
+			: options.command.length > 120
+				? `${options.command.slice(0, 117)}...`
+				: options.command;
 		let latestText = "";
 		let backgrounded = options.startBackgrounded;
 		const runningDetails = (jobId: string): Record<string, unknown> | undefined =>

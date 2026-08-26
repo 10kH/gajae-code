@@ -938,19 +938,6 @@ export class SessionLifecycleService {
 			| SessionReconcileUncertainOutcome;
 	}
 
-	async execute(
-		request: SessionLifecycleMutationRequest,
-	): Promise<
-		| SessionCreateOutcome
-		| SessionForkOutcome
-		| SessionResumeOutcome
-		| SessionCloseOutcome
-		| SessionDeleteOutcome
-		| SessionReconcileUncertainOutcome
-	> {
-		return this.#execute(request);
-	}
-
 	async executeWithIdempotencyKey(
 		request: SessionLifecycleMutationRequest,
 		idempotencyKey: string,
@@ -962,7 +949,7 @@ export class SessionLifecycleService {
 		| SessionDeleteOutcome
 		| SessionReconcileUncertainOutcome
 	> {
-		return this.#execute(request, idempotencyKey);
+		return this.execute(request, idempotencyKey);
 	}
 
 	async create(request: Omit<SessionCreateRequest, "operation">): Promise<SessionCreateOutcome> {

@@ -1436,15 +1436,19 @@ describe("SDK session index", () => {
 		try {
 			await index.append({
 				type: "host_registered",
-				locator: { repo: dir, stateRoot: dir },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
 				...expected,
 			});
 			const closed = await index.append({
 				type: "session_closed",
-				locator: { repo: dir, stateRoot: dir },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
 				...expected,
 			});
-			await index.append({ type: "session_deleted", locator: { repo: dir, stateRoot: dir }, ...expected });
+			await index.append({
+				type: "session_deleted",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...expected,
+			});
 			const historical = index.findHistoricalSessionIdentity(expected);
 			if (!historical) throw new Error("Expected historical retirement identity");
 			expect(index.findSessionClosedEvidence(historical)).toBe(closed.indexSeq);
@@ -1452,11 +1456,19 @@ describe("SDK session index", () => {
 			const delayedExpected = { ...expected, sessionId: "retirement-delayed" };
 			await index.append({
 				type: "host_registered",
-				locator: { repo: dir, stateRoot: dir },
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
 				...delayedExpected,
 			});
-			await index.append({ type: "session_deleted", locator: { repo: dir, stateRoot: dir }, ...delayedExpected });
-			await index.append({ type: "session_closed", locator: { repo: dir, stateRoot: dir }, ...delayedExpected });
+			await index.append({
+				type: "session_deleted",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...delayedExpected,
+			});
+			await index.append({
+				type: "session_closed",
+				locator: { cwd: dir, worktreeRoot: null, stateRoot: dir },
+				...delayedExpected,
+			});
 			const delayedHistorical = index.findHistoricalSessionIdentity(delayedExpected);
 			if (!delayedHistorical) throw new Error("Expected delayed historical identity");
 			expect(index.findSessionClosedEvidence(delayedHistorical)).toBeUndefined();

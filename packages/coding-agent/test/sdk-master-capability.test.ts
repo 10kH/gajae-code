@@ -1,12 +1,12 @@
-import { describe, expect, it, spyOn } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Broker } from "../src/sdk/broker/broker";
-import { readEndpoint } from "../src/sdk/broker/master-capability";
+import { readEndpointFile } from "../src/sdk/broker/endpoint-authority";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
-import { SessionIndex, type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
+import { type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import { SESSION_INDEX_EVENT_VERSION } from "../src/sdk/broker/state-version";
 import { verifyMasterCapabilityFrame } from "../src/sdk/host/session-runtime";
 
@@ -214,41 +214,39 @@ describe("master capability effective-host verification", () => {
 				2,
 			);
 			await writeIndex(agentDir, [direct, effective]);
-			const indexedEffective = (await new SessionIndex(agentDir).open())
-				.listSessionIdentities()
-				.find(row => row.sessionId === sessionId && row.endpointGeneration === 1);
-			if (!indexedEffective) throw new Error("Expected indexed effective master attachment");
 			const displacedEndpoint = `${host.endpointPath}.displaced-during-read`;
 			let swappedAfterOpen = false;
-			const realOpen = fs.open.bind(fs);
-			const openSpy = spyOn(fs, "open").mockImplementation(async (target, flags, mode) => {
-				const handle = await realOpen(target, flags, mode);
-				if (
-					!swappedAfterOpen &&
-					path.resolve(String(target)) === path.resolve(host!.endpointPath) &&
-					flags === "r"
-				) {
-					swappedAfterOpen = true;
-					await fs.rename(host!.endpointPath, displacedEndpoint);
-					await fs.writeFile(
-						host!.endpointPath,
-						JSON.stringify({
-							version: 1,
-							sessionId,
-							pid: process.pid,
-							url: "ws://127.0.0.1:1",
-							token: "substituted-endpoint-token",
-						}),
-						{ encoding: "utf8", mode: 0o600 },
-					);
-				}
-				return handle;
-			});
 			try {
-				expect(await readEndpoint(indexedEffective)).toEqual({ url: host.url, token: host.token });
+				const endpointFile = await readEndpointFile(host.endpointPath, {
+					open: async (target, flags) => {
+						const handle = await fs.open(target, flags);
+						if (!swappedAfterOpen && path.resolve(String(target)) === path.resolve(host!.endpointPath)) {
+							swappedAfterOpen = true;
+							await fs.rename(host!.endpointPath, displacedEndpoint);
+							await fs.writeFile(
+								host!.endpointPath,
+								JSON.stringify({
+									version: 1,
+									sessionId,
+									pid: process.pid,
+									url: "ws://127.0.0.1:1",
+									token: "substituted-endpoint-token",
+								}),
+								{ encoding: "utf8", mode: 0o600 },
+							);
+						}
+						return handle;
+					},
+				});
+				const endpointSource = endpointFile?.source;
+				expect(endpointFile).toMatchObject({
+					dev: expect.any(BigInt),
+					ino: expect.any(BigInt),
+					source: expect.stringContaining(host.url),
+				});
+				expect(JSON.parse(endpointSource ?? "{}")).toMatchObject({ url: host.url, token: host.token });
 				expect(swappedAfterOpen).toBe(true);
 			} finally {
-				openSpy.mockRestore();
 				await fs.rm(host.endpointPath, { force: true });
 				await fs.rename(displacedEndpoint, host.endpointPath);
 			}

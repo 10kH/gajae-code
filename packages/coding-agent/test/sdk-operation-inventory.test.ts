@@ -41,7 +41,7 @@ afterEach(async () => {
 describe("SDK operation inventory", () => {
 	it("has complete typed operation and adapter coverage", () => {
 		expect(OPERATIONS.filter(operation => operation.kind === "control")).toHaveLength(53);
-		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(8);
+		expect(OPERATIONS.filter(operation => operation.kind === "global")).toHaveLength(9);
 		expect(OPERATIONS.filter(operation => operation.kind === "query")).toHaveLength(30);
 		expect(OPERATIONS.filter(operation => operation.kind === "reverse")).toHaveLength(6);
 		for (const operation of OPERATIONS) {
@@ -59,7 +59,7 @@ describe("SDK operation inventory", () => {
 		expect(
 			OPERATIONS.find(operation => operation.kind === "global" && operation.sdkId === "session.spawn"),
 		).toMatchObject({
-			id: "G08",
+			id: "G09",
 			description: "Spawn a task-seeded background child session (local interactive master only).",
 			adapterDispositions: {
 				telegram: "prohibited",
@@ -70,7 +70,7 @@ describe("SDK operation inventory", () => {
 				daemonCli: "prohibited",
 			},
 		});
-		expect(findOperation("global", "session.spawn")).toMatchObject({ id: "G08", sdkId: "session.spawn" });
+		expect(findOperation("global", "session.spawn")).toMatchObject({ id: "G09", sdkId: "session.spawn" });
 		for (const id of ["C39", "C40"])
 			expect(OPERATIONS.find(operation => operation.id === id)?.adapterDispositions).toEqual({
 				telegram: "prohibited",

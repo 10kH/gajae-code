@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { readEndpointFile } from "./endpoint-authority";
 import {
 	type IndexedSession,
 	isSessionAuthorityEligible,
@@ -93,21 +93,11 @@ function adoptedDirectAttestation(
 /** Reads and validates a registered host's authenticated endpoint record. */
 export async function readEndpoint(record: IndexedSession): Promise<SessionEndpoint | undefined> {
 	if (record.endpointMtimeMs === undefined || record.endpointFileId === undefined) return undefined;
-	let endpointHandle: fs.FileHandle | undefined;
 	try {
 		const endpointPath = path.join(record.locator.stateRoot, "sdk", `${record.sessionId}.json`);
-		endpointHandle = await fs.open(endpointPath, "r");
-		const before = await endpointHandle.stat({ bigint: true });
-		const source = await endpointHandle.readFile("utf8");
-		const after = await endpointHandle.stat({ bigint: true });
-		if (
-			before.dev !== after.dev ||
-			before.ino !== after.ino ||
-			before.size !== after.size ||
-			before.mtimeNs !== after.mtimeNs
-		)
-			return undefined;
-		const endpoint = JSON.parse(source) as Record<string, unknown>;
+		const file = await readEndpointFile(endpointPath);
+		if (!file) return undefined;
+		const endpoint = JSON.parse(file.source) as Record<string, unknown>;
 		if (
 			endpoint.sessionId !== record.sessionId ||
 			endpoint.pid !== record.pid ||
@@ -115,8 +105,8 @@ export async function readEndpoint(record: IndexedSession): Promise<SessionEndpo
 			typeof endpoint.token !== "string" ||
 			endpoint.url.length === 0 ||
 			endpoint.token.length === 0 ||
-			endpointFileId(before) !== record.endpointFileId ||
-			Math.abs(Number(before.mtimeNs) / 1_000_000 - record.endpointMtimeMs) > 0.001
+			endpointFileId(file) !== record.endpointFileId ||
+			Math.abs(file.mtimeMs - record.endpointMtimeMs) > 0.001
 		)
 			return undefined;
 		const url = new URL(endpoint.url);
@@ -124,8 +114,6 @@ export async function readEndpoint(record: IndexedSession): Promise<SessionEndpo
 		return { url: endpoint.url, token: endpoint.token };
 	} catch {
 		return undefined;
-	} finally {
-		await endpointHandle?.close().catch(() => undefined);
 	}
 }
 

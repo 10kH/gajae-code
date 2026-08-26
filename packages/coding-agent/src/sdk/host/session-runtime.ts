@@ -23,6 +23,7 @@ import {
 	settleOwnedWork,
 } from "../../session/terminal-abort";
 import { parseThinkingLevel } from "../../thinking";
+import { readEndpointFile } from "../broker/endpoint-authority";
 import { ensureBroker } from "../broker/ensure";
 import { processIncarnation } from "../broker/process-incarnation";
 import {
@@ -4210,33 +4211,18 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						if (publishedEndpointUrl === undefined)
 							throw new Error("SDK transport endpoint was not published before broker registration.");
 						const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
-						const endpointHandle = await fs.open(endpointPath, "r");
-						let endpointMtimeMs: number;
-						let endpointFileId: string;
-						try {
-							const before = await endpointHandle.stat({ bigint: true });
-							const source = await endpointHandle.readFile("utf8");
-							const after = await endpointHandle.stat({ bigint: true });
-							if (
-								before.dev !== after.dev ||
-								before.ino !== after.ino ||
-								before.size !== after.size ||
-								before.mtimeNs !== after.mtimeNs
-							)
-								throw new Error("SDK endpoint changed while broker registration was reading it.");
-							const endpoint = JSON.parse(source) as Record<string, unknown>;
-							if (
-								endpoint.sessionId !== input.sessionId ||
-								endpoint.pid !== process.pid ||
-								endpoint.url !== publishedEndpointUrl ||
-								endpoint.token !== transport.token
-							)
-								throw new Error("SDK endpoint did not match the published transport authority.");
-							endpointMtimeMs = Number(before.mtimeNs) / 1_000_000;
-							endpointFileId = `${before.dev}:${before.ino}`;
-						} finally {
-							await endpointHandle.close();
-						}
+						const file = await readEndpointFile(endpointPath);
+						if (!file) throw new Error("SDK endpoint could not be read as a stable regular file.");
+						const endpoint = JSON.parse(file.source) as Record<string, unknown>;
+						if (
+							endpoint.sessionId !== input.sessionId ||
+							endpoint.pid !== process.pid ||
+							endpoint.url !== publishedEndpointUrl ||
+							endpoint.token !== transport.token
+						)
+							throw new Error("SDK endpoint did not match the published transport authority.");
+						const endpointMtimeMs = file.mtimeMs;
+						const endpointFileId = `${file.dev}:${file.ino}`;
 						const masterRole = masterAttestationForEffectiveHost({
 							masterCapability: options.masterCapability,
 							attestationEpoch: options.masterAttestationEpoch,

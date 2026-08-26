@@ -351,17 +351,17 @@ export const OPERATIONS: readonly Operation[] = [
 							acp: "machine_only",
 							daemonCli: "machine_only",
 						})
-					: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
-						? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
-						: id === "G08"
-							? dispositions({
-									telegram: "prohibited",
-									discord: "prohibited",
-									slack: "prohibited",
-									mcp: "prohibited",
-									acp: "prohibited",
-									daemonCli: "prohibited",
-								})
+					: id === "G09"
+						? dispositions({
+								telegram: "prohibited",
+								discord: "prohibited",
+								slack: "prohibited",
+								mcp: "prohibited",
+								acp: "prohibited",
+								daemonCli: "prohibited",
+							})
+						: ["G03", "G04", "G05", "G06", "G07", "G08"].includes(id)
+							? dispositions({ telegram: "prohibited", discord: "prohibited", slack: "prohibited" })
 							: dispositions(),
 			testIds: ["packages/coding-agent/test/sdk-operation-inventory.test.ts"],
 		};

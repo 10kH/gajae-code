@@ -20,8 +20,8 @@ import type {
 	SessionLifecycleOperation,
 	SessionLifecycleSavedSession,
 	SessionLifecycleSavedSessionIdentity,
-	SessionReconcileUncertainTarget,
 	SessionLifecycleService,
+	SessionReconcileUncertainTarget,
 } from "../lifecycle/service";
 import { PROMPT_CLIENT_REF_MAX_LENGTH } from "../prompt-status";
 import { validateAdapterControl, validateAdapterSecretFields } from "../protocol/adapter-validation";

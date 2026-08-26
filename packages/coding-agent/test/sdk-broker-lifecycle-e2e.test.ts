@@ -3883,7 +3883,7 @@ test("reconcile_uncertain retires one dead create identity and refuses live host
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: 4,
 			pid: child.pid!,
 			endpointMtimeMs: 1,
@@ -4041,7 +4041,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: input.endpointGeneration,
 			pid: process.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
@@ -4052,7 +4052,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 		await broker.index.append({
 			type: "host_registered",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
@@ -4063,7 +4063,7 @@ test("reconcile_uncertain replays a ledger-stage receipt after deletion and same
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,
@@ -4203,7 +4203,7 @@ test("reconcile_uncertain fails closed when deletion wins the closure append rac
 		await broker.index.append({
 			type: "lifecycle_terminal",
 			sessionId,
-			locator: { repo: agentDir, stateRoot },
+			locator: { cwd: agentDir, worktreeRoot: null, stateRoot },
 			endpointGeneration: input.endpointGeneration,
 			pid: child.pid,
 			endpointMtimeMs: input.endpointMtimeMs,

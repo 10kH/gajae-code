@@ -28,6 +28,7 @@ import {
 	readBrokerDiscovery,
 	redactBrokerDiscovery,
 } from "./discovery";
+import { readEndpointFile } from "./endpoint-authority";
 import { deriveIdempotencyIdentity, getBrokerIdentityKey } from "./identity";
 import {
 	canonicalDeleteLocatorPath,
@@ -754,6 +755,9 @@ function sameEndpointRecord(expected: IndexedSession, current: IndexedSession): 
 		current.endpointGeneration === expected.endpointGeneration &&
 		current.pid === expected.pid &&
 		current.endpointMtimeMs === expected.endpointMtimeMs &&
+		(expected.endpointFileId === undefined || current.endpointFileId === expected.endpointFileId) &&
+		(expected.processIncarnation === undefined || current.processIncarnation === expected.processIncarnation) &&
+		(expected.hostIncarnation === undefined || current.hostIncarnation === expected.hostIncarnation) &&
 		path.resolve(current.locator.cwd) === path.resolve(expected.locator.cwd) &&
 		path.resolve(current.locator.stateRoot) === path.resolve(expected.locator.stateRoot)
 	);
@@ -2739,14 +2743,24 @@ export class Broker {
 
 		try {
 			const endpointPath = path.join(record.locator.stateRoot, "sdk", `${record.sessionId}.json`);
-			const [source, metadata] = await Promise.all([fs.readFile(endpointPath, "utf8"), fs.stat(endpointPath)]);
-			const endpoint = JSON.parse(source) as Record<string, unknown>;
+			const file = await readEndpointFile(endpointPath);
+			if (!file) {
+				try {
+					await fs.lstat(endpointPath);
+				} catch (statError) {
+					if ((statError as NodeJS.ErrnoException).code === "ENOENT")
+						return error("resource_gone", "session endpoint record is gone");
+				}
+				return error("endpoint_stale", "session endpoint is stale");
+			}
+			const endpoint = JSON.parse(file.source) as Record<string, unknown>;
 			if (
 				endpoint.sessionId !== record.sessionId ||
 				endpoint.pid !== record.pid ||
 				endpoint.stale === true ||
 				record.endpointMtimeMs === undefined ||
-				Math.abs(metadata.mtimeMs - record.endpointMtimeMs) > 0.001
+				Math.abs(file.mtimeMs - record.endpointMtimeMs) > 0.001 ||
+				(record.endpointFileId !== undefined && `${file.dev}:${file.ino}` !== record.endpointFileId)
 			)
 				return error("endpoint_stale", "session endpoint is stale");
 			await this.index.refresh();
