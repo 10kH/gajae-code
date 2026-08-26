@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@gajae-code/agent-core";
 import type { Component } from "@gajae-code/tui";
 import { getKeybindings, ImageProtocol, TERMINAL, Text, visibleWidth } from "@gajae-code/tui";
-import { getProjectDir, isCompiledBinary, isEnoent, logger, prompt } from "@gajae-code/utils";
+import { getProjectDir, isEnoent, logger, prompt } from "@gajae-code/utils";
 import * as z from "zod/v4";
 import { AsyncJobManager } from "../async";
 import { type BashArtifactSaveResult, type BashResult, executeBash } from "../exec/bash-executor";
@@ -18,6 +18,7 @@ import { InternalUrlRouter } from "../internal-urls";
 import { truncateToVisualLines } from "../modes/components/visual-truncate";
 import { highlightCode, type Theme } from "../modes/theme/theme";
 import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
+import { renderSpawnTable, runSdkSpawn, type SdkSpawnArgs } from "../sdk/cli/master-cli";
 import type { ArtifactManager } from "../session/artifacts";
 import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
 import {
@@ -559,20 +560,40 @@ export function isStrictDirectSdkSpawnCommand(command: string): boolean {
 	return strictDirectSdkSpawnTokens(command) !== undefined;
 }
 
-function shellQuote(value: string): string {
-	return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-function trustedDirectSdkSpawnCommand(command: string): string | undefined {
+function parseDirectSdkSpawnArgs(command: string): SdkSpawnArgs {
 	const tokens = strictDirectSdkSpawnTokens(command);
-	if (tokens === undefined) return undefined;
-	const executable = isCompiledBinary()
-		? [process.execPath]
-		: process.argv[1] === undefined
-			? undefined
-			: [process.execPath, path.resolve(process.argv[1])];
-	if (executable === undefined) return undefined;
-	return [...executable, ...tokens.slice(1)].map(shellQuote).join(" ");
+	if (tokens === undefined) throw new ToolError("Master spawn command is not a direct shell-safe invocation.");
+	const args: SdkSpawnArgs = {};
+	for (let index = 3; index < tokens.length; index++) {
+		const token = tokens[index]!;
+		if (token === "--json") {
+			args.json = true;
+			continue;
+		}
+		const equals = token.indexOf("=");
+		const name = equals < 0 ? token : token.slice(0, equals);
+		const value = equals < 0 ? tokens[++index] : token.slice(equals + 1);
+		if (value === undefined || value.length === 0) throw new ToolError(`Master spawn flag ${name} requires a value.`);
+		switch (name) {
+			case "--cwd":
+				args.cwd = value;
+				break;
+			case "--prompt":
+				args.prompt = value;
+				break;
+			case "--model":
+				args.model = value;
+				break;
+			case "--profile":
+				args.profile = value;
+				break;
+			case "--agent-dir":
+				throw new ToolError("Master spawn cannot override the session agent directory.");
+			default:
+				throw new ToolError(`Unsupported master spawn flag: ${name}`);
+		}
+	}
+	return args;
 }
 
 export function masterCommandEnvOverrides(
@@ -1172,11 +1193,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// Check both spellings so cwd normalization or URL expansion cannot turn a
 		// command that contained shell syntax into a privileged one.
 		const directMasterSpawn = isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
-		if (directMasterSpawn) {
-			const trustedCommand = trustedDirectSdkSpawnCommand(command);
-			if (trustedCommand === undefined) throw new ToolError("Trusted gjc sdk spawn entrypoint is unavailable.");
-			command = trustedCommand;
-		}
 		const masterCapability = directMasterSpawn ? this.session.getMasterBashCapability?.() : undefined;
 		const commandEnvOverrides = masterCommandEnvOverrides(expandedEnv, directMasterSpawn);
 		const resolvedEnv = {
@@ -1231,6 +1247,48 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			timeoutMs,
 			notices,
 		};
+	}
+
+	async #executeDirectMasterSpawn(
+		command: string,
+		commandCwd: string,
+		timeoutSec: number,
+		requestedTimeoutSec: number,
+		notices: readonly string[],
+		masterCapability: string,
+		sessionAgentDir: string,
+	): Promise<AgentToolResult<BashToolDetails>> {
+		const args = parseDirectSdkSpawnArgs(command);
+		args.agentDir = sessionAgentDir;
+		if (args.cwd !== undefined && !path.isAbsolute(args.cwd)) args.cwd = path.resolve(commandCwd, args.cwd);
+		const result = await runSdkSpawn(args, {
+			env: {
+				...process.env,
+				GJC_MASTER_CAPABILITY: masterCapability,
+				GJC_SESSION_ID: this.session.getSessionId?.() ?? undefined,
+				GJC_CODING_AGENT_DIR: sessionAgentDir,
+			},
+		});
+		const output = args.json ? JSON.stringify(result.rendered) : renderSpawnTable(result.rendered);
+		const outputBytes = Buffer.byteLength(output, "utf8");
+		const outputLines = output.split("\n").length;
+		return this.#buildCompletedResult(
+			{
+				output,
+				exitCode: result.exitCode,
+				cancelled: false,
+				truncated: false,
+				totalLines: outputLines,
+				totalBytes: outputBytes,
+				outputLines,
+				outputBytes,
+			},
+			timeoutSec,
+			{
+				requestedTimeoutSec,
+				notices,
+			},
+		);
 	}
 
 	/**
@@ -1398,6 +1456,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			timeoutMs,
 			notices: pendingNotices,
 		} = prepared;
+		const masterCapability = directMasterSpawn ? resolvedEnv[MASTER_CAPABILITY_ENV] : undefined;
+		if (directMasterSpawn && masterCapability !== undefined) {
+			const sessionAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
+			if (sessionAgentDir === undefined) throw new ToolError("Master session agent directory is unavailable.");
+			return await this.#executeDirectMasterSpawn(
+				command,
+				commandCwd,
+				timeoutSec,
+				requestedTimeoutSec,
+				pendingNotices,
+				masterCapability,
+				sessionAgentDir,
+			);
+		}
 
 		if (asyncRequested) {
 			// Availability is endpoint-first: a concurrent top-level session
