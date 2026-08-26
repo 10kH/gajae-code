@@ -104,6 +104,7 @@ export class DapClient {
 	#isReading = false;
 	#disposed = false;
 	#lastActivity = Date.now();
+	#writeQueue = Promise.resolve();
 	#capabilities?: DapCapabilities;
 	#eventHandlers = new Map<string, Set<DapEventHandler>>();
 	#anyEventHandlers = new Set<DapEventHandler>();
@@ -417,7 +418,7 @@ export class DapClient {
 		});
 		this.#lastActivity = Date.now();
 		try {
-			await writeMessage(this.#writeSink, request);
+			await this.#queueWrite(request);
 		} catch (error) {
 			this.#pendingRequests.delete(requestSeq);
 			cleanup();
@@ -436,7 +437,13 @@ export class DapClient {
 			...(message ? { message } : {}),
 			...(body !== undefined ? { body } : {}),
 		};
-		await writeMessage(this.#writeSink, response);
+		await this.#queueWrite(response);
+	}
+
+	#queueWrite(message: DapRequestMessage | DapResponseMessage): Promise<void> {
+		const write = this.#writeQueue.catch(() => {}).then(() => writeMessage(this.#writeSink, message));
+		this.#writeQueue = write.catch(() => {});
+		return write;
 	}
 
 	async dispose(): Promise<void> {

@@ -5,6 +5,7 @@ import { logger } from "@gajae-code/utils";
 import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 import { HttpTransport } from "../../src/runtime-mcp/transports/http";
 import { StdioTransport } from "../../src/runtime-mcp/transports/stdio";
+import { MCPExpectedFailure } from "../../src/runtime-mcp/types";
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs = 10_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
@@ -111,6 +112,27 @@ afterEach(async () => {
 });
 
 describe("MCP stdio transport lifecycle", () => {
+	test("propagates backpressured write failures without unhandled rejection", async () => {
+		const transport = new StdioTransport({
+			command: process.execPath,
+			args: ["-e", "setTimeout(() => process.exit(1), 100)"],
+			timeout: 1_000,
+		});
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			await transport.connect();
+			await expect(
+				transport.notify("notifications/large", { text: "x".repeat(64 * 1024 * 1024) }),
+			).rejects.toBeInstanceOf(MCPExpectedFailure);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			await transport.close().catch(() => {});
+		}
+	}, 10_000);
+
 	test("close and reconnect dispose the old owned child tree", async () => {
 		vi.restoreAllMocks();
 		if (process.env[STDIO_LIFECYCLE_ISOLATION] !== "1") {
