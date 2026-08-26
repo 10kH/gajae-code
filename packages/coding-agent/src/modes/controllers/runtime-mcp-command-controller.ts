@@ -572,6 +572,7 @@ export class MCPCommandController {
 			},
 			keyData => this.#openWizardOAuthCommandPalette(wizard, keyData),
 			parsed.initialName,
+			credentialId => this.#removeManagedOAuthCredential(credentialId),
 		);
 
 		// Replace editor with wizard

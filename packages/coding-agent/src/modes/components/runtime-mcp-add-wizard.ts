@@ -135,7 +135,10 @@ export class MCPAddWizard extends Container {
 	#onTestConnectionCallback: ((config: MCPServerConfig) => Promise<void>) | null = null;
 	#onRenderCallback: (() => void) | null = null;
 	#onCommandPaletteCallback: ((keyData: string) => boolean) | null = null;
+	#onOAuthCredentialCleanupCallback: ((credentialId: string) => Promise<void> | void) | null = null;
 	#oauthAbortController: AbortController | undefined;
+	#oauthCredentialCleanupStarted = false;
+	#completed = false;
 	#disposed = false;
 	#transitionTimers = new Set<NodeJS.Timeout>();
 	#healthCheckSpinner?: NodeJS.Timeout;
@@ -158,6 +161,7 @@ export class MCPAddWizard extends Container {
 		onRender?: () => void,
 		onCommandPalette?: (keyData: string) => boolean,
 		initialName?: string,
+		onOAuthCredentialCleanup?: (credentialId: string) => Promise<void> | void,
 	) {
 		super();
 		this.#onCompleteCallback = onComplete;
@@ -166,6 +170,7 @@ export class MCPAddWizard extends Container {
 		this.#onTestConnectionCallback = onTestConnection ?? null;
 		this.#onRenderCallback = onRender ?? null;
 		this.#onCommandPaletteCallback = onCommandPalette ?? null;
+		this.#onOAuthCredentialCleanupCallback = onOAuthCredentialCleanup ?? null;
 		if (initialName && initialName.trim().length > 0) {
 			this.#state.name = initialName.trim();
 			this.#currentStep = "transport";
@@ -198,6 +203,10 @@ export class MCPAddWizard extends Container {
 		this.#asyncGeneration += 1;
 		this.#oauthAbortController?.abort(new Error("OAuth flow cancelled"));
 		this.#oauthAbortController = undefined;
+		if (!this.#completed && !this.#oauthCredentialCleanupStarted && this.#state.oauthCredentialId) {
+			this.#oauthCredentialCleanupStarted = true;
+			void this.#onOAuthCredentialCleanupCallback?.(this.#state.oauthCredentialId);
+		}
 		for (const timer of this.#transitionTimers) {
 			clearTimeout(timer);
 		}
@@ -1337,6 +1346,7 @@ export class MCPAddWizard extends Container {
 
 	#complete(): void {
 		if (!this.#state.scope) return;
+		this.#completed = true;
 
 		// Build the config
 		const config: MCPServerConfig = this.#buildConfig();
