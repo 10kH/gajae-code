@@ -204,7 +204,7 @@ describe("CommandPalette", () => {
 			handlePlanModeCommand: () => {},
 			showError: () => {},
 			showStatus: () => {},
-			setOAuthUrlForCopy: () => {},
+			beginOAuthUrlForCopy: () => () => {},
 			hasOAuthUrlForCopy: () => true,
 			copyOAuthUrl: async () => {},
 			historyStorage: { getRecent: () => [] },

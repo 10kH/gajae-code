@@ -2215,7 +2215,16 @@ export class InputController {
 
 		const actions = [...this.#commandPaletteActions.entries()]
 			.filter(([id]) => !this.#availabilityGatedPaletteActions.has(id) || this.actionRegistry.isAvailable(id))
-			.map(([, action]) => action);
+			.map(([id, action]) =>
+				this.#availabilityGatedPaletteActions.has(id)
+					? {
+							...action,
+							handler: async () => {
+								await this.actionRegistry.executeFresh(id);
+							},
+						}
+					: action,
+			);
 		const slashCommands = [...(this.ctx.getSlashCommands?.() ?? this.#slashCommands)];
 		if (!this.ctx.showCommandPalette) {
 			let overlayHandle: ReturnType<typeof this.ctx.ui.showOverlay> | undefined;

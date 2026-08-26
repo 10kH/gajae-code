@@ -118,8 +118,9 @@ async function renderLoginRows(
 		editor: {},
 		showStatus: () => {},
 		showError: () => {},
-		setOAuthUrlForCopy: (next: string | undefined) => {
+		beginOAuthUrlForCopy: (next: string) => {
 			pendingUrls.push(next);
+			return () => pendingUrls.push(undefined);
 		},
 		hasOAuthUrlForCopy: () => false,
 		copyOAuthUrl: async () => {},

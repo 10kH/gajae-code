@@ -3489,6 +3489,7 @@ export class SelectorController {
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const manualInput = this.ctx.oauthManualInput;
 		const useManualInput = CALLBACK_SERVER_PROVIDERS.has(providerId as OAuthProvider);
+		let releaseOAuthUrlForCopy: (() => void) | undefined;
 		if (providerId === "opencodex") {
 			this.ctx.showStatus("Checking the local OpenCodex proxy…");
 		}
@@ -3497,7 +3498,8 @@ export class SelectorController {
 				providerId as OAuthProvider,
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
-						this.ctx.setOAuthUrlForCopy(info.url);
+						releaseOAuthUrlForCopy?.();
+						releaseOAuthUrlForCopy = this.ctx.beginOAuthUrlForCopy(info.url);
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", buildOAuthLoginAnchor(info.url)), 1, 0));
 						const hyperlink = buildOAuthLoginAnchor(info.url, "Click here to login");
@@ -3569,7 +3571,7 @@ export class SelectorController {
 		} catch (error: unknown) {
 			this.ctx.showError(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
 		} finally {
-			this.ctx.setOAuthUrlForCopy(undefined);
+			releaseOAuthUrlForCopy?.();
 			if (useManualInput) {
 				manualInput.clear(`Manual OAuth input cleared for ${providerId}`);
 			}

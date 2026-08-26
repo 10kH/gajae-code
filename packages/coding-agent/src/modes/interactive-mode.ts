@@ -431,7 +431,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	hookEditor: HookEditorComponent | undefined = undefined;
 	lastStatusSpacer: Spacer | undefined = undefined;
 	lastStatusText: Text | undefined = undefined;
-	#oauthUrlForCopy: string | undefined;
+	#oauthUrlForCopy?: { token: symbol; url: string };
 	fileSlashCommands: Set<string> = new Set();
 	skillCommands: Map<string, Skill> = new Map();
 	oauthManualInput: OAuthManualInputManager = new OAuthManualInputManager();
@@ -1839,8 +1839,12 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#uiHelpers.showWarning(message);
 	}
 
-	setOAuthUrlForCopy(url: string | undefined): void {
-		this.#oauthUrlForCopy = url;
+	beginOAuthUrlForCopy(url: string): () => void {
+		const token = Symbol("oauth-url-copy");
+		this.#oauthUrlForCopy = { token, url };
+		return () => {
+			if (this.#oauthUrlForCopy?.token === token) this.#oauthUrlForCopy = undefined;
+		};
 	}
 
 	hasOAuthUrlForCopy(): boolean {
@@ -1848,13 +1852,13 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	async copyOAuthUrl(): Promise<void> {
-		const url = this.#oauthUrlForCopy;
-		if (url === undefined) {
+		const pending = this.#oauthUrlForCopy;
+		if (pending === undefined) {
 			this.showStatus("No OAuth URL is available to copy.");
 			return;
 		}
 		try {
-			await copyToClipboard(url);
+			await copyToClipboard(pending.url);
 			this.showStatus("OAuth URL copied to clipboard.");
 		} catch {
 			this.showWarning("Failed to copy OAuth URL to clipboard.");

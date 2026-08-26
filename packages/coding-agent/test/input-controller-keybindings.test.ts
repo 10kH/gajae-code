@@ -327,7 +327,7 @@ async function createContext(options?: {
 		showWarning: vi.fn(),
 		showStatus,
 		showError: vi.fn(),
-		setOAuthUrlForCopy: vi.fn(),
+		beginOAuthUrlForCopy: vi.fn(() => vi.fn()),
 		hasOAuthUrlForCopy,
 		copyOAuthUrl,
 		showHookSelector,

@@ -546,6 +546,7 @@ export class MCPCommandController {
 
 		const resolvedClientId = clientId.trim() || parsedAuthUrl.searchParams.get("client_id") || undefined;
 		const resolvedClientSecret = clientSecret.trim() || undefined;
+		let releaseOAuthUrlForCopy: (() => void) | undefined;
 
 		try {
 			// Create OAuth flow
@@ -569,7 +570,8 @@ export class MCPCommandController {
 				},
 				{
 					onAuth: (info: { url: string; instructions?: string }) => {
-						this.ctx.setOAuthUrlForCopy(info.url);
+						releaseOAuthUrlForCopy?.();
+						releaseOAuthUrlForCopy = this.ctx.beginOAuthUrlForCopy(info.url);
 						// Show auth URL prominently in chat
 						this.ctx.chatContainer.addChild(new Spacer(1));
 						this.ctx.chatContainer.addChild(
@@ -684,7 +686,7 @@ export class MCPCommandController {
 				throw new Error(`OAuth authentication failed: ${errorMsg}`);
 			}
 		} finally {
-			this.ctx.setOAuthUrlForCopy(undefined);
+			releaseOAuthUrlForCopy?.();
 		}
 	}
 
