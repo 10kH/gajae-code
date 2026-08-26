@@ -4,6 +4,11 @@ import * as fs from "node:fs/promises";
 import path from "node:path";
 
 const SUPPORTED_VERSION = 1;
+const CURRENT_SESSION_INDEX_VERSION = 4;
+
+function isCurrentSessionIndex(relativePath: string): boolean {
+	return relativePath === path.join("sessions", "index.jsonl") || relativePath === path.join("sessions", "index.snapshot.json");
+}
 
 type Omission = { path: string; field: string; reason: string };
 type PretrainBinaryAudit = {
@@ -55,6 +60,7 @@ async function validateJson(file: string): Promise<void> {
 async function validateTree(source: string): Promise<void> {
 	if (!(await exists(source))) return;
 	for await (const entry of new Bun.Glob("**/*").scan({ cwd: source, onlyFiles: true })) {
+		if (isCurrentSessionIndex(entry)) continue;
 		const file = path.join(source, entry);
 		if (entry.endsWith(".json")) await validateJson(file);
 		if (entry.endsWith(".jsonl")) for (const line of (await fs.readFile(file, "utf8")).split("\n")) if (line) await validateJsonText(file, line);
@@ -137,10 +143,24 @@ async function copyLegacyEndpoints(source: string, destination: string, copied: 
 	}
 }
 
-async function copyTree(source: string, destination: string, copied: string[], relativeRoot: string): Promise<void> {
+async function copyTree(
+	source: string,
+	destination: string,
+	copied: string[],
+	 omissions: Omission[],
+	relativeRoot: string,
+): Promise<void> {
 	if (!(await exists(source))) return;
 	await fs.mkdir(destination, { recursive: true, mode: 0o700 });
 	for await (const entry of new Bun.Glob("**/*").scan({ cwd: source, onlyFiles: true })) {
+		if (isCurrentSessionIndex(entry)) {
+			omissions.push({
+				path: path.join(relativeRoot, entry),
+				field: "version",
+				reason: `session index format ${CURRENT_SESSION_INDEX_VERSION} is not readable by the rollback target`,
+			});
+			continue;
+		}
 		const input = path.join(source, entry);
 		const output = path.join(destination, entry);
 		await fs.mkdir(path.dirname(output), { recursive: true, mode: 0o700 });
@@ -156,7 +176,7 @@ export async function transformSdkStateForRollback({ from, out, to, pretrainBina
 	const endpointSource = path.join(from, "state", "sdk");
 	const report: TransformReport = { schemaVersion: 1, sourceVersion: SUPPORTED_VERSION, targetVersion: to, omissions: [], copied: [], ...(pretrainBinary ? { pretrainBinary } : {}) };
 	await fs.mkdir(out, { recursive: true, mode: 0o700 });
-	await copyTree(path.join(from, "sdk"), path.join(out, "sdk"), report.copied, "sdk");
+	await copyTree(path.join(from, "sdk"), path.join(out, "sdk"), report.copied, report.omissions, "sdk");
 	// Pre-Phase-B readers discover only strict v1 session endpoint records here.
 	await copyLegacyEndpoints(endpointSource, path.join(out, "state", "notifications"), report.copied);
 	await fs.writeFile(path.join(out, "report.json"), `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
