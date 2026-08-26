@@ -4006,7 +4006,12 @@ export class AgentSession {
 					: undefined;
 			this.#fireQueuedPromotionHooks(messages, promotion);
 			if (consumedSdkRunToken !== undefined) this.#activeSdkRunToken = consumedSdkRunToken;
-			for (const message of [...messages, ...dropped]) this.#sdkRunTokensByQueuedMessage.delete(message);
+			// Dropped or in-run follow-ups have no later own-run acceptance callback;
+			// delete those tokens now. Own-run messages stay mapped until
+			// #scheduleAgentContinue.onRunAccepted binds the new attempt scope.
+			for (const message of dropped) this.#sdkRunTokensByQueuedMessage.delete(message);
+			if (promotion.startsOwnRun !== true)
+				for (const message of messages) this.#sdkRunTokensByQueuedMessage.delete(message);
 		};
 		// Steering consumed mid-run never starts its own run: fire the stored
 		// promotion hook at the REAL dequeue boundary so the SDK attaches the

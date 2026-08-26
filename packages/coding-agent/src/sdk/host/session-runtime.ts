@@ -1533,6 +1533,7 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 		const assistant = lastAssistant as {
 			stopReason?: unknown;
 			errorMessage?: unknown;
+			errorKind?: unknown;
 			errorStatus?: unknown;
 			transportFailure?: { status?: unknown };
 		};
@@ -1543,6 +1544,13 @@ function providerFailureFromAgentEnd(event: unknown): { code: string; message: s
 			return undefined;
 		}
 		if (stopReason !== "error") return undefined;
+		let errorKind: unknown;
+		try {
+			errorKind = assistant.errorKind;
+		} catch {
+			return undefined;
+		}
+		if (errorKind === "local_snapshot_failure" || errorKind === "local_buffer_overflow") return undefined;
 		let errorMessage: unknown;
 		try {
 			errorMessage = assistant.errorMessage;
@@ -3278,7 +3286,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	};
 	const removeLifecycleReferences = (owner: RuntimeState, correlation: InvocationCorrelation): void => {
 		const target = lifecycleCorrelationKey(correlation);
-		owner.pending = owner.pending.filter(entry => lifecycleCorrelationKey(entry.correlation) !== target);
+		const retainedPending = owner.pending.filter(entry => lifecycleCorrelationKey(entry.correlation) !== target);
+		owner.pending.splice(0, owner.pending.length, ...retainedPending);
 		for (const batch of owner.openLifecycleBatches) {
 			batch.invocations = batch.invocations.filter(entry => lifecycleCorrelationKey(entry.correlation) !== target);
 			batch.attachedInvocations = batch.attachedInvocations.filter(
