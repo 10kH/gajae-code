@@ -3572,7 +3572,10 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					controller.signal.addEventListener("abort", onAbort, { once: true });
 					await wait.promise;
 					controller.signal.removeEventListener("abort", onAbort);
-					if (controller.signal.aborted) return;
+					if (controller.signal.aborted) {
+						skillTerminalRecoveryKeys.delete(recoveryKey);
+						return;
+					}
 					return attempt();
 				}
 			};
