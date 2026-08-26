@@ -907,38 +907,37 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 				let executionResult: BashResult | BashInteractiveResult | undefined;
 				try {
-					const result = await executeBash(options.command, {
-						cwd: options.commandCwd,
-						settings: this.session.settings,
-						sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
-						timeout: options.timeoutMs,
-						signal: runSignal,
-						env: options.resolvedEnv,
-						artifactPath,
-						artifactId,
-						artifactPublisher,
-						spillThreshold,
-						headBytes,
-						oneShot: true,
-						ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only" || options.directMasterSpawn,
-						disableShellSnapshot:
-							this.session.bashRestrictionProfile === "read-only" || options.directMasterSpawn,
-						onChunk: chunk => {
-							tailBuffer.append(chunk);
-							latestText = tailBuffer.text();
-							void reportProgress(latestText, runningDetails(jobId));
-						},
-						onRawChunk: chunk => {
-							// Forward the unthrottled sanitized chunk to the async-job
-							// substrate so the Monitor tool can read the complete process
-							// stream by byte offset, independent of the throttled preview
-							// path above.
-							manager.appendOutput(jobId, chunk);
-						},
-						onMinimizedSave: async originalText => {
-							return saveBashOriginalArtifact(this.session, originalText);
-						},
-					});
+					const result = options.directMasterSpawn
+						? await this.#runDirectMasterSpawn(
+								options.command,
+								options.commandCwd,
+								options.timeoutMs,
+								runSignal,
+								options.resolvedEnv,
+							)
+						: await executeBash(options.command, {
+								cwd: options.commandCwd,
+								settings: this.session.settings,
+								sessionKey: `${this.session.getSessionId?.() ?? ""}:async:${jobId}`,
+								timeout: options.timeoutMs,
+								signal: runSignal,
+								env: options.resolvedEnv,
+								artifactPath,
+								artifactId,
+								artifactPublisher,
+								spillThreshold,
+								headBytes,
+								oneShot: true,
+								ignoreShellPrefix: this.session.bashRestrictionProfile === "read-only",
+								disableShellSnapshot: this.session.bashRestrictionProfile === "read-only",
+								onChunk: chunk => {
+									tailBuffer.append(chunk);
+									latestText = tailBuffer.text();
+									void reportProgress(latestText, runningDetails(jobId));
+								},
+								onRawChunk: chunk => manager.appendOutput(jobId, chunk),
+								onMinimizedSave: async originalText => saveBashOriginalArtifact(this.session, originalText),
+							});
 					executionResult = result;
 					const finalResult = this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -1249,19 +1248,21 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		};
 	}
 
-	async #executeDirectMasterSpawn(
+	async #runDirectMasterSpawn(
 		command: string,
 		commandCwd: string,
-		timeoutSec: number,
-		requestedTimeoutSec: number,
-		notices: readonly string[],
-		masterCapability: string,
-		sessionAgentDir: string,
-	): Promise<AgentToolResult<BashToolDetails>> {
+		timeoutMs: number,
+		signal: AbortSignal | undefined,
+		resolvedEnv: Record<string, string> | undefined,
+	): Promise<BashResult> {
+		const masterCapability = resolvedEnv?.[MASTER_CAPABILITY_ENV];
+		const sessionAgentDir = resolvedEnv?.GJC_CODING_AGENT_DIR;
+		if (masterCapability === undefined || sessionAgentDir === undefined)
+			throw new ToolError("Master spawn authority context is unavailable.");
 		const args = parseDirectSdkSpawnArgs(command);
 		args.agentDir = sessionAgentDir;
 		if (args.cwd !== undefined && !path.isAbsolute(args.cwd)) args.cwd = path.resolve(commandCwd, args.cwd);
-		const result = await runSdkSpawn(args, {
+		const request = runSdkSpawn(args, {
 			env: {
 				...process.env,
 				GJC_MASTER_CAPABILITY: masterCapability,
@@ -1269,26 +1270,46 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				GJC_CODING_AGENT_DIR: sessionAgentDir,
 			},
 		});
+		const timeout = Bun.sleep(timeoutMs).then(() => {
+			throw new ToolError(`Command timed out after ${Math.ceil(timeoutMs / 1000)} seconds`);
+		});
+		const aborted = Promise.withResolvers<never>();
+		const onAbort = (): void => aborted.reject(new ToolAbortError("Command aborted"));
+		if (signal?.aborted) onAbort();
+		else signal?.addEventListener("abort", onAbort, { once: true });
+		let result: Awaited<typeof request>;
+		try {
+			result = await Promise.race([request, timeout, aborted.promise]);
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
 		const output = args.json ? JSON.stringify(result.rendered) : renderSpawnTable(result.rendered);
 		const outputBytes = Buffer.byteLength(output, "utf8");
 		const outputLines = output.split("\n").length;
-		return this.#buildCompletedResult(
-			{
-				output,
-				exitCode: result.exitCode,
-				cancelled: false,
-				truncated: false,
-				totalLines: outputLines,
-				totalBytes: outputBytes,
-				outputLines,
-				outputBytes,
-			},
-			timeoutSec,
-			{
-				requestedTimeoutSec,
-				notices,
-			},
-		);
+		return {
+			output,
+			exitCode: result.exitCode,
+			cancelled: false,
+			truncated: false,
+			totalLines: outputLines,
+			totalBytes: outputBytes,
+			outputLines,
+			outputBytes,
+		};
+	}
+
+	async #executeDirectMasterSpawn(
+		command: string,
+		commandCwd: string,
+		timeoutSec: number,
+		timeoutMs: number,
+		requestedTimeoutSec: number,
+		notices: readonly string[],
+		signal: AbortSignal | undefined,
+		resolvedEnv: Record<string, string>,
+	): Promise<AgentToolResult<BashToolDetails>> {
+		const result = await this.#runDirectMasterSpawn(command, commandCwd, timeoutMs, signal, resolvedEnv);
+		return this.#buildCompletedResult(result, timeoutSec, { requestedTimeoutSec, notices });
 	}
 
 	/**
@@ -1457,17 +1478,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			notices: pendingNotices,
 		} = prepared;
 		const masterCapability = directMasterSpawn ? resolvedEnv[MASTER_CAPABILITY_ENV] : undefined;
-		if (directMasterSpawn && masterCapability !== undefined) {
-			const sessionAgentDir = this.session.getSessionAgentDir?.() ?? this.session.settings?.getAgentDir?.();
-			if (sessionAgentDir === undefined) throw new ToolError("Master session agent directory is unavailable.");
+		if (directMasterSpawn && masterCapability !== undefined && !asyncRequested) {
 			return await this.#executeDirectMasterSpawn(
 				command,
 				commandCwd,
 				timeoutSec,
+				timeoutMs,
 				requestedTimeoutSec,
 				pendingNotices,
-				masterCapability,
-				sessionAgentDir,
+				signal,
+				resolvedEnv,
 			);
 		}
 
