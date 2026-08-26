@@ -46,9 +46,20 @@ export class AdaptiveCompactionTracker {
 		this.#state.callsInWindow = 0;
 	}
 
+	reset(now = Date.now()): void {
+		this.#state = {
+			turnsSinceCompact: 0,
+			callsInWindow: 0,
+			windowStart: now,
+			lastContextTokens: 0,
+			lastCompactContextTokens: null,
+			lastCompactTs: null,
+		};
+	}
+
 	recordCall(contextTokens: number, now = Date.now()): void {
 		this.#state.turnsSinceCompact += 1;
-		if (now - this.#state.windowStart > this.windowMs) {
+		if (now - this.#state.windowStart >= this.windowMs) {
 			this.#state.windowStart = now;
 			this.#state.callsInWindow = 0;
 		}

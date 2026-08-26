@@ -175,21 +175,25 @@ export function computeAdaptiveThresholdPercent(
 	state: AdaptiveCompactionDecisionState | undefined,
 	options: AdaptiveCompactionOptions | undefined,
 ): number {
-	if (!options?.enabled || !state || contextWindow <= 0) return basePercent;
+	if (!options?.enabled || !state || !Number.isFinite(contextWindow) || contextWindow <= 0) return basePercent;
 
-	const clampedBasePercent = Math.min(99, Math.max(1, basePercent));
+	const clampedBasePercent = Number.isFinite(basePercent) ? Math.min(99, Math.max(1, basePercent)) : 85;
 	if (state.turnsSinceCompact < 3) return clampedBasePercent;
 
-	const fillRatio = contextTokens / contextWindow;
+	const safeContextTokens = Number.isFinite(contextTokens) ? Math.max(0, contextTokens) : 0;
+	const fillRatio = safeContextTokens / contextWindow;
 	const baseRatio = clampedBasePercent / 100;
 	if (fillRatio < baseRatio * 0.7) return clampedBasePercent;
 
-	const windowTurns = Math.max(1, options.turnWindow * 4);
+	const windowTurns = Number.isFinite(options.turnWindow) ? Math.max(1, options.turnWindow * 4) : 1;
 	const intensity = Math.min(1, Math.max(0, state.callsInWindow) / windowTurns);
-	const aggression = Math.min(1, Math.max(0, options.aggression));
+	const aggression = Number.isFinite(options.aggression) ? Math.min(1, Math.max(0, options.aggression)) : 0;
+	const configuredMinThresholdPercent = options.minThresholdPercent;
 	const minThresholdPercent = Math.min(
 		clampedBasePercent,
-		Math.max(1, options.minThresholdPercent ?? clampedBasePercent * 0.5),
+		typeof configuredMinThresholdPercent === "number" && Number.isFinite(configuredMinThresholdPercent)
+			? Math.max(1, configuredMinThresholdPercent)
+			: clampedBasePercent * 0.5,
 	);
 	const loweredPercent = clampedBasePercent - (clampedBasePercent - minThresholdPercent) * aggression * intensity;
 	return Math.max(1, Math.min(99, Math.round(loweredPercent)));
@@ -410,7 +414,7 @@ export function resolveThresholdTokens(
 	contextWindow: number,
 	settings: CompactionSettings,
 	maxOutputTokens = 0,
-	contextTokens = 0,
+	contextTokens?: number,
 ): number {
 	// Fixed token limit takes priority over percentage
 	const thresholdTokens = settings.thresholdTokens;
@@ -425,10 +429,12 @@ export function resolveThresholdTokens(
 		if (!settings.adaptive?.enabled) {
 			return contextWindow - effectiveReserveTokens(contextWindow, settings, maxOutputTokens);
 		}
-		const adaptiveBasePercent = Math.min(99, Math.max(1, settings.adaptive.baseThresholdPercent));
+		const adaptiveBasePercent = Number.isFinite(settings.adaptive.baseThresholdPercent)
+			? Math.min(99, Math.max(1, settings.adaptive.baseThresholdPercent))
+			: 85;
 		const adaptiveThresholdPercent = computeAdaptiveThresholdPercent(
 			adaptiveBasePercent,
-			contextTokens || settings.adaptiveState?.lastContextTokens || 0,
+			adaptiveContextTokens(contextTokens, settings.adaptiveState?.lastContextTokens),
 			contextWindow,
 			settings.adaptiveState,
 			settings.adaptive,
@@ -438,13 +444,20 @@ export function resolveThresholdTokens(
 	const clampedThresholdPercent = Math.min(99, Math.max(1, thresholdPercent));
 	const adaptiveThresholdPercent = computeAdaptiveThresholdPercent(
 		settings.adaptive?.baseThresholdPercent ?? clampedThresholdPercent,
-		contextTokens || settings.adaptiveState?.lastContextTokens || 0,
+		adaptiveContextTokens(contextTokens, settings.adaptiveState?.lastContextTokens),
 		contextWindow,
 		settings.adaptiveState,
 		settings.adaptive,
 	);
 	const effectiveThresholdPercent = settings.adaptive?.enabled ? adaptiveThresholdPercent : clampedThresholdPercent;
 	return Math.floor(contextWindow * (effectiveThresholdPercent / 100));
+}
+
+function adaptiveContextTokens(contextTokens: number | undefined, lastContextTokens: number | undefined): number {
+	if (contextTokens !== undefined && Number.isFinite(contextTokens)) return Math.max(0, contextTokens);
+	if (typeof lastContextTokens === "number" && Number.isFinite(lastContextTokens))
+		return Math.max(0, lastContextTokens);
+	return 0;
 }
 
 // ============================================================================

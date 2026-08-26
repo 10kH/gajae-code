@@ -29,20 +29,37 @@ describe("AdaptiveCompactionTracker", () => {
 		});
 	});
 
-	it("keeps a sliding call-rate window", () => {
+	it("starts a new tumbling call-rate window at the expiry boundary", () => {
 		const tracker = new AdaptiveCompactionTracker(60_000, 0);
 
 		tracker.recordCall(80_000, 1_000);
 		tracker.recordCall(90_000, 30_000);
 		expect(tracker.snapshot().callsInWindow).toBe(2);
 
-		tracker.recordCall(95_000, 61_001);
+		tracker.recordCall(95_000, 61_000);
 		expect(tracker.snapshot()).toMatchObject({
 			turnsSinceCompact: 3,
 			callsInWindow: 1,
-			windowStart: 61_001,
+			windowStart: 61_000,
 			lastContextTokens: 95_000,
 		});
+	});
+
+	it("resets without changing the configured window", () => {
+		const tracker = new AdaptiveCompactionTracker(60_000, 0);
+		tracker.recordCall(80_000, 1_000);
+
+		tracker.reset(2_000);
+
+		expect(tracker.snapshot()).toMatchObject({
+			turnsSinceCompact: 0,
+			callsInWindow: 0,
+			windowStart: 2_000,
+			lastContextTokens: 0,
+			lastCompactContextTokens: null,
+			lastCompactTs: null,
+		});
+		expect(tracker.windowMs).toBe(60_000);
 	});
 
 	it("exposes the latest context size for adaptive decisions", () => {

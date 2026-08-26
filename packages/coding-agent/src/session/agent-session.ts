@@ -2432,6 +2432,7 @@ export class AgentSession {
 	// it survives the message-array rebuild that compaction/prune perform.
 	#lastMidRunMaintenanceAnchorSignature: string | undefined = undefined;
 	#adaptiveCompactionTracker = new AdaptiveCompactionTracker();
+	#adaptiveCompactionRecordedMessages = new WeakSet<AssistantMessage>();
 	#resourceSampler: () => EmergencyCompactionSample = () => this.#defaultResourceSample();
 	#retainedMemorySampler: (() => RetainedMemorySample) | undefined;
 
@@ -7704,6 +7705,8 @@ export class AgentSession {
 	 * such event.
 	 */
 	#syncAgentSessionId(sessionId?: string): void {
+		this.#adaptiveCompactionTracker.reset();
+		this.#adaptiveCompactionRecordedMessages = new WeakSet<AssistantMessage>();
 		this.#reasoningControlContextGeneration++;
 		const sid = this.#providerSessionId ?? sessionId ?? this.sessionManager.getSessionId();
 		this.agent.sessionId = sid;
@@ -15859,10 +15862,10 @@ export class AgentSession {
 					fromExtension,
 					preserveData,
 				);
-				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 				if (compactionSettings.adaptive?.enabled) {
 					this.#adaptiveCompactionTracker.recordCompact(tokensBefore);
 				}
+				await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
 
 				const compactionResult: CompactionResult = {
 					summary,
@@ -16385,7 +16388,11 @@ export class AgentSession {
 		// which breaks the provider prompt-cache prefix mid-epoch. Only prune at a
 		// sanctioned maintenance boundary, i.e. when the un-pruned context already
 		// crosses the compaction threshold. Pruning may then avert full compaction.
-		const adaptiveCompactionSettings = this.#recordAdaptiveCompactionCall(contextTokens, compactionSettings);
+		const adaptiveCompactionSettings = this.#recordAdaptiveCompactionCall(
+			contextTokens,
+			compactionSettings,
+			assistantMessage,
+		);
 		if (!shouldCompact(contextTokens, contextWindow, adaptiveCompactionSettings, autoCompactionOutputReserveTokens))
 			return true;
 		const pruneEstimate = estimateToolOutputPruneSavings(this.sessionManager.getBranch(), DEFAULT_PRUNE_CONFIG, {
@@ -16718,9 +16725,14 @@ export class AgentSession {
 	#recordAdaptiveCompactionCall<T extends { adaptive?: { enabled: boolean; turnWindow: number } }>(
 		contextTokens: number,
 		settings: T,
+		assistantMessage: AssistantMessage,
 	): T {
 		if (!settings.adaptive?.enabled) return settings;
 		this.#adaptiveCompactionTracker.setWindowMs(settings.adaptive.turnWindow * 60_000);
+		if (this.#adaptiveCompactionRecordedMessages.has(assistantMessage)) {
+			return this.#compactionSettingsWithAdaptiveState(settings);
+		}
+		this.#adaptiveCompactionRecordedMessages.add(assistantMessage);
 		this.#adaptiveCompactionTracker.recordCall(contextTokens);
 		return this.#compactionSettingsWithAdaptiveState(settings);
 	}
@@ -18183,11 +18195,11 @@ export class AgentSession {
 				fromExtension,
 				preserveData,
 			);
-			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
-			if (autoCompactionSignal.aborted) return await emitAborted();
 			if (compactionSettings.adaptive?.enabled) {
 				this.#adaptiveCompactionTracker.recordCompact(tokensBefore);
 			}
+			await this.#applyCompactionPostAppend(compactionEntryId, firstKeptEntryId, fromExtension);
+			if (autoCompactionSignal.aborted) return await emitAborted();
 
 			const result: CompactionResult = {
 				summary,

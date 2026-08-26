@@ -93,4 +93,24 @@ describe("adaptive compaction threshold", () => {
 			}),
 		).toBe(90_000);
 	});
+
+	it("keeps invalid adaptive inputs finite and honors explicit zero context", () => {
+		const state = { turnsSinceCompact: 20, callsInWindow: 60, lastContextTokens: 80_000 };
+		const invalid = computeAdaptiveThresholdPercent(85, 80_000, 100_000, state, {
+			...adaptiveOptions,
+			aggression: Number.NaN,
+		});
+		const zeroContext = resolveThresholdTokens(
+			100_000,
+			{
+				...adaptiveSettings,
+				adaptiveState: state,
+			},
+			0,
+			0,
+		);
+
+		expect(invalid).toBe(85);
+		expect(zeroContext).toBe(85_000);
+	});
 });
