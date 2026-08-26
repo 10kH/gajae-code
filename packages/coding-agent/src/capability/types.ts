@@ -107,6 +107,8 @@ export interface LoadOptions {
 	disabledExtensions?: string[];
 	/** Session settings whose provider policy applies to this load. */
 	settings?: Settings;
+	/** Internal: prevent explicit-home loads from consulting process-global policy. */
+	isolatedHome?: boolean;
 }
 
 /**
