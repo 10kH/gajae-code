@@ -121,6 +121,17 @@ async function assertVerifiableMasterAttachment(
 		effective?.masterRole?.launchProcessIncarnation,
 	);
 	if (!effective) throw new Error("Expected effective master host");
+	const endpointPath = path.join(effective.locator.stateRoot, "sdk", `${effective.sessionId}.json`);
+	const [endpointStat, endpointIdentity] = await Promise.all([
+		fs.promises.stat(endpointPath),
+		fs.promises.stat(endpointPath, { bigint: true }),
+	]);
+	const endpointFileId = effective.endpointFileId;
+	const endpointMtimeMs = effective.endpointMtimeMs;
+	if (endpointFileId === undefined || endpointMtimeMs === undefined)
+		throw new Error("Expected effective master host endpoint identity");
+	expect(`${endpointIdentity.dev}:${endpointIdentity.ino}`).toBe(endpointFileId);
+	expect(endpointStat.mtimeMs).toBe(endpointMtimeMs);
 	expect(await readEndpoint(effective)).toBeDefined();
 	return index;
 }

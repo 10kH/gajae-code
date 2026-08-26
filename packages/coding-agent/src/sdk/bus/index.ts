@@ -7777,7 +7777,10 @@ export function createNotificationsExtension(
 					const index = await new SessionIndex(agentDir).open();
 					throwIfLifecycleStopped();
 					const locator = await resolveSessionLocator(ctx.cwd, endpointStateRoot);
-					const endpointMtimeMs = fs.statSync(path.join(endpointStateRoot, "sdk", `${id}.json`)).mtimeMs;
+					const endpointPath = path.join(endpointStateRoot, "sdk", `${id}.json`);
+					const endpointMtimeMs = fs.statSync(endpointPath).mtimeMs;
+					const endpointIdentity = fs.statSync(endpointPath, { bigint: true });
+					const endpointFileId = `${endpointIdentity.dev}:${endpointIdentity.ino}`;
 					const hostProcessIncarnation = processIncarnation(process.pid);
 					const direct = await reattestMasterSessionIdentity({
 						index,
@@ -7814,6 +7817,7 @@ export function createNotificationsExtension(
 								// teardown identity provable after that workspace is gone.
 								...(hostProcessIncarnation ? { processIncarnation: hostProcessIncarnation } : {}),
 								endpointMtimeMs,
+								endpointFileId,
 								...(masterRole ? { masterRole } : {}),
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});

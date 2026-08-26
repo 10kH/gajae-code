@@ -138,6 +138,8 @@ export interface SessionIndexEvent {
 	 */
 	processIncarnation?: string;
 	endpointMtimeMs?: number;
+	/** Immutable endpoint file identity captured by the broker at registration. */
+	endpointFileId?: string;
 	lifecycleRequestId?: string;
 	terminalUncertain?: boolean;
 	/** OS process incarnation (C1); absent on legacy v1/v2 events. */
@@ -156,6 +158,8 @@ export interface IndexedSession {
 	/** OS start incarnation of `pid` as published by its own host at registration. */
 	processIncarnation?: string;
 	endpointMtimeMs?: number;
+	/** Immutable endpoint file identity captured by the broker at registration. */
+	endpointFileId?: string;
 	live: boolean;
 	indexSeq: number;
 	lifecycleRequestId?: string;
@@ -591,6 +595,7 @@ function projectIdentity(
 		pid: latest.pid,
 		processIncarnation: latest.processIncarnation,
 		endpointMtimeMs: latest.endpointMtimeMs,
+		endpointFileId: latest.endpointFileId,
 		lifecycleRequestId: latest.lifecycleRequestId,
 		terminalUncertain,
 		indexSeq: latest.indexSeq,
@@ -2031,6 +2036,7 @@ export class SessionIndex {
 					pid: event.pid,
 					processIncarnation: event.processIncarnation,
 					endpointMtimeMs: event.endpointMtimeMs,
+					endpointFileId: event.endpointFileId,
 					lifecycleRequestId: event.lifecycleRequestId,
 					terminalUncertain: false,
 					indexSeq: event.indexSeq,

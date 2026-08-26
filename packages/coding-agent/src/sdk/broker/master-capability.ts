@@ -59,6 +59,7 @@ function sameAttachment(left: IndexedSession, right: IndexedSession): boolean {
 		left.endpointGeneration === right.endpointGeneration &&
 		left.pid === right.pid &&
 		left.endpointMtimeMs === right.endpointMtimeMs &&
+		left.endpointFileId === right.endpointFileId &&
 		left.hostIncarnation === right.hostIncarnation &&
 		left.processIncarnation === right.processIncarnation &&
 		left.indexSeq === right.indexSeq &&
@@ -66,6 +67,10 @@ function sameAttachment(left: IndexedSession, right: IndexedSession): boolean {
 		right.masterRole !== undefined &&
 		matchesAttestation(left.masterRole, right.masterRole)
 	);
+}
+
+function endpointFileId(stat: { dev: bigint; ino: bigint }): string {
+	return `${stat.dev}:${stat.ino}`;
 }
 
 function adoptedDirectAttestation(
@@ -87,10 +92,14 @@ function adoptedDirectAttestation(
 
 /** Reads and validates a registered host's authenticated endpoint record. */
 export async function readEndpoint(record: IndexedSession): Promise<SessionEndpoint | undefined> {
-	if (record.endpointMtimeMs === undefined) return undefined;
+	if (record.endpointMtimeMs === undefined || record.endpointFileId === undefined) return undefined;
 	try {
 		const endpointPath = path.join(record.locator.stateRoot, "sdk", `${record.sessionId}.json`);
-		const [source, metadata] = await Promise.all([fs.readFile(endpointPath, "utf8"), fs.stat(endpointPath)]);
+		const [source, metadata, identity] = await Promise.all([
+			fs.readFile(endpointPath, "utf8"),
+			fs.stat(endpointPath),
+			fs.stat(endpointPath, { bigint: true }),
+		]);
 		const endpoint = JSON.parse(source) as Record<string, unknown>;
 		if (
 			endpoint.sessionId !== record.sessionId ||
@@ -99,11 +108,14 @@ export async function readEndpoint(record: IndexedSession): Promise<SessionEndpo
 			typeof endpoint.token !== "string" ||
 			endpoint.url.length === 0 ||
 			endpoint.token.length === 0 ||
+			endpointFileId(identity) !== record.endpointFileId ||
 			Math.abs(metadata.mtimeMs - record.endpointMtimeMs) > 0.001
 		)
 			return undefined;
 		const url = new URL(endpoint.url);
 		if (url.protocol !== "ws:" && url.protocol !== "wss:") return undefined;
+		const after = await fs.stat(endpointPath, { bigint: true });
+		if (endpointFileId(after) !== record.endpointFileId) return undefined;
 		return { url: endpoint.url, token: endpoint.token };
 	} catch {
 		return undefined;

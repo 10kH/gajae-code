@@ -14,6 +14,7 @@ const capabilityDigest = createHash("sha256").update(capability).digest("hex");
 const sessionId = "master-e2e";
 const attestationEpoch = "master-attestation-epoch-e2e";
 const hostIncarnation = processIncarnation(process.pid);
+type TestHost = { url: string; token: string; endpointPath: string; endpointFileId: string; stop: () => void };
 
 function event(
 	input: Omit<SessionIndexEvent, "version" | "indexSeq" | "checksum" | "ts">,
@@ -37,7 +38,7 @@ async function writeIndex(agentDir: string, events: readonly SessionIndexEvent[]
 async function startHost(
 	stateRoot: string,
 	answer: "correct" | "wrong" | "replay",
-): Promise<{ url: string; token: string; stop: () => void }> {
+): Promise<TestHost> {
 	const token = "host-token-e2e";
 	const server = Bun.serve<{ connectionId: string }>({
 		hostname: "127.0.0.1",
@@ -73,7 +74,14 @@ async function startHost(
 	const url = new URL(server.url);
 	url.protocol = "ws:";
 	await Bun.write(endpoint, JSON.stringify({ version: 1, sessionId, pid: process.pid, url: url.toString(), token }));
-	return { url: url.toString(), token, stop: () => server.stop(true) };
+	const stat = await fs.stat(endpoint, { bigint: true });
+	return {
+		url: url.toString(),
+		token,
+		endpointPath: endpoint,
+		endpointFileId: `${stat.dev}:${stat.ino}`,
+		stop: () => server.stop(true),
+	};
 }
 
 async function spawn(broker: Broker, suppliedCapability = capability): Promise<unknown> {
@@ -186,7 +194,7 @@ describe("master capability effective-host verification", () => {
 			spawnPromptLayer: spawnPromptLayerFake,
 		});
 		await broker.start();
-		let host: { stop: () => void } | undefined;
+		let host: TestHost | undefined;
 		try {
 			await writeIndex(agentDir, [direct]);
 			expect(await spawn(broker)).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
@@ -202,6 +210,7 @@ describe("master capability effective-host verification", () => {
 					pid: process.pid,
 					hostIncarnation,
 					endpointMtimeMs,
+					endpointFileId: host.endpointFileId,
 					masterRole: attestation,
 				},
 				2,
@@ -215,12 +224,12 @@ describe("master capability effective-host verification", () => {
 
 			host.stop();
 			host = await startHost(stateRoot, "replay");
-			const replacedMtimeMs = (await fs.stat(path.join(stateRoot, "sdk", `${sessionId}.json`))).mtimeMs;
-			const replaced = event(
-				{ ...effective, endpointMtimeMs: replacedMtimeMs, indexSeq: undefined, checksum: undefined } as never,
-				3,
+			await fs.utimes(
+				host.endpointPath,
+				effective.endpointMtimeMs! / 1_000,
+				effective.endpointMtimeMs! / 1_000,
 			);
-			await writeIndex(agentDir, [direct, effective, replaced]);
+			await writeIndex(agentDir, [direct, effective]);
 			expect(await spawn(broker)).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
 
 			await writeIndex(agentDir, [direct]);

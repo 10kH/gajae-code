@@ -4206,8 +4206,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 				await runtime.registerWithBroker({
 					register: async input => {
-						const endpointMtimeMs = (await fs.stat(path.join(input.stateRoot, "sdk", `${input.sessionId}.json`)))
-							.mtimeMs;
+						const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
+						const [endpointStat, endpointIdentity] = await Promise.all([
+							fs.stat(endpointPath),
+							fs.stat(endpointPath, { bigint: true }),
+						]);
+						const endpointMtimeMs = endpointStat.mtimeMs;
+						const endpointFileId = `${endpointIdentity.dev}:${endpointIdentity.ino}`;
 						const masterRole = masterAttestationForEffectiveHost({
 							masterCapability: options.masterCapability,
 							attestationEpoch: options.masterAttestationEpoch,
@@ -4223,6 +4228,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 							locator,
 							pid: process.pid,
 							endpointMtimeMs,
+							endpointFileId,
 							...(masterRole ? { masterRole } : {}),
 						});
 					},
