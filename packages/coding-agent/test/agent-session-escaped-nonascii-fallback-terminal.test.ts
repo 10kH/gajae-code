@@ -34,6 +34,10 @@ function escapedTurn(id: string) {
 	};
 }
 
+function literalTurn(id: string) {
+	return { content: [{ type: "toolCall" as const, id, name: "ask", arguments: { question: QUESTION } }] };
+}
+
 const schema = z.object({ question: z.string() });
 
 function askTool(executed: Array<Record<string, unknown>>): AgentTool<typeof schema, Record<string, never>> {
@@ -86,6 +90,7 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		const modelRegistry = new ModelRegistry(authStorage);
 		const manager = SessionManager.create(tempDir.path(), tempDir.path());
 		const executed: Array<Record<string, unknown>> = [];
+		const callModels: string[] = [];
 
 		// Deterministic escaper: every wire attempt escapes, forever.
 		// This reproduces the v0.15.0 fallback-exhaustion defect without Windows.
@@ -96,7 +101,10 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		const agent = new Agent({
 			initialState: { model: primary, systemPrompt: ["test"], tools: [askTool(executed)], messages: [] },
 			convertToLlm: identityConverter,
-			streamFn: (model, context, options) => mock.stream(model, context, options),
+			streamFn: (model, context, options) => {
+				callModels.push(selector(model));
+				return mock.stream(model, context, options);
+			},
 		});
 
 		const settings = Settings.isolated({
@@ -160,21 +168,121 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		expect(last?.stopReason === "error" || last?.stopReason === "exhausted").toBe(true);
 		expect(last?.errorMessage ?? "").toContain("escaped non-ASCII");
 
-		// Steering instruction is transient: at most one steered request, never durable.
+		// Steering instructions are transient and never durable.
 		expect(hasUserText(durable, ESCAPED_NONASCII_RECOVERY_PROMPT)).toBe(false);
+
+		// Every eligible model receives its initial request plus two steered retries;
+		// only then does the chain advance, and the final model fails closed.
+		expect(callModels).toEqual([
+			selector(primary),
+			selector(primary),
+			selector(primary),
+			selector(fallback),
+			selector(fallback),
+			selector(fallback),
+		]);
+		expect(mock.model.calls.length).toBe(6);
+		expect(events).toEqual([
+			expect.objectContaining({
+				type: "model_fallback_switched",
+				from: selector(primary),
+				to: selector(fallback),
+				reason: "escaped_non_ascii",
+				attemptsUsed: 1,
+			}),
+		]);
 		const steeredRequests = mock.model.calls.filter(request =>
 			hasUserText(request.context.messages, ESCAPED_NONASCII_RECOVERY_PROMPT),
 		);
-		expect(steeredRequests.length).toBeLessThanOrEqual(1);
+		expect(steeredRequests).toHaveLength(5);
+		expect(
+			manager
+				.buildSessionContext()
+				.messages.some(
+					message =>
+						message.role === "user" &&
+						typeof message.content === "string" &&
+						message.content.includes("literal UTF-8"),
+				),
+		).toBe(false);
+	});
 
-		// Bounded provider calls: initial + bounded managed retries (steered + blind).
-		// Must NOT burn the full fallback chain (2 resamples × 2 models × 3 attempts).
-		expect(mock.model.calls.length).toBeLessThanOrEqual(4);
-		expect(mock.model.calls.length).toBeGreaterThanOrEqual(2);
+	it("recovers on the next model after the first model exhausts escaped retries", async () => {
+		tempDir = TempDir.createSync("@gjc-escaped-fallback-advance-4880-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
 
-		// No same-model duplicate re-entry: the chain never re-charged the same model.
-		// With fallback.maxAttempts=3 the old bug re-charged opus-4-6 three times and
-		// emitted model_fallback_switched with reason unknown and attemptsUsed 3.
-		expect(events).toEqual([]);
+		const primary = getBundledModel("anthropic", "claude-opus-5");
+		const fallback = getBundledModel("anthropic", "claude-opus-4-6");
+		if (!primary || !fallback) throw new Error("Expected bundled opus models");
+
+		const modelRegistry = new ModelRegistry(authStorage);
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const executed: Array<Record<string, unknown>> = [];
+		const callModels: string[] = [];
+		const mock = createMockModel({
+			responses: [
+				escapedTurn("tc-primary-1"),
+				escapedTurn("tc-primary-2"),
+				escapedTurn("tc-primary-3"),
+				literalTurn("tc-fallback-1"),
+				{ content: ["done"] },
+			],
+		});
+		const agent = new Agent({
+			initialState: { model: primary, systemPrompt: ["test"], tools: [askTool(executed)], messages: [] },
+			convertToLlm: identityConverter,
+			streamFn: (model, context, options) => {
+				callModels.push(selector(model));
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 3,
+			"retry.baseDelayMs": 10,
+		});
+		settings.setModelRole("default", selector(primary));
+		session = new AgentSession({ agent, sessionManager: manager, settings, modelRegistry });
+		session.setConfiguredModelChain("default", [selector(primary), selector(fallback)], "test");
+		const events: Array<{ from?: string; to?: string; reason?: string; attemptsUsed?: number }> = [];
+		session.subscribe(event => {
+			if (event.type === "model_fallback_switched") {
+				events.push({
+					from: event.from,
+					to: event.to,
+					reason: event.reason,
+					attemptsUsed: event.attemptsUsed,
+				});
+			}
+		});
+
+		await session.prompt("ask me");
+		await manager.flush();
+
+		expect(executed).toEqual([{ question: QUESTION }]);
+		expect(callModels).toEqual([
+			selector(primary),
+			selector(primary),
+			selector(primary),
+			selector(fallback),
+			selector(fallback),
+		]);
+		expect(events).toEqual([
+			expect.objectContaining({
+				from: selector(primary),
+				to: selector(fallback),
+				reason: "escaped_non_ascii",
+				attemptsUsed: 1,
+			}),
+		]);
+		const durable = manager.buildSessionContext().messages;
+		const persistedToolCallIds = durable.flatMap(message =>
+			message.role === "assistant"
+				? message.content.flatMap(block => (block.type === "toolCall" ? [block.id] : []))
+				: [],
+		);
+		expect(persistedToolCallIds).toEqual(["tc-fallback-1"]);
+		expect(hasUserText(durable, ESCAPED_NONASCII_RECOVERY_PROMPT)).toBe(false);
 	});
 });

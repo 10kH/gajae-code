@@ -18725,27 +18725,45 @@ export class AgentSession {
 			//
 			// The retries are un-charged by design, so a deterministic escaper
 			// would otherwise loop forever: each continuation is a fresh loop with
-			// a fresh in-loop resample budget, and the fallback chain never sees a
-			// charge to exhaust on. Bound them per logical run and fail closed to
-			// the terminal exhaustion message once the budget is spent — the same
-			// fail-closed answer the unmanaged path gives via the per-call
-			// rejection. New user turns reset the budget in #resetDefaultFallbackForNewTurn.
+			// a fresh in-loop resample budget. After that bounded recovery budget is
+			// spent, charge the active model once and advance to the next eligible
+			// fallback entry. Only the final eligible model returns the terminal
+			// fail-closed answer.
 			this.#escapedNonAsciiManagedRetries += 1;
 			if (this.#escapedNonAsciiManagedRetries > MAX_ESCAPED_NONASCII_MANAGED_RETRIES) {
+				const errorMessage =
+					`Managed fallback retried the escaped non-ASCII tool-call turn ${MAX_ESCAPED_NONASCII_MANAGED_RETRIES} times without a literal-UTF-8 re-issue; ` +
+					`giving up on this model so the next eligible fallback can re-issue with literal UTF-8.`;
+				const controller = this.#defaultFallbackChain();
+				controller.discardStartedAttempt();
+				const advanced = controller.recordEscapedArgumentsFailure(errorMessage);
+				this.#escapedNonAsciiManagedRetries = 0;
+				if (advanced && (await this.#advanceDefaultFallback(controller, "escaped_non_ascii", 1))) {
+					return {
+						type: "retry",
+						continuation: async ownership => {
+							if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+							await this.agent.continue({
+								...this.#managedFallbackPromptOptions(),
+								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
+							});
+						},
+					};
+				}
+				this.#defaultFallbackExhaustedLastTurn = true;
 				return this.#managedFallbackExhaustionDecision(
 					outcome.message,
-					`Managed fallback retried the escaped non-ASCII tool-call turn ${MAX_ESCAPED_NONASCII_MANAGED_RETRIES} times without a literal-UTF-8 re-issue; giving up so the run fails closed instead of looping.`,
+					`Managed fallback exhausted every eligible model after escaped non-ASCII tool-call retries; the run fails closed. ${errorMessage}`,
 				);
 			}
 			this.#defaultFallbackChain().discardStartedAttempt();
-			const steering = outcome.steeringPending === true;
 			return {
 				type: "retry",
 				continuation: async ownership => {
 					if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
 					await this.agent.continue({
 						...this.#managedFallbackPromptOptions(),
-						...(steering ? { transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage() } : {}),
+						transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
 					});
 				},
 			};
