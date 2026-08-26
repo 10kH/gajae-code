@@ -785,7 +785,9 @@ export function createInvocationReconciliation(
 					turnId: correlation.turnId,
 					error: formatPromptFailureForLocalLog(frame.error),
 				});
-				next.error ??= sanitizePromptFailure(frame.error);
+				const failure = sanitizePromptFailure(frame.error);
+				if (next.error === undefined || (next.error.code === "agent_failed" && failure.code !== "agent_failed"))
+					next.error = failure;
 			} else {
 				next.status = next.error === undefined ? "terminal_ok" : "failed";
 				next.terminalAt = Date.now();
@@ -3182,6 +3184,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				lifecycleActive: boolean;
 				lifecycleEpoch: number;
 				failureDiagnosticKeys: Set<string>;
+				failureDiagnosticCodes: Map<string, string>;
 				lifecycleTasks: Set<Promise<void>>;
 				/** Failure reasons whose durable agent_failed write failed; the
 				 * subsequent agent_end must re-record them before terminalizing or
@@ -3266,6 +3269,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		// diagnostic suppression or failed-write recovery state after the owner is
 		// no longer eligible to receive a delayed event.
 		owner.failureDiagnosticKeys.clear();
+		owner.failureDiagnosticCodes.clear();
 		owner.unrecordedFailureReasons?.clear();
 		for (const [token, binding] of lifecycleRunOwners) if (binding.state === owner) lifecycleRunOwners.delete(token);
 	};
@@ -3595,8 +3599,13 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			transitions = transitions.filter(
 				invocation => !current.failureDiagnosticKeys.has(correlationKey(invocation.correlation)),
 			);
+			const diagnosticCode = sanitizePromptFailure(
+				failureCause ?? Object.assign(new Error("agent run failed"), { code: "agent_failed" }),
+			).code;
 			for (const invocation of transitions)
 				current.failureDiagnosticKeys.add(correlationKey(invocation.correlation));
+			for (const invocation of transitions)
+				current.failureDiagnosticCodes.set(correlationKey(invocation.correlation), diagnosticCode);
 		}
 		// Observe whether the lifecycle publication actually landed: a terminal
 		// abort awaits this result so its durable row only claims
@@ -3703,6 +3712,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						removeLifecycleReferences(current, invocation.correlation);
 					if (!failedKeys.has(correlationKey(invocation.correlation)))
 						current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
+					if (!failedKeys.has(correlationKey(invocation.correlation)))
+						current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
 				}
 				options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 				resolveTerminalPublicationWaiters(observed);
@@ -3728,6 +3739,8 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			for (const invocation of transitions) removeLifecycleReferences(current, invocation.correlation);
 			for (const invocation of transitions)
 				current.failureDiagnosticKeys.delete(correlationKey(invocation.correlation));
+			for (const invocation of transitions)
+				current.failureDiagnosticCodes.delete(correlationKey(invocation.correlation));
 			options.onFailureDiagnosticKeyCountForTests?.(current.failureDiagnosticKeys.size);
 			for (const invocation of transitions)
 				if (invocation.kind === "prompt") current.deadlineManager.clear(invocation.correlation);
@@ -3782,15 +3795,19 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				}
 			: undefined;
 		const currentInvocation = endedBatch?.invocations[0] ?? owner?.activeInvocation;
-		const failureAlreadyPublished = currentInvocation
-			? owner?.failureDiagnosticKeys.has(
-					`${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`,
-				)
-			: false;
 		const failure = providerFailureFromAgentEnd(event);
+		const currentFailureKey = currentInvocation
+			? `${currentInvocation.correlation.commandId}:${currentInvocation.correlation.turnId}`
+			: undefined;
+		const failureAlreadyPublished =
+			currentFailureKey !== undefined && owner?.failureDiagnosticKeys.has(currentFailureKey)
+				? failure === undefined || owner.failureDiagnosticCodes.get(currentFailureKey) === failure.code
+				: false;
 		return trackLifecycle(async () => {
-			if (failure && !failureAlreadyPublished)
+			if (failure && !failureAlreadyPublished) {
+				if (currentFailureKey !== undefined) owner?.failureDiagnosticKeys.delete(currentFailureKey);
 				await emitLifecycle("agent_failed", ctx, failure, undefined, lifecycleOwner);
+			}
 			await emitLifecycle(
 				"agent_end",
 				ctx,
@@ -4553,6 +4570,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			lifecycleActive: false,
 			lifecycleEpoch: 0,
 			failureDiagnosticKeys: new Set(),
+			failureDiagnosticCodes: new Map(),
 			lifecycleTasks: new Set(),
 		};
 		lifecycleOwnerHolder.state = runtimeOwner;
@@ -4594,6 +4612,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					lifecycleActive: false,
 					lifecycleEpoch: 0,
 					failureDiagnosticKeys: new Set(),
+					failureDiagnosticCodes: new Map(),
 					lifecycleTasks: new Set(),
 				};
 				lifecycleOwnerHolder.state = failedRuntimeOwner;
