@@ -3196,6 +3196,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 	const retiredLifecycleOwnerTimers = new Map<RuntimeState, ReturnType<typeof setTimeout>>();
 	const skillRecoveryControllers = new Map<string, AbortController>();
 	const skillTerminalRecoveryControllers = new Map<string, AbortController>();
+	const quiescingLifecycleOwners = new WeakSet<RuntimeState>();
 	const ambiguousLifecycleIdentities = new Set<string>();
 	const lifecycleRunOwners = new Map<
 		string,
@@ -3513,6 +3514,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			correlation: InvocationCorrelation;
 		}): void => {
 			if (invocation.kind !== "skill") return;
+			if (quiescingLifecycleOwners.has(current)) return;
 			const recoveryKey = `${invocation.correlation.commandId}:${invocation.correlation.turnId}`;
 			if (skillTerminalRecoveryKeys.has(recoveryKey)) return;
 			skillTerminalRecoveryKeys.add(recoveryKey);
@@ -3981,6 +3983,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			correlation: InvocationCorrelation,
 			failureIntent?: { code: string; message: string },
 		): void => {
+			if (lifecycleOwnerHolder.quiescing) return;
 			const key = lifecycleCorrelationKey(correlation);
 			if (skillRecoveryTasks.has(key)) return;
 			const controller = new AbortController();
@@ -4537,6 +4540,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			quiesceInput: () => {
 				inputGate.quiescing = true;
 				lifecycleOwnerHolder.quiescing = true;
+				quiescingLifecycleOwners.add(runtimeOwner);
 			},
 			fenceGateResolutions: () => {
 				acceptingGateResolutions = false;
@@ -4578,6 +4582,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					quiesceInput: () => {
 						inputGate.quiescing = true;
 						lifecycleOwnerHolder.quiescing = true;
+						quiescingLifecycleOwners.add(failedRuntimeOwner);
 					},
 					fenceGateResolutions: () => {
 						acceptingGateResolutions = false;
