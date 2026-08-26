@@ -18,7 +18,7 @@ import {
 	setServerDisabled,
 	updateMCPServer,
 } from "../../runtime-mcp/config-writer";
-import { canonicalMCPResourceUri, MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
+import { canonicalMCPResourceUri, type MCPOAuthConfig, MCPOAuthFlow } from "../../runtime-mcp/oauth-flow";
 import {
 	clearSmitheryApiKey,
 	createSmitheryCliAuthSession,
@@ -70,6 +70,17 @@ interface OAuthFlowResult {
 
 type MCPAddScope = "user" | "project";
 type MCPAddTransport = "http" | "sse";
+
+type MCPAuthFlow = Pick<MCPOAuthFlow, "resolvedClientId" | "registeredClientSecret"> & {
+	login(): Promise<{ access: string; refresh: string; expires: number }>;
+};
+
+type MCPAuthCallbacks = {
+	onAuth(info: { url: string; instructions?: string }): void;
+	onProgress(message: string): void;
+};
+
+type MCPAuthFlowFactory = (config: MCPOAuthConfig, callbacks: MCPAuthCallbacks) => MCPAuthFlow;
 
 type MCPAddParsed = {
 	initialName?: string;
@@ -425,7 +436,7 @@ export class MCPCommandController {
 
 						try {
 							const oauthClientSecret = finalConfig.oauth?.clientSecret ?? "";
-							const oauthResult = await this.#handleOAuthFlow(
+							const oauthResult = await this.handleOAuthFlow(
 								finalConfig.url,
 								oauth.authorizationUrl,
 								oauth.tokenUrl,
@@ -493,7 +504,7 @@ export class MCPCommandController {
 				clientSecret: string,
 				scopes: string,
 			) => {
-				return await this.#handleOAuthFlow(endpointUrl, authUrl, tokenUrl, clientId, clientSecret, scopes);
+				return await this.handleOAuthFlow(endpointUrl, authUrl, tokenUrl, clientId, clientSecret, scopes);
 			},
 			async (config: MCPServerConfig) => {
 				return await this.#handleTestConnection(config);
@@ -518,7 +529,8 @@ export class MCPCommandController {
 	/**
 	 * Handle OAuth authentication flow for MCP server
 	 */
-	async #handleOAuthFlow(
+	/** Internal OAuth entry point; injectable flow construction keeps controller lifecycle coverage deterministic. */
+	async handleOAuthFlow(
 		endpointUrl: string,
 		authUrl: string,
 		tokenUrl: string,
@@ -529,6 +541,7 @@ export class MCPCommandController {
 		callbackPath?: string,
 		redirectUri?: string,
 		oauthMeta?: { issuer?: string; issuerResponseIssSupported?: boolean },
+		createFlow: MCPAuthFlowFactory = (config, callbacks) => new MCPOAuthFlow(config, callbacks),
 	): Promise<OAuthFlowResult> {
 		const authStorage = this.ctx.session.modelRegistry.authStorage;
 		let parsedAuthUrl: URL;
@@ -555,7 +568,7 @@ export class MCPCommandController {
 
 		try {
 			// Create OAuth flow
-			const flow = new MCPOAuthFlow(
+			const flow = createFlow(
 				{
 					authorizationUrl: authUrl,
 					tokenUrl: tokenEndpoint,
@@ -1368,7 +1381,7 @@ export class MCPCommandController {
 
 			this.#showMessage(["", theme.fg("muted", `Reauthorizing "${name}"...`), ""].join("\n"));
 
-			const oauthResult = await this.#handleOAuthFlow(
+			const oauthResult = await this.handleOAuthFlow(
 				found.config.url,
 				oauth.authorizationUrl,
 				oauth.tokenUrl,

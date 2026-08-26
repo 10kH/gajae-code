@@ -8,6 +8,7 @@ import { createOAuthUrlCopyLease } from "@gajae-code/coding-agent/modes/shared/o
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { type Component, Text } from "@gajae-code/tui";
+import { MCPCommandController } from "../src/modes/controllers/runtime-mcp-command-controller";
 
 // A login URL is a single unbreakable token, so any pane narrower than the URL
 // splits it across rows. The wrap layer re-opens the identical OSC 8 link on
@@ -204,5 +205,72 @@ describe("OAuth URL copy lease wiring", () => {
 			"https://example.test/oauth/two",
 			undefined,
 		]);
+	});
+
+	it("registers and releases the lease through the runtime MCP OAuth controller", async () => {
+		const pendingUrls: Array<string | undefined> = [];
+		const storedCredentials: unknown[] = [];
+		const ctx = {
+			keybindings: { getDisplayString: () => "Alt+Shift+U" },
+			beginOAuthUrlForCopy: (url: string) => {
+				pendingUrls.push(url);
+				return () => pendingUrls.push(undefined);
+			},
+			chatContainer: { addChild: () => {} },
+			ui: { requestRender: () => {} },
+			showError: () => {},
+			session: { modelRegistry: { authStorage: { set: async (value: unknown) => storedCredentials.push(value) } } },
+		} as unknown as InteractiveModeContext;
+		const controller = new MCPCommandController(ctx);
+		const authUrl = "https://auth.example.test/authorize?client_id=test-client";
+
+		await controller.handleOAuthFlow(
+			"https://mcp.example.test",
+			authUrl,
+			"https://auth.example.test/token",
+			"test-client",
+			"",
+			"",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			(config, callbacks) => ({
+				resolvedClientId: config.clientId,
+				registeredClientSecret: undefined,
+				login: async () => {
+					callbacks.onAuth({ url: authUrl });
+					return { access: "access", refresh: "refresh", expires: 1 };
+				},
+			}),
+		);
+
+		expect(pendingUrls).toEqual([authUrl, undefined]);
+		expect(storedCredentials).toHaveLength(1);
+
+		await expect(
+			controller.handleOAuthFlow(
+				"https://mcp.example.test",
+				authUrl,
+				"https://auth.example.test/token",
+				"test-client",
+				"",
+				"",
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				(_config, callbacks) => ({
+					resolvedClientId: "test-client",
+					registeredClientSecret: undefined,
+					login: async () => {
+						callbacks.onAuth({ url: authUrl });
+						throw new Error("cancelled");
+					},
+				}),
+			),
+		).rejects.toThrow("OAuth authentication failed: cancelled");
+
+		expect(pendingUrls).toEqual([authUrl, undefined, authUrl, undefined]);
 	});
 });
