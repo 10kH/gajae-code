@@ -745,7 +745,7 @@ export class InputController {
 		const queue = () => this.handleQueueSubmit();
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
 		this.ctx.editor.onQueue = () => this.#executeAction("app.message.queue");
-		this.#registerCommandPaletteAction("app.message.queue", queue);
+		this.#registerCommandPaletteAction("app.message.queue", queue, true);
 
 		this.ctx.editor.onViewportPageScroll = direction => this.ctx.ui.scrollViewportPages(direction);
 		this.ctx.editor.onViewportFollowLive = () => {

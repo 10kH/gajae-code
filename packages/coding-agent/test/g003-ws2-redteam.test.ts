@@ -176,6 +176,34 @@ describe("G003 WS2 red-team: command palette", () => {
 		expect(order).toEqual(["hide", "focus", "execute", "error"]);
 	});
 
+	it("does not expose idle queue submission through the draft palette", () => {
+		let idlePalette: CommandPalette | undefined;
+		const idle = new InputController(
+			createControllerContext({
+				editor: { getText: () => "draft", setText: () => {}, onSubmit: async () => {} } as never,
+				ui: {
+					showOverlay(component: CommandPalette) {
+						idlePalette = component;
+						return { hide: () => {} };
+					},
+					setFocus: () => {},
+					requestRender: () => {},
+				} as never,
+			}) as never,
+		);
+		expect(idle.actionRegistry.isAvailable("app.message.queue")).toBe(false);
+		idle.openCommandPalette();
+		expect(idlePalette?.getEntries().some(entry => entry.id === "action:app.message.queue")).toBe(false);
+
+		const busy = new InputController(
+			createControllerContext({
+				editor: { getText: () => "draft", setText: () => {}, onSubmit: async () => {} } as never,
+				session: { isStreaming: true } as never,
+			}) as never,
+		);
+		expect(busy.actionRegistry.isAvailable("app.message.queue")).toBe(true);
+	});
+
 	it("does not open a palette over an active transcript overlay", () => {
 		let overlays = 0;
 		const ctx = createControllerContext({
