@@ -16,9 +16,13 @@ const masterEnv = { GJC_MASTER_CAPABILITY: capability, GJC_SESSION_ID: "master-c
 const epoch = async () => "epoch-cli";
 
 describe("gjc sdk spawn CLI", () => {
-	const attestation = (attestationEpoch: string, launchProcessIncarnation: string) => ({
+	const attestation = (
+		attestationEpoch: string,
+		launchProcessIncarnation: string,
+		ownerSessionId = "master-cli-owner",
+	) => ({
 		version: 2 as const,
-		ownerSessionId: "master-cli-owner",
+		ownerSessionId,
 		launchPid: 42,
 		launchProcessIncarnation,
 		role: "master" as const,
@@ -30,8 +34,10 @@ describe("gjc sdk spawn CLI", () => {
 		endpointGeneration: number,
 		live = true,
 		processIncarnation = "process-42",
+		sessionId = "master-cli-owner",
+		ownerSessionId = "master-cli-owner",
 	): IndexedSession => ({
-		sessionId: "master-cli-owner",
+		sessionId,
 		locator: { cwd: "/repo", worktreeRoot: "/repo", stateRoot: "/state" },
 		endpointGeneration,
 		pid: 42,
@@ -41,7 +47,7 @@ describe("gjc sdk spawn CLI", () => {
 		identityProvenance: "composite",
 		ambiguous: false,
 		terminal: false,
-		masterRole: attestation(epoch, processIncarnation),
+		masterRole: attestation(epoch, processIncarnation, ownerSessionId),
 	});
 
 	it("selects the older live epoch when a newer crashed master registration remains", () => {
@@ -66,6 +72,12 @@ describe("gjc sdk spawn CLI", () => {
 		];
 
 		expect(selectNewestMasterAttestationEpoch(rows, "master-cli-owner")).toBe("resumed-epoch");
+
+		const successorRows = [
+			row(40, "lineage-epoch", 0, true, "process-42", "master-cli-successor", "master-cli-owner"),
+			row(41, "lineage-epoch", 1, true, "process-42", "master-cli-successor", "master-cli-owner"),
+		];
+		expect(selectNewestMasterAttestationEpoch(successorRows, "master-cli-owner")).toBe("lineage-epoch");
 	});
 
 	it("requires --cwd and --prompt", async () => {

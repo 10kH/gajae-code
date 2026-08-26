@@ -103,7 +103,6 @@ export function selectNewestMasterAttestationEpoch(
 	for (const row of rows) {
 		const attestation = row.masterRole;
 		if (
-			row.sessionId !== ownerSessionId ||
 			!Number.isSafeInteger(row.indexSeq) ||
 			attestation === undefined ||
 			attestation.version !== 2 ||
