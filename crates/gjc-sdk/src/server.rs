@@ -120,7 +120,10 @@ enum DirectCommand {
 	},
 	/// Acknowledged only after every directed frame queued before it has
 	/// finished on this connection's writer path.
-	DirectedDeliveryBarrier(oneshot::Sender<()>),
+	DirectedDeliveryBarrier {
+		settled: oneshot::Sender<()>,
+		pending: Arc<AtomicBool>,
+	},
 	ReevaluateAsk,
 }
 
@@ -254,6 +257,7 @@ struct Connection {
 	negotiation:            Negotiation,
 	delivered:              Option<Delivered>,
 	queued_directed_frames: Arc<AtomicUsize>,
+	barrier_pending:        Arc<AtomicBool>,
 	tx:                     mpsc::UnboundedSender<DirectCommand>,
 }
 
@@ -831,29 +835,56 @@ impl ServerHandle {
 		})
 	}
 
-	/// Wait until every currently authenticated connection has processed all
+	/// Wait until the selected authenticated connections have processed all
 	/// directed frames accepted before this call. The barrier is serialized on
 	/// each connection's writer queue, so a later broadcast cannot overtake an
-	/// earlier positioned or excluded-recipient delivery.
+	/// earlier positioned or excluded-recipient delivery. A selected connection
+	/// is captured by id, so connections that join after the prerequisite frame
+	/// snapshot cannot acknowledge a barrier for an identity they never
+	/// received.
 	///
 	/// Returns `false` when a connection closes before acknowledging its barrier
 	/// or the bounded wait expires. With no connected clients there is nothing
 	/// to order and the barrier succeeds immediately.
-	pub async fn wait_for_directed_delivery(&self, wait: Duration) -> bool {
+	pub async fn wait_for_directed_delivery(
+		&self,
+		connection_ids: Option<&[String]>,
+		wait: Duration,
+	) -> bool {
 		let senders = self
 			.state
 			.connections
 			.lock()
-			.values()
-			.map(|connection| connection.tx.clone())
+			.iter()
+			.filter(|(connection_id, _)| {
+				connection_ids.is_none_or(|ids| ids.iter().any(|id| id == *connection_id))
+			})
+			.map(|(_, connection)| (connection.tx.clone(), Arc::clone(&connection.barrier_pending)))
 			.collect::<Vec<_>>();
+		if connection_ids.is_some_and(|ids| ids.len() != senders.len()) {
+			return false;
+		}
 		let mut receipts = Vec::with_capacity(senders.len());
-		for sender in senders {
-			let (settled_tx, settled_rx) = oneshot::channel();
-			if sender
-				.send(DirectCommand::DirectedDeliveryBarrier(settled_tx))
+		for (sender, pending) in senders {
+			if pending
+				.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
 				.is_err()
 			{
+				return false;
+			}
+			let (settled_tx, settled_rx) = oneshot::channel();
+			let pending_for_command = Arc::clone(&pending);
+			if sender
+				.send(DirectCommand::DirectedDeliveryBarrier {
+					settled: settled_tx,
+					pending: pending_for_command,
+				})
+				.is_err()
+			{
+				// This command never entered the writer queue, so its reservation is
+				// safe to release. Earlier reservations remain held until their
+				// already-enqueued barriers are processed.
+				pending.store(false, Ordering::Release);
 				return false;
 			}
 			receipts.push(settled_rx);
@@ -1402,6 +1433,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 	let generation = "0".to_owned();
 	let (direct_tx, mut direct_rx) = mpsc::unbounded_channel::<DirectCommand>();
 	let queued_directed_frames = Arc::new(AtomicUsize::new(0));
+	let barrier_pending = Arc::new(AtomicBool::new(false));
 	let mut rx = state.tx.subscribe();
 	let (mut write, mut read) = ws.split();
 	let hello = ServerMessage::Hello(ServerHello {
@@ -1434,6 +1466,7 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 			negotiation:            Negotiation::AwaitingHello,
 			delivered:              None,
 			queued_directed_frames: Arc::clone(&queued_directed_frames),
+			barrier_pending:        Arc::clone(&barrier_pending),
 			tx:                     direct_tx.clone(),
 		});
 
@@ -1485,7 +1518,8 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 								requires_tool_activity,
 							) && write.send(Message::Text(json)).await.is_ok()
 						},
-						DirectCommand::DirectedDeliveryBarrier(settled) => {
+						DirectCommand::DirectedDeliveryBarrier { settled, pending } => {
+							pending.store(false, Ordering::Release);
 							let _ = settled.send(());
 							true
 						},
@@ -1575,7 +1609,8 @@ async fn handle_conn(stream: TcpStream, state: Arc<ServerState>, cancel: Cancell
 							break;
 						}
 					},
-					DirectCommand::DirectedDeliveryBarrier(settled) => {
+					DirectCommand::DirectedDeliveryBarrier { settled, pending } => {
+						pending.store(false, Ordering::Release);
 						let _ = settled.send(());
 					},
 					DirectCommand::ReevaluateAsk => {
@@ -2029,6 +2064,7 @@ mod tests {
 				negotiation: Negotiation::Negotiated,
 				delivered: None,
 				queued_directed_frames: Arc::clone(&queued),
+				barrier_pending: Arc::new(AtomicBool::new(false)),
 				tx,
 			});
 
@@ -2069,6 +2105,7 @@ mod tests {
 				negotiation: Negotiation::Negotiated,
 				delivered: None,
 				queued_directed_frames: Arc::clone(&queued),
+				barrier_pending: Arc::new(AtomicBool::new(false)),
 				tx,
 			});
 
@@ -2081,7 +2118,7 @@ mod tests {
 			let handle = handle.clone();
 			tokio::spawn(async move {
 				handle
-					.wait_for_directed_delivery(Duration::from_secs(1))
+					.wait_for_directed_delivery(Some(&["slow".into()]), Duration::from_secs(1))
 					.await
 			})
 		};
@@ -2090,12 +2127,59 @@ mod tests {
 			panic!("expected directed frame before its barrier");
 		};
 		release_directed_frame(&queued);
-		let DirectCommand::DirectedDeliveryBarrier(settled) =
+		let DirectCommand::DirectedDeliveryBarrier { settled, .. } =
 			rx.recv().await.expect("directed delivery barrier")
 		else {
 			panic!("expected directed delivery barrier after the frame");
 		};
+		assert!(
+			!handle
+				.wait_for_directed_delivery(Some(&["slow".into()]), Duration::from_millis(10))
+				.await,
+			"a timed-out barrier must not enqueue a second barrier while the first is pending"
+		);
 		assert!(!barrier.is_finished());
+		settled.send(()).expect("barrier waiter remains live");
+		assert!(barrier.await.expect("barrier task"));
+		handle.stop();
+	}
+
+	#[tokio::test]
+	async fn directed_delivery_barrier_only_targets_snapshot_recipients() {
+		let handle = start(ServerConfig::new("s", "secret")).await.unwrap();
+		let (first_tx, mut first_rx) = mpsc::unbounded_channel::<DirectCommand>();
+		let (late_tx, mut late_rx) = mpsc::unbounded_channel::<DirectCommand>();
+		for (id, tx) in [("first", first_tx), ("late", late_tx)] {
+			handle
+				.state
+				.connections
+				.lock()
+				.insert(id.into(), Connection {
+					generation: "generation".into(),
+					capabilities: Vec::new(),
+					negotiation: Negotiation::Negotiated,
+					delivered: None,
+					queued_directed_frames: Arc::new(AtomicUsize::new(0)),
+					barrier_pending: Arc::new(AtomicBool::new(false)),
+					tx,
+				});
+		}
+		let ids = vec!["first".to_owned()];
+		let barrier = {
+			let handle = handle.clone();
+			let ids = ids.clone();
+			tokio::spawn(async move {
+				handle
+					.wait_for_directed_delivery(Some(&ids), Duration::from_secs(1))
+					.await
+			})
+		};
+		let DirectCommand::DirectedDeliveryBarrier { settled, .. } =
+			first_rx.recv().await.expect("selected recipient barrier")
+		else {
+			panic!("expected selected recipient barrier");
+		};
+		assert!(late_rx.try_recv().is_err(), "late recipients must not receive the barrier");
 		settled.send(()).expect("barrier waiter remains live");
 		assert!(barrier.await.expect("barrier task"));
 		handle.stop();
@@ -2115,13 +2199,14 @@ mod tests {
 				negotiation: Negotiation::Negotiated,
 				delivered: None,
 				queued_directed_frames: Arc::new(AtomicUsize::new(0)),
+				barrier_pending: Arc::new(AtomicBool::new(false)),
 				tx,
 			});
 		drop(rx);
 
 		assert!(
 			!handle
-				.wait_for_directed_delivery(Duration::from_millis(100))
+				.wait_for_directed_delivery(Some(&["closed".into()]), Duration::from_millis(100))
 				.await
 		);
 		handle.stop();
@@ -2150,7 +2235,10 @@ mod tests {
 		));
 		assert!(
 			handle
-				.wait_for_directed_delivery(Duration::from_secs(1))
+				.wait_for_directed_delivery(
+					Some(std::slice::from_ref(&connection_id)),
+					Duration::from_secs(1)
+				)
 				.await
 		);
 		handle.note_idle(idle("ordered-idle"));
@@ -3963,6 +4051,7 @@ mod tests {
 				negotiation: Negotiation::Negotiated,
 				delivered: None,
 				queued_directed_frames: Arc::new(AtomicUsize::new(0)),
+				barrier_pending: Arc::new(AtomicBool::new(false)),
 				tx,
 			});
 		let task = {

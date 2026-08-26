@@ -242,13 +242,13 @@ export declare class NotificationServer {
    */
   supportsPositionedRawExclusion(): boolean
   /** Send a validated, bounded JSON envelope to one connected v3 SDK client. */
-  sendTo(connectionId: string, json: string): void
+  sendTo(connectionId: string, json: string): boolean
   /**
    * Wait until every connected writer has processed the directed frames that
    * were accepted before this call. This preserves ordering when a dependent
    * frame uses the independent broadcast lane.
    */
-  waitForDirectedDelivery(timeoutMs: number): Promise<boolean>
+  waitForDirectedDelivery(timeoutMs: number, connectionIds?: Array<string> | undefined | null): Promise<boolean>
   /**
    * Publish a replayable `session_ready` readiness signal. `ready_json` is a
    * JSON `SessionReady`. Unlike [`Self::push_frame`], this frame is buffered

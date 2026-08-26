@@ -722,26 +722,27 @@ impl NotificationServer {
 
 	/// Send a validated, bounded JSON envelope to one connected v3 SDK client.
 	#[napi]
-	pub fn send_to(&self, connection_id: String, json: String) -> Result<()> {
+	#[must_use]
+	pub fn send_to(&self, connection_id: String, json: String) -> Result<bool> {
 		let handle = self.handle()?;
-		if handle.send_to(&connection_id, json) {
-			Ok(())
-		} else {
-			Err(Error::from_reason(
-				"SDK connection is unavailable or directed frame is invalid, oversized, or \
-				 unauthorized, or its writer backlog is full",
-			))
-		}
+		Ok(handle.send_to(&connection_id, json))
 	}
 
 	/// Wait until every connected writer has processed the directed frames that
 	/// were accepted before this call. This preserves ordering when a dependent
 	/// frame uses the independent broadcast lane.
 	#[napi]
-	pub async fn wait_for_directed_delivery(&self, timeout_ms: u32) -> Result<bool> {
+	pub async fn wait_for_directed_delivery(
+		&self,
+		timeout_ms: u32,
+		connection_ids: Option<Vec<String>>,
+	) -> Result<bool> {
 		let handle = self.with_handle(Clone::clone)?;
 		Ok(handle
-			.wait_for_directed_delivery(Duration::from_millis(u64::from(timeout_ms)))
+			.wait_for_directed_delivery(
+				connection_ids.as_deref(),
+				Duration::from_millis(u64::from(timeout_ms)),
+			)
 			.await)
 	}
 
