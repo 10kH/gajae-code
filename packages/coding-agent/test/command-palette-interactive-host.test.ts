@@ -453,6 +453,31 @@ describe("command palette InteractiveMode host", () => {
 		}
 	});
 
+	it("restores a nonempty draft before a selected action reports an error", async () => {
+		const host = await createHost();
+		const editor = host.mode.editor;
+		editor.setText("preserve this action draft");
+		editor.handleInput("\u001b[D");
+		const cursor = editor.getCursor();
+		const failure = new Error("dashboard action failed");
+		vi.spyOn(host.mode, "showSessionsDashboard").mockImplementation(() => {
+			throw failure;
+		});
+		const showError = vi.spyOn(host.mode, "showError");
+
+		const palette = await openPalette(host);
+		expect(palette.getEntries().some(entry => entry.id === "action:app.session.dashboard")).toBe(true);
+		select(palette, "sessions dashboard");
+		await waitFor(() => showError.mock.calls.length === 1, "the dashboard action error");
+
+		expect(host.mode.editor).toBe(editor);
+		expect(editor.getText()).toBe("preserve this action draft");
+		expect(editor.getCursor()).toEqual(cursor);
+		expect(host.mode.editorContainer.children).toEqual([editor]);
+		expect(host.focus).toHaveBeenLastCalledWith(editor);
+		expect(showError).toHaveBeenCalledWith(expect.stringContaining("dashboard action failed"));
+	});
+
 	it("allows a draft palette and blocks overlapping palette commands without leaking a modal", async () => {
 		const host = await createHost();
 		const status = vi.spyOn(host.mode, "showStatus");
