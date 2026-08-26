@@ -133,6 +133,7 @@ export class MCPAddWizard extends Container {
 		| null = null;
 	#onTestConnectionCallback: ((config: MCPServerConfig) => Promise<void>) | null = null;
 	#onRenderCallback: (() => void) | null = null;
+	#onCommandPaletteCallback: ((keyData: string) => boolean) | null = null;
 	#disposed = false;
 	#transitionTimers = new Set<NodeJS.Timeout>();
 	#healthCheckSpinner?: NodeJS.Timeout;
@@ -152,6 +153,7 @@ export class MCPAddWizard extends Container {
 		) => Promise<MCPAddWizardOAuthResult>,
 		onTestConnection?: (config: MCPServerConfig) => Promise<void>,
 		onRender?: () => void,
+		onCommandPalette?: (keyData: string) => boolean,
 		initialName?: string,
 	) {
 		super();
@@ -160,6 +162,7 @@ export class MCPAddWizard extends Container {
 		this.#onOAuthCallback = onOAuth ?? null;
 		this.#onTestConnectionCallback = onTestConnection ?? null;
 		this.#onRenderCallback = onRender ?? null;
+		this.#onCommandPaletteCallback = onCommandPalette ?? null;
 		if (initialName && initialName.trim().length > 0) {
 			this.#state.name = initialName.trim();
 			this.#currentStep = "transport";
@@ -509,6 +512,8 @@ export class MCPAddWizard extends Container {
 	}
 
 	handleInput(keyData: string): void {
+		if (this.#onCommandPaletteCallback?.(keyData) === true) return;
+
 		// Handle Ctrl+C to cancel wizard immediately
 		if (keyData === "\x03") {
 			// Ctrl+C pressed - cancel wizard

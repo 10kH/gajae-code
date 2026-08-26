@@ -5,6 +5,7 @@ import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "@gajae-code/codi
 import { getThemeByName, setThemeInstance } from "@gajae-code/coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@gajae-code/coding-agent/modes/types";
 import { type Component, Text } from "@gajae-code/tui";
+import { MCPAddWizard } from "../src/modes/components/runtime-mcp-add-wizard";
 import { MCPCommandController } from "../src/modes/controllers/runtime-mcp-command-controller";
 
 // A login URL is a single unbreakable token, so any pane narrower than the URL
@@ -288,5 +289,25 @@ describe("OAuth URL copy lease wiring", () => {
 		).rejects.toThrow("OAuth authentication failed: cancelled");
 
 		expect(pendingUrls).toEqual([authUrl, undefined, authUrl, undefined]);
+	});
+
+	it("routes the command-palette chord through a focused MCP wizard", () => {
+		let receivedKey = "";
+		const wizard = new MCPAddWizard(
+			() => {},
+			() => {},
+			undefined,
+			undefined,
+			undefined,
+			keyData => {
+				receivedKey = keyData;
+				return true;
+			},
+		);
+
+		wizard.handleInput("\x10");
+
+		expect(receivedKey).toBe("\x10");
+		wizard.dispose();
 	});
 });

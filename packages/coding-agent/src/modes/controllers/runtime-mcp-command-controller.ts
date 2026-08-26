@@ -5,7 +5,7 @@
  */
 import * as path from "node:path";
 import { resolveMCPOAuthResourceOrigin, resolveMCPOAuthTokenEndpoint } from "@gajae-code/ai/core";
-import { Spacer, Text } from "@gajae-code/tui";
+import { matchesKey, type OverlayHandle, Spacer, Text } from "@gajae-code/tui";
 import { getMCPConfigPath, getProjectDir } from "@gajae-code/utils";
 import type { SourceMeta } from "../../capability/types";
 import { analyzeAuthError, discoverOAuthEndpoints, MCPManager } from "../../runtime-mcp";
@@ -38,6 +38,7 @@ import type { MCPAuthConfig, MCPServerConfig } from "../../runtime-mcp/types";
 import type { OAuthCredential } from "../../session/auth-storage";
 import { shortenPath } from "../../tools/render-utils";
 import { openPath } from "../../utils/open";
+import { CommandPalette, type CommandPaletteEntry } from "../components/command-palette";
 import { MCPAddWizard } from "../components/runtime-mcp-add-wizard";
 import { parseCommandArgs } from "../shared";
 import { buildOAuthLoginAnchor, createOAuthUrlCopyLease } from "../shared/oauth-url-copy";
@@ -391,6 +392,46 @@ export class MCPCommandController {
 		return { keyword, scope, limit, semantic };
 	}
 
+	#openWizardOAuthCommandPalette(wizard: MCPAddWizard, keyData: string): boolean {
+		if (this.ctx.hasOAuthUrlForCopy?.() !== true) return false;
+		if (!this.ctx.keybindings.getKeys("app.commandPalette.open").some(key => matchesKey(keyData, key))) return false;
+
+		let overlayHandle: OverlayHandle | undefined;
+		const close = (): void => {
+			overlayHandle?.hide();
+			this.ctx.ui.setFocus(wizard);
+			this.ctx.ui.requestRender(true);
+		};
+		const copyEntry: CommandPaletteEntry = {
+			id: "action:app.clipboard.copyOAuthUrl",
+			label: "Copy OAuth URL",
+			description: "Copy the pending OAuth authorization URL",
+			keybinding: this.ctx.keybindings.getDisplayString("app.clipboard.copyOAuthUrl") || undefined,
+			handler: async () => {
+				await this.ctx.copyOAuthUrl();
+			},
+		};
+		const palette = new CommandPalette(
+			[copyEntry],
+			entry => {
+				close();
+				void Promise.resolve(entry.handler?.()).catch(error => {
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
+				});
+			},
+			close,
+		);
+		overlayHandle = this.ctx.ui.showOverlay(palette, {
+			anchor: "bottom-center",
+			width: "100%",
+			maxHeight: "100%",
+			margin: 0,
+		});
+		this.ctx.ui.setFocus(palette);
+		this.ctx.ui.requestRender();
+		return true;
+	}
+
 	/**
 	 * Handle /mcp add - Launch interactive wizard or quick-add from args
 	 */
@@ -487,7 +528,8 @@ export class MCPCommandController {
 		};
 
 		// Create wizard with OAuth handler and connection test
-		const wizard = new MCPAddWizard(
+		let wizard: MCPAddWizard;
+		wizard = new MCPAddWizard(
 			async (name: string, config: MCPServerConfig, scope: "user" | "project") => {
 				done();
 				await this.#handleWizardComplete(name, config, scope);
@@ -512,6 +554,7 @@ export class MCPCommandController {
 			() => {
 				this.ctx.ui.requestRender();
 			},
+			keyData => this.#openWizardOAuthCommandPalette(wizard, keyData),
 			parsed.initialName,
 		);
 

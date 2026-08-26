@@ -352,10 +352,6 @@ export class InputController {
 				this.#executeAction("app.clipboard.copyOAuthUrl");
 				return { consume: true };
 			}
-			if (this.ctx.keybindings.getKeys("app.commandPalette.open").some(key => matchesKey(data, key))) {
-				this.#executeAction("app.commandPalette.open");
-				return { consume: true };
-			}
 		});
 	}
 
