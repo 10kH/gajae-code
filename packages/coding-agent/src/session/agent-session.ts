@@ -18841,6 +18841,7 @@ export class AgentSession {
 		return {
 			...discarded,
 			content: [{ type: "text", text: "" }],
+			providerPayload: undefined,
 			stopReason: "error",
 			errorMessage,
 			timestamp: Date.now(),

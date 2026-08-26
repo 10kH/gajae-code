@@ -163,10 +163,11 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 
 		// Terminal error still names escaped non-ASCII, retains original cause.
 		const last = durable.findLast(message => message.role === "assistant") as
-			| { stopReason?: string; errorMessage?: string }
+			| { stopReason?: string; errorMessage?: string; providerPayload?: unknown }
 			| undefined;
 		expect(last?.stopReason === "error" || last?.stopReason === "exhausted").toBe(true);
 		expect(last?.errorMessage ?? "").toContain("escaped non-ASCII");
+		expect(last?.providerPayload).toBeUndefined();
 
 		// Steering instructions are transient and never durable.
 		expect(hasUserText(durable, ESCAPED_NONASCII_RECOVERY_PROMPT)).toBe(false);
