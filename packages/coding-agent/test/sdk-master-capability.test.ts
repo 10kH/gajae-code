@@ -35,10 +35,7 @@ async function writeIndex(agentDir: string, events: readonly SessionIndexEvent[]
 	await Bun.write(path.join(directory, "index.jsonl"), `${events.map(row => JSON.stringify(row)).join("\n")}\n`);
 }
 
-async function startHost(
-	stateRoot: string,
-	answer: "correct" | "wrong" | "replay",
-): Promise<TestHost> {
+async function startHost(stateRoot: string, answer: "correct" | "wrong" | "replay"): Promise<TestHost> {
 	const token = "host-token-e2e";
 	const server = Bun.serve<{ connectionId: string }>({
 		hostname: "127.0.0.1",
@@ -224,11 +221,7 @@ describe("master capability effective-host verification", () => {
 
 			host.stop();
 			host = await startHost(stateRoot, "replay");
-			await fs.utimes(
-				host.endpointPath,
-				effective.endpointMtimeMs! / 1_000,
-				effective.endpointMtimeMs! / 1_000,
-			);
+			await fs.utimes(host.endpointPath, effective.endpointMtimeMs! / 1_000, effective.endpointMtimeMs! / 1_000);
 			await writeIndex(agentDir, [direct, effective]);
 			expect(await spawn(broker)).toMatchObject({ ok: false, error: { code: "spawn_failed" } });
 
