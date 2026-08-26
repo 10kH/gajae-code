@@ -18926,6 +18926,19 @@ export class AgentSession {
 	): Promise<boolean> {
 		const promptAbortSignal = this.#promptPreflightAbortController.signal;
 		const cancellationSignal = signal ? AbortSignal.any([signal, promptAbortSignal]) : promptAbortSignal;
+		const awaitWithCancellation = async <T>(pending: Promise<T>) => {
+			const cancellation = Promise.withResolvers<"aborted">();
+			const onAbort = () => cancellation.resolve("aborted");
+			cancellationSignal.addEventListener("abort", onAbort, { once: true });
+			try {
+				return await Promise.race([
+					pending.then(value => ({ kind: "resolved" as const, value })),
+					cancellation.promise.then(() => ({ kind: "aborted" as const })),
+				]);
+			} finally {
+				cancellationSignal.removeEventListener("abort", onAbort);
+			}
+		};
 		const rollbackCancelled = async (): Promise<boolean> => {
 			if (rollbackState) controller.restoreRuntimeState(rollbackState);
 			if (previousModel && this.model !== previousModel) {
@@ -18947,26 +18960,27 @@ export class AgentSession {
 			const selector = controller.currentSelector();
 			if (!selector) return false;
 			const profileAliasIntent = this.#persistedModelProfileAliasIntent("default");
-			const resolved = profileAliasIntent
-				? await resolveModelChainWithAuth(
-						[selector],
-						this.#modelRegistry,
-						this.settings,
-						this.credentialSessionId,
-						{
+			const profileResolution = profileAliasIntent
+				? await awaitWithCancellation(
+						resolveModelChainWithAuth([selector], this.#modelRegistry, this.settings, this.credentialSessionId, {
 							managedFallback: true,
 							...profileAliasIntent,
 							canonicalSessionId: this.agent.providerSessionId ?? this.sessionId,
 							credentialSessionId: this.credentialSessionId,
-						},
+						}),
 					)
-				: resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
-						settings: this.settings,
-						matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
-						modelRegistry: this.#modelRegistry,
-						sessionId: this.agent.providerSessionId ?? this.sessionId,
-						credentialSessionId: this.credentialSessionId,
-					});
+				: undefined;
+			if (profileResolution?.kind === "aborted") return await rollbackCancelled();
+			const resolved =
+				profileResolution?.kind === "resolved"
+					? profileResolution.value
+					: resolveModelRoleValue(selector, this.#modelRegistry.getAvailable(), {
+							settings: this.settings,
+							matchPreferences: { usageOrder: this.settings.getStorage()?.getModelUsageOrder() },
+							modelRegistry: this.#modelRegistry,
+							sessionId: this.agent.providerSessionId ?? this.sessionId,
+							credentialSessionId: this.credentialSessionId,
+						});
 			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
 				return await rollbackCancelled();
 			if (!resolved.model) {
@@ -18982,22 +18996,11 @@ export class AgentSession {
 				controller.onResolutionSkip(managedCursorUnavailable);
 				continue;
 			}
-			const cancellation = Promise.withResolvers<"aborted">();
-			const onAbort = () => cancellation.resolve("aborted");
-			cancellationSignal.addEventListener("abort", onAbort, { once: true });
-			let keyResult: { kind: "resolved"; key: string | undefined } | { kind: "aborted" };
-			try {
-				keyResult = await Promise.race([
-					this.#modelRegistry
-						.getApiKey(resolved.model, this.credentialSessionId)
-						.then(key => ({ kind: "resolved" as const, key })),
-					cancellation.promise.then(() => ({ kind: "aborted" as const })),
-				]);
-			} finally {
-				cancellationSignal.removeEventListener("abort", onAbort);
-			}
+			const keyResult = await awaitWithCancellation(
+				this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId),
+			);
 			if (keyResult.kind === "aborted") return await rollbackCancelled();
-			const key = keyResult.key;
+			const key = keyResult.value;
 			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
 				return await rollbackCancelled();
 			if (!isAuthenticated(key) && key !== kNoAuth) {
