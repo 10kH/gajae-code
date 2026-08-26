@@ -113,17 +113,8 @@ export class InputController {
 			context: undefined,
 			showError: actionId => this.ctx.showError(actionId),
 		});
-		this.ctx.ui.addInputListener?.(data => {
-			if (
-				!this.ctx.hasOAuthUrlForCopy() ||
-				!this.ctx.keybindings.getKeys("app.clipboard.copyOAuthUrl").some(key => matchesKey(data, key))
-			) {
-				return;
-			}
-			this.#executeAction("app.clipboard.copyOAuthUrl");
-			return { consume: true };
-		});
 		this.#registerActions();
+		this.#installOAuthCopyListener();
 	}
 
 	#registerActions(): void {
@@ -343,12 +334,29 @@ export class InputController {
 	}
 
 	#globalInterruptUnsubscribe: (() => void) | undefined;
+	#oauthCopyUnsubscribe: (() => void) | undefined;
 	#draftClearEscapeText: string | undefined;
 
 	#resetEscapeGestures(): void {
 		this.ctx.lastEscapeTime = 0;
 		this.ctx.lastComposerClearEscapeTime = 0;
 		this.#draftClearEscapeText = undefined;
+	}
+
+	#installOAuthCopyListener(): void {
+		if (typeof this.ctx.ui.addInputListener !== "function") return;
+		this.#oauthCopyUnsubscribe?.();
+		this.#oauthCopyUnsubscribe = this.ctx.ui.addInputListener(data => {
+			if (this.ctx.hasOAuthUrlForCopy?.() !== true) return;
+			if (this.ctx.keybindings.getKeys("app.clipboard.copyOAuthUrl").some(key => matchesKey(data, key))) {
+				this.#executeAction("app.clipboard.copyOAuthUrl");
+				return { consume: true };
+			}
+			if (this.ctx.keybindings.getKeys("app.commandPalette.open").some(key => matchesKey(data, key))) {
+				this.#executeAction("app.commandPalette.open");
+				return { consume: true };
+			}
+		});
 	}
 
 	#armDraftClearEscape(text: string, now: number): void {
@@ -599,6 +607,7 @@ export class InputController {
 			return bypassAutocomplete;
 		};
 		this.#installGlobalInterruptListener();
+		this.#installOAuthCopyListener();
 
 		// An open btw panel must stay dismissable with Esc even while another
 		// controller (auto-compaction, auto-retry, manual compaction, etc.) has

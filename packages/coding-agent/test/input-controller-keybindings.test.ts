@@ -72,6 +72,7 @@ async function createContext(options?: {
 	const keyMap: Record<string, string[]> = {
 		"app.model.selectTemporary": ["ctrl+y"],
 		"app.model.select": ["ctrl+l"],
+		"app.commandPalette.open": ["ctrl+p"],
 		"app.message.queue": ["alt+enter"],
 		"app.message.followUp": options?.followUpKeys ?? [],
 		"app.message.dequeue": ["alt+up", "alt+down"],
@@ -428,6 +429,19 @@ describe("InputController keybinding setup", () => {
 		await Promise.resolve();
 		expect(spies.copyOAuthUrl).toHaveBeenCalledTimes(1);
 		expect(ctx.ui.setFocus as ReturnType<typeof vi.fn>).not.toHaveBeenCalled();
+	});
+
+	it("opens the command palette globally while an OAuth URL is pending", async () => {
+		const { InputController, ctx, spies } = await createContext();
+		const showCommandPalette = vi.fn();
+		ctx.showCommandPalette = showCommandPalette;
+		spies.hasOAuthUrlForCopy.mockReturnValue(true);
+		new InputController(ctx);
+		const addInputListener = ctx.ui.addInputListener as ReturnType<typeof vi.fn>;
+		const listener = addInputListener.mock.calls[0]?.[0] as (data: string) => { consume: boolean } | undefined;
+
+		expect(listener("\x10")).toEqual({ consume: true });
+		expect(showCommandPalette).toHaveBeenCalledTimes(1);
 	});
 
 	it("enables model cycling from configured role candidates without a model scope", async () => {
