@@ -15,6 +15,8 @@ export interface MasterPeerSnapshotMessage {
 export interface MasterPeerSnapshotContributorInput {
 	readonly lifecycle: MasterPeerSnapshotLifecycle;
 	readonly ownerSessionId: string;
+	/** Current transcript/session identity; differs from ownerSessionId after a branch or switch. */
+	readonly getSessionId?: () => string;
 	readonly scope: MasterScope;
 	/** Live cwd accessor; resolved at injection time, not at registration. */
 	readonly getCwd: () => string;
@@ -45,6 +47,7 @@ export function createMasterPeerSnapshotContributor(
 				lifecycle: input.lifecycle,
 				actor: { id: input.ownerSessionId, namespace: "sdk:master-snapshot" },
 				ownerSessionId: input.ownerSessionId,
+				...(input.getSessionId === undefined ? {} : { currentSessionId: input.getSessionId() }),
 				scope: input.scope,
 				requestAnchor: { cwd: anchorCwd, worktreeRoot: await sessionWorktreeRoot(anchorCwd) },
 			});

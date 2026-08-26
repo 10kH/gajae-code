@@ -4308,6 +4308,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				createMasterPeerSnapshotContributor({
 					lifecycle: createSessionLifecycleService(agentDir),
 					ownerSessionId: masterModeContext.ownerSessionId,
+					getSessionId: () => sessionManager.getSessionId(),
 					scope: masterModeContext.scope,
 					getCwd: getLiveCwd,
 					hasPersistedInjection: () =>

@@ -30,6 +30,7 @@ export interface CollectMasterPeerSnapshotInput {
 	readonly lifecycle: MasterPeerSnapshotLifecycle;
 	readonly actor: SessionLifecycleActor;
 	readonly ownerSessionId: string;
+	readonly currentSessionId?: string;
 	readonly scope: ScopeNameV1;
 	readonly requestAnchor: ScopeRequestV1["requestAnchor"];
 	readonly timeoutMs?: number;
@@ -119,7 +120,9 @@ export async function collectMasterPeerSnapshot(input: CollectMasterPeerSnapshot
 		observedAt: result.observedAt,
 		...(result.indexSeq === undefined ? {} : { indexSeq: result.indexSeq }),
 	};
-	const rows = result.rows.filter(row => row.id !== input.ownerSessionId).sort(compareRows);
+	const rows = result.rows
+		.filter(row => row.id !== (input.currentSessionId ?? input.ownerSessionId))
+		.sort(compareRows);
 	const bounded = boundSnapshotRows(snapshot, rows);
 	return {
 		...snapshot,

@@ -2132,12 +2132,12 @@ export class Broker {
 				}
 				const masterAlive = rows.some(
 					row =>
-						row.sessionId === authority.ownerSessionId &&
 						row.endpointGeneration > 0 &&
 						row.live &&
 						!row.terminal &&
 						!row.terminalUncertain &&
-						row.masterRole?.role === "master",
+						row.masterRole?.role === "master" &&
+						row.masterRole.ownerSessionId === authority.ownerSessionId,
 				);
 				const orphanPending =
 					authority.orphanedAt !== undefined &&
