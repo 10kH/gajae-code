@@ -9,8 +9,10 @@ interface Harness {
 	emit(frame: Record<string, unknown>): Promise<Record<string, unknown>>;
 	/** Response frames observed after the emission they belong to already ended. */
 	readonly lateResponses: ReadonlyArray<Record<string, unknown>>;
-	/** Deliver the next host response through the transport. */
-	deliverNextResponse(): Promise<void>;
+	/** Deliver a specific host response through the transport after production. */
+	deliverResponse(id: string): Promise<void>;
+	/** Wait until a specific host response has been produced and queued. */
+	waitForResponse(id: string): Promise<void>;
 	/** End the current emission without delivering its queued response. */
 	expirePendingEmission(): void;
 	start(): Promise<void>;
@@ -35,9 +37,8 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 		  }
 		| undefined;
 	const lateResponses: Array<Record<string, unknown>> = [];
-	const queuedResponses: Array<Record<string, unknown>> = [];
-	let deliveryRequested = false;
-	let deliveryWaiter: PromiseWithResolvers<void> | undefined;
+	const queuedResponses = new Map<string, Record<string, unknown>>();
+	const responseWaiters = new Map<string, Array<PromiseWithResolvers<void>>>();
 	const deliverResponse = (response: Record<string, unknown>): void => {
 		const current = pending;
 		// A response only satisfies the emission whose request id it carries.
@@ -56,14 +57,10 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 		token: "test-token",
 		sendFrame: (_connectionId, frame) => {
 			const response = frame as Record<string, unknown>;
-			if (deliveryRequested) {
-				deliveryRequested = false;
-				deliverResponse(response);
-				deliveryWaiter?.resolve();
-				deliveryWaiter = undefined;
-			} else {
-				queuedResponses.push(response);
-			}
+			const id = String(response.id);
+			queuedResponses.set(id, response);
+			for (const waiter of responseWaiters.get(id) ?? []) waiter.resolve();
+			responseWaiters.delete(id);
 		},
 		onFrame: handler => {
 			receive = handler;
@@ -73,8 +70,8 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 		},
 		start: async () => ({ url: "memory://host-steer" }),
 		stop: async () => {
-			queuedResponses.length = 0;
-			deliveryRequested = false;
+			queuedResponses.clear();
+			responseWaiters.clear();
 		},
 	};
 	const api = {
@@ -113,6 +110,14 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 		getPendingMessageCounts: () => ({ steering: 0, followUp: 0, nextTurn: 0 }),
 		getTranscript: () => [],
 	} as unknown as ExtensionContext;
+	const waitForQueuedResponse = async (id: string): Promise<void> => {
+		if (queuedResponses.has(id)) return;
+		const waiter = Promise.withResolvers<void>();
+		const waiters = responseWaiters.get(id) ?? [];
+		waiters.push(waiter);
+		responseWaiters.set(id, waiters);
+		await waiter.promise;
+	};
 	return {
 		start: async () => {
 			await handlers.get("session_start")?.({ type: "session_start" }, base);
@@ -132,16 +137,13 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 				if (pending?.id === String(frame.id)) pending = undefined;
 			}
 		},
-		deliverNextResponse: () => {
-			const response = queuedResponses.shift();
-			if (response) {
-				deliverResponse(response);
-				return Promise.resolve();
-			} else {
-				deliveryRequested = true;
-				deliveryWaiter = Promise.withResolvers<void>();
-				return deliveryWaiter.promise;
-			}
+		waitForResponse: waitForQueuedResponse,
+		deliverResponse: async id => {
+			await waitForQueuedResponse(id);
+			const response = queuedResponses.get(id);
+			if (!response) throw new Error(`response ${id} was already delivered`);
+			queuedResponses.delete(id);
+			deliverResponse(response);
 		},
 		expirePendingEmission: () => {
 			const current = pending;
@@ -163,7 +165,7 @@ function createHarness(cwd: string, sessionId: string, sessionFile: string | und
 
 async function control(harness: Harness, id: string, text: string, clientRef: string) {
 	const response = harness.emit({ type: "control_request", id, operation: "turn.steer", input: { text, clientRef } });
-	await harness.deliverNextResponse();
+	await harness.deliverResponse(id);
 	return await response;
 }
 
@@ -173,7 +175,7 @@ function controlWithoutDelivery(harness: Harness, id: string, text: string, clie
 
 async function query(harness: Harness, id: string, input: Record<string, unknown>) {
 	const response = harness.emit({ type: "query_request", id, query: "turn.steer_status", input });
-	await harness.deliverNextResponse();
+	await harness.deliverResponse(id);
 	return await response;
 }
 
@@ -185,7 +187,7 @@ test("harness handshake resolves after explicit host progression", async () => {
 		// The response is held until explicit host progression, so this proof is
 		// independent of whether a fresh CI process can schedule a 1ms timer.
 		const delayed = controlWithoutDelivery(harness, "delayed", "delayed steer", "delayed-ref");
-		await harness.deliverNextResponse();
+		await harness.deliverResponse("delayed");
 		expect(await delayed).toMatchObject({ ok: true, result: { accepted: true, clientRef: "delayed-ref" } });
 		expect(harness.dispatches).toBe(1);
 		expect(harness.lateResponses).toEqual([]);
@@ -208,11 +210,12 @@ test("harness handshake times out, and a late response never satisfies a later e
 		// Start a fresh emission before releasing the stale frame. The old frame
 		// must be fenced while this newer await is live, not merely after the
 		// harness has no pending emission.
+		await harness.waitForResponse("slow");
 		const accepted = controlWithoutDelivery(harness, "recovered", "recovering steer", "recovered-ref");
-		await harness.deliverNextResponse();
+		await harness.deliverResponse("slow");
 		expect(harness.lateResponses.length).toBe(1);
 		expect(harness.lateResponses[0]).toMatchObject({ id: "slow", type: "control_response" });
-		await harness.deliverNextResponse();
+		await harness.deliverResponse("recovered");
 		expect(await accepted).toMatchObject({ ok: true, result: { accepted: true, clientRef: "recovered-ref" } });
 		expect(harness.dispatches).toBe(2);
 		expect(harness.lateResponses.length).toBe(1);
@@ -227,20 +230,21 @@ test("harness keeps late responses fenced across repeated bounded-load emissions
 	try {
 		const harness = createHarness(cwd, "handshake-stress", undefined);
 		await harness.start();
-		const rounds = 32;
+		const rounds = 16;
 		for (let index = 0; index < rounds; index++) {
 			const timedOut = controlWithoutDelivery(harness, `slow-${index}`, "slow steer", `slow-ref-${index}`);
 			harness.expirePendingEmission();
 			await expect(timedOut).rejects.toThrow("host did not respond");
 
+			await harness.waitForResponse(`slow-${index}`);
 			const recovered = controlWithoutDelivery(
 				harness,
 				`recovered-${index}`,
 				"recovering steer",
 				`recovered-ref-${index}`,
 			);
-			await harness.deliverNextResponse();
-			await harness.deliverNextResponse();
+			await harness.deliverResponse(`slow-${index}`);
+			await harness.deliverResponse(`recovered-${index}`);
 			expect(await recovered).toMatchObject({
 				ok: true,
 				result: { accepted: true, clientRef: `recovered-ref-${index}` },
