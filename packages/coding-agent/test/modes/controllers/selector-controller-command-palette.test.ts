@@ -69,6 +69,38 @@ describe("SelectorController command palette", () => {
 
 		expect(showError).toHaveBeenCalledWith("external editor failed");
 	});
+	it("restores composer before executing and reporting a throwing action", async () => {
+		const order: string[] = [];
+		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
+		const ctx = {
+			editorContainer: component,
+			editor: {},
+			restoreComposer: vi.fn(() => order.push("focus")),
+			keybindings: { getDisplayString: () => "" },
+			ui: { setFocus: vi.fn(), requestRender: vi.fn() },
+			showError: vi.fn(() => order.push("error")),
+		} as unknown as InteractiveModeContext;
+		const controller = new SelectorController(ctx);
+
+		controller.showCommandPalette(
+			[],
+			[
+				{
+					id: "app.editor.external",
+					label: "External editor",
+					handler: async () => {
+						order.push("execute");
+						throw new Error("external editor failed");
+					},
+				},
+			],
+			async () => {},
+		);
+		const palette = component.addChild.mock.calls[0]?.[0] as CommandPaletteComponent;
+		palette.handleInput("\r");
+		await new Promise<void>(resolve => setImmediate(resolve));
+		expect(order).toEqual(["focus", "execute", "error"]);
+	});
 	it("uses effective display strings and omits unbound action shortcuts", () => {
 		const component = { clear: vi.fn(), detachChild: vi.fn(), addChild: vi.fn() };
 		const keybindings = {

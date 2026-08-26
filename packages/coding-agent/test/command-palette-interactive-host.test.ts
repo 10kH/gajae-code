@@ -271,8 +271,8 @@ async function createHost(): Promise<InteractivePaletteHost> {
 	}
 }
 
-async function openPalette(host: InteractivePaletteHost): Promise<CommandPaletteComponent> {
-	host.mode.editor.handleInput("\u0010");
+async function openPalette(host: InteractivePaletteHost, key = "\u0010"): Promise<CommandPaletteComponent> {
+	host.mode.editor.handleInput(key);
 	let palette: CommandPaletteComponent | undefined;
 	await waitFor(() => {
 		const component = host.mode.editorContainer.children[0];
@@ -430,6 +430,26 @@ describe("command palette InteractiveMode host", () => {
 			const palette = await openPalette(host);
 			palette.handleInput("\u001b");
 			expect(host.mode.editorContainer.children).toEqual([host.mode.editor]);
+		}
+	});
+
+	it("preserves whitespace and Unicode multiline drafts across repeated palette cycles", async () => {
+		const host = await createHost();
+		const editor = host.mode.editor;
+
+		for (const draft of ["   ", "한글\nsecond line\n終わり"]) {
+			editor.setText(draft);
+			const cursor = editor.getCursor();
+			for (let cycle = 0; cycle < 3; cycle += 1) {
+				const palette = await openPalette(host);
+				expect(host.mode.editor).toBe(editor);
+				expect(editor.getText()).toBe(draft);
+				expect(editor.getCursor()).toEqual(cursor);
+				palette.handleInput("\u001b");
+				expect(host.mode.editorContainer.children).toEqual([editor]);
+				expect(host.mode.editor.getText()).toBe(draft);
+				expect(host.mode.editor.getCursor()).toEqual(cursor);
+			}
 		}
 	});
 
