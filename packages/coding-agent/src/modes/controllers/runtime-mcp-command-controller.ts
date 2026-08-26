@@ -546,6 +546,10 @@ export class MCPCommandController {
 
 		const resolvedClientId = clientId.trim() || parsedAuthUrl.searchParams.get("client_id") || undefined;
 		const resolvedClientSecret = clientSecret.trim() || undefined;
+		const copyOAuthUrlKey = this.ctx.keybindings?.getDisplayString?.("app.clipboard.copyOAuthUrl") ?? "";
+		const copyOAuthUrlHint = copyOAuthUrlKey
+			? `Use ${copyOAuthUrlKey} or command palette → Copy OAuth URL to copy this exact URL:`
+			: "Use command palette → Copy OAuth URL to copy this exact URL:";
 		let releaseOAuthUrlForCopy: (() => void) | undefined;
 
 		try {
@@ -607,16 +611,7 @@ export class MCPCommandController {
 							this.ctx.chatContainer.addChild(
 								new Text(theme.fg("muted", "Alternative if browser did not open:"), 1, 0),
 							);
-							this.ctx.chatContainer.addChild(
-								new Text(
-									theme.fg(
-										"success",
-										"Use Alt+Shift+U or command palette → Copy OAuth URL to copy this exact URL:",
-									),
-									1,
-									0,
-								),
-							);
+							this.ctx.chatContainer.addChild(new Text(theme.fg("success", copyOAuthUrlHint), 1, 0));
 							this.ctx.chatContainer.addChild(new Text(theme.fg("accent", info.url), 1, 0));
 							this.ctx.ui.requestRender();
 						} catch (_error) {
@@ -625,16 +620,7 @@ export class MCPCommandController {
 							this.ctx.chatContainer.addChild(
 								new Text(theme.fg("warning", "→ Could not open browser automatically"), 1, 0),
 							);
-							this.ctx.chatContainer.addChild(
-								new Text(
-									theme.fg(
-										"success",
-										"Use Alt+Shift+U or command palette → Copy OAuth URL to copy this exact URL:",
-									),
-									1,
-									0,
-								),
-							);
+							this.ctx.chatContainer.addChild(new Text(theme.fg("success", copyOAuthUrlHint), 1, 0));
 							this.ctx.chatContainer.addChild(new Text(theme.fg("accent", info.url), 1, 0));
 							this.ctx.ui.requestRender();
 						}

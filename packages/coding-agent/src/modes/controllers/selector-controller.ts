@@ -3489,6 +3489,10 @@ export class SelectorController {
 		this.ctx.showStatus(`Logging in to ${providerId}…`);
 		const manualInput = this.ctx.oauthManualInput;
 		const useManualInput = CALLBACK_SERVER_PROVIDERS.has(providerId as OAuthProvider);
+		const copyOAuthUrlKey = this.ctx.keybindings?.getDisplayString?.("app.clipboard.copyOAuthUrl") ?? "";
+		const copyOAuthUrlHint = copyOAuthUrlKey
+			? `${copyOAuthUrlKey} or command palette → Copy OAuth URL copies the URL exactly.`
+			: "Command palette → Copy OAuth URL copies the URL exactly.";
 		let releaseOAuthUrlForCopy: (() => void) | undefined;
 		if (providerId === "opencodex") {
 			this.ctx.showStatus("Checking the local OpenCodex proxy…");
@@ -3504,13 +3508,7 @@ export class SelectorController {
 						this.ctx.chatContainer.addChild(new Text(theme.fg("dim", buildOAuthLoginAnchor(info.url)), 1, 0));
 						const hyperlink = buildOAuthLoginAnchor(info.url, "Click here to login");
 						this.ctx.chatContainer.addChild(new Text(theme.fg("accent", hyperlink), 1, 0));
-						this.ctx.chatContainer.addChild(
-							new Text(
-								theme.fg("muted", "Alt+Shift+U or command palette → Copy OAuth URL copies the URL exactly."),
-								1,
-								0,
-							),
-						);
+						this.ctx.chatContainer.addChild(new Text(theme.fg("muted", copyOAuthUrlHint), 1, 0));
 						if (info.instructions) {
 							this.ctx.chatContainer.addChild(new Spacer(1));
 							this.ctx.chatContainer.addChild(new Text(theme.fg("warning", info.instructions), 1, 0));
