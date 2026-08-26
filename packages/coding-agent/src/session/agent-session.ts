@@ -19085,6 +19085,7 @@ export class AgentSession {
 									...profileAliasIntent,
 									canonicalSessionId,
 									credentialSessionId: this.credentialSessionId,
+									signal: cancellationSignal,
 								},
 							);
 							return await awaitWithCancellation(
