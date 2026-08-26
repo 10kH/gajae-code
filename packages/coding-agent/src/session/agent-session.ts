@@ -18778,15 +18778,29 @@ export class AgentSession {
 					return {
 						type: "retry",
 						continuation: async ownership => {
-							if (!ownership.isCurrent() || ownership.lease.signal.aborted) {
-								if (this.#abortAdmissionEpoch === abortEpoch) {
+							const continuationCancelled =
+								!ownership.isCurrent() ||
+								ownership.lease.signal.aborted ||
+								cancellationSignal?.aborted ||
+								this.#abortAdmissionEpoch !== abortEpoch;
+							if (continuationCancelled) {
+								if (this.#abortAdmissionEpoch === abortEpoch)
 									await this.#restoreDefaultFallbackTransition(
 										controller,
 										controllerStateBeforeFailure,
 										previousModel,
 										previousThinkingLevel,
 									);
-								}
+								return;
+							}
+							if (cancellationSignal?.aborted || this.#abortAdmissionEpoch !== abortEpoch) {
+								if (this.#abortAdmissionEpoch === abortEpoch)
+									await this.#restoreDefaultFallbackTransition(
+										controller,
+										controllerStateBeforeFailure,
+										previousModel,
+										previousThinkingLevel,
+									);
 								return;
 							}
 							await this.agent.continue({
