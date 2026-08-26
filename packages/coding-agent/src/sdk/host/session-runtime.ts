@@ -4020,10 +4020,12 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					} as never);
 				} catch (reasonError) {
 					if (remaining <= 1) {
-						// Hand replay to the deadline manager: the lease stays armed and
-						// its bounded expiry retries the durable terminal transition
-						// instead of leaving an accepted row with no recovery owner.
-						deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
+						// Prompts use the deadline lease; skills have no prompt lease and
+						// must use their kind-aware durable retry owner instead.
+						if (kind === "skill")
+							scheduleSkillRecovery(correlation, { code: error.code, message: error.message });
+						else
+							deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
 						logger.error("SDK abandoned submission failed to record its failure reason", {
 							kind,
 							commandId: correlation.commandId,
@@ -4042,8 +4044,9 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					// 3. Release recovery ownership ONLY after durable terminalization.
 					deadlineManager.clear(correlation);
 				} catch (transitionError) {
-					// Keep the lease armed; the manager replays the real agent_end.
-					deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
+					// Keep prompt recovery leased; skill recovery has no prompt lease.
+					if (kind === "skill") scheduleSkillRecovery(correlation);
+					else deadlineManager.noteTerminalTransition(correlation, { code: error.code, message: error.message });
 					logger.error("SDK abandoned submission failed to terminalize", {
 						kind,
 						commandId: correlation.commandId,
