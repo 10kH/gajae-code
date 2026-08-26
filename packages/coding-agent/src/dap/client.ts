@@ -62,8 +62,13 @@ function parseMessage(
 
 async function writeMessage(sink: DapWriteSink, message: DapRequestMessage | DapResponseMessage): Promise<void> {
 	const content = JSON.stringify(message);
-	sink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n`);
-	sink.write(content);
+	// DapWriteSink.write() returns `number | Promise<number>`: under
+	// backpressure it returns a promise whose rejection (e.g. EPIPE when the
+	// adapter dies mid-write) would otherwise be discarded here and surface as
+	// an unhandled rejection. Await both writes so failures reach the callers
+	// that already handle flush() errors.
+	await sink.write(`Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n`);
+	await sink.write(content);
 	await sink.flush();
 }
 
@@ -99,6 +104,7 @@ export class DapClient {
 	#isReading = false;
 	#disposed = false;
 	#lastActivity = Date.now();
+	#writeQueue = Promise.resolve();
 	#capabilities?: DapCapabilities;
 	#eventHandlers = new Map<string, Set<DapEventHandler>>();
 	#anyEventHandlers = new Set<DapEventHandler>();
@@ -328,6 +334,7 @@ export class DapClient {
 			throw signal.reason instanceof Error ? signal.reason : new ToolAbortError();
 		}
 		const { promise, resolve, reject } = Promise.withResolvers<TBody>();
+		void promise.catch(() => {});
 		let timeout: NodeJS.Timeout | undefined;
 		const cleanup = () => {
 			unsubscribe();
@@ -411,13 +418,11 @@ export class DapClient {
 			},
 		});
 		this.#lastActivity = Date.now();
-		try {
-			await writeMessage(this.#writeSink, request);
-		} catch (error) {
+		void this.#queueWrite(request).catch(error => {
 			this.#pendingRequests.delete(requestSeq);
 			cleanup();
-			throw error;
-		}
+			reject(error);
+		});
 		return promise;
 	}
 
@@ -431,7 +436,13 @@ export class DapClient {
 			...(message ? { message } : {}),
 			...(body !== undefined ? { body } : {}),
 		};
-		await writeMessage(this.#writeSink, response);
+		await this.#queueWrite(response);
+	}
+
+	#queueWrite(message: DapRequestMessage | DapResponseMessage): Promise<void> {
+		const write = this.#writeQueue.catch(() => {}).then(() => writeMessage(this.#writeSink, message));
+		this.#writeQueue = write.catch(() => {});
+		return write;
 	}
 
 	async dispose(): Promise<void> {

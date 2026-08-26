@@ -10,7 +10,7 @@ import {
 	waitForProjectLoaded,
 } from "../../src/lsp/client";
 import type { ServerConfig } from "../../src/lsp/types";
-import { disposeAllOwnedProcesses } from "../../src/runtime/process-lifecycle";
+import { disposeAllOwnedProcesses, liveOwnedProcessCount } from "../../src/runtime/process-lifecycle";
 
 const BUN = process.execPath;
 const ORIGINAL_PATH = Bun.env.PATH;
@@ -39,11 +39,11 @@ function serverConfig(command: string, args: string[] = []): ServerConfig {
 	};
 }
 
-async function writeFakeLspServer(dir: string): Promise<string> {
+async function writeFakeLspServer(dir: string, options?: { initDelayMs?: number }): Promise<string> {
 	const script = path.join(dir, "fake-lsp.ts");
 	await Bun.write(
 		script,
-		`let buffer = Buffer.alloc(0);\nfunction write(message) {\n  const body = JSON.stringify(message);\n  process.stdout.write(\`Content-Length: \${Buffer.byteLength(body, "utf8")}\\r\\n\\r\\n\${body}\`);\n}\nfunction handle(message) {\n  if (message.method === "initialize") {\n    write({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });\n    return;\n  }\n  if (message.method === "shutdown") {\n    write({ jsonrpc: "2.0", id: message.id, result: null });\n    process.exit(0);\n    return;\n  }\n}\nprocess.stdin.on("data", chunk => {\n  buffer = Buffer.concat([buffer, chunk]);\n  for (;;) {\n    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");\n    if (headerEnd === -1) return;\n    const header = buffer.subarray(0, headerEnd).toString();\n    const match = /Content-Length: (\\d+)/i.exec(header);\n    if (!match) return;\n    const length = Number(match[1]);\n    const start = headerEnd + 4;\n    const end = start + length;\n    if (buffer.length < end) return;\n    const message = JSON.parse(buffer.subarray(start, end).toString());\n    buffer = buffer.subarray(end);\n    handle(message);\n  }\n});\nsetInterval(() => {}, 1000);\n`,
+		`let buffer = Buffer.alloc(0);\nfunction write(message) {\n  const body = JSON.stringify(message);\n  process.stdout.write(\`Content-Length: \${Buffer.byteLength(body, "utf8")}\\r\\n\\r\\n\${body}\`);\n}\nfunction handle(message) {\n  if (message.method === "initialize") {\n    setTimeout(() => {\n      write({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });\n    }, ${options?.initDelayMs ?? 0});\n    return;\n  }\n  if (message.method === "shutdown") {\n    write({ jsonrpc: "2.0", id: message.id, result: null });\n    process.exit(0);\n    return;\n  }\n}\nprocess.stdin.on("data", chunk => {\n  buffer = Buffer.concat([buffer, chunk]);\n  for (;;) {\n    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");\n    if (headerEnd === -1) return;\n    const header = buffer.subarray(0, headerEnd).toString();\n    const match = /Content-Length: (\\d+)/i.exec(header);\n    if (!match) return;\n    const length = Number(match[1]);\n    const start = headerEnd + 4;\n    const end = start + length;\n    if (buffer.length < end) return;\n    const message = JSON.parse(buffer.subarray(start, end).toString());\n    buffer = buffer.subarray(end);\n    handle(message);\n  }\n});\nsetInterval(() => {}, 1000);\n`,
 	);
 	return script;
 }
@@ -228,4 +228,118 @@ describe("LSP lifecycle behavior", () => {
 			await fs.rm(cwd, { recursive: true, force: true });
 		}
 	}, 3_000);
+});
+
+async function writeBusyThenDyingLspServer(dir: string): Promise<string> {
+	// Answers `initialize`, then blocks its event loop without consuming stdin
+	// (like a server busy analyzing a large file), then exits while the client
+	// still has a large in-flight write queued in the socket buffer.
+	const script = path.join(dir, "busy-lsp.ts");
+	await Bun.write(
+		script,
+		`let buffer = Buffer.alloc(0);\nfunction write(message) {\n  const body = JSON.stringify(message);\n  process.stdout.write(\`Content-Length: \${Buffer.byteLength(body, "utf8")}\\r\\n\\r\\n\${body}\`);\n}\nprocess.stdin.on("data", chunk => {\n  buffer = Buffer.concat([buffer, chunk]);\n  for (;;) {\n    const headerEnd = buffer.indexOf("\\r\\n\\r\\n");\n    if (headerEnd === -1) return;\n    const header = buffer.subarray(0, headerEnd).toString();\n    const match = /Content-Length: (\\d+)/i.exec(header);\n    if (!match) return;\n    const length = Number(match[1]);\n    const start = headerEnd + 4;\n    const end = start + length;\n    if (buffer.length < end) return;\n    const message = JSON.parse(buffer.subarray(start, end).toString());\n    buffer = buffer.subarray(end);\n    if (message.method === "initialize") {\n      write({ jsonrpc: "2.0", id: message.id, result: { capabilities: {} } });\n      // Immediately simulate a server that stops servicing stdin (like one\n      // busy analyzing a large file): the reply is already in the kernel pipe\n      // buffer, so blocking the event loop keeps stdin unconsumed and the\n      // client's next large write stays pending in the kernel socket buffer.\n      const until = Date.now() + 3000;\n      while (Date.now() < until) {}\n      process.exit(1);\n    }\n  }\n});\nsetInterval(() => {}, 1000);\n`,
+	);
+	return script;
+}
+
+describe("LSP transport write failures", () => {
+	it("a large pending write to a dying server is terminalized, not an unhandled rejection", async () => {
+		const cwd = await tempDir("gjc-lsp-epipe-");
+		const unhandled: unknown[] = [];
+		const onUnhandledRejection = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandledRejection);
+		try {
+			const script = await writeBusyThenDyingLspServer(cwd);
+			const config = serverConfig(BUN, [script]);
+			const client = await getOrCreateClient(config, cwd, 5_000);
+
+			// Larger than the kernel socket buffer so FileSink.write() returns a
+			// promise (backpressure) that stays pending while the server is busy.
+			const largeParams = { text: "x".repeat(512 * 1024) };
+			const largeWrite = sendNotification(client, "textDocument/didChange", largeParams);
+			await Bun.sleep(100);
+
+			// Kill the server while the write is still pending, exactly like a
+			// language server that crashes mid-analysis with a large didOpen or
+			// didChange queued: the pending write fails with EPIPE.
+			client.proc.kill();
+			await largeWrite;
+			await Bun.sleep(200);
+
+			expect(unhandled).toEqual([]);
+
+			// The transport must be terminalized: notifications resolve quietly
+			// and later requests reject with the mapped error, not the raw one.
+			await sendNotification(client, "test/afterExit", {});
+			const staleRequestError = await captureError(sendRequest(client, "test/stale", null));
+			expect(staleRequestError.message).toBe("LSP transport closed");
+		} finally {
+			process.off("unhandledRejection", onUnhandledRejection);
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	it("concurrent callers during a slow initialize share the initialized client, never an uninitialized one", async () => {
+		const cwd = await tempDir("gjc-lsp-slow-init-");
+		try {
+			const script = await writeFakeLspServer(cwd, { initDelayMs: 150 });
+			const config = serverConfig(BUN, [script]);
+
+			const firstPromise = getOrCreateClient(config, cwd, 5_000);
+			let secondResolvedBeforeHandshake = false;
+			const secondPromise = getOrCreateClient(config, cwd, 5_000).then(client => {
+				secondResolvedBeforeHandshake = client.serverCapabilities === undefined;
+				return client;
+			});
+			const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+			expect(second).toBe(first);
+			expect(secondResolvedBeforeHandshake).toBe(false);
+			expect(second.serverCapabilities).toBeDefined();
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	it("concurrent callers observe the same failure when the server dies during initialize", async () => {
+		const cwd = await tempDir("gjc-lsp-dying-init-");
+		try {
+			// A server that exits immediately, like a broken launcher on PATH
+			// (e.g. a Python LSP stub whose interpreter can no longer import it).
+			const script = path.join(cwd, "dying-lsp.ts");
+			await Bun.write(script, "console.error(\"No module named 'fake-lsp'\");\nprocess.exit(1);\n");
+			const config = serverConfig(BUN, [script]);
+
+			const firstPromise = getOrCreateClient(config, cwd, 5_000).catch(error => error);
+			const secondPromise = getOrCreateClient(config, cwd, 5_000).catch(error => error);
+			const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+			expect(first).toBeInstanceOf(Error);
+			expect(second).toBe(first);
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	}, 10_000);
+
+	it("shutdownAll disposes an in-flight initializer and prevents cache resurrection", async () => {
+		const cwd = await tempDir("gjc-lsp-shutdown-init-");
+		try {
+			const script = await writeFakeLspServer(cwd, { initDelayMs: 500 });
+			const config = serverConfig(BUN, [script]);
+			const before = liveOwnedProcessCount();
+			const initializing = getOrCreateClient(config, cwd, 5_000);
+			await Bun.sleep(50);
+			await shutdownAll();
+			await expect(initializing).rejects.toThrow("LSP client shutdown");
+			await Bun.sleep(100);
+			expect(liveOwnedProcessCount()).toBe(before);
+
+			const retry = await getOrCreateClient(config, cwd, 5_000);
+			expect(retry.proc.exitCode).toBeNull();
+		} finally {
+			await fs.rm(cwd, { recursive: true, force: true });
+		}
+	});
 });
