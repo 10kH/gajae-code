@@ -18965,7 +18965,8 @@ export class AgentSession {
 						sessionId: this.agent.providerSessionId ?? this.sessionId,
 						credentialSessionId: this.credentialSessionId,
 					});
-			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) return false;
+			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+				return await rollbackCancelled();
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
 				continue;
@@ -18980,7 +18981,8 @@ export class AgentSession {
 				continue;
 			}
 			const key = await this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId, { signal });
-			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) return false;
+			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+				return await rollbackCancelled();
 			if (!isAuthenticated(key) && key !== kNoAuth) {
 				controller.onResolutionSkip("unauthenticated");
 				continue;
@@ -18991,9 +18993,11 @@ export class AgentSession {
 			const previousEditMode = this.#resolveActiveEditMode();
 			this.#escapedNonAsciiManagedRetries = 0;
 			this.#setModelAuthoritatively(resolved.model, "fallback-switch");
-			this.setThinkingLevel(
+			this.#thinkingLevel = resolveThinkingLevelForModel(
+				this.model,
 				this.#thinkingLevelForResolvedFallback(resolved.explicitThinkingLevel, resolved.thinkingLevel),
 			);
+			this.agent.setThinkingLevel(toReasoningEffort(this.#thinkingLevel));
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
 			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) {
 				return await rollbackCancelled();
@@ -19015,6 +19019,8 @@ export class AgentSession {
 					attemptsUsed,
 				});
 			}
+			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+				return await rollbackCancelled();
 			return true;
 		}
 		return false;
