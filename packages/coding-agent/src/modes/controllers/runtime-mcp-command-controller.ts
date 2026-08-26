@@ -1836,6 +1836,14 @@ export class MCPCommandController {
 
 	async #handleSmitheryBrowserLogin(): Promise<boolean> {
 		const session = await createSmitheryCliAuthSession();
+		const oauthUrlCopyLease = createOAuthUrlCopyLease(this.ctx);
+		const abortController = new AbortController();
+		const interruptUnsubscribe = this.ctx.ui.addInputListener?.(data => {
+			if (data !== "\x03" && !matchesAppInterrupt(data)) return;
+			abortController.abort(new Error("Smithery authorization cancelled."));
+			return { consume: true };
+		});
+		oauthUrlCopyLease.replace(session.authUrl);
 		const fallbackLoginUrl = getSmitheryLoginUrl();
 		this.#showMessage(
 			[
@@ -1843,7 +1851,7 @@ export class MCPCommandController {
 				theme.bold("Smithery Login"),
 				theme.fg("muted", "Browser authorization started. Complete auth in your browser."),
 				theme.fg("dim", "Authorize URL:"),
-				theme.fg("accent", session.authUrl),
+				theme.fg("accent", buildOAuthLoginAnchor(session.authUrl)),
 				theme.fg("dim", `Fallback: ${fallbackLoginUrl}`),
 				"",
 			].join("\n"),
@@ -1854,11 +1862,16 @@ export class MCPCommandController {
 			// URL is already shown above.
 		}
 
-		const apiKey = await this.#waitForSmitheryCliApiKey(session.sessionId, new AbortController().signal);
-		await this.#validateSmitheryApiKey(apiKey);
-		await saveSmitheryApiKey(apiKey);
-		this.ctx.showStatus("Smithery API key saved.");
-		return true;
+		try {
+			const apiKey = await this.#waitForSmitheryCliApiKey(session.sessionId, abortController.signal);
+			await this.#validateSmitheryApiKey(apiKey);
+			await saveSmitheryApiKey(apiKey);
+			this.ctx.showStatus("Smithery API key saved.");
+			return true;
+		} finally {
+			oauthUrlCopyLease.release();
+			interruptUnsubscribe?.();
+		}
 	}
 
 	async #promptSmitheryLogin(reason: string): Promise<boolean> {

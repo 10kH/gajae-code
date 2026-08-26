@@ -1860,8 +1860,16 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 		try {
-			await copyToClipboard(pending.url);
-			this.showStatus("OAuth URL copied to clipboard.");
+			const outcome = await copyToClipboard(pending.url);
+			if (outcome.status === "verified") {
+				this.showStatus("OAuth URL copied to clipboard.");
+			} else if (outcome.reason.includes("failed") || outcome.reason.includes("rejected")) {
+				this.showWarning(
+					`OAuth URL delivery was not confirmed (${outcome.transport}). Use the visible link or copy it manually.`,
+				);
+			} else {
+				this.showStatus(`OAuth URL delivery attempted via ${outcome.transport}; verify it arrived before pasting.`);
+			}
 		} catch {
 			this.showWarning("Failed to copy OAuth URL to clipboard.");
 		}
