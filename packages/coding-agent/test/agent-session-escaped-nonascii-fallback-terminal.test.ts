@@ -350,4 +350,52 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 			),
 		).toBe(true);
 	});
+
+	it("skips duplicate concrete models after escaped recovery exhaustion", async () => {
+		tempDir = TempDir.createSync("@gjc-escaped-fallback-duplicate-4880-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		authStorage.setRuntimeApiKey("openai", "test-key");
+
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallback = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !fallback) throw new Error("Expected bundled duplicate-fallback models");
+
+		const modelRegistry = new ModelRegistry(authStorage);
+		const manager = SessionManager.create(tempDir.path(), tempDir.path());
+		const executed: Array<Record<string, unknown>> = [];
+		const callModels: string[] = [];
+		const mock = createMockModel({
+			responses: [
+				escapedTurn("tc-primary-1"),
+				escapedTurn("tc-primary-2"),
+				escapedTurn("tc-primary-3"),
+				literalTurn("tc-fallback-1"),
+				{ content: ["done"] },
+			],
+		});
+		const agent = new Agent({
+			initialState: { model: primary, systemPrompt: ["test"], tools: [askTool(executed)], messages: [] },
+			convertToLlm: identityConverter,
+			streamFn: (model, context, options) => {
+				callModels.push(selector(model));
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"fallback.maxAttempts": 3,
+			"retry.baseDelayMs": 10,
+		});
+		settings.setModelRole("default", selector(primary));
+		session = new AgentSession({ agent, sessionManager: manager, settings, modelRegistry });
+		session.setConfiguredModelChain("default", [selector(primary), selector(primary), selector(fallback)], "test");
+
+		await session.prompt("ask me");
+		await manager.flush();
+
+		expect(callModels).toEqual([selector(primary), selector(primary), selector(primary), selector(fallback), selector(fallback)]);
+		expect(executed).toEqual([{ question: QUESTION }]);
+		expect(session.isStreaming).toBe(false);
+	});
 });

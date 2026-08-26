@@ -2485,6 +2485,8 @@ export class AgentSession {
 	#defaultFallbackController: FallbackChainController | undefined;
 	/** Managed escaped-non-ASCII retries issued for the current logical run. Bounded so a deterministic escaper cannot loop forever through un-charged fallback retries. */
 	#escapedNonAsciiManagedRetries = 0;
+	/** Concrete models that already exhausted escaped-argument recovery this turn. */
+	#escapedNonAsciiExhaustedModelKeys = new Set<string>();
 	#overflowMaintenanceAttempts = 0;
 	#defaultFallbackExhaustedLastTurn = false;
 	#fallbackInvocationId = 0;
@@ -13867,6 +13869,7 @@ export class AgentSession {
 		if (role === "default") {
 			this.#defaultFallbackController = undefined;
 			this.#defaultFallbackExhaustedLastTurn = false;
+			this.#escapedNonAsciiExhaustedModelKeys.clear();
 		}
 		this.settings.getStorage()?.recordModelUsage(`${model.provider}/${model.id}`);
 
@@ -18615,6 +18618,7 @@ export class AgentSession {
 		// A fresh user turn gets a fresh escaped-non-ASCII retry budget: the
 		// defect is per-turn wire luck, not a sticky model property.
 		this.#escapedNonAsciiManagedRetries = 0;
+		this.#escapedNonAsciiExhaustedModelKeys.clear();
 		const controller = this.#defaultFallbackChain();
 		if (this.#defaultFallbackExhaustedLastTurn) {
 			this.#defaultFallbackExhaustedLastTurn = false;
@@ -18734,6 +18738,9 @@ export class AgentSession {
 					`Managed fallback retried the escaped non-ASCII tool-call turn ${MAX_ESCAPED_NONASCII_MANAGED_RETRIES} times without a literal-UTF-8 re-issue; ` +
 					`giving up on this model so the next eligible fallback can re-issue with literal UTF-8.`;
 				const controller = this.#defaultFallbackChain();
+				if (this.model) {
+					this.#escapedNonAsciiExhaustedModelKeys.add(`${this.model.provider}\u0000${this.model.id}`);
+				}
 				controller.discardStartedAttempt();
 				const advanced = controller.recordEscapedArgumentsFailure(errorMessage);
 				this.#escapedNonAsciiManagedRetries = 0;
@@ -18909,6 +18916,10 @@ export class AgentSession {
 					});
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
+				continue;
+			}
+			if (this.#escapedNonAsciiExhaustedModelKeys.has(`${resolved.model.provider}\u0000${resolved.model.id}`)) {
+				controller.onResolutionSkip("escaped_non_ascii_model_exhausted");
 				continue;
 			}
 			const managedCursorUnavailable = managedCursorFallbackUnavailableReason(resolved.model, selector);
