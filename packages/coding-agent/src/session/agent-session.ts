@@ -13869,7 +13869,9 @@ export class AgentSession {
 			role,
 			this.#formatRoleModelValue(role, model, options?.selector, options?.thinkingLevel),
 		);
-		if (role === "default") {
+		// Only an explicit user selection starts a new fallback epoch. Internal
+		// fallback switches must preserve the exhausted-model set while advancing.
+		if (role === "default" && (options?.cause ?? "user-selection") === "user-selection") {
 			this.#defaultFallbackController = undefined;
 			this.#defaultFallbackExhaustedLastTurn = false;
 			this.#escapedNonAsciiExhaustedModelKeys.clear();
