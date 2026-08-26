@@ -18963,14 +18963,27 @@ export class AgentSession {
 			if (!selector) return false;
 			const profileAliasIntent = this.#persistedModelProfileAliasIntent("default");
 			const profileResolution = profileAliasIntent
-				? await awaitWithCancellation(
-						resolveModelChainWithAuth([selector], this.#modelRegistry, this.settings, this.credentialSessionId, {
-							managedFallback: true,
-							...profileAliasIntent,
-							canonicalSessionId: this.agent.providerSessionId ?? this.sessionId,
-							credentialSessionId: this.credentialSessionId,
-						}),
-					)
+				? await (async () => {
+						try {
+							return await awaitWithCancellation(
+								resolveModelChainWithAuth(
+									[selector],
+									this.#modelRegistry,
+									this.settings,
+									this.credentialSessionId,
+									{
+										managedFallback: true,
+										...profileAliasIntent,
+										canonicalSessionId: this.agent.providerSessionId ?? this.sessionId,
+										credentialSessionId: this.credentialSessionId,
+									},
+								),
+							);
+						} catch (error) {
+							await rollbackCancelled();
+							throw error;
+						}
+					})()
 				: undefined;
 			if (profileResolution?.kind === "aborted") return await rollbackCancelled();
 			const resolved =
@@ -18989,6 +19002,7 @@ export class AgentSession {
 				controller.onResolutionSkip("unknown_model");
 				continue;
 			}
+			const resolvedModel = resolved.model;
 			if (this.#escapedNonAsciiExhaustedModelKeys.has(`${resolved.model.provider}\u0000${resolved.model.id}`)) {
 				controller.onResolutionSkip("escaped_non_ascii_model_exhausted");
 				continue;
@@ -18998,9 +19012,16 @@ export class AgentSession {
 				controller.onResolutionSkip(managedCursorUnavailable);
 				continue;
 			}
-			const keyResult = await awaitWithCancellation(
-				this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId),
-			);
+			const keyResult = await (async () => {
+				try {
+					return await awaitWithCancellation(
+						this.#modelRegistry.getApiKey(resolvedModel, this.credentialSessionId),
+					);
+				} catch (error) {
+					await rollbackCancelled();
+					throw error;
+				}
+			})();
 			if (keyResult.kind === "aborted") return await rollbackCancelled();
 			const key = keyResult.value;
 			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
