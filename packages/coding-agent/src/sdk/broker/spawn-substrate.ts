@@ -2,6 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@gajae-code/utils";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { resolveGjcTmuxBinary } from "../../gjc-runtime/psmux-detect";
 import { sessionRuntimeDir } from "../../gjc-runtime/session-layout";
@@ -37,8 +38,17 @@ export interface SpawnSubstrateProviderDependencies {
 	closeManaged?: (proof: ManagedTmuxLaunchProof, env: NodeJS.ProcessEnv) => Promise<void>;
 	processIncarnation?: (pid: number) => string | undefined;
 	startHeadless?: (spec: SpawnSubstrateLaunchSpec, env: NodeJS.ProcessEnv) => SpawnHeadlessProcess;
-	signalHeadless?: (pid: number, incarnation: string, platform: NodeJS.Platform) => boolean;
+	signalHeadless?: (
+		pid: number,
+		incarnation: string,
+		platform: NodeJS.Platform,
+		signal: "SIGTERM" | "SIGKILL",
+	) => boolean;
 	isProcessGone?: (pid: number) => boolean;
+	/** @internal Test seam for bounded close polling. */
+	sleep?: (milliseconds: number) => Promise<void>;
+	/** @internal Test seam for non-secret inherited-environment launch diagnostics. */
+	onInheritedEnvironmentDrop?: (names: readonly string[]) => void;
 }
 
 type HeadlessState = {
@@ -58,6 +68,10 @@ const HEADLESS_STATE_KEYS = new Set([
 	"childSessionId",
 	"createdAt",
 ]);
+
+const ENVIRONMENT_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const HEADLESS_CLOSE_GRACE_MS = 2_000;
+const HEADLESS_CLOSE_POLL_MS = 50;
 
 function messageFor(code: "substrate_unavailable" | "substrate_proof_failed"): string {
 	return code === "substrate_unavailable"
@@ -98,14 +112,25 @@ function validLaunchSpec(spec: SpawnSubstrateLaunchSpec, platform: NodeJS.Platfo
 		spec.argv.length > 0 &&
 		spec.argv.every(value => isNonEmptyString(value) && !value.includes("\0")) &&
 		(spec.env === undefined ||
-			// An empty environment value is legitimate and meaningful (for example
-			// AWS_PAGER="" disables a pager), so only the NAME must be non-empty.
-			// Requiring a non-empty value rejected ordinary inherited environments
-			// and failed every spawn before launch.
 			Object.entries(spec.env).every(
-				([name, value]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && isBoundedString(value) && !value.includes("\0"),
+				([name, value]) => ENVIRONMENT_NAME.test(name) && isBoundedString(value) && !value.includes("\0"),
 			))
 	);
+}
+
+function filterInheritedEnvironment(environment: NodeJS.ProcessEnv | Readonly<Record<string, string>>): {
+	environment: NodeJS.ProcessEnv;
+	dropped: string[];
+} {
+	const filtered: NodeJS.ProcessEnv = {};
+	const dropped: string[] = [];
+	for (const [name, value] of Object.entries(environment).sort(([left], [right]) =>
+		left < right ? -1 : left > right ? 1 : 0,
+	)) {
+		if (ENVIRONMENT_NAME.test(name) && isBoundedString(value) && !value.includes("\0")) filtered[name] = value;
+		else dropped.push(name);
+	}
+	return { environment: filtered, dropped };
 }
 
 function isHeadlessState(value: unknown): value is HeadlessState {
@@ -180,7 +205,7 @@ function startHeadless(spec: SpawnSubstrateLaunchSpec, env: NodeJS.ProcessEnv): 
 	const child = Bun.spawn({
 		cmd: [...spec.argv],
 		cwd: spec.cwd,
-		env: { ...env, ...(spec.env ?? {}) },
+		env,
 		stdin: "ignore",
 		stdout: "ignore",
 		stderr: "ignore",
@@ -197,19 +222,24 @@ function defaultIsProcessGone(pid: number): boolean {
 	}
 }
 
-function signalExactHeadless(pid: number, expectedIncarnation: string, platform: NodeJS.Platform): boolean {
+function signalExactHeadless(
+	pid: number,
+	expectedIncarnation: string,
+	platform: NodeJS.Platform,
+	signal: "SIGTERM" | "SIGKILL",
+): boolean {
 	try {
 		const reference = nativeProcessBindings().Process.fromPid(pid);
 		if (!reference || reference.incarnation !== expectedIncarnation) return false;
 		if (platform === "darwin") {
 			const current = nativeProcessBindings().Process.fromPid(pid);
 			if (!current || current.incarnation !== expectedIncarnation) return false;
-			process.kill(pid, "SIGTERM");
+			process.kill(pid, signal);
 			return true;
 		}
 		const rootProcess = reference as typeof reference & { signalRoot(signal: number): boolean };
-		const signal = os.constants.signals.SIGTERM;
-		return signal !== undefined && rootProcess.signalRoot(signal);
+		const signalNumber = signal === "SIGTERM" ? os.constants.signals.SIGTERM : os.constants.signals.SIGKILL;
+		return signalNumber !== undefined && rootProcess.signalRoot(signalNumber);
 	} catch {
 		return false;
 	}
@@ -273,6 +303,22 @@ function headlessProofMatches(proof: SpawnSubstrateProof, state: HeadlessState):
 	);
 }
 
+async function waitForHeadlessExit(
+	proof: SpawnSubstrateProof,
+	verify: (proof: SpawnSubstrateProof) => Promise<"verified" | "mismatch" | "gone">,
+	sleep: (milliseconds: number) => Promise<void>,
+): Promise<"verified" | "mismatch" | "gone"> {
+	let verdict = await verify(proof);
+	if (verdict !== "verified") return verdict;
+	const polls = Math.ceil(HEADLESS_CLOSE_GRACE_MS / HEADLESS_CLOSE_POLL_MS);
+	for (let attempt = 0; attempt < polls; attempt++) {
+		await sleep(HEADLESS_CLOSE_POLL_MS);
+		verdict = await verify(proof);
+		if (verdict !== "verified") return verdict;
+	}
+	return verdict;
+}
+
 function managedStateProof(proof: ManagedTmuxLaunchProof): Readonly<Record<string, string | number>> {
 	return {
 		sessionName: proof.name,
@@ -308,25 +354,35 @@ export function createSpawnSubstrateProvider(
 	const launchHeadless = dependencies.startHeadless ?? startHeadless;
 	const signalHeadless = dependencies.signalHeadless ?? signalExactHeadless;
 	const isGone = dependencies.isProcessGone ?? defaultIsProcessGone;
+	const sleep = dependencies.sleep ?? (milliseconds => Bun.sleep(milliseconds));
 
 	const provider: SpawnSubstrateProvider = {
 		async launch(spec) {
 			if (!validLaunchSpec(spec, platform))
 				return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
+			const inherited = filterInheritedEnvironment(spec.inheritedEnv ?? env);
+			if (inherited.dropped.length > 0) {
+				if (dependencies.onInheritedEnvironmentDrop) dependencies.onInheritedEnvironmentDrop(inherited.dropped);
+				else
+					logger.warn("sdk broker dropped unsupported inherited child environment entries", {
+						names: inherited.dropped,
+					});
+			}
+			const launchEnv: NodeJS.ProcessEnv = { ...inherited.environment, ...(spec.env ?? {}) };
 			const selected = selectMultiplexer();
 			if (selected === "proof_failed")
 				return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
 			if (selected === "tmux" || selected === "psmux") {
 				let managed: ManagedTmuxLaunchProof;
 				try {
-					managed = launchManaged(spec, env, platform);
+					managed = launchManaged(spec, launchEnv, platform);
 				} catch {
 					return { ok: false, code: "substrate_proof_failed", message: messageFor("substrate_proof_failed") };
 				}
 				const incarnation = readIncarnation(managed.pid);
-				if (!incarnation || verifyManaged(managed, env) !== "verified") {
+				if (!incarnation || verifyManaged(managed, launchEnv) !== "verified") {
 					try {
-						await closeManaged(managed, env);
+						await closeManaged(managed, launchEnv);
 					} catch {
 						// The managed close primitive is already exact-proof fenced. Retain its result only in authority state.
 					}
@@ -346,7 +402,7 @@ export function createSpawnSubstrateProvider(
 			}
 			let child: SpawnHeadlessProcess;
 			try {
-				child = launchHeadless(spec, env);
+				child = launchHeadless(spec, launchEnv);
 			} catch {
 				return { ok: false, code: "substrate_unavailable", message: messageFor("substrate_unavailable") };
 			}
@@ -414,9 +470,24 @@ export function createSpawnSubstrateProvider(
 			}
 			if (!isPositiveInteger(proof.pid) || !isNonEmptyString(proof.processIncarnation))
 				return { ok: false, code: "substrate_mismatch" };
-			return signalHeadless(proof.pid, proof.processIncarnation, platform)
-				? { ok: true }
-				: { ok: false, code: "substrate_mismatch" };
+			const closeFailure = (verdict: "verified" | "mismatch" | "gone") => ({
+				ok: false,
+				code: verdict === "verified" ? "substrate_close_pending" : `substrate_${verdict}`,
+			});
+			// Delivery starts shutdown; only a later exact proof of absence completes it.
+			if (!signalHeadless(proof.pid, proof.processIncarnation, platform, "SIGTERM")) {
+				const afterSignalFailure = await provider.verify(proof);
+				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
+			}
+			const afterTerm = await waitForHeadlessExit(proof, provider.verify, sleep);
+			if (afterTerm === "gone") return { ok: true };
+			if (afterTerm !== "verified") return closeFailure(afterTerm);
+			if (!signalHeadless(proof.pid, proof.processIncarnation, platform, "SIGKILL")) {
+				const afterSignalFailure = await provider.verify(proof);
+				return afterSignalFailure === "gone" ? { ok: true } : closeFailure(afterSignalFailure);
+			}
+			const afterKill = await waitForHeadlessExit(proof, provider.verify, sleep);
+			return afterKill === "gone" ? { ok: true } : closeFailure(afterKill);
 		},
 	};
 	return provider;

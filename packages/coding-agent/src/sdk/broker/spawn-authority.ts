@@ -53,6 +53,9 @@ export interface SpawnSubstrateLaunchSpec {
 	childSessionId: string;
 	cwd: string;
 	argv: readonly string[];
+	/** Broker-inherited values are filtered to the portable launch subset. */
+	inheritedEnv?: Readonly<Record<string, string>>;
+	/** Child-specific values are part of this spec and must be shell-safe. */
 	env?: Readonly<Record<string, string>>;
 }
 

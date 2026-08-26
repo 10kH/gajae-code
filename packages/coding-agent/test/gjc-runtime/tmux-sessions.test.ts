@@ -9,9 +9,11 @@ import {
 	__setExecutableIdentityResolverForTests,
 	clearPsmuxDetectionCache,
 } from "@gajae-code/coding-agent/gjc-runtime/psmux-detect";
+import { tmuxRuntimeSessionPath } from "@gajae-code/coding-agent/gjc-runtime/session-layout";
 import {
 	buildGjcTmuxExactOptionTarget,
 	buildGjcTmuxExactSessionTarget,
+	buildGjcTmuxSessionSlug,
 	buildGjcTmuxUntaggedSessionHint,
 } from "@gajae-code/coding-agent/gjc-runtime/tmux-common";
 import {
@@ -31,6 +33,7 @@ import {
 	__setMutationServerProofForTests,
 	attachGjcTmuxSession,
 	createGjcTmuxSession,
+	createManagedGjcTmuxSession,
 	forceCloseGjcTmuxSession,
 	listGjcTmuxSessions,
 	removeGjcTmuxSession,
@@ -741,6 +744,94 @@ describe("GJC tmux session management", () => {
 		expect(innerCommand).toContain("BROKER_CHILD_ENV='enabled'");
 		expect(innerCommand).toContain('GJC_MANAGED_OWNER_COMMAND_JSON=\'["child-command","--safe"]\'');
 		expect(innerCommand).toContain("GJC_MANAGED_OWNER_REDACT_COMMAND='1'");
+	});
+
+	it("cleans the exact created session when managed proof rejects multiple pane PIDs", () => {
+		const cwd = path.join(os.tmpdir(), `gjc-managed-proof-cleanup-${crypto.randomUUID()}`);
+		const sessionName = "broker-child";
+		const stateFile = tmuxRuntimeSessionPath(cwd, sessionName, buildGjcTmuxSessionSlug(sessionName));
+		let generation = "";
+		__setMutationServerProofForTests(() => ({ pid: 1, startTime: "test" }));
+		__setCreateOwnerIsolationForTests({
+			execute: plan => ({
+				ok: true,
+				code: "executed",
+				execution: plan.ok ? plan.execution : (undefined as never),
+				server: { state: "safe", pid: 1, startTime: "test", cgroup: { classification: "safe" } },
+				server_key: "tmux",
+				server_pid: 1,
+				server_start_time: "test",
+				server_session: sessionName,
+				native_session_id: "$1",
+			}),
+		});
+		const calls: string[][] = [];
+		(spyOn(Bun, "spawnSync") as unknown as SpawnSyncSpy).mockImplementation((rawCommand: unknown) => {
+			const command = normalizeSpawnSyncCommand(rawCommand);
+			calls.push(command);
+			if (command.includes("if-shell")) {
+				generation = command.join(" ").match(/@gjc-owner-generation" "([^"]+)"/)?.[1] ?? generation;
+				return spawnResult(0, "__gjc_tmux_guarded_mutation_ok__\n");
+			}
+			if (command.includes("list-sessions"))
+				return spawnResult(
+					0,
+					[
+						sessionName,
+						"1",
+						"0",
+						"1770000000",
+						"1",
+						"root",
+						"1",
+						"101,102",
+						"",
+						"",
+						"",
+						sessionName,
+						stateFile,
+						generation,
+						"",
+						"",
+						"$1",
+					].join("\t") + "\n",
+				);
+			if (command.includes("display-message")) {
+				if (command.includes("#{session_id}\t#{session_name}")) return spawnResult(0, `$1\t${sessionName}\n`);
+				return spawnResult(0, command.includes("#{session_name}") ? `${sessionName}\n` : "$1\n");
+			}
+			if (command.includes("show-options")) {
+				const option = command.at(-1);
+				const value =
+					option === "@gjc-profile"
+						? "1"
+						: option === "@gjc-session-id"
+							? sessionName
+							: option === "@gjc-session-state-file"
+								? stateFile
+								: option === "@gjc-owner-generation"
+									? generation
+									: option === "@gjc-owner-server-key"
+										? "tmux"
+										: "";
+				return spawnResult(0, `${value}\n`);
+			}
+			return spawnResult(0, "");
+		});
+
+		expect(() =>
+			createManagedGjcTmuxSession(
+				{ childSessionId: sessionName, cwd, argv: ["child-command"] },
+				{ GJC_TMUX_COMMAND: "tmux" },
+				{ platform: "darwin" },
+			),
+		).toThrow("gjc_tmux_managed_launch_proof_unavailable");
+		const cleanup = calls.find(
+			command => command[1] === "if-shell" && command.some(argument => argument.includes("kill-session")),
+		);
+		expect(cleanup?.[3]).toBe("$1");
+		expect(cleanup?.[5]).toContain("#{session_id},$1");
+		expect(cleanup?.[5]).toContain(`#{session_name},${sessionName}`);
 	});
 	it("refuses psmux before attach-session mutation", () => {
 		__setBinaryResolverForTests(candidate => (candidate === "psmux" ? "/fake/psmux" : null));
