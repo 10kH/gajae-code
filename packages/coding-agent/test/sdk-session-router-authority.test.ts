@@ -1881,7 +1881,7 @@ describe("SessionRouter dispatch authority", () => {
 				indexSeq: 1,
 				sessions: [wedged, healthy].map(sessionId => ({
 					sessionId,
-					locator: { repo, stateRoot },
+					locator: { cwd: repo, worktreeRoot: repo, stateRoot },
 					endpointGeneration: 1,
 					pid: 42,
 					endpointMtimeMs: fs.statSync(endpointFiles.get(sessionId)!).mtimeMs,
@@ -1976,7 +1976,7 @@ describe("SessionRouter dispatch authority", () => {
 				sessions: [
 					{
 						sessionId,
-						locator: { repo, stateRoot },
+						locator: { cwd: repo, worktreeRoot: repo, stateRoot },
 						endpointGeneration: 1,
 						pid: 42,
 						endpointMtimeMs: fs.statSync(endpointFile).mtimeMs,
@@ -1987,7 +1987,7 @@ describe("SessionRouter dispatch authority", () => {
 					},
 					{
 						sessionId: transient,
-						locator: { repo, stateRoot },
+						locator: { cwd: repo, worktreeRoot: repo, stateRoot },
 						endpointGeneration: 1,
 						pid: 43,
 						endpointMtimeMs: fs.statSync(transientEndpoint).mtimeMs,
