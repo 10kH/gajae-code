@@ -299,3 +299,64 @@ test("SDK-only runtime registers its broker endpoint and retracts it on shutdown
 		await fs.rm(agentDir, { recursive: true, force: true });
 	}
 });
+
+test("SDK-only runtime rejects an endpoint substituted before broker registration", async () => {
+	const agentDir = await fs.mkdtemp(path.join(process.env.TMPDIR ?? "/tmp", "gjc-sdk-registration-authority-"));
+	const cwd = path.join(agentDir, "workspace");
+	const sessionId = "sdk-registration-authority";
+	const broker = new Broker({ agentDir });
+	await broker.start();
+	const handlers = new Map<string, (event: unknown, ctx: ExtensionContext) => void | Promise<void>>();
+	const api = {
+		on(event: string, handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>) {
+			handlers.set(event, handler);
+		},
+	} as unknown as ExtensionAPI;
+	createSdkSessionRuntimeExtension(api, {
+		agentDir,
+		brokerRegistrationRequired: true,
+		createTransport: async input => {
+			const transport = await createSdkWebSocketTransport(input);
+			const realStart = transport.start.bind(transport);
+			return {
+				...transport,
+				start: async () => {
+					const endpoint = await realStart();
+					const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
+					await fs.rename(endpointPath, `${endpointPath}.substituted`);
+					await fs.writeFile(
+						endpointPath,
+						JSON.stringify({
+							version: 1,
+							sessionId: input.sessionId,
+							pid: process.pid,
+							url: "ws://127.0.0.1:1",
+							token: "substituted-endpoint-token",
+						}),
+						{ encoding: "utf8", mode: 0o600 },
+					);
+					return endpoint;
+				},
+			};
+		},
+	});
+	const context = {
+		cwd,
+		sdkBindings: () => [],
+		sessionManager: { getSessionId: () => sessionId, getSessionName: () => undefined },
+	} as unknown as ExtensionContext;
+	try {
+		const start = handlers.get("session_start");
+		if (!start) throw new Error("SDK-only session_start handler was not registered.");
+		await expect(start({}, context)).rejects.toThrow("SDK endpoint did not match the published transport authority.");
+		expect(await broker.handleRequest("session.get_endpoint", { sessionId, endpointGeneration: 1 })).toMatchObject({
+			ok: false,
+			error: { code: "resource_gone" },
+		});
+	} finally {
+		const shutdown = handlers.get("session_shutdown");
+		if (shutdown) await Promise.resolve(shutdown({}, context)).catch(() => undefined);
+		await broker.stop();
+		await fs.rm(agentDir, { recursive: true, force: true });
+	}
+});

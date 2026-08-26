@@ -4186,6 +4186,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 		const disposeGate = ctx.workflowGate?.onGateEmitted?.(gate =>
 			runtime.emitEvent({ kind: "workflow_gate", payload: gate }),
 		);
+		let publishedEndpointUrl: string | undefined;
 		let brokerRegistered = false;
 		const registerBroker = async (): Promise<void> => {
 			if (brokerRegistered) return;
@@ -4206,13 +4207,36 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				});
 				await runtime.registerWithBroker({
 					register: async input => {
+						if (publishedEndpointUrl === undefined)
+							throw new Error("SDK transport endpoint was not published before broker registration.");
 						const endpointPath = path.join(input.stateRoot, "sdk", `${input.sessionId}.json`);
-						const [endpointStat, endpointIdentity] = await Promise.all([
-							fs.stat(endpointPath),
-							fs.stat(endpointPath, { bigint: true }),
-						]);
-						const endpointMtimeMs = endpointStat.mtimeMs;
-						const endpointFileId = `${endpointIdentity.dev}:${endpointIdentity.ino}`;
+						const endpointHandle = await fs.open(endpointPath, "r");
+						let endpointMtimeMs: number;
+						let endpointFileId: string;
+						try {
+							const before = await endpointHandle.stat({ bigint: true });
+							const source = await endpointHandle.readFile("utf8");
+							const after = await endpointHandle.stat({ bigint: true });
+							if (
+								before.dev !== after.dev ||
+								before.ino !== after.ino ||
+								before.size !== after.size ||
+								before.mtimeNs !== after.mtimeNs
+							)
+								throw new Error("SDK endpoint changed while broker registration was reading it.");
+							const endpoint = JSON.parse(source) as Record<string, unknown>;
+							if (
+								endpoint.sessionId !== input.sessionId ||
+								endpoint.pid !== process.pid ||
+								endpoint.url !== publishedEndpointUrl ||
+								endpoint.token !== transport.token
+							)
+								throw new Error("SDK endpoint did not match the published transport authority.");
+							endpointMtimeMs = Number(before.mtimeNs) / 1_000_000;
+							endpointFileId = `${before.dev}:${before.ino}`;
+						} finally {
+							await endpointHandle.close();
+						}
 						const masterRole = masterAttestationForEffectiveHost({
 							masterCapability: options.masterCapability,
 							attestationEpoch: options.masterAttestationEpoch,
@@ -4261,7 +4285,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			lifecycleEpoch: 0,
 		};
 		try {
-			await runtime.start();
+			publishedEndpointUrl = (await runtime.start()).url;
 			await registerBroker();
 		} catch (error) {
 			active = undefined;

@@ -93,13 +93,20 @@ function adoptedDirectAttestation(
 /** Reads and validates a registered host's authenticated endpoint record. */
 export async function readEndpoint(record: IndexedSession): Promise<SessionEndpoint | undefined> {
 	if (record.endpointMtimeMs === undefined || record.endpointFileId === undefined) return undefined;
+	let endpointHandle: fs.FileHandle | undefined;
 	try {
 		const endpointPath = path.join(record.locator.stateRoot, "sdk", `${record.sessionId}.json`);
-		const [source, metadata, identity] = await Promise.all([
-			fs.readFile(endpointPath, "utf8"),
-			fs.stat(endpointPath),
-			fs.stat(endpointPath, { bigint: true }),
-		]);
+		endpointHandle = await fs.open(endpointPath, "r");
+		const before = await endpointHandle.stat({ bigint: true });
+		const source = await endpointHandle.readFile("utf8");
+		const after = await endpointHandle.stat({ bigint: true });
+		if (
+			before.dev !== after.dev ||
+			before.ino !== after.ino ||
+			before.size !== after.size ||
+			before.mtimeNs !== after.mtimeNs
+		)
+			return undefined;
 		const endpoint = JSON.parse(source) as Record<string, unknown>;
 		if (
 			endpoint.sessionId !== record.sessionId ||
@@ -108,17 +115,17 @@ export async function readEndpoint(record: IndexedSession): Promise<SessionEndpo
 			typeof endpoint.token !== "string" ||
 			endpoint.url.length === 0 ||
 			endpoint.token.length === 0 ||
-			endpointFileId(identity) !== record.endpointFileId ||
-			Math.abs(metadata.mtimeMs - record.endpointMtimeMs) > 0.001
+			endpointFileId(before) !== record.endpointFileId ||
+			Math.abs(Number(before.mtimeNs) / 1_000_000 - record.endpointMtimeMs) > 0.001
 		)
 			return undefined;
 		const url = new URL(endpoint.url);
 		if (url.protocol !== "ws:" && url.protocol !== "wss:") return undefined;
-		const after = await fs.stat(endpointPath, { bigint: true });
-		if (endpointFileId(after) !== record.endpointFileId) return undefined;
 		return { url: endpoint.url, token: endpoint.token };
 	} catch {
 		return undefined;
+	} finally {
+		await endpointHandle?.close().catch(() => undefined);
 	}
 }
 
