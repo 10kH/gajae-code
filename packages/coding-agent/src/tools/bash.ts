@@ -560,7 +560,7 @@ export function isStrictDirectSdkSpawnCommand(command: string): boolean {
 	return strictDirectSdkSpawnTokens(command) !== undefined;
 }
 
-function parseDirectSdkSpawnArgs(command: string): SdkSpawnArgs {
+export function parseDirectSdkSpawnArgs(command: string): SdkSpawnArgs {
 	const tokens = strictDirectSdkSpawnTokens(command);
 	if (tokens === undefined) throw new ToolError("Master spawn command is not a direct shell-safe invocation.");
 	const args: SdkSpawnArgs = {};
@@ -586,6 +586,9 @@ function parseDirectSdkSpawnArgs(command: string): SdkSpawnArgs {
 				break;
 			case "--profile":
 				args.profile = value;
+				break;
+			case "--idempotency-key":
+				args.idempotencyKey = value;
 				break;
 			case "--agent-dir":
 				throw new ToolError("Master spawn cannot override the session agent directory.");
