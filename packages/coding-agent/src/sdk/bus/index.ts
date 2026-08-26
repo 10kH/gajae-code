@@ -94,10 +94,13 @@ import { resolveSessionLocator, SessionIndex } from "../broker/session-index";
 import {
 	CAP_GATED_FRAME_KINDS,
 	createSdkSurfaceFactory,
+	masterAttestationForEffectiveHost,
+	reattestMasterSessionIdentity,
 	type SessionSdkHost,
 	SessionSdkSessionRuntime,
 	shouldHostSdk,
 	TOOL_ACTIVITY_CAPABILITY,
+	verifyMasterCapabilityFrame,
 } from "../host";
 import { type AbortScope, type ControlSurface, dispatchControl, TypedControlError } from "../host/control";
 import { BROKER_RUNTIME_CLOSE_CAPABILITY_FIELD } from "../host/control/runtime-gate";
@@ -4033,6 +4036,10 @@ export function createNotificationsExtension(
 		controller?: NotificationSessionController;
 		/** Whether this host mode can own the root SDK endpoint. Default: true. */
 		sdkHostModeSupported?: boolean;
+		/** In-memory master capability for private broker verification only. */
+		masterCapability?: string;
+		/** Opaque direct-role epoch this effective host may adopt. */
+		masterAttestationEpoch?: string;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
@@ -4093,6 +4100,7 @@ export function createNotificationsExtension(
 		  }
 		| undefined;
 	let extensionShuttingDown = false;
+	const consumedMasterNonces = new Map<string, number>();
 
 	async function ensureTelegramOwner(settings: Settings): Promise<"ready" | "blocked_identity"> {
 		if (!telegramTopicsEnabled()) return "blocked_identity";
@@ -6581,6 +6589,13 @@ export function createNotificationsExtension(
 			...(activationGate ? { activationGate } : {}),
 			...(settings ? { settings } : {}),
 			...(configOverrides ? { configOverrides } : {}),
+			masterCapabilityVerify: frame =>
+				verifyMasterCapabilityFrame({
+					frame,
+					expectedCapability: options.masterCapability,
+					expectedEpoch: options.masterAttestationEpoch,
+					replay: consumedMasterNonces,
+				}),
 			connectionCapabilities: connectionId => hostCapCache.get(connectionId),
 			installProviderDefinitions,
 			onProviderDefinitionsRemoved: removeProviderDefinitions,
@@ -7729,10 +7744,28 @@ export function createNotificationsExtension(
 					const locator = await resolveSessionLocator(ctx.cwd, endpointStateRoot);
 					const endpointMtimeMs = fs.statSync(path.join(endpointStateRoot, "sdk", `${id}.json`)).mtimeMs;
 					const hostProcessIncarnation = processIncarnation(process.pid);
+					const direct = await reattestMasterSessionIdentity({
+						index,
+						locator,
+						masterCapability: options.masterCapability,
+						attestationEpoch: options.masterAttestationEpoch,
+						sessionId: id,
+						pid: process.pid,
+						processIncarnation: hostProcessIncarnation,
+					});
+					throwIfLifecycleStopped();
 					await host.registerWithBroker({
 						// The endpoint is written before registration. Its exact mtime
 						// binds this index generation to that discovery record.
 						register: async input => {
+							const masterRole = masterAttestationForEffectiveHost({
+								masterCapability: options.masterCapability,
+								attestationEpoch: options.masterAttestationEpoch,
+								sessionId: input.sessionId,
+								pid: process.pid,
+								processIncarnation: hostProcessIncarnation,
+								direct,
+							});
 							await index.append({
 								type: "host_registered",
 								...input,
@@ -7744,6 +7777,7 @@ export function createNotificationsExtension(
 								// teardown identity provable after that workspace is gone.
 								...(hostProcessIncarnation ? { processIncarnation: hostProcessIncarnation } : {}),
 								endpointMtimeMs,
+								...(masterRole ? { masterRole } : {}),
 								...(lifecycleRequestId ? { lifecycleRequestId } : {}),
 							});
 						},
