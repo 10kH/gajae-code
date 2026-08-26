@@ -742,7 +742,7 @@ export class InputController {
 		this.ctx.editor.setActionKeys("app.message.dequeue", this.ctx.keybindings.getKeys("app.message.dequeue"));
 		this.ctx.editor.onDequeue = () => this.#executeAction("app.message.dequeue");
 		this.#registerCommandPaletteAction("app.message.dequeue", dequeue);
-		const queue = () => this.handleQueueSubmit();
+		const queue = () => this.#executeAction("app.message.queue");
 		this.ctx.editor.setActionKeys("app.message.queue", this.ctx.keybindings.getKeys("app.message.queue"));
 		this.ctx.editor.onQueue = () => this.#executeAction("app.message.queue");
 		this.#registerCommandPaletteAction("app.message.queue", queue, true);

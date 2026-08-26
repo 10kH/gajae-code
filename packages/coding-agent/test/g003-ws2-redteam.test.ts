@@ -204,6 +204,50 @@ describe("G003 WS2 red-team: command palette", () => {
 		expect(busy.actionRegistry.isAvailable("app.message.queue")).toBe(true);
 	});
 
+	it("rechecks queue availability when streaming ends after palette open", async () => {
+		let text = "draft";
+		let submitted = 0;
+		let palette: CommandPalette | undefined;
+		const session = {
+			messages: [],
+			isStreaming: true,
+			getQueuedMessageEntries: () => [],
+			getRoleModelCycleCandidateCount: () => 0,
+			hasForegroundBashBackgroundRequestHandler: () => false,
+			prompt: async () => {
+				submitted += 1;
+			},
+		};
+		const controller = new InputController(
+			createControllerContext({
+				editor: {
+					getText: () => text,
+					setText: (value: string) => {
+						text = value;
+					},
+					onSubmit: async () => {},
+				} as never,
+				session: session as never,
+				ui: {
+					showOverlay(component: CommandPalette) {
+						palette = component;
+						return { hide: () => {} };
+					},
+					setFocus: () => {},
+					requestRender: () => {},
+				} as never,
+			}) as never,
+		);
+		controller.openCommandPalette();
+		for (const key of "queue message") palette?.handleInput(key);
+		session.isStreaming = false;
+		palette?.handleInput("\n");
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(submitted).toBe(0);
+		expect(text).toBe("draft");
+	});
+
 	it("does not open a palette over an active transcript overlay", () => {
 		let overlays = 0;
 		const ctx = createControllerContext({
