@@ -441,7 +441,11 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		});
 		const events: string[] = [];
 		const mock = createMockModel({
-			responses: [{ throw: "503 service unavailable: overloaded_error" }, { content: ["done"] }],
+			responses: [
+				{ throw: "503 service unavailable: overloaded_error" },
+				{ throw: "503 service unavailable: overloaded_error" },
+				{ content: ["done"] },
+			],
 		});
 		const agent = new Agent({
 			initialState: { model: primary, systemPrompt: ["test"], tools: [], messages: [] },
@@ -467,17 +471,17 @@ describe("AgentSession escaped non-ASCII fallback terminal (#4880)", () => {
 		for (let attempt = 0; attempt < 100 && keyCalls < 3; attempt++) await Bun.sleep(5);
 		expect(keyCalls).toBeGreaterThanOrEqual(3);
 		const abort = session.abort();
-		holdFallbackResolution = false;
-		fallbackKeyGate.resolve("test-key");
 		await abort;
 		await prompt.catch(() => {});
+		holdFallbackResolution = false;
+		fallbackKeyGate.resolve("test-key");
 		await session.waitForIdle();
 
 		expect(streamCalls).toEqual([selector(primary)]);
 		expect(events).toEqual([]);
 		await session.prompt("after abort");
-		expect(streamCalls).toEqual([selector(primary), selector(primary)]);
-		expect(session.model?.provider).toBe(primary.provider);
-		expect(session.model?.id).toBe(primary.id);
+		expect(streamCalls).toEqual([selector(primary), selector(primary), selector(fallback)]);
+		expect(session.model?.provider).toBe(fallback.provider);
+		expect(session.model?.id).toBe(fallback.id);
 	});
 });

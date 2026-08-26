@@ -18924,6 +18924,8 @@ export class AgentSession {
 		previousModel?: Model,
 		previousThinkingLevel?: ThinkingLevel,
 	): Promise<boolean> {
+		const promptAbortSignal = this.#promptPreflightAbortController.signal;
+		const cancellationSignal = signal ? AbortSignal.any([signal, promptAbortSignal]) : promptAbortSignal;
 		const rollbackCancelled = async (): Promise<boolean> => {
 			if (rollbackState) controller.restoreRuntimeState(rollbackState);
 			if (previousModel && this.model !== previousModel) {
@@ -18939,7 +18941,7 @@ export class AgentSession {
 			}
 			return false;
 		};
-		if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+		if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
 			return await rollbackCancelled();
 		while (!controller.isExhausted()) {
 			const selector = controller.currentSelector();
@@ -18965,7 +18967,7 @@ export class AgentSession {
 						sessionId: this.agent.providerSessionId ?? this.sessionId,
 						credentialSessionId: this.credentialSessionId,
 					});
-			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
 				return await rollbackCancelled();
 			if (!resolved.model) {
 				controller.onResolutionSkip("unknown_model");
@@ -18980,8 +18982,23 @@ export class AgentSession {
 				controller.onResolutionSkip(managedCursorUnavailable);
 				continue;
 			}
-			const key = await this.#modelRegistry.getApiKey(resolved.model, this.credentialSessionId);
-			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+			const cancellation = Promise.withResolvers<"aborted">();
+			const onAbort = () => cancellation.resolve("aborted");
+			cancellationSignal.addEventListener("abort", onAbort, { once: true });
+			let keyResult: { kind: "resolved"; key: string | undefined } | { kind: "aborted" };
+			try {
+				keyResult = await Promise.race([
+					this.#modelRegistry
+						.getApiKey(resolved.model, this.credentialSessionId)
+						.then(key => ({ kind: "resolved" as const, key })),
+					cancellation.promise.then(() => ({ kind: "aborted" as const })),
+				]);
+			} finally {
+				cancellationSignal.removeEventListener("abort", onAbort);
+			}
+			if (keyResult.kind === "aborted") return await rollbackCancelled();
+			const key = keyResult.key;
+			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
 				return await rollbackCancelled();
 			if (!isAuthenticated(key) && key !== kNoAuth) {
 				controller.onResolutionSkip("unauthenticated");
@@ -18999,7 +19016,7 @@ export class AgentSession {
 			);
 			this.agent.setThinkingLevel(toReasoningEffort(this.#thinkingLevel));
 			await this.#syncEditToolModeAfterModelChange(previousEditMode);
-			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) {
+			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch)) {
 				return await rollbackCancelled();
 			}
 			if (from !== to) {
@@ -19019,7 +19036,7 @@ export class AgentSession {
 					attemptsUsed,
 				});
 			}
-			if (signal?.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
+			if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
 				return await rollbackCancelled();
 			return true;
 		}
@@ -19404,7 +19421,7 @@ export class AgentSession {
 		const retry = async (ownership?: ManagedAttemptContinuationOwnership): Promise<void> => {
 			const activePromptHandle = this.activePromptHandle;
 			const cancellationSignal =
-				ownership?.lease.signal ??
+				ownership?.domain.signal ??
 				(activePromptHandle ? this.#runCancellationDomains.lookup(activePromptHandle)?.signal : undefined);
 			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
 			const abortEpoch = this.#abortAdmissionEpoch;
@@ -19422,6 +19439,10 @@ export class AgentSession {
 				if (failedEntryIndex >= 0 && failedEntryIndex < controller.chain.entries.length) {
 					controllerStateBeforeAdvance.activeIndex = failedEntryIndex;
 					controllerStateBeforeAdvance.attemptsUsed = 0;
+					controllerStateBeforeAdvance.totalAttemptsUsed = Math.max(
+						0,
+						controllerStateBeforeAdvance.totalAttemptsUsed - 1,
+					);
 					controllerStateBeforeAdvance.attemptStarted = false;
 					controllerStateBeforeAdvance.exhaustedForTurn = false;
 					controllerStateBeforeAdvance.tried = controllerStateBeforeAdvance.tried.slice(0, -1);
