@@ -1858,7 +1858,7 @@ function createControlSurface(
 									});
 									retirePendingOwner?.(kind, correlation, "always");
 								} catch (transitionError) {
-									if (kind === "prompt") {
+									if (kind === "prompt" || kind === "skill") {
 										retirePendingOwner?.(kind, correlation, "recover-terminal");
 										return;
 									}
@@ -1920,7 +1920,7 @@ function createControlSurface(
 								try {
 									await reconciliation.noteTransition(kind, correlation, { type: "agent_failed", error });
 								} catch {
-									if (kind === "prompt") {
+									if (kind === "prompt" || kind === "skill") {
 										retirePendingOwner?.(
 											kind,
 											correlation,
@@ -1953,7 +1953,7 @@ function createControlSurface(
 								try {
 									await reconciliation.noteTransition(kind, correlation, { type: "agent_end" });
 								} catch (transitionError) {
-									if (kind === "prompt") {
+									if (kind === "prompt" || kind === "skill") {
 										retirePendingOwner?.(
 											kind,
 											correlation,
