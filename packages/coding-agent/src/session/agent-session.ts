@@ -18776,7 +18776,17 @@ export class AgentSession {
 					return {
 						type: "retry",
 						continuation: async ownership => {
-							if (!ownership.isCurrent() || ownership.lease.signal.aborted) return;
+							if (!ownership.isCurrent() || ownership.lease.signal.aborted) {
+								if (this.#abortAdmissionEpoch === abortEpoch) {
+									await this.#restoreDefaultFallbackTransition(
+										controller,
+										controllerStateBeforeFailure,
+										previousModel,
+										previousThinkingLevel,
+									);
+								}
+								return;
+							}
 							await this.agent.continue({
 								...this.#managedFallbackPromptOptions(),
 								transientRecoveryMessage: this.#escapedNonAsciiRecoveryMessage(),
@@ -18916,6 +18926,26 @@ export class AgentSession {
 		return undefined;
 	}
 
+	async #restoreDefaultFallbackTransition(
+		controller: FallbackChainController,
+		rollbackState: FallbackChainRuntimeState | undefined,
+		previousModel: Model | undefined,
+		previousThinkingLevel: ThinkingLevel | undefined,
+	): Promise<void> {
+		if (rollbackState) controller.restoreRuntimeState(rollbackState);
+		if (previousModel && this.model !== previousModel) {
+			const previousEditMode = this.#resolveActiveEditMode();
+			this.#setModelAuthoritatively(previousModel, "fallback-switch");
+			this.#thinkingLevel = previousThinkingLevel;
+			this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
+			await this.#syncEditToolModeAfterModelChange(previousEditMode);
+		}
+		if (previousModel && this.model === previousModel && this.thinkingLevel !== previousThinkingLevel) {
+			this.#thinkingLevel = previousThinkingLevel;
+			this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
+		}
+	}
+
 	async #advanceDefaultFallback(
 		controller: FallbackChainController,
 		reason: string,
@@ -18928,6 +18958,8 @@ export class AgentSession {
 	): Promise<boolean> {
 		const promptAbortSignal = this.#promptPreflightAbortController.signal;
 		const cancellationSignal = signal ? AbortSignal.any([signal, promptAbortSignal]) : promptAbortSignal;
+		const restoreFallbackTransition = () =>
+			this.#restoreDefaultFallbackTransition(controller, rollbackState, previousModel, previousThinkingLevel);
 		const awaitWithCancellation = async <T>(pending: Promise<T>) => {
 			const cancellation = Promise.withResolvers<"aborted">();
 			const onAbort = () => cancellation.resolve("aborted");
@@ -18942,18 +18974,7 @@ export class AgentSession {
 			}
 		};
 		const rollbackCancelled = async (): Promise<boolean> => {
-			if (rollbackState) controller.restoreRuntimeState(rollbackState);
-			if (previousModel && this.model !== previousModel) {
-				const previousEditMode = this.#resolveActiveEditMode();
-				this.#setModelAuthoritatively(previousModel, "fallback-switch");
-				this.#thinkingLevel = previousThinkingLevel;
-				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
-				await this.#syncEditToolModeAfterModelChange(previousEditMode);
-			}
-			if (previousModel && this.model === previousModel && this.thinkingLevel !== previousThinkingLevel) {
-				this.#thinkingLevel = previousThinkingLevel;
-				this.agent.setThinkingLevel(toReasoningEffort(previousThinkingLevel));
-			}
+			await restoreFallbackTransition();
 			return false;
 		};
 		if (cancellationSignal.aborted || (abortEpoch !== undefined && this.#abortAdmissionEpoch !== abortEpoch))
@@ -19459,8 +19480,11 @@ export class AgentSession {
 			}
 			let advanced = outcome !== "advance";
 			let resolutionError: unknown;
+			let controllerStateBeforeAdvance: FallbackChainRuntimeState | undefined;
+			let previousModel: Model | undefined;
+			let previousThinkingLevel: ThinkingLevel | undefined;
 			if (outcome === "advance") {
-				const controllerStateBeforeAdvance = controller.snapshotRuntimeState();
+				controllerStateBeforeAdvance = controller.snapshotRuntimeState();
 				const failedEntryIndex = controller.activeIndex - 1;
 				if (failedEntryIndex >= 0 && failedEntryIndex < controller.chain.entries.length) {
 					controllerStateBeforeAdvance.activeIndex = failedEntryIndex;
@@ -19473,8 +19497,8 @@ export class AgentSession {
 					controllerStateBeforeAdvance.exhaustedForTurn = false;
 					controllerStateBeforeAdvance.tried = controllerStateBeforeAdvance.tried.slice(0, -1);
 				}
-				const previousModel = this.model;
-				const previousThinkingLevel = this.thinkingLevel;
+				previousModel = this.model;
+				previousThinkingLevel = this.thinkingLevel;
 				try {
 					advanced = await this.#advanceDefaultFallback(
 						controller,
@@ -19490,7 +19514,17 @@ export class AgentSession {
 					resolutionError = error;
 				}
 			}
-			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) return;
+			if (ownership && (!ownership.isCurrent() || cancellationSignal?.aborted)) {
+				if (this.#abortAdmissionEpoch === abortEpoch) {
+					await this.#restoreDefaultFallbackTransition(
+						controller,
+						controllerStateBeforeAdvance,
+						previousModel,
+						previousThinkingLevel,
+					);
+				}
+				return;
+			}
 			if (this.#abortAdmissionEpoch !== abortEpoch) {
 				controller.resetForNewTurn();
 				return;
