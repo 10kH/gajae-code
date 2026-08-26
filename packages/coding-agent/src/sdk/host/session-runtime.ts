@@ -1575,7 +1575,6 @@ function createControlSurface(
 		waiters?: Array<{ epoch: number; resolve: (observed: boolean) => void }>;
 	},
 	activePromptOwnerHolder?: { connectionIds?: ReadonlySet<string>; lifecycleEpoch?: number },
-	lifecycleRuntimeState?: RuntimeState,
 	retirePendingOwner?: (
 		kind: InvocationKind,
 		correlation: InvocationCorrelation,
@@ -4039,7 +4038,6 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 			options.terminalAbortSeams,
 			terminalPublicationCapture,
 			activePromptOwnerHolder,
-			lifecycleRuntimeState,
 			(
 				kind: InvocationKind,
 				correlation: InvocationCorrelation,
@@ -4287,7 +4285,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 				logger.warn(`sdk broker registration unavailable: ${String(error)}`);
 			}
 		};
-		active = {
+		lifecycleRuntimeState = active = {
 			sessionId,
 			sessionIdentity,
 			runtime,
