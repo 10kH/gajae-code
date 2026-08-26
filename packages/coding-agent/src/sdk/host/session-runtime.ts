@@ -188,6 +188,8 @@ export interface SessionSdkRuntimeOptions
 	settings?: Settings;
 	/** Mutable shadow of patched config values merged into query readback. */
 	configOverrides?: Map<string, unknown>;
+	/** Stable master lineage identity retained across session switches/branches. */
+	masterOwnerSessionId?: string;
 }
 
 export interface SdkOnlyInvocationRecord extends InvocationCorrelation {
@@ -461,6 +463,8 @@ export interface CreateSdkSessionRuntimeOptions {
 	masterCapability?: string;
 	/** Opaque direct-role epoch this effective host may adopt. */
 	masterAttestationEpoch?: string;
+	/** Stable master lineage identity retained across session switches/branches. */
+	masterOwnerSessionId?: string;
 	/** Private session-owned terminal-abort capabilities; never exposed on ExtensionContext. */
 	terminalAbortSeams?: SdkOnlyTerminalAbortSeams;
 	/** Callback when a frame is admitted to the runtime (test harness). */
@@ -3104,6 +3108,7 @@ export function registerSdkOnlyNotificationCommand(api: ExtensionAPI): void {
 export function masterAttestationForEffectiveHost(input: {
 	masterCapability: string | undefined;
 	attestationEpoch: string | undefined;
+	ownerSessionId?: string;
 	sessionId: string;
 	pid: number;
 	processIncarnation: string | undefined;
@@ -3114,7 +3119,7 @@ export function masterAttestationForEffectiveHost(input: {
 		input.masterCapability === undefined ||
 		input.attestationEpoch === undefined ||
 		direct === undefined ||
-		direct.ownerSessionId !== input.sessionId ||
+		direct.ownerSessionId !== (input.ownerSessionId ?? input.sessionId) ||
 		direct.launchPid !== input.pid ||
 		direct.launchProcessIncarnation !== input.processIncarnation ||
 		direct.attestationEpoch !== input.attestationEpoch
@@ -3126,6 +3131,7 @@ export function masterAttestationForEffectiveHost(input: {
 function masterDirectAttestation(input: {
 	masterCapability: string | undefined;
 	attestationEpoch: string | undefined;
+	ownerSessionId?: string;
 	sessionId: string;
 	pid: number;
 	processIncarnation: string | undefined;
@@ -3138,7 +3144,7 @@ function masterDirectAttestation(input: {
 		return undefined;
 	return {
 		version: 2,
-		ownerSessionId: input.sessionId,
+		ownerSessionId: input.ownerSessionId ?? input.sessionId,
 		launchPid: input.pid,
 		launchProcessIncarnation: input.processIncarnation,
 		role: "master",
@@ -3168,6 +3174,7 @@ export async function reattestMasterSessionIdentity(input: {
 	locator: SessionLocatorV2;
 	masterCapability: string | undefined;
 	attestationEpoch: string | undefined;
+	ownerSessionId?: string;
 	sessionId: string;
 	pid: number;
 	processIncarnation: string | undefined;
@@ -4192,6 +4199,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 					locator,
 					masterCapability: options.masterCapability,
 					attestationEpoch: options.masterAttestationEpoch,
+					ownerSessionId: options.masterOwnerSessionId,
 					sessionId,
 					pid: process.pid,
 					processIncarnation: effectiveIncarnation,
@@ -4203,6 +4211,7 @@ export function createSdkSessionRuntimeExtension(api: ExtensionAPI, options: Cre
 						const masterRole = masterAttestationForEffectiveHost({
 							masterCapability: options.masterCapability,
 							attestationEpoch: options.masterAttestationEpoch,
+							ownerSessionId: options.masterOwnerSessionId,
 							sessionId: input.sessionId,
 							pid: process.pid,
 							processIncarnation: effectiveIncarnation,

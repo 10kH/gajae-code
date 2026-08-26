@@ -2576,6 +2576,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agentRegistry,
 			getSessionSpawns: () => options.spawns ?? "*",
 			getMasterBashCapability: () => masterModeContext?.getCapability(),
+			getMasterOwnerSessionId: () => masterModeContext?.ownerSessionId,
 			getModelString: () => (hasExplicitModel && model ? formatModelString(model) : undefined),
 			getActiveModelString,
 			getPlanModeState: () => session?.getPlanModeState(),
@@ -3128,6 +3129,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								? {
 										masterCapability: masterModeContext.getCapability(),
 										masterAttestationEpoch: masterModeContext.attestationEpoch,
+										masterOwnerSessionId: masterModeContext.ownerSessionId,
 									}
 								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the
@@ -3184,6 +3186,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 								? {
 										masterCapability: masterModeContext.getCapability(),
 										masterAttestationEpoch: masterModeContext.attestationEpoch,
+										masterOwnerSessionId: masterModeContext.ownerSessionId,
 									}
 								: {}),
 							// INTERNAL terminal-abort seams, threaded directly from the

@@ -4040,6 +4040,8 @@ export function createNotificationsExtension(
 		masterCapability?: string;
 		/** Opaque direct-role epoch this effective host may adopt. */
 		masterAttestationEpoch?: string;
+		/** Stable master lineage identity retained across session switches/branches. */
+		masterOwnerSessionId?: string;
 		onSdkRequest?: (kind: "control" | "query", connectionId: string, frame: Record<string, unknown>) => void;
 		runBtwTurn?: (question: string, signal: AbortSignal) => Promise<{ replyText: string }>;
 		/** Observes settlement of optional session-branch startup after reconciliation completes. */
@@ -6570,6 +6572,7 @@ export function createNotificationsExtension(
 		}
 
 		sdkRuntime = new SessionSdkSessionRuntime({
+			masterOwnerSessionId: options.masterOwnerSessionId,
 			transport: {
 				sessionId: id,
 				stateRoot,
@@ -7749,6 +7752,7 @@ export function createNotificationsExtension(
 						locator,
 						masterCapability: options.masterCapability,
 						attestationEpoch: options.masterAttestationEpoch,
+						ownerSessionId: options.masterOwnerSessionId,
 						sessionId: id,
 						pid: process.pid,
 						processIncarnation: hostProcessIncarnation,
@@ -7761,6 +7765,7 @@ export function createNotificationsExtension(
 							const masterRole = masterAttestationForEffectiveHost({
 								masterCapability: options.masterCapability,
 								attestationEpoch: options.masterAttestationEpoch,
+								ownerSessionId: options.masterOwnerSessionId,
 								sessionId: input.sessionId,
 								pid: process.pid,
 								processIncarnation: hostProcessIncarnation,

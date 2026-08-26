@@ -1196,6 +1196,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// command that contained shell syntax into a privileged one.
 		const directMasterSpawn = isStrictDirectSdkSpawnCommand(rawCommand) && isStrictDirectSdkSpawnCommand(command);
 		const masterCapability = directMasterSpawn ? this.session.getMasterBashCapability?.() : undefined;
+		const masterOwnerSessionId = directMasterSpawn ? this.session.getMasterOwnerSessionId?.() : undefined;
 		const commandEnvOverrides = masterCommandEnvOverrides(expandedEnv, directMasterSpawn);
 		const resolvedEnv = {
 			...buildGjcRuntimeSessionEnv({
@@ -1208,6 +1209,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				: {}),
 			...commandEnvOverrides,
 			...(masterCapability ? { [MASTER_CAPABILITY_ENV]: masterCapability } : {}),
+			...(masterOwnerSessionId ? { GJC_MASTER_OWNER_SESSION_ID: masterOwnerSessionId } : {}),
 			...(this.session.bashRestrictionProfile === "read-only" ? READ_ONLY_BASH_ENV : {}),
 			...(allowedPrefixes && allowedPrefixes.length > 0 ? { [GJC_RESTRICTED_ROLE_AGENT_BASH_ENV]: "1" } : {}),
 		};
@@ -1269,7 +1271,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			env: {
 				...process.env,
 				GJC_MASTER_CAPABILITY: masterCapability,
-				GJC_SESSION_ID: this.session.getSessionId?.() ?? undefined,
+				GJC_SESSION_ID: resolvedEnv?.GJC_MASTER_OWNER_SESSION_ID ?? this.session.getSessionId?.() ?? undefined,
 				GJC_CODING_AGENT_DIR: sessionAgentDir,
 			},
 		});

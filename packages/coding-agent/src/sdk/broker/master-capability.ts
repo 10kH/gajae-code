@@ -128,8 +128,12 @@ async function verifyOverAttachment(input: {
 		const url = new URL(input.endpoint.url);
 		url.searchParams.set("token", input.endpoint.token);
 		socket = new WebSocket(url);
-		const onError = (): void => settle(false);
-		const onClose = (): void => settle(false);
+		const onClose = (): void => {
+			settle(false);
+		};
+		const onError = (): void => {
+			settle(false);
+		};
 		const onMessage = (event: MessageEvent): void => {
 			let frame: Record<string, unknown>;
 			try {
@@ -141,6 +145,7 @@ async function verifyOverAttachment(input: {
 			}
 			if (frame.type === "hello") {
 				try {
+					socket?.send(JSON.stringify({ type: "hello", protocolVersion: 3, capabilities: [] }));
 					socket?.send(
 						JSON.stringify({
 							type: "master_capability_verify",

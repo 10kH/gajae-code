@@ -73,10 +73,15 @@ async function waitFor(predicate: () => boolean | Promise<boolean>, label: strin
 	}
 }
 
-function hasMasterAttestation(rows: readonly IndexedSession[], sessionId: string, epoch: string): boolean {
+function hasMasterAttestation(
+	rows: readonly IndexedSession[],
+	sessionId: string,
+	epoch: string,
+	ownerSessionId = sessionId,
+): boolean {
 	const matches = (row: IndexedSession | undefined): boolean =>
 		row?.masterRole?.version === 2 &&
-		row.masterRole.ownerSessionId === sessionId &&
+		row.masterRole.ownerSessionId === ownerSessionId &&
 		row.masterRole.launchPid === process.pid &&
 		row.masterRole.role === "master" &&
 		row.masterRole.attestationEpoch === epoch;
@@ -86,10 +91,15 @@ function hasMasterAttestation(rows: readonly IndexedSession[], sessionId: string
 	);
 }
 
-async function waitForMasterAttestation(agentDir: string, sessionId: string, epoch: string): Promise<void> {
+async function waitForMasterAttestation(
+	agentDir: string,
+	sessionId: string,
+	epoch: string,
+	ownerSessionId = sessionId,
+): Promise<void> {
 	await waitFor(async () => {
 		const index = await new SessionIndex(agentDir).open();
-		return hasMasterAttestation(index.listSessionIdentities(), sessionId, epoch);
+		return hasMasterAttestation(index.listSessionIdentities(), sessionId, epoch, ownerSessionId);
 	}, `master attestation for ${sessionId}`);
 }
 
@@ -97,13 +107,14 @@ async function assertVerifiableMasterAttachment(
 	agentDir: string,
 	sessionId: string,
 	epoch: string,
+	ownerSessionId = sessionId,
 ): Promise<SessionIndex> {
 	const index = await new SessionIndex(agentDir).open();
 	await index.refresh();
 	const rows = index.listSessionIdentities();
 	const direct = rows.find(row => row.sessionId === sessionId && row.endpointGeneration === 0);
 	const effective = rows.find(row => row.sessionId === sessionId && row.endpointGeneration > 0);
-	expect(hasMasterAttestation(rows, sessionId, epoch)).toBe(true);
+	expect(hasMasterAttestation(rows, sessionId, epoch, ownerSessionId)).toBe(true);
 	expect(direct?.hostIncarnation ?? direct?.processIncarnation).toBe(direct?.masterRole?.launchProcessIncarnation);
 	expect(effective).toMatchObject({ live: true, terminal: false, ambiguous: false });
 	expect(effective?.hostIncarnation ?? effective?.processIncarnation).toBe(

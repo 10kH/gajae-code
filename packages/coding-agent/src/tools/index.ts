@@ -271,6 +271,8 @@ export interface ToolSession {
 	bashRestrictionProfile?: BashRestrictionProfile;
 	/** Process-local master capability injected into direct Bash children only. */
 	getMasterBashCapability?: () => string | undefined;
+	/** Stable master lineage identity used across session switches and branches. */
+	getMasterOwnerSessionId?: () => string | undefined;
 	/** Optional per-session allowlist for tools exposed through search_tool_bm25. */
 	discoverableToolAllowedNames?: readonly string[];
 	/** Throw instead of warn when toolNames contains an unknown name. */
