@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { SdkSearchResultV1 } from "../src/sdk/broker/session-scope";
+import { type SdkSearchResultV1, sdkSearchResultV1 } from "../src/sdk/broker/session-scope";
 import { mergeProbedSearchRows, renderSdkSearchTable, runSdkSearch } from "../src/sdk/cli/session-cli";
 import { type SessionLifecycleClient, SessionLifecycleService } from "../src/sdk/lifecycle/service";
 
@@ -99,41 +99,57 @@ test("preserves scoped rows beyond the bounded probe budget", () => {
 	expect(merged.slice(100)).toEqual(rows.slice(100));
 });
 
-test("drains all broker continuation pages for scoped search", async () => {
+test("returns one bounded scoped broker page with a resumable cursor", async () => {
 	const root = await temp();
 	const git = Bun.spawn(["git", "init", "-q", root]);
 	await git.exited;
 	try {
-		const rows = Array.from({ length: 125 }, (_, index) => ({
+		const rows = Array.from({ length: 5 }, (_, index) => ({
 			sessionId: `session-${index}`,
 			live: false,
 			locator: { cwd: root, worktreeRoot: root, stateRoot: "/state" },
 		}));
 		const scope = envelope(root, "empty").scope;
+		const inputs: Record<string, unknown>[] = [];
 		class PagedClient implements SessionLifecycleClient {
 			async global(_operation: string, input: Record<string, unknown>): Promise<unknown> {
-				const page = input.cursor === "cursor-1" ? rows.slice(100) : rows.slice(0, 100);
+				inputs.push({ ...input });
+				const offset = input.cursor === "cursor-1" ? 2 : 0;
 				return {
 					ok: true,
 					result: {
 						indexSeq: 7,
-						sessions: page,
+						sessions: rows.slice(offset, offset + 2),
 						warnings: [],
 						scope,
 						observedAt: "2026-08-23T12:00:00.000Z",
-						...(input.cursor === undefined ? { continuationCursor: "cursor-1" } : {}),
+						continuationCursor: offset === 0 ? "cursor-1" : "cursor-2",
 					},
 				};
 			}
 		}
-		const search = await runSdkSearch(
-			{ repo: root },
-			() => new SessionLifecycleService(new PagedClient()),
+		const createService = () => new SessionLifecycleService(new PagedClient());
+		const first = await runSdkSearch({ repo: root, limit: 2 }, createService, async (_agentDir, value) => value);
+		const resumed = await runSdkSearch(
+			{ repo: root, limit: 2, cursor: "cursor-1" },
+			createService,
 			async (_agentDir, value) => value,
 		);
 
-		expect(search.exitCode).toBe(0);
-		expect(search.result.rows).toHaveLength(125);
+		expect(first.exitCode).toBe(0);
+		expect(first.result.rows.map(row => row.id)).toEqual(["session-0", "session-1"]);
+		expect(first.result.rows).toHaveLength(2);
+		expect(first.result.cursor).toBe("cursor-1");
+		expect(sdkSearchResultV1(first.result)).toMatchObject({ cursor: "cursor-1" });
+		expect(renderSdkSearchTable(first.result)).toContain("Continuation cursor: cursor-1");
+		expect(resumed.exitCode).toBe(0);
+		expect(resumed.result.rows.map(row => row.id)).toEqual(["session-2", "session-3"]);
+		expect(resumed.result.rows).toHaveLength(2);
+		expect(resumed.result.cursor).toBe("cursor-2");
+		expect(inputs).toHaveLength(2);
+		expect(inputs[0]).toMatchObject({ limit: 2, scope: { requested: "repo" } });
+		expect(inputs[0]).not.toHaveProperty("cursor");
+		expect(inputs[1]).toMatchObject({ limit: 2, cursor: "cursor-1", scope: { requested: "repo" } });
 	} finally {
 		await fs.rm(root, { recursive: true, force: true });
 	}

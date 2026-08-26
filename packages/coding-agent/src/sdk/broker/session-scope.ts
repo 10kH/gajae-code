@@ -34,6 +34,7 @@ export type SdkSearchResultV1 = {
 	observedAt: string;
 	indexSeq?: number;
 	rows: readonly SdkSearchRowV1[];
+	cursor?: string;
 	warnings: readonly string[];
 	error?: { code: string; message: string };
 };
@@ -155,6 +156,7 @@ export function sdkSearchRowV1(value: unknown): SdkSearchRowV1 | undefined {
 export function sdkSearchResultV1(value: unknown): SdkSearchResultV1 | undefined {
 	const result = record(value);
 	const scope = result === undefined ? undefined : resolvedScopeV1(result.scope);
+	const cursor = typeof result?.cursor === "string" && result.cursor.length > 0 ? result.cursor : undefined;
 	if (
 		result?.version !== 1 ||
 		!scope ||
@@ -166,6 +168,7 @@ export function sdkSearchResultV1(value: unknown): SdkSearchResultV1 | undefined
 		!Array.isArray(result.rows) ||
 		!Array.isArray(result.warnings) ||
 		result.rows.some(row => !sdkSearchRowV1(row)) ||
+		(result.cursor !== undefined && cursor === undefined) ||
 		result.warnings.some(warning => typeof warning !== "string") ||
 		Object.keys(result).some(
 			key =>
@@ -175,6 +178,7 @@ export function sdkSearchResultV1(value: unknown): SdkSearchResultV1 | undefined
 				key !== "observedAt" &&
 				key !== "indexSeq" &&
 				key !== "rows" &&
+				key !== "cursor" &&
 				key !== "warnings" &&
 				key !== "error",
 		)
@@ -201,6 +205,7 @@ export function sdkSearchResultV1(value: unknown): SdkSearchResultV1 | undefined
 		observedAt: result.observedAt,
 		...(indexSeq === undefined ? {} : { indexSeq }),
 		rows: result.rows.map(row => sdkSearchRowV1(row)!),
+		...(cursor === undefined ? {} : { cursor }),
 		warnings: [...result.warnings],
 		...(error === undefined ? {} : { error: { code: error.code as string, message: error.message as string } }),
 	};

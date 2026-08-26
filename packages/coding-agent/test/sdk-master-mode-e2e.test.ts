@@ -7,7 +7,7 @@ import { getBrokerIdentityKey } from "../src/sdk/broker/identity";
 import { processIncarnation } from "../src/sdk/broker/process-incarnation";
 import { type SessionIndexEvent, sessionIndexChecksum } from "../src/sdk/broker/session-index";
 import { SpawnAuthorityStore } from "../src/sdk/broker/spawn-authority";
-import { SDK_STATE_VERSION } from "../src/sdk/broker/state-version";
+import { SESSION_INDEX_EVENT_VERSION } from "../src/sdk/broker/state-version";
 import { runSdkSpawn } from "../src/sdk/cli/master-cli";
 
 const grant = "master-e2e-grant-value";
@@ -22,7 +22,7 @@ function indexEvent(
 ): SessionIndexEvent {
 	const unsigned: Omit<SessionIndexEvent, "checksum"> = {
 		...input,
-		version: SDK_STATE_VERSION as 1,
+		version: SESSION_INDEX_EVENT_VERSION,
 		indexSeq,
 		ts: Date.now(),
 	};
@@ -36,6 +36,7 @@ async function writeIndex(agentDir: string, events: readonly SessionIndexEvent[]
 }
 
 function substrateFake(counters: { launches: number; closes: number }) {
+	let gone = false;
 	return {
 		launch: async () => {
 			counters.launches += 1;
@@ -49,9 +50,10 @@ function substrateFake(counters: { launches: number; closes: number }) {
 				},
 			};
 		},
-		verify: async () => "verified" as const,
+		verify: async () => (gone ? ("gone" as const) : ("verified" as const)),
 		close: async () => {
 			counters.closes += 1;
+			gone = true;
 			return { ok: true };
 		},
 	};
@@ -138,10 +140,13 @@ describe("master mode end to end", () => {
 		try {
 			await writeIndex(agentDir, [direct, effective]);
 
-			// The CLI resolves the epoch from the adopted attestation row and
-			// dispatches through the Broker with a fresh identity per invocation.
+			// The CLI resolves the epoch from the adopted attestation row and can
+			// replay a durable Broker claim when the caller supplies its identity.
+
 			const dispatched: Record<string, unknown>[] = [];
 			const dispatchedKeys: string[] = [];
+			const idempotencyKey = "shared-cli-spawn-key";
+
 			const cliDeps = {
 				env: { GJC_MASTER_CAPABILITY: grant, GJC_SESSION_ID: ownerId },
 				dispatch: async (_dir: string, payload: Record<string, unknown>, idempotencyKey: string) => {
@@ -150,7 +155,10 @@ describe("master mode end to end", () => {
 					return await broker.handleRequest("session.spawn", payload, idempotencyKey);
 				},
 			};
-			const accepted = await runSdkSpawn({ cwd: process.cwd(), prompt: seedText, agentDir }, cliDeps);
+			const accepted = await runSdkSpawn(
+				{ cwd: process.cwd(), prompt: seedText, agentDir, idempotencyKey },
+				cliDeps,
+			);
 			expect(accepted.exitCode).toBe(0);
 			expect(accepted.rendered.code).toBe("spawn_accepted");
 			expect(accepted.rendered.substrateKind).toBe("headless");
@@ -159,9 +167,8 @@ describe("master mode end to end", () => {
 			expect(counters.launches).toBe(1);
 			expect(dispatchCounters.dispatches).toBe(1);
 
-			// The SAME idempotency identity replays the stored outcome: no second
-			// child and no second seed prompt. A new key would be a new task by
-			// contract, so replay must reuse the key the CLI actually sent.
+			// Re-running the CLI with the same identity joins the original claim:
+			// it creates neither another child nor another seed prompt.
 			const childId = accepted.rendered.sessionId;
 			expect(childId).toBeDefined();
 			const identityKey = await getBrokerIdentityKey(agentDir);
@@ -169,8 +176,12 @@ describe("master mode end to end", () => {
 			await store.open();
 			const claim = store.claims().find(row => row.childId === childId);
 			expect(claim?.state).toBe("accepted");
-			const replay = await broker.handleRequest("session.spawn", dispatched[0]!, dispatchedKeys[0]!);
-			expect(replay).toMatchObject({ ok: true, result: { code: "spawn_replayed", sessionId: childId } });
+			const replay = await runSdkSpawn({ cwd: process.cwd(), prompt: seedText, agentDir, idempotencyKey }, cliDeps);
+			expect(replay).toMatchObject({
+				exitCode: 0,
+				rendered: { code: "spawn_replayed", sessionId: childId },
+			});
+			expect(dispatchedKeys).toEqual([idempotencyKey, idempotencyKey]);
 			expect(counters.launches).toBe(1);
 			expect(dispatchCounters.dispatches).toBe(1);
 

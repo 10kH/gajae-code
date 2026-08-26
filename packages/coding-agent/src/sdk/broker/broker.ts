@@ -1428,6 +1428,7 @@ export class Broker {
 					childSessionId: prep.childId,
 					cwd: prep.cwd,
 					argv: prep.argv,
+					inheritedEnv: prep.inheritedEnv,
 					env: prep.env,
 				});
 				if (launched.ok) launchedProof = launched.proof;
@@ -2070,6 +2071,9 @@ export class Broker {
 			if (verdict === "verified") {
 				const closedSubstrate = await provider.close(proof);
 				if (!closedSubstrate.ok) return "retained";
+				// Signal delivery is not terminal evidence: only a second exact proof
+				// that observes this substrate gone permits the durable close.
+				if ((await provider.verify(proof)) !== "gone") return "retained";
 			}
 			const at = Math.max(Date.now(), authority.updatedAt + 1);
 			const closedAuthority: SpawnAuthorityV1 = { ...authority, closeState: "closed", closedAt: at, updatedAt: at };
@@ -2089,9 +2093,9 @@ export class Broker {
 	}
 
 	/**
-	 * Broker-owned orphan reaping. First confirmed master loss stores a durable
-	 * orphan clock; recovery before expiry clears it; expiry converges through
-	 * the ordinary exact close for only the matching owned child.
+	 * Replays pending exact closes, then reaps children after confirmed master
+	 * loss. Orphan clocks survive recovery and expiry converges through the same
+	 * exact close path for only the matching owned child.
 	 */
 	/** Deterministic single reap pass; used by maintenance paths and tests. */
 	async reapSpawnOrphansOnce(): Promise<void> {
@@ -2110,6 +2114,14 @@ export class Broker {
 				const authority = store.authority(claim.lifecycleIdentity);
 				if (!authority || (authority.closeState !== "active" && authority.closeState !== "close_requested"))
 					continue;
+				if (authority.closeState === "close_requested") {
+					try {
+						await this.#closeSpawnAuthority(claim.lifecycleIdentity);
+					} catch {
+						// One authority's reap failure never blocks the remaining scan.
+					}
+					continue;
+				}
 				if (rows === undefined) {
 					try {
 						await this.index.refresh();

@@ -944,14 +944,16 @@ function command(broker: Broker): LifecycleCommand {
 
 /**
  * Reuses the ordinary lifecycle host bootstrap without performing its direct
- * process spawn. Broker-owned substrate providers receive this exact argv/env
- * pair and remain the only launch authority for session.spawn.
+ * process spawn. Broker-owned substrate providers receive this exact argv and
+ * split inherited/child-specific environment contract as their only launch
+ * authority for session.spawn.
  */
 export type SpawnChildHostLaunch = {
 	childId: string;
 	cwd: string;
 	stateRoot: string;
 	argv: readonly string[];
+	inheritedEnv: Readonly<Record<string, string>>;
 	env: Readonly<Record<string, string>>;
 	effectMarker: string;
 };
@@ -977,7 +979,7 @@ export function prepareSpawnChildHostLaunch(
 	};
 	const cmd = command(broker);
 	const inherited = "kind" in cmd ? cmd.env : process.env;
-	const env = Object.fromEntries(
+	const inheritedEnv = Object.fromEntries(
 		Object.entries(inherited).filter(
 			(entry): entry is [string, string] => entry[0] !== "GJC_MASTER_CAPABILITY" && typeof entry[1] === "string",
 		),
@@ -987,8 +989,8 @@ export function prepareSpawnChildHostLaunch(
 		cwd,
 		stateRoot,
 		argv: [cmd.file, ...cmd.args],
+		inheritedEnv,
 		env: {
-			...env,
 			GJC_AGENT_DIR: broker.settings.agentDir,
 			GJC_CODING_AGENT_DIR: broker.settings.agentDir,
 			GJC_SESSION_ID: childId,

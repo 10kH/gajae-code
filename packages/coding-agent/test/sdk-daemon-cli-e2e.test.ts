@@ -48,14 +48,14 @@ function publicSessionArgs(args: string[]): string[] {
 		: ["sdk", "session", ...args];
 }
 
-async function runCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
+async function runCliArgs(repo: string, agentDir: string, commandArgs: string[]): Promise<CliResult> {
 	const captureDir = await fs.mkdtemp(path.join(os.tmpdir(), "gjc-sdk-cli-capture-"));
 	const stdoutPath = path.join(captureDir, "stdout");
 	const stderrPath = path.join(captureDir, "stderr");
 	const stdoutFd = openSync(stdoutPath, "w");
 	const stderrFd = openSync(stderrPath, "w");
 	try {
-		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, ...publicSessionArgs(args)], {
+		const child = Bun.spawn([process.execPath, "run", cliEntrypoint, ...commandArgs], {
 			cwd: repo,
 			env: { ...process.env, GJC_CODING_AGENT_DIR: agentDir },
 			stdout: stdoutFd,
@@ -76,6 +76,14 @@ async function runCli(repo: string, agentDir: string, args: string[]): Promise<C
 		closeCaptureFd(stderrFd);
 		await fs.rm(captureDir, { recursive: true, force: true });
 	}
+}
+
+async function runCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
+	return await runCliArgs(repo, agentDir, publicSessionArgs(args));
+}
+
+async function runSdkCli(repo: string, agentDir: string, args: string[]): Promise<CliResult> {
+	return await runCliArgs(repo, agentDir, ["sdk", ...args]);
 }
 
 // Broker `session.list` rows always carry a v2 locator: legacy shapes are
@@ -358,7 +366,7 @@ describe("SDK session CLI", () => {
 	it("uses the broker and Router-owned session attachments without leaking credentials", async () => {
 		const list = await runCli(root, agentDir, ["list"]);
 		expect(list.exitCode).toBe(0);
-		expect(JSON.parse(list.stdout)).toMatchObject({ result: { sessions: [{ sessionId: "live" }] } });
+		expect(JSON.parse(list.stdout)).toMatchObject({ result: { version: 2, sessions: [{ sessionId: "live" }] } });
 		const connectionsAfterList = endpointConnections;
 
 		const control = await runCli(root, agentDir, [
@@ -408,13 +416,48 @@ describe("SDK session CLI", () => {
 		expect(credentialFlag.exitCode).toBe(2);
 		expect(`${credentialFlag.stdout}\n${credentialFlag.stderr}`).not.toContain("session-token");
 	}, 60_000);
+	it("returns malformed scoped broker rows in the JSON search envelope", async () => {
+		const scope = {
+			version: 1 as const,
+			requested: "repo" as const,
+			requestAnchor: { cwd: root, worktreeRoot: null },
+			resolved: null,
+			resolution: "not-in-git-worktree" as const,
+		};
+		const originalHandleRequest = broker.handleRequest.bind(broker);
+		broker.handleRequest = async (operation, input, idempotencyKey) => {
+			if (operation !== "session.list") return await originalHandleRequest(operation, input, idempotencyKey);
+			return {
+				ok: true,
+				result: {
+					indexSeq: 1,
+					sessions: [{ sessionId: "malformed", locator: { cwd: root, worktreeRoot: null } }],
+					warnings: [],
+					scope,
+					observedAt: "2026-08-26T00:00:00.000Z",
+				},
+			};
+		};
+		try {
+			const result = await runSdkCli(root, agentDir, ["search", "--json"]);
+			expect(result.exitCode, `search stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(1);
+			expect(JSON.parse(result.stdout)).toMatchObject({
+				version: 1,
+				status: "unavailable",
+				rows: [],
+				error: { code: "malformed_response" },
+			});
+		} finally {
+			broker.handleRequest = originalHandleRequest;
+		}
+	}, 60_000);
 
 	it("routes semantic inspect, send, status, and tail through Router-owned attachments", async () => {
 		const inspect = await runCli(root, agentDir, ["inspect", "live"]);
 		expect(inspect.exitCode, inspect.stderr).toBe(0);
 		expect(JSON.parse(inspect.stdout)).toMatchObject({
 			ok: true,
-			result: { source: "broker", session: { sessionId: "live" } },
+			result: { version: 2, source: "broker", session: { sessionId: "live" } },
 		});
 
 		const send = await runCli(root, agentDir, ["send", "live", "--text", "hello", "--op-ref", "semantic-ref"]);
@@ -453,7 +496,12 @@ describe("SDK session CLI", () => {
 		expect(tail.exitCode, `tail stdout=${tail.stdout}\nstderr=${tail.stderr}`).toBe(0);
 		expect(JSON.parse(tail.stdout)).toMatchObject({
 			ok: true,
-			result: { source: "session", terminal: true, items: [expect.objectContaining({ kind: "turn_end", seq: 1 })] },
+			result: {
+				version: 2,
+				source: "session",
+				terminal: true,
+				items: [expect.objectContaining({ kind: "turn_end", seq: 1 })],
+			},
 		});
 	}, 60_000);
 
@@ -1131,7 +1179,7 @@ describe("SDK session CLI", () => {
 		expect(result.exitCode, `tail stdout=${result.stdout}\nstderr=${result.stderr}`).toBe(0);
 		expect(JSON.parse(result.stdout)).toMatchObject({
 			ok: true,
-			result: { source: "offline", session: { sessionId: session.id }, terminal: true },
+			result: { version: 2, source: "offline", session: { sessionId: session.id }, terminal: true },
 		});
 	}, 60_000);
 	it("fails closed when the Broker-selected offline transcript is rewritten in place with restored metadata", async () => {

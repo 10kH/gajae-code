@@ -225,6 +225,33 @@ describe("SessionLifecycleService", () => {
 		const result = await service.list({ actor, capability: "session.list", target: { scope: scopeRequest } });
 		expect(result).toMatchObject({ ok: false, certainty: "uncertain", error: { code: "scope_observation_drift" } });
 	});
+	it("maps malformed scoped locator rows to a malformed_response failure", async () => {
+		const anchor = await resolveSessionLocator(process.cwd(), path.join(process.cwd(), ".gjc", "state"));
+		const scopeRequest = {
+			version: 1 as const,
+			requested: "global" as const,
+			requestAnchor: { cwd: anchor.cwd, worktreeRoot: anchor.worktreeRoot },
+		};
+		const scope = await resolveScopeRequest(scopeRequest);
+		const { service } = serviceWith({
+			ok: true,
+			result: {
+				indexSeq: 7,
+				sessions: [{ sessionId: "malformed", locator: { cwd: "/workspace", worktreeRoot: null } }],
+				warnings: [],
+				scope,
+				observedAt: "2026-08-25T03:00:00.000Z",
+			},
+		});
+
+		await expect(
+			service.list({ actor, capability: "session.list", target: { scope: scopeRequest } }),
+		).resolves.toMatchObject({
+			ok: false,
+			certainty: "uncertain",
+			error: { code: "malformed_response" },
+		});
+	});
 	it("fails safely when a Broker list cursor repeats", async () => {
 		const { service, client } = serviceWith();
 		client.responses.push(
